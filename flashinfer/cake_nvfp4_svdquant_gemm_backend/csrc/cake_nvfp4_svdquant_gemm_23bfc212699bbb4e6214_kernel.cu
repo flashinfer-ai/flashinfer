@@ -74,9 +74,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_SMEM_OUT_OFF 1024
 #define SMEM_SMEM_OUT_STAGE_BYTES 4096
 #define SMEM_SMEM_OUT_STRIDE 4096
-#define SMEM_SMEM_BIAS_PAIRS_OFF 230400
-#define SMEM_SMEM_BIAS_PAIRS_STAGE_BYTES 128
-#define SMEM_SMEM_BIAS_PAIRS_STRIDE 128
 #define SMEM_TOTAL 230528
 #define THREADS 256
 #define LAUNCH_MIN_BLOCKS 1
@@ -305,7 +302,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) __cluster_dims__(1,2,1) void
-kernel_cake_nvfp4_svdquant_gemm_44ec820136bf5bcde86e(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap D, const __grid_constant__ CUtensorMap L1, float* __restrict__ alpha, __nv_bfloat16* __restrict__ bias, const __grid_constant__ CUtensorMap out, int M, int N, int K_tiles, int rank_tiles, int grid_n, int has_bias)
+kernel_cake_nvfp4_svdquant_gemm_23bfc212699bbb4e6214(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap D, const __grid_constant__ CUtensorMap L1, float* __restrict__ alpha, __nv_bfloat16* __restrict__ bias, const __grid_constant__ CUtensorMap out, int M, int N, int K_tiles, int rank_tiles, int grid_n, int has_bias)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -354,8 +351,6 @@ kernel_cake_nvfp4_svdquant_gemm_44ec820136bf5bcde86e(const __grid_constant__ CUt
     const int smem_l1_addr = smem + 9216;
     __nv_bfloat16* smem_out = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_out_addr = smem + 1024;
-    unsigned int* smem_bias_pairs = reinterpret_cast<unsigned int*>(smem_raw + 230400);
-    const int smem_bias_pairs_addr = smem + 230400;
     if (warp == 3) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&A))) : "memory"); }
     if (warp == 3) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&B))) : "memory"); }
     if (warp == 3) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&SFA))) : "memory"); }
@@ -624,19 +619,6 @@ kernel_cake_nvfp4_svdquant_gemm_44ec820136bf5bcde86e(const __grid_constant__ CUt
             int epi_half = epi_bid_m % 2;
             int live_warp = epi_warp - epi_half * 2;
             float alpha_value = alpha[0];
-            int epi_tid = epi_warp * 32 + lane;
-            unsigned int staged_bias_pair = 0;
-            if (epi_tid < 32) {
-                if (has_bias != 0) {
-                    unsigned int _vec_load_0[2];
-                    {
-                        uint32_t _bf16x2_bits_0;
-                        _bf16x2_bits_0 = *reinterpret_cast<const uint32_t*>(bias + off_n_1 + epi_tid * 2);
-                        _vec_load_0[0] = _bf16x2_bits_0;
-                    }
-                    staged_bias_pair = _vec_load_0[0];
-                }
-            }
             unsigned int dead_off = (unsigned int)((1 - epi_half) * 4096 + (epi_warp * 32 + lane) * 16);
             unsigned int zero_words[4] = {0};
             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_a_addr + dead_off), "r"(zero_words[0]), "r"(zero_words[1]), "r"(zero_words[2]), "r"(zero_words[3]) : "memory");
@@ -675,10 +657,6 @@ kernel_cake_nvfp4_svdquant_gemm_44ec820136bf5bcde86e(const __grid_constant__ CUt
             asm volatile("barrier.sync 2, 160;" ::: "memory");
             uint32_t _mbar_token_6 = mbarrier_try_wait(acc_full_addr, 0);
             unsigned int acc_wait_token = _mbar_token_6;
-            if (epi_tid < 32) {
-                smem_bias_pairs[epi_tid] = staged_bias_pair;
-            }
-            asm volatile("barrier.sync 1, 128;" ::: "memory");
             mbarrier_wait_token(acc_full_addr, 0, acc_wait_token);
             asm volatile("tcgen05.fence::after_thread_sync;");
             int tmem_addr = taddr + (unsigned int)(epi_warp * 32 << 16);
@@ -694,48 +672,12 @@ kernel_cake_nvfp4_svdquant_gemm_44ec820136bf5bcde86e(const __grid_constant__ CUt
                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
                 : "=f"(_tmem_load_0[32]), "=f"(_tmem_load_0[33]), "=f"(_tmem_load_0[34]), "=f"(_tmem_load_0[35]), "=f"(_tmem_load_0[36]), "=f"(_tmem_load_0[37]), "=f"(_tmem_load_0[38]), "=f"(_tmem_load_0[39]), "=f"(_tmem_load_0[40]), "=f"(_tmem_load_0[41]), "=f"(_tmem_load_0[42]), "=f"(_tmem_load_0[43]), "=f"(_tmem_load_0[44]), "=f"(_tmem_load_0[45]), "=f"(_tmem_load_0[46]), "=f"(_tmem_load_0[47]), "=f"(_tmem_load_0[48]), "=f"(_tmem_load_0[49]), "=f"(_tmem_load_0[50]), "=f"(_tmem_load_0[51]), "=f"(_tmem_load_0[52]), "=f"(_tmem_load_0[53]), "=f"(_tmem_load_0[54]), "=f"(_tmem_load_0[55]), "=f"(_tmem_load_0[56]), "=f"(_tmem_load_0[57]), "=f"(_tmem_load_0[58]), "=f"(_tmem_load_0[59]), "=f"(_tmem_load_0[60]), "=f"(_tmem_load_0[61]), "=f"(_tmem_load_0[62]), "=f"(_tmem_load_0[63])
                 : "r"(tmem_addr + 32));
-            unsigned int bias_pairs[32];
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[0])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(0) + 3]))
-                : "r"(smem_bias_pairs_addr));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[4])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(4) + 3]))
-                : "r"(smem_bias_pairs_addr + 16));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[8])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(8) + 3]))
-                : "r"(smem_bias_pairs_addr + 32));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[12])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(12) + 3]))
-                : "r"(smem_bias_pairs_addr + 48));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[16])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(16) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(16) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(16) + 3]))
-                : "r"(smem_bias_pairs_addr + 64));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[20])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(20) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(20) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(20) + 3]))
-                : "r"(smem_bias_pairs_addr + 80));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[24])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(24) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(24) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(24) + 3]))
-                : "r"(smem_bias_pairs_addr + 96));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[28])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(28) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(28) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(28) + 3]))
-                : "r"(smem_bias_pairs_addr + 112));
             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
             asm volatile("tcgen05.fence::before_thread_sync;");
             mbarrier_arrive(tmem_dealloc_addr);
-            unsigned int bias_pair = 0;
-            unsigned int bias_lo_bits = 0;
-            float bias_lo = 0.0f;
-            unsigned int bias_hi_bits = 0;
-            float bias_hi = 0.0f;
             #pragma unroll
-            for (int j = 0; j < 32; j++) {
-                bias_pair = bias_pairs[j];
-                bias_lo_bits = bias_pair << 16;
-                bias_lo = reinterpret_cast<float*>(&bias_lo_bits)[0];
-                bias_hi_bits = bias_pair & 4294901760u;
-                bias_hi = reinterpret_cast<float*>(&bias_hi_bits)[0];
-                result[2 * j] = __fmaf_rn(_tmem_load_0[2 * j], alpha_value, bias_lo);
-                result[2 * j + 1] = __fmaf_rn(_tmem_load_0[2 * j + 1], alpha_value, bias_hi);
+            for (int j = 0; j < 64; j++) {
+                result[j] = _tmem_load_0[j] * alpha_value;
             }
             unsigned int result_bf16[32];
             #pragma unroll
