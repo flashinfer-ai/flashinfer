@@ -1774,6 +1774,7 @@ def test_attention_ts_context_paged_run_validate_false_bypasses_validators(
     wrapper._plan_state = context_module._PagedContextPlanState(
         geometry=SimpleNamespace(
             output_dtype=out.dtype,
+            max_seq_len_q=1,
             uniform_packed_lengths=True,
             has_q_offset=False,
         ),
@@ -1876,7 +1877,9 @@ def test_attention_ts_context_paged_run_forwards_valid_scales(
     wrapper = BatchPrefillPagedTSWrapper()
     wrapper._plan_state = context_module._PagedContextPlanState(
         geometry=SimpleNamespace(
-            device=torch.device("cpu"), output_dtype=torch.float32
+            device=torch.device("cpu"),
+            output_dtype=torch.float32,
+            max_seq_len_q=1,
         ),
         scale_softmax_log2=plan_scale_softmax_log2,
         output_scale=plan_output_scale,
@@ -1915,6 +1918,7 @@ def test_attention_ts_context_paged_run_forwards_valid_scales(
         qo_indptr,
         block_tables,
         seq_lens_kv,
+        1,
     )
     assert all(
         actual is expected
@@ -3781,24 +3785,48 @@ def test_attention_ts_context_reuses_compiled_topology_across_batch_sizes(
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
-def test_attention_ts_paged_context_reuses_compiled_topology_across_batch_sizes():
-    """One paged-context topology accepts different batch extents."""
+@pytest.mark.parametrize(
+    (
+        "head_dim",
+        "qkv_dtype",
+        "mask_type",
+        "window_left",
+        "uniform_packed_lengths",
+    ),
+    (
+        (128, torch.float16, "dense", -1, False),
+        (192, torch.bfloat16, "causal", 511, False),
+        (192, _FP8, "causal", 511, False),
+        (128, torch.float16, "dense", -1, True),
+    ),
+)
+def test_attention_ts_paged_context_compile_reuse_across_batch_and_q_sizes(
+    head_dim: int,
+    qkv_dtype: torch.dtype,
+    mask_type: str,
+    window_left: int,
+    uniform_packed_lengths: bool,
+):
+    """Reuse runtime Q bounds while retaining exact-uniform specializations."""
 
     wrappers = []
-    for batch_size in (3, 4):
+    for batch_size, q_length in ((3, 33), (4, 129)):
         case = _make_paged_context_case(
-            q_lengths=(33,) * batch_size,
-            k_lengths=(65,) * batch_size,
-            num_qo_heads=4,
-            num_kv_heads=4,
-            head_dim=128,
-            qk_dtype=torch.float16,
-            mask_type="dense",
-            output_dtype=torch.float16,
+            q_lengths=(q_length,) * batch_size,
+            k_lengths=(513,) * batch_size,
+            num_qo_heads=16,
+            num_kv_heads=1,
+            head_dim=head_dim,
+            qk_dtype=qkv_dtype,
+            mask_type=mask_type,
+            window_left=window_left,
+            output_dtype=torch.bfloat16,
             seed=2026071430 + batch_size,
         )
         wrapper = BatchPrefillPagedTSWrapper()
-        metadata = _plan_paged_wrapper(wrapper, case)
+        metadata = _plan_paged_wrapper(
+            wrapper, case, uniform_packed_lengths=uniform_packed_lengths
+        )
         actual = _run_paged_wrapper(wrapper, case, metadata)
         _assert_context_correct(actual, case.reference)
         wrappers.append(wrapper)
@@ -3807,7 +3835,9 @@ def test_attention_ts_paged_context_reuses_compiled_topology_across_batch_sizes(
     second_state = wrappers[1]._plan_state
     assert first_state is not None
     assert second_state is not None
-    assert first_state.compiled is second_state.compiled
+    assert (first_state.compiled is second_state.compiled) == (
+        not uniform_packed_lengths
+    )
 
 
 @pytest.mark.arch_blackwell

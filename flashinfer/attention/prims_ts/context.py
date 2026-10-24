@@ -291,7 +291,9 @@ class _PagedContextCompileSpec:
     """Batch-independent identity for one paged context compile."""
 
     device_index: int
-    max_seq_len_q: int
+    # General varlen launches pass this bound at runtime. Exact-uniform
+    # kernels still specialize the request length through their config.
+    max_seq_len_q: int | None
     max_kv_len: int
     page_size: int
     num_qo_heads: int
@@ -1944,7 +1946,9 @@ def _paged_context_compile_spec(
     """Build the paged compile key, including separate QK and PV dtype keys."""
     return _PagedContextCompileSpec(
         device_index=geometry.device_index,
-        max_seq_len_q=geometry.max_seq_len_q,
+        max_seq_len_q=(
+            geometry.max_seq_len_q if geometry.uniform_packed_lengths else None
+        ),
         max_kv_len=geometry.max_kv_len,
         page_size=geometry.page_size,
         num_qo_heads=geometry.num_qo_heads,
@@ -2254,7 +2258,7 @@ def _get_compiled_paged_context(
     """Compile one batch-dynamic packed-Q, paged-K/V specialization."""
 
     device_index = compile_spec.device_index
-    max_seq_len_q = compile_spec.max_seq_len_q
+    max_seq_len_q = compile_spec.max_seq_len_q or 0
     max_kv_len = compile_spec.max_kv_len
     page_size = compile_spec.page_size
     num_qo_heads = compile_spec.num_qo_heads
@@ -2334,7 +2338,7 @@ def _get_compiled_paged_context(
         seq_lens_kv: cute.Tensor,
         stream: cuda_drv.CUstream,
         static_max_active_clusters: cutlass.Constexpr[int],
-        static_max_seq_len_q: cutlass.Constexpr[int],
+        runtime_max_seq_len_q: cutlass.Int32,
         static_max_kv_len: cutlass.Constexpr[int],
     ) -> None:
         fmha(
@@ -2347,7 +2351,7 @@ def _get_compiled_paged_context(
             static_max_active_clusters,
             stream,
             cum_seqlen_q=qo_indptr,
-            max_seqlen_q=cutlass.Int32(static_max_seq_len_q),
+            max_seqlen_q=runtime_max_seq_len_q,
             max_seqlen_k=cutlass.Int32(static_max_kv_len),
             block_tables=block_tables,
             seq_lens_kv=seq_lens_kv,
@@ -2412,7 +2416,7 @@ def _get_compiled_paged_context(
             seq_lens_fake,
             stream_fake,
             max_active_clusters,
-            max_seq_len_q,
+            cutlass.Int32(max_seq_len_q),
             max_kv_len,
             options=_COMPILE_OPTIONS,
         )
@@ -3551,6 +3555,7 @@ class BatchPrefillPagedTSWrapper:
             qo_indptr,
             block_tables,
             seq_lens_kv,
+            geometry.max_seq_len_q,
         )
         return out
 
