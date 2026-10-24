@@ -169,6 +169,46 @@ def stage_mega_moe_inputs(
         _note_staged_tokens(topk_idx_out, 0)
         return
 
+    if (
+        quantize_input
+        and safe_quantization
+        and hidden_states.is_cuda
+        and hidden_states.dtype == torch.bfloat16
+        and hidden_states.shape[1] > 0
+        and topk_ids.shape[0] == num_tokens
+        and topk_ids.shape[1] > 0
+        and topk_ids.dtype == torch.int64
+        and topk_weights.dtype == torch.float32
+        and all(
+            tensor.is_contiguous()
+            for tensor in (
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                x_fp8,
+                x_sf,
+                topk_idx_out,
+                topk_weights_out,
+            )
+        )
+    ):
+        from .safe_quantize import quantize_and_stage_from_amax
+
+        fp32 = hidden_states.to(torch.float32)
+        absmax = fp32.abs().amax(dim=1, keepdim=True)
+        quantize_and_stage_from_amax(
+            fp32,
+            absmax,
+            x_fp8,
+            x_sf,
+            topk_ids,
+            topk_weights,
+            topk_idx_out,
+            topk_weights_out,
+        )
+        _note_staged_tokens(topk_idx_out, num_tokens)
+        return
+
     if quantize_input:
         quantized, logical_scale = _quantize_e4m3_per_token_full_hidden(
             hidden_states, safe_quantization=safe_quantization
