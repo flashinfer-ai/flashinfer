@@ -42,6 +42,12 @@ from flashinfer.attention.prims_ts.vc_attention.quantization import (
 
 from tests.attention.test_attention_ts_context import _REQUIRES_CONTEXT_GPU
 
+# The SM107 plan rejects VC-Attention, so tests that need a VC plan skip there.
+_VC_PLAN_GPU = pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 7),
+    reason="VC-Attention is off on SM107",
+)
+
 _FP8 = torch.float8_e4m3fn
 _HEAD_DIM = 128
 _MEAN_CONFIG = VCAttentionConfig()
@@ -321,6 +327,7 @@ def test_vc_plan_rejects_unsupported_recipes(overrides, error, match):
 
 
 @_REQUIRES_CONTEXT_GPU
+@_VC_PLAN_GPU
 def test_vc_run_rejects_mismatched_operands():
     q, k, v = _random_inputs(1, 1024, 2)
     ops = vc_quantize(k, v)

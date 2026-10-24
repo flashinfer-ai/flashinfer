@@ -2063,6 +2063,16 @@ def _configure_kv_ring_depths(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None:
                 cfg, is_clc_dynamic=is_clc_dynamic, require_cadence=False
             ),
         )
+        if cfg.kv_ring_stages:
+            n_stages = max(
+                cfg.num_head_dim_stages_k + cfg.num_head_dim_stages_v,
+                cfg.kv_ring_stages,
+            )
+        if cfg.vc_restores_means and n_stages < 2:
+            # The tail holds the last two tile-mean operands at once.
+            raise ValueError(
+                f"VC-Attention needs at least 2 K/V stages, kv_ring_stages gives {n_stages}"
+            )
         cfg.kv_stage = n_stages
         cfg.kv_stage_k = n_stages
         cfg.kv_stage_v = n_stages
@@ -2100,6 +2110,8 @@ def _configure_kv_ring_depths(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None:
             f"VC-Attention needs at least 2 stages per K/V ring, but the "
             f"shared-memory budget of {budget_bytes} bytes fits only {n_stages}"
         )
+    if cfg.kv_ring_stages:
+        n_stages = max(cadence, cfg.kv_ring_stages)
     cfg.kv_stage_k = n_stages
     cfg.kv_stage_v = n_stages
 
@@ -2926,6 +2938,10 @@ class FmhaTs:
         into the TMEM S load on the non-masked path (default: False). The
         context runner enables this by default on SM103 (B300) and SM107
         (Rubin).
+    kv_ring_stages : int, optional
+        K/V ring depth. Zero derives the depth from the shared-memory budget.
+    umma_fp8_k64 : bool, optional
+        Issue the fp8 PV UMMAs with K=64 per instruction.
     two_cta_umma : bool, optional
         Issue the QK and PV UMMAs in ``cta_group::2`` across a 2-CTA cluster, each
         CTA staging half of every K/V tile. Dense contiguous query-paired D128 with
@@ -2966,6 +2982,8 @@ class FmhaTs:
         enable_skip_correction: bool = True,
         uses_ldtm_stat: bool = False,
         fp8_psmem_early_token: bool = False,
+        kv_ring_stages: int = 0,
+        umma_fp8_k64: bool = False,
         two_cta_umma: bool = False,
         use_paged_kv: bool = False,
         num_tokens_per_page: int = 32,
@@ -3100,6 +3118,8 @@ class FmhaTs:
             cfg.corr_skip_threshold_log2 = _CORR_SKIP_THRESHOLD_LOG2
         cfg.uses_ldtm_stat = uses_ldtm_stat
         cfg.fp8_psmem_early_token = fp8_psmem_early_token
+        cfg.kv_ring_stages = kv_ring_stages
+        cfg.umma_fp8_k64 = umma_fp8_k64
         cfg.qk_acc_dtype = qk_acc_dtype or cutlass.Float32
         cfg.pv_acc_dtype = pv_acc_dtype or cutlass.Float32
 
