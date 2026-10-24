@@ -214,7 +214,13 @@ class FrostLowLatencyRunner(MoERunner):
             else (
                 "fp4-route-reuse-load-width-lut-fp16-v8"
                 if self._fp4_weight_only
-                else "unified-fma-tc-standard-timing-v5"
+                else (
+                    "w8a16-route-group-v1"
+                    if self.config.quant.weight is QuantFormat.FP8PerTensor
+                    and self.config.quant.activation
+                    in (QuantFormat.BF16, QuantFormat.FP16)
+                    else "unified-fma-tc-standard-timing-v5"
+                )
             ),
             self.options.max_num_tokens,
             self.config.execution.enable_pdl,
@@ -264,6 +270,19 @@ class FrostLowLatencyRunner(MoERunner):
                     for b in columns
                 ]
             return tactics
+        if (
+            self.config.quant.weight is QuantFormat.FP8PerTensor
+            and self.config.quant.activation in (QuantFormat.BF16, QuantFormat.FP16)
+            and capability == (12, 0)
+            and inputs[0].shape[0] >= 4
+        ):
+            # T=2 warm reuse gains did not offset its cold-cache regression.
+            return [("ffma", a, b) for a in (1, 2, 4, 8) for b in (1, 2, 4, 8)] + [
+                ("ffma", a, b, group)
+                for a in (1, 2, 4)
+                for b in (1, 2, 4, 8)
+                for group in (2, 4)
+            ]
         if self._fp4_weight_only or self.config.quant.weight in (
             QuantFormat.BF16,
             QuantFormat.FP16,

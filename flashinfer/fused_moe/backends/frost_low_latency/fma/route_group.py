@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Reuse FP4 FC1 weights across dynamically matched expert routes."""
+"""Reuse weight-only FC1 weights across dynamically matched expert routes."""
 
 import cutlass
 from cutlass import cute
@@ -20,8 +20,11 @@ def load_weight(
     width: cutlass.Constexpr,
     native: cutlass.Constexpr,
     scale_block: cutlass.Constexpr,
+    fp8_weights: cutlass.Constexpr,
 ):
     word = wp[(expert * rows + row) * (width // 4) + col]
+    if cutlass.const_expr(fp8_weights):
+        return _quad(word, cutlass.Float8E4M3FN)
     scale = weight_scale(sf[expert, row, col // (scale_block // 4)], scale_block)
     return scaled_quad(word, scale, native, scale_block)
 
@@ -54,6 +57,7 @@ def _kernel(
     row = (bid % tiles) * 8 * columns + warp * columns
     expert = ids[leader // k, leader % k].to(cutlass.Int64)
     branches = 2 if gated else 1
+    fp8_weights = w.element_type == cutlass.Float8E4M3FN
     if expert >= 0 and expert < cute.size(w, mode=[0]):
         # Each group is owned by its first occurrence in flattened route order.
         # All lanes in a warp see the same leader; ballot operations are uniform.
@@ -127,7 +131,9 @@ def _kernel(
                 gate.fill(0.0)
                 xv = cute.make_rmem_tensor((group_size, 4), cutlass.Float32)
                 xp = cute.recast_ptr(x.iterator, dtype=cutlass.Uint64)
-                wp = cute.recast_ptr(w.iterator, dtype=cutlass.Uint16)
+                wp = cute.recast_ptr(
+                    w.iterator, dtype=cutlass.Uint32 if fp8_weights else cutlass.Uint16
+                )
                 for group in range(h // 128):
                     col = group * 32 + lane
                     xv.fill(0.0)
@@ -149,6 +155,7 @@ def _kernel(
                             h,
                             native,
                             scale_block,
+                            fp8_weights,
                         )
                         if cutlass.const_expr(gated):
                             gv = load_weight(
@@ -161,6 +168,7 @@ def _kernel(
                                 h,
                                 native,
                                 scale_block,
+                                fp8_weights,
                             )
                         for p in cutlass.range_constexpr(group_size):
                             if members[p] >= 0:
@@ -187,13 +195,13 @@ def _kernel(
                             )
                         if lane == 0 and members[p] >= 0:
                             u = (
-                                (u * dq[expert, 0])
+                                (u * (dq[expert] if fp8_weights else dq[expert, 0]))
                                 .to(mid.element_type)
                                 .to(cutlass.Float32)
                             )
                             if cutlass.const_expr(gated):
                                 g = (
-                                    (g * dq[expert, 1])
+                                    (g * (dq[expert] if fp8_weights else dq[expert, 1]))
                                     .to(mid.element_type)
                                     .to(cutlass.Float32)
                                 )

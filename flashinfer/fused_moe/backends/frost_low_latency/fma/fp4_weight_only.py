@@ -9,7 +9,7 @@ from cutlass.cute.runtime import from_dlpack
 from .activation_config import lower_activation
 from .bf16.fma_fc1 import _kernel as fc1
 from .bf16.fma_fc2 import _kernel as fc2
-from .fp4_route_group import _kernel as grouped_fc1
+from .route_group import _kernel as grouped_fc1
 
 
 @cute.jit
