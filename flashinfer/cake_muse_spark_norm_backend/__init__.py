@@ -81,11 +81,27 @@ def _device_index(device: torch.device) -> int:
     return device.index if device.index is not None else torch.cuda.current_device()
 
 
+_CAPABILITIES: dict[tuple[int, int], tuple[Any, tuple[int, int]]] = {}
+
+
+def _capability(device: torch.device) -> tuple[int, int]:
+    """``torch.cuda.get_device_capability(device)``, asked once per device and per probe function.  The entry keeps
+    the probe it came from, so a test that replaces ``torch.cuda.get_device_capability`` gets an entry of its own and
+    the probe's id cannot be reused while the entry lives."""
+    probe = torch.cuda.get_device_capability
+    key = (_device_index(device), id(probe))
+    entry = _CAPABILITIES.get(key)
+    if entry is None or entry[0] is not probe:
+        major, minor = probe(device)
+        entry = _CAPABILITIES[key] = (probe, (int(major), int(minor)))
+    return entry[1]
+
+
 def _arch(device: torch.device) -> Optional[str]:
     """The exported architecture of ``device``, or ``None`` for a device the package has no build for."""
     if device.type != "cuda":
         return None
-    return arch_for_capability(tuple(torch.cuda.get_device_capability(device)))
+    return arch_for_capability(_capability(device))
 
 
 def gated_residual_next_rmsnorm_variant(
