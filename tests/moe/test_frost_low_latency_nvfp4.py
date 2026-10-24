@@ -96,7 +96,7 @@ def reference(q, sf, view, ids, scores, activation, packed):
 
 @pytest.mark.parametrize("index,activation", list(enumerate(ACTIVATIONS)))
 def test_nvfp4_activation_tactics_and_changing_graphs(index, activation):
-    _require_gpu()
+    _require_gpu(allow_sm120=True)
     torch.manual_seed(7100 + index)
     t, h, i, e, k = (1, 2, 4, 8)[index % 4], 512, 128, 5, 3
     w1 = (
@@ -201,7 +201,7 @@ def test_nvfp4_recipe_rejection():
 def test_nvfp4_exact_midpoints_round_to_even(negative):
     from flashinfer.fused_moe import Identity
 
-    _require_gpu()
+    _require_gpu(allow_sm120=True)
     h, i = 512, 128
     device = torch.device("cuda", torch.cuda.current_device())
     w1 = torch.zeros((1, i, h // 2), dtype=torch.uint8, device=device)

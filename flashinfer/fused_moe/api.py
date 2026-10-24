@@ -2946,7 +2946,7 @@ class CudnnFrostMxfp8Mxfp4Config:
 
 @dataclass(frozen=True)
 class FrostLowLatencyConfig:
-    """Low-token routed MoE on SM100/SM103/SM107.
+    """Low-token routed MoE on SM100/SM103/SM107, with FMA-only SM120 support.
 
     Explicit opt-in; omitted from the default backend list. Autotuning selects
     Tensor Core tile sizes or a scalar FMA tactic (top-k <= 32) using the same
@@ -2958,10 +2958,12 @@ class FrostLowLatencyConfig:
 
     MXFP4/MXFP8 weights with MXFP8 inputs support the same ten typed
     activations as BF16, through TC or FMA. Non-gated weights omit gate rows.
-    BF16 weights/inputs use FMA with gated or non-gated activations and top-k
-    at most 32. BF16 rounds the activation to BF16 and combines BF16 expert
-    outputs with ordered, separate FP32 multiplication and addition. This is
-    distinct from the MX intermediate quantization/combine contract.
+    BF16 or FP16 weights/inputs use FMA with gated or non-gated activations and
+    top-k at most 32. The activation is rounded to the input dtype and expert
+    outputs to the configured BF16/FP16 output dtype. Combine uses ordered,
+    separate FP32 multiplication and addition. Packed routing scores retain
+    BF16 rounding regardless of the input/output dtype. This is distinct from
+    the MX intermediate quantization/combine contract.
 
     NVFP4 weights/inputs use shared FMA with H divisible by 512, I by 128,
     and top-k at most 32. It retains BF16 activation/expert rounding and
@@ -2976,7 +2978,7 @@ class FrostLowLatencyConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in (100, 103, 107)
+        return arch in (100, 103, 107, 120)
 
     @staticmethod
     def prepare_weights(w1, w1_scale, w2, w2_scale, *, activation=None):
@@ -2997,6 +2999,15 @@ class FrostLowLatencyConfig:
         from .backends.frost_low_latency.prepare import prepare_bf16_weights
 
         return prepare_bf16_weights(
+            w1, w2, SwiGLU() if activation is None else activation
+        )
+
+    @staticmethod
+    def prepare_fp16_weights(w1, w2, *, activation=None):
+        """Prepare FP16 [up, gate] or non-gated weights, padding I to 128."""
+        from .backends.frost_low_latency.prepare import prepare_fp16_weights
+
+        return prepare_fp16_weights(
             w1, w2, SwiGLU() if activation is None else activation
         )
 

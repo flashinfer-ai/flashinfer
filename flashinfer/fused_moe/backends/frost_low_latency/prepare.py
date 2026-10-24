@@ -92,7 +92,15 @@ def prepare_weights(w1, w1_scale, w2, w2_scale, *, activation):
 
 
 def prepare_bf16_weights(w1, w2, activation):
-    """Prepare canonical BF16 [up, gate] or non-gated weights without rounding.
+    return _prepare_float16_weights(w1, w2, activation, torch.bfloat16)
+
+
+def prepare_fp16_weights(w1, w2, activation):
+    return _prepare_float16_weights(w1, w2, activation, torch.float16)
+
+
+def _prepare_float16_weights(w1, w2, activation, dtype):
+    """Prepare canonical 16-bit [up, gate] or non-gated weights without rounding.
 
     Logical I is padded to 128 for the shared FC2 reduction. Weight preparation
     is outside execution/capture; no activation values or pointers are cached.
@@ -100,8 +108,8 @@ def prepare_bf16_weights(w1, w2, activation):
     from .fma.activation_config import lower_activation
 
     lower_activation(activation)
-    if w1.dtype != torch.bfloat16 or w2.dtype != torch.bfloat16:
-        raise TypeError("BF16 preparation requires two bfloat16 weight tensors")
+    if w1.dtype != dtype or w2.dtype != dtype:
+        raise TypeError(f"Preparation requires two {dtype} weight tensors")
     if w1.ndim != 3 or w2.ndim != 3:
         raise ValueError("weights must be 3-D")
     e, h, i = w2.shape
