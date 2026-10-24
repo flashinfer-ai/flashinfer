@@ -60,12 +60,14 @@ void Run(TensorView a_partial_out, TensorView a_partial_lse, TensorView a_gate, 
   check_contiguous(a_gate, "gate");
   check_same_device(a_gate, a_partial_out, "gate", "partial_out");
   check_same_device(a_out, a_partial_out, "out", "partial_out");
-  TVM_FFI_CHECK((a_num_splits >= 1), ValueError)
+  TVM_FFI_CHECK((a_num_splits >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (num_splits >= 1)";
-  TVM_FFI_CHECK((a_num_splits <= 128), ValueError)
+  TVM_FFI_CHECK((a_num_splits <= 128LL), ValueError)
       << KERNEL_NAME << ": requires (num_splits <= 128)";
-  TVM_FFI_CHECK((a_num_qo_heads >= 1), ValueError)
+  TVM_FFI_CHECK((a_num_qo_heads >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (num_qo_heads >= 1)";
+  TVM_FFI_CHECK(((a_num_qo_heads == 1LL) || (a_out_stride_head >= 256LL)), ValueError)
+      << KERNEL_NAME << ": requires ((num_qo_heads == 1) || (out_stride_head >= 256))";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
   TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)

@@ -66,6 +66,9 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_ADDR_RING_OFF 47632
 #define SMEM_ADDR_RING_STAGE_BYTES 2048
 #define SMEM_ADDR_RING_STRIDE 2048
+#define SMEM_LUT_S_OFF 49696
+#define SMEM_LUT_S_STAGE_BYTES 16
+#define SMEM_LUT_S_STRIDE 16
 #define SMEM_SLOT_VALID_OFF 49680
 #define SMEM_SLOT_VALID_STAGE_BYTES 16
 #define SMEM_SLOT_VALID_STRIDE 16
@@ -143,6 +146,8 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
     const int valid_s_addr = smem + 47616;
     unsigned int* addr_ring = reinterpret_cast<unsigned int*>(smem_raw + 47632);
     const int addr_ring_addr = smem + 47632;
+    unsigned int* lut_s = reinterpret_cast<unsigned int*>(smem_raw + 49696);
+    const int lut_s_addr = smem + 49696;
     unsigned int* slot_valid = reinterpret_cast<unsigned int*>(smem_raw + 49680);
     const int slot_valid_addr = smem + 49680;
     float* lse_tab = reinterpret_cast<float*>(smem_raw + 0);
@@ -346,6 +351,13 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
     unsigned long long k_sf_base = (unsigned long long)k_sf + head_sf;
     unsigned long long v_sf_base = (unsigned long long)v_sf + head_sf;
     unsigned int kv_addr = kv_u8_addr;
+#if __CUDA_ARCH__ == 900
+    if (tid_0 == 0) {
+        asm volatile("st.shared.v2.b32 [%0], {%1,%2};" :: "r"(lut_s_addr), "r"(2071689984), "r"(3229614080u) : "memory");
+    }
+    unsigned int lut_regs[2];
+#else
+#endif
     float o[32];
     o[0] = 0.0f;
     o[1] = 0.0f;
@@ -634,6 +646,12 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
     for (int tile = split; tile < tile_end; tile += num_splits) {
         asm volatile("cp.async.wait_group 1;");
         __syncthreads();
+#if __CUDA_ARCH__ == 900
+        asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&lut_regs[0])), "=r"(*reinterpret_cast<uint32_t*>(&lut_regs[(0) + 1]))
+            : "r"(lut_s_addr));
+#else
+#endif
         if (warp_1 < 2 && multi) {
             int column_0 = (tile + 3 * num_splits) * 64 + token;
             bool in_range_1 = column_0 < topk && tile_end > tile + 3 * num_splits;
@@ -749,20 +767,12 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sf_words[1])) : "r"(k1_addr + scale_col));
         uint32_t _prmt_0;
         asm("prmt.b32 %0, %1, %2, 0x1302;" : "=r"(_prmt_0) : "r"(sf_words[0]), "r"(sf_words[0]));
-        uint32_t _bf16x2_fma_0;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_0) : "r"(_prmt_0 & 2147516416u | (_prmt_0 & 2130738944) >> 4), "r"(2072017792), "r"(2147516416u));
-        sf0[0] = _bf16x2_fma_0;
-        uint32_t _bf16x2_fma_1;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_1) : "r"(_prmt_0 << 8 & 2147516416u | (_prmt_0 << 8 & 2130738944) >> 4), "r"(2072017792), "r"(2147516416u));
-        sf0[1] = _bf16x2_fma_1;
+        sf0[0] = _prmt_0 & 2147516416u | (_prmt_0 & 2130738944) >> 4;
+        sf0[1] = _prmt_0 << 8 & 2147516416u | (_prmt_0 << 8 & 2130738944) >> 4;
         uint32_t _prmt_1;
         asm("prmt.b32 %0, %1, %2, 0x1302;" : "=r"(_prmt_1) : "r"(sf_words[1]), "r"(sf_words[1]));
-        uint32_t _bf16x2_fma_2;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_2) : "r"(_prmt_1 & 2147516416u | (_prmt_1 & 2130738944) >> 4), "r"(2072017792), "r"(2147516416u));
-        sf1[0] = _bf16x2_fma_2;
-        uint32_t _bf16x2_fma_3;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_3) : "r"(_prmt_1 << 8 & 2147516416u | (_prmt_1 << 8 & 2130738944) >> 4), "r"(2072017792), "r"(2147516416u));
-        sf1[1] = _bf16x2_fma_3;
+        sf1[0] = _prmt_1 & 2147516416u | (_prmt_1 & 2130738944) >> 4;
+        sf1[1] = _prmt_1 << 8 & 2147516416u | (_prmt_1 << 8 & 2130738944) >> 4;
         s[0] = 0.0f;
         s[1] = 0.0f;
         s[2] = 0.0f;
@@ -781,13 +791,29 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         uint32_t _prmt_2;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_2) : "r"(raw0[0] & 2004318071), "r"(raw0[0] & 2004318071));
         uint32_t _prmt_3;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_3) : "r"(1061109504), "r"(1077952576), "r"(raw0[0] & 2004318071));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_3) : "r"(lut_regs[0]), "r"(2088533116), "r"(raw0[0] & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_3) : "r"(2071689984), "r"(2088533116), "r"(raw0[0] & 2004318071));
+#endif
         uint32_t _prmt_4;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_4) : "r"(1061109504), "r"(1077952576), "r"(_prmt_2));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_4) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_2));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_4) : "r"(2071689984), "r"(2088533116), "r"(_prmt_2));
+#endif
         uint32_t _prmt_5;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_5) : "r"(lut_regs[1]), "r"(3229630464u), "r"(raw0[0] & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_5) : "r"(3229614080u), "r"(3229630464u), "r"(raw0[0] & 2004318071));
+#endif
         uint32_t _prmt_6;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_6) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_2));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_6) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_2));
+#endif
         uint32_t _prmt_7;
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_7) : "r"(raw0[0] << 4), "r"(raw0[0]));
         uint32_t _prmt_8;
@@ -807,13 +833,29 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         uint32_t _prmt_9;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_9) : "r"(raw1[0] & 2004318071), "r"(raw1[0] & 2004318071));
         uint32_t _prmt_10;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_10) : "r"(1061109504), "r"(1077952576), "r"(raw1[0] & 2004318071));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_10) : "r"(lut_regs[0]), "r"(2088533116), "r"(raw1[0] & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_10) : "r"(2071689984), "r"(2088533116), "r"(raw1[0] & 2004318071));
+#endif
         uint32_t _prmt_11;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_11) : "r"(1061109504), "r"(1077952576), "r"(_prmt_9));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_11) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_9));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_11) : "r"(2071689984), "r"(2088533116), "r"(_prmt_9));
+#endif
         uint32_t _prmt_12;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_12) : "r"(lut_regs[1]), "r"(3229630464u), "r"(raw1[0] & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_12) : "r"(3229614080u), "r"(3229630464u), "r"(raw1[0] & 2004318071));
+#endif
         uint32_t _prmt_13;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_13) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_9));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_13) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_9));
+#endif
         uint32_t _prmt_14;
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_14) : "r"(raw1[0] << 4), "r"(raw1[0]));
         uint32_t _prmt_15;
@@ -834,30 +876,30 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         asm("prmt.b32 %0, %1, %2, 0x1010;" : "=r"(_prmt_16) : "r"(sf0[0]), "r"(0));
         uint32_t _prmt_17;
         asm("prmt.b32 %0, %1, %2, 0x1010;" : "=r"(_prmt_17) : "r"(sf1[0]), "r"(0));
+        uint32_t _bf16x2_fma_0;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_0) : "r"(d0[0]), "r"(_prmt_16), "r"(2147516416u));
+        d0[0] = _bf16x2_fma_0;
+        uint32_t _bf16x2_fma_1;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_1) : "r"(d1[0]), "r"(_prmt_17), "r"(2147516416u));
+        d1[0] = _bf16x2_fma_1;
+        uint32_t _bf16x2_fma_2;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_2) : "r"(d0[1]), "r"(_prmt_16), "r"(2147516416u));
+        d0[1] = _bf16x2_fma_2;
+        uint32_t _bf16x2_fma_3;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_3) : "r"(d1[1]), "r"(_prmt_17), "r"(2147516416u));
+        d1[1] = _bf16x2_fma_3;
         uint32_t _bf16x2_fma_4;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_4) : "r"(d0[0]), "r"(_prmt_16), "r"(2147516416u));
-        d0[0] = _bf16x2_fma_4;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_4) : "r"(d0[2]), "r"(_prmt_16), "r"(2147516416u));
+        d0[2] = _bf16x2_fma_4;
         uint32_t _bf16x2_fma_5;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_5) : "r"(d1[0]), "r"(_prmt_17), "r"(2147516416u));
-        d1[0] = _bf16x2_fma_5;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_5) : "r"(d1[2]), "r"(_prmt_17), "r"(2147516416u));
+        d1[2] = _bf16x2_fma_5;
         uint32_t _bf16x2_fma_6;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_6) : "r"(d0[1]), "r"(_prmt_16), "r"(2147516416u));
-        d0[1] = _bf16x2_fma_6;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_6) : "r"(d0[3]), "r"(_prmt_16), "r"(2147516416u));
+        d0[3] = _bf16x2_fma_6;
         uint32_t _bf16x2_fma_7;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_7) : "r"(d1[1]), "r"(_prmt_17), "r"(2147516416u));
-        d1[1] = _bf16x2_fma_7;
-        uint32_t _bf16x2_fma_8;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_8) : "r"(d0[2]), "r"(_prmt_16), "r"(2147516416u));
-        d0[2] = _bf16x2_fma_8;
-        uint32_t _bf16x2_fma_9;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_9) : "r"(d1[2]), "r"(_prmt_17), "r"(2147516416u));
-        d1[2] = _bf16x2_fma_9;
-        uint32_t _bf16x2_fma_10;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_10) : "r"(d0[3]), "r"(_prmt_16), "r"(2147516416u));
-        d0[3] = _bf16x2_fma_10;
-        uint32_t _bf16x2_fma_11;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_11) : "r"(d1[3]), "r"(_prmt_17), "r"(2147516416u));
-        d1[3] = _bf16x2_fma_11;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_7) : "r"(d1[3]), "r"(_prmt_17), "r"(2147516416u));
+        d1[3] = _bf16x2_fma_7;
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&a_frag[0])), "=r"(*reinterpret_cast<uint32_t*>(&a_frag[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&a_frag[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&a_frag[(0) + 3]))
             : "r"(q_frag_addr + (unsigned int)(16 * lane_1)));
@@ -887,13 +929,29 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         uint32_t _prmt_18;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_18) : "r"(raw0[1] & 2004318071), "r"(raw0[1] & 2004318071));
         uint32_t _prmt_19;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_19) : "r"(1061109504), "r"(1077952576), "r"(raw0[1] & 2004318071));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_19) : "r"(lut_regs[0]), "r"(2088533116), "r"(raw0[1] & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_19) : "r"(2071689984), "r"(2088533116), "r"(raw0[1] & 2004318071));
+#endif
         uint32_t _prmt_20;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_20) : "r"(1061109504), "r"(1077952576), "r"(_prmt_18));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_20) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_18));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_20) : "r"(2071689984), "r"(2088533116), "r"(_prmt_18));
+#endif
         uint32_t _prmt_21;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_21) : "r"(lut_regs[1]), "r"(3229630464u), "r"(raw0[1] & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_21) : "r"(3229614080u), "r"(3229630464u), "r"(raw0[1] & 2004318071));
+#endif
         uint32_t _prmt_22;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_22) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_18));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_22) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_18));
+#endif
         uint32_t _prmt_23_1;
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_23_1) : "r"(raw0[1] << 4), "r"(raw0[1]));
         uint32_t _prmt_24_1;
@@ -913,13 +971,29 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         uint32_t _prmt_25_1;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_25_1) : "r"(raw1[1] & 2004318071), "r"(raw1[1] & 2004318071));
         uint32_t _prmt_26_1;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_26_1) : "r"(1061109504), "r"(1077952576), "r"(raw1[1] & 2004318071));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_26_1) : "r"(lut_regs[0]), "r"(2088533116), "r"(raw1[1] & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_26_1) : "r"(2071689984), "r"(2088533116), "r"(raw1[1] & 2004318071));
+#endif
         uint32_t _prmt_27_1;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_27_1) : "r"(1061109504), "r"(1077952576), "r"(_prmt_25_1));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_27_1) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_25_1));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_27_1) : "r"(2071689984), "r"(2088533116), "r"(_prmt_25_1));
+#endif
         uint32_t _prmt_28_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_28_1) : "r"(lut_regs[1]), "r"(3229630464u), "r"(raw1[1] & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_28_1) : "r"(3229614080u), "r"(3229630464u), "r"(raw1[1] & 2004318071));
+#endif
         uint32_t _prmt_29_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_29_1) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_25_1));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_29_1) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_25_1));
+#endif
         uint32_t _prmt_30_1;
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_30_1) : "r"(raw1[1] << 4), "r"(raw1[1]));
         uint32_t _prmt_31_1;
@@ -940,30 +1014,30 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         asm("prmt.b32 %0, %1, %2, 0x1010;" : "=r"(_prmt_32_1) : "r"(sf0[0]), "r"(0));
         uint32_t _prmt_33_1;
         asm("prmt.b32 %0, %1, %2, 0x1010;" : "=r"(_prmt_33_1) : "r"(sf1[0]), "r"(0));
+        uint32_t _bf16x2_fma_8;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_8) : "r"(d0[0]), "r"(_prmt_32_1), "r"(2147516416u));
+        d0[0] = _bf16x2_fma_8;
+        uint32_t _bf16x2_fma_9;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_9) : "r"(d1[0]), "r"(_prmt_33_1), "r"(2147516416u));
+        d1[0] = _bf16x2_fma_9;
+        uint32_t _bf16x2_fma_10;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_10) : "r"(d0[1]), "r"(_prmt_32_1), "r"(2147516416u));
+        d0[1] = _bf16x2_fma_10;
+        uint32_t _bf16x2_fma_11;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_11) : "r"(d1[1]), "r"(_prmt_33_1), "r"(2147516416u));
+        d1[1] = _bf16x2_fma_11;
         uint32_t _bf16x2_fma_12;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_12) : "r"(d0[0]), "r"(_prmt_32_1), "r"(2147516416u));
-        d0[0] = _bf16x2_fma_12;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_12) : "r"(d0[2]), "r"(_prmt_32_1), "r"(2147516416u));
+        d0[2] = _bf16x2_fma_12;
         uint32_t _bf16x2_fma_13;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_13) : "r"(d1[0]), "r"(_prmt_33_1), "r"(2147516416u));
-        d1[0] = _bf16x2_fma_13;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_13) : "r"(d1[2]), "r"(_prmt_33_1), "r"(2147516416u));
+        d1[2] = _bf16x2_fma_13;
         uint32_t _bf16x2_fma_14;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_14) : "r"(d0[1]), "r"(_prmt_32_1), "r"(2147516416u));
-        d0[1] = _bf16x2_fma_14;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_14) : "r"(d0[3]), "r"(_prmt_32_1), "r"(2147516416u));
+        d0[3] = _bf16x2_fma_14;
         uint32_t _bf16x2_fma_15;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_15) : "r"(d1[1]), "r"(_prmt_33_1), "r"(2147516416u));
-        d1[1] = _bf16x2_fma_15;
-        uint32_t _bf16x2_fma_16;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_16) : "r"(d0[2]), "r"(_prmt_32_1), "r"(2147516416u));
-        d0[2] = _bf16x2_fma_16;
-        uint32_t _bf16x2_fma_17;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_17) : "r"(d1[2]), "r"(_prmt_33_1), "r"(2147516416u));
-        d1[2] = _bf16x2_fma_17;
-        uint32_t _bf16x2_fma_18;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_18) : "r"(d0[3]), "r"(_prmt_32_1), "r"(2147516416u));
-        d0[3] = _bf16x2_fma_18;
-        uint32_t _bf16x2_fma_19;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_19) : "r"(d1[3]), "r"(_prmt_33_1), "r"(2147516416u));
-        d1[3] = _bf16x2_fma_19;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_15) : "r"(d1[3]), "r"(_prmt_33_1), "r"(2147516416u));
+        d1[3] = _bf16x2_fma_15;
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&a_frag[0])), "=r"(*reinterpret_cast<uint32_t*>(&a_frag[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&a_frag[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&a_frag[(0) + 3]))
             : "r"(q_frag_addr + (unsigned int)(16 * (64 + lane_1))));
@@ -993,13 +1067,29 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         uint32_t _prmt_34_1;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_34_1) : "r"(raw0[2] & 2004318071), "r"(raw0[2] & 2004318071));
         uint32_t _prmt_35_1;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_35_1) : "r"(1061109504), "r"(1077952576), "r"(raw0[2] & 2004318071));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_35_1) : "r"(lut_regs[0]), "r"(2088533116), "r"(raw0[2] & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_35_1) : "r"(2071689984), "r"(2088533116), "r"(raw0[2] & 2004318071));
+#endif
         uint32_t _prmt_36_1;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_36_1) : "r"(1061109504), "r"(1077952576), "r"(_prmt_34_1));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_36_1) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_34_1));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_36_1) : "r"(2071689984), "r"(2088533116), "r"(_prmt_34_1));
+#endif
         uint32_t _prmt_37_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_37_1) : "r"(lut_regs[1]), "r"(3229630464u), "r"(raw0[2] & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_37_1) : "r"(3229614080u), "r"(3229630464u), "r"(raw0[2] & 2004318071));
+#endif
         uint32_t _prmt_38_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_38_1) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_34_1));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_38_1) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_34_1));
+#endif
         uint32_t _prmt_39;
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_39) : "r"(raw0[2] << 4), "r"(raw0[2]));
         uint32_t _prmt_40;
@@ -1019,13 +1109,29 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         uint32_t _prmt_41_1;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_41_1) : "r"(raw1[2] & 2004318071), "r"(raw1[2] & 2004318071));
         uint32_t _prmt_42_1;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_42_1) : "r"(1061109504), "r"(1077952576), "r"(raw1[2] & 2004318071));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_42_1) : "r"(lut_regs[0]), "r"(2088533116), "r"(raw1[2] & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_42_1) : "r"(2071689984), "r"(2088533116), "r"(raw1[2] & 2004318071));
+#endif
         uint32_t _prmt_43;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_43) : "r"(1061109504), "r"(1077952576), "r"(_prmt_41_1));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_43) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_41_1));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_43) : "r"(2071689984), "r"(2088533116), "r"(_prmt_41_1));
+#endif
         uint32_t _prmt_44;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_44) : "r"(lut_regs[1]), "r"(3229630464u), "r"(raw1[2] & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_44) : "r"(3229614080u), "r"(3229630464u), "r"(raw1[2] & 2004318071));
+#endif
         uint32_t _prmt_45;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_45) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_41_1));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_45) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_41_1));
+#endif
         uint32_t _prmt_46;
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_46) : "r"(raw1[2] << 4), "r"(raw1[2]));
         uint32_t _prmt_47;
@@ -1046,30 +1152,30 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_48) : "r"(sf0[0]), "r"(0));
         uint32_t _prmt_49;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_49) : "r"(sf1[0]), "r"(0));
+        uint32_t _bf16x2_fma_16;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_16) : "r"(d0[0]), "r"(_prmt_48), "r"(2147516416u));
+        d0[0] = _bf16x2_fma_16;
+        uint32_t _bf16x2_fma_17;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_17) : "r"(d1[0]), "r"(_prmt_49), "r"(2147516416u));
+        d1[0] = _bf16x2_fma_17;
+        uint32_t _bf16x2_fma_18;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_18) : "r"(d0[1]), "r"(_prmt_48), "r"(2147516416u));
+        d0[1] = _bf16x2_fma_18;
+        uint32_t _bf16x2_fma_19;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_19) : "r"(d1[1]), "r"(_prmt_49), "r"(2147516416u));
+        d1[1] = _bf16x2_fma_19;
         uint32_t _bf16x2_fma_20;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_20) : "r"(d0[0]), "r"(_prmt_48), "r"(2147516416u));
-        d0[0] = _bf16x2_fma_20;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_20) : "r"(d0[2]), "r"(_prmt_48), "r"(2147516416u));
+        d0[2] = _bf16x2_fma_20;
         uint32_t _bf16x2_fma_21;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_21) : "r"(d1[0]), "r"(_prmt_49), "r"(2147516416u));
-        d1[0] = _bf16x2_fma_21;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_21) : "r"(d1[2]), "r"(_prmt_49), "r"(2147516416u));
+        d1[2] = _bf16x2_fma_21;
         uint32_t _bf16x2_fma_22;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_22) : "r"(d0[1]), "r"(_prmt_48), "r"(2147516416u));
-        d0[1] = _bf16x2_fma_22;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_22) : "r"(d0[3]), "r"(_prmt_48), "r"(2147516416u));
+        d0[3] = _bf16x2_fma_22;
         uint32_t _bf16x2_fma_23;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_23) : "r"(d1[1]), "r"(_prmt_49), "r"(2147516416u));
-        d1[1] = _bf16x2_fma_23;
-        uint32_t _bf16x2_fma_24;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_24) : "r"(d0[2]), "r"(_prmt_48), "r"(2147516416u));
-        d0[2] = _bf16x2_fma_24;
-        uint32_t _bf16x2_fma_25;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_25) : "r"(d1[2]), "r"(_prmt_49), "r"(2147516416u));
-        d1[2] = _bf16x2_fma_25;
-        uint32_t _bf16x2_fma_26;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_26) : "r"(d0[3]), "r"(_prmt_48), "r"(2147516416u));
-        d0[3] = _bf16x2_fma_26;
-        uint32_t _bf16x2_fma_27;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_27) : "r"(d1[3]), "r"(_prmt_49), "r"(2147516416u));
-        d1[3] = _bf16x2_fma_27;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_23) : "r"(d1[3]), "r"(_prmt_49), "r"(2147516416u));
+        d1[3] = _bf16x2_fma_23;
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&a_frag[0])), "=r"(*reinterpret_cast<uint32_t*>(&a_frag[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&a_frag[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&a_frag[(0) + 3]))
             : "r"(q_frag_addr + (unsigned int)(16 * (128 + lane_1))));
@@ -1099,13 +1205,29 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         uint32_t _prmt_50;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_50) : "r"(raw0[3] & 2004318071), "r"(raw0[3] & 2004318071));
         uint32_t _prmt_51;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_51) : "r"(1061109504), "r"(1077952576), "r"(raw0[3] & 2004318071));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_51) : "r"(lut_regs[0]), "r"(2088533116), "r"(raw0[3] & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_51) : "r"(2071689984), "r"(2088533116), "r"(raw0[3] & 2004318071));
+#endif
         uint32_t _prmt_52;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_52) : "r"(1061109504), "r"(1077952576), "r"(_prmt_50));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_52) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_50));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_52) : "r"(2071689984), "r"(2088533116), "r"(_prmt_50));
+#endif
         uint32_t _prmt_53;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_53) : "r"(lut_regs[1]), "r"(3229630464u), "r"(raw0[3] & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_53) : "r"(3229614080u), "r"(3229630464u), "r"(raw0[3] & 2004318071));
+#endif
         uint32_t _prmt_54;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_54) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_50));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_54) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_50));
+#endif
         uint32_t _prmt_55;
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_55) : "r"(raw0[3] << 4), "r"(raw0[3]));
         uint32_t _prmt_56;
@@ -1125,13 +1247,29 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         uint32_t _prmt_57;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_57) : "r"(raw1[3] & 2004318071), "r"(raw1[3] & 2004318071));
         uint32_t _prmt_58;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_58) : "r"(1061109504), "r"(1077952576), "r"(raw1[3] & 2004318071));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_58) : "r"(lut_regs[0]), "r"(2088533116), "r"(raw1[3] & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_58) : "r"(2071689984), "r"(2088533116), "r"(raw1[3] & 2004318071));
+#endif
         uint32_t _prmt_59;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_59) : "r"(1061109504), "r"(1077952576), "r"(_prmt_57));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_59) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_57));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_59) : "r"(2071689984), "r"(2088533116), "r"(_prmt_57));
+#endif
         uint32_t _prmt_60;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_60) : "r"(lut_regs[1]), "r"(3229630464u), "r"(raw1[3] & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_60) : "r"(3229614080u), "r"(3229630464u), "r"(raw1[3] & 2004318071));
+#endif
         uint32_t _prmt_61;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_61) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_57));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_61) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_57));
+#endif
         uint32_t _prmt_62;
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_62) : "r"(raw1[3] << 4), "r"(raw1[3]));
         uint32_t _prmt_63;
@@ -1152,30 +1290,30 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_64) : "r"(sf0[0]), "r"(0));
         uint32_t _prmt_65;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_65) : "r"(sf1[0]), "r"(0));
+        uint32_t _bf16x2_fma_24;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_24) : "r"(d0[0]), "r"(_prmt_64), "r"(2147516416u));
+        d0[0] = _bf16x2_fma_24;
+        uint32_t _bf16x2_fma_25;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_25) : "r"(d1[0]), "r"(_prmt_65), "r"(2147516416u));
+        d1[0] = _bf16x2_fma_25;
+        uint32_t _bf16x2_fma_26;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_26) : "r"(d0[1]), "r"(_prmt_64), "r"(2147516416u));
+        d0[1] = _bf16x2_fma_26;
+        uint32_t _bf16x2_fma_27;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_27) : "r"(d1[1]), "r"(_prmt_65), "r"(2147516416u));
+        d1[1] = _bf16x2_fma_27;
         uint32_t _bf16x2_fma_28;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_28) : "r"(d0[0]), "r"(_prmt_64), "r"(2147516416u));
-        d0[0] = _bf16x2_fma_28;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_28) : "r"(d0[2]), "r"(_prmt_64), "r"(2147516416u));
+        d0[2] = _bf16x2_fma_28;
         uint32_t _bf16x2_fma_29;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_29) : "r"(d1[0]), "r"(_prmt_65), "r"(2147516416u));
-        d1[0] = _bf16x2_fma_29;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_29) : "r"(d1[2]), "r"(_prmt_65), "r"(2147516416u));
+        d1[2] = _bf16x2_fma_29;
         uint32_t _bf16x2_fma_30;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_30) : "r"(d0[1]), "r"(_prmt_64), "r"(2147516416u));
-        d0[1] = _bf16x2_fma_30;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_30) : "r"(d0[3]), "r"(_prmt_64), "r"(2147516416u));
+        d0[3] = _bf16x2_fma_30;
         uint32_t _bf16x2_fma_31;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_31) : "r"(d1[1]), "r"(_prmt_65), "r"(2147516416u));
-        d1[1] = _bf16x2_fma_31;
-        uint32_t _bf16x2_fma_32;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_32) : "r"(d0[2]), "r"(_prmt_64), "r"(2147516416u));
-        d0[2] = _bf16x2_fma_32;
-        uint32_t _bf16x2_fma_33;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_33) : "r"(d1[2]), "r"(_prmt_65), "r"(2147516416u));
-        d1[2] = _bf16x2_fma_33;
-        uint32_t _bf16x2_fma_34;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_34) : "r"(d0[3]), "r"(_prmt_64), "r"(2147516416u));
-        d0[3] = _bf16x2_fma_34;
-        uint32_t _bf16x2_fma_35;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_35) : "r"(d1[3]), "r"(_prmt_65), "r"(2147516416u));
-        d1[3] = _bf16x2_fma_35;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_31) : "r"(d1[3]), "r"(_prmt_65), "r"(2147516416u));
+        d1[3] = _bf16x2_fma_31;
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&a_frag[0])), "=r"(*reinterpret_cast<uint32_t*>(&a_frag[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&a_frag[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&a_frag[(0) + 3]))
             : "r"(q_frag_addr + (unsigned int)(16 * (192 + lane_1))));
@@ -1212,13 +1350,29 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         uint32_t _prmt_66;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_66) : "r"(raw0[0] & 2004318071), "r"(raw0[0] & 2004318071));
         uint32_t _prmt_67;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_67) : "r"(1061109504), "r"(1077952576), "r"(raw0[0] & 2004318071));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_67) : "r"(lut_regs[0]), "r"(2088533116), "r"(raw0[0] & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_67) : "r"(2071689984), "r"(2088533116), "r"(raw0[0] & 2004318071));
+#endif
         uint32_t _prmt_68;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_68) : "r"(1061109504), "r"(1077952576), "r"(_prmt_66));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_68) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_66));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_68) : "r"(2071689984), "r"(2088533116), "r"(_prmt_66));
+#endif
         uint32_t _prmt_69;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_69) : "r"(lut_regs[1]), "r"(3229630464u), "r"(raw0[0] & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_69) : "r"(3229614080u), "r"(3229630464u), "r"(raw0[0] & 2004318071));
+#endif
         uint32_t _prmt_70;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_70) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_66));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_70) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_66));
+#endif
         uint32_t _prmt_71;
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_71) : "r"(raw0[0] << 4), "r"(raw0[0]));
         uint32_t _prmt_72;
@@ -1238,13 +1392,29 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         uint32_t _prmt_73;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_73) : "r"(raw1[0] & 2004318071), "r"(raw1[0] & 2004318071));
         uint32_t _prmt_74;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_74) : "r"(1061109504), "r"(1077952576), "r"(raw1[0] & 2004318071));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_74) : "r"(lut_regs[0]), "r"(2088533116), "r"(raw1[0] & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_74) : "r"(2071689984), "r"(2088533116), "r"(raw1[0] & 2004318071));
+#endif
         uint32_t _prmt_75;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_75) : "r"(1061109504), "r"(1077952576), "r"(_prmt_73));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_75) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_73));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_75) : "r"(2071689984), "r"(2088533116), "r"(_prmt_73));
+#endif
         uint32_t _prmt_76;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_76) : "r"(lut_regs[1]), "r"(3229630464u), "r"(raw1[0] & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_76) : "r"(3229614080u), "r"(3229630464u), "r"(raw1[0] & 2004318071));
+#endif
         uint32_t _prmt_77;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_77) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_73));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_77) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_73));
+#endif
         uint32_t _prmt_78;
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_78) : "r"(raw1[0] << 4), "r"(raw1[0]));
         uint32_t _prmt_79;
@@ -1265,30 +1435,30 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         asm("prmt.b32 %0, %1, %2, 0x1010;" : "=r"(_prmt_80) : "r"(sf0[1]), "r"(0));
         uint32_t _prmt_81;
         asm("prmt.b32 %0, %1, %2, 0x1010;" : "=r"(_prmt_81) : "r"(sf1[1]), "r"(0));
+        uint32_t _bf16x2_fma_32;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_32) : "r"(d0[0]), "r"(_prmt_80), "r"(2147516416u));
+        d0[0] = _bf16x2_fma_32;
+        uint32_t _bf16x2_fma_33;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_33) : "r"(d1[0]), "r"(_prmt_81), "r"(2147516416u));
+        d1[0] = _bf16x2_fma_33;
+        uint32_t _bf16x2_fma_34;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_34) : "r"(d0[1]), "r"(_prmt_80), "r"(2147516416u));
+        d0[1] = _bf16x2_fma_34;
+        uint32_t _bf16x2_fma_35;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_35) : "r"(d1[1]), "r"(_prmt_81), "r"(2147516416u));
+        d1[1] = _bf16x2_fma_35;
         uint32_t _bf16x2_fma_36;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_36) : "r"(d0[0]), "r"(_prmt_80), "r"(2147516416u));
-        d0[0] = _bf16x2_fma_36;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_36) : "r"(d0[2]), "r"(_prmt_80), "r"(2147516416u));
+        d0[2] = _bf16x2_fma_36;
         uint32_t _bf16x2_fma_37;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_37) : "r"(d1[0]), "r"(_prmt_81), "r"(2147516416u));
-        d1[0] = _bf16x2_fma_37;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_37) : "r"(d1[2]), "r"(_prmt_81), "r"(2147516416u));
+        d1[2] = _bf16x2_fma_37;
         uint32_t _bf16x2_fma_38;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_38) : "r"(d0[1]), "r"(_prmt_80), "r"(2147516416u));
-        d0[1] = _bf16x2_fma_38;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_38) : "r"(d0[3]), "r"(_prmt_80), "r"(2147516416u));
+        d0[3] = _bf16x2_fma_38;
         uint32_t _bf16x2_fma_39;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_39) : "r"(d1[1]), "r"(_prmt_81), "r"(2147516416u));
-        d1[1] = _bf16x2_fma_39;
-        uint32_t _bf16x2_fma_40;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_40) : "r"(d0[2]), "r"(_prmt_80), "r"(2147516416u));
-        d0[2] = _bf16x2_fma_40;
-        uint32_t _bf16x2_fma_41;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_41) : "r"(d1[2]), "r"(_prmt_81), "r"(2147516416u));
-        d1[2] = _bf16x2_fma_41;
-        uint32_t _bf16x2_fma_42;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_42) : "r"(d0[3]), "r"(_prmt_80), "r"(2147516416u));
-        d0[3] = _bf16x2_fma_42;
-        uint32_t _bf16x2_fma_43;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_43) : "r"(d1[3]), "r"(_prmt_81), "r"(2147516416u));
-        d1[3] = _bf16x2_fma_43;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_39) : "r"(d1[3]), "r"(_prmt_81), "r"(2147516416u));
+        d1[3] = _bf16x2_fma_39;
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&a_frag[0])), "=r"(*reinterpret_cast<uint32_t*>(&a_frag[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&a_frag[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&a_frag[(0) + 3]))
             : "r"(q_frag_addr + (unsigned int)(16 * (256 + lane_1))));
@@ -1318,13 +1488,29 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         uint32_t _prmt_82;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_82) : "r"(raw0[1] & 2004318071), "r"(raw0[1] & 2004318071));
         uint32_t _prmt_83;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_83) : "r"(1061109504), "r"(1077952576), "r"(raw0[1] & 2004318071));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_83) : "r"(lut_regs[0]), "r"(2088533116), "r"(raw0[1] & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_83) : "r"(2071689984), "r"(2088533116), "r"(raw0[1] & 2004318071));
+#endif
         uint32_t _prmt_84;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_84) : "r"(1061109504), "r"(1077952576), "r"(_prmt_82));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_84) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_82));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_84) : "r"(2071689984), "r"(2088533116), "r"(_prmt_82));
+#endif
         uint32_t _prmt_85;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_85) : "r"(lut_regs[1]), "r"(3229630464u), "r"(raw0[1] & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_85) : "r"(3229614080u), "r"(3229630464u), "r"(raw0[1] & 2004318071));
+#endif
         uint32_t _prmt_86;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_86) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_82));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_86) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_82));
+#endif
         uint32_t _prmt_87;
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_87) : "r"(raw0[1] << 4), "r"(raw0[1]));
         uint32_t _prmt_88;
@@ -1344,13 +1530,29 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         uint32_t _prmt_89;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_89) : "r"(raw1[1] & 2004318071), "r"(raw1[1] & 2004318071));
         uint32_t _prmt_90;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_90) : "r"(1061109504), "r"(1077952576), "r"(raw1[1] & 2004318071));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_90) : "r"(lut_regs[0]), "r"(2088533116), "r"(raw1[1] & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_90) : "r"(2071689984), "r"(2088533116), "r"(raw1[1] & 2004318071));
+#endif
         uint32_t _prmt_91;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_91) : "r"(1061109504), "r"(1077952576), "r"(_prmt_89));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_91) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_89));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_91) : "r"(2071689984), "r"(2088533116), "r"(_prmt_89));
+#endif
         uint32_t _prmt_92;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_92) : "r"(lut_regs[1]), "r"(3229630464u), "r"(raw1[1] & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_92) : "r"(3229614080u), "r"(3229630464u), "r"(raw1[1] & 2004318071));
+#endif
         uint32_t _prmt_93;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_93) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_89));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_93) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_89));
+#endif
         uint32_t _prmt_94;
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_94) : "r"(raw1[1] << 4), "r"(raw1[1]));
         uint32_t _prmt_95;
@@ -1371,30 +1573,30 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         asm("prmt.b32 %0, %1, %2, 0x1010;" : "=r"(_prmt_96) : "r"(sf0[1]), "r"(0));
         uint32_t _prmt_97;
         asm("prmt.b32 %0, %1, %2, 0x1010;" : "=r"(_prmt_97) : "r"(sf1[1]), "r"(0));
+        uint32_t _bf16x2_fma_40;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_40) : "r"(d0[0]), "r"(_prmt_96), "r"(2147516416u));
+        d0[0] = _bf16x2_fma_40;
+        uint32_t _bf16x2_fma_41;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_41) : "r"(d1[0]), "r"(_prmt_97), "r"(2147516416u));
+        d1[0] = _bf16x2_fma_41;
+        uint32_t _bf16x2_fma_42;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_42) : "r"(d0[1]), "r"(_prmt_96), "r"(2147516416u));
+        d0[1] = _bf16x2_fma_42;
+        uint32_t _bf16x2_fma_43;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_43) : "r"(d1[1]), "r"(_prmt_97), "r"(2147516416u));
+        d1[1] = _bf16x2_fma_43;
         uint32_t _bf16x2_fma_44;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_44) : "r"(d0[0]), "r"(_prmt_96), "r"(2147516416u));
-        d0[0] = _bf16x2_fma_44;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_44) : "r"(d0[2]), "r"(_prmt_96), "r"(2147516416u));
+        d0[2] = _bf16x2_fma_44;
         uint32_t _bf16x2_fma_45;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_45) : "r"(d1[0]), "r"(_prmt_97), "r"(2147516416u));
-        d1[0] = _bf16x2_fma_45;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_45) : "r"(d1[2]), "r"(_prmt_97), "r"(2147516416u));
+        d1[2] = _bf16x2_fma_45;
         uint32_t _bf16x2_fma_46;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_46) : "r"(d0[1]), "r"(_prmt_96), "r"(2147516416u));
-        d0[1] = _bf16x2_fma_46;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_46) : "r"(d0[3]), "r"(_prmt_96), "r"(2147516416u));
+        d0[3] = _bf16x2_fma_46;
         uint32_t _bf16x2_fma_47;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_47) : "r"(d1[1]), "r"(_prmt_97), "r"(2147516416u));
-        d1[1] = _bf16x2_fma_47;
-        uint32_t _bf16x2_fma_48;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_48) : "r"(d0[2]), "r"(_prmt_96), "r"(2147516416u));
-        d0[2] = _bf16x2_fma_48;
-        uint32_t _bf16x2_fma_49;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_49) : "r"(d1[2]), "r"(_prmt_97), "r"(2147516416u));
-        d1[2] = _bf16x2_fma_49;
-        uint32_t _bf16x2_fma_50;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_50) : "r"(d0[3]), "r"(_prmt_96), "r"(2147516416u));
-        d0[3] = _bf16x2_fma_50;
-        uint32_t _bf16x2_fma_51;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_51) : "r"(d1[3]), "r"(_prmt_97), "r"(2147516416u));
-        d1[3] = _bf16x2_fma_51;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_47) : "r"(d1[3]), "r"(_prmt_97), "r"(2147516416u));
+        d1[3] = _bf16x2_fma_47;
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&a_frag[0])), "=r"(*reinterpret_cast<uint32_t*>(&a_frag[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&a_frag[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&a_frag[(0) + 3]))
             : "r"(q_frag_addr + (unsigned int)(16 * (320 + lane_1))));
@@ -1424,13 +1626,29 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         uint32_t _prmt_98;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_98) : "r"(raw0[2] & 2004318071), "r"(raw0[2] & 2004318071));
         uint32_t _prmt_99;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_99) : "r"(1061109504), "r"(1077952576), "r"(raw0[2] & 2004318071));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_99) : "r"(lut_regs[0]), "r"(2088533116), "r"(raw0[2] & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_99) : "r"(2071689984), "r"(2088533116), "r"(raw0[2] & 2004318071));
+#endif
         uint32_t _prmt_100;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_100) : "r"(1061109504), "r"(1077952576), "r"(_prmt_98));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_100) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_98));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_100) : "r"(2071689984), "r"(2088533116), "r"(_prmt_98));
+#endif
         uint32_t _prmt_101;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_101) : "r"(lut_regs[1]), "r"(3229630464u), "r"(raw0[2] & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_101) : "r"(3229614080u), "r"(3229630464u), "r"(raw0[2] & 2004318071));
+#endif
         uint32_t _prmt_102;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_102) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_98));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_102) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_98));
+#endif
         uint32_t _prmt_103;
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_103) : "r"(raw0[2] << 4), "r"(raw0[2]));
         uint32_t _prmt_104;
@@ -1450,13 +1668,29 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         uint32_t _prmt_105;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_105) : "r"(raw1[2] & 2004318071), "r"(raw1[2] & 2004318071));
         uint32_t _prmt_106;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_106) : "r"(1061109504), "r"(1077952576), "r"(raw1[2] & 2004318071));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_106) : "r"(lut_regs[0]), "r"(2088533116), "r"(raw1[2] & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_106) : "r"(2071689984), "r"(2088533116), "r"(raw1[2] & 2004318071));
+#endif
         uint32_t _prmt_107;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_107) : "r"(1061109504), "r"(1077952576), "r"(_prmt_105));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_107) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_105));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_107) : "r"(2071689984), "r"(2088533116), "r"(_prmt_105));
+#endif
         uint32_t _prmt_108;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_108) : "r"(lut_regs[1]), "r"(3229630464u), "r"(raw1[2] & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_108) : "r"(3229614080u), "r"(3229630464u), "r"(raw1[2] & 2004318071));
+#endif
         uint32_t _prmt_109;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_109) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_105));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_109) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_105));
+#endif
         uint32_t _prmt_110;
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_110) : "r"(raw1[2] << 4), "r"(raw1[2]));
         uint32_t _prmt_111;
@@ -1477,30 +1711,30 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_112) : "r"(sf0[1]), "r"(0));
         uint32_t _prmt_113;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_113) : "r"(sf1[1]), "r"(0));
+        uint32_t _bf16x2_fma_48;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_48) : "r"(d0[0]), "r"(_prmt_112), "r"(2147516416u));
+        d0[0] = _bf16x2_fma_48;
+        uint32_t _bf16x2_fma_49;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_49) : "r"(d1[0]), "r"(_prmt_113), "r"(2147516416u));
+        d1[0] = _bf16x2_fma_49;
+        uint32_t _bf16x2_fma_50;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_50) : "r"(d0[1]), "r"(_prmt_112), "r"(2147516416u));
+        d0[1] = _bf16x2_fma_50;
+        uint32_t _bf16x2_fma_51;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_51) : "r"(d1[1]), "r"(_prmt_113), "r"(2147516416u));
+        d1[1] = _bf16x2_fma_51;
         uint32_t _bf16x2_fma_52;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_52) : "r"(d0[0]), "r"(_prmt_112), "r"(2147516416u));
-        d0[0] = _bf16x2_fma_52;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_52) : "r"(d0[2]), "r"(_prmt_112), "r"(2147516416u));
+        d0[2] = _bf16x2_fma_52;
         uint32_t _bf16x2_fma_53;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_53) : "r"(d1[0]), "r"(_prmt_113), "r"(2147516416u));
-        d1[0] = _bf16x2_fma_53;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_53) : "r"(d1[2]), "r"(_prmt_113), "r"(2147516416u));
+        d1[2] = _bf16x2_fma_53;
         uint32_t _bf16x2_fma_54;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_54) : "r"(d0[1]), "r"(_prmt_112), "r"(2147516416u));
-        d0[1] = _bf16x2_fma_54;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_54) : "r"(d0[3]), "r"(_prmt_112), "r"(2147516416u));
+        d0[3] = _bf16x2_fma_54;
         uint32_t _bf16x2_fma_55;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_55) : "r"(d1[1]), "r"(_prmt_113), "r"(2147516416u));
-        d1[1] = _bf16x2_fma_55;
-        uint32_t _bf16x2_fma_56;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_56) : "r"(d0[2]), "r"(_prmt_112), "r"(2147516416u));
-        d0[2] = _bf16x2_fma_56;
-        uint32_t _bf16x2_fma_57;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_57) : "r"(d1[2]), "r"(_prmt_113), "r"(2147516416u));
-        d1[2] = _bf16x2_fma_57;
-        uint32_t _bf16x2_fma_58;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_58) : "r"(d0[3]), "r"(_prmt_112), "r"(2147516416u));
-        d0[3] = _bf16x2_fma_58;
-        uint32_t _bf16x2_fma_59;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_59) : "r"(d1[3]), "r"(_prmt_113), "r"(2147516416u));
-        d1[3] = _bf16x2_fma_59;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_55) : "r"(d1[3]), "r"(_prmt_113), "r"(2147516416u));
+        d1[3] = _bf16x2_fma_55;
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&a_frag[0])), "=r"(*reinterpret_cast<uint32_t*>(&a_frag[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&a_frag[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&a_frag[(0) + 3]))
             : "r"(q_frag_addr + (unsigned int)(16 * (384 + lane_1))));
@@ -1530,13 +1764,29 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         uint32_t _prmt_114;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_114) : "r"(raw0[3] & 2004318071), "r"(raw0[3] & 2004318071));
         uint32_t _prmt_115;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_115) : "r"(1061109504), "r"(1077952576), "r"(raw0[3] & 2004318071));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_115) : "r"(lut_regs[0]), "r"(2088533116), "r"(raw0[3] & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_115) : "r"(2071689984), "r"(2088533116), "r"(raw0[3] & 2004318071));
+#endif
         uint32_t _prmt_116;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_116) : "r"(1061109504), "r"(1077952576), "r"(_prmt_114));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_116) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_114));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_116) : "r"(2071689984), "r"(2088533116), "r"(_prmt_114));
+#endif
         uint32_t _prmt_117;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_117) : "r"(lut_regs[1]), "r"(3229630464u), "r"(raw0[3] & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_117) : "r"(3229614080u), "r"(3229630464u), "r"(raw0[3] & 2004318071));
+#endif
         uint32_t _prmt_118;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_118) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_114));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_118) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_114));
+#endif
         uint32_t _prmt_119;
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_119) : "r"(raw0[3] << 4), "r"(raw0[3]));
         uint32_t _prmt_120;
@@ -1556,13 +1806,29 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         uint32_t _prmt_121;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_121) : "r"(raw1[3] & 2004318071), "r"(raw1[3] & 2004318071));
         uint32_t _prmt_122;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_122) : "r"(1061109504), "r"(1077952576), "r"(raw1[3] & 2004318071));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_122) : "r"(lut_regs[0]), "r"(2088533116), "r"(raw1[3] & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_122) : "r"(2071689984), "r"(2088533116), "r"(raw1[3] & 2004318071));
+#endif
         uint32_t _prmt_123;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_123) : "r"(1061109504), "r"(1077952576), "r"(_prmt_121));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_123) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_121));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_123) : "r"(2071689984), "r"(2088533116), "r"(_prmt_121));
+#endif
         uint32_t _prmt_124;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_124) : "r"(lut_regs[1]), "r"(3229630464u), "r"(raw1[3] & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_124) : "r"(3229614080u), "r"(3229630464u), "r"(raw1[3] & 2004318071));
+#endif
         uint32_t _prmt_125;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_125) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_121));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_125) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_121));
+#endif
         uint32_t _prmt_126;
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_126) : "r"(raw1[3] << 4), "r"(raw1[3]));
         uint32_t _prmt_127;
@@ -1583,30 +1849,30 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_128) : "r"(sf0[1]), "r"(0));
         uint32_t _prmt_129;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_129) : "r"(sf1[1]), "r"(0));
+        uint32_t _bf16x2_fma_56;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_56) : "r"(d0[0]), "r"(_prmt_128), "r"(2147516416u));
+        d0[0] = _bf16x2_fma_56;
+        uint32_t _bf16x2_fma_57;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_57) : "r"(d1[0]), "r"(_prmt_129), "r"(2147516416u));
+        d1[0] = _bf16x2_fma_57;
+        uint32_t _bf16x2_fma_58;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_58) : "r"(d0[1]), "r"(_prmt_128), "r"(2147516416u));
+        d0[1] = _bf16x2_fma_58;
+        uint32_t _bf16x2_fma_59;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_59) : "r"(d1[1]), "r"(_prmt_129), "r"(2147516416u));
+        d1[1] = _bf16x2_fma_59;
         uint32_t _bf16x2_fma_60;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_60) : "r"(d0[0]), "r"(_prmt_128), "r"(2147516416u));
-        d0[0] = _bf16x2_fma_60;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_60) : "r"(d0[2]), "r"(_prmt_128), "r"(2147516416u));
+        d0[2] = _bf16x2_fma_60;
         uint32_t _bf16x2_fma_61;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_61) : "r"(d1[0]), "r"(_prmt_129), "r"(2147516416u));
-        d1[0] = _bf16x2_fma_61;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_61) : "r"(d1[2]), "r"(_prmt_129), "r"(2147516416u));
+        d1[2] = _bf16x2_fma_61;
         uint32_t _bf16x2_fma_62;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_62) : "r"(d0[1]), "r"(_prmt_128), "r"(2147516416u));
-        d0[1] = _bf16x2_fma_62;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_62) : "r"(d0[3]), "r"(_prmt_128), "r"(2147516416u));
+        d0[3] = _bf16x2_fma_62;
         uint32_t _bf16x2_fma_63;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_63) : "r"(d1[1]), "r"(_prmt_129), "r"(2147516416u));
-        d1[1] = _bf16x2_fma_63;
-        uint32_t _bf16x2_fma_64;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_64) : "r"(d0[2]), "r"(_prmt_128), "r"(2147516416u));
-        d0[2] = _bf16x2_fma_64;
-        uint32_t _bf16x2_fma_65;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_65) : "r"(d1[2]), "r"(_prmt_129), "r"(2147516416u));
-        d1[2] = _bf16x2_fma_65;
-        uint32_t _bf16x2_fma_66;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_66) : "r"(d0[3]), "r"(_prmt_128), "r"(2147516416u));
-        d0[3] = _bf16x2_fma_66;
-        uint32_t _bf16x2_fma_67;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_67) : "r"(d1[3]), "r"(_prmt_129), "r"(2147516416u));
-        d1[3] = _bf16x2_fma_67;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_63) : "r"(d1[3]), "r"(_prmt_129), "r"(2147516416u));
+        d1[3] = _bf16x2_fma_63;
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&a_frag[0])), "=r"(*reinterpret_cast<uint32_t*>(&a_frag[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&a_frag[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&a_frag[(0) + 3]))
             : "r"(q_frag_addr + (unsigned int)(16 * (448 + lane_1))));
@@ -1801,191 +2067,392 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&p_a[0])), "=r"(*reinterpret_cast<uint32_t*>(&p_a[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_a[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_a[(0) + 3]))
             : "r"(p_frag_addr + (unsigned int)(16 * lane_1)));
+#if __CUDA_ARCH__ == 900
+#else
         unsigned int sf_packed = 0;
+#endif
         int v_row = v_stage + 2 * t * 144;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&vw[0])) : "r"(kv_addr + (unsigned int)(v_row + v_col)));
         unsigned int scale_byte = (unsigned int)kv_u8[v_row + v_scale_col];
+#if __CUDA_ARCH__ == 900
+#else
         sf_packed = sf_packed | scale_byte;
+#endif
         int v_row_3 = v_stage + (2 * t + 1) * 144;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&vw[1])) : "r"(kv_addr + (unsigned int)(v_row_3 + v_col)));
         unsigned int scale_byte_4 = (unsigned int)kv_u8[v_row_3 + v_scale_col];
+#if __CUDA_ARCH__ == 900
+#else
         sf_packed = sf_packed | scale_byte_4 << 8;
+#endif
         int v_row_5 = v_stage + (2 * t + 8) * 144;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&vw[2])) : "r"(kv_addr + (unsigned int)(v_row_5 + v_col)));
         unsigned int scale_byte_6 = (unsigned int)kv_u8[v_row_5 + v_scale_col];
+#if __CUDA_ARCH__ == 900
+#else
         sf_packed = sf_packed | scale_byte_6 << 16;
+#endif
         int v_row_7 = v_stage + (2 * t + 1 + 8) * 144;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&vw[3])) : "r"(kv_addr + (unsigned int)(v_row_7 + v_col)));
         unsigned int scale_byte_8 = (unsigned int)kv_u8[v_row_7 + v_scale_col];
+#if __CUDA_ARCH__ == 900
+#else
         sf_packed = sf_packed | scale_byte_8 << 24;
+#endif
         uint32_t _prmt_130;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x4501;" : "=r"(_prmt_130) : "r"(scale_byte), "r"(scale_byte_4));
+#else
         asm("prmt.b32 %0, %1, %2, 0x1302;" : "=r"(_prmt_130) : "r"(sf_packed), "r"(sf_packed));
-        uint32_t _bf16x2_fma_68;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_68) : "r"(_prmt_130 & 2147516416u | (_prmt_130 & 2130738944) >> 4), "r"(2072017792), "r"(2147516416u));
-        sfv[0] = _bf16x2_fma_68;
-        uint32_t _bf16x2_fma_69;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_69) : "r"(_prmt_130 << 8 & 2147516416u | (_prmt_130 << 8 & 2130738944) >> 4), "r"(2072017792), "r"(2147516416u));
-        sfv[1] = _bf16x2_fma_69;
+#endif
+        sfv[0] = _prmt_130 & 2147516416u | (_prmt_130 & 2130738944) >> 4;
+#if __CUDA_ARCH__ == 900
+        uint32_t _prmt_131;
+        asm("prmt.b32 %0, %1, %2, 0x4501;" : "=r"(_prmt_131) : "r"(scale_byte_6), "r"(scale_byte_8));
+        sfv[1] = _prmt_131 & 2147516416u | (_prmt_131 & 2130738944) >> 4;
+#else
+        sfv[1] = _prmt_130 << 8 & 2147516416u | (_prmt_130 << 8 & 2130738944) >> 4;
+#endif
         uint32_t w_lo;
         asm("prmt.b32 %0, %1, %2, 0x5140;" : "=r"(w_lo) : "r"(vw[0]), "r"(vw[1]));
         uint32_t w_hi;
         asm("prmt.b32 %0, %1, %2, 0x7362;" : "=r"(w_hi) : "r"(vw[0]), "r"(vw[1]));
+#if __CUDA_ARCH__ == 900
+#else
         uint32_t _prmt_131;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_131) : "r"(w_lo & 2004318071), "r"(w_lo & 2004318071));
+#endif
         uint32_t _prmt_132;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_132) : "r"(1061109504), "r"(1077952576), "r"(w_lo & 2004318071));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_132) : "r"(w_lo & 2004318071), "r"(w_lo & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_132) : "r"(2071689984), "r"(2088533116), "r"(w_lo & 2004318071));
+#endif
         uint32_t _prmt_133;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_133) : "r"(1061109504), "r"(1077952576), "r"(_prmt_131));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_133) : "r"(lut_regs[0]), "r"(2088533116), "r"(w_lo & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_133) : "r"(2071689984), "r"(2088533116), "r"(_prmt_131));
+#endif
         uint32_t _prmt_134;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_134) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_132));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_134) : "r"(3229614080u), "r"(3229630464u), "r"(w_lo & 2004318071));
+#endif
         uint32_t _prmt_135;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_135) : "r"(lut_regs[1]), "r"(3229630464u), "r"(w_lo & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_135) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_131));
+#endif
         uint32_t _prmt_136;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_136) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_132));
+#else
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_136) : "r"(w_lo << 4), "r"(w_lo));
+#endif
         uint32_t _prmt_137;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_137) : "r"(w_lo << 4), "r"(w_lo));
+        uint32_t _prmt_138;
+        asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_138) : "r"(w_lo << 4), "r"(w_lo));
+#else
         asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_137) : "r"(w_lo << 4), "r"(w_lo));
+#endif
         uint32_t _prmt_103_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_103_1) : "r"(_prmt_135), "r"(_prmt_133 | _prmt_137 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_103_1) : "r"(_prmt_134), "r"(_prmt_132 | _prmt_136 & 2155905152u));
+#endif
         dp_lo[0] = _prmt_103_1;
         uint32_t _prmt_104_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_104_1) : "r"(_prmt_135), "r"(_prmt_133 | _prmt_137 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_104_1) : "r"(_prmt_134), "r"(_prmt_132 | _prmt_136 & 2155905152u));
+#endif
         dp_lo[1] = _prmt_104_1;
         uint32_t _prmt_105_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_105_1) : "r"(_prmt_136), "r"(_prmt_134 | _prmt_138 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_105_1) : "r"(_prmt_135), "r"(_prmt_133 | _prmt_137 & 2155905152u));
+#endif
         dp_lo[2] = _prmt_105_1;
         uint32_t _prmt_106_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_106_1) : "r"(_prmt_136), "r"(_prmt_134 | _prmt_138 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_106_1) : "r"(_prmt_135), "r"(_prmt_133 | _prmt_137 & 2155905152u));
+#endif
         dp_lo[3] = _prmt_106_1;
+#if __CUDA_ARCH__ == 900
+#else
         uint32_t _prmt_138;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_138) : "r"(w_hi & 2004318071), "r"(w_hi & 2004318071));
+#endif
         uint32_t _prmt_139;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_139) : "r"(1061109504), "r"(1077952576), "r"(w_hi & 2004318071));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_139) : "r"(w_hi & 2004318071), "r"(w_hi & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_139) : "r"(2071689984), "r"(2088533116), "r"(w_hi & 2004318071));
+#endif
         uint32_t _prmt_140;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_140) : "r"(1061109504), "r"(1077952576), "r"(_prmt_138));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_140) : "r"(lut_regs[0]), "r"(2088533116), "r"(w_hi & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_140) : "r"(2071689984), "r"(2088533116), "r"(_prmt_138));
+#endif
         uint32_t _prmt_141;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_141) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_139));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_141) : "r"(3229614080u), "r"(3229630464u), "r"(w_hi & 2004318071));
+#endif
         uint32_t _prmt_142;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_142) : "r"(lut_regs[1]), "r"(3229630464u), "r"(w_hi & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_142) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_138));
+#endif
         uint32_t _prmt_143;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_143) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_139));
+#else
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_143) : "r"(w_hi << 4), "r"(w_hi));
+#endif
         uint32_t _prmt_144;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_144) : "r"(w_hi << 4), "r"(w_hi));
+        uint32_t _prmt_145;
+        asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_145) : "r"(w_hi << 4), "r"(w_hi));
+#else
         asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_144) : "r"(w_hi << 4), "r"(w_hi));
+#endif
         uint32_t _prmt_107_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_107_1) : "r"(_prmt_142), "r"(_prmt_140 | _prmt_144 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_107_1) : "r"(_prmt_141), "r"(_prmt_139 | _prmt_143 & 2155905152u));
+#endif
         dp_hi[0] = _prmt_107_1;
         uint32_t _prmt_108_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_108_1) : "r"(_prmt_142), "r"(_prmt_140 | _prmt_144 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_108_1) : "r"(_prmt_141), "r"(_prmt_139 | _prmt_143 & 2155905152u));
+#endif
         dp_hi[1] = _prmt_108_1;
         uint32_t _prmt_109_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_109_1) : "r"(_prmt_143), "r"(_prmt_141 | _prmt_145 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_109_1) : "r"(_prmt_142), "r"(_prmt_140 | _prmt_144 & 2155905152u));
+#endif
         dp_hi[2] = _prmt_109_1;
         uint32_t _prmt_110_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_110_1) : "r"(_prmt_143), "r"(_prmt_141 | _prmt_145 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_110_1) : "r"(_prmt_142), "r"(_prmt_140 | _prmt_144 & 2155905152u));
+#endif
         dp_hi[3] = _prmt_110_1;
+        uint32_t _bf16x2_fma_64;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_64) : "r"(dp_lo[0]), "r"(sfv[0]), "r"(2147516416u));
+        dp_lo[0] = _bf16x2_fma_64;
+        uint32_t _bf16x2_fma_65;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_65) : "r"(dp_hi[0]), "r"(sfv[0]), "r"(2147516416u));
+        dp_hi[0] = _bf16x2_fma_65;
+        uint32_t _bf16x2_fma_66;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_66) : "r"(dp_lo[1]), "r"(sfv[0]), "r"(2147516416u));
+        dp_lo[1] = _bf16x2_fma_66;
+        uint32_t _bf16x2_fma_67;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_67) : "r"(dp_hi[1]), "r"(sfv[0]), "r"(2147516416u));
+        dp_hi[1] = _bf16x2_fma_67;
+        uint32_t _bf16x2_fma_68;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_68) : "r"(dp_lo[2]), "r"(sfv[0]), "r"(2147516416u));
+        dp_lo[2] = _bf16x2_fma_68;
+        uint32_t _bf16x2_fma_69;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_69) : "r"(dp_hi[2]), "r"(sfv[0]), "r"(2147516416u));
+        dp_hi[2] = _bf16x2_fma_69;
         uint32_t _bf16x2_fma_70;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_70) : "r"(dp_lo[0]), "r"(sfv[0]), "r"(2147516416u));
-        dp_lo[0] = _bf16x2_fma_70;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_70) : "r"(dp_lo[3]), "r"(sfv[0]), "r"(2147516416u));
+        dp_lo[3] = _bf16x2_fma_70;
         uint32_t _bf16x2_fma_71;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_71) : "r"(dp_hi[0]), "r"(sfv[0]), "r"(2147516416u));
-        dp_hi[0] = _bf16x2_fma_71;
-        uint32_t _bf16x2_fma_72;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_72) : "r"(dp_lo[1]), "r"(sfv[0]), "r"(2147516416u));
-        dp_lo[1] = _bf16x2_fma_72;
-        uint32_t _bf16x2_fma_73;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_73) : "r"(dp_hi[1]), "r"(sfv[0]), "r"(2147516416u));
-        dp_hi[1] = _bf16x2_fma_73;
-        uint32_t _bf16x2_fma_74;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_74) : "r"(dp_lo[2]), "r"(sfv[0]), "r"(2147516416u));
-        dp_lo[2] = _bf16x2_fma_74;
-        uint32_t _bf16x2_fma_75;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_75) : "r"(dp_hi[2]), "r"(sfv[0]), "r"(2147516416u));
-        dp_hi[2] = _bf16x2_fma_75;
-        uint32_t _bf16x2_fma_76;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_76) : "r"(dp_lo[3]), "r"(sfv[0]), "r"(2147516416u));
-        dp_lo[3] = _bf16x2_fma_76;
-        uint32_t _bf16x2_fma_77;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_77) : "r"(dp_hi[3]), "r"(sfv[0]), "r"(2147516416u));
-        dp_hi[3] = _bf16x2_fma_77;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_71) : "r"(dp_hi[3]), "r"(sfv[0]), "r"(2147516416u));
+        dp_hi[3] = _bf16x2_fma_71;
         uint32_t w_lo_9;
         asm("prmt.b32 %0, %1, %2, 0x5140;" : "=r"(w_lo_9) : "r"(vw[2]), "r"(vw[3]));
         uint32_t w_hi_10;
         asm("prmt.b32 %0, %1, %2, 0x7362;" : "=r"(w_hi_10) : "r"(vw[2]), "r"(vw[3]));
+#if __CUDA_ARCH__ == 900
+#else
         uint32_t _prmt_145;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_145) : "r"(w_lo_9 & 2004318071), "r"(w_lo_9 & 2004318071));
+#endif
         uint32_t _prmt_146;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_146) : "r"(1061109504), "r"(1077952576), "r"(w_lo_9 & 2004318071));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_146) : "r"(w_lo_9 & 2004318071), "r"(w_lo_9 & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_146) : "r"(2071689984), "r"(2088533116), "r"(w_lo_9 & 2004318071));
+#endif
         uint32_t _prmt_147;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_147) : "r"(1061109504), "r"(1077952576), "r"(_prmt_145));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_147) : "r"(lut_regs[0]), "r"(2088533116), "r"(w_lo_9 & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_147) : "r"(2071689984), "r"(2088533116), "r"(_prmt_145));
+#endif
         uint32_t _prmt_148;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_148) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_146));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_148) : "r"(3229614080u), "r"(3229630464u), "r"(w_lo_9 & 2004318071));
+#endif
         uint32_t _prmt_149;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_149) : "r"(lut_regs[1]), "r"(3229630464u), "r"(w_lo_9 & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_149) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_145));
+#endif
         uint32_t _prmt_150;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_150) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_146));
+#else
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_150) : "r"(w_lo_9 << 4), "r"(w_lo_9));
+#endif
         uint32_t _prmt_151;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_151) : "r"(w_lo_9 << 4), "r"(w_lo_9));
+        uint32_t _prmt_152;
+        asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_152) : "r"(w_lo_9 << 4), "r"(w_lo_9));
+#else
         asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_151) : "r"(w_lo_9 << 4), "r"(w_lo_9));
+#endif
         uint32_t _prmt_111_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_111_1) : "r"(_prmt_149), "r"(_prmt_147 | _prmt_151 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_111_1) : "r"(_prmt_148), "r"(_prmt_146 | _prmt_150 & 2155905152u));
+#endif
         dp_lo[4] = _prmt_111_1;
         uint32_t _prmt_112_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_112_1) : "r"(_prmt_149), "r"(_prmt_147 | _prmt_151 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_112_1) : "r"(_prmt_148), "r"(_prmt_146 | _prmt_150 & 2155905152u));
+#endif
         dp_lo[5] = _prmt_112_1;
         uint32_t _prmt_113_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_113_1) : "r"(_prmt_150), "r"(_prmt_148 | _prmt_152 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_113_1) : "r"(_prmt_149), "r"(_prmt_147 | _prmt_151 & 2155905152u));
+#endif
         dp_lo[6] = _prmt_113_1;
         uint32_t _prmt_114_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_114_1) : "r"(_prmt_150), "r"(_prmt_148 | _prmt_152 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_114_1) : "r"(_prmt_149), "r"(_prmt_147 | _prmt_151 & 2155905152u));
+#endif
         dp_lo[7] = _prmt_114_1;
+#if __CUDA_ARCH__ == 900
+#else
         uint32_t _prmt_152;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_152) : "r"(w_hi_10 & 2004318071), "r"(w_hi_10 & 2004318071));
+#endif
         uint32_t _prmt_153;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_153) : "r"(1061109504), "r"(1077952576), "r"(w_hi_10 & 2004318071));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_153) : "r"(w_hi_10 & 2004318071), "r"(w_hi_10 & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_153) : "r"(2071689984), "r"(2088533116), "r"(w_hi_10 & 2004318071));
+#endif
         uint32_t _prmt_154;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_154) : "r"(1061109504), "r"(1077952576), "r"(_prmt_152));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_154) : "r"(lut_regs[0]), "r"(2088533116), "r"(w_hi_10 & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_154) : "r"(2071689984), "r"(2088533116), "r"(_prmt_152));
+#endif
         uint32_t _prmt_155;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_155) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_153));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_155) : "r"(3229614080u), "r"(3229630464u), "r"(w_hi_10 & 2004318071));
+#endif
         uint32_t _prmt_156;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_156) : "r"(lut_regs[1]), "r"(3229630464u), "r"(w_hi_10 & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_156) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_152));
+#endif
         uint32_t _prmt_157;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_157) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_153));
+#else
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_157) : "r"(w_hi_10 << 4), "r"(w_hi_10));
+#endif
         uint32_t _prmt_158;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_158) : "r"(w_hi_10 << 4), "r"(w_hi_10));
+        uint32_t _prmt_159;
+        asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_159) : "r"(w_hi_10 << 4), "r"(w_hi_10));
+#else
         asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_158) : "r"(w_hi_10 << 4), "r"(w_hi_10));
+#endif
         uint32_t _prmt_115_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_115_1) : "r"(_prmt_156), "r"(_prmt_154 | _prmt_158 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_115_1) : "r"(_prmt_155), "r"(_prmt_153 | _prmt_157 & 2155905152u));
+#endif
         dp_hi[4] = _prmt_115_1;
         uint32_t _prmt_116_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_116_1) : "r"(_prmt_156), "r"(_prmt_154 | _prmt_158 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_116_1) : "r"(_prmt_155), "r"(_prmt_153 | _prmt_157 & 2155905152u));
+#endif
         dp_hi[5] = _prmt_116_1;
         uint32_t _prmt_117_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_117_1) : "r"(_prmt_157), "r"(_prmt_155 | _prmt_159 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_117_1) : "r"(_prmt_156), "r"(_prmt_154 | _prmt_158 & 2155905152u));
+#endif
         dp_hi[6] = _prmt_117_1;
         uint32_t _prmt_118_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_118_1) : "r"(_prmt_157), "r"(_prmt_155 | _prmt_159 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_118_1) : "r"(_prmt_156), "r"(_prmt_154 | _prmt_158 & 2155905152u));
+#endif
         dp_hi[7] = _prmt_118_1;
+        uint32_t _bf16x2_fma_72;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_72) : "r"(dp_lo[4]), "r"(sfv[1]), "r"(2147516416u));
+        dp_lo[4] = _bf16x2_fma_72;
+        uint32_t _bf16x2_fma_73;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_73) : "r"(dp_hi[4]), "r"(sfv[1]), "r"(2147516416u));
+        dp_hi[4] = _bf16x2_fma_73;
+        uint32_t _bf16x2_fma_74;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_74) : "r"(dp_lo[5]), "r"(sfv[1]), "r"(2147516416u));
+        dp_lo[5] = _bf16x2_fma_74;
+        uint32_t _bf16x2_fma_75;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_75) : "r"(dp_hi[5]), "r"(sfv[1]), "r"(2147516416u));
+        dp_hi[5] = _bf16x2_fma_75;
+        uint32_t _bf16x2_fma_76;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_76) : "r"(dp_lo[6]), "r"(sfv[1]), "r"(2147516416u));
+        dp_lo[6] = _bf16x2_fma_76;
+        uint32_t _bf16x2_fma_77;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_77) : "r"(dp_hi[6]), "r"(sfv[1]), "r"(2147516416u));
+        dp_hi[6] = _bf16x2_fma_77;
         uint32_t _bf16x2_fma_78;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_78) : "r"(dp_lo[4]), "r"(sfv[1]), "r"(2147516416u));
-        dp_lo[4] = _bf16x2_fma_78;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_78) : "r"(dp_lo[7]), "r"(sfv[1]), "r"(2147516416u));
+        dp_lo[7] = _bf16x2_fma_78;
         uint32_t _bf16x2_fma_79;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_79) : "r"(dp_hi[4]), "r"(sfv[1]), "r"(2147516416u));
-        dp_hi[4] = _bf16x2_fma_79;
-        uint32_t _bf16x2_fma_80;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_80) : "r"(dp_lo[5]), "r"(sfv[1]), "r"(2147516416u));
-        dp_lo[5] = _bf16x2_fma_80;
-        uint32_t _bf16x2_fma_81;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_81) : "r"(dp_hi[5]), "r"(sfv[1]), "r"(2147516416u));
-        dp_hi[5] = _bf16x2_fma_81;
-        uint32_t _bf16x2_fma_82;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_82) : "r"(dp_lo[6]), "r"(sfv[1]), "r"(2147516416u));
-        dp_lo[6] = _bf16x2_fma_82;
-        uint32_t _bf16x2_fma_83;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_83) : "r"(dp_hi[6]), "r"(sfv[1]), "r"(2147516416u));
-        dp_hi[6] = _bf16x2_fma_83;
-        uint32_t _bf16x2_fma_84;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_84) : "r"(dp_lo[7]), "r"(sfv[1]), "r"(2147516416u));
-        dp_lo[7] = _bf16x2_fma_84;
-        uint32_t _bf16x2_fma_85;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_85) : "r"(dp_hi[7]), "r"(sfv[1]), "r"(2147516416u));
-        dp_hi[7] = _bf16x2_fma_85;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_79) : "r"(dp_hi[7]), "r"(sfv[1]), "r"(2147516416u));
+        dp_hi[7] = _bf16x2_fma_79;
         b_pair[0] = dp_lo[0];
         b_pair[1] = dp_lo[4];
         asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
@@ -2029,6 +2496,20 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&p_a[0])), "=r"(*reinterpret_cast<uint32_t*>(&p_a[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_a[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_a[(0) + 3]))
             : "r"(p_frag_addr + (unsigned int)(16 * (32 + lane_1))));
+#if __CUDA_ARCH__ == 900
+        int v_row_11 = v_stage + (16 + 2 * t) * 144;
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&vw[0])) : "r"(kv_addr + (unsigned int)(v_row_11 + v_col)));
+        unsigned int scale_byte_12 = (unsigned int)kv_u8[v_row_11 + v_scale_col];
+        int v_row_13 = v_stage + (16 + 2 * t + 1) * 144;
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&vw[1])) : "r"(kv_addr + (unsigned int)(v_row_13 + v_col)));
+        unsigned int scale_byte_14 = (unsigned int)kv_u8[v_row_13 + v_scale_col];
+        int v_row_15 = v_stage + (16 + 2 * t + 8) * 144;
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&vw[2])) : "r"(kv_addr + (unsigned int)(v_row_15 + v_col)));
+        unsigned int scale_byte_16 = (unsigned int)kv_u8[v_row_15 + v_scale_col];
+        int v_row_17 = v_stage + (16 + 2 * t + 1 + 8) * 144;
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&vw[3])) : "r"(kv_addr + (unsigned int)(v_row_17 + v_col)));
+        unsigned int scale_byte_18 = (unsigned int)kv_u8[v_row_17 + v_scale_col];
+#else
         unsigned int sf_packed_11 = 0;
         int v_row_12 = v_stage + (16 + 2 * t) * 144;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&vw[0])) : "r"(kv_addr + (unsigned int)(v_row_12 + v_col)));
@@ -2048,92 +2529,192 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         sf_packed_11 = sf_packed_11 | scale_byte_19 << 24;
         uint32_t _prmt_159;
         asm("prmt.b32 %0, %1, %2, 0x1302;" : "=r"(_prmt_159) : "r"(sf_packed_11), "r"(sf_packed_11));
-        uint32_t _bf16x2_fma_86;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_86) : "r"(_prmt_159 & 2147516416u | (_prmt_159 & 2130738944) >> 4), "r"(2072017792), "r"(2147516416u));
-        sfv[0] = _bf16x2_fma_86;
-        uint32_t _bf16x2_fma_87;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_87) : "r"(_prmt_159 << 8 & 2147516416u | (_prmt_159 << 8 & 2130738944) >> 4), "r"(2072017792), "r"(2147516416u));
-        sfv[1] = _bf16x2_fma_87;
+        sfv[0] = _prmt_159 & 2147516416u | (_prmt_159 & 2130738944) >> 4;
+        sfv[1] = _prmt_159 << 8 & 2147516416u | (_prmt_159 << 8 & 2130738944) >> 4;
         uint32_t w_lo_20;
         asm("prmt.b32 %0, %1, %2, 0x5140;" : "=r"(w_lo_20) : "r"(vw[0]), "r"(vw[1]));
         uint32_t w_hi_21;
         asm("prmt.b32 %0, %1, %2, 0x7362;" : "=r"(w_hi_21) : "r"(vw[0]), "r"(vw[1]));
+#endif
         uint32_t _prmt_160;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x4501;" : "=r"(_prmt_160) : "r"(scale_byte_12), "r"(scale_byte_14));
+        sfv[0] = _prmt_160 & 2147516416u | (_prmt_160 & 2130738944) >> 4;
+#else
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_160) : "r"(w_lo_20 & 2004318071), "r"(w_lo_20 & 2004318071));
+#endif
         uint32_t _prmt_161;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_161) : "r"(1061109504), "r"(1077952576), "r"(w_lo_20 & 2004318071));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x4501;" : "=r"(_prmt_161) : "r"(scale_byte_16), "r"(scale_byte_18));
+        sfv[1] = _prmt_161 & 2147516416u | (_prmt_161 & 2130738944) >> 4;
+        uint32_t w_lo_19;
+        asm("prmt.b32 %0, %1, %2, 0x5140;" : "=r"(w_lo_19) : "r"(vw[0]), "r"(vw[1]));
+        uint32_t w_hi_20;
+        asm("prmt.b32 %0, %1, %2, 0x7362;" : "=r"(w_hi_20) : "r"(vw[0]), "r"(vw[1]));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_161) : "r"(2071689984), "r"(2088533116), "r"(w_lo_20 & 2004318071));
+#endif
         uint32_t _prmt_162;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_162) : "r"(1061109504), "r"(1077952576), "r"(_prmt_160));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_162) : "r"(w_lo_19 & 2004318071), "r"(w_lo_19 & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_162) : "r"(2071689984), "r"(2088533116), "r"(_prmt_160));
+#endif
         uint32_t _prmt_163;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_163) : "r"(lut_regs[0]), "r"(2088533116), "r"(w_lo_19 & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_163) : "r"(3229614080u), "r"(3229630464u), "r"(w_lo_20 & 2004318071));
+#endif
         uint32_t _prmt_164;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_164) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_162));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_164) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_160));
+#endif
         uint32_t _prmt_165;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_165) : "r"(lut_regs[1]), "r"(3229630464u), "r"(w_lo_19 & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_165) : "r"(w_lo_20 << 4), "r"(w_lo_20));
+#endif
         uint32_t _prmt_166;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_166) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_162));
+        uint32_t _prmt_167;
+        asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_167) : "r"(w_lo_19 << 4), "r"(w_lo_19));
+        uint32_t _prmt_168;
+        asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_168) : "r"(w_lo_19 << 4), "r"(w_lo_19));
+#else
         asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_166) : "r"(w_lo_20 << 4), "r"(w_lo_20));
+#endif
         uint32_t _prmt_119_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_119_1) : "r"(_prmt_165), "r"(_prmt_163 | _prmt_167 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_119_1) : "r"(_prmt_163), "r"(_prmt_161 | _prmt_165 & 2155905152u));
+#endif
         dp_lo[0] = _prmt_119_1;
         uint32_t _prmt_120_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_120_1) : "r"(_prmt_165), "r"(_prmt_163 | _prmt_167 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_120_1) : "r"(_prmt_163), "r"(_prmt_161 | _prmt_165 & 2155905152u));
+#endif
         dp_lo[1] = _prmt_120_1;
         uint32_t _prmt_121_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_121_1) : "r"(_prmt_166), "r"(_prmt_164 | _prmt_168 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_121_1) : "r"(_prmt_164), "r"(_prmt_162 | _prmt_166 & 2155905152u));
+#endif
         dp_lo[2] = _prmt_121_1;
         uint32_t _prmt_122_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_122_1) : "r"(_prmt_166), "r"(_prmt_164 | _prmt_168 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_122_1) : "r"(_prmt_164), "r"(_prmt_162 | _prmt_166 & 2155905152u));
+#endif
         dp_lo[3] = _prmt_122_1;
+#if __CUDA_ARCH__ == 900
+#else
         uint32_t _prmt_167;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_167) : "r"(w_hi_21 & 2004318071), "r"(w_hi_21 & 2004318071));
         uint32_t _prmt_168;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_168) : "r"(1061109504), "r"(1077952576), "r"(w_hi_21 & 2004318071));
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_168) : "r"(2071689984), "r"(2088533116), "r"(w_hi_21 & 2004318071));
+#endif
         uint32_t _prmt_169;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_169) : "r"(1061109504), "r"(1077952576), "r"(_prmt_167));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_169) : "r"(w_hi_20 & 2004318071), "r"(w_hi_20 & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_169) : "r"(2071689984), "r"(2088533116), "r"(_prmt_167));
+#endif
         uint32_t _prmt_170;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_170) : "r"(lut_regs[0]), "r"(2088533116), "r"(w_hi_20 & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_170) : "r"(3229614080u), "r"(3229630464u), "r"(w_hi_21 & 2004318071));
+#endif
         uint32_t _prmt_171;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_171) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_169));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_171) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_167));
+#endif
         uint32_t _prmt_172;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_172) : "r"(lut_regs[1]), "r"(3229630464u), "r"(w_hi_20 & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_172) : "r"(w_hi_21 << 4), "r"(w_hi_21));
+#endif
         uint32_t _prmt_173;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_173) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_169));
+        uint32_t _prmt_174;
+        asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_174) : "r"(w_hi_20 << 4), "r"(w_hi_20));
+        uint32_t _prmt_175;
+        asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_175) : "r"(w_hi_20 << 4), "r"(w_hi_20));
+#else
         asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_173) : "r"(w_hi_21 << 4), "r"(w_hi_21));
+#endif
         uint32_t _prmt_123_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_123_1) : "r"(_prmt_172), "r"(_prmt_170 | _prmt_174 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_123_1) : "r"(_prmt_170), "r"(_prmt_168 | _prmt_172 & 2155905152u));
+#endif
         dp_hi[0] = _prmt_123_1;
         uint32_t _prmt_124_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_124_1) : "r"(_prmt_172), "r"(_prmt_170 | _prmt_174 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_124_1) : "r"(_prmt_170), "r"(_prmt_168 | _prmt_172 & 2155905152u));
+#endif
         dp_hi[1] = _prmt_124_1;
         uint32_t _prmt_125_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_125_1) : "r"(_prmt_173), "r"(_prmt_171 | _prmt_175 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_125_1) : "r"(_prmt_171), "r"(_prmt_169 | _prmt_173 & 2155905152u));
+#endif
         dp_hi[2] = _prmt_125_1;
         uint32_t _prmt_126_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_126_1) : "r"(_prmt_173), "r"(_prmt_171 | _prmt_175 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_126_1) : "r"(_prmt_171), "r"(_prmt_169 | _prmt_173 & 2155905152u));
+#endif
         dp_hi[3] = _prmt_126_1;
-        uint32_t _bf16x2_fma_88;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_88) : "r"(dp_lo[0]), "r"(sfv[0]), "r"(2147516416u));
-        dp_lo[0] = _bf16x2_fma_88;
-        uint32_t _bf16x2_fma_89;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_89) : "r"(dp_hi[0]), "r"(sfv[0]), "r"(2147516416u));
-        dp_hi[0] = _bf16x2_fma_89;
-        uint32_t _bf16x2_fma_90;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_90) : "r"(dp_lo[1]), "r"(sfv[0]), "r"(2147516416u));
-        dp_lo[1] = _bf16x2_fma_90;
-        uint32_t _bf16x2_fma_91;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_91) : "r"(dp_hi[1]), "r"(sfv[0]), "r"(2147516416u));
-        dp_hi[1] = _bf16x2_fma_91;
-        uint32_t _bf16x2_fma_92;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_92) : "r"(dp_lo[2]), "r"(sfv[0]), "r"(2147516416u));
-        dp_lo[2] = _bf16x2_fma_92;
-        uint32_t _bf16x2_fma_93;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_93) : "r"(dp_hi[2]), "r"(sfv[0]), "r"(2147516416u));
-        dp_hi[2] = _bf16x2_fma_93;
-        uint32_t _bf16x2_fma_94;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_94) : "r"(dp_lo[3]), "r"(sfv[0]), "r"(2147516416u));
-        dp_lo[3] = _bf16x2_fma_94;
-        uint32_t _bf16x2_fma_95;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_95) : "r"(dp_hi[3]), "r"(sfv[0]), "r"(2147516416u));
-        dp_hi[3] = _bf16x2_fma_95;
+        uint32_t _bf16x2_fma_80;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_80) : "r"(dp_lo[0]), "r"(sfv[0]), "r"(2147516416u));
+        dp_lo[0] = _bf16x2_fma_80;
+        uint32_t _bf16x2_fma_81;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_81) : "r"(dp_hi[0]), "r"(sfv[0]), "r"(2147516416u));
+        dp_hi[0] = _bf16x2_fma_81;
+        uint32_t _bf16x2_fma_82;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_82) : "r"(dp_lo[1]), "r"(sfv[0]), "r"(2147516416u));
+        dp_lo[1] = _bf16x2_fma_82;
+        uint32_t _bf16x2_fma_83;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_83) : "r"(dp_hi[1]), "r"(sfv[0]), "r"(2147516416u));
+        dp_hi[1] = _bf16x2_fma_83;
+        uint32_t _bf16x2_fma_84;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_84) : "r"(dp_lo[2]), "r"(sfv[0]), "r"(2147516416u));
+        dp_lo[2] = _bf16x2_fma_84;
+        uint32_t _bf16x2_fma_85;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_85) : "r"(dp_hi[2]), "r"(sfv[0]), "r"(2147516416u));
+        dp_hi[2] = _bf16x2_fma_85;
+        uint32_t _bf16x2_fma_86;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_86) : "r"(dp_lo[3]), "r"(sfv[0]), "r"(2147516416u));
+        dp_lo[3] = _bf16x2_fma_86;
+        uint32_t _bf16x2_fma_87;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_87) : "r"(dp_hi[3]), "r"(sfv[0]), "r"(2147516416u));
+        dp_hi[3] = _bf16x2_fma_87;
+#if __CUDA_ARCH__ == 900
+        uint32_t w_lo_21;
+        asm("prmt.b32 %0, %1, %2, 0x5140;" : "=r"(w_lo_21) : "r"(vw[2]), "r"(vw[3]));
+        uint32_t w_hi_22;
+        asm("prmt.b32 %0, %1, %2, 0x7362;" : "=r"(w_hi_22) : "r"(vw[2]), "r"(vw[3]));
+#else
         uint32_t w_lo_22;
         asm("prmt.b32 %0, %1, %2, 0x5140;" : "=r"(w_lo_22) : "r"(vw[2]), "r"(vw[3]));
         uint32_t w_hi_23;
@@ -2141,79 +2722,163 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         uint32_t _prmt_174;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_174) : "r"(w_lo_22 & 2004318071), "r"(w_lo_22 & 2004318071));
         uint32_t _prmt_175;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_175) : "r"(1061109504), "r"(1077952576), "r"(w_lo_22 & 2004318071));
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_175) : "r"(2071689984), "r"(2088533116), "r"(w_lo_22 & 2004318071));
+#endif
         uint32_t _prmt_176;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_176) : "r"(1061109504), "r"(1077952576), "r"(_prmt_174));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_176) : "r"(w_lo_21 & 2004318071), "r"(w_lo_21 & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_176) : "r"(2071689984), "r"(2088533116), "r"(_prmt_174));
+#endif
         uint32_t _prmt_177;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_177) : "r"(lut_regs[0]), "r"(2088533116), "r"(w_lo_21 & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_177) : "r"(3229614080u), "r"(3229630464u), "r"(w_lo_22 & 2004318071));
+#endif
         uint32_t _prmt_178;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_178) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_176));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_178) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_174));
+#endif
         uint32_t _prmt_179;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_179) : "r"(lut_regs[1]), "r"(3229630464u), "r"(w_lo_21 & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_179) : "r"(w_lo_22 << 4), "r"(w_lo_22));
+#endif
         uint32_t _prmt_180;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_180) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_176));
+        uint32_t _prmt_181;
+        asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_181) : "r"(w_lo_21 << 4), "r"(w_lo_21));
+        uint32_t _prmt_182;
+        asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_182) : "r"(w_lo_21 << 4), "r"(w_lo_21));
+#else
         asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_180) : "r"(w_lo_22 << 4), "r"(w_lo_22));
+#endif
         uint32_t _prmt_127_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_127_1) : "r"(_prmt_179), "r"(_prmt_177 | _prmt_181 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_127_1) : "r"(_prmt_177), "r"(_prmt_175 | _prmt_179 & 2155905152u));
+#endif
         dp_lo[4] = _prmt_127_1;
         uint32_t _prmt_128_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_128_1) : "r"(_prmt_179), "r"(_prmt_177 | _prmt_181 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_128_1) : "r"(_prmt_177), "r"(_prmt_175 | _prmt_179 & 2155905152u));
+#endif
         dp_lo[5] = _prmt_128_1;
         uint32_t _prmt_129_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_129_1) : "r"(_prmt_180), "r"(_prmt_178 | _prmt_182 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_129_1) : "r"(_prmt_178), "r"(_prmt_176 | _prmt_180 & 2155905152u));
+#endif
         dp_lo[6] = _prmt_129_1;
         uint32_t _prmt_130_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_130_1) : "r"(_prmt_180), "r"(_prmt_178 | _prmt_182 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_130_1) : "r"(_prmt_178), "r"(_prmt_176 | _prmt_180 & 2155905152u));
+#endif
         dp_lo[7] = _prmt_130_1;
+#if __CUDA_ARCH__ == 900
+#else
         uint32_t _prmt_181;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_181) : "r"(w_hi_23 & 2004318071), "r"(w_hi_23 & 2004318071));
         uint32_t _prmt_182;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_182) : "r"(1061109504), "r"(1077952576), "r"(w_hi_23 & 2004318071));
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_182) : "r"(2071689984), "r"(2088533116), "r"(w_hi_23 & 2004318071));
+#endif
         uint32_t _prmt_183;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_183) : "r"(1061109504), "r"(1077952576), "r"(_prmt_181));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_183) : "r"(w_hi_22 & 2004318071), "r"(w_hi_22 & 2004318071));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_183) : "r"(2071689984), "r"(2088533116), "r"(_prmt_181));
+#endif
         uint32_t _prmt_184;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_184) : "r"(lut_regs[0]), "r"(2088533116), "r"(w_hi_22 & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_184) : "r"(3229614080u), "r"(3229630464u), "r"(w_hi_23 & 2004318071));
+#endif
         uint32_t _prmt_185;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_185) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_183));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_185) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_181));
+#endif
         uint32_t _prmt_186;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_186) : "r"(lut_regs[1]), "r"(3229630464u), "r"(w_hi_22 & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_186) : "r"(w_hi_23 << 4), "r"(w_hi_23));
+#endif
         uint32_t _prmt_187;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_187) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_183));
+        uint32_t _prmt_188;
+        asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_188) : "r"(w_hi_22 << 4), "r"(w_hi_22));
+        uint32_t _prmt_189;
+        asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_189) : "r"(w_hi_22 << 4), "r"(w_hi_22));
+#else
         asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_187) : "r"(w_hi_23 << 4), "r"(w_hi_23));
+#endif
         uint32_t _prmt_131_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_131_1) : "r"(_prmt_186), "r"(_prmt_184 | _prmt_188 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_131_1) : "r"(_prmt_184), "r"(_prmt_182 | _prmt_186 & 2155905152u));
+#endif
         dp_hi[4] = _prmt_131_1;
         uint32_t _prmt_132_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_132_1) : "r"(_prmt_186), "r"(_prmt_184 | _prmt_188 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_132_1) : "r"(_prmt_184), "r"(_prmt_182 | _prmt_186 & 2155905152u));
+#endif
         dp_hi[5] = _prmt_132_1;
         uint32_t _prmt_133_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_133_1) : "r"(_prmt_187), "r"(_prmt_185 | _prmt_189 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_133_1) : "r"(_prmt_185), "r"(_prmt_183 | _prmt_187 & 2155905152u));
+#endif
         dp_hi[6] = _prmt_133_1;
         uint32_t _prmt_134_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_134_1) : "r"(_prmt_187), "r"(_prmt_185 | _prmt_189 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_134_1) : "r"(_prmt_185), "r"(_prmt_183 | _prmt_187 & 2155905152u));
+#endif
         dp_hi[7] = _prmt_134_1;
-        uint32_t _bf16x2_fma_96;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_96) : "r"(dp_lo[4]), "r"(sfv[1]), "r"(2147516416u));
-        dp_lo[4] = _bf16x2_fma_96;
-        uint32_t _bf16x2_fma_97;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_97) : "r"(dp_hi[4]), "r"(sfv[1]), "r"(2147516416u));
-        dp_hi[4] = _bf16x2_fma_97;
-        uint32_t _bf16x2_fma_98;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_98) : "r"(dp_lo[5]), "r"(sfv[1]), "r"(2147516416u));
-        dp_lo[5] = _bf16x2_fma_98;
-        uint32_t _bf16x2_fma_99;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_99) : "r"(dp_hi[5]), "r"(sfv[1]), "r"(2147516416u));
-        dp_hi[5] = _bf16x2_fma_99;
-        uint32_t _bf16x2_fma_100;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_100) : "r"(dp_lo[6]), "r"(sfv[1]), "r"(2147516416u));
-        dp_lo[6] = _bf16x2_fma_100;
-        uint32_t _bf16x2_fma_101;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_101) : "r"(dp_hi[6]), "r"(sfv[1]), "r"(2147516416u));
-        dp_hi[6] = _bf16x2_fma_101;
-        uint32_t _bf16x2_fma_102;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_102) : "r"(dp_lo[7]), "r"(sfv[1]), "r"(2147516416u));
-        dp_lo[7] = _bf16x2_fma_102;
-        uint32_t _bf16x2_fma_103;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_103) : "r"(dp_hi[7]), "r"(sfv[1]), "r"(2147516416u));
-        dp_hi[7] = _bf16x2_fma_103;
+        uint32_t _bf16x2_fma_88;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_88) : "r"(dp_lo[4]), "r"(sfv[1]), "r"(2147516416u));
+        dp_lo[4] = _bf16x2_fma_88;
+        uint32_t _bf16x2_fma_89;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_89) : "r"(dp_hi[4]), "r"(sfv[1]), "r"(2147516416u));
+        dp_hi[4] = _bf16x2_fma_89;
+        uint32_t _bf16x2_fma_90;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_90) : "r"(dp_lo[5]), "r"(sfv[1]), "r"(2147516416u));
+        dp_lo[5] = _bf16x2_fma_90;
+        uint32_t _bf16x2_fma_91;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_91) : "r"(dp_hi[5]), "r"(sfv[1]), "r"(2147516416u));
+        dp_hi[5] = _bf16x2_fma_91;
+        uint32_t _bf16x2_fma_92;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_92) : "r"(dp_lo[6]), "r"(sfv[1]), "r"(2147516416u));
+        dp_lo[6] = _bf16x2_fma_92;
+        uint32_t _bf16x2_fma_93;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_93) : "r"(dp_hi[6]), "r"(sfv[1]), "r"(2147516416u));
+        dp_hi[6] = _bf16x2_fma_93;
+        uint32_t _bf16x2_fma_94;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_94) : "r"(dp_lo[7]), "r"(sfv[1]), "r"(2147516416u));
+        dp_lo[7] = _bf16x2_fma_94;
+        uint32_t _bf16x2_fma_95;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_95) : "r"(dp_hi[7]), "r"(sfv[1]), "r"(2147516416u));
+        dp_hi[7] = _bf16x2_fma_95;
         b_pair[0] = dp_lo[0];
         b_pair[1] = dp_lo[4];
         asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
@@ -2257,18 +2922,38 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&p_a[0])), "=r"(*reinterpret_cast<uint32_t*>(&p_a[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_a[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_a[(0) + 3]))
             : "r"(p_frag_addr + (unsigned int)(16 * (64 + lane_1))));
+#if __CUDA_ARCH__ == 900
+        int v_row_23 = v_stage + (32 + 2 * t) * 144;
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&vw[0])) : "r"(kv_addr + (unsigned int)(v_row_23 + v_col)));
+        unsigned int scale_byte_24 = (unsigned int)kv_u8[v_row_23 + v_scale_col];
+        int v_row_25 = v_stage + (32 + 2 * t + 1) * 144;
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&vw[1])) : "r"(kv_addr + (unsigned int)(v_row_25 + v_col)));
+#else
         unsigned int sf_packed_24 = 0;
         int v_row_25 = v_stage + (32 + 2 * t) * 144;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&vw[0])) : "r"(kv_addr + (unsigned int)(v_row_25 + v_col)));
+#endif
         unsigned int scale_byte_26 = (unsigned int)kv_u8[v_row_25 + v_scale_col];
+#if __CUDA_ARCH__ == 900
+        int v_row_27 = v_stage + (32 + 2 * t + 8) * 144;
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&vw[2])) : "r"(kv_addr + (unsigned int)(v_row_27 + v_col)));
+#else
         sf_packed_24 = sf_packed_24 | scale_byte_26;
         int v_row_27 = v_stage + (32 + 2 * t + 1) * 144;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&vw[1])) : "r"(kv_addr + (unsigned int)(v_row_27 + v_col)));
+#endif
         unsigned int scale_byte_28 = (unsigned int)kv_u8[v_row_27 + v_scale_col];
+#if __CUDA_ARCH__ == 900
+        int v_row_29 = v_stage + (32 + 2 * t + 1 + 8) * 144;
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&vw[3])) : "r"(kv_addr + (unsigned int)(v_row_29 + v_col)));
+#else
         sf_packed_24 = sf_packed_24 | scale_byte_28 << 8;
         int v_row_29 = v_stage + (32 + 2 * t + 8) * 144;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&vw[2])) : "r"(kv_addr + (unsigned int)(v_row_29 + v_col)));
+#endif
         unsigned int scale_byte_30 = (unsigned int)kv_u8[v_row_29 + v_scale_col];
+#if __CUDA_ARCH__ == 900
+#else
         sf_packed_24 = sf_packed_24 | scale_byte_30 << 16;
         int v_row_31 = v_stage + (32 + 2 * t + 1 + 8) * 144;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&vw[3])) : "r"(kv_addr + (unsigned int)(v_row_31 + v_col)));
@@ -2276,92 +2961,188 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         sf_packed_24 = sf_packed_24 | scale_byte_32 << 24;
         uint32_t _prmt_188;
         asm("prmt.b32 %0, %1, %2, 0x1302;" : "=r"(_prmt_188) : "r"(sf_packed_24), "r"(sf_packed_24));
-        uint32_t _bf16x2_fma_104;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_104) : "r"(_prmt_188 & 2147516416u | (_prmt_188 & 2130738944) >> 4), "r"(2072017792), "r"(2147516416u));
-        sfv[0] = _bf16x2_fma_104;
-        uint32_t _bf16x2_fma_105;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_105) : "r"(_prmt_188 << 8 & 2147516416u | (_prmt_188 << 8 & 2130738944) >> 4), "r"(2072017792), "r"(2147516416u));
-        sfv[1] = _bf16x2_fma_105;
+        sfv[0] = _prmt_188 & 2147516416u | (_prmt_188 & 2130738944) >> 4;
+        sfv[1] = _prmt_188 << 8 & 2147516416u | (_prmt_188 << 8 & 2130738944) >> 4;
         uint32_t w_lo_33;
         asm("prmt.b32 %0, %1, %2, 0x5140;" : "=r"(w_lo_33) : "r"(vw[0]), "r"(vw[1]));
         uint32_t w_hi_34;
         asm("prmt.b32 %0, %1, %2, 0x7362;" : "=r"(w_hi_34) : "r"(vw[0]), "r"(vw[1]));
         uint32_t _prmt_189;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_189) : "r"(w_lo_33 & 2004318071), "r"(w_lo_33 & 2004318071));
+#endif
         uint32_t _prmt_190;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_190) : "r"(1061109504), "r"(1077952576), "r"(w_lo_33 & 2004318071));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x4501;" : "=r"(_prmt_190) : "r"(scale_byte_24), "r"(scale_byte_26));
+        sfv[0] = _prmt_190 & 2147516416u | (_prmt_190 & 2130738944) >> 4;
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_190) : "r"(2071689984), "r"(2088533116), "r"(w_lo_33 & 2004318071));
+#endif
         uint32_t _prmt_191;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_191) : "r"(1061109504), "r"(1077952576), "r"(_prmt_189));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x4501;" : "=r"(_prmt_191) : "r"(scale_byte_28), "r"(scale_byte_30));
+        sfv[1] = _prmt_191 & 2147516416u | (_prmt_191 & 2130738944) >> 4;
+        uint32_t w_lo_31;
+        asm("prmt.b32 %0, %1, %2, 0x5140;" : "=r"(w_lo_31) : "r"(vw[0]), "r"(vw[1]));
+        uint32_t w_hi_32;
+        asm("prmt.b32 %0, %1, %2, 0x7362;" : "=r"(w_hi_32) : "r"(vw[0]), "r"(vw[1]));
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_191) : "r"(2071689984), "r"(2088533116), "r"(_prmt_189));
+#endif
         uint32_t _prmt_192;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_192) : "r"(w_lo_31 & 2004318071), "r"(w_lo_31 & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_192) : "r"(3229614080u), "r"(3229630464u), "r"(w_lo_33 & 2004318071));
+#endif
         uint32_t _prmt_193;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_193) : "r"(lut_regs[0]), "r"(2088533116), "r"(w_lo_31 & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_193) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_189));
+#endif
         uint32_t _prmt_194;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_194) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_192));
+#else
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_194) : "r"(w_lo_33 << 4), "r"(w_lo_33));
+#endif
         uint32_t _prmt_195;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_195) : "r"(lut_regs[1]), "r"(3229630464u), "r"(w_lo_31 & 2004318071));
+        uint32_t _prmt_196;
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_196) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_192));
+        uint32_t _prmt_197;
+        asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_197) : "r"(w_lo_31 << 4), "r"(w_lo_31));
+        uint32_t _prmt_198;
+        asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_198) : "r"(w_lo_31 << 4), "r"(w_lo_31));
+#else
         asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_195) : "r"(w_lo_33 << 4), "r"(w_lo_33));
+#endif
         uint32_t _prmt_135_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_135_1) : "r"(_prmt_195), "r"(_prmt_193 | _prmt_197 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_135_1) : "r"(_prmt_192), "r"(_prmt_190 | _prmt_194 & 2155905152u));
+#endif
         dp_lo[0] = _prmt_135_1;
         uint32_t _prmt_136_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_136_1) : "r"(_prmt_195), "r"(_prmt_193 | _prmt_197 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_136_1) : "r"(_prmt_192), "r"(_prmt_190 | _prmt_194 & 2155905152u));
+#endif
         dp_lo[1] = _prmt_136_1;
         uint32_t _prmt_137_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_137_1) : "r"(_prmt_196), "r"(_prmt_194 | _prmt_198 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_137_1) : "r"(_prmt_193), "r"(_prmt_191 | _prmt_195 & 2155905152u));
+#endif
         dp_lo[2] = _prmt_137_1;
         uint32_t _prmt_138_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_138_1) : "r"(_prmt_196), "r"(_prmt_194 | _prmt_198 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_138_1) : "r"(_prmt_193), "r"(_prmt_191 | _prmt_195 & 2155905152u));
+#endif
         dp_lo[3] = _prmt_138_1;
+#if __CUDA_ARCH__ == 900
+#else
         uint32_t _prmt_196;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_196) : "r"(w_hi_34 & 2004318071), "r"(w_hi_34 & 2004318071));
         uint32_t _prmt_197;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_197) : "r"(1061109504), "r"(1077952576), "r"(w_hi_34 & 2004318071));
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_197) : "r"(2071689984), "r"(2088533116), "r"(w_hi_34 & 2004318071));
         uint32_t _prmt_198;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_198) : "r"(1061109504), "r"(1077952576), "r"(_prmt_196));
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_198) : "r"(2071689984), "r"(2088533116), "r"(_prmt_196));
+#endif
         uint32_t _prmt_199;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_199) : "r"(w_hi_32 & 2004318071), "r"(w_hi_32 & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_199) : "r"(3229614080u), "r"(3229630464u), "r"(w_hi_34 & 2004318071));
+#endif
         uint32_t _prmt_200;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_200) : "r"(lut_regs[0]), "r"(2088533116), "r"(w_hi_32 & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_200) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_196));
+#endif
         uint32_t _prmt_201;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_201) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_199));
+#else
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_201) : "r"(w_hi_34 << 4), "r"(w_hi_34));
+#endif
         uint32_t _prmt_202;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_202) : "r"(lut_regs[1]), "r"(3229630464u), "r"(w_hi_32 & 2004318071));
+        uint32_t _prmt_203;
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_203) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_199));
+        uint32_t _prmt_204;
+        asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_204) : "r"(w_hi_32 << 4), "r"(w_hi_32));
+        uint32_t _prmt_205;
+        asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_205) : "r"(w_hi_32 << 4), "r"(w_hi_32));
+#else
         asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_202) : "r"(w_hi_34 << 4), "r"(w_hi_34));
+#endif
         uint32_t _prmt_139_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_139_1) : "r"(_prmt_202), "r"(_prmt_200 | _prmt_204 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_139_1) : "r"(_prmt_199), "r"(_prmt_197 | _prmt_201 & 2155905152u));
+#endif
         dp_hi[0] = _prmt_139_1;
         uint32_t _prmt_140_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_140_1) : "r"(_prmt_202), "r"(_prmt_200 | _prmt_204 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_140_1) : "r"(_prmt_199), "r"(_prmt_197 | _prmt_201 & 2155905152u));
+#endif
         dp_hi[1] = _prmt_140_1;
         uint32_t _prmt_141_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_141_1) : "r"(_prmt_203), "r"(_prmt_201 | _prmt_205 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_141_1) : "r"(_prmt_200), "r"(_prmt_198 | _prmt_202 & 2155905152u));
+#endif
         dp_hi[2] = _prmt_141_1;
         uint32_t _prmt_142_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_142_1) : "r"(_prmt_203), "r"(_prmt_201 | _prmt_205 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_142_1) : "r"(_prmt_200), "r"(_prmt_198 | _prmt_202 & 2155905152u));
+#endif
         dp_hi[3] = _prmt_142_1;
-        uint32_t _bf16x2_fma_106;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_106) : "r"(dp_lo[0]), "r"(sfv[0]), "r"(2147516416u));
-        dp_lo[0] = _bf16x2_fma_106;
-        uint32_t _bf16x2_fma_107;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_107) : "r"(dp_hi[0]), "r"(sfv[0]), "r"(2147516416u));
-        dp_hi[0] = _bf16x2_fma_107;
-        uint32_t _bf16x2_fma_108;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_108) : "r"(dp_lo[1]), "r"(sfv[0]), "r"(2147516416u));
-        dp_lo[1] = _bf16x2_fma_108;
-        uint32_t _bf16x2_fma_109;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_109) : "r"(dp_hi[1]), "r"(sfv[0]), "r"(2147516416u));
-        dp_hi[1] = _bf16x2_fma_109;
-        uint32_t _bf16x2_fma_110;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_110) : "r"(dp_lo[2]), "r"(sfv[0]), "r"(2147516416u));
-        dp_lo[2] = _bf16x2_fma_110;
-        uint32_t _bf16x2_fma_111;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_111) : "r"(dp_hi[2]), "r"(sfv[0]), "r"(2147516416u));
-        dp_hi[2] = _bf16x2_fma_111;
-        uint32_t _bf16x2_fma_112;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_112) : "r"(dp_lo[3]), "r"(sfv[0]), "r"(2147516416u));
-        dp_lo[3] = _bf16x2_fma_112;
-        uint32_t _bf16x2_fma_113;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_113) : "r"(dp_hi[3]), "r"(sfv[0]), "r"(2147516416u));
-        dp_hi[3] = _bf16x2_fma_113;
+        uint32_t _bf16x2_fma_96;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_96) : "r"(dp_lo[0]), "r"(sfv[0]), "r"(2147516416u));
+        dp_lo[0] = _bf16x2_fma_96;
+        uint32_t _bf16x2_fma_97;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_97) : "r"(dp_hi[0]), "r"(sfv[0]), "r"(2147516416u));
+        dp_hi[0] = _bf16x2_fma_97;
+        uint32_t _bf16x2_fma_98;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_98) : "r"(dp_lo[1]), "r"(sfv[0]), "r"(2147516416u));
+        dp_lo[1] = _bf16x2_fma_98;
+        uint32_t _bf16x2_fma_99;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_99) : "r"(dp_hi[1]), "r"(sfv[0]), "r"(2147516416u));
+        dp_hi[1] = _bf16x2_fma_99;
+        uint32_t _bf16x2_fma_100;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_100) : "r"(dp_lo[2]), "r"(sfv[0]), "r"(2147516416u));
+        dp_lo[2] = _bf16x2_fma_100;
+        uint32_t _bf16x2_fma_101;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_101) : "r"(dp_hi[2]), "r"(sfv[0]), "r"(2147516416u));
+        dp_hi[2] = _bf16x2_fma_101;
+        uint32_t _bf16x2_fma_102;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_102) : "r"(dp_lo[3]), "r"(sfv[0]), "r"(2147516416u));
+        dp_lo[3] = _bf16x2_fma_102;
+        uint32_t _bf16x2_fma_103;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_103) : "r"(dp_hi[3]), "r"(sfv[0]), "r"(2147516416u));
+        dp_hi[3] = _bf16x2_fma_103;
+#if __CUDA_ARCH__ == 900
+        uint32_t w_lo_33;
+        asm("prmt.b32 %0, %1, %2, 0x5140;" : "=r"(w_lo_33) : "r"(vw[2]), "r"(vw[3]));
+        uint32_t w_hi_34;
+        asm("prmt.b32 %0, %1, %2, 0x7362;" : "=r"(w_hi_34) : "r"(vw[2]), "r"(vw[3]));
+#else
         uint32_t w_lo_35;
         asm("prmt.b32 %0, %1, %2, 0x5140;" : "=r"(w_lo_35) : "r"(vw[2]), "r"(vw[3]));
         uint32_t w_hi_36;
@@ -2369,79 +3150,159 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         uint32_t _prmt_203;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_203) : "r"(w_lo_35 & 2004318071), "r"(w_lo_35 & 2004318071));
         uint32_t _prmt_204;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_204) : "r"(1061109504), "r"(1077952576), "r"(w_lo_35 & 2004318071));
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_204) : "r"(2071689984), "r"(2088533116), "r"(w_lo_35 & 2004318071));
         uint32_t _prmt_205;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_205) : "r"(1061109504), "r"(1077952576), "r"(_prmt_203));
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_205) : "r"(2071689984), "r"(2088533116), "r"(_prmt_203));
+#endif
         uint32_t _prmt_206;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_206) : "r"(w_lo_33 & 2004318071), "r"(w_lo_33 & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_206) : "r"(3229614080u), "r"(3229630464u), "r"(w_lo_35 & 2004318071));
+#endif
         uint32_t _prmt_207;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_207) : "r"(lut_regs[0]), "r"(2088533116), "r"(w_lo_33 & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_207) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_203));
+#endif
         uint32_t _prmt_208;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_208) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_206));
+#else
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_208) : "r"(w_lo_35 << 4), "r"(w_lo_35));
+#endif
         uint32_t _prmt_209;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_209) : "r"(lut_regs[1]), "r"(3229630464u), "r"(w_lo_33 & 2004318071));
+        uint32_t _prmt_210;
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_210) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_206));
+        uint32_t _prmt_211;
+        asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_211) : "r"(w_lo_33 << 4), "r"(w_lo_33));
+        uint32_t _prmt_212;
+        asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_212) : "r"(w_lo_33 << 4), "r"(w_lo_33));
+#else
         asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_209) : "r"(w_lo_35 << 4), "r"(w_lo_35));
+#endif
         uint32_t _prmt_143_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_143_1) : "r"(_prmt_209), "r"(_prmt_207 | _prmt_211 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_143_1) : "r"(_prmt_206), "r"(_prmt_204 | _prmt_208 & 2155905152u));
+#endif
         dp_lo[4] = _prmt_143_1;
         uint32_t _prmt_144_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_144_1) : "r"(_prmt_209), "r"(_prmt_207 | _prmt_211 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_144_1) : "r"(_prmt_206), "r"(_prmt_204 | _prmt_208 & 2155905152u));
+#endif
         dp_lo[5] = _prmt_144_1;
         uint32_t _prmt_145_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_145_1) : "r"(_prmt_210), "r"(_prmt_208 | _prmt_212 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_145_1) : "r"(_prmt_207), "r"(_prmt_205 | _prmt_209 & 2155905152u));
+#endif
         dp_lo[6] = _prmt_145_1;
         uint32_t _prmt_146_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_146_1) : "r"(_prmt_210), "r"(_prmt_208 | _prmt_212 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_146_1) : "r"(_prmt_207), "r"(_prmt_205 | _prmt_209 & 2155905152u));
+#endif
         dp_lo[7] = _prmt_146_1;
+#if __CUDA_ARCH__ == 900
+#else
         uint32_t _prmt_210;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_210) : "r"(w_hi_36 & 2004318071), "r"(w_hi_36 & 2004318071));
         uint32_t _prmt_211;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_211) : "r"(1061109504), "r"(1077952576), "r"(w_hi_36 & 2004318071));
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_211) : "r"(2071689984), "r"(2088533116), "r"(w_hi_36 & 2004318071));
         uint32_t _prmt_212;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_212) : "r"(1061109504), "r"(1077952576), "r"(_prmt_210));
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_212) : "r"(2071689984), "r"(2088533116), "r"(_prmt_210));
+#endif
         uint32_t _prmt_213;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_213) : "r"(w_hi_34 & 2004318071), "r"(w_hi_34 & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_213) : "r"(3229614080u), "r"(3229630464u), "r"(w_hi_36 & 2004318071));
+#endif
         uint32_t _prmt_214;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_214) : "r"(lut_regs[0]), "r"(2088533116), "r"(w_hi_34 & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_214) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_210));
+#endif
         uint32_t _prmt_215;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_215) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_213));
+#else
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_215) : "r"(w_hi_36 << 4), "r"(w_hi_36));
+#endif
         uint32_t _prmt_216;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_216) : "r"(lut_regs[1]), "r"(3229630464u), "r"(w_hi_34 & 2004318071));
+        uint32_t _prmt_217;
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_217) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_213));
+        uint32_t _prmt_218;
+        asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_218) : "r"(w_hi_34 << 4), "r"(w_hi_34));
+        uint32_t _prmt_219;
+        asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_219) : "r"(w_hi_34 << 4), "r"(w_hi_34));
+#else
         asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_216) : "r"(w_hi_36 << 4), "r"(w_hi_36));
+#endif
         uint32_t _prmt_147_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_147_1) : "r"(_prmt_216), "r"(_prmt_214 | _prmt_218 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_147_1) : "r"(_prmt_213), "r"(_prmt_211 | _prmt_215 & 2155905152u));
+#endif
         dp_hi[4] = _prmt_147_1;
         uint32_t _prmt_148_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_148_1) : "r"(_prmt_216), "r"(_prmt_214 | _prmt_218 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_148_1) : "r"(_prmt_213), "r"(_prmt_211 | _prmt_215 & 2155905152u));
+#endif
         dp_hi[5] = _prmt_148_1;
         uint32_t _prmt_149_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_149_1) : "r"(_prmt_217), "r"(_prmt_215 | _prmt_219 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_149_1) : "r"(_prmt_214), "r"(_prmt_212 | _prmt_216 & 2155905152u));
+#endif
         dp_hi[6] = _prmt_149_1;
         uint32_t _prmt_150_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_150_1) : "r"(_prmt_217), "r"(_prmt_215 | _prmt_219 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_150_1) : "r"(_prmt_214), "r"(_prmt_212 | _prmt_216 & 2155905152u));
+#endif
         dp_hi[7] = _prmt_150_1;
-        uint32_t _bf16x2_fma_114;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_114) : "r"(dp_lo[4]), "r"(sfv[1]), "r"(2147516416u));
-        dp_lo[4] = _bf16x2_fma_114;
-        uint32_t _bf16x2_fma_115;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_115) : "r"(dp_hi[4]), "r"(sfv[1]), "r"(2147516416u));
-        dp_hi[4] = _bf16x2_fma_115;
-        uint32_t _bf16x2_fma_116;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_116) : "r"(dp_lo[5]), "r"(sfv[1]), "r"(2147516416u));
-        dp_lo[5] = _bf16x2_fma_116;
-        uint32_t _bf16x2_fma_117;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_117) : "r"(dp_hi[5]), "r"(sfv[1]), "r"(2147516416u));
-        dp_hi[5] = _bf16x2_fma_117;
-        uint32_t _bf16x2_fma_118;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_118) : "r"(dp_lo[6]), "r"(sfv[1]), "r"(2147516416u));
-        dp_lo[6] = _bf16x2_fma_118;
-        uint32_t _bf16x2_fma_119;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_119) : "r"(dp_hi[6]), "r"(sfv[1]), "r"(2147516416u));
-        dp_hi[6] = _bf16x2_fma_119;
-        uint32_t _bf16x2_fma_120;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_120) : "r"(dp_lo[7]), "r"(sfv[1]), "r"(2147516416u));
-        dp_lo[7] = _bf16x2_fma_120;
-        uint32_t _bf16x2_fma_121;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_121) : "r"(dp_hi[7]), "r"(sfv[1]), "r"(2147516416u));
-        dp_hi[7] = _bf16x2_fma_121;
+        uint32_t _bf16x2_fma_104;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_104) : "r"(dp_lo[4]), "r"(sfv[1]), "r"(2147516416u));
+        dp_lo[4] = _bf16x2_fma_104;
+        uint32_t _bf16x2_fma_105;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_105) : "r"(dp_hi[4]), "r"(sfv[1]), "r"(2147516416u));
+        dp_hi[4] = _bf16x2_fma_105;
+        uint32_t _bf16x2_fma_106;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_106) : "r"(dp_lo[5]), "r"(sfv[1]), "r"(2147516416u));
+        dp_lo[5] = _bf16x2_fma_106;
+        uint32_t _bf16x2_fma_107;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_107) : "r"(dp_hi[5]), "r"(sfv[1]), "r"(2147516416u));
+        dp_hi[5] = _bf16x2_fma_107;
+        uint32_t _bf16x2_fma_108;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_108) : "r"(dp_lo[6]), "r"(sfv[1]), "r"(2147516416u));
+        dp_lo[6] = _bf16x2_fma_108;
+        uint32_t _bf16x2_fma_109;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_109) : "r"(dp_hi[6]), "r"(sfv[1]), "r"(2147516416u));
+        dp_hi[6] = _bf16x2_fma_109;
+        uint32_t _bf16x2_fma_110;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_110) : "r"(dp_lo[7]), "r"(sfv[1]), "r"(2147516416u));
+        dp_lo[7] = _bf16x2_fma_110;
+        uint32_t _bf16x2_fma_111;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_111) : "r"(dp_hi[7]), "r"(sfv[1]), "r"(2147516416u));
+        dp_hi[7] = _bf16x2_fma_111;
         b_pair[0] = dp_lo[0];
         b_pair[1] = dp_lo[4];
         asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
@@ -2485,6 +3346,20 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&p_a[0])), "=r"(*reinterpret_cast<uint32_t*>(&p_a[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_a[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_a[(0) + 3]))
             : "r"(p_frag_addr + (unsigned int)(16 * (96 + lane_1))));
+#if __CUDA_ARCH__ == 900
+        int v_row_35 = v_stage + (48 + 2 * t) * 144;
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&vw[0])) : "r"(kv_addr + (unsigned int)(v_row_35 + v_col)));
+        unsigned int scale_byte_36 = (unsigned int)kv_u8[v_row_35 + v_scale_col];
+        int v_row_37 = v_stage + (48 + 2 * t + 1) * 144;
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&vw[1])) : "r"(kv_addr + (unsigned int)(v_row_37 + v_col)));
+        unsigned int scale_byte_38 = (unsigned int)kv_u8[v_row_37 + v_scale_col];
+        int v_row_39 = v_stage + (48 + 2 * t + 8) * 144;
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&vw[2])) : "r"(kv_addr + (unsigned int)(v_row_39 + v_col)));
+        unsigned int scale_byte_40 = (unsigned int)kv_u8[v_row_39 + v_scale_col];
+        int v_row_41 = v_stage + (48 + 2 * t + 1 + 8) * 144;
+        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&vw[3])) : "r"(kv_addr + (unsigned int)(v_row_41 + v_col)));
+        unsigned int scale_byte_42 = (unsigned int)kv_u8[v_row_41 + v_scale_col];
+#else
         unsigned int sf_packed_37 = 0;
         int v_row_38 = v_stage + (48 + 2 * t) * 144;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&vw[0])) : "r"(kv_addr + (unsigned int)(v_row_38 + v_col)));
@@ -2504,12 +3379,8 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         sf_packed_37 = sf_packed_37 | scale_byte_45 << 24;
         uint32_t _prmt_217;
         asm("prmt.b32 %0, %1, %2, 0x1302;" : "=r"(_prmt_217) : "r"(sf_packed_37), "r"(sf_packed_37));
-        uint32_t _bf16x2_fma_122;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_122) : "r"(_prmt_217 & 2147516416u | (_prmt_217 & 2130738944) >> 4), "r"(2072017792), "r"(2147516416u));
-        sfv[0] = _bf16x2_fma_122;
-        uint32_t _bf16x2_fma_123;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_123) : "r"(_prmt_217 << 8 & 2147516416u | (_prmt_217 << 8 & 2130738944) >> 4), "r"(2072017792), "r"(2147516416u));
-        sfv[1] = _bf16x2_fma_123;
+        sfv[0] = _prmt_217 & 2147516416u | (_prmt_217 & 2130738944) >> 4;
+        sfv[1] = _prmt_217 << 8 & 2147516416u | (_prmt_217 << 8 & 2130738944) >> 4;
         uint32_t w_lo_46;
         asm("prmt.b32 %0, %1, %2, 0x5140;" : "=r"(w_lo_46) : "r"(vw[0]), "r"(vw[1]));
         uint32_t w_hi_47;
@@ -2517,79 +3388,175 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         uint32_t _prmt_218;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_218) : "r"(w_lo_46 & 2004318071), "r"(w_lo_46 & 2004318071));
         uint32_t _prmt_219;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_219) : "r"(1061109504), "r"(1077952576), "r"(w_lo_46 & 2004318071));
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_219) : "r"(2071689984), "r"(2088533116), "r"(w_lo_46 & 2004318071));
+#endif
         uint32_t _prmt_220;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_220) : "r"(1061109504), "r"(1077952576), "r"(_prmt_218));
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x4501;" : "=r"(_prmt_220) : "r"(scale_byte_36), "r"(scale_byte_38));
+        sfv[0] = _prmt_220 & 2147516416u | (_prmt_220 & 2130738944) >> 4;
+#else
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_220) : "r"(2071689984), "r"(2088533116), "r"(_prmt_218));
+#endif
         uint32_t _prmt_221;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x4501;" : "=r"(_prmt_221) : "r"(scale_byte_40), "r"(scale_byte_42));
+        sfv[1] = _prmt_221 & 2147516416u | (_prmt_221 & 2130738944) >> 4;
+        uint32_t w_lo_43;
+        asm("prmt.b32 %0, %1, %2, 0x5140;" : "=r"(w_lo_43) : "r"(vw[0]), "r"(vw[1]));
+        uint32_t w_hi_44;
+        asm("prmt.b32 %0, %1, %2, 0x7362;" : "=r"(w_hi_44) : "r"(vw[0]), "r"(vw[1]));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_221) : "r"(3229614080u), "r"(3229630464u), "r"(w_lo_46 & 2004318071));
+#endif
         uint32_t _prmt_222;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_222) : "r"(w_lo_43 & 2004318071), "r"(w_lo_43 & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_222) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_218));
+#endif
         uint32_t _prmt_223;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_223) : "r"(lut_regs[0]), "r"(2088533116), "r"(w_lo_43 & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_223) : "r"(w_lo_46 << 4), "r"(w_lo_46));
+#endif
         uint32_t _prmt_224;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_224) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_222));
+        uint32_t _prmt_225;
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_225) : "r"(lut_regs[1]), "r"(3229630464u), "r"(w_lo_43 & 2004318071));
+        uint32_t _prmt_226;
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_226) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_222));
+        uint32_t _prmt_227;
+        asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_227) : "r"(w_lo_43 << 4), "r"(w_lo_43));
+        uint32_t _prmt_228;
+        asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_228) : "r"(w_lo_43 << 4), "r"(w_lo_43));
+#else
         asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_224) : "r"(w_lo_46 << 4), "r"(w_lo_46));
+#endif
         uint32_t _prmt_151_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_151_1) : "r"(_prmt_225), "r"(_prmt_223 | _prmt_227 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_151_1) : "r"(_prmt_221), "r"(_prmt_219 | _prmt_223 & 2155905152u));
+#endif
         dp_lo[0] = _prmt_151_1;
         uint32_t _prmt_152_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_152_1) : "r"(_prmt_225), "r"(_prmt_223 | _prmt_227 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_152_1) : "r"(_prmt_221), "r"(_prmt_219 | _prmt_223 & 2155905152u));
+#endif
         dp_lo[1] = _prmt_152_1;
         uint32_t _prmt_153_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_153_1) : "r"(_prmt_226), "r"(_prmt_224 | _prmt_228 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_153_1) : "r"(_prmt_222), "r"(_prmt_220 | _prmt_224 & 2155905152u));
+#endif
         dp_lo[2] = _prmt_153_1;
         uint32_t _prmt_154_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_154_1) : "r"(_prmt_226), "r"(_prmt_224 | _prmt_228 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_154_1) : "r"(_prmt_222), "r"(_prmt_220 | _prmt_224 & 2155905152u));
+#endif
         dp_lo[3] = _prmt_154_1;
+#if __CUDA_ARCH__ == 900
+#else
         uint32_t _prmt_225;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_225) : "r"(w_hi_47 & 2004318071), "r"(w_hi_47 & 2004318071));
         uint32_t _prmt_226;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_226) : "r"(1061109504), "r"(1077952576), "r"(w_hi_47 & 2004318071));
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_226) : "r"(2071689984), "r"(2088533116), "r"(w_hi_47 & 2004318071));
         uint32_t _prmt_227;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_227) : "r"(1061109504), "r"(1077952576), "r"(_prmt_225));
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_227) : "r"(2071689984), "r"(2088533116), "r"(_prmt_225));
         uint32_t _prmt_228;
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_228) : "r"(3229614080u), "r"(3229630464u), "r"(w_hi_47 & 2004318071));
+#endif
         uint32_t _prmt_229;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_229) : "r"(w_hi_44 & 2004318071), "r"(w_hi_44 & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_229) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_225));
+#endif
         uint32_t _prmt_230;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_230) : "r"(lut_regs[0]), "r"(2088533116), "r"(w_hi_44 & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_230) : "r"(w_hi_47 << 4), "r"(w_hi_47));
+#endif
         uint32_t _prmt_231;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_231) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_229));
+        uint32_t _prmt_232;
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_232) : "r"(lut_regs[1]), "r"(3229630464u), "r"(w_hi_44 & 2004318071));
+        uint32_t _prmt_233;
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_233) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_229));
+        uint32_t _prmt_234;
+        asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_234) : "r"(w_hi_44 << 4), "r"(w_hi_44));
+        uint32_t _prmt_235;
+        asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_235) : "r"(w_hi_44 << 4), "r"(w_hi_44));
+#else
         asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_231) : "r"(w_hi_47 << 4), "r"(w_hi_47));
+#endif
         uint32_t _prmt_155_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_155_1) : "r"(_prmt_232), "r"(_prmt_230 | _prmt_234 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_155_1) : "r"(_prmt_228), "r"(_prmt_226 | _prmt_230 & 2155905152u));
+#endif
         dp_hi[0] = _prmt_155_1;
         uint32_t _prmt_156_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_156_1) : "r"(_prmt_232), "r"(_prmt_230 | _prmt_234 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_156_1) : "r"(_prmt_228), "r"(_prmt_226 | _prmt_230 & 2155905152u));
+#endif
         dp_hi[1] = _prmt_156_1;
         uint32_t _prmt_157_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_157_1) : "r"(_prmt_233), "r"(_prmt_231 | _prmt_235 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_157_1) : "r"(_prmt_229), "r"(_prmt_227 | _prmt_231 & 2155905152u));
+#endif
         dp_hi[2] = _prmt_157_1;
         uint32_t _prmt_158_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_158_1) : "r"(_prmt_233), "r"(_prmt_231 | _prmt_235 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_158_1) : "r"(_prmt_229), "r"(_prmt_227 | _prmt_231 & 2155905152u));
+#endif
         dp_hi[3] = _prmt_158_1;
-        uint32_t _bf16x2_fma_124;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_124) : "r"(dp_lo[0]), "r"(sfv[0]), "r"(2147516416u));
-        dp_lo[0] = _bf16x2_fma_124;
-        uint32_t _bf16x2_fma_125;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_125) : "r"(dp_hi[0]), "r"(sfv[0]), "r"(2147516416u));
-        dp_hi[0] = _bf16x2_fma_125;
-        uint32_t _bf16x2_fma_126;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_126) : "r"(dp_lo[1]), "r"(sfv[0]), "r"(2147516416u));
-        dp_lo[1] = _bf16x2_fma_126;
-        uint32_t _bf16x2_fma_127;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_127) : "r"(dp_hi[1]), "r"(sfv[0]), "r"(2147516416u));
-        dp_hi[1] = _bf16x2_fma_127;
-        uint32_t _bf16x2_fma_128;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_128) : "r"(dp_lo[2]), "r"(sfv[0]), "r"(2147516416u));
-        dp_lo[2] = _bf16x2_fma_128;
-        uint32_t _bf16x2_fma_129;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_129) : "r"(dp_hi[2]), "r"(sfv[0]), "r"(2147516416u));
-        dp_hi[2] = _bf16x2_fma_129;
-        uint32_t _bf16x2_fma_130;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_130) : "r"(dp_lo[3]), "r"(sfv[0]), "r"(2147516416u));
-        dp_lo[3] = _bf16x2_fma_130;
-        uint32_t _bf16x2_fma_131;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_131) : "r"(dp_hi[3]), "r"(sfv[0]), "r"(2147516416u));
-        dp_hi[3] = _bf16x2_fma_131;
+        uint32_t _bf16x2_fma_112;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_112) : "r"(dp_lo[0]), "r"(sfv[0]), "r"(2147516416u));
+        dp_lo[0] = _bf16x2_fma_112;
+        uint32_t _bf16x2_fma_113;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_113) : "r"(dp_hi[0]), "r"(sfv[0]), "r"(2147516416u));
+        dp_hi[0] = _bf16x2_fma_113;
+        uint32_t _bf16x2_fma_114;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_114) : "r"(dp_lo[1]), "r"(sfv[0]), "r"(2147516416u));
+        dp_lo[1] = _bf16x2_fma_114;
+        uint32_t _bf16x2_fma_115;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_115) : "r"(dp_hi[1]), "r"(sfv[0]), "r"(2147516416u));
+        dp_hi[1] = _bf16x2_fma_115;
+        uint32_t _bf16x2_fma_116;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_116) : "r"(dp_lo[2]), "r"(sfv[0]), "r"(2147516416u));
+        dp_lo[2] = _bf16x2_fma_116;
+        uint32_t _bf16x2_fma_117;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_117) : "r"(dp_hi[2]), "r"(sfv[0]), "r"(2147516416u));
+        dp_hi[2] = _bf16x2_fma_117;
+        uint32_t _bf16x2_fma_118;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_118) : "r"(dp_lo[3]), "r"(sfv[0]), "r"(2147516416u));
+        dp_lo[3] = _bf16x2_fma_118;
+        uint32_t _bf16x2_fma_119;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_119) : "r"(dp_hi[3]), "r"(sfv[0]), "r"(2147516416u));
+        dp_hi[3] = _bf16x2_fma_119;
+#if __CUDA_ARCH__ == 900
+        uint32_t w_lo_45;
+        asm("prmt.b32 %0, %1, %2, 0x5140;" : "=r"(w_lo_45) : "r"(vw[2]), "r"(vw[3]));
+        uint32_t w_hi_46;
+        asm("prmt.b32 %0, %1, %2, 0x7362;" : "=r"(w_hi_46) : "r"(vw[2]), "r"(vw[3]));
+#else
         uint32_t w_lo_48;
         asm("prmt.b32 %0, %1, %2, 0x5140;" : "=r"(w_lo_48) : "r"(vw[2]), "r"(vw[3]));
         uint32_t w_hi_49;
@@ -2597,79 +3564,155 @@ kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8(__nv_bfloat16* __restrict__ q, uint8_
         uint32_t _prmt_232;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_232) : "r"(w_lo_48 & 2004318071), "r"(w_lo_48 & 2004318071));
         uint32_t _prmt_233;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_233) : "r"(1061109504), "r"(1077952576), "r"(w_lo_48 & 2004318071));
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_233) : "r"(2071689984), "r"(2088533116), "r"(w_lo_48 & 2004318071));
         uint32_t _prmt_234;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_234) : "r"(1061109504), "r"(1077952576), "r"(_prmt_232));
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_234) : "r"(2071689984), "r"(2088533116), "r"(_prmt_232));
         uint32_t _prmt_235;
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_235) : "r"(3229614080u), "r"(3229630464u), "r"(w_lo_48 & 2004318071));
+#endif
         uint32_t _prmt_236;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_236) : "r"(w_lo_45 & 2004318071), "r"(w_lo_45 & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_236) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_232));
+#endif
         uint32_t _prmt_237;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_237) : "r"(lut_regs[0]), "r"(2088533116), "r"(w_lo_45 & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_237) : "r"(w_lo_48 << 4), "r"(w_lo_48));
+#endif
         uint32_t _prmt_238;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_238) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_236));
+        uint32_t _prmt_239;
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_239) : "r"(lut_regs[1]), "r"(3229630464u), "r"(w_lo_45 & 2004318071));
+        uint32_t _prmt_240;
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_240) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_236));
+        uint32_t _prmt_241;
+        asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_241) : "r"(w_lo_45 << 4), "r"(w_lo_45));
+        uint32_t _prmt_242;
+        asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_242) : "r"(w_lo_45 << 4), "r"(w_lo_45));
+#else
         asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_238) : "r"(w_lo_48 << 4), "r"(w_lo_48));
+#endif
         uint32_t _prmt_159_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_159_1) : "r"(_prmt_239), "r"(_prmt_237 | _prmt_241 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_159_1) : "r"(_prmt_235), "r"(_prmt_233 | _prmt_237 & 2155905152u));
+#endif
         dp_lo[4] = _prmt_159_1;
         uint32_t _prmt_160_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_160_1) : "r"(_prmt_239), "r"(_prmt_237 | _prmt_241 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_160_1) : "r"(_prmt_235), "r"(_prmt_233 | _prmt_237 & 2155905152u));
+#endif
         dp_lo[5] = _prmt_160_1;
         uint32_t _prmt_161_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_161_1) : "r"(_prmt_240), "r"(_prmt_238 | _prmt_242 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_161_1) : "r"(_prmt_236), "r"(_prmt_234 | _prmt_238 & 2155905152u));
+#endif
         dp_lo[6] = _prmt_161_1;
         uint32_t _prmt_162_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_162_1) : "r"(_prmt_240), "r"(_prmt_238 | _prmt_242 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_162_1) : "r"(_prmt_236), "r"(_prmt_234 | _prmt_238 & 2155905152u));
+#endif
         dp_lo[7] = _prmt_162_1;
+#if __CUDA_ARCH__ == 900
+#else
         uint32_t _prmt_239;
         asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_239) : "r"(w_hi_49 & 2004318071), "r"(w_hi_49 & 2004318071));
         uint32_t _prmt_240;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_240) : "r"(1061109504), "r"(1077952576), "r"(w_hi_49 & 2004318071));
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_240) : "r"(2071689984), "r"(2088533116), "r"(w_hi_49 & 2004318071));
         uint32_t _prmt_241;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_241) : "r"(1061109504), "r"(1077952576), "r"(_prmt_239));
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_241) : "r"(2071689984), "r"(2088533116), "r"(_prmt_239));
         uint32_t _prmt_242;
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_242) : "r"(3229614080u), "r"(3229630464u), "r"(w_hi_49 & 2004318071));
+#endif
         uint32_t _prmt_243;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x3232;" : "=r"(_prmt_243) : "r"(w_hi_46 & 2004318071), "r"(w_hi_46 & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_243) : "r"(3229614080u), "r"(3229630464u), "r"(_prmt_239));
+#endif
         uint32_t _prmt_244;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_244) : "r"(lut_regs[0]), "r"(2088533116), "r"(w_hi_46 & 2004318071));
+#else
         asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_244) : "r"(w_hi_49 << 4), "r"(w_hi_49));
+#endif
         uint32_t _prmt_245;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_245) : "r"(lut_regs[0]), "r"(2088533116), "r"(_prmt_243));
+        uint32_t _prmt_246;
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_246) : "r"(lut_regs[1]), "r"(3229630464u), "r"(w_hi_46 & 2004318071));
+        uint32_t _prmt_247;
+        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_247) : "r"(lut_regs[1]), "r"(3229630464u), "r"(_prmt_243));
+        uint32_t _prmt_248;
+        asm("prmt.b32 %0, %1, %2, 0xd9c8;" : "=r"(_prmt_248) : "r"(w_hi_46 << 4), "r"(w_hi_46));
+        uint32_t _prmt_249;
+        asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_249) : "r"(w_hi_46 << 4), "r"(w_hi_46));
+#else
         asm("prmt.b32 %0, %1, %2, 0xfbea;" : "=r"(_prmt_245) : "r"(w_hi_49 << 4), "r"(w_hi_49));
+#endif
         uint32_t _prmt_163_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_163_1) : "r"(_prmt_246), "r"(_prmt_244 | _prmt_248 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_163_1) : "r"(_prmt_242), "r"(_prmt_240 | _prmt_244 & 2155905152u));
+#endif
         dp_hi[4] = _prmt_163_1;
         uint32_t _prmt_164_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_164_1) : "r"(_prmt_246), "r"(_prmt_244 | _prmt_248 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_164_1) : "r"(_prmt_242), "r"(_prmt_240 | _prmt_244 & 2155905152u));
+#endif
         dp_hi[5] = _prmt_164_1;
         uint32_t _prmt_165_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_165_1) : "r"(_prmt_247), "r"(_prmt_245 | _prmt_249 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x6240;" : "=r"(_prmt_165_1) : "r"(_prmt_243), "r"(_prmt_241 | _prmt_245 & 2155905152u));
+#endif
         dp_hi[6] = _prmt_165_1;
         uint32_t _prmt_166_1;
+#if __CUDA_ARCH__ == 900
+        asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_166_1) : "r"(_prmt_247), "r"(_prmt_245 | _prmt_249 & 2155905152u));
+#else
         asm("prmt.b32 %0, %1, %2, 0x7351;" : "=r"(_prmt_166_1) : "r"(_prmt_243), "r"(_prmt_241 | _prmt_245 & 2155905152u));
+#endif
         dp_hi[7] = _prmt_166_1;
-        uint32_t _bf16x2_fma_132;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_132) : "r"(dp_lo[4]), "r"(sfv[1]), "r"(2147516416u));
-        dp_lo[4] = _bf16x2_fma_132;
-        uint32_t _bf16x2_fma_133;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_133) : "r"(dp_hi[4]), "r"(sfv[1]), "r"(2147516416u));
-        dp_hi[4] = _bf16x2_fma_133;
-        uint32_t _bf16x2_fma_134;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_134) : "r"(dp_lo[5]), "r"(sfv[1]), "r"(2147516416u));
-        dp_lo[5] = _bf16x2_fma_134;
-        uint32_t _bf16x2_fma_135;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_135) : "r"(dp_hi[5]), "r"(sfv[1]), "r"(2147516416u));
-        dp_hi[5] = _bf16x2_fma_135;
-        uint32_t _bf16x2_fma_136;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_136) : "r"(dp_lo[6]), "r"(sfv[1]), "r"(2147516416u));
-        dp_lo[6] = _bf16x2_fma_136;
-        uint32_t _bf16x2_fma_137;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_137) : "r"(dp_hi[6]), "r"(sfv[1]), "r"(2147516416u));
-        dp_hi[6] = _bf16x2_fma_137;
-        uint32_t _bf16x2_fma_138;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_138) : "r"(dp_lo[7]), "r"(sfv[1]), "r"(2147516416u));
-        dp_lo[7] = _bf16x2_fma_138;
-        uint32_t _bf16x2_fma_139;
-        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_139) : "r"(dp_hi[7]), "r"(sfv[1]), "r"(2147516416u));
-        dp_hi[7] = _bf16x2_fma_139;
+        uint32_t _bf16x2_fma_120;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_120) : "r"(dp_lo[4]), "r"(sfv[1]), "r"(2147516416u));
+        dp_lo[4] = _bf16x2_fma_120;
+        uint32_t _bf16x2_fma_121;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_121) : "r"(dp_hi[4]), "r"(sfv[1]), "r"(2147516416u));
+        dp_hi[4] = _bf16x2_fma_121;
+        uint32_t _bf16x2_fma_122;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_122) : "r"(dp_lo[5]), "r"(sfv[1]), "r"(2147516416u));
+        dp_lo[5] = _bf16x2_fma_122;
+        uint32_t _bf16x2_fma_123;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_123) : "r"(dp_hi[5]), "r"(sfv[1]), "r"(2147516416u));
+        dp_hi[5] = _bf16x2_fma_123;
+        uint32_t _bf16x2_fma_124;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_124) : "r"(dp_lo[6]), "r"(sfv[1]), "r"(2147516416u));
+        dp_lo[6] = _bf16x2_fma_124;
+        uint32_t _bf16x2_fma_125;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_125) : "r"(dp_hi[6]), "r"(sfv[1]), "r"(2147516416u));
+        dp_hi[6] = _bf16x2_fma_125;
+        uint32_t _bf16x2_fma_126;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_126) : "r"(dp_lo[7]), "r"(sfv[1]), "r"(2147516416u));
+        dp_lo[7] = _bf16x2_fma_126;
+        uint32_t _bf16x2_fma_127;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(_bf16x2_fma_127) : "r"(dp_hi[7]), "r"(sfv[1]), "r"(2147516416u));
+        dp_hi[7] = _bf16x2_fma_127;
         b_pair[0] = dp_lo[0];
         b_pair[1] = dp_lo[4];
         asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
