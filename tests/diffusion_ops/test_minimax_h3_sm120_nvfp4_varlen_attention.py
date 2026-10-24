@@ -73,7 +73,6 @@ CU_SEQLENS = [
     (0, 4096),
     (0, 4097),
 ]
-PV_MODES = ("fp4", "fp8")
 
 
 def _supported() -> bool:
@@ -85,6 +84,24 @@ def _supported() -> bool:
 
 requires_sm120 = pytest.mark.skipif(
     not _supported(), reason="requires an SM120 (RTX 5090 / RTX PRO 6000 Blackwell) GPU"
+)
+
+
+def _fp8pv_supported() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    # The existing FP4 route supports SM121, but the FP8-PV programs ship for sm_120a only.
+    return get_compute_capability(torch.device("cuda:0")) == (12, 0)
+
+
+requires_sm120_fp8pv = pytest.mark.skipif(
+    not _fp8pv_supported(),
+    reason='pv_mode="fp8" requires exact compute capability 12.0 (SM120)',
+)
+
+PV_MODES = (
+    "fp4",
+    pytest.param("fp8", marks=requires_sm120_fp8pv),
 )
 
 
@@ -308,7 +325,7 @@ def test_minimax_h3_sm120_nvfp4_fp8pv_workspace_is_smaller_than_fp8() -> None:
         )
 
 
-@requires_sm120
+@requires_sm120_fp8pv
 @pytest.mark.parametrize(
     ("cu_seqlens", "quantize", "attention"),
     [
@@ -349,7 +366,7 @@ def test_minimax_h3_sm120_nvfp4_fp8pv_routes_its_programs(
     _check(out, fp32_oracle(q, k, v, cu_seqlens))
 
 
-@requires_sm120
+@requires_sm120_fp8pv
 def test_minimax_h3_sm120_nvfp4_fp8pv_is_more_accurate_than_the_default_route() -> None:
     """``pv_mode="fp8"`` keeps the probabilities and V in E4M3: its relative-L2 error against the FP32
     oracle is below the default (Sage3-recipe) route's on the same inputs, and it meets the FP4
@@ -374,7 +391,7 @@ def test_minimax_h3_sm120_nvfp4_fp8pv_is_more_accurate_than_the_default_route() 
         assert rel8 < rel4, (cu_seqlens, rel8, rel4)
 
 
-@requires_sm120
+@requires_sm120_fp8pv
 def test_minimax_h3_sm120_nvfp4_fp8pv_two_streams_keep_private_counters() -> None:
     """The statistics launch's arrival counters are per (device, stream): two streams running the
     route concurrently on different inputs each reproduce their single-stream result bit for bit."""
