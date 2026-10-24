@@ -125,8 +125,12 @@ def gemm_kernel_persistent(
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         c = accumulator.to(c_ptr.dtype.element_ty)
 
-        c = tl.fma(c, alpha, beta * tl.load(c_ptrs, mask=c_mask))
-        tl.store(c_ptrs, c, mask=c_mask)
+        # C is write-only when beta == 0, so it must not be read there.
+        if beta != 0:
+            res = tl.fma(c, alpha, beta * tl.load(c_ptrs, mask=c_mask))
+        else:
+            res = c * alpha
+        tl.store(c_ptrs, res, mask=c_mask)
 
 
 @triton.jit(launch_metadata=_matmul_launch_metadata)
@@ -205,18 +209,29 @@ def gemm_kernel_descriptor_persistent(
             acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
             acc = tl.permute(acc, (0, 2, 1))
             acc0, acc1 = tl.split(acc)
-            acc0 = tl.fma(acc0, alpha, beta * c_desc.load([offs_cm, offs_cn]))
-            acc1 = tl.fma(
-                acc1, alpha, beta * c_desc.load([offs_cm, offs_cn + BLOCK_SIZE_N // 2])
-            )
+            # C is write-only when beta == 0, so it must not be read there.
+            if beta != 0:
+                acc0 = tl.fma(acc0, alpha, beta * c_desc.load([offs_cm, offs_cn]))
+                acc1 = tl.fma(
+                    acc1,
+                    alpha,
+                    beta * c_desc.load([offs_cm, offs_cn + BLOCK_SIZE_N // 2]),
+                )
+            else:
+                acc0 = acc0 * alpha
+                acc1 = acc1 * alpha
             c0 = acc0.to(dtype)
             c_desc.store([offs_cm, offs_cn], c0)
             c1 = acc1.to(dtype)
             c_desc.store([offs_cm, offs_cn + BLOCK_SIZE_N // 2], c1)
         else:
-            accumulator = tl.fma(
-                accumulator, alpha, beta * c_desc.load([offs_cm, offs_cn])
-            )
+            # C is write-only when beta == 0, so it must not be read there.
+            if beta != 0:
+                accumulator = tl.fma(
+                    accumulator, alpha, beta * c_desc.load([offs_cm, offs_cn])
+                )
+            else:
+                accumulator = accumulator * alpha
             c = accumulator.to(dtype)
             c_desc.store([offs_cm, offs_cn], c)
 
@@ -286,5 +301,9 @@ def gemm_kernel(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    c = tl.fma(c, alpha, beta * tl.load(c_ptrs, mask=c_mask))
-    tl.store(c_ptrs, c, mask=c_mask)
+    # C is write-only when beta == 0, so it must not be read there.
+    if beta != 0:
+        res = tl.fma(c, alpha, beta * tl.load(c_ptrs, mask=c_mask))
+    else:
+        res = c * alpha
+    tl.store(c_ptrs, res, mask=c_mask)
