@@ -95,7 +95,8 @@ def test_single_decode_tensor_cores(
         q, k, v, kv_layout, pos_encoding_mode, use_tensor_cores=True
     )
 
-    torch.testing.assert_close(o, o_tensor_cores, rtol=1e-3, atol=1e-3)
+    # fp16 tensor-core vs cuda-core: 1e-3/1e-3 flakes on SM121 (see #5400; abs~1.16e-3).
+    torch.testing.assert_close(o, o_tensor_cores, rtol=1e-2, atol=2e-3)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -189,8 +190,8 @@ def test_batch_decode_tensor_cores(
         q, kv_data, return_lse=True
     )
 
-    torch.testing.assert_close(o, o_tensor_cores, rtol=1e-3, atol=1e-3)
-    torch.testing.assert_close(lse, lse_tensor_cores, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(o, o_tensor_cores, rtol=1e-2, atol=2e-3)
+    torch.testing.assert_close(lse, lse_tensor_cores, rtol=1e-2, atol=2e-3)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -330,8 +331,8 @@ def test_batch_decode_tensor_cores_cuda_graph(
     # replay
     g.replay()
 
-    torch.testing.assert_close(o, o_tensor_cores, rtol=1e-3, atol=1e-3)
-    torch.testing.assert_close(lse, lse_tensor_cores, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(o, o_tensor_cores, rtol=1e-2, atol=2e-3)
+    torch.testing.assert_close(lse, lse_tensor_cores, rtol=1e-2, atol=2e-3)
 
 
 global_override_indptr_cpu = None
@@ -647,8 +648,8 @@ def test_batch_fast_decode_tensor_cores_cuda_graph(
     # replay
     g.replay()
 
-    torch.testing.assert_close(o, o_tensor_cores, rtol=1e-3, atol=1e-3)
-    torch.testing.assert_close(lse, lse_tensor_cores, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(o, o_tensor_cores, rtol=1e-2, atol=2e-3)
+    torch.testing.assert_close(lse, lse_tensor_cores, rtol=1e-2, atol=2e-3)
 
 
 @pytest.mark.parametrize("batch_size", [1, 17])
