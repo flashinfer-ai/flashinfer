@@ -3106,7 +3106,7 @@ class FrostLowLatencyConfig:
             one,
             w2,
             w2_block_scale,
-            one,
+            one.clone(),
             SwiGLU() if activation is None else activation,
             scale_block_size=32,
             integer_weights=True,
@@ -3132,7 +3132,7 @@ class FrostLowLatencyConfig:
             one,
             w2,
             w2_block_scale,
-            one,
+            one.clone(),
             SwiGLU() if activation is None else activation,
             scale_block_size=32,
         )

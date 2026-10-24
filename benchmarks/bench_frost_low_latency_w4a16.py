@@ -338,7 +338,7 @@ def main():
             raise RuntimeError(
                 "Select an architecture-appropriate NVFP4 native baseline"
             )
-    elif a.native_backend in ("cute-dsl", "sm12x", "sm120-tc"):
+    elif a.native_backend in ("cute-dsl", "sm12x", "sm120-tc", "expanded-bf16"):
         raise ValueError("This native adapter supports NVFP4/BF16 only")
     is_int = a.weight_format == "mxint4"
     if is_int != (a.native_backend == "trtllm-mxint4"):

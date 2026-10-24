@@ -1,7 +1,7 @@
 {
   "scope": "Same-GPU, same-checkpoint routed FC1/activation/FC2/combine GPU intervals. Preparation, router network, shared experts, EP communication, host submission and serving excluded. Synthetic model shapes, not model throughput.",
   "numerical_contract": "FP4 Frost rounds preactivation/intermediate/expert to BF16. MXINT4 retains FP32 preactivation. Native Blackwell NVFP4 and B300 MXFP4 can retain FP32 preactivation; SM12x uses FP16 partial products and FP32 expert/combine, fused SM120 TC atomically combines into BF16. Each path has its separate reference; not bitwise-identical rounding across every backend.",
-  "timing": "CUPTI first-to-last GPU activity span on H100/SM120; explicit CUDA-graph globaltimer on B300, with empty/event controls. Cold flushing outside timing. Four frozen ABBA rounds after candidate search.",
+  "timing": "CUPTI first-to-last GPU activity span on H100/SM120 with independent warm CUDA-event controls; explicit CUDA-graph globaltimer on B300 with empty-interval and A/A controls, without independent CUDA-event controls. Cold flushing outside timing. Four frozen ABBA rounds after candidate search.",
   "main_base": "195ccacadc3b9c826a492885c8e89a8b32041ac4",
   "runtime_commit": "45efecebb",
   "correctness": {

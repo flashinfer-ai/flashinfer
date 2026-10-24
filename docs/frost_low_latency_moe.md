@@ -3,7 +3,7 @@
 `FrostLowLatencyConfig` adds an explicit low-token candidate to `MoELayer` on
 SM100/SM103/SM107, with FMA-only support on SM90 and SM120.
 SM90 admits BF16, FP16, ordinary per-tensor FP8, DeepSeek block FP8 and
-NVFP4/MXFP4 weights with BF16 activations. MXFP8 inputs and NVFP4 activations remain
+NVFP4/MXFP4/MXINT4 weights with BF16 activations. MXFP8 inputs and NVFP4 activations remain
 unsupported on SM90. The MX Tensor Core path uses
 CuTe DSL and the existing FlashInfer low-latency blockscaled GEMM's TMA
 producers and epilogue. It does not depend on cuDNN.
@@ -255,7 +255,7 @@ the BF16 table or the earlier unclamped-SwiGLU cohort.
 
 | Property | Support |
 |---|---|
-| Architecture | SM90: BF16/FP16/per-tensor FP8/DeepSeek block FP8/NVFP4-weight BF16-activation FMA only, top-k <= 32; SM100/103/107: FMA and MX Tensor Core; SM120: FMA only, top-k <= 32 |
+| Architecture | SM90: BF16/FP16/per-tensor FP8/DeepSeek block FP8/NVFP4-MXFP4-MXINT4-weight BF16-activation FMA only, top-k <= 32; SM100/103/107: FMA and MX Tensor Core; SM120: FMA only, top-k <= 32 |
 | Input | Static per-tensor E4M3 FP8; E4M3 MXFP8 with linear group-32 UE8M0 scales; packed NVFP4 with linear group-16 E4M3 scales; or unquantized BF16/FP16 |
 | Weights | Per-tensor FP8 input: per-expert E4M3 FP8 with static calibration; MX input: MXFP4 or MXFP8 with group-32 UE8M0 scales; NVFP4 input: NVFP4 with group-16 E4M3 scales; unquantized input: matching BF16/FP16 weights, or E4M3 weights with per-expert FP32 scales and BF16 activation/output |
 | Output | Quantized paths: BF16; unquantized paths: BF16 or FP16. Finalized or raw token/slot-ordered expert rows |
@@ -1301,15 +1301,18 @@ Token count alone is insufficient to choose this path:
 
 The final twelve-file regression suite passes on H100 (402 passed, 17 skipped),
 B300 (412 passed, 7 skipped), and SM120 (398 passed, 21 skipped). Skips are
-architecture-specific tests and are not counted as device validation. Fresh
-SM100/SM107 four-bit qualification remains for CI.
+architecture-specific tests and are not counted as device validation. Independent
+SM107 CI passed 413 tests with 6 skips at `bc167c0a5`. Fresh SM100 four-bit
+device qualification remains pending; its current CI environment skips
+the GPU cases because its CuTe DSL is older than 4.8.
 
 The benchmark compares identical checkpoint payloads and routes. It searches
 advertised Frost and applicable native candidates, freezes winners and runs
 ABBA validation. It retains the output created during CUDA Graph capture
-and checks that output after timed replay. Warm CUDA-event and empty-interval
-controls are also retained. H100/SM120 use CUPTI activity spans; B300 can use
-explicit graph globaltimer intervals with `--timer globaltimer`.
+and checks that output after timed replay. H100/SM120 use CUPTI activity spans
+with independent warm CUDA-event controls. B300 uses explicit graph globaltimer
+intervals with empty-interval and A/A controls (`--timer globaltimer`); these
+records do not include an independent CUDA-event control.
 
 The GPU interval includes required route packing, FC1, activation, FC2 and
 combine. It excludes preparation, the routing network, shared experts,
@@ -1324,7 +1327,12 @@ accumulation. Passing each independent reference does not make the paths
 bitwise interchangeable. MXINT4 preserves FP32 preactivation in both paths.
 
 ```bash
-# Hopper NVFP4 versus native cuTile; use cutlass for MXFP4.
+# Hopper NVFP4 headline comparator: exact offline BF16 expansion.
+python benchmarks/bench_frost_low_latency_w4a16.py \
+  --weight-format nvfp4 --native-backend expanded-bf16 \
+  --tokens 1 --cache-mode warm --output nvfp4-expanded-warm.json
+
+# Secondary native four-bit cuTile comparator; use cutlass for MXFP4.
 python benchmarks/bench_frost_low_latency_w4a16.py \
   --weight-format nvfp4 --native-backend cutile \
   --tokens 1 --cache-mode warm --output nvfp4-warm.json
