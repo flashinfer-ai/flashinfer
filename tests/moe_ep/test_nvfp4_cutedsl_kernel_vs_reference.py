@@ -808,7 +808,7 @@ def _check_nvfp4_kernel_matches_torch_reference(
     if mode == "w4a4":
         pack = MoEWeightPack(w13=problem["w13"], w2=problem["w2"])
     elif mode == "w4a16":
-        from .w4a16_reference import make_w4a16_weights
+        from tests.test_helpers.w4a16_reference import make_w4a16_weights
 
         pack = make_w4a16_weights(hidden, intermediate, num_experts)
     transformed_l1, transformed_l2 = preprocess_mega_weights(
@@ -973,7 +973,7 @@ def _assert_nvfp4_reference(y_kernel, reference, *, mode, in_kernel_fc2_reduce=F
                 y_kernel, reference, ikr=True, label="w4a16 atomic BF16 combine"
             )
         else:
-            from .w4a16_reference import assert_w4a16_bits
+            from tests.test_helpers.w4a16_reference import assert_w4a16_bits
 
             assert_w4a16_bits(y_kernel, reference)
         return
@@ -1014,7 +1014,7 @@ def _nvfp4_reference_from_weights(
     assert mode in NVFP4_MODES, mode
     assert isinstance(weights, PrequantizedMoEWeights), type(weights)
     if mode == "w4a16":
-        from .w4a16_reference import w4a16_reference
+        from tests.test_helpers.w4a16_reference import w4a16_reference
 
         return w4a16_reference(
             problem,
@@ -1076,7 +1076,7 @@ def test_nvfp4_w4a16_fp32_scales_and_routing(
         Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
 
-    from .w4a16_reference import assert_w4a16_bits
+    from tests.test_helpers.w4a16_reference import assert_w4a16_bits
 
     _require_cuda()
     monkeypatch.setenv("MEGA_NO_DIST", "1")

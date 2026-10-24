@@ -13,6 +13,11 @@ from flashinfer.tllm_enums import (
     DEFAULT_SWIGLU_BETA,
     DEFAULT_SWIGLU_LIMIT,
 )
+from tests.test_helpers.w4a16_reference import (
+    assert_w4a16_bits,
+    combine_w4a16_split_terms,
+    w4a16_reference,
+)
 
 from .utils import create_moe_tensors
 
@@ -117,45 +122,168 @@ def test_dynamic_n_grouped_gemm_tails(mma_m, route_tile, cluster_m, activation_t
         expected[:valid_rows] = values.to(torch.bfloat16)
         # Includes the untouched invalid rows, so writing stale accumulator
         # columns cannot pass merely because the live prefix was correct.
-        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        assert_w4a16_bits(output, expected)
+
+
+def _canonical_reference_weights(tensors, gated):
+    """Read packed split weights without using the production dequantizer."""
+    from flashinfer.moe_ep import PrequantizedMoEWeights
+
+    def unpack(name):
+        packed = tensors[f"{name}_weight"]
+        experts, rows, packed_k = packed.shape
+        # Logical scale coordinates are (row%32, row//32%4, row//128,
+        # block%4, block//4, expert). Flatten them to [expert,row,block].
+        scales = (
+            tensors[f"{name}_weight_sf"]
+            .permute(5, 2, 1, 0, 4, 3)
+            .contiguous()
+            .view(torch.uint8)
+            .reshape(experts, rows, packed_k // 8)
+        )
+        if name == "w1" and gated:
+            # Split stores [up64,gate64,...]; the shared oracle consumes
+            # canonical [all_gate,all_up], including the matching scales.
+            def gate_first(value):
+                return (
+                    value.reshape(experts, rows // 128, 2, 64, value.shape[-1])
+                    .transpose(1, 2)
+                    .flip(1)
+                    .reshape_as(value)
+                    .contiguous()
+                )
+
+            packed, scales = gate_first(packed), gate_first(scales)
+        return packed, scales.view(torch.float8_e4m3fn)
+
+    w13, w13_scale = unpack("w1")
+    w2, w2_scale = unpack("w2")
+    return PrequantizedMoEWeights(w13, w2, w13_scale, w2_scale)
 
 
 @pytest.mark.parametrize(
-    "mma_m,route_tile,activation_type,use_fused_finalize",
+    "mma_m,route_tile,activation_type,use_fused_finalize,activation_options,nonlocal_routes",
     [
-        pytest.param(128, 64, ActivationType.Swiglu, False, id="1cta-swiglu-unfused"),
-        pytest.param(128, 64, ActivationType.GegluTanh, True, id="1cta-geglu-fused"),
-        pytest.param(256, 128, ActivationType.Swiglu, True, id="2cta-swiglu-fused"),
         pytest.param(
-            256, 128, ActivationType.GegluTanh, False, id="2cta-geglu-unfused"
+            128, 64, ActivationType.Swiglu, False, {}, False, id="1cta-swiglu-unfused"
         ),
-        pytest.param(256, 64, ActivationType.Relu2, True, id="2cta-relu2-fused"),
         pytest.param(
-            256, 192, ActivationType.Relu2, False, id="2cta-n192-relu2-unfused"
+            128, 64, ActivationType.GegluTanh, True, {}, False, id="1cta-geglu-fused"
+        ),
+        pytest.param(
+            256, 128, ActivationType.Swiglu, True, {}, False, id="2cta-swiglu-fused"
+        ),
+        pytest.param(
+            256,
+            128,
+            ActivationType.GegluTanh,
+            False,
+            {},
+            False,
+            id="2cta-geglu-unfused",
+        ),
+        pytest.param(
+            256, 64, ActivationType.Relu2, True, {}, False, id="2cta-relu2-fused"
+        ),
+        pytest.param(
+            256,
+            192,
+            ActivationType.Relu2,
+            False,
+            {},
+            False,
+            id="2cta-n192-relu2-unfused",
+        ),
+        pytest.param(
+            128,
+            64,
+            ActivationType.Swiglu,
+            False,
+            {"swiglu_alpha": 1.7, "swiglu_beta": 0.2, "swiglu_limit": 0.5},
+            False,
+            id="1cta-parameterized-swiglu-unfused",
+        ),
+        pytest.param(
+            256,
+            128,
+            ActivationType.Swiglu,
+            True,
+            {"situ_beta": 1.3, "situ_linear_beta": 2.7},
+            False,
+            id="2cta-situ-fused",
+        ),
+        pytest.param(
+            256,
+            64,
+            ActivationType.Swiglu,
+            False,
+            {},
+            True,
+            id="2cta-swiglu-nonlocal-unfused",
         ),
     ],
 )
 def test_dynamic_n_graph_routing(
-    mma_m, route_tile, activation_type, use_fused_finalize
+    mma_m,
+    route_tile,
+    activation_type,
+    use_fused_finalize,
+    activation_options,
+    nonlocal_routes,
 ):
-    from flashinfer.cute_dsl.utils import convert_sf_from_mma_layout
-    from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import launch_w4a16_moe
-    from flashinfer.quantization import e2m1_and_ufp8sf_scale_to_float
+    _check_dynamic_n_graph_routing(
+        mma_m,
+        route_tile,
+        activation_type,
+        use_fused_finalize,
+        activation_options,
+        nonlocal_routes,
+    )
 
-    num_tokens, hidden_size, intermediate_size = 129, 256, 512
-    num_experts, top_k = 4, 2
+
+def test_dynamic_n_model_width_graph_routing():
+    _check_dynamic_n_graph_routing(
+        256,
+        64,
+        ActivationType.Swiglu,
+        False,
+        {},
+        False,
+        problem_shape=(17, 7168, 2048),
+    )
+
+
+def _check_dynamic_n_graph_routing(
+    mma_m,
+    route_tile,
+    activation_type,
+    use_fused_finalize,
+    activation_options,
+    nonlocal_routes,
+    *,
+    problem_shape=(129, 256, 512),
+):
+    from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import launch_w4a16_moe
+
+    num_tokens, hidden_size, intermediate_size = problem_shape
+    num_local_experts, top_k = 4, 2
+    num_experts = 8 if nonlocal_routes else num_local_experts
+    local_expert_offset = 2 if nonlocal_routes else 0
     gated = activation_type != ActivationType.Relu2
     tensors = create_moe_tensors(
         num_tokens=num_tokens,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         num_experts=num_experts,
-        num_local_experts=num_experts,
+        num_local_experts=num_local_experts,
         top_k=top_k,
         gated=gated,
-        use_nontrivial_alphas=False,
+        use_nontrivial_alphas=True,
+        vary_block_scales=True,
     )
-    tensors["token_final_scales"][:] = torch.tensor([0.25, 0.75], device="cuda")
+    # FP32 weights and alphas exercise both the FC2 epilogue's scale order and
+    # the different BF16 rounding points of fused and unfused finalization.
+    tensors["token_final_scales"][:] = torch.tensor([0.3127, 0.6873], device="cuda")
     routing = tensors["token_selected_experts"]
     output = torch.empty_like(tensors["x_bf16"])
     gemm_tactic = ((mma_m, route_tile, 256), (2, 1), True)
@@ -172,62 +300,56 @@ def test_dynamic_n_graph_routing(
             w2_weight_sf=tensors["w2_weight_sf"],
             w2_alpha=tensors["w2_alpha"],
             num_experts=num_experts,
-            num_local_experts=num_experts,
-            local_expert_offset=0,
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
             moe_output=output,
             use_fused_finalize=use_fused_finalize,
             enable_pdl=False,
             activation_type=activation_type,
             tactic=(gemm_tactic, gemm_tactic),
+            **activation_options,
         )
 
-    def dequantize(name):
-        packed = tensors[f"{name}_weight"]
-        experts, rows, packed_k = packed.shape
-        scales = convert_sf_from_mma_layout(
-            tensors[f"{name}_weight_sf"], rows, packed_k * 2, experts
-        )
-        return (
-            e2m1_and_ufp8sf_scale_to_float(
-                packed.reshape(-1, packed_k).cpu(),
-                scales.view(torch.uint8).flatten().cpu(),
-                torch.ones(1),
-                sf_vec_size=16,
-                ufp8_type=1,
-                is_sf_swizzled_layout=True,
+    weights = _canonical_reference_weights(tensors, gated)
+    activation = {
+        ActivationType.Swiglu: "swiglu",
+        ActivationType.GegluTanh: "geglu_tanh",
+        ActivationType.Relu2: "relu2",
+    }[activation_type]
+    if activation_options.get("situ_beta") is not None:
+        activation = "situ"
+    route_pairs = [
+        (local_expert_offset, local_expert_offset + 2),
+        (local_expert_offset + 1, local_expert_offset + 3),
+    ]
+    if nonlocal_routes:
+        route_pairs += [(0, local_expert_offset + 2), (0, 1)]
+    route_pairs = torch.tensor(route_pairs, dtype=torch.int32, device="cuda")
+    reference_pairs = []
+    for pair in route_pairs:
+        ids = pair.expand_as(routing)
+        reference_options = dict(activation_options)
+        reference_options["gate_up_clamp"] = reference_options.pop("swiglu_limit", None)
+        reference_pairs.append(
+            w4a16_reference(
+                {
+                    "hidden_states": tensors["x_bf16"],
+                    "topk_ids": ids,
+                    "topk_weights": tensors["token_final_scales"],
+                    "activation": activation,
+                    **reference_options,
+                },
+                weights,
+                fc1_alpha=tensors["w1_alpha"],
+                fc2_alpha=tensors["w2_alpha"],
+                backend="split",
+                local_expert_offset=local_expert_offset,
+                use_fused_finalize=use_fused_finalize,
             )
-            .reshape(experts, rows, packed_k * 2)
-            .cuda()
-            .bfloat16()
-            .float()
         )
+    reference_pairs = torch.stack(reference_pairs)
 
-    # Use the actual quantized weights, not their pre-quantization inputs.
-    w1, w2 = dequantize("w1"), dequantize("w2")
-    if gated:
-        w1 = w1.reshape(num_experts, intermediate_size // 64, 2, 64, hidden_size)
-        w1 = w1.transpose(1, 2).reshape(num_experts, 2 * intermediate_size, hidden_size)
-    fc1 = torch.matmul(tensors["x_bf16"].float(), w1.transpose(1, 2))
-    if gated:
-        up, gate = fc1.chunk(2, dim=-1)
-        if activation_type == ActivationType.Swiglu:
-            intermediate = up * torch.nn.functional.silu(gate)
-        else:
-            intermediate = up * torch.nn.functional.gelu(gate, approximate="tanh")
-    else:
-        intermediate = fc1.relu().square()
-    fc2 = torch.bmm(intermediate.bfloat16().float(), w2.transpose(1, 2))
-    scores = torch.tensor([0.25, 0.25, 0.75, 0.75], device="cuda")[:, None, None]
-    if use_fused_finalize:
-        contributions = (fc2 * scores).bfloat16().float()
-    else:
-        contributions = fc2.bfloat16().float() * scores
-    reference_pairs = torch.stack(
-        [contributions[0] + contributions[2], contributions[1] + contributions[3]]
-    ).bfloat16()
-
-    routing[:, 0] = 0
-    routing[:, 1] = 2
+    routing[:] = route_pairs[0]
     for _ in range(3):
         run()
     torch.cuda.synchronize()
@@ -237,19 +359,91 @@ def test_dynamic_n_graph_routing(
 
     # Expert counts change without changing the graph, tensor sizes or addresses.
     # Start large, shrink over instruction boundaries, then grow to a full tile.
-    for split in (129, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129):
+    boundaries = (1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128)
+    splits = (num_tokens, *(n for n in boundaries if n < num_tokens), num_tokens)
+    for split in splits:
         choices = (torch.arange(num_tokens, device="cuda") >= split).to(torch.int32)
-        routing[:, 0] = choices
-        routing[:, 1] = choices + 2
+        if nonlocal_routes:
+            choices = choices * 2 + torch.arange(num_tokens, device="cuda") % 2
+        routing[:] = route_pairs[choices.long()]
         output.fill_(float("nan"))
         graph.replay()
         captured = output.clone()
         expected = reference_pairs[
             choices.long(), torch.arange(num_tokens, device="cuda")
         ]
-        torch.testing.assert_close(captured, expected, rtol=0.015, atol=0.005)
+        assert_w4a16_bits(captured, expected)
         output.fill_(float("nan"))
         run()
         # Two contributions per output make the BF16 atomic sum independent
         # of route order, so replay and eager execution must agree bit for bit.
-        torch.testing.assert_close(captured, output, rtol=0, atol=0)
+        assert_w4a16_bits(captured, output)
+
+
+@pytest.mark.parametrize("input_is_expanded", [False, True])
+def test_split_finalize_fma_contract(input_is_expanded):
+    from flashinfer.fused_moe.cute_dsl.blackwell.moe_finalize import moe_unpermute
+
+    pytest.importorskip("triton")
+    num_tokens, top_k, hidden_size = 8, 8, 8
+    terms = torch.full(
+        (num_tokens, top_k, hidden_size),
+        float("nan"),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    scores = torch.full((num_tokens, top_k), float("nan"), device="cuda")
+    local = torch.zeros((num_tokens, top_k), dtype=torch.bool, device="cuda")
+
+    # The exact residual is 2**-30. Separately rounding the final multiply
+    # before the add instead produces zero. Visit all eight route slots.
+    local[0] = True
+    terms[0] = 0
+    scores[0] = 0.314159
+    terms[0, 0], scores[0, 0] = -1, 1 + 2**-7 + 2**-23
+    terms[0, 7], scores[0, 7] = 1 + 2**-7, 1 + 2**-23
+    # Both BF16 and FP32 subnormal operands are preserved, as are subnormal
+    # products; the final BF16 conversion must not silently flush them either.
+    local[1:5, 3] = True
+    terms[1, 3], scores[1, 3] = 2**-133, 2**20
+    terms[2, 3], scores[2, 3] = 2**30, 2**-140
+    terms[3, 3], scores[3, 3] = 2**-120, 2**-10
+    terms[4, 3], scores[4, 3] = -(2**-120), 2**-10
+    # Slot zero uses multiply, preserving -0. A later -0 uses FMA with +0.
+    # The all-nonlocal row remains +0 without reading its NaN inputs.
+    local[5, 0] = local[7, 3] = True
+    terms[5, 0], scores[5, 0] = -0.0, 1.0
+    terms[7, 3], scores[7, 3] = -0.0, 1.0
+    expected = torch.zeros(
+        (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
+    )
+    expected[0] = 2**-30
+    expected[1] = 2**-113
+    expected[2] = 2**-110
+    expected[3] = 2**-130
+    expected[4] = -(2**-130)
+    expected[5] = -0.0
+    reference = combine_w4a16_split_terms(terms, scores, local)
+    assert_w4a16_bits(reference, expected)
+
+    expanded = terms.reshape(num_tokens * top_k, hidden_size)
+    route_rows = torch.arange(num_tokens * top_k, device="cuda", dtype=torch.int32)
+    if input_is_expanded:
+        expert_output = expanded.contiguous()
+        mapping = route_rows.reshape(num_tokens, top_k)
+    else:
+        # A nonidentity permutation makes addressing errors observable too.
+        expert_output = expanded.flip(0).contiguous()
+        mapping = route_rows.flip(0).reshape(num_tokens, top_k)
+    mapping = mapping.masked_fill(~local, -1).contiguous()
+    output = torch.full_like(expected, float("nan"))
+    moe_unpermute(
+        expert_output,
+        output,
+        mapping,
+        scores,
+        num_tokens,
+        top_k,
+        input_is_expanded=input_is_expanded,
+    )
+    assert_w4a16_bits(output, reference)
