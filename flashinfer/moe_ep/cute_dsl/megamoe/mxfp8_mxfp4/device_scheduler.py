@@ -249,8 +249,6 @@ class DeviceSchedulerParams:
         self.claim_order = claim_order
         self.load_balance_mode = load_balance_mode
         self.load_balance_counter_ptr = load_balance_counter_ptr
-        # wait accounting (debug knob): mega stats word offset or None.
-        self.wait_stats_offset = None
         self.num_stages = num_stages
 
     @property
@@ -324,7 +322,6 @@ class DeviceSchedulerParams:
             "load_balance_mode",
             "claim_order",
             "num_stages",
-            "wait_stats_offset",
         ):
             setattr(result, name, getattr(self, name))
         assert idx == len(values)
@@ -811,25 +808,7 @@ class PersistentDeviceScheduler:
     def internal_init(self, warp_idx, sched_warp_id: int, *, loc=None, ip=None):
         """Prime the scheduler after dispatch has reset counters and counts."""
         if warp_idx == sched_warp_id:
-            if const_expr(self.params.wait_stats_offset is not None):
-                from .wait_stats import Slot, globaltimer_lo, stat_add
-                from .wait_stats_config import SLOTS
-
-                bx, by, bz = cute.arch.block_idx()
-                gx, gy, _ = cute.arch.grid_dim()
-                table_stats = (
-                    self.params.fc1_done_counter_ptr
-                    + Int32(self.params.wait_stats_offset)
-                    + (bx + by * gx + bz * gx * gy) * Int32(SLOTS)
-                )
-                table_start = globaltimer_lo()
             self._init_expert_tables()
-            if const_expr(self.params.wait_stats_offset is not None):
-                if cute.arch.lane_idx() == Int32(0):
-                    stat_add(
-                        table_stats + Int32(Slot.SCHED_INIT_DECODE_NS),
-                        globaltimer_lo() - table_start,
-                    )
             # Carry the helper's rebound count view across the warp branch.
             self.params = self.params
         else:
@@ -877,44 +856,10 @@ class PersistentDeviceScheduler:
                 self._alternating = self._alternating
         elif const_expr(self.params.load_balance_mode == "static"):
             if warp_idx == sched_warp_id:
-                # wait accounting (debug knob, mega only): the params
-                # carry the stats region's word offset from fc1_done_counter.
-                stats_offset = getattr(self.params, "wait_stats_offset", None)
-                if const_expr(stats_offset is not None):
-                    from .wait_stats import Slot, globaltimer_lo, stat_add
-                    from .wait_stats_config import SLOTS
-
-                    bx, by, bz = cute.arch.block_idx()
-                    gx, gy, _ = cute.arch.grid_dim()
-                    stats_base = (
-                        self.params.fc1_done_counter_ptr
-                        + Int32(stats_offset)
-                        + (bx + by * gx + bz * gx * gy) * Int32(SLOTS)
-                    )
-                    loads_start = globaltimer_lo()
-                    if cute.arch.lane_idx() == Int32(0):
-                        stat_add(
-                            stats_base + Int32(Slot.SCHED_LOADS_START_RAW), loads_start
-                        )
-                    touched = Int32(0)
-                    for expert in cutlass.range(0, self.expert_count, 1, unroll=1):
-                        touched = touched + self.params.expert_token_sizes[expert]
-                    decode_start = globaltimer_lo()
-                    if cute.arch.lane_idx() == Int32(0):
-                        stat_add(
-                            stats_base + Int32(Slot.SCHED_INIT_COUNT_LOADS_NS),
-                            decode_start - loads_start + (touched >> Int32(31)),
-                        )
                 claimed = self._claim_static()
                 self._decode_claim(claimed)
                 self._state = self._state
                 self.current_work = self.current_work
-                if const_expr(stats_offset is not None):
-                    if cute.arch.lane_idx() == Int32(0):
-                        stat_add(
-                            stats_base + Int32(Slot.SCHED_INIT_DECODE_NS),
-                            globaltimer_lo() - decode_start,
-                        )
             else:
                 self._state = self._state
                 self.current_work = self.current_work
@@ -1011,12 +956,6 @@ class PersistentDeviceScheduler:
                     threshold = (
                         index // self._fc2_feature_blocks + Int32(1)
                     ) * self._fc1_feature_blocks
-                    stats_offset = self.params.wait_stats_offset
-                    if const_expr(stats_offset is not None):
-                        from .wait_stats import Slot, globaltimer_lo, stat_add
-                        from .wait_stats_config import SLOTS
-
-                        started = globaltimer_lo()
                     observed = Int32(0)
                     while observed < threshold:
                         observed = cute.arch.load(
@@ -1024,16 +963,6 @@ class PersistentDeviceScheduler:
                             Int32,
                             sem="acquire",
                             scope="gpu",
-                        )
-                    if const_expr(stats_offset is not None):
-                        bx, by, bz = cute.arch.block_idx()
-                        gx, gy, _ = cute.arch.grid_dim()
-                        stat_add(
-                            self.params.fc1_done_counter_ptr
-                            + Int32(stats_offset)
-                            + (bx + by * gx + bz * gx * gy) * Int32(SLOTS)
-                            + Int32(Slot.SCHED_LATE_CLAIM_NS),
-                            globaltimer_lo() - started,
                         )
                     claimed = -index - Int32(1)
                     searching = Int32(0)

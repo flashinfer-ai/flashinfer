@@ -3,10 +3,9 @@
 
 """Graph-safe lazy frontend boundary for MXFP8 x MXFP4 MegaMoE.
 
-The persistent kernel is assembled separately.  Integration supplies a small
-adapter that compiles a :class:`KernelLaunchSpec` and binds it to a zero-arg
-launcher.  Keeping that adapter injectable freezes the host contract without
-guessing the unfinished kernel's Python constructor or ``__call__`` signature.
+Integration compiles a :class:`KernelLaunchSpec` and binds a zero-argument
+launcher. Compilation and binding caches preserve workspace ownership and
+allow stream rebinding without rebuilding tensor adapters during capture.
 """
 
 from __future__ import annotations

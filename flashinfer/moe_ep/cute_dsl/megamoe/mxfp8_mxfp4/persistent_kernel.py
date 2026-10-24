@@ -18,60 +18,6 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 
-class KernelAssemblyPendingError(RuntimeError):
-    """Raised when a native assembly dependency is unavailable."""
-
-
-@dataclass(frozen=True)
-class DeviceAssemblyProtocol:
-    required_launch_regions: tuple[str, ...] = ("local", "shared", "route_terms")
-    required_local_views: tuple[str, ...] = (
-        "l1_arrival_count",
-        "expert_send_count",
-        "grid_sync_counter",
-        "fc1_done_counter",
-        "l1_token_buffer",
-        "nvlink_barrier_counter",
-        "l1_sf_buffer",
-        "l1_topk_weights_buffer",
-        "token_src_metadata",
-        "fc1_output",
-        "fc1_output_sf",
-    )
-    dispatch_products: tuple[str, ...] = (
-        "expert_recv_count_sum",
-        "expert_pool_offsets",
-        "token_src_metadata",
-        "fc1_ready_counters",
-    )
-    weight_scale_products: tuple[str, ...] = (
-        "fc1_weight_sfa_logical",
-        "fc2_weight_sfa_logical",
-    )
-
-
-DEVICE_ASSEMBLY_PROTOCOL = DeviceAssemblyProtocol()
-# The M128/N128 single-rank assembly passed the B200 compile and numerical gate.
-ASSEMBLY_READY = True
-
-
-def _missing_protocols() -> tuple[str, ...]:
-    probes = (
-        ("device_workspace", "DeviceWorkspacePartition"),
-        ("dispatch", "SingleRankMxfp8DispatchPhase"),
-        ("weight_scale_views", "SwizzledWeightScaleViews"),
-        ("packed_weight_views", "PackedWeightViews"),
-    )
-    missing = []
-    for module, symbol in probes:
-        try:
-            imported = __import__(f"{__package__}.{module}", fromlist=[symbol])
-            getattr(imported, symbol)
-        except (ImportError, AttributeError):
-            missing.append(f"{module}.{symbol}")
-    return tuple(missing)
-
-
 @dataclass(frozen=True)
 class _CompiledAssembly:
     persistent: Any
@@ -136,7 +82,7 @@ def _layout_adapter(cls, *, hidden: int, intermediate: int, experts: int):
     return obj
 
 
-class _MegaAdapterBindings:
+class PersistentMxfp8Mxfp4KernelAdapter:
     """Frontend adapter for one native persistent kernel plus reducer."""
 
     def __init__(self, *, workspace, tactic, gate_up_clamp, fast_math) -> None:
@@ -144,10 +90,6 @@ class _MegaAdapterBindings:
         self.tactic = dict(tactic)
         self.gate_up_clamp = gate_up_clamp
         self.fast_math = bool(fast_math)
-
-    @staticmethod
-    def assembly_protocol() -> DeviceAssemblyProtocol:
-        return DEVICE_ASSEMBLY_PROTOCOL
 
     def _validate_static_contract(self, config, spec) -> None:
         expected = {
@@ -166,7 +108,7 @@ class _MegaAdapterBindings:
             raise ValueError(f"frontend/workspace static contract mismatch: {mismatch}")
         missing = tuple(
             key
-            for key in DEVICE_ASSEMBLY_PROTOCOL.required_launch_regions
+            for key in ("local", "shared", "route_terms")
             if key not in spec.workspace_regions
         )
         if missing:
@@ -264,17 +206,6 @@ class _MegaAdapterBindings:
             expert_scale_row_offsets=None,
         )
 
-
-class PersistentFc12KernelBase:
-    """Shared compute assembly; communication is a compile-time specialization."""
-
-    # Concrete launchers supply these before assembling the shared kernel.
-    tactic: dict[str, Any]
-    workspace: Any
-    gate_up_clamp: float | None
-    fast_math: bool
-
-    mega = False
     resolved_num_stages = None
     resolved_persistent_clusters = None
 
@@ -302,17 +233,15 @@ class PersistentFc12KernelBase:
         from .dispatch import Mxfp8DispatchPhase
         from .kernel_pipelines import fit_operand_stages
 
-        dispatch = None
-        if self.mega:
-            dispatch = Mxfp8DispatchPhase(
-                wc,
-                rank=local_rank,
-                cluster_shape_mn=cluster_shape_mn,
-                dispatch_warp_start=warps.dispatch[0],
-                num_other_warps=len(warps.epilogue) + 4,
-                flag_batch=flag_batch,
-                cta_local_counts=self.tactic.get("cta_local_counts", False),
-            )
+        dispatch = Mxfp8DispatchPhase(
+            wc,
+            rank=local_rank,
+            cluster_shape_mn=cluster_shape_mn,
+            dispatch_warp_start=warps.dispatch[0],
+            num_other_warps=len(warps.epilogue) + 4,
+            flag_batch=flag_batch,
+            cta_local_counts=self.tactic.get("cta_local_counts", False),
+        )
         fit = fit_operand_stages(
             mma_tiler_mnk=tuple(self.tactic["mma_tiler_mnk"]),
             scheduler_params=SimpleNamespace(
@@ -383,22 +312,11 @@ class PersistentFc12KernelBase:
         self.resolved_persistent_clusters = clusters
         m, n, _ = self.tactic["mma_tiler_mnk"]
         cm, cn, _ = self.tactic["cluster_shape_mnk"]
-        mega = self.mega
         cta_local_counts = self.tactic.get("cta_local_counts", False)
-        in_kernel_reduce = mega and self.tactic.get("in_kernel_reduce", False)
-        # The tactic selects the epilogue width (Mega always resolves one);
-        # the lean proxy's fixed tactic has none and follows the environment.
+        in_kernel_reduce = self.tactic.get("in_kernel_reduce", False)
         epilogue_warps = self.tactic.get("epilogue_warps", EPILOGUE_WARPS)
-        warps = KernelWarpIds.for_epilogue(epilogue_warps, mega=mega)
-        # wait accounting (debug knob): the mega stats region offset.
-        from .wait_stats_config import mega_stats_word_offset
+        warps = KernelWarpIds.for_epilogue(epilogue_warps, mega=True)
 
-        workspace = getattr(self, "workspace", None)
-        stats_word_offset = (
-            mega_stats_word_offset(workspace.plan)
-            if mega and workspace is not None
-            else None
-        )
         weight_layouts = _layout_adapter(
             PackedWeightViews,
             hidden=config.hidden,
@@ -417,8 +335,6 @@ class PersistentFc12KernelBase:
         input_sf_capacity = wc.pool_sf_capacity
         output_sf_capacity = (
             wc.pool_token_capacity + wc.num_experts_per_rank * wc.sf_padding_block
-            if mega
-            else wc.pool_sf_capacity
         )
         cluster_size = cm * cn
         active_sms = clusters * cluster_size
@@ -432,12 +348,8 @@ class PersistentFc12KernelBase:
         # Every CTA publishes FC1 completion once per 128-row tile, so FC2
         # waits for all ceil(2I / cta_m) tiles of the token block.
         fc2_threshold = (2 * config.intermediate + cta_m - 1) // cta_m
-        claim_order = (
-            self.tactic.get("claim_order", "expert") if self.mega else "expert"
-        )
+        claim_order = self.tactic.get("claim_order", "expert")
         load_balance_mode = self.tactic["load_balance_mode"]
-        if not self.mega and load_balance_mode != "static":
-            raise ValueError("lean FC12 requires static load balancing")
         flag_batch = self.tactic["flag_batch"]
         weight_l2_evict_first = self.tactic.get("weight_l2_evict_first", False)
         num_stages = self.tactic["num_stages"]
@@ -494,17 +406,15 @@ class PersistentFc12KernelBase:
                 cluster_shape_mn=(cm, cn),
                 num_stages=num_stages,
             )
-            dispatch = None
-            if cutlass.const_expr(mega):
-                dispatch = Mxfp8DispatchPhase(
-                    wc,
-                    rank=local_rank,
-                    cluster_shape_mn=(cm, cn),
-                    dispatch_warp_start=warps.dispatch[0],
-                    num_other_warps=len(warps.epilogue) + 4,
-                    flag_batch=flag_batch,
-                    cta_local_counts=cta_local_counts,
-                )
+            dispatch = Mxfp8DispatchPhase(
+                wc,
+                rank=local_rank,
+                cluster_shape_mn=(cm, cn),
+                dispatch_warp_start=warps.dispatch[0],
+                num_other_warps=len(warps.epilogue) + 4,
+                flag_batch=flag_batch,
+                cta_local_counts=cta_local_counts,
+            )
             epilogue = PersistentMxfp8Mxfp4Epilogue(
                 DeviceEpilogueConfig(
                     cta_tile_features=cta_m,
@@ -554,7 +464,7 @@ class PersistentFc12KernelBase:
                 warp_ids=warps,
             )
             storage = smem.allocate(pipes.shared_storage_type())
-            if cutlass.const_expr(mega and cta_local_counts):
+            if cutlass.const_expr(cta_local_counts):
                 scheduler_params.expert_token_sizes = dispatch.bind_local_counts(
                     dispatch_args, storage.dispatch
                 )
@@ -619,11 +529,10 @@ class PersistentFc12KernelBase:
                     cpasync.prefetch_descriptor(atom)
             fc2_store = Fc2RouteStore(
                 route_terms,
-                dispatch_args.peer_rank_ptr_mapper if mega else None,
+                dispatch_args.peer_rank_ptr_mapper,
             )
             PersistentM128DeviceDriver(
                 kernel_pipelines=pipes,
-                stats_word_offset=stats_word_offset,
                 weight_l2_evict_first=weight_l2_evict_first,
             )(
                 mainloop_pipelines=mainloop,
@@ -638,10 +547,10 @@ class PersistentFc12KernelBase:
                     fc1_output_scales=fc1_output_sf_logical,
                     route_store=fc2_store,
                     fc1_done_counter=fc1_done_counter,
-                    token_metadata=dispatch_args.token_src_metadata if mega else None,
+                    token_metadata=dispatch_args.token_src_metadata,
                 ),
                 dispatch_args=dispatch_args,
-                dispatch_storage=storage.dispatch if mega else None,
+                dispatch_storage=storage.dispatch,
                 epilogue_exchange=epilogue_exchange,
                 fc1_k_tiles=(config.hidden + staging.mma_tiler[2] - 1)
                 // staging.mma_tiler[2],
@@ -692,38 +601,33 @@ class PersistentFc12KernelBase:
                     cluster_shape_mn=(cm, cn),
                     num_stages=num_stages,
                 )
-                args = None
-                counts = expert_recv_count_sum
-                if cutlass.const_expr(mega):
-                    args = self.make_dispatch_args(
-                        input_token_buffer,
-                        input_sf_buffer,
-                        input_topk_idx,
-                        input_topk_weights,
-                        expert_send_count,
-                        expert_recv_count,
-                        expert_recv_count_sum,
-                        src_token_topk_idx,
-                        token_src_metadata,
-                        l1_arrival_count,
-                        l1_token_buffer,
-                        l1_sf_buffer,
-                        l1_topk_weights_buffer,
-                        nvlink_barrier_signal,
-                        nvlink_barrier_counter,
-                        grid_sync_counter,
-                        local_zero_prefix,
-                        shared_zero_prefix,
-                        peer_rank_ptr_mapper_host,
-                        route_terms,
-                    )
-                    counts_i32 = cute.recast_tensor(
-                        expert_recv_count_sum, cutlass.Int32
-                    )
-                    counts = cute.make_tensor(
-                        counts_i32.iterator,
-                        cute.make_layout((config.num_experts,), stride=(2,)),
-                    )
+                args = self.make_dispatch_args(
+                    input_token_buffer,
+                    input_sf_buffer,
+                    input_topk_idx,
+                    input_topk_weights,
+                    expert_send_count,
+                    expert_recv_count,
+                    expert_recv_count_sum,
+                    src_token_topk_idx,
+                    token_src_metadata,
+                    l1_arrival_count,
+                    l1_token_buffer,
+                    l1_sf_buffer,
+                    l1_topk_weights_buffer,
+                    nvlink_barrier_signal,
+                    nvlink_barrier_counter,
+                    grid_sync_counter,
+                    local_zero_prefix,
+                    shared_zero_prefix,
+                    peer_rank_ptr_mapper_host,
+                    route_terms,
+                )
+                counts_i32 = cute.recast_tensor(expert_recv_count_sum, cutlass.Int32)
+                counts = cute.make_tensor(
+                    counts_i32.iterator,
+                    cute.make_layout((config.num_experts,), stride=(2,)),
+                )
                 params = DeviceSchedulerParams(
                     expert_token_sizes=counts,
                     expert_count=config.num_experts,
@@ -737,7 +641,7 @@ class PersistentFc12KernelBase:
                     group_hint=group_hint,
                     token_padding_block=wc.token_padding_block,
                     sf_padding_block=wc.sf_padding_block,
-                    fc1_ready_counter_ptr=l1_arrival_count.iterator if mega else None,
+                    fc1_ready_counter_ptr=l1_arrival_count.iterator,
                     fc1_done_counter_ptr=fc1_done_counter.iterator,
                     fc2_ready_threshold=fc2_threshold,
                     load_balance_mode=load_balance_mode,
@@ -748,8 +652,6 @@ class PersistentFc12KernelBase:
                         else None
                     ),
                 )
-                # wait accounting (debug knob, mega only).
-                params.wait_stats_offset = stats_word_offset
                 w = weight_layouts.make_logical_views(fc1_weight, fc2_weight)
                 ws = sf_layouts.make_logical_views(fc1_weight_scales, fc2_weight_scales)
                 x1 = cute.make_tensor(
@@ -885,20 +787,8 @@ class PersistentFc12KernelBase:
 
         return Launcher()
 
-
-class PersistentMxfp8Mxfp4KernelAdapter(_MegaAdapterBindings, PersistentFc12KernelBase):
-    """Mega specialization of the shared FC12 kernel, with NVLink dispatch."""
-
-    mega = True
-
     def compile(self, config: "FrontendConfig", spec: "KernelLaunchSpec") -> Any:
         self._validate_static_contract(config, spec)
-        missing = _missing_protocols()
-        if missing:
-            raise KernelAssemblyPendingError(
-                "native persistent MXFP8 x MXFP4 assembly is waiting for: "
-                + ", ".join(missing)
-            )
         import cutlass.cute as cute
         import cutlass.utils as cutlass_utils
         from .fc2_epilogue import DeterministicTopKReducer
@@ -968,10 +858,5 @@ class PersistentMxfp8Mxfp4KernelAdapter(_MegaAdapterBindings, PersistentFc12Kern
 
 
 __all__ = [
-    "ASSEMBLY_READY",
-    "DEVICE_ASSEMBLY_PROTOCOL",
-    "DeviceAssemblyProtocol",
-    "KernelAssemblyPendingError",
-    "PersistentFc12KernelBase",
     "PersistentMxfp8Mxfp4KernelAdapter",
 ]

@@ -275,13 +275,7 @@ def local_region_specs(config: WorkspaceConfig) -> tuple[RegionSpec, ...]:
             ),
         ]
     )
-    from .wait_stats_config import MEGA_STATS_WORDS, wait_stats_enabled
 
-    if wait_stats_enabled():
-        # Debug-only; after the data regions so the tail's zero-prefix reset
-        # keeps it. Accumulates across launches; the reader zeroes it. The
-        # per-CTA block is followed by the start-up ring.
-        specs.append(_region("wait_stats", "int32", 4, (MEGA_STATS_WORDS,)))
     return tuple(specs)
 
 

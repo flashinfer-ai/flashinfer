@@ -196,7 +196,7 @@ B200, both `nccl_ep` and `nixl_ep`. Correctness is covered in `docs/design_docs/
 
 ## MXFP8 x MXFP4 MegaMoE
 
-`benchmarks/bench_mxfp8_mxfp4.py` measures the native SM100
+`benchmarks/moe_ep/backends/mega/kernel/sm100/bench_mxfp8_mxfp4.py` measures the native SM100
 MegaMoE block with pre-staged inputs, default tactics, and cold-L2 CUPTI
 timing over CUDA graph replay. It records absolute latency, GPU identity,
 geometry, software versions, and tactics. Use `--save-outputs` for exact
@@ -204,13 +204,12 @@ before/after checks. Run each revision in a fresh process on the same B200,
 then repeat the baseline to detect drift:
 
 ```bash
-python benchmarks/bench_mxfp8_mxfp4.py \
+python benchmarks/moe_ep/backends/mega/kernel/sm100/bench_mxfp8_mxfp4.py \
   --tokens 32 128 512 --hidden 4096 --intermediate 6400 \
   --experts 32 --top-k 8 \
   --output /tmp/mxfp8-mxfp4.json --save-outputs /tmp/mxfp8-mxfp4.pt
 ```
 
-`benchmarks/profile_mxfp8_mxfp4_lean.py` provides focused FC1/FC2 profiling.
 Routing and attention are excluded from these measurements.
 
 ### Synthetic EP2 example on GB300
@@ -260,7 +259,7 @@ graph replay, 50 warmups, median of 100 samples):
 
 Cache residency determines the copy cost in a real forward. These activity
 durations isolate the copy; full MoE timings above use the workspace view.
-Add `--owned-output` to `benchmarks/bench_mxfp8_mxfp4.py` to include the copy
+Add `--owned-output` to `benchmarks/moe_ep/backends/mega/kernel/sm100/bench_mxfp8_mxfp4.py` to include the copy
 in an end-to-end single-GPU measurement. Reproduce the isolated copy with:
 
 ```python

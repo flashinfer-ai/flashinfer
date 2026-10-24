@@ -56,7 +56,6 @@ def test_single_rank_dispatch_compacts_mxfp8_routes_on_device(
     local_counts,
     hidden,
     scale_offset,
-    monkeypatch,
 ) -> None:
     pytest.importorskip("cutlass")
     from flashinfer.utils import is_sm100a_supported
@@ -64,7 +63,6 @@ def test_single_rank_dispatch_compacts_mxfp8_routes_on_device(
     if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("requires SM100/SM103 and CUDA 12.8+")
 
-    monkeypatch.setenv("FLASHINFER_MXFP8_MXFP4_WAIT_STATS", "1")
     config = _config(hidden)
     plan = make_workspace_plan(config)
     device = torch.device("cuda")
@@ -215,29 +213,6 @@ def test_single_rank_dispatch_compacts_mxfp8_routes_on_device(
             products.expert_pool_offsets.expert_counts.cpu(),
             torch.tensor([2, 2, 3, 0], dtype=torch.int32),
         )
-
-
-def test_startup_ring_layout_and_decode() -> None:
-    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.wait_stats_config import (
-        MEGA_STATS_WORDS,
-        STARTUP_RING_ENTRIES,
-        STARTUP_RING_WORDS,
-        STATS_WORDS,
-        decode_startup_ring,
-    )
-
-    assert MEGA_STATS_WORDS == STATS_WORDS + 1 + 3 * STARTUP_RING_ENTRIES
-    ring = torch.zeros(STARTUP_RING_WORDS, dtype=torch.int32)
-    # Device layout: word 0 counts launches; entry i holds (launch + 1,
-    # arrival ns, wait ns) of launch i modulo the ring size.
-    ring[0] = 3
-    for launch, arrival, wait in ((2, 9000, 1500), (0, 7000, 2500), (1, 8000, 500)):
-        ring[1 + 3 * launch : 4 + 3 * launch] = torch.tensor(
-            [launch + 1, arrival, wait]
-        )
-    rows = decode_startup_ring(ring)
-    assert [row["launch"] for row in rows] == [0, 1, 2]
-    assert rows[0] == {"launch": 0, "local_arrival_us": 7.0, "signal_wait_us": 2.5}
 
 
 def test_dispatch_rejects_distributed_configuration() -> None:

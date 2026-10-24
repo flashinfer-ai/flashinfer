@@ -60,16 +60,17 @@ def test_compute_uses_stable_reducer_output(monkeypatch, owned_output):
     torch.testing.assert_close(result, view)
 
 
-def test_backend_registers_after_persistent_assembly_is_ready() -> None:
-    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.persistent_kernel import (
-        ASSEMBLY_READY,
+def test_backend_registers() -> None:
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp4_bf16_cutedsl.backend import (
+        Mxfp8Mxfp4CutedslMegaKernelBackend,
     )
 
-    assert ASSEMBLY_READY is True
     config = Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=128, top_k=4
     )
     assert is_mega_kernel_config(config)
+    assert isinstance(create_mega_kernel(config), Mxfp8Mxfp4CutedslMegaKernelBackend)
 
 
 def test_public_name_and_quant_taxonomy_are_activation_first() -> None:

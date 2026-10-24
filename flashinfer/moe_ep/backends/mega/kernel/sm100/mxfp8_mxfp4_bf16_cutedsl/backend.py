@@ -250,7 +250,7 @@ class Mxfp8Mxfp4CutedslMegaKernelBackend(MegaKernelBackend):
             # including graph capture; rebinding DLPack views there is unsafe.
             # GB300 BF16 copy, H4096/T32..1024: 1.15-2.61 us warm L2,
             # 1.94-4.83 us cold L2 (CUPTI activity measurements).
-            # Method and reproduction: benchmarks/moe_ep/MoE_benchmarks.md.
+            # Method and reproduction: benchmarks/MoE_benchmarks.md.
             None,
             transformed_weights[0],
             transformed_weights[1],
@@ -303,15 +303,13 @@ __all__ = ["Mxfp8Mxfp4CutedslMegaKernelBackend"]
 # the original import failure through the registry.
 try:
     from ......cute_dsl.megamoe.mxfp8_mxfp4.persistent_kernel import (
-        ASSEMBLY_READY as _ASSEMBLY_READY,
+        PersistentMxfp8Mxfp4KernelAdapter as _KernelAdapter,  # noqa: F401
     )
 except ImportError as exc:
     from ......core.kernel.registry import register_unavailable_mega_kernel
 
     register_unavailable_mega_kernel(KERNEL_NAME, exc)
-    _ASSEMBLY_READY = False
-
-if _ASSEMBLY_READY:
+else:
     from ......core.kernel.registry import register_mega_kernel
 
     register_mega_kernel(KERNEL_NAME)(Mxfp8Mxfp4CutedslMegaKernelBackend)

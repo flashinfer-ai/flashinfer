@@ -12,8 +12,7 @@ from typing import Any
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
-from cutlass.cutlass_dsl import Float32, Int32, Int64, Uint32, dsl_user_op
-from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import Float32, Int32, Int64, Uint32
 
 from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.src.src.grid_sync import (
     software_grid_sync,
@@ -36,24 +35,7 @@ from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.src.src.sf_swizzle impor
 )
 from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.src.src.token_comm import (
     TokenSrcMetadata,
-    _iket,
 )
-
-from .wait_stats import Slot, SLOTS, globaltimer_lo
-
-
-@dsl_user_op
-def _startup_phase_assert(actual, expected, *, loc=None, ip=None):
-    llvm.inline_asm(
-        None,
-        [actual.ir_value(), expected.ir_value()],
-        "{ .reg .pred p; setp.ne.s32 p, $0, $1; @p trap; }",
-        "r,r",
-        has_side_effects=True,
-        asm_dialect=0,
-        loc=loc,
-        ip=ip,
-    )
 
 
 def overwrite_count_token_comm_class(base: Any) -> type:
@@ -142,15 +124,7 @@ def overwrite_count_token_comm_class(base: Any) -> type:
             num_global_warps: cutlass.Constexpr[int] = num_sms * self.num_dispatch_warps
             token_idx = sm_idx * Int32(self.num_dispatch_warps) + warp_idx
 
-            _iket_pull_emit = (
-                (sm_idx == Int32(0))
-                and (warp_idx == Int32(0))
-                and (lane_idx == Int32(0))
-            )
-
             while current_expert_idx < Int32(self.num_experts_per_rank):
-                if _iket_pull_emit:
-                    _iket.range_push("Pull.ChooseToken")
                 old_expert_idx = current_expert_idx
                 while (token_idx >= expert_end_idx) and (
                     current_expert_idx < Int32(self.num_experts_per_rank)
@@ -246,10 +220,6 @@ def overwrite_count_token_comm_class(base: Any) -> type:
                         else:
                             decided = Int32(1)
 
-                    if _iket_pull_emit:
-                        _iket.range_pop()  # Pull.ChooseToken
-                        _iket.range_push("Pull.TMA_NVLink_Roundtrip")
-
                     src_token_topk = Uint32(
                         src_token_topk_idx[
                             current_expert_idx,
@@ -293,8 +263,6 @@ def overwrite_count_token_comm_class(base: Any) -> type:
                     # in SF_Weight_STG, the first use. TMA_Wait is the row load's
                     # remaining mbarrier wait; the outer TMA_NVLink_Roundtrip spans
                     # issue to completion.
-                    if _iket_pull_emit:
-                        _iket.range_push("Pull.SF_Load")
 
                     sf_token_in_pool_axis = (
                         expert_sf_pool_block_offset * Int32(self.sf_padding_block)
@@ -325,9 +293,6 @@ def overwrite_count_token_comm_class(base: Any) -> type:
                             )
                             sf_vals[i] = ldg_b32_raw(sf_addr)
 
-                    if _iket_pull_emit:
-                        _iket.range_pop()  # Pull.SF_Load
-                        _iket.range_push("Pull.Weight_LDG")
                     weight = Float32(0.0)
                     if lane_idx == Int32(0):
                         weight_addr = (
@@ -338,10 +303,6 @@ def overwrite_count_token_comm_class(base: Any) -> type:
                             )
                         )
                         weight = ldg_f32_raw(weight_addr)
-
-                    if _iket_pull_emit:
-                        _iket.range_pop()  # Pull.Weight_LDG
-                        _iket.range_push("Pull.SF_Weight_STG")
 
                     for i in cutlass.range_constexpr(0, sf_passes, 1):
                         j = Int32(i * self.warp_threads) + lane_idx
@@ -364,9 +325,6 @@ def overwrite_count_token_comm_class(base: Any) -> type:
                     if lane_idx == Int32(0):
                         fc1_input_topk_weights_buffer[pool_token_idx] = weight
 
-                    if _iket_pull_emit:
-                        _iket.range_pop()  # Pull.SF_Weight_STG
-                        _iket.range_push("Pull.TMA_Wait")
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive_and_expect_tx(
                             pull_mbar_ptr + warp_idx, Int32(self.hidden_bytes)
@@ -375,11 +333,6 @@ def overwrite_count_token_comm_class(base: Any) -> type:
                             pull_mbar_ptr + warp_idx,
                             phase_bit,
                         )
-
-                    if _iket_pull_emit:
-                        _iket.range_pop()  # Pull.TMA_Wait
-                        _iket.range_pop()  # Pull.TMA_NVLink_Roundtrip (outer)
-                        _iket.range_push("Pull.TMA_Store")
 
                     with cute.arch.elect_one():
                         pull_buffer_warp_ptr = pull_buffer_ptr + (
@@ -394,8 +347,6 @@ def overwrite_count_token_comm_class(base: Any) -> type:
                             Int32(self.hidden_bytes),
                         )
 
-                    if _iket_pull_emit:
-                        _iket.range_push("Pull.Metadata_STG")
                     with cute.arch.elect_one():
                         TokenSrcMetadata(
                             src_rank=current_rank_in_expert_idx,
@@ -405,16 +356,10 @@ def overwrite_count_token_comm_class(base: Any) -> type:
                             token_src_metadata.iterator
                             + Int64(pool_token_idx) * Int64(TokenSrcMetadata.nbytes)
                         )
-                    if _iket_pull_emit:
-                        _iket.range_pop()  # Pull.Metadata_STG
 
                     with cute.arch.elect_one():
                         cute.arch.cp_async_bulk_commit_group()
                         cute.arch.cp_async_bulk_wait_group(0)
-
-                    if _iket_pull_emit:
-                        _iket.range_pop()  # Pull.TMA_Store
-                        _iket.range_push("Pull.Arrival_Atomic")
 
                     # Accumulate this token's release target into the rotating-lane
                     # batch tracker.  task_tile_idx is warp-uniform (token_idx /
@@ -434,22 +379,6 @@ def overwrite_count_token_comm_class(base: Any) -> type:
                         task_tile_addr,
                     )
                     cute.arch.sync_warp()
-
-                    if _iket_pull_emit:
-                        _iket.range_pop()  # Pull.Arrival_Atomic
-                    # Pull progress on every dispatch warp: an instant per token,
-                    # followed by one instant per set bit of its local expert.
-                    if lane_idx == Int32(0):
-                        _iket.range_push("Pull.TokenDone")
-                        _iket.range_pop()
-                        for bit in cutlass.range_constexpr(
-                            max(1, (self.num_experts_per_rank - 1).bit_length())
-                        ):
-                            if (current_expert_idx >> Int32(bit)) & Int32(1) != Int32(
-                                0
-                            ):
-                                _iket.range_push(f"expert_b{bit}")
-                                _iket.range_pop()
 
                     phase_bit = phase_bit ^ Int32(1)
 
@@ -487,20 +416,7 @@ def overwrite_count_token_comm_class(base: Any) -> type:
                 startup_status = cute.arch.load(
                     nvlink_barrier_counter.iterator, Int32, sem="relaxed", scope="gpu"
                 ) & Int32(3)
-                if cutlass.const_expr(hasattr(self, "_stamp")):
-                    if warp_idx == Int32(0) and lane_idx == Int32(0):
-                        phase_ptr = (
-                            grid_sync_counter.iterator
-                            + Int32(self.stats_word_offsets["grid_sync_counter"])
-                            + sm_idx * Int32(SLOTS)
-                            + Int32(Slot.STARTUP_PHASE_RAW)
-                        )
-                        cute.make_tensor(phase_ptr, cute.make_layout(1))[0] = (
-                            startup_status
-                        )
 
-            if cutlass.const_expr(hasattr(self, "_stamp")):
-                grid_start = globaltimer_lo()
             software_grid_sync(
                 grid_sync_counter,
                 sm_idx,
@@ -509,31 +425,6 @@ def overwrite_count_token_comm_class(base: Any) -> type:
                 num_threads=self.num_dispatch_threads,
             )
 
-            if cutlass.const_expr(self.cta_local_counts and hasattr(self, "_stamp")):
-                if warp_idx == Int32(0) and lane_idx == Int32(0):
-                    # The first grid sync orders CTA 0's debug snapshot. Unlike
-                    # the live barrier counter, it cannot advance during acquire.
-                    phase_ptr = (
-                        grid_sync_counter.iterator
-                        + Int32(self.stats_word_offsets["grid_sync_counter"])
-                        + Int32(Slot.STARTUP_PHASE_RAW)
-                    )
-                    expected_phase = cute.arch.load(
-                        phase_ptr, Int32, sem="relaxed", scope="gpu"
-                    )
-                    _startup_phase_assert(startup_status, expected_phase)
-
-            if cutlass.const_expr(hasattr(self, "_stamp")):
-                send_start = globaltimer_lo()
-                self._stamp(
-                    grid_sync_counter.iterator,
-                    "grid_sync_counter",
-                    sm_idx,
-                    warp_idx,
-                    lane_idx,
-                    Slot.DISPATCH_GRID_SYNC_NS,
-                    send_start - grid_start,
-                )
             if sm_idx == 0:
                 for offset in cutlass.range_constexpr(
                     0,
@@ -568,17 +459,6 @@ def overwrite_count_token_comm_class(base: Any) -> type:
                 number_of_threads=self.num_dispatch_threads,
             )
 
-            if cutlass.const_expr(hasattr(self, "_stamp")):
-                rendezvous_start = globaltimer_lo()
-                self._stamp(
-                    grid_sync_counter.iterator,
-                    "grid_sync_counter",
-                    sm_idx,
-                    warp_idx,
-                    lane_idx,
-                    Slot.DISPATCH_COUNT_SEND_NS,
-                    rendezvous_start - send_start,
-                )
             if cutlass.const_expr(self.cta_local_counts):
                 self.startup_acquire(
                     nvlink_barrier_signal,
@@ -602,17 +482,6 @@ def overwrite_count_token_comm_class(base: Any) -> type:
                     num_sms=num_sms,
                     prologue_grid_sync=False,
                     epilogue_grid_sync=False,
-                )
-            if cutlass.const_expr(hasattr(self, "_stamp")):
-                sum_start = globaltimer_lo()
-                self._stamp(
-                    grid_sync_counter.iterator,
-                    "grid_sync_counter",
-                    sm_idx,
-                    warp_idx,
-                    lane_idx,
-                    Slot.DISPATCH_RENDEZVOUS_NS,
-                    sum_start - rendezvous_start,
                 )
 
             # Each CTA acquired peer count stores through startup_acquire.
@@ -656,17 +525,6 @@ def overwrite_count_token_comm_class(base: Any) -> type:
                             expert_recv_count_sum[expert] = (
                                 Int64(self.world_size * num_sms) << Int64(32)
                             ) | total
-            if cutlass.const_expr(hasattr(self, "_stamp")):
-                grid_start = globaltimer_lo()
-                self._stamp(
-                    grid_sync_counter.iterator,
-                    "grid_sync_counter",
-                    sm_idx,
-                    warp_idx,
-                    lane_idx,
-                    Slot.DISPATCH_COUNT_SUM_NS,
-                    grid_start - sum_start,
-                )
             if cutlass.const_expr(not self.cta_local_counts):
                 software_grid_sync(
                     grid_sync_counter,
@@ -675,17 +533,6 @@ def overwrite_count_token_comm_class(base: Any) -> type:
                     tid_in_group,
                     num_threads=self.num_dispatch_threads,
                 )
-
-                if cutlass.const_expr(hasattr(self, "_stamp")):
-                    self._stamp(
-                        grid_sync_counter.iterator,
-                        "grid_sync_counter",
-                        sm_idx,
-                        warp_idx,
-                        lane_idx,
-                        Slot.DISPATCH_GRID_SYNC_NS,
-                        globaltimer_lo() - grid_start,
-                    )
 
         @cute.jit
         def startup_acquire(
@@ -699,26 +546,12 @@ def overwrite_count_token_comm_class(base: Any) -> type:
             status,
             grid_sync_counter,
         ):
-            if cutlass.const_expr(hasattr(self, "_stamp")):
-                self._nvlink_probed = True
-                self._nvlink_start = globaltimer_lo()
-                self._stamp(
-                    grid_sync_counter.iterator,
-                    "grid_sync_counter",
-                    sm_idx,
-                    warp_idx,
-                    lane_idx,
-                    Slot.DISPATCH_SYNC_SEND_NS,
-                    self._nvlink_start - self._barrier_start,
-                )
             phase = status & Int32(1)
             delta = Int32(1)
             target = Int32(self.world_size)
             if (status >> Int32(1)) != Int32(0):
                 delta = Int32(-1)
                 target = Int32(0)
-            if cutlass.const_expr(hasattr(self, "_stamp")):
-                send_at = globaltimer_lo()
             if warp_idx == Int32(0):
                 if sm_idx == Int32(0):
                     if lane_idx < Int32(self.world_size):
@@ -743,18 +576,10 @@ def overwrite_count_token_comm_class(base: Any) -> type:
                         != target
                     ):
                         pass
-                    if cutlass.const_expr(hasattr(self, "_stamp")):
-                        if sm_idx == Int32(0):
-                            self._record_startup_signal(
-                                grid_sync_counter, send_at, globaltimer_lo() - send_at
-                            )
             cute.arch.barrier(
                 barrier_id=self.dispatch_intra_cta_bar_id,
                 number_of_threads=self.num_dispatch_threads,
             )
-
-            if cutlass.const_expr(hasattr(self, "_stamp")):
-                self._signal_done = globaltimer_lo()
 
         @cute.jit
         def kernel_tail(

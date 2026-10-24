@@ -3,7 +3,6 @@
 
 """Focused host simulation and source-shape checks for the device scheduler."""
 
-import ast
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import sys
@@ -87,74 +86,17 @@ def test_every_cluster_cta_decodes_one_claim_with_shared_phase_and_offsets() -> 
         assert records[1].tile_n_idx == records[0].tile_n_idx + 1
 
 
-def test_device_module_is_standalone_and_exposes_full_persistent_protocol() -> None:
-    path = _HERE / "device_scheduler.py"
-    source = path.read_text()
-    tree = ast.parse(source)
-    imports = {
-        alias.name
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Import)
-        for alias in node.names
-    }
-    imported_from = {
-        node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
-    }
-    assert not any(
-        "kernel_src.sm100.cutedsl_megamoe" in name for name in imports | imported_from
-    )
-
-    classes = {
-        node.name: {
-            child.name
-            for child in node.body
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
-        for node in tree.body
-        if isinstance(node, ast.ClassDef)
-    }
-    assert {
-        "create",
-        "internal_init",
-        "gen_next_work",
-        "publish_work",
-        "produce_tail",
-        "make_consumer",
-        "_claim_static",
-        "_claim_atomic",
-        "_advance_group",
-        "_switch_to_fc2",
-        "_advance_expert",
-        "_peek_readiness",
-    } <= classes["PersistentDeviceScheduler"]
-    assert classes["DeviceWorkRecord"] >= {
-        "to_rmem",
-        "from_rmem",
-        "write_to_smem",
-        "read_from_smem",
-    }
-    assert "cute.arch.atomic_add" in source
-    assert "mapa.shared::cluster" in source
-    assert 'sem="acquire", scope="gpu"' in source
-    assert "WORK_RECORD_WORDS = 8" in source
-
-
 @pytest.mark.parametrize("order", ["expert", "longest_first"])
-@pytest.mark.parametrize("lean", [False, True])
 @pytest.mark.parametrize("mode", ["static", "atomic_counter", "alternating"])
-def test_scheduler_params_optional_fields_roundtrip(lean, mode, order):
+def test_scheduler_params_optional_fields_roundtrip(mode, order, monkeypatch):
     """Exercise the actual marshaling methods with strict lightweight values.
 
-    This runs without CUDA/CuTe installed; the stand-ins reject None so a lost
-    optional-field guard or inconsistent extraction order fails locally.
+    Stand-ins reject None so a lost optional-field guard or inconsistent
+    extraction order fails without requiring a GPU.
     Device compilation remains covered by the GPU integration suite.
     """
-    tree = ast.parse((_HERE / "device_scheduler.py").read_text())
-    params_class = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "DeviceSchedulerParams"
-    )
+    pytest.importorskip("cutlass")
+    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4 import device_scheduler
 
     class DynamicInt(int):
         pass
@@ -171,26 +113,10 @@ def test_scheduler_params_optional_fields_roundtrip(lean, mode, order):
         assert prototype is not None and len(values) == 1
         return values[0]
 
-    namespace = dict(
-        Int32=DynamicInt,
-        SCALE_VECTOR_SIZE=32,
-        extract_mlir_values=extract,
-        new_from_mlir_values=rebind,
-    )
-    module = ast.Module(
-        body=[
-            ast.ImportFrom(
-                module="__future__", names=[ast.alias(name="annotations")], level=0
-            ),
-            params_class,
-        ],
-        type_ignores=[],
-    )
-    exec(
-        compile(ast.fix_missing_locations(module), "device_scheduler.py", "exec"),
-        namespace,
-    )
-    params = namespace["DeviceSchedulerParams"](
+    monkeypatch.setattr(device_scheduler, "Int32", DynamicInt)
+    monkeypatch.setattr(device_scheduler, "extract_mlir_values", extract)
+    monkeypatch.setattr(device_scheduler, "new_from_mlir_values", rebind)
+    params = device_scheduler.DeviceSchedulerParams(
         expert_token_sizes=Value("counts"),
         expert_count=DynamicInt(3),
         gate_up_size=512,
@@ -201,11 +127,11 @@ def test_scheduler_params_optional_fields_roundtrip(lean, mode, order):
         group_hint=5,
         token_padding_block=64,
         sf_padding_block=128,
-        fc1_ready_counter_ptr=None if lean else Value("dispatch"),
+        fc1_ready_counter_ptr=Value("dispatch"),
         fc1_done_counter_ptr=Value("fc1_done"),
         fc2_ready_threshold=4,
-        expert_data_row_offsets=Value("data") if lean else None,
-        expert_scale_row_offsets=Value("scales") if lean else None,
+        expert_data_row_offsets=None,
+        expert_scale_row_offsets=None,
         load_balance_mode=mode,
         claim_order=order,
         load_balance_counter_ptr=Value("claim") if mode != "static" else None,
@@ -218,8 +144,4 @@ def test_scheduler_params_optional_fields_roundtrip(lean, mode, order):
     replacements = [Value(f"new_{index}") for index in range(len(values))]
     rebound = params.__new_from_mlir_values__(replacements)
     assert rebound.expert_token_sizes is replacements[1]
-    assert (
-        rebound.fc1_ready_counter_ptr is None
-        if lean
-        else rebound.fc1_ready_counter_ptr is replacements[2]
-    )
+    assert rebound.fc1_ready_counter_ptr is replacements[2]

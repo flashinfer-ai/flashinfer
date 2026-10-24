@@ -1296,8 +1296,7 @@ override them. Use explicit `knobs` for reproducible A/B runs, including
 `epilogue_warps`, `in_kernel_reduce`, and `load_balance_mode`. Complete
 collective tuning and eager warmup before CUDA graph capture. The selected
 tactic is bound to workspace capacity, so serving with fewer active tokens
-retains the prepared layout. `FLASHINFER_MXFP8_MXFP4_WAIT_STATS` is a
-compile-time diagnostic; leave it unset for performance measurements.
+retains the prepared layout.
 
 Validate single-GPU behavior with `pytest tests/moe_ep/test_mxfp8_mxfp4*.py`.
 For NVLink reference checks, repeated launches, and graph replay, run

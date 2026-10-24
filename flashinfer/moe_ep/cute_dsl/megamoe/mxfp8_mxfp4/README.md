@@ -9,8 +9,7 @@ This Blackwell CuTe DSL kernel combines expert dispatch, FC1, SwiGLU,
 FC2, token return, and deterministic top-k reduction. Activations use E4M3
 with E8M0 scales per 32 values; weights use packed E2M1 with E8M0 scales
 per 32 values. The output is BF16. The native kernel supports both
-single-CTA and paired-CTA MMA, and the lean FC12 path shares its compute
-implementation with MegaMoE.
+single-CTA and paired-CTA MMA.
 
 The MoE EP backend is `sm100_mxfp8_mxfp4_bf16_cutedsl`. Its configuration,
 weight preprocessing, and offline tuner live in
@@ -119,25 +118,14 @@ in the default policy above; single-CTA tiles are used otherwise.
 | `weight_l2_evict_first` | `True` for pairs through capacity 512; `False` otherwise | Boolean. Give streamed weight and scale TMA loads the EVICT_FIRST L2 policy to preserve token/intermediate reuse. |
 | `token_back_mode` | `"epi_warps"` | Send FC2 rows from epilogue warps. This is the only supported token-back mode. |
 | `epilogue_warps` | 8 for pairs at capacity 256 or above; 4 otherwise | 4 or 8. Eight splits token groups across two warpgroups, increasing threads and shared storage and potentially reducing operand stages. |
-| `in_kernel_reduce` | `True` below capacity 256; `False` otherwise | Boolean. Reduce top-k in the persistent kernel tail instead of launching the standalone reducer. Mega only; reduction order is unchanged. |
+| `in_kernel_reduce` | `True` below capacity 256; `False` otherwise | Boolean. Reduce top-k in the persistent kernel tail instead of launching the standalone reducer. Reduction order is unchanged. |
 | `cta_local_counts` | `True` | Boolean. Each CTA acquires startup signals and computes owner counts into reusable shared scratch, removing the closing startup grid rendezvous. CTA 0 retains a global diagnostic copy. |
 
-Dispatch and startup options affect Mega execution, not lean FC12.
 Use `validate_tactic` for host validation and `resolve_tactic` to inspect the
 complete tactic. Passing host validation alone does not guarantee that a
 configuration fits shared memory or is accepted by the device assembler.
 
-### Diagnostic environment switches
-
-Use tactic dictionary fields for scheduling A/B runs.
-In the next table, append each diagnostic suffix to `FLASHINFER_MXFP8_MXFP4_`.
-
-| Suffix | Default | Purpose |
-|---|---|---|
-| `WAIT_STATS` | `0` | `1` allocates and instruments per-CTA wait statistics and the startup ring. Set before workspace allocation. Read via `read_mega_wait_stats`, `read_mega_startup_ring`, `summarize`, and `decode_startup_ring` in `wait_stats_config.py`. |
-| `IKET_FINE_CTAS` | `0` | Number of initial CTAs with detailed IKET ranges; requires `CUTE_DSL_COMPILER_OPT=iket`. |
-
-Related controls use their full names below:
+### Environment controls
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -146,7 +134,6 @@ Related controls use their full names below:
 | `MEGA_NO_DIST` | `0` | `1` selects single-process setup; keep `0` for distributed EP. |
 | `MEGA_USE_NCU` | `0` | `1` selects the profiling tail signal path. |
 | `FLASHINFER_MOE_EP_SKIP_DSL_CHECK` | Unset: check enabled | `1` bypasses the shared shim's CuTe DSL version check. |
-| `CUTE_DSL_COMPILER_OPT` | Unset/empty: no IKET instrumentation | Include the `iket` token to enable this kernel's IKET markers; `IKET_FINE_CTAS` controls detailed CTA coverage. |
 
 Dynamic-N MMA, native FC1 TMEM loads, and skipping empty FC1 epilogue
 groups are always enabled. FC1 uses direct stores; FC2 uses the shared
@@ -352,8 +339,7 @@ quantization/staging, while a full layer call includes them. Validate against
 the reference before timing; include sparse/empty experts and skewed routing.
 For graph timing, warm up the exact buffers before capture and replay on all
 ranks in the same order. Report the slowest rank's latency for collective
-execution. Debug wait counters and IKET traces are diagnostic runs, separate
-from uninstrumented performance measurements.
+execution.
 
 The allocator, tactic switching, tuning, and teardown use the same EP process
 group. Recoverable host/compilation failures during selection restore the

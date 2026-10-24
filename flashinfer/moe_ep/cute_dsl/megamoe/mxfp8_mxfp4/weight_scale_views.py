@@ -142,7 +142,7 @@ def from_atom_swizzled(
 
 @dataclass(frozen=True)
 class CuteWeightScaleViews:
-    """Named products consumed by ``DeviceAssemblyProtocol``."""
+    """Logical scale views consumed by the persistent kernel."""
 
     fc1_weight_sfa_logical: Any
     fc2_weight_sfa_logical: Any

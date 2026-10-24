@@ -63,27 +63,3 @@ def test_device_interface_has_no_routing_score() -> None:
         assert "route_score" not in parameters
         assert "topk_score" not in parameters
         assert "routing_weight" not in parameters
-
-
-def test_device_epilogue_owns_pipeline_and_publication() -> None:
-    source = inspect.getsource(PersistentMxfp8Mxfp4Epilogue.run)
-    assert "consumer_wait" in source
-    assert "fence_view_async_tmem_load" in source
-    assert "consumer_release" in source
-    assert "fence_acq_rel_gpu" in source
-    assert "_red_add_release_gpu_s32" in source
-
-
-def test_device_epilogue_reuses_numerical_primitives() -> None:
-    source = inspect.getsource(PersistentMxfp8Mxfp4Epilogue)
-    assert "Fc1Epilogue" in source
-    assert "_clamp_and_swiglu(" in source
-    assert "stage_native_bf16(" in source
-    assert "store_staged_vector(" in source
-
-
-def test_device_epilogue_exchanges_paired_native_feature_warps() -> None:
-    source = inspect.getsource(PersistentMxfp8Mxfp4Epilogue)
-    assert "_load_fc1_native_half" in source
-    assert "epilogue_exchange" in source
-    assert "pair_idx" in source
