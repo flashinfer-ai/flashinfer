@@ -178,6 +178,8 @@ struct Data {
   int32_t* expandedIdxToPermutedIdx;
 
   int32_t const* totalNumPaddedTokens;
+  int32_t const* ctaIdxXyToMnLimit = nullptr;
+  int32_t const* numNonExitingCtas = nullptr;
 
   // Optional per-local-expert SwiGLU OAI controls, [localNumExperts] each. Null means the
   // neutral value (alpha=1, beta=0, no clamp), which reduces the epilogue to plain SwiGLU.
@@ -210,6 +212,8 @@ struct KernelParams {
   int32_t* expandedIdxToPermutedIdx;
 
   int32_t const* totalNumPaddedTokens;
+  int32_t const* ctaIdxXyToMnLimit = nullptr;
+  int32_t const* numNonExitingCtas = nullptr;
 
   float const* gatedActAlphaPtr = nullptr;
   float const* gatedActBetaPtr = nullptr;
@@ -231,6 +235,8 @@ struct KernelParams {
     params.numTokens = data.numTokens;
     params.topK = data.topK;
     params.totalNumPaddedTokens = data.totalNumPaddedTokens;
+    params.ctaIdxXyToMnLimit = data.ctaIdxXyToMnLimit;
+    params.numNonExitingCtas = data.numNonExitingCtas;
 
     params.gatedActAlphaPtr = data.gatedActAlphaPtr;
     params.gatedActBetaPtr = data.gatedActBetaPtr;
