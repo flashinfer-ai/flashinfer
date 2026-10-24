@@ -302,7 +302,7 @@ The output CSV will contain detailed metrics including:
 | `--mat2_dtype`           | Data type for second matrix (for FP8 GEMM, e.g. `fp8_e4m3`)                                                |
 | `--use_128x4_sf_layout`  | Use 128x4 scale/format layout for FP4 GEMM (for `mm_fp4` routine)                                          |
 | `--use_nvfp4`            | Whether to use nvfp4 quantization or mxfp4 quantization, defaults to False.(for `mm_fp4` routine)          |
-| `--autotune`             | Enable autotune for supported operation (`mm_fp4`, `bmm_fp8`, `mm_fp8`, `bmm_mxfp8`, `mm_mxfp8`, `mm_bf16`, `bmm_bf16` routines) |
+| `--autotune`             | Enable autotune for supported operation (`mm_fp4`, `mm_bf16_fp4`, `bmm_fp8`, `mm_fp8`, `bmm_mxfp8`, `mm_mxfp8`, `mm_bf16`, `bmm_bf16` routines). Prints `[INFO] --autotune has no effect` for `gemm_fp8_nt_groupwise`, `group_gemm_fp8_nt_groupwise` and `tinygemm_bf16`, whose backends do not use the AutoTuner |
 | `--bias`                 | Use bias for `mm_bf16` (Enabled for TGV backend)                                                           |
 
 ### MOE Flags
@@ -332,7 +332,7 @@ The output CSV will contain detailed metrics including:
 | `--ep_size`              | Expert-parallel world size                                                                                  |
 | `--ep_rank`              | Expert-parallel rank                                                                                        |
 | `--activation-type`      | Activation function: `Swiglu` (default), `Geglu`, `SwigluStep` (clipped SwiGLU, limit=7.0), `Relu2`, etc.  |
-| `--autotune`             | Enable autotune for supported operation                                                                     |
+| `--autotune`             | Enable autotune for supported operation (`trtllm_fp4_block_scale_moe`, `trtllm_fp8_block_scale_moe`, `trtllm_fp8_per_tensor_scale_moe`, `cutlass_fused_moe`, `cute_dsl_fp4_block_scale_moe`, `cute_dsl_bf16_moe`, `b12x_fused_moe`, `unified_moe`). Autotuned results append `_autotune` to the backend name |
 
 ### MOE Routing Method Compatibility
 

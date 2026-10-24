@@ -237,7 +237,9 @@ def parse_moe_args(line, parser):
         action="store_true",
         default=False,
         help=(
-            "Enable autotuner warmup for supported routines (trtllm_fp4_block_scale_moe and cutlass_fused_moe)."
+            "Enable autotuner warmup for supported routines (trtllm_fp4_block_scale_moe, "
+            "trtllm_fp8_block_scale_moe, trtllm_fp8_per_tensor_scale_moe, cutlass_fused_moe, "
+            "cute_dsl_fp4_block_scale_moe, cute_dsl_bf16_moe, b12x_fused_moe)."
         ),
     )
     parser.add_argument(
@@ -2848,6 +2850,36 @@ def testTrtllmFp8BlockScaleMoe(args):
             enable_pdl=args.enable_pdl,
         )
 
+    backend = "trtllm"
+
+    # Optional autotune warmup: trtllm_fp8_block_scale_moe picks its GEMM tactics
+    # through the AutoTuner, so without this the benchmark measures the default pick.
+    cache_path = getattr(args, "autotune_cache", None)
+    if getattr(args, "autotune", False):
+        warmup_iters = (
+            args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
+        )
+        backend = "trtllm_autotune"
+        if args.verbose >= 1:
+            print(
+                f"[INFO] Autotune warmup for FP8 block scale MoE: {warmup_iters} iters"
+            )
+        with autotune(True, cache=cache_path):
+            for _ in range(warmup_iters):
+                run_fp8_block_moe(
+                    routing_logits,
+                    routing_bias,
+                    hidden_states,
+                    hidden_states_scale,
+                    kernel_gemm1_weights,
+                    gemm1_weights_scale,
+                    kernel_gemm2_weights,
+                    gemm2_weights_scale,
+                )
+    elif cache_path:
+        with autotune(False, cache=cache_path):
+            pass
+
     # Benchmark timing
     times = bench_gpu_time(
         fn=run_fp8_block_moe,
@@ -2897,7 +2929,6 @@ def testTrtllmFp8BlockScaleMoe(args):
         verbose=args.verbose,
     )
 
-    backend = "trtllm"
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
     if args.output_path is not None:
@@ -3083,6 +3114,37 @@ def testTrtllmFp8PerTensorScaleMoe(args):
             **_activation_kwarg(trtllm_fp8_per_tensor_scale_moe, activation_type),
         )
 
+    backend = "trtllm"
+
+    # Optional autotune warmup: trtllm_fp8_per_tensor_scale_moe picks its GEMM tactics
+    # through the AutoTuner, so without this the benchmark measures the default pick.
+    cache_path = getattr(args, "autotune_cache", None)
+    if getattr(args, "autotune", False):
+        warmup_iters = (
+            args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
+        )
+        backend = "trtllm_autotune"
+        if args.verbose >= 1:
+            print(
+                f"[INFO] Autotune warmup for FP8 per tensor scale MoE: {warmup_iters} iters"
+            )
+        with autotune(True, cache=cache_path):
+            for _ in range(warmup_iters):
+                run_fp8_per_tensor_moe(
+                    routing_logits,
+                    routing_bias,
+                    hidden_states_fp8,
+                    gemm1_weights_fp8,
+                    output1_scales_scalar,
+                    output1_scales_gate_scalar,
+                    gemm2_weights_fp8,
+                    output2_scales_scalar,
+                    args.activation_type,
+                )
+    elif cache_path:
+        with autotune(False, cache=cache_path):
+            pass
+
     # Benchmark timing
     times = bench_gpu_time(
         fn=run_fp8_per_tensor_moe,
@@ -3133,7 +3195,6 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         verbose=args.verbose,
     )
 
-    backend = "trtllm"
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
     if args.output_path is not None:
