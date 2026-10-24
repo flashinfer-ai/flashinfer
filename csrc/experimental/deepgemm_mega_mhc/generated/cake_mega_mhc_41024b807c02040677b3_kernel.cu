@@ -3615,6 +3615,7 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
     mbarrier_wait(weight_full_addr, 0);
     unsigned int shard = (unsigned int)bid % 16;
     unsigned int local_tokens = ((num_tokens) < (num_ctas * 3) ? (num_tokens) : (num_ctas * 3));
+    bool y_fit = (num_tokens + 63) / 64 <= 64;
     unsigned int ticket = 0;
     unsigned int token_1 = 0;
     #pragma unroll 1
@@ -4260,10 +4261,8 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
                     normalized_words[j] = __as_u32(__float22bfloat162_rn(make_float2(weighted.x, weighted.y)));
                 }
                 unsigned long long off_1 = (unsigned long long)token_1 * 4096 + (unsigned long long)(hidden_pack_1 * 256) + (unsigned long long)(lane_in_warp * 8);
-                {
-                    int4 _iv4 = make_int4(normalized_words[0 + 0], normalized_words[0 + 1], normalized_words[0 + 2], normalized_words[0 + 3]);
-                    *reinterpret_cast<int4*>(y_bf16 + off_1 + 0) = _iv4;
-                }
+                asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %6, 0; @p_ st.global.L2::cache_hint.v4.b32 [%0], {%1, %2, %3, %4}, %5; }" :: "l"(y_bf16 + off_1), "r"(normalized_words[(0) + 0]), "r"(normalized_words[(0) + 1]), "r"(normalized_words[(0) + 2]), "r"(normalized_words[(0) + 3]), "l"(0x12F0000000000000ULL), "r"((unsigned int)(y_fit)) : "memory");
+                asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(y_bf16 + off_1), "r"(normalized_words[(0) + 0]), "r"(normalized_words[(0) + 1]), "r"(normalized_words[(0) + 2]), "r"(normalized_words[(0) + 3]), "r"((unsigned int)(!y_fit)) : "memory");
                 if (pack_1 + 1 < 4) {
                     #pragma unroll
                     for (int j_1 = 0; j_1 < 4; j_1++) {
