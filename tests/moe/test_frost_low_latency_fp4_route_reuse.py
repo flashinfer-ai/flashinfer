@@ -10,6 +10,7 @@ from flashinfer.fused_moe import (
     MoEActivationPack,
     MoEFinalizeConfig,
     MoEWeightPack,
+    QuantFormat,
     SwiGLU,
 )
 from flashinfer.fused_moe.backends.frost_low_latency.runner import FrostLowLatencyRunner
@@ -18,9 +19,17 @@ from tests.moe.test_frost_low_latency_w4a16 import _inputs as nv_inputs
 from tests.moe.test_frost_low_latency_mxfp4_w4a16 import _inputs as mx_inputs
 
 
-def _check_case(factory, index, activation, group, finalize, top_k=3):
+def _check_case(
+    factory, index, activation, group, finalize, top_k=3, dtype=torch.bfloat16
+):
     cfg, x, ids, scores, pack, view = factory(activation, index, top_k=top_k)
-    cfg = replace(cfg, finalize=MoEFinalizeConfig(do_finalize=finalize))
+    qtype = QuantFormat.FP16 if dtype is torch.float16 else QuantFormat.BF16
+    cfg = replace(
+        cfg,
+        finalize=MoEFinalizeConfig(do_finalize=finalize),
+        quant=replace(cfg.quant, activation=qtype, output=qtype),
+    )
+    x = x.to(dtype)
     runner = FrostLowLatencyRunner(cfg, x.device)
     runner.check_support()
     runner.build()
@@ -62,15 +71,19 @@ def _check_case(factory, index, activation, group, finalize, top_k=3):
 @pytest.mark.parametrize("factory", [nv_inputs, mx_inputs], ids=["nvfp4", "mxfp4"])
 @pytest.mark.parametrize("index,activation", list(enumerate(ACTIVATIONS)))
 @pytest.mark.parametrize("group,finalize", [(2, True), (4, False)])
-def test_fp4_route_reuse_activations_graph(factory, index, activation, group, finalize):
-    _check_case(factory, index, activation, group, finalize)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fp4_route_reuse_activations_graph(
+    factory, index, activation, group, finalize, dtype
+):
+    _check_case(factory, index, activation, group, finalize, dtype=dtype)
 
 
 @pytest.mark.parametrize("factory", [nv_inputs, mx_inputs], ids=["nvfp4", "mxfp4"])
 @pytest.mark.parametrize("group", [2, 4])
 @pytest.mark.parametrize("finalize", [False, True])
-def test_fp4_route_reuse_max_routes(factory, group, finalize):
-    _check_case(factory, 3, SwiGLU(), group, finalize, top_k=32)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fp4_route_reuse_max_routes(factory, group, finalize, dtype):
+    _check_case(factory, 3, SwiGLU(), group, finalize, top_k=32, dtype=dtype)
 
 
 @pytest.mark.parametrize("factory", [nv_inputs, mx_inputs], ids=["nvfp4", "mxfp4"])

@@ -57,9 +57,10 @@ def execute(inputs, config, tactic):
     columns, down_columns = tactic[1:]
     finalize = config.finalize.do_finalize
     key = (
-        "fp8-per-tensor-ffi-v2",
+        "fp8-per-tensor-ffi-v3",
         x.dtype,
         mid.dtype,
+        output.dtype,
         tuple(x.shape),
         tuple(w1.shape),
         tuple(w2.shape),

@@ -926,12 +926,16 @@ python scripts/generate_moe_activation_matrix.py --write
 | `frost_low_latency` | `FrostLowLatencyConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
 | `frost_low_latency` | `FrostLowLatencyConfig` | `FP16×FP16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
 | `frost_low_latency` | `FrostLowLatencyConfig` | `FP8PerTensor×BF16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `FP8PerTensor×FP16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
 | `frost_low_latency` | `FrostLowLatencyConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
 | `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP4×BF16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP4×FP16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
 | `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP4×MXFP8` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
 | `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP8×MXFP8` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
 | `frost_low_latency` | `FrostLowLatencyConfig` | `MXINT4×BF16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `MXINT4×FP16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
 | `frost_low_latency` | `FrostLowLatencyConfig` | `NVFP4×BF16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `NVFP4×FP16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
 | `frost_low_latency` | `FrostLowLatencyConfig` | `NVFP4×NVFP4` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
 | `prims_ts` | `PrimsTsConfig` | `BF16×BF16` | `SwiGLU`, `ReLU2` |
 | `prims_ts` | `PrimsTsConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |

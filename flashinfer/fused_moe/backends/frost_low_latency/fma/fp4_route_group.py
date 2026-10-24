@@ -188,19 +188,19 @@ def _kernel(
                         if lane == 0 and members[p] >= 0:
                             u = (
                                 (u * dq[expert, 0])
-                                .to(cutlass.BFloat16)
+                                .to(mid.element_type)
                                 .to(cutlass.Float32)
                             )
                             if cutlass.const_expr(gated):
                                 g = (
                                     (g * dq[expert, 1])
-                                    .to(cutlass.BFloat16)
+                                    .to(mid.element_type)
                                     .to(cutlass.Float32)
                                 )
                             mid[members[p], row + o] = apply_activation(
                                 u, g, activation, parameters=parameters
-                            ).to(cutlass.BFloat16)
+                            ).to(mid.element_type)
     else:
         if lane == 0:
             for o in cutlass.range_constexpr(columns):
-                mid[leader, row + o] = cutlass.BFloat16(0.0)
+                mid[leader, row + o] = mid.element_type(0.0)

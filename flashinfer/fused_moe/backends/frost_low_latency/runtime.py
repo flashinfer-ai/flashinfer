@@ -19,7 +19,10 @@ _COMPILE_LOCK = threading.Lock()
 
 
 def execute(inputs, config, tile_k):
-    if config.quant.activation is QuantFormat.BF16 and config.quant.weight in (
+    if config.quant.activation in (
+        QuantFormat.BF16,
+        QuantFormat.FP16,
+    ) and config.quant.weight in (
         QuantFormat.NVFP4,
         QuantFormat.MXFP4,
         QuantFormat.MXINT4,

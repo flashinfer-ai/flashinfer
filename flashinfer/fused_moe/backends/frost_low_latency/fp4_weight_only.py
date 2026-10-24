@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Canonical packed four-bit weights with live scales and BF16 bindings."""
+"""Canonical packed four-bit weights with live scales and typed 16-bit bindings."""
 
 import torch
 
@@ -86,21 +86,27 @@ def pack_inputs(act, weights, config, device):
     group = 16 if config.quant.weight is QuantFormat.NVFP4 else 32
     scale_dtype = torch.bfloat16 if integer_weights else torch.uint8
 
+    activation_dtype = (
+        torch.float16 if config.quant.activation is QuantFormat.FP16 else torch.bfloat16
+    )
+    output_dtype = (
+        torch.float16 if config.quant.output is QuantFormat.FP16 else torch.bfloat16
+    )
     x, ids, scores = act.hidden_states_q, act.topk_ids, act.topk_weights
     t, h = x.shape
     e, k = config.routing.num_experts, config.routing.top_k
     p = (config.experts.intermediate_size + 127) // 128 * 128
     branches = 2 if config.activation.is_gated else 1
     if act.hidden_states_scale is not None:
-        raise ValueError("W4A16 BF16 input must not supply an activation scale")
+        raise ValueError("W4A16 input must not supply an activation scale")
     if (
-        x.dtype is not torch.bfloat16
+        x.dtype is not activation_dtype
         or x.device != device
         or not x.is_contiguous()
         or x.data_ptr() % 16
     ):
         raise ValueError(
-            "W4A16 requires aligned contiguous BF16 input on the runner device"
+            f"W4A16 requires aligned contiguous {activation_dtype} input on the runner device"
         )
     view = weights.get_view("frost_low_latency")
     for name, shape, dtype in (
@@ -135,9 +141,9 @@ def pack_inputs(act, weights, config, device):
         view["fc2_dequant_scale"],
         ids,
         scores,
-        torch.empty((t * k, p), device=device, dtype=torch.bfloat16),
-        torch.empty((t * k, h), device=device, dtype=torch.bfloat16),
-        torch.empty((t, h), device=device, dtype=torch.bfloat16),
+        torch.empty((t * k, p), device=device, dtype=activation_dtype),
+        torch.empty((t * k, h), device=device, dtype=output_dtype),
+        torch.empty((t, h), device=device, dtype=output_dtype),
         narrow,
     ]
 

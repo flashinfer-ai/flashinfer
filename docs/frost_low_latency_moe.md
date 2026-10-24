@@ -3,7 +3,7 @@
 `FrostLowLatencyConfig` adds an explicit low-token candidate to `MoELayer` on
 SM100/SM103/SM107, with FMA-only support on SM90 and SM120.
 SM90 admits BF16, FP16, ordinary per-tensor FP8, DeepSeek block FP8 and
-NVFP4/MXFP4/MXINT4 weights with BF16 activations. MXFP8 inputs and NVFP4 activations remain
+NVFP4/MXFP4/MXINT4 weights with BF16/FP16 activations. MXFP8 inputs and NVFP4 activations remain
 unsupported on SM90. The MX Tensor Core path uses
 CuTe DSL and the existing FlashInfer low-latency blockscaled GEMM's TMA
 producers and epilogue. It does not depend on cuDNN.
@@ -255,9 +255,9 @@ the BF16 table or the earlier unclamped-SwiGLU cohort.
 
 | Property | Support |
 |---|---|
-| Architecture | SM90: BF16/FP16/per-tensor FP8/DeepSeek block FP8/NVFP4-MXFP4-MXINT4-weight BF16-activation FMA only, top-k <= 32; SM100/103/107: FMA and MX Tensor Core; SM120: FMA only, top-k <= 32 |
+| Architecture | SM90: BF16/FP16/per-tensor FP8/DeepSeek block FP8/NVFP4-MXFP4-MXINT4-weight BF16/FP16-activation FMA only, top-k <= 32; SM100/103/107: FMA and MX Tensor Core; SM120: FMA only, top-k <= 32 |
 | Input | Static per-tensor E4M3 FP8; E4M3 MXFP8 with linear group-32 UE8M0 scales; packed NVFP4 with linear group-16 E4M3 scales; or unquantized BF16/FP16 |
-| Weights | Per-tensor FP8 input: per-expert E4M3 FP8 with static calibration; MX input: MXFP4 or MXFP8 with group-32 UE8M0 scales; NVFP4 input: NVFP4 with group-16 E4M3 scales; unquantized input: matching BF16/FP16 weights, or E4M3 weights with per-expert FP32 scales and BF16 activation/output |
+| Weights | Per-tensor FP8 input: per-expert E4M3 FP8 with static calibration; MX input: MXFP4 or MXFP8 with group-32 UE8M0 scales; NVFP4 input: NVFP4 with group-16 E4M3 scales; unquantized input: matching BF16/FP16 weights, or E4M3/NVFP4/MXFP4/MXINT4 weight-only checkpoints with BF16/FP16 input and output |
 | Output | Quantized paths: BF16; unquantized paths: BF16 or FP16. Finalized or raw token/slot-ordered expert rows |
 | MX activation | SwiGLU, SiTU, GeGLU, GeGLUTanh, SwiGLUStep, GELU, ReLU, ReLU2, SiLU, Identity |
 | BF16 activation | SwiGLU, SiTU, GeGLU, GeGLUTanh, SwiGLUStep, GELU, ReLU, ReLU2, SiLU, Identity |
@@ -1349,4 +1349,102 @@ python benchmarks/bench_frost_low_latency_w4a16.py \
 python benchmarks/bench_frost_low_latency_w4a16.py \
   --weight-format nvfp4 --native-backend sm120-tc \
   --tokens 1 --cache-mode cold --output nvfp4-sm120-tc.json
+```
+
+
+## FP16 weight-only activation and output coverage
+
+The explicit Frost FMA path accepts BF16 or FP16 inputs for NVFP4, MXFP4,
+MXINT4, and per-tensor E4M3 weight-only checkpoints. Output can independently
+be BF16 or FP16. The checkpoint payloads, scale interpretation and route
+contracts are unchanged. FP4/E4M3 preactivation rounds to the input dtype;
+MXINT4 retains FP32 preactivation. Intermediate activations use the input
+dtype, and expert values use the output dtype before ordered FP32 combine.
+
+Static FP8 activation/requantization remains a separate quantized contract.
+The weight-only path ignores its intermediate quantization multiplier.
+Compiled bindings key on input, intermediate and output dtype to separate
+BF16/FP16 variants while binding fresh tensors per call.
+
+For example, pair the existing weight preparation helper with
+`QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.FP16,
+output=QuantFormat.FP16)`. Keep `FrostLowLatencyConfig()` in the explicit
+backend candidates. The same choice works for NVFP4, MXINT4 and E4M3
+(`QuantFormat.FP8PerTensor`) weights with their corresponding preparation helpers.
+
+```mermaid
+flowchart LR
+  X[BF16 or FP16 input] --> F1[FC1: decode weights and accumulate FP32]
+  W[Original checkpoint and live scales] --> F1
+  F1 --> A[Typed activation; input dtype intermediate]
+  A --> F2[FC2: decode weights and accumulate FP32]
+  W --> F2
+  F2 --> E[Round expert values to output dtype]
+  E --> C[Ordered FP32 weighted combine]
+  C --> Y[BF16 or FP16 output]
+```
+
+NVFP4/MXFP4 expose both four- and eight-value loads on SM90/SM100/SM103/SM120
+for FP16 input. Hopper also offers FC1 groups of two or four routes for T>=2.
+These groups match expert IDs at runtime and reuse decoded weights; they do
+not assume routes remain unchanged across graph replays. Independent routes
+can be slower, so ordinary tactics remain available. SM107 retains the
+existing narrow-load choices. MXINT4 FP16 and E4M3 FP16 retain 16 column pairs.
+
+The native SM120 comparison also admits direct routing through T=8 for
+FP16 packed NVFP4 with H<=2048, I<=512 and top-k<=10. Larger shapes keep the
+previous threshold: skipping route packing can lose the weight reuse of
+grouping several tokens into one expert tile. BF16's separate decode path
+is unchanged. This bounded native improvement is included when measuring
+the remaining Frost advantage.
+
+### FP16 measurements
+
+The following complete routed-expert GPU spans use SwiGLU,
+H2048/I512/E512/K10. Shared routes select the same expert set for each token.
+The expanded-FP16 CUTLASS comparator preserves checkpoint values exactly,
+but uses **4x weight payload storage for four-bit formats, or 2x for E4M3**;
+expansion is outside timing. It is a dense FP16 control, not a native low-bit
+baseline. Native SM120 uses its tuned FP16 Tensor Core pipeline, including
+route packing where required. Neither table measures model throughput.
+
+| GPU / weight format / T | Comparator | Warm comparator -> Frost (us) | Speedup | Cold comparator -> Frost (us) | Speedup |
+|---|---|---:|---:|---:|---:|
+| H100 / NVFP4 / 1 | Expanded FP16 CUTLASS | 54.024 -> 15.776 | 3.424x | 61.296 -> 19.216 | 3.190x |
+| H100 / MXFP4 / 1 | Expanded FP16 CUTLASS | 53.863 -> 16.816 | 3.203x | 61.455 -> 20.008 | 3.072x |
+| H100 / MXINT4 / 1 | Expanded FP16 CUTLASS | 53.768 -> 13.344 | 4.029x | 61.560 -> 18.319 | 3.360x |
+| H100 / E4M3 / 1 | Expanded FP16 CUTLASS | 53.456 -> 11.944 | 4.476x | 61.760 -> 21.679 | 2.849x |
+| H100 / E4M3 / 4, shared | Expanded FP16 CUTLASS | 51.608 -> 29.192 | 1.768x | 59.312 -> 36.904 | 1.607x |
+| H100 / E4M3 / 8, shared | Expanded FP16 CUTLASS | 51.896 -> 46.504 | 1.116x | 59.216 -> 55.568 | 1.066x |
+| H100 / MXFP4 / 8, shared | Expanded FP16 CUTLASS | 51.928 -> 78.040 | 0.665x | 58.911 -> 85.408 | 0.690x |
+| SM120 / NVFP4 / 1 | Native FP16 TC | 11.104 -> 7.776 | 1.428x | 21.000 -> 19.488 | 1.078x |
+| SM120 / NVFP4 / 2, shared | Native FP16 TC | 14.080 -> 12.104 | 1.163x | 21.720 -> 22.232 | 0.977x |
+| SM120 / NVFP4 / 8, shared | Improved native FP16 TC | 40.032 -> 34.504 | 1.160x | 49.064 -> 50.288 | 0.976x |
+
+For H7168/I2048/E256/K8/T2 with shared routes on H100, expanded FP16 CUTLASS
+versus Frost measures 225.214 -> 194.670 us warm (1.157x) and
+235.238 -> 201.007 us cold (1.170x). The much larger small-shape ratios do
+not generalize to this larger expert.
+
+The [saved measurements](../benchmarks/data/frost_weight_only_fp16_20261024.json)
+retain source fingerprints, tactic counts, trial medians and maximum reference
+errors. These records use CUPTI activity spans, interleaved ABBA validation and
+independent warm CUDA-event controls. Each path is checked against an
+independent reference with its own numerical boundaries. Expanded CUTLASS
+rounds preactivation to FP16; Frost MXINT4 retains FP32. Native SM120 retains
+FP32 preactivation and expert partials; Frost rounds both to FP16 in these
+cases. The checkpoint values match, but these are not bitwise-identical
+rounding contracts. Preparation, router-network evaluation, shared experts,
+EP communication and CPU submission are outside the measured span.
+
+```bash
+# H100: exact expanded-FP16 control; repeat with cold and other formats/T.
+python benchmarks/bench_frost_low_latency_w4a16.py \
+  --activation-dtype fp16 --weight-format w8a16 --native-backend expanded-fp16 \
+  --tokens 8 --expert-reuse shared --cache-mode warm --output w8-fp16.json
+
+# SM120: full native route and small/large Tensor Core tile search.
+python benchmarks/bench_frost_low_latency_w4a16.py \
+  --activation-dtype fp16 --weight-format nvfp4 --native-backend sm120-tc \
+  --tokens 8 --expert-reuse shared --cache-mode cold --output nvfp4-fp16.json
 ```
