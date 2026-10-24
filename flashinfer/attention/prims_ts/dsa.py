@@ -101,6 +101,34 @@ def _select_split_kv(num_ctas: int, sparse_mla_top_k: int, sm_count: int) -> int
     return 1
 
 
+def _select_fp8_split(
+    num_ctas: int, sparse_mla_top_k: int, sm_count: int
+) -> tuple[int, int]:
+    """Return ``(split_kv, head_dim_split)`` for an E4M3 launch of ``num_ctas`` CTAs.
+
+    trtllm-gen's MLA generation rule: split the top-k list so every CTA keeps
+    at least two 128-key tiles within one wave, then, while fewer than half
+    the SMs have work, split the 512 V columns over 4 (or 2) CTAs.  Each V
+    slice repeats the QK / softmax of its tiles, but a one- or two-tile CTA is
+    bound by its fixed latency (Q load, first gather, the single QK-softmax-PV
+    chain, the partial-O store), which the slice cuts.  B200, K=2048: B1 is
+    8 x 4 = 32 CTAs instead of 16 x 1.
+    """
+    if num_ctas >= SPLIT_KV_MIN_CTAS:
+        return 1, 1
+    pairs = -(-sparse_mla_top_k // 256)
+    limit = min(pairs, sm_count // num_ctas)
+    split = next((s for s in SPLIT_KV_CHOICES if s <= limit), 1)
+    if split == 1:
+        return 1, 1
+    total = num_ctas * split
+    if total * 4 <= sm_count:
+        return split, 4
+    if total * 2 <= sm_count:
+        return split, 2
+    return split, 1
+
+
 def _split_workspace(
     device: torch.device, total_q: int, num_heads: int, split_kv: int
 ) -> Optional[torch.Tensor]:
@@ -381,13 +409,16 @@ def prims_ts_dsa_sparse_mla_fp8(
         )
     num_heads = query.shape[1]
     num_ctas = query.shape[0] * (num_heads // 64)
-    split_kv = _select_split_kv(num_ctas, sparse_mla_top_k, _sm_count(device_index))
+    split_kv, head_dim_split = _select_fp8_split(
+        num_ctas, sparse_mla_top_k, _sm_count(device_index)
+    )
     compiled = compile_dsa_sparse_kernel(
         device_index,
         num_heads=num_heads,
         sparse_mla_top_k=sparse_mla_top_k,
         enable_skip_correction=skip_corr_threshold > 0.0,
         split_kv=split_kv,
+        head_dim_split=head_dim_split,
     )
     launch_dsa_sparse_kernel(
         compiled,

@@ -158,6 +158,7 @@ def compile_dsa_sparse_kernel(
     residual_dim: int = 64,
     dequant_prefetch: bool = False,
     split_kv: int = 1,
+    head_dim_split: int = 1,
 ):
     """Compile one token-sparse 1CTA specialization (JIT key = the argument list).
 
@@ -165,6 +166,9 @@ def compile_dsa_sparse_kernel(
     tile ranges, one CTA each; the CTAs write BF16 partial O / LSE to the
     caller's workspace (:func:`dsa_split_workspace_bytes`) and the kernel's
     standalone reducer (launched with PDL) merges them into ``out`` / ``lse``.
+    ``head_dim_split > 1`` (split launches only) also splits the 512 V columns
+    over that many CTAs: each one still runs the whole QK / softmax for its
+    tile range but gathers, multiplies and writes only its V slice.
     """
 
     import cutlass
@@ -178,14 +182,17 @@ def compile_dsa_sparse_kernel(
     phys_heads = 64
     phys_sq = num_heads // phys_heads
     profile = _PROFILE
+    if head_dim_split > 1 and split_kv == 1:
+        raise NotImplementedError("token-sparse V head-dim split requires split-KV")
     if split_kv > 1:
-        # Explicit profile: the generic split profile would also split the V
-        # head dimension from the compile-time batch (1 here, one batch per
-        # token at run time), which the token-sparse schedules do not support.
+        # Explicit profile: the generic split profile derives the V head-dim
+        # split from the compile-time batch (1 here, one batch per token at
+        # run time); the caller picks it from the run-time token count instead.
+        hdim = "" if head_dim_split == 1 else f"_hdim{V_DIM // head_dim_split}"
         profile = MlaProfile(
-            name=f"h64_keeps_mma_ab_splitkv{split_kv}_gmem",
+            name=f"h64_keeps_mma_ab_splitkv{split_kv}{hdim}_gmem",
             num_ctas_per_seq_kv=split_kv,
-            num_ctas_per_head_dim=1,
+            num_ctas_per_head_dim=head_dim_split,
             use_persistent_scheduler=0,
             use_clc_dynamic_persistent_scheduler=0,
             use_multi_ctas_kv=1,
@@ -223,12 +230,12 @@ def compile_dsa_sparse_kernel(
     cfg = kernel._make_config()
     if (
         int(cfg.num_ctas_per_seq_kv) != split_kv
-        or int(cfg.num_ctas_per_head_dim) != 1
+        or int(cfg.num_ctas_per_head_dim) != head_dim_split
         or int(cfg.use_cluster_reduction) != 0
     ):
         raise NotImplementedError(
-            f"token-sparse 1CTA MLA expects {split_kv} KV CTAs per token, one V "
-            f"head-dim CTA and GMEM reduction; got {cfg.num_ctas_per_seq_kv}, "
+            f"token-sparse 1CTA MLA expects {split_kv} KV CTAs per token, "
+            f"{head_dim_split} V head-dim CTAs and GMEM reduction; got {cfg.num_ctas_per_seq_kv}, "
             f"{cfg.num_ctas_per_head_dim}, cluster={cfg.use_cluster_reduction}"
         )
 
