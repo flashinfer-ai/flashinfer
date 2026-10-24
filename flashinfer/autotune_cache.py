@@ -464,16 +464,14 @@ class ManagedAutotuneCache:
         )
 
 
-def _resolve_managed_store(tuner, cache_root, manifest: Dict[str, str]):
-    """Return the managed store for ``(cache_root, manifest)`` and set it as
-    the process ambient (last-wins).
+def _resolve_managed_store(
+    tuner, cache_root, manifest: Dict[str, str], *, attach_ambient: bool = True
+):
+    """Resolve and hydrate an identity, optionally attaching it for bare serving.
 
-    A persistent autotune_v2 context always attaches its store as the ambient
-    the moment it opens, so bare, context-free serving after the context
-    exits resolves to it.  autotune_v2 does not nest, so there is no scoped
-    variant to preserve an outer ambient for; sequential contexts are simply
-    last-wins.  The store object (and its memos) is reused across identity
-    switches via the registry.
+    Context scopes never change the ambient pointer. Swapping and restoring
+    it would overwrite another thread's intervening process attachment.
+    Both scopes reuse the same store registry and persistence format.
     """
     resolved = (
         pathlib.Path(cache_root) if cache_root is not None else get_default_cache_root()
@@ -488,7 +486,7 @@ def _resolve_managed_store(tuner, cache_root, manifest: Dict[str, str]):
         if store is None:
             store = ManagedAutotuneCache(manifest=manifest, root=resolved)
             tuner._managed_stores[reg_key] = store
-        if store is not tuner._managed_cache:
+        if attach_ambient and store is not tuner._managed_cache:
             if tuner._managed_cache is not None:
                 logger.info(
                     f"[Autotuner]: Re-attaching managed autotune cache at "
@@ -578,10 +576,16 @@ def autotune_v2_reload() -> None:
     Only meaningful when tuning published to a store: winners that were
     never published (e.g. ``persistent_cache=False`` segments) fall back to
     heuristics after the reload.
+
+    Call outside context-scoped caches. Reload clears all in-process
+    partitions and eagerly hydrates the ambient store; scoped stores hydrate
+    when next selected. Reload inside a context scope raises ``RuntimeError``.
     """
     from .autotuner import AutoTuner
 
     tuner = AutoTuner.get()
+    if tuner._v2_local.active and tuner._v2_local.cache_scope == "context":
+        raise RuntimeError("reload inside a context-scoped cache is not supported")
     with tuner._lock:
         tuner.profiling_cache.clear()
         tuner._ranked_tactics_cache.clear()
@@ -617,6 +621,7 @@ def autotune_v2(
     cache_root: Union[str, os.PathLike, None] = None,
     measurement_policy: Optional[MeasurementPolicy] = None,
     *,
+    cache_scope: str = "process",
     tuning_buckets: Optional[Tuple[int, ...]] = None,
     round_up: Optional[bool] = None,
     skip_ops: Optional[Union[str, Set[str]]] = None,
@@ -652,7 +657,7 @@ def autotune_v2(
     serves only what is already in the in-memory winner cache (e.g. tuned
     in-memory earlier this process).
 
-    **Attach semantics**: ``persistent_cache=True`` attaches the managed
+    **Attach semantics**: by default, ``persistent_cache=True`` attaches the managed
     store for the remainder of the process (like v1's ``load_configs``),
     so inference *after* the context exits keeps reusing on-disk entries.
     Publishing only happens while tuning inside a context.  See the module
@@ -673,6 +678,16 @@ def autotune_v2(
             choice of root can mix incompatible entries).  Defaults to
             ``FLASHINFER_CACHE_DIR/autotune``, overridable with the
             ``FLASHINFER_AUTOTUNE_CACHE_DIR`` environment variable.
+        cache_scope: ``"process"`` (default) attaches the store for bare
+            serving after exit. ``"context"`` selects it only inside the
+            context, without changing the ambient store. An identified
+            context (a managed store or nonempty measurement policy) ignores
+            legacy-loaded and bundled configs. With persistence disabled and
+            no policy, legacy memory/file behavior is unchanged. Use the same
+            identity for tuning and capture-time lookup; graph replay itself
+            runs no Python lookup. Nested v2 contexts and scoped reload are
+            unsupported. Concurrent tuning/serving and distributed scoped
+            stores require separate qualification.
         tuning_buckets: Forwarded to :func:`flashinfer.autotune`.
         round_up: Forwarded to :func:`flashinfer.autotune`.  Context-
             scoped: post-context lookups use each op's default bucket
@@ -713,6 +728,8 @@ def autotune_v2(
             f"{type(persistent_cache).__name__!r}; to place the store, pass "
             f"cache_root=<directory> instead."
         )
+    if cache_scope not in ("process", "context"):
+        raise ValueError("cache_scope must be 'process' or 'context'")
     enable_tuning = mode == "tune"
 
     tuner = AutoTuner.get()
@@ -739,10 +756,9 @@ def autotune_v2(
             if measurement_policy is not None:
                 # The policy is part of the environment identity.
                 manifest.update(measurement_policy.manifest_fields())
-            # A persistent context always attaches its store as the process
-            # ambient (last-wins), so bare serving after it exits resolves
-            # to it.
-            store = _resolve_managed_store(tuner, cache_root, manifest)
+            store = _resolve_managed_store(
+                tuner, cache_root, manifest, attach_ambient=cache_scope == "process"
+            )
         else:
             # Disk forbidden for this context: lookups and publishes skip the
             # managed store even if one is attached as ambient (the ambient
@@ -758,9 +774,11 @@ def autotune_v2(
         local.active = True
         local.store = store
         local.measure = measurement_policy
+        local.cache_scope = cache_scope
         try:
             yield
         finally:
             local.active = False
             local.store = None
             local.measure = None
+            local.cache_scope = "process"

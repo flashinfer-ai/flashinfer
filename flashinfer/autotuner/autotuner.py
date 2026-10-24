@@ -1629,6 +1629,7 @@ class _V2Local(threading.local):
     active: bool = False
     store: Any = None
     measure: Any = None
+    cache_scope: str = "process"
 
 
 class AutoTuner:
@@ -1923,6 +1924,16 @@ class AutoTuner:
         """Whether an autotune_v2 context is open on this thread."""
         return self._v2_local.active
 
+    @property
+    def _isolate_legacy_configs(self) -> bool:
+        """Identified context scopes consume only their own winner sources."""
+        local = self._v2_local
+        return (
+            local.active
+            and local.cache_scope == "context"
+            and self._winner_cache_identity() is not None
+        )
+
     def _winner_cache(self) -> dict:
         """In-memory winner-cache partition for the active MEASUREMENT identity.
 
@@ -2132,7 +2143,7 @@ class AutoTuner:
             # 2. User-loaded configs (from load_configs or autotune(cache=...)).
             #    Skipped wholesale when nothing was loaded, so the common
             #    serving path never builds a file_key string here.
-            if self._file_configs:
+            if self._file_configs and not self._isolate_legacy_configs:
                 for r_id, cache_key in runner_keys:
                     file_key = cache_key.file_key
                     if file_key in excluded_file_keys:
@@ -2215,6 +2226,7 @@ class AutoTuner:
             if (
                 os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1"
                 and not self.is_tuning_mode
+                and not self._isolate_legacy_configs
             ):
                 for r_id, cache_key in runner_keys:
                     if cache_key.file_key in excluded_file_keys or (
@@ -2465,7 +2477,7 @@ class AutoTuner:
                         k.custom_op == custom_op for k in self._winner_cache()
                     )
                     file_key_op_prefix = f"({repr(custom_op)}, "
-                    op_has_file = any(
+                    op_has_file = not self._isolate_legacy_configs and any(
                         k.startswith(file_key_op_prefix) for k in self._file_configs
                     )
                     has_tune_data = op_has_profiling or op_has_file
