@@ -327,13 +327,25 @@ Persistence and orchestration stay separate responsibilities.
 
 - **Shared filesystem**: per-entry publication prevents torn entries. It does not provide a
   snapshot across ranks: concurrent publishers or an interrupted run can produce mixed hits.
-- **Profiling participation**: with `set_autotune_process_group`, each profile first reduces
-  its hit flag and a digest of the cached runner/tactic. Only an all-hit group with matching
-  selections skips profiling; any miss or disagreement makes all ranks discard that
-  profile's old runner entries and re-profile. Invalidation covers memory and persistence so
-  a different runner can win without an older entry taking precedence after reload. These
-  collectives run only during tuning, outside CUDA Graph capture. The framework must still
-  ensure matching op/profile/candidate order and skip lists across the group.
+- **Profiling participation**: `set_autotune_process_group` adds startup gates
+  for operation/runner order, skip decisions, profile count, effective measurement
+  policy and ordered candidates. A mismatch raises on all participating ranks
+  before they enter incompatible tactic loops. Rank-local shapes and cache roots
+  need not match; runners still own the validity of their distributed inputs and
+  kernel collectives. Every rank must enable tuning and enter the same calls.
+  A missing rank remains a process-group timeout, not a recoverable plan mismatch.
+- **Preparation failures**: input synthesis, candidate discovery and runner
+  preparation coordinate OOM fallback and propagate caught non-OOM Python errors
+  across the group. A fixed-size phase/selection exchange also detects mismatched
+  nested shortlist preparation. It does not recover sticky CUDA errors or
+  failures inside arbitrary runner collectives. Delegated protocols still own
+  their distributed coordination.
+- **Cache agreement**: each profile reduces its hit flag and a digest of the
+  cached runner/tactic. Only an all-hit group with matching selections skips
+  profiling; any miss or disagreement makes all ranks discard that profile's
+  winner/shortlist and re-profile. Malformed persisted selections remain cache
+  misses. Warm tuning still performs startup gates; serving with tuning disabled
+  adds no collective. Distributed tuning must run outside CUDA Graph capture.
 - **In-session rank consistency**: coordinated tuning re-profiles divergent cached winners and
   tactic shortlists. Independent tuning without a process group can still diverge until
   `autotune_v2_reload()` runs — a finalize step (tune → barrier → reload) that drops in-process
