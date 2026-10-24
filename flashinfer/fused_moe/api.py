@@ -2948,6 +2948,7 @@ class CudnnFrostMxfp8Mxfp4Config:
 class FrostLowLatencyConfig:
     """Low-token routed MoE on SM100/SM103/SM107, with FMA-only SM120 support.
 
+    SM90 supports BF16, FP16 and ordinary per-tensor FP8 FMA only.
     Explicit opt-in; omitted from the default backend list. Autotuning selects
     Tensor Core tile sizes or a scalar FMA tactic (top-k <= 32) using the same
     prepared weights and numerical contract. Both are multi-kernel pipelines,
@@ -2965,6 +2966,13 @@ class FrostLowLatencyConfig:
     BF16 rounding regardless of the input/output dtype. This is distinct from
     the MX intermediate quantization/combine contract.
 
+    Ordinary per-tensor E4M3 FP8 uses static calibration multipliers, with
+    BF16 FC1 preactivation rounding as in the CUTLASS per-tensor backbone.
+    Activation and intermediate quantization remain fused into FC1; FC2
+    produces BF16 expert/final outputs with ordered FP32 multiply/add combine.
+    The TRT-LLM per-tensor path retains FP32 preactivations, so its rounding
+    contract differs even with identical quantized weights and scales.
+
     NVFP4 weights/inputs use shared FMA with H divisible by 512, I by 128,
     and top-k at most 32. It retains BF16 activation/expert rounding and
     separate FP32 multiply/add combine; the 4over6 recipe is not supported.
@@ -2978,7 +2986,7 @@ class FrostLowLatencyConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in (100, 103, 107, 120)
+        return arch in (90, 100, 103, 107, 120)
 
     @staticmethod
     def prepare_weights(w1, w1_scale, w2, w2_scale, *, activation=None):
@@ -3010,6 +3018,38 @@ class FrostLowLatencyConfig:
         return prepare_fp16_weights(
             w1, w2, SwiGLU() if activation is None else activation
         )
+
+    @staticmethod
+    def prepare_fp8_per_tensor_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        hidden_states_scale_global,
+        intermediate_scale_global,
+        num_local_experts,
+        hidden_size,
+        intermediate_size,
+        activation=None,
+        device=None,
+    ):
+        """Prepare E4M3 weights with static input/intermediate calibration scales."""
+        from .backends.frost_low_latency.prepare import prepare_fp8_per_tensor_weights
+
+        return prepare_fp8_per_tensor_weights(
+            w1_bf16,
+            w2_bf16,
+            hidden_states_scale_global=hidden_states_scale_global,
+            intermediate_scale_global=intermediate_scale_global,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+        )
+
+    prepare_fp8_per_tensor_activations = staticmethod(
+        TrtllmFp8PerTensorConfig.prepare_activations
+    )
 
     @staticmethod
     def prepare_nvfp4_weights(w1, w2, *, activation=None):

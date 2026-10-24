@@ -5,6 +5,7 @@
 
 import cutlass
 from cutlass import cute
+from flashinfer.cute_dsl.fp4_common import cvt_e4m3x4_to_f32x4, cvt_f32_to_e4m3
 from flashinfer.fused_moe.backends.frost_low_latency.fma.activations import (
     apply_activation,
 )
@@ -15,7 +16,9 @@ _GATED = True
 
 
 @cute.jit
-def _float16x4(word, dtype: cutlass.Constexpr):
+def _quad(word, dtype: cutlass.Constexpr):
+    if cutlass.const_expr(dtype == cutlass.Float8E4M3FN):
+        return cvt_e4m3x4_to_f32x4(word)
     return (
         word.to(cutlass.Uint16).bitcast(dtype).to(cutlass.Float32),
         (word >> 16).to(cutlass.Uint16).bitcast(dtype).to(cutlass.Float32),
@@ -34,6 +37,8 @@ def _kernel(
     activation: cutlass.Constexpr,
     gated: cutlass.Constexpr,
     parameters: cutlass.Constexpr = None,
+    dequant=None,
+    mid_scale=None,
 ):
     bid, _, _ = cute.arch.block_idx()
     lane = cute.arch.lane_idx()
@@ -52,18 +57,21 @@ def _kernel(
     up.fill(0.0)
     gate.fill(0.0)
     if expert >= 0 and expert < cute.size(weights, mode=[0]):
-        xp = cute.recast_ptr(x.iterator, dtype=cutlass.Uint64)
-        wp = cute.recast_ptr(weights.iterator, dtype=cutlass.Uint64)
-        # Four adjacent 16-bit values per lane give coalesced 64-bit loads.
-        # Accumulate in FP32; round only after the fused activation.
+        word_type = (
+            cutlass.Uint32 if x.element_type == cutlass.Float8E4M3FN else cutlass.Uint64
+        )
+        xp = cute.recast_ptr(x.iterator, dtype=word_type)
+        wp = cute.recast_ptr(weights.iterator, dtype=word_type)
+        # Four adjacent values per lane give coalesced word loads.
+        # Accumulate in FP32; each format's rounding boundary is applied below.
         for group in range(h // 128):
             col = group * 32 + lane
-            xv = _float16x4(xp[(route // k) * (h // 4) + col], x.element_type)
+            xv = _quad(xp[(route // k) * (h // 4) + col], x.element_type)
             for o in cutlass.range_constexpr(outputs):
                 offset = (expert * branches * i + row + o) * (h // 4) + col
-                uv = _float16x4(wp[offset], weights.element_type)
+                uv = _quad(wp[offset], weights.element_type)
                 if cutlass.const_expr(gated):
-                    gv = _float16x4(wp[offset + i * (h // 4)], weights.element_type)
+                    gv = _quad(wp[offset + i * (h // 4)], weights.element_type)
                 for c in cutlass.range_constexpr(4):
                     up[c, o] = up[c, o] + xv[c] * uv[c]
                     if cutlass.const_expr(gated):
@@ -76,7 +84,22 @@ def _kernel(
                 gate[0, o] + gate[1, o] + gate[2, o] + gate[3, o]
             )
         if lane == 0:
+            if cutlass.const_expr(x.element_type == cutlass.Float8E4M3FN):
+                if expert >= 0 and expert < cute.size(weights, mode=[0]):
+                    u = u * dequant[expert]
+                    g = g * dequant[expert]
+                    # Match the per-tensor FP8 backbone's BF16 FC1 boundary
+                    # before activation and static FP8 requantization.
+                    u = u.to(cutlass.BFloat16).to(cutlass.Float32)
+                    g = g.to(cutlass.BFloat16).to(cutlass.Float32)
             value = apply_activation(u, g, activation, parameters=parameters)
+            if cutlass.const_expr(mid.element_type == cutlass.Float8E4M3FN):
+                # Preserve the checkpoint's static intermediate multiplier.
+                value = (
+                    cvt_f32_to_e4m3(value * mid_scale[0])
+                    .to(cutlass.Uint8)
+                    .bitcast(cutlass.Float8E4M3FN)
+                )
             mid[route, row + o] = value.to(mid.element_type)
 
 
