@@ -43,7 +43,11 @@ def execute(inputs, config, tile_k):
 
         return execute_nvfp4(inputs, config, tile_k)
     if config.quant.weight in (QuantFormat.BF16, QuantFormat.FP16):
-        if isinstance(tile_k, tuple) and tile_k and tile_k[0] in ("wgmma", "warp_mma"):
+        if (
+            isinstance(tile_k, tuple)
+            and tile_k
+            and tile_k[0] in ("wgmma", "warp_mma", "ampere_mma")
+        ):
             from .tc.runtime import execute as execute_grouped
 
             return execute_grouped(inputs, config, tile_k)

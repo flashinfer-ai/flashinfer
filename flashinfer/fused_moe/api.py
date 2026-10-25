@@ -2946,7 +2946,9 @@ class CudnnFrostMxfp8Mxfp4Config:
 
 @dataclass(frozen=True)
 class FrostLowLatencyConfig:
-    """Low-token routed MoE on SM90/SM100/SM103/SM107/SM120.
+    """Low-token routed MoE on SM80/SM90/SM100/SM103/SM107/SM120.
+
+    SM80 supports BF16/FP16 inputs and weights.
 
     SM90 supports BF16, FP16, ordinary per-tensor FP8, DeepSeek FP8 and
     NVFP4/MXFP4/MXINT4-weight with BF16/FP16-activation FMA.
@@ -2965,10 +2967,13 @@ class FrostLowLatencyConfig:
     outputs to the configured BF16/FP16 output dtype. Combine uses ordered,
     separate FP32 multiplication and addition. Packed routing scores retain
     BF16 rounding regardless of the input/output dtype. This is distinct from
-    the MX intermediate quantization/combine contract. SM90 and SM120 also
-    offer grouped BF16 Tensor Core candidates for default SwiGLU,
-    H=2048/I=512/top-k=10, T=4 or 8, with finalized BF16 output. Those
-    projections share the typed intermediate and ordered combine contract;
+    the MX intermediate quantization/combine contract. SM80, SM90 and SM120 also
+    offer grouped BF16/FP16 Tensor Core candidates at H=2048/I=512/top-k=10,
+    T=4 or 8, with finalized matching output dtype. SM80 admits default SwiGLU
+    and ReLU2; SM90/SM120 add GeGLU, and ReLU2/SiLU use T8 on SM90 and T4/T8
+    on SM120. SM80 additionally admits BF16 default SwiGLU at
+    H=7168/I=2048/top-k=8 and T=4 or 8. These projections share the typed
+    intermediate and ordered combine contract;
     FMA remains the untuned default and a tuning candidate.
 
     Ordinary per-tensor E4M3 FP8 uses static calibration multipliers, with
@@ -3013,7 +3018,7 @@ class FrostLowLatencyConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in (90, 100, 103, 107, 120)
+        return arch in (80, 90, 100, 103, 107, 120)
 
     @staticmethod
     def prepare_weights(w1, w1_scale, w2, w2_scale, *, activation=None):
