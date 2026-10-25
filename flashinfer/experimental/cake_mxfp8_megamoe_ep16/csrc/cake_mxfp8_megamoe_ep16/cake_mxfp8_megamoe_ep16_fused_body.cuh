@@ -83,6 +83,85 @@ static __device__ __forceinline__ void cake_megamoe_dispatch_rows(
     }
 }
 #endif
+#ifndef CAKE_MEGAMOE_DISPATCH_ROWS_EARLY_DEFINED
+#define CAKE_MEGAMOE_DISPATCH_ROWS_EARLY_DEFINED
+// Early dispatch: lanes 0-7 load the token's route id and weight together; the warp votes on ownership before the
+// row claim, and issues the remote row loads before the claim's atomic, so an owned token waits for two NVLink round
+// trips (ids+weights, row) instead of four (ids, weight after the claim, two row passes).  Warps whose role holds 80
+// registers (kOnePass) load the whole 6 KiB row at once; the 64-register roles keep two passes of six words.
+// Token slots: epilogue warps 0-3 -> 0-3, transform warps 8-11 -> 4-7, warps 4-7 -> 8-11.
+template <bool kOnePass>
+static __device__ __forceinline__ void cake_megamoe_dispatch_rows_early(
+    int bid, int slot, int lane, int tokens_per_rank, int mega_pg_rank,
+    int* const* __restrict__ published_topk_ids_i32_peers,
+    float* const* __restrict__ published_topk_weights_f32_peers,
+    __nv_bfloat16* const* __restrict__ published_hidden_bf16_peers,
+    unsigned int* __restrict__ route_counts_u32, int* __restrict__ route_map_i32, float* __restrict__ route_scale_f32,
+    __nv_bfloat16* __restrict__ activation_bf16_ptr) {
+    const int source_rank = bid % 16;
+    const int source_token_begin = bid / 16;
+    const int* remote_ids = reinterpret_cast<const int*>(published_topk_ids_i32_peers[source_rank]);
+    const float* remote_weights = reinterpret_cast<const float*>(published_topk_weights_f32_peers[source_rank]);
+    const uint4* remote_hidden = reinterpret_cast<const uint4*>(published_hidden_bf16_peers[source_rank]);
+    const int local_tokens = (tokens_per_rank - source_token_begin + 8) / 9;
+    constexpr int kWords = kOnePass ? 12 : 6;
+    #pragma unroll 1
+    for (int local_token = slot; local_token < local_tokens; local_token += 12) {
+        const int source_token = source_token_begin + local_token * 9;
+        const int routes_per_source = tokens_per_rank * 8;
+        const int source_route_lane = source_token * 8 + lane;
+        int global_expert = 0;
+        unsigned int weight_bits = 0u;
+        if (lane < 8) {
+            asm volatile("ld.global.b32 %0, [%1];" : "=r"(global_expert) : "l"(remote_ids + source_route_lane) : "memory");
+            asm volatile("ld.global.b32 %0, [%1];" : "=r"(weight_bits) : "l"(remote_weights + source_route_lane) : "memory");
+        }
+        const bool owned = lane < 8 && global_expert / 32 == mega_pg_rank;
+        if (__any_sync(0xFFFFFFFFu, owned)) {
+            const uint4* src = remote_hidden + source_token * 384;
+            uint4 words[kWords];
+            #pragma unroll
+            for (int k = 0; k < kWords; ++k) {
+                asm volatile("ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                             : "=r"(words[k].x), "=r"(words[k].y), "=r"(words[k].z), "=r"(words[k].w)
+                             : "l"(src + lane + 32 * k) : "memory");
+            }
+            int row_index_lane = -1;
+            if (owned) {
+                const int local_expert_lane = global_expert - mega_pg_rank * 32;
+                const int row_lane = (int)atomicAdd(&route_counts_u32[local_expert_lane], 1u);
+                // Every route owns a distinct packed row for its expert, including duplicate expert IDs in separate
+                // top-k slots. The N32/N16/N16 segments preserve the full 64-row carrier.
+                if (row_lane < 64) {
+                    row_index_lane = local_expert_lane * 64 + row_lane;
+                    route_map_i32[row_index_lane] = source_rank * routes_per_source + source_route_lane;
+                    route_scale_f32[row_index_lane] = __uint_as_float(weight_bits);
+                }
+            }
+            #pragma unroll
+            for (int pass = 0; pass < 12 / kWords; ++pass) {
+                if (pass == 1) {
+                    #pragma unroll
+                    for (int k = 0; k < kWords; ++k) {
+                        asm volatile("ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                                     : "=r"(words[k].x), "=r"(words[k].y), "=r"(words[k].z), "=r"(words[k].w)
+                                     : "l"(src + lane + 32 * (kWords + k)) : "memory");
+                    }
+                }
+                #pragma unroll
+                for (int route_slot = 0; route_slot < 8; ++route_slot) {
+                    const int row = __shfl_sync(0xFFFFFFFFu, row_index_lane, route_slot);
+                    if (row >= 0) {
+                        uint4* dst = reinterpret_cast<uint4*>(activation_bf16_ptr + row * 3072);
+                        #pragma unroll
+                        for (int k = 0; k < kWords; ++k) dst[lane + 32 * (pass * kWords + k)] = words[k];
+                    }
+                }
+            }
+        }
+    }
+}
+#endif
 extern "C" {
 
 __global__ __launch_bounds__(384, 1) __cluster_dims__(2,1,1) void
@@ -252,6 +331,17 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
     if (warp <= 3) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 80;");
         { // epilogue_main
+            // Rank-barrier phase 0 operands, loaded before the wait that precedes the barrier: the peer flag
+            // pointers and this rank's flag word (its sense bit cannot flip before this rank's own add).
+            unsigned* barrier_peer_flags0[16];
+            unsigned* barrier_local_flag0 = nullptr;
+            unsigned barrier_old_sense0 = 0u;
+            if (bid == 0 && warp == 0) {
+                #pragma unroll
+                for (int __r = 0; __r < 16; ++__r) barrier_peer_flags0[__r] = mega_pg_flags[__r < mega_pg_world ? __r : 0] + 0;
+                barrier_local_flag0 = mega_pg_flags[mega_pg_rank] + 0;
+                asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(barrier_old_sense0) : "l"(barrier_local_flag0) : "memory");
+            }
             int linear_thread = bid * 384 + tid;
             int thread_stride = num_bids * 384;
             #pragma unroll 1
@@ -339,21 +429,18 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                         const int __ws = mega_pg_world;
                         const int __me = mega_pg_rank;
                         const int __slot = 0;
-                        unsigned* __local_flag = mega_pg_flags[__me] + __slot;
-                        unsigned __old_sense = 0u;
+                        unsigned* __local_flag = barrier_local_flag0;
+                        unsigned __old_sense = barrier_old_sense0;
                         const unsigned __delta = (__me == 0) ? (0x80000000u - (unsigned)(__ws - 1)) : 1u;
                         asm volatile("fence.proxy.async.global;" ::: "memory");
                         unsigned* __peer_flags[16];
                         #pragma unroll
-                        for (int __r = 0; __r < 16; ++__r) __peer_flags[__r] = mega_pg_flags[__r < __ws ? __r : 0] + __slot;
+                        for (int __r = 0; __r < 16; ++__r) __peer_flags[__r] = barrier_peer_flags0[__r];
                         asm volatile("fence.acq_rel.sys;" ::: "memory");
                         #pragma unroll
                         for (int __r = 0; __r < 16; ++__r) {
                             if (__r < __ws) {
-                                if (__r == __me) {
-                                    asm volatile("atom.add.relaxed.sys.u32 %0, [%1], %2;"
-                                        : "=r"(__old_sense) : "l"(__peer_flags[__r]), "r"(__delta) : "memory");
-                                } else {
+                                {
                                     asm volatile("red.relaxed.sys.global.add.u32 [%0], %1;"
                                         :: "l"(__peer_flags[__r]), "r"(__delta) : "memory");
                                 }
@@ -392,7 +479,7 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                 }
             }
             asm volatile("barrier.sync 12, 384;" ::: "memory");
-            cake_megamoe_dispatch_rows(bid, warp, lane, tokens_per_rank, mega_pg_rank, published_topk_ids_i32_peers,
+            cake_megamoe_dispatch_rows_early<true>(bid, warp, lane, tokens_per_rank, mega_pg_rank, published_topk_ids_i32_peers,
                 published_topk_weights_f32_peers, published_hidden_bf16_peers, route_counts_u32, route_map_i32,
                 route_scale_f32, activation_bf16_ptr);
             asm volatile("barrier.sync 12, 384;" ::: "memory");
@@ -1250,6 +1337,17 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                     }
                 }
             }
+            // Rank-barrier phase 1 operands, loaded before the wait that precedes the barrier: the peer flag
+            // pointers and this rank's flag word (its sense bit cannot flip before this rank's own add).
+            unsigned* barrier_peer_flags1[16];
+            unsigned* barrier_local_flag1 = nullptr;
+            unsigned barrier_old_sense1 = 0u;
+            if (bid == 0 && warp == 0) {
+                #pragma unroll
+                for (int __r = 0; __r < 16; ++__r) barrier_peer_flags1[__r] = mega_pg_flags[__r < mega_pg_world ? __r : 0] + 1;
+                barrier_local_flag1 = mega_pg_flags[mega_pg_rank] + 1;
+                asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(barrier_old_sense1) : "l"(barrier_local_flag1) : "memory");
+            }
 #if CAKE_MEGAMOE_RETURN_ALL_CTA  // cake-variant
             if (warp == 0) {
                 if (elect_sync()) {
@@ -1271,21 +1369,18 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                         const int __ws = mega_pg_world;
                         const int __me = mega_pg_rank;
                         const int __slot = 1;
-                        unsigned* __local_flag = mega_pg_flags[__me] + __slot;
-                        unsigned __old_sense = 0u;
+                        unsigned* __local_flag = barrier_local_flag1;
+                        unsigned __old_sense = barrier_old_sense1;
                         const unsigned __delta = (__me == 0) ? (0x80000000u - (unsigned)(__ws - 1)) : 1u;
                         asm volatile("fence.proxy.async.global;" ::: "memory");
                         unsigned* __peer_flags[16];
                         #pragma unroll
-                        for (int __r = 0; __r < 16; ++__r) __peer_flags[__r] = mega_pg_flags[__r < __ws ? __r : 0] + __slot;
+                        for (int __r = 0; __r < 16; ++__r) __peer_flags[__r] = barrier_peer_flags1[__r];
                         asm volatile("fence.acq_rel.sys;" ::: "memory");
                         #pragma unroll
                         for (int __r = 0; __r < 16; ++__r) {
                             if (__r < __ws) {
-                                if (__r == __me) {
-                                    asm volatile("atom.add.relaxed.sys.u32 %0, [%1], %2;"
-                                        : "=r"(__old_sense) : "l"(__peer_flags[__r]), "r"(__delta) : "memory");
-                                } else {
+                                {
                                     asm volatile("red.relaxed.sys.global.add.u32 [%0], %1;"
                                         :: "l"(__peer_flags[__r]), "r"(__delta) : "memory");
                                 }
@@ -1325,21 +1420,18 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                             const int __ws = mega_pg_world;
                             const int __me = mega_pg_rank;
                             const int __slot = 1;
-                            unsigned* __local_flag = mega_pg_flags[__me] + __slot;
-                            unsigned __old_sense = 0u;
+                            unsigned* __local_flag = barrier_local_flag1;
+                            unsigned __old_sense = barrier_old_sense1;
                             const unsigned __delta = (__me == 0) ? (0x80000000u - (unsigned)(__ws - 1)) : 1u;
                             asm volatile("fence.proxy.async.global;" ::: "memory");
                             unsigned* __peer_flags[16];
                             #pragma unroll
-                            for (int __r = 0; __r < 16; ++__r) __peer_flags[__r] = mega_pg_flags[__r < __ws ? __r : 0] + __slot;
+                            for (int __r = 0; __r < 16; ++__r) __peer_flags[__r] = barrier_peer_flags1[__r];
                             asm volatile("fence.acq_rel.sys;" ::: "memory");
                             #pragma unroll
                             for (int __r = 0; __r < 16; ++__r) {
                                 if (__r < __ws) {
-                                    if (__r == __me) {
-                                        asm volatile("atom.add.relaxed.sys.u32 %0, [%1], %2;"
-                                            : "=r"(__old_sense) : "l"(__peer_flags[__r]), "r"(__delta) : "memory");
-                                    } else {
+                                    {
                                         asm volatile("red.relaxed.sys.global.add.u32 [%0], %1;"
                                             :: "l"(__peer_flags[__r]), "r"(__delta) : "memory");
                                     }
@@ -1525,7 +1617,7 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                 }
             }
             asm volatile("barrier.sync 12, 384;" ::: "memory");
-            cake_megamoe_dispatch_rows(bid, warp, lane, tokens_per_rank, mega_pg_rank, published_topk_ids_i32_peers,
+            cake_megamoe_dispatch_rows_early<false>(bid, warp + 4, lane, tokens_per_rank, mega_pg_rank, published_topk_ids_i32_peers,
                 published_topk_weights_f32_peers, published_hidden_bf16_peers, route_counts_u32, route_map_i32,
                 route_scale_f32, activation_bf16_ptr);
             asm volatile("barrier.sync 12, 384;" ::: "memory");
@@ -1791,6 +1883,30 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
     // ---- Role: tma_a_scale ----
     if (warp == 5) {
         { // tma_a_scale_main
+            {
+                // Before its main loop, TMA-A asks L2 for the weight and scale tiles of this CTA's
+                // first 1 FC1 work item(s) (cp.async.bulk.prefetch.tensor, no shared memory, no completion): the
+                // HBM is idle while the rank publishes, waits for its peers and dispatches, and the FC1 stream then
+                // starts from L2.  A hint only: the tiles the main loop loads, and so the results, are unchanged.
+                if (elect_sync()) {
+                    #pragma unroll 1
+                    for (int pf_item = 0; pf_item < 1; pf_item++) {
+                        const int pf_work = pf_item * 72 + (int)cluster_id;
+                        const int pf_expert = pf_work / 40;
+                        const int pf_m_tile = pf_work - pf_expert * 40;
+                        #pragma unroll 1
+                        for (int pf_k = 0; pf_k < 24; pf_k++) {
+                            asm volatile("cp.async.bulk.prefetch.tensor.4d.L2.global.tile [%0, {%1, %2, %3, %4}];"
+                                         :: "l"(fc1_weight_e4m3), "r"(0), "r"(pf_m_tile * 256 + cta_rank * 128), "r"(pf_k),
+                                            "r"(pf_expert) : "memory");
+                            const int pf_atom = pf_expert * 1920 + (pf_m_tile * 2 + cta_rank) * 24 + pf_k;
+                            asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];"
+                                         :: "l"(fc1_blocked_e8m0), "r"(0), "r"(pf_atom * 4) : "memory");
+                        }
+                    }
+                }
+                __syncwarp();
+            }
             int linear_thread_2 = bid * 384 + tid;
             int thread_stride_2 = num_bids * 384;
             #pragma unroll 1
@@ -1931,7 +2047,7 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                 }
             }
             asm volatile("barrier.sync 12, 384;" ::: "memory");
-            cake_megamoe_dispatch_rows(bid, warp, lane, tokens_per_rank, mega_pg_rank, published_topk_ids_i32_peers,
+            cake_megamoe_dispatch_rows_early<false>(bid, warp + 4, lane, tokens_per_rank, mega_pg_rank, published_topk_ids_i32_peers,
                 published_topk_weights_f32_peers, published_hidden_bf16_peers, route_counts_u32, route_map_i32,
                 route_scale_f32, activation_bf16_ptr);
             asm volatile("barrier.sync 12, 384;" ::: "memory");
@@ -2243,7 +2359,7 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                 }
             }
             asm volatile("barrier.sync 12, 384;" ::: "memory");
-            cake_megamoe_dispatch_rows(bid, warp, lane, tokens_per_rank, mega_pg_rank, published_topk_ids_i32_peers,
+            cake_megamoe_dispatch_rows_early<false>(bid, warp + 4, lane, tokens_per_rank, mega_pg_rank, published_topk_ids_i32_peers,
                 published_topk_weights_f32_peers, published_hidden_bf16_peers, route_counts_u32, route_map_i32,
                 route_scale_f32, activation_bf16_ptr);
             asm volatile("barrier.sync 12, 384;" ::: "memory");
@@ -2585,7 +2701,7 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                 }
             }
             asm volatile("barrier.sync 12, 384;" ::: "memory");
-            cake_megamoe_dispatch_rows(bid, warp, lane, tokens_per_rank, mega_pg_rank, published_topk_ids_i32_peers,
+            cake_megamoe_dispatch_rows_early<false>(bid, warp + 4, lane, tokens_per_rank, mega_pg_rank, published_topk_ids_i32_peers,
                 published_topk_weights_f32_peers, published_hidden_bf16_peers, route_counts_u32, route_map_i32,
                 route_scale_f32, activation_bf16_ptr);
             asm volatile("barrier.sync 12, 384;" ::: "memory");
@@ -2848,7 +2964,7 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                 }
             }
             asm volatile("barrier.sync 12, 384;" ::: "memory");
-            cake_megamoe_dispatch_rows(bid, warp, lane, tokens_per_rank, mega_pg_rank, published_topk_ids_i32_peers,
+            cake_megamoe_dispatch_rows_early<true>(bid, warp - 4, lane, tokens_per_rank, mega_pg_rank, published_topk_ids_i32_peers,
                 published_topk_weights_f32_peers, published_hidden_bf16_peers, route_counts_u32, route_map_i32,
                 route_scale_f32, activation_bf16_ptr);
             asm volatile("barrier.sync 12, 384;" ::: "memory");
