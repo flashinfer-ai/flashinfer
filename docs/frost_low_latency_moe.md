@@ -1757,3 +1757,23 @@ Use `--expert-reuse paired` or `disjoint` and `--cache-mode cold` to probe reuse
 and cache boundaries. This measures routed-expert kernel GPU time with
 precomputed routes; it does not measure router evaluation, shared experts,
 communication, host enqueue or model token throughput.
+
+
+### Cooperative grouped projection staging
+
+Ampere K128 tiles distribute activation gathering across all four warps and
+use CUTLASS 128-bit `cp.async` copies for aligned inputs. Unaligned inputs
+retain a scalar fallback; missing route members are zero-filled. All threads
+participate in the existing copy-group completion and CTA synchronization.
+K64 gathering keeps its original schedule.
+
+Hopper distributes activation rows across four warps. BF16/FP16 weight TMA
+starts before gathering so the independent transfers can overlap; FP8 keeps
+gather-before-TMA ordering. Producers acquire a stage before any writer reuses
+it, publish every warp's activation stores, and synchronize the CTA before
+consumption. The weight TMA barrier alone does not publish those stores.
+
+These changes preserve the existing candidate domains, checkpoint layouts,
+activation and rounding contracts, workspace ownership, and default tactics.
+Use the existing grouped-TC and FP8 reproductions with warm/cold caches and
+shared/disjoint routing when measuring the scheduling change.
