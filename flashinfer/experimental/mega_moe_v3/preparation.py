@@ -294,18 +294,64 @@ def build_tile_lists(per_expert_M, num_experts: int):
     )
 
 
-def prepare_pipeline_bindings(inputs, num_sms, *, local_expert_filter=False):
+def source_schedule_form(metadata, num_tokens, num_experts, top_k, weight_fmt):
+    """``(block_m, block_readiness, slot_list)`` of a route's generated program.
+
+    A route's ``metadata`` names the source tile height (``block_m``) and the
+    readiness form (``readiness``: ``"block"`` when the program starts an
+    expert block as soon as its rows arrive, ``"grid"`` when it waits for the
+    whole dispatch). ``slot_list`` (per-expert slot lists of ``num_tokens``
+    entries, rewritten by every launch) defaults to the block-readiness form
+    except at one token, where the program folds the metadata instead. The
+    original routes carry none of these: their programs were generated with
+    the heuristic tile height and use the slot-list form at the token counts
+    listed here.
+    """
+    block_m = metadata.get("block_m")
+    block_m = (
+        _source_block_m(num_tokens, num_experts, top_k)
+        if block_m is None
+        else int(block_m)
+    )
+    if block_m < 1 or block_m > 128 or 128 % block_m:
+        raise ValueError(
+            f"MegaMoE source tile height {block_m} is outside the generated "
+            "programs' 16-, 32- and 128-row forms"
+        )
+    readiness = metadata.get("readiness")
+    if readiness is None:
+        slot_list = (
+            weight_fmt == "fp4" and num_tokens in (16, 128, 512, 1024, 4096)
+        ) or (weight_fmt == "fp8" and num_tokens == 16)
+        block_readiness = slot_list or num_tokens == 1
+    elif readiness in ("block", "grid"):
+        block_readiness = readiness == "block"
+        slot_list = bool(metadata.get("slot_list", block_readiness and num_tokens != 1))
+    else:
+        raise ValueError(
+            f"route metadata 'readiness' must be 'block' or 'grid'; got {readiness!r}"
+        )
+    return block_m, block_readiness, slot_list
+
+
+def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
     """Pack ``inputs`` for the persistent grid of a ``num_sms``-SM catalogued route.
 
     ``inputs["intermediate"]`` is the logical width; the weights and scales are
     padded to the physical width of the route (``physical_intermediate``) when
     the two differ, and the kernel scalars ``N1``/``K2`` name the physical width.
-    ``local_expert_filter`` states that the route's program filters global ids
-    through the ``local_expert_offset`` kernel scalar; without it the call must
-    describe a single-rank window (offset 0, every id below ``num_experts``).
+    ``route_metadata`` is the catalogued route's ``metadata`` mapping: its
+    ``block_m`` and ``readiness`` size the source-schedule workspace
+    (``source_schedule_form``) and ``local_expert_filter`` states that the
+    program filters global ids through the ``local_expert_offset`` kernel
+    scalar; without the filter the call must describe a single-rank window
+    (offset 0, every id below ``num_experts``). Without metadata (the original
+    routes) the host uses the original heuristics.
     """
     import torch
 
+    metadata = {} if route_metadata is None else route_metadata
+    local_expert_filter = bool(metadata.get("local_expert_filter", False))
     args = pipeline_route_args(inputs)
     E, TK, T, H, I = (
         args[k]
@@ -357,7 +403,9 @@ def prepare_pipeline_bindings(inputs, num_sms, *, local_expert_filter=False):
             f"topk_idx must hold global expert ids in [0, {global_experts}) or -1; "
             f"got [{int(ids.min())}, {int(ids.max())}]"
         )
-    source_block_m = _source_block_m(T, E, TK)
+    source_block_m, block_readiness, slot_list = source_schedule_form(
+        metadata, T, E, TK, weight_fmt
+    )
     source_blocks = E + (T * TK + source_block_m - 1) // source_block_m
     N1, K1, N2, K2 = (2 * I, H, H, I)
     grid_n1, K1_tiles = (N1 // BLOCK_N, K1 // BLOCK_K)
@@ -395,23 +443,20 @@ def prepare_pipeline_bindings(inputs, num_sms, *, local_expert_filter=False):
     # the routes fill, e.g. when -1 slots leave fewer routed tokens.
     persistent_grid = num_sms
     grid = (persistent_grid, 1, 1)
-    residual_readiness = (
-        weight_fmt == "fp4"
-        and T in (16, 128, 512, 1024, 4096)
-        or (weight_fmt == "fp8" and T == 16)
-    )
+    # Two task counters, two mask words per source block and, with per-block
+    # readiness, one arrival word per source block.
     arrival_words = total_m_tiles * K2_tiles
     arrival_words = max(
         arrival_words,
-        2 + (3 if T == 1 or residual_readiness else 2) * source_blocks,
+        2 + (3 if block_readiness else 2) * source_blocks,
     )
     reset_storage = torch.zeros(
         2 * E + 4 + arrival_words, dtype=torch.uint32, device="cuda"
     )
     expert_counts = reset_storage[:E].view(torch.int32)
     expert_row_offsets = torch.zeros(E, dtype=torch.int32, device="cuda")
-    if residual_readiness:
-        # Round-7 slot-list dispatch: per-expert slot list [E, T] (native
+    if slot_list:
+        # Slot-list dispatch: per-expert slot list [E, T] (native
         # src_token_topk_idx), fully rewritten by every launch, never reset.
         expert_scatter_offsets = torch.empty(E * T, dtype=torch.int32, device="cuda")
     else:
@@ -532,4 +577,5 @@ def prepare_pipeline_bindings(inputs, num_sms, *, local_expert_filter=False):
         intermediate=I,
         local_expert_offset=offset,
         num_global_experts=global_experts,
+        block_m=source_block_m,
     )

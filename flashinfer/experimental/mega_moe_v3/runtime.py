@@ -1,6 +1,7 @@
 """Prepared v3 full pipeline and grouped FP4 compute surfaces on SM100a/SM103a."""
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 from ..deepgemm_common import load_catalog
@@ -65,24 +66,72 @@ def key(surface, args):
     )
 
 
-def _route(arch, surface, args):
-    """Catalogued route for ``surface``/``args``; unknown routes raise."""
+# The shape fields a missing-route error lists per catalogued route.
+_SHAPE_SUMMARY = {
+    "pipeline": ("num_experts", "intermediate", "num_tokens", "routed_weight_dtype")
+}
+
+
+def _shape_summary(surface, fields):
+    names = _SHAPE_SUMMARY.get(surface)
+    if names is None:
+        return json.dumps(fields, sort_keys=True, separators=(",", ":"))
+    return tuple(fields.get(name) for name in names)
+
+
+def _route(arch, surface, args, *, note=""):
+    """Catalogued route for ``surface``/``args``.
+
+    An unknown route raises a ``RuntimeError`` that names the requested key
+    fields and the shapes the ``arch`` catalog does carry for ``surface``
+    (``_SHAPE_SUMMARY`` fields, every key field for the other surfaces).
+    """
+    routes = catalog().routes(arch)
+    route_key = key(surface, args)
     try:
-        return catalog().routes(arch)[key(surface, args)]
+        return routes[route_key]
     except KeyError as error:
+        wanted = json.loads(route_key)[1]
+        catalogued = sorted(
+            (
+                _shape_summary(surface, json.loads(k)[1])
+                for k in routes
+                if json.loads(k)[0] == surface
+            ),
+            key=str,
+        )
+        fields = _SHAPE_SUMMARY.get(surface, "key fields")
         raise RuntimeError(
-            f"No exported {arch} {surface} schedule for {args}"
+            f"No exported {arch} {surface} schedule for "
+            + ", ".join(f"{k}={v}" for k, v in wanted.items())
+            + f"{note}; the {arch} catalog lists {len(catalogued)} {surface} "
+            f"route(s) by {fields}: {catalogued}"
         ) from error
+
+
+def _per_arch(value, arch):
+    """A route field given per architecture (``{arch: value}``) or once."""
+    return value[arch] if isinstance(value, Mapping) else value
+
+
+def route_num_sms(route, arch):
+    """The SM count ``route`` was generated for on ``arch``."""
+    return int(_per_arch(route["num_sms"], arch))
+
+
+def route_grid(route, arch):
+    """The launch grid of ``route`` on ``arch``."""
+    return tuple(_per_arch(route["grid"], arch))
 
 
 def _route_arch(route, device):
     """Architecture of ``device``; it must carry the SM count ``route`` was generated for."""
     arch = device_arch(device)
     sms = catalog().device_num_sms(device, arch)
-    if sms != route["num_sms"][arch]:
+    if sms != route_num_sms(route, arch):
         raise RuntimeError(
             f"The exported {arch} {route['metadata']['surface']} schedule was generated "
-            f"for {route['num_sms'][arch]} physical SMs; this device has {sms}"
+            f"for {route_num_sms(route, arch)} physical SMs; this device has {sms}"
         )
     return arch
 
@@ -164,7 +213,7 @@ class V3Plan:
             if isinstance(v, torch.Tensor)
         )
         self.arch = _route_arch(route, t.device)
-        self.num_sms = route["num_sms"][self.arch]
+        self.num_sms = route_num_sms(route, self.arch)
         self.route, self.outputs = route, outputs
         self.reset_storage, self.reset_buffers = reset_storage, tuple(reset_buffers)
         # Declared per architecture by the exported catalog route; absent means
@@ -262,7 +311,7 @@ def bind_prepared(
     arch = device_arch(t.device)
     route = _route(arch, surface, args)
     main = stage_bindings[route["stages"][-1]["name"]]
-    if tuple(main["grid"]) != tuple(route["grid"][arch]):
+    if tuple(main["grid"]) != route_grid(route, arch):
         raise ValueError("No exported scheduling specialization for this prepared grid")
     return V3Plan(
         route,
@@ -292,9 +341,18 @@ def prepare_pipeline(inputs):
     """
     arch = device_arch(inputs["x_fp8_packed"].device)
     args = pipeline_route_args(inputs)
-    route = _route(arch, "pipeline", args)
-    # The persistent grid derives from the SM count the route was generated for.
-    data = prepare_pipeline_bindings(inputs, route["num_sms"][arch])
+    logical = int(inputs["intermediate"])
+    note = (
+        ""
+        if args["intermediate"] == logical
+        else f" (logical intermediate {logical} pads to {args['intermediate']})"
+    )
+    route = _route(arch, "pipeline", args, note=note)
+    # The persistent grid derives from the SM count the route was generated
+    # for; the route's metadata names the program's source-schedule form.
+    data = prepare_pipeline_bindings(
+        inputs, route_num_sms(route, arch), route_metadata=route["metadata"]
+    )
     return bind_prepared(
         "pipeline",
         args,
@@ -331,7 +389,7 @@ def prepare_grouped_l2(
     route = _route(arch, "grouped_l2", args)
     tiles = te.numel()
     main = dict(
-        grid=tuple(route["grid"][arch]),
+        grid=route_grid(route, arch),
         A=A.view(torch.uint8),
         B=B.view(torch.uint8),
         SFA=packed_a,
