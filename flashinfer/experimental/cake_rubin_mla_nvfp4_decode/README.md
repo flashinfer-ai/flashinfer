@@ -136,7 +136,10 @@ tiles, half tiles whose rows past the first 128 are padding) with the least
 modelled makespan over the device's clusters and pairs -- and emits the work
 items (full-tile items first). A plan without half tiles launches the
 `decode_full` build (the same kernel without the double-item test at each
-item's end); otherwise `decode`. An item holding all of its rows' keys writes
+item's end); otherwise `decode`. The one plan whose scalars (rows, full-tile
+items, items, splits) lie in the `decode_full_pairpipe` record's box launches
+that build instead: the full kernel with the pair body's converter pipeline.
+An item holding all of its rows' keys writes
 `out` / `lse` directly; split items write normalised BF16 partials and
 log2-domain partial LSEs into the workspace.
 
@@ -174,7 +177,7 @@ The selection and grid rules are data in `cake_jit.MODULES` (`select_rule`,
   `launch.use_pdl` is `"runtime"`).
 * `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
   package (byte-identical copies) and this package's build manifest (schema
-  `cake-build/1`): one entry per `<library>_sm_107a` (6 programs) with its
+  `cake-build/1`): one entry per `<library>_sm_107a` (8 programs) with its
   two translation units, digests, nvcc flags, closure digest and
   `aot/<name>.so` path. `cake_build.load_library(name)` loads the prebuilt
   library when `aot/` holds it and otherwise JIT-builds the entry through
