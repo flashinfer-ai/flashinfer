@@ -365,12 +365,20 @@ kernel_cake_rmsnorm_train_7dc29629ff21625607f8(__nv_bfloat16* __restrict__ g, __
                         "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                         " [%0], [%1], %2, [%3], %4;"
                         :: "r"(sbase + rg * 3072), "l"(reinterpret_cast<const uint8_t*>(g + g_srcg)), "r"((unsigned)(3072)), "r"(bars_addr + (s) * 8),
+#if __CUDA_ARCH__ == 1070
+                           "l"(0x14F0000000000000ULL) : "memory");
+#else
                            "l"(0x12F0000000000000ULL) : "memory");
+#endif
                     asm volatile(
                         "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                         " [%0], [%1], %2, [%3], %4;"
                         :: "r"(sbase + (rg + 4) * 3072), "l"(reinterpret_cast<const uint8_t*>(x + x_srcg)), "r"((unsigned)(3072)), "r"(bars_addr + (s) * 8),
+#if __CUDA_ARCH__ == 1070
+                           "l"(0x14F0000000000000ULL) : "memory");
+#else
                            "l"(0x12F0000000000000ULL) : "memory");
+#endif
                 }
             }
             ps[0] = ps[0] + 4;
@@ -568,12 +576,20 @@ kernel_cake_rmsnorm_train_7dc29629ff21625607f8(__nv_bfloat16* __restrict__ g, __
                             "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                             " [%0], [%1], %2, [%3], %4;"
                             :: "r"(sbase_1 + rg * 3072), "l"(reinterpret_cast<const uint8_t*>(g + g_srcg_1)), "r"((unsigned)(3072)), "r"(bars_addr + (slot) * 8),
+#if __CUDA_ARCH__ == 1070
+                               "l"(0x14F0000000000000ULL) : "memory");
+#else
                                "l"(0x12F0000000000000ULL) : "memory");
+#endif
                         asm volatile(
                             "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                             " [%0], [%1], %2, [%3], %4;"
                             :: "r"(sbase_1 + (rg + 4) * 3072), "l"(reinterpret_cast<const uint8_t*>(x + x_srcg_1)), "r"((unsigned)(3072)), "r"(bars_addr + (slot) * 8),
+#if __CUDA_ARCH__ == 1070
+                               "l"(0x14F0000000000000ULL) : "memory");
+#else
                                "l"(0x12F0000000000000ULL) : "memory");
+#endif
                     }
                 }
                 ps[0] = ps[0] + 4;

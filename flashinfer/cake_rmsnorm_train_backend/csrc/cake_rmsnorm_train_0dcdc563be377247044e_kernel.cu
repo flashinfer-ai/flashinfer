@@ -122,6 +122,9 @@ kernel_cake_rmsnorm_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g, __
         unsigned int _atomic_fetch_add_0 = atomicAdd(&counters[0], 1);
         nxt = _atomic_fetch_add_0;
     }
+#if __CUDA_ARCH__ == 1070
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
     long long g_stride = g_stride_p0;
     long long x_stride = x_stride_p0;
     long long gh_stride = g_h_stride_p0;
@@ -1153,7 +1156,9 @@ kernel_cake_rmsnorm_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g, __
         __syncthreads();
         c = flags[claim_it & 1];
     }
+#if __CUDA_ARCH__ != 1070
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
     if (tid == 0) {
         if (c == n_chunks + (int)gridDim.x - 1) {
             *(reinterpret_cast<unsigned int*>(counters) + (0)) = 0;
