@@ -62,6 +62,13 @@ from .moe_utils import (
 
 logger = logging.getLogger(__name__)
 
+# Bump this token whenever the SM100 per-token producer/consumer handoff changes
+# in a way that can affect GEMM tactic ranking.  Persisted autotune file keys do
+# not include the runner hash, so the pipeline contract belongs in ``extras``.
+_SM100_PER_TOKEN_PIPELINE_CACHE_SCHEMA = (
+    "aux_amax_blocked8_native_sm100_min_tokens_512_v4"
+)
+
 
 def _seeded_activation(shapes, dtype, device):
     generator = torch.Generator(device=device).manual_seed(515)
@@ -726,6 +733,8 @@ class CuteDslFusedMoERunner(TunableRunner):
             self.output_dtype,
             self.enable_pdl,
         )
+        if self.use_per_token_activation:
+            extras += (_SM100_PER_TOKEN_PIPELINE_CACHE_SCHEMA,)
         if self.use_cuda_graph:
             extras += ("cuda_graph",)
         return extras + self._localization_signature()

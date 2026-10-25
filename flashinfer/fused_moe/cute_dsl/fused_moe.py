@@ -85,7 +85,7 @@ from ...quantization.nvfp4_quantization_utils import (
     nvfp4_e4m3_max,
     resolve_nvfp4_4over6,
 )
-from ...utils import supported_compute_capability
+from ...utils import get_compute_capability, supported_compute_capability
 from .moe_utils import (
     moe_output_memset_inplace,
     moe_sort,
@@ -111,6 +111,7 @@ from .tuner import (
 # =============================================================================
 
 _cuda_graph_resources: Dict[str, Any] = {}
+_PER_TOKEN_AUX_AMAX_MIN_TOKENS = 512
 
 
 def _intermediate_c_dtype(output_dtype: torch.dtype) -> str:
@@ -612,7 +613,28 @@ def _moe_core_impl(
         if use_per_token_activation
         else "float4_e2m1fn"
     )
+    # B300 deterministic-RL measurements favor the standalone reduction for
+    # small batches; use the aux handoff from the measured 512-token crossover.
+    # num_tokens is host-static, so CUDA graph capture specializes one path
+    # without a device-side branch or synchronization.
+    use_intermediate_amax = (
+        use_per_token_activation
+        and not is_rubin
+        and num_tokens >= _PER_TOKEN_AUX_AMAX_MIN_TOKENS
+        and get_compute_capability(x.device) in {(10, 0), (10, 3)}
+    )
     intermediate_per_token_scale = None
+    intermediate_amax = None
+    if use_intermediate_amax:
+        intermediate_size = w1_weight.shape[1] // (2 if gated else 1)
+        output_tile_n = gemm1_mma_tiler_mn[1] // (2 if gated else 1)
+        num_output_tiles = intermediate_size // output_tile_n
+        num_permuted_rows = permuted_idx_to_expanded_idx.shape[0]
+        intermediate_amax = torch.empty(
+            (num_permuted_rows // 8, num_output_tiles, 8),
+            dtype=output_dtype,
+            device=x.device,
+        )
     if use_localized_path:
         # execute_on_streams forks and joins the main stream, ordering
         # both domains after moe_sort and before consumers of the shared output.
@@ -694,6 +716,7 @@ def _moe_core_impl(
                 num_non_exiting_tiles=num_non_exiting_tiles,
                 out=gemm1_out,
                 out_scale=None if use_per_token_activation else gemm1_out_scale,
+                out_amax=intermediate_amax,
                 global_scale=(
                     fc2_input_scale
                     if not is_mxfp8 and not use_per_token_activation
@@ -729,6 +752,10 @@ def _moe_core_impl(
                 sf_layout=SF_LAYOUT_128x4,
                 enable_pdl=enable_pdl,
                 nvfp4_4over6=nvfp4_4over6,
+                input_amax=intermediate_amax,
+                input_amax_valid_rows=(
+                    total_num_padded_tokens if intermediate_amax is not None else None
+                ),
             )
         )
         intermediate_sf = convert_sf_to_mma_layout(
