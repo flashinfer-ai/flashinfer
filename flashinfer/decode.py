@@ -4192,14 +4192,15 @@ def trtllm_batch_decode_with_kv_cache(
         contents of ``request_order`` in place.
 
     sparse_top_k : int = 0
-        Static token-sparse MQA/GQA (``trtllm-gen`` backend): each query token attends to
+        Static token-sparse MQA (``trtllm-gen`` backend): each query token attends to
         its own list of at most ``sparse_top_k`` KV tokens, such as a Top-K selection. Each
-        query token is its own request over pages of one token. Pass
+        query token is its own request over pages of one token, with one KV head. Pass
         ``uses_shared_paged_kv_idx=False`` and ``block_tables`` of shape
         ``[batch_size, 2, sparse_top_k]`` with each token's K and V token indices, and
         ``seq_lens`` with how many leading entries of each list are valid. ``sparse_top_k``
-        must be a multiple of 4, the heads of a KV head at most 128, and ``batch_size`` at
-        most 65535. ``0`` (default) disables it.
+        must be a multiple of 4, the query heads at most 128, and ``batch_size`` at most
+        65535. A sliding window and attention sinks are not supported. ``0`` (default)
+        disables it.
 
     Returns
     -------
@@ -4235,6 +4236,11 @@ def trtllm_batch_decode_with_kv_cache(
     if sparse_top_k:
         if q_len_per_req != 1 or cum_seq_lens_q is not None:
             raise ValueError("sparse_top_k requires one query token per request")
+        # The token-sparse kernels apply neither a sliding window nor sinks.
+        if window_left != -1 or sinks is not None:
+            raise ValueError(
+                "sparse_top_k supports neither a sliding window nor attention sinks"
+            )
         if (
             uses_shared_paged_kv_idx
             or block_tables.shape[1:] != (2, sparse_top_k)
@@ -4249,6 +4255,9 @@ def trtllm_batch_decode_with_kv_cache(
         page_size = k_cache.shape[-2 if kv_layout == "HND" else -3]
         if page_size != 1 or k_cache.stride(0) != v_cache.stride(0):
             raise ValueError("sparse_top_k needs one-token K and V pages of one stride")
+        # The token-sparse kernels address K/V without a head stride: one KV head.
+        if k_cache.shape[-3 if kv_layout == "HND" else -2] != 1:
+            raise ValueError("sparse_top_k needs one KV head (MQA)")
         # The kernel copies indices with 16-byte cp.async (four int32s), and its
         # non-persistent launch grid caps the request count at 65535 (as in mla/_core.py).
         if sparse_top_k % 4 or query.shape[0] > 65535:

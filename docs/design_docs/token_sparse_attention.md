@@ -1,5 +1,7 @@
 # Token-sparse attention for MQA/GQA
 
+**Scope**: Static token-sparse MQA/GQA decode on trtllm-gen (`sparse_top_k`), and the helpers that build its K/V slot lists.
+
 In token-sparse attention, each query token attends to its own list of keys,
 such as the Top-K keys an indexer selects for it (DeepSeek Sparse Attention,
 DSA, selects 2048 per token). trtllm-gen ships static token-sparse kernels, but
@@ -11,7 +13,9 @@ its own list of at most `K` keys.
 - `block_tables` is `[batch, 2, K]`: each token's K and V slot indices, with
   `uses_shared_paged_kv_idx=False`. `seq_lens` counts each list's valid entries.
 - `K` is a multiple of 4, since indices are copied 16 bytes at a time. `batch`
-  is at most 65535 (the launch grid), and a KV head at most 128 query heads.
+  is at most 65535 (the launch grid), and there are at most 128 query heads.
+- There is one KV head: the kernels address K and V rows without a head stride.
+  A sliding window and attention sinks are not supported.
 - K and V can be views of one `[K | V]` cache row, in BF16 or FP8.
 
 The dispatch changes are small. `TllmGenFmhaRunnerParams::isMla()` names the MLA

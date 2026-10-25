@@ -55,3 +55,45 @@ def test_token_sparse_matches_reference(rows, heads, dtype, top_k):
         check()
         table.copy_(table.flip(0))  # row r takes the last but r-th selection and count
         counts.copy_(counts.flip(0))
+
+
+def test_token_sparse_rejects_unsupported() -> None:
+    """More than one KV head (the kernels have no head stride), a sliding window
+    and attention sinks are refused, not run."""
+    if get_compute_capability(torch.device("cuda"))[0] != 10:
+        pytest.skip("trtllm-gen token-sparse cubins are SM100/SM103")
+    top_k, rows = 512, 4
+    q = torch.zeros(rows, 8, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    table = torch.zeros(rows, 2, top_k, dtype=torch.int32, device="cuda")
+    counts = torch.full((rows,), top_k, dtype=torch.int32, device="cuda")
+    workspace = torch.zeros(128 << 20, dtype=torch.uint8, device="cuda")
+
+    def run(kv_heads=1, **kwargs):
+        kv = torch.zeros(
+            TOKENS, kv_heads, 1, 2 * HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+        )
+        k, v = kv.split(HEAD_DIM, dim=-1)
+        trtllm_batch_decode_with_kv_cache(
+            q,
+            (k, v),
+            workspace,
+            table,
+            counts,
+            top_k,
+            bmm1_scale=1.0,
+            backend="trtllm-gen",
+            sparse_top_k=top_k,
+            uses_shared_paged_kv_idx=False,
+            **kwargs,
+        )
+
+    with pytest.raises(ValueError, match="one KV head"):
+        run(kv_heads=2)
+    with pytest.raises(
+        ValueError, match="neither a sliding window nor attention sinks"
+    ):
+        run(window_left=127)
+    with pytest.raises(
+        ValueError, match="neither a sliding window nor attention sinks"
+    ):
+        run(sinks=torch.zeros(8, device="cuda"))
