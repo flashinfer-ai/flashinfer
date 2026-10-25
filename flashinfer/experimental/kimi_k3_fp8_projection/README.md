@@ -107,21 +107,23 @@ times the 132 representative rows (22 families x `M in {1, 8, 64, 256, 4096,
 sm2, `trtllm`, `cutile`) on the same weight.
 
 Generated sources live under `csrc/cake_kimi_k3_fp8_projection/`: one kernel
-source per program or lever family and one launcher source per launcher text
-(54 launcher sources for the 107 programs) for both architectures (the
-architecture-specific lowering sits behind `__CUDA_ARCH__` guards; the JIT
-compiles each source with the flags of the device it runs on), the shared
-device-helper header, the host-helper header
-(`cake_kimi_k3_fp8_projection_host_common.cuh`: the dynamic-shared-memory
-opt-in and the receipt / chain text every launcher includes verbatim inside
-its namespace), and nothing else. A program that differs from a sibling only
-by a prefetch lever or by the raster group width shares the sibling's kernel
-source and selects its lever value (`-DCAKE_LEVER_*` or `-DGROUP_M`) on the
-compile line; programs whose exported launcher text differs only in the
-kernel symbol and the launcher namespace share one launcher source. A program
-that builds a shared source names its own kernel symbol and launcher
-namespace (`-DCAKE_PROGRAM_KERNEL`, `-DCAKE_PROGRAM_SHIM`) on the compile
-line; a source's defaults select the program it was exported for.
+source per program or lever family and one launcher source per argument plan
+(5 launcher sources, one per argument plan, for the 107 programs) for both
+architectures (the architecture-specific lowering sits behind `__CUDA_ARCH__`
+guards; the JIT compiles each source with the flags of the device it runs
+on), the shared device-helper header, the host-helper header
+(`cake_kimi_k3_fp8_projection_host_common.cuh`: the dynamic-shared-memory and
+non-portable-cluster opt-ins and the receipt / chain text every launcher
+includes verbatim inside its namespace), and nothing else. A program that
+differs from a sibling only by a prefetch lever or by the raster group width
+shares the sibling's kernel source and selects its lever value
+(`-DCAKE_LEVER_*` or `-DGROUP_M`) on the compile line; the programs of one
+argument plan share one launcher source, and a program's TMA box dimensions,
+dynamic shared memory, block and cluster dimensions and its kernel symbol and
+launcher namespace are `-D` constants on its compile line (`-DCAKE_BOX_*`,
+`-DCAKE_DYN_SMEM`, `-DCAKE_BLOCK_X`, `-DCAKE_CLUSTER_*`,
+`-DCAKE_PROGRAM_KERNEL`, `-DCAKE_PROGRAM_SHIM`); a source's defaults select
+the program it was exported for.
 `cake_jit.py` registers them (`MODULES`: one record per program, expanded
 from one row per program and the five named argument plans of `ARG_PLANS`;
 `KERNELS`: logical kernel key -> program and compile-line defines, e.g. the
