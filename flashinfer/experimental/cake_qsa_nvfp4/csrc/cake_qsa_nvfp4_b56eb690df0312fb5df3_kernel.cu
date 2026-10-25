@@ -228,7 +228,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_t* __restrict__ k_data, uint8_t* __restrict__ v_data, uint8_t* __restrict__ k_sf, uint8_t* __restrict__ v_sf, int* __restrict__ indices, int* __restrict__ block_table, int* __restrict__ token_to_req, __nv_bfloat16* __restrict__ gate, __nv_bfloat16* __restrict__ out, float* partial_out, float* partial_lse, unsigned int* __restrict__ merge_counters, long long q_stride_row, long long q_stride_head, long long data_stride_block, long long data_stride_token, long long data_stride_head, long long sf_stride_block, long long sf_stride_token, long long sf_stride_head, long long indices_stride_row, long long table_stride_req, long long out_stride_row, long long out_stride_head, float score_scale, float output_scale, int num_rows, int num_requests, int num_blocks, CakeFastDivmod page_div, int table_width, int topk, int group_size, int num_qo_heads, int num_tiles, int num_splits)
+kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_t* __restrict__ k_data, uint8_t* __restrict__ v_data, uint8_t* __restrict__ k_sf, uint8_t* __restrict__ v_sf, int* __restrict__ indices, int* __restrict__ block_table, int* __restrict__ token_to_req, __nv_bfloat16* __restrict__ gate, __nv_bfloat16* __restrict__ out, float* partial_out, float* partial_lse, unsigned int* __restrict__ merge_counters, long long q_stride_row, long long q_stride_head, long long data_stride_block, long long data_stride_token, long long data_stride_head, long long sf_stride_block, long long sf_stride_token, long long sf_stride_head, long long indices_stride_row, long long table_stride_req, long long out_stride_row, long long out_stride_head, float score_scale, float output_scale, int num_rows, int num_requests, int num_blocks, CakeFastDivmod page_div, int table_width, int topk, int group_size, int num_qo_heads, int num_tiles, int num_splits)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -7924,7 +7924,11 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 if (par_1 == 0) {
                     uint32_t _elected_0 = elect_sync();
+#if __CUDA_ARCH__ == 1070
+                    int _smem_desc_lo_1 = (((smem_q_addr) >> 4) & 0x7FFF) + (0) * 128;
+#else
                     int _smem_desc_lo_1 = (((smem_q_addr) >> 4) & 0x3FFF) + (0) * 128;
+#endif
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -7954,7 +7958,11 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_tmem_s), "r"(_smem_desc_lo_1), "r"(tmem_tmem_k), "r"(0), "r"(_elected_0) : "memory");
+#if __CUDA_ARCH__ == 1070
+                    int _smem_desc_lo_2 = (((smem_q_addr) >> 4) & 0x7FFF) + (1) * 128;
+#else
                     int _smem_desc_lo_2 = (((smem_q_addr) >> 4) & 0x3FFF) + (1) * 128;
+#endif
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -7984,7 +7992,11 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_tmem_s), "r"(_smem_desc_lo_2), "r"(tmem_tmem_k + 32), "r"(1), "r"(_elected_0) : "memory");
+#if __CUDA_ARCH__ == 1070
+                    int _smem_desc_lo_3 = (((smem_q_addr) >> 4) & 0x7FFF) + (2) * 128;
+#else
                     int _smem_desc_lo_3 = (((smem_q_addr) >> 4) & 0x3FFF) + (2) * 128;
+#endif
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -8014,7 +8026,11 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_tmem_s), "r"(_smem_desc_lo_3), "r"(tmem_tmem_k + 64), "r"(1), "r"(_elected_0) : "memory");
+#if __CUDA_ARCH__ == 1070
+                    int _smem_desc_lo_4 = (((smem_q_addr) >> 4) & 0x7FFF) + (3) * 128;
+#else
                     int _smem_desc_lo_4 = (((smem_q_addr) >> 4) & 0x3FFF) + (3) * 128;
+#endif
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -8048,7 +8064,11 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                     tcgen05_commit_leader(s_full_addr, _elected_0);
                 } else {
                     uint32_t _elected_5 = elect_sync();
+#if __CUDA_ARCH__ == 1070
+                    int _smem_desc_lo_6 = (((smem_q_addr) >> 4) & 0x7FFF) + (0) * 128;
+#else
                     int _smem_desc_lo_6 = (((smem_q_addr) >> 4) & 0x3FFF) + (0) * 128;
+#endif
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -8078,7 +8098,11 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"((tmem_tmem_s + (1048592))), "r"(_smem_desc_lo_6), "r"(tmem_tmem_k + 1048576), "r"(0), "r"(_elected_5) : "memory");
+#if __CUDA_ARCH__ == 1070
+                    int _smem_desc_lo_7 = (((smem_q_addr) >> 4) & 0x7FFF) + (1) * 128;
+#else
                     int _smem_desc_lo_7 = (((smem_q_addr) >> 4) & 0x3FFF) + (1) * 128;
+#endif
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -8108,7 +8132,11 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"((tmem_tmem_s + (1048592))), "r"(_smem_desc_lo_7), "r"(tmem_tmem_k + 1048608), "r"(1), "r"(_elected_5) : "memory");
+#if __CUDA_ARCH__ == 1070
+                    int _smem_desc_lo_8 = (((smem_q_addr) >> 4) & 0x7FFF) + (2) * 128;
+#else
                     int _smem_desc_lo_8 = (((smem_q_addr) >> 4) & 0x3FFF) + (2) * 128;
+#endif
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -8138,7 +8166,11 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"((tmem_tmem_s + (1048592))), "r"(_smem_desc_lo_8), "r"(tmem_tmem_k + 1048640), "r"(1), "r"(_elected_5) : "memory");
+#if __CUDA_ARCH__ == 1070
+                    int _smem_desc_lo_9 = (((smem_q_addr) >> 4) & 0x7FFF) + (3) * 128;
+#else
                     int _smem_desc_lo_9 = (((smem_q_addr) >> 4) & 0x3FFF) + (3) * 128;
+#endif
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -8190,8 +8222,13 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                 mbarrier_wait(p_full_addr + (_stage_p_full) * 8, _parity_p_full);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 uint32_t _elected_0 = elect_sync();
+#if __CUDA_ARCH__ == 1070
+                int _smem_desc_lo_1_1 = ((((smem_vt_addr) >> 4) & 0x7FFF) | 0x2000000) + (2 * vs_1) * 1024;
+                int _smem_desc_lo_2_1 = ((((smem_p_addr) >> 4) & 0x7FFF) | 0x800000) + (ps) * 128;
+#else
                 int _smem_desc_lo_1_1 = ((((smem_vt_addr) >> 4) & 0x3FFF) | 0x2000000) + (2 * vs_1) * 1024;
                 int _smem_desc_lo_2_1 = ((((smem_p_addr) >> 4) & 0x3FFF) | 0x800000) + (ps) * 128;
+#endif
                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -8226,8 +8263,13 @@ kernel_cake_qsa_nvfp4_0ceab6626450e29f384c(__nv_bfloat16* __restrict__ q, uint8_
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_smem_desc_lo_1_1), "r"(_smem_desc_lo_2_1), "r"(tmem_tmem_o), "r"(((first_pv) ? 0 : 1)), "r"(_elected_0) : "memory");
+#if __CUDA_ARCH__ == 1070
+                int _smem_desc_lo_3_1 = ((((smem_vt_addr) >> 4) & 0x7FFF) | 0x2000000) + (2 * vs_1 + 1) * 1024;
+                int _smem_desc_lo_4_1 = ((((smem_p_addr) >> 4) & 0x7FFF) | 0x800000) + (ps) * 128;
+#else
                 int _smem_desc_lo_3_1 = ((((smem_vt_addr) >> 4) & 0x3FFF) | 0x2000000) + (2 * vs_1 + 1) * 1024;
                 int _smem_desc_lo_4_1 = ((((smem_p_addr) >> 4) & 0x3FFF) | 0x800000) + (ps) * 128;
+#endif
                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
