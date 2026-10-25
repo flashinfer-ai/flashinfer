@@ -141,7 +141,7 @@ __device__ __forceinline__ float approx_rcp(float x) {
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
-kernel_cake_minimax_h3_sm120_quant_varlen_attention_7c1e7479b71d9454c3f5(const __grid_constant__ CUtensorMap Q_map, const __grid_constant__ CUtensorMap K_map, const __grid_constant__ CUtensorMap V_map, __nv_bfloat16* __restrict__ O, float* __restrict__ q_scale, float* __restrict__ k_scale, float* __restrict__ v_scale, int* __restrict__ seg_begin, int* __restrict__ seg_len, int* __restrict__ unit_table, int total_units, int num_heads, int num_kblocks, float softmax_scale_log2)
+kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const __grid_constant__ CUtensorMap Q_map, const __grid_constant__ CUtensorMap K_map, const __grid_constant__ CUtensorMap V_map, __nv_bfloat16* __restrict__ O, float* __restrict__ q_scale, float* __restrict__ k_scale, float* __restrict__ v_scale, int* __restrict__ seg_begin, int* __restrict__ seg_len, int* __restrict__ unit_table, int total_units, int num_heads, int num_kblocks, float softmax_scale_log2)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -710,6 +710,7 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_7c1e7479b71d9454c3f5(const _
                 : "+f"(s_acc[60]), "+f"(s_acc[(60) + 1]), "+f"(s_acc[(60) + 2]), "+f"(s_acc[(60) + 3])
                 : "r"(q_frags[12]), "r"(q_frags[(12) + 1]), "r"(q_frags[(12) + 2]), "r"(q_frags[(12) + 3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]), "r"((uint32_t)(fp8_unit_sfa_main[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_main[0])), "h"((uint16_t)0), "h"((uint16_t)0));
             asm volatile("barrier.arrive %0, 256;" :: "r"(2 - warp / 4) : "memory");
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncwarp();
             if (elect_sync()) {
                 mbarrier_arrive(k_empty_addr + (kv_stage) * 8);
@@ -1588,6 +1589,7 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_7c1e7479b71d9454c3f5(const _
             asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                 : "+f"(o_acc[60]), "+f"(o_acc[(60) + 1]), "+f"(o_acc[(60) + 2]), "+f"(o_acc[(60) + 3])
                 : "r"(p_frag[12]), "r"(p_frag[(12) + 1]), "r"(p_frag[(12) + 2]), "r"(p_frag[(12) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]), "r"((uint32_t)(fp8_unit_sfa_main[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_main[0])), "h"((uint16_t)0), "h"((uint16_t)0));
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncwarp();
             if (elect_sync()) {
                 mbarrier_arrive(v_empty_addr + (kv_stage) * 8);
