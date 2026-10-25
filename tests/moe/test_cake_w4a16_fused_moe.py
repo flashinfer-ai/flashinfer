@@ -832,8 +832,7 @@ class TestPublicRoute:
 
     def test_cutlass_fused_moe_backend_cake(self, device, weights_by_preset):
         """``cutlass_fused_moe(backend="cake")`` reaches the W4A16 route and
-        agrees bit for bit with the module entry.  Skips while the backend still
-        hands every ``"cake"`` call to the Kimi-K3 SiTU plan."""
+        agrees bit for bit with the module entry."""
         from flashinfer.fused_moe import (
             cutlass_fused_moe,
             cutlass_fused_moe_workspace_size,
@@ -845,23 +844,18 @@ class TestPublicRoute:
         row = _row_index("G", tokens)
         x = make_inputs(p, tokens, row, device)
         ids, scores = make_routing(p, tokens, row, "uniform", device)
-        try:
-            nbytes = cutlass_fused_moe_workspace_size(
-                tokens,
-                p.hidden,
-                p.intermediate,
-                p.num_experts,
-                p.top_k,
-                x_dtype=torch.bfloat16,
-                weight_dtype=torch.uint8,
-                ep_size=p.num_experts // p.num_local_experts,
-                ep_rank=p.local_expert_offset // p.num_local_experts,
-                backend="cake",
-            )
-        except ValueError as exc:
-            if "SiTU" in str(exc) or "Situ" in str(exc):
-                pytest.skip("backend='cake' does not dispatch the W4A16 form yet")
-            raise
+        nbytes = cutlass_fused_moe_workspace_size(
+            tokens,
+            p.hidden,
+            p.intermediate,
+            p.num_experts,
+            p.top_k,
+            x_dtype=torch.bfloat16,
+            weight_dtype=torch.uint8,
+            ep_size=p.num_experts // p.num_local_experts,
+            ep_rank=p.local_expert_offset // p.num_local_experts,
+            backend="cake",
+        )
         assert nbytes == cake.cake_w4a16_workspace_size(
             tokens, p.hidden, p.intermediate, p.num_local_experts, p.top_k
         )
