@@ -878,11 +878,23 @@ def test_rmsnorm_sigmoid_gate_pdl_route_names_a_build_form_per_window():
                     tokens,
                 )
             if form == "plain":
-                assert name == plain_by_key[(16, 1024, None)] and name in plain_names
+                # the plain route's record of the same program: its window holds the borrowed one
+                containing = next(
+                    w
+                    for w in plain_by_key
+                    if w[0] == heads
+                    and w[1] <= above
+                    and (w[2] is None or (at_most is not None and at_most <= w[2]))
+                )
+                assert name == plain_by_key[containing] and name in plain_names, (
+                    arch,
+                    key,
+                )
                 assert record["route"] == plain_route
-                assert record["select_rule"]["routes"][route][arch] == [
-                    [16, 1024, None]
-                ]
+                assert list(key) in record["select_rule"]["routes"][route][arch], (
+                    arch,
+                    key,
+                )
             else:
                 assert (
                     record["route"] == route and "routes" not in record["select_rule"]
@@ -1495,8 +1507,9 @@ def test_rmsnorm_sigmoid_gate_support_follows_the_head_and_token_counts_through_
 def test_the_launch_attribute_follows_the_record():
     """A record's ``launch.use_pdl`` is its binding's programmatic-stream-serialization attribute: in the binding of
     every PDL build, absent from every plain build's -- the plain builds the PDL routes borrow included, so a call of
-    a PDL route in such a window launches without the attribute; on sm_100a every PDL route of ops A and C borrows
-    one, on sm_103a all but the mode-0 route, on sm_107a none."""
+    a PDL route in such a window launches without the attribute; on sm_100a op A's mode-0 route and op C's route
+    borrow one, on sm_103a op C's route alone (the mode-1 routes borrow nothing since the window re-measurement), on
+    sm_107a none."""
     attribute = "cudaLaunchAttributeProgrammaticStreamSerialization"
     borrowed = {}
     for name, record in loader.MODULES.items():
@@ -1510,13 +1523,9 @@ def test_the_launch_attribute_follows_the_record():
     assert borrowed == {
         "sm_100a": {
             loader.route_key(OP_A, "mode0_pdl"),
-            loader.route_key(OP_A, "mode1_pdl"),
             loader.route_key(OP_C, "bf16_pdl"),
         },
-        "sm_103a": {
-            loader.route_key(OP_A, "mode1_pdl"),
-            loader.route_key(OP_C, "bf16_pdl"),
-        },
+        "sm_103a": {loader.route_key(OP_C, "bf16_pdl")},
     }
     for arch, routes in borrowed.items():
         for route in routes:
