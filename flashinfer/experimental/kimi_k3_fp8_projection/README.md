@@ -130,5 +130,6 @@ from one row per program and the five named argument plans of `ARG_PLANS`;
 three quantization widths are one program with `-DQUANT_UNITS=1|2|4`). Both
 are written by the Cake generated-program export; the shared kernel and
 launcher sources, the hoisted host header, the `-D` entries of the records
-that use them and the row form of `MODULES` are a hand fold of the exported
-files, pending regeneration by the export.
+that use them, the row form of `MODULES`, the `shim` / `fast_math` row fields
+and the `_KERNEL_PROGRAMS` table are a hand fold of the exported files,
+pending regeneration by the export.
