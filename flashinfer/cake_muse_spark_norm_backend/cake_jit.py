@@ -7942,7 +7942,7 @@ VARIANTS: dict[str, tuple[str, ...]] = {
         "alpha_tensor_nopw",
     ),
     "gated_residual_rmsnorm": ("mode0", "mode0_pdl", "mode1", "mode1_pdl"),
-    "rmsnorm_sigmoid_gate": ("bf16",),
+    "rmsnorm_sigmoid_gate": ("bf16", "bf16_pdl"),
 }
 SELECT_KIND = "rows_between"
 SELECT_KINDS = (SELECT_KIND, "tokens_heads_between")
@@ -8029,18 +8029,24 @@ def route_modules(arch: str, route: str) -> tuple[str, ...]:
 
 
 def admits(
-    rule: dict[str, Any] | None, rows: int, arch: str, heads: int | None = None
+    rule: dict[str, Any] | None,
+    rows: int,
+    arch: str,
+    heads: int | None = None,
+    route: str | None = None,
 ) -> bool:
     """The record's selection rule: ``None`` admits every call; ``rows_between`` admits ``rows`` on ``arch``
     when one of the architecture's windows holds ``above < rows <= at_most`` (``at_most`` ``None`` = unbounded);
     ``tokens_heads_between`` admits ``rows`` tokens of ``heads`` heads when one of the architecture's windows
-    ``[heads, above, at_most]`` names the head count and holds the token count."""
+    ``[heads, above, at_most]`` names the head count and holds the token count.  A rule's ``routes`` spell the
+    windows another route gives the record (a PDL route launching the plain build): a call of that ``route``
+    reads them in place of ``windows``."""
     if rule is None:
         return True
     kind = rule.get("kind")
     if kind not in SELECT_KINDS:
         raise ValueError(f"unknown Cake norm select rule {kind!r}")
-    windows = rule["windows"].get(arch, ())
+    windows = rule.get("routes", {}).get(route, rule["windows"]).get(arch, ())
     if kind == SELECT_KIND:
         return any(
             rows > int(above) and (at_most is None or rows <= int(at_most))
@@ -8062,7 +8068,7 @@ def selected_module(arch: str, route: str, rows: int, heads: int | None = None) 
     if rows <= 0:
         raise ValueError(f"Cake norm launches need a positive row count, got {rows}")
     for name in route_modules(arch, route):
-        if admits(MODULES[name].get("select_rule"), rows, arch, heads):
+        if admits(MODULES[name].get("select_rule"), rows, arch, heads, route):
             return name
     heads_text = "" if heads is None else f" of {heads} heads"
     raise NotImplementedError(
