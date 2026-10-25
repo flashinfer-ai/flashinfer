@@ -334,6 +334,26 @@ def source_schedule_form(metadata, num_tokens, num_experts, top_k, weight_fmt):
     return block_m, block_readiness, slot_list
 
 
+def source_workspace_words(
+    num_experts, num_tokens, top_k, block_m, block_readiness, total_m_tiles, k2_tiles
+):
+    """``(source_blocks, arrival_words)`` of the source-schedule workspace.
+
+    ``source_blocks`` is the program's block budget (one per expert plus the
+    token blocks). The arrival words hold two task counters and two mask words
+    per source block, plus one readiness word per source block when the
+    program starts an expert block as soon as its rows arrive; the first term
+    is the original per-tile bound. The per-expert claim scratch
+    (``expert_scatter_offsets`` without a slot list) lives outside these words,
+    in the counter storage the plan zeroes at bind.
+    """
+    source_blocks = num_experts + (num_tokens * top_k + block_m - 1) // block_m
+    arrival_words = max(
+        total_m_tiles * k2_tiles, 2 + (3 if block_readiness else 2) * source_blocks
+    )
+    return source_blocks, arrival_words
+
+
 def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
     """Pack ``inputs`` for the persistent grid of a ``num_sms``-SM catalogued route.
 
@@ -406,17 +426,20 @@ def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
     source_block_m, block_readiness, slot_list = source_schedule_form(
         metadata, T, E, TK, weight_fmt
     )
-    source_blocks = E + (T * TK + source_block_m - 1) // source_block_m
     N1, K1, N2, K2 = (2 * I, H, H, I)
     grid_n1, K1_tiles = (N1 // BLOCK_N, K1 // BLOCK_K)
     # K2_tiles is a legacy term of the arrival-word bound and an unused kernel
     # scalar; the physical width needs ceil(I / 256) of the 256-wide tiles.
     grid_n2, K2_tiles = (N2 // BLOCK_N, -(-K2 // BLOCK_K))
     ref = _mega_dispatch_reference(ids, E, local_expert_offset=offset)
-    # A batch whose every slot is -1 routes no row; its pools keep one aligned
-    # block so that their tensor maps stay valid.
+    # A batch that routes no row on this rank (every slot -1 or held by
+    # another rank) keeps one aligned block in its pools so that their tensor
+    # maps stay valid; the kernel writes zeros for every token.
     M_total = max(ref["M_total"], ALIGN_M)
     total_m_tiles = ref["total_m_tiles"]
+    source_blocks, arrival_words = source_workspace_words(
+        E, T, TK, source_block_m, block_readiness, total_m_tiles, K2_tiles
+    )
     topk_idx_i32 = inputs["topk_idx"].contiguous().view(torch.int32)
     topk_weights_flat = inputs["topk_weights"].contiguous().view(-1)
     x_fp8 = (
@@ -443,13 +466,6 @@ def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
     # the routes fill, e.g. when -1 slots leave fewer routed tokens.
     persistent_grid = num_sms
     grid = (persistent_grid, 1, 1)
-    # Two task counters, two mask words per source block and, with per-block
-    # readiness, one arrival word per source block.
-    arrival_words = total_m_tiles * K2_tiles
-    arrival_words = max(
-        arrival_words,
-        2 + (3 if block_readiness else 2) * source_blocks,
-    )
     reset_storage = torch.zeros(
         2 * E + 4 + arrival_words, dtype=torch.uint32, device="cuda"
     )
@@ -460,6 +476,8 @@ def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
         # src_token_topk_idx), fully rewritten by every launch, never reset.
         expert_scatter_offsets = torch.empty(E * T, dtype=torch.int32, device="cuda")
     else:
+        # Per-expert claim scratch [E], read before it is written: zero at
+        # prepare (and at bind), zeroed again by the kernel on exit.
         expert_scatter_offsets = reset_storage[E : 2 * E].view(torch.int32)
     tile_expert = torch.full((total_m_tiles,), -1, dtype=torch.int32, device="cuda")
     tile_m_local = torch.full((total_m_tiles,), -1, dtype=torch.int32, device="cuda")

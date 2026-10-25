@@ -600,9 +600,24 @@ def test_ep_all_remote_batch_is_zero(case, num_tokens):
     )
     assert not local_slots(inputs).any().item()
     plan = _v3_runtime.prepare_pipeline(inputs)
+    # No local row, yet the pools keep one 256-row aligned block for the
+    # program's tensor maps.
+    data = plan.owners[1]
+    bindings = plan.stages[0].bindings
+    assert data["M_total"] == _v3_preparation.ALIGN_M and data["total_m_tiles"] == 0
+    for name in (
+        "pool_fp8",
+        "pool_sf",
+        "routing_weight_pool",
+        "meta_token",
+        "A2",
+        "expert_output",
+    ):
+        assert bindings[name].shape[0] == _v3_preparation.ALIGN_M, name
+    assert bindings["tile_expert"].numel() == 0
     expected = torch.zeros_like(plan.outputs)
     check_route_contract(plan, expected)
-    assert (plan.stages[0].bindings["token_to_permuted"] == -1).all().item()
+    assert (bindings["token_to_permuted"] == -1).all().item()
 
 
 @pytest.mark.parametrize("num_tokens", TP_EP_TOKENS)
