@@ -303,6 +303,12 @@ to the host. Use per-request work only when its lengths are already on CPU;
 otherwise retain the existing bound-based policy. Check with a busy GPU stream
 and synchronization debugging, not just a predicate-level test.
 
+Full-prefill admission requires each request's Q length to equal its KV length;
+equal batch maxima do not establish that contract. Prove it using existing CPU
+metadata, and decline the full-prefill extension when independent query-length
+overrides or device-only KV lengths prevent that proof. Preserve the existing
+prefix policy without adding a device readback just for dispatch.
+
 ## Benchmarking
 
 For SM90 NVFP4 fused/split and MXFP4 fused MegaMoE, use
