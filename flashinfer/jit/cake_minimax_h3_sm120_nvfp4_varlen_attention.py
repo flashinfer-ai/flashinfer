@@ -33,12 +33,12 @@ from . import cake_program
 from .core import JitSpec
 
 PREPROCESS = cake_program.CakeProgram(
-    name="cake_minimax_h3_sm120_nvfp4_varlen_attention_91933bc58e196b42b232",
+    name="cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571",
     operator_dir="cake_minimax_h3_sm120_nvfp4_varlen_attention",
-    kernel="kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_91933bc58e196b42b232",
+    kernel="kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571",
     sources=(
-        "cake_minimax_h3_sm120_nvfp4_varlen_attention_91933bc58e196b42b232_kernel.cu",
-        "cake_minimax_h3_sm120_nvfp4_varlen_attention_91933bc58e196b42b232_binding.cu",
+        "cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571_kernel.cu",
+        "cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571_binding.cu",
     ),
     targets=("sm_120a",),
     compile_options=(("sm_120a", ()),),

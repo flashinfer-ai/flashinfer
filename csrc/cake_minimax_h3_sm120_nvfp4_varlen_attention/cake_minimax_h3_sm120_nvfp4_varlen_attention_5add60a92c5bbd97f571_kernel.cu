@@ -60,14 +60,14 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_FLAG_STRIDE 16
 #define SMEM_TOTAL 16512
 #define THREADS 256
-#define LAUNCH_MIN_BLOCKS 2
+#define LAUNCH_MIN_BLOCKS 3
 
 #include <math_constants.h>
 
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
-kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_91933bc58e196b42b232(__nv_bfloat16* __restrict__ Q, __nv_bfloat16* __restrict__ K, __nv_bfloat16* __restrict__ V, int* __restrict__ tile_table, int* __restrict__ seg_tile_begin, int* __restrict__ tok_seg, int* __restrict__ cu_seqlens, float* __restrict__ partials, unsigned int* __restrict__ counters, float* __restrict__ mean_k, float* __restrict__ q_mean, unsigned int* __restrict__ q4, unsigned int* __restrict__ k4, uint8_t* __restrict__ q_sf, uint8_t* __restrict__ k_sf, unsigned int* __restrict__ qm4, uint8_t* __restrict__ qm_sf, unsigned int* __restrict__ vt4, uint8_t* __restrict__ v_sf, unsigned int* __restrict__ barrier, int num_tiles, int total_tokens, int total_padded, int num_heads, int num_kblocks)
+kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bfloat16* __restrict__ Q, __nv_bfloat16* __restrict__ K, __nv_bfloat16* __restrict__ V, int* __restrict__ tile_table, int* __restrict__ seg_tile_begin, int* __restrict__ tok_seg, int* __restrict__ cu_seqlens, float* __restrict__ partials, unsigned int* __restrict__ counters, float* __restrict__ mean_k, float* __restrict__ q_mean, unsigned int* __restrict__ q4, unsigned int* __restrict__ k4, uint8_t* __restrict__ q_sf, uint8_t* __restrict__ k_sf, unsigned int* __restrict__ qm4, uint8_t* __restrict__ qm_sf, unsigned int* __restrict__ vt4, uint8_t* __restrict__ v_sf, unsigned int* __restrict__ barrier, int num_tiles, int total_tokens, int total_padded, int num_heads, int num_kblocks)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
