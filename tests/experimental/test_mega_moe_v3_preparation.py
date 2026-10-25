@@ -151,6 +151,30 @@ def test_workspace_words_for_block_readiness_without_a_slot_list_at_one_token():
     )
 
 
+@pytest.mark.parametrize(("logical", "physical"), [(576, 640), (288, 384)])
+def test_w1_launch_view_hands_the_expert_map_the_logical_rows_under_the_padded_pitch(
+    logical, physical
+):
+    """A route with ``w1_expert_map`` takes B1 as a strided per-expert view of
+    the logical gate / up rows (no copy); every other route takes the dense
+    two-dimensional map."""
+    torch = pytest.importorskip("torch")
+    experts, k_bytes = 3, 64
+    b1 = torch.arange(experts * 2 * physical * k_bytes, dtype=torch.int32).view(
+        experts, 2 * physical, k_bytes
+    )
+    view = preparation.w1_launch_view(b1, logical, True)
+    assert view.shape == (experts, 2 * logical, k_bytes)
+    assert view.stride() == (2 * physical * k_bytes, k_bytes, 1)
+    assert view.data_ptr() == b1.data_ptr() and not view.is_contiguous()
+    assert torch.equal(view[1, 2 * logical - 1], b1[1, 2 * logical - 1])
+    dense = preparation.w1_launch_view(b1, logical, False)
+    assert dense.shape == (experts * 2 * physical, k_bytes) and dense.is_contiguous()
+    # Equal widths: the expert map is the whole tensor.
+    same = preparation.w1_launch_view(b1, physical, True)
+    assert same.shape == b1.shape and same.is_contiguous()
+
+
 def test_dispatch_reference_filters_the_window_and_keeps_the_tile_lists():
     torch = pytest.importorskip("torch")
     ids = torch.tensor([[0, 95, 96, 191, 383, -1], [96, 96, 97, -1, 300, 5]])

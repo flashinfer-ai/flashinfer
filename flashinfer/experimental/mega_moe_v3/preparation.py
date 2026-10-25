@@ -366,6 +366,22 @@ def source_workspace_words(
     return source_blocks, arrival_words
 
 
+def w1_launch_view(b1, logical_intermediate: int, expert_map: bool):
+    """``B1`` (the interleaved, padded ``[E, 2 * I_phys, K / pack]`` weight
+    bytes) as the route's program takes its W1 TMA map.
+
+    A program with the route's ``w1_expert_map`` streams W1 through a
+    per-expert three-dimensional map: it takes ``[E, 2 * I, K / pack]`` with
+    ``I`` the logical width, rows contiguous, under the padded expert pitch
+    (a strided view, no copy), so the padded gate / up rows past ``2 * I`` are
+    TMA zero fill instead of bytes streamed from memory. Every other program
+    takes the dense two-dimensional ``[E * 2 * I_phys, K / pack]`` map.
+    """
+    if not expert_map:
+        return b1.reshape(-1, b1.shape[-1])
+    return b1[:, : 2 * logical_intermediate]
+
+
 def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
     """Pack ``inputs`` for the persistent grid of a ``num_sms``-SM catalogued route.
 
@@ -374,16 +390,19 @@ def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
     the two differ, and the kernel scalars ``N1``/``K2`` name the physical width.
     ``route_metadata`` is the catalogued route's ``metadata`` mapping: its
     ``block_m`` and ``readiness`` size the source-schedule workspace
-    (``source_schedule_form``) and ``local_expert_filter`` states that the
+    (``source_schedule_form``), ``local_expert_filter`` states that the
     program filters global ids through the ``local_expert_offset`` kernel
-    scalar; without the filter the call must describe a single-rank window
-    (offset 0, every id below ``num_experts``). Without metadata (the original
-    routes) the host uses the original heuristics.
+    scalar (without the filter the call must describe a single-rank window:
+    offset 0, every id below ``num_experts``), and ``w1_expert_map`` states
+    that the program streams ``B1`` through a per-expert three-dimensional TMA
+    map (``w1_launch_view``). Without metadata (the original routes) the host
+    uses the original heuristics.
     """
     import torch
 
     metadata = {} if route_metadata is None else route_metadata
     local_expert_filter = bool(metadata.get("local_expert_filter", False))
+    w1_expert_map = bool(metadata.get("w1_expert_map", False))
     args = pipeline_route_args(inputs)
     E, TK, T, H, I = (
         args[k]
@@ -591,9 +610,8 @@ def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
             .contiguous()
             .reshape(-1, rows)
         )
-    for name in ("B1", "B2"):
-        original = launch_kwargs[name]
-        launch_kwargs[name] = original.reshape(-1, original.shape[-1])
+    launch_kwargs["B2"] = launch_kwargs["B2"].reshape(-1, launch_kwargs["B2"].shape[-1])
+    launch_kwargs["B1"] = w1_launch_view(launch_kwargs["B1"], logical_I, w1_expert_map)
     source_rows = source_blocks * 128
     source_sf1 = torch.zeros((H // 128, source_rows), dtype=torch.uint32, device="cuda")
     source_sf2 = torch.zeros((I // 128, source_rows), dtype=torch.uint32, device="cuda")

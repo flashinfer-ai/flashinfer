@@ -36,6 +36,15 @@ def expected_source_form(num_experts, num_tokens):
     return "block", True
 
 
+def expected_w1_expert_map(num_experts, intermediate):
+    """Whether a TP/EP row's program streams W1 through the per-expert
+    three-dimensional map: the tensor-parallel rank shapes (every expert, a
+    padded intermediate of 640 or 384), whose last FC1 tile has an N tail the
+    map turns into TMA zero fill; the expert-parallel shapes keep the dense
+    two-dimensional map."""
+    return (num_experts, intermediate) in ((384, 640), (384, 384))
+
+
 def _catalog():
     return runtime.catalog()
 
@@ -92,6 +101,9 @@ def test_tp_ep_routes_ship_with_the_local_expert_filter_and_their_source_form():
             assert metadata["surface"] == "pipeline", shape
             assert metadata["self_cleaning"] is True, shape
             assert metadata["local_expert_filter"] is True, shape
+            assert metadata["w1_expert_map"] is expected_w1_expert_map(
+                num_experts, intermediate
+            ), shape
             assert metadata["kernel_intermediate"] == intermediate, shape
             assert metadata["block_m"] == expected_block_m(num_tokens), shape
             assert (
