@@ -1,8 +1,9 @@
-"""Independent BF16/FP32 W4A16 oracle shared by MegaMoE and split tests."""
+"""Independent BF16/FP32 W4A16 oracle shared by dense, MegaMoE, and split tests."""
 
 from __future__ import annotations
 
 import functools
+from contextlib import contextmanager
 
 import pytest
 import torch
@@ -51,6 +52,88 @@ def _dequantize(packed, scales):
     codes = torch.stack((packed & 15, packed >> 4), dim=-1).long()
     values = lookup[codes].reshape(*scales.shape, 16)
     return (values * scales.float().unsqueeze(-1)).flatten(-2).bfloat16()
+
+
+@contextmanager
+def _w4a16_matmul_precision():
+    matmul = torch.backends.cuda.matmul
+    if not hasattr(matmul, "allow_bf16_reduced_precision_reduction_split_k"):
+        pytest.skip("Bit-exact W4A16 oracle requires PyTorch 2.12 BF16 split-K control")
+    previous_blas = torch.backends.cuda.preferred_blas_library()
+    previous_reduction = (
+        matmul.allow_bf16_reduced_precision_reduction,
+        matmul.allow_bf16_reduced_precision_reduction_split_k,
+    )
+    previous_tf32 = matmul.allow_tf32
+    try:
+        torch.backends.cuda.preferred_blas_library("cublaslt")
+        matmul.allow_bf16_reduced_precision_reduction = (False, False)
+        matmul.allow_tf32 = False
+        yield
+    finally:
+        matmul.allow_bf16_reduced_precision_reduction = previous_reduction
+        torch.backends.cuda.preferred_blas_library(previous_blas)
+        matmul.allow_tf32 = previous_tf32
+
+
+def _scaled_bf16_matmul(activation, weight, alpha):
+    """FP32 accumulation and post-GEMM scaling, before any BF16 output rounding."""
+    result = torch.mm(activation, weight.T, out_dtype=torch.float32)
+    if alpha is not None:
+        result.mul_(alpha)
+    return result
+
+
+def _unswizzle_mma_scales(scales, rows, k, groups):
+    """Undo the shared dense/split six-dimensional scale view independently."""
+    shape = (32, 4, (rows + 127) // 128, 4, (k + 63) // 64, groups)
+    if tuple(scales.shape) != shape or k % 16:
+        raise ValueError(f"Expected six-dimensional W4A16 scales {shape} and K%16=0")
+    if scales.dtype not in (torch.uint8, torch.float8_e4m3fn):
+        raise TypeError("W4A16 scales must contain E4M3 bytes")
+    # Logical coordinates: (row%32, row//32%4, row//128,
+    # block%4, block//4, group). Crop both padded dimensions.
+    return (
+        scales.permute(5, 2, 1, 0, 4, 3)
+        .contiguous()
+        .view(torch.uint8)
+        .reshape(groups, shape[2] * 128, shape[4] * 4)
+    )[:, :rows, : k // 16].contiguous()
+
+
+@torch.no_grad()
+def dense_w4a16_reference(a, packed, scales, alpha=None):
+    """Reference for standard full-K SM10x CuTe DSL GEMM prepared weights.
+
+    ``packed`` is (N, K/2) E2M1 and ``scales`` is the six-dimensional E4M3
+    view shared with split MoE. Alpha scales the FP32 accumulator; the result
+    rounds once to BF16. Split-K, stream-K, and other backend layouts are outside
+    this contract.
+    """
+    if a.ndim != 2 or packed.ndim != 2:
+        raise ValueError("Dense W4A16 activation and packed weights must be matrices")
+    if a.dtype != torch.bfloat16 or packed.dtype != torch.uint8:
+        raise TypeError("Dense W4A16 requires BF16 activation and uint8 packed weights")
+    m, k = a.shape
+    n, packed_k = packed.shape
+    if n <= 0 or k <= 0 or k != 2 * packed_k or k % 16:
+        raise ValueError("Dense W4A16 requires matching positive N/K and K%16=0")
+    if not a.is_cuda or packed.device != a.device or scales.device != a.device:
+        raise ValueError("Dense W4A16 inputs must share a CUDA device")
+    if alpha is not None:
+        if alpha.dtype != torch.float32 or alpha.numel() != 1:
+            raise TypeError("Dense W4A16 alpha must be a single FP32 value")
+        if alpha.device != a.device:
+            raise ValueError("Dense W4A16 alpha must share the input CUDA device")
+    linear_scales = _unswizzle_mma_scales(scales, n, k, 1)[0]
+    weight = _dequantize(packed, linear_scales.view(torch.float8_e4m3fn))
+    output = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
+    with _w4a16_matmul_precision():
+        for start in range(0, m, 256):
+            output[start : start + 256] = _scaled_bf16_matmul(
+                a[start : start + 256], weight, alpha
+            ).bfloat16()
+    return output
 
 
 @functools.cache
@@ -314,9 +397,6 @@ def w4a16_reference(
     if activation_kind not in ("swiglu", "situ", "geglu_tanh", "relu2", "relu"):
         raise ValueError(f"Unsupported W4A16 activation: {activation_kind}")
     assert (problem.get("situ_beta") is not None) == (activation_kind == "situ")
-    matmul = torch.backends.cuda.matmul
-    if not hasattr(matmul, "allow_bf16_reduced_precision_reduction_split_k"):
-        pytest.skip("Bit-exact W4A16 oracle requires PyTorch 2.12 BF16 split-K control")
     pytest.importorskip("triton")
     x = problem["hidden_states"]
     rank, world = (
@@ -350,16 +430,7 @@ def w4a16_reference(
     )
     fc1_alpha = torch.ones(experts, device=x.device) if fc1_alpha is None else fc1_alpha
     fc2_alpha = torch.ones(experts, device=x.device) if fc2_alpha is None else fc2_alpha
-    previous_blas = torch.backends.cuda.preferred_blas_library()
-    previous_reduction = (
-        matmul.allow_bf16_reduced_precision_reduction,
-        matmul.allow_bf16_reduced_precision_reduction_split_k,
-    )
-    previous_tf32 = matmul.allow_tf32
-    try:
-        torch.backends.cuda.preferred_blas_library("cublaslt")
-        matmul.allow_bf16_reduced_precision_reduction = (False, False)
-        matmul.allow_tf32 = False
+    with _w4a16_matmul_precision():
         for expert in range(experts):
             rows, slots = torch.where(ids == expert_offset + expert)
             if not rows.numel():
@@ -375,8 +446,7 @@ def w4a16_reference(
                     rows[start : start + 256],
                     slots[start : start + 256],
                 )
-                fc1 = torch.mm(x[batch], w13.T, out_dtype=torch.float32)
-                fc1.mul_(fc1_alpha[expert])
+                fc1 = _scaled_bf16_matmul(x[batch], w13, fc1_alpha[expert])
                 intermediate = w2.shape[1]
                 activation = torch.empty(
                     (batch.numel(), intermediate), dtype=torch.bfloat16, device=x.device
@@ -401,16 +471,11 @@ def w4a16_reference(
                     problem.get("situ_beta"),
                     problem.get("situ_linear_beta"),
                 )
-                fc2 = torch.mm(activation, w2.T, out_dtype=torch.float32)
-                fc2.mul_(fc2_alpha[expert])
+                fc2 = _scaled_bf16_matmul(activation, w2, fc2_alpha[expert])
                 term = fc2.bfloat16()
                 if in_kernel_fc2_reduce and not apply_routing_weights_before_fc2:
                     term = (term.float() * scores[batch, route_slots, None]).bfloat16()
                 terms[batch, route_slots] = term.view(torch.int16).to(torch.int32)
-    finally:
-        matmul.allow_bf16_reduced_precision_reduction = previous_reduction
-        torch.backends.cuda.preferred_blas_library(previous_blas)
-        matmul.allow_tf32 = previous_tf32
     # Exactly one expert owner contributes each route: integer SUM transports
     # BF16 bits (including signed zero), without a floating-point reduction.
     if world > 1:
@@ -466,17 +531,9 @@ def canonical_split_w4a16_weights(tensors, gated):
         packed = tensors[f"{name}_weight"]
         experts, rows, packed_k = packed.shape
         assert packed_k % 8 == 0
-        # Logical scale coordinates are (row%32, row//32%4, row//128,
-        # block%4, block//4, expert). Crop padding before reordering FC1.
-        padded_rows = ((rows + 127) // 128) * 128
-        padded_blocks = ((2 * packed_k + 63) // 64) * 4
-        scales = (
-            tensors[f"{name}_weight_sf"]
-            .permute(5, 2, 1, 0, 4, 3)
-            .contiguous()
-            .view(torch.uint8)
-            .reshape(experts, padded_rows, padded_blocks)
-        )[:, :rows, : packed_k // 8].contiguous()
+        scales = _unswizzle_mma_scales(
+            tensors[f"{name}_weight_sf"], rows, 2 * packed_k, experts
+        )
         if name == "w1" and gated:
             # Split stores [up64,gate64,...]; the oracle consumes
             # canonical [all_gate,all_up], including matching scales.
