@@ -9319,15 +9319,21 @@ def trtllm_fmha_v2_prefill(
 
 
 @flashinfer_experimental_api
-def prepare_nvfp4_attention(q, k, v, out, *, backend="cake"):
-    """Prepare NVFP4 attention from BF16 [B,H,S,128] tensors.
+def prepare_nvfp4_attention(
+    q, k, v, out, *, backend="cake", softmax_scale=None, workspace=None
+):
+    """Prepare NVFP4 attention from BF16 logical ``[B, H, S, 128]`` tensors.
 
-    The experimental Cake backend requires SM103 and noncausal S divisible
-    by 512. ``q``, ``k`` and ``v`` may have any strides; ``out`` is contiguous.
-    Preparation quantizes Q/K/V to block-scaled E2M1 and returns an
-    NVFP4AttentionRunner. Calling the runner executes QK, softmax and PV
-    attention and writes the caller-owned BF16 output without CUDA allocation.
-    Prepare a new runner after changing input values or bindings. CUDA Graph
+    The experimental Cake backend runs on SM100, SM103 and SM120 GPUs: dense,
+    noncausal, ``D = 128``, equal query and key heads, any ``S``.  ``q``, ``k``,
+    ``v`` and ``out`` may have any strides (an ``[B, S, H, 128]`` buffer is passed
+    as its ``[B, H, S, 128]`` view and read or written in place).
+    ``softmax_scale`` defaults to ``128 ** -0.5``; ``workspace`` is a caller-owned
+    ``uint8`` tensor of at least :func:`nvfp4_attention_workspace_bytes` bytes,
+    else one is allocated here.  Returns a runner whose ``launch()`` (or call)
+    quantizes the inputs and runs the attention chain on the current stream,
+    writing the caller-owned BF16 output without CUDA allocation; input values
+    are free between launches, identities and strides are bound.  CUDA Graph
     ownership remains with the caller.
     """
     if backend != "cake":
@@ -9336,7 +9342,20 @@ def prepare_nvfp4_attention(q, k, v, out, *, backend="cake"):
         prepare_nvfp4_attention as prepare,
     )
 
-    return prepare(q, k, v, out, backend="cake")
+    return prepare(
+        q, k, v, out, backend="cake", softmax_scale=softmax_scale, workspace=workspace
+    )
+
+
+@flashinfer_experimental_api
+def nvfp4_attention_workspace_bytes(batch, heads, seqlen, device):
+    """Bytes of the ``uint8`` workspace :func:`prepare_nvfp4_attention` needs for
+    ``[batch, heads, seqlen, 128]`` tensors on ``device`` (the Cake backend)."""
+    from .experimental.nvfp4_attention.cake_backend import (
+        nvfp4_attention_workspace_bytes as workspace_bytes,
+    )
+
+    return workspace_bytes(batch, heads, seqlen, device)
 
 
 @flashinfer_experimental_api(feature="MiniMax-H3 packed-varlen BF16 attention")
