@@ -302,6 +302,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
     float row_scale[2];
     float local_sum[2];
     float pack_values[4];
+    float p_half0[16];
     for (int row = 0; row < 2; row++) {
         row_max[row] = -CUDART_INF_F;
         row_shift[row] = 0.0f;
@@ -326,10 +327,11 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
     mbarrier_wait(q_full_addr, _phase_q_full_0);
     _phase_q_full_0 ^= 1;
     int current_physical = first_physical;
+    int _min_0 = ((selected_count) < (1) ? (selected_count) : (1));
     unsigned int _phase_k_full_0 = 0;
     unsigned int _phase_v_full_0 = 0;
     #pragma unroll 1
-    for (int load_count = 0; load_count < selected_count; load_count++) {
+    for (int load_count = 0; load_count < _min_0; load_count++) {
         mbarrier_wait(k_full_addr, _phase_k_full_0);
         _phase_k_full_0 ^= 1;
         unsigned int q_row_base = warp * 16 + lane % 16;
@@ -558,8 +560,8 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
                 valid_tokens = 0;
             }
             {
-                int _min_0 = ((valid_tokens) < (block_sizes[(batch * num_heads + head) * num_k_blocks + current_physical]) ? (valid_tokens) : (block_sizes[(batch * num_heads + head) * num_k_blocks + current_physical]));
-                valid_tokens = _min_0;
+                int _min_0_1 = ((valid_tokens) < (block_sizes[(batch * num_heads + head) * num_k_blocks + current_physical]) ? (valid_tokens) : (block_sizes[(batch * num_heads + head) * num_k_blocks + current_physical]));
+                valid_tokens = _min_0_1;
             }
             if (valid_tokens < 0) {
                 valid_tokens = 0;
@@ -592,8 +594,8 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
                 valid_tokens = 0;
             }
             {
-                int _min_0 = ((valid_tokens) < (block_sizes[batch * num_k_blocks + current_physical]) ? (valid_tokens) : (block_sizes[batch * num_k_blocks + current_physical]));
-                valid_tokens = _min_0;
+                int _min_0_1 = ((valid_tokens) < (block_sizes[batch * num_k_blocks + current_physical]) ? (valid_tokens) : (block_sizes[batch * num_k_blocks + current_physical]));
+                valid_tokens = _min_0_1;
             }
             if (valid_tokens < 0) {
                 valid_tokens = 0;
@@ -626,8 +628,8 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
                 valid_tokens = 0;
             }
             {
-                int _min_0 = ((valid_tokens) < (block_sizes[current_physical]) ? (valid_tokens) : (block_sizes[current_physical]));
-                valid_tokens = _min_0;
+                int _min_0_1 = ((valid_tokens) < (block_sizes[current_physical]) ? (valid_tokens) : (block_sizes[current_physical]));
+                valid_tokens = _min_0_1;
             }
             if (valid_tokens < 0) {
                 valid_tokens = 0;
@@ -1497,61 +1499,1543 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
         }
         current_physical = next_physical;
     }
+    #pragma unroll 1
+    for (int load_count_1 = 1; load_count_1 < selected_count; load_count_1++) {
+        mbarrier_wait(k_full_addr, _phase_k_full_0);
+        _phase_k_full_0 ^= 1;
+        unsigned int q_row_base_1 = warp * 16 + lane % 16;
+        unsigned int q_col_base_2 = lane / 16;
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(q_frag[0]), "=r"(q_frag[1]), "=r"(q_frag[2]), "=r"(q_frag[3])
+            : "r"(q_smem_addr + (q_row_base_1 * 8 + (unsigned int)((q_col_base_2 * 16 ^ (q_row_base_1 & 7) << 4) / 16)) * 16)
+            : "memory");
+        unsigned int q_row_base_0_1 = warp * 16 + lane % 16;
+        unsigned int q_col_base_1_1 = lane / 16;
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(q_prefetch[0]), "=r"(q_prefetch[1]), "=r"(q_prefetch[2]), "=r"(q_prefetch[3])
+            : "r"(q_smem_addr + (q_row_base_0_1 * 8 + (unsigned int)(((q_col_base_1_1 + 2) * 16 ^ (q_row_base_0_1 & 7) << 4) / 16)) * 16)
+            : "memory");
+        unsigned int k_row_base_1 = lane % 8 + lane / 16 * 8;
+        unsigned int k_col_base_1 = lane / 8 % 2;
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
+            : "r"(k_smem_addr + (k_row_base_1 * 8 + (unsigned int)((k_col_base_1 * 16 ^ (k_row_base_1 & 7) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
+            : "=r"(scores_i32[0]), "=r"(scores_i32[1]), "=r"(scores_i32[2]), "=r"(scores_i32[3])
+            : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[0]), "r"(k_frag[1]), "r"(0), "r"(0), "r"(0), "r"(0));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
+            : "=r"(scores_i32[4]), "=r"(scores_i32[(4) + 1]), "=r"(scores_i32[(4) + 2]), "=r"(scores_i32[(4) + 3])
+            : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]), "r"(0), "r"(0), "r"(0), "r"(0));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
+            : "r"(k_smem_addr + ((k_row_base_1 + 16) * 8 + (unsigned int)((k_col_base_1 * 16 ^ (k_row_base_1 + 16 & 7) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
+            : "=r"(scores_i32[8]), "=r"(scores_i32[(8) + 1]), "=r"(scores_i32[(8) + 2]), "=r"(scores_i32[(8) + 3])
+            : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[0]), "r"(k_frag[1]), "r"(0), "r"(0), "r"(0), "r"(0));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
+            : "=r"(scores_i32[12]), "=r"(scores_i32[(12) + 1]), "=r"(scores_i32[(12) + 2]), "=r"(scores_i32[(12) + 3])
+            : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]), "r"(0), "r"(0), "r"(0), "r"(0));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
+            : "r"(k_smem_addr + ((k_row_base_1 + 32) * 8 + (unsigned int)((k_col_base_1 * 16 ^ (k_row_base_1 + 32 & 7) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
+            : "=r"(scores_i32[16]), "=r"(scores_i32[(16) + 1]), "=r"(scores_i32[(16) + 2]), "=r"(scores_i32[(16) + 3])
+            : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[0]), "r"(k_frag[1]), "r"(0), "r"(0), "r"(0), "r"(0));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
+            : "=r"(scores_i32[20]), "=r"(scores_i32[(20) + 1]), "=r"(scores_i32[(20) + 2]), "=r"(scores_i32[(20) + 3])
+            : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]), "r"(0), "r"(0), "r"(0), "r"(0));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
+            : "r"(k_smem_addr + ((k_row_base_1 + 48) * 8 + (unsigned int)((k_col_base_1 * 16 ^ (k_row_base_1 + 48 & 7) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
+            : "=r"(scores_i32[24]), "=r"(scores_i32[(24) + 1]), "=r"(scores_i32[(24) + 2]), "=r"(scores_i32[(24) + 3])
+            : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[0]), "r"(k_frag[1]), "r"(0), "r"(0), "r"(0), "r"(0));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
+            : "=r"(scores_i32[28]), "=r"(scores_i32[(28) + 1]), "=r"(scores_i32[(28) + 2]), "=r"(scores_i32[(28) + 3])
+            : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]), "r"(0), "r"(0), "r"(0), "r"(0));
+        unsigned int q_row_base_2_1 = warp * 16 + lane % 16;
+        unsigned int q_col_base_3_1 = lane / 16;
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(q_frag[0]), "=r"(q_frag[1]), "=r"(q_frag[2]), "=r"(q_frag[3])
+            : "r"(q_smem_addr + (q_row_base_2_1 * 8 + (unsigned int)(((q_col_base_3_1 + 4) * 16 ^ (q_row_base_2_1 & 7) << 4) / 16)) * 16)
+            : "memory");
+        unsigned int k_row_base_4_1 = lane % 8 + lane / 16 * 8;
+        unsigned int k_col_base_5_1 = lane / 8 % 2;
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
+            : "r"(k_smem_addr + (k_row_base_4_1 * 8 + (unsigned int)(((k_col_base_5_1 + 2) * 16 ^ (k_row_base_4_1 & 7) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+r"(scores_i32[0]), "+r"(scores_i32[1]), "+r"(scores_i32[2]), "+r"(scores_i32[3])
+            : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[0]), "r"(k_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+r"(scores_i32[4]), "+r"(scores_i32[(4) + 1]), "+r"(scores_i32[(4) + 2]), "+r"(scores_i32[(4) + 3])
+            : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
+            : "r"(k_smem_addr + ((k_row_base_4_1 + 16) * 8 + (unsigned int)(((k_col_base_5_1 + 2) * 16 ^ (k_row_base_4_1 + 16 & 7) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+r"(scores_i32[8]), "+r"(scores_i32[(8) + 1]), "+r"(scores_i32[(8) + 2]), "+r"(scores_i32[(8) + 3])
+            : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[0]), "r"(k_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+r"(scores_i32[12]), "+r"(scores_i32[(12) + 1]), "+r"(scores_i32[(12) + 2]), "+r"(scores_i32[(12) + 3])
+            : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
+            : "r"(k_smem_addr + ((k_row_base_4_1 + 32) * 8 + (unsigned int)(((k_col_base_5_1 + 2) * 16 ^ (k_row_base_4_1 + 32 & 7) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+r"(scores_i32[16]), "+r"(scores_i32[(16) + 1]), "+r"(scores_i32[(16) + 2]), "+r"(scores_i32[(16) + 3])
+            : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[0]), "r"(k_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+r"(scores_i32[20]), "+r"(scores_i32[(20) + 1]), "+r"(scores_i32[(20) + 2]), "+r"(scores_i32[(20) + 3])
+            : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
+            : "r"(k_smem_addr + ((k_row_base_4_1 + 48) * 8 + (unsigned int)(((k_col_base_5_1 + 2) * 16 ^ (k_row_base_4_1 + 48 & 7) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+r"(scores_i32[24]), "+r"(scores_i32[(24) + 1]), "+r"(scores_i32[(24) + 2]), "+r"(scores_i32[(24) + 3])
+            : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[0]), "r"(k_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+r"(scores_i32[28]), "+r"(scores_i32[(28) + 1]), "+r"(scores_i32[(28) + 2]), "+r"(scores_i32[(28) + 3])
+            : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
+        unsigned int q_row_base_6_1 = warp * 16 + lane % 16;
+        unsigned int q_col_base_7_1 = lane / 16;
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(q_prefetch[0]), "=r"(q_prefetch[1]), "=r"(q_prefetch[2]), "=r"(q_prefetch[3])
+            : "r"(q_smem_addr + (q_row_base_6_1 * 8 + (unsigned int)(((q_col_base_7_1 + 6) * 16 ^ (q_row_base_6_1 & 7) << 4) / 16)) * 16)
+            : "memory");
+        unsigned int k_row_base_8_1 = lane % 8 + lane / 16 * 8;
+        unsigned int k_col_base_9_1 = lane / 8 % 2;
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
+            : "r"(k_smem_addr + (k_row_base_8_1 * 8 + (unsigned int)(((k_col_base_9_1 + 4) * 16 ^ (k_row_base_8_1 & 7) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+r"(scores_i32[0]), "+r"(scores_i32[1]), "+r"(scores_i32[2]), "+r"(scores_i32[3])
+            : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[0]), "r"(k_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+r"(scores_i32[4]), "+r"(scores_i32[(4) + 1]), "+r"(scores_i32[(4) + 2]), "+r"(scores_i32[(4) + 3])
+            : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
+            : "r"(k_smem_addr + ((k_row_base_8_1 + 16) * 8 + (unsigned int)(((k_col_base_9_1 + 4) * 16 ^ (k_row_base_8_1 + 16 & 7) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+r"(scores_i32[8]), "+r"(scores_i32[(8) + 1]), "+r"(scores_i32[(8) + 2]), "+r"(scores_i32[(8) + 3])
+            : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[0]), "r"(k_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+r"(scores_i32[12]), "+r"(scores_i32[(12) + 1]), "+r"(scores_i32[(12) + 2]), "+r"(scores_i32[(12) + 3])
+            : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
+            : "r"(k_smem_addr + ((k_row_base_8_1 + 32) * 8 + (unsigned int)(((k_col_base_9_1 + 4) * 16 ^ (k_row_base_8_1 + 32 & 7) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+r"(scores_i32[16]), "+r"(scores_i32[(16) + 1]), "+r"(scores_i32[(16) + 2]), "+r"(scores_i32[(16) + 3])
+            : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[0]), "r"(k_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+r"(scores_i32[20]), "+r"(scores_i32[(20) + 1]), "+r"(scores_i32[(20) + 2]), "+r"(scores_i32[(20) + 3])
+            : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
+            : "r"(k_smem_addr + ((k_row_base_8_1 + 48) * 8 + (unsigned int)(((k_col_base_9_1 + 4) * 16 ^ (k_row_base_8_1 + 48 & 7) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+r"(scores_i32[24]), "+r"(scores_i32[(24) + 1]), "+r"(scores_i32[(24) + 2]), "+r"(scores_i32[(24) + 3])
+            : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[0]), "r"(k_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+r"(scores_i32[28]), "+r"(scores_i32[(28) + 1]), "+r"(scores_i32[(28) + 2]), "+r"(scores_i32[(28) + 3])
+            : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
+        unsigned int k_row_base_10_1 = lane % 8 + lane / 16 * 8;
+        unsigned int k_col_base_11_1 = lane / 8 % 2;
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
+            : "r"(k_smem_addr + (k_row_base_10_1 * 8 + (unsigned int)(((k_col_base_11_1 + 6) * 16 ^ (k_row_base_10_1 & 7) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+r"(scores_i32[0]), "+r"(scores_i32[1]), "+r"(scores_i32[2]), "+r"(scores_i32[3])
+            : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[0]), "r"(k_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+r"(scores_i32[4]), "+r"(scores_i32[(4) + 1]), "+r"(scores_i32[(4) + 2]), "+r"(scores_i32[(4) + 3])
+            : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
+            : "r"(k_smem_addr + ((k_row_base_10_1 + 16) * 8 + (unsigned int)(((k_col_base_11_1 + 6) * 16 ^ (k_row_base_10_1 + 16 & 7) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+r"(scores_i32[8]), "+r"(scores_i32[(8) + 1]), "+r"(scores_i32[(8) + 2]), "+r"(scores_i32[(8) + 3])
+            : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[0]), "r"(k_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+r"(scores_i32[12]), "+r"(scores_i32[(12) + 1]), "+r"(scores_i32[(12) + 2]), "+r"(scores_i32[(12) + 3])
+            : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
+            : "r"(k_smem_addr + ((k_row_base_10_1 + 32) * 8 + (unsigned int)(((k_col_base_11_1 + 6) * 16 ^ (k_row_base_10_1 + 32 & 7) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+r"(scores_i32[16]), "+r"(scores_i32[(16) + 1]), "+r"(scores_i32[(16) + 2]), "+r"(scores_i32[(16) + 3])
+            : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[0]), "r"(k_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+r"(scores_i32[20]), "+r"(scores_i32[(20) + 1]), "+r"(scores_i32[(20) + 2]), "+r"(scores_i32[(20) + 3])
+            : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
+            : "r"(k_smem_addr + ((k_row_base_10_1 + 48) * 8 + (unsigned int)(((k_col_base_11_1 + 6) * 16 ^ (k_row_base_10_1 + 48 & 7) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+r"(scores_i32[24]), "+r"(scores_i32[(24) + 1]), "+r"(scores_i32[(24) + 2]), "+r"(scores_i32[(24) + 3])
+            : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[0]), "r"(k_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+r"(scores_i32[28]), "+r"(scores_i32[(28) + 1]), "+r"(scores_i32[(28) + 2]), "+r"(scores_i32[(28) + 3])
+            : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
+        float k_scale_lane_1 = 0.0f;
+        if (lane == 0) {
+            k_scale_lane_1 = k_scale[k_scale_base + current_physical];
+        }
+        float k_scale_value_1 = __shfl_sync(0xFFFFFFFF, k_scale_lane_1, 0);
+        float score_scale_log2_1 = q_softmax_log2 * k_scale_value_1;
+        int valid_tokens_1 = 64;
+#if CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_FULL_K64_TILES && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        {
+            valid_tokens_1 = seqlen_k - current_physical * 64;
+            if (valid_tokens_1 > 64) {
+                valid_tokens_1 = 64;
+            }
+            if (valid_tokens_1 < 0) {
+                valid_tokens_1 = 0;
+            }
+            {
+                int _min_14 = ((valid_tokens_1) < (block_sizes[(batch * num_heads + head) * num_k_blocks + current_physical]) ? (valid_tokens_1) : (block_sizes[(batch * num_heads + head) * num_k_blocks + current_physical]));
+                valid_tokens_1 = _min_14;
+            }
+            if (valid_tokens_1 < 0) {
+                valid_tokens_1 = 0;
+            }
+        }
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_FULL_K64_TILES && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        {
+            valid_tokens_1 = seqlen_k - current_physical * 64;
+            if (valid_tokens_1 > 64) {
+                valid_tokens_1 = 64;
+            }
+            if (valid_tokens_1 < 0) {
+                valid_tokens_1 = 0;
+            }
+            {
+                int _min_13 = ((valid_tokens_1) < (block_sizes[(batch * num_heads + head) * num_k_blocks + current_physical]) ? (valid_tokens_1) : (block_sizes[(batch * num_heads + head) * num_k_blocks + current_physical]));
+                valid_tokens_1 = _min_13;
+            }
+            if (valid_tokens_1 < 0) {
+                valid_tokens_1 = 0;
+            }
+        }
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_FULL_K64_TILES && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        {
+            valid_tokens_1 = seqlen_k - current_physical * 64;
+            if (valid_tokens_1 > 64) {
+                valid_tokens_1 = 64;
+            }
+            if (valid_tokens_1 < 0) {
+                valid_tokens_1 = 0;
+            }
+            {
+                int _min_14 = ((valid_tokens_1) < (block_sizes[batch * num_k_blocks + current_physical]) ? (valid_tokens_1) : (block_sizes[batch * num_k_blocks + current_physical]));
+                valid_tokens_1 = _min_14;
+            }
+            if (valid_tokens_1 < 0) {
+                valid_tokens_1 = 0;
+            }
+        }
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_FULL_K64_TILES && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        {
+            valid_tokens_1 = seqlen_k - current_physical * 64;
+            if (valid_tokens_1 > 64) {
+                valid_tokens_1 = 64;
+            }
+            if (valid_tokens_1 < 0) {
+                valid_tokens_1 = 0;
+            }
+            {
+                int _min_13 = ((valid_tokens_1) < (block_sizes[batch * num_k_blocks + current_physical]) ? (valid_tokens_1) : (block_sizes[batch * num_k_blocks + current_physical]));
+                valid_tokens_1 = _min_13;
+            }
+            if (valid_tokens_1 < 0) {
+                valid_tokens_1 = 0;
+            }
+        }
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_FULL_K64_TILES && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        {
+            valid_tokens_1 = seqlen_k - current_physical * 64;
+            if (valid_tokens_1 > 64) {
+                valid_tokens_1 = 64;
+            }
+            if (valid_tokens_1 < 0) {
+                valid_tokens_1 = 0;
+            }
+            {
+                int _min_14 = ((valid_tokens_1) < (block_sizes[current_physical]) ? (valid_tokens_1) : (block_sizes[current_physical]));
+                valid_tokens_1 = _min_14;
+            }
+            if (valid_tokens_1 < 0) {
+                valid_tokens_1 = 0;
+            }
+        }
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_FULL_K64_TILES && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        {
+            valid_tokens_1 = seqlen_k - current_physical * 64;
+            if (valid_tokens_1 > 64) {
+                valid_tokens_1 = 64;
+            }
+            if (valid_tokens_1 < 0) {
+                valid_tokens_1 = 0;
+            }
+            {
+                int _min_13 = ((valid_tokens_1) < (block_sizes[current_physical]) ? (valid_tokens_1) : (block_sizes[current_physical]));
+                valid_tokens_1 = _min_13;
+            }
+            if (valid_tokens_1 < 0) {
+                valid_tokens_1 = 0;
+            }
+        }
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && !CAKE_SAGE_FULL_K64_TILES && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && !CAKE_SAGE_FULL_K64_TILES && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        {
+            valid_tokens_1 = seqlen_k - current_physical * 64;
+            if (valid_tokens_1 > 64) {
+                valid_tokens_1 = 64;
+            }
+            if (valid_tokens_1 < 0) {
+                valid_tokens_1 = 0;
+            }
+            if (valid_tokens_1 < 0) {
+                valid_tokens_1 = 0;
+            }
+        }
+#endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_FULL_K64_TILES, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        int preload_count_1 = load_count_1 + 1;
+        int next_physical_1 = 0;
+        if (preload_count_1 < selected_count) {
+            {
+#if CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+                next_physical_1 = current_physical - 1;
+                if (next_physical_1 < 0) {
+                    next_physical_1 = next_physical_1 + num_k_blocks;
+                }
+#else
+                next_physical_1 = q2k_block_index[index_base + selected_count - 1 - preload_count_1];
+#endif  // CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+            }
+            __syncthreads();
+            if (warp == 0) {
+                if (elect_sync()) {
+                    mbarrier_arrive_expect_tx(k_full_addr, 8192);
+                    asm volatile(
+                        "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                        :: "r"(k_smem_addr), "l"((&K_map)), "r"(0), "r"(next_physical_1 * 64), "r"(head), "r"(batch),
+                           "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                }
+            }
+        }
+        scores[0] = (float)scores_i32[0];
+        scores[1] = (float)scores_i32[1];
+        scores[2] = (float)scores_i32[2];
+        scores[3] = (float)scores_i32[3];
+        scores[4] = (float)scores_i32[4];
+        scores[5] = (float)scores_i32[5];
+        scores[6] = (float)scores_i32[6];
+        scores[7] = (float)scores_i32[7];
+        scores[8] = (float)scores_i32[8];
+        scores[9] = (float)scores_i32[9];
+        scores[10] = (float)scores_i32[10];
+        scores[11] = (float)scores_i32[11];
+        scores[12] = (float)scores_i32[12];
+        scores[13] = (float)scores_i32[13];
+        scores[14] = (float)scores_i32[14];
+        scores[15] = (float)scores_i32[15];
+        scores[16] = (float)scores_i32[16];
+        scores[17] = (float)scores_i32[17];
+        scores[18] = (float)scores_i32[18];
+        scores[19] = (float)scores_i32[19];
+        scores[20] = (float)scores_i32[20];
+        scores[21] = (float)scores_i32[21];
+        scores[22] = (float)scores_i32[22];
+        scores[23] = (float)scores_i32[23];
+        scores[24] = (float)scores_i32[24];
+        scores[25] = (float)scores_i32[25];
+        scores[26] = (float)scores_i32[26];
+        scores[27] = (float)scores_i32[27];
+        scores[28] = (float)scores_i32[28];
+        scores[29] = (float)scores_i32[29];
+        scores[30] = (float)scores_i32[30];
+        scores[31] = (float)scores_i32[31];
+        if (valid_tokens_1 < 64) {
+            int lane_col_base_1 = 2 * (lane % 4);
+            int token_in_tile_31 = lane_col_base_1;
+            if (token_in_tile_31 >= valid_tokens_1) {
+                scores[0] = -CUDART_INF_F;
+            }
+            int token_in_tile_0_1 = lane_col_base_1 + 1;
+            if (token_in_tile_0_1 >= valid_tokens_1) {
+                scores[1] = -CUDART_INF_F;
+            }
+            int token_in_tile_1_1 = lane_col_base_1;
+            if (token_in_tile_1_1 >= valid_tokens_1) {
+                scores[2] = -CUDART_INF_F;
+            }
+            int token_in_tile_2_1 = lane_col_base_1 + 1;
+            if (token_in_tile_2_1 >= valid_tokens_1) {
+                scores[3] = -CUDART_INF_F;
+            }
+            int token_in_tile_3_1 = lane_col_base_1 + 8;
+            if (token_in_tile_3_1 >= valid_tokens_1) {
+                scores[4] = -CUDART_INF_F;
+            }
+            int token_in_tile_4_1 = lane_col_base_1 + 8 + 1;
+            if (token_in_tile_4_1 >= valid_tokens_1) {
+                scores[5] = -CUDART_INF_F;
+            }
+            int token_in_tile_5_1 = lane_col_base_1 + 8;
+            if (token_in_tile_5_1 >= valid_tokens_1) {
+                scores[6] = -CUDART_INF_F;
+            }
+            int token_in_tile_6_1 = lane_col_base_1 + 8 + 1;
+            if (token_in_tile_6_1 >= valid_tokens_1) {
+                scores[7] = -CUDART_INF_F;
+            }
+            int token_in_tile_7_1 = 16 + lane_col_base_1;
+            if (token_in_tile_7_1 >= valid_tokens_1) {
+                scores[8] = -CUDART_INF_F;
+            }
+            int token_in_tile_8_1 = 16 + lane_col_base_1 + 1;
+            if (token_in_tile_8_1 >= valid_tokens_1) {
+                scores[9] = -CUDART_INF_F;
+            }
+            int token_in_tile_9_1 = 16 + lane_col_base_1;
+            if (token_in_tile_9_1 >= valid_tokens_1) {
+                scores[10] = -CUDART_INF_F;
+            }
+            int token_in_tile_10_1 = 16 + lane_col_base_1 + 1;
+            if (token_in_tile_10_1 >= valid_tokens_1) {
+                scores[11] = -CUDART_INF_F;
+            }
+            int token_in_tile_11_1 = 16 + lane_col_base_1 + 8;
+            if (token_in_tile_11_1 >= valid_tokens_1) {
+                scores[12] = -CUDART_INF_F;
+            }
+            int token_in_tile_12_1 = 16 + lane_col_base_1 + 8 + 1;
+            if (token_in_tile_12_1 >= valid_tokens_1) {
+                scores[13] = -CUDART_INF_F;
+            }
+            int token_in_tile_13_1 = 16 + lane_col_base_1 + 8;
+            if (token_in_tile_13_1 >= valid_tokens_1) {
+                scores[14] = -CUDART_INF_F;
+            }
+            int token_in_tile_14_1 = 16 + lane_col_base_1 + 8 + 1;
+            if (token_in_tile_14_1 >= valid_tokens_1) {
+                scores[15] = -CUDART_INF_F;
+            }
+            int token_in_tile_15_1 = 32 + lane_col_base_1;
+            if (token_in_tile_15_1 >= valid_tokens_1) {
+                scores[16] = -CUDART_INF_F;
+            }
+            int token_in_tile_16_1 = 32 + lane_col_base_1 + 1;
+            if (token_in_tile_16_1 >= valid_tokens_1) {
+                scores[17] = -CUDART_INF_F;
+            }
+            int token_in_tile_17_1 = 32 + lane_col_base_1;
+            if (token_in_tile_17_1 >= valid_tokens_1) {
+                scores[18] = -CUDART_INF_F;
+            }
+            int token_in_tile_18_1 = 32 + lane_col_base_1 + 1;
+            if (token_in_tile_18_1 >= valid_tokens_1) {
+                scores[19] = -CUDART_INF_F;
+            }
+            int token_in_tile_19_1 = 32 + lane_col_base_1 + 8;
+            if (token_in_tile_19_1 >= valid_tokens_1) {
+                scores[20] = -CUDART_INF_F;
+            }
+            int token_in_tile_20_1 = 32 + lane_col_base_1 + 8 + 1;
+            if (token_in_tile_20_1 >= valid_tokens_1) {
+                scores[21] = -CUDART_INF_F;
+            }
+            int token_in_tile_21_1 = 32 + lane_col_base_1 + 8;
+            if (token_in_tile_21_1 >= valid_tokens_1) {
+                scores[22] = -CUDART_INF_F;
+            }
+            int token_in_tile_22_1 = 32 + lane_col_base_1 + 8 + 1;
+            if (token_in_tile_22_1 >= valid_tokens_1) {
+                scores[23] = -CUDART_INF_F;
+            }
+            int token_in_tile_23_1 = 48 + lane_col_base_1;
+            if (token_in_tile_23_1 >= valid_tokens_1) {
+                scores[24] = -CUDART_INF_F;
+            }
+            int token_in_tile_24_1 = 48 + lane_col_base_1 + 1;
+            if (token_in_tile_24_1 >= valid_tokens_1) {
+                scores[25] = -CUDART_INF_F;
+            }
+            int token_in_tile_25_1 = 48 + lane_col_base_1;
+            if (token_in_tile_25_1 >= valid_tokens_1) {
+                scores[26] = -CUDART_INF_F;
+            }
+            int token_in_tile_26_1 = 48 + lane_col_base_1 + 1;
+            if (token_in_tile_26_1 >= valid_tokens_1) {
+                scores[27] = -CUDART_INF_F;
+            }
+            int token_in_tile_27_1 = 48 + lane_col_base_1 + 8;
+            if (token_in_tile_27_1 >= valid_tokens_1) {
+                scores[28] = -CUDART_INF_F;
+            }
+            int token_in_tile_28_1 = 48 + lane_col_base_1 + 8 + 1;
+            if (token_in_tile_28_1 >= valid_tokens_1) {
+                scores[29] = -CUDART_INF_F;
+            }
+            int token_in_tile_29_1 = 48 + lane_col_base_1 + 8;
+            if (token_in_tile_29_1 >= valid_tokens_1) {
+                scores[30] = -CUDART_INF_F;
+            }
+            int token_in_tile_30_1 = 48 + lane_col_base_1 + 8 + 1;
+            if (token_in_tile_30_1 >= valid_tokens_1) {
+                scores[31] = -CUDART_INF_F;
+            }
+        }
+#if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        float _exp2_15 = approx_exp2(__fmaf_rn(scores[0], score_scale_log2_1, -row_shift[0]));
+        p_half0[0] = _exp2_15;
+        float _exp2_16 = approx_exp2(__fmaf_rn(scores[2], score_scale_log2_1, -row_shift[1]));
+        p_half0[2] = _exp2_16;
+        float _exp2_17 = approx_exp2(__fmaf_rn(scores[1], score_scale_log2_1, -row_shift[0]));
+        p_half0[1] = _exp2_17;
+        float _exp2_18 = approx_exp2(__fmaf_rn(scores[3], score_scale_log2_1, -row_shift[1]));
+        p_half0[3] = _exp2_18;
+        float _exp2_19 = approx_exp2(__fmaf_rn(scores[4], score_scale_log2_1, -row_shift[0]));
+        p_half0[4] = _exp2_19;
+        float _exp2_20 = approx_exp2(__fmaf_rn(scores[6], score_scale_log2_1, -row_shift[1]));
+        p_half0[6] = _exp2_20;
+        float _exp2_21 = approx_exp2(__fmaf_rn(scores[5], score_scale_log2_1, -row_shift[0]));
+        p_half0[5] = _exp2_21;
+        float _exp2_22 = approx_exp2(__fmaf_rn(scores[7], score_scale_log2_1, -row_shift[1]));
+        p_half0[7] = _exp2_22;
+        float _exp2_23 = approx_exp2(__fmaf_rn(scores[8], score_scale_log2_1, -row_shift[0]));
+        p_half0[8] = _exp2_23;
+        float _exp2_24 = approx_exp2(__fmaf_rn(scores[10], score_scale_log2_1, -row_shift[1]));
+        p_half0[10] = _exp2_24;
+        float _exp2_25 = approx_exp2(__fmaf_rn(scores[9], score_scale_log2_1, -row_shift[0]));
+        p_half0[9] = _exp2_25;
+        float _exp2_26 = approx_exp2(__fmaf_rn(scores[11], score_scale_log2_1, -row_shift[1]));
+        p_half0[11] = _exp2_26;
+        float _exp2_27 = approx_exp2(__fmaf_rn(scores[12], score_scale_log2_1, -row_shift[0]));
+        p_half0[12] = _exp2_27;
+        float _exp2_28 = approx_exp2(__fmaf_rn(scores[14], score_scale_log2_1, -row_shift[1]));
+        p_half0[14] = _exp2_28;
+        float _exp2_29 = approx_exp2(__fmaf_rn(scores[13], score_scale_log2_1, -row_shift[0]));
+        p_half0[13] = _exp2_29;
+        float _exp2_30 = approx_exp2(__fmaf_rn(scores[15], score_scale_log2_1, -row_shift[1]));
+        p_half0[15] = _exp2_30;
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        float _exp2_14 = approx_exp2(__fmaf_rn(scores[0], score_scale_log2_1, -row_shift[0]));
+        p_half0[0] = _exp2_14;
+        float _exp2_15 = approx_exp2(__fmaf_rn(scores[2], score_scale_log2_1, -row_shift[1]));
+        p_half0[2] = _exp2_15;
+        float _exp2_16 = approx_exp2(__fmaf_rn(scores[1], score_scale_log2_1, -row_shift[0]));
+        p_half0[1] = _exp2_16;
+        float _exp2_17 = approx_exp2(__fmaf_rn(scores[3], score_scale_log2_1, -row_shift[1]));
+        p_half0[3] = _exp2_17;
+        float _exp2_18 = approx_exp2(__fmaf_rn(scores[4], score_scale_log2_1, -row_shift[0]));
+        p_half0[4] = _exp2_18;
+        float _exp2_19 = approx_exp2(__fmaf_rn(scores[6], score_scale_log2_1, -row_shift[1]));
+        p_half0[6] = _exp2_19;
+        float _exp2_20 = approx_exp2(__fmaf_rn(scores[5], score_scale_log2_1, -row_shift[0]));
+        p_half0[5] = _exp2_20;
+        float _exp2_21 = approx_exp2(__fmaf_rn(scores[7], score_scale_log2_1, -row_shift[1]));
+        p_half0[7] = _exp2_21;
+        float _exp2_22 = approx_exp2(__fmaf_rn(scores[8], score_scale_log2_1, -row_shift[0]));
+        p_half0[8] = _exp2_22;
+        float _exp2_23 = approx_exp2(__fmaf_rn(scores[10], score_scale_log2_1, -row_shift[1]));
+        p_half0[10] = _exp2_23;
+        float _exp2_24 = approx_exp2(__fmaf_rn(scores[9], score_scale_log2_1, -row_shift[0]));
+        p_half0[9] = _exp2_24;
+        float _exp2_25 = approx_exp2(__fmaf_rn(scores[11], score_scale_log2_1, -row_shift[1]));
+        p_half0[11] = _exp2_25;
+        float _exp2_26 = approx_exp2(__fmaf_rn(scores[12], score_scale_log2_1, -row_shift[0]));
+        p_half0[12] = _exp2_26;
+        float _exp2_27 = approx_exp2(__fmaf_rn(scores[14], score_scale_log2_1, -row_shift[1]));
+        p_half0[14] = _exp2_27;
+        float _exp2_28 = approx_exp2(__fmaf_rn(scores[13], score_scale_log2_1, -row_shift[0]));
+        p_half0[13] = _exp2_28;
+        float _exp2_29 = approx_exp2(__fmaf_rn(scores[15], score_scale_log2_1, -row_shift[1]));
+        p_half0[15] = _exp2_29;
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        float _exp2_13 = approx_exp2(__fmaf_rn(scores[0], score_scale_log2_1, -row_shift[0]));
+        p_half0[0] = _exp2_13;
+        float _exp2_14 = approx_exp2(__fmaf_rn(scores[2], score_scale_log2_1, -row_shift[1]));
+        p_half0[2] = _exp2_14;
+        float _exp2_15 = approx_exp2(__fmaf_rn(scores[1], score_scale_log2_1, -row_shift[0]));
+        p_half0[1] = _exp2_15;
+        float _exp2_16 = approx_exp2(__fmaf_rn(scores[3], score_scale_log2_1, -row_shift[1]));
+        p_half0[3] = _exp2_16;
+        float _exp2_17 = approx_exp2(__fmaf_rn(scores[4], score_scale_log2_1, -row_shift[0]));
+        p_half0[4] = _exp2_17;
+        float _exp2_18 = approx_exp2(__fmaf_rn(scores[6], score_scale_log2_1, -row_shift[1]));
+        p_half0[6] = _exp2_18;
+        float _exp2_19 = approx_exp2(__fmaf_rn(scores[5], score_scale_log2_1, -row_shift[0]));
+        p_half0[5] = _exp2_19;
+        float _exp2_20 = approx_exp2(__fmaf_rn(scores[7], score_scale_log2_1, -row_shift[1]));
+        p_half0[7] = _exp2_20;
+        float _exp2_21 = approx_exp2(__fmaf_rn(scores[8], score_scale_log2_1, -row_shift[0]));
+        p_half0[8] = _exp2_21;
+        float _exp2_22 = approx_exp2(__fmaf_rn(scores[10], score_scale_log2_1, -row_shift[1]));
+        p_half0[10] = _exp2_22;
+        float _exp2_23 = approx_exp2(__fmaf_rn(scores[9], score_scale_log2_1, -row_shift[0]));
+        p_half0[9] = _exp2_23;
+        float _exp2_24 = approx_exp2(__fmaf_rn(scores[11], score_scale_log2_1, -row_shift[1]));
+        p_half0[11] = _exp2_24;
+        float _exp2_25 = approx_exp2(__fmaf_rn(scores[12], score_scale_log2_1, -row_shift[0]));
+        p_half0[12] = _exp2_25;
+        float _exp2_26 = approx_exp2(__fmaf_rn(scores[14], score_scale_log2_1, -row_shift[1]));
+        p_half0[14] = _exp2_26;
+        float _exp2_27 = approx_exp2(__fmaf_rn(scores[13], score_scale_log2_1, -row_shift[0]));
+        p_half0[13] = _exp2_27;
+        float _exp2_28 = approx_exp2(__fmaf_rn(scores[15], score_scale_log2_1, -row_shift[1]));
+        p_half0[15] = _exp2_28;
+#else
+        float _exp2_12 = approx_exp2(__fmaf_rn(scores[0], score_scale_log2_1, -row_shift[0]));
+        p_half0[0] = _exp2_12;
+        float _exp2_13 = approx_exp2(__fmaf_rn(scores[2], score_scale_log2_1, -row_shift[1]));
+        p_half0[2] = _exp2_13;
+        float _exp2_14 = approx_exp2(__fmaf_rn(scores[1], score_scale_log2_1, -row_shift[0]));
+        p_half0[1] = _exp2_14;
+        float _exp2_15 = approx_exp2(__fmaf_rn(scores[3], score_scale_log2_1, -row_shift[1]));
+        p_half0[3] = _exp2_15;
+        float _exp2_16 = approx_exp2(__fmaf_rn(scores[4], score_scale_log2_1, -row_shift[0]));
+        p_half0[4] = _exp2_16;
+        float _exp2_17 = approx_exp2(__fmaf_rn(scores[6], score_scale_log2_1, -row_shift[1]));
+        p_half0[6] = _exp2_17;
+        float _exp2_18 = approx_exp2(__fmaf_rn(scores[5], score_scale_log2_1, -row_shift[0]));
+        p_half0[5] = _exp2_18;
+        float _exp2_19 = approx_exp2(__fmaf_rn(scores[7], score_scale_log2_1, -row_shift[1]));
+        p_half0[7] = _exp2_19;
+        float _exp2_20 = approx_exp2(__fmaf_rn(scores[8], score_scale_log2_1, -row_shift[0]));
+        p_half0[8] = _exp2_20;
+        float _exp2_21 = approx_exp2(__fmaf_rn(scores[10], score_scale_log2_1, -row_shift[1]));
+        p_half0[10] = _exp2_21;
+        float _exp2_22 = approx_exp2(__fmaf_rn(scores[9], score_scale_log2_1, -row_shift[0]));
+        p_half0[9] = _exp2_22;
+        float _exp2_23 = approx_exp2(__fmaf_rn(scores[11], score_scale_log2_1, -row_shift[1]));
+        p_half0[11] = _exp2_23;
+        float _exp2_24 = approx_exp2(__fmaf_rn(scores[12], score_scale_log2_1, -row_shift[0]));
+        p_half0[12] = _exp2_24;
+        float _exp2_25 = approx_exp2(__fmaf_rn(scores[14], score_scale_log2_1, -row_shift[1]));
+        p_half0[14] = _exp2_25;
+        float _exp2_26 = approx_exp2(__fmaf_rn(scores[13], score_scale_log2_1, -row_shift[0]));
+        p_half0[13] = _exp2_26;
+        float _exp2_27 = approx_exp2(__fmaf_rn(scores[15], score_scale_log2_1, -row_shift[1]));
+        p_half0[15] = _exp2_27;
+#endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        float carry_current_1[2];
+        float carry_safe_1[2];
+        float carry_delta_1[2];
+        float previous_max_1 = row_max[0];
+        float group_max_1 = fmaxf(fmaxf(scores[0], scores[1]), fmaxf(scores[4], scores[5]));
+        group_max_1 = fmaxf(group_max_1, fmaxf(fmaxf(scores[8], scores[9]), fmaxf(scores[12], scores[13])));
+        group_max_1 = fmaxf(group_max_1, fmaxf(fmaxf(scores[16], scores[17]), fmaxf(scores[20], scores[21])));
+        group_max_1 = fmaxf(group_max_1, fmaxf(fmaxf(scores[24], scores[25]), fmaxf(scores[28], scores[29])));
+#if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        float _shfl_xor_sync_31 = __shfl_xor_sync(0xFFFFFFFF, group_max_1, 1);
+        group_max_1 = fmaxf(group_max_1, _shfl_xor_sync_31);
+        float _shfl_xor_sync_32 = __shfl_xor_sync(0xFFFFFFFF, group_max_1, 2);
+        group_max_1 = fmaxf(group_max_1, _shfl_xor_sync_32);
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        float _shfl_xor_sync_30 = __shfl_xor_sync(0xFFFFFFFF, group_max_1, 1);
+        group_max_1 = fmaxf(group_max_1, _shfl_xor_sync_30);
+        float _shfl_xor_sync_31 = __shfl_xor_sync(0xFFFFFFFF, group_max_1, 2);
+        group_max_1 = fmaxf(group_max_1, _shfl_xor_sync_31);
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        float _shfl_xor_sync_29 = __shfl_xor_sync(0xFFFFFFFF, group_max_1, 1);
+        group_max_1 = fmaxf(group_max_1, _shfl_xor_sync_29);
+        float _shfl_xor_sync_30 = __shfl_xor_sync(0xFFFFFFFF, group_max_1, 2);
+        group_max_1 = fmaxf(group_max_1, _shfl_xor_sync_30);
+#else
+        float _shfl_xor_sync_28 = __shfl_xor_sync(0xFFFFFFFF, group_max_1, 1);
+        group_max_1 = fmaxf(group_max_1, _shfl_xor_sync_28);
+        float _shfl_xor_sync_29 = __shfl_xor_sync(0xFFFFFFFF, group_max_1, 2);
+        group_max_1 = fmaxf(group_max_1, _shfl_xor_sync_29);
+#endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        float current_max_1 = fmaxf(previous_max_1, group_max_1 * score_scale_log2_1);
+#if CAKE_SAGE_FULL_K64_TILES
+        float safe_max_1 = current_max_1;
+#else
+        float safe_max_1 = ((current_max_1 == -CUDART_INF_F) ? 0.0f : current_max_1);
+#endif  // CAKE_SAGE_FULL_K64_TILES
+        carry_current_1[0] = current_max_1;
+        carry_safe_1[0] = safe_max_1;
+        carry_delta_1[0] = previous_max_1 - safe_max_1;
+        row_scale[0] = 1.0f;
+        float previous_max_12_1 = row_max[1];
+        float group_max_13_1 = fmaxf(fmaxf(scores[2], scores[3]), fmaxf(scores[6], scores[7]));
+        group_max_13_1 = fmaxf(group_max_13_1, fmaxf(fmaxf(scores[10], scores[11]), fmaxf(scores[14], scores[15])));
+        group_max_13_1 = fmaxf(group_max_13_1, fmaxf(fmaxf(scores[18], scores[19]), fmaxf(scores[22], scores[23])));
+        group_max_13_1 = fmaxf(group_max_13_1, fmaxf(fmaxf(scores[26], scores[27]), fmaxf(scores[30], scores[31])));
+#if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        float _shfl_xor_sync_33 = __shfl_xor_sync(0xFFFFFFFF, group_max_13_1, 1);
+        group_max_13_1 = fmaxf(group_max_13_1, _shfl_xor_sync_33);
+        float _shfl_xor_sync_34 = __shfl_xor_sync(0xFFFFFFFF, group_max_13_1, 2);
+        group_max_13_1 = fmaxf(group_max_13_1, _shfl_xor_sync_34);
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        float _shfl_xor_sync_32 = __shfl_xor_sync(0xFFFFFFFF, group_max_13_1, 1);
+        group_max_13_1 = fmaxf(group_max_13_1, _shfl_xor_sync_32);
+        float _shfl_xor_sync_33 = __shfl_xor_sync(0xFFFFFFFF, group_max_13_1, 2);
+        group_max_13_1 = fmaxf(group_max_13_1, _shfl_xor_sync_33);
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        float _shfl_xor_sync_31 = __shfl_xor_sync(0xFFFFFFFF, group_max_13_1, 1);
+        group_max_13_1 = fmaxf(group_max_13_1, _shfl_xor_sync_31);
+        float _shfl_xor_sync_32 = __shfl_xor_sync(0xFFFFFFFF, group_max_13_1, 2);
+        group_max_13_1 = fmaxf(group_max_13_1, _shfl_xor_sync_32);
+#else
+        float _shfl_xor_sync_30 = __shfl_xor_sync(0xFFFFFFFF, group_max_13_1, 1);
+        group_max_13_1 = fmaxf(group_max_13_1, _shfl_xor_sync_30);
+        float _shfl_xor_sync_31 = __shfl_xor_sync(0xFFFFFFFF, group_max_13_1, 2);
+        group_max_13_1 = fmaxf(group_max_13_1, _shfl_xor_sync_31);
+#endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        float current_max_14_1 = fmaxf(previous_max_12_1, group_max_13_1 * score_scale_log2_1);
+#if CAKE_SAGE_FULL_K64_TILES
+        float safe_max_15_1 = current_max_14_1;
+#else
+        float safe_max_15_1 = ((current_max_14_1 == -CUDART_INF_F) ? 0.0f : current_max_14_1);
+#endif  // CAKE_SAGE_FULL_K64_TILES
+        carry_current_1[1] = current_max_14_1;
+        carry_safe_1[1] = safe_max_15_1;
+        carry_delta_1[1] = previous_max_12_1 - safe_max_15_1;
+        row_scale[1] = 1.0f;
+#if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        int _warp_vote_35 = __any_sync(0xFFFFFFFF, carry_delta_1[0] < -0.8073549f || carry_delta_1[1] < -0.8073549f);
+        if (_warp_vote_35 != 0) {
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        int _warp_vote_34 = __any_sync(0xFFFFFFFF, carry_delta_1[0] < -0.8073549f || carry_delta_1[1] < -0.8073549f);
+        if (_warp_vote_34 != 0) {
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        int _warp_vote_33 = __any_sync(0xFFFFFFFF, carry_delta_1[0] < -0.8073549f || carry_delta_1[1] < -0.8073549f);
+        if (_warp_vote_33 != 0) {
+#else
+        int _warp_vote_32 = __any_sync(0xFFFFFFFF, carry_delta_1[0] < -0.8073549f || carry_delta_1[1] < -0.8073549f);
+        if (_warp_vote_32 != 0) {
+#endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+            if (carry_delta_1[0] < -0.8073549f) {
+#if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+                float _exp2_36 = approx_exp2(carry_delta_1[0]);
+                row_scale[0] = _exp2_36;
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+                float _exp2_35 = approx_exp2(carry_delta_1[0]);
+                row_scale[0] = _exp2_35;
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+                float _exp2_34 = approx_exp2(carry_delta_1[0]);
+                row_scale[0] = _exp2_34;
+#else
+                float _exp2_33 = approx_exp2(carry_delta_1[0]);
+                row_scale[0] = _exp2_33;
+#endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+                row_max[0] = carry_current_1[0];
+                row_shift[0] = carry_safe_1[0] - 8.0f;
+            }
+            if (carry_delta_1[1] < -0.8073549f) {
+#if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+                float _exp2_37 = approx_exp2(carry_delta_1[1]);
+                row_scale[1] = _exp2_37;
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+                float _exp2_36 = approx_exp2(carry_delta_1[1]);
+                row_scale[1] = _exp2_36;
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+                float _exp2_35 = approx_exp2(carry_delta_1[1]);
+                row_scale[1] = _exp2_35;
+#else
+                float _exp2_34 = approx_exp2(carry_delta_1[1]);
+                row_scale[1] = _exp2_34;
+#endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+                row_max[1] = carry_current_1[1];
+                row_shift[1] = carry_safe_1[1] - 8.0f;
+            }
+            {
+#if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+                float2 _pair_scale_even2_38 = make_float2(row_scale[0], row_scale[0]);
+                float2 _pair_scale_odd2_38 = make_float2(row_scale[1], row_scale[1]);
+                float2* _pair_scale_src2_38 = reinterpret_cast<float2*>(&output[0]);
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[0]) : "l"(*(unsigned long long*)&_pair_scale_even2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[1]) : "l"(*(unsigned long long*)&_pair_scale_odd2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[2]) : "l"(*(unsigned long long*)&_pair_scale_even2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[3]) : "l"(*(unsigned long long*)&_pair_scale_odd2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[4]) : "l"(*(unsigned long long*)&_pair_scale_even2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[5]) : "l"(*(unsigned long long*)&_pair_scale_odd2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[6]) : "l"(*(unsigned long long*)&_pair_scale_even2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[7]) : "l"(*(unsigned long long*)&_pair_scale_odd2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[8]) : "l"(*(unsigned long long*)&_pair_scale_even2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[9]) : "l"(*(unsigned long long*)&_pair_scale_odd2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[10]) : "l"(*(unsigned long long*)&_pair_scale_even2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[11]) : "l"(*(unsigned long long*)&_pair_scale_odd2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[12]) : "l"(*(unsigned long long*)&_pair_scale_even2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[13]) : "l"(*(unsigned long long*)&_pair_scale_odd2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[14]) : "l"(*(unsigned long long*)&_pair_scale_even2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[15]) : "l"(*(unsigned long long*)&_pair_scale_odd2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[16]) : "l"(*(unsigned long long*)&_pair_scale_even2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[17]) : "l"(*(unsigned long long*)&_pair_scale_odd2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[18]) : "l"(*(unsigned long long*)&_pair_scale_even2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[19]) : "l"(*(unsigned long long*)&_pair_scale_odd2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[20]) : "l"(*(unsigned long long*)&_pair_scale_even2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[21]) : "l"(*(unsigned long long*)&_pair_scale_odd2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[22]) : "l"(*(unsigned long long*)&_pair_scale_even2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[23]) : "l"(*(unsigned long long*)&_pair_scale_odd2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[24]) : "l"(*(unsigned long long*)&_pair_scale_even2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[25]) : "l"(*(unsigned long long*)&_pair_scale_odd2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[26]) : "l"(*(unsigned long long*)&_pair_scale_even2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[27]) : "l"(*(unsigned long long*)&_pair_scale_odd2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[28]) : "l"(*(unsigned long long*)&_pair_scale_even2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[29]) : "l"(*(unsigned long long*)&_pair_scale_odd2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[30]) : "l"(*(unsigned long long*)&_pair_scale_even2_38));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_38[31]) : "l"(*(unsigned long long*)&_pair_scale_odd2_38));
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+                float2 _pair_scale_even2_37 = make_float2(row_scale[0], row_scale[0]);
+                float2 _pair_scale_odd2_37 = make_float2(row_scale[1], row_scale[1]);
+                float2* _pair_scale_src2_37 = reinterpret_cast<float2*>(&output[0]);
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[0]) : "l"(*(unsigned long long*)&_pair_scale_even2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[1]) : "l"(*(unsigned long long*)&_pair_scale_odd2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[2]) : "l"(*(unsigned long long*)&_pair_scale_even2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[3]) : "l"(*(unsigned long long*)&_pair_scale_odd2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[4]) : "l"(*(unsigned long long*)&_pair_scale_even2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[5]) : "l"(*(unsigned long long*)&_pair_scale_odd2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[6]) : "l"(*(unsigned long long*)&_pair_scale_even2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[7]) : "l"(*(unsigned long long*)&_pair_scale_odd2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[8]) : "l"(*(unsigned long long*)&_pair_scale_even2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[9]) : "l"(*(unsigned long long*)&_pair_scale_odd2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[10]) : "l"(*(unsigned long long*)&_pair_scale_even2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[11]) : "l"(*(unsigned long long*)&_pair_scale_odd2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[12]) : "l"(*(unsigned long long*)&_pair_scale_even2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[13]) : "l"(*(unsigned long long*)&_pair_scale_odd2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[14]) : "l"(*(unsigned long long*)&_pair_scale_even2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[15]) : "l"(*(unsigned long long*)&_pair_scale_odd2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[16]) : "l"(*(unsigned long long*)&_pair_scale_even2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[17]) : "l"(*(unsigned long long*)&_pair_scale_odd2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[18]) : "l"(*(unsigned long long*)&_pair_scale_even2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[19]) : "l"(*(unsigned long long*)&_pair_scale_odd2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[20]) : "l"(*(unsigned long long*)&_pair_scale_even2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[21]) : "l"(*(unsigned long long*)&_pair_scale_odd2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[22]) : "l"(*(unsigned long long*)&_pair_scale_even2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[23]) : "l"(*(unsigned long long*)&_pair_scale_odd2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[24]) : "l"(*(unsigned long long*)&_pair_scale_even2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[25]) : "l"(*(unsigned long long*)&_pair_scale_odd2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[26]) : "l"(*(unsigned long long*)&_pair_scale_even2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[27]) : "l"(*(unsigned long long*)&_pair_scale_odd2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[28]) : "l"(*(unsigned long long*)&_pair_scale_even2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[29]) : "l"(*(unsigned long long*)&_pair_scale_odd2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[30]) : "l"(*(unsigned long long*)&_pair_scale_even2_37));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_37[31]) : "l"(*(unsigned long long*)&_pair_scale_odd2_37));
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+                float2 _pair_scale_even2_36 = make_float2(row_scale[0], row_scale[0]);
+                float2 _pair_scale_odd2_36 = make_float2(row_scale[1], row_scale[1]);
+                float2* _pair_scale_src2_36 = reinterpret_cast<float2*>(&output[0]);
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[0]) : "l"(*(unsigned long long*)&_pair_scale_even2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[1]) : "l"(*(unsigned long long*)&_pair_scale_odd2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[2]) : "l"(*(unsigned long long*)&_pair_scale_even2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[3]) : "l"(*(unsigned long long*)&_pair_scale_odd2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[4]) : "l"(*(unsigned long long*)&_pair_scale_even2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[5]) : "l"(*(unsigned long long*)&_pair_scale_odd2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[6]) : "l"(*(unsigned long long*)&_pair_scale_even2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[7]) : "l"(*(unsigned long long*)&_pair_scale_odd2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[8]) : "l"(*(unsigned long long*)&_pair_scale_even2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[9]) : "l"(*(unsigned long long*)&_pair_scale_odd2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[10]) : "l"(*(unsigned long long*)&_pair_scale_even2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[11]) : "l"(*(unsigned long long*)&_pair_scale_odd2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[12]) : "l"(*(unsigned long long*)&_pair_scale_even2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[13]) : "l"(*(unsigned long long*)&_pair_scale_odd2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[14]) : "l"(*(unsigned long long*)&_pair_scale_even2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[15]) : "l"(*(unsigned long long*)&_pair_scale_odd2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[16]) : "l"(*(unsigned long long*)&_pair_scale_even2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[17]) : "l"(*(unsigned long long*)&_pair_scale_odd2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[18]) : "l"(*(unsigned long long*)&_pair_scale_even2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[19]) : "l"(*(unsigned long long*)&_pair_scale_odd2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[20]) : "l"(*(unsigned long long*)&_pair_scale_even2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[21]) : "l"(*(unsigned long long*)&_pair_scale_odd2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[22]) : "l"(*(unsigned long long*)&_pair_scale_even2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[23]) : "l"(*(unsigned long long*)&_pair_scale_odd2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[24]) : "l"(*(unsigned long long*)&_pair_scale_even2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[25]) : "l"(*(unsigned long long*)&_pair_scale_odd2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[26]) : "l"(*(unsigned long long*)&_pair_scale_even2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[27]) : "l"(*(unsigned long long*)&_pair_scale_odd2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[28]) : "l"(*(unsigned long long*)&_pair_scale_even2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[29]) : "l"(*(unsigned long long*)&_pair_scale_odd2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[30]) : "l"(*(unsigned long long*)&_pair_scale_even2_36));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_36[31]) : "l"(*(unsigned long long*)&_pair_scale_odd2_36));
+#else
+                float2 _pair_scale_even2_35 = make_float2(row_scale[0], row_scale[0]);
+                float2 _pair_scale_odd2_35 = make_float2(row_scale[1], row_scale[1]);
+                float2* _pair_scale_src2_35 = reinterpret_cast<float2*>(&output[0]);
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[0]) : "l"(*(unsigned long long*)&_pair_scale_even2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[1]) : "l"(*(unsigned long long*)&_pair_scale_odd2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[2]) : "l"(*(unsigned long long*)&_pair_scale_even2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[3]) : "l"(*(unsigned long long*)&_pair_scale_odd2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[4]) : "l"(*(unsigned long long*)&_pair_scale_even2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[5]) : "l"(*(unsigned long long*)&_pair_scale_odd2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[6]) : "l"(*(unsigned long long*)&_pair_scale_even2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[7]) : "l"(*(unsigned long long*)&_pair_scale_odd2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[8]) : "l"(*(unsigned long long*)&_pair_scale_even2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[9]) : "l"(*(unsigned long long*)&_pair_scale_odd2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[10]) : "l"(*(unsigned long long*)&_pair_scale_even2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[11]) : "l"(*(unsigned long long*)&_pair_scale_odd2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[12]) : "l"(*(unsigned long long*)&_pair_scale_even2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[13]) : "l"(*(unsigned long long*)&_pair_scale_odd2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[14]) : "l"(*(unsigned long long*)&_pair_scale_even2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[15]) : "l"(*(unsigned long long*)&_pair_scale_odd2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[16]) : "l"(*(unsigned long long*)&_pair_scale_even2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[17]) : "l"(*(unsigned long long*)&_pair_scale_odd2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[18]) : "l"(*(unsigned long long*)&_pair_scale_even2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[19]) : "l"(*(unsigned long long*)&_pair_scale_odd2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[20]) : "l"(*(unsigned long long*)&_pair_scale_even2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[21]) : "l"(*(unsigned long long*)&_pair_scale_odd2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[22]) : "l"(*(unsigned long long*)&_pair_scale_even2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[23]) : "l"(*(unsigned long long*)&_pair_scale_odd2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[24]) : "l"(*(unsigned long long*)&_pair_scale_even2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[25]) : "l"(*(unsigned long long*)&_pair_scale_odd2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[26]) : "l"(*(unsigned long long*)&_pair_scale_even2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[27]) : "l"(*(unsigned long long*)&_pair_scale_odd2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[28]) : "l"(*(unsigned long long*)&_pair_scale_even2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[29]) : "l"(*(unsigned long long*)&_pair_scale_odd2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[30]) : "l"(*(unsigned long long*)&_pair_scale_even2_35));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_35[31]) : "l"(*(unsigned long long*)&_pair_scale_odd2_35));
+#endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+            }
+#if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+            float _exp2_39 = approx_exp2(__fmaf_rn(scores[0], score_scale_log2_1, -row_shift[0]));
+            p_half0[0] = _exp2_39;
+            float _exp2_40 = approx_exp2(__fmaf_rn(scores[2], score_scale_log2_1, -row_shift[1]));
+            p_half0[2] = _exp2_40;
+            float _exp2_41 = approx_exp2(__fmaf_rn(scores[1], score_scale_log2_1, -row_shift[0]));
+            p_half0[1] = _exp2_41;
+            float _exp2_42 = approx_exp2(__fmaf_rn(scores[3], score_scale_log2_1, -row_shift[1]));
+            p_half0[3] = _exp2_42;
+            float _exp2_43 = approx_exp2(__fmaf_rn(scores[4], score_scale_log2_1, -row_shift[0]));
+            p_half0[4] = _exp2_43;
+            float _exp2_44 = approx_exp2(__fmaf_rn(scores[6], score_scale_log2_1, -row_shift[1]));
+            p_half0[6] = _exp2_44;
+            float _exp2_45 = approx_exp2(__fmaf_rn(scores[5], score_scale_log2_1, -row_shift[0]));
+            p_half0[5] = _exp2_45;
+            float _exp2_46 = approx_exp2(__fmaf_rn(scores[7], score_scale_log2_1, -row_shift[1]));
+            p_half0[7] = _exp2_46;
+            float _exp2_47 = approx_exp2(__fmaf_rn(scores[8], score_scale_log2_1, -row_shift[0]));
+            p_half0[8] = _exp2_47;
+            float _exp2_48 = approx_exp2(__fmaf_rn(scores[10], score_scale_log2_1, -row_shift[1]));
+            p_half0[10] = _exp2_48;
+            float _exp2_49 = approx_exp2(__fmaf_rn(scores[9], score_scale_log2_1, -row_shift[0]));
+            p_half0[9] = _exp2_49;
+            float _exp2_50 = approx_exp2(__fmaf_rn(scores[11], score_scale_log2_1, -row_shift[1]));
+            p_half0[11] = _exp2_50;
+            float _exp2_51 = approx_exp2(__fmaf_rn(scores[12], score_scale_log2_1, -row_shift[0]));
+            p_half0[12] = _exp2_51;
+            float _exp2_52 = approx_exp2(__fmaf_rn(scores[14], score_scale_log2_1, -row_shift[1]));
+            p_half0[14] = _exp2_52;
+            float _exp2_53 = approx_exp2(__fmaf_rn(scores[13], score_scale_log2_1, -row_shift[0]));
+            p_half0[13] = _exp2_53;
+            float _exp2_54 = approx_exp2(__fmaf_rn(scores[15], score_scale_log2_1, -row_shift[1]));
+            p_half0[15] = _exp2_54;
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+            float _exp2_38 = approx_exp2(__fmaf_rn(scores[0], score_scale_log2_1, -row_shift[0]));
+            p_half0[0] = _exp2_38;
+            float _exp2_39 = approx_exp2(__fmaf_rn(scores[2], score_scale_log2_1, -row_shift[1]));
+            p_half0[2] = _exp2_39;
+            float _exp2_40 = approx_exp2(__fmaf_rn(scores[1], score_scale_log2_1, -row_shift[0]));
+            p_half0[1] = _exp2_40;
+            float _exp2_41 = approx_exp2(__fmaf_rn(scores[3], score_scale_log2_1, -row_shift[1]));
+            p_half0[3] = _exp2_41;
+            float _exp2_42 = approx_exp2(__fmaf_rn(scores[4], score_scale_log2_1, -row_shift[0]));
+            p_half0[4] = _exp2_42;
+            float _exp2_43 = approx_exp2(__fmaf_rn(scores[6], score_scale_log2_1, -row_shift[1]));
+            p_half0[6] = _exp2_43;
+            float _exp2_44 = approx_exp2(__fmaf_rn(scores[5], score_scale_log2_1, -row_shift[0]));
+            p_half0[5] = _exp2_44;
+            float _exp2_45 = approx_exp2(__fmaf_rn(scores[7], score_scale_log2_1, -row_shift[1]));
+            p_half0[7] = _exp2_45;
+            float _exp2_46 = approx_exp2(__fmaf_rn(scores[8], score_scale_log2_1, -row_shift[0]));
+            p_half0[8] = _exp2_46;
+            float _exp2_47 = approx_exp2(__fmaf_rn(scores[10], score_scale_log2_1, -row_shift[1]));
+            p_half0[10] = _exp2_47;
+            float _exp2_48 = approx_exp2(__fmaf_rn(scores[9], score_scale_log2_1, -row_shift[0]));
+            p_half0[9] = _exp2_48;
+            float _exp2_49 = approx_exp2(__fmaf_rn(scores[11], score_scale_log2_1, -row_shift[1]));
+            p_half0[11] = _exp2_49;
+            float _exp2_50 = approx_exp2(__fmaf_rn(scores[12], score_scale_log2_1, -row_shift[0]));
+            p_half0[12] = _exp2_50;
+            float _exp2_51 = approx_exp2(__fmaf_rn(scores[14], score_scale_log2_1, -row_shift[1]));
+            p_half0[14] = _exp2_51;
+            float _exp2_52 = approx_exp2(__fmaf_rn(scores[13], score_scale_log2_1, -row_shift[0]));
+            p_half0[13] = _exp2_52;
+            float _exp2_53 = approx_exp2(__fmaf_rn(scores[15], score_scale_log2_1, -row_shift[1]));
+            p_half0[15] = _exp2_53;
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+            float _exp2_37 = approx_exp2(__fmaf_rn(scores[0], score_scale_log2_1, -row_shift[0]));
+            p_half0[0] = _exp2_37;
+            float _exp2_38 = approx_exp2(__fmaf_rn(scores[2], score_scale_log2_1, -row_shift[1]));
+            p_half0[2] = _exp2_38;
+            float _exp2_39 = approx_exp2(__fmaf_rn(scores[1], score_scale_log2_1, -row_shift[0]));
+            p_half0[1] = _exp2_39;
+            float _exp2_40 = approx_exp2(__fmaf_rn(scores[3], score_scale_log2_1, -row_shift[1]));
+            p_half0[3] = _exp2_40;
+            float _exp2_41 = approx_exp2(__fmaf_rn(scores[4], score_scale_log2_1, -row_shift[0]));
+            p_half0[4] = _exp2_41;
+            float _exp2_42 = approx_exp2(__fmaf_rn(scores[6], score_scale_log2_1, -row_shift[1]));
+            p_half0[6] = _exp2_42;
+            float _exp2_43 = approx_exp2(__fmaf_rn(scores[5], score_scale_log2_1, -row_shift[0]));
+            p_half0[5] = _exp2_43;
+            float _exp2_44 = approx_exp2(__fmaf_rn(scores[7], score_scale_log2_1, -row_shift[1]));
+            p_half0[7] = _exp2_44;
+            float _exp2_45 = approx_exp2(__fmaf_rn(scores[8], score_scale_log2_1, -row_shift[0]));
+            p_half0[8] = _exp2_45;
+            float _exp2_46 = approx_exp2(__fmaf_rn(scores[10], score_scale_log2_1, -row_shift[1]));
+            p_half0[10] = _exp2_46;
+            float _exp2_47 = approx_exp2(__fmaf_rn(scores[9], score_scale_log2_1, -row_shift[0]));
+            p_half0[9] = _exp2_47;
+            float _exp2_48 = approx_exp2(__fmaf_rn(scores[11], score_scale_log2_1, -row_shift[1]));
+            p_half0[11] = _exp2_48;
+            float _exp2_49 = approx_exp2(__fmaf_rn(scores[12], score_scale_log2_1, -row_shift[0]));
+            p_half0[12] = _exp2_49;
+            float _exp2_50 = approx_exp2(__fmaf_rn(scores[14], score_scale_log2_1, -row_shift[1]));
+            p_half0[14] = _exp2_50;
+            float _exp2_51 = approx_exp2(__fmaf_rn(scores[13], score_scale_log2_1, -row_shift[0]));
+            p_half0[13] = _exp2_51;
+            float _exp2_52 = approx_exp2(__fmaf_rn(scores[15], score_scale_log2_1, -row_shift[1]));
+            p_half0[15] = _exp2_52;
+#else
+            float _exp2_36 = approx_exp2(__fmaf_rn(scores[0], score_scale_log2_1, -row_shift[0]));
+            p_half0[0] = _exp2_36;
+            float _exp2_37 = approx_exp2(__fmaf_rn(scores[2], score_scale_log2_1, -row_shift[1]));
+            p_half0[2] = _exp2_37;
+            float _exp2_38 = approx_exp2(__fmaf_rn(scores[1], score_scale_log2_1, -row_shift[0]));
+            p_half0[1] = _exp2_38;
+            float _exp2_39 = approx_exp2(__fmaf_rn(scores[3], score_scale_log2_1, -row_shift[1]));
+            p_half0[3] = _exp2_39;
+            float _exp2_40 = approx_exp2(__fmaf_rn(scores[4], score_scale_log2_1, -row_shift[0]));
+            p_half0[4] = _exp2_40;
+            float _exp2_41 = approx_exp2(__fmaf_rn(scores[6], score_scale_log2_1, -row_shift[1]));
+            p_half0[6] = _exp2_41;
+            float _exp2_42 = approx_exp2(__fmaf_rn(scores[5], score_scale_log2_1, -row_shift[0]));
+            p_half0[5] = _exp2_42;
+            float _exp2_43 = approx_exp2(__fmaf_rn(scores[7], score_scale_log2_1, -row_shift[1]));
+            p_half0[7] = _exp2_43;
+            float _exp2_44 = approx_exp2(__fmaf_rn(scores[8], score_scale_log2_1, -row_shift[0]));
+            p_half0[8] = _exp2_44;
+            float _exp2_45 = approx_exp2(__fmaf_rn(scores[10], score_scale_log2_1, -row_shift[1]));
+            p_half0[10] = _exp2_45;
+            float _exp2_46 = approx_exp2(__fmaf_rn(scores[9], score_scale_log2_1, -row_shift[0]));
+            p_half0[9] = _exp2_46;
+            float _exp2_47 = approx_exp2(__fmaf_rn(scores[11], score_scale_log2_1, -row_shift[1]));
+            p_half0[11] = _exp2_47;
+            float _exp2_48 = approx_exp2(__fmaf_rn(scores[12], score_scale_log2_1, -row_shift[0]));
+            p_half0[12] = _exp2_48;
+            float _exp2_49 = approx_exp2(__fmaf_rn(scores[14], score_scale_log2_1, -row_shift[1]));
+            p_half0[14] = _exp2_49;
+            float _exp2_50 = approx_exp2(__fmaf_rn(scores[13], score_scale_log2_1, -row_shift[0]));
+            p_half0[13] = _exp2_50;
+            float _exp2_51 = approx_exp2(__fmaf_rn(scores[15], score_scale_log2_1, -row_shift[1]));
+            p_half0[15] = _exp2_51;
+#endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        }
+        local_sum[0] = p_half0[0];
+        local_sum[1] = p_half0[2];
+        local_sum[0] = local_sum[0] + p_half0[1];
+        local_sum[1] = local_sum[1] + p_half0[3];
+        local_sum[0] = local_sum[0] + p_half0[4];
+        local_sum[1] = local_sum[1] + p_half0[6];
+        local_sum[0] = local_sum[0] + p_half0[5];
+        local_sum[1] = local_sum[1] + p_half0[7];
+        local_sum[0] = local_sum[0] + p_half0[8];
+        local_sum[1] = local_sum[1] + p_half0[10];
+        local_sum[0] = local_sum[0] + p_half0[9];
+        local_sum[1] = local_sum[1] + p_half0[11];
+        local_sum[0] = local_sum[0] + p_half0[12];
+        local_sum[1] = local_sum[1] + p_half0[14];
+        local_sum[0] = local_sum[0] + p_half0[13];
+        local_sum[1] = local_sum[1] + p_half0[15];
+        pack_values[0] = p_half0[0];
+        pack_values[1] = p_half0[1];
+        pack_values[2] = p_half0[4];
+        pack_values[3] = p_half0[5];
+        {
+            uint32_t _packed;
+            asm volatile("{\n\t"
+                ".reg .b16 _lo;\n\t"
+                ".reg .b16 _hi;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                "mov.b32 %0, {_lo, _hi};\n\t"
+                "}"
+                : "=r"(_packed) : "f"(pack_values[0]), "f"(pack_values[1]),
+                                   "f"(pack_values[2]), "f"(pack_values[3]));
+            probabilities[0] = _packed;
+        }
+        pack_values[0] = p_half0[2];
+        pack_values[1] = p_half0[3];
+        pack_values[2] = p_half0[6];
+        pack_values[3] = p_half0[7];
+        {
+            uint32_t _packed;
+            asm volatile("{\n\t"
+                ".reg .b16 _lo;\n\t"
+                ".reg .b16 _hi;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                "mov.b32 %0, {_lo, _hi};\n\t"
+                "}"
+                : "=r"(_packed) : "f"(pack_values[0]), "f"(pack_values[1]),
+                                   "f"(pack_values[2]), "f"(pack_values[3]));
+            probabilities[1] = _packed;
+        }
+        pack_values[0] = p_half0[8];
+        pack_values[1] = p_half0[9];
+        pack_values[2] = p_half0[12];
+        pack_values[3] = p_half0[13];
+        {
+            uint32_t _packed;
+            asm volatile("{\n\t"
+                ".reg .b16 _lo;\n\t"
+                ".reg .b16 _hi;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                "mov.b32 %0, {_lo, _hi};\n\t"
+                "}"
+                : "=r"(_packed) : "f"(pack_values[0]), "f"(pack_values[1]),
+                                   "f"(pack_values[2]), "f"(pack_values[3]));
+            probabilities[2] = _packed;
+        }
+        pack_values[0] = p_half0[10];
+        pack_values[1] = p_half0[11];
+        pack_values[2] = p_half0[14];
+        pack_values[3] = p_half0[15];
+        {
+            uint32_t _packed;
+            asm volatile("{\n\t"
+                ".reg .b16 _lo;\n\t"
+                ".reg .b16 _hi;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                "mov.b32 %0, {_lo, _hi};\n\t"
+                "}"
+                : "=r"(_packed) : "f"(pack_values[0]), "f"(pack_values[1]),
+                                   "f"(pack_values[2]), "f"(pack_values[3]));
+            probabilities[3] = _packed;
+        }
+        mbarrier_wait(v_full_addr, _phase_v_full_0);
+        _phase_v_full_0 ^= 1;
+        unsigned int v_row_base_1 = lane % 8 + lane / 16 * 8;
+        unsigned int v_col_base_1 = lane / 8 % 2;
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
+            : "r"(v_smem_addr + (v_row_base_1 * 4 + (unsigned int)((v_col_base_1 * 16 ^ (v_row_base_1 >> 1 & 3) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[0]), "+f"(output[1]), "+f"(output[2]), "+f"(output[3])
+            : "r"(probabilities[0]), "r"(probabilities[1]), "r"(probabilities[2]), "r"(probabilities[3]), "r"(v_frag[0]), "r"(v_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[4]), "+f"(output[(4) + 1]), "+f"(output[(4) + 2]), "+f"(output[(4) + 3])
+            : "r"(probabilities[0]), "r"(probabilities[1]), "r"(probabilities[2]), "r"(probabilities[3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
+            : "r"(v_smem_addr + ((v_row_base_1 + 16) * 4 + (unsigned int)((v_col_base_1 * 16 ^ (v_row_base_1 + 16 >> 1 & 3) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[8]), "+f"(output[(8) + 1]), "+f"(output[(8) + 2]), "+f"(output[(8) + 3])
+            : "r"(probabilities[0]), "r"(probabilities[1]), "r"(probabilities[2]), "r"(probabilities[3]), "r"(v_frag[0]), "r"(v_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[12]), "+f"(output[(12) + 1]), "+f"(output[(12) + 2]), "+f"(output[(12) + 3])
+            : "r"(probabilities[0]), "r"(probabilities[1]), "r"(probabilities[2]), "r"(probabilities[3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
+            : "r"(v_smem_addr + ((v_row_base_1 + 32) * 4 + (unsigned int)((v_col_base_1 * 16 ^ (v_row_base_1 + 32 >> 1 & 3) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[16]), "+f"(output[(16) + 1]), "+f"(output[(16) + 2]), "+f"(output[(16) + 3])
+            : "r"(probabilities[0]), "r"(probabilities[1]), "r"(probabilities[2]), "r"(probabilities[3]), "r"(v_frag[0]), "r"(v_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[20]), "+f"(output[(20) + 1]), "+f"(output[(20) + 2]), "+f"(output[(20) + 3])
+            : "r"(probabilities[0]), "r"(probabilities[1]), "r"(probabilities[2]), "r"(probabilities[3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
+            : "r"(v_smem_addr + ((v_row_base_1 + 48) * 4 + (unsigned int)((v_col_base_1 * 16 ^ (v_row_base_1 + 48 >> 1 & 3) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[24]), "+f"(output[(24) + 1]), "+f"(output[(24) + 2]), "+f"(output[(24) + 3])
+            : "r"(probabilities[0]), "r"(probabilities[1]), "r"(probabilities[2]), "r"(probabilities[3]), "r"(v_frag[0]), "r"(v_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[28]), "+f"(output[(28) + 1]), "+f"(output[(28) + 2]), "+f"(output[(28) + 3])
+            : "r"(probabilities[0]), "r"(probabilities[1]), "r"(probabilities[2]), "r"(probabilities[3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
+            : "r"(v_smem_addr + ((v_row_base_1 + 64) * 4 + (unsigned int)((v_col_base_1 * 16 ^ (v_row_base_1 + 64 >> 1 & 3) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[32]), "+f"(output[(32) + 1]), "+f"(output[(32) + 2]), "+f"(output[(32) + 3])
+            : "r"(probabilities[0]), "r"(probabilities[1]), "r"(probabilities[2]), "r"(probabilities[3]), "r"(v_frag[0]), "r"(v_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[36]), "+f"(output[(36) + 1]), "+f"(output[(36) + 2]), "+f"(output[(36) + 3])
+            : "r"(probabilities[0]), "r"(probabilities[1]), "r"(probabilities[2]), "r"(probabilities[3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
+            : "r"(v_smem_addr + ((v_row_base_1 + 80) * 4 + (unsigned int)((v_col_base_1 * 16 ^ (v_row_base_1 + 80 >> 1 & 3) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[40]), "+f"(output[(40) + 1]), "+f"(output[(40) + 2]), "+f"(output[(40) + 3])
+            : "r"(probabilities[0]), "r"(probabilities[1]), "r"(probabilities[2]), "r"(probabilities[3]), "r"(v_frag[0]), "r"(v_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[44]), "+f"(output[(44) + 1]), "+f"(output[(44) + 2]), "+f"(output[(44) + 3])
+            : "r"(probabilities[0]), "r"(probabilities[1]), "r"(probabilities[2]), "r"(probabilities[3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
+            : "r"(v_smem_addr + ((v_row_base_1 + 96) * 4 + (unsigned int)((v_col_base_1 * 16 ^ (v_row_base_1 + 96 >> 1 & 3) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[48]), "+f"(output[(48) + 1]), "+f"(output[(48) + 2]), "+f"(output[(48) + 3])
+            : "r"(probabilities[0]), "r"(probabilities[1]), "r"(probabilities[2]), "r"(probabilities[3]), "r"(v_frag[0]), "r"(v_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[52]), "+f"(output[(52) + 1]), "+f"(output[(52) + 2]), "+f"(output[(52) + 3])
+            : "r"(probabilities[0]), "r"(probabilities[1]), "r"(probabilities[2]), "r"(probabilities[3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
+            : "r"(v_smem_addr + ((v_row_base_1 + 112) * 4 + (unsigned int)((v_col_base_1 * 16 ^ (v_row_base_1 + 112 >> 1 & 3) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[56]), "+f"(output[(56) + 1]), "+f"(output[(56) + 2]), "+f"(output[(56) + 3])
+            : "r"(probabilities[0]), "r"(probabilities[1]), "r"(probabilities[2]), "r"(probabilities[3]), "r"(v_frag[0]), "r"(v_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[60]), "+f"(output[(60) + 1]), "+f"(output[(60) + 2]), "+f"(output[(60) + 3])
+            : "r"(probabilities[0]), "r"(probabilities[1]), "r"(probabilities[2]), "r"(probabilities[3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
+        float value0_1 = approx_exp2(__fmaf_rn(scores[16], score_scale_log2_1, -row_shift[0]));
+        scores[16] = value0_1;
+        local_sum[0] = local_sum[0] + value0_1;
+        float value1_1 = approx_exp2(__fmaf_rn(scores[18], score_scale_log2_1, -row_shift[1]));
+        scores[18] = value1_1;
+        local_sum[1] = local_sum[1] + value1_1;
+        float value0_16_1 = approx_exp2(__fmaf_rn(scores[17], score_scale_log2_1, -row_shift[0]));
+        scores[17] = value0_16_1;
+        local_sum[0] = local_sum[0] + value0_16_1;
+        float value1_17_1 = approx_exp2(__fmaf_rn(scores[19], score_scale_log2_1, -row_shift[1]));
+        scores[19] = value1_17_1;
+        local_sum[1] = local_sum[1] + value1_17_1;
+        float value0_18_1 = approx_exp2(__fmaf_rn(scores[20], score_scale_log2_1, -row_shift[0]));
+        scores[20] = value0_18_1;
+        local_sum[0] = local_sum[0] + value0_18_1;
+        float value1_19_1 = approx_exp2(__fmaf_rn(scores[22], score_scale_log2_1, -row_shift[1]));
+        scores[22] = value1_19_1;
+        local_sum[1] = local_sum[1] + value1_19_1;
+        float value0_20_1 = approx_exp2(__fmaf_rn(scores[21], score_scale_log2_1, -row_shift[0]));
+        scores[21] = value0_20_1;
+        local_sum[0] = local_sum[0] + value0_20_1;
+        float value1_21_1 = approx_exp2(__fmaf_rn(scores[23], score_scale_log2_1, -row_shift[1]));
+        scores[23] = value1_21_1;
+        local_sum[1] = local_sum[1] + value1_21_1;
+        float value0_22_1 = approx_exp2(__fmaf_rn(scores[24], score_scale_log2_1, -row_shift[0]));
+        scores[24] = value0_22_1;
+        local_sum[0] = local_sum[0] + value0_22_1;
+        float value1_23_1 = approx_exp2(__fmaf_rn(scores[26], score_scale_log2_1, -row_shift[1]));
+        scores[26] = value1_23_1;
+        local_sum[1] = local_sum[1] + value1_23_1;
+        float value0_24_1 = approx_exp2(__fmaf_rn(scores[25], score_scale_log2_1, -row_shift[0]));
+        scores[25] = value0_24_1;
+        local_sum[0] = local_sum[0] + value0_24_1;
+        float value1_25_1 = approx_exp2(__fmaf_rn(scores[27], score_scale_log2_1, -row_shift[1]));
+        scores[27] = value1_25_1;
+        local_sum[1] = local_sum[1] + value1_25_1;
+        float value0_26_1 = approx_exp2(__fmaf_rn(scores[28], score_scale_log2_1, -row_shift[0]));
+        scores[28] = value0_26_1;
+        local_sum[0] = local_sum[0] + value0_26_1;
+        float value1_27_1 = approx_exp2(__fmaf_rn(scores[30], score_scale_log2_1, -row_shift[1]));
+        scores[30] = value1_27_1;
+        local_sum[1] = local_sum[1] + value1_27_1;
+        float value0_28_1 = approx_exp2(__fmaf_rn(scores[29], score_scale_log2_1, -row_shift[0]));
+        scores[29] = value0_28_1;
+        local_sum[0] = local_sum[0] + value0_28_1;
+        float value1_29_1 = approx_exp2(__fmaf_rn(scores[31], score_scale_log2_1, -row_shift[1]));
+        scores[31] = value1_29_1;
+        local_sum[1] = local_sum[1] + value1_29_1;
+#if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        float _shfl_xor_sync_55 = __shfl_xor_sync(0xFFFFFFFF, local_sum[0], 1);
+        local_sum[0] = local_sum[0] + _shfl_xor_sync_55;
+        float _shfl_xor_sync_56 = __shfl_xor_sync(0xFFFFFFFF, local_sum[0], 2);
+        local_sum[0] = local_sum[0] + _shfl_xor_sync_56;
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        float _shfl_xor_sync_54 = __shfl_xor_sync(0xFFFFFFFF, local_sum[0], 1);
+        local_sum[0] = local_sum[0] + _shfl_xor_sync_54;
+        float _shfl_xor_sync_55 = __shfl_xor_sync(0xFFFFFFFF, local_sum[0], 2);
+        local_sum[0] = local_sum[0] + _shfl_xor_sync_55;
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        float _shfl_xor_sync_53 = __shfl_xor_sync(0xFFFFFFFF, local_sum[0], 1);
+        local_sum[0] = local_sum[0] + _shfl_xor_sync_53;
+        float _shfl_xor_sync_54 = __shfl_xor_sync(0xFFFFFFFF, local_sum[0], 2);
+        local_sum[0] = local_sum[0] + _shfl_xor_sync_54;
+#else
+        float _shfl_xor_sync_52 = __shfl_xor_sync(0xFFFFFFFF, local_sum[0], 1);
+        local_sum[0] = local_sum[0] + _shfl_xor_sync_52;
+        float _shfl_xor_sync_53 = __shfl_xor_sync(0xFFFFFFFF, local_sum[0], 2);
+        local_sum[0] = local_sum[0] + _shfl_xor_sync_53;
+#endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        row_sum[0] = __fmaf_rn(row_sum[0], row_scale[0], local_sum[0]);
+#if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        float _shfl_xor_sync_57 = __shfl_xor_sync(0xFFFFFFFF, local_sum[1], 1);
+        local_sum[1] = local_sum[1] + _shfl_xor_sync_57;
+        float _shfl_xor_sync_58 = __shfl_xor_sync(0xFFFFFFFF, local_sum[1], 2);
+        local_sum[1] = local_sum[1] + _shfl_xor_sync_58;
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        float _shfl_xor_sync_56 = __shfl_xor_sync(0xFFFFFFFF, local_sum[1], 1);
+        local_sum[1] = local_sum[1] + _shfl_xor_sync_56;
+        float _shfl_xor_sync_57 = __shfl_xor_sync(0xFFFFFFFF, local_sum[1], 2);
+        local_sum[1] = local_sum[1] + _shfl_xor_sync_57;
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        float _shfl_xor_sync_55 = __shfl_xor_sync(0xFFFFFFFF, local_sum[1], 1);
+        local_sum[1] = local_sum[1] + _shfl_xor_sync_55;
+        float _shfl_xor_sync_56 = __shfl_xor_sync(0xFFFFFFFF, local_sum[1], 2);
+        local_sum[1] = local_sum[1] + _shfl_xor_sync_56;
+#else
+        float _shfl_xor_sync_54 = __shfl_xor_sync(0xFFFFFFFF, local_sum[1], 1);
+        local_sum[1] = local_sum[1] + _shfl_xor_sync_54;
+        float _shfl_xor_sync_55 = __shfl_xor_sync(0xFFFFFFFF, local_sum[1], 2);
+        local_sum[1] = local_sum[1] + _shfl_xor_sync_55;
+#endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        row_sum[1] = __fmaf_rn(row_sum[1], row_scale[1], local_sum[1]);
+        pack_values[0] = scores[16];
+        pack_values[1] = scores[17];
+        pack_values[2] = scores[20];
+        pack_values[3] = scores[21];
+        {
+            uint32_t _packed;
+            asm volatile("{\n\t"
+                ".reg .b16 _lo;\n\t"
+                ".reg .b16 _hi;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                "mov.b32 %0, {_lo, _hi};\n\t"
+                "}"
+                : "=r"(_packed) : "f"(pack_values[0]), "f"(pack_values[1]),
+                                   "f"(pack_values[2]), "f"(pack_values[3]));
+            probabilities[4] = _packed;
+        }
+        pack_values[0] = scores[18];
+        pack_values[1] = scores[19];
+        pack_values[2] = scores[22];
+        pack_values[3] = scores[23];
+        {
+            uint32_t _packed;
+            asm volatile("{\n\t"
+                ".reg .b16 _lo;\n\t"
+                ".reg .b16 _hi;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                "mov.b32 %0, {_lo, _hi};\n\t"
+                "}"
+                : "=r"(_packed) : "f"(pack_values[0]), "f"(pack_values[1]),
+                                   "f"(pack_values[2]), "f"(pack_values[3]));
+            probabilities[5] = _packed;
+        }
+        pack_values[0] = scores[24];
+        pack_values[1] = scores[25];
+        pack_values[2] = scores[28];
+        pack_values[3] = scores[29];
+        {
+            uint32_t _packed;
+            asm volatile("{\n\t"
+                ".reg .b16 _lo;\n\t"
+                ".reg .b16 _hi;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                "mov.b32 %0, {_lo, _hi};\n\t"
+                "}"
+                : "=r"(_packed) : "f"(pack_values[0]), "f"(pack_values[1]),
+                                   "f"(pack_values[2]), "f"(pack_values[3]));
+            probabilities[6] = _packed;
+        }
+        pack_values[0] = scores[26];
+        pack_values[1] = scores[27];
+        pack_values[2] = scores[30];
+        pack_values[3] = scores[31];
+        {
+            uint32_t _packed;
+            asm volatile("{\n\t"
+                ".reg .b16 _lo;\n\t"
+                ".reg .b16 _hi;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                "mov.b32 %0, {_lo, _hi};\n\t"
+                "}"
+                : "=r"(_packed) : "f"(pack_values[0]), "f"(pack_values[1]),
+                                   "f"(pack_values[2]), "f"(pack_values[3]));
+            probabilities[7] = _packed;
+        }
+        unsigned int v_row_base_30 = lane % 8 + lane / 16 * 8;
+        unsigned int v_col_base_31 = lane / 8 % 2;
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
+            : "r"(v_smem_addr + (v_row_base_30 * 4 + (unsigned int)(((v_col_base_31 + 2) * 16 ^ (v_row_base_30 >> 1 & 3) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[0]), "+f"(output[1]), "+f"(output[2]), "+f"(output[3])
+            : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[0]), "r"(v_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[4]), "+f"(output[(4) + 1]), "+f"(output[(4) + 2]), "+f"(output[(4) + 3])
+            : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
+            : "r"(v_smem_addr + ((v_row_base_30 + 16) * 4 + (unsigned int)(((v_col_base_31 + 2) * 16 ^ (v_row_base_30 + 16 >> 1 & 3) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[8]), "+f"(output[(8) + 1]), "+f"(output[(8) + 2]), "+f"(output[(8) + 3])
+            : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[0]), "r"(v_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[12]), "+f"(output[(12) + 1]), "+f"(output[(12) + 2]), "+f"(output[(12) + 3])
+            : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
+            : "r"(v_smem_addr + ((v_row_base_30 + 32) * 4 + (unsigned int)(((v_col_base_31 + 2) * 16 ^ (v_row_base_30 + 32 >> 1 & 3) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[16]), "+f"(output[(16) + 1]), "+f"(output[(16) + 2]), "+f"(output[(16) + 3])
+            : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[0]), "r"(v_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[20]), "+f"(output[(20) + 1]), "+f"(output[(20) + 2]), "+f"(output[(20) + 3])
+            : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
+            : "r"(v_smem_addr + ((v_row_base_30 + 48) * 4 + (unsigned int)(((v_col_base_31 + 2) * 16 ^ (v_row_base_30 + 48 >> 1 & 3) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[24]), "+f"(output[(24) + 1]), "+f"(output[(24) + 2]), "+f"(output[(24) + 3])
+            : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[0]), "r"(v_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[28]), "+f"(output[(28) + 1]), "+f"(output[(28) + 2]), "+f"(output[(28) + 3])
+            : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
+            : "r"(v_smem_addr + ((v_row_base_30 + 64) * 4 + (unsigned int)(((v_col_base_31 + 2) * 16 ^ (v_row_base_30 + 64 >> 1 & 3) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[32]), "+f"(output[(32) + 1]), "+f"(output[(32) + 2]), "+f"(output[(32) + 3])
+            : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[0]), "r"(v_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[36]), "+f"(output[(36) + 1]), "+f"(output[(36) + 2]), "+f"(output[(36) + 3])
+            : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
+            : "r"(v_smem_addr + ((v_row_base_30 + 80) * 4 + (unsigned int)(((v_col_base_31 + 2) * 16 ^ (v_row_base_30 + 80 >> 1 & 3) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[40]), "+f"(output[(40) + 1]), "+f"(output[(40) + 2]), "+f"(output[(40) + 3])
+            : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[0]), "r"(v_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[44]), "+f"(output[(44) + 1]), "+f"(output[(44) + 2]), "+f"(output[(44) + 3])
+            : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
+            : "r"(v_smem_addr + ((v_row_base_30 + 96) * 4 + (unsigned int)(((v_col_base_31 + 2) * 16 ^ (v_row_base_30 + 96 >> 1 & 3) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[48]), "+f"(output[(48) + 1]), "+f"(output[(48) + 2]), "+f"(output[(48) + 3])
+            : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[0]), "r"(v_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[52]), "+f"(output[(52) + 1]), "+f"(output[(52) + 2]), "+f"(output[(52) + 3])
+            : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
+            : "r"(v_smem_addr + ((v_row_base_30 + 112) * 4 + (unsigned int)(((v_col_base_31 + 2) * 16 ^ (v_row_base_30 + 112 >> 1 & 3) << 4) / 16)) * 16)
+            : "memory");
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[56]), "+f"(output[(56) + 1]), "+f"(output[(56) + 2]), "+f"(output[(56) + 3])
+            : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[0]), "r"(v_frag[1]));
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(output[60]), "+f"(output[(60) + 1]), "+f"(output[(60) + 2]), "+f"(output[(60) + 3])
+            : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
+        if (preload_count_1 < selected_count) {
+            __syncthreads();
+            if (warp == 0) {
+                if (elect_sync()) {
+                    mbarrier_arrive_expect_tx(v_full_addr, 8192);
+                    asm volatile(
+                        "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                        :: "r"(v_tma_smem_addr), "l"((&V_map)), "r"(next_physical_1 * 64), "r"(0), "r"(head), "r"(batch),
+                           "r"(v_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                }
+            }
+        }
+        current_physical = next_physical_1;
+    }
     __syncthreads();
     float reciprocal[2];
     float total = row_sum[0];
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-    float _rcp_14 = approx_rcp(((total != 0.0f && total == total) ? total : 1.0f));
-    reciprocal[0] = _rcp_14;
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-    float _rcp_13 = approx_rcp(((total != 0.0f && total == total) ? total : 1.0f));
-    reciprocal[0] = _rcp_13;
+    float _rcp_59 = approx_rcp(((total != 0.0f && total == total) ? total : 1.0f));
+    reciprocal[0] = _rcp_59;
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+    float _rcp_58 = approx_rcp(((total != 0.0f && total == total) ? total : 1.0f));
+    reciprocal[0] = _rcp_58;
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+    float _rcp_57 = approx_rcp(((total != 0.0f && total == total) ? total : 1.0f));
+    reciprocal[0] = _rcp_57;
 #else
-    float _rcp_12 = approx_rcp(((total != 0.0f && total == total) ? total : 1.0f));
-    reciprocal[0] = _rcp_12;
+    float _rcp_56 = approx_rcp(((total != 0.0f && total == total) ? total : 1.0f));
+    reciprocal[0] = _rcp_56;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     float total_0 = row_sum[1];
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-    float _rcp_15 = approx_rcp(((total_0 != 0.0f && total_0 == total_0) ? total_0 : 1.0f));
-    reciprocal[1] = _rcp_15;
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-    float _rcp_14 = approx_rcp(((total_0 != 0.0f && total_0 == total_0) ? total_0 : 1.0f));
-    reciprocal[1] = _rcp_14;
+    float _rcp_60 = approx_rcp(((total_0 != 0.0f && total_0 == total_0) ? total_0 : 1.0f));
+    reciprocal[1] = _rcp_60;
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+    float _rcp_59 = approx_rcp(((total_0 != 0.0f && total_0 == total_0) ? total_0 : 1.0f));
+    reciprocal[1] = _rcp_59;
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+    float _rcp_58 = approx_rcp(((total_0 != 0.0f && total_0 == total_0) ? total_0 : 1.0f));
+    reciprocal[1] = _rcp_58;
 #else
-    float _rcp_13 = approx_rcp(((total_0 != 0.0f && total_0 == total_0) ? total_0 : 1.0f));
-    reciprocal[1] = _rcp_13;
+    float _rcp_57 = approx_rcp(((total_0 != 0.0f && total_0 == total_0) ? total_0 : 1.0f));
+    reciprocal[1] = _rcp_57;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     unsigned int scale_base = v_scale_base + lane % 4 * 2;
     float _vec_load_0[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_16 = *reinterpret_cast<const float2*>(v_scale + scale_base);
-        _vec_load_0[0] = _v2_16.x;
-        _vec_load_0[0 + 1] = _v2_16.y;
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_15 = *reinterpret_cast<const float2*>(v_scale + scale_base);
-        _vec_load_0[0] = _v2_15.x;
-        _vec_load_0[0 + 1] = _v2_15.y;
+        float2 _v2_61 = *reinterpret_cast<const float2*>(v_scale + scale_base);
+        _vec_load_0[0] = _v2_61.x;
+        _vec_load_0[0 + 1] = _v2_61.y;
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        float2 _v2_60 = *reinterpret_cast<const float2*>(v_scale + scale_base);
+        _vec_load_0[0] = _v2_60.x;
+        _vec_load_0[0 + 1] = _v2_60.y;
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        float2 _v2_59 = *reinterpret_cast<const float2*>(v_scale + scale_base);
+        _vec_load_0[0] = _v2_59.x;
+        _vec_load_0[0 + 1] = _v2_59.y;
 #else
-        float2 _v2_14 = *reinterpret_cast<const float2*>(v_scale + scale_base);
-        _vec_load_0[0] = _v2_14.x;
-        _vec_load_0[0 + 1] = _v2_14.y;
+        float2 _v2_58 = *reinterpret_cast<const float2*>(v_scale + scale_base);
+        _vec_load_0[0] = _v2_58.x;
+        _vec_load_0[0 + 1] = _v2_58.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
     float _vec_load_1[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_17 = *reinterpret_cast<const float2*>(v_scale + scale_base + 8);
-        _vec_load_1[0] = _v2_17.x;
-        _vec_load_1[0 + 1] = _v2_17.y;
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_16 = *reinterpret_cast<const float2*>(v_scale + scale_base + 8);
-        _vec_load_1[0] = _v2_16.x;
-        _vec_load_1[0 + 1] = _v2_16.y;
+        float2 _v2_62 = *reinterpret_cast<const float2*>(v_scale + scale_base + 8);
+        _vec_load_1[0] = _v2_62.x;
+        _vec_load_1[0 + 1] = _v2_62.y;
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        float2 _v2_61 = *reinterpret_cast<const float2*>(v_scale + scale_base + 8);
+        _vec_load_1[0] = _v2_61.x;
+        _vec_load_1[0 + 1] = _v2_61.y;
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        float2 _v2_60 = *reinterpret_cast<const float2*>(v_scale + scale_base + 8);
+        _vec_load_1[0] = _v2_60.x;
+        _vec_load_1[0 + 1] = _v2_60.y;
 #else
-        float2 _v2_15 = *reinterpret_cast<const float2*>(v_scale + scale_base + 8);
-        _vec_load_1[0] = _v2_15.x;
-        _vec_load_1[0 + 1] = _v2_15.y;
+        float2 _v2_59 = *reinterpret_cast<const float2*>(v_scale + scale_base + 8);
+        _vec_load_1[0] = _v2_59.x;
+        _vec_load_1[0 + 1] = _v2_59.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
     float scale0 = _vec_load_0[0];
@@ -1573,52 +3057,64 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
         packed[_lp] = *(uint32_t*)&_bf2;
     }
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-    uint32_t _stmatrix_addr_18 = static_cast<uint32_t>(o_smem_addr + (unsigned int)((lane / 16 / 8 * 512 + (warp * 16 + lane % 16) * 8 + (lane / 16 % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-    uint32_t _stmatrix_addr_17 = static_cast<uint32_t>(o_smem_addr + (unsigned int)((lane / 16 / 8 * 512 + (warp * 16 + lane % 16) * 8 + (lane / 16 % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+    uint32_t _stmatrix_addr_63 = static_cast<uint32_t>(o_smem_addr + (unsigned int)((lane / 16 / 8 * 512 + (warp * 16 + lane % 16) * 8 + (lane / 16 % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+    uint32_t _stmatrix_addr_62 = static_cast<uint32_t>(o_smem_addr + (unsigned int)((lane / 16 / 8 * 512 + (warp * 16 + lane % 16) * 8 + (lane / 16 % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+    uint32_t _stmatrix_addr_61 = static_cast<uint32_t>(o_smem_addr + (unsigned int)((lane / 16 / 8 * 512 + (warp * 16 + lane % 16) * 8 + (lane / 16 % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
 #else
-    uint32_t _stmatrix_addr_16 = static_cast<uint32_t>(o_smem_addr + (unsigned int)((lane / 16 / 8 * 512 + (warp * 16 + lane % 16) * 8 + (lane / 16 % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+    uint32_t _stmatrix_addr_60 = static_cast<uint32_t>(o_smem_addr + (unsigned int)((lane / 16 / 8 * 512 + (warp * 16 + lane % 16) * 8 + (lane / 16 % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_18), "r"(*reinterpret_cast<const uint32_t*>(&packed[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed[3]))
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_17), "r"(*reinterpret_cast<const uint32_t*>(&packed[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed[3]))
+        :: "r"(_stmatrix_addr_63), "r"(*reinterpret_cast<const uint32_t*>(&packed[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed[3]))
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        :: "r"(_stmatrix_addr_62), "r"(*reinterpret_cast<const uint32_t*>(&packed[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed[3]))
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        :: "r"(_stmatrix_addr_61), "r"(*reinterpret_cast<const uint32_t*>(&packed[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed[3]))
 #else
-        :: "r"(_stmatrix_addr_16), "r"(*reinterpret_cast<const uint32_t*>(&packed[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed[3]))
+        :: "r"(_stmatrix_addr_60), "r"(*reinterpret_cast<const uint32_t*>(&packed[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed[3]))
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
         : "memory");
     unsigned int scale_base_1 = v_scale_base + 16 + lane % 4 * 2;
     float _vec_load_2[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_19 = *reinterpret_cast<const float2*>(v_scale + scale_base_1);
-        _vec_load_2[0] = _v2_19.x;
-        _vec_load_2[0 + 1] = _v2_19.y;
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_18 = *reinterpret_cast<const float2*>(v_scale + scale_base_1);
-        _vec_load_2[0] = _v2_18.x;
-        _vec_load_2[0 + 1] = _v2_18.y;
+        float2 _v2_64 = *reinterpret_cast<const float2*>(v_scale + scale_base_1);
+        _vec_load_2[0] = _v2_64.x;
+        _vec_load_2[0 + 1] = _v2_64.y;
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        float2 _v2_63 = *reinterpret_cast<const float2*>(v_scale + scale_base_1);
+        _vec_load_2[0] = _v2_63.x;
+        _vec_load_2[0 + 1] = _v2_63.y;
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        float2 _v2_62 = *reinterpret_cast<const float2*>(v_scale + scale_base_1);
+        _vec_load_2[0] = _v2_62.x;
+        _vec_load_2[0 + 1] = _v2_62.y;
 #else
-        float2 _v2_17 = *reinterpret_cast<const float2*>(v_scale + scale_base_1);
-        _vec_load_2[0] = _v2_17.x;
-        _vec_load_2[0 + 1] = _v2_17.y;
+        float2 _v2_61 = *reinterpret_cast<const float2*>(v_scale + scale_base_1);
+        _vec_load_2[0] = _v2_61.x;
+        _vec_load_2[0 + 1] = _v2_61.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
     float _vec_load_3[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_20 = *reinterpret_cast<const float2*>(v_scale + scale_base_1 + 8);
-        _vec_load_3[0] = _v2_20.x;
-        _vec_load_3[0 + 1] = _v2_20.y;
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_19 = *reinterpret_cast<const float2*>(v_scale + scale_base_1 + 8);
-        _vec_load_3[0] = _v2_19.x;
-        _vec_load_3[0 + 1] = _v2_19.y;
+        float2 _v2_65 = *reinterpret_cast<const float2*>(v_scale + scale_base_1 + 8);
+        _vec_load_3[0] = _v2_65.x;
+        _vec_load_3[0 + 1] = _v2_65.y;
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        float2 _v2_64 = *reinterpret_cast<const float2*>(v_scale + scale_base_1 + 8);
+        _vec_load_3[0] = _v2_64.x;
+        _vec_load_3[0 + 1] = _v2_64.y;
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        float2 _v2_63 = *reinterpret_cast<const float2*>(v_scale + scale_base_1 + 8);
+        _vec_load_3[0] = _v2_63.x;
+        _vec_load_3[0 + 1] = _v2_63.y;
 #else
-        float2 _v2_18 = *reinterpret_cast<const float2*>(v_scale + scale_base_1 + 8);
-        _vec_load_3[0] = _v2_18.x;
-        _vec_load_3[0 + 1] = _v2_18.y;
+        float2 _v2_62 = *reinterpret_cast<const float2*>(v_scale + scale_base_1 + 8);
+        _vec_load_3[0] = _v2_62.x;
+        _vec_load_3[0 + 1] = _v2_62.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
     float scale0_2 = _vec_load_2[0];
@@ -1640,52 +3136,64 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
         packed_6[_lp] = *(uint32_t*)&_bf2;
     }
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-    uint32_t _stmatrix_addr_21 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((2 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((2 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-    uint32_t _stmatrix_addr_20 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((2 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((2 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+    uint32_t _stmatrix_addr_66 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((2 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((2 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+    uint32_t _stmatrix_addr_65 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((2 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((2 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+    uint32_t _stmatrix_addr_64 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((2 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((2 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
 #else
-    uint32_t _stmatrix_addr_19 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((2 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((2 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+    uint32_t _stmatrix_addr_63 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((2 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((2 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_21), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[3]))
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_20), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[3]))
+        :: "r"(_stmatrix_addr_66), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[3]))
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        :: "r"(_stmatrix_addr_65), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[3]))
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        :: "r"(_stmatrix_addr_64), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[3]))
 #else
-        :: "r"(_stmatrix_addr_19), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[3]))
+        :: "r"(_stmatrix_addr_63), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[3]))
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
         : "memory");
     unsigned int scale_base_7 = v_scale_base + 32 + lane % 4 * 2;
     float _vec_load_4[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_22 = *reinterpret_cast<const float2*>(v_scale + scale_base_7);
-        _vec_load_4[0] = _v2_22.x;
-        _vec_load_4[0 + 1] = _v2_22.y;
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_21 = *reinterpret_cast<const float2*>(v_scale + scale_base_7);
-        _vec_load_4[0] = _v2_21.x;
-        _vec_load_4[0 + 1] = _v2_21.y;
+        float2 _v2_67 = *reinterpret_cast<const float2*>(v_scale + scale_base_7);
+        _vec_load_4[0] = _v2_67.x;
+        _vec_load_4[0 + 1] = _v2_67.y;
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        float2 _v2_66 = *reinterpret_cast<const float2*>(v_scale + scale_base_7);
+        _vec_load_4[0] = _v2_66.x;
+        _vec_load_4[0 + 1] = _v2_66.y;
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        float2 _v2_65 = *reinterpret_cast<const float2*>(v_scale + scale_base_7);
+        _vec_load_4[0] = _v2_65.x;
+        _vec_load_4[0 + 1] = _v2_65.y;
 #else
-        float2 _v2_20 = *reinterpret_cast<const float2*>(v_scale + scale_base_7);
-        _vec_load_4[0] = _v2_20.x;
-        _vec_load_4[0 + 1] = _v2_20.y;
+        float2 _v2_64 = *reinterpret_cast<const float2*>(v_scale + scale_base_7);
+        _vec_load_4[0] = _v2_64.x;
+        _vec_load_4[0 + 1] = _v2_64.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
     float _vec_load_5[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_23 = *reinterpret_cast<const float2*>(v_scale + scale_base_7 + 8);
-        _vec_load_5[0] = _v2_23.x;
-        _vec_load_5[0 + 1] = _v2_23.y;
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_22 = *reinterpret_cast<const float2*>(v_scale + scale_base_7 + 8);
-        _vec_load_5[0] = _v2_22.x;
-        _vec_load_5[0 + 1] = _v2_22.y;
+        float2 _v2_68 = *reinterpret_cast<const float2*>(v_scale + scale_base_7 + 8);
+        _vec_load_5[0] = _v2_68.x;
+        _vec_load_5[0 + 1] = _v2_68.y;
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        float2 _v2_67 = *reinterpret_cast<const float2*>(v_scale + scale_base_7 + 8);
+        _vec_load_5[0] = _v2_67.x;
+        _vec_load_5[0 + 1] = _v2_67.y;
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        float2 _v2_66 = *reinterpret_cast<const float2*>(v_scale + scale_base_7 + 8);
+        _vec_load_5[0] = _v2_66.x;
+        _vec_load_5[0 + 1] = _v2_66.y;
 #else
-        float2 _v2_21 = *reinterpret_cast<const float2*>(v_scale + scale_base_7 + 8);
-        _vec_load_5[0] = _v2_21.x;
-        _vec_load_5[0 + 1] = _v2_21.y;
+        float2 _v2_65 = *reinterpret_cast<const float2*>(v_scale + scale_base_7 + 8);
+        _vec_load_5[0] = _v2_65.x;
+        _vec_load_5[0 + 1] = _v2_65.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
     float scale0_8 = _vec_load_4[0];
@@ -1707,52 +3215,64 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
         packed_12[_lp] = *(uint32_t*)&_bf2;
     }
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-    uint32_t _stmatrix_addr_24 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((4 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((4 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-    uint32_t _stmatrix_addr_23 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((4 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((4 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+    uint32_t _stmatrix_addr_69 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((4 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((4 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+    uint32_t _stmatrix_addr_68 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((4 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((4 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+    uint32_t _stmatrix_addr_67 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((4 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((4 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
 #else
-    uint32_t _stmatrix_addr_22 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((4 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((4 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+    uint32_t _stmatrix_addr_66 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((4 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((4 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_24), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[3]))
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_23), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[3]))
+        :: "r"(_stmatrix_addr_69), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[3]))
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        :: "r"(_stmatrix_addr_68), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[3]))
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        :: "r"(_stmatrix_addr_67), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[3]))
 #else
-        :: "r"(_stmatrix_addr_22), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[3]))
+        :: "r"(_stmatrix_addr_66), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[3]))
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
         : "memory");
     unsigned int scale_base_13 = v_scale_base + 48 + lane % 4 * 2;
     float _vec_load_6[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_25 = *reinterpret_cast<const float2*>(v_scale + scale_base_13);
-        _vec_load_6[0] = _v2_25.x;
-        _vec_load_6[0 + 1] = _v2_25.y;
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_24 = *reinterpret_cast<const float2*>(v_scale + scale_base_13);
-        _vec_load_6[0] = _v2_24.x;
-        _vec_load_6[0 + 1] = _v2_24.y;
+        float2 _v2_70 = *reinterpret_cast<const float2*>(v_scale + scale_base_13);
+        _vec_load_6[0] = _v2_70.x;
+        _vec_load_6[0 + 1] = _v2_70.y;
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        float2 _v2_69 = *reinterpret_cast<const float2*>(v_scale + scale_base_13);
+        _vec_load_6[0] = _v2_69.x;
+        _vec_load_6[0 + 1] = _v2_69.y;
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        float2 _v2_68 = *reinterpret_cast<const float2*>(v_scale + scale_base_13);
+        _vec_load_6[0] = _v2_68.x;
+        _vec_load_6[0 + 1] = _v2_68.y;
 #else
-        float2 _v2_23 = *reinterpret_cast<const float2*>(v_scale + scale_base_13);
-        _vec_load_6[0] = _v2_23.x;
-        _vec_load_6[0 + 1] = _v2_23.y;
+        float2 _v2_67 = *reinterpret_cast<const float2*>(v_scale + scale_base_13);
+        _vec_load_6[0] = _v2_67.x;
+        _vec_load_6[0 + 1] = _v2_67.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
     float _vec_load_7[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_26 = *reinterpret_cast<const float2*>(v_scale + scale_base_13 + 8);
-        _vec_load_7[0] = _v2_26.x;
-        _vec_load_7[0 + 1] = _v2_26.y;
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_25 = *reinterpret_cast<const float2*>(v_scale + scale_base_13 + 8);
-        _vec_load_7[0] = _v2_25.x;
-        _vec_load_7[0 + 1] = _v2_25.y;
+        float2 _v2_71 = *reinterpret_cast<const float2*>(v_scale + scale_base_13 + 8);
+        _vec_load_7[0] = _v2_71.x;
+        _vec_load_7[0 + 1] = _v2_71.y;
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        float2 _v2_70 = *reinterpret_cast<const float2*>(v_scale + scale_base_13 + 8);
+        _vec_load_7[0] = _v2_70.x;
+        _vec_load_7[0 + 1] = _v2_70.y;
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        float2 _v2_69 = *reinterpret_cast<const float2*>(v_scale + scale_base_13 + 8);
+        _vec_load_7[0] = _v2_69.x;
+        _vec_load_7[0 + 1] = _v2_69.y;
 #else
-        float2 _v2_24 = *reinterpret_cast<const float2*>(v_scale + scale_base_13 + 8);
-        _vec_load_7[0] = _v2_24.x;
-        _vec_load_7[0 + 1] = _v2_24.y;
+        float2 _v2_68 = *reinterpret_cast<const float2*>(v_scale + scale_base_13 + 8);
+        _vec_load_7[0] = _v2_68.x;
+        _vec_load_7[0 + 1] = _v2_68.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
     float scale0_14 = _vec_load_6[0];
@@ -1774,52 +3294,64 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
         packed_18[_lp] = *(uint32_t*)&_bf2;
     }
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-    uint32_t _stmatrix_addr_27 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((6 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((6 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-    uint32_t _stmatrix_addr_26 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((6 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((6 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+    uint32_t _stmatrix_addr_72 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((6 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((6 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+    uint32_t _stmatrix_addr_71 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((6 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((6 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+    uint32_t _stmatrix_addr_70 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((6 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((6 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
 #else
-    uint32_t _stmatrix_addr_25 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((6 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((6 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+    uint32_t _stmatrix_addr_69 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((6 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((6 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_27), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[3]))
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_26), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[3]))
+        :: "r"(_stmatrix_addr_72), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[3]))
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        :: "r"(_stmatrix_addr_71), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[3]))
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        :: "r"(_stmatrix_addr_70), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[3]))
 #else
-        :: "r"(_stmatrix_addr_25), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[3]))
+        :: "r"(_stmatrix_addr_69), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[3]))
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
         : "memory");
     unsigned int scale_base_19 = v_scale_base + 64 + lane % 4 * 2;
     float _vec_load_8[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_28 = *reinterpret_cast<const float2*>(v_scale + scale_base_19);
-        _vec_load_8[0] = _v2_28.x;
-        _vec_load_8[0 + 1] = _v2_28.y;
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_27 = *reinterpret_cast<const float2*>(v_scale + scale_base_19);
-        _vec_load_8[0] = _v2_27.x;
-        _vec_load_8[0 + 1] = _v2_27.y;
+        float2 _v2_73 = *reinterpret_cast<const float2*>(v_scale + scale_base_19);
+        _vec_load_8[0] = _v2_73.x;
+        _vec_load_8[0 + 1] = _v2_73.y;
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        float2 _v2_72 = *reinterpret_cast<const float2*>(v_scale + scale_base_19);
+        _vec_load_8[0] = _v2_72.x;
+        _vec_load_8[0 + 1] = _v2_72.y;
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        float2 _v2_71 = *reinterpret_cast<const float2*>(v_scale + scale_base_19);
+        _vec_load_8[0] = _v2_71.x;
+        _vec_load_8[0 + 1] = _v2_71.y;
 #else
-        float2 _v2_26 = *reinterpret_cast<const float2*>(v_scale + scale_base_19);
-        _vec_load_8[0] = _v2_26.x;
-        _vec_load_8[0 + 1] = _v2_26.y;
+        float2 _v2_70 = *reinterpret_cast<const float2*>(v_scale + scale_base_19);
+        _vec_load_8[0] = _v2_70.x;
+        _vec_load_8[0 + 1] = _v2_70.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
     float _vec_load_9[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_29 = *reinterpret_cast<const float2*>(v_scale + scale_base_19 + 8);
-        _vec_load_9[0] = _v2_29.x;
-        _vec_load_9[0 + 1] = _v2_29.y;
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_28 = *reinterpret_cast<const float2*>(v_scale + scale_base_19 + 8);
-        _vec_load_9[0] = _v2_28.x;
-        _vec_load_9[0 + 1] = _v2_28.y;
+        float2 _v2_74 = *reinterpret_cast<const float2*>(v_scale + scale_base_19 + 8);
+        _vec_load_9[0] = _v2_74.x;
+        _vec_load_9[0 + 1] = _v2_74.y;
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        float2 _v2_73 = *reinterpret_cast<const float2*>(v_scale + scale_base_19 + 8);
+        _vec_load_9[0] = _v2_73.x;
+        _vec_load_9[0 + 1] = _v2_73.y;
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        float2 _v2_72 = *reinterpret_cast<const float2*>(v_scale + scale_base_19 + 8);
+        _vec_load_9[0] = _v2_72.x;
+        _vec_load_9[0 + 1] = _v2_72.y;
 #else
-        float2 _v2_27 = *reinterpret_cast<const float2*>(v_scale + scale_base_19 + 8);
-        _vec_load_9[0] = _v2_27.x;
-        _vec_load_9[0 + 1] = _v2_27.y;
+        float2 _v2_71 = *reinterpret_cast<const float2*>(v_scale + scale_base_19 + 8);
+        _vec_load_9[0] = _v2_71.x;
+        _vec_load_9[0 + 1] = _v2_71.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
     float scale0_20 = _vec_load_8[0];
@@ -1841,52 +3373,64 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
         packed_24[_lp] = *(uint32_t*)&_bf2;
     }
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-    uint32_t _stmatrix_addr_30 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((8 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((8 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-    uint32_t _stmatrix_addr_29 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((8 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((8 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+    uint32_t _stmatrix_addr_75 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((8 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((8 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+    uint32_t _stmatrix_addr_74 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((8 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((8 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+    uint32_t _stmatrix_addr_73 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((8 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((8 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
 #else
-    uint32_t _stmatrix_addr_28 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((8 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((8 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+    uint32_t _stmatrix_addr_72 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((8 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((8 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_30), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[3]))
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_29), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[3]))
+        :: "r"(_stmatrix_addr_75), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[3]))
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        :: "r"(_stmatrix_addr_74), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[3]))
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        :: "r"(_stmatrix_addr_73), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[3]))
 #else
-        :: "r"(_stmatrix_addr_28), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[3]))
+        :: "r"(_stmatrix_addr_72), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[3]))
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
         : "memory");
     unsigned int scale_base_25 = v_scale_base + 80 + lane % 4 * 2;
     float _vec_load_10[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_31 = *reinterpret_cast<const float2*>(v_scale + scale_base_25);
-        _vec_load_10[0] = _v2_31.x;
-        _vec_load_10[0 + 1] = _v2_31.y;
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_30 = *reinterpret_cast<const float2*>(v_scale + scale_base_25);
-        _vec_load_10[0] = _v2_30.x;
-        _vec_load_10[0 + 1] = _v2_30.y;
+        float2 _v2_76 = *reinterpret_cast<const float2*>(v_scale + scale_base_25);
+        _vec_load_10[0] = _v2_76.x;
+        _vec_load_10[0 + 1] = _v2_76.y;
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        float2 _v2_75 = *reinterpret_cast<const float2*>(v_scale + scale_base_25);
+        _vec_load_10[0] = _v2_75.x;
+        _vec_load_10[0 + 1] = _v2_75.y;
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        float2 _v2_74 = *reinterpret_cast<const float2*>(v_scale + scale_base_25);
+        _vec_load_10[0] = _v2_74.x;
+        _vec_load_10[0 + 1] = _v2_74.y;
 #else
-        float2 _v2_29 = *reinterpret_cast<const float2*>(v_scale + scale_base_25);
-        _vec_load_10[0] = _v2_29.x;
-        _vec_load_10[0 + 1] = _v2_29.y;
+        float2 _v2_73 = *reinterpret_cast<const float2*>(v_scale + scale_base_25);
+        _vec_load_10[0] = _v2_73.x;
+        _vec_load_10[0 + 1] = _v2_73.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
     float _vec_load_11[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_32 = *reinterpret_cast<const float2*>(v_scale + scale_base_25 + 8);
-        _vec_load_11[0] = _v2_32.x;
-        _vec_load_11[0 + 1] = _v2_32.y;
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_31 = *reinterpret_cast<const float2*>(v_scale + scale_base_25 + 8);
-        _vec_load_11[0] = _v2_31.x;
-        _vec_load_11[0 + 1] = _v2_31.y;
+        float2 _v2_77 = *reinterpret_cast<const float2*>(v_scale + scale_base_25 + 8);
+        _vec_load_11[0] = _v2_77.x;
+        _vec_load_11[0 + 1] = _v2_77.y;
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        float2 _v2_76 = *reinterpret_cast<const float2*>(v_scale + scale_base_25 + 8);
+        _vec_load_11[0] = _v2_76.x;
+        _vec_load_11[0 + 1] = _v2_76.y;
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        float2 _v2_75 = *reinterpret_cast<const float2*>(v_scale + scale_base_25 + 8);
+        _vec_load_11[0] = _v2_75.x;
+        _vec_load_11[0 + 1] = _v2_75.y;
 #else
-        float2 _v2_30 = *reinterpret_cast<const float2*>(v_scale + scale_base_25 + 8);
-        _vec_load_11[0] = _v2_30.x;
-        _vec_load_11[0 + 1] = _v2_30.y;
+        float2 _v2_74 = *reinterpret_cast<const float2*>(v_scale + scale_base_25 + 8);
+        _vec_load_11[0] = _v2_74.x;
+        _vec_load_11[0 + 1] = _v2_74.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
     float scale0_26 = _vec_load_10[0];
@@ -1908,52 +3452,64 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
         packed_30[_lp] = *(uint32_t*)&_bf2;
     }
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-    uint32_t _stmatrix_addr_33 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((10 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((10 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-    uint32_t _stmatrix_addr_32 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((10 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((10 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+    uint32_t _stmatrix_addr_78 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((10 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((10 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+    uint32_t _stmatrix_addr_77 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((10 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((10 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+    uint32_t _stmatrix_addr_76 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((10 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((10 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
 #else
-    uint32_t _stmatrix_addr_31 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((10 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((10 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+    uint32_t _stmatrix_addr_75 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((10 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((10 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_33), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[3]))
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_32), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[3]))
+        :: "r"(_stmatrix_addr_78), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[3]))
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        :: "r"(_stmatrix_addr_77), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[3]))
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        :: "r"(_stmatrix_addr_76), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[3]))
 #else
-        :: "r"(_stmatrix_addr_31), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[3]))
+        :: "r"(_stmatrix_addr_75), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[3]))
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
         : "memory");
     unsigned int scale_base_31 = v_scale_base + 96 + lane % 4 * 2;
     float _vec_load_12[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_34 = *reinterpret_cast<const float2*>(v_scale + scale_base_31);
-        _vec_load_12[0] = _v2_34.x;
-        _vec_load_12[0 + 1] = _v2_34.y;
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_33 = *reinterpret_cast<const float2*>(v_scale + scale_base_31);
-        _vec_load_12[0] = _v2_33.x;
-        _vec_load_12[0 + 1] = _v2_33.y;
+        float2 _v2_79 = *reinterpret_cast<const float2*>(v_scale + scale_base_31);
+        _vec_load_12[0] = _v2_79.x;
+        _vec_load_12[0 + 1] = _v2_79.y;
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        float2 _v2_78 = *reinterpret_cast<const float2*>(v_scale + scale_base_31);
+        _vec_load_12[0] = _v2_78.x;
+        _vec_load_12[0 + 1] = _v2_78.y;
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        float2 _v2_77 = *reinterpret_cast<const float2*>(v_scale + scale_base_31);
+        _vec_load_12[0] = _v2_77.x;
+        _vec_load_12[0 + 1] = _v2_77.y;
 #else
-        float2 _v2_32 = *reinterpret_cast<const float2*>(v_scale + scale_base_31);
-        _vec_load_12[0] = _v2_32.x;
-        _vec_load_12[0 + 1] = _v2_32.y;
+        float2 _v2_76 = *reinterpret_cast<const float2*>(v_scale + scale_base_31);
+        _vec_load_12[0] = _v2_76.x;
+        _vec_load_12[0 + 1] = _v2_76.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
     float _vec_load_13[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_35 = *reinterpret_cast<const float2*>(v_scale + scale_base_31 + 8);
-        _vec_load_13[0] = _v2_35.x;
-        _vec_load_13[0 + 1] = _v2_35.y;
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_34 = *reinterpret_cast<const float2*>(v_scale + scale_base_31 + 8);
-        _vec_load_13[0] = _v2_34.x;
-        _vec_load_13[0 + 1] = _v2_34.y;
+        float2 _v2_80 = *reinterpret_cast<const float2*>(v_scale + scale_base_31 + 8);
+        _vec_load_13[0] = _v2_80.x;
+        _vec_load_13[0 + 1] = _v2_80.y;
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        float2 _v2_79 = *reinterpret_cast<const float2*>(v_scale + scale_base_31 + 8);
+        _vec_load_13[0] = _v2_79.x;
+        _vec_load_13[0 + 1] = _v2_79.y;
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        float2 _v2_78 = *reinterpret_cast<const float2*>(v_scale + scale_base_31 + 8);
+        _vec_load_13[0] = _v2_78.x;
+        _vec_load_13[0 + 1] = _v2_78.y;
 #else
-        float2 _v2_33 = *reinterpret_cast<const float2*>(v_scale + scale_base_31 + 8);
-        _vec_load_13[0] = _v2_33.x;
-        _vec_load_13[0 + 1] = _v2_33.y;
+        float2 _v2_77 = *reinterpret_cast<const float2*>(v_scale + scale_base_31 + 8);
+        _vec_load_13[0] = _v2_77.x;
+        _vec_load_13[0 + 1] = _v2_77.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
     float scale0_32 = _vec_load_12[0];
@@ -1975,52 +3531,64 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
         packed_36[_lp] = *(uint32_t*)&_bf2;
     }
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-    uint32_t _stmatrix_addr_36 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((12 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((12 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-    uint32_t _stmatrix_addr_35 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((12 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((12 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+    uint32_t _stmatrix_addr_81 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((12 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((12 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+    uint32_t _stmatrix_addr_80 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((12 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((12 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+    uint32_t _stmatrix_addr_79 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((12 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((12 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
 #else
-    uint32_t _stmatrix_addr_34 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((12 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((12 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+    uint32_t _stmatrix_addr_78 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((12 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((12 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_36), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[3]))
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_35), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[3]))
+        :: "r"(_stmatrix_addr_81), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[3]))
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        :: "r"(_stmatrix_addr_80), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[3]))
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        :: "r"(_stmatrix_addr_79), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[3]))
 #else
-        :: "r"(_stmatrix_addr_34), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[3]))
+        :: "r"(_stmatrix_addr_78), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[3]))
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
         : "memory");
     unsigned int scale_base_37 = v_scale_base + 112 + lane % 4 * 2;
     float _vec_load_14[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_37 = *reinterpret_cast<const float2*>(v_scale + scale_base_37);
-        _vec_load_14[0] = _v2_37.x;
-        _vec_load_14[0 + 1] = _v2_37.y;
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_36 = *reinterpret_cast<const float2*>(v_scale + scale_base_37);
-        _vec_load_14[0] = _v2_36.x;
-        _vec_load_14[0 + 1] = _v2_36.y;
+        float2 _v2_82 = *reinterpret_cast<const float2*>(v_scale + scale_base_37);
+        _vec_load_14[0] = _v2_82.x;
+        _vec_load_14[0 + 1] = _v2_82.y;
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        float2 _v2_81 = *reinterpret_cast<const float2*>(v_scale + scale_base_37);
+        _vec_load_14[0] = _v2_81.x;
+        _vec_load_14[0 + 1] = _v2_81.y;
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        float2 _v2_80 = *reinterpret_cast<const float2*>(v_scale + scale_base_37);
+        _vec_load_14[0] = _v2_80.x;
+        _vec_load_14[0 + 1] = _v2_80.y;
 #else
-        float2 _v2_35 = *reinterpret_cast<const float2*>(v_scale + scale_base_37);
-        _vec_load_14[0] = _v2_35.x;
-        _vec_load_14[0 + 1] = _v2_35.y;
+        float2 _v2_79 = *reinterpret_cast<const float2*>(v_scale + scale_base_37);
+        _vec_load_14[0] = _v2_79.x;
+        _vec_load_14[0 + 1] = _v2_79.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
     float _vec_load_15[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_38 = *reinterpret_cast<const float2*>(v_scale + scale_base_37 + 8);
-        _vec_load_15[0] = _v2_38.x;
-        _vec_load_15[0 + 1] = _v2_38.y;
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_37 = *reinterpret_cast<const float2*>(v_scale + scale_base_37 + 8);
-        _vec_load_15[0] = _v2_37.x;
-        _vec_load_15[0 + 1] = _v2_37.y;
+        float2 _v2_83 = *reinterpret_cast<const float2*>(v_scale + scale_base_37 + 8);
+        _vec_load_15[0] = _v2_83.x;
+        _vec_load_15[0 + 1] = _v2_83.y;
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        float2 _v2_82 = *reinterpret_cast<const float2*>(v_scale + scale_base_37 + 8);
+        _vec_load_15[0] = _v2_82.x;
+        _vec_load_15[0 + 1] = _v2_82.y;
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        float2 _v2_81 = *reinterpret_cast<const float2*>(v_scale + scale_base_37 + 8);
+        _vec_load_15[0] = _v2_81.x;
+        _vec_load_15[0 + 1] = _v2_81.y;
 #else
-        float2 _v2_36 = *reinterpret_cast<const float2*>(v_scale + scale_base_37 + 8);
-        _vec_load_15[0] = _v2_36.x;
-        _vec_load_15[0 + 1] = _v2_36.y;
+        float2 _v2_80 = *reinterpret_cast<const float2*>(v_scale + scale_base_37 + 8);
+        _vec_load_15[0] = _v2_80.x;
+        _vec_load_15[0 + 1] = _v2_80.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
     float scale0_38 = _vec_load_14[0];
@@ -2042,19 +3610,23 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
         packed_42[_lp] = *(uint32_t*)&_bf2;
     }
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-    uint32_t _stmatrix_addr_39 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((14 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((14 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-    uint32_t _stmatrix_addr_38 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((14 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((14 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+    uint32_t _stmatrix_addr_84 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((14 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((14 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+    uint32_t _stmatrix_addr_83 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((14 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((14 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+    uint32_t _stmatrix_addr_82 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((14 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((14 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
 #else
-    uint32_t _stmatrix_addr_37 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((14 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((14 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
+    uint32_t _stmatrix_addr_81 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((14 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((14 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_39), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[3]))
-#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_38), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[3]))
+        :: "r"(_stmatrix_addr_84), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[3]))
+#elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
+        :: "r"(_stmatrix_addr_83), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[3]))
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        :: "r"(_stmatrix_addr_82), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[3]))
 #else
-        :: "r"(_stmatrix_addr_37), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[3]))
+        :: "r"(_stmatrix_addr_81), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[3]))
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
         : "memory");
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
