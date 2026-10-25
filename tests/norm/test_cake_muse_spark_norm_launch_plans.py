@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team
 """CPU tests of the launch plans of ``flashinfer.cake_muse_spark_norm_backend``: a repeated call of one signature
-selects its record, resolves its grid and binds its entry once, a new signature prepares its own plan, a contract
-breach after a plan exists still raises the package's error, and the plan's argument order is the loader's."""
+selects its record, resolves its grid and binds its entry once, a new signature (the launch form among its keys)
+prepares its own plan, a contract breach after a plan exists still raises the package's error, a PDL route's window
+naming the plain build is that record's plan, and the plan's argument order is the loader's."""
 
 import pytest
 import torch
@@ -175,7 +176,7 @@ def test_a_plan_orders_its_arguments_like_the_loader(plans):
 
 def test_a_repeated_rmsnorm_sigmoid_gate_call_reuses_its_plan(plans):
     module, launched, selections = plans
-    tokens, heads = 64, 128
+    tokens, heads = 32, 128
     projection = torch.zeros(tokens, 3 * heads * HEAD_DIM, dtype=torch.bfloat16)
     gate = projection[:, : heads * HEAD_DIM].view(tokens, heads, HEAD_DIM)
     x = torch.zeros(tokens, heads, HEAD_DIM, dtype=torch.bfloat16)
@@ -190,7 +191,7 @@ def test_a_repeated_rmsnorm_sigmoid_gate_call_reuses_its_plan(plans):
     pkg.cake_rmsnorm_sigmoid_gate(x, gate.contiguous(), eps=1e-5)
     assert len(selections) == 3  # the plan's selection plus this test's own call above
     # a 2-D call is one head, which no route of the architecture names: no plan, the package's error
-    with pytest.raises(ValueError, match="admits 64 tokens of 1 heads"):
+    with pytest.raises(ValueError, match="admits 32 tokens of 1 heads"):
         pkg.cake_rmsnorm_sigmoid_gate(
             x.view(-1, HEAD_DIM)[:tokens].clone(),
             gate.reshape(-1, HEAD_DIM)[:tokens].clone(),
@@ -202,3 +203,113 @@ def test_a_repeated_rmsnorm_sigmoid_gate_call_reuses_its_plan(plans):
     with pytest.raises(ValueError, match="must be a bfloat16"):
         pkg.cake_rmsnorm_sigmoid_gate(x, gate.float(), eps=1e-5)
     assert len(launched) == 4
+    # the launch form is part of the signature: the PDL route prepares a plan of its own, keyed by enable_pdl
+    before_selections, before_launches = len(selections), len(launched)
+    for _ in range(3):
+        pkg.cake_rmsnorm_sigmoid_gate(x, gate, eps=1e-5, enable_pdl=True)
+    assert len(selections) == before_selections + 1
+    assert len(launched) == before_launches + 3
+    pdl_route = pkg.rmsnorm_sigmoid_gate_route(True)
+    name_pdl = loader.selected_module(ARCH, pdl_route, tokens, heads)
+    assert [n for n, _ in launched[-3:]] == [name_pdl] * 3 and name_pdl != name
+    assert loader.MODULES[name_pdl]["launch"]["use_pdl"] is True
+    assert loader.MODULES[name_pdl]["build"] == {
+        **loader.MODULES[name]["build"],
+        "pdl": True,
+    }
+    # a window of the PDL route naming the plain build: the plain record's plan, launched without the attribute
+    tokens_plain, heads_plain = 1025, 16
+    projection_plain = torch.zeros(
+        tokens_plain, 3 * heads_plain * HEAD_DIM, dtype=torch.bfloat16
+    )
+    gate_plain = projection_plain[:, : heads_plain * HEAD_DIM].view(
+        tokens_plain, heads_plain, HEAD_DIM
+    )
+    x_plain = torch.zeros(tokens_plain, heads_plain, HEAD_DIM, dtype=torch.bfloat16)
+    pkg.cake_rmsnorm_sigmoid_gate(x_plain, gate_plain, eps=1e-5, enable_pdl=True)
+    borrowed = launched[-1][0]
+    assert borrowed == loader.selected_module(
+        ARCH, pdl_route, tokens_plain, heads_plain
+    )
+    assert borrowed == loader.selected_module(
+        ARCH, pkg.rmsnorm_sigmoid_gate_route(), tokens_plain, heads_plain
+    )
+    assert loader.MODULES[borrowed]["launch"]["use_pdl"] is False
+    assert loader.MODULES[borrowed]["build"]["pdl"] is False
+    # the PDL route's first window of 128 heads is a declared gap (one token: the CuTe DSL kernel under PDL wins
+    # there), so the PDL call is refused and the plain call runs the program the plain route selects; two tokens
+    # select the PDL build of that program
+    one = torch.zeros(1, 128, HEAD_DIM, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="admits 1 tokens of 128 heads"):
+        pkg.cake_rmsnorm_sigmoid_gate(one, one.clone(), eps=1e-5, enable_pdl=True)
+    with pytest.raises(NotImplementedError, match="admits 1 rows"):
+        loader.selected_module(ARCH, pdl_route, 1, 128)
+    two = torch.zeros(2, 128, HEAD_DIM, dtype=torch.bfloat16)
+    pkg.cake_rmsnorm_sigmoid_gate(two, two.clone(), eps=1e-5, enable_pdl=True)
+    first_pdl = launched[-1][0]
+    assert first_pdl == loader.selected_module(ARCH, pdl_route, 2, 128)
+    assert loader.MODULES[first_pdl]["launch"]["use_pdl"] is True
+    pkg.cake_rmsnorm_sigmoid_gate(one, one.clone(), eps=1e-5)
+    first_plain = launched[-1][0]
+    assert first_plain == loader.selected_module(
+        ARCH, pkg.rmsnorm_sigmoid_gate_route(), 1, 128
+    )
+    assert loader.MODULES[first_plain]["launch"]["use_pdl"] is False
+    assert loader.MODULES[first_pdl]["build"] == {
+        **loader.MODULES[first_plain]["build"],
+        "pdl": True,
+    }
+
+
+def test_the_admit_index_admits_exactly_the_row_counts_the_loader_scan_admits():
+    """``is_cake_*_supported`` answers a call's row count from the package's admit index (one bisection); the loader's
+    record-by-record ``admits`` is the reference, over every row or token count up to 20000 of every route of every
+    architecture -- the sigmoid gate per head count its route names and one it does not -- and over the calls
+    without a row count (route available; head count named)."""
+    counts = range(1, 20001)
+    for arch in loader.ARCHES:
+        for route, names in loader.ROUTES[arch].items():
+            rules = [loader.MODULES[name].get("select_rule") for name in names]
+            assert pkg._admits(arch, route, None) is loader.route_available(
+                arch, route
+            ), (arch, route)
+            if any(
+                rule is not None and rule["kind"] != loader.SELECT_KIND
+                for rule in rules
+            ):
+                named = sorted(
+                    {
+                        int(window[0])
+                        for rule in rules
+                        if rule is not None
+                        for window in rule.get("routes", {})
+                        .get(route, rule["windows"])
+                        .get(arch, ())
+                    }
+                )
+                for heads in (*named, 64):
+                    scan = [
+                        any(
+                            loader.admits(rule, tokens, arch, heads, route)
+                            for rule in rules
+                        )
+                        for tokens in counts
+                    ]
+                    index = [
+                        pkg._admits(arch, route, tokens, heads) for tokens in counts
+                    ]
+                    assert index == scan, (arch, route, heads)
+                    assert pkg._admits(arch, route, None, heads) is (heads in named), (
+                        arch,
+                        route,
+                        heads,
+                    )
+            else:
+                scan = [
+                    any(loader.admits(rule, rows, arch, route=route) for rule in rules)
+                    for rows in counts
+                ]
+                index = [pkg._admits(arch, route, rows) for rows in counts]
+                assert index == scan, (arch, route)
+    assert not pkg._admits("sm_100a", "no_such_route", 1)
+    assert not pkg._admits("sm_100a", "no_such_route", None)
