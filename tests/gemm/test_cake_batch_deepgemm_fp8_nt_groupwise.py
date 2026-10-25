@@ -164,6 +164,30 @@ def test_public_api_backend_cake(nk):
     )
 
 
+@pytest.mark.parametrize(
+    "groups,m,n,k,expected_m",
+    [(8, 256, 4096, 2048, 230), (6, 4096, 4096, 4096, 1228)],
+)
+def test_swap_ab_full_groups_with_partial_last_m_block(groups, m, n, k, expected_m):
+    # Every group is full and M is not a multiple of the swap-AB GEMM's 224-row
+    # tile, so the last 16 rows of each group are stored by the last strip of a
+    # partial tile, right before the strips past M that store nothing.
+    device = torch.device("cuda")
+    a, b, a_scale, b_scale, masked_m, _ = _make_inputs(
+        groups, m, n, k, seed=933, device=device, masked=[m] * groups
+    )
+    prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a, b, a_scale, b_scale, masked_m, expected_m
+    )
+    assert prepared.route.startswith("seed_swap_m224_packed")
+    expected = _reference(a, b, a_scale, b_scale, masked_m)
+    for _ in range(4):
+        prepared.out.fill_(float("nan"))
+        prepared.launch()
+        torch.cuda.synchronize()
+        _assert_valid_rows_close(prepared.out, expected, masked_m)
+
+
 def test_cuda_graph_capture_of_first_launch():
     device = torch.device("cuda")
     # A swap-AB route (scale-pack kernel + GEMM, packed-scale workspace): the
