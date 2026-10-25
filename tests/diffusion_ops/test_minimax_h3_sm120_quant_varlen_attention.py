@@ -279,3 +279,14 @@ def test_minimax_h3_sm120_varlen_plan_covers_every_unit_once() -> None:
     assert workspace_bytes(4824, heads, 5) > 0
     assert assign_unit_slots([], 8) == []
     assert sorted(assign_unit_slots([3, 1, 2, 5, 4], 2)) == [0, 1, 2, 3, 4]
+
+
+def test_minimax_h3_sm120_varlen_plan_rejects_32_bit_offset_overflow() -> None:
+    # The largest token count whose padded [tokens, heads, 128] extent fits a signed 32-bit offset.
+    heads = MINIMAX_H3_NUM_HEADS
+    row = heads * MINIMAX_H3_HEAD_DIM
+    fits = ((1 << 31) - 1) // row // 128 * 128
+    plan = MiniMaxH3VarlenPlan((0, fits), heads, torch.device("cpu"), num_ctas=170)
+    assert plan.padded_tokens * row <= (1 << 31) - 1
+    with pytest.raises(ValueError, match="32-bit offsets"):
+        MiniMaxH3VarlenPlan((0, fits + 1), heads, torch.device("cpu"), num_ctas=170)

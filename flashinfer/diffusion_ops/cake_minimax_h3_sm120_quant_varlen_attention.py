@@ -37,6 +37,8 @@ _BLOCK_M = 128
 _BLOCK_N = 128
 _MAX_HEADS = 1 << 15
 _MAX_SEGMENT_TILES = 1 << 16
+# The kernels index the [tokens padded to _BLOCK_N, heads, 128] operands with 32-bit offsets.
+_MAX_ELEMENTS = (1 << 31) - 1
 # Fixed per-unit overhead (Q TMA, pipeline fill, epilogue) in K/V-tile units for the LPT placement.
 _UNIT_OVERHEAD_TILES = 2
 _PARTIAL_FLOATS = 2 * MINIMAX_H3_HEAD_DIM
@@ -120,6 +122,12 @@ class MiniMaxH3VarlenPlan:
         self.key = (bounds, num_heads, device.index, int(num_ctas))
         self.num_heads = num_heads
         self.total_tokens = bounds[-1]
+        padded_tokens = max(1, _ceil_div(self.total_tokens, _BLOCK_N)) * _BLOCK_N
+        if padded_tokens * num_heads * MINIMAX_H3_HEAD_DIM > _MAX_ELEMENTS:
+            raise ValueError(
+                f"tokens (padded to {_BLOCK_N}) * heads * {MINIMAX_H3_HEAD_DIM} must fit the "
+                f"kernels' 32-bit offsets, got tokens={self.total_tokens}, heads={num_heads}"
+            )
         self.num_segments = len(bounds) - 1
         begins = [bounds[s] for s in range(self.num_segments)]
         lens = [bounds[s + 1] - bounds[s] for s in range(self.num_segments)]
