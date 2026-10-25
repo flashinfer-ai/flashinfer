@@ -3093,7 +3093,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     ],
                     [
                         512,
-                        768,
+                        1024,
                     ],
                     [
                         8191,
