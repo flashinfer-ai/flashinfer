@@ -107,7 +107,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_oneshot_bf16_rso_el",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_oneshot_bf16_rso_el_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_oneshot_bf16_rso_el_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_oneshot_bf16_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226176,
@@ -156,7 +156,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_oneshot_bf16_rst",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_oneshot_bf16_rst_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_oneshot_bf16_rst_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_oneshot_bf16_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226176,
@@ -254,7 +254,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_oneshot_nvfp4_rsb",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_oneshot_nvfp4_rsb_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_oneshot_nvfp4_rsb_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_oneshot_nvfp4_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226176,
@@ -303,7 +303,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_bf16_bf16_p2d_u4_csp_sop",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_bf16_p2d_u4_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_bf16_p2d_u4_csp_sop_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_bf16_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 205696,
@@ -357,7 +357,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_bf16_bf16_p2d_u4_csp_sop_pf",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_bf16_p2d_u4_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_bf16_p2d_u4_csp_sop_pf_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_bf16_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 205696,
@@ -411,7 +411,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_bf16_bf16_p2d_u4_w11_csp_sop",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_bf16_p2d_u4_w11_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_bf16_p2d_u4_w11_csp_sop_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_bf16_binding.cu",
         ),
         "block": 384,
         "dynamic_smem_bytes": 225024,
@@ -465,7 +465,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_p2d_w11_qp_csp_sop",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_p2d_w11_qp_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_p2d_w11_qp_csp_sop_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_binding.cu",
         ),
         "block": 384,
         "dynamic_smem_bytes": 225024,
@@ -521,7 +521,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_qp_csp_sop",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_qp_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_qp_csp_sop_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226176,
@@ -577,7 +577,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_qp_csp_sop_pf",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_qp_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_qp_csp_sop_pf_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226176,
@@ -633,7 +633,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_sfu_csp_sop",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_sfu_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_sfu_csp_sop_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226176,
@@ -689,7 +689,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_sfu_csp_sop_pf",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_sfu_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_sfu_csp_sop_pf_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226176,
@@ -745,7 +745,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_csp_sop",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_csp_sop_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226176,
@@ -801,7 +801,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_csp_sop_pf",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_csp_sop_pf_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226176,
@@ -857,7 +857,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_p2d_w11_qp_csp_sop",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_p2d_w11_qp_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_p2d_w11_qp_csp_sop_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_binding.cu",
         ),
         "block": 384,
         "dynamic_smem_bytes": 225024,
@@ -913,7 +913,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_p2d_w11_qp_sfu_csp_sop",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_p2d_w11_qp_sfu_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_p2d_w11_qp_sfu_csp_sop_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_binding.cu",
         ),
         "block": 384,
         "dynamic_smem_bytes": 225024,
@@ -969,7 +969,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_qp_el_csp_sop",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_qp_el_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_qp_el_csp_sop_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226176,
@@ -1025,7 +1025,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_qp_el_csp_sop_pf",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_qp_el_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_qp_el_csp_sop_pf_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226176,
@@ -1081,7 +1081,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_qp_sfu_csp_sop",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_qp_sfu_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_qp_sfu_csp_sop_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226176,
@@ -1137,7 +1137,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_qp_sfu_csp_sop_pf",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_qp_sfu_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_qp_sfu_csp_sop_pf_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226176,
@@ -1193,7 +1193,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_p2d_u24_csp_sop",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_p2d_u24_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_p2d_u24_csp_sop_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_binding.cu",
         ),
         "block": 288,
         "dynamic_smem_bytes": 195072,
@@ -1248,7 +1248,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_p2d_u24_csp_sop_pf",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_p2d_u24_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_p2d_u24_csp_sop_pf_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_binding.cu",
         ),
         "block": 288,
         "dynamic_smem_bytes": 195072,
@@ -1303,7 +1303,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pa_p2d_u2_csp",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pa_p2d_u2_csp_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pa_p2d_u2_csp_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_binding.cu",
         ),
         "block": 288,
         "dynamic_smem_bytes": 195072,
@@ -1358,7 +1358,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pa_p2d_u2_csp_sop",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pa_p2d_u2_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pa_p2d_u2_csp_sop_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_binding.cu",
         ),
         "block": 288,
         "dynamic_smem_bytes": 195072,
@@ -1413,7 +1413,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pa_p2d_u2_csp_sop_pf",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pa_p2d_u2_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pa_p2d_u2_csp_sop_pf_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_binding.cu",
         ),
         "block": 288,
         "dynamic_smem_bytes": 195072,
@@ -1468,7 +1468,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_csp_sop",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_csp_sop_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_binding.cu",
         ),
         "block": 288,
         "dynamic_smem_bytes": 211456,
@@ -1525,7 +1525,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_csp_sop_pf",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_csp_sop_pf_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_binding.cu",
         ),
         "block": 288,
         "dynamic_smem_bytes": 211456,
@@ -1582,7 +1582,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_pa_qp_csp_sop",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_pa_qp_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_pa_qp_csp_sop_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_binding.cu",
         ),
         "block": 288,
         "dynamic_smem_bytes": 211456,
@@ -1639,7 +1639,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_pa_qp_csp_sop_pf",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_pa_qp_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_pa_qp_csp_sop_pf_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_binding.cu",
         ),
         "block": 288,
         "dynamic_smem_bytes": 211456,
@@ -1696,7 +1696,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_pa_qp_sfu_csp_sop",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_pa_qp_sfu_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_pa_qp_sfu_csp_sop_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_binding.cu",
         ),
         "block": 288,
         "dynamic_smem_bytes": 211456,
@@ -1753,7 +1753,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_pa_qp_sfu_csp_sop_pf",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_pa_qp_sfu_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_pa_qp_sfu_csp_sop_pf_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_binding.cu",
         ),
         "block": 288,
         "dynamic_smem_bytes": 211456,
@@ -1810,7 +1810,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_qp_sfu_csp_sop",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_qp_sfu_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_qp_sfu_csp_sop_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_binding.cu",
         ),
         "block": 288,
         "dynamic_smem_bytes": 211456,
@@ -1867,7 +1867,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_qp_sfu_csp_sop_pf",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_qp_sfu_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_qp_sfu_csp_sop_pf_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_binding.cu",
         ),
         "block": 288,
         "dynamic_smem_bytes": 211456,
@@ -1924,7 +1924,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_sfu_csp_sop",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_sfu_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_sfu_csp_sop_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_binding.cu",
         ),
         "block": 288,
         "dynamic_smem_bytes": 211456,
@@ -1981,7 +1981,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_sfu_csp_sop_pf",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_sfu_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_sfu_csp_sop_pf_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_binding.cu",
         ),
         "block": 288,
         "dynamic_smem_bytes": 211456,
@@ -2038,7 +2038,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_sfu_csp_sop",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_sfu_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_sfu_csp_sop_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_binding.cu",
         ),
         "block": 288,
         "dynamic_smem_bytes": 211456,
@@ -2095,7 +2095,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_sfu_csp_sop_pf",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_sfu_csp_sop_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_sfu_csp_sop_pf_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_binding.cu",
         ),
         "block": 288,
         "dynamic_smem_bytes": 211456,
@@ -2152,7 +2152,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp4_twoshot_bf16_bv0_csp_b1r_p2m_rst",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_bf16_bv0_csp_b1r_p2m_rst_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_bf16_bv0_csp_b1r_p2m_rst_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_bf16_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226432,
@@ -2201,7 +2201,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp4_twoshot_bf16_bv0_csp_b1r_rst",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_bf16_bv0_csp_b1r_rst_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_bf16_bv0_csp_b1r_rst_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_bf16_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226432,
@@ -2250,7 +2250,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp4_twoshot_bf16_bv0_csp_fe_b1r_p2m",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_bf16_bv0_csp_fe_b1r_p2m_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_bf16_bv0_csp_fe_b1r_p2m_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_bf16_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226432,
@@ -2299,7 +2299,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp4_twoshot_bf16_bv1_csp_b1r_rst",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_bf16_bv1_csp_b1r_rst_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_bf16_bv1_csp_b1r_rst_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_bf16_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226432,
@@ -2348,7 +2348,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp4_twoshot_bf16_bv1_csp_fe_b1r",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_bf16_bv1_csp_fe_b1r_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_bf16_bv1_csp_fe_b1r_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_bf16_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226432,
@@ -2397,7 +2397,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp4_twoshot_bf16_bv2_csp_b1r",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_bf16_bv2_csp_b1r_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_bf16_bv2_csp_b1r_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_bf16_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226432,
@@ -2446,7 +2446,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp4_twoshot_bf16_bv2_csp_b1r_p2m",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_bf16_bv2_csp_b1r_p2m_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_bf16_bv2_csp_b1r_p2m_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_bf16_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226432,
@@ -2495,7 +2495,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp4_twoshot_bf16_bv2_csp_fe_b1r",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_bf16_bv2_csp_fe_b1r_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_bf16_bv2_csp_fe_b1r_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_bf16_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226432,
@@ -2544,7 +2544,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp4_twoshot_nvfp4_bv0_csp_b1r",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_nvfp4_bv0_csp_b1r_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_nvfp4_bv0_csp_b1r_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_nvfp4_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226432,
@@ -2594,7 +2594,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp4_twoshot_nvfp4_bv0_csp_b1r_p2m",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_nvfp4_bv0_csp_b1r_p2m_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_nvfp4_bv0_csp_b1r_p2m_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_nvfp4_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226432,
@@ -2644,7 +2644,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp4_twoshot_nvfp4_bv0_csp_b1r_p2m_rst",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_nvfp4_bv0_csp_b1r_p2m_rst_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_nvfp4_bv0_csp_b1r_p2m_rst_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_nvfp4_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226432,
@@ -2694,7 +2694,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp4_twoshot_nvfp4_bv1_csp_b1r",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_nvfp4_bv1_csp_b1r_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_nvfp4_bv1_csp_b1r_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_nvfp4_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226432,
@@ -2744,7 +2744,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp4_twoshot_nvfp4_bv1_csp_b1r_rst",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_nvfp4_bv1_csp_b1r_rst_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_nvfp4_bv1_csp_b1r_rst_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_nvfp4_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226432,
@@ -2794,7 +2794,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp4_twoshot_nvfp4_bv2_csp_b1r",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_nvfp4_bv2_csp_b1r_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_nvfp4_bv2_csp_b1r_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_nvfp4_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226432,
@@ -2844,7 +2844,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "kernel_symbol": "cake_fp4_allreduce_tp4_twoshot_nvfp4_bv2_csp_b1r_p2m_rst",
         "sources": (
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_nvfp4_bv2_csp_b1r_p2m_rst_kernel.cu",
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_nvfp4_bv2_csp_b1r_p2m_rst_binding.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp4_twoshot_nvfp4_binding.cu",
         ),
         "block": 352,
         "dynamic_smem_bytes": 226432,

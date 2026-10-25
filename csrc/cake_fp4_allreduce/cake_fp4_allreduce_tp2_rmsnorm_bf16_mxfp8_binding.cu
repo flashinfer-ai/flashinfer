@@ -14,9 +14,11 @@
  * limitations under the License.
  */
 
-// Host launcher of the Cake FP4-transport all-reduce family program
-// tp2_rmsnorm_bf16_nvfp4_qp_el_csp_sop: tensor-metadata checks, the one-time dynamic shared-memory
-// opt-in and one launch.
+// Host launcher shared by the Cake FP4-transport all-reduce fused-norm programs with BF16 input and
+// MXFP8 output: tensor-metadata checks, the one-time dynamic shared-memory opt-in and one launch.
+// The loader selects the program with -DCAKE_FP4_ALLREDUCE_KERNEL=<kernel symbol>,
+// -DCAKE_FP4_ALLREDUCE_THREADS=<block> and -DCAKE_FP4_ALLREDUCE_DYNAMIC_SMEM=<dynamic_smem_bytes>
+// (the registry record's block and dynamic_smem_bytes).
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -24,10 +26,24 @@
 
 #include "tvm_ffi_utils.h"
 
+#ifndef CAKE_FP4_ALLREDUCE_KERNEL
+#error "CAKE_FP4_ALLREDUCE_KERNEL: the loader passes the program's kernel symbol with -D"
+#endif
+#ifndef CAKE_FP4_ALLREDUCE_THREADS
+#error "CAKE_FP4_ALLREDUCE_THREADS: the loader passes the registry block with -D"
+#endif
+#ifndef CAKE_FP4_ALLREDUCE_DYNAMIC_SMEM
+#error "CAKE_FP4_ALLREDUCE_DYNAMIC_SMEM: the loader passes the registry dynamic_smem_bytes with -D"
+#endif
+#ifndef CAKE_STRINGIZE
+#define CAKE_STRINGIZE_(x) #x
+#define CAKE_STRINGIZE(x) CAKE_STRINGIZE_(x)
+#endif
+
 using tvm::ffi::TensorView;
 
 // clang-format off
-extern "C" __global__ void cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_qp_el_csp_sop(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ res_in, __nv_bfloat16* __restrict__ w, uint8_t* __restrict__ outq, uint8_t* __restrict__ out_sf, float* __restrict__ gs_out, __nv_bfloat16* __restrict__ res_out, uint8_t* __restrict__ os_wire, uint8_t* __restrict__ os_rs, long long* __restrict__ peer_ptrs, unsigned int* __restrict__ ctrl, int rank, int rows, int cap, float eps, float wbias);
+extern "C" __global__ void CAKE_FP4_ALLREDUCE_KERNEL(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ res_in, __nv_bfloat16* __restrict__ w, uint8_t* __restrict__ outq, uint8_t* __restrict__ out_sf, float* __restrict__ gs_out, __nv_bfloat16* __restrict__ res_out, uint8_t* __restrict__ os_wire, uint8_t* __restrict__ os_rs, long long* __restrict__ peer_ptrs, unsigned int* __restrict__ ctrl, int rank, int rows, int cap, float eps, float wbias);
 // clang-format on
 
 namespace {
@@ -36,13 +52,13 @@ constexpr int64_t kWorldSize = 2;
 constexpr int64_t kCapMax = 103563;
 constexpr int64_t kGridMax = 4096;
 constexpr int64_t kHidden = 6144;
-constexpr int64_t kOutRowBytes = 3072;
-constexpr int64_t kScalesPerRow = 384;
+constexpr int64_t kOutRowBytes = 6144;
+constexpr int64_t kScalesPerRow = 192;
 constexpr int64_t kScaleRowTile = 128;
 constexpr int64_t kTableEntries = 4;
 constexpr int64_t kCtrlWords = 16384;
-constexpr unsigned kThreads = 352;
-constexpr unsigned kDynamicSmemBytes = 226176;
+constexpr unsigned kThreads = CAKE_FP4_ALLREDUCE_THREADS;
+constexpr unsigned kDynamicSmemBytes = CAKE_FP4_ALLREDUCE_DYNAMIC_SMEM;
 
 int64_t byte_size(const TensorView& t) { return t.numel() * get_element_size(t); }
 
@@ -85,14 +101,14 @@ void run(TensorView x, TensorView res_in, TensorView w, TensorView outq, TensorV
   TVM_FFI_CHECK(w.numel() == kHidden, ValueError)
       << "w must hold " << kHidden << " weights, got " << w.numel();
   check_cuda_tensor(outq, "outq");
-  check_dtype(outq, dl_uint8, "outq");
+  TVM_FFI_CHECK(outq.dtype() == dl_uint8 || outq.dtype() == dl_float8_e4m3fn, TypeError)
+      << "outq must be uint8 or float8_e4m3fn";
   check_contiguous(outq, "outq");
   check_same_device(outq, x, "outq", "x");
   TVM_FFI_CHECK(is_matrix(outq, rows, kOutRowBytes), ValueError)
       << "outq must be [rows, " << kOutRowBytes << "] quantized values with rows = " << rows;
   check_cuda_tensor(out_sf, "out_sf");
-  TVM_FFI_CHECK(out_sf.dtype() == dl_uint8 || out_sf.dtype() == dl_float8_e4m3fn, TypeError)
-      << "out_sf must be uint8 or float8_e4m3fn";
+  check_dtype(out_sf, dl_uint8, "out_sf");
   check_contiguous(out_sf, "out_sf");
   check_same_device(out_sf, x, "out_sf", "x");
   const int64_t sf_rows = (rows + kScaleRowTile - 1) / kScaleRowTile * kScaleRowTile;
@@ -140,8 +156,7 @@ void run(TensorView x, TensorView res_in, TensorView w, TensorView outq, TensorV
   const DLDevice device = x.device();
   ffi::CUDADeviceGuard device_guard(device.device_id);
   const cudaStream_t stream = get_stream(device);
-  const void* kernel =
-      reinterpret_cast<const void*>(&cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_qp_el_csp_sop);
+  const void* kernel = reinterpret_cast<const void*>(&CAKE_FP4_ALLREDUCE_KERNEL);
   static const cudaError_t smem_status = cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicSmemBytes));
   TVM_FFI_CHECK(smem_status == cudaSuccess, RuntimeError)
@@ -196,8 +211,7 @@ void run(TensorView x, TensorView res_in, TensorView w, TensorView outq, TensorV
   config.numAttrs = num_attrs;
   const cudaError_t status = cudaLaunchKernelExC(&config, kernel, args);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
-      << "cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_qp_el_csp_sop launch failed: "
-      << cudaGetErrorString(status);
+      << CAKE_STRINGIZE(CAKE_FP4_ALLREDUCE_KERNEL) " launch failed: " << cudaGetErrorString(status);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, run);

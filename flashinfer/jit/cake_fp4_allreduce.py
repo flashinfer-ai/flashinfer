@@ -31,7 +31,8 @@ and ``LIMITS``: the host rules).  Every
 program is an exact-architecture source:
 it is compiled once per exact target (``sm_100a`` for B200, ``sm_103a`` for
 B300, ``sm_107a`` for SM107 devices) with that target's flag set and the
-program's ``-D`` defines (:func:`program_defines`: the kernel symbol, and the
+program's ``-D`` defines (:func:`program_defines`: the kernel symbol, the CTA
+size and the dynamic shared memory of its form's shared binding, and the
 residual prefetch of a prefetch program, which shares its base program's
 kernel source), without fast math and with ``--fmad=false``, into a module
 named after the program, the target and a digest of its sources and
@@ -533,18 +534,26 @@ def program_sources(program: str) -> list[Path]:
 
 
 def program_defines(program: str) -> list[str]:
-    """The ``-D`` flags that select ``program`` in its kernel source.
+    """The ``-D`` flags that select ``program`` in its shared sources.
 
-    A fused-norm kernel source serves its own program and that program's
-    prefetch twin: ``CAKE_FP4_ALLREDUCE_KERNEL`` names the kernel symbol (the
-    source's default is its base program's symbol) and
-    ``CAKE_FP4_ALLREDUCE_PREFETCH`` enables the residual prefetch of the twin.
-    Every record passes its kernel symbol; a source without a twin reads
-    neither macro, so the flag changes nothing there.
+    The binding of a (family, world size, input format, output format) form
+    serves every program of the form: ``CAKE_FP4_ALLREDUCE_KERNEL`` names the
+    kernel symbol, ``CAKE_FP4_ALLREDUCE_THREADS`` the CTA size (the registry
+    ``block``) and ``CAKE_FP4_ALLREDUCE_DYNAMIC_SMEM`` the dynamic shared memory
+    (``dynamic_smem_bytes``).  A fused-norm kernel source serves its own
+    program and that program's prefetch twin: the symbol macro's default is
+    its base program's symbol, and ``CAKE_FP4_ALLREDUCE_PREFETCH`` enables the
+    residual prefetch of the twin.  Every record passes its symbol, block and
+    dynamic shared memory; a kernel without a twin reads none of the macros,
+    so the flags change nothing there.
     """
 
     record = program_record(program)
-    defines = [f"-DCAKE_FP4_ALLREDUCE_KERNEL={record['kernel_symbol']}"]
+    defines = [
+        f"-DCAKE_FP4_ALLREDUCE_KERNEL={record['kernel_symbol']}",
+        f"-DCAKE_FP4_ALLREDUCE_THREADS={int(record['block'])}",
+        f"-DCAKE_FP4_ALLREDUCE_DYNAMIC_SMEM={int(record['dynamic_smem_bytes'])}",
+    ]
     if record["prefetch"]:
         defines.append("-DCAKE_FP4_ALLREDUCE_PREFETCH=1")
     return defines

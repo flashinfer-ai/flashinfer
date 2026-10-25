@@ -344,6 +344,14 @@ def _expected_params(
     )
 
 
+def _binding_form(record: dict) -> str:
+    """The shared binding form of a record: family, world size and formats."""
+    if record["family"] == "allreduce":
+        shot = "oneshot" if record["world_size"] == 2 else "twoshot"
+        return f"tp{record['world_size']}_{shot}_{record['input_format']}"
+    return f"tp2_rmsnorm_{record['input_format']}_{record['output_format']}"
+
+
 # ---------------------------------------------------------------------------
 # registry schema
 # ---------------------------------------------------------------------------
@@ -405,12 +413,14 @@ def test_registry_lists_every_program_with_the_contract_parameters() -> None:
         assert record["kernel_symbol"] == f"cake_fp4_allreduce_{program}"
         assert record["kernel_symbol"] not in symbols
         symbols.add(record["kernel_symbol"])
-        # A prefetch program shares its base program's kernel source; the kernel
-        # symbol and the prefetch come through the loader's -D flags.
+        # A prefetch program shares its base program's kernel source, and every
+        # program shares the binding of its form; the kernel symbol, the block
+        # size, the dynamic shared memory and the prefetch come through the
+        # loader's -D flags.
         stem = program[: -len("_pf")] if record["prefetch"] else program
         assert tuple(record["sources"]) == (
             f"{SOURCE_DIR}/cake_fp4_allreduce_{stem}_kernel.cu",
-            f"{SOURCE_DIR}/cake_fp4_allreduce_{program}_binding.cu",
+            f"{SOURCE_DIR}/cake_fp4_allreduce_{_binding_form(record)}_binding.cu",
         )
         assert record["entry"] == "run"
         # One warp per worker and one more: ten workers for a BF16 input and eight for an NVFP4 input,
@@ -850,7 +860,25 @@ def test_program_sources_exist_and_declare_their_kernels() -> None:
         assert f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({record['entry']}," in binding_text, (
             program
         )
-        assert record["kernel_symbol"] in binding_text, program
+        # Every program of a (family, world size, input format, output format)
+        # form shares one binding; its kernel symbol, block size and dynamic
+        # shared memory come through the loader's -D flags, so the binding
+        # names no program.
+        form = _binding_form(record)
+        assert binding.name == f"cake_fp4_allreduce_{form}_binding.cu", program
+        for macro in (
+            "CAKE_FP4_ALLREDUCE_KERNEL",
+            "CAKE_FP4_ALLREDUCE_THREADS",
+            "CAKE_FP4_ALLREDUCE_DYNAMIC_SMEM",
+        ):
+            assert f"#ifndef {macro}" in binding_text, (program, macro)
+        assert "cake_fp4_allreduce_tp" not in binding_text, program
+        assert loader.program_defines(program) == [
+            f"-DCAKE_FP4_ALLREDUCE_KERNEL={record['kernel_symbol']}",
+            f"-DCAKE_FP4_ALLREDUCE_THREADS={record['block']}",
+            f"-DCAKE_FP4_ALLREDUCE_DYNAMIC_SMEM={record['dynamic_smem_bytes']}",
+            *(["-DCAKE_FP4_ALLREDUCE_PREFETCH=1"] if record["prefetch"] else []),
+        ], program
     # The loader resolves sources under the package data directory (``flashinfer/data/csrc``, a
     # symlink to the repository's ``csrc`` in an editable install): compare the real files.
     assert {path.resolve() for path in loader.program_sources("tp2_oneshot_bf16")} == {
