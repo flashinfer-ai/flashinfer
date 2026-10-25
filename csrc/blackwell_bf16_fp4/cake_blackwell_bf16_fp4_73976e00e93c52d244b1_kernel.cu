@@ -314,7 +314,7 @@ kernel_cake_blackwell_bf16_fp4_73976e00e93c52d244b1(const __grid_constant__ CUte
     const int smem_sf_addr = smem + 202752;
     if (warp == 5) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&A))) : "memory"); }
     if (warp == 6) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&B))) : "memory"); }
-    if (warp == 6) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&B_descale))) : "memory"); }
+    if (warp == 7) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&B_descale))) : "memory"); }
 
     // Mbarrier init (10 pipeline groups, 0 ordered-sequence groups, 72 barriers)
     // Mbarriers at smem_raw[0..576)
@@ -325,27 +325,28 @@ kernel_cake_blackwell_bf16_fp4_73976e00e93c52d244b1(const __grid_constant__ CUte
         // smem_a_done: 8 barriers, init_count=1
         // --- pipeline 'pack_pipe' ---
         // bsrc_full: 14 barriers, init_count=1
-        // bsrc_done: 14 barriers, init_count=1
+        // bsrc_done: 14 barriers, init_count=2
         // --- pipeline 'b_pipe' ---
-        // smem_b_full: 8 barriers, init_count=2
+        // smem_b_full: 8 barriers, init_count=4
         // smem_b_done: 8 barriers, init_count=1
         // --- pipeline 'sf_pipe' ---
         // sf_full: 4 barriers, init_count=1
-        // sf_done: 4 barriers, init_count=4
+        // sf_done: 4 barriers, init_count=8
         // --- pipeline 'mainloop_pipe' ---
         // mainloop_done: 2 barriers, init_count=1
         // epilogue_done: 2 barriers, init_count=8
         // Warp-cooperative initialization in physical record order.
-        uint32_t _mbarrier_init_count_0_0 = 1;
+        uint32_t _mbarrier_init_count_0_0 = 2;
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(30), "r"((uint32_t)(1)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(8), "r"((uint32_t)(2)));
         mbarrier_init(smem + 0 + lane * 8, _mbarrier_init_count_0_0);
         uint32_t _mbarrier_init_count_0_32 = 1;
-        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(20), "r"((uint32_t)(2)));
-        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(12), "r"((uint32_t)(1)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(20), "r"((uint32_t)(4)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(12), "r"((uint32_t)(2)));
         mbarrier_init(smem + 256 + lane * 8, _mbarrier_init_count_0_32);
         uint32_t _mbarrier_init_count_0_64 = 8;
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_64) : "r"(lane), "n"(6), "r"((uint32_t)(1)));
-        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_64) : "r"(lane), "n"(4), "r"((uint32_t)(4)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_64) : "r"(lane), "n"(4), "r"((uint32_t)(8)));
         if (lane < 8) {
             mbarrier_init(smem + 512 + lane * 8, _mbarrier_init_count_0_64);
         }
@@ -364,10 +365,10 @@ kernel_cake_blackwell_bf16_fp4_73976e00e93c52d244b1(const __grid_constant__ CUte
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
     }
 
-    if (warp <= 15) {
-        asm volatile("barrier.sync.aligned %0, %1;" :: "r"(7), "r"(512) : "memory");
+    if (warp <= 4) {
+        asm volatile("barrier.sync.aligned %0, %1;" :: "r"(7), "r"(160) : "memory");
     }
-    const int taddr = (warp <= 15) ? tmem_addr_storage[0] : 0;
+    const int taddr = (warp <= 4) ? tmem_addr_storage[0] : 0;
 
     // Kernel post-init ops
     const int tmem_accum = taddr;
@@ -591,9 +592,7 @@ kernel_cake_blackwell_bf16_fp4_73976e00e93c52d244b1(const __grid_constant__ CUte
     if (warp == 6) {
         { // load_b_main
             unsigned int load_b_stage = 0;
-            unsigned int sf_stage = 0;
             int num_groups = K / 256;
-            unsigned int _phase_sf_done = 1;
             unsigned int _phase_bsrc_done = 1;
             if (elect_sync()) {
                 #pragma unroll 1
@@ -603,11 +602,6 @@ kernel_cake_blackwell_bf16_fp4_73976e00e93c52d244b1(const __grid_constant__ CUte
                     b_row = b_row + cta_rank * 48;
                     #pragma unroll 1
                     for (int group = 0; group < num_groups; group++) {
-                        mbarrier_wait(sf_done_addr + (sf_stage) * 8, _phase_sf_done);
-                        tma_2d_gmem2smem(smem_sf_addr + sf_stage * 768, (&B_descale), group * 16, b_row, sf_full_addr + (sf_stage) * 8);
-                        mbarrier_arrive_expect_tx(sf_full_addr + (sf_stage) * 8, 768);
-                        sf_stage += 1;
-                        if (sf_stage == 4) { sf_stage = 0; _phase_sf_done ^= 1; }
                         #pragma unroll 1
                         for (int sub = 0; sub < 4; sub += 2) {
                             mbarrier_wait(bsrc_done_addr + (load_b_stage) * 8, _phase_bsrc_done);
@@ -625,7 +619,9 @@ kernel_cake_blackwell_bf16_fp4_73976e00e93c52d244b1(const __grid_constant__ CUte
     if (warp == 7) {
         { // load_b2_main
             unsigned int load_b_stage_1 = 1;
+            unsigned int sf_stage = 0;
             int num_groups_1 = K / 256;
+            unsigned int _phase_sf_done = 1;
             unsigned int _phase_bsrc_done_1 = 1;
             if (elect_sync()) {
                 #pragma unroll 1
@@ -635,6 +631,11 @@ kernel_cake_blackwell_bf16_fp4_73976e00e93c52d244b1(const __grid_constant__ CUte
                     b_row_1 = b_row_1 + cta_rank * 48;
                     #pragma unroll 1
                     for (int group_1 = 0; group_1 < num_groups_1; group_1++) {
+                        mbarrier_wait(sf_done_addr + (sf_stage) * 8, _phase_sf_done);
+                        tma_2d_gmem2smem(smem_sf_addr + sf_stage * 768, (&B_descale), group_1 * 16, b_row_1, sf_full_addr + (sf_stage) * 8);
+                        mbarrier_arrive_expect_tx(sf_full_addr + (sf_stage) * 8, 768);
+                        sf_stage += 1;
+                        if (sf_stage == 4) { sf_stage = 0; _phase_sf_done ^= 1; }
                         #pragma unroll 1
                         for (int sub_1 = 1; sub_1 < 4; sub_1 += 2) {
                             mbarrier_wait(bsrc_done_addr + (load_b_stage_1) * 8, _phase_bsrc_done_1);
@@ -652,13 +653,13 @@ kernel_cake_blackwell_bf16_fp4_73976e00e93c52d244b1(const __grid_constant__ CUte
     if (warp >= 8 && warp <= 15) {
         { // convert_main
             int warp_id_in_role = warp - 8;
-            int group_2 = warp_id_in_role;
+            int group_2 = warp_id_in_role / 2;
             unsigned int cvt_stage = (unsigned int)group_2;
             unsigned int cvt_pack_stage = (unsigned int)group_2;
             unsigned int cvt_sf_stage = (unsigned int)(group_2 / 4);
             int num_iters_2 = K / 64;
-            int phase8 = 0;
-            int convert_tid = lane;
+            int phase4 = 0;
+            int convert_tid = warp_id_in_role % 2 * 32 + lane;
             int row0 = convert_tid / 4;
             int k_block = convert_tid - row0 * 4;
             int swz = row0 & 7;
@@ -671,9 +672,9 @@ kernel_cake_blackwell_bf16_fp4_73976e00e93c52d244b1(const __grid_constant__ CUte
             unsigned int _phase_sf_full = 0;
             #pragma unroll 1
             for (unsigned int tile_idx_5 = cluster_id; tile_idx_5 < grid_m * grid_n; tile_idx_5 += num_clusters) {
-                int first = group_2 - phase8 & 7;
+                int first = group_2 - phase4 & 3;
                 #pragma unroll 1
-                for (int local = first; local < num_iters_2; local += 8) {
+                for (int local = first; local < num_iters_2; local += 4) {
                     int sub_2 = local & 3;
                     mbarrier_wait(smem_b_done_addr + (cvt_stage) * 8, _phase_smem_b_done);
                     mbarrier_wait(bsrc_full_addr + (cvt_pack_stage) * 8, _phase_bsrc_full);
@@ -683,8 +684,8 @@ kernel_cake_blackwell_bf16_fp4_73976e00e93c52d244b1(const __grid_constant__ CUte
                     int packed_base = smem_bpack_addr + cvt_pack_stage * 1536;
                     int bcvt_base = smem_b_cvt_addr + cvt_stage * 6144;
                     #pragma unroll
-                    for (int half = 0; half < 6; half++) {
-                        int row = row0 + half * 8;
+                    for (int half = 0; half < 3; half++) {
+                        int row = row0 + half * 16;
                         asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&raw_words[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw_words[(0) + 1]))
                             : "r"(packed_base + row * 32 + k_block * 8));
@@ -708,13 +709,14 @@ kernel_cake_blackwell_bf16_fp4_73976e00e93c52d244b1(const __grid_constant__ CUte
                             :: "r"((smem_b_full_addr + (cvt_stage) * 8) & 0xFEFFFFFF) : "memory");
                         mbarrier_arrive(sf_done_addr + (cvt_sf_stage) * 8);
                     }
-                    _phase_smem_b_done ^= 1;
-                    if (cvt_pack_stage + 8 >= 14) { _phase_bsrc_full ^= 1; }
-                    cvt_pack_stage = (cvt_pack_stage + 8) % 14;
-                    if (cvt_sf_stage + 2 >= 4) { _phase_sf_full ^= 1; }
-                    cvt_sf_stage = (cvt_sf_stage + 2) % 4;
+                    if (cvt_stage + 4 >= 8) { _phase_smem_b_done ^= 1; }
+                    cvt_stage = (cvt_stage + 4) % 8;
+                    if (cvt_pack_stage + 4 >= 14) { _phase_bsrc_full ^= 1; }
+                    cvt_pack_stage = (cvt_pack_stage + 4) % 14;
+                    cvt_sf_stage += 1;
+                    if (cvt_sf_stage == 4) { cvt_sf_stage = 0; _phase_sf_full ^= 1; }
                 }
-                phase8 = phase8 + num_iters_2 & 7;
+                phase4 = phase4 + num_iters_2 & 3;
             }
         }
     }
