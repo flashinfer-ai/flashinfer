@@ -253,3 +253,57 @@ def test_a_repeated_rmsnorm_sigmoid_gate_call_reuses_its_plan(plans):
         **loader.MODULES[first_plain]["build"],
         "pdl": True,
     }
+
+
+def test_the_admit_index_admits_exactly_the_row_counts_the_loader_scan_admits():
+    """``is_cake_*_supported`` answers a call's row count from the package's admit index (one bisection); the loader's
+    record-by-record ``admits`` is the reference, over every row or token count up to 20000 of every route of every
+    architecture -- the sigmoid gate per head count its route names and one it does not -- and over the calls
+    without a row count (route available; head count named)."""
+    counts = range(1, 20001)
+    for arch in loader.ARCHES:
+        for route, names in loader.ROUTES[arch].items():
+            rules = [loader.MODULES[name].get("select_rule") for name in names]
+            assert pkg._admits(arch, route, None) is loader.route_available(
+                arch, route
+            ), (arch, route)
+            if any(
+                rule is not None and rule["kind"] != loader.SELECT_KIND
+                for rule in rules
+            ):
+                named = sorted(
+                    {
+                        int(window[0])
+                        for rule in rules
+                        if rule is not None
+                        for window in rule.get("routes", {})
+                        .get(route, rule["windows"])
+                        .get(arch, ())
+                    }
+                )
+                for heads in (*named, 64):
+                    scan = [
+                        any(
+                            loader.admits(rule, tokens, arch, heads, route)
+                            for rule in rules
+                        )
+                        for tokens in counts
+                    ]
+                    index = [
+                        pkg._admits(arch, route, tokens, heads) for tokens in counts
+                    ]
+                    assert index == scan, (arch, route, heads)
+                    assert pkg._admits(arch, route, None, heads) is (heads in named), (
+                        arch,
+                        route,
+                        heads,
+                    )
+            else:
+                scan = [
+                    any(loader.admits(rule, rows, arch, route=route) for rule in rules)
+                    for rows in counts
+                ]
+                index = [pkg._admits(arch, route, rows) for rows in counts]
+                assert index == scan, (arch, route)
+    assert not pkg._admits("sm_100a", "no_such_route", 1)
+    assert not pkg._admits("sm_100a", "no_such_route", None)

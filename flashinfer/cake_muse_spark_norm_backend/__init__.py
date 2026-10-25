@@ -47,8 +47,9 @@ the facade's ``"auto"`` keeps the CuTe DSL kernel there.
 
 from __future__ import annotations
 
+import bisect
 import operator
-from typing import Any, Callable, Optional, cast
+from typing import Any, Callable, Iterable, Optional, Sequence, cast
 
 import torch
 import tvm_ffi
@@ -104,6 +105,108 @@ def _arch(device: torch.device) -> Optional[str]:
     return arch_for_capability(_capability(device))
 
 
+# ----------------------------------------------------------------------------- admit index
+#
+# ``backend="auto"`` asks ``is_cake_*_supported(..., rows=)`` (``heads=`` / ``tokens=`` for the sigmoid gate) on every
+# call.  The loader's ``admits`` answers one record at a time -- a Python loop over the route's records per call, growing
+# with the records before the one that admits the row count.  The index below folds each route's windows, per
+# architecture and (for the sigmoid gate) per head count, into one sorted list of disjoint spans ``above < rows <=
+# at_most`` -- at import for every route of the registry, on first use for any other (arch, route) a call asks (the
+# variant functions spell finitely many) -- so a call answers with one bisection.  It admits exactly the row counts the
+# loader's scan admits: tests/norm/test_cake_muse_spark_norm_launch_plans.py compares the two over every row count up to
+# 20000 of every route.  A test that replaces registry records or route lists resets the index with
+# ``monkeypatch.setattr(pkg, "_ADMIT_INDEX", {})`` after the replacement.
+
+_UNBOUNDED = float("inf")
+_Spans = tuple[list[int], list[float]]
+_RouteIndex = tuple[bool, bool, list[int], list[float], dict[int, _Spans]]
+
+
+def _spans(windows: Iterable[Sequence[Any]]) -> _Spans:
+    """``(aboves, at_mosts)`` of the disjoint spans ``above < rows <= at_most`` that the ``(above, at_most)`` windows
+    cover (``at_most`` ``None`` = unbounded), sorted by ``above``: a window holding no row count is dropped, touching
+    or overlapping windows are merged, so the span holding ``rows`` is the last one whose ``above`` lies below it."""
+    merged: list[list[float]] = []
+    for above, at_most in sorted(
+        (int(above), _UNBOUNDED if at_most is None else int(at_most))
+        for above, at_most in windows
+    ):
+        if at_most <= above:
+            continue
+        if merged and above <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], at_most)
+        else:
+            merged.append([above, at_most])
+    return [int(above) for above, _ in merged], [at_most for _, at_most in merged]
+
+
+def _route_index(arch: str, route: str) -> _RouteIndex:
+    """``(exported, always, aboves, at_mosts, by_heads)`` of ``route`` on ``arch``: ``exported`` when the architecture
+    ships a record of the route (the loader's ``route_available``); ``always`` when a record of the route has no
+    selection rule; the spans of the route's ``rows_between`` windows; the spans of its ``tokens_heads_between``
+    windows per head count.  A rule's ``routes`` spell the windows another route gives the record (a PDL route
+    launching the plain build): the index of that route reads them in place of ``windows``."""
+    always = False
+    row_windows: list[Sequence[Any]] = []
+    head_windows: dict[int, list[Sequence[Any]]] = {}
+    for name in _loader.route_modules(arch, route):
+        rule = _loader.MODULES[name].get("select_rule")
+        if rule is None:
+            always = True
+            continue
+        kind = rule.get("kind")
+        if kind not in _loader.SELECT_KINDS:
+            raise ValueError(f"unknown Cake norm select rule {kind!r}")
+        windows = rule.get("routes", {}).get(route, rule["windows"]).get(arch, ())
+        if kind == _loader.SELECT_KIND:
+            row_windows.extend(windows)
+        else:
+            for count, above, at_most in windows:
+                head_windows.setdefault(int(count), []).append((above, at_most))
+    aboves, at_mosts = _spans(row_windows)
+    return (
+        _loader.route_available(arch, route),
+        always,
+        aboves,
+        at_mosts,
+        {count: _spans(w) for count, w in head_windows.items()},
+    )
+
+
+_ADMIT_INDEX: dict[tuple[str, str], _RouteIndex] = {
+    (arch, route): _route_index(arch, route)
+    for arch, routes in _loader.ROUTES.items()
+    for route in routes
+}
+
+
+def _admits(
+    arch: str, route: str, rows: Optional[int], heads: Optional[int] = None
+) -> bool:
+    """Whether ``arch`` ships a program of ``route`` and, with ``rows``, one of the route's windows admits that row
+    count; for a route selecting on the head count as well (the sigmoid gate), with ``heads``, whether one of its
+    windows names that head count and, with ``rows`` too, holds the token count.  The loader's record-by-record
+    ``admits`` folded into one bisection of the admit index."""
+    entry = _ADMIT_INDEX.get((arch, route))
+    if entry is None:
+        entry = _ADMIT_INDEX[(arch, route)] = _route_index(arch, route)
+    exported, always, aboves, at_mosts, by_heads = entry
+    if not exported:
+        return False
+    if always:
+        return True
+    if heads is not None:
+        spans = by_heads.get(int(heads))
+        if spans is None:
+            return False
+        aboves, at_mosts = spans
+    if rows is None:
+        return True
+    rows = int(rows)
+    i = bisect.bisect_left(aboves, rows)
+    return i > 0 and rows <= at_mosts[i - 1]
+
+
 def gated_residual_next_rmsnorm_variant(
     tensor_alpha: bool, has_post_weight: bool
 ) -> str:
@@ -136,16 +239,8 @@ def is_cake_gated_residual_next_rmsnorm_supported(
     arch = _arch(device)
     if arch is None:
         return False
-    route = gated_residual_next_rmsnorm_route(tensor_alpha, has_post_weight)
-    if not _loader.route_available(arch, route):
-        return False
-    if rows is None:
-        return True
-    return any(
-        _loader.admits(
-            _loader.MODULES[name].get("select_rule"), int(rows), arch, route=route
-        )
-        for name in _loader.route_modules(arch, route)
+    return _admits(
+        arch, gated_residual_next_rmsnorm_route(tensor_alpha, has_post_weight), rows
     )
 
 
@@ -355,16 +450,8 @@ def is_cake_gated_residual_rmsnorm_supported(
     arch = _arch(device)
     if arch is None:
         return False
-    route = gated_residual_rmsnorm_route(weight_before_norm, enable_pdl)
-    if not _loader.route_available(arch, route):
-        return False
-    if rows is None:
-        return True
-    return any(
-        _loader.admits(
-            _loader.MODULES[name].get("select_rule"), int(rows), arch, route=route
-        )
-        for name in _loader.route_modules(arch, route)
+    return _admits(
+        arch, gated_residual_rmsnorm_route(weight_before_norm, enable_pdl), rows
     )
 
 
@@ -696,21 +783,7 @@ def is_cake_rmsnorm_sigmoid_gate_supported(
     if arch is None:
         return False
     route = rmsnorm_sigmoid_gate_route(enable_pdl)
-    if not _loader.route_available(arch, route):
-        return False
-    if heads is None:
-        return True
-    for name in _loader.route_modules(arch, route):
-        rule = _loader.MODULES[name]["select_rule"]
-        windows = rule.get("routes", {}).get(route, rule["windows"]).get(arch, ())
-        for count, above, at_most in windows:
-            if int(count) != int(heads):
-                continue
-            if tokens is None or (
-                tokens > int(above) and (at_most is None or tokens <= int(at_most))
-            ):
-                return True
-    return False
+    return _admits(arch, route, None if heads is None else tokens, heads)
 
 
 def _gate_layout(tensor: torch.Tensor, name: str, device: torch.device) -> int:

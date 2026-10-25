@@ -387,6 +387,9 @@ def test_a_gap_of_the_windows_falls_to_the_cute_kernel(monkeypatch):
     }
     monkeypatch.setitem(loader.MODULES, "gapped_record", gapped)
     monkeypatch.setitem(loader.ROUTES[_arch()], route, ["gapped_record"])
+    monkeypatch.setattr(
+        pkg, "_ADMIT_INDEX", {}
+    )  # the replaced route rebuilds its admit index
     pkg.clear_launch_plans()  # plans prepared under the real registry must not serve the gapped one
     launched = []
     monkeypatch.setattr(pkg, "_launch", lambda *a: launched.append(a))

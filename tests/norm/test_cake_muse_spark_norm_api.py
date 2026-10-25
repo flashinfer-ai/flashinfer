@@ -512,6 +512,9 @@ def test_support_follows_the_row_count_through_the_route_windows(monkeypatch):
     }
     monkeypatch.setitem(loader.MODULES, "gapped_record", gapped)
     monkeypatch.setitem(loader.ROUTES["sm_100a"], route, ["gapped_record"])
+    monkeypatch.setattr(
+        pkg, "_ADMIT_INDEX", {}
+    )  # the replaced route rebuilds its admit index
     assert pkg.is_cake_gated_residual_next_rmsnorm_supported(device)
     assert pkg.is_cake_gated_residual_next_rmsnorm_supported(device, rows=128)
     assert pkg.is_cake_gated_residual_next_rmsnorm_supported(device, rows=257)
@@ -1278,6 +1281,9 @@ def test_gated_residual_rmsnorm_support_follows_the_row_count_through_gaps(monke
     }
     monkeypatch.setitem(loader.MODULES, "gapped_a", gapped)
     monkeypatch.setitem(loader.ROUTES["sm_103a"], route, ["gapped_a"])
+    monkeypatch.setattr(
+        pkg, "_ADMIT_INDEX", {}
+    )  # the replaced route rebuilds its admit index
     form = dict(weight_before_norm=True, enable_pdl=True)
     assert pkg.is_cake_gated_residual_rmsnorm_supported(device, **form)
     for rows in (1, 64, 257, 2048):
@@ -1438,6 +1444,9 @@ def test_rmsnorm_sigmoid_gate_support_follows_the_head_and_token_counts_through_
     }
     monkeypatch.setitem(loader.MODULES, "gapped_c", gapped)
     monkeypatch.setitem(loader.ROUTES["sm_100a"], route, ["gapped_c"])
+    monkeypatch.setattr(
+        pkg, "_ADMIT_INDEX", {}
+    )  # the replaced route rebuilds its admit index
     assert pkg.is_cake_rmsnorm_sigmoid_gate_supported(device)
     assert pkg.is_cake_rmsnorm_sigmoid_gate_supported(device, heads=128)
     assert pkg.is_cake_rmsnorm_sigmoid_gate_supported(device, heads=128, tokens=8)
@@ -1463,6 +1472,9 @@ def test_rmsnorm_sigmoid_gate_support_follows_the_head_and_token_counts_through_
     }
     monkeypatch.setitem(loader.MODULES, "borrowed_c", borrowed)
     monkeypatch.setitem(loader.ROUTES["sm_100a"], pdl_route, ["borrowed_c"])
+    monkeypatch.setattr(
+        pkg, "_ADMIT_INDEX", {}
+    )  # the replaced route rebuilds its admit index
     assert pkg.is_cake_rmsnorm_sigmoid_gate_supported(
         device, heads=16, tokens=1025, enable_pdl=True
     )

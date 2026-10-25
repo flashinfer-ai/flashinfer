@@ -987,8 +987,10 @@ def rmsnorm_sigmoid_gate(
         or device.type != "cuda"
     ):
         raise ValueError("tensors do not satisfy the rmsnorm_sigmoid_gate contract")
-    # One backend decision per call, handed to the implementation as the resolved backend and launch form.
-    enable_pdl = _resolved_pdl(device, enable_pdl)
+    # One backend decision per call, handed to the implementation as the resolved backend; the implementation resolves
+    # the launch form against the device once (the package ships its PDL route on PDL-capable architectures alone, so
+    # the decision reads the requested form).
+    enable_pdl = bool(enable_pdl)
     chosen = _rmsnorm_sigmoid_gate_backend(
         backend,
         device,
