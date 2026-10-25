@@ -34,6 +34,7 @@ from typing import Literal, Optional, Tuple
 
 import torch
 
+from .gdn_kernels.head_sizes import MTP_DECODE_HEAD_SIZES, check_head_sizes
 from .jit.core import logger
 from .utils import get_compute_capability
 
@@ -1488,18 +1489,15 @@ def gated_delta_rule_mtp(
     _, _, HV, V = v.shape
     pool_size = initial_state.shape[0]
 
-    # Dynamic TILE_V and vec_size selection based on batch size and sequence length
+    # Dynamic TILE_V selection based on batch size and sequence length
     tile_v = get_tile_v_mtp(B, T, num_v_heads=HV, v_dim=V)
-    vec_size = get_vec_size_mtp(B, T)
 
     # Validate state shape
     assert initial_state.shape == (pool_size, HV, V, K), (
         f"Expected initial_state shape [pool_size={pool_size}, HV={HV}, V={V}, K={K}], got {initial_state.shape}"
     )
 
-    # Validate K and V constraints
-    assert K >= 128, f"K must be at least 128, got K={K}"
-    assert V >= 128, f"V must be at least 128, got V={V}"
+    check_head_sizes("MTP GDN decode", K, V, MTP_DECODE_HEAD_SIZES)
     assert V % tile_v == 0, (
         f"V must be divisible by {tile_v} to prevent out-of-bounds access, got V={V}"
     )
@@ -1765,7 +1763,6 @@ def gated_delta_rule_mtp(
         pool_size,
         cache_steps,
         tile_v,
-        vec_size,
         scale,
         use_qk_l2norm,
         disable_state_update,
