@@ -9,8 +9,9 @@ https://www.apache.org/licenses/LICENSE-2.0
 The table holds the bin offsets as absolute table indices, then the task ids
 ``sequence * num_heads + head``; tasks go longest first to the least-loaded
 bin (the planner's LPT rule), one bin per SM up to the task count. A launch
-asks for the work-binned program only with more tasks than SMs, and the
-loader resolves it through the work-bin routes.
+asks for the work-binned program only where a bin runs tasks back to back on
+the critical path (its chunk load exceeds the longest task), and the loader
+resolves it through the work-bin routes.
 """
 
 import types
@@ -75,23 +76,45 @@ def test_direct_work_bins_reject_empty_inputs(kwargs):
         )
 
 
+MIXED = (17, 64, 65, 127, 128, 200, 255, 96) * 2
+
+
 @pytest.mark.parametrize(
     ("lengths", "num_heads", "sm_count", "binned"),
     (
+        # At most one task per SM.
         ((64,) * 4, 12, 148, False),
         ((64,) * 4, 16, 152, False),
         ((4096,) * 4, 16, 148, False),
-        ((64,) * 16, 12, 148, True),
-        ((64,) * 64, 16, 152, True),
-        ((1024, 64) * 8, 12, 148, True),
         ((37,) * 37, 4, 148, False),
+        # Equal tasks beyond one per SM: some bin runs two or more back to back.
+        ((64,) * 16, 12, 148, True),
+        ((128,) * 16, 16, 148, True),
+        ((256,) * 16, 12, 152, True),
+        ((64,) * 64, 16, 152, True),
         ((37,) * 37, 4, 147, True),
+        # The longest task alone sets the makespan: short tasks fill the other bins.
+        ((1024, 64) * 8, 12, 148, False),
+        ((1024, 64) * 8, 16, 148, False),
+        (MIXED, 12, 148, False),
+        (MIXED, 16, 148, False),
+        (MIXED, 16, 64, True),
+        # An empty sequence keeps the one-task-per-CTA launch.
+        ((0,) + (64,) * 16, 12, 148, False),
     ),
 )
-def test_direct_work_bins_only_beyond_one_task_per_sm(
+def test_direct_work_bins_only_where_a_bin_chains_tasks(
     lengths, num_heads, sm_count, binned
 ):
-    assert runtime._use_direct_work_bins(len(lengths) * num_heads, sm_count) is binned
+    assert (
+        runtime._use_direct_work_bins(
+            lengths,
+            num_heads=num_heads,
+            sm_count=sm_count,
+            chunk_tokens=runtime.BF16_M128_CHUNK,
+        )
+        is binned
+    )
 
 
 def test_factory_takes_the_work_bin_program_only_when_asked(monkeypatch):

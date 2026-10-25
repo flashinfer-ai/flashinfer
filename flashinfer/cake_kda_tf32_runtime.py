@@ -1516,14 +1516,34 @@ def _make_direct_work_bins(
     return tuple(table), num_bins
 
 
-def _use_direct_work_bins(total_tasks: int, sm_count: int) -> bool:
+def _use_direct_work_bins(
+    seq_lens: tuple[int, ...], *, num_heads: int, sm_count: int, chunk_tokens: int
+) -> bool:
     """Whether a direct M128 launch asks for its program built with work bins.
 
-    Bins pay where one CTA per (sequence, head) task needs more than one wave:
-    with more tasks than SMs, one bin per SM runs its tasks back to back. A
-    launch with at most one task per SM keeps the one-task-per-CTA program.
+    The one-task-per-CTA launch already starts the longest (sequence, head)
+    tasks first, so bins pay only where an SM runs tasks back to back on the
+    critical path: with more tasks than SMs and a bin assignment
+    (``_make_direct_work_bins``) whose largest bin, in chunks, exceeds the
+    longest task.  Where the longest task alone sets the makespan, with at
+    most one task per SM, or with an empty sequence, the launch keeps the
+    one-task-per-CTA program.
     """
-    return total_tasks > sm_count
+    if not seq_lens or min(seq_lens) <= 0:
+        return False
+    if len(seq_lens) * num_heads <= sm_count:
+        return False
+    table, num_bins = _make_direct_work_bins(
+        seq_lens, num_heads=num_heads, worker_count=sm_count, chunk_tokens=chunk_tokens
+    )
+    chunks = [(length + chunk_tokens - 1) // chunk_tokens for length in seq_lens]
+    largest_bin = max(
+        sum(
+            chunks[task // num_heads] for task in table[table[index] : table[index + 1]]
+        )
+        for index in range(num_bins)
+    )
+    return largest_bin > max(chunks)
 
 
 def _constrained_direct_m128_route(
@@ -2777,7 +2797,15 @@ class FlashKDABlackwellBF16FusedLaunch:
                     _factory,
                     "compiled_bf16_fused_m128",
                     route_work_bins=route == BF16_ROUTE_DIRECT_M128
-                    and _use_direct_work_bins(total_tasks, sm_count),
+                    and _use_direct_work_bins(
+                        tuple(
+                            offsets[index + 1] - offsets[index]
+                            for index in range(num_seqs)
+                        ),
+                        num_heads=num_heads,
+                        sm_count=sm_count,
+                        chunk_tokens=BF16_M128_CHUNK,
+                    ),
                 ),
                 BF16_N16_M128_CHUNK if use_direct_m128_n16 else BF16_M128_CHUNK,
                 serving_native_abi=serving_native_abi,
