@@ -792,6 +792,71 @@ def _ffi_raw_pointer_carrier(tensor):
     return carrier
 
 
+def _ffi_arguments(arguments) -> tuple:
+    """Positional FFI arguments with every torch tensor exported to tvm-ffi once.
+
+    A tvm-ffi call converts each torch tensor argument through DLPack on every
+    call and, on the first CUDA tensor, looks up torch's current stream for the
+    call. A launch record holds the converted tensors instead: the same data
+    pointer, shape, strides and dtype reach the binding, and the binding takes
+    its stream from the enclosing :func:`_ffi_stream_context` (the caller's
+    current torch stream, which is the capture stream under CUDA-graph capture).
+    The tvm-ffi tensors keep their torch storage alive like the argument dicts.
+    """
+    import torch
+    import tvm_ffi
+
+    return tuple(
+        tvm_ffi.from_dlpack(value) if isinstance(value, torch.Tensor) else value
+        for value in arguments
+    )
+
+
+def _prepared_kernel_record(module, grid, bindings) -> tuple:
+    """(native entry, positional arguments) of one ``PreparedKernel.launch``."""
+    if not module._ready:
+        raise RuntimeError("TMA descriptors must be initialized during preparation")
+    return module._call, _ffi_arguments(module._arguments(grid, bindings))
+
+
+def _run_launch_records(records) -> None:
+    for call, arguments in records:
+        call(*arguments)
+
+
+def _settled_launch_records(launch) -> list:
+    """Re-encode a part's moved descriptors on the current stream, then return its records."""
+    if launch._descriptors_stale:
+        launch._prepare_descriptors_in_stream()
+    return launch._build_launch_records()
+
+
+def _invalidate_launch_records(impl) -> None:
+    """Drop the stored launch records of a launch and of its composite parts."""
+    impl.__dict__.pop("_launch_records", None)
+    for sub_name in AFFINE_SUB_LAUNCHES:
+        sub = impl.__dict__.get(sub_name)
+        if sub is not None:
+            sub.__dict__.pop("_launch_records", None)
+
+
+# Chain-route window-map bodies that may run ahead of the index gather and the
+# main kernel.  Each body reads only its own tail inputs (q / k / g / beta
+# tails, the zero value rows, the identity initial map, A_log, dt_bias, tail
+# sequence offsets) and writes only its own map state and map output; its
+# ``initial_state_f32`` argument (bound to the main kernel's final states) is
+# never dereferenced, and every data access follows the body's grid-dependency
+# wait.  The scan kernel waits on the main kernel at its first instruction and
+# reads the map state that the index gather (a plain launch after the map)
+# already ordered.
+_MAP_FIRST_MODULES = frozenset(
+    (
+        "cake_kda_bf16_f74a288bb51b335a1ccf",
+        "cake_kda_bf16_5639519f5c942ed86e4f",
+    )
+)
+
+
 # Bodies that reach an operand only through its TMA descriptor never
 # dereference the raw pointer argument of the same name.  The generated FFI
 # shim still applies the contiguous-by-default host contract to that pointer,
@@ -3101,6 +3166,10 @@ class FlashKDABlackwellBF16FusedLaunch:
         self._cuda_graph_warmed = False
 
     _descriptors_stale = False
+    # Every operation of one launch() in order, as (callable, positional
+    # arguments) with the arguments final; built once per binding and dropped
+    # by a plan-cache rebind (_invalidate_launch_records).
+    _launch_records: tuple | None = None
 
     def _prepare_descriptors_in_stream(self) -> None:
         """Encode and upload every TMA descriptor on the current stream."""
@@ -3109,19 +3178,33 @@ class FlashKDABlackwellBF16FusedLaunch:
         self.module.prepare(grid=self.grid, **self.args)
         self._descriptors_stale = False
 
+    def _build_launch_records(self) -> list:
+        """The staging copies and kernel launches of one launch(), in order."""
+        records = [
+            (destination.copy_, (source,))
+            for destination, source in self._token_storage_refreshes
+        ]
+        if self._beta_tma_valid is not None:
+            records.append((self._beta_tma_valid.copy_, (self._beta_tma_source,)))
+        if self.prepare_module is not None:
+            records.append(
+                _prepared_kernel_record(
+                    self.prepare_module, self.prepare_grid, self.prepare_args
+                )
+            )
+        records.append(_prepared_kernel_record(self.module, self.grid, self.args))
+        return records
+
     def _launch_in_stream(self) -> None:
         """Launch inside an already entered FFI/Torch stream context."""
         if self._descriptors_stale:
             # A plan-cache rebind moved a descriptor source; re-encode in
             # the same stream context as the launch it precedes.
             self._prepare_descriptors_in_stream()
-        for destination, source in self._token_storage_refreshes:
-            destination.copy_(source)
-        if self._beta_tma_valid is not None:
-            self._beta_tma_valid.copy_(self._beta_tma_source)
-        if self.prepare_module is not None:
-            self.prepare_module.launch(grid=self.prepare_grid, **self.prepare_args)
-        self.module.launch(grid=self.grid, **self.args)
+        records = self._launch_records
+        if records is None:
+            records = self._launch_records = tuple(self._build_launch_records())
+        _run_launch_records(records)
 
     def _launch_uncaptured(self) -> None:
         with _ffi_stream_context(self._launch_device):
@@ -4053,10 +4136,35 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         self._cuda_graph_warmed = False
         self._cuda_graph = None
         self._cuda_graph_capture_stream = None
+        # The window-map kernel of the chain route runs ahead of the index
+        # gather and the main kernel (see _MAP_FIRST_MODULES): it fills the
+        # host gap before the main launch instead of waiting for the main
+        # kernel it does not depend on.
+        self._map_first = (
+            not self._apply_route
+            and self._correction is not None
+            and self._map.prepare_module is None
+            and getattr(self._map.module, "name", None) in _MAP_FIRST_MODULES
+        )
 
     def _launch_uncaptured(self) -> None:
-        import torch
+        with _ffi_stream_context(self._launch_device):
+            records = self._launch_records
+            if records is None or self._descriptors_stale:
+                self._launch_building_records()
+            else:
+                _run_launch_records(records)
 
+    def _launch_building_records(self) -> None:
+        """Launch once while (re)building the launch records.
+
+        Runs on the first launch, after a plan-cache rebind (which drops the
+        records) and on a hit under CUDA-graph capture (which marks the
+        composite stale).  Every descriptor re-encode is enqueued right before
+        the first kernel that reads it, and a deferred map/correction rebind is
+        applied while the first chain kernel runs.  Later calls fire the
+        stored records back to back with no host work between two launches.
+        """
         if self._descriptors_stale:
             # A plan-cache hit under CUDA-graph capture marks the composite;
             # every part re-encodes its descriptors in its own stream context.
@@ -4070,155 +4178,217 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             self._apply_descriptors_stale = bool(self._apply_route)
             self._apply_prefix_stale = bool(self._apply_route)
             self._descriptors_stale = False
-        with _ffi_stream_context(self._launch_device):
-            for destination, source in self._affine_input_refreshes:
-                destination.copy_(source)
-            if self._fused_epilogue is not None:
-                # One kernel gathers every per-call index the parts consume
-                # (window state indices, in-place row starts, the int64 state
-                # indices of the epilogue); the torch sequence below costs
-                # four launches on the host path before the first chain kernel.
-                rows = self._checkpoint_in_place
-                self._fused_epilogue.index_prep(
-                    self._state_indices,
-                    self._first_parts,
-                    self._part_state_indices,
-                    self._state_indices_long,
-                    self._checkpoint_start if rows else self._first_parts,
-                    self._part_seq_ids if rows else self._first_parts,
-                    self._part_local_rows if rows else self._first_parts,
-                    self._part_row_starts if rows else self._first_parts,
-                    self.num_parts if rows else 0,
-                )
-            else:
-                self._part_state_indices.index_copy_(
-                    0, self._first_parts, self._state_indices
-                )
-                if self._checkpoint_in_place:
-                    starts = self._part_row_starts[: self.num_parts]
-                    torch.index_select(
-                        self._checkpoint_start, 0, self._part_seq_ids, out=starts
-                    )
-                    starts.add_(self._part_local_rows)
-            # The parts share this stream context (no re-entry per part).
-            self._main._launch_in_stream()
-            # The map/correction rebinds of a plan-cache hit were deferred
-            # past the first chain kernel; apply them while it runs.
+        map_first = self._map_first
+        if map_first:
+            # The map is the first chain kernel: its rebind lands before it.
             flush_deferred_rebind(self)
-            if self._fused_epilogue is None and not self._apply_route:
-                # The int64 index copy is only consumed by the final-state
-                # scatter, so it follows the first chain kernel.
-                self._state_indices_long.copy_(self._state_indices)
-            if self._apply_route and getattr(self, "_apply_descriptors_stale", False):
-                if getattr(self, "_apply_prefix_stale", False):
-                    # Only the fused apply kernel stores through the caller's
-                    # out_tma / rows_tma (the pair-map producer runs the same
-                    # ABI in PAIRMAP mode and writes launch-owned maps only;
-                    # the prefix chain addresses launch-owned buffers), so a
-                    # plan-cache rebind re-uploads one descriptor set and the
-                    # pair-map / prefix sets re-prepare only on the capture /
-                    # full-stale path.
-                    self._pairmap_module.prepare(
-                        grid=self._pairmap_grid, **self._pairmap_bindings()
-                    )
-                    self._prefix_module.prepare(
-                        grid=self._prefix_grid, **self._prefix_bindings()
-                    )
-                    self._apply_prefix_stale = False
-                self._apply_module.prepare(
-                    grid=self._apply_grid, **self._apply_bindings()
-                )
-                self._apply_descriptors_stale = False
-            if self._apply_route and self._lean_map:
-                self._launch_lean_map()
-            else:
-                self._map._launch_in_stream()
-            self._scan_module.launch(
-                grid=(self._num_sequences * int(self._main_final.shape[1]) * 32, 1, 1),
-                split_state=self._main_final,
-                map_state_bf16=self._map_state,
-                carry=self._carry,
-                carry_hi=self._carry_hi,
-                carry_lo=self._carry_lo,
-                num_heads=int(self._main_final.shape[1]),
-                part_cu_seqlens=self._part_cu_seqlens,
-                **self._scan_epilogue_bindings(),
-            )
-            if self._use_output_projection:
-                self._projection_module.launch(
-                    grid=self._projection_grid, **self._projection_args
-                )
-            elif self._apply_route:
-                self._launch_apply()
-            else:
-                self._correction._launch_in_stream()
-            if self._apply_route:
-                # The scan kernel wrote the final states into the pool and the
-                # row-0 carries into the checkpoint rows: no epilogue launch.
-                return
-            if self._fused_epilogue is not None:
-                self._launch_fused_epilogue()
-                return
-            if self._checkpoint_output is not None and not self._checkpoint_in_place:
-                self._checkpoint_merged_first.copy_(self._checkpoint_main_first)
-                torch.add(
-                    self._checkpoint_main_tail,
-                    self._checkpoint_correction,
-                    out=self._checkpoint_merged_tail,
-                )
-                if self._num_sequences == 1:
-                    torch.add(
-                        self._checkpoint_offsets,
-                        self._checkpoint_start,
-                        out=self._checkpoint_indices,
-                    )
-                else:
-                    torch.index_select(
-                        self._checkpoint_start,
-                        0,
-                        self._checkpoint_sequence_ids,
-                        out=self._checkpoint_indices,
-                    )
-                    self._checkpoint_indices.add_(self._checkpoint_offsets)
-                self._checkpoint_output.index_copy_(
-                    0, self._checkpoint_indices, self._checkpoint_merged
-                )
-            if not (self._apply_route and self._apply_out_fused):
-                assert self._correction_out is not None
-                self._out_tail.add_(self._correction_out)
-            if not self._use_output_projection:
-                if self._num_sequences == 1:
-                    torch.add(
-                        self._main_final[-1:],
-                        self._correction_final[-1:],
-                        out=self._final_compact,
-                    )
-                else:
-                    torch.index_select(
-                        self._main_final,
-                        0,
-                        self._last_parts,
-                        out=self._final_main_selected,
-                    )
-                    torch.index_select(
-                        self._correction_final,
-                        0,
-                        self._last_correction_parts,
-                        out=self._final_correction_selected,
-                    )
-                    if self._zero_first_correction:
-                        self._final_correction_selected[:1].zero_()
-                    torch.add(
-                        self._final_main_selected,
-                        self._final_correction_selected,
-                        out=self._final_compact,
-                    )
-            self._final_pool.index_copy_(
-                0, self._state_indices_long, self._final_compact
-            )
+        records: list = []
 
-    def _launch_fused_epilogue(self) -> None:
-        """One kernel: checkpoint-row merge/scatter, tail add, final state."""
+        def fire(part) -> None:
+            _run_launch_records(part)
+            records.extend(part)
+
+        fire(
+            [
+                (destination.copy_, (source,))
+                for destination, source in self._affine_input_refreshes
+            ]
+        )
+        if map_first:
+            fire(self._map_records())
+        if self._fused_epilogue is not None:
+            # One kernel gathers every per-call index the parts consume
+            # (window state indices, in-place row starts, the int64 state
+            # indices of the epilogue).
+            fire(
+                [
+                    (
+                        self._fused_epilogue.index_prep,
+                        _ffi_arguments(self._index_prep_arguments()),
+                    )
+                ]
+            )
+        else:
+            fire([(self._gather_indices_with_torch, ())])
+        fire(_settled_launch_records(self._main))
+        # The map/correction rebinds of a plan-cache hit were deferred past
+        # the first chain kernel; apply them while it runs.
+        flush_deferred_rebind(self)
+        if self._fused_epilogue is None and not self._apply_route:
+            # The int64 index copy is only consumed by the final-state
+            # scatter, so it follows the first chain kernel.
+            fire([(self._state_indices_long.copy_, (self._state_indices,))])
+        if not map_first:
+            fire(self._map_records())
+        scan_grid = (self._num_sequences * int(self._main_final.shape[1]) * 32, 1, 1)
+        fire(
+            [
+                _prepared_kernel_record(
+                    self._scan_module, scan_grid, self._scan_bindings()
+                )
+            ]
+        )
+        if self._use_output_projection:
+            fire(
+                [
+                    _prepared_kernel_record(
+                        self._projection_module,
+                        self._projection_grid,
+                        self._projection_args,
+                    )
+                ]
+            )
+        elif self._apply_route:
+            fire(
+                [
+                    _prepared_kernel_record(
+                        self._apply_module, self._apply_grid, self._apply_bindings()
+                    )
+                ]
+            )
+        else:
+            fire(_settled_launch_records(self._correction))
+        if not self._apply_route:
+            # The apply route's scan kernel wrote the final states into the
+            # pool and the row-0 carries into the checkpoint rows.
+            if self._fused_epilogue is not None:
+                fire(
+                    [
+                        (
+                            self._fused_epilogue.run,
+                            _ffi_arguments(self._fused_epilogue_arguments()),
+                        )
+                    ]
+                )
+            else:
+                fire([(self._torch_epilogue, ())])
+        self._launch_records = tuple(records)
+
+    def _map_records(self) -> list:
+        """Window maps: the apply route's pair-map + prefix chain, else the map launch."""
+        if self._apply_route and getattr(self, "_apply_descriptors_stale", False):
+            if getattr(self, "_apply_prefix_stale", False):
+                # Only the fused apply kernel stores through the caller's
+                # out_tma / rows_tma (the pair-map producer runs the same ABI
+                # in PAIRMAP mode and writes launch-owned maps only; the prefix
+                # chain addresses launch-owned buffers), so a plan-cache rebind
+                # re-uploads one descriptor set and the pair-map / prefix sets
+                # re-prepare only on the capture / full-stale path.
+                self._pairmap_module.prepare(
+                    grid=self._pairmap_grid, **self._pairmap_bindings()
+                )
+                self._prefix_module.prepare(
+                    grid=self._prefix_grid, **self._prefix_bindings()
+                )
+                self._apply_prefix_stale = False
+            self._apply_module.prepare(grid=self._apply_grid, **self._apply_bindings())
+            self._apply_descriptors_stale = False
+        if self._apply_route and self._lean_map:
+            return [
+                _prepared_kernel_record(
+                    self._pairmap_module, self._pairmap_grid, self._pairmap_bindings()
+                ),
+                _prepared_kernel_record(
+                    self._prefix_module, self._prefix_grid, self._prefix_bindings()
+                ),
+            ]
+        return _settled_launch_records(self._map)
+
+    def _index_prep_arguments(self) -> tuple:
+        rows = self._checkpoint_in_place
+        return (
+            self._state_indices,
+            self._first_parts,
+            self._part_state_indices,
+            self._state_indices_long,
+            self._checkpoint_start if rows else self._first_parts,
+            self._part_seq_ids if rows else self._first_parts,
+            self._part_local_rows if rows else self._first_parts,
+            self._part_row_starts if rows else self._first_parts,
+            self.num_parts if rows else 0,
+        )
+
+    def _scan_bindings(self) -> dict:
+        heads = int(self._main_final.shape[1])
+        return dict(
+            split_state=self._main_final,
+            map_state_bf16=self._map_state,
+            carry=self._carry,
+            carry_hi=self._carry_hi,
+            carry_lo=self._carry_lo,
+            num_heads=heads,
+            part_cu_seqlens=self._part_cu_seqlens,
+            **self._scan_epilogue_bindings(),
+        )
+
+    def _gather_indices_with_torch(self) -> None:
+        import torch
+
+        self._part_state_indices.index_copy_(0, self._first_parts, self._state_indices)
+        if self._checkpoint_in_place:
+            starts = self._part_row_starts[: self.num_parts]
+            torch.index_select(
+                self._checkpoint_start, 0, self._part_seq_ids, out=starts
+            )
+            starts.add_(self._part_local_rows)
+
+    def _torch_epilogue(self) -> None:
+        """Torch glue of the chain route without the fused epilogue kernel."""
+        import torch
+
+        if self._checkpoint_output is not None and not self._checkpoint_in_place:
+            self._checkpoint_merged_first.copy_(self._checkpoint_main_first)
+            torch.add(
+                self._checkpoint_main_tail,
+                self._checkpoint_correction,
+                out=self._checkpoint_merged_tail,
+            )
+            if self._num_sequences == 1:
+                torch.add(
+                    self._checkpoint_offsets,
+                    self._checkpoint_start,
+                    out=self._checkpoint_indices,
+                )
+            else:
+                torch.index_select(
+                    self._checkpoint_start,
+                    0,
+                    self._checkpoint_sequence_ids,
+                    out=self._checkpoint_indices,
+                )
+                self._checkpoint_indices.add_(self._checkpoint_offsets)
+            self._checkpoint_output.index_copy_(
+                0, self._checkpoint_indices, self._checkpoint_merged
+            )
+        assert self._correction_out is not None
+        self._out_tail.add_(self._correction_out)
+        if not self._use_output_projection:
+            if self._num_sequences == 1:
+                torch.add(
+                    self._main_final[-1:],
+                    self._correction_final[-1:],
+                    out=self._final_compact,
+                )
+            else:
+                torch.index_select(
+                    self._main_final, 0, self._last_parts, out=self._final_main_selected
+                )
+                torch.index_select(
+                    self._correction_final,
+                    0,
+                    self._last_correction_parts,
+                    out=self._final_correction_selected,
+                )
+                if self._zero_first_correction:
+                    self._final_correction_selected[:1].zero_()
+                torch.add(
+                    self._final_main_selected,
+                    self._final_correction_selected,
+                    out=self._final_compact,
+                )
+        self._final_pool.index_copy_(0, self._state_indices_long, self._final_compact)
+
+    def _fused_epilogue_arguments(self) -> tuple:
         fused = self._fused_epilogue
         merge_rows = (
             self._checkpoint_output is not None and not self._checkpoint_in_place
@@ -4242,7 +4412,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 self._last_parts,
                 self._last_parts,
             )
-        fused.run(
+        return (
             *rows,
             fused.first_rows,
             fused.num_rows,
@@ -4268,18 +4438,6 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             # output tail; the epilogue then skips the tail add.
             0 if getattr(self, "_apply_out_fused", False) else fused.tail_elems,
             int(merge_rows),
-        )
-
-    def _launch_lean_map(self, *, maps=None, map_final=None) -> None:
-        """Pair-map producer + prefix chain: the 64-token prefix maps and window maps from the exported operators."""
-
-        self._pairmap_module.launch(
-            grid=self._pairmap_grid,
-            **self._pairmap_bindings(maps=maps, map_final=map_final),
-        )
-        self._prefix_module.launch(
-            grid=self._prefix_grid,
-            **self._prefix_bindings(maps=maps, map_final=map_final),
         )
 
     def _pairmap_bindings(self, *, maps=None, map_final=None) -> dict:
@@ -4375,15 +4533,6 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             row_starts=self._part_row_starts,
             write_rows=int(self._checkpoint_in_place),
         )
-
-    def _launch_apply(self) -> None:
-        """Fused apply kernel: S_w^in (BF16 hi/lo) x prefix maps x exported chunk operators.
-
-        Row 0 of every tail window (the state entering it) and the sequence
-        final states are written by the scan kernel.
-        """
-
-        self._apply_module.launch(grid=self._apply_grid, **self._apply_bindings())
 
     def _apply_bindings(self) -> dict:
         """Kernel arguments of the fused apply kernel.
@@ -5140,6 +5289,8 @@ def _apply_rebind_specs(
     """Re-point the given view/address specs; mark owners whose TMA sources moved."""
     import torch
 
+    # The stored launch records hold the previous binding's arguments.
+    _invalidate_launch_records(impl)
     containers = _rebind_containers(impl)
     tma_moved = False
     resolved: dict[tuple, Any] = {}
