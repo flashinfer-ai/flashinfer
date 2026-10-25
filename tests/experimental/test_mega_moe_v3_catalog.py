@@ -25,9 +25,15 @@ def expected_block_m(num_tokens):
 
 def expected_source_form(num_experts, num_tokens):
     """``(readiness, slot_list)`` of a TP/EP row's generated program: per-block
-    readiness on every row; the per-expert slot list on every row but the
-    one-token rows, whose program folds the dispatch metadata instead."""
-    return "block", num_tokens != 1
+    readiness with the per-expert slot list on every row but the one-token
+    rows, whose program folds the dispatch metadata instead, and the two
+    384-expert four-token rows, whose program waits for the whole dispatch
+    (grid readiness, no slot list)."""
+    if num_tokens == 1:
+        return "block", False
+    if num_experts == 384 and num_tokens == 4:
+        return "grid", False
+    return "block", True
 
 
 def _catalog():
