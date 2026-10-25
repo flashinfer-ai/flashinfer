@@ -184,7 +184,7 @@ __device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_cake_tinygemm2_tcgen05_bf37103a836956cde306(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ bias, int M, int N, int K)
+kernel_cake_tinygemm2_tcgen05_e610d4eb6c9b0fecb5d9(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ bias, int M, int N, int K)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -589,18 +589,6 @@ kernel_cake_tinygemm2_tcgen05_bf37103a836956cde306(const __grid_constant__ CUten
             }
             int row_in = lane;
             int col_half = 0;
-            int bm0 = m0_e + epi_tid % 32;
-            int _min_0_2 = ((bm0) < (M - 1) ? (bm0) : (M - 1));
-            float bv0 = bias[_min_0_2];
-            int bm1 = m0_e + (epi_tid + 128) % 32;
-            int _min_1_2 = ((bm1) < (M - 1) ? (bm1) : (M - 1));
-            float bv1 = bias[_min_1_2];
-            int bm2 = m0_e + (epi_tid + 256) % 32;
-            int _min_2 = ((bm2) < (M - 1) ? (bm2) : (M - 1));
-            float bv2 = bias[_min_2];
-            int bm3 = m0_e + (epi_tid + 384) % 32;
-            int _min_3 = ((bm3) < (M - 1) ? (bm3) : (M - 1));
-            float bv3 = bias[_min_3];
             unsigned int _phase_mma_epi_full_0 = 0;
             mbarrier_wait(mma_epi_full_addr, _phase_mma_epi_full_0);
             _phase_mma_epi_full_0 ^= 1;
@@ -637,9 +625,8 @@ kernel_cake_tinygemm2_tcgen05_bf37103a836956cde306(const __grid_constant__ CUten
                 float s012_0 = s01_0 + red[elem0 + 1024];
                 float tot0 = s012_0 + red[elem0 + 1536];
                 int my_m0 = m0_e + r_e0;
-                float totb0 = tot0 + bv0;
                 if (my_m0 < M && n0_e + col_e0 < N) {
-                    *(reinterpret_cast<__nv_bfloat16*>(out + (my_m0 + (n0_e + col_e0) * M)) + (0)) = (__nv_bfloat16)totb0;
+                    *(reinterpret_cast<__nv_bfloat16*>(out + (my_m0 + (n0_e + col_e0) * M)) + (0)) = (__nv_bfloat16)tot0;
                 }
             }
             int elem1 = epi_tid + 128;
@@ -650,9 +637,8 @@ kernel_cake_tinygemm2_tcgen05_bf37103a836956cde306(const __grid_constant__ CUten
                 float s012_1 = s01_1 + red[elem1 + 1024];
                 float tot1 = s012_1 + red[elem1 + 1536];
                 int my_m1 = m0_e + r_e1;
-                float totb1 = tot1 + bv1;
                 if (my_m1 < M && n0_e + col_e1 < N) {
-                    *(reinterpret_cast<__nv_bfloat16*>(out + (my_m1 + (n0_e + col_e1) * M)) + (0)) = (__nv_bfloat16)totb1;
+                    *(reinterpret_cast<__nv_bfloat16*>(out + (my_m1 + (n0_e + col_e1) * M)) + (0)) = (__nv_bfloat16)tot1;
                 }
             }
             int elem2 = epi_tid + 256;
@@ -663,9 +649,8 @@ kernel_cake_tinygemm2_tcgen05_bf37103a836956cde306(const __grid_constant__ CUten
                 float s012_2 = s01_2 + red[elem2 + 1024];
                 float tot2 = s012_2 + red[elem2 + 1536];
                 int my_m2 = m0_e + r_e2;
-                float totb2 = tot2 + bv2;
                 if (my_m2 < M && n0_e + col_e2 < N) {
-                    *(reinterpret_cast<__nv_bfloat16*>(out + (my_m2 + (n0_e + col_e2) * M)) + (0)) = (__nv_bfloat16)totb2;
+                    *(reinterpret_cast<__nv_bfloat16*>(out + (my_m2 + (n0_e + col_e2) * M)) + (0)) = (__nv_bfloat16)tot2;
                 }
             }
             int elem3 = epi_tid + 384;
@@ -676,9 +661,8 @@ kernel_cake_tinygemm2_tcgen05_bf37103a836956cde306(const __grid_constant__ CUten
                 float s012_3 = s01_3 + red[elem3 + 1024];
                 float tot3 = s012_3 + red[elem3 + 1536];
                 int my_m3 = m0_e + r_e3;
-                float totb3 = tot3 + bv3;
                 if (my_m3 < M && n0_e + col_e3 < N) {
-                    *(reinterpret_cast<__nv_bfloat16*>(out + (my_m3 + (n0_e + col_e3) * M)) + (0)) = (__nv_bfloat16)totb3;
+                    *(reinterpret_cast<__nv_bfloat16*>(out + (my_m3 + (n0_e + col_e3) * M)) + (0)) = (__nv_bfloat16)tot3;
                 }
             }
         }

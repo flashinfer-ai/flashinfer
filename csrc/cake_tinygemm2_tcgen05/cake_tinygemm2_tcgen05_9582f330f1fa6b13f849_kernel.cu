@@ -184,7 +184,7 @@ __device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_cake_tinygemm2_tcgen05_96c37e6e2085293c8af5(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ bias, int M, int N, int K)
+kernel_cake_tinygemm2_tcgen05_9582f330f1fa6b13f849(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ bias, int M, int N, int K)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -326,8 +326,6 @@ kernel_cake_tinygemm2_tcgen05_96c37e6e2085293c8af5(const __grid_constant__ CUten
             int n_rounds_b = (n_groups_b + 16 - 1) / 16;
             unsigned int _phase_tma_empty_1 = 1;
             if (elect_sync()) {
-                asm volatile("griddepcontrol.wait;" ::: "memory");
-                asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
                 #pragma unroll 1
                 for (int rho_1 = 0; rho_1 < n_rounds_b; rho_1++) {
                     int s0b = rho_1 * 16;
