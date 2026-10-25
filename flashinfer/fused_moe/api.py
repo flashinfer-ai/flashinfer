@@ -2946,14 +2946,16 @@ class CudnnFrostMxfp8Mxfp4Config:
 
 @dataclass(frozen=True)
 class FrostLowLatencyConfig:
-    """Low-token routed MoE on SM100/SM103/SM107, with FMA-only SM120 support.
+    """Low-token routed MoE on SM80/SM90/SM100/SM103/SM107/SM120.
+
+    SM80 supports BF16/FP16 inputs and weights.
 
     SM90 supports BF16, FP16, ordinary per-tensor FP8, DeepSeek FP8 and
-    NVFP4/MXFP4/MXINT4-weight with BF16-activation FMA.
+    NVFP4/MXFP4/MXINT4-weight with BF16/FP16-activation FMA.
     Explicit opt-in; omitted from the default backend list. Autotuning selects
     Tensor Core tile sizes or a scalar FMA tactic (top-k <= 32) using the same
     prepared weights and numerical contract. Both are multi-kernel pipelines,
-    with precomputed routing and no EP communication. The Tensor Core path
+    with precomputed routing and no EP communication. The MX Tensor Core path
     overlaps its fused GU/activation/quantizer and Down GEMM through PDL.
     Set ``max_num_tokens`` up to 8 for tuning; the default admits at most 2.
     Prepare other backend views as well to permit fallback for larger inputs.
@@ -2965,33 +2967,48 @@ class FrostLowLatencyConfig:
     outputs to the configured BF16/FP16 output dtype. Combine uses ordered,
     separate FP32 multiplication and addition. Packed routing scores retain
     BF16 rounding regardless of the input/output dtype. This is distinct from
-    the MX intermediate quantization/combine contract.
+    the MX intermediate quantization/combine contract. SM80, SM90 and SM120 also
+    offer grouped BF16/FP16 Tensor Core candidates at H=2048/I=512/top-k=10,
+    T=4 or 8, with finalized matching output dtype. SM80 admits default SwiGLU
+    and ReLU2; SM90/SM120 add GeGLU, and ReLU2/SiLU use T8 on SM90 and T4/T8
+    on SM120. SM120 also admits GeGLUTanh and default SiTU/SwiGLUStep
+    at T4/T8 with matching BF16/FP16 types. SM80 additionally admits BF16 default SwiGLU at
+    H=7168/I=2048/top-k=8 and T=4 or 8. These projections share the typed
+    intermediate and ordered combine contract;
+    FMA remains the untuned default and a tuning candidate.
 
     Ordinary per-tensor E4M3 FP8 uses static calibration multipliers, with
     BF16 FC1 preactivation rounding as in the CUTLASS per-tensor backbone.
     Activation and intermediate quantization remain fused into FC1; FC2
     produces BF16 expert/final outputs with ordered FP32 multiply/add combine.
+    On SM90, finalized default SwiGLU/SiTU at H=2048/I=512/top-k=10, T=4 or 8,
+    and ReLU2 at T=8 also offer grouped E4M3 WGMMA with bounded-K64 FP32 partial
+    promotion. SM120 adds grouped E4M3 warp MMA for the same shape, with
+    default SwiGLU/SiTU/ReLU2 at T4/T8. Static scales stay live, and FMA
+    remains the untuned default and tuning candidate.
     The TRT-LLM per-tensor path retains FP32 preactivations, so its rounding
     contract differs even with identical quantized weights and scales.
 
-    E4M3 weight-only mode uses BF16 inputs and intermediates, with per-expert
-    FP32 weight scales. It shares the same FMA bodies, BF16 FC1 preactivation
-    and ordered output combine; no activation quantization is required.
+    E4M3 weight-only mode uses BF16/FP16 inputs and intermediates, with
+    per-expert FP32 weight scales. FC1 preactivation rounds to the input dtype;
+    expert outputs round to the independently configured BF16/FP16 dtype.
+    No activation quantization is required.
 
     DeepSeek FP8 preserves FP32 preactivation and 128x128 weight block scales.
     BF16 input is quantized per 128 values; prequantized E4M3 input retains
     its supplied FP32 scales. The intermediate is dynamically quantized to
     E4M3 before FC2; expert outputs and ordered combine follow BF16 rounding.
 
-    FP4 weight-only modes keep BF16 input/preactivation/intermediate/expert
-    rounding and canonical E2M1 payloads. NVFP4 uses linear E4M3 K16 scales;
+    FP4 weight-only modes preserve canonical E2M1 payloads with BF16/FP16
+    input, preactivation and intermediate rounding. Expert outputs use the
+    configured BF16/FP16 output dtype. NVFP4 uses linear E4M3 K16 scales;
     MXFP4 uses E8M0 K32 scales and FP32 dequantization to retain its wider
     range. It uses software decoding on SM90 and native FP4 conversion on Blackwell/Rubin, sharing
     the BF16 FMA schedule and typed activation/combine implementation.
     H must be divisible by 128; logical I is padded to 128 from multiples of 32.
 
     MXINT4 weight-only mode preserves signed INT4 payloads and BF16 K32
-    scales. It retains FP32 preactivation, then BF16 intermediate/expert
+    scales. It retains FP32 preactivation, then BF16/FP16 intermediate/expert
     rounding and ordered FP32 combine through the same two FMA kernels.
 
     NVFP4 weights/inputs use shared FMA with H divisible by 512, I by 128,
@@ -3007,7 +3024,7 @@ class FrostLowLatencyConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in (90, 100, 103, 107, 120)
+        return arch in (80, 90, 100, 103, 107, 120)
 
     @staticmethod
     def prepare_weights(w1, w1_scale, w2, w2_scale, *, activation=None):
@@ -3070,12 +3087,14 @@ class FrostLowLatencyConfig:
 
     @staticmethod
     def prepare_fp8_weight_only_weights(w1, w1_scale, w2, w2_scale, *, activation=None):
-        """Prepare E4M3 weights for BF16 inputs without requantizing the payload.
+        """Prepare E4M3 weights for BF16/FP16 inputs without requantizing the payload.
 
         Canonical weights are [E, 2*I, H] in [up, gate] order, or [E, I, H]
         for non-gated activation, and [E, H, I]. Each FP32 scale is [E] and
         dequantizes that expert's weight matrix. Logical I is padded to 128.
-        Configure FP8PerTensor weights with BF16 activations and BF16 output.
+        Configure FP8PerTensor weights with BF16/FP16 activations and BF16/FP16 output.
+        Preactivation and intermediate round to the activation dtype; expert
+        values round to the output dtype before ordered FP32 combine.
         """
         from .backends.frost_low_latency.prepare import prepare_fp8_weight_only_weights
 
@@ -3092,8 +3111,8 @@ class FrostLowLatencyConfig:
         Weights are uint8 [E,branches*I,H/2] in [up,gate] order and [E,H,I/2].
         Each byte stores the even K value in its low nibble, signed [-8,7].
         H is divisible by 128; logical I is divisible by 32 and padded to 128.
-        Configure MXINT4 weights with BF16 inputs/output. FC1 preactivation
-        remains FP32; activation and expert outputs round to BF16. Preparation
+        Configure MXINT4 weights with BF16/FP16 inputs/output. FC1 preactivation
+        remains FP32; intermediate/expert values use the input/output dtype. Preparation
         never requantizes the weights or reads values back to the host.
         """
         import torch
@@ -3120,7 +3139,8 @@ class FrostLowLatencyConfig:
 
         Canonical gated FC1 rows use [up,gate] order. H is divisible by128;
         logical I is divisible by32 and padded to128. Configure MXFP4 weights
-        with BF16 activations/output. No activation quantization is performed.
+        with BF16/FP16 activations and BF16/FP16 output. No activation
+        quantization is performed.
         """
         import torch
         from .backends.frost_low_latency.fp4_weight_only import prepare_weights
@@ -3155,7 +3175,8 @@ class FrostLowLatencyConfig:
         FP32 global scales dequantize each expert; FC1 accepts [E] or
         [E,branches] and FC2 accepts [E]. H is divisible by 128; logical I
         is divisible by 32 and padded to 128. Configure NVFP4 weights with
-        BF16 inputs/output; no activation quantization is performed.
+        BF16/FP16 inputs and BF16/FP16 output; no activation quantization
+        is performed.
         All tensors must reside on the same CUDA device. Payloads and scales
         from a 4over6 checkpoint are preserved without requantization.
         """

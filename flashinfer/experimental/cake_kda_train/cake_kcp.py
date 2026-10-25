@@ -209,10 +209,10 @@ EXCHANGES = ("auto", "a2a", "ring")
 OFFSET_CLASSES = ("fla", "fp32")
 RING_MAX_HOPS = 2
 TRANSFER_WALKS = (
+    "bf16x3_hw64",
     "tf32_hilo",
     "bf16x3",
-    "bf16x3_hw64",
-)  # K3 program family (non-default only via _kcp_test_knobs)  # exchange="auto" picks the ring when every chain has at most this many hops (SPEC-2)
+)  # K3 program family: the shipped BF16x3 half-width walk first (the others only via _kcp_test_knobs)  # exchange="auto" picks the ring when every chain has at most this many hops (SPEC-2)
 KCP_SAVED_VERSION = 2  # saved set {tables, S_in [, c1 receive tensor, M_seg, carry plane] -- the optional members travel as flags}; version 1 also held the token-row Aqk / Akk
 TEST_KNOBS_ENV = "CAKE_KCP_TEST_KNOBS"
 # Host / plan knobs (test knob class: reachable only through _kcp_test_knobs):
@@ -346,7 +346,7 @@ LOCAL_STAGES_BWD = (
     "dav",
     "dqkg",
     "glm_intra",
-    "gate_epilogue",
+    "gate_epilogue",  # no launch where the plan's GLM intra program fuses it (glm_intra_v14 on sm_103a)
 )
 # The paths of the existing backend's plan the local stages take their records from (the forward without a saved
 # set, the checkpoint replay for both backward modes: :mod:`.cake_kcp_plan`) and the arena layouts they run on.
@@ -718,7 +718,8 @@ class KernelBackend(Backend):
 
     def stage(self, name: str, call: KcpCall, **extra: Any) -> None:
         """One local stage of :data:`LOCAL_STAGES_FWD` / :data:`LOCAL_STAGES_BWD`: the plan's record on the call's path
-        (or the direct WY record), the KCP-owned record of ``fwd_o`` / ``dav``."""
+        (or the direct WY record), the KCP-owned record of ``fwd_o`` / ``dav``; nothing for an optional stage the plan
+        does not launch on the path (``gate_epilogue`` where ``glm_intra_v14`` writes the gate gradients itself)."""
         values, views = call.local_values, call.scratch["views"]
         local = call.local
         p = local.plan
@@ -754,6 +755,12 @@ class KernelBackend(Backend):
                 device_index=local.device_index,
             )
             return
+        if (
+            name in cake_jit.OPTIONAL_STAGES
+            and name not in WY_DIRECT_RECORDS
+            and not p.dispatched(name, path)
+        ):
+            return  # the plan fuses the stage away on this device (the gate epilogue inside glm_intra_v14): no launch
         record, grid = _local_record(p, name, path)
         self._launch(call, record, grid, {**values, **extra})
         if name == "wy" and call.scratch.get("spec3_ref") is not None:
@@ -1750,7 +1757,7 @@ class _FiPrograms:
         grid: int,
         device_index: int,
         precision_mode: int = 0,
-        transfer_walk: str = "tf32_hilo",
+        transfer_walk: str = "bf16x3_hw64",
         name: str | None = None,
         args: dict[str, Any] | None = None,
         cols_per_cta: int | None = None,
@@ -1920,7 +1927,7 @@ class _FiPrograms:
         grid: int,
         device_index: int,
         precision_mode: int = 0,
-        transfer_walk: str = "tf32_hilo",
+        transfer_walk: str = "bf16x3_hw64",
         name: str | None = None,
         args: dict[str, Any] | None = None,
         cols_per_cta: int | None = None,
@@ -1952,12 +1959,10 @@ class _FiPrograms:
             return
         record = f"kcp_{program}"
         if program == "transfer_walk":
-            if transfer_walk != "tf32_hilo":
-                record = "kcp_transfer_walk_bf16x3" + (
-                    "_hw64" if transfer_walk == "bf16x3_hw64" else ""
-                )
-            elif precision_mode:
+            if precision_mode:
                 record += {1: "_three_mma", 2: "_plain_tf32"}[int(precision_mode)]
+            elif transfer_walk != TRANSFER_WALKS[0]:
+                record += f"_{transfer_walk}"
         elif program == "affine_merge":
             record += (
                 "_c8" if int(abi[ABI_PARAMS[program].index("ncols")]) == D else "_c16"
@@ -3089,7 +3094,7 @@ class KcpSaved:
     exchange: str
     precision_mode: int
     ctx: Any
-    transfer_walk: str = "tf32_hilo"
+    transfer_walk: str = "bf16x3_hw64"
     carry: torch.Tensor | None = (
         None  # the forward's carry plane (P > 1; None at P = 1 or under saved_carry=0)
     )
@@ -3173,9 +3178,7 @@ class KcpOptions:
     offset_class: str = "fla"
     debug_sequence: bool = False
     precision_mode: int = 0
-    transfer_walk: str = (
-        "tf32_hilo"  # K3 program family; set only through _kcp_test_knobs
-    )
+    transfer_walk: str = "bf16x3_hw64"  # K3 program family: the shipped BF16x3 half-width walk; tf32_hilo / bf16x3 only through _kcp_test_knobs
     p_rule: str | None = (
         None  # plan P rule named by _kcp_test_knobs (the wave rules); None = the context's (P_RULE_DEFAULT "wave_fill1_p1tie"); must equal ctx.p_rule
     )
@@ -3227,7 +3230,7 @@ class KcpOptions:
             )
         if self.precision_mode and self.transfer_walk != "tf32_hilo":
             raise ValueError(
-                "precision_mode selects a program of the tf32_hilo family; it cannot combine with transfer_walk"
+                "precision_mode selects a program of the tf32_hilo family; it cannot combine with a BF16x3 transfer_walk"
             )
         for key, allowed in P2_KNOBS.items():
             if getattr(self, key) not in allowed:
@@ -3250,8 +3253,9 @@ _OPTION_KEYS = (
 def _options(kwargs: dict[str, Any]) -> KcpOptions:
     """Validate the entry points' ``**options`` (unknown keywords are a ``TypeError``); ``_kcp_test_knobs`` goes
     through the plan module's validator (``precision_mode``) and, for the test knob ``transfer_walk`` (K3's
-    ``bf16x3`` / ``bf16x3_hw64`` candidates of ``build.test.json``), through the same environment gate here, so the
-    public API can never select a non-zero ``precision_mode`` or a non-shipped transfer-walk program."""
+    ``tf32_hilo`` / ``bf16x3`` programs of ``build.test.json``: the TF32 hi/lo walk and the full-width BF16x3 form),
+    through the same environment gate here, so the public API can never select a non-zero ``precision_mode`` or a
+    non-shipped transfer-walk program."""
     pre = kwargs.get("_kcp_options")
     if (
         pre is not None
@@ -3263,7 +3267,9 @@ def _options(kwargs: dict[str, Any]) -> KcpOptions:
         return pre
     kwargs = dict(kwargs)
     raw = kwargs.pop("_kcp_test_knobs", None)
-    transfer_walk = TRANSFER_WALKS[0]
+    transfer_walk: str | None = (
+        None  # unset: the shipped walk (the hi/lo walk under precision_mode)
+    )
     if isinstance(raw, dict) and "transfer_walk" in raw:
         if os.environ.get(cake_kcp_plan.TEST_KNOBS_ENV) != "1":
             raise ValueError(
@@ -3300,6 +3306,10 @@ def _options(kwargs: dict[str, Any]) -> KcpOptions:
             )
         kwargs["graph"] = p2.pop("graph")
     knobs = cake_kcp_plan.validate_test_knobs(raw)
+    if transfer_walk is None:  # the static TF32 programs are forms of the hi/lo walk
+        transfer_walk = (
+            "tf32_hilo" if int(knobs["precision_mode"]) else TRANSFER_WALKS[0]
+        )
     p_rule = (
         knobs["p_rule"] if isinstance(raw, dict) and "p_rule" in raw else None
     )  # plan rule: the context carries the rule

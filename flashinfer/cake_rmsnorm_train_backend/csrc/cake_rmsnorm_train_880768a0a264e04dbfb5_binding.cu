@@ -49,7 +49,7 @@ void Run(TensorView a_partial, TensorView a_dw, int64_t a_n_chunks, int64_t grid
   check_contiguous(a_partial, "partial");
   check_contiguous(a_dw, "dw");
   check_same_device(a_dw, a_partial, "dw", "partial");
-  TVM_FFI_CHECK((a_n_chunks >= 1), ValueError)
+  TVM_FFI_CHECK((a_n_chunks >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (n_chunks >= 1)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";

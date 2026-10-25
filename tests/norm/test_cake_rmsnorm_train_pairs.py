@@ -171,12 +171,12 @@ def test_every_backward_route_selects_an_owner_then_its_companion(arch: str) -> 
 def test_chunk_formula_matches_the_design_examples() -> None:
     """The host's copy of the kernels' chunk table: the halving rounds and the final equalised round, in
     pipeline-stage units (``rows_per_issue`` rows per stage)."""
-    assert (loader.TAIL_DIV, loader.MAX_HALVING, loader.MAX_ROUNDS) == (16, 5, 4)
+    assert (loader.TAIL_DIV, loader.MAX_HALVING, loader.MAX_ROUNDS) == (12, 5, 4)
     slots = 296  # two CTAs per SM on a 148-SM device
     assert [loader.n_chunks(T, slots, 1) for T in (256, 1024, 4096, 16384, 65536)] == [
         256,
         592,
-        1136,
+        888,
         1184,
         1184,
     ]
@@ -184,8 +184,8 @@ def test_chunk_formula_matches_the_design_examples() -> None:
     assert loader.chunk_rounds(4096, slots, 1) == [
         (296, 7),
         (296, 4),
-        (296, 2),
-        (248, 1),
+        (248, 3),
+        (48, 2),
     ]
     assert loader.chunk_rounds(16384, slots, 1) == [
         (296, 28),
@@ -221,6 +221,10 @@ def test_chunk_formula_matches_the_design_examples() -> None:
         (48, 8),
     ]
     assert loader.n_chunks(16384, 148, 4) == 592
+    # row counts between the last halving round's reach and the capacity (eight rows per stage, two CTAs per SM)
+    assert [
+        loader.n_chunks(T, slots, 8) for T in (32768, 33000, 36864, 37888, 38000)
+    ] == [888, 888, 888, 888, 888]
     assert loader.chunk_rounds(0, slots, 1) == []
     assert loader.chunk_table(5, slots, 1) == [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]
     assert loader.chunk_table(5, slots, 4) == [(0, 4), (4, 5)]

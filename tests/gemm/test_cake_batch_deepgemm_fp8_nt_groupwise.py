@@ -260,6 +260,34 @@ def test_packed_ue8m0_scales_match_reference():
     )
 
 
+@pytest.mark.parametrize("groups", sorted(PACKED_GROUPS))
+@pytest.mark.parametrize("nk", sorted(PACKED_NK))
+def test_packed_serving_expected_m_one_with_multi_block_groups(nk, groups):
+    """``expected_m`` is only a hint: at ``expected_m=1`` a group can still hold
+    more than one 32-row M block (here 40 and 33 rows) on the serving route."""
+    device = torch.device("cuda")
+    n, k = nk
+    m = 256
+    masked = [g % 5 for g in range(groups)]
+    masked[9], masked[20] = 40, 33
+    a, b, a_scale, b_scale, masked_m, _ = _make_inputs(
+        groups, m, n, k, seed=930, device=device, masked=masked
+    )
+    a_packed = _pack_ue8m0(a_scale)
+    b_packed = _pack_ue8m0(b_scale.repeat_interleave(128, dim=1))
+    prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a, b, a_packed, b_packed, masked_m, 1
+    )
+    assert prepared.route == "seed_serving_m32_packed"
+    out = batch_deepgemm_fp8_nt_groupwise(
+        a, b, a_packed, b_packed, masked_m, 1, backend="cake"
+    )
+    torch.cuda.synchronize()
+    _assert_valid_rows_close(
+        out, _reference(a, b, a_scale, b_scale, masked_m), masked_m
+    )
+
+
 def test_out_of_band_problems_raise():
     device = torch.device("cuda")
     a, b, a_scale, b_scale, masked_m, expected_m = _make_inputs(

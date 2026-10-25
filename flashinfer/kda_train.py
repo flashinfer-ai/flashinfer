@@ -114,11 +114,12 @@ def chunk_kda_fwd(
     workspace : KdaWorkspace, optional
         A reused workspace from :func:`kda_train_workspace`; without one this call allocates its own.
     save_mode : str, optional
-        ``"light"`` (saved set version 3: ``Aqk`` / ``Akk`` and the tables, 256 B per token-head, plus the
-        segment-boundary states on the segmented route when ``S >= 384 * NSEG``, so the backward skips the
-        forward half of its recurrence recompute) or ``"tape"`` (version 2: also the forward's state tape and
-        ``v_new``, 768 B more per token-head, so the backward skips the whole recompute); ``None`` takes the
-        workspace's default (``"light"`` without one).
+        ``"light"`` (saved set version 4: ``Aqk`` / ``Akk`` and the tables, 256 B per token-head, the forward's
+        gated queries ``qg``, 256 B per internal token-head, plus the segment-boundary states on the segmented
+        route when ``S >= 384 * NSEG``, so the backward skips the forward half of its recurrence recompute, and
+        the WY representation on the rows whose backward reads it from the set) or ``"tape"`` (version 2: also
+        the forward's state tape and ``v_new``, 768 B more per token-head, so the backward skips the whole
+        recompute); ``None`` takes the workspace's default (``"light"`` without one).
     arena : KdaArena, optional
         The lower-memory arena option (:func:`kda_train_arena`; off by default): the forward's layout is the
         same under every option, and a batched option (``batch_tokens``) runs the forward once per document
@@ -174,7 +175,7 @@ def chunk_kda_bwd(
     dout : torch.Tensor
         BF16 gradient of ``out``, laid out like ``v``.
     saved : KdaChunkSaved, optional
-        The forward's saved set (version 3 or 2); ``None`` recomputes it from the inputs (checkpoint replay).
+        The forward's saved set (version 4 or 2); ``None`` recomputes it from the inputs (checkpoint replay).
     scale : float, optional
         The forward's scale; ``128 ** -0.5`` when ``None``.
     workspace : KdaWorkspace, optional
@@ -345,8 +346,10 @@ def kda_train_saved_bytes(
     save_mode: str = "light",
     sm_count: Optional[int] = None,
 ) -> int:
-    """Bytes of the saved set: ``Aqk`` and ``Akk`` (``256 * S * H``), plus the device tables when ``num_docs`` is
-    given, plus the state tape, ``v_new`` and the segment transfers with ``save_mode="tape"``."""
+    """Bytes of the saved set: ``Aqk`` and ``Akk`` (``256 * S * H``), plus, when ``num_docs`` is given, the device
+    tables and the version's per-call tensors: the forward's gated queries ``qg`` (and, on the rows whose backward
+    reads it from the set, the WY representation ``w`` / ``u``) and the segment-boundary states under the size rule
+    with ``save_mode="light"``; the state tape, ``v_new`` and the segment transfers with ``save_mode="tape"``."""
     from .experimental.cake_kda_train import cake_backend
 
     return cake_backend.saved_bytes(

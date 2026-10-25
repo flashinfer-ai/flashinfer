@@ -9,8 +9,19 @@ def pack_inputs(act, weights, config, device):
     from ...api import QuantFormat, RoutingInputMode
 
     x, ids, scores = act.hidden_states_q, act.topk_ids, act.topk_weights
-    weight_only = config.quant.activation is QuantFormat.BF16
-    activation_dtype = torch.bfloat16 if weight_only else torch.float8_e4m3fn
+    weight_only = config.quant.activation in (QuantFormat.BF16, QuantFormat.FP16)
+    activation_dtype = (
+        (
+            torch.float16
+            if config.quant.activation is QuantFormat.FP16
+            else torch.bfloat16
+        )
+        if weight_only
+        else torch.float8_e4m3fn
+    )
+    output_dtype = (
+        torch.float16 if config.quant.output is QuantFormat.FP16 else torch.bfloat16
+    )
     t, h = x.shape
     e, k = config.routing.num_experts, config.routing.top_k
     p = (config.experts.intermediate_size + 127) // 128 * 128
@@ -57,8 +68,8 @@ def pack_inputs(act, weights, config, device):
         view["fc1_expert_weights"],
         view["fc2_expert_weights"],
         torch.empty((t * k, p), device=device, dtype=activation_dtype),
-        torch.empty((t * k, h), device=device, dtype=torch.bfloat16),
-        torch.empty((t, h), device=device, dtype=torch.bfloat16),
+        torch.empty((t * k, h), device=device, dtype=output_dtype),
+        torch.empty((t, h), device=device, dtype=output_dtype),
         narrow,
         view["fc1_dequant_scale"],
         view["fc2_act_quant_scale"].reshape(1),

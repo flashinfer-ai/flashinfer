@@ -268,9 +268,16 @@ def main():
         return errors
 
     def measure(name, tactic, phase="selection", group="rows"):
-        call = (lambda: frost(tactic)) if name == "frost" else (lambda: native(tactic))
-        output = call()
-        check(output, name)
+        forward = (
+            (lambda: frost(tactic)) if name == "frost" else (lambda: native(tactic))
+        )
+        replay_output = [None]
+
+        def call():
+            replay_output[0] = forward()
+            return replay_output[0]
+
+        check(call(), name)
         samples = [
             1000 * v
             for v in bench_gpu_time_with_cupti(
@@ -287,16 +294,16 @@ def main():
             phase=phase,
             median_us=median(samples),
             samples_us=samples,
-            errors=check(output, name),
+            errors=check(replay_output[0], name),
         )
         result[group].append(row)
         save()
         print(phase, name, tactic, row["median_us"], row["errors"], flush=True)
         return row
 
-    for first in (1, 2, 4, 8):
-        for second in (1, 2, 4, 8):
-            measure("frost", (first, second))
+    for tactic in frost_runner.get_valid_tactics(frost_inputs, None):
+        assert tactic[0] == "ffma"
+        measure("frost", tuple(tactic[1:]))
     for tactic in native_tactics:
         measure("cutile_w8a16", tactic)
     result["native_search"] = (
@@ -346,12 +353,12 @@ def main():
         for name in selected
     }
 
-    def event_chain(call):
+    def event_chain(call, name):
         call()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             for _ in range(128):
-                call()
+                output = call()
         for _ in range(3):
             graph.replay()
         times = []
@@ -365,13 +372,15 @@ def main():
             end.record()
             end.synchronize()
             times.append(start.elapsed_time(end) * 1000 / 128)
+        check(output, name)
         return dict(median_us=median(times), samples_us=times)
 
     result["warm_event_chain_control"] = {
         name: event_chain(
             (lambda: frost(selected[name]))
             if name == "frost"
-            else (lambda: native(selected[name]))
+            else (lambda: native(selected[name])),
+            name,
         )
         for name in selected
     }

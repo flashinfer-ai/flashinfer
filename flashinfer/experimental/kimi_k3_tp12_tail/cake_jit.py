@@ -46,12 +46,12 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 #   the poll, the twelve-way sum stays in ascending rank order;
 # * ``k1_twoshot_ess:grouped``  the token-sliced two-shot form (owner reduce +
 #   norm, multicast broadcast) with the early shared scatter for
-#   ``16 < M < 256``; ``grouped`` issues all twelve remote loads of the owner
+#   ``16 < M <= 960``; ``grouped`` issues all twelve remote loads of the owner
 #   retry body before the first test;
 # * ``k1_twoshot:<grouped|pinned>``  the two-shot form without the shared
-#   scatter for ``M >= 256`` (the persistent tail scatters the shared partial
-#   itself); ``grouped`` at ``M = 256``, ``pinned`` (the per-rank pinned retry
-#   body) above;
+#   scatter (the persistent tail scatters the shared partial itself);
+#   ``pinned`` (the per-rank pinned retry body) for ``M >= 961``; the
+#   ``grouped`` program stays registered, but no token count selects it;
 # * ``k23:c<4|8>``  the fused up-projection + tail for ``M <= 8``: the fp32
 #   slice GEMM of the normalised latent with this rank's weight slice in the
 #   K2-stream summation order, fused with the owner reduce of the
@@ -60,7 +60,7 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 #   K3 pair); one CTA per eight output columns, one program per accumulator
 #   capacity (four tokens for ``M <= 4``, eight for ``5 <= M <= 8``); the
 #   rank's column width only sizes the grid;
-# * ``k3_ess:grouped``  the tail for ``4 < M < 256`` after an ESS K1: owner
+# * ``k3_ess:grouped``  the tail for ``8 < M <= 960`` after an ESS K1: owner
 #   reduce of the scattered shared columns, fused add of this rank's cuBLAS
 #   up-projection slice, one BF16 rounding and the multicast all-gather of
 #   the output row; one CTA per token and column half, no shared operand;
@@ -68,11 +68,12 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 #   owner reduce + add + rounding, all-gather) on a persistent grid of
 #   ``min(M, SM count)`` CTAs per column half, each walking its tokens as a
 #   three-stage pipeline (scatter ``t``, owner reduce + multicast ``t - P``,
-#   gather ``t - 2P``) so the fabric hops of consecutive tokens overlap
-#   (``M = 256``);
+#   gather ``t - 2P``) so the fabric hops of consecutive tokens overlap;
+#   registered, but no token count selects it (the ESS tail serves
+#   ``M <= 960``);
 # * ``k3_persist_bulk:pinned``  the persistent K3 whose reduce-scatter stage
 #   pushes the shared columns with ``cp.async.bulk``, pinned poll schedule
-#   (``M > 256``).
+#   (``M >= 961``).
 #
 # Every program is one source compiled for each architecture it lists (the
 # SM100-family lowering preferences are ``__CUDA_ARCH__`` guards inside the
@@ -452,11 +453,15 @@ def _nvcc_flags(arches: list[str]) -> list[str]:
 
 
 def required_kernel_keys() -> tuple[str, ...]:
-    """Every logical kernel the runtime can select (nine keys, the same programs on both architectures)."""
+    """Every registered logical kernel: nine keys, the same programs on both arches.
+
+    ``k1_twoshot:grouped`` and ``k3_persist:grouped`` stay registered, but the current
+    token thresholds select neither.
+    """
     # Unreachable, hence not registered: ``k1_twoshot_ess:pinned`` and ``k3_ess:pinned``
-    # (the ESS range ``M < 256`` is grouped-only), ``k3_persist:pinned`` and
-    # ``k3_persist_bulk:grouped`` (the plain persistent K3 serves exactly 256 tokens,
-    # the cp.async.bulk form the whole pinned range ``M > 256``).
+    # (the ESS range ``M <= 960`` is grouped-only), ``k3_persist:pinned`` and
+    # ``k3_persist_bulk:grouped`` (the cp.async.bulk form serves the whole persistent
+    # range ``M >= 961``).
     return (
         "k1_oneshot_ess",
         "k1_twoshot_ess:grouped",

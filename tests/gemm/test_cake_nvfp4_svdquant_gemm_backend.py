@@ -120,9 +120,10 @@ RANKS = (32, 64, 96, 128)
 # current route table (tactic 25: K 12288 at rank 32 between M 256 and 4095;
 # the rank 64 / 96 tail-split builds; the hinted-store persistent builds of
 # ranks 64 / 96 / 128 at a deep K; the K12288 form of the 64-row program at
-# M 129, whose K 12288 rows the split-K program takes).  Update them when the
-# route table changes;
-# ``test_matrix_reaches_every_program`` says when a program is missed.
+# M 129, whose K 12288 rows the split-K program takes; the form-A biased
+# 64-row program at M 129 on sm_103a, whose K 3072 rows the L2-promoted
+# builds take there -- a K 6144 row).  Update them when the route table
+# changes; ``test_matrix_reaches_every_program`` says when a program is missed.
 COVERAGE_ROWS: tuple[tuple[int, int, int, int, bool], ...] = (
     (333, 3072, 12288, 32, True),
     (6912, 3072, 12288, 64, True),
@@ -132,6 +133,7 @@ COVERAGE_ROWS: tuple[tuple[int, int, int, int, bool], ...] = (
     (4096, 3072, 12288, 128, True),
     (129, 3072, 12544, 32, True),
     (129, 3072, 12544, 32, False),
+    (129, 3072, 6144, 32, True),
 )
 CONTRACT_ROWS: tuple[tuple[int, int, int, int, bool], ...] = tuple(
     (m, CONTRACT_N, CONTRACT_K, rank, bias)
@@ -140,11 +142,12 @@ CONTRACT_ROWS: tuple[tuple[int, int, int, int, bool], ...] = tuple(
     for bias in (False, True)
 )
 # The exact-dispatch rows per architecture: the split-K rows (the M 129 K 12288
-# rows of the architectures where the swap-AB split-K program measured faster)
-# and the convergence finals' rows; (M, N, K, rank, bias) -> the program it
-# dispatches to there (the shipped cake_r1 two-CTA r32 build on the held rows),
-# the build keywords of those programs, and the programs only one
-# architecture's rows reach.
+# rows of the architectures where the swap-AB split-K program measured faster),
+# the sm_103a M 129 K 3072 rows (the 64-row builds with the TMA L2 promotion of
+# the weight descriptors, shipped for sm_103a only) and the convergence finals'
+# rows; (M, N, K, rank, bias) -> the program it dispatches to there (the shipped
+# cake_r1 two-CTA r32 build on the held rows), the build keywords of those
+# programs, and the programs only one architecture's rows reach.
 _P = "cake_nvfp4_svdquant_gemm_"
 EXACT_ROWS: dict[str, dict[tuple[int, int, int, int, bool], str]] = {
     "sm_100a": {
@@ -166,9 +169,12 @@ EXACT_ROWS: dict[str, dict[tuple[int, int, int, int, bool], str]] = {
         (16384, 12288, 3072, 32, True): _P + "b4be925d9e1e6959b702",
     },
     "sm_103a": {
-        (129, 3072, 3072, 96, True): _P + "44ec820136bf5bcde86e",
-        (129, 3072, 3072, 128, False): _P + "fed389c9e9cb9293bd29",
-        (129, 3072, 3072, 128, True): _P + "44ec820136bf5bcde86e",
+        (129, 3072, 3072, 32, False): _P + "8319e1548886614ab273",
+        (129, 3072, 3072, 32, True): _P + "99bdf6e03d704178faf9",
+        (129, 3072, 3072, 64, True): _P + "99bdf6e03d704178faf9",
+        (129, 3072, 3072, 96, True): _P + "01405277c4bbc4031fbd",
+        (129, 3072, 3072, 128, False): _P + "23bfc212699bbb4e6214",
+        (129, 3072, 3072, 128, True): _P + "01405277c4bbc4031fbd",
         (129, 3072, 12288, 32, False): _P + "0a3a28f6f508e7d75146",
         (129, 3072, 12288, 32, True): _P + "8958df827006875b2512",
         (129, 3072, 12288, 128, False): _P + "0a3a28f6f508e7d75146",
@@ -210,10 +216,17 @@ EXACT_BUILDS: dict[str, dict[str, object]] = {
         "out_store": "v8hint",
         "rank": 32,
     },
-    _P + "44ec820136bf5bcde86e": {
+    _P + "99bdf6e03d704178faf9": {
+        "bias": True,
+        "epi": "fused64",
+        "l2_promotion": "l2_256b",
+        "prologue": "overlap",
+    },
+    _P + "01405277c4bbc4031fbd": {
         "bias": True,
         "epi": "fused64",
         "epi_alias": True,
+        "l2_promotion": "l2_256b",
         "prologue": "overlap",
         "stages": 16,
     },
@@ -250,10 +263,17 @@ EXACT_BUILDS: dict[str, dict[str, object]] = {
         "out_store": "v8hint",
         "rank": 32,
     },
-    _P + "fed389c9e9cb9293bd29": {
+    _P + "8319e1548886614ab273": {
+        "bias": False,
+        "epi": "fused64",
+        "l2_promotion": "l2_256b",
+        "prologue": "overlap",
+    },
+    _P + "23bfc212699bbb4e6214": {
         "bias": False,
         "epi": "fused64",
         "epi_alias": True,
+        "l2_promotion": "l2_256b",
         "prologue": "overlap",
         "stages": 16,
     },
@@ -268,9 +288,11 @@ ARCH_ONLY: dict[str, set[str]] = {
         _P + "c80322ffcfa97a956474",
     },
     "sm_103a": {
-        _P + "44ec820136bf5bcde86e",
+        _P + "01405277c4bbc4031fbd",
+        _P + "23bfc212699bbb4e6214",
         _P + "5dc32691ea15528b11be",
-        _P + "fed389c9e9cb9293bd29",
+        _P + "8319e1548886614ab273",
+        _P + "99bdf6e03d704178faf9",
     },
 }
 # (M, N, K, rank, bias) -> the substring of the ValueError the shape rule raises.
@@ -893,7 +915,9 @@ def test_m129_rows_route_by_k_class(bias) -> None:
     the K12288 form for K >= 12288 with K % 256 == 0, the K3072 form otherwise
     (including K % 256 != 0 and the K between the two classes); the bias form
     follows the problem.  On an architecture whose exact rows name the split-K
-    program for K 12288, that row takes it instead."""
+    program for K 12288, that row takes it instead; an exact row naming a
+    64-row build (the sm_103a K 3072 rows, whose builds promote the weight
+    loads to 256-byte L2 lines) takes that build of its K class."""
     for k, form in (
         (3072, M129_FORM_K3072),
         (3200, M129_FORM_K3072),
@@ -907,14 +931,21 @@ def test_m129_rows_route_by_k_class(bias) -> None:
         )
         record = loader.MODULES[name]
         exact = EXACT_ROWS[_arch()].get((129, 3072, k, 32, bias))
-        if exact is not None:
+        if exact is not None and record["plan"]["grid_rule"] == "splitk_cluster":
             assert name == exact and record["build"] == EXACT_BUILDS[exact], (
                 k,
                 bias,
                 name,
             )
-            assert record["plan"]["grid_rule"] == "splitk_cluster"
             assert record["plan"]["block_m"] == 136 and record["plan"]["block_k"] == 128
+        elif exact is not None:
+            assert name == exact and record["build"] == EXACT_BUILDS[exact], (
+                k,
+                bias,
+                name,
+            )
+            assert record["build"] == {"bias": bias, **form, "l2_promotion": "l2_256b"}
+            assert record["plan"]["block_m"] == 64 and record["plan"]["block_k"] == 128
         else:
             assert record["build"] == {"bias": bias, **form}, (k, bias, record["build"])
             assert record["plan"]["block_m"] == 64 and record["plan"]["block_k"] == 128

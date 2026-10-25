@@ -96,6 +96,15 @@ PACKED_QUANT_FORMS = {
     },
     "sm_107a": set(),
 }
+# The (input format, output format) fused-norm programs with NVFP4 / MXFP8 output each target builds with the
+# scale store's swizzled address formed in 32-bit arithmetic once per row ("_sfu"), from its own measurement;
+# every other build forms the whole 64-bit address per store.  Both forms store the same bytes to the same
+# addresses, so the reference does not read the form.  A cell's band inherits the form.
+SF_ADDR_U32_FORMS = {
+    "sm_100a": {("nvfp4", "nvfp4")},
+    "sm_103a": {("bf16", "nvfp4"), ("nvfp4", "mxfp8"), ("nvfp4", "nvfp4")},
+    "sm_107a": {("bf16", "mxfp8"), ("nvfp4", "nvfp4")},
+}
 # The BF16-output fused-norm programs run the direct pass 2 ("_p2d") with the unroll each target measured
 # ("_u<N>" for an unroll other than 1); the quantized outputs run the staged pass 2 (unroll 1, no token).
 PASS2_DIRECT_UNROLL = {
@@ -175,20 +184,22 @@ def _two_shot_suffix(target: str, input_format: str, bv: int) -> str:
 def _fused_norm_forms(target: str, input_format: str, output_format: str) -> dict:
     """The forms of the whole fused-norm program ``target`` builds for one (input format, output format), as
     the registry records them: the poll ("all" for the probe-all poll), the pass 2 and its unroll, the worker
-    count (None for the kernel's own), the quantizing pass 2 (None for BF16 output), the launch trigger and
-    the pass-1 sum-of-squares order."""
+    count (None for the kernel's own), the quantizing pass 2 and the scale-address form (None for BF16 output),
+    the launch trigger and the pass-1 sum-of-squares order."""
     cell = (input_format, output_format)
     probe_all = input_format == "nvfp4" and target in PROBE_ALL_TARGETS
     unroll = PASS2_DIRECT_UNROLL.get((target, *cell))
-    quant = None
+    quant = sf_addr = None
     if output_format != "bf16":
         quant = "packed" if cell in PACKED_QUANT_FORMS[target] else "f32"
+        sf_addr = "u32" if cell in SF_ADDR_U32_FORMS[target] else "i64"
     return {
         "poll": "all" if probe_all else "grouped",
         "pass2": "direct" if unroll else "staged",
         "unroll": unroll or 1,
         "workers": None,
         "quant": quant,
+        "sf_addr": sf_addr,
         "early_launch": cell in EARLY_LAUNCH_FORMS[target],
         "ss_order": "perm" if cell in PERMUTED_SS_FORMS[target] else "natural",
     }
@@ -199,8 +210,9 @@ def _fused_norm_name(
 ) -> str:
     """The name of the fused-norm program with ``forms``: "_pa" for the probe-all poll, "_p2d" for the direct
     pass 2 and "_u<N>" for its unroll other than 1, "_w<N>" for a worker count the build spells, "_qp" for the
-    packed quantizing pass 2, "_el" for the early launch trigger, "_csp" for the per-CTA call state, "_sop"
-    for the permuted sum of squares, "_pf" for the residual prefetch, in that order."""
+    packed quantizing pass 2, "_sfu" for the 32-bit scale-address form, "_el" for the early launch trigger,
+    "_csp" for the per-CTA call state, "_sop" for the permuted sum of squares, "_pf" for the residual prefetch,
+    in that order."""
     return (
         f"tp2_rmsnorm_{input_format}_{output_format}"
         + ("_pa" if forms["poll"] == "all" else "")
@@ -208,6 +220,7 @@ def _fused_norm_name(
         + (f"_u{forms['unroll']}" if forms["unroll"] != 1 else "")
         + (f"_w{forms['workers']}" if forms["workers"] is not None else "")
         + ("_qp" if forms["quant"] == "packed" else "")
+        + ("_sfu" if forms["sf_addr"] == "u32" else "")
         + ("_el" if forms["early_launch"] else "")
         + CALL_STATE_TOKEN
         + ("_sop" if forms["ss_order"] == "perm" else "")
@@ -329,7 +342,7 @@ def _expected_params(
 
 def test_registry_lists_every_program_with_the_contract_parameters() -> None:
     assert set(PROGRAMS) == _expected_program_ids()
-    assert len(PROGRAMS) == 54
+    assert len(PROGRAMS) == 58
     keys = {
         "family",
         "world_size",
@@ -353,6 +366,7 @@ def test_registry_lists_every_program_with_the_contract_parameters() -> None:
         "rs_fused",
         "rows_kind",
         "rows_threshold",
+        "sf_addr",
         "targets",
         "kernel_symbol",
         "sources",
@@ -472,6 +486,12 @@ def test_registry_lists_every_program_with_the_contract_parameters() -> None:
             # The early launch trigger ("_el", before "_csp").
             assert stem.endswith("_el") == record["early_launch"], program
             stem = stem[: -len("_el")] if record["early_launch"] else stem
+            # The scale-address form exists for the NVFP4 / MXFP8 outputs only ("_sfu" for the 32-bit form,
+            # before "_el"); both forms store the same bytes, so no other table depends on it.
+            assert (record["sf_addr"] is None) == (output_format == "bf16"), program
+            assert record["sf_addr"] in (None, "i64", "u32"), program
+            assert stem.endswith("_sfu") == (record["sf_addr"] == "u32"), program
+            stem = stem[: -len("_sfu")] if record["sf_addr"] == "u32" else stem
             # The quantizing pass-2 form exists for the NVFP4 / MXFP8 outputs only ("_qp" for the packed form).
             assert (record["quant"] is None) == (output_format == "bf16"), program
             assert record["quant"] in (None, "f32", "packed"), program
@@ -497,6 +517,7 @@ def test_registry_lists_every_program_with_the_contract_parameters() -> None:
         else:
             assert record["prefetch"] is None and record["poll"] is None
             assert record["quant"] is None and record["ss_order"] is None
+            assert record["sf_addr"] is None
     assert {
         target for record in PROGRAMS.values() for target in record["targets"]
     } == set(TARGETS)
@@ -673,14 +694,42 @@ def test_fused_norm_programs_cover_every_form_once_per_target() -> None:
         for output_format in ("nvfp4", "mxfp8"):
             quantized = f"tp2_rmsnorm_bf16_{output_format}"
             assert f"{quantized}_qp_csp{pf}" not in PROGRAMS
-            assert PROGRAMS[f"{quantized}_csp_sop{pf}"]["targets"] == ("sm_107a",)
-            assert PROGRAMS[f"{quantized}_p2d_w11_qp_csp_sop{pf}"]["targets"] == (
-                "sm_100a",
-                "sm_103a",
+            # sm_107a forms the scale store's address in 32-bit arithmetic for bf16 -> mxfp8 and nvfp4 -> nvfp4
+            # ("_sfu"); its bf16 -> nvfp4 and nvfp4 -> mxfp8 programs keep the 64-bit form and the plain name.
+            sfu = (
+                "_sfu"
+                if ("bf16", output_format) in SF_ADDR_U32_FORMS["sm_107a"]
+                else ""
             )
+            assert PROGRAMS[f"{quantized}{sfu}_csp_sop{pf}"]["targets"] == ("sm_107a",)
+            assert f"{quantized}{'' if sfu else '_sfu'}_csp_sop{pf}" not in PROGRAMS
+            assert PROGRAMS[f"{quantized}{sfu}_csp_sop{pf}"]["sf_addr"] == (
+                "u32" if sfu else "i64"
+            )
+            # The BF16-input suffix bands: one program on both targets for mxfp8; for nvfp4 sm_103a's
+            # band inherits its cell's 32-bit form and splits off sm_100a's plain-named band.
+            band = PROGRAMS[f"{quantized}_p2d_w11_qp_csp_sop{pf}"]
+            assert band["sf_addr"] == "i64"
+            if output_format == "mxfp8":
+                assert band["targets"] == ("sm_100a", "sm_103a")
+                assert f"{quantized}_p2d_w11_qp_sfu_csp_sop{pf}" not in PROGRAMS
+            else:
+                assert band["targets"] == ("sm_100a",)
+                band_103 = PROGRAMS[f"{quantized}_p2d_w11_qp_sfu_csp_sop{pf}"]
+                assert band_103["targets"] == ("sm_103a",)
+                assert band_103["sf_addr"] == "u32"
             records = f"tp2_rmsnorm_nvfp4_{output_format}"
             assert f"{records}_pa_csp{pf}" not in PROGRAMS
-            assert PROGRAMS[f"{records}_csp_sop{pf}"]["targets"] == ("sm_107a",)
+            sfu = (
+                "_sfu"
+                if ("nvfp4", output_format) in SF_ADDR_U32_FORMS["sm_107a"]
+                else ""
+            )
+            assert PROGRAMS[f"{records}{sfu}_csp_sop{pf}"]["targets"] == ("sm_107a",)
+            assert f"{records}{'' if sfu else '_sfu'}_csp_sop{pf}" not in PROGRAMS
+            assert PROGRAMS[f"{records}{sfu}_csp_sop{pf}"]["sf_addr"] == (
+                "u32" if sfu else "i64"
+            )
             assert f"{quantized}{pf}" not in PROGRAMS
             assert f"{quantized}_csp{pf}" not in PROGRAMS
             assert f"{records}{pf}" not in PROGRAMS
@@ -689,22 +738,47 @@ def test_fused_norm_programs_cover_every_form_once_per_target() -> None:
             "sm_100a",
             "sm_103a",
         )
-        assert PROGRAMS[f"tp2_rmsnorm_bf16_nvfp4_qp_csp_sop{pf}"]["targets"] == (
-            "sm_103a",
-        )
-        assert PROGRAMS[f"tp2_rmsnorm_bf16_nvfp4_qp_el_csp_sop{pf}"]["targets"] == (
-            "sm_100a",
-        )
-        assert PROGRAMS[f"tp2_rmsnorm_nvfp4_mxfp8_pa_qp_csp_sop{pf}"]["targets"] == (
-            "sm_100a",
-            "sm_103a",
-        )
-        assert PROGRAMS[f"tp2_rmsnorm_nvfp4_nvfp4_pa_csp_sop{pf}"]["targets"] == (
-            "sm_100a",
-        )
-        assert PROGRAMS[f"tp2_rmsnorm_nvfp4_nvfp4_pa_qp_csp_sop{pf}"]["targets"] == (
-            "sm_103a",
-        )
+        # The 32-bit scale-address form splits the sm_100a / sm_103a programs whose cells disagree in it
+        # (nvfp4 -> mxfp8) and renames the ones whose cells agree on it or ship alone; the plain names with
+        # no target left are gone.
+        for program, targets in (
+            (f"tp2_rmsnorm_bf16_nvfp4_qp_sfu_csp_sop{pf}", ("sm_103a",)),
+            (f"tp2_rmsnorm_bf16_nvfp4_qp_el_csp_sop{pf}", ("sm_100a",)),
+            (f"tp2_rmsnorm_nvfp4_mxfp8_pa_qp_csp_sop{pf}", ("sm_100a",)),
+            (f"tp2_rmsnorm_nvfp4_mxfp8_pa_qp_sfu_csp_sop{pf}", ("sm_103a",)),
+            (f"tp2_rmsnorm_nvfp4_nvfp4_pa_sfu_csp_sop{pf}", ("sm_100a",)),
+            (f"tp2_rmsnorm_nvfp4_nvfp4_pa_qp_sfu_csp_sop{pf}", ("sm_103a",)),
+        ):
+            form = "u32" if "_sfu" in program else "i64"
+            assert PROGRAMS[program]["targets"] == targets, program
+            assert PROGRAMS[program]["sf_addr"] == form, program
+        for program in (
+            f"tp2_rmsnorm_bf16_nvfp4_qp_csp_sop{pf}",
+            f"tp2_rmsnorm_nvfp4_nvfp4_pa_csp_sop{pf}",
+            f"tp2_rmsnorm_nvfp4_nvfp4_pa_qp_csp_sop{pf}",
+        ):
+            assert program not in PROGRAMS
+        # The 32-bit scale-address form ships on fourteen programs: the six cells' whole programs and
+        # sm_103a's bf16 -> nvfp4 band, with and without the prefetch.
+        assert sorted(p for p in PROGRAMS if "_sfu" in p) == [
+            "tp2_rmsnorm_bf16_mxfp8_sfu_csp_sop",
+            "tp2_rmsnorm_bf16_mxfp8_sfu_csp_sop_pf",
+            "tp2_rmsnorm_bf16_nvfp4_p2d_w11_qp_sfu_csp_sop",
+            "tp2_rmsnorm_bf16_nvfp4_p2d_w11_qp_sfu_csp_sop_pf",
+            "tp2_rmsnorm_bf16_nvfp4_qp_sfu_csp_sop",
+            "tp2_rmsnorm_bf16_nvfp4_qp_sfu_csp_sop_pf",
+            "tp2_rmsnorm_nvfp4_mxfp8_pa_qp_sfu_csp_sop",
+            "tp2_rmsnorm_nvfp4_mxfp8_pa_qp_sfu_csp_sop_pf",
+            "tp2_rmsnorm_nvfp4_nvfp4_pa_qp_sfu_csp_sop",
+            "tp2_rmsnorm_nvfp4_nvfp4_pa_qp_sfu_csp_sop_pf",
+            "tp2_rmsnorm_nvfp4_nvfp4_pa_sfu_csp_sop",
+            "tp2_rmsnorm_nvfp4_nvfp4_pa_sfu_csp_sop_pf",
+            "tp2_rmsnorm_nvfp4_nvfp4_sfu_csp_sop",
+            "tp2_rmsnorm_nvfp4_nvfp4_sfu_csp_sop_pf",
+        ]
+        assert sorted(
+            p for p, r in PROGRAMS.items() if r["sf_addr"] == "u32"
+        ) == sorted(p for p in PROGRAMS if "_sfu" in p)
         for output_format in OUTPUT_FORMATS:
             assert f"tp2_rmsnorm_bf16_{output_format}_pa_csp{pf}" not in PROGRAMS
             assert f"tp2_rmsnorm_nvfp4_{output_format}_qp_csp{pf}" not in PROGRAMS
@@ -1363,7 +1437,7 @@ def test_registry_bands_are_the_measured_cells() -> None:
             "threshold": threshold,
             "whole": {target: f"tp2_oneshot_{input_format}"},
         }
-    assert len(expected) == 9
+    assert len(expected) == 11
     assert expected == loader.SELECT_ROWS
 
 

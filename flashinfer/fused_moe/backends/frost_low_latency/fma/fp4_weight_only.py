@@ -9,7 +9,7 @@ from cutlass.cute.runtime import from_dlpack
 from .activation_config import lower_activation
 from .bf16.fma_fc1 import _kernel as fc1
 from .bf16.fma_fc2 import _kernel as fc2
-from .fp4_route_group import _kernel as grouped_fc1
+from .route_group import _kernel as grouped_fc1
 
 
 @cute.jit
@@ -128,12 +128,14 @@ def execute(inputs, config, tactic):
     finalize = config.finalize.do_finalize
     scale_block_size = 16 if config.quant.weight is QuantFormat.NVFP4 else 32
     key = (
-        "packed4-weight-only-ffi-v7",
+        "packed4-weight-only-ffi-v8",
         route_group,
         first_values,
         second_values,
         integer_weights,
         scale_block_size,
+        x.dtype,
+        output.dtype,
         tuple(x.shape),
         tuple(w1.shape),
         tuple(w2.shape),

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""NVFP4/MXFP4/MXINT4 weight-only MoE: shared FMA versus architecture-specific natives.
+"""NVFP4/MXFP4/MXINT4/E4M3 weight-only MoE: shared FMA versus architecture-specific natives.
 
 Synthetic model geometry, not serving throughput. Search native stage pairs,
 freeze winners, validate with ABBA and independent warm CUDA-event chains.
@@ -121,7 +121,7 @@ def _quantize_weights(
 
 
 def _sm120_tc_native(x, w1, s1, a1, w2, s2, a2, ids, scores):
-    """Strong fused Tensor Core decode path, including all native small tiles."""
+    """SM120 BF16 decode / FP16 Tensor Core paths with supported native tiles."""
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_host import (
         select_route_block_size_m,
         unswizzle_expert_scales,
@@ -136,6 +136,9 @@ def _sm120_tc_native(x, w1, s1, a1, w2, s2, a2, ids, scores):
         compile_w4a16_fused_moe,
         run_w4a16_moe,
         _SMALL_BATCH_TILE_CONFIGS,
+        _LARGE_BATCH_TILE_CONFIGS,
+        _direct_topk_route_m_cap,
+        _tc_decode_m_cap,
     )
     from flashinfer.quantization.fp4_quantization import block_scale_interleave
 
@@ -159,7 +162,7 @@ def _sm120_tc_native(x, w1, s1, a1, w2, s2, a2, ids, scores):
         sw2,
         a2,
         activation="silu",
-        params_dtype=torch.bfloat16,
+        params_dtype=x.dtype,
         source_format="modelopt",
     )
     workspace = allocate_sm120_moe_workspace(
@@ -177,6 +180,16 @@ def _sm120_tc_native(x, w1, s1, a1, w2, s2, a2, ids, scores):
     props = torch.cuda.get_device_properties(x.device)
     block = select_route_block_size_m(t, k, e)
     compiled = {}
+    fp16 = x.dtype is torch.float16
+    tc_decode = not fp16 and t <= _tc_decode_m_cap(
+        int(props.major) * 10 + int(props.minor), "bf16", "packed", "e4m3_k16", h, i, k
+    )
+    direct = tc_decode or t <= _direct_topk_route_m_cap(
+        "fp16" if fp16 else "bf16", "packed", "e4m3_k16", h, i, k
+    )
+    tiles = tuple(
+        dict.fromkeys((*_SMALL_BATCH_TILE_CONFIGS, *_LARGE_BATCH_TILE_CONFIGS))
+    )
 
     def call(tactic):
         tactic = tuple(tactic)
@@ -193,27 +206,30 @@ def _sm120_tc_native(x, w1, s1, a1, w2, s2, a2, ids, scores):
                     apply_router_weight_on_input=False,
                     zero_fc2_output=False,
                     moe_block_size=block,
-                    max_m_blocks=t * k,
-                    element_dtype="bf16",
+                    max_m_blocks=t * k
+                    if direct
+                    else workspace.block_expert_ids.numel(),
+                    element_dtype="fp16" if fp16 else "bf16",
                     fast_math=True,
                     sms=props.multi_processor_count,
                     max_shared_mem=props.shared_memory_per_block_optin,
                     weight_layout="packed",
                     scale_format="e4m3_k16",
-                    direct_topk_routes=True,
-                    tc_decode_fused_sum=True,
+                    direct_topk_routes=direct,
+                    tc_decode_fused_sum=tc_decode,
                     force_tile_config=tactic,
                 )
             fused = compiled[tactic]
-            assert fused.tc_decode_fused_sum and fused.direct_topk_routes
+            assert fused.tc_decode_fused_sum == tc_decode
+            assert fused.direct_topk_routes == direct
         return run_w4a16_moe(
             x,
             prepared,
             scores,
             ids,
             activation="silu",
-            intermediate_cache13=workspace.intermediate_cache13,
-            intermediate_cache2=workspace.intermediate_cache2,
+            intermediate_cache13=workspace.intermediate_cache13.view(x.dtype),
+            intermediate_cache2=workspace.intermediate_cache2.view(x.dtype),
             output=output,
             fc1_c_tmp=workspace.fc1_c_tmp,
             fc2_c_tmp=workspace.fc2_c_tmp,
@@ -227,10 +243,7 @@ def _sm120_tc_native(x, w1, s1, a1, w2, s2, a2, ids, scores):
         )
 
     tactics = [(-1,)] + [
-        (ak, an, bk, bn)
-        for ak, an, ath in _SMALL_BATCH_TILE_CONFIGS
-        for bk, bn, bth in _SMALL_BATCH_TILE_CONFIGS
-        if ath == bth
+        (ak, an, bk, bn) for ak, an, ath in tiles for bk, bn, bth in tiles if ath == bth
     ]
     return call, tactics
 
@@ -283,11 +296,137 @@ def _expand_nvfp4_bf16(q, scales):
     return result
 
 
+def _expand_weight_only_fp16(q, sf, global_scale, weight_format):
+    """Exact checkpoint expansion; fail rather than round an unsupported value."""
+    packed = weight_format != "w8a16"
+    shape = (*q.shape[:-1], q.shape[-1] * (2 if packed else 1))
+    result = torch.empty(shape, device=q.device, dtype=torch.float16)
+    lut = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=q.device)
+    for begin in range(0, q.shape[0], 8):
+        chunk, scale = q[begin : begin + 8], sf[begin : begin + 8]
+        if not packed:
+            decoded = chunk.float() * scale[:, None, None]
+        else:
+            codes = torch.stack((chunk & 15, chunk >> 4), dim=-1).flatten(-2).long()
+            if weight_format == "mxint4":
+                decoded = torch.where(codes < 8, codes, codes - 16).float()
+                scale, block = scale.float(), 32
+            else:
+                decoded = lut[codes & 7] * (1 - 2 * ((codes & 8) != 0).float())
+                block = 32 if weight_format == "mxfp4" else 16
+                scale = scale.view(
+                    torch.float8_e8m0fnu if block == 32 else torch.float8_e4m3fn
+                ).float()
+            decoded *= scale.repeat_interleave(block, -1)
+        decoded *= global_scale[begin : begin + 8, None, None]
+        converted = decoded.half()
+        torch.testing.assert_close(converted.float(), decoded, atol=0, rtol=0)
+        result[begin : begin + 8].copy_(converted)
+    return result
+
+
+def _expanded_fp16_native(x, w1, w2, ids, scores):
+    """Dense CUTLASS control; expansion and its larger storage are explicit."""
+    from flashinfer.fused_moe.core import (
+        get_cutlass_fused_moe_module,
+        cutlass_fused_moe,
+        cutlass_fused_moe_workspace_size,
+    )
+    from flashinfer.fused_moe import SwiGLU
+    from flashinfer.autotuner import AutoTuner, TuningConfig
+
+    t, h, i, e, k = x.shape[0], x.shape[1], w2.shape[2], w1.shape[0], ids.shape[1]
+    cc = torch.cuda.get_device_capability(x.device)
+    module = get_cutlass_fused_moe_module(str(cc[0] * 10 + cc[1]))
+    inner = module.MoERunner(
+        x_dtype=torch.float16,
+        weight_dtype=torch.float16,
+        output_dtype=torch.float16,
+        top_k=k,
+        tp_size=1,
+        tp_rank=0,
+        ep_size=1,
+        ep_rank=0,
+        cluster_size=1,
+        cluster_rank=0,
+        enable_alltoall=False,
+        use_deepseek_fp8_block_scale=False,
+        use_w4_group_scaling=False,
+        use_mxfp8_act_scaling=False,
+        min_latency_mode=False,
+        enable_pdl=False,
+        activation_type=SwiGLU().type,
+        use_packed_weights=False,
+        use_fused_finalize=True,
+        use_wfp4afp8_humming=False,
+    )
+    stage_choices = []
+    with autotune(True):
+        for stage in (1, 2):
+            inner.gemm_idx_for_tuning = stage
+            stage_choices.append(
+                AutoTuner.get().rank_tactics(
+                    f"frost_control_cutlass_fp16_expanded_stage{stage}",
+                    [inner],
+                    TuningConfig(),
+                    [x, w1, None, w2, None],
+                    k=2,
+                    gemm_idx=stage,
+                )
+            )
+    inner.gemm_idx_for_tuning = None
+    tactics = [
+        -1,
+        *[(int(one), int(two)) for one in stage_choices[0] for two in stage_choices[1]],
+    ]
+    workspace = torch.empty(
+        cutlass_fused_moe_workspace_size(
+            t,
+            h,
+            i,
+            e,
+            k,
+            x_dtype=torch.float16,
+            weight_dtype=torch.float16,
+            output_dtype=torch.float16,
+            use_w4_group_scaling=False,
+            device=x.device,
+        ),
+        device=x.device,
+        dtype=torch.uint8,
+    )
+    output = torch.empty_like(x)
+
+    def call(tactic):
+        with autotune(False):
+            value = cutlass_fused_moe(
+                x,
+                ids,
+                scores,
+                w1,
+                w2,
+                torch.float16,
+                [],
+                output=output,
+                use_w4_group_scaling=False,
+                tune_max_num_tokens=t,
+                enable_pdl=False,
+                profile_ids=None if tactic == -1 else list(tactic),
+                workspace_buffer=workspace,
+            )
+        return value[0] if isinstance(value, (list, tuple)) else value
+
+    return call, tactics
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
-        "--weight-format", choices=("nvfp4", "mxfp4", "mxint4"), default="nvfp4"
+        "--weight-format",
+        choices=("nvfp4", "mxfp4", "mxint4", "w8a16"),
+        default="nvfp4",
     )
+    p.add_argument("--activation-dtype", choices=("bf16", "fp16"), default="bf16")
     p.add_argument(
         "--native-backend",
         choices=(
@@ -299,6 +438,8 @@ def main():
             "sm12x",
             "sm120-tc",
             "expanded-bf16",
+            "expanded-fp16",
+            "frost-ungrouped",
         ),
         default="cutile",
     )
@@ -319,6 +460,13 @@ def main():
     p.add_argument("--expert-reuse", choices=("shared", "disjoint"), default="disjoint")
     p.add_argument("--output", type=Path, required=True)
     a = p.parse_args()
+    is_fp16 = a.activation_dtype == "fp16"
+    is_w8 = a.weight_format == "w8a16"
+    dtype = torch.float16 if is_fp16 else torch.bfloat16
+    quant_format = QuantFormat.FP16 if is_fp16 else QuantFormat.BF16
+    expanded_fp16 = a.native_backend == "expanded-fp16"
+    reuse_control = a.native_backend == "frost-ungrouped"
+    preact_boundary = a.activation_dtype + "_preact"
     if a.timer == "cupti":
         import cupti.cupti  # noqa: F401
 
@@ -333,15 +481,52 @@ def main():
         "sm12x": ((12, 0), (12, 1)),
         "sm120-tc": ((12, 0), (12, 1)),
     }
-    if a.weight_format == "nvfp4":
+    if reuse_control:
+        if not is_w8 or cc != (12, 0):
+            raise ValueError("frost-ungrouped is the SM120 W8A16 reuse ablation")
+    elif expanded_fp16:
+        if not is_fp16 or cc not in ((9, 0), (10, 0), (10, 3)):
+            raise ValueError(
+                "expanded-fp16 requires FP16 activations on SM90/SM100/SM103"
+            )
+    elif is_fp16:
+        if (
+            cc != (12, 0)
+            or a.weight_format != "nvfp4"
+            or a.native_backend != "sm120-tc"
+        ):
+            raise ValueError(
+                "FP16 comparison requires SM120 NVFP4 sm120-tc or expanded-fp16 on SM90/SM100/SM103"
+            )
+    elif is_w8:
+        raise ValueError(
+            "The W8A16 control requires --activation-dtype fp16 --native-backend expanded-fp16"
+        )
+    if not expanded_fp16 and a.weight_format == "nvfp4":
         if cc not in nv_native_archs.get(a.native_backend, ()):
             raise RuntimeError(
                 "Select an architecture-appropriate NVFP4 native baseline"
             )
-    elif a.native_backend in ("cute-dsl", "sm12x", "sm120-tc", "expanded-bf16"):
+    elif a.weight_format != "nvfp4" and a.native_backend in (
+        "cute-dsl",
+        "sm12x",
+        "sm120-tc",
+        "expanded-bf16",
+    ):
         raise ValueError("This native adapter supports NVFP4/BF16 only")
+    mx_native_archs = {
+        "cutlass": ((9, 0),),
+        "prims-ts": ((10, 0), (10, 3)),
+        "cutile": ((9, 0), (12, 0), (12, 1)),
+    }
+    if (
+        not expanded_fp16
+        and a.weight_format == "mxfp4"
+        and cc not in mx_native_archs.get(a.native_backend, ())
+    ):
+        raise RuntimeError("Select an architecture-appropriate MXFP4 native baseline")
     is_int = a.weight_format == "mxint4"
-    if is_int != (a.native_backend == "trtllm-mxint4"):
+    if not expanded_fp16 and is_int != (a.native_backend == "trtllm-mxint4"):
         raise ValueError("MXINT4 comparison requires --native-backend trtllm-mxint4")
     is_mx = a.weight_format == "mxfp4"
     scale_block = 32 if is_mx or is_int else 16
@@ -353,7 +538,7 @@ def main():
     t, h, i, e, k = a.tokens, a.hidden, a.intermediate, a.experts, a.top_k
     assert h % 128 == i % 128 == 0 and t * k <= e and 1 <= t <= 8 and k <= 32
     torch.manual_seed(20261024)
-    x = torch.randn(t, h, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(t, h, device="cuda", dtype=dtype)
 
     def weights(rows, cols):
         chunks = []
@@ -361,8 +546,13 @@ def main():
             value = (
                 torch.randn(min(16, e - begin), rows, cols, device="cuda") / cols**0.5
             ).bfloat16()
-            q, sf, _ = _quantize_weights(value, scale_block_size=scale_block)
-            chunks.append((q, sf.view(torch.uint8)))
+            if is_w8:
+                q = (value.float() * 256.0).to(torch.float8_e4m3fn)
+                sf = torch.full((value.shape[0],), 1.0 / 256.0, device=value.device)
+                chunks.append((q, sf))
+            else:
+                q, sf, _ = _quantize_weights(value, scale_block_size=scale_block)
+                chunks.append((q, sf.view(torch.uint8)))
         return torch.cat([q for q, sf in chunks]), torch.cat([sf for q, sf in chunks])
 
     if is_int:
@@ -380,12 +570,34 @@ def main():
         w2, s2 = weights(h, i)
     a1 = torch.ones(e, device="cuda")
     a2 = torch.ones(e, device="cuda")
+    if is_fp16 and a.weight_format == "nvfp4" and not expanded_fp16:
+        # Preserve the checkpoint exactly while avoiding native FP16 preparation's
+        # tiny-block-scale clamp. Both paths receive these equivalent scales.
+        for sf in (s1, s2):
+            values = sf.view(torch.float8_e4m3fn).float() * 128.0
+            converted = values.to(torch.float8_e4m3fn)
+            torch.testing.assert_close(converted.float(), values, atol=0, rtol=0)
+            sf.copy_(converted.view(torch.uint8))
+        a1.fill_(1.0 / 128.0)
+        a2.fill_(1.0 / 128.0)
     ids = torch.arange(t * k, device="cuda", dtype=torch.int32).reshape(t, k)
     if a.expert_reuse == "shared":
         ids.remainder_(k)
     scores = torch.randn(t, k, device="cuda").softmax(-1).bfloat16().float()
     original_ids, original_scores = ids.clone(), scores.clone()
-    if is_int:
+    if reuse_control:
+        option, native_key, view = (
+            FrostLowLatencyConfig(),
+            "frost_ungrouped_16_tactics",
+            None,
+        )
+    elif expanded_fp16:
+        option, native_key, view = (
+            FrostLowLatencyConfig(),
+            "cutlass_fp16_expanded",
+            None,
+        )
+    elif is_int:
         option = TrtllmMxInt4Config()
         native_key = "trtllm_mxint4_routed"
         # Official preparation calls the same deterministic canonical quantizer
@@ -410,7 +622,11 @@ def main():
         view = _cute_dsl_nvfp4_view(w1, s1, a1, w2, s2, a2)
     elif a.native_backend == "sm120-tc":
         # The direct native adapter below has no unified-runner tactic wrapper.
-        option, native_key, view = FrostLowLatencyConfig(), "sm120_fused_tc", None
+        option, native_key, view = (
+            FrostLowLatencyConfig(),
+            ("sm120_fp16_tc" if is_fp16 else "sm120_fused_tc"),
+            None,
+        )
     elif a.native_backend in ("cutile", "sm12x"):
         option = (
             SM12xNvfp4Bf16Config()
@@ -489,17 +705,30 @@ def main():
     cfg = MoEConfig(
         RoutingConfig(e, k),
         QuantConfig(
-            weight=QuantFormat.MXINT4
+            weight=QuantFormat.FP8PerTensor
+            if is_w8
+            else QuantFormat.MXINT4
             if is_int
             else (QuantFormat.MXFP4 if is_mx else QuantFormat.NVFP4),
-            activation=QuantFormat.BF16,
+            activation=quant_format,
+            output=quant_format,
         ),
         ExpertConfig(i),
         backend=BackendOptions((option,)),
         execution=ExecutionConfig(tune_max_num_tokens=t),
     )
     act = MoEActivationPack(x, None, ids, scores)
-    if a.native_backend == "sm120-tc":
+    if reuse_control:
+        native_tactics = [(a, b) for a in (1, 2, 4, 8) for b in (1, 2, 4, 8)]
+    elif expanded_fp16:
+        native, native_tactics = _expanded_fp16_native(
+            x,
+            _expand_weight_only_fp16(w1, s1, a1, a.weight_format),
+            _expand_weight_only_fp16(w2, s2, a2, a.weight_format),
+            ids,
+            scores,
+        )
+    elif a.native_backend == "sm120-tc":
         native, native_tactics = _sm120_tc_native(
             x, w1, s1, a1, w2, s2, a2, ids, scores
         )
@@ -566,7 +795,9 @@ def main():
     )
     frost_pack = MoEWeightPack()
     frost_view = (
-        FrostLowLatencyConfig.prepare_mxint4_weight_only_weights(w1, s1, w2, s2)
+        FrostLowLatencyConfig.prepare_fp8_weight_only_weights(w1, s1, w2, s2)
+        if is_w8
+        else FrostLowLatencyConfig.prepare_mxint4_weight_only_weights(w1, s1, w2, s2)
         if is_int
         else FrostLowLatencyConfig.prepare_mxfp4_weight_only_weights(
             w1, s1.view(scale_dtype), w2, s2.view(scale_dtype)
@@ -587,9 +818,14 @@ def main():
         frost_layer._winners[frost_bucket] = (frost_runner, ("ffma", *tactic))
         return frost_layer(act, frost_pack)
 
+    if reuse_control:
+        native = frost
+
     lut = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device="cuda")
 
     def decode(q, sf):
+        if is_w8:
+            return q.double() * sf.double()
         code = torch.stack((q & 15, q >> 4), dim=-1).flatten(-2).long()
         if is_int:
             values = torch.where(code < 8, code, code - 16).float()
@@ -602,21 +838,25 @@ def main():
 
     references = {
         boundary: torch.zeros(t, h, device="cuda")
-        for boundary in ("bf16_preact", "fp32_preact", "fp32_preact_expert")
+        for boundary in (preact_boundary, "fp32_preact", "fp32_preact_expert")
     }
     for token in range(t):
         for slot, expert in enumerate(ids[token].tolist()):
-            pre = (decode(w1[expert], s1[expert]) @ x[token].double()).float()
+            pre = (decode(w1[expert], s1[expert]) @ x[token].double()).float() * a1[
+                expert
+            ]
             for boundary, reference in references.items():
                 up, gate = (
-                    pre.bfloat16().float() if boundary == "bf16_preact" else pre
+                    pre.to(dtype).float() if boundary == preact_boundary else pre
                 ).chunk(2)
-                hidden = (up * torch.nn.functional.silu(gate)).bfloat16()
-                value = (decode(w2[expert], s2[expert]) @ hidden.double()).float()
+                hidden = (up * torch.nn.functional.silu(gate)).to(dtype)
+                value = (decode(w2[expert], s2[expert]) @ hidden.double()).float() * a2[
+                    expert
+                ]
                 if boundary != "fp32_preact_expert":
-                    value = value.bfloat16().float()
+                    value = value.to(dtype).float()
                 reference[token] += value * scores[token, slot]
-    references = {name: value.bfloat16() for name, value in references.items()}
+    references = {name: value.to(dtype) for name, value in references.items()}
 
     def err(v, r):
         delta = v.double() - r.double()
@@ -653,11 +893,21 @@ def main():
         workload=vars(a) | {"output": str(a.output)},
         gpu=torch.cuda.get_device_name(),
         cc=torch.cuda.get_device_capability(),
-        scope="BF16 input + routed FC1/activation + FC2/combine; identical checkpoint payloads, scales and routes. Host/preparation/routing network/shared experts/communication/serving excluded",
-        numerical_contract="BF16 input and intermediate. Unless noted otherwise, BF16 expert outputs with FP32 accumulation/combine. FP4 Frost/cuTile/SM90 CUTLASS round FC1 preactivation to BF16; Prims-TS and both MXINT4 paths retain FP32 through activation. CuTe DSL also retains FP32 preactivation; SM12x and SM120 fused TC retain FP32 expert partials. SM12x uses FP16 partial products/accumulation internally. SM120 fused TC combines atomically into BF16 output. Separate references are recorded; different boundaries are not bitwise-equivalent math.",
+        scope=f"{a.activation_dtype.upper()} input/output + routed FC1/activation + FC2/combine; identical checkpoint payloads, scales and routes. Host/preparation/routing network/shared experts/communication/serving excluded",
+        numerical_contract=(
+            "Both paths use identical E4M3 checkpoints, input/preactivation/intermediate/expert/output rounding and ordered combine. Compare the best original 16 tactics with the expanded candidate set."
+            if reuse_control
+            else "FP16 input/intermediate/output; Frost FP4/E4M3 rounds preactivation to FP16, MXINT4 retains FP32. Expanded CUTLASS rounds preactivation to FP16; SM120 native retains FP32 preactivation/partials. Each has a separate reference."
+            if is_fp16
+            else "BF16 input and intermediate. Unless noted otherwise, BF16 expert outputs with FP32 accumulation/combine. FP4 Frost/cuTile/SM90 CUTLASS round FC1 preactivation to BF16; Prims-TS and both MXINT4 paths retain FP32 through activation. CuTe DSL also retains FP32 preactivation; SM12x and SM120 fused TC retain FP32 expert partials. SM12x uses FP16 partial products/accumulation internally. SM120 fused TC combines atomically into BF16 output. Separate references are recorded; different boundaries are not bitwise-equivalent math."
+        ),
         native_backend=native_key,
         native_weight_storage=(
-            "Exact offline NVFP4 expansion to BF16; unit global scales; 4x packed-weight bytes; expansion excluded from timing; not a native four-bit implementation"
+            "Identical E4M3 checkpoint and per-expert FP32 scales on both paths"
+            if reuse_control
+            else f"Exact offline {a.weight_format} expansion to FP16; {2 if is_w8 else 4}x payload storage; expansion excluded; not a native low-bit implementation"
+            if expanded_fp16
+            else "Exact offline NVFP4 expansion to BF16; unit global scales; 4x packed-weight bytes; expansion excluded from timing; not a native four-bit implementation"
             if a.native_backend == "expanded-bf16"
             else "Native packed four-bit checkpoint"
         ),
@@ -709,18 +959,21 @@ def main():
         own = errors[
             "fp32_preact_expert"
             if name == "native" and a.native_backend in ("sm12x", "sm120-tc")
-            else "bf16_preact"
-            if not is_int
-            and (
-                name == "frost"
-                or a.native_backend in ("cutile", "cutlass", "expanded-bf16")
+            else preact_boundary
+            if (name == "native" and (expanded_fp16 or reuse_control))
+            or (
+                not is_int
+                and (
+                    name == "frost"
+                    or a.native_backend in ("cutile", "cutlass", "expanded-bf16")
+                )
             )
             else "fp32_preact"
         ]
         assert (
             torch.isfinite(v).all()
-            and own["relative_l2"] < 0.015
-            and own["normalized_max"] < 0.06
+            and own["relative_l2"] < (0.003 if is_fp16 else 0.015)
+            and own["normalized_max"] < (0.01 if is_fp16 else 0.06)
         ), (name, errors)
         return errors
 
@@ -821,7 +1074,9 @@ def main():
     for tactic in native_tactics:
         measure("native", tactic)
     result["native_search"] = (
-        "All advertised native choices plus default; cuTile additionally enumerates the selected/all supported block-size stage pairs; SM120 fused TC uses all same-thread small-tile pairs"
+        "All 16 original Frost FC1/FC2 column pairs; identical checkpoint and numerical contract"
+        if reuse_control
+        else "All advertised native choices plus default; cuTile additionally enumerates the selected/all supported block-size stage pairs; SM120 native uses all same-thread small/large-tile pairs; expanded FP16 ranks top-two per stage plus default"
     )
     result["native_tactic_count"] = len(native_tactics)
     selected = {

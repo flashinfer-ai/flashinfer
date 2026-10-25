@@ -95,12 +95,18 @@ _COMMON = dict(
     candidate_slack=128,
     cand_mult_rule=[384.0, 8],
     cand_cap_floor=8192,
+    candidate_multiplier_unsampled=4,
+    cand_mult_rule_unsampled=[384.0, 8],
+    cand_cap_floor_unsampled=8192,
+    cand_cap_ceiling=None,
+    cand_cap_ceiling_unsampled=None,
     split_max=32,
     split_min_range_tiles=64,
     snake_default=False,
     tile_unroll_default=1,
     tile_unroll_factor=2,
     sample_fit_max_mean_tiles=512,
+    sample_fit_kinds=["l6", "narrow", "pair_l6", "pair_narrow", "pair_wide", "wide"],
     sample_tiles_max=32,
     sample_tiles_short_units=16,
     sample_dispatch_mean_tiles_max=640,
@@ -619,6 +625,19 @@ def test_policy_record_round_trip_and_validation():
         dict(far_sample=2),  # the far-sample first threshold switch: 0 or 1
         dict(far_sample=-1),
         dict(far_sample=True),
+        dict(candidate_multiplier_unsampled=0),  # the unsampled capacity values
+        dict(cand_mult_rule_unsampled=384),
+        dict(cand_cap_floor_unsampled=8192.5),
+        # the capacity ceilings: positive, at or above the floor
+        dict(cand_cap_ceiling=0),
+        dict(cand_cap_ceiling=4096),
+        dict(cand_cap_ceiling=32768.5),
+        dict(cand_cap_ceiling_unsampled=4096),
+        # the kinds with a sampled-fit program: an ascending list of physical kinds
+        dict(sample_fit_kinds="l6"),
+        dict(sample_fit_kinds=["split"]),
+        dict(sample_fit_kinds=["wide", "l6"]),
+        dict(sample_fit_kinds=["l6", "l6"]),
     ):
         with pytest.raises(ValueError):
             DispatchPolicy.from_record(dict(record, **bad))
@@ -649,6 +668,50 @@ def test_policy_capacity_period_and_finalize():
     assert p.cand_cap_multiplier_for(8192, 1048576, 1, 1, 2048) == 8
     assert p.cand_cap_multiplier_for(65536, 65536, 1, 1, 256) == 32
     assert p.cand_cap_multiplier_for(65536, 65536, 1, 1, 4096) == 4
+    # the unsampled capacity values stand in when the sampled first threshold is off
+    raised = DispatchPolicy.from_record(
+        dict(p.record(), candidate_multiplier=16, cand_cap_floor=16384)
+    )
+    assert raised.cand_cap_multiplier_for(65536, 65536, 1, 1, 2048) == 16
+    assert raised.cand_cap_multiplier_for(65536, 65536, 1, 1, 2048, sampled=False) == 4
+    assert raised.cand_cap_multiplier_for(65536, 65536, 1, 1, 256, sampled=False) == 32
+    geometry = dict(
+        num_queries=65536, num_keys=65536, num_segments=1, ratio=1, top_k=2048, grid=148
+    )
+    sampled = cake_policy.select_program(raised, **geometry)
+    unsampled = cake_policy.select_program(raised, sample_tiles_max=0, **geometry)
+    assert sampled.cand_cap == 32768 and sampled.sample_tiles_max > 0
+    assert unsampled.cand_cap == 8192 and unsampled.sample_tiles_max == 0
+    assert (
+        unsampled.cand_cap
+        == cake_policy.select_program(p, sample_tiles_max=0, **geometry).cand_cap
+    )
+    assert (unsampled.scan_key, unsampled.n_split) == (
+        sampled.scan_key,
+        sampled.n_split,
+    )
+    # the ceiling lowers the multiplier once multiplier x top_k would exceed it: 16 x top_k up to 32768 slots, long units
+    # and the floor untouched
+    capped = DispatchPolicy.from_record(
+        dict(
+            p.record(),
+            candidate_multiplier=16,
+            cand_cap_floor=16384,
+            cand_cap_ceiling=32768,
+        )
+    )
+    assert capped.cand_cap_multiplier_for(65536, 65536, 1, 1, 2048) == 16
+    assert capped.cand_cap_multiplier_for(65536, 65536, 1, 1, 4096) == 8
+    assert capped.cand_cap_multiplier_for(65536, 65536, 1, 1, 3000) == 10
+    assert capped.cand_cap_multiplier_for(65536, 65536, 1, 1, 256) == 64
+    assert capped.cand_cap_multiplier_for(8192, 1048576, 1, 1, 2048) == 8
+    assert capped.cand_cap_multiplier_for(65536, 65536, 1, 1, 2048, sampled=False) == 4
+    assert [
+        capped.candidate_capacity(
+            k, capped.cand_cap_multiplier_for(65536, 65536, 1, 1, k)
+        )
+        for k in (256, 2048, 3000, 4096)
+    ] == [16384, 32768, 30080, 32768]
     # right-sized finalize programs for small top_k, 256 threads up to 2048, 512 above
     assert [p.finalize_threads_for(k) for k in (1, 256, 257, 512, 513, 1024, 1025, 2048, 2049, 4096)] == [
         32, 32, 64, 64, 128, 128, 256, 256, 512, 512,
@@ -1227,6 +1290,72 @@ def test_policy_selects_registered_programs_on_a_dense_geometry_grid():
                             bound,
                             key,
                         )
+
+
+def test_sample_fit_kinds_name_exactly_the_registered_sampled_fit_programs():
+    """``sample_fit_kinds`` is the registry's own list: every scan kind with a registered ``:f1`` program and no other, so
+    the dispatch never composes a sampled-fit key the architecture does not ship (round 3: a 32768-slot capacity made
+    split units of 22k-42k keys fit the buffer and selected ``scan:split_l6:u1:s0:f1``, which has no program)."""
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    for arch, keys in cake_jit.PROGRAM_KEYS.items():
+        registered = sorted(
+            {
+                key.split(":")[1]
+                for key in keys
+                if key.startswith("scan:") and key.endswith(":f1")
+            }
+        )
+        assert policy_for(arch).sample_fit_kinds == registered, arch
+    # a split unit that fits a 32768-slot buffer keeps the plain split program; the gate, not the geometry, decides
+    p = policy_for("sm_103a")
+    geometry = dict(
+        num_queries=4, num_keys=22018, num_segments=1, ratio=1, top_k=2048, grid=148
+    )
+    c = select_program(p, candidate_multiplier=16, **geometry)
+    assert (c.scan_key, c.n_split, c.cand_cap) == ("scan:split_l6:u1:s0:f0", 2, 32768)
+    assert c.physical_kind == "split_l6" and not c.sample_fit
+    assert (
+        select_program(p, **geometry).cand_cap == 32768
+    )  # the record's own multiplier reaches the same plan
+    wider = DispatchPolicy.from_record(
+        dict(p.record(), sample_fit_kinds=sorted(p.sample_fit_kinds + ["split_l6"]))
+    )
+    c = select_program(wider, candidate_multiplier=16, **geometry)
+    assert c.scan_key == "scan:split_l6:u1:s0:f1" and c.sample_fit
+    assert p.sample_fit_for(4, 22018, 1, 1, 32768) and not p.sample_fit_for(
+        4, 22018, 1, 1, 32768, "split_l6"
+    )
+
+
+def test_shipped_capacity_rules_by_architecture():
+    """sm_103a: short units (under 384 mean tiles) take 16 x top_k slots up to the 32768-slot ceiling, long units keep
+    8 x top_k above the 16384-slot floor; sm_100a keeps 4 x top_k above the floor; the unsampled values (``sample_tiles_max=0``)
+    are the 8192-slot rule on both."""
+    short = dict(
+        num_queries=65536, num_keys=65536, num_segments=1, ratio=1, grid=148
+    )  # 256 mean tiles
+    long = dict(
+        num_queries=16384, num_keys=270336, num_segments=2, ratio=1, grid=148
+    )  # 1024 mean tiles
+    p103, p100 = policy_for("sm_103a"), policy_for("sm_100a")
+    caps = lambda p, g, **kw: [
+        select_program(p, top_k=k, **g, **kw).cand_cap for k in (256, 2048, 4096)
+    ]  # noqa: E731
+    assert caps(p103, short) == [16384, 32768, 32768]
+    assert caps(p103, long) == [16384, 16384, 32768]
+    assert caps(p100, short) == [16384, 16384, 16384]
+    assert caps(p100, long) == [16384, 16384, 32768]
+    assert (
+        caps(p103, short, sample_tiles_max=0)
+        == caps(p100, short, sample_tiles_max=0)
+        == [8192, 8192, 16384]
+    )
+    assert (
+        caps(p103, long, sample_tiles_max=0)
+        == caps(p100, long, sample_tiles_max=0)
+        == [8192, 16384, 32768]
+    )
 
 
 def test_program_keys_and_slugs():

@@ -144,7 +144,8 @@ def _inputs(rank: int, tokens: int, routing: str, seed: int) -> MoEEpTensors:
         # The eight distinct local experts exercise the local weighted reduction.
         owner = seed % _WORLD
         local_expert = (token * 5 + slot + rank + seed) % _LOCAL_EXPERTS
-        ids = (owner * _LOCAL_EXPERTS + local_expert).to(torch.int32)
+        # int64 like all_ranks: the layer's steady-state input signature includes the id dtype.
+        ids = (owner * _LOCAL_EXPERTS + local_expert).to(torch.int64)
     scores = torch.rand(
         tokens, _TOP_K, dtype=torch.float32, device="cuda", generator=generator
     )
