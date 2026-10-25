@@ -1121,7 +1121,7 @@ def test_registry_records_follow_the_plan_vocabulary():
         "merge": cake_jit.MERGE_PARAMETERS,
         "quantize": cake_jit.QUANTIZE_PARAMETERS,
     }
-    select_kinds = {"always", "all_full", "rows_splits_within"}
+    select_kinds = {"always", "all_full", "plan_within", "rows_splits_within"}
     grid_kinds = {"ctas_per_item", "rows_per_cta"}
     assert cake_jit.ARCHES == ("sm_107a",) and cake_jit.ARCH_BY_CAPABILITY == {
         (10, 7): "sm_107a"
@@ -1147,7 +1147,11 @@ def test_registry_records_follow_the_plan_vocabulary():
             assert key in cake_jit.LOGICAL_TENSORS or key in cake_jit.LOGICAL_SCALARS, (
                 key
             )
-    assert cake_jit.records_of_stage("decode") == ("decode", "decode_full")
+    assert cake_jit.records_of_stage("decode") == (
+        "decode",
+        "decode_full",
+        "decode_full_pairpipe",
+    )
     assert cake_jit.records_of_stage("merge") == (
         "merge_w1",
         "merge_w2",
@@ -1167,6 +1171,21 @@ def test_select_rules_and_grids():
     )
     assert cake_jit.select_record("decode", rows=384, n_full=1, items=3) == "decode"
     assert cake_jit.select_record("decode", rows=96, n_full=0, items=4) == "decode"
+    # The pair-body converter pipeline program takes the one plan box of its rule (64 requests of
+    # 8 query tokens over 96 heads, 64K keys: 618 full-tile items, 4 splits); its neighbours keep
+    # the all_full / half-tile selection.
+    assert (
+        cake_jit.select_record("decode", rows=49152, n_full=618, items=618, splits=4)
+        == "decode_full_pairpipe"
+    )
+    assert (
+        cake_jit.select_record("decode", rows=49152, n_full=618, items=618, splits=2)
+        == "decode_full"
+    )
+    assert (
+        cake_jit.select_record("decode", rows=49152, n_full=617, items=618, splits=4)
+        == "decode"
+    )
     cases = (
         (96, 24, "merge_w8"),
         (192, 52, "merge_w8"),

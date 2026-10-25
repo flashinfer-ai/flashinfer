@@ -97,7 +97,7 @@
     },
     {
       "arch": "sm_100a",
-      "closure_sha256": "d9bf81c2407852f3b8f3d82789406cf839c32c605e6e736e2985d90f912f4b60",
+      "closure_sha256": "9af767d551b73c7518eb5856123741b94a08ef6c30b2559395f93c4886fff275",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
       "min_cuda": "12.8",
@@ -109,7 +109,7 @@
       "path": "aot/cake_nvfp4_mla_decode_4cd8124d834b7ab3a055_sm_100a.so",
       "sha256": {
         "csrc/cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_4cd8124d834b7ab3a055_binding.cu": "457867e35e6999660445ea04e9b95475c5b71a8d992918ee4893d9b44b19ad23",
-        "csrc/cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_4cd8124d834b7ab3a055_kernel.cu": "524f9d741fbd2f6cb1ef501a35b76e36864471cf735ef6b9a049d011555e30b0"
+        "csrc/cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_4cd8124d834b7ab3a055_kernel.cu": "83825412836b8e1a04572f08d9e448958e3dfa9eee272f0d43816a0ac04fe5a8"
       },
       "sources": [
         "csrc/cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_4cd8124d834b7ab3a055_kernel.cu",
@@ -118,7 +118,7 @@
     },
     {
       "arch": "sm_103a",
-      "closure_sha256": "d4580f9e4c3a87c4ca31ac20e02c2ab18b4caa18a1795f9be1da6fd06991d9d8",
+      "closure_sha256": "6bcbda4a18136cdda3cff8f4175b5aa3988cab374d715aae0d8deba3c3603ae3",
       "entry": "run",
       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
       "min_cuda": "12.9",
@@ -130,7 +130,7 @@
       "path": "aot/cake_nvfp4_mla_decode_4cd8124d834b7ab3a055_sm_103a.so",
       "sha256": {
         "csrc/cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_4cd8124d834b7ab3a055_binding.cu": "457867e35e6999660445ea04e9b95475c5b71a8d992918ee4893d9b44b19ad23",
-        "csrc/cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_4cd8124d834b7ab3a055_kernel.cu": "524f9d741fbd2f6cb1ef501a35b76e36864471cf735ef6b9a049d011555e30b0"
+        "csrc/cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_4cd8124d834b7ab3a055_kernel.cu": "83825412836b8e1a04572f08d9e448958e3dfa9eee272f0d43816a0ac04fe5a8"
       },
       "sources": [
         "csrc/cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_4cd8124d834b7ab3a055_kernel.cu",

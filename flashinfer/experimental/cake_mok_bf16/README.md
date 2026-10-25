@@ -104,6 +104,13 @@ backward as `dot(d_hidden, hidden) / score`, as in native MoK. Scores must be
 positive; a zero score yields a zero score gradient. A larger macrobatch ring
 uses more memory and replays less in backward.
 
+`backward` returns `dx`, `dscores` and the six weight gradients. The fused
+kernel's routed and shared scratch is released as soon as the launch is
+enqueued, before the output epilogue and the score-gradient copy allocate,
+so a training step's peak allocation is inside the fused backward launch for
+both precisions, except when the intermediate size is below a third of the
+hidden size and a rank's source rows exceed twice the macrobatch.
+
 `recompute_forward_context(config, workspace, schedule, x, shared_gate,
 shared_up, routed_gate, routed_up, swiglu_limit=None)` dispatches and
 recomputes the gate/up GEMMs and SwiGLU of exactly that context. Pass the same
@@ -163,6 +170,18 @@ inputs and workspace remain alive. Run graphs sharing a workspace serially
 and in the same order across ranks. Growth beyond capacity requires all ranks
 to recreate the workspace.
 
+`build_schedule` derives the expert layout once per schedule
+(`MoKSchedule.layout`, int32 `[3 * local experts + schedule_capacity / 256]`:
+padded counts, row offsets, real rows and the expert of each 256-row block) and
+every fused launch of that schedule reads it; a schedule built without it
+(`layout=None`) makes each launch derive its own. The layout is a function of
+`tokens_per_expert` and `peer_rank`, whose real rows come first within each
+expert's padded rows; a schedule copied with `dataclasses.replace` that changes
+`peer_rank`, `tokens_per_expert` or the capacity must pass `layout=None`. The
+launchers memoise their launch-invariant geometry per distinct launch
+arguments (integers and, for MXFP8, the device); the memo holds no tensors
+and does not change the launch sequence.
+
 ## Contract
 
 - Scheduler layouts `(EP, local experts)`: `(1, 4)` and `(4, 4)` diagnostic
@@ -182,11 +201,12 @@ to recreate the workspace.
   are positive and even, leaving compute SMs available.
 - Imbalance-aware split (`MoKConfig.imbalance_comm_sms` / `imbalance_threshold`;
   factory default `imbalance_comm_sms="auto"`, `None` keeps the fixed split): every
-  `build_schedule` counts the gathered expert IDs per owning rank on device (one
-  `torch.histc` pass, linear in the number of ids) and copies the counts into
-  pinned host memory behind a CUDA event (no host synchronization; skipped during
-  graph capture). The gathered IDs and the counts are identical on every rank;
-  each rank applies its own latest completed observation, so with back-to-back
+  `build_schedule` counts the gathered expert IDs per owning rank on device
+  inside the scheduler's count kernel (the same pass that counts this rank's
+  experts; no extra launch) and copies the counts into pinned host memory
+  behind a CUDA event (no host synchronization; skipped during graph capture).
+  The gathered IDs and the counts are identical on every rank; each rank
+  applies its own latest completed observation, so with back-to-back
   steps a launch may use different splits on different ranks for a step - the
   split is a per-rank launch parameter and the protocol does not require
   agreement. While the hottest rank's load is at least `imbalance_threshold`
@@ -244,7 +264,10 @@ Single-GPU tests:
   an independent BF16-rounding reference (empty experts, multiple ring lengths,
   variable widths, CUDA Graph replay, changed and zero scores), clamped SwiGLU,
   FP32 accumulation, GLM-5.3-Flash local expert counts, recompute versus
-  saved context, every scheduler layout and the epilogues.
+  saved context, every scheduler layout (with the owner-rank load counts
+  against the host reference and the expert layout against a torch reference,
+  explicit and launcher-derived), the counter slab, the launch-geometry memo
+  and the epilogues.
 - `tests/experimental/test_mok_mxfp8.py`: the weight quantizer, the fused MXFP8
   forward and forward+backward against a quantization-aware reference (plain
   and clamped; routed and shared-expert gradients; BF16 or FP32

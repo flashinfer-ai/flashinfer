@@ -552,7 +552,10 @@ def test_stream_counters_are_cached_per_stream():
     splits = _splits(rows, num_kv_heads, device)
     if (
         splits == 1
-        or cake_backend.select_form(rows, num_kv_heads, splits, index) != "fused"
+        or cake_backend.select_form(
+            rows, num_kv_heads, splits, cake_backend.num_tiles(WIDTH), index
+        )
+        != "fused"
     ):
         pytest.skip("the fused form is not selected on this device")
     q, cache, selection, gate = _inputs(rows, num_qo_heads, num_kv_heads, "NHD", 61)
@@ -1038,7 +1041,9 @@ def test_form_rule_takes_the_fused_form_within_the_capacity_and_the_eager_rule(
     monkeypatch,
 ):
     """``select_form``: never above one split or the device's fused capacity. Within
-    it, compute capability 9.0 and 12.0 take the fused form on every host, eager or captured;
+    it, compute capability 9.0 takes the fused form on every host, eager or captured,
+    and so does 12.0 below the tile stream (a call whose CTAs would each walk
+    ``STREAM_TILES`` tiles takes the split form: the whole-tile program's);
     10.0 / 10.3 take it only on an ``aarch64`` host, at ``rows <= FUSED_MAX_ROWS`` and
     outside capture (the captured call keeps the split form); 10.7 and 8.x are split alone.
     GPU-free: the device facts are faked per device index."""
@@ -1050,7 +1055,13 @@ def test_form_rule_takes_the_fused_form_within_the_capacity_and_the_eager_rule(
         1070: ("sm_107a", 212),
         1200: ("sm_120a", 188),
     }
-    form = cake_backend.select_form
+    tiles = cake_backend.num_tiles(WIDTH)  # 33: every call below is at the full width
+
+    def form(rows, num_kv_heads, splits, index, capturing=False):
+        return cake_backend.select_form(
+            rows, num_kv_heads, splits, tiles, index, capturing
+        )
+
     reads = cake_backend._reads_capture_state
     monkeypatch.setattr(cake_backend, "_device_facts", lambda index: facts[index])
     cake_backend.fused_capacity.cache_clear()
@@ -1100,11 +1111,17 @@ def test_form_rule_takes_the_fused_form_within_the_capacity_and_the_eager_rule(
                 assert form(16, 2, 8, 900, capturing) == "fused"
                 assert form(16, 2, 9, 900, capturing) == "split"
             assert reads(8, 900) is False
-            # Compute capability 12.0: the fused form within 376 CTAs (two per SM on 188 SMs),
-            # whatever the host or the capture state; above it the split form.
+            # Compute capability 12.0: the fused form within 376 CTAs (two per SM on
+            # 188 SMs) below the tile stream (33 tiles at 4 splits: 9 per CTA), whatever
+            # the host or the capture state; above the capacity, or at the stream (33
+            # tiles at 3 or 2 splits: 11 / 17 per CTA, the whole-tile program's calls),
+            # the split form.
+            assert cake_backend.STREAM_TILES == 11
             for capturing in (False, True):
-                assert form(64, 2, 2, 1200, capturing) == "fused"
-                assert form(64, 2, 3, 1200, capturing) == "split"
+                assert form(32, 2, 4, 1200, capturing) == "fused"
+                assert form(48, 2, 4, 1200, capturing) == "split"
+                assert form(32, 2, 3, 1200, capturing) == "split"
+                assert form(64, 2, 2, 1200, capturing) == "split"
             assert reads(8, 1200) is False
             # Compute capability 8.x: the split form alone.
             assert form(1, 2, 33, 800) == "split"
@@ -1185,7 +1202,7 @@ def test_registry_records_carry_the_launch_facts_and_the_argument_plans():
     }
     arches = {
         "decode": ("sm_80", "sm_90a", "sm_120a"),
-        "decode_whole_tile": ("sm_80",),
+        "decode_whole_tile": ("sm_80", "sm_120a"),
         "decode_coop": ("sm_80", "sm_90a", "sm_120a"),
         "decode_tcgen05": ("sm_100a", "sm_103a", "sm_107a"),
         "decode_tcgen05_coop": ("sm_100a", "sm_103a", "sm_107a"),
@@ -1194,16 +1211,16 @@ def test_registry_records_carry_the_launch_facts_and_the_argument_plans():
     }
     tcgen05 = ("decode_tcgen05", "decode_tcgen05_coop", "decode_tcgen05_persistent")
     assert cake_jit.SELECT_RULES == ("form", "form_grid")
-    assert cake_jit.GRID_BOUNDS == ("multi_wave_long", "two_wave_walk")
+    assert cake_jit.GRID_BOUNDS == ("multi_wave_long", "long_stream", "two_wave_walk")
     persistent = cake_jit.MODULES["decode_tcgen05_persistent"]
     assert persistent["stage"] == "decode"
     assert persistent["variant"] == "tcgen05_persistent"
     assert persistent["select_rule"] == {
         "kind": "form_grid",
         "value": "split",
-        "arch": "sm_103a",
-        "grid": "two_wave_walk",
+        "grid": {"sm_103a": "two_wave_walk"},
     }
+    assert list(persistent["select_rule"]["grid"]) == persistent["arches"]
     assert persistent["grid_rule"] == {"kind": "walk_ctas"}
     assert (
         persistent["workspace_rule"]
@@ -1214,9 +1231,9 @@ def test_registry_records_carry_the_launch_facts_and_the_argument_plans():
     assert whole_tile["select_rule"] == {
         "kind": "form_grid",
         "value": "split",
-        "arch": "sm_80",
-        "grid": "multi_wave_long",
+        "grid": {"sm_80": "multi_wave_long", "sm_120a": "long_stream"},
     }
+    assert list(whole_tile["select_rule"]["grid"]) == whole_tile["arches"]
     for key in ("grid_rule", "workspace_rule", "launch", "arg_plan", "logical"):
         assert whole_tile[key] == cake_jit.MODULES["decode"][key], key
     for name in tcgen05:
@@ -1375,7 +1392,12 @@ def test_workspace_at_a_recycled_address_is_zeroed_again():
     device = _device_or_skip()
     rows, num_qo_heads, num_kv_heads = 8, 24, 2
     splits = _splits(rows, num_kv_heads, device)
-    if cake_backend.select_form(rows, num_kv_heads, splits, device.index) != "fused":
+    if (
+        cake_backend.select_form(
+            rows, num_kv_heads, splits, cake_backend.num_tiles(WIDTH), device.index
+        )
+        != "fused"
+    ):
         pytest.skip("the split form keeps no counters in the workspace")
     q, cache, selection, gate = _inputs(rows, num_qo_heads, num_kv_heads, "NHD", 31)
     nbytes = cake_backend.qsa_workspace_bytes(rows, num_qo_heads, num_kv_heads, splits)

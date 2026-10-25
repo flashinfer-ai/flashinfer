@@ -138,6 +138,19 @@ constexpr bool IsGeometry(const Shape& shape, int32_t hidden_size, int32_t inter
          shape.top_k == top_k;
 }
 
+// The fused route-pack K256 FC2 rows that run the linear-grid, unthrottled workfeed program:
+// one 1-D grid of min(grid_m * route tiles, workfeed CTAs) CTAs, each starting at the tile of
+// its block index, instead of the grid_m x (workfeed CTAs / grid_m) pool. The other rows of
+// that FC2 keep the pool program.
+constexpr bool LinearK256Fc2(Target target, const Shape& shape) {
+  const int32_t t = shape.num_tokens;
+  if (target == Target::kSm100a)
+    return (IsGeometry(shape, 4096, 256, 512, 10) && t >= 9 && t <= 32) ||
+           (IsGeometry(shape, 4096, 512, 512, 10) && t >= 19 && t <= 32);
+  return (IsGeometry(shape, 4096, 256, 512, 10) && t >= 7 && t <= 32) ||
+         (IsGeometry(shape, 4096, 512, 512, 10) && t >= 12 && t <= 32);
+}
+
 constexpr Activation ActivationForGeometry(Geometry geometry) {
   if (geometry == Geometry::kH6144I1536E192K4) return Activation::kSiLU;
   if (geometry == Geometry::kH6144I3072E128K4 ||
@@ -689,6 +702,25 @@ constexpr Schedule SelectSm100aSchedule(const Shape& shape) {
 constexpr Schedule SelectSchedule(const Shape& shape) {
   return kTarget == Target::kSm100a ? SelectSm100aSchedule(shape) : SelectSm103aSchedule(shape);
 }
+
+// Every linear-grid row is a supported fused route-pack K256 FC2 row of its target: the host
+// picks the FC2 program and arms its workfeed counter from that schedule and the predicate.
+constexpr bool LinearK256Fc2RowsAreFusedK256(Target target) {
+  for (int32_t t = 0; t <= 64; ++t) {
+    const Shape shapes[] = {Shape{t, 4096, 256, 512, 512, 10}, Shape{t, 4096, 512, 512, 512, 10}};
+    for (const Shape& shape : shapes) {
+      if (!LinearK256Fc2(target, shape)) continue;
+      const Schedule s =
+          target == Target::kSm100a ? SelectSm100aSchedule(shape) : SelectSm103aSchedule(shape);
+      if (!s.supported || s.route_layout != RouteLayout::kGpuPacked ||
+          s.route_packer != RoutePacker::kFusedFc1 || s.fc2 != Fc2Schedule::kRouteParallelK256)
+        return false;
+    }
+  }
+  return true;
+}
+static_assert(LinearK256Fc2RowsAreFusedK256(Target::kSm100a));
+static_assert(LinearK256Fc2RowsAreFusedK256(Target::kSm103a));
 
 constexpr Shape E512Shape(int32_t tokens) { return {tokens, 2048, 512, 512, 512, 10}; }
 constexpr Shape E60Shape(int32_t tokens) { return {tokens, 2048, 1536, 60, 60, 4}; }

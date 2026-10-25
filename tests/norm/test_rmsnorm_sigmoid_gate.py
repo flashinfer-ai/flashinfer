@@ -6,6 +6,9 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 import flashinfer.norm as norm
+from flashinfer.cake_muse_spark_norm_backend import (
+    is_cake_rmsnorm_sigmoid_gate_supported,
+)
 from flashinfer.norm import (
     rmsnorm_sigmoid_gate,
     supports_rmsnorm_sigmoid_gate,
@@ -24,6 +27,17 @@ def _skip_unless_supported(backend):
         pytest.skip("RMSNorm sigmoid gate requires BF16 on SM100, SM103, or SM107")
     if not supports_rmsnorm_sigmoid_gate(torch.bfloat16, HEAD_DIM, backend=backend):
         pytest.skip(f"backend {backend!r} is not available on this device")
+
+
+def _cake_admits(tokens: int) -> bool:
+    """Whether the Cake package routes a call of ``tokens`` rows of ``NUM_HEADS`` heads in the facade's default launch
+    form (``enable_pdl=True``): its PDL route declares gaps, where ``"auto"`` keeps the CuTe DSL kernel under PDL."""
+    return is_cake_rmsnorm_sigmoid_gate_supported(
+        torch.device("cuda", torch.cuda.current_device()),
+        heads=NUM_HEADS,
+        tokens=tokens,
+        enable_pdl=True,
+    )
 
 
 def _inputs(tokens: int, seed: int):
@@ -68,7 +82,7 @@ def test_rmsnorm_sigmoid_gate_dispatch(monkeypatch, backend, shape):
     )
     monkeypatch.setattr(norm, "device_support_pdl", lambda *_: True)
 
-    def supported(device, *, heads=None, tokens=None):
+    def supported(device, *, heads=None, tokens=None, enable_pdl=None):
         return heads is None or heads == NUM_HEADS
 
     monkeypatch.setattr(
@@ -100,7 +114,8 @@ def test_rmsnorm_sigmoid_gate_dispatch(monkeypatch, backend, shape):
         if cake_expected:
             assert len(cake_calls) == 1 and not cute_calls
             args, keywords = cake_calls[0]
-            assert args == (x, gate) and keywords == {"eps": 1e-3}
+            # the facade hands the package the resolved launch form (device_support_pdl is True here)
+            assert args == (x, gate) and keywords == {"eps": 1e-3, "enable_pdl": True}
         else:
             assert not cake_calls and len(cute_calls) == 1
             args, keywords = cute_calls[0]
@@ -130,7 +145,16 @@ def test_rmsnorm_sigmoid_gate_matches_strided_reference(
 
     expected = _reference(x, gate, eps)
     output_ptr = x.data_ptr()
-    rmsnorm_sigmoid_gate(x, gate, eps, backend=backend)
+    if backend == "cake" and tokens and not _cake_admits(tokens):
+        # a declared gap of the package's PDL route: the explicit "cake" call is refused, the default backend
+        # ("auto") serves the call with the CuTe DSL kernel under PDL
+        with pytest.raises(
+            ValueError, match=f"admits {tokens} tokens of {NUM_HEADS} heads"
+        ):
+            rmsnorm_sigmoid_gate(x, gate, eps, backend=backend)
+        rmsnorm_sigmoid_gate(x, gate, eps)
+    else:
+        rmsnorm_sigmoid_gate(x, gate, eps, backend=backend)
     torch.cuda.synchronize()
 
     assert x.data_ptr() == output_ptr

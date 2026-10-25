@@ -17,7 +17,7 @@ Registry and loader glue of the Cake QSA sparse paged GQA decode over an
 NVFP4 KV cache for SM80, SM90, SM100, SM103, SM107 and SM120: two split-KV decode
 programs partitioning the architectures -- the ``mma.sync`` decode of ``sm_80``,
 ``sm_90a`` and ``sm_120a`` (its plain K-first build, its whole-tile build delivered for
-``sm_80`` alone, and its cooperative build, which merges the splits in the
+``sm_80`` and ``sm_120a``, and its cooperative build, which merges the splits in the
 same launch) and the tcgen05 decode of ``sm_100a``, ``sm_103a`` and ``sm_107a``
 (its plain and its cooperative build; tensor memory, one CTA per SM; and its
 persistent-walk build delivered for ``sm_103a`` alone) -- and the separate
@@ -27,8 +27,8 @@ Every record of ``MODULES`` is one mechanically exported program: a CUDA
 device translation unit plus a tvm-ffi binding, compiled for each architecture
 of the record's ``arches`` (one source per program; ``sm_80``, ``sm_90a`` and
 ``sm_120a`` for the ``mma.sync`` decodes, ``sm_100a``, ``sm_103a`` and ``sm_107a`` for the
-tcgen05 decodes, all five for the merge, ``sm_80`` alone for the whole-tile
-decode, ``sm_103a`` alone for the persistent walk).  A record
+tcgen05 decodes, all six for the merge, ``sm_80`` and ``sm_120a`` for the
+whole-tile decode, ``sm_103a`` alone for the persistent walk).  A record
 carries the host plan only: the program's ``library`` stem (its ``build.json``
 entry is ``<library>_<arch>``), the architectures it is delivered for, the
 ``stage`` of the launch order it fills and its ``variant``, the
@@ -48,23 +48,26 @@ The rules are data, evaluated here (:func:`select_records`,
 the plain decode, then the merge when the call has more than one split;
 ``"fused"``: the cooperative decode alone, its CTAs merging the splits
 through a counter per (row, KV head)), the device's exported architecture
-``arch`` and whether the decode grid is *wide* (a multi-wave, long-stream
-grid: above one resident wave, ``DECODE_CTAS_PER_SM`` CTAs per SM times the
-SM count, with every CTA walking at least ``DECODE_LONG_STREAM_TILES``
-tiles), the CTA count ``walk`` of the *persistent walk* when the host serves
-the call with it (``0`` otherwise: a two-wave split-form grid on ``sm_103a``
-whose longest walked CTA is shorter than the plain program's, the host's
-:func:`.cake_backend.select_walk`), the row count ``rows``, the KV head count
-``kv_heads``, the query head count ``qo_heads`` and the split count ``splits``
-(the walk's partial slots per (row, KV head), :func:`walk_splits`, where the
-walk serves the call).  Only the records delivered for ``arch``
+``arch`` and whether the call is *wide* at the architecture's grid bound (the
+whole-tile record's ``grid`` map: on ``sm_80`` a multi-wave, long-stream grid
+-- above one resident wave, ``DECODE_CTAS_PER_SM`` CTAs per SM times the SM
+count, with every CTA walking at least ``DECODE_LONG_STREAM_TILES`` tiles; on
+``sm_120a`` a long stream alone, at least ``DECODE_STREAM_TILES`` tiles per
+CTA whatever the grid), the CTA count ``walk`` of the *persistent walk* when
+the host serves the call with it (``0`` otherwise: a two-wave split-form grid
+on ``sm_103a`` whose longest walked CTA is shorter than the plain program's,
+the host's :func:`.cake_backend.select_walk`), the row count ``rows``, the KV
+head count ``kv_heads``, the query head count ``qo_heads`` and the split count
+``splits`` (the walk's partial slots per (row, KV head), :func:`walk_splits`,
+where the walk serves the call).  Only the records delivered for ``arch``
 (``record["arches"]``) are candidates: each decode program has a ``form``
 record per form.  A selection rule of kind ``form`` admits its form on every
 architecture its record ships for; one of kind ``form_grid`` admits its form
-on one architecture at one grid class, and wins over a ``form`` rule when both
-admit (the whole-tile decode: the split form on ``sm_80`` on a wide grid; the
+on the architectures its ``grid`` map names, each at the grid bound the map
+gives it, and wins over a ``form`` rule when both admit (the whole-tile
+decode: the split form on ``sm_80`` / ``sm_120a`` on a wide call; the
 persistent walk: the split form on ``sm_103a`` on a walked grid).  No rule
-reads a tensor.  Which form a call takes, its split count, whether its grid
+reads a tensor.  Which form a call takes, its split count, whether the call
 is wide and whether the walk serves it are the host's decisions
 (:mod:`.cake_backend`), not rules.
 
@@ -111,13 +114,16 @@ STAGES = ("decode", "merge")
 FORMS = ("split", "fused")
 # The selection rule kinds, least specific first: ``form`` admits its ``value``
 # form on every architecture its record ships for; ``form_grid`` admits its
-# ``value`` form on its ``arch`` alone and only at the grid class its ``grid`` names
-# (``GRID_BOUNDS``: ``"multi_wave_long"`` is a decode grid above one resident
-# wave whose CTAs each walk at least ``DECODE_LONG_STREAM_TILES`` tiles, the
-# host's ``wide``; ``"two_wave_walk"`` is a split-form grid the persistent walk
-# serves, the host's ``walk > 0``).  When both admit, the more specific wins.
+# ``value`` form on the architectures its ``grid`` map names alone, each only at
+# the grid bound the map gives it (``GRID_BOUNDS``: ``"multi_wave_long"`` is a
+# decode grid above one resident wave whose CTAs each walk at least
+# ``DECODE_LONG_STREAM_TILES`` tiles, the host's ``wide``; ``"long_stream"`` is
+# CTAs each walking at least ``DECODE_STREAM_TILES`` tiles whatever the grid,
+# the host's ``wide`` too; ``"two_wave_walk"`` is a split-form grid the
+# persistent walk serves, the host's ``walk > 0``).  When both admit, the more
+# specific wins.
 SELECT_RULES = ("form", "form_grid")
-GRID_BOUNDS = ("multi_wave_long", "two_wave_walk")
+GRID_BOUNDS = ("multi_wave_long", "long_stream", "two_wave_walk")
 # The merge's split bound: a (row, head) has at most this many partials (one
 # per lane of the merge's four warps).  The host's split rule never exceeds it.
 MAX_SPLITS = 128
@@ -134,10 +140,12 @@ TILE_TOKENS = 64
 # the SM) and the fused form's capacity per SM, the co-resident build's
 # launch bound: the form rule takes the fused form only below
 # ``DECODE_FUSED_CTAS_PER_SM[arch]`` x the SM count CTAs (``sm_80`` is absent:
-# its calls take the split form alone).  Within the capacity sm_90a and
-# sm_120a always take the fused form; sm_100a / sm_103a take it under the
-# host's eager rule, sm_107a never (the split form on every host)
-# (``cake_backend.select_form``: an aarch64 host, rows <= 4, no capture).  The
+# its calls take the split form alone).  Within the capacity sm_90a always
+# takes the fused form and sm_120a does except on a wide call (the whole-tile
+# program's long-stream window, which ships in the split form alone); sm_100a /
+# sm_103a take it under the host's eager rule, sm_107a never (the split form on
+# every host) (``cake_backend.select_form``: an aarch64 host, rows <= 4, no
+# capture).  The
 # exporter holds the launch-bound tables to the kernel files and the fused
 # table to its host policy.
 DECODE_THREADS = {
@@ -169,6 +177,13 @@ DECODE_FUSED_CTAS_PER_SM = {
 # tokens (the 128-row shapes at 17 tiles per CTA favoured it, the 64-row shapes
 # at 9 did not).
 DECODE_LONG_STREAM_TILES = 16
+# The stream bound of the ``long_stream`` grid class (``sm_120a``): the per-CTA
+# tile stream from which the whole-tile program with the L2 evict-first policy
+# measured faster than the K-first one whatever the grid (an RTX PRO 6000 holds
+# every owner grid within one wave of its 376 resident CTAs); 11 tiles = 704
+# selected tokens (rows 32 / 64 / 128 at 11 / 17 / 33 tiles per CTA favoured it
+# under both L2 flushes, rows 16 at 7 tiles did not).
+DECODE_STREAM_TILES = 11
 # The persistent walk's wave bound (the ``sm_103a`` kernel file's ``WALK_MAX_WAVES``,
 # held by the exporter): a split-form call whose plain decode grid runs more
 # than one resident wave and at most this many, and whose longest walked CTA is
@@ -406,7 +421,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "workspace_rule": {"kind": "split_partials"},
     },
     "decode_whole_tile": {
-        "arches": ["sm_80"],
+        "arches": ["sm_80", "sm_120a"],
         "arg_plan": [
             ["buffer", "q"],
             ["buffer", "k_data"],
@@ -500,8 +515,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "v_sf": "v_sf",
         },
         "select_rule": {
-            "arch": "sm_80",
-            "grid": "multi_wave_long",
+            "grid": {"sm_80": "multi_wave_long", "sm_120a": "long_stream"},
             "kind": "form_grid",
             "value": "split",
         },
@@ -852,7 +866,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "walk_ctas"},
-        "kernel_symbol": "kernel_cake_qsa_nvfp4_097d6404dd678ef3f3e5",
+        "kernel_symbol": "kernel_cake_qsa_nvfp4_dfd8600d03040c9f808d",
         "launch": {
             "block": (512, 1, 1),
             "cluster": (1, 1, 1),
@@ -860,7 +874,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 192896,
             "use_pdl": False,
         },
-        "library": "cake_qsa_nvfp4_097d6404dd678ef3f3e5",
+        "library": "cake_qsa_nvfp4_dfd8600d03040c9f808d",
         "logical": {
             "block_table": "block_table",
             "data_stride_block": "data_stride_block",
@@ -901,8 +915,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "v_sf": "v_sf",
         },
         "select_rule": {
-            "arch": "sm_103a",
-            "grid": "two_wave_walk",
+            "grid": {"sm_103a": "two_wave_walk"},
             "kind": "form_grid",
             "value": "split",
         },
@@ -966,21 +979,27 @@ def _admits(
 ) -> bool:
     """Whether a record's selection rule admits the call; the caller has
     already kept the records delivered for ``arch`` alone.  A ``form_grid``
-    rule reads the grid class its ``grid`` names: ``multi_wave_long`` is the
-    host's ``wide``, ``two_wave_walk`` the host's ``walk > 0``."""
+    rule reads the grid bound its ``grid`` map gives ``arch`` (none: the rule
+    does not admit): ``multi_wave_long`` and ``long_stream`` are the host's
+    ``wide``, ``two_wave_walk`` the host's ``walk > 0``."""
     kind = rule["kind"]
     if kind == "form":
         return rule["value"] == form
     if kind == "form_grid":
-        if rule["value"] != form or rule["arch"] != arch:
+        # ``grid`` maps each architecture the rule refines to its grid bound: the
+        # host's ``wide`` is the verdict of ``multi_wave_long`` / ``long_stream``
+        # for the device's architecture, ``walk > 0`` that of ``two_wave_walk``.
+        if rule["value"] != form:
             return False
-        grid = rule["grid"]
-        if grid == "multi_wave_long":
+        bound = rule["grid"].get(arch)
+        if bound is None:
+            return False
+        if bound in ("multi_wave_long", "long_stream"):
             return bool(wide)
-        if grid == "two_wave_walk":
+        if bound == "two_wave_walk":
             return int(walk) > 0
         raise ValueError(
-            f"unknown Cake QSA NVFP4 decode grid class {grid!r}; the classes are {GRID_BOUNDS}"
+            f"unknown Cake QSA NVFP4 decode grid class {bound!r}; the classes are {GRID_BOUNDS}"
         )
     raise ValueError(f"unknown Cake QSA NVFP4 decode selection rule: {kind!r}")
 
@@ -993,20 +1012,21 @@ def select_record(
     ``form`` is ``"split"`` (the plain decode and, above one split, the merge)
     or ``"fused"`` (the cooperative decode, which merges its splits itself);
     ``arch`` is the device's exported architecture, ``wide`` whether the
-    decode grid is wide -- above one resident wave with at least
-    ``DECODE_LONG_STREAM_TILES`` tiles per CTA -- and ``walk`` the CTA count
-    of the persistent walk when the host serves the call with it, ``0``
-    otherwise (all three the host's: :mod:`.cake_backend`).
+    call is wide at the architecture's grid bound -- on ``sm_80`` above one
+    resident wave with at least ``DECODE_LONG_STREAM_TILES`` tiles per CTA, on
+    ``sm_120a`` at least ``DECODE_STREAM_TILES`` tiles per CTA -- and ``walk``
+    the CTA count of the persistent walk when the host serves the call with
+    it, ``0`` otherwise (all three the host's: :mod:`.cake_backend`).
     Only the records delivered for ``arch`` are candidates (the ``mma.sync``
-    decode's on ``sm_80`` / ``sm_90a``, the tcgen05 decode's on ``sm_100a`` /
-    ``sm_103a`` / ``sm_107a``); of those whose rule admits the call, the most specific rule
-    kind (``SELECT_RULES`` order) wins: on ``sm_80`` a wide split-form call
-    selects the whole-tile decode over the K-first one, on ``sm_103a`` a
-    walked split-form call the persistent walk over the plain tcgen05 decode.
-    A grid class no record of the architecture reads falls through to its
-    ``form`` record (``wide`` on ``sm_90a``, ``walk`` on ``sm_100a``;
-    :func:`resolved_launches` refuses a walk the selected decode cannot
-    launch).  The ``merge`` stage has no
+    decode's on ``sm_80`` / ``sm_90a`` / ``sm_120a``, the tcgen05 decode's on
+    ``sm_100a`` / ``sm_103a`` / ``sm_107a``); of those whose rule admits the call, the most specific rule
+    kind (``SELECT_RULES`` order) wins: on ``sm_80`` and ``sm_120a`` a wide
+    split-form call selects the whole-tile decode over the K-first one, on
+    ``sm_103a`` a walked split-form call the persistent walk over the plain
+    tcgen05 decode.  A grid class no record of the architecture reads falls
+    through to its ``form`` record (``wide`` on ``sm_90a``, ``walk`` on
+    ``sm_100a``; :func:`resolved_launches` refuses a walk the selected decode
+    cannot launch).  The ``merge`` stage has no
     record in the fused form (:func:`select_records` leaves it out); asking for
     one is an error.  Exactly one record remains, or the registry is
     inconsistent.
@@ -1409,6 +1429,7 @@ __all__ = [
     "DECODE_FUSED_CTAS_PER_SM",
     "DECODE_LONG_STREAM_TILES",
     "DECODE_PARAMETERS",
+    "DECODE_STREAM_TILES",
     "DECODE_THREADS",
     "FORMS",
     "GRID_BOUNDS",
