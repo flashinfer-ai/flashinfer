@@ -2446,15 +2446,18 @@ class FlashKDABlackwellBF16FusedLaunch:
             and (state_indices is not None)
             and (max_seq_len <= H12_DIRECT_N32_MAX_SEQ_LEN)
         )
-        # Work bins where a bin runs tasks back to back.
+        # Work bins where a bin runs tasks back to back (the direct N32 and N16
+        # bodies, in chunks of their own size).
         route_work_bins = (
-            route == BF16_ROUTE_DIRECT_M128
+            route in {BF16_ROUTE_DIRECT_M128, BF16_ROUTE_DIRECT_M128_N16}
             and (not use_tf32_direct_m128)
             and _use_direct_work_bins(
                 tuple(offsets[index + 1] - offsets[index] for index in range(num_seqs)),
                 num_heads=num_heads,
                 sm_count=sm_count,
-                chunk_tokens=BF16_M128_CHUNK,
+                chunk_tokens=(
+                    BF16_N16_M128_CHUNK if use_direct_m128_n16 else BF16_M128_CHUNK
+                ),
             )
         )
         # The bounded N32 body without the early state pack is faster on the
@@ -3040,15 +3043,17 @@ class FlashKDABlackwellBF16FusedLaunch:
         if getattr(self.module, "work_bins", False):
             # A body built with work bins reads its bin table through seq_order
             # and runs one CTA per bin.
-            if route != BF16_ROUTE_DIRECT_M128:
+            if route not in {BF16_ROUTE_DIRECT_M128, BF16_ROUTE_DIRECT_M128_N16}:
                 raise NotImplementedError(
-                    "work bins are built for the direct M128 N32 body only"
+                    "work bins are built for the direct M128 N32 and N16 bodies only"
                 )
             work_bin_table, num_work_bins = _make_direct_work_bins(
                 tuple(offsets[index + 1] - offsets[index] for index in range(num_seqs)),
                 num_heads=num_heads,
                 worker_count=sm_count,
-                chunk_tokens=BF16_M128_CHUNK,
+                chunk_tokens=(
+                    BF16_N16_M128_CHUNK if use_direct_m128_n16 else BF16_M128_CHUNK
+                ),
             )
             work_bin_upload = _upload_int32_batch(
                 q.device, {"seq_order": list(work_bin_table)}

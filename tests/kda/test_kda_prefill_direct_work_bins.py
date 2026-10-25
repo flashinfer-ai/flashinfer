@@ -117,6 +117,19 @@ def test_direct_work_bins_only_where_a_bin_chains_tasks(
     )
 
 
+def test_n16_work_bins_count_16_token_chunks():
+    # Three tasks on two SMs. In 32-token chunks the 40-token task (2) sets the
+    # makespan beside the bin of both 32-token tasks (1 + 1); in 16-token chunks
+    # that bin (2 + 2) exceeds it (3).
+    lengths = (40, 32, 32)
+    assert not runtime._use_direct_work_bins(
+        lengths, num_heads=1, sm_count=2, chunk_tokens=runtime.BF16_M128_CHUNK
+    )
+    assert runtime._use_direct_work_bins(
+        lengths, num_heads=1, sm_count=2, chunk_tokens=runtime.BF16_N16_M128_CHUNK
+    )
+
+
 def test_factory_takes_the_work_bin_program_only_when_asked(monkeypatch):
     arch = "sm_100a"
     monkeypatch.setattr(jit, "device_arch", lambda device=None: arch)
