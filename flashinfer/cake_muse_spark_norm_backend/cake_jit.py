@@ -6732,6 +6732,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_muse_spark_norm_21dccf5cd73a70753e08": {
         "arches": [
+            "sm_100a",
             "sm_103a",
         ],
         "arg_plan": [
@@ -6840,6 +6841,18 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "kind": "tokens_heads_between",
             "windows": {
+                "sm_100a": [
+                    [
+                        16,
+                        0,
+                        1,
+                    ],
+                    [
+                        16,
+                        8,
+                        256,
+                    ],
+                ],
                 "sm_103a": [
                     [
                         16,
@@ -7223,14 +7236,14 @@ MODULES: dict[str, dict[str, Any]] = {
                 "sm_100a": [
                     [
                         128,
-                        1,
+                        0,
                         8,
                     ],
                 ],
                 "sm_103a": [
                     [
                         128,
-                        1,
+                        0,
                         8,
                     ],
                 ],
@@ -7351,19 +7364,9 @@ MODULES: dict[str, dict[str, Any]] = {
             "windows": {
                 "sm_100a": [
                     [
-                        128,
-                        255,
-                        256,
-                    ],
-                    [
                         32,
+                        0,
                         1,
-                        64,
-                    ],
-                    [
-                        32,
-                        1023,
-                        1024,
                     ],
                 ],
                 "sm_103a": [
@@ -7374,7 +7377,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     ],
                     [
                         32,
-                        1,
+                        0,
                         8,
                     ],
                 ],
@@ -8559,7 +8562,12 @@ MODULES: dict[str, dict[str, Any]] = {
                 "sm_100a": [
                     [
                         16,
-                        7,
+                        1,
+                        8,
+                    ],
+                    [
+                        16,
+                        256,
                         1024,
                     ],
                 ],
@@ -8581,6 +8589,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_muse_spark_norm_feff5e270b2146886c6c": {
         "arches": [
+            "sm_100a",
             "sm_103a",
         ],
         "arg_plan": [
@@ -8689,6 +8698,18 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "kind": "tokens_heads_between",
             "windows": {
+                "sm_100a": [
+                    [
+                        128,
+                        8,
+                        256,
+                    ],
+                    [
+                        32,
+                        1,
+                        1024,
+                    ],
+                ],
                 "sm_103a": [
                     [
                         128,
@@ -8767,9 +8788,11 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         ],
         "rmsnorm_sigmoid_gate_bf16_pdl": [
             "cake_muse_spark_norm_49015ea91c011bd1740a",
-            "cake_muse_spark_norm_4c2847f766bb9a2330d6",
+            "cake_muse_spark_norm_feff5e270b2146886c6c",
             "cake_muse_spark_norm_c7c7921f8495c0384ee7",
+            "cake_muse_spark_norm_4c2847f766bb9a2330d6",
             "cake_muse_spark_norm_fb5857b9f0bbd10ec74b",
+            "cake_muse_spark_norm_21dccf5cd73a70753e08",
             "cake_muse_spark_norm_fba020bb2e3b8aaf63f0",
             "cake_muse_spark_norm_20b424e339bbe5210ad5",
         ],
