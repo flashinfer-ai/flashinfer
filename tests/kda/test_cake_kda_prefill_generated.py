@@ -354,10 +354,14 @@ def test_map_first_programs_wait_before_touching_memory():
     )
     assert set(shipped) <= _MAP_FIRST_MODULES
     rendered = _MAP_FIRST_MODULES - set(shipped)
-    for arch, routes in registry._RENDERED_ROUTES.items():
-        for module in shipped:
-            if module in routes:
-                assert routes[module] in rendered, (arch, module, routes[module])
+    routed = {
+        routes[module]
+        for routes in registry._RENDERED_ROUTES.values()
+        for module in shipped
+        if module in routes
+    }
+    # Every generated program a map module routes to, and nothing else.
+    assert rendered == routed and rendered, (sorted(rendered), sorted(routed))
     assert rendered <= set(GENERATED)
     for name in sorted(rendered):
         record = registry._RENDERED_MODULES[name]

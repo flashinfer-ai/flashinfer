@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from functools import partial
 
-from flashinfer.jit.cake_kda_tf32 import _factory
+from flashinfer.jit.cake_kda_tf32 import _RENDERED_ROUTES, _factory
 from flashinfer.jit.cake_kda_tf32 import device_arch as detect_gpu_arch
 from flashinfer.kda_prefill import (
     _direct_m128_route,
@@ -851,14 +851,17 @@ def _invalidate_launch_records(impl) -> None:
 # already ordered.  The generated programs the loader routes those two shipped
 # modules to on sm_100a and sm_103a keep the same contract: their only work
 # before the grid-dependency wait, which every thread runs, is barrier
-# initialization and tensor-memory allocation.
-_MAP_FIRST_MODULES = frozenset(
-    (
-        "cake_kda_bf16_f74a288bb51b335a1ccf",
-        "cake_kda_bf16_5639519f5c942ed86e4f",
-        "cake_kda_prefill_d057d2f13a1cc539c368",
-        "cake_kda_prefill_75de35b15f3e0cf2f3f8",
-    )
+# initialization and tensor-memory allocation.  The generated names come from
+# the route table, so a new generated build of either module joins this set.
+_MAP_FIRST_SHIPPED = (
+    "cake_kda_bf16_f74a288bb51b335a1ccf",
+    "cake_kda_bf16_5639519f5c942ed86e4f",
+)
+_MAP_FIRST_MODULES = frozenset(_MAP_FIRST_SHIPPED) | frozenset(
+    routes[module]
+    for routes in _RENDERED_ROUTES.values()
+    for module in _MAP_FIRST_SHIPPED
+    if module in routes
 )
 
 
