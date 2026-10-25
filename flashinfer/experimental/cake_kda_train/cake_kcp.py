@@ -84,7 +84,10 @@ tape CTAs, which thrash when co-resident).  The test knob ``walk_form``
 (``"full"`` / ``"split"``) forces one form on every launch for the A/B record;
 the call's ``walk_form_log`` records ``(program, form, n_walk)`` per launch.
 The tape programs' rule is ``split`` (their full-width records are test-only,
-under ``walk_form="full"``).
+under ``walk_form="full"``).  The rule's inputs are static per ``(ctx, H)``, so
+the form of each ``(program, walk list)`` is decided once per table set
+(``_Tables.walk_form``) and looked up on every later launch: the eager call
+carries no per-launch list scheduling.
 
 The bracket is host-side runtime state, so it is never issued inside a CUDA
 stream capture (``cudaDeviceSetCacheConfig`` would invalidate the capture,
@@ -567,22 +570,20 @@ _PROGRAM_OF = {
 def _walk_form_of(call: Any, programs: Any, name: str, args: dict[str, Any]) -> str:
     """The record form of walk launch ``name`` (``"full"`` / ``"split"``): the registry's rule
     (``cake_kcp_jit.walk_form``) on the launch's chains (the chunk counts of its listed segments), the call's head
-    count and the device's SM count, under the call's ``walk_form`` knob; ``"full"`` with a registry that has no form
-    rule (one record per walk program)."""
+    count and the device's SM count, under the call's ``walk_form`` knob -- decided once per ``(program, walk list)``
+    of the call's table set and looked up on every later launch (:meth:`_Tables.walk_form`); ``"full"`` with a
+    registry that has no form rule (one record per walk program)."""
     jit = getattr(programs, "jit", None)
     rule = getattr(jit, "walk_form", None)
     if rule is None or name not in getattr(jit, "WALK_FORM_RULES", {}):
         return "full"
-    seg = call.tb.hp.seg_chunk_start
-    chains = [int(seg[s + 1]) - int(seg[s]) for s in args["walk"]]
-    return str(
-        rule(
-            name,
-            chains,
-            int(call.H),
-            int(jit.sm_count(call.device.index)),
-            knob=str(call.walk_form),
-        )
+    return call.tb.walk_form(
+        name,
+        args["walk"],
+        int(call.H),
+        int(jit.sm_count(call.device.index)),
+        str(call.walk_form),
+        rule,
     )
 
 
@@ -2918,6 +2919,40 @@ class _Tables:
         )
         cache[key] = (index, tiles, meta)
         return meta
+
+    def walk_form(
+        self,
+        name: str,
+        walk: Sequence[int],
+        H: int,
+        sm_count: int,
+        knob: str,
+        rule: Any,
+    ) -> str:
+        """The record form (``"full"`` / ``"split"``) of walk launch ``name`` over the segments ``walk``: the registry's
+        rule ``rule`` (``cake_kcp_jit.walk_form``) on the launch's chains (the chunk counts of its listed segments), the
+        head count ``H``, the device's SM count and the ``walk_form`` knob -- evaluated once per ``(name, walk list, H,
+        SM count, knob, rule)`` of this table set and looked up on every later launch.  The rule's inputs are static per
+        ``(ctx, H)`` (the walk lists and ``hp.seg_chunk_start`` are this set's, never mutated), so the lookup returns
+        what a per-launch evaluation would; the evaluation itself (the ``fit`` rule list-schedules the chains in
+        Python) leaves the launch path.  Keyed by value: a fresh equal list finds the same entry."""
+        key = (str(name), tuple(walk), int(H), int(sm_count), str(knob), rule)
+        cache = self.__dict__.setdefault("_walk_forms", {})
+        form = cache.get(key)
+        if form is None:
+            if len(cache) >= self.ID_CACHE_MAX:
+                cache.clear()
+            seg = self.hp.seg_chunk_start
+            form = cache[key] = str(
+                rule(
+                    name,
+                    [int(seg[s + 1]) - int(seg[s]) for s in walk],
+                    int(H),
+                    int(sm_count),
+                    knob=str(knob),
+                )
+            )
+        return form
 
     def pool_sizes(self, backward: bool) -> dict[str, int]:
         names = [

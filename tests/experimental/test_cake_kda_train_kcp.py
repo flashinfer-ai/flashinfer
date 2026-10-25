@@ -4100,6 +4100,82 @@ def test_host_trim_kernel_backend_run_skips_the_discarded_abi() -> None:
     assert calls == [("run_program", "kcp_fwdh_tape", None, None)]
 
 
+def test_walk_form_of_decides_once_per_table_set() -> None:
+    """``_walk_form_of`` (the record form of a K1 / K2 walk launch) evaluates the registry's rule once per
+    ``(program, walk list, H, SM count, knob)`` of the call's table set and looks the form up on every later launch:
+    the forms of a per-launch evaluation (the rule's inputs are static per ``(ctx, H)``), a fresh equal list finding
+    the same entry, the knob's forced forms passing through; a provider without a form rule gives ``"full"``."""
+    part = kp.kcp_partition((0, 64 * 200, 64 * 350), 4, layout="contiguous")
+    ctx = kp.build_kcp_context(part, None, 0, "cpu", 4, sm_count=148)
+    tb = cake_kcp._Tables(ctx, 64)
+    evaluated: list[tuple] = []
+
+    def rule(program, chains, num_heads, sm_count, *, knob="auto"):
+        evaluated.append((program, tuple(chains), num_heads, sm_count, knob))
+        return cake_kcp_jit.walk_form(program, chains, num_heads, sm_count, knob=knob)
+
+    programs = types.SimpleNamespace(
+        jit=types.SimpleNamespace(
+            walk_form=rule,
+            WALK_FORM_RULES=cake_kcp_jit.WALK_FORM_RULES,
+            sm_count=lambda index: 148,
+        )
+    )
+    seg = [int(x) for x in tb.hp.seg_chunk_start]
+    lists = {
+        "offset": tb.walk_offset,
+        "in": tb.walk_in,
+        "live": tb.walk_live,
+        "end": tb.walk_end,
+        "first": list(tb.walk_offset[:1]),  # a list unlike the others: its own entry
+    }
+
+    def call(knob: str):
+        return types.SimpleNamespace(
+            tb=tb, H=64, device=torch.device("cpu"), walk_form=knob
+        )
+
+    forms: dict[
+        tuple, str
+    ] = {}  # (knob, program, walk tuple) -> form: one rule evaluation each
+    for knob in ("auto", "full", "split"):
+        for name in cake_kcp_jit.WALK_FORM_RULES:
+            for tag, lst in lists.items():
+                if not lst:
+                    continue
+                want = cake_kcp_jit.walk_form(
+                    name, [seg[s + 1] - seg[s] for s in lst], 64, 148, knob=knob
+                )
+                forms[(knob, name, tuple(lst))] = want
+                for _ in range(3):  # the first launch evaluates, the others look up
+                    got = cake_kcp._walk_form_of(
+                        call(knob), programs, name, {"walk": lst}
+                    )
+                    assert got == want, (knob, name, tag, got, want)
+                fresh = {
+                    "walk": [int(s) for s in lst]
+                }  # a fresh equal list: the same entry
+                assert cake_kcp._walk_form_of(call(knob), programs, name, fresh) == want
+    # every distinct (knob, program, walk list) evaluated exactly once (equal lists share the entry)
+    assert len(forms) >= 3 * len(cake_kcp_jit.WALK_FORM_RULES) * 2, len(forms)
+    assert sorted(evaluated) == sorted(
+        (name, tuple(seg[s + 1] - seg[s] for s in walk), 64, 148, knob)
+        for (knob, name, walk) in forms
+    ), (len(evaluated), len(forms))
+    assert all(form == knob for (knob, _, _), form in forms.items() if knob != "auto")
+    assert {
+        forms[("auto", name, tuple(tb.walk_offset))]
+        for name in cake_kcp_jit.WALK_FORM_RULES
+    } >= {"split"}  # the tape programs' rule
+    bare = types.SimpleNamespace(jit=types.SimpleNamespace())
+    assert (
+        cake_kcp._walk_form_of(
+            types.SimpleNamespace(), bare, "kcp_fwdh_offset", {"walk": tb.walk_offset}
+        )
+        == "full"
+    )
+
+
 class _FakeGraphRt:
     """A CUDA-runtime double of the capture-graph entry points of the kernel-node cap forms: one
     active capture whose next operation depends on one kernel node; records every call."""
