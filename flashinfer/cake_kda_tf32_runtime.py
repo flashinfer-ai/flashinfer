@@ -1058,6 +1058,39 @@ def _should_use_small_bh_owner_helper(
 CHUNK = 32  # apply/pair-map kernel chunk (tokens)
 
 
+def _affine_apply_runs(
+    window_heads: int, sm_count: int, max_blocks: int, pairmap: bool
+) -> int:
+    """Block runs per window-head of the apply / pair-map grid.
+
+    Both kernels take the whole shared-memory carve-out (one CTA per SM), so a
+    grid of ``runs * window_heads`` items runs in ``ceil(items / sm_count)``
+    waves of at most ``ceil(max_blocks / runs)`` blocks each.  The base split,
+    ``ceil(sm_count / window_heads)`` runs, occupies every SM at least once.
+    One alternative replaces it only when its waves x blocks cost is strictly
+    lower: two runs when the window-heads exceed the SMs (the base single run
+    leaves a sub-wave tail), and for the pair map a single run instead of the
+    base two (one wave; an odd block count no longer rounds up per run).  The
+    apply keeps its base split below one wave: its runs also stream the
+    checkpoint rows, and fewer concurrent CTAs measured slower there.  Every
+    block's arithmetic is independent of the split.
+    """
+
+    base = max(1, -(-sm_count // window_heads))
+    if window_heads > sm_count:
+        alternative = 2
+    elif pairmap and base == 2:
+        alternative = 1
+    else:
+        return base
+
+    def cost(runs: int) -> int:
+        waves = -(-(runs * window_heads) // sm_count)
+        return waves * -(-max_blocks // min(runs, max_blocks))
+
+    return alternative if cost(alternative) < cost(base) else base
+
+
 def build_affine_apply_items(
     *,
     tail_lengths: list[int],
@@ -1076,13 +1109,20 @@ def build_affine_apply_items(
     ``w + 1``), ``cu_chunk_offsets`` the main pass's per-part chunk prefix,
     ``snap_starts[w]`` the first snapshot row of the window,
     ``tail_offsets[w]`` its first tail token.  Each window-head is cut into
-    enough equal block runs to occupy every SM at least once; the run owning
-    the window's last block also evaluates ``S_w^in · M_final``.
+    ``_affine_apply_runs`` equal block runs (at least enough to occupy every
+    SM once); the run owning the window's last block also evaluates
+    ``S_w^in · M_final``.
     """
 
     items: list[list[int]] = []
     window_heads = max(1, len(tail_lengths) * num_heads)
-    runs_per_window = max(1, -(-sm_count // window_heads))
+    max_blocks = max(
+        [((length + CHUNK - 1) // CHUNK + 1) // 2 for length in tail_lengths],
+        default=1,
+    )
+    runs_per_window = _affine_apply_runs(
+        window_heads, sm_count, max(1, max_blocks), pairmap
+    )
     for w, length in enumerate(tail_lengths):
         chunks = (length + CHUNK - 1) // CHUNK
         blocks = (chunks + 1) // 2
