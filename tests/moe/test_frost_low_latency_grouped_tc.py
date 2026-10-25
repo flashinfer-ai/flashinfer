@@ -17,6 +17,9 @@ from flashinfer.fused_moe import (
     ReLU2,
     GeGLU,
     GeGLUTanh,
+    SiTU,
+    SwiGLUStep,
+    GELU,
     SiLU,
 )
 from flashinfer.fused_moe.api import RoutingInputMode
@@ -323,6 +326,12 @@ def test_grouped_projection_independent_buffers_and_streams(
         (torch.float16, GeGLU()),
         (torch.bfloat16, SiLU()),
         (torch.float16, SiLU()),
+        (torch.bfloat16, GeGLUTanh()),
+        (torch.float16, GeGLUTanh()),
+        (torch.bfloat16, SiTU()),
+        (torch.float16, SiTU()),
+        (torch.bfloat16, SwiGLUStep()),
+        (torch.float16, SwiGLUStep()),
     ],
 )
 def test_bounded_tactics_share_original_weights(tokens, dtype, activation):
@@ -350,7 +359,9 @@ def test_bounded_tactics_share_original_weights(tokens, dtype, activation):
             else []
         )
     elif torch.cuda.get_device_capability() == (9, 0):
-        if activation == GeGLU():
+        if activation in (GeGLUTanh(), SiTU(), SwiGLUStep()):
+            expected_tactics = []
+        elif activation == GeGLU():
             expected_tactics = [("wgmma", 2, 4, 128 if tokens == 4 else 64)]
         elif dtype == torch.float16 or activation in (ReLU2(), SiLU()):
             if activation in (ReLU2(), SiLU()):
@@ -381,6 +392,8 @@ def test_bounded_tactics_share_original_weights(tokens, dtype, activation):
         x.neg_()
         ids.copy_(ids.roll(1, dims=1))
         scores.copy_(scores.flip(1))
+        for buf in inputs[5:8]:
+            buf.fill_(float("nan"))
         graph.replay()
         torch.cuda.synchronize()
         _, expected, _ = _reference(
@@ -388,6 +401,9 @@ def test_bounded_tactics_share_original_weights(tokens, dtype, activation):
         )
         error = (got.double() - expected.double()).norm() / expected.double().norm()
         assert torch.isfinite(got).all() and error < 0.01
+        assert (
+            got.double() - expected.double()
+        ).abs().max() / expected.double().abs().max() < 0.03
     # Untuned selection stays on FMA, even where TC choices are offered.
     from unittest.mock import patch
 
@@ -406,6 +422,8 @@ def test_bounded_tactics_share_original_weights(tokens, dtype, activation):
         "fp16_mixed_output",
         "fp16_custom_swiglu",
         "custom_swiglu",
+        "custom_swiglu_step",
+        "fp16_custom_swiglu_step",
         "mixed_output",
         "other_activation",
         "tokens2",
@@ -424,17 +442,21 @@ def test_unmeasured_workloads_keep_fma_choices(case):
         if case == "fp16_large":
             args.update(hidden=7168, intermediate=2048, topk=8)
         elif case == "fp16_other_activation":
-            activation = GeGLUTanh()
+            activation = GELU()
+        elif case == "fp16_custom_swiglu_step":
+            activation = SwiGLUStep(limit=3.0)
         elif case == "fp16_mixed_output":
             args["output_dtype"] = torch.bfloat16
         else:
             activation = SwiGLU(alpha=1.702)
+    elif case == "custom_swiglu_step":
+        activation = SwiGLUStep(limit=3.0)
     elif case == "custom_swiglu":
         activation = SwiGLU(alpha=1.702)
     elif case == "mixed_output":
         args["output_dtype"] = torch.float16
     elif case == "other_activation":
-        activation = GeGLUTanh()
+        activation = GELU()
     elif case == "tokens2":
         args["tokens"] = 2
     elif case == "large_i":
@@ -451,6 +473,13 @@ def test_unmeasured_workloads_keep_fma_choices(case):
     runner.build()
     inputs = runner.pack_inputs(MoEActivationPack(x, None, ids, scores), weights)
     assert all(v[0] == "ffma" for v in runner.get_valid_tactics(inputs, None))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_custom_situ_remains_unsupported(dtype):
+    _require_grouped_tc()
+    with pytest.raises(NotImplementedError, match="default parameters for SiTU"):
+        _inputs(SiTU(gate_scale=2.0), dtype=dtype, output_dtype=dtype)
 
 
 @pytest.mark.parametrize("tokens", [4, 8])

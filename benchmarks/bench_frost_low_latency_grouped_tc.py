@@ -39,6 +39,9 @@ from flashinfer.fused_moe import (
     SwiGLU,
     ReLU2,
     GeGLU,
+    GeGLUTanh,
+    SiTU,
+    SwiGLUStep,
     SiLU,
 )
 from flashinfer.fused_moe.backends.frost_low_latency.runner import FrostLowLatencyRunner
@@ -93,7 +96,17 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
     parser.add_argument(
-        "--activation", choices=("swiglu", "relu2", "geglu", "silu"), default="swiglu"
+        "--activation",
+        choices=(
+            "swiglu",
+            "relu2",
+            "geglu",
+            "silu",
+            "geglu_tanh",
+            "situ",
+            "swiglu_step",
+        ),
+        default="swiglu",
     )
     args = parser.parse_args()
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
@@ -103,6 +116,9 @@ def main():
         "relu2": ReLU2,
         "geglu": GeGLU,
         "silu": SiLU,
+        "geglu_tanh": GeGLUTanh,
+        "situ": SiTU,
+        "swiglu_step": SwiGLUStep,
     }[args.activation]()
     arch = torch.cuda.get_device_capability()
     if arch not in ((8, 0), (9, 0), (12, 0)):

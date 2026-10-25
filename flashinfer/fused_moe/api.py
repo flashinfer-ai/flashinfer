@@ -2971,7 +2971,8 @@ class FrostLowLatencyConfig:
     offer grouped BF16/FP16 Tensor Core candidates at H=2048/I=512/top-k=10,
     T=4 or 8, with finalized matching output dtype. SM80 admits default SwiGLU
     and ReLU2; SM90/SM120 add GeGLU, and ReLU2/SiLU use T8 on SM90 and T4/T8
-    on SM120. SM80 additionally admits BF16 default SwiGLU at
+    on SM120. SM120 also admits GeGLUTanh and default SiTU/SwiGLUStep
+    at T4/T8 with matching BF16/FP16 types. SM80 additionally admits BF16 default SwiGLU at
     H=7168/I=2048/top-k=8 and T=4 or 8. These projections share the typed
     intermediate and ordered combine contract;
     FMA remains the untuned default and a tuning candidate.

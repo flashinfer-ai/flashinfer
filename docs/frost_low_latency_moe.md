@@ -42,7 +42,10 @@ BF16 and FP16 ReLU2 are additionally offered at T8 on Hopper (group2/stages4/K12
 and T4/T8 on SM120 using the same bounded warp-MMA choices.
 BF16/FP16 GeGLU also uses T4/T8; Hopper uses group2/stages4 with K128 at T4
 and K64 at T8. SiLU follows the ReLU2 bounds: Hopper T8, SM120 T4/T8.
-Mixed output dtypes and other activations retain FMA-only candidates.
+SM120 additionally offers BF16/FP16 GeGLUTanh and default SiTU/SwiGLUStep
+at T4/T8 with the same bounded warp-MMA choices. Supported custom SwiGLU/
+SwiGLUStep parameters, mixed output dtypes and other activations retain FMA-only
+candidates. Custom SiTU parameters remain unsupported by both paths.
 The grouped implementation, typed epilogues and buffer ownership are shared;
 on SM90/SM120 this extension changes candidate admission, not the device pipeline.
 The original 16 FMA choices remain available and the untuned default remains FMA.

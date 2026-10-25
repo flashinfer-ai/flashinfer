@@ -11,6 +11,9 @@ from ....autotuner import TuningConfig
 from ...api import (
     FrostLowLatencyConfig,
     GeGLU,
+    GeGLUTanh,
+    SiTU,
+    SwiGLUStep,
     QuantFormat,
     ReLU2,
     RoutingInputMode,
@@ -238,10 +241,10 @@ class FrostLowLatencyRunner(MoERunner):
                     and self.config.quant.activation
                     in (QuantFormat.BF16, QuantFormat.FP16)
                     else (
-                        "bf16-grouped-tc-v5"
+                        "bf16-grouped-tc-v6"
                         if self.config.quant.weight is QuantFormat.BF16
                         else (
-                            "fp16-grouped-tc-v3"
+                            "fp16-grouped-tc-v4"
                             if self.config.quant.weight is QuantFormat.FP16
                             else "unified-fma-tc-standard-timing-v5"
                         )
@@ -375,6 +378,11 @@ class FrostLowLatencyRunner(MoERunner):
                         == (2048, 512, 10)
                         and (
                             self.config.activation in (SwiGLU(), GeGLU())
+                            or (
+                                capability == (12, 0)
+                                and self.config.activation
+                                in (GeGLUTanh(), SiTU(), SwiGLUStep())
+                            )
                             or (
                                 self.config.activation in (ReLU2(), SiLU())
                                 and (capability == (12, 0) or inputs[0].shape[0] == 8)
