@@ -212,11 +212,20 @@ def test_quant_plan_grid_and_keys():
     assert cb.quant_plan(33, 28672, True, False, "sm_100a", 148).cluster_split == 1
     assert cb.quant_plan(8, 28672, False, False, "sm_100a", 148).cluster_split == 1
     assert cb.quant_plan(8, 12288, True, False, "sm_100a", 148).cluster_split == 1
-    # sm_103a, K = 8192 with the out_scale folded: the split up to 17 tokens.
+    # K = 8192: one CTA per row for 2..32 tokens (sm_100a) and 2..16 tokens (sm_103a),
+    # with or without the folded out_scale.  One token keeps the four-CTA split, and so
+    # does sm_103a from 17 tokens up to its limits (17 with the out_scale folded).
+    for arch, sm_count, high in (("sm_100a", 148, 32), ("sm_103a", 152, 16)):
+        for fold in (False, True):
+            splits = [
+                cb.quant_plan(m, 8192, True, fold, arch, sm_count).cluster_split
+                for m in (1, 2, high)
+            ]
+            assert splits == [4, 1, 1], (arch, fold, splits)
     assert cb.quant_plan(17, 8192, True, True, "sm_103a", 152).cluster_split == 4
     assert cb.quant_plan(18, 8192, True, True, "sm_103a", 152).cluster_split == 1
     assert cb.quant_plan(32, 8192, True, False, "sm_103a", 152).cluster_split == 4
-    assert cb.quant_plan(32, 8192, True, True, "sm_100a", 148).cluster_split == 4
+    assert cb.quant_plan(32, 8192, True, True, "sm_100a", 148).cluster_split == 1
     # One program per CTA shape (threads, register blocks per thread, occupancy):
     # K = 2688 and 4096 resolve to one shape, 7168 and 8192 to another.  The widths of
     # the static tier share that shape's program and differ in K_STATIC; a width outside
