@@ -295,8 +295,7 @@ kernel_cake_kimi_k3_attn_res_7ce0328b5bfd961f919c(__nv_bfloat16* __restrict__ ou
                     : "memory");
             }
             unsigned int producer_stage = 0;
-            unsigned int producer_phase = 0;
-            unsigned int producer_phase_flipped = 1;
+            unsigned int _phase_consumed = 1;
             #pragma unroll 1
             for (int token = bid; token < M; token += num_bids) {
                 #pragma unroll
@@ -304,7 +303,7 @@ kernel_cake_kimi_k3_attn_res_7ce0328b5bfd961f919c(__nv_bfloat16* __restrict__ ou
                     const int source_base = chunk * 3;
                     const int remaining_sources = 6 - source_base;
                     const int active_rows = ((remaining_sources > 3) ? 3 : remaining_sources);
-                    mbarrier_wait(consumed_addr + (producer_stage) * 8, producer_phase_flipped);
+                    mbarrier_wait(consumed_addr + (producer_stage) * 8, _phase_consumed);
                     if (elect_sync()) {
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         const int extra_delta_row = ((chunk == 1) ? 1 : 0);
@@ -335,7 +334,7 @@ kernel_cake_kimi_k3_attn_res_7ce0328b5bfd961f919c(__nv_bfloat16* __restrict__ ou
                         }
                     }
                     producer_stage += 1;
-                    if (producer_stage == 3) { producer_stage = 0; producer_phase ^= 1; producer_phase_flipped ^= 1; }
+                    if (producer_stage == 3) { producer_stage = 0; _phase_consumed ^= 1; }
                 }
             }
             if (elect_sync()) {
@@ -346,7 +345,7 @@ kernel_cake_kimi_k3_attn_res_7ce0328b5bfd961f919c(__nv_bfloat16* __restrict__ ou
     // ---- Role: consumers ----
     } else if (warp >= 1 && warp <= 8) {
         { // consumers_main
-            int warp_id_in_role = (warp - 1);
+            int warp_id_in_role = warp - 1;
             int consumer_warp = warp_id_in_role;
             int consumer_thread = consumer_warp * 32 + lane;
             int group = consumer_warp / 4;
@@ -458,9 +457,9 @@ kernel_cake_kimi_k3_attn_res_7ce0328b5bfd961f919c(__nv_bfloat16* __restrict__ ou
             }
             float block_carry[28];
             unsigned int consumer_stage = 0;
-            unsigned int consumer_phase = 0;
             mbarrier_wait(output_norm_ready_addr, 0);
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            unsigned int _phase_ready = 0;
             #pragma unroll 1
             for (int token_1 = bid; token_1 < M; token_1 += num_bids) {
                 float acc32[28];
@@ -475,7 +474,7 @@ kernel_cake_kimi_k3_attn_res_7ce0328b5bfd961f919c(__nv_bfloat16* __restrict__ ou
                     const int source_base_1 = chunk_1 * 3;
                     const int remaining_sources_1 = 6 - source_base_1;
                     const int active_rows_1 = ((remaining_sources_1 > 3) ? 3 : remaining_sources_1);
-                    mbarrier_wait(ready_addr + (consumer_stage) * 8, consumer_phase);
+                    mbarrier_wait(ready_addr + (consumer_stage) * 8, _phase_ready);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     float2 local_sum_sq[3];
@@ -537,13 +536,18 @@ kernel_cake_kimi_k3_attn_res_7ce0328b5bfd961f919c(__nv_bfloat16* __restrict__ ou
                                             values[value_idx_4] = (float)(__nv_bfloat16)updated_pair.x;
                                             values[value_idx_4 + 1] = (float)(__nv_bfloat16)updated_pair.y;
                                         }
-                                        {
-                                            uint2 _pk2;
-                                            __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
-                                            _pk[0] = __floats2bfloat162_rn(values[0 + 0], values[0 + 1]);
-                                            _pk[1] = __floats2bfloat162_rn(values[0 + 2], values[0 + 3]);
-                                            *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(prefix))[token_1 * 7168 + hidden_base_2]) = _pk2;
+                                        unsigned int _packed_0[2];
+                                        #pragma unroll
+                                        for (int _lp = 0; _lp < 1; _lp++) {
+                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values[_lp*2 + 0], values[_lp*2+1 + 0]));
+                                            _packed_0[_lp] = *(uint32_t*)&_bf2;
                                         }
+                                        #pragma unroll
+                                        for (int _lp = 0; _lp < 1; _lp++) {
+                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values[_lp*2 + 2], values[_lp*2+1 + 2]));
+                                            _packed_0[_lp + 1] = *(uint32_t*)&_bf2;
+                                        }
+                                        reinterpret_cast<int2*>(prefix + (token_1 * 7168 + hidden_base_2))[0] = reinterpret_cast<int2*>(_packed_0)[0];
                                     }
                                     #pragma unroll
                                     for (int pair_idx_3 = 0; pair_idx_3 < 2; pair_idx_3++) {
@@ -607,14 +611,28 @@ kernel_cake_kimi_k3_attn_res_7ce0328b5bfd961f919c(__nv_bfloat16* __restrict__ ou
                                             values_1[value_idx_7] = (float)(__nv_bfloat16)updated_pair_1.x;
                                             values_1[value_idx_7 + 1] = (float)(__nv_bfloat16)updated_pair_1.y;
                                         }
-                                        {
-                                            __nv_bfloat162 _pk[4];
-                                            _pk[0] = __floats2bfloat162_rn(values_1[0 + 0], values_1[0 + 1]);
-                                            _pk[1] = __floats2bfloat162_rn(values_1[0 + 2], values_1[0 + 3]);
-                                            _pk[2] = __floats2bfloat162_rn(values_1[0 + 4], values_1[0 + 5]);
-                                            _pk[3] = __floats2bfloat162_rn(values_1[0 + 6], values_1[0 + 7]);
-                                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(prefix))[token_1 * 7168 + hidden_base_3 + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                                        unsigned int _packed_1[4];
+                                        #pragma unroll
+                                        for (int _lp = 0; _lp < 1; _lp++) {
+                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1[_lp*2 + 0], values_1[_lp*2+1 + 0]));
+                                            _packed_1[_lp] = *(uint32_t*)&_bf2;
                                         }
+                                        #pragma unroll
+                                        for (int _lp = 0; _lp < 1; _lp++) {
+                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1[_lp*2 + 2], values_1[_lp*2+1 + 2]));
+                                            _packed_1[_lp + 1] = *(uint32_t*)&_bf2;
+                                        }
+                                        #pragma unroll
+                                        for (int _lp = 0; _lp < 1; _lp++) {
+                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1[_lp*2 + 4], values_1[_lp*2+1 + 4]));
+                                            _packed_1[_lp + 2] = *(uint32_t*)&_bf2;
+                                        }
+                                        #pragma unroll
+                                        for (int _lp = 0; _lp < 1; _lp++) {
+                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1[_lp*2 + 6], values_1[_lp*2+1 + 6]));
+                                            _packed_1[_lp + 3] = *(uint32_t*)&_bf2;
+                                        }
+                                        reinterpret_cast<int4*>(prefix + (token_1 * 7168 + hidden_base_3))[0] = reinterpret_cast<int4*>(_packed_1)[0];
                                     }
                                     #pragma unroll
                                     for (int pair_idx_5 = 0; pair_idx_5 < 4; pair_idx_5++) {
@@ -800,7 +818,7 @@ kernel_cake_kimi_k3_attn_res_7ce0328b5bfd961f919c(__nv_bfloat16* __restrict__ ou
                     m_running = new_max;
                     if (chunk_1 != 1) {
                         consumer_stage += 1;
-                        if (consumer_stage == 3) { consumer_stage = 0; consumer_phase ^= 1; }
+                        if (consumer_stage == 3) { consumer_stage = 0; _phase_ready ^= 1; }
                     }
                 }
                 float output_norm_first_values[8];
@@ -826,7 +844,7 @@ kernel_cake_kimi_k3_attn_res_7ce0328b5bfd961f919c(__nv_bfloat16* __restrict__ ou
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 mbarrier_arrive(consumed_addr + (consumer_stage) * 8);
                 consumer_stage += 1;
-                if (consumer_stage == 3) { consumer_stage = 0; consumer_phase ^= 1; }
+                if (consumer_stage == 3) { consumer_stage = 0; _phase_ready ^= 1; }
                 float _shfl_down_sync_24 = __shfl_down_sync(0xFFFFFFFF, total_output_sum_sq, 4, 8);
                 total_output_sum_sq += _shfl_down_sync_24;
                 float _shfl_down_sync_25 = __shfl_down_sync(0xFFFFFFFF, total_output_sum_sq, 2, 8);
@@ -873,13 +891,18 @@ kernel_cake_kimi_k3_attn_res_7ce0328b5bfd961f919c(__nv_bfloat16* __restrict__ ou
                             acc32[acc_idx_4] = normalized_pair.x;
                             acc32[acc_idx_4 + 1] = normalized_pair.y;
                         }
-                        {
-                            uint2 _pk2;
-                            __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
-                            _pk[0] = __floats2bfloat162_rn(acc32[slice_idx_3 * 8 + 0], acc32[slice_idx_3 * 8 + 1]);
-                            _pk[1] = __floats2bfloat162_rn(acc32[slice_idx_3 * 8 + 2], acc32[slice_idx_3 * 8 + 3]);
-                            *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(out))[token_1 * 7168 + hidden_base_4]) = _pk2;
+                        unsigned int _packed_2[2];
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 1; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc32 + slice_idx_3 * 8)[_lp*2 + 0], (acc32 + slice_idx_3 * 8)[_lp*2+1 + 0]));
+                            _packed_2[_lp] = *(uint32_t*)&_bf2;
                         }
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 1; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc32 + slice_idx_3 * 8)[_lp*2 + 2], (acc32 + slice_idx_3 * 8)[_lp*2+1 + 2]));
+                            _packed_2[_lp + 1] = *(uint32_t*)&_bf2;
+                        }
+                        reinterpret_cast<int2*>(out + (token_1 * 7168 + hidden_base_4))[0] = reinterpret_cast<int2*>(_packed_2)[0];
                     } else {
                         int hidden_tile_2 = slice_idx_3 * 2 + group;
                         int hidden_base_5 = hidden_tile_2 * 1024 + thread_in_group * 8;
@@ -912,14 +935,28 @@ kernel_cake_kimi_k3_attn_res_7ce0328b5bfd961f919c(__nv_bfloat16* __restrict__ ou
                             acc32[acc_idx_5] = normalized_pair_1.x;
                             acc32[acc_idx_5 + 1] = normalized_pair_1.y;
                         }
-                        {
-                            __nv_bfloat162 _pk[4];
-                            _pk[0] = __floats2bfloat162_rn(acc32[slice_idx_3 * 8 + 0], acc32[slice_idx_3 * 8 + 1]);
-                            _pk[1] = __floats2bfloat162_rn(acc32[slice_idx_3 * 8 + 2], acc32[slice_idx_3 * 8 + 3]);
-                            _pk[2] = __floats2bfloat162_rn(acc32[slice_idx_3 * 8 + 4], acc32[slice_idx_3 * 8 + 5]);
-                            _pk[3] = __floats2bfloat162_rn(acc32[slice_idx_3 * 8 + 6], acc32[slice_idx_3 * 8 + 7]);
-                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(out))[token_1 * 7168 + hidden_base_5 + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                        unsigned int _packed_3[4];
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 1; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc32 + slice_idx_3 * 8)[_lp*2 + 0], (acc32 + slice_idx_3 * 8)[_lp*2+1 + 0]));
+                            _packed_3[_lp] = *(uint32_t*)&_bf2;
                         }
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 1; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc32 + slice_idx_3 * 8)[_lp*2 + 2], (acc32 + slice_idx_3 * 8)[_lp*2+1 + 2]));
+                            _packed_3[_lp + 1] = *(uint32_t*)&_bf2;
+                        }
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 1; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc32 + slice_idx_3 * 8)[_lp*2 + 4], (acc32 + slice_idx_3 * 8)[_lp*2+1 + 4]));
+                            _packed_3[_lp + 2] = *(uint32_t*)&_bf2;
+                        }
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 1; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc32 + slice_idx_3 * 8)[_lp*2 + 6], (acc32 + slice_idx_3 * 8)[_lp*2+1 + 6]));
+                            _packed_3[_lp + 3] = *(uint32_t*)&_bf2;
+                        }
+                        reinterpret_cast<int4*>(out + (token_1 * 7168 + hidden_base_5))[0] = reinterpret_cast<int4*>(_packed_3)[0];
                     }
                 }
             }
