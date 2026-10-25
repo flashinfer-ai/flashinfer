@@ -61,6 +61,9 @@ SHIPPED_SINKHORN_ITERS: tuple[int, ...] = (SINKHORN_ITERS,)
 # tensor memory accelerator: contiguous storage, 32-byte aligned base.
 TENSOR_ALIGNMENT_BYTES = 32
 WORKSPACE_ALIGNMENT_BYTES = 256
+# Bound of the per-token-count caches below (layouts, default-workspace views,
+# launch plans); ``cake_jit.host_plan`` keeps the same bound.
+_CACHE_ENTRIES = 4096
 _BF16 = torch.bfloat16
 _F32 = torch.float32
 _TORCH_DTYPES = {
@@ -74,15 +77,24 @@ def _device_index(device: torch.device) -> int:
     return device.index if device.index is not None else torch.cuda.current_device()
 
 
+# The exported architecture of each CUDA device, resolved once per device
+# index (the capability of a device never changes within a process).
+_DEVICE_ARCH: dict[int, str] = {}
+
+
 def _device_arch(device: torch.device) -> str:
     if device.type != "cuda":
         raise ValueError(f"Cake mHC training requires CUDA tensors, got {device}")
-    capability = tuple(torch.cuda.get_device_capability(device))
-    arch = arch_for_capability(capability)
+    index = _device_index(device)
+    arch = _DEVICE_ARCH.get(index)
     if arch is None:
-        raise ValueError(
-            f"Cake mHC training supports compute capability {sorted(ARCH_BY_CAPABILITY)} only, got {capability}"
-        )
+        capability = tuple(torch.cuda.get_device_capability(index))
+        arch = arch_for_capability(capability)
+        if arch is None:
+            raise ValueError(
+                f"Cake mHC training supports compute capability {sorted(ARCH_BY_CAPABILITY)} only, got {capability}"
+            )
+        _DEVICE_ARCH[index] = arch
     return arch
 
 
@@ -126,7 +138,7 @@ def _validate_tensor(
         raise ValueError(f"{name} must live on {device}, got {tensor.device}")
     if tensor.dtype != dtype:
         raise ValueError(f"{name} must be {dtype}, got {tensor.dtype}")
-    if tuple(tensor.shape) != shape:
+    if tensor.shape != shape:
         raise ValueError(f"{name} must have shape {shape}, got {tuple(tensor.shape)}")
     if tensor.numel() == 0:
         return tensor
@@ -193,7 +205,14 @@ def _output(
     return _validate_tensor(tensor, name, shape=shape, device=device, dtype=dtype)
 
 
+# The (architecture, route kind) pairs the registry has already been checked
+# for; the check itself is a pure function of the registry.
+_ROUTES_CHECKED: set[tuple[str, str]] = set()
+
+
 def _check_route(device: torch.device, arch: str, kind: str) -> None:
+    if (arch, kind) in _ROUTES_CHECKED:
+        return
     if not route_applies(
         device_capability=tuple(torch.cuda.get_device_capability(device)),
         hidden=HIDDEN,
@@ -203,6 +222,7 @@ def _check_route(device: torch.device, arch: str, kind: str) -> None:
             f"no exported Cake mHC training route {route_key(HIDDEN, kind)!r} on {arch}; "
             f"supported hidden sizes: {supported_hidden_sizes(arch)}"
         )
+    _ROUTES_CHECKED.add((arch, kind))
 
 
 def _parameters(
@@ -297,12 +317,45 @@ def cake_mhc_train_reset_workspace(workspace: torch.Tensor) -> None:
     workspace.zero_()
 
 
+# The byte layout of one (workspace kind, token count, SM count, architecture)
+# -- region dtypes, shapes, contiguous strides and element offsets -- is
+# computed once;
+# the region views of a caller workspace are then one ``as_strided`` per
+# region on a typed view of the buffer.
+_LAYOUTS: dict[tuple[str, int, int, str], dict[str, Any]] = {}
+
+
+def _layout(kind: str, rows: int, sm_count: int, arch: str) -> dict[str, Any]:
+    key = (kind, rows, sm_count, arch)
+    found = _LAYOUTS.get(key)
+    if found is None:
+        regions = _loader.workspace_regions(kind, rows, sm_count, arch)
+        plan = []
+        for name, region in regions["regions"].items():
+            dtype = _TORCH_DTYPES[region["dtype"]]
+            shape = tuple(int(dim) for dim in region["shape"])
+            strides = []
+            step = 1
+            for dim in reversed(shape):
+                strides.append(step)
+                step *= dim
+            element_offset = region["offset"] // dtype.itemsize
+            plan.append((name, dtype, shape, tuple(reversed(strides)), element_offset))
+        found = {"total_bytes": int(regions["total_bytes"]), "plan": tuple(plan)}
+        if len(_LAYOUTS) >= _CACHE_ENTRIES:
+            _LAYOUTS.clear()
+        _LAYOUTS[key] = found
+    return found
+
+
 def _workspace_views(
     workspace: Any, kind: str, *, rows: int, device: torch.device
 ) -> dict[str, torch.Tensor]:
     """The region views of ``workspace`` for exactly ``rows`` tokens (validated against the layout)."""
 
-    layout = _loader.workspace_layout(kind, rows, device_index=_device_index(device))
+    layout = _layout(
+        kind, rows, _loader.sm_count(_device_index(device)), _device_arch(device)
+    )
     if not isinstance(workspace, torch.Tensor):
         raise TypeError("workspace must be a torch.Tensor")
     if (
@@ -321,23 +374,26 @@ def _workspace_views(
         raise ValueError(
             f"workspace must be contiguous and {WORKSPACE_ALIGNMENT_BYTES}-byte aligned"
         )
-    if workspace.numel() < layout["total_bytes"]:
+    total = layout["total_bytes"]
+    if workspace.numel() < total:
         helper = (
             "cake_mhc_train_forward_workspace_bytes"
             if kind == "fwd"
             else "cake_mhc_train_backward_workspace_bytes"
         )
         raise ValueError(
-            f"workspace holds {workspace.numel()} bytes; T={rows} needs {layout['total_bytes']} ({helper})"
+            f"workspace holds {workspace.numel()} bytes; T={rows} needs {total} ({helper})"
         )
+    base = workspace[:total]  # a multiple of 256 bytes: every typed view divides it
+    typed: dict[torch.dtype, torch.Tensor] = {}
     views: dict[str, torch.Tensor] = {}
-    for name, region in layout["regions"].items():
-        begin = region["offset"]
-        views[name] = (
-            workspace[begin : begin + region["bytes"]]
-            .view(_TORCH_DTYPES[region["dtype"]])
-            .view(*region["shape"])
-        )
+    for name, dtype, shape, strides, offset in layout["plan"]:
+        flat = typed.get(dtype)
+        if flat is None:
+            flat = typed[dtype] = base.view(dtype)
+        views[name] = flat.as_strided(shape, strides, flat.storage_offset() + offset)
+    if kind == "bwd":
+        views["dzp_rows"] = views["dzp"][:rows]
     return views
 
 
@@ -360,21 +416,131 @@ def _default_workspace(kind: str, rows: int, device: torch.device) -> torch.Tens
     return found
 
 
+# The region views of the default workspaces, per (device, kind, token
+# count): those buffers live for the whole process, so their views can too.
+_DEFAULT_VIEWS: dict[tuple[int, str, int], dict[str, torch.Tensor]] = {}
+
+
 def _workspace_for(
     workspace: Optional[torch.Tensor], kind: str, rows: int, device: torch.device
 ) -> dict[str, torch.Tensor]:
     if workspace is None:
-        workspace = _default_workspace(kind, rows, device)
+        key = (_device_index(device), kind, rows)
+        views = _DEFAULT_VIEWS.get(key)
+        if views is None:
+            views = _workspace_views(
+                _default_workspace(kind, rows, device), kind, rows=rows, device=device
+            )
+            if len(_DEFAULT_VIEWS) >= _CACHE_ENTRIES:
+                _DEFAULT_VIEWS.clear()
+            _DEFAULT_VIEWS[key] = views
+        return views
     return _workspace_views(workspace, kind, rows=rows, device=device)
+
+
+# ----------------------------------------------------------------------------
+# Launch plans
+#
+# The modules one public call launches, their grids and their argument order
+# are pure functions of (architecture, route, token count, device); the plan
+# below resolves them once per such key and keeps the bound FFI entry of every
+# module, so a call fills the tensor slots of each argument template and
+# launches.  The route runs on the current torch stream of the tensors'
+# device, set once for the whole route.
+
+_TVM_FFI: Any = None
+_TVM_DEVICES: dict[int, Any] = {}
+
+
+def _tvm_ffi() -> Any:
+    global _TVM_FFI
+    if _TVM_FFI is None:
+        import tvm_ffi
+
+        _TVM_FFI = tvm_ffi
+    return _TVM_FFI
+
+
+def _tvm_device(device_index: int) -> Any:
+    found = _TVM_DEVICES.get(device_index)
+    if found is None:
+        found = _TVM_DEVICES[device_index] = _tvm_ffi().device("cuda", device_index)
+    return found
+
+
+class _Launch:
+    """One module launch of a route plan: the bound FFI entry, the argument
+    template (grid and record-fixed scalars filled in) and the template
+    positions a call fills from its logical values."""
+
+    __slots__ = ("run", "template", "slots")
+
+    def __init__(
+        self, run: Any, template: list[Any], slots: tuple[tuple[int, str], ...]
+    ) -> None:
+        self.run, self.template, self.slots = run, template, slots
+
+
+_PLANS: dict[tuple[str, str, int, int], tuple[_Launch, ...]] = {}
+
+
+def _route_plan(
+    arch: str, kind: str, rows: int, device_index: int
+) -> tuple[_Launch, ...]:
+    """The launches of one route for ``rows`` tokens on ``device_index``."""
+
+    key = (arch, kind, rows, device_index)
+    plan = _PLANS.get(key)
+    if plan is None:
+        launches = []
+        sm_count = _loader.sm_count(device_index)
+        for name in selected_modules(arch, HIDDEN, kind, rows=rows, sm_count=sm_count):
+            record = _loader.MODULES[name]
+            logical = record["logical"]
+            fixed = _loader.RECORD_SCALARS.get(name, {})
+            grid_x, grid_y, grid_z = _loader.launch_grid(
+                record, rows, device_index=device_index
+            )
+            grid_values = {"grid_x": grid_x, "grid_y": grid_y, "grid_z": grid_z}
+            template: list[Any] = []
+            slots: list[tuple[int, str]] = []
+            for position, (arg_kind, arg_key) in enumerate(record["arg_plan"]):
+                if arg_kind == "grid":
+                    template.append(grid_values[arg_key])
+                    continue
+                logical_name = logical[arg_key]
+                if logical_name in fixed:
+                    template.append(fixed[logical_name])
+                    continue
+                template.append(None)
+                slots.append((position, logical_name))
+            module = _loader.load(name, arch)
+            launches.append(
+                _Launch(getattr(module, record["ffi_entry"]), template, tuple(slots))
+            )
+        if len(_PLANS) >= _CACHE_ENTRIES:
+            _PLANS.clear()
+        plan = _PLANS[key] = tuple(launches)
+    return plan
 
 
 def _run_route(
     arch: str, kind: str, values: dict[str, Any], *, rows: int, device: torch.device
 ) -> None:
     device_index = _device_index(device)
-    sm_count = _loader.sm_count(device_index)
-    for name in selected_modules(arch, HIDDEN, kind, rows=rows, sm_count=sm_count):
-        _loader.run_module(name, values, rows=rows, device_index=device_index)
+    plan = _route_plan(arch, kind, rows, device_index)
+    stream = torch.cuda.current_stream(device_index).cuda_stream
+    with _tvm_ffi().use_raw_stream(_tvm_device(device_index), stream):
+        for launch in plan:
+            args = launch.template.copy()
+            try:
+                for position, logical_name in launch.slots:
+                    args[position] = values[logical_name]
+            except KeyError as missing:
+                raise ValueError(
+                    f"the {route_key(HIDDEN, kind)!r} route needs the logical value {missing.args[0]!r}"
+                ) from None
+            launch.run(*args)
 
 
 # ----------------------------------------------------------------------------
@@ -472,6 +638,8 @@ def cake_mhc_train_forward_prepare(
     (256 bytes per token) that ``forward_finish``, ``backward_prepare`` and
     ``backward_finish`` consume.  No ``[T, 16384]`` or ``[T, 4, 4096]`` FP32
     temporary is produced.
+
+    The launches run on the current torch stream of the tensors' device.
     """
 
     _check_constants(rms_eps, hc_eps, sinkhorn_iters)
@@ -538,6 +706,8 @@ def cake_mhc_train_forward_stats(
     :func:`cake_mhc_train_forward_prepare` returns for the same inputs on the same
     device: the route is the strict prefix of the forward (fn split, mapping
     pass, coefficients) under the same work partition, without the ``U`` write.
+
+    The launches run on the current torch stream of the tensors' device.
     """
 
     _check_constants(rms_eps, hc_eps, sinkhorn_iters)
@@ -594,6 +764,8 @@ def cake_mhc_train_forward_finish(
     Returns
     -------
     BF16 ``Y`` of shape ``[T, 4, 4096]``; the FP32 sum is rounded once.
+
+    The launches run on the current torch stream of the tensors' device.
     """
 
     rows, device = _rows_of(X)
@@ -646,6 +818,8 @@ def cake_mhc_train_backward_prepare(
     rounding of the full FP32 sum) and the FP32 ``[T, 32]`` record
     ``dpost[4] | dC[16] | zeros[12]`` (``dpost[t, j] = sum_d dY B``,
     ``dC[t, i, j] = sum_d X[t, i, d] dY[t, j, d]``) that ``backward_finish`` consumes.
+
+    The launches run on the current torch stream of the tensors' device.
     """
 
     rows, device = _rows_of(X)
@@ -751,6 +925,8 @@ def cake_mhc_train_backward_finish(
     count on a given device.  With ``T == 0`` nothing is launched: ``dX`` is
     empty and the parameter gradients are zeroed (``accumulate=False``) or left
     untouched (``accumulate=True``).
+
+    The launches run on the current torch stream of the tensors' device.
     """
 
     _check_constants(rms_eps, hc_eps, sinkhorn_iters)
@@ -816,7 +992,7 @@ def cake_mhc_train_backward_finish(
         "hc_eps": float(hc_eps),
         "x_flat": X.view(rows, HIDDEN_TOTAL),
         "dy_flat": dY.view(rows, HIDDEN_TOTAL),
-        "dzp_rows": ws["dzp"][:rows],
+        "dzp_rows": ws["dzp_rows"],
         "dx_flat": dX.view(rows, HIDDEN_TOTAL),
         "dfn_part": ws["dfn_part"],
         "parts": plan["parts"],
@@ -898,9 +1074,11 @@ class _MHCTrainState:
         return self.stats
 
 
-def _as_bf16(grad: Optional[torch.Tensor], like: torch.Tensor) -> torch.Tensor:
+def _as_bf16(
+    grad: Optional[torch.Tensor], *, shape: tuple[int, ...], device: torch.device
+) -> torch.Tensor:
     if grad is None:
-        return torch.zeros_like(like, dtype=_BF16)
+        return torch.zeros(shape, dtype=_BF16, device=device)
     return grad.contiguous().to(_BF16)
 
 
@@ -951,7 +1129,7 @@ class CakeMHCTrainPrepareFunction(torch.autograd.Function):
         dX, dfn, dscale, dbase = cake_mhc_train_backward_finish(
             X,
             dY,
-            _as_bf16(dU, torch.empty((rows, HIDDEN), dtype=_BF16, device=X.device)),
+            _as_bf16(dU, shape=(rows, HIDDEN), device=X.device),
             None,  # ``B``: validated when given, not read
             state.fn,
             state.scale,
@@ -1002,7 +1180,7 @@ class CakeMHCTrainFinishFunction(torch.autograd.Function):
         X, B, *saved = ctx.saved_tensors
         state = ctx.state
         stats = saved[0] if saved else state.statistics(X)
-        dY = _as_bf16(dY, X)
+        dY = _as_bf16(dY, shape=(X.shape[0], STREAMS, HIDDEN), device=X.device)
         dB, grad_stats = cake_mhc_train_backward_prepare(dY, B, X, stats)
         state.dY, state.grad_stats = dY, grad_stats
         return None, dB, None
