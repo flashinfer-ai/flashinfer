@@ -330,7 +330,7 @@ void Run(TensorView a_Q, TensorView a_K, TensorView a_Vt, TensorView a_SFQ, Tens
   check_same_device(a_SFVtLo, a_Q, "SFVtLo", "Q");
   check_same_device(a_SFVtHi, a_Q, "SFVtHi", "Q");
   check_same_device(a_O, a_Q, "O", "Q");
-  TVM_FFI_CHECK((a_seqlen_kv >= 1), ValueError)
+  TVM_FFI_CHECK((a_seqlen_kv >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (seqlen_kv >= 1)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
