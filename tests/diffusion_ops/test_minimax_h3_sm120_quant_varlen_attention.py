@@ -290,3 +290,21 @@ def test_minimax_h3_sm120_varlen_plan_rejects_32_bit_offset_overflow() -> None:
     assert plan.padded_tokens * row <= (1 << 31) - 1
     with pytest.raises(ValueError, match="32-bit offsets"):
         MiniMaxH3VarlenPlan((0, fits + 1), heads, torch.device("cpu"), num_ctas=170)
+
+
+def test_minimax_h3_sm120_varlen_plan_rejects_32_bit_statistics_overflow() -> None:
+    heads = MINIMAX_H3_NUM_HEADS
+    limit = (1 << 31) - 1
+    # Empty segments: no tokens, one [heads, 128] row of K means and V scales each.
+    segments = limit // (heads * MINIMAX_H3_HEAD_DIM) + 1
+    with pytest.raises(ValueError, match="statistics kernels' 32-bit offsets"):
+        MiniMaxH3VarlenPlan(
+            (0,) * (segments + 1), heads, torch.device("cpu"), num_ctas=170
+        )
+    # One-token segments: the tokens fit, but each segment is a query tile with
+    # 2 * 128 partial floats per head.
+    tiles = limit // (heads * 2 * MINIMAX_H3_HEAD_DIM) + 1
+    with pytest.raises(ValueError, match="statistics kernels' 32-bit offsets"):
+        MiniMaxH3VarlenPlan(
+            tuple(range(tiles + 1)), heads, torch.device("cpu"), num_ctas=170
+        )

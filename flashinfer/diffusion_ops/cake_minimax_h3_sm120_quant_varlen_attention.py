@@ -37,7 +37,8 @@ _BLOCK_M = 128
 _BLOCK_N = 128
 _MAX_HEADS = 1 << 15
 _MAX_SEGMENT_TILES = 1 << 16
-# The kernels index the [tokens padded to _BLOCK_N, heads, 128] operands with 32-bit offsets.
+# The kernels index the [tokens padded to _BLOCK_N, heads, 128] operands, the [segments, heads, 128]
+# statistics and the [query tiles, heads, _PARTIAL_FLOATS] statistics partials with 32-bit offsets.
 _MAX_ELEMENTS = (1 << 31) - 1
 # Fixed per-unit overhead (Q TMA, pipeline fill, epilogue) in K/V-tile units for the LPT placement.
 _UNIT_OVERHEAD_TILES = 2
@@ -131,6 +132,17 @@ class MiniMaxH3VarlenPlan:
         self.num_segments = len(bounds) - 1
         begins = [bounds[s] for s in range(self.num_segments)]
         lens = [bounds[s + 1] - bounds[s] for s in range(self.num_segments)]
+        num_tiles = sum(_ceil_div(length, _BLOCK_M) for length in lens)
+        if (
+            max(self.num_segments * MINIMAX_H3_HEAD_DIM, num_tiles * _PARTIAL_FLOATS)
+            * num_heads
+            > _MAX_ELEMENTS
+        ):
+            raise ValueError(
+                f"segments * heads * {MINIMAX_H3_HEAD_DIM} and query tiles * heads * "
+                f"{_PARTIAL_FLOATS} must fit the statistics kernels' 32-bit offsets, got "
+                f"segments={self.num_segments}, tiles={num_tiles}, heads={num_heads}"
+            )
         tile_table: List[int] = []
         seg_tile_begin: List[int] = [0]
         units: List[Tuple[int, int, int]] = []
