@@ -41,9 +41,11 @@ forward path.
 
 - `cake_mxfp8_megamoe_ep16_fused_kernel.cu` with the fused kernel body in
   `cake_mxfp8_megamoe_ep16_fused_body.cuh`. The body is included once per
-  return protocol (`CAKE_MEGAMOE_RETURN_ALL_CTA` 0: CTA-0 coordinator for 16
-  and 64 tokens per rank; 1: all-CTA protocol for 32), so both kernel symbols
-  come from one text. The host binding selects the symbol by token count.
+  token specialization (`CAKE_MEGAMOE_RETURN_ALL_CTA` 0 for 16 and 64 tokens
+  per rank, 1 for 32), so both kernel symbols come from one text. Both return
+  the FC2 route terms with relaxed system-scope stores into the source rank's
+  route-term words, which the reducer waits on. The host binding selects the
+  symbol by token count.
 - the ordered route reducer and the tvm-ffi binding;
 - `cute/`: the CuTe-DSL fused kernel (`compile_program(return_all_cta, arch)`)
   and reducer (`compile_program(arch)`).
@@ -63,6 +65,10 @@ does not re-verify digests at import time.
 - immutable routing prepared with the session, with at most 64 routes assigned
   to any expert across all ranks
 - compute capability 10.0 or 10.3 and NVSHMEM symmetric memory
+
+The top-k reducer waits for every route term of the forward. Routing outside
+this contract (for example routing changed in place after the session is
+created) leaves route terms unwritten and hangs the forward on all ranks.
 
 End-to-end EP16 correctness and performance were measured on 16 GB300 GPUs
 (SM103). The SM100 target is admitted from the same source: the device text
