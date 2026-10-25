@@ -18,11 +18,27 @@ Cake fused residual-add + RMSNorm + eight-peer BF16 combine (SM100 / SM103).
 One launch per rank adds the residual to a two-track BF16 input, applies
 RMSNorm per track with per-track weights, averages the two normalized tracks
 into one BF16 contribution and reduces that contribution across eight peers in
-ascending rank order with BF16 rounding after every addition.  Below 256
-tokens the exchange is a one-shot Lamport publication (every peer polls all
-eight stripes); at and above it is a fence-free two-round owner reduce (token
-``t`` is owned by peer ``t % 8``).  Outputs are the normalized tracks, the
-propagated residual and the replicated collective result.
+ascending rank order with BF16 rounding after every addition.  Outputs are the
+normalized tracks, the propagated residual and the replicated collective
+result.
+
+Four generated programs (``flashinfer.jit.cake_fused_norm_combine``) share one
+peer-mapped workspace; :func:`select_variant` picks one per token count:
+
+* ``PARALLEL`` (below ``SPLIT_MIN_TOKENS``): a one-shot Lamport exchange
+  (every peer polls all eight stripes) with one CTA per token;
+* ``PARALLEL_SPLIT`` (below ``STREAM_MIN_TOKENS``): the same exchange over
+  eight CTAs per token, each owning one eighth of the hidden columns;
+* ``OWNER_STREAM`` (below ``PIPELINED_MIN_TOKENS``): a fence-free two-round
+  owner reduce (token ``t`` is owned by peer ``t % 8``) over a compact payload
+  as a persistent grid of one CTA per SM;
+* ``OWNER_PIPELINED``: the same owner reduce as a persistent
+  software-pipelined grid of at most ``CTAS_PER_SM["OWNER_PIPELINED"]`` CTAs
+  per SM.
+
+The two persistent programs launch cooperatively; their grid is every token
+when all fit the co-resident capacity their launch bounds guarantee, else the
+largest odd CTA count within it.
 
 Usage protocol::
 
@@ -42,9 +58,7 @@ Usage protocol::
     cake_fused_norm_combine_destroy_workspace(workspace)
 
 Requirements: eight ranks on one node with CUDA IPC peer access, SM100 (B200)
-or SM103 (B300) devices that are build targets of this process
-(``FLASHINFER_CUDA_ARCH_LIST`` when set, else the visible devices), hidden
-size 2560, two tracks, contiguous BF16 tensors
+or SM103 (B300) devices, hidden size 2560, two tracks, contiguous BF16 tensors
 (``x``/``residual``/``norm_out``/``residual_out`` are ``[T, 2, 2560]``,
 ``weight`` is ``[2, 2560]``, ``collective_out`` is ``[T, 2560]``) and
 ``T <= max_tokens``.  A workspace carries one ordered launch sequence; every
@@ -54,32 +68,121 @@ rank must launch before any rank waits for the result.
 from __future__ import annotations
 
 import ctypes
+import functools
 from typing import List, Literal, Optional
 
 import torch
 import torch.distributed as dist
+import tvm_ffi
 
-from ..jit.cake_fused_norm_combine import (
-    HIDDEN_DIM,
-    LARGE_MIN_TOKENS,
-    SUPPORTED_CAPABILITIES,
-    TRACKS,
-    WIDE_MIN_TOKENS,
-    WORKSPACE_TABLE_ENTRIES,
-    WORLD_SIZE,
-    device_facts,
-    route_applies,
-    run_cake_fused_norm_combine,
-    select_variant,
-)
 from .cuda_ipc import create_shared_buffer, cudart, free_shared_buffer
 from .dlpack_utils import pack_strided_memory
 
+WORLD_SIZE = 8
+HIDDEN_DIM = 2560
+TRACKS = 2
+SUPPORTED_CAPABILITIES: tuple[tuple[int, int], ...] = ((10, 0), (10, 3))
 # Lamport payload words are self-validating: the producer never publishes BF16
 # negative zero (``0x8000``), so a cleared region is filled with that pattern.
 LAMPORT_SENTINEL_U16 = 0x8000
 LAMPORT_SLOTS = 3
 CONTROL_WORDS = 5
+# Workspace pointer table: eight data regions, eight flag regions, eight
+# three-slot Lamport payload regions, then the local control words.
+WORKSPACE_TABLE_ENTRIES = 3 * WORLD_SIZE + 1
+
+# The programs of ``flashinfer.jit.cake_fused_norm_combine``, by dispatch band.
+VARIANT_PARALLEL = "PARALLEL"
+VARIANT_PARALLEL_SPLIT = "PARALLEL_SPLIT"
+VARIANT_OWNER_STREAM = "OWNER_STREAM"
+VARIANT_OWNER_PIPELINED = "OWNER_PIPELINED"
+VARIANTS: tuple[str, ...] = (
+    VARIANT_PARALLEL,
+    VARIANT_PARALLEL_SPLIT,
+    VARIANT_OWNER_STREAM,
+    VARIANT_OWNER_PIPELINED,
+)
+SPLIT_MIN_TOKENS = 4
+STREAM_MIN_TOKENS = 40
+PIPELINED_MIN_TOKENS = 480
+# ``PARALLEL_SPLIT`` launches this many CTAs per token.
+SPLIT_CTAS_PER_TOKEN = 8
+# CTAs per SM the launch bounds of each persistent program guarantee
+# co-resident: the cooperative grid never exceeds this times the SM count.
+CTAS_PER_SM: dict[str, int] = {VARIANT_OWNER_STREAM: 1, VARIANT_OWNER_PIPELINED: 4}
+
+
+def select_variant(tokens: int) -> str:
+    """Name the program the dispatch launches for ``tokens`` rows."""
+
+    if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens <= 0:
+        raise ValueError("tokens must be a positive integer")
+    if tokens >= PIPELINED_MIN_TOKENS:
+        return VARIANT_OWNER_PIPELINED
+    if tokens >= STREAM_MIN_TOKENS:
+        return VARIANT_OWNER_STREAM
+    if tokens >= SPLIT_MIN_TOKENS:
+        return VARIANT_PARALLEL_SPLIT
+    return VARIANT_PARALLEL
+
+
+def persistent_grid(tokens: int, capacity: int) -> int:
+    """Grid of a persistent program.
+
+    ``tokens`` CTAs when they are all co-resident, otherwise the largest odd
+    CTA count not above ``capacity``: an odd grid keeps the token-to-owner
+    assignment (owner = token % 8) rotating across the CTAs.
+    """
+
+    if tokens <= 0 or capacity <= 0:
+        raise ValueError("tokens and capacity must be positive")
+    limit = min(tokens, capacity)
+    if limit >= tokens:
+        return tokens
+    return limit if limit % 2 else limit - 1
+
+
+def launch_grid_x(variant: str, tokens: int, sm_count: int) -> int:
+    """Grid width of ``variant`` for ``tokens`` rows on a device of ``sm_count`` SMs."""
+
+    if variant == VARIANT_PARALLEL:
+        return int(tokens)
+    if variant == VARIANT_PARALLEL_SPLIT:
+        return SPLIT_CTAS_PER_TOKEN * int(tokens)
+    if variant not in CTAS_PER_SM:
+        raise ValueError(f"unknown Cake fused norm-combine variant: {variant!r}")
+    return persistent_grid(int(tokens), CTAS_PER_SM[variant] * int(sm_count))
+
+
+def _program(variant: str):
+    from ..jit import cake_fused_norm_combine as loader
+
+    if variant not in VARIANTS:
+        raise ValueError(f"unknown Cake fused norm-combine variant: {variant!r}")
+    return getattr(loader, variant)
+
+
+@functools.cache
+def _device_facts(device_index: int) -> tuple[tuple[int, int], int]:
+    properties = torch.cuda.get_device_properties(device_index)
+    return (int(properties.major), int(properties.minor)), int(
+        properties.multi_processor_count
+    )
+
+
+def cake_fused_norm_combine_target(device: torch.device) -> str:
+    """The exact target of the generated programs on ``device``: ``"sm_100a"`` or
+    ``"sm_103a"``; any other device is an error."""
+
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    capability, _ = _device_facts(int(index))
+    target = _program(VARIANT_PARALLEL).target_for(capability)
+    if target is None:
+        raise ValueError(
+            "the Cake fused norm-combine export covers compute capability 10.0 "
+            f"(sm_100a) and 10.3 (sm_103a), got {capability[0]}.{capability[1]}"
+        )
+    return target
 
 
 def cake_fused_norm_combine_workspace_bytes(
@@ -333,43 +436,68 @@ def cake_fused_norm_combine(
         raise ValueError(
             f"tokens ({tokens}) exceed workspace.max_tokens ({workspace.max_tokens})"
         )
-    if not route_applies(
-        world_size=workspace.world_size,
-        device_capability=device_facts(device.index).capability,
-        hidden_dim=workspace.hidden,
-    ):
+    if workspace.world_size != WORLD_SIZE or workspace.hidden != HIDDEN_DIM:
         raise ValueError(
-            "the Cake fused norm-combine export covers eight SM100 or SM103 peers with hidden size 2560"
+            "the Cake fused norm-combine export covers eight peers with hidden size 2560"
         )
-    run_cake_fused_norm_combine(
-        backend="cake",
-        x=x,
-        residual=residual,
-        weight=weight,
-        norm_out=norm_out,
-        residual_out=residual_out,
-        collective_out=collective_out,
-        workspace_ptrs=workspace.workspace_ptrs,
-        rank=workspace.rank,
-        tokens=tokens,
-        epsilon=float(epsilon),
-    )
+    target = cake_fused_norm_combine_target(device)
+    variant = select_variant(tokens)
+    _, sm_count = _device_facts(int(device.index))
+    program = _program(variant)
+    # The generated binding's arguments by name (``CakeProgram.args`` orders
+    # them): the six tensors, the workspace pointer table, the rank, the token
+    # count, epsilon and the grid.
+    values = {
+        "x": x,
+        "residual": residual,
+        "weight": weight,
+        "norm_out": norm_out,
+        "residual_out": residual_out,
+        "collective_out": collective_out,
+        "workspace": workspace.workspace_ptrs,
+        "rank": int(workspace.rank),
+        "tokens": tokens,
+        "epsilon": float(epsilon),
+        "grid_x": launch_grid_x(variant, tokens, sm_count),
+        "grid_y": 1,
+        "grid_z": 1,
+    }
+    if set(program.args) != set(values):
+        raise RuntimeError(
+            f"the generated {program.name} binding takes {list(program.args)}; "
+            f"the host spells {sorted(values)}"
+        )
+    entry = program.entry(target)
+    with torch.cuda.device(device), tvm_ffi.use_torch_stream():
+        entry(*[values[name] for name in program.args])
 
 
 __all__ = [
     "CONTROL_WORDS",
+    "CTAS_PER_SM",
     "HIDDEN_DIM",
     "LAMPORT_SENTINEL_U16",
     "LAMPORT_SLOTS",
-    "LARGE_MIN_TOKENS",
+    "PIPELINED_MIN_TOKENS",
+    "SPLIT_CTAS_PER_TOKEN",
+    "SPLIT_MIN_TOKENS",
+    "STREAM_MIN_TOKENS",
     "SUPPORTED_CAPABILITIES",
     "TRACKS",
-    "WIDE_MIN_TOKENS",
+    "VARIANTS",
+    "VARIANT_OWNER_PIPELINED",
+    "VARIANT_OWNER_STREAM",
+    "VARIANT_PARALLEL",
+    "VARIANT_PARALLEL_SPLIT",
+    "WORKSPACE_TABLE_ENTRIES",
     "WORLD_SIZE",
     "CakeFusedNormCombineWorkspace",
     "cake_fused_norm_combine",
     "cake_fused_norm_combine_create_workspace",
     "cake_fused_norm_combine_destroy_workspace",
+    "cake_fused_norm_combine_target",
     "cake_fused_norm_combine_workspace_bytes",
+    "launch_grid_x",
+    "persistent_grid",
     "select_variant",
 ]

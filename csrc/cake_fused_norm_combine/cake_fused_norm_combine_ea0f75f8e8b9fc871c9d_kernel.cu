@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2026 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -54,13 +54,14 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_SCRATCH_STRIDE 128
 #define SMEM_TOTAL 128
 #define THREADS 160
+#define LAUNCH_MIN_BLOCKS 4
 
 #include <math_constants.h>
 
 extern "C" {
 
-__global__ __launch_bounds__(160) void
-kernel_cake_fused_norm_combine_bf16_490c897e3cff3f38e0b8(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ residual, __nv_bfloat16* __restrict__ weight, __nv_bfloat16* __restrict__ norm_out, __nv_bfloat16* __restrict__ residual_out, __nv_bfloat16* __restrict__ collective_out, unsigned long long* __restrict__ workspace, int rank, int tokens, float epsilon)
+__global__ __launch_bounds__(160, LAUNCH_MIN_BLOCKS) void
+kernel_cake_fused_norm_combine_ea0f75f8e8b9fc871c9d(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ residual, __nv_bfloat16* __restrict__ weight, __nv_bfloat16* __restrict__ norm_out, __nv_bfloat16* __restrict__ residual_out, __nv_bfloat16* __restrict__ collective_out, unsigned long long* __restrict__ workspace, int rank, int tokens, float epsilon)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -84,28 +85,25 @@ kernel_cake_fused_norm_combine_bf16_490c897e3cff3f38e0b8(__nv_bfloat16* __restri
     float* scratch = reinterpret_cast<float*>(smem_raw + 0);
     const int scratch_addr = smem + 0;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     asm volatile("griddepcontrol.wait;" ::: "memory");
     unsigned long long control_address = workspace[24];
-    int* control = reinterpret_cast<int*>(control_address);
-    unsigned int* completion = reinterpret_cast<unsigned int*>(control_address);
-    int rotation = control[2];
-    int rotation_bytes = control[3];
-    int previous_clear_bytes = control[4];
-    int data_rotation = rotation % 3;
-    int clear_rotation = (rotation + 2) % 3;
+    int* control_0 = reinterpret_cast<int*>(control_address);
+    int control_current_word = control_0[2];
+    int control_bytes_per_buffer_word = control_0[3];
+    int control_clear_word = control_0[4];
+    int control_current = control_current_word % 3;
+    int control_dirty = (control_current_word + 2) % 3;
     __nv_bfloat16* local_payload = reinterpret_cast<__nv_bfloat16*>(workspace[16 + rank]);
-    long long data_base = (long long)data_rotation * (long long)rotation_bytes / 2;
-    long long clear_base = (long long)clear_rotation * (long long)rotation_bytes / 2;
+    long long data_base = (long long)control_current * (long long)control_bytes_per_buffer_word / 2;
+    long long clear_base = (long long)control_dirty * (long long)control_bytes_per_buffer_word / 2;
     int total_vectors = tokens * 160;
     int vector_index = bid * 160 + tid;
     __syncthreads();
     if (tid == 0) {
-        {
-            unsigned int* _lca_p_0 = reinterpret_cast<unsigned int*>(completion) + (0);
-            atomicAdd(_lca_p_0, 1u);
-        }
+        asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(control_0)) + (0))), "r"(static_cast<unsigned int>(1)) : "memory");
     }
+    int slots = (tokens + 7) / 8;
     #pragma unroll 1
     for (int token = bid; token < tokens; token += num_bids) {
         float mean[16];
@@ -118,143 +116,60 @@ kernel_cake_fused_norm_combine_bf16_490c897e3cff3f38e0b8(__nv_bfloat16* __restri
             long long offset = ((long long)token * 2 + (long long)track) * 2560 + (long long)(tid * 16);
             float _vec_load_0[16];
             {
-                const void* _v8p_1 = (const void*)(x + offset + (0));
+                const void* _v8p_0 = (const void*)(x + offset + (0));
+                uint32_t _v8_0_0[8];
+                asm volatile(
+                    "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                    : "=r"(_v8_0_0[0]), "=r"(_v8_0_0[1]), "=r"(_v8_0_0[2]), "=r"(_v8_0_0[3]), "=r"(_v8_0_0[4]), "=r"(_v8_0_0[5]), "=r"(_v8_0_0[6]), "=r"(_v8_0_0[7]) : "l"((const char*)_v8p_0 + 0) : "memory");
+                (&_vec_load_0[0 + 0])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[0]) << 16);
+                (&_vec_load_0[0 + 0])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[0]) & 0xffff0000u);
+                (&_vec_load_0[0 + 2])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[1]) << 16);
+                (&_vec_load_0[0 + 2])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[1]) & 0xffff0000u);
+                (&_vec_load_0[0 + 4])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[2]) << 16);
+                (&_vec_load_0[0 + 4])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[2]) & 0xffff0000u);
+                (&_vec_load_0[0 + 6])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[3]) << 16);
+                (&_vec_load_0[0 + 6])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[3]) & 0xffff0000u);
+                (&_vec_load_0[0 + 8])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[4]) << 16);
+                (&_vec_load_0[0 + 8])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[4]) & 0xffff0000u);
+                (&_vec_load_0[0 + 10])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[5]) << 16);
+                (&_vec_load_0[0 + 10])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[5]) & 0xffff0000u);
+                (&_vec_load_0[0 + 12])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[6]) << 16);
+                (&_vec_load_0[0 + 12])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[6]) & 0xffff0000u);
+                (&_vec_load_0[0 + 14])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[7]) << 16);
+                (&_vec_load_0[0 + 14])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[7]) & 0xffff0000u);
+            }
+            float _vec_load_1[16];
+            {
+                const void* _v8p_1 = (const void*)(residual + offset + (0));
                 uint32_t _v8_1_0[8];
                 asm volatile(
                     "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
                     : "=r"(_v8_1_0[0]), "=r"(_v8_1_0[1]), "=r"(_v8_1_0[2]), "=r"(_v8_1_0[3]), "=r"(_v8_1_0[4]), "=r"(_v8_1_0[5]), "=r"(_v8_1_0[6]), "=r"(_v8_1_0[7]) : "l"((const char*)_v8p_1 + 0) : "memory");
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_0[0 + 0])[0]), "=f"((&_vec_load_0[0 + 0])[1])
-                    : "r"(_v8_1_0[0]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_0[0 + 2])[0]), "=f"((&_vec_load_0[0 + 2])[1])
-                    : "r"(_v8_1_0[1]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_0[0 + 4])[0]), "=f"((&_vec_load_0[0 + 4])[1])
-                    : "r"(_v8_1_0[2]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_0[0 + 6])[0]), "=f"((&_vec_load_0[0 + 6])[1])
-                    : "r"(_v8_1_0[3]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_0[0 + 8])[0]), "=f"((&_vec_load_0[0 + 8])[1])
-                    : "r"(_v8_1_0[4]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_0[0 + 10])[0]), "=f"((&_vec_load_0[0 + 10])[1])
-                    : "r"(_v8_1_0[5]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_0[0 + 12])[0]), "=f"((&_vec_load_0[0 + 12])[1])
-                    : "r"(_v8_1_0[6]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_0[0 + 14])[0]), "=f"((&_vec_load_0[0 + 14])[1])
-                    : "r"(_v8_1_0[7]));
-            }
-            float _vec_load_1[16];
-            {
-                const void* _v8p_2 = (const void*)(residual + offset + (0));
-                uint32_t _v8_2_0[8];
-                asm volatile(
-                    "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                    : "=r"(_v8_2_0[0]), "=r"(_v8_2_0[1]), "=r"(_v8_2_0[2]), "=r"(_v8_2_0[3]), "=r"(_v8_2_0[4]), "=r"(_v8_2_0[5]), "=r"(_v8_2_0[6]), "=r"(_v8_2_0[7]) : "l"((const char*)_v8p_2 + 0) : "memory");
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_1[0 + 0])[0]), "=f"((&_vec_load_1[0 + 0])[1])
-                    : "r"(_v8_2_0[0]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_1[0 + 2])[0]), "=f"((&_vec_load_1[0 + 2])[1])
-                    : "r"(_v8_2_0[1]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_1[0 + 4])[0]), "=f"((&_vec_load_1[0 + 4])[1])
-                    : "r"(_v8_2_0[2]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_1[0 + 6])[0]), "=f"((&_vec_load_1[0 + 6])[1])
-                    : "r"(_v8_2_0[3]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_1[0 + 8])[0]), "=f"((&_vec_load_1[0 + 8])[1])
-                    : "r"(_v8_2_0[4]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_1[0 + 10])[0]), "=f"((&_vec_load_1[0 + 10])[1])
-                    : "r"(_v8_2_0[5]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_1[0 + 12])[0]), "=f"((&_vec_load_1[0 + 12])[1])
-                    : "r"(_v8_2_0[6]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_1[0 + 14])[0]), "=f"((&_vec_load_1[0 + 14])[1])
-                    : "r"(_v8_2_0[7]));
+                (&_vec_load_1[0 + 0])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[0]) << 16);
+                (&_vec_load_1[0 + 0])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[0]) & 0xffff0000u);
+                (&_vec_load_1[0 + 2])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[1]) << 16);
+                (&_vec_load_1[0 + 2])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[1]) & 0xffff0000u);
+                (&_vec_load_1[0 + 4])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[2]) << 16);
+                (&_vec_load_1[0 + 4])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[2]) & 0xffff0000u);
+                (&_vec_load_1[0 + 6])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[3]) << 16);
+                (&_vec_load_1[0 + 6])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[3]) & 0xffff0000u);
+                (&_vec_load_1[0 + 8])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[4]) << 16);
+                (&_vec_load_1[0 + 8])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[4]) & 0xffff0000u);
+                (&_vec_load_1[0 + 10])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[5]) << 16);
+                (&_vec_load_1[0 + 10])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[5]) & 0xffff0000u);
+                (&_vec_load_1[0 + 12])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[6]) << 16);
+                (&_vec_load_1[0 + 12])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[6]) & 0xffff0000u);
+                (&_vec_load_1[0 + 14])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[7]) << 16);
+                (&_vec_load_1[0 + 14])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[7]) & 0xffff0000u);
             }
             float propagated[16];
             float square_sum = 0.0f;
             #pragma unroll
             for (int element_1 = 0; element_1 < 16; element_1++) {
-                __nv_bfloat16 _cvt_bf16_0 = __float2bfloat16(_vec_load_0[element_1] + _vec_load_1[element_1]);
-                float _cvt_f32_0 = __bfloat162float(_cvt_bf16_0);
-                propagated[element_1] = _cvt_f32_0;
-                float _fma_0 = __fmaf_rn(propagated[element_1], propagated[element_1], square_sum);
-                square_sum = _fma_0;
+                propagated[element_1] = (float)(__nv_bfloat16)(_vec_load_0[element_1] + _vec_load_1[element_1]);
+                square_sum = __fmaf_rn(propagated[element_1], propagated[element_1], square_sum);
             }
-            uint32_t propagated_bf16[8];
+            unsigned int propagated_bf16[8];
             #pragma unroll
             for (int _lp = 0; _lp < 8; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(propagated[_lp*2 + 0], propagated[_lp*2+1 + 0]));
@@ -276,86 +191,43 @@ kernel_cake_fused_norm_combine_bf16_490c897e3cff3f38e0b8(__nv_bfloat16* __restri
                 for (int offset = 16; offset > 0; offset >>= 1)
                     _warp_reduce_1 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset);
                 if (lane == 0) {
-                    scratch[0] = _warp_reduce_1;
+                    scratch[5] = _warp_reduce_1;
                 }
             }
             __syncthreads();
-            float result = scratch[0];
+            float result = scratch[5];
             float _rsqrt_0 = rsqrtf(result / 2560.0f + epsilon);
             float _vec_load_2[16];
             {
-                const void* _v8p_3 = (const void*)(weight + (track * 2560 + tid * 16) + (0));
-                uint32_t _v8_3_0[8];
+                const void* _v8p_2 = (const void*)(weight + (track * 2560 + tid * 16) + (0));
+                uint32_t _v8_2_0[8];
                 asm volatile(
                     "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                    : "=r"(_v8_3_0[0]), "=r"(_v8_3_0[1]), "=r"(_v8_3_0[2]), "=r"(_v8_3_0[3]), "=r"(_v8_3_0[4]), "=r"(_v8_3_0[5]), "=r"(_v8_3_0[6]), "=r"(_v8_3_0[7]) : "l"((const char*)_v8p_3 + 0) : "memory");
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_2[0 + 0])[0]), "=f"((&_vec_load_2[0 + 0])[1])
-                    : "r"(_v8_3_0[0]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_2[0 + 2])[0]), "=f"((&_vec_load_2[0 + 2])[1])
-                    : "r"(_v8_3_0[1]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_2[0 + 4])[0]), "=f"((&_vec_load_2[0 + 4])[1])
-                    : "r"(_v8_3_0[2]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_2[0 + 6])[0]), "=f"((&_vec_load_2[0 + 6])[1])
-                    : "r"(_v8_3_0[3]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_2[0 + 8])[0]), "=f"((&_vec_load_2[0 + 8])[1])
-                    : "r"(_v8_3_0[4]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_2[0 + 10])[0]), "=f"((&_vec_load_2[0 + 10])[1])
-                    : "r"(_v8_3_0[5]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_2[0 + 12])[0]), "=f"((&_vec_load_2[0 + 12])[1])
-                    : "r"(_v8_3_0[6]));
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_2[0 + 14])[0]), "=f"((&_vec_load_2[0 + 14])[1])
-                    : "r"(_v8_3_0[7]));
+                    : "=r"(_v8_2_0[0]), "=r"(_v8_2_0[1]), "=r"(_v8_2_0[2]), "=r"(_v8_2_0[3]), "=r"(_v8_2_0[4]), "=r"(_v8_2_0[5]), "=r"(_v8_2_0[6]), "=r"(_v8_2_0[7]) : "l"((const char*)_v8p_2 + 0) : "memory");
+                (&_vec_load_2[0 + 0])[0] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[0]) << 16);
+                (&_vec_load_2[0 + 0])[1] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[0]) & 0xffff0000u);
+                (&_vec_load_2[0 + 2])[0] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[1]) << 16);
+                (&_vec_load_2[0 + 2])[1] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[1]) & 0xffff0000u);
+                (&_vec_load_2[0 + 4])[0] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[2]) << 16);
+                (&_vec_load_2[0 + 4])[1] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[2]) & 0xffff0000u);
+                (&_vec_load_2[0 + 6])[0] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[3]) << 16);
+                (&_vec_load_2[0 + 6])[1] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[3]) & 0xffff0000u);
+                (&_vec_load_2[0 + 8])[0] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[4]) << 16);
+                (&_vec_load_2[0 + 8])[1] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[4]) & 0xffff0000u);
+                (&_vec_load_2[0 + 10])[0] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[5]) << 16);
+                (&_vec_load_2[0 + 10])[1] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[5]) & 0xffff0000u);
+                (&_vec_load_2[0 + 12])[0] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[6]) << 16);
+                (&_vec_load_2[0 + 12])[1] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[6]) & 0xffff0000u);
+                (&_vec_load_2[0 + 14])[0] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[7]) << 16);
+                (&_vec_load_2[0 + 14])[1] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[7]) & 0xffff0000u);
             }
             float normalized[16];
             #pragma unroll
             for (int element_2 = 0; element_2 < 16; element_2++) {
-                __nv_bfloat16 _cvt_bf16_1 = __float2bfloat16(propagated[element_2] * _rsqrt_0 * _vec_load_2[element_2]);
-                float _cvt_f32_1 = __bfloat162float(_cvt_bf16_1);
-                normalized[element_2] = _cvt_f32_1;
-                float _fma_1 = __fmaf_rn(normalized[element_2], 0.5f, mean[element_2]);
-                mean[element_2] = _fma_1;
+                normalized[element_2] = (float)(__nv_bfloat16)(propagated[element_2] * _rsqrt_0 * _vec_load_2[element_2]);
+                mean[element_2] = __fmaf_rn(normalized[element_2], 0.5f, mean[element_2]);
             }
-            uint32_t normalized_bf16[8];
+            unsigned int normalized_bf16[8];
             #pragma unroll
             for (int _lp = 0; _lp < 8; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(normalized[_lp*2 + 0], normalized[_lp*2+1 + 0]));
@@ -366,11 +238,10 @@ kernel_cake_fused_norm_combine_bf16_490c897e3cff3f38e0b8(__nv_bfloat16* __restri
         float contribution[16];
         #pragma unroll
         for (int element_3 = 0; element_3 < 16; element_3++) {
-            __nv_bfloat16 _cvt_bf16_2 = __float2bfloat16(mean[element_3]);
-            float _cvt_f32_2 = __bfloat162float(_cvt_bf16_2);
-            contribution[element_3] = ((_cvt_f32_2 == 0.0f) ? 0.0f : _cvt_f32_2);
+            float _cvt_f32_0 = (float)(__nv_bfloat16)mean[element_3];
+            contribution[element_3] = ((_cvt_f32_0 == 0.0f) ? 0.0f : _cvt_f32_0);
         }
-        uint32_t contribution_bf16[8];
+        unsigned int contribution_bf16[8];
         #pragma unroll
         for (int _lp = 0; _lp < 8; _lp++) {
             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(contribution[_lp*2 + 0], contribution[_lp*2+1 + 0]));
@@ -378,23 +249,30 @@ kernel_cake_fused_norm_combine_bf16_490c897e3cff3f38e0b8(__nv_bfloat16* __restri
         }
         int owner = token % 8;
         __nv_bfloat16* owner_payload = reinterpret_cast<__nv_bfloat16*>(workspace[16 + owner]);
-        int vector_index_0 = token * 160 + tid;
-        long long publish_offset = data_base + ((long long)rank * (long long)total_vectors + (long long)vector_index_0) * 16;
-        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(owner_payload + publish_offset), "r"((contribution_bf16)[0]), "r"((contribution_bf16)[1]), "r"((contribution_bf16)[2]), "r"((contribution_bf16)[3]), "r"((contribution_bf16)[4]), "r"((contribution_bf16)[5]), "r"((contribution_bf16)[6]), "r"((contribution_bf16)[7]) : "memory");
+        long long offset_1 = data_base + ((long long)(rank * slots + token / 8) * 160 + (long long)tid) * 16;
+        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(owner_payload + offset_1), "r"((contribution_bf16)[0]), "r"((contribution_bf16)[1]), "r"((contribution_bf16)[2]), "r"((contribution_bf16)[3]), "r"((contribution_bf16)[4]), "r"((contribution_bf16)[5]), "r"((contribution_bf16)[6]), "r"((contribution_bf16)[7]) : "memory");
         int previous = token - 2 * num_bids;
         if (previous >= 0) {
             if (previous % 8 == rank) {
-                int vector_index_1 = previous * 160 + tid;
+                int slot = previous / 8;
+                long long offset_0 = data_base + ((long long)slot * 160 + (long long)tid) * 16;
+                long long offset_1_1 = data_base + ((long long)(slots + slot) * 160 + (long long)tid) * 16;
+                long long offset_2 = data_base + ((long long)(2 * slots + slot) * 160 + (long long)tid) * 16;
+                long long offset_3 = data_base + ((long long)(3 * slots + slot) * 160 + (long long)tid) * 16;
+                long long offset_4 = data_base + ((long long)(4 * slots + slot) * 160 + (long long)tid) * 16;
+                long long offset_5 = data_base + ((long long)(5 * slots + slot) * 160 + (long long)tid) * 16;
+                long long offset_6 = data_base + ((long long)(6 * slots + slot) * 160 + (long long)tid) * 16;
+                long long offset_7 = data_base + ((long long)(7 * slots + slot) * 160 + (long long)tid) * 16;
                 uint32_t _sysv_poll256_group_0[64];
                 do {
-                    asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[0]), "=r"(_sysv_poll256_group_0[1]), "=r"(_sysv_poll256_group_0[2]), "=r"(_sysv_poll256_group_0[3]), "=r"(_sysv_poll256_group_0[4]), "=r"(_sysv_poll256_group_0[5]), "=r"(_sysv_poll256_group_0[6]), "=r"(_sysv_poll256_group_0[7]) : "l"(local_payload + (data_base + (long long)(vector_index_1 * 16))) : "memory");
-                    asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[8]), "=r"(_sysv_poll256_group_0[9]), "=r"(_sysv_poll256_group_0[10]), "=r"(_sysv_poll256_group_0[11]), "=r"(_sysv_poll256_group_0[12]), "=r"(_sysv_poll256_group_0[13]), "=r"(_sysv_poll256_group_0[14]), "=r"(_sysv_poll256_group_0[15]) : "l"(local_payload + (data_base + (long long)((total_vectors + vector_index_1) * 16))) : "memory");
-                    asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[16]), "=r"(_sysv_poll256_group_0[17]), "=r"(_sysv_poll256_group_0[18]), "=r"(_sysv_poll256_group_0[19]), "=r"(_sysv_poll256_group_0[20]), "=r"(_sysv_poll256_group_0[21]), "=r"(_sysv_poll256_group_0[22]), "=r"(_sysv_poll256_group_0[23]) : "l"(local_payload + (data_base + (long long)((2 * total_vectors + vector_index_1) * 16))) : "memory");
-                    asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[24]), "=r"(_sysv_poll256_group_0[25]), "=r"(_sysv_poll256_group_0[26]), "=r"(_sysv_poll256_group_0[27]), "=r"(_sysv_poll256_group_0[28]), "=r"(_sysv_poll256_group_0[29]), "=r"(_sysv_poll256_group_0[30]), "=r"(_sysv_poll256_group_0[31]) : "l"(local_payload + (data_base + (long long)((3 * total_vectors + vector_index_1) * 16))) : "memory");
-                    asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[32]), "=r"(_sysv_poll256_group_0[33]), "=r"(_sysv_poll256_group_0[34]), "=r"(_sysv_poll256_group_0[35]), "=r"(_sysv_poll256_group_0[36]), "=r"(_sysv_poll256_group_0[37]), "=r"(_sysv_poll256_group_0[38]), "=r"(_sysv_poll256_group_0[39]) : "l"(local_payload + (data_base + (long long)((4 * total_vectors + vector_index_1) * 16))) : "memory");
-                    asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[40]), "=r"(_sysv_poll256_group_0[41]), "=r"(_sysv_poll256_group_0[42]), "=r"(_sysv_poll256_group_0[43]), "=r"(_sysv_poll256_group_0[44]), "=r"(_sysv_poll256_group_0[45]), "=r"(_sysv_poll256_group_0[46]), "=r"(_sysv_poll256_group_0[47]) : "l"(local_payload + (data_base + (long long)((5 * total_vectors + vector_index_1) * 16))) : "memory");
-                    asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[48]), "=r"(_sysv_poll256_group_0[49]), "=r"(_sysv_poll256_group_0[50]), "=r"(_sysv_poll256_group_0[51]), "=r"(_sysv_poll256_group_0[52]), "=r"(_sysv_poll256_group_0[53]), "=r"(_sysv_poll256_group_0[54]), "=r"(_sysv_poll256_group_0[55]) : "l"(local_payload + (data_base + (long long)((6 * total_vectors + vector_index_1) * 16))) : "memory");
-                    asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[56]), "=r"(_sysv_poll256_group_0[57]), "=r"(_sysv_poll256_group_0[58]), "=r"(_sysv_poll256_group_0[59]), "=r"(_sysv_poll256_group_0[60]), "=r"(_sysv_poll256_group_0[61]), "=r"(_sysv_poll256_group_0[62]), "=r"(_sysv_poll256_group_0[63]) : "l"(local_payload + (data_base + (long long)((7 * total_vectors + vector_index_1) * 16))) : "memory");
+                    asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[0]), "=r"(_sysv_poll256_group_0[1]), "=r"(_sysv_poll256_group_0[2]), "=r"(_sysv_poll256_group_0[3]), "=r"(_sysv_poll256_group_0[4]), "=r"(_sysv_poll256_group_0[5]), "=r"(_sysv_poll256_group_0[6]), "=r"(_sysv_poll256_group_0[7]) : "l"(local_payload + offset_0) : "memory");
+                    asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[8]), "=r"(_sysv_poll256_group_0[9]), "=r"(_sysv_poll256_group_0[10]), "=r"(_sysv_poll256_group_0[11]), "=r"(_sysv_poll256_group_0[12]), "=r"(_sysv_poll256_group_0[13]), "=r"(_sysv_poll256_group_0[14]), "=r"(_sysv_poll256_group_0[15]) : "l"(local_payload + offset_1_1) : "memory");
+                    asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[16]), "=r"(_sysv_poll256_group_0[17]), "=r"(_sysv_poll256_group_0[18]), "=r"(_sysv_poll256_group_0[19]), "=r"(_sysv_poll256_group_0[20]), "=r"(_sysv_poll256_group_0[21]), "=r"(_sysv_poll256_group_0[22]), "=r"(_sysv_poll256_group_0[23]) : "l"(local_payload + offset_2) : "memory");
+                    asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[24]), "=r"(_sysv_poll256_group_0[25]), "=r"(_sysv_poll256_group_0[26]), "=r"(_sysv_poll256_group_0[27]), "=r"(_sysv_poll256_group_0[28]), "=r"(_sysv_poll256_group_0[29]), "=r"(_sysv_poll256_group_0[30]), "=r"(_sysv_poll256_group_0[31]) : "l"(local_payload + offset_3) : "memory");
+                    asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[32]), "=r"(_sysv_poll256_group_0[33]), "=r"(_sysv_poll256_group_0[34]), "=r"(_sysv_poll256_group_0[35]), "=r"(_sysv_poll256_group_0[36]), "=r"(_sysv_poll256_group_0[37]), "=r"(_sysv_poll256_group_0[38]), "=r"(_sysv_poll256_group_0[39]) : "l"(local_payload + offset_4) : "memory");
+                    asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[40]), "=r"(_sysv_poll256_group_0[41]), "=r"(_sysv_poll256_group_0[42]), "=r"(_sysv_poll256_group_0[43]), "=r"(_sysv_poll256_group_0[44]), "=r"(_sysv_poll256_group_0[45]), "=r"(_sysv_poll256_group_0[46]), "=r"(_sysv_poll256_group_0[47]) : "l"(local_payload + offset_5) : "memory");
+                    asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[48]), "=r"(_sysv_poll256_group_0[49]), "=r"(_sysv_poll256_group_0[50]), "=r"(_sysv_poll256_group_0[51]), "=r"(_sysv_poll256_group_0[52]), "=r"(_sysv_poll256_group_0[53]), "=r"(_sysv_poll256_group_0[54]), "=r"(_sysv_poll256_group_0[55]) : "l"(local_payload + offset_6) : "memory");
+                    asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[56]), "=r"(_sysv_poll256_group_0[57]), "=r"(_sysv_poll256_group_0[58]), "=r"(_sysv_poll256_group_0[59]), "=r"(_sysv_poll256_group_0[60]), "=r"(_sysv_poll256_group_0[61]), "=r"(_sysv_poll256_group_0[62]), "=r"(_sysv_poll256_group_0[63]) : "l"(local_payload + offset_7) : "memory");
                 } while (
                     (((_sysv_poll256_group_0[0] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[0] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[1] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[1] >> 16) & 0xffffu) == 0x8000u) ||
                     (((_sysv_poll256_group_0[2] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[2] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[3] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[3] >> 16) & 0xffffu) == 0x8000u) ||
@@ -429,112 +307,99 @@ kernel_cake_fused_norm_combine_bf16_490c897e3cff3f38e0b8(__nv_bfloat16* __restri
                     (((_sysv_poll256_group_0[60] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[60] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[61] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[61] >> 16) & 0xffffu) == 0x8000u) ||
                     (((_sysv_poll256_group_0[62] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[62] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[63] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[63] >> 16) & 0xffffu) == 0x8000u)
                 );
-                float _sysv_poll256_group_0_f32[16];
+                float _unpack_bf16_0[16];
                 #pragma unroll
                 for (int _pair = 0; _pair < 8; _pair++) {
-                    asm volatile(
-                        "{\n\t"
-                        "shl.b32 %0, %2, 16;\n\t"
-                        "and.b32 %1, %2, 0xffff0000;\n\t"
-                        "}\n"
-                        : "=f"((&_sysv_poll256_group_0_f32[_pair * 2])[0]), "=f"((&_sysv_poll256_group_0_f32[_pair * 2])[1])
-                        : "r"(_sysv_poll256_group_0[_pair]));
+                    (&_unpack_bf16_0[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_0[_pair]) << 16);
+                    (&_unpack_bf16_0[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_0[_pair]) & 0xffff0000u);
                 }
                 #pragma unroll
                 for (int peer = 1; peer < 8; peer++) {
-                    float _sysv_poll256_group_0_f32_0[16];
+                    float _unpack_bf16_1[16];
                     #pragma unroll
                     for (int _pair = 0; _pair < 8; _pair++) {
-                        asm volatile(
-                            "{\n\t"
-                            "shl.b32 %0, %2, 16;\n\t"
-                            "and.b32 %1, %2, 0xffff0000;\n\t"
-                            "}\n"
-                            : "=f"((&_sysv_poll256_group_0_f32_0[_pair * 2])[0]), "=f"((&_sysv_poll256_group_0_f32_0[_pair * 2])[1])
-                            : "r"((_sysv_poll256_group_0 + peer * 8)[_pair]));
+                        (&_unpack_bf16_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((_sysv_poll256_group_0 + peer * 8)[_pair]) << 16);
+                        (&_unpack_bf16_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((_sysv_poll256_group_0 + peer * 8)[_pair]) & 0xffff0000u);
                     }
                     #pragma unroll
                     for (int element_4 = 0; element_4 < 16; element_4++) {
-                        __nv_bfloat16 _cvt_bf16_3 = __float2bfloat16(_sysv_poll256_group_0_f32[element_4] + _sysv_poll256_group_0_f32_0[element_4]);
-                        float _cvt_f32_3 = __bfloat162float(_cvt_bf16_3);
-                        _sysv_poll256_group_0_f32[element_4] = _cvt_f32_3;
+                        _unpack_bf16_0[element_4] = (float)(__nv_bfloat16)(_unpack_bf16_0[element_4] + _unpack_bf16_1[element_4]);
                     }
                 }
-                uint32_t _sysv_poll256_group_0_f32_bf16[8];
+                unsigned int _unpack_bf16_0_bf16[8];
                 #pragma unroll
                 for (int _lp = 0; _lp < 8; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_sysv_poll256_group_0_f32[_lp*2 + 0], _sysv_poll256_group_0_f32[_lp*2+1 + 0]));
-                    _sysv_poll256_group_0_f32_bf16[_lp] = *(uint32_t*)&_bf2;
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_unpack_bf16_0[_lp*2 + 0], _unpack_bf16_0[_lp*2+1 + 0]));
+                    _unpack_bf16_0_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
-                long long owner_offset = data_base + ((long long)rank * (long long)total_vectors + (long long)vector_index_1) * 16;
+                long long offset_8 = data_base + ((long long)(8 * slots + previous) * 160 + (long long)tid) * 16;
                 #pragma unroll
                 for (int peer_1 = 0; peer_1 < 8; peer_1++) {
                     __nv_bfloat16* peer_payload = reinterpret_cast<__nv_bfloat16*>(workspace[16 + peer_1]);
-                    asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(peer_payload + owner_offset), "r"((_sysv_poll256_group_0_f32_bf16)[0]), "r"((_sysv_poll256_group_0_f32_bf16)[1]), "r"((_sysv_poll256_group_0_f32_bf16)[2]), "r"((_sysv_poll256_group_0_f32_bf16)[3]), "r"((_sysv_poll256_group_0_f32_bf16)[4]), "r"((_sysv_poll256_group_0_f32_bf16)[5]), "r"((_sysv_poll256_group_0_f32_bf16)[6]), "r"((_sysv_poll256_group_0_f32_bf16)[7]) : "memory");
+                    asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(peer_payload + offset_8), "r"((_unpack_bf16_0_bf16)[0]), "r"((_unpack_bf16_0_bf16)[1]), "r"((_unpack_bf16_0_bf16)[2]), "r"((_unpack_bf16_0_bf16)[3]), "r"((_unpack_bf16_0_bf16)[4]), "r"((_unpack_bf16_0_bf16)[5]), "r"((_unpack_bf16_0_bf16)[6]), "r"((_unpack_bf16_0_bf16)[7]) : "memory");
                 }
             }
         }
         int earlier = token - 4 * num_bids;
         if (earlier >= 0) {
-            int owner_0 = earlier % 8;
-            int vector_index_1_1 = earlier * 160 + tid;
-            long long owner_offset_1 = data_base + ((long long)owner_0 * (long long)total_vectors + (long long)vector_index_1_1) * 16;
+            long long offset_0_1 = data_base + ((long long)(8 * slots + earlier) * 160 + (long long)tid) * 16;
             uint32_t _sysv_poll256_group_1[8];
             do {
-                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_1[0]), "=r"(_sysv_poll256_group_1[1]), "=r"(_sysv_poll256_group_1[2]), "=r"(_sysv_poll256_group_1[3]), "=r"(_sysv_poll256_group_1[4]), "=r"(_sysv_poll256_group_1[5]), "=r"(_sysv_poll256_group_1[6]), "=r"(_sysv_poll256_group_1[7]) : "l"(local_payload + owner_offset_1) : "memory");
+                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_1[0]), "=r"(_sysv_poll256_group_1[1]), "=r"(_sysv_poll256_group_1[2]), "=r"(_sysv_poll256_group_1[3]), "=r"(_sysv_poll256_group_1[4]), "=r"(_sysv_poll256_group_1[5]), "=r"(_sysv_poll256_group_1[6]), "=r"(_sysv_poll256_group_1[7]) : "l"(local_payload + offset_0_1) : "memory");
             } while (
                 (((_sysv_poll256_group_1[0] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_1[0] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_1[1] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_1[1] >> 16) & 0xffffu) == 0x8000u) ||
                 (((_sysv_poll256_group_1[2] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_1[2] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_1[3] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_1[3] >> 16) & 0xffffu) == 0x8000u) ||
                 (((_sysv_poll256_group_1[4] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_1[4] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_1[5] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_1[5] >> 16) & 0xffffu) == 0x8000u) ||
                 (((_sysv_poll256_group_1[6] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_1[6] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_1[7] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_1[7] >> 16) & 0xffffu) == 0x8000u)
             );
-            float _sysv_poll256_group_1_f32[16];
+            float _unpack_bf16_2[16];
             #pragma unroll
             for (int _pair = 0; _pair < 8; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_sysv_poll256_group_1_f32[_pair * 2])[0]), "=f"((&_sysv_poll256_group_1_f32[_pair * 2])[1])
-                    : "r"(_sysv_poll256_group_1[_pair]));
+                (&_unpack_bf16_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_1[_pair]) << 16);
+                (&_unpack_bf16_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_1[_pair]) & 0xffff0000u);
             }
-            uint32_t _sysv_poll256_group_1_f32_bf16[8];
+            unsigned int _unpack_bf16_2_bf16[8];
             #pragma unroll
             for (int _lp = 0; _lp < 8; _lp++) {
-                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_sysv_poll256_group_1_f32[_lp*2 + 0], _sysv_poll256_group_1_f32[_lp*2+1 + 0]));
-                _sysv_poll256_group_1_f32_bf16[_lp] = *(uint32_t*)&_bf2;
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_unpack_bf16_2[_lp*2 + 0], _unpack_bf16_2[_lp*2+1 + 0]));
+                _unpack_bf16_2_bf16[_lp] = *(uint32_t*)&_bf2;
             }
-            asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(collective_out + ((long long)vector_index_1_1 * 16)), "r"((_sysv_poll256_group_1_f32_bf16)[0]), "r"((_sysv_poll256_group_1_f32_bf16)[1]), "r"((_sysv_poll256_group_1_f32_bf16)[2]), "r"((_sysv_poll256_group_1_f32_bf16)[3]), "r"((_sysv_poll256_group_1_f32_bf16)[4]), "r"((_sysv_poll256_group_1_f32_bf16)[5]), "r"((_sysv_poll256_group_1_f32_bf16)[6]), "r"((_sysv_poll256_group_1_f32_bf16)[7]) : "memory");
+            asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(collective_out + (((long long)earlier * 160 + (long long)tid) * 16)), "r"((_unpack_bf16_2_bf16)[0]), "r"((_unpack_bf16_2_bf16)[1]), "r"((_unpack_bf16_2_bf16)[2]), "r"((_unpack_bf16_2_bf16)[3]), "r"((_unpack_bf16_2_bf16)[4]), "r"((_unpack_bf16_2_bf16)[5]), "r"((_unpack_bf16_2_bf16)[6]), "r"((_unpack_bf16_2_bf16)[7]) : "memory");
         }
     }
-    {
-        unsigned int sentinel[8];
-        #pragma unroll
-        for (int word = 0; word < 8; word++) {
-            sentinel[word] = 2147516416;
-        }
-        int clear_start = bid * 160 + tid;
-        #pragma unroll 1
-        for (int clear_index = clear_start; clear_index < previous_clear_bytes / 32; clear_index += num_bids * 160) {
-            asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(local_payload + (clear_base + (long long)clear_index * 16)), "r"((sentinel)[0]), "r"((sentinel)[1]), "r"((sentinel)[2]), "r"((sentinel)[3]), "r"((sentinel)[4]), "r"((sentinel)[5]), "r"((sentinel)[6]), "r"((sentinel)[7]) : "memory");
-        }
+    unsigned int sentinel[8];
+    #pragma unroll
+    for (int word = 0; word < 8; word++) {
+        sentinel[word] = 2147516416;
+    }
+    int clear_start = bid * 160 + tid;
+    #pragma unroll 1
+    for (int clear_index = clear_start; clear_index < control_clear_word / 32; clear_index += num_bids * 160) {
+        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(local_payload + (clear_base + (long long)clear_index * 16)), "r"((sentinel)[0]), "r"((sentinel)[1]), "r"((sentinel)[2]), "r"((sentinel)[3]), "r"((sentinel)[4]), "r"((sentinel)[5]), "r"((sentinel)[6]), "r"((sentinel)[7]) : "memory");
     }
     int last = bid + (tokens - 1 - bid) / num_bids * num_bids;
     int pending = last - num_bids;
     if (pending >= 0) {
         if (pending % 8 == rank) {
-            int vector_index_0_1 = pending * 160 + tid;
+            int slot_1 = pending / 8;
+            long long offset_9 = data_base + ((long long)slot_1 * 160 + (long long)tid) * 16;
+            long long offset_0_2 = data_base + ((long long)(slots + slot_1) * 160 + (long long)tid) * 16;
+            long long offset_1_2 = data_base + ((long long)(2 * slots + slot_1) * 160 + (long long)tid) * 16;
+            long long offset_2_1 = data_base + ((long long)(3 * slots + slot_1) * 160 + (long long)tid) * 16;
+            long long offset_3_1 = data_base + ((long long)(4 * slots + slot_1) * 160 + (long long)tid) * 16;
+            long long offset_4_1 = data_base + ((long long)(5 * slots + slot_1) * 160 + (long long)tid) * 16;
+            long long offset_5_1 = data_base + ((long long)(6 * slots + slot_1) * 160 + (long long)tid) * 16;
+            long long offset_6_1 = data_base + ((long long)(7 * slots + slot_1) * 160 + (long long)tid) * 16;
             uint32_t _sysv_poll256_group_2[64];
             do {
-                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_2[0]), "=r"(_sysv_poll256_group_2[1]), "=r"(_sysv_poll256_group_2[2]), "=r"(_sysv_poll256_group_2[3]), "=r"(_sysv_poll256_group_2[4]), "=r"(_sysv_poll256_group_2[5]), "=r"(_sysv_poll256_group_2[6]), "=r"(_sysv_poll256_group_2[7]) : "l"(local_payload + (data_base + (long long)(vector_index_0_1 * 16))) : "memory");
-                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_2[8]), "=r"(_sysv_poll256_group_2[9]), "=r"(_sysv_poll256_group_2[10]), "=r"(_sysv_poll256_group_2[11]), "=r"(_sysv_poll256_group_2[12]), "=r"(_sysv_poll256_group_2[13]), "=r"(_sysv_poll256_group_2[14]), "=r"(_sysv_poll256_group_2[15]) : "l"(local_payload + (data_base + (long long)((total_vectors + vector_index_0_1) * 16))) : "memory");
-                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_2[16]), "=r"(_sysv_poll256_group_2[17]), "=r"(_sysv_poll256_group_2[18]), "=r"(_sysv_poll256_group_2[19]), "=r"(_sysv_poll256_group_2[20]), "=r"(_sysv_poll256_group_2[21]), "=r"(_sysv_poll256_group_2[22]), "=r"(_sysv_poll256_group_2[23]) : "l"(local_payload + (data_base + (long long)((2 * total_vectors + vector_index_0_1) * 16))) : "memory");
-                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_2[24]), "=r"(_sysv_poll256_group_2[25]), "=r"(_sysv_poll256_group_2[26]), "=r"(_sysv_poll256_group_2[27]), "=r"(_sysv_poll256_group_2[28]), "=r"(_sysv_poll256_group_2[29]), "=r"(_sysv_poll256_group_2[30]), "=r"(_sysv_poll256_group_2[31]) : "l"(local_payload + (data_base + (long long)((3 * total_vectors + vector_index_0_1) * 16))) : "memory");
-                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_2[32]), "=r"(_sysv_poll256_group_2[33]), "=r"(_sysv_poll256_group_2[34]), "=r"(_sysv_poll256_group_2[35]), "=r"(_sysv_poll256_group_2[36]), "=r"(_sysv_poll256_group_2[37]), "=r"(_sysv_poll256_group_2[38]), "=r"(_sysv_poll256_group_2[39]) : "l"(local_payload + (data_base + (long long)((4 * total_vectors + vector_index_0_1) * 16))) : "memory");
-                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_2[40]), "=r"(_sysv_poll256_group_2[41]), "=r"(_sysv_poll256_group_2[42]), "=r"(_sysv_poll256_group_2[43]), "=r"(_sysv_poll256_group_2[44]), "=r"(_sysv_poll256_group_2[45]), "=r"(_sysv_poll256_group_2[46]), "=r"(_sysv_poll256_group_2[47]) : "l"(local_payload + (data_base + (long long)((5 * total_vectors + vector_index_0_1) * 16))) : "memory");
-                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_2[48]), "=r"(_sysv_poll256_group_2[49]), "=r"(_sysv_poll256_group_2[50]), "=r"(_sysv_poll256_group_2[51]), "=r"(_sysv_poll256_group_2[52]), "=r"(_sysv_poll256_group_2[53]), "=r"(_sysv_poll256_group_2[54]), "=r"(_sysv_poll256_group_2[55]) : "l"(local_payload + (data_base + (long long)((6 * total_vectors + vector_index_0_1) * 16))) : "memory");
-                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_2[56]), "=r"(_sysv_poll256_group_2[57]), "=r"(_sysv_poll256_group_2[58]), "=r"(_sysv_poll256_group_2[59]), "=r"(_sysv_poll256_group_2[60]), "=r"(_sysv_poll256_group_2[61]), "=r"(_sysv_poll256_group_2[62]), "=r"(_sysv_poll256_group_2[63]) : "l"(local_payload + (data_base + (long long)((7 * total_vectors + vector_index_0_1) * 16))) : "memory");
+                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_2[0]), "=r"(_sysv_poll256_group_2[1]), "=r"(_sysv_poll256_group_2[2]), "=r"(_sysv_poll256_group_2[3]), "=r"(_sysv_poll256_group_2[4]), "=r"(_sysv_poll256_group_2[5]), "=r"(_sysv_poll256_group_2[6]), "=r"(_sysv_poll256_group_2[7]) : "l"(local_payload + offset_9) : "memory");
+                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_2[8]), "=r"(_sysv_poll256_group_2[9]), "=r"(_sysv_poll256_group_2[10]), "=r"(_sysv_poll256_group_2[11]), "=r"(_sysv_poll256_group_2[12]), "=r"(_sysv_poll256_group_2[13]), "=r"(_sysv_poll256_group_2[14]), "=r"(_sysv_poll256_group_2[15]) : "l"(local_payload + offset_0_2) : "memory");
+                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_2[16]), "=r"(_sysv_poll256_group_2[17]), "=r"(_sysv_poll256_group_2[18]), "=r"(_sysv_poll256_group_2[19]), "=r"(_sysv_poll256_group_2[20]), "=r"(_sysv_poll256_group_2[21]), "=r"(_sysv_poll256_group_2[22]), "=r"(_sysv_poll256_group_2[23]) : "l"(local_payload + offset_1_2) : "memory");
+                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_2[24]), "=r"(_sysv_poll256_group_2[25]), "=r"(_sysv_poll256_group_2[26]), "=r"(_sysv_poll256_group_2[27]), "=r"(_sysv_poll256_group_2[28]), "=r"(_sysv_poll256_group_2[29]), "=r"(_sysv_poll256_group_2[30]), "=r"(_sysv_poll256_group_2[31]) : "l"(local_payload + offset_2_1) : "memory");
+                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_2[32]), "=r"(_sysv_poll256_group_2[33]), "=r"(_sysv_poll256_group_2[34]), "=r"(_sysv_poll256_group_2[35]), "=r"(_sysv_poll256_group_2[36]), "=r"(_sysv_poll256_group_2[37]), "=r"(_sysv_poll256_group_2[38]), "=r"(_sysv_poll256_group_2[39]) : "l"(local_payload + offset_3_1) : "memory");
+                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_2[40]), "=r"(_sysv_poll256_group_2[41]), "=r"(_sysv_poll256_group_2[42]), "=r"(_sysv_poll256_group_2[43]), "=r"(_sysv_poll256_group_2[44]), "=r"(_sysv_poll256_group_2[45]), "=r"(_sysv_poll256_group_2[46]), "=r"(_sysv_poll256_group_2[47]) : "l"(local_payload + offset_4_1) : "memory");
+                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_2[48]), "=r"(_sysv_poll256_group_2[49]), "=r"(_sysv_poll256_group_2[50]), "=r"(_sysv_poll256_group_2[51]), "=r"(_sysv_poll256_group_2[52]), "=r"(_sysv_poll256_group_2[53]), "=r"(_sysv_poll256_group_2[54]), "=r"(_sysv_poll256_group_2[55]) : "l"(local_payload + offset_5_1) : "memory");
+                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_2[56]), "=r"(_sysv_poll256_group_2[57]), "=r"(_sysv_poll256_group_2[58]), "=r"(_sysv_poll256_group_2[59]), "=r"(_sysv_poll256_group_2[60]), "=r"(_sysv_poll256_group_2[61]), "=r"(_sysv_poll256_group_2[62]), "=r"(_sysv_poll256_group_2[63]) : "l"(local_payload + offset_6_1) : "memory");
             } while (
                 (((_sysv_poll256_group_2[0] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_2[0] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_2[1] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_2[1] >> 16) & 0xffffu) == 0x8000u) ||
                 (((_sysv_poll256_group_2[2] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_2[2] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_2[3] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_2[3] >> 16) & 0xffffu) == 0x8000u) ||
@@ -569,65 +434,61 @@ kernel_cake_fused_norm_combine_bf16_490c897e3cff3f38e0b8(__nv_bfloat16* __restri
                 (((_sysv_poll256_group_2[60] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_2[60] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_2[61] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_2[61] >> 16) & 0xffffu) == 0x8000u) ||
                 (((_sysv_poll256_group_2[62] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_2[62] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_2[63] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_2[63] >> 16) & 0xffffu) == 0x8000u)
             );
-            float _sysv_poll256_group_2_f32[16];
+            float _unpack_bf16_3[16];
             #pragma unroll
             for (int _pair = 0; _pair < 8; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_sysv_poll256_group_2_f32[_pair * 2])[0]), "=f"((&_sysv_poll256_group_2_f32[_pair * 2])[1])
-                    : "r"(_sysv_poll256_group_2[_pair]));
+                (&_unpack_bf16_3[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_2[_pair]) << 16);
+                (&_unpack_bf16_3[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_2[_pair]) & 0xffff0000u);
             }
             #pragma unroll
             for (int peer_2 = 1; peer_2 < 8; peer_2++) {
-                float _sysv_poll256_group_2_f32_0[16];
+                float _unpack_bf16_4[16];
                 #pragma unroll
                 for (int _pair = 0; _pair < 8; _pair++) {
-                    asm volatile(
-                        "{\n\t"
-                        "shl.b32 %0, %2, 16;\n\t"
-                        "and.b32 %1, %2, 0xffff0000;\n\t"
-                        "}\n"
-                        : "=f"((&_sysv_poll256_group_2_f32_0[_pair * 2])[0]), "=f"((&_sysv_poll256_group_2_f32_0[_pair * 2])[1])
-                        : "r"((_sysv_poll256_group_2 + peer_2 * 8)[_pair]));
+                    (&_unpack_bf16_4[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((_sysv_poll256_group_2 + peer_2 * 8)[_pair]) << 16);
+                    (&_unpack_bf16_4[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((_sysv_poll256_group_2 + peer_2 * 8)[_pair]) & 0xffff0000u);
                 }
                 #pragma unroll
                 for (int element_5 = 0; element_5 < 16; element_5++) {
-                    __nv_bfloat16 _cvt_bf16_4 = __float2bfloat16(_sysv_poll256_group_2_f32[element_5] + _sysv_poll256_group_2_f32_0[element_5]);
-                    float _cvt_f32_4 = __bfloat162float(_cvt_bf16_4);
-                    _sysv_poll256_group_2_f32[element_5] = _cvt_f32_4;
+                    _unpack_bf16_3[element_5] = (float)(__nv_bfloat16)(_unpack_bf16_3[element_5] + _unpack_bf16_4[element_5]);
                 }
             }
-            uint32_t _sysv_poll256_group_2_f32_bf16[8];
+            unsigned int _unpack_bf16_3_bf16[8];
             #pragma unroll
             for (int _lp = 0; _lp < 8; _lp++) {
-                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_sysv_poll256_group_2_f32[_lp*2 + 0], _sysv_poll256_group_2_f32[_lp*2+1 + 0]));
-                _sysv_poll256_group_2_f32_bf16[_lp] = *(uint32_t*)&_bf2;
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_unpack_bf16_3[_lp*2 + 0], _unpack_bf16_3[_lp*2+1 + 0]));
+                _unpack_bf16_3_bf16[_lp] = *(uint32_t*)&_bf2;
             }
-            long long owner_offset_2 = data_base + ((long long)rank * (long long)total_vectors + (long long)vector_index_0_1) * 16;
+            long long offset_7_1 = data_base + ((long long)(8 * slots + pending) * 160 + (long long)tid) * 16;
             #pragma unroll
             for (int peer_3 = 0; peer_3 < 8; peer_3++) {
                 __nv_bfloat16* peer_payload_1 = reinterpret_cast<__nv_bfloat16*>(workspace[16 + peer_3]);
-                asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(peer_payload_1 + owner_offset_2), "r"((_sysv_poll256_group_2_f32_bf16)[0]), "r"((_sysv_poll256_group_2_f32_bf16)[1]), "r"((_sysv_poll256_group_2_f32_bf16)[2]), "r"((_sysv_poll256_group_2_f32_bf16)[3]), "r"((_sysv_poll256_group_2_f32_bf16)[4]), "r"((_sysv_poll256_group_2_f32_bf16)[5]), "r"((_sysv_poll256_group_2_f32_bf16)[6]), "r"((_sysv_poll256_group_2_f32_bf16)[7]) : "memory");
+                asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(peer_payload_1 + offset_7_1), "r"((_unpack_bf16_3_bf16)[0]), "r"((_unpack_bf16_3_bf16)[1]), "r"((_unpack_bf16_3_bf16)[2]), "r"((_unpack_bf16_3_bf16)[3]), "r"((_unpack_bf16_3_bf16)[4]), "r"((_unpack_bf16_3_bf16)[5]), "r"((_unpack_bf16_3_bf16)[6]), "r"((_unpack_bf16_3_bf16)[7]) : "memory");
             }
         }
     }
-    int pending_0 = last;
-    if (pending_0 >= 0) {
-        if (pending_0 % 8 == rank) {
-            int vector_index_0_2 = pending_0 * 160 + tid;
+    int pending_1 = last;
+    if (pending_1 >= 0) {
+        if (pending_1 % 8 == rank) {
+            int slot_2 = pending_1 / 8;
+            long long offset_10 = data_base + ((long long)slot_2 * 160 + (long long)tid) * 16;
+            long long offset_0_3 = data_base + ((long long)(slots + slot_2) * 160 + (long long)tid) * 16;
+            long long offset_1_3 = data_base + ((long long)(2 * slots + slot_2) * 160 + (long long)tid) * 16;
+            long long offset_2_2 = data_base + ((long long)(3 * slots + slot_2) * 160 + (long long)tid) * 16;
+            long long offset_3_2 = data_base + ((long long)(4 * slots + slot_2) * 160 + (long long)tid) * 16;
+            long long offset_4_2 = data_base + ((long long)(5 * slots + slot_2) * 160 + (long long)tid) * 16;
+            long long offset_5_2 = data_base + ((long long)(6 * slots + slot_2) * 160 + (long long)tid) * 16;
+            long long offset_6_2 = data_base + ((long long)(7 * slots + slot_2) * 160 + (long long)tid) * 16;
             uint32_t _sysv_poll256_group_3[64];
             do {
-                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_3[0]), "=r"(_sysv_poll256_group_3[1]), "=r"(_sysv_poll256_group_3[2]), "=r"(_sysv_poll256_group_3[3]), "=r"(_sysv_poll256_group_3[4]), "=r"(_sysv_poll256_group_3[5]), "=r"(_sysv_poll256_group_3[6]), "=r"(_sysv_poll256_group_3[7]) : "l"(local_payload + (data_base + (long long)(vector_index_0_2 * 16))) : "memory");
-                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_3[8]), "=r"(_sysv_poll256_group_3[9]), "=r"(_sysv_poll256_group_3[10]), "=r"(_sysv_poll256_group_3[11]), "=r"(_sysv_poll256_group_3[12]), "=r"(_sysv_poll256_group_3[13]), "=r"(_sysv_poll256_group_3[14]), "=r"(_sysv_poll256_group_3[15]) : "l"(local_payload + (data_base + (long long)((total_vectors + vector_index_0_2) * 16))) : "memory");
-                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_3[16]), "=r"(_sysv_poll256_group_3[17]), "=r"(_sysv_poll256_group_3[18]), "=r"(_sysv_poll256_group_3[19]), "=r"(_sysv_poll256_group_3[20]), "=r"(_sysv_poll256_group_3[21]), "=r"(_sysv_poll256_group_3[22]), "=r"(_sysv_poll256_group_3[23]) : "l"(local_payload + (data_base + (long long)((2 * total_vectors + vector_index_0_2) * 16))) : "memory");
-                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_3[24]), "=r"(_sysv_poll256_group_3[25]), "=r"(_sysv_poll256_group_3[26]), "=r"(_sysv_poll256_group_3[27]), "=r"(_sysv_poll256_group_3[28]), "=r"(_sysv_poll256_group_3[29]), "=r"(_sysv_poll256_group_3[30]), "=r"(_sysv_poll256_group_3[31]) : "l"(local_payload + (data_base + (long long)((3 * total_vectors + vector_index_0_2) * 16))) : "memory");
-                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_3[32]), "=r"(_sysv_poll256_group_3[33]), "=r"(_sysv_poll256_group_3[34]), "=r"(_sysv_poll256_group_3[35]), "=r"(_sysv_poll256_group_3[36]), "=r"(_sysv_poll256_group_3[37]), "=r"(_sysv_poll256_group_3[38]), "=r"(_sysv_poll256_group_3[39]) : "l"(local_payload + (data_base + (long long)((4 * total_vectors + vector_index_0_2) * 16))) : "memory");
-                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_3[40]), "=r"(_sysv_poll256_group_3[41]), "=r"(_sysv_poll256_group_3[42]), "=r"(_sysv_poll256_group_3[43]), "=r"(_sysv_poll256_group_3[44]), "=r"(_sysv_poll256_group_3[45]), "=r"(_sysv_poll256_group_3[46]), "=r"(_sysv_poll256_group_3[47]) : "l"(local_payload + (data_base + (long long)((5 * total_vectors + vector_index_0_2) * 16))) : "memory");
-                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_3[48]), "=r"(_sysv_poll256_group_3[49]), "=r"(_sysv_poll256_group_3[50]), "=r"(_sysv_poll256_group_3[51]), "=r"(_sysv_poll256_group_3[52]), "=r"(_sysv_poll256_group_3[53]), "=r"(_sysv_poll256_group_3[54]), "=r"(_sysv_poll256_group_3[55]) : "l"(local_payload + (data_base + (long long)((6 * total_vectors + vector_index_0_2) * 16))) : "memory");
-                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_3[56]), "=r"(_sysv_poll256_group_3[57]), "=r"(_sysv_poll256_group_3[58]), "=r"(_sysv_poll256_group_3[59]), "=r"(_sysv_poll256_group_3[60]), "=r"(_sysv_poll256_group_3[61]), "=r"(_sysv_poll256_group_3[62]), "=r"(_sysv_poll256_group_3[63]) : "l"(local_payload + (data_base + (long long)((7 * total_vectors + vector_index_0_2) * 16))) : "memory");
+                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_3[0]), "=r"(_sysv_poll256_group_3[1]), "=r"(_sysv_poll256_group_3[2]), "=r"(_sysv_poll256_group_3[3]), "=r"(_sysv_poll256_group_3[4]), "=r"(_sysv_poll256_group_3[5]), "=r"(_sysv_poll256_group_3[6]), "=r"(_sysv_poll256_group_3[7]) : "l"(local_payload + offset_10) : "memory");
+                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_3[8]), "=r"(_sysv_poll256_group_3[9]), "=r"(_sysv_poll256_group_3[10]), "=r"(_sysv_poll256_group_3[11]), "=r"(_sysv_poll256_group_3[12]), "=r"(_sysv_poll256_group_3[13]), "=r"(_sysv_poll256_group_3[14]), "=r"(_sysv_poll256_group_3[15]) : "l"(local_payload + offset_0_3) : "memory");
+                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_3[16]), "=r"(_sysv_poll256_group_3[17]), "=r"(_sysv_poll256_group_3[18]), "=r"(_sysv_poll256_group_3[19]), "=r"(_sysv_poll256_group_3[20]), "=r"(_sysv_poll256_group_3[21]), "=r"(_sysv_poll256_group_3[22]), "=r"(_sysv_poll256_group_3[23]) : "l"(local_payload + offset_1_3) : "memory");
+                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_3[24]), "=r"(_sysv_poll256_group_3[25]), "=r"(_sysv_poll256_group_3[26]), "=r"(_sysv_poll256_group_3[27]), "=r"(_sysv_poll256_group_3[28]), "=r"(_sysv_poll256_group_3[29]), "=r"(_sysv_poll256_group_3[30]), "=r"(_sysv_poll256_group_3[31]) : "l"(local_payload + offset_2_2) : "memory");
+                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_3[32]), "=r"(_sysv_poll256_group_3[33]), "=r"(_sysv_poll256_group_3[34]), "=r"(_sysv_poll256_group_3[35]), "=r"(_sysv_poll256_group_3[36]), "=r"(_sysv_poll256_group_3[37]), "=r"(_sysv_poll256_group_3[38]), "=r"(_sysv_poll256_group_3[39]) : "l"(local_payload + offset_3_2) : "memory");
+                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_3[40]), "=r"(_sysv_poll256_group_3[41]), "=r"(_sysv_poll256_group_3[42]), "=r"(_sysv_poll256_group_3[43]), "=r"(_sysv_poll256_group_3[44]), "=r"(_sysv_poll256_group_3[45]), "=r"(_sysv_poll256_group_3[46]), "=r"(_sysv_poll256_group_3[47]) : "l"(local_payload + offset_4_2) : "memory");
+                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_3[48]), "=r"(_sysv_poll256_group_3[49]), "=r"(_sysv_poll256_group_3[50]), "=r"(_sysv_poll256_group_3[51]), "=r"(_sysv_poll256_group_3[52]), "=r"(_sysv_poll256_group_3[53]), "=r"(_sysv_poll256_group_3[54]), "=r"(_sysv_poll256_group_3[55]) : "l"(local_payload + offset_5_2) : "memory");
+                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_3[56]), "=r"(_sysv_poll256_group_3[57]), "=r"(_sysv_poll256_group_3[58]), "=r"(_sysv_poll256_group_3[59]), "=r"(_sysv_poll256_group_3[60]), "=r"(_sysv_poll256_group_3[61]), "=r"(_sysv_poll256_group_3[62]), "=r"(_sysv_poll256_group_3[63]) : "l"(local_payload + offset_6_2) : "memory");
             } while (
                 (((_sysv_poll256_group_3[0] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_3[0] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_3[1] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_3[1] >> 16) & 0xffffu) == 0x8000u) ||
                 (((_sysv_poll256_group_3[2] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_3[2] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_3[3] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_3[3] >> 16) & 0xffffu) == 0x8000u) ||
@@ -662,192 +523,153 @@ kernel_cake_fused_norm_combine_bf16_490c897e3cff3f38e0b8(__nv_bfloat16* __restri
                 (((_sysv_poll256_group_3[60] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_3[60] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_3[61] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_3[61] >> 16) & 0xffffu) == 0x8000u) ||
                 (((_sysv_poll256_group_3[62] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_3[62] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_3[63] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_3[63] >> 16) & 0xffffu) == 0x8000u)
             );
-            float _sysv_poll256_group_3_f32[16];
+            float _unpack_bf16_5[16];
             #pragma unroll
             for (int _pair = 0; _pair < 8; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_sysv_poll256_group_3_f32[_pair * 2])[0]), "=f"((&_sysv_poll256_group_3_f32[_pair * 2])[1])
-                    : "r"(_sysv_poll256_group_3[_pair]));
+                (&_unpack_bf16_5[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_3[_pair]) << 16);
+                (&_unpack_bf16_5[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_3[_pair]) & 0xffff0000u);
             }
             #pragma unroll
             for (int peer_4 = 1; peer_4 < 8; peer_4++) {
-                float _sysv_poll256_group_3_f32_0[16];
+                float _unpack_bf16_6[16];
                 #pragma unroll
                 for (int _pair = 0; _pair < 8; _pair++) {
-                    asm volatile(
-                        "{\n\t"
-                        "shl.b32 %0, %2, 16;\n\t"
-                        "and.b32 %1, %2, 0xffff0000;\n\t"
-                        "}\n"
-                        : "=f"((&_sysv_poll256_group_3_f32_0[_pair * 2])[0]), "=f"((&_sysv_poll256_group_3_f32_0[_pair * 2])[1])
-                        : "r"((_sysv_poll256_group_3 + peer_4 * 8)[_pair]));
+                    (&_unpack_bf16_6[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((_sysv_poll256_group_3 + peer_4 * 8)[_pair]) << 16);
+                    (&_unpack_bf16_6[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((_sysv_poll256_group_3 + peer_4 * 8)[_pair]) & 0xffff0000u);
                 }
                 #pragma unroll
                 for (int element_6 = 0; element_6 < 16; element_6++) {
-                    __nv_bfloat16 _cvt_bf16_5 = __float2bfloat16(_sysv_poll256_group_3_f32[element_6] + _sysv_poll256_group_3_f32_0[element_6]);
-                    float _cvt_f32_5 = __bfloat162float(_cvt_bf16_5);
-                    _sysv_poll256_group_3_f32[element_6] = _cvt_f32_5;
+                    _unpack_bf16_5[element_6] = (float)(__nv_bfloat16)(_unpack_bf16_5[element_6] + _unpack_bf16_6[element_6]);
                 }
             }
-            uint32_t _sysv_poll256_group_3_f32_bf16[8];
+            unsigned int _unpack_bf16_5_bf16[8];
             #pragma unroll
             for (int _lp = 0; _lp < 8; _lp++) {
-                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_sysv_poll256_group_3_f32[_lp*2 + 0], _sysv_poll256_group_3_f32[_lp*2+1 + 0]));
-                _sysv_poll256_group_3_f32_bf16[_lp] = *(uint32_t*)&_bf2;
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_unpack_bf16_5[_lp*2 + 0], _unpack_bf16_5[_lp*2+1 + 0]));
+                _unpack_bf16_5_bf16[_lp] = *(uint32_t*)&_bf2;
             }
-            long long owner_offset_3 = data_base + ((long long)rank * (long long)total_vectors + (long long)vector_index_0_2) * 16;
+            long long offset_7_2 = data_base + ((long long)(8 * slots + pending_1) * 160 + (long long)tid) * 16;
             #pragma unroll
             for (int peer_5 = 0; peer_5 < 8; peer_5++) {
                 __nv_bfloat16* peer_payload_2 = reinterpret_cast<__nv_bfloat16*>(workspace[16 + peer_5]);
-                asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(peer_payload_2 + owner_offset_3), "r"((_sysv_poll256_group_3_f32_bf16)[0]), "r"((_sysv_poll256_group_3_f32_bf16)[1]), "r"((_sysv_poll256_group_3_f32_bf16)[2]), "r"((_sysv_poll256_group_3_f32_bf16)[3]), "r"((_sysv_poll256_group_3_f32_bf16)[4]), "r"((_sysv_poll256_group_3_f32_bf16)[5]), "r"((_sysv_poll256_group_3_f32_bf16)[6]), "r"((_sysv_poll256_group_3_f32_bf16)[7]) : "memory");
+                asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(peer_payload_2 + offset_7_2), "r"((_unpack_bf16_5_bf16)[0]), "r"((_unpack_bf16_5_bf16)[1]), "r"((_unpack_bf16_5_bf16)[2]), "r"((_unpack_bf16_5_bf16)[3]), "r"((_unpack_bf16_5_bf16)[4]), "r"((_unpack_bf16_5_bf16)[5]), "r"((_unpack_bf16_5_bf16)[6]), "r"((_unpack_bf16_5_bf16)[7]) : "memory");
             }
         }
     }
     int unfinished = last - 3 * num_bids;
     if (unfinished >= 0) {
-        int owner_1 = unfinished % 8;
-        int vector_index_0_3 = unfinished * 160 + tid;
-        long long owner_offset_4 = data_base + ((long long)owner_1 * (long long)total_vectors + (long long)vector_index_0_3) * 16;
+        long long offset_11 = data_base + ((long long)(8 * slots + unfinished) * 160 + (long long)tid) * 16;
         uint32_t _sysv_poll256_group_4[8];
         do {
-            asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_4[0]), "=r"(_sysv_poll256_group_4[1]), "=r"(_sysv_poll256_group_4[2]), "=r"(_sysv_poll256_group_4[3]), "=r"(_sysv_poll256_group_4[4]), "=r"(_sysv_poll256_group_4[5]), "=r"(_sysv_poll256_group_4[6]), "=r"(_sysv_poll256_group_4[7]) : "l"(local_payload + owner_offset_4) : "memory");
+            asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_4[0]), "=r"(_sysv_poll256_group_4[1]), "=r"(_sysv_poll256_group_4[2]), "=r"(_sysv_poll256_group_4[3]), "=r"(_sysv_poll256_group_4[4]), "=r"(_sysv_poll256_group_4[5]), "=r"(_sysv_poll256_group_4[6]), "=r"(_sysv_poll256_group_4[7]) : "l"(local_payload + offset_11) : "memory");
         } while (
             (((_sysv_poll256_group_4[0] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[0] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[1] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[1] >> 16) & 0xffffu) == 0x8000u) ||
             (((_sysv_poll256_group_4[2] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[2] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[3] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[3] >> 16) & 0xffffu) == 0x8000u) ||
             (((_sysv_poll256_group_4[4] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[4] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[5] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[5] >> 16) & 0xffffu) == 0x8000u) ||
             (((_sysv_poll256_group_4[6] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[6] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[7] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[7] >> 16) & 0xffffu) == 0x8000u)
         );
-        float _sysv_poll256_group_4_f32[16];
+        float _unpack_bf16_7[16];
         #pragma unroll
         for (int _pair = 0; _pair < 8; _pair++) {
-            asm volatile(
-                "{\n\t"
-                "shl.b32 %0, %2, 16;\n\t"
-                "and.b32 %1, %2, 0xffff0000;\n\t"
-                "}\n"
-                : "=f"((&_sysv_poll256_group_4_f32[_pair * 2])[0]), "=f"((&_sysv_poll256_group_4_f32[_pair * 2])[1])
-                : "r"(_sysv_poll256_group_4[_pair]));
+            (&_unpack_bf16_7[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_4[_pair]) << 16);
+            (&_unpack_bf16_7[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_4[_pair]) & 0xffff0000u);
         }
-        uint32_t _sysv_poll256_group_4_f32_bf16[8];
+        unsigned int _unpack_bf16_7_bf16[8];
         #pragma unroll
         for (int _lp = 0; _lp < 8; _lp++) {
-            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_sysv_poll256_group_4_f32[_lp*2 + 0], _sysv_poll256_group_4_f32[_lp*2+1 + 0]));
-            _sysv_poll256_group_4_f32_bf16[_lp] = *(uint32_t*)&_bf2;
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_unpack_bf16_7[_lp*2 + 0], _unpack_bf16_7[_lp*2+1 + 0]));
+            _unpack_bf16_7_bf16[_lp] = *(uint32_t*)&_bf2;
         }
-        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(collective_out + ((long long)vector_index_0_3 * 16)), "r"((_sysv_poll256_group_4_f32_bf16)[0]), "r"((_sysv_poll256_group_4_f32_bf16)[1]), "r"((_sysv_poll256_group_4_f32_bf16)[2]), "r"((_sysv_poll256_group_4_f32_bf16)[3]), "r"((_sysv_poll256_group_4_f32_bf16)[4]), "r"((_sysv_poll256_group_4_f32_bf16)[5]), "r"((_sysv_poll256_group_4_f32_bf16)[6]), "r"((_sysv_poll256_group_4_f32_bf16)[7]) : "memory");
+        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(collective_out + (((long long)unfinished * 160 + (long long)tid) * 16)), "r"((_unpack_bf16_7_bf16)[0]), "r"((_unpack_bf16_7_bf16)[1]), "r"((_unpack_bf16_7_bf16)[2]), "r"((_unpack_bf16_7_bf16)[3]), "r"((_unpack_bf16_7_bf16)[4]), "r"((_unpack_bf16_7_bf16)[5]), "r"((_unpack_bf16_7_bf16)[6]), "r"((_unpack_bf16_7_bf16)[7]) : "memory");
     }
-    int unfinished_1 = last - 2 * num_bids;
-    if (unfinished_1 >= 0) {
-        int owner_2 = unfinished_1 % 8;
-        int vector_index_0_4 = unfinished_1 * 160 + tid;
-        long long owner_offset_5 = data_base + ((long long)owner_2 * (long long)total_vectors + (long long)vector_index_0_4) * 16;
+    int unfinished_2 = last - 2 * num_bids;
+    if (unfinished_2 >= 0) {
+        long long offset_12 = data_base + ((long long)(8 * slots + unfinished_2) * 160 + (long long)tid) * 16;
         uint32_t _sysv_poll256_group_5[8];
         do {
-            asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_5[0]), "=r"(_sysv_poll256_group_5[1]), "=r"(_sysv_poll256_group_5[2]), "=r"(_sysv_poll256_group_5[3]), "=r"(_sysv_poll256_group_5[4]), "=r"(_sysv_poll256_group_5[5]), "=r"(_sysv_poll256_group_5[6]), "=r"(_sysv_poll256_group_5[7]) : "l"(local_payload + owner_offset_5) : "memory");
+            asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_5[0]), "=r"(_sysv_poll256_group_5[1]), "=r"(_sysv_poll256_group_5[2]), "=r"(_sysv_poll256_group_5[3]), "=r"(_sysv_poll256_group_5[4]), "=r"(_sysv_poll256_group_5[5]), "=r"(_sysv_poll256_group_5[6]), "=r"(_sysv_poll256_group_5[7]) : "l"(local_payload + offset_12) : "memory");
         } while (
             (((_sysv_poll256_group_5[0] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_5[0] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_5[1] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_5[1] >> 16) & 0xffffu) == 0x8000u) ||
             (((_sysv_poll256_group_5[2] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_5[2] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_5[3] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_5[3] >> 16) & 0xffffu) == 0x8000u) ||
             (((_sysv_poll256_group_5[4] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_5[4] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_5[5] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_5[5] >> 16) & 0xffffu) == 0x8000u) ||
             (((_sysv_poll256_group_5[6] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_5[6] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_5[7] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_5[7] >> 16) & 0xffffu) == 0x8000u)
         );
-        float _sysv_poll256_group_5_f32[16];
+        float _unpack_bf16_8[16];
         #pragma unroll
         for (int _pair = 0; _pair < 8; _pair++) {
-            asm volatile(
-                "{\n\t"
-                "shl.b32 %0, %2, 16;\n\t"
-                "and.b32 %1, %2, 0xffff0000;\n\t"
-                "}\n"
-                : "=f"((&_sysv_poll256_group_5_f32[_pair * 2])[0]), "=f"((&_sysv_poll256_group_5_f32[_pair * 2])[1])
-                : "r"(_sysv_poll256_group_5[_pair]));
+            (&_unpack_bf16_8[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_5[_pair]) << 16);
+            (&_unpack_bf16_8[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_5[_pair]) & 0xffff0000u);
         }
-        uint32_t _sysv_poll256_group_5_f32_bf16[8];
+        unsigned int _unpack_bf16_8_bf16[8];
         #pragma unroll
         for (int _lp = 0; _lp < 8; _lp++) {
-            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_sysv_poll256_group_5_f32[_lp*2 + 0], _sysv_poll256_group_5_f32[_lp*2+1 + 0]));
-            _sysv_poll256_group_5_f32_bf16[_lp] = *(uint32_t*)&_bf2;
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_unpack_bf16_8[_lp*2 + 0], _unpack_bf16_8[_lp*2+1 + 0]));
+            _unpack_bf16_8_bf16[_lp] = *(uint32_t*)&_bf2;
         }
-        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(collective_out + ((long long)vector_index_0_4 * 16)), "r"((_sysv_poll256_group_5_f32_bf16)[0]), "r"((_sysv_poll256_group_5_f32_bf16)[1]), "r"((_sysv_poll256_group_5_f32_bf16)[2]), "r"((_sysv_poll256_group_5_f32_bf16)[3]), "r"((_sysv_poll256_group_5_f32_bf16)[4]), "r"((_sysv_poll256_group_5_f32_bf16)[5]), "r"((_sysv_poll256_group_5_f32_bf16)[6]), "r"((_sysv_poll256_group_5_f32_bf16)[7]) : "memory");
+        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(collective_out + (((long long)unfinished_2 * 160 + (long long)tid) * 16)), "r"((_unpack_bf16_8_bf16)[0]), "r"((_unpack_bf16_8_bf16)[1]), "r"((_unpack_bf16_8_bf16)[2]), "r"((_unpack_bf16_8_bf16)[3]), "r"((_unpack_bf16_8_bf16)[4]), "r"((_unpack_bf16_8_bf16)[5]), "r"((_unpack_bf16_8_bf16)[6]), "r"((_unpack_bf16_8_bf16)[7]) : "memory");
     }
-    int unfinished_2 = last - num_bids;
-    if (unfinished_2 >= 0) {
-        int owner_3 = unfinished_2 % 8;
-        int vector_index_0_5 = unfinished_2 * 160 + tid;
-        long long owner_offset_6 = data_base + ((long long)owner_3 * (long long)total_vectors + (long long)vector_index_0_5) * 16;
+    int unfinished_3 = last - num_bids;
+    if (unfinished_3 >= 0) {
+        long long offset_13 = data_base + ((long long)(8 * slots + unfinished_3) * 160 + (long long)tid) * 16;
         uint32_t _sysv_poll256_group_6[8];
         do {
-            asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_6[0]), "=r"(_sysv_poll256_group_6[1]), "=r"(_sysv_poll256_group_6[2]), "=r"(_sysv_poll256_group_6[3]), "=r"(_sysv_poll256_group_6[4]), "=r"(_sysv_poll256_group_6[5]), "=r"(_sysv_poll256_group_6[6]), "=r"(_sysv_poll256_group_6[7]) : "l"(local_payload + owner_offset_6) : "memory");
+            asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_6[0]), "=r"(_sysv_poll256_group_6[1]), "=r"(_sysv_poll256_group_6[2]), "=r"(_sysv_poll256_group_6[3]), "=r"(_sysv_poll256_group_6[4]), "=r"(_sysv_poll256_group_6[5]), "=r"(_sysv_poll256_group_6[6]), "=r"(_sysv_poll256_group_6[7]) : "l"(local_payload + offset_13) : "memory");
         } while (
             (((_sysv_poll256_group_6[0] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_6[0] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_6[1] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_6[1] >> 16) & 0xffffu) == 0x8000u) ||
             (((_sysv_poll256_group_6[2] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_6[2] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_6[3] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_6[3] >> 16) & 0xffffu) == 0x8000u) ||
             (((_sysv_poll256_group_6[4] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_6[4] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_6[5] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_6[5] >> 16) & 0xffffu) == 0x8000u) ||
             (((_sysv_poll256_group_6[6] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_6[6] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_6[7] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_6[7] >> 16) & 0xffffu) == 0x8000u)
         );
-        float _sysv_poll256_group_6_f32[16];
+        float _unpack_bf16_9[16];
         #pragma unroll
         for (int _pair = 0; _pair < 8; _pair++) {
-            asm volatile(
-                "{\n\t"
-                "shl.b32 %0, %2, 16;\n\t"
-                "and.b32 %1, %2, 0xffff0000;\n\t"
-                "}\n"
-                : "=f"((&_sysv_poll256_group_6_f32[_pair * 2])[0]), "=f"((&_sysv_poll256_group_6_f32[_pair * 2])[1])
-                : "r"(_sysv_poll256_group_6[_pair]));
+            (&_unpack_bf16_9[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_6[_pair]) << 16);
+            (&_unpack_bf16_9[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_6[_pair]) & 0xffff0000u);
         }
-        uint32_t _sysv_poll256_group_6_f32_bf16[8];
+        unsigned int _unpack_bf16_9_bf16[8];
         #pragma unroll
         for (int _lp = 0; _lp < 8; _lp++) {
-            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_sysv_poll256_group_6_f32[_lp*2 + 0], _sysv_poll256_group_6_f32[_lp*2+1 + 0]));
-            _sysv_poll256_group_6_f32_bf16[_lp] = *(uint32_t*)&_bf2;
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_unpack_bf16_9[_lp*2 + 0], _unpack_bf16_9[_lp*2+1 + 0]));
+            _unpack_bf16_9_bf16[_lp] = *(uint32_t*)&_bf2;
         }
-        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(collective_out + ((long long)vector_index_0_5 * 16)), "r"((_sysv_poll256_group_6_f32_bf16)[0]), "r"((_sysv_poll256_group_6_f32_bf16)[1]), "r"((_sysv_poll256_group_6_f32_bf16)[2]), "r"((_sysv_poll256_group_6_f32_bf16)[3]), "r"((_sysv_poll256_group_6_f32_bf16)[4]), "r"((_sysv_poll256_group_6_f32_bf16)[5]), "r"((_sysv_poll256_group_6_f32_bf16)[6]), "r"((_sysv_poll256_group_6_f32_bf16)[7]) : "memory");
+        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(collective_out + (((long long)unfinished_3 * 160 + (long long)tid) * 16)), "r"((_unpack_bf16_9_bf16)[0]), "r"((_unpack_bf16_9_bf16)[1]), "r"((_unpack_bf16_9_bf16)[2]), "r"((_unpack_bf16_9_bf16)[3]), "r"((_unpack_bf16_9_bf16)[4]), "r"((_unpack_bf16_9_bf16)[5]), "r"((_unpack_bf16_9_bf16)[6]), "r"((_unpack_bf16_9_bf16)[7]) : "memory");
     }
-    int unfinished_3 = last;
-    if (unfinished_3 >= 0) {
-        int owner_4 = unfinished_3 % 8;
-        int vector_index_0_6 = unfinished_3 * 160 + tid;
-        long long owner_offset_7 = data_base + ((long long)owner_4 * (long long)total_vectors + (long long)vector_index_0_6) * 16;
+    int unfinished_4 = last;
+    if (unfinished_4 >= 0) {
+        long long offset_14 = data_base + ((long long)(8 * slots + unfinished_4) * 160 + (long long)tid) * 16;
         uint32_t _sysv_poll256_group_7[8];
         do {
-            asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_7[0]), "=r"(_sysv_poll256_group_7[1]), "=r"(_sysv_poll256_group_7[2]), "=r"(_sysv_poll256_group_7[3]), "=r"(_sysv_poll256_group_7[4]), "=r"(_sysv_poll256_group_7[5]), "=r"(_sysv_poll256_group_7[6]), "=r"(_sysv_poll256_group_7[7]) : "l"(local_payload + owner_offset_7) : "memory");
+            asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_7[0]), "=r"(_sysv_poll256_group_7[1]), "=r"(_sysv_poll256_group_7[2]), "=r"(_sysv_poll256_group_7[3]), "=r"(_sysv_poll256_group_7[4]), "=r"(_sysv_poll256_group_7[5]), "=r"(_sysv_poll256_group_7[6]), "=r"(_sysv_poll256_group_7[7]) : "l"(local_payload + offset_14) : "memory");
         } while (
             (((_sysv_poll256_group_7[0] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_7[0] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_7[1] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_7[1] >> 16) & 0xffffu) == 0x8000u) ||
             (((_sysv_poll256_group_7[2] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_7[2] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_7[3] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_7[3] >> 16) & 0xffffu) == 0x8000u) ||
             (((_sysv_poll256_group_7[4] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_7[4] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_7[5] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_7[5] >> 16) & 0xffffu) == 0x8000u) ||
             (((_sysv_poll256_group_7[6] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_7[6] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_7[7] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_7[7] >> 16) & 0xffffu) == 0x8000u)
         );
-        float _sysv_poll256_group_7_f32[16];
+        float _unpack_bf16_10[16];
         #pragma unroll
         for (int _pair = 0; _pair < 8; _pair++) {
-            asm volatile(
-                "{\n\t"
-                "shl.b32 %0, %2, 16;\n\t"
-                "and.b32 %1, %2, 0xffff0000;\n\t"
-                "}\n"
-                : "=f"((&_sysv_poll256_group_7_f32[_pair * 2])[0]), "=f"((&_sysv_poll256_group_7_f32[_pair * 2])[1])
-                : "r"(_sysv_poll256_group_7[_pair]));
+            (&_unpack_bf16_10[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_7[_pair]) << 16);
+            (&_unpack_bf16_10[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_7[_pair]) & 0xffff0000u);
         }
-        uint32_t _sysv_poll256_group_7_f32_bf16[8];
+        unsigned int _unpack_bf16_10_bf16[8];
         #pragma unroll
         for (int _lp = 0; _lp < 8; _lp++) {
-            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_sysv_poll256_group_7_f32[_lp*2 + 0], _sysv_poll256_group_7_f32[_lp*2+1 + 0]));
-            _sysv_poll256_group_7_f32_bf16[_lp] = *(uint32_t*)&_bf2;
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_unpack_bf16_10[_lp*2 + 0], _unpack_bf16_10[_lp*2+1 + 0]));
+            _unpack_bf16_10_bf16[_lp] = *(uint32_t*)&_bf2;
         }
-        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(collective_out + ((long long)vector_index_0_6 * 16)), "r"((_sysv_poll256_group_7_f32_bf16)[0]), "r"((_sysv_poll256_group_7_f32_bf16)[1]), "r"((_sysv_poll256_group_7_f32_bf16)[2]), "r"((_sysv_poll256_group_7_f32_bf16)[3]), "r"((_sysv_poll256_group_7_f32_bf16)[4]), "r"((_sysv_poll256_group_7_f32_bf16)[5]), "r"((_sysv_poll256_group_7_f32_bf16)[6]), "r"((_sysv_poll256_group_7_f32_bf16)[7]) : "memory");
+        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(collective_out + (((long long)unfinished_4 * 160 + (long long)tid) * 16)), "r"((_unpack_bf16_10_bf16)[0]), "r"((_unpack_bf16_10_bf16)[1]), "r"((_unpack_bf16_10_bf16)[2]), "r"((_unpack_bf16_10_bf16)[3]), "r"((_unpack_bf16_10_bf16)[4]), "r"((_unpack_bf16_10_bf16)[5]), "r"((_unpack_bf16_10_bf16)[6]), "r"((_unpack_bf16_10_bf16)[7]) : "memory");
     }
     if (bid == 0) {
         if (tid == 0) {
+            int clear_bytes = (8 * slots + tokens) * 5120;
             {
-                volatile int* _lcv_p_4 = reinterpret_cast<volatile int*>(completion) + (0);
-                while (*_lcv_p_4 != static_cast<int>(num_bids)) {}
-                *reinterpret_cast<int*>(control + 2) = static_cast<int>((rotation + 1) % 3);
-                *reinterpret_cast<int*>(control + 4) = static_cast<int>(tokens * 2560 * 8 * 2);
-                *(reinterpret_cast<int*>(completion) + (0)) = 0;
+                volatile int* _sysv_wait_p_3 = reinterpret_cast<volatile int*>(reinterpret_cast<unsigned int*>(control_0)) + (0);
+                while (*_sysv_wait_p_3 != static_cast<int>(num_bids)) {}
             }
+            control_0[2] = (control_current_word + 1) % 3;
+            control_0[4] = clear_bytes;
+            reinterpret_cast<unsigned int*>(control_0)[0] = 0;
         }
     }
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
