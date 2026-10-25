@@ -208,6 +208,39 @@ _ROUND_5_ROWS: dict[tuple[str, int, int, int], tuple[str, str, int]] = {
 }
 
 
+# Round 6: the POLICY_ROWS cells the convergence-screen tables move (``R2_PERSISTENT_KEY_CELLS``):
+# sm_100a (4096, 4) takes the held nc3 depth-3 K = 4 program; sm_103a (1024, 4) the held packed-add
+# program at 148 SMs and the early packed-add fast-math program at 152 SMs; sm_103a (4096, 5) at 148
+# SMs the held relaxed-producer-wait program; sm_103a (512, 4) at 152 SMs the early depth-3 program.
+_ROUND_6_ROWS: dict[tuple[str, int, int, int], tuple[str, str, int]] = {
+    ("sm_100a", 4096, 4, 148): (
+        "persistent",
+        "trtllm_persistent_ws288_nc3_d3_vec128_fp32x2",
+        148,
+    ),
+    ("sm_103a", 1024, 4, 148): (
+        "persistent",
+        "trtllm_persistent_ws288_nc3_d3_vec128_fp32x2_prefix_bf16_add_packed_inputs_prefix_shared_addr",
+        148,
+    ),
+    ("sm_103a", 1024, 4, 152): (
+        "persistent",
+        "trtllm_persistent_ws288_nc3_d3_vec128_fp32x2_early_consume_prefix_bf16_add_packed_inputs_prefix_shared_addr",
+        152,
+    ),
+    ("sm_103a", 4096, 5, 148): (
+        "persistent",
+        "trtllm_persistent_ws288_nc4_d3_vec128_fp32x2_relaxed_producer_wait",
+        148,
+    ),
+    ("sm_103a", 512, 4, 152): (
+        "persistent",
+        "trtllm_persistent_ws288_nc3_d3_vec128_fp32x2_early_consume",
+        128,
+    ),
+}
+
+
 def _expected_at(sm_count: int, grid_x, schedule_id: str) -> tuple[int, str]:
     """The (grid, schedule id) a POLICY_ROWS cell takes on ``sm_count`` SMs: the native ports and the
     SM-count-multiple grids scale with the count (148 -> sm_count, 444 -> 3 x sm_count); the token-bound,
@@ -223,7 +256,7 @@ def _expected_at(sm_count: int, grid_x, schedule_id: str) -> tuple[int, str]:
 @pytest.mark.parametrize("arch,M,K,pdl,kind,schedule_id,grid_x", POLICY_ROWS)
 def test_plan_route_policy(arch, M, K, pdl, kind, schedule_id, grid_x, sm_count):
     grid_x, schedule_id = _expected_at(sm_count, grid_x, schedule_id)
-    kind, schedule_id, grid_x = (_ROUND_2_ROWS | _ROUND_5_ROWS).get(
+    kind, schedule_id, grid_x = (_ROUND_2_ROWS | _ROUND_5_ROWS | _ROUND_6_ROWS).get(
         (arch, M, K, sm_count), (kind, schedule_id, grid_x)
     )
     plan = plan_route(arch, sm_count, M, K, pdl)
@@ -232,7 +265,11 @@ def test_plan_route_policy(arch, M, K, pdl, kind, schedule_id, grid_x, sm_count)
     # ``_fastmath``, kernel key ``_fm``); the rows pin the program apart from that axis.
     assert plan.schedule_id.removesuffix("_fastmath") == schedule_id
     assert plan.schedule_id.endswith("_fastmath") is ("_fm" in plan.kernel_key)
-    if kind in ("small_m", "persistent"):
+    # A round-6 exact cell carries its fast-math axis in its table key, not in the fast-math bands.
+    if (
+        kind in ("small_m", "persistent")
+        and (arch, M, K, sm_count) not in _ROUND_6_ROWS
+    ):
         assert plan.schedule_id.endswith("_fastmath") is cb._fast_math(
             arch, M, K, kind, sm_count
         )
@@ -261,12 +298,13 @@ def test_plan_route_policy(arch, M, K, pdl, kind, schedule_id, grid_x, sm_count)
         (4096, 2, True),
         (4097, 2, False),
         (6144, 2, False),
-        # K4: the nc5 band M513..1023 + the pow2 cells {512, 1024, 2048, 4096}; held at 1025..2047 and above 4096.
+        # K4: the nc5 band M513..1023 + the pow2 cells {512, 2048, 4096}; held at 1024..2047 and above 4096.
         (512, 4, True),
         (513, 4, True),
         (768, 4, True),
         (1023, 4, True),
-        (1024, 4, True),
+        # round 6: the held packed-add depth-3 program at 148 SMs
+        (1024, 4, False),
         (1025, 4, False),
         (1536, 4, False),
         (2048, 4, True),
@@ -326,7 +364,9 @@ def test_round_2_cells_take_their_table_program():
             flags = cb._PERSISTENT_KEY.match(key).group(4)
             if flags[cb._PERSISTENT_FLAG_REGISTER_CARRY_ONLY] == "1":
                 assert flags[cb._PERSISTENT_FLAG_PREFIX_BF16_ADD] == "1"
-                assert plan.schedule_id.split("_fastmath")[0].endswith(
+                # the fence-free twin (_crfnone) appends _authored_fences
+                schedule = plan.schedule_id.split("_fastmath")[0]
+                assert schedule.removesuffix("_authored_fences").endswith(
                     "_register_carry_only"
                 )
             seen += 1
@@ -360,11 +400,28 @@ def test_round_2_cells_take_their_table_program():
             )
             assert 1 <= plan.grid_x <= max(M, sm_count)
             dense = plan_route(arch, sm_count, M, K, pdl)
-            assert dense.kind == "persistent" and dense.kernel_key != key, (dense, key)
+            # Round 6: the (256, 7) write cells of sm_100a and of sm_103a at 148 SMs run the
+            # snapshot-write variant of the program their dense cell runs.
+            on_dense = (arch, sm_count, M, K) in {
+                ("sm_100a", 148, 256, 7),
+                ("sm_103a", 148, 256, 7),
+            }
+            assert (dense.kernel_key == key) is on_dense, (dense, key)
             seen += 1
+    # Round 6 adds the (256, 4), (256, 7), (1024, 1) and (1024, 7) write cells (sm_100a: (256, 7),
+    # (1024, 1) and (1024, 7); sm_103a: (256, 4), (256, 7) and (1024, 7)).
     assert list(_r2_cells("WRITE_PERSISTENT_KEY_CELLS")) == [
+        ("sm_100a", 148, 256, 7, "persistent:k7_nc4_d2_f111000000000000_fm"),
+        ("sm_100a", 148, 1024, 1, "persistent:k1_nc2_d3_f110000000000000_fm"),
+        ("sm_100a", 148, 1024, 7, "persistent:k7_nc4_d2_f111000000000000_fm"),
         ("sm_100a", 148, 4096, 4, "persistent:k4_nc3_d2_f111000000000000"),
+        ("sm_103a", 148, 256, 4, "persistent:k4_nc3_d2_f111000000000000_fm"),
+        ("sm_103a", 148, 256, 7, "persistent:k7_nc4_d2_f111000000000000_fm"),
+        ("sm_103a", 148, 1024, 7, "persistent:k7_nc4_d2_f111000000000000_fm"),
         ("sm_103a", 148, 4096, 4, "persistent:k4_nc3_d2_f111000000000000"),
+        ("sm_103a", 152, 256, 4, "persistent:k4_nc3_d2_f111000000000000_fm"),
+        ("sm_103a", 152, 256, 7, "persistent:k7_nc4_d2_f110000000000000_fm"),
+        ("sm_103a", 152, 1024, 7, "persistent:k7_nc4_d2_f111000000000000_fm"),
         ("sm_103a", 152, 4096, 4, "persistent:k4_nc3_d2_f111000000000000"),
     ]
     for arch, sm_count, M, K, key in _r2_cells("R2_PAIR_CELLS"):
@@ -421,23 +478,25 @@ def test_round_2_cells_take_their_table_program():
             "persistent:k1_nc4_d2_f110000000000000",
         )
     # Cells round 2 left alone keep the legacy program: the GB300 K6 M3 small-M cell, the B300 K6 M192
-    # (pair) cell, the record-only K2 M8192 (152) / M4096 (148) cells.
+    # (pair) cell. Round 6 moved the record-only K2 M8192 (152) / M4096 (148) cells to the K2
+    # register-carry programs without the consumed-release fence.
     assert (
         plan_route("sm_103a", 152, 3, 6, False).kernel_key == "small_m_cluster2:k6_fm"
     )
     assert plan_route("sm_103a", 148, 192, 6, False).kind == "persistent"
     assert (
         plan_route("sm_103a", 152, 8192, 2, False).kernel_key
-        == "persistent:k2_nc4_d2_f011000000000000"
+        == "persistent:k2_nc3_d2_f011010000000000_crfnone"
     )
     assert (
         plan_route("sm_103a", 148, 4096, 2, False).kernel_key
-        == "persistent:k2_nc4_d2_f110000000000000"
+        == "persistent:k2_nc3_d2_f111010000000000_crfnone"
     )
     # Round 3: the sm_103a K5 cells M = 192 / 256 / 768 and the sm_100a K5 cells M = 192 / 256 / 384 /
     # 768 / 1024 / 1536 / 2048 run the native K5 port (one CTA per SM, one two-architecture program)
     # at the qualified SM counts and both PDL modes; M = 384 on sm_103a keeps its round-2 persistent
-    # key and M = 512 on sm_100a its legacy one.
+    # key at 152 SMs (round 6 gives 148 SMs an nc3 fast-math program) and M = 512 on sm_100a runs the
+    # round-6 early-release program.
     for sm_count in SM_COUNTS:
         for M in (192, 256, 768):
             for pdl in (False, True):
@@ -454,9 +513,10 @@ def test_round_2_cells_take_their_table_program():
                     None,
                 ), (sm_count, M, pdl, plan)
                 assert plan.schedule_id == f"native_k5_nc3_d2_ws288_grid{sm_count}"
-        assert (
-            plan_route("sm_103a", sm_count, 384, 5, False).kernel_key
-            == "persistent:k5_nc4_d2_f111000000000000"
+        assert plan_route("sm_103a", sm_count, 384, 5, False).kernel_key == (
+            "persistent:k5_nc3_d2_f111000000000000_fm"
+            if sm_count == 148
+            else "persistent:k5_nc4_d2_f111000000000000"
         )
     for M in (192, 256, 384, 768, 1024, 1536, 2048):
         for pdl in (False, True):
@@ -470,37 +530,42 @@ def test_round_2_cells_take_their_table_program():
             assert plan.schedule_id == "native_k5_nc3_d2_ws288_grid148"
     assert (
         plan_route("sm_100a", 148, 512, 5, False).kernel_key
-        == "persistent:k5_nc4_d2_f110000000000000"
+        == "persistent:k5_nc4_d2_f111000000000000"
     )
-    # Round 3: twelve sm_100a K2 / K3 cells run the fence-authored twins of their early-release
-    # persistent programs: the key of the fenced program plus ``_crfnone`` (a registered program of
-    # its own, never a fallback across that suffix), the schedule label plus ``_authored_fences``,
-    # the same grid; K3 M = 1024 / 1536 and the band interiors keep the fenced programs, and no
-    # ``_crfnone`` key exists on sm_103a.
-    for M, K in (
-        (2048, 3),
-        (3072, 3),
-        (6144, 3),
-        (8192, 3),
-        (12288, 3),
-        (16384, 3),
-        (3072, 2),
-        (4096, 2),
-        (6144, 2),
-        (8192, 2),
-        (12288, 2),
-        (16384, 2),
-    ):
-        fenced = f"persistent:k{K}_nc4_d2_f110000000000000"
-        fenced_label = cb._persistent_schedule_id(4, 2, "110000000000000")
+    # Round 3: twelve sm_100a K2 / K3 cells run the fence-authored twins of their persistent
+    # programs: the key of the fenced program plus ``_crfnone`` (a registered program of its own,
+    # never a fallback across that suffix), the schedule label plus ``_authored_fences``, the same
+    # grid; K3 M = 1536 and the band interiors keep the fenced programs.  Round 6 moved the K3 cells
+    # from M = 3072 up to the held-release twin and the K3 M2048 / K2 M12288 / M16384 cells to the
+    # bf16-prefix-add twin, and gives sm_103a its own nc3 K2 ``_crfnone`` programs on four large-M
+    # cells (below); every other large-M sm_103a K2 / K3 cell keeps a fenced program, and the
+    # sm_100a nc4 twins stay sm_100a only.
+    sm100_fence_free = {
+        (2048, 3): "011000000000000",
+        (3072, 3): "010000000000000",
+        (6144, 3): "010000000000000",
+        (8192, 3): "010000000000000",
+        (12288, 3): "010000000000000",
+        (16384, 3): "010000000000000",
+        (3072, 2): "110000000000000",
+        (4096, 2): "110000000000000",
+        (6144, 2): "110000000000000",
+        (8192, 2): "110000000000000",
+        (12288, 2): "011000000000000",
+        (16384, 2): "011000000000000",
+    }
+    for (M, K), flags in sm100_fence_free.items():
         for pdl in (False, True):
             plan = plan_route("sm_100a", 148, M, K, pdl)
             assert (plan.kind, plan.kernel_key, plan.fallback_from) == (
                 "persistent",
-                fenced + "_crfnone",
+                f"persistent:k{K}_nc4_d2_f{flags}_crfnone",
                 None,
             ), (M, K, pdl, plan)
-            assert plan.schedule_id == fenced_label + "_authored_fences"
+            assert (
+                plan.schedule_id
+                == cb._persistent_schedule_id(4, 2, flags) + "_authored_fences"
+            )
             assert (plan.grid_x, plan.threads) == (
                 cb._grid(M, 148, 4)[0],
                 cb.PERSISTENT_THREADS,
@@ -516,25 +581,52 @@ def test_round_2_cells_take_their_table_program():
             )
             assert not plan.kernel_key.endswith("_crfnone"), (M, K, pdl, plan)
             assert not plan.schedule_id.endswith("_authored_fences")
-    for pdl in (False, True):
-        assert (
-            plan_route("sm_100a", 148, 1024, 3, pdl).kernel_key
-            == "persistent:k3_nc4_d2_f110000000000000"
-        )
+    round_6 = {
+        (148, 4096, 2): "persistent:k2_nc3_d2_f111010000000000_crfnone",
+        (148, 16384, 2): "persistent:k2_nc3_d2_f011010000000000_crfnone",
+        (152, 8192, 2): "persistent:k2_nc3_d2_f011010000000000_crfnone",
+        (152, 12288, 2): "persistent:k2_nc3_d2_f011010000000000_crfnone",
+    }
     for sm_count in SM_COUNTS:
         for M in (2048, 3072, 4096, 6144, 8192, 12288, 16384):
             for K in (2, 3):
-                assert not plan_route(
-                    "sm_103a", sm_count, M, K, False
-                ).kernel_key.endswith("_crfnone")
+                key = plan_route("sm_103a", sm_count, M, K, False).kernel_key
+                if (sm_count, M, K) in round_6:
+                    assert key == round_6[sm_count, M, K], (sm_count, M, K, key)
+                else:
+                    assert not key.endswith("_crfnone"), (sm_count, M, K, key)
+    # The sm_100a (384, 3) / (1024, 3) cells at 148 SMs run programs built for two CTAs per SM
+    # (``_cta2``): a one-deep chunk ring with the early consumed release, launched on min(M, 2 x SMs)
+    # CTAs.
+    for M, key in (
+        (384, "persistent:k3_nc4_d1_f111000000000000_fm_cta2"),
+        (1024, "persistent:k3_nc4_d1_f110000000000000_cta2"),
+    ):
+        for pdl in (False, True):
+            plan = plan_route("sm_100a", 148, M, 3, pdl)
+            assert (plan.kind, plan.kernel_key, plan.grid_x) == (
+                "persistent",
+                key,
+                296,
+            ), (M, pdl, plan)
+            assert plan.schedule_id.endswith(
+                "_fastmath_two_ctas_per_sm"
+                if key.endswith("_fm_cta2")
+                else "_two_ctas_per_sm"
+            )
+            assert plan.route_id.endswith(".two_ctas_per_sm")
     if MODULES:
         assert KERNELS["sm_100a"]["native_k5"] == KERNELS["sm_103a"]["native_k5"]
         assert MODULES[KERNELS["sm_103a"]["native_k5"]]["arches"] == [
             "sm_100a",
             "sm_103a",
         ]
-        for K in (2, 3):
-            key = f"persistent:k{K}_nc4_d2_f110000000000000_crfnone"
+        for key in sorted(
+            {
+                f"persistent:k{K}_nc4_d2_f{flags}_crfnone"
+                for (_, K), flags in sm100_fence_free.items()
+            }
+        ):
             assert key in KERNELS["sm_100a"] and key not in KERNELS["sm_103a"]
             assert MODULES[KERNELS["sm_100a"][key]]["arches"] == ["sm_100a"]
             assert MODULES[KERNELS["sm_100a"][key]]["schedule_id"].endswith(
@@ -892,9 +984,10 @@ def test_registry_records_reference_the_build_manifest():
             "pair",
         )
         assert record["ffi_entry"] == "run" and record["launch"]["use_pdl"] == "runtime"
-        fast_math = record["kernel_key"].endswith(("_fm", "_fm_write")) or record[
-            "kind"
-        ] in ("native", "pair")
+        fast_math = bool(
+            re.search(r"_fm(_crfnone)?(_write)?(_cta2)?$", record["kernel_key"])
+        )
+        fast_math = fast_math or record["kind"] in ("native", "pair")
         for arch in record["arches"]:
             library = cake_jit.library_name(name, arch)
             referenced.add(library)
@@ -993,35 +1086,46 @@ def test_every_common_path_route_resolves_to_a_registered_program(arch, sm_count
 # First token count of every dense route band: the M at which ``plan_route`` changes its kernel
 # key on some architecture, SM count in SM_COUNTS or PDL setting, per K.  The bands follow the
 # route tables (the small-M table and its cluster / chunk / fast-math bands, the round-r5 cells,
-# the round-2 / round-3 cells, the release bands, the nc / depth edges, the native and pair cells) and, for
-# K8 on sm_100a, the SM count itself (the release flips at M = SMs + 1).
+# the round-2 / round-3 / round-6 cells, the release bands, the nc / depth edges, the native and
+# pair cells) and, for K8 on sm_100a, the SM count itself (the release flips at M = SMs + 1).
 # ``test_gpu_rows_are_the_route_band_starts`` recomputes the set from the tables.
 # fmt: off
 _ROUTE_BAND_START_ROWS = {
-    0: (1, 6, 8, 9, 16, 17, 32, 33, 257, 513),
+    0: (1, 6, 8, 9, 16, 17, 32, 33, 192, 193, 257, 513),
     1: (
-        1, 513, 768, 1024, 1025, 1536, 1537, 2048, 2049, 3072, 3073, 4096, 4097, 6144, 6145, 8192,
-        8193, 12288, 12289, 16384,
+        1, 513, 768, 769, 1024, 1025, 1536, 1537, 2048, 2049, 3072, 3073, 4096, 4097, 6144, 6145,
+        8192, 8193, 12288, 12289, 16384,
     ),
     2: (
         1, 192, 193, 257, 384, 385, 512, 513, 768, 769, 1024, 1025, 1536, 1537, 2048, 2049, 3072,
         3073, 4096, 4097, 6144, 6145, 8192, 8193, 12288, 12289, 16384,
     ),
     3: (
-        1, 9, 12, 13, 16, 17, 24, 25, 32, 33, 48, 49, 64, 65, 96, 97, 128, 129, 256, 257, 385, 769,
-        2048, 2049, 3072, 3073, 4096, 4097, 6144, 6145, 8192, 8193, 12288, 12289, 16384,
+        1, 9, 12, 13, 16, 17, 24, 25, 32, 33, 48, 49, 64, 65, 96, 97, 128, 129, 192, 193, 256, 257,
+        384, 385, 512, 513, 768, 769, 1024, 1025, 2048, 2049, 3072, 3073, 4096, 4097, 6144, 6145,
+        8192, 8193, 12288, 12289, 16384,
     ),
     4: (
-        1, 5, 17, 129, 192, 193, 256, 257, 384, 385, 512, 513, 1024, 1025, 1537, 2048, 2049, 4096,
-        4097,
+        1, 5, 17, 129, 192, 193, 256, 257, 384, 385, 512, 513, 768, 769, 1024, 1025, 1536, 1537,
+        2048, 2049, 3072, 3073, 4096, 4097, 6144, 6145,
     ),
     5: (
         1, 5, 9, 12, 13, 16, 17, 33, 129, 192, 193, 256, 257, 384, 385, 512, 513, 768, 769, 1024,
-        1025, 1536, 1537, 2048, 2049, 3072, 3073, 4096, 4097, 6144, 6145, 8192, 8193,
+        1025, 1536, 1537, 2048, 2049, 3072, 3073, 4096, 4097, 6144, 6145, 8192, 8193, 12288, 12289,
+        16384,
     ),
-    6: (1, 2, 5, 17, 33, 129, 192, 193, 384, 513),
-    7: (1, 5, 17, 33, 65, 129, 192, 193, 256, 257, 385, 513, 768, 769),
-    8: (1, 3, 6, 7, 17, 65, 149, 153, 192, 193, 256, 257, 384, 385, 512, 769, 1536, 1537),
+    6: (
+        1, 2, 5, 17, 33, 129, 192, 193, 256, 257, 384, 385, 512, 513, 768, 769, 1024, 1025, 1536,
+        1537, 2048, 2049, 3072, 3073, 4096, 4097,
+    ),
+    7: (
+        1, 5, 17, 33, 65, 129, 192, 193, 256, 257, 385, 512, 513, 768, 769, 1024, 1025, 1536, 1537,
+        2048, 2049, 3072, 3073, 4096, 4097, 6144, 6145, 12288, 12289,
+    ),
+    8: (
+        1, 3, 6, 7, 17, 65, 149, 153, 192, 193, 256, 257, 384, 385, 512, 513, 768, 769, 1024, 1025,
+        1536, 1537, 2048, 2049, 3072, 3073,
+    ),
 }
 # fmt: on
 
