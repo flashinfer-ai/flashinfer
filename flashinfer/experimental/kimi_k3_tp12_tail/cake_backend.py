@@ -45,16 +45,20 @@ limitations under the License.
 #   all-gather, one CTA per ``K23_ROWS`` output columns; the four-token program
 #   for ``M <= 4``, the eight-token program for ``5 <= M <= 8``; the rank's
 #   column width only sizes the grid) for ``M <= 8``;
-#   ``k3_ess:grouped`` (one CTA per token and column half) for ``8 < M < 256``; the persistent
+#   ``k3_ess:grouped`` (one CTA per token and column half) for
+#   ``8 < M < K3_PERSIST_MIN_TOKENS`` (961); from there on the persistent
 #   token pipeline (``min(M, SM count)`` CTAs per column half, own scatter of
-#   ``shared_partial``) as ``k3_persist:grouped`` at 256 tokens and as
-#   ``k3_persist_bulk:pinned`` (``cp.async.bulk`` reduce-scatter pushes) above.
+#   ``shared_partial``) with ``cp.async.bulk`` reduce-scatter pushes,
+#   ``k3_persist_bulk:pinned``.
 #
 # Rows ``M <= 4`` and ``M > 8`` are bitwise identical to the round-4 / round-5
-# routes (K23 keeps the numerics of the round-4 K2-stream + fp32-add K3 pair);
+# routes (K23 keeps the numerics of the round-4 K2-stream + fp32-add K3 pair;
+# the ESS and the persistent tails reduce in the same order);
 # ``5 <= M <= 8`` (round 6) round once instead of twice -- a strict error
-# reduction against the fp64 reference.  The thresholds are pinned by the
-# round-5 / round-6 paired A/Bs on GB200 and GB300 NVL72.
+# reduction against the fp64 reference.  The one-shot / K23 thresholds are
+# pinned by the round-5 / round-6 paired A/Bs on GB200 and GB300 NVL72, the
+# ESS / persistent boundary by a paired A/B of the two tail routes at 640 to
+# 1056 tokens on both.
 #
 # The three Lamport workspaces are FlashInfer's own MNNVL all-reduce
 # workspaces (``MNNVLAllReduceFusionWorkspace``: three rotating symmetric
@@ -89,8 +93,8 @@ ELEMENT_BYTES = 2  # BF16 payload elements
 PARTITION = (640,) * 8 + (512,) * 4
 #: One-shot K1 up to this many tokens, two-shot above.
 ONESHOT_MAX_TOKENS = 16
-#: Grouped owner poll-reduce loads up to this many tokens, pinned above.
-GROUPED_MAX_TOKENS = 256
+#: Grouped owner poll-reduce loads up to this many tokens (the ESS range), pinned above.
+GROUPED_MAX_TOKENS = 960
 #: One 16-byte packet per thread covers one 3584-wide row (K1) or one 3584-wide half row (K3).
 THREADS = 448
 K3_GRID_Y = 2
@@ -110,12 +114,15 @@ K23_ROWS = 8
 #: The tail runs the persistent token pipeline (``k3_persist*:*``, grid ``(min(M, SM count), 2, 1)``: CTA ``b`` walks
 #: tokens ``b, b + P, ...`` scattering token ``t_k`` while reducing ``t_{k-1}`` and gathering ``t_{k-2}``) from this many
 #: tokens on; below it an early-shared-scatter K1 (``k1_*_ess``) scatters ``shared_partial`` and the one-CTA-per-token
-#: K3-ESS form (``k3_ess:grouped``, grid ``(M, 2, 1)``) reduces, adds and gathers.
-K3_PERSIST_MIN_TOKENS = 256
+#: K3-ESS form (``k3_ess:grouped``, grid ``(M, 2, 1)``) reduces, adds and gathers.  In a paired A/B on GB200 and GB300
+#: NVL72 the ESS route is 1.6-7.2 us faster than the persistent one from 640 through 960 tokens and ties or loses from
+#: 1023 tokens on.
+K3_PERSIST_MIN_TOKENS = GROUPED_MAX_TOKENS + 1
 #: The persistent tail pushes its reduce-scatter stage with ``cp.async.bulk`` (``k3_persist_bulk:pinned``) from this many
-#: tokens on, i.e. over the whole pinned poll-schedule range; the plain ``k3_persist:grouped`` serves exactly 256 tokens.
-#: Every threshold is pinned by the round-5 paired A/B on GB200 and GB300 NVL72.
-BULK_MIN_TOKENS = GROUPED_MAX_TOKENS + 1
+#: tokens on, i.e. over the whole pinned poll-schedule range.  It equals ``K3_PERSIST_MIN_TOKENS``: the plain persistent
+#: tail ``k3_persist:grouped`` and the plain grouped two-shot K1 ``k1_twoshot:grouped`` stay registered, but no token
+#: count selects them.
+BULK_MIN_TOKENS = K3_PERSIST_MIN_TOKENS
 DEFAULT_MAX_TOKENS = 4096
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 
@@ -166,7 +173,8 @@ def k23_capacity_for(num_tokens: int) -> int:
 def k3_form_for(num_tokens: int) -> str:
     """Tail form for ``num_tokens``: ``"k23"`` (fused up-projection + tail, ``M <= K23_MAX_TOKENS``), ``"ess"`` (one CTA
     per token and column half after an ESS K1, ``M < K3_PERSIST_MIN_TOKENS``), ``"persist"`` (persistent token
-    pipeline, ``M < BULK_MIN_TOKENS``) or ``"persist_bulk"`` (persistent pipeline with ``cp.async.bulk`` pushes)."""
+    pipeline, ``M < BULK_MIN_TOKENS``: an empty range while the two thresholds are equal) or ``"persist_bulk"``
+    (persistent pipeline with ``cp.async.bulk`` pushes)."""
     if num_tokens <= K23_MAX_TOKENS:
         return "k23"
     if num_tokens < K3_PERSIST_MIN_TOKENS:
@@ -397,11 +405,12 @@ class _Launch:
 class KimiK3Tp12TailRunner:
     """The prepared launch sequence of one fused tail call on one rank.
 
-    ``launch()`` submits K1 (the early-shared-scatter form below 256 tokens),
-    cuBLAS for the up-projection slice when ``cublas`` is set
-    (``M > K23_MAX_TOKENS``) and the tail kernel -- the fused K23 for
-    ``M <= K23_MAX_TOKENS``, K3-ESS below ``K3_PERSIST_MIN_TOKENS``, the
-    persistent K3 (plain at 256 tokens, ``cp.async.bulk`` pushes above) -- in
+    ``launch()`` submits K1 (the early-shared-scatter form below
+    ``K3_PERSIST_MIN_TOKENS``), cuBLAS for the up-projection slice when
+    ``cublas`` is set (``M > K23_MAX_TOKENS``) and the tail kernel -- the
+    fused K23 for ``M <= K23_MAX_TOKENS``, K3-ESS below
+    ``K3_PERSIST_MIN_TOKENS``, the persistent K3 with ``cp.async.bulk``
+    pushes from there on -- in
     order on the current torch stream with no CUDA allocation and no host
     synchronisation; the kernels read every operand on device at launch, so
     the runner (or a CUDA Graph capturing it) replays for new values written
@@ -577,7 +586,8 @@ def _k3_launch_kwargs(
             grid=grid,
         )
     else:
-        # persistent K3 (plain at 256 tokens, cp.async.bulk pushes above): scatters shared_partial itself
+        # persistent K3 (cp.async.bulk pushes; the unselected plain form takes the same arguments): scatters
+        # shared_partial itself
         k3_kwargs = dict(
             shared=shared_partial,
             gemm_slice=gemm,
