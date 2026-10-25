@@ -51,6 +51,7 @@ _COMMON_SOURCES: tuple[str, ...] = (
     "cake_warp_decode_2d89b2ccfa19074dd9fb_kernel.cu",
     "cake_warp_decode_345efbf7077827bc328e_kernel.cu",
     "cake_warp_decode_3aa297e8ff45f1333ec9_kernel.cu",
+    "cake_warp_decode_4f408b642a6c28d2940e_kernel.cu",
     "cake_warp_decode_510ad9e9035da24674b6_kernel.cu",
     "cake_warp_decode_514c77f65f72ffd8d0a5_kernel.cu",
     "cake_warp_decode_5312a73885ff3541a6b6_kernel.cu",

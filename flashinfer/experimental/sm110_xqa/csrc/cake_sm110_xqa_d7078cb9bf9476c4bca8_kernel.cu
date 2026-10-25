@@ -37,11 +37,6 @@
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
-#define CAKE_SM110_XQA_NEED_MBARRIER_ARRIVE
-#define CAKE_SM110_XQA_NEED_MUL_F32X2_INPLACE
-#define CAKE_SM110_XQA_NEED_TMA_3D_GMEM2SMEM
-#define CAKE_SM110_XQA_NEED_TCGEN05_COMMIT
-#define CAKE_SM110_XQA_NEED_TCGEN05_COMMIT_LEADER
 #include "cake_sm110_xqa_device_helpers.cuh"
 extern "C" {
 

@@ -22,9 +22,11 @@ The facade is a re-export of ``flashinfer.cake_vsa_sm90_backend``; this module
 checks that identity and the wrapper route end to end (numerics against FA3
 and an FP32 reference, DPS output ABI, graph capture, re-planning, rejected
 options; the Sage FP8 route: ``q_data_type=torch.float8_e4m3fn`` with the three
-scales at ``plan()``, its validation messages, BF16 output, graph replay) and
-leaves the planner, the plan object and the package contract to
-``test_cake_vsa_sm90.py``, which imports only the backend package.
+scales at ``plan()``, its validation messages, BF16 output, graph replay; the
+grouped-query route: ``num_qo_heads = g x num_kv_heads`` with ``g`` in {2, 4, 8}
+on the kv-head-shaped mask and scales, other ratios rejected) and leaves the
+planner, the plan object and the package contract to ``test_cake_vsa_sm90.py``,
+which imports only the backend package.
 """
 
 
@@ -99,6 +101,35 @@ def _inputs(h, mb, nb, seed=7):
     )
 
 
+def _gqa_inputs(h, h_kv, mb, nb, seed=7):
+    """``q`` over the ``h`` query heads, ``k`` / ``v`` over the ``h_kv`` kv heads (``_inputs``' draw at
+    ``h_kv`` heads, so the MHA route on ``k.repeat_interleave(g, 0)`` is the replicated-input baseline)."""
+    q = _inputs(h, mb, nb, seed)[0]
+    _, k, v = _inputs(h_kv, mb, nb, seed)
+    return q, k, v
+
+
+def _gqa_wrapper(mask_kv, num_qo_heads, backend="cake", scale=None, **plan_kwargs):
+    """A wrapper planned on the kv-head-shaped mask for ``num_qo_heads`` query heads."""
+    h_kv, mb, nb = mask_kv.shape
+    workspace_size = 0 if backend == "cake" else 128 * 1024 * 1024
+    wrapper = VariableBlockSparseAttentionWrapper(
+        torch.empty(workspace_size, device="cuda", dtype=torch.uint8), backend=backend
+    )
+    wrapper.plan(
+        mask_kv,
+        torch.full((h_kv, mb), 64, dtype=torch.int32, device=mask_kv.device),
+        torch.full((h_kv, nb), 64, dtype=torch.int32, device=mask_kv.device),
+        num_qo_heads,
+        h_kv,
+        128,
+        sm_scale=scale,
+        non_blocking=False,
+        **({"q_data_type": torch.bfloat16} | plan_kwargs),
+    )
+    return wrapper
+
+
 def _reference(q, k, v, mask, scale):
     """Independent FP32 reference: masked dense softmax attention per head.
 
@@ -130,9 +161,10 @@ _K_GROUP = 16
 def _torch_sage_quantize_hnd(q, k, v):
     """Torch Sage recipe on HND tensors: E4M3 q/k/v and the FP32 scales in the shapes ``plan()`` takes
     (``q_scale (1, H, Sq)`` per token, ``k_scale (1, H, ceil(Sk / 16))`` per 16-token group, ``v_scale (H, 128)``
-    per channel); the SM100 recipe with ``batch := H`` and one head."""
-    h, sq, dim = q.shape
-    sk = k.shape[1]
+    per channel); the SM100 recipe with ``batch := H`` and one head.  ``k`` / ``v`` may carry the kv heads of a
+    GQA problem (every tensor is quantized per its own head)."""
+    _h, sq, dim = q.shape
+    h, sk = k.shape[0], k.shape[1]
     q32, k32, v32 = (t.float() for t in (q, k, v))
     q_scale = q32.abs().amax(dim=-1).clamp_min(1e-12) / _FP8_MAX
     q8 = (q32 / q_scale.unsqueeze(-1)).clamp(-_FP8_MAX, _FP8_MAX).to(FP8)
@@ -155,7 +187,7 @@ def _torch_sage_quantize_hnd(q, k, v):
 
 
 def _dequantize(q8, k8, v8, q_scale, k_scale, v_scale):
-    """FP32 q/k/v the E4M3 tensors and their scales denote (reference (b) of the contract)."""
+    """FP32 q/k/v the E4M3 tensors and their scales denote (the inputs of reference (b))."""
     sk = k8.shape[1]
     k_tok = k_scale[0].repeat_interleave(_K_GROUP, dim=-1)[:, :sk]
     return (
@@ -365,13 +397,16 @@ def test_unsupported_options(kwargs, match):
 
 @requires_hopper
 @pytest.mark.parametrize(
-    "mutation", ["gqa", "head64", "row32", "col63", "dtype", "shape", "empty"]
+    "mutation",
+    ["gqa3", "gqa_nonmultiple", "head64", "row32", "col63", "dtype", "shape", "empty"],
 )
 def test_invalid_sparse_metadata(mutation):
     mask, rows, cols = _descriptors(device="cuda")
     h, kv_h, d = 2, 2, 128
-    if mutation == "gqa":
-        kv_h = 1
+    if mutation == "gqa3":  # three query heads per kv head is not a supported group
+        h = 6
+    elif mutation == "gqa_nonmultiple":
+        h = 3
     elif mutation == "head64":
         d = 64
     elif mutation == "row32":
@@ -389,6 +424,81 @@ def test_invalid_sparse_metadata(mutation):
     )
     with pytest.raises(ValueError):
         wrapper.plan(mask, rows, cols, h, kv_h, d, q_data_type=torch.bfloat16)
+
+
+@requires_hopper
+@pytest.mark.parametrize(
+    "g,h_kv,mb,nb,capacity,scale",
+    [
+        (2, 2, 4, 8, 3, None),  # small route
+        (4, 1, 16, 8, 4, 0.5),  # MQA
+        (8, 1, 4, 4, 1, None),  # MQA, one block per query block
+        (4, 2, 160, 16, 12, -0.125),  # persistent pair plan
+        (2, 3, 33, 64, 64, None),  # full lists, odd kv-head and query-block counts
+    ],
+)
+def test_gqa_head_ratios_run_the_gqa_kernels(g, h_kv, mb, nb, capacity, scale):
+    """``backend="cake"`` accepts ``num_qo_heads = g x num_kv_heads`` for ``g`` in {2, 4, 8} (MQA included)
+    with the kv-head-shaped mask and descriptors: the GQA stage of the MHA route runs, the output (DPS
+    ``[H*M, 1, 128]``, HND return value) matches the FP32 reference and -- bit for bit on the static programs
+    -- the MHA route on replicated inputs; two launches are bit-identical."""
+    h = g * h_kv
+    mask = _random_mask(
+        h_kv, mb, nb, capacity, seed=h_kv * 1000 + mb, ragged=True, device="cuda"
+    )
+    mask_rep = mask.repeat_interleave(g, dim=0)
+    q, k, v = _gqa_inputs(h, h_kv, mb, nb)
+    k_rep, v_rep = k.repeat_interleave(g, dim=0), v.repeat_interleave(g, dim=0)
+    gqa = _gqa_wrapper(mask, h, scale=scale)
+    mha = _wrapper(mask_rep, scale=scale)
+    plan, plan_mha = gqa._cake_vsa_sm90_plan, mha._cake_vsa_sm90_plan
+    assert (plan.gqa, plan.num_qo_heads, plan.num_kv_heads) == (g, h, h_kv)
+    assert backend.stage_gqa(plan.stage) and not backend.stage_gqa(plan_mha.stage)
+    assert plan.mode == plan_mha.mode
+    out = torch.full(
+        (h * mb * 64, 1, 128), float("nan"), device="cuda", dtype=torch.bfloat16
+    )
+    actual = gqa.run(q, k, v, out=out, enable_pdl=False)
+    assert actual.data_ptr() == out.data_ptr() and actual.shape == q.shape
+    assert bool(torch.isfinite(actual).all())
+    expected = mha.run(q, k_rep, v_rep, enable_pdl=False)
+    static = plan.small_kmax is None or not (plan.small_split or plan.small_cluster)
+    if static:
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    else:
+        torch.testing.assert_close(actual, expected, atol=0.01, rtol=0.01)
+    reference = _reference(
+        q, k_rep, v_rep, mask_rep, 128**-0.5 if scale is None else scale
+    )
+    torch.testing.assert_close(actual.float(), reference, atol=0.01, rtol=0.01)
+    assert float((actual.float() - reference).abs().max()) <= 0.03
+    torch.testing.assert_close(gqa.run(q, k, v), actual, atol=0, rtol=0)
+    with pytest.raises(ValueError, match="k must have shape"):
+        gqa.run(q, k_rep, v_rep)
+
+
+@requires_hopper
+@pytest.mark.parametrize(
+    "h,kv_h,match",
+    [
+        (6, 2, r"g in \(2, 4, 8\)"),
+        (10, 2, r"g in \(2, 4, 8\)"),
+        (12, 2, r"g in \(2, 4, 8\)"),
+        (32, 2, r"g in \(2, 4, 8\)"),
+        (5, 2, r"must be a multiple of num_kv_heads"),
+        (3, 2, r"must be a multiple of num_kv_heads"),
+        (4, 1, r"must equal num_kv_heads \(1\)"),  # descriptors given per query head
+    ],
+)
+def test_gqa_unsupported_head_ratios_are_rejected(h, kv_h, match):
+    """Other multiples (3, 5, 6, 16 query heads per kv head), non-multiples and a mask shaped by the query
+    heads are refused by name at ``plan()``."""
+    mask, rows, cols = _descriptors(device="cuda")  # two (kv) heads
+    wrapper = VariableBlockSparseAttentionWrapper(
+        torch.empty(0, device="cuda", dtype=torch.uint8), backend="cake"
+    )
+    with pytest.raises(ValueError, match=match):
+        wrapper.plan(mask, rows, cols, h, kv_h, 128, q_data_type=torch.bfloat16)
 
 
 @requires_hopper
@@ -493,12 +603,23 @@ def test_facade_re_exports_the_backend():
         "split_cluster_variant_for",
         "split_kmax",
         "is_cake_vsa_sm90_supported",
+        "stage_gqa",
+        "GQA_PERSISTENT_STAGES",
+        "GQA_SMALL_STAGES",
+        "FP8_GQA_PERSISTENT_STAGES",
+        "FP8_GQA_SMALL_STAGES",
     ):
         assert getattr(facade, name) is getattr(backend, name), name
     assert facade.ARCHES == backend.ARCHES == ("sm_90a",)
     assert facade.SUPPORTED_COMPUTE_CAPABILITIES == ((9, 0),)
+    assert facade.GQA_GROUPS == backend.GQA_GROUPS == (1, 2, 4, 8)
     assert set(facade.__all__) <= set(dir(backend))
-    assert len(facade.STAGES) == 40  # 19 BF16 + 19 FP8 twins + 2 quantizers
+    # 19 BF16 + 19 FP8 twins + 2 quantizers + 19 + 19 GQA stages + the two round-2 FP8 GQA programs
+    assert len(facade.STAGES) == 80
+    assert len(facade.GQA_PERSISTENT_STAGES) + len(facade.GQA_SMALL_STAGES) == 19
+    assert (
+        len(facade.FP8_GQA_PERSISTENT_STAGES) + len(facade.FP8_GQA_SMALL_STAGES) == 21
+    )
     assert facade.sage_fp8_quantize_sm90 is backend.sage_fp8_quantize_sm90
     assert facade.FP8_DTYPE is torch.float8_e4m3fn and facade.K_SCALE_GROUP == 16
     assert "sage_fp8_quantize_sm90" in facade.__all__
@@ -531,8 +652,8 @@ def test_facade_support_predicate_follows_the_device():
 )
 def test_fp8_route_against_the_dequantized_reference(h, mb, nb, capacity, scale):
     """``q_data_type=torch.float8_e4m3fn`` with the three scales plans the FP8 twin of the route the BF16
-    plan takes; the BF16 output matches the exact softmax of the dequantized E4M3 inputs (reference (b),
-    contract §2: atol = rtol = 5e-2, no element outside) and three launches are bit-identical."""
+    plan takes; the BF16 output matches the exact softmax of the dequantized E4M3 inputs (reference (b):
+    atol = rtol = 5e-2, no element outside) and three launches are bit-identical."""
     mask = _random_mask(h, mb, nb, capacity, seed=5, ragged=True, device="cuda")
     q, k, v = _inputs(h, mb, nb)
     wrapper, (q8, k8, v8), scales = _fp8_plan(mask, q, k, v, scale)
@@ -642,12 +763,17 @@ def test_fp8_requires_the_three_scales_together(given):
         ),
         ("k_strided", r"k_scale must be contiguous on the planned device"),
         ("v_cpu", r"v_scale must be contiguous on the planned device"),
-        ("gqa", r"equal, positive query/KV head counts"),
+        # GQA: k_scale / v_scale are per kv head (query-head-shaped ones are refused by shape); g = 3 refused
+        (
+            "gqa_k_scale_at_query_heads",
+            r"k_scale must have shape \(1, 1, 20\) and dtype float32, got \(1, 2, 20\) float32",
+        ),
+        ("gqa_ratio_3", r"g in \(2, 4, 8\)"),
     ],
 )
 def test_fp8_scale_validation(mutation, match):
-    """Exact shapes ``(1, H, Sq)`` / ``(1, H, ceil(Sk / 16))`` / ``(H, 128)``, FP32, contiguous on the plan
-    device; GQA stays rejected on the FP8 route."""
+    """Exact shapes ``(1, num_qo_heads, Sq)`` / ``(1, num_kv_heads, ceil(Sk / 16))`` / ``(num_kv_heads, 128)``,
+    FP32, contiguous on the plan device; a GQA request is validated against the kv-head-shaped mask and scales."""
     mask, rows, cols = _descriptors(
         device="cuda"
     )  # H = 2, MB = 3, NB = 5 -> Sq 192, Sk 320, 20 groups
@@ -667,8 +793,13 @@ def test_fp8_scale_validation(mutation, match):
         k_scale = torch.ones((1, 2, 40), device="cuda")[..., ::2]
     elif mutation == "v_cpu":
         v_scale = v_scale.cpu()
-    else:
+    elif mutation == "gqa_k_scale_at_query_heads":
+        mask, rows, cols = mask[:1], rows[:1], cols[:1]  # one kv head, two query heads
         kv_h = 1
+        v_scale = v_scale[:1]
+    else:  # gqa_ratio_3: six query heads over two kv heads
+        h = 6
+        q_scale = torch.ones((1, 6, 192), device="cuda")
     wrapper = VariableBlockSparseAttentionWrapper(
         torch.empty(0, device="cuda", dtype=torch.uint8), backend="cake"
     )
@@ -689,7 +820,7 @@ def test_fp8_scale_validation(mutation, match):
 
 @requires_hopper
 def test_fp8_empty_rows_raise_the_bf16_error():
-    """An empty query block is refused with the same ValueError on both data types (ruling R1)."""
+    """An empty query block is refused with the same ValueError on both data types."""
     mask, rows, cols = _descriptors(device="cuda")
     mask[0, 1] = False
     q_scale = torch.ones((1, 2, 192), device="cuda")
@@ -769,7 +900,7 @@ def test_fp8_plan_stream_and_graph_lifetime():
 @requires_hopper
 def test_fp8_and_bf16_plans_share_the_planner_bytes():
     """The FP8 twin consumes exactly the BF16 planner's ``meta`` / ``hdr`` (persistent) or ``plan`` (small)
-    tensors (ruling R5): same route, same bytes, only the stage name and the bound scales differ."""
+    tensors: same route, same bytes, only the stage name and the bound scales differ."""
     for mask in (
         _random_mask(2, 3, 5, 2, seed=5, device="cuda"),  # small
         _random_mask(2, 160, 16, 12, seed=5, device="cuda"),  # persistent
@@ -788,3 +919,86 @@ def test_fp8_and_bf16_plans_share_the_planner_bytes():
                 and fp8.num_items == bf16.num_items
             )
         assert fp8.k_scale_groups == -(-(nb * 64) // 16)
+
+
+@requires_hopper
+@pytest.mark.parametrize(
+    "g,h_kv,mb,nb,capacity,scale",
+    [
+        (2, 2, 3, 5, 2, None),  # small kernel
+        (4, 1, 16, 16, 16, 0.5),  # cluster
+        (8, 1, 8, 64, 64, None),  # MQA, split-KV, full 64-block lists
+        (4, 2, 160, 16, 12, -0.125),  # persistent pair plan
+    ],
+)
+def test_fp8_gqa_route_against_the_dequantized_reference(
+    g, h_kv, mb, nb, capacity, scale
+):
+    """``q_data_type=torch.float8_e4m3fn`` on a GQA problem: the package quantizer takes ``k`` / ``v`` over the kv
+    heads and returns the kv-head-shaped scales, ``plan()`` takes them with the kv-head mask, the FP8 GQA twin
+    of the BF16 GQA route runs, three launches are bit-identical, the BF16 output matches the exact softmax of
+    the dequantized inputs (reference (b), 5e-2) and -- bit for bit on the static programs -- the FP8 MHA route
+    on replicated inputs."""
+    h = g * h_kv
+    mask = _random_mask(h_kv, mb, nb, capacity, seed=5, ragged=True, device="cuda")
+    mask_rep = mask.repeat_interleave(g, dim=0)
+    q, k, v = _gqa_inputs(h, h_kv, mb, nb)
+    q8, k8, v8, q_scale, k_scale, v_scale = facade.sage_fp8_quantize_sm90(q, k, v)
+    groups = -(-(nb * 64) // 16)
+    assert tuple(q_scale.shape) == (1, h, mb * 64)
+    assert tuple(k_scale.shape) == (1, h_kv, groups) and tuple(v_scale.shape) == (
+        h_kv,
+        128,
+    )
+    wrapper = _gqa_wrapper(
+        mask,
+        h,
+        scale=scale,
+        q_data_type=FP8,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    plan = wrapper._cake_vsa_sm90_plan
+    bf16 = _gqa_wrapper(mask, h, scale=scale)._cake_vsa_sm90_plan
+    assert plan.fp8 and plan.gqa == g and backend.stage_gqa(plan.stage)
+    assert backend.stage_dtype(plan.stage) == "e4m3" and plan.mode == bf16.mode
+    assert plan.stage == (
+        bf16.stage.replace("attention", "attention_fp8")
+        if bf16.stage.startswith("attention")
+        else bf16.stage.replace("small_", "small_fp8_")
+    )
+    outs = [wrapper.run(q8, k8, v8).clone() for _ in range(3)]
+    assert outs[0].dtype == torch.bfloat16 and outs[0].shape == q.shape
+    for later in outs[1:]:
+        torch.testing.assert_close(later, outs[0], atol=0, rtol=0)
+    k8_rep, v8_rep = k8.repeat_interleave(g, dim=0), v8.repeat_interleave(g, dim=0)
+    scales_rep = (
+        q_scale,
+        k_scale.repeat_interleave(g, dim=1),
+        v_scale.repeat_interleave(g, dim=0),
+    )
+    exact = _reference(
+        *_dequantize(q8, k8_rep, v8_rep, *scales_rep),
+        mask_rep,
+        128**-0.5 if scale is None else scale,
+    )
+    torch.testing.assert_close(outs[0].float(), exact, atol=5e-2, rtol=5e-2)
+    # the FP8 MHA route on replicated inputs quantized through the MHA quantizer path: the same FP8 bits
+    mha, (q8_m, k8_m, v8_m), scales_m = _fp8_plan(
+        mask_rep, q, k.repeat_interleave(g, dim=0), v.repeat_interleave(g, dim=0), scale
+    )
+    assert torch.equal(q8_m.view(torch.uint8), q8.view(torch.uint8))
+    assert torch.equal(k8_m.view(torch.uint8), k8_rep.view(torch.uint8))
+    assert torch.equal(v8_m.view(torch.uint8), v8_rep.view(torch.uint8))
+    for a, b in zip(scales_m, scales_rep, strict=True):
+        assert torch.equal(a, b)
+    expected = mha.run(q8_m, k8_m, v8_m)
+    plan_mha = mha._cake_vsa_sm90_plan
+    assert not backend.stage_gqa(plan_mha.stage) and plan_mha.mode == plan.mode
+    if plan.small_kmax is None or not (plan.small_split or plan.small_cluster):
+        torch.testing.assert_close(outs[0], expected, atol=0, rtol=0)
+    else:
+        torch.testing.assert_close(
+            outs[0].float(), expected.float(), atol=1e-2, rtol=1e-2
+        )

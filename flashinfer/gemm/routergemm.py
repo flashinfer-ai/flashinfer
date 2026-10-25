@@ -17,8 +17,9 @@ from flashinfer.jit.cake_router_gemm import (
 import functools
 import os
 from types import SimpleNamespace
-from typing import Optional, Tuple
+from typing import Literal, NamedTuple, Optional, Tuple
 import torch
+import tvm_ffi
 from flashinfer.utils import (
     get_compute_capability,
     register_custom_op,
@@ -917,6 +918,232 @@ def _use_tinygemm2_sm100(device: torch.device) -> bool:
     )
 
 
+# tinygemm2_tcgen05: generated tcgen05 programs (flashinfer.jit.cake_tinygemm2_tcgen05)
+# with the reference's output bits.  They keep the reference's four K chains, the
+# K16 order within a chain and its +0 start, and sum the chains and the bias in the
+# reference's order, so a routed call returns exactly what the reference returns.
+# Three tiles, each with and without the bias and with and without programmatic
+# dependent launch, as (output features, batch rows) per CTA:
+_TINYGEMM2_TCGEN05_TILES = {
+    "PACKED_NARROW": (8, 2),
+    "PACKED": (32, 16),
+    "ACCUMULATORS": (32, 64),
+}
+
+
+class _Tcgen05Window(NamedTuple):
+    """Shapes one tile serves: every bound inclusive, ``None`` unbounded."""
+
+    tile: str
+    min_batch: int
+    max_batch: int
+    bias: Optional[bool] = None  # None: with and without a bias
+    min_output_features: Optional[int] = None
+    max_output_features: Optional[int] = None
+    min_input_features: Optional[int] = None
+    max_input_features: Optional[int] = None
+    min_weight_elements: Optional[int] = None  # output x input features
+    one_wave: bool = False  # only while PACKED's grid fits one CTA per SM
+
+    def admits(
+        self, batch: int, out_features: int, in_features: int, bias: bool, sms: int
+    ) -> bool:
+        def within(value: int, low: Optional[int], high: Optional[int]) -> bool:
+            return (low is None or value >= low) and (high is None or value <= high)
+
+        features, rows = _TINYGEMM2_TCGEN05_TILES["PACKED"]
+        packed_ctas = -(-out_features // features) * -(-batch // rows)
+        return (
+            within(batch, self.min_batch, self.max_batch)
+            and (self.bias is None or self.bias == bias)
+            and within(out_features, self.min_output_features, self.max_output_features)
+            and within(in_features, self.min_input_features, self.max_input_features)
+            and within(out_features * in_features, self.min_weight_elements, None)
+            and (not self.one_wave or packed_ctas <= sms)
+        )
+
+
+# The windows where a tile measured faster than the kernel the call runs
+# otherwise (the reference without a bias, tinygemm2_sm100 with one) on every
+# measured shape, with and without programmatic dependent launch; the first
+# window admitting a shape selects its tile, and every other shape keeps that
+# kernel.  The bounds are the measured ranges.  Small weights stay on that kernel:
+# the tensor-memory allocation adds a fixed half microsecond to a launch that
+# takes four.  The narrow tile serves 32 to 128 output features over long inputs
+# without a bias, and with one on 3 to 8 rows at an input of 4096 or from 16384.
+# PACKED serves eight rows or fewer only without a bias and from 2880 output
+# features (90 CTAs).  With a bias, tinygemm2_sm100 stays faster up to 27 rows
+# except for PACKED on 9 to 16 rows from 2880 output features and an input of
+# 2112, and up to 32 rows below 1536 output features.  From 9 rows without a bias
+# (28 with one) PACKED serves while its grid fits one wave; past that ACCUMULATORS
+# (64 rows per CTA) does.  On sm_107a the narrow tile starts at 64 output features
+# and serves a bias only at an input of 4096, no PACKED window covers 16 rows or
+# fewer, and with a bias 28 to 32 rows start at 2048 output features.
+_LARGE_WEIGHT = 6_000_000
+_MANY_ROWS_NOBIAS = (
+    _Tcgen05Window(
+        "PACKED", 9, 32, False, 1536, 4096, None, 6144, _LARGE_WEIGHT, one_wave=True
+    ),
+    _Tcgen05Window(
+        "ACCUMULATORS", 17, 32, False, 1536, 4096, None, 6144, _LARGE_WEIGHT
+    ),
+    _Tcgen05Window(
+        "PACKED", 33, 64, False, 1024, 4096, None, 6144, _LARGE_WEIGHT, one_wave=True
+    ),
+    _Tcgen05Window(
+        "ACCUMULATORS", 33, 64, False, 1024, 4096, None, 6144, _LARGE_WEIGHT
+    ),
+)
+
+
+def _many_rows_bias(low: int) -> Tuple[_Tcgen05Window, ...]:
+    """With a bias: 28 to 32 rows from ``low`` output features, 33 to 64 from 1024."""
+    return (
+        _Tcgen05Window(
+            "PACKED", 28, 32, True, low, 4096, None, 6144, _LARGE_WEIGHT, one_wave=True
+        ),
+        _Tcgen05Window(
+            "ACCUMULATORS", 28, 32, True, low, 4096, None, 6144, _LARGE_WEIGHT
+        ),
+        _Tcgen05Window(
+            "PACKED", 33, 64, True, 1024, 4096, None, 6144, _LARGE_WEIGHT, one_wave=True
+        ),
+        _Tcgen05Window(
+            "ACCUMULATORS", 33, 64, True, 1024, 4096, None, 6144, _LARGE_WEIGHT
+        ),
+    )
+
+
+_SM100_SM103 = (
+    _Tcgen05Window("PACKED_NARROW", 1, 2, False, 32, 128, 10240, 20480),
+    _Tcgen05Window("PACKED_NARROW", 3, 8, False, 32, 128, 6144, 20480),
+    _Tcgen05Window("PACKED_NARROW", 3, 8, True, 32, 128, 4096, 4096),
+    _Tcgen05Window("PACKED_NARROW", 3, 8, True, 64, 128, 16384, 20480),
+    _Tcgen05Window("PACKED", 1, 8, False, 2880, 4096, None, 6144, _LARGE_WEIGHT),
+    _Tcgen05Window("PACKED", 9, 16, True, 2880, 4096, 2112, 6144, _LARGE_WEIGHT),
+    *_MANY_ROWS_NOBIAS,
+    *_many_rows_bias(1536),
+)
+_SM107 = (
+    _Tcgen05Window("PACKED_NARROW", 1, 2, False, 64, 128, 10240, 20480),
+    _Tcgen05Window("PACKED_NARROW", 3, 8, False, 64, 128, 6144, 20480),
+    _Tcgen05Window("PACKED_NARROW", 3, 8, True, 64, 128, 4096, 4096),
+    *_MANY_ROWS_NOBIAS,
+    *_many_rows_bias(2048),
+)
+_TINYGEMM2_TCGEN05_WINDOWS = {
+    (10, 0): _SM100_SM103,
+    (10, 3): _SM100_SM103,
+    (10, 7): _SM107,
+}
+
+
+@functools.cache
+def _multiprocessor_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+@functools.cache
+def _tinygemm2_tcgen05_enabled(
+    disabled: str, compute_capability: Tuple[int, int]
+) -> bool:
+    if disabled == "1" or compute_capability not in _TINYGEMM2_TCGEN05_WINDOWS:
+        return False
+    return version_at_least(torch.version.cuda, "12.8")
+
+
+def _tinygemm2_tcgen05_program(
+    input: torch.Tensor, weight: torch.Tensor, has_bias: bool, use_pdl: bool
+) -> Optional[str]:
+    """The identifier of the generated program serving the call, or ``None``."""
+    capability = get_compute_capability(input.device)
+    if not _tinygemm2_tcgen05_enabled(
+        os.environ.get("FLASHINFER_DISABLE_TINYGEMM2_TCGEN05", "0"), capability
+    ):
+        return None
+    batch, in_features = input.shape
+    out_features = weight.shape[0]
+    # The programs read the weight and the activations through tensor maps: 16-byte
+    # aligned bases and rows.
+    if (
+        batch == 0
+        or in_features % 8 != 0
+        or input.data_ptr() % 16 != 0
+        or weight.data_ptr() % 16 != 0
+    ):
+        return None
+    sms = _multiprocessor_count(input.device.index)
+    for window in _TINYGEMM2_TCGEN05_WINDOWS[capability]:
+        if window.admits(batch, out_features, in_features, has_bias, sms):
+            return (
+                window.tile
+                + ("" if has_bias else "_NOBIAS")
+                + ("_PDL" if use_pdl else "")
+            )
+    return None
+
+
+@functools.cache
+def get_tinygemm2_tcgen05_op():
+    from ..jit import cake_tinygemm2_tcgen05 as programs
+
+    @register_custom_op(
+        "flashinfer::tinygemm2_tcgen05_op",
+        mutates_args=["out"],
+    )
+    def tinygemm2_tcgen05_op(
+        program: str,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        out: torch.Tensor,
+    ) -> None:
+        record = getattr(programs, program)
+        tile = program.removesuffix("_PDL").removesuffix("_NOBIAS")
+        features, rows = _TINYGEMM2_TCGEN05_TILES[tile]
+        batch, in_features = input.shape
+        out_features = weight.shape[0]
+        target = record.target_for(get_compute_capability(input.device))
+        # The generated binding's arguments by name (``CakeProgram.args`` orders
+        # them).  A program without the bias never reads ``bias``; ``out`` stands
+        # in for it.
+        values = {
+            "W": weight,
+            "X": input,
+            "out": out,
+            "bias": out if bias is None else bias,
+            "M": out_features,
+            "N": batch,
+            "K": in_features,
+            "grid_x": (out_features + features - 1) // features,
+            "grid_y": (batch + rows - 1) // rows,
+            "grid_z": 1,
+        }
+        if set(record.args) != set(values):
+            raise RuntimeError(
+                f"the generated {record.name} binding takes {list(record.args)}; "
+                f"the host spells {sorted(values)}"
+            )
+        entry = record.entry(target)
+        with torch.cuda.device(input.device), tvm_ffi.use_torch_stream():
+            entry(*[values[name] for name in record.args])
+
+    return tinygemm2_tcgen05_op
+
+
+def _tinygemm_bf16_cake(
+    program: str,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out: torch.Tensor,
+    *,
+    backend: Literal["cake"],
+) -> None:
+    """Launches the generated tcgen05 program ``program`` (the Cake backend)."""
+    get_tinygemm2_tcgen05_op()(program, input, weight, bias, out)
+
+
 @backend_requirement({}, common_check=_tinygemm_bf16_shape_checks)
 @flashinfer_api(trace=tinygemm_bf16_trace)
 def tinygemm_bf16(
@@ -969,8 +1196,17 @@ def tinygemm_bf16(
     bit-identical outputs and lower latency (see
     ``csrc/tinygemm2_sm100.cu``).  Set ``FLASHINFER_DISABLE_TINYGEMM2_SM100=1``
     to force the reference implementation everywhere.
+
+    On the same devices, shapes with large weights (up to 64 batch rows) and
+    narrow outputs over long inputs dispatch to ``tinygemm2_tcgen05`` instead:
+    generated tcgen05 programs whose outputs are bit-identical to the
+    reference's (``flashinfer.jit.cake_tinygemm2_tcgen05``).  Set
+    ``FLASHINFER_DISABLE_TINYGEMM2_TCGEN05=1`` to keep the kernels above.
     """
-    if bias is None:
+    program = _tinygemm2_tcgen05_program(input, weight, bias is not None, use_pdl)
+    if program is not None:
+        _tinygemm_bf16_cake(program, input, weight, bias, out, backend="cake")
+    elif bias is None:
         get_tinygemm2_module().tinygemm2_nobias_op(input, weight, out, use_pdl)
     elif _use_tinygemm2_sm100(input.device):
         get_tinygemm2_sm100_module().tinygemm2_sm100_op(

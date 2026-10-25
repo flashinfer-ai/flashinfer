@@ -385,14 +385,14 @@ def test_public_api_cannot_select_a_precision_mode(monkeypatch) -> None:
 
 
 def test_public_api_cannot_select_a_transfer_walk(monkeypatch) -> None:
-    """The ``transfer_walk`` knob (K3's ``bf16x3`` candidates of ``build.test.json``) is reachable only through
+    """The ``transfer_walk`` knob (K3's ``tf32_hilo`` / ``bf16x3`` programs of ``build.test.json``) is reachable only through
     the gated test hook; the public options never select a non-shipped transfer-walk program (SPEC-11)."""
     monkeypatch.delenv(cake_kcp_plan.TEST_KNOBS_ENV, raising=False)
     with pytest.raises(TypeError):
         cake_kcp._options({"transfer_walk": "bf16x3"})
     with pytest.raises(ValueError):
         cake_kcp._options({"_kcp_test_knobs": {"transfer_walk": "bf16x3"}})
-    assert cake_kcp._options({}).transfer_walk == "tf32_hilo"
+    assert cake_kcp._options({}).transfer_walk == "bf16x3_hw64"
     monkeypatch.setenv(cake_kcp_plan.TEST_KNOBS_ENV, "1")
     assert (
         cake_kcp._options(
@@ -407,7 +407,19 @@ def test_public_api_cannot_select_a_transfer_walk(monkeypatch) -> None:
         == "bf16x3_hw64"
     )
     assert (
+        cake_kcp._options(
+            {"_kcp_test_knobs": {"transfer_walk": "tf32_hilo"}}
+        ).transfer_walk
+        == "tf32_hilo"
+    )
+    assert (
         cake_kcp._options({"_kcp_test_knobs": {"precision_mode": 1}}).transfer_walk
+        == "tf32_hilo"
+    )
+    assert (
+        cake_kcp._options(
+            {"_kcp_test_knobs": {"precision_mode": 1, "transfer_walk": "tf32_hilo"}}
+        ).transfer_walk
         == "tf32_hilo"
     )
     with pytest.raises(ValueError):
@@ -417,6 +429,12 @@ def test_public_api_cannot_select_a_transfer_walk(monkeypatch) -> None:
     ):  # a K3 precision_mode program belongs to the tf32_hilo family
         cake_kcp._options(
             {"_kcp_test_knobs": {"precision_mode": 1, "transfer_walk": "bf16x3"}}
+        )
+    with pytest.raises(
+        ValueError
+    ):  # the shipped BF16x3 walk named beside it is refused too
+        cake_kcp._options(
+            {"_kcp_test_knobs": {"precision_mode": 2, "transfer_walk": "bf16x3_hw64"}}
         )
 
 

@@ -54,10 +54,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define NUM_RING_STAGES 2
 #define NUM_ACCS_STAGES 2
 #define SMEM_DO_S_OFF 1024
-#define SMEM_DO_S_STAGE_BYTES 16384
+#define SMEM_DO_S_STAGE_BYTES 32768
 #define SMEM_DO_S_STRIDE 65536
 #define SMEM_VNEW_S_OFF 33792
-#define SMEM_VNEW_S_STAGE_BYTES 16384
+#define SMEM_VNEW_S_STAGE_BYTES 32768
 #define SMEM_VNEW_S_STRIDE 65536
 #define SMEM_DO_K_OFF 1024
 #define SMEM_DO_K_STAGE_BYTES 32768
@@ -307,8 +307,7 @@ kernel_cake_kda_train_021592c077b54de470a5(const __grid_constant__ CUtensorMap d
             }
             asm volatile("barrier.sync 1, 128;" ::: "memory");
             if (warp == 0) {
-                int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
-                asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(_tmem_dealloc_addr), "r"(256));
+                asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(256));
             }
         }
     }

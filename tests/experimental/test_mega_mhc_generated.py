@@ -44,6 +44,8 @@ H4096_TOKENS = (
     8192,
 )
 H4096_SM_COUNTS = (148, 152, 208, 212, 216)
+# The architectures every hidden-4096 program ships for, in the records' order.
+H4096_ARCHES = ["sm_107a", "sm_100a", "sm_103a"]
 # The hidden-4096 output layouts: the BF16 output alone, or the BF16 output beside
 # its quantization (vLLM's per-token-group FP8 of it; bitwise, the tests hold).
 H4096_LAYOUTS = ("bf16", "fp8_group128", "nvfp4")
@@ -771,11 +773,15 @@ TAIL_PROGRAMS = {
 # the token counts of the producer's own rules test, all as that test spells them.
 H4096_PROGRAM_SWITCH = {148: 257, 152: 257, 208: 385, 212: 385, 216: 385}
 H4096_WSMEM_SWITCH = {148: 2369, 152: 2433, 208: 3329, 212: 3393, 216: 3457}
+# The first token count at which the quantized variants take 8 splits: the
+# production count's tasks in seven waves of the full grid (the first m-block
+# count with ceil(16 m / num_sms) >= 7), past the weight-staging switch.
+H4096_VARIANT_SWITCH = {148: 3521, 152: 3649, 208: 4993, 212: 5057, 216: 5185}
 H4096_RULE_TOKENS = (
     *(1, 2, 3, 4, 5, 7, 63, 64, 65, 127, 128, 129, 192, 193, 200, 255, 256, 257),
     *(320, 321, 384, 385, 448, 449, 512, 513, 576, 577, 832, 833, 1000, 1024),
-    *(1025, 1153, 1216, 1280, 1281, 1665, 2048, 2049, 2496, 2497, 4096, 16263),
-    65536,
+    *(1025, 1153, 1216, 1280, 1281, 1665, 2048, 2049, 2496, 2497, 3520, 3521),
+    *(3648, 3649, 4096, 4992, 4993, 5056, 5057, 5184, 5185, 8192, 16263, 65536),
     1 << 20,
 )
 
@@ -808,7 +814,8 @@ def test_h4096_host_rules(num_sms):
     count, one token less keeps the previous one), the count's bounds (at least
     ten, never above the deepgemm count of at least 16; a smaller count only
     where the tokens fit two tail rounds of the grid, its tasks in two waves),
-    a resident grid, the scratch size, and the deterministic mode's 16."""
+    a resident grid, the scratch size, and the deterministic mode's 16; the
+    quantized variants' count (8 from seven task waves of the production count on)."""
     points = _runtime.mhc_infer_switch_points(num_sms)
     assert points == H4096_SWITCH_POINTS[num_sms]
     assert points == _runtime.mhc_infer_switch_points(num_sms, max_tokens=1 << 14)
@@ -820,6 +827,7 @@ def test_h4096_host_rules(num_sms):
             64,
             65,
             *(p + d for p in points for d in (-1, 0)),
+            *(H4096_VARIANT_SWITCH[num_sms] + d for d in (-1, 0)),
             4096,
             8192,
             1 << 20,
@@ -850,6 +858,32 @@ def test_h4096_host_rules(num_sms):
     if num_sms == 208:
         table = {t: _runtime.mhc_infer_num_splits(t, num_sms) for t in H4096_SPLITS_208}
         assert table == H4096_SPLITS_208
+    # The quantized variants' count: the production count, except 8 where the
+    # BF16 output runs the weight-staging program and the tasks run in at least
+    # seven waves of the grid; 16 when deterministic. Its one switch of its own
+    # is that wave count's first token count (H4096_VARIANT_SWITCH).
+    for t in tokens:
+        splits = _runtime.mhc_infer_num_splits(t, num_sms)
+        variant = _runtime.mhc_infer_variant_num_splits(t, num_sms)
+        grid = _runtime.mhc_infer_num_ctas(t, num_sms, splits)
+        waves = ((t + 63) // 64 * splits + grid - 1) // grid
+        wsmem = _runtime.mhc_infer_tail_program(t, num_sms) == "tailpipe_wsmem"
+        plain = wsmem and waves >= _runtime.VARIANT_PLAIN_MIN_WAVES
+        assert variant == (_runtime.VARIANT_WSMEM_REGIME_SPLITS if plain else splits)
+        assert 8 <= variant <= splits and (variant != splits) == plain
+        assert (
+            _runtime.mhc_infer_variant_num_splits(t, num_sms, deterministic=True) == 16
+        )
+    assert _runtime.VARIANT_WSMEM_REGIME_SPLITS == 8
+    assert _runtime.VARIANT_PLAIN_MIN_WAVES == 7
+    switch = H4096_VARIANT_SWITCH[num_sms]
+    assert switch > H4096_WSMEM_SWITCH[num_sms]
+    assert _runtime.mhc_infer_variant_num_splits(switch - 1, num_sms) == 16
+    assert _runtime.mhc_infer_variant_num_splits(switch, num_sms) == 8
+    assert _runtime.mhc_infer_variant_num_splits(4096, num_sms) == (
+        8 if num_sms in (148, 152) else 16
+    )
+    assert _runtime.mhc_infer_variant_num_splits(8192, num_sms) == 8
 
 
 def _expected_h4096_program(t, num_sms, deterministic=False):
@@ -1016,7 +1050,12 @@ def test_h4096_values_and_replay(tokens, layout):
     kw = layout_kwargs(layout, values)
     plan = prepare_mega_mhc(**values, sf_layout=layout, **kw)
     _arch, sms = _runtime.device_facts(torch.cuda.current_device())
-    assert plan.config["num_splits"] == _runtime.mhc_infer_num_splits(tokens, sms)
+    rule = (
+        _runtime.mhc_infer_variant_num_splits
+        if layout in _runtime.QUANT_LAYOUTS
+        else _runtime.mhc_infer_num_splits
+    )
+    assert plan.config["num_splits"] == rule(tokens, sms)
     assert plan.config["num_launch_sms"] == _runtime.mhc_infer_num_ctas(
         tokens, sms, plan.config["num_splits"]
     )
@@ -1200,11 +1239,13 @@ def test_h4096_quant_routes_select_their_programs():
         == base["launch"]["dynamic_smem_bytes"] + 4096 * 2
     )
     matrix = _runtime._support_matrix()
-    assert "hidden=4096 output=bf16 on ['sm_107a']" in matrix
+    assert f"hidden=4096 output=bf16 on {H4096_ARCHES}" in matrix
     for layout in ("fp8_group128", "nvfp4"):
         exported = _runtime.supported("sm_107a", 4096, layout)
         assert not _runtime.supported("sm_107a", 5120, layout)
-        assert not _runtime.supported("sm_100a", 4096, layout)
+        assert _runtime.supported("sm_100a", 4096, layout) == exported
+        assert _runtime.supported("sm_103a", 4096, layout) == exported
+        assert not _runtime.supported("sm_120a", 4096, layout)
         if not exported:
             assert f"output={layout}" not in matrix
             with pytest.raises(NotImplementedError, match="(?i)exported:"):
@@ -1225,13 +1266,43 @@ def test_h4096_quant_routes_select_their_programs():
             )
             assert same[0] == program, "a single-program layout ignores the regime"
         record = _runtime.PROGRAMS[program]
-        assert record["hidden"] == 4096 and record["arches"] == ["sm_107a"]
+        assert record["hidden"] == 4096 and record["arches"] == H4096_ARCHES
         routes = [r for r in _runtime.ROUTES if r["program"] == program]
         assert [r["sf_layout"] for r in routes] == [layout]
-        assert f"hidden=4096 output={layout} on ['sm_107a']" in matrix
+        assert f"hidden=4096 output={layout} on {H4096_ARCHES}" in matrix
         names = [name for _kind, name in _runtime.record_arg_plan(record)]
         assert names[-3:] == ["grid_x", "grid_y", "grid_z"]
         assert set(QUANT_OUTPUTS[layout]) < set(names)
+
+
+def test_h4096_every_program_ships_for_every_listed_architecture():
+    """Each hidden-4096 record lists the same three architectures, sm_107a first,
+    and the routes select the same program on each of them; hidden 5120 stays
+    unexported on sm_107a."""
+    h4096 = [
+        name for name, record in _runtime.PROGRAMS.items() if record["hidden"] == 4096
+    ]
+    assert len(h4096) == 5
+    for name in h4096:
+        assert _runtime.record_arches(_runtime.PROGRAMS[name]) == H4096_ARCHES, name
+    for arch in H4096_ARCHES:
+        for splits, regime, program in (
+            (64, "bf16", BF16_PROGRAM),
+            (16, "tailpipe", TAILPIPE_PROGRAM),
+            (16, "tailpipe_wsmem", WSMEM_PROGRAM),
+        ):
+            assert _runtime.select_program(
+                4096, splits, False, False, "bf16", arch, regime=regime
+            ) == (program, {})
+        for layout in ("fp8_group128", "nvfp4"):
+            if _runtime.supported(arch, 4096, layout):
+                program, defines = _runtime.select_program(
+                    4096, 16, False, False, layout, arch
+                )
+                assert program not in (BF16_PROGRAM, TAILPIPE_PROGRAM, WSMEM_PROGRAM)
+                assert defines == {}
+        assert _runtime.supported(arch, 5120, "col") == (arch != "sm_107a")
+    assert _runtime.shipped_arches() == sorted(H4096_ARCHES)
 
 
 def test_h4096_quant_keyword_rules():

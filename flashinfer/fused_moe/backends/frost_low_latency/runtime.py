@@ -19,11 +19,46 @@ _COMPILE_LOCK = threading.Lock()
 
 
 def execute(inputs, config, tile_k):
+    if config.quant.activation in (
+        QuantFormat.BF16,
+        QuantFormat.FP16,
+    ) and config.quant.weight in (
+        QuantFormat.NVFP4,
+        QuantFormat.MXFP4,
+        QuantFormat.MXINT4,
+    ):
+        from .fp4_weight_only import execute as execute_w4a16
+
+        return execute_w4a16(inputs, config, tile_k)
+    if config.quant.weight is QuantFormat.DeepSeekFp8:
+        if isinstance(tile_k, tuple) and tile_k and tile_k[0] in ("wgmma", "warp_mma"):
+            from .tc.deepseek_fp8 import execute as execute_grouped_block
+
+            return execute_grouped_block(inputs, config, tile_k)
+        from .deepseek_fp8 import execute as execute_deepseek
+
+        return execute_deepseek(inputs, config, tile_k)
+    if config.quant.weight is QuantFormat.FP8PerTensor:
+        if isinstance(tile_k, tuple) and tile_k and tile_k[0] in ("wgmma", "warp_mma"):
+            from .tc.runtime import execute as execute_grouped
+
+            return execute_grouped(inputs, config, tile_k)
+        from .fp8_per_tensor import execute as execute_fp8
+
+        return execute_fp8(inputs, config, tile_k)
     if config.quant.weight is QuantFormat.NVFP4:
         from .nvfp4 import execute as execute_nvfp4
 
         return execute_nvfp4(inputs, config, tile_k)
     if config.quant.weight in (QuantFormat.BF16, QuantFormat.FP16):
+        if (
+            isinstance(tile_k, tuple)
+            and tile_k
+            and tile_k[0] in ("wgmma", "warp_mma", "ampere_mma")
+        ):
+            from .tc.runtime import execute as execute_grouped
+
+            return execute_grouped(inputs, config, tile_k)
         from .fma.bf16.runtime import execute as execute_bf16
 
         return execute_bf16(inputs, config, tile_k)

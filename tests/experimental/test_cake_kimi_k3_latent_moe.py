@@ -145,6 +145,13 @@ def test_decode_plan_rules():
     assert not decode_front_plan(128, i_local_for_tp(1))["land_alias"]
     assert cb.land_alias_auto(128, 152) and not cb.land_alias_auto(128, 19)
     assert not cb.land_alias_auto(64, 152)
+    # Evict-first weight streams: every front instance and the TP1 tail; the TP8 tail keeps the default L2 policy.
+    assert la_front["a_evict_first"]
+    assert decode_front_plan(8, i_local_for_tp(1))["a_evict_first"]
+    assert decode_tail_plan(64, i_local_for_tp(1), 1)["a_evict_first"]
+    assert la_tail["a_evict_first"]
+    assert decode_kernel_key(la_tail).endswith("_f_la_ef")
+    assert not decode_tail_plan(64, i_local_for_tp(8), 8)["a_evict_first"]
     # A second routed partial disables the staged rows (P == 1 only).
     assert not decode_tail_plan(1, i_local_for_tp(8), 8, num_partials=2)["rows_smem"]
     with pytest.raises(ValueError):
@@ -166,16 +173,21 @@ def test_split_plan_rules():
     assert rem["sk_ipc"] == 79 and rem["num_items"] == 148
     assert split_plan(56, 152, SM_COUNT, 2)["sk_tiles"] == 0
     assert split_plan(140, 152, SM_COUNT, 5)["sk_tiles"] == 0
-    # TP1 T=2048 (224 pair tiles on 74 resident clusters): 2 x 74 whole + one stream-K wave (module docstring).
+    # TP1 T=2048 (224 pair tiles on 74 resident clusters): 3 x 74 whole, then the 2 remainder tiles as 8 stream-K
+    # ranges of 38 K iterations; the last full wave stays whole.
     sk = split_plan(224, 152, SM_COUNT, 8)
-    assert sk["full_items"] == 148 and sk["sk_tiles"] == 76 and sk["sk_ipc"] == 157
-    assert (
-        sk["num_items"] == 148 + -(-76 * 152 // 157)
-        and 1 < sk["sk_max_seg"] <= cb.MAX_SEG
+    assert sk == dict(
+        num_items=222 + 8,
+        full_items=222,
+        sk_ipc=38,
+        sk_max_seg=4,
+        sk_total=2 * 152,
+        sk_tiles=2,
     )
     # Minimum stream-K saving: on 152 SMs the TP1 T=4096 / T=8192 regions (448 / 896 pair tiles on 76
-    # resident clusters) leave a near-whole remainder wave whose cut saves 4 / 20 iterations on paper and loses 3.6-4.8 %
-    # on the device, so they stay whole-tile; T=16384 (1792 tiles, saving 52) and the 148-SM rows above keep their cut.
+    # resident clusters) leave a near-whole remainder wave whose cut saves less than SK_MIN_SAVING_ITERS on paper (a
+    # cut there measured 3.6-4.8 % slower), so they stay whole-tile; T=16384 (1792 tiles, saving 40) and the 148-SM
+    # rows above keep their cut.
     assert (
         split_plan(448, 152, 152, 8)["sk_tiles"] == 0
         and split_plan(448, 152, 152, 8)["num_items"] == 448
@@ -282,9 +294,15 @@ def test_prefill_tail_plan_and_trigger():
     )
     assert not n128["final_ts"]
     assert cb.tail_gemm_final_ts(1024, 8) and not cb.tail_gemm_final_ts(512, 8)
-    # Fused norm: TP1 T = 256 / 512 (single wave, K2 = 96 blocks); TP8 (K2 = 12) and multi-wave grids do not fuse.
+    # Fused norm: TP1 T = 256 / 512 on the single-wave grid (K2 = 96 blocks), larger TP1 rows on the claimed resident
+    # grid; TP8 (K2 = 12) does not fuse.
     assert tp1["fused_norm"] and prefill_tail_plan(512, 1)["fused_norm"]
-    assert not plan["fused_norm"] and not prefill_tail_plan(1024, 1)["fused_norm"]
+    assert not tp1["claim_items"] and not prefill_tail_plan(512, 1)["claim_items"]
+    assert (
+        prefill_tail_plan(1024, 1)["fused_norm"]
+        and prefill_tail_plan(1024, 1)["claim_items"]
+    )
+    assert not plan["fused_norm"] and not plan["claim_items"]
     assert cb.use_fused_norm(256, 112, SM_COUNT, 96) and not cb.use_fused_norm(
         256, 56, SM_COUNT, 12
     )
@@ -307,8 +325,9 @@ COVERAGE_PARTIALS = (1, 2, 4)
 @pytest.mark.parametrize("sm_count", QUALIFIED_SM_COUNTS)
 def test_route_keys_are_registered_for_every_token_count(sm_count):
     """Every route of the public contract resolves to a registered program on every qualified SM
-    count (no token-range holes; the 152-SM plans differ from the 148-SM plans only in runtime
-    values -- stream-K windows, resident pairs -- never in the program they launch)."""
+    count (no token-range holes; the 152-SM plans differ from the 148-SM plans in runtime values --
+    stream-K windows, resident pairs -- and in the TP1 tail rows that take the 256 x 512 pair tile
+    from 4096 tokens there instead of 8192)."""
     assert MODULES and KERNELS
     arches = cake_jit.registered_arches()
     assert set(arches) <= set(SUPPORTED_COMPUTE_CAPABILITIES.values()) and arches
@@ -385,20 +404,22 @@ def test_plans_follow_the_device_sm_count():
     assert decode_tail_plan(1, i_local_for_tp(8), 8, 1, 152)["grid"] == 112
     # Prefill: 76 resident pairs instead of 74 change the trailing-wave plan of these contract
     # rows (the programs stay the same; the values are launch arguments).
-    assert prefill_tail_plan(2048, 1, 148)["sk_tiles"] == 76
+    assert prefill_tail_plan(2048, 1, 148)["sk_tiles"] == 2
     assert prefill_tail_plan(2048, 1, 152)["sk_tiles"] == 0
     assert prefill_tail_plan(2048, 1, 152)["full_items"] == 224
     assert prefill_tail_plan(1024, 1, 152)["full_items"] == 76
     assert prefill_front_plan(1024, i_local_for_tp(1), 148)["sk_tiles"] == 0
     assert prefill_front_plan(1024, i_local_for_tp(1), 152)["sk_tiles"] == 36
     for tp in SUPPORTED_TP:
-        for tokens in (256, 512, 300, 4096, 16384):
+        for tokens in (256, 512, 300, 1024, 2048, 4096, 8192, 16384):
             assert route_kernel_keys("front", tp, tokens, 148) == route_kernel_keys(
                 "front", tp, tokens, 152
             )
-            assert route_kernel_keys("tail", tp, tokens, 148) == route_kernel_keys(
+            same_tail = route_kernel_keys("tail", tp, tokens, 148) == route_kernel_keys(
                 "tail", tp, tokens, 152
             )
+            # The 256 x 512 tail tile starts at 4096 TP1 tokens on 152 SMs, at 8192 on 148.
+            assert same_tail == (tp != 1 or not 4096 <= tokens < 8192)
 
 
 def test_generated_program_available_follows_partials_and_sm_count(monkeypatch):
@@ -444,7 +465,8 @@ def test_route_rules_select_the_expected_programs():
         assert plan["weights_evict_first"]
         assert len(route_kernel_keys("tail", 8, tokens)) == 2
     assert cb.prefill_tail_plan(512, 8)["early_trigger"]
-    assert len(route_kernel_keys("tail", 1, 16384)) == 2
+    assert len(route_kernel_keys("tail", 1, 16384)) == 1
+    assert len(route_kernel_keys("tail", 8, 16384)) == 2
     # P >= 2 routed partials leave the staged-rows / resident-B decode instances (T <= 16, TP8).
     one = decode_tail_plan(16, i_local_for_tp(8), 8, 1)
     two = decode_tail_plan(16, i_local_for_tp(8), 8, 2)
@@ -454,6 +476,28 @@ def test_route_rules_select_the_expected_programs():
     assert decode_kernel_key(
         decode_tail_plan(32, i_local_for_tp(8), 8, 1)
     ) == decode_kernel_key(decode_tail_plan(32, i_local_for_tp(8), 8, 2))
+
+
+def test_tp1_tail_prefill_routes():
+    """TP1 prefill tails past the single-wave fused norm run one claimed launch on the resident grid
+    (one CTA pair per resident cluster, default weight L2 policy); the 256 x 512 pair tile starts
+    at 4096 tokens on 152 SMs and at 8192 on 148."""
+    assert cb.tail_wide_min_tokens(152) == 4096 and cb.tail_wide_min_tokens(148) == 8192
+    for sm_count in QUALIFIED_SM_COUNTS:
+        wide = cb.tail_wide_min_tokens(sm_count)
+        for tokens in (129, 256, 300, 512, 513, 1024, 2048, 4095, 4096, 8192, 16384):
+            plan = prefill_tail_plan(tokens, 1, sm_count)
+            claimed = tokens > 512
+            assert plan["fused_norm"] and plan["claim_items"] == claimed
+            assert plan["block_n"] == (512 if tokens >= wide else 256)
+            assert len(route_kernel_keys("tail", 1, tokens, sm_count)) == 1
+            if claimed:
+                assert not plan["weights_evict_first"]
+                assert plan["gemm_grid"] == cb.resident_grid(
+                    plan["num_items"], sm_count
+                )
+                assert plan["gemm_grid"] <= sm_count
+    assert cb.resident_grid(3, 148) == 6 and cb.resident_grid(500, 152) == 152
 
 
 # ---------------------------------------------------------------------------
@@ -721,7 +765,7 @@ def test_tail_matches_reference(tp, tokens):
         y_workspace=y,
     )
     assert runner.route == ("decode" if tokens <= DECODE_MAX_T else "prefill")
-    assert runner.kernel_keys == route_kernel_keys("tail", tp, tokens)
+    assert runner.kernel_keys == route_kernel_keys("tail", tp, tokens, runner.sm_count)
     assert runner.launch_count == (
         1 if tokens <= DECODE_MAX_T or runner.plan.get("fused_norm") else 2
     )
@@ -860,6 +904,50 @@ def test_tail_tp8_between_the_single_wave_rows(tokens):
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(first[0], y) and torch.equal(first[1], out)
+
+
+@pytest.mark.parametrize("tokens", (1024, 2048))
+def test_tail_tp1_claimed_resident_grid(tokens):
+    """TP1 tails past the single-wave fused norm run one claimed launch on the resident grid; the
+    kernel re-arms its claim counter, so re-launch and CUDA-graph replay reproduce the result."""
+    tp, rank = 1, 0
+    device = _require_program("tail", tp, tokens)
+    w, routed, shared_act, out, y = _tail_case(
+        device, tp, rank, tokens, 1, 1100 + tokens
+    )
+    runner = prepare_kimi_k3_latent_moe_tail(
+        routed,
+        w["norm_weight"],
+        w["up_weight"],
+        shared_act,
+        w["shared_down_weight"],
+        out,
+        tp=tp,
+        rank=rank,
+        y_workspace=y,
+    )
+    assert runner.route == "prefill" and runner.launch_count == 1
+    assert runner.plan["claim_items"] and runner.plan["fused_norm"]
+    assert runner.plan["gemm_grid"] <= runner.sm_count
+    runner()
+    torch.cuda.synchronize()
+    expected = tail_reference(routed, shared_act, w, tp, rank)
+    _assert_close("y", y, expected["y"], ATOL, RTOL)
+    _assert_close("out", out, expected["out"], ATOL, RTOL)
+    first = (y.clone(), out.clone())
+    for _ in range(2):
+        y.fill_(float("nan"))
+        out.fill_(float("nan"))
+        runner()
+        torch.cuda.synchronize()
+        assert torch.equal(first[0], y) and torch.equal(first[1], out)
+    graph = _graph_replay(runner)
+    for _ in range(2):
+        y.fill_(float("nan"))
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(first[0], y) and torch.equal(first[1], out)
 
 
 @pytest.mark.parametrize("tokens", (3, 8, 16, 64))

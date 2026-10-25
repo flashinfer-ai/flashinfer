@@ -20,8 +20,23 @@ _CASES = (
     ("stp_fp32", 64, 64, 8, 128, 128, 0, torch.float32, "auto", False, None),
     ("mtp_short1", 64, 64, 8, 128, 128, 1, torch.bfloat16, "auto", False, None),
     ("mtp_short2", 64, 64, 8, 128, 128, 2, torch.bfloat16, "auto", False, None),
+    ("mtp_short2_h32", 64, 32, 8, 128, 128, 2, torch.bfloat16, "auto", False, None),
     ("mtp_cache", 1, 64, 8, 64, 128, 6, torch.bfloat16, "vertical", True, None),
+    ("mtp_cache_g1", 1, 64, 1, 64, 128, 6, torch.bfloat16, "vertical", True, None),
     ("mtp_horizontal", 32, 64, 8, 64, 128, 6, torch.bfloat16, "horizontal", True, None),
+    (
+        "mtp_horizontal_b64",
+        64,
+        64,
+        8,
+        64,
+        128,
+        6,
+        torch.bfloat16,
+        "horizontal",
+        True,
+        None,
+    ),
     ("dynamic0", 1, 16, 1, 64, 128, 1, torch.float32, "simple", False, 0),
     ("dynamic0_b8", 8, 16, 1, 64, 128, 2, torch.float32, "simple", False, 0),
     ("dynamic1", 1, 16, 1, 64, 128, 4, torch.float32, "simple", False, 1),
@@ -29,6 +44,19 @@ _CASES = (
     ("dynamic7", 1, 16, 1, 64, 128, 8, torch.float32, "simple", False, 7),
     # Headdim-64 single-token decode (Nemotron-H / granite-4.0-h): row-owner tiles and paired batch programs.
     ("stp_hd64_rows_bf16", 4, 128, 8, 64, 128, 0, torch.bfloat16, "auto", False, None),
+    (
+        "stp_hd64_rows_bf16_b1",
+        1,
+        128,
+        8,
+        64,
+        128,
+        0,
+        torch.bfloat16,
+        "auto",
+        False,
+        None,
+    ),
     (
         "stp_hd64_paired_rows",
         64,
@@ -460,12 +488,41 @@ def _canonical_arm(candidate):
     )
 
 
+def _routes_as_measured() -> bool:
+    """The paired row-major programs are chosen by program heads per SM: the expected names of the test cases
+    hold on B200 (148 SMs) and GB300 (152 SMs)."""
+    return cake._sm_count(torch.cuda.current_device()) in (148, 152)
+
+
+# (name, batch, state dtype, program, groups): 128 heads of 64 rows, 64 program heads when paired.
 _RAW_DECODE_CASES = (
-    ("rows_bf16", 2, torch.bfloat16, "stp_hd64_rows_bf16"),
-    ("paired_bf16", 64, torch.bfloat16, "stp_paired_rows"),
-    # 16 x 64 program heads: inside the sm_100a four-CTA residency band (6.9 per SM).
-    ("paired_bf16_four_cta", 16, torch.bfloat16, "stp_paired_rows"),
-    ("rows_fp32", 8, torch.float32, "stp_hd64_rows_fp32"),
+    ("rows_bf16", 2, torch.bfloat16, "stp_hd64_rows_bf16_dt8_bf16_i32", 8),
+    ("rows_bf16_dt4", 4, torch.bfloat16, "stp_hd64_rows_bf16_dt4_od_bf16_i32", 8),
+    ("paired_bf16", 64, torch.bfloat16, "stp_hd64_paired_hpc2_bf16_i32", 8),
+    (
+        "paired_bf16_one_head",
+        5,
+        torch.bfloat16,
+        "stp_hd64_paired_hpc1_ratio8_bf16_i32",
+        8,
+    ),
+    ("paired_bf16_one_head_g4", 5, torch.bfloat16, "stp_hd64_paired_hpc1_bf16_i32", 4),
+    ("paired_bf16_two_ctas", 8, torch.bfloat16, "stp_hd64_paired_hpc2_mb2_bf16_i32", 8),
+    ("paired_bf16_four_heads", 16, torch.bfloat16, "stp_hd64_paired_hpc4_bf16_i32", 8),
+    ("rows_fp32_dt8", 1, torch.float32, "stp_hd64_rows_fp32_dt8_bf16_i32", 8),
+    ("rows_fp32_dt4", 2, torch.float32, "stp_hd64_rows_fp32_dt4_bf16_i32", 8),
+    ("rows_fp32_dt2", 4, torch.float32, "stp_hd64_rows_fp32_dt2_bf16_i32", 8),
+    ("rows_fp32", 8, torch.float32, "stp_hd64_rows_fp32_dt1_bf16_i32", 8),
+    ("rows_fp32_2048", 16, torch.float32, "stp_hd64_rows_fp32_dt1_bf16_i32", 8),
+    (
+        "rows_fp32_l2_prefetch",
+        32,
+        torch.float32,
+        "stp_hd64_rows_fp32_dt1_l2_prefetch_bf16_i32",
+        8,
+    ),
+    ("rows_fp32_between", 48, torch.float32, "stp_hd64_rows_fp32", 8),
+    ("rows_fp32_large", 64, torch.float32, "stp_hd64_rows_fp32_dt1_large_bf16_i32", 8),
 )
 
 
@@ -473,17 +530,145 @@ _RAW_DECODE_CASES = (
 @pytest.mark.parametrize("case", _RAW_DECODE_CASES, ids=lambda case: case[0])
 def test_raw_decode_layout_matches_flashinfer(case, cake_hits) -> None:
     """Padded fused-projection views, BF16 dt/D/dt_bias and int32 slot tables run on the headdim-64 programs."""
-    _name, batch_size, state_dtype, program = case
-    candidate = _raw_decode_case(batch_size, state_dtype)
+    _name, batch_size, state_dtype, program, ngroups = case
+    candidate = _raw_decode_case(batch_size, state_dtype, ngroups=ngroups)
     reference = _canonical_arm(candidate)
     out_reference = selective_state_update(**reference, backend="flashinfer")
     plan = _route(dict(candidate, x=candidate["x"]), output_like=candidate["x"])
-    assert plan is not None and plan.program == program
+    assert plan is not None
+    if _routes_as_measured():
+        assert plan.program == program
     out_candidate = torch.empty(
         (batch_size, 128, 64), dtype=torch.bfloat16, device="cuda"
     )
     cake_selective_state_update(**candidate, out=out_candidate)
     assert cake_hits == [True], "the raw decode layout must run on Cake"
+    torch.testing.assert_close(out_candidate, out_reference, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        candidate["state"], reference["state"], atol=1e-2, rtol=1e-2
+    )
+
+
+# (name, raw ABI, nheads, batch, {arch: program}): BF16-state headdim-64 rows of eight groups at 512
+# batch-heads, FlashInfer's four-tile band on both devices (below the paired programs' work).
+_BF16_DT4_CASES = (
+    (
+        "canonical_h128",
+        False,
+        128,
+        4,
+        {
+            "sm_100a": "stp_hd64_rows_bf16_dt4_xa_od",
+            "sm_103a": "stp_hd64_rows_bf16_dt4_od",
+        },
+    ),
+    (
+        "canonical_h32",
+        False,
+        32,
+        16,
+        {
+            "sm_100a": "stp_hd64_rows_bf16_dt4_xa_od",
+            "sm_103a": "stp_hd64_rows_bf16_dt4_od",
+        },
+    ),
+    (
+        "raw_h128",
+        True,
+        128,
+        4,
+        {
+            "sm_100a": "stp_hd64_rows_bf16_dt4_od_bf16_i32",
+            "sm_103a": "stp_hd64_rows_bf16_dt4_od_bf16_i32",
+        },
+    ),
+    (
+        "raw_h64",
+        True,
+        64,
+        8,
+        {
+            "sm_100a": "stp_hd64_rows_bf16_dt4_od_bf16_i32",
+            "sm_103a": "stp_hd64_rows_bf16_dt4_od_bf16_i32",
+        },
+    ),
+    (
+        "raw_h32",
+        True,
+        32,
+        16,
+        {
+            "sm_100a": "stp_hd64_rows_bf16_dt4_od_bf16_i32",
+            "sm_103a": "stp_hd64_rows_bf16_dt4_xa_bf16_i32",
+        },
+    ),
+)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("case", _BF16_DT4_CASES, ids=lambda case: case[0])
+def test_bf16_four_tile_rows_pick_the_build_of_the_device(case, cake_hits) -> None:
+    """The four-tile BF16 band runs the build of the device's architecture and, in the BF16/int32 ABI, of the
+    head count: the outputs and state match FlashInfer on every build."""
+    _name, raw_abi, nheads, batch_size, programs = case
+    raw = _raw_decode_case(batch_size, torch.bfloat16, nheads=nheads, ngroups=8)
+    reference = _canonical_arm(raw)
+    candidate = raw if raw_abi else dict(reference, state=reference["state"].clone())
+    out_reference = selective_state_update(**reference, backend="flashinfer")
+    plan = _route(dict(candidate), output_like=candidate["x"])
+    assert plan is not None
+    if _routes_as_measured():
+        arch = cake._device_arch(torch.cuda.current_device())
+        assert (plan.program, plan.grid) == (programs[arch], (4, nheads, batch_size))
+    out_candidate = torch.empty(
+        (batch_size, nheads, 64), dtype=torch.bfloat16, device="cuda"
+    )
+    cake_selective_state_update(**candidate, out=out_candidate)
+    assert cake_hits == [True], "the four-tile BF16 rows must run on Cake"
+    torch.testing.assert_close(out_candidate, out_reference, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        candidate["state"], reference["state"], atol=1e-2, rtol=1e-2
+    )
+
+
+# (name, batch, program, (DIM_TILES, PREFETCH_ROWS) of the carried program or None): canonical-ABI FP32 rows of
+# 128 heads of 64 rows. The bands without measured canonical-ABI rows (four and two tiles, and 4096 to 8192
+# batch-heads at one tile) keep the carried row-owner program under the tile plan's defines.
+_CANONICAL_FP32_ROWS_CASES = (
+    ("dt8", 1, "stp_hd64_rows_fp32_dt8", None),
+    ("dt4", 2, "stp_hd64_rows_fp32", (4, 1)),
+    ("dt2", 4, "stp_hd64_rows_fp32", (2, 4)),
+    ("dt1", 8, "stp_hd64_rows_fp32_dt1", None),
+    ("dt1_between", 48, "stp_hd64_rows_fp32", (1, 4)),
+    ("dt1_large", 64, "stp_hd64_rows_fp32_dt1_large", None),
+)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("case", _CANONICAL_FP32_ROWS_CASES, ids=lambda case: case[0])
+def test_canonical_fp32_rows_keep_the_carried_program_outside_the_measured_bands(
+    case, cake_hits
+) -> None:
+    """Canonical FP32 headdim-64 rows run their band's rendered build where it has one; a canonical call at four
+    or two tiles, or between 4096 and 8192 batch-heads, runs the carried row-owner program as before."""
+    _name, batch_size, program, carried = case
+    candidate = _canonical_arm(_raw_decode_case(batch_size, torch.float32))
+    reference = dict(candidate, state=candidate["state"].clone())
+    out_reference = selective_state_update(**reference, backend="flashinfer")
+    plan = _route(candidate)
+    assert plan is not None
+    if _routes_as_measured():
+        assert plan.program == program
+        if carried is None:
+            assert plan.defines == ()
+        else:
+            dim_tiles, prefetch_rows = carried
+            assert plan.defines == cake.rows_defines(
+                torch.float32, torch.int64, prefetch_rows, dim_tiles
+            )
+            assert plan.grid == (dim_tiles, 128, batch_size)
+    out_candidate = cake_selective_state_update(**candidate)
+    assert cake_hits == [True], "the canonical FP32 rows must run on Cake"
     torch.testing.assert_close(out_candidate, out_reference, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(
         candidate["state"], reference["state"], atol=1e-2, rtol=1e-2
@@ -551,7 +736,7 @@ def test_hd64_routes_capture_into_cuda_graph(case_name, cake_hits) -> None:
 def test_hd64_route_falls_back_for_non_dense_rows(cake_hits) -> None:
     """Rows with a non-unit inner stride are outside the programs' addressing; the call runs on FlashInfer."""
     inputs = _make_case(_case("stp_hd64_paired_rows"))
-    assert _route(inputs).program == "stp_paired_rows"
+    assert _route(inputs).program == "stp_hd64_paired_hpc2"
     batch_size, nheads, dim = inputs["x"].shape
     wide = torch.zeros(
         (batch_size, nheads, 2 * dim), dtype=torch.bfloat16, device="cuda"
@@ -585,59 +770,82 @@ def test_hd64_defines_follow_the_storage_dtypes() -> None:
         ("PREFETCH_ROWS", 4),
         ("DIM_TILES", 2),
     )
-    assert cake.batch_abi_defines(torch.bfloat16, torch.int32, True, 4) == (
-        ("COEFFICIENT_BF16", 1),
-        ("INDEX_I32", 1),
-        ("PAIRED_HEADS", 1),
-        ("HEADS_PER_CTA", 4),
-    )
-    assert cake.direct_defines(8, 1024) == (
-        ("HEADS_PER_GROUP_STATIC", 8),
-        ("DIRECT_UNROLL", 4),
-    )
-    assert cake.direct_defines(64, 4096) == (
-        ("HEADS_PER_GROUP_STATIC", 0),
-        ("DIRECT_UNROLL", 1),
-    )
 
 
-def test_paired_heads_per_cta_follows_the_work_and_arch() -> None:
-    sms = 148
-    assert (
-        cake._paired_heads_per_cta(6 * 64, sms, "sm_100a") == 1
-    )  # 2.6 program heads per SM: one head per CTA
-    assert (
-        cake._paired_heads_per_cta(8 * 64, sms, "sm_100a") == 2
-    )  # 3.5 program heads per SM
-    assert (
-        cake._paired_heads_per_cta(16 * 64, sms, "sm_100a") == 2
-    )  # 6.9: below the B200 band
-    assert (
-        cake._paired_heads_per_cta(16 * 64, 152, "sm_103a") == 4
-    )  # 6.7: inside the GB300 band
-    assert (
-        cake._paired_heads_per_cta(20 * 64, sms, "sm_100a") == 4
-    )  # 8.6: inside the band
-    assert (
-        cake._paired_heads_per_cta(32 * 64, sms, "sm_100a") == 2
-    )  # 13.8: above the band
-    assert cake._paired_heads_per_cta(128 * 64, sms, "sm_100a") == 4  # 55: saturated
-    assert (
-        cake._paired_heads_per_cta(20 * 64, sms, "sm_120a") == 2
-    )  # no band for other archs
-    three = ("stp_paired_rows", (("LAUNCH_MIN_BLOCKS", 3),))
-    four = ("stp_paired_rows", (("LAUNCH_MIN_BLOCKS", 4),))
-    assert cake._paired_rows_program(8 * 64, sms, "sm_100a") == three  # 3.5 per SM
-    assert (
-        cake._paired_rows_program(16 * 64, sms, "sm_100a") == four
-    )  # 6.9: inside the B200 band
-    assert cake._paired_rows_program(32 * 64, sms, "sm_100a") == four  # 13.8
-    assert (
-        cake._paired_rows_program(64 * 64, sms, "sm_100a") == three
-    )  # 27.7: above the band
-    assert (
-        cake._paired_rows_program(16 * 64, 152, "sm_103a") == three
-    )  # no band on GB300
+def test_paired_rows_programs_follow_the_work() -> None:
+    """Program heads per SM select the work tile of the paired headdim-64 route; the gate and the head ratio
+    select the 128x128 build."""
+
+    def hd64(row_groups, sm_count, program_heads_per_group=8, raw_abi=False):
+        return cake.hd64_paired_program(
+            row_groups, program_heads_per_group, sm_count, raw_abi
+        )
+
+    # (batch x groups, SMs[, program heads per group]); comments count program heads and CTAs.
+    assert hd64(55, 148) == ("stp_hd64_paired_hpc1_ratio8", 1)  # 440: below 3 per SM
+    assert hd64(110, 148, 4) == ("stp_hd64_paired_hpc1", 1)  # runtime head ratio
+    assert hd64(111, 148, 4) == ("stp_hd64_paired_hpc2_mb2", 2)  # 444: 222 CTAs
+    assert hd64(111, 152, 4) == ("stp_hd64_paired_hpc1", 1)  # 444: 2.9 per SM
+    assert hd64(296, 148, 2) == ("stp_hd64_paired_hpc2_mb2", 2)  # 296 CTAs: two per SM
+    assert hd64(297, 148, 2) == ("stp_hd64_paired_hpc2", 2)  # 297 CTAs
+    assert hd64(76, 152) == ("stp_hd64_paired_hpc2_mb2", 2)  # 304 CTAs
+    # An odd head count per group leaves a part-filled tile in every group: the CTAs, not the heads, decide.
+    assert hd64(148, 148, 3) == ("stp_hd64_paired_hpc2_mb2", 2)  # 444: 296 CTAs
+    assert hd64(149, 148, 3) == ("stp_hd64_paired_hpc2", 2)  # 447: 298 CTAs
+    assert hd64(160, 148, 3) == ("stp_hd64_paired_hpc2", 2)  # 480: 320 CTAs
+    # From 6 per SM: four heads per CTA unless two put fewer head slots on the busiest SM.
+    assert hd64(111, 148) == ("stp_hd64_paired_hpc2", 2)  # busiest SM 6 vs 8
+    assert hd64(114, 148) == ("stp_hd64_paired_hpc4", 4)  # 8 vs 8
+    assert hd64(150, 148) == ("stp_hd64_paired_hpc2", 2)  # 10 vs 12
+    assert hd64(150, 152) == ("stp_hd64_paired_hpc4", 4)  # 8 vs 8
+    assert hd64(400, 148, 3) == ("stp_hd64_paired_hpc4", 4)  # 800 / 400 CTAs: 12 vs 12
+    assert hd64(221, 148) == ("stp_hd64_paired_hpc4", 4)  # 12 vs 12
+    assert hd64(222, 148) == ("stp_hd64_paired_hpc2", 2)  # 1776: 12 per SM
+    assert hd64(512, 152, raw_abi=True) == ("stp_hd64_paired_hpc2_bf16_i32", 2)
+    assert cake.dim128_program(8, gated=True) == ("stp_dim128_z_gated", 2)
+    assert cake.dim128_program(1, gated=True) == ("stp_dim128_z_gated", 2)
+    assert cake.dim128_program(1, gated=False) == ("stp_dim128_hpc1_mb4", 1)
+    assert cake.dim128_program(8, gated=False) == ("stp_dim128_hpc2", 2)
+
+
+# (case, z, the program the route selects): canonical layouts on every paired row-major program.
+_PAIRED_ROWS_CASES = (
+    (("dim128_hpc2", 64, 64, 8, 128, 128, 0), False, "stp_dim128_hpc2"),
+    (("dim128_hpc1", 32, 16, 16, 128, 128, 0), False, "stp_dim128_hpc1_mb4"),
+    (("dim128_z", 64, 64, 8, 128, 128, 0), True, "stp_dim128_z_gated"),
+    (("dim128_z_hpc1", 32, 16, 16, 128, 128, 0), True, "stp_dim128_z_gated"),
+    (("hd64_one_head", 5, 128, 8, 64, 128, 0), False, "stp_hd64_paired_hpc1_ratio8"),
+    (("hd64_one_head_g4", 5, 128, 4, 64, 128, 0), False, "stp_hd64_paired_hpc1"),
+    (("hd64_two_ctas", 8, 128, 8, 64, 128, 0), False, "stp_hd64_paired_hpc2_mb2"),
+    (("hd64_two_heads", 10, 128, 8, 64, 128, 0), False, "stp_hd64_paired_hpc2"),
+    (("hd64_four_heads", 16, 128, 8, 64, 128, 0), False, "stp_hd64_paired_hpc4"),
+    (("hd64_four_heads_z", 16, 128, 8, 64, 128, 0), True, "stp_hd64_paired_hpc4"),
+)
+
+
+@requires_blackwell
+@pytest.mark.parametrize(
+    "case, gated, program",
+    _PAIRED_ROWS_CASES,
+    ids=[case[0][0] for case in _PAIRED_ROWS_CASES],
+)
+def test_paired_rows_routes_match_flashinfer(case, gated, program, cake_hits) -> None:
+    """Every paired row-major program serves its route: same outputs and state as FlashInfer."""
+    inputs = _make_case((*case, torch.bfloat16, "auto", False, None))
+    if gated:
+        generator = torch.Generator(device="cuda").manual_seed(1)
+        inputs["z"] = (
+            torch.randn(inputs["x"].shape, generator=generator, device="cuda") * 0.5
+        ).to(torch.bfloat16)
+    plan = _route(inputs)
+    assert plan is not None
+    if _routes_as_measured():
+        assert plan.program == program
+    reference, candidate = _split_arms(inputs)
+    out_reference = selective_state_update(**reference, backend="flashinfer")
+    out_candidate = cake_selective_state_update(**candidate)
+    assert cake_hits == [True], "the paired row-major route must run on Cake"
+    _assert_arms_close(candidate, out_candidate, reference, out_reference)
 
 
 def test_hd64_rows_plan_follows_the_work() -> None:
@@ -650,6 +858,129 @@ def test_hd64_rows_plan_follows_the_work() -> None:
     assert cake.hd64_rows_plan(4, 128, torch.float32, sm_count) == (2, 4)
     assert cake.hd64_rows_plan(8, 128, torch.float32, sm_count) == (1, 4)
     assert cake.hd64_rows_plan(64, 128, torch.float32, sm_count) == (1, 4)
+
+
+def test_hd64_rows_program_follows_the_bands() -> None:
+    """The rendered row-owner build of each band; ``None`` keeps the carried FP32 program."""
+    f32, bf16 = torch.float32, torch.bfloat16
+    program = cake.hd64_rows_program
+    for arch in ("sm_100a", "sm_103a"):
+        assert program(bf16, False, 8, 128, arch, 128) == ("stp_hd64_rows_bf16_dt8", 4)
+        assert program(bf16, True, 8, 128, arch, 128) == (
+            "stp_hd64_rows_bf16_dt8_bf16_i32",
+            4,
+        )
+        assert program(f32, False, 8, 128, arch, 128) == ("stp_hd64_rows_fp32_dt8", 4)
+        assert program(f32, True, 8, 128, arch, 128) == (
+            "stp_hd64_rows_fp32_dt8_bf16_i32",
+            4,
+        )
+    # Four BF16 tiles: one build per architecture in the canonical ABI; in the raw ABI the one-division build,
+    # but on sm_103a below 64 heads the x-in-all-lanes build.
+    for nheads in (32, 63, 64, 128):
+        assert program(bf16, False, 4, 512, "sm_100a", nheads) == (
+            "stp_hd64_rows_bf16_dt4_xa_od",
+            4,
+        )
+        assert program(bf16, False, 4, 512, "sm_103a", nheads) == (
+            "stp_hd64_rows_bf16_dt4_od",
+            4,
+        )
+        assert program(bf16, True, 4, 512, "sm_100a", nheads) == (
+            "stp_hd64_rows_bf16_dt4_od_bf16_i32",
+            4,
+        )
+    for nheads, build in ((32, "xa"), (63, "xa"), (64, "od"), (128, "od")):
+        assert program(bf16, True, 4, 512, "sm_103a", nheads) == (
+            f"stp_hd64_rows_bf16_dt4_{build}_bf16_i32",
+            4,
+        )
+    for arch in ("sm_100a", "sm_103a"):
+        # Four and two FP32 tiles: raw-ABI builds only; a canonical call keeps the carried program.
+        assert program(f32, True, 4, 256, arch, 128) == (
+            "stp_hd64_rows_fp32_dt4_bf16_i32",
+            4,
+        )
+        assert program(f32, True, 2, 512, arch, 128) == (
+            "stp_hd64_rows_fp32_dt2_bf16_i32",
+            4,
+        )
+        assert program(f32, False, 4, 256, arch, 128) is None
+        assert program(f32, False, 2, 512, arch, 128) is None
+        # One tile per head, by batch-heads.
+        assert program(f32, False, 1, 4096, arch, 128) == ("stp_hd64_rows_fp32_dt1", 4)
+        assert program(f32, True, 1, 2048, arch, 128) == (
+            "stp_hd64_rows_fp32_dt1_bf16_i32",
+            2,
+        )
+        l2_prefetch = ("stp_hd64_rows_fp32_dt1_l2_prefetch_bf16_i32", 4)
+        assert program(f32, True, 1, 2049, arch, 128) == l2_prefetch
+        assert program(f32, True, 1, 4096, arch, 128) == l2_prefetch
+        for raw_abi in (False, True):
+            assert program(f32, raw_abi, 1, 4097, arch, 128) is None
+            assert program(f32, raw_abi, 1, 8191, arch, 128) is None
+        # From 8192 batch-heads: the four-tile read-ahead build in either ABI.
+        assert program(f32, False, 1, 8192, arch, 128) == (
+            "stp_hd64_rows_fp32_dt1_large",
+            4,
+        )
+        assert program(f32, True, 1, 32768, arch, 128) == (
+            "stp_hd64_rows_fp32_dt1_large_bf16_i32",
+            4,
+        )
+
+
+def test_cache_program_follows_the_projection_layout() -> None:
+    """The three prebuilt projection layouts run their rendered builds, the canonical ones on exactly 64 heads of
+    the layout's group count with dense slots the folded builds; any other layout keeps the carried program."""
+
+    def layout(raw_abi, nheads, ngroups, x_stride, dt_stride, bc_stride):
+        coefficient = torch.bfloat16 if raw_abi else torch.float32
+        index = torch.int32 if raw_abi else torch.int64
+        return cake.cache_defines(
+            coefficient,
+            index,
+            nheads,
+            ngroups,
+            x_stride,
+            dt_stride,
+            bc_stride,
+            bc_stride,
+        )
+
+    def program(defines, nheads=64, ngroups=1, dense_slots=True):
+        return cake.mtp_cache_program(
+            defines, nheads=nheads, ngroups=ngroups, dense_slots=dense_slots
+        )
+
+    groups1 = layout(False, 64, 1, (24576, 4096), (384, 64), (768, 128))
+    groups8 = layout(False, 64, 8, (24576, 4096), (384, 64), (6144, 1024))
+    raw = layout(True, 64, 1, (26112, 4352), (51072, 8512), (26112, 4352))
+    assert program(groups1) == ("mtp_cache_groups1_heads64", ())
+    assert program(groups8, ngroups=8) == ("mtp_cache_groups8_heads64", ())
+    assert program(raw) == ("mtp_cache_bf16_i32", ())
+    assert program(raw, dense_slots=False) == ("mtp_cache_bf16_i32", ())
+    # The canonical layouts off the folded counts or slots keep the layout's build: fewer heads in a 64-head
+    # projection, fewer groups in an 8-group one, a slot stride other than the dense one.
+    assert program(groups1, nheads=32) == ("mtp_cache_groups1", ())
+    assert program(groups8, nheads=32, ngroups=8) == ("mtp_cache_groups8", ())
+    assert program(groups8, ngroups=4) == ("mtp_cache_groups8", ())
+    assert program(groups1, dense_slots=False) == ("mtp_cache_groups1", ())
+    assert program(groups8, ngroups=8, dense_slots=False) == ("mtp_cache_groups8", ())
+    # They are the carried program's prebuilt instantiations.
+    listed = cake.MODULES[cake.PROGRAMS["mtp_cache_c4_t6"]]["instantiations"]
+    assert {cake.define_digest(d) for d in (groups1, groups8, raw)} == set(listed)
+    for defines, nheads, ngroups in (
+        (layout(False, 64, 1, (26112, 4352), (384, 64), (768, 128)), 64, 1),  # padded x
+        (layout(False, 32, 1, (12288, 2048), (192, 32), (768, 128)), 32, 1),  # 32 heads
+        (
+            layout(False, 64, 4, (24576, 4096), (384, 64), (3072, 512)),
+            64,
+            4,
+        ),  # 4 groups
+        (layout(True, 64, 2, (26112, 4352), (51072, 8512), (26112, 4352)), 64, 2),
+    ):
+        assert program(defines, nheads, ngroups) == ("mtp_cache_c4_t6", defines)
 
 
 def _case(name):
@@ -678,7 +1009,7 @@ def _route(inputs, output_like=None):
     )
     return cake.plan_route(
         **{key: inputs[key] for key in forwarded},
-        z=None,
+        z=inputs.get("z"),
         output=torch.empty(
             tuple((inputs["x"] if output_like is None else output_like).shape),
             dtype=torch.bfloat16,
@@ -697,7 +1028,7 @@ def _route(inputs, output_like=None):
 def test_dynamic_route_falls_back_for_non_contiguous_inputs(cake_hits) -> None:
     """A padded projection view reaches FlashInfer instead of the binding's contiguity check."""
     inputs = _make_case(_case("dynamic0_b8"))
-    assert _route(inputs).program == "dynamic"
+    assert _route(inputs).program == "dynamic_lanes8"
     batch_size, token_steps, nheads, dim = inputs["x"].shape
     padded = torch.zeros(
         (batch_size, token_steps + 1, nheads, dim), dtype=torch.bfloat16, device="cuda"
@@ -706,7 +1037,7 @@ def test_dynamic_route_falls_back_for_non_contiguous_inputs(cake_hits) -> None:
     inputs["x"] = padded[:, :token_steps]
     assert not inputs["x"].is_contiguous()
     # The shapes still plan the launch; the binding rejects the padded rows before launching.
-    assert _route(inputs).program == "dynamic"
+    assert _route(inputs).program == "dynamic_lanes8"
     reference, candidate = _split_arms(inputs)
     out_reference = selective_state_update(**reference, backend="flashinfer")
     out_candidate = cake_selective_state_update(**candidate)
@@ -752,9 +1083,9 @@ def _assert_falls_back(inputs, cake_hits):
 
 @requires_blackwell
 def test_identity_route_falls_back_for_non_broadcast_coefficients(cake_hits) -> None:
-    """A dense A (one value per element instead of one per head) never reaches the FP32 identity program."""
+    """A dense A (one value per element instead of one per head) never reaches the 128x128 FP32 program."""
     inputs = _make_case(_case("stp_fp32"))
-    assert _route(inputs).program == "stp_fp32_identity"
+    assert _route(inputs).program == "stp_dim128_fp32"
     inputs["A"] = inputs["A"].contiguous()
     assert _route(inputs) is None
     _assert_falls_back(inputs, cake_hits)
@@ -770,20 +1101,18 @@ def test_identity_route_falls_back_for_non_contiguous_inputs(cake_hits) -> None:
     storage[:, 0].copy_(inputs["x"])
     inputs["x"] = storage[:, 0]
     assert not inputs["x"].is_contiguous()
-    assert (
-        _route(inputs).program == "stp_fp32_identity"
-    )  # planned; the binding rejects the padded rows
+    assert _route(inputs) is None  # the route serves contiguous rows only
     _assert_falls_back(inputs, cake_hits)
 
 
 @requires_blackwell
 def test_short_route_falls_back_for_non_contiguous_inputs(cake_hits) -> None:
     inputs = _make_case(_case("mtp_short2"))
-    assert _route(inputs).program == "mtp_short"
+    assert _route(inputs).program == "mtp_short_prefetch_heads64_groups8"
     inputs["x"] = _padded_steps(inputs["x"])
     assert not inputs["x"].is_contiguous()
     assert (
-        _route(inputs).program == "mtp_short"
+        _route(inputs).program == "mtp_short_prefetch_heads64_groups8"
     )  # planned; the binding rejects the padded rows
     _assert_falls_back(inputs, cake_hits)
 
@@ -805,7 +1134,7 @@ def test_horizontal_route_serves_padded_rows(cake_hits) -> None:
     inputs = _make_case(_case("mtp_horizontal"))
     inputs["x"] = _padded_steps(inputs["x"])
     assert not inputs["x"].is_contiguous()
-    assert _route(inputs).program == "mtp_horizontal"
+    assert _route(inputs).program == "mtp_horizontal_early"
     reference, candidate = _split_arms(inputs)
     out_reference = selective_state_update(**reference, backend="flashinfer")
     out_candidate = cake_selective_state_update(**candidate)
@@ -817,14 +1146,14 @@ def test_horizontal_route_serves_padded_rows(cake_hits) -> None:
 def test_horizontal_route_falls_back_for_non_contiguous_inputs(cake_hits) -> None:
     """The slot tables are read directly (the binding checks their contiguity): a strided table falls back."""
     inputs = _make_case(_case("mtp_horizontal"))
-    assert _route(inputs).program == "mtp_horizontal"
+    assert _route(inputs).program == "mtp_horizontal_early"
     table = torch.zeros((inputs["x"].shape[0], 2), dtype=torch.int64, device="cuda")
     table[:, 0] = inputs["state_batch_indices"]
     inputs["state_batch_indices"] = table[:, 0]
     inputs["intermediate_state_indices"] = table[:, 0]
     assert not inputs["state_batch_indices"].is_contiguous()
     assert (
-        _route(inputs).program == "mtp_horizontal"
+        _route(inputs).program == "mtp_horizontal_early"
     )  # planned; the binding rejects the strided table
     _assert_falls_back(inputs, cake_hits)
 
@@ -840,6 +1169,36 @@ def test_horizontal_route_falls_back_for_mismatched_shapes() -> None:
     assert _route(dict(inputs, C=inputs["C"][..., :64].contiguous())) is None
 
 
+# (case, program, grid): the multi-token routes' builds and launch grids.
+_MULTI_TOKEN_ROUTES = (
+    ("dynamic0", "dynamic_lanes8", (1, 16, 4)),
+    ("dynamic1", "dynamic_lanes16", (1, 16, 8)),
+    ("dynamic0_b8", "dynamic_lanes8", (8, 16, 4)),
+    ("mtp_cache", "mtp_cache_groups8_heads64", (1, 64, 4)),
+    ("mtp_cache_g1", "mtp_cache_groups1_heads64", (1, 64, 4)),
+    ("mtp_short2", "mtp_short_prefetch_heads64_groups8", (64 * 64, 1, 1)),
+    ("mtp_short2_h32", "mtp_short_prefetch", (64 * 32, 1, 1)),
+    ("mtp_horizontal", "mtp_horizontal_early", (32 * 64 // 2, 1, 1)),
+    ("mtp_horizontal_b64", "mtp_horizontal_direct", (64 * 64 // 2, 1, 1)),
+    ("stp_fp32", "stp_dim128_fp32", (8, 64, 64)),
+)
+
+
+@requires_blackwell
+@pytest.mark.parametrize(
+    "case_name, program, grid",
+    _MULTI_TOKEN_ROUTES,
+    ids=[route[0] for route in _MULTI_TOKEN_ROUTES],
+)
+def test_routes_pick_the_build_and_grid(case_name, program, grid) -> None:
+    """The dynamic program runs 16 lanes per row below eight batch rows of a multi-token call; the horizontal
+    producer runs one CTA per work group, the early-index build up to eight work groups per SM."""
+    plan = _route(_make_case(_case(case_name)))
+    assert plan is not None
+    if _routes_as_measured():
+        assert (plan.program, plan.grid, plan.defines) == (program, grid, ())
+
+
 def _unlisted_projection_layout(x):
     """``x`` with one spare head of padding per step: a projection layout no listed cache instantiation has."""
     batch_size, token_steps, nheads, dim = x.shape
@@ -852,7 +1211,8 @@ def _unlisted_projection_layout(x):
 
 @requires_blackwell
 @pytest.mark.parametrize(
-    "case_name, program", [("dynamic0_b8", "dynamic"), ("mtp_cache", "mtp_cache_c4_t6")]
+    "case_name, program",
+    [("dynamic0_b8", "dynamic_lanes8"), ("mtp_cache", "mtp_cache_groups8_heads64")],
 )
 def test_routes_fall_back_when_jit_is_disabled_and_the_build_is_missing(
     case_name, program, monkeypatch, cake_hits
@@ -959,52 +1319,6 @@ def test_cache_defines_follow_the_storage_dtypes_and_projection_layout() -> None
     )
 
 
-def test_direct_defines_follow_the_head_ratio_and_grid() -> None:
-    assert cake.direct_defines(1, 512) == (
-        ("HEADS_PER_GROUP_STATIC", 0),
-        ("DIRECT_UNROLL", 4),
-    )
-    assert cake.direct_defines(8, 1024) == (
-        ("HEADS_PER_GROUP_STATIC", 8),
-        ("DIRECT_UNROLL", 4),
-    )
-    assert cake.direct_defines(8, 2048) == (
-        ("HEADS_PER_GROUP_STATIC", 8),
-        ("DIRECT_UNROLL", 1),
-    )
-    assert cake.direct_defines(16, 4096) == (
-        ("HEADS_PER_GROUP_STATIC", 16),
-        ("DIRECT_UNROLL", 4),
-    )
-
-
-def test_shipped_stp_program_follows_the_head_ratio_and_grid() -> None:
-    """The BF16 single-token clones keep their selection rules, and every one of them is present as source."""
-    sm_count = 148
-    assert cake.shipped_stp_program(1, 512, sm_count) == "stp_bf16_direct"
-    assert cake.shipped_stp_program(4, 512, sm_count) == "stp_bf16_direct"
-    assert cake.shipped_stp_program(8, 1024, sm_count) == "stp_bf16_ratio8"
-    assert cake.shipped_stp_program(8, 2048, sm_count) == "stp_bf16_ratio8_saturated"
-    assert cake.shipped_stp_program(16, 2048, sm_count) == "stp_bf16_ratio16"
-    # The direct cap is nine resident waves of three CTAs per SM; above it the persistent program runs.
-    assert cake.shipped_stp_program(16, 27 * sm_count, sm_count) == "stp_bf16_ratio16"
-    assert (
-        cake.shipped_stp_program(16, 27 * sm_count + 1, sm_count)
-        == "stp_bf16_persistent"
-    )
-    assert (
-        cake.shipped_stp_program(1, 27 * sm_count + 1, sm_count)
-        == "stp_bf16_persistent"
-    )
-    for name in cake._SHIPPED_STP:
-        assert (
-            cake._source_dir() / "cuda" / f"cake_selective_state_update_{name}.cu"
-        ).is_file()
-        assert (
-            cake._source_dir() / "host" / f"cake_selective_state_update_{name}.cc"
-        ).is_file()
-
-
 def test_jit_names_stay_within_the_file_name_limit() -> None:
     """Every delivered instantiation is named by its define-set digest (never the spelled-out defines)."""
     seen = set()
@@ -1036,75 +1350,66 @@ def test_jit_names_stay_within_the_file_name_limit() -> None:
         cake.define_digest(raw)
         in cake.MODULES[cake.PROGRAMS["mtp_cache_c4_t6"]]["instantiations"]
     )
-    # The paired row-major route composes the same define tuples as the table on both residency
-    # schedules (16 x 64 program heads inside the sm_100a band, 64 x 64 above it).
-    paired = cake.MODULES[cake.PROGRAMS["stp_paired_rows"]]["instantiations"]
-    program, residency = cake._paired_rows_program(16 * 64, 148, "sm_100a")
-    assert (program, residency) == ("stp_paired_rows", (("LAUNCH_MIN_BLOCKS", 4),))
-    band = (
-        cake.direct_defines(8, 512)
-        + cake.batch_abi_defines(torch.bfloat16, torch.int32, True, 2)
-        + residency
-    )
-    assert cake.define_digest(band) in paired
-    _, residency = cake._paired_rows_program(64 * 64, 148, "sm_100a")
-    assert residency == (("LAUNCH_MIN_BLOCKS", 3),)
-    above = (
-        cake.direct_defines(8, 2048)
-        + cake.batch_abi_defines(torch.float32, torch.int64, True, 2)
-        + residency
-    )
-    assert cake.define_digest(above) in paired
 
 
 def test_aot_table_names_every_delivered_build() -> None:
-    """The AOT specifications are exactly the loader's build specifications: one per program instantiation
-    a route of the architecture selects."""
-    default = cake._PAIRED_ROWS_MIN_BLOCKS
+    """The AOT specifications are exactly the loader's build specifications: every program instantiation, on
+    both architectures."""
     for arch in ("sm_100a", "sm_103a"):
         expected = set()
         for module, record in cake.MODULES.items():
             for values in (record["instantiations"] or {"": {}}).values():
                 defines = tuple((name, int(values[name])) for name in record["defines"])
-                if (
-                    values.get("LAUNCH_MIN_BLOCKS", default) != default
-                    and arch not in cake._PAIRED_ROWS_MIN_BLOCKS_BANDS
-                ):
-                    continue  # the four-CTA residency band exists on sm_100a only
                 expected.add(cake.jit_spec(module, arch, defines).name)
         specs = cake.gen_cake_selective_state_update_modules(arch)
         assert len(specs) == len(expected)
         assert {spec.name for spec in specs} == expected
-    # The two LAUNCH_MIN_BLOCKS=4 instantiations of the paired row-major program are built for
-    # sm_100a alone; every other build is shared by both architectures.
-    module = cake.PROGRAMS["stp_paired_rows"]
-    four_cta = [
-        digest
-        for digest, values in cake.MODULES[module]["instantiations"].items()
-        if values["LAUNCH_MIN_BLOCKS"] == 4
-    ]
-    assert len(four_cta) == 2
-    built = {
-        arch: {spec.name for spec in cake.gen_cake_selective_state_update_modules(arch)}
-        for arch in ("sm_100a", "sm_103a")
-    }
-    for digest in four_cta:
-        assert f"{module}_sm_100a_{digest}" in built["sm_100a"]
-        assert f"{module}_sm_103a_{digest}" not in built["sm_103a"]
-    assert len(built["sm_100a"]) == len(built["sm_103a"]) + 2
 
 
 def test_registry_names_every_program() -> None:
-    assert set(cake.PROGRAMS) == {
-        "stp_paired_rows",
-        "stp_hd64_rows_bf16",
-        "stp_hd64_rows_fp32",
-        "stp_fp32_identity",
-        "mtp_short",
-        "mtp_cache_c4_t6",
-        "mtp_horizontal",
-        "dynamic",
+    paired_rows = {
+        f"stp_hd64_paired_{variant}{abi}"
+        for variant in ("hpc1_ratio8", "hpc1", "hpc2_mb2", "hpc2", "hpc4")
+        for abi in ("", "_bf16_i32")
+    } | {"stp_dim128_hpc2", "stp_dim128_hpc1_mb4", "stp_dim128_z_gated"}
+    rows = {
+        f"stp_hd64_rows_{band}{abi}"
+        for band in ("bf16_dt8", "bf16_dt4_od", "fp32_dt8", "fp32_dt1_large")
+        for abi in ("", "_bf16_i32")
+    } | {
+        "stp_hd64_rows_bf16_dt4_xa_od",
+        "stp_hd64_rows_bf16_dt4_xa_bf16_i32",
+        "stp_hd64_rows_fp32_dt1",
+        "stp_hd64_rows_fp32_dt4_bf16_i32",
+        "stp_hd64_rows_fp32_dt2_bf16_i32",
+        "stp_hd64_rows_fp32_dt1_bf16_i32",
+        "stp_hd64_rows_fp32_dt1_l2_prefetch_bf16_i32",
+        "stp_dim128_fp32",
     }
+    multi_token = {
+        "dynamic_lanes8",
+        "dynamic_lanes16",
+        "mtp_cache_groups1",
+        "mtp_cache_groups8",
+        "mtp_cache_bf16_i32",
+        "mtp_cache_groups1_heads64",
+        "mtp_cache_groups8_heads64",
+        "mtp_short_prefetch",
+        "mtp_short_prefetch_heads64_groups8",
+        "mtp_horizontal_early",
+        "mtp_horizontal_direct",
+    }
+    # The carried programs: the FP32 row-owner tile under the tile plan's defines (bands without a rendered
+    # build) and the six-token cache producer instantiated per projection layout (layouts beyond the rendered
+    # three).
+    carried = {"stp_hd64_rows_fp32", "mtp_cache_c4_t6"}
+    assert set(cake.PROGRAMS) == paired_rows | rows | multi_token | carried
+    assert len(cake.PROGRAMS) == 42
+    for program in carried:
+        assert cake.MODULES[cake.PROGRAMS[program]]["defines"]
+    for program in set(cake.PROGRAMS) - carried:
+        assert cake.MODULES[cake.PROGRAMS[program]]["defines"] == []
+        assert cake.MODULES[cake.PROGRAMS[program]]["instantiations"] == {}
     assert set(cake.PROGRAMS.values()) == set(cake.MODULES)
     for record in cake.MODULES.values():
         assert len(record["sources"]) == 2

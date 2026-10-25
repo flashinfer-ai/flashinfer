@@ -122,9 +122,11 @@ class Geometry:
 
 
 GEOMETRIES = (
-    Geometry("e512_i512_k10", 2048, 512, 512, 10, (1, 2, 22, 23, 32)),
-    Geometry("e60_i1536_k4", 2048, 1536, 60, 4, (1, 7, 8, 10, 11, 12, 16, 17, 32)),
-    Geometry("e192_i1536_k4_silu", 6144, 1536, 192, 4, (1, 2, 32), SiLU()),
+    Geometry("e512_i512_k10", 2048, 512, 512, 10, (1, 3, 4, 32)),
+    Geometry(
+        "e60_i1536_k4", 2048, 1536, 60, 4, (1, 4, 5, 10, 11, 12, 14, 15, 16, 17, 32)
+    ),
+    Geometry("e192_i1536_k4_silu", 6144, 1536, 192, 4, (1, 32), SiLU()),
     Geometry(
         "e256_i2048_k6_clamp10",
         4096,
@@ -134,19 +136,19 @@ GEOMETRIES = (
         (1, 6, 7, 8, 9, 10, 11, 12, 22, 23, 24, 32),
         SwiGLU(limit=10.0),
     ),
-    Geometry("e384_i768_k4", 2560, 768, 384, 4, (1, 2, 32)),
-    Geometry("e128_i768_k8", 2048, 768, 128, 8, (1, 2, 32)),
-    Geometry("e128_i1536_k8", 4096, 1536, 128, 8, (1, 2, 32)),
-    Geometry("e256_i512_k8", 2048, 512, 256, 8, (1, 2, 32)),
+    Geometry("e384_i768_k4", 2560, 768, 384, 4, (1, 32)),
+    Geometry("e128_i768_k8", 2048, 768, 128, 8, (1, 7, 8, 15, 16, 32)),
+    Geometry("e128_i1536_k8", 4096, 1536, 128, 8, (1, 11, 12, 32)),
+    Geometry("e256_i512_k8", 2048, 512, 256, 8, (1, 15, 16, 32)),
     Geometry("e512_i1024_k10", 4096, 1024, 512, 10, (1, 2, 32)),
-    Geometry("e256_i1536_k8", 3072, 1536, 256, 8, (1, 2, 32)),
+    Geometry("e256_i1536_k8", 3072, 1536, 256, 8, (1, 15, 16, 32)),
     Geometry(
         "e128_i3072_k4_swiglu_oa",
         6144,
         3072,
         128,
         4,
-        (1, 2, 32),
+        (1, 3, 4, 32),
         SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
     ),
     Geometry(
@@ -200,17 +202,10 @@ def _selector_bucket(geometry: Geometry, num_tokens: int) -> str:
     )
     if isinstance(geometry.activation, SiTU):
         return "static_direct"
-    if key not in ((2048, 512, 512, 10), (2048, 1536, 60, 4)):
-        return "static_direct" if num_tokens == 1 else "persistent_direct"
+    if key != (2048, 1536, 60, 4):
+        return "persistent_direct"
 
-    if key == (2048, 512, 512, 10):
-        if num_tokens == 1:
-            return "static_direct"
-        if num_tokens <= 22:
-            return "persistent_direct"
-        return "persistent_general_route_packer"
-
-    if num_tokens <= 7:
+    if num_tokens <= 4:
         return "persistent_direct"
     if num_tokens <= 10:
         return "persistent_direct_padded_sfb"

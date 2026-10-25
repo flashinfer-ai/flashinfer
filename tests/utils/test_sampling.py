@@ -145,10 +145,13 @@ def test_validate_softmax_temperature_rejects_non_numeric_scalar(temperature):
         flashinfer.sampling._validate_softmax_temperature(logits, temperature)
 
 
-@pytest.mark.parametrize("rows", [128, 512, 1024])
-def test_blackwell_mr515_none_route_is_exact_and_correct(rows):
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("MR515 hybrid route is restricted to sm_103a")
+@pytest.mark.parametrize("rows", [128, 256, 384, 512, 1024])
+def test_blackwell_32k_rows_take_cached_cluster_route(rows):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
 
     logits = torch.randn((rows, 32000), device="cuda", dtype=torch.float32)
     route = flashinfer.sampling._blackwell_softmax_route_for_testing(
@@ -157,7 +160,7 @@ def test_blackwell_mr515_none_route_is_exact_and_correct(rows):
     actual = flashinfer.sampling.softmax(logits, temperature=None, enable_pdl=False)
     expected = torch.softmax(logits, dim=-1)
 
-    assert route == flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_MR515_V32000_T512
+    assert route == flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER
     assert actual.data_ptr() != logits.data_ptr()
     torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
 
@@ -182,40 +185,21 @@ def test_blackwell_scalar_one_pdl_b64_v32000_takes_cached_cluster_route():
 
 
 @pytest.mark.parametrize(
-    "rows,temperature,enable_pdl",
-    [
-        (4, None, False),
-        (64, None, False),
-        (256, None, False),
-        (128, None, True),
-        (512, 1.0, False),
-        (64, 1.0, True),
-        (64, 0.5, True),
-    ],
-)
-def test_blackwell_mr515_route_does_not_interpolate(rows, temperature, enable_pdl):
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("MR515 hybrid route is restricted to sm_103a")
-
-    logits = torch.empty((rows, 32000), device="cuda", dtype=torch.float32)
-    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
-        logits, temperature=temperature, enable_pdl=enable_pdl
-    )
-
-    assert route != flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_MR515_V32000_T512
-
-
-@pytest.mark.parametrize(
     "rows,vocab_size,temperature,enable_pdl,expected_route",
     [
         (1, 111, 0.5, False, 1),
-        (256, 32000, None, False, 2),
+        (256, 32004, None, False, 2),
         (1, 32004, None, False, 3),
-        (512, 32000, None, False, 4),
+        (256, 32000, None, False, 5),
+        (512, 32000, None, False, 5),
         (256, 32000, 0.5, False, 5),
         (256, 64000, None, False, 5),
         (1, 32000, None, False, 5),
         (1, 256000, None, False, 5),
+        (48, 256000, None, False, 6),
+        (100, 128000, 0.5, True, 6),
+        (256, 256000, None, False, 7),
+        (512, 128000, 0.5, True, 7),
     ],
 )
 def test_blackwell_softmax_all_negative_infinity_matches_public_semantics(
@@ -224,8 +208,6 @@ def test_blackwell_softmax_all_negative_infinity_matches_public_semantics(
     capability = torch.cuda.get_device_capability()
     if capability not in ((10, 0), (10, 3)):
         pytest.skip("Blackwell Softmax routes require SM100 or SM103")
-    if expected_route == 4 and capability != (10, 3):
-        pytest.skip("MR515 hybrid route is restricted to sm_103a")
 
     logits = torch.full((rows, vocab_size), -torch.inf, device="cuda")
     route = flashinfer.sampling._blackwell_softmax_route_for_testing(
@@ -257,19 +239,26 @@ def test_blackwell_route_observer_falls_back_off_blackwell():
 
 
 @pytest.mark.parametrize(
-    "rows,vocab_size,temperature_kind,enable_pdl",
+    "rows,vocab_size,temperature_kind,enable_pdl,expected_route",
     [
-        (1, 32000, "none", False),
-        (1, 262144, "none", False),  # widest cached row: 16 CTAs x 8 tiles
-        (8, 4096, "scalar", False),
-        (64, 32000, "scalar", True),  # scalar 0.5 leaves the sm_103a MR515 shape
-        (1024, 128000, "none", False),
-        (1024, 256000, "per_row", True),  # 16-CTA non-portable clusters
-        (989, 128256, "per_row", True),
+        (1, 32000, "none", False, "row"),
+        (1, 262144, "none", False, "row"),  # widest cached row: 16 CTAs x 8 tiles
+        (8, 4096, "scalar", False, "row"),
+        (64, 32000, "scalar", True, "row"),
+        (8, 256000, "none", False, "row"),  # 8-tile rows in one wave
+        (16, 256000, "none", False, "shared_tiles"),  # under the persistent threshold
+        (40, 151936, "scalar", False, "shared_tiles"),  # 5-tile chunks
+        (48, 256000, "per_row", True, "persistent"),  # persistent 16-CTA clusters
+        (100, 128000, "none", False, "persistent"),  # persistent 8-CTA clusters
+        (96, 100008, "none", False, "persistent"),  # a partial last tile in every row
+        (1024, 128000, "none", False, "shared_tiles"),  # 4+ rows per cluster
+        (1024, 256000, "per_row", True, "shared_tiles"),
+        (989, 128256, "per_row", True, "shared_tiles"),  # rows not a multiple of 8
+        (600, 100008, "scalar", False, "shared_tiles"),  # the last tile unreached
     ],
 )
 def test_blackwell_cached_cluster_route_is_selected_and_correct(
-    rows, vocab_size, temperature_kind, enable_pdl
+    rows, vocab_size, temperature_kind, enable_pdl, expected_route
 ):
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("Blackwell Softmax routes require SM100 or SM103")
@@ -293,7 +282,12 @@ def test_blackwell_cached_cluster_route_is_selected_and_correct(
         logits, temperature=temperature, enable_pdl=enable_pdl
     )
 
-    assert route == flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER
+    routes = {
+        "row": flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER,
+        "persistent": flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_PERSISTENT,
+        "shared_tiles": flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_SHARED_TILES,
+    }
+    assert route == routes[expected_route]
     assert probs.data_ptr() != logits.data_ptr()
     torch.testing.assert_close(probs, probs_ref, atol=1e-3, rtol=1e-3)
 
@@ -318,6 +312,8 @@ def test_blackwell_cached_cluster_route_declines_unaligned_rows(rows, vocab_size
     assert route not in (
         flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_FALLBACK,
         flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER,
+        flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_PERSISTENT,
+        flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_SHARED_TILES,
     )
     torch.testing.assert_close(
         probs, torch.softmax(logits, dim=-1), atol=1e-3, rtol=1e-3
@@ -389,12 +385,13 @@ def test_softmax(
     "batch_size,vocab_size,temperature_kind",
     [
         (1, 32000, "none"),  # cached cluster route, one row spread over 16 CTAs
-        (256, 32000, "none"),  # rowwise route (ties the cluster family here)
+        (256, 32000, "none"),  # cached cluster route, 4-CTA clusters
         (256, 64000, "none"),  # cached cluster route, 8-CTA clusters
         (512, 64000, "none"),  # cached cluster route, 8-CTA clusters
         (1024, 64000, "none"),  # cached cluster route, 8-CTA clusters
-        (1024, 256000, "none"),  # cached cluster route, 16-CTA non-portable clusters
-        (989, 128256, "per_row"),  # cached cluster route, per-row temperature
+        (48, 256000, "none"),  # persistent 16-CTA non-portable clusters
+        (1024, 256000, "none"),  # shared-tile 16-CTA non-portable clusters
+        (989, 128256, "per_row"),  # shared-tile 8-CTA clusters, per-row temperature
         (1, 32004, "none"),  # cooperative bootstrap route (vocab not a multiple of 8)
         (256, 32004, "none"),  # rowwise route (vocab not a multiple of 8)
         (1, 111, "scalar"),  # scalar-temperature warp-packed route

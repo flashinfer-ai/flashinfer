@@ -895,12 +895,12 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_source_hidden_bf16,
         smem_status = cudaFuncSetAttribute(
             reinterpret_cast<const void*>(kernel_cake_mxfp8_megamoe_ep16_755cbcfb83b38527fe16),
             cudaFuncAttributeMaxDynamicSharedMemorySize,
-            76800);
+            160768);
       if (smem_status == cudaSuccess) {
         smem_status = cudaFuncSetAttribute(
             reinterpret_cast<const void*>(kernel_cake_mxfp8_megamoe_ep16_2670aaff9ad59db52e36),
             cudaFuncAttributeMaxDynamicSharedMemorySize,
-            76800);
+            160768);
       }
       }
       smem_status_by_device->emplace(dev.device_id, smem_status);
@@ -1011,7 +1011,7 @@ inline void Submit(PreparedLaunch& prepared, cudaStream_t stream) {
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
   config.blockDim = block;
-  config.dynamicSmemBytes = 76800u;
+  config.dynamicSmemBytes = 160768u;
   config.stream = stream;
   config.attrs = attrs;
   config.numAttrs = n;

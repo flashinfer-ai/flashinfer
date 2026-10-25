@@ -327,6 +327,7 @@ def decode_front_plan(
         stagger=0,
         wait_warps=False,
         land_alias=bool(land_alias),
+        a_evict_first=DECODE_A_EVICT_FIRST,
         tiles=tiles,
     )
 
@@ -433,10 +434,17 @@ def decode_tail_plan(
         else 0,
         wait_warps=bool(use_rows and n_pad >= ROWS_NO_TMAP_PREFETCH_MIN_N_PAD),
         land_alias=bool(land_alias),
+        a_evict_first=bool(DECODE_A_EVICT_FIRST and tp == 1),
         tiles=tiles,
         k1=k1,
         k2=k2,
     )
+
+
+# The decode kernels stream every weight box once per launch: they load it with the ``evict_first`` L2 policy, so the
+# stream evicts its own lines first and the activations and outputs other kernels left in L2 survive it (front TP1 / TP8
+# and tail TP1 rows 8-16 % faster under a cold, dirty L2); the TP8 tail's short stream keeps the default policy (neutral).
+DECODE_A_EVICT_FIRST = True
 
 
 def decode_symbol(plan: dict[str, Any]) -> str:
@@ -455,6 +463,7 @@ def decode_symbol(plan: dict[str, Any]) -> str:
         f"{probe}{gate}{smem_b1}{rows}{'_tl' if plan['timeline'] else ''}{'' if plan['tmap_prefetch'] else '_np'}"
         f"{stagger}"
         f"{'_ww' if plan['wait_warps'] else ''}{'_la' if plan['land_alias'] else ''}"
+        f"{'_ef' if plan.get('a_evict_first') else ''}"
     )
 
 
@@ -672,21 +681,42 @@ TAIL_N128_STAGES = 9
 TAIL_FINAL_TS = True
 
 
-def tail_gemm_config(M: int, tp: int) -> tuple[int, int, bool]:
-    """``(num_stages, block_n, final_ts)`` of the production prefill tail GEMM instance for ``M`` tokens at ``tp``."""
+# TP1 prefill rows from ``tail_wide_min_tokens(sm_count)`` tokens run the 256 x 512 pair tile (a 4-stage ring,
+# single-buffered TMEM): a third fewer operand bytes per FLOP through L2 and shared memory, which the power-capped large
+# rows turn into time; below it the 512-wide items quantise into too few waves (2048 tokens: 112 items over 76 clusters).
+TAIL_WIDE_TP = 1
+TAIL_WIDE_STAGES = 4
+TAIL_WIDE_BLOCK_N = 512
+# Wide tile from 4096 tokens on 152 SMs (speedup at 4096: 1.03 wide vs 1.01-1.02 256-wide), 8192 on 148 (1.03 vs 1.06).
+TAIL_WIDE_MIN_T = 8192
+TAIL_WIDE_MIN_T_BY_SM_COUNT = {152: 4096}
+
+
+def tail_wide_min_tokens(sm_count: int = SM_COUNT) -> int:
+    """First TP1 token count of the 256 x 512 pair tile on a ``sm_count``-SM device."""
+    return TAIL_WIDE_MIN_T_BY_SM_COUNT.get(int(sm_count), TAIL_WIDE_MIN_T)
+
+
+def tail_gemm_config(
+    M: int, tp: int, sm_count: int = SM_COUNT
+) -> tuple[int, int, bool]:
+    """``(num_stages, block_n, final_ts)`` of the production prefill tail GEMM instance for ``M`` tokens at ``tp`` on a
+    ``sm_count``-SM device."""
     if int(tp) == TAIL_RING6_TP and int(M) <= TAIL_RING6_MAX_T:
         return TAIL_RING6_STAGES, BLOCK_N, TAIL_FINAL_TS
+    if int(tp) == TAIL_WIDE_TP and int(M) >= tail_wide_min_tokens(sm_count):
+        return TAIL_WIDE_STAGES, TAIL_WIDE_BLOCK_N, TAIL_FINAL_TS
     if int(tp) == TAIL_N128_TP and int(M) == TAIL_N128_T:
         return TAIL_N128_STAGES, TAIL_N128_BLOCK_N, False
     return TAIL_NUM_STAGES, BLOCK_N, TAIL_FINAL_TS
 
 
-def tail_gemm_num_stages(M: int, tp: int) -> int:
-    return tail_gemm_config(M, tp)[0]
+def tail_gemm_num_stages(M: int, tp: int, sm_count: int = SM_COUNT) -> int:
+    return tail_gemm_config(M, tp, sm_count)[0]
 
 
-def tail_gemm_final_ts(M: int, tp: int) -> bool:
-    return tail_gemm_config(M, tp)[2]
+def tail_gemm_final_ts(M: int, tp: int, sm_count: int = SM_COUNT) -> bool:
+    return tail_gemm_config(M, tp, sm_count)[2]
 
 
 def tail_gemm_kernel_key(
@@ -696,9 +726,11 @@ def tail_gemm_kernel_key(
     num_stages: int = TAIL_NUM_STAGES,
     block_n: int = BLOCK_N,
     final_ts: bool = False,
+    claim_items: bool = False,
 ) -> str:
-    """``tail_gemm:tp<tp>e<evict>f<fused>[s<stages>][n<block_n>][t1]``; the ring-depth, tile-width and final-item
-    staged-store suffixes appear only for a non-default instance."""
+    """``tail_gemm:tp<tp>e<evict>f<fused>[s<stages>][n<block_n>][t1][ci]``; the ring-depth, tile-width, final-item
+    staged-store and claimed-item suffixes appear only for a non-default instance (``ci``: the resident grid of one CTA
+    pair per resident cluster, which claims the items past its first from a device counter)."""
     key = f"tail_gemm:tp{int(tp)}e{1 if weights_evict_first else 0}f{1 if fused_norm else 0}"
     if int(num_stages) != TAIL_NUM_STAGES:
         key += f"s{int(num_stages)}"
@@ -706,6 +738,8 @@ def tail_gemm_kernel_key(
         key += f"n{int(block_n)}"
     if final_ts:
         key += "t1"
+    if claim_items:
+        key += "ci"
     return key
 
 
@@ -720,8 +754,8 @@ def _sk_max_seg(sk_tiles: int, num_k: int, ipc: int) -> int:
 def split_plan(
     cluster_tiles: int, num_k: int, sm_count: int, reuse_rows: int = 1
 ) -> dict[str, int]:
-    """Persistent plan: whole pair tiles for the full waves, a stream-K trailing wave when it wins by at least
-    ``SK_MIN_SAVING_ITERS`` (mirror of the Cake tail module's ``split_plan``; a near-whole remainder wave is not cut)."""
+    """Persistent plan: whole pair tiles for the full waves, then the remainder tiles cut into stream-K ranges when
+    that saves at least ``SK_MIN_SAVING_ITERS``; a near-whole remainder wave with partial B-tile reuse is not cut."""
     resident = max(1, sm_count // CTA_GROUP)
     full = (cluster_tiles // resident) * resident
     rem = cluster_tiles - full
@@ -746,29 +780,26 @@ def split_plan(
         )
     ):
         return plan
-    # Partial B-tile reuse: split only the remainder wave after a full wave (never the folded last full wave).
-    for sk_tiles in (rem,) if partial_reuse else (rem, rem + resident):
-        if sk_tiles > cluster_tiles:
+    # The last full wave stays whole: in stream-K each range pays two fp32 partial round trips (1-3 % slower, 148 SMs).
+    full_i = cluster_tiles - rem
+    total = rem * num_k
+    for g in range(min(resident, total // SK_MIN_ITERS), 0, -1):
+        ipc = (total + g - 1) // g
+        g2 = (total + ipc - 1) // ipc
+        max_seg = _sk_max_seg(rem, num_k, ipc)
+        if max_seg > MAX_SEG:
             continue
-        full_i = cluster_tiles - sk_tiles
-        total = sk_tiles * num_k
-        for g in range(min(resident, total // SK_MIN_ITERS), 0, -1):
-            ipc = (total + g - 1) // g
-            g2 = (total + ipc - 1) // ipc
-            max_seg = _sk_max_seg(sk_tiles, num_k, ipc)
-            if max_seg > MAX_SEG:
-                continue
-            cost = (full_i // resident) * num_k + ipc + SK_FIXUP_ITERS * (max_seg - 1)
-            if cost < best_cost and cost <= whole_cost - SK_MIN_SAVING_ITERS:
-                best_cost = cost
-                plan = {
-                    "num_items": full_i + g2,
-                    "full_items": full_i,
-                    "sk_ipc": ipc,
-                    "sk_max_seg": max_seg,
-                    "sk_total": total,
-                    "sk_tiles": sk_tiles,
-                }
+        cost = (full_i // resident) * num_k + ipc + SK_FIXUP_ITERS * (max_seg - 1)
+        if cost < best_cost and cost <= whole_cost - SK_MIN_SAVING_ITERS:
+            best_cost = cost
+            plan = {
+                "num_items": full_i + g2,
+                "full_items": full_i,
+                "sk_ipc": ipc,
+                "sk_max_seg": max_seg,
+                "sk_total": total,
+                "sk_tiles": rem,
+            }
     return plan
 
 
@@ -784,11 +815,33 @@ def weights_evict_first(gemm_ctas: int, sm_count: int) -> bool:
 
 
 FUSED_MIN_K2_ITERS = 48
+# u32 words of the fused-norm counter buffer: two row-release semaphores, the claim ticket and the
+# retirement count of the claimed instances (``_tail_workspace``).
+NORM_COUNTER_WORDS = 4
 
 
 def fused_norm_fits(M: int, gemm_ctas: int, sm_count: int) -> bool:
     """Single-wave grids whose epilogue warps can own every latent row (one row per warp)."""
     return gemm_ctas <= sm_count and TAIL_EPI_WARPS * gemm_ctas >= M
+
+
+def use_resident_fused_norm(
+    M: int, gemm_ctas: int, sm_count: int, k2_iters: int
+) -> bool:
+    """Rows with the long shared-expert window (TP1) that the single-wave fused norm does not cover (a multi-wave grid,
+    or more rows than its epilogue warps) fuse the norm on the resident grid: the launch holds one CTA pair per
+    resident cluster, which claims the items past its first from a device counter, and its epilogue warps normalise
+    every row (the first raster group's rows while the first item's shared-expert K blocks stream)."""
+    return k2_iters >= FUSED_MIN_K2_ITERS and not fused_norm_fits(
+        M, gemm_ctas, sm_count
+    )
+
+
+def resident_grid(num_items: int, sm_count: int) -> int:
+    """CTAs of the claimed launch: one CTA pair per resident cluster, at most one per item.  Every CTA of the claimed
+    instances allocates all 512 TMEM columns and more than half of the SM's shared memory, so one CTA runs per SM and
+    ``sm_count // 2`` pairs are resident at once, as the cooperative launch requires."""
+    return min(int(num_items), max(1, int(sm_count) // CTA_GROUP)) * CTA_GROUP
 
 
 def use_fused_norm(M: int, gemm_ctas: int, sm_count: int, k2_iters: int) -> bool:
@@ -805,13 +858,16 @@ def prefill_tail_plan(M: int, tp: int, sm_count: int = SM_COUNT) -> dict[str, An
     i_local = i_local_for_tp(tp)
     norm_grid = (M + NORM_ROWS_PER_CTA - 1) // NORM_ROWS_PER_CTA
     m_tiles = m_tiles_for(M)
-    num_stages, block_n, final_ts = tail_gemm_config(M, tp)
+    num_stages, block_n, final_ts = tail_gemm_config(M, tp, sm_count)
     n_tiles = HIDDEN // block_n
     cluster_tiles = (m_tiles // CTA_GROUP) * n_tiles
     num_k = (k_up + i_local) // BLOCK_K
     sk = split_plan(cluster_tiles, num_k, sm_count, min(GROUP_M, m_tiles) // CTA_GROUP)
     gemm_grid = sk["num_items"] * CTA_GROUP
     early = norm_early_trigger(gemm_grid, norm_grid, sm_count)
+    single_fused = use_fused_norm(M, gemm_grid, sm_count, i_local // BLOCK_K)
+    claim_items = use_resident_fused_norm(M, gemm_grid, sm_count, i_local // BLOCK_K)
+    launch_grid = resident_grid(sk["num_items"], sm_count) if claim_items else gemm_grid
     return dict(
         M=M,
         tp=tp,
@@ -821,10 +877,14 @@ def prefill_tail_plan(M: int, tp: int, sm_count: int = SM_COUNT) -> dict[str, An
         m_tiles=m_tiles,
         cluster_tiles=cluster_tiles,
         num_k=num_k,
-        gemm_grid=gemm_grid,
+        gemm_grid=launch_grid,
         early_trigger=bool(early),
-        weights_evict_first=bool(weights_evict_first(gemm_grid, sm_count)),
-        fused_norm=bool(use_fused_norm(M, gemm_grid, sm_count, i_local // BLOCK_K)),
+        # The claimed instances load the weights with the default L2 policy.
+        weights_evict_first=bool(
+            weights_evict_first(gemm_grid, sm_count) and not claim_items
+        ),
+        fused_norm=bool(single_fused or claim_items),
+        claim_items=bool(claim_items),
         num_stages=num_stages,
         block_n=block_n,
         final_ts=bool(final_ts),
@@ -878,6 +938,7 @@ def route_kernel_keys(
             plan["num_stages"],
             plan["block_n"],
             plan["final_ts"],
+            plan["claim_items"],
         )
         if plan["fused_norm"]:
             return (gemm,)
@@ -1004,8 +1065,15 @@ def _scratch(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Te
 def _tail_workspace(
     device: torch.device, sk_tiles: int, max_seg: int, block_n: int = BLOCK_N
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Stream-K fp32 partial workspace, self-resetting arrival counters and the fused-norm grid
-    semaphore (self-wrapping ``atom.inc``, never reset) per device and plan class."""
+    """Stream-K fp32 partial workspace, self-resetting arrival counters and the fused-norm words per
+    device and plan class.
+
+    The ``NORM_COUNTER_WORDS`` u32 words are zeroed once and never written by the host again:
+    ``[0]`` / ``[1]`` are the row-release semaphores (``atom.inc`` with limit grid - 1, so the
+    last arrival of a launch wraps each back to 0), ``[2]`` is the claimed instances' item ticket
+    and ``[3]`` their retirement count, which the last CTA to retire resets to 0 with ``[2]``.
+    Eager launches and graph replays therefore share one zero-initialised buffer.
+    """
     index = device.index if device.index is not None else torch.cuda.current_device()
     key = (index, int(sk_tiles), int(max_seg), int(block_n))
     entry = _TAIL_WS.get(key)
@@ -1015,7 +1083,7 @@ def _tail_workspace(
         entry = (
             torch.empty(n * BLOCK_M * block_n, dtype=torch.float32, device=dev),
             torch.zeros(max(2, sk_tiles * CTA_GROUP), dtype=torch.int32, device=dev),
-            torch.zeros(4, dtype=torch.uint32, device=dev),
+            torch.zeros(NORM_COUNTER_WORDS, dtype=torch.uint32, device=dev),
         )
         _TAIL_WS[key] = entry
     return entry
@@ -1392,6 +1460,7 @@ def prepare_kimi_k3_latent_moe_tail(
                 plan["num_stages"],
                 plan["block_n"],
                 plan["final_ts"],
+                plan["claim_items"],
             )
             # ``out_map``: the bf16 tensor map of ``out`` for the final-item staged TMA store (``t1`` instances bind it
             # by value from the same tensor as the ``out`` pointer; the argument plan of the 128-wide instance does not
@@ -1528,7 +1597,10 @@ __all__ = [
     "tail_gemm_config",
     "tail_gemm_final_ts",
     "tail_gemm_kernel_key",
+    "tail_wide_min_tokens",
     "use_fused_norm",
+    "use_resident_fused_norm",
+    "resident_grid",
     "fused_norm_fits",
     "FUSED_MIN_K2_ITERS",
     "weights_evict_first",

@@ -107,6 +107,7 @@ def test_fp16_output_requires_dense_formats():
         (QuantFormat.NVFP4, QuantFormat.NVFP4),
         (QuantFormat.MXFP4, QuantFormat.MXFP8),
         (QuantFormat.MXFP8, QuantFormat.MXFP8),
+        (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),
     ):
         assert not FrostLowLatencyRunner.supports_quant(
             QuantConfig(
@@ -118,11 +119,10 @@ def test_fp16_output_requires_dense_formats():
     assert FrostLowLatencyConfig.supported(120)
 
 
-def test_sm120_does_not_admit_tensor_core_tactics(monkeypatch):
+@pytest.mark.parametrize("arch", [(9, 0), (12, 0)])
+def test_fma_only_arch_does_not_admit_tensor_core_tactics(monkeypatch, arch):
     cfg, x, _, _, ids, scores, pack = _inputs(SwiGLU(), dtype=torch.float16)
-    monkeypatch.setattr(
-        "flashinfer.utils.get_compute_capability", lambda device: (12, 0)
-    )
+    monkeypatch.setattr("flashinfer.utils.get_compute_capability", lambda device: arch)
     runner = FrostLowLatencyRunner(cfg, x.device)
     runner.check_support()
     runner.build()
@@ -132,3 +132,22 @@ def test_sm120_does_not_admit_tensor_core_tactics(monkeypatch):
     )
     with pytest.raises(ValueError, match="Tensor Core"):
         runner.forward(buffers, 128)
+
+
+def test_sm90_rejects_unqualified_blockscaled_formats(monkeypatch):
+    cfg, x, _, _, _, _, _ = _inputs(SwiGLU())
+    monkeypatch.setattr(
+        "flashinfer.utils.get_compute_capability", lambda device: (9, 0)
+    )
+    assert FrostLowLatencyConfig.supported(90)
+    for weight, activation in (
+        (QuantFormat.MXFP4, QuantFormat.MXFP8),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8),
+        (QuantFormat.NVFP4, QuantFormat.NVFP4),
+    ):
+        runner = FrostLowLatencyRunner(
+            replace(cfg, quant=QuantConfig(weight=weight, activation=activation)),
+            x.device,
+        )
+        with pytest.raises(NotImplementedError, match="SM90 supports"):
+            runner.check_support()

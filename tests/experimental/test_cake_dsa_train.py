@@ -31,6 +31,7 @@ from tests.test_helpers.cake_dsa_train_reference import (
     calibrate_beta,
     compact_rows,
     compact_rows_loop,
+    derive_topk_length,
     globalize_gather_indices_loop,
     make_inputs,
     reference_fp64,
@@ -64,7 +65,6 @@ generated_program_available = cake_backend.generated_program_available
 key_pass_dq_mode = cake_backend.key_pass_dq_mode
 key_pass_ranges = cake_backend.key_pass_ranges
 offset_gather_kv_indices = cake_backend.offset_gather_kv_indices
-derive_topk_length = cake_backend.derive_topk_length
 plan_key_passes = cake_backend.plan_key_passes
 prepare_dsa_train = cake_backend.prepare_dsa_train
 record_for = cake_backend.record_for
@@ -605,7 +605,7 @@ def test_registry_record_is_well_formed():
         } <= set(cake_launch.STAGE_ARGS["bwd_main_natural"])
     for stage in stages:
         physical = record[stage]
-        assert physical["library"] == physical["module"] and physical["ffi_entry"]
+        assert physical["library"] and physical["ffi_entry"]
         for arch in record["arches"]:
             entry = libraries[f"{physical['library']}_{arch}"]
             assert entry["arch"] == arch and entry["entry"] == physical["ffi_entry"]
@@ -613,7 +613,9 @@ def test_registry_record_is_well_formed():
             assert all(
                 s.startswith("csrc/cake_dsa_h64_train/") for s in entry["sources"]
             )
-            assert all(physical["module"] in s for s in entry["sources"])
+            kinds = [Path(s).name.rsplit("_", 1) for s in entry["sources"]]
+            assert len({stem for stem, _ in kinds}) == 1
+            assert sorted(kind for _, kind in kinds) == ["binding.cu", "kernel.cu"]
             assert all(
                 (Path(cake_jit.__file__).parent / s).is_file() for s in entry["sources"]
             )
@@ -2861,7 +2863,7 @@ def test_registry_programs_are_well_formed(program):
     pending = []
     for stage in stages:
         physical = record[stage]
-        assert physical["library"] == physical["module"] and physical["ffi_entry"]
+        assert physical["library"] and physical["ffi_entry"]
         for arch in record["arches"]:
             entry = libraries.get(f"{physical['library']}_{arch}")
             if entry is None:
@@ -2923,7 +2925,9 @@ def test_nope_stage_names_and_registry_accessors():
     assert cake_jit.STAGE_PREFIX == {cake_jit.PROGRAM: "", NOPE_PROGRAM: "nope_"}
     assert tuple(f"nope_{s}" for s in cake_jit.STAGES) == cake_jit.NOPE_STAGES
     assert cake_jit.NOPE_FORWARD_STAGES == ("nope_fwd",)
-    assert cake_jit.NOPE_STAGES[1:] == cake_jit.NOPE_BACKWARD_STAGES
+    assert cake_jit.NOPE_STAGES[1:] == tuple(
+        cake_jit.stage_name(s, NOPE_PROGRAM) for s in cake_jit.STAGES[1:]
+    )
     assert cake_jit.STAGES_OF == {
         cake_jit.PROGRAM: cake_jit.STAGES,
         NOPE_PROGRAM: cake_jit.NOPE_STAGES,
@@ -3014,17 +3018,16 @@ def test_binding_run_signatures_match_the_stage_argument_lists(program):
     record = cake_jit.record(program)
     root = Path(cake_jit.__file__).parent
     pattern = re.compile(r"\bvoid\s+Run\s*\(([^)]*)\)\s*\{", re.S)
+    entries = {e["name"]: e for e in cake_build.manifest()["libraries"]}
     pending = []
     for stage in cake_jit.registered_stages(program):
-        binding = (
-            root
-            / "csrc"
-            / "cake_dsa_h64_train"
-            / f"{record[stage]['library']}_binding.cu"
-        )
-        if not binding.is_file():
+        name = cake_jit.library_name(stage, record["arches"][0], program)
+        sources = entries[name]["sources"] if name in entries else []
+        bindings = [root / s for s in sources if s.endswith("_binding.cu")]
+        if len(bindings) != 1 or not bindings[0].is_file():
             pending.append(stage)
             continue
+        binding = bindings[0]
         found = pattern.findall(binding.read_text())
         assert len(found) == 1, binding
         params = [p.strip().split()[-1] for p in found[0].split(",")]
@@ -3239,7 +3242,6 @@ INDEX_PREP_ARGS = (
     "grid_z",
 )
 _INDEX_PREP_STAND_IN = {
-    "module": f"{NOPE_PROGRAM}_stand_in_index_prep",
     "library": f"{NOPE_PROGRAM}_stand_in_index_prep",
     "ffi_entry": "run",
     "launch": {
@@ -3410,7 +3412,7 @@ def test_nope_record_registers_the_index_prep_stage_first():
     record = cake_jit.record(NOPE_PROGRAM)
     assert record["stages"][0] == NOPE_INDEX_PREP_STAGE
     stage = record[NOPE_INDEX_PREP_STAGE]
-    assert stage["library"] == stage["module"] and stage["ffi_entry"] == "run"
+    assert stage["library"] and stage["ffi_entry"] == "run"
     assert stage["launch"]["block"] == [128, 1, 1]
     assert stage["launch"]["cluster"] == [1, 1, 1]
     assert stage["launch"]["dynamic_smem_bytes"] == 0
@@ -3904,7 +3906,6 @@ def _completed_nope_record() -> dict:
         if stage not in record:
             library = f"{NOPE_PROGRAM}_stand_in_{stage}"
             record[stage] = {
-                "module": library,
                 "library": library,
                 "ffi_entry": "run",
                 "launch": {

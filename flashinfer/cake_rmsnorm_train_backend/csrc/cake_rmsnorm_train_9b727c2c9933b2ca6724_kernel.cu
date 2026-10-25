@@ -55,14 +55,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_GRP_FOLD_OFF 6144
 #define SMEM_GRP_FOLD_STAGE_BYTES 1024
 #define SMEM_GRP_FOLD_STRIDE 1024
-#if __CUDA_ARCH__ == 1070
-#define SMEM_TOTAL 7168
-#else
 #define SMEM_STAGE_OFF 7168
 #define SMEM_STAGE_STAGE_BYTES 98304
 #define SMEM_STAGE_STRIDE 98304
 #define SMEM_TOTAL 105472
-#endif
 #define THREADS 384
 
 #include <math_constants.h>
@@ -95,11 +91,8 @@ kernel_cake_rmsnorm_train_9b727c2c9933b2ca6724(float* __restrict__ partial, floa
     const int red_fold_addr = smem + 0;
     float* grp_fold = reinterpret_cast<float*>(smem_raw + 6144);
     const int grp_fold_addr = smem + 6144;
-#if __CUDA_ARCH__ == 1070
-#else
     uint8_t* stage = reinterpret_cast<uint8_t*>(smem_raw + 7168);
     const int stage_addr = smem + 7168;
-#endif
 
     // === Task calls (declaration order) ===
     asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -116,20 +109,6 @@ kernel_cake_rmsnorm_train_9b727c2c9933b2ca6724(float* __restrict__ partial, floa
         c[e] = 0.0f;
     }
     int n_trips = (n_chunks + 47) / 48;
-#if __CUDA_ARCH__ == 1070
-    #pragma unroll 4
-    for (int k = 0; k < n_trips; k++) {
-        int cc = rsub + k * 48;
-        if (cc < n_chunks) {
-            float _vec_load_0[4];
-            {
-                float4 _v4 = *reinterpret_cast<const float4*>(partial + (unsigned long long)cc * 1536 + (unsigned long long)col);
-                _vec_load_0[0 + 0] = _v4.x;
-                _vec_load_0[0 + 1] = _v4.y;
-                _vec_load_0[0 + 2] = _v4.z;
-                _vec_load_0[0 + 3] = _v4.w;
-            }
-#else
     int n_waves = (n_trips + 7) / 8;
     unsigned int slot0 = (unsigned int)stage_addr + (unsigned int)tid * 16;
     unsigned int zero_off = 0;
@@ -156,15 +135,7 @@ kernel_cake_rmsnorm_train_9b727c2c9933b2ca6724(float* __restrict__ partial, floa
         for (int d_1 = 0; d_1 < 8; d_1++) {
             int cc_1 = rsub + (w * 8 + d_1) * 48;
             long long src_1 = (long long)cc_1 * 1536 + (long long)col;
-#endif
             #pragma unroll
-#if __CUDA_ARCH__ == 1070
-            for (int e_1 = 0; e_1 < 4; e_1++) {
-                float y = __fmaf_rn(_vec_load_0[e_1], 1.0f, -c[e_1]);
-                float t = a[e_1] + y;
-                c[e_1] = t - a[e_1] - y;
-                a[e_1] = t;
-#else
             for (int q_1 = 0; q_1 < 1; q_1++) {
                 asm volatile(
                     "{\n\t"
@@ -232,18 +203,12 @@ kernel_cake_rmsnorm_train_9b727c2c9933b2ca6724(float* __restrict__ partial, floa
                 float t_1 = a[e_2] + y_1;
                 c[e_2] = t_1 - a[e_2] - y_1;
                 a[e_2] = t_1;
-#endif
             }
         }
     }
     #pragma unroll
-#if __CUDA_ARCH__ == 1070
-    for (int e_2 = 0; e_2 < 4; e_2++) {
-        red_fold[rsub * 32 + cg * 4 + e_2] = a[e_2] - c[e_2];
-#else
     for (int e_3 = 0; e_3 < 4; e_3++) {
         red_fold[rsub * 32 + cg * 4 + e_3] = a[e_3] - c[e_3];
-#endif
     }
     __syncthreads();
     if (tid < 64) {
@@ -252,48 +217,24 @@ kernel_cake_rmsnorm_train_9b727c2c9933b2ca6724(float* __restrict__ partial, floa
         float o[4];
         float oc[4];
         #pragma unroll
-#if __CUDA_ARCH__ == 1070
-        for (int e_3 = 0; e_3 < 4; e_3++) {
-            o[e_3] = 0.0f;
-            oc[e_3] = 0.0f;
-#else
         for (int e_4 = 0; e_4 < 4; e_4++) {
             o[e_4] = 0.0f;
             oc[e_4] = 0.0f;
-#endif
         }
         #pragma unroll
-#if __CUDA_ARCH__ == 1070
-        for (int k_1 = 0; k_1 < 6; k_1++) {
-#else
         for (int k = 0; k < 6; k++) {
-#endif
             #pragma unroll
-#if __CUDA_ARCH__ == 1070
-            for (int e_4 = 0; e_4 < 4; e_4++) {
-                float d = red_fold[(gi * 6 + k_1) * 32 + lane_1 * 4 + e_4];
-                float y_1 = __fmaf_rn(d, 1.0f, -oc[e_4]);
-                float t_1 = o[e_4] + y_1;
-                oc[e_4] = t_1 - o[e_4] - y_1;
-                o[e_4] = t_1;
-#else
             for (int e_5 = 0; e_5 < 4; e_5++) {
                 float d_6 = red_fold[(gi * 6 + k) * 32 + lane_1 * 4 + e_5];
                 float y_2 = __fmaf_rn(d_6, 1.0f, -oc[e_5]);
                 float t_2 = o[e_5] + y_2;
                 oc[e_5] = t_2 - o[e_5] - y_2;
                 o[e_5] = t_2;
-#endif
             }
         }
         #pragma unroll
-#if __CUDA_ARCH__ == 1070
-        for (int e_5 = 0; e_5 < 4; e_5++) {
-            grp_fold[gi * 32 + lane_1 * 4 + e_5] = o[e_5] - oc[e_5];
-#else
         for (int e_6 = 0; e_6 < 4; e_6++) {
             grp_fold[gi * 32 + lane_1 * 4 + e_6] = o[e_6] - oc[e_6];
-#endif
         }
     }
     __syncthreads();
@@ -301,44 +242,24 @@ kernel_cake_rmsnorm_train_9b727c2c9933b2ca6724(float* __restrict__ partial, floa
         float o2[4];
         float oc2[4];
         #pragma unroll
-#if __CUDA_ARCH__ == 1070
-        for (int e_6 = 0; e_6 < 4; e_6++) {
-            o2[e_6] = 0.0f;
-            oc2[e_6] = 0.0f;
-#else
         for (int e_7 = 0; e_7 < 4; e_7++) {
             o2[e_7] = 0.0f;
             oc2[e_7] = 0.0f;
-#endif
         }
         #pragma unroll
         for (int gk = 0; gk < 8; gk++) {
             #pragma unroll
-#if __CUDA_ARCH__ == 1070
-            for (int e_7 = 0; e_7 < 4; e_7++) {
-                float d2 = grp_fold[gk * 32 + tid * 4 + e_7];
-                float y_2 = __fmaf_rn(d2, 1.0f, -oc2[e_7]);
-                float t_2 = o2[e_7] + y_2;
-                oc2[e_7] = t_2 - o2[e_7] - y_2;
-                o2[e_7] = t_2;
-#else
             for (int e_8 = 0; e_8 < 4; e_8++) {
                 float d2 = grp_fold[gk * 32 + tid * 4 + e_8];
                 float y_3 = __fmaf_rn(d2, 1.0f, -oc2[e_8]);
                 float t_3 = o2[e_8] + y_3;
                 oc2[e_8] = t_3 - o2[e_8] - y_3;
                 o2[e_8] = t_3;
-#endif
             }
         }
         #pragma unroll
-#if __CUDA_ARCH__ == 1070
-        for (int e_8 = 0; e_8 < 4; e_8++) {
-            o2[e_8] = o2[e_8] - oc2[e_8];
-#else
         for (int e_9 = 0; e_9 < 4; e_9++) {
             o2[e_9] = o2[e_9] - oc2[e_9];
-#endif
         }
         int ocol2 = s * 32 + tid * 4;
         {

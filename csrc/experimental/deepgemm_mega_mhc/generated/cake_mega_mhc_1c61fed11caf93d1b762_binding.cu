@@ -66,6 +66,17 @@ int64_t NumelAbove(const TensorView& t, int trailing) {
   return product;
 }
 
+[[noreturn]] void NoInt64(int64_t a, const char* op, int64_t b) {
+  TVM_FFI_THROW(ValueError) << KERNEL_NAME << ": " << a << " " << op << " " << b
+                            << " has no int64 value in a host check";
+}
+
+int64_t CheckedMul(int64_t a, int64_t b) {
+  int64_t product;
+  if (__builtin_mul_overflow(a, b, &product)) NoInt64(a, "*", b);
+  return product;
+}
+
 cuuint64_t Extent(int64_t value, const char* descriptor) {
   TVM_FFI_CHECK(value > 0, ValueError)
       << KERNEL_NAME << ": an extent of descriptor '" << descriptor << "' resolves to " << value;
@@ -94,8 +105,8 @@ CUtensorMap EncodeTma_residual_map(const TensorView& t) {
   CheckUnitInnerStride(t, "residual_map");
   int64_t d1 = t.size(-1);
   int64_t d3 = t.size(-3);
-  cuuint64_t global_dim[3] = {Extent(d1, "residual_map"), Extent(d3, "residual_map"), Extent(4, "residual_map")};
-  cuuint64_t global_strides[2] = {Stride(((4 * d1) * 2), "residual_map"), Stride((d1 * 2), "residual_map")};
+  cuuint64_t global_dim[3] = {Extent(d1, "residual_map"), Extent(d3, "residual_map"), Extent(4LL, "residual_map")};
+  cuuint64_t global_strides[2] = {Stride(CheckedMul(CheckedMul(4LL, d1), 2LL), "residual_map"), Stride(CheckedMul(d1, 2LL), "residual_map")};
   cuuint32_t box_dim[3] = {64u, 64u, 4u};
   cuuint32_t elem_strides[3] = {1u, 1u, 1u};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[2] <= global_dim[2], ValueError)
@@ -228,8 +239,8 @@ CUtensorMap EncodeTma_new_residual_map(const TensorView& t) {
   CheckUnitInnerStride(t, "new_residual_map");
   int64_t d1 = t.size(-1);
   int64_t d3 = t.size(-3);
-  cuuint64_t global_dim[3] = {Extent(d1, "new_residual_map"), Extent(d3, "new_residual_map"), Extent(4, "new_residual_map")};
-  cuuint64_t global_strides[2] = {Stride(((4 * d1) * 2), "new_residual_map"), Stride((d1 * 2), "new_residual_map")};
+  cuuint64_t global_dim[3] = {Extent(d1, "new_residual_map"), Extent(d3, "new_residual_map"), Extent(4LL, "new_residual_map")};
+  cuuint64_t global_strides[2] = {Stride(CheckedMul(CheckedMul(4LL, d1), 2LL), "new_residual_map"), Stride(CheckedMul(d1, 2LL), "new_residual_map")};
   cuuint32_t box_dim[3] = {64u, 64u, 4u};
   cuuint32_t elem_strides[3] = {1u, 1u, 1u};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[2] <= global_dim[2], ValueError)
@@ -336,19 +347,21 @@ void Run(TensorView a_residual_map, TensorView a_x_map, TensorView a_fnp_map, Te
   check_same_device(a_y_fp4_sf, a_residual_map, "y_fp4_sf", "residual_map");
   check_contiguous(a_fp4_global_scale, "fp4_global_scale");
   check_same_device(a_fp4_global_scale, a_residual_map, "fp4_global_scale", "residual_map");
-  TVM_FFI_CHECK((a_num_tokens >= 1), ValueError)
+  TVM_FFI_CHECK((a_split_div >= 1LL), ValueError)
+      << KERNEL_NAME << ": requires (split_div >= 1)";
+  TVM_FFI_CHECK((a_num_tokens >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (num_tokens >= 1)";
-  TVM_FFI_CHECK((a_num_tokens <= 1048576), ValueError)
+  TVM_FFI_CHECK((a_num_tokens <= 1048576LL), ValueError)
       << KERNEL_NAME << ": requires (num_tokens <= 1048576)";
-  TVM_FFI_CHECK((a_num_splits >= 1), ValueError)
+  TVM_FFI_CHECK((a_num_splits >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (num_splits >= 1)";
-  TVM_FFI_CHECK((a_num_splits <= 64), ValueError)
+  TVM_FFI_CHECK((a_num_splits <= 64LL), ValueError)
       << KERNEL_NAME << ": requires (num_splits <= 64)";
-  TVM_FFI_CHECK((a_num_ctas >= 1), ValueError)
+  TVM_FFI_CHECK((a_num_ctas >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (num_ctas >= 1)";
-  TVM_FFI_CHECK(((a_num_ctas * 64) >= a_num_tokens), ValueError)
+  TVM_FFI_CHECK((CheckedMul(a_num_ctas, 64LL) >= a_num_tokens), ValueError)
       << KERNEL_NAME << ": requires ((num_ctas * 64) >= num_tokens)";
-  TVM_FFI_CHECK((a_num_sinkhorn_iters >= 1), ValueError)
+  TVM_FFI_CHECK((a_num_sinkhorn_iters >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (num_sinkhorn_iters >= 1)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
