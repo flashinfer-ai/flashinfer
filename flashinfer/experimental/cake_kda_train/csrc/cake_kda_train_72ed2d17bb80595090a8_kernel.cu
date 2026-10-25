@@ -407,8 +407,8 @@ kernel_cake_kda_train_72ed2d17bb80595090a8(const __grid_constant__ CUtensorMap d
             mbarrier_init(smem + 72, 1);
             // hd_empty: 1 barriers, init_count=256
             mbarrier_init(smem + 80, 256);
-            // d_committed: 1 barriers, init_count=1
-            mbarrier_init(smem + 88, 1);
+            // d_committed: 1 barriers, init_count=257
+            mbarrier_init(smem + 88, 257);
             // a_ready: 1 barriers, init_count=1
             mbarrier_init(smem + 96, 1);
             // a_drained: 1 barriers, init_count=256
@@ -496,6 +496,7 @@ kernel_cake_kda_train_72ed2d17bb80595090a8(const __grid_constant__ CUtensorMap d
             unsigned int _phase_h_full_0 = 0;
             unsigned int _phase_dh_full_0 = 0;
             unsigned int _phase_a_ready_0 = 0;
+            unsigned int _phase_dovn_full_0 = 0;
             unsigned int _phase_ops_full_0 = 0;
             unsigned int _phase_akkv_full_0 = 0;
             unsigned int _phase_b_ready_0 = 0;
@@ -561,6 +562,8 @@ kernel_cake_kda_train_72ed2d17bb80595090a8(const __grid_constant__ CUtensorMap d
                 mbarrier_arrive(hd_read_done_addr);
                 mbarrier_wait(a_ready_addr, _phase_a_ready_0);
                 _phase_a_ready_0 ^= 1;
+                mbarrier_wait(dovn_full_addr, _phase_dovn_full_0);
+                _phase_dovn_full_0 ^= 1;
                 mbarrier_wait(ops_full_addr, _phase_ops_full_0);
                 _phase_ops_full_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -1451,6 +1454,7 @@ kernel_cake_kda_train_72ed2d17bb80595090a8(const __grid_constant__ CUtensorMap d
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 mbarrier_arrive(c_drained_addr);
+                mbarrier_arrive(d_committed_addr);
                 mbarrier_wait(d_ready_addr, _phase_d_ready_0);
                 _phase_d_ready_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -1772,7 +1776,7 @@ kernel_cake_kda_train_72ed2d17bb80595090a8(const __grid_constant__ CUtensorMap d
         { // mma_main
             int nc_m = seq_chunk_start[num_seqs];
             int num_items_m = nc_m * num_heads;
-            unsigned int _phase_dovn_full_0 = 0;
+            unsigned int _phase_dovn_full_0_1 = 0;
             unsigned int _phase_dv2_full_0 = 0;
             unsigned int _phase_h_full_0_1 = 0;
             unsigned int _phase_dh_full_0_1 = 0;
@@ -1786,8 +1790,8 @@ kernel_cake_kda_train_72ed2d17bb80595090a8(const __grid_constant__ CUtensorMap d
                 for (unsigned int it_2 = bid; it_2 < num_items_m; it_2 += num_bids) {
                     int _cm = it_2 / (unsigned int)num_heads;
                     int clen_m = chunk_len[_cm];
-                    mbarrier_wait(dovn_full_addr, _phase_dovn_full_0);
-                    _phase_dovn_full_0 ^= 1;
+                    mbarrier_wait(dovn_full_addr, _phase_dovn_full_0_1);
+                    _phase_dovn_full_0_1 ^= 1;
                     mbarrier_wait(dv2_full_addr, _phase_dv2_full_0);
                     _phase_dv2_full_0 ^= 1;
                     mbarrier_wait(h_full_addr, _phase_h_full_0_1);
