@@ -100,6 +100,21 @@ cuuint64_t Stride(int64_t value, const char* descriptor) {
   return static_cast<cuuint64_t>(value);
 }
 
+CUtensorMap* TensorMapBuffer(const TensorView& t, int64_t count) {
+  TVM_FFI_CHECK(t.device().device_type == kDLCPU || t.device().device_type == kDLCUDAHost, ValueError)
+      << KERNEL_NAME << ": 'tensor_maps' must be a CPU tensor";
+  check_dtype(t, DLDataType{kDLUInt, 8, 1}, "tensor_maps");
+  check_contiguous(t, "tensor_maps");
+  const int64_t bytes = count * static_cast<int64_t>(sizeof(CUtensorMap));
+  TVM_FFI_CHECK(t.numel() == bytes, ValueError)
+      << KERNEL_NAME << ": 'tensor_maps' must hold exactly " << bytes << " bytes (" << count << " tensor maps), got "
+      << t.numel();
+  void* data = DataPtr(t);
+  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(data) % alignof(CUtensorMap) == 0, ValueError)
+      << KERNEL_NAME << ": 'tensor_maps' must be aligned to " << alignof(CUtensorMap) << " bytes";
+  return static_cast<CUtensorMap*>(data);
+}
+
 CUtensorMap EncodeTma_q_tma(const TensorView& t) {
   TVM_FFI_CHECK(t.ndim() >= 3, ValueError)
       << KERNEL_NAME << ": descriptor 'q_tma' takes a source of at least 3 dims, got " << t.ndim();
@@ -299,7 +314,10 @@ CUtensorMap EncodeTma_state_checkpoints_tma(const TensorView& t) {
   return map;
 }
 
-void Run(TensorView a_q, TensorView a_q_tma, TensorView a_k, TensorView a_k_tma, TensorView a_v, TensorView a_v_tma, TensorView a_g, TensorView a_g_tma, TensorView a_beta, TensorView a_beta_tma, TensorView a_A_log, TensorView a_dt_bias, TensorView a_cu_seqlens, TensorView a_seq_order, TensorView a_initial_state, TensorView a_out, TensorView a_out_tma, TensorView a_final_state, int64_t a_num_heads, int64_t a_use_initial_state, int64_t a_store_final_state, double a_scale, double a_lower_bound, int64_t a_state_indices_addr, int64_t a_state_checkpoints_addr, int64_t a_checkpoint_cu_starts_addr, int64_t a_beta_token_stride, int64_t a_state_slot_stride, int64_t a_use_state_indices, int64_t a_checkpoint_every_n_tokens, TensorView a_cu_chunk_offsets, TensorView a_chunk_state, TensorView a_state_checkpoint_needed, TensorView a_tape_qd, TensorView a_tape_kd, TensorView a_tape_kr, TensorView a_tape_j, TensorView a_tape_restore_factor, TensorView a_tape_e, TensorView a_tape_x, TensorView a_tape_r, TensorView a_norm_inv_out, TensorView a_decay_out, TensorView a_beta_active_out, TensorView a_initial_state_f32, TensorView a_zero_workspace, int64_t a_zero_words, int64_t a_num_sequences, TensorView a_state_checkpoints_tma, TensorView a_final_state_f32, int64_t a_g_token_stride, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+// The number of tensor maps the caller's buffer holds, in the order of the descriptor arguments.
+int64_t TensorMapCount() { return 7; }
+
+void EncodeTensorMaps(TensorView a_q, TensorView a_q_tma, TensorView a_k, TensorView a_k_tma, TensorView a_v, TensorView a_v_tma, TensorView a_g, TensorView a_g_tma, TensorView a_beta, TensorView a_beta_tma, TensorView a_A_log, TensorView a_dt_bias, TensorView a_cu_seqlens, TensorView a_seq_order, TensorView a_initial_state, TensorView a_out, TensorView a_out_tma, TensorView a_final_state, int64_t a_num_heads, int64_t a_use_initial_state, int64_t a_store_final_state, double a_scale, double a_lower_bound, int64_t a_state_indices_addr, int64_t a_state_checkpoints_addr, int64_t a_checkpoint_cu_starts_addr, int64_t a_beta_token_stride, int64_t a_state_slot_stride, int64_t a_use_state_indices, int64_t a_checkpoint_every_n_tokens, TensorView a_cu_chunk_offsets, TensorView a_chunk_state, TensorView a_state_checkpoint_needed, TensorView a_tape_qd, TensorView a_tape_kd, TensorView a_tape_kr, TensorView a_tape_j, TensorView a_tape_restore_factor, TensorView a_tape_e, TensorView a_tape_x, TensorView a_tape_r, TensorView a_norm_inv_out, TensorView a_decay_out, TensorView a_beta_active_out, TensorView a_initial_state_f32, TensorView a_zero_workspace, int64_t a_zero_words, int64_t a_num_sequences, TensorView a_state_checkpoints_tma, TensorView a_final_state_f32, int64_t a_g_token_stride, TensorView a_tensor_maps) {
   DLDevice dev = a_q.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   check_cuda_tensor(a_q, "q");
@@ -475,38 +493,233 @@ void Run(TensorView a_q, TensorView a_q_tma, TensorView a_k, TensorView a_k_tma,
       << KERNEL_NAME << ": requires (checkpoint_every_n_tokens >= 0)";
   TVM_FFI_CHECK((a_num_heads >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (num_heads >= 1)";
+  CUtensorMap* maps = TensorMapBuffer(a_tensor_maps, 7);
+  {
+    // Once per thread per device: the tensor-map encoders need this thread's context of the device bound.
+    static thread_local uint64_t prepared_devices = 0;
+    const uint64_t device_bit = dev.device_id < 64 ? uint64_t{1} << dev.device_id : uint64_t{0};
+    if (device_bit == 0 || (prepared_devices & device_bit) == 0) {
+      CheckCuda(cudaSetDevice(dev.device_id), "cudaSetDevice");
+      prepared_devices |= device_bit;
+    }
+  }
+  maps[0] = EncodeTma_q_tma(a_q_tma);
+  maps[1] = EncodeTma_k_tma(a_k_tma);
+  maps[2] = EncodeTma_v_tma(a_v_tma);
+  maps[3] = EncodeTma_g_tma(a_g_tma);
+  maps[4] = EncodeTma_beta_tma(a_beta_tma);
+  maps[5] = EncodeTma_out_tma(a_out_tma);
+  maps[6] = EncodeTma_state_checkpoints_tma(a_state_checkpoints_tma);
+}
+
+void Run(TensorView a_q, TensorView a_q_tma, TensorView a_k, TensorView a_k_tma, TensorView a_v, TensorView a_v_tma, TensorView a_g, TensorView a_g_tma, TensorView a_beta, TensorView a_beta_tma, TensorView a_A_log, TensorView a_dt_bias, TensorView a_cu_seqlens, TensorView a_seq_order, TensorView a_initial_state, TensorView a_out, TensorView a_out_tma, TensorView a_final_state, int64_t a_num_heads, int64_t a_use_initial_state, int64_t a_store_final_state, double a_scale, double a_lower_bound, int64_t a_state_indices_addr, int64_t a_state_checkpoints_addr, int64_t a_checkpoint_cu_starts_addr, int64_t a_beta_token_stride, int64_t a_state_slot_stride, int64_t a_use_state_indices, int64_t a_checkpoint_every_n_tokens, TensorView a_cu_chunk_offsets, TensorView a_chunk_state, TensorView a_state_checkpoint_needed, TensorView a_tape_qd, TensorView a_tape_kd, TensorView a_tape_kr, TensorView a_tape_j, TensorView a_tape_restore_factor, TensorView a_tape_e, TensorView a_tape_x, TensorView a_tape_r, TensorView a_norm_inv_out, TensorView a_decay_out, TensorView a_beta_active_out, TensorView a_initial_state_f32, TensorView a_zero_workspace, int64_t a_zero_words, int64_t a_num_sequences, TensorView a_state_checkpoints_tma, TensorView a_final_state_f32, int64_t a_g_token_stride, TensorView a_tensor_maps, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+  DLDevice dev = a_q.device();
+  tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
+  check_cuda_tensor(a_q, "q");
+  check_dtype(a_q, DLDataType{kDLBfloat, 16, 1}, "q");
+  check_cuda_tensor(a_q_tma, "q_tma");
+  check_dtype(a_q_tma, DLDataType{kDLBfloat, 16, 1}, "q_tma");
+  check_cuda_tensor(a_k, "k");
+  check_dtype(a_k, DLDataType{kDLBfloat, 16, 1}, "k");
+  check_cuda_tensor(a_k_tma, "k_tma");
+  check_dtype(a_k_tma, DLDataType{kDLBfloat, 16, 1}, "k_tma");
+  check_cuda_tensor(a_v, "v");
+  check_dtype(a_v, DLDataType{kDLBfloat, 16, 1}, "v");
+  check_cuda_tensor(a_v_tma, "v_tma");
+  check_dtype(a_v_tma, DLDataType{kDLBfloat, 16, 1}, "v_tma");
+  check_cuda_tensor(a_g, "g");
+  check_dtype(a_g, DLDataType{kDLBfloat, 16, 1}, "g");
+  check_cuda_tensor(a_g_tma, "g_tma");
+  check_dtype(a_g_tma, DLDataType{kDLBfloat, 16, 1}, "g_tma");
+  check_cuda_tensor(a_beta, "beta");
+  check_dtype(a_beta, DLDataType{kDLBfloat, 16, 1}, "beta");
+  check_cuda_tensor(a_beta_tma, "beta_tma");
+  check_dtype(a_beta_tma, DLDataType{kDLBfloat, 16, 1}, "beta_tma");
+  check_cuda_tensor(a_A_log, "A_log");
+  check_dtype(a_A_log, DLDataType{kDLFloat, 32, 1}, "A_log");
+  check_cuda_tensor(a_dt_bias, "dt_bias");
+  check_dtype(a_dt_bias, DLDataType{kDLFloat, 32, 1}, "dt_bias");
+  check_cuda_tensor(a_cu_seqlens, "cu_seqlens");
+  check_dtype(a_cu_seqlens, DLDataType{kDLInt, 64, 1}, "cu_seqlens");
+  check_cuda_tensor(a_seq_order, "seq_order");
+  check_dtype(a_seq_order, DLDataType{kDLInt, 32, 1}, "seq_order");
+  check_cuda_tensor(a_initial_state, "initial_state");
+  check_dtype(a_initial_state, DLDataType{kDLBfloat, 16, 1}, "initial_state");
+  check_cuda_tensor(a_out, "out");
+  check_dtype(a_out, DLDataType{kDLBfloat, 16, 1}, "out");
+  check_cuda_tensor(a_out_tma, "out_tma");
+  check_dtype(a_out_tma, DLDataType{kDLBfloat, 16, 1}, "out_tma");
+  check_cuda_tensor(a_final_state, "final_state");
+  check_dtype(a_final_state, DLDataType{kDLBfloat, 16, 1}, "final_state");
+  TVM_FFI_CHECK(a_num_heads >= -2147483648LL && a_num_heads <= 2147483647LL, ValueError)
+      << KERNEL_NAME << ": 'num_heads' = " << a_num_heads
+      << " is outside the i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(a_use_initial_state >= -2147483648LL && a_use_initial_state <= 2147483647LL, ValueError)
+      << KERNEL_NAME << ": 'use_initial_state' = " << a_use_initial_state
+      << " is outside the i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(a_store_final_state >= -2147483648LL && a_store_final_state <= 2147483647LL, ValueError)
+      << KERNEL_NAME << ": 'store_final_state' = " << a_store_final_state
+      << " is outside the i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(a_state_indices_addr >= 0LL && a_state_indices_addr <= 9223372036854775807LL, ValueError)
+      << KERNEL_NAME << ": 'state_indices_addr' = " << a_state_indices_addr
+      << " is outside the u64 range [0, 9223372036854775807]";
+  TVM_FFI_CHECK(a_state_checkpoints_addr >= 0LL && a_state_checkpoints_addr <= 9223372036854775807LL, ValueError)
+      << KERNEL_NAME << ": 'state_checkpoints_addr' = " << a_state_checkpoints_addr
+      << " is outside the u64 range [0, 9223372036854775807]";
+  TVM_FFI_CHECK(a_checkpoint_cu_starts_addr >= 0LL && a_checkpoint_cu_starts_addr <= 9223372036854775807LL, ValueError)
+      << KERNEL_NAME << ": 'checkpoint_cu_starts_addr' = " << a_checkpoint_cu_starts_addr
+      << " is outside the u64 range [0, 9223372036854775807]";
+  TVM_FFI_CHECK(a_use_state_indices >= -2147483648LL && a_use_state_indices <= 2147483647LL, ValueError)
+      << KERNEL_NAME << ": 'use_state_indices' = " << a_use_state_indices
+      << " is outside the i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(a_checkpoint_every_n_tokens >= -2147483648LL && a_checkpoint_every_n_tokens <= 2147483647LL, ValueError)
+      << KERNEL_NAME << ": 'checkpoint_every_n_tokens' = " << a_checkpoint_every_n_tokens
+      << " is outside the i32 range [-2147483648, 2147483647]";
+  check_cuda_tensor(a_cu_chunk_offsets, "cu_chunk_offsets");
+  check_dtype(a_cu_chunk_offsets, DLDataType{kDLInt, 64, 1}, "cu_chunk_offsets");
+  check_cuda_tensor(a_chunk_state, "chunk_state");
+  check_dtype(a_chunk_state, DLDataType{kDLBfloat, 16, 1}, "chunk_state");
+  check_cuda_tensor(a_state_checkpoint_needed, "state_checkpoint_needed");
+  check_dtype(a_state_checkpoint_needed, DLDataType{kDLUInt, 32, 1}, "state_checkpoint_needed");
+  check_cuda_tensor(a_tape_qd, "tape_qd");
+  check_dtype(a_tape_qd, DLDataType{kDLBfloat, 16, 1}, "tape_qd");
+  check_cuda_tensor(a_tape_kd, "tape_kd");
+  check_dtype(a_tape_kd, DLDataType{kDLBfloat, 16, 1}, "tape_kd");
+  check_cuda_tensor(a_tape_kr, "tape_kr");
+  check_dtype(a_tape_kr, DLDataType{kDLBfloat, 16, 1}, "tape_kr");
+  check_cuda_tensor(a_tape_j, "tape_j");
+  check_dtype(a_tape_j, DLDataType{kDLBfloat, 16, 1}, "tape_j");
+  check_cuda_tensor(a_tape_restore_factor, "tape_restore_factor");
+  check_dtype(a_tape_restore_factor, DLDataType{kDLFloat, 32, 1}, "tape_restore_factor");
+  check_cuda_tensor(a_tape_e, "tape_e");
+  check_dtype(a_tape_e, DLDataType{kDLBfloat, 16, 1}, "tape_e");
+  check_cuda_tensor(a_tape_x, "tape_x");
+  check_dtype(a_tape_x, DLDataType{kDLBfloat, 16, 1}, "tape_x");
+  check_cuda_tensor(a_tape_r, "tape_r");
+  check_dtype(a_tape_r, DLDataType{kDLBfloat, 16, 1}, "tape_r");
+  check_cuda_tensor(a_norm_inv_out, "norm_inv_out");
+  check_dtype(a_norm_inv_out, DLDataType{kDLFloat, 32, 1}, "norm_inv_out");
+  check_cuda_tensor(a_decay_out, "decay_out");
+  check_dtype(a_decay_out, DLDataType{kDLBfloat, 16, 1}, "decay_out");
+  check_cuda_tensor(a_beta_active_out, "beta_active_out");
+  check_dtype(a_beta_active_out, DLDataType{kDLFloat, 32, 1}, "beta_active_out");
+  check_cuda_tensor(a_initial_state_f32, "initial_state_f32");
+  check_dtype(a_initial_state_f32, DLDataType{kDLFloat, 32, 1}, "initial_state_f32");
+  check_cuda_tensor(a_zero_workspace, "zero_workspace");
+  check_dtype(a_zero_workspace, DLDataType{kDLUInt, 32, 1}, "zero_workspace");
+  TVM_FFI_CHECK(a_zero_words >= -2147483648LL && a_zero_words <= 2147483647LL, ValueError)
+      << KERNEL_NAME << ": 'zero_words' = " << a_zero_words
+      << " is outside the i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(a_num_sequences >= -2147483648LL && a_num_sequences <= 2147483647LL, ValueError)
+      << KERNEL_NAME << ": 'num_sequences' = " << a_num_sequences
+      << " is outside the i32 range [-2147483648, 2147483647]";
+  check_cuda_tensor(a_state_checkpoints_tma, "state_checkpoints_tma");
+  check_dtype(a_state_checkpoints_tma, DLDataType{kDLBfloat, 16, 1}, "state_checkpoints_tma");
+  check_cuda_tensor(a_final_state_f32, "final_state_f32");
+  check_dtype(a_final_state_f32, DLDataType{kDLFloat, 32, 1}, "final_state_f32");
+  CheckRank(a_q, "q", 3);
+  CheckUnitInnerStride(a_q, "q");
+  check_same_device(a_q_tma, a_q, "q_tma", "q");
+  CheckRank(a_k, "k", 3);
+  CheckUnitInnerStride(a_k, "k");
+  check_same_device(a_k, a_q, "k", "q");
+  check_same_device(a_k_tma, a_q, "k_tma", "q");
+  CheckRank(a_v, "v", 3);
+  CheckUnitInnerStride(a_v, "v");
+  check_same_device(a_v, a_q, "v", "q");
+  check_same_device(a_v_tma, a_q, "v_tma", "q");
+  check_same_device(a_g, a_q, "g", "q");
+  check_same_device(a_g_tma, a_q, "g_tma", "q");
+  check_same_device(a_beta, a_q, "beta", "q");
+  check_same_device(a_beta_tma, a_q, "beta_tma", "q");
+  check_contiguous(a_A_log, "A_log");
+  check_same_device(a_A_log, a_q, "A_log", "q");
+  check_contiguous(a_dt_bias, "dt_bias");
+  check_same_device(a_dt_bias, a_q, "dt_bias", "q");
+  check_contiguous(a_cu_seqlens, "cu_seqlens");
+  check_same_device(a_cu_seqlens, a_q, "cu_seqlens", "q");
+  check_contiguous(a_seq_order, "seq_order");
+  check_same_device(a_seq_order, a_q, "seq_order", "q");
+  check_contiguous(a_initial_state, "initial_state");
+  check_same_device(a_initial_state, a_q, "initial_state", "q");
+  check_contiguous(a_out, "out");
+  check_same_device(a_out, a_q, "out", "q");
+  check_contiguous(a_out_tma, "out_tma");
+  check_same_device(a_out_tma, a_q, "out_tma", "q");
+  check_contiguous(a_final_state, "final_state");
+  check_same_device(a_final_state, a_q, "final_state", "q");
+  check_contiguous(a_cu_chunk_offsets, "cu_chunk_offsets");
+  check_same_device(a_cu_chunk_offsets, a_q, "cu_chunk_offsets", "q");
+  check_contiguous(a_chunk_state, "chunk_state");
+  check_same_device(a_chunk_state, a_q, "chunk_state", "q");
+  check_contiguous(a_state_checkpoint_needed, "state_checkpoint_needed");
+  check_same_device(a_state_checkpoint_needed, a_q, "state_checkpoint_needed", "q");
+  check_contiguous(a_tape_qd, "tape_qd");
+  check_same_device(a_tape_qd, a_q, "tape_qd", "q");
+  check_contiguous(a_tape_kd, "tape_kd");
+  check_same_device(a_tape_kd, a_q, "tape_kd", "q");
+  check_contiguous(a_tape_kr, "tape_kr");
+  check_same_device(a_tape_kr, a_q, "tape_kr", "q");
+  check_contiguous(a_tape_j, "tape_j");
+  check_same_device(a_tape_j, a_q, "tape_j", "q");
+  check_contiguous(a_tape_restore_factor, "tape_restore_factor");
+  check_same_device(a_tape_restore_factor, a_q, "tape_restore_factor", "q");
+  check_contiguous(a_tape_e, "tape_e");
+  check_same_device(a_tape_e, a_q, "tape_e", "q");
+  check_contiguous(a_tape_x, "tape_x");
+  check_same_device(a_tape_x, a_q, "tape_x", "q");
+  check_contiguous(a_tape_r, "tape_r");
+  check_same_device(a_tape_r, a_q, "tape_r", "q");
+  check_contiguous(a_norm_inv_out, "norm_inv_out");
+  check_same_device(a_norm_inv_out, a_q, "norm_inv_out", "q");
+  check_contiguous(a_decay_out, "decay_out");
+  check_same_device(a_decay_out, a_q, "decay_out", "q");
+  check_contiguous(a_beta_active_out, "beta_active_out");
+  check_same_device(a_beta_active_out, a_q, "beta_active_out", "q");
+  check_contiguous(a_initial_state_f32, "initial_state_f32");
+  check_same_device(a_initial_state_f32, a_q, "initial_state_f32", "q");
+  check_contiguous(a_zero_workspace, "zero_workspace");
+  check_same_device(a_zero_workspace, a_q, "zero_workspace", "q");
+  check_contiguous(a_state_checkpoints_tma, "state_checkpoints_tma");
+  check_same_device(a_state_checkpoints_tma, a_q, "state_checkpoints_tma", "q");
+  check_contiguous(a_final_state_f32, "final_state_f32");
+  check_same_device(a_final_state_f32, a_q, "final_state_f32", "q");
+  TVM_FFI_CHECK((a_checkpoint_every_n_tokens >= 0LL), ValueError)
+      << KERNEL_NAME << ": requires (checkpoint_every_n_tokens >= 0)";
+  TVM_FFI_CHECK((a_num_heads >= 1LL), ValueError)
+      << KERNEL_NAME << ": requires (num_heads >= 1)";
+  const CUtensorMap* maps = TensorMapBuffer(a_tensor_maps, 7);
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
   TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") exceeds CUDA's limits";
   cudaStream_t stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(dev.device_type, dev.device_id));
   {
-    // Once per thread per device: the kernel's function attributes hold per device; the tensor-map encoders need this thread's context of the device bound.
+    // Once per thread per device: the kernel's function attributes hold per device.
     static thread_local uint64_t prepared_devices = 0;
     const uint64_t device_bit = dev.device_id < 64 ? uint64_t{1} << dev.device_id : uint64_t{0};
     if (device_bit == 0 || (prepared_devices & device_bit) == 0) {
-      CheckCuda(cudaSetDevice(dev.device_id), "cudaSetDevice");
       CheckCuda(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_cake_kda_prefill_63e875b3444b55a08998), cudaFuncAttributeMaxDynamicSharedMemorySize, 227968), "cudaFuncSetAttribute");
       prepared_devices |= device_bit;
     }
   }
   void* v_q = DataPtr(a_q);
-  CUtensorMap v_q_tma = EncodeTma_q_tma(a_q_tma);
+  CUtensorMap v_q_tma = maps[0];
   void* v_k = DataPtr(a_k);
-  CUtensorMap v_k_tma = EncodeTma_k_tma(a_k_tma);
+  CUtensorMap v_k_tma = maps[1];
   void* v_v = DataPtr(a_v);
-  CUtensorMap v_v_tma = EncodeTma_v_tma(a_v_tma);
+  CUtensorMap v_v_tma = maps[2];
   void* v_g = DataPtr(a_g);
-  CUtensorMap v_g_tma = EncodeTma_g_tma(a_g_tma);
+  CUtensorMap v_g_tma = maps[3];
   void* v_beta = DataPtr(a_beta);
-  CUtensorMap v_beta_tma = EncodeTma_beta_tma(a_beta_tma);
+  CUtensorMap v_beta_tma = maps[4];
   void* v_A_log = DataPtr(a_A_log);
   void* v_dt_bias = DataPtr(a_dt_bias);
   void* v_cu_seqlens = DataPtr(a_cu_seqlens);
   void* v_seq_order = DataPtr(a_seq_order);
   void* v_initial_state = DataPtr(a_initial_state);
   void* v_out = DataPtr(a_out);
-  CUtensorMap v_out_tma = EncodeTma_out_tma(a_out_tma);
+  CUtensorMap v_out_tma = maps[5];
   void* v_final_state = DataPtr(a_final_state);
   int32_t v_num_heads = static_cast<int32_t>(a_num_heads);
   int32_t v_use_initial_state = static_cast<int32_t>(a_use_initial_state);
@@ -538,7 +751,7 @@ void Run(TensorView a_q, TensorView a_q_tma, TensorView a_k, TensorView a_k_tma,
   void* v_zero_workspace = DataPtr(a_zero_workspace);
   int32_t v_zero_words = static_cast<int32_t>(a_zero_words);
   int32_t v_num_sequences = static_cast<int32_t>(a_num_sequences);
-  CUtensorMap v_state_checkpoints_tma = EncodeTma_state_checkpoints_tma(a_state_checkpoints_tma);
+  CUtensorMap v_state_checkpoints_tma = maps[6];
   void* v_final_state_f32 = DataPtr(a_final_state_f32);
   int64_t v_g_token_stride = static_cast<int64_t>(a_g_token_stride);
   int64_t v_q_stride_m3 = a_q.stride(-3);
@@ -562,4 +775,6 @@ void Run(TensorView a_q, TensorView a_q_tma, TensorView a_k, TensorView a_k_tma,
 }  // namespace cake_binding_kernel_cake_kda_prefill_63e875b3444b55a08998
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_binding_kernel_cake_kda_prefill_63e875b3444b55a08998::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(encode_tensor_maps, cake_binding_kernel_cake_kda_prefill_63e875b3444b55a08998::EncodeTensorMaps);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(tensor_map_count, cake_binding_kernel_cake_kda_prefill_63e875b3444b55a08998::TensorMapCount);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(build_cuda_version, cake_ffi_build_cuda_version);

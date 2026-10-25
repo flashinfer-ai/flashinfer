@@ -95,6 +95,21 @@ cuuint64_t Stride(int64_t value, const char* descriptor) {
   return static_cast<cuuint64_t>(value);
 }
 
+CUtensorMap* TensorMapBuffer(const TensorView& t, int64_t count) {
+  TVM_FFI_CHECK(t.device().device_type == kDLCPU || t.device().device_type == kDLCUDAHost, ValueError)
+      << KERNEL_NAME << ": 'tensor_maps' must be a CPU tensor";
+  check_dtype(t, DLDataType{kDLUInt, 8, 1}, "tensor_maps");
+  check_contiguous(t, "tensor_maps");
+  const int64_t bytes = count * static_cast<int64_t>(sizeof(CUtensorMap));
+  TVM_FFI_CHECK(t.numel() == bytes, ValueError)
+      << KERNEL_NAME << ": 'tensor_maps' must hold exactly " << bytes << " bytes (" << count << " tensor maps), got "
+      << t.numel();
+  void* data = DataPtr(t);
+  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(data) % alignof(CUtensorMap) == 0, ValueError)
+      << KERNEL_NAME << ": 'tensor_maps' must be aligned to " << alignof(CUtensorMap) << " bytes";
+  return static_cast<CUtensorMap*>(data);
+}
+
 CUtensorMap EncodeTma_pair_tma(const TensorView& t) {
   TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
       << KERNEL_NAME << ": descriptor 'pair_tma' takes a source of at least 2 dims, got " << t.ndim();
@@ -175,7 +190,10 @@ CUtensorMap EncodeTma_map_final_tma(const TensorView& t) {
   return map;
 }
 
-void Run(TensorView a_items, int64_t a_num_heads, TensorView a_pair, TensorView a_pair_tma, TensorView a_dpair, TensorView a_maps, TensorView a_maps_tma, TensorView a_map_final, TensorView a_map_final_tma, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+// The number of tensor maps the caller's buffer holds, in the order of the descriptor arguments.
+int64_t TensorMapCount() { return 3; }
+
+void EncodeTensorMaps(TensorView a_items, int64_t a_num_heads, TensorView a_pair, TensorView a_pair_tma, TensorView a_dpair, TensorView a_maps, TensorView a_maps_tma, TensorView a_map_final, TensorView a_map_final_tma, TensorView a_tensor_maps) {
   DLDevice dev = a_items.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   check_cuda_tensor(a_items, "items");
@@ -212,17 +230,69 @@ void Run(TensorView a_items, int64_t a_num_heads, TensorView a_pair, TensorView 
   check_same_device(a_map_final, a_items, "map_final", "items");
   check_contiguous(a_map_final_tma, "map_final_tma");
   check_same_device(a_map_final_tma, a_items, "map_final_tma", "items");
+  CUtensorMap* maps = TensorMapBuffer(a_tensor_maps, 3);
+  {
+    // Once per thread per device: the tensor-map encoders need this thread's context of the device bound.
+    static thread_local uint64_t prepared_devices = 0;
+    const uint64_t device_bit = dev.device_id < 64 ? uint64_t{1} << dev.device_id : uint64_t{0};
+    if (device_bit == 0 || (prepared_devices & device_bit) == 0) {
+      CheckCuda(cudaSetDevice(dev.device_id), "cudaSetDevice");
+      prepared_devices |= device_bit;
+    }
+  }
+  maps[0] = EncodeTma_pair_tma(a_pair_tma);
+  maps[1] = EncodeTma_maps_tma(a_maps_tma);
+  maps[2] = EncodeTma_map_final_tma(a_map_final_tma);
+}
+
+void Run(TensorView a_items, int64_t a_num_heads, TensorView a_pair, TensorView a_pair_tma, TensorView a_dpair, TensorView a_maps, TensorView a_maps_tma, TensorView a_map_final, TensorView a_map_final_tma, TensorView a_tensor_maps, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+  DLDevice dev = a_items.device();
+  tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
+  check_cuda_tensor(a_items, "items");
+  check_dtype(a_items, DLDataType{kDLInt, 32, 1}, "items");
+  TVM_FFI_CHECK(a_num_heads >= -2147483648LL && a_num_heads <= 2147483647LL, ValueError)
+      << KERNEL_NAME << ": 'num_heads' = " << a_num_heads
+      << " is outside the i32 range [-2147483648, 2147483647]";
+  check_cuda_tensor(a_pair, "pair");
+  check_dtype(a_pair, DLDataType{kDLBfloat, 16, 1}, "pair");
+  check_cuda_tensor(a_pair_tma, "pair_tma");
+  check_dtype(a_pair_tma, DLDataType{kDLBfloat, 16, 1}, "pair_tma");
+  check_cuda_tensor(a_dpair, "dpair");
+  check_dtype(a_dpair, DLDataType{kDLFloat, 32, 1}, "dpair");
+  check_cuda_tensor(a_maps, "maps");
+  check_dtype(a_maps, DLDataType{kDLBfloat, 16, 1}, "maps");
+  check_cuda_tensor(a_maps_tma, "maps_tma");
+  check_dtype(a_maps_tma, DLDataType{kDLBfloat, 16, 1}, "maps_tma");
+  check_cuda_tensor(a_map_final, "map_final");
+  check_dtype(a_map_final, DLDataType{kDLBfloat, 16, 1}, "map_final");
+  check_cuda_tensor(a_map_final_tma, "map_final_tma");
+  check_dtype(a_map_final_tma, DLDataType{kDLBfloat, 16, 1}, "map_final_tma");
+  check_contiguous(a_items, "items");
+  check_contiguous(a_pair, "pair");
+  check_same_device(a_pair, a_items, "pair", "items");
+  check_contiguous(a_pair_tma, "pair_tma");
+  check_same_device(a_pair_tma, a_items, "pair_tma", "items");
+  check_contiguous(a_dpair, "dpair");
+  check_same_device(a_dpair, a_items, "dpair", "items");
+  check_contiguous(a_maps, "maps");
+  check_same_device(a_maps, a_items, "maps", "items");
+  check_contiguous(a_maps_tma, "maps_tma");
+  check_same_device(a_maps_tma, a_items, "maps_tma", "items");
+  check_contiguous(a_map_final, "map_final");
+  check_same_device(a_map_final, a_items, "map_final", "items");
+  check_contiguous(a_map_final_tma, "map_final_tma");
+  check_same_device(a_map_final_tma, a_items, "map_final_tma", "items");
+  const CUtensorMap* maps = TensorMapBuffer(a_tensor_maps, 3);
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
   TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") exceeds CUDA's limits";
   cudaStream_t stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(dev.device_type, dev.device_id));
   {
-    // Once per thread per device: the kernel's function attributes hold per device; the tensor-map encoders need this thread's context of the device bound.
+    // Once per thread per device: the kernel's function attributes hold per device.
     static thread_local uint64_t prepared_devices = 0;
     const uint64_t device_bit = dev.device_id < 64 ? uint64_t{1} << dev.device_id : uint64_t{0};
     if (device_bit == 0 || (prepared_devices & device_bit) == 0) {
-      CheckCuda(cudaSetDevice(dev.device_id), "cudaSetDevice");
       CheckCuda(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_cake_kda_prefill_0c19a9863fa28a7dad1a), cudaFuncAttributeMaxDynamicSharedMemorySize, 118784), "cudaFuncSetAttribute");
       prepared_devices |= device_bit;
     }
@@ -230,12 +300,12 @@ void Run(TensorView a_items, int64_t a_num_heads, TensorView a_pair, TensorView 
   void* v_items = DataPtr(a_items);
   int32_t v_num_heads = static_cast<int32_t>(a_num_heads);
   void* v_pair = DataPtr(a_pair);
-  CUtensorMap v_pair_tma = EncodeTma_pair_tma(a_pair_tma);
+  CUtensorMap v_pair_tma = maps[0];
   void* v_dpair = DataPtr(a_dpair);
   void* v_maps = DataPtr(a_maps);
-  CUtensorMap v_maps_tma = EncodeTma_maps_tma(a_maps_tma);
+  CUtensorMap v_maps_tma = maps[1];
   void* v_map_final = DataPtr(a_map_final);
-  CUtensorMap v_map_final_tma = EncodeTma_map_final_tma(a_map_final_tma);
+  CUtensorMap v_map_final_tma = maps[2];
   void* kernel_args[] = {&v_items, &v_num_heads, &v_pair, &v_pair_tma, &v_dpair, &v_maps, &v_maps_tma, &v_map_final, &v_map_final_tma};
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
@@ -249,4 +319,6 @@ void Run(TensorView a_items, int64_t a_num_heads, TensorView a_pair, TensorView 
 }  // namespace cake_binding_kernel_cake_kda_prefill_0c19a9863fa28a7dad1a
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_binding_kernel_cake_kda_prefill_0c19a9863fa28a7dad1a::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(encode_tensor_maps, cake_binding_kernel_cake_kda_prefill_0c19a9863fa28a7dad1a::EncodeTensorMaps);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(tensor_map_count, cake_binding_kernel_cake_kda_prefill_0c19a9863fa28a7dad1a::TensorMapCount);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(build_cuda_version, cake_ffi_build_cuda_version);
