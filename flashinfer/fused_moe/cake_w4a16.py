@@ -75,7 +75,7 @@ from __future__ import annotations
 import functools
 import math
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 import tvm_ffi
@@ -621,7 +621,7 @@ def is_cake_w4a16_form(options: Mapping[str, Any]) -> bool:
     w13 = options.get("fc1_expert_weights")
     w2 = options.get("fc2_expert_weights")
     routes = options.get("token_selected_experts")
-    scales = options.get("quant_scales") or ()
+    scales: Sequence[Any] = options.get("quant_scales") or ()
     return (
         isinstance(x, torch.Tensor)
         and x.dtype == torch.bfloat16
