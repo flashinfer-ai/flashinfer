@@ -39,7 +39,10 @@ pytestmark = [
     pytest.mark.gpu_4,
     pytest.mark.skipif(
         not torch.cuda.is_available()
-        or torch.cuda.get_device_capability(0) not in ((10, 0), (10, 3), (10, 7)),
+        or any(
+            torch.cuda.get_device_capability(i) not in ((10, 0), (10, 3), (10, 7))
+            for i in range(torch.cuda.device_count())
+        ),
         reason="W4A16 split MoE requires SM100, SM103, or SM107",
     ),
     pytest.mark.usefixtures("require_split_backend"),
