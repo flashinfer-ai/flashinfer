@@ -10,7 +10,6 @@ import torch
 import torch.distributed as dist
 
 import flashinfer.comm as comm
-from flashinfer.utils import round_up
 
 # todo(Yingyi): add benchmark and quant test
 
@@ -56,7 +55,7 @@ def _run_correctness_worker(
     try:
         device = torch.device(f"cuda:{rank}")
         seq_lens = [16]
-        top_k = 8
+        top_k = expanded_idx_to_permuted_idx.shape[1]
         eps = 1e-5
 
         launch_with_pdls = [True, False]
@@ -104,8 +103,9 @@ def _run_correctness_worker(
                     )
                     # E4M3 scales in the SWIZZLED_128x4 layout.
                     scale_out = torch.empty(
-                        round_up(seq_len, 128)
-                        * round_up(hidden_size // SF_VEC_SIZE, 4),
+                        comm.compute_fp4_swizzled_layout_sf_size(
+                            seq_len, hidden_size // SF_VEC_SIZE
+                        ),
                         dtype=torch.uint8,
                         device=device,
                     )
@@ -167,8 +167,12 @@ def _run_correctness_worker(
                     torch.cuda.synchronize()
 
                     # == Calculate reference output (in FP32, like the kernel) ==
+                    local = (expanded_idx_to_permuted_idx >= 0).unsqueeze(-1)
                     expert_reduction = torch.sum(
-                        fc2_output_clone.float()[expanded_idx_to_permuted_idx]
+                        fc2_output_clone.float()[
+                            expanded_idx_to_permuted_idx.clamp(min=0)
+                        ]
+                        * local
                         * scale.float().unsqueeze(-1)
                         * routed_scaling_factor,
                         dim=1,
@@ -376,7 +380,9 @@ def multi_process_parallel(
 
 @pytest.mark.parametrize("world_size", [2, 4])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_trtllm_moe_finalize_allreduce_fusion(world_size, dtype):
+# The kernel gathers routes 8 at a time: a partial chunk, one chunk, and two.
+@pytest.mark.parametrize("top_k", [6, 8, 10])
+def test_trtllm_moe_finalize_allreduce_fusion(world_size, dtype, top_k):
     np.random.seed(42)
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
@@ -390,7 +396,6 @@ def test_trtllm_moe_finalize_allreduce_fusion(world_size, dtype):
     # generate shared random input tensor across all ranks
     seq_len = 16
     hidden_size = 7168
-    top_k = 8
 
     shared_expert_output = torch.randn((seq_len, hidden_size), dtype=dtype)
     fc2_output = torch.randn((seq_len * top_k, hidden_size), dtype=dtype)
@@ -398,6 +403,8 @@ def test_trtllm_moe_finalize_allreduce_fusion(world_size, dtype):
     expanded_idx_to_permuted_idx = torch.randint(
         0, seq_len * top_k, (seq_len, top_k), dtype=torch.int32
     )
+    # Routes to experts on other ranks are -1.
+    expanded_idx_to_permuted_idx[torch.rand(seq_len, top_k) < 0.25] = -1
     residual = torch.randn_like(shared_expert_output)
 
     multi_process_parallel(
@@ -423,4 +430,4 @@ def test_trtllm_moe_finalize_allreduce_fusion_back_to_back(world_size):
 
 
 if __name__ == "__main__":
-    test_trtllm_moe_finalize_allreduce_fusion(2, torch.float16)
+    test_trtllm_moe_finalize_allreduce_fusion(2, torch.float16, 8)

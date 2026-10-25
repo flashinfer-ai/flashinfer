@@ -1292,9 +1292,8 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
   int thread_offset_within_token = threadid_in_cluster * VEC_SIZE;
 
   int top_k = params.top_k;
-  bool use_scale_factor = params.expert_scale_factor != nullptr;
+  auto const* expert_scales = static_cast<ScaleType const*>(params.expert_scale_factor);
   float routed_scaling_factor = params.routed_scaling_factor;
-  bool use_routed_scaling_factor = routed_scaling_factor != 1.0f;
 
   // Persistent Kernel
   // Each cluster iterate through all token it need to handle
@@ -1304,11 +1303,7 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
     }
 
     // * MoE finalize, accumulated in FP32.
-    float acc[VEC_SIZE];
-#pragma unroll
-    for (int i = 0; i < VEC_SIZE; ++i) {
-      acc[i] = 0.f;
-    }
+    float acc_f32[VEC_SIZE] = {};
     // The shared expert row does not depend on the routing; load it first.
     vec_t<T, VEC_SIZE> shared_expert_output;
     if (params.shared_expert_output) {
@@ -1326,11 +1321,14 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
       for (int j = 0; j < kTopKChunk; ++j) {
         int const k = k0 + j;
         int const expanded_idx = token_id * top_k + k;
-        permuted_idx[j] = k < top_k ? params.expanded_idx_to_permuted_idx[expanded_idx] : -1;
-        block_scale[j] = k < top_k && use_scale_factor
-                             ? static_cast<float>(static_cast<ScaleType*>(
-                                   params.expert_scale_factor)[expanded_idx])
-                             : 1.f;
+        permuted_idx[j] = -1;
+        block_scale[j] = 1.f;
+        if (k < top_k) {
+          permuted_idx[j] = params.expanded_idx_to_permuted_idx[expanded_idx];
+          if (expert_scales) {
+            block_scale[j] = static_cast<float>(expert_scales[expanded_idx]);
+          }
+        }
       }
       vec_t<T, VEC_SIZE> permuted_data[kTopKChunk];
 #pragma unroll
@@ -1345,7 +1343,7 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
         if (permuted_idx[j] != -1) {
 #pragma unroll
           for (int i = 0; i < VEC_SIZE; ++i) {
-            acc[i] += static_cast<float>(permuted_data[j][i]) * block_scale[j];
+            acc_f32[i] += static_cast<float>(permuted_data[j][i]) * block_scale[j];
           }
         }
       }
@@ -1356,7 +1354,7 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
     vec_t<T, VEC_SIZE> accumulator;
 #pragma unroll
     for (int i = 0; i < VEC_SIZE; ++i) {
-      float v = use_routed_scaling_factor ? acc[i] * routed_scaling_factor : acc[i];
+      float v = acc_f32[i] * routed_scaling_factor;
       if (params.shared_expert_output) {
         v += static_cast<float>(shared_expert_output[i]);
       }
