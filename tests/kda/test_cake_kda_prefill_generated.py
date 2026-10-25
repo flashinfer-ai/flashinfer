@@ -310,7 +310,7 @@ def test_prepared_kernel_encodes_the_maps_into_its_host_buffer(monkeypatch):
     storage = kernel.descriptor_storage
     assert kernel.encodes_on_host
     assert storage.device.type == "cpu" and storage.dtype == torch.uint8
-    assert storage.numel() == 3 * 128 and storage.data_ptr() % 64 == 0
+    assert storage.numel() == 3 * 128 and storage.data_ptr() % 128 == 0
     assert storage.is_contiguous()
     names = [n for kind, n in plan if kind not in ("grid", "workspace")]
     bindings = {n: object() for n in names}

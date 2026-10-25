@@ -3792,11 +3792,13 @@ def load(name, arch):
 #: encodes: a host buffer of ``tensor_map_count()`` maps, 128 bytes each.
 TENSOR_MAP_PLAN_ENTRY = ("workspace", "tensor_maps")
 _TENSOR_MAP_BYTES = 128
-_TENSOR_MAP_ALIGNMENT = 64
+# The binding checks the buffer against alignof(CUtensorMap): 128 bytes with the
+# CUDA 13 headers, 64 with CUDA 12. torch's CPU allocator guarantees only 64.
+_TENSOR_MAP_ALIGNMENT = 128
 
 
 def _aligned_host_bytes(count):
-    """A CPU uint8 buffer of ``count`` bytes whose address is 64-byte aligned."""
+    """A CPU uint8 buffer of ``count`` bytes whose address is 128-byte aligned."""
     raw = torch.zeros(count + _TENSOR_MAP_ALIGNMENT, dtype=torch.uint8)
     offset = -raw.data_ptr() % _TENSOR_MAP_ALIGNMENT
     return raw[offset : offset + count]
