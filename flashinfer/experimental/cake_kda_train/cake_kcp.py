@@ -82,7 +82,8 @@ form for the multi-wave launches (more work per issued instruction).  A split
 tape launch is never capped at one CTA per SM (the cap serves the full-width
 tape CTAs, which thrash when co-resident).  The test knob ``walk_form``
 (``"full"`` / ``"split"``) forces one form on every launch for the A/B record;
-the call's ``walk_form_log`` records ``(program, form, n_walk)`` per launch.
+the call's ``walk_form_log`` records ``(program, form, n_walk)`` per launch
+(``LAST_CALL[kind]["walk_forms"]`` keeps the copy).
 The tape programs' rule is ``split`` (their full-width records are test-only,
 under ``walk_form="full"``).  The rule's inputs are static per ``(ctx, H)``, so
 the form of each ``(program, walk list)`` is decided once per table set
@@ -3743,6 +3744,9 @@ def _record(kind: str, call: KcpCall) -> None:
         "fused_walks": call.tb.fused_walks,
         "cols_rule": call.cols_rule,  # the earlier knobs
         "walk_geometry": call.walk_geometry,  # walk-launch geometry
+        "walk_forms": list(
+            call.walk_form_log
+        ),  # (record, form, n_walk) per K1 / K2 walk launch: the registry's rule or the walk_form knob
         # the host path of this call (1 trimmed = shipped / 0 previous; same launches)
         "host_trim": call.host_trim,
         "merge_fuse": call.merge_fuse,  # the fused carry merges (test knob)
