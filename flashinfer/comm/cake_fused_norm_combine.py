@@ -28,7 +28,9 @@ peer-mapped workspace; :func:`select_variant` picks one per token count:
 * ``PARALLEL`` (below ``SPLIT_MIN_TOKENS``): a one-shot Lamport exchange
   (every peer polls all eight stripes) with one CTA per token;
 * ``PARALLEL_SPLIT`` (below ``STREAM_MIN_TOKENS``): the same exchange over
-  eight CTAs per token, each owning one eighth of the hidden columns;
+  eight CTAs per token; each CTA normalizes the whole token and publishes it
+  to one destination peer, and only the CTA whose destination is this rank
+  writes the local outputs and sums the eight stripes;
 * ``OWNER_STREAM`` (below ``PIPELINED_MIN_TOKENS``): a fence-free two-round
   owner reduce (token ``t`` is owned by peer ``t % 8``) over a compact payload
   as a persistent grid of one CTA per SM;
