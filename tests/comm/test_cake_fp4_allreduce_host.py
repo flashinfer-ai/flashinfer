@@ -235,12 +235,24 @@ def _fused_norm_band_forms(target: str, input_format: str, output_format: str) -
     return {**_fused_norm_forms(target, input_format, output_format), **extra}
 
 
-def _fused_norm_band(
-    target: str, input_format: str, output_format: str, prefetch: bool
-) -> str:
-    """The name of the band program ``target`` builds for the cell (which must have a band)."""
+def _fused_norm_band(target: str, input_format: str, output_format: str) -> str:
+    """The name of the band program ``target`` builds for the cell (which must have a band); a band
+    ships without the prefetch."""
     forms = _fused_norm_band_forms(target, input_format, output_format)
-    return _fused_norm_name(input_format, output_format, prefetch, forms)
+    return _fused_norm_name(input_format, output_format, False, forms)
+
+
+def _fused_norm_whole_forms(
+    target: str, input_format: str, output_format: str, prefetch: bool
+) -> dict:
+    """The forms of the whole program ``target`` builds for the cell's prefetch form.  The prefetch rows
+    (18 to 28 per CTA: at most 4639 rows on 148 or 160 SMs) all fall inside a prefix band and outside a
+    suffix band, so the prefetch form ships one program per cell: in the band's forms where the band is a
+    prefix, in the forms the target measured everywhere else."""
+    band = FUSED_NORM_BANDS.get((target, input_format, output_format))
+    if prefetch and band is not None and band[0] == "prefix":
+        return _fused_norm_band_forms(target, input_format, output_format)
+    return _fused_norm_forms(target, input_format, output_format)
 
 
 def _fused_norm_program(
@@ -250,14 +262,14 @@ def _fused_norm_program(
     prefetch: bool,
     rows: int | None = None,
 ) -> str:
-    """The fused-norm program ``target`` runs for the cell: the band program when the cell has a band and
-    ``rows`` falls inside it, else the whole program."""
+    """The fused-norm program ``target`` runs for the cell: the band program when the cell has a band, the
+    call runs without the prefetch and ``rows`` falls inside the band, else the whole program."""
     band = FUSED_NORM_BANDS.get((target, input_format, output_format))
-    if rows is not None and band is not None:
+    if rows is not None and band is not None and not prefetch:
         kind, _ = band
         if loader.select_rows(rows, kind, BAND_THRESHOLD):
-            return _fused_norm_band(target, input_format, output_format, prefetch)
-    forms = _fused_norm_forms(target, input_format, output_format)
+            return _fused_norm_band(target, input_format, output_format)
+    forms = _fused_norm_whole_forms(target, input_format, output_format, prefetch)
     return _fused_norm_name(input_format, output_format, prefetch, forms)
 
 
@@ -281,7 +293,8 @@ def _expected_program_ids() -> set[str]:
     }
     # One two-shot program per (target, input format, bv) and one fused-norm program per (target, input
     # format, output format, prefetch form), named by the forms that target measured; targets whose forms
-    # agree share the name (and the program).  A cell with a band adds the band's program.
+    # agree share the name (and the program).  A cell with a band adds the band's program, which ships
+    # without the prefetch.
     ids |= {
         f"tp4_twoshot_{i}_bv{bv}{_two_shot_suffix(t, i, bv)}"
         for t in TARGETS
@@ -295,11 +308,7 @@ def _expected_program_ids() -> set[str]:
         for o in OUTPUT_FORMATS
         for pf in (False, True)
     }
-    ids |= {
-        _fused_norm_band(t, i, o, pf)
-        for (t, i, o) in FUSED_NORM_BANDS
-        for pf in (False, True)
-    }
+    ids |= {_fused_norm_band(t, i, o) for (t, i, o) in FUSED_NORM_BANDS}
     return ids
 
 
@@ -342,7 +351,7 @@ def _expected_params(
 
 def test_registry_lists_every_program_with_the_contract_parameters() -> None:
     assert set(PROGRAMS) == _expected_program_ids()
-    assert len(PROGRAMS) == 58
+    assert len(PROGRAMS) == 53
     keys = {
         "family",
         "world_size",
@@ -618,7 +627,8 @@ def test_one_shot_programs_serve_every_target_once() -> None:
 def test_fused_norm_programs_cover_every_form_once_per_target() -> None:
     """On each target one whole program serves each (input format, output format, prefetch form), in the poll,
     pass-2, quantizing, launch-trigger and sum-of-squares forms that target measured, with the per-CTA call
-    state ("_csp") on every target; a cell with a band adds the one band program in the band's forms."""
+    state ("_csp") on every target; a cell with a band adds the one band program, without the prefetch, in
+    the band's forms."""
     for target in TARGETS:
         for input_format in INPUT_FORMATS:
             for output_format in OUTPUT_FORMATS:
@@ -634,11 +644,10 @@ def test_fused_norm_programs_cover_every_form_once_per_target() -> None:
                         and target in record["targets"]
                     ]
                     whole = _fused_norm_program(*cell, prefetch)
-                    expected = {whole: _fused_norm_forms(*cell)}
-                    if cell in FUSED_NORM_BANDS:
-                        expected[_fused_norm_band(*cell, prefetch)] = (
-                            _fused_norm_band_forms(*cell)
-                        )
+                    expected = {whole: _fused_norm_whole_forms(*cell, prefetch)}
+                    if cell in FUSED_NORM_BANDS and not prefetch:
+                        band_program = _fused_norm_band(*cell)
+                        expected[band_program] = _fused_norm_band_forms(*cell)
                     assert sorted(matching) == sorted(expected), (
                         cell,
                         prefetch,
@@ -662,25 +671,41 @@ def test_fused_norm_programs_cover_every_form_once_per_target() -> None:
                 t
                 for t in TARGETS
                 if (t, i, o) in FUSED_NORM_BANDS
-                and program == _fused_norm_band(t, i, o, pf)
+                and program == _fused_norm_band(t, i, o)
             )
         else:
             targets = tuple(
                 t for t in TARGETS if program == _fused_norm_program(t, i, o, pf)
             )
         assert record["targets"] == targets, program
+    # The bands ship without the prefetch: the prefetch rows (18 to 28 per CTA) stay below 6144 rows on
+    # 148 or 160 SMs, outside every suffix band and inside the nvfp4 -> bf16 prefix band, whose forms the
+    # cell's whole prefetch program carries ("_sop_pf").
+    assert PROGRAMS["tp2_rmsnorm_bf16_bf16_p2d_u4_w11_csp_sop"]["targets"] == (
+        "sm_103a",
+    )
+    assert (
+        PROGRAMS["tp2_rmsnorm_nvfp4_bf16_pa_p2d_u2_csp"]["targets"] == PROBE_ALL_TARGETS
+    )
+    for output_format in ("nvfp4", "mxfp8"):
+        quantized = f"tp2_rmsnorm_bf16_{output_format}"
+        # The BF16-input suffix bands: one program on both targets for mxfp8; for nvfp4 sm_103a's band
+        # inherits its cell's 32-bit form and splits off sm_100a's plain-named band.
+        band = PROGRAMS[f"{quantized}_p2d_w11_qp_csp_sop"]
+        assert band["sf_addr"] == "i64"
+        if output_format == "mxfp8":
+            assert band["targets"] == ("sm_100a", "sm_103a")
+            assert f"{quantized}_p2d_w11_qp_sfu_csp_sop" not in PROGRAMS
+        else:
+            assert band["targets"] == ("sm_100a",)
+            band_103 = PROGRAMS[f"{quantized}_p2d_w11_qp_sfu_csp_sop"]
+            assert band_103["targets"] == ("sm_103a",)
+            assert band_103["sf_addr"] == "u32"
     for pf in ("", "_pf"):
         assert f"tp2_rmsnorm_bf16_bf16{pf}" not in PROGRAMS
         assert f"tp2_rmsnorm_bf16_bf16_csp_sop{pf}" not in PROGRAMS
         assert (
             PROGRAMS[f"tp2_rmsnorm_bf16_bf16_p2d_u4_csp_sop{pf}"]["targets"] == TARGETS
-        )
-        assert PROGRAMS[f"tp2_rmsnorm_bf16_bf16_p2d_u4_w11_csp_sop{pf}"]["targets"] == (
-            "sm_103a",
-        )
-        assert (
-            PROGRAMS[f"tp2_rmsnorm_nvfp4_bf16_pa_p2d_u2_csp{pf}"]["targets"]
-            == PROBE_ALL_TARGETS
         )
         assert (
             PROGRAMS[f"tp2_rmsnorm_nvfp4_bf16_pa_p2d_u2_csp_sop{pf}"]["targets"]
@@ -706,18 +731,6 @@ def test_fused_norm_programs_cover_every_form_once_per_target() -> None:
             assert PROGRAMS[f"{quantized}{sfu}_csp_sop{pf}"]["sf_addr"] == (
                 "u32" if sfu else "i64"
             )
-            # The BF16-input suffix bands: one program on both targets for mxfp8; for nvfp4 sm_103a's
-            # band inherits its cell's 32-bit form and splits off sm_100a's plain-named band.
-            band = PROGRAMS[f"{quantized}_p2d_w11_qp_csp_sop{pf}"]
-            assert band["sf_addr"] == "i64"
-            if output_format == "mxfp8":
-                assert band["targets"] == ("sm_100a", "sm_103a")
-                assert f"{quantized}_p2d_w11_qp_sfu_csp_sop{pf}" not in PROGRAMS
-            else:
-                assert band["targets"] == ("sm_100a",)
-                band_103 = PROGRAMS[f"{quantized}_p2d_w11_qp_sfu_csp_sop{pf}"]
-                assert band_103["targets"] == ("sm_103a",)
-                assert band_103["sf_addr"] == "u32"
             records = f"tp2_rmsnorm_nvfp4_{output_format}"
             assert f"{records}_pa_csp{pf}" not in PROGRAMS
             sfu = (
@@ -758,13 +771,12 @@ def test_fused_norm_programs_cover_every_form_once_per_target() -> None:
             f"tp2_rmsnorm_nvfp4_nvfp4_pa_qp_csp_sop{pf}",
         ):
             assert program not in PROGRAMS
-        # The 32-bit scale-address form ships on fourteen programs: the six cells' whole programs and
-        # sm_103a's bf16 -> nvfp4 band, with and without the prefetch.
+        # The 32-bit scale-address form ships on thirteen programs: the six cells' whole programs, with
+        # and without the prefetch, and sm_103a's bf16 -> nvfp4 band.
         assert sorted(p for p in PROGRAMS if "_sfu" in p) == [
             "tp2_rmsnorm_bf16_mxfp8_sfu_csp_sop",
             "tp2_rmsnorm_bf16_mxfp8_sfu_csp_sop_pf",
             "tp2_rmsnorm_bf16_nvfp4_p2d_w11_qp_sfu_csp_sop",
-            "tp2_rmsnorm_bf16_nvfp4_p2d_w11_qp_sfu_csp_sop_pf",
             "tp2_rmsnorm_bf16_nvfp4_qp_sfu_csp_sop",
             "tp2_rmsnorm_bf16_nvfp4_qp_sfu_csp_sop_pf",
             "tp2_rmsnorm_nvfp4_mxfp8_pa_qp_sfu_csp_sop",
@@ -793,16 +805,13 @@ def test_fused_norm_programs_cover_every_form_once_per_target() -> None:
         if record["family"] == "rmsnorm"
     )
     # The natural order survives on one whole program only: nvfp4 -> bf16 on sm_100a / sm_103a (its band
-    # permutes).
+    # and its prefetch form permute).
     natural = {
         program
         for program, record in PROGRAMS.items()
         if record["ss_order"] == "natural"
     }
-    assert natural == {
-        "tp2_rmsnorm_nvfp4_bf16_pa_p2d_u2_csp",
-        "tp2_rmsnorm_nvfp4_bf16_pa_p2d_u2_csp_pf",
-    }
+    assert natural == {"tp2_rmsnorm_nvfp4_bf16_pa_p2d_u2_csp"}
 
 
 def _checkout_source_dir() -> Path:
@@ -1235,7 +1244,9 @@ def test_program_for_one_shot_and_fused_norm(target: str) -> None:
                     else _fused_norm_forms(target, input_format, output_format)
                 )
                 assert PROGRAMS[program]["ss_order"] == forms["ss_order"]
-                assert (program in loader.SELECT_ROWS) == inside
+                # The prefetch form has no band: inside a prefix band its whole program carries the band's
+                # forms, and no prefetch row count reaches a suffix band.
+                assert (program in loader.SELECT_ROWS) == (inside and not suffix)
     with pytest.raises(ValueError):
         loader.program_for(
             family="allreduce",
@@ -1419,25 +1430,25 @@ def test_select_rows_bands_name_dispatched_programs_with_their_whole_program() -
 
 
 def test_registry_bands_are_the_measured_cells() -> None:
-    """The registry's bands are exactly the measured ones: the fused norm's seven cells (both prefetch forms)
-    at 6144 rows and sm_100a's NVFP4 one-shot at 16384 rows, each naming its whole program per target."""
+    """The registry's bands are exactly the measured ones: the fused norm's seven cells (without the
+    prefetch) at 6144 rows and sm_100a's NVFP4 one-shot at 16384 rows, each naming its whole program per
+    target."""
     expected: dict[str, dict] = {}
     for (target, input_format, output_format), (kind, _) in FUSED_NORM_BANDS.items():
-        for prefetch in (False, True):
-            band = _fused_norm_band(target, input_format, output_format, prefetch)
-            entry = expected.setdefault(
-                band, {"kind": kind, "threshold": BAND_THRESHOLD, "whole": {}}
-            )
-            entry["whole"][target] = _fused_norm_program(
-                target, input_format, output_format, prefetch
-            )
+        band = _fused_norm_band(target, input_format, output_format)
+        entry = expected.setdefault(
+            band, {"kind": kind, "threshold": BAND_THRESHOLD, "whole": {}}
+        )
+        entry["whole"][target] = _fused_norm_program(
+            target, input_format, output_format, False
+        )
     for (target, input_format), (kind, threshold, token) in ONESHOT_BANDS.items():
         expected[f"tp2_oneshot_{input_format}{token}"] = {
             "kind": kind,
             "threshold": threshold,
             "whole": {target: f"tp2_oneshot_{input_format}"},
         }
-    assert len(expected) == 11
+    assert len(expected) == 6
     assert expected == loader.SELECT_ROWS
 
 
