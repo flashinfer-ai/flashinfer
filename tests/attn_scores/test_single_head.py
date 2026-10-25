@@ -624,3 +624,29 @@ def test_gather_key_sample_rejects_bad_shapes() -> None:
             sample_scales=None,
         )
 
+
+@torch.inference_mode()
+def test_sample_helpers_need_cute_dsl_4_7(monkeypatch) -> None:
+    """Without CuTe DSL 4.7 the sample helpers say so, like the other CuTe
+    single-head APIs, before they import the CuTe scorer."""
+    monkeypatch.setattr(
+        single_head, "is_cute_dsl_experimental_available", lambda: False
+    )
+    zeros = partial(torch.zeros, device="cuda")
+    with pytest.raises(RuntimeError, match="needs CuTe DSL 4.7"):
+        gather_key_sample(
+            zeros(4, 64, 128, dtype=torch.bfloat16),
+            zeros(2, 2, dtype=torch.int32),
+            zeros(128, dtype=torch.uint8),
+            zeros(2, dtype=torch.int32),
+            sample_keys=zeros(2, 128, 128, dtype=torch.bfloat16),
+            samples_per_run=1,
+            pages_per_run=2,
+        )
+    with pytest.raises(RuntimeError, match="needs CuTe DSL 4.7"):
+        thresholds_from_sample(
+            zeros(4, 128),
+            zeros(4, 8, dtype=torch.int32),
+            thresholds=zeros(4),
+            counters=zeros(4, 2, dtype=torch.int32),
+        )
