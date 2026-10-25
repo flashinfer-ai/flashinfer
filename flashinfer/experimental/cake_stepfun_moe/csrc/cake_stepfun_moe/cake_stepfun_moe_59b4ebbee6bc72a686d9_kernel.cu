@@ -64,7 +64,7 @@ kernel_cake_stepfun_moe_59b4ebbee6bc72a686d9(int* __restrict__ topk_ids, __nv_bf
     int* warp_totals = reinterpret_cast<int*>(smem_raw + 1024);
     const int warp_totals_addr = smem + 1024;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int thread_idx = (int)tid;
     int lane_idx = (int)lane;
     int warp_idx = (int)warp;
@@ -246,13 +246,11 @@ kernel_cake_stepfun_moe_59b4ebbee6bc72a686d9(int* __restrict__ topk_ids, __nv_bf
             int mn_limit2 = scaled_1 + acc_count;
             int _min_0 = ((scaled_0) < (mn_limit2) ? (scaled_0) : (mn_limit2));
             cta_idx_xy_to_mn_limit[exclusive + cta] = _min_0;
-            int _min_1 = ((scaled_0) < (_min_0 + (-_min_0 & 3)) ? (scaled_0) : (_min_0 + (-_min_0 & 3)));
-            int head_end = _min_1;
+            int head_end = ((scaled_0) < (_min_0 + (-_min_0 & 3)) ? (scaled_0) : (_min_0 + (-_min_0 & 3)));
             for (int head = _min_0; head < head_end; head++) {
                 permuted_idx_to_token_idx[head] = -1;
             }
-            int _max_0 = ((scaled_0 - head_end) > (0) ? (scaled_0 - head_end) : (0));
-            int body_len = _max_0;
+            int body_len = ((scaled_0 - head_end) > (0) ? (scaled_0 - head_end) : (0));
             int tail_begin = head_end + (body_len >> 2 << 2);
             for (int body = head_end; body < tail_begin; body += 4) {
                 {

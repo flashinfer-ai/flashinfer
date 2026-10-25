@@ -874,7 +874,10 @@ def get_batch_prefill_module(backend, *args):
                 multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
             )
         elif backend == "fa2":
-            assert not is_float8(q)
+            assert not is_float8(q) or (
+                q.dtype == paged_k_cache.dtype == torch.float8_e4m3fn
+                and get_compute_capability(q.device) == (12, 0)
+            )
             if tuple(paged_k_cache.stride()) == tuple(paged_v_cache.stride()):
                 routed_paged_run_func = paged_run_func
             else:
@@ -2575,34 +2578,37 @@ def _blackwell_paged_auto_cudnn(
 # Measured on B200 (bf16, causal, 20 iters after 5 warmup, medians):
 #   d128 square    cuDNN 1.09-1.45x faster than CUTLASS -> cuDNN first
 #   d256 square    CUTLASS declines the shape entirely  -> cuDNN only
-#   d192/128 MHA   CUTLASS 1.09-1.12x faster than cuDNN -> CUTLASS first
+#   d192/128       cuDNN 9.27.0.42 / 9.29 dev faster on every measured shape
+#                  (table below)
 _BLACKWELL_RAGGED_AUTO_PREFERENCE = ("cudnn", "cutlass")
 
 # Per-shape overrides of the default order, keyed on
 # (head_dim_qk, head_dim_vo). Deliberately EMPTY: a head-dim key turned out to
 # be the wrong granularity.
 #
-# The 128-head d192/128 cell looked like a clean CUTLASS win at (b16, s4096) --
-# 14.16 vs 15.62 ms, reproduced over four runs. Sweeping the rest of that cell
-# on B200 showed the winner flips with sequence length and head config, not
-# head dim (medians, 30 iters after 10 warmup):
+# The d192/128 cell was first measured with cuDNN 9.26, where CUTLASS led
+# long-sequence MHA and cuDNN led short-sequence and GQA shapes, so no head-dim
+# order could be right for both. Re-measured on a full B200 against three cuDNN
+# libraries (9.26.0.51, 9.27.0.42, a 9.29 dev build), same FlashInfer and
+# frontend (benchmarks/flashinfer_benchmark.py, bf16 causal, 30 iters after 10
+# warmup, median of two rounds; ms):
 #
-#   b4  s1024  128x128   CUTLASS 0.334   cuDNN 0.265   cuDNN  1.26x
-#   b16 s1024  128x128   CUTLASS 1.257   cuDNN 1.030   cuDNN  1.22x
-#   b64 s1024  128x128   CUTLASS 5.764   cuDNN 4.178   cuDNN  1.38x
-#   b8  s2048   32x8     CUTLASS 0.509   cuDNN 0.383   cuDNN  1.33x
-#   b8  s2048   64x8     CUTLASS 0.969   cuDNN 0.716   cuDNN  1.35x
-#   b1  s4096  128x128   CUTLASS 0.738   cuDNN 0.816   CUTLASS 1.11x
-#   b16 s4096  128x128   CUTLASS 14.061  cuDNN 15.818  CUTLASS 1.12x
-#   b4  s16384 128x128   CUTLASS 49.555  cuDNN 68.782  CUTLASS 1.39x
+#   shape                   CUTLASS  cuDNN 9.26  cuDNN 9.27  CUTLASS / cuDNN
+#   b4  s1024    128x128      0.399       0.237       0.230   1.68x -> 1.73x
+#   b16 s1024    128x128      1.431       0.903       0.862   1.59x -> 1.66x
+#   b64 s1024    128x128      5.651       3.551       3.388   1.59x -> 1.67x
+#   b8  s2048     32x8        0.540       0.328       0.327   1.65x -> 1.66x
+#   b8  s2048     64x8        1.006       0.613       0.615   1.64x -> 1.64x
+#   b1  s4096    128x128      0.746       0.708       0.609   1.05x -> 1.22x
+#   b16 s4096    128x128     13.392      11.813       9.720   1.14x -> 1.38x
+#   b4  s16384   128x128     42.297      47.204      36.246   0.90x -> 1.17x
+#   b1  q8k/kv64k 128x128    33.940      43.517      31.398   0.78x -> 1.08x
 #
-# cuDNN takes 5 of 8 -- every short-sequence case and every GQA case -- while
-# CUTLASS only leads long-sequence MHA. Pinning the whole head-dim to CUTLASS
-# would trade 1.22-1.38x away on the majority to win 1.11-1.39x on the rest, so
-# the default order stands and this table stays empty until a heuristic keyed on
-# the axes that actually discriminate (sequence length, MHA vs GQA) is measured
-# across architectures. Until then, callers who know their shape can pin the
-# order with the environment variable below.
+# The 9.26 long-sequence loss was a cuDNN regression (cudnn-frontend issue
+# #1085), fixed in 9.27.0. With cuDNN 9.27.0.42, cuDNN leads all 15 measured
+# d192/128 shapes (1.07-1.73x; the 9.29 dev build matches it), so the
+# default order stands and this table stays empty. On 9.26, callers with
+# long-sequence MHA can pin "cutlass,cudnn" with the environment variable below.
 _BLACKWELL_RAGGED_AUTO_PREFERENCE_BY_HEAD_DIM: Dict[
     Tuple[int, int], Tuple[str, ...]
 ] = {}
@@ -2972,6 +2978,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
+            In CUDA-graph mode, once FA2 has been planned, later plans keep FA2 so
+            its captured scheduling metadata is refreshed. Use a separate wrapper
+            to select cuDNN for a new graph after planning FA2.
             The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
             ``cute-dsl-prims`` backend is a SM120-only FP8 attention backend implemented using
             CUTLASS primitives.
@@ -3803,6 +3812,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             )
             if (
                 self._backend == "fa2"
+                # A retained FA2 capture also needs its CPU-generated schedule
+                # refreshed, not just the raw page and length buffers. Keep
+                # planning FA2 instead of maintaining a second planner for it.
+                and (not self.is_cuda_graph_enabled or self._plan_info is None)
                 and causal
                 and pos_encoding_mode == "NONE"
                 and not use_fp16_qk_reduction
@@ -5907,9 +5920,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._custom_mask_buf[: len(packed_custom_mask)] = packed_custom_mask
                 self._mask_indptr_buf.copy_(mask_indptr, non_blocking=non_blocking)
         else:
-            if self._backend == "cudnn":
-                # CPU metadata needs a device mirror, not a new allocation on
-                # every replan. Never overwrite a caller-owned CUDA tensor.
+            if self._backend == "cudnn" or self._requested_backend == "auto":
+                # Auto resolves later in plan(), so its first call needs the
+                # same owned mirrors as subsequent cuDNN plans. Otherwise a
+                # replan can release the prefixes retained by an older capture.
+                # Never overwrite a caller-owned CUDA tensor.
                 self._qo_indptr_buf = self._stage_cudnn_indptr(
                     qo_indptr, 0, non_blocking
                 )
@@ -8914,9 +8929,9 @@ def fmha_v2_prefill_sm120(
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Run SM120 FMHA v2 with contiguous, separate Q/K/V tensors.
 
-    Supports FP8 E4M3 standard MHA self-attention with equal Q/K/V head counts
-    and head dimensions of 64 or 128, and BF16 output. GQA and MQA are not
-    supported by this entry point. ``scale_bmm1`` combines the Q and K
+    Supports FP8 E4M3 MHA, GQA, and MQA self-attention with head dimensions
+    of 64, 128, or 256 and BF16 output. The query head count must be divisible by
+    the K/V head count. ``scale_bmm1`` combines the Q and K
     dequantization scales with the attention scale; ``scale_bmm2`` is the V
     dequantization scale. Set ``causal=False`` for dense / bidirectional
     attention. Q/K/V/O use fixed-shape ``[batch, seq_len, heads, head_dim]``
@@ -8934,7 +8949,8 @@ def fmha_v2_prefill_sm120(
     Parameters
     ----------
     query, key, value : torch.Tensor
-        Contiguous FP8 E4M3 Q, K, and V tensors in BSHD layout.
+        Contiguous FP8 E4M3 tensors in BSHD layout. Q has ``num_heads`` heads;
+        K and V have the same, possibly smaller, head count.
     out : torch.Tensor
         Caller-owned contiguous BF16 output tensor in BSHD layout.
     num_heads, head_dim, seq_len : int
@@ -8965,20 +8981,24 @@ def fmha_v2_prefill_sm120(
     if not all(t.device == query.device for t in (key, value, out)):
         raise ValueError("query, key, value, and out must be on the same device.")
     expected_prefix = (query.shape[0], seq_len, num_heads)
+    if query.shape[:3] != expected_prefix or out.shape[:3] != expected_prefix:
+        raise ValueError(
+            "query and out shapes must match batch, seq_len, and num_heads."
+        )
+    if key.shape[:2] != expected_prefix[:2] or value.shape[:3] != key.shape[:3]:
+        raise ValueError(
+            "key and value must have matching batch, seq_len, and KV head count."
+        )
+    num_kv_heads = key.shape[2]
+    if num_heads <= 0 or num_kv_heads <= 0 or num_heads % num_kv_heads != 0:
+        raise ValueError("num_heads must be divisible by a positive KV head count.")
     if (
-        query.shape[:3] != expected_prefix
-        or key.shape[:3] != expected_prefix
-        or value.shape[:3] != expected_prefix
-        or out.shape[:3] != expected_prefix
-    ):
-        raise ValueError("tensor shapes must match batch, seq_len, and num_heads.")
-    if (
-        head_dim not in (64, 128)
+        head_dim not in (64, 128, 256)
         or query.shape[3] != head_dim
         or key.shape[3] != head_dim
     ):
         raise ValueError(
-            "standard SM120 self-attention requires Q/K head_dim=64 or 128."
+            "standard SM120 self-attention requires Q/K head_dim=64, 128, or 256."
         )
     if value.shape[3] != head_dim or out.shape[3] != head_dim:
         raise ValueError(
@@ -9033,17 +9053,26 @@ def fmha_v2_prefill_deepseek(
     scale_bmm1_d: Optional[torch.Tensor] = None,
     scale_bmm2_d: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """
+    """Run causal SM12x FMHA v2 for MLA context or 128-dimension GQA.
+
+    Supports the DeepSeek Q/K=192, V=128 layout and FP8 E4M3 Q/K/V=128
+    with BF16 output, including GLM-4.7's 96 query heads and 8 K/V heads.
+    GLM-4.7-Flash MLA context uses Q/K/V=256 with 20 heads and supports
+    FP8 E4M3 input with BF16 output. The 128- and 256-dimension paths accept
+    MHA, GQA, and MQA with the same requirements as
+    :func:`fmha_v2_prefill_sm120`.
+
     Parameters
     ----------
     query : torch.Tensor
         query tensor with shape [batch_size, seq_len, num_heads, head_dim]
     key : torch.Tensor
-        key tensor with shape [batch_size, seq_len, num_heads, head_dim]
+        key tensor with shape [batch_size, seq_len, num_kv_heads, head_dim]
     value : torch.Tensor
-        value tensor with shape [batch_size, seq_len, num_heads, head_dim]
+        value tensor with shape [batch_size, seq_len, num_kv_heads, head_dim_v],
+        where head_dim_v is 128 for Q/K=128 or 192, and 256 for Q/K=256.
     out : torch.Tensor
-        output tensor with shape [batch_size, seq_len, num_heads, head_dim]
+        output tensor with shape [batch_size, seq_len, num_heads, head_dim_v]
     return_lse : bool
         whether to return the log-sum-exp of attention output
     num_heads : int
@@ -9076,12 +9105,32 @@ def fmha_v2_prefill_deepseek(
     """
     if not is_sm12x_supported(query.device):
         raise ValueError("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
+    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4 or out.ndim != 4:
+        raise ValueError("query, key, value, and out must be 4D BSHD tensors.")
     if query.shape[1] != seq_len:
         raise ValueError("query sequence length must match seq_len.")
     if return_lse and lse is None:
         raise ValueError("lse must be provided when return_lse=True.")
+    if query.shape[3] in (128, 256):
+        return fmha_v2_prefill_sm120(
+            query,
+            key,
+            value,
+            out,
+            num_heads,
+            head_dim,
+            seq_len,
+            scale_softmax,
+            scale_bmm1,
+            scale_bmm2,
+            causal=True,
+            return_lse=return_lse,
+            lse=lse,
+            scale_bmm1_d=scale_bmm1_d,
+            scale_bmm2_d=scale_bmm2_d,
+        )
     assert query.shape[3] == 192 and key.shape[3] == 192 and value.shape[3] == 128, (
-        "currently only support deepseek r1 192 query and 128 value"
+        "supported Q/K and V head dimensions are 192/128, 128/128, and 256/256"
     )
     return _fmha_v2_prefill_sm120_run(
         query,
@@ -9492,15 +9541,21 @@ def trtllm_fmha_v2_prefill(
 
 
 @flashinfer_experimental_api
-def prepare_nvfp4_attention(q, k, v, out, *, backend="cake"):
-    """Prepare NVFP4 attention from BF16 [B,H,S,128] tensors.
+def prepare_nvfp4_attention(
+    q, k, v, out, *, backend="cake", softmax_scale=None, workspace=None
+):
+    """Prepare NVFP4 attention from BF16 logical ``[B, H, S, 128]`` tensors.
 
-    The experimental Cake backend requires SM103 and noncausal S divisible
-    by 512. ``q``, ``k`` and ``v`` may have any strides; ``out`` is contiguous.
-    Preparation quantizes Q/K/V to block-scaled E2M1 and returns an
-    NVFP4AttentionRunner. Calling the runner executes QK, softmax and PV
-    attention and writes the caller-owned BF16 output without CUDA allocation.
-    Prepare a new runner after changing input values or bindings. CUDA Graph
+    The experimental Cake backend runs on SM100, SM103 and SM120 GPUs: dense,
+    noncausal, ``D = 128``, equal query and key heads, any ``S``.  ``q``, ``k``,
+    ``v`` and ``out`` may have any strides (an ``[B, S, H, 128]`` buffer is passed
+    as its ``[B, H, S, 128]`` view and read or written in place).
+    ``softmax_scale`` defaults to ``128 ** -0.5``; ``workspace`` is a caller-owned
+    ``uint8`` tensor of at least :func:`nvfp4_attention_workspace_bytes` bytes,
+    else one is allocated here.  Returns a runner whose ``launch()`` (or call)
+    quantizes the inputs and runs the attention chain on the current stream,
+    writing the caller-owned BF16 output without CUDA allocation; input values
+    are free between launches, identities and strides are bound.  CUDA Graph
     ownership remains with the caller.
     """
     if backend != "cake":
@@ -9509,7 +9564,20 @@ def prepare_nvfp4_attention(q, k, v, out, *, backend="cake"):
         prepare_nvfp4_attention as prepare,
     )
 
-    return prepare(q, k, v, out, backend="cake")
+    return prepare(
+        q, k, v, out, backend="cake", softmax_scale=softmax_scale, workspace=workspace
+    )
+
+
+@flashinfer_experimental_api
+def nvfp4_attention_workspace_bytes(batch, heads, seqlen, device):
+    """Bytes of the ``uint8`` workspace :func:`prepare_nvfp4_attention` needs for
+    ``[batch, heads, seqlen, 128]`` tensors on ``device`` (the Cake backend)."""
+    from .experimental.nvfp4_attention.cake_backend import (
+        nvfp4_attention_workspace_bytes as workspace_bytes,
+    )
+
+    return workspace_bytes(batch, heads, seqlen, device)
 
 
 @flashinfer_experimental_api(feature="MiniMax-H3 packed-varlen BF16 attention")

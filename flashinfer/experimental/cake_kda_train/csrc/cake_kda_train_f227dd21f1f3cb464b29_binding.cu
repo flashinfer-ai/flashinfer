@@ -177,6 +177,8 @@ void Run(TensorView a_do_tma, TensorView a_vnew_tma, TensorView a_aqk_tma, Tenso
   check_same_device(a_dAqk, a_do_tma, "dAqk", "do_tma");
   check_contiguous(a_dv1, "dv1");
   check_same_device(a_dv1, a_do_tma, "dv1", "do_tma");
+  TVM_FFI_CHECK((a_num_heads >= 1), ValueError)
+      << KERNEL_NAME << ": requires (num_heads >= 1)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
   TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)

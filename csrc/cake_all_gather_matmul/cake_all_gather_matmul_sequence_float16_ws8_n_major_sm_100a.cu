@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2026 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -359,9 +359,9 @@ constexpr int64_t sm_push_max_cols(int64_t padded_rows) {
 // Per-architecture SM push bands of this sequence's world size (the exported route
 // table): a call of exactly kSmPushBandRows[i] padded rows with N <= kSmPushBandCols[i]
 // also takes the SM push route (a trailing 0 entry keeps an empty table well-formed).
-constexpr int kSmPushBandCount = 0;
-constexpr int64_t kSmPushBandRows[kSmPushBandCount + 1] = {0};
-constexpr int64_t kSmPushBandCols[kSmPushBandCount + 1] = {0};
+constexpr int kSmPushBandCount = 1;
+constexpr int64_t kSmPushBandRows[kSmPushBandCount + 1] = {1024, 0};
+constexpr int64_t kSmPushBandCols[kSmPushBandCount + 1] = {1619, 0};
 constexpr bool sm_push_band(int64_t padded_rows, int64_t cols) {
   for (int i = 0; i < kSmPushBandCount; ++i) {
     if (kSmPushBandRows[i] == padded_rows && cols <= kSmPushBandCols[i]) return true;

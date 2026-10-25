@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import math
-from typing import Any, List, Literal, Optional
+from dataclasses import replace
+from typing import Any, ClassVar, List, Literal, Optional
 
 import torch
 
@@ -29,7 +30,11 @@ class _BatchMLAPagedAttentionCuteDslMonolithicBackend(
     _backend_name = "cute-dsl-monolithic"
     _supports_lse = True
     _supports_variable_q = True
-    _plan_capabilities = MLAPlanCapabilities(
+    _causal_multi_q = True
+    _supports_fp8_output = True
+    _split_tactic_schema = "split-budget-v1"
+    _split_budgets = (1, 2, 4, 8, 16, 32)
+    _plan_capabilities: ClassVar[MLAPlanCapabilities] = MLAPlanCapabilities(
         backend_name="cute-dsl-monolithic",
         lse_modes=frozenset({"none", "basee", "base2"}),
         kv_layouts=frozenset({"combined", "adjacent-split"}),
@@ -49,6 +54,17 @@ class _BatchMLAPagedAttentionCuteDslMonolithicBackend(
         # The public run contract fixes the LSE base at plan time.
         backend._lse_scale = math.log(2.0) if args.lse_mode == "basee" else 1.0
         return backend
+
+    @staticmethod
+    def _implementation():
+        from flashinfer.cute_dsl.attention.monolithic import mla_decode
+
+        return mla_decode
+
+    def _plan(self, **kwargs):
+        self._compile_options: dict[str, Any] = {}
+        super()._plan(**kwargs)
+        self._tactic_states = {-1: self._execution_state}
 
     # Functional entrypoint. This never performs wrapper planning or host reads.
 
@@ -113,6 +129,17 @@ class _BatchMLAPagedAttentionCuteDslMonolithicBackend(
 
     # Planned kernel preparation and native launch.
 
+    @staticmethod
+    def _validate_reducer_grid(q_len: int, workspace_size: int) -> None:
+        # Monolithic uses one grid-Y slot per query. The MTP subclass only
+        # supports Q2/Q4 and folds pairs, so its reducer is always within this
+        # bound. Keep this static check independent of implementation helpers.
+        if workspace_size and q_len > 65_535:
+            raise ValueError(
+                f"split-KV reducer grid.y would be {q_len}, "
+                "exceeding the CUDA limit 65535"
+            )
+
     def _compile_kernel(
         self,
         *,
@@ -132,15 +159,14 @@ class _BatchMLAPagedAttentionCuteDslMonolithicBackend(
         max_seq_len: int,
         use_sinks: bool,
         enable_pdl: bool,
+        num_kv_splits: Optional[int] = None,
     ) -> tuple[Any, Any, torch.Tensor, int, int]:
         if use_sinks:
             raise _CuteDslKernelUnsupportedError(
                 "cute-dsl-monolithic does not support sinks."
             )
         try:
-            from flashinfer.cute_dsl.attention.monolithic import (
-                mla_decode as implementation,
-            )
+            implementation = self._implementation()
         except ImportError as error:
             raise _CuteDslKernelUnsupportedError(str(error)) from error
         try:
@@ -170,15 +196,52 @@ class _BatchMLAPagedAttentionCuteDslMonolithicBackend(
                 occupancy_q_tiles=(
                     max(1, min(total_q, batch_size * num_q_tiles)) if is_var_q else None
                 ),
+                num_kv_splits=num_kv_splits,
             )
-            if workspace_size:
-                # The planned reducer launches one grid-Y slot per query.
-                try:
-                    implementation._validate_nonpersistent_grid_y(1, q_len, False)
-                except ValueError as error:
-                    raise ValueError(f"split-KV reducer: {error}") from error
+            capacity = workspace_buffer.numel() * workspace_buffer.element_size()
+            if num_kv_splits is None and workspace_size > capacity:
+                split_kv, workspace_size = (
+                    implementation._get_split_kv_and_workspace_size(
+                        batch_size,
+                        q_len,
+                        num_heads,
+                        head_dim_ckv,
+                        implementation.get_num_sm(device),
+                        max_seq_len=max_seq_len,
+                        occupancy_q_tiles=(
+                            max(1, min(total_q, batch_size * num_q_tiles))
+                            if is_var_q
+                            else None
+                        ),
+                        num_kv_splits=1,
+                    )
+                )
+            if workspace_size > capacity:
+                raise ValueError(
+                    "workspace_buffer too small for the requested split tactic"
+                )
+            self._validate_reducer_grid(q_len, workspace_size)
         except (ImportError, ValueError) as error:
             raise _CuteDslKernelUnsupportedError(str(error)) from error
+        if self._is_planned and num_kv_splits is None:
+            self._compile_options = dict(
+                workspace_buffer=workspace_buffer,
+                device=device,
+                q_data_type=q_data_type,
+                out_dtype=out_dtype,
+                page_size=page_size,
+                batch_size=batch_size,
+                num_heads=num_heads,
+                q_len=q_len,
+                head_dim_ckv=head_dim_ckv,
+                head_dim_kpe=head_dim_kpe,
+                resolved_is_var_seq=resolved_is_var_seq,
+                is_var_q=is_var_q,
+                total_q=total_q,
+                max_seq_len=max_seq_len,
+                use_sinks=use_sinks,
+                enable_pdl=enable_pdl,
+            )
         # Compilation errors must propagate rather than exclude the candidate.
         # Use one D tile and specialize reducer capacity to the planned split count.
         compiled_kernel = implementation._get_compiled_mla_kernel(
@@ -225,9 +288,79 @@ class _BatchMLAPagedAttentionCuteDslMonolithicBackend(
 
     # Autotuning support for functional profiles and the current wrapper plan.
 
+    def _split_workspace(self, inputs, tactic):
+        """Resolve one budget using only static shape and capacity metadata."""
+        implementation = self._implementation()
+        state = self._execution_state
+        B, q_len, heads, rank = (
+            state.batch_size,
+            state.q_len,
+            state.num_heads,
+            state.kv_lora_rank,
+        )
+        max_seq_len = state.block_tables.shape[1] * state.page_size
+        device = state.device
+        args = (B, q_len, heads, rank, implementation.get_num_sm(device))
+        options = dict(
+            max_seq_len=max_seq_len, num_kv_splits=None if tactic == -1 else tactic
+        )
+        if state.cum_seq_lens_q is not None:
+            _, tiles, _ = implementation.compute_q_tile_layout(heads, q_len)
+            options["occupancy_q_tiles"] = max(
+                1, min(self._execution_state.total_q, B * tiles)
+            )
+        try:
+            splits, size = implementation._get_split_kv_and_workspace_size(
+                *args, **options
+            )
+        except ValueError:
+            if tactic != -1:
+                raise
+            # A native default can exceed a kernel's indexing bound even if
+            # enough bytes were supplied. The default may choose one split;
+            # explicit positive budgets are always exact.
+            options["num_kv_splits"] = 1
+            splits, size = implementation._get_split_kv_and_workspace_size(
+                *args, **options
+            )
+        capacity = (
+            self._float_workspace_buffer.numel()
+            * self._float_workspace_buffer.element_size()
+        )
+        if tactic == -1 and size > capacity:
+            options["num_kv_splits"] = 1
+            splits, size = implementation._get_split_kv_and_workspace_size(
+                *args, **options
+            )
+        self._validate_reducer_grid(q_len, size)
+        return splits, size
+
     def get_valid_tactics(self, inputs, profile) -> List[int]:
         if self._is_planned:
-            return self._get_planned_valid_tactics(inputs)
+            if not self._get_planned_valid_tactics(inputs):
+                return []
+            capacity = (
+                self._float_workspace_buffer.numel()
+                * self._float_workspace_buffer.element_size()
+            )
+            max_seq_len = (
+                self._execution_state.block_tables.shape[1]
+                * self._execution_state.page_size
+            )
+            ceiling = (max_seq_len + 127) // 128
+            tactics = []
+            for tactic in (-1, *self._split_budgets):
+                if tactic != -1 and tactic > ceiling:
+                    continue
+                try:
+                    _, size = self._split_workspace(inputs, tactic)
+                except ValueError:
+                    # Static sizing owns known shape/indexing refusals. Compiler
+                    # and launch failures happen outside this admission boundary.
+                    continue
+                if size <= capacity:
+                    tactics.append(tactic)
+            return tactics
         # Workspace-bound: cute-dsl's per-CTA split-K state grows with B.
         # If the caller's workspace can't fit batch=B for this profile, opt
         # out so the autotuner skips us (no JIT cost) and trtllm-gen wins by
@@ -252,9 +385,44 @@ class _BatchMLAPagedAttentionCuteDslMonolithicBackend(
             return []
         return [-1]
 
+    def validate_tactic(self, inputs, tactic) -> bool:
+        if not self._is_planned:
+            return tactic == -1
+        return type(tactic) is int and tactic in self.get_valid_tactics(inputs, None)
+
+    def _prepare_planned_tactic(self, inputs, tactic):
+        if tactic in self._tactic_states:
+            return
+        if self.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "CuTe MLA split tactics must be prepared before CUDA graph capture."
+            )
+        _, compiled, workspace, size, splits = self._compile_kernel(
+            **self._compile_options, num_kv_splits=tactic
+        )
+        self._tactic_states[tactic] = replace(
+            self._tactic_states[-1],
+            compiled_kernel=compiled,
+            workspace_bytes=None if size == 0 else workspace[:size],
+            split_kv=splits,
+        )
+
+    def precompile_tactics(self, inputs, tactics, profile, **kwargs):
+        if not self._is_planned:
+            return False
+        if self.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "CuTe MLA split tactics must be prepared before CUDA graph capture."
+            )
+        for tactic in tactics:
+            if not self.validate_tactic(inputs, tactic):
+                raise ValueError(f"Unsupported {self._backend} tactic: {tactic!r}.")
+            self._prepare_planned_tactic(inputs, tactic)
+        return True
+
     def get_cache_key_extras(self, inputs):
         if self._is_planned:
-            return ("planned", self._planned_tuning_key)
+            return (self._split_tactic_schema, "planned", self._planned_tuning_key)
         q, _, _, out = inputs[:4]
         # Preserve the functional workload facts. K-tile count and workspace
         # capacity prevent reuse across different split-workspace decisions.
@@ -295,22 +463,34 @@ class _BatchMLAPagedAttentionCuteDslMonolithicBackend(
         run_options=None,
         **kwargs,
     ):
+        if self._is_planned:
+            if not self.validate_tactic(inputs, tactic):
+                raise ValueError(f"Unsupported {self._backend} tactic: {tactic!r}.")
+            self._prepare_planned_tactic(inputs, tactic)
+            previous_state = self._execution_state
+            self._execution_state = self._tactic_states[tactic]
+            try:
+                query, kv_cache, out, lse, sinks = inputs[:5]
+                return self.run_from_wrapper(
+                    query=query,
+                    kv_cache=kv_cache,
+                    out=out,
+                    lse=lse,
+                    sinks=sinks,
+                    profiler_buffer=None,
+                    kv_len=None,
+                    page_table=None,
+                    ckv_scale_arr=None,
+                    **(
+                        self._planned_run_options
+                        if run_options is None
+                        else run_options
+                    ),
+                )
+            finally:
+                self._execution_state = previous_state
         if tactic != -1:
             raise ValueError(f"Unsupported monolithic CuTe MLA tactic: {tactic!r}.")
-        if self._is_planned:
-            query, kv_cache, out, lse, sinks = inputs[:5]
-            return self.run_from_wrapper(
-                query=query,
-                kv_cache=kv_cache,
-                out=out,
-                lse=lse,
-                sinks=sinks,
-                profiler_buffer=None,
-                kv_len=None,
-                page_table=None,
-                ckv_scale_arr=None,
-                **(self._planned_run_options if run_options is None else run_options),
-            )
         query, block_tables, seq_lens, out = inputs[:4]
         causal_seqlens_kv_global = inputs[4] if self.enable_dcp else None
 

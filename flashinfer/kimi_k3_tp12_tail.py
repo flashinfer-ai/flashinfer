@@ -104,16 +104,16 @@ def prepare_kimi_k3_tp12_tail(
         latent = KimiRMSNorm(sum_r routed_partial_r)                  [M, 3584]  (eps 1e-5)
         out    = BF16(latent @ up_weight.T + sum_r shared_partial_r)  [M, 7168]
 
-    in two generated launches per rank, with cuBLAS between them for ``M > 4``:
+    in two generated launches per rank, with cuBLAS between them for ``M > 8``:
     a Lamport all-reduce of ``routed_partial`` fused with the norm (one-shot
-    for ``M <= 16``, two-shot above; below 256 tokens it also scatters this
+    for ``M <= 16``, two-shot above; below 961 tokens it also scatters this
     rank's columns of ``shared_partial`` to their owner ranks), the
     up-projection of this rank's contiguous 640- or 512-row slice of
     ``up_weight`` (``7168 = 8 x 640 + 4 x 512``; fused into the tail kernel for
-    ``M <= 4``, cuBLAS above), and the tail: the owner reduce of the
+    ``M <= 8``, cuBLAS above), and the tail: the owner reduce of the
     ``shared_partial`` columns fused with the add of the slice, one BF16
     rounding and the multicast all-gather of ``out`` (one CTA per eight output
-    columns for ``M <= 4``, one CTA per token below 256 tokens, a persistent
+    columns for ``M <= 8``, one CTA per token below 961 tokens, a persistent
     token pipeline above).  ``out`` is bitwise identical on every rank.
     Every rank must prepare and launch the same ``M``.
 
@@ -138,7 +138,7 @@ def prepare_kimi_k3_tp12_tail(
     Returns
     -------
     KimiK3Tp12TailRunner
-        Calling it launches the two generated kernels (and cuBLAS for ``M > 4``)
+        Calling it launches the two generated kernels (and cuBLAS for ``M > 8``)
         on the current stream with no CUDA allocation or host synchronization
         and returns ``out``.  CUDA Graph capture of the runner is supported;
         prepare outside capture.

@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from .test_mega_workspace_api import _make_layer
+from .test_sm107_block_scaled_config import _BACKENDS
 
 
 @pytest.mark.parametrize(
@@ -93,7 +94,7 @@ def _check_tuning_result(monkeypatch, config_name, package, dtype):
     monkeypatch.setattr(shim, f"autotune_{dtype}_mega_moe", tune)
     monkeypatch.setattr(shim, f"{dtype}_mega_moe", mock.Mock())
     workspace = mock.MagicMock()
-    workspace._frontend.config.defer_topk_reduce = False
+    workspace._frontend.config.use_custom_finalize = False
     output = torch.zeros(2, 128, dtype=torch.bfloat16)
     if hasattr(backend, "_prepared_thunk_state"):
         monkeypatch.setattr(
@@ -120,3 +121,60 @@ def test_layer_getter_returns_independent_result_and_checks_lifecycle():
         layer.destroy()
     with pytest.raises(MoEEpConfigError, match="destroyed"):
         layer.get_tuned_knobs()
+
+
+@pytest.mark.parametrize("config_cls,backend_cls,name", _BACKENDS)
+def test_rubin_getter_selects_workspace_without_allocation(
+    config_cls, backend_cls, name
+):
+    from types import SimpleNamespace
+
+    from flashinfer.moe_ep import MoEEpConfigError
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_state import (
+        AutoTuningState,
+    )
+    from .test_mega_workspace_api import _create_workspace
+
+    layer, _, _ = _make_layer()
+    other, _, _ = _make_layer()
+    config = config_cls(128, 2, knobs="auto")
+    layer._megakernel_config = config
+    layer._kernel = create_mega_kernel(config)
+    layer._kernel.bind_ep_bootstrap(layer._bootstrap)
+
+    def raw(knobs):
+        return SimpleNamespace(_tuning_state=AutoTuningState(winner=knobs))
+
+    with (
+        mock.patch.object(layer._kernel, "destroy"),
+        mock.patch.object(
+            layer, "_ensure_workspace", side_effect=AssertionError("getter allocated")
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="no completed automatic tuning result"):
+            layer.get_tuned_knobs()
+        first, *_ = _create_workspace(
+            layer, 64, raw({"mma_tiler_mnk": [256, 128, 256]})
+        )
+        second, *_ = _create_workspace(layer, 128, raw({"fc2_use_bulk": True}))
+        assert layer.get_tuned_knobs() == {"mma_tiler_mnk": [256, 128, 256]}
+        assert layer.get_tuned_knobs(workspace=second) == {"fc2_use_bulk": True}
+        copy = layer.get_tuned_knobs(workspace=first)
+        copy["mma_tiler_mnk"][0] = 1
+        assert layer.get_tuned_knobs()["mma_tiler_mnk"][0] == 256
+        with pytest.raises(MoEEpConfigError, match="different layer"):
+            other.get_tuned_knobs(workspace=first)
+
+        # Replacement changes the default, without changing an existing handle.
+        layer._default_workspace_handle = None
+        layer._workspace = raw({"fc2_use_bulk": False})
+        assert layer.get_tuned_knobs() == {"fc2_use_bulk": False}
+        assert layer.get_tuned_knobs(workspace=first) == {
+            "mma_tiler_mnk": [256, 128, 256]
+        }
+        first.destroy()
+        with pytest.raises(MoEEpConfigError, match="destroyed"):
+            layer.get_tuned_knobs(workspace=first)
+        layer.destroy()
+    other.destroy()

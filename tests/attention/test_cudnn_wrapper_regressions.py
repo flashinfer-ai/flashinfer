@@ -253,6 +253,30 @@ def test_prefill_plan_snapshots_layout_and_replan_rekeys(monkeypatch):
     assert replanned.exact_keys != plan.exact_keys
 
 
+def test_prefill_replan_rechecks_retained_metadata_layout(monkeypatch):
+    """Reusing the input metadata object must not hide a later layout change."""
+    monkeypatch.setattr(prefill, "_cudnn_supports_shape_override", lambda: False)
+    metadata = prefill._PrefillMetadata(
+        3,
+        64,
+        False,
+        True,
+        actual_seq_lens_q=torch.empty(2, dtype=torch.int32),
+        actual_seq_lens_kv=torch.empty(2, dtype=torch.int32),
+        block_tables=torch.empty(2, 4, dtype=torch.int32),
+    )
+    device = metadata.block_tables.device
+    original = prefill._CudnnPrefillPlan.prepare(metadata, torch.bfloat16, device)
+    metadata.block_tables.as_strided_((2, 4), (1, 2))
+    replanned = prefill._CudnnPrefillPlan.prepare(
+        metadata, torch.bfloat16, device, original
+    )
+    assert replanned.exact_keys != original.exact_keys
+    assert replanned.exact_keys[True] == prefill._prefill_descriptor_key(
+        **metadata.graph_kwargs(None)
+    )
+
+
 @pytest.mark.parametrize("change", ["view_alias", "set_storage", "set_offset"])
 def test_prefill_replan_tracks_storage_not_tensor_identity(monkeypatch, change):
     """Fresh views reuse bindings; rebinding the same tensor must replace them."""
@@ -1076,24 +1100,97 @@ def test_paged_auto_preserves_runtime_scales(tensor_scales):
 
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
-def test_attention_handles_follow_device_and_thread():
+@pytest.mark.parametrize("use_device", [False, True])
+def test_attention_handles_follow_device_and_thread(use_device):
     import concurrent.futures
     from flashinfer.cudnn.decode import _create_cudnn_handle as decode_handle
     from flashinfer.cudnn.prefill import _create_cudnn_handle as prefill_handle
 
     if torch.cuda.device_count() < 2:
         pytest.skip("requires two CUDA devices")
+
+    def acquire(factory, index):
+        if use_device:
+            return factory(device=torch.device("cuda", index))
+        return factory(torch.cuda.current_stream(index))
+
     # Leave device 0 current while explicitly requesting a handle on device 1.
     with torch.cuda.device(0):
-        first = decode_handle(torch.cuda.current_stream(0))
-        second = prefill_handle(torch.cuda.current_stream(1))
+        first = acquire(decode_handle, 0)
+        second = acquire(prefill_handle, 1)
         assert first != second
-        assert decode_handle(torch.cuda.current_stream(0)) == first
+        assert acquire(decode_handle, 0) == first
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            other = pool.submit(
-                lambda: decode_handle(torch.cuda.current_stream(0))
-            ).result()
+            other = pool.submit(acquire, decode_handle, 0).result()
             assert other != first
+
+
+@pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
+@pytest.mark.parametrize("kind", ["paged", "ragged", "decode"])
+def test_cudnn_run_follows_current_stream_and_capture(kind):
+    """One prepared wrapper must follow stream switches, including capture."""
+    q, k, v, qo, ip, ix, last = _paged_inputs()
+    ws = torch.empty(128 << 20, dtype=torch.uint8, device=q.device)
+    if kind == "decode":
+        q, qo = q[:2].contiguous(), torch.tensor([0, 1, 2], dtype=torch.int32)
+        w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(ws, "NHD", backend="cudnn")
+        w.plan(ip, ix, last, 8, 2, 128, 16, q_data_type=q.dtype)
+        operands = ((k, v),)
+    elif kind == "paged":
+        w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, "NHD", backend="cudnn")
+        w.plan(qo, ip, ix, last, 8, 2, 128, 16, q_data_type=q.dtype)
+        operands = ((k, v),)
+    else:
+        keys, values, lengths = [], [], []
+        for b in range(2):
+            length = int((ip[b + 1] - ip[b] - 1) * 16 + last[b])
+            ids = ix[ip[b] : ip[b + 1]].long()
+            keys.append(k[ids].flatten(0, 1)[:length])
+            values.append(v[ids].flatten(0, 1)[:length])
+            lengths.append(length)
+        kv = torch.tensor([0, lengths[0], sum(lengths)], dtype=torch.int32)
+        w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(ws, backend="cudnn")
+        w.plan(qo, kv, 8, 2, 128, q_data_type=q.dtype)
+        operands = (torch.cat(keys), torch.cat(values))
+    out = torch.empty_like(q)
+    lse = torch.empty(q.shape[:2], device=q.device, dtype=torch.float32)
+
+    def run():
+        return w.run(q, *operands, out=out, lse=lse, return_lse=True)
+
+    def check():
+        ref, stats = _reference(
+            q, k, v, qo, ip, ix, last, causal=False, scale=128**-0.5
+        )
+        torch.testing.assert_close(out.float(), ref, atol=0.015, rtol=0.015)
+        torch.testing.assert_close(
+            lse, stats * math.log2(math.e), atol=0.003, rtol=0.003
+        )
+
+    streams = [torch.cuda.Stream(device=q.device) for _ in range(2)]
+    for stream in streams:
+        stream.wait_stream(torch.cuda.current_stream(q.device))
+        with torch.cuda.stream(stream):
+            run()
+        stream.synchronize()
+        check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=streams[0]):
+        run()
+    try:
+        # Rebind the handle on B, then replay the graph captured on A.
+        with torch.cuda.stream(streams[1]):
+            q.mul_(0.5)
+            run()
+        streams[1].synchronize()
+        check()
+        out.fill_(torch.nan)
+        lse.fill_(torch.nan)
+        graph.replay()
+        torch.cuda.current_stream(q.device).synchronize()
+        check()
+    finally:
+        graph.reset()
 
 
 @pytest.mark.parametrize("backend", ["cudnn", "fa2"])
@@ -1473,8 +1570,15 @@ def test_paged_capture_replan_changes_indices_and_lengths(
 @pytest.mark.parametrize("lse_layout", ["NH", "HN"])
 @pytest.mark.parametrize("device_lengths", [False, True])
 @pytest.mark.parametrize("external_table", [False, True])
+@pytest.mark.parametrize("capture_backend", ["cudnn", "fa2"])
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
 def test_paged_auto_fallback_refreshes_retained_capture(
-    monkeypatch, lse_layout, device_lengths, external_table
+    monkeypatch,
+    lse_layout,
+    device_lengths,
+    external_table,
+    capture_backend,
+    use_cuda_graph,
 ):
     if (
         not prefill._cudnn_supports_paged_auto()
@@ -1484,8 +1588,10 @@ def test_paged_auto_fallback_refreshes_retained_capture(
     # Override shape admission only after checking the real runtime capability:
     # older backends can reject the reserved page table before capture begins.
     # Control admission to exercise the transition independently of performance
-    # heuristics. A captured cuDNN call still reads its original owned table.
-    admitted = [True]
+    # heuristics. Exercise both initial providers: graph wrappers must keep
+    # refreshing a retained FA2 schedule, while eager wrappers may switch freely.
+    initially_cudnn = capture_backend == "cudnn"
+    admitted = [initially_cudnn]
     monkeypatch.setattr(
         flashinfer.prefill, "_blackwell_paged_auto_cudnn", lambda *a: admitted[0]
     )
@@ -1497,7 +1603,7 @@ def test_paged_auto_fallback_refreshes_retained_capture(
         torch.empty(128 << 20, device=q.device, dtype=torch.uint8),
         kv_layout="HND",
         backend="auto",
-        use_cuda_graph=True,
+        use_cuda_graph=use_cuda_graph,
         qo_indptr_buf=torch.empty_like(qo, device=q.device),
         paged_kv_indptr_buf=torch.empty_like(ip, device=q.device),
         paged_kv_indices_buf=torch.empty_like(ix),
@@ -1541,30 +1647,38 @@ def test_paged_auto_fallback_refreshes_retained_capture(
         )
 
     plan()
-    assert wrapper._backend == "cudnn"
+    assert wrapper._backend == capture_backend
     run()
     check()
     torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
+    graph = torch.cuda.CUDAGraph() if use_cuda_graph else None
     try:
-        with torch.cuda.graph(graph):
-            run()
-        for selected in (False, True):
+        if graph is not None:
+            with torch.cuda.graph(graph):
+                run()
+        for selected in (not initially_cudnn, initially_cudnn):
             admitted[0] = selected
             qo = torch.tensor([0, 2, 5], dtype=torch.int32)
             ip = torch.tensor([0, 2, 5], dtype=torch.int32)
             ix = torch.tensor([5, 2, 4, 3, 1], device=q.device, dtype=torch.int32)
             plan(external_table)
-            assert wrapper._backend == ("cudnn" if selected else "fa2")
+            # Both sequences reach FA2 before the first retained replay.
+            # Graph wrappers keep its planner; eager wrappers may switch back.
+            expected_backend = "cudnn" if selected and not use_cuda_graph else "fa2"
+            assert wrapper._backend == expected_backend
             run()
             check()
             v.mul_(0.75)
             out.fill_(torch.nan)
             lse.fill_(torch.nan)
-            graph.replay()
+            if graph is not None:
+                graph.replay()
+            else:
+                run()
             check()
     finally:
-        graph.reset()
+        if graph is not None:
+            graph.reset()
 
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")

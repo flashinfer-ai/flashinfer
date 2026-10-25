@@ -167,9 +167,8 @@ from .jit.mamba.cake_selective_state_update import (
     gen_cake_selective_state_update_modules,
 )
 from .jit.mhc import gen_mhc_module
-from .jit.cake_minimax_h3_mxfp8 import (
-    MiniMaxH3Mxfp8Target,
-    gen_minimax_h3_mxfp8_aot_modules,
+from .jit.cake_minimax_h3_mxfp8_pre_attention import (
+    aot_specs as gen_cake_minimax_h3_mxfp8_pre_attention_aot_modules,
 )
 from .jit.cake_minimax_h3_nvfp4_pre_attention import (
     aot_specs as gen_cake_minimax_h3_nvfp4_pre_attention_aot_modules,
@@ -198,6 +197,9 @@ from .jit.cake_concat_mla_kv_quant_fp8 import (
 )
 from .jit.cake_grouped_mxfp8_quantize import (
     aot_specs as gen_cake_grouped_mxfp8_quantize_aot_modules,
+)
+from .jit.cake_bf16_bmm_swap_ab import (
+    aot_specs as gen_cake_bf16_bmm_swap_ab_aot_modules,
 )
 from .jit.mla_kv_pack import gen_mla_kv_pack_fp8_module
 from .jit.api_log_stats import gen_api_log_stats_module
@@ -624,7 +626,14 @@ def _gen_blackwell_bf16_bmm_aot_specs(sm_capabilities: dict) -> List[JitSpec]:
         targets.append("sm100a")
     if sm_capabilities.get("sm103a_exact", False):
         targets.append("sm103a")
-    return [gen_blackwell_bf16_bmm_module(target) for target in targets]
+    specs = [gen_blackwell_bf16_bmm_module(target) for target in targets]
+    # The generated swap-AB programs serving the decode rows of
+    # bmm_bf16(backend="cake"), one library each per exact target.
+    if sm_capabilities.get("sm100a_exact", False):
+        specs.extend(gen_cake_bf16_bmm_swap_ab_aot_modules("sm_100a"))
+    if sm_capabilities.get("sm103a_exact", False):
+        specs.extend(gen_cake_bf16_bmm_swap_ab_aot_modules("sm_103a"))
+    return specs
 
 
 def gen_all_modules(
@@ -750,13 +759,12 @@ def gen_all_modules(
                 for variant in BLACKWELL_MSA_VARIANTS_BY_TARGET[blackwell_msa_target]
             )
 
-    minimax_h3_targets: tuple[tuple[MiniMaxH3Mxfp8Target, bool], ...] = (
-        ("sm100a", sm_capabilities.get("sm100a_exact", False)),
-        ("sm103a", sm_capabilities.get("sm103a_exact", False)),
-    )
-    for minimax_h3_target, enabled in minimax_h3_targets:
-        if enabled:
-            jit_specs.extend(gen_minimax_h3_mxfp8_aot_modules(minimax_h3_target))
+    # Cake MiniMax-H3 MXFP8 pre-attention: the norm stage and the fused GEMM of
+    # each exact sm_100a / sm_103a target.
+    if has_sm100a_exact:
+        jit_specs.extend(gen_cake_minimax_h3_mxfp8_pre_attention_aot_modules("sm_100a"))
+    if has_sm103a_exact:
+        jit_specs.extend(gen_cake_minimax_h3_mxfp8_pre_attention_aot_modules("sm_103a"))
 
     # Cake MiniMax-H3 NVFP4 pre-attention: the norm stage and, per output
     # format, the fused GEMM of each exact sm_100a / sm_103a target.
@@ -1115,6 +1123,10 @@ def gen_all_modules(
         # orthogonal to the SM version.
         jit_specs.append(gen_pcie_ipc_comm_module())
         jit_specs.append(gen_pcie_ipc_ag_rs_module())
+        # gen_ulysses_a2a_module and gen_ulysses_pcie_module are deliberately
+        # absent: Ulysses is JIT-only, and the PCIe module additionally links
+        # -libverbs -lmlx5 -lcuda, which an AOT wheel builder cannot be assumed
+        # to have.
 
     if add_misc:
         jit_specs += [
