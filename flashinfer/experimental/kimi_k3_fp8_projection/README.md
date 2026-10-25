@@ -117,7 +117,7 @@ non-portable-cluster opt-ins and the receipt / chain text every launcher
 includes verbatim inside its namespace), and nothing else. A program that
 differs from a sibling only by a prefetch lever or by the raster group width
 shares the sibling's kernel source and selects its lever value
-(`-DCAKE_LEVER_*` or `-DGROUP_M`) on the compile line; the programs of one
+(`-DCAKE_LEVER_*`, `-DACC_BUFS` or `-DGROUP_M`) on the compile line; the programs of one
 argument plan share one launcher source, and a program's TMA box dimensions,
 dynamic shared memory, block and cluster dimensions and its kernel symbol and
 launcher namespace are `-D` constants on its compile line (`-DCAKE_BOX_*`,

@@ -109,7 +109,7 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # regeneration by the export: a row whose kernel source is another record's
 # translation unit (a prefetch-lever or raster-width twin) names that program
 # in ``kernel`` and carries in ``compile_flags`` the lever define
-# (``-DCAKE_LEVER_<X>=<n>`` or ``-DGROUP_M=<n>``; the shared kernel source
+# (``-DCAKE_LEVER_<X>=<n>``, ``-DACC_BUFS=<n>`` or ``-DGROUP_M=<n>``; the shared kernel source
 # carries the matching guarded defaults and ``#if`` arms); a row whose host
 # launcher is another record's translation unit (the exported launcher texts
 # differ in the kernel symbol, the namespace and the launch constants the
@@ -503,7 +503,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "-DCAKE_PROGRAM_SHIM=cake_host_shim_a97da878d0841d4b",
         ],
         "arg_plan": "gemm",
-        "closure_sha256": "9417f86cb981500ae8c02d270ba5dbbfca2793c2950e35e07e6fd9d61c2e6a9e",
+        "closure_sha256": "4cced977f7c28802433cd01e7169c2d06d96fb1985abb9658f35d4a95a0c067f",
     },
     "3654f2f7a859afea0aa6": {
         "kernel": "24a91d5a85a8465ab6ca",
@@ -1189,7 +1189,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "-DCAKE_PROGRAM_SHIM=cake_host_shim_c8fa7e525eb9728f",
         ],
         "arg_plan": "decode",
-        "closure_sha256": "a7b1b6ab578b369114c658ae6a203e55ea17d68b910d88c916502814f41f52a3",
+        "closure_sha256": "34ef1697d5d39e2b479fe69ef6b0edd79167c9535b8a0c8b9b1f093617669e81",
     },
     "6965aeafa116c7f6ef89": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -1414,7 +1414,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "-DCAKE_PROGRAM_SHIM=cake_host_shim_1e8984f59bc213a0",
         ],
         "arg_plan": "decode",
-        "closure_sha256": "8f2be95de4578da497f5eb30ae14e60c957b782190e258f9ce3832e5dab51cd7",
+        "closure_sha256": "f98e9e28b1698564e4fb533206c58c30fed76bd057bdec840988d49d4b8249df",
     },
     "76f152b19e7a843ba820": {
         "binding": "09ef673497e9adb01b7e",
@@ -1425,7 +1425,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "-DCAKE_PROGRAM_SHIM=cake_host_shim_d1a707a70e8690c8",
         ],
         "arg_plan": "gemm",
-        "closure_sha256": "6cff1a7969b6021de83fe08f38c281f4119fb99417be9de23e937058e9f21f58",
+        "closure_sha256": "83df931013c207ea263c1bab76ed5c5fc38be0441511c1607129ee0950ba0ed4",
     },
     "79f0e568c12ad3ab2f9a": {
         "kernel": "b66413033ce4e9b54af0",
@@ -1492,7 +1492,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "-DCAKE_PROGRAM_SHIM=cake_host_shim_8611f07d0d8cdf4f",
         ],
         "arg_plan": "decode",
-        "closure_sha256": "9283d2a4ed72d8c41a3f360b8c34665be2e816fff4d46eddf76cb947685cce80",
+        "closure_sha256": "1ee8fad20b14494483dd7822d7777bd3ee6278bcad2d2617ce99b9dd5ccc027e",
     },
     "7a9e8f32c95b21cd3ba3": {
         "binding": "09ef673497e9adb01b7e",
@@ -1525,10 +1525,12 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         "closure_sha256": "b06d4eb29d20446ce0dc51d531dd5162abd0de44638e489561bb69b3afc47978",
     },
     "7abdff4851061bffe5cb": {
+        "kernel": "67b79a99dbca18833ff9",
         "binding": "0cdb8cc10eb1192d3635",
         "arches": _SM103,
         "compile_flags": [
             "--use_fast_math",
+            "-DACC_BUFS=2",
             "-DCAKE_BLOCK_X=192",
             "-DCAKE_DYN_SMEM=222208",
             "-DCAKE_CLUSTER_X=2",
@@ -1554,7 +1556,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "-DCAKE_PROGRAM_SHIM=cake_host_shim_ad38838a5a43e7f8",
         ],
         "arg_plan": "decode",
-        "closure_sha256": "7dd234c9895c93bf8a097858498c3ce899606d9c62900a559a0462735c14196b",
+        "closure_sha256": "57f04664c57eb71dfecf39595050d18e860cf95e550e7eee1a70c019e1922bb7",
     },
     "7c0c2078f3110d338d76": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -1726,10 +1728,12 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         "closure_sha256": "243ee798c9abd71c45b930c9f8a053cc46f82341bc10d04d85b8e6addf7ad03e",
     },
     "8b6f92bd50579503f035": {
+        "kernel": "75e18bf3c6d16aa5ba9a",
         "binding": "0cdb8cc10eb1192d3635",
         "arches": _SM100,
         "compile_flags": [
             "--use_fast_math",
+            "-DACC_BUFS=1",
             "-DCAKE_BLOCK_X=320",
             "-DCAKE_DYN_SMEM=218624",
             "-DCAKE_CLUSTER_X=3",
@@ -1755,7 +1759,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "-DCAKE_PROGRAM_SHIM=cake_host_shim_2bb5104bbff68b55",
         ],
         "arg_plan": "decode",
-        "closure_sha256": "c83dae9df11476fb02434a9825baab8d35e58f4a7b996a0f7f0d4890f5f8c534",
+        "closure_sha256": "3c1cc51ac596facf1bee407e5db9d7d1b0e701b5e9cf6c46e36517abbc0428e2",
     },
     "8becf9f889fc4a657c22": {
         "kernel": "5196dc524176f72bfdb6",
@@ -2825,15 +2829,17 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         "closure_sha256": "851a5739be79b50308a0c106b9a9aa62ebaacd6520d693814153c88ce4edab84",
     },
     "d4d43a9ba6f62cb3d829": {
+        "kernel": "76f152b19e7a843ba820",
         "binding": "09ef673497e9adb01b7e",
         "arches": _SM103,
         "compile_flags": [
             "--use_fast_math",
+            "-DCAKE_LEVER_PDLB=1",
             "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_d4d43a9ba6f62cb3d829",
             "-DCAKE_PROGRAM_SHIM=cake_host_shim_4b31950b1739f772",
         ],
         "arg_plan": "gemm",
-        "closure_sha256": "8549ecaeaa800cb378d8ac1501292a5dfab079e5a8e92e76be6e08b47cfad93f",
+        "closure_sha256": "80acb5b4bfa4f4b958ee53750d8912d2e11c47d79d3e01bc30e56ee968991b4f",
     },
     "e319dfda1d4453cff859": {
         "kernel": "baa922f3fad64f788380",
@@ -3003,10 +3009,13 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         "closure_sha256": "47d312f24817191d1e1097ac470c75ffd4f74914c4a28643ff31db7ea45407a7",
     },
     "eb810f44b85f3a53dea5": {
+        "kernel": "7a477ba7758c4954b1ff",
         "binding": "0cdb8cc10eb1192d3635",
         "arches": _SM100,
         "compile_flags": [
             "--use_fast_math",
+            "-DCAKE_LEVER_PX=0",
+            "-DCAKE_LEVER_QER=1",
             "-DCAKE_BLOCK_X=480",
             "-DCAKE_DYN_SMEM=215552",
             "-DCAKE_CLUSTER_X=14",
@@ -3032,7 +3041,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "-DCAKE_PROGRAM_SHIM=cake_host_shim_020a34fdcec918cd",
         ],
         "arg_plan": "decode",
-        "closure_sha256": "e6db5576dc87abc717efe1444a56cfbbdd8500111debdfee0107b1b7a925c6eb",
+        "closure_sha256": "6ea3ef2020bdb18053bcc3ee5ff5224aa077877f20fb729cdd53c42313f6a114",
     },
     "ee2e0fe9754d301492e2": {
         "binding": "09ef673497e9adb01b7e",
@@ -3289,15 +3298,17 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         "closure_sha256": "18f83beb561c302f29a00db74c032ea31ff9e017f3baba3f543f5bbe2930281d",
     },
     "fdb1ab7e8ccbb2e8e1d8": {
+        "kernel": "35deb0e5eea243f77d81",
         "binding": "09ef673497e9adb01b7e",
         "arches": _SM100,
         "compile_flags": [
             "--use_fast_math",
+            "-DCAKE_LEVER_PF=1",
             "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_fdb1ab7e8ccbb2e8e1d8",
             "-DCAKE_PROGRAM_SHIM=cake_host_shim_093cff4da441bc1a",
         ],
         "arg_plan": "gemm",
-        "closure_sha256": "377be7ee4daa4cacc08a9e66c7f514716de4e2d23c8430088b176d458145c7c5",
+        "closure_sha256": "e7eec67ad7659e83678054b65f6597e078c0bf319c432eb27c9aaa3e287cc00c",
     },
     "fe01dd81c571f1f74124": {
         "binding": "0cdb8cc10eb1192d3635",
