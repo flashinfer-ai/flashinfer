@@ -872,7 +872,9 @@ def test_form_rule_takes_the_fused_form_within_the_capacity_and_the_eager_rule(
         assert cake_backend.FUSED_HOST_RULE_ARCHES == ("sm_100a", "sm_103a", "sm_107a")
         assert cake_backend.FUSED_HOSTS == ("aarch64",)
         assert cake_backend.FUSED_MAX_ROWS == 4
-        capacity = [cake_backend.fused_capacity(i) for i in (800, 900, 1000, 1030, 1070)]
+        capacity = [
+            cake_backend.fused_capacity(i) for i in (800, 900, 1000, 1030, 1070)
+        ]
         assert capacity == [0, 264, 148, 152, 212]
         for host in ("aarch64", "x86_64"):
             monkeypatch.setattr(cake_backend, "HOST_MACHINE", host)
