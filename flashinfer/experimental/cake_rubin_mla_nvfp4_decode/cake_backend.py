@@ -490,8 +490,9 @@ class Plan:
     ``item_table`` is the flat int32 ``[items * 6]`` the decode walks (full-tile items first, ``n_full`` of them),
     ``q_indptr`` the ``[B + 1]`` query prefix sums, ``row_limit`` the ``[rows_total]`` per-row key limits;
     together they are the plan block uploaded once per runner.  ``max_splits`` is the partial-slot count per row
-    (1: every item direct, no merge).  ``decode_record`` is ``decode_full`` when ``n_full == items`` else
-    ``decode``; ``merge_record`` the merge variant for the row count and partials per row, ``None`` when ``max_splits == 1``.
+    (1: every item direct, no merge).  ``decode_record`` is ``decode_full_pairpipe`` when the plan scalars lie in
+    its registry boxes, else ``decode_full`` when ``n_full == items``, else ``decode``; ``merge_record`` the merge
+    variant for the row count and partials per row, ``None`` when ``max_splits == 1``.
     """
 
     batch: int
@@ -636,7 +637,7 @@ def _plan_cached(
         kv_lens, q_lens, num_heads, kv_lens_global, cp_world, cp_rank, cp_interleave
     )
     decode_record = cake_jit.select_record(
-        "decode", rows=rows_total, n_full=n_full, items=items
+        "decode", rows=rows_total, n_full=n_full, items=items, splits=max_splits
     )
     merge_record = (
         cake_jit.select_record(
