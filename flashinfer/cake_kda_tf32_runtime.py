@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from functools import partial
 
+from flashinfer.jit import cake_kda_tf32 as _kda_registry
 from flashinfer.jit.cake_kda_tf32 import _RENDERED_ROUTES, _factory
 from flashinfer.jit.cake_kda_tf32 import device_arch as detect_gpu_arch
 from flashinfer.kda_prefill import (
@@ -865,6 +866,46 @@ _MAP_FIRST_MODULES = frozenset(_MAP_FIRST_SHIPPED) | frozenset(
 )
 
 
+# Chain-route correction bodies that merge themselves into the composite.
+# Each window reduce-adds its output into the caller's output tail,
+# accumulates its checkpoint rows onto the rows the main windows wrote in
+# place (row zero included), and a window that ends a sequence stores main
+# final + correction final (one IEEE FP32 addition, as the epilogue did) into
+# that sequence's pool slot, so no epilogue kernel follows the chain.  They
+# are the loader's ``_RENDERED_MERGE_ROUTES`` builds of the correction
+# modules (read at launch preparation); every other launch of those modules
+# keeps the routed program.
+def _correction_merge_routed(device) -> bool:
+    """The loader names a merging correction build for ``device``."""
+    import torch
+
+    arch = {(10, 0): "sm_100a", (10, 3): "sm_103a"}.get(
+        torch.cuda.get_device_capability(device)
+    )
+    return bool(_kda_registry._RENDERED_MERGE_ROUTES.get(arch))
+
+
+class _CorrectionMergeUnavailable(Exception):
+    """The chain's correction module has no merging build on this device."""
+
+
+def _correction_merge_factory(name, *args, route_heads=None, **kwargs):
+    """The merging build of the factory row's correction module.
+
+    ``_factory`` resolves the row to its shipped module and that module
+    through the routes; this takes the module's ``_RENDERED_MERGE_ROUTES``
+    build instead (same argument plan, the merge on top).
+    """
+    del route_heads
+    arch = detect_gpu_arch()
+    rows = _kda_registry.FACTORIES.get(arch, {}).get(name, {})
+    module = rows.get(_kda_registry._key(args, kwargs))
+    program = _kda_registry._RENDERED_MERGE_ROUTES.get(arch, {}).get(module)
+    if program is None:
+        raise _CorrectionMergeUnavailable
+    return _kda_registry.PreparedKernel(program, arch)
+
+
 # Bodies that reach an operand only through its TMA descriptor never
 # dereference the raw pointer argument of the same name.  The generated FFI
 # shim still applies the contiguous-by-default host contract to that pointer,
@@ -1198,6 +1239,8 @@ class _FusedAffineEpilogue:
     pool_slot_stride: int
     first_rows: int
     num_rows: int
+    # The index preparation of a composite whose correction windows merge themselves (no ``run`` launch).
+    index_prep_merge: Any = None
 
     @staticmethod
     def build(impl) -> "_FusedAffineEpilogue | None":
@@ -1235,6 +1278,7 @@ class _FusedAffineEpilogue:
             pool_slot_stride=int(pool.stride(0)),
             first_rows=first_rows,
             num_rows=num_rows,
+            index_prep_merge=getattr(module, "index_prep_merge", None),
         )
 
 
@@ -3412,6 +3456,27 @@ class FlashKDABlackwellFP32SlabM128PDLConsumerAccumulateLaunch(
     _checkpoint_accumulate = True
 
 
+class FlashKDABlackwellFP32SlabM128PDLConsumerMergeLaunch(
+    FlashKDABlackwellFP32SlabM128PDLConsumerLaunch
+):
+    """Correction windows that merge themselves into the affine composite.
+
+    The factory row is the plain correction's; the body is that module's
+    merging build (``_correction_merge_factory``), which accumulates its rows
+    by build.  Raises ``_CorrectionMergeUnavailable`` when the module has none.
+    """
+
+    @staticmethod
+    def _build_kda_module(factory, *args, **kwargs):
+        if getattr(factory, "func", None) is _factory and factory.args == (
+            "compiled_bf16_fused_m128",
+        ):
+            factory = partial(
+                _correction_merge_factory, *factory.args, **factory.keywords
+            )
+        return _build_kda_module(factory, *args, **kwargs)
+
+
 def _allocate_operator_export(offsets, num_heads: int, device):
     """Per-chunk-head operator slabs for the affine operator export (kernel round 2).
 
@@ -3498,7 +3563,18 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
     route = BF16_ROUTE_AFFINE_SPLIT_M128
     schedule = "split_seq_affine_prefix_direct_m128_fp32_state"
 
-    def __init__(
+    def __init__(self, *args, **kwargs) -> None:
+        try:
+            self._init(*args, **kwargs)
+        except _CorrectionMergeUnavailable:
+            # The correction module has no merging build, or the composite
+            # cannot gather the merge's pool offsets: build it again with
+            # private correction windows and the epilogue kernel.
+            self.__dict__.clear()
+            kwargs["_merge_correction"] = False
+            self._init(*args, **kwargs)
+
+    def _init(
         self,
         q,
         k,
@@ -3521,6 +3597,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         compute_dtype: str = "bf16",
         sequence_lengths: tuple[int, ...] | None = None,
         active_beta_f32: bool = False,
+        _merge_correction: bool = True,
     ) -> None:
         import torch
 
@@ -3648,6 +3725,22 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         num_parts = len(token_offsets) - 1
         self._num_sequences = num_sequences
         self.sequence_lengths = resolved_lengths
+        # The bounded BF16 chain's correction windows merge themselves into
+        # the output tail, the checkpoint rows (BF16 rows, then written in
+        # place by the main windows) and the pool when the loader routes the
+        # correction modules to merging programs.
+        self._correction_merge = bool(
+            _merge_correction
+            and num_parts >= 2
+            and compute_dtype == "bf16"
+            and lower_bound is not None
+            and (state_checkpoints is None or state_checkpoints.dtype == torch.bfloat16)
+            and final_state.dtype == torch.float32
+            and final_state.ndim == 4
+            and final_state[0].is_contiguous()
+            and _fused_affine_epilogue_enabled()
+            and _correction_merge_routed(q.device)
+        )
         # Every host-side metadata list of the composite (part windows, part
         # selectors, checkpoint-row plan) goes up in two pinned, stream-ordered
         # copies (int32 / int64) after the lists are complete; one pageable
@@ -3734,14 +3827,15 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             self._checkpoint_merged_first = None
             self._checkpoint_merged_tail = None
             self._first_cp_count = first_cp_count
-            self._checkpoint_in_place = (
+            self._checkpoint_in_place = self._correction_merge or (
                 state_checkpoints.dtype == torch.float32
                 and _affine_rows_in_place_enabled()
             )
             if self._checkpoint_in_place:
-                # FP32 rows: the main windows write the caller's rows directly
-                # and the correction windows add theirs in place, so no row is
-                # staged, re-read and merged.  Each window's destination row
+                # FP32 rows (or the merging correction's BF16 rows): the main
+                # windows write the caller's rows directly and the correction
+                # windows add theirs in place, so no row is staged, re-read and
+                # merged.  Each window's destination row
                 # start (caller cu_starts of its sequence + rows before it) is
                 # gathered on the device at every launch: no host readback.
                 part_seq_ids, part_local_rows = _affine_window_row_starts(
@@ -3781,8 +3875,22 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                     (cp_count,), dtype=torch.int64, device=q.device
                 )
                 self.schedule += "_checkpoint64"
+        if self._correction_merge:
+            # Correction window (part - 1) that ends each sequence; a first
+            # sequence of one window has no correction window and takes the
+            # table's last entry.
+            host_i64["merge_final_positions"] = [
+                end - 2 if end >= 2 else num_parts - 1 for end in part_offsets[1:]
+            ]
         uploaded_i32 = _upload_int_batch(q.device, host_i32, torch.int32)
         uploaded_i64 = _upload_int_batch(q.device, host_i64, torch.int64)
+        if self._correction_merge:
+            self._merge_final_positions = uploaded_i64["merge_final_positions"]
+            # Pool element offset per correction window (-1: the window ends no
+            # sequence), then the first sequence's; index prep fills the slots.
+            self._merge_final_offsets = torch.full(
+                (num_parts,), -1, dtype=torch.int64, device=q.device
+            )
         self._metadata_host = (
             uploaded_i32.get("_host_pinned"),
             uploaded_i64.get("_host_pinned"),
@@ -3854,7 +3962,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             and not self._use_output_projection
             and (state_checkpoints is None or self._checkpoint_in_place)
         )
-        if not self._apply_route:
+        if not self._apply_route and not self._correction_merge:
             self._correction_out = torch.empty_like(out[:, first_part_tokens:])
         main_launch_cls = (
             FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerExportLaunch
@@ -3895,12 +4003,21 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         self._main.args["initial_state_f32"] = self._initial_pool_pointer
         self._correction = None
         if not self._use_output_projection and not self._apply_route:
-            correction_cls = (
-                FlashKDABlackwellFP32SlabM128PDLConsumerAccumulateLaunch
-                if self._checkpoint_in_place
-                else FlashKDABlackwellFP32SlabM128PDLConsumerLaunch
+            correction_cls: type[FlashKDABlackwellFP32SlabM128PDLConsumerLaunch]
+            if self._correction_merge:
+                correction_cls = FlashKDABlackwellFP32SlabM128PDLConsumerMergeLaunch
+            elif self._checkpoint_in_place:
+                correction_cls = (
+                    FlashKDABlackwellFP32SlabM128PDLConsumerAccumulateLaunch
+                )
+            else:
+                correction_cls = FlashKDABlackwellFP32SlabM128PDLConsumerLaunch
+            correction_out = (
+                out[:, first_part_tokens:]
+                if self._correction_merge
+                else self._correction_out
             )
-            assert self._correction_out is not None
+            assert correction_out is not None
             self._correction = correction_cls(
                 q[:, first_part_tokens:],
                 k[:, first_part_tokens:],
@@ -3908,7 +4025,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 g[:, first_part_tokens:],
                 beta[:, first_part_tokens:],
                 scale,
-                self._correction_out,
+                correction_out,
                 A_log,
                 dt_bias,
                 lower_bound,
@@ -3929,6 +4046,17 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                     )
                 ),
             )
+            if self._correction_merge:
+                # The merging body reads the per-window pool offsets through
+                # ``state_indices_addr``, the main windows' final states through
+                # ``norm_inv_out`` and stores into the pool (``final_state_f32``).
+                self._correction.args.update(
+                    state_indices_addr=self._merge_final_offsets.data_ptr(),
+                    use_state_indices=0,
+                    norm_inv_out=self._main_final,
+                    final_state_f32=_ffi_raw_pointer_carrier(self._final_pool),
+                )
+                self.schedule += "_correction_merge"
         map_snapshot_kwargs = {}
         tail_lengths = [
             end - begin
@@ -4170,8 +4298,14 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         self._fused_epilogue = None
         if not self._use_output_projection and _fused_affine_epilogue_enabled():
             self._fused_epilogue = _FusedAffineEpilogue.build(self)
-            if self._fused_epilogue is not None:
+            if self._fused_epilogue is not None and not self._correction_merge:
                 self.schedule += "_fused_epilogue"
+        if self._correction_merge and (
+            self._fused_epilogue is None
+            or self._fused_epilogue.index_prep_merge is None
+        ):
+            # The merge needs the per-launch pool offsets of the index prep.
+            raise _CorrectionMergeUnavailable
         if self._fused_epilogue is None:
             # Torch epilogue scratch: a merged copy of the checkpoint rows plus
             # the selected final states (~4x the checkpoint rows of a 16K pack;
@@ -4250,7 +4384,25 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         )
         if map_first:
             fire(self._map_records())
-        if self._fused_epilogue is not None:
+        if self._correction_merge:
+            # The index gather also places each sequence's pool offset at the
+            # correction window that ends it.
+            fire(
+                [
+                    (
+                        self._fused_epilogue.index_prep_merge,
+                        _ffi_arguments(
+                            (
+                                *self._index_prep_arguments(),
+                                self._merge_final_positions,
+                                self._merge_final_offsets,
+                                self._fused_epilogue.pool_slot_stride,
+                            )
+                        ),
+                    )
+                ]
+            )
+        elif self._fused_epilogue is not None:
             # One kernel gathers every per-call index the parts consume
             # (window state indices, in-place row starts, the int64 state
             # indices of the epilogue).
@@ -4308,7 +4460,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             )
         else:
             fire(_settled_launch_records(self._correction))
-        if not self._apply_route:
+        if not self._apply_route and not self._correction_merge:
             # The apply route's scan kernel wrote the final states into the
             # pool and the row-0 carries into the checkpoint rows.
             if self._fused_epilogue is not None:

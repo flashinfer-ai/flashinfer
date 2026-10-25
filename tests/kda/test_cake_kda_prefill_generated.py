@@ -96,6 +96,14 @@ def test_routes_point_shipped_modules_at_generated_programs():
                 assert program in registry._RENDERED_MODULES, (arch, program)
                 assert arch in registry._RENDERED_MODULES[program]["arches"]
                 routed.add(program)
+    assert set(registry._RENDERED_MERGE_ROUTES) == set(registry.ARCHES)
+    for arch, modules in registry._RENDERED_MERGE_ROUTES.items():
+        for module, program in modules.items():
+            # Every other launch of the module keeps its route.
+            assert module in registry._RENDERED_ROUTES[arch], (arch, module)
+            assert program in registry._RENDERED_MODULES, (arch, program)
+            assert arch in registry._RENDERED_MODULES[program]["arches"]
+            routed.add(program)
     assert routed == set(GENERATED)
 
 
@@ -130,8 +138,12 @@ def test_generated_record_is_lean_and_names_its_units(name):
 def test_generated_plans_bind_from_the_shipped_plans():
     """The launch classes bind by the shipped plan's names: a generated plan
     must name a subset of them, tensors as tensors and scalars as scalars."""
-    for arch, routes in registry._RENDERED_ROUTES.items():
-        for module, program in routes.items():
+    for arch in registry.ARCHES:
+        routes = [
+            *registry._RENDERED_ROUTES[arch].items(),
+            *registry._RENDERED_MERGE_ROUTES[arch].items(),
+        ]
+        for module, program in routes:
             shipped = {
                 name: kind for kind, name in registry.MODULES[module]["arg_plan"]
             }
@@ -385,6 +397,38 @@ def test_map_first_programs_wait_before_touching_memory():
             prologue,
         ), name
         assert not re.search(r"\binitial_state_f32\b", body), name
+
+
+CORRECTION_MODULES = (
+    "cake_kda_bf16_2b5f2c6b7cfc10ffa244",
+    "cake_kda_bf16_f66adfecf2022fc198b6",
+)
+OUTPUT_REDUCE = re.compile(r"\bcp\.reduce\.async\.bulk\.tensor\.[\w:.]*\.add\b")
+TAIL_REDUCE = re.compile(r"\bred\.[\w:.]*global\.add\.noftz\.bf16x2\b")
+
+
+@requires_programs
+def test_merging_correction_builds_reduce_into_the_composite():
+    """The chain route's correction modules have a merging build per
+    architecture (``_RENDERED_MERGE_ROUTES``): a generated program of its own,
+    never the module's routed program, that reduce-adds its output tiles into
+    the caller's output (a bulk tensor reduce, a packed BF16 add for a tail
+    chunk).  The routed program, which every other launch keeps, stores."""
+    assert set(registry._RENDERED_MERGE_ROUTES) == set(registry.ARCHES)
+    for arch, merging in registry._RENDERED_MERGE_ROUTES.items():
+        assert sorted(merging) == list(CORRECTION_MODULES), arch
+        for module, name in merging.items():
+            routed = registry._RENDERED_ROUTES[arch][module]
+            assert name in GENERATED and name != routed, (arch, module)
+            assert arch in registry._RENDERED_MODULES[name]["arches"]
+            record = registry._RENDERED_MODULES[name]
+            assert record["arg_plan"] == registry._RENDERED_MODULES[routed]["arg_plan"]
+            text = (ROOT / record["sources"][0]).read_text()
+            assert OUTPUT_REDUCE.search(text) and TAIL_REDUCE.search(text), name
+            text = (ROOT / registry._RENDERED_MODULES[routed]["sources"][0]).read_text()
+            assert not OUTPUT_REDUCE.search(text) and not TAIL_REDUCE.search(text), (
+                routed
+            )
 
 
 # ---------------------------------------------------------------- GPU numerics
@@ -643,7 +687,11 @@ def unrouted(monkeypatch):
     """Clear the routes: every factory row builds its shipped module."""
 
     def clear():
-        for table in ("_RENDERED_ROUTES", "_RENDERED_HEAD_ROUTES"):
+        for table in (
+            "_RENDERED_ROUTES",
+            "_RENDERED_HEAD_ROUTES",
+            "_RENDERED_MERGE_ROUTES",
+        ):
             monkeypatch.setattr(registry, table, {arch: {} for arch in registry.ARCHES})
 
     return clear
@@ -681,6 +729,53 @@ def test_serving_rows_match_the_fp32_reference(lengths, heads, lower_bound, unro
     shipped = _Call(d, lower_bound)
     _assert_close(shipped.run(), want, "shipped")
     assert not _modules(shipped.prepared) & set(GENERATED)
+
+
+MERGE_ROWS = [
+    pytest.param([8192], 12, id="8192-h12"),
+    pytest.param([3000, 13384], 16, id="3000+13384-h16"),
+    pytest.param([8128, 64, 8128, 64], 12, id="8128+64x4-h12"),
+]
+
+
+@requires_blackwell
+@pytest.mark.parametrize("lengths,heads", MERGE_ROWS)
+def test_merging_correction_is_bitwise_the_epilogue_composite(
+    lengths, heads, monkeypatch
+):
+    """A chain composite whose correction windows merge themselves equals,
+    bit for bit, the composite that runs the epilogue kernel after them (the
+    loader without merging builds): output, pool slots and checkpoint rows,
+    every element written over NaN, the other pool slots untouched."""
+    arch = registry.device_arch()
+    merging = registry._RENDERED_MERGE_ROUTES[arch]
+    routed = {registry._RENDERED_ROUTES[arch][module] for module in merging}
+    d = _inputs(lengths, heads)
+    untouched = torch.ones(d["state"].shape[0], dtype=torch.bool, device="cuda")
+    untouched[d["state_indices"].long()] = False
+
+    merged = _Call(d, -5.0)
+    merged_result = merged.run()
+    loaded = _modules(merged.prepared)
+    assert not loaded & routed, "a chain correction kept its epilogue"
+    chain = bool(loaded & set(merging.values()))
+    if lengths in ([8192], [3000, 13384]):
+        assert chain, "the chain route's correction did not merge"
+    assert torch.equal(d["state"][untouched], d["initial_pool"][untouched])
+    _assert_bitwise(merged.run(), merged_result, "merged repeat")
+
+    monkeypatch.setattr(
+        registry,
+        "_RENDERED_MERGE_ROUTES",
+        {name: {} for name in registry.ARCHES},
+    )
+    epilogue = _Call(d, -5.0)
+    epilogue_result = epilogue.run()
+    assert not _modules(epilogue.prepared) & set(merging.values())
+    if chain:
+        assert _modules(epilogue.prepared) & routed
+    _assert_bitwise(merged_result, epilogue_result, "merged vs epilogue composite")
+    assert torch.equal(d["state"][untouched], d["initial_pool"][untouched])
 
 
 GRAPH_ROWS = [

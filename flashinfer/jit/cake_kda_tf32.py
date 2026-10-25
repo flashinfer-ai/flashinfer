@@ -3408,6 +3408,13 @@ _RENDERED_HEAD_ROUTES = {
     },
 }
 
+# architecture -> shipped module -> the generated build of a chain-route
+# correction module whose windows merge themselves into the affine composite
+# (no epilogue kernel follows them). The runtime takes it instead of the
+# ``_RENDERED_ROUTES`` program when it launches the composite without the
+# epilogue; every other launch of the module keeps the routed program.
+_RENDERED_MERGE_ROUTES = {"sm_100a": {}, "sm_103a": {}}
+
 MODULES = {
     **{name: _module_record(name, *row) for name, row in _MODULE_ROWS.items()},
     **_RENDERED_MODULES,
