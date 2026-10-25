@@ -58,7 +58,8 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 #   register-resident row) for one CTA width, launch-bounds occupancy, input
 #   dtype and folded output scale (``cake_backend.quant_plan``); the
 #   ``_k<K>`` keys of the small-row tier share one program per CTA shape whose
-#   row width is the compile-line definition ``K_STATIC`` (``DEFINITIONS``);
+#   row width is the compile-line definition ``K_STATIC`` (``DEFINITIONS``),
+#   and the ``_cs<C>`` keys split each token row over a cluster of ``C`` CTAs;
 # * ``gemm:<orientation><tile>[_k512][_2cta][_hm][_sk<split>]_<bf16|f16>
 #   [_a<hint>][_b<hint>][_l2<promo>][_g<group>][_clc][_s<stages>][_o<ctas>]``
 #   the persistent block-scaled tcgen05 GEMM with the per-token alpha epilogue
@@ -1771,6 +1772,8 @@ KERNELS: dict[str, dict[str, str]] = {
 }
 
 DEFINITIONS: dict[str, dict[str, int]] = {
+    "quant:t128_b1_mb1_bf16_cs4_k7168": {"K_STATIC": 7168},
+    "quant:t128_b1_mb1_bf16_fold_cs4_k7168": {"K_STATIC": 7168},
     "quant:t256_b1_mb1_bf16_fold_k2688": {"K_STATIC": 2688},
     "quant:t256_b1_mb1_bf16_fold_k4096": {"K_STATIC": 4096},
     "quant:t256_b1_mb1_bf16_k2688": {"K_STATIC": 2688},

@@ -16,19 +16,22 @@ out = mm_fp4(fp4, w_fp4.T, sf, w_sf.T, scale * w_scale, torch.bfloat16, backend=
 
 | Entry point | Program | Contract |
 | --- | --- | --- |
-| `nvfp4_quantize(x, global_scale_inv, per_token_activation=True, backend="cake", out_scale=...)` | `quant:...` (one CTA per token row, register-resident row) | `x [M, K]` bf16 / fp16, `K % 16 == 0`, 128x4 scale layout, no shuffle, no `expanded_idx_to_permuted_idx`; returns `fp4 [M, K/2]` uint8, `sf [round_up(M, 128), round_up(K/16, 4)]` uint8, `per_token_scale [M]` fp32 (times `out_scale` when given) -- bitwise equal to `backend="cute-dsl"` |
+| `nvfp4_quantize(x, global_scale_inv, per_token_activation=True, backend="cake", out_scale=...)` | `quant:...` (one CTA per token row, register-resident row; short launches of long bf16 rows split each row over a cluster of four CTAs) | `x [M, K]` bf16 / fp16, `K % 16 == 0`, 128x4 scale layout, no shuffle, no `expanded_idx_to_permuted_idx`; returns `fp4 [M, K/2]` uint8, `sf [round_up(M, 128), round_up(K/16, 4)]` uint8, `per_token_scale [M]` fp32 (times `out_scale` when given) -- bitwise equal to `backend="cute-dsl"` |
 | `mm_fp4(a, b, a_descale, b_descale, alpha, out_dtype, out, backend="cake")` | `gemm:...` (persistent tcgen05 block-scaled GEMM, per-token alpha epilogue) | `alpha [M]` fp32 (per-token path only), `a [M, K/2]` contiguous, `b = b_fp4.T` of a contiguous `[N, K/2]` weight, 128x4 scales (`b_descale = b_sf.T`), `block_size 16`, `N % 8 == 0`, `K % 256 == 0`, bf16 / fp16 output, contiguous `out` |
 
 The GEMM tactic is the rule of the Cake launcher (`cake_backend.default_tactic`):
 `M <= 32` runs the swapped orientation (8 / 16 / 32 tokens per tile; cluster split-K
 while the tile grid leaves most SMs idle - three K slices instead of two on the 8-token rows
 with several token tiles when the whole cluster grid is co-resident per the part's
-driver-measured cluster capacity (`cake_backend.CLUSTER_CAPACITY_BY_SM_COUNT`) - and
+driver-measured cluster capacity (`cake_backend.CLUSTER_CAPACITY_BY_SM_COUNT`), else on
+the 16-token tile for the measured narrow rows of each output dtype (`cake_backend.N16_SPLITK3_M`) - and
 split-K 2 on the deep-K rows whose weight tiles fill at most half the SMs; two CTAs per SM or three mainloop stages on the rows
-whose weight-tile count exceeds or fills one wave, chosen per SM count); larger `M`
+whose weight-tile count exceeds or fills one wave, chosen per SM count, and 64-row weight tiles at one CTA per SM for the
+8-token tile on the 152-SM part when the weight tiles outnumber the SMs); larger `M`
 runs the tile the bucket scorer picks (1-CTA 128-token tiles, or 2-CTA 256-token tiles
 whose width is re-picked on multi-wave grids from the measured per-wave cost of the
-128 / 192 / 256-wide tiles, with the grouped raster for narrow weights on multi-wave
+128 / 192 / 256-wide tiles -- on the 152-SM SM103 part the cost of the K = 96 mainloop
+programs when the re-picked plan is one of them -- with the grouped raster for narrow weights on multi-wave
 grids and the cluster-launch-control tile scheduler for the largest rows), with three
 single-token-tile overrides: a 2-CTA
 256x64 pair for `M <= 128` over at most 40 narrow weight tiles, the 128-wide two-wave tile
@@ -70,7 +73,9 @@ Generated sources live flat under `csrc/cake_nvfp4_per_token/` (architecture-neu
 `*_kernel.cu` / `*_binding.cu` sources whose per-architecture lowering is selected by
 `__CUDA_ARCH__` guards, plus the shared `*_common.cuh` headers) and are registered in
 `cake_jit.py` (`MODULES`, `KERNELS`) by the Cake generated-program export (see the
-hand-fold note below).
+hand-fold note below).  The cluster-split quantizers and the SM103 K = 96 GEMM programs
+are rendered by the export with their own kernel and binding sources and the
+`cake_ffi_checks.h` header.
 
 Hand-fold note: the kernel and binding sources under `csrc/` and the registry rows in
 `cake_jit.py` are exporter output hand-folded here pending exporter support. A program
