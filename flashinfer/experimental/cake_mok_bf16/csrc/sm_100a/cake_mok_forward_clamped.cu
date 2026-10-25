@@ -214,6 +214,10 @@ __device__ __forceinline__ __nv_bfloat162 __as_bf16x2(unsigned int v) {
     return __nv_bfloat162(raw);
 }
 
+__device__ __forceinline__ float2 cake_bf16x2_to_f32x2(__nv_bfloat162 v) {
+    return __bfloat1622float2(v);
+}
+
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
@@ -611,14 +615,14 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                                 for (int mini = first_mini; mini < last_mini + 1; mini++) {
                                     int mini_rows = ((mini_size) < (tokens - mini * mini_size) ? (mini_size) : (tokens - mini * mini_size));
                                     int required = (mini_rows + 255) / 256 * (hidden / 256) * 2;
-                                    int32_t _relaxed_ld_0;
-                                    asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_0) : "l"(y_ready + mini) : "memory");
-                                    int value = _relaxed_ld_0;
-                                    while (value < required) {
+                                    int _poll_0_first;
+                                    asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_poll_0_first) : "l"(y_ready + mini) : "memory");
+                                    int _poll_0 = _poll_0_first;
+                                    while (_poll_0 < required) {
                                         asm volatile("nanosleep.u32 %0;" :: "r"(16));
-                                        int32_t _relaxed_ld_1;
-                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_1) : "l"(y_ready + mini) : "memory");
-                                        value = _relaxed_ld_1;
+                                        int _poll_0_next;
+                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_poll_0_next) : "l"(y_ready + mini) : "memory");
+                                        _poll_0 = _poll_0_next;
                                     }
                                     asm volatile("fence.acquire.gpu;" ::: "memory");
                                 }
@@ -698,14 +702,14 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                                     int required_1 = (mini_rows_1 + 255) / 256 * (hidden / 256) * 2;
                                     bool enabled_value_1 = 1;
                                     if (enabled_value_1 != 0) {
-                                        int32_t _relaxed_ld_2;
-                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_2) : "l"(y_ready + previous_mini) : "memory");
-                                        int value_1 = _relaxed_ld_2;
-                                        while (value_1 < required_1) {
+                                        int _poll_1_first;
+                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_poll_1_first) : "l"(y_ready + previous_mini) : "memory");
+                                        int _poll_1 = _poll_1_first;
+                                        while (_poll_1 < required_1) {
                                             asm volatile("nanosleep.u32 %0;" :: "r"(16));
-                                            int32_t _relaxed_ld_3;
-                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_3) : "l"(y_ready + previous_mini) : "memory");
-                                            value_1 = _relaxed_ld_3;
+                                            int _poll_1_next;
+                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_poll_1_next) : "l"(y_ready + previous_mini) : "memory");
+                                            _poll_1 = _poll_1_next;
                                         }
                                         asm volatile("fence.acquire.gpu;" ::: "memory");
                                     }
@@ -721,7 +725,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                                     asm volatile("st.v4.u32 [%0], {%1, %2, %3, %4};" :: "l"((uint64_t)(reinterpret_cast<uint8_t*>(dispatch_smem) + (tid * 1024 + vec_2 * 16))), "r"(static_cast<uint32_t>((unsigned int)0)), "r"(static_cast<uint32_t>((unsigned int)0)), "r"(static_cast<uint32_t>((unsigned int)0)), "r"(static_cast<uint32_t>((unsigned int)0)) : "memory");
                                 }
                             }
-                            mbarrier_wait(dispatch_arrived_addr, phase_bits_1 & 1);
+                            unsigned int _parity_dispatch_arrived = phase_bits_1 % 2;
+                            mbarrier_wait(dispatch_arrived_addr, _parity_dispatch_arrived);
                             phase_bits_1 = phase_bits_1 ^ 1;
                             if (tid < 128) {
                                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -777,14 +782,14 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                     int rows_4 = ((unit_rows_0) < (block_3 * 128 + 128 - first_row_5) ? (unit_rows_0) : (block_3 * 128 + 128 - first_row_5));
                     int mini_1 = (macro_offset_2 + first_row_5) / mini_size;
                     int mini_rows_2 = ((mini_size) < (tokens - mini_1 * mini_size) ? (mini_size) : (tokens - mini_1 * mini_size));
-                    int32_t _relaxed_ld_4;
-                    asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_4) : "l"(y_ready + mini_1) : "memory");
-                    int value_2 = _relaxed_ld_4;
-                    while (value_2 < (mini_rows_2 + 255) / 256 * (hidden / 256) * 2) {
+                    int _poll_2_first;
+                    asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_poll_2_first) : "l"(y_ready + mini_1) : "memory");
+                    int _poll_2 = _poll_2_first;
+                    while (_poll_2 < (mini_rows_2 + 255) / 256 * (hidden / 256) * 2) {
                         asm volatile("nanosleep.u32 %0;" :: "r"(16));
-                        int32_t _relaxed_ld_5;
-                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_5) : "l"(y_ready + mini_1) : "memory");
-                        value_2 = _relaxed_ld_5;
+                        int _poll_2_next;
+                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_poll_2_next) : "l"(y_ready + mini_1) : "memory");
+                        _poll_2 = _poll_2_next;
                     }
                     asm volatile("fence.acquire.gpu;" ::: "memory");
                     mbarrier_arrive_expect_tx(rows_arrived_addr + (buffer_2) * 8, (unsigned int)(rows_4 * hidden * 2));
@@ -835,14 +840,14 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         int rows_3_1 = ((unit_rows_0) < (block_1_2 * 128 + 128 - first_row_2_1) ? (unit_rows_0) : (block_1_2 * 128 + 128 - first_row_2_1));
                         int mini_2 = (macro_offset_2 + first_row_2_1) / mini_size;
                         int mini_rows_3 = ((mini_size) < (tokens - mini_2 * mini_size) ? (mini_size) : (tokens - mini_2 * mini_size));
-                        int32_t _relaxed_ld_6;
-                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_6) : "l"(y_ready + mini_2) : "memory");
-                        int value_3 = _relaxed_ld_6;
-                        while (value_3 < (mini_rows_3 + 255) / 256 * (hidden / 256) * 2) {
+                        int _poll_3_first;
+                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_poll_3_first) : "l"(y_ready + mini_2) : "memory");
+                        int _poll_3 = _poll_3_first;
+                        while (_poll_3 < (mini_rows_3 + 255) / 256 * (hidden / 256) * 2) {
                             asm volatile("nanosleep.u32 %0;" :: "r"(16));
-                            int32_t _relaxed_ld_7;
-                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_7) : "l"(y_ready + mini_2) : "memory");
-                            value_3 = _relaxed_ld_7;
+                            int _poll_3_next;
+                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_poll_3_next) : "l"(y_ready + mini_2) : "memory");
+                            _poll_3 = _poll_3_next;
                         }
                         asm volatile("fence.acquire.gpu;" ::: "memory");
                         mbarrier_arrive_expect_tx(rows_arrived_addr + (buffer_0_1) * 8, (unsigned int)(rows_3_1 * hidden * 2));
@@ -872,7 +877,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                 if (warp == 5) {
                     if (elect_sync()) {
                         if (cta_rank_0 == 0) {
-                            mbarrier_wait(schedule_finished_addr, (iteration + 1) % 2);
+                            int _parity_schedule_finished = (int)((unsigned int)(iteration + 1) % 2);
+                            mbarrier_wait(schedule_finished_addr, _parity_schedule_finished);
                             asm volatile(
                                 "clusterlaunchcontrol.try_cancel.async.shared::cta"
                                     ".mbarrier::complete_tx::bytes.multicast::cluster::all.b128"
@@ -1349,8 +1355,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         gate_packed[31] = __as_u32(__float22bfloat162_rn(make_float2(_tmem_load_6[14], _tmem_load_6[15])));
                         up_packed[31] = __as_u32(__float22bfloat162_rn(make_float2(_tmem_load_7[14], _tmem_load_7[15])));
                         asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
-                        float2 _cvt_f32_0 = __bfloat1622float2(__as_bf16x2(gate_packed[0]));
-                        float2 _cvt_f32_1 = __bfloat1622float2(__as_bf16x2(up_packed[0]));
+                        float2 _cvt_f32_0 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[0]));
+                        float2 _cvt_f32_1 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[0]));
                         float gate_x = _cvt_f32_0.x;
                         float gate_y = _cvt_f32_0.y;
                         float up_x = _cvt_f32_1.x;
@@ -1366,8 +1372,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x = gate_x / denominator_x * up_x;
                         float hidden_y = gate_y / denominator_y * up_y;
                         hidden_packed[0] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x, hidden_y)));
-                        float2 _cvt_f32_2 = __bfloat1622float2(__as_bf16x2(gate_packed[1]));
-                        float2 _cvt_f32_3 = __bfloat1622float2(__as_bf16x2(up_packed[1]));
+                        float2 _cvt_f32_2 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[1]));
+                        float2 _cvt_f32_3 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[1]));
                         float gate_x_3 = _cvt_f32_2.x;
                         float gate_y_4 = _cvt_f32_2.y;
                         float up_x_5 = _cvt_f32_3.x;
@@ -1383,8 +1389,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_9 = gate_x_3 / denominator_x_7 * up_x_5;
                         float hidden_y_10 = gate_y_4 / denominator_y_8 * up_y_6;
                         hidden_packed[1] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_9, hidden_y_10)));
-                        float2 _cvt_f32_4 = __bfloat1622float2(__as_bf16x2(gate_packed[2]));
-                        float2 _cvt_f32_5 = __bfloat1622float2(__as_bf16x2(up_packed[2]));
+                        float2 _cvt_f32_4 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[2]));
+                        float2 _cvt_f32_5 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[2]));
                         float gate_x_11 = _cvt_f32_4.x;
                         float gate_y_12 = _cvt_f32_4.y;
                         float up_x_13 = _cvt_f32_5.x;
@@ -1400,8 +1406,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_17 = gate_x_11 / denominator_x_15 * up_x_13;
                         float hidden_y_18 = gate_y_12 / denominator_y_16 * up_y_14;
                         hidden_packed[2] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_17, hidden_y_18)));
-                        float2 _cvt_f32_6 = __bfloat1622float2(__as_bf16x2(gate_packed[3]));
-                        float2 _cvt_f32_7 = __bfloat1622float2(__as_bf16x2(up_packed[3]));
+                        float2 _cvt_f32_6 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[3]));
+                        float2 _cvt_f32_7 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[3]));
                         float gate_x_19 = _cvt_f32_6.x;
                         float gate_y_20 = _cvt_f32_6.y;
                         float up_x_21 = _cvt_f32_7.x;
@@ -1417,8 +1423,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_25 = gate_x_19 / denominator_x_23 * up_x_21;
                         float hidden_y_26 = gate_y_20 / denominator_y_24 * up_y_22;
                         hidden_packed[3] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_25, hidden_y_26)));
-                        float2 _cvt_f32_8 = __bfloat1622float2(__as_bf16x2(gate_packed[4]));
-                        float2 _cvt_f32_9 = __bfloat1622float2(__as_bf16x2(up_packed[4]));
+                        float2 _cvt_f32_8 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[4]));
+                        float2 _cvt_f32_9 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[4]));
                         float gate_x_27 = _cvt_f32_8.x;
                         float gate_y_28 = _cvt_f32_8.y;
                         float up_x_29 = _cvt_f32_9.x;
@@ -1434,8 +1440,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_33 = gate_x_27 / denominator_x_31 * up_x_29;
                         float hidden_y_34 = gate_y_28 / denominator_y_32 * up_y_30;
                         hidden_packed[4] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_33, hidden_y_34)));
-                        float2 _cvt_f32_10 = __bfloat1622float2(__as_bf16x2(gate_packed[5]));
-                        float2 _cvt_f32_11 = __bfloat1622float2(__as_bf16x2(up_packed[5]));
+                        float2 _cvt_f32_10 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[5]));
+                        float2 _cvt_f32_11 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[5]));
                         float gate_x_35 = _cvt_f32_10.x;
                         float gate_y_36 = _cvt_f32_10.y;
                         float up_x_37 = _cvt_f32_11.x;
@@ -1451,8 +1457,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_41 = gate_x_35 / denominator_x_39 * up_x_37;
                         float hidden_y_42 = gate_y_36 / denominator_y_40 * up_y_38;
                         hidden_packed[5] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_41, hidden_y_42)));
-                        float2 _cvt_f32_12 = __bfloat1622float2(__as_bf16x2(gate_packed[6]));
-                        float2 _cvt_f32_13 = __bfloat1622float2(__as_bf16x2(up_packed[6]));
+                        float2 _cvt_f32_12 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[6]));
+                        float2 _cvt_f32_13 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[6]));
                         float gate_x_43 = _cvt_f32_12.x;
                         float gate_y_44 = _cvt_f32_12.y;
                         float up_x_45 = _cvt_f32_13.x;
@@ -1468,8 +1474,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_49 = gate_x_43 / denominator_x_47 * up_x_45;
                         float hidden_y_50 = gate_y_44 / denominator_y_48 * up_y_46;
                         hidden_packed[6] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_49, hidden_y_50)));
-                        float2 _cvt_f32_14 = __bfloat1622float2(__as_bf16x2(gate_packed[7]));
-                        float2 _cvt_f32_15 = __bfloat1622float2(__as_bf16x2(up_packed[7]));
+                        float2 _cvt_f32_14 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[7]));
+                        float2 _cvt_f32_15 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[7]));
                         float gate_x_51 = _cvt_f32_14.x;
                         float gate_y_52 = _cvt_f32_14.y;
                         float up_x_53 = _cvt_f32_15.x;
@@ -1485,8 +1491,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_57 = gate_x_51 / denominator_x_55 * up_x_53;
                         float hidden_y_58 = gate_y_52 / denominator_y_56 * up_y_54;
                         hidden_packed[7] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_57, hidden_y_58)));
-                        float2 _cvt_f32_16 = __bfloat1622float2(__as_bf16x2(gate_packed[8]));
-                        float2 _cvt_f32_17 = __bfloat1622float2(__as_bf16x2(up_packed[8]));
+                        float2 _cvt_f32_16 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[8]));
+                        float2 _cvt_f32_17 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[8]));
                         float gate_x_59 = _cvt_f32_16.x;
                         float gate_y_60 = _cvt_f32_16.y;
                         float up_x_61 = _cvt_f32_17.x;
@@ -1502,8 +1508,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_65 = gate_x_59 / denominator_x_63 * up_x_61;
                         float hidden_y_66 = gate_y_60 / denominator_y_64 * up_y_62;
                         hidden_packed[8] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_65, hidden_y_66)));
-                        float2 _cvt_f32_18 = __bfloat1622float2(__as_bf16x2(gate_packed[9]));
-                        float2 _cvt_f32_19 = __bfloat1622float2(__as_bf16x2(up_packed[9]));
+                        float2 _cvt_f32_18 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[9]));
+                        float2 _cvt_f32_19 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[9]));
                         float gate_x_67 = _cvt_f32_18.x;
                         float gate_y_68 = _cvt_f32_18.y;
                         float up_x_69 = _cvt_f32_19.x;
@@ -1519,8 +1525,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_73 = gate_x_67 / denominator_x_71 * up_x_69;
                         float hidden_y_74 = gate_y_68 / denominator_y_72 * up_y_70;
                         hidden_packed[9] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_73, hidden_y_74)));
-                        float2 _cvt_f32_20 = __bfloat1622float2(__as_bf16x2(gate_packed[10]));
-                        float2 _cvt_f32_21 = __bfloat1622float2(__as_bf16x2(up_packed[10]));
+                        float2 _cvt_f32_20 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[10]));
+                        float2 _cvt_f32_21 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[10]));
                         float gate_x_75 = _cvt_f32_20.x;
                         float gate_y_76 = _cvt_f32_20.y;
                         float up_x_77 = _cvt_f32_21.x;
@@ -1536,8 +1542,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_81 = gate_x_75 / denominator_x_79 * up_x_77;
                         float hidden_y_82 = gate_y_76 / denominator_y_80 * up_y_78;
                         hidden_packed[10] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_81, hidden_y_82)));
-                        float2 _cvt_f32_22 = __bfloat1622float2(__as_bf16x2(gate_packed[11]));
-                        float2 _cvt_f32_23 = __bfloat1622float2(__as_bf16x2(up_packed[11]));
+                        float2 _cvt_f32_22 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[11]));
+                        float2 _cvt_f32_23 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[11]));
                         float gate_x_83 = _cvt_f32_22.x;
                         float gate_y_84 = _cvt_f32_22.y;
                         float up_x_85 = _cvt_f32_23.x;
@@ -1553,8 +1559,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_89 = gate_x_83 / denominator_x_87 * up_x_85;
                         float hidden_y_90 = gate_y_84 / denominator_y_88 * up_y_86;
                         hidden_packed[11] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_89, hidden_y_90)));
-                        float2 _cvt_f32_24 = __bfloat1622float2(__as_bf16x2(gate_packed[12]));
-                        float2 _cvt_f32_25 = __bfloat1622float2(__as_bf16x2(up_packed[12]));
+                        float2 _cvt_f32_24 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[12]));
+                        float2 _cvt_f32_25 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[12]));
                         float gate_x_91 = _cvt_f32_24.x;
                         float gate_y_92 = _cvt_f32_24.y;
                         float up_x_93 = _cvt_f32_25.x;
@@ -1570,8 +1576,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_97 = gate_x_91 / denominator_x_95 * up_x_93;
                         float hidden_y_98 = gate_y_92 / denominator_y_96 * up_y_94;
                         hidden_packed[12] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_97, hidden_y_98)));
-                        float2 _cvt_f32_26 = __bfloat1622float2(__as_bf16x2(gate_packed[13]));
-                        float2 _cvt_f32_27 = __bfloat1622float2(__as_bf16x2(up_packed[13]));
+                        float2 _cvt_f32_26 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[13]));
+                        float2 _cvt_f32_27 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[13]));
                         float gate_x_99 = _cvt_f32_26.x;
                         float gate_y_100 = _cvt_f32_26.y;
                         float up_x_101 = _cvt_f32_27.x;
@@ -1587,8 +1593,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_105 = gate_x_99 / denominator_x_103 * up_x_101;
                         float hidden_y_106 = gate_y_100 / denominator_y_104 * up_y_102;
                         hidden_packed[13] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_105, hidden_y_106)));
-                        float2 _cvt_f32_28 = __bfloat1622float2(__as_bf16x2(gate_packed[14]));
-                        float2 _cvt_f32_29 = __bfloat1622float2(__as_bf16x2(up_packed[14]));
+                        float2 _cvt_f32_28 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[14]));
+                        float2 _cvt_f32_29 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[14]));
                         float gate_x_107 = _cvt_f32_28.x;
                         float gate_y_108 = _cvt_f32_28.y;
                         float up_x_109 = _cvt_f32_29.x;
@@ -1604,8 +1610,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_113 = gate_x_107 / denominator_x_111 * up_x_109;
                         float hidden_y_114 = gate_y_108 / denominator_y_112 * up_y_110;
                         hidden_packed[14] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_113, hidden_y_114)));
-                        float2 _cvt_f32_30 = __bfloat1622float2(__as_bf16x2(gate_packed[15]));
-                        float2 _cvt_f32_31 = __bfloat1622float2(__as_bf16x2(up_packed[15]));
+                        float2 _cvt_f32_30 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[15]));
+                        float2 _cvt_f32_31 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[15]));
                         float gate_x_115 = _cvt_f32_30.x;
                         float gate_y_116 = _cvt_f32_30.y;
                         float up_x_117 = _cvt_f32_31.x;
@@ -1621,8 +1627,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_121 = gate_x_115 / denominator_x_119 * up_x_117;
                         float hidden_y_122 = gate_y_116 / denominator_y_120 * up_y_118;
                         hidden_packed[15] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_121, hidden_y_122)));
-                        float2 _cvt_f32_32 = __bfloat1622float2(__as_bf16x2(gate_packed[16]));
-                        float2 _cvt_f32_33 = __bfloat1622float2(__as_bf16x2(up_packed[16]));
+                        float2 _cvt_f32_32 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[16]));
+                        float2 _cvt_f32_33 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[16]));
                         float gate_x_123 = _cvt_f32_32.x;
                         float gate_y_124 = _cvt_f32_32.y;
                         float up_x_125 = _cvt_f32_33.x;
@@ -1638,8 +1644,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_129 = gate_x_123 / denominator_x_127 * up_x_125;
                         float hidden_y_130 = gate_y_124 / denominator_y_128 * up_y_126;
                         hidden_packed[16] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_129, hidden_y_130)));
-                        float2 _cvt_f32_34 = __bfloat1622float2(__as_bf16x2(gate_packed[17]));
-                        float2 _cvt_f32_35 = __bfloat1622float2(__as_bf16x2(up_packed[17]));
+                        float2 _cvt_f32_34 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[17]));
+                        float2 _cvt_f32_35 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[17]));
                         float gate_x_131 = _cvt_f32_34.x;
                         float gate_y_132 = _cvt_f32_34.y;
                         float up_x_133 = _cvt_f32_35.x;
@@ -1655,8 +1661,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_137 = gate_x_131 / denominator_x_135 * up_x_133;
                         float hidden_y_138 = gate_y_132 / denominator_y_136 * up_y_134;
                         hidden_packed[17] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_137, hidden_y_138)));
-                        float2 _cvt_f32_36 = __bfloat1622float2(__as_bf16x2(gate_packed[18]));
-                        float2 _cvt_f32_37 = __bfloat1622float2(__as_bf16x2(up_packed[18]));
+                        float2 _cvt_f32_36 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[18]));
+                        float2 _cvt_f32_37 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[18]));
                         float gate_x_139 = _cvt_f32_36.x;
                         float gate_y_140 = _cvt_f32_36.y;
                         float up_x_141 = _cvt_f32_37.x;
@@ -1672,8 +1678,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_145 = gate_x_139 / denominator_x_143 * up_x_141;
                         float hidden_y_146 = gate_y_140 / denominator_y_144 * up_y_142;
                         hidden_packed[18] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_145, hidden_y_146)));
-                        float2 _cvt_f32_38 = __bfloat1622float2(__as_bf16x2(gate_packed[19]));
-                        float2 _cvt_f32_39 = __bfloat1622float2(__as_bf16x2(up_packed[19]));
+                        float2 _cvt_f32_38 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[19]));
+                        float2 _cvt_f32_39 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[19]));
                         float gate_x_147 = _cvt_f32_38.x;
                         float gate_y_148 = _cvt_f32_38.y;
                         float up_x_149 = _cvt_f32_39.x;
@@ -1689,8 +1695,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_153 = gate_x_147 / denominator_x_151 * up_x_149;
                         float hidden_y_154 = gate_y_148 / denominator_y_152 * up_y_150;
                         hidden_packed[19] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_153, hidden_y_154)));
-                        float2 _cvt_f32_40 = __bfloat1622float2(__as_bf16x2(gate_packed[20]));
-                        float2 _cvt_f32_41 = __bfloat1622float2(__as_bf16x2(up_packed[20]));
+                        float2 _cvt_f32_40 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[20]));
+                        float2 _cvt_f32_41 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[20]));
                         float gate_x_155 = _cvt_f32_40.x;
                         float gate_y_156 = _cvt_f32_40.y;
                         float up_x_157 = _cvt_f32_41.x;
@@ -1706,8 +1712,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_161 = gate_x_155 / denominator_x_159 * up_x_157;
                         float hidden_y_162 = gate_y_156 / denominator_y_160 * up_y_158;
                         hidden_packed[20] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_161, hidden_y_162)));
-                        float2 _cvt_f32_42 = __bfloat1622float2(__as_bf16x2(gate_packed[21]));
-                        float2 _cvt_f32_43 = __bfloat1622float2(__as_bf16x2(up_packed[21]));
+                        float2 _cvt_f32_42 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[21]));
+                        float2 _cvt_f32_43 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[21]));
                         float gate_x_163 = _cvt_f32_42.x;
                         float gate_y_164 = _cvt_f32_42.y;
                         float up_x_165 = _cvt_f32_43.x;
@@ -1723,8 +1729,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_169 = gate_x_163 / denominator_x_167 * up_x_165;
                         float hidden_y_170 = gate_y_164 / denominator_y_168 * up_y_166;
                         hidden_packed[21] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_169, hidden_y_170)));
-                        float2 _cvt_f32_44 = __bfloat1622float2(__as_bf16x2(gate_packed[22]));
-                        float2 _cvt_f32_45 = __bfloat1622float2(__as_bf16x2(up_packed[22]));
+                        float2 _cvt_f32_44 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[22]));
+                        float2 _cvt_f32_45 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[22]));
                         float gate_x_171 = _cvt_f32_44.x;
                         float gate_y_172 = _cvt_f32_44.y;
                         float up_x_173 = _cvt_f32_45.x;
@@ -1740,8 +1746,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_177 = gate_x_171 / denominator_x_175 * up_x_173;
                         float hidden_y_178 = gate_y_172 / denominator_y_176 * up_y_174;
                         hidden_packed[22] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_177, hidden_y_178)));
-                        float2 _cvt_f32_46 = __bfloat1622float2(__as_bf16x2(gate_packed[23]));
-                        float2 _cvt_f32_47 = __bfloat1622float2(__as_bf16x2(up_packed[23]));
+                        float2 _cvt_f32_46 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[23]));
+                        float2 _cvt_f32_47 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[23]));
                         float gate_x_179 = _cvt_f32_46.x;
                         float gate_y_180 = _cvt_f32_46.y;
                         float up_x_181 = _cvt_f32_47.x;
@@ -1757,8 +1763,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_185 = gate_x_179 / denominator_x_183 * up_x_181;
                         float hidden_y_186 = gate_y_180 / denominator_y_184 * up_y_182;
                         hidden_packed[23] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_185, hidden_y_186)));
-                        float2 _cvt_f32_48 = __bfloat1622float2(__as_bf16x2(gate_packed[24]));
-                        float2 _cvt_f32_49 = __bfloat1622float2(__as_bf16x2(up_packed[24]));
+                        float2 _cvt_f32_48 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[24]));
+                        float2 _cvt_f32_49 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[24]));
                         float gate_x_187 = _cvt_f32_48.x;
                         float gate_y_188 = _cvt_f32_48.y;
                         float up_x_189 = _cvt_f32_49.x;
@@ -1774,8 +1780,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_193 = gate_x_187 / denominator_x_191 * up_x_189;
                         float hidden_y_194 = gate_y_188 / denominator_y_192 * up_y_190;
                         hidden_packed[24] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_193, hidden_y_194)));
-                        float2 _cvt_f32_50 = __bfloat1622float2(__as_bf16x2(gate_packed[25]));
-                        float2 _cvt_f32_51 = __bfloat1622float2(__as_bf16x2(up_packed[25]));
+                        float2 _cvt_f32_50 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[25]));
+                        float2 _cvt_f32_51 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[25]));
                         float gate_x_195 = _cvt_f32_50.x;
                         float gate_y_196 = _cvt_f32_50.y;
                         float up_x_197 = _cvt_f32_51.x;
@@ -1791,8 +1797,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_201 = gate_x_195 / denominator_x_199 * up_x_197;
                         float hidden_y_202 = gate_y_196 / denominator_y_200 * up_y_198;
                         hidden_packed[25] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_201, hidden_y_202)));
-                        float2 _cvt_f32_52 = __bfloat1622float2(__as_bf16x2(gate_packed[26]));
-                        float2 _cvt_f32_53 = __bfloat1622float2(__as_bf16x2(up_packed[26]));
+                        float2 _cvt_f32_52 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[26]));
+                        float2 _cvt_f32_53 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[26]));
                         float gate_x_203 = _cvt_f32_52.x;
                         float gate_y_204 = _cvt_f32_52.y;
                         float up_x_205 = _cvt_f32_53.x;
@@ -1808,8 +1814,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_209 = gate_x_203 / denominator_x_207 * up_x_205;
                         float hidden_y_210 = gate_y_204 / denominator_y_208 * up_y_206;
                         hidden_packed[26] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_209, hidden_y_210)));
-                        float2 _cvt_f32_54 = __bfloat1622float2(__as_bf16x2(gate_packed[27]));
-                        float2 _cvt_f32_55 = __bfloat1622float2(__as_bf16x2(up_packed[27]));
+                        float2 _cvt_f32_54 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[27]));
+                        float2 _cvt_f32_55 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[27]));
                         float gate_x_211 = _cvt_f32_54.x;
                         float gate_y_212 = _cvt_f32_54.y;
                         float up_x_213 = _cvt_f32_55.x;
@@ -1825,8 +1831,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_217 = gate_x_211 / denominator_x_215 * up_x_213;
                         float hidden_y_218 = gate_y_212 / denominator_y_216 * up_y_214;
                         hidden_packed[27] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_217, hidden_y_218)));
-                        float2 _cvt_f32_56 = __bfloat1622float2(__as_bf16x2(gate_packed[28]));
-                        float2 _cvt_f32_57 = __bfloat1622float2(__as_bf16x2(up_packed[28]));
+                        float2 _cvt_f32_56 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[28]));
+                        float2 _cvt_f32_57 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[28]));
                         float gate_x_219 = _cvt_f32_56.x;
                         float gate_y_220 = _cvt_f32_56.y;
                         float up_x_221 = _cvt_f32_57.x;
@@ -1842,8 +1848,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_225 = gate_x_219 / denominator_x_223 * up_x_221;
                         float hidden_y_226 = gate_y_220 / denominator_y_224 * up_y_222;
                         hidden_packed[28] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_225, hidden_y_226)));
-                        float2 _cvt_f32_58 = __bfloat1622float2(__as_bf16x2(gate_packed[29]));
-                        float2 _cvt_f32_59 = __bfloat1622float2(__as_bf16x2(up_packed[29]));
+                        float2 _cvt_f32_58 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[29]));
+                        float2 _cvt_f32_59 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[29]));
                         float gate_x_227 = _cvt_f32_58.x;
                         float gate_y_228 = _cvt_f32_58.y;
                         float up_x_229 = _cvt_f32_59.x;
@@ -1859,8 +1865,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_233 = gate_x_227 / denominator_x_231 * up_x_229;
                         float hidden_y_234 = gate_y_228 / denominator_y_232 * up_y_230;
                         hidden_packed[29] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_233, hidden_y_234)));
-                        float2 _cvt_f32_60 = __bfloat1622float2(__as_bf16x2(gate_packed[30]));
-                        float2 _cvt_f32_61 = __bfloat1622float2(__as_bf16x2(up_packed[30]));
+                        float2 _cvt_f32_60 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[30]));
+                        float2 _cvt_f32_61 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[30]));
                         float gate_x_235 = _cvt_f32_60.x;
                         float gate_y_236 = _cvt_f32_60.y;
                         float up_x_237 = _cvt_f32_61.x;
@@ -1876,8 +1882,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_241 = gate_x_235 / denominator_x_239 * up_x_237;
                         float hidden_y_242 = gate_y_236 / denominator_y_240 * up_y_238;
                         hidden_packed[30] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_241, hidden_y_242)));
-                        float2 _cvt_f32_62 = __bfloat1622float2(__as_bf16x2(gate_packed[31]));
-                        float2 _cvt_f32_63 = __bfloat1622float2(__as_bf16x2(up_packed[31]));
+                        float2 _cvt_f32_62 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed[31]));
+                        float2 _cvt_f32_63 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed[31]));
                         float gate_x_243 = _cvt_f32_62.x;
                         float gate_y_244 = _cvt_f32_62.y;
                         float up_x_245 = _cvt_f32_63.x;
@@ -2193,8 +2199,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         gate_packed_262[31] = __as_u32(__float22bfloat162_rn(make_float2(_tmem_load_14[14], _tmem_load_14[15])));
                         up_packed_263[31] = __as_u32(__float22bfloat162_rn(make_float2(_tmem_load_15[14], _tmem_load_15[15])));
                         asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
-                        float2 _cvt_f32_64 = __bfloat1622float2(__as_bf16x2(gate_packed_262[0]));
-                        float2 _cvt_f32_65 = __bfloat1622float2(__as_bf16x2(up_packed_263[0]));
+                        float2 _cvt_f32_64 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[0]));
+                        float2 _cvt_f32_65 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[0]));
                         float gate_x_269 = _cvt_f32_64.x;
                         float gate_y_270 = _cvt_f32_64.y;
                         float up_x_271 = _cvt_f32_65.x;
@@ -2210,8 +2216,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_275 = gate_x_269 / denominator_x_273 * up_x_271;
                         float hidden_y_276 = gate_y_270 / denominator_y_274 * up_y_272;
                         hidden_packed_264[0] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_275, hidden_y_276)));
-                        float2 _cvt_f32_66 = __bfloat1622float2(__as_bf16x2(gate_packed_262[1]));
-                        float2 _cvt_f32_67 = __bfloat1622float2(__as_bf16x2(up_packed_263[1]));
+                        float2 _cvt_f32_66 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[1]));
+                        float2 _cvt_f32_67 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[1]));
                         float gate_x_277 = _cvt_f32_66.x;
                         float gate_y_278 = _cvt_f32_66.y;
                         float up_x_279 = _cvt_f32_67.x;
@@ -2227,8 +2233,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_283 = gate_x_277 / denominator_x_281 * up_x_279;
                         float hidden_y_284 = gate_y_278 / denominator_y_282 * up_y_280;
                         hidden_packed_264[1] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_283, hidden_y_284)));
-                        float2 _cvt_f32_68 = __bfloat1622float2(__as_bf16x2(gate_packed_262[2]));
-                        float2 _cvt_f32_69 = __bfloat1622float2(__as_bf16x2(up_packed_263[2]));
+                        float2 _cvt_f32_68 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[2]));
+                        float2 _cvt_f32_69 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[2]));
                         float gate_x_285 = _cvt_f32_68.x;
                         float gate_y_286 = _cvt_f32_68.y;
                         float up_x_287 = _cvt_f32_69.x;
@@ -2244,8 +2250,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_291 = gate_x_285 / denominator_x_289 * up_x_287;
                         float hidden_y_292 = gate_y_286 / denominator_y_290 * up_y_288;
                         hidden_packed_264[2] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_291, hidden_y_292)));
-                        float2 _cvt_f32_70 = __bfloat1622float2(__as_bf16x2(gate_packed_262[3]));
-                        float2 _cvt_f32_71 = __bfloat1622float2(__as_bf16x2(up_packed_263[3]));
+                        float2 _cvt_f32_70 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[3]));
+                        float2 _cvt_f32_71 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[3]));
                         float gate_x_293 = _cvt_f32_70.x;
                         float gate_y_294 = _cvt_f32_70.y;
                         float up_x_295 = _cvt_f32_71.x;
@@ -2261,8 +2267,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_299 = gate_x_293 / denominator_x_297 * up_x_295;
                         float hidden_y_300 = gate_y_294 / denominator_y_298 * up_y_296;
                         hidden_packed_264[3] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_299, hidden_y_300)));
-                        float2 _cvt_f32_72 = __bfloat1622float2(__as_bf16x2(gate_packed_262[4]));
-                        float2 _cvt_f32_73 = __bfloat1622float2(__as_bf16x2(up_packed_263[4]));
+                        float2 _cvt_f32_72 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[4]));
+                        float2 _cvt_f32_73 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[4]));
                         float gate_x_301 = _cvt_f32_72.x;
                         float gate_y_302 = _cvt_f32_72.y;
                         float up_x_303 = _cvt_f32_73.x;
@@ -2278,8 +2284,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_307 = gate_x_301 / denominator_x_305 * up_x_303;
                         float hidden_y_308 = gate_y_302 / denominator_y_306 * up_y_304;
                         hidden_packed_264[4] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_307, hidden_y_308)));
-                        float2 _cvt_f32_74 = __bfloat1622float2(__as_bf16x2(gate_packed_262[5]));
-                        float2 _cvt_f32_75 = __bfloat1622float2(__as_bf16x2(up_packed_263[5]));
+                        float2 _cvt_f32_74 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[5]));
+                        float2 _cvt_f32_75 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[5]));
                         float gate_x_309 = _cvt_f32_74.x;
                         float gate_y_310 = _cvt_f32_74.y;
                         float up_x_311 = _cvt_f32_75.x;
@@ -2295,8 +2301,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_315 = gate_x_309 / denominator_x_313 * up_x_311;
                         float hidden_y_316 = gate_y_310 / denominator_y_314 * up_y_312;
                         hidden_packed_264[5] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_315, hidden_y_316)));
-                        float2 _cvt_f32_76 = __bfloat1622float2(__as_bf16x2(gate_packed_262[6]));
-                        float2 _cvt_f32_77 = __bfloat1622float2(__as_bf16x2(up_packed_263[6]));
+                        float2 _cvt_f32_76 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[6]));
+                        float2 _cvt_f32_77 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[6]));
                         float gate_x_317 = _cvt_f32_76.x;
                         float gate_y_318 = _cvt_f32_76.y;
                         float up_x_319 = _cvt_f32_77.x;
@@ -2312,8 +2318,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_323 = gate_x_317 / denominator_x_321 * up_x_319;
                         float hidden_y_324 = gate_y_318 / denominator_y_322 * up_y_320;
                         hidden_packed_264[6] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_323, hidden_y_324)));
-                        float2 _cvt_f32_78 = __bfloat1622float2(__as_bf16x2(gate_packed_262[7]));
-                        float2 _cvt_f32_79 = __bfloat1622float2(__as_bf16x2(up_packed_263[7]));
+                        float2 _cvt_f32_78 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[7]));
+                        float2 _cvt_f32_79 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[7]));
                         float gate_x_325 = _cvt_f32_78.x;
                         float gate_y_326 = _cvt_f32_78.y;
                         float up_x_327 = _cvt_f32_79.x;
@@ -2329,8 +2335,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_331 = gate_x_325 / denominator_x_329 * up_x_327;
                         float hidden_y_332 = gate_y_326 / denominator_y_330 * up_y_328;
                         hidden_packed_264[7] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_331, hidden_y_332)));
-                        float2 _cvt_f32_80 = __bfloat1622float2(__as_bf16x2(gate_packed_262[8]));
-                        float2 _cvt_f32_81 = __bfloat1622float2(__as_bf16x2(up_packed_263[8]));
+                        float2 _cvt_f32_80 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[8]));
+                        float2 _cvt_f32_81 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[8]));
                         float gate_x_333 = _cvt_f32_80.x;
                         float gate_y_334 = _cvt_f32_80.y;
                         float up_x_335 = _cvt_f32_81.x;
@@ -2346,8 +2352,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_339 = gate_x_333 / denominator_x_337 * up_x_335;
                         float hidden_y_340 = gate_y_334 / denominator_y_338 * up_y_336;
                         hidden_packed_264[8] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_339, hidden_y_340)));
-                        float2 _cvt_f32_82 = __bfloat1622float2(__as_bf16x2(gate_packed_262[9]));
-                        float2 _cvt_f32_83 = __bfloat1622float2(__as_bf16x2(up_packed_263[9]));
+                        float2 _cvt_f32_82 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[9]));
+                        float2 _cvt_f32_83 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[9]));
                         float gate_x_341 = _cvt_f32_82.x;
                         float gate_y_342 = _cvt_f32_82.y;
                         float up_x_343 = _cvt_f32_83.x;
@@ -2363,8 +2369,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_347 = gate_x_341 / denominator_x_345 * up_x_343;
                         float hidden_y_348 = gate_y_342 / denominator_y_346 * up_y_344;
                         hidden_packed_264[9] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_347, hidden_y_348)));
-                        float2 _cvt_f32_84 = __bfloat1622float2(__as_bf16x2(gate_packed_262[10]));
-                        float2 _cvt_f32_85 = __bfloat1622float2(__as_bf16x2(up_packed_263[10]));
+                        float2 _cvt_f32_84 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[10]));
+                        float2 _cvt_f32_85 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[10]));
                         float gate_x_349 = _cvt_f32_84.x;
                         float gate_y_350 = _cvt_f32_84.y;
                         float up_x_351 = _cvt_f32_85.x;
@@ -2380,8 +2386,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_355 = gate_x_349 / denominator_x_353 * up_x_351;
                         float hidden_y_356 = gate_y_350 / denominator_y_354 * up_y_352;
                         hidden_packed_264[10] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_355, hidden_y_356)));
-                        float2 _cvt_f32_86 = __bfloat1622float2(__as_bf16x2(gate_packed_262[11]));
-                        float2 _cvt_f32_87 = __bfloat1622float2(__as_bf16x2(up_packed_263[11]));
+                        float2 _cvt_f32_86 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[11]));
+                        float2 _cvt_f32_87 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[11]));
                         float gate_x_357 = _cvt_f32_86.x;
                         float gate_y_358 = _cvt_f32_86.y;
                         float up_x_359 = _cvt_f32_87.x;
@@ -2397,8 +2403,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_363 = gate_x_357 / denominator_x_361 * up_x_359;
                         float hidden_y_364 = gate_y_358 / denominator_y_362 * up_y_360;
                         hidden_packed_264[11] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_363, hidden_y_364)));
-                        float2 _cvt_f32_88 = __bfloat1622float2(__as_bf16x2(gate_packed_262[12]));
-                        float2 _cvt_f32_89 = __bfloat1622float2(__as_bf16x2(up_packed_263[12]));
+                        float2 _cvt_f32_88 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[12]));
+                        float2 _cvt_f32_89 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[12]));
                         float gate_x_365 = _cvt_f32_88.x;
                         float gate_y_366 = _cvt_f32_88.y;
                         float up_x_367 = _cvt_f32_89.x;
@@ -2414,8 +2420,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_371 = gate_x_365 / denominator_x_369 * up_x_367;
                         float hidden_y_372 = gate_y_366 / denominator_y_370 * up_y_368;
                         hidden_packed_264[12] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_371, hidden_y_372)));
-                        float2 _cvt_f32_90 = __bfloat1622float2(__as_bf16x2(gate_packed_262[13]));
-                        float2 _cvt_f32_91 = __bfloat1622float2(__as_bf16x2(up_packed_263[13]));
+                        float2 _cvt_f32_90 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[13]));
+                        float2 _cvt_f32_91 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[13]));
                         float gate_x_373 = _cvt_f32_90.x;
                         float gate_y_374 = _cvt_f32_90.y;
                         float up_x_375 = _cvt_f32_91.x;
@@ -2431,8 +2437,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_379 = gate_x_373 / denominator_x_377 * up_x_375;
                         float hidden_y_380 = gate_y_374 / denominator_y_378 * up_y_376;
                         hidden_packed_264[13] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_379, hidden_y_380)));
-                        float2 _cvt_f32_92 = __bfloat1622float2(__as_bf16x2(gate_packed_262[14]));
-                        float2 _cvt_f32_93 = __bfloat1622float2(__as_bf16x2(up_packed_263[14]));
+                        float2 _cvt_f32_92 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[14]));
+                        float2 _cvt_f32_93 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[14]));
                         float gate_x_381 = _cvt_f32_92.x;
                         float gate_y_382 = _cvt_f32_92.y;
                         float up_x_383 = _cvt_f32_93.x;
@@ -2448,8 +2454,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_387 = gate_x_381 / denominator_x_385 * up_x_383;
                         float hidden_y_388 = gate_y_382 / denominator_y_386 * up_y_384;
                         hidden_packed_264[14] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_387, hidden_y_388)));
-                        float2 _cvt_f32_94 = __bfloat1622float2(__as_bf16x2(gate_packed_262[15]));
-                        float2 _cvt_f32_95 = __bfloat1622float2(__as_bf16x2(up_packed_263[15]));
+                        float2 _cvt_f32_94 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[15]));
+                        float2 _cvt_f32_95 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[15]));
                         float gate_x_389 = _cvt_f32_94.x;
                         float gate_y_390 = _cvt_f32_94.y;
                         float up_x_391 = _cvt_f32_95.x;
@@ -2465,8 +2471,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_395 = gate_x_389 / denominator_x_393 * up_x_391;
                         float hidden_y_396 = gate_y_390 / denominator_y_394 * up_y_392;
                         hidden_packed_264[15] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_395, hidden_y_396)));
-                        float2 _cvt_f32_96 = __bfloat1622float2(__as_bf16x2(gate_packed_262[16]));
-                        float2 _cvt_f32_97 = __bfloat1622float2(__as_bf16x2(up_packed_263[16]));
+                        float2 _cvt_f32_96 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[16]));
+                        float2 _cvt_f32_97 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[16]));
                         float gate_x_397 = _cvt_f32_96.x;
                         float gate_y_398 = _cvt_f32_96.y;
                         float up_x_399 = _cvt_f32_97.x;
@@ -2482,8 +2488,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_403 = gate_x_397 / denominator_x_401 * up_x_399;
                         float hidden_y_404 = gate_y_398 / denominator_y_402 * up_y_400;
                         hidden_packed_264[16] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_403, hidden_y_404)));
-                        float2 _cvt_f32_98 = __bfloat1622float2(__as_bf16x2(gate_packed_262[17]));
-                        float2 _cvt_f32_99 = __bfloat1622float2(__as_bf16x2(up_packed_263[17]));
+                        float2 _cvt_f32_98 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[17]));
+                        float2 _cvt_f32_99 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[17]));
                         float gate_x_405 = _cvt_f32_98.x;
                         float gate_y_406 = _cvt_f32_98.y;
                         float up_x_407 = _cvt_f32_99.x;
@@ -2499,8 +2505,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_411 = gate_x_405 / denominator_x_409 * up_x_407;
                         float hidden_y_412 = gate_y_406 / denominator_y_410 * up_y_408;
                         hidden_packed_264[17] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_411, hidden_y_412)));
-                        float2 _cvt_f32_100 = __bfloat1622float2(__as_bf16x2(gate_packed_262[18]));
-                        float2 _cvt_f32_101 = __bfloat1622float2(__as_bf16x2(up_packed_263[18]));
+                        float2 _cvt_f32_100 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[18]));
+                        float2 _cvt_f32_101 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[18]));
                         float gate_x_413 = _cvt_f32_100.x;
                         float gate_y_414 = _cvt_f32_100.y;
                         float up_x_415 = _cvt_f32_101.x;
@@ -2516,8 +2522,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_419 = gate_x_413 / denominator_x_417 * up_x_415;
                         float hidden_y_420 = gate_y_414 / denominator_y_418 * up_y_416;
                         hidden_packed_264[18] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_419, hidden_y_420)));
-                        float2 _cvt_f32_102 = __bfloat1622float2(__as_bf16x2(gate_packed_262[19]));
-                        float2 _cvt_f32_103 = __bfloat1622float2(__as_bf16x2(up_packed_263[19]));
+                        float2 _cvt_f32_102 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[19]));
+                        float2 _cvt_f32_103 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[19]));
                         float gate_x_421 = _cvt_f32_102.x;
                         float gate_y_422 = _cvt_f32_102.y;
                         float up_x_423 = _cvt_f32_103.x;
@@ -2533,8 +2539,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_427 = gate_x_421 / denominator_x_425 * up_x_423;
                         float hidden_y_428 = gate_y_422 / denominator_y_426 * up_y_424;
                         hidden_packed_264[19] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_427, hidden_y_428)));
-                        float2 _cvt_f32_104 = __bfloat1622float2(__as_bf16x2(gate_packed_262[20]));
-                        float2 _cvt_f32_105 = __bfloat1622float2(__as_bf16x2(up_packed_263[20]));
+                        float2 _cvt_f32_104 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[20]));
+                        float2 _cvt_f32_105 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[20]));
                         float gate_x_429 = _cvt_f32_104.x;
                         float gate_y_430 = _cvt_f32_104.y;
                         float up_x_431 = _cvt_f32_105.x;
@@ -2550,8 +2556,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_435 = gate_x_429 / denominator_x_433 * up_x_431;
                         float hidden_y_436 = gate_y_430 / denominator_y_434 * up_y_432;
                         hidden_packed_264[20] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_435, hidden_y_436)));
-                        float2 _cvt_f32_106 = __bfloat1622float2(__as_bf16x2(gate_packed_262[21]));
-                        float2 _cvt_f32_107 = __bfloat1622float2(__as_bf16x2(up_packed_263[21]));
+                        float2 _cvt_f32_106 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[21]));
+                        float2 _cvt_f32_107 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[21]));
                         float gate_x_437 = _cvt_f32_106.x;
                         float gate_y_438 = _cvt_f32_106.y;
                         float up_x_439 = _cvt_f32_107.x;
@@ -2567,8 +2573,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_443 = gate_x_437 / denominator_x_441 * up_x_439;
                         float hidden_y_444 = gate_y_438 / denominator_y_442 * up_y_440;
                         hidden_packed_264[21] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_443, hidden_y_444)));
-                        float2 _cvt_f32_108 = __bfloat1622float2(__as_bf16x2(gate_packed_262[22]));
-                        float2 _cvt_f32_109 = __bfloat1622float2(__as_bf16x2(up_packed_263[22]));
+                        float2 _cvt_f32_108 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[22]));
+                        float2 _cvt_f32_109 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[22]));
                         float gate_x_445 = _cvt_f32_108.x;
                         float gate_y_446 = _cvt_f32_108.y;
                         float up_x_447 = _cvt_f32_109.x;
@@ -2584,8 +2590,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_451 = gate_x_445 / denominator_x_449 * up_x_447;
                         float hidden_y_452 = gate_y_446 / denominator_y_450 * up_y_448;
                         hidden_packed_264[22] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_451, hidden_y_452)));
-                        float2 _cvt_f32_110 = __bfloat1622float2(__as_bf16x2(gate_packed_262[23]));
-                        float2 _cvt_f32_111 = __bfloat1622float2(__as_bf16x2(up_packed_263[23]));
+                        float2 _cvt_f32_110 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[23]));
+                        float2 _cvt_f32_111 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[23]));
                         float gate_x_453 = _cvt_f32_110.x;
                         float gate_y_454 = _cvt_f32_110.y;
                         float up_x_455 = _cvt_f32_111.x;
@@ -2601,8 +2607,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_459 = gate_x_453 / denominator_x_457 * up_x_455;
                         float hidden_y_460 = gate_y_454 / denominator_y_458 * up_y_456;
                         hidden_packed_264[23] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_459, hidden_y_460)));
-                        float2 _cvt_f32_112 = __bfloat1622float2(__as_bf16x2(gate_packed_262[24]));
-                        float2 _cvt_f32_113 = __bfloat1622float2(__as_bf16x2(up_packed_263[24]));
+                        float2 _cvt_f32_112 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[24]));
+                        float2 _cvt_f32_113 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[24]));
                         float gate_x_461 = _cvt_f32_112.x;
                         float gate_y_462 = _cvt_f32_112.y;
                         float up_x_463 = _cvt_f32_113.x;
@@ -2618,8 +2624,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_467 = gate_x_461 / denominator_x_465 * up_x_463;
                         float hidden_y_468 = gate_y_462 / denominator_y_466 * up_y_464;
                         hidden_packed_264[24] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_467, hidden_y_468)));
-                        float2 _cvt_f32_114 = __bfloat1622float2(__as_bf16x2(gate_packed_262[25]));
-                        float2 _cvt_f32_115 = __bfloat1622float2(__as_bf16x2(up_packed_263[25]));
+                        float2 _cvt_f32_114 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[25]));
+                        float2 _cvt_f32_115 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[25]));
                         float gate_x_469 = _cvt_f32_114.x;
                         float gate_y_470 = _cvt_f32_114.y;
                         float up_x_471 = _cvt_f32_115.x;
@@ -2635,8 +2641,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_475 = gate_x_469 / denominator_x_473 * up_x_471;
                         float hidden_y_476 = gate_y_470 / denominator_y_474 * up_y_472;
                         hidden_packed_264[25] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_475, hidden_y_476)));
-                        float2 _cvt_f32_116 = __bfloat1622float2(__as_bf16x2(gate_packed_262[26]));
-                        float2 _cvt_f32_117 = __bfloat1622float2(__as_bf16x2(up_packed_263[26]));
+                        float2 _cvt_f32_116 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[26]));
+                        float2 _cvt_f32_117 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[26]));
                         float gate_x_477 = _cvt_f32_116.x;
                         float gate_y_478 = _cvt_f32_116.y;
                         float up_x_479 = _cvt_f32_117.x;
@@ -2652,8 +2658,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_483 = gate_x_477 / denominator_x_481 * up_x_479;
                         float hidden_y_484 = gate_y_478 / denominator_y_482 * up_y_480;
                         hidden_packed_264[26] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_483, hidden_y_484)));
-                        float2 _cvt_f32_118 = __bfloat1622float2(__as_bf16x2(gate_packed_262[27]));
-                        float2 _cvt_f32_119 = __bfloat1622float2(__as_bf16x2(up_packed_263[27]));
+                        float2 _cvt_f32_118 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[27]));
+                        float2 _cvt_f32_119 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[27]));
                         float gate_x_485 = _cvt_f32_118.x;
                         float gate_y_486 = _cvt_f32_118.y;
                         float up_x_487 = _cvt_f32_119.x;
@@ -2669,8 +2675,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_491 = gate_x_485 / denominator_x_489 * up_x_487;
                         float hidden_y_492 = gate_y_486 / denominator_y_490 * up_y_488;
                         hidden_packed_264[27] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_491, hidden_y_492)));
-                        float2 _cvt_f32_120 = __bfloat1622float2(__as_bf16x2(gate_packed_262[28]));
-                        float2 _cvt_f32_121 = __bfloat1622float2(__as_bf16x2(up_packed_263[28]));
+                        float2 _cvt_f32_120 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[28]));
+                        float2 _cvt_f32_121 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[28]));
                         float gate_x_493 = _cvt_f32_120.x;
                         float gate_y_494 = _cvt_f32_120.y;
                         float up_x_495 = _cvt_f32_121.x;
@@ -2686,8 +2692,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_499 = gate_x_493 / denominator_x_497 * up_x_495;
                         float hidden_y_500 = gate_y_494 / denominator_y_498 * up_y_496;
                         hidden_packed_264[28] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_499, hidden_y_500)));
-                        float2 _cvt_f32_122 = __bfloat1622float2(__as_bf16x2(gate_packed_262[29]));
-                        float2 _cvt_f32_123 = __bfloat1622float2(__as_bf16x2(up_packed_263[29]));
+                        float2 _cvt_f32_122 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[29]));
+                        float2 _cvt_f32_123 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[29]));
                         float gate_x_501 = _cvt_f32_122.x;
                         float gate_y_502 = _cvt_f32_122.y;
                         float up_x_503 = _cvt_f32_123.x;
@@ -2703,8 +2709,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_507 = gate_x_501 / denominator_x_505 * up_x_503;
                         float hidden_y_508 = gate_y_502 / denominator_y_506 * up_y_504;
                         hidden_packed_264[29] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_507, hidden_y_508)));
-                        float2 _cvt_f32_124 = __bfloat1622float2(__as_bf16x2(gate_packed_262[30]));
-                        float2 _cvt_f32_125 = __bfloat1622float2(__as_bf16x2(up_packed_263[30]));
+                        float2 _cvt_f32_124 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[30]));
+                        float2 _cvt_f32_125 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[30]));
                         float gate_x_509 = _cvt_f32_124.x;
                         float gate_y_510 = _cvt_f32_124.y;
                         float up_x_511 = _cvt_f32_125.x;
@@ -2720,8 +2726,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_515 = gate_x_509 / denominator_x_513 * up_x_511;
                         float hidden_y_516 = gate_y_510 / denominator_y_514 * up_y_512;
                         hidden_packed_264[30] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_515, hidden_y_516)));
-                        float2 _cvt_f32_126 = __bfloat1622float2(__as_bf16x2(gate_packed_262[31]));
-                        float2 _cvt_f32_127 = __bfloat1622float2(__as_bf16x2(up_packed_263[31]));
+                        float2 _cvt_f32_126 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262[31]));
+                        float2 _cvt_f32_127 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263[31]));
                         float gate_x_517 = _cvt_f32_126.x;
                         float gate_y_518 = _cvt_f32_126.y;
                         float up_x_519 = _cvt_f32_127.x;
@@ -3037,8 +3043,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         gate_packed_537[31] = __as_u32(__float22bfloat162_rn(make_float2(_tmem_load_22[14], _tmem_load_22[15])));
                         up_packed_538[31] = __as_u32(__float22bfloat162_rn(make_float2(_tmem_load_23[14], _tmem_load_23[15])));
                         asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
-                        float2 _cvt_f32_128 = __bfloat1622float2(__as_bf16x2(gate_packed_537[0]));
-                        float2 _cvt_f32_129 = __bfloat1622float2(__as_bf16x2(up_packed_538[0]));
+                        float2 _cvt_f32_128 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[0]));
+                        float2 _cvt_f32_129 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[0]));
                         float gate_x_544 = _cvt_f32_128.x;
                         float gate_y_545 = _cvt_f32_128.y;
                         float up_x_546 = _cvt_f32_129.x;
@@ -3054,8 +3060,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_550 = gate_x_544 / denominator_x_548 * up_x_546;
                         float hidden_y_551 = gate_y_545 / denominator_y_549 * up_y_547;
                         hidden_packed_539[0] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_550, hidden_y_551)));
-                        float2 _cvt_f32_130 = __bfloat1622float2(__as_bf16x2(gate_packed_537[1]));
-                        float2 _cvt_f32_131 = __bfloat1622float2(__as_bf16x2(up_packed_538[1]));
+                        float2 _cvt_f32_130 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[1]));
+                        float2 _cvt_f32_131 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[1]));
                         float gate_x_552 = _cvt_f32_130.x;
                         float gate_y_553 = _cvt_f32_130.y;
                         float up_x_554 = _cvt_f32_131.x;
@@ -3071,8 +3077,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_558 = gate_x_552 / denominator_x_556 * up_x_554;
                         float hidden_y_559 = gate_y_553 / denominator_y_557 * up_y_555;
                         hidden_packed_539[1] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_558, hidden_y_559)));
-                        float2 _cvt_f32_132 = __bfloat1622float2(__as_bf16x2(gate_packed_537[2]));
-                        float2 _cvt_f32_133 = __bfloat1622float2(__as_bf16x2(up_packed_538[2]));
+                        float2 _cvt_f32_132 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[2]));
+                        float2 _cvt_f32_133 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[2]));
                         float gate_x_560 = _cvt_f32_132.x;
                         float gate_y_561 = _cvt_f32_132.y;
                         float up_x_562 = _cvt_f32_133.x;
@@ -3088,8 +3094,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_566 = gate_x_560 / denominator_x_564 * up_x_562;
                         float hidden_y_567 = gate_y_561 / denominator_y_565 * up_y_563;
                         hidden_packed_539[2] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_566, hidden_y_567)));
-                        float2 _cvt_f32_134 = __bfloat1622float2(__as_bf16x2(gate_packed_537[3]));
-                        float2 _cvt_f32_135 = __bfloat1622float2(__as_bf16x2(up_packed_538[3]));
+                        float2 _cvt_f32_134 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[3]));
+                        float2 _cvt_f32_135 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[3]));
                         float gate_x_568 = _cvt_f32_134.x;
                         float gate_y_569 = _cvt_f32_134.y;
                         float up_x_570 = _cvt_f32_135.x;
@@ -3105,8 +3111,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_574 = gate_x_568 / denominator_x_572 * up_x_570;
                         float hidden_y_575 = gate_y_569 / denominator_y_573 * up_y_571;
                         hidden_packed_539[3] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_574, hidden_y_575)));
-                        float2 _cvt_f32_136 = __bfloat1622float2(__as_bf16x2(gate_packed_537[4]));
-                        float2 _cvt_f32_137 = __bfloat1622float2(__as_bf16x2(up_packed_538[4]));
+                        float2 _cvt_f32_136 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[4]));
+                        float2 _cvt_f32_137 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[4]));
                         float gate_x_576 = _cvt_f32_136.x;
                         float gate_y_577 = _cvt_f32_136.y;
                         float up_x_578 = _cvt_f32_137.x;
@@ -3122,8 +3128,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_582 = gate_x_576 / denominator_x_580 * up_x_578;
                         float hidden_y_583 = gate_y_577 / denominator_y_581 * up_y_579;
                         hidden_packed_539[4] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_582, hidden_y_583)));
-                        float2 _cvt_f32_138 = __bfloat1622float2(__as_bf16x2(gate_packed_537[5]));
-                        float2 _cvt_f32_139 = __bfloat1622float2(__as_bf16x2(up_packed_538[5]));
+                        float2 _cvt_f32_138 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[5]));
+                        float2 _cvt_f32_139 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[5]));
                         float gate_x_584 = _cvt_f32_138.x;
                         float gate_y_585 = _cvt_f32_138.y;
                         float up_x_586 = _cvt_f32_139.x;
@@ -3139,8 +3145,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_590 = gate_x_584 / denominator_x_588 * up_x_586;
                         float hidden_y_591 = gate_y_585 / denominator_y_589 * up_y_587;
                         hidden_packed_539[5] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_590, hidden_y_591)));
-                        float2 _cvt_f32_140 = __bfloat1622float2(__as_bf16x2(gate_packed_537[6]));
-                        float2 _cvt_f32_141 = __bfloat1622float2(__as_bf16x2(up_packed_538[6]));
+                        float2 _cvt_f32_140 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[6]));
+                        float2 _cvt_f32_141 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[6]));
                         float gate_x_592 = _cvt_f32_140.x;
                         float gate_y_593 = _cvt_f32_140.y;
                         float up_x_594 = _cvt_f32_141.x;
@@ -3156,8 +3162,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_598 = gate_x_592 / denominator_x_596 * up_x_594;
                         float hidden_y_599 = gate_y_593 / denominator_y_597 * up_y_595;
                         hidden_packed_539[6] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_598, hidden_y_599)));
-                        float2 _cvt_f32_142 = __bfloat1622float2(__as_bf16x2(gate_packed_537[7]));
-                        float2 _cvt_f32_143 = __bfloat1622float2(__as_bf16x2(up_packed_538[7]));
+                        float2 _cvt_f32_142 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[7]));
+                        float2 _cvt_f32_143 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[7]));
                         float gate_x_600 = _cvt_f32_142.x;
                         float gate_y_601 = _cvt_f32_142.y;
                         float up_x_602 = _cvt_f32_143.x;
@@ -3173,8 +3179,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_606 = gate_x_600 / denominator_x_604 * up_x_602;
                         float hidden_y_607 = gate_y_601 / denominator_y_605 * up_y_603;
                         hidden_packed_539[7] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_606, hidden_y_607)));
-                        float2 _cvt_f32_144 = __bfloat1622float2(__as_bf16x2(gate_packed_537[8]));
-                        float2 _cvt_f32_145 = __bfloat1622float2(__as_bf16x2(up_packed_538[8]));
+                        float2 _cvt_f32_144 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[8]));
+                        float2 _cvt_f32_145 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[8]));
                         float gate_x_608 = _cvt_f32_144.x;
                         float gate_y_609 = _cvt_f32_144.y;
                         float up_x_610 = _cvt_f32_145.x;
@@ -3190,8 +3196,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_614 = gate_x_608 / denominator_x_612 * up_x_610;
                         float hidden_y_615 = gate_y_609 / denominator_y_613 * up_y_611;
                         hidden_packed_539[8] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_614, hidden_y_615)));
-                        float2 _cvt_f32_146 = __bfloat1622float2(__as_bf16x2(gate_packed_537[9]));
-                        float2 _cvt_f32_147 = __bfloat1622float2(__as_bf16x2(up_packed_538[9]));
+                        float2 _cvt_f32_146 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[9]));
+                        float2 _cvt_f32_147 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[9]));
                         float gate_x_616 = _cvt_f32_146.x;
                         float gate_y_617 = _cvt_f32_146.y;
                         float up_x_618 = _cvt_f32_147.x;
@@ -3207,8 +3213,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_622 = gate_x_616 / denominator_x_620 * up_x_618;
                         float hidden_y_623 = gate_y_617 / denominator_y_621 * up_y_619;
                         hidden_packed_539[9] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_622, hidden_y_623)));
-                        float2 _cvt_f32_148 = __bfloat1622float2(__as_bf16x2(gate_packed_537[10]));
-                        float2 _cvt_f32_149 = __bfloat1622float2(__as_bf16x2(up_packed_538[10]));
+                        float2 _cvt_f32_148 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[10]));
+                        float2 _cvt_f32_149 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[10]));
                         float gate_x_624 = _cvt_f32_148.x;
                         float gate_y_625 = _cvt_f32_148.y;
                         float up_x_626 = _cvt_f32_149.x;
@@ -3224,8 +3230,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_630 = gate_x_624 / denominator_x_628 * up_x_626;
                         float hidden_y_631 = gate_y_625 / denominator_y_629 * up_y_627;
                         hidden_packed_539[10] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_630, hidden_y_631)));
-                        float2 _cvt_f32_150 = __bfloat1622float2(__as_bf16x2(gate_packed_537[11]));
-                        float2 _cvt_f32_151 = __bfloat1622float2(__as_bf16x2(up_packed_538[11]));
+                        float2 _cvt_f32_150 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[11]));
+                        float2 _cvt_f32_151 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[11]));
                         float gate_x_632 = _cvt_f32_150.x;
                         float gate_y_633 = _cvt_f32_150.y;
                         float up_x_634 = _cvt_f32_151.x;
@@ -3241,8 +3247,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_638 = gate_x_632 / denominator_x_636 * up_x_634;
                         float hidden_y_639 = gate_y_633 / denominator_y_637 * up_y_635;
                         hidden_packed_539[11] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_638, hidden_y_639)));
-                        float2 _cvt_f32_152 = __bfloat1622float2(__as_bf16x2(gate_packed_537[12]));
-                        float2 _cvt_f32_153 = __bfloat1622float2(__as_bf16x2(up_packed_538[12]));
+                        float2 _cvt_f32_152 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[12]));
+                        float2 _cvt_f32_153 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[12]));
                         float gate_x_640 = _cvt_f32_152.x;
                         float gate_y_641 = _cvt_f32_152.y;
                         float up_x_642 = _cvt_f32_153.x;
@@ -3258,8 +3264,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_646 = gate_x_640 / denominator_x_644 * up_x_642;
                         float hidden_y_647 = gate_y_641 / denominator_y_645 * up_y_643;
                         hidden_packed_539[12] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_646, hidden_y_647)));
-                        float2 _cvt_f32_154 = __bfloat1622float2(__as_bf16x2(gate_packed_537[13]));
-                        float2 _cvt_f32_155 = __bfloat1622float2(__as_bf16x2(up_packed_538[13]));
+                        float2 _cvt_f32_154 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[13]));
+                        float2 _cvt_f32_155 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[13]));
                         float gate_x_648 = _cvt_f32_154.x;
                         float gate_y_649 = _cvt_f32_154.y;
                         float up_x_650 = _cvt_f32_155.x;
@@ -3275,8 +3281,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_654 = gate_x_648 / denominator_x_652 * up_x_650;
                         float hidden_y_655 = gate_y_649 / denominator_y_653 * up_y_651;
                         hidden_packed_539[13] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_654, hidden_y_655)));
-                        float2 _cvt_f32_156 = __bfloat1622float2(__as_bf16x2(gate_packed_537[14]));
-                        float2 _cvt_f32_157 = __bfloat1622float2(__as_bf16x2(up_packed_538[14]));
+                        float2 _cvt_f32_156 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[14]));
+                        float2 _cvt_f32_157 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[14]));
                         float gate_x_656 = _cvt_f32_156.x;
                         float gate_y_657 = _cvt_f32_156.y;
                         float up_x_658 = _cvt_f32_157.x;
@@ -3292,8 +3298,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_662 = gate_x_656 / denominator_x_660 * up_x_658;
                         float hidden_y_663 = gate_y_657 / denominator_y_661 * up_y_659;
                         hidden_packed_539[14] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_662, hidden_y_663)));
-                        float2 _cvt_f32_158 = __bfloat1622float2(__as_bf16x2(gate_packed_537[15]));
-                        float2 _cvt_f32_159 = __bfloat1622float2(__as_bf16x2(up_packed_538[15]));
+                        float2 _cvt_f32_158 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[15]));
+                        float2 _cvt_f32_159 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[15]));
                         float gate_x_664 = _cvt_f32_158.x;
                         float gate_y_665 = _cvt_f32_158.y;
                         float up_x_666 = _cvt_f32_159.x;
@@ -3309,8 +3315,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_670 = gate_x_664 / denominator_x_668 * up_x_666;
                         float hidden_y_671 = gate_y_665 / denominator_y_669 * up_y_667;
                         hidden_packed_539[15] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_670, hidden_y_671)));
-                        float2 _cvt_f32_160 = __bfloat1622float2(__as_bf16x2(gate_packed_537[16]));
-                        float2 _cvt_f32_161 = __bfloat1622float2(__as_bf16x2(up_packed_538[16]));
+                        float2 _cvt_f32_160 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[16]));
+                        float2 _cvt_f32_161 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[16]));
                         float gate_x_672 = _cvt_f32_160.x;
                         float gate_y_673 = _cvt_f32_160.y;
                         float up_x_674 = _cvt_f32_161.x;
@@ -3326,8 +3332,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_678 = gate_x_672 / denominator_x_676 * up_x_674;
                         float hidden_y_679 = gate_y_673 / denominator_y_677 * up_y_675;
                         hidden_packed_539[16] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_678, hidden_y_679)));
-                        float2 _cvt_f32_162 = __bfloat1622float2(__as_bf16x2(gate_packed_537[17]));
-                        float2 _cvt_f32_163 = __bfloat1622float2(__as_bf16x2(up_packed_538[17]));
+                        float2 _cvt_f32_162 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[17]));
+                        float2 _cvt_f32_163 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[17]));
                         float gate_x_680 = _cvt_f32_162.x;
                         float gate_y_681 = _cvt_f32_162.y;
                         float up_x_682 = _cvt_f32_163.x;
@@ -3343,8 +3349,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_686 = gate_x_680 / denominator_x_684 * up_x_682;
                         float hidden_y_687 = gate_y_681 / denominator_y_685 * up_y_683;
                         hidden_packed_539[17] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_686, hidden_y_687)));
-                        float2 _cvt_f32_164 = __bfloat1622float2(__as_bf16x2(gate_packed_537[18]));
-                        float2 _cvt_f32_165 = __bfloat1622float2(__as_bf16x2(up_packed_538[18]));
+                        float2 _cvt_f32_164 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[18]));
+                        float2 _cvt_f32_165 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[18]));
                         float gate_x_688 = _cvt_f32_164.x;
                         float gate_y_689 = _cvt_f32_164.y;
                         float up_x_690 = _cvt_f32_165.x;
@@ -3360,8 +3366,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_694 = gate_x_688 / denominator_x_692 * up_x_690;
                         float hidden_y_695 = gate_y_689 / denominator_y_693 * up_y_691;
                         hidden_packed_539[18] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_694, hidden_y_695)));
-                        float2 _cvt_f32_166 = __bfloat1622float2(__as_bf16x2(gate_packed_537[19]));
-                        float2 _cvt_f32_167 = __bfloat1622float2(__as_bf16x2(up_packed_538[19]));
+                        float2 _cvt_f32_166 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[19]));
+                        float2 _cvt_f32_167 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[19]));
                         float gate_x_696 = _cvt_f32_166.x;
                         float gate_y_697 = _cvt_f32_166.y;
                         float up_x_698 = _cvt_f32_167.x;
@@ -3377,8 +3383,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_702 = gate_x_696 / denominator_x_700 * up_x_698;
                         float hidden_y_703 = gate_y_697 / denominator_y_701 * up_y_699;
                         hidden_packed_539[19] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_702, hidden_y_703)));
-                        float2 _cvt_f32_168 = __bfloat1622float2(__as_bf16x2(gate_packed_537[20]));
-                        float2 _cvt_f32_169 = __bfloat1622float2(__as_bf16x2(up_packed_538[20]));
+                        float2 _cvt_f32_168 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[20]));
+                        float2 _cvt_f32_169 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[20]));
                         float gate_x_704 = _cvt_f32_168.x;
                         float gate_y_705 = _cvt_f32_168.y;
                         float up_x_706 = _cvt_f32_169.x;
@@ -3394,8 +3400,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_710 = gate_x_704 / denominator_x_708 * up_x_706;
                         float hidden_y_711 = gate_y_705 / denominator_y_709 * up_y_707;
                         hidden_packed_539[20] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_710, hidden_y_711)));
-                        float2 _cvt_f32_170 = __bfloat1622float2(__as_bf16x2(gate_packed_537[21]));
-                        float2 _cvt_f32_171 = __bfloat1622float2(__as_bf16x2(up_packed_538[21]));
+                        float2 _cvt_f32_170 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[21]));
+                        float2 _cvt_f32_171 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[21]));
                         float gate_x_712 = _cvt_f32_170.x;
                         float gate_y_713 = _cvt_f32_170.y;
                         float up_x_714 = _cvt_f32_171.x;
@@ -3411,8 +3417,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_718 = gate_x_712 / denominator_x_716 * up_x_714;
                         float hidden_y_719 = gate_y_713 / denominator_y_717 * up_y_715;
                         hidden_packed_539[21] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_718, hidden_y_719)));
-                        float2 _cvt_f32_172 = __bfloat1622float2(__as_bf16x2(gate_packed_537[22]));
-                        float2 _cvt_f32_173 = __bfloat1622float2(__as_bf16x2(up_packed_538[22]));
+                        float2 _cvt_f32_172 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[22]));
+                        float2 _cvt_f32_173 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[22]));
                         float gate_x_720 = _cvt_f32_172.x;
                         float gate_y_721 = _cvt_f32_172.y;
                         float up_x_722 = _cvt_f32_173.x;
@@ -3428,8 +3434,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_726 = gate_x_720 / denominator_x_724 * up_x_722;
                         float hidden_y_727 = gate_y_721 / denominator_y_725 * up_y_723;
                         hidden_packed_539[22] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_726, hidden_y_727)));
-                        float2 _cvt_f32_174 = __bfloat1622float2(__as_bf16x2(gate_packed_537[23]));
-                        float2 _cvt_f32_175 = __bfloat1622float2(__as_bf16x2(up_packed_538[23]));
+                        float2 _cvt_f32_174 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[23]));
+                        float2 _cvt_f32_175 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[23]));
                         float gate_x_728 = _cvt_f32_174.x;
                         float gate_y_729 = _cvt_f32_174.y;
                         float up_x_730 = _cvt_f32_175.x;
@@ -3445,8 +3451,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_734 = gate_x_728 / denominator_x_732 * up_x_730;
                         float hidden_y_735 = gate_y_729 / denominator_y_733 * up_y_731;
                         hidden_packed_539[23] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_734, hidden_y_735)));
-                        float2 _cvt_f32_176 = __bfloat1622float2(__as_bf16x2(gate_packed_537[24]));
-                        float2 _cvt_f32_177 = __bfloat1622float2(__as_bf16x2(up_packed_538[24]));
+                        float2 _cvt_f32_176 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[24]));
+                        float2 _cvt_f32_177 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[24]));
                         float gate_x_736 = _cvt_f32_176.x;
                         float gate_y_737 = _cvt_f32_176.y;
                         float up_x_738 = _cvt_f32_177.x;
@@ -3462,8 +3468,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_742 = gate_x_736 / denominator_x_740 * up_x_738;
                         float hidden_y_743 = gate_y_737 / denominator_y_741 * up_y_739;
                         hidden_packed_539[24] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_742, hidden_y_743)));
-                        float2 _cvt_f32_178 = __bfloat1622float2(__as_bf16x2(gate_packed_537[25]));
-                        float2 _cvt_f32_179 = __bfloat1622float2(__as_bf16x2(up_packed_538[25]));
+                        float2 _cvt_f32_178 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[25]));
+                        float2 _cvt_f32_179 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[25]));
                         float gate_x_744 = _cvt_f32_178.x;
                         float gate_y_745 = _cvt_f32_178.y;
                         float up_x_746 = _cvt_f32_179.x;
@@ -3479,8 +3485,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_750 = gate_x_744 / denominator_x_748 * up_x_746;
                         float hidden_y_751 = gate_y_745 / denominator_y_749 * up_y_747;
                         hidden_packed_539[25] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_750, hidden_y_751)));
-                        float2 _cvt_f32_180 = __bfloat1622float2(__as_bf16x2(gate_packed_537[26]));
-                        float2 _cvt_f32_181 = __bfloat1622float2(__as_bf16x2(up_packed_538[26]));
+                        float2 _cvt_f32_180 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[26]));
+                        float2 _cvt_f32_181 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[26]));
                         float gate_x_752 = _cvt_f32_180.x;
                         float gate_y_753 = _cvt_f32_180.y;
                         float up_x_754 = _cvt_f32_181.x;
@@ -3496,8 +3502,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_758 = gate_x_752 / denominator_x_756 * up_x_754;
                         float hidden_y_759 = gate_y_753 / denominator_y_757 * up_y_755;
                         hidden_packed_539[26] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_758, hidden_y_759)));
-                        float2 _cvt_f32_182 = __bfloat1622float2(__as_bf16x2(gate_packed_537[27]));
-                        float2 _cvt_f32_183 = __bfloat1622float2(__as_bf16x2(up_packed_538[27]));
+                        float2 _cvt_f32_182 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[27]));
+                        float2 _cvt_f32_183 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[27]));
                         float gate_x_760 = _cvt_f32_182.x;
                         float gate_y_761 = _cvt_f32_182.y;
                         float up_x_762 = _cvt_f32_183.x;
@@ -3513,8 +3519,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_766 = gate_x_760 / denominator_x_764 * up_x_762;
                         float hidden_y_767 = gate_y_761 / denominator_y_765 * up_y_763;
                         hidden_packed_539[27] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_766, hidden_y_767)));
-                        float2 _cvt_f32_184 = __bfloat1622float2(__as_bf16x2(gate_packed_537[28]));
-                        float2 _cvt_f32_185 = __bfloat1622float2(__as_bf16x2(up_packed_538[28]));
+                        float2 _cvt_f32_184 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[28]));
+                        float2 _cvt_f32_185 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[28]));
                         float gate_x_768 = _cvt_f32_184.x;
                         float gate_y_769 = _cvt_f32_184.y;
                         float up_x_770 = _cvt_f32_185.x;
@@ -3530,8 +3536,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_774 = gate_x_768 / denominator_x_772 * up_x_770;
                         float hidden_y_775 = gate_y_769 / denominator_y_773 * up_y_771;
                         hidden_packed_539[28] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_774, hidden_y_775)));
-                        float2 _cvt_f32_186 = __bfloat1622float2(__as_bf16x2(gate_packed_537[29]));
-                        float2 _cvt_f32_187 = __bfloat1622float2(__as_bf16x2(up_packed_538[29]));
+                        float2 _cvt_f32_186 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[29]));
+                        float2 _cvt_f32_187 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[29]));
                         float gate_x_776 = _cvt_f32_186.x;
                         float gate_y_777 = _cvt_f32_186.y;
                         float up_x_778 = _cvt_f32_187.x;
@@ -3547,8 +3553,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_782 = gate_x_776 / denominator_x_780 * up_x_778;
                         float hidden_y_783 = gate_y_777 / denominator_y_781 * up_y_779;
                         hidden_packed_539[29] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_782, hidden_y_783)));
-                        float2 _cvt_f32_188 = __bfloat1622float2(__as_bf16x2(gate_packed_537[30]));
-                        float2 _cvt_f32_189 = __bfloat1622float2(__as_bf16x2(up_packed_538[30]));
+                        float2 _cvt_f32_188 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[30]));
+                        float2 _cvt_f32_189 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[30]));
                         float gate_x_784 = _cvt_f32_188.x;
                         float gate_y_785 = _cvt_f32_188.y;
                         float up_x_786 = _cvt_f32_189.x;
@@ -3564,8 +3570,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_790 = gate_x_784 / denominator_x_788 * up_x_786;
                         float hidden_y_791 = gate_y_785 / denominator_y_789 * up_y_787;
                         hidden_packed_539[30] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_790, hidden_y_791)));
-                        float2 _cvt_f32_190 = __bfloat1622float2(__as_bf16x2(gate_packed_537[31]));
-                        float2 _cvt_f32_191 = __bfloat1622float2(__as_bf16x2(up_packed_538[31]));
+                        float2 _cvt_f32_190 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537[31]));
+                        float2 _cvt_f32_191 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538[31]));
                         float gate_x_792 = _cvt_f32_190.x;
                         float gate_y_793 = _cvt_f32_190.y;
                         float up_x_794 = _cvt_f32_191.x;
@@ -3890,8 +3896,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                                 "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                                 :: "r"((output_finished_addr + 8) & 0xFEFFFFFF) : "memory");
                         }
-                        float2 _cvt_f32_192 = __bfloat1622float2(__as_bf16x2(gate_packed_812[0]));
-                        float2 _cvt_f32_193 = __bfloat1622float2(__as_bf16x2(up_packed_813[0]));
+                        float2 _cvt_f32_192 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[0]));
+                        float2 _cvt_f32_193 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[0]));
                         float gate_x_819 = _cvt_f32_192.x;
                         float gate_y_820 = _cvt_f32_192.y;
                         float up_x_821 = _cvt_f32_193.x;
@@ -3907,8 +3913,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_825 = gate_x_819 / denominator_x_823 * up_x_821;
                         float hidden_y_826 = gate_y_820 / denominator_y_824 * up_y_822;
                         hidden_packed_814[0] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_825, hidden_y_826)));
-                        float2 _cvt_f32_194 = __bfloat1622float2(__as_bf16x2(gate_packed_812[1]));
-                        float2 _cvt_f32_195 = __bfloat1622float2(__as_bf16x2(up_packed_813[1]));
+                        float2 _cvt_f32_194 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[1]));
+                        float2 _cvt_f32_195 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[1]));
                         float gate_x_827 = _cvt_f32_194.x;
                         float gate_y_828 = _cvt_f32_194.y;
                         float up_x_829 = _cvt_f32_195.x;
@@ -3924,8 +3930,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_833 = gate_x_827 / denominator_x_831 * up_x_829;
                         float hidden_y_834 = gate_y_828 / denominator_y_832 * up_y_830;
                         hidden_packed_814[1] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_833, hidden_y_834)));
-                        float2 _cvt_f32_196 = __bfloat1622float2(__as_bf16x2(gate_packed_812[2]));
-                        float2 _cvt_f32_197 = __bfloat1622float2(__as_bf16x2(up_packed_813[2]));
+                        float2 _cvt_f32_196 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[2]));
+                        float2 _cvt_f32_197 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[2]));
                         float gate_x_835 = _cvt_f32_196.x;
                         float gate_y_836 = _cvt_f32_196.y;
                         float up_x_837 = _cvt_f32_197.x;
@@ -3941,8 +3947,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_841 = gate_x_835 / denominator_x_839 * up_x_837;
                         float hidden_y_842 = gate_y_836 / denominator_y_840 * up_y_838;
                         hidden_packed_814[2] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_841, hidden_y_842)));
-                        float2 _cvt_f32_198 = __bfloat1622float2(__as_bf16x2(gate_packed_812[3]));
-                        float2 _cvt_f32_199 = __bfloat1622float2(__as_bf16x2(up_packed_813[3]));
+                        float2 _cvt_f32_198 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[3]));
+                        float2 _cvt_f32_199 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[3]));
                         float gate_x_843 = _cvt_f32_198.x;
                         float gate_y_844 = _cvt_f32_198.y;
                         float up_x_845 = _cvt_f32_199.x;
@@ -3958,8 +3964,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_849 = gate_x_843 / denominator_x_847 * up_x_845;
                         float hidden_y_850 = gate_y_844 / denominator_y_848 * up_y_846;
                         hidden_packed_814[3] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_849, hidden_y_850)));
-                        float2 _cvt_f32_200 = __bfloat1622float2(__as_bf16x2(gate_packed_812[4]));
-                        float2 _cvt_f32_201 = __bfloat1622float2(__as_bf16x2(up_packed_813[4]));
+                        float2 _cvt_f32_200 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[4]));
+                        float2 _cvt_f32_201 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[4]));
                         float gate_x_851 = _cvt_f32_200.x;
                         float gate_y_852 = _cvt_f32_200.y;
                         float up_x_853 = _cvt_f32_201.x;
@@ -3975,8 +3981,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_857 = gate_x_851 / denominator_x_855 * up_x_853;
                         float hidden_y_858 = gate_y_852 / denominator_y_856 * up_y_854;
                         hidden_packed_814[4] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_857, hidden_y_858)));
-                        float2 _cvt_f32_202 = __bfloat1622float2(__as_bf16x2(gate_packed_812[5]));
-                        float2 _cvt_f32_203 = __bfloat1622float2(__as_bf16x2(up_packed_813[5]));
+                        float2 _cvt_f32_202 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[5]));
+                        float2 _cvt_f32_203 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[5]));
                         float gate_x_859 = _cvt_f32_202.x;
                         float gate_y_860 = _cvt_f32_202.y;
                         float up_x_861 = _cvt_f32_203.x;
@@ -3992,8 +3998,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_865 = gate_x_859 / denominator_x_863 * up_x_861;
                         float hidden_y_866 = gate_y_860 / denominator_y_864 * up_y_862;
                         hidden_packed_814[5] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_865, hidden_y_866)));
-                        float2 _cvt_f32_204 = __bfloat1622float2(__as_bf16x2(gate_packed_812[6]));
-                        float2 _cvt_f32_205 = __bfloat1622float2(__as_bf16x2(up_packed_813[6]));
+                        float2 _cvt_f32_204 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[6]));
+                        float2 _cvt_f32_205 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[6]));
                         float gate_x_867 = _cvt_f32_204.x;
                         float gate_y_868 = _cvt_f32_204.y;
                         float up_x_869 = _cvt_f32_205.x;
@@ -4009,8 +4015,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_873 = gate_x_867 / denominator_x_871 * up_x_869;
                         float hidden_y_874 = gate_y_868 / denominator_y_872 * up_y_870;
                         hidden_packed_814[6] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_873, hidden_y_874)));
-                        float2 _cvt_f32_206 = __bfloat1622float2(__as_bf16x2(gate_packed_812[7]));
-                        float2 _cvt_f32_207 = __bfloat1622float2(__as_bf16x2(up_packed_813[7]));
+                        float2 _cvt_f32_206 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[7]));
+                        float2 _cvt_f32_207 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[7]));
                         float gate_x_875 = _cvt_f32_206.x;
                         float gate_y_876 = _cvt_f32_206.y;
                         float up_x_877 = _cvt_f32_207.x;
@@ -4026,8 +4032,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_881 = gate_x_875 / denominator_x_879 * up_x_877;
                         float hidden_y_882 = gate_y_876 / denominator_y_880 * up_y_878;
                         hidden_packed_814[7] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_881, hidden_y_882)));
-                        float2 _cvt_f32_208 = __bfloat1622float2(__as_bf16x2(gate_packed_812[8]));
-                        float2 _cvt_f32_209 = __bfloat1622float2(__as_bf16x2(up_packed_813[8]));
+                        float2 _cvt_f32_208 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[8]));
+                        float2 _cvt_f32_209 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[8]));
                         float gate_x_883 = _cvt_f32_208.x;
                         float gate_y_884 = _cvt_f32_208.y;
                         float up_x_885 = _cvt_f32_209.x;
@@ -4043,8 +4049,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_889 = gate_x_883 / denominator_x_887 * up_x_885;
                         float hidden_y_890 = gate_y_884 / denominator_y_888 * up_y_886;
                         hidden_packed_814[8] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_889, hidden_y_890)));
-                        float2 _cvt_f32_210 = __bfloat1622float2(__as_bf16x2(gate_packed_812[9]));
-                        float2 _cvt_f32_211 = __bfloat1622float2(__as_bf16x2(up_packed_813[9]));
+                        float2 _cvt_f32_210 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[9]));
+                        float2 _cvt_f32_211 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[9]));
                         float gate_x_891 = _cvt_f32_210.x;
                         float gate_y_892 = _cvt_f32_210.y;
                         float up_x_893 = _cvt_f32_211.x;
@@ -4060,8 +4066,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_897 = gate_x_891 / denominator_x_895 * up_x_893;
                         float hidden_y_898 = gate_y_892 / denominator_y_896 * up_y_894;
                         hidden_packed_814[9] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_897, hidden_y_898)));
-                        float2 _cvt_f32_212 = __bfloat1622float2(__as_bf16x2(gate_packed_812[10]));
-                        float2 _cvt_f32_213 = __bfloat1622float2(__as_bf16x2(up_packed_813[10]));
+                        float2 _cvt_f32_212 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[10]));
+                        float2 _cvt_f32_213 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[10]));
                         float gate_x_899 = _cvt_f32_212.x;
                         float gate_y_900 = _cvt_f32_212.y;
                         float up_x_901 = _cvt_f32_213.x;
@@ -4077,8 +4083,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_905 = gate_x_899 / denominator_x_903 * up_x_901;
                         float hidden_y_906 = gate_y_900 / denominator_y_904 * up_y_902;
                         hidden_packed_814[10] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_905, hidden_y_906)));
-                        float2 _cvt_f32_214 = __bfloat1622float2(__as_bf16x2(gate_packed_812[11]));
-                        float2 _cvt_f32_215 = __bfloat1622float2(__as_bf16x2(up_packed_813[11]));
+                        float2 _cvt_f32_214 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[11]));
+                        float2 _cvt_f32_215 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[11]));
                         float gate_x_907 = _cvt_f32_214.x;
                         float gate_y_908 = _cvt_f32_214.y;
                         float up_x_909 = _cvt_f32_215.x;
@@ -4094,8 +4100,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_913 = gate_x_907 / denominator_x_911 * up_x_909;
                         float hidden_y_914 = gate_y_908 / denominator_y_912 * up_y_910;
                         hidden_packed_814[11] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_913, hidden_y_914)));
-                        float2 _cvt_f32_216 = __bfloat1622float2(__as_bf16x2(gate_packed_812[12]));
-                        float2 _cvt_f32_217 = __bfloat1622float2(__as_bf16x2(up_packed_813[12]));
+                        float2 _cvt_f32_216 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[12]));
+                        float2 _cvt_f32_217 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[12]));
                         float gate_x_915 = _cvt_f32_216.x;
                         float gate_y_916 = _cvt_f32_216.y;
                         float up_x_917 = _cvt_f32_217.x;
@@ -4111,8 +4117,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_921 = gate_x_915 / denominator_x_919 * up_x_917;
                         float hidden_y_922 = gate_y_916 / denominator_y_920 * up_y_918;
                         hidden_packed_814[12] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_921, hidden_y_922)));
-                        float2 _cvt_f32_218 = __bfloat1622float2(__as_bf16x2(gate_packed_812[13]));
-                        float2 _cvt_f32_219 = __bfloat1622float2(__as_bf16x2(up_packed_813[13]));
+                        float2 _cvt_f32_218 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[13]));
+                        float2 _cvt_f32_219 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[13]));
                         float gate_x_923 = _cvt_f32_218.x;
                         float gate_y_924 = _cvt_f32_218.y;
                         float up_x_925 = _cvt_f32_219.x;
@@ -4128,8 +4134,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_929 = gate_x_923 / denominator_x_927 * up_x_925;
                         float hidden_y_930 = gate_y_924 / denominator_y_928 * up_y_926;
                         hidden_packed_814[13] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_929, hidden_y_930)));
-                        float2 _cvt_f32_220 = __bfloat1622float2(__as_bf16x2(gate_packed_812[14]));
-                        float2 _cvt_f32_221 = __bfloat1622float2(__as_bf16x2(up_packed_813[14]));
+                        float2 _cvt_f32_220 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[14]));
+                        float2 _cvt_f32_221 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[14]));
                         float gate_x_931 = _cvt_f32_220.x;
                         float gate_y_932 = _cvt_f32_220.y;
                         float up_x_933 = _cvt_f32_221.x;
@@ -4145,8 +4151,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_937 = gate_x_931 / denominator_x_935 * up_x_933;
                         float hidden_y_938 = gate_y_932 / denominator_y_936 * up_y_934;
                         hidden_packed_814[14] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_937, hidden_y_938)));
-                        float2 _cvt_f32_222 = __bfloat1622float2(__as_bf16x2(gate_packed_812[15]));
-                        float2 _cvt_f32_223 = __bfloat1622float2(__as_bf16x2(up_packed_813[15]));
+                        float2 _cvt_f32_222 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[15]));
+                        float2 _cvt_f32_223 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[15]));
                         float gate_x_939 = _cvt_f32_222.x;
                         float gate_y_940 = _cvt_f32_222.y;
                         float up_x_941 = _cvt_f32_223.x;
@@ -4162,8 +4168,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_945 = gate_x_939 / denominator_x_943 * up_x_941;
                         float hidden_y_946 = gate_y_940 / denominator_y_944 * up_y_942;
                         hidden_packed_814[15] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_945, hidden_y_946)));
-                        float2 _cvt_f32_224 = __bfloat1622float2(__as_bf16x2(gate_packed_812[16]));
-                        float2 _cvt_f32_225 = __bfloat1622float2(__as_bf16x2(up_packed_813[16]));
+                        float2 _cvt_f32_224 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[16]));
+                        float2 _cvt_f32_225 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[16]));
                         float gate_x_947 = _cvt_f32_224.x;
                         float gate_y_948 = _cvt_f32_224.y;
                         float up_x_949 = _cvt_f32_225.x;
@@ -4179,8 +4185,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_953 = gate_x_947 / denominator_x_951 * up_x_949;
                         float hidden_y_954 = gate_y_948 / denominator_y_952 * up_y_950;
                         hidden_packed_814[16] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_953, hidden_y_954)));
-                        float2 _cvt_f32_226 = __bfloat1622float2(__as_bf16x2(gate_packed_812[17]));
-                        float2 _cvt_f32_227 = __bfloat1622float2(__as_bf16x2(up_packed_813[17]));
+                        float2 _cvt_f32_226 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[17]));
+                        float2 _cvt_f32_227 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[17]));
                         float gate_x_955 = _cvt_f32_226.x;
                         float gate_y_956 = _cvt_f32_226.y;
                         float up_x_957 = _cvt_f32_227.x;
@@ -4196,8 +4202,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_961 = gate_x_955 / denominator_x_959 * up_x_957;
                         float hidden_y_962 = gate_y_956 / denominator_y_960 * up_y_958;
                         hidden_packed_814[17] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_961, hidden_y_962)));
-                        float2 _cvt_f32_228 = __bfloat1622float2(__as_bf16x2(gate_packed_812[18]));
-                        float2 _cvt_f32_229 = __bfloat1622float2(__as_bf16x2(up_packed_813[18]));
+                        float2 _cvt_f32_228 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[18]));
+                        float2 _cvt_f32_229 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[18]));
                         float gate_x_963 = _cvt_f32_228.x;
                         float gate_y_964 = _cvt_f32_228.y;
                         float up_x_965 = _cvt_f32_229.x;
@@ -4213,8 +4219,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_969 = gate_x_963 / denominator_x_967 * up_x_965;
                         float hidden_y_970 = gate_y_964 / denominator_y_968 * up_y_966;
                         hidden_packed_814[18] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_969, hidden_y_970)));
-                        float2 _cvt_f32_230 = __bfloat1622float2(__as_bf16x2(gate_packed_812[19]));
-                        float2 _cvt_f32_231 = __bfloat1622float2(__as_bf16x2(up_packed_813[19]));
+                        float2 _cvt_f32_230 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[19]));
+                        float2 _cvt_f32_231 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[19]));
                         float gate_x_971 = _cvt_f32_230.x;
                         float gate_y_972 = _cvt_f32_230.y;
                         float up_x_973 = _cvt_f32_231.x;
@@ -4230,8 +4236,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_977 = gate_x_971 / denominator_x_975 * up_x_973;
                         float hidden_y_978 = gate_y_972 / denominator_y_976 * up_y_974;
                         hidden_packed_814[19] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_977, hidden_y_978)));
-                        float2 _cvt_f32_232 = __bfloat1622float2(__as_bf16x2(gate_packed_812[20]));
-                        float2 _cvt_f32_233 = __bfloat1622float2(__as_bf16x2(up_packed_813[20]));
+                        float2 _cvt_f32_232 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[20]));
+                        float2 _cvt_f32_233 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[20]));
                         float gate_x_979 = _cvt_f32_232.x;
                         float gate_y_980 = _cvt_f32_232.y;
                         float up_x_981 = _cvt_f32_233.x;
@@ -4247,8 +4253,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_985 = gate_x_979 / denominator_x_983 * up_x_981;
                         float hidden_y_986 = gate_y_980 / denominator_y_984 * up_y_982;
                         hidden_packed_814[20] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_985, hidden_y_986)));
-                        float2 _cvt_f32_234 = __bfloat1622float2(__as_bf16x2(gate_packed_812[21]));
-                        float2 _cvt_f32_235 = __bfloat1622float2(__as_bf16x2(up_packed_813[21]));
+                        float2 _cvt_f32_234 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[21]));
+                        float2 _cvt_f32_235 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[21]));
                         float gate_x_987 = _cvt_f32_234.x;
                         float gate_y_988 = _cvt_f32_234.y;
                         float up_x_989 = _cvt_f32_235.x;
@@ -4264,8 +4270,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_993 = gate_x_987 / denominator_x_991 * up_x_989;
                         float hidden_y_994 = gate_y_988 / denominator_y_992 * up_y_990;
                         hidden_packed_814[21] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_993, hidden_y_994)));
-                        float2 _cvt_f32_236 = __bfloat1622float2(__as_bf16x2(gate_packed_812[22]));
-                        float2 _cvt_f32_237 = __bfloat1622float2(__as_bf16x2(up_packed_813[22]));
+                        float2 _cvt_f32_236 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[22]));
+                        float2 _cvt_f32_237 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[22]));
                         float gate_x_995 = _cvt_f32_236.x;
                         float gate_y_996 = _cvt_f32_236.y;
                         float up_x_997 = _cvt_f32_237.x;
@@ -4281,8 +4287,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_1001 = gate_x_995 / denominator_x_999 * up_x_997;
                         float hidden_y_1002 = gate_y_996 / denominator_y_1000 * up_y_998;
                         hidden_packed_814[22] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_1001, hidden_y_1002)));
-                        float2 _cvt_f32_238 = __bfloat1622float2(__as_bf16x2(gate_packed_812[23]));
-                        float2 _cvt_f32_239 = __bfloat1622float2(__as_bf16x2(up_packed_813[23]));
+                        float2 _cvt_f32_238 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[23]));
+                        float2 _cvt_f32_239 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[23]));
                         float gate_x_1003 = _cvt_f32_238.x;
                         float gate_y_1004 = _cvt_f32_238.y;
                         float up_x_1005 = _cvt_f32_239.x;
@@ -4298,8 +4304,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_1009 = gate_x_1003 / denominator_x_1007 * up_x_1005;
                         float hidden_y_1010 = gate_y_1004 / denominator_y_1008 * up_y_1006;
                         hidden_packed_814[23] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_1009, hidden_y_1010)));
-                        float2 _cvt_f32_240 = __bfloat1622float2(__as_bf16x2(gate_packed_812[24]));
-                        float2 _cvt_f32_241 = __bfloat1622float2(__as_bf16x2(up_packed_813[24]));
+                        float2 _cvt_f32_240 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[24]));
+                        float2 _cvt_f32_241 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[24]));
                         float gate_x_1011 = _cvt_f32_240.x;
                         float gate_y_1012 = _cvt_f32_240.y;
                         float up_x_1013 = _cvt_f32_241.x;
@@ -4315,8 +4321,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_1017 = gate_x_1011 / denominator_x_1015 * up_x_1013;
                         float hidden_y_1018 = gate_y_1012 / denominator_y_1016 * up_y_1014;
                         hidden_packed_814[24] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_1017, hidden_y_1018)));
-                        float2 _cvt_f32_242 = __bfloat1622float2(__as_bf16x2(gate_packed_812[25]));
-                        float2 _cvt_f32_243 = __bfloat1622float2(__as_bf16x2(up_packed_813[25]));
+                        float2 _cvt_f32_242 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[25]));
+                        float2 _cvt_f32_243 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[25]));
                         float gate_x_1019 = _cvt_f32_242.x;
                         float gate_y_1020 = _cvt_f32_242.y;
                         float up_x_1021 = _cvt_f32_243.x;
@@ -4332,8 +4338,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_1025 = gate_x_1019 / denominator_x_1023 * up_x_1021;
                         float hidden_y_1026 = gate_y_1020 / denominator_y_1024 * up_y_1022;
                         hidden_packed_814[25] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_1025, hidden_y_1026)));
-                        float2 _cvt_f32_244 = __bfloat1622float2(__as_bf16x2(gate_packed_812[26]));
-                        float2 _cvt_f32_245 = __bfloat1622float2(__as_bf16x2(up_packed_813[26]));
+                        float2 _cvt_f32_244 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[26]));
+                        float2 _cvt_f32_245 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[26]));
                         float gate_x_1027 = _cvt_f32_244.x;
                         float gate_y_1028 = _cvt_f32_244.y;
                         float up_x_1029 = _cvt_f32_245.x;
@@ -4349,8 +4355,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_1033 = gate_x_1027 / denominator_x_1031 * up_x_1029;
                         float hidden_y_1034 = gate_y_1028 / denominator_y_1032 * up_y_1030;
                         hidden_packed_814[26] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_1033, hidden_y_1034)));
-                        float2 _cvt_f32_246 = __bfloat1622float2(__as_bf16x2(gate_packed_812[27]));
-                        float2 _cvt_f32_247 = __bfloat1622float2(__as_bf16x2(up_packed_813[27]));
+                        float2 _cvt_f32_246 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[27]));
+                        float2 _cvt_f32_247 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[27]));
                         float gate_x_1035 = _cvt_f32_246.x;
                         float gate_y_1036 = _cvt_f32_246.y;
                         float up_x_1037 = _cvt_f32_247.x;
@@ -4366,8 +4372,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_1041 = gate_x_1035 / denominator_x_1039 * up_x_1037;
                         float hidden_y_1042 = gate_y_1036 / denominator_y_1040 * up_y_1038;
                         hidden_packed_814[27] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_1041, hidden_y_1042)));
-                        float2 _cvt_f32_248 = __bfloat1622float2(__as_bf16x2(gate_packed_812[28]));
-                        float2 _cvt_f32_249 = __bfloat1622float2(__as_bf16x2(up_packed_813[28]));
+                        float2 _cvt_f32_248 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[28]));
+                        float2 _cvt_f32_249 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[28]));
                         float gate_x_1043 = _cvt_f32_248.x;
                         float gate_y_1044 = _cvt_f32_248.y;
                         float up_x_1045 = _cvt_f32_249.x;
@@ -4383,8 +4389,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_1049 = gate_x_1043 / denominator_x_1047 * up_x_1045;
                         float hidden_y_1050 = gate_y_1044 / denominator_y_1048 * up_y_1046;
                         hidden_packed_814[28] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_1049, hidden_y_1050)));
-                        float2 _cvt_f32_250 = __bfloat1622float2(__as_bf16x2(gate_packed_812[29]));
-                        float2 _cvt_f32_251 = __bfloat1622float2(__as_bf16x2(up_packed_813[29]));
+                        float2 _cvt_f32_250 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[29]));
+                        float2 _cvt_f32_251 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[29]));
                         float gate_x_1051 = _cvt_f32_250.x;
                         float gate_y_1052 = _cvt_f32_250.y;
                         float up_x_1053 = _cvt_f32_251.x;
@@ -4400,8 +4406,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_1057 = gate_x_1051 / denominator_x_1055 * up_x_1053;
                         float hidden_y_1058 = gate_y_1052 / denominator_y_1056 * up_y_1054;
                         hidden_packed_814[29] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_1057, hidden_y_1058)));
-                        float2 _cvt_f32_252 = __bfloat1622float2(__as_bf16x2(gate_packed_812[30]));
-                        float2 _cvt_f32_253 = __bfloat1622float2(__as_bf16x2(up_packed_813[30]));
+                        float2 _cvt_f32_252 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[30]));
+                        float2 _cvt_f32_253 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[30]));
                         float gate_x_1059 = _cvt_f32_252.x;
                         float gate_y_1060 = _cvt_f32_252.y;
                         float up_x_1061 = _cvt_f32_253.x;
@@ -4417,8 +4423,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                         float hidden_x_1065 = gate_x_1059 / denominator_x_1063 * up_x_1061;
                         float hidden_y_1066 = gate_y_1060 / denominator_y_1064 * up_y_1062;
                         hidden_packed_814[30] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_1065, hidden_y_1066)));
-                        float2 _cvt_f32_254 = __bfloat1622float2(__as_bf16x2(gate_packed_812[31]));
-                        float2 _cvt_f32_255 = __bfloat1622float2(__as_bf16x2(up_packed_813[31]));
+                        float2 _cvt_f32_254 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812[31]));
+                        float2 _cvt_f32_255 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813[31]));
                         float gate_x_1067 = _cvt_f32_254.x;
                         float gate_y_1068 = _cvt_f32_254.y;
                         float up_x_1069 = _cvt_f32_255.x;
@@ -4672,14 +4678,14 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             {
                                 bool enabled_value_3 = 1;
                                 if (enabled_value_3 != 0) {
-                                    int32_t _relaxed_ld_8;
-                                    asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_8) : "l"(hidden_ready + (macro_rows_2 + x_1)) : "memory");
-                                    int value_4 = _relaxed_ld_8;
-                                    while (value_4 < 2 * (intermediate / 128)) {
+                                    int _poll_4_first;
+                                    asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_poll_4_first) : "l"(hidden_ready + (macro_rows_2 + x_1)) : "memory");
+                                    int _poll_4 = _poll_4_first;
+                                    while (_poll_4 < 2 * (intermediate / 128)) {
                                         asm volatile("nanosleep.u32 %0;" :: "r"(16));
-                                        int32_t _relaxed_ld_9;
-                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_9) : "l"(hidden_ready + (macro_rows_2 + x_1)) : "memory");
-                                        value_4 = _relaxed_ld_9;
+                                        int _poll_4_next;
+                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_poll_4_next) : "l"(hidden_ready + (macro_rows_2 + x_1)) : "memory");
+                                        _poll_4 = _poll_4_next;
                                     }
                                     asm volatile("fence.acquire.gpu;" ::: "memory");
                                 }
@@ -5216,14 +5222,14 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                                     int required_4 = (mini_rows_6 + 127) / 128 * ((hidden + 511) / 512);
                                     bool enabled_value_4 = 1;
                                     if (enabled_value_4 != 0) {
-                                        int32_t _relaxed_ld_10;
-                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_10) : "l"(x_ready + global_mini_2) : "memory");
-                                        int value_5 = _relaxed_ld_10;
-                                        while (value_5 < required_4) {
+                                        int _poll_5_first;
+                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_poll_5_first) : "l"(x_ready + global_mini_2) : "memory");
+                                        int _poll_5 = _poll_5_first;
+                                        while (_poll_5 < required_4) {
                                             asm volatile("nanosleep.u32 %0;" :: "r"(16));
-                                            int32_t _relaxed_ld_11;
-                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_11) : "l"(x_ready + global_mini_2) : "memory");
-                                            value_5 = _relaxed_ld_11;
+                                            int _poll_5_next;
+                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_poll_5_next) : "l"(x_ready + global_mini_2) : "memory");
+                                            _poll_5 = _poll_5_next;
                                         }
                                         asm volatile("fence.acquire.gpu;" ::: "memory");
                                     }
@@ -5647,8 +5653,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             gate_packed_1[31] = __as_u32(__float22bfloat162_rn(make_float2(_tmem_load_40[14], _tmem_load_40[15])));
                             up_packed_1[31] = __as_u32(__float22bfloat162_rn(make_float2(_tmem_load_41[14], _tmem_load_41[15])));
                             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
-                            float2 _cvt_f32_256 = __bfloat1622float2(__as_bf16x2(gate_packed_1[0]));
-                            float2 _cvt_f32_257 = __bfloat1622float2(__as_bf16x2(up_packed_1[0]));
+                            float2 _cvt_f32_256 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[0]));
+                            float2 _cvt_f32_257 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[0]));
                             float gate_x_1 = _cvt_f32_256.x;
                             float gate_y_1 = _cvt_f32_256.y;
                             float up_x_1 = _cvt_f32_257.x;
@@ -5664,8 +5670,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_1 = gate_x_1 / denominator_x_1 * up_x_1;
                             float hidden_y_1 = gate_y_1 / denominator_y_1 * up_y_1;
                             hidden_packed_1[0] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_1, hidden_y_1)));
-                            float2 _cvt_f32_258 = __bfloat1622float2(__as_bf16x2(gate_packed_1[1]));
-                            float2 _cvt_f32_259 = __bfloat1622float2(__as_bf16x2(up_packed_1[1]));
+                            float2 _cvt_f32_258 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[1]));
+                            float2 _cvt_f32_259 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[1]));
                             float gate_x_3_1 = _cvt_f32_258.x;
                             float gate_y_4_1 = _cvt_f32_258.y;
                             float up_x_5_1 = _cvt_f32_259.x;
@@ -5681,8 +5687,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_9_1 = gate_x_3_1 / denominator_x_7_1 * up_x_5_1;
                             float hidden_y_10_1 = gate_y_4_1 / denominator_y_8_1 * up_y_6_1;
                             hidden_packed_1[1] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_9_1, hidden_y_10_1)));
-                            float2 _cvt_f32_260 = __bfloat1622float2(__as_bf16x2(gate_packed_1[2]));
-                            float2 _cvt_f32_261 = __bfloat1622float2(__as_bf16x2(up_packed_1[2]));
+                            float2 _cvt_f32_260 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[2]));
+                            float2 _cvt_f32_261 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[2]));
                             float gate_x_11_1 = _cvt_f32_260.x;
                             float gate_y_12_1 = _cvt_f32_260.y;
                             float up_x_13_1 = _cvt_f32_261.x;
@@ -5698,8 +5704,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_17_1 = gate_x_11_1 / denominator_x_15_1 * up_x_13_1;
                             float hidden_y_18_1 = gate_y_12_1 / denominator_y_16_1 * up_y_14_1;
                             hidden_packed_1[2] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_17_1, hidden_y_18_1)));
-                            float2 _cvt_f32_262 = __bfloat1622float2(__as_bf16x2(gate_packed_1[3]));
-                            float2 _cvt_f32_263 = __bfloat1622float2(__as_bf16x2(up_packed_1[3]));
+                            float2 _cvt_f32_262 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[3]));
+                            float2 _cvt_f32_263 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[3]));
                             float gate_x_19_1 = _cvt_f32_262.x;
                             float gate_y_20_1 = _cvt_f32_262.y;
                             float up_x_21_1 = _cvt_f32_263.x;
@@ -5715,8 +5721,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_25_1 = gate_x_19_1 / denominator_x_23_1 * up_x_21_1;
                             float hidden_y_26_1 = gate_y_20_1 / denominator_y_24_1 * up_y_22_1;
                             hidden_packed_1[3] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_25_1, hidden_y_26_1)));
-                            float2 _cvt_f32_264 = __bfloat1622float2(__as_bf16x2(gate_packed_1[4]));
-                            float2 _cvt_f32_265 = __bfloat1622float2(__as_bf16x2(up_packed_1[4]));
+                            float2 _cvt_f32_264 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[4]));
+                            float2 _cvt_f32_265 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[4]));
                             float gate_x_27_1 = _cvt_f32_264.x;
                             float gate_y_28_1 = _cvt_f32_264.y;
                             float up_x_29_1 = _cvt_f32_265.x;
@@ -5732,8 +5738,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_33_1 = gate_x_27_1 / denominator_x_31_1 * up_x_29_1;
                             float hidden_y_34_1 = gate_y_28_1 / denominator_y_32_1 * up_y_30_1;
                             hidden_packed_1[4] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_33_1, hidden_y_34_1)));
-                            float2 _cvt_f32_266 = __bfloat1622float2(__as_bf16x2(gate_packed_1[5]));
-                            float2 _cvt_f32_267 = __bfloat1622float2(__as_bf16x2(up_packed_1[5]));
+                            float2 _cvt_f32_266 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[5]));
+                            float2 _cvt_f32_267 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[5]));
                             float gate_x_35_1 = _cvt_f32_266.x;
                             float gate_y_36_1 = _cvt_f32_266.y;
                             float up_x_37_1 = _cvt_f32_267.x;
@@ -5749,8 +5755,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_41_1 = gate_x_35_1 / denominator_x_39_1 * up_x_37_1;
                             float hidden_y_42_1 = gate_y_36_1 / denominator_y_40_1 * up_y_38_1;
                             hidden_packed_1[5] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_41_1, hidden_y_42_1)));
-                            float2 _cvt_f32_268 = __bfloat1622float2(__as_bf16x2(gate_packed_1[6]));
-                            float2 _cvt_f32_269 = __bfloat1622float2(__as_bf16x2(up_packed_1[6]));
+                            float2 _cvt_f32_268 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[6]));
+                            float2 _cvt_f32_269 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[6]));
                             float gate_x_43_1 = _cvt_f32_268.x;
                             float gate_y_44_1 = _cvt_f32_268.y;
                             float up_x_45_1 = _cvt_f32_269.x;
@@ -5766,8 +5772,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_49_1 = gate_x_43_1 / denominator_x_47_1 * up_x_45_1;
                             float hidden_y_50_1 = gate_y_44_1 / denominator_y_48_1 * up_y_46_1;
                             hidden_packed_1[6] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_49_1, hidden_y_50_1)));
-                            float2 _cvt_f32_270 = __bfloat1622float2(__as_bf16x2(gate_packed_1[7]));
-                            float2 _cvt_f32_271 = __bfloat1622float2(__as_bf16x2(up_packed_1[7]));
+                            float2 _cvt_f32_270 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[7]));
+                            float2 _cvt_f32_271 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[7]));
                             float gate_x_51_1 = _cvt_f32_270.x;
                             float gate_y_52_1 = _cvt_f32_270.y;
                             float up_x_53_1 = _cvt_f32_271.x;
@@ -5783,8 +5789,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_57_1 = gate_x_51_1 / denominator_x_55_1 * up_x_53_1;
                             float hidden_y_58_1 = gate_y_52_1 / denominator_y_56_1 * up_y_54_1;
                             hidden_packed_1[7] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_57_1, hidden_y_58_1)));
-                            float2 _cvt_f32_272 = __bfloat1622float2(__as_bf16x2(gate_packed_1[8]));
-                            float2 _cvt_f32_273 = __bfloat1622float2(__as_bf16x2(up_packed_1[8]));
+                            float2 _cvt_f32_272 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[8]));
+                            float2 _cvt_f32_273 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[8]));
                             float gate_x_59_1 = _cvt_f32_272.x;
                             float gate_y_60_1 = _cvt_f32_272.y;
                             float up_x_61_1 = _cvt_f32_273.x;
@@ -5800,8 +5806,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_65_1 = gate_x_59_1 / denominator_x_63_1 * up_x_61_1;
                             float hidden_y_66_1 = gate_y_60_1 / denominator_y_64_1 * up_y_62_1;
                             hidden_packed_1[8] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_65_1, hidden_y_66_1)));
-                            float2 _cvt_f32_274 = __bfloat1622float2(__as_bf16x2(gate_packed_1[9]));
-                            float2 _cvt_f32_275 = __bfloat1622float2(__as_bf16x2(up_packed_1[9]));
+                            float2 _cvt_f32_274 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[9]));
+                            float2 _cvt_f32_275 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[9]));
                             float gate_x_67_1 = _cvt_f32_274.x;
                             float gate_y_68_1 = _cvt_f32_274.y;
                             float up_x_69_1 = _cvt_f32_275.x;
@@ -5817,8 +5823,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_73_1 = gate_x_67_1 / denominator_x_71_1 * up_x_69_1;
                             float hidden_y_74_1 = gate_y_68_1 / denominator_y_72_1 * up_y_70_1;
                             hidden_packed_1[9] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_73_1, hidden_y_74_1)));
-                            float2 _cvt_f32_276 = __bfloat1622float2(__as_bf16x2(gate_packed_1[10]));
-                            float2 _cvt_f32_277 = __bfloat1622float2(__as_bf16x2(up_packed_1[10]));
+                            float2 _cvt_f32_276 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[10]));
+                            float2 _cvt_f32_277 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[10]));
                             float gate_x_75_1 = _cvt_f32_276.x;
                             float gate_y_76_1 = _cvt_f32_276.y;
                             float up_x_77_1 = _cvt_f32_277.x;
@@ -5834,8 +5840,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_81_1 = gate_x_75_1 / denominator_x_79_1 * up_x_77_1;
                             float hidden_y_82_1 = gate_y_76_1 / denominator_y_80_1 * up_y_78_1;
                             hidden_packed_1[10] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_81_1, hidden_y_82_1)));
-                            float2 _cvt_f32_278 = __bfloat1622float2(__as_bf16x2(gate_packed_1[11]));
-                            float2 _cvt_f32_279 = __bfloat1622float2(__as_bf16x2(up_packed_1[11]));
+                            float2 _cvt_f32_278 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[11]));
+                            float2 _cvt_f32_279 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[11]));
                             float gate_x_83_1 = _cvt_f32_278.x;
                             float gate_y_84_1 = _cvt_f32_278.y;
                             float up_x_85_1 = _cvt_f32_279.x;
@@ -5851,8 +5857,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_89_1 = gate_x_83_1 / denominator_x_87_1 * up_x_85_1;
                             float hidden_y_90_1 = gate_y_84_1 / denominator_y_88_1 * up_y_86_1;
                             hidden_packed_1[11] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_89_1, hidden_y_90_1)));
-                            float2 _cvt_f32_280 = __bfloat1622float2(__as_bf16x2(gate_packed_1[12]));
-                            float2 _cvt_f32_281 = __bfloat1622float2(__as_bf16x2(up_packed_1[12]));
+                            float2 _cvt_f32_280 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[12]));
+                            float2 _cvt_f32_281 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[12]));
                             float gate_x_91_1 = _cvt_f32_280.x;
                             float gate_y_92_1 = _cvt_f32_280.y;
                             float up_x_93_1 = _cvt_f32_281.x;
@@ -5868,8 +5874,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_97_1 = gate_x_91_1 / denominator_x_95_1 * up_x_93_1;
                             float hidden_y_98_1 = gate_y_92_1 / denominator_y_96_1 * up_y_94_1;
                             hidden_packed_1[12] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_97_1, hidden_y_98_1)));
-                            float2 _cvt_f32_282 = __bfloat1622float2(__as_bf16x2(gate_packed_1[13]));
-                            float2 _cvt_f32_283 = __bfloat1622float2(__as_bf16x2(up_packed_1[13]));
+                            float2 _cvt_f32_282 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[13]));
+                            float2 _cvt_f32_283 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[13]));
                             float gate_x_99_1 = _cvt_f32_282.x;
                             float gate_y_100_1 = _cvt_f32_282.y;
                             float up_x_101_1 = _cvt_f32_283.x;
@@ -5885,8 +5891,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_105_1 = gate_x_99_1 / denominator_x_103_1 * up_x_101_1;
                             float hidden_y_106_1 = gate_y_100_1 / denominator_y_104_1 * up_y_102_1;
                             hidden_packed_1[13] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_105_1, hidden_y_106_1)));
-                            float2 _cvt_f32_284 = __bfloat1622float2(__as_bf16x2(gate_packed_1[14]));
-                            float2 _cvt_f32_285 = __bfloat1622float2(__as_bf16x2(up_packed_1[14]));
+                            float2 _cvt_f32_284 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[14]));
+                            float2 _cvt_f32_285 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[14]));
                             float gate_x_107_1 = _cvt_f32_284.x;
                             float gate_y_108_1 = _cvt_f32_284.y;
                             float up_x_109_1 = _cvt_f32_285.x;
@@ -5902,8 +5908,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_113_1 = gate_x_107_1 / denominator_x_111_1 * up_x_109_1;
                             float hidden_y_114_1 = gate_y_108_1 / denominator_y_112_1 * up_y_110_1;
                             hidden_packed_1[14] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_113_1, hidden_y_114_1)));
-                            float2 _cvt_f32_286 = __bfloat1622float2(__as_bf16x2(gate_packed_1[15]));
-                            float2 _cvt_f32_287 = __bfloat1622float2(__as_bf16x2(up_packed_1[15]));
+                            float2 _cvt_f32_286 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[15]));
+                            float2 _cvt_f32_287 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[15]));
                             float gate_x_115_1 = _cvt_f32_286.x;
                             float gate_y_116_1 = _cvt_f32_286.y;
                             float up_x_117_1 = _cvt_f32_287.x;
@@ -5919,8 +5925,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_121_1 = gate_x_115_1 / denominator_x_119_1 * up_x_117_1;
                             float hidden_y_122_1 = gate_y_116_1 / denominator_y_120_1 * up_y_118_1;
                             hidden_packed_1[15] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_121_1, hidden_y_122_1)));
-                            float2 _cvt_f32_288 = __bfloat1622float2(__as_bf16x2(gate_packed_1[16]));
-                            float2 _cvt_f32_289 = __bfloat1622float2(__as_bf16x2(up_packed_1[16]));
+                            float2 _cvt_f32_288 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[16]));
+                            float2 _cvt_f32_289 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[16]));
                             float gate_x_123_1 = _cvt_f32_288.x;
                             float gate_y_124_1 = _cvt_f32_288.y;
                             float up_x_125_1 = _cvt_f32_289.x;
@@ -5936,8 +5942,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_129_1 = gate_x_123_1 / denominator_x_127_1 * up_x_125_1;
                             float hidden_y_130_1 = gate_y_124_1 / denominator_y_128_1 * up_y_126_1;
                             hidden_packed_1[16] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_129_1, hidden_y_130_1)));
-                            float2 _cvt_f32_290 = __bfloat1622float2(__as_bf16x2(gate_packed_1[17]));
-                            float2 _cvt_f32_291 = __bfloat1622float2(__as_bf16x2(up_packed_1[17]));
+                            float2 _cvt_f32_290 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[17]));
+                            float2 _cvt_f32_291 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[17]));
                             float gate_x_131_1 = _cvt_f32_290.x;
                             float gate_y_132_1 = _cvt_f32_290.y;
                             float up_x_133_1 = _cvt_f32_291.x;
@@ -5953,8 +5959,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_137_1 = gate_x_131_1 / denominator_x_135_1 * up_x_133_1;
                             float hidden_y_138_1 = gate_y_132_1 / denominator_y_136_1 * up_y_134_1;
                             hidden_packed_1[17] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_137_1, hidden_y_138_1)));
-                            float2 _cvt_f32_292 = __bfloat1622float2(__as_bf16x2(gate_packed_1[18]));
-                            float2 _cvt_f32_293 = __bfloat1622float2(__as_bf16x2(up_packed_1[18]));
+                            float2 _cvt_f32_292 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[18]));
+                            float2 _cvt_f32_293 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[18]));
                             float gate_x_139_1 = _cvt_f32_292.x;
                             float gate_y_140_1 = _cvt_f32_292.y;
                             float up_x_141_1 = _cvt_f32_293.x;
@@ -5970,8 +5976,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_145_1 = gate_x_139_1 / denominator_x_143_1 * up_x_141_1;
                             float hidden_y_146_1 = gate_y_140_1 / denominator_y_144_1 * up_y_142_1;
                             hidden_packed_1[18] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_145_1, hidden_y_146_1)));
-                            float2 _cvt_f32_294 = __bfloat1622float2(__as_bf16x2(gate_packed_1[19]));
-                            float2 _cvt_f32_295 = __bfloat1622float2(__as_bf16x2(up_packed_1[19]));
+                            float2 _cvt_f32_294 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[19]));
+                            float2 _cvt_f32_295 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[19]));
                             float gate_x_147_1 = _cvt_f32_294.x;
                             float gate_y_148_1 = _cvt_f32_294.y;
                             float up_x_149_1 = _cvt_f32_295.x;
@@ -5987,8 +5993,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_153_1 = gate_x_147_1 / denominator_x_151_1 * up_x_149_1;
                             float hidden_y_154_1 = gate_y_148_1 / denominator_y_152_1 * up_y_150_1;
                             hidden_packed_1[19] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_153_1, hidden_y_154_1)));
-                            float2 _cvt_f32_296 = __bfloat1622float2(__as_bf16x2(gate_packed_1[20]));
-                            float2 _cvt_f32_297 = __bfloat1622float2(__as_bf16x2(up_packed_1[20]));
+                            float2 _cvt_f32_296 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[20]));
+                            float2 _cvt_f32_297 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[20]));
                             float gate_x_155_1 = _cvt_f32_296.x;
                             float gate_y_156_1 = _cvt_f32_296.y;
                             float up_x_157_1 = _cvt_f32_297.x;
@@ -6004,8 +6010,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_161_1 = gate_x_155_1 / denominator_x_159_1 * up_x_157_1;
                             float hidden_y_162_1 = gate_y_156_1 / denominator_y_160_1 * up_y_158_1;
                             hidden_packed_1[20] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_161_1, hidden_y_162_1)));
-                            float2 _cvt_f32_298 = __bfloat1622float2(__as_bf16x2(gate_packed_1[21]));
-                            float2 _cvt_f32_299 = __bfloat1622float2(__as_bf16x2(up_packed_1[21]));
+                            float2 _cvt_f32_298 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[21]));
+                            float2 _cvt_f32_299 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[21]));
                             float gate_x_163_1 = _cvt_f32_298.x;
                             float gate_y_164_1 = _cvt_f32_298.y;
                             float up_x_165_1 = _cvt_f32_299.x;
@@ -6021,8 +6027,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_169_1 = gate_x_163_1 / denominator_x_167_1 * up_x_165_1;
                             float hidden_y_170_1 = gate_y_164_1 / denominator_y_168_1 * up_y_166_1;
                             hidden_packed_1[21] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_169_1, hidden_y_170_1)));
-                            float2 _cvt_f32_300 = __bfloat1622float2(__as_bf16x2(gate_packed_1[22]));
-                            float2 _cvt_f32_301 = __bfloat1622float2(__as_bf16x2(up_packed_1[22]));
+                            float2 _cvt_f32_300 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[22]));
+                            float2 _cvt_f32_301 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[22]));
                             float gate_x_171_1 = _cvt_f32_300.x;
                             float gate_y_172_1 = _cvt_f32_300.y;
                             float up_x_173_1 = _cvt_f32_301.x;
@@ -6038,8 +6044,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_177_1 = gate_x_171_1 / denominator_x_175_1 * up_x_173_1;
                             float hidden_y_178_1 = gate_y_172_1 / denominator_y_176_1 * up_y_174_1;
                             hidden_packed_1[22] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_177_1, hidden_y_178_1)));
-                            float2 _cvt_f32_302 = __bfloat1622float2(__as_bf16x2(gate_packed_1[23]));
-                            float2 _cvt_f32_303 = __bfloat1622float2(__as_bf16x2(up_packed_1[23]));
+                            float2 _cvt_f32_302 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[23]));
+                            float2 _cvt_f32_303 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[23]));
                             float gate_x_179_1 = _cvt_f32_302.x;
                             float gate_y_180_1 = _cvt_f32_302.y;
                             float up_x_181_1 = _cvt_f32_303.x;
@@ -6055,8 +6061,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_185_1 = gate_x_179_1 / denominator_x_183_1 * up_x_181_1;
                             float hidden_y_186_1 = gate_y_180_1 / denominator_y_184_1 * up_y_182_1;
                             hidden_packed_1[23] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_185_1, hidden_y_186_1)));
-                            float2 _cvt_f32_304 = __bfloat1622float2(__as_bf16x2(gate_packed_1[24]));
-                            float2 _cvt_f32_305 = __bfloat1622float2(__as_bf16x2(up_packed_1[24]));
+                            float2 _cvt_f32_304 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[24]));
+                            float2 _cvt_f32_305 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[24]));
                             float gate_x_187_1 = _cvt_f32_304.x;
                             float gate_y_188_1 = _cvt_f32_304.y;
                             float up_x_189_1 = _cvt_f32_305.x;
@@ -6072,8 +6078,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_193_1 = gate_x_187_1 / denominator_x_191_1 * up_x_189_1;
                             float hidden_y_194_1 = gate_y_188_1 / denominator_y_192_1 * up_y_190_1;
                             hidden_packed_1[24] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_193_1, hidden_y_194_1)));
-                            float2 _cvt_f32_306 = __bfloat1622float2(__as_bf16x2(gate_packed_1[25]));
-                            float2 _cvt_f32_307 = __bfloat1622float2(__as_bf16x2(up_packed_1[25]));
+                            float2 _cvt_f32_306 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[25]));
+                            float2 _cvt_f32_307 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[25]));
                             float gate_x_195_1 = _cvt_f32_306.x;
                             float gate_y_196_1 = _cvt_f32_306.y;
                             float up_x_197_1 = _cvt_f32_307.x;
@@ -6089,8 +6095,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_201_1 = gate_x_195_1 / denominator_x_199_1 * up_x_197_1;
                             float hidden_y_202_1 = gate_y_196_1 / denominator_y_200_1 * up_y_198_1;
                             hidden_packed_1[25] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_201_1, hidden_y_202_1)));
-                            float2 _cvt_f32_308 = __bfloat1622float2(__as_bf16x2(gate_packed_1[26]));
-                            float2 _cvt_f32_309 = __bfloat1622float2(__as_bf16x2(up_packed_1[26]));
+                            float2 _cvt_f32_308 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[26]));
+                            float2 _cvt_f32_309 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[26]));
                             float gate_x_203_1 = _cvt_f32_308.x;
                             float gate_y_204_1 = _cvt_f32_308.y;
                             float up_x_205_1 = _cvt_f32_309.x;
@@ -6106,8 +6112,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_209_1 = gate_x_203_1 / denominator_x_207_1 * up_x_205_1;
                             float hidden_y_210_1 = gate_y_204_1 / denominator_y_208_1 * up_y_206_1;
                             hidden_packed_1[26] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_209_1, hidden_y_210_1)));
-                            float2 _cvt_f32_310 = __bfloat1622float2(__as_bf16x2(gate_packed_1[27]));
-                            float2 _cvt_f32_311 = __bfloat1622float2(__as_bf16x2(up_packed_1[27]));
+                            float2 _cvt_f32_310 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[27]));
+                            float2 _cvt_f32_311 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[27]));
                             float gate_x_211_1 = _cvt_f32_310.x;
                             float gate_y_212_1 = _cvt_f32_310.y;
                             float up_x_213_1 = _cvt_f32_311.x;
@@ -6123,8 +6129,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_217_1 = gate_x_211_1 / denominator_x_215_1 * up_x_213_1;
                             float hidden_y_218_1 = gate_y_212_1 / denominator_y_216_1 * up_y_214_1;
                             hidden_packed_1[27] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_217_1, hidden_y_218_1)));
-                            float2 _cvt_f32_312 = __bfloat1622float2(__as_bf16x2(gate_packed_1[28]));
-                            float2 _cvt_f32_313 = __bfloat1622float2(__as_bf16x2(up_packed_1[28]));
+                            float2 _cvt_f32_312 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[28]));
+                            float2 _cvt_f32_313 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[28]));
                             float gate_x_219_1 = _cvt_f32_312.x;
                             float gate_y_220_1 = _cvt_f32_312.y;
                             float up_x_221_1 = _cvt_f32_313.x;
@@ -6140,8 +6146,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_225_1 = gate_x_219_1 / denominator_x_223_1 * up_x_221_1;
                             float hidden_y_226_1 = gate_y_220_1 / denominator_y_224_1 * up_y_222_1;
                             hidden_packed_1[28] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_225_1, hidden_y_226_1)));
-                            float2 _cvt_f32_314 = __bfloat1622float2(__as_bf16x2(gate_packed_1[29]));
-                            float2 _cvt_f32_315 = __bfloat1622float2(__as_bf16x2(up_packed_1[29]));
+                            float2 _cvt_f32_314 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[29]));
+                            float2 _cvt_f32_315 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[29]));
                             float gate_x_227_1 = _cvt_f32_314.x;
                             float gate_y_228_1 = _cvt_f32_314.y;
                             float up_x_229_1 = _cvt_f32_315.x;
@@ -6157,8 +6163,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_233_1 = gate_x_227_1 / denominator_x_231_1 * up_x_229_1;
                             float hidden_y_234_1 = gate_y_228_1 / denominator_y_232_1 * up_y_230_1;
                             hidden_packed_1[29] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_233_1, hidden_y_234_1)));
-                            float2 _cvt_f32_316 = __bfloat1622float2(__as_bf16x2(gate_packed_1[30]));
-                            float2 _cvt_f32_317 = __bfloat1622float2(__as_bf16x2(up_packed_1[30]));
+                            float2 _cvt_f32_316 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[30]));
+                            float2 _cvt_f32_317 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[30]));
                             float gate_x_235_1 = _cvt_f32_316.x;
                             float gate_y_236_1 = _cvt_f32_316.y;
                             float up_x_237_1 = _cvt_f32_317.x;
@@ -6174,8 +6180,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_241_1 = gate_x_235_1 / denominator_x_239_1 * up_x_237_1;
                             float hidden_y_242_1 = gate_y_236_1 / denominator_y_240_1 * up_y_238_1;
                             hidden_packed_1[30] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_241_1, hidden_y_242_1)));
-                            float2 _cvt_f32_318 = __bfloat1622float2(__as_bf16x2(gate_packed_1[31]));
-                            float2 _cvt_f32_319 = __bfloat1622float2(__as_bf16x2(up_packed_1[31]));
+                            float2 _cvt_f32_318 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_1[31]));
+                            float2 _cvt_f32_319 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_1[31]));
                             float gate_x_243_1 = _cvt_f32_318.x;
                             float gate_y_244_1 = _cvt_f32_318.y;
                             float up_x_245_1 = _cvt_f32_319.x;
@@ -6491,8 +6497,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             gate_packed_262_1[31] = __as_u32(__float22bfloat162_rn(make_float2(_tmem_load_48[14], _tmem_load_48[15])));
                             up_packed_263_1[31] = __as_u32(__float22bfloat162_rn(make_float2(_tmem_load_49[14], _tmem_load_49[15])));
                             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
-                            float2 _cvt_f32_320 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[0]));
-                            float2 _cvt_f32_321 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[0]));
+                            float2 _cvt_f32_320 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[0]));
+                            float2 _cvt_f32_321 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[0]));
                             float gate_x_269_1 = _cvt_f32_320.x;
                             float gate_y_270_1 = _cvt_f32_320.y;
                             float up_x_271_1 = _cvt_f32_321.x;
@@ -6508,8 +6514,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_275_1 = gate_x_269_1 / denominator_x_273_1 * up_x_271_1;
                             float hidden_y_276_1 = gate_y_270_1 / denominator_y_274_1 * up_y_272_1;
                             hidden_packed_264_1[0] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_275_1, hidden_y_276_1)));
-                            float2 _cvt_f32_322 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[1]));
-                            float2 _cvt_f32_323 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[1]));
+                            float2 _cvt_f32_322 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[1]));
+                            float2 _cvt_f32_323 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[1]));
                             float gate_x_277_1 = _cvt_f32_322.x;
                             float gate_y_278_1 = _cvt_f32_322.y;
                             float up_x_279_1 = _cvt_f32_323.x;
@@ -6525,8 +6531,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_283_1 = gate_x_277_1 / denominator_x_281_1 * up_x_279_1;
                             float hidden_y_284_1 = gate_y_278_1 / denominator_y_282_1 * up_y_280_1;
                             hidden_packed_264_1[1] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_283_1, hidden_y_284_1)));
-                            float2 _cvt_f32_324 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[2]));
-                            float2 _cvt_f32_325 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[2]));
+                            float2 _cvt_f32_324 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[2]));
+                            float2 _cvt_f32_325 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[2]));
                             float gate_x_285_1 = _cvt_f32_324.x;
                             float gate_y_286_1 = _cvt_f32_324.y;
                             float up_x_287_1 = _cvt_f32_325.x;
@@ -6542,8 +6548,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_291_1 = gate_x_285_1 / denominator_x_289_1 * up_x_287_1;
                             float hidden_y_292_1 = gate_y_286_1 / denominator_y_290_1 * up_y_288_1;
                             hidden_packed_264_1[2] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_291_1, hidden_y_292_1)));
-                            float2 _cvt_f32_326 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[3]));
-                            float2 _cvt_f32_327 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[3]));
+                            float2 _cvt_f32_326 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[3]));
+                            float2 _cvt_f32_327 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[3]));
                             float gate_x_293_1 = _cvt_f32_326.x;
                             float gate_y_294_1 = _cvt_f32_326.y;
                             float up_x_295_1 = _cvt_f32_327.x;
@@ -6559,8 +6565,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_299_1 = gate_x_293_1 / denominator_x_297_1 * up_x_295_1;
                             float hidden_y_300_1 = gate_y_294_1 / denominator_y_298_1 * up_y_296_1;
                             hidden_packed_264_1[3] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_299_1, hidden_y_300_1)));
-                            float2 _cvt_f32_328 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[4]));
-                            float2 _cvt_f32_329 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[4]));
+                            float2 _cvt_f32_328 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[4]));
+                            float2 _cvt_f32_329 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[4]));
                             float gate_x_301_1 = _cvt_f32_328.x;
                             float gate_y_302_1 = _cvt_f32_328.y;
                             float up_x_303_1 = _cvt_f32_329.x;
@@ -6576,8 +6582,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_307_1 = gate_x_301_1 / denominator_x_305_1 * up_x_303_1;
                             float hidden_y_308_1 = gate_y_302_1 / denominator_y_306_1 * up_y_304_1;
                             hidden_packed_264_1[4] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_307_1, hidden_y_308_1)));
-                            float2 _cvt_f32_330 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[5]));
-                            float2 _cvt_f32_331 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[5]));
+                            float2 _cvt_f32_330 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[5]));
+                            float2 _cvt_f32_331 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[5]));
                             float gate_x_309_1 = _cvt_f32_330.x;
                             float gate_y_310_1 = _cvt_f32_330.y;
                             float up_x_311_1 = _cvt_f32_331.x;
@@ -6593,8 +6599,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_315_1 = gate_x_309_1 / denominator_x_313_1 * up_x_311_1;
                             float hidden_y_316_1 = gate_y_310_1 / denominator_y_314_1 * up_y_312_1;
                             hidden_packed_264_1[5] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_315_1, hidden_y_316_1)));
-                            float2 _cvt_f32_332 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[6]));
-                            float2 _cvt_f32_333 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[6]));
+                            float2 _cvt_f32_332 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[6]));
+                            float2 _cvt_f32_333 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[6]));
                             float gate_x_317_1 = _cvt_f32_332.x;
                             float gate_y_318_1 = _cvt_f32_332.y;
                             float up_x_319_1 = _cvt_f32_333.x;
@@ -6610,8 +6616,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_323_1 = gate_x_317_1 / denominator_x_321_1 * up_x_319_1;
                             float hidden_y_324_1 = gate_y_318_1 / denominator_y_322_1 * up_y_320_1;
                             hidden_packed_264_1[6] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_323_1, hidden_y_324_1)));
-                            float2 _cvt_f32_334 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[7]));
-                            float2 _cvt_f32_335 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[7]));
+                            float2 _cvt_f32_334 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[7]));
+                            float2 _cvt_f32_335 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[7]));
                             float gate_x_325_1 = _cvt_f32_334.x;
                             float gate_y_326_1 = _cvt_f32_334.y;
                             float up_x_327_1 = _cvt_f32_335.x;
@@ -6627,8 +6633,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_331_1 = gate_x_325_1 / denominator_x_329_1 * up_x_327_1;
                             float hidden_y_332_1 = gate_y_326_1 / denominator_y_330_1 * up_y_328_1;
                             hidden_packed_264_1[7] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_331_1, hidden_y_332_1)));
-                            float2 _cvt_f32_336 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[8]));
-                            float2 _cvt_f32_337 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[8]));
+                            float2 _cvt_f32_336 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[8]));
+                            float2 _cvt_f32_337 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[8]));
                             float gate_x_333_1 = _cvt_f32_336.x;
                             float gate_y_334_1 = _cvt_f32_336.y;
                             float up_x_335_1 = _cvt_f32_337.x;
@@ -6644,8 +6650,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_339_1 = gate_x_333_1 / denominator_x_337_1 * up_x_335_1;
                             float hidden_y_340_1 = gate_y_334_1 / denominator_y_338_1 * up_y_336_1;
                             hidden_packed_264_1[8] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_339_1, hidden_y_340_1)));
-                            float2 _cvt_f32_338 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[9]));
-                            float2 _cvt_f32_339 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[9]));
+                            float2 _cvt_f32_338 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[9]));
+                            float2 _cvt_f32_339 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[9]));
                             float gate_x_341_1 = _cvt_f32_338.x;
                             float gate_y_342_1 = _cvt_f32_338.y;
                             float up_x_343_1 = _cvt_f32_339.x;
@@ -6661,8 +6667,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_347_1 = gate_x_341_1 / denominator_x_345_1 * up_x_343_1;
                             float hidden_y_348_1 = gate_y_342_1 / denominator_y_346_1 * up_y_344_1;
                             hidden_packed_264_1[9] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_347_1, hidden_y_348_1)));
-                            float2 _cvt_f32_340 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[10]));
-                            float2 _cvt_f32_341 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[10]));
+                            float2 _cvt_f32_340 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[10]));
+                            float2 _cvt_f32_341 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[10]));
                             float gate_x_349_1 = _cvt_f32_340.x;
                             float gate_y_350_1 = _cvt_f32_340.y;
                             float up_x_351_1 = _cvt_f32_341.x;
@@ -6678,8 +6684,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_355_1 = gate_x_349_1 / denominator_x_353_1 * up_x_351_1;
                             float hidden_y_356_1 = gate_y_350_1 / denominator_y_354_1 * up_y_352_1;
                             hidden_packed_264_1[10] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_355_1, hidden_y_356_1)));
-                            float2 _cvt_f32_342 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[11]));
-                            float2 _cvt_f32_343 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[11]));
+                            float2 _cvt_f32_342 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[11]));
+                            float2 _cvt_f32_343 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[11]));
                             float gate_x_357_1 = _cvt_f32_342.x;
                             float gate_y_358_1 = _cvt_f32_342.y;
                             float up_x_359_1 = _cvt_f32_343.x;
@@ -6695,8 +6701,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_363_1 = gate_x_357_1 / denominator_x_361_1 * up_x_359_1;
                             float hidden_y_364_1 = gate_y_358_1 / denominator_y_362_1 * up_y_360_1;
                             hidden_packed_264_1[11] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_363_1, hidden_y_364_1)));
-                            float2 _cvt_f32_344 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[12]));
-                            float2 _cvt_f32_345 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[12]));
+                            float2 _cvt_f32_344 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[12]));
+                            float2 _cvt_f32_345 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[12]));
                             float gate_x_365_1 = _cvt_f32_344.x;
                             float gate_y_366_1 = _cvt_f32_344.y;
                             float up_x_367_1 = _cvt_f32_345.x;
@@ -6712,8 +6718,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_371_1 = gate_x_365_1 / denominator_x_369_1 * up_x_367_1;
                             float hidden_y_372_1 = gate_y_366_1 / denominator_y_370_1 * up_y_368_1;
                             hidden_packed_264_1[12] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_371_1, hidden_y_372_1)));
-                            float2 _cvt_f32_346 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[13]));
-                            float2 _cvt_f32_347 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[13]));
+                            float2 _cvt_f32_346 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[13]));
+                            float2 _cvt_f32_347 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[13]));
                             float gate_x_373_1 = _cvt_f32_346.x;
                             float gate_y_374_1 = _cvt_f32_346.y;
                             float up_x_375_1 = _cvt_f32_347.x;
@@ -6729,8 +6735,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_379_1 = gate_x_373_1 / denominator_x_377_1 * up_x_375_1;
                             float hidden_y_380_1 = gate_y_374_1 / denominator_y_378_1 * up_y_376_1;
                             hidden_packed_264_1[13] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_379_1, hidden_y_380_1)));
-                            float2 _cvt_f32_348 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[14]));
-                            float2 _cvt_f32_349 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[14]));
+                            float2 _cvt_f32_348 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[14]));
+                            float2 _cvt_f32_349 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[14]));
                             float gate_x_381_1 = _cvt_f32_348.x;
                             float gate_y_382_1 = _cvt_f32_348.y;
                             float up_x_383_1 = _cvt_f32_349.x;
@@ -6746,8 +6752,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_387_1 = gate_x_381_1 / denominator_x_385_1 * up_x_383_1;
                             float hidden_y_388_1 = gate_y_382_1 / denominator_y_386_1 * up_y_384_1;
                             hidden_packed_264_1[14] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_387_1, hidden_y_388_1)));
-                            float2 _cvt_f32_350 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[15]));
-                            float2 _cvt_f32_351 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[15]));
+                            float2 _cvt_f32_350 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[15]));
+                            float2 _cvt_f32_351 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[15]));
                             float gate_x_389_1 = _cvt_f32_350.x;
                             float gate_y_390_1 = _cvt_f32_350.y;
                             float up_x_391_1 = _cvt_f32_351.x;
@@ -6763,8 +6769,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_395_1 = gate_x_389_1 / denominator_x_393_1 * up_x_391_1;
                             float hidden_y_396_1 = gate_y_390_1 / denominator_y_394_1 * up_y_392_1;
                             hidden_packed_264_1[15] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_395_1, hidden_y_396_1)));
-                            float2 _cvt_f32_352 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[16]));
-                            float2 _cvt_f32_353 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[16]));
+                            float2 _cvt_f32_352 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[16]));
+                            float2 _cvt_f32_353 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[16]));
                             float gate_x_397_1 = _cvt_f32_352.x;
                             float gate_y_398_1 = _cvt_f32_352.y;
                             float up_x_399_1 = _cvt_f32_353.x;
@@ -6780,8 +6786,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_403_1 = gate_x_397_1 / denominator_x_401_1 * up_x_399_1;
                             float hidden_y_404_1 = gate_y_398_1 / denominator_y_402_1 * up_y_400_1;
                             hidden_packed_264_1[16] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_403_1, hidden_y_404_1)));
-                            float2 _cvt_f32_354 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[17]));
-                            float2 _cvt_f32_355 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[17]));
+                            float2 _cvt_f32_354 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[17]));
+                            float2 _cvt_f32_355 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[17]));
                             float gate_x_405_1 = _cvt_f32_354.x;
                             float gate_y_406_1 = _cvt_f32_354.y;
                             float up_x_407_1 = _cvt_f32_355.x;
@@ -6797,8 +6803,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_411_1 = gate_x_405_1 / denominator_x_409_1 * up_x_407_1;
                             float hidden_y_412_1 = gate_y_406_1 / denominator_y_410_1 * up_y_408_1;
                             hidden_packed_264_1[17] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_411_1, hidden_y_412_1)));
-                            float2 _cvt_f32_356 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[18]));
-                            float2 _cvt_f32_357 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[18]));
+                            float2 _cvt_f32_356 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[18]));
+                            float2 _cvt_f32_357 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[18]));
                             float gate_x_413_1 = _cvt_f32_356.x;
                             float gate_y_414_1 = _cvt_f32_356.y;
                             float up_x_415_1 = _cvt_f32_357.x;
@@ -6814,8 +6820,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_419_1 = gate_x_413_1 / denominator_x_417_1 * up_x_415_1;
                             float hidden_y_420_1 = gate_y_414_1 / denominator_y_418_1 * up_y_416_1;
                             hidden_packed_264_1[18] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_419_1, hidden_y_420_1)));
-                            float2 _cvt_f32_358 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[19]));
-                            float2 _cvt_f32_359 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[19]));
+                            float2 _cvt_f32_358 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[19]));
+                            float2 _cvt_f32_359 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[19]));
                             float gate_x_421_1 = _cvt_f32_358.x;
                             float gate_y_422_1 = _cvt_f32_358.y;
                             float up_x_423_1 = _cvt_f32_359.x;
@@ -6831,8 +6837,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_427_1 = gate_x_421_1 / denominator_x_425_1 * up_x_423_1;
                             float hidden_y_428_1 = gate_y_422_1 / denominator_y_426_1 * up_y_424_1;
                             hidden_packed_264_1[19] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_427_1, hidden_y_428_1)));
-                            float2 _cvt_f32_360 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[20]));
-                            float2 _cvt_f32_361 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[20]));
+                            float2 _cvt_f32_360 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[20]));
+                            float2 _cvt_f32_361 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[20]));
                             float gate_x_429_1 = _cvt_f32_360.x;
                             float gate_y_430_1 = _cvt_f32_360.y;
                             float up_x_431_1 = _cvt_f32_361.x;
@@ -6848,8 +6854,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_435_1 = gate_x_429_1 / denominator_x_433_1 * up_x_431_1;
                             float hidden_y_436_1 = gate_y_430_1 / denominator_y_434_1 * up_y_432_1;
                             hidden_packed_264_1[20] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_435_1, hidden_y_436_1)));
-                            float2 _cvt_f32_362 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[21]));
-                            float2 _cvt_f32_363 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[21]));
+                            float2 _cvt_f32_362 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[21]));
+                            float2 _cvt_f32_363 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[21]));
                             float gate_x_437_1 = _cvt_f32_362.x;
                             float gate_y_438_1 = _cvt_f32_362.y;
                             float up_x_439_1 = _cvt_f32_363.x;
@@ -6865,8 +6871,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_443_1 = gate_x_437_1 / denominator_x_441_1 * up_x_439_1;
                             float hidden_y_444_1 = gate_y_438_1 / denominator_y_442_1 * up_y_440_1;
                             hidden_packed_264_1[21] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_443_1, hidden_y_444_1)));
-                            float2 _cvt_f32_364 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[22]));
-                            float2 _cvt_f32_365 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[22]));
+                            float2 _cvt_f32_364 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[22]));
+                            float2 _cvt_f32_365 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[22]));
                             float gate_x_445_1 = _cvt_f32_364.x;
                             float gate_y_446_1 = _cvt_f32_364.y;
                             float up_x_447_1 = _cvt_f32_365.x;
@@ -6882,8 +6888,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_451_1 = gate_x_445_1 / denominator_x_449_1 * up_x_447_1;
                             float hidden_y_452_1 = gate_y_446_1 / denominator_y_450_1 * up_y_448_1;
                             hidden_packed_264_1[22] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_451_1, hidden_y_452_1)));
-                            float2 _cvt_f32_366 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[23]));
-                            float2 _cvt_f32_367 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[23]));
+                            float2 _cvt_f32_366 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[23]));
+                            float2 _cvt_f32_367 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[23]));
                             float gate_x_453_1 = _cvt_f32_366.x;
                             float gate_y_454_1 = _cvt_f32_366.y;
                             float up_x_455_1 = _cvt_f32_367.x;
@@ -6899,8 +6905,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_459_1 = gate_x_453_1 / denominator_x_457_1 * up_x_455_1;
                             float hidden_y_460_1 = gate_y_454_1 / denominator_y_458_1 * up_y_456_1;
                             hidden_packed_264_1[23] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_459_1, hidden_y_460_1)));
-                            float2 _cvt_f32_368 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[24]));
-                            float2 _cvt_f32_369 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[24]));
+                            float2 _cvt_f32_368 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[24]));
+                            float2 _cvt_f32_369 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[24]));
                             float gate_x_461_1 = _cvt_f32_368.x;
                             float gate_y_462_1 = _cvt_f32_368.y;
                             float up_x_463_1 = _cvt_f32_369.x;
@@ -6916,8 +6922,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_467_1 = gate_x_461_1 / denominator_x_465_1 * up_x_463_1;
                             float hidden_y_468_1 = gate_y_462_1 / denominator_y_466_1 * up_y_464_1;
                             hidden_packed_264_1[24] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_467_1, hidden_y_468_1)));
-                            float2 _cvt_f32_370 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[25]));
-                            float2 _cvt_f32_371 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[25]));
+                            float2 _cvt_f32_370 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[25]));
+                            float2 _cvt_f32_371 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[25]));
                             float gate_x_469_1 = _cvt_f32_370.x;
                             float gate_y_470_1 = _cvt_f32_370.y;
                             float up_x_471_1 = _cvt_f32_371.x;
@@ -6933,8 +6939,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_475_1 = gate_x_469_1 / denominator_x_473_1 * up_x_471_1;
                             float hidden_y_476_1 = gate_y_470_1 / denominator_y_474_1 * up_y_472_1;
                             hidden_packed_264_1[25] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_475_1, hidden_y_476_1)));
-                            float2 _cvt_f32_372 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[26]));
-                            float2 _cvt_f32_373 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[26]));
+                            float2 _cvt_f32_372 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[26]));
+                            float2 _cvt_f32_373 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[26]));
                             float gate_x_477_1 = _cvt_f32_372.x;
                             float gate_y_478_1 = _cvt_f32_372.y;
                             float up_x_479_1 = _cvt_f32_373.x;
@@ -6950,8 +6956,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_483_1 = gate_x_477_1 / denominator_x_481_1 * up_x_479_1;
                             float hidden_y_484_1 = gate_y_478_1 / denominator_y_482_1 * up_y_480_1;
                             hidden_packed_264_1[26] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_483_1, hidden_y_484_1)));
-                            float2 _cvt_f32_374 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[27]));
-                            float2 _cvt_f32_375 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[27]));
+                            float2 _cvt_f32_374 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[27]));
+                            float2 _cvt_f32_375 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[27]));
                             float gate_x_485_1 = _cvt_f32_374.x;
                             float gate_y_486_1 = _cvt_f32_374.y;
                             float up_x_487_1 = _cvt_f32_375.x;
@@ -6967,8 +6973,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_491_1 = gate_x_485_1 / denominator_x_489_1 * up_x_487_1;
                             float hidden_y_492_1 = gate_y_486_1 / denominator_y_490_1 * up_y_488_1;
                             hidden_packed_264_1[27] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_491_1, hidden_y_492_1)));
-                            float2 _cvt_f32_376 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[28]));
-                            float2 _cvt_f32_377 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[28]));
+                            float2 _cvt_f32_376 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[28]));
+                            float2 _cvt_f32_377 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[28]));
                             float gate_x_493_1 = _cvt_f32_376.x;
                             float gate_y_494_1 = _cvt_f32_376.y;
                             float up_x_495_1 = _cvt_f32_377.x;
@@ -6984,8 +6990,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_499_1 = gate_x_493_1 / denominator_x_497_1 * up_x_495_1;
                             float hidden_y_500_1 = gate_y_494_1 / denominator_y_498_1 * up_y_496_1;
                             hidden_packed_264_1[28] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_499_1, hidden_y_500_1)));
-                            float2 _cvt_f32_378 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[29]));
-                            float2 _cvt_f32_379 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[29]));
+                            float2 _cvt_f32_378 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[29]));
+                            float2 _cvt_f32_379 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[29]));
                             float gate_x_501_1 = _cvt_f32_378.x;
                             float gate_y_502_1 = _cvt_f32_378.y;
                             float up_x_503_1 = _cvt_f32_379.x;
@@ -7001,8 +7007,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_507_1 = gate_x_501_1 / denominator_x_505_1 * up_x_503_1;
                             float hidden_y_508_1 = gate_y_502_1 / denominator_y_506_1 * up_y_504_1;
                             hidden_packed_264_1[29] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_507_1, hidden_y_508_1)));
-                            float2 _cvt_f32_380 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[30]));
-                            float2 _cvt_f32_381 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[30]));
+                            float2 _cvt_f32_380 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[30]));
+                            float2 _cvt_f32_381 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[30]));
                             float gate_x_509_1 = _cvt_f32_380.x;
                             float gate_y_510_1 = _cvt_f32_380.y;
                             float up_x_511_1 = _cvt_f32_381.x;
@@ -7018,8 +7024,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_515_1 = gate_x_509_1 / denominator_x_513_1 * up_x_511_1;
                             float hidden_y_516_1 = gate_y_510_1 / denominator_y_514_1 * up_y_512_1;
                             hidden_packed_264_1[30] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_515_1, hidden_y_516_1)));
-                            float2 _cvt_f32_382 = __bfloat1622float2(__as_bf16x2(gate_packed_262_1[31]));
-                            float2 _cvt_f32_383 = __bfloat1622float2(__as_bf16x2(up_packed_263_1[31]));
+                            float2 _cvt_f32_382 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_262_1[31]));
+                            float2 _cvt_f32_383 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_263_1[31]));
                             float gate_x_517_1 = _cvt_f32_382.x;
                             float gate_y_518_1 = _cvt_f32_382.y;
                             float up_x_519_1 = _cvt_f32_383.x;
@@ -7335,8 +7341,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             gate_packed_537_1[31] = __as_u32(__float22bfloat162_rn(make_float2(_tmem_load_56[14], _tmem_load_56[15])));
                             up_packed_538_1[31] = __as_u32(__float22bfloat162_rn(make_float2(_tmem_load_57[14], _tmem_load_57[15])));
                             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
-                            float2 _cvt_f32_384 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[0]));
-                            float2 _cvt_f32_385 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[0]));
+                            float2 _cvt_f32_384 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[0]));
+                            float2 _cvt_f32_385 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[0]));
                             float gate_x_544_1 = _cvt_f32_384.x;
                             float gate_y_545_1 = _cvt_f32_384.y;
                             float up_x_546_1 = _cvt_f32_385.x;
@@ -7352,8 +7358,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_550_1 = gate_x_544_1 / denominator_x_548_1 * up_x_546_1;
                             float hidden_y_551_1 = gate_y_545_1 / denominator_y_549_1 * up_y_547_1;
                             hidden_packed_539_1[0] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_550_1, hidden_y_551_1)));
-                            float2 _cvt_f32_386 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[1]));
-                            float2 _cvt_f32_387 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[1]));
+                            float2 _cvt_f32_386 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[1]));
+                            float2 _cvt_f32_387 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[1]));
                             float gate_x_552_1 = _cvt_f32_386.x;
                             float gate_y_553_1 = _cvt_f32_386.y;
                             float up_x_554_1 = _cvt_f32_387.x;
@@ -7369,8 +7375,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_558_1 = gate_x_552_1 / denominator_x_556_1 * up_x_554_1;
                             float hidden_y_559_1 = gate_y_553_1 / denominator_y_557_1 * up_y_555_1;
                             hidden_packed_539_1[1] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_558_1, hidden_y_559_1)));
-                            float2 _cvt_f32_388 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[2]));
-                            float2 _cvt_f32_389 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[2]));
+                            float2 _cvt_f32_388 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[2]));
+                            float2 _cvt_f32_389 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[2]));
                             float gate_x_560_1 = _cvt_f32_388.x;
                             float gate_y_561_1 = _cvt_f32_388.y;
                             float up_x_562_1 = _cvt_f32_389.x;
@@ -7386,8 +7392,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_566_1 = gate_x_560_1 / denominator_x_564_1 * up_x_562_1;
                             float hidden_y_567_1 = gate_y_561_1 / denominator_y_565_1 * up_y_563_1;
                             hidden_packed_539_1[2] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_566_1, hidden_y_567_1)));
-                            float2 _cvt_f32_390 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[3]));
-                            float2 _cvt_f32_391 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[3]));
+                            float2 _cvt_f32_390 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[3]));
+                            float2 _cvt_f32_391 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[3]));
                             float gate_x_568_1 = _cvt_f32_390.x;
                             float gate_y_569_1 = _cvt_f32_390.y;
                             float up_x_570_1 = _cvt_f32_391.x;
@@ -7403,8 +7409,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_574_1 = gate_x_568_1 / denominator_x_572_1 * up_x_570_1;
                             float hidden_y_575_1 = gate_y_569_1 / denominator_y_573_1 * up_y_571_1;
                             hidden_packed_539_1[3] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_574_1, hidden_y_575_1)));
-                            float2 _cvt_f32_392 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[4]));
-                            float2 _cvt_f32_393 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[4]));
+                            float2 _cvt_f32_392 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[4]));
+                            float2 _cvt_f32_393 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[4]));
                             float gate_x_576_1 = _cvt_f32_392.x;
                             float gate_y_577_1 = _cvt_f32_392.y;
                             float up_x_578_1 = _cvt_f32_393.x;
@@ -7420,8 +7426,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_582_1 = gate_x_576_1 / denominator_x_580_1 * up_x_578_1;
                             float hidden_y_583_1 = gate_y_577_1 / denominator_y_581_1 * up_y_579_1;
                             hidden_packed_539_1[4] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_582_1, hidden_y_583_1)));
-                            float2 _cvt_f32_394 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[5]));
-                            float2 _cvt_f32_395 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[5]));
+                            float2 _cvt_f32_394 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[5]));
+                            float2 _cvt_f32_395 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[5]));
                             float gate_x_584_1 = _cvt_f32_394.x;
                             float gate_y_585_1 = _cvt_f32_394.y;
                             float up_x_586_1 = _cvt_f32_395.x;
@@ -7437,8 +7443,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_590_1 = gate_x_584_1 / denominator_x_588_1 * up_x_586_1;
                             float hidden_y_591_1 = gate_y_585_1 / denominator_y_589_1 * up_y_587_1;
                             hidden_packed_539_1[5] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_590_1, hidden_y_591_1)));
-                            float2 _cvt_f32_396 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[6]));
-                            float2 _cvt_f32_397 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[6]));
+                            float2 _cvt_f32_396 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[6]));
+                            float2 _cvt_f32_397 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[6]));
                             float gate_x_592_1 = _cvt_f32_396.x;
                             float gate_y_593_1 = _cvt_f32_396.y;
                             float up_x_594_1 = _cvt_f32_397.x;
@@ -7454,8 +7460,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_598_1 = gate_x_592_1 / denominator_x_596_1 * up_x_594_1;
                             float hidden_y_599_1 = gate_y_593_1 / denominator_y_597_1 * up_y_595_1;
                             hidden_packed_539_1[6] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_598_1, hidden_y_599_1)));
-                            float2 _cvt_f32_398 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[7]));
-                            float2 _cvt_f32_399 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[7]));
+                            float2 _cvt_f32_398 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[7]));
+                            float2 _cvt_f32_399 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[7]));
                             float gate_x_600_1 = _cvt_f32_398.x;
                             float gate_y_601_1 = _cvt_f32_398.y;
                             float up_x_602_1 = _cvt_f32_399.x;
@@ -7471,8 +7477,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_606_1 = gate_x_600_1 / denominator_x_604_1 * up_x_602_1;
                             float hidden_y_607_1 = gate_y_601_1 / denominator_y_605_1 * up_y_603_1;
                             hidden_packed_539_1[7] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_606_1, hidden_y_607_1)));
-                            float2 _cvt_f32_400 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[8]));
-                            float2 _cvt_f32_401 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[8]));
+                            float2 _cvt_f32_400 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[8]));
+                            float2 _cvt_f32_401 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[8]));
                             float gate_x_608_1 = _cvt_f32_400.x;
                             float gate_y_609_1 = _cvt_f32_400.y;
                             float up_x_610_1 = _cvt_f32_401.x;
@@ -7488,8 +7494,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_614_1 = gate_x_608_1 / denominator_x_612_1 * up_x_610_1;
                             float hidden_y_615_1 = gate_y_609_1 / denominator_y_613_1 * up_y_611_1;
                             hidden_packed_539_1[8] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_614_1, hidden_y_615_1)));
-                            float2 _cvt_f32_402 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[9]));
-                            float2 _cvt_f32_403 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[9]));
+                            float2 _cvt_f32_402 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[9]));
+                            float2 _cvt_f32_403 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[9]));
                             float gate_x_616_1 = _cvt_f32_402.x;
                             float gate_y_617_1 = _cvt_f32_402.y;
                             float up_x_618_1 = _cvt_f32_403.x;
@@ -7505,8 +7511,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_622_1 = gate_x_616_1 / denominator_x_620_1 * up_x_618_1;
                             float hidden_y_623_1 = gate_y_617_1 / denominator_y_621_1 * up_y_619_1;
                             hidden_packed_539_1[9] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_622_1, hidden_y_623_1)));
-                            float2 _cvt_f32_404 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[10]));
-                            float2 _cvt_f32_405 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[10]));
+                            float2 _cvt_f32_404 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[10]));
+                            float2 _cvt_f32_405 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[10]));
                             float gate_x_624_1 = _cvt_f32_404.x;
                             float gate_y_625_1 = _cvt_f32_404.y;
                             float up_x_626_1 = _cvt_f32_405.x;
@@ -7522,8 +7528,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_630_1 = gate_x_624_1 / denominator_x_628_1 * up_x_626_1;
                             float hidden_y_631_1 = gate_y_625_1 / denominator_y_629_1 * up_y_627_1;
                             hidden_packed_539_1[10] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_630_1, hidden_y_631_1)));
-                            float2 _cvt_f32_406 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[11]));
-                            float2 _cvt_f32_407 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[11]));
+                            float2 _cvt_f32_406 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[11]));
+                            float2 _cvt_f32_407 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[11]));
                             float gate_x_632_1 = _cvt_f32_406.x;
                             float gate_y_633_1 = _cvt_f32_406.y;
                             float up_x_634_1 = _cvt_f32_407.x;
@@ -7539,8 +7545,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_638_1 = gate_x_632_1 / denominator_x_636_1 * up_x_634_1;
                             float hidden_y_639_1 = gate_y_633_1 / denominator_y_637_1 * up_y_635_1;
                             hidden_packed_539_1[11] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_638_1, hidden_y_639_1)));
-                            float2 _cvt_f32_408 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[12]));
-                            float2 _cvt_f32_409 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[12]));
+                            float2 _cvt_f32_408 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[12]));
+                            float2 _cvt_f32_409 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[12]));
                             float gate_x_640_1 = _cvt_f32_408.x;
                             float gate_y_641_1 = _cvt_f32_408.y;
                             float up_x_642_1 = _cvt_f32_409.x;
@@ -7556,8 +7562,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_646_1 = gate_x_640_1 / denominator_x_644_1 * up_x_642_1;
                             float hidden_y_647_1 = gate_y_641_1 / denominator_y_645_1 * up_y_643_1;
                             hidden_packed_539_1[12] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_646_1, hidden_y_647_1)));
-                            float2 _cvt_f32_410 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[13]));
-                            float2 _cvt_f32_411 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[13]));
+                            float2 _cvt_f32_410 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[13]));
+                            float2 _cvt_f32_411 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[13]));
                             float gate_x_648_1 = _cvt_f32_410.x;
                             float gate_y_649_1 = _cvt_f32_410.y;
                             float up_x_650_1 = _cvt_f32_411.x;
@@ -7573,8 +7579,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_654_1 = gate_x_648_1 / denominator_x_652_1 * up_x_650_1;
                             float hidden_y_655_1 = gate_y_649_1 / denominator_y_653_1 * up_y_651_1;
                             hidden_packed_539_1[13] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_654_1, hidden_y_655_1)));
-                            float2 _cvt_f32_412 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[14]));
-                            float2 _cvt_f32_413 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[14]));
+                            float2 _cvt_f32_412 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[14]));
+                            float2 _cvt_f32_413 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[14]));
                             float gate_x_656_1 = _cvt_f32_412.x;
                             float gate_y_657_1 = _cvt_f32_412.y;
                             float up_x_658_1 = _cvt_f32_413.x;
@@ -7590,8 +7596,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_662_1 = gate_x_656_1 / denominator_x_660_1 * up_x_658_1;
                             float hidden_y_663_1 = gate_y_657_1 / denominator_y_661_1 * up_y_659_1;
                             hidden_packed_539_1[14] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_662_1, hidden_y_663_1)));
-                            float2 _cvt_f32_414 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[15]));
-                            float2 _cvt_f32_415 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[15]));
+                            float2 _cvt_f32_414 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[15]));
+                            float2 _cvt_f32_415 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[15]));
                             float gate_x_664_1 = _cvt_f32_414.x;
                             float gate_y_665_1 = _cvt_f32_414.y;
                             float up_x_666_1 = _cvt_f32_415.x;
@@ -7607,8 +7613,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_670_1 = gate_x_664_1 / denominator_x_668_1 * up_x_666_1;
                             float hidden_y_671_1 = gate_y_665_1 / denominator_y_669_1 * up_y_667_1;
                             hidden_packed_539_1[15] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_670_1, hidden_y_671_1)));
-                            float2 _cvt_f32_416 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[16]));
-                            float2 _cvt_f32_417 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[16]));
+                            float2 _cvt_f32_416 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[16]));
+                            float2 _cvt_f32_417 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[16]));
                             float gate_x_672_1 = _cvt_f32_416.x;
                             float gate_y_673_1 = _cvt_f32_416.y;
                             float up_x_674_1 = _cvt_f32_417.x;
@@ -7624,8 +7630,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_678_1 = gate_x_672_1 / denominator_x_676_1 * up_x_674_1;
                             float hidden_y_679_1 = gate_y_673_1 / denominator_y_677_1 * up_y_675_1;
                             hidden_packed_539_1[16] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_678_1, hidden_y_679_1)));
-                            float2 _cvt_f32_418 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[17]));
-                            float2 _cvt_f32_419 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[17]));
+                            float2 _cvt_f32_418 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[17]));
+                            float2 _cvt_f32_419 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[17]));
                             float gate_x_680_1 = _cvt_f32_418.x;
                             float gate_y_681_1 = _cvt_f32_418.y;
                             float up_x_682_1 = _cvt_f32_419.x;
@@ -7641,8 +7647,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_686_1 = gate_x_680_1 / denominator_x_684_1 * up_x_682_1;
                             float hidden_y_687_1 = gate_y_681_1 / denominator_y_685_1 * up_y_683_1;
                             hidden_packed_539_1[17] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_686_1, hidden_y_687_1)));
-                            float2 _cvt_f32_420 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[18]));
-                            float2 _cvt_f32_421 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[18]));
+                            float2 _cvt_f32_420 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[18]));
+                            float2 _cvt_f32_421 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[18]));
                             float gate_x_688_1 = _cvt_f32_420.x;
                             float gate_y_689_1 = _cvt_f32_420.y;
                             float up_x_690_1 = _cvt_f32_421.x;
@@ -7658,8 +7664,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_694_1 = gate_x_688_1 / denominator_x_692_1 * up_x_690_1;
                             float hidden_y_695_1 = gate_y_689_1 / denominator_y_693_1 * up_y_691_1;
                             hidden_packed_539_1[18] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_694_1, hidden_y_695_1)));
-                            float2 _cvt_f32_422 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[19]));
-                            float2 _cvt_f32_423 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[19]));
+                            float2 _cvt_f32_422 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[19]));
+                            float2 _cvt_f32_423 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[19]));
                             float gate_x_696_1 = _cvt_f32_422.x;
                             float gate_y_697_1 = _cvt_f32_422.y;
                             float up_x_698_1 = _cvt_f32_423.x;
@@ -7675,8 +7681,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_702_1 = gate_x_696_1 / denominator_x_700_1 * up_x_698_1;
                             float hidden_y_703_1 = gate_y_697_1 / denominator_y_701_1 * up_y_699_1;
                             hidden_packed_539_1[19] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_702_1, hidden_y_703_1)));
-                            float2 _cvt_f32_424 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[20]));
-                            float2 _cvt_f32_425 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[20]));
+                            float2 _cvt_f32_424 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[20]));
+                            float2 _cvt_f32_425 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[20]));
                             float gate_x_704_1 = _cvt_f32_424.x;
                             float gate_y_705_1 = _cvt_f32_424.y;
                             float up_x_706_1 = _cvt_f32_425.x;
@@ -7692,8 +7698,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_710_1 = gate_x_704_1 / denominator_x_708_1 * up_x_706_1;
                             float hidden_y_711_1 = gate_y_705_1 / denominator_y_709_1 * up_y_707_1;
                             hidden_packed_539_1[20] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_710_1, hidden_y_711_1)));
-                            float2 _cvt_f32_426 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[21]));
-                            float2 _cvt_f32_427 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[21]));
+                            float2 _cvt_f32_426 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[21]));
+                            float2 _cvt_f32_427 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[21]));
                             float gate_x_712_1 = _cvt_f32_426.x;
                             float gate_y_713_1 = _cvt_f32_426.y;
                             float up_x_714_1 = _cvt_f32_427.x;
@@ -7709,8 +7715,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_718_1 = gate_x_712_1 / denominator_x_716_1 * up_x_714_1;
                             float hidden_y_719_1 = gate_y_713_1 / denominator_y_717_1 * up_y_715_1;
                             hidden_packed_539_1[21] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_718_1, hidden_y_719_1)));
-                            float2 _cvt_f32_428 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[22]));
-                            float2 _cvt_f32_429 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[22]));
+                            float2 _cvt_f32_428 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[22]));
+                            float2 _cvt_f32_429 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[22]));
                             float gate_x_720_1 = _cvt_f32_428.x;
                             float gate_y_721_1 = _cvt_f32_428.y;
                             float up_x_722_1 = _cvt_f32_429.x;
@@ -7726,8 +7732,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_726_1 = gate_x_720_1 / denominator_x_724_1 * up_x_722_1;
                             float hidden_y_727_1 = gate_y_721_1 / denominator_y_725_1 * up_y_723_1;
                             hidden_packed_539_1[22] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_726_1, hidden_y_727_1)));
-                            float2 _cvt_f32_430 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[23]));
-                            float2 _cvt_f32_431 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[23]));
+                            float2 _cvt_f32_430 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[23]));
+                            float2 _cvt_f32_431 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[23]));
                             float gate_x_728_1 = _cvt_f32_430.x;
                             float gate_y_729_1 = _cvt_f32_430.y;
                             float up_x_730_1 = _cvt_f32_431.x;
@@ -7743,8 +7749,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_734_1 = gate_x_728_1 / denominator_x_732_1 * up_x_730_1;
                             float hidden_y_735_1 = gate_y_729_1 / denominator_y_733_1 * up_y_731_1;
                             hidden_packed_539_1[23] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_734_1, hidden_y_735_1)));
-                            float2 _cvt_f32_432 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[24]));
-                            float2 _cvt_f32_433 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[24]));
+                            float2 _cvt_f32_432 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[24]));
+                            float2 _cvt_f32_433 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[24]));
                             float gate_x_736_1 = _cvt_f32_432.x;
                             float gate_y_737_1 = _cvt_f32_432.y;
                             float up_x_738_1 = _cvt_f32_433.x;
@@ -7760,8 +7766,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_742_1 = gate_x_736_1 / denominator_x_740_1 * up_x_738_1;
                             float hidden_y_743_1 = gate_y_737_1 / denominator_y_741_1 * up_y_739_1;
                             hidden_packed_539_1[24] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_742_1, hidden_y_743_1)));
-                            float2 _cvt_f32_434 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[25]));
-                            float2 _cvt_f32_435 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[25]));
+                            float2 _cvt_f32_434 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[25]));
+                            float2 _cvt_f32_435 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[25]));
                             float gate_x_744_1 = _cvt_f32_434.x;
                             float gate_y_745_1 = _cvt_f32_434.y;
                             float up_x_746_1 = _cvt_f32_435.x;
@@ -7777,8 +7783,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_750_1 = gate_x_744_1 / denominator_x_748_1 * up_x_746_1;
                             float hidden_y_751_1 = gate_y_745_1 / denominator_y_749_1 * up_y_747_1;
                             hidden_packed_539_1[25] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_750_1, hidden_y_751_1)));
-                            float2 _cvt_f32_436 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[26]));
-                            float2 _cvt_f32_437 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[26]));
+                            float2 _cvt_f32_436 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[26]));
+                            float2 _cvt_f32_437 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[26]));
                             float gate_x_752_1 = _cvt_f32_436.x;
                             float gate_y_753_1 = _cvt_f32_436.y;
                             float up_x_754_1 = _cvt_f32_437.x;
@@ -7794,8 +7800,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_758_1 = gate_x_752_1 / denominator_x_756_1 * up_x_754_1;
                             float hidden_y_759_1 = gate_y_753_1 / denominator_y_757_1 * up_y_755_1;
                             hidden_packed_539_1[26] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_758_1, hidden_y_759_1)));
-                            float2 _cvt_f32_438 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[27]));
-                            float2 _cvt_f32_439 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[27]));
+                            float2 _cvt_f32_438 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[27]));
+                            float2 _cvt_f32_439 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[27]));
                             float gate_x_760_1 = _cvt_f32_438.x;
                             float gate_y_761_1 = _cvt_f32_438.y;
                             float up_x_762_1 = _cvt_f32_439.x;
@@ -7811,8 +7817,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_766_1 = gate_x_760_1 / denominator_x_764_1 * up_x_762_1;
                             float hidden_y_767_1 = gate_y_761_1 / denominator_y_765_1 * up_y_763_1;
                             hidden_packed_539_1[27] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_766_1, hidden_y_767_1)));
-                            float2 _cvt_f32_440 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[28]));
-                            float2 _cvt_f32_441 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[28]));
+                            float2 _cvt_f32_440 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[28]));
+                            float2 _cvt_f32_441 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[28]));
                             float gate_x_768_1 = _cvt_f32_440.x;
                             float gate_y_769_1 = _cvt_f32_440.y;
                             float up_x_770_1 = _cvt_f32_441.x;
@@ -7828,8 +7834,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_774_1 = gate_x_768_1 / denominator_x_772_1 * up_x_770_1;
                             float hidden_y_775_1 = gate_y_769_1 / denominator_y_773_1 * up_y_771_1;
                             hidden_packed_539_1[28] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_774_1, hidden_y_775_1)));
-                            float2 _cvt_f32_442 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[29]));
-                            float2 _cvt_f32_443 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[29]));
+                            float2 _cvt_f32_442 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[29]));
+                            float2 _cvt_f32_443 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[29]));
                             float gate_x_776_1 = _cvt_f32_442.x;
                             float gate_y_777_1 = _cvt_f32_442.y;
                             float up_x_778_1 = _cvt_f32_443.x;
@@ -7845,8 +7851,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_782_1 = gate_x_776_1 / denominator_x_780_1 * up_x_778_1;
                             float hidden_y_783_1 = gate_y_777_1 / denominator_y_781_1 * up_y_779_1;
                             hidden_packed_539_1[29] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_782_1, hidden_y_783_1)));
-                            float2 _cvt_f32_444 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[30]));
-                            float2 _cvt_f32_445 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[30]));
+                            float2 _cvt_f32_444 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[30]));
+                            float2 _cvt_f32_445 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[30]));
                             float gate_x_784_1 = _cvt_f32_444.x;
                             float gate_y_785_1 = _cvt_f32_444.y;
                             float up_x_786_1 = _cvt_f32_445.x;
@@ -7862,8 +7868,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_790_1 = gate_x_784_1 / denominator_x_788_1 * up_x_786_1;
                             float hidden_y_791_1 = gate_y_785_1 / denominator_y_789_1 * up_y_787_1;
                             hidden_packed_539_1[30] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_790_1, hidden_y_791_1)));
-                            float2 _cvt_f32_446 = __bfloat1622float2(__as_bf16x2(gate_packed_537_1[31]));
-                            float2 _cvt_f32_447 = __bfloat1622float2(__as_bf16x2(up_packed_538_1[31]));
+                            float2 _cvt_f32_446 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_537_1[31]));
+                            float2 _cvt_f32_447 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_538_1[31]));
                             float gate_x_792_1 = _cvt_f32_446.x;
                             float gate_y_793_1 = _cvt_f32_446.y;
                             float up_x_794_1 = _cvt_f32_447.x;
@@ -8188,8 +8194,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                                     :: "r"((output_finished_addr + 8) & 0xFEFFFFFF) : "memory");
                             }
-                            float2 _cvt_f32_448 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[0]));
-                            float2 _cvt_f32_449 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[0]));
+                            float2 _cvt_f32_448 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[0]));
+                            float2 _cvt_f32_449 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[0]));
                             float gate_x_819_1 = _cvt_f32_448.x;
                             float gate_y_820_1 = _cvt_f32_448.y;
                             float up_x_821_1 = _cvt_f32_449.x;
@@ -8205,8 +8211,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_825_1 = gate_x_819_1 / denominator_x_823_1 * up_x_821_1;
                             float hidden_y_826_1 = gate_y_820_1 / denominator_y_824_1 * up_y_822_1;
                             hidden_packed_814_1[0] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_825_1, hidden_y_826_1)));
-                            float2 _cvt_f32_450 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[1]));
-                            float2 _cvt_f32_451 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[1]));
+                            float2 _cvt_f32_450 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[1]));
+                            float2 _cvt_f32_451 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[1]));
                             float gate_x_827_1 = _cvt_f32_450.x;
                             float gate_y_828_1 = _cvt_f32_450.y;
                             float up_x_829_1 = _cvt_f32_451.x;
@@ -8222,8 +8228,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_833_1 = gate_x_827_1 / denominator_x_831_1 * up_x_829_1;
                             float hidden_y_834_1 = gate_y_828_1 / denominator_y_832_1 * up_y_830_1;
                             hidden_packed_814_1[1] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_833_1, hidden_y_834_1)));
-                            float2 _cvt_f32_452 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[2]));
-                            float2 _cvt_f32_453 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[2]));
+                            float2 _cvt_f32_452 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[2]));
+                            float2 _cvt_f32_453 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[2]));
                             float gate_x_835_1 = _cvt_f32_452.x;
                             float gate_y_836_1 = _cvt_f32_452.y;
                             float up_x_837_1 = _cvt_f32_453.x;
@@ -8239,8 +8245,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_841_1 = gate_x_835_1 / denominator_x_839_1 * up_x_837_1;
                             float hidden_y_842_1 = gate_y_836_1 / denominator_y_840_1 * up_y_838_1;
                             hidden_packed_814_1[2] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_841_1, hidden_y_842_1)));
-                            float2 _cvt_f32_454 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[3]));
-                            float2 _cvt_f32_455 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[3]));
+                            float2 _cvt_f32_454 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[3]));
+                            float2 _cvt_f32_455 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[3]));
                             float gate_x_843_1 = _cvt_f32_454.x;
                             float gate_y_844_1 = _cvt_f32_454.y;
                             float up_x_845_1 = _cvt_f32_455.x;
@@ -8256,8 +8262,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_849_1 = gate_x_843_1 / denominator_x_847_1 * up_x_845_1;
                             float hidden_y_850_1 = gate_y_844_1 / denominator_y_848_1 * up_y_846_1;
                             hidden_packed_814_1[3] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_849_1, hidden_y_850_1)));
-                            float2 _cvt_f32_456 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[4]));
-                            float2 _cvt_f32_457 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[4]));
+                            float2 _cvt_f32_456 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[4]));
+                            float2 _cvt_f32_457 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[4]));
                             float gate_x_851_1 = _cvt_f32_456.x;
                             float gate_y_852_1 = _cvt_f32_456.y;
                             float up_x_853_1 = _cvt_f32_457.x;
@@ -8273,8 +8279,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_857_1 = gate_x_851_1 / denominator_x_855_1 * up_x_853_1;
                             float hidden_y_858_1 = gate_y_852_1 / denominator_y_856_1 * up_y_854_1;
                             hidden_packed_814_1[4] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_857_1, hidden_y_858_1)));
-                            float2 _cvt_f32_458 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[5]));
-                            float2 _cvt_f32_459 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[5]));
+                            float2 _cvt_f32_458 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[5]));
+                            float2 _cvt_f32_459 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[5]));
                             float gate_x_859_1 = _cvt_f32_458.x;
                             float gate_y_860_1 = _cvt_f32_458.y;
                             float up_x_861_1 = _cvt_f32_459.x;
@@ -8290,8 +8296,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_865_1 = gate_x_859_1 / denominator_x_863_1 * up_x_861_1;
                             float hidden_y_866_1 = gate_y_860_1 / denominator_y_864_1 * up_y_862_1;
                             hidden_packed_814_1[5] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_865_1, hidden_y_866_1)));
-                            float2 _cvt_f32_460 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[6]));
-                            float2 _cvt_f32_461 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[6]));
+                            float2 _cvt_f32_460 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[6]));
+                            float2 _cvt_f32_461 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[6]));
                             float gate_x_867_1 = _cvt_f32_460.x;
                             float gate_y_868_1 = _cvt_f32_460.y;
                             float up_x_869_1 = _cvt_f32_461.x;
@@ -8307,8 +8313,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_873_1 = gate_x_867_1 / denominator_x_871_1 * up_x_869_1;
                             float hidden_y_874_1 = gate_y_868_1 / denominator_y_872_1 * up_y_870_1;
                             hidden_packed_814_1[6] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_873_1, hidden_y_874_1)));
-                            float2 _cvt_f32_462 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[7]));
-                            float2 _cvt_f32_463 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[7]));
+                            float2 _cvt_f32_462 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[7]));
+                            float2 _cvt_f32_463 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[7]));
                             float gate_x_875_1 = _cvt_f32_462.x;
                             float gate_y_876_1 = _cvt_f32_462.y;
                             float up_x_877_1 = _cvt_f32_463.x;
@@ -8324,8 +8330,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_881_1 = gate_x_875_1 / denominator_x_879_1 * up_x_877_1;
                             float hidden_y_882_1 = gate_y_876_1 / denominator_y_880_1 * up_y_878_1;
                             hidden_packed_814_1[7] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_881_1, hidden_y_882_1)));
-                            float2 _cvt_f32_464 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[8]));
-                            float2 _cvt_f32_465 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[8]));
+                            float2 _cvt_f32_464 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[8]));
+                            float2 _cvt_f32_465 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[8]));
                             float gate_x_883_1 = _cvt_f32_464.x;
                             float gate_y_884_1 = _cvt_f32_464.y;
                             float up_x_885_1 = _cvt_f32_465.x;
@@ -8341,8 +8347,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_889_1 = gate_x_883_1 / denominator_x_887_1 * up_x_885_1;
                             float hidden_y_890_1 = gate_y_884_1 / denominator_y_888_1 * up_y_886_1;
                             hidden_packed_814_1[8] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_889_1, hidden_y_890_1)));
-                            float2 _cvt_f32_466 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[9]));
-                            float2 _cvt_f32_467 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[9]));
+                            float2 _cvt_f32_466 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[9]));
+                            float2 _cvt_f32_467 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[9]));
                             float gate_x_891_1 = _cvt_f32_466.x;
                             float gate_y_892_1 = _cvt_f32_466.y;
                             float up_x_893_1 = _cvt_f32_467.x;
@@ -8358,8 +8364,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_897_1 = gate_x_891_1 / denominator_x_895_1 * up_x_893_1;
                             float hidden_y_898_1 = gate_y_892_1 / denominator_y_896_1 * up_y_894_1;
                             hidden_packed_814_1[9] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_897_1, hidden_y_898_1)));
-                            float2 _cvt_f32_468 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[10]));
-                            float2 _cvt_f32_469 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[10]));
+                            float2 _cvt_f32_468 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[10]));
+                            float2 _cvt_f32_469 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[10]));
                             float gate_x_899_1 = _cvt_f32_468.x;
                             float gate_y_900_1 = _cvt_f32_468.y;
                             float up_x_901_1 = _cvt_f32_469.x;
@@ -8375,8 +8381,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_905_1 = gate_x_899_1 / denominator_x_903_1 * up_x_901_1;
                             float hidden_y_906_1 = gate_y_900_1 / denominator_y_904_1 * up_y_902_1;
                             hidden_packed_814_1[10] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_905_1, hidden_y_906_1)));
-                            float2 _cvt_f32_470 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[11]));
-                            float2 _cvt_f32_471 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[11]));
+                            float2 _cvt_f32_470 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[11]));
+                            float2 _cvt_f32_471 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[11]));
                             float gate_x_907_1 = _cvt_f32_470.x;
                             float gate_y_908_1 = _cvt_f32_470.y;
                             float up_x_909_1 = _cvt_f32_471.x;
@@ -8392,8 +8398,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_913_1 = gate_x_907_1 / denominator_x_911_1 * up_x_909_1;
                             float hidden_y_914_1 = gate_y_908_1 / denominator_y_912_1 * up_y_910_1;
                             hidden_packed_814_1[11] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_913_1, hidden_y_914_1)));
-                            float2 _cvt_f32_472 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[12]));
-                            float2 _cvt_f32_473 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[12]));
+                            float2 _cvt_f32_472 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[12]));
+                            float2 _cvt_f32_473 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[12]));
                             float gate_x_915_1 = _cvt_f32_472.x;
                             float gate_y_916_1 = _cvt_f32_472.y;
                             float up_x_917_1 = _cvt_f32_473.x;
@@ -8409,8 +8415,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_921_1 = gate_x_915_1 / denominator_x_919_1 * up_x_917_1;
                             float hidden_y_922_1 = gate_y_916_1 / denominator_y_920_1 * up_y_918_1;
                             hidden_packed_814_1[12] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_921_1, hidden_y_922_1)));
-                            float2 _cvt_f32_474 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[13]));
-                            float2 _cvt_f32_475 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[13]));
+                            float2 _cvt_f32_474 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[13]));
+                            float2 _cvt_f32_475 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[13]));
                             float gate_x_923_1 = _cvt_f32_474.x;
                             float gate_y_924_1 = _cvt_f32_474.y;
                             float up_x_925_1 = _cvt_f32_475.x;
@@ -8426,8 +8432,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_929_1 = gate_x_923_1 / denominator_x_927_1 * up_x_925_1;
                             float hidden_y_930_1 = gate_y_924_1 / denominator_y_928_1 * up_y_926_1;
                             hidden_packed_814_1[13] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_929_1, hidden_y_930_1)));
-                            float2 _cvt_f32_476 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[14]));
-                            float2 _cvt_f32_477 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[14]));
+                            float2 _cvt_f32_476 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[14]));
+                            float2 _cvt_f32_477 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[14]));
                             float gate_x_931_1 = _cvt_f32_476.x;
                             float gate_y_932_1 = _cvt_f32_476.y;
                             float up_x_933_1 = _cvt_f32_477.x;
@@ -8443,8 +8449,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_937_1 = gate_x_931_1 / denominator_x_935_1 * up_x_933_1;
                             float hidden_y_938_1 = gate_y_932_1 / denominator_y_936_1 * up_y_934_1;
                             hidden_packed_814_1[14] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_937_1, hidden_y_938_1)));
-                            float2 _cvt_f32_478 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[15]));
-                            float2 _cvt_f32_479 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[15]));
+                            float2 _cvt_f32_478 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[15]));
+                            float2 _cvt_f32_479 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[15]));
                             float gate_x_939_1 = _cvt_f32_478.x;
                             float gate_y_940_1 = _cvt_f32_478.y;
                             float up_x_941_1 = _cvt_f32_479.x;
@@ -8460,8 +8466,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_945_1 = gate_x_939_1 / denominator_x_943_1 * up_x_941_1;
                             float hidden_y_946_1 = gate_y_940_1 / denominator_y_944_1 * up_y_942_1;
                             hidden_packed_814_1[15] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_945_1, hidden_y_946_1)));
-                            float2 _cvt_f32_480 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[16]));
-                            float2 _cvt_f32_481 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[16]));
+                            float2 _cvt_f32_480 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[16]));
+                            float2 _cvt_f32_481 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[16]));
                             float gate_x_947_1 = _cvt_f32_480.x;
                             float gate_y_948_1 = _cvt_f32_480.y;
                             float up_x_949_1 = _cvt_f32_481.x;
@@ -8477,8 +8483,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_953_1 = gate_x_947_1 / denominator_x_951_1 * up_x_949_1;
                             float hidden_y_954_1 = gate_y_948_1 / denominator_y_952_1 * up_y_950_1;
                             hidden_packed_814_1[16] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_953_1, hidden_y_954_1)));
-                            float2 _cvt_f32_482 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[17]));
-                            float2 _cvt_f32_483 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[17]));
+                            float2 _cvt_f32_482 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[17]));
+                            float2 _cvt_f32_483 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[17]));
                             float gate_x_955_1 = _cvt_f32_482.x;
                             float gate_y_956_1 = _cvt_f32_482.y;
                             float up_x_957_1 = _cvt_f32_483.x;
@@ -8494,8 +8500,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_961_1 = gate_x_955_1 / denominator_x_959_1 * up_x_957_1;
                             float hidden_y_962_1 = gate_y_956_1 / denominator_y_960_1 * up_y_958_1;
                             hidden_packed_814_1[17] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_961_1, hidden_y_962_1)));
-                            float2 _cvt_f32_484 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[18]));
-                            float2 _cvt_f32_485 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[18]));
+                            float2 _cvt_f32_484 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[18]));
+                            float2 _cvt_f32_485 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[18]));
                             float gate_x_963_1 = _cvt_f32_484.x;
                             float gate_y_964_1 = _cvt_f32_484.y;
                             float up_x_965_1 = _cvt_f32_485.x;
@@ -8511,8 +8517,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_969_1 = gate_x_963_1 / denominator_x_967_1 * up_x_965_1;
                             float hidden_y_970_1 = gate_y_964_1 / denominator_y_968_1 * up_y_966_1;
                             hidden_packed_814_1[18] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_969_1, hidden_y_970_1)));
-                            float2 _cvt_f32_486 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[19]));
-                            float2 _cvt_f32_487 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[19]));
+                            float2 _cvt_f32_486 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[19]));
+                            float2 _cvt_f32_487 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[19]));
                             float gate_x_971_1 = _cvt_f32_486.x;
                             float gate_y_972_1 = _cvt_f32_486.y;
                             float up_x_973_1 = _cvt_f32_487.x;
@@ -8528,8 +8534,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_977_1 = gate_x_971_1 / denominator_x_975_1 * up_x_973_1;
                             float hidden_y_978_1 = gate_y_972_1 / denominator_y_976_1 * up_y_974_1;
                             hidden_packed_814_1[19] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_977_1, hidden_y_978_1)));
-                            float2 _cvt_f32_488 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[20]));
-                            float2 _cvt_f32_489 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[20]));
+                            float2 _cvt_f32_488 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[20]));
+                            float2 _cvt_f32_489 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[20]));
                             float gate_x_979_1 = _cvt_f32_488.x;
                             float gate_y_980_1 = _cvt_f32_488.y;
                             float up_x_981_1 = _cvt_f32_489.x;
@@ -8545,8 +8551,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_985_1 = gate_x_979_1 / denominator_x_983_1 * up_x_981_1;
                             float hidden_y_986_1 = gate_y_980_1 / denominator_y_984_1 * up_y_982_1;
                             hidden_packed_814_1[20] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_985_1, hidden_y_986_1)));
-                            float2 _cvt_f32_490 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[21]));
-                            float2 _cvt_f32_491 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[21]));
+                            float2 _cvt_f32_490 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[21]));
+                            float2 _cvt_f32_491 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[21]));
                             float gate_x_987_1 = _cvt_f32_490.x;
                             float gate_y_988_1 = _cvt_f32_490.y;
                             float up_x_989_1 = _cvt_f32_491.x;
@@ -8562,8 +8568,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_993_1 = gate_x_987_1 / denominator_x_991_1 * up_x_989_1;
                             float hidden_y_994_1 = gate_y_988_1 / denominator_y_992_1 * up_y_990_1;
                             hidden_packed_814_1[21] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_993_1, hidden_y_994_1)));
-                            float2 _cvt_f32_492 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[22]));
-                            float2 _cvt_f32_493 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[22]));
+                            float2 _cvt_f32_492 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[22]));
+                            float2 _cvt_f32_493 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[22]));
                             float gate_x_995_1 = _cvt_f32_492.x;
                             float gate_y_996_1 = _cvt_f32_492.y;
                             float up_x_997_1 = _cvt_f32_493.x;
@@ -8579,8 +8585,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_1001_1 = gate_x_995_1 / denominator_x_999_1 * up_x_997_1;
                             float hidden_y_1002_1 = gate_y_996_1 / denominator_y_1000_1 * up_y_998_1;
                             hidden_packed_814_1[22] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_1001_1, hidden_y_1002_1)));
-                            float2 _cvt_f32_494 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[23]));
-                            float2 _cvt_f32_495 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[23]));
+                            float2 _cvt_f32_494 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[23]));
+                            float2 _cvt_f32_495 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[23]));
                             float gate_x_1003_1 = _cvt_f32_494.x;
                             float gate_y_1004_1 = _cvt_f32_494.y;
                             float up_x_1005_1 = _cvt_f32_495.x;
@@ -8596,8 +8602,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_1009_1 = gate_x_1003_1 / denominator_x_1007_1 * up_x_1005_1;
                             float hidden_y_1010_1 = gate_y_1004_1 / denominator_y_1008_1 * up_y_1006_1;
                             hidden_packed_814_1[23] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_1009_1, hidden_y_1010_1)));
-                            float2 _cvt_f32_496 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[24]));
-                            float2 _cvt_f32_497 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[24]));
+                            float2 _cvt_f32_496 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[24]));
+                            float2 _cvt_f32_497 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[24]));
                             float gate_x_1011_1 = _cvt_f32_496.x;
                             float gate_y_1012_1 = _cvt_f32_496.y;
                             float up_x_1013_1 = _cvt_f32_497.x;
@@ -8613,8 +8619,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_1017_1 = gate_x_1011_1 / denominator_x_1015_1 * up_x_1013_1;
                             float hidden_y_1018_1 = gate_y_1012_1 / denominator_y_1016_1 * up_y_1014_1;
                             hidden_packed_814_1[24] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_1017_1, hidden_y_1018_1)));
-                            float2 _cvt_f32_498 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[25]));
-                            float2 _cvt_f32_499 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[25]));
+                            float2 _cvt_f32_498 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[25]));
+                            float2 _cvt_f32_499 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[25]));
                             float gate_x_1019_1 = _cvt_f32_498.x;
                             float gate_y_1020_1 = _cvt_f32_498.y;
                             float up_x_1021_1 = _cvt_f32_499.x;
@@ -8630,8 +8636,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_1025_1 = gate_x_1019_1 / denominator_x_1023_1 * up_x_1021_1;
                             float hidden_y_1026_1 = gate_y_1020_1 / denominator_y_1024_1 * up_y_1022_1;
                             hidden_packed_814_1[25] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_1025_1, hidden_y_1026_1)));
-                            float2 _cvt_f32_500 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[26]));
-                            float2 _cvt_f32_501 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[26]));
+                            float2 _cvt_f32_500 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[26]));
+                            float2 _cvt_f32_501 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[26]));
                             float gate_x_1027_1 = _cvt_f32_500.x;
                             float gate_y_1028_1 = _cvt_f32_500.y;
                             float up_x_1029_1 = _cvt_f32_501.x;
@@ -8647,8 +8653,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_1033_1 = gate_x_1027_1 / denominator_x_1031_1 * up_x_1029_1;
                             float hidden_y_1034_1 = gate_y_1028_1 / denominator_y_1032_1 * up_y_1030_1;
                             hidden_packed_814_1[26] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_1033_1, hidden_y_1034_1)));
-                            float2 _cvt_f32_502 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[27]));
-                            float2 _cvt_f32_503 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[27]));
+                            float2 _cvt_f32_502 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[27]));
+                            float2 _cvt_f32_503 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[27]));
                             float gate_x_1035_1 = _cvt_f32_502.x;
                             float gate_y_1036_1 = _cvt_f32_502.y;
                             float up_x_1037_1 = _cvt_f32_503.x;
@@ -8664,8 +8670,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_1041_1 = gate_x_1035_1 / denominator_x_1039_1 * up_x_1037_1;
                             float hidden_y_1042_1 = gate_y_1036_1 / denominator_y_1040_1 * up_y_1038_1;
                             hidden_packed_814_1[27] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_1041_1, hidden_y_1042_1)));
-                            float2 _cvt_f32_504 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[28]));
-                            float2 _cvt_f32_505 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[28]));
+                            float2 _cvt_f32_504 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[28]));
+                            float2 _cvt_f32_505 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[28]));
                             float gate_x_1043_1 = _cvt_f32_504.x;
                             float gate_y_1044_1 = _cvt_f32_504.y;
                             float up_x_1045_1 = _cvt_f32_505.x;
@@ -8681,8 +8687,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_1049_1 = gate_x_1043_1 / denominator_x_1047_1 * up_x_1045_1;
                             float hidden_y_1050_1 = gate_y_1044_1 / denominator_y_1048_1 * up_y_1046_1;
                             hidden_packed_814_1[28] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_1049_1, hidden_y_1050_1)));
-                            float2 _cvt_f32_506 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[29]));
-                            float2 _cvt_f32_507 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[29]));
+                            float2 _cvt_f32_506 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[29]));
+                            float2 _cvt_f32_507 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[29]));
                             float gate_x_1051_1 = _cvt_f32_506.x;
                             float gate_y_1052_1 = _cvt_f32_506.y;
                             float up_x_1053_1 = _cvt_f32_507.x;
@@ -8698,8 +8704,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_1057_1 = gate_x_1051_1 / denominator_x_1055_1 * up_x_1053_1;
                             float hidden_y_1058_1 = gate_y_1052_1 / denominator_y_1056_1 * up_y_1054_1;
                             hidden_packed_814_1[29] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_1057_1, hidden_y_1058_1)));
-                            float2 _cvt_f32_508 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[30]));
-                            float2 _cvt_f32_509 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[30]));
+                            float2 _cvt_f32_508 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[30]));
+                            float2 _cvt_f32_509 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[30]));
                             float gate_x_1059_1 = _cvt_f32_508.x;
                             float gate_y_1060_1 = _cvt_f32_508.y;
                             float up_x_1061_1 = _cvt_f32_509.x;
@@ -8715,8 +8721,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                             float hidden_x_1065_1 = gate_x_1059_1 / denominator_x_1063_1 * up_x_1061_1;
                             float hidden_y_1066_1 = gate_y_1060_1 / denominator_y_1064_1 * up_y_1062_1;
                             hidden_packed_814_1[30] = __as_u32(__float22bfloat162_rn(make_float2(hidden_x_1065_1, hidden_y_1066_1)));
-                            float2 _cvt_f32_510 = __bfloat1622float2(__as_bf16x2(gate_packed_812_1[31]));
-                            float2 _cvt_f32_511 = __bfloat1622float2(__as_bf16x2(up_packed_813_1[31]));
+                            float2 _cvt_f32_510 = cake_bf16x2_to_f32x2(__as_bf16x2(gate_packed_812_1[31]));
+                            float2 _cvt_f32_511 = cake_bf16x2_to_f32x2(__as_bf16x2(up_packed_813_1[31]));
                             float gate_x_1067_1 = _cvt_f32_510.x;
                             float gate_y_1068_1 = _cvt_f32_510.y;
                             float up_x_1069_1 = _cvt_f32_511.x;
@@ -8980,14 +8986,14 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                                 {
                                     bool enabled_value_5 = 1;
                                     if (enabled_value_5 != 0) {
-                                        int32_t _relaxed_ld_12;
-                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_12) : "l"(hidden_ready + (shared_rows + macro_rows_4 + x_3)) : "memory");
-                                        int value_6 = _relaxed_ld_12;
-                                        while (value_6 < 2 * (intermediate / 128)) {
+                                        int _poll_6_first;
+                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_poll_6_first) : "l"(hidden_ready + (shared_rows + macro_rows_4 + x_3)) : "memory");
+                                        int _poll_6 = _poll_6_first;
+                                        while (_poll_6 < 2 * (intermediate / 128)) {
                                             asm volatile("nanosleep.u32 %0;" :: "r"(16));
-                                            int32_t _relaxed_ld_13;
-                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_13) : "l"(hidden_ready + (shared_rows + macro_rows_4 + x_3)) : "memory");
-                                            value_6 = _relaxed_ld_13;
+                                            int _poll_6_next;
+                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_poll_6_next) : "l"(hidden_ready + (shared_rows + macro_rows_4 + x_3)) : "memory");
+                                            _poll_6 = _poll_6_next;
                                         }
                                         asm volatile("fence.acquire.gpu;" ::: "memory");
                                     }
@@ -9329,14 +9335,14 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                                 if (output_row_1 < _min_630) {
                                     bool enabled_value_6 = 1;
                                     if (enabled_value_6 != 0) {
-                                        int32_t _relaxed_ld_14;
-                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_14) : "l"(y_done + ((previous_offset_2 + output_row_1) / 128)) : "memory");
-                                        int value_7 = _relaxed_ld_14;
-                                        while (value_7 < 8 * ((hidden + 1023) / 1024)) {
+                                        int _poll_7_first;
+                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_poll_7_first) : "l"(y_done + ((previous_offset_2 + output_row_1) / 128)) : "memory");
+                                        int _poll_7 = _poll_7_first;
+                                        while (_poll_7 < 8 * ((hidden + 1023) / 1024)) {
                                             asm volatile("nanosleep.u32 %0;" :: "r"(16));
-                                            int32_t _relaxed_ld_15;
-                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_15) : "l"(y_done + ((previous_offset_2 + output_row_1) / 128)) : "memory");
-                                            value_7 = _relaxed_ld_15;
+                                            int _poll_7_next;
+                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_poll_7_next) : "l"(y_done + ((previous_offset_2 + output_row_1) / 128)) : "memory");
+                                            _poll_7 = _poll_7_next;
                                         }
                                         asm volatile("fence.acquire.gpu;" ::: "memory");
                                     }
@@ -9468,7 +9474,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                     gemm_bits = phase_bits_5;
                 }
             }
-            mbarrier_wait(schedule_arrived_addr, iteration % 2);
+            int _parity_schedule_arrived = (int)((unsigned int)iteration % 2);
+            mbarrier_wait(schedule_arrived_addr, _parity_schedule_arrived);
             uint32_t _clc_valid_0 = 0;
             uint32_t _clc_ctaid_x_0;
             uint32_t _clc_ctaid_y_0;
@@ -9513,7 +9520,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
             }
             mbarrier_arrive_expect_tx(drain_arrived_0_addr, 16);
             while (1) {
-                mbarrier_wait(drain_arrived_0_addr, iteration_0 % 2);
+                int _parity_drain_arrived_0 = (int)((unsigned int)iteration_0 % 2);
+                mbarrier_wait(drain_arrived_0_addr, _parity_drain_arrived_0);
                 uint32_t _clc_valid_1 = 0;
                 uint32_t _clc_ctaid_x_1;
                 uint32_t _clc_ctaid_y_1;
@@ -9537,7 +9545,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                     :: "r"((drain_finished_0_addr) & 0xFEFFFFFF) : "memory");
                 if (cta_rank_0 == 0) {
-                    mbarrier_wait(drain_finished_0_addr, iteration_0 % 2);
+                    int _parity_drain_finished_0 = (int)((unsigned int)iteration_0 % 2);
+                    mbarrier_wait(drain_finished_0_addr, _parity_drain_finished_0);
                 }
                 if (_clc_valid_1 == 0) {
                     break;
@@ -9566,7 +9575,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
             }
             mbarrier_arrive_expect_tx(drain_arrived_1_addr, 16);
             while (1) {
-                mbarrier_wait(drain_arrived_1_addr, iteration_0_1 % 2);
+                int _parity_drain_arrived_1 = (int)((unsigned int)iteration_0_1 % 2);
+                mbarrier_wait(drain_arrived_1_addr, _parity_drain_arrived_1);
                 uint32_t _clc_valid_2 = 0;
                 uint32_t _clc_ctaid_x_2;
                 uint32_t _clc_ctaid_y_2;
@@ -9590,7 +9600,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                     :: "r"((drain_finished_1_addr) & 0xFEFFFFFF) : "memory");
                 if (cta_rank_0 == 0) {
-                    mbarrier_wait(drain_finished_1_addr, iteration_0_1 % 2);
+                    int _parity_drain_finished_1 = (int)((unsigned int)iteration_0_1 % 2);
+                    mbarrier_wait(drain_finished_1_addr, _parity_drain_finished_1);
                 }
                 if (_clc_valid_2 == 0) {
                     break;
@@ -9619,7 +9630,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
             }
             mbarrier_arrive_expect_tx(drain_arrived_2_addr, 16);
             while (1) {
-                mbarrier_wait(drain_arrived_2_addr, iteration_0_2 % 2);
+                int _parity_drain_arrived_2 = (int)((unsigned int)iteration_0_2 % 2);
+                mbarrier_wait(drain_arrived_2_addr, _parity_drain_arrived_2);
                 uint32_t _clc_valid_3 = 0;
                 uint32_t _clc_ctaid_x_3;
                 uint32_t _clc_ctaid_y_3;
@@ -9643,7 +9655,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                     :: "r"((drain_finished_2_addr) & 0xFEFFFFFF) : "memory");
                 if (cta_rank_0 == 0) {
-                    mbarrier_wait(drain_finished_2_addr, iteration_0_2 % 2);
+                    int _parity_drain_finished_2 = (int)((unsigned int)iteration_0_2 % 2);
+                    mbarrier_wait(drain_finished_2_addr, _parity_drain_finished_2);
                 }
                 if (_clc_valid_3 == 0) {
                     break;
@@ -9672,7 +9685,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
             }
             mbarrier_arrive_expect_tx(drain_arrived_3_addr, 16);
             while (1) {
-                mbarrier_wait(drain_arrived_3_addr, iteration_0_3 % 2);
+                int _parity_drain_arrived_3 = (int)((unsigned int)iteration_0_3 % 2);
+                mbarrier_wait(drain_arrived_3_addr, _parity_drain_arrived_3);
                 uint32_t _clc_valid_4 = 0;
                 uint32_t _clc_ctaid_x_4;
                 uint32_t _clc_ctaid_y_4;
@@ -9696,7 +9710,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                     :: "r"((drain_finished_3_addr) & 0xFEFFFFFF) : "memory");
                 if (cta_rank_0 == 0) {
-                    mbarrier_wait(drain_finished_3_addr, iteration_0_3 % 2);
+                    int _parity_drain_finished_3 = (int)((unsigned int)iteration_0_3 % 2);
+                    mbarrier_wait(drain_finished_3_addr, _parity_drain_finished_3);
                 }
                 if (_clc_valid_4 == 0) {
                     break;
@@ -9725,7 +9740,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
             }
             mbarrier_arrive_expect_tx(drain_arrived_4_addr, 16);
             while (1) {
-                mbarrier_wait(drain_arrived_4_addr, iteration_0_4 % 2);
+                int _parity_drain_arrived_4 = (int)((unsigned int)iteration_0_4 % 2);
+                mbarrier_wait(drain_arrived_4_addr, _parity_drain_arrived_4);
                 uint32_t _clc_valid_5 = 0;
                 uint32_t _clc_ctaid_x_5;
                 uint32_t _clc_ctaid_y_5;
@@ -9749,7 +9765,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                     :: "r"((drain_finished_4_addr) & 0xFEFFFFFF) : "memory");
                 if (cta_rank_0 == 0) {
-                    mbarrier_wait(drain_finished_4_addr, iteration_0_4 % 2);
+                    int _parity_drain_finished_4 = (int)((unsigned int)iteration_0_4 % 2);
+                    mbarrier_wait(drain_finished_4_addr, _parity_drain_finished_4);
                 }
                 if (_clc_valid_5 == 0) {
                     break;
@@ -9778,7 +9795,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
             }
             mbarrier_arrive_expect_tx(drain_arrived_5_addr, 16);
             while (1) {
-                mbarrier_wait(drain_arrived_5_addr, iteration_0_5 % 2);
+                int _parity_drain_arrived_5 = (int)((unsigned int)iteration_0_5 % 2);
+                mbarrier_wait(drain_arrived_5_addr, _parity_drain_arrived_5);
                 uint32_t _clc_valid_6 = 0;
                 uint32_t _clc_ctaid_x_6;
                 uint32_t _clc_ctaid_y_6;
@@ -9802,7 +9820,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                     :: "r"((drain_finished_5_addr) & 0xFEFFFFFF) : "memory");
                 if (cta_rank_0 == 0) {
-                    mbarrier_wait(drain_finished_5_addr, iteration_0_5 % 2);
+                    int _parity_drain_finished_5 = (int)((unsigned int)iteration_0_5 % 2);
+                    mbarrier_wait(drain_finished_5_addr, _parity_drain_finished_5);
                 }
                 if (_clc_valid_6 == 0) {
                     break;
@@ -9831,7 +9850,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
             }
             mbarrier_arrive_expect_tx(drain_arrived_6_addr, 16);
             while (1) {
-                mbarrier_wait(drain_arrived_6_addr, iteration_0_6 % 2);
+                int _parity_drain_arrived_6 = (int)((unsigned int)iteration_0_6 % 2);
+                mbarrier_wait(drain_arrived_6_addr, _parity_drain_arrived_6);
                 uint32_t _clc_valid_7 = 0;
                 uint32_t _clc_ctaid_x_7;
                 uint32_t _clc_ctaid_y_7;
@@ -9855,7 +9875,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                     :: "r"((drain_finished_6_addr) & 0xFEFFFFFF) : "memory");
                 if (cta_rank_0 == 0) {
-                    mbarrier_wait(drain_finished_6_addr, iteration_0_6 % 2);
+                    int _parity_drain_finished_6 = (int)((unsigned int)iteration_0_6 % 2);
+                    mbarrier_wait(drain_finished_6_addr, _parity_drain_finished_6);
                 }
                 if (_clc_valid_7 == 0) {
                     break;
@@ -9884,7 +9905,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
             }
             mbarrier_arrive_expect_tx(drain_arrived_7_addr, 16);
             while (1) {
-                mbarrier_wait(drain_arrived_7_addr, iteration_0_7 % 2);
+                int _parity_drain_arrived_7 = (int)((unsigned int)iteration_0_7 % 2);
+                mbarrier_wait(drain_arrived_7_addr, _parity_drain_arrived_7);
                 uint32_t _clc_valid_8 = 0;
                 uint32_t _clc_ctaid_x_8;
                 uint32_t _clc_ctaid_y_8;
@@ -9908,7 +9930,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                     :: "r"((drain_finished_7_addr) & 0xFEFFFFFF) : "memory");
                 if (cta_rank_0 == 0) {
-                    mbarrier_wait(drain_finished_7_addr, iteration_0_7 % 2);
+                    int _parity_drain_finished_7 = (int)((unsigned int)iteration_0_7 % 2);
+                    mbarrier_wait(drain_finished_7_addr, _parity_drain_finished_7);
                 }
                 if (_clc_valid_8 == 0) {
                     break;

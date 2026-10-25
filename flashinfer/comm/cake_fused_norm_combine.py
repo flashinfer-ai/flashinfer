@@ -22,9 +22,12 @@ ascending rank order with BF16 rounding after every addition.  Outputs are the
 normalized tracks, the propagated residual and the replicated collective
 result.
 
-Four generated programs (``flashinfer.jit.cake_fused_norm_combine``) share one
+Six generated programs (``flashinfer.jit.cake_fused_norm_combine``) share one
 peer-mapped workspace; :func:`select_variant` picks one per token count:
 
+* ``PARALLEL_SINGLE`` (one token): the ``PARALLEL`` exchange built for a
+  single token, with the control-record update off the collective tail and
+  the previous payload rotation cleared while the exchange is in flight;
 * ``PARALLEL`` (below ``SPLIT_MIN_TOKENS``): a one-shot Lamport exchange
   (every peer polls all eight stripes) with one CTA per token;
 * ``PARALLEL_SPLIT`` (below ``STREAM_MIN_TOKENS``): the same exchange over
@@ -36,9 +39,14 @@ peer-mapped workspace; :func:`select_variant` picks one per token count:
   as a persistent grid of one CTA per SM;
 * ``OWNER_PIPELINED``: the same owner reduce as a persistent
   software-pipelined grid of at most ``CTAS_PER_SM["OWNER_PIPELINED"]`` CTAs
-  per SM.
+  per SM;
+* ``OWNER_PIPELINED_EARLY``: the pipelined reduce at
+  ``CTAS_PER_SM["OWNER_PIPELINED_EARLY"]`` CTAs per SM, which issues the first
+  token's loads before the workspace snapshot; it serves the token counts the
+  ``OWNER_PIPELINED`` grid cannot hold in one step, up to
+  ``EARLY_MAX_STEPS`` steps of its own grid.
 
-The two persistent programs launch cooperatively; their grid is every token
+The three persistent programs launch cooperatively; their grid is every token
 when all fit the co-resident capacity their launch bounds guarantee, else the
 largest odd CTA count within it.
 
@@ -94,15 +102,19 @@ CONTROL_WORDS = 5
 WORKSPACE_TABLE_ENTRIES = 3 * WORLD_SIZE + 1
 
 # The programs of ``flashinfer.jit.cake_fused_norm_combine``, by dispatch band.
+VARIANT_PARALLEL_SINGLE = "PARALLEL_SINGLE"
 VARIANT_PARALLEL = "PARALLEL"
 VARIANT_PARALLEL_SPLIT = "PARALLEL_SPLIT"
 VARIANT_OWNER_STREAM = "OWNER_STREAM"
 VARIANT_OWNER_PIPELINED = "OWNER_PIPELINED"
+VARIANT_OWNER_PIPELINED_EARLY = "OWNER_PIPELINED_EARLY"
 VARIANTS: tuple[str, ...] = (
+    VARIANT_PARALLEL_SINGLE,
     VARIANT_PARALLEL,
     VARIANT_PARALLEL_SPLIT,
     VARIANT_OWNER_STREAM,
     VARIANT_OWNER_PIPELINED,
+    VARIANT_OWNER_PIPELINED_EARLY,
 )
 SPLIT_MIN_TOKENS = 4
 STREAM_MIN_TOKENS = 40
@@ -111,15 +123,37 @@ PIPELINED_MIN_TOKENS = 480
 SPLIT_CTAS_PER_TOKEN = 8
 # CTAs per SM the launch bounds of each persistent program guarantee
 # co-resident: the cooperative grid never exceeds this times the SM count.
-CTAS_PER_SM: dict[str, int] = {VARIANT_OWNER_STREAM: 1, VARIANT_OWNER_PIPELINED: 4}
+CTAS_PER_SM: dict[str, int] = {
+    VARIANT_OWNER_STREAM: 1,
+    VARIANT_OWNER_PIPELINED: 4,
+    VARIANT_OWNER_PIPELINED_EARLY: 3,
+}
+# ``OWNER_PIPELINED_EARLY`` serves token counts that need at most this many
+# steps of its grid.
+EARLY_MAX_STEPS = 4
 
 
-def select_variant(tokens: int) -> str:
-    """Name the program the dispatch launches for ``tokens`` rows."""
+def _positive_int(value: int, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
 
-    if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens <= 0:
-        raise ValueError("tokens must be a positive integer")
+
+def select_variant(tokens: int, sm_count: int) -> str:
+    """Name the program the dispatch launches for ``tokens`` rows on a device
+    of ``sm_count`` SMs."""
+
+    _positive_int(tokens, "tokens")
+    _positive_int(sm_count, "sm_count")
+    if tokens == 1:
+        return VARIANT_PARALLEL_SINGLE
     if tokens >= PIPELINED_MIN_TOKENS:
+        one_step = CTAS_PER_SM[VARIANT_OWNER_PIPELINED] * sm_count
+        early_grid = persistent_grid(
+            tokens, CTAS_PER_SM[VARIANT_OWNER_PIPELINED_EARLY] * sm_count
+        )
+        if one_step < tokens <= EARLY_MAX_STEPS * early_grid:
+            return VARIANT_OWNER_PIPELINED_EARLY
         return VARIANT_OWNER_PIPELINED
     if tokens >= STREAM_MIN_TOKENS:
         return VARIANT_OWNER_STREAM
@@ -147,7 +181,7 @@ def persistent_grid(tokens: int, capacity: int) -> int:
 def launch_grid_x(variant: str, tokens: int, sm_count: int) -> int:
     """Grid width of ``variant`` for ``tokens`` rows on a device of ``sm_count`` SMs."""
 
-    if variant == VARIANT_PARALLEL:
+    if variant in (VARIANT_PARALLEL_SINGLE, VARIANT_PARALLEL):
         return int(tokens)
     if variant == VARIANT_PARALLEL_SPLIT:
         return SPLIT_CTAS_PER_TOKEN * int(tokens)
@@ -443,8 +477,8 @@ def cake_fused_norm_combine(
             "the Cake fused norm-combine export covers eight peers with hidden size 2560"
         )
     target = cake_fused_norm_combine_target(device)
-    variant = select_variant(tokens)
     _, sm_count = _device_facts(int(device.index))
+    variant = select_variant(tokens, sm_count)
     program = _program(variant)
     # The generated binding's arguments by name (``CakeProgram.args`` orders
     # them): the six tensors, the workspace pointer table, the rank, the token
@@ -477,6 +511,7 @@ def cake_fused_norm_combine(
 __all__ = [
     "CONTROL_WORDS",
     "CTAS_PER_SM",
+    "EARLY_MAX_STEPS",
     "HIDDEN_DIM",
     "LAMPORT_SENTINEL_U16",
     "LAMPORT_SLOTS",
@@ -488,8 +523,10 @@ __all__ = [
     "TRACKS",
     "VARIANTS",
     "VARIANT_OWNER_PIPELINED",
+    "VARIANT_OWNER_PIPELINED_EARLY",
     "VARIANT_OWNER_STREAM",
     "VARIANT_PARALLEL",
+    "VARIANT_PARALLEL_SINGLE",
     "VARIANT_PARALLEL_SPLIT",
     "WORKSPACE_TABLE_ENTRIES",
     "WORLD_SIZE",

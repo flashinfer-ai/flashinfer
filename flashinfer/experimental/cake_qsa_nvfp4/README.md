@@ -82,9 +82,10 @@ B200 (148 SMs) at the owner's 24 x 2 heads and 2051 selections the formula
 gives 33, 33, 18, 9, 4, 2, 1, 1 splits for rows 1, 2, 4, 8, 16, 32, 64, 128;
 on an RTX PRO 6000 (188 SMs, two CTAs per SM) it gives 33, 33, 33, 23, 11, 5,
 2, 1 and the table replaces rows 4, 8, 16 and 32 with 16, 11, 5 and 3.
-Where the persistent walk serves the call (compute capability 10.3, program
-rule below) the split count is instead the walk's partial slots per (row, KV
-head) -- 2 for rows 128 on a GB300 -- and the merge reads that many.
+Where the persistent walk serves the call (compute capability 10.3 and 10.7,
+program rule below) the split count is instead the walk's partial slots per
+(row, KV head) -- 2 for rows 128 on a GB300, 2 for rows 128 and 256 on an
+R200 -- and the merge reads that many.
 
 **Form rule.** With one split the plain decode writes `out` itself. Above
 one split the *fused* form (the cooperative build of the decode, whose CTAs
@@ -93,8 +94,10 @@ needs `rows * num_kv_heads * splits` within the co-residency the decode's
 launch bound guarantees (`FUSED_CTAS_PER_SM[arch]` times the SM count: two per
 SM on compute capability 9.0 and 12.0, 264 on an H100, 376 on an RTX PRO 6000;
 one per SM on 10.0 / 10.3 / 10.7, 148 on a B200, 152 on a GB300, 212 on an R200
-board of 212 SMs). Within it, compute capability 9.0 and 12.0 always take the
-fused form. Compute capability 10.0 and 10.3 take it under the eager host rule
+board of 212 SMs). Within it, compute capability 9.0 always takes the fused
+form, and 12.0 does except on a *wide* call (the program rule below: the
+whole-tile program ships in the split form alone, so a wide call takes the
+split form there). Compute capability 10.0 and 10.3 take it under the eager host rule
 alone: on an `aarch64` host (`FUSED_HOSTS`), at `rows <= 4` (`FUSED_MAX_ROWS`)
 and when the current stream is not capturing. Compute capability 10.7 keeps
 the split form on every host (`FUSED_SPLIT_ONLY_ARCHES`): on an R200 system the
@@ -125,19 +128,45 @@ SM count; 216 on an A100) and each of its CTAs walks a long tile stream,
 `ceil(tiles / splits) >= 16` (1024 selected tokens). A wide call launches
 `decode_whole_tile`, the previous release's `sm_80` program (whole-tile
 gather, no L2 cache hint, shift selector); every other call launches the
-K-first program `decode`, and compute capability 9.0 and 12.0 always do; 10.0,
+K-first program `decode`, and compute capability 9.0 always does. On compute
+capability 12.0 a split-form call is *wide* when each of its CTAs walks at
+least 11 tiles (704 selected tokens), whatever the grid (an RTX PRO 6000's 376
+resident CTAs hold every owner grid within one wave): it launches the
+`sm_120a` build of `decode_whole_tile`, whose copies carry the L2 evict-first
+policy (the form rule takes the split form on a wide call); below that stream
+the K-first program. On an
+A100 (108 SMs) at the owner's 24 x 2 heads and 2051 selections (33 tiles):
+rows 1-32 run at most one wave and take the K-first program; rows 64 (4
+splits, 512 CTAs, 9 tiles per CTA) take the K-first program; rows 128 (2
+splits, 512 CTAs, 17 tiles per CTA) and the 2048-row single-split call (33
+tiles per CTA) take the whole-tile program. Measured paired on two A100s
+(80 GB and 40 GB PCIe) under a memset flush, the K-first program is 1-7 %
+faster at rows 64 and the whole-tile program 6-8 % faster at rows 128, on
+both units. On an RTX PRO 6000 (188 SMs) at the same heads and selections,
+rows 32 (3 splits, 11 tiles per CTA), 64 (2 splits, 17) and 128 (1 split, 33)
+are wide and rows 1-16 (at most 7 tiles per CTA) are not; measured paired
+there under both L2 flushes, the whole-tile program is 2-9 % faster whole call
+at rows 32 / 64 / 128 and within noise or slower at rows 16 and below. The
+rule reads the architecture, the SM count and the call's tile and split
+counts alone. 10.0,
 10.3 and 10.7 launch `decode_tcgen05` in the split form and `decode_tcgen05_coop`
-in the fused form, by the form rule alone -- except that 10.3 launches the
-*persistent walk* `decode_tcgen05_persistent` on a split-form grid whose plain
-cut runs two resident waves (`1 < ceil(rows * num_kv_heads * splits /
-sm_count) <= WALK_MAX_WAVES = 2`) and whose longest walked CTA is shorter than
-the plain program's longest: one CTA per SM walking a balanced, contiguous
-share of the (row, KV head) x tile slots. On a GB300 (152 SMs) at the owner's
-shape that is rows 128 alone: 256 plain CTAs of 33 tiles in two waves become
-152 CTAs of 56-57 tiles with 2 partial slots per pair, 5.6-7.1 % faster whole
-call in every mode; rows 1-64 (one wave) and rows 256 and above (more than two
-waves) keep the plain cut, and so does 10.0, where the same grids tie on a
-B200. On an
+in the fused form, by the form rule alone -- except that 10.3 and 10.7 launch
+the *persistent walk* `decode_tcgen05_persistent` on a split-form grid whose
+plain cut runs more than one resident wave within the architecture's measured
+range (`1 < ceil(rows * num_kv_heads * splits / sm_count) <=
+WALK_MAX_WAVES[arch]`: 2 on 10.3, 3 on 10.7) and whose longest walked CTA is
+shorter than the plain program's longest: one CTA per SM walking a balanced,
+contiguous share of the (row, KV head) x tile slots. On a GB300 (152 SMs) at
+the owner's shape that is rows 128 alone: 256 plain CTAs of 33 tiles in two
+waves become 152 CTAs of 56-57 tiles with 2 partial slots per pair, 5.6-7.1 %
+faster whole call in every mode; rows 1-64 (one wave) and rows 256 and above
+(more than two waves) keep the plain cut. On an R200 (212 SMs) it is rows 128
+(256 plain CTAs in two waves, the second 44 wide, become 212 CTAs of 39-40
+tiles with 2 slots per pair: 19-21 % faster whole call in every mode) and rows
+256 (512 plain CTAs in three waves become 212 CTAs of 79-80 tiles with 2
+slots: 8-9 % faster); rows 1-64 (one wave) and rows 318 and above (more than
+three waves) keep the plain cut. So does 10.0 everywhere, where the same
+two-wave grids tie on a B200. On an
 A100 (108 SMs) at the owner's 24 x 2 heads and 2051 selections (33 tiles):
 rows 1-32 run at most one wave and take the K-first program; rows 64 (4
 splits, 512 CTAs, 9 tiles per CTA) take the K-first program; rows 128 (2
@@ -186,12 +215,14 @@ environment-stream context.
   and the normalised partial output of its group's heads in FP32 and, above
   one split, writes `partial_out` / `partial_lse`; with one split it writes
   the gated BF16 output.
-- `decode_whole_tile` (plain build, `sm_80` only): the previous release's
-  decode program with the same parameters, grid, launch bound and
-  shared-memory pool; it gathers each tile's K / V rows whole, issues its
-  copies without an L2 cache hint and selects the E2M1 nibbles by shift.
-  The program rule launches it on the wide grids: above one resident wave
-  with at least 16 tiles (1024 selected tokens) per CTA.
+- `decode_whole_tile` (plain build, `sm_80` and `sm_120a`): the previous
+  release's decode program with the same parameters, grid, launch bound and
+  shared-memory pool; it gathers each tile's K / V rows whole and selects the
+  E2M1 nibbles by shift; the `sm_80` build issues its copies without an L2
+  cache hint, the `sm_120a` build with the evict-first policy. The program
+  rule launches it on the wide calls: on `sm_80` above one resident wave with
+  at least 16 tiles (1024 selected tokens) per CTA, on `sm_120a` at least 11
+  tiles (704 selected tokens) per CTA whatever the grid.
 - `decode_coop` (cooperative build): the same decode launched cooperatively;
   after its partials each CTA takes a slice of its (row, KV head) group's
   output, waits on the group's counter and merges every split's partial for
@@ -209,14 +240,15 @@ environment-stream context.
   counter and slice merge as `decode_coop`; one CTA per SM. The host selects
   it under the form rule's eager rule alone (10.0 / 10.3 on an `aarch64` host, `rows <= 4`,
   no capture; never on 10.7); every other 10.0 / 10.3 / 10.7 call takes `decode_tcgen05`.
-- `decode_tcgen05_persistent` (persistent build, `sm_103a` only): the tcgen05
+- `decode_tcgen05_persistent` (persistent build, `sm_103a` / `sm_107a`): the tcgen05
   decode's body on a grid of `walk_ctas = min(sm_count, rows * num_kv_heads *
   tiles)` CTAs, each walking a contiguous range of the (row, KV head) x tile
   slots and writing one partial slot per pair segment (`num_splits` is the
   most segments any pair has, `walk_splits`); Q^T double-buffered across
   pairs, the raw ring live across the walk, a 183,680-byte pool (192,896 B of
   dynamic shared memory as launched). The host
-  selects it on 10.3 for two-wave split-form grids (the program rule).
+  selects it on 10.3 for two-wave and on 10.7 for two- and three-wave
+  split-form grids (the program rule).
 - `merge`: `out[row, head] = bf16(bf16(merged) * sigmoid(gate))` where
   `merged` is the LSE-weighted mean of the splits' partials; split-parallel
   over four warps above four splits, one warp per head at or below. On

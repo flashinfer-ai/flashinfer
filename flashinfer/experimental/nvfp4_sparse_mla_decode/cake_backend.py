@@ -19,19 +19,21 @@ Generated-program backend: NVFP4 sparse MLA decode (SM100 / SM103).
 operator and tensor ABI as the hand-written ``backend="cuda"`` kernel (E4M3
 ``[T, 16, 576]`` queries, 352-byte ``nvfp4_ds_mla`` cache rows, int32
 ``[T, topk]`` row ids with ``-1`` marking an empty slot, BF16 ``[T, 16, 512]``
-output), served by a family of generated kernels.  One thread-block cluster of
-``C`` CTAs serves one query token (grid ``(T, C, 1)``, cluster ``(1, C, 1)``):
-CTA ``c`` owns the keys ``[c * keys_per_cta, (c + 1) * keys_per_cta)``, walks
-them in 32-key stages with 8 math warps, 4 softmax warps and 2 loader warps,
-and either writes the normalized output directly (``C = 1``) or pushes its
-fp32 partial ``(O, m, l)`` through distributed shared memory to the cluster
-peers that own the 8-dim output groups, which merge and store.  ``C`` is one of
-1, 2, 3, 4, 5, 6 or 8 -- one program per cluster size, delivered for both
-architectures (``cake_jit.MODULES``) -- and is planned per launch from the
-driver's one-wave cluster capacity unless the caller forces it with
-``num_ctas_per_token``.  Nothing is allocated at launch (only the optional
-output), so a prepared runner is CUDA Graph safe.  See ``README.md`` in this
-package.
+output), served by a family of generated tcgen05 kernels.  One thread-block
+cluster of ``C`` CTAs serves one query token (grid ``(T, C, 1)``, cluster
+``(1, C, 1)``, 512 threads): CTA ``c`` owns the keys ``[c * keys_per_cta,
+(c + 1) * keys_per_cta)`` with ``keys_per_cta = ceil(topk / C)``, gathers
+their raw rows with TMA, dequantizes them and computes ``S`` and ``O`` on the
+tensor core in 128-key tiles, and either writes the normalized output directly
+(``C = 1``) or pushes its fp32 partial ``(O, m, l)`` through distributed shared
+memory to the cluster peers that own the 8-dim output groups, which merge and
+store.  ``C`` is one of 1, 2, 3, 4, 5, 6 or 8, and every cluster size has one
+program per split bound (at most 64, 128, 192 or 256 keys per CTA, or any) --
+delivered for both architectures (``cake_jit.MODULES``).  ``C`` is planned per
+launch from the driver's one-wave cluster capacity unless the caller forces it
+with ``num_ctas_per_token``; the split bound follows from ``keys_per_cta``.
+Nothing is allocated at launch (only the optional output), so a prepared runner
+is CUDA Graph safe.  See ``README.md`` in this package.
 """
 
 from __future__ import annotations
@@ -49,23 +51,24 @@ from .cake_jit import (
     ARCH_BY_CAPABILITY,
     ARCHES,
     CLUSTER_SIZES,
+    MAX_KEYS,
     MODULES,
     arch_for_capability,
     launch_args,
     launch_grid,
     load,
+    program_max_keys,
+    record_for,
     registered_clusters,
     select_module,
 )
 
 __all__ = [
     "CLUSTER_SIZES",
-    "MAX_KEYS_PER_CTA",
+    "MAX_KEYS",
+    "MIN_PLAN_KEYS",
     "NVFP4SparseMLADecodeCakeRunner",
     "PLAN_CTAS",
-    "SMEM_BYTES",
-    "SMEM_BYTES_CLUSTER",
-    "STAGE_KEYS",
     "SUPPORTED_COMPUTE_CAPABILITIES",
     "THREADS",
     "cluster_capacity_for",
@@ -75,24 +78,23 @@ __all__ = [
     "nvfp4_sparse_mla_decode",
     "plan_ctas",
     "prepare_nvfp4_sparse_mla_decode",
+    "program_max_keys",
+    "split_cost",
 ]
 
 SUPPORTED_COMPUTE_CAPABILITIES = dict(ARCH_BY_CAPABILITY)
 assert set(SUPPORTED_COMPUTE_CAPABILITIES.values()) == set(ARCHES)
 
-# Generated-kernel constants (copied from the program that the export renders;
+# Generated-kernel constant (copied from the programs that the export renders;
 # the registry's launch records must agree, see ``_check_launch_record``).
-THREADS = 448  # 8 math warps + 4 softmax warps + 2 loader warps
-STAGE_KEYS = 32  # keys per pipeline stage; keys_per_cta is a multiple of it
-MAX_KEYS_PER_CTA = 2048  # entries of the per-CTA shared-memory index table
-SMEM_BYTES = 192256  # dynamic shared memory of the generated program, cluster size 1 (pool + mbarriers)
-SMEM_BYTES_CLUSTER = (
-    226816  # dynamic shared memory of the generated program, cluster size > 1
-)
+THREADS = 512  # 4 layout, 4 softmax, 2 MMA, 2 TMA gather and 4 tile-0 copy warps
 # Split sizes the automatic plan considers, largest first; 1 is the fallback
-# when no split leaves every CTA a full stage.  7 is not a variant of the program.
+# when no split leaves every CTA MIN_PLAN_KEYS keys.  7 is not a variant of the
+# program.
 PLAN_CTAS = (8, 6, 5, 4, 3, 2)
 assert tuple(sorted((1, *PLAN_CTAS))) == CLUSTER_SIZES
+# Fewest keys per CTA the automatic plan gives a split.
+MIN_PLAN_KEYS = 32
 LOG2E = math.log2(math.e)
 
 # Exact keyword set of the generated program's ``run`` entry (bound through the
@@ -101,6 +103,7 @@ LOG2E = math.log2(math.e)
 MAIN_KWARGS = (
     "q",
     "kv",
+    "kv_rows",
     "indices",
     "out",
     "topk",
@@ -117,45 +120,46 @@ MAIN_KWARGS = (
 
 
 def keys_per_cta(topk: int, num_ctas: int) -> int:
-    """Keys each CTA of a ``num_ctas`` split owns: ``topk / num_ctas`` rounded up to whole 32-key stages."""
-    kpc = -(-int(topk) // int(num_ctas))
-    kpc = -(-kpc // STAGE_KEYS) * STAGE_KEYS
-    if kpc > MAX_KEYS_PER_CTA:
-        raise ValueError(
-            f"{kpc} keys per CTA exceed the {MAX_KEYS_PER_CTA}-entry index table"
-        )
-    return kpc
+    """Keys each CTA of a ``num_ctas`` split owns: ``ceil(topk / num_ctas)``."""
+    return -(-int(topk) // int(num_ctas))
+
+
+def split_cost(keys: int) -> int:
+    """Work of one CTA that owns ``keys`` keys, in 64-key halves of a 128-key
+    tile: the programs of at most 256 keys skip an empty half tile, the general
+    program walks whole tiles."""
+    keys = int(keys)
+    return -(-keys // 64) if keys <= 256 else 2 * -(-keys // 128)
 
 
 def plan_ctas(*, num_tokens: int, topk: int, capacity: Dict[int, int]) -> int:
-    """Key splits per token: the largest of 8, 6, 5, 4, 3, 2 giving every CTA at least one full 32-key stage
-    and leaving no CTA without keys (:func:`is_valid_split`) whose ``num_tokens`` clusters are co-resident in
-    one wave (``capacity[c]`` clusters of ``c`` CTAs run at once); otherwise the smallest such size (several
-    waves); 1 when no split leaves a full stage per CTA."""
+    """Key splits per token: among 8, 6, 5, 4, 3, 2 giving every CTA at least
+    :data:`MIN_PLAN_KEYS` keys and leaving no CTA without keys
+    (:func:`is_valid_split`) whose ``num_tokens`` clusters are co-resident in one
+    wave (``capacity[c]`` clusters of ``c`` CTAs run at once), the one with the
+    least work per CTA (:func:`split_cost`), then the fewest CTAs; otherwise the
+    smallest such size (several waves); 1 when no split qualifies."""
+    topk = int(topk)
     valid = [
-        c for c in PLAN_CTAS if topk // c >= STAGE_KEYS and is_valid_split(topk, c)
+        c for c in PLAN_CTAS if topk // c >= MIN_PLAN_KEYS and is_valid_split(topk, c)
     ]
-    for c in valid:
-        if num_tokens <= capacity.get(c, 0):
-            return c
+    one_wave = [c for c in valid if num_tokens <= capacity.get(c, 0)]
+    if one_wave:
+        return min(one_wave, key=lambda c: (split_cost(keys_per_cta(topk, c)), c))
     return valid[-1] if valid else 1
 
 
 def is_valid_split(topk: int, num_ctas: int) -> bool:
-    """Whether the program admits ``num_ctas`` CTAs per token for ``topk`` keys.
+    """Whether the programs admit ``num_ctas`` CTAs per token for ``topk`` keys.
 
-    ``num_ctas`` must be 1 or one of :data:`PLAN_CTAS` (7 is not a variant), the
-    per-CTA share must fit the index table, and for a cluster the rounded share
-    must not leave a CTA without keys (``ceil(topk / keys_per_cta) == num_ctas``).
+    ``num_ctas`` must be 1 or one of :data:`PLAN_CTAS` (7 is not a variant), and
+    for a cluster the per-CTA share must not leave a CTA without keys
+    (``ceil(topk / keys_per_cta) == num_ctas``).
     """
-    num_ctas = int(num_ctas)
-    if int(topk) <= 0 or (num_ctas != 1 and num_ctas not in PLAN_CTAS):
+    topk, num_ctas = int(topk), int(num_ctas)
+    if topk <= 0 or (num_ctas != 1 and num_ctas not in PLAN_CTAS):
         return False
-    try:
-        kpc = keys_per_cta(topk, num_ctas)
-    except ValueError:
-        return False
-    return num_ctas == 1 or -(-int(topk) // kpc) == num_ctas
+    return num_ctas == 1 or -(-topk // keys_per_cta(topk, num_ctas)) == num_ctas
 
 
 # ---------------------------------------------------------------------------
@@ -177,11 +181,11 @@ def _device_arch(device: torch.device | int) -> str:
 def generated_program_available(
     device: torch.device, num_ctas: Optional[int] = None
 ) -> bool:
-    """True when this checkout delivers the program for ``device``.
+    """True when this checkout delivers the programs for ``device``.
 
-    With ``num_ctas`` the check names the program of that cluster size; without
-    it every cluster size of the program must be delivered (the automatic plan
-    may select any of them).
+    With ``num_ctas`` the check names the programs of that cluster size (every
+    split bound); without it every cluster size must be delivered (the automatic
+    plan may select any of them).
     """
     arch = arch_for_capability(tuple(torch.cuda.get_device_capability(device)))
     if arch is None:
@@ -213,44 +217,42 @@ def _max_active_clusters(module: Any, record: dict[str, Any], device_index: int)
 
 @functools.cache
 def cluster_capacity_for(device_index: int) -> Dict[int, int]:
-    """``{cluster size: co-resident clusters}`` of the device for the program's split sizes.
+    """``{cluster size: co-resident clusters}`` of the device for the split sizes.
 
-    Asks each split's own library (its ``max_active_clusters`` entry, the
-    ``cudaOccupancyMaxActiveClusters`` of that program's launch configuration),
-    so the first automatic plan on a device builds every :data:`PLAN_CTAS`
-    library.
+    Asks the general program of each split size (its ``max_active_clusters``
+    entry, the ``cudaOccupancyMaxActiveClusters`` of that program's launch
+    configuration; every program runs one CTA per SM), so the first automatic
+    plan on a device builds the general library of every :data:`PLAN_CTAS` size.
     """
     arch = _device_arch(device_index)
     capacity: Dict[int, int] = {}
     with torch.cuda.device(device_index):
         for c in PLAN_CTAS:
-            name = select_module(arch, c)
+            name = record_for(c, 0)
             module = load(name, arch)
             capacity[c] = _max_active_clusters(module, MODULES[name], device_index)
     return capacity
 
 
 def _check_launch_record(record: dict[str, Any], num_ctas: int) -> None:
-    """The registry's launch record must be the generated-kernel constants this host side assumes."""
+    """The registry's launch record must be the launch this host side assumes."""
     launch = record["launch"]
     expected = {
         "block": (THREADS, 1, 1),
         "cluster": (1, num_ctas, 1),
         "cooperative": False,
-        "dynamic_smem_bytes": SMEM_BYTES if num_ctas == 1 else SMEM_BYTES_CLUSTER,
         "use_pdl": False,
     }
     actual = {
         "block": tuple(int(v) for v in launch["block"]),
         "cluster": tuple(int(v) for v in launch["cluster"]),
         "cooperative": bool(launch["cooperative"]),
-        "dynamic_smem_bytes": int(launch["dynamic_smem_bytes"]),
         "use_pdl": launch["use_pdl"],
     }
-    if actual != expected:
+    if actual != expected or int(launch["dynamic_smem_bytes"]) <= 0:
         raise RuntimeError(
-            f"registered launch record {actual} of the cluster-size-{num_ctas} program "
-            f"differ from the generated-kernel constants {expected}"
+            f"registered launch record {dict(launch)} of the cluster-size-{num_ctas} program "
+            f"differs from the launch {expected} with positive dynamic shared memory"
         )
 
 
@@ -275,6 +277,7 @@ class NVFP4SparseMLADecodeCakeRunner:
     arch: str
     num_ctas: int
     keys_per_cta: int
+    max_keys: int
     grid: tuple[int, int, int]
     out: torch.Tensor
     entry: Callable[..., Any]
@@ -301,9 +304,9 @@ def prepare_nvfp4_sparse_mla_decode(
     """Validate the inputs, plan the cluster size and bind the launch.
 
     Every allocation happens here (only the optional ``out``); the returned
-    runner launches with none.  The library of the selected cluster size (and,
-    for the automatic plan, of every planned size) is built and loaded here,
-    so prepare outside CUDA Graph capture.
+    runner launches with none.  The library of the selected program (and, for
+    the automatic plan, the general library of every planned size) is built and
+    loaded here, so prepare outside CUDA Graph capture.
     """
     _check_inputs(query, kv_cache, indices, out)
     device = query.device
@@ -341,20 +344,22 @@ def prepare_nvfp4_sparse_mla_decode(
         if not is_valid_split(topk, num_ctas):
             raise ValueError(
                 f"num_ctas_per_token={num_ctas} is not valid for topk={topk}: the generated "
-                f"program serves cluster sizes {CLUSTER_SIZES} whose per-CTA share of at most "
-                f"{MAX_KEYS_PER_CTA} keys (whole {STAGE_KEYS}-key stages) leaves no CTA empty"
+                f"programs serve cluster sizes {CLUSTER_SIZES} whose per-CTA share "
+                "ceil(topk / C) leaves no CTA empty"
             )
     kpc = keys_per_cta(topk, num_ctas)
 
-    module_name = select_module(arch, num_ctas)
+    module_name = select_module(arch, num_ctas, kpc)
     record = MODULES[module_name]
     _check_launch_record(record, num_ctas)
     with torch.cuda.device(device_index):
         module = load(module_name, arch)
     grid = launch_grid(record, num_tokens=num_tokens)
+    rows = kv_cache.view(-1, 352)
     main_kwargs = dict(
         q=query.view(torch.int32),
-        kv=kv_cache.view(-1),
+        kv=rows.view(torch.int32),
+        kv_rows=rows,
         indices=indices,
         out=out,
         topk=topk,
@@ -368,7 +373,15 @@ def prepare_nvfp4_sparse_mla_decode(
     arguments = launch_args(record, main_kwargs, grid)
     entry = getattr(module, record["ffi_entry"])
     return NVFP4SparseMLADecodeCakeRunner(
-        module_name, arch, num_ctas, kpc, grid, out, entry, arguments
+        module_name,
+        arch,
+        num_ctas,
+        kpc,
+        int(record["max_keys"]),
+        grid,
+        out,
+        entry,
+        arguments,
     )
 
 
