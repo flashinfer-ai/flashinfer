@@ -3657,17 +3657,29 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
         assert cake_kcp.LAST_CALL["fwd"]["graph"] == "replay"
         cap_cc = graph_cap if capped else "none"
         assert [c[0] for c in ccs] == [eager_cc, cap_cc, cap_cc, cap_cc], ccs
-        assert [c[1] for c in ccs] == [eager_cc, eager_cc, cap_cc, cap_cc], ccs
+        # the backward's validity key hashes the workspace pools and the saved tensors: whether the second
+        # replay-mode call repeats the first call's key (capture at the second call, like the forward) or sees a
+        # key the first calls changed (capture at the third) depends on which pools those calls create -- both
+        # were observed (sm_100a two-level-carry rows: second; sm_103a: third) -- so the sequence is pinned by its
+        # structure: eager calls, one capture, replays after it
+        bwd_events = [e[1] for e in events]
+        cap_b = bwd_events.index("capture")
+        assert cap_b in (1, 2), events
+        assert bwd_events == ["eager"] * cap_b + ["capture"] + ["replay"] * (
+            3 - cap_b
+        ), events
+        assert [c[1] for c in ccs] == [eager_cc] * cap_b + [cap_cc] * (4 - cap_b), ccs
         if capped and graph_cap in cake_kcp.GRAPH_NODE_CAPS:
             # kernel-node cap forms: nothing launched bare; every captured tape launch carries the node attribute
             assert programs.capture_skips == skips0, (programs.capture_skips, skips0)
-            assert programs.node_attrs == nodes0 + tapes[1][0] + tapes[2][1], (
+            assert programs.node_attrs == nodes0 + tapes[1][0] + tapes[cap_b][1], (
                 programs.node_attrs,
                 nodes0,
                 tapes,
             )
             assert (
-                nodes[1][0] == tapes[1][0] >= 1 and nodes[2][1] == tapes[2][1] >= 1
+                nodes[1][0] == tapes[1][0] >= 1
+                and nodes[cap_b][1] == tapes[cap_b][1] >= 1
             ), (
                 nodes,
                 tapes,
@@ -3675,7 +3687,7 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
             assert [n[0] for n in nodes[1:]] == [tapes[1][0]] * 3, (
                 nodes
             )  # the replays carry the capture's record
-            assert brackets[1][0] is None and brackets[2][1] is None, brackets
+            assert brackets[1][0] is None and brackets[cap_b][1] is None, brackets
             evidence = programs.node_attr_log
             assert evidence and all(
                 e["rc"] == 0
@@ -3691,7 +3703,7 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
             if graph_cap == "capture_pref":
                 for b in (
                     brackets[1][0],
-                    brackets[2][1],
+                    brackets[cap_b][1],
                 ):  # the forward's and the backward's capture evidence
                     assert [e["set"] for e in b] == [
                         cake_kcp.WALK_CACHE_CONFIG_CAP,
@@ -3699,7 +3711,7 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
                     ], b
                     assert all(e["rc"] == 0 and e["readback"] == e["set"] for e in b), b
             else:
-                assert brackets[1][0] is None and brackets[2][1] is None, brackets
+                assert brackets[1][0] is None and brackets[cap_b][1] is None, brackets
         out2, _ = cake_kcp.chunk_kda_kcp_fwd(
             q.clone(), k, v, g, beta, ctx, workspace=ws, graph="replay", **knobs
         )
@@ -4627,8 +4639,14 @@ def test_local_stage_values_cover_the_records(H, arch, sm, monkeypatch) -> None:
         "kcp_dav",
         expect("dqkg", b),
         expect("glm_intra", b),
-        expect("gate_epilogue", b),
+        # the gate epilogue launches only where the plan's GLM intra program does not fuse it (sm_100a / sm_107a:
+        # glm_intra; sm_103a runs glm_intra_v14, and the stage call launches nothing)
+        *([expect("gate_epilogue", b)] if plan.dispatched("gate_epilogue", b) else []),
     ]
+    assert plan.dispatched("gate_epilogue", b) == (arch != "sm_103a")
+    assert expect("glm_intra", b) == (
+        "glm_intra_v14" if arch == "sm_103a" else "glm_intra"
+    )
     if (
         H == 64 and arch != "sm_107a"
     ):  # the plan fuses the WY representation into its recurrences there
