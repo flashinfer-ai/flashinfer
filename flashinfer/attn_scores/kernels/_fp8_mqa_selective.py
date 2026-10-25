@@ -2195,9 +2195,12 @@ class FP8MQASelectiveLogitsKernel(_FP8MQAEngineMixin):
     @cute.jit
     def _ordered_key(self, score):
         bits = cutlass.Uint32(fp32_to_i32_bits(score))
-        sign_mask = cutlass.Uint32(0x80000000)
-        if cutlass.Int32(bits) < 0:
-            sign_mask = cutlass.Uint32(0xFFFFFFFF)
+        # Keep the sign dependency explicit across guarded policy-word loads:
+        # negative scores invert every bit; nonnegative scores flip the sign bit.
+        # Arithmetic sign extension avoids a select in the ordering transform.
+        sign_mask = cutlass.Uint32(cutlass.Int32(bits) >> 31) | cutlass.Uint32(
+            0x80000000
+        )
         return bits ^ sign_mask
 
     @cute.jit

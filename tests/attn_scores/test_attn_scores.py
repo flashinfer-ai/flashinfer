@@ -5767,6 +5767,53 @@ def test_engine_sampled_common_and_exact_repair(force_ties, math_mode):
 
 
 @_requires_selective_sm100
+@pytest.mark.parametrize("ties", [True, False], ids=["tied", "distinct"])
+@pytest.mark.parametrize("q_lengths", [[2], [2, 2]], ids=["compact", "standard"])
+def test_unified_wrapper_exact_repair_negative_threshold(q_lengths, ties):
+    """Exact repair keys a negative TopK threshold in both repair layouts."""
+
+    # Positive dots with negative weights give negative scores. Tied rows
+    # overflow both bounded passes; varying scales also tests strict ordering.
+    inputs = _request_inputs(q_lengths, [9001] * len(q_lengths))
+    q, kv, scale, weights, cu_q, cu_kv = inputs
+    q.copy_(torch.ones(q.shape, device=q.device).to(q.dtype))
+    kv.copy_(torch.ones(kv.shape, device=kv.device).to(kv.dtype))
+    scale.fill_(1.0)
+    if not ties:
+        # Distinct negative scores exercise ordering, not just sign mapping.
+        scale.copy_(torch.linspace(1.0, 2.0, scale.numel(), device=scale.device))
+    weights.fill_(-1.0)
+    kv_fused, block_table = _paged_inputs(inputs)
+
+    wrapper = FP8PagedMQATopKWrapper(
+        strategy="selective",
+        max_context_length=9001,
+        max_chunk_size=q.shape[0],
+        max_batch_size=len(q_lengths),
+        kv_layout=kv_fused,
+    )
+    wrapper.prepare_pool(kv_fused)
+    engine = wrapper._capacity_plan._engine
+    assert engine._compact_repair == (len(q_lengths) == 1)
+    wrapper.plan(cu_q, cu_kv, block_table, num_query_rows=q.shape[0])
+    selected = wrapper.run(q, weights, kv_fused)
+    torch.cuda.synchronize()
+
+    assert wrapper.error.item() == wrapper.repair_error.item() == 0
+    if ties:
+        assert int(engine._second_repair_flags.count_nonzero()) == q.shape[0]
+    expected = _oracle_rows(inputs)
+    assert all(bool((row < 0).all()) for row in expected)
+    _check_selection(selected, expected, 512)
+    if not ties:
+        outside = torch.topk(expected[0], 513).indices[-1]
+        corrupted = selected.clone()
+        corrupted[0, 0] = outside
+        with pytest.raises(AssertionError):
+            _check_selection(corrupted, expected, 512)
+
+
+@_requires_selective_sm100
 @pytest.mark.parametrize("math_mode", ["relu_fast", "relu_strict"])
 def test_sample_candidate_overflow_and_exact_modes(math_mode):
     from flashinfer.attn_scores.selective_logits import (
