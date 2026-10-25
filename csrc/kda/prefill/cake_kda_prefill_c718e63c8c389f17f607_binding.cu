@@ -355,10 +355,8 @@ void Run(TensorView a_q, TensorView a_q_tma, TensorView a_k, TensorView a_k_tma,
   CheckUnitInnerStride(a_v, "v");
   check_same_device(a_v, a_q, "v", "q");
   check_same_device(a_v_tma, a_q, "v_tma", "q");
-  check_contiguous(a_g, "g");
   check_same_device(a_g, a_q, "g", "q");
   check_same_device(a_g_tma, a_q, "g_tma", "q");
-  check_contiguous(a_beta, "beta");
   check_same_device(a_beta, a_q, "beta", "q");
   check_same_device(a_beta_tma, a_q, "beta_tma", "q");
   check_contiguous(a_A_log, "A_log");
