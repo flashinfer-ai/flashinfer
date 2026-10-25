@@ -147,7 +147,9 @@ def test_active_stage_grids_are_bounded_by_capacity(tokens, gemm_y):
     module = _session_module()
     grids = module._active_stage_grids(tokens)
 
-    assert grids["dispatch"] == (8 * tokens, 1, 1)
+    # up to 16 active rows one extra dispatch CTA computes the route (no route kernel)
+    assert grids["dispatch"] == (8 * tokens + (1 if tokens <= 16 else 0), 1, 1)
+    assert grids["stage_inputs"] == (tokens, 1, 1)
     assert "route_count" not in grids and "route_scatter" not in grids
     assert grids["gemm1_swiglu"] == (32, gemm_y, 1)
     assert grids["gemm2"] == (56, gemm_y, 1)

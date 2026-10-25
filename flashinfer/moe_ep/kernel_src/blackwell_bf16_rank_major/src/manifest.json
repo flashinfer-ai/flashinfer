@@ -17,21 +17,61 @@
     "world_size": 8
   },
   "kernel_symbols": [
-    "kernel_rank_major_input_barrier_v1",
-    "kernel_rank_major_dispatch_v1",
+    "kernel_rank_major_stage_inputs_v1",
+    "kernel_rank_major_input_arrive_v1",
+    "kernel_rank_major_dispatch_v2",
     "kernel_rank_major_route_fused_v1",
     "kernel_rank_major_exact_fc1_swiglu_v1",
     "kernel_trtllm_moe_bmm_tile_n64_fc2_bf16",
     "kernel_rank_major_exact_unpermute_v2",
-    "kernel_rank_major_partial_barrier_v1",
-    "kernel_rank_major_combine_v2"
+    "kernel_rank_major_partial_arrive_v1",
+    "kernel_rank_major_combine_v3"
   ],
   "schema_version": 1,
-  "source_sha256": "252dbdd7d82545ce873aed9fad0cd774e169926e52d6f2d3e9729a7a75212c09",
+  "source_sha256": "96283d84de09afaea949a580bce19ddfe60ba1428be4ed79a14324fd09ab4ca1",
   "stages": [
     {
       "bindings": [
-        "expert_ids",
+        "hidden_in",
+        "ids_in",
+        "weights_in",
+        "hidden_states",
+        "topk_ids",
+        "topk_weights",
+        "ids_is_int64",
+        "hidden_copy",
+        "active_tokens_per_rank"
+      ],
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "dynamic_smem_bytes": 0,
+      "grid": [
+        128,
+        1,
+        1
+      ],
+      "name": "stage_inputs",
+      "pdl_launch": true,
+      "pdl_sync": false,
+      "scalar_bindings": [
+        [
+          "active_tokens_per_rank",
+          128
+        ]
+      ],
+      "symbol": "kernel_rank_major_stage_inputs_v1",
+      "use_pdl": false
+    },
+    {
+      "bindings": [
         "topk_ids",
         "active_tokens_per_rank",
         "pg_world",
@@ -55,17 +95,17 @@
         1,
         1
       ],
-      "name": "input_barrier",
+      "name": "input_arrive",
       "pdl_launch": true,
-      "pdl_sync": false,
+      "pdl_sync": true,
       "scalar_bindings": [
         [
           "active_tokens_per_rank",
           128
         ]
       ],
-      "symbol": "kernel_rank_major_input_barrier_v1",
-      "use_pdl": false
+      "symbol": "kernel_rank_major_input_arrive_v1",
+      "use_pdl": true
     },
     {
       "bindings": [
@@ -82,7 +122,16 @@
         "topk_ids_peers",
         "topk_weights",
         "topk_weights_peers",
-        "routed"
+        "routed",
+        "expert_scatter_offsets",
+        "token_to_permuted",
+        "cta_to_expert",
+        "cta_to_mn_limit",
+        "expert_padded_row_offsets",
+        "num_non_exiting_ctas",
+        "total_padded_rows",
+        "route_map",
+        "zero_sentinel"
       ],
       "block": [
         256,
@@ -96,7 +145,7 @@
       ],
       "dynamic_smem_bytes": 15488,
       "grid": [
-        1024,
+        1025,
         1,
         1
       ],
@@ -109,7 +158,7 @@
           128
         ]
       ],
-      "symbol": "kernel_rank_major_dispatch_v1",
+      "symbol": "kernel_rank_major_dispatch_v2",
       "use_pdl": true
     },
     {
@@ -294,11 +343,11 @@
         1,
         1
       ],
-      "name": "partial_barrier",
+      "name": "partial_arrive",
       "pdl_launch": true,
       "pdl_sync": true,
       "scalar_bindings": [],
-      "symbol": "kernel_rank_major_partial_barrier_v1",
+      "symbol": "kernel_rank_major_partial_arrive_v1",
       "use_pdl": true
     },
     {
@@ -331,7 +380,7 @@
       "pdl_launch": false,
       "pdl_sync": true,
       "scalar_bindings": [],
-      "symbol": "kernel_rank_major_combine_v2",
+      "symbol": "kernel_rank_major_combine_v3",
       "use_pdl": true
     }
   ]

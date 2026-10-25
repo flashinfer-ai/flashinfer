@@ -32,22 +32,34 @@ _LOCAL_EXPERTS = _NUM_EXPERTS // _WORLD_SIZE
 _TOP_K = 8
 _FIXED_EXPERT_ROWS = 32768
 _MAX_Y_GROUPS = 512
+_ROUTE_IN_DISPATCH_MAX_T = 16
 _DESCRIPTOR_BYTES = 128
 _FC1_WEIGHT_BOX_DIM = (64, 128, 2, 1)
 _SOURCE_NAME = "flashinfer_blackwell_moe_ep_layer_sm100.cu"
 _STAGE_NAMES = (
-    "input_barrier",
+    "stage_inputs",
+    "input_arrive",
     "dispatch",
     "route_fused",
     "gemm1_swiglu",
     "gemm2",
     "local_unpermute",
-    "partial_barrier",
+    "partial_arrive",
     "combine",
 )
 _STAGE_BINDINGS = {
-    "input_barrier": (
-        "expert_ids",
+    "stage_inputs": (
+        "hidden_in",
+        "ids_in",
+        "weights_in",
+        "hidden_states",
+        "topk_ids",
+        "topk_weights",
+        "ids_is_int64",
+        "hidden_copy",
+        "active_tokens_per_rank",
+    ),
+    "input_arrive": (
         "topk_ids",
         "active_tokens_per_rank",
         "pg_world",
@@ -70,6 +82,15 @@ _STAGE_BINDINGS = {
         "topk_weights",
         "topk_weights_peers",
         "routed",
+        "expert_scatter_offsets",
+        "token_to_permuted",
+        "cta_to_expert",
+        "cta_to_mn_limit",
+        "expert_padded_row_offsets",
+        "num_non_exiting_ctas",
+        "total_padded_rows",
+        "route_map",
+        "zero_sentinel",
     ),
     "route_fused": (
         "recv_local_ids",
@@ -111,7 +132,7 @@ _STAGE_BINDINGS = {
         "hidden_size",
         "active_tokens_per_rank",
     ),
-    "partial_barrier": ("pg_world", "pg_rank", "pg_flags"),
+    "partial_arrive": ("pg_world", "pg_rank", "pg_flags"),
     "combine": (
         "output",
         "pg_world",
@@ -123,9 +144,9 @@ _STAGE_BINDINGS = {
     ),
 }
 _STAGE_LAUNCH_CONTRACTS = {
-    "input_barrier": (
-        (1, 1, 1),
-        (32, 1, 1),
+    "stage_inputs": (
+        (128, 1, 1),
+        (256, 1, 1),
         (1, 1, 1),
         0,
         (("active_tokens_per_rank", 128),),
@@ -133,8 +154,18 @@ _STAGE_LAUNCH_CONTRACTS = {
         True,
         False,
     ),
+    "input_arrive": (
+        (1, 1, 1),
+        (32, 1, 1),
+        (1, 1, 1),
+        0,
+        (("active_tokens_per_rank", 128),),
+        True,
+        True,
+        True,
+    ),
     "dispatch": (
-        (1024, 1, 1),
+        (1025, 1, 1),
         (256, 1, 1),
         (1, 1, 1),
         15488,
@@ -183,7 +214,7 @@ _STAGE_LAUNCH_CONTRACTS = {
         True,
         True,
     ),
-    "partial_barrier": ((1, 1, 1), (32, 1, 1), (1, 1, 1), 0, (), True, True, True),
+    "partial_arrive": ((1, 1, 1), (32, 1, 1), (1, 1, 1), 0, (), True, True, True),
     "combine": ((128, 7, 1), (128, 1, 1), (1, 1, 1), 17408, (), True, False, True),
 }
 
@@ -210,7 +241,14 @@ def _active_stage_grids(
     # y-groups, which stays below the y=512 capacity for every active prefix.
     gemm_y = min(_MAX_Y_GROUPS, active_tokens_per_rank + _LOCAL_EXPERTS - 1)
     return {
-        "dispatch": (_WORLD_SIZE * active_tokens_per_rank, 1, 1),
+        "stage_inputs": (active_tokens_per_rank, 1, 1),
+        # up to 16 active rows one extra dispatch CTA computes the route (no route kernel)
+        "dispatch": (
+            _WORLD_SIZE * active_tokens_per_rank
+            + (1 if active_tokens_per_rank <= _ROUTE_IN_DISPATCH_MAX_T else 0),
+            1,
+            1,
+        ),
         "gemm1_swiglu": (32, gemm_y, 1),
         "gemm2": (56, gemm_y, 1),
         "local_unpermute": (_WORLD_SIZE * active_tokens_per_rank, 7, 1),
@@ -686,9 +724,6 @@ class BlackwellBf16RankMajorSession:
         )
         self._routed.local.zero_()
 
-        self._expert_ids_i64 = torch.empty(
-            (_TOKENS_PER_RANK, _TOP_K), dtype=torch.int64, device=self._device
-        )
         self._recv_hidden = torch.zeros(
             (_RANK_MAJOR_TOKENS, _HIDDEN_SIZE),
             dtype=torch.bfloat16,
@@ -730,6 +765,9 @@ class BlackwellBf16RankMajorSession:
         )
 
         self._manifest, source_path = _load_manifest()
+        self._stage_by_name = {
+            stage["name"]: stage for stage in self._manifest["stages"]
+        }
         cubin_path = _compile_cubin(source_path, self._manifest)
         torch.distributed.barrier(group=process_group)
         self._library = _KernelLibrary(
@@ -788,9 +826,30 @@ class BlackwellBf16RankMajorSession:
                 )
             if tensor.device != self._device or not tensor.is_contiguous():
                 raise ValueError(f"{name} must be contiguous on {self._device}")
-        self._hidden_states.local[:active_tokens_per_rank].copy_(hidden_states)
-        self._expert_ids_i64[:active_tokens_per_rank].copy_(topk_ids)
-        self._topk_weights.local[:active_tokens_per_rank].copy_(topk_weights)
+        # One staging kernel: hidden row copy, ids narrowed to int32, weights (the
+        # dependent input barrier waits on it through PDL).
+        hidden_copy = 1
+        if hidden_states.data_ptr() % 16:
+            self._hidden_states.local[:active_tokens_per_rank].copy_(hidden_states)
+            hidden_copy = 0
+        p = self._ptr
+        self._library.launch(
+            self._stage_by_name["stage_inputs"],
+            (
+                p(hidden_states),
+                p(topk_ids),
+                p(topk_weights),
+                p(self._hidden_states.local),
+                p(self._topk_ids.local),
+                p(self._topk_weights.local),
+                1 if topk_ids.dtype is torch.int64 else 0,
+                hidden_copy,
+                active_tokens_per_rank,
+            ),
+            (*self._pointer_types(6), ctypes.c_int32, ctypes.c_int32, ctypes.c_int32),
+            torch.cuda.current_stream(self._device).cuda_stream,
+            grid=(active_tokens_per_rank, 1, 1),
+        )
         self._active_tokens_per_rank = active_tokens_per_rank
         self._inputs_staged = True
 
@@ -936,10 +995,9 @@ class BlackwellBf16RankMajorSession:
             )
         active_tokens_per_rank = self._active_tokens_per_rank
         world_rank = (_WORLD_SIZE, self._rank)
-        if name == "input_barrier":
+        if name in ("input_barrier", "input_arrive"):
             return (
                 (
-                    p(self._expert_ids_i64),
                     p(self._topk_ids.local),
                     active_tokens_per_rank,
                     *world_rank,
@@ -947,7 +1005,6 @@ class BlackwellBf16RankMajorSession:
                     p(self._routed.peers),
                 ),
                 (
-                    ctypes.c_void_p,
                     ctypes.c_void_p,
                     ctypes.c_int32,
                     ctypes.c_int32,
@@ -971,6 +1028,15 @@ class BlackwellBf16RankMajorSession:
                 p(self._topk_weights.local),
                 p(self._topk_weights.peers),
                 p(self._routed.local),
+                p(self._expert_scatter_offsets),
+                p(self._token_to_permuted),
+                p(self._cta_to_expert),
+                p(self._cta_to_mn_limit),
+                p(self._expert_padded_row_offsets),
+                p(self._num_non_exiting_ctas),
+                p(self._total_padded_rows),
+                p(self._route_map),
+                p(self._gemm2_output[_FIXED_EXPERT_ROWS]),
             )
             return values, (
                 ctypes.c_void_p,
@@ -987,6 +1053,7 @@ class BlackwellBf16RankMajorSession:
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.c_void_p,
+                *self._pointer_types(9),
             )
         if name == "route_fused":
             sentinel = self._gemm2_output[_FIXED_EXPERT_ROWS]
@@ -1037,7 +1104,7 @@ class BlackwellBf16RankMajorSession:
                 active_tokens_per_rank,
             )
             return values, (*self._pointer_types(4), ctypes.c_int32, ctypes.c_int32)
-        if name == "partial_barrier":
+        if name in ("partial_barrier", "partial_arrive"):
             return (
                 (*world_rank, p(self._flags.peers)),
                 (ctypes.c_int32, ctypes.c_int32, ctypes.c_void_p),
@@ -1086,6 +1153,13 @@ class BlackwellBf16RankMajorSession:
         active_grids = _active_stage_grids(active_tokens_per_rank)
         stream = torch.cuda.current_stream(self._device).cuda_stream
         for stage in self._manifest["stages"]:
+            if stage["name"] == "stage_inputs":
+                continue
+            if (
+                stage["name"] == "route_fused"
+                and active_tokens_per_rank <= _ROUTE_IN_DISPATCH_MAX_T
+            ):
+                continue
             values, types = self._stage_arguments(stage["name"], output)
             if len(values) != len(stage["bindings"]):
                 raise RuntimeError(
