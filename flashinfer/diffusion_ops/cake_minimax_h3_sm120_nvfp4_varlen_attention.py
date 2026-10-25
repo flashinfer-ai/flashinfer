@@ -32,10 +32,15 @@ from ..jit.cake_minimax_h3_sm120_nvfp4_fp8pv_varlen_attention import (
 )
 from ..jit.cake_minimax_h3_sm120_nvfp4_varlen_attention import (
     ATTENTION,
+    ATTENTION_LEAD,
     ATTENTION_NODELTA,
+    ATTENTION_NODELTA_LEAD,
+    ATTENTION_NODELTA_TAIL,
+    ATTENTION_TAIL,
     ATTENTION_WS,
     ATTENTION_WS_NODELTA,
     PREPROCESS,
+    PREPROCESS_HEAD_MAJOR,
     QUANTIZE_KV,
     QUANTIZE_KV_HBLK64,
     STATS,
@@ -106,6 +111,16 @@ _WS_MIN_SMS = 188
 _WS_NODELTA_FUSED_MIN_SMS = 170
 _WS_MIN_MEAN_SEGMENT = 1536
 _WS_MAX_MEAN_SEGMENT = 16384
+# The overlapped form of a plan of the fused pre-processing, on a part whose SM count has an overlap width P
+# (``minimax_h3_sm120_nvfp4_overlap_grids``): the lead attention launch (a plain launch) over all but P SMs, the
+# head-major pre-processing producers (three CTAs on each of the P SMs the lead leaves free) and the tail
+# attention launch over P CTAs, all three sharing the head-control words ``hctr`` (5 words per head, then 8):
+# each head's operands are published by a ready flag the attention CTAs wait on before their loads, and the
+# words reset themselves in every complete call.
+_OVERLAP_WIDTH = {170: 42, 188: 46}
+_OVERLAP_PRODUCERS_PER_SM = 3
+_HCTR_WORDS_PER_HEAD = 5
+_HCTR_TAIL_WORDS = 8
 _NVFP4_PROGRAMS = (
     PREPROCESS,
     STATS,
@@ -115,6 +130,11 @@ _NVFP4_PROGRAMS = (
     ATTENTION_NODELTA,
     ATTENTION_WS,
     ATTENTION_WS_NODELTA,
+    PREPROCESS_HEAD_MAJOR,
+    ATTENTION_LEAD,
+    ATTENTION_TAIL,
+    ATTENTION_NODELTA_LEAD,
+    ATTENTION_NODELTA_TAIL,
 )
 
 
@@ -236,6 +256,42 @@ def _plan_rows(plan, device: torch.device) -> tuple:
     cached = (tile_rows.to(device), tiles, unit_rows.to(device), plan)
     _PLAN_ROWS[key] = cached
     return cached[0], cached[1], cached[2]
+
+
+_PLAN_ROWS_HM: dict = {}
+
+
+def _plan_rows_head_major(plan, device: torch.device) -> torch.Tensor:
+    """int32 ``[4 * num_units]`` unit rows of the overlapped form, head-major: every unit of head 0, then of head 1,
+    ..., each head's units in segment and Q-tile order, with the rows of ``_plan_rows``.  The attention CTAs take
+    the units in this order, so the heads become ready in the producers' order.  Cached per plan like
+    ``_plan_rows``."""
+    key = (id(plan), _device_index(device))
+    cached = _PLAN_ROWS_HM.get(key)
+    if cached is not None and cached[1] is plan:
+        return cached[0]
+    bounds = [int(b) for b in plan.bounds]
+    per_head: list = []
+    for seg, (a, b) in enumerate(zip(bounds[:-1], bounds[1:], strict=False)):
+        for tile in range(_ceil_div(b - a, _BLOCK_M) if b > a else 0):
+            per_head.append((seg, tile, a, b))
+    rows = [
+        (seg, (head << 16) | tile, a, b)
+        for head in range(plan.num_heads)
+        for seg, tile, a, b in per_head
+    ]
+    if len(rows) != plan.num_units:
+        raise RuntimeError(
+            f"head-major unit rows: {len(rows)} units, the plan has {plan.num_units}"
+        )
+    unit_rows = (
+        torch.tensor(rows, dtype=torch.int32).reshape(-1)
+        if rows
+        else torch.zeros(_UNIT_ROW_INTS, dtype=torch.int32)
+    )
+    cached = (unit_rows.to(device), plan)
+    _PLAN_ROWS_HM[key] = cached
+    return cached[0]
 
 
 def _token_segment_ids(
@@ -643,9 +699,20 @@ def minimax_h3_sm120_nvfp4_programs(
     ``ATTENTION_WS_NODELTA`` when ``delta`` is false; without ``delta`` also when ``num_sms >= 170``
     for a plan of the fused pre-processing) when ``num_sms >= 188`` and the mean segment length
     ``tokens / segments`` (empty segments included) is at least 1536 tokens and, with ``delta``, below
-    16384 tokens; else ``ATTENTION`` / ``ATTENTION_NODELTA``."""
+    16384 tokens; else ``ATTENTION`` / ``ATTENTION_NODELTA``.
+
+    A plan of the fused pre-processing on a part whose SM count has an overlap width
+    (``minimax_h3_sm120_nvfp4_overlap_grids``) runs the overlapped form instead: ``(ATTENTION_LEAD,
+    PREPROCESS_HEAD_MAJOR, ATTENTION_TAIL)`` (``ATTENTION_NODELTA_LEAD`` / ``ATTENTION_NODELTA_TAIL`` when
+    ``delta`` is false) -- the lead attention launch, the head-major pre-processing producers on the SMs the
+    lead leaves free, then the tail attention launch."""
     padded = int(plan.padded_tokens)
-    if _PREPROCESS_MIN_TOKENS <= padded <= _PREPROCESS_MAX_TOKENS:
+    fused = _PREPROCESS_MIN_TOKENS <= padded <= _PREPROCESS_MAX_TOKENS
+    if fused and int(num_sms) in _OVERLAP_WIDTH:
+        if delta:
+            return (ATTENTION_LEAD, PREPROCESS_HEAD_MAJOR, ATTENTION_TAIL)
+        return (ATTENTION_NODELTA_LEAD, PREPROCESS_HEAD_MAJOR, ATTENTION_NODELTA_TAIL)
+    if fused:
         pre: Tuple[CakeProgram, ...] = (PREPROCESS,)
     elif padded > _PREPROCESS_MAX_TOKENS:
         pre = (STATS, QUANTIZE_KV_HBLK64)
@@ -653,7 +720,6 @@ def minimax_h3_sm120_nvfp4_programs(
         pre = (STATS, QUANTIZE_KV)
     tokens, segments = int(plan.total_tokens), int(plan.num_segments)
     bound = _WS_MAX_MEAN_SEGMENT if delta else 0
-    fused = _PREPROCESS_MIN_TOKENS <= padded <= _PREPROCESS_MAX_TOKENS
     ws = tokens >= _WS_MIN_MEAN_SEGMENT * segments and (
         (int(num_sms) >= _WS_MIN_SMS and (bound <= 0 or tokens < bound * segments))
         or (not delta and fused and int(num_sms) >= _WS_NODELTA_FUSED_MIN_SMS)
@@ -724,6 +790,25 @@ def minimax_h3_sm120_nvfp4_launch_grids(
     return preprocess, stats, quantize, attention
 
 
+def minimax_h3_sm120_nvfp4_overlap_grids(
+    num_sms: int, *, num_units: int
+) -> Optional[Tuple[int, int, int]]:
+    """The ``(lead attention, producers, tail attention)`` launch grids of the overlapped form on a device of
+    ``num_sms`` SMs, or ``None`` when that SM count has no overlap width ``P`` (170 SMs: 42, 188 SMs: 46):
+    the lead attention takes one persistent CTA per SM on all but ``P`` SMs up to the unit count,
+    ``max(1, min(num_sms - P, num_units))``; the producers ``3 * P`` CTAs (three per SM on the ``P`` SMs the
+    lead leaves free); the tail attention ``P`` CTAs.  Both attention launches take the units from one shared
+    counter, so the tail CTAs run the units the lead CTAs have not taken."""
+    sms = int(num_sms)
+    if sms <= 0:
+        raise ValueError(f"num_sms must be positive, got {num_sms}")
+    width = _OVERLAP_WIDTH.get(sms)
+    if width is None:
+        return None
+    lead = max(1, min(sms - width, int(num_units)))
+    return lead, _OVERLAP_PRODUCERS_PER_SM * width, width
+
+
 @functools.cache
 def _nvfp4_target(index: int) -> str:
     """The exact target (``"sm_120a"``) every NVFP4 program ships for device ``index``."""
@@ -753,7 +838,9 @@ def _nvfp4_entry(target: str, slot: int) -> Any:
 def _nvfp4_buffers(plan, num_stats_tiles: int, index: int) -> Tuple[torch.Tensor, ...]:
     """The grow-only workspace buffers a call of ``plan`` needs: the quantized operands, scales and
     statistics of the (device, current stream) set (``_workspace``), then the per-device arrival counters
-    and grid-barrier word (``_zero_workspace``), which start zeroed and are reset by the kernels."""
+    and grid-barrier word (``_zero_workspace``) and the overlapped form's head-control words of the
+    (device, current stream) set (``_zero_stream_workspace``), which start zeroed and are reset by the
+    kernels."""
     tokens, heads, hd = plan.total_tokens, plan.num_heads, MINIMAX_H3_HEAD_DIM
     qtiles = max(1, plan.num_tiles)
     n_rows4 = tokens * heads * _ROW_BYTES4
@@ -776,6 +863,12 @@ def _nvfp4_buffers(plan, num_stats_tiles: int, index: int) -> Tuple[torch.Tensor
             index, "counters", max(1, plan.num_segments) * heads, torch.uint32
         ),
         _zero_workspace(index, "barrier", 4, torch.uint32),
+        _zero_stream_workspace(
+            index,
+            "hctr",
+            _HCTR_WORDS_PER_HEAD * heads + _HCTR_TAIL_WORDS,
+            torch.uint32,
+        ),
     )
 
 
@@ -810,6 +903,7 @@ class _Nvfp4Launch:
         n_mean_k = plan.num_segments * heads * hd
         n_partials = max(1, num_stats_tiles * heads * hd)
         n_counters = max(1, plan.num_segments) * heads
+        n_hctr = _HCTR_WORDS_PER_HEAD * heads + _HCTR_TAIL_WORDS
         sizes = (
             n_rows4,
             n_rows4,
@@ -824,6 +918,7 @@ class _Nvfp4Launch:
             n_partials,
             n_counters,
             4,
+            n_hctr,
         )
         (
             q4,
@@ -839,6 +934,7 @@ class _Nvfp4Launch:
             partials,
             counters,
             barrier,
+            hctr,
         ) = (buffer[:size] for buffer, size in zip(buffers, sizes, strict=True))
         q_slots = _q_slots(plan.bounds)
         sms = _sm_count(index)
@@ -857,6 +953,19 @@ class _Nvfp4Launch:
             )
         )
         fused = programs[0] is PREPROCESS
+        overlap = len(programs) == 3 and programs[1] is PREPROCESS_HEAD_MAJOR
+        tail, tail_grid, units_per_head = -1, 1, 0
+        if overlap:
+            # (lead attention, producers, tail attention): the producers take the pre-processing slot, the
+            # lead the attention slot; the attention CTAs take the head-major units
+            grids = minimax_h3_sm120_nvfp4_overlap_grids(sms, num_units=plan.num_units)
+            assert grids is not None
+            attention_grid, preprocess_grid, tail_grid = grids
+            slots = (slots[1], slots[0])
+            tail = _NVFP4_PROGRAMS.index(programs[2])
+            unit_rows = _plan_rows_head_major(plan, device)
+            units_per_head = plan.num_units // heads
+            fused = True
         u32 = torch.uint32
         tensors = (
             _token_segment_ids(plan.bounds, plan.padded_tokens, device),
@@ -877,6 +986,7 @@ class _Nvfp4Launch:
             partials,
             counters,
             barrier,
+            hctr,
             q4.view(tokens, heads, _ROW_BYTES4),
             k4.view(tokens, heads, _ROW_BYTES4),
             k_sf.view(-1, _SCALE_ROW_BYTES),
@@ -898,6 +1008,9 @@ class _Nvfp4Launch:
             preprocess_grid if fused else stats_grid,
             quantize_grid,
             attention_grid,
+            tail,
+            tail_grid,
+            units_per_head,
         )
 
 
@@ -934,6 +1047,68 @@ def _nvfp4_launch(
     return launch
 
 
+# (device index, lead attention slot) of every overlapped form whose three programs are loaded.
+_NVFP4_OVERLAP_LOADED: set = set()
+
+
+def _load_overlap(
+    target: str,
+    slots: Tuple[int, int, int],
+    attention_args: Tuple[Any, ...],
+    producer_args: Tuple[Any, ...],
+    tokens: int,
+    num_kblocks: int,
+    softmax_scale_log2: float,
+    index: int,
+) -> None:
+    """Load the overlapped form's three programs before their first overlapped call on device ``index``.
+
+    The lead attention CTAs wait on flags only the producers set, and a function's first launch loads its
+    module, which waits for the device: with lazy module loading the producers or the tail launched behind a
+    running lead would never start.  Each program is therefore launched once with no work (no unit, no item)
+    on the current stream before the first overlapped call, each on its own scratch control words (one head),
+    which the launch leaves zero again.  Not during graph capture (nothing runs while a graph is captured)."""
+    lead, producers, tail = slots
+    words = _HCTR_WORDS_PER_HEAD + _HCTR_TAIL_WORDS
+    scratch = _zero_workspace(index, "hctr_load", 3 * words, torch.uint32)
+    lead_words, producer_words, tail_words = (
+        tvm_ffi.from_dlpack(scratch[i * words : (i + 1) * words]) for i in range(3)
+    )
+    # attention: no unit, one head; the lead alone (no tail CTA), the tail alone (no lead CTA)
+    _nvfp4_entry(target, lead)(
+        *attention_args,
+        0,
+        1,
+        num_kblocks,
+        softmax_scale_log2,
+        lead_words,
+        1,
+        1,
+        0,
+        1,
+        1,
+        1,
+    )
+    # producers: no statistics tile and no token block, one head
+    _nvfp4_entry(target, producers)(
+        *producer_args, producer_words, 0, tokens, 0, 1, num_kblocks, 1, 1, 1
+    )
+    _nvfp4_entry(target, tail)(
+        *attention_args,
+        0,
+        1,
+        num_kblocks,
+        softmax_scale_log2,
+        tail_words,
+        1,
+        0,
+        1,
+        1,
+        1,
+        1,
+    )
+
+
 # One custom op serves both routes: the attention program slot it is handed selects the compensated or the
 # uncompensated attention.
 @register_custom_op(
@@ -953,6 +1128,7 @@ def _nvfp4_launch(
         "partials",
         "counters",
         "barrier",
+        "hctr",
     ),
 )
 def _minimax_h3_sm120_varlen_attention_nvfp4_impl(
@@ -978,6 +1154,7 @@ def _minimax_h3_sm120_varlen_attention_nvfp4_impl(
     partials: Any,
     counters: Any,
     barrier: Any,
+    hctr: Any,
     q4_rows: Any,
     k4_rows: Any,
     k_sf_rows: Any,
@@ -996,6 +1173,9 @@ def _minimax_h3_sm120_varlen_attention_nvfp4_impl(
     first_grid: int,
     second_grid: int,
     attention_grid: int,
+    tail: int,
+    tail_grid: int,
+    units_per_head: int,
     softmax_scale_log2: float,
     stream: int,
     target: str,
@@ -1006,8 +1186,103 @@ def _minimax_h3_sm120_varlen_attention_nvfp4_impl(
     # ``_NVFP4_PROGRAMS``.  The bindings take the host arguments in the kernels' signature order followed
     # by the grid triple; the attention binding encodes its five tensor maps from the byte tensors handed
     # in its descriptor positions (``*_rows``, views of the quantized operands and scales).
+    # The overlapped form (``tail >= 0``): the lead attention (``attention``, a plain launch over
+    # ``attention_grid`` CTAs), the head-major producers (``first``, ``first_grid`` CTAs) and the tail
+    # attention (``tail``, ``tail_grid`` CTAs), sharing the head-control words ``hctr``.
     tokens, heads = int(q.shape[0]), int(q.shape[1])
     with tvm_ffi.use_raw_stream(_ffi_device(q.device.index), stream):
+        if tail >= 0:
+            attention_args = (
+                q4_rows,
+                k4_rows,
+                k_sf_rows,
+                vt4_rows,
+                v_sf_rows,
+                out,
+                q_sf_words,
+                qm4,
+                qm_sf_words,
+                seg_tile_begin,
+                unit_table,
+            )
+            producer_args = (
+                q,
+                k,
+                v,
+                tile_table,
+                seg_tile_begin,
+                tok_seg,
+                cu_seqlens,
+                partials,
+                counters,
+                mean_k,
+                q_mean,
+                q4,
+                k4,
+                q_sf,
+                k_sf,
+                qm4,
+                qm_sf,
+                vt4,
+                v_sf,
+            )
+            key = (q.device.index, attention)
+            if (
+                key not in _NVFP4_OVERLAP_LOADED
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                _load_overlap(
+                    target,
+                    (attention, first, tail),
+                    attention_args,
+                    producer_args,
+                    tokens,
+                    num_kblocks,
+                    softmax_scale_log2,
+                    q.device.index,
+                )
+                _NVFP4_OVERLAP_LOADED.add(key)
+            _nvfp4_entry(target, attention)(
+                *attention_args,
+                num_units,
+                heads,
+                num_kblocks,
+                softmax_scale_log2,
+                hctr,
+                units_per_head,
+                attention_grid,
+                tail_grid,
+                attention_grid,
+                1,
+                1,
+            )
+            _nvfp4_entry(target, first)(
+                *producer_args,
+                hctr,
+                num_stats_tiles,
+                tokens,
+                padded_tokens,
+                heads,
+                num_kblocks,
+                first_grid,
+                1,
+                1,
+            )
+            _nvfp4_entry(target, tail)(
+                *attention_args,
+                num_units,
+                heads,
+                num_kblocks,
+                softmax_scale_log2,
+                hctr,
+                units_per_head,
+                attention_grid,
+                tail_grid,
+                tail_grid,
+                1,
+                1,
+            )
+            return
         if second < 0:
             _nvfp4_entry(target, first)(
                 q,
@@ -1131,6 +1406,7 @@ def _minimax_h3_sm120_varlen_attention_nvfp4_fake(
     partials: Any,
     counters: Any,
     barrier: Any,
+    hctr: Any,
     q4_rows: Any,
     k4_rows: Any,
     k_sf_rows: Any,
@@ -1149,6 +1425,9 @@ def _minimax_h3_sm120_varlen_attention_nvfp4_fake(
     first_grid: int,
     second_grid: int,
     attention_grid: int,
+    tail: int,
+    tail_grid: int,
+    units_per_head: int,
     softmax_scale_log2: float,
     stream: int,
     target: str,
@@ -1215,7 +1494,12 @@ def minimax_h3_sm120_varlen_attention_nvfp4(
     stream (``minimax_h3_sm120_nvfp4_programs``; grids ``minimax_h3_sm120_nvfp4_launch_grids``): a
     plan of 2048 to 16384 padded tokens runs the fused pre-processing (K sums and Q block means, a
     grid barrier, then the quantized operands, in one cooperative launch); any other plan runs the
-    statistics launch, which also quantizes Q and the block-mean rows, then the K / V quantizer.
+    statistics launch, which also quantizes Q and the block-mean rows, then the K / V quantizer.  On a
+    part of 170 or 188 SMs a plan of 2048 to 16384 padded tokens runs the overlapped form instead
+    (``minimax_h3_sm120_nvfp4_overlap_grids``): the attention starts on most SMs while head-major
+    pre-processing producers fill the remaining SMs, each head's attention waiting for its operands,
+    and a second attention launch takes the remaining work on the producers' SMs; the outputs are
+    bitwise the same.
     The attention launch takes the warp-specialised form on parts of at least 188 SMs when the mean
     segment (empty segments included) is at least 1536 and below 16384 tokens.  The quantized
     operands live in a grow-only workspace per (device, stream) (``workspace_bytes_nvfp4``) whose
@@ -1393,6 +1677,7 @@ __all__ = [
     "minimax_h3_sm120_nvfp4_fp8pv_launch_grids",
     "minimax_h3_sm120_nvfp4_fp8pv_programs",
     "minimax_h3_sm120_nvfp4_launch_grids",
+    "minimax_h3_sm120_nvfp4_overlap_grids",
     "minimax_h3_sm120_nvfp4_programs",
     "minimax_h3_sm120_varlen_attention_nvfp4",
     "minimax_h3_sm120_varlen_attention_nvfp4_nodelta",

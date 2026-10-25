@@ -16,8 +16,8 @@ and ``minimax_h3_sm120_varlen_attention_nvfp4_nodelta`` (no CUDA device): each p
 ``flashinfer.jit.cake_minimax_h3_sm120_nvfp4_varlen_attention`` matches its two translation units (the kernel
 symbol the device unit defines and the binding declares, the binding namespace, the exported ``run`` entry,
 the FFI checks header), its digests follow from the file bytes, its JIT spec carries the target flags,
-``--fmad=false`` and the recorded options, and the host module's program routing, grid rule and Q slot
-count are what the kernels expect."""
+``--fmad=false`` and the recorded options, and the host module's program routing, grid rules (the
+overlapped form's included), head-major unit rows and Q slot count are what the kernels expect."""
 
 import hashlib
 import math
@@ -34,10 +34,15 @@ from flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_varlen_attention impor
 from flashinfer.jit import cake_program
 from flashinfer.jit.cake_minimax_h3_sm120_nvfp4_varlen_attention import (
     ATTENTION,
+    ATTENTION_LEAD,
     ATTENTION_NODELTA,
+    ATTENTION_NODELTA_LEAD,
+    ATTENTION_NODELTA_TAIL,
+    ATTENTION_TAIL,
     ATTENTION_WS,
     ATTENTION_WS_NODELTA,
     PREPROCESS,
+    PREPROCESS_HEAD_MAJOR,
     PROGRAMS,
     QUANTIZE_KV,
     QUANTIZE_KV_HBLK64,
@@ -54,7 +59,14 @@ NAMED = {
     "ATTENTION_NODELTA": ATTENTION_NODELTA,
     "ATTENTION_WS": ATTENTION_WS,
     "ATTENTION_WS_NODELTA": ATTENTION_WS_NODELTA,
+    "PREPROCESS_HEAD_MAJOR": PREPROCESS_HEAD_MAJOR,
+    "ATTENTION_LEAD": ATTENTION_LEAD,
+    "ATTENTION_TAIL": ATTENTION_TAIL,
+    "ATTENTION_NODELTA_LEAD": ATTENTION_NODELTA_LEAD,
+    "ATTENTION_NODELTA_TAIL": ATTENTION_NODELTA_TAIL,
 }
+# The overlapped form's lead attention programs: plain launches (no programmatic dependent launch).
+PLAIN = ("ATTENTION_LEAD", "ATTENTION_NODELTA_LEAD")
 DYNAMIC_SMEM = {
     "PREPROCESS": 16512,
     "STATS": 17024,
@@ -64,6 +76,11 @@ DYNAMIC_SMEM = {
     "ATTENTION_NODELTA": 48128,
     "ATTENTION_WS": 80896,
     "ATTENTION_WS_NODELTA": 80896,
+    "PREPROCESS_HEAD_MAJOR": 16512,
+    "ATTENTION_LEAD": 66560,
+    "ATTENTION_TAIL": 66560,
+    "ATTENTION_NODELTA_LEAD": 48128,
+    "ATTENTION_NODELTA_TAIL": 48128,
 }
 THREADS = {identifier: 256 for identifier in NAMED} | {
     "ATTENTION_WS": 384,
@@ -152,6 +169,14 @@ ATTENTION_ARGS = (
     "num_kblocks",
     "softmax_scale_log2",
 )
+PREPROCESS_HEAD_MAJOR_ARGS = (*PREPROCESS_ARGS[:19], "hctr", *PREPROCESS_ARGS[20:])
+ATTENTION_OVERLAP_ARGS = (
+    *ATTENTION_ARGS,
+    "hctr",
+    "units_per_head",
+    "lead_ctas",
+    "tail_ctas",
+)
 HOST_ARGS = {
     "PREPROCESS": PREPROCESS_ARGS,
     "STATS": STATS_ARGS,
@@ -161,13 +186,18 @@ HOST_ARGS = {
     "ATTENTION_NODELTA": ATTENTION_ARGS,
     "ATTENTION_WS": ATTENTION_ARGS,
     "ATTENTION_WS_NODELTA": ATTENTION_ARGS,
+    "PREPROCESS_HEAD_MAJOR": PREPROCESS_HEAD_MAJOR_ARGS,
+    "ATTENTION_LEAD": ATTENTION_OVERLAP_ARGS,
+    "ATTENTION_TAIL": ATTENTION_OVERLAP_ARGS,
+    "ATTENTION_NODELTA_LEAD": ATTENTION_OVERLAP_ARGS,
+    "ATTENTION_NODELTA_TAIL": ATTENTION_OVERLAP_ARGS,
 }
 
 
-def test_the_loader_publishes_the_eight_programs() -> None:
+def test_the_loader_publishes_the_thirteen_programs() -> None:
     assert tuple(NAMED.values()) == PROGRAMS
     assert ops._NVFP4_PROGRAMS == PROGRAMS
-    assert len({program.name for program in PROGRAMS}) == 8
+    assert len({program.name for program in PROGRAMS}) == 13
     for identifier, program in NAMED.items():
         assert program.name.startswith("cake_minimax_h3_sm120_nvfp4_varlen_attention_")
         assert program.operator_dir == "cake_minimax_h3_sm120_nvfp4_varlen_attention"
@@ -181,7 +211,8 @@ def test_the_loader_publishes_the_eight_programs() -> None:
             # the fused pre-processing's grid barrier needs every CTA co-resident
             "cooperative": identifier == "PREPROCESS",
             "dynamic_smem_bytes": DYNAMIC_SMEM[identifier],
-            "use_pdl": True,
+            # the overlapped form's lead attention starts after every earlier launch of the stream
+            "use_pdl": identifier not in PLAIN,
         }
         assert program.needs_device_linking is False
     # the two quantizer work orders and the four attention programs share their argument lists
@@ -189,6 +220,13 @@ def test_the_loader_publishes_the_eight_programs() -> None:
     assert QUANTIZE_KV.name != QUANTIZE_KV_HBLK64.name
     attention = (ATTENTION, ATTENTION_NODELTA, ATTENTION_WS, ATTENTION_WS_NODELTA)
     assert len({program.args for program in attention}) == 1
+    overlap = (
+        ATTENTION_LEAD,
+        ATTENTION_TAIL,
+        ATTENTION_NODELTA_LEAD,
+        ATTENTION_NODELTA_TAIL,
+    )
+    assert len({program.args for program in overlap}) == 1
 
 
 @pytest.mark.parametrize("identifier", sorted(NAMED))
@@ -251,15 +289,30 @@ def test_architecture_router_rejects_cross_routing(monkeypatch) -> None:
     ops._nvfp4_target.cache_clear()
 
 
-def _plan(bounds):
+def _plan(bounds, num_heads=1):
     tokens = bounds[-1]
     padded = max(1, -(-tokens // 128)) * 128
+    tiles = sum(
+        -(-(b - a) // 128)
+        for a, b in zip(bounds[:-1], bounds[1:], strict=False)
+        if b > a
+    )
     return types.SimpleNamespace(
         bounds=bounds,
         total_tokens=tokens,
         num_segments=len(bounds) - 1,
         padded_tokens=padded,
+        num_heads=num_heads,
+        num_units=tiles * num_heads,
     )
+
+
+OVERLAP = (ATTENTION_LEAD, PREPROCESS_HEAD_MAJOR, ATTENTION_TAIL)
+OVERLAP_NODELTA = (
+    ATTENTION_NODELTA_LEAD,
+    PREPROCESS_HEAD_MAJOR,
+    ATTENTION_NODELTA_TAIL,
+)
 
 
 @pytest.mark.parametrize(
@@ -268,16 +321,16 @@ def _plan(bounds):
         ((0, 1), 188, (STATS, QUANTIZE_KV), ATTENTION, ATTENTION_NODELTA),
         ((0, 1920), 188, (STATS, QUANTIZE_KV), ATTENTION_WS, ATTENTION_WS_NODELTA),
         ((0, 1920), 170, (STATS, QUANTIZE_KV), ATTENTION, ATTENTION_NODELTA),
-        ((0, 2048), 188, (PREPROCESS,), ATTENTION_WS, ATTENTION_WS_NODELTA),
-        # on 170 to 187 SMs only the uncompensated route of a fused pre-processing plan takes the
-        # warp-specialised form
-        ((0, 2049), 170, (PREPROCESS,), ATTENTION, ATTENTION_WS_NODELTA),
-        ((0, 16384), 170, (PREPROCESS,), ATTENTION, ATTENTION_WS_NODELTA),
+        ((0, 2048), 187, (PREPROCESS,), ATTENTION, ATTENTION_WS_NODELTA),
+        # on 170 to 187 SMs (without an overlap width) only the uncompensated route of a fused
+        # pre-processing plan takes the warp-specialised form
+        ((0, 2049), 171, (PREPROCESS,), ATTENTION, ATTENTION_WS_NODELTA),
+        ((0, 16384), 186, (PREPROCESS,), ATTENTION, ATTENTION_WS_NODELTA),
         ((0, 16385), 170, (STATS, QUANTIZE_KV_HBLK64), ATTENTION, ATTENTION_NODELTA),
-        ((0, 3000, 3000), 170, (PREPROCESS,), ATTENTION, ATTENTION_NODELTA),
+        ((0, 3000, 3000), 171, (PREPROCESS,), ATTENTION, ATTENTION_NODELTA),
         ((0, 2049), 169, (PREPROCESS,), ATTENTION, ATTENTION_NODELTA),
         # the mean segment counts the empty segments
-        ((0, 3000, 3000), 188, (PREPROCESS,), ATTENTION, ATTENTION_NODELTA),
+        ((0, 3000, 3000), 189, (PREPROCESS,), ATTENTION, ATTENTION_NODELTA),
         (
             (0, 0, 129, 129, 500),
             188,
@@ -286,7 +339,7 @@ def _plan(bounds):
             ATTENTION_NODELTA,
         ),
         # the compensated route's warp-specialised form stops below a mean of 16384 tokens
-        ((0, 16384), 188, (PREPROCESS,), ATTENTION, ATTENTION_WS_NODELTA),
+        ((0, 16384), 189, (PREPROCESS,), ATTENTION, ATTENTION_WS_NODELTA),
         ((0, 16385), 188, (STATS, QUANTIZE_KV_HBLK64), ATTENTION, ATTENTION_WS_NODELTA),
         (
             (0, 8368, 16736, 25104, 33472),
@@ -306,6 +359,71 @@ def test_program_routing_follows_the_plan_and_the_sm_count(
         *pre,
         attention_nodelta,
     )
+
+
+@pytest.mark.parametrize(
+    "bounds",
+    [
+        (0, 2048),
+        (0, 2049),
+        (0, 3000, 3000),
+        (0, 4096),
+        (0, 1100, 2100, 6000),
+        (0, 16384),
+    ],
+)
+@pytest.mark.parametrize("num_sms", [170, 188])
+def test_fused_plans_take_the_overlapped_form_on_the_overlap_sm_counts(
+    bounds, num_sms
+) -> None:
+    plan = _plan(bounds)
+    assert ops.minimax_h3_sm120_nvfp4_programs(plan, num_sms) == OVERLAP
+    assert ops.minimax_h3_sm120_nvfp4_programs(plan, num_sms, delta=False) == (
+        OVERLAP_NODELTA
+    )
+    # a plan outside the fused pre-processing keeps the separate launches
+    small, large = _plan((0, 1920)), _plan((0, 16385))
+    assert PREPROCESS_HEAD_MAJOR not in ops.minimax_h3_sm120_nvfp4_programs(
+        small, num_sms
+    )
+    assert PREPROCESS_HEAD_MAJOR not in ops.minimax_h3_sm120_nvfp4_programs(
+        large, num_sms
+    )
+
+
+@pytest.mark.parametrize(
+    ("num_sms", "num_units", "expected"),
+    [
+        (170, 1792, (128, 126, 42)),
+        (188, 1792, (142, 138, 46)),
+        (170, 16, (16, 126, 42)),
+        (188, 0, (1, 138, 46)),
+        (171, 1792, None),
+        (187, 1792, None),
+        (84, 1792, None),
+    ],
+)
+def test_overlap_grids_follow_the_sm_count(num_sms, num_units, expected) -> None:
+    assert (
+        ops.minimax_h3_sm120_nvfp4_overlap_grids(num_sms, num_units=num_units)
+        == expected
+    )
+    with pytest.raises(ValueError):
+        ops.minimax_h3_sm120_nvfp4_overlap_grids(0, num_units=num_units)
+
+
+def test_head_major_unit_rows_cover_every_unit_once() -> None:
+    bounds = (0, 0, 129, 129, 500)
+    heads = 3
+    plan = _plan(bounds, heads)
+    rows = ops._plan_rows_head_major(plan, torch.device("cpu", 0)).view(-1, 4).tolist()
+    assert len(rows) == plan.num_units == 5 * heads
+    expected = [
+        [seg, (head << 16) | tile, bounds[seg], bounds[seg + 1]]
+        for head in range(heads)
+        for seg, tile in ((1, 0), (1, 1), (3, 0), (3, 1), (3, 2))
+    ]
+    assert rows == expected
 
 
 @pytest.mark.parametrize(
@@ -400,6 +518,7 @@ def test_softmax_scale_log2_is_the_kernels_constant() -> None:
 def test_public_names_are_exported() -> None:
     for name in (
         "minimax_h3_sm120_nvfp4_launch_grids",
+        "minimax_h3_sm120_nvfp4_overlap_grids",
         "minimax_h3_sm120_nvfp4_programs",
         "minimax_h3_sm120_varlen_attention_nvfp4",
         "minimax_h3_sm120_varlen_attention_nvfp4_nodelta",
