@@ -162,7 +162,7 @@ __device__ __forceinline__ float mul_f32_rn_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(288, LAUNCH_MIN_BLOCKS) void
-cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_csp_sop_pf(uint8_t* __restrict__ xq, float* __restrict__ gs, __nv_bfloat16* __restrict__ res_in, __nv_bfloat16* __restrict__ w, uint8_t* __restrict__ outq, uint8_t* __restrict__ out_sf, float* __restrict__ gs_out, __nv_bfloat16* __restrict__ res_out, uint8_t* __restrict__ os_wire, uint8_t* __restrict__ os_rs, long long* __restrict__ peer_ptrs, unsigned int* __restrict__ ctrl, int rank, int rows, int cap, float eps, float wbias)
+cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_sfu_csp_sop_pf(uint8_t* __restrict__ xq, float* __restrict__ gs, __nv_bfloat16* __restrict__ res_in, __nv_bfloat16* __restrict__ w, uint8_t* __restrict__ outq, uint8_t* __restrict__ out_sf, float* __restrict__ gs_out, __nv_bfloat16* __restrict__ res_out, uint8_t* __restrict__ os_wire, uint8_t* __restrict__ os_rs, long long* __restrict__ peer_ptrs, unsigned int* __restrict__ ctrl, int rank, int rows, int cap, float eps, float wbias)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1523,6 +1523,11 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_csp_sop_pf(uint8_t* __restrict__ xq, 
                     float rcp6 = approx_rcp(six);
                     float rcp_gs = approx_rcp(gso);
                     float rcp448 = approx_rcp(e4m3_max);
+                    unsigned int row32 = (unsigned int)drow;
+                    unsigned int tile = row32 >> 7;
+                    unsigned int lanepart = ((unsigned int)lane_2 >> 1) * 512;
+                    unsigned int intile = row32 << 4 & 496 | row32 >> 3 & 12 | lanepart;
+                    long long sf_base = (long long)tile * 49152;
                     #pragma unroll 1
                     for (int j = 0; j < 6; j++) {
                         int pp = lane_2 + 32 * j;
@@ -1687,6 +1692,7 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_csp_sop_pf(uint8_t* __restrict__ xq, 
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(y[_lp*2 + 0], y[_lp*2+1 + 0]));
                             y_bf16[_lp] = *(uint32_t*)&_bf2;
                         }
+                        long long hoff = sf_base + (long long)(intile + (unsigned int)(8192 * j));
                         float yb[32];
                         yb[0] = __uint_as_float(y_bf16[0] << 16);
                         yb[1] = __uint_as_float(y_bf16[0] & 4294901760u);
@@ -1992,10 +1998,7 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_csp_sop_pf(uint8_t* __restrict__ xq, 
                         unsigned int lo_1 = half & ~oddmask | _shfl_xor_0 & oddmask;
                         unsigned int hi_1 = _shfl_xor_0 & ~oddmask | half & oddmask;
                         unsigned int word = lo_1 | hi_1 << 16;
-                        long long rowpart = drow / 128 * 49152 + drow % 32 * 16 + drow % 128 / 32 * 4;
-                        int bpart = (4 * (pp >> 1) >> 2) * 512 + (4 * (pp >> 1) & 3);
-                        long long off = rowpart + (long long)bpart;
-                        *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(out_sf + off)) + (0)) = word;
+                        *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(out_sf + hoff)) + (0)) = word;
                     }
                     if (n > kd + 1) {
                         __syncwarp();
