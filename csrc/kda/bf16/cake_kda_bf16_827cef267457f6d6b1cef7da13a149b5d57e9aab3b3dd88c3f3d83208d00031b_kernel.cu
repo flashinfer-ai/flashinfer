@@ -1517,10 +1517,12 @@ kernel_cake_kda_bf16_827cef267457f6d6b1cef7da13a149b5d57e9aab3b3dd88c3f3d83208d0
                         :: "r"(taddr + (unsigned int)tmem_row_base + (unsigned int)(state_col_half_1 * 32)), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[3])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[4])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[5])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[6])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[7])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[8])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[9])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[10])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[11])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[12])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[13])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[14])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[15])));
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     if (elect_sync()) {
+                        asm volatile("tcgen05.fence::before_thread_sync;");
                         mbarrier_arrive(state_inp_ready_addr + (compute_stage) * 8);
                     }
                 }
                 mbarrier_wait(qk_full_addr + (compute_stage) * 8, _phase_qk_full);
+                asm volatile("tcgen05.fence::after_thread_sync;");
                 {
                     #pragma unroll
                     for (int decay_col_half = 0; decay_col_half < 2; decay_col_half++) {
@@ -1551,10 +1553,12 @@ kernel_cake_kda_bf16_827cef267457f6d6b1cef7da13a149b5d57e9aab3b3dd88c3f3d83208d0
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 }
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                asm volatile("tcgen05.fence::before_thread_sync;");
                 mbarrier_arrive(state_diag_ready_addr + (compute_stage) * 8);
                 mbarrier_wait(v_full_addr, _phase_v_full_0);
                 _phase_v_full_0 ^= 1;
                 mbarrier_wait(old_out_ready_addr + (compute_stage) * 8, _phase_old_out_ready);
+                asm volatile("tcgen05.fence::after_thread_sync;");
                 float _tmem_load_3[16];
                 asm volatile(
                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
@@ -1611,11 +1615,13 @@ kernel_cake_kda_bf16_827cef267457f6d6b1cef7da13a149b5d57e9aab3b3dd88c3f3d83208d0
                     " [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
                     :: "r"(taddr + 224 + (unsigned int)tmem_row_base), "r"(*reinterpret_cast<const uint32_t*>(&residual_values_bf16[0])), "r"(*reinterpret_cast<const uint32_t*>(&residual_values_bf16[1])), "r"(*reinterpret_cast<const uint32_t*>(&residual_values_bf16[2])), "r"(*reinterpret_cast<const uint32_t*>(&residual_values_bf16[3])), "r"(*reinterpret_cast<const uint32_t*>(&residual_values_bf16[4])), "r"(*reinterpret_cast<const uint32_t*>(&residual_values_bf16[5])), "r"(*reinterpret_cast<const uint32_t*>(&residual_values_bf16[6])), "r"(*reinterpret_cast<const uint32_t*>(&residual_values_bf16[7])));
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                asm volatile("tcgen05.fence::before_thread_sync;");
                 mbarrier_arrive(v_free_addr);
                 if (elect_sync()) {
                     mbarrier_arrive(u_inp_ready_addr + (compute_stage) * 8);
                 }
                 mbarrier_wait(u2_acc_ready_addr + (compute_stage) * 8, _phase_u2_acc_ready);
+                asm volatile("tcgen05.fence::after_thread_sync;");
                 float _tmem_load_4[16];
                 asm volatile(
                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
@@ -1655,9 +1661,12 @@ kernel_cake_kda_bf16_827cef267457f6d6b1cef7da13a149b5d57e9aab3b3dd88c3f3d83208d0
                     :: "r"(taddr + 224 + (unsigned int)tmem_row_base), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_4_bf16_1[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_4_bf16_1[1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_4_bf16_1[2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_4_bf16_1[3])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_4_bf16_1[4])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_4_bf16_1[5])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_4_bf16_1[6])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_4_bf16_1[7])));
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 if (elect_sync()) {
+                    asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(u2_inp_ready_addr + (compute_stage) * 8);
                 }
                 mbarrier_wait(final_ready_addr + (compute_stage) * 8, _phase_final_ready);
+                asm volatile("tcgen05.fence::after_thread_sync;");
+                asm volatile("tcgen05.fence::before_thread_sync;");
                 mbarrier_arrive(smem_free_addr + (compute_stage) * 8);
                 int checkpoint_token = (chunk_idx + 1) * 32;
                 if (checkpoint_every_n_tokens != 0 && checkpoint_token < seq_len && checkpoint_token % checkpoint_every_n_tokens == 0) {
@@ -1719,6 +1728,7 @@ kernel_cake_kda_bf16_827cef267457f6d6b1cef7da13a149b5d57e9aab3b3dd88c3f3d83208d0
                     }
                 }
             }
+            asm volatile("tcgen05.fence::before_thread_sync;");
             asm volatile("barrier.sync 10, 128;" ::: "memory");
             if (compute_local_warp == 0) {
                 if (elect_sync()) {
@@ -1755,6 +1765,7 @@ kernel_cake_kda_bf16_827cef267457f6d6b1cef7da13a149b5d57e9aab3b3dd88c3f3d83208d0
             #pragma unroll 1
             for (int chunk_idx_1 = 0; chunk_idx_1 < num_chunks_1; chunk_idx_1++) {
                 mbarrier_wait(final_ready_addr + (epilogue_stage) * 8, _phase_final_ready_1);
+                asm volatile("tcgen05.fence::after_thread_sync;");
                 int chunk_is_full = ((seq_len_1 >= (chunk_idx_1 + 1) * 32) ? 1 : 0);
                 if (chunk_is_full != 0) {
                     float _tmem_load_7[16];
@@ -1765,6 +1776,7 @@ kernel_cake_kda_bf16_827cef267457f6d6b1cef7da13a149b5d57e9aab3b3dd88c3f3d83208d0
                         : "r"(taddr + 192 + (unsigned int)tmem_row_base_1));
                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                     if (elect_sync()) {
+                        asm volatile("tcgen05.fence::before_thread_sync;");
                         mbarrier_arrive(out_empty_addr);
                     }
                     unsigned int out_packed[8];
@@ -1778,6 +1790,7 @@ kernel_cake_kda_bf16_827cef267457f6d6b1cef7da13a149b5d57e9aab3b3dd88c3f3d83208d0
                             asm volatile("cp.async.bulk.wait_group.read 1;");
                         }
                     }
+                    asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile("barrier.sync 9, 128;" ::: "memory");
                     int out_stage_addr = smem_out_addr + output_stage * 4096;
                     #pragma unroll
@@ -1816,6 +1829,7 @@ kernel_cake_kda_bf16_827cef267457f6d6b1cef7da13a149b5d57e9aab3b3dd88c3f3d83208d0
                         : "r"(taddr + 192 + (unsigned int)tmem_row_base_1));
                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                     if (elect_sync()) {
+                        asm volatile("tcgen05.fence::before_thread_sync;");
                         mbarrier_arrive(out_empty_addr);
                     }
                     #pragma unroll
@@ -1844,6 +1858,7 @@ kernel_cake_kda_bf16_827cef267457f6d6b1cef7da13a149b5d57e9aab3b3dd88c3f3d83208d0
             if (epilogue_local_warp == 0) {
                 asm volatile("cp.async.bulk.wait_group 0;");
             }
+            asm volatile("tcgen05.fence::before_thread_sync;");
             asm volatile("barrier.sync 9, 128;" ::: "memory");
             if (epilogue_local_warp == 0) {
                 if (elect_sync()) {
@@ -1877,6 +1892,7 @@ kernel_cake_kda_bf16_827cef267457f6d6b1cef7da13a149b5d57e9aab3b3dd88c3f3d83208d0
                 mbarrier_wait(state_inp_ready_addr + (mma_stage) * 8, _phase_state_inp_ready);
                 mbarrier_wait(out_empty_addr, _phase_out_empty_0);
                 _phase_out_empty_0 ^= 1;
+                asm volatile("tcgen05.fence::after_thread_sync;");
                 int _mma_b_lo_0 = make_warp_uniform((((smem_qd_addr) >> 4) & 0x3FFF) + (mma_stage) * 2624);
                 asm volatile(
                     "{\n\t"
@@ -1972,6 +1988,7 @@ kernel_cake_kda_bf16_827cef267457f6d6b1cef7da13a149b5d57e9aab3b3dd88c3f3d83208d0
                 elect_commit2(old_out_ready_addr + (mma_stage) * 8, raw_inputs_free_addr + (mma_stage) * 8);
                 mbarrier_wait(state_diag_ready_addr + (mma_stage) * 8, _phase_state_diag_ready);
                 mbarrier_wait(u_inp_ready_addr + (mma_stage) * 8, _phase_u_inp_ready);
+                asm volatile("tcgen05.fence::after_thread_sync;");
                 int _mma_b_lo_10 = make_warp_uniform((((smem_inv_addr) >> 4) & 0x3FFF) + (mma_stage) * 2624);
                 asm volatile(
                     "{\n\t"
@@ -1996,6 +2013,7 @@ kernel_cake_kda_bf16_827cef267457f6d6b1cef7da13a149b5d57e9aab3b3dd88c3f3d83208d0
                     :: "r"(tmem_tmem_u2_acc), "r"(_mma_b_lo_10), "r"(tmem_tmem_u2_inp), "r"(0));
                 elect_commit(u2_acc_ready_addr + (mma_stage) * 8);
                 mbarrier_wait(u2_inp_ready_addr + (mma_stage) * 8, _phase_u2_inp_ready);
+                asm volatile("tcgen05.fence::after_thread_sync;");
                 int _mma_b_lo_11 = make_warp_uniform(((((smem_final_trans_addr) >> 4) & 0x3FFF) | 0x1000000) + (mma_stage) * 2624);
                 asm volatile(
                     "{\n\t"

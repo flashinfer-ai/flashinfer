@@ -1591,6 +1591,7 @@ kernel_cake_kda_bf16_1dcd1f92c8941333cedbaa26d406b60dded4804d87a88feac472028a663
                 unsigned int state_packed2[16];
                 unsigned int state_packed3[16];
                 mbarrier_wait(qk_full_addr + (compute_stage) * 8, _phase_qk_full);
+                asm volatile("tcgen05.fence::after_thread_sync;");
                 #pragma unroll 1
                 for (int state_col_block_2 = 0; state_col_block_2 < ((0) ? 4 : 3); state_col_block_2++) {
                     int state_addr = taddr + 64 + (unsigned int)tmem_row_base + (unsigned int)(state_col_block_2 * 32);
@@ -1654,6 +1655,7 @@ kernel_cake_kda_bf16_1dcd1f92c8941333cedbaa26d406b60dded4804d87a88feac472028a663
                         }
                         if (STORE_BACKWARD_TAPE == 0 && checkpoint_entering != 0 && chunk_idx != 0) {
                             mbarrier_wait(checkpoint_snapshot_done_addr + (snapshot_stage_compute) * 8, _phase_checkpoint_snapshot_done);
+                            asm volatile("tcgen05.fence::after_thread_sync;");
                             snapshot_stage_compute += 1;
                             if (snapshot_stage_compute == 4) { snapshot_stage_compute = 0; _phase_checkpoint_snapshot_done ^= 1; }
                         }
@@ -1711,6 +1713,7 @@ kernel_cake_kda_bf16_1dcd1f92c8941333cedbaa26d406b60dded4804d87a88feac472028a663
                 }
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 if (elect_sync()) {
+                    asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(state_inp_ready_addr + (compute_stage) * 8);
                 }
                 {
@@ -1727,6 +1730,7 @@ kernel_cake_kda_bf16_1dcd1f92c8941333cedbaa26d406b60dded4804d87a88feac472028a663
                     }
                     if (STORE_BACKWARD_TAPE == 0 && checkpoint_entering != 0 && chunk_idx != 0) {
                         mbarrier_wait(checkpoint_snapshot_done_addr + (snapshot_stage_compute) * 8, _phase_checkpoint_snapshot_done);
+                        asm volatile("tcgen05.fence::after_thread_sync;");
                         snapshot_stage_compute += 1;
                         if (snapshot_stage_compute == 4) { snapshot_stage_compute = 0; _phase_checkpoint_snapshot_done ^= 1; }
                     }
@@ -1735,6 +1739,7 @@ kernel_cake_kda_bf16_1dcd1f92c8941333cedbaa26d406b60dded4804d87a88feac472028a663
                 mbarrier_wait(v_full_addr + (compute_stage) * 8, _phase_v_full);
                 unsigned int v_prefetch_bits[8];
                 mbarrier_wait(old_out_ready_addr + (compute_stage) * 8, _phase_old_out_ready);
+                asm volatile("tcgen05.fence::after_thread_sync;");
                 float prediction[32];
                 asm volatile(
                     "tcgen05.ld.sync.aligned.32x32b.x32.b32"
@@ -1812,11 +1817,13 @@ kernel_cake_kda_bf16_1dcd1f92c8941333cedbaa26d406b60dded4804d87a88feac472028a663
                     }
                 }
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                asm volatile("tcgen05.fence::before_thread_sync;");
                 mbarrier_arrive(v_free_addr + (compute_stage) * 8);
                 if (elect_sync()) {
                     mbarrier_arrive(u_inp_ready_addr + (compute_stage) * 8);
                 }
                 mbarrier_wait(u2_acc_ready_addr + (compute_stage) * 8, _phase_u2_acc_ready);
+                asm volatile("tcgen05.fence::after_thread_sync;");
                 float _tmem_load_3[32];
                 asm volatile(
                     "tcgen05.ld.sync.aligned.32x32b.x32.b32"
@@ -1850,10 +1857,13 @@ kernel_cake_kda_bf16_1dcd1f92c8941333cedbaa26d406b60dded4804d87a88feac472028a663
                     :: "r"(taddr + 224 + (unsigned int)tmem_row_base), "r"(u2_packed[0]), "r"(u2_packed[1]), "r"(u2_packed[2]), "r"(u2_packed[3]), "r"(u2_packed[4]), "r"(u2_packed[5]), "r"(u2_packed[6]), "r"(u2_packed[7]), "r"(u2_packed[8]), "r"(u2_packed[9]), "r"(u2_packed[10]), "r"(u2_packed[11]), "r"(u2_packed[12]), "r"(u2_packed[13]), "r"(u2_packed[14]), "r"(u2_packed[15]));
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 if (elect_sync()) {
+                    asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(u2_inp_ready_addr + (compute_stage) * 8);
                 }
                 mbarrier_wait(final_ready_addr + (compute_stage) * 8, _phase_final_ready);
+                asm volatile("tcgen05.fence::after_thread_sync;");
                 {
+                    asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(smem_free_addr + (compute_stage) * 8);
                 }
                 compute_stage += 1;
@@ -1888,6 +1898,7 @@ kernel_cake_kda_bf16_1dcd1f92c8941333cedbaa26d406b60dded4804d87a88feac472028a663
                     }
                 }
             }
+            asm volatile("tcgen05.fence::before_thread_sync;");
             asm volatile("barrier.sync 9, 128;" ::: "memory");
             __threadfence();
             asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
@@ -1934,6 +1945,7 @@ kernel_cake_kda_bf16_1dcd1f92c8941333cedbaa26d406b60dded4804d87a88feac472028a663
                 int chunk_is_full = ((seq_len_1 >= (chunk_idx_1 + 1) * 32) ? 1 : 0);
                 if (chunk_is_full != 0) {
                     mbarrier_wait(final_ready_addr + (epilogue_stage) * 8, _phase_final_ready_1);
+                    asm volatile("tcgen05.fence::after_thread_sync;");
                     float _tmem_load_5[16];
                     asm volatile(
                         "tcgen05.ld.sync.aligned.16x256b.x4.b32"
@@ -1947,6 +1959,7 @@ kernel_cake_kda_bf16_1dcd1f92c8941333cedbaa26d406b60dded4804d87a88feac472028a663
                         : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[15]))
                         : "r"(taddr + 192 + (unsigned int)tmem_row_base_1 + 1048576));
                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                    asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile("barrier.sync 8, 128;" ::: "memory");
                     if (epilogue_local_warp == 0) {
                         if (elect_sync()) {
@@ -1997,6 +2010,7 @@ kernel_cake_kda_bf16_1dcd1f92c8941333cedbaa26d406b60dded4804d87a88feac472028a663
                     }
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("barrier.sync 8, 128;" ::: "memory");
+                    asm volatile("tcgen05.fence::after_thread_sync;");
                     if (epilogue_local_warp == 0) {
                         if (elect_sync()) {
                             tma_store_4d(out_tma, 0, (int)(bos_1 + (long long)(chunk_idx_1 * 32)), head_idx_1, 0, smem_out_addr + output_stage * 8192);
@@ -2020,6 +2034,7 @@ kernel_cake_kda_bf16_1dcd1f92c8941333cedbaa26d406b60dded4804d87a88feac472028a663
                                     : "r"(taddr + 64 + (unsigned int)tmem_row_base_1 + (unsigned int)(snapshot_panel * 32)));
                                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                                 if (elect_sync()) {
+                                    asm volatile("tcgen05.fence::before_thread_sync;");
                                     mbarrier_arrive(checkpoint_snapshot_done_addr + (snapshot_stage_epilogue) * 8);
                                 }
                                 snapshot_stage_epilogue += 1;
@@ -2027,6 +2042,7 @@ kernel_cake_kda_bf16_1dcd1f92c8941333cedbaa26d406b60dded4804d87a88feac472028a663
                                 if (epilogue_local_warp == 0) {
                                     asm volatile("cp.async.bulk.wait_group.read 0;");
                                 }
+                                asm volatile("tcgen05.fence::before_thread_sync;");
                                 asm volatile("barrier.sync 8, 128;" ::: "memory");
                                 uint32_t _tmem_load_7_bf16[16];
                                 #pragma unroll
@@ -2040,6 +2056,7 @@ kernel_cake_kda_bf16_1dcd1f92c8941333cedbaa26d406b60dded4804d87a88feac472028a663
                                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v18_addr + (unsigned int)(state_row_1 * 128 + 48 ^ (state_row_1 * 128 + 48 >> 7 & 7) << 4))), "r"(_tmem_load_7_bf16[12]), "r"(_tmem_load_7_bf16[13]), "r"(_tmem_load_7_bf16[14]), "r"(_tmem_load_7_bf16[15]) : "memory");
                                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                                 asm volatile("barrier.sync 8, 128;" ::: "memory");
+                                asm volatile("tcgen05.fence::after_thread_sync;");
                                 if (epilogue_local_warp == 0) {
                                     if (elect_sync()) {
                                         tma_store_3d(state_checkpoints_tma, snapshot_panel * 32, 0, snapshot_outer, smem_v18_addr);
@@ -2055,6 +2072,7 @@ kernel_cake_kda_bf16_1dcd1f92c8941333cedbaa26d406b60dded4804d87a88feac472028a663
                     }
                 } else {
                     mbarrier_wait(final_ready_addr + (epilogue_stage) * 8, _phase_final_ready_1);
+                    asm volatile("tcgen05.fence::after_thread_sync;");
                     float _tmem_load_8[32];
                     asm volatile(
                         "tcgen05.ld.sync.aligned.32x32b.x32.b32"
@@ -2062,6 +2080,7 @@ kernel_cake_kda_bf16_1dcd1f92c8941333cedbaa26d406b60dded4804d87a88feac472028a663
                         : "=f"(_tmem_load_8[0]), "=f"(_tmem_load_8[1]), "=f"(_tmem_load_8[2]), "=f"(_tmem_load_8[3]), "=f"(_tmem_load_8[4]), "=f"(_tmem_load_8[5]), "=f"(_tmem_load_8[6]), "=f"(_tmem_load_8[7]), "=f"(_tmem_load_8[8]), "=f"(_tmem_load_8[9]), "=f"(_tmem_load_8[10]), "=f"(_tmem_load_8[11]), "=f"(_tmem_load_8[12]), "=f"(_tmem_load_8[13]), "=f"(_tmem_load_8[14]), "=f"(_tmem_load_8[15]), "=f"(_tmem_load_8[16]), "=f"(_tmem_load_8[17]), "=f"(_tmem_load_8[18]), "=f"(_tmem_load_8[19]), "=f"(_tmem_load_8[20]), "=f"(_tmem_load_8[21]), "=f"(_tmem_load_8[22]), "=f"(_tmem_load_8[23]), "=f"(_tmem_load_8[24]), "=f"(_tmem_load_8[25]), "=f"(_tmem_load_8[26]), "=f"(_tmem_load_8[27]), "=f"(_tmem_load_8[28]), "=f"(_tmem_load_8[29]), "=f"(_tmem_load_8[30]), "=f"(_tmem_load_8[31])
                         : "r"(taddr + 192 + (unsigned int)tmem_row_base_1));
                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                    asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile("barrier.sync 8, 128;" ::: "memory");
                     if (epilogue_local_warp == 0) {
                         if (elect_sync()) {
@@ -2174,6 +2193,7 @@ kernel_cake_kda_bf16_1dcd1f92c8941333cedbaa26d406b60dded4804d87a88feac472028a663
                 }
                 {
                     mbarrier_wait(state_inp_ready_addr + (mma_stage) * 8, _phase_state_inp_ready);
+                    asm volatile("tcgen05.fence::after_thread_sync;");
                     {
                         {
                             int _mma_b_lo_6 = make_warp_uniform((((smem_qd_addr) >> 4) & 0x3FFF) + (mma_stage) * 2624);
@@ -2275,6 +2295,7 @@ kernel_cake_kda_bf16_1dcd1f92c8941333cedbaa26d406b60dded4804d87a88feac472028a663
                     elect_commit2(old_out_ready_addr + (mma_stage) * 8, raw_inputs_free_addr + (mma_stage) * 8);
                 }
                 mbarrier_wait(u_inp_ready_addr + (mma_stage) * 8, _phase_u_inp_ready);
+                asm volatile("tcgen05.fence::after_thread_sync;");
                 {
                     if (elect_sync()) {
                         long long op_chunk_1 = cu_chunk_offsets[seq_idx_2] + (long long)_chunk_idx;
@@ -2312,6 +2333,7 @@ kernel_cake_kda_bf16_1dcd1f92c8941333cedbaa26d406b60dded4804d87a88feac472028a663
                     :: "r"(tmem_tmem_u2_acc), "r"(_mma_b_lo_8), "r"(tmem_tmem_u2_inp), "r"(0));
                 elect_commit(u2_acc_ready_addr + (mma_stage) * 8);
                 mbarrier_wait(u2_inp_ready_addr + (mma_stage) * 8, _phase_u2_inp_ready);
+                asm volatile("tcgen05.fence::after_thread_sync;");
                 {
                     if (elect_sync()) {
                         long long op_chunk_2 = cu_chunk_offsets[seq_idx_2] + (long long)_chunk_idx;
@@ -2385,6 +2407,7 @@ kernel_cake_kda_bf16_1dcd1f92c8941333cedbaa26d406b60dded4804d87a88feac472028a663
                 {
                     if (elect_sync()) {
                         asm volatile("cp.async.bulk.wait_group.read 0;");
+                        asm volatile("tcgen05.fence::before_thread_sync;");
                         mbarrier_arrive(raw_inputs_free_addr + (mma_stage) * 8);
                         mbarrier_arrive(smem_free_addr + (mma_stage) * 8);
                     }

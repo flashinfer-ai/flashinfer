@@ -1074,6 +1074,7 @@ kernel_cake_kda_bf16_d4ff22207792366eab60b789e452c65302005372ca900f47ed636c53328
             }
             asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
             if (elect_sync()) {
+                asm volatile("tcgen05.fence::before_thread_sync;");
                 mbarrier_arrive(init_ready_addr);
             }
             unsigned int _phase_init_ready_0 = 0;
@@ -1093,6 +1094,7 @@ kernel_cake_kda_bf16_d4ff22207792366eab60b789e452c65302005372ca900f47ed636c53328
                     mbarrier_wait(snap_done_addr + (prev_stage) * 8, prev_phase);
                 }
                 mbarrier_wait(r_full_addr + (compute_stage) * 8, _phase_r_full);
+                asm volatile("tcgen05.fence::after_thread_sync;");
                 int d_base = (int)compute_stage * 256;
                 float m_frag0[32];
                 float m_frag1[32];
@@ -1209,6 +1211,7 @@ kernel_cake_kda_bf16_d4ff22207792366eab60b789e452c65302005372ca900f47ed636c53328
                 tmem_st_x32_f32(m_base + dst_sel + 96, m_frag3);
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 if (elect_sync()) {
+                    asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(inp_ready_addr);
                 }
                 compute_stage += 1;
@@ -1216,6 +1219,7 @@ kernel_cake_kda_bf16_d4ff22207792366eab60b789e452c65302005372ca900f47ed636c53328
             }
             if (warp_in_wg == 0) {
                 if (elect_sync()) {
+                    asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(tmem_dealloc_ready_addr);
                 }
             }
@@ -1242,11 +1246,13 @@ kernel_cake_kda_bf16_d4ff22207792366eab60b789e452c65302005372ca900f47ed636c53328
                 if (is_first_1 != 0) {
                     mbarrier_wait(init_ready_addr, _phase_init_ready_0_1);
                     _phase_init_ready_0_1 ^= 1;
+                    asm volatile("tcgen05.fence::after_thread_sync;");
                 } else {
                     int prev_block_1 = p_1 - 1;
                     int prev_stage_1 = prev_block_1 & 1;
                     int prev_phase_1 = prev_block_1 >> 1 & 1;
                     mbarrier_wait(m_ready_addr + (prev_stage_1) * 8, prev_phase_1);
+                    asm volatile("tcgen05.fence::after_thread_sync;");
                 }
                 int snap_sel = p_1 % 2 * 192;
                 float frag0[32];
@@ -1276,11 +1282,13 @@ kernel_cake_kda_bf16_d4ff22207792366eab60b789e452c65302005372ca900f47ed636c53328
                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                 int snap_arrive_stage = p_1 & 1;
                 if (elect_sync()) {
+                    asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(snap_done_addr + (snap_arrive_stage) * 8);
                 }
                 if (epilogue_local_warp == 0) {
                     asm volatile("cp.async.bulk.wait_group.read 0;");
                 }
+                asm volatile("tcgen05.fence::before_thread_sync;");
                 asm volatile("barrier.sync 8, 128;" ::: "memory");
                 uint32_t frag0_bf16[16];
                 #pragma unroll
@@ -1406,6 +1414,7 @@ kernel_cake_kda_bf16_d4ff22207792366eab60b789e452c65302005372ca900f47ed636c53328
                 mbarrier_wait(r_full_addr + (mma_stage) * 8, _phase_r_full_1);
                 mbarrier_wait(inp_ready_addr, _phase_inp_ready_0);
                 _phase_inp_ready_0 ^= 1;
+                asm volatile("tcgen05.fence::after_thread_sync;");
                 int parity = p_2 % 2;
                 if (parity == 0) {
                     int _mma_b_lo_0 = make_warp_uniform(((((smem_r_addr) >> 4) & 0x3FFF) | 0x4000000) + (mma_stage) * 2048);
