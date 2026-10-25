@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from flashinfer.experimental.deepgemm_common import jit_spec_name
 from flashinfer.experimental.mega_moe_v3 import runtime
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -88,7 +89,9 @@ def test_programs_sources_symbols_and_compile_line_definitions():
             # Architecture-neutral pipeline schedule: the SM count comes from the
             # compile line, one of the counts the record's architectures route on.
             assert record["definitions"] == ["NUM_CTAS"]
-            assert all(runtime.supported_num_sms(arch) for arch in record["arches"]), name
+            assert all(runtime.supported_num_sms(arch) for arch in record["arches"]), (
+                name
+            )
             assert (
                 "#ifndef NUM_CTAS" in kernel_text
                 and "#define NUM_CTAS" not in kernel_text
@@ -130,7 +133,7 @@ def test_load_program_supplies_the_route_sm_count_as_num_ctas():
                 flags = spec.extra_cuda_cflags
                 if record.get("definitions"):
                     assert f"-DNUM_CTAS={num_sms}" in flags
-                    assert spec.name == f"{name}_{arch}_num_ctas{num_sms}"
+                    assert spec.name == f"{jit_spec_name(name, arch)}_num_ctas{num_sms}"
                 else:
                     assert not any(f.startswith("-DNUM_CTAS") for f in flags)
                 for flag in catalog.compile_flags(record, arch):
