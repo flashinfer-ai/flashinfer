@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team
 """CPU tests of the launch plans of ``flashinfer.cake_muse_spark_norm_backend``: a repeated call of one signature
-selects its record, resolves its grid and binds its entry once, a new signature prepares its own plan, a contract
-breach after a plan exists still raises the package's error, and the plan's argument order is the loader's."""
+selects its record, resolves its grid and binds its entry once, a new signature (the launch form among its keys)
+prepares its own plan, a contract breach after a plan exists still raises the package's error, a PDL route's window
+naming the plain build is that record's plan, and the plan's argument order is the loader's."""
 
 import pytest
 import torch
@@ -202,3 +203,43 @@ def test_a_repeated_rmsnorm_sigmoid_gate_call_reuses_its_plan(plans):
     with pytest.raises(ValueError, match="must be a bfloat16"):
         pkg.cake_rmsnorm_sigmoid_gate(x, gate.float(), eps=1e-5)
     assert len(launched) == 4
+    # the launch form is part of the signature: the PDL route prepares a plan of its own, keyed by enable_pdl
+    before_selections, before_launches = len(selections), len(launched)
+    for _ in range(3):
+        pkg.cake_rmsnorm_sigmoid_gate(x, gate, eps=1e-5, enable_pdl=True)
+    assert len(selections) == before_selections + 1
+    assert len(launched) == before_launches + 3
+    pdl_route = pkg.rmsnorm_sigmoid_gate_route(True)
+    name_pdl = loader.selected_module(ARCH, pdl_route, tokens, heads)
+    assert [n for n, _ in launched[-3:]] == [name_pdl] * 3 and name_pdl != name
+    assert loader.MODULES[name_pdl]["launch"]["use_pdl"] is True
+    assert loader.MODULES[name_pdl]["build"] == {
+        **loader.MODULES[name]["build"],
+        "pdl": True,
+    }
+    # a window of the PDL route naming the plain build: the plain record's plan, launched without the attribute
+    tokens_plain, heads_plain = 1025, 16
+    projection_plain = torch.zeros(
+        tokens_plain, 3 * heads_plain * HEAD_DIM, dtype=torch.bfloat16
+    )
+    gate_plain = projection_plain[:, : heads_plain * HEAD_DIM].view(
+        tokens_plain, heads_plain, HEAD_DIM
+    )
+    x_plain = torch.zeros(tokens_plain, heads_plain, HEAD_DIM, dtype=torch.bfloat16)
+    pkg.cake_rmsnorm_sigmoid_gate(x_plain, gate_plain, eps=1e-5, enable_pdl=True)
+    borrowed = launched[-1][0]
+    assert borrowed == loader.selected_module(
+        ARCH, pdl_route, tokens_plain, heads_plain
+    )
+    assert borrowed == loader.selected_module(
+        ARCH, pkg.rmsnorm_sigmoid_gate_route(), tokens_plain, heads_plain
+    )
+    assert loader.MODULES[borrowed]["launch"]["use_pdl"] is False
+    assert loader.MODULES[borrowed]["build"]["pdl"] is False
+    # a gap of the PDL route (128 heads at one token on every Blackwell architecture) is the package's error; the
+    # plain route serves the call
+    one = torch.zeros(1, 128, HEAD_DIM, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="admits 1 tokens of 128 heads"):
+        pkg.cake_rmsnorm_sigmoid_gate(one, one.clone(), eps=1e-5, enable_pdl=True)
+    pkg.cake_rmsnorm_sigmoid_gate(one, one.clone(), eps=1e-5)
+    assert loader.MODULES[launched[-1][0]]["launch"]["use_pdl"] is False

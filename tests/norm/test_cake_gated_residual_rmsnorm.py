@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team
 """GPU tests of the Cake gated residual RMSNorm (``flashinfer.cake_muse_spark_norm_backend``) behind
 ``gated_residual_rmsnorm(..., backend="cake")``: every routed program against the reference on both sides of its
-window edges in both modes and both launch forms, the Cake result against the CuTe DSL kernel's, the output aliasing
-the residual, the empty batch, CUDA graph replay, the fall-back at a gap of the windows and the input checks."""
+window edges in both modes and both launch forms (a PDL route's windows name a PDL build, the plain build launched
+without the attribute, or no program: the CuTe DSL kernel under PDL), the Cake result against the CuTe DSL kernel's,
+the output aliasing the residual, the empty batch, CUDA graph replay, the fall-back at a gap of the windows and the
+input checks."""
 
 import pytest
 import torch
@@ -105,14 +107,42 @@ def _assert_close(actual, expected):
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
 
 
+def _windows(name: str, route: str) -> list:
+    """The record's windows on this device as a call of ``route`` reads them (its borrowed ones first)."""
+    rule = loader.MODULES[name]["select_rule"]
+    return list(rule.get("routes", {}).get(route, rule["windows"]).get(_arch(), ()))
+
+
 def _edge_rows(route: str) -> list[int]:
-    """1, both sides of every window edge of the route on this device, and two off-grid row counts."""
+    """1, both sides of every window edge of the route on this device (a PDL route's gaps included), and two
+    off-grid row counts."""
     rows = {1, 17, 2437}
     for name in loader.route_modules(_arch(), route):
-        for _above, at_most in loader.MODULES[name]["select_rule"]["windows"][_arch()]:
+        for above, at_most in _windows(name, route):
+            rows.add(int(above) + 1)
             if at_most is not None:
                 rows.update((int(at_most), int(at_most) + 1))
     return sorted(rows)
+
+
+def _admits(weight_before_norm: bool, enable_pdl: bool, rows: int) -> bool:
+    return pkg.is_cake_gated_residual_rmsnorm_supported(
+        _device(),
+        weight_before_norm=weight_before_norm,
+        enable_pdl=enable_pdl,
+        rows=rows,
+    )
+
+
+def _uses_pdl(name: str, route: str, enable_pdl: bool) -> bool:
+    """The launch attribute a call of ``route`` gets from the record: a PDL build's, or none for the plain build a
+    PDL route borrows (its ``routes`` name the route)."""
+    borrowed = route in loader.MODULES[name]["select_rule"].get("routes", {})
+    return bool(enable_pdl and not borrowed)
+
+
+def _cute_available(inputs) -> bool:
+    return supports_gated_residual_rmsnorm(*inputs, backend="cute")
 
 
 def _form_id(form):
@@ -143,11 +173,24 @@ def test_every_window_matches_the_reference(form):
                 enable_pdl=enable_pdl,
                 backend="cake",
             )
+            if not _admits(weight_before_norm, enable_pdl, rows):
+                # a gap of the PDL route: the package refuses the call and ``auto`` runs the CuTe DSL kernel
+                assert enable_pdl
+                with pytest.raises(ValueError, match=f"admits {rows} rows"):
+                    _call(inputs, weight_before_norm, enable_pdl, backend="cake")
+                if _cute_available(inputs):
+                    before = len(launched)
+                    out = _call(inputs, weight_before_norm, enable_pdl, backend="auto")
+                    _assert_close(out, _reference(inputs, weight_before_norm))
+                    assert len(launched) == before
+                continue
             out = _call(inputs, weight_before_norm, enable_pdl)
             _assert_close(out, _reference(inputs, weight_before_norm))
             name = loader.selected_module(_arch(), route, rows)
             assert launched[-1] == (name, rows)
-            assert loader.MODULES[name]["launch"]["use_pdl"] is enable_pdl
+            assert loader.MODULES[name]["launch"]["use_pdl"] is _uses_pdl(
+                name, route, enable_pdl
+            )
     finally:
         pkg._launch = original
 
@@ -160,11 +203,98 @@ def test_matches_the_cute_kernel(form):
         inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], backend="cute"
     ):
         pytest.skip("the CuTe DSL kernel is not available on this device")
+    compared = 0
     for rows in (1, 17, 128, 1024, 2437):
+        if not _admits(weight_before_norm, enable_pdl, rows):
+            continue  # a gap of the PDL route: no Cake program to compare
         inputs = _inputs(rows, seed=2000 + rows)
         cake = _call(inputs, weight_before_norm, enable_pdl, backend="cake")
         cute = _call(inputs, weight_before_norm, enable_pdl, backend="cute")
         _assert_close(cake, cute)
+        compared += 1
+    assert compared
+
+
+@pytest.mark.parametrize("weight_before_norm", [False, True])
+def test_a_borrowed_window_launches_the_plain_build_without_the_attribute(
+    weight_before_norm,
+):
+    """A window of the PDL route that names the plain build: the call runs a record of the plain route, whose
+    launch carries no programmatic-stream-serialization attribute."""
+    route = pkg.gated_residual_rmsnorm_route(weight_before_norm, True)
+    borrowed = [
+        (name, window)
+        for name in loader.route_modules(_arch(), route)
+        for window in loader.MODULES[name]["select_rule"]
+        .get("routes", {})
+        .get(route, {})
+        .get(_arch(), ())
+    ]
+    if not borrowed:
+        pytest.skip("no window of the PDL route borrows the plain build on this device")
+    launched = []
+    original = pkg._launch
+
+    def spy(plan, args):
+        launched.append((plan.name, plan.rows))
+        return original(plan, args)
+
+    try:
+        pkg._launch = spy
+        for name, (above, _at_most) in borrowed:
+            rows = int(above) + 1
+            assert loader.MODULES[name]["launch"]["use_pdl"] is False
+            assert name in loader.route_modules(
+                _arch(), pkg.gated_residual_rmsnorm_route(weight_before_norm, False)
+            )
+            inputs = _inputs(rows, seed=7000 + rows)
+            out = _call(inputs, weight_before_norm, True)
+            _assert_close(out, _reference(inputs, weight_before_norm))
+            assert launched[-1] == (name, rows)
+            assert loader.selected_module(_arch(), route, rows) == name
+    finally:
+        pkg._launch = original
+
+
+@pytest.mark.parametrize("weight_before_norm", [False, True])
+def test_a_gap_of_the_pdl_route_falls_to_the_cute_kernel(weight_before_norm):
+    """A row count the PDL route leaves to the CuTe DSL kernel while the plain route serves it: ``auto`` under PDL
+    launches no Cake program, an explicit ``"cake"`` raises, and ``enable_pdl=False`` runs the plain route."""
+    gaps = [
+        rows
+        for rows in (769, 1000, 2437, 4000, 5000, 8000)
+        if _admits(weight_before_norm, False, rows)
+        and not _admits(weight_before_norm, True, rows)
+    ]
+    if not gaps:
+        pytest.skip("the PDL route leaves no gap the plain route serves on this device")
+    launched = []
+    original = pkg._launch
+
+    def spy(plan, args):
+        launched.append((plan.name, plan.rows))
+        return original(plan, args)
+
+    try:
+        pkg._launch = spy
+        for rows in gaps:
+            inputs = _inputs(rows, seed=8000 + rows)
+            expected = _reference(inputs, weight_before_norm)
+            with pytest.raises(ValueError, match=f"admits {rows} rows"):
+                _call(inputs, weight_before_norm, True, backend="cake")
+            if _cute_available(inputs):
+                _assert_close(
+                    _call(inputs, weight_before_norm, True, backend="auto"), expected
+                )
+                assert launched == []
+            _assert_close(
+                _call(inputs, weight_before_norm, False, backend="cake"), expected
+            )
+            plain = pkg.gated_residual_rmsnorm_route(weight_before_norm, False)
+            assert launched[-1] == (loader.selected_module(_arch(), plain, rows), rows)
+            launched.clear()
+    finally:
+        pkg._launch = original
 
 
 @pytest.mark.parametrize("weight_before_norm", [False, True])

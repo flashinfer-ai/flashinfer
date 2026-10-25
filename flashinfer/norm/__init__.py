@@ -313,9 +313,10 @@ def _cake_rmsnorm_sigmoid_gate_available(
     *,
     heads: Optional[int] = None,
     tokens: Optional[int] = None,
+    enable_pdl: bool = False,
 ) -> bool:
     return _HAS_CAKE_FUSED_NORM and _cake_rmsnorm_sigmoid_gate_supported(
-        device, heads=heads, tokens=tokens
+        device, heads=heads, tokens=tokens, enable_pdl=enable_pdl
     )
 
 
@@ -325,13 +326,16 @@ def _rmsnorm_sigmoid_gate_backend(
     *,
     heads: Optional[int] = None,
     tokens: Optional[int] = None,
+    enable_pdl: bool = False,
 ) -> Optional[str]:
     """The backend one call runs on: ``"cake"`` when the Cake package ships a
-    program for the device and (with ``heads`` and ``tokens``) the call's head
-    count and token count (preferred under ``"auto"``; a head count the
-    package's windows do not name, or a token count in a gap of them, falls to
-    the CuTe DSL kernel), else ``"cute"`` when the CuTe DSL kernel targets the
-    device; ``None`` when the requested backend is not available."""
+    program for the device, the call's launch form (its PDL route under
+    ``enable_pdl``, which the package ships on the Blackwell architectures
+    alone) and (with ``heads`` and ``tokens``) the call's head count and token
+    count (preferred under ``"auto"``; a head count the package's windows do
+    not name, or a token count in a gap of them, falls to the CuTe DSL kernel),
+    else ``"cute"`` when the CuTe DSL kernel targets the device; ``None`` when
+    the requested backend is not available."""
     if backend not in _GATED_RESIDUAL_NEXT_BACKENDS:
         raise ValueError(
             f"backend must be one of {_GATED_RESIDUAL_NEXT_BACKENDS}, got {backend!r}"
@@ -340,6 +344,7 @@ def _rmsnorm_sigmoid_gate_backend(
         device,
         heads=None if backend == "cake" else heads,
         tokens=None if backend == "cake" else tokens,
+        enable_pdl=enable_pdl,
     ):
         return "cake"
     if backend != "cake" and _cute_supports_rmsnorm_sigmoid_gate(
@@ -355,12 +360,15 @@ def supports_rmsnorm_sigmoid_gate(
     device: torch.device | str | None = None,
     *,
     backend: Literal["auto", "cake", "cute"] = "auto",
+    enable_pdl: bool = True,
 ) -> bool:
     """Whether a BF16, head-dimension-64 call can run on ``device`` (the current
     one when ``None``) through ``backend`` (``"auto"``: the Cake package or the
-    CuTe DSL kernel).  The package routes on the head count and the token count
-    of a call as well; ``rmsnorm_sigmoid_gate`` falls to the CuTe DSL kernel
-    where they lie outside its windows."""
+    CuTe DSL kernel) in the launch form ``enable_pdl`` selects (the package's
+    PDL route exists on the Blackwell architectures alone).  The package routes
+    on the head count and the token count of a call as well;
+    ``rmsnorm_sigmoid_gate`` falls to the CuTe DSL kernel where they lie outside
+    its windows."""
     if dtype != torch.bfloat16 or head_dim != _RMSNORM_SIGMOID_GATE_HEAD_DIM:
         return False
     if device is None:
@@ -371,7 +379,12 @@ def supports_rmsnorm_sigmoid_gate(
         resolved = torch.device(device)
     if resolved.type != "cuda" or not torch.cuda.is_available():
         return False
-    return _rmsnorm_sigmoid_gate_backend(backend, resolved) is not None
+    return (
+        _rmsnorm_sigmoid_gate_backend(
+            backend, resolved, enable_pdl=_resolved_pdl(resolved, enable_pdl)
+        )
+        is not None
+    )
 
 
 def supports_gated_residual_rmsnorm(
@@ -946,18 +959,23 @@ def rmsnorm_sigmoid_gate(
     eps : float
         Epsilon added to the RMS denominator.
     enable_pdl : bool
-        Whether to enable programmatic dependent launch on the CuTe DSL kernel.
-        Defaults to ``True``; pass ``False`` to disable it. The Cake kernels
-        launch without the attribute and ignore this argument.
+        Whether to launch with programmatic dependent launch. Defaults to
+        ``True``; pass ``False`` to disable it. The CuTe DSL kernel takes the
+        attribute directly; the Cake package serves the call from its PDL
+        route, whose windows name a PDL build, a plain build (launched without
+        the attribute where the PDL build measured slower) or no program (where
+        the CuTe DSL kernel under PDL measured ahead). The package ships that
+        route on SM100 and SM103; on SM107 ``"auto"`` runs the CuTe DSL kernel
+        with PDL and the Cake kernels serve ``enable_pdl=False`` calls.
     backend : str
         ``"auto"`` (default) runs the Cake kernels
         (:mod:`flashinfer.cake_muse_spark_norm_backend`) where the package ships
-        a program for the device, the call's head count and its token count (the
-        package routes 128, 32 and 16 heads; its windows may leave token-count
-        gaps where the CuTe DSL kernel measured ahead), else the CuTe DSL kernel;
-        ``"cake"`` and ``"cute"`` select one and raise ``ValueError`` when it is
-        not available (``"cake"`` at a head count or token count outside the
-        package's windows raises too).
+        a program for the device, the call's launch form, head count and token
+        count (the package routes 128, 32 and 16 heads; its windows may leave
+        token-count gaps where the CuTe DSL kernel measured ahead), else the CuTe
+        DSL kernel; ``"cake"`` and ``"cute"`` select one and raise ``ValueError``
+        when it is not available (``"cake"`` at a head count or token count
+        outside the package's windows of the launch form raises too).
     """
     if input.ndim not in (2, 3) or gate.shape != input.shape:
         raise ValueError("input and gate must have matching 2-D or 3-D shapes")
@@ -968,12 +986,14 @@ def rmsnorm_sigmoid_gate(
         or device.type != "cuda"
     ):
         raise ValueError("tensors do not satisfy the rmsnorm_sigmoid_gate contract")
-    # One backend decision per call, handed to the implementation as the resolved backend.
+    # One backend decision per call, handed to the implementation as the resolved backend and launch form.
+    enable_pdl = _resolved_pdl(device, enable_pdl)
     chosen = _rmsnorm_sigmoid_gate_backend(
         backend,
         device,
         heads=input.shape[1] if input.ndim == 3 else 1,
         tokens=input.shape[0],
+        enable_pdl=enable_pdl,
     )
     if chosen is None:
         raise ValueError(
@@ -1004,6 +1024,8 @@ def _rmsnorm_sigmoid_gate_impl(
     enable_pdl: bool = True,
     backend: str = "auto",
 ) -> None:
+    if enable_pdl:
+        enable_pdl = device_support_pdl(input.device)
     if backend == "cake" or backend == "cute":
         chosen = backend  # resolved by the public wrapper (or requested explicitly)
     else:
@@ -1012,17 +1034,16 @@ def _rmsnorm_sigmoid_gate_impl(
             input.device,
             heads=input.shape[1] if input.ndim == 3 else 1,
             tokens=input.shape[0],
+            enable_pdl=enable_pdl,
         )
     if chosen == "cake":
-        # The Cake programs launch without programmatic dependent launch.
-        _cake_rmsnorm_sigmoid_gate(input, gate, eps=eps)
+        # The package's PDL route decides per window whether the program launches with the attribute.
+        _cake_rmsnorm_sigmoid_gate(input, gate, eps=eps, enable_pdl=enable_pdl)
         return
     if chosen is None:
         raise ValueError(
             f"rmsnorm_sigmoid_gate: backend {backend!r} is not available on {input.device}"
         )
-    if enable_pdl:
-        enable_pdl = device_support_pdl(input.device)
     _rmsnorm_sigmoid_gate_cute(input, gate, eps, enable_pdl=enable_pdl)
 
 

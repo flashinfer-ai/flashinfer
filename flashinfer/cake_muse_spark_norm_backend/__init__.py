@@ -142,7 +142,9 @@ def is_cake_gated_residual_next_rmsnorm_supported(
     if rows is None:
         return True
     return any(
-        _loader.admits(_loader.MODULES[name].get("select_rule"), int(rows), arch)
+        _loader.admits(
+            _loader.MODULES[name].get("select_rule"), int(rows), arch, route=route
+        )
         for name in _loader.route_modules(arch, route)
     )
 
@@ -347,8 +349,9 @@ def is_cake_gated_residual_rmsnorm_supported(
 ) -> bool:
     """Whether this package ships a program for ``device`` and the call's variant (``weight`` applied before the norm
     or absent, programmatic dependent launch or not) -- and, with ``rows``, one whose window admits that row count
-    (a route's windows may leave gaps where the kernel lane measured the FlashInfer kernel ahead).  The tensor
-    contract is :mod:`flashinfer.norm`'s."""
+    (a route's windows may leave gaps where the kernel lane measured the FlashInfer kernel ahead; a window of a PDL
+    route may name the plain build of its program, launched without the attribute).  The tensor contract is
+    :mod:`flashinfer.norm`'s."""
     arch = _arch(device)
     if arch is None:
         return False
@@ -358,7 +361,9 @@ def is_cake_gated_residual_rmsnorm_supported(
     if rows is None:
         return True
     return any(
-        _loader.admits(_loader.MODULES[name].get("select_rule"), int(rows), arch)
+        _loader.admits(
+            _loader.MODULES[name].get("select_rule"), int(rows), arch, route=route
+        )
         for name in _loader.route_modules(arch, route)
     )
 
@@ -662,9 +667,18 @@ def cake_gated_residual_rmsnorm(
     )
 
 
-def rmsnorm_sigmoid_gate_route() -> str:
-    """The one route of the sigmoid gate (BF16 rows of 64)."""
-    return route_key(RMSNORM_SIGMOID_GATE, "bf16")
+def rmsnorm_sigmoid_gate_variant(enable_pdl: bool = False) -> str:
+    """The variant a sigmoid gate call maps onto: ``bf16`` (BF16 rows of 64), with ``_pdl`` for a programmatic
+    dependent launch."""
+    return f"bf16{'_pdl' if enable_pdl else ''}"
+
+
+def rmsnorm_sigmoid_gate_route(enable_pdl: bool = False) -> str:
+    """The route a sigmoid gate call launches from (its variant's).  A window of the ``_pdl`` route names the PDL
+    build of a program, its plain build (launched without the attribute where the PDL build measured slower) or no
+    program (a gap: the FlashInfer kernel under PDL measured ahead); the package ships that route on the Blackwell
+    architectures alone."""
+    return route_key(RMSNORM_SIGMOID_GATE, rmsnorm_sigmoid_gate_variant(enable_pdl))
 
 
 def is_cake_rmsnorm_sigmoid_gate_supported(
@@ -672,20 +686,23 @@ def is_cake_rmsnorm_sigmoid_gate_supported(
     *,
     heads: Optional[int] = None,
     tokens: Optional[int] = None,
+    enable_pdl: bool = False,
 ) -> bool:
-    """Whether this package ships a program for ``device`` -- and, with ``heads``, one whose windows name that head
-    count (a 2-D ``(rows, 64)`` call is one head), with ``tokens`` too, one whose window admits that token count.
-    The tensor contract is :mod:`flashinfer.norm`'s."""
+    """Whether this package ships a program for ``device`` and the call's launch form (plain, or the ``_pdl`` route
+    under ``enable_pdl``) -- and, with ``heads``, one whose windows name that head count (a 2-D ``(rows, 64)`` call
+    is one head), with ``tokens`` too, one whose window admits that token count.  The tensor contract is
+    :mod:`flashinfer.norm`'s."""
     arch = _arch(device)
     if arch is None:
         return False
-    route = rmsnorm_sigmoid_gate_route()
+    route = rmsnorm_sigmoid_gate_route(enable_pdl)
     if not _loader.route_available(arch, route):
         return False
     if heads is None:
         return True
     for name in _loader.route_modules(arch, route):
-        windows = _loader.MODULES[name]["select_rule"]["windows"].get(arch, ())
+        rule = _loader.MODULES[name]["select_rule"]
+        windows = rule.get("routes", {}).get(route, rule["windows"]).get(arch, ())
         for count, above, at_most in windows:
             if int(count) != int(heads):
                 continue
@@ -723,7 +740,7 @@ def _gate_layout(tensor: torch.Tensor, name: str, device: torch.device) -> int:
 
 
 def _prepare_rmsnorm_sigmoid_gate(
-    input: torch.Tensor, gate: torch.Tensor
+    input: torch.Tensor, gate: torch.Tensor, *, enable_pdl: bool
 ) -> Optional[_LaunchPlan]:
     """The full contract check of one call and its launch plan (``None`` for an empty batch, which launches nothing)."""
     device = input.device
@@ -742,14 +759,16 @@ def _prepare_rmsnorm_sigmoid_gate(
     gate_stride = _gate_layout(gate, "gate", device)
     tokens = int(input.shape[0])
     heads = int(input.shape[1]) if input.ndim == 3 else 1
-    route = rmsnorm_sigmoid_gate_route()
+    route = rmsnorm_sigmoid_gate_route(enable_pdl)
     if not _loader.route_available(arch, route):
         raise ValueError(
             f"cake_rmsnorm_sigmoid_gate: no exported program of route {route!r} on {arch}"
         )
     if tokens == 0:
         return None
-    if not is_cake_rmsnorm_sigmoid_gate_supported(device, heads=heads, tokens=tokens):
+    if not is_cake_rmsnorm_sigmoid_gate_supported(
+        device, heads=heads, tokens=tokens, enable_pdl=enable_pdl
+    ):
         # a head count or a token count outside the route's windows: the facade's "auto" runs the CuTe DSL kernel
         raise ValueError(
             f"cake_rmsnorm_sigmoid_gate: no exported program of route {route!r} on {arch} admits "
@@ -773,6 +792,7 @@ def _prepare_rmsnorm_sigmoid_gate(
         heads,
         input_stride,
         gate_stride,
+        bool(enable_pdl),
     )
     plan = _LAUNCH_PLANS[key] = _LaunchPlan(
         name, arch, _device_index(device), values, tokens
@@ -781,12 +801,15 @@ def _prepare_rmsnorm_sigmoid_gate(
 
 
 def cake_rmsnorm_sigmoid_gate(
-    input: torch.Tensor, gate: torch.Tensor, *, eps: float
+    input: torch.Tensor, gate: torch.Tensor, *, eps: float, enable_pdl: bool = False
 ) -> None:
     """``input = bf16(RMSNorm(input) * sigmoid(gate))`` per row of 64, in place, one launch of the exported program
     whose window admits the head count and the token count.  ``input`` and ``gate`` are ``(tokens, 64)`` or
     ``(tokens, heads, 64)`` with the same shape; their token strides may differ (``gate`` is typically a view of a
-    wider projection).  An empty batch launches nothing.
+    wider projection).  ``enable_pdl`` selects the programmatic dependent launch route: its window names the PDL
+    build of a program or its plain build (which launches without the attribute); a window naming no program, like a
+    head count the routes do not name, is the facade's CuTe DSL branch (``ValueError`` here).  An empty batch
+    launches nothing.
     """
     device = input.device
     shape = input.shape
@@ -804,6 +827,7 @@ def cake_rmsnorm_sigmoid_gate(
                 heads,
                 input_stride,
                 gate_stride,
+                bool(enable_pdl),
             )
         )
     bf16, align = torch.bfloat16, ROW_ALIGNMENT_BYTES
@@ -819,7 +843,7 @@ def cake_rmsnorm_sigmoid_gate(
         and input.data_ptr() % align == 0
         and gate.data_ptr() % align == 0
     ):
-        plan = _prepare_rmsnorm_sigmoid_gate(input, gate)
+        plan = _prepare_rmsnorm_sigmoid_gate(input, gate, enable_pdl=enable_pdl)
         if plan is None:
             return
         heads = shape[1] if ndim == 3 else 1
@@ -857,6 +881,7 @@ __all__ = [
     "is_cake_gated_residual_rmsnorm_supported",
     "is_cake_rmsnorm_sigmoid_gate_supported",
     "rmsnorm_sigmoid_gate_route",
+    "rmsnorm_sigmoid_gate_variant",
     "warm_up",
     "zero_post_weight",
 ]
