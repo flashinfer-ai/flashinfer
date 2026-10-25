@@ -29,12 +29,12 @@ from . import cake_program
 from .core import JitSpec
 
 PARALLEL = cake_program.CakeProgram(
-    name="cake_fused_norm_combine_db41f58338195351baf2",
+    name="cake_fused_norm_combine_f0f0fd407a1de987d19e",
     operator_dir="cake_fused_norm_combine",
-    kernel="kernel_cake_fused_norm_combine_db41f58338195351baf2",
+    kernel="kernel_cake_fused_norm_combine_f0f0fd407a1de987d19e",
     sources=(
-        "cake_fused_norm_combine_db41f58338195351baf2_kernel.cu",
-        "cake_fused_norm_combine_db41f58338195351baf2_binding.cu",
+        "cake_fused_norm_combine_f0f0fd407a1de987d19e_kernel.cu",
+        "cake_fused_norm_combine_f0f0fd407a1de987d19e_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(("sm_100a", ("--fmad=true",)), ("sm_103a", ("--fmad=true",))),
@@ -71,12 +71,12 @@ PARALLEL = cake_program.CakeProgram(
 )
 
 PARALLEL_SPLIT = cake_program.CakeProgram(
-    name="cake_fused_norm_combine_cec346b7d50af298d145",
+    name="cake_fused_norm_combine_45d4f681e01eef5ea0d0",
     operator_dir="cake_fused_norm_combine",
-    kernel="kernel_cake_fused_norm_combine_cec346b7d50af298d145",
+    kernel="kernel_cake_fused_norm_combine_45d4f681e01eef5ea0d0",
     sources=(
-        "cake_fused_norm_combine_cec346b7d50af298d145_kernel.cu",
-        "cake_fused_norm_combine_cec346b7d50af298d145_binding.cu",
+        "cake_fused_norm_combine_45d4f681e01eef5ea0d0_kernel.cu",
+        "cake_fused_norm_combine_45d4f681e01eef5ea0d0_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(("sm_100a", ("--fmad=true",)), ("sm_103a", ("--fmad=true",))),
@@ -113,12 +113,12 @@ PARALLEL_SPLIT = cake_program.CakeProgram(
 )
 
 OWNER_STREAM = cake_program.CakeProgram(
-    name="cake_fused_norm_combine_ebeb96fe4edaefc6931d",
+    name="cake_fused_norm_combine_068ee430f3a25ed6d13e",
     operator_dir="cake_fused_norm_combine",
-    kernel="kernel_cake_fused_norm_combine_ebeb96fe4edaefc6931d",
+    kernel="kernel_cake_fused_norm_combine_068ee430f3a25ed6d13e",
     sources=(
-        "cake_fused_norm_combine_ebeb96fe4edaefc6931d_kernel.cu",
-        "cake_fused_norm_combine_ebeb96fe4edaefc6931d_binding.cu",
+        "cake_fused_norm_combine_068ee430f3a25ed6d13e_kernel.cu",
+        "cake_fused_norm_combine_068ee430f3a25ed6d13e_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(("sm_100a", ("--fmad=true",)), ("sm_103a", ("--fmad=true",))),
@@ -155,12 +155,12 @@ OWNER_STREAM = cake_program.CakeProgram(
 )
 
 OWNER_PIPELINED = cake_program.CakeProgram(
-    name="cake_fused_norm_combine_41820a073fe8aa16387b",
+    name="cake_fused_norm_combine_43fbcf87256eb482ea39",
     operator_dir="cake_fused_norm_combine",
-    kernel="kernel_cake_fused_norm_combine_41820a073fe8aa16387b",
+    kernel="kernel_cake_fused_norm_combine_43fbcf87256eb482ea39",
     sources=(
-        "cake_fused_norm_combine_41820a073fe8aa16387b_kernel.cu",
-        "cake_fused_norm_combine_41820a073fe8aa16387b_binding.cu",
+        "cake_fused_norm_combine_43fbcf87256eb482ea39_kernel.cu",
+        "cake_fused_norm_combine_43fbcf87256eb482ea39_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(("sm_100a", ("--fmad=true",)), ("sm_103a", ("--fmad=true",))),
