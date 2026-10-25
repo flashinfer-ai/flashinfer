@@ -19,8 +19,8 @@ programs partitioning the architectures -- the ``mma.sync`` decode of ``sm_80``,
 ``sm_90a`` and ``sm_120a`` (its plain K-first build, its whole-tile build delivered for
 ``sm_80`` alone, and its cooperative build, which merges the splits in the
 same launch) and the tcgen05 decode of ``sm_100a``, ``sm_103a`` and ``sm_107a``
-(its plain and its cooperative build; tensor memory, one CTA per SM) -- and the
-separate
+(its plain and its cooperative build; tensor memory, one CTA per SM; and its
+persistent-walk build delivered for ``sm_103a`` alone) -- and the separate
 split-KV merge with the sigmoid output gate, delivered for every architecture.
 
 Every record of ``MODULES`` is one mechanically exported program: a CUDA
@@ -28,7 +28,7 @@ device translation unit plus a tvm-ffi binding, compiled for each architecture
 of the record's ``arches`` (one source per program; ``sm_80``, ``sm_90a`` and
 ``sm_120a`` for the ``mma.sync`` decodes, ``sm_100a``, ``sm_103a`` and ``sm_107a`` for the
 tcgen05 decodes, all five for the merge, ``sm_80`` alone for the whole-tile
-decode).  A record
+decode, ``sm_103a`` alone for the persistent walk).  A record
 carries the host plan only: the program's ``library`` stem (its ``build.json``
 entry is ``<library>_<arch>``), the architectures it is delivered for, the
 ``stage`` of the launch order it fills and its ``variant``, the
@@ -51,15 +51,21 @@ through a counter per (row, KV head)), the device's exported architecture
 ``arch`` and whether the decode grid is *wide* (a multi-wave, long-stream
 grid: above one resident wave, ``DECODE_CTAS_PER_SM`` CTAs per SM times the
 SM count, with every CTA walking at least ``DECODE_LONG_STREAM_TILES``
-tiles), the row count ``rows``, the KV head count ``kv_heads``, the query
-head count ``qo_heads`` and the split count ``splits``.  Only the records
-delivered for ``arch`` (``record["arches"]``) are candidates: each decode
-program has a ``form`` record per form.  A selection rule of kind ``form``
-admits its form on every architecture its record ships for; one of kind
-``form_grid`` admits its form on one architecture at one grid class, and wins
-over a ``form`` rule when both admit (the whole-tile decode: the split form on
-``sm_80`` on a wide grid).  No rule reads a tensor.  Which form a call takes,
-its split count and whether its grid is wide are the host's decisions
+tiles), the CTA count ``walk`` of the *persistent walk* when the host serves
+the call with it (``0`` otherwise: a two-wave split-form grid on ``sm_103a``
+whose longest walked CTA is shorter than the plain program's, the host's
+:func:`.cake_backend.select_walk`), the row count ``rows``, the KV head count
+``kv_heads``, the query head count ``qo_heads`` and the split count ``splits``
+(the walk's partial slots per (row, KV head), :func:`walk_splits`, where the
+walk serves the call).  Only the records delivered for ``arch``
+(``record["arches"]``) are candidates: each decode program has a ``form``
+record per form.  A selection rule of kind ``form`` admits its form on every
+architecture its record ships for; one of kind ``form_grid`` admits its form
+on one architecture at one grid class, and wins over a ``form`` rule when both
+admit (the whole-tile decode: the split form on ``sm_80`` on a wide grid; the
+persistent walk: the split form on ``sm_103a`` on a walked grid).  No rule
+reads a tensor.  Which form a call takes, its split count, whether its grid
+is wide and whether the walk serves it are the host's decisions
 (:mod:`.cake_backend`), not rules.
 
 The derived leaves of a record (``kernel_symbol``, ``launch``, ``arg_plan``,
@@ -106,10 +112,12 @@ FORMS = ("split", "fused")
 # The selection rule kinds, least specific first: ``form`` admits its ``value``
 # form on every architecture its record ships for; ``form_grid`` admits its
 # ``value`` form on its ``arch`` alone and only at the grid class its ``grid`` names
-# (``"multi_wave_long"``: a decode grid above one resident wave whose CTAs each
-# walk at least ``DECODE_LONG_STREAM_TILES`` tiles).  When both admit, the more
-# specific wins.
+# (``GRID_BOUNDS``: ``"multi_wave_long"`` is a decode grid above one resident
+# wave whose CTAs each walk at least ``DECODE_LONG_STREAM_TILES`` tiles, the
+# host's ``wide``; ``"two_wave_walk"`` is a split-form grid the persistent walk
+# serves, the host's ``walk > 0``).  When both admit, the more specific wins.
 SELECT_RULES = ("form", "form_grid")
+GRID_BOUNDS = ("multi_wave_long", "two_wave_walk")
 # The merge's split bound: a (row, head) has at most this many partials (one
 # per lane of the merge's four warps).  The host's split rule never exceeds it.
 MAX_SPLITS = 128
@@ -161,6 +169,15 @@ DECODE_FUSED_CTAS_PER_SM = {
 # tokens (the 128-row shapes at 17 tiles per CTA favoured it, the 64-row shapes
 # at 9 did not).
 DECODE_LONG_STREAM_TILES = 16
+# The persistent walk's wave bound (the ``sm_103a`` kernel file's ``WALK_MAX_WAVES``,
+# held by the exporter): a split-form call whose plain decode grid runs more
+# than one resident wave and at most this many, and whose longest walked CTA is
+# shorter than the plain program's longest (:func:`walk_applies`), launches the
+# persistent walk (``select_rule`` kind ``form_grid``, grid ``two_wave_walk``)
+# on :func:`walk_ctas` CTAs with :func:`walk_splits` partial slots per (row, KV
+# head) instead of the plain split count.  Two: the class the paired
+# measurements cover (rows 128 of the owner's shapes on 148 / 152 SMs).
+WALK_MAX_WAVES = 2
 
 # Logical argument names the host backend binds: the kernels' own parameter
 # names (``record["logical"]`` is the identity map).  Decode: ``q`` BF16
@@ -789,6 +806,110 @@ MODULES: dict[str, dict[str, Any]] = {
         "variant": "tcgen05_coop",
         "workspace_rule": {"kind": "fused_partials_counters"},
     },
+    "decode_tcgen05_persistent": {
+        "arches": ["sm_103a"],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "k_data"],
+            ["buffer", "v_data"],
+            ["buffer", "k_sf"],
+            ["buffer", "v_sf"],
+            ["buffer", "indices"],
+            ["buffer", "block_table"],
+            ["buffer", "token_to_req"],
+            ["buffer", "gate"],
+            ["buffer", "out"],
+            ["buffer", "partial_out"],
+            ["buffer", "partial_lse"],
+            ["buffer", "merge_counters"],
+            ["parameter", "q_stride_row"],
+            ["parameter", "q_stride_head"],
+            ["parameter", "data_stride_block"],
+            ["parameter", "data_stride_token"],
+            ["parameter", "data_stride_head"],
+            ["parameter", "sf_stride_block"],
+            ["parameter", "sf_stride_token"],
+            ["parameter", "sf_stride_head"],
+            ["parameter", "indices_stride_row"],
+            ["parameter", "table_stride_req"],
+            ["parameter", "out_stride_row"],
+            ["parameter", "out_stride_head"],
+            ["parameter", "score_scale"],
+            ["parameter", "output_scale"],
+            ["parameter", "num_rows"],
+            ["parameter", "num_requests"],
+            ["parameter", "num_blocks"],
+            ["parameter", "page_div"],
+            ["parameter", "table_width"],
+            ["parameter", "topk"],
+            ["parameter", "group_size"],
+            ["parameter", "num_qo_heads"],
+            ["parameter", "num_tiles"],
+            ["parameter", "num_splits"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "walk_ctas"},
+        "kernel_symbol": "kernel_cake_qsa_nvfp4_097d6404dd678ef3f3e5",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 192896,
+            "use_pdl": False,
+        },
+        "library": "cake_qsa_nvfp4_097d6404dd678ef3f3e5",
+        "logical": {
+            "block_table": "block_table",
+            "data_stride_block": "data_stride_block",
+            "data_stride_head": "data_stride_head",
+            "data_stride_token": "data_stride_token",
+            "gate": "gate",
+            "group_size": "group_size",
+            "indices": "indices",
+            "indices_stride_row": "indices_stride_row",
+            "k_data": "k_data",
+            "k_sf": "k_sf",
+            "merge_counters": "merge_counters",
+            "num_blocks": "num_blocks",
+            "num_qo_heads": "num_qo_heads",
+            "num_requests": "num_requests",
+            "num_rows": "num_rows",
+            "num_splits": "num_splits",
+            "num_tiles": "num_tiles",
+            "out": "out",
+            "out_stride_head": "out_stride_head",
+            "out_stride_row": "out_stride_row",
+            "output_scale": "output_scale",
+            "page_div": "page_div",
+            "partial_lse": "partial_lse",
+            "partial_out": "partial_out",
+            "q": "q",
+            "q_stride_head": "q_stride_head",
+            "q_stride_row": "q_stride_row",
+            "score_scale": "score_scale",
+            "sf_stride_block": "sf_stride_block",
+            "sf_stride_head": "sf_stride_head",
+            "sf_stride_token": "sf_stride_token",
+            "table_stride_req": "table_stride_req",
+            "table_width": "table_width",
+            "token_to_req": "token_to_req",
+            "topk": "topk",
+            "v_data": "v_data",
+            "v_sf": "v_sf",
+        },
+        "select_rule": {
+            "arch": "sm_103a",
+            "grid": "two_wave_walk",
+            "kind": "form_grid",
+            "value": "split",
+        },
+        "stage": "decode",
+        "variant": "tcgen05_persistent",
+        "workspace_rule": {"kind": "split_partials"},
+    },
     "merge": {
         "arches": ["sm_80", "sm_90a", "sm_100a", "sm_103a", "sm_107a", "sm_120a"],
         "arg_plan": [
@@ -840,35 +961,52 @@ def records_of_stage(stage: str) -> tuple[str, ...]:
     return tuple(name for name, rec in MODULES.items() if rec["stage"] == stage)
 
 
-def _admits(rule: dict[str, Any], *, form: str, arch: str, wide: bool) -> bool:
+def _admits(
+    rule: dict[str, Any], *, form: str, arch: str, wide: bool, walk: int = 0
+) -> bool:
     """Whether a record's selection rule admits the call; the caller has
-    already kept the records delivered for ``arch`` alone."""
+    already kept the records delivered for ``arch`` alone.  A ``form_grid``
+    rule reads the grid class its ``grid`` names: ``multi_wave_long`` is the
+    host's ``wide``, ``two_wave_walk`` the host's ``walk > 0``."""
     kind = rule["kind"]
     if kind == "form":
         return rule["value"] == form
     if kind == "form_grid":
-        return (
-            rule["value"] == form
-            and rule["arch"] == arch
-            and (rule["grid"] == "multi_wave_long") == bool(wide)
+        if rule["value"] != form or rule["arch"] != arch:
+            return False
+        grid = rule["grid"]
+        if grid == "multi_wave_long":
+            return bool(wide)
+        if grid == "two_wave_walk":
+            return int(walk) > 0
+        raise ValueError(
+            f"unknown Cake QSA NVFP4 decode grid class {grid!r}; the classes are {GRID_BOUNDS}"
         )
     raise ValueError(f"unknown Cake QSA NVFP4 decode selection rule: {kind!r}")
 
 
-def select_record(stage: str, *, form: str, arch: str, wide: bool) -> str:
+def select_record(
+    stage: str, *, form: str, arch: str, wide: bool, walk: int = 0
+) -> str:
     """The one record of ``stage`` the call selects.
 
     ``form`` is ``"split"`` (the plain decode and, above one split, the merge)
     or ``"fused"`` (the cooperative decode, which merges its splits itself);
-    ``arch`` is the device's exported architecture and ``wide`` whether the
+    ``arch`` is the device's exported architecture, ``wide`` whether the
     decode grid is wide -- above one resident wave with at least
-    ``DECODE_LONG_STREAM_TILES`` tiles per CTA (both the host's:
-    :mod:`.cake_backend`).
+    ``DECODE_LONG_STREAM_TILES`` tiles per CTA -- and ``walk`` the CTA count
+    of the persistent walk when the host serves the call with it, ``0``
+    otherwise (all three the host's: :mod:`.cake_backend`).
     Only the records delivered for ``arch`` are candidates (the ``mma.sync``
     decode's on ``sm_80`` / ``sm_90a``, the tcgen05 decode's on ``sm_100a`` /
     ``sm_103a`` / ``sm_107a``); of those whose rule admits the call, the most specific rule
     kind (``SELECT_RULES`` order) wins: on ``sm_80`` a wide split-form call
-    selects the whole-tile decode over the K-first one.  The ``merge`` stage has no
+    selects the whole-tile decode over the K-first one, on ``sm_103a`` a
+    walked split-form call the persistent walk over the plain tcgen05 decode.
+    A grid class no record of the architecture reads falls through to its
+    ``form`` record (``wide`` on ``sm_90a``, ``walk`` on ``sm_100a``;
+    :func:`resolved_launches` refuses a walk the selected decode cannot
+    launch).  The ``merge`` stage has no
     record in the fused form (:func:`select_records` leaves it out); asking for
     one is an error.  Exactly one record remains, or the registry is
     inconsistent.
@@ -877,11 +1015,17 @@ def select_record(stage: str, *, form: str, arch: str, wide: bool) -> str:
         raise ValueError(f"unknown form {form!r}; the forms are {FORMS}")
     if arch not in ARCHES:
         raise ValueError(f"unknown arch {arch!r}; the architectures are {ARCHES}")
+    if int(walk) < 0:
+        raise ValueError(
+            f"walk must be 0 (no walk) or the walk's CTA count, got {walk}"
+        )
     admitted = [
         name
         for name in records_of_stage(stage)
         if arch in MODULES[name]["arches"]
-        and _admits(MODULES[name]["select_rule"], form=form, arch=arch, wide=wide)
+        and _admits(
+            MODULES[name]["select_rule"], form=form, arch=arch, wide=wide, walk=walk
+        )
     ]
     if admitted:
         top = max(
@@ -895,20 +1039,23 @@ def select_record(stage: str, *, form: str, arch: str, wide: bool) -> str:
     if len(admitted) != 1:
         raise ValueError(
             f"stage {stage!r}: records {admitted} admit form={form!r}, arch={arch!r}, "
-            f"wide={bool(wide)}; exactly one must"
+            f"wide={bool(wide)}, walk={int(walk)}; exactly one must"
         )
     return admitted[0]
 
 
-def select_records(*, form: str, splits: int, arch: str, wide: bool) -> tuple[str, ...]:
+def select_records(
+    *, form: str, splits: int, arch: str, wide: bool, walk: int = 0
+) -> tuple[str, ...]:
     """The records one call launches, in launch order: the decode of ``form``
-    on ``arch`` at the grid class ``wide`` and, in the split form with
-    ``splits > 1``, the merge."""
+    on ``arch`` at the grid classes ``wide`` / ``walk`` and, in the split form
+    with ``splits > 1``, the merge (``splits`` is the call's: the walk's slots
+    where the walk serves it)."""
     if int(splits) < 1:
         raise ValueError(f"splits must be at least 1, got {splits}")
-    names = [select_record("decode", form=form, arch=arch, wide=wide)]
+    names = [select_record("decode", form=form, arch=arch, wide=wide, walk=walk)]
     if form == "split" and int(splits) > 1:
-        names.append(select_record("merge", form=form, arch=arch, wide=wide))
+        names.append(select_record("merge", form=form, arch=arch, wide=wide, walk=walk))
     return tuple(names)
 
 
@@ -919,13 +1066,21 @@ def merge_heads_per_cta(splits: int) -> int:
 
 
 def launch_grid(
-    name: str, *, rows: int, kv_heads: int, qo_heads: int, splits: int
+    name: str,
+    *,
+    rows: int,
+    kv_heads: int,
+    qo_heads: int,
+    splits: int,
+    walk: int = 0,
 ) -> tuple[int, int, int]:
     """The launch grid of record ``name`` under its recorded grid rule.
 
     ``rows_kv_heads_splits`` launches ``(rows, kv_heads, splits)`` (the decode:
     one CTA per (row, KV head, split)); ``rows_head_groups`` launches ``(rows,
-    ceil(qo_heads / merge_heads_per_cta(splits)), 1)`` (the merge).
+    ceil(qo_heads / merge_heads_per_cta(splits)), 1)`` (the merge);
+    ``walk_ctas`` launches ``(walk, 1, 1)`` (the persistent walk: the host's
+    CTA count, at least one).
     """
     rule = MODULES[name]["grid_rule"]
     kind = rule["kind"]
@@ -936,6 +1091,12 @@ def launch_grid(
         )
     if kind == "rows_kv_heads_splits":
         return (int(rows), int(kv_heads), int(splits))
+    if kind == "walk_ctas":
+        if int(walk) < 1:
+            raise ValueError(
+                f"record {name}: the persistent walk needs its CTA count (walk={walk})"
+            )
+        return (int(walk), 1, 1)
     if kind == "rows_head_groups":
         if int(rule["warps"]) != MERGE_WARPS:
             raise ValueError(
@@ -944,6 +1105,74 @@ def launch_grid(
         per = merge_heads_per_cta(splits)
         return (int(rows), -(-int(qo_heads) // per), 1)
     raise ValueError(f"unknown Cake QSA NVFP4 decode grid rule: {kind!r}")
+
+
+# ---- The persistent walk's arithmetic: pure integers, mirrors of the ``sm_103a`` kernel file's ``walk_ctas`` /
+# ``walk_splits`` / ``walk_applies`` (the kernel's slot math: slot ``s = pair x tiles + tile`` over ``pairs = rows x
+# kv_heads``; CTA ``c`` of ``G`` walks the slots ``[c S // G, (c + 1) S // G)`` with ``S = pairs x tiles``; the CTA
+# holding slot ``s`` is ``((s + 1) G - 1) // S``).  The host policy that calls them is :mod:`.cake_backend`.
+
+
+def walk_ctas(sm_count: int, pairs: int, tiles: int) -> int:
+    """``G = min(sm_count, pairs x tiles)``: one CTA per SM, never more CTAs
+    than tile slots."""
+    if int(sm_count) < 1 or int(pairs) < 1 or int(tiles) < 1:
+        raise ValueError(
+            f"sm_count={sm_count}, pairs={pairs}, tiles={tiles} must all be at least 1"
+        )
+    return min(int(sm_count), int(pairs) * int(tiles))
+
+
+def _slot_owner(slot: int, ctas: int, slots: int) -> int:
+    return ((slot + 1) * ctas - 1) // slots
+
+
+def walk_splits(ctas: int, pairs: int, tiles: int) -> int:
+    """The partial slots per (row, KV head) the persistent walk needs as its
+    ``num_splits``: the most segments any pair is cut into by ``ctas`` CTAs
+    walking the ``pairs x tiles`` slots in contiguous ranges (exact over the
+    pairs; ``1`` when every pair sits inside one CTA, and the kernel then
+    writes the output itself)."""
+    slots = int(pairs) * int(tiles)
+    if not 1 <= int(ctas) <= slots:
+        raise ValueError(f"ctas={ctas} is not between 1 and the {slots} tile slots")
+    return max(
+        _slot_owner(p * int(tiles) + int(tiles) - 1, int(ctas), slots)
+        - _slot_owner(p * int(tiles), int(ctas), slots)
+        + 1
+        for p in range(int(pairs))
+    )
+
+
+def walk_applies(
+    rows: int, kv_heads: int, tiles: int, splits: int, sm_count: int
+) -> bool:
+    """Whether the walk shortens a split-form call (the kernel file's rule):
+    the plain program's grid ``rows x kv_heads x splits`` at the plain split
+    count ``splits`` runs more than one resident wave of ``sm_count`` CTAs
+    (``waves = ceil(rows x kv_heads x splits / sm_count) > 1``), at most
+    ``WALK_MAX_WAVES``, and the walk's longest CTA walks fewer tiles than the
+    plain program's longest, ``ceil(pairs x tiles / G) < waves x ceil(tiles /
+    splits)``.  Pure in its integers; whether the architecture ships the walk
+    is the host's (:func:`.cake_backend.select_walk`)."""
+    if (
+        int(rows) < 1
+        or int(kv_heads) < 1
+        or int(tiles) < 1
+        or int(splits) < 1
+        or int(sm_count) < 1
+    ):
+        raise ValueError(
+            f"rows={rows}, kv_heads={kv_heads}, tiles={tiles}, splits={splits}, "
+            f"sm_count={sm_count} must all be at least 1"
+        )
+    pairs = int(rows) * int(kv_heads)
+    ctas = walk_ctas(sm_count, pairs, tiles)
+    longest_walk = -(-(pairs * int(tiles)) // ctas)
+    waves = -(-(pairs * int(splits)) // int(sm_count))
+    if waves <= 1 or waves > WALK_MAX_WAVES:
+        return False
+    return longest_walk < waves * -(-int(tiles) // int(splits))
 
 
 def arch_for_capability(capability: tuple[int, int]) -> str | None:
@@ -1094,6 +1323,7 @@ def resolved_launches(
     rows: int,
     kv_heads: int,
     qo_heads: int,
+    walk: int = 0,
 ) -> tuple[tuple[Any, Callable[[Any], tuple[Any, ...]], tuple[int, int, int]], ...]:
     """The launches of one call, resolved once per key of host scalars: per
     record of :func:`select_records`, in launch order, its loaded FFI entry,
@@ -1101,24 +1331,38 @@ def resolved_launches(
     argument sequence ``LOGICAL_TENSORS + LOGICAL_SCALARS`` (``LOGICAL_INDEX``)
     and its launch grid (:func:`launch_grid`).  A launch is then
     ``entry(*getter(arguments), *grid)``: every argument plan ends with the
-    three grid arguments, and the host interprets no plan per call.
+    three grid arguments, and the host interprets no plan per call.  A walk
+    (``walk > 0``) whose selected decode record keeps its own grid rule is
+    refused: the walk's split count is the walk's slots, not the plain cut.
     """
+    names = select_records(form=form, splits=splits, arch=arch, wide=wide, walk=walk)
+    if int(walk) > 0 and MODULES[names[0]]["grid_rule"]["kind"] != "walk_ctas":
+        raise ValueError(
+            f"walk={int(walk)} CTAs on {arch}, but the selected decode record {names[0]!r} "
+            "is not the persistent walk (its grid rule is "
+            f"{MODULES[names[0]]['grid_rule']['kind']!r})"
+        )
     launches = []
-    for name in select_records(form=form, splits=splits, arch=arch, wide=wide):
+    for name in names:
         plan = _argument_plan(name)
         grid_axes = [axis for logical, axis in plan if logical is None]
         if grid_axes != [0, 1, 2] or any(logical is None for logical, _ in plan[:-3]):
             raise RuntimeError(
                 f"record {name}: the grid arguments are not the suffix of its argument plan"
             )
-        names = [logical for logical, _ in plan[:-3]]
-        for logical in names:
+        logicals = [logical for logical, _ in plan[:-3]]
+        for logical in logicals:
             if logical not in LOGICAL_INDEX:
                 raise ValueError(f"record {name} needs logical argument {logical!r}")
-        getter = operator.itemgetter(*(LOGICAL_INDEX[logical] for logical in names))
+        getter = operator.itemgetter(*(LOGICAL_INDEX[logical] for logical in logicals))
         entry = getattr(load(name, arch), MODULES[name]["ffi_entry"])
         grid = launch_grid(
-            name, rows=rows, kv_heads=kv_heads, qo_heads=qo_heads, splits=splits
+            name,
+            rows=rows,
+            kv_heads=kv_heads,
+            qo_heads=qo_heads,
+            splits=splits,
+            walk=walk,
         )
         launches.append((entry, getter, grid))
     return tuple(launches)
@@ -1167,6 +1411,7 @@ __all__ = [
     "DECODE_PARAMETERS",
     "DECODE_THREADS",
     "FORMS",
+    "GRID_BOUNDS",
     "LOGICAL_INDEX",
     "LOGICAL_SCALARS",
     "LOGICAL_TENSORS",
@@ -1178,6 +1423,7 @@ __all__ = [
     "SELECT_RULES",
     "STAGES",
     "TILE_TOKENS",
+    "WALK_MAX_WAVES",
     "arch_for_capability",
     "current_raw_stream",
     "device_arch",
@@ -1194,4 +1440,7 @@ __all__ = [
     "select_records",
     "sm_count",
     "specs_for_arch",
+    "walk_applies",
+    "walk_ctas",
+    "walk_splits",
 ]

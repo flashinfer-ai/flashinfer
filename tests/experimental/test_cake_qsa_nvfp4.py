@@ -78,6 +78,9 @@ DECODE_SMEM_BYTES = 49792
 # The tcgen05 decode's pool (four raw stages, 158,848 B, plus its barrier words), passed as
 # dynamic shared memory by its binding; one CTA of it holds an SM (the launch bound).
 DECODE_TCGEN05_SMEM_BYTES = 159872
+# The persistent walk's pool (the tcgen05 pool plus a second Q^T buffer and an epilogue
+# exchange region of its own: the raw ring stays live across the pairs a CTA walks).
+DECODE_TCGEN05_PERSISTENT_SMEM_BYTES = 192896
 MAX_SPLITS = 128  # the merge kernel's split bound: the host rule never passes more
 ROWS = (1, 2, 4, 8, 16, 32, 64, 128)  # the decode row counts of the owner's shape list
 
@@ -153,11 +156,47 @@ def _sm_count(device) -> int:
 
 
 def _splits(rows, num_kv_heads, device) -> int:
-    """The split count the package passes for ``rows`` on ``device``: its host split rule."""
+    """The split count the package passes for ``rows`` on ``device``: its host split rule
+    (the persistent walk's partial slots where the walk serves the call)."""
     index = device.index if device.index is not None else torch.cuda.current_device()
     return num_splits(
         rows, num_kv_heads, WIDTH, _sm_count(device), cake_jit.device_arch(index)
     )
+
+
+def _walk(rows, num_kv_heads, device) -> int:
+    """The persistent walk's CTA count the package launches for ``rows`` on ``device``, 0
+    where the plain cut is kept (every architecture but sm_103a; one-wave grids)."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return cake_backend.select_walk(
+        rows,
+        num_kv_heads,
+        math.ceil(WIDTH / TILE),
+        _sm_count(device),
+        cake_jit.device_arch(index),
+    )
+
+
+def _walk_segments(rows, num_kv_heads, num_tiles, ctas):
+    """Each tile's partial slot under the persistent walk's cut, ``[rows, kv_heads, tiles]``:
+    the kernel's slot math restated here rather than imported -- slot ``pair * tiles + tile``
+    over ``pairs = rows * kv_heads``, CTA ``c`` of ``G`` walks ``[c S // G, (c + 1) S // G)``
+    (``S`` the slot count), the CTA holding slot ``s`` is ``((s + 1) G - 1) // S``, and a
+    pair's segment ``k`` is its ``k``-th CTA."""
+    pairs = rows * num_kv_heads
+    slots = pairs * num_tiles
+
+    def owner(slot):
+        return ((slot + 1) * ctas - 1) // slots
+
+    seg = torch.empty(rows, num_kv_heads, num_tiles, dtype=torch.long)
+    for pair in range(pairs):
+        first = owner(pair * num_tiles)
+        for tile in range(num_tiles):
+            seg[pair // num_kv_heads, pair % num_kv_heads, tile] = (
+                owner(pair * num_tiles + tile) - first
+            )
+    return seg
 
 
 def _dequant(data, sf, scale):
@@ -222,7 +261,7 @@ def _ulp_bf16(x):
     return torch.ldexp(torch.ones_like(x), torch.frexp(x)[1] - 8) * (x != 0)
 
 
-def _reference(q, cache, selection, gate, num_splits, chunk=64):
+def _reference(q, cache, selection, gate, num_splits, chunk=64, segments=None):
     """Float64 references, row chunk by row chunk.
 
     contract: the kernel's arithmetic -- 64-column tiles walked per split with an online
@@ -230,6 +269,10 @@ def _reference(q, cache, selection, gate, num_splits, chunk=64):
     worst-case bound on how far one-ulp P rounding, FP32 scores (with exp2.approx), FP32
     accumulation and the two output roundings can move the kernel from it.
     exact: softmax attention times the gate, unrounded, and sum_n p_n |v_n| times the gate.
+    The cut of a (row, KV head)'s tiles into its ``num_splits`` partials is the plain
+    program's strided one (tile ``t`` in split ``t % num_splits``) or, given ``segments``
+    (``[rows, kv_heads, tiles]`` of partial slots, :func:`_walk_segments`), the persistent
+    walk's contiguous one; within a partial the tiles are walked in order either way.
     """
     k_deq, v_deq = cache[3]
     table, token_to_req, indices = selection
@@ -259,14 +302,29 @@ def _reference(q, cache, selection, gate, num_splits, chunk=64):
         p = e / e.sum(-1, keepdim=True).clamp(min=1e-300)
         exact = torch.einsum("rhgw,rwhd->rhgd", p, v)
         bound = torch.einsum("rhgw,rwhd->rhgd", p, v.abs())
+        seg = None if segments is None else segments[r0 : r0 + chunk].to(s.device)
         splits = []
         for split in range(num_splits):
             m = torch.full(s.shape[:-1], -1e20, dtype=s.dtype, device=s.device)
             l, acc, flip = torch.zeros_like(m), 0.0, 0.0
-            for tile in range(split, num_tiles, num_splits):
+            if seg is None:
+                tiles = range(split, num_tiles, num_splits)
+            else:
+                tiles = [t for t in range(num_tiles) if (seg[..., t] == split).any()]
+            for tile in tiles:
                 cols = slice(64 * tile, 64 * tile + 64)
                 m_new = torch.maximum(m, s[..., cols].amax(-1))
+                if seg is not None:
+                    # Only the (row, KV head) pairs whose segment ``split`` holds this tile
+                    # take it; the others keep their state (alpha = 1, nothing added).
+                    take = (seg[..., tile] == split)[..., None]
+                    m_new = torch.where(take, m_new, m)
                 pt = torch.exp2(s[..., cols] - m_new[..., None]) * mask[..., cols]
+                if seg is not None:
+                    # Select 0 rather than multiply by 0: before the pair's first held tile of this
+                    # slot ``m`` is still -1e20 and exp2(s - m) is inf (inf * 0 would be NaN and
+                    # ``nan_to_num`` would then drop the whole partial).
+                    pt = torch.where(take[..., None], pt, 0.0)
                 pb = pt.bfloat16().double()
                 alpha = torch.exp2(m - m_new)[..., None]
                 acc = acc * alpha + torch.einsum("rhgw,rwhd->rhgd", pb, v[:, cols])
@@ -341,8 +399,15 @@ def _inputs(rows, num_qo_heads, num_kv_heads, layout, seed):
     return q, _make_cache(num_kv_heads, layout, seed), _make_selection(rows, seed), gate
 
 
-def _check_contract(out, q, cache, selection, gate, splits):
-    contract, tolerance, exact, bound = _reference(q, cache, selection, gate, splits)
+def _check_contract(out, q, cache, selection, gate, splits, walk=0):
+    segments = (
+        _walk_segments(q.shape[0], cache[3][0].shape[2], math.ceil(WIDTH / TILE), walk)
+        if walk
+        else None
+    )
+    contract, tolerance, exact, bound = _reference(
+        q, cache, selection, gate, splits, segments=segments
+    )
     assert ((out - contract).abs() <= tolerance).all()
     # Accuracy limit against exact attention; validated empirically, not a proven bound.
     assert ((out - exact).abs() / bound.clamp(min=1e-12)).max().item() <= 2**-6
@@ -379,7 +444,15 @@ def test_matches_reference(layout, rows, num_qo_heads, num_kv_heads):
     device = _device_or_skip()
     q, cache, selection, gate = _inputs(rows, num_qo_heads, num_kv_heads, layout, rows)
     out = _run(q, cache, selection, gate).double()
-    _check_contract(out, q, cache, selection, gate, _splits(rows, num_kv_heads, device))
+    _check_contract(
+        out,
+        q,
+        cache,
+        selection,
+        gate,
+        _splits(rows, num_kv_heads, device),
+        _walk(rows, num_kv_heads, device),
+    )
     if rows > 2:
         assert not out[1].any() and out[2].any()  # count 0; count 1 with a real token
 
@@ -396,6 +469,51 @@ def test_thirty_three_splits(layout):
     q, cache, selection, gate = _inputs(2, 24, 2, layout, 33)
     out = _run(q, cache, selection, gate).double()
     _check_contract(out, q, cache, selection, gate, 33)
+
+
+def test_two_wave_walk_matches_the_plain_cut_and_replays(monkeypatch):
+    """On a GB300 (sm_103a, 152 SMs) rows 128 at two KV heads take the persistent walk:
+    one CTA per SM walking a contiguous share of the (row, KV head) x tile slots, 2 partial
+    slots per pair, then the merge.  The walked call meets the contract of its own cut;
+    forced onto the plain cut (one split, 256 CTAs in two waves: the host's walk rule off)
+    the same call meets the contract of the strided cut and differs from the walked one by
+    the merge's association alone, within the kernel tests' bound; the walked call replays
+    bit for bit under CUDA-graph capture.  Skipped where the host walks nothing (every
+    other architecture; SM counts whose rows 128 grid is one wave)."""
+    device = _device_or_skip()
+    rows, num_kv_heads = 128, 2
+    walk = _walk(rows, num_kv_heads, device)
+    if not walk:
+        pytest.skip("the host walks nothing on this device")
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    assert cake_jit.device_arch(index) in cake_backend.WALK_ARCHES
+    assert walk == _sm_count(device) and _splits(rows, num_kv_heads, device) == 2
+    q, cache, selection, gate = _inputs(rows, 24, num_kv_heads, "NHD", 1280)
+    walked = _run(q, cache, selection, gate)
+    _check_contract(walked.double(), q, cache, selection, gate, 2, walk)
+    cake_backend._resolve.cache_clear()
+    monkeypatch.setattr(cake_backend, "WALK_ARCHES", ())
+    try:
+        assert _walk(rows, num_kv_heads, device) == 0
+        plain_splits = _splits(rows, num_kv_heads, device)
+        assert plain_splits == 1
+        plain = _run(q, cache, selection, gate)
+    finally:
+        monkeypatch.undo()
+        cake_backend._resolve.cache_clear()
+    assert _walk(rows, num_kv_heads, device) == walk
+    _check_contract(plain.double(), q, cache, selection, gate, plain_splits)
+    torch.testing.assert_close(walked.float(), plain.float(), rtol=2**-6, atol=0.04)
+    out = torch.empty_like(q)
+    _run(q, cache, selection, gate, out)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run(q, cache, selection, gate, out)
+    for dst, src in zip(selection, _make_selection(rows, 1281), strict=True):
+        dst.copy_(src)
+    q.copy_(torch.randn_like(q))
+    graph.replay()
+    torch.testing.assert_close(out, _run(q, cache, selection, gate), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("rows", [1, 8, 64])
@@ -764,7 +882,9 @@ def test_split_formula_fills_the_device_capacity():
         1,
         1,
     ]
-    assert [num_splits(r, 2, WIDTH, 148, "sm_103a") for r in ROWS] == [
+    # sm_103a: the plain cut at rows 1-64; rows 128 (256 plain CTAs: two waves) take the
+    # persistent walk and its 2 partial slots per (row, KV head) replace the formula's 1.
+    assert [cake_backend.plain_splits(r, 2, WIDTH, 148, "sm_103a") for r in ROWS] == [
         33,
         33,
         18,
@@ -773,6 +893,26 @@ def test_split_formula_fills_the_device_capacity():
         2,
         1,
         1,
+    ]
+    assert [num_splits(r, 2, WIDTH, 148, "sm_103a") for r in ROWS] == [
+        33,
+        33,
+        18,
+        9,
+        4,
+        2,
+        1,
+        2,
+    ]
+    assert [num_splits(r, 2, WIDTH, 152, "sm_103a") for r in ROWS] == [
+        33,
+        33,
+        19,
+        9,
+        4,
+        2,
+        1,
+        2,
     ]
     assert [num_splits(r, 2, WIDTH, 212, "sm_107a") for r in ROWS] == [
         33,
@@ -832,13 +972,18 @@ def test_split_formula_fills_the_device_capacity():
         (66, "sm_80"),
         (148, "sm_100a"),
         (148, "sm_103a"),
+        (152, "sm_103a"),
         (212, "sm_107a"),
         (216, "sm_107a"),
         (190, "sm_120a"),
     ):
-        assert [num_splits(r, 2, WIDTH, sm_count, arch) for r in ROWS] == [
-            _formula(r, 2, WIDTH, sm_count, arch) for r in ROWS
-        ]
+        assert [
+            cake_backend.plain_splits(r, 2, WIDTH, sm_count, arch) for r in ROWS
+        ] == [_formula(r, 2, WIDTH, sm_count, arch) for r in ROWS]
+        if arch != "sm_103a":
+            assert [num_splits(r, 2, WIDTH, sm_count, arch) for r in ROWS] == [
+                _formula(r, 2, WIDTH, sm_count, arch) for r in ROWS
+            ]
     assert num_splits(2048, 2, WIDTH, 132, "sm_90a") == 1
     assert num_splits(1, 1, TILE, 132, "sm_90a") == 1
     assert num_splits(1, 1, 200 * TILE, 10**6, "sm_90a") == MAX_SPLITS
@@ -1020,19 +1165,22 @@ def test_capabilities_route_to_the_six_libraries():
 
 
 def test_registry_records_carry_the_launch_facts_and_the_argument_plans():
-    """Six programs: the mma.sync plain decode, its whole-tile build delivered for sm_80
+    """Seven programs: the mma.sync plain decode, its whole-tile build delivered for sm_80
     alone (the split form on a multi-wave, long-stream grid), the mma.sync cooperative
     decode that merges its splits in the launch, the tcgen05 plain and cooperative decodes
-    of sm_100a / sm_103a / sm_107a, and the separate merge; 128 threads for the mma.sync programs and
-    the merge, 512 for the tcgen05 ones, no cluster; the decodes' shared-memory pools as
-    dynamic shared memory, the merge's static; the argument plan names every kernel
-    parameter in order and then the grid (the five decodes take the same parameters)."""
+    of sm_100a / sm_103a / sm_107a, the tcgen05 persistent walk delivered for sm_103a alone
+    (the split form on a two-wave grid, one CTA per SM), and the separate merge; 128
+    threads for the mma.sync programs and the merge, 512 for the tcgen05 ones, no cluster;
+    the decodes' shared-memory pools as dynamic shared memory, the merge's static; the
+    argument plan names every kernel parameter in order and then the grid (the six decodes
+    take the same parameters)."""
     assert set(cake_jit.MODULES) == {
         "decode",
         "decode_whole_tile",
         "decode_coop",
         "decode_tcgen05",
         "decode_tcgen05_coop",
+        "decode_tcgen05_persistent",
         "merge",
     }
     arches = {
@@ -1041,10 +1189,26 @@ def test_registry_records_carry_the_launch_facts_and_the_argument_plans():
         "decode_coop": ("sm_80", "sm_90a", "sm_120a"),
         "decode_tcgen05": ("sm_100a", "sm_103a", "sm_107a"),
         "decode_tcgen05_coop": ("sm_100a", "sm_103a", "sm_107a"),
+        "decode_tcgen05_persistent": ("sm_103a",),
         "merge": ("sm_80", "sm_90a", "sm_100a", "sm_103a", "sm_107a", "sm_120a"),
     }
-    tcgen05 = ("decode_tcgen05", "decode_tcgen05_coop")
+    tcgen05 = ("decode_tcgen05", "decode_tcgen05_coop", "decode_tcgen05_persistent")
     assert cake_jit.SELECT_RULES == ("form", "form_grid")
+    assert cake_jit.GRID_BOUNDS == ("multi_wave_long", "two_wave_walk")
+    persistent = cake_jit.MODULES["decode_tcgen05_persistent"]
+    assert persistent["stage"] == "decode"
+    assert persistent["variant"] == "tcgen05_persistent"
+    assert persistent["select_rule"] == {
+        "kind": "form_grid",
+        "value": "split",
+        "arch": "sm_103a",
+        "grid": "two_wave_walk",
+    }
+    assert persistent["grid_rule"] == {"kind": "walk_ctas"}
+    assert (
+        persistent["workspace_rule"]
+        == cake_jit.MODULES["decode_tcgen05"]["workspace_rule"]
+    )
     whole_tile = cake_jit.MODULES["decode_whole_tile"]
     assert whole_tile["stage"] == "decode" and whole_tile["variant"] == "whole_tile"
     assert whole_tile["select_rule"] == {
@@ -1057,6 +1221,8 @@ def test_registry_records_carry_the_launch_facts_and_the_argument_plans():
         assert whole_tile[key] == cake_jit.MODULES["decode"][key], key
     for name in tcgen05:
         for key in ("grid_rule", "arg_plan", "logical"):
+            if key == "grid_rule" and name == "decode_tcgen05_persistent":
+                continue  # the walk's grid is its CTA count (asserted above)
             assert cake_jit.MODULES[name][key] == cake_jit.MODULES["decode"][key], (
                 name,
                 key,
@@ -1078,6 +1244,8 @@ def test_registry_records_carry_the_launch_facts_and_the_argument_plans():
         assert launch["dynamic_smem_bytes"] == (
             0
             if name == "merge"
+            else DECODE_TCGEN05_PERSISTENT_SMEM_BYTES
+            if name == "decode_tcgen05_persistent"
             else DECODE_TCGEN05_SMEM_BYTES
             if name in tcgen05
             else DECODE_SMEM_BYTES

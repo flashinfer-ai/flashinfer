@@ -26,8 +26,9 @@ implementation, an unknown value is refused -- device runs of the route and of t
 default against the package, bit for bit, and
 the NVFP4 paged writer against the torch port the backend suite fills its caches with.
 It also holds the host's program rule on the CPU: which records a call launches for its
-form, architecture and grid class, and when a grid is wide (above one resident wave with
-at least 16 tiles per CTA).
+form, architecture and grid classes, when a grid is wide (above one resident wave with
+at least 16 tiles per CTA) and when the sm_103a persistent walk serves it (a two-wave
+split-form grid whose longest walked CTA is shorter than the plain program's).
 """
 
 import contextlib
@@ -282,10 +283,11 @@ def test_program_rule_selects_the_records_of_a_call():
     on sm_80 / sm_90a / sm_120a, the tcgen05 decode's on sm_100a / sm_103a / sm_107a.  On sm_80 a
     wide (multi-wave, long-stream) split-form call launches the whole-tile decode, every
     other call the K-first decode; the tcgen05 architectures launch the tcgen05 decode
-    whatever the grid;
+    whatever the grid, except that on sm_103a a walked split-form call (``walk`` = the
+    persistent walk's CTA count) launches the persistent walk;
     the merge follows above one split on every architecture; the fused form is the
     architecture's cooperative decode alone; an unknown form, architecture or split count is
-    refused."""
+    refused, as is a walk on an architecture whose decode cannot launch it (the plan)."""
     select = cake_jit.select_records
     assert select(form="split", splits=4, arch="sm_80", wide=True) == (
         "decode_whole_tile",
@@ -321,6 +323,39 @@ def test_program_rule_selects_the_records_of_a_call():
             assert select(form="fused", splits=4, arch=arch, wide=wide) == (
                 "decode_tcgen05_coop",
             )
+    # The persistent walk: on sm_103a a walked split-form call launches the walk, then the
+    # merge above one partial slot; the fused form ignores the walk; sm_100a / sm_107a have
+    # no record reading the walked grid class, so selection falls through to the plain
+    # tcgen05 decode and the plan refuses the walk there (its split count would be the
+    # walk's slots, not the plain cut).
+    assert select(form="split", splits=2, arch="sm_103a", wide=True, walk=152) == (
+        "decode_tcgen05_persistent",
+        "merge",
+    )
+    assert select(form="split", splits=1, arch="sm_103a", wide=False, walk=1) == (
+        "decode_tcgen05_persistent",
+    )
+    assert select(form="fused", splits=2, arch="sm_103a", wide=False, walk=152) == (
+        "decode_tcgen05_coop",
+    )
+    for arch in ("sm_100a", "sm_107a"):
+        assert select(form="split", splits=2, arch=arch, wide=False, walk=148) == (
+            "decode_tcgen05",
+            "merge",
+        )
+        with pytest.raises(ValueError, match="persistent walk"):
+            cake_jit.resolved_launches(
+                form="split",
+                splits=2,
+                arch=arch,
+                wide=False,
+                rows=128,
+                kv_heads=2,
+                qo_heads=24,
+                walk=148,
+            )
+    with pytest.raises(ValueError, match="walk"):
+        select(form="split", splits=1, arch="sm_103a", wide=False, walk=-1)
     assert cake_jit.ARCHES == (
         "sm_80",
         "sm_90a",
@@ -332,11 +367,15 @@ def test_program_rule_selects_the_records_of_a_call():
     for name in cake_jit.MODULES:
         assert cake_jit.MODULES[name]["stage"] in cake_jit.STAGES
         assert set(cake_jit.MODULES[name]["arches"]) <= set(cake_jit.ARCHES)
-    # Every (form, architecture) selects exactly one decode record; the merge is one record on every architecture.
+    # Every (form, architecture, grid classes) selects exactly one decode record; the merge is one record on every
+    # architecture.
     for arch in cake_jit.ARCHES:
         for form in cake_jit.FORMS:
             for wide in (False, True):
-                cake_jit.select_record("decode", form=form, arch=arch, wide=wide)
+                for walk in (0, 1):
+                    cake_jit.select_record(
+                        "decode", form=form, arch=arch, wide=wide, walk=walk
+                    )
         assert (
             cake_jit.select_record("merge", form="split", arch=arch, wide=False)
             == "merge"
@@ -349,6 +388,94 @@ def test_program_rule_selects_the_records_of_a_call():
         select(form="split", splits=0, arch="sm_80", wide=False)
     with pytest.raises(ValueError, match="merge"):
         cake_jit.select_record("merge", form="fused", arch="sm_90a", wide=False)
+
+
+def test_two_wave_walk_rule_on_sm_103a():
+    """``select_walk`` / ``num_splits`` at the owner's shape (2 KV heads, 33 tiles) on a
+    GB300's 152 SMs and on 148: rows 128 (256 plain CTAs in two waves) take the persistent
+    walk on one CTA per SM with 2 partial slots per (row, KV head); rows 1-64 (one wave) and
+    rows 256 / 512 (4 / 7 waves, past ``WALK_MAX_WAVES``) keep the plain cut, as does every
+    other architecture.  The walk arithmetic: ``walk_ctas`` never exceeds the slots,
+    ``walk_splits`` is the most segments any pair is cut into, ``walk_applies`` needs two
+    waves at most and a shorter longest CTA; the walk's launch grid is ``(walk, 1, 1)`` and
+    the merge's ignores the walk."""
+    tiles = cake_backend.num_tiles(2051)
+    assert tiles == 33
+    assert cake_backend.WALK_ARCHES == ("sm_103a",)
+    assert cake_backend.WALK_MAX_WAVES == cake_jit.WALK_MAX_WAVES == 2
+    assert (
+        tuple(cake_jit.MODULES["decode_tcgen05_persistent"]["arches"])
+        == cake_backend.WALK_ARCHES
+    )
+    for sm_count in (148, 152):
+        assert cake_backend.select_walk(128, 2, tiles, sm_count, "sm_103a") == sm_count
+        assert cake_backend.plain_splits(128, 2, 2051, sm_count, "sm_103a") == 1
+        assert cake_backend.num_splits(128, 2, 2051, sm_count, "sm_103a") == 2
+        for rows in (1, 2, 4, 8, 16, 32, 64, 256, 512):
+            assert cake_backend.select_walk(rows, 2, tiles, sm_count, "sm_103a") == 0, (
+                rows
+            )
+            assert cake_backend.num_splits(
+                rows, 2, 2051, sm_count, "sm_103a"
+            ) == cake_backend.plain_splits(rows, 2, 2051, sm_count, "sm_103a"), rows
+        for arch in ("sm_80", "sm_90a", "sm_100a", "sm_107a"):
+            assert cake_backend.select_walk(128, 2, tiles, sm_count, arch) == 0, arch
+            assert cake_backend.num_splits(
+                128, 2, 2051, sm_count, arch
+            ) == cake_backend.plain_splits(128, 2, 2051, sm_count, arch), arch
+    # The wave window: 256 pairs at one split on 152 SMs are two waves (the walk applies),
+    # rows 256 four (past the bound), rows 64 one (nothing to balance).
+    assert cake_jit.walk_applies(128, 2, tiles, 1, 152)
+    assert not cake_jit.walk_applies(256, 2, tiles, 1, 152)
+    assert not cake_jit.walk_applies(64, 2, tiles, 1, 152)
+    # The shortening condition: 3 pairs of 1 tile on 2 SMs (two waves) cannot be shortened
+    # (the longest CTA walks 2 tiles either way); 3 pairs of 4 tiles can (6 < 8).
+    assert not cake_jit.walk_applies(3, 1, 1, 1, 2)
+    assert cake_jit.walk_applies(3, 1, 4, 1, 2)
+    assert (
+        cake_jit.walk_ctas(152, 256, 33) == 152 and cake_jit.walk_ctas(152, 2, 4) == 8
+    )
+    assert cake_jit.walk_splits(152, 256, 33) == 2
+    assert cake_jit.walk_splits(148, 256, 33) == 2
+    # 5 CTAs over 2 x 33 slots: 13-14 slots each, both pairs meet three CTAs; one CTA holds
+    # everything in one slot; 66 CTAs over 66 slots hold one tile each: still one segment
+    # per pair?  No -- each pair's 33 tiles sit in 33 CTAs.
+    assert cake_jit.walk_splits(5, 2, 33) == 3
+    assert cake_jit.walk_splits(1, 4, 33) == 1
+    assert cake_jit.walk_splits(66, 2, 33) == 33
+    for bad in ((0, 2, 33), (67, 2, 33)):
+        with pytest.raises(ValueError):
+            cake_jit.walk_splits(*bad)
+    for bad in (
+        (0, 2, tiles, 152, "sm_103a"),
+        (1, 0, tiles, 152, "sm_103a"),
+        (1, 2, 0, 152, "sm_103a"),
+        (1, 2, tiles, 0, "sm_103a"),
+        (1, 2, tiles, 152, "sm_999a"),
+    ):
+        with pytest.raises(ValueError):
+            cake_backend.select_walk(*bad)
+    grid = cake_jit.launch_grid
+    assert grid(
+        "decode_tcgen05_persistent",
+        rows=128,
+        kv_heads=2,
+        qo_heads=24,
+        splits=2,
+        walk=152,
+    ) == (152, 1, 1)
+    with pytest.raises(ValueError, match="CTA count"):
+        grid("decode_tcgen05_persistent", rows=128, kv_heads=2, qo_heads=24, splits=2)
+    assert grid("merge", rows=128, kv_heads=2, qo_heads=24, splits=2, walk=152) == (
+        128,
+        6,
+        1,
+    )
+    assert grid("decode_tcgen05", rows=128, kv_heads=2, qo_heads=24, splits=1) == (
+        128,
+        2,
+        1,
+    )
 
 
 def test_wide_grid_is_multi_wave_with_long_streams():
