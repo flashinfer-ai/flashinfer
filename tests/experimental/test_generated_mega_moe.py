@@ -96,8 +96,12 @@ def require_route(num_experts, intermediate, num_tokens):
 
 def case_inputs(case, num_tokens, *, rank=0, **overrides):
     """One rank's inputs of a TP/EP case at ``num_tokens`` (skips without the
-    route or the memory); the long token counts lower the down-projection
-    scales as the model-route tests do."""
+    route or the memory). The down-projection scales are lowered at every token
+    count, as the model-route tests lower them at the long ones: with the
+    default scales a weighted expert output of these geometries reaches ~500,
+    where one accumulation-order flip moves an element by one bf16 ulp (2.0),
+    outside the elementwise tolerance for any implementation of this
+    arithmetic. Tolerances are unchanged."""
     geometry = dict(TP_EP_CASES[case])
     ep = geometry.pop("ep")
     require_route(geometry["num_experts"], geometry["intermediate"], num_tokens)
@@ -105,7 +109,7 @@ def case_inputs(case, num_tokens, *, rank=0, **overrides):
     return fixtures.model_inputs(
         "fp4",
         num_tokens=num_tokens,
-        l2_scale_shift=5 if num_tokens >= 1024 else 0,
+        l2_scale_shift=5,
         ep=ep,
         rank=rank,
         **geometry,
