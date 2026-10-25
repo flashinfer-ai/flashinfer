@@ -4729,8 +4729,7 @@ def test_source_program_table_names_shipped_sources():
     its preprocess stage (the segment preprocess, one warp per tile of its
     block, or the packed-varlen metadata kernel of the ``exactmeta``
     programs), its family's host template and main dynamic SMEM, and a main
-    kernel whose symbol is the module identity without its hash.  Table
-    entries the Cake export has not filled fail here by name."""
+    kernel whose symbol is the module identity without its hash."""
 
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     source_dir = module._source_dir()
@@ -4795,53 +4794,41 @@ def test_source_program_table_names_shipped_sources():
     assert set(module._CHUNKPAR3_MODULES) == {
         name for name in module._PROGRAMS if name.startswith("chunkpar3_")
     }
-    # The sm_107a (Rubin) module table: every exported program except the
-    # retained start ``exact_*`` programs, each entry the fold module's stem
-    # under its own identity (the export's content hash, or the pending token
-    # before the export fills it); an ``exactmeta_*`` entry equals its
-    # ``exactfused_*`` varlen twin, and the ``exactone_*`` entry of the suffix
-    # is a source of its own (the one-launch render beside the SM100-form
-    # render), as on SM103.
+    # The sm_107a (Rubin) module table: the programs whose Rubin render was
+    # regenerated with its own geometry -- the fused and one-launch varlen
+    # scans, the look-back chunk-parallel program and the two-kernel varlen
+    # ring program -- each entry the fold module's stem under its own
+    # identity (the export's content hash).  Every other program builds its
+    # fold module on sm_107a too: the retained start ``exact_*`` programs,
+    # the SM100-only ``exactmeta_*`` programs and the programs whose Rubin
+    # render differed from the fold only by the descriptor mask (an
+    # ``__CUDA_ARCH__`` branch of the fold source).  The ``exactone_*`` entry
+    # of a suffix is a source of its own (the one-launch render beside the
+    # SM100-form render), as on SM103.
     assert set(module._SM107_MODULES) == {
-        name for name in module._PROGRAMS if not name.startswith("exact_")
+        f"{family}_{state}_{mode}{variant}"
+        for family, mode, variants in (
+            ("exactfused", "varlen", ("", "_noring")),
+            ("exactone", "varlen", ("", "_noring")),
+            ("exactpre", "varlen", ("",)),
+            ("chunkpar", "batched", ("",)),
+            ("chunkpar", "varlen", ("",)),
+        )
+        for variant in variants
+        for state in ("bf16", "f16", "f32")
+        if (variant, state) != ("_noring", "f32")
     }
-    assert len(module._SM107_MODULES) == 45
+    assert len(module._SM107_MODULES) == 19
+    assert set(module._SM107_MODULES) <= set(module._PROGRAMS)
     for name, own in module._SM107_MODULES.items():
         if name.startswith("exactone_"):
             twin = module._SM107_MODULES[name.replace("exactone_", "exactfused_", 1)]
-            assert module._PENDING_EXPORT in own or twin != own, (name, twin)
-    assert len(
-        {
-            identity
-            for identity in module._SM107_MODULES.values()
-            if module._PENDING_EXPORT not in identity
-        }
-    ) == len(module._SM107_MODULES) - sum(
-        1 for name in module._SM107_MODULES if name.startswith("exactmeta_")
-    )
+            assert twin != own, (name, twin)
+    assert len(set(module._SM107_MODULES.values())) == len(module._SM107_MODULES)
     for name, identity in module._SM107_MODULES.items():
         stem, suffix = identity.rsplit("_", 1)
         assert stem == module._PROGRAMS[name].main.module.rsplit("_", 1)[0], name
-        assert suffix == module._PENDING_EXPORT or re.fullmatch(r"[0-9a-f]+", suffix), (
-            name
-        )
-    assert {
-        name.replace("exactfused_", "exactmeta_", 1): shared
-        for name, shared in module._SM107_MODULES.items()
-        if name.startswith("exactfused_") and "_varlen" in name
-    } == {
-        name: shared
-        for name, shared in module._SM107_MODULES.items()
-        if name.startswith("exactmeta_")
-    }
-    pending = sorted(
-        name
-        for name, program in module._PROGRAMS.items()
-        if module._PENDING_EXPORT in program.main.module or program.main_smem_bytes <= 0
-    )
-    assert not pending, f"programs awaiting the Cake export: {pending}"
-    assert module._PENDING_EXPORT not in module._SEGMENT_PREPROCESS_MODULE
-    assert module._PENDING_EXPORT not in module._PACKED_METADATA_MODULE
+        assert re.fullmatch(r"[0-9a-f]+", suffix), name
     assert (
         module._SEGMENT_PREPROCESS.threads
         == 32 * module._SEGMENT_PREPROCESS_TILES_PER_BLOCK
@@ -4961,9 +4948,8 @@ def test_source_program_table_names_shipped_sources():
             )
             device_sources.add(source)
         # The sm_107a render of the program (``_SM107_MODULES``): the same
-        # kernel symbol behind the shared preprocess, in its own device source
-        # once the Cake export has filled the identity; a pending identity
-        # ships no source and ``_require_exported`` refuses it by name.
+        # kernel symbol behind the shared preprocess, in its own device source;
+        # a program without an entry builds its fold source on sm_107a too.
         rubin = module._arch_program(name, "sm_107a")
         assert rubin.main.kernel == program.main.kernel
         assert rubin.preprocess is program.preprocess
@@ -4971,18 +4957,13 @@ def test_source_program_table_names_shipped_sources():
             assert rubin is program
         else:
             assert rubin.main.module == module._SM107_MODULES[name]
-            if module._PENDING_EXPORT in rubin.main.module:
-                with pytest.raises(RuntimeError, match=f"{name} for sm_107a is not"):
-                    module._require_exported(name, rubin, "sm_107a")
-            else:
-                assert rubin.main.module != program.main.module
-                module._require_exported(name, rubin, "sm_107a")
-                source = source_dir / module._DEVICE_DIR / rubin.main.source
-                assert source.is_file(), source
-                assert re.search(
-                    rf"\b{rubin.main.kernel}\(", source.read_text(encoding="utf-8")
-                )
-                device_sources.add(source)
+            assert rubin.main.module != program.main.module
+            source = source_dir / module._DEVICE_DIR / rubin.main.source
+            assert source.is_file(), source
+            assert re.search(
+                rf"\b{rubin.main.kernel}\(", source.read_text(encoding="utf-8")
+            )
+            device_sources.add(source)
         template = templates[family]
         rendered = module._render_host_source(template, name, program)
         assert all(placeholder in template for placeholder in _HOST_PLACEHOLDERS)
@@ -5012,20 +4993,14 @@ def test_source_program_table_names_shipped_sources():
     # main sources (six ring + five ``_noring``), eleven fused ``exactfused``
     # main sources (the five varlen ones also serving ``exactmeta``), five
     # one-launch ``exactone`` main sources (the SM103 render of the fused
-    # varlen entries; on sm_107a that render serves ``exactfused`` and
-    # ``exactmeta`` too), twelve
-    # two-kernel ``exactpre`` main sources (six ring, six ``_tail``), six
-    # look-back (``chunkpar``) and six three-phase (``chunkpar3``)
-    # chunk-parallel main sources plus the segment preprocess and the
-    # packed-varlen metadata kernel; plus one sm_107a (Rubin) render per
-    # filled ``_SM107_MODULES`` identity (an ``exactmeta`` entry shares its
-    # ``exactfused`` varlen twin's file; the nine retired programs have no
-    # sm_107a entry either), no other architecture copies and no orphans.
-    rubin_sources = {
-        identity
-        for identity in module._SM107_MODULES.values()
-        if module._PENDING_EXPORT not in identity
-    }
+    # varlen entries), twelve two-kernel ``exactpre`` main sources (six ring,
+    # six ``_tail``), six look-back (``chunkpar``) and six three-phase
+    # (``chunkpar3``) chunk-parallel main sources plus the segment preprocess
+    # and the packed-varlen metadata kernel; plus one sm_107a (Rubin) render
+    # per ``_SM107_MODULES`` identity (a program without an entry builds its
+    # fold source on sm_107a, whose descriptor mask is an ``__CUDA_ARCH__``
+    # branch), no other architecture copies and no orphans.
+    rubin_sources = set(module._SM107_MODULES.values())
     assert len(device_sources) == 53 + len(rubin_sources)
     assert sorted(
         path.name for path in (source_dir / module._DEVICE_DIR).glob("*.cu")
@@ -5038,18 +5013,11 @@ def test_active_source_package_declares_cuda_half_types_explicitly():
 
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     source_root = module._source_dir() / module._DEVICE_DIR
-    # Programs the Cake export has not filled yet ship no source; they fail
-    # by name in test_source_program_table_names_shipped_sources.
     sources = {
         kernel.source
         for program in module._PROGRAMS.values()
         for kernel in program.kernels
-        if module._PENDING_EXPORT not in kernel.module
-    } | {
-        f"{identity}.cu"
-        for identity in module._SM107_MODULES.values()
-        if module._PENDING_EXPORT not in identity
-    }
+    } | {f"{identity}.cu" for identity in module._SM107_MODULES.values()}
     assert sources
     for name in sorted(sources):
         source = (source_root / name).read_text(encoding="utf-8")
@@ -5780,58 +5748,15 @@ def test_source_chunk_parallel_launch_orders_its_main_arguments(monkeypatch):
         )
 
 
-@pytest.mark.parametrize("gap", ("module", "smem"))
-def test_source_unexported_program_refuses_to_build(monkeypatch, tmp_path, gap):
-    """A program whose table entries the Cake export has not filled -- a
-    module identity still carrying the placeholder token or a zero main
-    dynamic SMEM literal -- is refused by name, naming the export step,
-    before any source is read or nvcc is resolved."""
-
-    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
-    exported = module._PROGRAMS["exact_bf16_batched"]
-    module._require_exported("exact_bf16_batched", exported)
-    if gap == "module":
-        main = module._scan("mamba_ssd_chunk_parallel_bf16_batched_PENDINGEXPORT")
-        smem_bytes = exported.main_smem_bytes
-    else:
-        main = module._scan("mamba_ssd_chunk_parallel_bf16_batched_0123456789")
-        smem_bytes = 0
-    assert main.kernel == "kernel_mamba_ssd_chunk_parallel_bf16_batched"
-    program = module._Program(
-        "chunkpar",
-        module._SEGMENT_PREPROCESS,
-        main,
-        4,
-        16,
-        smem_bytes,
-        module._CHUNKPAR_HOST_TEMPLATE,
-        module._MAIN_ARGS_CHUNKPAR,
-        module._PREPROCESS_ARGS,
-    )
-    name = "chunkpar_bf16_batched_probe"
-    monkeypatch.setitem(module._PROGRAMS, name, program)
-    monkeypatch.setattr(module, "_source_dir", lambda: tmp_path)
-    monkeypatch.setattr(
-        module, "_nvcc", lambda: pytest.fail("nvcc resolved for an unexported program")
-    )
-    module._load_generated_program.cache_clear()
-
-    with pytest.raises(RuntimeError, match="not exported yet") as excinfo:
-        module._load_generated_program(name, "sm_100a")
-    module._load_generated_program.cache_clear()
-
-    message = str(excinfo.value)
-    assert name in message and "export_cake_mamba_ssd_combined" in message
-    assert not any(tmp_path.iterdir())
-
-
 def test_source_sm107_lookup_shadows_the_fold_main_module():
     """``_main_module`` / ``_arch_program``: on sm_107a (Rubin) a program in
     ``_SM107_MODULES`` builds the table module -- the same kernel symbol,
     thread count and build flags behind the shared preprocess, host template
     and SMEM literal -- and every other program (the retained start
-    ``exact_*`` programs) its fold module; sm_100a and sm_103a always build
-    the fold module.  ``_TARGET_ARCHS`` names the three capabilities, the
+    ``exact_*`` programs, the SM100-only ``exactmeta_*`` programs and the
+    programs whose fold source selects the Rubin descriptor mask by
+    ``__CUDA_ARCH__``) its fold module; sm_100a and sm_103a always build the
+    fold module.  ``_TARGET_ARCHS`` names the three capabilities, the
     seq_idx triple form deriving its table routes SM107 like SM103 (the
     one-launch ``exactone`` render), the look-back program
     balances against Rubin's 212 SMs capped at the device's SM count and the
@@ -5869,8 +5794,9 @@ def test_source_sm107_lookup_shadows_the_fold_main_module():
             assert module._main_module(name, arch) == program.main.module
             assert module._arch_program(name, arch) is program
         rubin = module._arch_program(name, "sm_107a")
-        if name.startswith("exact_"):
+        if name.startswith(("exact_", "exactmeta_")):
             assert name not in module._SM107_MODULES
+        if name not in module._SM107_MODULES:
             assert module._main_module(name, "sm_107a") == program.main.module
             assert rubin is program
             continue
@@ -5883,45 +5809,23 @@ def test_source_sm107_lookup_shadows_the_fold_main_module():
         assert module.replace(rubin, main=program.main) == program
 
 
-@pytest.mark.parametrize("state", ("pending", "filled"))
-def test_source_sm107_program_builds_its_table_module_or_refuses_pending(
-    monkeypatch, tmp_path, state
-):
+def test_source_sm107_program_builds_its_table_module(monkeypatch, tmp_path):
     """On sm_107a the loader builds the program's ``_SM107_MODULES`` entry,
-    never its fold source: a pending identity is refused by name and
-    architecture before any source is read or nvcc is resolved (the fold
-    module of the same program still passes ``_require_exported`` for
-    sm_100a); a filled identity is compiled with ``-arch=sm_107a`` from its
-    own device file and embedded under its own module name next to the
-    shared preprocess cubin.  The table entry is overridden here, so both
-    states hold before and after the Cake export fills the table."""
+    never its fold source: the identity is compiled with ``-arch=sm_107a``
+    from its own device file and embedded under its own module name next to
+    the shared preprocess cubin.  The table entry is overridden here, so the
+    test holds for a program with or without a shipped sm_107a render."""
 
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     name = "exactfused_bf16_batched"
     fold = module._PROGRAMS[name]
     stem = fold.main.module.rsplit("_", 1)[0]
-    suffix = module._PENDING_EXPORT if state == "pending" else "0123456789"
-    identity = f"{stem}_{suffix}"
+    identity = f"{stem}_0123456789"
     monkeypatch.setitem(module._SM107_MODULES, name, identity)
     monkeypatch.setattr(module, "_source_dir", lambda: tmp_path)
     module._load_generated_program.cache_clear()
     rubin = module._arch_program(name, "sm_107a")
     assert rubin.main.module == identity and rubin.main.kernel == fold.main.kernel
-    if state == "pending":
-        monkeypatch.setattr(
-            module,
-            "_nvcc",
-            lambda: pytest.fail("nvcc resolved for a pending sm_107a program"),
-        )
-        module._require_exported(name, module._arch_program(name, "sm_100a"), "sm_100a")
-        with pytest.raises(RuntimeError, match="not exported yet") as excinfo:
-            module._load_generated_program(name, "sm_107a")
-        module._load_generated_program.cache_clear()
-        message = str(excinfo.value)
-        assert f"{name} for sm_107a" in message and identity in message
-        assert "export_cake_mamba_ssd_combined" in message
-        assert not any(tmp_path.iterdir())
-        return
 
     # The fake source tree holds the shared preprocess and the sm_107a main
     # source only: reading the fold source would fail.
@@ -6194,8 +6098,7 @@ def test_source_three_phase_host_template_binds_main_arguments_in_loader_order()
     """The three-phase chunk-parallel host launcher is the third exported
     template with the same nine placeholders and namespace scheme; its
     ``Prepare`` / ``Run`` list ``_PREPROCESS_ARGS`` and ``_MAIN_ARGS_CHUNKPAR3``
-    in order, and its programs' main modules are exported (no placeholder
-    token).  Fails by name until the Cake export delivers the template."""
+    in order, and every program of the family ships its main source."""
 
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     assert (
@@ -6219,7 +6122,6 @@ def test_source_three_phase_host_template_binds_main_arguments_in_loader_order()
     for name, program in module._PROGRAMS.items():
         if program.family != "chunkpar3":
             continue
-        module._require_exported(name, program)
         assert (
             module._source_dir() / module._DEVICE_DIR / program.main.source
         ).is_file(), name
