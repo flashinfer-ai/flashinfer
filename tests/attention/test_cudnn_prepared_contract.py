@@ -118,7 +118,8 @@ def test_attention_handle_keeps_torch_stream_fallback(monkeypatch, fallback):
     monkeypatch.setattr(torch.cuda, "current_stream", current_stream)
     monkeypatch.setattr(torch.cuda, "device", lambda device: contextlib.nullcontext())
     assert utils.get_cudnn_attention_handle(backend, device=requested) == 17
-    assert calls == [requested] and bound == [(17, 515)]
+    expected_index = 1 if fallback in ("cold", "missing") else None
+    assert calls == [expected_index] and bound == [(17, 515)]
     assert set(utils._attention_handles.handles) == {resolved}
 
 

@@ -144,6 +144,10 @@ def get_cudnn_attention_handle(backend, stream=None, *, device=None):
         # the ordinary path below; a raw query does not perform lazy init.
         stream_ptr = _get_current_raw_stream(device.index)
     else:
+        # Warm callers already know the index; preserve the ordinary path's
+        # integer lookup when the raw getter is unavailable.
+        if isinstance(device, torch.device) and device.type == "cuda":
+            device = device.index
         stream = torch.cuda.current_stream(device)
         device, stream_ptr = stream.device, stream.cuda_stream
     handles = getattr(_attention_handles, "handles", None)
