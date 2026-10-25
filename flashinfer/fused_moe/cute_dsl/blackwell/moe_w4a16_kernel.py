@@ -49,7 +49,7 @@ from cutlass.utils.mixed_input_helpers import TransformMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import builtin, llvm
-from cutlass.cutlass_dsl import Boolean, Int32, dsl_user_op
+from cutlass.cutlass_dsl import Boolean, Int32, T, dsl_user_op
 
 from flashinfer.tllm_enums import (
     ActivationType,
@@ -62,13 +62,10 @@ from ..moe_utils import validate_cute_dsl_moe_situ_config
 from .moe_w4a16_utils import decode_nvfp4_fragment_to_bf16
 from .utils import (
     blk_reduce_bf16,
-    f32_reciprocal,
     fmin,
     gelu_tanh_f32,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
-    situ_f32,
-    tanh_f32,
 )
 
 
@@ -76,6 +73,37 @@ _NVFP4_SCALE_GRANULARITY_M = 1
 _NVFP4_SCALE_GRANULARITY_K = 16
 _TMA_CACHE_HINT_EVICT_FIRST = 0x12F0000000000000
 _TMA_CACHE_HINT_EVICT_LAST = 0x14F0000000000000
+
+
+@dsl_user_op
+def _w4a16_scaled_tanh(value, beta: float, loc=None, ip=None):
+    """Match MegaMoE's beta*tanh(value/beta) rounding for W4A16 SiTU."""
+    # The reciprocal is rounded once from the Python beta. Keep the tanh's
+    # multiply and subtraction separate, as in the existing MegaMoE oracle.
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                cutlass.Float32(value).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(beta).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(1.0 / beta).ir_value(loc=loc, ip=ip),
+            ],
+            "{\n\t.reg .f32 x, exponent, denominator, inverse, result;\n\t"
+            "mul.rn.f32 x, $1, $3;\n\t"
+            "mul.rn.f32 x, x, 0fC038AA3B;\n\t"
+            "ex2.approx.ftz.f32 exponent, x;\n\t"
+            "add.rn.f32 denominator, exponent, 0f3F800000;\n\t"
+            "rcp.approx.ftz.f32 inverse, denominator;\n\t"
+            "mul.rn.f32 result, inverse, 0f40000000;\n\t"
+            "sub.rn.f32 result, result, 0f3F800000;\n\t"
+            "mul.rn.f32 $0, $2, result;\n\t}",
+            "=f,f,f,f",
+            has_side_effects=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 def _align_n(x, alignment: int):
@@ -2189,11 +2217,10 @@ class Sm100W4A16GroupedGemmKernel:
                         cute.size(gated_tTR_tAcc.shape, mode=[4]), active_subtile_cnt
                     )
                     gated_alpha_f32 = cutlass.Float32(alpha_val)
-                    swiglu_alpha = cutlass.Float32(self.swiglu_alpha)
                     swiglu_beta = cutlass.Float32(self.swiglu_beta)
                     swiglu_limit = cutlass.Float32(self.swiglu_limit)
-                    neg_swiglu_alpha_log2_e = -(
-                        swiglu_alpha * cutlass.Float32(1.4426950408889634)
+                    neg_swiglu_alpha_log2_e = cutlass.Float32(
+                        -self.swiglu_alpha * 1.4426950408889634
                     )
                     for gated_subtile_idx in cutlass.range(gated_subtile_cnt):
                         gated_tTR_tAcc_mn = gated_tTR_tAcc[
@@ -2237,29 +2264,37 @@ class Sm100W4A16GroupedGemmKernel:
                                 self.activation_type == ActivationType.Swiglu.value
                                 and self.situ_beta is not None
                             ):
-                                # Keep the Python float so situ_f32 can fold
-                                # 1 / beta at trace time instead of emitting a
-                                # per-element div.rn.f32.
-                                situ_beta = self.situ_beta
-                                situ_gate_pair = (
-                                    situ_f32(gate_pair[0], situ_beta, fastmath=True),
-                                    situ_f32(gate_pair[1], situ_beta, fastmath=True),
+                                bounded_gate = (
+                                    _w4a16_scaled_tanh(gate_pair[0], self.situ_beta),
+                                    _w4a16_scaled_tanh(gate_pair[1], self.situ_beta),
+                                )
+                                gate_log2e = cute.arch.mul_packed_f32x2(
+                                    gate_pair,
+                                    (-1.4426950408889634, -1.4426950408889634),
+                                )
+                                denominator = cute.arch.add_packed_f32x2(
+                                    (
+                                        cute.math.exp2(gate_log2e[0], fastmath=True),
+                                        cute.math.exp2(gate_log2e[1], fastmath=True),
+                                    ),
+                                    (1.0, 1.0),
+                                )
+                                sigmoid = (
+                                    cute.arch.rcp_approx(denominator[0]),
+                                    cute.arch.rcp_approx(denominator[1]),
+                                )
+                                situ_gate_pair = cute.arch.mul_packed_f32x2(
+                                    bounded_gate, sigmoid
                                 )
                                 if cutlass.const_expr(
                                     self.situ_linear_beta is not None
                                 ):
-                                    linear_beta = cutlass.Float32(self.situ_linear_beta)
-                                    inv_linear_beta = cutlass.Float32(
-                                        f32_reciprocal(self.situ_linear_beta)
-                                    )
                                     up_pair = (
-                                        linear_beta
-                                        * tanh_f32(
-                                            up_pair[0] * inv_linear_beta, fastmath=True
+                                        _w4a16_scaled_tanh(
+                                            up_pair[0], self.situ_linear_beta
                                         ),
-                                        linear_beta
-                                        * tanh_f32(
-                                            up_pair[1] * inv_linear_beta, fastmath=True
+                                        _w4a16_scaled_tanh(
+                                            up_pair[1], self.situ_linear_beta
                                         ),
                                     )
                                 result = cute.arch.mul_packed_f32x2(
@@ -2313,12 +2348,21 @@ class Sm100W4A16GroupedGemmKernel:
                                     cute.arch.rcp_approx(sigmoid[0]),
                                     cute.arch.rcp_approx(sigmoid[1]),
                                 )
-                                silu = cute.arch.mul_packed_f32x2(gate_pair, sigmoid)
                                 if cutlass.const_expr(self.parameterized_swiglu):
                                     up_pair = cute.arch.add_packed_f32x2(
                                         up_pair, (swiglu_beta, swiglu_beta)
                                     )
-                                result = cute.arch.mul_packed_f32x2(up_pair, silu)
+                                    up_gate = cute.arch.mul_packed_f32x2(
+                                        up_pair, gate_pair
+                                    )
+                                    result = cute.arch.mul_packed_f32x2(
+                                        up_gate, sigmoid
+                                    )
+                                else:
+                                    silu = cute.arch.mul_packed_f32x2(
+                                        gate_pair, sigmoid
+                                    )
+                                    result = cute.arch.mul_packed_f32x2(up_pair, silu)
 
                             coord_0 = up_coords[i]
                             coord_1 = up_coords[i + 1]

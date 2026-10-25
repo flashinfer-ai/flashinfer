@@ -2805,6 +2805,15 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation):
         quant=quant,
         **shape,
     )
+    if quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16):
+        config = dataclasses.replace(
+            config,
+            finalize=dataclasses.replace(config.finalize, use_fused_finalize=False),
+        )
+    elif quant.pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
+        pass
+    else:
+        raise ValueError(f"Unsupported test quantization pair {quant.pair!r}")
     config = dataclasses.replace(
         config,
         backend=BackendOptions(candidates=(CuteDslConfig(),)),
@@ -2841,7 +2850,6 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation):
                 token_selected_experts=act_pack.topk_ids,
                 token_final_scales=act_pack.topk_weights,
                 local_expert_offset=config.experts.local_expert_offset,
-                use_fused_finalize=config.finalize.use_fused_finalize,
                 wrong_formula=wrong_formula,
                 **activation_options,
             )

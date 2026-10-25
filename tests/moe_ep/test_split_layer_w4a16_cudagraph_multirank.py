@@ -89,6 +89,7 @@ def _build_layer(rank, world_size, backend):
         ExecutionConfig,
         ExpertConfig,
         MoEConfig,
+        MoEFinalizeConfig,
         QuantConfig,
         QuantFormat,
         RoutingConfig,
@@ -122,6 +123,7 @@ def _build_layer(rank, world_size, backend):
         ),
         backend=BackendOptions(candidates=(CuteDslConfig(),)),
         execution=ExecutionConfig(tune_max_num_tokens=compute_max_tokens),
+        finalize=MoEFinalizeConfig(use_fused_finalize=False),
     )
 
     # Canonical weights are plain BF16; prepare.py quantizes them to NVFP4

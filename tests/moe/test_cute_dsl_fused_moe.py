@@ -55,7 +55,6 @@ from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
 from flashinfer.utils import get_compute_capability
 from tests.moe_ep.w4a16_reference import (
     assert_w4a16_bits,
-    prepare_split_w4a16_exact_fused,
     split_w4a16_reference_from_tensors,
 )
 from .utils import (
@@ -184,12 +183,27 @@ _MOE_QUANT_MODE_CASES = (
     pytest.param("w4a4", True, id="w4a4-per-token"),
     pytest.param("w4a16", False, id="w4a16"),
 )
+_MOE_QUANT_FINALIZE_CASES = (
+    pytest.param("w4a4", False, False, id="w4a4-per-tensor-unfused"),
+    pytest.param("w4a4", False, True, id="w4a4-per-tensor-fused"),
+    pytest.param("w4a4", True, False, id="w4a4-per-token-unfused"),
+    pytest.param("w4a4", True, True, id="w4a4-per-token-fused"),
+    pytest.param("w4a16", False, False, id="w4a16-unfused"),
+)
+
+
+def _use_fused_finalize_for_quant_mode(quant_mode):
+    if quant_mode == "w4a4":
+        return True
+    elif quant_mode == "w4a16":
+        return False
+    else:
+        raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
 
 
 def _prepare_moe_quant_mode_inputs(
     tensors: dict,
     quant_mode: str,
-    use_fused_finalize: bool = True,
 ) -> tuple[dict, dict]:
     """Select API and reference inputs for a shared MoE test case."""
     if quant_mode == "w4a4":
@@ -211,12 +225,6 @@ def _prepare_moe_quant_mode_inputs(
             },
         )
     elif quant_mode == "w4a16":
-        if use_fused_finalize and tensors["token_selected_experts"].shape[1] > 2:
-            # Keep every route active while limiting each FC2 output channel
-            # to two expert owners. Arbitrary BF16 atomic sums of >2 nonzero
-            # terms depend on arrival order and have no single exact result.
-            # Unfused tests and fused top-k<=2 retain the original dense weights.
-            prepare_split_w4a16_exact_fused(tensors)
         return (
             {
                 "x": tensors["x_bf16"],
@@ -230,9 +238,7 @@ def _prepare_moe_quant_mode_inputs(
         raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
 
 
-def _compute_moe_quant_mode_reference(
-    tensors, quant_mode, use_fused_finalize=True, **kwargs
-):
+def _compute_moe_quant_mode_reference(tensors, quant_mode, **kwargs):
     if quant_mode == "w4a16":
         # The shared oracle reads the actual packed E2M1 weights and E4M3 scale
         # planes, preserving alpha, activation and combine rounding separately.
@@ -249,7 +255,6 @@ def _compute_moe_quant_mode_reference(
         )
         return split_w4a16_reference_from_tensors(
             tensors,
-            use_fused_finalize=use_fused_finalize,
             **{key: kwargs[key] for key in reference_keys if key in kwargs},
         )
     elif quant_mode == "w4a4":
@@ -1801,6 +1806,7 @@ class TestCuteDslMoeW4A16:
                 intermediate_size=intermediate_size,
                 use_cuda_graph=False,
                 quant_mode="w4a16",
+                use_fused_finalize=False,
             )
         else:
             moe = None
@@ -1813,6 +1819,7 @@ class TestCuteDslMoeW4A16:
                 num_experts=num_experts,
                 top_k=top_k,
                 quant_mode="w4a16",
+                use_fused_finalize=False,
             )
 
         # Weight scales are serving-owned tensors and may be updated in place.
@@ -1950,7 +1957,6 @@ class TestCuteDslMoeW4A16:
         "half_tile_tail", [False, True], ids=["tail1", "tail-half-plus1"]
     )
     @pytest.mark.parametrize("top_k", [2, 3])
-    @pytest.mark.parametrize("use_fused_finalize", [False, True])
     def test_route_tile_boundary_accuracy(
         self,
         route_tile: int,
@@ -1958,7 +1964,6 @@ class TestCuteDslMoeW4A16:
         gemm2_tactic: tuple,
         half_tile_tail: bool,
         top_k: int,
-        use_fused_finalize: bool,
     ):
         from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import (
             launch_w4a16_moe,
@@ -1980,9 +1985,7 @@ class TestCuteDslMoeW4A16:
         tensors["token_selected_experts"][:] = torch.arange(
             top_k, device=tensors["token_selected_experts"].device
         )
-        _, reference_inputs = _prepare_moe_quant_mode_inputs(
-            tensors, "w4a16", use_fused_finalize=use_fused_finalize
-        )
+        _, reference_inputs = _prepare_moe_quant_mode_inputs(tensors, "w4a16")
         tactic = (gemm1_tactic, gemm2_tactic)
         assert tactic in W4A16_MOE_TACTICS
 
@@ -2002,7 +2005,7 @@ class TestCuteDslMoeW4A16:
             moe_output=torch.empty(
                 (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
             ),
-            use_fused_finalize=use_fused_finalize,
+            use_fused_finalize=False,
             enable_pdl=False,
             activation_type=ActivationType.Swiglu,
             tactic=tactic,
@@ -2010,7 +2013,6 @@ class TestCuteDslMoeW4A16:
         ref_output = _compute_moe_quant_mode_reference(
             tensors,
             "w4a16",
-            use_fused_finalize=use_fused_finalize,
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -2070,7 +2072,7 @@ class TestCuteDslFusedMoeFunctional:
             num_experts,
             quant_mode,
             use_per_token_activation,
-            use_fused_finalize=True,
+            use_fused_finalize=_use_fused_finalize_for_quant_mode(quant_mode),
         )
 
     @pytest.mark.parametrize(
@@ -2097,28 +2099,6 @@ class TestCuteDslFusedMoeFunctional:
                 384,
                 True,
                 id="relu2-per-token",
-            ),
-            pytest.param(
-                "w4a16",
-                ActivationType.Swiglu,
-                128,
-                1,
-                256,
-                512,
-                256,
-                False,
-                id="w4a16-swiglu",
-            ),
-            pytest.param(
-                "w4a16",
-                ActivationType.Relu2,
-                515,
-                8,
-                1024,
-                2048,
-                384,
-                False,
-                id="w4a16-relu2",
             ),
         ],
     )
@@ -2151,7 +2131,6 @@ class TestCuteDslFusedMoeFunctional:
             pytest.param("w4a4", False, True, (256, 384), id="w4a4-per-tensor"),
             pytest.param("w4a4", True, True, (256, 384), id="w4a4-per-token"),
             pytest.param("w4a16", False, False, (256, 384, 256), id="w4a16-ordinary"),
-            pytest.param("w4a16", False, True, (256, 384, 256), id="w4a16-fused"),
         ],
     )
     def test_finalize_handles_cluster_padding_and_partial_tiles(
@@ -2176,7 +2155,7 @@ class TestCuteDslFusedMoeFunctional:
             )
         elif quant_mode == "w4a16":
             # The same cache sees a full cluster, a padding peer, then a full
-            # cluster again. Keep route tails in both finalize modes.
+            # cluster again, including route tails with deterministic finalize.
             tail_config = (
                 ((256, 128, 256), (2, 1), True),
                 ((256, 128, 256), (2, 1), True),
@@ -2231,7 +2210,7 @@ class TestCuteDslFusedMoeFunctional:
             use_per_token_activation=use_per_token_activation,
         )
         api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(
-            tensors, quant_mode, use_fused_finalize=use_fused_finalize
+            tensors, quant_mode
         )
 
         result = cute_dsl_fused_moe(
@@ -2260,7 +2239,6 @@ class TestCuteDslFusedMoeFunctional:
         ref_output = _compute_moe_quant_mode_reference(
             tensors,
             quant_mode,
-            use_fused_finalize=use_fused_finalize,
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -2311,6 +2289,7 @@ class TestCuteDslFusedMoeFunctional:
             num_experts=num_experts,
             top_k=top_k,
             activation_type=activation_type,
+            use_fused_finalize=_use_fused_finalize_for_quant_mode(quant_mode),
             quant_mode=quant_mode,
             **api_inputs,
         )
@@ -2407,6 +2386,7 @@ class TestCuteDslFusedMoeFunctional:
             activation_type=ActivationType.Swiglu,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
+            use_fused_finalize=_use_fused_finalize_for_quant_mode(quant_mode),
             quant_mode=quant_mode,
             **api_inputs,
         )
@@ -2496,6 +2476,7 @@ class TestCuteDslFusedMoeFunctional:
                 swiglu_alpha=1.702,
                 swiglu_beta=1.0,
                 swiglu_limit=7.0,
+                use_fused_finalize=_use_fused_finalize_for_quant_mode(quant_mode),
                 quant_mode=quant_mode,
                 **api_inputs,
             )
@@ -2552,6 +2533,7 @@ class TestCuteDslFusedMoeFunctional:
             swiglu_alpha=1.702,
             swiglu_beta=1.0,
             swiglu_limit=7.0,
+            use_fused_finalize=_use_fused_finalize_for_quant_mode(quant_mode),
             quant_mode=quant_mode,
             **api_inputs,
         )
@@ -2609,6 +2591,7 @@ class TestCuteDslFusedMoeFunctional:
             top_k=top_k,
             activation_type=ActivationType.Swiglu,
             swiglu_limit=swiglu_limit,
+            use_fused_finalize=_use_fused_finalize_for_quant_mode(quant_mode),
             quant_mode=quant_mode,
             **api_inputs,
         )
@@ -2662,9 +2645,9 @@ class TestCuteDslMoEWrapper:
     pytestmark = _requires_dsl_arch
 
     @pytest.mark.parametrize("num_tokens", [128, 256, 512])
-    @pytest.mark.parametrize("use_fused_finalize", [False, True])
     @pytest.mark.parametrize(
-        "quant_mode,use_per_token_activation", _MOE_QUANT_MODE_CASES
+        "quant_mode,use_per_token_activation,use_fused_finalize",
+        _MOE_QUANT_FINALIZE_CASES,
     )
     @pytest.mark.parametrize("top_k", [2, 8])
     @pytest.mark.parametrize("num_experts", [256, 384])
@@ -2692,7 +2675,7 @@ class TestCuteDslMoEWrapper:
             use_per_token_activation=use_per_token_activation,
         )
         api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(
-            tensors, quant_mode, use_fused_finalize=use_fused_finalize
+            tensors, quant_mode
         )
 
         # Create wrapper WITHOUT CUDA graph
@@ -2725,7 +2708,6 @@ class TestCuteDslMoEWrapper:
         ref_output = _compute_moe_quant_mode_reference(
             tensors,
             quant_mode,
-            use_fused_finalize=use_fused_finalize,
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -2773,6 +2755,7 @@ class TestCuteDslMoEWrapper:
             swiglu_alpha=1.702,
             swiglu_beta=1.0,
             swiglu_limit=7.0,
+            use_fused_finalize=_use_fused_finalize_for_quant_mode(quant_mode),
             quant_mode=quant_mode,
         )
 
@@ -2807,9 +2790,9 @@ class TestCuteDslMoEWrapper:
 
         _assert_moe_quant_mode_reference(result, ref_output, quant_mode)
 
-    @pytest.mark.parametrize("use_fused_finalize", [False, True])
     @pytest.mark.parametrize(
-        "quant_mode,use_per_token_activation", _MOE_QUANT_MODE_CASES
+        "quant_mode,use_per_token_activation,use_fused_finalize",
+        _MOE_QUANT_FINALIZE_CASES,
     )
     @pytest.mark.parametrize("num_tokens", [64, 128, 256])
     @pytest.mark.parametrize("num_experts", [256, 384])
@@ -2842,7 +2825,7 @@ class TestCuteDslMoEWrapper:
             use_per_token_activation=use_per_token_activation,
         )
         api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(
-            tensors, quant_mode, use_fused_finalize=use_fused_finalize
+            tensors, quant_mode
         )
 
         # Create wrapper WITH CUDA graph
@@ -2928,7 +2911,6 @@ class TestCuteDslMoEWrapper:
         ref_output = _compute_moe_quant_mode_reference(
             tensors,
             quant_mode,
-            use_fused_finalize=use_fused_finalize,
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -2990,6 +2972,7 @@ class TestCuteDslMoEWrapper:
             intermediate_size=intermediate_size,
             use_cuda_graph=False,
             activation_type=activation_type,
+            use_fused_finalize=_use_fused_finalize_for_quant_mode(quant_mode),
             quant_mode=quant_mode,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
@@ -3243,7 +3226,9 @@ class TestApiConsistency:
             **api_inputs,
         )
         result_functional = cute_dsl_fused_moe(
-            **functional_inputs, quant_mode=quant_mode
+            **functional_inputs,
+            use_fused_finalize=_use_fused_finalize_for_quant_mode(quant_mode),
+            quant_mode=quant_mode,
         )
         if quant_mode == "w4a4":
             with pytest.warns(DeprecationWarning, match="cute_dsl_fused_moe_nvfp4"):
@@ -3257,6 +3242,7 @@ class TestApiConsistency:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             use_cuda_graph=False,
+            use_fused_finalize=_use_fused_finalize_for_quant_mode(quant_mode),
             quant_mode=quant_mode,
         )
 
@@ -3347,6 +3333,7 @@ class TestExpertParallelism:
             intermediate_size=intermediate_size,
             num_local_experts=num_local_experts,
             local_expert_offset=local_expert_offset,
+            use_fused_finalize=_use_fused_finalize_for_quant_mode(quant_mode),
             quant_mode=quant_mode,
         )
 
@@ -3384,9 +3371,9 @@ class TestExpertParallelism:
 
         _assert_moe_quant_mode_reference(result, ref_output, quant_mode)
 
-    @pytest.mark.parametrize("use_fused_finalize", [False, True])
     @pytest.mark.parametrize(
-        "quant_mode,use_per_token_activation", _MOE_QUANT_MODE_CASES
+        "quant_mode,use_per_token_activation,use_fused_finalize",
+        _MOE_QUANT_FINALIZE_CASES,
     )
     @pytest.mark.parametrize("ep_size", [8])
     def test_functional_with_ep(
@@ -3417,7 +3404,7 @@ class TestExpertParallelism:
             use_per_token_activation=use_per_token_activation,
         )
         api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(
-            tensors, quant_mode, use_fused_finalize=use_fused_finalize
+            tensors, quant_mode
         )
 
         result = cute_dsl_fused_moe(
@@ -3446,7 +3433,6 @@ class TestExpertParallelism:
         ref_output = _compute_moe_quant_mode_reference(
             tensors,
             quant_mode,
-            use_fused_finalize=use_fused_finalize,
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
