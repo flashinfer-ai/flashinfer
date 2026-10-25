@@ -64,6 +64,11 @@ MODULES: dict[str, dict[str, Any]] = {
         "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_trtllm_moe_finalize_bfloat16_ws4_o110_lt": {
+        "sources": ["cake_trtllm_moe_finalize_bfloat16_ws4_o110_lt_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110_lt",
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_trtllm_moe_finalize_bfloat16_ws4_o110_small": {
         "sources": ["cake_trtllm_moe_finalize_bfloat16_ws4_o110_small_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110_small",
@@ -72,6 +77,11 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_trtllm_moe_finalize_bfloat16_ws4_o111": {
         "sources": ["cake_trtllm_moe_finalize_bfloat16_ws4_o111_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_moe_finalize_bfloat16_ws4_o111_lt": {
+        "sources": ["cake_trtllm_moe_finalize_bfloat16_ws4_o111_lt_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_lt",
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_trtllm_moe_finalize_bfloat16_ws4_o111_small": {
@@ -84,6 +94,11 @@ MODULES: dict[str, dict[str, Any]] = {
         "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_trtllm_moe_finalize_bfloat16_ws8_o110_lt": {
+        "sources": ["cake_trtllm_moe_finalize_bfloat16_ws8_o110_lt_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_lt",
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_trtllm_moe_finalize_bfloat16_ws8_o110_small": {
         "sources": ["cake_trtllm_moe_finalize_bfloat16_ws8_o110_small_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_small",
@@ -92,6 +107,11 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_trtllm_moe_finalize_bfloat16_ws8_o111": {
         "sources": ["cake_trtllm_moe_finalize_bfloat16_ws8_o111_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_moe_finalize_bfloat16_ws8_o111_lt": {
+        "sources": ["cake_trtllm_moe_finalize_bfloat16_ws8_o111_lt_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_lt",
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_trtllm_moe_finalize_bfloat16_ws8_o111_small": {
@@ -124,6 +144,11 @@ MODULES: dict[str, dict[str, Any]] = {
         "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws4_o110",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_trtllm_moe_finalize_float16_ws4_o110_lt": {
+        "sources": ["cake_trtllm_moe_finalize_float16_ws4_o110_lt_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws4_o110_lt",
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_trtllm_moe_finalize_float16_ws4_o110_small": {
         "sources": ["cake_trtllm_moe_finalize_float16_ws4_o110_small_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws4_o110_small",
@@ -132,6 +157,11 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_trtllm_moe_finalize_float16_ws4_o111": {
         "sources": ["cake_trtllm_moe_finalize_float16_ws4_o111_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws4_o111",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_moe_finalize_float16_ws4_o111_lt": {
+        "sources": ["cake_trtllm_moe_finalize_float16_ws4_o111_lt_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws4_o111_lt",
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_trtllm_moe_finalize_float16_ws4_o111_small": {
@@ -144,6 +174,11 @@ MODULES: dict[str, dict[str, Any]] = {
         "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws8_o110",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_trtllm_moe_finalize_float16_ws8_o110_lt": {
+        "sources": ["cake_trtllm_moe_finalize_float16_ws8_o110_lt_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws8_o110_lt",
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_trtllm_moe_finalize_float16_ws8_o110_small": {
         "sources": ["cake_trtllm_moe_finalize_float16_ws8_o110_small_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws8_o110_small",
@@ -154,6 +189,11 @@ MODULES: dict[str, dict[str, Any]] = {
         "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws8_o111",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_trtllm_moe_finalize_float16_ws8_o111_lt": {
+        "sources": ["cake_trtllm_moe_finalize_float16_ws8_o111_lt_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws8_o111_lt",
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_trtllm_moe_finalize_float16_ws8_o111_small": {
         "sources": ["cake_trtllm_moe_finalize_float16_ws8_o111_small_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws8_o111_small",
@@ -161,8 +201,9 @@ MODULES: dict[str, dict[str, Any]] = {
     },
 }
 
-# The largest token count that runs the small-token program, at every world size;
-# larger batches run the persistent program.
+# The largest token count that runs the small-token program, at every world size.
+# Larger batches run the persistent program or, at world sizes 4 and 8 once the batch
+# exceeds twice the persistent program's launched clusters, the large-token program.
 SMALL_TOKEN_MAX = 64
 
 

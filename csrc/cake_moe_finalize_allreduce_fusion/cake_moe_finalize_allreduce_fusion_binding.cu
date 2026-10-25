@@ -4,10 +4,12 @@
  */
 
 // Host launcher for the Cake MoE finalize + all-reduce fusion kernels. One module per
-// architecture links two programs for each dtype x world size x optional NVFP4 epilogue:
-// a small-token program and a persistent program. The caller passes the largest token
-// count that runs the small-token program. The launch configuration is shared and PDL is
-// a launch attribute chosen at run time.
+// architecture links the programs of each dtype x world size x optional NVFP4 epilogue:
+// a small-token program and a persistent program, and at world sizes 4 and 8 a
+// large-token program. The caller passes the largest token count that runs the
+// small-token program; above it the persistent program runs, or the large-token program
+// once every cluster of the persistent program would hold at least three tokens. The
+// launch configuration is shared and PDL is a launch attribute chosen at run time.
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -57,6 +59,14 @@ CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16
 CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_small)
 CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_small)
 CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_small)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws4_o110_lt)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws4_o111_lt)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws8_o110_lt)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws8_o111_lt)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110_lt)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_lt)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_lt)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_lt)
 
 #undef CAKE_MOE_FINALIZE_KERNEL
 
@@ -101,6 +111,20 @@ const void* const kSmallKernels[2][3][2] = {
       reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_small)},
      {reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_small),
       reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_small)}},
+};
+
+// Large-token programs, same order as kKernels; world size 2 has none.
+const void* const kLargeTokenKernels[2][3][2] = {
+    {{nullptr, nullptr},
+     {reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws4_o110_lt),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws4_o111_lt)},
+     {reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws8_o110_lt),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws8_o111_lt)}},
+    {{nullptr, nullptr},
+     {reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110_lt),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_lt)},
+     {reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_lt),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_lt)}},
 };
 
 int sm_count(int device_id) {
@@ -176,7 +200,9 @@ int64_t byte_size(const TensorView& t) { return t.numel() * get_element_size(t);
 // expanded_idx_to_permuted_idx is [tokens, top_k]; allreduce_in is the permuted expert
 // output [num_permuted_rows, 7168]. quant_out / scale_out carry packed FP4 data and E4M3
 // scales (SWIZZLED_128x4); they are checked by byte size and accept any element type.
-// Batches of at most small_token_max tokens run the small-token program.
+// Batches of at most small_token_max tokens run the small-token program; larger batches
+// run the persistent program, or at world sizes 4 and 8 the large-token program when the
+// batch exceeds twice the persistent program's launched clusters.
 void cake_moe_finalize_allreduce_fusion(
     TensorView allreduce_in, TensorView residual_in, TensorView norm_weight,
     TensorView expanded_idx_to_permuted_idx, TensorView expert_scale_factor,
@@ -275,17 +301,7 @@ void cake_moe_finalize_allreduce_fusion(
   const DLDevice device = allreduce_in.device();
   ffi::CUDADeviceGuard device_guard(device.device_id);
   const int ws_index = world_size == 2 ? 0 : (world_size == 4 ? 1 : 2);
-  const bool use_small = tokens <= small_token_max;
-  const void* kernel = (use_small ? kSmallKernels : kKernels)[dtype_index][ws_index][quantize ? 1 : 0];
-  // Persistent grid: enough four-CTA clusters to keep every SM at its resident CTA count (occupancy-derived,
-  // capped at kMaxCtasPerSm), never more clusters than tokens.  One CTA per SM leaves the HBM/NVLink paths
-  // 3-5x under-subscribed for tokens >= 128 (measured on B200: 1.9x at 128 tokens, 2.8x at 2048 with four).
-  // The occupancy is the selected program's own.  The launch further caps the cluster count at
-  // the device's active-cluster capacity for the program (max_active_clusters).
-  const int64_t wanted_clusters =
-      std::min<int64_t>(ctas_per_sm(device.device_id, kernel) * sm_count(device.device_id),
-                        tokens * CAKE_MOE_FINALIZE_CLUSTER_CTAS) /
-      CAKE_MOE_FINALIZE_CLUSTER_CTAS;
+  const int quant_index = quantize ? 1 : 0;
 
   void* p_allreduce_in = allreduce_in.data_ptr();
   void* p_inverse_indices = expanded_idx_to_permuted_idx.data_ptr();
@@ -333,8 +349,39 @@ void cake_moe_finalize_allreduce_fusion(
   config.stream = get_stream(device);
   config.attrs = attrs;
   config.numAttrs = n;
-  const int64_t clusters = std::min<int64_t>(
-      wanted_clusters, max_active_clusters(device.device_id, kernel, config));
+
+  // Persistent grid: enough four-CTA clusters to keep every SM at its resident CTA count
+  // (occupancy-derived, capped at kMaxCtasPerSm), never more clusters than tokens.  One CTA per SM
+  // leaves the HBM/NVLink paths 3-5x under-subscribed for tokens >= 128 (measured on B200: 1.9x at
+  // 128 tokens, 2.8x at 2048 with four).  The occupancy is the program's own, and the launch
+  // further caps the cluster count at the device's active-cluster capacity for the program
+  // (max_active_clusters).
+  auto launched_clusters = [&](const void* program) {
+    const int64_t wanted_clusters =
+        std::min<int64_t>(ctas_per_sm(device.device_id, program) * sm_count(device.device_id),
+                          tokens * CAKE_MOE_FINALIZE_CLUSTER_CTAS) /
+        CAKE_MOE_FINALIZE_CLUSTER_CTAS;
+    return std::min<int64_t>(wanted_clusters,
+                             max_active_clusters(device.device_id, program, config));
+  };
+  const void* kernel = nullptr;
+  int64_t clusters = 0;
+  if (tokens <= small_token_max) {
+    kernel = kSmallKernels[dtype_index][ws_index][quant_index];
+    clusters = launched_clusters(kernel);
+  } else {
+    kernel = kKernels[dtype_index][ws_index][quant_index];
+    clusters = launched_clusters(kernel);
+    // The large-token program is faster only when every cluster of the persistent program would
+    // hold at least three tokens.  Large-token / persistent speed measured on B200 and B300:
+    // world size 8, 284 tokens 0.990 / 0.996, 352 tokens 1.047 / 1.038; world size 4, 288 tokens
+    // 0.92, 352 tokens 1.013 / 1.016.
+    const void* large_token = kLargeTokenKernels[dtype_index][ws_index][quant_index];
+    if (large_token != nullptr && tokens > 2 * clusters) {
+      kernel = large_token;
+      clusters = launched_clusters(kernel);
+    }
+  }
   TVM_FFI_CHECK(clusters > 0, RuntimeError)
       << "Cake MoE finalize requires one complete four-CTA cluster";
   config.gridDim = dim3(static_cast<unsigned>(clusters * CAKE_MOE_FINALIZE_CLUSTER_CTAS), 1, 1);
