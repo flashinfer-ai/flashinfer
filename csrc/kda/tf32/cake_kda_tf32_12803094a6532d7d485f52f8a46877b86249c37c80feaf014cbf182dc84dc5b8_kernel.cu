@@ -759,6 +759,7 @@ CAKE_KDA_KERNEL_SYMBOL(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma
                             }
                             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                             asm volatile("barrier.sync %0, 128;" :: "r"(prep_instance + 1) : "memory");
+                            asm volatile("tcgen05.fence::after_thread_sync;");
                             if (tensor_pair != 0) {
                                 if (prep_warp == 0) {
                                     int _mma_a_lo_2 = make_warp_uniform((((smem_qdkd_addr) >> 4) & 0x3FFF) + (prep_instance) * 4672);
@@ -848,6 +849,7 @@ CAKE_KDA_KERNEL_SYMBOL(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma
                                     elect_commit(pair_done_addr + (prep_instance) * 8);
                                 }
                                 mbarrier_wait(pair_done_addr + (prep_instance) * 8, (unsigned int)(raw_epoch - 1 & 1));
+                                asm volatile("tcgen05.fence::after_thread_sync;");
                                 if (prep_warp < 4) {
                                     float _tmem_load_2[16];
                                     asm volatile(
@@ -930,6 +932,7 @@ CAKE_KDA_KERNEL_SYMBOL(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma
                                         smem_abt[(unsigned int)(tid / 128 * 18688) + (element % 32 / 32 * 4096 + element / 32 * 128 + element % 32 % 32 * 4 ^ (element % 32 / 32 * 4096 + element / 32 * 128 + element % 32 % 32 * 4 >> 7 & 3) << 5) / 4] = 0.0f;
                                     }
                                 }
+                                asm volatile("tcgen05.fence::before_thread_sync;");
                                 asm volatile("barrier.sync %0, 128;" :: "r"(prep_instance + 1) : "memory");
                                 unsigned int wide_masks[4];
                                 int wide_count = 0;
@@ -1216,6 +1219,7 @@ CAKE_KDA_KERNEL_SYMBOL(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma
                                     smem_inverse_cross[(unsigned int)(tid / 128 * 18688) + (element_1 % 32 / 16 * 2048 + element_1 / 32 * 64 + element_1 % 32 % 16 * 4 ^ (element_1 % 32 / 16 * 2048 + element_1 / 32 * 64 + element_1 % 32 % 16 * 4 >> 7 & 3) << 4) / 4] = smem_abt[(unsigned int)(tid / 128 * 18688) + (element_1 % 32 / 32 * 4096 + element_1 / 32 * 128 + element_1 % 32 % 32 * 4 ^ (element_1 % 32 / 32 * 4096 + element_1 / 32 * 128 + element_1 % 32 % 32 * 4 >> 7 & 3) << 5) / 4];
                                 }
                             }
+                            asm volatile("tcgen05.fence::before_thread_sync;");
                             asm volatile("barrier.sync %0, 128;" :: "r"(prep_instance + 1) : "memory");
                             float kk_acc[8];
                             if (prep_warp < 3) {
@@ -1859,7 +1863,9 @@ CAKE_KDA_KERNEL_SYMBOL(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma
                         }
                     }
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                    asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile("barrier.sync 4, 128;" ::: "memory");
+                    asm volatile("tcgen05.fence::after_thread_sync;");
                     #pragma unroll 1
                     for (int cta_chunk_1 = 0; cta_chunk_1 < my_chunks_1; cta_chunk_1++) {
                         long long token_base_1 = bos_1 + (long long)(cta_chunk_1 * 32);
@@ -1870,6 +1876,7 @@ CAKE_KDA_KERNEL_SYMBOL(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma
                         }
                         {
                             mbarrier_wait(factor_full_addr + (factor_stage) * 8, factor_phase);
+                            asm volatile("tcgen05.fence::after_thread_sync;");
                         }
                         int next_state_buffer = 0;
                         {
@@ -1959,7 +1966,9 @@ CAKE_KDA_KERNEL_SYMBOL(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma
                                     }
                                 }
                                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                                asm volatile("tcgen05.fence::before_thread_sync;");
                                 asm volatile("barrier.sync 4, 128;" ::: "memory");
+                                asm volatile("tcgen05.fence::after_thread_sync;");
                             }
                         }
                         if (warp_in_wg == 0) {
@@ -2126,6 +2135,7 @@ CAKE_KDA_KERNEL_SYMBOL(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma
                         mbarrier_wait(mma_done_addr, mma_phase);
                         mma_phase = mma_phase ^ 1;
                         mbarrier_wait(v_full_addr + (factor_stage) * 8, factor_phase);
+                        asm volatile("tcgen05.fence::after_thread_sync;");
                         #pragma unroll 1
                         for (int row_band_2 = 0; row_band_2 < 2; row_band_2++) {
                             float v_prefetch_values[16];
@@ -2198,7 +2208,9 @@ CAKE_KDA_KERNEL_SYMBOL(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma
                                 :: "r"(taddr + (unsigned int)tmem_row + (unsigned int)(row_band_2 * 16 << 16) + 256 + 32), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[0])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[1])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[2])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[3])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[4])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[5])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[6])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[7])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[8])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[9])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[10])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[11])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[12])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[13])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[14])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[15])));
                         }
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                        asm volatile("tcgen05.fence::before_thread_sync;");
                         asm volatile("barrier.sync 4, 128;" ::: "memory");
+                        asm volatile("tcgen05.fence::after_thread_sync;");
                         {
                             if (warp_in_wg == 0) {
                                 int _mma_b_lo_22 = make_warp_uniform(((((smem_inverse_out_addr) >> 4) & 0x3FFF) | 0x1000000) + (factor_stage) * 4672);
@@ -2237,7 +2249,9 @@ CAKE_KDA_KERNEL_SYMBOL(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma
                             mma_phase = mma_phase ^ 1;
                         }
                         {
+                            asm volatile("tcgen05.fence::before_thread_sync;");
                             asm volatile("barrier.sync 4, 128;" ::: "memory");
+                            asm volatile("tcgen05.fence::after_thread_sync;");
                         }
                         if (warp_in_wg == 0) {
                             {
@@ -2307,6 +2321,7 @@ CAKE_KDA_KERNEL_SYMBOL(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma
                             elect_commit(mma_done_addr);
                         }
                         mbarrier_wait(mma_done_addr, mma_phase);
+                        asm volatile("tcgen05.fence::after_thread_sync;");
                         mma_phase = mma_phase ^ 1;
                         {
                             float output_scale = scale;
@@ -2364,7 +2379,9 @@ CAKE_KDA_KERNEL_SYMBOL(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma
                             }
                         }
                         state_buffer = next_state_buffer;
+                        asm volatile("tcgen05.fence::before_thread_sync;");
                         asm volatile("barrier.sync 4, 128;" ::: "memory");
+                        asm volatile("tcgen05.fence::after_thread_sync;");
                         {
                             mbarrier_arrive(factor_free_addr + (factor_stage) * 8);
                         }
@@ -2436,6 +2453,7 @@ CAKE_KDA_KERNEL_SYMBOL(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma
                             }
                         }
                     }
+                    asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile("barrier.sync 4, 128;" ::: "memory");
                     __threadfence();
                     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");

@@ -149,6 +149,7 @@ kernel_cake_kda_tf32_4434066f7f1b6aae62ab53df58e3987bf70dc53d8c5a87d196461674cbc
             }
         }
         mbarrier_wait(loaded_addr, (unsigned int)inner);
+        asm volatile("tcgen05.fence::after_thread_sync;");
         if (warp == 0) {
             int _mma_a_lo_0 = make_warp_uniform(((smem_b_addr) >> 4) & 0x3FFF);
             int _mma_b_lo_0 = make_warp_uniform(((state_addr) >> 4) & 0x3FFF);
@@ -197,7 +198,9 @@ kernel_cake_kda_tf32_4434066f7f1b6aae62ab53df58e3987bf70dc53d8c5a87d196461674cbc
             elect_commit(done_addr);
         }
         mbarrier_wait(done_addr, (unsigned int)inner);
+        asm volatile("tcgen05.fence::before_thread_sync;");
         __syncthreads();
+        asm volatile("tcgen05.fence::after_thread_sync;");
     }
     #pragma unroll 1
     for (int panel = 0; panel < 4; panel++) {
@@ -223,6 +226,7 @@ kernel_cake_kda_tf32_4434066f7f1b6aae62ab53df58e3987bf70dc53d8c5a87d196461674cbc
             }
         }
     }
+    asm volatile("tcgen05.fence::before_thread_sync;");
     __syncthreads();
 
     // Cleanup

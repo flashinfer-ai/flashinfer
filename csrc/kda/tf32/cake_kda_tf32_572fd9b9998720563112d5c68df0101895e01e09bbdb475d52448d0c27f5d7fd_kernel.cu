@@ -409,7 +409,9 @@ kernel_cake_kda_tf32_572fd9b9998720563112d5c68df0101895e01e09bbdb475d52448d0c27f
                         }
                     }
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                    asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile("barrier.sync 4, 128;" ::: "memory");
+                    asm volatile("tcgen05.fence::after_thread_sync;");
                     #pragma unroll 1
                     for (int cta_chunk = 0; cta_chunk < my_chunks; cta_chunk++) {
                         long long token_base = bos_1 + (long long)(cta_chunk * 32);
@@ -420,6 +422,7 @@ kernel_cake_kda_tf32_572fd9b9998720563112d5c68df0101895e01e09bbdb475d52448d0c27f
                         }
                         {
                             mbarrier_wait(factor_full_addr + (factor_stage) * 8, factor_phase);
+                            asm volatile("tcgen05.fence::after_thread_sync;");
                         }
                         int next_state_buffer = 0;
                         {
@@ -463,7 +466,9 @@ kernel_cake_kda_tf32_572fd9b9998720563112d5c68df0101895e01e09bbdb475d52448d0c27f
                                     }
                                 }
                                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                                asm volatile("tcgen05.fence::before_thread_sync;");
                                 asm volatile("barrier.sync 4, 128;" ::: "memory");
+                                asm volatile("tcgen05.fence::after_thread_sync;");
                             }
                         }
                         if (warp_in_wg == 0) {
@@ -550,6 +555,7 @@ kernel_cake_kda_tf32_572fd9b9998720563112d5c68df0101895e01e09bbdb475d52448d0c27f
                         mbarrier_wait(mma_done_addr, mma_phase);
                         mma_phase = mma_phase ^ 1;
                         mbarrier_wait(v_full_addr + (factor_stage) * 8, factor_phase);
+                        asm volatile("tcgen05.fence::after_thread_sync;");
                         #pragma unroll 1
                         for (int row_band_2 = 0; row_band_2 < 2; row_band_2++) {
                             float v_prefetch_values[16];
@@ -591,7 +597,9 @@ kernel_cake_kda_tf32_572fd9b9998720563112d5c68df0101895e01e09bbdb475d52448d0c27f
                                 :: "r"(taddr + (unsigned int)tmem_row + (unsigned int)(row_band_2 * 16 << 16) + 256 + 32), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[0])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[1])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[2])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[3])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[4])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[5])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[6])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[7])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[8])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[9])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[10])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[11])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[12])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[13])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[14])), "r"(*reinterpret_cast<const uint32_t*>(&(reinterpret_cast<float*>(residual_words))[15])));
                         }
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                        asm volatile("tcgen05.fence::before_thread_sync;");
                         asm volatile("barrier.sync 4, 128;" ::: "memory");
+                        asm volatile("tcgen05.fence::after_thread_sync;");
                         {
                             if (warp_in_wg == 0) {
                                 int _mma_b_lo_22 = make_warp_uniform(((((smem_inverse_out_addr) >> 4) & 0x3FFF) | 0x1000000) + (factor_stage) * 4672);
@@ -630,7 +638,9 @@ kernel_cake_kda_tf32_572fd9b9998720563112d5c68df0101895e01e09bbdb475d52448d0c27f
                             mma_phase = mma_phase ^ 1;
                         }
                         {
+                            asm volatile("tcgen05.fence::before_thread_sync;");
                             asm volatile("barrier.sync 4, 128;" ::: "memory");
+                            asm volatile("tcgen05.fence::after_thread_sync;");
                         }
                         if (warp_in_wg == 0) {
                             {
@@ -670,7 +680,9 @@ kernel_cake_kda_tf32_572fd9b9998720563112d5c68df0101895e01e09bbdb475d52448d0c27f
                         mbarrier_wait(mma_done_addr, mma_phase);
                         mma_phase = mma_phase ^ 1;
                         state_buffer = next_state_buffer;
+                        asm volatile("tcgen05.fence::before_thread_sync;");
                         asm volatile("barrier.sync 4, 128;" ::: "memory");
+                        asm volatile("tcgen05.fence::after_thread_sync;");
                         {
                             mbarrier_arrive(factor_free_addr + (factor_stage) * 8);
                         }
@@ -715,6 +727,7 @@ kernel_cake_kda_tf32_572fd9b9998720563112d5c68df0101895e01e09bbdb475d52448d0c27f
                             }
                         }
                     }
+                    asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile("barrier.sync 4, 128;" ::: "memory");
                     __threadfence();
                     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");

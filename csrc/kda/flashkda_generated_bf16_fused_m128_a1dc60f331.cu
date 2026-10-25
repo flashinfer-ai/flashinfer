@@ -1141,6 +1141,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                 unsigned int state_packed2[16];
                 unsigned int state_packed3[16];
                 mbarrier_wait(qk_full_addr + (compute_stage) * 8, _phase_qk_full);
+                asm volatile("tcgen05.fence::after_thread_sync;");
                 #pragma unroll 1
                 for (int state_col_block_1 = 0; state_col_block_1 < ((1) ? 4 : 3); state_col_block_1++) {
                     int state_addr = taddr + 64 + (unsigned int)tmem_row_base + (unsigned int)(state_col_block_1 * 32);
@@ -1179,6 +1180,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                         if (state_col_block_1 == 1) {
                             asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                             if (elect_sync()) {
+                                asm volatile("tcgen05.fence::before_thread_sync;");
                                 mbarrier_arrive(state_inp_left_ready_addr + (compute_stage) * 8);
                             }
                         }
@@ -1189,6 +1191,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                 unsigned int state_tail_packed[16];
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 if (elect_sync()) {
+                    asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(state_inp_ready_addr + (compute_stage) * 8);
                 }
                 mbarrier_wait(v_full_addr + (compute_stage) * 8, _phase_v_full);
@@ -1214,6 +1217,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                     }
                 }
                 mbarrier_wait(old_out_ready_addr + (compute_stage) * 8, _phase_old_out_ready);
+                asm volatile("tcgen05.fence::after_thread_sync;");
                 float _tmem_load_1[16];
                 tmem_ld_x16(&_tmem_load_1[0], taddr + 224 + (unsigned int)tmem_row_base);
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
@@ -1286,10 +1290,12 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                 }
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 if (elect_sync()) {
+                    asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(v_free_addr + (compute_stage) * 8);
                     mbarrier_arrive(u_inp_ready_addr + (compute_stage) * 8);
                 }
                 mbarrier_wait(u2_acc_ready_addr + (compute_stage) * 8, _phase_u2_acc_ready);
+                asm volatile("tcgen05.fence::after_thread_sync;");
                 float _tmem_load_3[16];
                 tmem_ld_x16(&_tmem_load_3[0], taddr + 208 + (unsigned int)tmem_row_base);
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
@@ -1317,10 +1323,13 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                 tmem_st_x8_u32(taddr + 224 + (unsigned int)tmem_row_base, (const uint32_t*)_tmem_load_3_bf16);
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 if (elect_sync()) {
+                    asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(u2_inp_ready_addr + (compute_stage) * 8);
                 }
                 mbarrier_wait(final_ready_addr + (compute_stage) * 8, _phase_final_ready);
+                asm volatile("tcgen05.fence::after_thread_sync;");
                 if (elect_sync()) {
+                    asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(smem_free_addr + (compute_stage) * 8);
                 }
                 compute_stage += 1;
@@ -1366,6 +1375,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                     }
                 }
             }
+            asm volatile("tcgen05.fence::before_thread_sync;");
             asm volatile("barrier.sync 9, 128;" ::: "memory");
             if (compute_local_warp == 0) {
                 if (elect_sync()) {
@@ -1405,6 +1415,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                 int chunk_is_full = ((seq_len_1 >= (chunk_idx_1 + 1) * 16) ? 1 : 0);
                 if (chunk_is_full != 0) {
                     mbarrier_wait(final_ready_addr + (epilogue_stage) * 8, _phase_final_ready_1);
+                    asm volatile("tcgen05.fence::after_thread_sync;");
                     float _tmem_load_5[8];
                     asm volatile(
                         "tcgen05.ld.sync.aligned.16x256b.x2.b32"
@@ -1418,6 +1429,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                         : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_6[7]))
                         : "r"(taddr + 192 + (unsigned int)tmem_row_base_1 + 1048576));
                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                    asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile("barrier.sync 8, 128;" ::: "memory");
                     if (epilogue_local_warp == 0) {
                         if (elect_sync()) {
@@ -1477,9 +1489,11 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                     output_stage = output_stage ^ 1;
                 } else {
                     mbarrier_wait(final_ready_addr + (epilogue_stage) * 8, _phase_final_ready_1);
+                    asm volatile("tcgen05.fence::after_thread_sync;");
                     float _tmem_load_7[16];
                     tmem_ld_x16(&_tmem_load_7[0], taddr + 192 + (unsigned int)tmem_row_base_1);
                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                    asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile("barrier.sync 8, 128;" ::: "memory");
                     if (epilogue_local_warp == 0) {
                         if (elect_sync()) {
@@ -2219,6 +2233,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                 }
                 {
                     mbarrier_wait(state_inp_left_ready_addr + (mma_stage) * 8, _phase_state_inp_left_ready);
+                    asm volatile("tcgen05.fence::after_thread_sync;");
                     int _mma_b_lo_0 = make_warp_uniform((((smem_kd_addr) >> 4) & 0x3FFF) + (mma_stage) * 1344);
                     asm volatile(
                     "{\n\t"
@@ -2250,6 +2265,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                     "}\n"
                     :: "r"(tmem_tmem_u_acc), "r"(_mma_b_lo_0), "r"(tmem_tmem_state_inp), "r"(0));
                     mbarrier_wait(state_inp_ready_addr + (mma_stage) * 8, _phase_state_inp_ready);
+                    asm volatile("tcgen05.fence::after_thread_sync;");
                     int _mma_b_lo_1 = make_warp_uniform((((smem_kd_addr) >> 4) & 0x3FFF) + (mma_stage) * 1344);
                     asm volatile(
                     "{\n\t"
@@ -2333,10 +2349,12 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                     elect_commit2(old_out_ready_addr + (mma_stage) * 8, raw_inputs_free_addr + (mma_stage) * 8);
                 }
                 mbarrier_wait(u_inp_ready_addr + (mma_stage) * 8, _phase_u_inp_ready);
+                asm volatile("tcgen05.fence::after_thread_sync;");
                 int _mma_b_lo_7 = make_warp_uniform((((smem_inv_addr) >> 4) & 0x3FFF) + (mma_stage) * 1344);
                 mma_ts_step(tmem_tmem_u2_acc, tmem_tmem_u2_inp, _mma_b_lo_7, 0xC0004010, 134481040, 0);
                 elect_commit(u2_acc_ready_addr + (mma_stage) * 8);
                 mbarrier_wait(u2_inp_ready_addr + (mma_stage) * 8, _phase_u2_inp_ready);
+                asm volatile("tcgen05.fence::after_thread_sync;");
                 int _mma_b_lo_8 = make_warp_uniform(((((smem_kr_trans_addr) >> 4) & 0x3FFF) | 0x800000) + (mma_stage) * 1344);
                 mma_ts_step(tmem_tmem_state, tmem_tmem_u2_inp, _mma_b_lo_8, 0x40004040, 136381584, 1);
                 int _mma_b_lo_9 = make_warp_uniform(((((smem_mqk_trans_addr) >> 4) & 0x3FFF) | 0x200000) + (mma_stage) * 1344);
