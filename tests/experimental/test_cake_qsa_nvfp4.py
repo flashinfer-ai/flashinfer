@@ -977,9 +977,9 @@ def test_split_formula_fills_the_device_capacity():
         (216, "sm_107a"),
         (190, "sm_120a"),
     ):
-        assert [cake_backend.plain_splits(r, 2, WIDTH, sm_count, arch) for r in ROWS] == [
-            _formula(r, 2, WIDTH, sm_count, arch) for r in ROWS
-        ]
+        assert [
+            cake_backend.plain_splits(r, 2, WIDTH, sm_count, arch) for r in ROWS
+        ] == [_formula(r, 2, WIDTH, sm_count, arch) for r in ROWS]
         if arch != "sm_103a":
             assert [num_splits(r, 2, WIDTH, sm_count, arch) for r in ROWS] == [
                 _formula(r, 2, WIDTH, sm_count, arch) for r in ROWS
@@ -1205,7 +1205,10 @@ def test_registry_records_carry_the_launch_facts_and_the_argument_plans():
         "grid": "two_wave_walk",
     }
     assert persistent["grid_rule"] == {"kind": "walk_ctas"}
-    assert persistent["workspace_rule"] == cake_jit.MODULES["decode_tcgen05"]["workspace_rule"]
+    assert (
+        persistent["workspace_rule"]
+        == cake_jit.MODULES["decode_tcgen05"]["workspace_rule"]
+    )
     whole_tile = cake_jit.MODULES["decode_whole_tile"]
     assert whole_tile["stage"] == "decode" and whole_tile["variant"] == "whole_tile"
     assert whole_tile["select_rule"] == {

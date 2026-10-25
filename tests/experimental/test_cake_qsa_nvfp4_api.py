@@ -412,7 +412,9 @@ def test_two_wave_walk_rule_on_sm_103a():
         assert cake_backend.plain_splits(128, 2, 2051, sm_count, "sm_103a") == 1
         assert cake_backend.num_splits(128, 2, 2051, sm_count, "sm_103a") == 2
         for rows in (1, 2, 4, 8, 16, 32, 64, 256, 512):
-            assert cake_backend.select_walk(rows, 2, tiles, sm_count, "sm_103a") == 0, rows
+            assert cake_backend.select_walk(rows, 2, tiles, sm_count, "sm_103a") == 0, (
+                rows
+            )
             assert cake_backend.num_splits(
                 rows, 2, 2051, sm_count, "sm_103a"
             ) == cake_backend.plain_splits(rows, 2, 2051, sm_count, "sm_103a"), rows
@@ -430,7 +432,9 @@ def test_two_wave_walk_rule_on_sm_103a():
     # (the longest CTA walks 2 tiles either way); 3 pairs of 4 tiles can (6 < 8).
     assert not cake_jit.walk_applies(3, 1, 1, 1, 2)
     assert cake_jit.walk_applies(3, 1, 4, 1, 2)
-    assert cake_jit.walk_ctas(152, 256, 33) == 152 and cake_jit.walk_ctas(152, 2, 4) == 8
+    assert (
+        cake_jit.walk_ctas(152, 256, 33) == 152 and cake_jit.walk_ctas(152, 2, 4) == 8
+    )
     assert cake_jit.walk_splits(152, 256, 33) == 2
     assert cake_jit.walk_splits(148, 256, 33) == 2
     # 5 CTAs over 2 x 33 slots: 13-14 slots each, both pairs meet three CTAs; one CTA holds
@@ -453,7 +457,12 @@ def test_two_wave_walk_rule_on_sm_103a():
             cake_backend.select_walk(*bad)
     grid = cake_jit.launch_grid
     assert grid(
-        "decode_tcgen05_persistent", rows=128, kv_heads=2, qo_heads=24, splits=2, walk=152
+        "decode_tcgen05_persistent",
+        rows=128,
+        kv_heads=2,
+        qo_heads=24,
+        splits=2,
+        walk=152,
     ) == (152, 1, 1)
     with pytest.raises(ValueError, match="CTA count"):
         grid("decode_tcgen05_persistent", rows=128, kv_heads=2, qo_heads=24, splits=2)

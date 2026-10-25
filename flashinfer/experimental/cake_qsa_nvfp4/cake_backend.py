@@ -241,7 +241,12 @@ def select_walk(
     walk (:data:`WALK_ARCHES`) and the walk shortens the call's longest CTA at the plain split count
     (:func:`cake_jit.walk_applies`: a two-wave plain grid).  Pure in its integers.  The fused form is never walked:
     its grid is within one wave by the form rule, so the walk's two-wave condition excludes it."""
-    if int(num_rows) < 1 or int(num_kv_heads) < 1 or int(num_tiles) < 1 or int(sm_count) < 1:
+    if (
+        int(num_rows) < 1
+        or int(num_kv_heads) < 1
+        or int(num_tiles) < 1
+        or int(sm_count) < 1
+    ):
         raise ValueError(
             f"num_rows={num_rows}, num_kv_heads={num_kv_heads}, num_tiles={num_tiles}, sm_count={sm_count} must all "
             "be at least 1"
@@ -252,20 +257,29 @@ def select_walk(
         )
     if arch not in WALK_ARCHES:
         return 0
-    plain = plain_splits(num_rows, num_kv_heads, int(num_tiles) * TILE_TOKENS, sm_count, arch)
+    plain = plain_splits(
+        num_rows, num_kv_heads, int(num_tiles) * TILE_TOKENS, sm_count, arch
+    )
     if not cake_jit.walk_applies(num_rows, num_kv_heads, num_tiles, plain, sm_count):
         return 0
     return cake_jit.walk_ctas(sm_count, int(num_rows) * int(num_kv_heads), num_tiles)
 
 
 def _split_count(
-    num_rows: int, num_kv_heads: int, num_tiles: int, sm_count: int, arch: str, walk: int
+    num_rows: int,
+    num_kv_heads: int,
+    num_tiles: int,
+    sm_count: int,
+    arch: str,
+    walk: int,
 ) -> int:
     """The call's split count given its walk: the walk's partial slots per (row, KV head) where the walk serves it,
     the plain program's split count otherwise."""
     if walk:
         return cake_jit.walk_splits(walk, int(num_rows) * int(num_kv_heads), num_tiles)
-    return plain_splits(num_rows, num_kv_heads, int(num_tiles) * TILE_TOKENS, sm_count, arch)
+    return plain_splits(
+        num_rows, num_kv_heads, int(num_tiles) * TILE_TOKENS, sm_count, arch
+    )
 
 
 def num_splits(

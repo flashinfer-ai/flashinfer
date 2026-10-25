@@ -1016,7 +1016,9 @@ def select_record(
     if arch not in ARCHES:
         raise ValueError(f"unknown arch {arch!r}; the architectures are {ARCHES}")
     if int(walk) < 0:
-        raise ValueError(f"walk must be 0 (no walk) or the walk's CTA count, got {walk}")
+        raise ValueError(
+            f"walk must be 0 (no walk) or the walk's CTA count, got {walk}"
+        )
     admitted = [
         name
         for name in records_of_stage(stage)
@@ -1348,11 +1350,11 @@ def resolved_launches(
             raise RuntimeError(
                 f"record {name}: the grid arguments are not the suffix of its argument plan"
             )
-        names = [logical for logical, _ in plan[:-3]]
-        for logical in names:
+        logicals = [logical for logical, _ in plan[:-3]]
+        for logical in logicals:
             if logical not in LOGICAL_INDEX:
                 raise ValueError(f"record {name} needs logical argument {logical!r}")
-        getter = operator.itemgetter(*(LOGICAL_INDEX[logical] for logical in names))
+        getter = operator.itemgetter(*(LOGICAL_INDEX[logical] for logical in logicals))
         entry = getattr(load(name, arch), MODULES[name]["ffi_entry"])
         grid = launch_grid(
             name,
