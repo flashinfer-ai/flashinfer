@@ -15,6 +15,7 @@
 """TraceTemplates for paged-KV cache append operations."""
 
 import math
+from copy import deepcopy
 from typing import Any, cast
 
 import torch
@@ -535,6 +536,7 @@ def _fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_init(
     head_dim: int = 128,
     page_size: int = 16,
     num_pages: int = 4,
+    kv_layout: str = "NHD",
     device: str = "cuda",
     seed: int = 0,
 ):
@@ -548,7 +550,7 @@ def _fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_init(
     )
     append_value = torch.randn_like(append_key)
     slot_shape, sf_shape = _fp8_pth_paged_cache_shapes(
-        num_pages, page_size, num_kv_heads, head_dim, "NHD"
+        num_pages, page_size, num_kv_heads, head_dim, kv_layout
     )
     k_slot = torch.zeros(slot_shape, dtype=torch.uint8, device=device)
     v_slot = torch.zeros_like(k_slot)
@@ -562,6 +564,7 @@ def _fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_init(
         "slot_mapping": slot_mapping,
         "paged_kv_cache": (k_slot, v_slot),
         "kv_cache_sf": (k_sf, v_sf),
+        "kv_layout": kv_layout,
     }
 
 
@@ -571,7 +574,36 @@ cast(
 )._trace_init_dependencies = (_fp8_pth_paged_cache_shapes,)
 
 
-fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping_trace = TraceTemplate(
+def _fp8_pth_hnd_init(
+    *,
+    nnz_kv: int,
+    num_pages: int = 4,
+    num_kv_heads: int = 8,
+    head_dim: int = 128,
+    page_size: int = 16,
+    device: str = "cuda",
+    seed: int = 0,
+    kv_layout: str = "HND",
+):
+    return _fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_init(
+        nnz_kv=nnz_kv,
+        num_pages=num_pages,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        device=device,
+        seed=seed,
+        kv_layout=kv_layout,
+    )
+
+
+cast(Any, _fp8_pth_hnd_init)._trace_init_dependencies = (
+    _fp8_pth_paged_cache_shapes,
+    _fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_init,
+)
+
+
+_fp8_pth_nhd_trace = TraceTemplate(
     op_type="page_append",
     name_prefix="fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping",
     description=(
@@ -590,6 +622,7 @@ fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping_trace = TraceTem
     inputs={
         "append_key": Tensor(["nnz_kv", "num_kv_heads", "head_dim"]),
         "append_value": Tensor(["nnz_kv", "num_kv_heads", "head_dim"]),
+        "kv_layout": Scalar("string", optional=True),
         "slot_mapping": Tensor(["nnz_kv"], dtype="int32"),
         "paged_k_cache": Tensor(
             ["num_pages", "page_size", "num_kv_heads", "slot_last"],
@@ -651,6 +684,34 @@ fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping_trace = TraceTem
     ],
     tags=["status:verified"],
     init=_fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_init,
+)
+
+# Keep the existing NHD definition and name; HND swaps only the cache axes.
+_fp8_pth_hnd_trace = deepcopy(_fp8_pth_nhd_trace)
+_fp8_pth_hnd_trace.name_prefix = f"{_fp8_pth_nhd_trace.name_prefix}_hnd"
+_fp8_pth_hnd_trace.init = _fp8_pth_hnd_init
+_fp8_pth_nhd_trace.constraints.append("kv_layout == 'NHD'")
+_fp8_pth_hnd_trace.constraints.append("kv_layout == 'HND'")
+for _descriptors in (_fp8_pth_hnd_trace.inputs, _fp8_pth_hnd_trace.outputs):
+    for _descriptor in _descriptors.values():
+        if isinstance(_descriptor, Tensor) and _descriptor.param in (
+            "paged_kv_cache",
+            "kv_cache_sf",
+        ):
+            _descriptor.dim_names[1:3] = ["num_kv_heads", "page_size"]
+
+
+def fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping_trace(**kwargs):
+    if kwargs.get("kv_layout", "NHD") == "HND":
+        return _fp8_pth_hnd_trace
+    return _fp8_pth_nhd_trace
+
+
+cast(
+    Any, fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping_trace
+).templates = (
+    _fp8_pth_nhd_trace,
+    _fp8_pth_hnd_trace,
 )
 
 
