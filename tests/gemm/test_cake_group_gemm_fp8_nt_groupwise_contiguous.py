@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the generated Blackwell contiguous grouped FP8 GEMM programs."""
 
+import functools
 import random
 
 import pytest
@@ -15,15 +16,21 @@ from flashinfer.gemm.cake_grouped_fp8_gemm import (
     BS_N128_ROUTE,
     BS_N128_RUN32_ROUTE,
     BS_N256_ROUTE,
+    BS_N128_S16_ROUTE,
     BS_N256_RUN32_ROUTE,
+    BS_N256_S16_ROUTE,
     BS_ROUTES,
+    BS_STORE16_ROUTES,
     BS_SWAP_CARRY_ROUTE,
+    BS_SWAP_CARRY_S16_ROUTE,
     BS_SWAP_ROUTE,
     BS_SWAP_ROUTES,
     BS_SWAP_RUN32_ROUTE,
+    BS_SWAP_S16_ROUTE,
     DEEPK_CG2_FOUR_LOAD_GRID128_ROUTE,
     DEEPK_CG2_RECURRENCE_ROUTE,
     bs_route_for_shape,
+    bs_store16,
     bs_swap_route_for_shape,
     is_group_gemm_fp8_nt_groupwise_contiguous_prepared_available,
     launch_plan,
@@ -220,22 +227,14 @@ def _make_block_scaled_inputs(
 
 
 def _assert_block_scaled(out, expected, m_indices):
-    """Routed rows match the reference; padding is skipped per 32-row sub-block.
+    """Routed rows match the reference; the output rows of ``-1`` entries are unspecified.
 
-    Every row of a 32-row sub-block whose leading ``m_indices`` entry is ``-1`` stays
-    untouched (NaN-filled before the launch); ``-1`` rows sharing a sub-block with
-    routed rows hold finite values of no meaning (DeepGEMM does the same per 128-row
-    block).
+    A route writes each expert run's routed rows rounded up to 32 rows (16 on the
+    store16 programs): the other padding rows stay untouched, the rest hold values
+    of no meaning (DeepGEMM does the same per 128-row block).
     """
     valid = m_indices >= 0
     _assert_close(out[valid], expected[valid])
-    leading = m_indices.view(-1, 32)[:, :1].expand(-1, 32).reshape(-1)
-    untouched = leading < 0
-    if bool(untouched.any()):
-        assert torch.isnan(out[untouched].float()).all()
-    touched_padding = (~valid) & ~untouched
-    if bool(touched_padding.any()):
-        assert torch.isfinite(out[touched_padding].float()).all()
 
 
 # (group_counts, N, K, arbitrary_scales): small deterministic rows covering the
@@ -649,6 +648,9 @@ def test_block_scaled_packed_scales_match_reference(group_counts, n, k, alignmen
         prepared.route
         in (BS_N128_RUN32_ROUTE, BS_N256_RUN32_ROUTE, BS_SWAP_RUN32_ROUTE)
     ) == (alignment % 128 != 0)
+    assert (prepared.route in BS_STORE16_ROUTES.values()) == bs_store16(
+        int(m_indices.numel()), alignment=alignment, num_groups=len(group_counts)
+    )
     prepared.launch()
     torch.cuda.synchronize()
     _assert_block_scaled(out, expected, m_indices)
@@ -825,6 +827,11 @@ def test_block_scaled_route_rule():
         (65280, 1024, 2048, 256, 128, BS_SWAP_CARRY_ROUTE, None),
         (146944, 512, 4096, 512, 128, None, BS_SWAP_ROUTE),
         (163584, 1024, 2048, 256, 128, BS_SWAP_CARRY_ROUTE, BS_SWAP_CARRY_ROUTE),
+        # sm_100a also swaps long K when the BLOCK_N 128 grid is at most 74 tiles.
+        (1664, 256, 4096, 5, 128, BS_SWAP_ROUTE, BS_SWAP_ROUTE),
+        (4736, 256, 4096, 5, 128, BS_SWAP_ROUTE, BS_SWAP_ROUTE),
+        (4864, 256, 4096, 5, 128, None, BS_SWAP_ROUTE),
+        (1664, 256, 1536, 5, 128, None, BS_SWAP_CARRY_ROUTE),
     ],
 )
 def test_block_scaled_swap_route_rule(m, n, k, num_groups, alignment, sm_100a, sm_103a):
@@ -860,6 +867,42 @@ def test_block_scaled_swap_route_needs_groups_and_arch():
     )
 
 
+@pytest.mark.parametrize(
+    ("m", "n", "k", "num_groups", "alignment", "sm_100a", "sm_103a"),
+    [
+        # At most 128 routed rows per group: the store16 program of either family.
+        (1408, 256, 512, 6, 128, BS_N128_S16_ROUTE, BS_N128_S16_ROUTE),
+        (65408, 512, 4096, 512, 128, BS_SWAP_S16_ROUTE, BS_SWAP_S16_ROUTE),
+        (65280, 1024, 2048, 256, 128, BS_SWAP_CARRY_S16_ROUTE, BS_N256_S16_ROUTE),
+        # More rows per group, and the multi-run layouts: the 32-row stores.
+        (163584, 1024, 2048, 256, 128, BS_SWAP_CARRY_ROUTE, BS_SWAP_CARRY_ROUTE),
+        (16000, 4096, 256, 512, 32, BS_SWAP_RUN32_ROUTE, BS_SWAP_RUN32_ROUTE),
+    ],
+)
+def test_block_scaled_store16_rule(m, n, k, num_groups, alignment, sm_100a, sm_103a):
+    """Store16 programs from (m, num_groups, alignment, arch) only: single-run layouts of at most 128 routed rows per group."""
+    plan = functools.partial(
+        launch_plan,
+        sm_count=148,
+        scalar_output=False,
+        block_scaled=True,
+        alignment=alignment,
+        num_groups=num_groups,
+    )
+    for arch, expected in (("sm_100a", sm_100a), ("sm_103a", sm_103a)):
+        assert plan(m, n, k, arch=arch)[0] == expected
+    for arch in (None, "sm_120a"):
+        assert plan(m, n, k, arch=arch)[0] not in BS_STORE16_ROUTES.values()
+
+
+def test_block_scaled_store16_needs_single_run_and_groups():
+    """The bound is inclusive: 128 routed rows per group store16, 128.5 do not."""
+    assert bs_store16(65280, alignment=128, num_groups=256)
+    assert not bs_store16(65408, alignment=128, num_groups=256)
+    assert not bs_store16(65280, alignment=128, num_groups=None)
+    assert not bs_store16(16000, alignment=32, num_groups=512)
+
+
 def test_launch_plan_takes_the_swap_routes_with_the_architecture():
     """``arch`` admits the swap-AB routes; a two-CTA cluster takes two 128-row weight tiles."""
     for arch in ("sm_100a", "sm_103a"):
@@ -874,7 +917,7 @@ def test_launch_plan_takes_the_swap_routes_with_the_architecture():
             num_groups=512,
             arch=arch,
         )
-        assert route == BS_SWAP_ROUTE
+        assert route == BS_SWAP_S16_ROUTE
         assert grid == (2 * min(148 // 2, (65408 // 128) * (512 // 256)), 1, 1)
     route, grid = launch_plan(
         640,
@@ -961,6 +1004,8 @@ def test_block_scaled_swap_routes_match_the_non_swapped_routes(
         )
         if expected_route is None:
             assert prepared.route in BS_ROUTES
+        elif bs_store16(m, alignment=alignment, num_groups=len(group_counts)):
+            assert prepared.route == BS_STORE16_ROUTES[expected_route]
         else:
             assert prepared.route == expected_route
         prepared.launch()
@@ -986,7 +1031,7 @@ def test_block_scaled_swap_route_rebinds_token_operands_and_captures():
     prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous(
         a, b, a_packed, b_packed, m_indices, out=out
     )
-    assert prepared.route == BS_SWAP_ROUTE
+    assert prepared.route == BS_SWAP_S16_ROUTE
     a2, _, a_scale2, _, a_packed2, _, _ = _make_block_scaled_inputs(
         counts, 512, 1024, alignment=128, seed=4781, device=device
     )

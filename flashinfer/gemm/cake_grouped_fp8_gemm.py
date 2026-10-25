@@ -17,15 +17,18 @@ consecutive K-block exponents, activations ``(M, ceil(K/512))`` with any
 strides, weights ``(G, N//128, cols)`` or the row-repeated ``(G, N, cols)``)
 run the block-scaled family: ``tcgen05.mma.kind::mxf8f6f4`` applies both
 scales in the tensor core, ``-1`` entries of ``m_indices`` mark padding rows
-of the compact MoE layout (skipped, output rows untouched) and expert runs
+of the compact MoE layout (skipped, output rows unspecified) and expert runs
 start on multiples of ``alignment`` rows (128-multiples select the single-run
 schedule, other multiples of 32 the slower multi-run schedule).  When the
 packed words are DeepGEMM's MN-major activation words and the row-repeated
 weight words and ``N`` is a multiple of 256, the host may route a problem to
 the swap-AB programs (:func:`bs_swap_route_for_shape`): the weight rows fill
-the 256-row side of a two-CTA MMA and the routed tokens its N side.  Every
-block-scaled route accumulates each output in the same K order, so the route
-never changes the output bits.
+the 256-row side of a two-CTA MMA and the routed tokens its N side.  With the
+same words, a single-run layout of at most 128 routed rows per group runs the
+store16 programs (:func:`bs_store16`): they write each expert run's routed
+rows rounded up to 16 rows instead of 32.  Every block-scaled route
+accumulates each output in the same K order, so the route never changes the
+bits of a routed row.
 
 The host side selects one kernel route per problem shape and output
 alignment, resolves the launch grid from the device SM count (queried once per
@@ -81,8 +84,18 @@ BS_N128_ROUTE = "bs_ue8m0_n128"
 BS_N256_ROUTE = "bs_ue8m0_n256"
 BS_N128_RUN32_ROUTE = "bs_ue8m0_n128_run32"
 BS_N256_RUN32_ROUTE = "bs_ue8m0_n256_run32"
+# The store16 programs of the single-run routes (:func:`bs_store16`).
+BS_N128_S16_ROUTE = "bs_ue8m0_n128_s16"
+BS_N256_S16_ROUTE = "bs_ue8m0_n256_s16"
 BS_ROUTES = frozenset(
-    {BS_N128_ROUTE, BS_N256_ROUTE, BS_N128_RUN32_ROUTE, BS_N256_RUN32_ROUTE}
+    {
+        BS_N128_ROUTE,
+        BS_N256_ROUTE,
+        BS_N128_RUN32_ROUTE,
+        BS_N256_RUN32_ROUTE,
+        BS_N128_S16_ROUTE,
+        BS_N256_S16_ROUTE,
+    }
 )
 BS_BLOCK_M = 128
 BS_BLOCK_K = 128
@@ -209,8 +222,21 @@ def bs_route_for_shape(
 BS_SWAP_ROUTE = "bs_ue8m0_swap"
 BS_SWAP_CARRY_ROUTE = "bs_ue8m0_swap_carry"
 BS_SWAP_RUN32_ROUTE = "bs_ue8m0_swap_run32"
-BS_SWAP_ROUTES = frozenset({BS_SWAP_ROUTE, BS_SWAP_RUN32_ROUTE, BS_SWAP_CARRY_ROUTE})
+BS_SWAP_S16_ROUTE = "bs_ue8m0_swap_s16"
+BS_SWAP_CARRY_S16_ROUTE = "bs_ue8m0_swap_carry_s16"
+BS_SWAP_ROUTES = frozenset(
+    {
+        BS_SWAP_ROUTE,
+        BS_SWAP_RUN32_ROUTE,
+        BS_SWAP_CARRY_ROUTE,
+        BS_SWAP_S16_ROUTE,
+        BS_SWAP_CARRY_S16_ROUTE,
+    }
+)
 BS_SWAP_ARCHS = frozenset({"sm_100a", "sm_103a"})
+# sm_100a swaps a long-K problem of at least 100 rows per group when the
+# non-swapped BLOCK_N 128 grid has at most this many tiles (half of 148 SMs).
+BS_SWAP_SM100_MAX_TILES = 74
 
 
 def bs_swap_route_for_shape(
@@ -234,8 +260,10 @@ def bs_swap_route_for_shape(
       multi-run layouts) through ``BS_SWAP_RUN32_ROUTE``.
     - For K <= 512, swap at 2 <= rows <= 20, and at 1 <= rows < 2 when K <= 256.
     - For longer K, keep below 0.75 rows and swap below 100 rows.  From 100
-      rows, sm_100a swaps for N >= 1024 and sm_103a for N < 1024 or at least
-      400 rows.
+      rows, sm_100a swaps for N >= 1024, or for K >= 2048 when the BLOCK_N
+      128 grid, ``ceil(m / 128) * n / 128`` tiles, is at most
+      ``BS_SWAP_SM100_MAX_TILES``; sm_103a swaps for N < 1024 or at least 400
+      rows.
 
     Swapped single-run layouts with K <= 256, or K <= 2048 and at least 128
     rows, take ``BS_SWAP_CARRY_ROUTE``: it loads the next tile's group entries
@@ -263,7 +291,8 @@ def bs_swap_route_for_shape(
     elif routed < 100 * num_groups:
         swap = True
     elif arch == "sm_100a":
-        swap = n >= 1024
+        tiles = -(-m // BS_BLOCK_M) * (n // 128)
+        swap = n >= 1024 or (k >= 2048 and tiles <= BS_SWAP_SM100_MAX_TILES)
     else:
         swap = n < 1024 or routed >= 400 * num_groups
     if not swap:
@@ -271,6 +300,33 @@ def bs_swap_route_for_shape(
     if k <= 256 or (k <= 2048 and routed >= 128 * num_groups):
         return BS_SWAP_CARRY_ROUTE
     return BS_SWAP_ROUTE
+
+
+# The store16 programs: the single-run schedules with 16-row output stores.
+BS_STORE16_ROUTES = {
+    BS_N128_ROUTE: BS_N128_S16_ROUTE,
+    BS_N256_ROUTE: BS_N256_S16_ROUTE,
+    BS_SWAP_ROUTE: BS_SWAP_S16_ROUTE,
+    BS_SWAP_CARRY_ROUTE: BS_SWAP_CARRY_S16_ROUTE,
+}
+BS_STORE16_ARCHS = frozenset({"sm_100a", "sm_103a"})
+
+
+def bs_store16(m: int, *, alignment: int, num_groups: int | None) -> bool:
+    """Whether a single-run block-scaled problem takes the store16 programs.
+
+    The rule reads host-known values only, never the ``m_indices`` contents (a
+    launch may rebind them): ``alignment`` a multiple of 128 and at most 128
+    routed rows per group, estimated as in :func:`bs_swap_route_for_shape` by
+    ``(m - num_groups * (alignment - 1)) / num_groups``.  A store16 program
+    writes each expert run's routed rows rounded up to 16 rows instead of 32;
+    the routed rows keep their bits.  Above 128 rows per group the 32-row
+    stores are kept.
+    """
+    if not num_groups or num_groups <= 0 or alignment <= 0 or alignment % BS_BLOCK_M:
+        return False
+    # rows = routed / num_groups <= 128; compared without division.
+    return m - num_groups * (alignment - 1) <= BS_BLOCK_M * num_groups
 
 
 def resolve_route_for_grid(route: str, n: int, grid: tuple[int, int, int]) -> str:
@@ -318,8 +374,9 @@ def launch_plan(
     """Resolve ``(route, grid)`` for a problem shape on a device with ``sm_count`` SMs.
 
     ``arch`` (the device's, e.g. ``"sm_100a"``) admits the swap-AB routes of
-    :func:`bs_swap_route_for_shape` for a block-scaled problem; ``None`` keeps
-    the routes of :func:`bs_route_for_shape`.
+    :func:`bs_swap_route_for_shape` and the store16 programs of
+    :func:`bs_store16` for a block-scaled problem; ``None`` keeps the routes of
+    :func:`bs_route_for_shape`.
     """
     if sm_count <= 0:
         raise ValueError("sm_count must be positive")
@@ -338,6 +395,12 @@ def launch_plan(
                 )
                 or route
             )
+            if (
+                arch in BS_STORE16_ARCHS
+                and route in BS_STORE16_ROUTES
+                and bs_store16(m, alignment=alignment, num_groups=num_groups)
+            ):
+                route = BS_STORE16_ROUTES[route]
     elif scalar_output:
         route = DEEPK_C2_SCALAR_OUTPUT_ROUTE
     else:
@@ -815,12 +878,12 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
         value ``-1`` marks padding rows (the compact MoE layout): such a row is
         computed with the preceding expert's weights (expert 0 for leading
         padding) and its output row is unspecified.  The block-scaled family
-        reads ``-1`` natively per 32-row sub-block: a sub-block whose leading
-        entry is ``-1`` is skipped and its output rows are left untouched;
-        ``-1`` rows sharing a sub-block with routed rows receive finite values
-        of no meaning (as DeepGEMM's 128-row blocks do).  Every expert run must
-        start on a multiple of ``alignment`` rows (an expert's rows followed by
-        its padding).
+        reads ``-1`` natively: it writes each expert run's routed rows rounded
+        up to 32 rows (16 on the store16 programs of :func:`bs_store16`), and
+        the output rows of ``-1`` entries are unspecified (left untouched or
+        holding values of no meaning, as DeepGEMM's 128-row blocks do).  Every
+        expert run must start on a multiple of ``alignment`` rows (an expert's
+        rows followed by its padding).
     out : Optional[torch.Tensor]
         Contiguous bfloat16 output of shape ``(M, N)``.  Allocated if omitted.
         A 2-byte-aligned output whose address is not a multiple of 16 selects
@@ -838,7 +901,9 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
         single-run schedule; other values the slower 32-row multi-run schedule.
         The swap-AB routes need ``N`` a multiple of 256, ``M`` a multiple of
         128, the MN-major ``a_scale`` words and the row-repeated ``b_scale``
-        words; other problems run the non-swapped routes.
+        words; other problems run the non-swapped routes.  The store16
+        programs need the same ``M`` and words, an ``alignment`` multiple of
+        128 and at most 128 routed rows per group (:func:`bs_store16`).
 
     Returns
     -------
