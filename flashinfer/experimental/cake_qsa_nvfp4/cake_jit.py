@@ -14,19 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Registry and loader glue of the Cake QSA sparse paged GQA decode over an
-NVFP4 KV cache for SM80, SM90, SM100 and SM103: two split-KV decode programs
+NVFP4 KV cache for SM80, SM90, SM100, SM103 and SM107: two split-KV decode programs
 partitioning the architectures -- the ``mma.sync`` decode of ``sm_80`` and
 ``sm_90a`` (its plain K-first build, its whole-tile build delivered for
 ``sm_80`` alone, and its cooperative build, which merges the splits in the
-same launch) and the tcgen05 decode of ``sm_100a`` and ``sm_103a`` (its plain
-and its cooperative build; tensor memory, one CTA per SM) -- and the separate
+same launch) and the tcgen05 decode of ``sm_100a``, ``sm_103a`` and ``sm_107a``
+(its plain and its cooperative build; tensor memory, one CTA per SM) -- and the
+separate
 split-KV merge with the sigmoid output gate, delivered for every architecture.
 
 Every record of ``MODULES`` is one mechanically exported program: a CUDA
 device translation unit plus a tvm-ffi binding, compiled for each architecture
 of the record's ``arches`` (one source per program; ``sm_80`` and ``sm_90a``
-for the ``mma.sync`` decodes, ``sm_100a`` and ``sm_103a`` for the tcgen05
-decodes, all four for the merge, ``sm_80`` alone for the whole-tile decode).  A record
+for the ``mma.sync`` decodes, ``sm_100a``, ``sm_103a`` and ``sm_107a`` for the
+tcgen05 decodes, all five for the merge, ``sm_80`` alone for the whole-tile
+decode).  A record
 carries the host plan only: the program's ``library`` stem (its ``build.json``
 entry is ``<library>_<arch>``), the architectures it is delivered for, the
 ``stage`` of the launch order it fills and its ``variant``, the
@@ -73,13 +75,14 @@ from typing import Any, Callable
 
 import tvm_ffi
 
-# The four verified builds, each compiled with its exact ``-gencode`` flag set
+# The five verified builds, each compiled with its exact ``-gencode`` flag set
 # (``build.json`` ``arch_flags``): ``sm_80`` serves every compute capability
-# 8.x device, ``sm_90a`` the H100 (9.0), ``sm_100a`` the B200 / GB200 (10.0)
-# and ``sm_103a`` the B300 / GB300 (10.3).  No other capability is a target:
-# the table is capability-exact (10.7, 12.0 and 12.1 are not in it).  A
-# record lists the subset it is delivered for (``record["arches"]``).
-ARCHES = ("sm_80", "sm_90a", "sm_100a", "sm_103a")
+# 8.x device, ``sm_90a`` the H100 (9.0), ``sm_100a`` the B200 / GB200 (10.0),
+# ``sm_103a`` the B300 / GB300 (10.3) and ``sm_107a`` the R200 (10.7).  No
+# other capability is a target: the table is capability-exact (12.0 and 12.1
+# are not in it).  A record lists the subset it is delivered for
+# (``record["arches"]``).
+ARCHES = ("sm_80", "sm_90a", "sm_100a", "sm_103a", "sm_107a")
 ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
     (8, 0): "sm_80",
     (8, 6): "sm_80",
@@ -88,6 +91,7 @@ ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
     (9, 0): "sm_90a",
     (10, 0): "sm_100a",
     (10, 3): "sm_103a",
+    (10, 7): "sm_107a",
 }
 PREFIX = "cake_qsa_nvfp4"
 
@@ -121,13 +125,26 @@ TILE_TOKENS = 64
 # launch bound: the form rule takes the fused form only below
 # ``DECODE_FUSED_CTAS_PER_SM[arch]`` x the SM count CTAs (``sm_80`` is absent:
 # its calls take the split form alone).  Within the capacity sm_90a always
-# takes the fused form; sm_100a / sm_103a take it under the host's eager rule
+# takes the fused form; sm_100a / sm_103a / sm_107a take it under the host's
+# eager rule
 # (``cake_backend.select_form``: an aarch64 host, rows <= 4, no capture).  The
 # exporter holds the launch-bound tables to the kernel files and the fused
 # table to its host policy.
-DECODE_THREADS = {"sm_80": 128, "sm_90a": 128, "sm_100a": 512, "sm_103a": 512}
-DECODE_CTAS_PER_SM = {"sm_80": 2, "sm_90a": 2, "sm_100a": 1, "sm_103a": 1}
-DECODE_FUSED_CTAS_PER_SM = {"sm_90a": 2, "sm_100a": 1, "sm_103a": 1}
+DECODE_THREADS = {
+    "sm_80": 128,
+    "sm_90a": 128,
+    "sm_100a": 512,
+    "sm_103a": 512,
+    "sm_107a": 512,
+}
+DECODE_CTAS_PER_SM = {
+    "sm_80": 2,
+    "sm_90a": 2,
+    "sm_100a": 1,
+    "sm_103a": 1,
+    "sm_107a": 1,
+}
+DECODE_FUSED_CTAS_PER_SM = {"sm_90a": 2, "sm_100a": 1, "sm_103a": 1, "sm_107a": 1}
 # The long-stream bound of the ``multi_wave_long`` grid class: the per-CTA tile
 # stream, ``ceil(tiles / splits)``, from which the whole-tile program measured
 # faster than the K-first one above one resident wave; 16 tiles = 1024 selected
@@ -565,7 +582,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "workspace_rule": {"kind": "fused_partials_counters"},
     },
     "decode_tcgen05": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "q"],
             ["buffer", "k_data"],
@@ -618,7 +635,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 159872,
             "use_pdl": False,
         },
-        "library": "cake_qsa_nvfp4_192803b3bb911a6cbae1",
+        "library": "cake_qsa_nvfp4_6692f8122124ee26fba0",
         "logical": {
             "block_table": "block_table",
             "data_stride_block": "data_stride_block",
@@ -664,7 +681,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "workspace_rule": {"kind": "split_partials"},
     },
     "decode_tcgen05_coop": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "q"],
             ["buffer", "k_data"],
@@ -717,7 +734,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 159872,
             "use_pdl": False,
         },
-        "library": "cake_qsa_nvfp4_0ceab6626450e29f384c",
+        "library": "cake_qsa_nvfp4_b56eb690df0312fb5df3",
         "logical": {
             "block_table": "block_table",
             "data_stride_block": "data_stride_block",
@@ -763,7 +780,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "workspace_rule": {"kind": "fused_partials_counters"},
     },
     "merge": {
-        "arches": ["sm_80", "sm_90a", "sm_100a", "sm_103a"],
+        "arches": ["sm_80", "sm_90a", "sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "partial_out"],
             ["buffer", "partial_lse"],
@@ -787,7 +804,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_qsa_nvfp4_b7476d91de350347ab5a",
+        "library": "cake_qsa_nvfp4_6a7c3a5082657fdef802",
         "logical": {
             "gate": "gate",
             "num_qo_heads": "num_qo_heads",
@@ -839,7 +856,7 @@ def select_record(stage: str, *, form: str, arch: str, wide: bool) -> str:
     :mod:`.cake_backend`).
     Only the records delivered for ``arch`` are candidates (the ``mma.sync``
     decode's on ``sm_80`` / ``sm_90a``, the tcgen05 decode's on ``sm_100a`` /
-    ``sm_103a``); of those whose rule admits the call, the most specific rule
+    ``sm_103a`` / ``sm_107a``); of those whose rule admits the call, the most specific rule
     kind (``SELECT_RULES`` order) wins: on ``sm_80`` a wide split-form call
     selects the whole-tile decode over the K-first one.  The ``merge`` stage has no
     record in the fused form (:func:`select_records` leaves it out); asking for

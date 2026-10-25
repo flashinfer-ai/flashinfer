@@ -28,7 +28,7 @@ Split rule (:func:`num_splits`): ``tiles = ceil(selection_width / 64)``;
 ``splits = max(1, min(tiles, CTAS_PER_SM[arch] * sm_count // (rows *
 num_kv_heads)))`` (the resident CTAs per SM of the architecture's plain decode,
 its launch bound: two for the ``mma.sync`` decode of SM80 / SM90, one for the
-tcgen05 decode of SM100 / SM103); then the measured table
+tcgen05 decode of SM100 / SM103 / SM107); then the measured table
 :data:`SPLIT_OVERRIDES` of the device's SM count replaces the formula where it
 names ``(sm_count, rows)``; then ``splits <= min(tiles, MAX_SPLITS)``.  The
 rule reads the architecture and the SM count alone, cached per device.  On a
@@ -45,9 +45,10 @@ the co-residency the decode's launch bound guarantees on the device
 (:func:`fused_capacity`: ``FUSED_CTAS_PER_SM[arch]`` times the SM count, 264
 on an H100, 148 on a B200, 152 on a GB300; a cooperative launch above the
 device's co-residency is refused by the driver).  Within it, compute
-capability 9.0 always takes the fused form.  Compute capability 10.0 and 10.3
-take it under the eager host rule alone: on a host of ``FUSED_HOSTS``
-(``aarch64``: the Grace host of a GB200 / GB300, whose eager path leaves a
+capability 9.0 always takes the fused form.  Compute capability 10.0, 10.3
+and 10.7 take it under the eager host rule alone: on a host of ``FUSED_HOSTS``
+(``aarch64``: the Grace host of a GB200 / GB300 or an R200 system's, whose
+eager path leaves a
 gap of several microseconds between the decode launch and the merge launch
 that costs more than the fused form's in-kernel merge tail), at ``rows <=
 FUSED_MAX_ROWS`` (4) and when the current stream is not capturing: a captured
@@ -61,7 +62,8 @@ call with its captured replay bit for bit, so the two forms agree exactly.
 Program rule (:func:`select_wide`, then :func:`cake_jit.select_records`): the
 registry's records are filtered by the device's architecture first (the
 ``mma.sync`` decode's on ``sm_80`` / ``sm_90a``, the tcgen05 decode's on
-``sm_100a`` / ``sm_103a``).  On ``sm_80`` the plain decode has two programs:
+``sm_100a`` / ``sm_103a`` / ``sm_107a``).  On ``sm_80`` the plain decode has
+two programs:
 a split-form call is *wide* when both hold: its decode grid ``rows *
 num_kv_heads * splits`` exceeds one resident wave (``CTAS_PER_SM[arch]`` CTAs
 per SM times the SM count: 216 CTAs on an A100's 108 SMs) and each of its CTAs
@@ -69,9 +71,9 @@ walks a long tile stream, ``ceil(tiles / splits) >= LONG_STREAM_TILES`` (16
 tiles = 1024 selected tokens).  A wide call launches the whole-tile program
 (``decode_whole_tile``: whole-tile gather, no L2 cache hint, shift selector --
 the previous release's ``sm_80`` decode); every other call launches the
-K-first program (``decode``), and ``sm_90a`` always does; ``sm_100a`` and
-``sm_103a`` launch the tcgen05 program (``decode_tcgen05``) in the split form
-whatever the grid.  On 108 SMs at the owner's 24 x 2 heads and 2051 selections (33
+K-first program (``decode``), and ``sm_90a`` always does; ``sm_100a``,
+``sm_103a`` and ``sm_107a`` launch the tcgen05 program (``decode_tcgen05``) in
+the split form whatever the grid.  On 108 SMs at the owner's 24 x 2 heads and 2051 selections (33
 tiles): rows 1-32 run at most one wave -> K-first; rows 64 (4 splits, 512
 CTAs, 9 tiles per CTA) -> K-first; rows 128 (2 splits, 512 CTAs, 17 tiles per
 CTA) -> whole-tile; the 2048-row single-split call (33 tiles per CTA) ->
@@ -140,7 +142,7 @@ FUSED_CTAS_PER_SM = cake_jit.DECODE_FUSED_CTAS_PER_SM
 # The eager host rule of the tcgen05 architectures (module docstring, "Form rule"): within the fused capacity, those
 # architectures take the fused form only on these host machines (``platform.machine()``), at this many rows or fewer,
 # and only outside a stream capture; compute capability 9.0 takes it within its capacity on every host.
-FUSED_HOST_RULE_ARCHES = ("sm_100a", "sm_103a")
+FUSED_HOST_RULE_ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 FUSED_HOSTS = ("aarch64",)
 FUSED_MAX_ROWS = 4
 HOST_MACHINE = platform.machine()
