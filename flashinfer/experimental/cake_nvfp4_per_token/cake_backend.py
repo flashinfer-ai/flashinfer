@@ -250,6 +250,13 @@ CLUSTER_SPLIT_MAX_M: dict[int, int] = {
 # sm_103a, K = 8192 with the out_scale folded: the split up to 17 tokens (at 32 tokens it
 # ties one CTA per row on GB300).
 CLUSTER_SPLIT_MAX_M_FOLD_SM103_K8192 = 17
+# K = 8192, both folds: the token counts that keep one CTA per row on each architecture (in
+# some timing states the split reads 2-4 % slower than one CTA per row there); 1 token keeps
+# the split on both, and on sm_103a so do 17 tokens and up to the limits above.
+CLUSTER_SPLIT_ONE_CTA_M_K8192: dict[str, tuple[int, int]] = {
+    "sm_100a": (2, 32),
+    "sm_103a": (2, 16),
+}
 # 16-byte chunks of the last scale tile's padding one padding-cluster CTA zeroes.
 CLUSTER_SPLIT_PAD_CHUNKS = 1024
 
@@ -344,9 +351,14 @@ def static_k_for(k: int, m: int, x_row_stride: Optional[int] = None) -> Optional
 
 def quant_cluster_split(m: int, k: int, is_bf16: bool, fold: bool, arch: str) -> int:
     """CTAs per token row: :data:`QUANT_CLUSTER_SPLIT` for bf16 rows of a width in
-    :data:`CLUSTER_SPLIT_MAX_M` up to its token count, else 1."""
+    :data:`CLUSTER_SPLIT_MAX_M` up to its token count, else 1 (at K = 8192, also 1 for the
+    token counts :data:`CLUSTER_SPLIT_ONE_CTA_M_K8192` gives the architecture)."""
     if not is_bf16:
         return 1
+    if int(k) == 8192 and arch in CLUSTER_SPLIT_ONE_CTA_M_K8192:
+        low, high = CLUSTER_SPLIT_ONE_CTA_M_K8192[arch]
+        if low <= int(m) <= high:
+            return 1
     limit = CLUSTER_SPLIT_MAX_M.get(int(k), 0)
     if arch == "sm_103a" and int(k) == 8192 and fold:
         limit = CLUSTER_SPLIT_MAX_M_FOLD_SM103_K8192
