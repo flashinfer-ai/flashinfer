@@ -19,7 +19,13 @@ run the block-scaled family: ``tcgen05.mma.kind::mxf8f6f4`` applies both
 scales in the tensor core, ``-1`` entries of ``m_indices`` mark padding rows
 of the compact MoE layout (skipped, output rows untouched) and expert runs
 start on multiples of ``alignment`` rows (128-multiples select the single-run
-schedule, other multiples of 32 the slower multi-run schedule).
+schedule, other multiples of 32 the slower multi-run schedule).  When the
+packed words are DeepGEMM's MN-major activation words and the row-repeated
+weight words and ``N`` is a multiple of 256, the host may route a problem to
+the swap-AB programs (:func:`bs_swap_route_for_shape`): the weight rows fill
+the 256-row side of a two-CTA MMA and the routed tokens its N side.  Every
+block-scaled route accumulates each output in the same K order, so the route
+never changes the output bits.
 
 The host side selects one kernel route per problem shape and output
 alignment, resolves the launch grid from the device SM count (queried once per
@@ -122,21 +128,63 @@ def route_for_shape(m: int, n: int, k: int) -> str:
     )
 
 
-def bs_block_n(m: int, n: int, k: int, sm_count: int) -> int:
-    """``BLOCK_N`` of the block-scaled family (mirror of the source dispatcher's measured rule).
+def bs_block_n(
+    m: int,
+    n: int,
+    k: int,
+    sm_count: int,
+    *,
+    alignment: int = BS_BLOCK_M,
+    num_groups: int | None = None,
+) -> int:
+    """``BLOCK_N`` of the block-scaled family.
 
-    256-column tiles move the fewest bytes per output and win for short K loops or at
-    least three waves of M blocks; long-K problems with fewer M blocks run 128.
+    ``m`` counts every row of the compact layout, including the ``-1`` padding
+    tail, and each CTA steps over the skipped tiles of that tail: 256-column
+    tiles halve that walk and the A traffic, so they are the default.  128
+    columns win where they buy parallelism: when a 256-column grid has fewer
+    tiles than the device has SMs, and for long-K problems (at least 16 K
+    blocks) with fewer than three waves of M blocks.  Two cases of that long-K
+    range still run 256 columns:
+
+    - the single-run schedule below 32 K blocks and two waves of M blocks;
+    - the 32-row multi-run schedule once the routed rows, sized as
+      ``m - num_groups * (alignment - 1) - 127`` (the caller's buffer of routed
+      rows plus each group's alignment padding and the 128-row round-up), would
+      at one row per run fill more 128-column tiles than the device has SMs.
+
+    The choice never changes the output bits: every route accumulates each
+    output in the same K order.
     """
     if n % B_SCALE_BLOCK_N:
         raise ValueError(f"N must be a multiple of {B_SCALE_BLOCK_N}, got {n}")
+    if n % 256:
+        return 128
     m_blocks = (m + BS_BLOCK_M - 1) // BS_BLOCK_M
-    if n % 256 == 0 and not (k // K_BLOCK >= 16 and m_blocks < 3 * sm_count):
+    if m_blocks * (n // 256) < sm_count:
+        return 128
+    k_blocks = k // K_BLOCK
+    if k_blocks < 16 or m_blocks >= 3 * sm_count:
         return 256
+    if alignment % BS_BLOCK_M == 0:
+        return 256 if k_blocks < 32 and m_blocks < 2 * sm_count else 128
+    if num_groups is not None:
+        routed = m - num_groups * (alignment - 1) - (BS_BLOCK_M - 1)
+        run_blocks = (routed * alignment + BS_BLOCK_M - 1) // BS_BLOCK_M
+        if routed > 0 and run_blocks * (n // 128) > sm_count:
+            return 256
     return 128
 
 
-def bs_route_for_shape(m: int, n: int, k: int, *, alignment: int, sm_count: int) -> str:
+def bs_route_for_shape(
+    m: int,
+    n: int,
+    k: int,
+    *,
+    alignment: int,
+    sm_count: int,
+    num_groups: int | None = None,
+) -> str:
     """Select the block-scaled route for packed UE8M0 scales."""
     if alignment <= 0 or alignment % BS_SUB_ROWS:
         raise ValueError(
@@ -146,7 +194,7 @@ def bs_route_for_shape(m: int, n: int, k: int, *, alignment: int, sm_count: int)
         raise ValueError(
             f"block-scaled grouped FP8 GEMM requires positive K divisible by {BS_BLOCK_K}; got K={k}"
         )
-    block_n = bs_block_n(m, n, k, sm_count)
+    block_n = bs_block_n(m, n, k, sm_count, alignment=alignment, num_groups=num_groups)
     single_run = alignment % BS_BLOCK_M == 0
     return {
         (128, True): BS_N128_ROUTE,
@@ -154,6 +202,75 @@ def bs_route_for_shape(m: int, n: int, k: int, *, alignment: int, sm_count: int)
         (128, False): BS_N128_RUN32_ROUTE,
         (256, False): BS_N256_RUN32_ROUTE,
     }[(block_n, single_run)]
+
+
+# Swap-AB block-scaled programs: the weight rows fill the 256-row side of the
+# two-CTA MMA and the routed tokens its N side.
+BS_SWAP_ROUTE = "bs_ue8m0_swap"
+BS_SWAP_CARRY_ROUTE = "bs_ue8m0_swap_carry"
+BS_SWAP_RUN32_ROUTE = "bs_ue8m0_swap_run32"
+BS_SWAP_ROUTES = frozenset({BS_SWAP_ROUTE, BS_SWAP_RUN32_ROUTE, BS_SWAP_CARRY_ROUTE})
+BS_SWAP_ARCHS = frozenset({"sm_100a", "sm_103a"})
+
+
+def bs_swap_route_for_shape(
+    m: int,
+    n: int,
+    k: int,
+    *,
+    alignment: int,
+    num_groups: int | None,
+    arch: str,
+) -> str | None:
+    """Select the swap-AB route for packed UE8M0 scales, or ``None`` for :func:`bs_route_for_shape`.
+
+    The rule reads host-known values only.  ``rows`` estimates the routed rows
+    per group, ``(m - num_groups * (alignment - 1)) / num_groups``: the compact
+    layout less each group's largest alignment padding.
+
+    - Keep the non-swapped routes when N is not a multiple of 256 (the swapped
+      tile height) or the group count is unknown.
+    - Swap every layout whose alignment is not a multiple of 128 (the 32-row
+      multi-run layouts) through ``BS_SWAP_RUN32_ROUTE``.
+    - For K <= 512, swap at 2 <= rows <= 20, and at 1 <= rows < 2 when K <= 256.
+    - For longer K, keep below 0.75 rows and swap below 100 rows.  From 100
+      rows, sm_100a swaps for N >= 1024 and sm_103a for N < 1024 or at least
+      400 rows.
+
+    Swapped single-run layouts with K <= 256, or K <= 2048 and at least 128
+    rows, take ``BS_SWAP_CARRY_ROUTE``: it loads the next tile's group entries
+    at the head of each tile, so the load overlaps a tile of work.  The other
+    swapped layouts read each tile's entries at its head.
+
+    The choice never changes the output bits: every route accumulates each
+    output in the same K order.
+    """
+    if arch not in BS_SWAP_ARCHS or n % 256 or k % BS_BLOCK_K:
+        return None
+    single_run = alignment % BS_BLOCK_M == 0
+    if not single_run:
+        return BS_SWAP_RUN32_ROUTE
+    if not num_groups or num_groups <= 0:
+        return None
+    # rows = routed / num_groups; compared without division.
+    routed = m - num_groups * (alignment - 1)
+    if k <= 512:
+        swap = 2 * num_groups <= routed <= 20 * num_groups or (
+            k <= 256 and num_groups <= routed < 2 * num_groups
+        )
+    elif 4 * routed < 3 * num_groups:
+        swap = False
+    elif routed < 100 * num_groups:
+        swap = True
+    elif arch == "sm_100a":
+        swap = n >= 1024
+    else:
+        swap = n < 1024 or routed >= 400 * num_groups
+    if not swap:
+        return None
+    if k <= 256 or (k <= 2048 and routed >= 128 * num_groups):
+        return BS_SWAP_CARRY_ROUTE
+    return BS_SWAP_ROUTE
 
 
 def resolve_route_for_grid(route: str, n: int, grid: tuple[int, int, int]) -> str:
@@ -195,8 +312,15 @@ def launch_plan(
     scalar_output: bool,
     block_scaled: bool = False,
     alignment: int = 128,
+    num_groups: int | None = None,
+    arch: str | None = None,
 ) -> tuple[str, tuple[int, int, int]]:
-    """Resolve ``(route, grid)`` for a problem shape on a device with ``sm_count`` SMs."""
+    """Resolve ``(route, grid)`` for a problem shape on a device with ``sm_count`` SMs.
+
+    ``arch`` (the device's, e.g. ``"sm_100a"``) admits the swap-AB routes of
+    :func:`bs_swap_route_for_shape` for a block-scaled problem; ``None`` keeps
+    the routes of :func:`bs_route_for_shape`.
+    """
     if sm_count <= 0:
         raise ValueError("sm_count must be positive")
     if block_scaled:
@@ -204,7 +328,16 @@ def launch_plan(
             raise ValueError(
                 "block-scaled grouped FP8 GEMM requires a 16-byte-aligned output"
             )
-        route = bs_route_for_shape(m, n, k, alignment=alignment, sm_count=sm_count)
+        route = bs_route_for_shape(
+            m, n, k, alignment=alignment, sm_count=sm_count, num_groups=num_groups
+        )
+        if arch is not None:
+            route = (
+                bs_swap_route_for_shape(
+                    m, n, k, alignment=alignment, num_groups=num_groups, arch=arch
+                )
+                or route
+            )
     elif scalar_output:
         route = DEEPK_C2_SCALAR_OUTPUT_ROUTE
     else:
@@ -212,7 +345,7 @@ def launch_plan(
     tile_m, tile_n, cluster_ctas = route_geometry(route)
     total_tiles = math.ceil(m / tile_m) * math.ceil(n / tile_n)
     cta_limit = sm_count
-    if (m, n, k) in _CG2_GRID128_SHAPES:
+    if (m, n, k) in _CG2_GRID128_SHAPES and route not in BS_SWAP_ROUTES:
         cta_limit = min(cta_limit, 128)
     clusters = min(total_tiles, cta_limit // cluster_ctas)
     if clusters <= 0:
@@ -353,6 +486,35 @@ def _packed_weight_scale_strides(
     )
 
 
+def _swap_scale_surfaces(
+    a_scale: torch.Tensor, b_scale: torch.Tensor, *, m: int, n: int, k: int
+) -> Optional[tuple[torch.Tensor, torch.Tensor, int]]:
+    """The packed scale words as the swap-AB programs' tensor-map surfaces, or ``None``.
+
+    The swap-AB programs load the activation words as the uint32 surface
+    ``[cols, M]`` (DeepGEMM's MN-major layout: ``a_scale`` the transpose of a
+    contiguous tensor) and the weight words as ``[G * cols_b, N]`` (the
+    row-repeated ``(G, N, cols_b)`` layout, also the transpose of a contiguous
+    tensor), both read in place; the third value is ``cols_b``, the words per
+    group.  Any other layout, and an ``M`` that is not a multiple of 128 rows,
+    returns ``None``: the non-swapped routes read it as it is.
+    """
+    cols = -(-(k // K_BLOCK) // 4)
+    groups, rows, cols_b = (int(v) for v in b_scale.shape)
+    if m % BS_BLOCK_M or n % 4 or rows != n:
+        return None
+    if not (a_scale.mT.is_contiguous() and b_scale.mT.is_contiguous()):
+        return None
+    sfb = b_scale.as_strided(((groups - 1) * cols_b + cols, n), (n, 1))
+    return _swap_sfa(a_scale, m=m, k=k), sfb.view(torch.uint32), cols_b
+
+
+def _swap_sfa(a_scale: torch.Tensor, *, m: int, k: int) -> torch.Tensor:
+    """The MN-major activation words as the uint32 surface ``[cols, M]`` with word stride ``M``."""
+    cols = -(-(k // K_BLOCK) // 4)
+    return a_scale.as_strided((cols, m), (m, 1)).view(torch.uint32)
+
+
 def argument_slots(arg_plan: Sequence[Sequence[str]]) -> dict[str, tuple[int, ...]]:
     """Positions of every named binding in a generated program's argument plan."""
     slots: dict[str, list[int]] = {}
@@ -416,7 +578,7 @@ class PreparedGroupGemmFp8NtGroupwiseContiguous:
 
     @property
     def block_scaled(self) -> bool:
-        return self.route in BS_ROUTES
+        return self.route in BS_ROUTES or self.route in BS_SWAP_ROUTES
 
     @property
     def out(self) -> torch.Tensor:
@@ -437,7 +599,16 @@ class PreparedGroupGemmFp8NtGroupwiseContiguous:
         buffers.  Afterwards every ``launch`` must supply all of them.
         """
         arguments = list(self._arguments)
-        names: tuple[str, ...] = ("A", "A64", "A32", "C", "C_tma", "a_scale", "SFA")
+        names: tuple[str, ...] = (
+            "A",
+            "A64",
+            "A32",
+            "C",
+            "C_tma",
+            "a_scale",
+            "SFA",
+            "SFA_packed",
+        )
         if not self.fill_padding:
             names += ("m_indices",)
         for name in names:
@@ -512,6 +683,12 @@ class PreparedGroupGemmFp8NtGroupwiseContiguous:
                             f"a_scale must keep the prepared packed layout {self._a_scale_layout}, got {layout}"
                         )
                     self._rebind(rebound, "SFA", ffi_scale)
+                    if self.route in BS_SWAP_ROUTES:
+                        self._rebind(
+                            rebound,
+                            "SFA_packed",
+                            _swap_sfa(a_scale, m=self.m, k=self.k),
+                        )
                 else:
                     a_scale = _require_tensor(
                         a_scale,
@@ -659,6 +836,9 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
         Block-scaled family only: the row alignment of expert runs in the
         compact layout, a positive multiple of 32.  Multiples of 128 run the
         single-run schedule; other values the slower 32-row multi-run schedule.
+        The swap-AB routes need ``N`` a multiple of 256, ``M`` a multiple of
+        128, the MN-major ``a_scale`` words and the row-repeated ``b_scale``
+        words; other problems run the non-swapped routes.
 
     Returns
     -------
@@ -703,6 +883,7 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
         b, "b", shape=(groups, n, k), dtype=torch.float8_e4m3fn, device=device
     )
     block_scaled = isinstance(a_scale, torch.Tensor) and a_scale.dtype == torch.int32
+    swap_surfaces = None
     if block_scaled:
         if fill_padding:
             raise ValueError(
@@ -723,6 +904,7 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
         sfb, sfb_gs, sfb_rs, sfb_cs = _packed_weight_scale_strides(
             b_scale, groups=groups, n=n, k=k, device=device
         )
+        swap_surfaces = _swap_scale_surfaces(a_scale, b_scale, m=m, n=n, k=k)
     else:
         a_scale = _require_tensor(
             a_scale,
@@ -770,6 +952,8 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
         scalar_output=scalar_output,
         block_scaled=block_scaled,
         alignment=alignment,
+        num_groups=groups,
+        arch=arch if swap_surfaces is not None else None,
     )
     module_name = select_module(arch, route)
     program = PROGRAMS[MODULES[module_name]["program"]]
@@ -802,6 +986,11 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
             "sfb_row_stride": sfb_rs,
             "sfb_col_stride": sfb_cs,
         }
+        if route in BS_SWAP_ROUTES:
+            assert swap_surfaces is not None
+            bindings["SFA_packed"], bindings["SFB_packed"], bindings["sf_cols"] = (
+                swap_surfaces
+            )
         a_scale_layout = (tuple(int(v) for v in a_scale.shape), (sfa_rs, sfa_cs))
     else:
         bindings = {
