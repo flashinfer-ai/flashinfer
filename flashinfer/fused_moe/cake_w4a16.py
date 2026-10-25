@@ -19,8 +19,8 @@ E4M3 block-16 scales, decoded to BF16 inside the kernels and accumulated in FP32
 on ``tcgen05`` (sm_100a / sm_103a).
 
 Launch chain, with programmatic dependent launch on every boundary (the FC1
-programs of the ``n = 8`` and ``n = 16`` cells gather the token rows themselves
-and skip ``moe_permute``)::
+program of the ``n = 8`` cell gathers the token rows itself and skips
+``moe_permute``)::
 
     moe_sort (FlashInfer) -> moe_permute (FlashInfer) -> Cake FC1 (gated SwiGLU -> BF16)
       -> Cake FC2 (-> BF16) -> moe_unpermute (FlashInfer, FP32 FMA in top-k slot order)
@@ -63,9 +63,9 @@ not cooperative, 512 threads, cluster ``(cta_group, 1, 1)``).  This module
 assembles the binding's positional call from the program's recorded argument
 names (:data:`FC1_ARGS`, :data:`FC2_ARGS`), derives the grid
 (:func:`cake_w4a16_grid`) and launches through ``program.entry(target)`` under
-``tvm_ffi.use_torch_stream()``.  The FC1 programs of the ``n = 8`` and ``n = 16``
-cells take the route map and gather the token rows from ``x`` themselves, so
-the route skips ``moe_permute`` for them.  :func:`cake_w4a16_available` tells
+``tvm_ffi.use_torch_stream()``.  The FC1 program of the ``n = 8`` cell takes
+the route map and gathers the token rows from ``x`` itself, so the route skips
+``moe_permute`` for it.  :func:`cake_w4a16_available` tells
 whether the loader imports and publishes every program, so tests skip cleanly
 without it.
 """
