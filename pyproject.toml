@@ -90,6 +90,7 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 "flashinfer.cake_vsa_sm90_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_gdp_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_mhc_train_backend" = ["csrc/**", "build.json"]
+"flashinfer.cake_gated_act_mxfp8_backend" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_dsa_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_kda_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_gdn_train" = ["csrc/**", "build.json", "build.test.json"]
