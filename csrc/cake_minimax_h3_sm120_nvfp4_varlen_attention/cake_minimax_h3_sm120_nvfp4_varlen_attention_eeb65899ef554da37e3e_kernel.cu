@@ -172,7 +172,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
-kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_745ed7cf4e27bcbf77ef(const __grid_constant__ CUtensorMap Q_map, const __grid_constant__ CUtensorMap K_map, const __grid_constant__ CUtensorMap KSF_map, const __grid_constant__ CUtensorMap VT_map, const __grid_constant__ CUtensorMap VSF_map, __nv_bfloat16* __restrict__ O, unsigned int* __restrict__ q_sf, unsigned int* __restrict__ qm4, unsigned int* __restrict__ qm_sf, int* __restrict__ seg_tile_begin, int* __restrict__ unit_table, int total_units, int num_heads, int num_kblocks, float softmax_scale_log2)
+kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_eeb65899ef554da37e3e(const __grid_constant__ CUtensorMap Q_map, const __grid_constant__ CUtensorMap K_map, const __grid_constant__ CUtensorMap KSF_map, const __grid_constant__ CUtensorMap VT_map, const __grid_constant__ CUtensorMap VSF_map, __nv_bfloat16* __restrict__ O, unsigned int* __restrict__ q_sf, unsigned int* __restrict__ qm4, unsigned int* __restrict__ qm_sf, int* __restrict__ seg_tile_begin, int* __restrict__ unit_table, int total_units, int num_heads, int num_kblocks, float softmax_scale_log2)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -238,6 +238,7 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_745ed7cf4e27bcbf77ef(const _
             // delta_ready: 2 barriers, init_count=8
             mbarrier_init(smem + 72, 8);
             mbarrier_init(smem + 80, 8);
+            // --- pipeline 'prec' ---
             // p_full: 16 barriers, init_count=1
             mbarrier_init(smem + 88, 1);
             mbarrier_init(smem + 96, 1);
@@ -314,6 +315,9 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_745ed7cf4e27bcbf77ef(const _
                 }
             }
             unsigned int _phase_q_full_0 = 0;
+            unsigned int _phase_k_full = 0;
+            unsigned int _phase_delta_ready = 0;
+            unsigned int _phase_p_empty = 1;
             #pragma unroll 1
             for (int slot = bid; slot < total_units; slot += num_bids) {
                 int _vec_load_1[4];
@@ -428,7 +432,7 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_745ed7cf4e27bcbf77ef(const _
                     : "=r"(q_frags[4]), "=r"(q_frags[5]), "=r"(q_frags[6]), "=r"(q_frags[7])
                     : "r"(Q_addr + (unsigned int)((warp * 16 + (lane >> 3 & 1) * 8 + (lane & 7)) * 64) + (unsigned int)(32 + (lane >> 3 >> 1) * 16 ^ (warp * 16 + (lane >> 3 & 1) * 8 + (lane & 7) >> 1 & 3) << 4))
                     : "memory");
-                mbarrier_wait(k_full_addr + (kv_stage) * 8, kv_phase);
+                mbarrier_wait(k_full_addr + (kv_stage) * 8, _phase_k_full);
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                     : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
                     : "r"(K_stage_addr + kv_stage * 8192 + (unsigned int)((warp * 16 + (lane >> 4 & 1) * 8 + (lane & 7)) * 64) + (unsigned int)((lane >> 3 & 1) * 16 ^ (warp * 16 + (lane >> 4 & 1) * 8 + (lane & 7) >> 1 & 3) << 4))
@@ -469,8 +473,8 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_745ed7cf4e27bcbf77ef(const _
                 if (elect_sync()) {
                     mbarrier_arrive(delta_ready_addr + (d_stage) * 8);
                 }
-                asm volatile("barrier.sync 5, 256;" ::: "memory");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                asm volatile("barrier.sync 5, 256;" ::: "memory");
                 if (warp == 0) {
                     if (elect_sync()) {
                         mbarrier_arrive_expect_tx(q_full_addr, 8192);
@@ -483,8 +487,8 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_745ed7cf4e27bcbf77ef(const _
                 }
                 #pragma unroll 1
                 for (int kb = kb_first; kb < kb_last + 1; kb++) {
-                    mbarrier_wait(k_full_addr + (kv_stage) * 8, kv_phase);
-                    mbarrier_wait(delta_ready_addr + (d_stage) * 8, d_phase);
+                    mbarrier_wait(k_full_addr + (kv_stage) * 8, _phase_k_full);
+                    mbarrier_wait(delta_ready_addr + (d_stage) * 8, _phase_delta_ready);
                     float smem_regs_1[2];
                     #pragma unroll
                     for (int _lr_2 = 0; _lr_2 < 2; _lr_2++) {
@@ -871,12 +875,13 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_745ed7cf4e27bcbf77ef(const _
                         : "+f"(s_acc[60]), "+f"(s_acc[(60) + 1]), "+f"(s_acc[(60) + 2]), "+f"(s_acc[(60) + 3])
                         : "r"(q_frags[4]), "r"(q_frags[(4) + 1]), "r"(q_frags[(4) + 2]), "r"(q_frags[(4) + 3]), "r"(k_frag[6]), "r"(k_frag[(6) + 1]), "r"((uint32_t)(qsf[1])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(smem_regs_32[1])), "h"((uint16_t)0), "h"((uint16_t)0));
                     asm volatile("barrier.arrive %0, 256;" :: "r"(2 - warp / 4) : "memory");
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     __syncwarp();
                     if (elect_sync()) {
                         mbarrier_arrive(k_empty_addr + (kv_stage) * 8);
                     }
                     if (kb_last >= kb + 1) {
-                        mbarrier_wait(k_full_addr + (((kv_stage + 1 < 2) ? kv_stage + 1 : (unsigned int)0)) * 8, ((kv_stage + 1 < 2) ? kv_phase : kv_phase ^ 1));
+                        mbarrier_wait(k_full_addr + (((kv_stage + 1 < 2) ? kv_stage + 1 : (unsigned int)0)) * 8, ((kv_stage + 1 < 2) ? _phase_k_full : _phase_k_full ^ 1));
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
                             : "r"(K_stage_addr + ((kv_stage + 1 < 2) ? kv_stage + 1 : (unsigned int)0) * 8192 + (unsigned int)((warp * 16 + (lane >> 4 & 1) * 8 + (lane & 7)) * 64) + (unsigned int)((lane >> 3 & 1) * 16 ^ (warp * 16 + (lane >> 4 & 1) * 8 + (lane & 7) >> 1 & 3) << 4))
@@ -919,7 +924,7 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_745ed7cf4e27bcbf77ef(const _
                         }
                     }
                     d_stage += 1;
-                    if (d_stage == 2) { d_stage = 0; d_phase ^= 1; }
+                    if (d_stage == 2) { d_stage = 0; _phase_delta_ready ^= 1; }
                     if (kb_first == kb || kb_last == kb) {
                         s_acc[0] = ((seg_begin_v > kb * 128 + 2 * (lane & 3) || seg_end_v <= kb * 128 + 2 * (lane & 3)) ? -CUDART_INF_F : s_acc[0]);
                         s_acc[1] = ((seg_begin_v > kb * 128 + 2 * (lane & 3) + 1 || seg_end_v <= kb * 128 + 2 * (lane & 3) + 1) ? -CUDART_INF_F : s_acc[1]);
@@ -1286,7 +1291,7 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_745ed7cf4e27bcbf77ef(const _
                     asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(p_frag[7]) : "f"(p_tmp[24]), "f"(p_tmp[25]), "f"(p_tmp[26]), "f"(p_tmp[27]), "f"(p_tmp[28]), "f"(p_tmp[29]), "f"(p_tmp[30]), "f"(p_tmp[31]));
                     l_state[0] = __fmaf_rn(l_state[0], _exp2_0, _fma_12);
                     l_state[1] = __fmaf_rn(l_state[1], _exp2_1, _fma_13);
-                    mbarrier_wait(p_empty_addr + (p_slot * 8 + (unsigned int)warp) * 8, p_phase ^ 1);
+                    mbarrier_wait(p_empty_addr + (p_slot * 8 + (unsigned int)warp) * 8, _phase_p_empty);
                     PREC[(p_slot * 8 + (unsigned int)warp) * 512 + (unsigned int)lane] = p_frag[0];
                     PREC[(p_slot * 8 + (unsigned int)warp) * 512 + (unsigned int)lane + 32] = p_frag[1];
                     PREC[(p_slot * 8 + (unsigned int)warp) * 512 + (unsigned int)lane + 64] = p_frag[2];
@@ -1307,7 +1312,7 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_745ed7cf4e27bcbf77ef(const _
                         mbarrier_arrive(p_full_addr + (p_slot * 8 + (unsigned int)warp) * 8);
                     }
                     if (warp == 0) {
-                        mbarrier_wait(k_empty_addr + (kv_stage) * 8, kv_phase);
+                        mbarrier_wait(k_empty_addr + (kv_stage) * 8, _phase_k_full);
                     }
                     if (kb_last >= kb + 2) {
                         if (warp == 0) {
@@ -1327,9 +1332,9 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_745ed7cf4e27bcbf77ef(const _
                         }
                     }
                     kv_stage += 1;
-                    if (kv_stage == 2) { kv_stage = 0; kv_phase ^= 1; }
+                    if (kv_stage == 2) { kv_stage = 0; _phase_k_full ^= 1; }
                     p_slot += 1;
-                    if (p_slot == 2) { p_slot = 0; p_phase ^= 1; }
+                    if (p_slot == 2) { p_slot = 0; _phase_p_empty ^= 1; }
                 }
                 asm volatile("barrier.sync 5, 256;" ::: "memory");
             }
@@ -1347,6 +1352,8 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_745ed7cf4e27bcbf77ef(const _
             asm volatile("griddepcontrol.wait;" ::: "memory");
             asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
             int pvw = warp - 8;
+            unsigned int _phase_v_full = 0;
+            unsigned int _phase_p_full = 0;
             #pragma unroll 1
             for (int slot_1 = bid; slot_1 < total_units; slot_1 += num_bids) {
                 int _vec_load_3[4];
@@ -1544,8 +1551,8 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_745ed7cf4e27bcbf77ef(const _
                 asm volatile("barrier.sync 6, 128;" ::: "memory");
                 #pragma unroll 1
                 for (int kb_1 = kb_first_1; kb_1 < kb_last_1 + 1; kb_1++) {
-                    mbarrier_wait(v_full_addr + (kv_stage_1) * 8, kv_phase_1);
-                    mbarrier_wait(p_full_addr + (p_slot_1 * 8 + (unsigned int)(pvw * 2)) * 8, p_phase_1);
+                    mbarrier_wait(v_full_addr + (kv_stage_1) * 8, _phase_v_full);
+                    mbarrier_wait(p_full_addr + (p_slot_1 * 8 + (unsigned int)(pvw * 2)) * 8, _phase_p_full);
                     pf0[0] = PREC[(p_slot_1 * 8 + (unsigned int)(pvw * 2)) * 512 + (unsigned int)lane];
                     pf0[1] = PREC[(p_slot_1 * 8 + (unsigned int)(pvw * 2)) * 512 + (unsigned int)lane + 32];
                     pf0[2] = PREC[(p_slot_1 * 8 + (unsigned int)(pvw * 2)) * 512 + (unsigned int)lane + 64];
@@ -1603,7 +1610,7 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_745ed7cf4e27bcbf77ef(const _
                     if (elect_sync()) {
                         mbarrier_arrive(p_empty_addr + (p_slot_1 * 8 + (unsigned int)(pvw * 2)) * 8);
                     }
-                    mbarrier_wait(p_full_addr + (p_slot_1 * 8 + (unsigned int)(pvw * 2 + 1)) * 8, p_phase_1);
+                    mbarrier_wait(p_full_addr + (p_slot_1 * 8 + (unsigned int)(pvw * 2 + 1)) * 8, _phase_p_full);
                     pf1[0] = PREC[(p_slot_1 * 8 + (unsigned int)(pvw * 2 + 1)) * 512 + (unsigned int)lane];
                     pf1[1] = PREC[(p_slot_1 * 8 + (unsigned int)(pvw * 2 + 1)) * 512 + (unsigned int)lane + 32];
                     pf1[2] = PREC[(p_slot_1 * 8 + (unsigned int)(pvw * 2 + 1)) * 512 + (unsigned int)lane + 64];
@@ -2141,12 +2148,13 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_745ed7cf4e27bcbf77ef(const _
                     asm volatile("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                         : "+f"(o_acc1[60]), "+f"(o_acc1[(60) + 1]), "+f"(o_acc1[(60) + 2]), "+f"(o_acc1[(60) + 3])
                         : "r"(pf1[4]), "r"(pf1[(4) + 1]), "r"(pf1[(4) + 2]), "r"(pf1[(4) + 3]), "r"(v_frag[6]), "r"(v_frag[(6) + 1]), "r"((uint32_t)(psf1[1])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(smem_regs_30_1[1])), "h"((uint16_t)0), "h"((uint16_t)0));
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     __syncwarp();
                     if (elect_sync()) {
                         mbarrier_arrive(v_empty_addr + (kv_stage_1) * 8);
                     }
                     if (warp == 8) {
-                        mbarrier_wait(v_empty_addr + (kv_stage_1) * 8, kv_phase_1);
+                        mbarrier_wait(v_empty_addr + (kv_stage_1) * 8, _phase_v_full);
                     }
                     if (kb_last_1 >= kb_1 + 2) {
                         if (warp == 8) {
@@ -2166,9 +2174,9 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_745ed7cf4e27bcbf77ef(const _
                         }
                     }
                     kv_stage_1 += 1;
-                    if (kv_stage_1 == 2) { kv_stage_1 = 0; kv_phase_1 ^= 1; }
+                    if (kv_stage_1 == 2) { kv_stage_1 = 0; _phase_v_full ^= 1; }
                     p_slot_1 += 1;
-                    if (p_slot_1 == 2) { p_slot_1 = 0; p_phase_1 ^= 1; }
+                    if (p_slot_1 == 2) { p_slot_1 = 0; _phase_p_full ^= 1; }
                 }
                 int rows0[2];
                 int rows1[2];
