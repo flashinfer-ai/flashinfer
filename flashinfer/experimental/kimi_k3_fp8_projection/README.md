@@ -46,9 +46,9 @@ that pins it ships the pair `..._tso_dpf` (16-byte-aligned output views) and
 launch argument.
 
 `decode_table.py` is the measured dispatch table
-(`"<n_tiles128>,<num_k_iters>,<m_bucket>"`, buckets `M <= 1 / 8 / 64 / 256` for
-every family and `M <= 4096 / 16384` for the families measured faster on the
-decode kernel than on the GEMM)
+(`"<n_tiles128>,<num_k_iters>,<m_bucket>"`, buckets `M <= 1 / 8 / 64 / 256 / 512 /
+1024 / 2048` for every family and `M <= 4096 / 16384` for 20 and 21 of the 22
+families)
 over the 22 representative families (TP8 and TP1 `q_proj`, `fused_qkvg`,
 `in_proj_qkvgfab`, `f_a`, `f_b`, `b_proj`, `kv_a`, `fused_qkv_a`, `q_b`,
 `kv_b`, `o_proj`): one table shared by SM100 and SM103 (`DECODE_TABLE`) plus
