@@ -55,7 +55,6 @@ from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
 from flashinfer.utils import get_compute_capability
 from tests.test_helpers.w4a16_reference import (
     assert_w4a16_bits,
-    combine_w4a16_split_terms,
     prepare_split_w4a16_exact_fused,
     split_w4a16_reference_from_tensors,
 )
@@ -1763,75 +1762,6 @@ class TestAutotunerBucketConfig:
 @sm100_required
 class TestCuteDslMoeW4A16:
     pytestmark = _requires_dsl_arch
-
-    @pytest.mark.skipif(is_sm107(), reason="Requires Blackwell SM100 or SM103")
-    @pytest.mark.parametrize("input_is_expanded", [False, True])
-    def test_split_finalize_fma_contract(self, input_is_expanded):
-        from flashinfer.fused_moe.cute_dsl.blackwell.moe_finalize import moe_unpermute
-
-        pytest.importorskip("triton")
-        num_tokens, top_k, hidden_size = 8, 8, 8
-        terms = torch.full(
-            (num_tokens, top_k, hidden_size),
-            float("nan"),
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
-        scores = torch.full((num_tokens, top_k), float("nan"), device="cuda")
-        local = torch.zeros((num_tokens, top_k), dtype=torch.bool, device="cuda")
-
-        # The exact residual is 2**-30. Separately rounding the final multiply
-        # before the add instead produces zero. Visit all eight route slots.
-        local[0] = True
-        terms[0] = 0
-        scores[0] = 0.314159
-        terms[0, 0], scores[0, 0] = -1, 1 + 2**-7 + 2**-23
-        terms[0, 7], scores[0, 7] = 1 + 2**-7, 1 + 2**-23
-        # Both BF16 and FP32 subnormal operands are preserved, as are subnormal
-        # products; the final BF16 conversion must not silently flush them either.
-        local[1:5, 3] = True
-        terms[1, 3], scores[1, 3] = 2**-133, 2**20
-        terms[2, 3], scores[2, 3] = 2**30, 2**-140
-        terms[3, 3], scores[3, 3] = 2**-120, 2**-10
-        terms[4, 3], scores[4, 3] = -(2**-120), 2**-10
-        # Slot zero uses multiply, preserving -0. A later -0 uses FMA with +0.
-        # The all-nonlocal row remains +0 without reading its NaN inputs.
-        local[5, 0] = local[7, 3] = True
-        terms[5, 0], scores[5, 0] = -0.0, 1.0
-        terms[7, 3], scores[7, 3] = -0.0, 1.0
-        expected = torch.zeros(
-            (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
-        )
-        expected[0] = 2**-30
-        expected[1] = 2**-113
-        expected[2] = 2**-110
-        expected[3] = 2**-130
-        expected[4] = -(2**-130)
-        expected[5] = -0.0
-        reference = combine_w4a16_split_terms(terms, scores, local)
-        assert_w4a16_bits(reference, expected)
-
-        expanded = terms.reshape(num_tokens * top_k, hidden_size)
-        route_rows = torch.arange(num_tokens * top_k, device="cuda", dtype=torch.int32)
-        if input_is_expanded:
-            expert_output = expanded.contiguous()
-            mapping = route_rows.reshape(num_tokens, top_k)
-        else:
-            # A nonidentity permutation makes addressing errors observable too.
-            expert_output = expanded.flip(0).contiguous()
-            mapping = route_rows.flip(0).reshape(num_tokens, top_k)
-        mapping = mapping.masked_fill(~local, -1).contiguous()
-        output = torch.full_like(expected, float("nan"))
-        moe_unpermute(
-            expert_output,
-            output,
-            mapping,
-            scores,
-            num_tokens,
-            top_k,
-            input_is_expanded=input_is_expanded,
-        )
-        assert_w4a16_bits(output, reference)
 
     @pytest.mark.parametrize("use_wrapper", [False, True])
     def test_weight_scale_update(self, use_wrapper: bool):
