@@ -69,7 +69,7 @@ _HOST_SITES = {
 # exactly; ``cake_ffi_checks.h``).  Transcribed by hand from the host (edit with any .view(torch.<dtype>) change at the launch sites; a drift fails at the first launch, not here): ``_admit_sparse_decode`` admits bf16 ``q``, an
 # fp8 e4m3 cache, int32 tables and a bf16 ``out``; ``hopper_msa_sparse_decode_attention`` passes
 # ``q.view(torch.uint32)`` and the ``uint8`` views of the two cache halves; ``_scratch`` allocates
-# uint32 / float32 / uint32 / uint32.  ``_admit_sparse_prefill`` admits the same dtypes and
+# uint32 / float32 / uint32.  ``_admit_sparse_prefill`` admits the same dtypes and
 # ``hopper_msa_sparse_attention`` passes ``Q=q`` beside ``Q32``, the cache halves as fp8 e4m3 views for
 # the v1 program and as uint8 views for v2 (``plan_sparse_prefill`` picks).  ``_admit_proxy_decode``
 # admits ``q`` and the index cache in one dtype (fp8 e4m3 or bf16, the route's first coordinate) and a
@@ -92,7 +92,6 @@ _HOST_DTYPES = {
         "part_o": _U32,
         "part_ml": _F32,
         "counters": _U32,
-        "done": _U32,
     },
     "prefill_v1": {
         "Q": _BF16,
@@ -252,13 +251,16 @@ def _host_bound_names(function_names: tuple[str, ...]) -> set[str]:
 
 
 def test_every_program_serves_exactly_one_route():
-    """``ROUTES`` names each registered program once; no program is unrouted."""
+    """``ROUTES`` names each registered program once; no program is unrouted; every record's plan is one
+    of the named plans."""
 
     assert jm.MODULES
     assert sorted(jm.ROUTES.values()) == sorted(jm.MODULES)
-    assert tuple(jm.MODULES) == jm.HOPPER_MSA_VARIANTS
     for route, name in jm.ROUTES.items():
         assert jm.route_program(route) == name
+    plans = list(jm._ARG_PLANS.values())
+    for name in _PROGRAMS:
+        assert any(jm.MODULES[name]["arg_plan"] is plan for plan in plans), name
 
 
 def test_every_route_family_has_a_host_binding_site():
@@ -331,7 +333,7 @@ def test_shared_bindings_serve_one_route_family_each():
     for binding, names in by_binding.items():
         routes = [next(r for r, n in jm.ROUTES.items() if n == name) for name in names]
         assert len({ch._route_family(route) for route in routes}) == 1, binding
-        plans = {tuple(_plan(name)) for name in names}
+        plans = {id(jm.MODULES[name]["arg_plan"]) for name in names}
         assert len(plans) == 1, f"{binding}: shared by programs of different plans"
         flags = [tuple(sorted(_defines(name).items())) for name in names]
         assert len(set(flags)) == len(flags), (
@@ -351,12 +353,12 @@ def test_shared_bindings_serve_one_route_family_each():
             assert "void CAKE_PROGRAM_KERNEL(" in (_CSRC / kernel).read_text(), kernel
 
 
-@pytest.mark.parametrize("name", _PROGRAMS)
-def test_plan_ends_in_the_grid_triple(name):
-    """The argument plan ends in the three grid scalars, names each argument once, places no grid
+@pytest.mark.parametrize("plan_name", sorted(jm._ARG_PLANS))
+def test_plan_ends_in_the_grid_triple(plan_name):
+    """Each named argument plan ends in the three grid scalars, names each argument once, places no grid
     entry elsewhere and carries no ``trace`` argument."""
 
-    plan = _plan(name)
+    plan = [(str(kind), str(argument)) for kind, argument in jm._ARG_PLANS[plan_name]]
     assert plan[-3:] == _grid_triple()
     assert all(kind != "grid" for kind, _argument in plan[:-3])
     names = [argument for _kind, argument in plan]
