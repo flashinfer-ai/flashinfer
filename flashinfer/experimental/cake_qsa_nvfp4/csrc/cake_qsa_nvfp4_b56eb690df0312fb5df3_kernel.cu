@@ -1560,7 +1560,7 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                     if (end > begin) {
                         n_heads = (end - 1 >> 7) - head_first + 1;
                     }
-                    if (num_splits > 16) {
+                    if (num_splits > 36) {
                         int n_lse = n_heads * num_splits;
                         #pragma unroll 1
                         for (int i = tid_0; i < n_lse; i += 128) {
@@ -2846,10 +2846,10 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 *(reinterpret_cast<unsigned int*>(out + out_offset) + (0)) = word[0];
                             }
                         }
-                    } else if (num_splits > 8) {
-                        float lse_1[16];
-                        float p0_1[16];
-                        float p1_1[16];
+                    } else if (num_splits > 16) {
+                        float lse_1[36];
+                        float p0_1[36];
+                        float p1_1[36];
                         float acc0_1[4];
                         float acc1_1[4];
                         float den_1[4];
@@ -2857,39 +2857,11 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                         if (num_splits <= 4) {
                             chunk_w_1 = num_splits;
                         }
-                        int cidx_1[16];
-                        int split_i = 0;
-                        cidx_1[0] = split_i / chunk_w_1;
-                        int split_i_0 = 1;
-                        cidx_1[1] = split_i_0 / chunk_w_1;
-                        int split_i_1 = 2;
-                        cidx_1[2] = split_i_1 / chunk_w_1;
-                        int split_i_2 = 3;
-                        cidx_1[3] = split_i_2 / chunk_w_1;
-                        int split_i_3 = 4;
-                        cidx_1[4] = split_i_3 / chunk_w_1;
-                        int split_i_4 = 5;
-                        cidx_1[5] = split_i_4 / chunk_w_1;
-                        int split_i_5 = 6;
-                        cidx_1[6] = split_i_5 / chunk_w_1;
-                        int split_i_6 = 7;
-                        cidx_1[7] = split_i_6 / chunk_w_1;
-                        int split_i_7 = 8;
-                        cidx_1[8] = split_i_7 / chunk_w_1;
-                        int split_i_8 = 9;
-                        cidx_1[9] = split_i_8 / chunk_w_1;
-                        int split_i_9 = 10;
-                        cidx_1[10] = split_i_9 / chunk_w_1;
-                        int split_i_10 = 11;
-                        cidx_1[11] = split_i_10 / chunk_w_1;
-                        int split_i_11 = 12;
-                        cidx_1[12] = split_i_11 / chunk_w_1;
-                        int split_i_12 = 13;
-                        cidx_1[13] = split_i_12 / chunk_w_1;
-                        int split_i_13 = 14;
-                        cidx_1[14] = split_i_13 / chunk_w_1;
-                        int split_i_14 = 15;
-                        cidx_1[15] = split_i_14 / chunk_w_1;
+                        int bound[4];
+                        bound[0] = chunk_w_1;
+                        bound[1] = chunk_w_1 * 2;
+                        bound[2] = chunk_w_1 * 3;
+                        bound[3] = chunk_w_1 * 4;
                         float lse_max_1[1];
                         int valid_1[1];
                         int tab_1[1];
@@ -3138,6 +3110,266 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 p0_1[15] = _vec_load_93[0];
                                 p1_1[15] = _vec_load_93[1];
                             }
+                            lse_1[16] = -CUDART_INF_F;
+                            if (num_splits > 16) {
+                                long long part_row_80 = 16 * split_pitch + row_head_1[0];
+                                lse_1[16] = partial_lse[part_row_80];
+                                float _vec_load_94[2];
+                                {
+                                    float2 _v2_200 = *reinterpret_cast<const float2*>(partial_out + (part_row_80 * 256 + dim_1[0]) + 0);
+                                    _vec_load_94[0] = _v2_200.x;
+                                    _vec_load_94[0 + 1] = _v2_200.y;
+                                }
+                                p0_1[16] = _vec_load_94[0];
+                                p1_1[16] = _vec_load_94[1];
+                            }
+                            lse_1[17] = -CUDART_INF_F;
+                            if (num_splits > 17) {
+                                long long part_row_81 = 17 * split_pitch + row_head_1[0];
+                                lse_1[17] = partial_lse[part_row_81];
+                                float _vec_load_95[2];
+                                {
+                                    float2 _v2_201 = *reinterpret_cast<const float2*>(partial_out + (part_row_81 * 256 + dim_1[0]) + 0);
+                                    _vec_load_95[0] = _v2_201.x;
+                                    _vec_load_95[0 + 1] = _v2_201.y;
+                                }
+                                p0_1[17] = _vec_load_95[0];
+                                p1_1[17] = _vec_load_95[1];
+                            }
+                            lse_1[18] = -CUDART_INF_F;
+                            if (num_splits > 18) {
+                                long long part_row_82 = 18 * split_pitch + row_head_1[0];
+                                lse_1[18] = partial_lse[part_row_82];
+                                float _vec_load_96[2];
+                                {
+                                    float2 _v2_202 = *reinterpret_cast<const float2*>(partial_out + (part_row_82 * 256 + dim_1[0]) + 0);
+                                    _vec_load_96[0] = _v2_202.x;
+                                    _vec_load_96[0 + 1] = _v2_202.y;
+                                }
+                                p0_1[18] = _vec_load_96[0];
+                                p1_1[18] = _vec_load_96[1];
+                            }
+                            lse_1[19] = -CUDART_INF_F;
+                            if (num_splits > 19) {
+                                long long part_row_83 = 19 * split_pitch + row_head_1[0];
+                                lse_1[19] = partial_lse[part_row_83];
+                                float _vec_load_97[2];
+                                {
+                                    float2 _v2_203 = *reinterpret_cast<const float2*>(partial_out + (part_row_83 * 256 + dim_1[0]) + 0);
+                                    _vec_load_97[0] = _v2_203.x;
+                                    _vec_load_97[0 + 1] = _v2_203.y;
+                                }
+                                p0_1[19] = _vec_load_97[0];
+                                p1_1[19] = _vec_load_97[1];
+                            }
+                            lse_1[20] = -CUDART_INF_F;
+                            if (num_splits > 20) {
+                                long long part_row_84 = 20 * split_pitch + row_head_1[0];
+                                lse_1[20] = partial_lse[part_row_84];
+                                float _vec_load_98[2];
+                                {
+                                    float2 _v2_204 = *reinterpret_cast<const float2*>(partial_out + (part_row_84 * 256 + dim_1[0]) + 0);
+                                    _vec_load_98[0] = _v2_204.x;
+                                    _vec_load_98[0 + 1] = _v2_204.y;
+                                }
+                                p0_1[20] = _vec_load_98[0];
+                                p1_1[20] = _vec_load_98[1];
+                            }
+                            lse_1[21] = -CUDART_INF_F;
+                            if (num_splits > 21) {
+                                long long part_row_85 = 21 * split_pitch + row_head_1[0];
+                                lse_1[21] = partial_lse[part_row_85];
+                                float _vec_load_99[2];
+                                {
+                                    float2 _v2_205 = *reinterpret_cast<const float2*>(partial_out + (part_row_85 * 256 + dim_1[0]) + 0);
+                                    _vec_load_99[0] = _v2_205.x;
+                                    _vec_load_99[0 + 1] = _v2_205.y;
+                                }
+                                p0_1[21] = _vec_load_99[0];
+                                p1_1[21] = _vec_load_99[1];
+                            }
+                            lse_1[22] = -CUDART_INF_F;
+                            if (num_splits > 22) {
+                                long long part_row_86 = 22 * split_pitch + row_head_1[0];
+                                lse_1[22] = partial_lse[part_row_86];
+                                float _vec_load_100[2];
+                                {
+                                    float2 _v2_206 = *reinterpret_cast<const float2*>(partial_out + (part_row_86 * 256 + dim_1[0]) + 0);
+                                    _vec_load_100[0] = _v2_206.x;
+                                    _vec_load_100[0 + 1] = _v2_206.y;
+                                }
+                                p0_1[22] = _vec_load_100[0];
+                                p1_1[22] = _vec_load_100[1];
+                            }
+                            lse_1[23] = -CUDART_INF_F;
+                            if (num_splits > 23) {
+                                long long part_row_87 = 23 * split_pitch + row_head_1[0];
+                                lse_1[23] = partial_lse[part_row_87];
+                                float _vec_load_101[2];
+                                {
+                                    float2 _v2_207 = *reinterpret_cast<const float2*>(partial_out + (part_row_87 * 256 + dim_1[0]) + 0);
+                                    _vec_load_101[0] = _v2_207.x;
+                                    _vec_load_101[0 + 1] = _v2_207.y;
+                                }
+                                p0_1[23] = _vec_load_101[0];
+                                p1_1[23] = _vec_load_101[1];
+                            }
+                            lse_1[24] = -CUDART_INF_F;
+                            if (num_splits > 24) {
+                                long long part_row_88 = 24 * split_pitch + row_head_1[0];
+                                lse_1[24] = partial_lse[part_row_88];
+                                float _vec_load_102[2];
+                                {
+                                    float2 _v2_208 = *reinterpret_cast<const float2*>(partial_out + (part_row_88 * 256 + dim_1[0]) + 0);
+                                    _vec_load_102[0] = _v2_208.x;
+                                    _vec_load_102[0 + 1] = _v2_208.y;
+                                }
+                                p0_1[24] = _vec_load_102[0];
+                                p1_1[24] = _vec_load_102[1];
+                            }
+                            lse_1[25] = -CUDART_INF_F;
+                            if (num_splits > 25) {
+                                long long part_row_89 = 25 * split_pitch + row_head_1[0];
+                                lse_1[25] = partial_lse[part_row_89];
+                                float _vec_load_103[2];
+                                {
+                                    float2 _v2_209 = *reinterpret_cast<const float2*>(partial_out + (part_row_89 * 256 + dim_1[0]) + 0);
+                                    _vec_load_103[0] = _v2_209.x;
+                                    _vec_load_103[0 + 1] = _v2_209.y;
+                                }
+                                p0_1[25] = _vec_load_103[0];
+                                p1_1[25] = _vec_load_103[1];
+                            }
+                            lse_1[26] = -CUDART_INF_F;
+                            if (num_splits > 26) {
+                                long long part_row_90 = 26 * split_pitch + row_head_1[0];
+                                lse_1[26] = partial_lse[part_row_90];
+                                float _vec_load_104[2];
+                                {
+                                    float2 _v2_210 = *reinterpret_cast<const float2*>(partial_out + (part_row_90 * 256 + dim_1[0]) + 0);
+                                    _vec_load_104[0] = _v2_210.x;
+                                    _vec_load_104[0 + 1] = _v2_210.y;
+                                }
+                                p0_1[26] = _vec_load_104[0];
+                                p1_1[26] = _vec_load_104[1];
+                            }
+                            lse_1[27] = -CUDART_INF_F;
+                            if (num_splits > 27) {
+                                long long part_row_91 = 27 * split_pitch + row_head_1[0];
+                                lse_1[27] = partial_lse[part_row_91];
+                                float _vec_load_105[2];
+                                {
+                                    float2 _v2_211 = *reinterpret_cast<const float2*>(partial_out + (part_row_91 * 256 + dim_1[0]) + 0);
+                                    _vec_load_105[0] = _v2_211.x;
+                                    _vec_load_105[0 + 1] = _v2_211.y;
+                                }
+                                p0_1[27] = _vec_load_105[0];
+                                p1_1[27] = _vec_load_105[1];
+                            }
+                            lse_1[28] = -CUDART_INF_F;
+                            if (num_splits > 28) {
+                                long long part_row_92 = 28 * split_pitch + row_head_1[0];
+                                lse_1[28] = partial_lse[part_row_92];
+                                float _vec_load_106[2];
+                                {
+                                    float2 _v2_212 = *reinterpret_cast<const float2*>(partial_out + (part_row_92 * 256 + dim_1[0]) + 0);
+                                    _vec_load_106[0] = _v2_212.x;
+                                    _vec_load_106[0 + 1] = _v2_212.y;
+                                }
+                                p0_1[28] = _vec_load_106[0];
+                                p1_1[28] = _vec_load_106[1];
+                            }
+                            lse_1[29] = -CUDART_INF_F;
+                            if (num_splits > 29) {
+                                long long part_row_93 = 29 * split_pitch + row_head_1[0];
+                                lse_1[29] = partial_lse[part_row_93];
+                                float _vec_load_107[2];
+                                {
+                                    float2 _v2_213 = *reinterpret_cast<const float2*>(partial_out + (part_row_93 * 256 + dim_1[0]) + 0);
+                                    _vec_load_107[0] = _v2_213.x;
+                                    _vec_load_107[0 + 1] = _v2_213.y;
+                                }
+                                p0_1[29] = _vec_load_107[0];
+                                p1_1[29] = _vec_load_107[1];
+                            }
+                            lse_1[30] = -CUDART_INF_F;
+                            if (num_splits > 30) {
+                                long long part_row_94 = 30 * split_pitch + row_head_1[0];
+                                lse_1[30] = partial_lse[part_row_94];
+                                float _vec_load_108[2];
+                                {
+                                    float2 _v2_214 = *reinterpret_cast<const float2*>(partial_out + (part_row_94 * 256 + dim_1[0]) + 0);
+                                    _vec_load_108[0] = _v2_214.x;
+                                    _vec_load_108[0 + 1] = _v2_214.y;
+                                }
+                                p0_1[30] = _vec_load_108[0];
+                                p1_1[30] = _vec_load_108[1];
+                            }
+                            lse_1[31] = -CUDART_INF_F;
+                            if (num_splits > 31) {
+                                long long part_row_95 = 31 * split_pitch + row_head_1[0];
+                                lse_1[31] = partial_lse[part_row_95];
+                                float _vec_load_109[2];
+                                {
+                                    float2 _v2_215 = *reinterpret_cast<const float2*>(partial_out + (part_row_95 * 256 + dim_1[0]) + 0);
+                                    _vec_load_109[0] = _v2_215.x;
+                                    _vec_load_109[0 + 1] = _v2_215.y;
+                                }
+                                p0_1[31] = _vec_load_109[0];
+                                p1_1[31] = _vec_load_109[1];
+                            }
+                            lse_1[32] = -CUDART_INF_F;
+                            if (num_splits > 32) {
+                                long long part_row_96 = 32 * split_pitch + row_head_1[0];
+                                lse_1[32] = partial_lse[part_row_96];
+                                float _vec_load_110[2];
+                                {
+                                    float2 _v2_216 = *reinterpret_cast<const float2*>(partial_out + (part_row_96 * 256 + dim_1[0]) + 0);
+                                    _vec_load_110[0] = _v2_216.x;
+                                    _vec_load_110[0 + 1] = _v2_216.y;
+                                }
+                                p0_1[32] = _vec_load_110[0];
+                                p1_1[32] = _vec_load_110[1];
+                            }
+                            lse_1[33] = -CUDART_INF_F;
+                            if (num_splits > 33) {
+                                long long part_row_97 = 33 * split_pitch + row_head_1[0];
+                                lse_1[33] = partial_lse[part_row_97];
+                                float _vec_load_111[2];
+                                {
+                                    float2 _v2_217 = *reinterpret_cast<const float2*>(partial_out + (part_row_97 * 256 + dim_1[0]) + 0);
+                                    _vec_load_111[0] = _v2_217.x;
+                                    _vec_load_111[0 + 1] = _v2_217.y;
+                                }
+                                p0_1[33] = _vec_load_111[0];
+                                p1_1[33] = _vec_load_111[1];
+                            }
+                            lse_1[34] = -CUDART_INF_F;
+                            if (num_splits > 34) {
+                                long long part_row_98 = 34 * split_pitch + row_head_1[0];
+                                lse_1[34] = partial_lse[part_row_98];
+                                float _vec_load_112[2];
+                                {
+                                    float2 _v2_218 = *reinterpret_cast<const float2*>(partial_out + (part_row_98 * 256 + dim_1[0]) + 0);
+                                    _vec_load_112[0] = _v2_218.x;
+                                    _vec_load_112[0 + 1] = _v2_218.y;
+                                }
+                                p0_1[34] = _vec_load_112[0];
+                                p1_1[34] = _vec_load_112[1];
+                            }
+                            lse_1[35] = -CUDART_INF_F;
+                            if (num_splits > 35) {
+                                long long part_row_99 = 35 * split_pitch + row_head_1[0];
+                                lse_1[35] = partial_lse[part_row_99];
+                                float _vec_load_113[2];
+                                {
+                                    float2 _v2_219 = *reinterpret_cast<const float2*>(partial_out + (part_row_99 * 256 + dim_1[0]) + 0);
+                                    _vec_load_113[0] = _v2_219.x;
+                                    _vec_load_113[0 + 1] = _v2_219.y;
+                                }
+                                p0_1[35] = _vec_load_113[0];
+                                p1_1[35] = _vec_load_113[1];
+                            }
                             lse_max_1[0] = fmaxf(lse_max_1[0], lse_1[0]);
                             lse_max_1[0] = fmaxf(lse_max_1[0], lse_1[1]);
                             lse_max_1[0] = fmaxf(lse_max_1[0], lse_1[2]);
@@ -3154,388 +3386,852 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                             lse_max_1[0] = fmaxf(lse_max_1[0], lse_1[13]);
                             lse_max_1[0] = fmaxf(lse_max_1[0], lse_1[14]);
                             lse_max_1[0] = fmaxf(lse_max_1[0], lse_1[15]);
+                            lse_max_1[0] = fmaxf(lse_max_1[0], lse_1[16]);
+                            lse_max_1[0] = fmaxf(lse_max_1[0], lse_1[17]);
+                            lse_max_1[0] = fmaxf(lse_max_1[0], lse_1[18]);
+                            lse_max_1[0] = fmaxf(lse_max_1[0], lse_1[19]);
+                            lse_max_1[0] = fmaxf(lse_max_1[0], lse_1[20]);
+                            lse_max_1[0] = fmaxf(lse_max_1[0], lse_1[21]);
+                            lse_max_1[0] = fmaxf(lse_max_1[0], lse_1[22]);
+                            lse_max_1[0] = fmaxf(lse_max_1[0], lse_1[23]);
+                            lse_max_1[0] = fmaxf(lse_max_1[0], lse_1[24]);
+                            lse_max_1[0] = fmaxf(lse_max_1[0], lse_1[25]);
+                            lse_max_1[0] = fmaxf(lse_max_1[0], lse_1[26]);
+                            lse_max_1[0] = fmaxf(lse_max_1[0], lse_1[27]);
+                            lse_max_1[0] = fmaxf(lse_max_1[0], lse_1[28]);
+                            lse_max_1[0] = fmaxf(lse_max_1[0], lse_1[29]);
+                            lse_max_1[0] = fmaxf(lse_max_1[0], lse_1[30]);
+                            lse_max_1[0] = fmaxf(lse_max_1[0], lse_1[31]);
+                            lse_max_1[0] = fmaxf(lse_max_1[0], lse_1[32]);
+                            lse_max_1[0] = fmaxf(lse_max_1[0], lse_1[33]);
+                            lse_max_1[0] = fmaxf(lse_max_1[0], lse_1[34]);
+                            lse_max_1[0] = fmaxf(lse_max_1[0], lse_1[35]);
                             bool live_18 = num_splits > 0 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_18) {
                                 float weight_64 = approx_exp2(lse_1[0] - lse_max_1[0]);
-                                if (cidx_1[0] == 0) {
+                                if (bound[0] > 0) {
                                     den_1[0] = den_1[0] + weight_64;
                                     acc0_1[0] = __fmaf_rn(weight_64, p0_1[0], acc0_1[0]);
                                     acc1_1[0] = __fmaf_rn(weight_64, p1_1[0], acc1_1[0]);
-                                }
-                                if (cidx_1[0] == 1) {
+                                } else if (bound[1] > 0) {
                                     den_1[1] = den_1[1] + weight_64;
                                     acc0_1[1] = __fmaf_rn(weight_64, p0_1[0], acc0_1[1]);
                                     acc1_1[1] = __fmaf_rn(weight_64, p1_1[0], acc1_1[1]);
-                                }
-                                if (cidx_1[0] == 2) {
-                                    den_1[2] = den_1[2] + weight_64;
-                                    acc0_1[2] = __fmaf_rn(weight_64, p0_1[0], acc0_1[2]);
-                                    acc1_1[2] = __fmaf_rn(weight_64, p1_1[0], acc1_1[2]);
-                                }
-                                if (cidx_1[0] == 3) {
-                                    den_1[3] = den_1[3] + weight_64;
-                                    acc0_1[3] = __fmaf_rn(weight_64, p0_1[0], acc0_1[3]);
-                                    acc1_1[3] = __fmaf_rn(weight_64, p1_1[0], acc1_1[3]);
+                                } else {
+                                    if (bound[2] > 0) {
+                                        den_1[2] = den_1[2] + weight_64;
+                                        acc0_1[2] = __fmaf_rn(weight_64, p0_1[0], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_64, p1_1[0], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_64;
+                                        acc0_1[3] = __fmaf_rn(weight_64, p0_1[0], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_64, p1_1[0], acc1_1[3]);
+                                    }
                                 }
                             }
                             bool live_1_4 = num_splits > 1 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_1_4) {
                                 float weight_65 = approx_exp2(lse_1[1] - lse_max_1[0]);
-                                if (cidx_1[1] == 0) {
+                                if (bound[0] > 1) {
                                     den_1[0] = den_1[0] + weight_65;
                                     acc0_1[0] = __fmaf_rn(weight_65, p0_1[1], acc0_1[0]);
                                     acc1_1[0] = __fmaf_rn(weight_65, p1_1[1], acc1_1[0]);
-                                }
-                                if (cidx_1[1] == 1) {
+                                } else if (bound[1] > 1) {
                                     den_1[1] = den_1[1] + weight_65;
                                     acc0_1[1] = __fmaf_rn(weight_65, p0_1[1], acc0_1[1]);
                                     acc1_1[1] = __fmaf_rn(weight_65, p1_1[1], acc1_1[1]);
-                                }
-                                if (cidx_1[1] == 2) {
-                                    den_1[2] = den_1[2] + weight_65;
-                                    acc0_1[2] = __fmaf_rn(weight_65, p0_1[1], acc0_1[2]);
-                                    acc1_1[2] = __fmaf_rn(weight_65, p1_1[1], acc1_1[2]);
-                                }
-                                if (cidx_1[1] == 3) {
-                                    den_1[3] = den_1[3] + weight_65;
-                                    acc0_1[3] = __fmaf_rn(weight_65, p0_1[1], acc0_1[3]);
-                                    acc1_1[3] = __fmaf_rn(weight_65, p1_1[1], acc1_1[3]);
+                                } else {
+                                    if (bound[2] > 1) {
+                                        den_1[2] = den_1[2] + weight_65;
+                                        acc0_1[2] = __fmaf_rn(weight_65, p0_1[1], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_65, p1_1[1], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_65;
+                                        acc0_1[3] = __fmaf_rn(weight_65, p0_1[1], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_65, p1_1[1], acc1_1[3]);
+                                    }
                                 }
                             }
                             bool live_2_4 = num_splits > 2 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_2_4) {
                                 float weight_66 = approx_exp2(lse_1[2] - lse_max_1[0]);
-                                if (cidx_1[2] == 0) {
+                                if (bound[0] > 2) {
                                     den_1[0] = den_1[0] + weight_66;
                                     acc0_1[0] = __fmaf_rn(weight_66, p0_1[2], acc0_1[0]);
                                     acc1_1[0] = __fmaf_rn(weight_66, p1_1[2], acc1_1[0]);
-                                }
-                                if (cidx_1[2] == 1) {
+                                } else if (bound[1] > 2) {
                                     den_1[1] = den_1[1] + weight_66;
                                     acc0_1[1] = __fmaf_rn(weight_66, p0_1[2], acc0_1[1]);
                                     acc1_1[1] = __fmaf_rn(weight_66, p1_1[2], acc1_1[1]);
-                                }
-                                if (cidx_1[2] == 2) {
-                                    den_1[2] = den_1[2] + weight_66;
-                                    acc0_1[2] = __fmaf_rn(weight_66, p0_1[2], acc0_1[2]);
-                                    acc1_1[2] = __fmaf_rn(weight_66, p1_1[2], acc1_1[2]);
-                                }
-                                if (cidx_1[2] == 3) {
-                                    den_1[3] = den_1[3] + weight_66;
-                                    acc0_1[3] = __fmaf_rn(weight_66, p0_1[2], acc0_1[3]);
-                                    acc1_1[3] = __fmaf_rn(weight_66, p1_1[2], acc1_1[3]);
+                                } else {
+                                    if (bound[2] > 2) {
+                                        den_1[2] = den_1[2] + weight_66;
+                                        acc0_1[2] = __fmaf_rn(weight_66, p0_1[2], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_66, p1_1[2], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_66;
+                                        acc0_1[3] = __fmaf_rn(weight_66, p0_1[2], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_66, p1_1[2], acc1_1[3]);
+                                    }
                                 }
                             }
                             bool live_3_4 = num_splits > 3 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_3_4) {
                                 float weight_67 = approx_exp2(lse_1[3] - lse_max_1[0]);
-                                if (cidx_1[3] == 0) {
+                                if (bound[0] > 3) {
                                     den_1[0] = den_1[0] + weight_67;
                                     acc0_1[0] = __fmaf_rn(weight_67, p0_1[3], acc0_1[0]);
                                     acc1_1[0] = __fmaf_rn(weight_67, p1_1[3], acc1_1[0]);
-                                }
-                                if (cidx_1[3] == 1) {
+                                } else if (bound[1] > 3) {
                                     den_1[1] = den_1[1] + weight_67;
                                     acc0_1[1] = __fmaf_rn(weight_67, p0_1[3], acc0_1[1]);
                                     acc1_1[1] = __fmaf_rn(weight_67, p1_1[3], acc1_1[1]);
-                                }
-                                if (cidx_1[3] == 2) {
-                                    den_1[2] = den_1[2] + weight_67;
-                                    acc0_1[2] = __fmaf_rn(weight_67, p0_1[3], acc0_1[2]);
-                                    acc1_1[2] = __fmaf_rn(weight_67, p1_1[3], acc1_1[2]);
-                                }
-                                if (cidx_1[3] == 3) {
-                                    den_1[3] = den_1[3] + weight_67;
-                                    acc0_1[3] = __fmaf_rn(weight_67, p0_1[3], acc0_1[3]);
-                                    acc1_1[3] = __fmaf_rn(weight_67, p1_1[3], acc1_1[3]);
+                                } else {
+                                    if (bound[2] > 3) {
+                                        den_1[2] = den_1[2] + weight_67;
+                                        acc0_1[2] = __fmaf_rn(weight_67, p0_1[3], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_67, p1_1[3], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_67;
+                                        acc0_1[3] = __fmaf_rn(weight_67, p0_1[3], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_67, p1_1[3], acc1_1[3]);
+                                    }
                                 }
                             }
                             bool live_4_4 = num_splits > 4 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_4_4) {
                                 float weight_68 = approx_exp2(lse_1[4] - lse_max_1[0]);
-                                if (cidx_1[4] == 0) {
+                                if (bound[0] > 4) {
                                     den_1[0] = den_1[0] + weight_68;
                                     acc0_1[0] = __fmaf_rn(weight_68, p0_1[4], acc0_1[0]);
                                     acc1_1[0] = __fmaf_rn(weight_68, p1_1[4], acc1_1[0]);
-                                }
-                                if (cidx_1[4] == 1) {
+                                } else if (bound[1] > 4) {
                                     den_1[1] = den_1[1] + weight_68;
                                     acc0_1[1] = __fmaf_rn(weight_68, p0_1[4], acc0_1[1]);
                                     acc1_1[1] = __fmaf_rn(weight_68, p1_1[4], acc1_1[1]);
-                                }
-                                if (cidx_1[4] == 2) {
-                                    den_1[2] = den_1[2] + weight_68;
-                                    acc0_1[2] = __fmaf_rn(weight_68, p0_1[4], acc0_1[2]);
-                                    acc1_1[2] = __fmaf_rn(weight_68, p1_1[4], acc1_1[2]);
-                                }
-                                if (cidx_1[4] == 3) {
-                                    den_1[3] = den_1[3] + weight_68;
-                                    acc0_1[3] = __fmaf_rn(weight_68, p0_1[4], acc0_1[3]);
-                                    acc1_1[3] = __fmaf_rn(weight_68, p1_1[4], acc1_1[3]);
+                                } else {
+                                    if (bound[2] > 4) {
+                                        den_1[2] = den_1[2] + weight_68;
+                                        acc0_1[2] = __fmaf_rn(weight_68, p0_1[4], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_68, p1_1[4], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_68;
+                                        acc0_1[3] = __fmaf_rn(weight_68, p0_1[4], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_68, p1_1[4], acc1_1[3]);
+                                    }
                                 }
                             }
                             bool live_5_4 = num_splits > 5 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_5_4) {
                                 float weight_69 = approx_exp2(lse_1[5] - lse_max_1[0]);
-                                if (cidx_1[5] == 0) {
+                                if (bound[0] > 5) {
                                     den_1[0] = den_1[0] + weight_69;
                                     acc0_1[0] = __fmaf_rn(weight_69, p0_1[5], acc0_1[0]);
                                     acc1_1[0] = __fmaf_rn(weight_69, p1_1[5], acc1_1[0]);
-                                }
-                                if (cidx_1[5] == 1) {
+                                } else if (bound[1] > 5) {
                                     den_1[1] = den_1[1] + weight_69;
                                     acc0_1[1] = __fmaf_rn(weight_69, p0_1[5], acc0_1[1]);
                                     acc1_1[1] = __fmaf_rn(weight_69, p1_1[5], acc1_1[1]);
-                                }
-                                if (cidx_1[5] == 2) {
-                                    den_1[2] = den_1[2] + weight_69;
-                                    acc0_1[2] = __fmaf_rn(weight_69, p0_1[5], acc0_1[2]);
-                                    acc1_1[2] = __fmaf_rn(weight_69, p1_1[5], acc1_1[2]);
-                                }
-                                if (cidx_1[5] == 3) {
-                                    den_1[3] = den_1[3] + weight_69;
-                                    acc0_1[3] = __fmaf_rn(weight_69, p0_1[5], acc0_1[3]);
-                                    acc1_1[3] = __fmaf_rn(weight_69, p1_1[5], acc1_1[3]);
+                                } else {
+                                    if (bound[2] > 5) {
+                                        den_1[2] = den_1[2] + weight_69;
+                                        acc0_1[2] = __fmaf_rn(weight_69, p0_1[5], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_69, p1_1[5], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_69;
+                                        acc0_1[3] = __fmaf_rn(weight_69, p0_1[5], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_69, p1_1[5], acc1_1[3]);
+                                    }
                                 }
                             }
                             bool live_6_4 = num_splits > 6 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_6_4) {
                                 float weight_70 = approx_exp2(lse_1[6] - lse_max_1[0]);
-                                if (cidx_1[6] == 0) {
+                                if (bound[0] > 6) {
                                     den_1[0] = den_1[0] + weight_70;
                                     acc0_1[0] = __fmaf_rn(weight_70, p0_1[6], acc0_1[0]);
                                     acc1_1[0] = __fmaf_rn(weight_70, p1_1[6], acc1_1[0]);
-                                }
-                                if (cidx_1[6] == 1) {
+                                } else if (bound[1] > 6) {
                                     den_1[1] = den_1[1] + weight_70;
                                     acc0_1[1] = __fmaf_rn(weight_70, p0_1[6], acc0_1[1]);
                                     acc1_1[1] = __fmaf_rn(weight_70, p1_1[6], acc1_1[1]);
-                                }
-                                if (cidx_1[6] == 2) {
-                                    den_1[2] = den_1[2] + weight_70;
-                                    acc0_1[2] = __fmaf_rn(weight_70, p0_1[6], acc0_1[2]);
-                                    acc1_1[2] = __fmaf_rn(weight_70, p1_1[6], acc1_1[2]);
-                                }
-                                if (cidx_1[6] == 3) {
-                                    den_1[3] = den_1[3] + weight_70;
-                                    acc0_1[3] = __fmaf_rn(weight_70, p0_1[6], acc0_1[3]);
-                                    acc1_1[3] = __fmaf_rn(weight_70, p1_1[6], acc1_1[3]);
+                                } else {
+                                    if (bound[2] > 6) {
+                                        den_1[2] = den_1[2] + weight_70;
+                                        acc0_1[2] = __fmaf_rn(weight_70, p0_1[6], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_70, p1_1[6], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_70;
+                                        acc0_1[3] = __fmaf_rn(weight_70, p0_1[6], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_70, p1_1[6], acc1_1[3]);
+                                    }
                                 }
                             }
                             bool live_7_4 = num_splits > 7 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_7_4) {
                                 float weight_71 = approx_exp2(lse_1[7] - lse_max_1[0]);
-                                if (cidx_1[7] == 0) {
+                                if (bound[0] > 7) {
                                     den_1[0] = den_1[0] + weight_71;
                                     acc0_1[0] = __fmaf_rn(weight_71, p0_1[7], acc0_1[0]);
                                     acc1_1[0] = __fmaf_rn(weight_71, p1_1[7], acc1_1[0]);
-                                }
-                                if (cidx_1[7] == 1) {
+                                } else if (bound[1] > 7) {
                                     den_1[1] = den_1[1] + weight_71;
                                     acc0_1[1] = __fmaf_rn(weight_71, p0_1[7], acc0_1[1]);
                                     acc1_1[1] = __fmaf_rn(weight_71, p1_1[7], acc1_1[1]);
-                                }
-                                if (cidx_1[7] == 2) {
-                                    den_1[2] = den_1[2] + weight_71;
-                                    acc0_1[2] = __fmaf_rn(weight_71, p0_1[7], acc0_1[2]);
-                                    acc1_1[2] = __fmaf_rn(weight_71, p1_1[7], acc1_1[2]);
-                                }
-                                if (cidx_1[7] == 3) {
-                                    den_1[3] = den_1[3] + weight_71;
-                                    acc0_1[3] = __fmaf_rn(weight_71, p0_1[7], acc0_1[3]);
-                                    acc1_1[3] = __fmaf_rn(weight_71, p1_1[7], acc1_1[3]);
+                                } else {
+                                    if (bound[2] > 7) {
+                                        den_1[2] = den_1[2] + weight_71;
+                                        acc0_1[2] = __fmaf_rn(weight_71, p0_1[7], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_71, p1_1[7], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_71;
+                                        acc0_1[3] = __fmaf_rn(weight_71, p0_1[7], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_71, p1_1[7], acc1_1[3]);
+                                    }
                                 }
                             }
                             bool live_8_4 = num_splits > 8 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_8_4) {
                                 float weight_72 = approx_exp2(lse_1[8] - lse_max_1[0]);
-                                if (cidx_1[8] == 0) {
+                                if (bound[0] > 8) {
                                     den_1[0] = den_1[0] + weight_72;
                                     acc0_1[0] = __fmaf_rn(weight_72, p0_1[8], acc0_1[0]);
                                     acc1_1[0] = __fmaf_rn(weight_72, p1_1[8], acc1_1[0]);
-                                }
-                                if (cidx_1[8] == 1) {
+                                } else if (bound[1] > 8) {
                                     den_1[1] = den_1[1] + weight_72;
                                     acc0_1[1] = __fmaf_rn(weight_72, p0_1[8], acc0_1[1]);
                                     acc1_1[1] = __fmaf_rn(weight_72, p1_1[8], acc1_1[1]);
-                                }
-                                if (cidx_1[8] == 2) {
-                                    den_1[2] = den_1[2] + weight_72;
-                                    acc0_1[2] = __fmaf_rn(weight_72, p0_1[8], acc0_1[2]);
-                                    acc1_1[2] = __fmaf_rn(weight_72, p1_1[8], acc1_1[2]);
-                                }
-                                if (cidx_1[8] == 3) {
-                                    den_1[3] = den_1[3] + weight_72;
-                                    acc0_1[3] = __fmaf_rn(weight_72, p0_1[8], acc0_1[3]);
-                                    acc1_1[3] = __fmaf_rn(weight_72, p1_1[8], acc1_1[3]);
+                                } else {
+                                    if (bound[2] > 8) {
+                                        den_1[2] = den_1[2] + weight_72;
+                                        acc0_1[2] = __fmaf_rn(weight_72, p0_1[8], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_72, p1_1[8], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_72;
+                                        acc0_1[3] = __fmaf_rn(weight_72, p0_1[8], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_72, p1_1[8], acc1_1[3]);
+                                    }
                                 }
                             }
                             bool live_9_4 = num_splits > 9 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_9_4) {
                                 float weight_73 = approx_exp2(lse_1[9] - lse_max_1[0]);
-                                if (cidx_1[9] == 0) {
+                                if (bound[0] > 9) {
                                     den_1[0] = den_1[0] + weight_73;
                                     acc0_1[0] = __fmaf_rn(weight_73, p0_1[9], acc0_1[0]);
                                     acc1_1[0] = __fmaf_rn(weight_73, p1_1[9], acc1_1[0]);
-                                }
-                                if (cidx_1[9] == 1) {
+                                } else if (bound[1] > 9) {
                                     den_1[1] = den_1[1] + weight_73;
                                     acc0_1[1] = __fmaf_rn(weight_73, p0_1[9], acc0_1[1]);
                                     acc1_1[1] = __fmaf_rn(weight_73, p1_1[9], acc1_1[1]);
-                                }
-                                if (cidx_1[9] == 2) {
-                                    den_1[2] = den_1[2] + weight_73;
-                                    acc0_1[2] = __fmaf_rn(weight_73, p0_1[9], acc0_1[2]);
-                                    acc1_1[2] = __fmaf_rn(weight_73, p1_1[9], acc1_1[2]);
-                                }
-                                if (cidx_1[9] == 3) {
-                                    den_1[3] = den_1[3] + weight_73;
-                                    acc0_1[3] = __fmaf_rn(weight_73, p0_1[9], acc0_1[3]);
-                                    acc1_1[3] = __fmaf_rn(weight_73, p1_1[9], acc1_1[3]);
+                                } else {
+                                    if (bound[2] > 9) {
+                                        den_1[2] = den_1[2] + weight_73;
+                                        acc0_1[2] = __fmaf_rn(weight_73, p0_1[9], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_73, p1_1[9], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_73;
+                                        acc0_1[3] = __fmaf_rn(weight_73, p0_1[9], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_73, p1_1[9], acc1_1[3]);
+                                    }
                                 }
                             }
                             bool live_10_4 = num_splits > 10 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_10_4) {
                                 float weight_74 = approx_exp2(lse_1[10] - lse_max_1[0]);
-                                if (cidx_1[10] == 0) {
+                                if (bound[0] > 10) {
                                     den_1[0] = den_1[0] + weight_74;
                                     acc0_1[0] = __fmaf_rn(weight_74, p0_1[10], acc0_1[0]);
                                     acc1_1[0] = __fmaf_rn(weight_74, p1_1[10], acc1_1[0]);
-                                }
-                                if (cidx_1[10] == 1) {
+                                } else if (bound[1] > 10) {
                                     den_1[1] = den_1[1] + weight_74;
                                     acc0_1[1] = __fmaf_rn(weight_74, p0_1[10], acc0_1[1]);
                                     acc1_1[1] = __fmaf_rn(weight_74, p1_1[10], acc1_1[1]);
-                                }
-                                if (cidx_1[10] == 2) {
-                                    den_1[2] = den_1[2] + weight_74;
-                                    acc0_1[2] = __fmaf_rn(weight_74, p0_1[10], acc0_1[2]);
-                                    acc1_1[2] = __fmaf_rn(weight_74, p1_1[10], acc1_1[2]);
-                                }
-                                if (cidx_1[10] == 3) {
-                                    den_1[3] = den_1[3] + weight_74;
-                                    acc0_1[3] = __fmaf_rn(weight_74, p0_1[10], acc0_1[3]);
-                                    acc1_1[3] = __fmaf_rn(weight_74, p1_1[10], acc1_1[3]);
+                                } else {
+                                    if (bound[2] > 10) {
+                                        den_1[2] = den_1[2] + weight_74;
+                                        acc0_1[2] = __fmaf_rn(weight_74, p0_1[10], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_74, p1_1[10], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_74;
+                                        acc0_1[3] = __fmaf_rn(weight_74, p0_1[10], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_74, p1_1[10], acc1_1[3]);
+                                    }
                                 }
                             }
                             bool live_11_4 = num_splits > 11 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_11_4) {
                                 float weight_75 = approx_exp2(lse_1[11] - lse_max_1[0]);
-                                if (cidx_1[11] == 0) {
+                                if (bound[0] > 11) {
                                     den_1[0] = den_1[0] + weight_75;
                                     acc0_1[0] = __fmaf_rn(weight_75, p0_1[11], acc0_1[0]);
                                     acc1_1[0] = __fmaf_rn(weight_75, p1_1[11], acc1_1[0]);
-                                }
-                                if (cidx_1[11] == 1) {
+                                } else if (bound[1] > 11) {
                                     den_1[1] = den_1[1] + weight_75;
                                     acc0_1[1] = __fmaf_rn(weight_75, p0_1[11], acc0_1[1]);
                                     acc1_1[1] = __fmaf_rn(weight_75, p1_1[11], acc1_1[1]);
-                                }
-                                if (cidx_1[11] == 2) {
-                                    den_1[2] = den_1[2] + weight_75;
-                                    acc0_1[2] = __fmaf_rn(weight_75, p0_1[11], acc0_1[2]);
-                                    acc1_1[2] = __fmaf_rn(weight_75, p1_1[11], acc1_1[2]);
-                                }
-                                if (cidx_1[11] == 3) {
-                                    den_1[3] = den_1[3] + weight_75;
-                                    acc0_1[3] = __fmaf_rn(weight_75, p0_1[11], acc0_1[3]);
-                                    acc1_1[3] = __fmaf_rn(weight_75, p1_1[11], acc1_1[3]);
+                                } else {
+                                    if (bound[2] > 11) {
+                                        den_1[2] = den_1[2] + weight_75;
+                                        acc0_1[2] = __fmaf_rn(weight_75, p0_1[11], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_75, p1_1[11], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_75;
+                                        acc0_1[3] = __fmaf_rn(weight_75, p0_1[11], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_75, p1_1[11], acc1_1[3]);
+                                    }
                                 }
                             }
                             bool live_12_4 = num_splits > 12 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_12_4) {
                                 float weight_76 = approx_exp2(lse_1[12] - lse_max_1[0]);
-                                if (cidx_1[12] == 0) {
+                                if (bound[0] > 12) {
                                     den_1[0] = den_1[0] + weight_76;
                                     acc0_1[0] = __fmaf_rn(weight_76, p0_1[12], acc0_1[0]);
                                     acc1_1[0] = __fmaf_rn(weight_76, p1_1[12], acc1_1[0]);
-                                }
-                                if (cidx_1[12] == 1) {
+                                } else if (bound[1] > 12) {
                                     den_1[1] = den_1[1] + weight_76;
                                     acc0_1[1] = __fmaf_rn(weight_76, p0_1[12], acc0_1[1]);
                                     acc1_1[1] = __fmaf_rn(weight_76, p1_1[12], acc1_1[1]);
-                                }
-                                if (cidx_1[12] == 2) {
-                                    den_1[2] = den_1[2] + weight_76;
-                                    acc0_1[2] = __fmaf_rn(weight_76, p0_1[12], acc0_1[2]);
-                                    acc1_1[2] = __fmaf_rn(weight_76, p1_1[12], acc1_1[2]);
-                                }
-                                if (cidx_1[12] == 3) {
-                                    den_1[3] = den_1[3] + weight_76;
-                                    acc0_1[3] = __fmaf_rn(weight_76, p0_1[12], acc0_1[3]);
-                                    acc1_1[3] = __fmaf_rn(weight_76, p1_1[12], acc1_1[3]);
+                                } else {
+                                    if (bound[2] > 12) {
+                                        den_1[2] = den_1[2] + weight_76;
+                                        acc0_1[2] = __fmaf_rn(weight_76, p0_1[12], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_76, p1_1[12], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_76;
+                                        acc0_1[3] = __fmaf_rn(weight_76, p0_1[12], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_76, p1_1[12], acc1_1[3]);
+                                    }
                                 }
                             }
                             bool live_13_4 = num_splits > 13 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_13_4) {
                                 float weight_77 = approx_exp2(lse_1[13] - lse_max_1[0]);
-                                if (cidx_1[13] == 0) {
+                                if (bound[0] > 13) {
                                     den_1[0] = den_1[0] + weight_77;
                                     acc0_1[0] = __fmaf_rn(weight_77, p0_1[13], acc0_1[0]);
                                     acc1_1[0] = __fmaf_rn(weight_77, p1_1[13], acc1_1[0]);
-                                }
-                                if (cidx_1[13] == 1) {
+                                } else if (bound[1] > 13) {
                                     den_1[1] = den_1[1] + weight_77;
                                     acc0_1[1] = __fmaf_rn(weight_77, p0_1[13], acc0_1[1]);
                                     acc1_1[1] = __fmaf_rn(weight_77, p1_1[13], acc1_1[1]);
-                                }
-                                if (cidx_1[13] == 2) {
-                                    den_1[2] = den_1[2] + weight_77;
-                                    acc0_1[2] = __fmaf_rn(weight_77, p0_1[13], acc0_1[2]);
-                                    acc1_1[2] = __fmaf_rn(weight_77, p1_1[13], acc1_1[2]);
-                                }
-                                if (cidx_1[13] == 3) {
-                                    den_1[3] = den_1[3] + weight_77;
-                                    acc0_1[3] = __fmaf_rn(weight_77, p0_1[13], acc0_1[3]);
-                                    acc1_1[3] = __fmaf_rn(weight_77, p1_1[13], acc1_1[3]);
+                                } else {
+                                    if (bound[2] > 13) {
+                                        den_1[2] = den_1[2] + weight_77;
+                                        acc0_1[2] = __fmaf_rn(weight_77, p0_1[13], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_77, p1_1[13], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_77;
+                                        acc0_1[3] = __fmaf_rn(weight_77, p0_1[13], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_77, p1_1[13], acc1_1[3]);
+                                    }
                                 }
                             }
                             bool live_14_4 = num_splits > 14 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_14_4) {
                                 float weight_78 = approx_exp2(lse_1[14] - lse_max_1[0]);
-                                if (cidx_1[14] == 0) {
+                                if (bound[0] > 14) {
                                     den_1[0] = den_1[0] + weight_78;
                                     acc0_1[0] = __fmaf_rn(weight_78, p0_1[14], acc0_1[0]);
                                     acc1_1[0] = __fmaf_rn(weight_78, p1_1[14], acc1_1[0]);
-                                }
-                                if (cidx_1[14] == 1) {
+                                } else if (bound[1] > 14) {
                                     den_1[1] = den_1[1] + weight_78;
                                     acc0_1[1] = __fmaf_rn(weight_78, p0_1[14], acc0_1[1]);
                                     acc1_1[1] = __fmaf_rn(weight_78, p1_1[14], acc1_1[1]);
-                                }
-                                if (cidx_1[14] == 2) {
-                                    den_1[2] = den_1[2] + weight_78;
-                                    acc0_1[2] = __fmaf_rn(weight_78, p0_1[14], acc0_1[2]);
-                                    acc1_1[2] = __fmaf_rn(weight_78, p1_1[14], acc1_1[2]);
-                                }
-                                if (cidx_1[14] == 3) {
-                                    den_1[3] = den_1[3] + weight_78;
-                                    acc0_1[3] = __fmaf_rn(weight_78, p0_1[14], acc0_1[3]);
-                                    acc1_1[3] = __fmaf_rn(weight_78, p1_1[14], acc1_1[3]);
+                                } else {
+                                    if (bound[2] > 14) {
+                                        den_1[2] = den_1[2] + weight_78;
+                                        acc0_1[2] = __fmaf_rn(weight_78, p0_1[14], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_78, p1_1[14], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_78;
+                                        acc0_1[3] = __fmaf_rn(weight_78, p0_1[14], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_78, p1_1[14], acc1_1[3]);
+                                    }
                                 }
                             }
                             bool live_15_1 = num_splits > 15 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_15_1) {
                                 float weight_79 = approx_exp2(lse_1[15] - lse_max_1[0]);
-                                if (cidx_1[15] == 0) {
+                                if (bound[0] > 15) {
                                     den_1[0] = den_1[0] + weight_79;
                                     acc0_1[0] = __fmaf_rn(weight_79, p0_1[15], acc0_1[0]);
                                     acc1_1[0] = __fmaf_rn(weight_79, p1_1[15], acc1_1[0]);
-                                }
-                                if (cidx_1[15] == 1) {
+                                } else if (bound[1] > 15) {
                                     den_1[1] = den_1[1] + weight_79;
                                     acc0_1[1] = __fmaf_rn(weight_79, p0_1[15], acc0_1[1]);
                                     acc1_1[1] = __fmaf_rn(weight_79, p1_1[15], acc1_1[1]);
+                                } else {
+                                    if (bound[2] > 15) {
+                                        den_1[2] = den_1[2] + weight_79;
+                                        acc0_1[2] = __fmaf_rn(weight_79, p0_1[15], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_79, p1_1[15], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_79;
+                                        acc0_1[3] = __fmaf_rn(weight_79, p0_1[15], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_79, p1_1[15], acc1_1[3]);
+                                    }
                                 }
-                                if (cidx_1[15] == 2) {
-                                    den_1[2] = den_1[2] + weight_79;
-                                    acc0_1[2] = __fmaf_rn(weight_79, p0_1[15], acc0_1[2]);
-                                    acc1_1[2] = __fmaf_rn(weight_79, p1_1[15], acc1_1[2]);
+                            }
+                            bool live_16_1 = num_splits > 16 && lse_max_1[0] > -CUDART_INF_F;
+                            if (live_16_1) {
+                                float weight_80 = approx_exp2(lse_1[16] - lse_max_1[0]);
+                                if (bound[0] > 16) {
+                                    den_1[0] = den_1[0] + weight_80;
+                                    acc0_1[0] = __fmaf_rn(weight_80, p0_1[16], acc0_1[0]);
+                                    acc1_1[0] = __fmaf_rn(weight_80, p1_1[16], acc1_1[0]);
+                                } else if (bound[1] > 16) {
+                                    den_1[1] = den_1[1] + weight_80;
+                                    acc0_1[1] = __fmaf_rn(weight_80, p0_1[16], acc0_1[1]);
+                                    acc1_1[1] = __fmaf_rn(weight_80, p1_1[16], acc1_1[1]);
+                                } else {
+                                    if (bound[2] > 16) {
+                                        den_1[2] = den_1[2] + weight_80;
+                                        acc0_1[2] = __fmaf_rn(weight_80, p0_1[16], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_80, p1_1[16], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_80;
+                                        acc0_1[3] = __fmaf_rn(weight_80, p0_1[16], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_80, p1_1[16], acc1_1[3]);
+                                    }
                                 }
-                                if (cidx_1[15] == 3) {
-                                    den_1[3] = den_1[3] + weight_79;
-                                    acc0_1[3] = __fmaf_rn(weight_79, p0_1[15], acc0_1[3]);
-                                    acc1_1[3] = __fmaf_rn(weight_79, p1_1[15], acc1_1[3]);
+                            }
+                            bool live_17_1 = num_splits > 17 && lse_max_1[0] > -CUDART_INF_F;
+                            if (live_17_1) {
+                                float weight_81 = approx_exp2(lse_1[17] - lse_max_1[0]);
+                                if (bound[0] > 17) {
+                                    den_1[0] = den_1[0] + weight_81;
+                                    acc0_1[0] = __fmaf_rn(weight_81, p0_1[17], acc0_1[0]);
+                                    acc1_1[0] = __fmaf_rn(weight_81, p1_1[17], acc1_1[0]);
+                                } else if (bound[1] > 17) {
+                                    den_1[1] = den_1[1] + weight_81;
+                                    acc0_1[1] = __fmaf_rn(weight_81, p0_1[17], acc0_1[1]);
+                                    acc1_1[1] = __fmaf_rn(weight_81, p1_1[17], acc1_1[1]);
+                                } else {
+                                    if (bound[2] > 17) {
+                                        den_1[2] = den_1[2] + weight_81;
+                                        acc0_1[2] = __fmaf_rn(weight_81, p0_1[17], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_81, p1_1[17], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_81;
+                                        acc0_1[3] = __fmaf_rn(weight_81, p0_1[17], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_81, p1_1[17], acc1_1[3]);
+                                    }
+                                }
+                            }
+                            bool live_18_1 = num_splits > 18 && lse_max_1[0] > -CUDART_INF_F;
+                            if (live_18_1) {
+                                float weight_82 = approx_exp2(lse_1[18] - lse_max_1[0]);
+                                if (bound[0] > 18) {
+                                    den_1[0] = den_1[0] + weight_82;
+                                    acc0_1[0] = __fmaf_rn(weight_82, p0_1[18], acc0_1[0]);
+                                    acc1_1[0] = __fmaf_rn(weight_82, p1_1[18], acc1_1[0]);
+                                } else if (bound[1] > 18) {
+                                    den_1[1] = den_1[1] + weight_82;
+                                    acc0_1[1] = __fmaf_rn(weight_82, p0_1[18], acc0_1[1]);
+                                    acc1_1[1] = __fmaf_rn(weight_82, p1_1[18], acc1_1[1]);
+                                } else {
+                                    if (bound[2] > 18) {
+                                        den_1[2] = den_1[2] + weight_82;
+                                        acc0_1[2] = __fmaf_rn(weight_82, p0_1[18], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_82, p1_1[18], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_82;
+                                        acc0_1[3] = __fmaf_rn(weight_82, p0_1[18], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_82, p1_1[18], acc1_1[3]);
+                                    }
+                                }
+                            }
+                            bool live_19 = num_splits > 19 && lse_max_1[0] > -CUDART_INF_F;
+                            if (live_19) {
+                                float weight_83 = approx_exp2(lse_1[19] - lse_max_1[0]);
+                                if (bound[0] > 19) {
+                                    den_1[0] = den_1[0] + weight_83;
+                                    acc0_1[0] = __fmaf_rn(weight_83, p0_1[19], acc0_1[0]);
+                                    acc1_1[0] = __fmaf_rn(weight_83, p1_1[19], acc1_1[0]);
+                                } else if (bound[1] > 19) {
+                                    den_1[1] = den_1[1] + weight_83;
+                                    acc0_1[1] = __fmaf_rn(weight_83, p0_1[19], acc0_1[1]);
+                                    acc1_1[1] = __fmaf_rn(weight_83, p1_1[19], acc1_1[1]);
+                                } else {
+                                    if (bound[2] > 19) {
+                                        den_1[2] = den_1[2] + weight_83;
+                                        acc0_1[2] = __fmaf_rn(weight_83, p0_1[19], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_83, p1_1[19], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_83;
+                                        acc0_1[3] = __fmaf_rn(weight_83, p0_1[19], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_83, p1_1[19], acc1_1[3]);
+                                    }
+                                }
+                            }
+                            bool live_20 = num_splits > 20 && lse_max_1[0] > -CUDART_INF_F;
+                            if (live_20) {
+                                float weight_84 = approx_exp2(lse_1[20] - lse_max_1[0]);
+                                if (bound[0] > 20) {
+                                    den_1[0] = den_1[0] + weight_84;
+                                    acc0_1[0] = __fmaf_rn(weight_84, p0_1[20], acc0_1[0]);
+                                    acc1_1[0] = __fmaf_rn(weight_84, p1_1[20], acc1_1[0]);
+                                } else if (bound[1] > 20) {
+                                    den_1[1] = den_1[1] + weight_84;
+                                    acc0_1[1] = __fmaf_rn(weight_84, p0_1[20], acc0_1[1]);
+                                    acc1_1[1] = __fmaf_rn(weight_84, p1_1[20], acc1_1[1]);
+                                } else {
+                                    if (bound[2] > 20) {
+                                        den_1[2] = den_1[2] + weight_84;
+                                        acc0_1[2] = __fmaf_rn(weight_84, p0_1[20], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_84, p1_1[20], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_84;
+                                        acc0_1[3] = __fmaf_rn(weight_84, p0_1[20], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_84, p1_1[20], acc1_1[3]);
+                                    }
+                                }
+                            }
+                            bool live_21 = num_splits > 21 && lse_max_1[0] > -CUDART_INF_F;
+                            if (live_21) {
+                                float weight_85 = approx_exp2(lse_1[21] - lse_max_1[0]);
+                                if (bound[0] > 21) {
+                                    den_1[0] = den_1[0] + weight_85;
+                                    acc0_1[0] = __fmaf_rn(weight_85, p0_1[21], acc0_1[0]);
+                                    acc1_1[0] = __fmaf_rn(weight_85, p1_1[21], acc1_1[0]);
+                                } else if (bound[1] > 21) {
+                                    den_1[1] = den_1[1] + weight_85;
+                                    acc0_1[1] = __fmaf_rn(weight_85, p0_1[21], acc0_1[1]);
+                                    acc1_1[1] = __fmaf_rn(weight_85, p1_1[21], acc1_1[1]);
+                                } else {
+                                    if (bound[2] > 21) {
+                                        den_1[2] = den_1[2] + weight_85;
+                                        acc0_1[2] = __fmaf_rn(weight_85, p0_1[21], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_85, p1_1[21], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_85;
+                                        acc0_1[3] = __fmaf_rn(weight_85, p0_1[21], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_85, p1_1[21], acc1_1[3]);
+                                    }
+                                }
+                            }
+                            bool live_22 = num_splits > 22 && lse_max_1[0] > -CUDART_INF_F;
+                            if (live_22) {
+                                float weight_86 = approx_exp2(lse_1[22] - lse_max_1[0]);
+                                if (bound[0] > 22) {
+                                    den_1[0] = den_1[0] + weight_86;
+                                    acc0_1[0] = __fmaf_rn(weight_86, p0_1[22], acc0_1[0]);
+                                    acc1_1[0] = __fmaf_rn(weight_86, p1_1[22], acc1_1[0]);
+                                } else if (bound[1] > 22) {
+                                    den_1[1] = den_1[1] + weight_86;
+                                    acc0_1[1] = __fmaf_rn(weight_86, p0_1[22], acc0_1[1]);
+                                    acc1_1[1] = __fmaf_rn(weight_86, p1_1[22], acc1_1[1]);
+                                } else {
+                                    if (bound[2] > 22) {
+                                        den_1[2] = den_1[2] + weight_86;
+                                        acc0_1[2] = __fmaf_rn(weight_86, p0_1[22], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_86, p1_1[22], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_86;
+                                        acc0_1[3] = __fmaf_rn(weight_86, p0_1[22], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_86, p1_1[22], acc1_1[3]);
+                                    }
+                                }
+                            }
+                            bool live_23 = num_splits > 23 && lse_max_1[0] > -CUDART_INF_F;
+                            if (live_23) {
+                                float weight_87 = approx_exp2(lse_1[23] - lse_max_1[0]);
+                                if (bound[0] > 23) {
+                                    den_1[0] = den_1[0] + weight_87;
+                                    acc0_1[0] = __fmaf_rn(weight_87, p0_1[23], acc0_1[0]);
+                                    acc1_1[0] = __fmaf_rn(weight_87, p1_1[23], acc1_1[0]);
+                                } else if (bound[1] > 23) {
+                                    den_1[1] = den_1[1] + weight_87;
+                                    acc0_1[1] = __fmaf_rn(weight_87, p0_1[23], acc0_1[1]);
+                                    acc1_1[1] = __fmaf_rn(weight_87, p1_1[23], acc1_1[1]);
+                                } else {
+                                    if (bound[2] > 23) {
+                                        den_1[2] = den_1[2] + weight_87;
+                                        acc0_1[2] = __fmaf_rn(weight_87, p0_1[23], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_87, p1_1[23], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_87;
+                                        acc0_1[3] = __fmaf_rn(weight_87, p0_1[23], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_87, p1_1[23], acc1_1[3]);
+                                    }
+                                }
+                            }
+                            bool live_24 = num_splits > 24 && lse_max_1[0] > -CUDART_INF_F;
+                            if (live_24) {
+                                float weight_88 = approx_exp2(lse_1[24] - lse_max_1[0]);
+                                if (bound[0] > 24) {
+                                    den_1[0] = den_1[0] + weight_88;
+                                    acc0_1[0] = __fmaf_rn(weight_88, p0_1[24], acc0_1[0]);
+                                    acc1_1[0] = __fmaf_rn(weight_88, p1_1[24], acc1_1[0]);
+                                } else if (bound[1] > 24) {
+                                    den_1[1] = den_1[1] + weight_88;
+                                    acc0_1[1] = __fmaf_rn(weight_88, p0_1[24], acc0_1[1]);
+                                    acc1_1[1] = __fmaf_rn(weight_88, p1_1[24], acc1_1[1]);
+                                } else {
+                                    if (bound[2] > 24) {
+                                        den_1[2] = den_1[2] + weight_88;
+                                        acc0_1[2] = __fmaf_rn(weight_88, p0_1[24], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_88, p1_1[24], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_88;
+                                        acc0_1[3] = __fmaf_rn(weight_88, p0_1[24], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_88, p1_1[24], acc1_1[3]);
+                                    }
+                                }
+                            }
+                            bool live_25 = num_splits > 25 && lse_max_1[0] > -CUDART_INF_F;
+                            if (live_25) {
+                                float weight_89 = approx_exp2(lse_1[25] - lse_max_1[0]);
+                                if (bound[0] > 25) {
+                                    den_1[0] = den_1[0] + weight_89;
+                                    acc0_1[0] = __fmaf_rn(weight_89, p0_1[25], acc0_1[0]);
+                                    acc1_1[0] = __fmaf_rn(weight_89, p1_1[25], acc1_1[0]);
+                                } else if (bound[1] > 25) {
+                                    den_1[1] = den_1[1] + weight_89;
+                                    acc0_1[1] = __fmaf_rn(weight_89, p0_1[25], acc0_1[1]);
+                                    acc1_1[1] = __fmaf_rn(weight_89, p1_1[25], acc1_1[1]);
+                                } else {
+                                    if (bound[2] > 25) {
+                                        den_1[2] = den_1[2] + weight_89;
+                                        acc0_1[2] = __fmaf_rn(weight_89, p0_1[25], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_89, p1_1[25], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_89;
+                                        acc0_1[3] = __fmaf_rn(weight_89, p0_1[25], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_89, p1_1[25], acc1_1[3]);
+                                    }
+                                }
+                            }
+                            bool live_26 = num_splits > 26 && lse_max_1[0] > -CUDART_INF_F;
+                            if (live_26) {
+                                float weight_90 = approx_exp2(lse_1[26] - lse_max_1[0]);
+                                if (bound[0] > 26) {
+                                    den_1[0] = den_1[0] + weight_90;
+                                    acc0_1[0] = __fmaf_rn(weight_90, p0_1[26], acc0_1[0]);
+                                    acc1_1[0] = __fmaf_rn(weight_90, p1_1[26], acc1_1[0]);
+                                } else if (bound[1] > 26) {
+                                    den_1[1] = den_1[1] + weight_90;
+                                    acc0_1[1] = __fmaf_rn(weight_90, p0_1[26], acc0_1[1]);
+                                    acc1_1[1] = __fmaf_rn(weight_90, p1_1[26], acc1_1[1]);
+                                } else {
+                                    if (bound[2] > 26) {
+                                        den_1[2] = den_1[2] + weight_90;
+                                        acc0_1[2] = __fmaf_rn(weight_90, p0_1[26], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_90, p1_1[26], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_90;
+                                        acc0_1[3] = __fmaf_rn(weight_90, p0_1[26], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_90, p1_1[26], acc1_1[3]);
+                                    }
+                                }
+                            }
+                            bool live_27 = num_splits > 27 && lse_max_1[0] > -CUDART_INF_F;
+                            if (live_27) {
+                                float weight_91 = approx_exp2(lse_1[27] - lse_max_1[0]);
+                                if (bound[0] > 27) {
+                                    den_1[0] = den_1[0] + weight_91;
+                                    acc0_1[0] = __fmaf_rn(weight_91, p0_1[27], acc0_1[0]);
+                                    acc1_1[0] = __fmaf_rn(weight_91, p1_1[27], acc1_1[0]);
+                                } else if (bound[1] > 27) {
+                                    den_1[1] = den_1[1] + weight_91;
+                                    acc0_1[1] = __fmaf_rn(weight_91, p0_1[27], acc0_1[1]);
+                                    acc1_1[1] = __fmaf_rn(weight_91, p1_1[27], acc1_1[1]);
+                                } else {
+                                    if (bound[2] > 27) {
+                                        den_1[2] = den_1[2] + weight_91;
+                                        acc0_1[2] = __fmaf_rn(weight_91, p0_1[27], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_91, p1_1[27], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_91;
+                                        acc0_1[3] = __fmaf_rn(weight_91, p0_1[27], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_91, p1_1[27], acc1_1[3]);
+                                    }
+                                }
+                            }
+                            bool live_28 = num_splits > 28 && lse_max_1[0] > -CUDART_INF_F;
+                            if (live_28) {
+                                float weight_92 = approx_exp2(lse_1[28] - lse_max_1[0]);
+                                if (bound[0] > 28) {
+                                    den_1[0] = den_1[0] + weight_92;
+                                    acc0_1[0] = __fmaf_rn(weight_92, p0_1[28], acc0_1[0]);
+                                    acc1_1[0] = __fmaf_rn(weight_92, p1_1[28], acc1_1[0]);
+                                } else if (bound[1] > 28) {
+                                    den_1[1] = den_1[1] + weight_92;
+                                    acc0_1[1] = __fmaf_rn(weight_92, p0_1[28], acc0_1[1]);
+                                    acc1_1[1] = __fmaf_rn(weight_92, p1_1[28], acc1_1[1]);
+                                } else {
+                                    if (bound[2] > 28) {
+                                        den_1[2] = den_1[2] + weight_92;
+                                        acc0_1[2] = __fmaf_rn(weight_92, p0_1[28], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_92, p1_1[28], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_92;
+                                        acc0_1[3] = __fmaf_rn(weight_92, p0_1[28], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_92, p1_1[28], acc1_1[3]);
+                                    }
+                                }
+                            }
+                            bool live_29 = num_splits > 29 && lse_max_1[0] > -CUDART_INF_F;
+                            if (live_29) {
+                                float weight_93 = approx_exp2(lse_1[29] - lse_max_1[0]);
+                                if (bound[0] > 29) {
+                                    den_1[0] = den_1[0] + weight_93;
+                                    acc0_1[0] = __fmaf_rn(weight_93, p0_1[29], acc0_1[0]);
+                                    acc1_1[0] = __fmaf_rn(weight_93, p1_1[29], acc1_1[0]);
+                                } else if (bound[1] > 29) {
+                                    den_1[1] = den_1[1] + weight_93;
+                                    acc0_1[1] = __fmaf_rn(weight_93, p0_1[29], acc0_1[1]);
+                                    acc1_1[1] = __fmaf_rn(weight_93, p1_1[29], acc1_1[1]);
+                                } else {
+                                    if (bound[2] > 29) {
+                                        den_1[2] = den_1[2] + weight_93;
+                                        acc0_1[2] = __fmaf_rn(weight_93, p0_1[29], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_93, p1_1[29], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_93;
+                                        acc0_1[3] = __fmaf_rn(weight_93, p0_1[29], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_93, p1_1[29], acc1_1[3]);
+                                    }
+                                }
+                            }
+                            bool live_30 = num_splits > 30 && lse_max_1[0] > -CUDART_INF_F;
+                            if (live_30) {
+                                float weight_94 = approx_exp2(lse_1[30] - lse_max_1[0]);
+                                if (bound[0] > 30) {
+                                    den_1[0] = den_1[0] + weight_94;
+                                    acc0_1[0] = __fmaf_rn(weight_94, p0_1[30], acc0_1[0]);
+                                    acc1_1[0] = __fmaf_rn(weight_94, p1_1[30], acc1_1[0]);
+                                } else if (bound[1] > 30) {
+                                    den_1[1] = den_1[1] + weight_94;
+                                    acc0_1[1] = __fmaf_rn(weight_94, p0_1[30], acc0_1[1]);
+                                    acc1_1[1] = __fmaf_rn(weight_94, p1_1[30], acc1_1[1]);
+                                } else {
+                                    if (bound[2] > 30) {
+                                        den_1[2] = den_1[2] + weight_94;
+                                        acc0_1[2] = __fmaf_rn(weight_94, p0_1[30], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_94, p1_1[30], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_94;
+                                        acc0_1[3] = __fmaf_rn(weight_94, p0_1[30], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_94, p1_1[30], acc1_1[3]);
+                                    }
+                                }
+                            }
+                            bool live_31 = num_splits > 31 && lse_max_1[0] > -CUDART_INF_F;
+                            if (live_31) {
+                                float weight_95 = approx_exp2(lse_1[31] - lse_max_1[0]);
+                                if (bound[0] > 31) {
+                                    den_1[0] = den_1[0] + weight_95;
+                                    acc0_1[0] = __fmaf_rn(weight_95, p0_1[31], acc0_1[0]);
+                                    acc1_1[0] = __fmaf_rn(weight_95, p1_1[31], acc1_1[0]);
+                                } else if (bound[1] > 31) {
+                                    den_1[1] = den_1[1] + weight_95;
+                                    acc0_1[1] = __fmaf_rn(weight_95, p0_1[31], acc0_1[1]);
+                                    acc1_1[1] = __fmaf_rn(weight_95, p1_1[31], acc1_1[1]);
+                                } else {
+                                    if (bound[2] > 31) {
+                                        den_1[2] = den_1[2] + weight_95;
+                                        acc0_1[2] = __fmaf_rn(weight_95, p0_1[31], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_95, p1_1[31], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_95;
+                                        acc0_1[3] = __fmaf_rn(weight_95, p0_1[31], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_95, p1_1[31], acc1_1[3]);
+                                    }
+                                }
+                            }
+                            bool live_32 = num_splits > 32 && lse_max_1[0] > -CUDART_INF_F;
+                            if (live_32) {
+                                float weight_96 = approx_exp2(lse_1[32] - lse_max_1[0]);
+                                if (bound[0] > 32) {
+                                    den_1[0] = den_1[0] + weight_96;
+                                    acc0_1[0] = __fmaf_rn(weight_96, p0_1[32], acc0_1[0]);
+                                    acc1_1[0] = __fmaf_rn(weight_96, p1_1[32], acc1_1[0]);
+                                } else if (bound[1] > 32) {
+                                    den_1[1] = den_1[1] + weight_96;
+                                    acc0_1[1] = __fmaf_rn(weight_96, p0_1[32], acc0_1[1]);
+                                    acc1_1[1] = __fmaf_rn(weight_96, p1_1[32], acc1_1[1]);
+                                } else {
+                                    if (bound[2] > 32) {
+                                        den_1[2] = den_1[2] + weight_96;
+                                        acc0_1[2] = __fmaf_rn(weight_96, p0_1[32], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_96, p1_1[32], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_96;
+                                        acc0_1[3] = __fmaf_rn(weight_96, p0_1[32], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_96, p1_1[32], acc1_1[3]);
+                                    }
+                                }
+                            }
+                            bool live_33 = num_splits > 33 && lse_max_1[0] > -CUDART_INF_F;
+                            if (live_33) {
+                                float weight_97 = approx_exp2(lse_1[33] - lse_max_1[0]);
+                                if (bound[0] > 33) {
+                                    den_1[0] = den_1[0] + weight_97;
+                                    acc0_1[0] = __fmaf_rn(weight_97, p0_1[33], acc0_1[0]);
+                                    acc1_1[0] = __fmaf_rn(weight_97, p1_1[33], acc1_1[0]);
+                                } else if (bound[1] > 33) {
+                                    den_1[1] = den_1[1] + weight_97;
+                                    acc0_1[1] = __fmaf_rn(weight_97, p0_1[33], acc0_1[1]);
+                                    acc1_1[1] = __fmaf_rn(weight_97, p1_1[33], acc1_1[1]);
+                                } else {
+                                    if (bound[2] > 33) {
+                                        den_1[2] = den_1[2] + weight_97;
+                                        acc0_1[2] = __fmaf_rn(weight_97, p0_1[33], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_97, p1_1[33], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_97;
+                                        acc0_1[3] = __fmaf_rn(weight_97, p0_1[33], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_97, p1_1[33], acc1_1[3]);
+                                    }
+                                }
+                            }
+                            bool live_34 = num_splits > 34 && lse_max_1[0] > -CUDART_INF_F;
+                            if (live_34) {
+                                float weight_98 = approx_exp2(lse_1[34] - lse_max_1[0]);
+                                if (bound[0] > 34) {
+                                    den_1[0] = den_1[0] + weight_98;
+                                    acc0_1[0] = __fmaf_rn(weight_98, p0_1[34], acc0_1[0]);
+                                    acc1_1[0] = __fmaf_rn(weight_98, p1_1[34], acc1_1[0]);
+                                } else if (bound[1] > 34) {
+                                    den_1[1] = den_1[1] + weight_98;
+                                    acc0_1[1] = __fmaf_rn(weight_98, p0_1[34], acc0_1[1]);
+                                    acc1_1[1] = __fmaf_rn(weight_98, p1_1[34], acc1_1[1]);
+                                } else {
+                                    if (bound[2] > 34) {
+                                        den_1[2] = den_1[2] + weight_98;
+                                        acc0_1[2] = __fmaf_rn(weight_98, p0_1[34], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_98, p1_1[34], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_98;
+                                        acc0_1[3] = __fmaf_rn(weight_98, p0_1[34], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_98, p1_1[34], acc1_1[3]);
+                                    }
+                                }
+                            }
+                            bool live_35 = num_splits > 35 && lse_max_1[0] > -CUDART_INF_F;
+                            if (live_35) {
+                                float weight_99 = approx_exp2(lse_1[35] - lse_max_1[0]);
+                                if (bound[0] > 35) {
+                                    den_1[0] = den_1[0] + weight_99;
+                                    acc0_1[0] = __fmaf_rn(weight_99, p0_1[35], acc0_1[0]);
+                                    acc1_1[0] = __fmaf_rn(weight_99, p1_1[35], acc1_1[0]);
+                                } else if (bound[1] > 35) {
+                                    den_1[1] = den_1[1] + weight_99;
+                                    acc0_1[1] = __fmaf_rn(weight_99, p0_1[35], acc0_1[1]);
+                                    acc1_1[1] = __fmaf_rn(weight_99, p1_1[35], acc1_1[1]);
+                                } else {
+                                    if (bound[2] > 35) {
+                                        den_1[2] = den_1[2] + weight_99;
+                                        acc0_1[2] = __fmaf_rn(weight_99, p0_1[35], acc0_1[2]);
+                                        acc1_1[2] = __fmaf_rn(weight_99, p1_1[35], acc1_1[2]);
+                                    } else {
+                                        den_1[3] = den_1[3] + weight_99;
+                                        acc0_1[3] = __fmaf_rn(weight_99, p0_1[35], acc0_1[3]);
+                                        acc1_1[3] = __fmaf_rn(weight_99, p1_1[35], acc1_1[3]);
+                                    }
                                 }
                             }
                             if (valid_1[0] != 0) {
@@ -3553,28 +4249,28 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 acc1_k_1 = acc1_k_1 + acc1_1[3];
                                 float inv_3 = 0.0f;
                                 if (den_k_1 > 0.0f) {
-                                    float _rcp_200 = approx_rcp(den_k_1);
-                                    inv_3 = _rcp_200;
+                                    float _rcp_220 = approx_rcp(den_k_1);
+                                    inv_3 = _rcp_220;
                                 }
                                 float attn0_1 = (float)(__nv_bfloat16)(acc0_k_1 * inv_3);
                                 float attn1_1 = (float)(__nv_bfloat16)(acc1_k_1 * inv_3);
-                                float _exp2_202 = approx_exp2((-gate0_1[0]) * 1.442695f);
-                                float _rcp_201 = approx_rcp(1.0f + _exp2_202);
-                                float result0_1 = attn0_1 * _rcp_201;
-                                float _exp2_204 = approx_exp2((-gate1_1[0]) * 1.442695f);
-                                float _rcp_203 = approx_rcp(1.0f + _exp2_204);
-                                float result1_1 = attn1_1 * _rcp_203;
-                                __nv_bfloat162 _bit_cast_src_205 = __float22bfloat162_rn(make_float2(result0_1, result1_1));
-                                word_1[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_205)[0];
+                                float _exp2_222 = approx_exp2((-gate0_1[0]) * 1.442695f);
+                                float _rcp_221 = approx_rcp(1.0f + _exp2_222);
+                                float result0_1 = attn0_1 * _rcp_221;
+                                float _exp2_224 = approx_exp2((-gate1_1[0]) * 1.442695f);
+                                float _rcp_223 = approx_rcp(1.0f + _exp2_224);
+                                float result1_1 = attn1_1 * _rcp_223;
+                                __nv_bfloat162 _bit_cast_src_225 = __float22bfloat162_rn(make_float2(result0_1, result1_1));
+                                word_1[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_225)[0];
                                 long long out_offset_1 = row_i64 * out_stride_row + qo_head_3[0] * out_stride_head + dim_1[0];
                                 *(reinterpret_cast<unsigned int*>(out + out_offset_1) + (0)) = word_1[0];
                             }
                         }
                     } else {
-                        if (num_splits > 4) {
-                            float lse_2[16];
-                            float p0_2[16];
-                            float p1_2[16];
+                        if (num_splits > 8) {
+                            float lse_2[32];
+                            float p0_2[32];
+                            float p1_2[32];
                             float acc0_2[8];
                             float acc1_2[8];
                             float den_2[8];
@@ -3582,23 +4278,11 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                             if (num_splits <= 4) {
                                 chunk_w_2 = num_splits;
                             }
-                            int cidx_2[8];
-                            int split_i_15 = 0;
-                            cidx_2[0] = split_i_15 / chunk_w_2;
-                            int split_i_0_1 = 1;
-                            cidx_2[1] = split_i_0_1 / chunk_w_2;
-                            int split_i_1_1 = 2;
-                            cidx_2[2] = split_i_1_1 / chunk_w_2;
-                            int split_i_2_1 = 3;
-                            cidx_2[3] = split_i_2_1 / chunk_w_2;
-                            int split_i_3_1 = 4;
-                            cidx_2[4] = split_i_3_1 / chunk_w_2;
-                            int split_i_4_1 = 5;
-                            cidx_2[5] = split_i_4_1 / chunk_w_2;
-                            int split_i_5_1 = 6;
-                            cidx_2[6] = split_i_5_1 / chunk_w_2;
-                            int split_i_6_1 = 7;
-                            cidx_2[7] = split_i_6_1 / chunk_w_2;
+                            int bound_1[4];
+                            bound_1[0] = chunk_w_2;
+                            bound_1[1] = chunk_w_2 * 2;
+                            bound_1[2] = chunk_w_2 * 3;
+                            bound_1[3] = chunk_w_2 * 4;
                             float lse_max_2[2];
                             int valid_2[2];
                             int tab_2[2];
@@ -3630,15 +4314,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 acc1_2[3] = 0.0f;
                                 den_2[3] = 0.0f;
                                 lse_max_2[0] = -CUDART_INF_F;
-                                float _vec_load_94[2];
+                                float _vec_load_114[2];
                                 {
-                                    uint32_t _bf16x2_bits_206;
-                                    _bf16x2_bits_206 = *reinterpret_cast<const uint32_t*>(gate + (row_head_2[0] * 256 + dim_2[0]) + 0);
-                                    (&_vec_load_94[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_206) << 16);
-                                    (&_vec_load_94[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_206) & 0xffff0000u);
+                                    uint32_t _bf16x2_bits_226;
+                                    _bf16x2_bits_226 = *reinterpret_cast<const uint32_t*>(gate + (row_head_2[0] * 256 + dim_2[0]) + 0);
+                                    (&_vec_load_114[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_226) << 16);
+                                    (&_vec_load_114[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_226) & 0xffff0000u);
                                 }
-                                gate0_2[0] = _vec_load_94[0];
-                                gate1_2[0] = _vec_load_94[1];
+                                gate0_2[0] = _vec_load_114[0];
+                                gate1_2[0] = _vec_load_114[1];
                                 int pk_1_1 = ((p_1_2 + 128) < (end - 1) ? (p_1_2 + 128) : (end - 1));
                                 valid_2[1] = ((end > p_1_2 + 128) ? 1 : 0);
                                 int head_2 = pk_1_1 >> 7;
@@ -3658,222 +4342,430 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 acc1_2[7] = 0.0f;
                                 den_2[7] = 0.0f;
                                 lse_max_2[1] = -CUDART_INF_F;
-                                float _vec_load_95[2];
+                                float _vec_load_115[2];
                                 {
-                                    uint32_t _bf16x2_bits_207;
-                                    _bf16x2_bits_207 = *reinterpret_cast<const uint32_t*>(gate + (row_head_2[1] * 256 + dim_2[1]) + 0);
-                                    (&_vec_load_95[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_207) << 16);
-                                    (&_vec_load_95[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_207) & 0xffff0000u);
+                                    uint32_t _bf16x2_bits_227;
+                                    _bf16x2_bits_227 = *reinterpret_cast<const uint32_t*>(gate + (row_head_2[1] * 256 + dim_2[1]) + 0);
+                                    (&_vec_load_115[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_227) << 16);
+                                    (&_vec_load_115[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_227) & 0xffff0000u);
                                 }
-                                gate0_2[1] = _vec_load_95[0];
-                                gate1_2[1] = _vec_load_95[1];
+                                gate0_2[1] = _vec_load_115[0];
+                                gate1_2[1] = _vec_load_115[1];
                                 lse_2[0] = -CUDART_INF_F;
                                 if (num_splits > 0) {
-                                    long long part_row_80 = row_head_2[0];
-                                    lse_2[0] = partial_lse[part_row_80];
-                                    float _vec_load_96[2];
+                                    long long part_row_100 = row_head_2[0];
+                                    lse_2[0] = partial_lse[part_row_100];
+                                    float _vec_load_116[2];
                                     {
-                                        float2 _v2_208 = *reinterpret_cast<const float2*>(partial_out + (part_row_80 * 256 + dim_2[0]) + 0);
-                                        _vec_load_96[0] = _v2_208.x;
-                                        _vec_load_96[0 + 1] = _v2_208.y;
+                                        float2 _v2_228 = *reinterpret_cast<const float2*>(partial_out + (part_row_100 * 256 + dim_2[0]) + 0);
+                                        _vec_load_116[0] = _v2_228.x;
+                                        _vec_load_116[0 + 1] = _v2_228.y;
                                     }
-                                    p0_2[0] = _vec_load_96[0];
-                                    p1_2[0] = _vec_load_96[1];
+                                    p0_2[0] = _vec_load_116[0];
+                                    p1_2[0] = _vec_load_116[1];
                                 }
                                 lse_2[1] = -CUDART_INF_F;
                                 if (num_splits > 1) {
-                                    long long part_row_81 = split_pitch + row_head_2[0];
-                                    lse_2[1] = partial_lse[part_row_81];
-                                    float _vec_load_97[2];
+                                    long long part_row_101 = split_pitch + row_head_2[0];
+                                    lse_2[1] = partial_lse[part_row_101];
+                                    float _vec_load_117[2];
                                     {
-                                        float2 _v2_209 = *reinterpret_cast<const float2*>(partial_out + (part_row_81 * 256 + dim_2[0]) + 0);
-                                        _vec_load_97[0] = _v2_209.x;
-                                        _vec_load_97[0 + 1] = _v2_209.y;
+                                        float2 _v2_229 = *reinterpret_cast<const float2*>(partial_out + (part_row_101 * 256 + dim_2[0]) + 0);
+                                        _vec_load_117[0] = _v2_229.x;
+                                        _vec_load_117[0 + 1] = _v2_229.y;
                                     }
-                                    p0_2[1] = _vec_load_97[0];
-                                    p1_2[1] = _vec_load_97[1];
+                                    p0_2[1] = _vec_load_117[0];
+                                    p1_2[1] = _vec_load_117[1];
                                 }
                                 lse_2[2] = -CUDART_INF_F;
                                 if (num_splits > 2) {
-                                    long long part_row_82 = 2 * split_pitch + row_head_2[0];
-                                    lse_2[2] = partial_lse[part_row_82];
-                                    float _vec_load_98[2];
+                                    long long part_row_102 = 2 * split_pitch + row_head_2[0];
+                                    lse_2[2] = partial_lse[part_row_102];
+                                    float _vec_load_118[2];
                                     {
-                                        float2 _v2_210 = *reinterpret_cast<const float2*>(partial_out + (part_row_82 * 256 + dim_2[0]) + 0);
-                                        _vec_load_98[0] = _v2_210.x;
-                                        _vec_load_98[0 + 1] = _v2_210.y;
+                                        float2 _v2_230 = *reinterpret_cast<const float2*>(partial_out + (part_row_102 * 256 + dim_2[0]) + 0);
+                                        _vec_load_118[0] = _v2_230.x;
+                                        _vec_load_118[0 + 1] = _v2_230.y;
                                     }
-                                    p0_2[2] = _vec_load_98[0];
-                                    p1_2[2] = _vec_load_98[1];
+                                    p0_2[2] = _vec_load_118[0];
+                                    p1_2[2] = _vec_load_118[1];
                                 }
                                 lse_2[3] = -CUDART_INF_F;
                                 if (num_splits > 3) {
-                                    long long part_row_83 = 3 * split_pitch + row_head_2[0];
-                                    lse_2[3] = partial_lse[part_row_83];
-                                    float _vec_load_99[2];
+                                    long long part_row_103 = 3 * split_pitch + row_head_2[0];
+                                    lse_2[3] = partial_lse[part_row_103];
+                                    float _vec_load_119[2];
                                     {
-                                        float2 _v2_211 = *reinterpret_cast<const float2*>(partial_out + (part_row_83 * 256 + dim_2[0]) + 0);
-                                        _vec_load_99[0] = _v2_211.x;
-                                        _vec_load_99[0 + 1] = _v2_211.y;
+                                        float2 _v2_231 = *reinterpret_cast<const float2*>(partial_out + (part_row_103 * 256 + dim_2[0]) + 0);
+                                        _vec_load_119[0] = _v2_231.x;
+                                        _vec_load_119[0 + 1] = _v2_231.y;
                                     }
-                                    p0_2[3] = _vec_load_99[0];
-                                    p1_2[3] = _vec_load_99[1];
+                                    p0_2[3] = _vec_load_119[0];
+                                    p1_2[3] = _vec_load_119[1];
                                 }
                                 lse_2[4] = -CUDART_INF_F;
                                 if (num_splits > 4) {
-                                    long long part_row_84 = 4 * split_pitch + row_head_2[0];
-                                    lse_2[4] = partial_lse[part_row_84];
-                                    float _vec_load_100[2];
+                                    long long part_row_104 = 4 * split_pitch + row_head_2[0];
+                                    lse_2[4] = partial_lse[part_row_104];
+                                    float _vec_load_120[2];
                                     {
-                                        float2 _v2_212 = *reinterpret_cast<const float2*>(partial_out + (part_row_84 * 256 + dim_2[0]) + 0);
-                                        _vec_load_100[0] = _v2_212.x;
-                                        _vec_load_100[0 + 1] = _v2_212.y;
+                                        float2 _v2_232 = *reinterpret_cast<const float2*>(partial_out + (part_row_104 * 256 + dim_2[0]) + 0);
+                                        _vec_load_120[0] = _v2_232.x;
+                                        _vec_load_120[0 + 1] = _v2_232.y;
                                     }
-                                    p0_2[4] = _vec_load_100[0];
-                                    p1_2[4] = _vec_load_100[1];
+                                    p0_2[4] = _vec_load_120[0];
+                                    p1_2[4] = _vec_load_120[1];
                                 }
                                 lse_2[5] = -CUDART_INF_F;
                                 if (num_splits > 5) {
-                                    long long part_row_85 = 5 * split_pitch + row_head_2[0];
-                                    lse_2[5] = partial_lse[part_row_85];
-                                    float _vec_load_101[2];
+                                    long long part_row_105 = 5 * split_pitch + row_head_2[0];
+                                    lse_2[5] = partial_lse[part_row_105];
+                                    float _vec_load_121[2];
                                     {
-                                        float2 _v2_213 = *reinterpret_cast<const float2*>(partial_out + (part_row_85 * 256 + dim_2[0]) + 0);
-                                        _vec_load_101[0] = _v2_213.x;
-                                        _vec_load_101[0 + 1] = _v2_213.y;
+                                        float2 _v2_233 = *reinterpret_cast<const float2*>(partial_out + (part_row_105 * 256 + dim_2[0]) + 0);
+                                        _vec_load_121[0] = _v2_233.x;
+                                        _vec_load_121[0 + 1] = _v2_233.y;
                                     }
-                                    p0_2[5] = _vec_load_101[0];
-                                    p1_2[5] = _vec_load_101[1];
+                                    p0_2[5] = _vec_load_121[0];
+                                    p1_2[5] = _vec_load_121[1];
                                 }
                                 lse_2[6] = -CUDART_INF_F;
                                 if (num_splits > 6) {
-                                    long long part_row_86 = 6 * split_pitch + row_head_2[0];
-                                    lse_2[6] = partial_lse[part_row_86];
-                                    float _vec_load_102[2];
+                                    long long part_row_106 = 6 * split_pitch + row_head_2[0];
+                                    lse_2[6] = partial_lse[part_row_106];
+                                    float _vec_load_122[2];
                                     {
-                                        float2 _v2_214 = *reinterpret_cast<const float2*>(partial_out + (part_row_86 * 256 + dim_2[0]) + 0);
-                                        _vec_load_102[0] = _v2_214.x;
-                                        _vec_load_102[0 + 1] = _v2_214.y;
+                                        float2 _v2_234 = *reinterpret_cast<const float2*>(partial_out + (part_row_106 * 256 + dim_2[0]) + 0);
+                                        _vec_load_122[0] = _v2_234.x;
+                                        _vec_load_122[0 + 1] = _v2_234.y;
                                     }
-                                    p0_2[6] = _vec_load_102[0];
-                                    p1_2[6] = _vec_load_102[1];
+                                    p0_2[6] = _vec_load_122[0];
+                                    p1_2[6] = _vec_load_122[1];
                                 }
                                 lse_2[7] = -CUDART_INF_F;
                                 if (num_splits > 7) {
-                                    long long part_row_87 = 7 * split_pitch + row_head_2[0];
-                                    lse_2[7] = partial_lse[part_row_87];
-                                    float _vec_load_103[2];
+                                    long long part_row_107 = 7 * split_pitch + row_head_2[0];
+                                    lse_2[7] = partial_lse[part_row_107];
+                                    float _vec_load_123[2];
                                     {
-                                        float2 _v2_215 = *reinterpret_cast<const float2*>(partial_out + (part_row_87 * 256 + dim_2[0]) + 0);
-                                        _vec_load_103[0] = _v2_215.x;
-                                        _vec_load_103[0 + 1] = _v2_215.y;
+                                        float2 _v2_235 = *reinterpret_cast<const float2*>(partial_out + (part_row_107 * 256 + dim_2[0]) + 0);
+                                        _vec_load_123[0] = _v2_235.x;
+                                        _vec_load_123[0 + 1] = _v2_235.y;
                                     }
-                                    p0_2[7] = _vec_load_103[0];
-                                    p1_2[7] = _vec_load_103[1];
+                                    p0_2[7] = _vec_load_123[0];
+                                    p1_2[7] = _vec_load_123[1];
                                 }
                                 lse_2[8] = -CUDART_INF_F;
-                                if (num_splits > 0) {
-                                    long long part_row_88 = row_head_2[1];
-                                    lse_2[8] = partial_lse[part_row_88];
-                                    float _vec_load_104[2];
+                                if (num_splits > 8) {
+                                    long long part_row_108 = 8 * split_pitch + row_head_2[0];
+                                    lse_2[8] = partial_lse[part_row_108];
+                                    float _vec_load_124[2];
                                     {
-                                        float2 _v2_216 = *reinterpret_cast<const float2*>(partial_out + (part_row_88 * 256 + dim_2[1]) + 0);
-                                        _vec_load_104[0] = _v2_216.x;
-                                        _vec_load_104[0 + 1] = _v2_216.y;
+                                        float2 _v2_236 = *reinterpret_cast<const float2*>(partial_out + (part_row_108 * 256 + dim_2[0]) + 0);
+                                        _vec_load_124[0] = _v2_236.x;
+                                        _vec_load_124[0 + 1] = _v2_236.y;
                                     }
-                                    p0_2[8] = _vec_load_104[0];
-                                    p1_2[8] = _vec_load_104[1];
+                                    p0_2[8] = _vec_load_124[0];
+                                    p1_2[8] = _vec_load_124[1];
                                 }
                                 lse_2[9] = -CUDART_INF_F;
-                                if (num_splits > 1) {
-                                    long long part_row_89 = split_pitch + row_head_2[1];
-                                    lse_2[9] = partial_lse[part_row_89];
-                                    float _vec_load_105[2];
+                                if (num_splits > 9) {
+                                    long long part_row_109 = 9 * split_pitch + row_head_2[0];
+                                    lse_2[9] = partial_lse[part_row_109];
+                                    float _vec_load_125[2];
                                     {
-                                        float2 _v2_217 = *reinterpret_cast<const float2*>(partial_out + (part_row_89 * 256 + dim_2[1]) + 0);
-                                        _vec_load_105[0] = _v2_217.x;
-                                        _vec_load_105[0 + 1] = _v2_217.y;
+                                        float2 _v2_237 = *reinterpret_cast<const float2*>(partial_out + (part_row_109 * 256 + dim_2[0]) + 0);
+                                        _vec_load_125[0] = _v2_237.x;
+                                        _vec_load_125[0 + 1] = _v2_237.y;
                                     }
-                                    p0_2[9] = _vec_load_105[0];
-                                    p1_2[9] = _vec_load_105[1];
+                                    p0_2[9] = _vec_load_125[0];
+                                    p1_2[9] = _vec_load_125[1];
                                 }
                                 lse_2[10] = -CUDART_INF_F;
-                                if (num_splits > 2) {
-                                    long long part_row_90 = 2 * split_pitch + row_head_2[1];
-                                    lse_2[10] = partial_lse[part_row_90];
-                                    float _vec_load_106[2];
+                                if (num_splits > 10) {
+                                    long long part_row_110 = 10 * split_pitch + row_head_2[0];
+                                    lse_2[10] = partial_lse[part_row_110];
+                                    float _vec_load_126[2];
                                     {
-                                        float2 _v2_218 = *reinterpret_cast<const float2*>(partial_out + (part_row_90 * 256 + dim_2[1]) + 0);
-                                        _vec_load_106[0] = _v2_218.x;
-                                        _vec_load_106[0 + 1] = _v2_218.y;
+                                        float2 _v2_238 = *reinterpret_cast<const float2*>(partial_out + (part_row_110 * 256 + dim_2[0]) + 0);
+                                        _vec_load_126[0] = _v2_238.x;
+                                        _vec_load_126[0 + 1] = _v2_238.y;
                                     }
-                                    p0_2[10] = _vec_load_106[0];
-                                    p1_2[10] = _vec_load_106[1];
+                                    p0_2[10] = _vec_load_126[0];
+                                    p1_2[10] = _vec_load_126[1];
                                 }
                                 lse_2[11] = -CUDART_INF_F;
-                                if (num_splits > 3) {
-                                    long long part_row_91 = 3 * split_pitch + row_head_2[1];
-                                    lse_2[11] = partial_lse[part_row_91];
-                                    float _vec_load_107[2];
+                                if (num_splits > 11) {
+                                    long long part_row_111 = 11 * split_pitch + row_head_2[0];
+                                    lse_2[11] = partial_lse[part_row_111];
+                                    float _vec_load_127[2];
                                     {
-                                        float2 _v2_219 = *reinterpret_cast<const float2*>(partial_out + (part_row_91 * 256 + dim_2[1]) + 0);
-                                        _vec_load_107[0] = _v2_219.x;
-                                        _vec_load_107[0 + 1] = _v2_219.y;
+                                        float2 _v2_239 = *reinterpret_cast<const float2*>(partial_out + (part_row_111 * 256 + dim_2[0]) + 0);
+                                        _vec_load_127[0] = _v2_239.x;
+                                        _vec_load_127[0 + 1] = _v2_239.y;
                                     }
-                                    p0_2[11] = _vec_load_107[0];
-                                    p1_2[11] = _vec_load_107[1];
+                                    p0_2[11] = _vec_load_127[0];
+                                    p1_2[11] = _vec_load_127[1];
                                 }
                                 lse_2[12] = -CUDART_INF_F;
-                                if (num_splits > 4) {
-                                    long long part_row_92 = 4 * split_pitch + row_head_2[1];
-                                    lse_2[12] = partial_lse[part_row_92];
-                                    float _vec_load_108[2];
+                                if (num_splits > 12) {
+                                    long long part_row_112 = 12 * split_pitch + row_head_2[0];
+                                    lse_2[12] = partial_lse[part_row_112];
+                                    float _vec_load_128[2];
                                     {
-                                        float2 _v2_220 = *reinterpret_cast<const float2*>(partial_out + (part_row_92 * 256 + dim_2[1]) + 0);
-                                        _vec_load_108[0] = _v2_220.x;
-                                        _vec_load_108[0 + 1] = _v2_220.y;
+                                        float2 _v2_240 = *reinterpret_cast<const float2*>(partial_out + (part_row_112 * 256 + dim_2[0]) + 0);
+                                        _vec_load_128[0] = _v2_240.x;
+                                        _vec_load_128[0 + 1] = _v2_240.y;
                                     }
-                                    p0_2[12] = _vec_load_108[0];
-                                    p1_2[12] = _vec_load_108[1];
+                                    p0_2[12] = _vec_load_128[0];
+                                    p1_2[12] = _vec_load_128[1];
                                 }
                                 lse_2[13] = -CUDART_INF_F;
-                                if (num_splits > 5) {
-                                    long long part_row_93 = 5 * split_pitch + row_head_2[1];
-                                    lse_2[13] = partial_lse[part_row_93];
-                                    float _vec_load_109[2];
+                                if (num_splits > 13) {
+                                    long long part_row_113 = 13 * split_pitch + row_head_2[0];
+                                    lse_2[13] = partial_lse[part_row_113];
+                                    float _vec_load_129[2];
                                     {
-                                        float2 _v2_221 = *reinterpret_cast<const float2*>(partial_out + (part_row_93 * 256 + dim_2[1]) + 0);
-                                        _vec_load_109[0] = _v2_221.x;
-                                        _vec_load_109[0 + 1] = _v2_221.y;
+                                        float2 _v2_241 = *reinterpret_cast<const float2*>(partial_out + (part_row_113 * 256 + dim_2[0]) + 0);
+                                        _vec_load_129[0] = _v2_241.x;
+                                        _vec_load_129[0 + 1] = _v2_241.y;
                                     }
-                                    p0_2[13] = _vec_load_109[0];
-                                    p1_2[13] = _vec_load_109[1];
+                                    p0_2[13] = _vec_load_129[0];
+                                    p1_2[13] = _vec_load_129[1];
                                 }
                                 lse_2[14] = -CUDART_INF_F;
-                                if (num_splits > 6) {
-                                    long long part_row_94 = 6 * split_pitch + row_head_2[1];
-                                    lse_2[14] = partial_lse[part_row_94];
-                                    float _vec_load_110[2];
+                                if (num_splits > 14) {
+                                    long long part_row_114 = 14 * split_pitch + row_head_2[0];
+                                    lse_2[14] = partial_lse[part_row_114];
+                                    float _vec_load_130[2];
                                     {
-                                        float2 _v2_222 = *reinterpret_cast<const float2*>(partial_out + (part_row_94 * 256 + dim_2[1]) + 0);
-                                        _vec_load_110[0] = _v2_222.x;
-                                        _vec_load_110[0 + 1] = _v2_222.y;
+                                        float2 _v2_242 = *reinterpret_cast<const float2*>(partial_out + (part_row_114 * 256 + dim_2[0]) + 0);
+                                        _vec_load_130[0] = _v2_242.x;
+                                        _vec_load_130[0 + 1] = _v2_242.y;
                                     }
-                                    p0_2[14] = _vec_load_110[0];
-                                    p1_2[14] = _vec_load_110[1];
+                                    p0_2[14] = _vec_load_130[0];
+                                    p1_2[14] = _vec_load_130[1];
                                 }
                                 lse_2[15] = -CUDART_INF_F;
-                                if (num_splits > 7) {
-                                    long long part_row_95 = 7 * split_pitch + row_head_2[1];
-                                    lse_2[15] = partial_lse[part_row_95];
-                                    float _vec_load_111[2];
+                                if (num_splits > 15) {
+                                    long long part_row_115 = 15 * split_pitch + row_head_2[0];
+                                    lse_2[15] = partial_lse[part_row_115];
+                                    float _vec_load_131[2];
                                     {
-                                        float2 _v2_223 = *reinterpret_cast<const float2*>(partial_out + (part_row_95 * 256 + dim_2[1]) + 0);
-                                        _vec_load_111[0] = _v2_223.x;
-                                        _vec_load_111[0 + 1] = _v2_223.y;
+                                        float2 _v2_243 = *reinterpret_cast<const float2*>(partial_out + (part_row_115 * 256 + dim_2[0]) + 0);
+                                        _vec_load_131[0] = _v2_243.x;
+                                        _vec_load_131[0 + 1] = _v2_243.y;
                                     }
-                                    p0_2[15] = _vec_load_111[0];
-                                    p1_2[15] = _vec_load_111[1];
+                                    p0_2[15] = _vec_load_131[0];
+                                    p1_2[15] = _vec_load_131[1];
+                                }
+                                lse_2[16] = -CUDART_INF_F;
+                                if (num_splits > 0) {
+                                    long long part_row_116 = row_head_2[1];
+                                    lse_2[16] = partial_lse[part_row_116];
+                                    float _vec_load_132[2];
+                                    {
+                                        float2 _v2_244 = *reinterpret_cast<const float2*>(partial_out + (part_row_116 * 256 + dim_2[1]) + 0);
+                                        _vec_load_132[0] = _v2_244.x;
+                                        _vec_load_132[0 + 1] = _v2_244.y;
+                                    }
+                                    p0_2[16] = _vec_load_132[0];
+                                    p1_2[16] = _vec_load_132[1];
+                                }
+                                lse_2[17] = -CUDART_INF_F;
+                                if (num_splits > 1) {
+                                    long long part_row_117 = split_pitch + row_head_2[1];
+                                    lse_2[17] = partial_lse[part_row_117];
+                                    float _vec_load_133[2];
+                                    {
+                                        float2 _v2_245 = *reinterpret_cast<const float2*>(partial_out + (part_row_117 * 256 + dim_2[1]) + 0);
+                                        _vec_load_133[0] = _v2_245.x;
+                                        _vec_load_133[0 + 1] = _v2_245.y;
+                                    }
+                                    p0_2[17] = _vec_load_133[0];
+                                    p1_2[17] = _vec_load_133[1];
+                                }
+                                lse_2[18] = -CUDART_INF_F;
+                                if (num_splits > 2) {
+                                    long long part_row_118 = 2 * split_pitch + row_head_2[1];
+                                    lse_2[18] = partial_lse[part_row_118];
+                                    float _vec_load_134[2];
+                                    {
+                                        float2 _v2_246 = *reinterpret_cast<const float2*>(partial_out + (part_row_118 * 256 + dim_2[1]) + 0);
+                                        _vec_load_134[0] = _v2_246.x;
+                                        _vec_load_134[0 + 1] = _v2_246.y;
+                                    }
+                                    p0_2[18] = _vec_load_134[0];
+                                    p1_2[18] = _vec_load_134[1];
+                                }
+                                lse_2[19] = -CUDART_INF_F;
+                                if (num_splits > 3) {
+                                    long long part_row_119 = 3 * split_pitch + row_head_2[1];
+                                    lse_2[19] = partial_lse[part_row_119];
+                                    float _vec_load_135[2];
+                                    {
+                                        float2 _v2_247 = *reinterpret_cast<const float2*>(partial_out + (part_row_119 * 256 + dim_2[1]) + 0);
+                                        _vec_load_135[0] = _v2_247.x;
+                                        _vec_load_135[0 + 1] = _v2_247.y;
+                                    }
+                                    p0_2[19] = _vec_load_135[0];
+                                    p1_2[19] = _vec_load_135[1];
+                                }
+                                lse_2[20] = -CUDART_INF_F;
+                                if (num_splits > 4) {
+                                    long long part_row_120 = 4 * split_pitch + row_head_2[1];
+                                    lse_2[20] = partial_lse[part_row_120];
+                                    float _vec_load_136[2];
+                                    {
+                                        float2 _v2_248 = *reinterpret_cast<const float2*>(partial_out + (part_row_120 * 256 + dim_2[1]) + 0);
+                                        _vec_load_136[0] = _v2_248.x;
+                                        _vec_load_136[0 + 1] = _v2_248.y;
+                                    }
+                                    p0_2[20] = _vec_load_136[0];
+                                    p1_2[20] = _vec_load_136[1];
+                                }
+                                lse_2[21] = -CUDART_INF_F;
+                                if (num_splits > 5) {
+                                    long long part_row_121 = 5 * split_pitch + row_head_2[1];
+                                    lse_2[21] = partial_lse[part_row_121];
+                                    float _vec_load_137[2];
+                                    {
+                                        float2 _v2_249 = *reinterpret_cast<const float2*>(partial_out + (part_row_121 * 256 + dim_2[1]) + 0);
+                                        _vec_load_137[0] = _v2_249.x;
+                                        _vec_load_137[0 + 1] = _v2_249.y;
+                                    }
+                                    p0_2[21] = _vec_load_137[0];
+                                    p1_2[21] = _vec_load_137[1];
+                                }
+                                lse_2[22] = -CUDART_INF_F;
+                                if (num_splits > 6) {
+                                    long long part_row_122 = 6 * split_pitch + row_head_2[1];
+                                    lse_2[22] = partial_lse[part_row_122];
+                                    float _vec_load_138[2];
+                                    {
+                                        float2 _v2_250 = *reinterpret_cast<const float2*>(partial_out + (part_row_122 * 256 + dim_2[1]) + 0);
+                                        _vec_load_138[0] = _v2_250.x;
+                                        _vec_load_138[0 + 1] = _v2_250.y;
+                                    }
+                                    p0_2[22] = _vec_load_138[0];
+                                    p1_2[22] = _vec_load_138[1];
+                                }
+                                lse_2[23] = -CUDART_INF_F;
+                                if (num_splits > 7) {
+                                    long long part_row_123 = 7 * split_pitch + row_head_2[1];
+                                    lse_2[23] = partial_lse[part_row_123];
+                                    float _vec_load_139[2];
+                                    {
+                                        float2 _v2_251 = *reinterpret_cast<const float2*>(partial_out + (part_row_123 * 256 + dim_2[1]) + 0);
+                                        _vec_load_139[0] = _v2_251.x;
+                                        _vec_load_139[0 + 1] = _v2_251.y;
+                                    }
+                                    p0_2[23] = _vec_load_139[0];
+                                    p1_2[23] = _vec_load_139[1];
+                                }
+                                lse_2[24] = -CUDART_INF_F;
+                                if (num_splits > 8) {
+                                    long long part_row_124 = 8 * split_pitch + row_head_2[1];
+                                    lse_2[24] = partial_lse[part_row_124];
+                                    float _vec_load_140[2];
+                                    {
+                                        float2 _v2_252 = *reinterpret_cast<const float2*>(partial_out + (part_row_124 * 256 + dim_2[1]) + 0);
+                                        _vec_load_140[0] = _v2_252.x;
+                                        _vec_load_140[0 + 1] = _v2_252.y;
+                                    }
+                                    p0_2[24] = _vec_load_140[0];
+                                    p1_2[24] = _vec_load_140[1];
+                                }
+                                lse_2[25] = -CUDART_INF_F;
+                                if (num_splits > 9) {
+                                    long long part_row_125 = 9 * split_pitch + row_head_2[1];
+                                    lse_2[25] = partial_lse[part_row_125];
+                                    float _vec_load_141[2];
+                                    {
+                                        float2 _v2_253 = *reinterpret_cast<const float2*>(partial_out + (part_row_125 * 256 + dim_2[1]) + 0);
+                                        _vec_load_141[0] = _v2_253.x;
+                                        _vec_load_141[0 + 1] = _v2_253.y;
+                                    }
+                                    p0_2[25] = _vec_load_141[0];
+                                    p1_2[25] = _vec_load_141[1];
+                                }
+                                lse_2[26] = -CUDART_INF_F;
+                                if (num_splits > 10) {
+                                    long long part_row_126 = 10 * split_pitch + row_head_2[1];
+                                    lse_2[26] = partial_lse[part_row_126];
+                                    float _vec_load_142[2];
+                                    {
+                                        float2 _v2_254 = *reinterpret_cast<const float2*>(partial_out + (part_row_126 * 256 + dim_2[1]) + 0);
+                                        _vec_load_142[0] = _v2_254.x;
+                                        _vec_load_142[0 + 1] = _v2_254.y;
+                                    }
+                                    p0_2[26] = _vec_load_142[0];
+                                    p1_2[26] = _vec_load_142[1];
+                                }
+                                lse_2[27] = -CUDART_INF_F;
+                                if (num_splits > 11) {
+                                    long long part_row_127 = 11 * split_pitch + row_head_2[1];
+                                    lse_2[27] = partial_lse[part_row_127];
+                                    float _vec_load_143[2];
+                                    {
+                                        float2 _v2_255 = *reinterpret_cast<const float2*>(partial_out + (part_row_127 * 256 + dim_2[1]) + 0);
+                                        _vec_load_143[0] = _v2_255.x;
+                                        _vec_load_143[0 + 1] = _v2_255.y;
+                                    }
+                                    p0_2[27] = _vec_load_143[0];
+                                    p1_2[27] = _vec_load_143[1];
+                                }
+                                lse_2[28] = -CUDART_INF_F;
+                                if (num_splits > 12) {
+                                    long long part_row_128 = 12 * split_pitch + row_head_2[1];
+                                    lse_2[28] = partial_lse[part_row_128];
+                                    float _vec_load_144[2];
+                                    {
+                                        float2 _v2_256 = *reinterpret_cast<const float2*>(partial_out + (part_row_128 * 256 + dim_2[1]) + 0);
+                                        _vec_load_144[0] = _v2_256.x;
+                                        _vec_load_144[0 + 1] = _v2_256.y;
+                                    }
+                                    p0_2[28] = _vec_load_144[0];
+                                    p1_2[28] = _vec_load_144[1];
+                                }
+                                lse_2[29] = -CUDART_INF_F;
+                                if (num_splits > 13) {
+                                    long long part_row_129 = 13 * split_pitch + row_head_2[1];
+                                    lse_2[29] = partial_lse[part_row_129];
+                                    float _vec_load_145[2];
+                                    {
+                                        float2 _v2_257 = *reinterpret_cast<const float2*>(partial_out + (part_row_129 * 256 + dim_2[1]) + 0);
+                                        _vec_load_145[0] = _v2_257.x;
+                                        _vec_load_145[0 + 1] = _v2_257.y;
+                                    }
+                                    p0_2[29] = _vec_load_145[0];
+                                    p1_2[29] = _vec_load_145[1];
+                                }
+                                lse_2[30] = -CUDART_INF_F;
+                                if (num_splits > 14) {
+                                    long long part_row_130 = 14 * split_pitch + row_head_2[1];
+                                    lse_2[30] = partial_lse[part_row_130];
+                                    float _vec_load_146[2];
+                                    {
+                                        float2 _v2_258 = *reinterpret_cast<const float2*>(partial_out + (part_row_130 * 256 + dim_2[1]) + 0);
+                                        _vec_load_146[0] = _v2_258.x;
+                                        _vec_load_146[0 + 1] = _v2_258.y;
+                                    }
+                                    p0_2[30] = _vec_load_146[0];
+                                    p1_2[30] = _vec_load_146[1];
+                                }
+                                lse_2[31] = -CUDART_INF_F;
+                                if (num_splits > 15) {
+                                    long long part_row_131 = 15 * split_pitch + row_head_2[1];
+                                    lse_2[31] = partial_lse[part_row_131];
+                                    float _vec_load_147[2];
+                                    {
+                                        float2 _v2_259 = *reinterpret_cast<const float2*>(partial_out + (part_row_131 * 256 + dim_2[1]) + 0);
+                                        _vec_load_147[0] = _v2_259.x;
+                                        _vec_load_147[0 + 1] = _v2_259.y;
+                                    }
+                                    p0_2[31] = _vec_load_147[0];
+                                    p1_2[31] = _vec_load_147[1];
                                 }
                                 lse_max_2[0] = fmaxf(lse_max_2[0], lse_2[0]);
                                 lse_max_2[0] = fmaxf(lse_max_2[0], lse_2[1]);
@@ -3883,396 +4775,764 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_max_2[0] = fmaxf(lse_max_2[0], lse_2[5]);
                                 lse_max_2[0] = fmaxf(lse_max_2[0], lse_2[6]);
                                 lse_max_2[0] = fmaxf(lse_max_2[0], lse_2[7]);
-                                lse_max_2[1] = fmaxf(lse_max_2[1], lse_2[8]);
-                                lse_max_2[1] = fmaxf(lse_max_2[1], lse_2[9]);
-                                lse_max_2[1] = fmaxf(lse_max_2[1], lse_2[10]);
-                                lse_max_2[1] = fmaxf(lse_max_2[1], lse_2[11]);
-                                lse_max_2[1] = fmaxf(lse_max_2[1], lse_2[12]);
-                                lse_max_2[1] = fmaxf(lse_max_2[1], lse_2[13]);
-                                lse_max_2[1] = fmaxf(lse_max_2[1], lse_2[14]);
-                                lse_max_2[1] = fmaxf(lse_max_2[1], lse_2[15]);
-                                bool live_19 = num_splits > 0 && lse_max_2[0] > -CUDART_INF_F;
-                                if (live_19) {
-                                    float weight_80 = approx_exp2(lse_2[0] - lse_max_2[0]);
-                                    if (cidx_2[0] == 0) {
-                                        den_2[0] = den_2[0] + weight_80;
-                                        acc0_2[0] = __fmaf_rn(weight_80, p0_2[0], acc0_2[0]);
-                                        acc1_2[0] = __fmaf_rn(weight_80, p1_2[0], acc1_2[0]);
-                                    }
-                                    if (cidx_2[0] == 1) {
-                                        den_2[1] = den_2[1] + weight_80;
-                                        acc0_2[1] = __fmaf_rn(weight_80, p0_2[0], acc0_2[1]);
-                                        acc1_2[1] = __fmaf_rn(weight_80, p1_2[0], acc1_2[1]);
-                                    }
-                                    if (cidx_2[0] == 2) {
-                                        den_2[2] = den_2[2] + weight_80;
-                                        acc0_2[2] = __fmaf_rn(weight_80, p0_2[0], acc0_2[2]);
-                                        acc1_2[2] = __fmaf_rn(weight_80, p1_2[0], acc1_2[2]);
-                                    }
-                                    if (cidx_2[0] == 3) {
-                                        den_2[3] = den_2[3] + weight_80;
-                                        acc0_2[3] = __fmaf_rn(weight_80, p0_2[0], acc0_2[3]);
-                                        acc1_2[3] = __fmaf_rn(weight_80, p1_2[0], acc1_2[3]);
+                                lse_max_2[0] = fmaxf(lse_max_2[0], lse_2[8]);
+                                lse_max_2[0] = fmaxf(lse_max_2[0], lse_2[9]);
+                                lse_max_2[0] = fmaxf(lse_max_2[0], lse_2[10]);
+                                lse_max_2[0] = fmaxf(lse_max_2[0], lse_2[11]);
+                                lse_max_2[0] = fmaxf(lse_max_2[0], lse_2[12]);
+                                lse_max_2[0] = fmaxf(lse_max_2[0], lse_2[13]);
+                                lse_max_2[0] = fmaxf(lse_max_2[0], lse_2[14]);
+                                lse_max_2[0] = fmaxf(lse_max_2[0], lse_2[15]);
+                                lse_max_2[1] = fmaxf(lse_max_2[1], lse_2[16]);
+                                lse_max_2[1] = fmaxf(lse_max_2[1], lse_2[17]);
+                                lse_max_2[1] = fmaxf(lse_max_2[1], lse_2[18]);
+                                lse_max_2[1] = fmaxf(lse_max_2[1], lse_2[19]);
+                                lse_max_2[1] = fmaxf(lse_max_2[1], lse_2[20]);
+                                lse_max_2[1] = fmaxf(lse_max_2[1], lse_2[21]);
+                                lse_max_2[1] = fmaxf(lse_max_2[1], lse_2[22]);
+                                lse_max_2[1] = fmaxf(lse_max_2[1], lse_2[23]);
+                                lse_max_2[1] = fmaxf(lse_max_2[1], lse_2[24]);
+                                lse_max_2[1] = fmaxf(lse_max_2[1], lse_2[25]);
+                                lse_max_2[1] = fmaxf(lse_max_2[1], lse_2[26]);
+                                lse_max_2[1] = fmaxf(lse_max_2[1], lse_2[27]);
+                                lse_max_2[1] = fmaxf(lse_max_2[1], lse_2[28]);
+                                lse_max_2[1] = fmaxf(lse_max_2[1], lse_2[29]);
+                                lse_max_2[1] = fmaxf(lse_max_2[1], lse_2[30]);
+                                lse_max_2[1] = fmaxf(lse_max_2[1], lse_2[31]);
+                                bool live_36 = num_splits > 0 && lse_max_2[0] > -CUDART_INF_F;
+                                if (live_36) {
+                                    float weight_100 = approx_exp2(lse_2[0] - lse_max_2[0]);
+                                    if (bound_1[0] > 0) {
+                                        den_2[0] = den_2[0] + weight_100;
+                                        acc0_2[0] = __fmaf_rn(weight_100, p0_2[0], acc0_2[0]);
+                                        acc1_2[0] = __fmaf_rn(weight_100, p1_2[0], acc1_2[0]);
+                                    } else if (bound_1[1] > 0) {
+                                        den_2[1] = den_2[1] + weight_100;
+                                        acc0_2[1] = __fmaf_rn(weight_100, p0_2[0], acc0_2[1]);
+                                        acc1_2[1] = __fmaf_rn(weight_100, p1_2[0], acc1_2[1]);
+                                    } else {
+                                        if (bound_1[2] > 0) {
+                                            den_2[2] = den_2[2] + weight_100;
+                                            acc0_2[2] = __fmaf_rn(weight_100, p0_2[0], acc0_2[2]);
+                                            acc1_2[2] = __fmaf_rn(weight_100, p1_2[0], acc1_2[2]);
+                                        } else {
+                                            den_2[3] = den_2[3] + weight_100;
+                                            acc0_2[3] = __fmaf_rn(weight_100, p0_2[0], acc0_2[3]);
+                                            acc1_2[3] = __fmaf_rn(weight_100, p1_2[0], acc1_2[3]);
+                                        }
                                     }
                                 }
                                 bool live_3_5 = num_splits > 1 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_3_5) {
-                                    float weight_81 = approx_exp2(lse_2[1] - lse_max_2[0]);
-                                    if (cidx_2[1] == 0) {
-                                        den_2[0] = den_2[0] + weight_81;
-                                        acc0_2[0] = __fmaf_rn(weight_81, p0_2[1], acc0_2[0]);
-                                        acc1_2[0] = __fmaf_rn(weight_81, p1_2[1], acc1_2[0]);
-                                    }
-                                    if (cidx_2[1] == 1) {
-                                        den_2[1] = den_2[1] + weight_81;
-                                        acc0_2[1] = __fmaf_rn(weight_81, p0_2[1], acc0_2[1]);
-                                        acc1_2[1] = __fmaf_rn(weight_81, p1_2[1], acc1_2[1]);
-                                    }
-                                    if (cidx_2[1] == 2) {
-                                        den_2[2] = den_2[2] + weight_81;
-                                        acc0_2[2] = __fmaf_rn(weight_81, p0_2[1], acc0_2[2]);
-                                        acc1_2[2] = __fmaf_rn(weight_81, p1_2[1], acc1_2[2]);
-                                    }
-                                    if (cidx_2[1] == 3) {
-                                        den_2[3] = den_2[3] + weight_81;
-                                        acc0_2[3] = __fmaf_rn(weight_81, p0_2[1], acc0_2[3]);
-                                        acc1_2[3] = __fmaf_rn(weight_81, p1_2[1], acc1_2[3]);
+                                    float weight_101 = approx_exp2(lse_2[1] - lse_max_2[0]);
+                                    if (bound_1[0] > 1) {
+                                        den_2[0] = den_2[0] + weight_101;
+                                        acc0_2[0] = __fmaf_rn(weight_101, p0_2[1], acc0_2[0]);
+                                        acc1_2[0] = __fmaf_rn(weight_101, p1_2[1], acc1_2[0]);
+                                    } else if (bound_1[1] > 1) {
+                                        den_2[1] = den_2[1] + weight_101;
+                                        acc0_2[1] = __fmaf_rn(weight_101, p0_2[1], acc0_2[1]);
+                                        acc1_2[1] = __fmaf_rn(weight_101, p1_2[1], acc1_2[1]);
+                                    } else {
+                                        if (bound_1[2] > 1) {
+                                            den_2[2] = den_2[2] + weight_101;
+                                            acc0_2[2] = __fmaf_rn(weight_101, p0_2[1], acc0_2[2]);
+                                            acc1_2[2] = __fmaf_rn(weight_101, p1_2[1], acc1_2[2]);
+                                        } else {
+                                            den_2[3] = den_2[3] + weight_101;
+                                            acc0_2[3] = __fmaf_rn(weight_101, p0_2[1], acc0_2[3]);
+                                            acc1_2[3] = __fmaf_rn(weight_101, p1_2[1], acc1_2[3]);
+                                        }
                                     }
                                 }
                                 bool live_4_5 = num_splits > 2 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_4_5) {
-                                    float weight_82 = approx_exp2(lse_2[2] - lse_max_2[0]);
-                                    if (cidx_2[2] == 0) {
-                                        den_2[0] = den_2[0] + weight_82;
-                                        acc0_2[0] = __fmaf_rn(weight_82, p0_2[2], acc0_2[0]);
-                                        acc1_2[0] = __fmaf_rn(weight_82, p1_2[2], acc1_2[0]);
-                                    }
-                                    if (cidx_2[2] == 1) {
-                                        den_2[1] = den_2[1] + weight_82;
-                                        acc0_2[1] = __fmaf_rn(weight_82, p0_2[2], acc0_2[1]);
-                                        acc1_2[1] = __fmaf_rn(weight_82, p1_2[2], acc1_2[1]);
-                                    }
-                                    if (cidx_2[2] == 2) {
-                                        den_2[2] = den_2[2] + weight_82;
-                                        acc0_2[2] = __fmaf_rn(weight_82, p0_2[2], acc0_2[2]);
-                                        acc1_2[2] = __fmaf_rn(weight_82, p1_2[2], acc1_2[2]);
-                                    }
-                                    if (cidx_2[2] == 3) {
-                                        den_2[3] = den_2[3] + weight_82;
-                                        acc0_2[3] = __fmaf_rn(weight_82, p0_2[2], acc0_2[3]);
-                                        acc1_2[3] = __fmaf_rn(weight_82, p1_2[2], acc1_2[3]);
+                                    float weight_102 = approx_exp2(lse_2[2] - lse_max_2[0]);
+                                    if (bound_1[0] > 2) {
+                                        den_2[0] = den_2[0] + weight_102;
+                                        acc0_2[0] = __fmaf_rn(weight_102, p0_2[2], acc0_2[0]);
+                                        acc1_2[0] = __fmaf_rn(weight_102, p1_2[2], acc1_2[0]);
+                                    } else if (bound_1[1] > 2) {
+                                        den_2[1] = den_2[1] + weight_102;
+                                        acc0_2[1] = __fmaf_rn(weight_102, p0_2[2], acc0_2[1]);
+                                        acc1_2[1] = __fmaf_rn(weight_102, p1_2[2], acc1_2[1]);
+                                    } else {
+                                        if (bound_1[2] > 2) {
+                                            den_2[2] = den_2[2] + weight_102;
+                                            acc0_2[2] = __fmaf_rn(weight_102, p0_2[2], acc0_2[2]);
+                                            acc1_2[2] = __fmaf_rn(weight_102, p1_2[2], acc1_2[2]);
+                                        } else {
+                                            den_2[3] = den_2[3] + weight_102;
+                                            acc0_2[3] = __fmaf_rn(weight_102, p0_2[2], acc0_2[3]);
+                                            acc1_2[3] = __fmaf_rn(weight_102, p1_2[2], acc1_2[3]);
+                                        }
                                     }
                                 }
                                 bool live_5_5 = num_splits > 3 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_5_5) {
-                                    float weight_83 = approx_exp2(lse_2[3] - lse_max_2[0]);
-                                    if (cidx_2[3] == 0) {
-                                        den_2[0] = den_2[0] + weight_83;
-                                        acc0_2[0] = __fmaf_rn(weight_83, p0_2[3], acc0_2[0]);
-                                        acc1_2[0] = __fmaf_rn(weight_83, p1_2[3], acc1_2[0]);
-                                    }
-                                    if (cidx_2[3] == 1) {
-                                        den_2[1] = den_2[1] + weight_83;
-                                        acc0_2[1] = __fmaf_rn(weight_83, p0_2[3], acc0_2[1]);
-                                        acc1_2[1] = __fmaf_rn(weight_83, p1_2[3], acc1_2[1]);
-                                    }
-                                    if (cidx_2[3] == 2) {
-                                        den_2[2] = den_2[2] + weight_83;
-                                        acc0_2[2] = __fmaf_rn(weight_83, p0_2[3], acc0_2[2]);
-                                        acc1_2[2] = __fmaf_rn(weight_83, p1_2[3], acc1_2[2]);
-                                    }
-                                    if (cidx_2[3] == 3) {
-                                        den_2[3] = den_2[3] + weight_83;
-                                        acc0_2[3] = __fmaf_rn(weight_83, p0_2[3], acc0_2[3]);
-                                        acc1_2[3] = __fmaf_rn(weight_83, p1_2[3], acc1_2[3]);
+                                    float weight_103 = approx_exp2(lse_2[3] - lse_max_2[0]);
+                                    if (bound_1[0] > 3) {
+                                        den_2[0] = den_2[0] + weight_103;
+                                        acc0_2[0] = __fmaf_rn(weight_103, p0_2[3], acc0_2[0]);
+                                        acc1_2[0] = __fmaf_rn(weight_103, p1_2[3], acc1_2[0]);
+                                    } else if (bound_1[1] > 3) {
+                                        den_2[1] = den_2[1] + weight_103;
+                                        acc0_2[1] = __fmaf_rn(weight_103, p0_2[3], acc0_2[1]);
+                                        acc1_2[1] = __fmaf_rn(weight_103, p1_2[3], acc1_2[1]);
+                                    } else {
+                                        if (bound_1[2] > 3) {
+                                            den_2[2] = den_2[2] + weight_103;
+                                            acc0_2[2] = __fmaf_rn(weight_103, p0_2[3], acc0_2[2]);
+                                            acc1_2[2] = __fmaf_rn(weight_103, p1_2[3], acc1_2[2]);
+                                        } else {
+                                            den_2[3] = den_2[3] + weight_103;
+                                            acc0_2[3] = __fmaf_rn(weight_103, p0_2[3], acc0_2[3]);
+                                            acc1_2[3] = __fmaf_rn(weight_103, p1_2[3], acc1_2[3]);
+                                        }
                                     }
                                 }
                                 bool live_6_5 = num_splits > 4 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_6_5) {
-                                    float weight_84 = approx_exp2(lse_2[4] - lse_max_2[0]);
-                                    if (cidx_2[4] == 0) {
-                                        den_2[0] = den_2[0] + weight_84;
-                                        acc0_2[0] = __fmaf_rn(weight_84, p0_2[4], acc0_2[0]);
-                                        acc1_2[0] = __fmaf_rn(weight_84, p1_2[4], acc1_2[0]);
-                                    }
-                                    if (cidx_2[4] == 1) {
-                                        den_2[1] = den_2[1] + weight_84;
-                                        acc0_2[1] = __fmaf_rn(weight_84, p0_2[4], acc0_2[1]);
-                                        acc1_2[1] = __fmaf_rn(weight_84, p1_2[4], acc1_2[1]);
-                                    }
-                                    if (cidx_2[4] == 2) {
-                                        den_2[2] = den_2[2] + weight_84;
-                                        acc0_2[2] = __fmaf_rn(weight_84, p0_2[4], acc0_2[2]);
-                                        acc1_2[2] = __fmaf_rn(weight_84, p1_2[4], acc1_2[2]);
-                                    }
-                                    if (cidx_2[4] == 3) {
-                                        den_2[3] = den_2[3] + weight_84;
-                                        acc0_2[3] = __fmaf_rn(weight_84, p0_2[4], acc0_2[3]);
-                                        acc1_2[3] = __fmaf_rn(weight_84, p1_2[4], acc1_2[3]);
+                                    float weight_104 = approx_exp2(lse_2[4] - lse_max_2[0]);
+                                    if (bound_1[0] > 4) {
+                                        den_2[0] = den_2[0] + weight_104;
+                                        acc0_2[0] = __fmaf_rn(weight_104, p0_2[4], acc0_2[0]);
+                                        acc1_2[0] = __fmaf_rn(weight_104, p1_2[4], acc1_2[0]);
+                                    } else if (bound_1[1] > 4) {
+                                        den_2[1] = den_2[1] + weight_104;
+                                        acc0_2[1] = __fmaf_rn(weight_104, p0_2[4], acc0_2[1]);
+                                        acc1_2[1] = __fmaf_rn(weight_104, p1_2[4], acc1_2[1]);
+                                    } else {
+                                        if (bound_1[2] > 4) {
+                                            den_2[2] = den_2[2] + weight_104;
+                                            acc0_2[2] = __fmaf_rn(weight_104, p0_2[4], acc0_2[2]);
+                                            acc1_2[2] = __fmaf_rn(weight_104, p1_2[4], acc1_2[2]);
+                                        } else {
+                                            den_2[3] = den_2[3] + weight_104;
+                                            acc0_2[3] = __fmaf_rn(weight_104, p0_2[4], acc0_2[3]);
+                                            acc1_2[3] = __fmaf_rn(weight_104, p1_2[4], acc1_2[3]);
+                                        }
                                     }
                                 }
                                 bool live_7_5 = num_splits > 5 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_7_5) {
-                                    float weight_85 = approx_exp2(lse_2[5] - lse_max_2[0]);
-                                    if (cidx_2[5] == 0) {
-                                        den_2[0] = den_2[0] + weight_85;
-                                        acc0_2[0] = __fmaf_rn(weight_85, p0_2[5], acc0_2[0]);
-                                        acc1_2[0] = __fmaf_rn(weight_85, p1_2[5], acc1_2[0]);
-                                    }
-                                    if (cidx_2[5] == 1) {
-                                        den_2[1] = den_2[1] + weight_85;
-                                        acc0_2[1] = __fmaf_rn(weight_85, p0_2[5], acc0_2[1]);
-                                        acc1_2[1] = __fmaf_rn(weight_85, p1_2[5], acc1_2[1]);
-                                    }
-                                    if (cidx_2[5] == 2) {
-                                        den_2[2] = den_2[2] + weight_85;
-                                        acc0_2[2] = __fmaf_rn(weight_85, p0_2[5], acc0_2[2]);
-                                        acc1_2[2] = __fmaf_rn(weight_85, p1_2[5], acc1_2[2]);
-                                    }
-                                    if (cidx_2[5] == 3) {
-                                        den_2[3] = den_2[3] + weight_85;
-                                        acc0_2[3] = __fmaf_rn(weight_85, p0_2[5], acc0_2[3]);
-                                        acc1_2[3] = __fmaf_rn(weight_85, p1_2[5], acc1_2[3]);
+                                    float weight_105 = approx_exp2(lse_2[5] - lse_max_2[0]);
+                                    if (bound_1[0] > 5) {
+                                        den_2[0] = den_2[0] + weight_105;
+                                        acc0_2[0] = __fmaf_rn(weight_105, p0_2[5], acc0_2[0]);
+                                        acc1_2[0] = __fmaf_rn(weight_105, p1_2[5], acc1_2[0]);
+                                    } else if (bound_1[1] > 5) {
+                                        den_2[1] = den_2[1] + weight_105;
+                                        acc0_2[1] = __fmaf_rn(weight_105, p0_2[5], acc0_2[1]);
+                                        acc1_2[1] = __fmaf_rn(weight_105, p1_2[5], acc1_2[1]);
+                                    } else {
+                                        if (bound_1[2] > 5) {
+                                            den_2[2] = den_2[2] + weight_105;
+                                            acc0_2[2] = __fmaf_rn(weight_105, p0_2[5], acc0_2[2]);
+                                            acc1_2[2] = __fmaf_rn(weight_105, p1_2[5], acc1_2[2]);
+                                        } else {
+                                            den_2[3] = den_2[3] + weight_105;
+                                            acc0_2[3] = __fmaf_rn(weight_105, p0_2[5], acc0_2[3]);
+                                            acc1_2[3] = __fmaf_rn(weight_105, p1_2[5], acc1_2[3]);
+                                        }
                                     }
                                 }
                                 bool live_8_5 = num_splits > 6 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_8_5) {
-                                    float weight_86 = approx_exp2(lse_2[6] - lse_max_2[0]);
-                                    if (cidx_2[6] == 0) {
-                                        den_2[0] = den_2[0] + weight_86;
-                                        acc0_2[0] = __fmaf_rn(weight_86, p0_2[6], acc0_2[0]);
-                                        acc1_2[0] = __fmaf_rn(weight_86, p1_2[6], acc1_2[0]);
-                                    }
-                                    if (cidx_2[6] == 1) {
-                                        den_2[1] = den_2[1] + weight_86;
-                                        acc0_2[1] = __fmaf_rn(weight_86, p0_2[6], acc0_2[1]);
-                                        acc1_2[1] = __fmaf_rn(weight_86, p1_2[6], acc1_2[1]);
-                                    }
-                                    if (cidx_2[6] == 2) {
-                                        den_2[2] = den_2[2] + weight_86;
-                                        acc0_2[2] = __fmaf_rn(weight_86, p0_2[6], acc0_2[2]);
-                                        acc1_2[2] = __fmaf_rn(weight_86, p1_2[6], acc1_2[2]);
-                                    }
-                                    if (cidx_2[6] == 3) {
-                                        den_2[3] = den_2[3] + weight_86;
-                                        acc0_2[3] = __fmaf_rn(weight_86, p0_2[6], acc0_2[3]);
-                                        acc1_2[3] = __fmaf_rn(weight_86, p1_2[6], acc1_2[3]);
+                                    float weight_106 = approx_exp2(lse_2[6] - lse_max_2[0]);
+                                    if (bound_1[0] > 6) {
+                                        den_2[0] = den_2[0] + weight_106;
+                                        acc0_2[0] = __fmaf_rn(weight_106, p0_2[6], acc0_2[0]);
+                                        acc1_2[0] = __fmaf_rn(weight_106, p1_2[6], acc1_2[0]);
+                                    } else if (bound_1[1] > 6) {
+                                        den_2[1] = den_2[1] + weight_106;
+                                        acc0_2[1] = __fmaf_rn(weight_106, p0_2[6], acc0_2[1]);
+                                        acc1_2[1] = __fmaf_rn(weight_106, p1_2[6], acc1_2[1]);
+                                    } else {
+                                        if (bound_1[2] > 6) {
+                                            den_2[2] = den_2[2] + weight_106;
+                                            acc0_2[2] = __fmaf_rn(weight_106, p0_2[6], acc0_2[2]);
+                                            acc1_2[2] = __fmaf_rn(weight_106, p1_2[6], acc1_2[2]);
+                                        } else {
+                                            den_2[3] = den_2[3] + weight_106;
+                                            acc0_2[3] = __fmaf_rn(weight_106, p0_2[6], acc0_2[3]);
+                                            acc1_2[3] = __fmaf_rn(weight_106, p1_2[6], acc1_2[3]);
+                                        }
                                     }
                                 }
                                 bool live_9_5 = num_splits > 7 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_9_5) {
-                                    float weight_87 = approx_exp2(lse_2[7] - lse_max_2[0]);
-                                    if (cidx_2[7] == 0) {
-                                        den_2[0] = den_2[0] + weight_87;
-                                        acc0_2[0] = __fmaf_rn(weight_87, p0_2[7], acc0_2[0]);
-                                        acc1_2[0] = __fmaf_rn(weight_87, p1_2[7], acc1_2[0]);
-                                    }
-                                    if (cidx_2[7] == 1) {
-                                        den_2[1] = den_2[1] + weight_87;
-                                        acc0_2[1] = __fmaf_rn(weight_87, p0_2[7], acc0_2[1]);
-                                        acc1_2[1] = __fmaf_rn(weight_87, p1_2[7], acc1_2[1]);
-                                    }
-                                    if (cidx_2[7] == 2) {
-                                        den_2[2] = den_2[2] + weight_87;
-                                        acc0_2[2] = __fmaf_rn(weight_87, p0_2[7], acc0_2[2]);
-                                        acc1_2[2] = __fmaf_rn(weight_87, p1_2[7], acc1_2[2]);
-                                    }
-                                    if (cidx_2[7] == 3) {
-                                        den_2[3] = den_2[3] + weight_87;
-                                        acc0_2[3] = __fmaf_rn(weight_87, p0_2[7], acc0_2[3]);
-                                        acc1_2[3] = __fmaf_rn(weight_87, p1_2[7], acc1_2[3]);
+                                    float weight_107 = approx_exp2(lse_2[7] - lse_max_2[0]);
+                                    if (bound_1[0] > 7) {
+                                        den_2[0] = den_2[0] + weight_107;
+                                        acc0_2[0] = __fmaf_rn(weight_107, p0_2[7], acc0_2[0]);
+                                        acc1_2[0] = __fmaf_rn(weight_107, p1_2[7], acc1_2[0]);
+                                    } else if (bound_1[1] > 7) {
+                                        den_2[1] = den_2[1] + weight_107;
+                                        acc0_2[1] = __fmaf_rn(weight_107, p0_2[7], acc0_2[1]);
+                                        acc1_2[1] = __fmaf_rn(weight_107, p1_2[7], acc1_2[1]);
+                                    } else {
+                                        if (bound_1[2] > 7) {
+                                            den_2[2] = den_2[2] + weight_107;
+                                            acc0_2[2] = __fmaf_rn(weight_107, p0_2[7], acc0_2[2]);
+                                            acc1_2[2] = __fmaf_rn(weight_107, p1_2[7], acc1_2[2]);
+                                        } else {
+                                            den_2[3] = den_2[3] + weight_107;
+                                            acc0_2[3] = __fmaf_rn(weight_107, p0_2[7], acc0_2[3]);
+                                            acc1_2[3] = __fmaf_rn(weight_107, p1_2[7], acc1_2[3]);
+                                        }
                                     }
                                 }
-                                bool live_10_5 = num_splits > 0 && lse_max_2[1] > -CUDART_INF_F;
+                                bool live_10_5 = num_splits > 8 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_10_5) {
-                                    float weight_88 = approx_exp2(lse_2[8] - lse_max_2[1]);
-                                    if (cidx_2[0] == 0) {
-                                        den_2[4] = den_2[4] + weight_88;
-                                        acc0_2[4] = __fmaf_rn(weight_88, p0_2[8], acc0_2[4]);
-                                        acc1_2[4] = __fmaf_rn(weight_88, p1_2[8], acc1_2[4]);
-                                    }
-                                    if (cidx_2[0] == 1) {
-                                        den_2[5] = den_2[5] + weight_88;
-                                        acc0_2[5] = __fmaf_rn(weight_88, p0_2[8], acc0_2[5]);
-                                        acc1_2[5] = __fmaf_rn(weight_88, p1_2[8], acc1_2[5]);
-                                    }
-                                    if (cidx_2[0] == 2) {
-                                        den_2[6] = den_2[6] + weight_88;
-                                        acc0_2[6] = __fmaf_rn(weight_88, p0_2[8], acc0_2[6]);
-                                        acc1_2[6] = __fmaf_rn(weight_88, p1_2[8], acc1_2[6]);
-                                    }
-                                    if (cidx_2[0] == 3) {
-                                        den_2[7] = den_2[7] + weight_88;
-                                        acc0_2[7] = __fmaf_rn(weight_88, p0_2[8], acc0_2[7]);
-                                        acc1_2[7] = __fmaf_rn(weight_88, p1_2[8], acc1_2[7]);
+                                    float weight_108 = approx_exp2(lse_2[8] - lse_max_2[0]);
+                                    if (bound_1[0] > 8) {
+                                        den_2[0] = den_2[0] + weight_108;
+                                        acc0_2[0] = __fmaf_rn(weight_108, p0_2[8], acc0_2[0]);
+                                        acc1_2[0] = __fmaf_rn(weight_108, p1_2[8], acc1_2[0]);
+                                    } else if (bound_1[1] > 8) {
+                                        den_2[1] = den_2[1] + weight_108;
+                                        acc0_2[1] = __fmaf_rn(weight_108, p0_2[8], acc0_2[1]);
+                                        acc1_2[1] = __fmaf_rn(weight_108, p1_2[8], acc1_2[1]);
+                                    } else {
+                                        if (bound_1[2] > 8) {
+                                            den_2[2] = den_2[2] + weight_108;
+                                            acc0_2[2] = __fmaf_rn(weight_108, p0_2[8], acc0_2[2]);
+                                            acc1_2[2] = __fmaf_rn(weight_108, p1_2[8], acc1_2[2]);
+                                        } else {
+                                            den_2[3] = den_2[3] + weight_108;
+                                            acc0_2[3] = __fmaf_rn(weight_108, p0_2[8], acc0_2[3]);
+                                            acc1_2[3] = __fmaf_rn(weight_108, p1_2[8], acc1_2[3]);
+                                        }
                                     }
                                 }
-                                bool live_11_5 = num_splits > 1 && lse_max_2[1] > -CUDART_INF_F;
+                                bool live_11_5 = num_splits > 9 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_11_5) {
-                                    float weight_89 = approx_exp2(lse_2[9] - lse_max_2[1]);
-                                    if (cidx_2[1] == 0) {
-                                        den_2[4] = den_2[4] + weight_89;
-                                        acc0_2[4] = __fmaf_rn(weight_89, p0_2[9], acc0_2[4]);
-                                        acc1_2[4] = __fmaf_rn(weight_89, p1_2[9], acc1_2[4]);
-                                    }
-                                    if (cidx_2[1] == 1) {
-                                        den_2[5] = den_2[5] + weight_89;
-                                        acc0_2[5] = __fmaf_rn(weight_89, p0_2[9], acc0_2[5]);
-                                        acc1_2[5] = __fmaf_rn(weight_89, p1_2[9], acc1_2[5]);
-                                    }
-                                    if (cidx_2[1] == 2) {
-                                        den_2[6] = den_2[6] + weight_89;
-                                        acc0_2[6] = __fmaf_rn(weight_89, p0_2[9], acc0_2[6]);
-                                        acc1_2[6] = __fmaf_rn(weight_89, p1_2[9], acc1_2[6]);
-                                    }
-                                    if (cidx_2[1] == 3) {
-                                        den_2[7] = den_2[7] + weight_89;
-                                        acc0_2[7] = __fmaf_rn(weight_89, p0_2[9], acc0_2[7]);
-                                        acc1_2[7] = __fmaf_rn(weight_89, p1_2[9], acc1_2[7]);
+                                    float weight_109 = approx_exp2(lse_2[9] - lse_max_2[0]);
+                                    if (bound_1[0] > 9) {
+                                        den_2[0] = den_2[0] + weight_109;
+                                        acc0_2[0] = __fmaf_rn(weight_109, p0_2[9], acc0_2[0]);
+                                        acc1_2[0] = __fmaf_rn(weight_109, p1_2[9], acc1_2[0]);
+                                    } else if (bound_1[1] > 9) {
+                                        den_2[1] = den_2[1] + weight_109;
+                                        acc0_2[1] = __fmaf_rn(weight_109, p0_2[9], acc0_2[1]);
+                                        acc1_2[1] = __fmaf_rn(weight_109, p1_2[9], acc1_2[1]);
+                                    } else {
+                                        if (bound_1[2] > 9) {
+                                            den_2[2] = den_2[2] + weight_109;
+                                            acc0_2[2] = __fmaf_rn(weight_109, p0_2[9], acc0_2[2]);
+                                            acc1_2[2] = __fmaf_rn(weight_109, p1_2[9], acc1_2[2]);
+                                        } else {
+                                            den_2[3] = den_2[3] + weight_109;
+                                            acc0_2[3] = __fmaf_rn(weight_109, p0_2[9], acc0_2[3]);
+                                            acc1_2[3] = __fmaf_rn(weight_109, p1_2[9], acc1_2[3]);
+                                        }
                                     }
                                 }
-                                bool live_12_5 = num_splits > 2 && lse_max_2[1] > -CUDART_INF_F;
+                                bool live_12_5 = num_splits > 10 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_12_5) {
-                                    float weight_90 = approx_exp2(lse_2[10] - lse_max_2[1]);
-                                    if (cidx_2[2] == 0) {
-                                        den_2[4] = den_2[4] + weight_90;
-                                        acc0_2[4] = __fmaf_rn(weight_90, p0_2[10], acc0_2[4]);
-                                        acc1_2[4] = __fmaf_rn(weight_90, p1_2[10], acc1_2[4]);
-                                    }
-                                    if (cidx_2[2] == 1) {
-                                        den_2[5] = den_2[5] + weight_90;
-                                        acc0_2[5] = __fmaf_rn(weight_90, p0_2[10], acc0_2[5]);
-                                        acc1_2[5] = __fmaf_rn(weight_90, p1_2[10], acc1_2[5]);
-                                    }
-                                    if (cidx_2[2] == 2) {
-                                        den_2[6] = den_2[6] + weight_90;
-                                        acc0_2[6] = __fmaf_rn(weight_90, p0_2[10], acc0_2[6]);
-                                        acc1_2[6] = __fmaf_rn(weight_90, p1_2[10], acc1_2[6]);
-                                    }
-                                    if (cidx_2[2] == 3) {
-                                        den_2[7] = den_2[7] + weight_90;
-                                        acc0_2[7] = __fmaf_rn(weight_90, p0_2[10], acc0_2[7]);
-                                        acc1_2[7] = __fmaf_rn(weight_90, p1_2[10], acc1_2[7]);
+                                    float weight_110 = approx_exp2(lse_2[10] - lse_max_2[0]);
+                                    if (bound_1[0] > 10) {
+                                        den_2[0] = den_2[0] + weight_110;
+                                        acc0_2[0] = __fmaf_rn(weight_110, p0_2[10], acc0_2[0]);
+                                        acc1_2[0] = __fmaf_rn(weight_110, p1_2[10], acc1_2[0]);
+                                    } else if (bound_1[1] > 10) {
+                                        den_2[1] = den_2[1] + weight_110;
+                                        acc0_2[1] = __fmaf_rn(weight_110, p0_2[10], acc0_2[1]);
+                                        acc1_2[1] = __fmaf_rn(weight_110, p1_2[10], acc1_2[1]);
+                                    } else {
+                                        if (bound_1[2] > 10) {
+                                            den_2[2] = den_2[2] + weight_110;
+                                            acc0_2[2] = __fmaf_rn(weight_110, p0_2[10], acc0_2[2]);
+                                            acc1_2[2] = __fmaf_rn(weight_110, p1_2[10], acc1_2[2]);
+                                        } else {
+                                            den_2[3] = den_2[3] + weight_110;
+                                            acc0_2[3] = __fmaf_rn(weight_110, p0_2[10], acc0_2[3]);
+                                            acc1_2[3] = __fmaf_rn(weight_110, p1_2[10], acc1_2[3]);
+                                        }
                                     }
                                 }
-                                bool live_13_5 = num_splits > 3 && lse_max_2[1] > -CUDART_INF_F;
+                                bool live_13_5 = num_splits > 11 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_13_5) {
-                                    float weight_91 = approx_exp2(lse_2[11] - lse_max_2[1]);
-                                    if (cidx_2[3] == 0) {
-                                        den_2[4] = den_2[4] + weight_91;
-                                        acc0_2[4] = __fmaf_rn(weight_91, p0_2[11], acc0_2[4]);
-                                        acc1_2[4] = __fmaf_rn(weight_91, p1_2[11], acc1_2[4]);
-                                    }
-                                    if (cidx_2[3] == 1) {
-                                        den_2[5] = den_2[5] + weight_91;
-                                        acc0_2[5] = __fmaf_rn(weight_91, p0_2[11], acc0_2[5]);
-                                        acc1_2[5] = __fmaf_rn(weight_91, p1_2[11], acc1_2[5]);
-                                    }
-                                    if (cidx_2[3] == 2) {
-                                        den_2[6] = den_2[6] + weight_91;
-                                        acc0_2[6] = __fmaf_rn(weight_91, p0_2[11], acc0_2[6]);
-                                        acc1_2[6] = __fmaf_rn(weight_91, p1_2[11], acc1_2[6]);
-                                    }
-                                    if (cidx_2[3] == 3) {
-                                        den_2[7] = den_2[7] + weight_91;
-                                        acc0_2[7] = __fmaf_rn(weight_91, p0_2[11], acc0_2[7]);
-                                        acc1_2[7] = __fmaf_rn(weight_91, p1_2[11], acc1_2[7]);
+                                    float weight_111 = approx_exp2(lse_2[11] - lse_max_2[0]);
+                                    if (bound_1[0] > 11) {
+                                        den_2[0] = den_2[0] + weight_111;
+                                        acc0_2[0] = __fmaf_rn(weight_111, p0_2[11], acc0_2[0]);
+                                        acc1_2[0] = __fmaf_rn(weight_111, p1_2[11], acc1_2[0]);
+                                    } else if (bound_1[1] > 11) {
+                                        den_2[1] = den_2[1] + weight_111;
+                                        acc0_2[1] = __fmaf_rn(weight_111, p0_2[11], acc0_2[1]);
+                                        acc1_2[1] = __fmaf_rn(weight_111, p1_2[11], acc1_2[1]);
+                                    } else {
+                                        if (bound_1[2] > 11) {
+                                            den_2[2] = den_2[2] + weight_111;
+                                            acc0_2[2] = __fmaf_rn(weight_111, p0_2[11], acc0_2[2]);
+                                            acc1_2[2] = __fmaf_rn(weight_111, p1_2[11], acc1_2[2]);
+                                        } else {
+                                            den_2[3] = den_2[3] + weight_111;
+                                            acc0_2[3] = __fmaf_rn(weight_111, p0_2[11], acc0_2[3]);
+                                            acc1_2[3] = __fmaf_rn(weight_111, p1_2[11], acc1_2[3]);
+                                        }
                                     }
                                 }
-                                bool live_14_5 = num_splits > 4 && lse_max_2[1] > -CUDART_INF_F;
+                                bool live_14_5 = num_splits > 12 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_14_5) {
-                                    float weight_92 = approx_exp2(lse_2[12] - lse_max_2[1]);
-                                    if (cidx_2[4] == 0) {
-                                        den_2[4] = den_2[4] + weight_92;
-                                        acc0_2[4] = __fmaf_rn(weight_92, p0_2[12], acc0_2[4]);
-                                        acc1_2[4] = __fmaf_rn(weight_92, p1_2[12], acc1_2[4]);
-                                    }
-                                    if (cidx_2[4] == 1) {
-                                        den_2[5] = den_2[5] + weight_92;
-                                        acc0_2[5] = __fmaf_rn(weight_92, p0_2[12], acc0_2[5]);
-                                        acc1_2[5] = __fmaf_rn(weight_92, p1_2[12], acc1_2[5]);
-                                    }
-                                    if (cidx_2[4] == 2) {
-                                        den_2[6] = den_2[6] + weight_92;
-                                        acc0_2[6] = __fmaf_rn(weight_92, p0_2[12], acc0_2[6]);
-                                        acc1_2[6] = __fmaf_rn(weight_92, p1_2[12], acc1_2[6]);
-                                    }
-                                    if (cidx_2[4] == 3) {
-                                        den_2[7] = den_2[7] + weight_92;
-                                        acc0_2[7] = __fmaf_rn(weight_92, p0_2[12], acc0_2[7]);
-                                        acc1_2[7] = __fmaf_rn(weight_92, p1_2[12], acc1_2[7]);
+                                    float weight_112 = approx_exp2(lse_2[12] - lse_max_2[0]);
+                                    if (bound_1[0] > 12) {
+                                        den_2[0] = den_2[0] + weight_112;
+                                        acc0_2[0] = __fmaf_rn(weight_112, p0_2[12], acc0_2[0]);
+                                        acc1_2[0] = __fmaf_rn(weight_112, p1_2[12], acc1_2[0]);
+                                    } else if (bound_1[1] > 12) {
+                                        den_2[1] = den_2[1] + weight_112;
+                                        acc0_2[1] = __fmaf_rn(weight_112, p0_2[12], acc0_2[1]);
+                                        acc1_2[1] = __fmaf_rn(weight_112, p1_2[12], acc1_2[1]);
+                                    } else {
+                                        if (bound_1[2] > 12) {
+                                            den_2[2] = den_2[2] + weight_112;
+                                            acc0_2[2] = __fmaf_rn(weight_112, p0_2[12], acc0_2[2]);
+                                            acc1_2[2] = __fmaf_rn(weight_112, p1_2[12], acc1_2[2]);
+                                        } else {
+                                            den_2[3] = den_2[3] + weight_112;
+                                            acc0_2[3] = __fmaf_rn(weight_112, p0_2[12], acc0_2[3]);
+                                            acc1_2[3] = __fmaf_rn(weight_112, p1_2[12], acc1_2[3]);
+                                        }
                                     }
                                 }
-                                bool live_15_2 = num_splits > 5 && lse_max_2[1] > -CUDART_INF_F;
+                                bool live_15_2 = num_splits > 13 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_15_2) {
-                                    float weight_93 = approx_exp2(lse_2[13] - lse_max_2[1]);
-                                    if (cidx_2[5] == 0) {
-                                        den_2[4] = den_2[4] + weight_93;
-                                        acc0_2[4] = __fmaf_rn(weight_93, p0_2[13], acc0_2[4]);
-                                        acc1_2[4] = __fmaf_rn(weight_93, p1_2[13], acc1_2[4]);
-                                    }
-                                    if (cidx_2[5] == 1) {
-                                        den_2[5] = den_2[5] + weight_93;
-                                        acc0_2[5] = __fmaf_rn(weight_93, p0_2[13], acc0_2[5]);
-                                        acc1_2[5] = __fmaf_rn(weight_93, p1_2[13], acc1_2[5]);
-                                    }
-                                    if (cidx_2[5] == 2) {
-                                        den_2[6] = den_2[6] + weight_93;
-                                        acc0_2[6] = __fmaf_rn(weight_93, p0_2[13], acc0_2[6]);
-                                        acc1_2[6] = __fmaf_rn(weight_93, p1_2[13], acc1_2[6]);
-                                    }
-                                    if (cidx_2[5] == 3) {
-                                        den_2[7] = den_2[7] + weight_93;
-                                        acc0_2[7] = __fmaf_rn(weight_93, p0_2[13], acc0_2[7]);
-                                        acc1_2[7] = __fmaf_rn(weight_93, p1_2[13], acc1_2[7]);
-                                    }
-                                }
-                                bool live_16_1 = num_splits > 6 && lse_max_2[1] > -CUDART_INF_F;
-                                if (live_16_1) {
-                                    float weight_94 = approx_exp2(lse_2[14] - lse_max_2[1]);
-                                    if (cidx_2[6] == 0) {
-                                        den_2[4] = den_2[4] + weight_94;
-                                        acc0_2[4] = __fmaf_rn(weight_94, p0_2[14], acc0_2[4]);
-                                        acc1_2[4] = __fmaf_rn(weight_94, p1_2[14], acc1_2[4]);
-                                    }
-                                    if (cidx_2[6] == 1) {
-                                        den_2[5] = den_2[5] + weight_94;
-                                        acc0_2[5] = __fmaf_rn(weight_94, p0_2[14], acc0_2[5]);
-                                        acc1_2[5] = __fmaf_rn(weight_94, p1_2[14], acc1_2[5]);
-                                    }
-                                    if (cidx_2[6] == 2) {
-                                        den_2[6] = den_2[6] + weight_94;
-                                        acc0_2[6] = __fmaf_rn(weight_94, p0_2[14], acc0_2[6]);
-                                        acc1_2[6] = __fmaf_rn(weight_94, p1_2[14], acc1_2[6]);
-                                    }
-                                    if (cidx_2[6] == 3) {
-                                        den_2[7] = den_2[7] + weight_94;
-                                        acc0_2[7] = __fmaf_rn(weight_94, p0_2[14], acc0_2[7]);
-                                        acc1_2[7] = __fmaf_rn(weight_94, p1_2[14], acc1_2[7]);
+                                    float weight_113 = approx_exp2(lse_2[13] - lse_max_2[0]);
+                                    if (bound_1[0] > 13) {
+                                        den_2[0] = den_2[0] + weight_113;
+                                        acc0_2[0] = __fmaf_rn(weight_113, p0_2[13], acc0_2[0]);
+                                        acc1_2[0] = __fmaf_rn(weight_113, p1_2[13], acc1_2[0]);
+                                    } else if (bound_1[1] > 13) {
+                                        den_2[1] = den_2[1] + weight_113;
+                                        acc0_2[1] = __fmaf_rn(weight_113, p0_2[13], acc0_2[1]);
+                                        acc1_2[1] = __fmaf_rn(weight_113, p1_2[13], acc1_2[1]);
+                                    } else {
+                                        if (bound_1[2] > 13) {
+                                            den_2[2] = den_2[2] + weight_113;
+                                            acc0_2[2] = __fmaf_rn(weight_113, p0_2[13], acc0_2[2]);
+                                            acc1_2[2] = __fmaf_rn(weight_113, p1_2[13], acc1_2[2]);
+                                        } else {
+                                            den_2[3] = den_2[3] + weight_113;
+                                            acc0_2[3] = __fmaf_rn(weight_113, p0_2[13], acc0_2[3]);
+                                            acc1_2[3] = __fmaf_rn(weight_113, p1_2[13], acc1_2[3]);
+                                        }
                                     }
                                 }
-                                bool live_17_1 = num_splits > 7 && lse_max_2[1] > -CUDART_INF_F;
-                                if (live_17_1) {
-                                    float weight_95 = approx_exp2(lse_2[15] - lse_max_2[1]);
-                                    if (cidx_2[7] == 0) {
-                                        den_2[4] = den_2[4] + weight_95;
-                                        acc0_2[4] = __fmaf_rn(weight_95, p0_2[15], acc0_2[4]);
-                                        acc1_2[4] = __fmaf_rn(weight_95, p1_2[15], acc1_2[4]);
+                                bool live_16_2 = num_splits > 14 && lse_max_2[0] > -CUDART_INF_F;
+                                if (live_16_2) {
+                                    float weight_114 = approx_exp2(lse_2[14] - lse_max_2[0]);
+                                    if (bound_1[0] > 14) {
+                                        den_2[0] = den_2[0] + weight_114;
+                                        acc0_2[0] = __fmaf_rn(weight_114, p0_2[14], acc0_2[0]);
+                                        acc1_2[0] = __fmaf_rn(weight_114, p1_2[14], acc1_2[0]);
+                                    } else if (bound_1[1] > 14) {
+                                        den_2[1] = den_2[1] + weight_114;
+                                        acc0_2[1] = __fmaf_rn(weight_114, p0_2[14], acc0_2[1]);
+                                        acc1_2[1] = __fmaf_rn(weight_114, p1_2[14], acc1_2[1]);
+                                    } else {
+                                        if (bound_1[2] > 14) {
+                                            den_2[2] = den_2[2] + weight_114;
+                                            acc0_2[2] = __fmaf_rn(weight_114, p0_2[14], acc0_2[2]);
+                                            acc1_2[2] = __fmaf_rn(weight_114, p1_2[14], acc1_2[2]);
+                                        } else {
+                                            den_2[3] = den_2[3] + weight_114;
+                                            acc0_2[3] = __fmaf_rn(weight_114, p0_2[14], acc0_2[3]);
+                                            acc1_2[3] = __fmaf_rn(weight_114, p1_2[14], acc1_2[3]);
+                                        }
                                     }
-                                    if (cidx_2[7] == 1) {
-                                        den_2[5] = den_2[5] + weight_95;
-                                        acc0_2[5] = __fmaf_rn(weight_95, p0_2[15], acc0_2[5]);
-                                        acc1_2[5] = __fmaf_rn(weight_95, p1_2[15], acc1_2[5]);
+                                }
+                                bool live_17_2 = num_splits > 15 && lse_max_2[0] > -CUDART_INF_F;
+                                if (live_17_2) {
+                                    float weight_115 = approx_exp2(lse_2[15] - lse_max_2[0]);
+                                    if (bound_1[0] > 15) {
+                                        den_2[0] = den_2[0] + weight_115;
+                                        acc0_2[0] = __fmaf_rn(weight_115, p0_2[15], acc0_2[0]);
+                                        acc1_2[0] = __fmaf_rn(weight_115, p1_2[15], acc1_2[0]);
+                                    } else if (bound_1[1] > 15) {
+                                        den_2[1] = den_2[1] + weight_115;
+                                        acc0_2[1] = __fmaf_rn(weight_115, p0_2[15], acc0_2[1]);
+                                        acc1_2[1] = __fmaf_rn(weight_115, p1_2[15], acc1_2[1]);
+                                    } else {
+                                        if (bound_1[2] > 15) {
+                                            den_2[2] = den_2[2] + weight_115;
+                                            acc0_2[2] = __fmaf_rn(weight_115, p0_2[15], acc0_2[2]);
+                                            acc1_2[2] = __fmaf_rn(weight_115, p1_2[15], acc1_2[2]);
+                                        } else {
+                                            den_2[3] = den_2[3] + weight_115;
+                                            acc0_2[3] = __fmaf_rn(weight_115, p0_2[15], acc0_2[3]);
+                                            acc1_2[3] = __fmaf_rn(weight_115, p1_2[15], acc1_2[3]);
+                                        }
                                     }
-                                    if (cidx_2[7] == 2) {
-                                        den_2[6] = den_2[6] + weight_95;
-                                        acc0_2[6] = __fmaf_rn(weight_95, p0_2[15], acc0_2[6]);
-                                        acc1_2[6] = __fmaf_rn(weight_95, p1_2[15], acc1_2[6]);
+                                }
+                                bool live_18_2 = num_splits > 0 && lse_max_2[1] > -CUDART_INF_F;
+                                if (live_18_2) {
+                                    float weight_116 = approx_exp2(lse_2[16] - lse_max_2[1]);
+                                    if (bound_1[0] > 0) {
+                                        den_2[4] = den_2[4] + weight_116;
+                                        acc0_2[4] = __fmaf_rn(weight_116, p0_2[16], acc0_2[4]);
+                                        acc1_2[4] = __fmaf_rn(weight_116, p1_2[16], acc1_2[4]);
+                                    } else if (bound_1[1] > 0) {
+                                        den_2[5] = den_2[5] + weight_116;
+                                        acc0_2[5] = __fmaf_rn(weight_116, p0_2[16], acc0_2[5]);
+                                        acc1_2[5] = __fmaf_rn(weight_116, p1_2[16], acc1_2[5]);
+                                    } else {
+                                        if (bound_1[2] > 0) {
+                                            den_2[6] = den_2[6] + weight_116;
+                                            acc0_2[6] = __fmaf_rn(weight_116, p0_2[16], acc0_2[6]);
+                                            acc1_2[6] = __fmaf_rn(weight_116, p1_2[16], acc1_2[6]);
+                                        } else {
+                                            den_2[7] = den_2[7] + weight_116;
+                                            acc0_2[7] = __fmaf_rn(weight_116, p0_2[16], acc0_2[7]);
+                                            acc1_2[7] = __fmaf_rn(weight_116, p1_2[16], acc1_2[7]);
+                                        }
                                     }
-                                    if (cidx_2[7] == 3) {
-                                        den_2[7] = den_2[7] + weight_95;
-                                        acc0_2[7] = __fmaf_rn(weight_95, p0_2[15], acc0_2[7]);
-                                        acc1_2[7] = __fmaf_rn(weight_95, p1_2[15], acc1_2[7]);
+                                }
+                                bool live_19_1 = num_splits > 1 && lse_max_2[1] > -CUDART_INF_F;
+                                if (live_19_1) {
+                                    float weight_117 = approx_exp2(lse_2[17] - lse_max_2[1]);
+                                    if (bound_1[0] > 1) {
+                                        den_2[4] = den_2[4] + weight_117;
+                                        acc0_2[4] = __fmaf_rn(weight_117, p0_2[17], acc0_2[4]);
+                                        acc1_2[4] = __fmaf_rn(weight_117, p1_2[17], acc1_2[4]);
+                                    } else if (bound_1[1] > 1) {
+                                        den_2[5] = den_2[5] + weight_117;
+                                        acc0_2[5] = __fmaf_rn(weight_117, p0_2[17], acc0_2[5]);
+                                        acc1_2[5] = __fmaf_rn(weight_117, p1_2[17], acc1_2[5]);
+                                    } else {
+                                        if (bound_1[2] > 1) {
+                                            den_2[6] = den_2[6] + weight_117;
+                                            acc0_2[6] = __fmaf_rn(weight_117, p0_2[17], acc0_2[6]);
+                                            acc1_2[6] = __fmaf_rn(weight_117, p1_2[17], acc1_2[6]);
+                                        } else {
+                                            den_2[7] = den_2[7] + weight_117;
+                                            acc0_2[7] = __fmaf_rn(weight_117, p0_2[17], acc0_2[7]);
+                                            acc1_2[7] = __fmaf_rn(weight_117, p1_2[17], acc1_2[7]);
+                                        }
+                                    }
+                                }
+                                bool live_20_1 = num_splits > 2 && lse_max_2[1] > -CUDART_INF_F;
+                                if (live_20_1) {
+                                    float weight_118 = approx_exp2(lse_2[18] - lse_max_2[1]);
+                                    if (bound_1[0] > 2) {
+                                        den_2[4] = den_2[4] + weight_118;
+                                        acc0_2[4] = __fmaf_rn(weight_118, p0_2[18], acc0_2[4]);
+                                        acc1_2[4] = __fmaf_rn(weight_118, p1_2[18], acc1_2[4]);
+                                    } else if (bound_1[1] > 2) {
+                                        den_2[5] = den_2[5] + weight_118;
+                                        acc0_2[5] = __fmaf_rn(weight_118, p0_2[18], acc0_2[5]);
+                                        acc1_2[5] = __fmaf_rn(weight_118, p1_2[18], acc1_2[5]);
+                                    } else {
+                                        if (bound_1[2] > 2) {
+                                            den_2[6] = den_2[6] + weight_118;
+                                            acc0_2[6] = __fmaf_rn(weight_118, p0_2[18], acc0_2[6]);
+                                            acc1_2[6] = __fmaf_rn(weight_118, p1_2[18], acc1_2[6]);
+                                        } else {
+                                            den_2[7] = den_2[7] + weight_118;
+                                            acc0_2[7] = __fmaf_rn(weight_118, p0_2[18], acc0_2[7]);
+                                            acc1_2[7] = __fmaf_rn(weight_118, p1_2[18], acc1_2[7]);
+                                        }
+                                    }
+                                }
+                                bool live_21_1 = num_splits > 3 && lse_max_2[1] > -CUDART_INF_F;
+                                if (live_21_1) {
+                                    float weight_119 = approx_exp2(lse_2[19] - lse_max_2[1]);
+                                    if (bound_1[0] > 3) {
+                                        den_2[4] = den_2[4] + weight_119;
+                                        acc0_2[4] = __fmaf_rn(weight_119, p0_2[19], acc0_2[4]);
+                                        acc1_2[4] = __fmaf_rn(weight_119, p1_2[19], acc1_2[4]);
+                                    } else if (bound_1[1] > 3) {
+                                        den_2[5] = den_2[5] + weight_119;
+                                        acc0_2[5] = __fmaf_rn(weight_119, p0_2[19], acc0_2[5]);
+                                        acc1_2[5] = __fmaf_rn(weight_119, p1_2[19], acc1_2[5]);
+                                    } else {
+                                        if (bound_1[2] > 3) {
+                                            den_2[6] = den_2[6] + weight_119;
+                                            acc0_2[6] = __fmaf_rn(weight_119, p0_2[19], acc0_2[6]);
+                                            acc1_2[6] = __fmaf_rn(weight_119, p1_2[19], acc1_2[6]);
+                                        } else {
+                                            den_2[7] = den_2[7] + weight_119;
+                                            acc0_2[7] = __fmaf_rn(weight_119, p0_2[19], acc0_2[7]);
+                                            acc1_2[7] = __fmaf_rn(weight_119, p1_2[19], acc1_2[7]);
+                                        }
+                                    }
+                                }
+                                bool live_22_1 = num_splits > 4 && lse_max_2[1] > -CUDART_INF_F;
+                                if (live_22_1) {
+                                    float weight_120 = approx_exp2(lse_2[20] - lse_max_2[1]);
+                                    if (bound_1[0] > 4) {
+                                        den_2[4] = den_2[4] + weight_120;
+                                        acc0_2[4] = __fmaf_rn(weight_120, p0_2[20], acc0_2[4]);
+                                        acc1_2[4] = __fmaf_rn(weight_120, p1_2[20], acc1_2[4]);
+                                    } else if (bound_1[1] > 4) {
+                                        den_2[5] = den_2[5] + weight_120;
+                                        acc0_2[5] = __fmaf_rn(weight_120, p0_2[20], acc0_2[5]);
+                                        acc1_2[5] = __fmaf_rn(weight_120, p1_2[20], acc1_2[5]);
+                                    } else {
+                                        if (bound_1[2] > 4) {
+                                            den_2[6] = den_2[6] + weight_120;
+                                            acc0_2[6] = __fmaf_rn(weight_120, p0_2[20], acc0_2[6]);
+                                            acc1_2[6] = __fmaf_rn(weight_120, p1_2[20], acc1_2[6]);
+                                        } else {
+                                            den_2[7] = den_2[7] + weight_120;
+                                            acc0_2[7] = __fmaf_rn(weight_120, p0_2[20], acc0_2[7]);
+                                            acc1_2[7] = __fmaf_rn(weight_120, p1_2[20], acc1_2[7]);
+                                        }
+                                    }
+                                }
+                                bool live_23_1 = num_splits > 5 && lse_max_2[1] > -CUDART_INF_F;
+                                if (live_23_1) {
+                                    float weight_121 = approx_exp2(lse_2[21] - lse_max_2[1]);
+                                    if (bound_1[0] > 5) {
+                                        den_2[4] = den_2[4] + weight_121;
+                                        acc0_2[4] = __fmaf_rn(weight_121, p0_2[21], acc0_2[4]);
+                                        acc1_2[4] = __fmaf_rn(weight_121, p1_2[21], acc1_2[4]);
+                                    } else if (bound_1[1] > 5) {
+                                        den_2[5] = den_2[5] + weight_121;
+                                        acc0_2[5] = __fmaf_rn(weight_121, p0_2[21], acc0_2[5]);
+                                        acc1_2[5] = __fmaf_rn(weight_121, p1_2[21], acc1_2[5]);
+                                    } else {
+                                        if (bound_1[2] > 5) {
+                                            den_2[6] = den_2[6] + weight_121;
+                                            acc0_2[6] = __fmaf_rn(weight_121, p0_2[21], acc0_2[6]);
+                                            acc1_2[6] = __fmaf_rn(weight_121, p1_2[21], acc1_2[6]);
+                                        } else {
+                                            den_2[7] = den_2[7] + weight_121;
+                                            acc0_2[7] = __fmaf_rn(weight_121, p0_2[21], acc0_2[7]);
+                                            acc1_2[7] = __fmaf_rn(weight_121, p1_2[21], acc1_2[7]);
+                                        }
+                                    }
+                                }
+                                bool live_24_1 = num_splits > 6 && lse_max_2[1] > -CUDART_INF_F;
+                                if (live_24_1) {
+                                    float weight_122 = approx_exp2(lse_2[22] - lse_max_2[1]);
+                                    if (bound_1[0] > 6) {
+                                        den_2[4] = den_2[4] + weight_122;
+                                        acc0_2[4] = __fmaf_rn(weight_122, p0_2[22], acc0_2[4]);
+                                        acc1_2[4] = __fmaf_rn(weight_122, p1_2[22], acc1_2[4]);
+                                    } else if (bound_1[1] > 6) {
+                                        den_2[5] = den_2[5] + weight_122;
+                                        acc0_2[5] = __fmaf_rn(weight_122, p0_2[22], acc0_2[5]);
+                                        acc1_2[5] = __fmaf_rn(weight_122, p1_2[22], acc1_2[5]);
+                                    } else {
+                                        if (bound_1[2] > 6) {
+                                            den_2[6] = den_2[6] + weight_122;
+                                            acc0_2[6] = __fmaf_rn(weight_122, p0_2[22], acc0_2[6]);
+                                            acc1_2[6] = __fmaf_rn(weight_122, p1_2[22], acc1_2[6]);
+                                        } else {
+                                            den_2[7] = den_2[7] + weight_122;
+                                            acc0_2[7] = __fmaf_rn(weight_122, p0_2[22], acc0_2[7]);
+                                            acc1_2[7] = __fmaf_rn(weight_122, p1_2[22], acc1_2[7]);
+                                        }
+                                    }
+                                }
+                                bool live_25_1 = num_splits > 7 && lse_max_2[1] > -CUDART_INF_F;
+                                if (live_25_1) {
+                                    float weight_123 = approx_exp2(lse_2[23] - lse_max_2[1]);
+                                    if (bound_1[0] > 7) {
+                                        den_2[4] = den_2[4] + weight_123;
+                                        acc0_2[4] = __fmaf_rn(weight_123, p0_2[23], acc0_2[4]);
+                                        acc1_2[4] = __fmaf_rn(weight_123, p1_2[23], acc1_2[4]);
+                                    } else if (bound_1[1] > 7) {
+                                        den_2[5] = den_2[5] + weight_123;
+                                        acc0_2[5] = __fmaf_rn(weight_123, p0_2[23], acc0_2[5]);
+                                        acc1_2[5] = __fmaf_rn(weight_123, p1_2[23], acc1_2[5]);
+                                    } else {
+                                        if (bound_1[2] > 7) {
+                                            den_2[6] = den_2[6] + weight_123;
+                                            acc0_2[6] = __fmaf_rn(weight_123, p0_2[23], acc0_2[6]);
+                                            acc1_2[6] = __fmaf_rn(weight_123, p1_2[23], acc1_2[6]);
+                                        } else {
+                                            den_2[7] = den_2[7] + weight_123;
+                                            acc0_2[7] = __fmaf_rn(weight_123, p0_2[23], acc0_2[7]);
+                                            acc1_2[7] = __fmaf_rn(weight_123, p1_2[23], acc1_2[7]);
+                                        }
+                                    }
+                                }
+                                bool live_26_1 = num_splits > 8 && lse_max_2[1] > -CUDART_INF_F;
+                                if (live_26_1) {
+                                    float weight_124 = approx_exp2(lse_2[24] - lse_max_2[1]);
+                                    if (bound_1[0] > 8) {
+                                        den_2[4] = den_2[4] + weight_124;
+                                        acc0_2[4] = __fmaf_rn(weight_124, p0_2[24], acc0_2[4]);
+                                        acc1_2[4] = __fmaf_rn(weight_124, p1_2[24], acc1_2[4]);
+                                    } else if (bound_1[1] > 8) {
+                                        den_2[5] = den_2[5] + weight_124;
+                                        acc0_2[5] = __fmaf_rn(weight_124, p0_2[24], acc0_2[5]);
+                                        acc1_2[5] = __fmaf_rn(weight_124, p1_2[24], acc1_2[5]);
+                                    } else {
+                                        if (bound_1[2] > 8) {
+                                            den_2[6] = den_2[6] + weight_124;
+                                            acc0_2[6] = __fmaf_rn(weight_124, p0_2[24], acc0_2[6]);
+                                            acc1_2[6] = __fmaf_rn(weight_124, p1_2[24], acc1_2[6]);
+                                        } else {
+                                            den_2[7] = den_2[7] + weight_124;
+                                            acc0_2[7] = __fmaf_rn(weight_124, p0_2[24], acc0_2[7]);
+                                            acc1_2[7] = __fmaf_rn(weight_124, p1_2[24], acc1_2[7]);
+                                        }
+                                    }
+                                }
+                                bool live_27_1 = num_splits > 9 && lse_max_2[1] > -CUDART_INF_F;
+                                if (live_27_1) {
+                                    float weight_125 = approx_exp2(lse_2[25] - lse_max_2[1]);
+                                    if (bound_1[0] > 9) {
+                                        den_2[4] = den_2[4] + weight_125;
+                                        acc0_2[4] = __fmaf_rn(weight_125, p0_2[25], acc0_2[4]);
+                                        acc1_2[4] = __fmaf_rn(weight_125, p1_2[25], acc1_2[4]);
+                                    } else if (bound_1[1] > 9) {
+                                        den_2[5] = den_2[5] + weight_125;
+                                        acc0_2[5] = __fmaf_rn(weight_125, p0_2[25], acc0_2[5]);
+                                        acc1_2[5] = __fmaf_rn(weight_125, p1_2[25], acc1_2[5]);
+                                    } else {
+                                        if (bound_1[2] > 9) {
+                                            den_2[6] = den_2[6] + weight_125;
+                                            acc0_2[6] = __fmaf_rn(weight_125, p0_2[25], acc0_2[6]);
+                                            acc1_2[6] = __fmaf_rn(weight_125, p1_2[25], acc1_2[6]);
+                                        } else {
+                                            den_2[7] = den_2[7] + weight_125;
+                                            acc0_2[7] = __fmaf_rn(weight_125, p0_2[25], acc0_2[7]);
+                                            acc1_2[7] = __fmaf_rn(weight_125, p1_2[25], acc1_2[7]);
+                                        }
+                                    }
+                                }
+                                bool live_28_1 = num_splits > 10 && lse_max_2[1] > -CUDART_INF_F;
+                                if (live_28_1) {
+                                    float weight_126 = approx_exp2(lse_2[26] - lse_max_2[1]);
+                                    if (bound_1[0] > 10) {
+                                        den_2[4] = den_2[4] + weight_126;
+                                        acc0_2[4] = __fmaf_rn(weight_126, p0_2[26], acc0_2[4]);
+                                        acc1_2[4] = __fmaf_rn(weight_126, p1_2[26], acc1_2[4]);
+                                    } else if (bound_1[1] > 10) {
+                                        den_2[5] = den_2[5] + weight_126;
+                                        acc0_2[5] = __fmaf_rn(weight_126, p0_2[26], acc0_2[5]);
+                                        acc1_2[5] = __fmaf_rn(weight_126, p1_2[26], acc1_2[5]);
+                                    } else {
+                                        if (bound_1[2] > 10) {
+                                            den_2[6] = den_2[6] + weight_126;
+                                            acc0_2[6] = __fmaf_rn(weight_126, p0_2[26], acc0_2[6]);
+                                            acc1_2[6] = __fmaf_rn(weight_126, p1_2[26], acc1_2[6]);
+                                        } else {
+                                            den_2[7] = den_2[7] + weight_126;
+                                            acc0_2[7] = __fmaf_rn(weight_126, p0_2[26], acc0_2[7]);
+                                            acc1_2[7] = __fmaf_rn(weight_126, p1_2[26], acc1_2[7]);
+                                        }
+                                    }
+                                }
+                                bool live_29_1 = num_splits > 11 && lse_max_2[1] > -CUDART_INF_F;
+                                if (live_29_1) {
+                                    float weight_127 = approx_exp2(lse_2[27] - lse_max_2[1]);
+                                    if (bound_1[0] > 11) {
+                                        den_2[4] = den_2[4] + weight_127;
+                                        acc0_2[4] = __fmaf_rn(weight_127, p0_2[27], acc0_2[4]);
+                                        acc1_2[4] = __fmaf_rn(weight_127, p1_2[27], acc1_2[4]);
+                                    } else if (bound_1[1] > 11) {
+                                        den_2[5] = den_2[5] + weight_127;
+                                        acc0_2[5] = __fmaf_rn(weight_127, p0_2[27], acc0_2[5]);
+                                        acc1_2[5] = __fmaf_rn(weight_127, p1_2[27], acc1_2[5]);
+                                    } else {
+                                        if (bound_1[2] > 11) {
+                                            den_2[6] = den_2[6] + weight_127;
+                                            acc0_2[6] = __fmaf_rn(weight_127, p0_2[27], acc0_2[6]);
+                                            acc1_2[6] = __fmaf_rn(weight_127, p1_2[27], acc1_2[6]);
+                                        } else {
+                                            den_2[7] = den_2[7] + weight_127;
+                                            acc0_2[7] = __fmaf_rn(weight_127, p0_2[27], acc0_2[7]);
+                                            acc1_2[7] = __fmaf_rn(weight_127, p1_2[27], acc1_2[7]);
+                                        }
+                                    }
+                                }
+                                bool live_30_1 = num_splits > 12 && lse_max_2[1] > -CUDART_INF_F;
+                                if (live_30_1) {
+                                    float weight_128 = approx_exp2(lse_2[28] - lse_max_2[1]);
+                                    if (bound_1[0] > 12) {
+                                        den_2[4] = den_2[4] + weight_128;
+                                        acc0_2[4] = __fmaf_rn(weight_128, p0_2[28], acc0_2[4]);
+                                        acc1_2[4] = __fmaf_rn(weight_128, p1_2[28], acc1_2[4]);
+                                    } else if (bound_1[1] > 12) {
+                                        den_2[5] = den_2[5] + weight_128;
+                                        acc0_2[5] = __fmaf_rn(weight_128, p0_2[28], acc0_2[5]);
+                                        acc1_2[5] = __fmaf_rn(weight_128, p1_2[28], acc1_2[5]);
+                                    } else {
+                                        if (bound_1[2] > 12) {
+                                            den_2[6] = den_2[6] + weight_128;
+                                            acc0_2[6] = __fmaf_rn(weight_128, p0_2[28], acc0_2[6]);
+                                            acc1_2[6] = __fmaf_rn(weight_128, p1_2[28], acc1_2[6]);
+                                        } else {
+                                            den_2[7] = den_2[7] + weight_128;
+                                            acc0_2[7] = __fmaf_rn(weight_128, p0_2[28], acc0_2[7]);
+                                            acc1_2[7] = __fmaf_rn(weight_128, p1_2[28], acc1_2[7]);
+                                        }
+                                    }
+                                }
+                                bool live_31_1 = num_splits > 13 && lse_max_2[1] > -CUDART_INF_F;
+                                if (live_31_1) {
+                                    float weight_129 = approx_exp2(lse_2[29] - lse_max_2[1]);
+                                    if (bound_1[0] > 13) {
+                                        den_2[4] = den_2[4] + weight_129;
+                                        acc0_2[4] = __fmaf_rn(weight_129, p0_2[29], acc0_2[4]);
+                                        acc1_2[4] = __fmaf_rn(weight_129, p1_2[29], acc1_2[4]);
+                                    } else if (bound_1[1] > 13) {
+                                        den_2[5] = den_2[5] + weight_129;
+                                        acc0_2[5] = __fmaf_rn(weight_129, p0_2[29], acc0_2[5]);
+                                        acc1_2[5] = __fmaf_rn(weight_129, p1_2[29], acc1_2[5]);
+                                    } else {
+                                        if (bound_1[2] > 13) {
+                                            den_2[6] = den_2[6] + weight_129;
+                                            acc0_2[6] = __fmaf_rn(weight_129, p0_2[29], acc0_2[6]);
+                                            acc1_2[6] = __fmaf_rn(weight_129, p1_2[29], acc1_2[6]);
+                                        } else {
+                                            den_2[7] = den_2[7] + weight_129;
+                                            acc0_2[7] = __fmaf_rn(weight_129, p0_2[29], acc0_2[7]);
+                                            acc1_2[7] = __fmaf_rn(weight_129, p1_2[29], acc1_2[7]);
+                                        }
+                                    }
+                                }
+                                bool live_32_1 = num_splits > 14 && lse_max_2[1] > -CUDART_INF_F;
+                                if (live_32_1) {
+                                    float weight_130 = approx_exp2(lse_2[30] - lse_max_2[1]);
+                                    if (bound_1[0] > 14) {
+                                        den_2[4] = den_2[4] + weight_130;
+                                        acc0_2[4] = __fmaf_rn(weight_130, p0_2[30], acc0_2[4]);
+                                        acc1_2[4] = __fmaf_rn(weight_130, p1_2[30], acc1_2[4]);
+                                    } else if (bound_1[1] > 14) {
+                                        den_2[5] = den_2[5] + weight_130;
+                                        acc0_2[5] = __fmaf_rn(weight_130, p0_2[30], acc0_2[5]);
+                                        acc1_2[5] = __fmaf_rn(weight_130, p1_2[30], acc1_2[5]);
+                                    } else {
+                                        if (bound_1[2] > 14) {
+                                            den_2[6] = den_2[6] + weight_130;
+                                            acc0_2[6] = __fmaf_rn(weight_130, p0_2[30], acc0_2[6]);
+                                            acc1_2[6] = __fmaf_rn(weight_130, p1_2[30], acc1_2[6]);
+                                        } else {
+                                            den_2[7] = den_2[7] + weight_130;
+                                            acc0_2[7] = __fmaf_rn(weight_130, p0_2[30], acc0_2[7]);
+                                            acc1_2[7] = __fmaf_rn(weight_130, p1_2[30], acc1_2[7]);
+                                        }
+                                    }
+                                }
+                                bool live_33_1 = num_splits > 15 && lse_max_2[1] > -CUDART_INF_F;
+                                if (live_33_1) {
+                                    float weight_131 = approx_exp2(lse_2[31] - lse_max_2[1]);
+                                    if (bound_1[0] > 15) {
+                                        den_2[4] = den_2[4] + weight_131;
+                                        acc0_2[4] = __fmaf_rn(weight_131, p0_2[31], acc0_2[4]);
+                                        acc1_2[4] = __fmaf_rn(weight_131, p1_2[31], acc1_2[4]);
+                                    } else if (bound_1[1] > 15) {
+                                        den_2[5] = den_2[5] + weight_131;
+                                        acc0_2[5] = __fmaf_rn(weight_131, p0_2[31], acc0_2[5]);
+                                        acc1_2[5] = __fmaf_rn(weight_131, p1_2[31], acc1_2[5]);
+                                    } else {
+                                        if (bound_1[2] > 15) {
+                                            den_2[6] = den_2[6] + weight_131;
+                                            acc0_2[6] = __fmaf_rn(weight_131, p0_2[31], acc0_2[6]);
+                                            acc1_2[6] = __fmaf_rn(weight_131, p1_2[31], acc1_2[6]);
+                                        } else {
+                                            den_2[7] = den_2[7] + weight_131;
+                                            acc0_2[7] = __fmaf_rn(weight_131, p0_2[31], acc0_2[7]);
+                                            acc1_2[7] = __fmaf_rn(weight_131, p1_2[31], acc1_2[7]);
+                                        }
                                     }
                                 }
                                 if (valid_2[0] != 0) {
@@ -4290,19 +5550,19 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     acc1_k_2 = acc1_k_2 + acc1_2[3];
                                     float inv_4 = 0.0f;
                                     if (den_k_2 > 0.0f) {
-                                        float _rcp_224 = approx_rcp(den_k_2);
-                                        inv_4 = _rcp_224;
+                                        float _rcp_260 = approx_rcp(den_k_2);
+                                        inv_4 = _rcp_260;
                                     }
                                     float attn0_2 = (float)(__nv_bfloat16)(acc0_k_2 * inv_4);
                                     float attn1_2 = (float)(__nv_bfloat16)(acc1_k_2 * inv_4);
-                                    float _exp2_226 = approx_exp2((-gate0_2[0]) * 1.442695f);
-                                    float _rcp_225 = approx_rcp(1.0f + _exp2_226);
-                                    float result0_2 = attn0_2 * _rcp_225;
-                                    float _exp2_228 = approx_exp2((-gate1_2[0]) * 1.442695f);
-                                    float _rcp_227 = approx_rcp(1.0f + _exp2_228);
-                                    float result1_2 = attn1_2 * _rcp_227;
-                                    __nv_bfloat162 _bit_cast_src_229 = __float22bfloat162_rn(make_float2(result0_2, result1_2));
-                                    word_2[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_229)[0];
+                                    float _exp2_262 = approx_exp2((-gate0_2[0]) * 1.442695f);
+                                    float _rcp_261 = approx_rcp(1.0f + _exp2_262);
+                                    float result0_2 = attn0_2 * _rcp_261;
+                                    float _exp2_264 = approx_exp2((-gate1_2[0]) * 1.442695f);
+                                    float _rcp_263 = approx_rcp(1.0f + _exp2_264);
+                                    float result1_2 = attn1_2 * _rcp_263;
+                                    __nv_bfloat162 _bit_cast_src_265 = __float22bfloat162_rn(make_float2(result0_2, result1_2));
+                                    word_2[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_265)[0];
                                     long long out_offset_2 = row_i64 * out_stride_row + qo_head_4[0] * out_stride_head + dim_2[0];
                                     *(reinterpret_cast<unsigned int*>(out + out_offset_2) + (0)) = word_2[0];
                                 }
@@ -4321,55 +5581,51 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     acc1_k_3 = acc1_k_3 + acc1_2[7];
                                     float inv_5 = 0.0f;
                                     if (den_k_3 > 0.0f) {
-                                        float _rcp_230 = approx_rcp(den_k_3);
-                                        inv_5 = _rcp_230;
+                                        float _rcp_266 = approx_rcp(den_k_3);
+                                        inv_5 = _rcp_266;
                                     }
                                     float attn0_3 = (float)(__nv_bfloat16)(acc0_k_3 * inv_5);
                                     float attn1_3 = (float)(__nv_bfloat16)(acc1_k_3 * inv_5);
-                                    float _exp2_232 = approx_exp2((-gate0_2[1]) * 1.442695f);
-                                    float _rcp_231 = approx_rcp(1.0f + _exp2_232);
-                                    float result0_3 = attn0_3 * _rcp_231;
-                                    float _exp2_234 = approx_exp2((-gate1_2[1]) * 1.442695f);
-                                    float _rcp_233 = approx_rcp(1.0f + _exp2_234);
-                                    float result1_3 = attn1_3 * _rcp_233;
-                                    __nv_bfloat162 _bit_cast_src_235 = __float22bfloat162_rn(make_float2(result0_3, result1_3));
-                                    word_2[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_235)[0];
+                                    float _exp2_268 = approx_exp2((-gate0_2[1]) * 1.442695f);
+                                    float _rcp_267 = approx_rcp(1.0f + _exp2_268);
+                                    float result0_3 = attn0_3 * _rcp_267;
+                                    float _exp2_270 = approx_exp2((-gate1_2[1]) * 1.442695f);
+                                    float _rcp_269 = approx_rcp(1.0f + _exp2_270);
+                                    float result1_3 = attn1_3 * _rcp_269;
+                                    __nv_bfloat162 _bit_cast_src_271 = __float22bfloat162_rn(make_float2(result0_3, result1_3));
+                                    word_2[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_271)[0];
                                     long long out_offset_3 = row_i64 * out_stride_row + qo_head_4[1] * out_stride_head + dim_2[1];
                                     *(reinterpret_cast<unsigned int*>(out + out_offset_3) + (0)) = word_2[0];
                                 }
                             }
-                        } else {
+                        } else if (num_splits > 4) {
                             float lse_3[16];
                             float p0_3[16];
                             float p1_3[16];
-                            float acc0_3[16];
-                            float acc1_3[16];
-                            float den_3[16];
+                            float acc0_3[8];
+                            float acc1_3[8];
+                            float den_3[8];
                             int chunk_w_3 = (num_splits + 3) / 4;
                             if (num_splits <= 4) {
                                 chunk_w_3 = num_splits;
                             }
-                            int cidx_3[4];
-                            int split_i_16 = 0;
-                            cidx_3[0] = split_i_16 / chunk_w_3;
-                            int split_i_0_2 = 1;
-                            cidx_3[1] = split_i_0_2 / chunk_w_3;
-                            int split_i_1_2 = 2;
-                            cidx_3[2] = split_i_1_2 / chunk_w_3;
-                            int split_i_2_2 = 3;
-                            cidx_3[3] = split_i_2_2 / chunk_w_3;
-                            float lse_max_3[4];
-                            int valid_3[4];
-                            int tab_3[4];
-                            long long dim_3[4];
-                            long long qo_head_5[4];
-                            long long row_head_3[4];
-                            float gate0_3[4];
-                            float gate1_3[4];
+                            int bound_2[4];
+                            bound_2[0] = chunk_w_3;
+                            bound_2[1] = chunk_w_3 * 2;
+                            bound_2[2] = chunk_w_3 * 3;
+                            bound_2[3] = chunk_w_3 * 4;
+                            float lse_max_3[2];
+                            int valid_3[2];
+                            int tab_3[2];
+                            long long dim_3[2];
+                            long long qo_head_5[2];
+                            long long row_head_3[2];
+                            float gate0_3[2];
+                            float gate1_3[2];
                             unsigned int word_3[1];
                             long long nqo_3 = (long long)num_qo_heads;
                             #pragma unroll 1
-                            for (int p_1_3 = p_first; p_1_3 < end; p_1_3 += 512) {
+                            for (int p_1_3 = p_first; p_1_3 < end; p_1_3 += 256) {
                                 int pk_3 = ((p_1_3) < (end - 1) ? (p_1_3) : (end - 1));
                                 valid_3[0] = ((end > p_1_3) ? 1 : 0);
                                 int head_0_3 = pk_3 >> 7;
@@ -4389,15 +5645,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 acc1_3[3] = 0.0f;
                                 den_3[3] = 0.0f;
                                 lse_max_3[0] = -CUDART_INF_F;
-                                float _vec_load_112[2];
+                                float _vec_load_148[2];
                                 {
-                                    uint32_t _bf16x2_bits_236;
-                                    _bf16x2_bits_236 = *reinterpret_cast<const uint32_t*>(gate + (row_head_3[0] * 256 + dim_3[0]) + 0);
-                                    (&_vec_load_112[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_236) << 16);
-                                    (&_vec_load_112[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_236) & 0xffff0000u);
+                                    uint32_t _bf16x2_bits_272;
+                                    _bf16x2_bits_272 = *reinterpret_cast<const uint32_t*>(gate + (row_head_3[0] * 256 + dim_3[0]) + 0);
+                                    (&_vec_load_148[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_272) << 16);
+                                    (&_vec_load_148[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_272) & 0xffff0000u);
                                 }
-                                gate0_3[0] = _vec_load_112[0];
-                                gate1_3[0] = _vec_load_112[1];
+                                gate0_3[0] = _vec_load_148[0];
+                                gate1_3[0] = _vec_load_148[1];
                                 int pk_1_2 = ((p_1_3 + 128) < (end - 1) ? (p_1_3 + 128) : (end - 1));
                                 valid_3[1] = ((end > p_1_3 + 128) ? 1 : 0);
                                 int head_2_1 = pk_1_2 >> 7;
@@ -4417,677 +5673,605 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 acc1_3[7] = 0.0f;
                                 den_3[7] = 0.0f;
                                 lse_max_3[1] = -CUDART_INF_F;
-                                float _vec_load_113[2];
+                                float _vec_load_149[2];
                                 {
-                                    uint32_t _bf16x2_bits_237;
-                                    _bf16x2_bits_237 = *reinterpret_cast<const uint32_t*>(gate + (row_head_3[1] * 256 + dim_3[1]) + 0);
-                                    (&_vec_load_113[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_237) << 16);
-                                    (&_vec_load_113[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_237) & 0xffff0000u);
+                                    uint32_t _bf16x2_bits_273;
+                                    _bf16x2_bits_273 = *reinterpret_cast<const uint32_t*>(gate + (row_head_3[1] * 256 + dim_3[1]) + 0);
+                                    (&_vec_load_149[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_273) << 16);
+                                    (&_vec_load_149[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_273) & 0xffff0000u);
                                 }
-                                gate0_3[1] = _vec_load_113[0];
-                                gate1_3[1] = _vec_load_113[1];
-                                int pk_3_1 = ((p_1_3 + 256) < (end - 1) ? (p_1_3 + 256) : (end - 1));
-                                valid_3[2] = ((end > p_1_3 + 256) ? 1 : 0);
-                                int head_4 = pk_3_1 >> 7;
-                                dim_3[2] = (long long)((pk_3_1 & 127) * 2);
-                                qo_head_5[2] = (long long)(first_head + head_4);
-                                row_head_3[2] = row_i64 * nqo_3 + qo_head_5[2];
-                                acc0_3[8] = 0.0f;
-                                acc1_3[8] = 0.0f;
-                                den_3[8] = 0.0f;
-                                acc0_3[9] = 0.0f;
-                                acc1_3[9] = 0.0f;
-                                den_3[9] = 0.0f;
-                                acc0_3[10] = 0.0f;
-                                acc1_3[10] = 0.0f;
-                                den_3[10] = 0.0f;
-                                acc0_3[11] = 0.0f;
-                                acc1_3[11] = 0.0f;
-                                den_3[11] = 0.0f;
-                                lse_max_3[2] = -CUDART_INF_F;
-                                float _vec_load_114[2];
-                                {
-                                    uint32_t _bf16x2_bits_238;
-                                    _bf16x2_bits_238 = *reinterpret_cast<const uint32_t*>(gate + (row_head_3[2] * 256 + dim_3[2]) + 0);
-                                    (&_vec_load_114[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_238) << 16);
-                                    (&_vec_load_114[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_238) & 0xffff0000u);
-                                }
-                                gate0_3[2] = _vec_load_114[0];
-                                gate1_3[2] = _vec_load_114[1];
-                                int pk_5 = ((p_1_3 + 384) < (end - 1) ? (p_1_3 + 384) : (end - 1));
-                                valid_3[3] = ((end > p_1_3 + 384) ? 1 : 0);
-                                int head_6 = pk_5 >> 7;
-                                dim_3[3] = (long long)((pk_5 & 127) * 2);
-                                qo_head_5[3] = (long long)(first_head + head_6);
-                                row_head_3[3] = row_i64 * nqo_3 + qo_head_5[3];
-                                acc0_3[12] = 0.0f;
-                                acc1_3[12] = 0.0f;
-                                den_3[12] = 0.0f;
-                                acc0_3[13] = 0.0f;
-                                acc1_3[13] = 0.0f;
-                                den_3[13] = 0.0f;
-                                acc0_3[14] = 0.0f;
-                                acc1_3[14] = 0.0f;
-                                den_3[14] = 0.0f;
-                                acc0_3[15] = 0.0f;
-                                acc1_3[15] = 0.0f;
-                                den_3[15] = 0.0f;
-                                lse_max_3[3] = -CUDART_INF_F;
-                                float _vec_load_115[2];
-                                {
-                                    uint32_t _bf16x2_bits_239;
-                                    _bf16x2_bits_239 = *reinterpret_cast<const uint32_t*>(gate + (row_head_3[3] * 256 + dim_3[3]) + 0);
-                                    (&_vec_load_115[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_239) << 16);
-                                    (&_vec_load_115[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_239) & 0xffff0000u);
-                                }
-                                gate0_3[3] = _vec_load_115[0];
-                                gate1_3[3] = _vec_load_115[1];
+                                gate0_3[1] = _vec_load_149[0];
+                                gate1_3[1] = _vec_load_149[1];
                                 lse_3[0] = -CUDART_INF_F;
                                 if (num_splits > 0) {
-                                    long long part_row_96 = row_head_3[0];
-                                    lse_3[0] = partial_lse[part_row_96];
-                                    float _vec_load_116[2];
+                                    long long part_row_132 = row_head_3[0];
+                                    lse_3[0] = partial_lse[part_row_132];
+                                    float _vec_load_150[2];
                                     {
-                                        float2 _v2_240 = *reinterpret_cast<const float2*>(partial_out + (part_row_96 * 256 + dim_3[0]) + 0);
-                                        _vec_load_116[0] = _v2_240.x;
-                                        _vec_load_116[0 + 1] = _v2_240.y;
+                                        float2 _v2_274 = *reinterpret_cast<const float2*>(partial_out + (part_row_132 * 256 + dim_3[0]) + 0);
+                                        _vec_load_150[0] = _v2_274.x;
+                                        _vec_load_150[0 + 1] = _v2_274.y;
                                     }
-                                    p0_3[0] = _vec_load_116[0];
-                                    p1_3[0] = _vec_load_116[1];
+                                    p0_3[0] = _vec_load_150[0];
+                                    p1_3[0] = _vec_load_150[1];
                                 }
                                 lse_3[1] = -CUDART_INF_F;
                                 if (num_splits > 1) {
-                                    long long part_row_97 = split_pitch + row_head_3[0];
-                                    lse_3[1] = partial_lse[part_row_97];
-                                    float _vec_load_117[2];
+                                    long long part_row_133 = split_pitch + row_head_3[0];
+                                    lse_3[1] = partial_lse[part_row_133];
+                                    float _vec_load_151[2];
                                     {
-                                        float2 _v2_241 = *reinterpret_cast<const float2*>(partial_out + (part_row_97 * 256 + dim_3[0]) + 0);
-                                        _vec_load_117[0] = _v2_241.x;
-                                        _vec_load_117[0 + 1] = _v2_241.y;
+                                        float2 _v2_275 = *reinterpret_cast<const float2*>(partial_out + (part_row_133 * 256 + dim_3[0]) + 0);
+                                        _vec_load_151[0] = _v2_275.x;
+                                        _vec_load_151[0 + 1] = _v2_275.y;
                                     }
-                                    p0_3[1] = _vec_load_117[0];
-                                    p1_3[1] = _vec_load_117[1];
+                                    p0_3[1] = _vec_load_151[0];
+                                    p1_3[1] = _vec_load_151[1];
                                 }
                                 lse_3[2] = -CUDART_INF_F;
                                 if (num_splits > 2) {
-                                    long long part_row_98 = 2 * split_pitch + row_head_3[0];
-                                    lse_3[2] = partial_lse[part_row_98];
-                                    float _vec_load_118[2];
+                                    long long part_row_134 = 2 * split_pitch + row_head_3[0];
+                                    lse_3[2] = partial_lse[part_row_134];
+                                    float _vec_load_152[2];
                                     {
-                                        float2 _v2_242 = *reinterpret_cast<const float2*>(partial_out + (part_row_98 * 256 + dim_3[0]) + 0);
-                                        _vec_load_118[0] = _v2_242.x;
-                                        _vec_load_118[0 + 1] = _v2_242.y;
+                                        float2 _v2_276 = *reinterpret_cast<const float2*>(partial_out + (part_row_134 * 256 + dim_3[0]) + 0);
+                                        _vec_load_152[0] = _v2_276.x;
+                                        _vec_load_152[0 + 1] = _v2_276.y;
                                     }
-                                    p0_3[2] = _vec_load_118[0];
-                                    p1_3[2] = _vec_load_118[1];
+                                    p0_3[2] = _vec_load_152[0];
+                                    p1_3[2] = _vec_load_152[1];
                                 }
                                 lse_3[3] = -CUDART_INF_F;
                                 if (num_splits > 3) {
-                                    long long part_row_99 = 3 * split_pitch + row_head_3[0];
-                                    lse_3[3] = partial_lse[part_row_99];
-                                    float _vec_load_119[2];
+                                    long long part_row_135 = 3 * split_pitch + row_head_3[0];
+                                    lse_3[3] = partial_lse[part_row_135];
+                                    float _vec_load_153[2];
                                     {
-                                        float2 _v2_243 = *reinterpret_cast<const float2*>(partial_out + (part_row_99 * 256 + dim_3[0]) + 0);
-                                        _vec_load_119[0] = _v2_243.x;
-                                        _vec_load_119[0 + 1] = _v2_243.y;
+                                        float2 _v2_277 = *reinterpret_cast<const float2*>(partial_out + (part_row_135 * 256 + dim_3[0]) + 0);
+                                        _vec_load_153[0] = _v2_277.x;
+                                        _vec_load_153[0 + 1] = _v2_277.y;
                                     }
-                                    p0_3[3] = _vec_load_119[0];
-                                    p1_3[3] = _vec_load_119[1];
+                                    p0_3[3] = _vec_load_153[0];
+                                    p1_3[3] = _vec_load_153[1];
                                 }
                                 lse_3[4] = -CUDART_INF_F;
-                                if (num_splits > 0) {
-                                    long long part_row_100 = row_head_3[1];
-                                    lse_3[4] = partial_lse[part_row_100];
-                                    float _vec_load_120[2];
+                                if (num_splits > 4) {
+                                    long long part_row_136 = 4 * split_pitch + row_head_3[0];
+                                    lse_3[4] = partial_lse[part_row_136];
+                                    float _vec_load_154[2];
                                     {
-                                        float2 _v2_244 = *reinterpret_cast<const float2*>(partial_out + (part_row_100 * 256 + dim_3[1]) + 0);
-                                        _vec_load_120[0] = _v2_244.x;
-                                        _vec_load_120[0 + 1] = _v2_244.y;
+                                        float2 _v2_278 = *reinterpret_cast<const float2*>(partial_out + (part_row_136 * 256 + dim_3[0]) + 0);
+                                        _vec_load_154[0] = _v2_278.x;
+                                        _vec_load_154[0 + 1] = _v2_278.y;
                                     }
-                                    p0_3[4] = _vec_load_120[0];
-                                    p1_3[4] = _vec_load_120[1];
+                                    p0_3[4] = _vec_load_154[0];
+                                    p1_3[4] = _vec_load_154[1];
                                 }
                                 lse_3[5] = -CUDART_INF_F;
-                                if (num_splits > 1) {
-                                    long long part_row_101 = split_pitch + row_head_3[1];
-                                    lse_3[5] = partial_lse[part_row_101];
-                                    float _vec_load_121[2];
+                                if (num_splits > 5) {
+                                    long long part_row_137 = 5 * split_pitch + row_head_3[0];
+                                    lse_3[5] = partial_lse[part_row_137];
+                                    float _vec_load_155[2];
                                     {
-                                        float2 _v2_245 = *reinterpret_cast<const float2*>(partial_out + (part_row_101 * 256 + dim_3[1]) + 0);
-                                        _vec_load_121[0] = _v2_245.x;
-                                        _vec_load_121[0 + 1] = _v2_245.y;
+                                        float2 _v2_279 = *reinterpret_cast<const float2*>(partial_out + (part_row_137 * 256 + dim_3[0]) + 0);
+                                        _vec_load_155[0] = _v2_279.x;
+                                        _vec_load_155[0 + 1] = _v2_279.y;
                                     }
-                                    p0_3[5] = _vec_load_121[0];
-                                    p1_3[5] = _vec_load_121[1];
+                                    p0_3[5] = _vec_load_155[0];
+                                    p1_3[5] = _vec_load_155[1];
                                 }
                                 lse_3[6] = -CUDART_INF_F;
-                                if (num_splits > 2) {
-                                    long long part_row_102 = 2 * split_pitch + row_head_3[1];
-                                    lse_3[6] = partial_lse[part_row_102];
-                                    float _vec_load_122[2];
+                                if (num_splits > 6) {
+                                    long long part_row_138 = 6 * split_pitch + row_head_3[0];
+                                    lse_3[6] = partial_lse[part_row_138];
+                                    float _vec_load_156[2];
                                     {
-                                        float2 _v2_246 = *reinterpret_cast<const float2*>(partial_out + (part_row_102 * 256 + dim_3[1]) + 0);
-                                        _vec_load_122[0] = _v2_246.x;
-                                        _vec_load_122[0 + 1] = _v2_246.y;
+                                        float2 _v2_280 = *reinterpret_cast<const float2*>(partial_out + (part_row_138 * 256 + dim_3[0]) + 0);
+                                        _vec_load_156[0] = _v2_280.x;
+                                        _vec_load_156[0 + 1] = _v2_280.y;
                                     }
-                                    p0_3[6] = _vec_load_122[0];
-                                    p1_3[6] = _vec_load_122[1];
+                                    p0_3[6] = _vec_load_156[0];
+                                    p1_3[6] = _vec_load_156[1];
                                 }
                                 lse_3[7] = -CUDART_INF_F;
-                                if (num_splits > 3) {
-                                    long long part_row_103 = 3 * split_pitch + row_head_3[1];
-                                    lse_3[7] = partial_lse[part_row_103];
-                                    float _vec_load_123[2];
+                                if (num_splits > 7) {
+                                    long long part_row_139 = 7 * split_pitch + row_head_3[0];
+                                    lse_3[7] = partial_lse[part_row_139];
+                                    float _vec_load_157[2];
                                     {
-                                        float2 _v2_247 = *reinterpret_cast<const float2*>(partial_out + (part_row_103 * 256 + dim_3[1]) + 0);
-                                        _vec_load_123[0] = _v2_247.x;
-                                        _vec_load_123[0 + 1] = _v2_247.y;
+                                        float2 _v2_281 = *reinterpret_cast<const float2*>(partial_out + (part_row_139 * 256 + dim_3[0]) + 0);
+                                        _vec_load_157[0] = _v2_281.x;
+                                        _vec_load_157[0 + 1] = _v2_281.y;
                                     }
-                                    p0_3[7] = _vec_load_123[0];
-                                    p1_3[7] = _vec_load_123[1];
+                                    p0_3[7] = _vec_load_157[0];
+                                    p1_3[7] = _vec_load_157[1];
                                 }
                                 lse_3[8] = -CUDART_INF_F;
                                 if (num_splits > 0) {
-                                    long long part_row_104 = row_head_3[2];
-                                    lse_3[8] = partial_lse[part_row_104];
-                                    float _vec_load_124[2];
+                                    long long part_row_140 = row_head_3[1];
+                                    lse_3[8] = partial_lse[part_row_140];
+                                    float _vec_load_158[2];
                                     {
-                                        float2 _v2_248 = *reinterpret_cast<const float2*>(partial_out + (part_row_104 * 256 + dim_3[2]) + 0);
-                                        _vec_load_124[0] = _v2_248.x;
-                                        _vec_load_124[0 + 1] = _v2_248.y;
+                                        float2 _v2_282 = *reinterpret_cast<const float2*>(partial_out + (part_row_140 * 256 + dim_3[1]) + 0);
+                                        _vec_load_158[0] = _v2_282.x;
+                                        _vec_load_158[0 + 1] = _v2_282.y;
                                     }
-                                    p0_3[8] = _vec_load_124[0];
-                                    p1_3[8] = _vec_load_124[1];
+                                    p0_3[8] = _vec_load_158[0];
+                                    p1_3[8] = _vec_load_158[1];
                                 }
                                 lse_3[9] = -CUDART_INF_F;
                                 if (num_splits > 1) {
-                                    long long part_row_105 = split_pitch + row_head_3[2];
-                                    lse_3[9] = partial_lse[part_row_105];
-                                    float _vec_load_125[2];
+                                    long long part_row_141 = split_pitch + row_head_3[1];
+                                    lse_3[9] = partial_lse[part_row_141];
+                                    float _vec_load_159[2];
                                     {
-                                        float2 _v2_249 = *reinterpret_cast<const float2*>(partial_out + (part_row_105 * 256 + dim_3[2]) + 0);
-                                        _vec_load_125[0] = _v2_249.x;
-                                        _vec_load_125[0 + 1] = _v2_249.y;
+                                        float2 _v2_283 = *reinterpret_cast<const float2*>(partial_out + (part_row_141 * 256 + dim_3[1]) + 0);
+                                        _vec_load_159[0] = _v2_283.x;
+                                        _vec_load_159[0 + 1] = _v2_283.y;
                                     }
-                                    p0_3[9] = _vec_load_125[0];
-                                    p1_3[9] = _vec_load_125[1];
+                                    p0_3[9] = _vec_load_159[0];
+                                    p1_3[9] = _vec_load_159[1];
                                 }
                                 lse_3[10] = -CUDART_INF_F;
                                 if (num_splits > 2) {
-                                    long long part_row_106 = 2 * split_pitch + row_head_3[2];
-                                    lse_3[10] = partial_lse[part_row_106];
-                                    float _vec_load_126[2];
+                                    long long part_row_142 = 2 * split_pitch + row_head_3[1];
+                                    lse_3[10] = partial_lse[part_row_142];
+                                    float _vec_load_160[2];
                                     {
-                                        float2 _v2_250 = *reinterpret_cast<const float2*>(partial_out + (part_row_106 * 256 + dim_3[2]) + 0);
-                                        _vec_load_126[0] = _v2_250.x;
-                                        _vec_load_126[0 + 1] = _v2_250.y;
+                                        float2 _v2_284 = *reinterpret_cast<const float2*>(partial_out + (part_row_142 * 256 + dim_3[1]) + 0);
+                                        _vec_load_160[0] = _v2_284.x;
+                                        _vec_load_160[0 + 1] = _v2_284.y;
                                     }
-                                    p0_3[10] = _vec_load_126[0];
-                                    p1_3[10] = _vec_load_126[1];
+                                    p0_3[10] = _vec_load_160[0];
+                                    p1_3[10] = _vec_load_160[1];
                                 }
                                 lse_3[11] = -CUDART_INF_F;
                                 if (num_splits > 3) {
-                                    long long part_row_107 = 3 * split_pitch + row_head_3[2];
-                                    lse_3[11] = partial_lse[part_row_107];
-                                    float _vec_load_127[2];
+                                    long long part_row_143 = 3 * split_pitch + row_head_3[1];
+                                    lse_3[11] = partial_lse[part_row_143];
+                                    float _vec_load_161[2];
                                     {
-                                        float2 _v2_251 = *reinterpret_cast<const float2*>(partial_out + (part_row_107 * 256 + dim_3[2]) + 0);
-                                        _vec_load_127[0] = _v2_251.x;
-                                        _vec_load_127[0 + 1] = _v2_251.y;
+                                        float2 _v2_285 = *reinterpret_cast<const float2*>(partial_out + (part_row_143 * 256 + dim_3[1]) + 0);
+                                        _vec_load_161[0] = _v2_285.x;
+                                        _vec_load_161[0 + 1] = _v2_285.y;
                                     }
-                                    p0_3[11] = _vec_load_127[0];
-                                    p1_3[11] = _vec_load_127[1];
+                                    p0_3[11] = _vec_load_161[0];
+                                    p1_3[11] = _vec_load_161[1];
                                 }
                                 lse_3[12] = -CUDART_INF_F;
-                                if (num_splits > 0) {
-                                    long long part_row_108 = row_head_3[3];
-                                    lse_3[12] = partial_lse[part_row_108];
-                                    float _vec_load_128[2];
+                                if (num_splits > 4) {
+                                    long long part_row_144 = 4 * split_pitch + row_head_3[1];
+                                    lse_3[12] = partial_lse[part_row_144];
+                                    float _vec_load_162[2];
                                     {
-                                        float2 _v2_252 = *reinterpret_cast<const float2*>(partial_out + (part_row_108 * 256 + dim_3[3]) + 0);
-                                        _vec_load_128[0] = _v2_252.x;
-                                        _vec_load_128[0 + 1] = _v2_252.y;
+                                        float2 _v2_286 = *reinterpret_cast<const float2*>(partial_out + (part_row_144 * 256 + dim_3[1]) + 0);
+                                        _vec_load_162[0] = _v2_286.x;
+                                        _vec_load_162[0 + 1] = _v2_286.y;
                                     }
-                                    p0_3[12] = _vec_load_128[0];
-                                    p1_3[12] = _vec_load_128[1];
+                                    p0_3[12] = _vec_load_162[0];
+                                    p1_3[12] = _vec_load_162[1];
                                 }
                                 lse_3[13] = -CUDART_INF_F;
-                                if (num_splits > 1) {
-                                    long long part_row_109 = split_pitch + row_head_3[3];
-                                    lse_3[13] = partial_lse[part_row_109];
-                                    float _vec_load_129[2];
+                                if (num_splits > 5) {
+                                    long long part_row_145 = 5 * split_pitch + row_head_3[1];
+                                    lse_3[13] = partial_lse[part_row_145];
+                                    float _vec_load_163[2];
                                     {
-                                        float2 _v2_253 = *reinterpret_cast<const float2*>(partial_out + (part_row_109 * 256 + dim_3[3]) + 0);
-                                        _vec_load_129[0] = _v2_253.x;
-                                        _vec_load_129[0 + 1] = _v2_253.y;
+                                        float2 _v2_287 = *reinterpret_cast<const float2*>(partial_out + (part_row_145 * 256 + dim_3[1]) + 0);
+                                        _vec_load_163[0] = _v2_287.x;
+                                        _vec_load_163[0 + 1] = _v2_287.y;
                                     }
-                                    p0_3[13] = _vec_load_129[0];
-                                    p1_3[13] = _vec_load_129[1];
+                                    p0_3[13] = _vec_load_163[0];
+                                    p1_3[13] = _vec_load_163[1];
                                 }
                                 lse_3[14] = -CUDART_INF_F;
-                                if (num_splits > 2) {
-                                    long long part_row_110 = 2 * split_pitch + row_head_3[3];
-                                    lse_3[14] = partial_lse[part_row_110];
-                                    float _vec_load_130[2];
+                                if (num_splits > 6) {
+                                    long long part_row_146 = 6 * split_pitch + row_head_3[1];
+                                    lse_3[14] = partial_lse[part_row_146];
+                                    float _vec_load_164[2];
                                     {
-                                        float2 _v2_254 = *reinterpret_cast<const float2*>(partial_out + (part_row_110 * 256 + dim_3[3]) + 0);
-                                        _vec_load_130[0] = _v2_254.x;
-                                        _vec_load_130[0 + 1] = _v2_254.y;
+                                        float2 _v2_288 = *reinterpret_cast<const float2*>(partial_out + (part_row_146 * 256 + dim_3[1]) + 0);
+                                        _vec_load_164[0] = _v2_288.x;
+                                        _vec_load_164[0 + 1] = _v2_288.y;
                                     }
-                                    p0_3[14] = _vec_load_130[0];
-                                    p1_3[14] = _vec_load_130[1];
+                                    p0_3[14] = _vec_load_164[0];
+                                    p1_3[14] = _vec_load_164[1];
                                 }
                                 lse_3[15] = -CUDART_INF_F;
-                                if (num_splits > 3) {
-                                    long long part_row_111 = 3 * split_pitch + row_head_3[3];
-                                    lse_3[15] = partial_lse[part_row_111];
-                                    float _vec_load_131[2];
+                                if (num_splits > 7) {
+                                    long long part_row_147 = 7 * split_pitch + row_head_3[1];
+                                    lse_3[15] = partial_lse[part_row_147];
+                                    float _vec_load_165[2];
                                     {
-                                        float2 _v2_255 = *reinterpret_cast<const float2*>(partial_out + (part_row_111 * 256 + dim_3[3]) + 0);
-                                        _vec_load_131[0] = _v2_255.x;
-                                        _vec_load_131[0 + 1] = _v2_255.y;
+                                        float2 _v2_289 = *reinterpret_cast<const float2*>(partial_out + (part_row_147 * 256 + dim_3[1]) + 0);
+                                        _vec_load_165[0] = _v2_289.x;
+                                        _vec_load_165[0 + 1] = _v2_289.y;
                                     }
-                                    p0_3[15] = _vec_load_131[0];
-                                    p1_3[15] = _vec_load_131[1];
+                                    p0_3[15] = _vec_load_165[0];
+                                    p1_3[15] = _vec_load_165[1];
                                 }
                                 lse_max_3[0] = fmaxf(lse_max_3[0], lse_3[0]);
                                 lse_max_3[0] = fmaxf(lse_max_3[0], lse_3[1]);
                                 lse_max_3[0] = fmaxf(lse_max_3[0], lse_3[2]);
                                 lse_max_3[0] = fmaxf(lse_max_3[0], lse_3[3]);
-                                lse_max_3[1] = fmaxf(lse_max_3[1], lse_3[4]);
-                                lse_max_3[1] = fmaxf(lse_max_3[1], lse_3[5]);
-                                lse_max_3[1] = fmaxf(lse_max_3[1], lse_3[6]);
-                                lse_max_3[1] = fmaxf(lse_max_3[1], lse_3[7]);
-                                lse_max_3[2] = fmaxf(lse_max_3[2], lse_3[8]);
-                                lse_max_3[2] = fmaxf(lse_max_3[2], lse_3[9]);
-                                lse_max_3[2] = fmaxf(lse_max_3[2], lse_3[10]);
-                                lse_max_3[2] = fmaxf(lse_max_3[2], lse_3[11]);
-                                lse_max_3[3] = fmaxf(lse_max_3[3], lse_3[12]);
-                                lse_max_3[3] = fmaxf(lse_max_3[3], lse_3[13]);
-                                lse_max_3[3] = fmaxf(lse_max_3[3], lse_3[14]);
-                                lse_max_3[3] = fmaxf(lse_max_3[3], lse_3[15]);
-                                bool live_20 = num_splits > 0 && lse_max_3[0] > -CUDART_INF_F;
-                                if (live_20) {
-                                    float weight_96 = approx_exp2(lse_3[0] - lse_max_3[0]);
-                                    if (cidx_3[0] == 0) {
-                                        den_3[0] = den_3[0] + weight_96;
-                                        acc0_3[0] = __fmaf_rn(weight_96, p0_3[0], acc0_3[0]);
-                                        acc1_3[0] = __fmaf_rn(weight_96, p1_3[0], acc1_3[0]);
-                                    }
-                                    if (cidx_3[0] == 1) {
-                                        den_3[1] = den_3[1] + weight_96;
-                                        acc0_3[1] = __fmaf_rn(weight_96, p0_3[0], acc0_3[1]);
-                                        acc1_3[1] = __fmaf_rn(weight_96, p1_3[0], acc1_3[1]);
-                                    }
-                                    if (cidx_3[0] == 2) {
-                                        den_3[2] = den_3[2] + weight_96;
-                                        acc0_3[2] = __fmaf_rn(weight_96, p0_3[0], acc0_3[2]);
-                                        acc1_3[2] = __fmaf_rn(weight_96, p1_3[0], acc1_3[2]);
-                                    }
-                                    if (cidx_3[0] == 3) {
-                                        den_3[3] = den_3[3] + weight_96;
-                                        acc0_3[3] = __fmaf_rn(weight_96, p0_3[0], acc0_3[3]);
-                                        acc1_3[3] = __fmaf_rn(weight_96, p1_3[0], acc1_3[3]);
+                                lse_max_3[0] = fmaxf(lse_max_3[0], lse_3[4]);
+                                lse_max_3[0] = fmaxf(lse_max_3[0], lse_3[5]);
+                                lse_max_3[0] = fmaxf(lse_max_3[0], lse_3[6]);
+                                lse_max_3[0] = fmaxf(lse_max_3[0], lse_3[7]);
+                                lse_max_3[1] = fmaxf(lse_max_3[1], lse_3[8]);
+                                lse_max_3[1] = fmaxf(lse_max_3[1], lse_3[9]);
+                                lse_max_3[1] = fmaxf(lse_max_3[1], lse_3[10]);
+                                lse_max_3[1] = fmaxf(lse_max_3[1], lse_3[11]);
+                                lse_max_3[1] = fmaxf(lse_max_3[1], lse_3[12]);
+                                lse_max_3[1] = fmaxf(lse_max_3[1], lse_3[13]);
+                                lse_max_3[1] = fmaxf(lse_max_3[1], lse_3[14]);
+                                lse_max_3[1] = fmaxf(lse_max_3[1], lse_3[15]);
+                                bool live_37 = num_splits > 0 && lse_max_3[0] > -CUDART_INF_F;
+                                if (live_37) {
+                                    float weight_132 = approx_exp2(lse_3[0] - lse_max_3[0]);
+                                    if (bound_2[0] > 0) {
+                                        den_3[0] = den_3[0] + weight_132;
+                                        acc0_3[0] = __fmaf_rn(weight_132, p0_3[0], acc0_3[0]);
+                                        acc1_3[0] = __fmaf_rn(weight_132, p1_3[0], acc1_3[0]);
+                                    } else if (bound_2[1] > 0) {
+                                        den_3[1] = den_3[1] + weight_132;
+                                        acc0_3[1] = __fmaf_rn(weight_132, p0_3[0], acc0_3[1]);
+                                        acc1_3[1] = __fmaf_rn(weight_132, p1_3[0], acc1_3[1]);
+                                    } else {
+                                        if (bound_2[2] > 0) {
+                                            den_3[2] = den_3[2] + weight_132;
+                                            acc0_3[2] = __fmaf_rn(weight_132, p0_3[0], acc0_3[2]);
+                                            acc1_3[2] = __fmaf_rn(weight_132, p1_3[0], acc1_3[2]);
+                                        } else {
+                                            den_3[3] = den_3[3] + weight_132;
+                                            acc0_3[3] = __fmaf_rn(weight_132, p0_3[0], acc0_3[3]);
+                                            acc1_3[3] = __fmaf_rn(weight_132, p1_3[0], acc1_3[3]);
+                                        }
                                     }
                                 }
-                                bool live_7_6 = num_splits > 1 && lse_max_3[0] > -CUDART_INF_F;
+                                bool live_3_6 = num_splits > 1 && lse_max_3[0] > -CUDART_INF_F;
+                                if (live_3_6) {
+                                    float weight_133 = approx_exp2(lse_3[1] - lse_max_3[0]);
+                                    if (bound_2[0] > 1) {
+                                        den_3[0] = den_3[0] + weight_133;
+                                        acc0_3[0] = __fmaf_rn(weight_133, p0_3[1], acc0_3[0]);
+                                        acc1_3[0] = __fmaf_rn(weight_133, p1_3[1], acc1_3[0]);
+                                    } else if (bound_2[1] > 1) {
+                                        den_3[1] = den_3[1] + weight_133;
+                                        acc0_3[1] = __fmaf_rn(weight_133, p0_3[1], acc0_3[1]);
+                                        acc1_3[1] = __fmaf_rn(weight_133, p1_3[1], acc1_3[1]);
+                                    } else {
+                                        if (bound_2[2] > 1) {
+                                            den_3[2] = den_3[2] + weight_133;
+                                            acc0_3[2] = __fmaf_rn(weight_133, p0_3[1], acc0_3[2]);
+                                            acc1_3[2] = __fmaf_rn(weight_133, p1_3[1], acc1_3[2]);
+                                        } else {
+                                            den_3[3] = den_3[3] + weight_133;
+                                            acc0_3[3] = __fmaf_rn(weight_133, p0_3[1], acc0_3[3]);
+                                            acc1_3[3] = __fmaf_rn(weight_133, p1_3[1], acc1_3[3]);
+                                        }
+                                    }
+                                }
+                                bool live_4_6 = num_splits > 2 && lse_max_3[0] > -CUDART_INF_F;
+                                if (live_4_6) {
+                                    float weight_134 = approx_exp2(lse_3[2] - lse_max_3[0]);
+                                    if (bound_2[0] > 2) {
+                                        den_3[0] = den_3[0] + weight_134;
+                                        acc0_3[0] = __fmaf_rn(weight_134, p0_3[2], acc0_3[0]);
+                                        acc1_3[0] = __fmaf_rn(weight_134, p1_3[2], acc1_3[0]);
+                                    } else if (bound_2[1] > 2) {
+                                        den_3[1] = den_3[1] + weight_134;
+                                        acc0_3[1] = __fmaf_rn(weight_134, p0_3[2], acc0_3[1]);
+                                        acc1_3[1] = __fmaf_rn(weight_134, p1_3[2], acc1_3[1]);
+                                    } else {
+                                        if (bound_2[2] > 2) {
+                                            den_3[2] = den_3[2] + weight_134;
+                                            acc0_3[2] = __fmaf_rn(weight_134, p0_3[2], acc0_3[2]);
+                                            acc1_3[2] = __fmaf_rn(weight_134, p1_3[2], acc1_3[2]);
+                                        } else {
+                                            den_3[3] = den_3[3] + weight_134;
+                                            acc0_3[3] = __fmaf_rn(weight_134, p0_3[2], acc0_3[3]);
+                                            acc1_3[3] = __fmaf_rn(weight_134, p1_3[2], acc1_3[3]);
+                                        }
+                                    }
+                                }
+                                bool live_5_6 = num_splits > 3 && lse_max_3[0] > -CUDART_INF_F;
+                                if (live_5_6) {
+                                    float weight_135 = approx_exp2(lse_3[3] - lse_max_3[0]);
+                                    if (bound_2[0] > 3) {
+                                        den_3[0] = den_3[0] + weight_135;
+                                        acc0_3[0] = __fmaf_rn(weight_135, p0_3[3], acc0_3[0]);
+                                        acc1_3[0] = __fmaf_rn(weight_135, p1_3[3], acc1_3[0]);
+                                    } else if (bound_2[1] > 3) {
+                                        den_3[1] = den_3[1] + weight_135;
+                                        acc0_3[1] = __fmaf_rn(weight_135, p0_3[3], acc0_3[1]);
+                                        acc1_3[1] = __fmaf_rn(weight_135, p1_3[3], acc1_3[1]);
+                                    } else {
+                                        if (bound_2[2] > 3) {
+                                            den_3[2] = den_3[2] + weight_135;
+                                            acc0_3[2] = __fmaf_rn(weight_135, p0_3[3], acc0_3[2]);
+                                            acc1_3[2] = __fmaf_rn(weight_135, p1_3[3], acc1_3[2]);
+                                        } else {
+                                            den_3[3] = den_3[3] + weight_135;
+                                            acc0_3[3] = __fmaf_rn(weight_135, p0_3[3], acc0_3[3]);
+                                            acc1_3[3] = __fmaf_rn(weight_135, p1_3[3], acc1_3[3]);
+                                        }
+                                    }
+                                }
+                                bool live_6_6 = num_splits > 4 && lse_max_3[0] > -CUDART_INF_F;
+                                if (live_6_6) {
+                                    float weight_136 = approx_exp2(lse_3[4] - lse_max_3[0]);
+                                    if (bound_2[0] > 4) {
+                                        den_3[0] = den_3[0] + weight_136;
+                                        acc0_3[0] = __fmaf_rn(weight_136, p0_3[4], acc0_3[0]);
+                                        acc1_3[0] = __fmaf_rn(weight_136, p1_3[4], acc1_3[0]);
+                                    } else if (bound_2[1] > 4) {
+                                        den_3[1] = den_3[1] + weight_136;
+                                        acc0_3[1] = __fmaf_rn(weight_136, p0_3[4], acc0_3[1]);
+                                        acc1_3[1] = __fmaf_rn(weight_136, p1_3[4], acc1_3[1]);
+                                    } else {
+                                        if (bound_2[2] > 4) {
+                                            den_3[2] = den_3[2] + weight_136;
+                                            acc0_3[2] = __fmaf_rn(weight_136, p0_3[4], acc0_3[2]);
+                                            acc1_3[2] = __fmaf_rn(weight_136, p1_3[4], acc1_3[2]);
+                                        } else {
+                                            den_3[3] = den_3[3] + weight_136;
+                                            acc0_3[3] = __fmaf_rn(weight_136, p0_3[4], acc0_3[3]);
+                                            acc1_3[3] = __fmaf_rn(weight_136, p1_3[4], acc1_3[3]);
+                                        }
+                                    }
+                                }
+                                bool live_7_6 = num_splits > 5 && lse_max_3[0] > -CUDART_INF_F;
                                 if (live_7_6) {
-                                    float weight_97 = approx_exp2(lse_3[1] - lse_max_3[0]);
-                                    if (cidx_3[1] == 0) {
-                                        den_3[0] = den_3[0] + weight_97;
-                                        acc0_3[0] = __fmaf_rn(weight_97, p0_3[1], acc0_3[0]);
-                                        acc1_3[0] = __fmaf_rn(weight_97, p1_3[1], acc1_3[0]);
-                                    }
-                                    if (cidx_3[1] == 1) {
-                                        den_3[1] = den_3[1] + weight_97;
-                                        acc0_3[1] = __fmaf_rn(weight_97, p0_3[1], acc0_3[1]);
-                                        acc1_3[1] = __fmaf_rn(weight_97, p1_3[1], acc1_3[1]);
-                                    }
-                                    if (cidx_3[1] == 2) {
-                                        den_3[2] = den_3[2] + weight_97;
-                                        acc0_3[2] = __fmaf_rn(weight_97, p0_3[1], acc0_3[2]);
-                                        acc1_3[2] = __fmaf_rn(weight_97, p1_3[1], acc1_3[2]);
-                                    }
-                                    if (cidx_3[1] == 3) {
-                                        den_3[3] = den_3[3] + weight_97;
-                                        acc0_3[3] = __fmaf_rn(weight_97, p0_3[1], acc0_3[3]);
-                                        acc1_3[3] = __fmaf_rn(weight_97, p1_3[1], acc1_3[3]);
+                                    float weight_137 = approx_exp2(lse_3[5] - lse_max_3[0]);
+                                    if (bound_2[0] > 5) {
+                                        den_3[0] = den_3[0] + weight_137;
+                                        acc0_3[0] = __fmaf_rn(weight_137, p0_3[5], acc0_3[0]);
+                                        acc1_3[0] = __fmaf_rn(weight_137, p1_3[5], acc1_3[0]);
+                                    } else if (bound_2[1] > 5) {
+                                        den_3[1] = den_3[1] + weight_137;
+                                        acc0_3[1] = __fmaf_rn(weight_137, p0_3[5], acc0_3[1]);
+                                        acc1_3[1] = __fmaf_rn(weight_137, p1_3[5], acc1_3[1]);
+                                    } else {
+                                        if (bound_2[2] > 5) {
+                                            den_3[2] = den_3[2] + weight_137;
+                                            acc0_3[2] = __fmaf_rn(weight_137, p0_3[5], acc0_3[2]);
+                                            acc1_3[2] = __fmaf_rn(weight_137, p1_3[5], acc1_3[2]);
+                                        } else {
+                                            den_3[3] = den_3[3] + weight_137;
+                                            acc0_3[3] = __fmaf_rn(weight_137, p0_3[5], acc0_3[3]);
+                                            acc1_3[3] = __fmaf_rn(weight_137, p1_3[5], acc1_3[3]);
+                                        }
                                     }
                                 }
-                                bool live_8_6 = num_splits > 2 && lse_max_3[0] > -CUDART_INF_F;
+                                bool live_8_6 = num_splits > 6 && lse_max_3[0] > -CUDART_INF_F;
                                 if (live_8_6) {
-                                    float weight_98 = approx_exp2(lse_3[2] - lse_max_3[0]);
-                                    if (cidx_3[2] == 0) {
-                                        den_3[0] = den_3[0] + weight_98;
-                                        acc0_3[0] = __fmaf_rn(weight_98, p0_3[2], acc0_3[0]);
-                                        acc1_3[0] = __fmaf_rn(weight_98, p1_3[2], acc1_3[0]);
-                                    }
-                                    if (cidx_3[2] == 1) {
-                                        den_3[1] = den_3[1] + weight_98;
-                                        acc0_3[1] = __fmaf_rn(weight_98, p0_3[2], acc0_3[1]);
-                                        acc1_3[1] = __fmaf_rn(weight_98, p1_3[2], acc1_3[1]);
-                                    }
-                                    if (cidx_3[2] == 2) {
-                                        den_3[2] = den_3[2] + weight_98;
-                                        acc0_3[2] = __fmaf_rn(weight_98, p0_3[2], acc0_3[2]);
-                                        acc1_3[2] = __fmaf_rn(weight_98, p1_3[2], acc1_3[2]);
-                                    }
-                                    if (cidx_3[2] == 3) {
-                                        den_3[3] = den_3[3] + weight_98;
-                                        acc0_3[3] = __fmaf_rn(weight_98, p0_3[2], acc0_3[3]);
-                                        acc1_3[3] = __fmaf_rn(weight_98, p1_3[2], acc1_3[3]);
+                                    float weight_138 = approx_exp2(lse_3[6] - lse_max_3[0]);
+                                    if (bound_2[0] > 6) {
+                                        den_3[0] = den_3[0] + weight_138;
+                                        acc0_3[0] = __fmaf_rn(weight_138, p0_3[6], acc0_3[0]);
+                                        acc1_3[0] = __fmaf_rn(weight_138, p1_3[6], acc1_3[0]);
+                                    } else if (bound_2[1] > 6) {
+                                        den_3[1] = den_3[1] + weight_138;
+                                        acc0_3[1] = __fmaf_rn(weight_138, p0_3[6], acc0_3[1]);
+                                        acc1_3[1] = __fmaf_rn(weight_138, p1_3[6], acc1_3[1]);
+                                    } else {
+                                        if (bound_2[2] > 6) {
+                                            den_3[2] = den_3[2] + weight_138;
+                                            acc0_3[2] = __fmaf_rn(weight_138, p0_3[6], acc0_3[2]);
+                                            acc1_3[2] = __fmaf_rn(weight_138, p1_3[6], acc1_3[2]);
+                                        } else {
+                                            den_3[3] = den_3[3] + weight_138;
+                                            acc0_3[3] = __fmaf_rn(weight_138, p0_3[6], acc0_3[3]);
+                                            acc1_3[3] = __fmaf_rn(weight_138, p1_3[6], acc1_3[3]);
+                                        }
                                     }
                                 }
-                                bool live_9_6 = num_splits > 3 && lse_max_3[0] > -CUDART_INF_F;
+                                bool live_9_6 = num_splits > 7 && lse_max_3[0] > -CUDART_INF_F;
                                 if (live_9_6) {
-                                    float weight_99 = approx_exp2(lse_3[3] - lse_max_3[0]);
-                                    if (cidx_3[3] == 0) {
-                                        den_3[0] = den_3[0] + weight_99;
-                                        acc0_3[0] = __fmaf_rn(weight_99, p0_3[3], acc0_3[0]);
-                                        acc1_3[0] = __fmaf_rn(weight_99, p1_3[3], acc1_3[0]);
-                                    }
-                                    if (cidx_3[3] == 1) {
-                                        den_3[1] = den_3[1] + weight_99;
-                                        acc0_3[1] = __fmaf_rn(weight_99, p0_3[3], acc0_3[1]);
-                                        acc1_3[1] = __fmaf_rn(weight_99, p1_3[3], acc1_3[1]);
-                                    }
-                                    if (cidx_3[3] == 2) {
-                                        den_3[2] = den_3[2] + weight_99;
-                                        acc0_3[2] = __fmaf_rn(weight_99, p0_3[3], acc0_3[2]);
-                                        acc1_3[2] = __fmaf_rn(weight_99, p1_3[3], acc1_3[2]);
-                                    }
-                                    if (cidx_3[3] == 3) {
-                                        den_3[3] = den_3[3] + weight_99;
-                                        acc0_3[3] = __fmaf_rn(weight_99, p0_3[3], acc0_3[3]);
-                                        acc1_3[3] = __fmaf_rn(weight_99, p1_3[3], acc1_3[3]);
+                                    float weight_139 = approx_exp2(lse_3[7] - lse_max_3[0]);
+                                    if (bound_2[0] > 7) {
+                                        den_3[0] = den_3[0] + weight_139;
+                                        acc0_3[0] = __fmaf_rn(weight_139, p0_3[7], acc0_3[0]);
+                                        acc1_3[0] = __fmaf_rn(weight_139, p1_3[7], acc1_3[0]);
+                                    } else if (bound_2[1] > 7) {
+                                        den_3[1] = den_3[1] + weight_139;
+                                        acc0_3[1] = __fmaf_rn(weight_139, p0_3[7], acc0_3[1]);
+                                        acc1_3[1] = __fmaf_rn(weight_139, p1_3[7], acc1_3[1]);
+                                    } else {
+                                        if (bound_2[2] > 7) {
+                                            den_3[2] = den_3[2] + weight_139;
+                                            acc0_3[2] = __fmaf_rn(weight_139, p0_3[7], acc0_3[2]);
+                                            acc1_3[2] = __fmaf_rn(weight_139, p1_3[7], acc1_3[2]);
+                                        } else {
+                                            den_3[3] = den_3[3] + weight_139;
+                                            acc0_3[3] = __fmaf_rn(weight_139, p0_3[7], acc0_3[3]);
+                                            acc1_3[3] = __fmaf_rn(weight_139, p1_3[7], acc1_3[3]);
+                                        }
                                     }
                                 }
                                 bool live_10_6 = num_splits > 0 && lse_max_3[1] > -CUDART_INF_F;
                                 if (live_10_6) {
-                                    float weight_100 = approx_exp2(lse_3[4] - lse_max_3[1]);
-                                    if (cidx_3[0] == 0) {
-                                        den_3[4] = den_3[4] + weight_100;
-                                        acc0_3[4] = __fmaf_rn(weight_100, p0_3[4], acc0_3[4]);
-                                        acc1_3[4] = __fmaf_rn(weight_100, p1_3[4], acc1_3[4]);
-                                    }
-                                    if (cidx_3[0] == 1) {
-                                        den_3[5] = den_3[5] + weight_100;
-                                        acc0_3[5] = __fmaf_rn(weight_100, p0_3[4], acc0_3[5]);
-                                        acc1_3[5] = __fmaf_rn(weight_100, p1_3[4], acc1_3[5]);
-                                    }
-                                    if (cidx_3[0] == 2) {
-                                        den_3[6] = den_3[6] + weight_100;
-                                        acc0_3[6] = __fmaf_rn(weight_100, p0_3[4], acc0_3[6]);
-                                        acc1_3[6] = __fmaf_rn(weight_100, p1_3[4], acc1_3[6]);
-                                    }
-                                    if (cidx_3[0] == 3) {
-                                        den_3[7] = den_3[7] + weight_100;
-                                        acc0_3[7] = __fmaf_rn(weight_100, p0_3[4], acc0_3[7]);
-                                        acc1_3[7] = __fmaf_rn(weight_100, p1_3[4], acc1_3[7]);
+                                    float weight_140 = approx_exp2(lse_3[8] - lse_max_3[1]);
+                                    if (bound_2[0] > 0) {
+                                        den_3[4] = den_3[4] + weight_140;
+                                        acc0_3[4] = __fmaf_rn(weight_140, p0_3[8], acc0_3[4]);
+                                        acc1_3[4] = __fmaf_rn(weight_140, p1_3[8], acc1_3[4]);
+                                    } else if (bound_2[1] > 0) {
+                                        den_3[5] = den_3[5] + weight_140;
+                                        acc0_3[5] = __fmaf_rn(weight_140, p0_3[8], acc0_3[5]);
+                                        acc1_3[5] = __fmaf_rn(weight_140, p1_3[8], acc1_3[5]);
+                                    } else {
+                                        if (bound_2[2] > 0) {
+                                            den_3[6] = den_3[6] + weight_140;
+                                            acc0_3[6] = __fmaf_rn(weight_140, p0_3[8], acc0_3[6]);
+                                            acc1_3[6] = __fmaf_rn(weight_140, p1_3[8], acc1_3[6]);
+                                        } else {
+                                            den_3[7] = den_3[7] + weight_140;
+                                            acc0_3[7] = __fmaf_rn(weight_140, p0_3[8], acc0_3[7]);
+                                            acc1_3[7] = __fmaf_rn(weight_140, p1_3[8], acc1_3[7]);
+                                        }
                                     }
                                 }
                                 bool live_11_6 = num_splits > 1 && lse_max_3[1] > -CUDART_INF_F;
                                 if (live_11_6) {
-                                    float weight_101 = approx_exp2(lse_3[5] - lse_max_3[1]);
-                                    if (cidx_3[1] == 0) {
-                                        den_3[4] = den_3[4] + weight_101;
-                                        acc0_3[4] = __fmaf_rn(weight_101, p0_3[5], acc0_3[4]);
-                                        acc1_3[4] = __fmaf_rn(weight_101, p1_3[5], acc1_3[4]);
-                                    }
-                                    if (cidx_3[1] == 1) {
-                                        den_3[5] = den_3[5] + weight_101;
-                                        acc0_3[5] = __fmaf_rn(weight_101, p0_3[5], acc0_3[5]);
-                                        acc1_3[5] = __fmaf_rn(weight_101, p1_3[5], acc1_3[5]);
-                                    }
-                                    if (cidx_3[1] == 2) {
-                                        den_3[6] = den_3[6] + weight_101;
-                                        acc0_3[6] = __fmaf_rn(weight_101, p0_3[5], acc0_3[6]);
-                                        acc1_3[6] = __fmaf_rn(weight_101, p1_3[5], acc1_3[6]);
-                                    }
-                                    if (cidx_3[1] == 3) {
-                                        den_3[7] = den_3[7] + weight_101;
-                                        acc0_3[7] = __fmaf_rn(weight_101, p0_3[5], acc0_3[7]);
-                                        acc1_3[7] = __fmaf_rn(weight_101, p1_3[5], acc1_3[7]);
+                                    float weight_141 = approx_exp2(lse_3[9] - lse_max_3[1]);
+                                    if (bound_2[0] > 1) {
+                                        den_3[4] = den_3[4] + weight_141;
+                                        acc0_3[4] = __fmaf_rn(weight_141, p0_3[9], acc0_3[4]);
+                                        acc1_3[4] = __fmaf_rn(weight_141, p1_3[9], acc1_3[4]);
+                                    } else if (bound_2[1] > 1) {
+                                        den_3[5] = den_3[5] + weight_141;
+                                        acc0_3[5] = __fmaf_rn(weight_141, p0_3[9], acc0_3[5]);
+                                        acc1_3[5] = __fmaf_rn(weight_141, p1_3[9], acc1_3[5]);
+                                    } else {
+                                        if (bound_2[2] > 1) {
+                                            den_3[6] = den_3[6] + weight_141;
+                                            acc0_3[6] = __fmaf_rn(weight_141, p0_3[9], acc0_3[6]);
+                                            acc1_3[6] = __fmaf_rn(weight_141, p1_3[9], acc1_3[6]);
+                                        } else {
+                                            den_3[7] = den_3[7] + weight_141;
+                                            acc0_3[7] = __fmaf_rn(weight_141, p0_3[9], acc0_3[7]);
+                                            acc1_3[7] = __fmaf_rn(weight_141, p1_3[9], acc1_3[7]);
+                                        }
                                     }
                                 }
                                 bool live_12_6 = num_splits > 2 && lse_max_3[1] > -CUDART_INF_F;
                                 if (live_12_6) {
-                                    float weight_102 = approx_exp2(lse_3[6] - lse_max_3[1]);
-                                    if (cidx_3[2] == 0) {
-                                        den_3[4] = den_3[4] + weight_102;
-                                        acc0_3[4] = __fmaf_rn(weight_102, p0_3[6], acc0_3[4]);
-                                        acc1_3[4] = __fmaf_rn(weight_102, p1_3[6], acc1_3[4]);
-                                    }
-                                    if (cidx_3[2] == 1) {
-                                        den_3[5] = den_3[5] + weight_102;
-                                        acc0_3[5] = __fmaf_rn(weight_102, p0_3[6], acc0_3[5]);
-                                        acc1_3[5] = __fmaf_rn(weight_102, p1_3[6], acc1_3[5]);
-                                    }
-                                    if (cidx_3[2] == 2) {
-                                        den_3[6] = den_3[6] + weight_102;
-                                        acc0_3[6] = __fmaf_rn(weight_102, p0_3[6], acc0_3[6]);
-                                        acc1_3[6] = __fmaf_rn(weight_102, p1_3[6], acc1_3[6]);
-                                    }
-                                    if (cidx_3[2] == 3) {
-                                        den_3[7] = den_3[7] + weight_102;
-                                        acc0_3[7] = __fmaf_rn(weight_102, p0_3[6], acc0_3[7]);
-                                        acc1_3[7] = __fmaf_rn(weight_102, p1_3[6], acc1_3[7]);
+                                    float weight_142 = approx_exp2(lse_3[10] - lse_max_3[1]);
+                                    if (bound_2[0] > 2) {
+                                        den_3[4] = den_3[4] + weight_142;
+                                        acc0_3[4] = __fmaf_rn(weight_142, p0_3[10], acc0_3[4]);
+                                        acc1_3[4] = __fmaf_rn(weight_142, p1_3[10], acc1_3[4]);
+                                    } else if (bound_2[1] > 2) {
+                                        den_3[5] = den_3[5] + weight_142;
+                                        acc0_3[5] = __fmaf_rn(weight_142, p0_3[10], acc0_3[5]);
+                                        acc1_3[5] = __fmaf_rn(weight_142, p1_3[10], acc1_3[5]);
+                                    } else {
+                                        if (bound_2[2] > 2) {
+                                            den_3[6] = den_3[6] + weight_142;
+                                            acc0_3[6] = __fmaf_rn(weight_142, p0_3[10], acc0_3[6]);
+                                            acc1_3[6] = __fmaf_rn(weight_142, p1_3[10], acc1_3[6]);
+                                        } else {
+                                            den_3[7] = den_3[7] + weight_142;
+                                            acc0_3[7] = __fmaf_rn(weight_142, p0_3[10], acc0_3[7]);
+                                            acc1_3[7] = __fmaf_rn(weight_142, p1_3[10], acc1_3[7]);
+                                        }
                                     }
                                 }
                                 bool live_13_6 = num_splits > 3 && lse_max_3[1] > -CUDART_INF_F;
                                 if (live_13_6) {
-                                    float weight_103 = approx_exp2(lse_3[7] - lse_max_3[1]);
-                                    if (cidx_3[3] == 0) {
-                                        den_3[4] = den_3[4] + weight_103;
-                                        acc0_3[4] = __fmaf_rn(weight_103, p0_3[7], acc0_3[4]);
-                                        acc1_3[4] = __fmaf_rn(weight_103, p1_3[7], acc1_3[4]);
-                                    }
-                                    if (cidx_3[3] == 1) {
-                                        den_3[5] = den_3[5] + weight_103;
-                                        acc0_3[5] = __fmaf_rn(weight_103, p0_3[7], acc0_3[5]);
-                                        acc1_3[5] = __fmaf_rn(weight_103, p1_3[7], acc1_3[5]);
-                                    }
-                                    if (cidx_3[3] == 2) {
-                                        den_3[6] = den_3[6] + weight_103;
-                                        acc0_3[6] = __fmaf_rn(weight_103, p0_3[7], acc0_3[6]);
-                                        acc1_3[6] = __fmaf_rn(weight_103, p1_3[7], acc1_3[6]);
-                                    }
-                                    if (cidx_3[3] == 3) {
-                                        den_3[7] = den_3[7] + weight_103;
-                                        acc0_3[7] = __fmaf_rn(weight_103, p0_3[7], acc0_3[7]);
-                                        acc1_3[7] = __fmaf_rn(weight_103, p1_3[7], acc1_3[7]);
+                                    float weight_143 = approx_exp2(lse_3[11] - lse_max_3[1]);
+                                    if (bound_2[0] > 3) {
+                                        den_3[4] = den_3[4] + weight_143;
+                                        acc0_3[4] = __fmaf_rn(weight_143, p0_3[11], acc0_3[4]);
+                                        acc1_3[4] = __fmaf_rn(weight_143, p1_3[11], acc1_3[4]);
+                                    } else if (bound_2[1] > 3) {
+                                        den_3[5] = den_3[5] + weight_143;
+                                        acc0_3[5] = __fmaf_rn(weight_143, p0_3[11], acc0_3[5]);
+                                        acc1_3[5] = __fmaf_rn(weight_143, p1_3[11], acc1_3[5]);
+                                    } else {
+                                        if (bound_2[2] > 3) {
+                                            den_3[6] = den_3[6] + weight_143;
+                                            acc0_3[6] = __fmaf_rn(weight_143, p0_3[11], acc0_3[6]);
+                                            acc1_3[6] = __fmaf_rn(weight_143, p1_3[11], acc1_3[6]);
+                                        } else {
+                                            den_3[7] = den_3[7] + weight_143;
+                                            acc0_3[7] = __fmaf_rn(weight_143, p0_3[11], acc0_3[7]);
+                                            acc1_3[7] = __fmaf_rn(weight_143, p1_3[11], acc1_3[7]);
+                                        }
                                     }
                                 }
-                                bool live_14_6 = num_splits > 0 && lse_max_3[2] > -CUDART_INF_F;
+                                bool live_14_6 = num_splits > 4 && lse_max_3[1] > -CUDART_INF_F;
                                 if (live_14_6) {
-                                    float weight_104 = approx_exp2(lse_3[8] - lse_max_3[2]);
-                                    if (cidx_3[0] == 0) {
-                                        den_3[8] = den_3[8] + weight_104;
-                                        acc0_3[8] = __fmaf_rn(weight_104, p0_3[8], acc0_3[8]);
-                                        acc1_3[8] = __fmaf_rn(weight_104, p1_3[8], acc1_3[8]);
-                                    }
-                                    if (cidx_3[0] == 1) {
-                                        den_3[9] = den_3[9] + weight_104;
-                                        acc0_3[9] = __fmaf_rn(weight_104, p0_3[8], acc0_3[9]);
-                                        acc1_3[9] = __fmaf_rn(weight_104, p1_3[8], acc1_3[9]);
-                                    }
-                                    if (cidx_3[0] == 2) {
-                                        den_3[10] = den_3[10] + weight_104;
-                                        acc0_3[10] = __fmaf_rn(weight_104, p0_3[8], acc0_3[10]);
-                                        acc1_3[10] = __fmaf_rn(weight_104, p1_3[8], acc1_3[10]);
-                                    }
-                                    if (cidx_3[0] == 3) {
-                                        den_3[11] = den_3[11] + weight_104;
-                                        acc0_3[11] = __fmaf_rn(weight_104, p0_3[8], acc0_3[11]);
-                                        acc1_3[11] = __fmaf_rn(weight_104, p1_3[8], acc1_3[11]);
+                                    float weight_144 = approx_exp2(lse_3[12] - lse_max_3[1]);
+                                    if (bound_2[0] > 4) {
+                                        den_3[4] = den_3[4] + weight_144;
+                                        acc0_3[4] = __fmaf_rn(weight_144, p0_3[12], acc0_3[4]);
+                                        acc1_3[4] = __fmaf_rn(weight_144, p1_3[12], acc1_3[4]);
+                                    } else if (bound_2[1] > 4) {
+                                        den_3[5] = den_3[5] + weight_144;
+                                        acc0_3[5] = __fmaf_rn(weight_144, p0_3[12], acc0_3[5]);
+                                        acc1_3[5] = __fmaf_rn(weight_144, p1_3[12], acc1_3[5]);
+                                    } else {
+                                        if (bound_2[2] > 4) {
+                                            den_3[6] = den_3[6] + weight_144;
+                                            acc0_3[6] = __fmaf_rn(weight_144, p0_3[12], acc0_3[6]);
+                                            acc1_3[6] = __fmaf_rn(weight_144, p1_3[12], acc1_3[6]);
+                                        } else {
+                                            den_3[7] = den_3[7] + weight_144;
+                                            acc0_3[7] = __fmaf_rn(weight_144, p0_3[12], acc0_3[7]);
+                                            acc1_3[7] = __fmaf_rn(weight_144, p1_3[12], acc1_3[7]);
+                                        }
                                     }
                                 }
-                                bool live_15_3 = num_splits > 1 && lse_max_3[2] > -CUDART_INF_F;
+                                bool live_15_3 = num_splits > 5 && lse_max_3[1] > -CUDART_INF_F;
                                 if (live_15_3) {
-                                    float weight_105 = approx_exp2(lse_3[9] - lse_max_3[2]);
-                                    if (cidx_3[1] == 0) {
-                                        den_3[8] = den_3[8] + weight_105;
-                                        acc0_3[8] = __fmaf_rn(weight_105, p0_3[9], acc0_3[8]);
-                                        acc1_3[8] = __fmaf_rn(weight_105, p1_3[9], acc1_3[8]);
-                                    }
-                                    if (cidx_3[1] == 1) {
-                                        den_3[9] = den_3[9] + weight_105;
-                                        acc0_3[9] = __fmaf_rn(weight_105, p0_3[9], acc0_3[9]);
-                                        acc1_3[9] = __fmaf_rn(weight_105, p1_3[9], acc1_3[9]);
-                                    }
-                                    if (cidx_3[1] == 2) {
-                                        den_3[10] = den_3[10] + weight_105;
-                                        acc0_3[10] = __fmaf_rn(weight_105, p0_3[9], acc0_3[10]);
-                                        acc1_3[10] = __fmaf_rn(weight_105, p1_3[9], acc1_3[10]);
-                                    }
-                                    if (cidx_3[1] == 3) {
-                                        den_3[11] = den_3[11] + weight_105;
-                                        acc0_3[11] = __fmaf_rn(weight_105, p0_3[9], acc0_3[11]);
-                                        acc1_3[11] = __fmaf_rn(weight_105, p1_3[9], acc1_3[11]);
-                                    }
-                                }
-                                bool live_16_2 = num_splits > 2 && lse_max_3[2] > -CUDART_INF_F;
-                                if (live_16_2) {
-                                    float weight_106 = approx_exp2(lse_3[10] - lse_max_3[2]);
-                                    if (cidx_3[2] == 0) {
-                                        den_3[8] = den_3[8] + weight_106;
-                                        acc0_3[8] = __fmaf_rn(weight_106, p0_3[10], acc0_3[8]);
-                                        acc1_3[8] = __fmaf_rn(weight_106, p1_3[10], acc1_3[8]);
-                                    }
-                                    if (cidx_3[2] == 1) {
-                                        den_3[9] = den_3[9] + weight_106;
-                                        acc0_3[9] = __fmaf_rn(weight_106, p0_3[10], acc0_3[9]);
-                                        acc1_3[9] = __fmaf_rn(weight_106, p1_3[10], acc1_3[9]);
-                                    }
-                                    if (cidx_3[2] == 2) {
-                                        den_3[10] = den_3[10] + weight_106;
-                                        acc0_3[10] = __fmaf_rn(weight_106, p0_3[10], acc0_3[10]);
-                                        acc1_3[10] = __fmaf_rn(weight_106, p1_3[10], acc1_3[10]);
-                                    }
-                                    if (cidx_3[2] == 3) {
-                                        den_3[11] = den_3[11] + weight_106;
-                                        acc0_3[11] = __fmaf_rn(weight_106, p0_3[10], acc0_3[11]);
-                                        acc1_3[11] = __fmaf_rn(weight_106, p1_3[10], acc1_3[11]);
+                                    float weight_145 = approx_exp2(lse_3[13] - lse_max_3[1]);
+                                    if (bound_2[0] > 5) {
+                                        den_3[4] = den_3[4] + weight_145;
+                                        acc0_3[4] = __fmaf_rn(weight_145, p0_3[13], acc0_3[4]);
+                                        acc1_3[4] = __fmaf_rn(weight_145, p1_3[13], acc1_3[4]);
+                                    } else if (bound_2[1] > 5) {
+                                        den_3[5] = den_3[5] + weight_145;
+                                        acc0_3[5] = __fmaf_rn(weight_145, p0_3[13], acc0_3[5]);
+                                        acc1_3[5] = __fmaf_rn(weight_145, p1_3[13], acc1_3[5]);
+                                    } else {
+                                        if (bound_2[2] > 5) {
+                                            den_3[6] = den_3[6] + weight_145;
+                                            acc0_3[6] = __fmaf_rn(weight_145, p0_3[13], acc0_3[6]);
+                                            acc1_3[6] = __fmaf_rn(weight_145, p1_3[13], acc1_3[6]);
+                                        } else {
+                                            den_3[7] = den_3[7] + weight_145;
+                                            acc0_3[7] = __fmaf_rn(weight_145, p0_3[13], acc0_3[7]);
+                                            acc1_3[7] = __fmaf_rn(weight_145, p1_3[13], acc1_3[7]);
+                                        }
                                     }
                                 }
-                                bool live_17_2 = num_splits > 3 && lse_max_3[2] > -CUDART_INF_F;
-                                if (live_17_2) {
-                                    float weight_107 = approx_exp2(lse_3[11] - lse_max_3[2]);
-                                    if (cidx_3[3] == 0) {
-                                        den_3[8] = den_3[8] + weight_107;
-                                        acc0_3[8] = __fmaf_rn(weight_107, p0_3[11], acc0_3[8]);
-                                        acc1_3[8] = __fmaf_rn(weight_107, p1_3[11], acc1_3[8]);
-                                    }
-                                    if (cidx_3[3] == 1) {
-                                        den_3[9] = den_3[9] + weight_107;
-                                        acc0_3[9] = __fmaf_rn(weight_107, p0_3[11], acc0_3[9]);
-                                        acc1_3[9] = __fmaf_rn(weight_107, p1_3[11], acc1_3[9]);
-                                    }
-                                    if (cidx_3[3] == 2) {
-                                        den_3[10] = den_3[10] + weight_107;
-                                        acc0_3[10] = __fmaf_rn(weight_107, p0_3[11], acc0_3[10]);
-                                        acc1_3[10] = __fmaf_rn(weight_107, p1_3[11], acc1_3[10]);
-                                    }
-                                    if (cidx_3[3] == 3) {
-                                        den_3[11] = den_3[11] + weight_107;
-                                        acc0_3[11] = __fmaf_rn(weight_107, p0_3[11], acc0_3[11]);
-                                        acc1_3[11] = __fmaf_rn(weight_107, p1_3[11], acc1_3[11]);
-                                    }
-                                }
-                                bool live_18_1 = num_splits > 0 && lse_max_3[3] > -CUDART_INF_F;
-                                if (live_18_1) {
-                                    float weight_108 = approx_exp2(lse_3[12] - lse_max_3[3]);
-                                    if (cidx_3[0] == 0) {
-                                        den_3[12] = den_3[12] + weight_108;
-                                        acc0_3[12] = __fmaf_rn(weight_108, p0_3[12], acc0_3[12]);
-                                        acc1_3[12] = __fmaf_rn(weight_108, p1_3[12], acc1_3[12]);
-                                    }
-                                    if (cidx_3[0] == 1) {
-                                        den_3[13] = den_3[13] + weight_108;
-                                        acc0_3[13] = __fmaf_rn(weight_108, p0_3[12], acc0_3[13]);
-                                        acc1_3[13] = __fmaf_rn(weight_108, p1_3[12], acc1_3[13]);
-                                    }
-                                    if (cidx_3[0] == 2) {
-                                        den_3[14] = den_3[14] + weight_108;
-                                        acc0_3[14] = __fmaf_rn(weight_108, p0_3[12], acc0_3[14]);
-                                        acc1_3[14] = __fmaf_rn(weight_108, p1_3[12], acc1_3[14]);
-                                    }
-                                    if (cidx_3[0] == 3) {
-                                        den_3[15] = den_3[15] + weight_108;
-                                        acc0_3[15] = __fmaf_rn(weight_108, p0_3[12], acc0_3[15]);
-                                        acc1_3[15] = __fmaf_rn(weight_108, p1_3[12], acc1_3[15]);
+                                bool live_16_3 = num_splits > 6 && lse_max_3[1] > -CUDART_INF_F;
+                                if (live_16_3) {
+                                    float weight_146 = approx_exp2(lse_3[14] - lse_max_3[1]);
+                                    if (bound_2[0] > 6) {
+                                        den_3[4] = den_3[4] + weight_146;
+                                        acc0_3[4] = __fmaf_rn(weight_146, p0_3[14], acc0_3[4]);
+                                        acc1_3[4] = __fmaf_rn(weight_146, p1_3[14], acc1_3[4]);
+                                    } else if (bound_2[1] > 6) {
+                                        den_3[5] = den_3[5] + weight_146;
+                                        acc0_3[5] = __fmaf_rn(weight_146, p0_3[14], acc0_3[5]);
+                                        acc1_3[5] = __fmaf_rn(weight_146, p1_3[14], acc1_3[5]);
+                                    } else {
+                                        if (bound_2[2] > 6) {
+                                            den_3[6] = den_3[6] + weight_146;
+                                            acc0_3[6] = __fmaf_rn(weight_146, p0_3[14], acc0_3[6]);
+                                            acc1_3[6] = __fmaf_rn(weight_146, p1_3[14], acc1_3[6]);
+                                        } else {
+                                            den_3[7] = den_3[7] + weight_146;
+                                            acc0_3[7] = __fmaf_rn(weight_146, p0_3[14], acc0_3[7]);
+                                            acc1_3[7] = __fmaf_rn(weight_146, p1_3[14], acc1_3[7]);
+                                        }
                                     }
                                 }
-                                bool live_19_1 = num_splits > 1 && lse_max_3[3] > -CUDART_INF_F;
-                                if (live_19_1) {
-                                    float weight_109 = approx_exp2(lse_3[13] - lse_max_3[3]);
-                                    if (cidx_3[1] == 0) {
-                                        den_3[12] = den_3[12] + weight_109;
-                                        acc0_3[12] = __fmaf_rn(weight_109, p0_3[13], acc0_3[12]);
-                                        acc1_3[12] = __fmaf_rn(weight_109, p1_3[13], acc1_3[12]);
-                                    }
-                                    if (cidx_3[1] == 1) {
-                                        den_3[13] = den_3[13] + weight_109;
-                                        acc0_3[13] = __fmaf_rn(weight_109, p0_3[13], acc0_3[13]);
-                                        acc1_3[13] = __fmaf_rn(weight_109, p1_3[13], acc1_3[13]);
-                                    }
-                                    if (cidx_3[1] == 2) {
-                                        den_3[14] = den_3[14] + weight_109;
-                                        acc0_3[14] = __fmaf_rn(weight_109, p0_3[13], acc0_3[14]);
-                                        acc1_3[14] = __fmaf_rn(weight_109, p1_3[13], acc1_3[14]);
-                                    }
-                                    if (cidx_3[1] == 3) {
-                                        den_3[15] = den_3[15] + weight_109;
-                                        acc0_3[15] = __fmaf_rn(weight_109, p0_3[13], acc0_3[15]);
-                                        acc1_3[15] = __fmaf_rn(weight_109, p1_3[13], acc1_3[15]);
-                                    }
-                                }
-                                bool live_20_1 = num_splits > 2 && lse_max_3[3] > -CUDART_INF_F;
-                                if (live_20_1) {
-                                    float weight_110 = approx_exp2(lse_3[14] - lse_max_3[3]);
-                                    if (cidx_3[2] == 0) {
-                                        den_3[12] = den_3[12] + weight_110;
-                                        acc0_3[12] = __fmaf_rn(weight_110, p0_3[14], acc0_3[12]);
-                                        acc1_3[12] = __fmaf_rn(weight_110, p1_3[14], acc1_3[12]);
-                                    }
-                                    if (cidx_3[2] == 1) {
-                                        den_3[13] = den_3[13] + weight_110;
-                                        acc0_3[13] = __fmaf_rn(weight_110, p0_3[14], acc0_3[13]);
-                                        acc1_3[13] = __fmaf_rn(weight_110, p1_3[14], acc1_3[13]);
-                                    }
-                                    if (cidx_3[2] == 2) {
-                                        den_3[14] = den_3[14] + weight_110;
-                                        acc0_3[14] = __fmaf_rn(weight_110, p0_3[14], acc0_3[14]);
-                                        acc1_3[14] = __fmaf_rn(weight_110, p1_3[14], acc1_3[14]);
-                                    }
-                                    if (cidx_3[2] == 3) {
-                                        den_3[15] = den_3[15] + weight_110;
-                                        acc0_3[15] = __fmaf_rn(weight_110, p0_3[14], acc0_3[15]);
-                                        acc1_3[15] = __fmaf_rn(weight_110, p1_3[14], acc1_3[15]);
-                                    }
-                                }
-                                bool live_21 = num_splits > 3 && lse_max_3[3] > -CUDART_INF_F;
-                                if (live_21) {
-                                    float weight_111 = approx_exp2(lse_3[15] - lse_max_3[3]);
-                                    if (cidx_3[3] == 0) {
-                                        den_3[12] = den_3[12] + weight_111;
-                                        acc0_3[12] = __fmaf_rn(weight_111, p0_3[15], acc0_3[12]);
-                                        acc1_3[12] = __fmaf_rn(weight_111, p1_3[15], acc1_3[12]);
-                                    }
-                                    if (cidx_3[3] == 1) {
-                                        den_3[13] = den_3[13] + weight_111;
-                                        acc0_3[13] = __fmaf_rn(weight_111, p0_3[15], acc0_3[13]);
-                                        acc1_3[13] = __fmaf_rn(weight_111, p1_3[15], acc1_3[13]);
-                                    }
-                                    if (cidx_3[3] == 2) {
-                                        den_3[14] = den_3[14] + weight_111;
-                                        acc0_3[14] = __fmaf_rn(weight_111, p0_3[15], acc0_3[14]);
-                                        acc1_3[14] = __fmaf_rn(weight_111, p1_3[15], acc1_3[14]);
-                                    }
-                                    if (cidx_3[3] == 3) {
-                                        den_3[15] = den_3[15] + weight_111;
-                                        acc0_3[15] = __fmaf_rn(weight_111, p0_3[15], acc0_3[15]);
-                                        acc1_3[15] = __fmaf_rn(weight_111, p1_3[15], acc1_3[15]);
+                                bool live_17_3 = num_splits > 7 && lse_max_3[1] > -CUDART_INF_F;
+                                if (live_17_3) {
+                                    float weight_147 = approx_exp2(lse_3[15] - lse_max_3[1]);
+                                    if (bound_2[0] > 7) {
+                                        den_3[4] = den_3[4] + weight_147;
+                                        acc0_3[4] = __fmaf_rn(weight_147, p0_3[15], acc0_3[4]);
+                                        acc1_3[4] = __fmaf_rn(weight_147, p1_3[15], acc1_3[4]);
+                                    } else if (bound_2[1] > 7) {
+                                        den_3[5] = den_3[5] + weight_147;
+                                        acc0_3[5] = __fmaf_rn(weight_147, p0_3[15], acc0_3[5]);
+                                        acc1_3[5] = __fmaf_rn(weight_147, p1_3[15], acc1_3[5]);
+                                    } else {
+                                        if (bound_2[2] > 7) {
+                                            den_3[6] = den_3[6] + weight_147;
+                                            acc0_3[6] = __fmaf_rn(weight_147, p0_3[15], acc0_3[6]);
+                                            acc1_3[6] = __fmaf_rn(weight_147, p1_3[15], acc1_3[6]);
+                                        } else {
+                                            den_3[7] = den_3[7] + weight_147;
+                                            acc0_3[7] = __fmaf_rn(weight_147, p0_3[15], acc0_3[7]);
+                                            acc1_3[7] = __fmaf_rn(weight_147, p1_3[15], acc1_3[7]);
+                                        }
                                     }
                                 }
                                 if (valid_3[0] != 0) {
@@ -5105,19 +6289,19 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     acc1_k_4 = acc1_k_4 + acc1_3[3];
                                     float inv_6 = 0.0f;
                                     if (den_k_4 > 0.0f) {
-                                        float _rcp_256 = approx_rcp(den_k_4);
-                                        inv_6 = _rcp_256;
+                                        float _rcp_290 = approx_rcp(den_k_4);
+                                        inv_6 = _rcp_290;
                                     }
                                     float attn0_4 = (float)(__nv_bfloat16)(acc0_k_4 * inv_6);
                                     float attn1_4 = (float)(__nv_bfloat16)(acc1_k_4 * inv_6);
-                                    float _exp2_258 = approx_exp2((-gate0_3[0]) * 1.442695f);
-                                    float _rcp_257 = approx_rcp(1.0f + _exp2_258);
-                                    float result0_4 = attn0_4 * _rcp_257;
-                                    float _exp2_260 = approx_exp2((-gate1_3[0]) * 1.442695f);
-                                    float _rcp_259 = approx_rcp(1.0f + _exp2_260);
-                                    float result1_4 = attn1_4 * _rcp_259;
-                                    __nv_bfloat162 _bit_cast_src_261 = __float22bfloat162_rn(make_float2(result0_4, result1_4));
-                                    word_3[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_261)[0];
+                                    float _exp2_292 = approx_exp2((-gate0_3[0]) * 1.442695f);
+                                    float _rcp_291 = approx_rcp(1.0f + _exp2_292);
+                                    float result0_4 = attn0_4 * _rcp_291;
+                                    float _exp2_294 = approx_exp2((-gate1_3[0]) * 1.442695f);
+                                    float _rcp_293 = approx_rcp(1.0f + _exp2_294);
+                                    float result1_4 = attn1_4 * _rcp_293;
+                                    __nv_bfloat162 _bit_cast_src_295 = __float22bfloat162_rn(make_float2(result0_4, result1_4));
+                                    word_3[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_295)[0];
                                     long long out_offset_4 = row_i64 * out_stride_row + qo_head_5[0] * out_stride_head + dim_3[0];
                                     *(reinterpret_cast<unsigned int*>(out + out_offset_4) + (0)) = word_3[0];
                                 }
@@ -5136,83 +6320,878 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     acc1_k_5 = acc1_k_5 + acc1_3[7];
                                     float inv_7 = 0.0f;
                                     if (den_k_5 > 0.0f) {
-                                        float _rcp_262 = approx_rcp(den_k_5);
-                                        inv_7 = _rcp_262;
+                                        float _rcp_296 = approx_rcp(den_k_5);
+                                        inv_7 = _rcp_296;
                                     }
                                     float attn0_5 = (float)(__nv_bfloat16)(acc0_k_5 * inv_7);
                                     float attn1_5 = (float)(__nv_bfloat16)(acc1_k_5 * inv_7);
-                                    float _exp2_264 = approx_exp2((-gate0_3[1]) * 1.442695f);
-                                    float _rcp_263 = approx_rcp(1.0f + _exp2_264);
-                                    float result0_5 = attn0_5 * _rcp_263;
-                                    float _exp2_266 = approx_exp2((-gate1_3[1]) * 1.442695f);
-                                    float _rcp_265 = approx_rcp(1.0f + _exp2_266);
-                                    float result1_5 = attn1_5 * _rcp_265;
-                                    __nv_bfloat162 _bit_cast_src_267 = __float22bfloat162_rn(make_float2(result0_5, result1_5));
-                                    word_3[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_267)[0];
+                                    float _exp2_298 = approx_exp2((-gate0_3[1]) * 1.442695f);
+                                    float _rcp_297 = approx_rcp(1.0f + _exp2_298);
+                                    float result0_5 = attn0_5 * _rcp_297;
+                                    float _exp2_300 = approx_exp2((-gate1_3[1]) * 1.442695f);
+                                    float _rcp_299 = approx_rcp(1.0f + _exp2_300);
+                                    float result1_5 = attn1_5 * _rcp_299;
+                                    __nv_bfloat162 _bit_cast_src_301 = __float22bfloat162_rn(make_float2(result0_5, result1_5));
+                                    word_3[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_301)[0];
                                     long long out_offset_5 = row_i64 * out_stride_row + qo_head_5[1] * out_stride_head + dim_3[1];
                                     *(reinterpret_cast<unsigned int*>(out + out_offset_5) + (0)) = word_3[0];
                                 }
-                                if (valid_3[2] != 0) {
-                                    float den_k_6 = den_3[8];
-                                    float acc0_k_6 = acc0_3[8];
-                                    float acc1_k_6 = acc1_3[8];
-                                    den_k_6 = den_k_6 + den_3[9];
-                                    acc0_k_6 = acc0_k_6 + acc0_3[9];
-                                    acc1_k_6 = acc1_k_6 + acc1_3[9];
-                                    den_k_6 = den_k_6 + den_3[10];
-                                    acc0_k_6 = acc0_k_6 + acc0_3[10];
-                                    acc1_k_6 = acc1_k_6 + acc1_3[10];
-                                    den_k_6 = den_k_6 + den_3[11];
-                                    acc0_k_6 = acc0_k_6 + acc0_3[11];
-                                    acc1_k_6 = acc1_k_6 + acc1_3[11];
+                            }
+                        } else {
+                            float lse_4[16];
+                            float p0_4[16];
+                            float p1_4[16];
+                            float acc0_4[16];
+                            float acc1_4[16];
+                            float den_4[16];
+                            int chunk_w_4 = (num_splits + 3) / 4;
+                            if (num_splits <= 4) {
+                                chunk_w_4 = num_splits;
+                            }
+                            int bound_3[4];
+                            bound_3[0] = chunk_w_4;
+                            bound_3[1] = chunk_w_4 * 2;
+                            bound_3[2] = chunk_w_4 * 3;
+                            bound_3[3] = chunk_w_4 * 4;
+                            float lse_max_4[4];
+                            int valid_4[4];
+                            int tab_4[4];
+                            long long dim_4[4];
+                            long long qo_head_6[4];
+                            long long row_head_4[4];
+                            float gate0_4[4];
+                            float gate1_4[4];
+                            unsigned int word_4[1];
+                            long long nqo_4 = (long long)num_qo_heads;
+                            #pragma unroll 1
+                            for (int p_1_4 = p_first; p_1_4 < end; p_1_4 += 512) {
+                                int pk_4 = ((p_1_4) < (end - 1) ? (p_1_4) : (end - 1));
+                                valid_4[0] = ((end > p_1_4) ? 1 : 0);
+                                int head_0_4 = pk_4 >> 7;
+                                dim_4[0] = (long long)((pk_4 & 127) * 2);
+                                qo_head_6[0] = (long long)(first_head + head_0_4);
+                                row_head_4[0] = row_i64 * nqo_4 + qo_head_6[0];
+                                acc0_4[0] = 0.0f;
+                                acc1_4[0] = 0.0f;
+                                den_4[0] = 0.0f;
+                                acc0_4[1] = 0.0f;
+                                acc1_4[1] = 0.0f;
+                                den_4[1] = 0.0f;
+                                acc0_4[2] = 0.0f;
+                                acc1_4[2] = 0.0f;
+                                den_4[2] = 0.0f;
+                                acc0_4[3] = 0.0f;
+                                acc1_4[3] = 0.0f;
+                                den_4[3] = 0.0f;
+                                lse_max_4[0] = -CUDART_INF_F;
+                                float _vec_load_166[2];
+                                {
+                                    uint32_t _bf16x2_bits_302;
+                                    _bf16x2_bits_302 = *reinterpret_cast<const uint32_t*>(gate + (row_head_4[0] * 256 + dim_4[0]) + 0);
+                                    (&_vec_load_166[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_302) << 16);
+                                    (&_vec_load_166[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_302) & 0xffff0000u);
+                                }
+                                gate0_4[0] = _vec_load_166[0];
+                                gate1_4[0] = _vec_load_166[1];
+                                int pk_1_3 = ((p_1_4 + 128) < (end - 1) ? (p_1_4 + 128) : (end - 1));
+                                valid_4[1] = ((end > p_1_4 + 128) ? 1 : 0);
+                                int head_2_2 = pk_1_3 >> 7;
+                                dim_4[1] = (long long)((pk_1_3 & 127) * 2);
+                                qo_head_6[1] = (long long)(first_head + head_2_2);
+                                row_head_4[1] = row_i64 * nqo_4 + qo_head_6[1];
+                                acc0_4[4] = 0.0f;
+                                acc1_4[4] = 0.0f;
+                                den_4[4] = 0.0f;
+                                acc0_4[5] = 0.0f;
+                                acc1_4[5] = 0.0f;
+                                den_4[5] = 0.0f;
+                                acc0_4[6] = 0.0f;
+                                acc1_4[6] = 0.0f;
+                                den_4[6] = 0.0f;
+                                acc0_4[7] = 0.0f;
+                                acc1_4[7] = 0.0f;
+                                den_4[7] = 0.0f;
+                                lse_max_4[1] = -CUDART_INF_F;
+                                float _vec_load_167[2];
+                                {
+                                    uint32_t _bf16x2_bits_303;
+                                    _bf16x2_bits_303 = *reinterpret_cast<const uint32_t*>(gate + (row_head_4[1] * 256 + dim_4[1]) + 0);
+                                    (&_vec_load_167[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_303) << 16);
+                                    (&_vec_load_167[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_303) & 0xffff0000u);
+                                }
+                                gate0_4[1] = _vec_load_167[0];
+                                gate1_4[1] = _vec_load_167[1];
+                                int pk_3_1 = ((p_1_4 + 256) < (end - 1) ? (p_1_4 + 256) : (end - 1));
+                                valid_4[2] = ((end > p_1_4 + 256) ? 1 : 0);
+                                int head_4 = pk_3_1 >> 7;
+                                dim_4[2] = (long long)((pk_3_1 & 127) * 2);
+                                qo_head_6[2] = (long long)(first_head + head_4);
+                                row_head_4[2] = row_i64 * nqo_4 + qo_head_6[2];
+                                acc0_4[8] = 0.0f;
+                                acc1_4[8] = 0.0f;
+                                den_4[8] = 0.0f;
+                                acc0_4[9] = 0.0f;
+                                acc1_4[9] = 0.0f;
+                                den_4[9] = 0.0f;
+                                acc0_4[10] = 0.0f;
+                                acc1_4[10] = 0.0f;
+                                den_4[10] = 0.0f;
+                                acc0_4[11] = 0.0f;
+                                acc1_4[11] = 0.0f;
+                                den_4[11] = 0.0f;
+                                lse_max_4[2] = -CUDART_INF_F;
+                                float _vec_load_168[2];
+                                {
+                                    uint32_t _bf16x2_bits_304;
+                                    _bf16x2_bits_304 = *reinterpret_cast<const uint32_t*>(gate + (row_head_4[2] * 256 + dim_4[2]) + 0);
+                                    (&_vec_load_168[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_304) << 16);
+                                    (&_vec_load_168[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_304) & 0xffff0000u);
+                                }
+                                gate0_4[2] = _vec_load_168[0];
+                                gate1_4[2] = _vec_load_168[1];
+                                int pk_5 = ((p_1_4 + 384) < (end - 1) ? (p_1_4 + 384) : (end - 1));
+                                valid_4[3] = ((end > p_1_4 + 384) ? 1 : 0);
+                                int head_6 = pk_5 >> 7;
+                                dim_4[3] = (long long)((pk_5 & 127) * 2);
+                                qo_head_6[3] = (long long)(first_head + head_6);
+                                row_head_4[3] = row_i64 * nqo_4 + qo_head_6[3];
+                                acc0_4[12] = 0.0f;
+                                acc1_4[12] = 0.0f;
+                                den_4[12] = 0.0f;
+                                acc0_4[13] = 0.0f;
+                                acc1_4[13] = 0.0f;
+                                den_4[13] = 0.0f;
+                                acc0_4[14] = 0.0f;
+                                acc1_4[14] = 0.0f;
+                                den_4[14] = 0.0f;
+                                acc0_4[15] = 0.0f;
+                                acc1_4[15] = 0.0f;
+                                den_4[15] = 0.0f;
+                                lse_max_4[3] = -CUDART_INF_F;
+                                float _vec_load_169[2];
+                                {
+                                    uint32_t _bf16x2_bits_305;
+                                    _bf16x2_bits_305 = *reinterpret_cast<const uint32_t*>(gate + (row_head_4[3] * 256 + dim_4[3]) + 0);
+                                    (&_vec_load_169[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_305) << 16);
+                                    (&_vec_load_169[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_305) & 0xffff0000u);
+                                }
+                                gate0_4[3] = _vec_load_169[0];
+                                gate1_4[3] = _vec_load_169[1];
+                                lse_4[0] = -CUDART_INF_F;
+                                if (num_splits > 0) {
+                                    long long part_row_148 = row_head_4[0];
+                                    lse_4[0] = partial_lse[part_row_148];
+                                    float _vec_load_170[2];
+                                    {
+                                        float2 _v2_306 = *reinterpret_cast<const float2*>(partial_out + (part_row_148 * 256 + dim_4[0]) + 0);
+                                        _vec_load_170[0] = _v2_306.x;
+                                        _vec_load_170[0 + 1] = _v2_306.y;
+                                    }
+                                    p0_4[0] = _vec_load_170[0];
+                                    p1_4[0] = _vec_load_170[1];
+                                }
+                                lse_4[1] = -CUDART_INF_F;
+                                if (num_splits > 1) {
+                                    long long part_row_149 = split_pitch + row_head_4[0];
+                                    lse_4[1] = partial_lse[part_row_149];
+                                    float _vec_load_171[2];
+                                    {
+                                        float2 _v2_307 = *reinterpret_cast<const float2*>(partial_out + (part_row_149 * 256 + dim_4[0]) + 0);
+                                        _vec_load_171[0] = _v2_307.x;
+                                        _vec_load_171[0 + 1] = _v2_307.y;
+                                    }
+                                    p0_4[1] = _vec_load_171[0];
+                                    p1_4[1] = _vec_load_171[1];
+                                }
+                                lse_4[2] = -CUDART_INF_F;
+                                if (num_splits > 2) {
+                                    long long part_row_150 = 2 * split_pitch + row_head_4[0];
+                                    lse_4[2] = partial_lse[part_row_150];
+                                    float _vec_load_172[2];
+                                    {
+                                        float2 _v2_308 = *reinterpret_cast<const float2*>(partial_out + (part_row_150 * 256 + dim_4[0]) + 0);
+                                        _vec_load_172[0] = _v2_308.x;
+                                        _vec_load_172[0 + 1] = _v2_308.y;
+                                    }
+                                    p0_4[2] = _vec_load_172[0];
+                                    p1_4[2] = _vec_load_172[1];
+                                }
+                                lse_4[3] = -CUDART_INF_F;
+                                if (num_splits > 3) {
+                                    long long part_row_151 = 3 * split_pitch + row_head_4[0];
+                                    lse_4[3] = partial_lse[part_row_151];
+                                    float _vec_load_173[2];
+                                    {
+                                        float2 _v2_309 = *reinterpret_cast<const float2*>(partial_out + (part_row_151 * 256 + dim_4[0]) + 0);
+                                        _vec_load_173[0] = _v2_309.x;
+                                        _vec_load_173[0 + 1] = _v2_309.y;
+                                    }
+                                    p0_4[3] = _vec_load_173[0];
+                                    p1_4[3] = _vec_load_173[1];
+                                }
+                                lse_4[4] = -CUDART_INF_F;
+                                if (num_splits > 0) {
+                                    long long part_row_152 = row_head_4[1];
+                                    lse_4[4] = partial_lse[part_row_152];
+                                    float _vec_load_174[2];
+                                    {
+                                        float2 _v2_310 = *reinterpret_cast<const float2*>(partial_out + (part_row_152 * 256 + dim_4[1]) + 0);
+                                        _vec_load_174[0] = _v2_310.x;
+                                        _vec_load_174[0 + 1] = _v2_310.y;
+                                    }
+                                    p0_4[4] = _vec_load_174[0];
+                                    p1_4[4] = _vec_load_174[1];
+                                }
+                                lse_4[5] = -CUDART_INF_F;
+                                if (num_splits > 1) {
+                                    long long part_row_153 = split_pitch + row_head_4[1];
+                                    lse_4[5] = partial_lse[part_row_153];
+                                    float _vec_load_175[2];
+                                    {
+                                        float2 _v2_311 = *reinterpret_cast<const float2*>(partial_out + (part_row_153 * 256 + dim_4[1]) + 0);
+                                        _vec_load_175[0] = _v2_311.x;
+                                        _vec_load_175[0 + 1] = _v2_311.y;
+                                    }
+                                    p0_4[5] = _vec_load_175[0];
+                                    p1_4[5] = _vec_load_175[1];
+                                }
+                                lse_4[6] = -CUDART_INF_F;
+                                if (num_splits > 2) {
+                                    long long part_row_154 = 2 * split_pitch + row_head_4[1];
+                                    lse_4[6] = partial_lse[part_row_154];
+                                    float _vec_load_176[2];
+                                    {
+                                        float2 _v2_312 = *reinterpret_cast<const float2*>(partial_out + (part_row_154 * 256 + dim_4[1]) + 0);
+                                        _vec_load_176[0] = _v2_312.x;
+                                        _vec_load_176[0 + 1] = _v2_312.y;
+                                    }
+                                    p0_4[6] = _vec_load_176[0];
+                                    p1_4[6] = _vec_load_176[1];
+                                }
+                                lse_4[7] = -CUDART_INF_F;
+                                if (num_splits > 3) {
+                                    long long part_row_155 = 3 * split_pitch + row_head_4[1];
+                                    lse_4[7] = partial_lse[part_row_155];
+                                    float _vec_load_177[2];
+                                    {
+                                        float2 _v2_313 = *reinterpret_cast<const float2*>(partial_out + (part_row_155 * 256 + dim_4[1]) + 0);
+                                        _vec_load_177[0] = _v2_313.x;
+                                        _vec_load_177[0 + 1] = _v2_313.y;
+                                    }
+                                    p0_4[7] = _vec_load_177[0];
+                                    p1_4[7] = _vec_load_177[1];
+                                }
+                                lse_4[8] = -CUDART_INF_F;
+                                if (num_splits > 0) {
+                                    long long part_row_156 = row_head_4[2];
+                                    lse_4[8] = partial_lse[part_row_156];
+                                    float _vec_load_178[2];
+                                    {
+                                        float2 _v2_314 = *reinterpret_cast<const float2*>(partial_out + (part_row_156 * 256 + dim_4[2]) + 0);
+                                        _vec_load_178[0] = _v2_314.x;
+                                        _vec_load_178[0 + 1] = _v2_314.y;
+                                    }
+                                    p0_4[8] = _vec_load_178[0];
+                                    p1_4[8] = _vec_load_178[1];
+                                }
+                                lse_4[9] = -CUDART_INF_F;
+                                if (num_splits > 1) {
+                                    long long part_row_157 = split_pitch + row_head_4[2];
+                                    lse_4[9] = partial_lse[part_row_157];
+                                    float _vec_load_179[2];
+                                    {
+                                        float2 _v2_315 = *reinterpret_cast<const float2*>(partial_out + (part_row_157 * 256 + dim_4[2]) + 0);
+                                        _vec_load_179[0] = _v2_315.x;
+                                        _vec_load_179[0 + 1] = _v2_315.y;
+                                    }
+                                    p0_4[9] = _vec_load_179[0];
+                                    p1_4[9] = _vec_load_179[1];
+                                }
+                                lse_4[10] = -CUDART_INF_F;
+                                if (num_splits > 2) {
+                                    long long part_row_158 = 2 * split_pitch + row_head_4[2];
+                                    lse_4[10] = partial_lse[part_row_158];
+                                    float _vec_load_180[2];
+                                    {
+                                        float2 _v2_316 = *reinterpret_cast<const float2*>(partial_out + (part_row_158 * 256 + dim_4[2]) + 0);
+                                        _vec_load_180[0] = _v2_316.x;
+                                        _vec_load_180[0 + 1] = _v2_316.y;
+                                    }
+                                    p0_4[10] = _vec_load_180[0];
+                                    p1_4[10] = _vec_load_180[1];
+                                }
+                                lse_4[11] = -CUDART_INF_F;
+                                if (num_splits > 3) {
+                                    long long part_row_159 = 3 * split_pitch + row_head_4[2];
+                                    lse_4[11] = partial_lse[part_row_159];
+                                    float _vec_load_181[2];
+                                    {
+                                        float2 _v2_317 = *reinterpret_cast<const float2*>(partial_out + (part_row_159 * 256 + dim_4[2]) + 0);
+                                        _vec_load_181[0] = _v2_317.x;
+                                        _vec_load_181[0 + 1] = _v2_317.y;
+                                    }
+                                    p0_4[11] = _vec_load_181[0];
+                                    p1_4[11] = _vec_load_181[1];
+                                }
+                                lse_4[12] = -CUDART_INF_F;
+                                if (num_splits > 0) {
+                                    long long part_row_160 = row_head_4[3];
+                                    lse_4[12] = partial_lse[part_row_160];
+                                    float _vec_load_182[2];
+                                    {
+                                        float2 _v2_318 = *reinterpret_cast<const float2*>(partial_out + (part_row_160 * 256 + dim_4[3]) + 0);
+                                        _vec_load_182[0] = _v2_318.x;
+                                        _vec_load_182[0 + 1] = _v2_318.y;
+                                    }
+                                    p0_4[12] = _vec_load_182[0];
+                                    p1_4[12] = _vec_load_182[1];
+                                }
+                                lse_4[13] = -CUDART_INF_F;
+                                if (num_splits > 1) {
+                                    long long part_row_161 = split_pitch + row_head_4[3];
+                                    lse_4[13] = partial_lse[part_row_161];
+                                    float _vec_load_183[2];
+                                    {
+                                        float2 _v2_319 = *reinterpret_cast<const float2*>(partial_out + (part_row_161 * 256 + dim_4[3]) + 0);
+                                        _vec_load_183[0] = _v2_319.x;
+                                        _vec_load_183[0 + 1] = _v2_319.y;
+                                    }
+                                    p0_4[13] = _vec_load_183[0];
+                                    p1_4[13] = _vec_load_183[1];
+                                }
+                                lse_4[14] = -CUDART_INF_F;
+                                if (num_splits > 2) {
+                                    long long part_row_162 = 2 * split_pitch + row_head_4[3];
+                                    lse_4[14] = partial_lse[part_row_162];
+                                    float _vec_load_184[2];
+                                    {
+                                        float2 _v2_320 = *reinterpret_cast<const float2*>(partial_out + (part_row_162 * 256 + dim_4[3]) + 0);
+                                        _vec_load_184[0] = _v2_320.x;
+                                        _vec_load_184[0 + 1] = _v2_320.y;
+                                    }
+                                    p0_4[14] = _vec_load_184[0];
+                                    p1_4[14] = _vec_load_184[1];
+                                }
+                                lse_4[15] = -CUDART_INF_F;
+                                if (num_splits > 3) {
+                                    long long part_row_163 = 3 * split_pitch + row_head_4[3];
+                                    lse_4[15] = partial_lse[part_row_163];
+                                    float _vec_load_185[2];
+                                    {
+                                        float2 _v2_321 = *reinterpret_cast<const float2*>(partial_out + (part_row_163 * 256 + dim_4[3]) + 0);
+                                        _vec_load_185[0] = _v2_321.x;
+                                        _vec_load_185[0 + 1] = _v2_321.y;
+                                    }
+                                    p0_4[15] = _vec_load_185[0];
+                                    p1_4[15] = _vec_load_185[1];
+                                }
+                                lse_max_4[0] = fmaxf(lse_max_4[0], lse_4[0]);
+                                lse_max_4[0] = fmaxf(lse_max_4[0], lse_4[1]);
+                                lse_max_4[0] = fmaxf(lse_max_4[0], lse_4[2]);
+                                lse_max_4[0] = fmaxf(lse_max_4[0], lse_4[3]);
+                                lse_max_4[1] = fmaxf(lse_max_4[1], lse_4[4]);
+                                lse_max_4[1] = fmaxf(lse_max_4[1], lse_4[5]);
+                                lse_max_4[1] = fmaxf(lse_max_4[1], lse_4[6]);
+                                lse_max_4[1] = fmaxf(lse_max_4[1], lse_4[7]);
+                                lse_max_4[2] = fmaxf(lse_max_4[2], lse_4[8]);
+                                lse_max_4[2] = fmaxf(lse_max_4[2], lse_4[9]);
+                                lse_max_4[2] = fmaxf(lse_max_4[2], lse_4[10]);
+                                lse_max_4[2] = fmaxf(lse_max_4[2], lse_4[11]);
+                                lse_max_4[3] = fmaxf(lse_max_4[3], lse_4[12]);
+                                lse_max_4[3] = fmaxf(lse_max_4[3], lse_4[13]);
+                                lse_max_4[3] = fmaxf(lse_max_4[3], lse_4[14]);
+                                lse_max_4[3] = fmaxf(lse_max_4[3], lse_4[15]);
+                                bool live_38 = num_splits > 0 && lse_max_4[0] > -CUDART_INF_F;
+                                if (live_38) {
+                                    float weight_148 = approx_exp2(lse_4[0] - lse_max_4[0]);
+                                    if (bound_3[0] > 0) {
+                                        den_4[0] = den_4[0] + weight_148;
+                                        acc0_4[0] = __fmaf_rn(weight_148, p0_4[0], acc0_4[0]);
+                                        acc1_4[0] = __fmaf_rn(weight_148, p1_4[0], acc1_4[0]);
+                                    } else if (bound_3[1] > 0) {
+                                        den_4[1] = den_4[1] + weight_148;
+                                        acc0_4[1] = __fmaf_rn(weight_148, p0_4[0], acc0_4[1]);
+                                        acc1_4[1] = __fmaf_rn(weight_148, p1_4[0], acc1_4[1]);
+                                    } else {
+                                        if (bound_3[2] > 0) {
+                                            den_4[2] = den_4[2] + weight_148;
+                                            acc0_4[2] = __fmaf_rn(weight_148, p0_4[0], acc0_4[2]);
+                                            acc1_4[2] = __fmaf_rn(weight_148, p1_4[0], acc1_4[2]);
+                                        } else {
+                                            den_4[3] = den_4[3] + weight_148;
+                                            acc0_4[3] = __fmaf_rn(weight_148, p0_4[0], acc0_4[3]);
+                                            acc1_4[3] = __fmaf_rn(weight_148, p1_4[0], acc1_4[3]);
+                                        }
+                                    }
+                                }
+                                bool live_7_7 = num_splits > 1 && lse_max_4[0] > -CUDART_INF_F;
+                                if (live_7_7) {
+                                    float weight_149 = approx_exp2(lse_4[1] - lse_max_4[0]);
+                                    if (bound_3[0] > 1) {
+                                        den_4[0] = den_4[0] + weight_149;
+                                        acc0_4[0] = __fmaf_rn(weight_149, p0_4[1], acc0_4[0]);
+                                        acc1_4[0] = __fmaf_rn(weight_149, p1_4[1], acc1_4[0]);
+                                    } else if (bound_3[1] > 1) {
+                                        den_4[1] = den_4[1] + weight_149;
+                                        acc0_4[1] = __fmaf_rn(weight_149, p0_4[1], acc0_4[1]);
+                                        acc1_4[1] = __fmaf_rn(weight_149, p1_4[1], acc1_4[1]);
+                                    } else {
+                                        if (bound_3[2] > 1) {
+                                            den_4[2] = den_4[2] + weight_149;
+                                            acc0_4[2] = __fmaf_rn(weight_149, p0_4[1], acc0_4[2]);
+                                            acc1_4[2] = __fmaf_rn(weight_149, p1_4[1], acc1_4[2]);
+                                        } else {
+                                            den_4[3] = den_4[3] + weight_149;
+                                            acc0_4[3] = __fmaf_rn(weight_149, p0_4[1], acc0_4[3]);
+                                            acc1_4[3] = __fmaf_rn(weight_149, p1_4[1], acc1_4[3]);
+                                        }
+                                    }
+                                }
+                                bool live_8_7 = num_splits > 2 && lse_max_4[0] > -CUDART_INF_F;
+                                if (live_8_7) {
+                                    float weight_150 = approx_exp2(lse_4[2] - lse_max_4[0]);
+                                    if (bound_3[0] > 2) {
+                                        den_4[0] = den_4[0] + weight_150;
+                                        acc0_4[0] = __fmaf_rn(weight_150, p0_4[2], acc0_4[0]);
+                                        acc1_4[0] = __fmaf_rn(weight_150, p1_4[2], acc1_4[0]);
+                                    } else if (bound_3[1] > 2) {
+                                        den_4[1] = den_4[1] + weight_150;
+                                        acc0_4[1] = __fmaf_rn(weight_150, p0_4[2], acc0_4[1]);
+                                        acc1_4[1] = __fmaf_rn(weight_150, p1_4[2], acc1_4[1]);
+                                    } else {
+                                        if (bound_3[2] > 2) {
+                                            den_4[2] = den_4[2] + weight_150;
+                                            acc0_4[2] = __fmaf_rn(weight_150, p0_4[2], acc0_4[2]);
+                                            acc1_4[2] = __fmaf_rn(weight_150, p1_4[2], acc1_4[2]);
+                                        } else {
+                                            den_4[3] = den_4[3] + weight_150;
+                                            acc0_4[3] = __fmaf_rn(weight_150, p0_4[2], acc0_4[3]);
+                                            acc1_4[3] = __fmaf_rn(weight_150, p1_4[2], acc1_4[3]);
+                                        }
+                                    }
+                                }
+                                bool live_9_7 = num_splits > 3 && lse_max_4[0] > -CUDART_INF_F;
+                                if (live_9_7) {
+                                    float weight_151 = approx_exp2(lse_4[3] - lse_max_4[0]);
+                                    if (bound_3[0] > 3) {
+                                        den_4[0] = den_4[0] + weight_151;
+                                        acc0_4[0] = __fmaf_rn(weight_151, p0_4[3], acc0_4[0]);
+                                        acc1_4[0] = __fmaf_rn(weight_151, p1_4[3], acc1_4[0]);
+                                    } else if (bound_3[1] > 3) {
+                                        den_4[1] = den_4[1] + weight_151;
+                                        acc0_4[1] = __fmaf_rn(weight_151, p0_4[3], acc0_4[1]);
+                                        acc1_4[1] = __fmaf_rn(weight_151, p1_4[3], acc1_4[1]);
+                                    } else {
+                                        if (bound_3[2] > 3) {
+                                            den_4[2] = den_4[2] + weight_151;
+                                            acc0_4[2] = __fmaf_rn(weight_151, p0_4[3], acc0_4[2]);
+                                            acc1_4[2] = __fmaf_rn(weight_151, p1_4[3], acc1_4[2]);
+                                        } else {
+                                            den_4[3] = den_4[3] + weight_151;
+                                            acc0_4[3] = __fmaf_rn(weight_151, p0_4[3], acc0_4[3]);
+                                            acc1_4[3] = __fmaf_rn(weight_151, p1_4[3], acc1_4[3]);
+                                        }
+                                    }
+                                }
+                                bool live_10_7 = num_splits > 0 && lse_max_4[1] > -CUDART_INF_F;
+                                if (live_10_7) {
+                                    float weight_152 = approx_exp2(lse_4[4] - lse_max_4[1]);
+                                    if (bound_3[0] > 0) {
+                                        den_4[4] = den_4[4] + weight_152;
+                                        acc0_4[4] = __fmaf_rn(weight_152, p0_4[4], acc0_4[4]);
+                                        acc1_4[4] = __fmaf_rn(weight_152, p1_4[4], acc1_4[4]);
+                                    } else if (bound_3[1] > 0) {
+                                        den_4[5] = den_4[5] + weight_152;
+                                        acc0_4[5] = __fmaf_rn(weight_152, p0_4[4], acc0_4[5]);
+                                        acc1_4[5] = __fmaf_rn(weight_152, p1_4[4], acc1_4[5]);
+                                    } else {
+                                        if (bound_3[2] > 0) {
+                                            den_4[6] = den_4[6] + weight_152;
+                                            acc0_4[6] = __fmaf_rn(weight_152, p0_4[4], acc0_4[6]);
+                                            acc1_4[6] = __fmaf_rn(weight_152, p1_4[4], acc1_4[6]);
+                                        } else {
+                                            den_4[7] = den_4[7] + weight_152;
+                                            acc0_4[7] = __fmaf_rn(weight_152, p0_4[4], acc0_4[7]);
+                                            acc1_4[7] = __fmaf_rn(weight_152, p1_4[4], acc1_4[7]);
+                                        }
+                                    }
+                                }
+                                bool live_11_7 = num_splits > 1 && lse_max_4[1] > -CUDART_INF_F;
+                                if (live_11_7) {
+                                    float weight_153 = approx_exp2(lse_4[5] - lse_max_4[1]);
+                                    if (bound_3[0] > 1) {
+                                        den_4[4] = den_4[4] + weight_153;
+                                        acc0_4[4] = __fmaf_rn(weight_153, p0_4[5], acc0_4[4]);
+                                        acc1_4[4] = __fmaf_rn(weight_153, p1_4[5], acc1_4[4]);
+                                    } else if (bound_3[1] > 1) {
+                                        den_4[5] = den_4[5] + weight_153;
+                                        acc0_4[5] = __fmaf_rn(weight_153, p0_4[5], acc0_4[5]);
+                                        acc1_4[5] = __fmaf_rn(weight_153, p1_4[5], acc1_4[5]);
+                                    } else {
+                                        if (bound_3[2] > 1) {
+                                            den_4[6] = den_4[6] + weight_153;
+                                            acc0_4[6] = __fmaf_rn(weight_153, p0_4[5], acc0_4[6]);
+                                            acc1_4[6] = __fmaf_rn(weight_153, p1_4[5], acc1_4[6]);
+                                        } else {
+                                            den_4[7] = den_4[7] + weight_153;
+                                            acc0_4[7] = __fmaf_rn(weight_153, p0_4[5], acc0_4[7]);
+                                            acc1_4[7] = __fmaf_rn(weight_153, p1_4[5], acc1_4[7]);
+                                        }
+                                    }
+                                }
+                                bool live_12_7 = num_splits > 2 && lse_max_4[1] > -CUDART_INF_F;
+                                if (live_12_7) {
+                                    float weight_154 = approx_exp2(lse_4[6] - lse_max_4[1]);
+                                    if (bound_3[0] > 2) {
+                                        den_4[4] = den_4[4] + weight_154;
+                                        acc0_4[4] = __fmaf_rn(weight_154, p0_4[6], acc0_4[4]);
+                                        acc1_4[4] = __fmaf_rn(weight_154, p1_4[6], acc1_4[4]);
+                                    } else if (bound_3[1] > 2) {
+                                        den_4[5] = den_4[5] + weight_154;
+                                        acc0_4[5] = __fmaf_rn(weight_154, p0_4[6], acc0_4[5]);
+                                        acc1_4[5] = __fmaf_rn(weight_154, p1_4[6], acc1_4[5]);
+                                    } else {
+                                        if (bound_3[2] > 2) {
+                                            den_4[6] = den_4[6] + weight_154;
+                                            acc0_4[6] = __fmaf_rn(weight_154, p0_4[6], acc0_4[6]);
+                                            acc1_4[6] = __fmaf_rn(weight_154, p1_4[6], acc1_4[6]);
+                                        } else {
+                                            den_4[7] = den_4[7] + weight_154;
+                                            acc0_4[7] = __fmaf_rn(weight_154, p0_4[6], acc0_4[7]);
+                                            acc1_4[7] = __fmaf_rn(weight_154, p1_4[6], acc1_4[7]);
+                                        }
+                                    }
+                                }
+                                bool live_13_7 = num_splits > 3 && lse_max_4[1] > -CUDART_INF_F;
+                                if (live_13_7) {
+                                    float weight_155 = approx_exp2(lse_4[7] - lse_max_4[1]);
+                                    if (bound_3[0] > 3) {
+                                        den_4[4] = den_4[4] + weight_155;
+                                        acc0_4[4] = __fmaf_rn(weight_155, p0_4[7], acc0_4[4]);
+                                        acc1_4[4] = __fmaf_rn(weight_155, p1_4[7], acc1_4[4]);
+                                    } else if (bound_3[1] > 3) {
+                                        den_4[5] = den_4[5] + weight_155;
+                                        acc0_4[5] = __fmaf_rn(weight_155, p0_4[7], acc0_4[5]);
+                                        acc1_4[5] = __fmaf_rn(weight_155, p1_4[7], acc1_4[5]);
+                                    } else {
+                                        if (bound_3[2] > 3) {
+                                            den_4[6] = den_4[6] + weight_155;
+                                            acc0_4[6] = __fmaf_rn(weight_155, p0_4[7], acc0_4[6]);
+                                            acc1_4[6] = __fmaf_rn(weight_155, p1_4[7], acc1_4[6]);
+                                        } else {
+                                            den_4[7] = den_4[7] + weight_155;
+                                            acc0_4[7] = __fmaf_rn(weight_155, p0_4[7], acc0_4[7]);
+                                            acc1_4[7] = __fmaf_rn(weight_155, p1_4[7], acc1_4[7]);
+                                        }
+                                    }
+                                }
+                                bool live_14_7 = num_splits > 0 && lse_max_4[2] > -CUDART_INF_F;
+                                if (live_14_7) {
+                                    float weight_156 = approx_exp2(lse_4[8] - lse_max_4[2]);
+                                    if (bound_3[0] > 0) {
+                                        den_4[8] = den_4[8] + weight_156;
+                                        acc0_4[8] = __fmaf_rn(weight_156, p0_4[8], acc0_4[8]);
+                                        acc1_4[8] = __fmaf_rn(weight_156, p1_4[8], acc1_4[8]);
+                                    } else if (bound_3[1] > 0) {
+                                        den_4[9] = den_4[9] + weight_156;
+                                        acc0_4[9] = __fmaf_rn(weight_156, p0_4[8], acc0_4[9]);
+                                        acc1_4[9] = __fmaf_rn(weight_156, p1_4[8], acc1_4[9]);
+                                    } else {
+                                        if (bound_3[2] > 0) {
+                                            den_4[10] = den_4[10] + weight_156;
+                                            acc0_4[10] = __fmaf_rn(weight_156, p0_4[8], acc0_4[10]);
+                                            acc1_4[10] = __fmaf_rn(weight_156, p1_4[8], acc1_4[10]);
+                                        } else {
+                                            den_4[11] = den_4[11] + weight_156;
+                                            acc0_4[11] = __fmaf_rn(weight_156, p0_4[8], acc0_4[11]);
+                                            acc1_4[11] = __fmaf_rn(weight_156, p1_4[8], acc1_4[11]);
+                                        }
+                                    }
+                                }
+                                bool live_15_4 = num_splits > 1 && lse_max_4[2] > -CUDART_INF_F;
+                                if (live_15_4) {
+                                    float weight_157 = approx_exp2(lse_4[9] - lse_max_4[2]);
+                                    if (bound_3[0] > 1) {
+                                        den_4[8] = den_4[8] + weight_157;
+                                        acc0_4[8] = __fmaf_rn(weight_157, p0_4[9], acc0_4[8]);
+                                        acc1_4[8] = __fmaf_rn(weight_157, p1_4[9], acc1_4[8]);
+                                    } else if (bound_3[1] > 1) {
+                                        den_4[9] = den_4[9] + weight_157;
+                                        acc0_4[9] = __fmaf_rn(weight_157, p0_4[9], acc0_4[9]);
+                                        acc1_4[9] = __fmaf_rn(weight_157, p1_4[9], acc1_4[9]);
+                                    } else {
+                                        if (bound_3[2] > 1) {
+                                            den_4[10] = den_4[10] + weight_157;
+                                            acc0_4[10] = __fmaf_rn(weight_157, p0_4[9], acc0_4[10]);
+                                            acc1_4[10] = __fmaf_rn(weight_157, p1_4[9], acc1_4[10]);
+                                        } else {
+                                            den_4[11] = den_4[11] + weight_157;
+                                            acc0_4[11] = __fmaf_rn(weight_157, p0_4[9], acc0_4[11]);
+                                            acc1_4[11] = __fmaf_rn(weight_157, p1_4[9], acc1_4[11]);
+                                        }
+                                    }
+                                }
+                                bool live_16_4 = num_splits > 2 && lse_max_4[2] > -CUDART_INF_F;
+                                if (live_16_4) {
+                                    float weight_158 = approx_exp2(lse_4[10] - lse_max_4[2]);
+                                    if (bound_3[0] > 2) {
+                                        den_4[8] = den_4[8] + weight_158;
+                                        acc0_4[8] = __fmaf_rn(weight_158, p0_4[10], acc0_4[8]);
+                                        acc1_4[8] = __fmaf_rn(weight_158, p1_4[10], acc1_4[8]);
+                                    } else if (bound_3[1] > 2) {
+                                        den_4[9] = den_4[9] + weight_158;
+                                        acc0_4[9] = __fmaf_rn(weight_158, p0_4[10], acc0_4[9]);
+                                        acc1_4[9] = __fmaf_rn(weight_158, p1_4[10], acc1_4[9]);
+                                    } else {
+                                        if (bound_3[2] > 2) {
+                                            den_4[10] = den_4[10] + weight_158;
+                                            acc0_4[10] = __fmaf_rn(weight_158, p0_4[10], acc0_4[10]);
+                                            acc1_4[10] = __fmaf_rn(weight_158, p1_4[10], acc1_4[10]);
+                                        } else {
+                                            den_4[11] = den_4[11] + weight_158;
+                                            acc0_4[11] = __fmaf_rn(weight_158, p0_4[10], acc0_4[11]);
+                                            acc1_4[11] = __fmaf_rn(weight_158, p1_4[10], acc1_4[11]);
+                                        }
+                                    }
+                                }
+                                bool live_17_4 = num_splits > 3 && lse_max_4[2] > -CUDART_INF_F;
+                                if (live_17_4) {
+                                    float weight_159 = approx_exp2(lse_4[11] - lse_max_4[2]);
+                                    if (bound_3[0] > 3) {
+                                        den_4[8] = den_4[8] + weight_159;
+                                        acc0_4[8] = __fmaf_rn(weight_159, p0_4[11], acc0_4[8]);
+                                        acc1_4[8] = __fmaf_rn(weight_159, p1_4[11], acc1_4[8]);
+                                    } else if (bound_3[1] > 3) {
+                                        den_4[9] = den_4[9] + weight_159;
+                                        acc0_4[9] = __fmaf_rn(weight_159, p0_4[11], acc0_4[9]);
+                                        acc1_4[9] = __fmaf_rn(weight_159, p1_4[11], acc1_4[9]);
+                                    } else {
+                                        if (bound_3[2] > 3) {
+                                            den_4[10] = den_4[10] + weight_159;
+                                            acc0_4[10] = __fmaf_rn(weight_159, p0_4[11], acc0_4[10]);
+                                            acc1_4[10] = __fmaf_rn(weight_159, p1_4[11], acc1_4[10]);
+                                        } else {
+                                            den_4[11] = den_4[11] + weight_159;
+                                            acc0_4[11] = __fmaf_rn(weight_159, p0_4[11], acc0_4[11]);
+                                            acc1_4[11] = __fmaf_rn(weight_159, p1_4[11], acc1_4[11]);
+                                        }
+                                    }
+                                }
+                                bool live_18_3 = num_splits > 0 && lse_max_4[3] > -CUDART_INF_F;
+                                if (live_18_3) {
+                                    float weight_160 = approx_exp2(lse_4[12] - lse_max_4[3]);
+                                    if (bound_3[0] > 0) {
+                                        den_4[12] = den_4[12] + weight_160;
+                                        acc0_4[12] = __fmaf_rn(weight_160, p0_4[12], acc0_4[12]);
+                                        acc1_4[12] = __fmaf_rn(weight_160, p1_4[12], acc1_4[12]);
+                                    } else if (bound_3[1] > 0) {
+                                        den_4[13] = den_4[13] + weight_160;
+                                        acc0_4[13] = __fmaf_rn(weight_160, p0_4[12], acc0_4[13]);
+                                        acc1_4[13] = __fmaf_rn(weight_160, p1_4[12], acc1_4[13]);
+                                    } else {
+                                        if (bound_3[2] > 0) {
+                                            den_4[14] = den_4[14] + weight_160;
+                                            acc0_4[14] = __fmaf_rn(weight_160, p0_4[12], acc0_4[14]);
+                                            acc1_4[14] = __fmaf_rn(weight_160, p1_4[12], acc1_4[14]);
+                                        } else {
+                                            den_4[15] = den_4[15] + weight_160;
+                                            acc0_4[15] = __fmaf_rn(weight_160, p0_4[12], acc0_4[15]);
+                                            acc1_4[15] = __fmaf_rn(weight_160, p1_4[12], acc1_4[15]);
+                                        }
+                                    }
+                                }
+                                bool live_19_2 = num_splits > 1 && lse_max_4[3] > -CUDART_INF_F;
+                                if (live_19_2) {
+                                    float weight_161 = approx_exp2(lse_4[13] - lse_max_4[3]);
+                                    if (bound_3[0] > 1) {
+                                        den_4[12] = den_4[12] + weight_161;
+                                        acc0_4[12] = __fmaf_rn(weight_161, p0_4[13], acc0_4[12]);
+                                        acc1_4[12] = __fmaf_rn(weight_161, p1_4[13], acc1_4[12]);
+                                    } else if (bound_3[1] > 1) {
+                                        den_4[13] = den_4[13] + weight_161;
+                                        acc0_4[13] = __fmaf_rn(weight_161, p0_4[13], acc0_4[13]);
+                                        acc1_4[13] = __fmaf_rn(weight_161, p1_4[13], acc1_4[13]);
+                                    } else {
+                                        if (bound_3[2] > 1) {
+                                            den_4[14] = den_4[14] + weight_161;
+                                            acc0_4[14] = __fmaf_rn(weight_161, p0_4[13], acc0_4[14]);
+                                            acc1_4[14] = __fmaf_rn(weight_161, p1_4[13], acc1_4[14]);
+                                        } else {
+                                            den_4[15] = den_4[15] + weight_161;
+                                            acc0_4[15] = __fmaf_rn(weight_161, p0_4[13], acc0_4[15]);
+                                            acc1_4[15] = __fmaf_rn(weight_161, p1_4[13], acc1_4[15]);
+                                        }
+                                    }
+                                }
+                                bool live_20_2 = num_splits > 2 && lse_max_4[3] > -CUDART_INF_F;
+                                if (live_20_2) {
+                                    float weight_162 = approx_exp2(lse_4[14] - lse_max_4[3]);
+                                    if (bound_3[0] > 2) {
+                                        den_4[12] = den_4[12] + weight_162;
+                                        acc0_4[12] = __fmaf_rn(weight_162, p0_4[14], acc0_4[12]);
+                                        acc1_4[12] = __fmaf_rn(weight_162, p1_4[14], acc1_4[12]);
+                                    } else if (bound_3[1] > 2) {
+                                        den_4[13] = den_4[13] + weight_162;
+                                        acc0_4[13] = __fmaf_rn(weight_162, p0_4[14], acc0_4[13]);
+                                        acc1_4[13] = __fmaf_rn(weight_162, p1_4[14], acc1_4[13]);
+                                    } else {
+                                        if (bound_3[2] > 2) {
+                                            den_4[14] = den_4[14] + weight_162;
+                                            acc0_4[14] = __fmaf_rn(weight_162, p0_4[14], acc0_4[14]);
+                                            acc1_4[14] = __fmaf_rn(weight_162, p1_4[14], acc1_4[14]);
+                                        } else {
+                                            den_4[15] = den_4[15] + weight_162;
+                                            acc0_4[15] = __fmaf_rn(weight_162, p0_4[14], acc0_4[15]);
+                                            acc1_4[15] = __fmaf_rn(weight_162, p1_4[14], acc1_4[15]);
+                                        }
+                                    }
+                                }
+                                bool live_21_2 = num_splits > 3 && lse_max_4[3] > -CUDART_INF_F;
+                                if (live_21_2) {
+                                    float weight_163 = approx_exp2(lse_4[15] - lse_max_4[3]);
+                                    if (bound_3[0] > 3) {
+                                        den_4[12] = den_4[12] + weight_163;
+                                        acc0_4[12] = __fmaf_rn(weight_163, p0_4[15], acc0_4[12]);
+                                        acc1_4[12] = __fmaf_rn(weight_163, p1_4[15], acc1_4[12]);
+                                    } else if (bound_3[1] > 3) {
+                                        den_4[13] = den_4[13] + weight_163;
+                                        acc0_4[13] = __fmaf_rn(weight_163, p0_4[15], acc0_4[13]);
+                                        acc1_4[13] = __fmaf_rn(weight_163, p1_4[15], acc1_4[13]);
+                                    } else {
+                                        if (bound_3[2] > 3) {
+                                            den_4[14] = den_4[14] + weight_163;
+                                            acc0_4[14] = __fmaf_rn(weight_163, p0_4[15], acc0_4[14]);
+                                            acc1_4[14] = __fmaf_rn(weight_163, p1_4[15], acc1_4[14]);
+                                        } else {
+                                            den_4[15] = den_4[15] + weight_163;
+                                            acc0_4[15] = __fmaf_rn(weight_163, p0_4[15], acc0_4[15]);
+                                            acc1_4[15] = __fmaf_rn(weight_163, p1_4[15], acc1_4[15]);
+                                        }
+                                    }
+                                }
+                                if (valid_4[0] != 0) {
+                                    float den_k_6 = den_4[0];
+                                    float acc0_k_6 = acc0_4[0];
+                                    float acc1_k_6 = acc1_4[0];
+                                    den_k_6 = den_k_6 + den_4[1];
+                                    acc0_k_6 = acc0_k_6 + acc0_4[1];
+                                    acc1_k_6 = acc1_k_6 + acc1_4[1];
+                                    den_k_6 = den_k_6 + den_4[2];
+                                    acc0_k_6 = acc0_k_6 + acc0_4[2];
+                                    acc1_k_6 = acc1_k_6 + acc1_4[2];
+                                    den_k_6 = den_k_6 + den_4[3];
+                                    acc0_k_6 = acc0_k_6 + acc0_4[3];
+                                    acc1_k_6 = acc1_k_6 + acc1_4[3];
                                     float inv_8 = 0.0f;
                                     if (den_k_6 > 0.0f) {
-                                        float _rcp_268 = approx_rcp(den_k_6);
-                                        inv_8 = _rcp_268;
+                                        float _rcp_322 = approx_rcp(den_k_6);
+                                        inv_8 = _rcp_322;
                                     }
                                     float attn0_6 = (float)(__nv_bfloat16)(acc0_k_6 * inv_8);
                                     float attn1_6 = (float)(__nv_bfloat16)(acc1_k_6 * inv_8);
-                                    float _exp2_270 = approx_exp2((-gate0_3[2]) * 1.442695f);
-                                    float _rcp_269 = approx_rcp(1.0f + _exp2_270);
-                                    float result0_6 = attn0_6 * _rcp_269;
-                                    float _exp2_272 = approx_exp2((-gate1_3[2]) * 1.442695f);
-                                    float _rcp_271 = approx_rcp(1.0f + _exp2_272);
-                                    float result1_6 = attn1_6 * _rcp_271;
-                                    __nv_bfloat162 _bit_cast_src_273 = __float22bfloat162_rn(make_float2(result0_6, result1_6));
-                                    word_3[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_273)[0];
-                                    long long out_offset_6 = row_i64 * out_stride_row + qo_head_5[2] * out_stride_head + dim_3[2];
-                                    *(reinterpret_cast<unsigned int*>(out + out_offset_6) + (0)) = word_3[0];
+                                    float _exp2_324 = approx_exp2((-gate0_4[0]) * 1.442695f);
+                                    float _rcp_323 = approx_rcp(1.0f + _exp2_324);
+                                    float result0_6 = attn0_6 * _rcp_323;
+                                    float _exp2_326 = approx_exp2((-gate1_4[0]) * 1.442695f);
+                                    float _rcp_325 = approx_rcp(1.0f + _exp2_326);
+                                    float result1_6 = attn1_6 * _rcp_325;
+                                    __nv_bfloat162 _bit_cast_src_327 = __float22bfloat162_rn(make_float2(result0_6, result1_6));
+                                    word_4[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_327)[0];
+                                    long long out_offset_6 = row_i64 * out_stride_row + qo_head_6[0] * out_stride_head + dim_4[0];
+                                    *(reinterpret_cast<unsigned int*>(out + out_offset_6) + (0)) = word_4[0];
                                 }
-                                if (valid_3[3] != 0) {
-                                    float den_k_7 = den_3[12];
-                                    float acc0_k_7 = acc0_3[12];
-                                    float acc1_k_7 = acc1_3[12];
-                                    den_k_7 = den_k_7 + den_3[13];
-                                    acc0_k_7 = acc0_k_7 + acc0_3[13];
-                                    acc1_k_7 = acc1_k_7 + acc1_3[13];
-                                    den_k_7 = den_k_7 + den_3[14];
-                                    acc0_k_7 = acc0_k_7 + acc0_3[14];
-                                    acc1_k_7 = acc1_k_7 + acc1_3[14];
-                                    den_k_7 = den_k_7 + den_3[15];
-                                    acc0_k_7 = acc0_k_7 + acc0_3[15];
-                                    acc1_k_7 = acc1_k_7 + acc1_3[15];
+                                if (valid_4[1] != 0) {
+                                    float den_k_7 = den_4[4];
+                                    float acc0_k_7 = acc0_4[4];
+                                    float acc1_k_7 = acc1_4[4];
+                                    den_k_7 = den_k_7 + den_4[5];
+                                    acc0_k_7 = acc0_k_7 + acc0_4[5];
+                                    acc1_k_7 = acc1_k_7 + acc1_4[5];
+                                    den_k_7 = den_k_7 + den_4[6];
+                                    acc0_k_7 = acc0_k_7 + acc0_4[6];
+                                    acc1_k_7 = acc1_k_7 + acc1_4[6];
+                                    den_k_7 = den_k_7 + den_4[7];
+                                    acc0_k_7 = acc0_k_7 + acc0_4[7];
+                                    acc1_k_7 = acc1_k_7 + acc1_4[7];
                                     float inv_9 = 0.0f;
                                     if (den_k_7 > 0.0f) {
-                                        float _rcp_274 = approx_rcp(den_k_7);
-                                        inv_9 = _rcp_274;
+                                        float _rcp_328 = approx_rcp(den_k_7);
+                                        inv_9 = _rcp_328;
                                     }
                                     float attn0_7 = (float)(__nv_bfloat16)(acc0_k_7 * inv_9);
                                     float attn1_7 = (float)(__nv_bfloat16)(acc1_k_7 * inv_9);
-                                    float _exp2_276 = approx_exp2((-gate0_3[3]) * 1.442695f);
-                                    float _rcp_275 = approx_rcp(1.0f + _exp2_276);
-                                    float result0_7 = attn0_7 * _rcp_275;
-                                    float _exp2_278 = approx_exp2((-gate1_3[3]) * 1.442695f);
-                                    float _rcp_277 = approx_rcp(1.0f + _exp2_278);
-                                    float result1_7 = attn1_7 * _rcp_277;
-                                    __nv_bfloat162 _bit_cast_src_279 = __float22bfloat162_rn(make_float2(result0_7, result1_7));
-                                    word_3[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_279)[0];
-                                    long long out_offset_7 = row_i64 * out_stride_row + qo_head_5[3] * out_stride_head + dim_3[3];
-                                    *(reinterpret_cast<unsigned int*>(out + out_offset_7) + (0)) = word_3[0];
+                                    float _exp2_330 = approx_exp2((-gate0_4[1]) * 1.442695f);
+                                    float _rcp_329 = approx_rcp(1.0f + _exp2_330);
+                                    float result0_7 = attn0_7 * _rcp_329;
+                                    float _exp2_332 = approx_exp2((-gate1_4[1]) * 1.442695f);
+                                    float _rcp_331 = approx_rcp(1.0f + _exp2_332);
+                                    float result1_7 = attn1_7 * _rcp_331;
+                                    __nv_bfloat162 _bit_cast_src_333 = __float22bfloat162_rn(make_float2(result0_7, result1_7));
+                                    word_4[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_333)[0];
+                                    long long out_offset_7 = row_i64 * out_stride_row + qo_head_6[1] * out_stride_head + dim_4[1];
+                                    *(reinterpret_cast<unsigned int*>(out + out_offset_7) + (0)) = word_4[0];
+                                }
+                                if (valid_4[2] != 0) {
+                                    float den_k_8 = den_4[8];
+                                    float acc0_k_8 = acc0_4[8];
+                                    float acc1_k_8 = acc1_4[8];
+                                    den_k_8 = den_k_8 + den_4[9];
+                                    acc0_k_8 = acc0_k_8 + acc0_4[9];
+                                    acc1_k_8 = acc1_k_8 + acc1_4[9];
+                                    den_k_8 = den_k_8 + den_4[10];
+                                    acc0_k_8 = acc0_k_8 + acc0_4[10];
+                                    acc1_k_8 = acc1_k_8 + acc1_4[10];
+                                    den_k_8 = den_k_8 + den_4[11];
+                                    acc0_k_8 = acc0_k_8 + acc0_4[11];
+                                    acc1_k_8 = acc1_k_8 + acc1_4[11];
+                                    float inv_10 = 0.0f;
+                                    if (den_k_8 > 0.0f) {
+                                        float _rcp_334 = approx_rcp(den_k_8);
+                                        inv_10 = _rcp_334;
+                                    }
+                                    float attn0_8 = (float)(__nv_bfloat16)(acc0_k_8 * inv_10);
+                                    float attn1_8 = (float)(__nv_bfloat16)(acc1_k_8 * inv_10);
+                                    float _exp2_336 = approx_exp2((-gate0_4[2]) * 1.442695f);
+                                    float _rcp_335 = approx_rcp(1.0f + _exp2_336);
+                                    float result0_8 = attn0_8 * _rcp_335;
+                                    float _exp2_338 = approx_exp2((-gate1_4[2]) * 1.442695f);
+                                    float _rcp_337 = approx_rcp(1.0f + _exp2_338);
+                                    float result1_8 = attn1_8 * _rcp_337;
+                                    __nv_bfloat162 _bit_cast_src_339 = __float22bfloat162_rn(make_float2(result0_8, result1_8));
+                                    word_4[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_339)[0];
+                                    long long out_offset_8 = row_i64 * out_stride_row + qo_head_6[2] * out_stride_head + dim_4[2];
+                                    *(reinterpret_cast<unsigned int*>(out + out_offset_8) + (0)) = word_4[0];
+                                }
+                                if (valid_4[3] != 0) {
+                                    float den_k_9 = den_4[12];
+                                    float acc0_k_9 = acc0_4[12];
+                                    float acc1_k_9 = acc1_4[12];
+                                    den_k_9 = den_k_9 + den_4[13];
+                                    acc0_k_9 = acc0_k_9 + acc0_4[13];
+                                    acc1_k_9 = acc1_k_9 + acc1_4[13];
+                                    den_k_9 = den_k_9 + den_4[14];
+                                    acc0_k_9 = acc0_k_9 + acc0_4[14];
+                                    acc1_k_9 = acc1_k_9 + acc1_4[14];
+                                    den_k_9 = den_k_9 + den_4[15];
+                                    acc0_k_9 = acc0_k_9 + acc0_4[15];
+                                    acc1_k_9 = acc1_k_9 + acc1_4[15];
+                                    float inv_11 = 0.0f;
+                                    if (den_k_9 > 0.0f) {
+                                        float _rcp_340 = approx_rcp(den_k_9);
+                                        inv_11 = _rcp_340;
+                                    }
+                                    float attn0_9 = (float)(__nv_bfloat16)(acc0_k_9 * inv_11);
+                                    float attn1_9 = (float)(__nv_bfloat16)(acc1_k_9 * inv_11);
+                                    float _exp2_342 = approx_exp2((-gate0_4[3]) * 1.442695f);
+                                    float _rcp_341 = approx_rcp(1.0f + _exp2_342);
+                                    float result0_9 = attn0_9 * _rcp_341;
+                                    float _exp2_344 = approx_exp2((-gate1_4[3]) * 1.442695f);
+                                    float _rcp_343 = approx_rcp(1.0f + _exp2_344);
+                                    float result1_9 = attn1_9 * _rcp_343;
+                                    __nv_bfloat162 _bit_cast_src_345 = __float22bfloat162_rn(make_float2(result0_9, result1_9));
+                                    word_4[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_345)[0];
+                                    long long out_offset_9 = row_i64 * out_stride_row + qo_head_6[3] * out_stride_head + dim_4[3];
+                                    *(reinterpret_cast<unsigned int*>(out + out_offset_9) + (0)) = word_4[0];
                                 }
                             }
                         }
@@ -7627,9 +9606,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
             uint32_t _fast_div_q_0 = (page_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)safe_token), page_div.multiplier) >> page_div.shift_right) : (uint32_t)((unsigned int)safe_token);
             uint32_t _fast_div_r_0 = (uint32_t)((unsigned int)safe_token) - _fast_div_q_0 * (uint32_t)(page_div.divisor);
             int page = (int)_fast_div_q_0;
-            bool valid_4 = request_ok && idx[0] >= 0 && page < table_width;
+            bool valid_5 = request_ok && idx[0] >= 0 && page < table_width;
             int table_column = ((page) < (table_width - 1) ? (page) : (table_width - 1));
-            int entry = ((valid_4) ? block_table[safe_request_row + (long long)table_column] : -1);
+            int entry = ((valid_5) ? block_table[safe_request_row + (long long)table_column] : -1);
             phys[0] = entry;
             local[0] = (int)_fast_div_r_0;
             int safe_token_44 = ((idx[1]) > (0) ? (idx[1]) : (0));
@@ -7669,9 +9648,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                 uint32_t _fast_div_q_2 = (page_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)safe_token_3), page_div.multiplier) >> page_div.shift_right) : (uint32_t)((unsigned int)safe_token_3);
                 uint32_t _fast_div_r_2 = (uint32_t)((unsigned int)safe_token_3) - _fast_div_q_2 * (uint32_t)(page_div.divisor);
                 int page_4 = (int)_fast_div_q_2;
-                bool valid_5 = request_ok && idx[2] >= 0 && page_4 < table_width;
+                bool valid_5_1 = request_ok && idx[2] >= 0 && page_4 < table_width;
                 int table_column_6 = ((page_4) < (table_width - 1) ? (page_4) : (table_width - 1));
-                int entry_7 = ((valid_5) ? block_table[safe_request_row + (long long)table_column_6] : -1);
+                int entry_7 = ((valid_5_1) ? block_table[safe_request_row + (long long)table_column_6] : -1);
                 phys[2] = entry_7;
                 local[2] = (int)_fast_div_r_2;
                 bool valid_8 = phys[0] >= 0 && phys[0] < num_blocks;
