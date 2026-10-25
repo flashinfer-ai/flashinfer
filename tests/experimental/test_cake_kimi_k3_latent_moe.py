@@ -150,8 +150,25 @@ def test_decode_plan_rules():
     assert decode_front_plan(8, i_local_for_tp(1))["a_evict_first"]
     assert decode_tail_plan(64, i_local_for_tp(1), 1)["a_evict_first"]
     assert la_tail["a_evict_first"]
-    assert decode_kernel_key(la_tail).endswith("_f_la_ef")
+    assert decode_kernel_key(la_tail).endswith("_f_la_ef_p256b")
     assert not decode_tail_plan(64, i_local_for_tp(8), 8)["a_evict_first"]
+    # 256-byte L2 promotion of the weight maps: the TP1 tail at every N_PAD and the TP8 front up to N_PAD 64.
+    for tokens in (1, 16, 64, 128):
+        tail1 = decode_tail_plan(tokens, i_local_for_tp(1), 1)
+        assert tail1["a_l2_promotion"] == "l2_256b"
+        assert decode_kernel_key(tail1).endswith("_ef_p256b")
+        tail8 = decode_tail_plan(tokens, i_local_for_tp(8), 8)
+        assert tail8["a_l2_promotion"] == "none"
+        assert "_p256b" not in decode_kernel_key(tail8)
+        front1 = decode_front_plan(tokens, i_local_for_tp(1))
+        assert front1["a_l2_promotion"] == "none"
+        assert decode_kernel_key(front1).endswith("_ef")
+    for tokens in (1, 16, 32, 64):
+        front8 = decode_front_plan(tokens, i_local_for_tp(8))
+        assert front8["a_l2_promotion"] == "l2_256b"
+        assert decode_kernel_key(front8).endswith("_ef_p256b")
+    assert la_front["a_l2_promotion"] == "none"
+    assert decode_kernel_key(la_front).endswith("_la_ef")
     # A second routed partial disables the staged rows (P == 1 only).
     assert not decode_tail_plan(1, i_local_for_tp(8), 8, num_partials=2)["rows_smem"]
     with pytest.raises(ValueError):
@@ -286,6 +303,13 @@ def test_prefill_tail_plan_and_trigger():
         prefill_tail_plan(256, 8)["block_n"] == 256
         and prefill_tail_plan(256, 8)["n_tiles"] == 28
     )
+    # The packed norm instance: TP8, one routed partial, from 2048 tokens.
+    assert not n128["packed_norm"] and not plan["packed_norm"]
+    assert prefill_tail_plan(2048, 8)["packed_norm"]
+    assert not prefill_tail_plan(2048, 8, SM_COUNT, 2)["packed_norm"]
+    assert not prefill_tail_plan(2047, 8)["packed_norm"]
+    assert prefill_tail_plan(16384, 8)["packed_norm"]
+    assert not tp1["packed_norm"] and not prefill_tail_plan(4096, 1)["packed_norm"]
     # Round-10 rule: every 256-wide instance stages the CTA's final item through a TMA store (``final_ts``, a
     # separate kernel instance that binds the ``out`` tensor map beside the pointer); the 128-wide TP8 T=512
     # instance keeps the direct stores.
@@ -359,6 +383,14 @@ def test_route_keys_are_registered_for_every_token_count(sm_count):
                     f"tail tp{tp} T={tokens} P={num_partials} on {sm_count} SMs: {keys[0]}"
                 )
                 reached.add(KERNELS[keys[0]])
+            # The prefill tail's norm instance follows the partial count too (packed for one partial).
+            for tokens in (129, 300, 511, 512, 1024, 2047, 2048, 4096, 16384):
+                keys = route_kernel_keys("tail", tp, tokens, sm_count, num_partials)
+                for key in keys:
+                    assert key in KERNELS, (
+                        f"tail tp{tp} T={tokens} P={num_partials} on {sm_count} SMs: {key}"
+                    )
+                    reached.add(KERNELS[key])
     # Every registered program is reachable, serves every registered architecture once and carries
     # a complete launch contract.
     assert reached == set(MODULES)
@@ -464,9 +496,16 @@ def test_route_rules_select_the_expected_programs():
         assert not plan["fused_norm"] and not plan["early_trigger"]
         assert plan["weights_evict_first"]
         assert len(route_kernel_keys("tail", 8, tokens)) == 2
+        assert route_kernel_keys("tail", 8, tokens)[0] == "tail_norm:e0"
     assert cb.prefill_tail_plan(512, 8)["early_trigger"]
     assert len(route_kernel_keys("tail", 1, 16384)) == 1
     assert len(route_kernel_keys("tail", 8, 16384)) == 2
+    # TP8 prefill norm: the packed instance for one routed partial from 2048 tokens, the summing one otherwise.
+    assert route_kernel_keys("tail", 8, 256)[0] == "tail_norm:e1"
+    assert route_kernel_keys("tail", 8, 1024)[0] == "tail_norm:e1"
+    assert route_kernel_keys("tail", 8, 2048)[0] == "tail_norm:e1pk"
+    assert route_kernel_keys("tail", 8, 16384)[0] == "tail_norm:e1pk"
+    assert route_kernel_keys("tail", 8, 16384, SM_COUNT, 2)[0] == "tail_norm:e1"
     # P >= 2 routed partials leave the staged-rows / resident-B decode instances (T <= 16, TP8).
     one = decode_tail_plan(16, i_local_for_tp(8), 8, 1)
     two = decode_tail_plan(16, i_local_for_tp(8), 8, 2)
@@ -898,6 +937,51 @@ def test_tail_tp8_between_the_single_wave_rows(tokens):
     _assert_close("y", y, expected["y"], ATOL, RTOL)
     _assert_close("out", out, expected["out"], ATOL, RTOL)
     first = (y.clone(), out.clone())
+    graph = _graph_replay(runner)
+    y.fill_(float("nan"))
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(first[0], y) and torch.equal(first[1], out)
+
+
+@pytest.mark.parametrize("tokens", (1024, 2048))
+@pytest.mark.parametrize("num_partials", (1, 2))
+def test_tail_tp8_prefill_norm_follows_partials(tokens, num_partials):
+    """TP8 prefill tails of one routed partial from 2048 tokens run the packed norm instance, fewer
+    tokens or more partials the summing one; both reproduce across re-launch and CUDA-graph replay."""
+    tp, rank = 8, 0
+    device = _require_program("tail", tp, tokens, num_partials)
+    w, routed, shared_act, out, y = _tail_case(
+        device, tp, rank, tokens, num_partials, 1300 + tokens + num_partials
+    )
+    runner = prepare_kimi_k3_latent_moe_tail(
+        routed,
+        w["norm_weight"],
+        w["up_weight"],
+        shared_act,
+        w["shared_down_weight"],
+        out,
+        tp=tp,
+        rank=rank,
+        y_workspace=y,
+    )
+    assert runner.route == "prefill" and runner.launch_count == 2
+    packed = num_partials == 1 and tokens >= cb.PACKED_NORM_MIN_T
+    assert runner.plan["packed_norm"] == packed
+    assert runner.kernel_keys == route_kernel_keys(
+        "tail", tp, tokens, runner.sm_count, num_partials
+    )
+    assert runner.kernel_keys[0].endswith("pk") == packed
+    runner()
+    torch.cuda.synchronize()
+    expected = tail_reference(routed, shared_act, w, tp, rank)
+    _assert_close("y", y, expected["y"], ATOL, RTOL)
+    _assert_close("out", out, expected["out"], ATOL, RTOL)
+    first = (y.clone(), out.clone())
+    runner()
+    torch.cuda.synchronize()
+    assert torch.equal(first[0], y) and torch.equal(first[1], out)
     graph = _graph_replay(runner)
     y.fill_(float("nan"))
     out.fill_(float("nan"))

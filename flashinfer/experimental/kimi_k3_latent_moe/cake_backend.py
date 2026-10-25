@@ -297,6 +297,10 @@ def decode_front_plan(
         land_alias=land_alias,
     )
     land_alias = land_alias and cluster == 2
+    l2_promotion = (
+        i_local == i_local_for_tp(FRONT_L2_PROMOTION_TP)
+        and n_pad <= FRONT_L2_PROMOTION_MAX_N_PAD
+    )
     return dict(
         grid=grid,
         n_pad=n_pad,
@@ -328,6 +332,7 @@ def decode_front_plan(
         wait_warps=False,
         land_alias=bool(land_alias),
         a_evict_first=DECODE_A_EVICT_FIRST,
+        a_l2_promotion=DECODE_A_L2_PROMOTION if l2_promotion else "none",
         tiles=tiles,
     )
 
@@ -435,6 +440,7 @@ def decode_tail_plan(
         wait_warps=bool(use_rows and n_pad >= ROWS_NO_TMAP_PREFETCH_MIN_N_PAD),
         land_alias=bool(land_alias),
         a_evict_first=bool(DECODE_A_EVICT_FIRST and tp == 1),
+        a_l2_promotion=DECODE_A_L2_PROMOTION if tp == TAIL_L2_PROMOTION_TP else "none",
         tiles=tiles,
         k1=k1,
         k2=k2,
@@ -445,6 +451,15 @@ def decode_tail_plan(
 # stream evicts its own lines first and the activations and outputs other kernels left in L2 survive it (front TP1 / TP8
 # and tail TP1 rows 8-16 % faster under a cold, dirty L2); the TP8 tail's short stream keeps the default policy (neutral).
 DECODE_A_EVICT_FIRST = True
+# The TP1 tail and the TP8 front up to N_PAD 64 also promote the weight maps' L2 fills to 256 bytes
+# (``a_l2_promotion``, symbol suffix ``_p256b``): a weight box row's 128-byte miss brings the row's next 128 bytes (the
+# K chunk the same CTA streams next) into L2 with the same DRAM access.  Host-side tensor-map encoding only: the
+# device code and the outputs are the unpromoted instance's.  The TP1 front, the TP8 front at N_PAD 128 and the TP8
+# tail keep no promotion (slower or mixed with it).
+DECODE_A_L2_PROMOTION = "l2_256b"
+TAIL_L2_PROMOTION_TP = 1
+FRONT_L2_PROMOTION_TP = 8
+FRONT_L2_PROMOTION_MAX_N_PAD = 64
 
 
 def decode_symbol(plan: dict[str, Any]) -> str:
@@ -464,7 +479,13 @@ def decode_symbol(plan: dict[str, Any]) -> str:
         f"{stagger}"
         f"{'_ww' if plan['wait_warps'] else ''}{'_la' if plan['land_alias'] else ''}"
         f"{'_ef' if plan.get('a_evict_first') else ''}"
+        f"{_l2_promotion_suffix(plan.get('a_l2_promotion', 'none'))}"
     )
+
+
+def _l2_promotion_suffix(promotion: str) -> str:
+    """``_p256b`` for ``l2_256b`` (the kernel module's naming rule), nothing without promotion."""
+    return "" if promotion == "none" else "_" + promotion.replace("l2_", "p")
 
 
 def decode_kernel_key(plan: dict[str, Any]) -> str:
@@ -654,8 +675,9 @@ def prefill_front_plan(
     )
 
 
-def norm_kernel_key(early_trigger: bool) -> str:
-    return f"tail_norm:e{1 if early_trigger else 0}"
+def norm_kernel_key(early_trigger: bool, packed: bool = False) -> str:
+    """``tail_norm:e<0|1>[pk]``; ``pk``: the one-partial instance that keeps the row as packed bf16x2 words."""
+    return f"tail_norm:e{1 if early_trigger else 0}{'pk' if packed else ''}"
 
 
 # Ring depth of the prefill tail GEMM per row (Cake round-6 lever ledger, mirrored from
@@ -851,9 +873,28 @@ def use_fused_norm(M: int, gemm_ctas: int, sm_count: int, k2_iters: int) -> bool
     return fused_norm_fits(M, gemm_ctas, sm_count) and k2_iters >= FUSED_MIN_K2_ITERS
 
 
+# The TP8 prefill tails of one routed partial from 2048 tokens run the packed norm instance (``tail_norm:e<0|1>pk``):
+# the row stays in registers as packed bf16x2 words (half the registers per thread, twice the rows in flight per SM),
+# and the statistics and output repeat the summing instance's FP32 arithmetic, flushes and round points in the same
+# element order (``y`` is byte-identical for every input).
+PACKED_NORM_TP = 8
+PACKED_NORM_MIN_T = 2048
+
+
+def use_packed_norm(M: int, tp: int, num_partials: int) -> bool:
+    return (
+        int(tp) == PACKED_NORM_TP
+        and int(num_partials) == 1
+        and int(M) >= PACKED_NORM_MIN_T
+    )
+
+
 @_cached_plan
-def prefill_tail_plan(M: int, tp: int, sm_count: int = SM_COUNT) -> dict[str, Any]:
-    """Host plan of the prefill tail chain (norm launch + persistent GEMM) for ``M`` tokens."""
+def prefill_tail_plan(
+    M: int, tp: int, sm_count: int = SM_COUNT, num_partials: int = 1
+) -> dict[str, Any]:
+    """Host plan of the prefill tail chain (norm launch + persistent GEMM) for ``M`` tokens and ``num_partials``
+    routed partials (the norm instance depends on it)."""
     k_up = k_up_for_tp(tp)
     i_local = i_local_for_tp(tp)
     norm_grid = (M + NORM_ROWS_PER_CTA - 1) // NORM_ROWS_PER_CTA
@@ -884,6 +925,9 @@ def prefill_tail_plan(M: int, tp: int, sm_count: int = SM_COUNT) -> dict[str, An
             weights_evict_first(gemm_grid, sm_count) and not claim_items
         ),
         fused_norm=bool(single_fused or claim_items),
+        packed_norm=bool(
+            not (single_fused or claim_items) and use_packed_norm(M, tp, num_partials)
+        ),
         claim_items=bool(claim_items),
         num_stages=num_stages,
         block_n=block_n,
@@ -907,7 +951,7 @@ def route_kernel_keys(
 ) -> tuple[str, ...]:
     """Logical kernel keys launched by the production route of ``(stage, tp, num_tokens)`` on a
     ``sm_count``-SM device; ``num_partials`` is the tail's routed-partial count ``P`` (the decode
-    tail instance depends on it; the front and the prefill tail do not)."""
+    tail instance and the prefill tail's norm instance depend on it; the front does not)."""
     if tp not in SUPPORTED_TP:
         raise ValueError(f"tp must be one of {SUPPORTED_TP}, got {tp}")
     if num_tokens < 1:
@@ -930,7 +974,7 @@ def route_kernel_keys(
                     )
                 ),
             )
-        plan = prefill_tail_plan(num_tokens, tp, sm_count)
+        plan = prefill_tail_plan(num_tokens, tp, sm_count, int(num_partials))
         gemm = tail_gemm_kernel_key(
             tp,
             plan["weights_evict_first"],
@@ -942,7 +986,7 @@ def route_kernel_keys(
         )
         if plan["fused_norm"]:
             return (gemm,)
-        return (norm_kernel_key(plan["early_trigger"]), gemm)
+        return (norm_kernel_key(plan["early_trigger"], plan["packed_norm"]), gemm)
     raise ValueError(f"stage must be 'front' or 'tail', got {stage!r}")
 
 
@@ -1010,8 +1054,9 @@ def generated_program_available(
     """True when this checkout registers the programs for ``device`` (optionally: one exact route).
 
     The route is resolved with the device's SM count and, for the tail, the caller's
-    routed-partial count ``num_partials`` (the decode tail instance depends on it), so the
-    answer is exactly what ``prepare_kimi_k3_latent_moe_*`` would require.
+    routed-partial count ``num_partials`` (the decode tail instance and the TP8 prefill norm
+    instance depend on it), so the answer is exactly what ``prepare_kimi_k3_latent_moe_*``
+    would require.
     """
     capability, count = _device_facts(_device_index(device))
     arch = SUPPORTED_COMPUTE_CAPABILITIES.get(capability)
@@ -1449,7 +1494,7 @@ def prepare_kimi_k3_latent_moe_tail(
             )
             route = "decode"
         else:
-            plan = prefill_tail_plan(T, tp, sm_count)
+            plan = prefill_tail_plan(T, tp, sm_count, P)
             ws, counters, norm_counter = _tail_workspace(
                 device, plan["sk_tiles"], plan["sk_max_seg"], plan["block_n"]
             )
@@ -1506,7 +1551,7 @@ def prepare_kimi_k3_latent_moe_tail(
                 # ``y_workspace`` while its load warp streams the shared-expert K blocks.
                 launches = (gemm_launch,)
             else:
-                norm_key = norm_kernel_key(plan["early_trigger"])
+                norm_key = norm_kernel_key(plan["early_trigger"], plan["packed_norm"])
                 norm_kwargs = dict(
                     routed=routed,
                     norm_weight=norm_weight,
@@ -1599,6 +1644,7 @@ __all__ = [
     "tail_gemm_kernel_key",
     "tail_wide_min_tokens",
     "use_fused_norm",
+    "use_packed_norm",
     "use_resident_fused_norm",
     "resident_grid",
     "fused_norm_fits",
