@@ -612,7 +612,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunk_partials",
         },
     },
-    "cake_rmsnorm_train_4ad7e80276ea9252e88d": {
+    "cake_rmsnorm_train_7097069b8eea6ba44d5a__4096_32768": {
         "arches": [
             "sm_100a",
         ],
@@ -630,8 +630,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "fixed",
         },
         "hidden": 512,
-        "kernel": "cake_rmsnorm_train_4ad7e80276ea9252e88d",
-        "kernel_symbol": "kernel_cake_rmsnorm_train_4ad7e80276ea9252e88d",
+        "kernel": "cake_rmsnorm_train_7097069b8eea6ba44d5a",
+        "kernel_symbol": "kernel_cake_rmsnorm_train_7097069b8eea6ba44d5a",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -640,7 +640,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": True,
         },
-        "library": "cake_rmsnorm_train_4ad7e80276ea9252e88d",
+        "library": "cake_rmsnorm_train_7097069b8eea6ba44d5a",
         "logical": {
             "dw": "dw",
             "n_chunks": "n_chunks",
@@ -7020,7 +7020,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_rmsnorm_train_8877322a3002e3a4fefd",
             "cake_rmsnorm_train_7097069b8eea6ba44d5a",
             "cake_rmsnorm_train_7097069b8eea6ba44d5a__1024_4096",
-            "cake_rmsnorm_train_4ad7e80276ea9252e88d",
+            "cake_rmsnorm_train_7097069b8eea6ba44d5a__4096_32768",
             "cake_rmsnorm_train_122721bd6b4650866553",
         ],
         "bwd_h6144": [
