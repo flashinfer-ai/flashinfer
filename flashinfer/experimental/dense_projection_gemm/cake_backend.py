@@ -1109,7 +1109,7 @@ def swap_small_m(L: int, M: int, N: int, transposed_out: bool) -> bool:
 # Per-architecture, per-row knob overrides measured in Cake round 2, keyed by the static row identity
 # (arch, A MN-major, B MN-major, fp32 output, transposed output, batched, N, K, M); the ragged token
 # count never keys a rule (M = None for forward / input gradients, K = None for weight gradients).
-# The round-2 to round-33 rules are byte-identical to Cake ``ROW_RULES``; the shapes tranche below them (sm_100a and
+# The round-2 to round-33 rules mirror the former launcher's row table; the shapes tranche below them (sm_100a and
 # sm_103a) was measured with this package's planner and extends it per architecture (three round-33 sm_100a keys were
 # re-measured and re-valued there).  An architecture-wide default (``ARCH_RULE_DEFAULTS``, round 33) sits under every rule
 # of that architecture (``row_rule`` merges it; a row rule overrides).  Three sm_103a input-gradient rows (4096 -> 512,
