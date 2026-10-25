@@ -368,10 +368,15 @@ def prepare_pipeline(inputs):
     the model's logical width (a multiple of 32): the route is the one
     generated for the next multiple of 128, and preparation pads the weights
     and scales to that physical width with exact zeros when the two differ.
-    Gate/up weights are logical halves; preparation applies the selected
-    8-way interleave and source-schedule scale permutation. No upstream
-    library is imported. The counter workspace is allocated zeroed and the
-    self-cleaning kernel never needs it zeroed again.
+    Optional ``local_expert_offset`` (default 0) and ``num_global_experts``
+    (default ``num_experts``) describe this rank's window of the global
+    expert space: ``topk_idx`` holds global ids, a slot outside the window
+    routes to no expert like a -1 slot, and the output is the rank's partial
+    sum over its local routes (zero rows for tokens without one). Gate/up
+    weights are logical halves; preparation applies the selected 8-way
+    interleave and source-schedule scale permutation. No upstream library is
+    imported. The counter workspace is allocated zeroed and the self-cleaning
+    kernel never needs it zeroed again.
     """
     arch = device_arch(inputs["x_fp8_packed"].device)
     args = pipeline_route_args(inputs)
