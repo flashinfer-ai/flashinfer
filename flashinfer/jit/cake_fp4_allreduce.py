@@ -30,9 +30,12 @@ each served instead of its call's whole program for one band of row counts --
 and ``LIMITS``: the host rules).  Every
 program is an exact-architecture source:
 it is compiled once per exact target (``sm_100a`` for B200, ``sm_103a`` for
-B300, ``sm_107a`` for SM107 devices) with that target's flag set, without fast math and with
-``--fmad=false``, into a module named after the program, the target and a
-digest of its sources.  Build targets follow ``FLASHINFER_CUDA_ARCH_LIST``
+B300, ``sm_107a`` for SM107 devices) with that target's flag set and the
+program's ``-D`` defines (:func:`program_defines`: the kernel symbol, and the
+residual prefetch of a prefetch program, which shares its base program's
+kernel source), without fast math and with ``--fmad=false``, into a module
+named after the program, the target and a digest of its sources and
+defines.  Build targets follow ``FLASHINFER_CUDA_ARCH_LIST``
 when set, else the visible devices (:class:`CompilationContext`); a device
 whose capability is not a build target is rejected by :func:`target_arch`.
 """
@@ -529,6 +532,24 @@ def program_sources(program: str) -> list[Path]:
     return [_source_path(relative) for relative in program_record(program)["sources"]]
 
 
+def program_defines(program: str) -> list[str]:
+    """The ``-D`` flags that select ``program`` in its kernel source.
+
+    A fused-norm kernel source serves its own program and that program's
+    prefetch twin: ``CAKE_FP4_ALLREDUCE_KERNEL`` names the kernel symbol (the
+    source's default is its base program's symbol) and
+    ``CAKE_FP4_ALLREDUCE_PREFETCH`` enables the residual prefetch of the twin.
+    Every record passes its kernel symbol; a source without a twin reads
+    neither macro, so the flag changes nothing there.
+    """
+
+    record = program_record(program)
+    defines = [f"-DCAKE_FP4_ALLREDUCE_KERNEL={record['kernel_symbol']}"]
+    if record["prefetch"]:
+        defines.append("-DCAKE_FP4_ALLREDUCE_PREFETCH=1")
+    return defines
+
+
 def _check_target(target: str) -> None:
     if target not in TARGET_FLAGS:
         raise ValueError(
@@ -539,12 +560,15 @@ def _check_target(target: str) -> None:
 
 @functools.cache
 def module_name(program: str, target: str) -> str:
-    """``cake_fp4_allreduce_<program>_<target>_<digest>``: the exact target and a SHA-256 over the sources (20 hex digits).
+    """``cake_fp4_allreduce_<program>_<target>_<digest>``: the exact target and a SHA-256 over the sources and the program's defines (20 hex digits).
 
     FlashInfer resolves installed AOT artifacts by module name before ninja
     sees the build inputs, so the content-derived name keeps a changed program
     from reusing a stale library, and the target keeps the exact-architecture
-    libraries of one program apart under one target set.
+    libraries of one program apart under one target set.  The digest takes
+    the bytes of every source in registry order, then every ``-D`` flag of
+    :func:`program_defines` in order as UTF-8 text, so a define-only change
+    of a record renames its modules.
     """
 
     _check_target(target)
@@ -557,18 +581,24 @@ def module_name(program: str, target: str) -> str:
     digest = hashlib.sha256()
     for source in program_sources(program):
         digest.update(source.read_bytes())
+    for define in program_defines(program):
+        digest.update(define.encode())
     return f"{MODULE_PREFIX}_{program}_{target}_{digest.hexdigest()[:20]}"
 
 
 @functools.cache
 def gen_cake_fp4_allreduce_module(program: str, target: str) -> JitSpec:
-    """JIT spec of one (program, exact target): the device and binding translation units, the target's flags, no fast math."""
+    """JIT spec of one (program, exact target): the device and binding translation units, the target's flags, the program's defines, no fast math."""
 
     source_dir = _source_dir()
     return gen_jit_spec(
         name=module_name(program, target),
         sources=program_sources(program),
-        extra_cuda_cflags=[*TARGET_FLAGS[target], *COMPILE_FLAGS],
+        extra_cuda_cflags=[
+            *TARGET_FLAGS[target],
+            *COMPILE_FLAGS,
+            *program_defines(program),
+        ],
         extra_include_paths=[source_dir, source_dir.parent, _include_dir()],
         # The source build carries ``--fmad=false``; FlashInfer's default
         # ``-use_fast_math`` would change the codec's rounding.
@@ -622,6 +652,7 @@ __all__ = [
     "grid_max",
     "module_name",
     "output_formats",
+    "program_defines",
     "program_for",
     "program_record",
     "program_sources",

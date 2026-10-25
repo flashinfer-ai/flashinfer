@@ -405,8 +405,11 @@ def test_registry_lists_every_program_with_the_contract_parameters() -> None:
         assert record["kernel_symbol"] == f"cake_fp4_allreduce_{program}"
         assert record["kernel_symbol"] not in symbols
         symbols.add(record["kernel_symbol"])
+        # A prefetch program shares its base program's kernel source; the kernel
+        # symbol and the prefetch come through the loader's -D flags.
+        stem = program[: -len("_pf")] if record["prefetch"] else program
         assert tuple(record["sources"]) == (
-            f"{SOURCE_DIR}/cake_fp4_allreduce_{program}_kernel.cu",
+            f"{SOURCE_DIR}/cake_fp4_allreduce_{stem}_kernel.cu",
             f"{SOURCE_DIR}/cake_fp4_allreduce_{program}_binding.cu",
         )
         assert record["entry"] == "run"
@@ -829,8 +832,20 @@ def test_program_sources_exist_and_declare_their_kernels() -> None:
         assert kernel.is_file(), kernel
         assert binding.is_file(), binding
         kernel_text = kernel.read_text()
-        assert f"{record['kernel_symbol']}(" in kernel_text, program
         assert "__global__" in kernel_text, program
+        # A kernel whose prefetch twin ships serves both programs through the -D
+        # macros: the symbol macro with its own symbol as the default, and the
+        # prefetch switch.  Every other kernel keeps its plain symbol.
+        stem = program[: -len("_pf")] if record["prefetch"] else program
+        shared = f"{stem}_pf" in PROGRAMS
+        if shared:
+            assert "CAKE_FP4_ALLREDUCE_KERNEL(" in kernel_text, program
+            default = f"#define CAKE_FP4_ALLREDUCE_KERNEL cake_fp4_allreduce_{stem}"
+            assert default in kernel_text, program
+            assert "#ifdef CAKE_FP4_ALLREDUCE_PREFETCH" in kernel_text, program
+        else:
+            assert f"{record['kernel_symbol']}(" in kernel_text, program
+            assert "CAKE_FP4_ALLREDUCE_" not in kernel_text, program
         binding_text = binding.read_text()
         assert f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({record['entry']}," in binding_text, (
             program

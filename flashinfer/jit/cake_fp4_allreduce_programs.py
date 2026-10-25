@@ -356,7 +356,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "targets": ("sm_100a", "sm_103a", "sm_107a"),
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_bf16_bf16_p2d_u4_csp_sop_pf",
         "sources": (
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_bf16_p2d_u4_csp_sop_pf_kernel.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_bf16_p2d_u4_csp_sop_kernel.cu",
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_bf16_p2d_u4_csp_sop_pf_binding.cu",
         ),
         "block": 352,
@@ -576,7 +576,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "targets": ("sm_100a", "sm_103a"),
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_qp_csp_sop_pf",
         "sources": (
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_qp_csp_sop_pf_kernel.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_qp_csp_sop_kernel.cu",
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_qp_csp_sop_pf_binding.cu",
         ),
         "block": 352,
@@ -688,7 +688,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "targets": ("sm_107a",),
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_sfu_csp_sop_pf",
         "sources": (
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_sfu_csp_sop_pf_kernel.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_sfu_csp_sop_kernel.cu",
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_sfu_csp_sop_pf_binding.cu",
         ),
         "block": 352,
@@ -800,7 +800,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "targets": ("sm_107a",),
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_csp_sop_pf",
         "sources": (
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_csp_sop_pf_kernel.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_csp_sop_kernel.cu",
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_csp_sop_pf_binding.cu",
         ),
         "block": 352,
@@ -1024,7 +1024,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "targets": ("sm_100a",),
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_qp_el_csp_sop_pf",
         "sources": (
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_qp_el_csp_sop_pf_kernel.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_qp_el_csp_sop_kernel.cu",
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_qp_el_csp_sop_pf_binding.cu",
         ),
         "block": 352,
@@ -1136,7 +1136,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "targets": ("sm_103a",),
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_qp_sfu_csp_sop_pf",
         "sources": (
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_qp_sfu_csp_sop_pf_kernel.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_qp_sfu_csp_sop_kernel.cu",
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_nvfp4_qp_sfu_csp_sop_pf_binding.cu",
         ),
         "block": 352,
@@ -1247,7 +1247,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "targets": ("sm_107a",),
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_p2d_u24_csp_sop_pf",
         "sources": (
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_p2d_u24_csp_sop_pf_kernel.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_p2d_u24_csp_sop_kernel.cu",
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_p2d_u24_csp_sop_pf_binding.cu",
         ),
         "block": 288,
@@ -1412,7 +1412,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "targets": ("sm_100a", "sm_103a"),
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pa_p2d_u2_csp_sop_pf",
         "sources": (
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pa_p2d_u2_csp_sop_pf_kernel.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pa_p2d_u2_csp_sop_kernel.cu",
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pa_p2d_u2_csp_sop_pf_binding.cu",
         ),
         "block": 288,
@@ -1524,7 +1524,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "targets": ("sm_107a",),
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_csp_sop_pf",
         "sources": (
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_csp_sop_pf_kernel.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_csp_sop_kernel.cu",
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_csp_sop_pf_binding.cu",
         ),
         "block": 288,
@@ -1638,7 +1638,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "targets": ("sm_100a",),
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_pa_qp_csp_sop_pf",
         "sources": (
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_pa_qp_csp_sop_pf_kernel.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_pa_qp_csp_sop_kernel.cu",
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_pa_qp_csp_sop_pf_binding.cu",
         ),
         "block": 288,
@@ -1752,7 +1752,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "targets": ("sm_103a",),
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_pa_qp_sfu_csp_sop_pf",
         "sources": (
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_pa_qp_sfu_csp_sop_pf_kernel.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_pa_qp_sfu_csp_sop_kernel.cu",
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_pa_qp_sfu_csp_sop_pf_binding.cu",
         ),
         "block": 288,
@@ -1866,7 +1866,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "targets": ("sm_103a",),
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_qp_sfu_csp_sop_pf",
         "sources": (
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_qp_sfu_csp_sop_pf_kernel.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_qp_sfu_csp_sop_kernel.cu",
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_qp_sfu_csp_sop_pf_binding.cu",
         ),
         "block": 288,
@@ -1980,7 +1980,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "targets": ("sm_100a",),
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_sfu_csp_sop_pf",
         "sources": (
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_sfu_csp_sop_pf_kernel.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_sfu_csp_sop_kernel.cu",
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_pa_sfu_csp_sop_pf_binding.cu",
         ),
         "block": 288,
@@ -2094,7 +2094,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "targets": ("sm_107a",),
         "kernel_symbol": "cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_sfu_csp_sop_pf",
         "sources": (
-            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_sfu_csp_sop_pf_kernel.cu",
+            "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_sfu_csp_sop_kernel.cu",
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_sfu_csp_sop_pf_binding.cu",
         ),
         "block": 288,
