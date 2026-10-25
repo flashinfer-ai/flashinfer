@@ -72,6 +72,16 @@ __global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c16_t8(
     float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
     int parameter_kind, float scalar_temperature);
 
+// Shared-tile row-caching cluster kernels of 8 and 16 CTAs: each CTA keeps 4
+// tiles of its chunk in registers and up to 4 more in shared memory, copied
+// in at entry by 1D bulk copies, so 8-tile chunks run four CTAs per SM.
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c8_t4_s4(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c16_t4_s4(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+
 // Persistent row-caching cluster kernels of the 8-tile variants: a grid of at
 // most one cluster per row, each cluster walking rows k, k + n, ... with the
 // next row's chunk copied into shared memory by 1D bulk copies. Dynamic shared
