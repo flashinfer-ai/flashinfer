@@ -790,6 +790,8 @@ TAIL_PIPE_MAX_SPLITS = 22  # the largest split count the tailpipe program is lau
 # when the tasks run in at least WEIGHT_SMEM_MIN_WAVES waves of the grid (mhc_infer_tail_program).
 WEIGHT_SMEM_MAX_SPLITS = 16
 WEIGHT_SMEM_MIN_WAVES = 5
+VARIANT_WSMEM_REGIME_SPLITS = 8  # the quantized variants' count in that regime
+VARIANT_PLAIN_MIN_WAVES = 7  # ... from this many task waves of the production count on
 
 
 def mhc_infer_num_splits(
@@ -861,6 +863,39 @@ def mhc_infer_tail_program(
         if (m_blocks * splits + grid - 1) // grid >= WEIGHT_SMEM_MIN_WAVES:
             return "tailpipe_wsmem"
     return "tailpipe" if splits <= TAIL_PIPE_MAX_SPLITS else "bf16"
+
+
+def mhc_infer_variant_num_splits(
+    num_tokens: int, num_sms: int, deterministic: bool = False
+) -> int:
+    """Splits of the quantized-output variants (``sf_layout`` ``"fp8_group128"`` / ``"nvfp4"``): the production rule's
+    count (:func:`mhc_infer_num_splits`), except VARIANT_WSMEM_REGIME_SPLITS = 8 where that rule launches the production
+    program as ``"tailpipe_wsmem"`` (:func:`mhc_infer_tail_program`) and its tasks run in at least
+    VARIANT_PLAIN_MIN_WAVES = 7 waves of the grid (``ceil(m_blocks * splits / grid)``: T >= 3521 on 148 SMs, 3649 on
+    152, 4993 on 208). The variants are the plain program: over that many rounds the two-warp fold of every token
+    costs the helper warps their concurrent tail (what the weight_smem program avoids by keeping the one-warp fold),
+    and 8 splits halve the fold records per token and the tasks per round. Measured on three boards (16 -> 8 splits):
+    8 wins at 7 waves (T = 4096 on 148 and 152 SMs, 5-6 %: nvfp4 99.857 -> 94.241 us and 92.407 -> 86.344 us,
+    fp8_group128 98.935 -> 92.792 us), at 10 waves (T = 8192 on 208 SMs, 1-1.5 %: fp8_group128 125.032 -> 123.119 us,
+    nvfp4 115.792 -> 114.640 us) and at 14 waves (T = 8192 on 148 and 152 SMs, 4-5 %: nvfp4 195.091 -> 186.994 us
+    and 183.975 -> 174.863 us, fp8_group128 194.872 -> 186.456 us); 16 wins at 5 waves (T = 4096 on 208 SMs:
+    fp8_group128 62.168 -> 63.384 us, nvfp4 57.175 -> 57.912 us) and the two counts are mixed at 4 waves (T = 2048 on
+    152 SMs, below the regime), so a T between the tailpipe_wsmem switch and the 7-wave switch keeps the production
+    count, and below that regime (the tailpipe counts) fewer splits are neutral or slower. The outputs of the two
+    counts differ in their last bits (a split's record is the Kahan sum of its own K blocks' chunk partials, so the
+    fold's operands regroup with the count): the count is part of a launch's identity. In deterministic mode the count
+    stays the production rule's 16 unconditionally, because the wave count depends on the SM count and deterministic
+    outputs must stay host-independent: deterministic quantized launches at T >= the 7-wave switch keep 16 splits and
+    the plain program's multi-round cost."""
+    splits = mhc_infer_num_splits(num_tokens, num_sms, deterministic)
+    if deterministic:
+        return splits
+    if mhc_infer_tail_program(num_tokens, num_sms, deterministic) == "tailpipe_wsmem":
+        m_blocks = (num_tokens + 63) // 64
+        grid = mhc_infer_num_ctas(num_tokens, num_sms, splits)
+        if (m_blocks * splits + grid - 1) // grid >= VARIANT_PLAIN_MIN_WAVES:
+            return VARIANT_WSMEM_REGIME_SPLITS
+    return splits
 
 
 def split_fn(fn, out=None):
@@ -1184,9 +1219,12 @@ class MegaMHCPlan:
     [T, H // 16] in the linear layout) under the caller's ``fp4_global_scale``
     (float32 [1] on the device), as ``scaled_fp4_quant(y_bf16, fp4_global_scale,
     is_sf_swizzled_layout=False)`` does, a zero scale guarded as there. Any token
-    count in [1, 2**20] is accepted; the split count follows the token count (or
-    ``deterministic``), and the program for that split count must be exported
-    for ``hidden`` with that layout on the device's architecture. The BF16-output
+    count in [1, 2**20] is accepted; the split count follows the token count and
+    the SM count (or ``deterministic``): ``mhc_infer_num_splits`` for the BF16
+    output, ``mhc_infer_variant_num_splits`` for the quantized layouts (8 splits
+    from seven task waves of the production count on), and the program for that
+    split count must be exported for ``hidden`` with that layout on the device's
+    architecture. The BF16-output
     route runs one program per split regime, named by ``mhc_infer_tail_program``
     from the token count and the SM count (``"tailpipe_wsmem"`` up to
     ``WEIGHT_SMEM_MAX_SPLITS`` (16) splits over ``WEIGHT_SMEM_MIN_WAVES`` (5) task
@@ -1201,7 +1239,11 @@ class MegaMHCPlan:
     later change of ``fn`` reaches the kernel through ``update_fn()``, which
     re-splits into the retained buffer on the current stream.
 
-    Scratch, split_barriers, launch_epochs and fnp may be caller-owned. Fresh
+    Scratch, split_barriers, launch_epochs and fnp may be caller-owned. A
+    caller-owned ``scratch`` holds ``mhc_infer_scratch_floats(tokens, splits)``
+    floats of the plan's own split count (``plan.config["num_splits"]``): for a
+    quantized layout at the token counts where that count is 8, a buffer sized
+    from the production count is refused. Fresh
     barriers/epochs must be zeroed once before first use and retained across
     ordinary calls and CUDA Graph replay. Epoch storage always has num_sms
     entries, including CTAs omitted by a selected launch grid. One plan must
@@ -1285,7 +1327,13 @@ class MegaMHCPlan:
             splits = num_splits(tokens, hidden, sms, deterministic)
             regime = None
         else:
-            splits = mhc_infer_num_splits(tokens, sms, deterministic)
+            # The quantized variants take their own count: 8 from seven task waves of
+            # the production count on (inside the weight-staging regime), the
+            # production count elsewhere; the regime names the BF16-output program.
+            if sf_layout in QUANT_LAYOUTS:
+                splits = mhc_infer_variant_num_splits(tokens, sms, deterministic)
+            else:
+                splits = mhc_infer_num_splits(tokens, sms, deterministic)
             regime = mhc_infer_tail_program(tokens, sms, deterministic)
         program, defines = select_program(
             hidden, splits, shifted, shared_sf, sf_layout, arch, regime=regime

@@ -773,11 +773,15 @@ TAIL_PROGRAMS = {
 # the token counts of the producer's own rules test, all as that test spells them.
 H4096_PROGRAM_SWITCH = {148: 257, 152: 257, 208: 385, 212: 385, 216: 385}
 H4096_WSMEM_SWITCH = {148: 2369, 152: 2433, 208: 3329, 212: 3393, 216: 3457}
+# The first token count at which the quantized variants take 8 splits: the
+# production count's tasks in seven waves of the full grid (the first m-block
+# count with ceil(16 m / num_sms) >= 7), past the weight-staging switch.
+H4096_VARIANT_SWITCH = {148: 3521, 152: 3649, 208: 4993, 212: 5057, 216: 5185}
 H4096_RULE_TOKENS = (
     *(1, 2, 3, 4, 5, 7, 63, 64, 65, 127, 128, 129, 192, 193, 200, 255, 256, 257),
     *(320, 321, 384, 385, 448, 449, 512, 513, 576, 577, 832, 833, 1000, 1024),
-    *(1025, 1153, 1216, 1280, 1281, 1665, 2048, 2049, 2496, 2497, 4096, 16263),
-    65536,
+    *(1025, 1153, 1216, 1280, 1281, 1665, 2048, 2049, 2496, 2497, 3520, 3521),
+    *(3648, 3649, 4096, 4992, 4993, 5056, 5057, 5184, 5185, 8192, 16263, 65536),
     1 << 20,
 )
 
@@ -810,7 +814,8 @@ def test_h4096_host_rules(num_sms):
     count, one token less keeps the previous one), the count's bounds (at least
     ten, never above the deepgemm count of at least 16; a smaller count only
     where the tokens fit two tail rounds of the grid, its tasks in two waves),
-    a resident grid, the scratch size, and the deterministic mode's 16."""
+    a resident grid, the scratch size, and the deterministic mode's 16; the
+    quantized variants' count (8 from seven task waves of the production count on)."""
     points = _runtime.mhc_infer_switch_points(num_sms)
     assert points == H4096_SWITCH_POINTS[num_sms]
     assert points == _runtime.mhc_infer_switch_points(num_sms, max_tokens=1 << 14)
@@ -822,6 +827,7 @@ def test_h4096_host_rules(num_sms):
             64,
             65,
             *(p + d for p in points for d in (-1, 0)),
+            *(H4096_VARIANT_SWITCH[num_sms] + d for d in (-1, 0)),
             4096,
             8192,
             1 << 20,
@@ -852,6 +858,32 @@ def test_h4096_host_rules(num_sms):
     if num_sms == 208:
         table = {t: _runtime.mhc_infer_num_splits(t, num_sms) for t in H4096_SPLITS_208}
         assert table == H4096_SPLITS_208
+    # The quantized variants' count: the production count, except 8 where the
+    # BF16 output runs the weight-staging program and the tasks run in at least
+    # seven waves of the grid; 16 when deterministic. Its one switch of its own
+    # is that wave count's first token count (H4096_VARIANT_SWITCH).
+    for t in tokens:
+        splits = _runtime.mhc_infer_num_splits(t, num_sms)
+        variant = _runtime.mhc_infer_variant_num_splits(t, num_sms)
+        grid = _runtime.mhc_infer_num_ctas(t, num_sms, splits)
+        waves = ((t + 63) // 64 * splits + grid - 1) // grid
+        wsmem = _runtime.mhc_infer_tail_program(t, num_sms) == "tailpipe_wsmem"
+        plain = wsmem and waves >= _runtime.VARIANT_PLAIN_MIN_WAVES
+        assert variant == (_runtime.VARIANT_WSMEM_REGIME_SPLITS if plain else splits)
+        assert 8 <= variant <= splits and (variant != splits) == plain
+        assert (
+            _runtime.mhc_infer_variant_num_splits(t, num_sms, deterministic=True) == 16
+        )
+    assert _runtime.VARIANT_WSMEM_REGIME_SPLITS == 8
+    assert _runtime.VARIANT_PLAIN_MIN_WAVES == 7
+    switch = H4096_VARIANT_SWITCH[num_sms]
+    assert switch > H4096_WSMEM_SWITCH[num_sms]
+    assert _runtime.mhc_infer_variant_num_splits(switch - 1, num_sms) == 16
+    assert _runtime.mhc_infer_variant_num_splits(switch, num_sms) == 8
+    assert _runtime.mhc_infer_variant_num_splits(4096, num_sms) == (
+        8 if num_sms in (148, 152) else 16
+    )
+    assert _runtime.mhc_infer_variant_num_splits(8192, num_sms) == 8
 
 
 def _expected_h4096_program(t, num_sms, deterministic=False):
@@ -1018,7 +1050,12 @@ def test_h4096_values_and_replay(tokens, layout):
     kw = layout_kwargs(layout, values)
     plan = prepare_mega_mhc(**values, sf_layout=layout, **kw)
     _arch, sms = _runtime.device_facts(torch.cuda.current_device())
-    assert plan.config["num_splits"] == _runtime.mhc_infer_num_splits(tokens, sms)
+    rule = (
+        _runtime.mhc_infer_variant_num_splits
+        if layout in _runtime.QUANT_LAYOUTS
+        else _runtime.mhc_infer_num_splits
+    )
+    assert plan.config["num_splits"] == rule(tokens, sms)
     assert plan.config["num_launch_sms"] == _runtime.mhc_infer_num_ctas(
         tokens, sms, plan.config["num_splits"]
     )
