@@ -7,8 +7,10 @@
 on), the exact compile flags of the source build, the tvm-ffi entry, the kernel
 symbol and the id of its positional argument plan in ``ARG_PLANS``.  ``MODULES``
 names one JIT module per (program, architecture).  ``SERVING_PROGRAMS`` maps a
-packed-scale serving configuration to its program.  ``DISPATCH_TABLES`` holds, per
-architecture and SM count, the ordered first-match route chain of the Cake
+packed-scale serving configuration to its program (a key qualified by an
+architecture, ``"sm_103a:<configuration>"``, takes precedence on that
+architecture).  ``DISPATCH_TABLES`` holds, per architecture and SM count, the
+ordered first-match route chain of the Cake
 dispatcher, driven by the route table at the end of this module (``_ROUTES`` read
 by ``select``): every predicate, launch grid, argument binding and workspace shape
 is a function of the five scalars ``(B, M, N, K, expected_m)``; a string argument
@@ -892,6 +894,7 @@ SERVING_PROGRAMS: dict[str, str] = {
     "n4096_k7168_g64_s6e1_evict_normal_l1": "cake_batch_deepgemm_fp8_364ce5d12a45a1d49602",
     "n7168_k2048_g32_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_8f4bdd22c19c1467e2e6",
     "n7168_k2048_g32_s5e3_evict_normal_l8": "cake_batch_deepgemm_fp8_a7617f8e2deb15f1eb4a",
+    "sm_103a:n7168_k2048_g32_s5e3_evict_normal_l8": "cake_batch_deepgemm_fp8_646c28382e13d4a9eabe",
     "n7168_k2048_g64_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_0fbe46cd4a67fa93336b",
     "n7168_k2048_g64_s5e3_evict_normal_l8": "cake_batch_deepgemm_fp8_90284e378e31f0382475",
 }
@@ -1027,6 +1030,7 @@ def load_cake_batch_deepgemm_fp8_module(name: str):
 #   band      (N, K) == nk, (B, M) not in the family's exclusions for the
 #             architecture, B <= the family's B bound when it has one, and
 #             CTA inside one of the row's inclusive intervals (None = open)
+#   bcta      (N, K) == nk, B and CTA inside the row's inclusive intervals (None = open)
 #   nk        (N, K) == nk
 #   em_nk     expected_m in em_values and (N, K) in nk_set
 #   swap_mix  em_nk, or (B, M, N, K) in the architecture's points
@@ -1055,7 +1059,8 @@ _BAND_MAX_B: dict[tuple[int, int], int] = {(128, 512): 8}
 # Stage kinds and their launch shapes (``_stage_plan``):
 #   masked_bn  one BLOCK_N GEMM of the masked family; (program, kind, BLOCK_N,
 #              K tile of the k_tiles argument)
-#   n128_k512  / n512_k128  the whole-geometry GEMMs of the small shapes
+#   n128_k512  / n512_k128  the whole-geometry GEMMs of the small shapes; an
+#              n512_k128 stage may name its BLOCK_N (default 128)
 #   cta1       one CTA per 128-row M tile (the expected_m == 24 profile)
 #   large_nk   two CTAs per 256-row M tile (the large geometries)
 #   pack_m224 + gemm_m224   scale pack into the packed-scale workspace, then
@@ -1113,6 +1118,18 @@ def _band(
     )
 
 
+def _bcta(
+    route: str,
+    nk: tuple[int, int],
+    b: tuple[int, int],
+    cta: tuple[int | None, int | None],
+    stage: tuple[Any, ...],
+) -> _Route:
+    """(N, K) by B and by CTA = B * ceil(expected_m / 128), on both architectures."""
+    where = {"nk": nk, "b": b, "cta": cta}
+    return _Route(_BOTH, route, route.split("__")[0], "bcta", where, (stage,), None)
+
+
 def _nk(route: str, nk: tuple[int, int], stage: tuple[Any, ...]) -> _Route:
     """Every remaining shape of one (N, K) geometry, on both architectures."""
     return _Route(_BOTH, route, route, "nk", {"nk": nk}, (stage,), None)
@@ -1146,46 +1163,84 @@ def _swap_mix(
 
 # fmt: off
 _ROUTES: tuple[_Route, ...] = (
+    # Exact (B, M, N, K) shapes of the masked family at every expected_m: the
+    # scale-warp builds, and the swap-AB BLOCK_M builds (the weights on the M
+    # side of the MMA) of each architecture.
+    _point("sm_103a", "seed_masked_bn__b1_m128_n4096_k7168",
+           ((1, 128, 4096, 7168),), None,
+           (("cake_batch_deepgemm_fp8_ec99719e1e649d9ddb43", "masked_bn", 32, 256),),
+           parent="seed_masked_bn"),
+    _point(_BOTH, "seed_masked_bn__b1_m256_n4096_k7168",
+           ((1, 256, 4096, 7168),), None,
+           (("cake_batch_deepgemm_fp8_e40c2e351b7ee1f9e07a", "masked_bn", 64, 128),),
+           parent="seed_masked_bn"),
+    _point("sm_100a", "seed_swap_bm",
+           ((1, 1024, 7168, 2048), (4, 128, 7168, 2048), (4, 256, 7168, 2048),
+            (8, 128, 4096, 7168), (8, 128, 7168, 2048), (8, 256, 4096, 7168),
+            (64, 128, 4096, 7168), (64, 256, 4096, 7168), (64, 256, 7168, 2048),
+            (128, 128, 4096, 7168), (128, 128, 7168, 2048)), None,
+           (("cake_batch_deepgemm_fp8_f257a19ccc7a31cca355", "masked_bn", 128, 128),),
+           parent="seed_swap_bm"),
+    _point("sm_100a", "seed_swap_bm__bm192",
+           ((1, 8192, 4096, 7168), (4, 1024, 7168, 2048), (8, 256, 7168, 2048),
+            (8, 1024, 4096, 7168), (8, 1024, 7168, 2048)), None,
+           (("cake_batch_deepgemm_fp8_802de3de969a71fa24ba", "masked_bn", 128, 128),),
+           parent="seed_swap_bm"),
+    _point("sm_100a", "seed_swap_bm__bm224",
+           ((1, 1024, 4096, 7168), (1, 8192, 7168, 2048), (1, 16384, 4096, 7168),
+            (1, 16384, 7168, 2048), (4, 1024, 4096, 7168)), None,
+           (("cake_batch_deepgemm_fp8_6a1dec9afccecea359db", "masked_bn", 128, 128),),
+           parent="seed_swap_bm"),
+    _point("sm_100a", "seed_swap_bm__b_evict_first",
+           ((64, 128, 7168, 2048),), None,
+           (("cake_batch_deepgemm_fp8_d74da5f79ee356250373", "masked_bn", 128, 128),),
+           parent="seed_swap_bm"),
+    _point("sm_103a", "seed_swap_bm",
+           ((1, 8192, 4096, 7168), (8, 128, 4096, 7168), (8, 256, 7168, 2048),
+            (64, 256, 4096, 7168), (64, 256, 7168, 2048)), None,
+           (("cake_batch_deepgemm_fp8_f257a19ccc7a31cca355", "masked_bn", 128, 128),),
+           parent="seed_swap_bm"),
+    _point("sm_103a", "seed_swap_bm__bm160",
+           ((1, 1024, 7168, 2048), (8, 256, 4096, 7168)), None,
+           (("cake_batch_deepgemm_fp8_5ef7e95b2b466da8875d", "masked_bn", 128, 128),),
+           parent="seed_swap_bm"),
+    _point("sm_103a", "seed_swap_bm__bm192",
+           ((4, 1024, 4096, 7168), (4, 1024, 7168, 2048), (8, 1024, 4096, 7168)), None,
+           (("cake_batch_deepgemm_fp8_802de3de969a71fa24ba", "masked_bn", 128, 128),),
+           parent="seed_swap_bm"),
+    _point("sm_103a", "seed_swap_bm__bm208",
+           ((1, 16384, 4096, 7168), (1, 16384, 7168, 2048),
+            (8, 1024, 7168, 2048)), None,
+           (("cake_batch_deepgemm_fp8_39395937e1b02f1d7aa8", "masked_bn", 128, 128),),
+           parent="seed_swap_bm"),
+    _point("sm_103a", "seed_swap_bm__bm224",
+           ((1, 8192, 7168, 2048),), None,
+           (("cake_batch_deepgemm_fp8_6a1dec9afccecea359db", "masked_bn", 128, 128),),
+           parent="seed_swap_bm"),
+    _point("sm_103a", "seed_swap_bm__b_evict_first",
+           ((64, 128, 4096, 7168), (64, 128, 7168, 2048), (128, 128, 4096, 7168),
+            (128, 128, 7168, 2048)), None,
+           (("cake_batch_deepgemm_fp8_d74da5f79ee356250373", "masked_bn", 128, 128),),
+           parent="seed_swap_bm"),
+    # The N=512, K=128 geometry up to B = 8, by B and CTA = B * ceil(expected_m / 128).
+    _bcta("seed_n512_k128__b1_bn32", (512, 128), (1, 1), (None, 7),
+          ("cake_batch_deepgemm_fp8_c580972984193a63c3c2", "n512_k128", 32)),
+    _bcta("seed_n512_k128__b1_bn192", (512, 128), (1, 1), (8, None),
+          ("cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9", "masked_bn", 192, 128)),
+    _bcta("seed_n512_k128__b2_8_bn32", (512, 128), (2, 8), (None, 8),
+          ("cake_batch_deepgemm_fp8_8d6890e370790c5f11f1", "n512_k128", 32)),
+    _bcta("seed_n512_k128__b2_8_bn128", (512, 128), (2, 8), (9, 32),
+          ("cake_batch_deepgemm_fp8_c1541da977c9a379e49b", "masked_bn", 128, 128)),
+    _bcta("seed_n512_k128__b2_8_bn192", (512, 128), (2, 8), (33, None),
+          ("cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9", "masked_bn", 192, 128)),
     # Exact (B, M, N, K, expected_m) points of the masked BLOCK_N family.
     _point("sm_100a", "seed_masked_bn__b1_m128_n4096_k7168_em102",
            ((1, 128, 4096, 7168),), 102,
-           (("cake_batch_deepgemm_fp8_2ac9e23059edba242a92", "masked_bn", 32, 256),),
+           (("cake_batch_deepgemm_fp8_ec99719e1e649d9ddb43", "masked_bn", 32, 256),),
            parent="seed_masked_bn"),
     _point("sm_100a", "seed_masked_bn__b4_m256_n4096_k7168_em141",
            ((4, 256, 4096, 7168),), 141,
            (("cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9", "masked_bn", 192, 128),),
-           parent="seed_masked_bn"),
-    _point("sm_100a", "seed_masked_bn__b8_m128_n4096_k7168_em53",
-           ((8, 128, 4096, 7168),), 53,
-           (("cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6", "masked_bn", 112, 128),),
-           parent="seed_masked_bn"),
-    _point("sm_100a", "seed_masked_bn__b8_m256_n4096_k7168_em175",
-           ((8, 256, 4096, 7168),), 175,
-           (("cake_batch_deepgemm_fp8_02cd3d43724acdbda982", "masked_bn", 224, 128),),
-           parent="seed_masked_bn"),
-    _point("sm_100a", "seed_masked_bn__b4_m128_n7168_k2048_em21",
-           ((4, 128, 7168, 2048),), 21,
-           (("cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6", "masked_bn", 112, 128),),
-           parent="seed_masked_bn"),
-    _point("sm_100a", "seed_masked_bn__b4_m256_n7168_k2048_em115",
-           ((4, 256, 7168, 2048),), 115,
-           (("cake_batch_deepgemm_fp8_8c4067fce6c805ee9300", "masked_bn", 144, 128),),
-           parent="seed_masked_bn"),
-    _point("sm_100a", "seed_masked_bn__b8_m128_n7168_k2048_em44",
-           ((8, 128, 7168, 2048),), 44,
-           (("cake_batch_deepgemm_fp8_fe5a14cba1d988faaf43", "masked_bn", 96, 128),),
-           parent="seed_masked_bn"),
-    _point("sm_100a", "seed_masked_bn__b8_m256_n7168_k2048_em117",
-           ((8, 256, 7168, 2048),), 117,
-           (("cake_batch_deepgemm_fp8_02cd3d43724acdbda982", "masked_bn", 224, 128),),
-           parent="seed_masked_bn"),
-    _point("sm_100a", "seed_masked_bn__b64_m128_n7168_k2048_em68",
-           ((64, 128, 7168, 2048),), 68,
-           (("cake_batch_deepgemm_fp8_e306f272ed478b53bd16", "masked_bn", 144, 256),),
-           parent="seed_masked_bn"),
-    _point("sm_100a", "seed_masked_bn__b128_m128_n7168_k2048_em59",
-           ((128, 128, 7168, 2048),), 59,
-           (("cake_batch_deepgemm_fp8_e306f272ed478b53bd16", "masked_bn", 144, 256),),
            parent="seed_masked_bn"),
     _point("sm_100a", "seed_masked_bn__b1_m8192_n128_k512_em5116",
            ((1, 8192, 128, 512),), 5116,
@@ -1199,51 +1254,27 @@ _ROUTES: tuple[_Route, ...] = (
            ((8, 1024, 128, 512),), 380,
            (("cake_batch_deepgemm_fp8_0924c6ddd05c4e52de88", "masked_bn", 32, 256),),
            parent="seed_masked_bn"),
-    _point("sm_103a", "seed_masked_bn__b1_m128_n4096_k7168_em26",
-           ((1, 128, 4096, 7168),), 26,
-           (("cake_batch_deepgemm_fp8_2ac9e23059edba242a92", "masked_bn", 32, 256),),
-           parent="seed_masked_bn"),
-    _point("sm_103a", "seed_masked_bn__b4_m1024_n4096_k7168_em303",
-           ((4, 1024, 4096, 7168),), 303,
-           (("cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6", "masked_bn", 112, 128),),
-           parent="seed_masked_bn"),
-    _point("sm_103a", "seed_masked_bn__b8_m256_n4096_k7168_em101",
-           ((8, 256, 4096, 7168),), 101,
-           (("cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6", "masked_bn", 112, 128),),
-           parent="seed_masked_bn"),
-    _point("sm_103a", "seed_masked_bn__b8_m1024_n4096_k7168_em595",
-           ((8, 1024, 4096, 7168),), 595,
-           (("cake_batch_deepgemm_fp8_54ec41340241b946c14e", "masked_bn", 240, 128),),
-           parent="seed_masked_bn"),
-    _point("sm_103a", "seed_masked_bn__b8_m256_n7168_k2048_em44",
-           ((8, 256, 7168, 2048),), 44,
-           (("cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6", "masked_bn", 112, 128),),
-           parent="seed_masked_bn"),
-    _point("sm_103a", "seed_masked_bn__b64_m128_n7168_k2048_em68",
-           ((64, 128, 7168, 2048),), 68,
-           (("cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9", "masked_bn", 192, 128),),
-           parent="seed_masked_bn"),
-    _point("sm_103a", "seed_masked_bn__b128_m128_n7168_k2048_em60",
-           ((128, 128, 7168, 2048),), 60,
-           (("cake_batch_deepgemm_fp8_1b7b5278ee7b1be99f15", "masked_bn", 240, 256),),
-           parent="seed_masked_bn"),
     # N=4096, K=7168 bands of the masked family, by CTA = B * ceil(expected_m / 128).
     _band("seed_masked_bn__n4096_k7168_bn32", (4096, 7168),
           ("cake_batch_deepgemm_fp8_929a5561abc99caa7f4f", "masked_bn", 32, 128),
           {"sm_100a": ((None, 1),),
            "sm_103a": ((None, 1),)}),
     _band("seed_masked_bn__n4096_k7168_bn64", (4096, 7168),
+          ("cake_batch_deepgemm_fp8_e40c2e351b7ee1f9e07a", "masked_bn", 64, 128),
+          {"sm_100a": ((2, 2),)}),
+    _band("seed_masked_bn__n4096_k7168_bn64", (4096, 7168),
           ("cake_batch_deepgemm_fp8_a51ac2146dc44e7c0fd2", "masked_bn", 64, 128),
-          {"sm_100a": ((2, 2),),
-           "sm_103a": ((2, 2),)}),
+          {"sm_103a": ((2, 2),)}),
     _band("seed_masked_bn__n4096_k7168_bn96", (4096, 7168),
           ("cake_batch_deepgemm_fp8_fe5a14cba1d988faaf43", "masked_bn", 96, 128),
           {"sm_100a": ((3, 3),),
            "sm_103a": ((3, 3),)}),
     _band("seed_masked_bn__n4096_k7168_bn112", (4096, 7168),
+          ("cake_batch_deepgemm_fp8_71bde7c4a72fbaf55012", "masked_bn", 112, 128),
+          {"sm_100a": ((4, 4),)}),
+    _band("seed_masked_bn__n4096_k7168_bn112", (4096, 7168),
           ("cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6", "masked_bn", 112, 128),
-          {"sm_100a": ((4, 4),),
-           "sm_103a": ((4, 4),)}),
+          {"sm_103a": ((4, 4),)}),
     _band("seed_masked_bn__n4096_k7168_bn128", (4096, 7168),
           ("cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4", "masked_bn", 128, 128),
           {"sm_100a": ((9, 9),),
@@ -1284,16 +1315,16 @@ _ROUTES: tuple[_Route, ...] = (
                        (121, 126), (129, 135), (137, 143), (145, None))}),
     # N=7168, K=2048 bands of the masked family, by CTA = B * ceil(expected_m / 128).
     _band("seed_masked_bn__n7168_k2048_bn64", (7168, 2048),
-          ("cake_batch_deepgemm_fp8_a51ac2146dc44e7c0fd2", "masked_bn", 64, 128),
+          ("cake_batch_deepgemm_fp8_e40c2e351b7ee1f9e07a", "masked_bn", 64, 128),
           {"sm_100a": ((None, 1),)}),
     _band("seed_masked_bn__n7168_k2048_bn112", (7168, 2048),
-          ("cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6", "masked_bn", 112, 128),
+          ("cake_batch_deepgemm_fp8_71bde7c4a72fbaf55012", "masked_bn", 112, 128),
           {"sm_100a": ((2, 2),)}),
     _band("seed_masked_bn__n7168_k2048_bn128", (7168, 2048),
           ("cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4", "masked_bn", 128, 128),
           {"sm_100a": ((5, 5),)}),
     _band("seed_masked_bn__n7168_k2048_bn48", (7168, 2048),
-          ("cake_batch_deepgemm_fp8_e6e78deccdcbf45fa870", "masked_bn", 48, 128),
+          ("cake_batch_deepgemm_fp8_b6d143c6475ade2655a3", "masked_bn", 48, 128),
           {"sm_103a": ((None, 1),)}),
     _band("seed_masked_bn__n7168_k2048_bn96", (7168, 2048),
           ("cake_batch_deepgemm_fp8_fe5a14cba1d988faaf43", "masked_bn", 96, 128),
@@ -1325,13 +1356,17 @@ _ROUTES: tuple[_Route, ...] = (
                        (62, 65), (67, 70), (72, None))}),
     # N=128, K=512 bands of the masked family, by CTA = B * ceil(expected_m / 128).
     _band("seed_masked_bn__n128_k512_bn32", (128, 512),
-          ("cake_batch_deepgemm_fp8_a6a50eabd6d1caa8ec6a", "masked_bn", 32, 128),
-          {"sm_100a": ((None, 18), (19, 37)),
-           "sm_103a": ((None, 19), (20, 38))}),
+          ("cake_batch_deepgemm_fp8_b9f7146048e524aaea2a", "masked_bn", 32, 128),
+          {"sm_100a": ((None, 18), (19, 37))}),
+    _band("seed_masked_bn__n128_k512_bn32", (128, 512),
+          ("cake_batch_deepgemm_fp8_3982d376aa7b9dbf4dcb", "masked_bn", 32, 128),
+          {"sm_103a": ((None, 19), (20, 38))}),
     _band("seed_masked_bn__n128_k512_bn48", (128, 512),
           ("cake_batch_deepgemm_fp8_d22ea585c19c028e29ae", "masked_bn", 48, 128),
-          {"sm_100a": ((38, 49),),
-           "sm_103a": ((39, 50),)}),
+          {"sm_100a": ((38, 49),)}),
+    _band("seed_masked_bn__n128_k512_bn48", (128, 512),
+          ("cake_batch_deepgemm_fp8_b9135507532a235be639", "masked_bn", 48, 128),
+          {"sm_103a": ((39, 50),)}),
     _band("seed_masked_bn__n128_k512_bn64", (128, 512),
           ("cake_batch_deepgemm_fp8_2c120bce2db6a19bf130", "masked_bn", 64, 128),
           {"sm_100a": ((50, 74),),
@@ -1344,7 +1379,7 @@ _ROUTES: tuple[_Route, ...] = (
     _nk("seed_n128_k512", (128, 512),
         ("cake_batch_deepgemm_fp8_ba92e96364e30012640e", "n128_k512")),
     _nk("seed_n512_k128", (512, 128),
-        ("cake_batch_deepgemm_fp8_f2d3d7cdd838fe7ef523", "n512_k128")),
+        ("cake_batch_deepgemm_fp8_c9415f6c743e6bb72fc7", "n512_k128")),
     # Exact-shape swap-AB routes (scale-pack kernel + GEMM, packed-scale workspace).
     _point("sm_100a", "seed_swap_m32_fp32_sm100_b32",
            ((32, 4096, 6144, 7168),), 24,
@@ -1354,17 +1389,17 @@ _ROUTES: tuple[_Route, ...] = (
     _point("sm_100a", "seed_swap_m224_packed_l2_16",
            ((1, 16384, 4096, 7168), (1, 8192, 4096, 7168)), None,
            (("cake_batch_deepgemm_fp8_f376efa5168590657e71", "pack_m224"),
-            ("cake_batch_deepgemm_fp8_fffc74e89022d23621dd", "gemm_m224")),
+            ("cake_batch_deepgemm_fp8_53f48f6693638d36fbc2", "gemm_m224")),
            workspaces="m224"),
     _point("sm_100a", "seed_swap_m224_packed_sm100_b6_n4096",
            ((6, 4096, 4096, 4096),), 1228,
            (("cake_batch_deepgemm_fp8_f376efa5168590657e71", "pack_m224"),
-            ("cake_batch_deepgemm_fp8_1bb4c4c3d68e35871c2f", "gemm_m224")),
+            ("cake_batch_deepgemm_fp8_5c3089a67f23fe866223", "gemm_m224")),
            workspaces="m224"),
     _point("sm_100a", "seed_swap_m224_packed_sm100_b6_n6144",
            ((6, 4096, 6144, 7168),), 1228,
            (("cake_batch_deepgemm_fp8_f376efa5168590657e71", "pack_m224"),
-            ("cake_batch_deepgemm_fp8_b53863e736461b0c669d", "gemm_m224")),
+            ("cake_batch_deepgemm_fp8_d074b0a27a9bdf70184d", "gemm_m224")),
            workspaces="m224"),
     # The expected_m == 24 profile of the large geometries (one CTA per M tile).
     _em_nk("seed_large_nk_cta1", (24,),
@@ -1376,7 +1411,7 @@ _ROUTES: tuple[_Route, ...] = (
               {"sm_100a": ((1, 16384, 7168, 2048), (4, 1024, 4096, 7168)),
                "sm_103a": ((1, 8192, 7168, 2048), (1, 16384, 4096, 7168))},
               (("cake_batch_deepgemm_fp8_f376efa5168590657e71", "pack_m224"),
-               ("cake_batch_deepgemm_fp8_b53863e736461b0c669d", "gemm_m224")),
+               ("cake_batch_deepgemm_fp8_d074b0a27a9bdf70184d", "gemm_m224")),
               "m224"),
     # The remaining shapes of the large geometries.
     _nk("seed_large_nk_n6144_k7168", (6144, 7168),
@@ -1415,6 +1450,14 @@ def _matches(
             (lo is None or lo <= cta) and (hi is None or cta <= hi)
             for lo, hi in where["ctas"][arch]
         )
+    if row.form == "bcta":
+        if where["nk"] != (N, K):
+            return False
+        cta = B * ((expected_m + 127) // 128)
+        return all(
+            (lo is None or lo <= value) and (hi is None or value <= hi)
+            for value, (lo, hi) in ((B, where["b"]), (cta, where["cta"]))
+        )
     if row.form == "nk":
         return where["nk"] == (N, K)
     hit = expected_m in where["expected_m"] and (N, K) in where["nk_set"]
@@ -1444,8 +1487,9 @@ def _stage_plan(
         grid = (min(B * ((M + 255) // 256), sm_count // 2) * 2, 1, 1)
         args = ("a", "b", "a_scale", "b_scale", "masked_m", "out", B, M)
     elif kind == "n512_k128":
-        grid = (B * ((expected_m + 127) // 128 + 1) * (N // 128), 1, 1)
-        args = ("a", "b", "out", "a_scale", "b_scale", "masked_m", B, M, N // 128)
+        block_n = stage[2] if len(stage) > 2 else 128
+        grid = (B * ((expected_m + 127) // 128 + 1) * (N // block_n), 1, 1)
+        args = ("a", "b", "out", "a_scale", "b_scale", "masked_m", B, M, N // block_n)
     elif kind == "cta1":
         m_tiles = (expected_m + 127) // 128 + 1
         grid = (min(B * m_tiles * (N // 128), sm_count), 1, 1)
