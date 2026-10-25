@@ -602,6 +602,7 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_669e7fee056b9ea9bea1(const __gr
                             : "+f"(accum[124]), "+f"(accum[(124) + 1]), "+f"(accum[(124) + 2]), "+f"(accum[(124) + 3])
                             : "r"(a_frag[12]), "r"(a_frag[(12) + 1]), "r"(a_frag[(12) + 2]), "r"(a_frag[(12) + 3]), "r"(b_frag[14]), "r"(b_frag[(14) + 1]));
                     }
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     __syncwarp();
                     if (lane == 0) {
                         mbarrier_arrive(ab_empty_addr + (mma_stage) * 8);
@@ -6212,6 +6213,7 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_669e7fee056b9ea9bea1(const __gr
                             : "+f"(accum_1[124]), "+f"(accum_1[(124) + 1]), "+f"(accum_1[(124) + 2]), "+f"(accum_1[(124) + 3])
                             : "r"(a_frag_1[12]), "r"(a_frag_1[(12) + 1]), "r"(a_frag_1[(12) + 2]), "r"(a_frag_1[(12) + 3]), "r"(b_frag_1[14]), "r"(b_frag_1[(14) + 1]));
                     }
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     __syncwarp();
                     if (lane == 0) {
                         mbarrier_arrive(ab_empty_addr + (mma_stage_1) * 8);
