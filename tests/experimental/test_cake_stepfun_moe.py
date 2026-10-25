@@ -73,7 +73,7 @@ PRECISIONS = tuple(ref.PRECISION_FAMILY)
 PACKAGE_DIR = Path(pkg.__file__).resolve().parent
 STAGE_TABLE_SIZES = {"routing": 50, "fc1": 27, "requant": 2, "fc2": 28, "finalize": 4}
 ROUTE_COUNT = 138
-ARG_PLAN_COUNT = 27
+ARG_PLAN_COUNT = 26
 # The export's measurement catalogue (``ROUTES``), delivered with the tests.
 ROUTES_PATH = (
     Path(__file__).resolve().parents[1]
@@ -614,7 +614,7 @@ def test_package_sources_carry_no_target_minor_and_no_fast_math():
 
 def test_program_rows_expand_over_the_shared_argument_plans():
     """Every ``PROGRAMS`` record is expanded from a compact row: its argument plan is one of the
-    shared ``ARG_PLANS`` (27 distinct ``[kind, name]`` sequences, each serving at least one
+    shared ``ARG_PLANS`` (26 distinct ``[kind, name]`` sequences, each serving at least one
     program), the tensor-map operands of that plan are exactly the keys of ``unit["tma_ranks"]``,
     and the derived fields hold -- ``library`` is the program name, ``ffi_entry`` is ``run``,
     ``arches`` is ``ARCHES``, ``kernel`` is ``kernel_<program>`` unless ``_KERNEL_OVERRIDES`` names

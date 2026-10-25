@@ -828,6 +828,8 @@ kernel_cake_stepfun_moe_ae6ca81a0800a8c71538(const __grid_constant__ CUtensorMap
         { // copy_sf_main
             int tile_count_5 = num_non_exiting_ctas[0];
             unsigned int _phase_sfa_full = 0;
+            unsigned int _phase_sfb_full = 0;
+            unsigned int _phase_tmem_sf_empty = 1;
             unsigned int _phase_work_full_5 = 0;
             if (cta_rank == 0) {
                 unsigned int stage_4 = 0;
@@ -840,8 +842,8 @@ kernel_cake_stepfun_moe_ae6ca81a0800a8c71538(const __grid_constant__ CUtensorMap
                         #pragma unroll 1
                         for (int _iter_k = 0; _iter_k < K_tiles; _iter_k++) {
                             mbarrier_wait(sfa_full_addr + (stage_4) * 8, _phase_sfa_full);
-                            mbarrier_wait(sfb_full_addr + (stage_4) * 8, _phase_sfa_full);
-                            mbarrier_wait(tmem_sf_empty_addr + (stage_4) * 8, _phase_sfa_full ^ 1);
+                            mbarrier_wait(sfb_full_addr + (stage_4) * 8, _phase_sfb_full);
+                            mbarrier_wait(tmem_sf_empty_addr + (stage_4) * 8, _phase_tmem_sf_empty);
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             uint32_t _elected_0 = elect_sync();
                             #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
@@ -870,7 +872,7 @@ kernel_cake_stepfun_moe_ae6ca81a0800a8c71538(const __grid_constant__ CUtensorMap
                             elect_commit_cg2_multicast(sfa_empty_addr + (stage_4) * 8, (uint16_t)(3));
                             elect_commit_cg2_multicast(sfb_empty_addr + (stage_4) * 8, (uint16_t)(1));
                             stage_4 += 1;
-                            if (stage_4 == 7) { stage_4 = 0; _phase_sfa_full ^= 1; }
+                            if (stage_4 == 7) { stage_4 = 0; _phase_sfa_full ^= 1; _phase_sfb_full ^= 1; _phase_tmem_sf_empty ^= 1; }
                         }
                     }
                     mbarrier_wait(work_full_addr + (work_stage_5) * 8, _phase_work_full_5);
@@ -1066,6 +1068,7 @@ kernel_cake_stepfun_moe_ae6ca81a0800a8c71538(const __grid_constant__ CUtensorMap
             unsigned int _phase_throttle_full = 0;
             unsigned int _phase_fast_ready = 0;
             unsigned int _phase_work_empty = 1;
+            unsigned int _phase_work_full_7 = 0;
             if (cta_rank == 0) {
                 #pragma unroll 1
                 for (unsigned int _tile_iter_7 = 0; _tile_iter_7 < grid_m / 2 * grid_n; _tile_iter_7++) {
@@ -1189,7 +1192,7 @@ kernel_cake_stepfun_moe_ae6ca81a0800a8c71538(const __grid_constant__ CUtensorMap
                             :: "r"(work_response_addr + work_stage_7 * 16 + 0 * 16), "r"(work_full_addr + work_stage_7 * 8)
                             : "memory");
                     }
-                    mbarrier_wait(work_full_addr + (work_stage_7) * 8, _phase_work_empty ^ 1);
+                    mbarrier_wait(work_full_addr + (work_stage_7) * 8, _phase_work_full_7);
                     unsigned int valid_7 = 0;
                     unsigned int next_x_7 = 0;
                     unsigned int next_y_7 = 0;
@@ -1241,7 +1244,7 @@ kernel_cake_stepfun_moe_ae6ca81a0800a8c71538(const __grid_constant__ CUtensorMap
                         "}"
                         :: "r"(work_empty_addr + work_stage_7 * 8), "r"(0) : "memory");
                     work_stage_7 += 1;
-                    if (work_stage_7 == 3) { work_stage_7 = 0; _phase_work_empty ^= 1; }
+                    if (work_stage_7 == 3) { work_stage_7 = 0; _phase_work_empty ^= 1; _phase_work_full_7 ^= 1; }
                     unsigned int valid_0_7 = valid_7;
                     m_tile_7 = next_x_7 + (unsigned int)cta_rank;
                     n_tile_7 = next_y_7;
@@ -1253,7 +1256,7 @@ kernel_cake_stepfun_moe_ae6ca81a0800a8c71538(const __grid_constant__ CUtensorMap
                 for (unsigned int _tail_iter = 0; _tail_iter < 3; _tail_iter++) {
                     mbarrier_wait_cluster_hint(work_empty_addr + (work_stage_7) * 8, _phase_work_empty, 10000000);
                     work_stage_7 += 1;
-                    if (work_stage_7 == 3) { work_stage_7 = 0; _phase_work_empty ^= 1; }
+                    if (work_stage_7 == 3) { work_stage_7 = 0; _phase_work_empty ^= 1; _phase_work_full_7 ^= 1; }
                 }
             }
         }
@@ -1264,10 +1267,10 @@ kernel_cake_stepfun_moe_ae6ca81a0800a8c71538(const __grid_constant__ CUtensorMap
             unsigned int work_stage_8 = 0;
             unsigned int m_tile_8 = blockIdx.x;
             unsigned int n_tile_8 = blockIdx.y;
-            unsigned int _phase_work_full_7 = 0;
+            unsigned int _phase_work_full_8 = 0;
             #pragma unroll 1
             for (unsigned int _tile_iter_8 = 0; _tile_iter_8 < grid_m / 2 * grid_n; _tile_iter_8++) {
-                mbarrier_wait(work_full_addr + (work_stage_8) * 8, _phase_work_full_7);
+                mbarrier_wait(work_full_addr + (work_stage_8) * 8, _phase_work_full_8);
                 unsigned int valid_8 = 0;
                 unsigned int next_x_8 = 0;
                 unsigned int next_y_8 = 0;
@@ -1319,7 +1322,7 @@ kernel_cake_stepfun_moe_ae6ca81a0800a8c71538(const __grid_constant__ CUtensorMap
                     "}"
                     :: "r"(work_empty_addr + work_stage_8 * 8), "r"(0) : "memory");
                 work_stage_8 += 1;
-                if (work_stage_8 == 3) { work_stage_8 = 0; _phase_work_full_7 ^= 1; }
+                if (work_stage_8 == 3) { work_stage_8 = 0; _phase_work_full_8 ^= 1; }
                 unsigned int valid_0_8 = valid_8;
                 m_tile_8 = next_x_8 + (unsigned int)cta_rank;
                 n_tile_8 = next_y_8;

@@ -83,6 +83,11 @@ int64_t CDiv(int64_t a, int64_t b) {
   return a / b;
 }
 
+int64_t CMod(int64_t a, int64_t b) {
+  if (b == 0) NoInt64(a, "%", b);
+  return b == -1 ? 0 : a % b;
+}
+
 cuuint64_t Extent(int64_t value, const char* descriptor) {
   TVM_FFI_CHECK(value > 0, ValueError)
       << KERNEL_NAME << ": an extent of descriptor '" << descriptor << "' resolves to " << value;
@@ -210,6 +215,8 @@ void Run(TensorView a_A, TensorView a_B, TensorView a_C, TensorView a_tile_exper
   check_same_device(a_scale_c, a_A, "scale_c", "A");
   TVM_FFI_CHECK((a_K_tiles >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (K_tiles >= 1)";
+  TVM_FFI_CHECK((CMod(a_grid_m, 2LL) == 0LL), ValueError)
+      << KERNEL_NAME << ": requires (CMod(grid_m, 2) == 0)";
   TVM_FFI_CHECK(a_enable_pdl == 0LL || a_enable_pdl == 1LL, ValueError)
       << KERNEL_NAME << ": 'enable_pdl' = " << a_enable_pdl << " is not 0 or 1";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)

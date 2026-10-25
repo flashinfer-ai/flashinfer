@@ -77,8 +77,8 @@ union MmaSmemDesc {
 #include "cake_device_helpers/cake_tcgen05_commit_leader_e3117a6f79fc8438.cuh"
 #include "cake_device_helpers/cake_tcgen05_mma_mxf8_bs_elect_d8b2d8543ae3e577.cuh"
 #include "cake_device_helpers/cake_mma_ss_step_30cecb6a38393057.cuh"
-#include "cake_device_helpers/cake_tma_gather4_gmem2smem_mc_cta2_b39cbf08703a66bf.cuh"
 #include "cake_device_helpers/cake_tma_gather4_gmem2smem_33a27464a4fa7c33.cuh"
+#include "cake_device_helpers/cake_tma_gather4_gmem2smem_mc_cta2_b39cbf08703a66bf.cuh"
 #include "cake_device_helpers/cake_elect_commit_cg2_local_c035d647dc508c30.cuh"
 #include "cake_device_helpers/cake_tcgen05_mma_mxf8_bs_cta2_elect_58d7cf4bc245ed80.cuh"
 

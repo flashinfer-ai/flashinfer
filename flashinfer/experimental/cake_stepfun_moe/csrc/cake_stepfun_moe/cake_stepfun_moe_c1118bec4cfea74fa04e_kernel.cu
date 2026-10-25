@@ -263,6 +263,7 @@ kernel_cake_stepfun_moe_c1118bec4cfea74fa04e(const __grid_constant__ CUtensorMap
             }
             unsigned int _phase_mma_free = 1;
             unsigned int _phase_a_full = 0;
+            unsigned int _phase_b_full = 0;
             if (cta_rank == 0) {
                 unsigned int stage_2 = 0;
                 unsigned int acc_stage = 0;
@@ -272,7 +273,7 @@ kernel_cake_stepfun_moe_c1118bec4cfea74fa04e(const __grid_constant__ CUtensorMap
                     #pragma unroll 2
                     for (int iter_k_2 = 0; iter_k_2 < K_tiles; iter_k_2++) {
                         mbarrier_wait(a_full_addr + (stage_2) * 8, _phase_a_full);
-                        mbarrier_wait(b_full_addr + (stage_2) * 8, _phase_a_full);
+                        mbarrier_wait(b_full_addr + (stage_2) * 8, _phase_b_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         int _mma_a_lo_0 = (((smem_a_addr) >> 4) & 0x3FFF) + (stage_2) * 2048;
                         int _mma_b_lo_0 = (((smem_b_addr) >> 4) & 0x3FFF) + (stage_2) * 512;
@@ -335,7 +336,7 @@ kernel_cake_stepfun_moe_c1118bec4cfea74fa04e(const __grid_constant__ CUtensorMap
                             elect_commit_cg2_multicast(mma_full_addr + (acc_stage) * 8, (uint16_t)(3));
                         }
                         stage_2 += 1;
-                        if (stage_2 == 5) { stage_2 = 0; _phase_a_full ^= 1; }
+                        if (stage_2 == 5) { stage_2 = 0; _phase_a_full ^= 1; _phase_b_full ^= 1; }
                     }
                     acc_stage += 1;
                     if (acc_stage == 2) { acc_stage = 0; _phase_mma_free ^= 1; }

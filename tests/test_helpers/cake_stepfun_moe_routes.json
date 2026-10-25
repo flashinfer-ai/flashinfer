@@ -232,7 +232,7 @@
     "stages": [
       {
         "name": "fc1",
-        "program": "cake_stepfun_moe_5661b9fa756ca8f79d46"
+        "program": "cake_stepfun_moe_4120432c808d60d09d02"
       }
     ],
     "shapes": [
@@ -1582,7 +1582,7 @@
       },
       {
         "name": "fc1",
-        "program": "cake_stepfun_moe_5661b9fa756ca8f79d46"
+        "program": "cake_stepfun_moe_4120432c808d60d09d02"
       },
       {
         "name": "fc2",

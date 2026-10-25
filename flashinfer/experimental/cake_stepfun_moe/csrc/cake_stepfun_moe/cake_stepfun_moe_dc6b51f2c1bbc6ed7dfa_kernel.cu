@@ -318,6 +318,7 @@ kernel_cake_stepfun_moe_dc6b51f2c1bbc6ed7dfa(const __grid_constant__ CUtensorMap
             unsigned int n_tile_3 = 0;
             unsigned int _phase_mma_free = 1;
             unsigned int _phase_a_full = 0;
+            unsigned int _phase_b_full = 0;
             unsigned int _phase_work_full_2 = 0;
             #pragma unroll 1
             for (unsigned int _tile_2 = 0; _tile_2 < (unsigned int)grid_m * (unsigned int)max_tiles; _tile_2++) {
@@ -328,7 +329,7 @@ kernel_cake_stepfun_moe_dc6b51f2c1bbc6ed7dfa(const __grid_constant__ CUtensorMap
                 #pragma unroll 1
                 for (int iter_k_2 = 0; iter_k_2 < K_tiles; iter_k_2++) {
                     mbarrier_wait(a_full_addr + (stage_2) * 8, _phase_a_full);
-                    mbarrier_wait(b_full_addr + (stage_2) * 8, _phase_a_full);
+                    mbarrier_wait(b_full_addr + (stage_2) * 8, _phase_b_full);
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     int _mma_a_lo_0 = make_warp_uniform((((smem_a_addr) >> 4) & 0x3FFF) + (stage_2) * 2048);
@@ -381,7 +382,7 @@ kernel_cake_stepfun_moe_dc6b51f2c1bbc6ed7dfa(const __grid_constant__ CUtensorMap
                         elect_commit(k_done_addr + (stage_2) * 8);
                     }
                     stage_2 += 1;
-                    if (stage_2 == 6) { stage_2 = 0; _phase_a_full ^= 1; }
+                    if (stage_2 == 6) { stage_2 = 0; _phase_a_full ^= 1; _phase_b_full ^= 1; }
                 }
                 acc_stage += 1;
                 if (acc_stage == 2) { acc_stage = 0; _phase_mma_free ^= 1; }
@@ -522,6 +523,7 @@ kernel_cake_stepfun_moe_dc6b51f2c1bbc6ed7dfa(const __grid_constant__ CUtensorMap
             unsigned int static_next = first;
             unsigned int _phase_throttle_full = 0;
             unsigned int _phase_work_empty = 1;
+            unsigned int _phase_work_full_4 = 0;
             #pragma unroll 1
             for (unsigned int _tile_4 = 0; _tile_4 < (unsigned int)grid_m * (unsigned int)max_tiles; _tile_4++) {
                 if (valid_4 == 0) {
@@ -547,14 +549,14 @@ kernel_cake_stepfun_moe_dc6b51f2c1bbc6ed7dfa(const __grid_constant__ CUtensorMap
                     mbarrier_arrive(work_full_addr + (work_stage_4) * 8);
                 }
                 __syncwarp();
-                mbarrier_wait(work_full_addr + (work_stage_4) * 8, _phase_work_empty ^ 1);
+                mbarrier_wait(work_full_addr + (work_stage_4) * 8, _phase_work_full_4);
                 int index_5 = work_stage_4 * 4;
                 unsigned int valid_0_3 = work_response[index_5];
                 unsigned int m_tile_1_3 = work_response[index_5 + 1];
                 unsigned int n_tile_2_3 = work_response[index_5 + 2];
                 mbarrier_arrive(work_empty_addr + (work_stage_4) * 8);
                 work_stage_4 += 1;
-                if (work_stage_4 == 3) { work_stage_4 = 0; _phase_work_empty ^= 1; }
+                if (work_stage_4 == 3) { work_stage_4 = 0; _phase_work_empty ^= 1; _phase_work_full_4 ^= 1; }
                 valid_4 = valid_0_3;
                 m_tile_5 = m_tile_1_3;
                 n_tile_5 = n_tile_2_3;
