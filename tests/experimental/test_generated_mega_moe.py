@@ -33,6 +33,9 @@ TP_EP_CASES = {
 EP_CASES = [case for case, geometry in TP_EP_CASES.items() if geometry["ep"] > 1]
 TP_CASES = [case for case, geometry in TP_EP_CASES.items() if geometry["ep"] == 1]
 TP_EP_TOKENS = (1, 4, 16, 32, 128, 512, 1024, 4096)
+# The token counts the single-rank model route (384 experts, 2304 wide) shares
+# with the TP/EP routes.
+SHARED_TOKENS = (1, 16, 128, 512, 1024, 4096)
 TOP_K, HIDDEN = 6, 5120
 
 
@@ -548,23 +551,31 @@ def test_tp_logical_padding_invariance(case, num_tokens):
 @pytest.mark.parametrize("num_tokens", TP_EP_TOKENS)
 @pytest.mark.parametrize("case", EP_CASES)
 def test_ep_nonzero_rank_matches_reference_and_local_ids(case, num_tokens):
-    """The last rank of an expert-parallel case (nonzero offset) with -1 slots
-    mixed in: every fourth token is masked (all slots -1, weight 0) and another
-    quarter drop one slot whose weight stays nonzero. The output matches the
-    reference over the local routes, masked rows are zero, and it equals bit
-    for bit the output of the same call with the ids remapped on the host
-    (local ids, -1 for every remote or masked slot, offset 0): the device
-    filter and the -1 path are one path."""
-    ep = TP_EP_CASES[case]["ep"]
-    inputs, xs = case_inputs(case, num_tokens, rank=ep - 1)
-    assert inputs["local_expert_offset"] == (ep - 1) * inputs["num_experts"]
+    """Rank 1 of an expert-parallel case (nonzero offset) with -1 slots mixed
+    in: tokens 1 mod 4 are masked (all slots -1, weight 0) and tokens 2 mod 4
+    drop slot 5, whose weight stays nonzero and which rank 1 holds on those
+    tokens in both cases. Token 0 keeps every slot, so rank 1 computes a real
+    row at every token count (slot 1 of token 0 is its own). The output
+    matches the reference over the local routes, masked rows are zero, and
+    it equals bit for bit the output of the same call with the ids remapped
+    on the host (local ids, -1 for every remote or masked slot, offset 0): the
+    device filter and the -1 path are one path."""
+    inputs, xs = case_inputs(case, num_tokens, rank=1)
+    assert inputs["local_expert_offset"] == inputs["num_experts"]
     token = torch.arange(num_tokens, device="cuda")
     masked = token % 4 == 1
-    dropped = token % 4 == 0
+    dropped = token % 4 == 2
+    # Before the edits: slot 1 of token 0 and slot 5 of every dropped token
+    # are this rank's, so the dropped -1 (nonzero weight) is a local slot
+    # that must not count, and token 0 keeps a real local row.
+    before = local_slots(inputs)
+    assert before[0, 1].item() and before[dropped, 5].all().item()
     inputs["topk_idx"] = inputs["topk_idx"].clone()
     inputs["topk_idx"][masked] = -1
-    inputs["topk_idx"][dropped, 3] = -1
+    inputs["topk_idx"][dropped, 5] = -1
     inputs["topk_weights"][masked] = 0.0
+    local = local_slots(inputs)
+    assert local.any().item() and not local.all().item()
     plan = _v3_runtime.prepare_pipeline(inputs)
     assert (
         plan.stages[0].bindings["local_expert_offset"] == inputs["local_expert_offset"]
@@ -572,7 +583,6 @@ def test_ep_nonzero_rank_matches_reference_and_local_ids(case, num_tokens):
     expected = model_reference(inputs, xs)
     first = check_route_contract(plan, expected)
     assert first[masked].count_nonzero().item() == 0
-    local = local_slots(inputs)
     permuted = plan.stages[0].bindings["token_to_permuted"].reshape(local.shape)
     assert (permuted[~local] == -1).all().item()
     del plan
@@ -624,16 +634,16 @@ def test_ep_all_remote_batch_is_zero(case, num_tokens):
     assert (bindings["token_to_permuted"] == -1).all().item()
 
 
-@pytest.mark.parametrize("num_tokens", TP_EP_TOKENS)
+@pytest.mark.parametrize("num_tokens", SHARED_TOKENS)
 @pytest.mark.parametrize("case", EP_CASES)
 def test_ep_rank_matches_the_global_program(case, num_tokens):
     """Rank 1 of an expert-parallel case against the single-rank model
-    program at the same token count: the rank's program, given its slice of
-    the global weights, its offset and the global ids, writes bit for bit what
-    the 384-expert program writes for the global weight set when every slot
-    this rank does not hold is set to -1. Both compute the same per-route
-    arithmetic and combine the slots in ascending order; a mismatch is a bug,
-    not noise."""
+    program at the same token count (the six counts both routes share): the
+    rank's program, given its slice of the global weights, its offset and the
+    global ids, writes bit for bit what the 384-expert program writes for the
+    global weight set when every slot this rank does not hold is set to -1.
+    Both compute the same per-route arithmetic and combine the slots in
+    ascending order; a mismatch is a bug, not noise."""
     local_experts = TP_EP_CASES[case]["num_experts"]
     require_route(local_experts, 2304, num_tokens)
     require_route(384, 2304, num_tokens)

@@ -66,12 +66,18 @@ def test_expert_window_defaults_and_bounds():
 @pytest.mark.parametrize(
     ("metadata", "num_tokens", "expected"),
     [
-        # The generated expert-parallel / tensor-parallel rows: pinned tile
-        # height, per-block readiness at one token only, never a slot list.
+        # Forms a route names explicitly. The rendered TP/EP rows use per-block
+        # readiness with the slot list, and without it at one token; a row may
+        # also name grid readiness (no readiness words, no slot list).
         (
             {"block_m": 16, "readiness": "block", "slot_list": False},
             1,
             (16, True, False),
+        ),
+        (
+            {"block_m": 16, "readiness": "block", "slot_list": True},
+            4,
+            (16, True, True),
         ),
         (
             {"block_m": 16, "readiness": "grid", "slot_list": False},
@@ -117,6 +123,8 @@ def test_source_schedule_form_rejects_unknown_forms():
     # The local-expert heuristic would pick 192 rows at 4096 tokens for 96 experts.
     with pytest.raises(ValueError, match="tile height 192"):
         preparation.source_schedule_form({}, 4096, 96, 6, "fp4")
+    with pytest.raises(ValueError, match="tile height 64"):
+        preparation.source_schedule_form({"block_m": 64}, 512, 96, 6, "fp4")
     assert (
         preparation.source_schedule_form({"block_m": 128}, 4096, 96, 6, "fp4")[0] == 128
     )
