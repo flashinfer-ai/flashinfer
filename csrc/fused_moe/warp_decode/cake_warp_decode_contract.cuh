@@ -140,16 +140,17 @@ constexpr bool IsGeometry(const Shape& shape, int32_t hidden_size, int32_t inter
 
 // The fused route-pack K256 FC2 rows that run the linear-grid, unthrottled workfeed program:
 // one 1-D grid of min(grid_m * route tiles, workfeed CTAs) CTAs, each starting at the tile of
-// its block index, instead of the grid_m x (workfeed CTAs / grid_m) pool. The other rows of
-// that FC2 keep the pool program.
+// its block index, instead of the grid_m x (workfeed CTAs / grid_m) pool, with a five-deep work
+// ring and every route tile's metadata read once into a 512-row shared-memory table. The other
+// rows of that FC2 keep the pool program.
 constexpr bool LinearK256Fc2(Target target, const Shape& shape) {
+  (void)target;
   const int32_t t = shape.num_tokens;
-  if (target == Target::kSm100a)
-    return (IsGeometry(shape, 4096, 256, 512, 10) && t >= 9 && t <= 32) ||
-           (IsGeometry(shape, 4096, 512, 512, 10) && t >= 19 && t <= 32);
-  return (IsGeometry(shape, 4096, 256, 512, 10) && t >= 7 && t <= 32) ||
-         (IsGeometry(shape, 4096, 512, 512, 10) && t >= 12 && t <= 32);
+  return (IsGeometry(shape, 4096, 256, 512, 10) || IsGeometry(shape, 4096, 512, 512, 10)) &&
+         t >= 1 && t <= 32;
 }
+// The linear-grid program's shared-memory table holds the metadata of this many route tiles.
+inline constexpr int32_t kLinearK256Fc2MaxRouteTiles = 512;
 
 constexpr Activation ActivationForGeometry(Geometry geometry) {
   if (geometry == Geometry::kH6144I1536E192K4) return Activation::kSiLU;
@@ -703,8 +704,9 @@ constexpr Schedule SelectSchedule(const Shape& shape) {
   return kTarget == Target::kSm100a ? SelectSm100aSchedule(shape) : SelectSm103aSchedule(shape);
 }
 
-// Every linear-grid row is a supported fused route-pack K256 FC2 row of its target: the host
-// picks the FC2 program and arms its workfeed counter from that schedule and the predicate.
+// Every linear-grid row is a supported fused route-pack K256 FC2 row of its target whose route
+// tiles (the packed workspace's count) fit the program's metadata table: the host picks the FC2
+// program and arms its workfeed counter from that schedule and the predicate.
 constexpr bool LinearK256Fc2RowsAreFusedK256(Target target) {
   for (int32_t t = 0; t <= 64; ++t) {
     const Shape shapes[] = {Shape{t, 4096, 256, 512, 512, 10}, Shape{t, 4096, 512, 512, 512, 10}};
@@ -715,6 +717,9 @@ constexpr bool LinearK256Fc2RowsAreFusedK256(Target target) {
       if (!s.supported || s.route_layout != RouteLayout::kGpuPacked ||
           s.route_packer != RoutePacker::kFusedFc1 || s.fc2 != Fc2Schedule::kRouteParallelK256)
         return false;
+      const int32_t routes = shape.num_tokens * shape.top_k;
+      const int32_t nonempty = routes < shape.num_experts ? routes : shape.num_experts;
+      if (nonempty + (routes - nonempty) / 8 > kLinearK256Fc2MaxRouteTiles) return false;
     }
   }
   return true;
