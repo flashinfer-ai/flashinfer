@@ -359,7 +359,9 @@ def test_cake_keys_per_cta(topk, num_ctas, expected):
 def test_cake_split_bounds_and_cost(keys, max_keys, cost):
     # The program of a split is the smallest bound that holds its keys, the general one (0) past 256; its work
     # counts 64-key halves up to 256 keys and whole 128-key tiles beyond.
-    assert cake_backend.program_max_keys(keys) == loader.program_max_keys(keys) == max_keys
+    assert (
+        cake_backend.program_max_keys(keys) == loader.program_max_keys(keys) == max_keys
+    )
     assert cake_backend.split_cost(keys) == cost
 
 
@@ -432,11 +434,14 @@ def test_host_plan_of_the_records():
             {"grid_rule": {"kind": "linear"}, "cluster": 4}, num_tokens=1
         )
     # The argument plan: ``main_kwargs`` by logical name, then the grid axes.
-    values = {key: object() for kind, key in record["arg_plan"] if kind != "grid"}
+    logical = record["logical"]
+    values = {
+        logical[key]: object() for kind, key in record["arg_plan"] if kind != "grid"
+    }
     args = loader.launch_args(record, values, (24, 4, 1))
     assert args[-3:] == (24, 4, 1)
     assert args[:-3] == tuple(
-        values[key] for kind, key in record["arg_plan"] if kind != "grid"
+        values[logical[key]] for kind, key in record["arg_plan"] if kind != "grid"
     )
     with pytest.raises(ValueError, match="needs logical argument 'topk'"):
         loader.launch_args(
