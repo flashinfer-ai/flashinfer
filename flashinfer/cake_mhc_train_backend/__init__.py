@@ -23,6 +23,7 @@ entry points and the full user-facing documentation live in
 
 from __future__ import annotations
 
+import math
 from typing import Any, Optional
 
 import torch
@@ -51,6 +52,11 @@ from .cake_jit import (
 SUPPORTED_COMPUTE_CAPABILITIES: tuple[tuple[int, int], ...] = tuple(
     sorted(ARCH_BY_CAPABILITY)
 )
+# Sinkhorn iteration counts the export delivered programs for.  The count is a
+# compile-time constant of every delivered program (the chain is unrolled), so the
+# package keys its programs by it; the epsilons are launch arguments of the same
+# compiled programs and never key a build.
+SHIPPED_SINKHORN_ITERS: tuple[int, ...] = (SINKHORN_ITERS,)
 # Every kernel tensor is read with 256-bit vector loads or described to the
 # tensor memory accelerator: contiguous storage, 32-byte aligned base.
 TENSOR_ALIGNMENT_BYTES = 32
@@ -146,16 +152,29 @@ def _rows_of(X: Any) -> tuple[int, torch.device]:
 
 
 def _check_constants(rms_eps: float, hc_eps: float, sinkhorn_iters: int) -> None:
-    """The exported kernels are built for the model's constants; other values are not shipped."""
+    """Validate the three model constants of a call.
 
+    ``rms_eps`` and ``hc_eps`` are launch arguments of the exported kernels (every
+    mapping-pass and token-owner program takes them as kernel parameters), so any
+    finite positive value runs on the compiled programs without a rebuild; the
+    defaults are the model's ``1e-5`` / ``1e-6``.  ``sinkhorn_iters`` is a
+    compile-time constant of the exported programs: the package keys its programs
+    by that count and ships exactly :data:`SHIPPED_SINKHORN_ITERS`, so a different
+    count is not a launch argument but a program the export has not delivered
+    (``NotImplementedError``).
+    """
+
+    if not (math.isfinite(float(rms_eps)) and float(rms_eps) > 0.0):
+        raise ValueError(f"rms_eps must be a finite positive float, got {rms_eps!r}")
+    if not (math.isfinite(float(hc_eps)) and float(hc_eps) > 0.0):
+        raise ValueError(f"hc_eps must be a finite positive float, got {hc_eps!r}")
     if (
-        float(rms_eps) != RMS_EPS
-        or float(hc_eps) != HC_EPS
-        or int(sinkhorn_iters) != SINKHORN_ITERS
+        int(sinkhorn_iters) != sinkhorn_iters
+        or int(sinkhorn_iters) not in SHIPPED_SINKHORN_ITERS
     ):
         raise NotImplementedError(
-            f"the exported Cake mHC training kernels implement rms_eps={RMS_EPS}, hc_eps={HC_EPS}, "
-            f"sinkhorn_iters={SINKHORN_ITERS}; got rms_eps={rms_eps}, hc_eps={hc_eps}, sinkhorn_iters={sinkhorn_iters}"
+            f"the exported Cake mHC training programs are compiled for sinkhorn_iters in {SHIPPED_SINKHORN_ITERS} "
+            f"(a compile-time constant of the Sinkhorn chain, not a launch argument); got sinkhorn_iters={sinkhorn_iters!r}"
         )
 
 
@@ -372,6 +391,8 @@ def _forward_values(
     *,
     rows: int,
     device: torch.device,
+    rms_eps: float = RMS_EPS,
+    hc_eps: float = HC_EPS,
 ) -> dict[str, Any]:
     plan = _loader.host_plan(
         rows, _loader.sm_count(_device_index(device)), _device_arch(device)
@@ -396,8 +417,8 @@ def _forward_values(
         "log2_pk": plan["log2_pk"],
         "p_k": plan["p_k"],
         "t_pad": plan["t_pad"],
-        "rms_eps": float(RMS_EPS),
-        "hc_eps": float(HC_EPS),
+        "rms_eps": float(rms_eps),
+        "hc_eps": float(hc_eps),
     }
 
 
@@ -428,12 +449,14 @@ def cake_mhc_train_forward_prepare(
     base : torch.Tensor
         FP32 ``[24]`` logit offsets.
     rms_eps : float
-        Normalization epsilon; the exported kernels implement ``1e-5`` (any other
-        value raises ``NotImplementedError``).
+        Normalization epsilon (default ``1e-5``): a launch argument of the exported
+        kernels, so any finite positive value runs on the same compiled programs.
     hc_eps : float
-        Coefficient epsilon; the exported kernels implement ``1e-6``.
+        Coefficient epsilon (default ``1e-6``): a launch argument like ``rms_eps``.
     sinkhorn_iters : int
-        Finite Sinkhorn iteration count; the exported kernels implement ``20``.
+        Finite Sinkhorn iteration count (default ``20``): a compile-time constant of
+        the exported programs; a count the export has not delivered raises
+        ``NotImplementedError``.
     out : torch.Tensor, optional
         Preallocated BF16 ``[T, 4096]`` contiguous ``U``.
     stats_out : torch.Tensor, optional
@@ -466,7 +489,18 @@ def cake_mhc_train_forward_prepare(
     if rows == 0:
         return U, stats
     ws = _workspace_for(workspace, "fwd", rows, device)
-    values = _forward_values(X, fn, scale, base, stats, ws, rows=rows, device=device)
+    values = _forward_values(
+        X,
+        fn,
+        scale,
+        base,
+        stats,
+        ws,
+        rows=rows,
+        device=device,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+    )
     values["u"] = U
     _run_route(arch, "fwd_prepare", values, rows=rows, device=device)
     return U, stats
@@ -491,7 +525,8 @@ def cake_mhc_train_forward_stats(
     X, fn, scale, base : torch.Tensor
         As in :func:`cake_mhc_train_forward_prepare`.
     rms_eps, hc_eps, sinkhorn_iters : float, float, int
-        As in :func:`cake_mhc_train_forward_prepare` (``1e-5``, ``1e-6``, ``20``).
+        As in :func:`cake_mhc_train_forward_prepare` (the epsilons are launch
+        arguments; the iteration count must be a delivered one, default ``20``).
     stats_out : torch.Tensor, optional
         Preallocated FP32 ``[T, 64]`` contiguous statistics record.
     workspace : torch.Tensor, optional
@@ -519,7 +554,18 @@ def cake_mhc_train_forward_stats(
     if rows == 0:
         return stats
     ws = _workspace_for(workspace, "fwd", rows, device)
-    values = _forward_values(X, fn, scale, base, stats, ws, rows=rows, device=device)
+    values = _forward_values(
+        X,
+        fn,
+        scale,
+        base,
+        stats,
+        ws,
+        rows=rows,
+        device=device,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+    )
     _run_route(arch, "fwd_recompute", values, rows=rows, device=device)
     return stats
 
@@ -681,7 +727,8 @@ def cake_mhc_train_backward_finish(
     grad_stats : torch.Tensor
         FP32 ``[T, 32]`` record returned by :func:`cake_mhc_train_backward_prepare`.
     rms_eps, hc_eps, sinkhorn_iters : float, float, int
-        As in :func:`cake_mhc_train_forward_prepare` (``1e-5``, ``1e-6``, ``20``).
+        As in :func:`cake_mhc_train_forward_prepare` (the epsilons are launch
+        arguments; the iteration count must be a delivered one, default ``20``).
     accumulate : bool
         ``False`` (default): ``dfn``, ``dscale`` and ``dbase`` are written.
         ``True``: the caller passes all three and the fixed-order sums are added
@@ -766,7 +813,7 @@ def cake_mhc_train_backward_finish(
         "rows": rows,
         "t_pad": plan["t_pad"],
         "rows_per_cta": plan["rows_per_cta"],
-        "hc_eps": float(HC_EPS),
+        "hc_eps": float(hc_eps),
         "x_flat": X.view(rows, HIDDEN_TOTAL),
         "dy_flat": dY.view(rows, HIDDEN_TOTAL),
         "dzp_rows": ws["dzp"][:rows],
@@ -981,7 +1028,8 @@ def cake_mhc_train_prepare(
     X, fn, scale, base : torch.Tensor
         As in :func:`cake_mhc_train_forward_prepare` (``X`` and the parameters may require gradients).
     rms_eps, hc_eps, sinkhorn_iters : float, float, int
-        As in :func:`cake_mhc_train_forward_prepare` (``1e-5``, ``1e-6``, ``20``).
+        As in :func:`cake_mhc_train_forward_prepare` (the epsilons are launch
+        arguments; the iteration count must be a delivered one, default ``20``).
     save_stats : bool
         ``True`` (default): the per-token statistics are saved for the backward
         through the autograd saved tensors (an activation checkpoint frees and
