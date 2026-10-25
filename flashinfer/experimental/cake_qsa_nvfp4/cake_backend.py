@@ -43,7 +43,7 @@ both layouts, both L2 flushes: +15 to +39 % at rows 4 and 8, +2 to +8 % at rows
 That is the *plain* split count (:func:`plain_splits`).  Where the persistent
 walk serves the call (:func:`select_walk`, below) ``num_splits`` is instead the
 walk's partial slots per (row, KV head), :func:`cake_jit.walk_splits` -- 2 for
-rows 128 on 152 SMs -- and the merge reads that many.
+rows 128 on 152 SMs, 2 for rows 128 and 256 on 212 -- and the merge reads that many.
 
 Form rule (:func:`select_form`): with one split the plain decode writes the
 output itself.  Above one split the *fused* form -- the cooperative build of
@@ -91,19 +91,23 @@ launches the whole-tile program too (its ``sm_120a`` build carries the L2
 evict-first policy on its copies; the form rule takes the split form on a
 wide call); below that stream the K-first program.  ``sm_100a``,
 ``sm_103a`` and ``sm_107a`` launch the tcgen05 program (``decode_tcgen05``) in
-the split form whatever the grid, except that ``sm_103a`` launches the
-*persistent walk* (``decode_tcgen05_persistent``, :func:`select_walk`) on a
-split-form grid whose plain cut runs two resident waves
-(``1 < ceil(rows * num_kv_heads * plain_splits / sm_count) <=
-WALK_MAX_WAVES = 2``) and whose longest walked CTA is shorter than the plain
-program's longest (:func:`cake_jit.walk_applies`): one CTA per SM
-(:func:`cake_jit.walk_ctas` CTAs) walking a balanced, contiguous share of the
-(row, KV head) x tile slots, with :func:`cake_jit.walk_splits` partial slots
-per pair.  On a GB300 (152 SMs) at the owner's shape that is rows 128 alone
-(256 plain CTAs of 33 tiles in two waves -> 152 CTAs of 56-57 tiles, 2
-slots); rows 1-64 run one wave and rows 256 and above more than two, and
-keep the plain cut, as does every call on ``sm_100a`` / ``sm_107a`` (measured
-on a B200 the same two-wave grids tie).  On 108 SMs at the owner's 24 x 2 heads and 2051 selections (33
+the split form whatever the grid, except that ``sm_103a`` and ``sm_107a`` launch
+the *persistent walk* (``decode_tcgen05_persistent``, :func:`select_walk`) on a
+split-form grid whose plain cut runs more than one resident wave within the
+architecture's measured range (``1 < ceil(rows * num_kv_heads * plain_splits /
+sm_count) <= WALK_MAX_WAVES[arch]``: 2 on ``sm_103a``, 3 on ``sm_107a``) and whose
+longest walked CTA is shorter than the plain program's longest
+(:func:`cake_jit.walk_applies`): one CTA per SM (:func:`cake_jit.walk_ctas` CTAs)
+walking a balanced, contiguous share of the (row, KV head) x tile slots, with
+:func:`cake_jit.walk_splits` partial slots per pair.  On a GB300 (152 SMs) at
+the owner's shape that is rows 128 alone (256 plain CTAs of 33 tiles in two
+waves -> 152 CTAs of 56-57 tiles, 2 slots); rows 1-64 run one wave and rows
+256 and above more than two, and keep the plain cut.  On an R200 (212 SMs) it
+is rows 128 (256 plain CTAs in two waves, the second 44 wide -> 212 CTAs of
+39-40 tiles, 2 slots) and rows 256 (512 plain CTAs in three waves -> 212 CTAs
+of 79-80 tiles, 2 slots); rows 1-64 run one wave and rows 318 and above more
+than three, and keep the plain cut.  Every call on ``sm_100a`` keeps it too
+(measured on a B200 the same two-wave grids tie).  On 108 SMs at the owner's 24 x 2 heads and 2051 selections (33
 tiles): rows 1-32 run at most one wave -> K-first; rows 64 (4 splits, 512
 CTAs, 9 tiles per CTA) -> K-first; rows 128 (2 splits, 512 CTAs, 17 tiles per
 CTA) -> whole-tile; the 2048-row single-split call (33 tiles per CTA) ->
@@ -178,10 +182,11 @@ FUSED_HOSTS = ("aarch64",)
 FUSED_MAX_ROWS = 4
 # Architectures whose cooperative build ships but whose eager call keeps the split form on every host.
 FUSED_SPLIT_ONLY_ARCHES = ("sm_107a",)
-# Architectures the persistent walk ships for (module docstring, "Program rule"): sm_103a alone, where the two-wave grids
-# of the owner's shape gain with the walk; the same grids tie on a B200, so sm_100a keeps the plain program everywhere.
-# Its wave bound is the kernel file's, spelled by the registry.
-WALK_ARCHES = ("sm_103a",)
+# Architectures the persistent walk ships for (module docstring, "Program rule"): sm_103a, where the two-wave grids of
+# the owner's shape gain with the walk, and sm_107a, where its two- and three-wave grids do; the same two-wave grids tie
+# on a B200, so sm_100a keeps the plain program everywhere.  Its wave bound per architecture is the kernel file's table,
+# spelled by the registry.
+WALK_ARCHES = ("sm_103a", "sm_107a")
 WALK_MAX_WAVES = cake_jit.WALK_MAX_WAVES
 HOST_MACHINE = platform.machine()
 # The program rule's long-stream bound: tiles per CTA from which an sm_80 multi-wave grid runs the whole-tile program.
@@ -253,8 +258,9 @@ def select_walk(
     """The CTA count of the persistent walk when it serves a split-form call of ``num_tiles`` tiles on a device of
     ``sm_count`` SMs and architecture ``arch``, else 0 (module docstring, "Program rule"): the architecture ships the
     walk (:data:`WALK_ARCHES`) and the walk shortens the call's longest CTA at the plain split count
-    (:func:`cake_jit.walk_applies`: a two-wave plain grid).  Pure in its integers.  The fused form is never walked:
-    its grid is within one wave by the form rule, so the walk's two-wave condition excludes it."""
+    (:func:`cake_jit.walk_applies`: a multi-wave plain grid within the architecture's wave bound).  Pure in its
+    integers.  The fused form is never walked: its grid is within one wave by the form rule, so the walk's multi-wave
+    condition excludes it."""
     if (
         int(num_rows) < 1
         or int(num_kv_heads) < 1
@@ -274,7 +280,9 @@ def select_walk(
     plain = plain_splits(
         num_rows, num_kv_heads, int(num_tiles) * TILE_TOKENS, sm_count, arch
     )
-    if not cake_jit.walk_applies(num_rows, num_kv_heads, num_tiles, plain, sm_count):
+    if not cake_jit.walk_applies(
+        num_rows, num_kv_heads, num_tiles, plain, sm_count, arch
+    ):
         return 0
     return cake_jit.walk_ctas(sm_count, int(num_rows) * int(num_kv_heads), num_tiles)
 
