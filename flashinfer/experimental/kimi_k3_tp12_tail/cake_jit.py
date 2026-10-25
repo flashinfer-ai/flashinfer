@@ -60,7 +60,7 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 #   K3 pair); one CTA per eight output columns, one program per accumulator
 #   capacity (four tokens for ``M <= 4``, eight for ``5 <= M <= 8``); the
 #   rank's column width only sizes the grid;
-# * ``k3_ess:grouped``  the tail for ``4 < M <= 960`` after an ESS K1: owner
+# * ``k3_ess:grouped``  the tail for ``8 < M <= 960`` after an ESS K1: owner
 #   reduce of the scattered shared columns, fused add of this rank's cuBLAS
 #   up-projection slice, one BF16 rounding and the multicast all-gather of
 #   the output row; one CTA per token and column half, no shared operand;
