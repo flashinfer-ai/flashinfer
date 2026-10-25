@@ -411,6 +411,9 @@ def is_valid_bf16_nvfp4(knobs: Dict[str, Any]) -> bool:
     """Validate the mixed BF16/NVFP4 geometry and token-back carrier."""
     tile = tuple(knobs.get("mma_tiler_mnk", (256, 128, 256)))
     cluster = tuple(knobs.get("cluster_shape_mnk", (2, 1, 1)))
+    fallback = knobs.get("fallback_cluster_shape_mnk")
+    if fallback is not None:
+        fallback = tuple(fallback)
     token_back = knobs.get("token_back_mode", "epi_warps")
     return (
         tile
@@ -422,7 +425,12 @@ def is_valid_bf16_nvfp4(knobs: Dict[str, Any]) -> bool:
             (256, 64, 256),
             (256, 128, 256),
         )
-        and (cluster == (2, 1, 1) or (cluster == (1, 1, 1) and tile == (128, 64, 256)))
+        and (
+            cluster == (2, 1, 1)
+            or (cluster == (1, 1, 1) and tile == (128, 64, 256))
+            or (cluster == (4, 1, 1) and tile[0] == 256)
+        )
+        and (fallback is None or (cluster == (4, 1, 1) and fallback == (2, 1, 1)))
         and knobs.get("use_2cta_instrs", tile[0] == 256) == (tile[0] == 256)
         and knobs.get("load_balance_mode", "static") in ("static", "atomic_counter")
         and knobs.get("force_static_sched", True)

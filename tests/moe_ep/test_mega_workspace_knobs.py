@@ -40,6 +40,49 @@ def _mxfp8_backend(*, capacity=129, hidden=384, **kwargs):
     return backend, bootstrap, fleet
 
 
+@pytest.mark.parametrize("knobs", ["auto", None, {"group_hint": 512}])
+def test_w4a16_auto_workspace_bypasses_persistent_winner(
+    knobs, monkeypatch, dist_not_initialized
+):
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.cute_dsl.megamoe import bf16_nvfp4
+
+    backend = create_mega_kernel(
+        Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=128, top_k=2, knobs=knobs
+        )
+    )
+    backend.bind_ep_bootstrap(
+        BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False)
+    )
+    cached = dict(cluster_shape_mnk=(4, 1, 1), fallback_cluster_shape_mnk=(2, 1, 1))
+    cache = mock.Mock()
+    cache.resolve_knobs.return_value = (cached, "cache")
+    monkeypatch.setattr(backend, "_tuning_cache", lambda: cache)
+    allocator = mock.Mock(return_value=mock.sentinel.workspace)
+    monkeypatch.setattr(
+        bf16_nvfp4, "get_symm_buffer_for_bf16_nvfp4_mega_moe", allocator
+    )
+    fleet = FleetParams(num_experts=8, max_tokens_per_rank=64, token_hidden_size=128)
+    assert backend._allocate_workspace(fleet) is mock.sentinel.workspace
+    selected = allocator.call_args.kwargs["knobs"]
+    if knobs == "auto":
+        # None would trigger a second, capacity-keyed lookup inside frontend.
+        assert selected == {}
+        cache.resolve_knobs.assert_not_called()
+    elif knobs is None:
+        assert selected is cached
+        cache.resolve_knobs.assert_called_once()
+    else:
+        assert selected is knobs
+        cache.resolve_knobs.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "tile,cluster", [(None, None), ((256, 64, 128), (2, 1)), ((256, 64, 128), (4, 1))]
 )

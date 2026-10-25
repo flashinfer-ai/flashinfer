@@ -1995,9 +1995,17 @@ def _parse_megamoe_knobs(value):
         )
     # Native AUTO uses tuples; JSON arrays must recover that representation
     # before CuTe consumes shapes or uses tactics as compilation-cache keys.
-    for name in ("mma_tiler_mnk", "cluster_shape_mnk", "epi_flag_batch"):
+    for name in (
+        "mma_tiler_mnk",
+        "cluster_shape_mnk",
+        "fallback_cluster_shape_mnk",
+        "epi_flag_batch",
+    ):
         if name in knobs:
-            if name == "epi_flag_batch" and knobs[name] is None:
+            if (
+                name in ("epi_flag_batch", "fallback_cluster_shape_mnk")
+                and knobs[name] is None
+            ):
                 continue
             if not isinstance(knobs[name], list):
                 raise argparse.ArgumentTypeError(f"{name} must be a JSON array")

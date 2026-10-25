@@ -22,8 +22,21 @@ from .shim import (
     sm100_genphase_mega_launch_thunk,
     sm100_genphase_mega_moe,
 )
+from .shim import scheduler_helpers as _scheduler_helpers
+from .shim import mixed_cluster as _mixed_cluster
+
+
+def __getattr__(name):
+    if name in _mixed_cluster.__all__:
+        return getattr(_mixed_cluster, name)
+    if name in _scheduler_helpers.__all__:
+        return getattr(_scheduler_helpers, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
+    *_mixed_cluster.__all__,
+    *_scheduler_helpers.__all__,
     "concatenate_genphase_weights",
     "Sm100GenphaseMoeConfig",
     "Sm100GenphaseSymmBuffer",

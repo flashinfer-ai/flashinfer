@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import statistics
+import warnings
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import torch
@@ -22,11 +23,14 @@ def bf16_nvfp4_candidates(
     M128/M256 use one/two-CTA instructions and two dequantization warp
     groups, with flag batch 4 and scheduler depth 2. Group sizes 512/1024
     trade phase-transition overhead against earlier FC2 work and token return.
+    Preferred4/fallback2 adds M256 tactics with the same group/return choices,
+    plus group size 256 to match cluster2/group512's channel work per group.
     Opting into in-kernel reduction adds dispatch-return tactics.
     """
-    return [
+    uniform_candidates = [
         dict(
             cluster_shape_mnk=(2, 1, 1),
+            fallback_cluster_shape_mnk=None,
             group_hint=group_hint,
             epi_flag_batch=(2, 4),
             load_balance_mode="atomic_counter",
@@ -43,6 +47,84 @@ def bf16_nvfp4_candidates(
         for token_back in ("epi_warps", "reuse_dispatch_warps")
         if not in_kernel or token_back == "reuse_dispatch_warps"
     ]
+    # Preserve the existing uniform candidate order, including M128's one-CTA
+    # MMA. Mixed clusters retain M256 two-CTA MMA in both physical geometries.
+    mixed_candidates = [
+        dict(
+            candidate,
+            cluster_shape_mnk=(4, 1, 1),
+            fallback_cluster_shape_mnk=(2, 1, 1),
+        )
+        for candidate in uniform_candidates
+        if candidate["use_2cta_instrs"]
+    ]
+    # Group hints count logical cluster tiles. Doubling the channel cluster
+    # halves the hint needed for the same channel work when tiles divide evenly.
+    # Append these choices so the existing catalog keeps its order.
+    smaller_mixed_groups = [
+        dict(candidate, group_hint=256)
+        for candidate in mixed_candidates
+        if candidate["group_hint"] == 512
+    ]
+    return uniform_candidates + mixed_candidates + smaller_mixed_groups
+
+
+def _cluster_candidates(
+    candidates: List[Dict[str, Any]], config: Any, process_group: Any = None
+) -> List[Dict[str, Any]]:
+    """Keep cluster4 tactics only when every EP rank can launch them."""
+    needs_cluster4 = [
+        tuple(knobs.get("cluster_shape_mnk", config.cluster_shape_mnk)) == (4, 1, 1)
+        for knobs in candidates
+    ]
+    if not any(needs_cluster4):
+        return candidates
+
+    import torch.distributed as dist
+
+    from .frontend import _max_active_clusters
+
+    probe_error: Optional[Exception] = None
+    available = False
+    try:
+        available = _max_active_clusters(torch.cuda.current_device(), 4) > 0
+    except Exception as exc:
+        probe_error = exc
+
+    ready = probe_error is None
+    if dist.is_available() and dist.is_initialized():
+        # Match the graph-capture readiness gate: a rank-local query failure
+        # must not leave peers preparing a different candidate sequence.
+        status = torch.tensor(
+            [int(ready), int(available)], dtype=torch.int32, device="cuda"
+        )
+        dist.all_reduce(status, op=dist.ReduceOp.MIN, group=process_group)
+        ready, available = map(bool, status.tolist())
+    if not ready:
+        raise RuntimeError(
+            "W4A16 autotune cluster occupancy query failed on an EP rank."
+        ) from probe_error
+    if available:
+        return candidates
+
+    kept = [
+        knobs
+        for knobs, needs4 in zip(candidates, needs_cluster4, strict=True)
+        if not needs4
+    ]
+    if not kept:
+        raise ValueError(
+            "No W4A16 autotune candidates remain: four-CTA clusters are "
+            "unavailable on at least one EP rank's device partition."
+        )
+    warnings.warn(
+        f"[cutedsl-autotune] BF16/NVFP4 MegaMoE: dropped "
+        f"{len(candidates) - len(kept)}/{len(candidates)} candidates because "
+        "four-CTA clusters are unavailable on at least one EP rank's device partition.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    return kept
 
 
 def _sample_graph_seconds(
@@ -183,6 +265,7 @@ def autotune_bf16_nvfp4_mega_moe(
     # The sweep owns host-side compile, allocation, timing and collectives;
     # it must finish before the caller captures its serving graph.
     ensure_not_capturing("knobs='auto' collective autotune sweep")
+    candidates = _cluster_candidates(candidates, cfg, process_group)
 
     import torch.distributed as dist
 

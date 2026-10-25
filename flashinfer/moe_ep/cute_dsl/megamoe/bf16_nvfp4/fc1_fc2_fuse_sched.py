@@ -13,6 +13,7 @@ import cutlass.pipeline as pipeline
 from cutlass.cutlass_dsl import (
     Boolean,
     Int32,
+    Int64,
     Integer,
     extract_mlir_values,
     new_from_mlir_values,
@@ -35,6 +36,7 @@ from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
     mbarrier_arrive_expect_tx_on_peer,
     store_i32_to_peer_cluster_smem_async,
 )
+from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as _mixed_cga
 
 
 # =============================================================================
@@ -127,6 +129,10 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
     ``expert_shape[1]`` is ``intermediate_gateup`` (gate + up concatenated).
     Future training/non-swap MegaMoE variants should add their own params
     contract instead of overloading this one.
+
+    Mixed launches retain the preferred cluster's logical work-tile geometry.
+    ``fallback_cluster_count`` bounds registration/token storage; reserve two
+    slots per preferred grid position so it also covers an all-fallback launch.
     """
 
     def __init__(
@@ -141,6 +147,10 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         load_balance_mode: Literal["static", "atomic_counter"] = "static",
         load_balance_counter_ptr=None,
         override_num_stages: Optional[int] = None,
+        fallback_cluster_shape_mn: Optional[Tuple[int, int]] = None,
+        fallback_cluster_count: Optional[int] = None,
+        fallback_registration_counter_ptr=None,
+        fallback_group_token_ptr=None,
     ):
         """Create fused fc12 scheduler params."""
         if scenario != "2Dx3D":
@@ -161,6 +171,24 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
             raise ValueError(
                 f"token_padding_block must be positive, got {token_padding_block}"
             )
+        if fallback_cluster_shape_mn is not None:
+            if cluster_shape_mn != (4, 1) or fallback_cluster_shape_mn != (2, 1):
+                raise ValueError(
+                    "W4A16 mixed clusters require preferred (4, 1) and fallback (2, 1)."
+                )
+            if load_balance_mode == "atomic_counter":
+                if (
+                    not isinstance(fallback_cluster_count, int)
+                    or isinstance(fallback_cluster_count, bool)
+                    or fallback_cluster_count <= 0
+                    or fallback_cluster_count % 2
+                    or fallback_registration_counter_ptr is None
+                    or fallback_group_token_ptr is None
+                ):
+                    raise ValueError(
+                        "Mixed atomic scheduling requires a positive even fallback "
+                        "capacity and zero-initialized registration/token storage."
+                    )
         super().__init__(
             scenario=scenario,
             expert_shape=expert_shape,
@@ -174,6 +202,11 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         self.load_balance_mode = load_balance_mode
         self.load_balance_counter_ptr = load_balance_counter_ptr
         self.expert_token_sizes = expert_token_sizes
+        # These retain launch/GEMM axes; the base swaps cluster_shape_mn.
+        self.fallback_cluster_shape_mn = fallback_cluster_shape_mn
+        self.fallback_cluster_count = fallback_cluster_count
+        self.fallback_registration_counter_ptr = fallback_registration_counter_ptr
+        self.fallback_group_token_ptr = fallback_group_token_ptr
 
     def get_scheduler_type(self) -> type:
         return MoEFusedFc12PersistentTileScheduler
@@ -193,6 +226,10 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         ]
         if self.load_balance_mode == "atomic_counter":
             fields.append("load_balance_counter_ptr")
+            if self.fallback_cluster_shape_mn is not None:
+                fields.extend(
+                    ("fallback_registration_counter_ptr", "fallback_group_token_ptr")
+                )
         fields.append("expert_token_sizes")
         return fields
 
@@ -251,6 +288,7 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         num_sched_stages: int,
         cluster_pipeline,
         producer_state,
+        mixed_work_id_state=None,
     ):
         self.params = params
         self.num_persistent_clusters = num_persistent_clusters
@@ -266,6 +304,7 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         self._num_sched_stages = num_sched_stages
         self._cluster_pipeline = cluster_pipeline
         self._producer_state = producer_state
+        self._mixed_work_id_state = mixed_work_id_state
         # Codegen-time Python attribute (NOT MLIR-serialized).  Set to True
         # by ``internal_init`` to mark "scheduler state has been greedily
         # advanced one step (atomic_add cached for atomic_counter mode /
@@ -320,6 +359,7 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         num_consumer_threads: int,
         ext=_DEFAULT_SCHED_EXT,
         *,
+        active_cluster_shape_mn=None,
         loc: Optional[ir.Location] = None,
         ip: Optional[ir.InsertionPoint] = None,
     ) -> "MoEFusedFc12PersistentTileScheduler":
@@ -343,6 +383,17 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             Int32(bidx % params.cluster_shape_mn[1]),
             Int32(0),
         )
+        is_mixed = params.fallback_cluster_shape_mn is not None
+        if const_expr(is_mixed and active_cluster_shape_mn is None):
+            raise ValueError(
+                "Mixed scheduling requires the actual runtime cluster shape."
+            )
+        if const_expr(is_mixed and params.load_balance_mode == "atomic_counter"):
+            cta_id_in_cluster = (
+                Int32(bidy % active_cluster_shape_mn[1]),
+                Int32(bidx % active_cluster_shape_mn[0]),
+                Int32(0),
+            )
 
         # State machine sentinel init.  The 0 values for current_group_end /
         # current_expert_tile_end force gen_next_work's first call to enter
@@ -434,11 +485,15 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         )
 
         # Build the broadcast pipeline with the other scheduler pipelines.
-        # internal_init still claims the first atomic tile before common init.
+        # Uniform clusters preclaim before common init; mixed registration
+        # instead uses this channel after cluster initialization completes.
         cluster_pipeline = None
         dynamic_state: Optional[_DynamicLoadBalanceState] = None
+        mixed_work_id_state = None
         if const_expr(params.load_balance_mode == "atomic_counter"):
             cluster_size = params.cluster_shape_mn[0] * params.cluster_shape_mn[1]
+            if const_expr(is_mixed):
+                cluster_size = active_cluster_shape_mn[0] * active_cluster_shape_mn[1]
             cluster_pipeline = pipeline.PipelineAsync.create(
                 num_stages=1,
                 producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
@@ -457,14 +512,39 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             cluster_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, 1
             )
-            dynamic_state = _DynamicLoadBalanceState(
-                counter_ptr=params.load_balance_counter_ptr,
-                broadcast_ptr=sched_storage.cluster_broadcast_slot.data_ptr(),
-                is_leader_cta=is_leader_cta,
-                producer_state=cluster_producer_state,
-                consumer_state=cluster_consumer_state,
-                atomic_res=Int32(0),
-            )
+            if const_expr(is_mixed):
+                atomic_state = _mixed_cga.AtomicCounterWorkIdState(
+                    counter_pointer=params.load_balance_counter_ptr,
+                    counter_count=1,
+                    broadcast_pointer=sched_storage.cluster_broadcast_slot.data_ptr(),
+                    is_leader_cta=is_leader_cta,
+                    cluster_pipeline=cluster_pipeline,
+                    producer_state=cluster_producer_state,
+                    consumer_state=cluster_consumer_state,
+                    cluster_size=cluster_size,
+                )
+                mixed_work_id_state = _mixed_cga.FixedGroupMixedCgaAtomicCounterWorkIdState(
+                    atomic_counter_state=atomic_state,
+                    registration_counter_pointer=params.fallback_registration_counter_ptr,
+                    group_token_pointer=params.fallback_group_token_ptr,
+                    split_factor=2,
+                    fallback_cluster_count=params.fallback_cluster_count,
+                    is_fallback_cluster=active_cluster_shape_mn[0] == Int32(2),
+                    fallback_group_idx=Int32(0),
+                    in_group_idx=Int32(0),
+                    previous_token=Int64(0),
+                    next_generation=Int32(1),
+                    claimed_counter_index=Int32(0),
+                )
+            else:
+                dynamic_state = _DynamicLoadBalanceState(
+                    counter_ptr=params.load_balance_counter_ptr,
+                    broadcast_ptr=sched_storage.cluster_broadcast_slot.data_ptr(),
+                    is_leader_cta=is_leader_cta,
+                    producer_state=cluster_producer_state,
+                    consumer_state=cluster_consumer_state,
+                    atomic_res=Int32(0),
+                )
 
         return MoEFusedFc12PersistentTileScheduler(
             params=params,
@@ -481,10 +561,11 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             num_sched_stages=num_stages,
             cluster_pipeline=cluster_pipeline,
             producer_state=producer_state,
+            mixed_work_id_state=mixed_work_id_state,
         )
 
     # -------------------------------------------------------------------------
-    # internal_init: first-tile pre-init before pipeline_init_arrive
+    # internal_init: uniform pre-claim, or mixed registration after cluster init
     # -------------------------------------------------------------------------
 
     @dsl_user_op
@@ -498,7 +579,33 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         ip: Optional[ir.InsertionPoint] = None,
     ) -> None:
         """Claim/decode the first work tile during kernel prologue."""
-        if const_expr(self.params.load_balance_mode == "atomic_counter"):
+        if const_expr(
+            self.params.load_balance_mode == "atomic_counter"
+            and self.params.fallback_cluster_shape_mn is not None
+        ):
+            # Reuse the GenPhase/Rubin registration and handoff protocol. Each
+            # pair of fallback clusters claims one preferred tile, retaining
+            # common expert/token coordinates and disjoint channel halves.
+            # Registration uses DSMEM, so the caller runs this after common
+            # cluster-pipeline initialization rather than the early preclaim.
+            if warp_idx == sched_warp_id:
+                self._mixed_work_id_state = (
+                    _mixed_cga.initialize_fixed_group_mixed_cga_work_id_state(
+                        self._mixed_work_id_state
+                    )
+                )
+                channel_offset = Int32(0)
+                if self._mixed_work_id_state.is_fallback_cluster:
+                    channel_offset = self._mixed_work_id_state.in_group_idx * Int32(2)
+                self.cta_id_in_cluster = (
+                    self.cta_id_in_cluster[0],
+                    self.cta_id_in_cluster[1] + channel_offset,
+                    self.cta_id_in_cluster[2],
+                )
+            else:
+                self._mixed_work_id_state = self._mixed_work_id_state
+                self.cta_id_in_cluster = self.cta_id_in_cluster
+        elif const_expr(self.params.load_balance_mode == "atomic_counter"):
             # Pre-claim and broadcast first dynamic tile id.
             if warp_idx == sched_warp_id:
                 tidx, _, _ = cute.arch.thread_idx(loc=loc, ip=ip)
@@ -1025,9 +1132,14 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             pass
         else:
             if const_expr(self.params.load_balance_mode == "atomic_counter"):
-                cluster_linear_tile_idx = self._advance_work_linear_tile_idx_dynamic(
-                    loc=loc, ip=ip
-                )
+                if const_expr(self.params.fallback_cluster_shape_mn is not None):
+                    cluster_linear_tile_idx, self._mixed_work_id_state = (
+                        _mixed_cga.claim_work_id(self._mixed_work_id_state)
+                    )
+                else:
+                    cluster_linear_tile_idx = (
+                        self._advance_work_linear_tile_idx_dynamic(loc=loc, ip=ip)
+                    )
             else:
                 cluster_linear_tile_idx = self._advance_work_linear_tile_idx_static(
                     loc=loc, ip=ip
@@ -1053,7 +1165,10 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             "_num_fc2_hidden_blocks",
         )
         if self.params.load_balance_mode == "atomic_counter":
-            fields += ("_dynamic_state",)
+            if self.params.fallback_cluster_shape_mn is not None:
+                fields += ("_mixed_work_id_state",)
+            else:
+                fields += ("_dynamic_state",)
         return fields + ("_producer_state",)
 
     def __extract_mlir_values__(self) -> List[ir.Value]:

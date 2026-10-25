@@ -41,6 +41,9 @@ from .token_comm import W4A16TokenComm
 from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
     TokenCommArgs as ExtractedTokenCommArgs,
 )
+from flashinfer.moe_ep.kernel_src.sm100 import (
+    next_cutedsl_megamoe as mixed_cluster_helpers,
+)
 
 from .epilogue import W4A16Epilogue, W4A16EpiArgs
 from .topk_reduce import Bf16TopkReduce
@@ -159,6 +162,9 @@ class Sm100W4A16MegaMoEKernel:
         swiglu_beta=None,
         situ_beta=None,
         situ_linear_beta=None,
+        fallback_cluster_shape_mnk=None,
+        preferred_cluster_count=None,
+        fallback_cluster_count=None,
     ):
         if not force_static_sched or scenario != "2Dx3D":
             raise ValueError("W4A16 requires forward 2Dx3D scheduler records.")
@@ -184,12 +190,31 @@ class Sm100W4A16MegaMoEKernel:
             raise ValueError(
                 "W4A16 MegaMoE requires M128/N32,N64,N128 or M256/N32,N64,N128, K256."
             )
-        if cluster_shape_mnk != (2, 1, 1) and not (
+        if cluster_shape_mnk not in ((2, 1, 1), (4, 1, 1)) and not (
             cluster_shape_mnk == (1, 1, 1) and mma_tiler_mnk == (128, 64, 256)
         ):
             raise ValueError(
-                "W4A16 requires cluster (2,1,1), or (1,1,1) for M128/N64/K256."
+                "W4A16 requires cluster (2,1,1), M256 cluster (4,1,1), "
+                "or (1,1,1) for M128/N64/K256."
             )
+        if cluster_shape_mnk == (4, 1, 1) and mma_tiler_mnk[0] != 256:
+            raise ValueError("Four-CTA W4A16 clusters require M256 two-CTA MMA.")
+        if fallback_cluster_shape_mnk is not None:
+            if (cluster_shape_mnk, fallback_cluster_shape_mnk) != (
+                (4, 1, 1),
+                (2, 1, 1),
+            ):
+                raise ValueError("W4A16 mixed clusters require preferred4/fallback2.")
+            if (
+                preferred_cluster_count is None
+                or preferred_cluster_count <= 0
+                or fallback_cluster_count is None
+                or fallback_cluster_count <= 0
+                or fallback_cluster_count % 2
+            ):
+                raise ValueError(
+                    "Mixed clusters require positive P and even positive F."
+                )
         if use_2cta_instrs != (mma_tiler_mnk[0] == 256):
             raise ValueError("W4A16 MMA M128/M256 requires one/two-CTA instructions.")
         if static_expert_shape is None or hidden != static_expert_shape[2]:
@@ -214,6 +239,21 @@ class Sm100W4A16MegaMoEKernel:
 
         self.mma_tiler = mma_tiler_mnk
         self.cluster_shape_mn = cluster_shape_mnk[:2]
+        self.fallback_cluster_shape_mn = (
+            None
+            if fallback_cluster_shape_mnk is None
+            else fallback_cluster_shape_mnk[:2]
+        )
+        self.is_mixed_cluster = self.fallback_cluster_shape_mn is not None
+        self.preferred_cluster_count = preferred_cluster_count
+        self.fallback_cluster_count = fallback_cluster_count
+        # The fixed-group claim protocol registers fallback clusters at runtime.
+        # Reserve the all-fallback upper bound, independent of the placement order.
+        self.fallback_group_capacity = (
+            2 * (preferred_cluster_count + fallback_cluster_count // 2)
+            if self.is_mixed_cluster
+            else 0
+        )
         self.use_2cta_instrs = use_2cta_instrs
         self.static_expert_shape = static_expert_shape
         self.num_sched_stages = num_sched_stages or 3
@@ -319,6 +359,12 @@ class Sm100W4A16MegaMoEKernel:
             f"_tokens{self.max_tokens_per_rank}_flag{self.flag_batch}"
             f"_swiglua{self.swiglu_alpha}_swiglub{self.swiglu_beta}"
             f"_situb{self.situ_beta}_situlinb{self.situ_linear_beta}"
+            + (
+                f"_fallback{self.fallback_cluster_shape_mn}"
+                f"_clusters{self.preferred_cluster_count}_{self.fallback_cluster_count}"
+                if self.is_mixed_cluster
+                else ""
+            )
             + ("_ikr" if self.in_kernel_fc2_reduce else "")
             + (
                 "_routing_weights_before_fc2"
@@ -521,11 +567,20 @@ class Sm100W4A16MegaMoEKernel:
         fc1_done_counter = self._view_local(local_workspace, "fc1_done_counter")
 
         load_balance_counter: Optional[cute.Tensor] = None
+        fallback_registration_counter = None
+        fallback_group_tokens = None
         if cutlass.const_expr(self.load_balance_mode == "atomic_counter"):
             load_balance_counter = self._view_local(
                 local_workspace,
                 "load_balance_counter",
             )
+            if cutlass.const_expr(self.is_mixed_cluster):
+                fallback_registration_counter = self._view_local(
+                    local_workspace, "fallback_registration_counter"
+                ).iterator
+                fallback_group_tokens = self._view_local(
+                    local_workspace, "fallback_group_tokens"
+                ).iterator
 
         token_back_schedule_counter = None
         if cutlass.const_expr(self.token_back_schedule_mode == "atomic_counter"):
@@ -681,6 +736,8 @@ class Sm100W4A16MegaMoEKernel:
             max_active_clusters=max_active_clusters,
             stream=stream,
             load_balance_counter=load_balance_counter,
+            fallback_registration_counter=fallback_registration_counter,
+            fallback_group_tokens=fallback_group_tokens,
             expert_token_sizes=expert_token_sizes,
             token_comm_args=token_comm_args,
         )
@@ -705,6 +762,8 @@ class Sm100W4A16MegaMoEKernel:
         max_active_clusters,
         stream,
         load_balance_counter,
+        fallback_registration_counter,
+        fallback_group_tokens,
         expert_token_sizes,
         token_comm_args,
     ):
@@ -759,6 +818,10 @@ class Sm100W4A16MegaMoEKernel:
             load_balance_counter_ptr=counter_ptr,
             override_num_stages=self.num_sched_stages,
             expert_token_sizes=expert_token_sizes,
+            fallback_cluster_shape_mn=self.fallback_cluster_shape_mn,
+            fallback_cluster_count=self.fallback_group_capacity,
+            fallback_registration_counter_ptr=fallback_registration_counter,
+            fallback_group_token_ptr=fallback_group_tokens,
         )
         (
             self.mixed_fc1,
@@ -843,6 +906,18 @@ class Sm100W4A16MegaMoEKernel:
         ba2, bt2 = cute.nvgpu.make_tiled_tma_atom_B(
             b_op, b2, b_stage, self.mma_tiler, tiled_mma, mix.cluster_layout_vmnk.shape
         )
+        if cutlass.const_expr(self.is_mixed_cluster):
+            fallback_layout = cute.tiled_divide(
+                cute.make_layout((*self.fallback_cluster_shape_mn, 1)),
+                (tiled_mma.thr_id.shape,),
+            )
+            ba1_fallback, _ = cute.nvgpu.make_tiled_tma_atom_B(
+                b_op, b1, b_stage, self.mma_tiler, tiled_mma, fallback_layout.shape
+            )
+            ba2_fallback, _ = cute.nvgpu.make_tiled_tma_atom_B(
+                b_op, b2, b_stage, self.mma_tiler, tiled_mma, fallback_layout.shape
+            )
+            ba1, ba2 = (ba1, ba1_fallback), (ba2, ba2_fallback)
         self.a_tx_bytes = cute.size_in_bytes(
             cutlass.Float4E2M1FN, raw_stage
         ) + cute.size_in_bytes(cutlass.Float8E4M3FN, mix.smem_layout_scale_per_stage)
@@ -850,6 +925,9 @@ class Sm100W4A16MegaMoEKernel:
             tiled_mma.thr_id.shape
         )
         grid = sched.get_grid_shape(max_active_clusters)
+        launch_kwargs = {}
+        if cutlass.const_expr(self.is_mixed_cluster):
+            launch_kwargs["fallback_cluster"] = (*self.fallback_cluster_shape_mn, 1)
         self.kernel(
             tiled_mma,
             wa1,
@@ -887,6 +965,7 @@ class Sm100W4A16MegaMoEKernel:
             cluster=(*self.cluster_shape_mn, 1),
             stream=stream,
             min_blocks_per_mp=1,
+            **launch_kwargs,
         )
 
     @cute.jit
@@ -974,6 +1053,26 @@ class Sm100W4A16MegaMoEKernel:
         return state
 
     @cute.jit
+    def _select_activation_atom(self, atom, barrier, mask, is_fallback_cluster):
+        # Materialize both executable types before runtime selection, matching
+        # Rubin's TMA-B loop. Keep the existing BF16 activation L2 policy.
+        return mixed_cluster_helpers.select_tma_atom_for_cluster(
+            (
+                atom[0].with_(
+                    tma_bar_ptr=barrier,
+                    mcast_mask=mask,
+                    cache_policy=cutlass.Int64(0x14F0000000000000),
+                ),
+                atom[1].with_(
+                    tma_bar_ptr=barrier,
+                    mcast_mask=mask,
+                    cache_policy=cutlass.Int64(0x14F0000000000000),
+                ),
+            ),
+            is_fallback_cluster,
+        )
+
+    @cute.jit
     def _activation_task(
         self,
         mma,
@@ -987,6 +1086,8 @@ class Sm100W4A16MegaMoEKernel:
         pipe,
         state,
         k_count,
+        mixed_exec_atom,
+        mixed_partition_coord,
     ):
         iket.range_push(
             "activation_load_bf16_tile", (work.phase << 16) | work.expert_idx
@@ -1009,34 +1110,72 @@ class Sm100W4A16MegaMoEKernel:
         cta_layout = cute.make_layout(
             cute.slice_(cluster_layout, (0, None, 0, 0)).shape
         )
+        partition_atom = atom
+        partition_coord = cluster_coord[1]
+        if cutlass.const_expr(self.is_mixed_cluster):
+            # Partition with the preferred descriptor; runtime cluster
+            # selection and its coordinate are invariant across work tiles.
+            partition_atom = atom[0]
+            partition_coord = mixed_partition_coord
         dst, src = cpasync.tma_partition(
-            atom,
-            cluster_coord[1],
+            partition_atom,
+            partition_coord,
             cta_layout,
             cute.group_modes(s_b, 0, 3),
             cute.group_modes(thr.partition_B(gb), 0, 3),
         )
         src = src[(None, work.tile_n_idx, None, 0)]
-        mask = cpasync.create_tma_multicast_mask(
-            cluster_layout, cluster_coord, mcast_mode=1
-        )
+        if cutlass.const_expr(not self.is_mixed_cluster):
+            mask = cpasync.create_tma_multicast_mask(
+                cluster_layout, cluster_coord, mcast_mode=1
+            )
         state.reset_count()
+        empty_status = None
+        if cutlass.const_expr(self.is_mixed_cluster):
+            empty_status = pipe.producer_try_acquire(state)
         for _ in cutlass.range(k_count, unroll=1):
             iket.range_push("activation_wait_smem_slot_free", state.count)
-            pipe.producer_acquire(state)
+            if cutlass.const_expr(self.is_mixed_cluster):
+                pipe.producer_acquire(state, empty_status)
+            else:
+                pipe.producer_acquire(state)
             iket.range_pop()
             iket.range_push("activation_issue_bf16_tma", state.count)
-            cute.copy(
-                atom,
-                src[(None, state.count)],
-                dst[(None, state.index)],
-                tma_bar_ptr=pipe.producer_get_barrier(state),
-                mcast_mask=mask,
-                cache_policy=cutlass.Int64(0x14F0000000000000),
-            )
-            pipe.producer_commit(state)
+            if cutlass.const_expr(self.is_mixed_cluster):
+                # Match Rubin's TMA-B lookahead: retain this issue's fields,
+                # advance, and probe the next slot before issuing the copy.
+                k_tile_idx = state.count
+                tma_barrier = pipe.producer_get_barrier(state)
+                stage_index = state.index
+                state.advance()
+                if k_tile_idx + 1 < k_count:
+                    empty_status = pipe.producer_try_acquire(state)
+                issue_atom = mixed_cluster_helpers.bind_executable_tma_load_fields(
+                    mixed_exec_atom,
+                    tma_bar_ptr=tma_barrier,
+                    tma_desc_ptr=None,
+                    mcast_mask=None,
+                )
+                cute.copy(
+                    issue_atom,
+                    src[(None, k_tile_idx)],
+                    dst[(None, stage_index)],
+                )
+            else:
+                cute.copy(
+                    atom,
+                    src[(None, state.count)],
+                    dst[(None, state.index)],
+                    tma_bar_ptr=pipe.producer_get_barrier(state),
+                    mcast_mask=mask,
+                    cache_policy=cutlass.Int64(0x14F0000000000000),
+                )
+            # Mixed TMA commit is a no-op; its state already advanced above.
+            if cutlass.const_expr(not self.is_mixed_cluster):
+                pipe.producer_commit(state)
             iket.range_pop()
-            state.advance()
+            if cutlass.const_expr(not self.is_mixed_cluster):
+                state.advance()
         iket.range_pop()
         return state
 
@@ -1134,6 +1273,12 @@ class Sm100W4A16MegaMoEKernel:
         cluster_coord = cluster_layout.get_flat_coord(
             cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         )
+        active_cluster_shape_mn = None
+        is_fallback_cluster = cutlass.Boolean(False)
+        if cutlass.const_expr(self.is_mixed_cluster):
+            active_cluster_m, active_cluster_n, _ = cute.arch.block_in_cluster_dim()
+            active_cluster_shape_mn = (active_cluster_m, active_cluster_n)
+            is_fallback_cluster = active_cluster_m == cutlass.Int32(2)
         fc2_threshold = cute.ceil_div(
             self.intermediate_gateup, self.cta_tile_shape_mnk[0]
         )
@@ -1172,18 +1317,37 @@ class Sm100W4A16MegaMoEKernel:
             cta_layout_vmnk=cluster_layout,
             defer_sync=True,
         )
-        activation_pipe = pipeline.PipelineTmaUmma.create(
-            barrier_storage=storage.activation_barriers.data_ptr(),
-            num_stages=self.num_activation_stages,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-            consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, mix.num_mcast_ctas_b
-            ),
-            tx_count=self.b_tx_bytes,
-            cta_layout_vmnk=cluster_layout,
-            mcast_mode_mn=(0, 1),
-            defer_sync=True,
-        )
+        if cutlass.const_expr(self.is_mixed_cluster):
+            fallback_layout = cute.tiled_divide(
+                cute.make_layout((*self.fallback_cluster_shape_mn, 1)),
+                (mma.thr_id.shape,),
+            )
+            activation_pipe = mixed_cluster_helpers.PipelineTmaUmmaMixedCga.create(
+                barrier_storage=storage.activation_barriers.data_ptr(),
+                num_stages=self.num_activation_stages,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+                num_mma_consumer_warps=1,
+                tx_count=self.b_tx_bytes,
+                preferred_cta_layout_vmnk=cluster_layout,
+                fallback_cta_layout_vmnk=fallback_layout,
+                cta_coord_vmnk=cluster_coord,
+                is_fallback_cluster=is_fallback_cluster,
+                mcast_mode_mn=(0, 1),
+                defer_sync=True,
+            )
+        else:
+            activation_pipe = pipeline.PipelineTmaUmma.create(
+                barrier_storage=storage.activation_barriers.data_ptr(),
+                num_stages=self.num_activation_stages,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+                consumer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread, mix.num_mcast_ctas_b
+                ),
+                tx_count=self.b_tx_bytes,
+                cta_layout_vmnk=cluster_layout,
+                mcast_mode_mn=(0, 1),
+                defer_sync=True,
+            )
         acc_pipe = pipeline.PipelineUmmaAsync.create(
             barrier_storage=storage.acc_barriers.data_ptr(),
             num_stages=2,
@@ -1212,8 +1376,14 @@ class Sm100W4A16MegaMoEKernel:
             sched_storage=storage.sched_storage,
             num_consumer_threads=32 * (7 + self.num_transform_warps),
             ext=ext,
+            active_cluster_shape_mn=active_cluster_shape_mn,
         )
-        early_init = self.load_balance_mode == "atomic_counter"
+        early_init = (
+            self.load_balance_mode == "atomic_counter" and not self.is_mixed_cluster
+        )
+        early_mixed_init = (
+            self.load_balance_mode == "atomic_counter" and self.is_mixed_cluster
+        )
         if cutlass.const_expr(early_init):
             scheduler.internal_init(warp_idx=warp, sched_warp_id=7)
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
@@ -1251,10 +1421,14 @@ class Sm100W4A16MegaMoEKernel:
             iket.range_pop()
 
         if warp == 7:
+            if cutlass.const_expr(early_mixed_init):
+                # Like Rubin, register fallback groups after cluster init but
+                # before waiting for sizes. Mixed atomic init reads no metadata.
+                scheduler.internal_init(warp_idx=warp, sched_warp_id=7)
             iket.range_push("sched_wait_dispatch_metadata")
             self.token_comm.sched_warp_pre_init_wait(token_comm_args)
             iket.range_pop()
-            if cutlass.const_expr(not early_init):
+            if cutlass.const_expr(not early_init and not early_mixed_init):
                 scheduler.internal_init(warp_idx=warp, sched_warp_id=7)
             scheduler.gen_next_work()
             while scheduler.current_work.is_valid_tile:
@@ -1329,6 +1503,27 @@ class Sm100W4A16MegaMoEKernel:
             state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_activation_stages
             )
+            mixed_fc1_exec_atom = None
+            mixed_fc2_exec_atom = None
+            mixed_partition_coord = None
+            if cutlass.const_expr(self.is_mixed_cluster):
+                # The physical cluster and both FC descriptors are invariant
+                # for this persistent TMA warp. Select once, as in Rubin.
+                mask = cpasync.create_tma_multicast_mask(
+                    cluster_layout, cluster_coord, mcast_mode=1
+                )
+                mask = cutlass.Int32(mask)
+                mixed_partition_coord = cluster_coord[1]
+                if is_fallback_cluster:
+                    mask = mask & cutlass.Int32(0b11)
+                    mixed_partition_coord = mixed_partition_coord * cutlass.Int32(2)
+                initial_barrier = activation_pipe.producer_get_barrier(state)
+                mixed_fc1_exec_atom = self._select_activation_atom(
+                    ba1, initial_barrier, mask, is_fallback_cluster
+                )
+                mixed_fc2_exec_atom = self._select_activation_atom(
+                    ba2, initial_barrier, mask, is_fallback_cluster
+                )
             iket.range_push("activation_wait_sched_record")
             work = consumer.consume_work()
             iket.range_pop()
@@ -1352,6 +1547,8 @@ class Sm100W4A16MegaMoEKernel:
                         activation_pipe,
                         state,
                         self._fc1_k_tiles,
+                        mixed_fc1_exec_atom,
+                        mixed_partition_coord,
                     )
                 else:
                     if not work.peek_ready:
@@ -1379,6 +1576,8 @@ class Sm100W4A16MegaMoEKernel:
                         activation_pipe,
                         state,
                         self._fc2_k_tiles,
+                        mixed_fc2_exec_atom,
+                        mixed_partition_coord,
                     )
                 iket.range_push("activation_wait_sched_record")
                 work = consumer.consume_work()
@@ -1800,6 +1999,20 @@ class Sm100W4A16MegaMoEKernel:
                     16,
                 )
             )
+            if self.is_mixed_cluster:
+                specs.extend(
+                    [
+                        _RegionSpec(
+                            "fallback_registration_counter", cutlass.Int32, (1,), 16
+                        ),
+                        _RegionSpec(
+                            "fallback_group_tokens",
+                            cutlass.Int64,
+                            (self.fallback_group_capacity,),
+                            16,
+                        ),
+                    ]
+                )
 
         # Data buffers. l1_token_buffer must be the first data region because
         # __init__ derives local_zero_i32_count from its offset.

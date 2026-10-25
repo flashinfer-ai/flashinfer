@@ -7,6 +7,7 @@ from __future__ import annotations
 import dataclasses
 import math
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Callable, Literal, Optional, Tuple
 
 import torch
@@ -23,13 +24,28 @@ from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
 )
 
 
+@lru_cache(maxsize=None)
+def _max_active_clusters(device: int, cluster_size: int) -> int:
+    """Cache the CUTLASS occupancy query by device and physical cluster size."""
+    from cutlass.utils import HardwareInfo
+
+    with torch.cuda.device(device):
+        return int(HardwareInfo().get_max_active_clusters(cluster_size))
+
+
 @deprecated_aliases(
     apply_topk_in_fc1="apply_routing_weights_before_fc2",
     defer_topk_reduce="use_custom_finalize",
 )
 @dataclasses.dataclass(frozen=True)
 class MegaMoEBf16Nvfp4Config:
-    """Compile-time and launch-time W4A16 MegaMoE configuration."""
+    """Compile-time and launch-time W4A16 MegaMoE configuration.
+
+    M256 supports preferred ``cluster_shape_mnk=(4, 1, 1)`` with optional
+    ``fallback_cluster_shape_mnk=(2, 1, 1)``. Both physical cluster sizes retain
+    two-CTA MMA pairs; the scheduler shares one logical four-CTA tile between
+    two fallback clusters. ``None`` requests a uniform cluster size.
+    """
 
     rank: int
     world_size: int
@@ -61,6 +77,7 @@ class MegaMoEBf16Nvfp4Config:
     situ_beta: Optional[float] = None
     situ_linear_beta: Optional[float] = None
     use_custom_finalize: bool = False
+    fallback_cluster_shape_mnk: Optional[Tuple[int, int, int]] = None
 
     def __post_init__(self) -> None:
         if self.use_custom_finalize and (
@@ -96,6 +113,12 @@ class MegaMoEBf16Nvfp4Config:
         # Geometry knobs also arrive as JSON arrays from the benchmark.
         object.__setattr__(self, "mma_tiler_mnk", tuple(self.mma_tiler_mnk))
         object.__setattr__(self, "cluster_shape_mnk", tuple(self.cluster_shape_mnk))
+        if self.fallback_cluster_shape_mnk is not None:
+            object.__setattr__(
+                self,
+                "fallback_cluster_shape_mnk",
+                tuple(self.fallback_cluster_shape_mnk),
+            )
         if self.load_balance_mode not in ("static", "atomic_counter"):
             raise ValueError(
                 f"Unsupported load_balance_mode={self.load_balance_mode!r}."
@@ -133,11 +156,20 @@ class MegaMoEBf16Nvfp4Config:
             raise ValueError(
                 "W4A16 MegaMoE requires M128/N32,N64,N128 or M256/N32,N64,N128, K256."
             )
-        if self.cluster_shape_mnk != (2, 1, 1) and not (
+        if self.cluster_shape_mnk not in ((2, 1, 1), (4, 1, 1)) and not (
             self.cluster_shape_mnk == (1, 1, 1) and self.mma_tiler_mnk == (128, 64, 256)
         ):
             raise ValueError(
-                "W4A16 requires cluster (2,1,1), or (1,1,1) for M128/N64/K256."
+                "W4A16 requires cluster (2,1,1), (4,1,1), or (1,1,1) for M128/N64/K256."
+            )
+        if self.cluster_shape_mnk == (4, 1, 1) and self.mma_tiler_mnk[0] != 256:
+            raise ValueError("W4A16 four-CTA clusters require M256 two-CTA MMA.")
+        if self.fallback_cluster_shape_mnk is not None and (
+            self.cluster_shape_mnk != (4, 1, 1)
+            or self.fallback_cluster_shape_mnk != (2, 1, 1)
+        ):
+            raise ValueError(
+                "W4A16 mixed clusters require preferred (4,1,1), fallback (2,1,1)."
             )
         if self.use_2cta_instrs != (self.mma_tiler_mnk[0] == 256):
             raise ValueError("W4A16 MMA M128/M256 requires one/two-CTA instructions.")
@@ -180,6 +212,41 @@ class MegaMoEBf16Nvfp4Frontend:
         self._staging_variants: dict[tuple[torch.dtype, bool, bool], Callable] = {}
         self._unstaged_variants: dict[bool, Callable] = {}
         self._launch_inputs: Optional[MegaMoEBf16Nvfp4Inputs] = None
+
+    def _cluster_launch_configuration(self):
+        c = self.config
+        cluster_size = math.prod(c.cluster_shape_mnk)
+        device = torch.cuda.current_device()
+        # Keep the existing two-CTA launch unchanged. Larger clusters need the
+        # hardware occupancy probe: SM count / cluster size ignores GPC packing.
+        if cluster_size <= 2:
+            sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+            return max(1, sm_count // cluster_size), None, None
+        preferred_count = _max_active_clusters(device, cluster_size)
+        if preferred_count <= 0:
+            raise ValueError(
+                "Four-CTA W4A16 clusters are unavailable on this device partition; "
+                "select cluster_shape_mnk=(2, 1, 1)."
+            )
+        if c.fallback_cluster_shape_mnk is None:
+            return preferred_count, None, None
+        fallback_size = math.prod(c.fallback_cluster_shape_mnk)
+        fallback_capacity = _max_active_clusters(device, fallback_size) * fallback_size
+        preferred_capacity = preferred_count * cluster_size
+        if fallback_capacity < preferred_capacity:
+            raise ValueError(
+                "Fallback cluster capacity is smaller than preferred capacity."
+            )
+        # Same whole-preferred-tile accounting as the Rubin MegaMoE shim.
+        # Two physical fallback clusters jointly execute one logical four-CTA tile.
+        split_factor = cluster_size // fallback_size
+        remaining = (fallback_capacity - preferred_capacity) // fallback_size
+        fallback_count = remaining // split_factor * split_factor
+        return (
+            preferred_count + fallback_count // split_factor,
+            preferred_count,
+            fallback_count,
+        )
 
     @property
     def config(self) -> MegaMoEBf16Nvfp4Config:
@@ -266,14 +333,21 @@ class MegaMoEBf16Nvfp4Frontend:
             from .megamoe_kernel import Sm100W4A16MegaMoEKernel
 
             c = self.config
-            cluster_size = c.cluster_shape_mnk[0] * c.cluster_shape_mnk[1]
-            sm_count = torch.cuda.get_device_properties(
-                torch.cuda.current_device()
-            ).multi_processor_count
-            max_active_clusters = max(1, sm_count // cluster_size)
+            max_active_clusters, preferred_count, fallback_count = (
+                self._cluster_launch_configuration()
+            )
+            fallback_cluster_shape = c.fallback_cluster_shape_mnk
+            if fallback_count == 0:
+                # Match the established mixed-CGA normalization: no leftover
+                # capacity means a uniform preferred launch and no handoff state.
+                fallback_cluster_shape = None
+                preferred_count = fallback_count = None
             kernel = Sm100W4A16MegaMoEKernel(
                 mma_tiler_mnk=c.mma_tiler_mnk,
                 cluster_shape_mnk=c.cluster_shape_mnk,
+                fallback_cluster_shape_mnk=fallback_cluster_shape,
+                preferred_cluster_count=preferred_count,
+                fallback_cluster_count=fallback_count,
                 use_2cta_instrs=c.use_2cta_instrs,
                 group_hint=c.group_hint or max_active_clusters,
                 token_padding_block=c.mma_tiler_mnk[1],
@@ -360,15 +434,11 @@ class MegaMoEBf16Nvfp4Frontend:
         import cutlass.cute as cute
 
         c = self.config
-        sm_count = torch.cuda.get_device_properties(
-            torch.cuda.current_device()
-        ).multi_processor_count
-        cluster_size = c.cluster_shape_mnk[0] * c.cluster_shape_mnk[1]
         kwargs = self._runtime_kwargs(inputs, mega)
         if staging_key is not None:
             # Typed null pointers are compile descriptors, never launch inputs.
             kwargs["staging_inputs"] = self._staging_args(None, staging_key[:2])
-        kwargs["max_active_clusters"] = max(1, sm_count // cluster_size)
+        kwargs["max_active_clusters"] = self._cluster_launch_configuration()[0]
         # Start with 61440 registers per CTA; the kernel redistributes this
         # pool among the five warpgroup roles.
         kwargs["options"] = "--ptxas-options='-maxrregcount=96'"
