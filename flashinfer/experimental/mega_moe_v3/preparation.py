@@ -103,11 +103,18 @@ def expert_window(inputs):
     return offset, local, global_experts
 
 
-def _check_tensor(name, tensor, *, shape=None, numel=None, dtype=None, byte_wide=False):
+def _check_tensor(
+    name, tensor, *, device, shape=None, numel=None, dtype=None, byte_wide=False
+):
     import torch
 
     if not isinstance(tensor, torch.Tensor):
         raise TypeError(f"MegaMoE input {name!r} must be a tensor")
+    if tensor.device != device:
+        raise ValueError(
+            f"MegaMoE input {name!r} must be on {device} (the device of "
+            f"x_fp8_packed); got {tensor.device}"
+        )
     if shape is not None and tuple(tensor.shape) != tuple(shape):
         raise ValueError(
             f"MegaMoE input {name!r} must have shape {tuple(shape)}; "
@@ -127,11 +134,16 @@ def _check_tensor(name, tensor, *, shape=None, numel=None, dtype=None, byte_wide
         )
 
 
-def _check_bytes(name, tensor, nbytes):
+def _check_bytes(name, tensor, nbytes, *, device):
     import torch
 
     if not isinstance(tensor, torch.Tensor):
         raise TypeError(f"MegaMoE input {name!r} must be a tensor")
+    if tensor.device != device:
+        raise ValueError(
+            f"MegaMoE input {name!r} must be on {device} (the device of "
+            f"x_fp8_packed); got {tensor.device}"
+        )
     if tensor.numel() * tensor.element_size() != nbytes:
         raise ValueError(
             f"MegaMoE input {name!r} must hold {nbytes} bytes; "
@@ -313,7 +325,7 @@ def source_schedule_form(metadata, num_tokens, num_experts, top_k, weight_fmt):
         if block_m is None
         else int(block_m)
     )
-    if block_m < 1 or block_m > 128 or 128 % block_m:
+    if block_m not in (16, 32, 128):
         raise ValueError(
             f"MegaMoE source tile height {block_m} is outside the generated "
             "programs' 16-, 32- and 128-row forms"
@@ -396,27 +408,49 @@ def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
             "local_expert_offset 0 and num_global_experts == num_experts "
             f"({E}); got offset {offset} and {global_experts} global experts"
         )
+    if not isinstance(inputs["x_fp8_packed"], torch.Tensor):
+        raise TypeError("MegaMoE input 'x_fp8_packed' must be a tensor")
+    device = inputs["x_fp8_packed"].device
+    if device.type != "cuda":
+        raise ValueError(
+            f"MegaMoE inputs must be CUDA tensors; x_fp8_packed is on {device}"
+        )
     w1, w1_sf, w2, w2_sf = (
         inputs[k] for k in (f"w1_{weight_fmt}", "w1_sf", f"w2_{weight_fmt}", "w2_sf")
     )
+    check = dict(device=device)
     _check_tensor(
-        f"w1_{weight_fmt}", w1, shape=(E, 2 * logical_I, H // pack), byte_wide=True
+        f"w1_{weight_fmt}",
+        w1,
+        shape=(E, 2 * logical_I, H // pack),
+        byte_wide=True,
+        **check,
     )
     _check_tensor(
-        "w1_sf", w1_sf, shape=(E, 2 * logical_I, H // SF_GRAN), dtype=torch.float32
+        "w1_sf",
+        w1_sf,
+        shape=(E, 2 * logical_I, H // SF_GRAN),
+        dtype=torch.float32,
+        **check,
     )
     _check_tensor(
-        f"w2_{weight_fmt}", w2, shape=(E, H, logical_I // pack), byte_wide=True
+        f"w2_{weight_fmt}", w2, shape=(E, H, logical_I // pack), byte_wide=True, **check
     )
     _check_tensor(
-        "w2_sf", w2_sf, shape=(E, H, logical_I // SF_GRAN), dtype=torch.float32
+        "w2_sf", w2_sf, shape=(E, H, logical_I // SF_GRAN), dtype=torch.float32, **check
     )
-    _check_tensor("topk_idx", inputs["topk_idx"], numel=T * TK, dtype=torch.int64)
     _check_tensor(
-        "topk_weights", inputs["topk_weights"], numel=T * TK, dtype=torch.float32
+        "topk_idx", inputs["topk_idx"], numel=T * TK, dtype=torch.int64, **check
     )
-    _check_bytes("x_fp8_packed", inputs["x_fp8_packed"], T * H)
-    _check_bytes("x_sf_packed", inputs["x_sf_packed"], T * H // SF_GRAN)
+    _check_tensor(
+        "topk_weights",
+        inputs["topk_weights"],
+        numel=T * TK,
+        dtype=torch.float32,
+        **check,
+    )
+    _check_bytes("x_fp8_packed", inputs["x_fp8_packed"], T * H, **check)
+    _check_bytes("x_sf_packed", inputs["x_sf_packed"], T * H // SF_GRAN, **check)
     ids = inputs["topk_idx"].detach().reshape(-1).cpu()
     if int(ids.min()) < -1 or int(ids.max()) >= global_experts:
         raise ValueError(

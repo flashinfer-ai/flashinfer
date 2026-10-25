@@ -6,6 +6,7 @@ from pathlib import Path
 
 from ..deepgemm_common import UnsupportedDevice, load_catalog
 from .preparation import (
+    PIPELINE_KEY_FIELDS,
     build_tile_lists,
     pipeline_route_args,
     prepare_pipeline_bindings,
@@ -48,15 +49,7 @@ def load_program(arch, name, num_sms):
 
 def key(surface, args):
     names = (
-        (
-            "num_tokens",
-            "num_experts",
-            "top_k",
-            "hidden",
-            "intermediate",
-            "routed_weight_dtype",
-            "activation_clamp",
-        )
+        PIPELINE_KEY_FIELDS
         if surface == "pipeline"
         else (
             ("num_experts", "per_expert_M", "N", "K")
@@ -163,7 +156,7 @@ def _route_arch(route, device):
         )
     admitted = route_admitted_num_sms(route, arch)
     if sms not in admitted:
-        raise RuntimeError(
+        raise UnsupportedDevice(
             f"The exported {arch} {route['metadata']['surface']} schedule was generated "
             f"for {list(admitted)} physical SMs; this device has {sms}"
         )
