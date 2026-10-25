@@ -535,11 +535,13 @@ def thresholds_from_sample(
     """
     from ..cute_dsl.launch import launch
     from .kernels import single_head_scorer
-    from .kernels.single_head_scorer import THRESHOLD_ROWS_PER_CTA
+    from .kernels.single_head_scorer import COUNTERS, THRESHOLD_ROWS_PER_CTA
 
     rows, rank = sample_top.shape
     if {sample_scores.shape[0], thresholds.shape[0], counters.shape[0]} != {rows}:
         raise ValueError("Mismatched sample rows, thresholds or counters")
+    if counters.shape[1:] != (COUNTERS,):
+        raise ValueError(f"counters must be [rows, {COUNTERS}]")
     if rows:
         launch(
             single_head_scorer.thresholds_kernel,

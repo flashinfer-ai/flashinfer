@@ -564,3 +564,17 @@ def test_single_head_paged_mqa_logits_off_sm10x_rejects_bad_layouts(
             scores=torch.zeros(128, 4, device="cuda").T,
         )
 
+
+@sm10x_only
+@torch.inference_mode()
+def test_thresholds_from_sample_rejects_bad_counters() -> None:
+    scores = torch.zeros(4, 128, device="cuda")
+    top = torch.zeros(4, 8, dtype=torch.int32, device="cuda")
+    thresholds = torch.zeros(4, device="cuda")
+    with pytest.raises(ValueError, match="counters must be"):
+        thresholds_from_sample(
+            scores,
+            top,
+            thresholds=thresholds,
+            counters=torch.zeros(4, 1, dtype=torch.int32, device="cuda"),
+        )
