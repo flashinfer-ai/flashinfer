@@ -24,6 +24,7 @@ import flashinfer
 from flashinfer.topk import can_implement_filtered_topk
 from flashinfer.utils import get_compute_capability
 from tests.test_helpers.parametrize import parametrize_product
+from tests.test_helpers.pdl import late_store
 
 
 @pytest.fixture
@@ -3425,6 +3426,58 @@ def test_topk_clusters_exact_variable_seq_lens(batch_size, seq_len, k, dtype):
         row_accuracy = len(test_set & ref_set) / k
         acc = 0.95 if dtype == torch.bfloat16 else 0.99
         assert row_accuracy >= acc, f"Row {i} accuracy {row_accuracy:.4f} < {acc}"
+
+
+@pytest.mark.parametrize("variant", ["exact", "page_table", "ragged"])
+def test_topk_clusters_pdl_waits_before_reading(variant):
+    _require_sm100_or_sm103()
+    torch.manual_seed(42)
+    batch_size, top_k, seq_len = 4, 2048, 1000
+    width = seq_len if variant == "exact" else 4096
+    logits = torch.randn(batch_size, width, device="cuda")
+    seq_lens = torch.full((batch_size,), seq_len, device="cuda", dtype=torch.int32)
+    page_table = torch.arange(
+        batch_size * width, device="cuda", dtype=torch.int32
+    ).view(batch_size, width)
+    offsets = torch.arange(batch_size, device="cuda", dtype=torch.int32) * width
+    # Each row is shorter than top_k, so the kernel takes its copy-through path.
+    if variant == "exact":
+        late_input, late_value, run = (
+            logits,
+            logits[0, 0].item(),
+            # Values past seq_len are left unwritten.
+            lambda: tuple(
+                t[:, :seq_len]
+                for t in flashinfer.topk.topk_clusters_exact(
+                    logits, top_k, output_values=True, pdl=True
+                )
+            ),
+        )
+    elif variant == "page_table":
+        late_input, late_value, run = (
+            seq_lens,
+            seq_len,
+            lambda: flashinfer.topk.topk_clusters_page_table_transform(
+                logits, seq_lens, page_table, top_k, pdl=True
+            ),
+        )
+    else:
+        late_input, late_value, run = (
+            offsets,
+            0,
+            lambda: flashinfer.topk.topk_clusters_ragged_transform(
+                logits, seq_lens, offsets, top_k, pdl=True
+            ),
+        )
+    expected = run()
+
+    # Row 0's first input is what the previous kernel is still producing.
+    # No other kernel may run between that producer and the top-k kernel.
+    late_input.view(-1)[0] = 1
+    late_store(late_input, late_value)
+    out = run()
+
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("num_rows", [1, 16, 64])
