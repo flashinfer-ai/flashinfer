@@ -23,6 +23,21 @@ def test_catalog_is_the_merged_layout_with_both_architectures():
     assert runtime.supported_num_sms("sm_103a") == [152]
 
 
+def test_routes_are_keyed_by_architecture():
+    """The routes table is keyed by architecture, so a route may ship for one
+    architecture only; every route of ``sm_100a`` also ships for ``sm_103a``,
+    and the loader hands each architecture its own table."""
+    catalog = _catalog()
+    data = json.loads(catalog.path.read_text())
+    assert set(data["routes"]) == set(catalog.arches)
+    for arch in catalog.arches:
+        assert catalog.routes(arch) == data["routes"][arch]
+        assert catalog.routes(arch), arch
+    assert set(catalog.routes("sm_100a")) <= set(catalog.routes("sm_103a"))
+    # The JSON spelling the exporter writes.
+    assert catalog.path.read_text() == json.dumps(data, indent=1) + "\n"
+
+
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
 def test_every_route_resolves_its_programs_grid_and_sm_count(arch):
     catalog = _catalog()

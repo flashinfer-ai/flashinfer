@@ -815,448 +815,895 @@
   }
  },
  "routes": {
-  "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":1,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
-   "num_sms": {
-    "sm_100a": 148,
-    "sm_103a": 152
-   },
-   "grid": {
-    "sm_100a": [
-     148,
-     1,
-     1
-    ],
-    "sm_103a": [
-     152,
-     1,
-     1
-    ]
-   },
-   "metadata": {
-    "surface": "pipeline",
-    "extent": {
-     "grid_derivation": "original distinct top-k lower bound saturates the SM count",
-     "minimum_tiles": 480
+  "sm_100a": {
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":1,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
     },
-    "self_cleaning": true,
-    "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
-    "source_prepared_callback": "one-kernel callable (no host reset)",
-    "args": {
-     "num_experts": 384,
-     "top_k": 6,
-     "num_tokens": 1,
-     "hidden": 5120,
-     "intermediate": 2304,
-     "routed_weight_dtype": "fp4",
-     "activation_clamp": 10.0
-    }
-   },
-   "stages": [
-    {
-     "name": "pipeline",
-     "program": "deepgemm_mega_moe_v3_pipeline_fp4_t1"
-    }
-   ]
-  },
-  "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":16,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
-   "num_sms": {
-    "sm_100a": 148,
-    "sm_103a": 152
-   },
-   "grid": {
-    "sm_100a": [
-     148,
-     1,
-     1
-    ],
-    "sm_103a": [
-     152,
-     1,
-     1
-    ]
-   },
-   "metadata": {
-    "surface": "pipeline",
-    "extent": {
-     "grid_derivation": "original distinct top-k lower bound saturates the SM count",
-     "minimum_tiles": 480
-    },
-    "self_cleaning": true,
-    "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
-    "source_prepared_callback": "one-kernel callable (no host reset)",
-    "args": {
-     "num_experts": 384,
-     "top_k": 6,
-     "num_tokens": 16,
-     "hidden": 5120,
-     "intermediate": 2304,
-     "routed_weight_dtype": "fp4",
-     "activation_clamp": 10.0
-    }
-   },
-   "stages": [
-    {
-     "name": "pipeline",
-     "program": {
-      "sm_100a": "deepgemm_mega_moe_v3_pipeline_fp4_t16_sm100a",
-      "sm_103a": "deepgemm_mega_moe_v3_pipeline_fp4_t16_sm103a"
-     }
-    }
-   ]
-  },
-  "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":128,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
-   "num_sms": {
-    "sm_100a": 148,
-    "sm_103a": 152
-   },
-   "grid": {
-    "sm_100a": [
-     148,
-     1,
-     1
-    ],
-    "sm_103a": [
-     152,
-     1,
-     1
-    ]
-   },
-   "metadata": {
-    "surface": "pipeline",
-    "extent": {
-     "grid_derivation": "original distinct top-k lower bound saturates the SM count",
-     "minimum_tiles": 480
-    },
-    "self_cleaning": true,
-    "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
-    "source_prepared_callback": "one-kernel callable (no host reset)",
-    "args": {
-     "num_experts": 384,
-     "top_k": 6,
-     "num_tokens": 128,
-     "hidden": 5120,
-     "intermediate": 2304,
-     "routed_weight_dtype": "fp4",
-     "activation_clamp": 10.0
-    }
-   },
-   "stages": [
-    {
-     "name": "pipeline",
-     "program": {
-      "sm_100a": "deepgemm_mega_moe_v3_pipeline_fp4_t128_sm100a",
-      "sm_103a": "deepgemm_mega_moe_v3_pipeline_fp4_t128_sm103a"
-     }
-    }
-   ]
-  },
-  "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":512,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
-   "num_sms": {
-    "sm_100a": 148,
-    "sm_103a": 152
-   },
-   "grid": {
-    "sm_100a": [
-     148,
-     1,
-     1
-    ],
-    "sm_103a": [
-     152,
-     1,
-     1
-    ]
-   },
-   "metadata": {
-    "surface": "pipeline",
-    "extent": {
-     "grid_derivation": "original distinct top-k lower bound saturates the SM count",
-     "minimum_tiles": 480
-    },
-    "self_cleaning": true,
-    "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
-    "source_prepared_callback": "one-kernel callable (no host reset)",
-    "args": {
-     "num_experts": 384,
-     "top_k": 6,
-     "num_tokens": 512,
-     "hidden": 5120,
-     "intermediate": 2304,
-     "routed_weight_dtype": "fp4",
-     "activation_clamp": 10.0
-    }
-   },
-   "stages": [
-    {
-     "name": "pipeline",
-     "program": "deepgemm_mega_moe_v3_pipeline_fp4_t512"
-    }
-   ]
-  },
-  "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":16,\"routed_weight_dtype\":\"fp8\",\"top_k\":6}]": {
-   "num_sms": {
-    "sm_100a": 148,
-    "sm_103a": 152
-   },
-   "grid": {
-    "sm_100a": [
-     148,
-     1,
-     1
-    ],
-    "sm_103a": [
-     152,
-     1,
-     1
-    ]
-   },
-   "metadata": {
-    "surface": "pipeline",
-    "extent": {
-     "grid_derivation": "original distinct top-k lower bound saturates the SM count",
-     "minimum_tiles": 480
-    },
-    "self_cleaning": true,
-    "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
-    "source_prepared_callback": "one-kernel callable (no host reset)",
-    "args": {
-     "num_experts": 384,
-     "top_k": 6,
-     "num_tokens": 16,
-     "hidden": 5120,
-     "intermediate": 2304,
-     "routed_weight_dtype": "fp8",
-     "activation_clamp": 10.0
-    }
-   },
-   "stages": [
-    {
-     "name": "pipeline",
-     "program": "deepgemm_mega_moe_v3_pipeline_fp8_t16"
-    }
-   ]
-  },
-  "[\"grouped_fused\",{\"hidden\":7168,\"intermediate\":3072,\"num_experts\":4,\"per_expert_M\":[1024,1024,1024,1024]}]": {
-   "num_sms": {
-    "sm_100a": 148,
-    "sm_103a": 152
-   },
-   "grid": {
-    "sm_100a": [
-     148,
-     1,
-     1
-    ],
-    "sm_103a": [
-     152,
-     1,
-     1
-    ]
-   },
-   "metadata": {
-    "surface": "grouped_fused",
-    "M_total": 4096,
-    "total_m_tiles": 32,
-    "self_cleaning": false,
-    "reset_scope": "l1_arrival.zero_ then main",
-    "required_repack_each_invocation": false,
-    "args": {
-     "benchmark": true,
-     "hidden": 7168,
-     "intermediate": 3072,
-     "num_experts": 4,
-     "per_expert_M": [
-      1024,
-      1024,
-      1024,
-      1024
-     ]
-    }
-   },
-   "stages": [
-    {
-     "name": "main",
-     "program": "deepgemm_mega_moe_v3_grouped_fused"
-    }
-   ]
-  },
-  "[\"grouped_l2\",{\"hidden\":7168,\"intermediate\":3072,\"num_experts\":4,\"per_expert_M\":[1024,1024,1024,1024]}]": {
-   "num_sms": {
-    "sm_100a": 148,
-    "sm_103a": 152
-   },
-   "grid": {
-    "sm_100a": [
-     148,
-     1,
-     1
-    ],
-    "sm_103a": [
-     152,
-     1,
-     1
-    ]
-   },
-   "metadata": {
-    "surface": "grouped_l2",
-    "M_total": 4096,
-    "total_m_tiles": 32,
-    "self_cleaning": false,
-    "reset_scope": "no reset",
-    "required_repack_each_invocation": true,
-    "args": {
-     "benchmark": true,
-     "hidden": 7168,
-     "intermediate": 3072,
-     "num_experts": 4,
-     "per_expert_M": [
-      1024,
-      1024,
-      1024,
-      1024
-     ]
-    }
-   },
-   "stages": [
-    {
-     "name": "scale_layout",
-     "program": "deepgemm_mega_moe_v3_grouped_l2_scale_layout"
-    },
-    {
-     "name": "main",
-     "program": "deepgemm_mega_moe_v3_grouped_l2"
-    }
-   ]
-  },
-  "[\"grouped_l1\",{\"K\":512,\"N\":256,\"num_experts\":4,\"per_expert_M\":[256,256,256,256]}]": {
-   "num_sms": {
-    "sm_100a": 148,
-    "sm_103a": 152
-   },
-   "grid": {
-    "sm_100a": [
-     16,
-     1,
-     1
-    ],
-    "sm_103a": [
-     16,
-     1,
-     1
-    ]
-   },
-   "metadata": {
-    "surface": "grouped_l1",
-    "M_total": 1024,
-    "total_m_tiles": 8,
-    "self_cleaning": false,
-    "reset_scope": "no reset",
-    "required_repack_each_invocation": false,
-    "args": {
-     "num_experts": 4,
-     "per_expert_M": [
-      256,
-      256,
-      256,
-      256
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
      ],
-     "N": 256,
-     "K": 512,
-     "benchmark": false
-    }
-   },
-   "stages": [
-    {
-     "name": "main",
-     "program": "deepgemm_mega_moe_v3_grouped_l1"
-    }
-   ]
-  },
-  "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":1024,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
-   "num_sms": {
-    "sm_100a": 148,
-    "sm_103a": 152
-   },
-   "grid": {
-    "sm_100a": [
-     148,
-     1,
-     1
-    ],
-    "sm_103a": [
-     152,
-     1,
-     1
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "self_cleaning": true,
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 1,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_t1"
+     }
     ]
    },
-   "metadata": {
-    "args": {
-     "activation_clamp": 10.0,
-     "hidden": 5120,
-     "intermediate": 2304,
-     "num_experts": 384,
-     "num_tokens": 1024,
-     "routed_weight_dtype": "fp4",
-     "top_k": 6
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":16,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
     },
-    "extent": {
-     "grid_derivation": "original distinct top-k lower bound saturates the SM count",
-     "minimum_tiles": 480
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
     },
-    "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
-    "self_cleaning": true,
-    "source_prepared_callback": "one-kernel callable (no host reset)",
-    "surface": "pipeline"
-   },
-   "stages": [
-    {
-     "name": "pipeline",
-     "program": "deepgemm_mega_moe_v3_pipeline_fp4_t1024"
-    }
-   ]
-  },
-  "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":4096,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
-   "num_sms": {
-    "sm_100a": 148,
-    "sm_103a": 152
-   },
-   "grid": {
-    "sm_100a": [
-     148,
-     1,
-     1
-    ],
-    "sm_103a": [
-     152,
-     1,
-     1
+    "metadata": {
+     "surface": "pipeline",
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "self_cleaning": true,
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 16,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": {
+       "sm_100a": "deepgemm_mega_moe_v3_pipeline_fp4_t16_sm100a",
+       "sm_103a": "deepgemm_mega_moe_v3_pipeline_fp4_t16_sm103a"
+      }
+     }
     ]
    },
-   "metadata": {
-    "args": {
-     "activation_clamp": 10.0,
-     "hidden": 5120,
-     "intermediate": 2304,
-     "num_experts": 384,
-     "num_tokens": 4096,
-     "routed_weight_dtype": "fp4",
-     "top_k": 6
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":128,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
     },
-    "extent": {
-     "grid_derivation": "original distinct top-k lower bound saturates the SM count",
-     "minimum_tiles": 480
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
     },
-    "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
-    "self_cleaning": true,
-    "source_prepared_callback": "one-kernel callable (no host reset)",
-    "surface": "pipeline"
+    "metadata": {
+     "surface": "pipeline",
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "self_cleaning": true,
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 128,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": {
+       "sm_100a": "deepgemm_mega_moe_v3_pipeline_fp4_t128_sm100a",
+       "sm_103a": "deepgemm_mega_moe_v3_pipeline_fp4_t128_sm103a"
+      }
+     }
+    ]
    },
-   "stages": [
-    {
-     "name": "pipeline",
-     "program": "deepgemm_mega_moe_v3_pipeline_fp4_t4096"
-    }
-   ]
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":512,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "self_cleaning": true,
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 512,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_t512"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":16,\"routed_weight_dtype\":\"fp8\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "self_cleaning": true,
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 16,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp8",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp8_t16"
+     }
+    ]
+   },
+   "[\"grouped_fused\",{\"hidden\":7168,\"intermediate\":3072,\"num_experts\":4,\"per_expert_M\":[1024,1024,1024,1024]}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "grouped_fused",
+     "M_total": 4096,
+     "total_m_tiles": 32,
+     "self_cleaning": false,
+     "reset_scope": "l1_arrival.zero_ then main",
+     "required_repack_each_invocation": false,
+     "args": {
+      "benchmark": true,
+      "hidden": 7168,
+      "intermediate": 3072,
+      "num_experts": 4,
+      "per_expert_M": [
+       1024,
+       1024,
+       1024,
+       1024
+      ]
+     }
+    },
+    "stages": [
+     {
+      "name": "main",
+      "program": "deepgemm_mega_moe_v3_grouped_fused"
+     }
+    ]
+   },
+   "[\"grouped_l2\",{\"hidden\":7168,\"intermediate\":3072,\"num_experts\":4,\"per_expert_M\":[1024,1024,1024,1024]}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "grouped_l2",
+     "M_total": 4096,
+     "total_m_tiles": 32,
+     "self_cleaning": false,
+     "reset_scope": "no reset",
+     "required_repack_each_invocation": true,
+     "args": {
+      "benchmark": true,
+      "hidden": 7168,
+      "intermediate": 3072,
+      "num_experts": 4,
+      "per_expert_M": [
+       1024,
+       1024,
+       1024,
+       1024
+      ]
+     }
+    },
+    "stages": [
+     {
+      "name": "scale_layout",
+      "program": "deepgemm_mega_moe_v3_grouped_l2_scale_layout"
+     },
+     {
+      "name": "main",
+      "program": "deepgemm_mega_moe_v3_grouped_l2"
+     }
+    ]
+   },
+   "[\"grouped_l1\",{\"K\":512,\"N\":256,\"num_experts\":4,\"per_expert_M\":[256,256,256,256]}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      16,
+      1,
+      1
+     ],
+     "sm_103a": [
+      16,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "grouped_l1",
+     "M_total": 1024,
+     "total_m_tiles": 8,
+     "self_cleaning": false,
+     "reset_scope": "no reset",
+     "required_repack_each_invocation": false,
+     "args": {
+      "num_experts": 4,
+      "per_expert_M": [
+       256,
+       256,
+       256,
+       256
+      ],
+      "N": 256,
+      "K": 512,
+      "benchmark": false
+     }
+    },
+    "stages": [
+     {
+      "name": "main",
+      "program": "deepgemm_mega_moe_v3_grouped_l1"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":1024,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "args": {
+      "activation_clamp": 10.0,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "num_experts": 384,
+      "num_tokens": 1024,
+      "routed_weight_dtype": "fp4",
+      "top_k": 6
+     },
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "self_cleaning": true,
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "surface": "pipeline"
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_t1024"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":4096,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "args": {
+      "activation_clamp": 10.0,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "num_experts": 384,
+      "num_tokens": 4096,
+      "routed_weight_dtype": "fp4",
+      "top_k": 6
+     },
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "self_cleaning": true,
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "surface": "pipeline"
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_t4096"
+     }
+    ]
+   }
+  },
+  "sm_103a": {
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":1,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "self_cleaning": true,
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 1,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_t1"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":16,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "self_cleaning": true,
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 16,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": {
+       "sm_100a": "deepgemm_mega_moe_v3_pipeline_fp4_t16_sm100a",
+       "sm_103a": "deepgemm_mega_moe_v3_pipeline_fp4_t16_sm103a"
+      }
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":128,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "self_cleaning": true,
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 128,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": {
+       "sm_100a": "deepgemm_mega_moe_v3_pipeline_fp4_t128_sm100a",
+       "sm_103a": "deepgemm_mega_moe_v3_pipeline_fp4_t128_sm103a"
+      }
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":512,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "self_cleaning": true,
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 512,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_t512"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":16,\"routed_weight_dtype\":\"fp8\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "self_cleaning": true,
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 16,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp8",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp8_t16"
+     }
+    ]
+   },
+   "[\"grouped_fused\",{\"hidden\":7168,\"intermediate\":3072,\"num_experts\":4,\"per_expert_M\":[1024,1024,1024,1024]}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "grouped_fused",
+     "M_total": 4096,
+     "total_m_tiles": 32,
+     "self_cleaning": false,
+     "reset_scope": "l1_arrival.zero_ then main",
+     "required_repack_each_invocation": false,
+     "args": {
+      "benchmark": true,
+      "hidden": 7168,
+      "intermediate": 3072,
+      "num_experts": 4,
+      "per_expert_M": [
+       1024,
+       1024,
+       1024,
+       1024
+      ]
+     }
+    },
+    "stages": [
+     {
+      "name": "main",
+      "program": "deepgemm_mega_moe_v3_grouped_fused"
+     }
+    ]
+   },
+   "[\"grouped_l2\",{\"hidden\":7168,\"intermediate\":3072,\"num_experts\":4,\"per_expert_M\":[1024,1024,1024,1024]}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "grouped_l2",
+     "M_total": 4096,
+     "total_m_tiles": 32,
+     "self_cleaning": false,
+     "reset_scope": "no reset",
+     "required_repack_each_invocation": true,
+     "args": {
+      "benchmark": true,
+      "hidden": 7168,
+      "intermediate": 3072,
+      "num_experts": 4,
+      "per_expert_M": [
+       1024,
+       1024,
+       1024,
+       1024
+      ]
+     }
+    },
+    "stages": [
+     {
+      "name": "scale_layout",
+      "program": "deepgemm_mega_moe_v3_grouped_l2_scale_layout"
+     },
+     {
+      "name": "main",
+      "program": "deepgemm_mega_moe_v3_grouped_l2"
+     }
+    ]
+   },
+   "[\"grouped_l1\",{\"K\":512,\"N\":256,\"num_experts\":4,\"per_expert_M\":[256,256,256,256]}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      16,
+      1,
+      1
+     ],
+     "sm_103a": [
+      16,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "grouped_l1",
+     "M_total": 1024,
+     "total_m_tiles": 8,
+     "self_cleaning": false,
+     "reset_scope": "no reset",
+     "required_repack_each_invocation": false,
+     "args": {
+      "num_experts": 4,
+      "per_expert_M": [
+       256,
+       256,
+       256,
+       256
+      ],
+      "N": 256,
+      "K": 512,
+      "benchmark": false
+     }
+    },
+    "stages": [
+     {
+      "name": "main",
+      "program": "deepgemm_mega_moe_v3_grouped_l1"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":1024,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "args": {
+      "activation_clamp": 10.0,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "num_experts": 384,
+      "num_tokens": 1024,
+      "routed_weight_dtype": "fp4",
+      "top_k": 6
+     },
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "self_cleaning": true,
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "surface": "pipeline"
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_t1024"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":4096,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "args": {
+      "activation_clamp": 10.0,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "num_experts": 384,
+      "num_tokens": 4096,
+      "routed_weight_dtype": "fp4",
+      "top_k": 6
+     },
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "self_cleaning": true,
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "surface": "pipeline"
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_t4096"
+     }
+    ]
+   }
   }
  }
 }
