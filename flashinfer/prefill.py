@@ -9358,6 +9358,46 @@ def nvfp4_attention_workspace_bytes(batch, heads, seqlen, device):
     return workspace_bytes(batch, heads, seqlen, device)
 
 
+@flashinfer_experimental_api
+def prepare_fp8_attention(
+    q, k, v, out, *, backend="cake", softmax_scale=None, workspace=None
+):
+    """Prepare FP8 attention from BF16 logical ``[B, H, S, 128]`` tensors.
+
+    The experimental Cake backend runs on SM90 GPUs: dense, noncausal,
+    ``D = 128``, equal query and key heads, any ``S``.  ``q``, ``k``, ``v`` and
+    ``out`` may have any strides (an ``[B, S, H, 128]`` buffer is passed as its
+    ``[B, H, S, 128]`` view and read or written in place).  ``softmax_scale``
+    defaults to ``128 ** -0.5``; ``workspace`` is a caller-owned ``uint8`` tensor
+    of at least :func:`fp8_attention_workspace_bytes` bytes, else one is
+    allocated here.  Returns a runner whose ``launch()`` (or call) quantizes the
+    inputs (INT8 Q and K, E4M3 V) and runs the attention chain on the current
+    stream, writing the caller-owned BF16 output without CUDA allocation; input
+    values are free between launches, identities and strides are bound.  CUDA
+    Graph ownership remains with the caller.
+    """
+    if backend != "cake":
+        raise ValueError("FP8 attention currently supports backend='cake'")
+    from .experimental.cake_fp8_attention.cake_backend import (
+        prepare_fp8_attention as prepare,
+    )
+
+    return prepare(
+        q, k, v, out, backend="cake", softmax_scale=softmax_scale, workspace=workspace
+    )
+
+
+@flashinfer_experimental_api
+def fp8_attention_workspace_bytes(batch, heads, seqlen, device):
+    """Bytes of the ``uint8`` workspace :func:`prepare_fp8_attention` needs for
+    ``[batch, heads, seqlen, 128]`` tensors on ``device`` (the Cake backend)."""
+    from .experimental.cake_fp8_attention.cake_backend import (
+        fp8_attention_workspace_bytes as workspace_bytes,
+    )
+
+    return workspace_bytes(batch, heads, seqlen, device)
+
+
 @flashinfer_experimental_api(feature="MiniMax-H3 packed-varlen BF16 attention")
 def minimax_h3_varlen_attention(
     query: torch.Tensor,
