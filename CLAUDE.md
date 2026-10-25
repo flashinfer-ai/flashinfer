@@ -282,6 +282,10 @@ storage row stride and pointer. Include a backend-only provider control in
 capacity-lifetime tests, since FROST can accept an oversized descriptor that the
 backend rejects. Table capacity must cover initialized
 indices and rounded graph bounds; also test a fallback beyond cuDNN admission.
+An explicit KV maximum may be looser than the caller table's capacity. Intersect
+these two upper bounds when declaring the graph, using the same effective bound
+for the attention attribute and table slice; actual device lengths still mask
+the live tokens, without a host readback.
 Replay an old capture only with lengths inside its declared bounds and compatible
 buffers. Keep numerical and lifetime tests independent of heuristic winners and
 timing thresholds.

@@ -133,6 +133,99 @@ def _reference(q, k, v, qo, ip, ix, last, *, causal, scale, sinks=None):
 
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
+@pytest.mark.parametrize("mode", ["wrapper", "direct_tokens", "direct_elements"])
+@pytest.mark.parametrize("padded_stride", [False, True])
+def test_paged_prefill_accepts_loose_kv_bound(mode, padded_stride):
+    q, k, v, qo, ip, ix, last = _paged_inputs()
+    workspace = torch.empty(128 << 20, device=q.device, dtype=torch.uint8)
+    # Actual lengths 33/17 fit three pages even when the caller advertises 128.
+    # Preserve a nonzero offset and a larger physical row stride as well.
+    backing = torch.full(
+        (2, 8 if padded_stride else 3), -777, device=q.device, dtype=torch.int32
+    )
+    table = backing[:, 2:5] if padded_stride else backing
+    table.copy_(torch.tensor([[3, 0, 4], [2, 1, 0]], device=q.device))
+    out = torch.empty_like(q)
+    lse = torch.empty(q.shape[:2], device=q.device, dtype=torch.float32)
+    lengths = ((ip[1:] - ip[:-1] - 1) * 16 + last).to(q.device)
+    prefix = qo.to(q.device)
+    scale = 128**-0.5
+    if mode == "wrapper":
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            workspace, "NHD", backend="cudnn"
+        )
+        wrapper.plan(
+            qo,
+            ip,
+            ix,
+            last,
+            8,
+            2,
+            128,
+            16,
+            causal=True,
+            q_data_type=q.dtype,
+            max_sequence_kv=128,
+            seq_lens=lengths,
+            block_tables=table,
+        )
+
+        def run():
+            wrapper.run(q, (k, v), out=out, lse=lse, return_lse=True, lse_base="ln")
+    else:
+        tokens = mode == "direct_tokens"
+        offsets = prefix if tokens else prefix * q.stride(0)
+        stats_offsets = prefix if tokens else prefix * q.shape[1]
+        query_lengths = (prefix[1:] - prefix[:-1]).view(-1, 1, 1, 1)
+
+        def run():
+            prefill.cudnn_batch_prefill_with_kv_cache(
+                q,
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                scale,
+                workspace,
+                max_token_per_sequence=3,
+                max_sequence_kv=128,
+                actual_seq_lens_q=query_lengths,
+                actual_seq_lens_kv=lengths.view(-1, 1, 1, 1),
+                block_tables=table,
+                causal=True,
+                return_lse=True,
+                batch_offsets_q=offsets,
+                batch_offsets_o=offsets,
+                batch_offsets_stats=stats_offsets,
+                batch_offsets_units="tokens" if tokens else "elements",
+                out=out,
+                lse=lse,
+                lse_base="ln",
+            )
+
+    def check():
+        expected, stats = _reference(
+            q, k, v, qo, ip, ix, last, causal=True, scale=scale
+        )
+        torch.testing.assert_close(out.float(), expected, atol=0.015, rtol=0.015)
+        torch.testing.assert_close(lse, stats, atol=0.001, rtol=0.001)
+
+    run()
+    check()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            run()
+        q.neg_()
+        v.mul_(0.5)
+        out.fill_(float("nan"))
+        lse.fill_(float("nan"))
+        graph.replay()
+        check()
+    finally:
+        graph.reset()
+
+
+@pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
 @pytest.mark.parametrize("paged", [False, True])
 @pytest.mark.parametrize("return_lse", [False, True])
 @pytest.mark.parametrize("unit_scales", [False, True])
