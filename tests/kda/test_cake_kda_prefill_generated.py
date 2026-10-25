@@ -18,7 +18,7 @@ serving shapes (FP32 in-place state pool, reversed int32 state indices, a
 strided BF16 beta-logit slice, checkpoint rows every 64 tokens) with the routes
 in place and with the routes cleared, each against an FP32 token-by-token
 reference, and a launch with work bins bit for bit against the one-task-per-CTA
-program; replay the routed launch from a CUDA graph; and rebind it through a
+program and against the selection without work bins; replay the routed launch from a CUDA graph; and rebind it through a
 plan-cache hit.
 
 A program that takes tensor maps encodes them once per preparation into a host
@@ -35,6 +35,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import flashinfer.cake_kda_tf32_runtime as runtime
 import flashinfer.jit.cake_kda_tf32 as registry
 from flashinfer import (
     KDAPrefillPlanCache,
@@ -764,6 +765,15 @@ def test_serving_rows_match_the_fp32_reference(
             one_task_per_cta = _Call(d, lower_bound)
             assert not _modules(one_task_per_cta.prepared) & work_bin_programs
             _assert_bitwise(one_task_per_cta.run(), routed_result, "one task per CTA")
+        # Nor does the selection without work bins (where it takes the H12
+        # early-pack body, the binned launch takes the binned N32 body).
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                runtime, "_use_direct_work_bins", lambda *args, **kwargs: False
+            )
+            unbinned = _Call(d, lower_bound)
+            assert not _modules(unbinned.prepared) & work_bin_programs
+            _assert_bitwise(unbinned.run(), routed_result, "selection without bins")
 
     # The prepared path takes int64 sequence offsets (callers cast int32
     # offsets first); the routes leave that contract as it is.

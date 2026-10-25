@@ -2423,9 +2423,21 @@ class FlashKDABlackwellBF16FusedLaunch:
             and (state_indices is not None)
             and (max_seq_len <= H12_DIRECT_N32_MAX_SEQ_LEN)
         )
+        # Work bins where a bin runs tasks back to back.
+        route_work_bins = (
+            route == BF16_ROUTE_DIRECT_M128
+            and (not use_tf32_direct_m128)
+            and _use_direct_work_bins(
+                tuple(offsets[index + 1] - offsets[index] for index in range(num_seqs)),
+                num_heads=num_heads,
+                sm_count=sm_count,
+                chunk_tokens=BF16_M128_CHUNK,
+            )
+        )
         # The bounded N32 body without the early state pack is faster on the
         # short H12 grids and bitwise identical to the early-pack body, so the
-        # prepared path keeps it for every length.
+        # prepared path keeps it for every length; it also has the work-binned
+        # builds the early-pack body lacks.
         use_early_n32_state_pack = False
         use_n32_register_inverse = _should_use_n32_register_inverse(
             direct_n16=use_direct_m128_n16,
@@ -2796,16 +2808,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 partial(
                     _factory,
                     "compiled_bf16_fused_m128",
-                    route_work_bins=route == BF16_ROUTE_DIRECT_M128
-                    and _use_direct_work_bins(
-                        tuple(
-                            offsets[index + 1] - offsets[index]
-                            for index in range(num_seqs)
-                        ),
-                        num_heads=num_heads,
-                        sm_count=sm_count,
-                        chunk_tokens=BF16_M128_CHUNK,
-                    ),
+                    route_work_bins=route_work_bins,
                 ),
                 BF16_N16_M128_CHUNK if use_direct_m128_n16 else BF16_M128_CHUNK,
                 serving_native_abi=serving_native_abi,

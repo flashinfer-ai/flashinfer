@@ -295,6 +295,29 @@ UNBOUNDED_ROWS = (
             0,
             ("fused_direct_m128", "cake_kda_bf16_5be344cbddc29563f1ee"),
         ),
+        # H12 short rows with checkpoint rows: the bounded N32 body without the
+        # early state pack, one task per CTA where every task has an SM of its own
+        # and work-binned where a bin runs tasks back to back
+        (
+            (10, 0),
+            4,
+            12,
+            128,
+            -5.0,
+            True,
+            64,
+            ("fused_checkpoint_direct_m128_n32", "cake_kda_bf16_5be344cbddc29563f1ee"),
+        ),
+        (
+            (10, 0),
+            16,
+            12,
+            128,
+            -5.0,
+            True,
+            64,
+            ("fused_checkpoint_direct_m128_n32", "cake_kda_bf16_5be344cbddc29563f1ee"),
+        ),
         # unchanged selections
         ((10, 3), 8, 32, 1024, -5.0, True, 0, PREDICTION_FIRST),
         (
