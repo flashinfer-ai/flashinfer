@@ -952,6 +952,34 @@ def test_e4m3_rejects_wrong_operands() -> None:
         )
 
 
+def test_nvfp4_rejects_a_misaligned_scale_tile() -> None:
+    """The norm stage zeroes the padding rows of ``out_sf`` in 8-byte words."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("requires SM100a or SM103a")
+    device = torch.device("cuda")
+    M, P = 1, 8
+    values = _make_numerical_values(M, P, device)
+    size = values["out_sf"].numel()
+    storage = torch.zeros(size + 8, dtype=torch.uint8, device=device)
+    misaligned = storage[4 : 4 + size].view(values["out_sf"].shape)
+    common = {
+        "activation_q": torch.empty(
+            (M, _HIDDEN // 2), dtype=torch.uint8, device=device
+        ),
+        "activation_sf": torch.empty(
+            (_round_up(M, 128) * (_HIDDEN // _FP4_BLOCK),),
+            dtype=torch.uint8,
+            device=device,
+        ),
+        "P": P,
+    }
+    with pytest.raises(ValueError, match="out_sf must be 8-byte aligned"):
+        MiniMaxH3Nvfp4PreAttention(**{**values, "out_sf": misaligned}, **common)
+
+
 @pytest.mark.parametrize(
     ("M", "P", "qkv_scales"),
     [
