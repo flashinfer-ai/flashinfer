@@ -889,14 +889,18 @@ class _CorrectionMergeUnavailable(Exception):
     """The chain's correction module has no merging build on this device."""
 
 
-def _correction_merge_factory(name, *args, route_heads=None, **kwargs):
+def _correction_merge_factory(
+    name, *args, route_heads=None, route_work_bins=False, **kwargs
+):
     """The merging build of the factory row's correction module.
 
     ``_factory`` resolves the row to its shipped module and that module
     through the routes; this takes the module's ``_RENDERED_MERGE_ROUTES``
-    build instead (same argument plan, the merge on top).
+    build instead (same argument plan, the merge on top).  The routing
+    keywords are not part of the row's key, and a merging build has no
+    work bins.
     """
-    del route_heads
+    del route_heads, route_work_bins
     arch = detect_gpu_arch()
     rows = _kda_registry.FACTORIES.get(arch, {}).get(name, {})
     module = rows.get(_kda_registry._key(args, kwargs))
@@ -1510,6 +1514,16 @@ def _make_direct_work_bins(
     for tasks in bins:
         table.extend(tasks)
     return tuple(table), num_bins
+
+
+def _use_direct_work_bins(total_tasks: int, sm_count: int) -> bool:
+    """Whether a direct M128 launch asks for its program built with work bins.
+
+    Bins pay where one CTA per (sequence, head) task needs more than one wave:
+    with more tasks than SMs, one bin per SM runs its tasks back to back. A
+    launch with at most one task per SM keeps the one-task-per-CTA program.
+    """
+    return total_tasks > sm_count
 
 
 def _constrained_direct_m128_route(
@@ -2759,7 +2773,12 @@ class FlashKDABlackwellBF16FusedLaunch:
                     "checkpoint accumulation requires FP32 checkpoint rows"
                 )
             self.module = self._build_body(
-                partial(_factory, "compiled_bf16_fused_m128"),
+                partial(
+                    _factory,
+                    "compiled_bf16_fused_m128",
+                    route_work_bins=route == BF16_ROUTE_DIRECT_M128
+                    and _use_direct_work_bins(total_tasks, sm_count),
+                ),
                 BF16_N16_M128_CHUNK if use_direct_m128_n16 else BF16_M128_CHUNK,
                 serving_native_abi=serving_native_abi,
                 gate_kind=gate_kind,

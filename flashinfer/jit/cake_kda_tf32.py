@@ -8,7 +8,8 @@ binding of every shipped module is rendered from ``cake_kda_prefill_binding``
 into the generated-source directory when its JIT spec is created; a generated
 program (``_RENDERED_MODULES``) ships its own binding, and ``_RENDERED_ROUTES``
 points the factory rows of the modules it replaces at it (``_RENDERED_HEAD_ROUTES``
-per head count where a program's build depends on it).
+per head count where a program's build depends on it, ``_RENDERED_WORK_BIN_ROUTES``
+for launches that ask for a program built with work bins).
 """
 
 from functools import cache
@@ -3415,6 +3416,13 @@ _RENDERED_HEAD_ROUTES = {
 # epilogue; every other launch of the module keeps the routed program.
 _RENDERED_MERGE_ROUTES = {"sm_100a": {}, "sm_103a": {}}
 
+# architecture -> shipped module -> generated program built with work bins: each
+# CTA runs one bin of (sequence, head) tasks back to back (``PreparedKernel``
+# reads a program this table names as one). ``_factory`` prefers this table when
+# the call asks for work bins (a launch with more tasks than SMs); other launches
+# keep the ``_RENDERED_ROUTES`` program.
+_RENDERED_WORK_BIN_ROUTES = {"sm_100a": {}, "sm_103a": {}}
+
 MODULES = {
     **{name: _module_record(name, *row) for name, row in _MODULE_ROWS.items()},
     **_RENDERED_MODULES,
@@ -4490,7 +4498,10 @@ class PreparedKernel:
         self.name = name
         self.arch = arch
         self.schedule = None
-        self.work_bins = bool(record.get("work_bins", False))
+        # A program the work-bin routes name is built with work bins.
+        self.work_bins = bool(record.get("work_bins", False)) or (
+            name in _RENDERED_WORK_BIN_ROUTES.get(arch, {}).values()
+        )
         native = load(name, arch)
         entry = record["ffi_entry"]
         workspace_bytes = record.get("tma_workspace_bytes", 0)
@@ -4631,12 +4642,14 @@ def prepare_descriptors(prepared):
             owner._descriptors_stale = False
 
 
-def _factory(name, *args, route_heads=None, **kwargs):
+def _factory(name, *args, route_heads=None, route_work_bins=False, **kwargs):
     """The prepared module of one factory row, through the routes.
 
     ``route_heads`` is the head count of the call: a module the head-count
     routes name at that count resolves to that program, whose launch grid is
-    ``ctas_per_head`` CTAs per (sequence, head).
+    ``ctas_per_head`` CTAs per (sequence, head). ``route_work_bins`` asks for
+    the module's program built with work bins, where the work-bin routes name
+    one (its record sets ``work_bins``).
     """
     arch = device_arch()
     variants = FACTORIES.get(arch, {}).get(name, {})
@@ -4652,4 +4665,8 @@ def _factory(name, *args, route_heads=None, **kwargs):
         kernel = PreparedKernel(program, arch)
         kernel.ctas_per_head = int(ctas_per_head)
         return kernel
+    if route_work_bins:
+        program = _RENDERED_WORK_BIN_ROUTES.get(arch, {}).get(module)
+        if program is not None:
+            return PreparedKernel(program, arch)
     return PreparedKernel(_RENDERED_ROUTES.get(arch, {}).get(module, module), arch)
