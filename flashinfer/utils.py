@@ -197,6 +197,36 @@ def _check_kv_layout(kv_layout: str) -> None:
         raise KeyError("Invalid kv_layout {}".format(kv_layout))
 
 
+def _check_head_dim(head_dim_qk: int, head_dim_vo: int, backend: str) -> None:
+    """Validate the FA2 prefill head-dimension safety requirements."""
+    if head_dim_qk <= 0 or head_dim_vo <= 0:
+        raise ValueError(
+            "head_dim_qk and head_dim_vo must be positive, got "
+            "head_dim_qk={}, head_dim_vo={}.".format(head_dim_qk, head_dim_vo)
+        )
+    if backend != "fa2":  # only FA2 silently corrupts for non-64-multiple head dims
+        return
+    if head_dim_qk % 64 != 0 or head_dim_vo % 64 != 0:
+        raise ValueError(
+            "head_dim_qk and head_dim_vo must be positive multiples of 64, got "
+            "head_dim_qk={}, head_dim_vo={}. The FA2 prefill kernels only "
+            "safely handle head dims divisible by 64; other dims lead to "
+            "out-of-bounds accesses or silently wrong results.".format(
+                head_dim_qk, head_dim_vo
+            )
+        )
+    # KernelTraits tiles the output in chunks of at most 256 dims, and a chunk
+    # must divide head_dim_vo; other sizes fail to compile.
+    if head_dim_vo > 256 and head_dim_vo % 256 != 0:
+        raise ValueError(
+            "head_dim_vo above 256 must be a multiple of 256, got "
+            "head_dim_vo={}. The FA2 prefill kernels split the output into "
+            "tiles of at most 256 dims, which must divide head_dim_vo.".format(
+                head_dim_vo
+            )
+        )
+
+
 def is_float8(x: torch.Tensor) -> bool:
     return x.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
 
