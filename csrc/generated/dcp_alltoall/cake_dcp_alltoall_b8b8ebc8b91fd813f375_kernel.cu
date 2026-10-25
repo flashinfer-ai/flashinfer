@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2026 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -114,7 +114,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ void
-kernel_cake_dcp_alltoall_baedc53532c2be692cbd(__nv_bfloat16* __restrict__ partial_o, float* __restrict__ softmax_stats, __nv_bfloat16* __restrict__ partial_o_out, float* __restrict__ softmax_stats_out, uint8_t* __restrict__ workspace, unsigned long long workspace_stride_in_u64, int cp_rank, int entry_count, int max_channel_count)
+kernel_cake_dcp_alltoall_b8b8ebc8b91fd813f375(__nv_bfloat16* __restrict__ partial_o, float* __restrict__ softmax_stats, __nv_bfloat16* __restrict__ partial_o_out, float* __restrict__ softmax_stats_out, uint8_t* __restrict__ workspace, unsigned long long workspace_stride_in_u64, int cp_rank, int entry_count, int max_channel_count)
 {
     const int tid = threadIdx.y * 32 + threadIdx.x;
     const int warp = threadIdx.y;
@@ -141,9 +141,8 @@ kernel_cake_dcp_alltoall_baedc53532c2be692cbd(__nv_bfloat16* __restrict__ partia
     unsigned long long* packet = reinterpret_cast<unsigned long long*>(smem_raw + 0);
     const int packet_addr = smem + 0;
 
-    // === Task calls (dependency order) ===
-    int _uniform_0 = make_warp_uniform(warp);
-    int group = _uniform_0;
+    // === Task calls (declaration order) ===
+    int group = make_warp_uniform(warp);
     int lane_1 = threadIdx.x;
     int peer = group;
     int channel = blockIdx.y;
@@ -160,12 +159,13 @@ kernel_cake_dcp_alltoall_baedc53532c2be692cbd(__nv_bfloat16* __restrict__ partia
     unsigned long long receiver_info_offset = (unsigned long long)receiver_rank * rank_stride_bytes + fifo_region_bytes + info_plane_bytes + (unsigned long long)sender_rank * (unsigned long long)max_channel_count * 256 + (unsigned long long)channel * 256;
     unsigned int group_smem_addr = packet_addr + (unsigned int)(group * 512);
     int group_word_base = group * 64;
-    unsigned int phase = 0;
     if (elect_sync()) {
         mbarrier_init(ready_addr + (group) * 8, 32);
     }
     __syncwarp();
+    unsigned long long wire[2];
     asm volatile("griddepcontrol.wait;" ::: "memory");
+    unsigned int _phase_ready = 0;
     if (is_sender != 0) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
         long long head = reinterpret_cast<volatile long long*>(workspace + sender_info_offset)[0];
@@ -204,10 +204,10 @@ kernel_cake_dcp_alltoall_baedc53532c2be692cbd(__nv_bfloat16* __restrict__ partia
             asm volatile("cp.async.wait_group 0;");
             unsigned int ready_token = 0;
             while (ready_token == 0) {
-                uint32_t _mbar_token_0 = mbarrier_try_wait_plain(ready_addr + (group) * 8, phase);
+                uint32_t _mbar_token_0 = mbarrier_try_wait_plain(ready_addr + (group) * 8, _phase_ready);
                 ready_token = _mbar_token_0;
             }
-            phase ^= 1;
+            _phase_ready ^= 1;
             int half_lane = lane_1 % 16;
             int half_index = lane_1 / 16;
             int pack_base = half_index * 15;
@@ -247,6 +247,7 @@ kernel_cake_dcp_alltoall_baedc53532c2be692cbd(__nv_bfloat16* __restrict__ partia
         }
     } else {
         long long tail = reinterpret_cast<volatile long long*>(workspace + receiver_info_offset)[1];
+        reinterpret_cast<volatile long long*>(workspace + sender_info_offset)[1] = tail;
         int fifo_entry_block_base_1 = 1024;
         int fifo_index_1 = -1;
         int need_release = 0;
@@ -279,10 +280,10 @@ kernel_cake_dcp_alltoall_baedc53532c2be692cbd(__nv_bfloat16* __restrict__ partia
                 }
                 unsigned int ready_token_1 = 0;
                 while (ready_token_1 == 0) {
-                    uint32_t _mbar_token_1 = mbarrier_try_wait_plain(ready_addr + (group) * 8, phase);
+                    uint32_t _mbar_token_1 = mbarrier_try_wait_plain(ready_addr + (group) * 8, _phase_ready);
                     ready_token_1 = _mbar_token_1;
                 }
-                phase ^= 1;
+                _phase_ready ^= 1;
                 int matched = 0;
                 if (lane_1 < remaining_blocks) {
                     int probe_block = loaded_blocks + lane_1;
@@ -291,53 +292,35 @@ kernel_cake_dcp_alltoall_baedc53532c2be692cbd(__nv_bfloat16* __restrict__ partia
                     matched = probe_flag == (unsigned long long)tail;
                 }
                 __syncwarp();
-                unsigned int _vote_0 = __ballot_sync(0xFFFFFFFF, matched != 0);
-                unsigned int valid_mask = _vote_0;
-                int _ffs_0 = __ffs(~valid_mask);
-                int valid_blocks = _ffs_0 - 1;
+                unsigned int valid_mask = __ballot_sync(0xFFFFFFFF, matched != 0);
+                int _find_first_set_0 = __ffs(~valid_mask);
+                int valid_blocks = _find_first_set_0 - 1;
                 loaded_blocks += valid_blocks;
             }
-            int half_lane_1 = lane_1 % 16;
-            int half_index_1 = lane_1 / 16;
-            int unpack_base = half_index_1 * 15;
-            if (half_lane_1 < 15 && unpack_base + half_lane_1 < 3) {
-                int data_block_1 = unpack_base + half_lane_1;
-                int flag_word_1 = fifo_base_block_1 + data_block_1 & 15;
-                int tail_flag_word_1 = fifo_base_block_1 + 3 + half_index_1 & 15;
-                int tail_data_word_1 = half_lane_1;
-                if (tail_data_word_1 >= tail_flag_word_1) {
-                    tail_data_word_1 += 1;
-                }
-                unsigned long long carried = packet[group_word_base + 48 + tail_data_word_1];
-                packet[group_word_base + data_block_1 * 16 + flag_word_1] = carried;
+            long long data_index_1 = (long long)entry_1 * 4 + (long long)peer;
+            int out_flag_lane = (fifo_entry_block_base_1 & 15) / 2;
+            int lo_word = group_word_base + lane_1 * 2;
+            int hi_word = group_word_base + lane_1 * 2 + 1;
+            if (lane_1 == out_flag_lane) {
+                lo_word = group_word_base + 48;
+            }
+            if (lane_1 == out_flag_lane + 8) {
+                hi_word = group_word_base + 48 + 1;
+            }
+            wire[0] = packet[lo_word];
+            wire[1] = packet[hi_word];
+            if (lane_1 < 16) {
+                reinterpret_cast<int4*>(reinterpret_cast<unsigned long long*>(partial_o_out) + (data_index_1 * 32 + (long long)(lane_1 * 2)))[0] = reinterpret_cast<int4*>(wire)[0];
+            }
+            if (lane_1 == 16) {
+                *(reinterpret_cast<unsigned long long*>(reinterpret_cast<unsigned long long*>(softmax_stats_out)) + (data_index_1)) = wire[0];
             }
             __syncwarp();
-            long long data_index_1 = (long long)entry_1 * 4 + (long long)peer;
-            if (elect_sync()) {
-                {
-                    void* _cpbulk_dst_0 = reinterpret_cast<void*>(partial_o_out + (data_index_1 * 128));
-                    asm volatile(
-                        "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
-                        :: "l"(_cpbulk_dst_0), "r"(group_smem_addr), "r"((uint32_t)(256))
-                        : "memory");
-                }
-                float stats[2];
-                asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&stats[0])), "=r"(*reinterpret_cast<uint32_t*>(&stats[(0) + 1]))
-                    : "r"(group_smem_addr + 256));
-                {
-                    float2 _v2 = make_float2(stats[0 + 0], stats[0 + 1]);
-                    *reinterpret_cast<float2*>(softmax_stats_out + (data_index_1 * 2) + 0) = _v2;
-                }
-            }
-            asm volatile("cp.async.bulk.commit_group;");
-            asm volatile("cp.async.bulk.wait_group.read 0;");
             fifo_entry_block_base_1 += 4;
         }
         if (fifo_entry_block_base_1 > 0) {
             tail += 1;
             reinterpret_cast<volatile long long*>(workspace + receiver_info_offset)[1] = tail;
-            reinterpret_cast<volatile long long*>(workspace + sender_info_offset)[1] = tail;
         }
     }
 }
