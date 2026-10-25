@@ -97,13 +97,15 @@ def single_head_paged_mqa_logits(
             raise ValueError(
                 f"Keys must be [pages, {PAGE}, {DIM}] and queries [rows, {DIM}]"
             )
-        strides = (query.stride(1), key_cache.stride(2), scores.stride(1))
-        strides += (
+        strides = (
+            query.stride(1),
+            key_cache.stride(2),
+            scores.stride(1),
             block_table.stride(1),
             context_lengths.stride(0),
             requests.stride(0),
         )
-        if strides != (1,) * 6:
+        if strides != (1,) * len(strides):
             raise ValueError(
                 "Queries, keys, scores, lengths, requests and the block table "
                 "must have contiguous rows"
