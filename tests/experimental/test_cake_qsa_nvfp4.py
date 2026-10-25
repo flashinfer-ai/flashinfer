@@ -853,8 +853,8 @@ def test_form_rule_takes_the_fused_form_within_the_capacity_and_the_eager_rule(
 ):
     """``select_form``: never above one split or the device's fused capacity. Within
     it, compute capability 9.0 takes the fused form on every host, eager or captured;
-    10.0 / 10.3 / 10.7 take it only on an ``aarch64`` host, at ``rows <= FUSED_MAX_ROWS`` and
-    outside capture (the captured call keeps the split form); 8.x is split alone.
+    10.0 / 10.3 take it only on an ``aarch64`` host, at ``rows <= FUSED_MAX_ROWS`` and
+    outside capture (the captured call keeps the split form); 10.7 and 8.x are split alone.
     GPU-free: the device facts are faked per device index."""
     facts = {
         800: ("sm_80", 108),
@@ -869,7 +869,8 @@ def test_form_rule_takes_the_fused_form_within_the_capacity_and_the_eager_rule(
     cake_backend.fused_capacity.cache_clear()
     reads.cache_clear()
     try:
-        assert cake_backend.FUSED_HOST_RULE_ARCHES == ("sm_100a", "sm_103a", "sm_107a")
+        assert cake_backend.FUSED_HOST_RULE_ARCHES == ("sm_100a", "sm_103a")
+        assert cake_backend.FUSED_SPLIT_ONLY_ARCHES == ("sm_107a",)
         assert cake_backend.FUSED_HOSTS == ("aarch64",)
         assert cake_backend.FUSED_MAX_ROWS == 4
         capacity = [
@@ -899,6 +900,13 @@ def test_form_rule_takes_the_fused_form_within_the_capacity_and_the_eager_rule(
                 assert form(4, 2, sm_count // 8 + 1, index) == "split"
                 assert reads(8, index) is False
                 assert reads(16, index) is False
+            # 10.7: the split form at every row, eager or captured, on both hosts; no
+            # capture-state read.
+            for rows, splits in zip((1, 2, 4, 8), (33, 33, 26, 13), strict=True):
+                assert rows * 2 * splits <= 212
+                assert form(rows, 2, splits, 1070) == "split", (host, rows)
+                assert form(rows, 2, splits, 1070, True) == "split"
+                assert reads(rows, 1070) is False
             # Compute capability 9.0: the fused form within 264 CTAs, whatever the host
             # or the capture state; above it the split form.
             for capturing in (False, True):

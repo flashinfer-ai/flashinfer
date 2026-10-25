@@ -85,8 +85,10 @@ launch bound guarantees (`FUSED_CTAS_PER_SM[arch]` times the SM count: two per
 SM on compute capability 9.0, 264 on an H100; one per SM on 10.0 / 10.3 /
 10.7, 148 on a B200, 152 on a GB300, 212 on an R200 board of 212 SMs). Within
 it, compute capability 9.0 always takes the fused form. Compute capability
-10.0, 10.3 and 10.7 take it under the eager host rule alone: on an `aarch64` host (`FUSED_HOSTS`), at `rows <= 4` (`FUSED_MAX_ROWS`)
-and when the current stream is not capturing. Everywhere else -- compute
+10.0 and 10.3 take it under the eager host rule alone: on an `aarch64` host (`FUSED_HOSTS`), at `rows <= 4` (`FUSED_MAX_ROWS`)
+and when the current stream is not capturing. Compute capability 10.7 keeps
+the split form on every host (`FUSED_SPLIT_ONLY_ARCHES`): on an R200 system the
+split route's eager whole call is the shorter one at every row. Everywhere else -- compute
 capability 8.x, an x86 host, rows above 4, a capturing stream, a call on a
 device other than the current one -- the *split* form: the plain decode, then
 the separate merge (`(rows, ceil(num_qo_heads / heads_per_cta))` CTAs, one
@@ -185,8 +187,8 @@ environment-stream context.
 - `decode_tcgen05_coop` (cooperative build, `sm_100a` / `sm_103a` /
   `sm_107a`): the tcgen05 decode launched cooperatively, its softmax warps running the same
   counter and slice merge as `decode_coop`; one CTA per SM. The host selects
-  it under the form rule's eager rule alone (an `aarch64` host, `rows <= 4`,
-  no capture); every other 10.0 / 10.3 / 10.7 call takes `decode_tcgen05`.
+  it under the form rule's eager rule alone (10.0 / 10.3 on an `aarch64` host, `rows <= 4`,
+  no capture; never on 10.7); every other 10.0 / 10.3 / 10.7 call takes `decode_tcgen05`.
 - `merge`: `out[row, head] = bf16(bf16(merged) * sigmoid(gate))` where
   `merged` is the LSE-weighted mean of the splits' partials; split-parallel
   over four warps above four splits, one warp per head at or below. On

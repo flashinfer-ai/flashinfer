@@ -45,18 +45,20 @@ the co-residency the decode's launch bound guarantees on the device
 (:func:`fused_capacity`: ``FUSED_CTAS_PER_SM[arch]`` times the SM count, 264
 on an H100, 148 on a B200, 152 on a GB300; a cooperative launch above the
 device's co-residency is refused by the driver).  Within it, compute
-capability 9.0 always takes the fused form.  Compute capability 10.0, 10.3
-and 10.7 take it under the eager host rule alone: on a host of ``FUSED_HOSTS``
-(``aarch64``: the Grace host of a GB200 / GB300 or an R200 system's, whose
-eager path leaves a
+capability 9.0 always takes the fused form.  Compute capability 10.0 and
+10.3 take it under the eager host rule alone: on a host of ``FUSED_HOSTS``
+(``aarch64``: the Grace host of a GB200 / GB300, whose eager path leaves a
 gap of several microseconds between the decode launch and the merge launch
 that costs more than the fused form's in-kernel merge tail), at ``rows <=
 FUSED_MAX_ROWS`` (4) and when the current stream is not capturing: a captured
 call is replayed without that gap, so it keeps the *split* form, whose GPU
-time is the shorter one.  Everywhere else -- compute capability 8.x, an x86
-host, rows above 4, a capturing stream, a call on a device other than the
-current one (its capture state is unreadable) -- the *split* form: the plain
-decode, then the separate merge.  The package's graph tests compare an eager
+time is the shorter one.  Compute capability 10.7 keeps the split form on
+every host: on an R200 system the split route's eager whole call is the
+shorter one at every row (measured at rows 1 to 16), so the rule does not
+apply there.  Everywhere else -- compute capability 8.x, an x86 host, rows
+above 4, a capturing stream, a call on a device other than the current one
+(its capture state is unreadable) -- the *split* form: the plain decode, then
+the separate merge.  The package's graph tests compare an eager
 call with its captured replay bit for bit, so the two forms agree exactly.
 
 Program rule (:func:`select_wide`, then :func:`cake_jit.select_records`): the
@@ -139,12 +141,15 @@ MAX_SPLITS = cake_jit.MAX_SPLITS
 # co-residency per SM of the cooperative decode, the fused form's capacity (sm_80 absent: the split form alone).
 CTAS_PER_SM = cake_jit.DECODE_CTAS_PER_SM
 FUSED_CTAS_PER_SM = cake_jit.DECODE_FUSED_CTAS_PER_SM
-# The eager host rule of the tcgen05 architectures (module docstring, "Form rule"): within the fused capacity, those
+# The eager host rule of the tcgen05 architectures (module docstring, "Form rule"): within the fused capacity, these
 # architectures take the fused form only on these host machines (``platform.machine()``), at this many rows or fewer,
-# and only outside a stream capture; compute capability 9.0 takes it within its capacity on every host.
-FUSED_HOST_RULE_ARCHES = ("sm_100a", "sm_103a", "sm_107a")
+# and only outside a stream capture; compute capability 9.0 takes it within its capacity on every host, and sm_107a
+# (not listed) keeps the split form on every host, the measured shorter one there.
+FUSED_HOST_RULE_ARCHES = ("sm_100a", "sm_103a")
 FUSED_HOSTS = ("aarch64",)
 FUSED_MAX_ROWS = 4
+# Architectures whose cooperative build ships but whose eager call keeps the split form on every host.
+FUSED_SPLIT_ONLY_ARCHES = ("sm_107a",)
 HOST_MACHINE = platform.machine()
 # The program rule's long-stream bound: tiles per CTA from which an sm_80 multi-wave grid runs the whole-tile program.
 LONG_STREAM_TILES = cake_jit.DECODE_LONG_STREAM_TILES
@@ -226,6 +231,8 @@ def select_form(
     if int(splits) <= 1 or grid > fused_capacity(device_index):
         return "split"
     arch, _sm_count = _device_facts(device_index)
+    if arch in FUSED_SPLIT_ONLY_ARCHES:
+        return "split"
     if arch not in FUSED_HOST_RULE_ARCHES:
         return "fused"
     if (
@@ -886,6 +893,7 @@ __all__ = [
     "FUSED_HOSTS",
     "FUSED_HOST_RULE_ARCHES",
     "FUSED_MAX_ROWS",
+    "FUSED_SPLIT_ONLY_ARCHES",
     "HEAD_DIM",
     "HOST_MACHINE",
     "LONG_STREAM_TILES",
