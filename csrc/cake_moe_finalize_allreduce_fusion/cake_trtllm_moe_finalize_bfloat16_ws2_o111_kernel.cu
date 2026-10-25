@@ -158,8 +158,8 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o111(__nv_bfloat16* __restrict__ al
         atomicAdd(&reinterpret_cast<unsigned int*>(control_0)[0], 1);
     }
     if (tid == 0) {
-        mbarrier_init(rms_bar_addr, 1);
-        mbarrier_init(rms_bar_addr + 8, 1);
+        mbarrier_init(rms_bar_addr, 4);
+        mbarrier_init(rms_bar_addr + 8, 4);
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
@@ -688,60 +688,77 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o111(__nv_bfloat16* __restrict__ al
             reduce_smem[warp] = square_sum;
         }
         __syncthreads();
-        float block_sum = ((tid < 7) ? reduce_smem[lane] : 0.0f);
-        float _warp_reduce_10 = block_sum;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_10 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_10, offset);
-        block_sum = _warp_reduce_10;
         if (tid == 0) {
+            float block_sum = reduce_smem[0] + reduce_smem[4] + (reduce_smem[2] + reduce_smem[6]) + (reduce_smem[1] + reduce_smem[5] + reduce_smem[3]);
             mbarrier_arrive_expect_tx(rms_bar_addr + (rms_parity) * 8, 16);
             int slot_addr = rms_slots_addr + (unsigned int)(rms_parity * 16) + (unsigned int)(cta_rank * 4);
             unsigned int bar_addr = rms_bar_addr + (unsigned int)(rms_parity * 8);
+            uint32_t _cluster_mapa_10;
+            asm volatile(
+                "mapa.shared::cluster.u32 %0, %1, %2;"
+                : "=r"(_cluster_mapa_10) : "r"(slot_addr), "r"(0));
             uint32_t _cluster_mapa_11;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_11) : "r"(slot_addr), "r"(0));
+                : "=r"(_cluster_mapa_11) : "r"(bar_addr), "r"(0));
+            asm volatile(
+                "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
+                :: "r"(_cluster_mapa_10), "f"(block_sum), "r"(_cluster_mapa_11) : "memory");
             uint32_t _cluster_mapa_12;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_12) : "r"(bar_addr), "r"(0));
-            asm volatile(
-                "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_11), "f"(block_sum), "r"(_cluster_mapa_12) : "memory");
+                : "=r"(_cluster_mapa_12) : "r"(slot_addr), "r"(1));
             uint32_t _cluster_mapa_13;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_13) : "r"(slot_addr), "r"(1));
+                : "=r"(_cluster_mapa_13) : "r"(bar_addr), "r"(1));
+            asm volatile(
+                "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
+                :: "r"(_cluster_mapa_12), "f"(block_sum), "r"(_cluster_mapa_13) : "memory");
             uint32_t _cluster_mapa_14;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_14) : "r"(bar_addr), "r"(1));
-            asm volatile(
-                "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_13), "f"(block_sum), "r"(_cluster_mapa_14) : "memory");
+                : "=r"(_cluster_mapa_14) : "r"(slot_addr), "r"(2));
             uint32_t _cluster_mapa_15;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_15) : "r"(slot_addr), "r"(2));
+                : "=r"(_cluster_mapa_15) : "r"(bar_addr), "r"(2));
+            asm volatile(
+                "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
+                :: "r"(_cluster_mapa_14), "f"(block_sum), "r"(_cluster_mapa_15) : "memory");
             uint32_t _cluster_mapa_16;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_16) : "r"(bar_addr), "r"(2));
-            asm volatile(
-                "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_15), "f"(block_sum), "r"(_cluster_mapa_16) : "memory");
+                : "=r"(_cluster_mapa_16) : "r"(slot_addr), "r"(3));
             uint32_t _cluster_mapa_17;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_17) : "r"(slot_addr), "r"(3));
-            uint32_t _cluster_mapa_18;
-            asm volatile(
-                "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_18) : "r"(bar_addr), "r"(3));
+                : "=r"(_cluster_mapa_17) : "r"(bar_addr), "r"(3));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_17), "f"(block_sum), "r"(_cluster_mapa_18) : "memory");
+                :: "r"(_cluster_mapa_16), "f"(block_sum), "r"(_cluster_mapa_17) : "memory");
+            asm volatile("fence.release.sync_restrict::shared::cta.cluster;" ::: "memory");
+            asm volatile(
+                "{\n\t"
+                ".reg .b32 remAddr32;\n\t"
+                "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
+                "mbarrier.arrive.relaxed.cluster.shared::cluster.b64 _, [remAddr32];\n\t"
+                "}"
+                :: "r"(rms_bar_addr + (rms_parity) * 8), "r"(cta_rank ^ 1) : "memory");
+            asm volatile(
+                "{\n\t"
+                ".reg .b32 remAddr32;\n\t"
+                "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
+                "mbarrier.arrive.relaxed.cluster.shared::cluster.b64 _, [remAddr32];\n\t"
+                "}"
+                :: "r"(rms_bar_addr + (rms_parity) * 8), "r"(cta_rank ^ 2) : "memory");
+            asm volatile(
+                "{\n\t"
+                ".reg .b32 remAddr32;\n\t"
+                "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
+                "mbarrier.arrive.relaxed.cluster.shared::cluster.b64 _, [remAddr32];\n\t"
+                "}"
+                :: "r"(rms_bar_addr + (rms_parity) * 8), "r"(cta_rank ^ 3) : "memory");
         }
         mbarrier_wait_cluster_hint(rms_bar_addr + (rms_parity) * 8, rms_phase, 10000000);
         float cluster_sum = 0.0f;
@@ -776,9 +793,9 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o111(__nv_bfloat16* __restrict__ al
         asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_3) : "r"(norm_value_bf16[3]));
         uint32_t _bf16x2_max_2;
         asm("max.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_2) : "r"(_bf16x2_max_1), "r"(_bf16x2_abs_3));
-        unsigned int _shfl_xor_sync_19 = __shfl_xor_sync(0xFFFFFFFF, _bf16x2_max_2, 1);
+        unsigned int _shfl_xor_sync_18 = __shfl_xor_sync(0xFFFFFFFF, _bf16x2_max_2, 1);
         uint32_t _bf16x2_max_3;
-        asm("max.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_3) : "r"(_shfl_xor_sync_19), "r"(_bf16x2_max_2));
+        asm("max.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_3) : "r"(_shfl_xor_sync_18), "r"(_bf16x2_max_2));
         uint16_t _bf16_max_0;
         asm("max.bf16 %0, %1, %2;" : "=h"(_bf16_max_0) : "h"((uint16_t)(_bf16x2_max_3 & 65535)), "h"((uint16_t)(_bf16x2_max_3 >> 16)));
         float vector_max;
@@ -794,19 +811,19 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o111(__nv_bfloat16* __restrict__ al
                 : "=f"((&_unpack_bf16_5[_pair * 2])[0]), "=f"((&_unpack_bf16_5[_pair * 2])[1])
                 : "r"(norm_value_bf16[_pair]));
         }
-        float _rcp_20 = approx_rcp(6.0f);
-        float sf_value = scale_factor * (vector_max * _rcp_20);
-        uint16_t _e4m3x2_22;
-        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_22) : "f"(0.0f), "f"(sf_value));
-        uint8_t _cvt_satfinite_e4m3_f32_21 = (uint8_t)_e4m3x2_22;
-        uint32_t _f16x2_decode_23;
+        float _rcp_19 = approx_rcp(6.0f);
+        float sf_value = scale_factor * (vector_max * _rcp_19);
+        uint16_t _e4m3x2_21;
+        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_21) : "f"(0.0f), "f"(sf_value));
+        uint8_t _cvt_satfinite_e4m3_f32_20 = (uint8_t)_e4m3x2_21;
+        uint32_t _f16x2_decode_22;
         float sf_rounded;
-        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_decode_23) : "h"(_e4m3x2_22));
-        uint16_t _f16_decode_23 = (uint16_t)_f16x2_decode_23;
-        asm("cvt.f32.f16 %0, %1;" : "=f"(sf_rounded) : "h"(_f16_decode_23));
-        float _rcp_25 = approx_rcp(scale_factor);
-        float _rcp_24 = approx_rcp(sf_rounded * _rcp_25);
-        float output_scale = ((sf_rounded != 0.0f) ? _rcp_24 : 0.0f);
+        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_decode_22) : "h"(_e4m3x2_21));
+        uint16_t _f16_decode_22 = (uint16_t)_f16x2_decode_22;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(sf_rounded) : "h"(_f16_decode_22));
+        float _rcp_24 = approx_rcp(scale_factor);
+        float _rcp_23 = approx_rcp(sf_rounded * _rcp_24);
+        float output_scale = ((sf_rounded != 0.0f) ? _rcp_23 : 0.0f);
         #pragma unroll
         for (int j_15 = 0; j_15 < 8; j_15++) {
             _unpack_bf16_5[j_15] = _unpack_bf16_5[j_15] * output_scale;
@@ -822,9 +839,9 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o111(__nv_bfloat16* __restrict__ al
             int outer_m = token_1 % 32;
             int m_tile = token_1 / 128;
             int scale_index = m_tile * 112 * 512 + k_tile * 512 + outer_m * 16 + inner_m * 4 + inner_k;
-            uint16_t _cvt_satfinite_e4m3x2_f32_26;
-            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_f32_26) : "f"(0.0f), "f"(sf_value));
-            *reinterpret_cast<unsigned char*>(reinterpret_cast<uint8_t*>(scale_out) + scale_index) = (unsigned char)((unsigned int)(unsigned char)(_cvt_satfinite_e4m3x2_f32_26 & 127));
+            uint16_t _cvt_satfinite_e4m3x2_f32_25;
+            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_f32_25) : "f"(0.0f), "f"(sf_value));
+            *reinterpret_cast<unsigned char*>(reinterpret_cast<uint8_t*>(scale_out) + scale_index) = (unsigned char)((unsigned int)(unsigned char)(_cvt_satfinite_e4m3x2_f32_25 & 127));
         }
         access_1 += access_stride;
         rms_phase = rms_phase ^ rms_parity;
@@ -833,8 +850,8 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o111(__nv_bfloat16* __restrict__ al
     if (bid == 0) {
         if (tid == 0) {
             {
-                volatile int* _sysv_wait_p_27 = reinterpret_cast<volatile int*>(reinterpret_cast<unsigned int*>(control_0)) + (0);
-                while (*_sysv_wait_p_27 != static_cast<int>(num_bids)) {}
+                volatile int* _sysv_wait_p_26 = reinterpret_cast<volatile int*>(reinterpret_cast<unsigned int*>(control_0)) + (0);
+                while (*_sysv_wait_p_26 != static_cast<int>(num_bids)) {}
             }
             control_0[2] = (control_current_word + 1) % 3;
             control_0[4] = token_end * 7168 * 2;
