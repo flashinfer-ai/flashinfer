@@ -4199,8 +4199,9 @@ def trtllm_batch_decode_with_kv_cache(
         ``[batch_size, 2, sparse_top_k]`` with each token's K and V token indices, and
         ``seq_lens`` with how many leading entries of each list are valid. ``sparse_top_k``
         must be a multiple of 4, the query heads at most 128, and ``batch_size`` at most
-        65535. A sliding window and attention sinks are not supported. ``0`` (default)
-        disables it.
+        65535. A sliding window, attention sinks and head dim 512 (MLA's, see
+        :func:`trtllm_batch_decode_with_kv_cache_mla`) are not supported. ``0``
+        (default) disables it.
 
     Returns
     -------
@@ -4258,6 +4259,11 @@ def trtllm_batch_decode_with_kv_cache(
         # The token-sparse kernels address K/V without a head stride: one KV head.
         if k_cache.shape[-3 if kv_layout == "HND" else -2] != 1:
             raise ValueError("sparse_top_k needs one KV head (MQA)")
+        # Sparse 512/512 head dims select the MLA kernels (one latent K/V pool).
+        if query.shape[-1] == 512:
+            raise ValueError(
+                "sparse_top_k with head dim 512 is MLA's: use trtllm_batch_decode_with_kv_cache_mla"
+            )
         # The kernel copies indices with 16-byte cp.async (four int32s), and its
         # non-persistent launch grid caps the request count at 65535 (as in mla/_core.py).
         if sparse_top_k % 4 or query.shape[0] > 65535:
