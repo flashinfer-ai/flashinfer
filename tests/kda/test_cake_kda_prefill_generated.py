@@ -464,11 +464,17 @@ def test_serving_rows_match_the_fp32_reference(lengths, heads, lower_bound, unro
     assert not loaded & set(routes), "a routed shipped module was loaded"
     _assert_bitwise(routed.run(), routed_result, "routed repeat")
 
-    # The same launch with int32 sequence offsets.
-    narrow = _Call(d, lower_bound, cu_seqlens=d["cu_seqlens"].to(torch.int32))
-    _assert_bitwise(narrow.run(), routed_result, "int32 cu_seqlens")
+    # The prepared path takes int64 sequence offsets (callers cast int32
+    # offsets first); the routes leave that contract as it is.
+    narrow = d["cu_seqlens"].to(torch.int32)
+    with pytest.raises(TypeError, match="cu_seqlens must have dtype torch.int64"):
+        _Call(d, lower_bound, cu_seqlens=narrow)
+    widened = _Call(d, lower_bound, cu_seqlens=narrow.to(torch.int64))
+    _assert_bitwise(widened.run(), routed_result, "int32 offsets cast to int64")
 
     unrouted()
+    with pytest.raises(TypeError, match="cu_seqlens must have dtype torch.int64"):
+        _Call(d, lower_bound, cu_seqlens=narrow)
     shipped = _Call(d, lower_bound)
     _assert_close(shipped.run(), want, "shipped")
     assert not _modules(shipped.prepared) & set(GENERATED)
