@@ -1,4 +1,4 @@
-# Cake QSA sparse paged GQA decode over an NVFP4 KV cache (SM80 through SM107)
+# Cake QSA sparse paged GQA decode over an NVFP4 KV cache (SM80 through SM120)
 
 Experimental backend of `flashinfer.sparse.qsa_sparse_paged_attention`: gated
 sparse paged GQA decode attention (Qwen QSA: one query token per row, 256-dim
@@ -6,14 +6,17 @@ heads, a per-row selection of logical tokens, `bf16(attention) *
 sigmoid(output_gate)`) over the packed E2M1 KV cache with E4M3 block scales
 that `nvfp4_quantize_append_paged_kv_cache_with_slot_mapping` writes, on
 compute capability 8.x (the `sm_80` libraries), 9.0 (`sm_90a`), 10.0
-(`sm_100a`: B200 / GB200), 10.3 (`sm_103a`: B300 / GB300) and 10.7 (`sm_107a`:
-R200). Two decode programs partition them: the `mma.sync` decode of 8.x / 9.0
-and the tcgen05 decode of 10.0 / 10.3 / 10.7 (tensor memory, one CTA per SM);
-the merge serves all.
+(`sm_100a`: B200 / GB200), 10.3 (`sm_103a`: B300 / GB300), 10.7 (`sm_107a`:
+R200) and 12.0 (`sm_120a`: RTX PRO 6000 Blackwell). Two decode programs
+partition them: the `mma.sync` decode of 8.x / 9.0 / 12.0 and the tcgen05
+decode of 10.0 / 10.3 / 10.7 (tensor memory, one CTA per SM); the merge serves
+all. Compute capability 12.0 has no tcgen05 instructions and no tensor memory,
+so the SM80 `mma.sync` program is built for `sm_120a`: the one Blackwell
+architecture that program serves.
 
 Both the API and the backend are experimental: no compatibility guarantee.
 The public entry's `backend="auto"` (its default) selects this package on
-every compute capability it exports a library for (capability-exact: 12.x is
+every compute capability it exports a library for (capability-exact: 12.1 is
 not included); the feature does not participate in autotuning or
 trace-apply. Its libraries are loaded prebuilt from `aot/` when the package
 ships them and JIT-built by FlashInfer from `build.json` otherwise (see
@@ -33,7 +36,7 @@ out = qsa_sparse_paged_attention(
 ```
 
 `backend="auto"` (the default) runs this package on every exported compute
-capability (8.x, 9.0, 10.0, 10.3, 10.7) and the existing implementation on any other
+capability (8.x, 9.0, 10.0, 10.3, 10.7, 12.0) and the existing implementation on any other
 device, which then reports it as unsupported; `"cake"` selects this package and `"default"` the existing
 implementation explicitly; any other value raises `ValueError`. This package's
 results agree with the existing implementation within the test suites'
@@ -63,7 +66,7 @@ takes the same arguments plus the keyword `workspace_buffer` (below).
 
 The selection is cut into tiles of 64 tokens and the tiles into `splits`
 splits; one decode CTA serves one (row, KV head, split): 128 threads on the
-`mma.sync` decode (8.x / 9.0), 512 on the tcgen05 decode (10.0 / 10.3 / 10.7).
+`mma.sync` decode (8.x / 9.0 / 12.0), 512 on the tcgen05 decode (10.0 / 10.3 / 10.7).
 
 **Split rule.** `tiles = ceil(selection_width / 64)`;
 `splits = max(1, min(tiles, CTAS_PER_SM[arch] * sm_count // (rows *
@@ -72,20 +75,24 @@ its launch bound: two for the `mma.sync` decode, one for the tcgen05 decode,
 whose tensor memory and shared-memory pool hold the SM); then the measured
 table `SPLIT_OVERRIDES` of the device's SM count replaces the formula where it
 names `(sm_count, rows)` (`(132, 4) -> 16`, `(132, 8) -> 8`, `(108, 64) -> 4`,
-`(108, 128) -> 2`; no entry for a Blackwell SM count yet); then `splits <=
+`(108, 128) -> 2`, `(188, 4) -> 16`, `(188, 8) -> 11`, `(188, 16) -> 5`,
+`(188, 32) -> 3`; no entry for a tcgen05 device's SM count); then `splits <=
 min(tiles, 128)`. The rule reads the architecture and the SM count alone. On a
 B200 (148 SMs) at the owner's 24 x 2 heads and 2051 selections the formula
-gives 33, 33, 18, 9, 4, 2, 1, 1 splits for rows 1, 2, 4, 8, 16, 32, 64, 128.
+gives 33, 33, 18, 9, 4, 2, 1, 1 splits for rows 1, 2, 4, 8, 16, 32, 64, 128;
+on an RTX PRO 6000 (188 SMs, two CTAs per SM) it gives 33, 33, 33, 23, 11, 5,
+2, 1 and the table replaces rows 4, 8, 16 and 32 with 16, 11, 5 and 3.
 
 **Form rule.** With one split the plain decode writes `out` itself. Above
 one split the *fused* form (the cooperative build of the decode, whose CTAs
 merge the splits in the same launch through a counter per (row, KV head))
 needs `rows * num_kv_heads * splits` within the co-residency the decode's
 launch bound guarantees (`FUSED_CTAS_PER_SM[arch]` times the SM count: two per
-SM on compute capability 9.0, 264 on an H100; one per SM on 10.0 / 10.3 /
-10.7, 148 on a B200, 152 on a GB300, 212 on an R200 board of 212 SMs). Within
-it, compute capability 9.0 always takes the fused form. Compute capability
-10.0 and 10.3 take it under the eager host rule alone: on an `aarch64` host (`FUSED_HOSTS`), at `rows <= 4` (`FUSED_MAX_ROWS`)
+SM on compute capability 9.0 and 12.0, 264 on an H100, 376 on an RTX PRO 6000;
+one per SM on 10.0 / 10.3 / 10.7, 148 on a B200, 152 on a GB300, 212 on an R200
+board of 212 SMs). Within it, compute capability 9.0 and 12.0 always take the
+fused form. Compute capability 10.0 and 10.3 take it under the eager host rule
+alone: on an `aarch64` host (`FUSED_HOSTS`), at `rows <= 4` (`FUSED_MAX_ROWS`)
 and when the current stream is not capturing. Compute capability 10.7 keeps
 the split form on every host (`FUSED_SPLIT_ONLY_ARCHES`): on an R200 system the
 split route's eager whole call is the shorter one at every row. Everywhere else -- compute
@@ -106,17 +113,17 @@ unchanged by the rule. The two forms agree bit for bit: the graph tests
 compare an eager (fused) call with its captured (split) replay at `atol=0`.
 
 **Program rule.** The records are filtered by the device's architecture
-first: the `mma.sync` decode's records on 8.x / 9.0, the tcgen05 decode's on
-10.0 / 10.3 / 10.7. On compute capability 8.x the plain decode has two
-programs: a
+first: the `mma.sync` decode's records on 8.x / 9.0 / 12.0, the tcgen05
+decode's on 10.0 / 10.3 / 10.7. On compute capability 8.x the plain decode has
+two programs: a
 split-form call is *wide* when both hold: its decode grid `rows *
 num_kv_heads * splits` exceeds one resident wave (two CTAs per SM times the
 SM count; 216 on an A100) and each of its CTAs walks a long tile stream,
 `ceil(tiles / splits) >= 16` (1024 selected tokens). A wide call launches
 `decode_whole_tile`, the previous release's `sm_80` program (whole-tile
 gather, no L2 cache hint, shift selector); every other call launches the
-K-first program `decode`, and compute capability 9.0 always does; 10.0, 10.3
-and 10.7 launch `decode_tcgen05` in the split form and `decode_tcgen05_coop`
+K-first program `decode`, and compute capability 9.0 and 12.0 always do; 10.0,
+10.3 and 10.7 launch `decode_tcgen05` in the split form and `decode_tcgen05_coop`
 in the fused form, by the form rule alone. On an
 A100 (108 SMs) at the owner's 24 x 2 heads and 2051 selections (33 tiles):
 rows 1-32 run at most one wave and take the K-first program; rows 64 (4
@@ -218,4 +225,5 @@ Experimental. Validated against the default implementation's test suite with
 `backend="cake"` on compute capability 9.0 (`sm_90a`, H100) and 8.0 (`sm_80`,
 A100 80 GB and 40 GB PCIe); the tcgen05 programs (`sm_100a`, `sm_103a`,
 `sm_107a`) against the same suite on a B200 (10.0), a GB300 (10.3) and an R200
-(10.7).
+(10.7); the `sm_120a` build of the `mma.sync` programs against the same suite
+on an RTX PRO 6000 Blackwell Server Edition (12.0).
