@@ -89,7 +89,7 @@ def gen_minimax_h3_mlp_module(target: MiniMaxH3MlpTarget) -> JitSpec:
     # precise build the Cake runtime compiles; FlashInfer's default -use_fast_math (ftz, approximate
     # division / sqrt) would make this module differ from that build by one BF16 ulp on rare elements.
     return gen_jit_spec(
-        f"minimax_h3_mlp_{target}_v2",
+        f"minimax_h3_mlp_{target}_v3",
         [source],
         extra_cuda_cflags=list(_TARGETS[target][1]),
         use_fast_math=False,
