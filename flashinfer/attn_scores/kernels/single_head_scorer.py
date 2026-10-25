@@ -91,9 +91,9 @@ class PagedScorer:
     A job is ``rows`` consecutive query rows that share block-table row
     ``tile_requests[j]``. In "decode", a job is 1 to 8 rows that all see keys
     below ``row_ends[j]``. In "select", it is a 128-row query tile whose row r
-    sees keys below ``row_ends[r]``. Each job gets ``workers`` CTAs (jobs vary
-    fastest in the grid), and each CTA owns an equal run of the job's 128-key
-    tiles below its longest row end.
+    sees keys below ``row_ends[r]``. Each job gets ``workers`` CTAs, the first
+    ``wide`` jobs one more (jobs vary fastest in the grid), and each CTA owns an
+    equal run of the job's 128-key tiles below its longest row end.
 
     A CTA streams its run through its key stages: a tile's two 64-key pages are
     TMA-loaded into a stage once the MMA of the stage's previous tile is done.
@@ -142,6 +142,7 @@ class PagedScorer:
         output: cute.Tensor,
         key_rows: cutlass.Int32,
         workers: cutlass.Int32,
+        wide: cutlass.Int32,
         ties: cutlass.Int32,
     ):
         jobs, pages = query.shape[0] // self.rows, key_cache.shape[0]
@@ -267,9 +268,10 @@ class PagedScorer:
             key_pages,
             key_rows,
             workers,
+            wide,
             ties,
         ).launch(
-            grid=(jobs, workers, 1),
+            grid=(jobs, workers + cutlass.Int32(wide > 0), 1),
             block=(self.threads, 1, 1),
             smem=shared_bytes,
             min_blocks_per_mp=ctas,
@@ -299,10 +301,14 @@ class PagedScorer:
         key_pages: cute.Layout,
         key_rows: cutlass.Int32,
         workers: cutlass.Int32,
+        wide: cutlass.Int32,
         ties: cutlass.Int32,
     ):
         thread, _, _ = cute.arch.thread_idx()
         job, worker, _ = cute.arch.block_idx()
+        # The grid has a CTA more per job than all but the first `wide` jobs use;
+        # the others' extra CTA owns no tiles and exits below.
+        workers = cutlass.Int32(cutlass.select_(job < wide, workers + 1, workers))
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         @cute.struct
