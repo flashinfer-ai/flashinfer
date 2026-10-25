@@ -2884,6 +2884,106 @@ def dim128_program(heads_per_group: int, gated: bool) -> tuple[str, int]:
     return "stp_dim128_hpc2", 2
 
 
+# CTAs per SM of the two-head build from which a launch runs that build split two ways at five CTAs per SM, per
+# architecture: headdim 64, and headdim 128 (sm_100a only).
+_HD64_SPLIT_MB5_MIN_CTAS_PER_SM = {"sm_100a": 24, "sm_103a": 48}
+# The lower band of that split at headdim 64, per architecture: tenths of a CTA per SM of the two-head build from
+# which (inclusive) and below which a launch runs it.
+_HD64_SPLIT_MB5_BAND_TENTHS = {"sm_100a": (60, 75), "sm_103a": (66, 75)}
+_DIM128_SPLIT_MB5_MIN_CTAS_PER_SM = {"sm_100a": 48}
+
+
+def hd64_split_program(
+    row_groups: int,
+    program_heads_per_group: int,
+    sm_count: int,
+    arch: str,
+    raw_abi: bool,
+) -> Optional[tuple[str, int, int]]:
+    """``(program, heads_per_cta, p_split)`` of the P-split paired headdim-64 build for one launch, or ``None``
+    when the launch keeps the build :func:`hd64_paired_program` gives it (below two program heads per SM, the
+    row-owner tile).
+
+    A P-split build runs ``p_split`` CTAs on every work tile, each owning ``128 / p_split`` state rows of the
+    tile's program heads with its own consumer warps, at a fixed number of CTAs per SM; output and state are
+    bitwise those of the unsplit build.  The split follows the build :func:`hd64_paired_program` gives the
+    launch and that build's CTAs (``tiles``):
+
+    - one head per CTA: from one to two program heads per SM split four ways; above two, two heads per CTA
+      split two ways when the groups hold an even number of program heads (both with the folded ratio at eight
+      program heads per group);
+    - four heads per CTA: split two ways up to two ``tiles`` per SM;
+    - two heads per CTA at two CTAs per SM: no split;
+    - two heads per CTA at three CTAs per SM, below six ``tiles`` per SM and groups of a multiple of four
+      program heads: four heads per CTA split two ways up to three ``tiles`` per SM, above that split four ways
+      at nine CTAs per SM while the launch holds at most nine program heads per SM;
+    - two heads per CTA at three CTAs per SM from six ``tiles`` per SM: split two ways at five CTAs per SM from
+      6 (sm_100a) or 6.6 (sm_103a) to 7.5 ``tiles`` per SM and from 24 (sm_100a) or 48 (sm_103a) ``tiles`` per
+      SM.
+
+    ``raw_abi`` selects the build for BF16 ``dt`` / ``D`` / ``dt_bias`` and int32 slot tables.
+    """
+    suffix = "_bf16_i32" if raw_abi else ""
+    program_heads = row_groups * program_heads_per_group
+    if program_heads < 3 * sm_count:
+        ratio8 = "_ratio8" if program_heads_per_group == 8 else ""
+        if program_heads < sm_count:
+            return None
+        if program_heads <= 2 * sm_count:
+            return f"stp_hd64_paired_hpc1{ratio8}_s4w2{suffix}", 1, 4
+        if program_heads_per_group % 2:
+            return None
+        return f"stp_hd64_paired_hpc2{ratio8}_s2w4{suffix}", 2, 2
+    _, heads_per_cta = hd64_paired_program(
+        row_groups, program_heads_per_group, sm_count, raw_abi
+    )
+    tiles = _work_tiles(row_groups, program_heads_per_group, heads_per_cta)
+    if heads_per_cta == 4:
+        if tiles > 2 * sm_count:
+            return None
+        return f"stp_hd64_paired_hpc4_s2w4{suffix}", 4, 2
+    if program_heads < 6 * sm_count and tiles <= 2 * sm_count:
+        return None
+    if tiles < 6 * sm_count:
+        if program_heads_per_group % 4:
+            return None
+        if tiles <= 3 * sm_count:
+            return f"stp_hd64_paired_hpc4_s2w4{suffix}", 4, 2
+        if program_heads > 9 * sm_count:
+            return None
+        return f"stp_hd64_paired_hpc4_s4w2{suffix}", 4, 4
+    low, high = _HD64_SPLIT_MB5_BAND_TENTHS[arch]
+    if (
+        low * sm_count <= 10 * tiles < high * sm_count
+        or tiles >= _HD64_SPLIT_MB5_MIN_CTAS_PER_SM[arch] * sm_count
+    ):
+        return f"stp_hd64_paired_hpc2_s2w4_mb5{suffix}", 2, 2
+    return None
+
+
+def dim128_split_program(
+    row_groups: int, heads_per_group: int, sm_count: int, arch: str, gated: bool
+) -> Optional[tuple[str, int, int]]:
+    """``(program, heads_per_cta, p_split)`` of the P-split headdim-128 / dstate-128 build for one launch, or
+    ``None`` when the launch keeps the build :func:`dim128_program` gives it.  At one head per group the one-head
+    build splits two ways up to 3.5 CTAs per SM; from 48 CTAs per SM of the two-head build (16 waves of three
+    CTAs per SM), on sm_100a only, that build splits two ways at five CTAs per SM.  A call with ``z`` never
+    splits."""
+    if gated:
+        return None
+    if heads_per_group == 1:
+        if 2 * row_groups > 7 * sm_count:
+            return None
+        return "stp_dim128_hpc1_s2w4", 1, 2
+    min_ctas_per_sm = _DIM128_SPLIT_MB5_MIN_CTAS_PER_SM.get(arch)
+    if (
+        min_ctas_per_sm is None
+        or _work_tiles(row_groups, heads_per_group, 2) < min_ctas_per_sm * sm_count
+    ):
+        return None
+    return "stp_dim128_hpc2_s2w4_mb5", 2, 2
+
+
 def _plan_stp_rows(
     *,
     state,
@@ -2913,8 +3013,9 @@ def _plan_stp_rows(
     Every program head is one 128x128 BF16 state tile: with ``dim`` 64 two adjacent 64-row heads fold into one
     program head and the state is viewed as ``(slots, nheads / 2, 128, 128)``; with ``dim`` 128 one head is one
     program head and the tensor map covers the state as passed.  ``dt``, ``A``, ``D`` and ``dt_bias`` carry one
-    value per head at a unit head stride; slot tables are contiguous and cover the batch.  One ``shape`` /
-    ``stride()`` read per tensor.
+    value per head at a unit head stride; slot tables are contiguous and cover the batch.  A launch the P-split
+    rule takes (:func:`hd64_split_program`, :func:`dim128_split_program`) runs the split build under the same
+    bindings, ``p_split`` CTAs per work tile.  One ``shape`` / ``stride()`` read per tensor.
     """
     x_shape = x.shape
     batch_size = x_shape[0]
@@ -2972,17 +3073,28 @@ def _plan_stp_rows(
     if paired:
         program_heads = nheads >> 1
         heads_per_group = program_heads // ngroups
-        program, heads_per_cta = hd64_paired_program(
-            batch_size * ngroups, heads_per_group, sms, raw_abi
+        split = hd64_split_program(
+            batch_size * ngroups, heads_per_group, sms, arch, raw_abi
         )
+        if split is None:
+            program, heads_per_cta = hd64_paired_program(
+                batch_size * ngroups, heads_per_group, sms, raw_abi
+            )
         state_tma = state.view(state.shape[0], program_heads, 128, 128)
     else:
         if raw_abi:
             return None
         program_heads = nheads
         heads_per_group = nheads // ngroups
-        program, heads_per_cta = dim128_program(heads_per_group, z is not None)
+        split = dim128_split_program(
+            batch_size * ngroups, heads_per_group, sms, arch, z is not None
+        )
+        if split is None:
+            program, heads_per_cta = dim128_program(heads_per_group, z is not None)
         state_tma = state
+    p_split = 1
+    if split is not None:
+        program, heads_per_cta, p_split = split
     head_tiles = (heads_per_group + heads_per_cta - 1) // heads_per_cta
     bindings = dict(
         state_tma=state_tma,
@@ -3010,11 +3122,11 @@ def _plan_stp_rows(
         disable_state_update=int(disable_state_update),
         pad_slot_id=pad_slot_id,
     )
-    # One CTA per work tile of ``heads_per_cta`` program heads of one (batch, group).
+    # ``p_split`` CTAs per work tile of ``heads_per_cta`` program heads of one (batch, group).
     return RoutePlan(
         program,
         (),
-        (batch_size * ngroups * head_tiles, 1, 1),
+        (batch_size * ngroups * head_tiles * p_split, 1, 1),
         bindings,
         arch,
         device_index,
@@ -3140,41 +3252,48 @@ def _plan_stp_hd64(
 ) -> Optional[RoutePlan]:
     """Headdim-64 / dstate-128 single-token decode (Nemotron-H, granite-4.0-h) on both ABIs and state dtypes.
 
-    BF16 state at saturating work pairs two heads into one 128x128 program head of the paired row-major
-    programs (even head count and even heads per group, at least two program blocks per SM); every other case
-    runs the direct row-owner tile.  Dense x/B/C/out rows may carry padded batch strides (the SGLang
-    fused-projection views).
+    BF16 state with an even head count and even heads per group pairs two heads into one 128x128 program head
+    of the paired row-major programs at saturating work (at least two program heads per SM) and wherever the
+    P-split rule takes the launch below that (one to two program heads per SM, :func:`hd64_split_program`);
+    every other case, and a split launch whose layout the paired programs cannot read, runs the direct
+    row-owner tile.  Dense x/B/C/out rows may carry padded batch strides (the SGLang fused-projection views).
     """
     sms = _sm_count(device_index)
     if (
         state.dtype == torch.bfloat16
         and nheads % 2 == 0
         and (nheads // ngroups) % 2 == 0
-        and x.shape[0] * (nheads >> 1) >= 2 * sms
     ):
-        return _plan_stp_rows(
-            state=state,
-            x=x,
-            dt=dt,
-            A=A,
-            B=B,
-            C=C,
-            D=D,
-            z=z,
-            dt_bias=dt_bias,
-            output=output,
-            source=source,
-            destination=destination,
-            nheads=nheads,
-            ngroups=ngroups,
-            dim=64,
-            dt_softplus=dt_softplus,
-            disable_state_update=disable_state_update,
-            pad_slot_id=pad_slot_id,
-            arch=arch,
-            device_index=device_index,
-            sms=sms,
+        saturating = x.shape[0] * (nheads >> 1) >= 2 * sms
+        split = hd64_split_program(
+            x.shape[0] * ngroups, (nheads >> 1) // ngroups, sms, arch, False
         )
+        if saturating or split is not None:
+            plan = _plan_stp_rows(
+                state=state,
+                x=x,
+                dt=dt,
+                A=A,
+                B=B,
+                C=C,
+                D=D,
+                z=z,
+                dt_bias=dt_bias,
+                output=output,
+                source=source,
+                destination=destination,
+                nheads=nheads,
+                ngroups=ngroups,
+                dim=64,
+                dt_softplus=dt_softplus,
+                disable_state_update=disable_state_update,
+                pad_slot_id=pad_slot_id,
+                arch=arch,
+                device_index=device_index,
+                sms=sms,
+            )
+            if plan is not None or saturating:
+                return plan
     x_shape, x_stride = x.shape, x.stride()
     batch_size = x_shape[0]
     rows_plan = hd64_rows_plan(batch_size, nheads, state.dtype, sms)
@@ -3759,8 +3878,10 @@ __all__ = [
     "RoutePlan",
     "define_digest",
     "dim128_program",
+    "dim128_split_program",
     "hd64_paired_program",
     "hd64_rows_plan",
+    "hd64_split_program",
     "jit_spec",
     "plan_route",
     "rows_defines",

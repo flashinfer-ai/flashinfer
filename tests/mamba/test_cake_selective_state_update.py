@@ -497,18 +497,51 @@ def _routes_as_measured() -> bool:
 # (name, batch, state dtype, program, groups): 128 heads of 64 rows, 64 program heads when paired.
 _RAW_DECODE_CASES = (
     ("rows_bf16", 2, torch.bfloat16, "stp_hd64_rows_bf16_dt8_bf16_i32", 8),
-    ("rows_bf16_dt4", 4, torch.bfloat16, "stp_hd64_rows_bf16_dt4_od_bf16_i32", 8),
-    ("paired_bf16", 64, torch.bfloat16, "stp_hd64_paired_hpc2_bf16_i32", 8),
     (
-        "paired_bf16_one_head",
-        5,
+        "split_bf16_one_head",
+        4,
         torch.bfloat16,
-        "stp_hd64_paired_hpc1_ratio8_bf16_i32",
+        "stp_hd64_paired_hpc1_ratio8_s4w2_bf16_i32",
         8,
     ),
-    ("paired_bf16_one_head_g4", 5, torch.bfloat16, "stp_hd64_paired_hpc1_bf16_i32", 4),
+    (
+        "split_bf16_one_head_g4",
+        4,
+        torch.bfloat16,
+        "stp_hd64_paired_hpc1_s4w2_bf16_i32",
+        4,
+    ),
+    ("paired_bf16", 64, torch.bfloat16, "stp_hd64_paired_hpc2_bf16_i32", 8),
+    (
+        "split_bf16_two_heads",
+        5,
+        torch.bfloat16,
+        "stp_hd64_paired_hpc2_ratio8_s2w4_bf16_i32",
+        8,
+    ),
+    (
+        "split_bf16_two_heads_g4",
+        5,
+        torch.bfloat16,
+        "stp_hd64_paired_hpc2_s2w4_bf16_i32",
+        4,
+    ),
     ("paired_bf16_two_ctas", 8, torch.bfloat16, "stp_hd64_paired_hpc2_mb2_bf16_i32", 8),
-    ("paired_bf16_four_heads", 16, torch.bfloat16, "stp_hd64_paired_hpc4_bf16_i32", 8),
+    (
+        "split_bf16_four_heads",
+        16,
+        torch.bfloat16,
+        "stp_hd64_paired_hpc4_s2w4_bf16_i32",
+        8,
+    ),
+    (
+        "split_bf16_four_heads_s4",
+        20,
+        torch.bfloat16,
+        "stp_hd64_paired_hpc4_s4w2_bf16_i32",
+        8,
+    ),
+    ("split_bf16_mb5", 32, torch.bfloat16, "stp_hd64_paired_hpc2_s2w4_mb5_bf16_i32", 8),
     ("rows_fp32_dt8", 1, torch.float32, "stp_hd64_rows_fp32_dt8_bf16_i32", 8),
     ("rows_fp32_dt4", 2, torch.float32, "stp_hd64_rows_fp32_dt4_bf16_i32", 8),
     ("rows_fp32_dt2", 4, torch.float32, "stp_hd64_rows_fp32_dt2_bf16_i32", 8),
@@ -538,6 +571,7 @@ def test_raw_decode_layout_matches_flashinfer(case, cake_hits) -> None:
     assert plan is not None
     if _routes_as_measured():
         assert plan.program == program
+    _assert_split_grid(plan)
     out_candidate = torch.empty(
         (batch_size, 128, 64), dtype=torch.bfloat16, device="cuda"
     )
@@ -549,8 +583,8 @@ def test_raw_decode_layout_matches_flashinfer(case, cake_hits) -> None:
     )
 
 
-# (name, raw ABI, nheads, batch, {arch: program}): BF16-state headdim-64 rows of eight groups at 512
-# batch-heads, FlashInfer's four-tile band on both devices (below the paired programs' work).
+# (name, raw ABI, nheads, batch, {arch: program}): BF16-state headdim-64 rows of one head per group (no head
+# pairing) at 512 batch-heads, FlashInfer's four-tile band on both devices.
 _BF16_DT4_CASES = (
     (
         "canonical_h128",
@@ -611,7 +645,7 @@ def test_bf16_four_tile_rows_pick_the_build_of_the_device(case, cake_hits) -> No
     """The four-tile BF16 band runs the build of the device's architecture and, in the BF16/int32 ABI, of the
     head count: the outputs and state match FlashInfer on every build."""
     _name, raw_abi, nheads, batch_size, programs = case
-    raw = _raw_decode_case(batch_size, torch.bfloat16, nheads=nheads, ngroups=8)
+    raw = _raw_decode_case(batch_size, torch.bfloat16, nheads=nheads, ngroups=nheads)
     reference = _canonical_arm(raw)
     candidate = raw if raw_abi else dict(reference, state=reference["state"].clone())
     out_reference = selective_state_update(**reference, backend="flashinfer")
@@ -808,18 +842,112 @@ def test_paired_rows_programs_follow_the_work() -> None:
     assert cake.dim128_program(8, gated=False) == ("stp_dim128_hpc2", 2)
 
 
+def test_split_programs_follow_the_work() -> None:
+    """The P-split rule: ``(program, heads_per_cta, p_split)`` of the split build a launch runs, or ``None`` for
+    the build of :func:`hd64_paired_program` / :func:`dim128_program`."""
+
+    def hd64(rg, hpg, sms=148, arch="sm_100a", raw=False):
+        return cake.hd64_split_program(rg, hpg, sms, arch, raw)
+
+    hpc1_s4 = ("stp_hd64_paired_hpc1_s4w2", 1, 4)
+    hpc2_s2 = ("stp_hd64_paired_hpc2_s2w4", 2, 2)
+    hpc4_s2 = ("stp_hd64_paired_hpc4_s2w4", 4, 2)
+    hpc4_s4 = ("stp_hd64_paired_hpc4_s4w2", 4, 4)
+    mb5 = ("stp_hd64_paired_hpc2_s2w4_mb5", 2, 2)
+    ratio8_s4 = ("stp_hd64_paired_hpc1_ratio8_s4w2", 1, 4)
+    # (batch x groups, program heads per group[, SMs, arch]); comments count program heads and CTAs.
+    # Below three program heads per SM: one to two per SM split four ways, above two split two ways.
+    assert hd64(36, 4) is None  # 144: below one per SM, the row-owner tile
+    assert hd64(37, 4) == hpc1_s4  # 148
+    assert hd64(74, 4) == hpc1_s4  # 296
+    assert hd64(50, 3) == hpc1_s4  # 150 in groups of three program heads
+    assert hd64(75, 4) == hpc2_s2  # 300
+    assert hd64(110, 4) == hpc2_s2  # 440
+    assert hd64(100, 3) is None  # 300 in groups of three: no head pairs to split
+    assert hd64(16, 8) is None  # 128
+    assert hd64(19, 8) == ratio8_s4  # 152: the folded ratio at eight per group
+    assert hd64(40, 8) == ("stp_hd64_paired_hpc2_ratio8_s2w4", 2, 2)  # 320
+    assert hd64(19, 8, raw=True) == (f"{ratio8_s4[0]}_bf16_i32", 1, 4)
+    # From three per SM, by the unsplit build and its CTAs.
+    assert hd64(111, 4) is None  # 444: two heads per CTA at two CTAs per SM
+    assert hd64(111, 4, 152, "sm_103a") == hpc2_s2  # 444: below three per SM
+    assert hd64(128, 8) == hpc4_s2  # 1024: four heads per CTA, 256 CTAs
+    assert hd64(221, 8) is None  # 1768: four heads per CTA, 442 CTAs
+    assert hd64(80, 8) == hpc4_s2  # 640 / 320 CTAs: up to three CTAs per SM
+    assert hd64(100, 6) is None  # 600 / 300 CTAs in groups of six program heads
+    assert hd64(160, 8) == hpc4_s4  # 1280 / 640 CTAs
+    assert hd64(166, 8) == hpc4_s4  # 1328: at most nine program heads per SM
+    assert hd64(170, 8) is None  # 1360
+    assert hd64(222, 8) == mb5  # 888 CTAs: 6 per SM on sm_100a
+    assert hd64(244, 8) == mb5  # 976 CTAs
+    assert hd64(277, 8) == mb5  # 1108 CTAs: below 7.5 per SM
+    assert hd64(278, 8) is None  # 1112 CTAs
+    assert hd64(244, 8, 152, "sm_103a") is None  # 976 CTAs: below 6.6 per SM on sm_103a
+    assert hd64(251, 8, 152, "sm_103a") == mb5  # 1004 CTAs
+    assert hd64(284, 8, 152, "sm_103a") == mb5  # 1136 CTAs: below 7.5 per SM
+    assert hd64(285, 8, 152, "sm_103a") is None  # 1140 CTAs
+    assert hd64(887, 8) is None  # 3548 CTAs
+    assert hd64(888, 8) == mb5  # 3552 CTAs: 24 per SM
+    assert hd64(888, 8, 152, "sm_103a") is None
+    assert hd64(1824, 8, 152, "sm_103a") == mb5  # 7296 CTAs: 48 per SM
+
+    def dim128(rg, hpg, arch="sm_100a", gated=False):
+        return cake.dim128_split_program(rg, hpg, 148, arch, gated)
+
+    assert dim128(512, 1, gated=True) is None
+    assert dim128(518, 1) == ("stp_dim128_hpc1_s2w4", 1, 2)  # 518 CTAs: 3.5 per SM
+    assert dim128(519, 1) is None
+    assert dim128(1776, 8) == ("stp_dim128_hpc2_s2w4_mb5", 2, 2)  # 7104 CTAs: 48 per SM
+    assert dim128(1775, 8) is None  # 7100 CTAs: the two-head build
+    assert dim128(888, 8) is None  # 3552 CTAs: 24 per SM, 8 waves
+    assert dim128(1776, 8, "sm_103a") is None
+    assert cake.dim128_split_program(4096, 8, 152, "sm_103a", False) is None
+
+
+@requires_blackwell
+@pytest.mark.parametrize("batch_size", (221, 222))
+def test_dim128_two_head_split_starts_at_sixteen_waves(batch_size) -> None:
+    """On B200 the two-head 128x128 build runs split two ways at five CTAs per SM from 48 two-head CTAs per SM
+    (batch 222 of 64 heads in 8 groups: 7104 CTAs); batch 221 keeps the two-head build.  GB300 never splits it."""
+    bf16 = torch.bfloat16
+    case = ("waves16", batch_size, 64, 8, 128, 128, 0, bf16, "auto", False, None)
+    plan = _route(_make_case(case))
+    assert plan is not None
+    if not _routes_as_measured():
+        pytest.skip("the split floor is measured on B200 and GB300 only")
+    b200 = cake._sm_count(plan.device_index) == 148 and plan.arch == "sm_100a"
+    split = b200 and batch_size == 222
+    assert plan.program == ("stp_dim128_hpc2_s2w4_mb5" if split else "stp_dim128_hpc2")
+    assert plan.grid == (batch_size * 8 * 4 * (2 if split else 1), 1, 1)
+
+
 # (case, z, the program the route selects): canonical layouts on every paired row-major program.
 _PAIRED_ROWS_CASES = (
     (("dim128_hpc2", 64, 64, 8, 128, 128, 0), False, "stp_dim128_hpc2"),
-    (("dim128_hpc1", 32, 16, 16, 128, 128, 0), False, "stp_dim128_hpc1_mb4"),
+    (("dim128_hpc1", 32, 16, 16, 128, 128, 0), False, "stp_dim128_hpc1_s2w4"),
+    (("dim128_hpc1_mb4", 40, 16, 16, 128, 128, 0), False, "stp_dim128_hpc1_mb4"),
     (("dim128_z", 64, 64, 8, 128, 128, 0), True, "stp_dim128_z_gated"),
     (("dim128_z_hpc1", 32, 16, 16, 128, 128, 0), True, "stp_dim128_z_gated"),
-    (("hd64_one_head", 5, 128, 8, 64, 128, 0), False, "stp_hd64_paired_hpc1_ratio8"),
-    (("hd64_one_head_g4", 5, 128, 4, 64, 128, 0), False, "stp_hd64_paired_hpc1"),
+    (
+        ("hd64_one_head", 4, 128, 8, 64, 128, 0),
+        False,
+        "stp_hd64_paired_hpc1_ratio8_s4w2",
+    ),
+    (("hd64_one_head_g4", 4, 128, 4, 64, 128, 0), False, "stp_hd64_paired_hpc1_s4w2"),
+    (
+        ("hd64_two_heads", 5, 128, 8, 64, 128, 0),
+        False,
+        "stp_hd64_paired_hpc2_ratio8_s2w4",
+    ),
+    (("hd64_two_heads_g4", 5, 128, 4, 64, 128, 0), False, "stp_hd64_paired_hpc2_s2w4"),
     (("hd64_two_ctas", 8, 128, 8, 64, 128, 0), False, "stp_hd64_paired_hpc2_mb2"),
-    (("hd64_two_heads", 10, 128, 8, 64, 128, 0), False, "stp_hd64_paired_hpc2"),
-    (("hd64_four_heads", 16, 128, 8, 64, 128, 0), False, "stp_hd64_paired_hpc4"),
-    (("hd64_four_heads_z", 16, 128, 8, 64, 128, 0), True, "stp_hd64_paired_hpc4"),
+    (("hd64_one_head_odd", 20, 32, 16, 64, 128, 0), False, "stp_hd64_paired_hpc1"),
+    (("hd64_four_split", 10, 128, 8, 64, 128, 0), False, "stp_hd64_paired_hpc4_s2w4"),
+    (("hd64_four_heads", 16, 128, 8, 64, 128, 0), False, "stp_hd64_paired_hpc4_s2w4"),
+    (("hd64_four_heads_z", 16, 128, 8, 64, 128, 0), True, "stp_hd64_paired_hpc4_s2w4"),
+    (("hd64_four_s4", 20, 128, 8, 64, 128, 0), False, "stp_hd64_paired_hpc4_s4w2"),
+    (("hd64_two_heads_wide", 64, 128, 8, 64, 128, 0), False, "stp_hd64_paired_hpc2"),
+    (("hd64_mb5", 32, 128, 8, 64, 128, 0), False, "stp_hd64_paired_hpc2_s2w4_mb5"),
 )
 
 
@@ -841,10 +969,186 @@ def test_paired_rows_routes_match_flashinfer(case, gated, program, cake_hits) ->
     assert plan is not None
     if _routes_as_measured():
         assert plan.program == program
+    _assert_split_grid(plan)
     reference, candidate = _split_arms(inputs)
     out_reference = selective_state_update(**reference, backend="flashinfer")
     out_candidate = cake_selective_state_update(**candidate)
     assert cake_hits == [True], "the paired row-major route must run on Cake"
+    _assert_arms_close(candidate, out_candidate, reference, out_reference)
+
+
+# Each P-split build: the unsplit build it is bitwise equal to, its heads per CTA and its CTAs per work tile.
+_SPLIT_UNSPLIT = {
+    "stp_hd64_paired_hpc1_ratio8_s4w2": ("stp_hd64_paired_hpc1_ratio8", 1, 4),
+    "stp_hd64_paired_hpc1_s4w2": ("stp_hd64_paired_hpc1", 1, 4),
+    "stp_hd64_paired_hpc2_ratio8_s2w4": ("stp_hd64_paired_hpc2", 2, 2),
+    "stp_hd64_paired_hpc2_s2w4": ("stp_hd64_paired_hpc2", 2, 2),
+    "stp_hd64_paired_hpc2_s2w4_mb5": ("stp_hd64_paired_hpc2", 2, 2),
+    "stp_hd64_paired_hpc4_s2w4": ("stp_hd64_paired_hpc4", 4, 2),
+    "stp_hd64_paired_hpc4_s4w2": ("stp_hd64_paired_hpc4", 4, 4),
+    "stp_dim128_hpc1_s2w4": ("stp_dim128_hpc1_mb4", 1, 2),
+    "stp_dim128_hpc2_s2w4_mb5": ("stp_dim128_hpc2", 2, 2),
+}
+# (nheads, ngroups, dim) each build is checked on: eight program heads per group for the folded ratio, a
+# runtime ratio (two or four program heads per group) otherwise; every head ratio is one FlashInfer's
+# reference kernel dispatches.
+_SPLIT_HEADS = {
+    "stp_hd64_paired_hpc1_ratio8_s4w2": (128, 8, 64),
+    "stp_hd64_paired_hpc1_s4w2": (64, 16, 64),
+    "stp_hd64_paired_hpc2_ratio8_s2w4": (128, 8, 64),
+    "stp_hd64_paired_hpc2_s2w4": (128, 16, 64),
+    "stp_hd64_paired_hpc2_s2w4_mb5": (128, 8, 64),
+    "stp_hd64_paired_hpc4_s2w4": (128, 8, 64),
+    "stp_hd64_paired_hpc4_s4w2": (128, 8, 64),
+    "stp_dim128_hpc1_s2w4": (16, 16, 128),
+    "stp_dim128_hpc2_s2w4_mb5": (64, 8, 128),
+}
+# ``z`` and the raw ABI reach the headdim-64 builds only (a gated headdim-128 call runs the z-gated build).
+_SPLIT_VARIANTS = ("plain", "pad", "dst", "disable", "padded", "z", "raw")
+_SPLIT_CASES = [
+    (program, variant)
+    for program in _SPLIT_UNSPLIT
+    for variant in _SPLIT_VARIANTS
+    if program.startswith("stp_hd64") or variant not in ("z", "raw")
+]
+
+
+def _assert_split_grid(plan) -> None:
+    """A P-split plan launches ``p_split`` CTAs on every work tile of its heads per CTA."""
+    split = _SPLIT_UNSPLIT.get(plan.program.removesuffix("_bf16_i32"))
+    if split is None:
+        return
+    _, heads_per_cta, p_split = split
+    bindings = plan.bindings
+    heads_per_group = bindings["nheads"] // bindings["ngroups"]
+    assert bindings["head_tiles"] == -(-heads_per_group // heads_per_cta)
+    tiles = bindings["x"].shape[0] * bindings["ngroups"] * bindings["head_tiles"]
+    assert plan.grid == (tiles * p_split, 1, 1)
+
+
+def _padded_batch_stride(rows):
+    """The ``(batch, n, row)`` tensor as dense rows at a batch stride 128 elements wider."""
+    batch_size, n, row = rows.shape
+    wide = torch.zeros(
+        (batch_size, n * row + 128), dtype=rows.dtype, device=rows.device
+    )
+    view = wide[:, : n * row].view(batch_size, n, row)
+    view.copy_(rows)
+    return view
+
+
+def _split_inputs(program, variant):
+    """One P-split check: eight batch rows on the build's head geometry (enough program heads for the paired
+    programs' bindings on every SM100 / SM103 part), changed as ``variant`` says."""
+    nheads, ngroups, dim = _SPLIT_HEADS[program]
+    batch = 8
+    if variant == "raw":
+        return _raw_decode_case(batch, torch.bfloat16, nheads, ngroups)
+    bf16 = torch.bfloat16
+    case = ("split", batch, nheads, ngroups, dim, 128, 0, bf16, "auto", False, None)
+    inputs = _make_case(case)
+    generator = torch.Generator(device="cuda").manual_seed(1)
+    if variant == "pad":
+        inputs["state_batch_indices"][0] = -1
+    elif variant == "dst":
+        # Read the batch's slots and write a second set of slots of a pool twice the batch.
+        state = inputs["state"]
+        written = torch.randn(state.shape, generator=generator, device="cuda") * 0.05
+        inputs["state"] = torch.cat((state, written.to(state.dtype)))
+        inputs["dst_state_batch_indices"] = inputs["state_batch_indices"] + batch
+    elif variant == "disable":
+        inputs["disable_state_update"] = True
+    elif variant == "padded":
+        for key in ("x", "B", "C"):
+            inputs[key] = _padded_batch_stride(inputs[key])
+    elif variant == "z":
+        z = torch.randn(inputs["x"].shape, generator=generator, device="cuda") * 0.5
+        inputs["z"] = z.to(torch.bfloat16)
+    return inputs
+
+
+def _launch_paired(plan, program, heads_per_cta, p_split) -> None:
+    """Launch one paired row-major build on a route's bindings: ``p_split`` CTAs per work tile of
+    ``heads_per_cta`` program heads of one (batch, group)."""
+    bindings = plan.bindings
+    ngroups = bindings["ngroups"]
+    head_tiles = -(-(bindings["nheads"] // ngroups) // heads_per_cta)
+    grid = (bindings["x"].shape[0] * ngroups * head_tiles * p_split, 1, 1)
+    with torch.cuda.device(plan.device_index):
+        cake._program(program, plan.arch, ()).launch(
+            grid, dict(bindings, head_tiles=head_tiles)
+        )
+
+
+@requires_blackwell
+@pytest.mark.parametrize(
+    "program, variant", _SPLIT_CASES, ids=[f"{p}-{v}" for p, v in _SPLIT_CASES]
+)
+def test_split_programs_are_bitwise_the_unsplit_builds(program, variant) -> None:
+    """Each P-split build writes the output and state of the unsplit build it splits, bit for bit, on the same
+    bindings, and matches FlashInfer: pad slot, destination table, disabled state update, padded batch
+    strides, ``z`` and the raw ABI (BF16 coefficients, int32 slot tables)."""
+    unsplit, heads_per_cta, p_split = _SPLIT_UNSPLIT[program]
+    inputs = _split_inputs(program, variant)
+    if variant == "raw":
+        program, unsplit = f"{program}_bf16_i32", f"{unsplit}_bf16_i32"
+    arch = cake._device_arch(torch.cuda.current_device())
+    module = cake.PROGRAMS[program]
+    arches = cake.MODULES[module].get("arches", [arch])
+    if arch not in arches:
+        with pytest.raises(ValueError, match="not delivered"):
+            cake.jit_spec(module, arch)
+        pytest.skip(f"{program} is delivered for {arches} only")
+    initial_state = inputs["state"].clone()
+    split_arm, unsplit_arm = _split_arms(inputs)
+    if variant == "raw":
+        reference = _canonical_arm(inputs)
+    else:
+        reference = dict(inputs, state=inputs["state"].clone())
+        for key in ("x", "B", "C"):
+            reference[key] = reference[key].contiguous()
+    out_reference = selective_state_update(
+        **reference, backend="flashinfer", pad_slot_id=-1
+    )
+    plans = [_route(arm) for arm in (split_arm, unsplit_arm)]
+    builds = ((program, p_split), (unsplit, 1))
+    for plan, (build, ctas_per_tile) in zip(plans, builds, strict=True):
+        assert plan is not None and "head_tiles" in plan.bindings, (
+            "the call must plan the paired programs' bindings"
+        )
+        _launch_paired(plan, build, heads_per_cta, ctas_per_tile)
+    out_split, out_unsplit = (plan.bindings["output"] for plan in plans)
+    assert torch.equal(out_split, out_unsplit)
+    assert torch.equal(split_arm["state"], unsplit_arm["state"])
+    torch.testing.assert_close(out_split, out_reference, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        split_arm["state"], reference["state"], atol=1e-2, rtol=1e-2
+    )
+    if variant == "disable":
+        assert torch.equal(split_arm["state"], initial_state)
+
+
+@requires_blackwell
+def test_hd64_split_layout_outside_the_paired_programs_runs_the_row_owner_tile(
+    cake_hits,
+) -> None:
+    """A launch the P-split rule takes (one to two program heads per SM) whose ``D`` steps heads at stride two
+    is outside the paired programs' addressing: it runs the direct row-owner tile."""
+    inputs = _make_case(_case("stp_hd64_rows_bf16"))
+    if _routes_as_measured():
+        assert _route(inputs).program == "stp_hd64_paired_hpc1_ratio8_s4w2"
+    nheads, dim = inputs["D"].shape
+    D_rows = inputs["D"][:, 0].contiguous()
+    D_wide = torch.zeros(2 * nheads, dtype=D_rows.dtype, device="cuda")
+    D_wide[::2].copy_(D_rows)
+    inputs["D"] = D_wide.as_strided((nheads, dim), (2, 0))
+    plan = _route(inputs)
+    assert plan is not None and plan.program.startswith("stp_hd64_rows_bf16")
+    reference, candidate = _split_arms(inputs)
+    reference["D"] = D_rows.as_strided((nheads, dim), (1, 0))
+    out_reference = selective_state_update(**reference, backend="flashinfer")
+    out_candidate = cake_selective_state_update(**candidate)
+    assert cake_hits == [True], "the row-owner tile must serve the call"
     _assert_arms_close(candidate, out_candidate, reference, out_reference)
 
 
@@ -1328,6 +1632,10 @@ def test_jit_names_stay_within_the_file_name_limit() -> None:
             defines = tuple((name, int(values[name])) for name in record["defines"])
             assert digest == ("" if not defines else cake.define_digest(defines))
             for arch in ("sm_100a", "sm_103a"):
+                if arch not in record.get("arches", (arch,)):
+                    with pytest.raises(ValueError, match="not delivered"):
+                        cake.jit_spec(module, arch, defines)
+                    continue
                 spec = cake.jit_spec(module, arch, defines)
                 assert len(spec.name.encode()) < 200
                 assert spec.name not in seen
@@ -1354,10 +1662,12 @@ def test_jit_names_stay_within_the_file_name_limit() -> None:
 
 def test_aot_table_names_every_delivered_build() -> None:
     """The AOT specifications are exactly the loader's build specifications: every program instantiation, on
-    both architectures."""
+    each architecture the program is delivered for."""
     for arch in ("sm_100a", "sm_103a"):
         expected = set()
         for module, record in cake.MODULES.items():
+            if arch not in record.get("arches", (arch,)):
+                continue
             for values in (record["instantiations"] or {"": {}}).values():
                 defines = tuple((name, int(values[name])) for name in record["defines"])
                 expected.add(cake.jit_spec(module, arch, defines).name)
@@ -1367,11 +1677,18 @@ def test_aot_table_names_every_delivered_build() -> None:
 
 
 def test_registry_names_every_program() -> None:
+    hd64_unsplit = ("hpc1_ratio8", "hpc1", "hpc2_mb2", "hpc2", "hpc4")
     paired_rows = {
         f"stp_hd64_paired_{variant}{abi}"
-        for variant in ("hpc1_ratio8", "hpc1", "hpc2_mb2", "hpc2", "hpc4")
+        for variant in hd64_unsplit
         for abi in ("", "_bf16_i32")
     } | {"stp_dim128_hpc2", "stp_dim128_hpc1_mb4", "stp_dim128_z_gated"}
+    # The P-split builds of the headdim-64 pairs in both ABIs, and of the 128x128 heads.
+    split = {
+        f"{program}{abi}" for program in _SPLIT_UNSPLIT for abi in ("", "_bf16_i32")
+    }
+    split -= {"stp_dim128_hpc1_s2w4_bf16_i32", "stp_dim128_hpc2_s2w4_mb5_bf16_i32"}
+    assert len(split) == 16
     rows = {
         f"stp_hd64_rows_{band}{abi}"
         for band in ("bf16_dt8", "bf16_dt4_od", "fp32_dt8", "fp32_dt1_large")
@@ -1403,8 +1720,13 @@ def test_registry_names_every_program() -> None:
     # build) and the six-token cache producer instantiated per projection layout (layouts beyond the rendered
     # three).
     carried = {"stp_hd64_rows_fp32", "mtp_cache_c4_t6"}
-    assert set(cake.PROGRAMS) == paired_rows | rows | multi_token | carried
-    assert len(cake.PROGRAMS) == 42
+    assert set(cake.PROGRAMS) == paired_rows | split | rows | multi_token | carried
+    assert len(cake.PROGRAMS) == 58
+    # The two-head 128x128 build split two ways at five CTAs per SM ships for sm_100a alone.
+    narrowed = {p for p, m in cake.PROGRAMS.items() if "arches" in cake.MODULES[m]}
+    assert narrowed == {"stp_dim128_hpc2_s2w4_mb5"}
+    mb5 = cake.MODULES[cake.PROGRAMS["stp_dim128_hpc2_s2w4_mb5"]]
+    assert mb5["arches"] == ["sm_100a"]
     for program in carried:
         assert cake.MODULES[cake.PROGRAMS[program]]["defines"]
     for program in set(cake.PROGRAMS) - carried:
