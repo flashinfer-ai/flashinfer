@@ -44,6 +44,18 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
+// Shared by every record that names this translation unit in its sources: the record's
+// compile_flags set the knob values below (a knob without a -D flag is a compile error) and name
+// the kernel symbol (-DCAKE_PROGRAM_KERNEL=<its own symbol>; every JIT library of the family
+// exports a distinct kernel).
+//   CAKE_L2_EVICT_FIRST  1 = K/V TMA loads carry the L2 evict-first cache hint; 0 = plain loads
+#ifndef CAKE_L2_EVICT_FIRST
+#error "CAKE_L2_EVICT_FIRST must come from the record's compile_flags"
+#endif
+#ifndef CAKE_PROGRAM_KERNEL
+#error "CAKE_PROGRAM_KERNEL (the program's kernel symbol) must come from the record's compile_flags"
+#endif
+
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_KV8_OFF 1024
@@ -136,6 +148,18 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
   return c;
 }
 
+#if !CAKE_L2_EVICT_FIRST
+__device__ __forceinline__ void tma_3d_gmem2smem(int dst, const void* tmap_ptr, int x, int y, int z,
+                                                 int mbar_addr) {
+  asm volatile(
+      "cp.async.bulk.tensor.3d.shared::cta.global"
+      ".mbarrier::complete_tx::bytes"
+      " [%0], [%1, {%2, %3, %4}], [%5];" ::"r"(dst),
+      "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(mbar_addr)
+      : "memory");
+}
+#endif
+
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
   uint32_t result;
   asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;" : "=r"(result) : "r"(val));
@@ -144,8 +168,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 
 extern "C" {
 
-__global__
-__launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_d569914059e33efb7b5d(
+__global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void CAKE_PROGRAM_KERNEL(
     unsigned int* __restrict__ Q32, const __grid_constant__ CUtensorMap K,
     const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O,
     int* __restrict__ q2k_indices, int* __restrict__ page_table, int* __restrict__ seqused_k,
@@ -288,6 +311,7 @@ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_d569914059
     if (warp == 1) {
       if (elect_sync()) {
         mbarrier_arrive_expect_tx(kv_full_addr, 32768);
+#if CAKE_L2_EVICT_FIRST
         asm volatile(
             "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
             " [%0], [%1, {%2, %3, %4}], [%5], %6;" ::"r"(kv8_addr),
@@ -310,6 +334,12 @@ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_d569914059
             "l"((&V)), "r"(0), "r"(64), "r"(page_head), "r"(kv_full_addr),
             "l"(0x12F0000000000000ULL)
             : "memory");
+#else
+        tma_3d_gmem2smem(kv8_addr, (&K), 0, 0, page_head, kv_full_addr);
+        tma_3d_gmem2smem(kv8_addr + 8192, (&K), 0, 64, page_head, kv_full_addr);
+        tma_3d_gmem2smem(kv8_addr + 16384, (&V), 0, 0, page_head, kv_full_addr);
+        tma_3d_gmem2smem(kv8_addr + 24576, (&V), 0, 64, page_head, kv_full_addr);
+#endif
       }
     }
   }
@@ -705,6 +735,7 @@ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_d569914059
       if (warp == 1) {
         if (elect_sync()) {
           mbarrier_arrive_expect_tx(kv_full_addr + 8, 32768);
+#if CAKE_L2_EVICT_FIRST
           asm volatile(
               "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_"
               "hint"
@@ -733,6 +764,12 @@ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_d569914059
               "l"((&V)), "r"(0), "r"(64), "r"(page_head_1), "r"(kv_full_addr + 8),
               "l"(0x12F0000000000000ULL)
               : "memory");
+#else
+          tma_3d_gmem2smem(kv8_addr + 32768, (&K), 0, 0, page_head_1, kv_full_addr + 8);
+          tma_3d_gmem2smem(kv8_addr + 32768 + 8192, (&K), 0, 64, page_head_1, kv_full_addr + 8);
+          tma_3d_gmem2smem(kv8_addr + 32768 + 16384, (&V), 0, 0, page_head_1, kv_full_addr + 8);
+          tma_3d_gmem2smem(kv8_addr + 32768 + 24576, (&V), 0, 64, page_head_1, kv_full_addr + 8);
+#endif
         }
       }
     }
@@ -1630,6 +1667,7 @@ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_d569914059
       if (warp == 1) {
         if (elect_sync()) {
           mbarrier_arrive_expect_tx(kv_full_addr + (stage) * 8, 32768);
+#if CAKE_L2_EVICT_FIRST
           asm volatile(
               "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_"
               "hint"
@@ -1662,6 +1700,16 @@ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_d569914059
               "l"((&V)), "r"(0), "r"(64), "r"(page_head_2_1), "r"(kv_full_addr + (stage) * 8),
               "l"(0x12F0000000000000ULL)
               : "memory");
+#else
+          tma_3d_gmem2smem(kv8_addr + (unsigned int)(stage * 32768), (&K), 0, 0, page_head_2_1,
+                           kv_full_addr + (stage) * 8);
+          tma_3d_gmem2smem(kv8_addr + (unsigned int)(stage * 32768) + 8192, (&K), 0, 64,
+                           page_head_2_1, kv_full_addr + (stage) * 8);
+          tma_3d_gmem2smem(kv8_addr + (unsigned int)(stage * 32768) + 16384, (&V), 0, 0,
+                           page_head_2_1, kv_full_addr + (stage) * 8);
+          tma_3d_gmem2smem(kv8_addr + (unsigned int)(stage * 32768) + 24576, (&V), 0, 64,
+                           page_head_2_1, kv_full_addr + (stage) * 8);
+#endif
         }
       }
     }

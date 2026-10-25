@@ -18,7 +18,8 @@ Registry-form consistency of the Cake Hopper (SM90) MSA programs, on the CPU.
 ``flashinfer.jit.cake_hopper_msa`` registers one program per physical
 schedule: ``MODULES`` carries each program's two sources, compile flags, FFI
 entry and argument order, ``ROUTES`` maps each logical route to the program
-that serves it.  A binding source is shared by the programs of one role; the
+that serves it.  A binding source is shared by the programs of one role and a
+kernel source by the programs that differ only in a compile-time constant; the
 record's ``-D`` compile flags select the program (its kernel symbol, dynamic
 shared memory and block size for the binding).  These checks hold the registry
 to its sources under ``csrc/cake_hopper_msa/`` and to the host module that
@@ -191,6 +192,13 @@ def _defines(name: str) -> dict[str, str]:
     return defines
 
 
+def _knobs(name: str) -> tuple[tuple[str, str], ...]:
+    """The record's knob flags: its ``-D`` defines other than the three binding constants."""
+
+    defines = _defines(name)
+    return tuple(sorted(d for d in defines.items() if d[0] not in _BINDING_FLAGS))
+
+
 def _is_name(node: ast.AST, identifier: str) -> bool:
     return isinstance(node, ast.Name) and node.id == identifier
 
@@ -313,7 +321,9 @@ def test_units_match_the_record(name):
 
 def test_shared_bindings_serve_one_route_family_each():
     """A binding source is shared only within a route family (its tensor-map geometry and argument plan
-    are the family's), and the programs sharing it differ in their flag values."""
+    are the family's), and the programs sharing it differ in their flag values; a kernel source is shared
+    only within a family too, by programs whose knob flags differ, and a shared kernel takes its symbol
+    from the ``CAKE_PROGRAM_KERNEL`` flag."""
 
     by_binding: dict[str, list[str]] = {}
     for name in _PROGRAMS:
@@ -327,6 +337,18 @@ def test_shared_bindings_serve_one_route_family_each():
         assert len(set(flags)) == len(flags), (
             f"{binding}: two programs with the same flags"
         )
+    by_kernel: dict[str, list[str]] = {}
+    for name in _PROGRAMS:
+        by_kernel.setdefault(jm.MODULES[name]["kernel"], []).append(name)
+    for kernel, names in by_kernel.items():
+        routes = [next(r for r, n in jm.ROUTES.items() if n == name) for name in names]
+        assert len({ch._route_family(route) for route in routes}) == 1, kernel
+        knobs = [_knobs(name) for name in names]
+        assert len(set(knobs)) == len(knobs), (
+            f"{kernel}: two programs with the same knobs"
+        )
+        if len(names) > 1:
+            assert "void CAKE_PROGRAM_KERNEL(" in (_CSRC / kernel).read_text(), kernel
 
 
 @pytest.mark.parametrize("name", _PROGRAMS)

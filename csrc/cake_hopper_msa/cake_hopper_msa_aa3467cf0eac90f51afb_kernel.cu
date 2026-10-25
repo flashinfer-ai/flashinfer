@@ -44,6 +44,18 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
+// Shared by every record that names this translation unit in its sources: the record's
+// compile_flags set the knob values below (a knob without a -D flag is a compile error) and name
+// the kernel symbol (-DCAKE_PROGRAM_KERNEL=<its own symbol>; every JIT library of the family
+// exports a distinct kernel).
+//   CAKE_FOLD  1 = alternate-block fold of the flat CTA index (the F form); 0 = the plain raster
+#ifndef CAKE_FOLD
+#error "CAKE_FOLD must come from the record's compile_flags"
+#endif
+#ifndef CAKE_PROGRAM_KERNEL
+#error "CAKE_PROGRAM_KERNEL (the program's kernel symbol) must come from the record's compile_flags"
+#endif
+
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_Q_S_OFF 1024
@@ -132,8 +144,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 
 extern "C" {
 
-__global__
-__launch_bounds__(288, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_aa3467cf0eac90f51afb(
+__global__ __launch_bounds__(288, LAUNCH_MIN_BLOCKS) void CAKE_PROGRAM_KERNEL(
     const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K,
     float* __restrict__ out, int* __restrict__ cu_seqlens_q, int* __restrict__ page_table,
     int* __restrict__ seqused_k, int* __restrict__ q_offset, int has_qoff, int pt_stride,
@@ -193,6 +204,7 @@ __launch_bounds__(288, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_aa3467cf0e
         int split = blockIdx.y;
         int b = blockIdx.z;
         int mt = gridDim.x / num_heads - 1 - bx / num_heads;
+#if CAKE_FOLD
         split = bx / num_heads;
         mt = gridDim.y - 1 - blockIdx.y;
         int lid = bx + gridDim.x * blockIdx.y;
@@ -209,6 +221,7 @@ __launch_bounds__(288, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_aa3467cf0e
         bx = lid - byf * gridDim.x;
         split = bx / num_heads;
         mt = gridDim.y - 1 - byf;
+#endif
         int pt_base = b * pt_stride + split;
         int pg_first = page_table[pt_base];
         int h = bx % num_heads;
@@ -277,6 +290,7 @@ __launch_bounds__(288, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_aa3467cf0e
       int split_1 = blockIdx.y;
       int b_1 = blockIdx.z;
       int mt_1 = gridDim.x / num_heads - 1 - bx_1 / num_heads;
+#if CAKE_FOLD
       split_1 = bx_1 / num_heads;
       mt_1 = gridDim.y - 1 - blockIdx.y;
       int lid_1 = bx_1 + gridDim.x * blockIdx.y;
@@ -293,6 +307,7 @@ __launch_bounds__(288, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_aa3467cf0e
       bx_1 = lid_1 - byf_1 * gridDim.x;
       split_1 = bx_1 / num_heads;
       mt_1 = gridDim.y - 1 - byf_1;
+#endif
       int h_1 = bx_1 % num_heads;
       int qlo_1 = cu_seqlens_q[b_1];
       int sqb_1 = cu_seqlens_q[b_1 + 1] - qlo_1;

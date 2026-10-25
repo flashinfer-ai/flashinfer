@@ -44,6 +44,26 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
+// Shared by every record that names this translation unit in its sources: the record's
+// compile_flags set the knob values below (a knob without a -D flag is a compile error) and name
+// the kernel symbol (-DCAKE_PROGRAM_KERNEL=<its own symbol>; every JIT library of the family
+// exports a distinct kernel).
+//   CAKE_HQ     query heads per KV head of the route (hq1 / hq2 / hq4)
+//   CAKE_SQ     max query length of the route (sq1 .. sq4)
+//   CAKE_HQ_SQ  CAKE_HQ * CAKE_SQ, the query rows per batch element
+#ifndef CAKE_HQ
+#error "CAKE_HQ must come from the record's compile_flags"
+#endif
+#ifndef CAKE_SQ
+#error "CAKE_SQ must come from the record's compile_flags"
+#endif
+#ifndef CAKE_HQ_SQ
+#error "CAKE_HQ_SQ must come from the record's compile_flags"
+#endif
+#ifndef CAKE_PROGRAM_KERNEL
+#error "CAKE_PROGRAM_KERNEL (the program's kernel symbol) must come from the record's compile_flags"
+#endif
+
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_K_S_OFF 1024
@@ -121,8 +141,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 
 extern "C" {
 
-__global__
-__launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_e9f9ae0d08ebbf603198(
+__global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void CAKE_PROGRAM_KERNEL(
     const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K,
     float* __restrict__ out, int* __restrict__ page_table, int* __restrict__ seqused_k,
     int* __restrict__ q_offset, int has_qoff, int pt_stride, int max_k_tiles, int total_q,
@@ -186,13 +205,23 @@ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_e9f9ae0d08
   int sk = seqused_k[b];
   int page = page_table[b * pt_stride + t];
   int nb = (sk + 127) / 128;
-  int qoff = sk - 1;
+  int qoff = sk - CAKE_SQ;
   if (has_qoff != 0) {
     qoff = q_offset[b];
   }
+#if CAKE_HQ == 1 && CAKE_SQ == 1
   int oidx = ((tid_1 - tid_1) * max_k_tiles + t) * total_q + b + tid_1;
+#elif CAKE_HQ == 1
+  int oidx = ((tid_1 - tid_1) * max_k_tiles + t) * total_q + b * CAKE_SQ + tid_1;
+#elif CAKE_SQ == 1
+  int oidx =
+      ((tid_1 - tid_1 / CAKE_HQ * CAKE_HQ) * max_k_tiles + t) * total_q + b + tid_1 / CAKE_HQ;
+#else
+  int oidx = ((tid_1 - tid_1 / CAKE_HQ * CAKE_HQ) * max_k_tiles + t) * total_q + b * CAKE_SQ +
+             tid_1 / CAKE_HQ;
+#endif
   if (t >= nb) {
-    if (tid_1 < 1) {
+    if (tid_1 < CAKE_HQ_SQ) {
       out[oidx] = -CUDART_INF_F;
     }
   }
@@ -230,17 +259,29 @@ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_e9f9ae0d08
           tma_2d_gmem2smem(k_s_addr, (&K), 0, krow, full_addr);
           tma_2d_gmem2smem(k_s_addr + 8192, (&K), 0, krow + 64, full_addr);
         }
+#if CAKE_HQ == 1 && CAKE_SQ == 1
         tma_2d_gmem2smem(q_s_addr, (&Q), 0, b, full_addr);
+#else
+        tma_2d_gmem2smem(q_s_addr, (&Q), 0, b * CAKE_HQ_SQ, full_addr);
+#endif
       }
     }
     int sk1 = sk - 1;
     int limc[2];
+#if CAKE_HQ == 1
     int pos = qoff + 2 * cq;
+#else
+    int pos = qoff + 2 * cq / CAKE_HQ;
+#endif
     if (pos > sk1) {
       pos = sk1;
     }
     limc[0] = pos - t * 128;
+#if CAKE_HQ == 1
     int pos_0 = qoff + (2 * cq + 1);
+#else
+    int pos_0 = qoff + (2 * cq + 1) / CAKE_HQ;
+#endif
     if (pos_0 > sk1) {
       pos_0 = sk1;
     }
@@ -360,7 +401,7 @@ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_e9f9ae0d08
       red[(2 * lane_0 + 1) * 4 + warp_1] = cm[1];
     }
     asm volatile("barrier.sync 1, 128;" ::: "memory");
-    if (tid_1 < 1) {
+    if (tid_1 < CAKE_HQ_SQ) {
       float rv[4];
       asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                    : "=r"(*reinterpret_cast<uint32_t*>(&rv[0])),
