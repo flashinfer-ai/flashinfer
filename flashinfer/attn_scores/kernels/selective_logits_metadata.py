@@ -1628,6 +1628,8 @@ class SelectiveLogitsFinalizeKernel:
         tidx, _, _ = cute.arch.thread_idx()
         block_idx, _, _ = cute.arch.block_idx()
         row = block_idx * self.threads + tidx
+        # PDL secondary: the scorer's counts/values are visible only after wait.
+        cute.arch.griddepcontrol_wait()
         if row < rows:
             total = counts[(row, 0)]
             lengths[row] = min(total, capacity)
@@ -1646,6 +1648,7 @@ class SelectiveLogitsFinalizeKernel:
     ):
         tidx, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
+        cute.arch.griddepcontrol_wait()
         segment_capacity = cutlass.const_expr(self.capacity // self.num_segments)
 
         smem = SmemAllocator()
@@ -1724,6 +1727,7 @@ class SelectiveLogitsFinalizeKernel:
         """Compact fixed store-lane vector slices through shared memory."""
         tidx, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
+        cute.arch.griddepcontrol_wait()
         segment_capacity = cutlass.const_expr(self.capacity // self.num_segments)
         finalize_threads = cutlass.const_expr(512)
         num_warps = cutlass.const_expr(finalize_threads // 32)
