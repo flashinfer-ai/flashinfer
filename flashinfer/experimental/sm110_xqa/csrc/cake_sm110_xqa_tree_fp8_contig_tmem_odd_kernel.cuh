@@ -51,14 +51,6 @@
 #include "cake_sm110_xqa_kv_cache_list_contig.h"
 
 #include <math_constants.h>
-#define CAKE_SM110_XQA_NEED_MBARRIER_WAIT_HINT
-#define CAKE_SM110_XQA_NEED_ELECT_COMMIT
-#define CAKE_SM110_XQA_NEED_MBARRIER_ARRIVE
-#define CAKE_SM110_XQA_NEED_TMEM_ST_X16_F32
-#define CAKE_SM110_XQA_NEED_TMEM_ST_X32
-#define CAKE_SM110_XQA_NEED_APPROX_RCP
-#define CAKE_SM110_XQA_NEED_TCGEN05_COMMIT_LEADER
-#define CAKE_SM110_XQA_NEED_TMEM_LD_X16
 #include "cake_sm110_xqa_device_helpers.cuh"
 extern "C" {
 
