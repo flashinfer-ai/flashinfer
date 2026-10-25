@@ -72,6 +72,7 @@ from .cake_plan import (
     Geometry,
     cell_from_knobs,
     combine_grid,
+    fused_grid,
     local_buffers,
     select_cell,
     symmetric_buffers,
@@ -787,12 +788,12 @@ class Sm103Bf16Nvfp4Bf16CakeMegaKernelBackend(MegaKernelBackend):
         for cell in cells:
             handle = fused_handle(cell, geometry.hidden, device)
             cluster_ctas = int(math.prod(handle.cluster))
-            clusters = max(1, geometry.sm_count // cluster_ctas)
-            if handle.max_active_clusters is not None:
-                probe = int(handle.max_active_clusters(index))
-                if probe > 0:
-                    clusters = min(clusters, probe)
-            grids[cell.suffix] = clusters * cluster_ctas
+            probe = (
+                int(handle.max_active_clusters(index))
+                if handle.max_active_clusters is not None
+                else None
+            )
+            grids[cell.suffix] = fused_grid(geometry.sm_count, cluster_ctas, probe)[0]
         return grids
 
     def _collective_fused_grids(

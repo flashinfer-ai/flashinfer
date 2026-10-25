@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -214,6 +214,21 @@ def combine_grid(capacity: int, hidden: int) -> Tuple[int, int, int]:
     never happens here)."""
 
     return (hidden // COMBINE_HIDDEN_PER_CTA, max(capacity, 1), 1)
+
+
+def fused_grid(
+    sm_count: int, cluster_ctas: int, max_active_clusters: Optional[int] = None
+) -> Tuple[int, int, int]:
+    """Grid of the fused program on one rank: ``sm_count // cluster_ctas``
+    clusters (at least one), capped by the binding's residency probe when it
+    exports a positive one, times the cluster size -- the persistent grid whose
+    CTAs must all be co-resident. The backend takes the minimum over the EP
+    ranks so every rank launches the same grid."""
+
+    clusters = max(1, int(sm_count) // int(cluster_ctas))
+    if max_active_clusters is not None and int(max_active_clusters) > 0:
+        clusters = min(clusters, int(max_active_clusters))
+    return (clusters * int(cluster_ctas), 1, 1)
 
 
 def fused_h_max(hidden: int) -> int:
@@ -521,6 +536,7 @@ __all__ = [
     "FUSED_PER_FORWARD_ARGS",
     "KNOWN_HIDDEN_SIZES",
     "fused_h_max",
+    "fused_grid",
     "GRID_ARGS",
     "HIDDEN_ALIGN",
     "INTERMEDIATE_ALIGN",

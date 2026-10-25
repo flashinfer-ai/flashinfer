@@ -20,7 +20,11 @@ limitations under the License.
 # generated loader ``flashinfer/jit/cake_mega_moe_w4a16.py`` publishes one
 # ``CakeProgram`` constant per program (:data:`PROGRAM_IDENTIFIERS`:
 # ``FUSED_N<n>[_CG2][_H<h_max>]`` and ``COMBINE``), each shipped for the
-# exact targets it was rendered for. A program table resolves an identifier
+# exact targets it was rendered for. The route is available when the loader
+# publishes every program of the default pull-slot row and the combine program
+# (:data:`REQUIRED_IDENTIFIERS`); a wider-row variant (``_H<h_max>``) is
+# optional until it ships, and a forward whose hidden size needs one is refused
+# by name when its program is loaded. A program table resolves an identifier
 # to a :class:`ProgramHandle`: the binding's argument names in call order
 # (ending in ``grid_x, grid_y, grid_z``) and the launch callable. A table other
 # than the shipped loader is installed with :func:`set_programs` or named by
@@ -39,6 +43,7 @@ from typing import Any, Callable, Dict, Optional, Protocol, Tuple
 import torch
 
 from .cake_plan import (
+    CELLS,
     COMBINE,
     FUSED,
     GRID_ARGS,
@@ -51,6 +56,13 @@ from .cake_plan import (
 
 LOADER_MODULE = "flashinfer.jit.cake_mega_moe_w4a16"
 PROGRAMS_ENV = "FLASHINFER_CAKE_MEGA_MOE_W4A16_PROGRAMS"
+#: The programs the shipped loader must publish for the route to be available:
+#: the fused program of every cell at the default pull-slot row and the combine
+#: program. The wider-row fused variants are optional until they ship.
+REQUIRED_IDENTIFIERS: Tuple[str, ...] = (
+    *(program_identifier(FUSED, cell) for cell in CELLS),
+    program_identifier(COMBINE),
+)
 #: Exact targets of the family; a device is admitted when the programs ship
 #: for its capability.
 TARGETS: Dict[Tuple[int, int], str] = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
@@ -146,7 +158,7 @@ class ShippedPrograms:
             loader = cls.loader()
         except ImportError:
             return False
-        return all(hasattr(loader, identifier) for identifier in PROGRAM_IDENTIFIERS)
+        return all(hasattr(loader, identifier) for identifier in REQUIRED_IDENTIFIERS)
 
     def targets(self) -> Tuple[Tuple[int, int], ...]:
         try:
@@ -154,7 +166,7 @@ class ShippedPrograms:
         except ImportError:
             return ()
         shipped: Optional[set] = None
-        for identifier in PROGRAM_IDENTIFIERS:
+        for identifier in REQUIRED_IDENTIFIERS:
             program = getattr(loader, identifier, None)
             if program is None:
                 return ()
@@ -178,6 +190,15 @@ class ShippedPrograms:
         identifier = program_identifier(kernel, cell, hidden)
         program = getattr(self.loader(), identifier, None)
         if program is None:
+            if (
+                identifier in PROGRAM_IDENTIFIERS
+                and identifier not in REQUIRED_IDENTIFIERS
+            ):
+                raise RuntimeError(
+                    f"{LOADER_MODULE} publishes no program {identifier!r}: the fused program of "
+                    f"this hidden size ({hidden}) is not shipped yet; hidden sizes up to the "
+                    "default pull-slot row are served"
+                )
             raise RuntimeError(f"{LOADER_MODULE} publishes no program {identifier!r}")
         capability = get_compute_capability(device)
         target = program.target_for(capability)
@@ -285,6 +306,7 @@ def fused_handle(cell: Cell, hidden: int, device: torch.device) -> ProgramHandle
 __all__ = [
     "LOADER_MODULE",
     "PROGRAMS_ENV",
+    "REQUIRED_IDENTIFIERS",
     "TARGETS",
     "ProgramHandle",
     "ProgramTable",
