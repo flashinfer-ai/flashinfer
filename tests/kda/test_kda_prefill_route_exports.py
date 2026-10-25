@@ -274,7 +274,7 @@ UNBOUNDED_ROWS = (
                 "cake_kda_bf16_b38d251875e94cb4aaa6",
             ),
         ),
-        # unchanged selections
+        # short H12 grids keep the bounded N32 body without the early state pack
         (
             (10, 0),
             1,
@@ -283,8 +283,19 @@ UNBOUNDED_ROWS = (
             -5.0,
             True,
             0,
-            ("fused_direct_m128", "cake_kda_bf16_fd04381524dba62b317d"),
+            ("fused_direct_m128", "cake_kda_bf16_5be344cbddc29563f1ee"),
         ),
+        (
+            (10, 3),
+            16,
+            12,
+            128,
+            -5.0,
+            True,
+            0,
+            ("fused_direct_m128", "cake_kda_bf16_5be344cbddc29563f1ee"),
+        ),
+        # unchanged selections
         ((10, 3), 8, 32, 1024, -5.0, True, 0, PREDICTION_FIRST),
         (
             (10, 0),

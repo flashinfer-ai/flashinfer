@@ -2270,12 +2270,10 @@ class FlashKDABlackwellBF16FusedLaunch:
             and (state_indices is not None)
             and (max_seq_len <= H12_DIRECT_N32_MAX_SEQ_LEN)
         )
-        use_early_n32_state_pack = (
-            use_scalar_beta
-            and (not use_direct_m128_n16)
-            and (not use_n32_logical_page64)
-            and (max_seq_len <= H12_DIRECT_N32_EARLY_STATE_PACK_MAX_SEQ_LEN)
-        )
+        # The bounded N32 body without the early state pack is faster on the
+        # short H12 grids and bitwise identical to the early-pack body, so the
+        # prepared path keeps it for every length.
+        use_early_n32_state_pack = False
         use_n32_register_inverse = _should_use_n32_register_inverse(
             direct_n16=use_direct_m128_n16,
             gate_kind=gate_kind,
