@@ -237,10 +237,10 @@ kernel_cake_kda_train_6fac4410ba86c48541c4(const __grid_constant__ CUtensorMap w
     #define tiles_full_addr (mbar_base + 0)
     #define tiles_empty_addr (mbar_base + 16)
     #define hs_ready_addr (mbar_base + 32)
-    #define vp_ready_addr (mbar_base + 40)
-    #define bv_ready_addr (mbar_base + 48)
-    #define h_ready_addr (mbar_base + 56)
-    #define tape_free_addr (mbar_base + 64)
+    #define vp_ready_addr (mbar_base + 48)
+    #define bv_ready_addr (mbar_base + 56)
+    #define h_ready_addr (mbar_base + 72)
+    #define tape_free_addr (mbar_base + 80)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -269,8 +269,8 @@ kernel_cake_kda_train_6fac4410ba86c48541c4(const __grid_constant__ CUtensorMap w
     __nv_bfloat16* bv_panel = reinterpret_cast<__nv_bfloat16*>(smem_raw + 99328);
     const int bv_panel_addr = smem + 99328;
 
-    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 10 barriers)
-    // Mbarriers at smem_raw[0..80)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 12 barriers)
+    // Mbarriers at smem_raw[0..96)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -282,19 +282,24 @@ kernel_cake_kda_train_6fac4410ba86c48541c4(const __grid_constant__ CUtensorMap w
             // tiles_empty: 2 barriers, init_count=1
             mbarrier_init(smem + 16, 1);
             mbarrier_init(smem + 24, 1);
-            // --- pipeline 'one' ---
-            // hs_ready: 1 barriers, init_count=128
+            // --- pipeline 'tpipe' ---
+            // hs_ready: 2 barriers, init_count=128
             mbarrier_init(smem + 32, 128);
+            mbarrier_init(smem + 40, 128);
+            // --- pipeline 'one' ---
             // vp_ready: 1 barriers, init_count=1
-            mbarrier_init(smem + 40, 1);
-            // bv_ready: 1 barriers, init_count=128
-            mbarrier_init(smem + 48, 128);
+            mbarrier_init(smem + 48, 1);
+            // --- pipeline 'tpipe' ---
+            // bv_ready: 2 barriers, init_count=128
+            mbarrier_init(smem + 56, 128);
+            mbarrier_init(smem + 64, 128);
+            // --- pipeline 'one' ---
             // h_ready: 1 barriers, init_count=1
-            mbarrier_init(smem + 56, 1);
+            mbarrier_init(smem + 72, 1);
             // --- pipeline 'tpipe' ---
             // tape_free: 2 barriers, init_count=1
-            mbarrier_init(smem + 64, 1);
-            mbarrier_init(smem + 72, 1);
+            mbarrier_init(smem + 80, 1);
+            mbarrier_init(smem + 88, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -302,9 +307,9 @@ kernel_cake_kda_train_6fac4410ba86c48541c4(const __grid_constant__ CUtensorMap w
     __syncwarp();
 
     // TMEM alloc (128 columns, 128 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 80);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (warp == 0) {
-        int _tmem_hold = smem + 80;
+        int _tmem_hold = smem + 96;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(128) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
@@ -404,7 +409,7 @@ kernel_cake_kda_train_6fac4410ba86c48541c4(const __grid_constant__ CUtensorMap w
                 }
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
-                mbarrier_arrive(hs_ready_addr);
+                mbarrier_arrive(hs_ready_addr + (tc) * 8);
                 mbarrier_wait(vp_ready_addr, _phase_vp_ready_0);
                 _phase_vp_ready_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -468,7 +473,7 @@ kernel_cake_kda_train_6fac4410ba86c48541c4(const __grid_constant__ CUtensorMap w
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                mbarrier_arrive(bv_ready_addr);
+                mbarrier_arrive(bv_ready_addr + (tc) * 8);
                 mbarrier_wait(h_ready_addr, _phase_h_ready_0);
                 _phase_h_ready_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -495,8 +500,8 @@ kernel_cake_kda_train_6fac4410ba86c48541c4(const __grid_constant__ CUtensorMap w
             int v0_1 = blockIdx.x % 2 * 64;
             unsigned int tl = 0;
             unsigned int _phase_tiles_empty = 1;
-            unsigned int _phase_hs_ready_0 = 0;
-            unsigned int _phase_bv_ready_0 = 0;
+            unsigned int _phase_hs_ready = 0;
+            unsigned int _phase_bv_ready = 0;
             if (elect_sync()) {
                 #pragma unroll 1
                 for (int c_1 = 0; c_1 < nc_1; c_1++) {
@@ -524,16 +529,14 @@ kernel_cake_kda_train_6fac4410ba86c48541c4(const __grid_constant__ CUtensorMap w
                         stage += 1;
                         if (stage == 2) { stage = 0; _phase_tiles_empty ^= 1; }
                     }
-                    mbarrier_wait(hs_ready_addr, _phase_hs_ready_0);
-                    _phase_hs_ready_0 ^= 1;
+                    mbarrier_wait(hs_ready_addr + (tl) * 8, _phase_hs_ready);
                     int chunk_head = (c0_1 + c_1) * num_heads + head_1;
                     #pragma unroll
                     for (int panel_2 = 0; panel_2 < 1; panel_2++) {
                         tma_store_3d((&h_tape), v0_1 + panel_2 * 64, 0, chunk_head, hs_panel_addr + (tl + (unsigned int)panel_2) * 16384);
                     }
                     asm volatile("cp.async.bulk.commit_group;");
-                    mbarrier_wait(bv_ready_addr, _phase_bv_ready_0);
-                    _phase_bv_ready_0 ^= 1;
+                    mbarrier_wait(bv_ready_addr + (tl) * 8, _phase_bv_ready);
                     int vrow = row0_1 + c_1 * 64;
                     #pragma unroll
                     for (int panel_3 = 0; panel_3 < 1; panel_3++) {
@@ -543,7 +546,7 @@ kernel_cake_kda_train_6fac4410ba86c48541c4(const __grid_constant__ CUtensorMap w
                     asm volatile("cp.async.bulk.wait_group.read 0;");
                     mbarrier_arrive(tape_free_addr + (tl) * 8);
                     tl += 1;
-                    if (tl == 2) { tl = 0; }
+                    if (tl == 2) { tl = 0; _phase_hs_ready ^= 1; _phase_bv_ready ^= 1; }
                 }
                 asm volatile("cp.async.bulk.wait_group 0;");
             }
@@ -561,14 +564,13 @@ kernel_cake_kda_train_6fac4410ba86c48541c4(const __grid_constant__ CUtensorMap w
             unsigned int stage_1 = 0;
             unsigned int tm = 0;
             unsigned int _phase_tiles_full = 0;
-            unsigned int _phase_hs_ready_0_1 = 0;
-            unsigned int _phase_bv_ready_0_1 = 0;
+            unsigned int _phase_hs_ready_1 = 0;
+            unsigned int _phase_bv_ready_1 = 0;
             if (elect_sync()) {
                 #pragma unroll 1
                 for (int c_2 = 0; c_2 < nc_2; c_2++) {
                     mbarrier_wait(tiles_full_addr + (stage_1) * 8, _phase_tiles_full);
-                    mbarrier_wait(hs_ready_addr, _phase_hs_ready_0_1);
-                    _phase_hs_ready_0_1 ^= 1;
+                    mbarrier_wait(hs_ready_addr + (tm) * 8, _phase_hs_ready_1);
                     asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                     int _smem_desc_lo_0 = (((w_op_addr) >> 4) & 0x7FFF) + (stage_1) * 1024;
@@ -632,8 +634,7 @@ kernel_cake_kda_train_6fac4410ba86c48541c4(const __grid_constant__ CUtensorMap w
                     "}\n"
                     :: "r"(_smem_desc_lo_0), "r"(_smem_desc_lo_1), "r"(tmem_acc_vp), "r"(0) : "memory");
                     tcgen05_commit(vp_ready_addr);
-                    mbarrier_wait(bv_ready_addr, _phase_bv_ready_0_1);
-                    _phase_bv_ready_0_1 ^= 1;
+                    mbarrier_wait(bv_ready_addr + (tm) * 8, _phase_bv_ready_1);
                     asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                     int _smem_desc_lo_2 = ((((kg_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (stage_1) * 1024;
@@ -681,7 +682,7 @@ kernel_cake_kda_train_6fac4410ba86c48541c4(const __grid_constant__ CUtensorMap w
                     stage_1 += 1;
                     if (stage_1 == 2) { stage_1 = 0; _phase_tiles_full ^= 1; }
                     tm += 1;
-                    if (tm == 2) { tm = 0; }
+                    if (tm == 2) { tm = 0; _phase_hs_ready_1 ^= 1; _phase_bv_ready_1 ^= 1; }
                 }
             }
         }
