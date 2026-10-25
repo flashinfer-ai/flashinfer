@@ -4,6 +4,8 @@
 """The single-head paged MQA kernels and quantize_write_index_k_nvfp4 against
 exact references over random paged BF16 or NVFP4 keys."""
 
+from functools import partial
+
 import pytest
 import torch
 
@@ -488,3 +490,29 @@ def test_single_head_paged_mqa_threshold_select_rejects_bad_shapes() -> None:
                 max_context=128,
                 top_k=8,
             )
+
+
+@torch.inference_mode()
+def test_single_head_paged_mqa_logits_off_sm10x_rejects_bad_layouts(
+    monkeypatch,
+) -> None:
+    """The Triton path off SM10x checks the layouts its kernel assumes."""
+    monkeypatch.setattr(single_head, "get_compute_capability", lambda _: (9, 0))
+    query = torch.zeros(4, 128, dtype=torch.bfloat16, device="cuda")
+    key_cache = torch.zeros(4, 64, 128, dtype=torch.bfloat16, device="cuda")
+    table = torch.zeros(2, 2, dtype=torch.int32, device="cuda")
+    context = torch.zeros(2, dtype=torch.int32, device="cuda")
+    requests = torch.zeros(2, dtype=torch.int32, device="cuda")
+    scores = torch.zeros(4, 128, device="cuda")
+    run = partial(single_head_paged_mqa_logits, requests=requests)
+    with pytest.raises(ValueError, match="Keys must be"):
+        run(query[:, :64], key_cache[..., :64], table, context, scores=scores)
+    with pytest.raises(ValueError, match="contiguous rows"):
+        run(
+            query,
+            key_cache,
+            table,
+            context,
+            scores=torch.zeros(128, 4, device="cuda").T,
+        )
+

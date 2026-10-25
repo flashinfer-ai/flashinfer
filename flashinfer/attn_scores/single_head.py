@@ -72,7 +72,7 @@ def single_head_paged_mqa_logits(
         E4M3 ``[pages, 64, 8]`` for NVFP4 keys, paged like the keys. None for
         BF16.
     """
-    from .kernels.single_head_scorer import MAX_ROWS, PAGE
+    from .kernels.single_head_scorer import DIM, MAX_ROWS, PAGE
 
     max_context = scores.shape[1]
     batch, width = requests.shape[0], block_table.shape[1]
@@ -92,6 +92,13 @@ def single_head_paged_mqa_logits(
             raise ValueError(
                 "Off SM10x, queries and keys must be BF16 (NVFP4 needs SM10x)"
             )
+        # The kernel reads DIM-value keys PAGE to a page and contiguous rows.
+        if query.shape[1] != DIM or key_cache.shape[1:] != (PAGE, DIM):
+            raise ValueError(
+                f"Keys must be [pages, {PAGE}, {DIM}] and queries [rows, {DIM}]"
+            )
+        if (query.stride(1), key_cache.stride(2), scores.stride(1)) != (1, 1, 1):
+            raise ValueError("Queries, keys and scores must have contiguous rows")
         from ..triton.kernels.single_head_scorer import single_head_scorer_kernel
 
         single_head_scorer_kernel[(batch, -(-max_context // PAGE))](
