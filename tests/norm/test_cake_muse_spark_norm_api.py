@@ -222,12 +222,19 @@ GAPS_SM107A = {
 }
 # The declared gaps of the Blackwell PDL routes, keyed (arch, route, head count or None): the row counts where the
 # CuTe DSL kernel under PDL measured ahead of both the PDL build and the plain build of the routed program, so the
-# facade's auto keeps it there.  Op A's mode-0 routes alone declare gaps: op C's bf16_pdl tables are contiguous over
-# the token count for every head count (they mirror the plain route's boundaries), so an explicit cake call under
-# PDL never falls outside the launch form's windows.
+# facade's auto keeps it there.  Op A's mode-0 routes declare one gap each; op C's bf16_pdl tables declare the token
+# counts the CuTe DSL kernel under PDL wins in the graph regime (one token at every head count, 128 heads around 64
+# tokens, 32 heads around 128 and 256 tokens); the windows and gaps partition the token count for every head count
+# and keep the plain route's boundaries.
 GAPS_PDL = {
     ("sm_100a", f"{OP_A}_mode0_pdl", None): ((768, 4095),),
     ("sm_103a", f"{OP_A}_mode0_pdl", None): ((768, 8191),),
+    ("sm_100a", f"{OP_C}_bf16_pdl", 128): ((0, 1), (16, 64)),
+    ("sm_100a", f"{OP_C}_bf16_pdl", 32): ((0, 1), (64, 128), (192, 257)),
+    ("sm_100a", f"{OP_C}_bf16_pdl", 16): ((0, 1),),
+    ("sm_103a", f"{OP_C}_bf16_pdl", 128): ((0, 1), (32, 64)),
+    ("sm_103a", f"{OP_C}_bf16_pdl", 32): ((0, 1), (64, 128), (192, 256)),
+    ("sm_103a", f"{OP_C}_bf16_pdl", 16): ((0, 1),),
 }
 # Op A's Blackwell PDL routes, (at_most, program) windows per (arch, mode), the last unbounded: a program named by its
 # place in the plain route (c2 / c4 / rsa the three small-M composites, pro the prologue whole-row program, psb the
@@ -291,29 +298,32 @@ _C16, _CT16, _HM, _T256, _T128_CT16, _T128 = (
 )
 OP_C_PDL_WINDOWS = {
     "sm_100a": {
-        (128, 0, 8): (_C16, "pdl"),
-        (128, 8, 256): (_CT16, "pdl_late"),
+        (128, 1, 8): (_C16, "pdl"),
+        (128, 8, 16): (_CT16, "pdl_late"),
+        (128, 64, 256): (_CT16, "pdl_late"),
         (128, 256, None): (_HM, "pdl"),
-        (32, 0, 1): (_CT16, "pdl"),
-        (32, 1, 1024): (_CT16, "pdl_late"),
+        (32, 1, 64): (_CT16, "pdl_late"),
+        (32, 128, 192): (_CT16, "pdl_late"),
+        (32, 257, 1024): (_CT16, "pdl_late"),
         (32, 1024, None): (_T256, "pdl"),
-        (16, 0, 1): (_T128_CT16, "pdl_late"),
         (16, 1, 8): (_T128_CT16, "pdl"),
         (16, 8, 256): (_T128_CT16, "pdl_late"),
         (16, 256, 1024): (_T128_CT16, "pdl"),
         (16, 1024, None): (_T128, "plain"),
     },
     "sm_103a": {
-        (128, 0, 8): (_C16, "pdl"),
-        (128, 8, 64): (_CT16, "pdl"),
+        (128, 1, 8): (_C16, "pdl"),
+        (128, 8, 32): (_CT16, "pdl"),
         (128, 64, 256): (_CT16, "pdl_late"),
         (128, 256, 2048): (_HM, "plain"),
         (128, 2048, None): (_HM, "pdl"),
-        (32, 0, 8): (_CT16, "pdl"),
-        (32, 8, 1024): (_CT16, "pdl_late"),
+        (32, 1, 8): (_CT16, "pdl"),
+        (32, 8, 64): (_CT16, "pdl_late"),
+        (32, 128, 192): (_CT16, "pdl_late"),
+        (32, 256, 1024): (_CT16, "pdl_late"),
         (32, 1024, 8192): (_T256, "plain"),
         (32, 8192, None): (_T256, "pdl"),
-        (16, 0, 8): (_T128_CT16, "pdl"),
+        (16, 1, 8): (_T128_CT16, "pdl"),
         (16, 8, 64): (_T128_CT16, "pdl_late"),
         (16, 64, 1024): (_T128_CT16, "pdl"),
         (16, 1024, None): (_T128, "plain"),
@@ -832,10 +842,11 @@ def test_rmsnorm_sigmoid_gate_routes_window_the_token_count_per_head_count():
 
 def test_rmsnorm_sigmoid_gate_pdl_route_names_a_build_form_per_window():
     """Op C's PDL route has windows of its own per Blackwell architecture: each names the PDL build of a routed
-    program, its late-signal PDL build (sm_103a) or the plain build the route borrows (16 heads above 1024 tokens:
-    the plain record's plan, launched without the attribute); 128 and 32 heads at one token are declared gaps on
-    both, sm_100a also leaves 128 heads at 9-255, 32 heads at 65-1023 and 16 heads up to 7 tokens to the CuTe DSL
-    kernel under PDL.  The records appear in the route in window order, each once."""
+    program, its late-signal PDL build or the plain build the route borrows (16 heads above 1024 tokens on both
+    architectures, the whole-row programs up to 2048 / 8192 tokens on sm_103a: the plain record's plan, launched
+    without the attribute); the declared gaps (``GAPS_PDL``: one token at every head count, 128 heads around 64
+    tokens, 32 heads around 128 and 256 tokens) belong to no record.  The records appear in the route in window
+    order, each once."""
     plain_route = loader.route_key(OP_C, "bf16")
     route = loader.route_key(OP_C, "bf16_pdl")
     for arch in BLACKWELL:
@@ -900,9 +911,10 @@ def test_rmsnorm_sigmoid_gate_pdl_route_names_a_build_form_per_window():
                 assert record["arches"] == list(BLACKWELL) or record["arches"] == [arch]
                 assert name not in plain_names
         assert list(names) == order, arch
-        # five pdl builds, two pdl_late builds and the borrowed plain builds: the 16-head tail-free program on both
+        # the pdl builds of five programs (four on sm_100a: the 16-CTA token-cluster program's pdl build keeps no
+        # window there), two pdl_late builds and the borrowed plain builds: the 16-head tail-free program on both
         # architectures, plus the two whole-row programs on sm_103a
-        assert len(names) == (10 if arch == "sm_103a" else 8), arch
+        assert len(names) == (10 if arch == "sm_103a" else 7), arch
         for heads, gaps in (
             (128, GAPS_PDL.get((arch, route, 128), ())),
             (32, GAPS_PDL.get((arch, route, 32), ())),

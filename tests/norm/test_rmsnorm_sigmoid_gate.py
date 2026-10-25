@@ -6,6 +6,9 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 import flashinfer.norm as norm
+from flashinfer.cake_muse_spark_norm_backend import (
+    is_cake_rmsnorm_sigmoid_gate_supported,
+)
 from flashinfer.norm import (
     rmsnorm_sigmoid_gate,
     supports_rmsnorm_sigmoid_gate,
@@ -24,6 +27,17 @@ def _skip_unless_supported(backend):
         pytest.skip("RMSNorm sigmoid gate requires BF16 on SM100, SM103, or SM107")
     if not supports_rmsnorm_sigmoid_gate(torch.bfloat16, HEAD_DIM, backend=backend):
         pytest.skip(f"backend {backend!r} is not available on this device")
+
+
+def _cake_admits(tokens: int) -> bool:
+    """Whether the Cake package routes a call of ``tokens`` rows of ``NUM_HEADS`` heads in the facade's default launch
+    form (``enable_pdl=True``): its PDL route declares gaps, where ``"auto"`` keeps the CuTe DSL kernel under PDL."""
+    return is_cake_rmsnorm_sigmoid_gate_supported(
+        torch.device("cuda", torch.cuda.current_device()),
+        heads=NUM_HEADS,
+        tokens=tokens,
+        enable_pdl=True,
+    )
 
 
 def _inputs(tokens: int, seed: int):
@@ -131,7 +145,16 @@ def test_rmsnorm_sigmoid_gate_matches_strided_reference(
 
     expected = _reference(x, gate, eps)
     output_ptr = x.data_ptr()
-    rmsnorm_sigmoid_gate(x, gate, eps, backend=backend)
+    if backend == "cake" and tokens and not _cake_admits(tokens):
+        # a declared gap of the package's PDL route: the explicit "cake" call is refused, the default backend
+        # ("auto") serves the call with the CuTe DSL kernel under PDL
+        with pytest.raises(
+            ValueError, match=f"admits {tokens} tokens of {NUM_HEADS} heads"
+        ):
+            rmsnorm_sigmoid_gate(x, gate, eps, backend=backend)
+        rmsnorm_sigmoid_gate(x, gate, eps)
+    else:
+        rmsnorm_sigmoid_gate(x, gate, eps, backend=backend)
     torch.cuda.synchronize()
 
     assert x.data_ptr() == output_ptr

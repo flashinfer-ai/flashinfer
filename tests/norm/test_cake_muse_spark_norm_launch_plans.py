@@ -176,7 +176,7 @@ def test_a_plan_orders_its_arguments_like_the_loader(plans):
 
 def test_a_repeated_rmsnorm_sigmoid_gate_call_reuses_its_plan(plans):
     module, launched, selections = plans
-    tokens, heads = 64, 128
+    tokens, heads = 32, 128
     projection = torch.zeros(tokens, 3 * heads * HEAD_DIM, dtype=torch.bfloat16)
     gate = projection[:, : heads * HEAD_DIM].view(tokens, heads, HEAD_DIM)
     x = torch.zeros(tokens, heads, HEAD_DIM, dtype=torch.bfloat16)
@@ -191,7 +191,7 @@ def test_a_repeated_rmsnorm_sigmoid_gate_call_reuses_its_plan(plans):
     pkg.cake_rmsnorm_sigmoid_gate(x, gate.contiguous(), eps=1e-5)
     assert len(selections) == 3  # the plan's selection plus this test's own call above
     # a 2-D call is one head, which no route of the architecture names: no plan, the package's error
-    with pytest.raises(ValueError, match="admits 64 tokens of 1 heads"):
+    with pytest.raises(ValueError, match="admits 32 tokens of 1 heads"):
         pkg.cake_rmsnorm_sigmoid_gate(
             x.view(-1, HEAD_DIM)[:tokens].clone(),
             gate.reshape(-1, HEAD_DIM)[:tokens].clone(),
@@ -236,12 +236,18 @@ def test_a_repeated_rmsnorm_sigmoid_gate_call_reuses_its_plan(plans):
     )
     assert loader.MODULES[borrowed]["launch"]["use_pdl"] is False
     assert loader.MODULES[borrowed]["build"]["pdl"] is False
-    # the PDL route has no gap: 128 heads at one token (the first window of both routes) runs the PDL build of the
-    # program the plain route selects there, the plain call that program's plain build
+    # the PDL route's first window of 128 heads is a declared gap (one token: the CuTe DSL kernel under PDL wins
+    # there), so the PDL call is refused and the plain call runs the program the plain route selects; two tokens
+    # select the PDL build of that program
     one = torch.zeros(1, 128, HEAD_DIM, dtype=torch.bfloat16)
-    pkg.cake_rmsnorm_sigmoid_gate(one, one.clone(), eps=1e-5, enable_pdl=True)
+    with pytest.raises(ValueError, match="admits 1 tokens of 128 heads"):
+        pkg.cake_rmsnorm_sigmoid_gate(one, one.clone(), eps=1e-5, enable_pdl=True)
+    with pytest.raises(NotImplementedError, match="admits 1 rows"):
+        loader.selected_module(ARCH, pdl_route, 1, 128)
+    two = torch.zeros(2, 128, HEAD_DIM, dtype=torch.bfloat16)
+    pkg.cake_rmsnorm_sigmoid_gate(two, two.clone(), eps=1e-5, enable_pdl=True)
     first_pdl = launched[-1][0]
-    assert first_pdl == loader.selected_module(ARCH, pdl_route, 1, 128)
+    assert first_pdl == loader.selected_module(ARCH, pdl_route, 2, 128)
     assert loader.MODULES[first_pdl]["launch"]["use_pdl"] is True
     pkg.cake_rmsnorm_sigmoid_gate(one, one.clone(), eps=1e-5)
     first_plain = launched[-1][0]

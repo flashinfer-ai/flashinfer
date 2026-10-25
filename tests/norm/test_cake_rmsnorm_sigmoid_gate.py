@@ -5,8 +5,8 @@ behind ``rmsnorm_sigmoid_gate(..., backend="cake")``: every routed program again
 its window edges for the three routed head counts in both launch forms (the plain route, and the PDL route whose
 windows name a PDL build, the plain build launched without the attribute, or no program), the Cake result bit for
 bit against the CuTe DSL kernel's, the strided gate view of a wider projection, the 2-D call (one head, which the
-package does not route), the empty batch, CUDA graph replay, the contiguous PDL route, the fall-back at a gap of the plain windows and the input
-checks."""
+package does not route), the empty batch, CUDA graph replay, the PDL route and its declared gaps, the fall-back at a
+gap of the plain windows and the input checks."""
 
 import pytest
 import torch
@@ -247,11 +247,33 @@ def test_a_borrowed_window_launches_the_plain_build_without_the_attribute():
         pkg._launch = original
 
 
-def test_the_pdl_route_admits_every_token_count_the_plain_route_admits():
-    """The PDL route's table is contiguous over the token count for every head count the plain route names: an
-    explicit ``"cake"`` call under PDL runs a Cake program wherever ``enable_pdl=False`` does (no gap), from the
-    launch form the window names (its PDL build, its late-signal PDL build or the plain build without the
-    attribute)."""
+def _gaps(heads: int) -> list[tuple[int, int]]:
+    """The PDL route's declared gaps of the head count on this device: the ``(above, at_most]`` token ranges no
+    record's window admits, read from the registry (the windows and gaps partition the positive token counts)."""
+    route = _route(True)
+    windows = sorted(
+        (int(above), None if at_most is None else int(at_most))
+        for name in loader.route_modules(_arch(), route)
+        for count, above, at_most in _windows(name, route)
+        if int(count) == heads
+    )
+    gaps: list[tuple[int, int]] = []
+    edge = 0
+    for above, at_most in windows:
+        assert edge is not None and above >= edge, (heads, windows)
+        if above > edge:
+            gaps.append((edge, above))
+        edge = at_most
+    assert edge is None, (heads, windows)
+    return gaps
+
+
+def test_the_pdl_route_admits_every_token_count_the_plain_route_admits_but_its_gaps():
+    """The PDL route's windows and its declared gaps partition the token count for every head count the plain
+    route names: an explicit ``"cake"`` call under PDL runs a Cake program wherever ``enable_pdl=False`` does,
+    from the launch form the window names (its PDL build, its late-signal PDL build or the plain build without
+    the attribute) -- except in a gap, where the predicate answers False and the package refuses the call
+    (``auto`` keeps the CuTe DSL kernel under PDL there)."""
     _skip_without_pdl_route()
     launched = []
     original = pkg._launch
@@ -263,15 +285,18 @@ def test_the_pdl_route_admits_every_token_count_the_plain_route_admits():
     try:
         pkg._launch = spy
         for heads in HEADS:
+            gaps = _gaps(heads)
+            edges = {
+                tokens for low, high in gaps for tokens in (low + 1, high, high + 1)
+            }
             for tokens in sorted(
-                {1, 2, 7, 8, 9, 64, 65, 255, 256, 257, 1023, 1024, 1025, 4096}
+                {1, 2, 7, 8, 9, 64, 65, 255, 256, 257, 1023, 1024, 1025, 4096} | edges
             ):
-                assert (
-                    _admits(heads, tokens, True)
-                    is _admits(heads, tokens, False)
-                    is True
-                ), (heads, tokens)
-            for tokens in (1, 257, 1025):
+                in_gap = any(low < tokens <= high for low, high in gaps)
+                assert _admits(heads, tokens, False) is True, (heads, tokens)
+                assert _admits(heads, tokens, True) is (not in_gap), (heads, tokens)
+            for tokens in (2, 258, 1025):
+                assert _admits(heads, tokens, True), (heads, tokens)
                 x, gate, _ = _inputs(tokens, heads, seed=8000 + tokens)
                 expected = _reference(x, gate, 1e-5)
                 rmsnorm_sigmoid_gate(x, gate, 1e-5, enable_pdl=True, backend="cake")
@@ -283,6 +308,16 @@ def test_the_pdl_route_admits_every_token_count_the_plain_route_admits():
                     name, True
                 )
                 launched.clear()
+            for low, high in gaps:
+                for tokens in (low + 1, high):
+                    x, gate, _ = _inputs(tokens, heads, seed=9000 + tokens)
+                    with pytest.raises(
+                        ValueError, match=f"admits {tokens} tokens of {heads} heads"
+                    ):
+                        rmsnorm_sigmoid_gate(
+                            x, gate, 1e-5, enable_pdl=True, backend="cake"
+                        )
+                    assert not launched
     finally:
         pkg._launch = original
 
