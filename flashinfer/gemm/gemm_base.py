@@ -22,10 +22,11 @@ import weakref
 from dataclasses import astuple, replace
 from enum import Enum
 from types import SimpleNamespace
-from typing import Any, Callable, cast, List, Literal, Optional, Tuple
+from typing import Any, Callable, cast, List, Literal, NamedTuple, Optional, Tuple
 
 from packaging.version import Version
 import torch
+import tvm_ffi
 
 from flashinfer.trtllm_low_latency_gemm import trtllm_low_latency_gemm
 
@@ -104,6 +105,7 @@ from ..jit.gemm import gen_gemm_sm100_module_cutlass_mxfp8
 from ..jit.gemm import gen_gemm_sm120_module_cutlass_mxfp8
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_bf16
 from ..jit.gemm import gen_blackwell_bf16_bmm_module
+from ..jit.cake_program import CAPABILITY_TARGET
 from ..jit.gemm import gen_mm_bf16_cublaslt_module
 from ..jit.gemm import gen_trtllm_gen_gemm_module
 from ..jit.gemm import gen_tgv_gemm_sm10x_module
@@ -1050,6 +1052,10 @@ def bmm_bf16(
         SM100a/SM103a CAKE-generated dispatcher for contiguous A/output, exact
         transposed column-major B, 16-byte-aligned tensor data, N divisible by
         8, and K in {64, 256, 1024}. The output must not overlap either input.
+        On a few decode shapes with K 1024 it runs generated tcgen05 programs
+        (``flashinfer.jit.cake_bf16_bmm_swap_ab``) instead; set
+        ``FLASHINFER_DISABLE_CAKE_BF16_BMM_SWAP_AB=1`` to keep the dispatcher
+        on every shape.
         ``"cake"`` is explicit-only and is not considered by ``"auto"``;
         ``"auto"`` continues to select from the existing autotuned backends.
 
@@ -1102,7 +1108,11 @@ def bmm_bf16(
         return bmm_bf16_cutile(A, B, out)
 
     if backend == "cake":
-        get_blackwell_bf16_bmm_module(A.device, backend="cake").run(A, B, out)
+        swap_ab = _cake_bf16_bmm_swap_ab_route(A, B, out)
+        if swap_ab is not None:
+            _run_cake_bf16_bmm_swap_ab(*swap_ab, A, B, out)
+        else:
+            get_blackwell_bf16_bmm_module(A.device, backend="cake").run(A, B, out)
         return out
 
     workspace_buffer = _get_cache_buf(
@@ -1717,6 +1727,159 @@ def get_blackwell_bf16_bmm_module(
             f"got compute capability {compute_capability}"
         )
     return _get_blackwell_bf16_bmm_module(target)
+
+
+# bmm_bf16(backend="cake") on decode shapes: generated tcgen05 programs
+# (flashinfer.jit.cake_bf16_bmm_swap_ab) that put the weight rows (N) in the MMA's
+# M and the tokens (M) in its N, so a few tokens still fill one MMA.  A program
+# serves exactly the (batch, M, N, K, output dtype) rows listed for its target,
+# where it measured faster than the dispatcher above; every other row keeps the
+# dispatcher.  FLASHINFER_DISABLE_CAKE_BF16_BMM_SWAP_AB=1 keeps it on every row.
+class _SwapAB(NamedTuple):
+    """A generated swap-AB program and the CTA tile of its grid."""
+
+    program: str  # the constant of flashinfer.jit.cake_bf16_bmm_swap_ab
+    tile_w: int  # weight rows (N) per CTA
+    tile_t: int  # tokens (M) per CTA
+    split_k: int  # CTAs of one cluster sharing an output tile, each a K share
+
+
+_BF16, _F16, _F32 = torch.bfloat16, torch.float16, torch.float32
+_CAKE_BF16_BMM_SWAP_AB_ROUTES: dict[
+    str, dict[tuple[int, int, int, int, torch.dtype], _SwapAB]
+] = {
+    "sm_100a": {
+        (1, 8, 40, 1024, _F32): _SwapAB("W64_T8_S2_SK8_PF_F32", 64, 8, 8),
+        (2, 33, 1032, 1024, _BF16): _SwapAB("W64_T16_S8_SK2_PF_BF16", 64, 16, 2),
+        (1, 16, 64, 1024, _F16): _SwapAB("W64_T8_S2_SK8_CP_F16", 64, 8, 8),
+        (2, 8, 1024, 1024, _F16): _SwapAB("W64_T8_S4_SK4_PF_F16", 64, 8, 4),
+        (2, 8, 1024, 1024, _F32): _SwapAB("W64_T8_S4_SK4_PF_F32", 64, 8, 4),
+        (2, 8, 1024, 1024, _BF16): _SwapAB("W64_T8_S4_SK4_PF_BF16", 64, 8, 4),
+        (4, 16, 1024, 1024, _F16): _SwapAB("W64_T16_S8_SK2_PF_L2_F16", 64, 16, 2),
+        (4, 16, 1024, 1024, _F32): _SwapAB("W64_T16_S8_SK2_PF_F32", 64, 16, 2),
+        (4, 16, 1024, 1024, _BF16): _SwapAB("W64_T16_S8_SK2_PF_L2_BF16", 64, 16, 2),
+    },
+    "sm_103a": {
+        (1, 8, 40, 1024, _F32): _SwapAB("W64_T8_S2_SK8_CP_F32", 64, 8, 8),
+        (2, 33, 1032, 1024, _BF16): _SwapAB("W64_T32_S8_SK2_PF_BF16", 64, 32, 2),
+        (1, 16, 64, 1024, _F16): _SwapAB("W64_T8_S2_SK8_CP_F16", 64, 8, 8),
+        (2, 8, 1024, 1024, _F16): _SwapAB("W64_T8_S4_SK4_PF_F16", 64, 8, 4),
+        (2, 8, 1024, 1024, _F32): _SwapAB("W64_T8_S4_SK4_PF_F32", 64, 8, 4),
+        (2, 8, 1024, 1024, _BF16): _SwapAB("W64_T8_S4_SK4_PF_L2_BF16", 64, 8, 4),
+        (4, 16, 1024, 1024, _F16): _SwapAB("W64_T16_S8_SK2_PF_F16", 64, 16, 2),
+        (4, 16, 1024, 1024, _F32): _SwapAB("W64_T16_S8_SK2_PF_F32", 64, 16, 2),
+        (4, 16, 1024, 1024, _BF16): _SwapAB("W64_T16_S8_SK2_PF_BF16", 64, 16, 2),
+    },
+}
+# The generated bindings' arguments: the weights [batch, N, K], the tokens
+# [batch, M, K], the output bytes, M, N, K, the batch, then the grid.
+_CAKE_BF16_BMM_SWAP_AB_ARGS = (
+    "W",
+    "A",
+    "out",
+    "M",
+    "N",
+    "K",
+    "B",
+    "grid_x",
+    "grid_y",
+    "grid_z",
+)
+
+
+def _cake_bf16_bmm_swap_ab_route(
+    A: torch.Tensor, B: torch.Tensor, out: torch.Tensor
+) -> Optional[Tuple[str, _SwapAB]]:
+    """The target and the generated swap-AB program serving the call, or ``None``."""
+    if os.environ.get("FLASHINFER_DISABLE_CAKE_BF16_BMM_SWAP_AB", "0") == "1":
+        return None
+    target = CAPABILITY_TARGET.get(get_compute_capability(A.device))
+    if target is None or target not in _CAKE_BF16_BMM_SWAP_AB_ROUTES:
+        return None
+    if A.dim() != 3 or B.dim() != 3:
+        return None
+    batch, m, k = A.shape
+    n = B.shape[2]
+    route = _CAKE_BF16_BMM_SWAP_AB_ROUTES[target].get((batch, m, n, k, out.dtype))
+    if route is None:
+        return None
+    # The dispatcher's binding rejects dtypes, shapes and strides other than
+    # these, a data pointer off 16 bytes and an output overlapping an input, also
+    # under skip_check=True; such a call keeps the dispatcher, which raises its
+    # usual error.
+    if (
+        A.dtype != torch.bfloat16
+        or B.dtype != torch.bfloat16
+        or B.shape != (batch, k, n)
+        or out.shape != (batch, m, n)
+        or A.stride() != (m * k, k, 1)
+        or B.stride() != (k * n, 1, k)
+        or out.stride() != (m * n, n, 1)
+    ):
+        return None
+    a, b, o = A.data_ptr(), B.data_ptr(), out.data_ptr()
+    if a % 16 != 0 or b % 16 != 0 or o % 16 != 0:
+        return None
+    a_end = a + A.numel() * A.element_size()
+    b_end = b + B.numel() * B.element_size()
+    o_end = o + out.numel() * out.element_size()
+    if (o < a_end and a < o_end) or (o < b_end and b < o_end):
+        return None
+    return target, route
+
+
+@functools.cache
+def _get_cake_bf16_bmm_swap_ab_entry(program: str, target: str) -> Callable:
+    """The binding of the generated swap-AB ``program`` on ``target``, built and
+    loaded once."""
+    from ..jit import cake_bf16_bmm_swap_ab as programs
+
+    record = getattr(programs, program)
+    if record.args != _CAKE_BF16_BMM_SWAP_AB_ARGS:
+        raise RuntimeError(
+            f"the generated {record.name} binding takes {list(record.args)}; "
+            f"the host passes {list(_CAKE_BF16_BMM_SWAP_AB_ARGS)}"
+        )
+    return record.entry(target)
+
+
+def _cake_bf16_bmm_swap_ab_grid(
+    route: _SwapAB, m: int, n: int, batch: int
+) -> Tuple[int, int, int]:
+    """The grid of ``route`` on a [batch, m, n] output: one CTA per output tile
+    and K share, the split_k CTAs of a tile consecutive along x (one cluster)."""
+    return (
+        (n + route.tile_w - 1) // route.tile_w * route.split_k,
+        (m + route.tile_t - 1) // route.tile_t,
+        batch,
+    )
+
+
+def _run_cake_bf16_bmm_swap_ab(
+    target: str,
+    route: _SwapAB,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """``out[b] = A[b] @ B[b]`` by the generated swap-AB program of ``route``."""
+    batch, m, k = A.shape
+    n = B.shape[2]
+    entry = _get_cake_bf16_bmm_swap_ab_entry(route.program, target)
+    grid_x, grid_y, grid_z = _cake_bf16_bmm_swap_ab_grid(route, m, n, batch)
+    with torch.cuda.device(A.device), tvm_ffi.use_torch_stream():
+        entry(
+            B.transpose(1, 2),
+            A,
+            out.view(torch.uint8),
+            m,
+            n,
+            k,
+            batch,
+            grid_x,
+            grid_y,
+            grid_z,
+        )
 
 
 @functools.cache

@@ -198,6 +198,9 @@ from .jit.cake_concat_mla_kv_quant_fp8 import (
 from .jit.cake_grouped_mxfp8_quantize import (
     aot_specs as gen_cake_grouped_mxfp8_quantize_aot_modules,
 )
+from .jit.cake_bf16_bmm_swap_ab import (
+    aot_specs as gen_cake_bf16_bmm_swap_ab_aot_modules,
+)
 from .jit.mla_kv_pack import gen_mla_kv_pack_fp8_module
 from .jit.api_log_stats import gen_api_log_stats_module
 from .jit.norm import gen_norm_module
@@ -623,7 +626,14 @@ def _gen_blackwell_bf16_bmm_aot_specs(sm_capabilities: dict) -> List[JitSpec]:
         targets.append("sm100a")
     if sm_capabilities.get("sm103a_exact", False):
         targets.append("sm103a")
-    return [gen_blackwell_bf16_bmm_module(target) for target in targets]
+    specs = [gen_blackwell_bf16_bmm_module(target) for target in targets]
+    # The generated swap-AB programs serving the decode rows of
+    # bmm_bf16(backend="cake"), one library each per exact target.
+    if sm_capabilities.get("sm100a_exact", False):
+        specs.extend(gen_cake_bf16_bmm_swap_ab_aot_modules("sm_100a"))
+    if sm_capabilities.get("sm103a_exact", False):
+        specs.extend(gen_cake_bf16_bmm_swap_ab_aot_modules("sm_103a"))
+    return specs
 
 
 def gen_all_modules(
