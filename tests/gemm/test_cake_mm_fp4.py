@@ -242,6 +242,24 @@ def test_m64_ring_overlay_rows():
         )
 
 
+def test_m128_ring_overlay_rows():
+    # One 128-token tile over more 128-wide weight tiles than SMs (8192x28672 M = 128 on
+    # 148 SMs: 224 tiles) takes the overlay program of the 128-wide 1-CTA m tile, which
+    # only sm_100a registers; one wave of 128-wide tiles keeps its staging.
+    for out_f16, out in ((False, "bf16"), (True, "f16")):
+        plan = _registered(
+            cb.gemm_plan(128, 28672, 8192, out_f16, "sm_100a", 148), "sm_100a"
+        )
+        assert plan.kernel_key == f"gemm:m128_{out}_bF_ro", plan.kernel_key
+        plan = cb.gemm_plan(128, 18432, 7168, out_f16, "sm_100a", 148)
+        assert plan.kernel_key == f"gemm:m128_{out}_bF", plan.kernel_key
+    t = cb.default_tactic(128, 28672, 8192, 148, m128_ring_overlay=True)
+    assert t["tile_n"] == 128 and "two_cta" not in t and t["ring_overlay"]
+    assert "ring_overlay" not in cb.default_tactic(128, 28672, 8192, 148)
+    t = cb.default_tactic(128, 18432, 7168, 148, m128_ring_overlay=True)
+    assert "ring_overlay" not in t
+
+
 def test_n16_split3_rows():
     # The 16-token tile with three K slices on the measured rows of each SM count and
     # output dtype: M = 17 stands for 17..24 and M = 32 for 25..32 where both dtypes
@@ -529,7 +547,7 @@ def test_other_sm_count_runs_the_measured_kernel():
     rows = (
         ("sm_100a", 152, 16, 28672, 8192, "gemm:n16_bf16_aF_l2256b", 152),
         ("sm_100a", 152, 32, 28672, 8192, "gemm:n32_bf16_aF_l2256b", 152),
-        ("sm_100a", 152, 128, 28672, 8192, "gemm:m128_bf16_bF", 152),
+        ("sm_100a", 152, 128, 28672, 8192, "gemm:m128_bf16_bF_ro", 152),
         ("sm_100a", 152, 257, 7168, 16384, "gemm:m256_2cta_bf16_bF_l2256b", 112),
         ("sm_103a", 148, 512, 28672, 8192, "gemm:m256_2cta_bf16_bF_l2256b", 148),
         ("sm_103a", 148, 2048, 7168, 16384, "gemm:m256_2cta_bf16_aL_bL_l2256b_g8", 148),

@@ -497,6 +497,11 @@ N8_WIDE_W_ROWS = 64
 # mainloop ring (``ring_overlay``): one more mainloop stage (7 -> 8); the overlaid
 # stages go back to the next tile's loads once the stores have read them.
 RING_OVERLAY_TILE_N = 64
+# The architecture whose loader registers the overlay programs of the 128-wide 1-CTA m tile
+# (``_ro`` m128 keys): one token tile over more 128-wide weight tiles than SMs takes them
+# (8192x28672 M = 128 on B200: 224 tiles on 148 CTAs; a CTA's later tiles reuse the overlaid
+# stages once the previous tile's stores have read them).
+M128_RING_OVERLAY_ARCH = "sm_100a"
 # 16-token-tile raster groups when the group's fp4 operands (16 token tiles of A plus every
 # weight tile it sweeps) fit the 126 MiB L2 and the group sweeps at least 24 weight tiles.
 RASTER16_MIN_W_TILES = 24
@@ -603,6 +608,7 @@ def default_tactic(
     out_f16: bool = False,
     two_cta_wave_cost: Optional[dict[int, float]] = None,
     n8_wide_w_rows: bool = True,
+    m128_ring_overlay: bool = False,
 ) -> dict[str, Any]:
     """Untuned GEMM tactic (port of ``default_tactic`` of the Cake GEMM launcher).
 
@@ -632,7 +638,9 @@ def default_tactic(
     ``two_cta_wave_cost`` replaces the wave-cost table of the 2-CTA width re-pick
     (:func:`gemm_plan` passes the K = 96 table on sm_103a).  ``n8_wide_w_rows`` allows
     the 64-row weight tiles (:func:`gemm_plan` passes it on :data:`N8_WIDE_W_ROWS_ARCH`
-    only).
+    only).  ``m128_ring_overlay`` allows the overlay on the 128-wide 1-CTA m tile of one
+    token tile when its tiles outnumber the SMs (:func:`gemm_plan` passes it on
+    :data:`M128_RING_OVERLAY_ARCH` only).
     """
     if 1 <= m <= N_ORIENTATION_MAX_M and n % 8 == 0:
         tile_n = 8 if m <= 8 else 16 if m <= 16 else 32
@@ -780,6 +788,17 @@ def default_tactic(
         # The 64-wide 1-CTA tile: the output staging overlays the mainloop ring, 8
         # stages instead of 7 (18432x7168 and 28672x8192 M = 128: 2-3 % faster on both
         # parts).
+        tactic["ring_overlay"] = True
+    if (
+        m128_ring_overlay
+        and m <= BLOCK_M
+        and tile_m == BLOCK_M
+        and tile_n == 128
+        and (n + tile_n - 1) // tile_n > sm_count
+    ):
+        # One token tile over more 128-wide weight tiles than SMs: 6 mainloop stages instead
+        # of 5, the overlaid stages handed back per tile by the epilogue (the program of the
+        # single-token-tile 128-wide rows, no L2 promotion).
         tactic["ring_overlay"] = True
     if _half_m_pair_rows(m, n, tile_n, sm_count, tactic):
         tactic["half_m"] = True
@@ -1028,6 +1047,7 @@ def _gemm_plan(
             int(sm_count),
             out_f16=bool(out_f16),
             n8_wide_w_rows=arch == N8_WIDE_W_ROWS_ARCH,
+            m128_ring_overlay=arch == M128_RING_OVERLAY_ARCH,
         )
         if arch == K96_ARCH and int(sm_count) == K96_WIDTH_SM_COUNT:
             # The 2-CTA width re-pick of the K = 96 programs (K96_KERNEL_KEYS).
