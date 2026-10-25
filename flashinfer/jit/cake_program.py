@@ -58,6 +58,7 @@ from .core import (
     sm107a_nvcc_flags,
     sm110a_nvcc_flags,
     sm120a_nvcc_flags,
+    sm121a_nvcc_flags,
 )
 
 __all__ = [
@@ -79,6 +80,7 @@ TARGET_FLAGS: dict[str, Sequence[str]] = {
     "sm_107a": sm107a_nvcc_flags,
     "sm_110a": sm110a_nvcc_flags,
     "sm_120a": sm120a_nvcc_flags,
+    "sm_121a": sm121a_nvcc_flags,
 }
 #: The exact target of a device's compute capability.
 CAPABILITY_TARGET: dict[tuple[int, int], str] = {
@@ -88,6 +90,7 @@ CAPABILITY_TARGET: dict[tuple[int, int], str] = {
     (10, 7): "sm_107a",
     (11, 0): "sm_110a",
     (12, 0): "sm_120a",
+    (12, 1): "sm_121a",
 }
 #: The three grid arguments every binding takes after its host parameters.
 GRID_ARGS: tuple[str, str, str] = ("grid_x", "grid_y", "grid_z")
