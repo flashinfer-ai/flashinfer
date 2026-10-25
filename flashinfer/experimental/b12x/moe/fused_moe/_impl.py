@@ -2668,7 +2668,7 @@ def _heuristic_dynamic_route_mode(
         routed_rows=query.routed_rows,
         num_experts=query.num_experts,
         n=dynamic_n,
-        deterministic_output=False,
+        deterministic_output=bool(query.deterministic_output),
         planned_tile_m=planned_tile_m,
     )
     if (
