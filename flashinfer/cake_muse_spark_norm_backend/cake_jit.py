@@ -3554,12 +3554,6 @@ MODULES: dict[str, dict[str, Any]] = {
         "route": "gated_residual_rmsnorm_mode1",
         "select_rule": {
             "kind": "rows_between",
-            "routes": {
-                "gated_residual_rmsnorm_mode1_pdl": {
-                    "sm_100a": [[1024, 2048]],
-                    "sm_103a": [[768, 1024]],
-                },
-            },
             "windows": {
                 "sm_100a": [
                     [
@@ -4378,7 +4372,7 @@ MODULES: dict[str, dict[str, Any]] = {
                         383,
                     ],
                     [
-                        2048,
+                        1024,
                         None,
                     ],
                 ],
@@ -4388,7 +4382,7 @@ MODULES: dict[str, dict[str, Any]] = {
                         255,
                     ],
                     [
-                        1024,
+                        768,
                         None,
                     ],
                 ],
@@ -7617,6 +7611,9 @@ MODULES: dict[str, dict[str, Any]] = {
         "route": "rmsnorm_sigmoid_gate_bf16",
         "select_rule": {
             "kind": "tokens_heads_between",
+            "routes": {
+                "rmsnorm_sigmoid_gate_bf16_pdl": {"sm_103a": [[32, 1024, 8192]]},
+            },
             "windows": {
                 "sm_100a": [
                     [
@@ -8164,6 +8161,9 @@ MODULES: dict[str, dict[str, Any]] = {
         "route": "rmsnorm_sigmoid_gate_bf16",
         "select_rule": {
             "kind": "tokens_heads_between",
+            "routes": {
+                "rmsnorm_sigmoid_gate_bf16_pdl": {"sm_103a": [[128, 256, 2048]]},
+            },
             "windows": {
                 "sm_100a": [
                     [
@@ -8311,7 +8311,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "sm_103a": [
                     [
                         128,
-                        256,
+                        2048,
                         None,
                     ],
                 ],
@@ -8440,7 +8440,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "sm_103a": [
                     [
                         32,
-                        1024,
+                        8192,
                         None,
                     ],
                 ],
@@ -8776,7 +8776,6 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_muse_spark_norm_ffbfde93a6d276795e1d",
             "cake_muse_spark_norm_8e2e17ebd97563f6a23a",
             "cake_muse_spark_norm_b886dd6347cac2b58cf3",
-            "cake_muse_spark_norm_584407b9521564b8200f",
         ],
         "rmsnorm_sigmoid_gate_bf16": [
             "cake_muse_spark_norm_3cd64c9702f99e24eed8",
@@ -8840,7 +8839,6 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_muse_spark_norm_ffbfde93a6d276795e1d",
             "cake_muse_spark_norm_8e2e17ebd97563f6a23a",
             "cake_muse_spark_norm_b886dd6347cac2b58cf3",
-            "cake_muse_spark_norm_584407b9521564b8200f",
         ],
         "rmsnorm_sigmoid_gate_bf16": [
             "cake_muse_spark_norm_3cd64c9702f99e24eed8",
@@ -8854,7 +8852,9 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_muse_spark_norm_49015ea91c011bd1740a",
             "cake_muse_spark_norm_4c2847f766bb9a2330d6",
             "cake_muse_spark_norm_feff5e270b2146886c6c",
+            "cake_muse_spark_norm_c2e68308fdb46f236ac4",
             "cake_muse_spark_norm_c7c7921f8495c0384ee7",
+            "cake_muse_spark_norm_75b324d65c3bc77cc36b",
             "cake_muse_spark_norm_fb5857b9f0bbd10ec74b",
             "cake_muse_spark_norm_fba020bb2e3b8aaf63f0",
             "cake_muse_spark_norm_21dccf5cd73a70753e08",
