@@ -58,7 +58,7 @@ The ordinary facade owns its separate dtype and architecture contract.
 """
 
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -72,6 +72,7 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
+from .._fp8_mqa_constants import _COMPUTE_BLOCK_KV
 from .._math_policy import _validate_math_mode
 from .fp8_paged_mqa_logits import _FP8MQAEngineMixin
 
@@ -2358,3 +2359,682 @@ class FP8MQASelectiveLogitsKernel(_FP8MQAEngineMixin):
                         mLogits[(out_row, slot)] = cutlass.Int64(packed)
                     else:
                         mLogits[(out_row, slot)] = logical_index
+
+
+# Warp w of a row warpgroup publishes the KV lanes it reads, one warp-wide
+# span per compute tile, into candidate segment w.
+_H64_CANDIDATE_SEGMENTS = 4
+_H64_CANDIDATE_SEGMENT_SPAN = 32
+# One page-table load per lane covers this many KV tiles, which the math role
+# also unrolls statically so scale loads and TMEM reads of later tiles overlap.
+_H64_CANDIDATE_PAGE_CACHE = 32
+# Q4/N256 with one KV stream and two UMMA stages (see the class docstring).
+H64_CANDIDATE_TILING = replace(
+    SELECTIVE_LOGITS_TILING,
+    next_n=4,
+    num_q_stages=2,
+    num_kv_stages=4,
+    num_umma_stages=2,
+    num_epi_subtiles=2,
+)
+
+
+class FP8MQASelectiveH64CandidateKernel(FP8MQASelectiveLogitsKernel):
+    """Specialized H64 CANDIDATE variant: one query row per math warpgroup.
+
+    :class:`FP8MQASelectiveLogitsKernel` scores an H64 Q4 tile (N = 4 rows x 64
+    heads) with two KV streams of eight math warps. That fits one UMMA stage, and
+    each math thread owns all four query rows of its KV lane, so only 16 of a row's
+    64 head weights stay in registers; the other 48 are reread from shared memory
+    for every key, and a larger register cache spills.
+    For single-pool H64/D128 long-query prefill this variant keeps the same
+    request-tiled launch, metadata, arithmetic and publication ABI, and changes
+    only how the CTA's warps split the tile:
+
+      - warps 0-15: four math warpgroups. Warpgroup ``r`` owns query row ``r`` of
+        the tile and keeps that row's 64 weights in registers; its 128 threads
+        read one TMEM lane (KV position) each.
+      - warp 16: TMA producer for the request-tiled Q/weights and paged KV.
+      - warp 18: UMMA producer. One KV stream leaves TMEM for two accumulator
+        stages (2 x N256 = 512 columns), so math overlaps the next tile's MMA.
+
+    Publication is warp-ranked: warp ``w`` of a row appends the keys of TMEM lanes
+    ``32w..32w+31`` into segment ``w`` of the 4-segment candidate ABI
+    (``values[row, w * span + i]``, count in ``index_counts[row, 1 + w]``), so the
+    segmented PackedTopK, sample ladder and both repair stages are unchanged. A
+    segment that fills before the row's total does is an overflow and is repaired
+    like any other.
+
+    Scores use the engine's head reduction (:meth:`_accumulate_fp32_heads`) and
+    KV-scale policy, so they match the general layout bit for bit in both math
+    modes. Tiles, page-table rows and exact row bounds come from the prepared
+    ``tile_meta``/``context_lens``. KV and its FP32 scales are read in place from
+    the fused paged pool, one page per KV compute tile.
+
+    Construction, validation and the call ABI are the general kernel's
+    four-segment warp-striped CANDIDATE topology (``split_kv`` 1,
+    ``count_segment_span`` of one warp); only the launch and warp roles differ.
+    Requires pages of exactly one compute tile.
+    """
+
+    # 640 threads leave at most 102 registers per thread.
+    ptxas_max_registers = 96
+
+    def __init__(
+        self,
+        *,
+        num_sms: int,
+        capacity: int,
+        math_mode: str = "relu_strict",
+    ):
+        super().__init__(
+            num_heads=64,
+            head_dim=128,
+            phys_block_kv=_COMPUTE_BLOCK_KV,
+            num_sms=num_sms,
+            mode=_SelectiveLogitsMode.CANDIDATE,
+            capacity=capacity,
+            split_kv=1,
+            num_count_segments=_H64_CANDIDATE_SEGMENTS,
+            count_segment_span=_H64_CANDIDATE_SEGMENT_SPAN,
+            tiling=H64_CANDIDATE_TILING,
+            math_mode=math_mode,
+        )
+        # One KV stream; no dedicated store warps: math warps publish directly.
+        self.num_groups = 1
+        self.has_store_warp = False
+        self.threads_per_cta = 640
+
+    @cute.jit
+    def _launch(
+        self,
+        kv_fused: cute.Tensor,
+        b: cute.Tensor,
+        weights: cute.Tensor,
+        logits: cute.Tensor,
+        block_table: cute.Tensor,
+        index_counts: cute.Tensor,
+        context_lens: cute.Tensor,
+        schedule_meta: cute.Tensor,
+        kv_scale: cute.Tensor,
+        tile_meta: cute.Tensor,
+        policy_values: cute.Tensor,
+        num_phys_blocks: cutlass.Int32,
+        batch_size: cutlass.Int32,
+        stream: cuda.CUstream,
+        sample_page_indices: cute.Tensor = None,
+    ):
+        # Persistent CTAs walk query tiles directly: schedule_meta is the
+        # general layout's KV-pair plan, and scales are read from the fused
+        # pages, so neither it nor kv_scale or sample pages are used here.
+        kv_fp8 = cute.recast_tensor(kv_fused, cutlass.Float8E4M3FN)
+        b = cute.recast_tensor(b, cutlass.Float8E4M3FN)
+        page_stride = kv_fused.layout.stride[0]
+        # Each fused page holds one compute tile of K rows, then their FP32 scales.
+        a = cute.make_tensor(
+            kv_fp8.iterator,
+            cute.make_layout(
+                (self.block_kv, self.head_dim, num_phys_blocks),
+                stride=(self.head_dim, 1, page_stride),
+            ),
+        )
+        fused_pages = cute.make_tensor(
+            kv_fp8.iterator,
+            cute.make_layout(
+                (self.block_kv * (self.head_dim + 4), num_phys_blocks),
+                stride=(1, page_stride),
+            ),
+        )
+        scale_bytes = cute.domain_offset(
+            (self.block_kv * self.head_dim, 0), fused_pages
+        )
+        scales = cute.recast_tensor(
+            cute.make_tensor(
+                scale_bytes.iterator,
+                cute.make_layout(
+                    (self.block_kv * 4, num_phys_blocks), stride=(1, page_stride)
+                ),
+            ),
+            cutlass.Float32,
+        )
+
+        a_major = utils.LayoutEnum.from_tensor(a).mma_major_mode()
+        b_major = utils.LayoutEnum.ROW_MAJOR.mma_major_mode()
+        tiled_mma = self._setup_mma(a.element_type, b.element_type, a_major, b_major)
+        tma_load_op = cpasync.CopyBulkTensorTileG2SOp()
+        a_tma_view = cute.select(
+            cute.tiled_divide(
+                sm100_utils.make_smem_layout(
+                    cute.nvgpu.OperandMajorMode.K,
+                    (self.block_kv, self.head_dim),
+                    a.element_type,
+                    self.num_kv_stages,
+                ),
+                (self.block_kv, self.head_dim),
+            ),
+            mode=[0, 1, 3],
+        )
+        tma_atom_a, tma_tensor_a = cpasync.make_tiled_tma_atom(
+            tma_load_op, a, a_tma_view[0], (self.block_kv, self.head_dim)
+        )
+        b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
+        tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
+            sm100_utils.cluster_shape_to_tma_atom_B(
+                self.cluster_shape_mn, tiled_mma.thr_id
+            ),
+            b,
+            b_smem_layout,
+            self.mma_tiler,
+            tiled_mma,
+            self.cluster_layout_vmnk.shape,
+        )
+        w_smem_layout = cute.make_layout(
+            (self.N, self.num_q_stages), stride=(1, self.w_stage_stride)
+        )
+        tma_atom_w, tma_tensor_w = cpasync.make_tiled_tma_atom(
+            tma_load_op,
+            weights,
+            cute.make_layout((self.next_n, self.num_heads), stride=(self.num_heads, 1)),
+            (self.next_n, self.num_heads),
+        )
+        self.num_q_tma_bytes = cute.size_in_bytes(b.element_type, b_smem_layout) + (
+            self.N * 4
+        )
+        self.num_kv_tma_bytes = self.block_kv * self.head_dim
+
+        @cute.struct
+        class SharedStorage:
+            kv_mbar: cute.struct.MemRange[cutlass.Int64, self.num_kv_stages * 2]
+            q_mbar: cute.struct.MemRange[cutlass.Int64, self.num_q_stages * 2]
+            umma_mbar: cute.struct.MemRange[cutlass.Int64, self.num_umma_stages * 2]
+            tmem_holding_buf: cutlass.Int32
+
+        self.kernel(
+            tiled_mma,
+            tma_atom_a,
+            tma_tensor_a,
+            tma_atom_b,
+            tma_tensor_b,
+            tma_atom_w,
+            tma_tensor_w,
+            scales,
+            block_table,
+            logits,
+            index_counts,
+            context_lens,
+            tile_meta,
+            policy_values,
+            batch_size,
+            a_tma_view,
+            w_smem_layout,
+            self.cluster_layout_vmnk,
+            self.a_smem_layout_staged,
+            self.b_smem_layout_staged,
+            SharedStorage,
+        ).launch(
+            grid=(1, 1, min(batch_size, self.num_sms)),
+            block=[self.threads_per_cta, 1, 1],
+            cluster=(*self.cluster_shape_mn, 1),
+            stream=stream,
+            min_blocks_per_mp=0,
+        )
+
+    @cute.jit
+    def _score_kv_tile(
+        self,
+        kv_idx,
+        page,
+        mScales,
+        m_coord,
+        query_slot,
+        row_start,
+        row_end,
+        threshold,
+        cursor,
+        segment_rows,
+        span,
+        w_cache,
+        tCtAcc_base,
+        thr_copy,
+        tiled_copy,
+        tTR_rAcc,
+        epi_sub_mn,
+        umma_pipeline,
+        umma_state,
+    ):
+        """Score one KV tile for this warpgroup's row and append its hits."""
+        kv_pos = kv_idx * self.block_kv + m_coord
+        ready = umma_pipeline.consumer_try_wait(umma_state)
+        # The scale load overlaps the remaining MMA latency.
+        scale = mScales[(m_coord, page)]
+        if cutlass.const_expr(self.math_mode == "relu_fast"):
+            scale = scale * cutlass.Float32(0.5)
+        umma_pipeline.consumer_wait(umma_state, ready)
+        tTR = thr_copy.partition_S(
+            cute.flat_divide(
+                tCtAcc_base[(None, None, None, umma_state.index)][((None, None), 0, 0)],
+                epi_sub_mn,
+            )
+        )
+        sums = (
+            cutlass.Float32(0.0),
+            cutlass.Float32(0.0),
+            cutlass.Float32(0.0),
+            cutlass.Float32(0.0),
+        )
+        heads_per_subtile = self.num_heads // self.num_epi_subtiles
+        for i in cutlass.range_constexpr(self.num_epi_subtiles):
+            cute.copy(
+                tiled_copy,
+                tTR[(None, None, None, 0, query_slot * self.num_epi_subtiles + i)],
+                tTR_rAcc,
+            )
+            cute.arch.fence_view_async_tmem_load()
+            if cutlass.const_expr(i == self.num_epi_subtiles - 1):
+                # Every row's slice of this stage is in registers.
+                umma_pipeline.consumer_release(umma_state)
+                umma_state.advance()
+            acc = tTR_rAcc.load()
+            for h in cutlass.range_constexpr(0, heads_per_subtile, 4):
+                head = i * heads_per_subtile + h
+                sums = self._accumulate_fp32_heads(
+                    acc, h, w_cache, (head, head + 1, head + 2, head + 3), sums
+                )
+        s0x, s0y, s1x, s1y = sums
+        sum_x, sum_y = cute.arch.add_packed_f32x2((s0x, s0y), (s1x, s1y))
+        score = cutlass.Float32(sum_x + sum_y) * cutlass.Float32(scale)
+        hit = (kv_pos >= row_start) & (kv_pos < row_end) & (score >= threshold)
+        mask = cute.arch.vote_ballot_sync(hit)
+        if mask != 0:
+            lane_mask = (cutlass.Uint32(1) << cute.arch.lane_idx()) - 1
+            slot = cursor + cutlass.Int32(cute.arch.popc(mask & lane_mask))
+            if hit & (slot < span):
+                packed = (
+                    cutlass.Uint64(cutlass.Uint32(fp32_to_i32_bits(score))) << 32
+                ) | cutlass.Uint64(cutlass.Uint32(kv_pos))
+                segment_rows[slot] = cutlass.Int64(packed)
+            cursor = cursor + cutlass.Int32(cute.arch.popc(mask))
+        return cursor, umma_state
+
+    @cute.kernel
+    def kernel(
+        self,
+        tiled_mma: cute.TiledMma,
+        tma_atom_a: cute.CopyAtom,
+        mA: cute.Tensor,
+        tma_atom_b: cute.CopyAtom,
+        mB_nkl: cute.Tensor,
+        tma_atom_w: cute.CopyAtom,
+        mW_tma: cute.Tensor,
+        mScales: cute.Tensor,
+        mBlockTable: cute.Tensor,
+        mLogits: cute.Tensor,
+        mIndexCounts: cute.Tensor,
+        mContextLens: cute.Tensor,
+        mTileMeta: cute.Tensor,
+        mPolicyValues: cute.Tensor,
+        num_tiles: cutlass.Int32,
+        a_tma_view: cute.ComposedLayout,
+        w_smem_layout: cute.Layout,
+        cluster_layout_vmnk: cute.Layout,
+        a_smem_layout_staged: cute.ComposedLayout,
+        b_smem_layout_staged: cute.ComposedLayout,
+        SharedStorage: cutlass.Constexpr,
+    ):
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        tidx, _, _ = cute.arch.thread_idx()
+        _, _, bidz = cute.arch.block_idx()
+        grid = cute.arch.grid_dim()[2]
+        warpgroup_idx = warp_idx // 4
+        is_math_warp = warp_idx < 16
+        is_tma_warp = warp_idx == 16
+        is_umma_warp = warp_idx == 18
+        last_column = mBlockTable.shape[1] - 1
+
+        if is_tma_warp:
+            cpasync.prefetch_descriptor(tma_atom_a)
+            cpasync.prefetch_descriptor(tma_atom_b)
+            cpasync.prefetch_descriptor(tma_atom_w)
+
+        smem = utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+        producer = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        # The 16 math warps release a Q/weight stage after the tile's last KV.
+        q_pipeline = pipeline.PipelineTmaAsync.create(
+            barrier_storage=storage.q_mbar.data_ptr(),
+            num_stages=self.num_q_stages,
+            producer_group=producer,
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 16),
+            tx_count=self.num_q_tma_bytes,
+            cta_layout_vmnk=cluster_layout_vmnk,
+            tidx=tidx,
+            defer_sync=True,
+        )
+        # Math reads scales from the pool, so the MMA commit alone frees a stage.
+        kv_pipeline = pipeline.PipelineTmaUmma.create(
+            barrier_storage=storage.kv_mbar.data_ptr(),
+            num_stages=self.num_kv_stages,
+            producer_group=producer,
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+            tx_count=self.num_kv_tma_bytes,
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+        umma_pipeline = pipeline.PipelineUmmaAsync.create(
+            barrier_storage=storage.umma_mbar.data_ptr(),
+            num_stages=self.num_umma_stages,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 512),
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+        # Math warp 0 allocates; all 16 math warps and the UMMA warp retrieve.
+        tmem = utils.TmemAllocator(
+            storage.tmem_holding_buf,
+            barrier_for_retrieve=pipeline.NamedBarrier(barrier_id=1, num_threads=544),
+            allocator_warp_id=0,
+            is_two_cta=False,
+        )
+        pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
+
+        sKV = smem.allocate_tensor(
+            element_type=self.a_dtype,
+            layout=a_smem_layout_staged.outer,
+            byte_alignment=128,
+            swizzle=a_smem_layout_staged.inner,
+        )
+        sQ = smem.allocate_tensor(
+            element_type=self.b_dtype,
+            layout=b_smem_layout_staged.outer,
+            byte_alignment=128,
+            swizzle=b_smem_layout_staged.inner,
+        )
+        sW = smem.allocate_tensor(
+            element_type=cutlass.Float32, layout=w_smem_layout, byte_alignment=128
+        )
+        # The same linear stage viewed as [query row, head, stage].
+        sW = cute.make_tensor(
+            sW.iterator,
+            cute.make_layout(
+                (self.next_n, self.num_heads, self.num_q_stages),
+                stride=(self.num_heads, 1, self.w_stage_stride),
+            ),
+        )
+
+        thr_mma = tiled_mma.get_slice(0)
+        tAsA, tAgA = cpasync.tma_partition(
+            tma_atom_a,
+            0,
+            cute.make_layout(1),
+            cute.make_tensor(sKV.iterator, a_tma_view.outer),
+            cute.group_modes(
+                cute.local_tile(
+                    mA, (self.block_kv, self.head_dim), coord=(None, None, None)
+                ),
+                0,
+                2,
+            ),
+        )
+        tBsB, _ = cpasync.tma_partition(
+            tma_atom_b,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sQ, 0, 3),
+            cute.group_modes(
+                thr_mma.partition_B(
+                    cute.local_tile(
+                        mB_nkl,
+                        cute.slice_(self.mma_tiler, (0, None, None)),
+                        (None, None, None),
+                    )
+                ),
+                0,
+                3,
+            ),
+        )
+        tWsW, _ = cpasync.tma_partition(
+            tma_atom_w,
+            0,
+            cute.make_layout((1,)),
+            cute.group_modes(sW, 0, 2),
+            cute.group_modes(
+                cute.local_tile(mW_tma, (self.next_n, self.num_heads), (None, None)),
+                0,
+                2,
+            ),
+        )
+        tCrA = tiled_mma.make_fragment_A(sKV)
+        tCrB = tiled_mma.make_fragment_B(sQ)
+        tCtAcc_fake = tiled_mma.make_fragment_C(
+            cute.append(
+                tiled_mma.partition_shape_C(self.mma_tiler[:2]), self.num_umma_stages
+            )
+        )
+        epi_sub_mn = (self.block_kv, self.num_heads // self.num_epi_subtiles)
+        copy_atom_t2r = sm100_utils.get_tmem_load_op(
+            self.cta_tile_shape_mnk,
+            utils.LayoutEnum.ROW_MAJOR,
+            self.acc_dtype,
+            self.acc_dtype,
+            epi_sub_mn,
+            False,
+        )
+        pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
+
+        # Descending tiles reach a long causal request's longest rows first.
+        # Every role walks the same tile sequence and per-tile KV extent.
+        first_tile = num_tiles - 1 - bidz
+        if is_tma_warp:
+            q_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.num_q_stages
+            )
+            kv_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.num_kv_stages
+            )
+            tile = first_tile
+            while tile >= 0:
+                q_pipeline.producer_acquire(q_state)
+                q_bar = q_pipeline.producer_get_barrier(q_state)
+                q_source, w_source = self._tma_q_source_views(
+                    tile,
+                    True,
+                    mTileMeta,
+                    mB_nkl,
+                    mW_tma,
+                    thr_mma,
+                    sQ,
+                    sW,
+                    tma_atom_b,
+                    tma_atom_w,
+                    None,
+                    None,
+                )
+                cute.copy(
+                    tma_atom_b, q_source, tBsB[(None, q_state.index)], tma_bar_ptr=q_bar
+                )
+                cute.copy(
+                    tma_atom_w, w_source, tWsW[(None, q_state.index)], tma_bar_ptr=q_bar
+                )
+                q_state.advance()
+                page_row = mTileMeta[(tile, 1)]
+                num_kv = (mContextLens[tile] + self.block_kv - 1) // self.block_kv
+                chunk_base = cutlass.Int32(0)
+                while chunk_base < num_kv:
+                    # Lanes past the table read its last column, which no live
+                    # tile uses.
+                    page_cache = mBlockTable[
+                        (
+                            page_row,
+                            min(chunk_base + cute.arch.lane_idx(), last_column),
+                        )
+                    ]
+                    for chunk_slot in cutlass.range(
+                        min(num_kv - chunk_base, _H64_CANDIDATE_PAGE_CACHE), unroll=1
+                    ):
+                        page = cute.arch.shuffle_sync(page_cache, chunk_slot)
+                        kv_pipeline.producer_acquire(kv_state)
+                        cute.copy(
+                            tma_atom_a,
+                            tAgA[(None, 0, 0, page)],
+                            tAsA[(None, 0, kv_state.index)],
+                            tma_bar_ptr=kv_pipeline.producer_get_barrier(kv_state),
+                        )
+                        kv_state.advance()
+                    chunk_base = chunk_base + _H64_CANDIDATE_PAGE_CACHE
+                tile = tile - grid
+        elif is_umma_warp:
+            tmem.wait_for_alloc()
+            tCtAcc_base = cute.make_tensor(
+                tmem.retrieve_ptr(self.acc_dtype), tCtAcc_fake.layout
+            )
+            q_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.num_q_stages
+            )
+            kv_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.num_kv_stages
+            )
+            umma_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.num_umma_stages
+            )
+            tile = first_tile
+            while tile >= 0:
+                q_pipeline.consumer_wait(q_state)
+                num_kv = (mContextLens[tile] + self.block_kv - 1) // self.block_kv
+                for _ in cutlass.range(num_kv, unroll=1):
+                    kv_pipeline.consumer_wait(kv_state)
+                    umma_pipeline.producer_acquire(umma_state)
+                    tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                    tCtAcc = tCtAcc_base[(None, None, None, umma_state.index)]
+                    for k_block in cutlass.range_constexpr(cute.size(tCrA.shape[2])):
+                        cute.gemm(
+                            tiled_mma,
+                            tCtAcc,
+                            tCrA[None, None, k_block, kv_state.index],
+                            tCrB[None, None, k_block, q_state.index],
+                            tCtAcc,
+                        )
+                        tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                    kv_pipeline.consumer_release(kv_state)
+                    kv_state.advance()
+                    umma_pipeline.producer_commit(umma_state)
+                    umma_state.advance()
+                # The math warps release this Q stage after their last tile.
+                q_state.advance()
+                tile = tile - grid
+        elif is_math_warp:
+            tmem.allocate(self.num_tmem_alloc_cols_total)
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+            tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
+            local_tidx = tidx % 128
+            segment = local_tidx // 32
+            query_slot = warpgroup_idx
+            tAcc_ref = tCtAcc_base[(None, None, None, 0)][((None, None), 0, 0)]
+            tiled_copy = tcgen05.make_tmem_copy(
+                copy_atom_t2r,
+                cute.flat_divide(tAcc_ref, epi_sub_mn)[(None, None, 0, 0)],
+            )
+            thr_copy = tiled_copy.get_slice(local_tidx)
+            tTR_cC = thr_copy.partition_D(cute.make_identity_tensor(epi_sub_mn))
+            m_coord = tTR_cC[0][0]
+            tTR_rAcc = cute.make_rmem_tensor_like(tTR_cC, self.acc_dtype)
+            w_cache = cute.make_rmem_tensor((self.num_heads,), cutlass.Float32)
+            span = self.capacity // _H64_CANDIDATE_SEGMENTS
+            q_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.num_q_stages
+            )
+            umma_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.num_umma_stages
+            )
+            tile = first_tile
+            while tile >= 0:
+                q_pipeline.consumer_wait(q_state)
+                for h in cutlass.range_constexpr(self.num_heads):
+                    w_cache[h] = sW[(query_slot, h, q_state.index)]
+                active = query_slot < mTileMeta[(tile, 2)]
+                row = mTileMeta[(tile, 0)] + query_slot
+                # Inactive slots keep an empty [0, 0) range and never publish.
+                row_start = mTileMeta[(tile, 4 + query_slot)]
+                row_end = mTileMeta[(tile, 4 + self.next_n + query_slot)]
+                threshold = cutlass.Float32(float("inf"))
+                if active:
+                    threshold = i32_bits_to_fp32(mPolicyValues[row])
+                segment_rows = cute.make_tensor(
+                    mLogits.iterator
+                    + cutlass.Int64(row) * mLogits.layout.stride[0]
+                    + segment * span,
+                    cute.make_layout(span),
+                )
+                page_row = mTileMeta[(tile, 1)]
+                num_kv = (mContextLens[tile] + self.block_kv - 1) // self.block_kv
+                cursor = cutlass.Int32(0)
+                chunk_base = cutlass.Int32(0)
+                while chunk_base < num_kv:
+                    page_cache = mBlockTable[
+                        (
+                            page_row,
+                            min(chunk_base + cute.arch.lane_idx(), last_column),
+                        )
+                    ]
+                    chunk = min(num_kv - chunk_base, _H64_CANDIDATE_PAGE_CACHE)
+                    if chunk == _H64_CANDIDATE_PAGE_CACHE:
+                        # A static unroll overlaps later tiles' scale loads and
+                        # TMEM reads.
+                        for chunk_slot in cutlass.range_constexpr(
+                            _H64_CANDIDATE_PAGE_CACHE
+                        ):
+                            cursor, umma_state = self._score_kv_tile(
+                                chunk_base + chunk_slot,
+                                cute.arch.shuffle_sync(page_cache, chunk_slot),
+                                mScales,
+                                m_coord,
+                                query_slot,
+                                row_start,
+                                row_end,
+                                threshold,
+                                cursor,
+                                segment_rows,
+                                span,
+                                w_cache,
+                                tCtAcc_base,
+                                thr_copy,
+                                tiled_copy,
+                                tTR_rAcc,
+                                epi_sub_mn,
+                                umma_pipeline,
+                                umma_state,
+                            )
+                    else:
+                        for chunk_slot in cutlass.range(chunk, unroll=1):
+                            cursor, umma_state = self._score_kv_tile(
+                                chunk_base + chunk_slot,
+                                cute.arch.shuffle_sync(page_cache, chunk_slot),
+                                mScales,
+                                m_coord,
+                                query_slot,
+                                row_start,
+                                row_end,
+                                threshold,
+                                cursor,
+                                segment_rows,
+                                span,
+                                w_cache,
+                                tCtAcc_base,
+                                thr_copy,
+                                tiled_copy,
+                                tTR_rAcc,
+                                epi_sub_mn,
+                                umma_pipeline,
+                                umma_state,
+                            )
+                    chunk_base = chunk_base + _H64_CANDIDATE_PAGE_CACHE
+                if active & (cute.arch.lane_idx() == 0):
+                    # A raw count above span is an overflow; PackedTopK flags it.
+                    mIndexCounts[(row, segment + 1)] = cursor
+                q_pipeline.consumer_release(q_state)
+                q_state.advance()
+                tile = tile - grid
+            # Every math warp has finished its TMEM loads before the free.
+            pipeline.NamedBarrier(barrier_id=2, num_threads=512).arrive_and_wait()
+            tmem.relinquish_alloc_permit()
+            tmem.free(tmem_ptr)

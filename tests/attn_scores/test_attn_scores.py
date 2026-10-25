@@ -4423,6 +4423,111 @@ def _check_compressed_wrapper(output, payload, top_k):
 
 
 @_requires_selective_sm100
+@pytest.mark.parametrize(
+    ("heads", "page_size", "top_k", "q_lengths", "token_lengths"),
+    [
+        (8, 32, 512, [1, 2, 3], [1, 9, 11]),
+        (64, 64, 2048, [37], [37]),
+        (8, 128, 512, [1, 17], [1, 40001]),
+        (8, 128, 512, [1, 2, 3], [1, 2, 3]),
+        (64, 128, 512, [1, 17], [1, 40001]),
+        (64, 128, 512, [9], [40001]),
+        (64, 128, 2048, [9], [40001]),
+        (64, 128, 2048, [1, 37], [1, 37]),
+    ],
+)
+def test_engine_compressed_original_token_bounds_and_graph(
+    heads, page_size, top_k, q_lengths, token_lengths, monkeypatch
+):
+    """Nonzero-Q empty requests, per-request floors, poisoned pages and repair."""
+    monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    payload = _compressed_wrapper_fixture(q_lengths, token_lengths, heads, page_size)
+    q, fused, weights, cu_q, cu_tokens, table = payload
+    wrapper = SelectiveEngineCase()
+    wrapper.plan(
+        q,
+        fused,
+        weights,
+        cu_q,
+        cu_tokens,
+        table,
+        top_k=top_k,
+        num_heads=heads,
+        num_sms=4,
+        compression_ratio=4,
+    )
+    output = wrapper.run(q=q, kv_fused=fused, weights=weights, block_table=table)
+    torch.cuda.synchronize()
+    _check_compressed_wrapper(output, payload, top_k)
+    if page_size == 32:
+        from flashinfer.trace.templates.attn_scores import (
+            _compressed_topk_reference,
+            _compressed_topk_check,
+        )
+
+        trace_args = dict(
+            q=q,
+            kv_fused=fused,
+            weights=weights,
+            cu_q=cu_q,
+            cu_kv=cu_tokens,
+            block_table=table,
+            top_k=top_k,
+            compression_ratio=4,
+        )
+        reference = _compressed_topk_reference(**trace_args)
+        assert _compressed_topk_check(reference, output, **trace_args)
+        bad = output.clone()
+        bad[0, 0] = 0  # The first nonzero-Q request has no physical key0.
+        assert not _compressed_topk_check(reference, bad, **trace_args)
+    expected_prefix = [0]
+    for length in token_lengths:
+        expected_prefix.append(expected_prefix[-1] + length // 4)
+    assert wrapper._physical_cu_kv.tolist() == expected_prefix
+    if expected_prefix[-1] == 0:
+        assert wrapper._candidate_prepared is None
+        assert wrapper._empty_physical
+    if heads == 64 and q_lengths == [9]:
+        engine = wrapper
+        # R4 single-pool prefill is published by the H64 candidate variant.
+        assert engine._candidate_schedule.h64_candidate
+        assert engine._candidate_schedule.publication == "warp_striped"
+        assert engine._candidate_prepared.query_tile == 4
+        assert engine._candidate_prepared.num_umma_stages == 1
+        assert engine._candidate_prepared.split_kv == 1
+        assert engine._candidate_counts.shape[1] == 5
+        assert engine._candidate_schedule.sample_count_segments == 32
+    force_repair = max(token_lengths) == 40001
+    if force_repair:
+        engine = wrapper
+        threshold, threshold_args = engine._sample_threshold_launch
+
+        def forced_threshold(*args):
+            threshold(*args)
+            engine._thresholds.fill_(float("inf"))
+
+        engine._sample_threshold_launch = forced_threshold, threshold_args
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = wrapper.run(q=q, kv_fused=fused, weights=weights, block_table=table)
+    for _ in range(2):
+        q.copy_((q.float() * 0.5).to(q.dtype))
+        weights.mul_(0.75)
+        for request, length in enumerate(token_lengths):
+            if length // 4 >= 2 * page_size:
+                table[request, :2].copy_(table[request, :2].flip(0))
+        graph.replay()
+        torch.cuda.synchronize()
+        _check_compressed_wrapper(captured, payload, top_k)
+        assert captured.data_ptr() == output.data_ptr()
+    if force_repair:
+        repair_engine = wrapper
+        assert repair_engine._repair_flags.count_nonzero().item() > 0
+        assert repair_engine._exact_error.item() == 0
+
+
+@_requires_selective_sm100
 @pytest.mark.parametrize("strategy", ["selective"])
 @pytest.mark.parametrize("heads", [8, 64])
 def test_compressed_wrapper_empty_live_empty_replan(strategy, monkeypatch, heads):
@@ -5561,6 +5666,56 @@ def test_engine_segmented_publication_query_tiles(num_heads, query_tile):
             atol=5e-5,
             rtol=1e-5,
         )
+
+
+@_requires_selective_sm100
+@pytest.mark.parametrize(
+    ("num_heads", "q_rows", "expected_split"),
+    [(8, 32, 1), (8, 64, 2), (64, 6, 1), (64, 12, 1)],
+)
+def test_engine_selects_split_kv_from_sm_waves(num_heads, q_rows, expected_split):
+    """The public plan selects the smallest layout with best SM-wave use."""
+
+    kv_rows = 4096
+    inputs = _request_inputs((q_rows,), (kv_rows,), num_heads)
+    q, kv, scale, weights, cu_q, cu_kv = inputs
+    kv_fused, block_table = _paged_inputs(inputs)
+    oracle = _oracle_rows(inputs)
+
+    wrapper = SelectiveEngineCase()
+    wrapper.plan(
+        q,
+        kv_fused,
+        weights,
+        cu_q,
+        cu_kv,
+        block_table,
+        num_heads=num_heads,
+        head_dim=128,
+        num_sms=3,
+    )
+    assert wrapper._candidate_prepared.split_kv == expected_split
+    assert (
+        wrapper._candidate_schedule.query_tile == wrapper._candidate_prepared.query_tile
+    )
+    assert wrapper._candidate_schedule.split_kv == expected_split
+    warp_ranked = num_heads == 64
+    # Split-1 H64 prefill uses the H64 candidate variant's four warp segments.
+    assert wrapper._candidate_schedule.h64_candidate == (
+        warp_ranked and expected_split == 1
+    )
+    assert wrapper._candidate_schedule.publication == (
+        "warp_striped" if warp_ranked else "lane_local"
+    )
+    assert wrapper._candidate_counts.shape[1] == (
+        1 + (4 if warp_ranked else 32) * expected_split
+    )
+    assert wrapper._candidate_schedule.sample_count_segments == 32 * expected_split
+    selected = wrapper.run(q, kv_fused, weights, block_table).long()
+    torch.cuda.synchronize()
+
+    assert int(wrapper._exact_error.item()) == 0
+    _check_selection(selected, oracle, 512)
 
 
 @_requires_selective_sm100
@@ -8120,6 +8275,104 @@ def test_segmented_packed_topk(segments, top_k, capacity):
 
 
 @_requires_selective_sm100
+def test_h64_candidate_variant_requires_128_token_pages():
+    """Smaller pages keep the pooled layout and its exact selection."""
+    inputs = list(_inputs(q_rows=37, kv_rows=16384, num_heads=64))
+    q, kv, _scale, weights, _, _ = inputs
+    inputs[4] = torch.tensor([0, 37], device="cuda", dtype=torch.int32)
+    inputs[5] = torch.tensor([0, kv.shape[0]], device="cuda", dtype=torch.int32)
+    fused, table = _paged_inputs(tuple(inputs), block_size=64)
+    engine = SelectiveEngineCase(math_mode="relu_strict")
+    engine.plan(
+        q,
+        fused,
+        weights,
+        inputs[4],
+        inputs[5],
+        table,
+        top_k=512,
+        num_heads=64,
+        head_dim=128,
+        num_sms=2,
+    )
+    assert not engine._candidate_schedule.h64_candidate
+    selected = engine.run(q, fused, weights, table)
+    torch.cuda.synchronize()
+    _check_selection(selected, _oracle_rows(inputs), 512)
+
+
+@_requires_selective_sm100
+@pytest.mark.parametrize("top_k", [512, 2048])
+@pytest.mark.parametrize("ratio", [1, 4])
+@pytest.mark.parametrize("h64_candidate", [False, True])
+def test_single_pool8192_changed_map_tail_graph(
+    top_k, ratio, h64_candidate, monkeypatch
+):
+    """Split-1 H64 candidates, partial Q/page and mutable map replay.
+
+    The pooled layout publishes one repair-wide pool; the specialized H64
+    candidate variant splits the same backing into four warp segments.
+    """
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    physical = 16387
+    q, kv, scales, weights, _, _ = _inputs(9, physical, 64)
+    cu_q = torch.tensor([0, 9], device="cuda", dtype=torch.int32)
+    cu_physical = torch.tensor([0, physical], device="cuda", dtype=torch.int32)
+    fused, table = _paged_inputs((q, kv, scales, weights, cu_q, cu_physical))
+    tokens = physical * ratio + ratio - 1
+    cu_tokens = torch.tensor([0, tokens], device="cuda", dtype=torch.int32)
+    raw = fused.flatten(1)
+    last = int(table[0, -1].item())
+    raw[last, : 128 * 128].view(128, 128)[physical % 128 :].fill_(0x7F)
+    wrapper = SelectiveEngineCase()
+    _force_h64_candidate_layout(monkeypatch, h64_candidate)
+    wrapper.plan(
+        q,
+        fused,
+        weights,
+        cu_q,
+        cu_tokens,
+        table,
+        top_k=top_k,
+        num_heads=64,
+        num_sms=4,
+        compression_ratio=ratio,
+    )
+    assert wrapper._candidate_schedule.candidate_capacity == 8192
+    assert wrapper._candidate_schedule.sample_count_segments == 32
+    assert wrapper._candidate_schedule.h64_candidate is h64_candidate
+    assert wrapper._candidate_counts.shape[1] == (5 if h64_candidate else 2)
+    assert wrapper._candidate_values.shape[1] == 8192
+    assert wrapper._sample_threshold_launch[1][-2:] == (6144, 32)
+    assert not wrapper._compact_repair
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = wrapper.run(q, fused, weights, table)
+    for changed in (False, True):
+        if changed:
+            table[:, :2].copy_(table[:, :2].flip(1))
+            weights.mul_(0.75)
+        graph.replay()
+        torch.cuda.synchronize()
+        mapped = raw[table[0].long()]
+        keys = mapped[:, : 128 * 128].contiguous().view(q.dtype).reshape(-1, 128)
+        scale = mapped[:, 128 * 128 :].contiguous().view(torch.float32).reshape(-1)
+        for row in range(9):
+            end = (tokens - 9 + row + 1) // ratio
+            scores = (
+                (q[row].float() @ keys[:end].float().T).relu_() * weights[row, :, None]
+            ).sum(0) * scale[:end]
+            ids = output[row].long()
+            assert ((ids >= 0) & (ids < end)).all() and ids.unique().numel() == top_k
+            torch.testing.assert_close(
+                scores[ids].sort().values,
+                scores.topk(top_k).values.sort().values,
+                atol=5e-5,
+                rtol=1e-5,
+            )
+
+
+@_requires_selective_sm100
 @pytest.mark.parametrize("top_k", [512, 1024, 2048])
 @pytest.mark.parametrize("ratio", [1, 4])
 def test_lane_local8192_changed_map_tail_graph(top_k, ratio, monkeypatch):
@@ -9977,6 +10230,17 @@ def test_body_capture_failure_preserves_exception_and_recovers(
 # Selective row tails and storage replanning
 
 
+def _force_h64_candidate_layout(monkeypatch, variant: bool) -> None:
+    """Pin single-pool H64 publication to the variant or the pooled layout."""
+    import flashinfer.attn_scores.selective_logits as selective_logits
+
+    monkeypatch.setattr(
+        selective_logits,
+        "_h64_candidate_variant_serves",
+        lambda page_size: variant and page_size == 128,
+    )
+
+
 def _check_selection(selected, expected_rows, top_k):
     for row, scores in enumerate(expected_rows):
         count = min(top_k, scores.numel())
@@ -10291,6 +10555,138 @@ def test_policy_row_tails_forced_repair(ratio):
 
 
 # H64 query-tile scheduling and graph replay
+
+
+@_requires_selective_sm100
+@pytest.mark.parametrize(
+    "q_rows,top_k,ties,num_sms",
+    [
+        # Fallback/query4 boundaries, publication layouts and persistent tails.
+        (2, 512, False, 2),
+        (2, 2048, True, 4),
+        (4, 2048, False, 4),
+        (4, 512, True, 2),
+        (5, 512, False, 2),
+        (5, 2048, True, 2),
+        (5, 512, True, 4),
+        (5, 2048, False, 4),
+        (7, 512, False, 4),
+        (7, 2048, True, 2),
+        (33, 512, True, 2),
+        (33, 2048, False, 4),
+    ],
+)
+def test_h64_query4_eager_graph_and_tails(q_rows, top_k, ties, num_sms):
+    inputs = list(_inputs(q_rows=q_rows, kv_rows=16384, num_heads=64))
+    q, kv, scale, weights, _, _ = inputs
+    inputs[4] = torch.tensor([0, q_rows], device="cuda", dtype=torch.int32)
+    inputs[5] = torch.tensor([0, kv.shape[0]], device="cuda", dtype=torch.int32)
+    if ties:
+        q.zero_()
+    fused, table = _paged_inputs(tuple(inputs))
+    wrapper = SelectiveEngineCase(math_mode="relu_strict")
+    wrapper.plan(
+        q,
+        fused,
+        weights,
+        inputs[4],
+        inputs[5],
+        table,
+        top_k=top_k,
+        num_heads=64,
+        head_dim=128,
+        num_sms=num_sms,
+    )
+    candidate = wrapper._candidate_prepared
+    assert candidate.query_tile == (4 if q_rows > 4 else 2)
+    assert candidate.num_umma_stages == (1 if q_rows > 4 else 2)
+    if q_rows == 5:
+        assert candidate.split_kv == (1 if num_sms == 2 else 2)
+        # Split-1 H64 prefill uses the H64 candidate variant's 4 segments.
+        assert wrapper._candidate_schedule.h64_candidate == (num_sms == 2)
+        assert wrapper._candidate_schedule.publication == "warp_striped"
+        assert wrapper._candidate_schedule.count_segments == (4 if num_sms == 2 else 8)
+        assert wrapper._candidate_schedule.sample_count_segments == (
+            32 if num_sms == 2 else 64
+        )
+    for prepared in (
+        wrapper._sample_prepared,
+        wrapper._repair_prepared,
+        wrapper._prepared,
+    ):
+        assert prepared.query_tile == 2
+        assert prepared.num_umma_stages == 2
+    selected = wrapper.run(q, fused, weights, table)
+    torch.cuda.synchronize()
+    _check_selection(selected, _oracle_rows(inputs), top_k)
+    if ties:
+        assert (wrapper._repair_flags != 0).all()
+    assert int(wrapper._exact_error.item()) == 0
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = wrapper.run(q, fused, weights, table)
+    graph.replay()
+    torch.cuda.synchronize()
+    _check_selection(captured, _oracle_rows(inputs), top_k)
+    assert selected.data_ptr() == captured.data_ptr()
+    # Change physical placement and logical Q/scale/weight values in place.
+    fused.copy_(fused.flip(0))
+    table.copy_(fused.shape[0] - 1 - table)
+    q.copy_(q.float().neg().to(q.dtype))
+    weights[:, ::2].mul_(-1)
+    scale[::2].mul_(2)
+    fused.flatten(1)[:, 128 * 128 :].view(torch.float32)[:, ::2].mul_(2)
+    graph.replay()
+    torch.cuda.synchronize()
+    _check_selection(captured, _oracle_rows(inputs), top_k)
+    assert int(wrapper._exact_error.item()) == 0
+
+
+@_requires_selective_sm100
+@pytest.mark.parametrize("top_k", [512, 2048])
+@pytest.mark.parametrize(
+    ("q_lengths", "kv_lengths"),
+    [([1, 36], [132, 16252]), ([40, 7, 64], [5000, 300, 9000])],
+)
+def test_h64_candidate_variant_matches_pooled_layout(
+    q_lengths, kv_lengths, top_k, monkeypatch
+):
+    """The H64 candidate variant publishes the pooled layout's candidates.
+
+    Covers ragged multi-request prefill, partial query tiles and short rows.
+    """
+    inputs = _request_inputs(q_lengths, kv_lengths, heads=64)
+    q, _kv, _scale, weights, cu_q, cu_kv = inputs
+    fused, table = _paged_inputs(inputs)
+    oracle = _oracle_rows(inputs)
+    rows = sum(q_lengths)
+    selected, lengths = {}, {}
+    for h64_candidate in (False, True):
+        _force_h64_candidate_layout(monkeypatch, h64_candidate)
+        engine = SelectiveEngineCase(math_mode="relu_strict")
+        engine.plan(
+            q,
+            fused,
+            weights,
+            cu_q,
+            cu_kv,
+            table,
+            top_k=top_k,
+            num_heads=64,
+            head_dim=128,
+            num_sms=2,
+        )
+        assert engine._candidate_schedule.h64_candidate is h64_candidate
+        selected[h64_candidate] = engine.run(q, fused, weights, table).clone()
+        torch.cuda.synchronize()
+        lengths[h64_candidate] = engine._candidate_lengths[:rows].clone()
+        assert int(engine._exact_error.item()) == 0
+        _check_selection(selected[h64_candidate], oracle, top_k)
+    # Identical scores and thresholds publish identical candidate populations.
+    torch.testing.assert_close(lengths[True], lengths[False], atol=0, rtol=0)
+    torch.testing.assert_close(
+        selected[True].sort(1).values, selected[False].sort(1).values, atol=0, rtol=0
+    )
 
 
 @_requires_selective_sm100

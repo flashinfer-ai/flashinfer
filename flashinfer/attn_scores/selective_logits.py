@@ -146,6 +146,9 @@ class _CandidateSchedule:
     sample_count_segments: int
     # Publication budget is independent of the original sample-ladder budget.
     candidate_capacity: int = _CANDIDATE_CAPACITY
+    # Single-pool H64 prefill published by the specialized H64 candidate
+    # variant, one query row per math warpgroup in four warp segments.
+    h64_candidate: bool = False
 
 
 def _candidate_count_segments(split_kv: int) -> int:
@@ -487,6 +490,15 @@ def _select_request_tiling(
     )
 
 
+def _h64_candidate_variant_serves(page_size: int) -> bool:
+    """Whether the H64 candidate variant publishes a single-pool schedule.
+
+    The variant reads one page per compute tile, so smaller pages keep the
+    pooled layout.
+    """
+    return page_size == _COMPUTE_BLOCK_KV
+
+
 def _select_candidate_schedule(
     device: torch.device,
     num_heads: int,
@@ -497,8 +509,13 @@ def _select_candidate_schedule(
     num_sms: int,
     top_k: int,
     q1_owner_pool: bool | None = None,
+    page_size: int = _COMPUTE_BLOCK_KV,
 ) -> _CandidateSchedule:
-    """Choose scheduling, pooling eligible Q1 owners unless explicitly disabled."""
+    """Choose scheduling, pooling eligible Q1 owners unless explicitly disabled.
+
+    Single-pool H64 prefill on compute-tile pages publishes through the
+    specialized H64 candidate variant.
+    """
     tiling = _select_request_tiling(device, num_heads, head_dim, q_lengths)
     if num_heads == 64 and head_dim == 128 and max(q_lengths, default=0) > 4:
         # Retain both KV streams, trading UMMA double buffering for Q4 reuse.
@@ -539,6 +556,7 @@ def _select_candidate_schedule(
         # widen those lane banks; smaller targets keep 6144, where the wider
         # PackedTopK costs more than the few overflows it would avoid.
         candidate_capacity = _REPAIR_CAPACITY
+    h64_candidate = False
     if warp_ranked_prefill and _h64_single_pool_topology(
         num_heads,
         head_dim,
@@ -554,6 +572,11 @@ def _select_candidate_schedule(
         # One warp owns the entire row, so it can use the existing repair-wide
         # backing without changing sampling or any multi-bank stride/ABI.
         candidate_capacity = _REPAIR_CAPACITY
+        h64_candidate = _h64_candidate_variant_serves(page_size)
+        if h64_candidate:
+            # Each warp of a row's warpgroup owns one of four equal segments of
+            # the same repair-wide backing.
+            publication, count_segments = _WARP_STRIPED_PUBLICATION, 4
     q1_pool_eligible = all(
         length in (0, 1) for length in q_lengths
     ) and _q1_owner_pool_topology(
@@ -583,6 +606,7 @@ def _select_candidate_schedule(
         count_segments=count_segments,
         sample_count_segments=sample_count_segments,
         candidate_capacity=candidate_capacity,
+        h64_candidate=h64_candidate,
     )
 
 
@@ -669,7 +693,11 @@ def _compile_for_device(device: torch.device, kernel, *args):
     """Keep build context and generated architecture aligned with the tensor key."""
     with torch.cuda.device(device):
         major, minor = torch.cuda.get_device_capability(device)
-        return cute.compile(kernel, *args, options=f"--gpu-arch sm_{major}{minor}a")
+        options = f"--gpu-arch sm_{major}{minor}a"
+        max_registers = getattr(kernel, "ptxas_max_registers", None)
+        if max_registers is not None:
+            options += f" --ptxas-options=--maxrregcount={max_registers}"
+        return cute.compile(kernel, *args, options=options)
 
 
 def _require_cute() -> None:
@@ -1349,6 +1377,7 @@ def _fp8_mqa_selective_logits(
     _compile_only: bool = False,
     _clear_counts: bool = True,
     _candidate_counts_precleared: bool = False,
+    _h64_candidate: bool = False,
 ) -> None:
     """Run one explicitly selected logits phase into caller-owned storage.
 
@@ -1821,6 +1850,19 @@ def _fp8_mqa_selective_logits(
     )
     stream = _current_stream(q.device)
     capability = torch.cuda.get_device_capability(q.device)
+    if _h64_candidate and not (
+        mode == _SelectiveLogitsMode.CANDIDATE
+        and (prepared.num_heads, prepared.head_dim) == (64, 128)
+        and prepared.query_tile == 4
+        and prepared.page_size == _COMPUTE_BLOCK_KV
+        and prepared.split_kv == 1
+        and required_words == 1 + _candidate_count_segments(prepared.split_kv)
+        and sample_page_indices is None
+    ):
+        raise ValueError(
+            "the H64 candidate variant requires an H64 D128 Q4 split-1 CANDIDATE "
+            "launch with 128-token pages and four count segments"
+        )
     key: Tuple[Any, ...] = (
         capability[0] * 10 + capability[1],
         prepared.num_sms,
@@ -1839,6 +1881,7 @@ def _fp8_mqa_selective_logits(
         prepared.num_umma_stages,
         sample_page_indices is not None,
         prepared.math_mode,
+        _h64_candidate,
     )
     if mode in (
         _SelectiveLogitsMode.SAMPLE,
@@ -1855,6 +1898,20 @@ def _fp8_mqa_selective_logits(
         raise RuntimeError(
             "selective logits kernel is not compiled; prepare a pool before capture"
         )
+    if compiled is None and _h64_candidate:
+        from .kernels._fp8_mqa_selective import FP8MQASelectiveH64CandidateKernel
+
+        compiled = _compile_for_device(
+            q.device,
+            FP8MQASelectiveH64CandidateKernel(
+                num_sms=prepared.num_sms,
+                capacity=capacity,
+                math_mode=prepared.math_mode,
+            ),
+            *args,
+            stream,
+        )
+        _SELECTIVE_LOGITS_COMPILED[key] = compiled
     if compiled is None:
         from .kernels._fp8_mqa_selective import (
             FP8MQASelectiveLogitsKernel,
@@ -2367,6 +2424,7 @@ class _FP8PagedMQASelectiveTopKEngine:
             num_sms=requested_num_sms,
             top_k=top_k,
             q1_owner_pool=None,
+            page_size=kv_fused.shape[1],
         )
         query_tile = candidate_schedule.query_tile
         reference_query_tile = _select_request_tiling(
@@ -3141,6 +3199,7 @@ class _FP8PagedMQASelectiveTopKEngine:
             index_counts=self._candidate_counts,
             policy_values=self._thresholds,
             _compile_only=True,
+            _h64_candidate=self._candidate_schedule.h64_candidate,
         )
         _finalize_fp8_mqa_packed_candidates(
             self._candidate_counts,
@@ -3704,6 +3763,7 @@ class _FP8PagedMQASelectiveTopKEngine:
             index_counts=self._candidate_counts,
             policy_values=self._thresholds,
             _candidate_counts_precleared=_candidate_counts_precleared,
+            _h64_candidate=self._candidate_schedule.h64_candidate,
         )
         if not ((self._rows > 1) and self._candidate_counts.shape[1] > 1):
             _finalize_fp8_mqa_packed_candidates(
