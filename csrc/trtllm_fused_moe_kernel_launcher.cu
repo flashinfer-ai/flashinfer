@@ -5244,7 +5244,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
   }
 
   /** Return the launcher-owned finalized output handle used by the existing DA result ABI. */
-  Tensor finalized_da_output() const { return output; }
+  Optional<Tensor> finalized_da_output() const { return output; }
 
  private:
   Optional<TensorView> hidden_states_scale;
