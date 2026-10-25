@@ -15,8 +15,9 @@ Modes (one process per GPU under torchrun):
   The experts (``--baseline-gemm``) default to the mega kernel's own
   standalone fused FC12 -- FP8 in, BF16 out, like the Blackwell harness' FC12
   baseline -- behind a Triton pack / pre-reduce handoff; ``cutlass`` uses
-  flashinfer's CUTLASS fused MoE instead (blockwise takes BF16 there, so the
-  received rows are dequantized in the timed handoff).
+  flashinfer's SM90 CUTLASS FP8 GEMMs instead, also FP8 in: the per-tensor
+  fused MoE, or under blockwise the CUTLASS / DeepGEMM block-scale grouped
+  GEMM (FC1 fused with SwiGLU + requant, then FC2) behind the same handoff.
   ``nccl_ep_*`` need ``nccl.ep`` (nccl-extensions 0.1.0, whose kernels are
   built against the NCCL 2.30 device API: run it on NCCL 2.30.x, it faults on
   2.32); ``deepep`` needs DeepEP V2 (``deep_ep.ElasticBuffer``, NCCL GIN).
@@ -81,9 +82,10 @@ def _args():
         "--baseline-gemm",
         choices=["fc12", "cutlass"],
         default="fc12",
-        help="baselines' expert compute: the mega kernel's standalone fused FC12 "
-        "(FP8 in, as the Blackwell harness' FC12 baseline) or flashinfer's CUTLASS "
-        "fused MoE (blockwise takes BF16 input there)",
+        help="baselines' expert compute, FP8 in either way: the mega kernel's "
+        "standalone fused FC12 (as the Blackwell harness' FC12 baseline) or "
+        "flashinfer's SM90 CUTLASS FP8 GEMMs (per-tensor fused MoE / block-scale "
+        "grouped GEMM)",
     )
     p.add_argument(
         "--check",
@@ -382,7 +384,7 @@ class _DeepEp:
 
 
 def _dequant(x, sf):
-    """E4M3 rows (+ [M, H/128] fp32 1x128 block scales) -> BF16."""
+    """E4M3 rows (+ [M, H/128] fp32 1x128 block scales) -> BF16 (--check)."""
     if sf is None:
         return x.to(torch.bfloat16) * _ACT_SCALE
     m, h = x.shape
@@ -390,80 +392,68 @@ def _dequant(x, sf):
     return blocks.mul_(sf.to(torch.bfloat16).unsqueeze(-1)).view(m, h)
 
 
-class _CutlassExperts:
-    """This rank's experts as the SM90 CUTLASS FP8 fused MoE: per-tensor, or
-    DeepSeek 128x128 block scales under blockwise.  The block runner takes
-    BF16 activations and quantizes them 1x128 itself, so the received rows are
-    dequantized in the handoff stage."""
+class _CutlassPerTensorExperts:
+    """This rank's experts as flashinfer's SM90 CUTLASS per-tensor FP8 fused
+    MoE: the received E4M3 rows go in as they are."""
 
     def __init__(self, rank, experts, args):
         from flashinfer.fused_moe.api import (
-            CutlassFp8BlockConfig,
             CutlassFp8PerTensorConfig,
             MoEWeightPack as FusedWeightPack,
-            QuantFormat,
             SwiGLU,
         )
 
-        self.blockwise = args.scale_mode == "blockwise"
         w13, w2 = _bf16_weights(rank, experts, args.hidden, args.intermediate)
         self.activation = SwiGLU(limit=10.0)
-        shape = dict(
+        view = CutlassFp8PerTensorConfig.prepare_weights(
+            w13,
+            w2,
+            hidden_states_scale_global=1.0 / _ACT_SCALE,
+            intermediate_scale_global=1.0 / _ACT_SCALE,
             num_local_experts=experts,
             hidden_size=args.hidden,
             intermediate_size=args.intermediate,
             activation=self.activation,
         )
-        if self.blockwise:
-            self.config_cls, self.key = CutlassFp8BlockConfig, "cutlass_fp8_block"
-            self.fmt = QuantFormat.DeepSeekFp8
-            view = CutlassFp8BlockConfig.prepare_weights(w13, w2, **shape)
-        else:
-            self.config_cls = CutlassFp8PerTensorConfig
-            self.key, self.fmt = "cutlass_fp8_per_tensor", QuantFormat.FP8PerTensor
-            view = CutlassFp8PerTensorConfig.prepare_weights(
-                w13,
-                w2,
-                hidden_states_scale_global=1.0 / _ACT_SCALE,
-                intermediate_scale_global=1.0 / _ACT_SCALE,
-                **shape,
-            )
         del w13, w2
         torch.cuda.empty_cache()
         self.pack = FusedWeightPack()
-        self.pack.prepare_for(self.key, view)
+        self.pack.prepare_for("cutlass_fp8_per_tensor", view)
         self.experts, self.args = experts, args
         self.layer = None
 
     def build(self, tokens, rows):
         from flashinfer.fused_moe.api import (
             BackendOptions,
+            CutlassFp8PerTensorConfig,
             ExecutionConfig,
             ExpertConfig,
             MoEConfig,
             QuantConfig,
+            QuantFormat,
             RoutingConfig,
         )
         from flashinfer.fused_moe.layer import MoELayer
 
+        fp8 = QuantFormat.FP8PerTensor
         self.layer = MoELayer(
             MoEConfig(
                 routing=RoutingConfig(num_experts=self.experts, top_k=self.args.top_k),
-                quant=QuantConfig(weight=self.fmt, activation=self.fmt),
+                quant=QuantConfig(weight=fp8, activation=fp8),
                 experts=ExpertConfig(
                     intermediate_size=self.args.intermediate,
                     local_expert_offset=0,
                     local_num_experts=self.experts,
                 ),
                 activation=self.activation,
-                backend=BackendOptions(candidates=(self.config_cls(),)),
+                backend=BackendOptions(candidates=(CutlassFp8PerTensorConfig(),)),
                 execution=ExecutionConfig(tune_max_num_tokens=rows),
             )
         )
 
     def handoff(self, recv_x, recv_sf, recv_idx, recv_w, valid):
         self._ids, self._ws = _local_routing(recv_idx, recv_w, valid)
-        self._act = _dequant(recv_x, recv_sf) if self.blockwise else recv_x
+        self._act = recv_x
 
     def compute(self):
         from flashinfer.fused_moe.api import MoEActivationPack
@@ -483,7 +473,7 @@ class _CutlassExperts:
 
 
 @functools.cache
-def _fc12_triton_kernels():
+def _handoff_triton_kernels():
     import triton
     import triton.language as tl
 
@@ -519,6 +509,7 @@ def _fc12_triton_kernels():
         pool_x,
         pool_sf,
         SF_STRIDE,
+        SF_P,
         E,
         K: tl.constexpr,
         TILE: tl.constexpr,
@@ -528,11 +519,15 @@ def _fc12_triton_kernels():
         SF_COLS: tl.constexpr,
         SF_BLOCK: tl.constexpr,
         HAS_VALID: tl.constexpr,
+        DG_LAYOUT: tl.constexpr,
     ):
         # One program per received (row, pick): claim a slot in the pick's
-        # expert segment (segments padded to the GEMM token tile; starts
-        # recomputed in registers from the E counts) and copy the row (+ its
-        # block scales) there.
+        # expert segment (starts recomputed in registers from the E counts)
+        # and copy the row (+ its block scales) there.  FC12 layout: segments
+        # padded to the GEMM token tile, scales row-major, offs = int32
+        # cumulative ends.  DG_LAYOUT (CUTLASS / DeepGEMM block-scale grouped
+        # GEMM): unpadded segments (TILE=1), offs = int64 [E+1] starts, scales
+        # column-major [H/128, SF_P] at deep_gemm::compute_padded_offset.
         pick = tl.program_id(0)
         row = pick // K
         e = tl.load(idx + pick).to(tl.int32)
@@ -546,7 +541,11 @@ def _fc12_triton_kernels():
         padded = (c + TILE - 1) // TILE * TILE
         start = tl.sum(tl.where(r == es, tl.cumsum(padded, 0) - padded, 0), 0)
         if pick == 0:
-            tl.store(offs + r, tl.cumsum(c, 0), mask=rm)
+            if DG_LAYOUT:
+                tl.store(offs, 0)
+                tl.store(offs + 1 + r, tl.cumsum(c, 0).to(tl.int64), mask=rm)
+            else:
+                tl.store(offs + r, tl.cumsum(c, 0), mask=rm)
         claim = tl.atomic_add(cursor + es, 1, mask=ok)
         slot = tl.where(ok, start + claim, -1)
         tl.store(slots + pick, slot)
@@ -561,7 +560,11 @@ def _fc12_triton_kernels():
             s = tl.arange(0, SF_BLOCK)
             sm = (s < SF_COLS) & ok
             v = tl.load(sf + src * SF_STRIDE + s, mask=sm)
-            tl.store(pool_sf + dst * SF_COLS + s, v, mask=sm)
+            if DG_LAYOUT:
+                col = ((start + es * 31) // 32 * 32 + claim).to(tl.int64)
+                tl.store(pool_sf + s.to(tl.int64) * SF_P + col, v, mask=sm)
+            else:
+                tl.store(pool_sf + dst * SF_COLS + s, v, mask=sm)
 
     @triton.jit
     def reduce(
@@ -738,7 +741,7 @@ class _Fc12Experts:
     def handoff(self, recv_x, recv_sf, recv_idx, recv_w, valid):
         import triton
 
-        count, pack, _ = _fc12_triton_kernels()
+        count, pack, _ = _handoff_triton_kernels()
         e, k, h = self.experts, recv_idx.shape[1], recv_x.shape[1]
         idx = recv_idx.reshape(-1)
         n = idx.numel()
@@ -764,6 +767,7 @@ class _Fc12Experts:
             self.pool_x.view(torch.int32),
             pool_sf,
             sf.stride(0),
+            0,
             e,
             K=k,
             TILE=self.tile,
@@ -773,6 +777,7 @@ class _Fc12Experts:
             SF_COLS=h // 128 if self.blockwise else 0,
             SF_BLOCK=triton.next_power_of_2(h // 128),
             HAS_VALID=has_valid,
+            DG_LAYOUT=False,
         )
         self._w, self._rows = recv_w, recv_x.shape[0]
 
@@ -783,11 +788,150 @@ class _Fc12Experts:
     def reduce(self):
         import triton
 
-        _, _, reduce = _fc12_triton_kernels()
+        _, _, reduce = _handoff_triton_kernels()
         h, k = self.args.hidden, self.args.top_k
         rows, block = self._rows, 1024
         reduce[(rows, triton.cdiv(h, block))](
             self.slots, self._w, self.fc2_out, self.out, K=k, H=h, BLOCK=block
+        )
+        return self.out[:rows]
+
+
+class _CutlassBlockExperts:
+    """This rank's experts on flashinfer's SM90 CUTLASS / DeepGEMM FP8
+    block-scale grouped GEMM (TRT-LLM ``fp8_blockscale_gemm``, the runner of
+    the push-style MegaMoE): E4M3 rows + 1x128 scales in, 128x128 weight
+    scales.  FC1 runs fused with SwiGLU and the 1x128 requant (FP8 + scales
+    out), FC2 writes BF16.  The handoff packs the received picks into the
+    GEMM's layout (expert-contiguous rows, column-major padded scales); the
+    reduce is the FC12 path's."""
+
+    def __init__(self, rank, experts, args):
+        from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.gemm import (
+            create_sm90_push_fp8_moe_gemm_runner,
+        )
+        from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.weights import (
+            transform_weights_for_sm90_push,
+        )
+
+        w13, w2 = _bf16_weights(rank, experts, args.hidden, args.intermediate)
+        self.w13, self.w13_sf, self.w2, self.w2_sf = transform_weights_for_sm90_push(
+            w13, w2, interleave_gate_up=True
+        )
+        del w13, w2
+        torch.cuda.empty_cache()
+        self.runner = create_sm90_push_fp8_moe_gemm_runner()
+        self.experts, self.args = experts, args
+
+    def build(self, tokens, rows):
+        e, h, inter, k = (
+            self.experts,
+            self.args.hidden,
+            self.args.intermediate,
+            self.args.top_k,
+        )
+        max_rows = rows * k  # worst case: every received pick local
+        dev = "cuda"
+        self.runner.get_moe_workspace_size(
+            tokens * k, max_rows, max(2 * inter, h), max(h, inter), e, True, True
+        )
+        self._workspace = torch.empty(1, dtype=torch.uint8, device=dev)
+        self.runner.configure_workspace(self._workspace)
+        m_buf = (max_rows + 127) // 128 * 128
+        # Scale column stride: the runner's deep_gemm::compute_padded_offset(max_rows, E).
+        self.sf_p = (max_rows + e * 31) // 32 * 32
+        self.a1 = torch.empty(m_buf, h, dtype=torch.float8_e4m3fn, device=dev)
+        self.sfa1 = torch.empty(
+            (h // 128) * self.sf_p + 128, dtype=torch.float32, device=dev
+        )
+        self.a2 = torch.empty(m_buf, inter, dtype=torch.uint8, device=dev)
+        self.sfa2 = torch.empty(
+            (inter // 128) * self.sf_p + 128, dtype=torch.float32, device=dev
+        )
+        self.y = torch.empty(m_buf, h, dtype=torch.bfloat16, device=dev)
+        self.offsets = torch.zeros(e + 1, dtype=torch.int64, device=dev)
+        self.counters = torch.zeros(2 * e, dtype=torch.int32, device=dev)
+        self.slots = torch.empty(rows * k, dtype=torch.int32, device=dev)
+        self.out = torch.empty(rows, h, dtype=torch.bfloat16, device=dev)
+        # DeepGEMM JIT-compiles per (expected_m, N, K, groups) here, not timed.
+        self.offsets.zero_()
+        self.compute()
+        torch.cuda.synchronize()
+
+    def handoff(self, recv_x, recv_sf, recv_idx, recv_w, valid):
+        import triton
+
+        count, pack, _ = _handoff_triton_kernels()
+        e, k, h = self.experts, recv_idx.shape[1], recv_x.shape[1]
+        idx = recv_idx.reshape(-1)
+        n = idx.numel()
+        has_valid = valid is not None
+        valid = valid if has_valid else idx  # unread when HAS_VALID is False
+        counts, cursor = self.counters[:e], self.counters[e:]
+        self.counters.zero_()
+        count[(triton.cdiv(n, 1024),)](
+            idx, valid, counts, n, K=k, BLOCK=1024, HAS_VALID=has_valid
+        )
+        pack[(n,)](
+            idx,
+            valid,
+            counts,
+            cursor,
+            self.offsets,
+            self.slots,
+            recv_x.view(torch.int32),
+            recv_sf,
+            self.a1.view(torch.int32),
+            self.sfa1,
+            recv_sf.stride(0),
+            self.sf_p,
+            e,
+            K=k,
+            TILE=1,
+            E_BLOCK=triton.next_power_of_2(e),
+            WORDS=h // 4,
+            WBLOCK=triton.next_power_of_2(h // 4),
+            SF_COLS=h // 128,
+            SF_BLOCK=triton.next_power_of_2(h // 128),
+            HAS_VALID=has_valid,
+            DG_LAYOUT=True,
+        )
+        self._w, self._rows = recv_w, recv_x.shape[0]
+
+    def compute(self):
+        h, inter = self.args.hidden, self.args.intermediate
+        self.runner.moe_gemm_fc1_fused(
+            self.a2,
+            self.sfa2,
+            self.a1,
+            self.w13,
+            self.offsets,
+            2 * inter,
+            h,
+            self.sfa1,
+            self.w13_sf,
+            True,
+        )
+        self.runner.moe_gemm(
+            self.y,
+            self.a2.view(torch.float8_e4m3fn),
+            self.w2,
+            self.offsets,
+            h,
+            inter,
+            self.sfa2,
+            self.w2_sf,
+            True,
+        )
+
+    def reduce(self):
+        import triton
+
+        _, _, reduce = _handoff_triton_kernels()
+        h, k = self.args.hidden, self.args.top_k
+        rows, block = self._rows, 1024
+        reduce[(rows, triton.cdiv(h, block))](
+            self.slots, self._w, self.y, self.out, K=k, H=h, BLOCK=block
         )
         return self.out[:rows]
 
@@ -836,7 +980,7 @@ def _run_baselines(args, rank, world, per_node):
     # cache.  The module is cached per process for the runners built below.
     cutlass_gemm = args.baseline_gemm == "cutlass"
     for r in range(world):
-        if r == rank and cutlass_gemm:
+        if r == rank and cutlass_gemm and args.scale_mode == "per_tensor":
             get_cutlass_fused_moe_module("90")
         dist.barrier()
     # Average the tactic timings across ranks: tuned independently, timing
@@ -844,14 +988,19 @@ def _run_baselines(args, rank, world, per_node):
     # every other rank then waits for in combine.  All ranks tune the same
     # shapes (T * world rows), as the reduction requires.
     set_autotune_process_group(dist.group.WORLD)
-    experts_cls = _CutlassExperts if cutlass_gemm else _Fc12Experts
+    if not cutlass_gemm:
+        experts_cls = _Fc12Experts
+    elif args.scale_mode == "blockwise":
+        experts_cls = _CutlassBlockExperts
+    else:
+        experts_cls = _CutlassPerTensorExperts
     experts = experts_cls(rank, args.num_experts // world, args)
     mode = args.mode if not cutlass_gemm else f"{args.mode}+cutlass"
     rows = []
     for tokens in [int(t) for t in args.tokens.split(",")]:
         hs, w, idx = _inputs(rank, tokens, args.hidden, args.num_experts, args.top_k)
         # The E4M3 rows (and block scales) the mega kernel stages, up front.
-        if experts.blockwise:
+        if args.scale_mode == "blockwise":
             x, sf = quantize_fp8_per_token_block(
                 hs.float(), torch.float8_e4m3fn, block_k=Fp8BlockScaleK
             )
@@ -862,7 +1011,15 @@ def _run_baselines(args, rank, world, per_node):
             engine = _DeepEp(tokens, x, sf, idx, w, args, world)
         else:
             engine = _NcclEp(args.mode[-2:], tokens, x, sf, idx, w, args, world)
-        experts.build(tokens, tokens * world)
+        if experts_cls is _CutlassBlockExperts:
+            # One rank at a time: the DeepGEMM JIT compiles into a cache the
+            # ranks of a node share.
+            for r in range(world):
+                if r == rank:
+                    experts.build(tokens, tokens * world)
+                dist.barrier()
+        else:
+            experts.build(tokens, tokens * world)
         check_err = (
             _identity_check(engine, x, sf, rank, tokens, experts.experts)
             if args.check
@@ -886,7 +1043,7 @@ def _run_baselines(args, rank, world, per_node):
 
         # Tune the CUTLASS tactics for this row count first: untuned, the
         # fallback tactic is several times slower.
-        with autotune(cutlass_gemm):
+        with autotune(experts_cls is _CutlassPerTensorExperts):
             call()
         for _ in range(args.warmup):
             call()
