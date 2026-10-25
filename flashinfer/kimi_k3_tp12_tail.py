@@ -110,10 +110,10 @@ def prepare_kimi_k3_tp12_tail(
     rank's columns of ``shared_partial`` to their owner ranks), the
     up-projection of this rank's contiguous 640- or 512-row slice of
     ``up_weight`` (``7168 = 8 x 640 + 4 x 512``; fused into the tail kernel for
-    ``M <= 4``, cuBLAS above), and the tail: the owner reduce of the
+    ``M <= 8``, cuBLAS above), and the tail: the owner reduce of the
     ``shared_partial`` columns fused with the add of the slice, one BF16
     rounding and the multicast all-gather of ``out`` (one CTA per eight output
-    columns for ``M <= 4``, one CTA per token below 961 tokens, a persistent
+    columns for ``M <= 8``, one CTA per token below 961 tokens, a persistent
     token pipeline above).  ``out`` is bitwise identical on every rank.
     Every rank must prepare and launch the same ``M``.
 
