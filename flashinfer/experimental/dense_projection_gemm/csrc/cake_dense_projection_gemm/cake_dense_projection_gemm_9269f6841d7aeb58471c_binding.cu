@@ -54,12 +54,15 @@ void CheckUnitInnerStride(const TensorView& t, const char* name) {
       << KERNEL_NAME << ": '" << name << "' needs a unit innermost stride, got " << t.stride(-1);
 }
 
-int64_t NonZero(int64_t divisor) {
-  TVM_FFI_CHECK(divisor != 0, ValueError) << KERNEL_NAME << ": a descriptor formula divides by zero";
-  return divisor;
+[[noreturn]] void NoInt64(int64_t a, const char* op, int64_t b) {
+  TVM_FFI_THROW(ValueError) << KERNEL_NAME << ": " << a << " " << op << " " << b
+                            << " has no int64 value in a host check";
 }
 
-int64_t CMod(int64_t a, int64_t b) { return a % NonZero(b); }
+int64_t CMod(int64_t a, int64_t b) {
+  if (b == 0) NoInt64(a, "%", b);
+  return b == -1 ? 0 : a % b;
+}
 
 cuuint64_t Extent(int64_t value, const char* descriptor) {
   TVM_FFI_CHECK(value > 0, ValueError)
@@ -82,7 +85,7 @@ CUtensorMap EncodeTma_A(const TensorView& t, int64_t p_m_tiles) {
   int64_t d3 = t.size(-3);
   int64_t s2 = t.stride(-2) * 4;
   int64_t s3 = t.stride(-3) * 4;
-  TVM_FFI_CHECK((CMod(p_m_tiles, 2) == 0), ValueError)
+  TVM_FFI_CHECK((CMod(p_m_tiles, 2LL) == 0LL), ValueError)
       << KERNEL_NAME << ": descriptor 'A' requires (CMod(p_m_tiles, 2) == 0)";
   cuuint64_t global_dim[3] = {Extent(d1, "A"), Extent(d2, "A"), Extent(d3, "A")};
   cuuint64_t global_strides[2] = {Stride(s2, "A"), Stride(s3, "A")};
