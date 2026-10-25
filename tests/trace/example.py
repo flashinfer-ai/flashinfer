@@ -59,6 +59,7 @@ gelu_tanh_and_mul_h16384.json
 fp8_paged_mqa_logits_nn2_H64_D128_bs64.json
 fp4_paged_mqa_logits_nn2_H64_Dp64_bs64.json
 fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping_kv2_d128_sl144_ps4.json
+fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping_hnd_kv2_d128_sl144_ps4.json
 gqa_paged_decode_h32_kv8_d128_ps16.json
 gqa_paged_decode_h32_kv8_d128_ps64.json
 gqa_paged_prefill_h32_kv8_d128_ps16.json
@@ -2234,6 +2235,20 @@ with contextlib.suppress(Exception):
         _fpth_slots,
         (_fpth_k_slot, _fpth_v_slot),
         (_fpth_k_sf, _fpth_v_sf),
+    )
+
+    _fpth_k_hnd = _fpth_k_slot.transpose(1, 2).contiguous()
+    _fpth_v_hnd = _fpth_v_slot.transpose(1, 2).contiguous()
+    fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping(
+        _fpth_k,
+        _fpth_v,
+        _fpth_slots,
+        (_fpth_k_hnd, _fpth_v_hnd),
+        (
+            _fpth_k_hnd[..., _fpth_D : _fpth_D + 4].view(torch.float32).squeeze(-1),
+            _fpth_v_hnd[..., _fpth_D : _fpth_D + 4].view(torch.float32).squeeze(-1),
+        ),
+        kv_layout="HND",
     )
 
 # nvfp4_quantize_append_paged_mla_kv_cache: packed ckv plus FP8 kpe cache.
