@@ -8,14 +8,17 @@ https://www.apache.org/licenses/LICENSE-2.0
 
 ``_RENDERED_MODULES`` registers the generated programs (each compiled from its
 own device unit and host binding under ``csrc/kda/prefill/``) and
-``_RENDERED_ROUTES`` points the shipped modules of each architecture at them.
+``_RENDERED_ROUTES`` points the shipped modules of each architecture at them;
+``_RENDERED_WORK_BIN_ROUTES`` names the programs built with work bins that
+launches asking for work bins take instead.
 
 The CPU checks hold both tables to the units, to the shipped argument plans and
 to the factory lookup. The GPU checks run the prepared BF16 prefill on the
 serving shapes (FP32 in-place state pool, reversed int32 state indices, a
 strided BF16 beta-logit slice, checkpoint rows every 64 tokens) with the routes
 in place and with the routes cleared, each against an FP32 token-by-token
-reference; replay the routed launch from a CUDA graph; and rebind it through a
+reference, and a launch with work bins bit for bit against the one-task-per-CTA
+program; replay the routed launch from a CUDA graph; and rebind it through a
 plan-cache hit.
 
 A program that takes tensor maps encodes them once per preparation into a host
@@ -104,6 +107,14 @@ def test_routes_point_shipped_modules_at_generated_programs():
             assert program in registry._RENDERED_MODULES, (arch, program)
             assert arch in registry._RENDERED_MODULES[program]["arches"]
             routed.add(program)
+    assert set(registry._RENDERED_WORK_BIN_ROUTES) == set(registry.ARCHES)
+    for arch, modules in registry._RENDERED_WORK_BIN_ROUTES.items():
+        for module, program in modules.items():
+            # A launch that asks for no work bins keeps the module's route.
+            assert module in registry._RENDERED_ROUTES[arch], (arch, module)
+            assert program in registry._RENDERED_MODULES, (arch, program)
+            assert arch in registry._RENDERED_MODULES[program]["arches"]
+            routed.add(program)
     assert routed == set(GENERATED)
 
 
@@ -142,6 +153,7 @@ def test_generated_plans_bind_from_the_shipped_plans():
         routes = [
             *registry._RENDERED_ROUTES[arch].items(),
             *registry._RENDERED_MERGE_ROUTES[arch].items(),
+            *registry._RENDERED_WORK_BIN_ROUTES[arch].items(),
         ]
         for module, program in routes:
             shipped = {
@@ -181,6 +193,27 @@ def test_factory_resolves_a_head_count_through_the_head_routes(monkeypatch, arch
             other = registry._factory(family, *args, route_heads=7, **dict(kwargs))
             assert other.name == registry._RENDERED_ROUTES[arch][module]
             assert getattr(other, "ctas_per_head", None) is None
+    assert seen == set(by_module)
+
+
+@requires_programs
+@pytest.mark.parametrize("arch", sorted(registry.ARCHES))
+def test_factory_resolves_work_bins_through_the_work_bin_routes(monkeypatch, arch):
+    monkeypatch.setattr(registry, "device_arch", lambda device=None: arch)
+    monkeypatch.setattr(registry, "PreparedKernel", lambda name, target: (name, target))
+    by_module = registry._RENDERED_WORK_BIN_ROUTES[arch]
+    seen = set()
+    for family, variants in registry.FACTORIES[arch].items():
+        for (args, kwargs), module in variants.items():
+            if module not in by_module:
+                continue
+            seen.add(module)
+            binned = registry._factory(
+                family, *args, route_work_bins=True, **dict(kwargs)
+            )
+            assert binned == (by_module[module], arch)
+            plain = registry._factory(family, *args, **dict(kwargs))
+            assert plain == (registry._RENDERED_ROUTES[arch][module], arch)
     assert seen == set(by_module)
 
 
@@ -691,6 +724,7 @@ def unrouted(monkeypatch):
             "_RENDERED_ROUTES",
             "_RENDERED_HEAD_ROUTES",
             "_RENDERED_MERGE_ROUTES",
+            "_RENDERED_WORK_BIN_ROUTES",
         ):
             monkeypatch.setattr(registry, table, {arch: {} for arch in registry.ARCHES})
 
@@ -699,7 +733,9 @@ def unrouted(monkeypatch):
 
 @requires_blackwell
 @pytest.mark.parametrize("lengths,heads,lower_bound", ROWS)
-def test_serving_rows_match_the_fp32_reference(lengths, heads, lower_bound, unrouted):
+def test_serving_rows_match_the_fp32_reference(
+    lengths, heads, lower_bound, unrouted, monkeypatch
+):
     arch = registry.device_arch()
     routes = registry._RENDERED_ROUTES[arch]
     d = _inputs(lengths, heads)
@@ -714,6 +750,20 @@ def test_serving_rows_match_the_fp32_reference(lengths, heads, lower_bound, unro
     loaded = _modules(routed.prepared)
     assert not loaded & set(routes), "a routed shipped module was loaded"
     _assert_bitwise(routed.run(), routed_result, "routed repeat")
+
+    # Work bins only change which CTA runs a task: without them the launch takes
+    # the module's one-task-per-CTA program and matches bit for bit.
+    work_bin_programs = set(registry._RENDERED_WORK_BIN_ROUTES[arch].values())
+    if loaded & work_bin_programs:
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                registry,
+                "_RENDERED_WORK_BIN_ROUTES",
+                {name: {} for name in registry.ARCHES},
+            )
+            one_task_per_cta = _Call(d, lower_bound)
+            assert not _modules(one_task_per_cta.prepared) & work_bin_programs
+            _assert_bitwise(one_task_per_cta.run(), routed_result, "one task per CTA")
 
     # The prepared path takes int64 sequence offsets (callers cast int32
     # offsets first); the routes leave that contract as it is.
