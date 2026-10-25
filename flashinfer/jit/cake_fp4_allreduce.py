@@ -48,18 +48,18 @@ import hashlib
 import re
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Literal, NamedTuple, Optional
+from typing import Any, NamedTuple, Optional
 
 import torch
 
 from ..compilation_context import CompilationContext
-from . import cake_fp4_allreduce_programs as _programs
 from . import env as jit_env
 from .cake_fp4_allreduce_programs import (
     LIMITS,
     PROGRAMS,
     SELECT_BV,
     SELECT_PREFETCH,
+    SELECT_ROWS,
     WINDOWS,
 )
 from .core import (
@@ -70,15 +70,10 @@ from .core import (
     sm107a_nvcc_flags,
 )
 
-CakeFp4AllReduceTarget = Literal["sm_100a", "sm_103a", "sm_107a"]
-
 # SELECT_ROWS: per rows-dispatched program (a fused-norm or a world-size-2
 # all-reduce program), the band of row counts it serves instead of the whole
-# program of its call -- ``{"kind": "prefix" | "suffix", "threshold": rows,
-# "whole": {target: whole program}}``, the threshold inclusive for both kinds
-# (:func:`select_rows`).  A registry written before the generator published the
-# literal has no dispatched program.
-SELECT_ROWS: dict[str, dict[str, Any]] = dict(getattr(_programs, "SELECT_ROWS", {}))
+# program of its call -- ``{"kind": "prefix" | "suffix", "threshold": rows}``,
+# the threshold inclusive for both kinds (:func:`select_rows`).
 
 SOURCE_PACKAGE = "cake_fp4_allreduce"
 MODULE_PREFIX = "cake_fp4_allreduce"
@@ -217,13 +212,12 @@ def programs(
     input_format: Optional[str] = None,
     output_format: Optional[str] = None,
     bv: Optional[int] = None,
-    poll: Optional[str] = None,
     prefetch: Optional[bool] = None,
     target: Optional[str] = None,
 ) -> tuple[str, ...]:
     """Program ids whose registry rows match every given key, in registry order.
 
-    ``output_format=None``, ``bv=None``, ``poll=None`` and ``prefetch=None`` do
+    ``output_format=None``, ``bv=None`` and ``prefetch=None`` do
     not filter; pass ``output_format=""`` to select the rows without an output
     format (the ``allreduce`` family).  ``target`` keeps the rows compiled for
     that target.
@@ -242,8 +236,6 @@ def programs(
             if record["output_format"] != wanted:
                 continue
         if bv is not None and record["bv"] != int(bv):
-            continue
-        if poll is not None and record["poll"] != poll:
             continue
         if prefetch is not None and record["prefetch"] != bool(prefetch):
             continue
@@ -269,26 +261,6 @@ def world_sizes(family: str) -> tuple[int, ...]:
             }
         )
     )
-
-
-def output_formats(family: str, world_size: int, input_format: str) -> tuple[str, ...]:
-    """Output formats of one (family, world size, input format): ``("",)`` when the family has none."""
-
-    formats = tuple(
-        dict.fromkeys(
-            "" if record["output_format"] is None else record["output_format"]
-            for record in PROGRAMS.values()
-            if record["family"] == family
-            and int(record["world_size"]) == int(world_size)
-            and record["input_format"] == input_format
-        )
-    )
-    if not formats:
-        raise ValueError(
-            "no Cake NVFP4-transport all-reduce program for family "
-            f"{family!r}, world size {world_size}, input format {input_format!r}"
-        )
-    return formats
 
 
 def select_bv(rows: int, grid: int) -> int:
@@ -651,7 +623,6 @@ __all__ = [
     "TARGET_CAPABILITIES",
     "TARGET_FLAGS",
     "WINDOWS",
-    "CakeFp4AllReduceTarget",
     "DeviceFacts",
     "device_facts",
     "evaluate_linear_form",
@@ -660,7 +631,6 @@ __all__ = [
     "get_cake_fp4_allreduce_module",
     "grid_max",
     "module_name",
-    "output_formats",
     "program_defines",
     "program_for",
     "program_record",
