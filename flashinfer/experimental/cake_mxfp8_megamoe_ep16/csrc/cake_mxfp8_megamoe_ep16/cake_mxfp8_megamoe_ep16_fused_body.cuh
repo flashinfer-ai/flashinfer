@@ -376,8 +376,10 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
     if (warp <= 3) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 80;");
         { // epilogue_main
-            // Rank-barrier phase 0 operands, loaded before the wait that precedes the barrier: the peer flag
-            // pointers and this rank's flag word (its sense bit cannot flip before this rank's own add).
+            // Rank-barrier operands, loaded by every lane of CTA 0 warp 0 before the publication barrier: the phase-0
+            // peer flag pointers and this rank's flag word of both phases.  Every lane holds them, so the lane that a
+            // later elect_sync() picks can use them (two elect.sync calls need not pick the same lane).  A phase's
+            // sense bit cannot flip before this rank's own add, which follows these loads across the CTA barriers.
             unsigned* barrier_peer_flags0[16];
             unsigned* barrier_local_flag0 = nullptr;
             unsigned barrier_old_sense0 = 0u;
@@ -387,7 +389,9 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                 #pragma unroll
                 for (int __r = 0; __r < 16; ++__r) barrier_peer_flags0[__r] = mega_pg_flags[__r < mega_pg_world ? __r : 0] + 0;
                 barrier_local_flag0 = mega_pg_flags[mega_pg_rank] + 0;
+                barrier_local_flag1 = mega_pg_flags[mega_pg_rank] + 1;
                 asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(barrier_old_sense0) : "l"(barrier_local_flag0) : "memory");
+                asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(barrier_old_sense1) : "l"(barrier_local_flag1) : "memory");
             }
             int linear_thread = bid * 384 + tid;
             int thread_stride = num_bids * 384;
@@ -568,12 +572,10 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                 if (elect_sync()) {
                     // Rank barrier phase 1, arrival half: this rank's dispatch has read every peer's published rows
                     // (dispatch_done above), so it arrives now; the wait half runs at the end of the kernel, before the
-                    // next forward republishes.  The flag's sense bit cannot flip before this rank's own add.
+                    // next forward republishes.  The wait half's operands were loaded by every lane at the start.
                     {
                         const int __ws = mega_pg_world;
                         const int __me = mega_pg_rank;
-                        barrier_local_flag1 = mega_pg_flags[__me] + 1;
-                        asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(barrier_old_sense1) : "l"(barrier_local_flag1) : "memory");
                         const unsigned __delta = (__me == 0) ? (0x80000000u - (unsigned)(__ws - 1)) : 1u;
                         asm volatile("fence.acq_rel.sys;" ::: "memory");
                         #pragma unroll 1
@@ -1406,7 +1408,7 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
             if (bid == 0 && warp == 0) {
                 if (elect_sync()) {
                     // Rank barrier phase 1, wait half: every peer has arrived, i.e. finished reading this rank's
-                    // published rows, before this forward ends.
+                    // published rows, before this forward ends.  Every lane of this warp holds the operands.
                     while (true) {
                         unsigned __v;
                         asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(barrier_local_flag1) : "memory");
