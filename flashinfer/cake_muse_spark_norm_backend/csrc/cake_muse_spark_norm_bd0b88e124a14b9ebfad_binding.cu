@@ -79,9 +79,9 @@ void Run(TensorView a_branch, TensorView a_residual, TensorView a_weight, Tensor
   CheckRank(a_out, "out", 1);
   CheckUnitInnerStride(a_out, "out");
   check_same_device(a_out, a_branch, "out", "branch");
-  TVM_FFI_CHECK((a_M >= 1), ValueError)
+  TVM_FFI_CHECK((a_M >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (M >= 1)";
-  TVM_FFI_CHECK((a_out.stride(0) >= 8192), ValueError)
+  TVM_FFI_CHECK((a_out.stride(0) >= 8192LL), ValueError)
       << KERNEL_NAME << ": requires (out_stride_p0 >= 8192)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
