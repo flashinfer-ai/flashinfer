@@ -31,6 +31,10 @@ def execute(inputs, config, tile_k):
 
         return execute_w4a16(inputs, config, tile_k)
     if config.quant.weight is QuantFormat.DeepSeekFp8:
+        if isinstance(tile_k, tuple) and tile_k and tile_k[0] in ("wgmma", "warp_mma"):
+            from .tc.deepseek_fp8 import execute as execute_grouped_block
+
+            return execute_grouped_block(inputs, config, tile_k)
         from .deepseek_fp8 import execute as execute_deepseek
 
         return execute_deepseek(inputs, config, tile_k)

@@ -42,6 +42,7 @@ import cutlass.utils.hopper_helpers as sm90_utils
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from .route_members import route_members
+from .block_scale import promote_block_scaled
 from ..fma.activations import apply_activation
 from ..quantization import _mul
 from .....cute_dsl.fp4_common import cvt_f32_to_e4m3
@@ -58,6 +59,7 @@ class WarpGroupedProjection:
         activation="swiglu",
         gated=True,
         parameters=None,
+        block_scaled=False,
     ):
         if (
             group_size not in (2, 4, 8)
@@ -75,6 +77,7 @@ class WarpGroupedProjection:
         self.input_route_divisor = top_k if fc1 else 1
         self.activation = activation
         self.parameters = parameters
+        self.block_scaled = block_scaled
         self.rows_per_tile = 32 if self.split_gate else 64
         self.acc_dtype = cutlass.Float32
         self.cluster_shape_mn = (1, 1)
@@ -388,6 +391,9 @@ class WarpGroupedProjection:
                 copy_ra = copy_a_thr.retile(tCrA)
                 copy_rb = copy_b_thr.retile(tCrB)
                 acc_shape = tCgC.shape
+                coordinates = tiled_mma.get_slice(tidx).partition_C(
+                    cute.make_identity_tensor((64, 8))
+                )
                 accumulators = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
                 pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
                 k_tile_cnt = cute.size(gA_mkl, mode=[2])
@@ -482,12 +488,31 @@ class WarpGroupedProjection:
                             # Promote at most K64 per native FP8 partial sum,
                             # independent of the TMA tile's K64/K128 depth.
                             if (kb + 1) % 2 == 0 or kb + 1 == cute.size(tCrA, mode=[2]):
-                                for element in cutlass.range_constexpr(
-                                    cute.size(accumulators)
-                                ):
-                                    total[element] = (
-                                        total[element] + accumulators[element]
+                                if cutlass.const_expr(self.block_scaled):
+                                    promote_block_scaled(
+                                        accumulators,
+                                        total,
+                                        coordinates,
+                                        dequant,
+                                        mid_quant,
+                                        members,
+                                        expert,
+                                        cute.size(output, mode=[1]),
+                                        pid_m,
+                                        _k_tile,
+                                        self.rows_per_tile,
+                                        self.tile_k,
+                                        self.group_size,
+                                        self.split_gate,
+                                        self.input_route_divisor,
                                     )
+                                else:
+                                    for element in cutlass.range_constexpr(
+                                        cute.size(accumulators)
+                                    ):
+                                        total[element] = (
+                                            total[element] + accumulators[element]
+                                        )
                                 accumulators.fill(0.0)
                     cute.arch.sync_threads()
                     mainloop_pipeline.consumer_release(consumer)
@@ -589,7 +614,9 @@ class WarpGroupedProjection:
 
     @cute.jit
     def epilogue(self, value, gate, dequant, mid_quant, expert):
-        if cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN):
+        if cutlass.const_expr(
+            self.a_dtype == cutlass.Float8E4M3FN and not self.block_scaled
+        ):
             value = _mul(value, dequant[expert])
             if cutlass.const_expr(self.fc1):
                 gate = _mul(gate, dequant[expert])
@@ -599,7 +626,9 @@ class WarpGroupedProjection:
             value = apply_activation(
                 value, gate, self.activation, False, self.parameters
             )
-            if cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN):
+            if cutlass.const_expr(
+                self.a_dtype == cutlass.Float8E4M3FN and not self.block_scaled
+            ):
                 value = (
                     cvt_f32_to_e4m3(_mul(value, mid_quant[0]))
                     .to(cutlass.Uint8)

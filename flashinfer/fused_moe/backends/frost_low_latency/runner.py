@@ -230,6 +230,8 @@ class FrostLowLatencyRunner(MoERunner):
             "fp8-grouped-tc-v3"
             if self.config.quant.weight is QuantFormat.FP8PerTensor
             and self.config.quant.activation is QuantFormat.FP8PerTensor
+            else "block-fp8-grouped-tc-v1"
+            if self.config.quant.weight is QuantFormat.DeepSeekFp8
             else "mxint4-load-width-v1"
             if self.config.quant.weight is QuantFormat.MXINT4
             else (
@@ -347,6 +349,33 @@ class FrostLowLatencyRunner(MoERunner):
                     tactics.append(("wgmma", 2, 4, 128))
                 else:
                     tactics += [("warp_mma", group, 2, 128) for group in (2, 4)]
+            if (
+                capability in ((9, 0), (12, 0))
+                and self.config.quant.weight is QuantFormat.DeepSeekFp8
+                and self.config.quant.activation is QuantFormat.DeepSeekFp8
+                and self.config.quant.output is QuantFormat.BF16
+                and inputs[0].shape[0] in (4, 8)
+                and inputs[0].shape[1] == 2048
+                and self.config.experts.intermediate_size == 512
+                and self.config.routing.top_k == 10
+                and (
+                    self.config.activation == SwiGLU()
+                    or (
+                        inputs[0].shape[0] == 8
+                        and self.config.activation in (ReLU2(), SiLU())
+                    )
+                )
+                and self.config.finalize.do_finalize
+            ):
+                # Weight reuse can amortize block-scale promotion and TC setup.
+                # Keep all FMA choices for cold and disjoint-route workloads.
+                if capability == (9, 0):
+                    groups = (2, 4) if self.config.activation == SwiGLU() else (2,)
+                    tactics += [("wgmma", group, 4, 128) for group in groups]
+                else:
+                    tactics += [("warp_mma", group, 2, 128) for group in (2, 4)]
+                    if inputs[0].shape[0] == 4:
+                        tactics.append(("warp_mma", 4, 4, 128))
             if (
                 capability in ((8, 0), (9, 0), (12, 0))
                 and self.config.quant.weight in (QuantFormat.BF16, QuantFormat.FP16)
