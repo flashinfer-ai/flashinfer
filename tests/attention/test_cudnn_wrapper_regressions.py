@@ -941,24 +941,97 @@ def test_fp8_prefill_scales_capture_replay(paged, scale_type):
 
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
-def test_attention_handles_follow_device_and_thread():
+@pytest.mark.parametrize("use_device", [False, True])
+def test_attention_handles_follow_device_and_thread(use_device):
     import concurrent.futures
     from flashinfer.cudnn.decode import _create_cudnn_handle as decode_handle
     from flashinfer.cudnn.prefill import _create_cudnn_handle as prefill_handle
 
     if torch.cuda.device_count() < 2:
         pytest.skip("requires two CUDA devices")
+
+    def acquire(factory, index):
+        if use_device:
+            return factory(device=torch.device("cuda", index))
+        return factory(torch.cuda.current_stream(index))
+
     # Leave device 0 current while explicitly requesting a handle on device 1.
     with torch.cuda.device(0):
-        first = decode_handle(torch.cuda.current_stream(0))
-        second = prefill_handle(torch.cuda.current_stream(1))
+        first = acquire(decode_handle, 0)
+        second = acquire(prefill_handle, 1)
         assert first != second
-        assert decode_handle(torch.cuda.current_stream(0)) == first
+        assert acquire(decode_handle, 0) == first
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            other = pool.submit(
-                lambda: decode_handle(torch.cuda.current_stream(0))
-            ).result()
+            other = pool.submit(acquire, decode_handle, 0).result()
             assert other != first
+
+
+@pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
+@pytest.mark.parametrize("kind", ["paged", "ragged", "decode"])
+def test_cudnn_run_follows_current_stream_and_capture(kind):
+    """One prepared wrapper must follow stream switches, including capture."""
+    q, k, v, qo, ip, ix, last = _paged_inputs()
+    ws = torch.empty(128 << 20, dtype=torch.uint8, device=q.device)
+    if kind == "decode":
+        q, qo = q[:2].contiguous(), torch.tensor([0, 1, 2], dtype=torch.int32)
+        w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(ws, "NHD", backend="cudnn")
+        w.plan(ip, ix, last, 8, 2, 128, 16, q_data_type=q.dtype)
+        operands = ((k, v),)
+    elif kind == "paged":
+        w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, "NHD", backend="cudnn")
+        w.plan(qo, ip, ix, last, 8, 2, 128, 16, q_data_type=q.dtype)
+        operands = ((k, v),)
+    else:
+        keys, values, lengths = [], [], []
+        for b in range(2):
+            length = int((ip[b + 1] - ip[b] - 1) * 16 + last[b])
+            ids = ix[ip[b] : ip[b + 1]].long()
+            keys.append(k[ids].flatten(0, 1)[:length])
+            values.append(v[ids].flatten(0, 1)[:length])
+            lengths.append(length)
+        kv = torch.tensor([0, lengths[0], sum(lengths)], dtype=torch.int32)
+        w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(ws, backend="cudnn")
+        w.plan(qo, kv, 8, 2, 128, q_data_type=q.dtype)
+        operands = (torch.cat(keys), torch.cat(values))
+    out = torch.empty_like(q)
+    lse = torch.empty(q.shape[:2], device=q.device, dtype=torch.float32)
+
+    def run():
+        return w.run(q, *operands, out=out, lse=lse, return_lse=True)
+
+    def check():
+        ref, stats = _reference(
+            q, k, v, qo, ip, ix, last, causal=False, scale=128**-0.5
+        )
+        torch.testing.assert_close(out.float(), ref, atol=0.015, rtol=0.015)
+        torch.testing.assert_close(
+            lse, stats * math.log2(math.e), atol=0.003, rtol=0.003
+        )
+
+    streams = [torch.cuda.Stream(device=q.device) for _ in range(2)]
+    for stream in streams:
+        stream.wait_stream(torch.cuda.current_stream(q.device))
+        with torch.cuda.stream(stream):
+            run()
+        stream.synchronize()
+        check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=streams[0]):
+        run()
+    try:
+        # Rebind the handle on B, then replay the graph captured on A.
+        with torch.cuda.stream(streams[1]):
+            q.mul_(0.5)
+            run()
+        streams[1].synchronize()
+        check()
+        out.fill_(torch.nan)
+        lse.fill_(torch.nan)
+        graph.replay()
+        torch.cuda.current_stream(q.device).synchronize()
+        check()
+    finally:
+        graph.reset()
 
 
 @pytest.mark.parametrize("backend", ["cudnn", "fa2"])
