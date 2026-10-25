@@ -1194,6 +1194,11 @@ class NVFP4QuantizePerTokenKernel:
                 row_amax_buffer[lane_idx * Int32(2) + Int32(1)] = Float32(high_value)
         cute.arch.barrier()
 
+        # Every CTA, including inactive row blocks, lets FC2 start its prologue
+        # while quantization runs. FC2's dependency wait still protects our stores.
+        if cutlass.const_expr(self.enable_pdl):
+            cute.arch.griddepcontrol_launch_dependents()
+
         # Four warps quantize two rows each. Fixed full-warp ownership avoids
         # dynamic redux masks and gives each row 32-way block-scale parallelism
         # while amortizing one CTA over eight rows.
@@ -1294,11 +1299,6 @@ class NVFP4QuantizePerTokenKernel:
                         )
                         mScales[sf_offset] = Uint8(0)
                         sf_col_idx = sf_col_idx + Int32(WARP_SIZE)
-
-        # Every CTA must reach the PDL signal, including row blocks beyond the
-        # device-side active routing extent.
-        if cutlass.const_expr(self.enable_pdl):
-            cute.arch.griddepcontrol_launch_dependents()
 
     @cute.kernel
     def kernel(

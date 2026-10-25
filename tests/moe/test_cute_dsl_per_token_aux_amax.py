@@ -837,3 +837,99 @@ def test_large_token_moe_aux_path_is_bitwise_equal(
         gated=True,
         expect_unused_rows=True,
     )
+
+
+@pytest.mark.usefixtures("sm100_device")
+def test_per_token_aux_amax_pdl_graph_chain_is_bitwise_equal(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Replay FC1 -> aux quantization -> FC2 without synchronizing the handoffs."""
+    import flashinfer.fused_moe.cute_dsl.fused_moe as fused_moe_module
+
+    config = _quant_config(monkeypatch, deterministic=True)
+    num_tokens, top_k, num_experts = 1024, 2, 16
+    hidden_size, intermediate_size = 256, 512
+    tile_size, gemm1_n = 128, 128
+    assert num_tokens >= fused_moe_module._PER_TOKEN_AUX_AMAX_MIN_TOKENS
+    tensors = create_moe_tensors(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        num_local_experts=num_experts,
+        top_k=top_k,
+        gated=True,
+        use_per_token_activation=True,
+        nvfp4_4over6=config,
+    )
+    # Exactly 16 active M tiles within a 31-tile allocation leave inactive
+    # aux CTAs that must still release their dependent FC2 grid.
+    tensors["token_selected_experts"].copy_(
+        torch.tensor([0, 1], device="cuda", dtype=torch.int32).repeat(num_tokens, 1)
+    )
+    tensors["token_final_scales"].copy_(
+        torch.tensor([0.375, 0.625], device="cuda", dtype=torch.float32).repeat(
+            num_tokens, 1
+        )
+    )
+    kwargs = _make_core_kwargs(
+        tensors,
+        num_tokens=num_tokens,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        num_local_experts=num_experts,
+        local_expert_offset=0,
+        tile_size=tile_size,
+        gemm1_n=gemm1_n,
+        activation_type=ActivationType.Swiglu,
+        nvfp4_4over6=config,
+    )
+    active_rows = num_tokens * top_k
+    assert kwargs["gemm1_out"].shape[0] > active_rows
+    runs = {
+        enable_pdl: {
+            **kwargs,
+            "enable_pdl": enable_pdl,
+            "gemm1_out": kwargs["gemm1_out"].clone(),
+        }
+        for enable_pdl in (False, True)
+    }
+    input_scale = tensors["x_per_token_scale"]
+    scale_states = (input_scale.clone(), input_scale * 0.5)
+
+    # Compile and validate the explicit recipe before capture. Both arms use
+    # the production aux gate and the same fixed GEMM tactics; no call hooks.
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for run_kwargs in runs.values():
+            fused_moe_module._moe_core_impl(**run_kwargs)
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    torch.cuda.synchronize()
+
+    graphs, outputs = {}, {}
+    for enable_pdl, run_kwargs in runs.items():
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = fused_moe_module._moe_core_impl(**run_kwargs)
+        graphs[enable_pdl] = graph
+        outputs[enable_pdl] = output
+
+    first_output = None
+    for replay in range(64):
+        # Alternating inputs prevent an unchanged prior replay's intermediates
+        # from hiding a consumer that reads before quantization finishes.
+        input_scale.copy_(scale_states[replay % 2])
+        graphs[False].replay()
+        graphs[True].replay()
+        torch.cuda.synchronize()
+        assert torch.equal(outputs[True], outputs[False]), f"replay {replay}"
+        if replay == 0:
+            first_output = outputs[False].clone()
+        elif replay == 1:
+            assert not torch.equal(outputs[False], first_output)
+
+    for run_kwargs in runs.values():
+        tail = run_kwargs["gemm1_out"][active_rows:]
+        assert torch.equal(tail, torch.full_like(tail, 17.0))
