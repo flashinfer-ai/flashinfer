@@ -122,37 +122,119 @@ def test_tinygemm2_tcgen05_bitwise_parity(
         torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
 
 
-# (capability, batch, output features, input features, bias) -> the tile the
-# windows select, or None for the kernel the call runs otherwise.
-ROUTES = [
-    ((10, 0), 7, 128, 4096, True, "PACKED_NARROW"),
-    ((10, 0), 1, 128, 14336, True, "PACKED_NARROW"),
-    ((10, 0), 8, 256, 4096, False, "PACKED_NARROW"),
-    ((10, 0), 8, 272, 4096, False, None),
-    ((10, 0), 8, 128, 4080, True, None),
-    ((10, 0), 4, 2880, 2880, False, "PACKED"),
-    ((10, 0), 4, 2880, 2880, True, None),
-    ((10, 0), 9, 2880, 2880, True, "PACKED"),
-    ((10, 0), 32, 4096, 3072, True, "PACKED"),
-    ((10, 0), 33, 4096, 3072, True, "ACCUMULATORS"),
-    ((10, 0), 64, 4096, 4096, False, "ACCUMULATORS"),
-    ((10, 0), 65, 4096, 4096, False, None),
-    ((10, 0), 16, 2048, 2048, True, None),
-    ((10, 0), 8, 1024, 1024, False, None),
-    ((10, 3), 7, 128, 4096, True, "PACKED_NARROW"),
-    ((10, 3), 8, 128, 7168, True, None),
-    ((10, 3), 1, 128, 14336, True, None),
-    ((10, 3), 7, 128, 4096, False, None),
-    ((10, 3), 8, 128, 7168, False, "PACKED_NARROW"),
-    ((10, 3), 1, 128, 14336, False, "PACKED_NARROW"),
-    ((10, 3), 8, 4096, 4096, False, "PACKED"),
-    ((10, 3), 8, 4096, 4096, True, None),
-    ((10, 3), 16, 2880, 2880, True, "PACKED"),
-    ((10, 3), 64, 4096, 3072, True, "ACCUMULATORS"),
-    ((10, 3), 13, 1024, 2048, True, None),
-    ((10, 7), 64, 4096, 3072, True, None),
-    ((9, 0), 64, 4096, 3072, True, None),
+# (batch, output features, input features, bias) -> the tile the windows select
+# on sm_100a and sm_103a, or None for the kernel the call runs otherwise.  The
+# one-wave rule is checked at 148 SMs.
+SM100_FAMILY_ROUTES = [
+    # the narrow tile: no bias, 32 to 128 output features, batch 1-2 from K 10240,
+    # batch 3-8 from K 6144, K at most 20480
+    (1, 128, 14336, False, "PACKED_NARROW"),
+    (2, 64, 10240, False, "PACKED_NARROW"),
+    (2, 128, 7168, False, None),
+    (3, 32, 6144, False, "PACKED_NARROW"),
+    (8, 128, 7168, False, "PACKED_NARROW"),
+    (8, 64, 16384, False, "PACKED_NARROW"),
+    (8, 128, 4096, False, None),
+    (8, 16, 8192, False, None),
+    (8, 144, 8192, False, None),
+    (8, 128, 20544, False, None),
+    (9, 128, 8192, False, None),
+    (8, 128, 7168, True, None),
+    (1, 128, 14336, True, None),
+    # PACKED up to eight rows: no bias, 2880 to 4096 output features, K at most 6144
+    (1, 2880, 2112, False, "PACKED"),
+    (4, 2880, 2880, False, "PACKED"),
+    (8, 4096, 4096, False, "PACKED"),
+    (8, 2864, 4096, False, None),
+    (2, 2048, 3072, False, None),
+    (8, 4112, 2048, False, None),
+    (8, 4096, 6208, False, None),
+    (4, 2880, 2880, True, None),
+    (8, 4096, 4096, True, None),
+    # PACKED with a bias on 9 to 16 rows: from 2880 output features and K 2112
+    (9, 2880, 2112, True, "PACKED"),
+    (16, 2880, 2880, True, "PACKED"),
+    (16, 4096, 3072, True, "PACKED"),
+    (14, 3072, 2048, True, None),
+    (9, 2048, 3072, True, None),
+    (17, 2880, 2880, True, None),
+    (24, 3072, 2048, True, None),
+    # from 9 rows without a bias, 28 with one (from 1536 output features up to
+    # 32 rows, from 1024 past that): PACKED while its grid fits one wave
+    (9, 2048, 3072, False, "PACKED"),
+    (16, 2880, 2880, False, "PACKED"),
+    (24, 2048, 3072, False, "PACKED"),
+    (24, 2880, 2880, False, "ACCUMULATORS"),
+    (16, 1024, 6144, False, None),
+    (28, 2048, 3072, True, "PACKED"),
+    (28, 1024, 6144, True, None),
+    (32, 2880, 2112, True, "ACCUMULATORS"),
+    (33, 1536, 4096, True, "PACKED"),
+    (48, 1536, 4096, False, "PACKED"),
+    (33, 4096, 3072, True, "ACCUMULATORS"),
+    (64, 1024, 6144, True, "PACKED"),
+    (64, 1536, 4096, True, "ACCUMULATORS"),
+    (64, 4096, 3072, True, "ACCUMULATORS"),
+    (64, 4096, 4096, False, "ACCUMULATORS"),
+    (33, 1024, 4096, False, None),
+    (33, 1024, 6208, True, None),
+    (65, 4096, 4096, False, None),
+    # small weights keep the kernels above
+    (8, 1024, 1024, False, None),
+    (13, 1024, 2048, True, None),
+    (16, 2048, 2048, True, None),
 ]
+# The narrow tile with a bias on 3 to 8 rows: 32 to 128 output features at K 4096,
+# 64 to 128 from K 16384 to 20480.
+NARROW_BIAS_ROUTES = [
+    (3, 32, 4096, "PACKED_NARROW"),
+    (7, 128, 4096, "PACKED_NARROW"),
+    (8, 64, 4096, "PACKED_NARROW"),
+    (3, 64, 16384, "PACKED_NARROW"),
+    (8, 128, 20480, "PACKED_NARROW"),
+    (2, 128, 4096, None),
+    (9, 128, 4096, None),
+    (8, 16, 4096, None),
+    (8, 144, 4096, None),
+    (8, 128, 4160, None),
+    (8, 64, 8192, None),
+    (8, 32, 16384, None),
+    (2, 128, 14336, None),
+    (3, 64, 10240, None),
+    (8, 128, 14336, None),
+]
+# sm_107a: the narrow tile from 64 output features (with a bias only at K 4096),
+# no PACKED window up to 16 rows, and with a bias 28 to 32 rows from 2048 output
+# features.
+SM107_ROUTES = [
+    (1, 128, 14336, False, "PACKED_NARROW"),
+    (8, 128, 7168, False, "PACKED_NARROW"),
+    (8, 64, 10240, False, "PACKED_NARROW"),
+    (3, 32, 6144, False, None),
+    (7, 128, 4096, True, "PACKED_NARROW"),
+    (3, 64, 4096, True, "PACKED_NARROW"),
+    (3, 32, 4096, True, None),
+    (8, 128, 14336, True, None),
+    (4, 2880, 2880, False, None),
+    (8, 4096, 4096, False, None),
+    (9, 2880, 2112, True, None),
+    (16, 2880, 2880, True, None),
+    (16, 2880, 2880, False, "PACKED"),
+    (28, 1536, 4096, False, "PACKED"),
+    (28, 1536, 4096, True, None),
+    (32, 2048, 3072, True, "PACKED"),
+    (64, 4096, 3072, True, "ACCUMULATORS"),
+]
+ROUTES = (
+    [
+        (capability, *route)
+        for capability in ((10, 0), (10, 3))
+        for route in SM100_FAMILY_ROUTES
+        + [(b, o, k, True, tile) for b, o, k, tile in NARROW_BIAS_ROUTES]
+    ]
+    + [((10, 7), *route) for route in SM107_ROUTES]
+    + [((9, 0), 64, 4096, 3072, True, None)]
+)
 
 
 @pytest.mark.parametrize(
@@ -173,6 +255,7 @@ def test_tinygemm2_tcgen05_windows(
     import flashinfer.gemm.routergemm as routergemm
 
     monkeypatch.setattr(routergemm, "get_compute_capability", lambda _: capability)
+    monkeypatch.setattr(routergemm, "_multiprocessor_count", lambda _: 148)
     monkeypatch.delenv("FLASHINFER_DISABLE_TINYGEMM2_TCGEN05", raising=False)
     input = torch.empty(batch_size, input_features, dtype=torch.bfloat16)
     weight = torch.empty(output_features, input_features, dtype=torch.bfloat16)

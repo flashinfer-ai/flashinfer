@@ -938,56 +938,109 @@ class _Tcgen05Window(NamedTuple):
     min_batch: int
     max_batch: int
     bias: Optional[bool] = None  # None: with and without a bias
+    min_output_features: Optional[int] = None
     max_output_features: Optional[int] = None
     min_input_features: Optional[int] = None
     max_input_features: Optional[int] = None
     min_weight_elements: Optional[int] = None  # output x input features
+    one_wave: bool = False  # only while PACKED's grid fits one CTA per SM
 
-    def admits(self, batch: int, out_features: int, in_features: int, bias: bool):
+    def admits(
+        self, batch: int, out_features: int, in_features: int, bias: bool, sms: int
+    ) -> bool:
+        def within(value: int, low: Optional[int], high: Optional[int]) -> bool:
+            return (low is None or value >= low) and (high is None or value <= high)
+
+        features, rows = _TINYGEMM2_TCGEN05_TILES["PACKED"]
+        packed_ctas = -(-out_features // features) * -(-batch // rows)
         return (
-            self.min_batch <= batch <= self.max_batch
+            within(batch, self.min_batch, self.max_batch)
             and (self.bias is None or self.bias == bias)
-            and (
-                self.max_output_features is None
-                or out_features <= self.max_output_features
-            )
-            and (
-                self.min_input_features is None
-                or in_features >= self.min_input_features
-            )
-            and (
-                self.max_input_features is None
-                or in_features <= self.max_input_features
-            )
-            and (
-                self.min_weight_elements is None
-                or out_features * in_features >= self.min_weight_elements
-            )
+            and within(out_features, self.min_output_features, self.max_output_features)
+            and within(in_features, self.min_input_features, self.max_input_features)
+            and within(out_features * in_features, self.min_weight_elements, None)
+            and (not self.one_wave or packed_ctas <= sms)
         )
 
 
 # The windows where a tile measured faster than the kernel the call runs
-# otherwise (the reference without a bias, tinygemm2_sm100 with one), per compute
-# capability; the first window admitting a shape selects its tile, and every other
-# shape keeps that kernel.  Batches of at most eight on small weights stay there:
+# otherwise (the reference without a bias, tinygemm2_sm100 with one) on every
+# measured shape, with and without programmatic dependent launch; the first
+# window admitting a shape selects its tile, and every other shape keeps that
+# kernel.  The bounds are the measured ranges.  Small weights stay on that kernel:
 # the tensor-memory allocation adds a fixed half microsecond to a launch that
-# takes three.
+# takes four.  The narrow tile serves 32 to 128 output features over long inputs
+# without a bias, and with one on 3 to 8 rows at an input of 4096 or from 16384.
+# PACKED serves eight rows or fewer only without a bias and from 2880 output
+# features (90 CTAs).  With a bias, tinygemm2_sm100 stays faster up to 27 rows
+# except for PACKED on 9 to 16 rows from 2880 output features and an input of
+# 2112, and up to 32 rows below 1536 output features.  From 9 rows without a bias
+# (28 with one) PACKED serves while its grid fits one wave; past that ACCUMULATORS
+# (64 rows per CTA) does.  On sm_107a the narrow tile starts at 64 output features
+# and serves a bias only at an input of 4096, no PACKED window covers 16 rows or
+# fewer, and with a bias 28 to 32 rows start at 2048 output features.
 _LARGE_WEIGHT = 6_000_000
+_MANY_ROWS_NOBIAS = (
+    _Tcgen05Window(
+        "PACKED", 9, 32, False, 1536, 4096, None, 6144, _LARGE_WEIGHT, one_wave=True
+    ),
+    _Tcgen05Window(
+        "ACCUMULATORS", 17, 32, False, 1536, 4096, None, 6144, _LARGE_WEIGHT
+    ),
+    _Tcgen05Window(
+        "PACKED", 33, 64, False, 1024, 4096, None, 6144, _LARGE_WEIGHT, one_wave=True
+    ),
+    _Tcgen05Window(
+        "ACCUMULATORS", 33, 64, False, 1024, 4096, None, 6144, _LARGE_WEIGHT
+    ),
+)
+
+
+def _many_rows_bias(low: int) -> Tuple[_Tcgen05Window, ...]:
+    """With a bias: 28 to 32 rows from ``low`` output features, 33 to 64 from 1024."""
+    return (
+        _Tcgen05Window(
+            "PACKED", 28, 32, True, low, 4096, None, 6144, _LARGE_WEIGHT, one_wave=True
+        ),
+        _Tcgen05Window(
+            "ACCUMULATORS", 28, 32, True, low, 4096, None, 6144, _LARGE_WEIGHT
+        ),
+        _Tcgen05Window(
+            "PACKED", 33, 64, True, 1024, 4096, None, 6144, _LARGE_WEIGHT, one_wave=True
+        ),
+        _Tcgen05Window(
+            "ACCUMULATORS", 33, 64, True, 1024, 4096, None, 6144, _LARGE_WEIGHT
+        ),
+    )
+
+
+_SM100_SM103 = (
+    _Tcgen05Window("PACKED_NARROW", 1, 2, False, 32, 128, 10240, 20480),
+    _Tcgen05Window("PACKED_NARROW", 3, 8, False, 32, 128, 6144, 20480),
+    _Tcgen05Window("PACKED_NARROW", 3, 8, True, 32, 128, 4096, 4096),
+    _Tcgen05Window("PACKED_NARROW", 3, 8, True, 64, 128, 16384, 20480),
+    _Tcgen05Window("PACKED", 1, 8, False, 2880, 4096, None, 6144, _LARGE_WEIGHT),
+    _Tcgen05Window("PACKED", 9, 16, True, 2880, 4096, 2112, 6144, _LARGE_WEIGHT),
+    *_MANY_ROWS_NOBIAS,
+    *_many_rows_bias(1536),
+)
+_SM107 = (
+    _Tcgen05Window("PACKED_NARROW", 1, 2, False, 64, 128, 10240, 20480),
+    _Tcgen05Window("PACKED_NARROW", 3, 8, False, 64, 128, 6144, 20480),
+    _Tcgen05Window("PACKED_NARROW", 3, 8, True, 64, 128, 4096, 4096),
+    *_MANY_ROWS_NOBIAS,
+    *_many_rows_bias(2048),
+)
 _TINYGEMM2_TCGEN05_WINDOWS = {
-    (10, 0): (
-        _Tcgen05Window("PACKED_NARROW", 1, 8, None, 256, 4096),
-        _Tcgen05Window("PACKED", 1, 8, False, min_weight_elements=_LARGE_WEIGHT),
-        _Tcgen05Window("PACKED", 9, 32, min_weight_elements=_LARGE_WEIGHT),
-        _Tcgen05Window("ACCUMULATORS", 33, 64, min_weight_elements=_LARGE_WEIGHT),
-    ),
-    (10, 3): (
-        _Tcgen05Window("PACKED_NARROW", 1, 8, False, 256, 7168),
-        _Tcgen05Window("PACKED_NARROW", 1, 8, True, 256, 4096, 7167),
-        _Tcgen05Window("PACKED", 1, 8, False, min_weight_elements=_LARGE_WEIGHT),
-        _Tcgen05Window("PACKED", 9, 32, min_weight_elements=_LARGE_WEIGHT),
-        _Tcgen05Window("ACCUMULATORS", 33, 64, min_weight_elements=_LARGE_WEIGHT),
-    ),
+    (10, 0): _SM100_SM103,
+    (10, 3): _SM100_SM103,
+    (10, 7): _SM107,
 }
+
+
+@functools.cache
+def _multiprocessor_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
 @functools.cache
@@ -1019,8 +1072,9 @@ def _tinygemm2_tcgen05_program(
         or weight.data_ptr() % 16 != 0
     ):
         return None
+    sms = _multiprocessor_count(input.device.index)
     for window in _TINYGEMM2_TCGEN05_WINDOWS[capability]:
-        if window.admits(batch, out_features, in_features, has_bias):
+        if window.admits(batch, out_features, in_features, has_bias, sms):
             return (
                 window.tile
                 + ("" if has_bias else "_NOBIAS")
