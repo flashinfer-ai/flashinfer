@@ -11,6 +11,24 @@ from flashinfer.experimental.mega_moe_v3 import runtime
 
 ROOT = Path(__file__).resolve().parents[2]
 
+# The tensor-parallel and expert-parallel routes of the 384-expert, top-6,
+# hidden-5120 model on sm_103a: (experts held, physical intermediate width) at
+# every token count, routed FP4, activation clamp 10.
+TP_EP_SHAPES = ((384, 640), (384, 384), (96, 2304), (48, 2304))
+TP_EP_TOKENS = (1, 4, 16, 32, 128, 512, 1024, 4096)
+
+
+def expected_block_m(num_tokens):
+    """Source tile height of a TP/EP row: 16 rows up to 512 tokens, 32 at 1024, 128 at 4096."""
+    return 128 if num_tokens >= 4096 else 32 if num_tokens >= 1024 else 16
+
+
+def expected_source_form(num_experts, num_tokens):
+    """``(readiness, slot_list)`` of a TP/EP row's generated program: per-block
+    readiness on every row; the per-expert slot list on every row but the
+    one-token rows, whose program folds the dispatch metadata instead."""
+    return "block", num_tokens != 1
+
 
 def _catalog():
     return runtime.catalog()
@@ -37,6 +55,52 @@ def test_routes_are_keyed_by_architecture():
     assert set(catalog.routes("sm_100a")) <= set(catalog.routes("sm_103a"))
     # The JSON spelling the exporter writes.
     assert catalog.path.read_text() == json.dumps(data, indent=1) + "\n"
+
+
+def test_tp_ep_routes_ship_with_the_local_expert_filter_and_their_source_form():
+    """Every TP/EP route of the model is catalogued for sm_103a with the
+    local expert filter, its pinned source tile height, its source-schedule
+    form and its own program. The GPU tests skip a route the catalog lacks,
+    so this is the test that turns a missing or mis-described route into a
+    failure instead of a silent skip."""
+    catalog = _catalog()
+    routes = catalog.routes("sm_103a")
+    for num_experts, intermediate in TP_EP_SHAPES:
+        for num_tokens in TP_EP_TOKENS:
+            key = runtime.key(
+                "pipeline",
+                dict(
+                    num_tokens=num_tokens,
+                    num_experts=num_experts,
+                    top_k=6,
+                    hidden=5120,
+                    intermediate=intermediate,
+                    routed_weight_dtype="fp4",
+                    activation_clamp=10.0,
+                ),
+            )
+            shape = (num_experts, intermediate, num_tokens)
+            assert key in routes, shape
+            route = routes[key]
+            metadata = route["metadata"]
+            assert metadata["surface"] == "pipeline", shape
+            assert metadata["self_cleaning"] is True, shape
+            assert metadata["local_expert_filter"] is True, shape
+            assert metadata["kernel_intermediate"] == intermediate, shape
+            assert metadata["block_m"] == expected_block_m(num_tokens), shape
+            assert (
+                metadata["readiness"],
+                metadata["slot_list"],
+            ) == expected_source_form(num_experts, num_tokens), shape
+            assert runtime.route_admitted_num_sms(route, "sm_103a") == (152,), shape
+            assert runtime.route_grid(route, "sm_103a", 152) == (152, 1, 1), shape
+            (stage,) = route["stages"]
+            assert stage["name"] == "pipeline", shape
+            assert runtime.stage_program(stage, "sm_103a") == (
+                f"deepgemm_mega_moe_v3_pipeline_fp4_e{num_experts}_i{intermediate}"
+                f"_t{num_tokens}_sm103a"
+            ), shape
+            assert key not in catalog.routes("sm_100a"), shape
 
 
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
