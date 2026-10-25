@@ -874,7 +874,7 @@ class LowLatencyBlockscaledGemmKernel:
                     cute.arch.mbarrier_init(tmem_alloc_result_bar, 32 + 128 + 128)
                 else:
                     cute.arch.mbarrier_init(tmem_alloc_result_bar, 32 + 128)
-                if cutlass.const_expr(self.use_bias):
+                if cutlass.const_expr(self.use_scale or self.use_bias):
                     # All 32 B-load threads arrive after issuing activation loads
                     cute.arch.mbarrier_init(tma_epilog_full_bar, 32)
                 if self.split_k > 1:
@@ -1244,8 +1244,8 @@ class LowLatencyBlockscaledGemmKernel:
             )
             ab_state.advance()
 
-        # Release bias loads after the B-load warp satisfies the PDL dependency
-        if cutlass.const_expr(self.use_bias):
+        # Release epilogue input loads after the B-load warp satisfies the PDL dependency
+        if cutlass.const_expr(self.use_scale or self.use_bias):
             cute.arch.mbarrier_arrive(tma_epilog_full_bar)
 
         # Producer tail: keep shared memory alive until MMA releases every stage
@@ -1738,9 +1738,6 @@ class LowLatencyBlockscaledGemmKernel:
         for i in range(cute.size(tDpredC)):
             tDpredC[i] = cute.elem_less(tDcC[i], mC_mnl.shape)
 
-        if cutlass.const_expr(self.use_scale):
-            scale_value = mScale[0].to(self.acc_dtype)
-
         # Use C's register mapping for the M-broadcast bias
         if cutlass.const_expr(self.use_bias):
             gBias_mnl = cute.local_tile(
@@ -1763,8 +1760,12 @@ class LowLatencyBlockscaledGemmKernel:
             tDrBias = cute.make_rmem_tensor(epi_frag_shape, self.bias_dtype)
             tDrBiasAcc = cute.make_rmem_tensor(epi_frag_shape, self.acc_dtype)
 
-            # Wait for the B-load warp to satisfy the bias producer dependency
+        # Wait for the B-load warp to satisfy the scale and bias producer dependency
+        if cutlass.const_expr(self.use_scale or self.use_bias):
             cute.arch.mbarrier_wait(tma_epilog_full_bar, 0)
+        if cutlass.const_expr(self.use_scale):
+            scale_value = mScale[0].to(self.acc_dtype)
+        if cutlass.const_expr(self.use_bias):
             cute.basic_copy_if(tDpredC, tDgBias, tDrBias)
             tDrBiasAcc.store(tDrBias.load().to(self.acc_dtype))
 
