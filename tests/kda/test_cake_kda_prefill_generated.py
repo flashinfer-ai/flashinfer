@@ -724,15 +724,16 @@ def test_plan_cache_hit_matches_a_fresh_preparation(lengths, heads, lower_bound)
 
 
 def _host_encoded_parts(prepared):
-    """(module, grid, bindings) of every launch part whose module encodes its
-    tensor maps on the host: the part launches, their prepare kernels and, on
-    the apply route, the pair-map, prefix and fused apply kernels."""
+    """(owner, module, grid, bindings) of every launch part whose module encodes
+    its tensor maps on the host: the part launches, their prepare kernels and,
+    on the apply route, the pair-map, prefix and fused apply kernels (owner
+    ``None``: the composite re-prepares them itself)."""
     parts = []
     seen = set()
 
-    def add(module, grid, bindings):
+    def add(owner, module, grid, bindings):
         if isinstance(module, registry.PreparedKernel) and module.encodes_on_host:
-            parts.append((module, grid, bindings))
+            parts.append((owner, module, grid, bindings))
 
     def visit(obj, depth):
         if depth > 7 or id(obj) in seen:
@@ -757,10 +758,11 @@ def _host_encoded_parts(prepared):
             ("_projection_module", "_projection_grid", "_projection_args"),
         ):
             if attrs.get(module) is not None:
-                add(attrs[module], attrs[grid], attrs[bindings])
+                add(obj, attrs[module], attrs[grid], attrs[bindings])
         if attrs.get("_apply_route"):
             for part in ("pairmap", "prefix", "apply"):
                 add(
+                    None,
                     attrs[f"_{part}_module"],
                     attrs[f"_{part}_grid"],
                     getattr(obj, f"_{part}_bindings")(),
@@ -773,15 +775,22 @@ def _host_encoded_parts(prepared):
 
 
 def _assert_stored_maps_are_current(prepared, label):
+    """Every part holds the maps of the tensors it is bound to, or is marked
+    stale and re-encodes before its next kernel: a part the route does not
+    launch (the window-map launch of the lean apply route, which the pair-map
+    producer and the prefix chain replace) keeps the maps of its last
+    preparation after a rebind."""
     parts = _host_encoded_parts(prepared)
     assert parts, f"{label}: no part encodes its tensor maps on the host"
-    for module, grid, bindings in parts:
+    for owner, module, grid, bindings in parts:
         assert module._ready, (label, module.name)
         fresh = module.encoded_tensor_maps(grid=grid, **bindings)
-        assert torch.equal(fresh, module.descriptor_storage), (
+        if torch.equal(fresh, module.descriptor_storage):
+            continue
+        assert owner is not None and owner._descriptors_stale, (
             f"{label}: {module.name} launches with maps of other tensors"
         )
-    return {id(module): module.descriptor_storage.clone() for module, _, _ in parts}
+    return {id(module): module.descriptor_storage.clone() for _, module, _, _ in parts}
 
 
 STORED_MAP_ROWS = [
