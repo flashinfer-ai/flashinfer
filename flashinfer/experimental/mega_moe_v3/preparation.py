@@ -8,6 +8,14 @@ with zero weights when the logical width is not one already. The padded
 columns add exact zeros, so the result is bit-identical to the unpadded
 arithmetic, and a width that already is a multiple of 128 is packed exactly as
 before (no copy).
+
+Expert-parallel calls describe the rank's window of the global expert space:
+``num_experts`` is the number of experts this rank holds (the leading dimension
+of its weights), ``local_expert_offset`` the global id of its first expert and
+``num_global_experts`` the size of the global space. ``topk_idx`` carries
+global ids; a slot whose id falls outside the window (or is -1) routes to no
+expert on this rank, takes no row and adds nothing, so the output is the rank's
+partial sum over its local routes (zeros for a token without one).
 """
 
 import math
@@ -75,6 +83,62 @@ def pipeline_route_args(inputs):
     )
 
 
+def expert_window(inputs):
+    """``(local_expert_offset, num_experts, num_global_experts)`` of a call.
+
+    The rank holds the global experts ``[offset, offset + num_experts)``;
+    ``local_expert_offset`` defaults to 0 and ``num_global_experts`` to
+    ``num_experts`` (a single-rank call).
+    """
+    local = int(inputs["num_experts"])
+    offset = int(inputs.get("local_expert_offset", 0))
+    global_experts = inputs.get("num_global_experts")
+    global_experts = local if global_experts is None else int(global_experts)
+    if offset < 0 or local < 1 or offset + local > global_experts:
+        raise ValueError(
+            "MegaMoE expert window: local_expert_offset >= 0 and "
+            "local_expert_offset + num_experts <= num_global_experts are required; "
+            f"got offset {offset}, {local} local experts, {global_experts} global"
+        )
+    return offset, local, global_experts
+
+
+def _check_tensor(name, tensor, *, shape=None, numel=None, dtype=None, byte_wide=False):
+    import torch
+
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"MegaMoE input {name!r} must be a tensor")
+    if shape is not None and tuple(tensor.shape) != tuple(shape):
+        raise ValueError(
+            f"MegaMoE input {name!r} must have shape {tuple(shape)}; "
+            f"got {tuple(tensor.shape)}"
+        )
+    if numel is not None and tensor.numel() != numel:
+        raise ValueError(
+            f"MegaMoE input {name!r} must hold {numel} elements; got {tensor.numel()}"
+        )
+    if dtype is not None and tensor.dtype != dtype:
+        raise ValueError(
+            f"MegaMoE input {name!r} must have dtype {dtype}; got {tensor.dtype}"
+        )
+    if byte_wide and tensor.element_size() != 1:
+        raise ValueError(
+            f"MegaMoE input {name!r} must be a byte tensor; got {tensor.dtype}"
+        )
+
+
+def _check_bytes(name, tensor, nbytes):
+    import torch
+
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"MegaMoE input {name!r} must be a tensor")
+    if tensor.numel() * tensor.element_size() != nbytes:
+        raise ValueError(
+            f"MegaMoE input {name!r} must hold {nbytes} bytes; "
+            f"got {tensor.numel() * tensor.element_size()}"
+        )
+
+
 def _source_block_m(num_tokens: int, num_experts: int, top_k: int) -> int:
     """Expert tile height of the source schedule for a single-rank model row.
 
@@ -99,42 +163,41 @@ def _source_block_m(num_tokens: int, num_experts: int, top_k: int) -> int:
 
 
 def _mega_dispatch_reference(
-    topk_idx, num_experts: int, align_m: int = ALIGN_M, block_m: int = BLOCK_M
+    topk_idx,
+    num_experts: int,
+    align_m: int = ALIGN_M,
+    block_m: int = BLOCK_M,
+    local_expert_offset: int = 0,
 ):
     """CPU reference for the on-device dispatch: per-expert counts, 256-aligned
     row offsets, tile list, and total M. Row assignment within an expert is
     runtime-nondeterministic (atomic claim order), so pool/metadata are checked
     via token_to_permuted, not by fixed row — this returns only the
-    order-independent quantities. A negative id routes its slot to no expert
-    (a masked token) and takes no row."""
+    order-independent quantities. ``topk_idx`` holds global ids: a slot counts
+    for local expert ``id - local_expert_offset`` only when that falls in
+    ``[0, num_experts)``; a negative id (a masked token) or an id another rank
+    holds routes its slot to no expert and takes no row."""
     import torch
 
-    T, TK = topk_idx.shape
-    counts = torch.zeros(num_experts, dtype=torch.int64)
-    ids = topk_idx.cpu()
-    for t in range(T):
-        for k in range(TK):
-            expert = int(ids[t, k].item())
-            if expert >= 0:
-                counts[expert] += 1
+    ids = topk_idx.detach().reshape(-1).cpu().to(torch.int64) - int(local_expert_offset)
+    local = ids[(ids >= 0) & (ids < num_experts)]
+    counts = torch.bincount(local, minlength=num_experts)
     pad = ((counts + align_m - 1) // align_m) * align_m
-    offsets = torch.zeros(num_experts, dtype=torch.int64)
-    running = 0
-    tile_expert = []
-    tile_m_local = []
-    for e in range(num_experts):
-        offsets[e] = running
-        for tt in range(int(pad[e].item()) // block_m):
-            tile_expert.append(e)
-            tile_m_local.append(tt * block_m)
-        running += int(pad[e].item())
+    offsets = torch.cumsum(pad, 0) - pad
+    tiles = pad // block_m
+    total_m_tiles = int(tiles.sum())
+    tile_expert = torch.repeat_interleave(torch.arange(num_experts), tiles)
+    first_tile = torch.cumsum(tiles, 0) - tiles
+    tile_m_local = (
+        torch.arange(total_m_tiles) - torch.repeat_interleave(first_tile, tiles)
+    ) * block_m
     return {
         "counts": counts.to(torch.int32),
         "offsets": offsets.to(torch.int32),
-        "M_total": int(running),
-        "tile_expert": torch.tensor(tile_expert, dtype=torch.int32),
-        "tile_m_local": torch.tensor(tile_m_local, dtype=torch.int32),
-        "total_m_tiles": len(tile_expert),
+        "M_total": int(pad.sum()),
+        "tile_expert": tile_expert.to(torch.int32),
+        "tile_m_local": tile_m_local.to(torch.int32),
+        "total_m_tiles": total_m_tiles,
     }
 
 
@@ -231,12 +294,15 @@ def build_tile_lists(per_expert_M, num_experts: int):
     )
 
 
-def prepare_pipeline_bindings(inputs, num_sms):
+def prepare_pipeline_bindings(inputs, num_sms, *, local_expert_filter=False):
     """Pack ``inputs`` for the persistent grid of a ``num_sms``-SM catalogued route.
 
     ``inputs["intermediate"]`` is the logical width; the weights and scales are
     padded to the physical width of the route (``physical_intermediate``) when
     the two differ, and the kernel scalars ``N1``/``K2`` name the physical width.
+    ``local_expert_filter`` states that the route's program filters global ids
+    through the ``local_expert_offset`` kernel scalar; without it the call must
+    describe a single-rank window (offset 0, every id below ``num_experts``).
     """
     import torch
 
@@ -257,6 +323,40 @@ def prepare_pipeline_bindings(inputs, num_sms):
     if T < 1 or H % BLOCK_K:
         raise ValueError("MegaMoE requires positive T and H divisible by 256")
     assert I % INTERMEDIATE_ALIGN == 0, I
+    offset, _, global_experts = expert_window(inputs)
+    if (offset or global_experts != E) and not local_expert_filter:
+        raise ValueError(
+            "This route's program has no local expert filter: it requires "
+            "local_expert_offset 0 and num_global_experts == num_experts "
+            f"({E}); got offset {offset} and {global_experts} global experts"
+        )
+    w1, w1_sf, w2, w2_sf = (
+        inputs[k] for k in (f"w1_{weight_fmt}", "w1_sf", f"w2_{weight_fmt}", "w2_sf")
+    )
+    _check_tensor(
+        f"w1_{weight_fmt}", w1, shape=(E, 2 * logical_I, H // pack), byte_wide=True
+    )
+    _check_tensor(
+        "w1_sf", w1_sf, shape=(E, 2 * logical_I, H // SF_GRAN), dtype=torch.float32
+    )
+    _check_tensor(
+        f"w2_{weight_fmt}", w2, shape=(E, H, logical_I // pack), byte_wide=True
+    )
+    _check_tensor(
+        "w2_sf", w2_sf, shape=(E, H, logical_I // SF_GRAN), dtype=torch.float32
+    )
+    _check_tensor("topk_idx", inputs["topk_idx"], numel=T * TK, dtype=torch.int64)
+    _check_tensor(
+        "topk_weights", inputs["topk_weights"], numel=T * TK, dtype=torch.float32
+    )
+    _check_bytes("x_fp8_packed", inputs["x_fp8_packed"], T * H)
+    _check_bytes("x_sf_packed", inputs["x_sf_packed"], T * H // SF_GRAN)
+    ids = inputs["topk_idx"].detach().reshape(-1).cpu()
+    if int(ids.min()) < -1 or int(ids.max()) >= global_experts:
+        raise ValueError(
+            f"topk_idx must hold global expert ids in [0, {global_experts}) or -1; "
+            f"got [{int(ids.min())}, {int(ids.max())}]"
+        )
     source_block_m = _source_block_m(T, E, TK)
     source_blocks = E + (T * TK + source_block_m - 1) // source_block_m
     N1, K1, N2, K2 = (2 * I, H, H, I)
@@ -264,7 +364,7 @@ def prepare_pipeline_bindings(inputs, num_sms):
     # K2_tiles is a legacy term of the arrival-word bound and an unused kernel
     # scalar; the physical width needs ceil(I / 256) of the 256-wide tiles.
     grid_n2, K2_tiles = (N2 // BLOCK_N, -(-K2 // BLOCK_K))
-    ref = _mega_dispatch_reference(inputs["topk_idx"], E)
+    ref = _mega_dispatch_reference(ids, E, local_expert_offset=offset)
     # A batch whose every slot is -1 routes no row; its pools keep one aligned
     # block so that their tensor maps stay valid.
     M_total = max(ref["M_total"], ALIGN_M)
@@ -279,15 +379,7 @@ def prepare_pipeline_bindings(inputs, num_sms):
         .contiguous()
     )
     x_sf = inputs["x_sf_packed"].contiguous().view(torch.int32).view(torch.uint32)
-    w1, w1_sf, w2, w2_sf = _pad_intermediate(
-        inputs[f"w1_{weight_fmt}"],
-        inputs["w1_sf"],
-        inputs[f"w2_{weight_fmt}"],
-        inputs["w2_sf"],
-        logical_I,
-        I,
-        pack,
-    )
+    w1, w1_sf, w2, w2_sf = _pad_intermediate(w1, w1_sf, w2, w2_sf, logical_I, I, pack)
     B1 = _interleave_gate_up(w1).contiguous().view(torch.uint8)
     SFB1 = _sf_float_to_u32_words(_interleave_gate_up(w1_sf)).view(torch.uint32)
     B2 = w2.contiguous().view(torch.uint8)
@@ -387,6 +479,10 @@ def prepare_pipeline_bindings(inputs, num_sms):
         activation_clamp=float("inf")
         if inputs.get("activation_clamp") is None
         else float(inputs["activation_clamp"]),
+        # Global id of this rank's first expert: a program with the local
+        # expert filter routes ids outside [offset, offset + E) to no expert.
+        # A program whose argument plan lacks the scalar never reads it.
+        local_expert_offset=offset,
     )
     for name in ("SFB1", "SFB2"):
         original = launch_kwargs[name]
@@ -434,4 +530,6 @@ def prepare_pipeline_bindings(inputs, num_sms):
         M_total=M_total,
         total_m_tiles=total_m_tiles,
         intermediate=I,
+        local_expert_offset=offset,
+        num_global_experts=global_experts,
     )
