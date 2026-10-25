@@ -224,7 +224,10 @@ class FrostLowLatencyRunner(MoERunner):
     def _cache_key_extras(self):
         return super()._cache_key_extras() + (
             # Do not reuse winners selected with the deferred individual-call timer.
-            "mxint4-load-width-v1"
+            "fp8-grouped-wgmma-v1"
+            if self.config.quant.weight is QuantFormat.FP8PerTensor
+            and self.config.quant.activation is QuantFormat.FP8PerTensor
+            else "mxint4-load-width-v1"
             if self.config.quant.weight is QuantFormat.MXINT4
             else (
                 "fp4-route-reuse-load-width-lut-fp16-v8"
@@ -317,6 +320,20 @@ class FrostLowLatencyRunner(MoERunner):
                 for first in (1, 2, 4, 8)
                 for second in (1, 2, 4, 8)
             ]
+            if (
+                capability == (9, 0)
+                and self.config.quant.weight is QuantFormat.FP8PerTensor
+                and self.config.quant.activation is QuantFormat.FP8PerTensor
+                and self.config.quant.output is QuantFormat.BF16
+                and inputs[0].shape[0] in (4, 8)
+                and inputs[0].shape[1] == 2048
+                and self.config.experts.intermediate_size == 512
+                and self.config.routing.top_k == 10
+                and self.config.activation == SwiGLU()
+                and self.config.finalize.do_finalize
+            ):
+                # Shared routes amortize WGMMA setup; T2/disjoint favor FMA.
+                tactics.append(("wgmma", 2, 4, 128))
             if (
                 capability in ((8, 0), (9, 0), (12, 0))
                 and self.config.quant.weight in (QuantFormat.BF16, QuantFormat.FP16)

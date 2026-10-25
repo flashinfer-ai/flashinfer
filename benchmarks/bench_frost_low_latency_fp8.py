@@ -37,6 +37,7 @@ from flashinfer.testing import bench_gpu_time_with_cupti
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--route-seed", type=int, default=None)
     parser.add_argument("--tokens", type=int, default=1, choices=(1, 2, 4, 8))
     parser.add_argument("--hidden", type=int, default=2048)
     parser.add_argument("--intermediate", type=int, default=512)
@@ -85,6 +86,14 @@ def main():
     ids = torch.arange(t * k, device="cuda", dtype=torch.int32).view(t, k)
     if args.expert_reuse == "shared":
         ids.remainder_(k)
+    if args.route_seed is not None:
+        # Vary expert addresses and slot order without changing reuse or the checkpoint.
+        generator = torch.Generator().manual_seed(args.route_seed)
+        experts = torch.randperm(e, generator=generator).to(ids.device, dtype=ids.dtype)
+        slots = torch.stack(
+            [torch.randperm(k, generator=generator) for _ in range(t)]
+        ).to(ids.device)
+        ids.copy_(experts[ids.long()].gather(1, slots))
     scores = torch.randn(t, k, device="cuda").softmax(-1).bfloat16().float()
     quant = QuantConfig(
         weight=QuantFormat.FP8PerTensor, activation=QuantFormat.FP8PerTensor

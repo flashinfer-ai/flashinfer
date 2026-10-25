@@ -2980,6 +2980,9 @@ class FrostLowLatencyConfig:
     BF16 FC1 preactivation rounding as in the CUTLASS per-tensor backbone.
     Activation and intermediate quantization remain fused into FC1; FC2
     produces BF16 expert/final outputs with ordered FP32 multiply/add combine.
+    On SM90, finalized default SwiGLU at H=2048/I=512/top-k=10, T=4 or 8,
+    also offers grouped E4M3 WGMMA with per-tile FP32 partial promotion. Static
+    scales stay live, and FMA remains the untuned default and tuning candidate.
     The TRT-LLM per-tensor path retains FP32 preactivations, so its rounding
     contract differs even with identical quantized weights and scales.
 

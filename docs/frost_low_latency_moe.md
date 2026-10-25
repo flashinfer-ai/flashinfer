@@ -1662,3 +1662,30 @@ The timed interval includes FC1, activation, FC2 and combine. Preparation, host
 submission, router-network evaluation, shared experts, communication and model
 throughput are outside its scope. Keep each ratio within one paired checkpoint,
 shape, dtype, activation, routing and cache cohort.
+
+## Grouped per-tensor FP8 on Hopper
+
+SM90 additionally offers a grouped E4M3 WGMMA candidate for default SwiGLU,
+H2048/I512/top-k10, finalized BF16 output and T4/T8. Both weights and inputs
+use the existing per-tensor FP8 contract. The candidate uses group2/stages4/K128;
+all sixteen FMA choices and the untuned default remain. Other shapes, activations,
+T1/T2 and raw output retain existing choices. Representative routing and cache
+state must be profiled; shared-expert reuse does not establish a disjoint-route win.
+
+The shared Hopper projection keeps the original checkpoint layout and reads live
+per-expert dequantization and static intermediate quantization scales. Each FP8
+K-tile partial is completed and promoted through separate FP32 additions before
+the existing BF16 preactivation boundary, activation and E4M3 intermediate
+quantization. This avoids the numerical drift of a long WGMMA accumulation;
+FP16/BF16 retain their existing accumulation schedule. Expert partials are BF16
+and the shared finalizer preserves ordered FP32 multiplication/addition and
+skips invalid expert IDs before loading padding scores.
+
+Use the existing `benchmarks/bench_frost_low_latency_fp8.py` with `--tokens 4`
+or `8`, both `--cache-mode warm` and `cold`, and shared/disjoint expert reuse.
+Optional `--route-seed` shuffles expert addresses and slot order while preserving
+the reuse pattern and checkpoint; the default retains the original routing.
+The benchmark checks independent numerical references, tunes and freezes tactics
+before ABBA validation, and times the complete routed-expert CUDA Graph interval.
+It excludes host enqueue, preparation, router-network evaluation, shared experts
+and communication, and does not establish serving throughput.

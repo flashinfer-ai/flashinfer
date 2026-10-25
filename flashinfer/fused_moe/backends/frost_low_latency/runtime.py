@@ -35,6 +35,10 @@ def execute(inputs, config, tile_k):
 
         return execute_deepseek(inputs, config, tile_k)
     if config.quant.weight is QuantFormat.FP8PerTensor:
+        if isinstance(tile_k, tuple) and tile_k and tile_k[0] == "wgmma":
+            from .tc.runtime import execute as execute_grouped
+
+            return execute_grouped(inputs, config, tile_k)
         from .fp8_per_tensor import execute as execute_fp8
 
         return execute_fp8(inputs, config, tile_k)
