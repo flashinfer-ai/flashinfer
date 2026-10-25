@@ -1,66 +1,511 @@
+# Copyright (c) 2026 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Generated programs of the MiniMax-H3 SM120 NVFP4 packed-varlen attention (SageAttention3
+recipe): the fused pre-processing of plans of 2048 to 16384 padded tokens (PREPROCESS,
+cooperative), the statistics launch that also quantizes Q (STATS) and the K/V quantizer
+in its short-plan and long-plan work orders (QUANTIZE_KV, QUANTIZE_KV_HBLK64) of the
+other plans, and the attention launch of the compensated and uncompensated routes in the
+base and warp-specialised forms (ATTENTION, ATTENTION_NODELTA, ATTENTION_WS,
+ATTENTION_WS_NODELTA), each shipped for sm_120a. The host module
+``flashinfer.diffusion_ops.cake_minimax_h3_sm120_nvfp4_varlen_attention`` selects the
+programs, computes the grids and launches them behind
+``minimax_h3_sm120_varlen_attention_nvfp4`` and
+``minimax_h3_sm120_varlen_attention_nvfp4_nodelta``.
+
+Generated file: every value below is derived from the exported sources and checked
+against them; do not edit.
 """
-Copyright (c) 2026 by FlashInfer team.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+from __future__ import annotations
 
-  http://www.apache.org/licenses/LICENSE-2.0
+from . import cake_program
+from .core import JitSpec
 
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
-from pathlib import Path
-
-from . import env as jit_env
-from .core import (
-    JitSpec,
-    current_compilation_context,
-    gen_jit_spec,
-    refresh_current_compilation_context,
+PREPROCESS = cake_program.CakeProgram(
+    name="cake_minimax_h3_sm120_nvfp4_varlen_attention_91933bc58e196b42b232",
+    operator_dir="cake_minimax_h3_sm120_nvfp4_varlen_attention",
+    kernel="kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_91933bc58e196b42b232",
+    sources=(
+        "cake_minimax_h3_sm120_nvfp4_varlen_attention_91933bc58e196b42b232_kernel.cu",
+        "cake_minimax_h3_sm120_nvfp4_varlen_attention_91933bc58e196b42b232_binding.cu",
+    ),
+    targets=("sm_120a",),
+    compile_options=(("sm_120a", ()),),
+    args=(
+        "Q",
+        "K",
+        "V",
+        "tile_table",
+        "seg_tile_begin",
+        "tok_seg",
+        "cu_seqlens",
+        "partials",
+        "counters",
+        "mean_k",
+        "q_mean",
+        "q4",
+        "k4",
+        "q_sf",
+        "k_sf",
+        "qm4",
+        "qm_sf",
+        "vt4",
+        "v_sf",
+        "barrier",
+        "num_tiles",
+        "total_tokens",
+        "total_padded",
+        "num_heads",
+        "num_kblocks",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "Q",
+        "K",
+        "V",
+        "tile_table",
+        "seg_tile_begin",
+        "tok_seg",
+        "cu_seqlens",
+        "partials",
+        "counters",
+        "mean_k",
+        "q_mean",
+        "q4",
+        "k4",
+        "q_sf",
+        "k_sf",
+        "qm4",
+        "qm_sf",
+        "vt4",
+        "v_sf",
+        "barrier",
+    ),
+    block=(256, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=16512,
+    use_pdl=True,
+    cooperative=True,
+    needs_device_linking=False,
 )
 
-_CUDA_SOURCE_NAME = "cake_minimax_h3_sm120_nvfp4_varlen_attention_sm120a.cu"
-# GB202 only: the device code uses mma.sync kind::mxf4nvf4 (block-scaled QK^T and PV) + TMA (no tcgen05),
-# and the register schedule is tuned for the SM120 tensor-pipe / SMEM budget.
-_SUPPORTED_MAJOR_VERSIONS = [12]
+STATS = cake_program.CakeProgram(
+    name="cake_minimax_h3_sm120_nvfp4_varlen_attention_d7c436d339888a3ad66b",
+    operator_dir="cake_minimax_h3_sm120_nvfp4_varlen_attention",
+    kernel="kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_d7c436d339888a3ad66b",
+    sources=(
+        "cake_minimax_h3_sm120_nvfp4_varlen_attention_d7c436d339888a3ad66b_kernel.cu",
+        "cake_minimax_h3_sm120_nvfp4_varlen_attention_d7c436d339888a3ad66b_binding.cu",
+    ),
+    targets=("sm_120a",),
+    compile_options=(("sm_120a", ()),),
+    args=(
+        "Q",
+        "K",
+        "tile_table",
+        "seg_tile_begin",
+        "partials",
+        "counters",
+        "mean_k",
+        "q_mean",
+        "q4",
+        "q_sf",
+        "qm4",
+        "qm_sf",
+        "num_tiles",
+        "num_heads",
+        "q_slots",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "Q",
+        "K",
+        "tile_table",
+        "seg_tile_begin",
+        "partials",
+        "counters",
+        "mean_k",
+        "q_mean",
+        "q4",
+        "q_sf",
+        "qm4",
+        "qm_sf",
+    ),
+    block=(256, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=17024,
+    use_pdl=True,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+QUANTIZE_KV = cake_program.CakeProgram(
+    name="cake_minimax_h3_sm120_nvfp4_varlen_attention_62593fea84a43e92454e",
+    operator_dir="cake_minimax_h3_sm120_nvfp4_varlen_attention",
+    kernel="kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_62593fea84a43e92454e",
+    sources=(
+        "cake_minimax_h3_sm120_nvfp4_varlen_attention_62593fea84a43e92454e_kernel.cu",
+        "cake_minimax_h3_sm120_nvfp4_varlen_attention_62593fea84a43e92454e_binding.cu",
+    ),
+    targets=("sm_120a",),
+    compile_options=(("sm_120a", ()),),
+    args=(
+        "Q",
+        "K",
+        "V",
+        "tok_seg",
+        "cu_seqlens",
+        "seg_tile_begin",
+        "mean_k",
+        "q_mean",
+        "q4",
+        "k4",
+        "q_sf",
+        "k_sf",
+        "qm4",
+        "qm_sf",
+        "vt4",
+        "v_sf",
+        "total_tokens",
+        "total_padded",
+        "num_heads",
+        "num_kblocks",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "Q",
+        "K",
+        "V",
+        "tok_seg",
+        "cu_seqlens",
+        "seg_tile_begin",
+        "mean_k",
+        "q_mean",
+        "q4",
+        "k4",
+        "q_sf",
+        "k_sf",
+        "qm4",
+        "qm_sf",
+        "vt4",
+        "v_sf",
+    ),
+    block=(256, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=0,
+    use_pdl=True,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+QUANTIZE_KV_HBLK64 = cake_program.CakeProgram(
+    name="cake_minimax_h3_sm120_nvfp4_varlen_attention_3c3a82276b62686f6044",
+    operator_dir="cake_minimax_h3_sm120_nvfp4_varlen_attention",
+    kernel="kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_3c3a82276b62686f6044",
+    sources=(
+        "cake_minimax_h3_sm120_nvfp4_varlen_attention_3c3a82276b62686f6044_kernel.cu",
+        "cake_minimax_h3_sm120_nvfp4_varlen_attention_3c3a82276b62686f6044_binding.cu",
+    ),
+    targets=("sm_120a",),
+    compile_options=(("sm_120a", ()),),
+    args=(
+        "Q",
+        "K",
+        "V",
+        "tok_seg",
+        "cu_seqlens",
+        "seg_tile_begin",
+        "mean_k",
+        "q_mean",
+        "q4",
+        "k4",
+        "q_sf",
+        "k_sf",
+        "qm4",
+        "qm_sf",
+        "vt4",
+        "v_sf",
+        "total_tokens",
+        "total_padded",
+        "num_heads",
+        "num_kblocks",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "Q",
+        "K",
+        "V",
+        "tok_seg",
+        "cu_seqlens",
+        "seg_tile_begin",
+        "mean_k",
+        "q_mean",
+        "q4",
+        "k4",
+        "q_sf",
+        "k_sf",
+        "qm4",
+        "qm_sf",
+        "vt4",
+        "v_sf",
+    ),
+    block=(256, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=0,
+    use_pdl=True,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+ATTENTION = cake_program.CakeProgram(
+    name="cake_minimax_h3_sm120_nvfp4_varlen_attention_96b72f1619d4c2fcf336",
+    operator_dir="cake_minimax_h3_sm120_nvfp4_varlen_attention",
+    kernel="kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_96b72f1619d4c2fcf336",
+    sources=(
+        "cake_minimax_h3_sm120_nvfp4_varlen_attention_96b72f1619d4c2fcf336_kernel.cu",
+        "cake_minimax_h3_sm120_nvfp4_varlen_attention_96b72f1619d4c2fcf336_binding.cu",
+    ),
+    targets=("sm_120a",),
+    compile_options=(("sm_120a", ()),),
+    args=(
+        "Q_map",
+        "K_map",
+        "KSF_map",
+        "VT_map",
+        "VSF_map",
+        "O",
+        "q_sf",
+        "qm4",
+        "qm_sf",
+        "seg_tile_begin",
+        "unit_table",
+        "total_units",
+        "num_heads",
+        "num_kblocks",
+        "softmax_scale_log2",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "Q_map",
+        "K_map",
+        "KSF_map",
+        "VT_map",
+        "VSF_map",
+        "O",
+        "q_sf",
+        "qm4",
+        "qm_sf",
+        "seg_tile_begin",
+        "unit_table",
+    ),
+    block=(256, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=66560,
+    use_pdl=True,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+ATTENTION_NODELTA = cake_program.CakeProgram(
+    name="cake_minimax_h3_sm120_nvfp4_varlen_attention_e2f9f7cfe91213af830e",
+    operator_dir="cake_minimax_h3_sm120_nvfp4_varlen_attention",
+    kernel="kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_e2f9f7cfe91213af830e",
+    sources=(
+        "cake_minimax_h3_sm120_nvfp4_varlen_attention_e2f9f7cfe91213af830e_kernel.cu",
+        "cake_minimax_h3_sm120_nvfp4_varlen_attention_e2f9f7cfe91213af830e_binding.cu",
+    ),
+    targets=("sm_120a",),
+    compile_options=(("sm_120a", ()),),
+    args=(
+        "Q_map",
+        "K_map",
+        "KSF_map",
+        "VT_map",
+        "VSF_map",
+        "O",
+        "q_sf",
+        "qm4",
+        "qm_sf",
+        "seg_tile_begin",
+        "unit_table",
+        "total_units",
+        "num_heads",
+        "num_kblocks",
+        "softmax_scale_log2",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "Q_map",
+        "K_map",
+        "KSF_map",
+        "VT_map",
+        "VSF_map",
+        "O",
+        "q_sf",
+        "qm4",
+        "qm_sf",
+        "seg_tile_begin",
+        "unit_table",
+    ),
+    block=(256, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=48128,
+    use_pdl=True,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+ATTENTION_WS = cake_program.CakeProgram(
+    name="cake_minimax_h3_sm120_nvfp4_varlen_attention_745ed7cf4e27bcbf77ef",
+    operator_dir="cake_minimax_h3_sm120_nvfp4_varlen_attention",
+    kernel="kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_745ed7cf4e27bcbf77ef",
+    sources=(
+        "cake_minimax_h3_sm120_nvfp4_varlen_attention_745ed7cf4e27bcbf77ef_kernel.cu",
+        "cake_minimax_h3_sm120_nvfp4_varlen_attention_745ed7cf4e27bcbf77ef_binding.cu",
+    ),
+    targets=("sm_120a",),
+    compile_options=(("sm_120a", ()),),
+    args=(
+        "Q_map",
+        "K_map",
+        "KSF_map",
+        "VT_map",
+        "VSF_map",
+        "O",
+        "q_sf",
+        "qm4",
+        "qm_sf",
+        "seg_tile_begin",
+        "unit_table",
+        "total_units",
+        "num_heads",
+        "num_kblocks",
+        "softmax_scale_log2",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "Q_map",
+        "K_map",
+        "KSF_map",
+        "VT_map",
+        "VSF_map",
+        "O",
+        "q_sf",
+        "qm4",
+        "qm_sf",
+        "seg_tile_begin",
+        "unit_table",
+    ),
+    block=(384, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=80896,
+    use_pdl=True,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+ATTENTION_WS_NODELTA = cake_program.CakeProgram(
+    name="cake_minimax_h3_sm120_nvfp4_varlen_attention_ac4dc40c1d6424bf7950",
+    operator_dir="cake_minimax_h3_sm120_nvfp4_varlen_attention",
+    kernel="kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_ac4dc40c1d6424bf7950",
+    sources=(
+        "cake_minimax_h3_sm120_nvfp4_varlen_attention_ac4dc40c1d6424bf7950_kernel.cu",
+        "cake_minimax_h3_sm120_nvfp4_varlen_attention_ac4dc40c1d6424bf7950_binding.cu",
+    ),
+    targets=("sm_120a",),
+    compile_options=(("sm_120a", ()),),
+    args=(
+        "Q_map",
+        "K_map",
+        "KSF_map",
+        "VT_map",
+        "VSF_map",
+        "O",
+        "q_sf",
+        "qm4",
+        "qm_sf",
+        "seg_tile_begin",
+        "unit_table",
+        "total_units",
+        "num_heads",
+        "num_kblocks",
+        "softmax_scale_log2",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "Q_map",
+        "K_map",
+        "KSF_map",
+        "VT_map",
+        "VSF_map",
+        "O",
+        "q_sf",
+        "qm4",
+        "qm_sf",
+        "seg_tile_begin",
+        "unit_table",
+    ),
+    block=(384, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=80896,
+    use_pdl=True,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+PROGRAMS: tuple[cake_program.CakeProgram, ...] = (
+    PREPROCESS,
+    STATS,
+    QUANTIZE_KV,
+    QUANTIZE_KV_HBLK64,
+    ATTENTION,
+    ATTENTION_NODELTA,
+    ATTENTION_WS,
+    ATTENTION_WS_NODELTA,
+)
 
 
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+def aot_specs(target: str) -> tuple[JitSpec, ...]:
+    """JIT specs of every program shipping ``target``, for the ahead-of-time build."""
+    return cake_program.aot_specs(PROGRAMS, target)
 
 
-def _cuda_source() -> Path:
-    packaged = jit_env.FLASHINFER_CSRC_DIR / _CUDA_SOURCE_NAME
-    if packaged.is_file():
-        return packaged
-    source_tree = _repo_root() / "csrc" / _CUDA_SOURCE_NAME
-    if source_tree.is_file():
-        return source_tree
-    raise FileNotFoundError(
-        "MiniMax-H3 SM120 NVFP4 varlen attention CUDA source not found. Checked:\n"
-        f"  - {packaged}\n  - {source_tree}"
-    )
-
-
-def gen_minimax_h3_sm120_nvfp4_varlen_attention_module() -> JitSpec:
-    """JIT spec for the SM120 (GB202) NVFP4 (SageAttention3-recipe) MiniMax-H3 packed-varlen attention kernels."""
-
-    compilation_context = current_compilation_context
-    if not compilation_context.TARGET_CUDA_ARCHS:
-        compilation_context = refresh_current_compilation_context()
-    nvcc_flags = compilation_context.get_nvcc_flags_list(
-        supported_major_versions=_SUPPORTED_MAJOR_VERSIONS
-    )
-    return gen_jit_spec(
-        "minimax_h3_sm120_nvfp4_varlen_attention_sm120a_v1",
-        [_cuda_source()],
-        extra_cuda_cflags=nvcc_flags,
-    )
-
-
-__all__ = ["gen_minimax_h3_sm120_nvfp4_varlen_attention_module"]
+__all__ = [
+    "PREPROCESS",
+    "STATS",
+    "QUANTIZE_KV",
+    "QUANTIZE_KV_HBLK64",
+    "ATTENTION",
+    "ATTENTION_NODELTA",
+    "ATTENTION_WS",
+    "ATTENTION_WS_NODELTA",
+    "PROGRAMS",
+    "aot_specs",
+]
