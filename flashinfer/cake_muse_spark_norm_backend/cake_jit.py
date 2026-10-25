@@ -6830,11 +6830,6 @@ MODULES: dict[str, dict[str, Any]] = {
                 "sm_100a": [
                     [
                         16,
-                        0,
-                        1,
-                    ],
-                    [
-                        16,
                         8,
                         256,
                     ],
@@ -7222,14 +7217,14 @@ MODULES: dict[str, dict[str, Any]] = {
                 "sm_100a": [
                     [
                         128,
-                        0,
+                        1,
                         8,
                     ],
                 ],
                 "sm_103a": [
                     [
                         128,
-                        0,
+                        1,
                         8,
                     ],
                 ],
@@ -7239,7 +7234,6 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_muse_spark_norm_4c2847f766bb9a2330d6": {
         "arches": [
-            "sm_100a",
             "sm_103a",
         ],
         "arg_plan": [
@@ -7348,22 +7342,15 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "kind": "tokens_heads_between",
             "windows": {
-                "sm_100a": [
-                    [
-                        32,
-                        0,
-                        1,
-                    ],
-                ],
                 "sm_103a": [
                     [
                         128,
                         8,
-                        64,
+                        32,
                     ],
                     [
                         32,
-                        0,
+                        1,
                         8,
                     ],
                 ],
@@ -8566,7 +8553,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "sm_103a": [
                     [
                         16,
-                        0,
+                        1,
                         8,
                     ],
                     [
@@ -8694,11 +8681,26 @@ MODULES: dict[str, dict[str, Any]] = {
                     [
                         128,
                         8,
+                        16,
+                    ],
+                    [
+                        128,
+                        64,
                         256,
                     ],
                     [
                         32,
                         1,
+                        64,
+                    ],
+                    [
+                        32,
+                        128,
+                        192,
+                    ],
+                    [
+                        32,
+                        257,
                         1024,
                     ],
                 ],
@@ -8711,6 +8713,16 @@ MODULES: dict[str, dict[str, Any]] = {
                     [
                         32,
                         8,
+                        64,
+                    ],
+                    [
+                        32,
+                        128,
+                        192,
+                    ],
+                    [
+                        32,
+                        256,
                         1024,
                     ],
                 ],
@@ -8779,10 +8791,9 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_muse_spark_norm_49015ea91c011bd1740a",
             "cake_muse_spark_norm_feff5e270b2146886c6c",
             "cake_muse_spark_norm_c7c7921f8495c0384ee7",
-            "cake_muse_spark_norm_4c2847f766bb9a2330d6",
             "cake_muse_spark_norm_fb5857b9f0bbd10ec74b",
-            "cake_muse_spark_norm_21dccf5cd73a70753e08",
             "cake_muse_spark_norm_fba020bb2e3b8aaf63f0",
+            "cake_muse_spark_norm_21dccf5cd73a70753e08",
             "cake_muse_spark_norm_20b424e339bbe5210ad5",
         ],
     },
