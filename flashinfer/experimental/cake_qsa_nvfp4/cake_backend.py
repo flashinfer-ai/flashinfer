@@ -27,15 +27,19 @@ tiles into ``splits`` splits; one decode CTA serves one (row, KV head, split).
 Split rule (:func:`num_splits`): ``tiles = ceil(selection_width / 64)``;
 ``splits = max(1, min(tiles, CTAS_PER_SM[arch] * sm_count // (rows *
 num_kv_heads)))`` (the resident CTAs per SM of the architecture's plain decode,
-its launch bound: two for the ``mma.sync`` decode of SM80 / SM90, one for the
-tcgen05 decode of SM100 / SM103 / SM107); then the measured table
+its launch bound: two for the ``mma.sync`` decode of SM80 / SM90 / SM120, one
+for the tcgen05 decode of SM100 / SM103 / SM107); then the measured table
 :data:`SPLIT_OVERRIDES` of the device's SM count replaces the formula where it
 names ``(sm_count, rows)``; then ``splits <= min(tiles, MAX_SPLITS)``.  The
 rule reads the architecture and the SM count alone, cached per device.  On a
 B200 (148 SMs) the formula gives 33, 33, 18, 9, 4, 2, 1, 1 splits for rows 1,
 2, 4, 8, 16, 32, 64, 128 of the owner's shape (2 KV heads, 33 tiles); the
 table has no entry for 148 SMs (nor for the GB300's 152): the formula wins or
-ties every measured alternative there.
+ties every measured alternative there.  On an RTX PRO 6000 (188 SMs, two CTAs
+per SM) the formula gives 33, 33, 33, 23, 11, 5, 2, 1 and the table replaces
+rows 4, 8, 16 and 32 with 16, 11, 5 and 3 (measured whole call in both forms,
+both layouts, both L2 flushes: +15 to +39 % at rows 4 and 8, +2 to +8 % at rows
+16 and 32; rows 1 and 2 keep 33, where 16 splits lose 7 % after a read flush).
 
 Form rule (:func:`select_form`): with one split the plain decode writes the
 output itself.  Above one split the *fused* form -- the cooperative build of
@@ -43,10 +47,10 @@ the decode, whose CTAs merge the splits in the same launch through a counter
 per (row, KV head) -- needs its grid ``rows * num_kv_heads * splits`` within
 the co-residency the decode's launch bound guarantees on the device
 (:func:`fused_capacity`: ``FUSED_CTAS_PER_SM[arch]`` times the SM count, 264
-on an H100, 148 on a B200, 152 on a GB300; a cooperative launch above the
-device's co-residency is refused by the driver).  Within it, compute
-capability 9.0 always takes the fused form.  Compute capability 10.0 and
-10.3 take it under the eager host rule alone: on a host of ``FUSED_HOSTS``
+on an H100, 376 on an RTX PRO 6000, 148 on a B200, 152 on a GB300; a
+cooperative launch above the device's co-residency is refused by the driver).
+Within it, compute capability 9.0 and 12.0 always take the fused form.
+Compute capability 10.0 and 10.3 take it under the eager host rule alone: on a host of ``FUSED_HOSTS``
 (``aarch64``: the Grace host of a GB200 / GB300, whose eager path leaves a
 gap of several microseconds between the decode launch and the merge launch
 that costs more than the fused form's in-kernel merge tail), at ``rows <=
@@ -63,9 +67,9 @@ call with its captured replay bit for bit, so the two forms agree exactly.
 
 Program rule (:func:`select_wide`, then :func:`cake_jit.select_records`): the
 registry's records are filtered by the device's architecture first (the
-``mma.sync`` decode's on ``sm_80`` / ``sm_90a``, the tcgen05 decode's on
-``sm_100a`` / ``sm_103a`` / ``sm_107a``).  On ``sm_80`` the plain decode has
-two programs:
+``mma.sync`` decode's on ``sm_80`` / ``sm_90a`` / ``sm_120a``, the tcgen05
+decode's on ``sm_100a`` / ``sm_103a`` / ``sm_107a``).  On ``sm_80`` the plain
+decode has two programs:
 a split-form call is *wide* when both hold: its decode grid ``rows *
 num_kv_heads * splits`` exceeds one resident wave (``CTAS_PER_SM[arch]`` CTAs
 per SM times the SM count: 216 CTAs on an A100's 108 SMs) and each of its CTAs
@@ -73,7 +77,7 @@ walks a long tile stream, ``ceil(tiles / splits) >= LONG_STREAM_TILES`` (16
 tiles = 1024 selected tokens).  A wide call launches the whole-tile program
 (``decode_whole_tile``: whole-tile gather, no L2 cache hint, shift selector --
 the previous release's ``sm_80`` decode); every other call launches the
-K-first program (``decode``), and ``sm_90a`` always does; ``sm_100a``,
+K-first program (``decode``), and ``sm_90a`` / ``sm_120a`` always do; ``sm_100a``,
 ``sm_103a`` and ``sm_107a`` launch the tcgen05 program (``decode_tcgen05``) in
 the split form whatever the grid.  On 108 SMs at the owner's 24 x 2 heads and 2051 selections (33
 tiles): rows 1-32 run at most one wave -> K-first; rows 64 (4 splits, 512
@@ -143,8 +147,8 @@ CTAS_PER_SM = cake_jit.DECODE_CTAS_PER_SM
 FUSED_CTAS_PER_SM = cake_jit.DECODE_FUSED_CTAS_PER_SM
 # The eager host rule of the tcgen05 architectures (module docstring, "Form rule"): within the fused capacity, these
 # architectures take the fused form only on these host machines (``platform.machine()``), at this many rows or fewer,
-# and only outside a stream capture; compute capability 9.0 takes it within its capacity on every host, and sm_107a
-# (not listed) keeps the split form on every host, the measured shorter one there.
+# and only outside a stream capture; compute capability 9.0 and 12.0 take it within their capacity on every host, and
+# sm_107a (not listed) keeps the split form on every host, the measured shorter one there.
 FUSED_HOST_RULE_ARCHES = ("sm_100a", "sm_103a")
 FUSED_HOSTS = ("aarch64",)
 FUSED_MAX_ROWS = 4
@@ -159,14 +163,22 @@ _LOG2E = math.log2(math.e)
 # The measured split table: ``(sm_count, rows) -> splits`` where the fastest split count of the acceptance fixture
 # (2 KV heads, a selection of 2051 tokens = 33 tiles) differs from the formula.  Keyed by the SM count, never by a
 # product name.  H100 (132 SMs): rows 4 take 16 splits and rows 8 take 8; A100 (108 SMs): rows 64 take 4 and rows
-# 128 take 2 (both above the formula's capacity; a plain launch runs in more than one wave).  No entry for a Blackwell
-# SM count: on 148 SMs (B200) and 152 SMs (GB300) the tcgen05 decode's one-CTA-per-SM formula wins or ties every measured
-# alternative (half splits, two-wave grids: whole call, both layouts, both flushes), so its rows run the formula.
+# 128 take 2 (both above the formula's capacity; a plain launch runs in more than one wave).  No entry for a tcgen05
+# device's SM count: on 148 SMs (B200) and 152 SMs (GB300) the tcgen05 decode's one-CTA-per-SM formula wins or ties every
+# measured alternative (half splits, two-wave grids: whole call, both layouts, both flushes), so its rows run the formula.
+# RTX PRO 6000 (188 SMs, the mma.sync decode's two CTAs per SM): rows 4 take 16 splits, rows 8 take 11, rows 16 take 5
+# and rows 32 take 3 (about half the formula's 33 / 23 / 11 / 5: fewer CTAs of two to seven tiles beat the formula's
+# one-tile CTAs whole call in both forms, both layouts, both flushes); rows 1 and 2 keep 33 (16 splits win after a memset
+# flush yet lose 7 % after a read flush) and rows 64 and 128 keep the formula (4 and 2 splits lose 3 to 7 %).
 SPLIT_OVERRIDES: dict[tuple[int, int], int] = {
     (132, 4): 16,
     (132, 8): 8,
     (108, 64): 4,
     (108, 128): 2,
+    (188, 4): 16,
+    (188, 8): 11,
+    (188, 16): 5,
+    (188, 32): 3,
 }
 
 

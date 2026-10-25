@@ -20,7 +20,7 @@ The backend suite ``test_cake_qsa_nvfp4.py`` exercises the package.  This file c
 what needs flashinfer itself: the ``backend`` keyword of
 ``flashinfer.sparse.qsa_sparse_paged_attention`` -- ``backend="cake"`` reaches the
 package with every operand, the default ``"auto"`` is the package on every compute
-capability it exports a library for (8.x, 9.0, 10.0, 10.3, 10.7: capability-exact) and the
+capability it exports a library for (8.x, 9.0, 10.0, 10.3, 10.7, 12.0: capability-exact) and the
 existing implementation elsewhere, ``"default"`` keeps the existing
 implementation, an unknown value is refused -- device runs of the route and of the auto
 default against the package, bit for bit, and
@@ -172,10 +172,10 @@ def test_explicit_default_backend_keeps_the_existing_implementation(monkeypatch)
 
 def test_auto_backend_resolves_by_capability(monkeypatch):
     """``auto`` is the Cake route for every capability the package exports (8.0, 8.6, 8.7,
-    8.9, 9.0, 10.0, 10.3, 10.7) and the reference implementation for any other capability or
-    a non-CUDA device: the rule is capability-exact, so the 12.x devices stay on the
-    reference until the package ships for them; the table below needs no GPU, the
-    capability lookup is replaced."""
+    8.9, 9.0, 10.0, 10.3, 10.7, 12.0) and the reference implementation for any other capability
+    or a non-CUDA device: the rule is capability-exact, so 12.1 (no delivered library) stays on
+    the reference until the package ships for it; the table below needs no GPU, the capability
+    lookup is replaced."""
     assert public_api._qsa_auto_backend(torch.device("cpu")) == "default"
     device = torch.device("cuda", 0)
     table = {}
@@ -189,11 +189,12 @@ def test_auto_backend_resolves_by_capability(monkeypatch):
         (10, 0),
         (10, 3),
         (10, 7),
+        (12, 0),
     ]
     for capability in sorted(cake_jit.ARCH_BY_CAPABILITY):
         table[device] = capability
         assert public_api._qsa_auto_backend(device) == "cake", capability
-    for capability in ((7, 5), (12, 0), (12, 1)):
+    for capability in ((7, 5), (12, 1)):
         table[device] = capability
         assert public_api._qsa_auto_backend(device) == "default", capability
 
@@ -278,7 +279,7 @@ def test_generated_sources_are_declared_as_package_data():
 
 def test_program_rule_selects_the_records_of_a_call():
     """The records are filtered by the device's architecture first: the ``mma.sync`` decode's
-    on sm_80 / sm_90a, the tcgen05 decode's on sm_100a / sm_103a / sm_107a.  On sm_80 a
+    on sm_80 / sm_90a / sm_120a, the tcgen05 decode's on sm_100a / sm_103a / sm_107a.  On sm_80 a
     wide (multi-wave, long-stream) split-form call launches the whole-tile decode, every
     other call the K-first decode; the tcgen05 architectures launch the tcgen05 decode
     whatever the grid;
@@ -299,12 +300,13 @@ def test_program_rule_selects_the_records_of_a_call():
     )
     assert select(form="split", splits=1, arch="sm_80", wide=False) == ("decode",)
     for wide in (False, True):
-        assert select(form="split", splits=4, arch="sm_90a", wide=wide) == (
-            "decode",
-            "merge",
-        )
-        assert select(form="split", splits=1, arch="sm_90a", wide=wide) == ("decode",)
-        for arch in ("sm_80", "sm_90a"):
+        for arch in ("sm_90a", "sm_120a"):
+            assert select(form="split", splits=4, arch=arch, wide=wide) == (
+                "decode",
+                "merge",
+            )
+            assert select(form="split", splits=1, arch=arch, wide=wide) == ("decode",)
+        for arch in ("sm_80", "sm_90a", "sm_120a"):
             assert select(form="fused", splits=4, arch=arch, wide=wide) == (
                 "decode_coop",
             )
@@ -319,7 +321,14 @@ def test_program_rule_selects_the_records_of_a_call():
             assert select(form="fused", splits=4, arch=arch, wide=wide) == (
                 "decode_tcgen05_coop",
             )
-    assert cake_jit.ARCHES == ("sm_80", "sm_90a", "sm_100a", "sm_103a", "sm_107a")
+    assert cake_jit.ARCHES == (
+        "sm_80",
+        "sm_90a",
+        "sm_100a",
+        "sm_103a",
+        "sm_107a",
+        "sm_120a",
+    )
     for name in cake_jit.MODULES:
         assert cake_jit.MODULES[name]["stage"] in cake_jit.STAGES
         assert set(cake_jit.MODULES[name]["arches"]) <= set(cake_jit.ARCHES)
@@ -335,7 +344,7 @@ def test_program_rule_selects_the_records_of_a_call():
     with pytest.raises(ValueError, match="form"):
         select(form="other", splits=1, arch="sm_80", wide=False)
     with pytest.raises(ValueError, match="arch"):
-        select(form="split", splits=1, arch="sm_120a", wide=False)
+        select(form="split", splits=1, arch="sm_121a", wide=False)
     with pytest.raises(ValueError, match="splits"):
         select(form="split", splits=0, arch="sm_80", wide=False)
     with pytest.raises(ValueError, match="merge"):
@@ -363,6 +372,7 @@ def test_wide_grid_is_multi_wave_with_long_streams():
         "sm_100a": 1,
         "sm_103a": 1,
         "sm_107a": 1,
+        "sm_120a": 2,
     }
     rows_to_splits = {
         rows: cake_backend.num_splits(rows, 2, 2051, sm_count, arch)
@@ -409,7 +419,7 @@ def test_wide_grid_is_multi_wave_with_long_streams():
         (1, 2, 1, 0, "split", sm_count, arch),
         (1, 2, 1, tiles, "split", 0, arch),
         (1, 2, 1, tiles, "other", sm_count, arch),
-        (1, 2, 1, tiles, "split", sm_count, "sm_120a"),
+        (1, 2, 1, tiles, "split", sm_count, "sm_121a"),
     ):
         with pytest.raises(ValueError):
             wide(*bad)

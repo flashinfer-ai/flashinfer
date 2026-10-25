@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Registry and loader glue of the Cake QSA sparse paged GQA decode over an
-NVFP4 KV cache for SM80, SM90, SM100, SM103 and SM107: two split-KV decode programs
-partitioning the architectures -- the ``mma.sync`` decode of ``sm_80`` and
-``sm_90a`` (its plain K-first build, its whole-tile build delivered for
+NVFP4 KV cache for SM80, SM90, SM100, SM103, SM107 and SM120: two split-KV decode
+programs partitioning the architectures -- the ``mma.sync`` decode of ``sm_80``,
+``sm_90a`` and ``sm_120a`` (its plain K-first build, its whole-tile build delivered for
 ``sm_80`` alone, and its cooperative build, which merges the splits in the
 same launch) and the tcgen05 decode of ``sm_100a``, ``sm_103a`` and ``sm_107a``
 (its plain and its cooperative build; tensor memory, one CTA per SM) -- and the
@@ -25,8 +25,8 @@ split-KV merge with the sigmoid output gate, delivered for every architecture.
 
 Every record of ``MODULES`` is one mechanically exported program: a CUDA
 device translation unit plus a tvm-ffi binding, compiled for each architecture
-of the record's ``arches`` (one source per program; ``sm_80`` and ``sm_90a``
-for the ``mma.sync`` decodes, ``sm_100a``, ``sm_103a`` and ``sm_107a`` for the
+of the record's ``arches`` (one source per program; ``sm_80``, ``sm_90a`` and
+``sm_120a`` for the ``mma.sync`` decodes, ``sm_100a``, ``sm_103a`` and ``sm_107a`` for the
 tcgen05 decodes, all five for the merge, ``sm_80`` alone for the whole-tile
 decode).  A record
 carries the host plan only: the program's ``library`` stem (its ``build.json``
@@ -78,11 +78,12 @@ import tvm_ffi
 # The five verified builds, each compiled with its exact ``-gencode`` flag set
 # (``build.json`` ``arch_flags``): ``sm_80`` serves every compute capability
 # 8.x device, ``sm_90a`` the H100 (9.0), ``sm_100a`` the B200 / GB200 (10.0),
-# ``sm_103a`` the B300 / GB300 (10.3) and ``sm_107a`` the R200 (10.7).  No
-# other capability is a target: the table is capability-exact (12.0 and 12.1
-# are not in it).  A record lists the subset it is delivered for
-# (``record["arches"]``).
-ARCHES = ("sm_80", "sm_90a", "sm_100a", "sm_103a", "sm_107a")
+# ``sm_103a`` the B300 / GB300 (10.3), ``sm_107a`` the R200 (10.7) and ``sm_120a``
+# the RTX PRO 6000 Blackwell (12.0: no tcgen05 instructions and no tensor memory,
+# so the ``mma.sync`` decode serves it, the SM80 program built for sm_120a).  No
+# other capability is a target: the table is capability-exact (12.1 is not in
+# it).  A record lists the subset it is delivered for (``record["arches"]``).
+ARCHES = ("sm_80", "sm_90a", "sm_100a", "sm_103a", "sm_107a", "sm_120a")
 ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
     (8, 0): "sm_80",
     (8, 6): "sm_80",
@@ -92,6 +93,7 @@ ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
     (10, 0): "sm_100a",
     (10, 3): "sm_103a",
     (10, 7): "sm_107a",
+    (12, 0): "sm_120a",
 }
 PREFIX = "cake_qsa_nvfp4"
 
@@ -124,9 +126,9 @@ TILE_TOKENS = 64
 # the SM) and the fused form's capacity per SM, the co-resident build's
 # launch bound: the form rule takes the fused form only below
 # ``DECODE_FUSED_CTAS_PER_SM[arch]`` x the SM count CTAs (``sm_80`` is absent:
-# its calls take the split form alone).  Within the capacity sm_90a always
-# takes the fused form; sm_100a / sm_103a / sm_107a take it under the host's
-# eager rule
+# its calls take the split form alone).  Within the capacity sm_90a and
+# sm_120a always take the fused form; sm_100a / sm_103a take it under the
+# host's eager rule, sm_107a never (the split form on every host)
 # (``cake_backend.select_form``: an aarch64 host, rows <= 4, no capture).  The
 # exporter holds the launch-bound tables to the kernel files and the fused
 # table to its host policy.
@@ -136,6 +138,7 @@ DECODE_THREADS = {
     "sm_100a": 512,
     "sm_103a": 512,
     "sm_107a": 512,
+    "sm_120a": 128,
 }
 DECODE_CTAS_PER_SM = {
     "sm_80": 2,
@@ -143,8 +146,15 @@ DECODE_CTAS_PER_SM = {
     "sm_100a": 1,
     "sm_103a": 1,
     "sm_107a": 1,
+    "sm_120a": 2,
 }
-DECODE_FUSED_CTAS_PER_SM = {"sm_90a": 2, "sm_100a": 1, "sm_103a": 1, "sm_107a": 1}
+DECODE_FUSED_CTAS_PER_SM = {
+    "sm_90a": 2,
+    "sm_100a": 1,
+    "sm_103a": 1,
+    "sm_107a": 1,
+    "sm_120a": 2,
+}
 # The long-stream bound of the ``multi_wave_long`` grid class: the per-CTA tile
 # stream, ``ceil(tiles / splits)``, from which the whole-tile program measured
 # faster than the K-first one above one resident wave; 16 tiles = 1024 selected
@@ -280,7 +290,7 @@ MERGE_PARAMETERS = (
 # with their own block (512 threads) and shared-memory pool.
 MODULES: dict[str, dict[str, Any]] = {
     "decode": {
-        "arches": ["sm_80", "sm_90a"],
+        "arches": ["sm_80", "sm_90a", "sm_120a"],
         "arg_plan": [
             ["buffer", "q"],
             ["buffer", "k_data"],
@@ -325,7 +335,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "rows_kv_heads_splits"},
-        "kernel_symbol": "kernel_cake_qsa_nvfp4_ce0eb22c5279f0671378",
+        "kernel_symbol": "kernel_cake_qsa_nvfp4_f0ae7070812a3e062d6f",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -333,7 +343,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 49792,
             "use_pdl": False,
         },
-        "library": "cake_qsa_nvfp4_ce0eb22c5279f0671378",
+        "library": "cake_qsa_nvfp4_f0ae7070812a3e062d6f",
         "logical": {
             "block_table": "block_table",
             "data_stride_block": "data_stride_block",
@@ -424,7 +434,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "rows_kv_heads_splits"},
-        "kernel_symbol": "kernel_cake_qsa_nvfp4_27ee9c3b4b04fb0a1cb3",
+        "kernel_symbol": "kernel_cake_qsa_nvfp4_ecb46ae2b040daa1c35d",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -432,7 +442,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 49792,
             "use_pdl": False,
         },
-        "library": "cake_qsa_nvfp4_27ee9c3b4b04fb0a1cb3",
+        "library": "cake_qsa_nvfp4_ecb46ae2b040daa1c35d",
         "logical": {
             "block_table": "block_table",
             "data_stride_block": "data_stride_block",
@@ -483,7 +493,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "workspace_rule": {"kind": "split_partials"},
     },
     "decode_coop": {
-        "arches": ["sm_80", "sm_90a"],
+        "arches": ["sm_80", "sm_90a", "sm_120a"],
         "arg_plan": [
             ["buffer", "q"],
             ["buffer", "k_data"],
@@ -528,7 +538,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "rows_kv_heads_splits"},
-        "kernel_symbol": "kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8",
+        "kernel_symbol": "kernel_cake_qsa_nvfp4_4f13e4710a51ac27ff6f",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -536,7 +546,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 49792,
             "use_pdl": False,
         },
-        "library": "cake_qsa_nvfp4_69a1ca68c5e159455bc8",
+        "library": "cake_qsa_nvfp4_4f13e4710a51ac27ff6f",
         "logical": {
             "block_table": "block_table",
             "data_stride_block": "data_stride_block",
@@ -780,7 +790,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "workspace_rule": {"kind": "fused_partials_counters"},
     },
     "merge": {
-        "arches": ["sm_80", "sm_90a", "sm_100a", "sm_103a", "sm_107a"],
+        "arches": ["sm_80", "sm_90a", "sm_100a", "sm_103a", "sm_107a", "sm_120a"],
         "arg_plan": [
             ["buffer", "partial_out"],
             ["buffer", "partial_lse"],
@@ -796,7 +806,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "rows_head_groups", "warps": 4},
-        "kernel_symbol": "kernel_cake_qsa_nvfp4_6a7c3a5082657fdef802",
+        "kernel_symbol": "kernel_cake_qsa_nvfp4_aa2349948b0a711974f9",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -804,7 +814,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_qsa_nvfp4_6a7c3a5082657fdef802",
+        "library": "cake_qsa_nvfp4_aa2349948b0a711974f9",
         "logical": {
             "gate": "gate",
             "num_qo_heads": "num_qo_heads",
