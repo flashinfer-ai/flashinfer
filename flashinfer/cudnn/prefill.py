@@ -132,6 +132,7 @@ def _cudnn_single_token_gqa_ragged_stats_broken() -> bool:
     return cudnn.backend_version() < 92700
 
 
+@functools.cache
 def _cudnn_version_supports_shape_override() -> bool:
     """SDPA shape override needs the unified engine's support (cuDNN 9.22+) and a
     cudnn-frontend whose pygraph takes is_override_shape_enabled (1.29+)."""
@@ -249,8 +250,8 @@ def _get_dummy_scale_tensor(device: torch.device):
     return t
 
 
-def _create_cudnn_handle(stream: torch.cuda.Stream):
-    return get_cudnn_attention_handle(cudnn, stream)
+def _create_cudnn_handle(stream=None, *, device=None):
+    return get_cudnn_attention_handle(cudnn, stream, device=device)
 
 
 # Tensor ids
@@ -1786,10 +1787,7 @@ class CudnnPrefillGraph:
         lse_base,
         tensor_uids=None,
     ):
-        device = q.device
-        handle = _create_cudnn_handle(
-            torch.cuda.current_stream(device.index if device.type == "cuda" else device)
-        )
+        handle = _create_cudnn_handle(device=q.device)
         if tensor_uids is None:
             self.graph.execute(
                 var_map, workspace=workspace_buffer, handle=handle, **execute_kwargs

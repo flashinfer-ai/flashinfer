@@ -18,20 +18,21 @@ Standalone-import tests of the Cake MoE grouped GEMM package.
 A copy of ``flashinfer/experimental/cake_moe_grouped_gemm`` must import and
 reach its host-side checks on its own: under another top-level name, in a
 ``python -I`` subprocess with ``flashinfer`` blocked (the form of a vendoring
-gate).  Inside FlashInfer the package must bind FlashInfer's own
-experimental-API helpers, and the stand-ins it falls back to must match them
-word for word.  CPU-only: no GPU, no generated program and no JIT build is
+gate).  The package imports only itself, ``torch`` and ``tvm_ffi``; the
+experimental-API marking and the once-only warnings belong to the core entry
+points of ``flashinfer.grouped_mm`` (covered by
+``test_cake_moe_grouped_gemm_api.py``), so a direct call of the package emits
+no warning, and the only ``flashinfer`` import is the JIT fallback of
+``cake_build.py``.  CPU-only: no GPU, no generated program and no JIT build is
 needed, so every test here runs on every lane.
 """
 
 import ast
-import inspect
 import os
 import shutil
 import site
 import subprocess
 import sys
-import warnings
 from pathlib import Path
 
 import pytest
@@ -39,67 +40,10 @@ import torch
 
 tvm_ffi = pytest.importorskip("tvm_ffi")  # cake_backend imports it at module level
 
-import flashinfer.api_logging as api_logging
 import flashinfer.experimental.cake_moe_grouped_gemm as pkg
-from flashinfer.experimental.cake_moe_grouped_gemm import _experimental as ex
-from flashinfer.experimental.cake_moe_grouped_gemm import cake_backend as cb
 
 PACKAGE_DIR = Path(pkg.__file__).resolve().parent
 VENDORED_NAME = "vendored_grouped_gemm"  # the copy's top-level name in the subprocess
-API_NAMES = (
-    "grouped_gemm_fwd",
-    "grouped_gemm_dgrad",
-    "grouped_gemm_wgrad",
-    "cake_grouped_mm",
-)
-
-
-def _f32(*shape):
-    return torch.zeros(*shape, dtype=torch.float32)
-
-
-def _host_args(name):
-    """float32 CPU operands for API ``name``.
-
-    The bfloat16 check is the first host-side check of every entry point, so
-    the call raises ``ValueError`` before any device access.
-    """
-    offs = torch.tensor([2, 4], dtype=torch.int32)
-    rows, w_nk = _f32(4, 64), _f32(2, 256, 64)
-    return {
-        "grouped_gemm_fwd": (rows, w_nk, offs),
-        "grouped_gemm_dgrad": (rows, _f32(2, 64, 256), offs),
-        "grouped_gemm_wgrad": (_f32(4, 256), rows, offs),
-        "cake_grouped_mm": (rows, w_nk, offs),
-    }[name]
-
-
-def _emit(fn, *args, **kwargs):
-    return fn(*args, **kwargs)
-
-
-def _recorded(fn, *args, **kwargs):
-    """The one ExperimentalWarning (by category name) of ``fn(*args, **kwargs)``.
-
-    The call goes through one helper frame, so a decorator warning
-    (``stacklevel=2``) is attributed to ``_emit`` and a backend warning
-    (``stacklevel=3``) to this function, whichever helper emitted it.
-    """
-    with warnings.catch_warnings(record=True) as rec:
-        warnings.simplefilter("always")
-        _emit(fn, *args, **kwargs)
-    hits = [w for w in rec if w.category.__name__ == "ExperimentalWarning"]
-    assert len(hits) == 1, [str(w.message) for w in rec]
-    return hits[0]
-
-
-def _experimental_warnings_of(call):
-    """ExperimentalWarnings (by category name) of a ``call()`` raising ValueError."""
-    with warnings.catch_warnings(record=True) as rec:
-        warnings.simplefilter("always")
-        with pytest.raises(ValueError):
-            call()
-    return [w for w in rec if w.category.__name__ == "ExperimentalWarning"]
 
 
 # ---------------------------------------------------------------------------
@@ -146,19 +90,22 @@ sys.path.insert(0, PKG_ROOT)
 import torch
 
 assert not torch.cuda.is_available()
-warnings.simplefilter("always")
 
 pkg = importlib.import_module(PKG_NAME)
-assert os.path.realpath(pkg.__file__).startswith(os.path.realpath(PKG_ROOT) + os.sep), pkg.__file__
-ex = pkg._experimental
-assert ex.STANDALONE is True
-assert ex.__name__ == PKG_NAME + "._experimental"
-assert issubclass(ex.ExperimentalWarning, UserWarning)
-assert ex.ExperimentalWarning.__name__ == "ExperimentalWarning"
-assert ex.ExperimentalWarning.__module__ == PKG_NAME + "._experimental"
+assert os.path.realpath(pkg.__file__).startswith(
+    os.path.realpath(PKG_ROOT) + os.sep
+), pkg.__file__
 for name in pkg.__all__:  # the lazy re-exports load cake_backend and cake_autograd
     getattr(pkg, name)
 cb = importlib.import_module(PKG_NAME + ".cake_backend")
+for name in (
+    "grouped_gemm_fwd",
+    "grouped_gemm_dgrad",
+    "grouped_gemm_wgrad",
+    "cake_grouped_mm",
+):
+    # plain functions: the experimental marking belongs to the core entry points
+    assert not hasattr(getattr(pkg, name), "is_experimental"), name
 
 
 def f32(*shape):
@@ -166,63 +113,50 @@ def f32(*shape):
 
 
 offs = torch.tensor([2, 4], dtype=torch.int32)
-calls = {
-    "grouped_gemm_fwd": lambda: pkg.grouped_gemm_fwd(f32(4, 64), f32(2, 256, 64), offs),
-    "grouped_gemm_dgrad": lambda: pkg.grouped_gemm_dgrad(f32(4, 64), f32(2, 64, 256), offs),
-    "grouped_gemm_wgrad": lambda: pkg.grouped_gemm_wgrad(f32(4, 256), f32(4, 64), offs),
-    "cake_grouped_mm": lambda: pkg.cake_grouped_mm(f32(4, 64), f32(2, 256, 64), offs),
-}
-
-
-def experimental_warnings(call):
-    with warnings.catch_warnings(record=True) as rec:
-        warnings.simplefilter("always")
-        try:
-            call()
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("float32 operands must be rejected on the host")
-    return [w for w in rec if w.category.__name__ == "ExperimentalWarning"]
-
-
-for name, call in calls.items():
-    fn = getattr(pkg, name)
-    assert fn.is_experimental is True and fn.__wrapped__.is_experimental is True, name
-    assert fn.experimental_feature == "cake_moe_grouped_gemm." + name, name
-    assert fn.__doc__.startswith(".. warning::"), name
-    [w] = experimental_warnings(call)
-    assert w.category is ex.ExperimentalWarning, (name, w.category)
-    assert "'cake_moe_grouped_gemm." + name + "' is an experimental FlashInfer API" in str(w.message), str(w.message)
-    assert w.filename == "<string>", (name, w.filename)  # stacklevel=2: attributed to the caller
-    assert experimental_warnings(call) == [], name  # second call: silent
-
 m_indptr = torch.tensor([0, 2, 4], dtype=torch.int32)
-for i in range(2):
-    hits = experimental_warnings(
-        lambda: cb.grouped_mm_bf16_cake(f32(4, 64), f32(2, 256, 64), m_indptr, out_dtype=torch.float32)
-    )
-    assert len(hits) == (1 if i == 0 else 0), (i, [str(w.message) for w in hits])
-    if hits:
-        assert hits[0].category is ex.ExperimentalWarning, hits[0].category
-        assert "experimental backend 'cake' selected for 'grouped_mm_bf16'" in str(hits[0].message), str(hits[0].message)
-        assert hits[0].filename == "<string>", hits[0].filename  # stacklevel=3: attributed to the stable API's caller
+# float32 operands fail the bfloat16 check of the four package functions; the
+# two grouped_mm_bf16_cake calls fail their out_dtype / tactic checks first.
+# Every call raises ValueError before any device access.
+calls = [
+    lambda: pkg.grouped_gemm_fwd(f32(4, 64), f32(2, 256, 64), offs),
+    lambda: pkg.grouped_gemm_dgrad(f32(4, 64), f32(2, 64, 256), offs),
+    lambda: pkg.grouped_gemm_wgrad(f32(4, 256), f32(4, 64), offs),
+    lambda: pkg.cake_grouped_mm(f32(4, 64), f32(2, 256, 64), offs),
+    lambda: cb.grouped_mm_bf16_cake(
+        f32(4, 64), f32(2, 256, 64), m_indptr, out_dtype=torch.float32
+    ),
+    lambda: cb.grouped_mm_bf16_cake(f32(4, 64), f32(2, 256, 64), m_indptr, tactic=0),
+]
+
+with warnings.catch_warnings(record=True) as rec:
+    warnings.simplefilter("always")
+    for _ in range(2):  # a second round: nothing here warns, not even once
+        for call in calls:
+            try:
+                call()
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("float32 operands must be rejected on the host")
+assert not rec, [f"{w.category.__name__}: {w.message}" for w in rec]
 
 leaked = sorted(
-    k for k in sys.modules if (k == "flashinfer" and sys.modules[k] is not None) or k.startswith("flashinfer.")
+    k
+    for k in sys.modules
+    if (k == "flashinfer" and sys.modules[k] is not None)
+    or k.startswith("flashinfer.")
 )
 assert not leaked, leaked
 print("OK")
 """
 
 
-def test_vendored_copy_imports_and_warns_with_flashinfer_blocked(tmp_path):
+def test_vendored_copy_imports_with_flashinfer_blocked(tmp_path):
     """A copy of the package under another top-level name imports in a ``python -I``
     subprocess with ``flashinfer`` blocked (meta-path finder plus
-    ``sys.modules["flashinfer"] = None``), resolves every ``__all__`` name, binds
-    the stand-ins, warns once per API and once per (API, backend) pair with the
-    stand-in class, raises its host-side ``ValueError``s on CPU operands, and
-    loads no ``flashinfer`` module."""
+    ``sys.modules["flashinfer"] = None``), resolves every ``__all__`` name, raises
+    the host-side ``ValueError`` of every function on CPU operands without emitting
+    a warning of any kind, and loads no ``flashinfer`` module."""
     root = tmp_path / "site"
     shutil.copytree(
         PACKAGE_DIR,
@@ -266,12 +200,13 @@ def _imports_flashinfer(node):
     return False
 
 
-def test_flashinfer_is_named_only_inside_two_importerror_guards():
-    """Every ``flashinfer`` import of the package sits in the body of a ``try`` with
-    an ``except ImportError`` handler, there are exactly two such guards (the
-    helper binding in ``_experimental.py`` and the JIT fallback in
-    ``cake_build.py``), and no import reaches outside the package
-    (``from .. import``)."""
+def test_package_names_flashinfer_only_in_the_jit_fallback():
+    """The package imports nothing from the rest of FlashInfer: no relative import
+    climbs above the package (``from .. import``), every ``flashinfer`` import sits
+    in the body of a ``try`` with an ``except ImportError`` handler, exactly one
+    such guarded block exists -- the JIT fallback in ``cake_build.py`` -- and the
+    package carries no ``_experimental.py`` of its own helpers."""
+    assert not (PACKAGE_DIR / "_experimental.py").exists()
     guards = {}
     for path in sorted(PACKAGE_DIR.glob("*.py")):
         tree = ast.parse(path.read_text(), filename=str(path))
@@ -295,136 +230,5 @@ def test_flashinfer_is_named_only_inside_two_importerror_guards():
                 )
                 guards.setdefault(path.name, set()).add(guarded[node])
     assert {name: len(lines) for name, lines in guards.items()} == {
-        "_experimental.py": 1,
-        "cake_build.py": 1,
+        "cake_build.py": 1
     }, guards
-
-
-# ---------------------------------------------------------------------------
-# In-tree: FlashInfer's helpers are bound, and the stand-ins match them
-# ---------------------------------------------------------------------------
-
-
-def test_in_tree_binds_the_core_helpers(monkeypatch):
-    """Inside FlashInfer the package's helpers are ``flashinfer.api_logging``'s own
-    objects: the four APIs and the stable-API backend warn with FlashInfer's
-    ``ExperimentalWarning`` (so ``pytest.warns`` on that class matches) and the
-    backend pair is remembered in FlashInfer's set."""
-    assert ex.STANDALONE is False
-    assert ex.flashinfer_experimental_api is api_logging.flashinfer_experimental_api
-    assert (
-        ex.warn_experimental_backend_once is api_logging.warn_experimental_backend_once
-    )
-    # The stand-in class exists but nothing in-tree emits it.
-    assert ex.ExperimentalWarning is not api_logging.ExperimentalWarning
-
-    probe = ex.flashinfer_experimental_api(feature="cake_moe_grouped_gemm.probe")(
-        lambda: None
-    )
-    with pytest.warns(api_logging.ExperimentalWarning, match="probe"):
-        probe()
-
-    for name in API_NAMES:
-        fn = getattr(pkg, name)
-        assert fn.is_experimental is True, name
-        assert fn.__wrapped__.is_experimental is True, name
-        assert fn.experimental_feature == f"cake_moe_grouped_gemm.{name}", name
-        assert fn.__doc__.startswith(".. warning::"), name
-        # A fresh wrapper of the real function: its once-only warning is
-        # observable whatever ran earlier in this process.
-        fresh = ex.flashinfer_experimental_api(feature=fn.experimental_feature)(
-            fn.__wrapped__
-        )
-        [w] = _experimental_warnings_of(lambda: fresh(*_host_args(name)))
-        assert w.category is api_logging.ExperimentalWarning, (name, w.category)
-        assert fn.experimental_feature in str(w.message), str(w.message)
-        assert _experimental_warnings_of(lambda: fresh(*_host_args(name))) == [], name
-
-    monkeypatch.setattr(api_logging, "_WARNED_EXPERIMENTAL_BACKENDS", set())
-    m_indptr = torch.tensor([0, 2, 4], dtype=torch.int32)
-    backend_call = lambda: cb.grouped_mm_bf16_cake(
-        _f32(4, 64), _f32(2, 256, 64), m_indptr, out_dtype=torch.float32
-    )
-    [w] = _experimental_warnings_of(backend_call)
-    assert w.category is api_logging.ExperimentalWarning, w.category
-    assert "experimental backend 'cake' selected for 'grouped_mm_bf16'" in str(
-        w.message
-    )
-    assert ("grouped_mm_bf16", "cake") in api_logging._WARNED_EXPERIMENTAL_BACKENDS
-    assert not ex._WARNED_BACKENDS
-    assert _experimental_warnings_of(backend_call) == []
-
-
-def test_stand_ins_match_the_core_helpers(monkeypatch):
-    """The stand-ins reproduce FlashInfer's helpers: the same docstring banner,
-    attributes, signature, warning text, category name and attribution
-    (``stacklevel``), and the same once-only rule.  A wording change in
-    ``flashinfer.api_logging`` fails here until the stand-ins follow."""
-
-    def core_fn(x, *, y=1):
-        """Throwaway."""
-        return (x, y)
-
-    def standin_fn(x, *, y=1):
-        """Throwaway."""
-        return (x, y)
-
-    def raw(x):
-        return x
-
-    core = api_logging.flashinfer_experimental_api(feature="f")(core_fn)
-    standin = ex._standalone_experimental_api(feature="f")(standin_fn)
-    assert core.__doc__ == standin.__doc__
-    assert core.experimental_feature == standin.experimental_feature == "f"
-    assert core.is_experimental is True and standin.is_experimental is True
-    assert core.__wrapped__.is_experimental is True
-    assert standin.__wrapped__.is_experimental is True
-    assert inspect.signature(core) == inspect.signature(standin)
-    # Without feature= both fall back to the function's qualified name.
-    assert (
-        api_logging.flashinfer_experimental_api(raw).experimental_feature
-        == ex._standalone_experimental_api(raw).experimental_feature
-    )
-
-    a, b = _recorded(core, 1, y=2), _recorded(standin, 1, y=2)
-    assert str(a.message) == str(b.message)
-    assert a.category.__name__ == b.category.__name__ == "ExperimentalWarning"
-    assert a.category is api_logging.ExperimentalWarning
-    assert b.category is ex.ExperimentalWarning
-    assert (a.filename, a.lineno) == (b.filename, b.lineno)  # same stacklevel
-    assert Path(a.filename).name == Path(__file__).name
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", api_logging.ExperimentalWarning)
-        warnings.simplefilter("error", ex.ExperimentalWarning)
-        assert core(1) == standin(1) == (1, 1)  # second call: silent
-
-    assert inspect.signature(
-        ex._standalone_warn_backend_once, eval_str=True
-    ) == inspect.signature(api_logging.warn_experimental_backend_once, eval_str=True)
-    monkeypatch.setattr(api_logging, "_WARNED_EXPERIMENTAL_BACKENDS", set())
-    monkeypatch.setattr(ex, "_WARNED_BACKENDS", set())
-    for automatic in (False, True):
-        backend = "auto_backend" if automatic else "backend"
-        a = _recorded(
-            api_logging.warn_experimental_backend_once,
-            "api",
-            backend,
-            automatic=automatic,
-        )
-        b = _recorded(
-            ex._standalone_warn_backend_once, "api", backend, automatic=automatic
-        )
-        assert str(a.message) == str(b.message)
-        assert a.category.__name__ == b.category.__name__ == "ExperimentalWarning"
-        assert a.category is api_logging.ExperimentalWarning
-        assert b.category is ex.ExperimentalWarning
-        assert (a.filename, a.lineno) == (b.filename, b.lineno)  # same stacklevel
-        assert Path(a.filename).name == Path(__file__).name
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", api_logging.ExperimentalWarning)
-        warnings.simplefilter("error", ex.ExperimentalWarning)
-        api_logging.warn_experimental_backend_once("api", "backend")
-        ex._standalone_warn_backend_once("api", "backend")
-    expected = {("api", "backend"), ("api", "auto_backend")}
-    assert expected == api_logging._WARNED_EXPERIMENTAL_BACKENDS
-    assert expected == ex._WARNED_BACKENDS

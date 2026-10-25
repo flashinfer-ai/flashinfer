@@ -22,270 +22,38 @@
 #include "cake_ffi_checks.h"
 
 #include <cstdint>
+#ifndef CAKE_PROGRAM_KERNEL
+#define CAKE_PROGRAM_KERNEL kernel_cake_dsa_h64_train_e29d165e3abca62c430b
+#endif
+#ifndef CAKE_PROGRAM_SHIM
+#define CAKE_PROGRAM_SHIM cake_binding_kernel_cake_dsa_h64_train_e29d165e3abca62c430b
+#endif
+#define CAKE_STR_(x) #x
+#define CAKE_STR(x) CAKE_STR_(x)
 
-extern "C" __global__ void kernel_cake_dsa_h64_train_e29d165e3abca62c430b(const __grid_constant__ CUtensorMap q_latent, const __grid_constant__ CUtensorMap q_rope, const __grid_constant__ CUtensorMap dout, const __grid_constant__ CUtensorMap dq_latent, const __grid_constant__ CUtensorMap dq_rope, const __grid_constant__ CUtensorMap kv_latent, const __grid_constant__ CUtensorMap k_rope, float* __restrict__ lse, float* __restrict__ delta, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ o_lo, int* __restrict__ indices, int* __restrict__ topk_length, float* __restrict__ dkv_f32, float* __restrict__ dkr_f32, int dkv_stride, int dkr_stride, int dkr_col0, int* __restrict__ dkv_dst_map, int dkv_has_map, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int has_topk_length, int token_base, int token_step, float scale_log2, float sm_scale, int pass_lo, int pass_hi, int dq_mode, float* __restrict__ dq_partial, int* __restrict__ key_scratch, int* __restrict__ pass_counts);
+extern "C" __global__ void CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_constant__ CUtensorMap q_rope, const __grid_constant__ CUtensorMap dout, const __grid_constant__ CUtensorMap dq_latent, const __grid_constant__ CUtensorMap dq_rope, const __grid_constant__ CUtensorMap kv_latent, const __grid_constant__ CUtensorMap k_rope, float* __restrict__ lse, float* __restrict__ delta, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ o_lo, int* __restrict__ indices, int* __restrict__ topk_length, float* __restrict__ dkv_f32, float* __restrict__ dkr_f32, int dkv_stride, int dkr_stride, int dkr_col0, int* __restrict__ dkv_dst_map, int dkv_has_map, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int has_topk_length, int token_base, int token_step, float scale_log2, float sm_scale, int pass_lo, int pass_hi, int dq_mode, float* __restrict__ dq_partial, int* __restrict__ key_scratch, int* __restrict__ pass_counts);
 
-namespace cake_binding_kernel_cake_dsa_h64_train_e29d165e3abca62c430b {
+namespace CAKE_PROGRAM_SHIM {
 
 using tvm::ffi::TensorView;
 
-constexpr const char* KERNEL_NAME = "kernel_cake_dsa_h64_train_e29d165e3abca62c430b";
+constexpr const char* KERNEL_NAME = CAKE_STR(CAKE_PROGRAM_KERNEL);
 
-void CheckCuda(cudaError_t status, const char* what) {
-  TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
-      << KERNEL_NAME << ": " << what << " failed: " << cudaGetErrorString(status);
-}
+#include "cake_dsa_h64_train_binding_helpers.h"
 
-void CheckCu(CUresult result, const char* what) {
-  if (result != CUDA_SUCCESS) {
-    const char* name = nullptr;
-    const char* message = nullptr;
-    cuGetErrorName(result, &name);
-    cuGetErrorString(result, &message);
-    TVM_FFI_THROW(RuntimeError) << KERNEL_NAME << ": " << what << " failed with "
-                                << (name ? name : "an unknown CUresult") << " (" << static_cast<int>(result)
-                                << "): " << (message ? message : "");
-  }
-}
+#include "cake_dsa_h64_train_binding_tma_q_latent.h"
 
-void* DataPtr(const TensorView& t) { return static_cast<char*>(t.data_ptr()) + t.byte_offset(); }
+#include "cake_dsa_h64_train_binding_tma_q_rope.h"
 
-void CheckUnitInnerStride(const TensorView& t, const char* name) {
-  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
-      << KERNEL_NAME << ": '" << name << "' needs a unit innermost stride, got " << t.stride(-1);
-}
+#include "cake_dsa_h64_train_binding_tma_dout.h"
 
-// The product of the extents above the trailing `trailing` dims.
-int64_t NumelAbove(const TensorView& t, int trailing) {
-  int64_t product = 1;
-  for (int axis = 0; axis < t.ndim() - trailing; ++axis) product *= t.size(axis);
-  return product;
-}
+#include "cake_dsa_h64_train_binding_tma_dq_latent.h"
 
-int64_t NonZero(int64_t divisor) {
-  TVM_FFI_CHECK(divisor != 0, ValueError) << KERNEL_NAME << ": a descriptor formula divides by zero";
-  return divisor;
-}
+#include "cake_dsa_h64_train_binding_tma_dq_rope.h"
 
-int64_t CDiv(int64_t a, int64_t b) { return a / NonZero(b); }
+#include "cake_dsa_h64_train_binding_tma_kv_latent.h"
 
-int64_t CMod(int64_t a, int64_t b) { return a % NonZero(b); }
-
-cuuint64_t Extent(int64_t value, const char* descriptor) {
-  TVM_FFI_CHECK(value > 0, ValueError)
-      << KERNEL_NAME << ": an extent of descriptor '" << descriptor << "' resolves to " << value;
-  return static_cast<cuuint64_t>(value);
-}
-
-cuuint64_t Stride(int64_t value, const char* descriptor) {
-  TVM_FFI_CHECK(value >= 0, ValueError)
-      << KERNEL_NAME << ": a stride of descriptor '" << descriptor << "' resolves to " << value;
-  return static_cast<cuuint64_t>(value);
-}
-
-CUtensorMap EncodeTma_q_latent(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() >= 3, ValueError)
-      << KERNEL_NAME << ": descriptor 'q_latent' takes a source of at least 3 dims, got " << t.ndim();
-  CheckUnitInnerStride(t, "q_latent");
-  int64_t d1 = t.size(-1);
-  int64_t d2 = t.size(-2);
-  int64_t d3 = t.size(-3);
-  int64_t s2 = t.stride(-2) * 2;
-  int64_t s3 = t.stride(-3) * 2;
-  TVM_FFI_CHECK((CMod(d1, 64) == 0), ValueError)
-      << KERNEL_NAME << ": descriptor 'q_latent' requires (CMod(d1, 64) == 0)";
-  cuuint64_t global_dim[4] = {Extent(64, "q_latent"), Extent(d2, "q_latent"), Extent(CDiv(d1, 64), "q_latent"), Extent(d3, "q_latent")};
-  cuuint64_t global_strides[3] = {Stride(s2, "q_latent"), Stride(128, "q_latent"), Stride(s3, "q_latent")};
-  cuuint32_t box_dim[4] = {64u, 64u, 1u, 1u};
-  cuuint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2] && box_dim[3] <= global_dim[3], ValueError)
-      << KERNEL_NAME << ": the box of descriptor 'q_latent' exceeds its source extents";
-  TVM_FFI_CHECK(global_strides[0] % 16 == 0 && global_strides[1] % 16 == 0 && global_strides[2] % 16 == 0, ValueError)
-      << KERNEL_NAME << ": the strides of descriptor 'q_latent' must be multiples of 16 bytes";
-  void* address = DataPtr(t);
-  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(address) % 16 == 0, ValueError)
-      << KERNEL_NAME << ": the address of descriptor 'q_latent' must be 16-byte aligned";
-  CUtensorMap map{};
-  CheckCu(cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, address, global_dim, global_strides,
-                                 box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
-                                 CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
-          "cuTensorMapEncodeTiled of q_latent");
-  return map;
-}
-
-CUtensorMap EncodeTma_q_rope(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() >= 3, ValueError)
-      << KERNEL_NAME << ": descriptor 'q_rope' takes a source of at least 3 dims, got " << t.ndim();
-  CheckUnitInnerStride(t, "q_rope");
-  int64_t d1 = t.size(-1);
-  int64_t d2 = t.size(-2);
-  int64_t d3 = t.size(-3);
-  int64_t s2 = t.stride(-2) * 2;
-  int64_t s3 = t.stride(-3) * 2;
-  TVM_FFI_CHECK((CMod(d1, 64) == 0), ValueError)
-      << KERNEL_NAME << ": descriptor 'q_rope' requires (CMod(d1, 64) == 0)";
-  cuuint64_t global_dim[4] = {Extent(64, "q_rope"), Extent(d2, "q_rope"), Extent(CDiv(d1, 64), "q_rope"), Extent(d3, "q_rope")};
-  cuuint64_t global_strides[3] = {Stride(s2, "q_rope"), Stride(128, "q_rope"), Stride(s3, "q_rope")};
-  cuuint32_t box_dim[4] = {64u, 64u, 1u, 1u};
-  cuuint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2] && box_dim[3] <= global_dim[3], ValueError)
-      << KERNEL_NAME << ": the box of descriptor 'q_rope' exceeds its source extents";
-  TVM_FFI_CHECK(global_strides[0] % 16 == 0 && global_strides[1] % 16 == 0 && global_strides[2] % 16 == 0, ValueError)
-      << KERNEL_NAME << ": the strides of descriptor 'q_rope' must be multiples of 16 bytes";
-  void* address = DataPtr(t);
-  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(address) % 16 == 0, ValueError)
-      << KERNEL_NAME << ": the address of descriptor 'q_rope' must be 16-byte aligned";
-  CUtensorMap map{};
-  CheckCu(cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, address, global_dim, global_strides,
-                                 box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
-                                 CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
-          "cuTensorMapEncodeTiled of q_rope");
-  return map;
-}
-
-CUtensorMap EncodeTma_dout(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() >= 3, ValueError)
-      << KERNEL_NAME << ": descriptor 'dout' takes a source of at least 3 dims, got " << t.ndim();
-  CheckUnitInnerStride(t, "dout");
-  int64_t d1 = t.size(-1);
-  int64_t d2 = t.size(-2);
-  int64_t d3 = t.size(-3);
-  int64_t s2 = t.stride(-2) * 2;
-  int64_t s3 = t.stride(-3) * 2;
-  TVM_FFI_CHECK((CMod(d1, 64) == 0), ValueError)
-      << KERNEL_NAME << ": descriptor 'dout' requires (CMod(d1, 64) == 0)";
-  cuuint64_t global_dim[4] = {Extent(64, "dout"), Extent(d2, "dout"), Extent(CDiv(d1, 64), "dout"), Extent(d3, "dout")};
-  cuuint64_t global_strides[3] = {Stride(s2, "dout"), Stride(128, "dout"), Stride(s3, "dout")};
-  cuuint32_t box_dim[4] = {64u, 64u, 1u, 1u};
-  cuuint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2] && box_dim[3] <= global_dim[3], ValueError)
-      << KERNEL_NAME << ": the box of descriptor 'dout' exceeds its source extents";
-  TVM_FFI_CHECK(global_strides[0] % 16 == 0 && global_strides[1] % 16 == 0 && global_strides[2] % 16 == 0, ValueError)
-      << KERNEL_NAME << ": the strides of descriptor 'dout' must be multiples of 16 bytes";
-  void* address = DataPtr(t);
-  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(address) % 16 == 0, ValueError)
-      << KERNEL_NAME << ": the address of descriptor 'dout' must be 16-byte aligned";
-  CUtensorMap map{};
-  CheckCu(cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, address, global_dim, global_strides,
-                                 box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
-                                 CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
-          "cuTensorMapEncodeTiled of dout");
-  return map;
-}
-
-CUtensorMap EncodeTma_dq_latent(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() >= 3, ValueError)
-      << KERNEL_NAME << ": descriptor 'dq_latent' takes a source of at least 3 dims, got " << t.ndim();
-  CheckUnitInnerStride(t, "dq_latent");
-  int64_t d1 = t.size(-1);
-  int64_t d2 = t.size(-2);
-  int64_t d3 = t.size(-3);
-  int64_t s2 = t.stride(-2) * 2;
-  int64_t s3 = t.stride(-3) * 2;
-  TVM_FFI_CHECK((CMod(d1, 64) == 0), ValueError)
-      << KERNEL_NAME << ": descriptor 'dq_latent' requires (CMod(d1, 64) == 0)";
-  cuuint64_t global_dim[4] = {Extent(64, "dq_latent"), Extent(d2, "dq_latent"), Extent(CDiv(d1, 64), "dq_latent"), Extent(d3, "dq_latent")};
-  cuuint64_t global_strides[3] = {Stride(s2, "dq_latent"), Stride(128, "dq_latent"), Stride(s3, "dq_latent")};
-  cuuint32_t box_dim[4] = {64u, 64u, 1u, 1u};
-  cuuint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2] && box_dim[3] <= global_dim[3], ValueError)
-      << KERNEL_NAME << ": the box of descriptor 'dq_latent' exceeds its source extents";
-  TVM_FFI_CHECK(global_strides[0] % 16 == 0 && global_strides[1] % 16 == 0 && global_strides[2] % 16 == 0, ValueError)
-      << KERNEL_NAME << ": the strides of descriptor 'dq_latent' must be multiples of 16 bytes";
-  void* address = DataPtr(t);
-  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(address) % 16 == 0, ValueError)
-      << KERNEL_NAME << ": the address of descriptor 'dq_latent' must be 16-byte aligned";
-  CUtensorMap map{};
-  CheckCu(cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, address, global_dim, global_strides,
-                                 box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
-                                 CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
-          "cuTensorMapEncodeTiled of dq_latent");
-  return map;
-}
-
-CUtensorMap EncodeTma_dq_rope(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() >= 3, ValueError)
-      << KERNEL_NAME << ": descriptor 'dq_rope' takes a source of at least 3 dims, got " << t.ndim();
-  CheckUnitInnerStride(t, "dq_rope");
-  int64_t d1 = t.size(-1);
-  int64_t d2 = t.size(-2);
-  int64_t d3 = t.size(-3);
-  int64_t s2 = t.stride(-2) * 2;
-  int64_t s3 = t.stride(-3) * 2;
-  TVM_FFI_CHECK((CMod(d1, 64) == 0), ValueError)
-      << KERNEL_NAME << ": descriptor 'dq_rope' requires (CMod(d1, 64) == 0)";
-  cuuint64_t global_dim[4] = {Extent(64, "dq_rope"), Extent(d2, "dq_rope"), Extent(CDiv(d1, 64), "dq_rope"), Extent(d3, "dq_rope")};
-  cuuint64_t global_strides[3] = {Stride(s2, "dq_rope"), Stride(128, "dq_rope"), Stride(s3, "dq_rope")};
-  cuuint32_t box_dim[4] = {64u, 64u, 1u, 1u};
-  cuuint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2] && box_dim[3] <= global_dim[3], ValueError)
-      << KERNEL_NAME << ": the box of descriptor 'dq_rope' exceeds its source extents";
-  TVM_FFI_CHECK(global_strides[0] % 16 == 0 && global_strides[1] % 16 == 0 && global_strides[2] % 16 == 0, ValueError)
-      << KERNEL_NAME << ": the strides of descriptor 'dq_rope' must be multiples of 16 bytes";
-  void* address = DataPtr(t);
-  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(address) % 16 == 0, ValueError)
-      << KERNEL_NAME << ": the address of descriptor 'dq_rope' must be 16-byte aligned";
-  CUtensorMap map{};
-  CheckCu(cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, address, global_dim, global_strides,
-                                 box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
-                                 CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
-          "cuTensorMapEncodeTiled of dq_rope");
-  return map;
-}
-
-CUtensorMap EncodeTma_kv_latent(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
-      << KERNEL_NAME << ": descriptor 'kv_latent' takes a source of at least 2 dims, got " << t.ndim();
-  CheckUnitInnerStride(t, "kv_latent");
-  int64_t d1 = t.size(-1);
-  int64_t outer1 = NumelAbove(t, 1);
-  check_dense_leading_dims(t, 1, "kv_latent");
-  int64_t s2 = t.stride(-2) * 2;
-  cuuint64_t global_dim[2] = {Extent(d1, "kv_latent"), Extent(outer1, "kv_latent")};
-  cuuint64_t global_strides[1] = {Stride(s2, "kv_latent")};
-  cuuint32_t box_dim[2] = {64u, 1u};
-  cuuint32_t elem_strides[2] = {1u, 1u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1], ValueError)
-      << KERNEL_NAME << ": the box of descriptor 'kv_latent' exceeds its source extents";
-  TVM_FFI_CHECK(global_strides[0] % 16 == 0, ValueError)
-      << KERNEL_NAME << ": the strides of descriptor 'kv_latent' must be multiples of 16 bytes";
-  void* address = DataPtr(t);
-  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(address) % 16 == 0, ValueError)
-      << KERNEL_NAME << ": the address of descriptor 'kv_latent' must be 16-byte aligned";
-  CUtensorMap map{};
-  CheckCu(cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, address, global_dim, global_strides,
-                                 box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
-                                 CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
-          "cuTensorMapEncodeTiled of kv_latent");
-  return map;
-}
-
-CUtensorMap EncodeTma_k_rope(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
-      << KERNEL_NAME << ": descriptor 'k_rope' takes a source of at least 2 dims, got " << t.ndim();
-  CheckUnitInnerStride(t, "k_rope");
-  int64_t d1 = t.size(-1);
-  int64_t outer1 = NumelAbove(t, 1);
-  check_dense_leading_dims(t, 1, "k_rope");
-  int64_t s2 = t.stride(-2) * 2;
-  cuuint64_t global_dim[2] = {Extent(d1, "k_rope"), Extent(outer1, "k_rope")};
-  cuuint64_t global_strides[1] = {Stride(s2, "k_rope")};
-  cuuint32_t box_dim[2] = {64u, 1u};
-  cuuint32_t elem_strides[2] = {1u, 1u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1], ValueError)
-      << KERNEL_NAME << ": the box of descriptor 'k_rope' exceeds its source extents";
-  TVM_FFI_CHECK(global_strides[0] % 16 == 0, ValueError)
-      << KERNEL_NAME << ": the strides of descriptor 'k_rope' must be multiples of 16 bytes";
-  void* address = DataPtr(t);
-  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(address) % 16 == 0, ValueError)
-      << KERNEL_NAME << ": the address of descriptor 'k_rope' must be 16-byte aligned";
-  CUtensorMap map{};
-  CheckCu(cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, address, global_dim, global_strides,
-                                 box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
-                                 CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
-          "cuTensorMapEncodeTiled of k_rope");
-  return map;
-}
+#include "cake_dsa_h64_train_binding_tma_k_rope.h"
 
 void Run(TensorView a_q_latent, TensorView a_q_rope, TensorView a_dout, TensorView a_dq_latent, TensorView a_dq_rope, TensorView a_kv_latent, TensorView a_k_rope, TensorView a_lse, TensorView a_delta, TensorView a_out, TensorView a_o_lo, TensorView a_indices, TensorView a_topk_length, TensorView a_dkv_f32, TensorView a_dkr_f32, int64_t a_dkv_stride, int64_t a_dkr_stride, int64_t a_dkr_col0, TensorView a_dkv_dst_map, int64_t a_dkv_has_map, int64_t a_num_queries, int64_t a_num_kv, int64_t a_topk, int64_t a_idx_stride, int64_t a_indices_offset, int64_t a_has_topk_length, int64_t a_token_base, int64_t a_token_step, double a_scale_log2, double a_sm_scale, int64_t a_pass_lo, int64_t a_pass_hi, int64_t a_dq_mode, TensorView a_dq_partial, TensorView a_key_scratch, TensorView a_pass_counts, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_q_latent.device();
@@ -413,7 +181,7 @@ void Run(TensorView a_q_latent, TensorView a_q_rope, TensorView a_dout, TensorVi
     const uint64_t device_bit = dev.device_id < 64 ? uint64_t{1} << dev.device_id : uint64_t{0};
     if (device_bit == 0 || (prepared_devices & device_bit) == 0) {
       CheckCuda(cudaSetDevice(dev.device_id), "cudaSetDevice");
-      CheckCuda(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_cake_dsa_h64_train_e29d165e3abca62c430b), cudaFuncAttributeMaxDynamicSharedMemorySize, 231680), "cudaFuncSetAttribute");
+      CheckCuda(cudaFuncSetAttribute(reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL), cudaFuncAttributeMaxDynamicSharedMemorySize, 231680), "cudaFuncSetAttribute");
       prepared_devices |= device_bit;
     }
   }
@@ -459,11 +227,11 @@ void Run(TensorView a_q_latent, TensorView a_q_rope, TensorView a_dout, TensorVi
   config.blockDim = dim3(640, 1, 1);
   config.dynamicSmemBytes = 231680;
   config.stream = stream;
-  CheckCuda(cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_dsa_h64_train_e29d165e3abca62c430b), kernel_args),
+  CheckCuda(cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL), kernel_args),
             "cudaLaunchKernelExC");
 }
 
 }  // namespace cake_binding_kernel_cake_dsa_h64_train_e29d165e3abca62c430b
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_binding_kernel_cake_dsa_h64_train_e29d165e3abca62c430b::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, CAKE_PROGRAM_SHIM::Run);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(build_cuda_version, cake_ffi_build_cuda_version);

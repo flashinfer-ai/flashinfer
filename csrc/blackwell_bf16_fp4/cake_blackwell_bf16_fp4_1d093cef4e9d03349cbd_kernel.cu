@@ -14,26 +14,47 @@
  * limitations under the License.
  */
 
-// Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
-#include "cake_blackwell_bf16_fp4_device_common.cuh"
+typedef signed char        int8_t;
+typedef unsigned char      uint8_t;
+typedef unsigned short     uint16_t;
+typedef unsigned int       uint32_t;
+#if defined(__CUDACC_RTC__)
+typedef unsigned long long uint64_t;
+#else
+typedef unsigned long      uint64_t;
+#endif
+static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
+typedef signed int         int32_t;
+typedef short int          int16_t;
+struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
+static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
+static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+
+#if defined(__CUDACC_RTC__)
+typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
+#else
+#include <cuda.h>
+#endif
+
+static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+
+__device__ __forceinline__ int make_warp_uniform(int x) {
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
+}
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_SMK_A_OFF 1024
 #define SMEM_SMK_A_STAGE_BYTES 8192
 #define SMEM_SMK_A_STRIDE 11264
-#define SMEM_SMK_B0_OFF 9216
-#define SMEM_SMK_B0_STAGE_BYTES 512
-#define SMEM_SMK_B0_STRIDE 11264
-#define SMEM_SMK_B1_OFF 9728
-#define SMEM_SMK_B1_STAGE_BYTES 512
-#define SMEM_SMK_B1_STRIDE 11264
-#define SMEM_SMK_B2_OFF 10240
-#define SMEM_SMK_B2_STAGE_BYTES 512
-#define SMEM_SMK_B2_STRIDE 11264
-#define SMEM_SMK_B3_OFF 10752
-#define SMEM_SMK_B3_STAGE_BYTES 512
-#define SMEM_SMK_B3_STRIDE 11264
+#define SMEM_SMK_B_OFF 9216
+#define SMEM_SMK_B_STAGE_BYTES 2048
+#define SMEM_SMK_B_STRIDE 11264
 #define SMEM_SMK_SF_OFF 11264
 #define SMEM_SMK_SF_STAGE_BYTES 256
 #define SMEM_SMK_SF_STRIDE 11264
@@ -45,9 +66,80 @@
 #define HAS_ALPHA 1
 #define ENABLE_PDL 1
 
+__device__ __forceinline__ uint32_t cvt_bf16x2_e4m3x2(uint16_t src) {
+    uint32_t dst;
+#if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(dst) : "h"(src));
+#else
+    uint32_t _f16x2;
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2) : "h"(src));
+    uint16_t _h0 = (uint16_t)(_f16x2 & 0xFFFFu);
+    uint16_t _h1 = (uint16_t)((_f16x2 >> 16) & 0xFFFFu);
+    float _f0;
+    float _f1;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(_f0) : "h"(_h0));
+    asm("cvt.f32.f16 %0, %1;" : "=f"(_f1) : "h"(_h1));
+    asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(dst) : "f"(_f1), "f"(_f0));
+#endif
+    return dst;
+}
+
+#include <math_constants.h>
+
+__device__ __forceinline__ uint32_t elect_sync() {
+    uint32_t pred = 0;
+    asm volatile(
+        "{\n\t"
+        ".reg .pred %%px;\n\t"
+        "elect.sync _|%%px, %1;\n\t"
+        "@%%px mov.s32 %0, 1;\n\t"
+        "}\n"
+        : "+r"(pred)
+        : "r"(0xFFFFFFFF));
+    return pred;
+}
+
+
+__device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+        :: "r"(mbar_addr), "r"(count) : "memory");
+}
+
+
+
+// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
+// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
+// explicit loop still makes this helper blocking until acquire succeeds.
+__device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "LAB_WAIT:\n\t"
+        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
+        " P1, [%0], %1;\n\t"
+        "@P1 bra.uni DONE;\n\t"
+        "bra.uni LAB_WAIT;\n\t"
+        "DONE:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase) : "memory");
+}
+
+
+
+__device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
+    asm volatile(
+        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+        :: "r"(mbar_addr), "r"(bytes) : "memory");
+}
+
+
+
+
+
+
 extern "C" {
 
-__global__ __launch_bounds__(THREADS) void
+__global__ __launch_bounds__(256) void
 kernel_cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap B_descale, float* __restrict__ alpha, __half* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
@@ -72,20 +164,14 @@ kernel_cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd(const __grid_constant__ CUte
     const int cta_rank = 0;
 
     // Kernel setup ops
-    __nv_bfloat16* smk_a = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMK_A_OFF);
-    const int smk_a_addr = smem + SMEM_SMK_A_OFF;
-    uint8_t* smk_b0 = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMK_B0_OFF);
-    const int smk_b0_addr = smem + SMEM_SMK_B0_OFF;
-    uint8_t* smk_b1 = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMK_B1_OFF);
-    const int smk_b1_addr = smem + SMEM_SMK_B1_OFF;
-    uint8_t* smk_b2 = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMK_B2_OFF);
-    const int smk_b2_addr = smem + SMEM_SMK_B2_OFF;
-    uint8_t* smk_b3 = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMK_B3_OFF);
-    const int smk_b3_addr = smem + SMEM_SMK_B3_OFF;
-    uint8_t* smk_sf = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMK_SF_OFF);
-    const int smk_sf_addr = smem + SMEM_SMK_SF_OFF;
-    float* smk_part = reinterpret_cast<float*>(smem_raw + SMEM_SMK_PART_OFF);
-    const int smk_part_addr = smem + SMEM_SMK_PART_OFF;
+    __nv_bfloat16* smk_a = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
+    const int smk_a_addr = smem + 1024;
+    uint8_t* smk_b = reinterpret_cast<uint8_t*>(smem_raw + 9216);
+    const int smk_b_addr = smem + 9216;
+    uint8_t* smk_sf = reinterpret_cast<uint8_t*>(smem_raw + 11264);
+    const int smk_sf_addr = smem + 11264;
+    float* smk_part = reinterpret_cast<float*>(smem_raw + 46080);
+    const int smk_part_addr = smem + 46080;
 
     // Mbarrier init (1 pipeline groups, 0 ordered-sequence groups, 4 barriers)
     // Mbarriers at smem_raw[0..32)
@@ -104,7 +190,7 @@ kernel_cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd(const __grid_constant__ CUte
 
     __syncthreads();
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int off_n = blockIdx.x * 16;
     if (warp == 0) {
         if (elect_sync()) {
@@ -112,22 +198,22 @@ kernel_cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd(const __grid_constant__ CUte
             asm volatile(
                 "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1, {%2, %3}], [%4], %5;"
-                :: "r"(smk_b0_addr), "l"((&B)), "r"(0), "r"(off_n),
+                :: "r"(smk_b_addr), "l"((&B)), "r"(0), "r"(off_n),
                    "r"(full_addr), "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1, {%2, %3}], [%4], %5;"
-                :: "r"(smk_b1_addr), "l"((&B)), "r"(32), "r"(off_n),
+                :: "r"(smk_b_addr + 512), "l"((&B)), "r"(32), "r"(off_n),
                    "r"(full_addr), "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1, {%2, %3}], [%4], %5;"
-                :: "r"(smk_b2_addr), "l"((&B)), "r"(64), "r"(off_n),
+                :: "r"(smk_b_addr + 1024), "l"((&B)), "r"(64), "r"(off_n),
                    "r"(full_addr), "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1, {%2, %3}], [%4], %5;"
-                :: "r"(smk_b3_addr), "l"((&B)), "r"(96), "r"(off_n),
+                :: "r"(smk_b_addr + 1536), "l"((&B)), "r"(96), "r"(off_n),
                    "r"(full_addr), "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
@@ -138,22 +224,22 @@ kernel_cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd(const __grid_constant__ CUte
             asm volatile(
                 "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1, {%2, %3}], [%4], %5;"
-                :: "r"(smk_b0_addr + 11264), "l"((&B)), "r"(128), "r"(off_n),
+                :: "r"(smk_b_addr + 11264), "l"((&B)), "r"(128), "r"(off_n),
                    "r"(full_addr + 8), "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1, {%2, %3}], [%4], %5;"
-                :: "r"(smk_b1_addr + 11264), "l"((&B)), "r"(160), "r"(off_n),
+                :: "r"(smk_b_addr + 11264 + 512), "l"((&B)), "r"(160), "r"(off_n),
                    "r"(full_addr + 8), "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1, {%2, %3}], [%4], %5;"
-                :: "r"(smk_b2_addr + 11264), "l"((&B)), "r"(192), "r"(off_n),
+                :: "r"(smk_b_addr + 11264 + 1024), "l"((&B)), "r"(192), "r"(off_n),
                    "r"(full_addr + 8), "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1, {%2, %3}], [%4], %5;"
-                :: "r"(smk_b3_addr + 11264), "l"((&B)), "r"(224), "r"(off_n),
+                :: "r"(smk_b_addr + 11264 + 1536), "l"((&B)), "r"(224), "r"(off_n),
                    "r"(full_addr + 8), "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
@@ -164,22 +250,22 @@ kernel_cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd(const __grid_constant__ CUte
             asm volatile(
                 "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1, {%2, %3}], [%4], %5;"
-                :: "r"(smk_b0_addr + 22528), "l"((&B)), "r"(256), "r"(off_n),
+                :: "r"(smk_b_addr + 22528), "l"((&B)), "r"(256), "r"(off_n),
                    "r"(full_addr + 16), "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1, {%2, %3}], [%4], %5;"
-                :: "r"(smk_b1_addr + 22528), "l"((&B)), "r"(288), "r"(off_n),
+                :: "r"(smk_b_addr + 22528 + 512), "l"((&B)), "r"(288), "r"(off_n),
                    "r"(full_addr + 16), "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1, {%2, %3}], [%4], %5;"
-                :: "r"(smk_b2_addr + 22528), "l"((&B)), "r"(320), "r"(off_n),
+                :: "r"(smk_b_addr + 22528 + 1024), "l"((&B)), "r"(320), "r"(off_n),
                    "r"(full_addr + 16), "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1, {%2, %3}], [%4], %5;"
-                :: "r"(smk_b3_addr + 22528), "l"((&B)), "r"(352), "r"(off_n),
+                :: "r"(smk_b_addr + 22528 + 1536), "l"((&B)), "r"(352), "r"(off_n),
                    "r"(full_addr + 16), "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
@@ -190,22 +276,22 @@ kernel_cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd(const __grid_constant__ CUte
             asm volatile(
                 "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1, {%2, %3}], [%4], %5;"
-                :: "r"(smk_b0_addr + 33792), "l"((&B)), "r"(384), "r"(off_n),
+                :: "r"(smk_b_addr + 33792), "l"((&B)), "r"(384), "r"(off_n),
                    "r"(full_addr + 24), "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1, {%2, %3}], [%4], %5;"
-                :: "r"(smk_b1_addr + 33792), "l"((&B)), "r"(416), "r"(off_n),
+                :: "r"(smk_b_addr + 33792 + 512), "l"((&B)), "r"(416), "r"(off_n),
                    "r"(full_addr + 24), "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1, {%2, %3}], [%4], %5;"
-                :: "r"(smk_b2_addr + 33792), "l"((&B)), "r"(448), "r"(off_n),
+                :: "r"(smk_b_addr + 33792 + 1024), "l"((&B)), "r"(448), "r"(off_n),
                    "r"(full_addr + 24), "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1, {%2, %3}], [%4], %5;"
-                :: "r"(smk_b3_addr + 33792), "l"((&B)), "r"(480), "r"(off_n),
+                :: "r"(smk_b_addr + 33792 + 1536), "l"((&B)), "r"(480), "r"(off_n),
                    "r"(full_addr + 24), "l"(0x12F0000000000000ULL) : "memory");
             asm volatile(
                 "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
@@ -291,9 +377,7 @@ kernel_cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd(const __grid_constant__ CUte
     unsigned int yh1[4];
     unsigned int brawh[8];
     unsigned int sfwh[4];
-    unsigned int _phase_full_0 = 0;
-    mbarrier_wait(full_addr, _phase_full_0);
-    _phase_full_0 ^= 1;
+    mbarrier_wait(full_addr, 0);
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
         : "=r"(*reinterpret_cast<uint32_t*>(&xa0[0])), "=r"(*reinterpret_cast<uint32_t*>(&xa0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xa0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xa0[(0) + 3]))
@@ -309,11 +393,9 @@ kernel_cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd(const __grid_constant__ CUte
         : "r"(smk_a_addr + (unsigned int)a_lane1 + 1024));
     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
         : "=r"(*reinterpret_cast<uint32_t*>(&braw[0])), "=r"(*reinterpret_cast<uint32_t*>(&braw[(0) + 1]))
-        : "r"(smk_b0_addr + (unsigned int)b_lane));
+        : "r"(smk_b_addr + (unsigned int)b_lane));
     asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfw[0])) : "r"(smk_sf_addr + (unsigned int)sf_lane));
-    unsigned int _phase_full_1 = 0;
-    mbarrier_wait(full_addr + 8, _phase_full_1);
-    _phase_full_1 ^= 1;
+    mbarrier_wait(full_addr + 8, 0);
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
         : "=r"(*reinterpret_cast<uint32_t*>(&xh0[0])), "=r"(*reinterpret_cast<uint32_t*>(&xh0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xh0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xh0[(0) + 3]))
@@ -329,12 +411,11 @@ kernel_cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd(const __grid_constant__ CUte
         : "r"(smk_a_addr + 11264 + (unsigned int)a_lane1 + 1024));
     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
         : "=r"(*reinterpret_cast<uint32_t*>(&brawh[0])), "=r"(*reinterpret_cast<uint32_t*>(&brawh[(0) + 1]))
-        : "r"(smk_b0_addr + 11264 + (unsigned int)b_lane));
+        : "r"(smk_b_addr + 11264 + (unsigned int)b_lane));
     asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfwh[0])) : "r"(smk_sf_addr + 11264 + (unsigned int)sf_lane));
-    uint32_t _prmt_b32_0;
-    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_b32_0) : "r"(sfw[0]), "r"(sfw[0]), "r"(sf_sel));
-    uint32_t _bf16x2_from_e4m3x2_0 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_b32_0);
-    unsigned int car = _bf16x2_from_e4m3x2_0;
+    uint32_t _prmt_0;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_0) : "r"(sfw[0]), "r"(sfw[0]), "r"(sf_sel));
+    uint32_t car = cvt_bf16x2_e4m3x2((uint16_t)_prmt_0);
     uint32_t _fp4_bf16x8_0[4];
     {
     #if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -409,10 +490,9 @@ kernel_cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd(const __grid_constant__ CUte
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
         : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
         : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag[0]), "r"(b_frag[1]));
-    uint32_t _prmt_b32_1;
-    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_b32_1) : "r"(sfw[0]), "r"(sfw[0]), "r"(sf_sel));
-    uint32_t _bf16x2_from_e4m3x2_1 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_b32_1);
-    unsigned int car_1 = _bf16x2_from_e4m3x2_1;
+    uint32_t _prmt_1;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_1) : "r"(sfw[0]), "r"(sfw[0]), "r"(sf_sel));
+    uint32_t car_1 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_1);
     uint32_t _fp4_bf16x8_1[4];
     {
     #if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -487,9 +567,7 @@ kernel_cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd(const __grid_constant__ CUte
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
         : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
         : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag[0]), "r"(b_frag[1]));
-    unsigned int _phase_full_2 = 0;
-    mbarrier_wait(full_addr + 16, _phase_full_2);
-    _phase_full_2 ^= 1;
+    mbarrier_wait(full_addr + 16, 0);
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
         : "=r"(*reinterpret_cast<uint32_t*>(&xa0[0])), "=r"(*reinterpret_cast<uint32_t*>(&xa0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xa0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xa0[(0) + 3]))
@@ -505,12 +583,11 @@ kernel_cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd(const __grid_constant__ CUte
         : "r"(smk_a_addr + 22528 + (unsigned int)a_lane1 + 1024));
     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
         : "=r"(*reinterpret_cast<uint32_t*>(&braw[0])), "=r"(*reinterpret_cast<uint32_t*>(&braw[(0) + 1]))
-        : "r"(smk_b0_addr + 22528 + (unsigned int)b_lane));
+        : "r"(smk_b_addr + 22528 + (unsigned int)b_lane));
     asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfw[0])) : "r"(smk_sf_addr + 22528 + (unsigned int)sf_lane));
-    uint32_t _prmt_b32_2;
-    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_b32_2) : "r"(sfwh[0]), "r"(sfwh[0]), "r"(sf_sel));
-    uint32_t _bf16x2_from_e4m3x2_2 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_b32_2);
-    unsigned int car_2 = _bf16x2_from_e4m3x2_2;
+    uint32_t _prmt_2;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_2) : "r"(sfwh[0]), "r"(sfwh[0]), "r"(sf_sel));
+    uint32_t car_2 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_2);
     uint32_t _fp4_bf16x8_2[4];
     {
     #if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -585,10 +662,9 @@ kernel_cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd(const __grid_constant__ CUte
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
         : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
         : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag[0]), "r"(b_frag[1]));
-    uint32_t _prmt_b32_3;
-    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_b32_3) : "r"(sfwh[0]), "r"(sfwh[0]), "r"(sf_sel));
-    uint32_t _bf16x2_from_e4m3x2_3 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_b32_3);
-    unsigned int car_3 = _bf16x2_from_e4m3x2_3;
+    uint32_t _prmt_3;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_3) : "r"(sfwh[0]), "r"(sfwh[0]), "r"(sf_sel));
+    uint32_t car_3 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_3);
     uint32_t _fp4_bf16x8_3[4];
     {
     #if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -663,9 +739,7 @@ kernel_cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd(const __grid_constant__ CUte
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
         : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
         : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag[0]), "r"(b_frag[1]));
-    unsigned int _phase_full_3 = 0;
-    mbarrier_wait(full_addr + 24, _phase_full_3);
-    _phase_full_3 ^= 1;
+    mbarrier_wait(full_addr + 24, 0);
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
         : "=r"(*reinterpret_cast<uint32_t*>(&xh0[0])), "=r"(*reinterpret_cast<uint32_t*>(&xh0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xh0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xh0[(0) + 3]))
@@ -681,12 +755,11 @@ kernel_cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd(const __grid_constant__ CUte
         : "r"(smk_a_addr + 33792 + (unsigned int)a_lane1 + 1024));
     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
         : "=r"(*reinterpret_cast<uint32_t*>(&brawh[0])), "=r"(*reinterpret_cast<uint32_t*>(&brawh[(0) + 1]))
-        : "r"(smk_b0_addr + 33792 + (unsigned int)b_lane));
+        : "r"(smk_b_addr + 33792 + (unsigned int)b_lane));
     asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfwh[0])) : "r"(smk_sf_addr + 33792 + (unsigned int)sf_lane));
-    uint32_t _prmt_b32_4;
-    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_b32_4) : "r"(sfw[0]), "r"(sfw[0]), "r"(sf_sel));
-    uint32_t _bf16x2_from_e4m3x2_4 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_b32_4);
-    unsigned int car_4 = _bf16x2_from_e4m3x2_4;
+    uint32_t _prmt_4;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_4) : "r"(sfw[0]), "r"(sfw[0]), "r"(sf_sel));
+    uint32_t car_4 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_4);
     uint32_t _fp4_bf16x8_4[4];
     {
     #if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -761,10 +834,9 @@ kernel_cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd(const __grid_constant__ CUte
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
         : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
         : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag[0]), "r"(b_frag[1]));
-    uint32_t _prmt_b32_5;
-    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_b32_5) : "r"(sfw[0]), "r"(sfw[0]), "r"(sf_sel));
-    uint32_t _bf16x2_from_e4m3x2_5 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_b32_5);
-    unsigned int car_5 = _bf16x2_from_e4m3x2_5;
+    uint32_t _prmt_5;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_5) : "r"(sfw[0]), "r"(sfw[0]), "r"(sf_sel));
+    uint32_t car_5 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_5);
     uint32_t _fp4_bf16x8_5[4];
     {
     #if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -839,10 +911,9 @@ kernel_cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd(const __grid_constant__ CUte
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
         : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
         : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag[0]), "r"(b_frag[1]));
-    uint32_t _prmt_b32_6;
-    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_b32_6) : "r"(sfwh[0]), "r"(sfwh[0]), "r"(sf_sel));
-    uint32_t _bf16x2_from_e4m3x2_6 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_b32_6);
-    unsigned int car_6 = _bf16x2_from_e4m3x2_6;
+    uint32_t _prmt_6;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_6) : "r"(sfwh[0]), "r"(sfwh[0]), "r"(sf_sel));
+    uint32_t car_6 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_6);
     uint32_t _fp4_bf16x8_6[4];
     {
     #if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -917,10 +988,9 @@ kernel_cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd(const __grid_constant__ CUte
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
         : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
         : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag[0]), "r"(b_frag[1]));
-    uint32_t _prmt_b32_7;
-    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_b32_7) : "r"(sfwh[0]), "r"(sfwh[0]), "r"(sf_sel));
-    uint32_t _bf16x2_from_e4m3x2_7 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_b32_7);
-    unsigned int car_7 = _bf16x2_from_e4m3x2_7;
+    uint32_t _prmt_7;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_7) : "r"(sfwh[0]), "r"(sfwh[0]), "r"(sf_sel));
+    uint32_t car_7 = cvt_bf16x2_e4m3x2((uint16_t)_prmt_7);
     uint32_t _fp4_bf16x8_7[4];
     {
     #if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -1020,7 +1090,7 @@ kernel_cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd(const __grid_constant__ CUte
     int col_v = off_n + nw * 8 + lane_r * 2 + pair % 2;
     if (row_v < M) {
         if (col_v < N) {
-            *(reinterpret_cast<__half*>(C) + ((long long)row_v * (long long)N + (long long)col_v)) = __float2half_rn(red_v * alpha_value);
+            *(reinterpret_cast<__half*>(C) + ((long long)row_v * (long long)N + (long long)col_v)) = (__half)(red_v * alpha_value);
         }
     }
     if (warp == 0) {

@@ -24,13 +24,7 @@ import torch
 import tvm_ffi
 
 from ...utils import get_compute_capability, get_device_sm_count
-from .cake_jit import (
-    ARG_PLANS,
-    FFI_ENTRY,
-    load_program,
-    program_available,
-    select_program,
-)
+from .cake_jit import MODULES, launch_args, launch_grid, load, program_available
 
 # DeepSeek-V4 main-attention decode geometry served by the generated program:
 # MQA over one 512-wide NVFP4 latent row that is both K and V, 64-token pages.
@@ -787,9 +781,44 @@ def generated_program_available(device: torch.device) -> bool:
     return arch is not None and program_available(arch)
 
 
-def _arguments(kwargs: dict, plan: Sequence[Sequence[str]]) -> tuple:
-    grid = dict(zip(("grid_x", "grid_y", "grid_z"), kwargs["grid"], strict=True))
-    return tuple(grid[name] if kind == "grid" else kwargs[name] for kind, name in plan)
+# The registry's host-plan constants of each stage record: the values this
+# host side writes into the work table and sizes the partials with.
+_RECORD_CONSTANTS = {
+    "decode": {
+        "item_fields": ITEM_FIELDS,
+        "flag_seed_sink": FLAG_SEED_SINK,
+        "flag_direct_out": FLAG_DIRECT_OUT,
+        "rows_per_tile": ROWS_PER_TILE,
+        "tile_kv": TILE_KV,
+        "page_size": PAGE_SIZE,
+        "grid_rule": {"kind": "units_by_cluster", "ctas": CLUSTER_PAIR},
+    },
+    "reduce": {
+        "max_splits": MAX_SPLITS,
+        "grid_rule": {"kind": "rows_by_heads", "heads_per_cta": REDUCE_HEADS_PER_CTA},
+    },
+}
+
+
+def _check_record(stage: str) -> dict:
+    """The registry record of ``stage``, held to the host plan this module
+    assumes (its constants and its cluster launch)."""
+    record = MODULES[stage]
+    expected = _RECORD_CONSTANTS[stage]
+    actual = {key: record.get(key) for key in expected}
+    if actual != expected:
+        raise RuntimeError(
+            f"the registered {stage} record's host plan {actual} differs from "
+            f"this backend's {expected}"
+        )
+    cluster = tuple(int(v) for v in record["launch"]["cluster"])
+    want = (CLUSTER_PAIR, 1, 1) if stage == "decode" else (1, 1, 1)
+    if cluster != want:
+        raise RuntimeError(
+            f"the registered {stage} record launches clusters of {cluster}; "
+            f"this backend plans {want}"
+        )
+    return record
 
 
 def bind_decode_payload(
@@ -802,17 +831,21 @@ def bind_decode_payload(
     return_lse: bool,
     host_tables: Optional[torch.Tensor] = None,
 ) -> NVFP4MLADecodeRunner:
-    """Bind the prepared buffers to the generated physical argument order."""
-    main_program = select_program("main", arch)
-    main_entry = getattr(load_program(main_program, arch), FFI_ENTRY)
-    main_arguments = _arguments(main_kwargs, ARG_PLANS["main"])
+    """Bind the prepared buffers to the generated programs' argument plans."""
+    main_record = _check_record("decode")
+    main_program = main_record["library"]
+    main_entry = getattr(load("decode", arch), main_record["ffi_entry"])
+    main_arguments = launch_args(main_record, main_kwargs, main_kwargs["grid"])
     reduce_program = None
     reduce_entry = None
     reduce_arguments = ()
     if reduce_kwargs is not None:
-        reduce_program = select_program("reduce", arch)
-        reduce_entry = getattr(load_program(reduce_program, arch), FFI_ENTRY)
-        reduce_arguments = _arguments(reduce_kwargs, ARG_PLANS["reduce"])
+        reduce_record = _check_record("reduce")
+        reduce_program = reduce_record["library"]
+        reduce_entry = getattr(load("reduce", arch), reduce_record["ffi_entry"])
+        reduce_arguments = launch_args(
+            reduce_record, reduce_kwargs, reduce_kwargs["grid"]
+        )
     return NVFP4MLADecodeRunner(
         arch,
         main_program,
@@ -1071,7 +1104,7 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
         max_pages=max_pages,
         max_splits=max_splits,
         scale_log2=float(sm_scale) * LOG2E,
-        grid=plan.grid,
+        grid=launch_grid(MODULES["decode"], units=plan.num_units),
     )
     reduce_kwargs = None
     if max_splits > 1:
@@ -1084,7 +1117,7 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
             total_q=total_q,
             num_heads=num_heads,
             max_splits=max_splits,
-            grid=(total_q, math.ceil(num_heads / REDUCE_HEADS_PER_CTA), 1),
+            grid=launch_grid(MODULES["reduce"], total_q=total_q, num_heads=num_heads),
         )
     assert tuple(main_kwargs) == MAIN_KWARGS
     assert reduce_kwargs is None or tuple(reduce_kwargs) == REDUCE_KWARGS

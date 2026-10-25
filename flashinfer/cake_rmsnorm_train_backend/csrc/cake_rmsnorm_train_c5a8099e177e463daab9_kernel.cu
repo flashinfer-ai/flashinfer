@@ -71,12 +71,7 @@ kernel_cake_rmsnorm_train_c5a8099e177e463daab9(__nv_bfloat16* __restrict__ x, __
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-#if __CUDA_ARCH__ == 1000
-    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
-    smem = make_warp_uniform(smem);
-#else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
-#endif
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -188,14 +183,28 @@ kernel_cake_rmsnorm_train_c5a8099e177e463daab9(__nv_bfloat16* __restrict__ x, __
                 for (int j_3 = 0; j_3 < 8; j_3++) {
                     x_cache[v_3 * 8 + j_3] = x_cache[v_3 * 8 + j_3] * rstd * w_cache[v_3 * 8 + j_3];
                 }
-                {
-                    __nv_bfloat162 _pk[4];
-                    _pk[0] = __floats2bfloat162_rn(x_cache[v_3 * 8 + 0], x_cache[v_3 * 8 + 1]);
-                    _pk[1] = __floats2bfloat162_rn(x_cache[v_3 * 8 + 2], x_cache[v_3 * 8 + 3]);
-                    _pk[2] = __floats2bfloat162_rn(x_cache[v_3 * 8 + 4], x_cache[v_3 * 8 + 5]);
-                    _pk[3] = __floats2bfloat162_rn(x_cache[v_3 * 8 + 6], x_cache[v_3 * 8 + 7]);
-                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(y + (obase + (long long)(gtid * 8 + v_3 * (GROUP_THREADS * 8)))))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                unsigned int _packed_0[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((x_cache + v_3 * 8)[_lp*2 + 0], (x_cache + v_3 * 8)[_lp*2+1 + 0]));
+                    _packed_0[_lp] = *(uint32_t*)&_bf2;
                 }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((x_cache + v_3 * 8)[_lp*2 + 2], (x_cache + v_3 * 8)[_lp*2+1 + 2]));
+                    _packed_0[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((x_cache + v_3 * 8)[_lp*2 + 4], (x_cache + v_3 * 8)[_lp*2+1 + 4]));
+                    _packed_0[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((x_cache + v_3 * 8)[_lp*2 + 6], (x_cache + v_3 * 8)[_lp*2+1 + 6]));
+                    _packed_0[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                reinterpret_cast<int4*>(y + (obase + (long long)(gtid * 8 + v_3 * (GROUP_THREADS * 8))))[0] = reinterpret_cast<int4*>(_packed_0)[0];
             }
         }
     }

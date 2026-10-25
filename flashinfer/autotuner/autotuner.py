@@ -29,7 +29,7 @@ from typing import (
 import torch
 
 from flashinfer.autotune_cache import ManagedCacheEntry
-from flashinfer.tllm_utils import delay_kernel
+from flashinfer.tllm_utils import delay_kernel, get_trtllm_utils_module
 from flashinfer.utils import (
     next_positive_power_of_2,
     is_confidential_compute,
@@ -534,6 +534,12 @@ class TuningConfig:
             lane views in the reusable A/B profiling arenas. Their contents are
             staged once per profile even when they are not value-aware. Shared
             read-only tensors may be omitted and retain one pointer.
+        use_cuda_graph_individual_timing: When using CUDA graphs, measure each
+            invocation with its own in-graph event interval and return the
+            median latency. The default measures amortized sustained execution.
+            Cold-L2 profiling uses a separate measurement path. This
+            choice is recorded as tuning provenance because it can change the
+            winner; ordinary lookup can still consume that winner.
     """
 
     dynamic_tensor_specs: tuple[DynamicTensorSpec, ...] = ()
@@ -554,6 +560,7 @@ class TuningConfig:
     # for inputs whose default tensor_initializer would be random
     # (e.g. token_selected_experts in MoE workloads).
     inputs_pre_hook: Callable | None = None
+    use_cuda_graph_individual_timing: bool = False
 
     @property
     def uses_cold_chain(self) -> bool:
@@ -1206,17 +1213,21 @@ def set_autotune_process_group(
     Prefer a CPU (``gloo``) subgroup; a NCCL group also works. ``None``
     disables (default); not thread-safe.
 
-    Caller contract: every rank must enter ``_profile_single_kernel`` the same
-    number of times in the same order, or the reduction itself deadlocks. Across
-    ranks that requires identical: ``get_valid_tactics`` and shape buckets;
-    ``skip_ops`` (a skipped op returns before the tactic loop, doing zero
-    reduces). Cache hits are coordinated per profile: if any rank misses,
-    every rank profiles again. Cached runner/tactic selections must also agree;
-    disagreement triggers the same coordinated re-profile. Set the group from
-    the first ``choose_one``;
-    distributed tuning must run outside CUDA Graph capture. Input
-    synthesis and ``do_preparation`` OOMs are reduced across the group before
-    tactic profiling, giving every rank the same fallback decision.
+    All participants must enable tuning and enter the same operations in order,
+    outside CUDA Graph capture. Startup gates check operation/runner order,
+    skip decisions, profile count, measurement policy and ordered candidates.
+    Rank-local shapes and cache roots may differ. A mismatch raises on every
+    participating rank before tactic measurement. Cached selections must agree;
+    any miss or disagreement makes every rank re-profile.
+
+    Input/candidate/runner preparation OOMs keep coordinated fallback. Other
+    caught Python preparation errors raise across the group. Matching nested
+    shortlist preparation is supported; mismatched nesting is rejected. These
+    checks do not recover missing ranks, failed CUDA contexts or arbitrary
+    runner-internal collectives. A rank that never reaches a gate still needs
+    the process-group timeout. Delegated protocols own their coordination.
+    Serving with tuning disabled performs no collectives. Set the group before
+    the first tuning call and clear it after the coordinated warmup.
 
     Example::
 
@@ -1236,57 +1247,105 @@ def get_autotune_process_group() -> Optional["torch.distributed.ProcessGroup"]:
     return _tune_process_group
 
 
-def _sync_oom_across_tune_group(local_oom: bool) -> bool:
-    """Return whether any rank in the tuning group observed an OOM."""
-    if _tune_process_group is None:
-        return local_oom
+class _TuningGroupError(RuntimeError):
+    """A group-wide failure; do not retry it as a rank-local tactic error."""
 
+
+def _tuning_group_agreement(phase, selection, status=0, error=None):
+    """Exchange a fixed-size phase/selection fingerprint and failure status.
+
+    All startup gates use this envelope so a nested operation meeting its
+    parent's preparation gate fails coherently rather than reducing different
+    tensor sizes. Rank-local shapes and cache roots are deliberately excluded
+    by callers; they need not match in an expert-parallel deployment.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        raise _TuningGroupError(
+            "Distributed autotuning cannot synchronize during an active CUDA Graph capture"
+        )
     import torch.distributed as dist
 
+    def digest(value):
+        encoded = json.dumps(
+            _tactic_to_json(value),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+        return hashlib.sha256(encoded).digest()
+
+    phase_digest = digest(phase)
+    try:
+        selection_digest = digest(selection)
+    except Exception as exc:
+        selection_digest = bytes(32)
+        status = 2
+        error = f"unrepresentable selection: {exc}"
     backend = str(dist.get_backend(_tune_process_group)).lower()
     device = "cuda" if backend == "nccl" else "cpu"
-    oom_flag = torch.tensor([int(local_oom)], dtype=torch.int32, device=device)
-    dist.all_reduce(oom_flag, op=dist.ReduceOp.MAX, group=_tune_process_group)
-    return bool(oom_flag.item())
+    agreement = torch.tensor(
+        [
+            status,
+            *phase_digest,
+            *(-v for v in phase_digest),
+            *selection_digest,
+            *(-v for v in selection_digest),
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    dist.all_reduce(agreement, op=dist.ReduceOp.MAX, group=_tune_process_group)
+    if not torch.equal(agreement[1:33], -agreement[33:65]):
+        raise _TuningGroupError(f"Autotune group phase mismatch at {phase!r}")
+    group_status = int(agreement[0].item())
+    if group_status >= 2:
+        detail = error or "another rank failed preparation"
+        raise _TuningGroupError(f"Autotune group failure at {phase!r}: {detail}")
+    return group_status, torch.equal(agreement[65:97], -agreement[97:129])
+
+
+def _check_tuning_group_phase(phase, selection=(), error=None):
+    if _tune_process_group is None:
+        return
+    _, agreed = _tuning_group_agreement(phase, selection, 2 if error else 0, error)
+    if not agreed:
+        raise _TuningGroupError(
+            f"Autotune group plan mismatch at {phase!r}: local selection={repr(selection)[:512]}"
+        )
+
+
+def _sync_oom_across_tune_group(
+    local_oom: bool, *, phase="preparation", selection=(), error=None
+) -> bool:
+    """Coordinate preparation errors and its plan before profiling starts."""
+    if _tune_process_group is None:
+        return local_oom
+    status, agreed = _tuning_group_agreement(
+        phase, selection, 2 if error else int(local_oom), error
+    )
+    if status:
+        return True
+    if not agreed:
+        raise _TuningGroupError(
+            f"Autotune group plan mismatch at {phase!r}: local selection={repr(selection)[:512]}"
+        )
+    return False
 
 
 def _all_ranks_hit_cache(local_hit: bool, selection: Any = None) -> bool:
     """Reuse cached results only when every rank has the same selection."""
     if _tune_process_group is None:
         return local_hit
-    if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError(
-            "Distributed autotuning cannot synchronize cache hits during "
-            "an active CUDA Graph capture"
-        )
-
-    import torch.distributed as dist
-
-    backend = str(dist.get_backend(_tune_process_group)).lower()
-    device = "cuda" if backend == "nccl" else "cpu"
-    digest = bytes(32)
     if local_hit:
         try:
-            encoded = json.dumps(
-                _tactic_to_json(selection),
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode()
-            digest = hashlib.sha256(encoded).digest()
-        except (TypeError, ValueError):
-            # An unrepresentable selection cannot establish agreement. Every
-            # rank still joins the collective and takes the re-profile path.
+            # Invalid persisted selections remain cache misses, not fatal plans.
+            json.dumps(_tactic_to_json(selection), allow_nan=False)
+        except Exception:
             local_hit = False
-    # Packing the digest and its negation checks both min and max using the
-    # existing single collective, including when some ranks miss the cache.
-    agreement = torch.tensor(
-        [int(local_hit), *digest, *(-value for value in digest)],
-        dtype=torch.int32,
-        device=device,
+    status, agreed = _tuning_group_agreement(
+        "cache", selection if local_hit else None, int(not local_hit)
     )
-    dist.all_reduce(agreement, op=dist.ReduceOp.MIN, group=_tune_process_group)
-    return bool(agreement[0].item()) and torch.equal(agreement[1:33], -agreement[33:])
+    return not status and agreed
 
 
 @dataclass(frozen=True)
@@ -1629,6 +1688,9 @@ class _V2Local(threading.local):
     active: bool = False
     store: Any = None
     measure: Any = None
+    cache_scope: str = "process"
+    replay_report: Any = None
+    strict_replay: bool = False
 
 
 class AutoTuner:
@@ -1782,7 +1844,7 @@ class AutoTuner:
         # Measure-derived TuningConfig variants, keyed by original config
         # identity (same rationale as _override_config_cache below).
         self._measure_config_cache: weakref.WeakKeyDictionary[
-            TuningConfig, dict[tuple[bool, bool], TuningConfig]
+            TuningConfig, dict[tuple[bool, bool, bool], TuningConfig]
         ] = weakref.WeakKeyDictionary()
         # Cache overridden TuningConfig objects to keep stable object identity
         # for the nearest-profile LRU cache.
@@ -1854,14 +1916,23 @@ class AutoTuner:
             if policy.cold_l2 is None
             else policy.cold_l2
         )
+        individual_timing = (
+            tuning_config.use_cuda_graph_individual_timing
+            if policy.graph_timing is None
+            else policy.graph_timing == "individual"
+        )
+        # CUPTI owns per-invocation measurement, including its event fallback.
+        if policy.timer == "cupti":
+            individual_timing = False
         if (
             use_cuda_graph == tuning_config.use_cuda_graph
             and use_cold_l2 == tuning_config.use_cold_l2_cache
+            and individual_timing == tuning_config.use_cuda_graph_individual_timing
         ):
             return tuning_config
 
         per_config = self._measure_config_cache.get(tuning_config)
-        cache_key = (use_cuda_graph, use_cold_l2)
+        cache_key = (use_cuda_graph, use_cold_l2, individual_timing)
         if per_config is not None and cache_key in per_config:
             return per_config[cache_key]
 
@@ -1869,6 +1940,7 @@ class AutoTuner:
             tuning_config,
             use_cold_l2_cache=use_cold_l2,
             use_cuda_graph=use_cuda_graph,
+            use_cuda_graph_individual_timing=individual_timing,
         )
         self._measure_config_cache.setdefault(tuning_config, {})[cache_key] = new_config
         return new_config
@@ -1922,6 +1994,16 @@ class AutoTuner:
     def _in_v2_context(self) -> bool:
         """Whether an autotune_v2 context is open on this thread."""
         return self._v2_local.active
+
+    @property
+    def _isolate_legacy_configs(self) -> bool:
+        """Identified context scopes consume only their own winner sources."""
+        local = self._v2_local
+        return (
+            local.active
+            and local.cache_scope == "context"
+            and self._winner_cache_identity() is not None
+        )
 
     def _winner_cache(self) -> dict:
         """In-memory winner-cache partition for the active MEASUREMENT identity.
@@ -2094,6 +2176,9 @@ class AutoTuner:
             synthesis-invariant; see: TunableRunner.get_cache_key_extras.
         """
         with self._lock:
+            report = self._v2_local.replay_report
+            require_profiling_policy |= self._v2_local.strict_replay
+            rejections: list[str] | None = [] if report is not None else None
             requested_policy = self._profiling_policy(tuning_config)
             default_policy = self._default_profiling_policy(tuning_config)
             # 1. In-memory winners and provenance share the same partition.
@@ -2119,20 +2204,42 @@ class AutoTuner:
                         default_policy if winner_identity is None else None,
                     )
                     if check_memory_policy and cached_policy != requested_policy:
+                        if (
+                            rejections is not None
+                            and "policy_mismatch" not in rejections
+                        ):
+                            rejections.append("policy_mismatch")
                         continue
                     tactic, stored_profile = winners[cache_key]
                     if not self._tactic_still_valid(
                         r, inputs, tactic, custom_op, "memory"
                     ):
+                        if (
+                            rejections is not None
+                            and "invalid_tactic" not in rejections
+                        ):
+                            rejections.append("invalid_tactic")
                         # Fall through: another runner, a disk source, or
                         # (in tuning mode) a re-profile may still serve.
                         continue
+                    if report is not None:
+                        report._record(
+                            custom_op,
+                            input_shapes,
+                            winner_identity,
+                            status="hit",
+                            source="memory",
+                            requested_policy=requested_policy,
+                            stored_policy=cached_policy,
+                            runner=type(r).__name__,
+                            tactic=tactic,
+                        )
                     return True, r_id, tactic, stored_profile
 
             # 2. User-loaded configs (from load_configs or autotune(cache=...)).
             #    Skipped wholesale when nothing was loaded, so the common
             #    serving path never builds a file_key string here.
-            if self._file_configs:
+            if self._file_configs and not self._isolate_legacy_configs:
                 for r_id, cache_key in runner_keys:
                     file_key = cache_key.file_key
                     if file_key in excluded_file_keys:
@@ -2146,10 +2253,20 @@ class AutoTuner:
                             continue
                         runner_name, tactic = self._file_configs[file_key]
                         if runner_name != runners[r_id].__class__.__name__:
+                            if (
+                                rejections is not None
+                                and "runner_mismatch" not in rejections
+                            ):
+                                rejections.append("runner_mismatch")
                             continue
                         if not self._tactic_still_valid(
                             runners[r_id], inputs, tactic, custom_op, "config file"
                         ):
+                            if (
+                                rejections is not None
+                                and "invalid_tactic" not in rejections
+                            ):
+                                rejections.append("invalid_tactic")
                             continue
                         log_key = (custom_op, runner_name)
                         if log_key not in self._logged_file_hits:
@@ -2157,6 +2274,18 @@ class AutoTuner:
                             logger.info(
                                 f"[Autotuner]: Config cache hit for {custom_op} "
                                 f"(runner={runner_name}, source=config file)"
+                            )
+                        if report is not None:
+                            report._record(
+                                custom_op,
+                                input_shapes,
+                                winner_identity,
+                                status="hit",
+                                source="legacy",
+                                requested_policy=requested_policy,
+                                stored_policy=self._file_config_policies.get(file_key),
+                                runner=runner_name,
+                                tactic=tactic,
                             )
                         return True, r_id, tactic, None
 
@@ -2188,13 +2317,28 @@ class AutoTuner:
                         require_profiling_policy
                         and hit.profiling_policy != requested_policy
                     ):
+                        if (
+                            rejections is not None
+                            and "policy_mismatch" not in rejections
+                        ):
+                            rejections.append("policy_mismatch")
                         continue
                     runner_name, tactic = hit.runner, hit.tactic
                     if runner_name != runners[r_id].__class__.__name__:
+                        if (
+                            rejections is not None
+                            and "runner_mismatch" not in rejections
+                        ):
+                            rejections.append("runner_mismatch")
                         continue
                     if not self._tactic_still_valid(
                         runners[r_id], inputs, tactic, custom_op, "managed cache"
                     ):
+                        if (
+                            rejections is not None
+                            and "invalid_tactic" not in rejections
+                        ):
+                            rejections.append("invalid_tactic")
                         continue
                     log_key = (custom_op, runner_name)
                     if log_key not in self._logged_file_hits:
@@ -2209,12 +2353,25 @@ class AutoTuner:
                     self._profiling_cache_policies[(winner_identity, cache_key)] = (
                         hit.profiling_policy
                     )
+                    if report is not None:
+                        report._record(
+                            custom_op,
+                            input_shapes,
+                            winner_identity,
+                            status="hit",
+                            source="managed",
+                            requested_policy=requested_policy,
+                            stored_policy=hit.profiling_policy,
+                            runner=runner_name,
+                            tactic=tactic,
+                        )
                     return True, r_id, tactic, None
 
             # 3. Bundled package configs (legacy .py files)
             if (
                 os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1"
                 and not self.is_tuning_mode
+                and not self._isolate_legacy_configs
             ):
                 for r_id, cache_key in runner_keys:
                     if cache_key.file_key in excluded_file_keys or (
@@ -2224,9 +2381,38 @@ class AutoTuner:
                         continue
                     is_hit, _, file_tactic, _ = load_from_file(cache_key.file_key)
                     if is_hit:
+                        if report is not None:
+                            report._record(
+                                custom_op,
+                                input_shapes,
+                                winner_identity,
+                                status="hit",
+                                source="bundled",
+                                requested_policy=requested_policy,
+                                runner=type(runners[r_id]).__name__,
+                                tactic=file_tactic,
+                            )
                         return True, r_id, file_tactic, None
 
             # 4. Fallback
+            if report is not None:
+                reasons = tuple(rejections or ("not_found",))
+                report._record(
+                    custom_op,
+                    input_shapes,
+                    winner_identity,
+                    status="miss",
+                    source="fallback",
+                    requested_policy=requested_policy,
+                    runner=type(runners[0]).__name__ if runners else None,
+                    tactic=-1,
+                    reasons=reasons,
+                )
+                if self._v2_local.strict_replay:
+                    raise RuntimeError(
+                        f"autotune strict replay miss for {custom_op}: "
+                        f"input_shapes={input_shapes}, reasons={reasons}"
+                    )
             return False, 0, -1, None
 
     def _apply_tuning_overrides(self, tuning_config: TuningConfig) -> TuningConfig:
@@ -2336,8 +2522,37 @@ class AutoTuner:
         by the protocol, and are not imported or exported by the v1 JSON API.
         """
         with self._lock:
+            if self._v2_local.replay_report is not None and (
+                force_tune or self.is_tuning_mode
+            ):
+                raise RuntimeError("replay diagnostics forbid protocol tuning")
             context = self.protocol_context(custom_op, force_tune=force_tune)
             result = protocol.run(context)
+            report = self._v2_local.replay_report
+            if report is not None:
+                status = (
+                    "skipped"
+                    if context.skipped
+                    else "hit"
+                    if result.cache_hit
+                    else "miss"
+                )
+                report._record(
+                    custom_op,
+                    (),
+                    self._winner_cache_identity(),
+                    status=status,
+                    source="protocol",
+                    runner=None,
+                    tactic=None,
+                    reasons=()
+                    if result.cache_hit
+                    else ("skip_ops" if context.skipped else "protocol_miss",),
+                )
+                if status == "miss" and self._v2_local.strict_replay:
+                    raise RuntimeError(
+                        f"autotune strict replay miss for protocol {custom_op}"
+                    )
             if result.candidates:
                 self.stats.tuned_op_total_configs[custom_op] = (
                     self.stats.tuned_op_total_configs.get(custom_op, 0)
@@ -2391,6 +2606,17 @@ class AutoTuner:
         # the op's built-in heuristic, avoiding kernel compilation.
         # Checked before acquiring the lock since _effective_skip_ops is
         # thread-local and does not touch shared state.
+        if self.is_tuning_mode and _tune_process_group is not None:
+            _check_tuning_group_phase(
+                "operation",
+                (
+                    "choose_one",
+                    custom_op,
+                    [type(r).__name__ for r in runners],
+                    custom_op in self._effective_skip_ops,
+                    self._in_v2_context,
+                ),
+            )
         if custom_op in self._effective_skip_ops:
             logger.debug(
                 f"[AutoTuner]: Skipping autotuning for '{custom_op}' "
@@ -2398,10 +2624,25 @@ class AutoTuner:
             )
             if not runners:
                 raise ValueError(f"No runners provided for op '{custom_op}'")
+            report = self._v2_local.replay_report
+            if report is not None:
+                with self._lock:
+                    report._record(
+                        custom_op,
+                        self._get_input_sizes(inputs),
+                        self._winner_cache_identity(),
+                        status="skipped",
+                        source="skip_ops",
+                        runner=type(runners[0]).__name__,
+                        tactic=-1,
+                        reasons=("skip_ops",),
+                    )
             return runners[0], -1
 
         with self._lock:
             # Apply tuning bucket / rounding overrides from autotune() context.
+            if self._v2_local.replay_report is not None and self.is_tuning_mode:
+                raise RuntimeError("replay diagnostics forbid tuning")
             if (
                 self._override_tuning_buckets is not None
                 or self._override_round_up
@@ -2465,7 +2706,7 @@ class AutoTuner:
                         k.custom_op == custom_op for k in self._winner_cache()
                     )
                     file_key_op_prefix = f"({repr(custom_op)}, "
-                    op_has_file = any(
+                    op_has_file = not self._isolate_legacy_configs and any(
                         k.startswith(file_key_op_prefix) for k in self._file_configs
                     )
                     has_tune_data = op_has_profiling or op_has_file
@@ -2495,7 +2736,21 @@ class AutoTuner:
                 "All Given runners must be subclass of TunableRunner"
             )
 
-            profiles = self._generate_optimization_profiles(tuning_config, inputs)
+            plan_error = None
+            profiles = []
+            try:
+                profiles = self._generate_optimization_profiles(tuning_config, inputs)
+            except _TuningGroupError:
+                raise
+            except Exception as exc:
+                if _tune_process_group is None:
+                    raise
+                plan_error = f"{type(exc).__name__}: {exc}"
+            _check_tuning_group_phase(
+                ("profiles", custom_op),
+                (len(profiles), self._profiling_policy(tuning_config)),
+                plan_error,
+            )
             # Record the total configs to try
             self.stats.tuned_op_total_configs[custom_op] = len(profiles)
 
@@ -2563,6 +2818,7 @@ class AutoTuner:
                                 inputs,
                             )
                         input_preparation_oom = False
+                        input_error = None
                         try:
                             # Active capture is safe for skipped operations and warm cache hits, but
                             # input synthesis or profiling would mutate the caller's outer graph.
@@ -2586,8 +2842,20 @@ class AutoTuner:
                             input_preparation_oom = True
                             tensors = None
                             prepared_input_batches = None
+                        except _TuningGroupError:
+                            raise
+                        except Exception as exc:
+                            if _tune_process_group is None:
+                                raise
+                            input_error = f"{type(exc).__name__}: {exc}"
+                            tensors = None
+                            prepared_input_batches = None
 
-                        if _sync_oom_across_tune_group(input_preparation_oom):
+                        if _sync_oom_across_tune_group(
+                            input_preparation_oom,
+                            phase=("inputs", custom_op, _step),
+                            error=input_error,
+                        ):
                             tensors = None
                             prepared_input_batches = None
                             torch.cuda.empty_cache()
@@ -2621,6 +2889,8 @@ class AutoTuner:
                         skipped_count = 0
                         for r_id, r in enumerate(runners):
                             runner_preparation_oom = False
+                            runner_error = None
+                            valid_tactics = []
                             try:
                                 valid_tactics = r.get_valid_tactics(tensors, p)
                                 valid_tactics = self._blocklist.filter(
@@ -2632,10 +2902,38 @@ class AutoTuner:
                                     and -1 not in valid_tactics
                                 ):
                                     valid_tactics = [-1, *valid_tactics]
+                            except (torch.cuda.OutOfMemoryError, MemoryError):
+                                runner_preparation_oom = True
+                                tensors = None
+                                prepared_input_batches = None
+                            except _TuningGroupError:
+                                raise
+                            except Exception as exc:
+                                if _tune_process_group is None:
+                                    raise
+                                runner_error = f"{type(exc).__name__}: {exc}"
+                                tensors = None
+                                prepared_input_batches = None
+
+                            if _sync_oom_across_tune_group(
+                                runner_preparation_oom,
+                                phase=("candidates", custom_op, _step, r_id),
+                                selection=valid_tactics,
+                                error=runner_error,
+                            ):
+                                tensors = None
+                                prepared_input_batches = None
+                                torch.cuda.empty_cache()
+                                logger.warning(
+                                    "[Autotuner]: OOM detected, falling back to default tactic"
+                                )
+                                return runners[0], -1
+
+                            try:
                                 runner_arg_names = runner_arg_names_map[r]
                                 if (
                                     "do_preparation" in runner_arg_names
-                                    and len(valid_tactics) > 0
+                                    and valid_tactics
                                 ):
                                     handled = r.precompile_tactics(
                                         tensors, valid_tactics, p, **kwargs
@@ -2651,8 +2949,20 @@ class AutoTuner:
                                 runner_preparation_oom = True
                                 tensors = None
                                 prepared_input_batches = None
+                            except _TuningGroupError:
+                                raise
+                            except Exception as exc:
+                                if _tune_process_group is None:
+                                    raise
+                                runner_error = f"{type(exc).__name__}: {exc}"
+                                tensors = None
+                                prepared_input_batches = None
 
-                            if _sync_oom_across_tune_group(runner_preparation_oom):
+                            if _sync_oom_across_tune_group(
+                                runner_preparation_oom,
+                                phase=("runner_prepared", custom_op, _step, r_id),
+                                error=runner_error,
+                            ):
                                 tensors = None
                                 prepared_input_batches = None
                                 torch.cuda.empty_cache()
@@ -2903,6 +3213,17 @@ class AutoTuner:
         time are returned for callers that need a shortlist (e.g. multi-stage
         compound-tactic refinement).
         """
+        if self.is_tuning_mode and _tune_process_group is not None:
+            _check_tuning_group_phase(
+                "operation",
+                (
+                    "rank_tactics",
+                    custom_op,
+                    [type(r).__name__ for r in runners],
+                    custom_op in self._effective_skip_ops,
+                    k,
+                ),
+            )
         if k < 1:
             raise ValueError(f"k must be >= 1, got {k}")
         if len(runners) != 1:
@@ -2910,6 +3231,9 @@ class AutoTuner:
                 f"rank_tactics requires exactly one runner, got {len(runners)} "
                 f"for op '{custom_op}'"
             )
+
+        if self._v2_local.replay_report is not None and self.is_tuning_mode:
+            raise RuntimeError("replay diagnostics forbid tuning")
 
         if k == 1 or not self.is_tuning_mode:
             _, tactic = self.choose_one(
@@ -2936,30 +3260,46 @@ class AutoTuner:
                     tuning_config, self._effective_measure_policy
                 )
 
-            input_shapes = tuple(self._get_input_sizes(inputs))
-            profiles = self._generate_optimization_profiles(tuning_config, inputs)
-            runner = runners[0]
-            runner_arg_names = {
-                param.name
-                for param in inspect.signature(runner.forward).parameters.values()
-            }
-
-            nearest_profile = self._find_nearest_profile(input_shapes, tuning_config)
+            plan_error = None
             try:
-                profile = next(
-                    candidate
-                    for candidate in profiles
-                    if self._find_nearest_profile(
-                        candidate.get_opt_shapes(), tuning_config
-                    )
-                    == nearest_profile
-                )
-            except StopIteration as e:
-                raise RuntimeError(
-                    f"No optimization profile for mapped shapes {nearest_profile} "
-                    f"while ranking '{custom_op}'"
-                ) from e
+                input_shapes = tuple(self._get_input_sizes(inputs))
+                profiles = self._generate_optimization_profiles(tuning_config, inputs)
+                runner = runners[0]
+                runner_arg_names = {
+                    param.name
+                    for param in inspect.signature(runner.forward).parameters.values()
+                }
 
+                nearest_profile = self._find_nearest_profile(
+                    input_shapes, tuning_config
+                )
+                try:
+                    profile = next(
+                        candidate
+                        for candidate in profiles
+                        if self._find_nearest_profile(
+                            candidate.get_opt_shapes(), tuning_config
+                        )
+                        == nearest_profile
+                    )
+                except StopIteration as e:
+                    raise RuntimeError(
+                        f"No optimization profile for mapped shapes {nearest_profile} "
+                        f"while ranking '{custom_op}'"
+                    ) from e
+
+            except _TuningGroupError:
+                raise
+            except Exception as exc:
+                if _tune_process_group is None:
+                    raise
+                plan_error = f"{type(exc).__name__}: {exc}"
+
+            _check_tuning_group_phase(
+                ("ranking_profile", custom_op),
+                self._profiling_policy(tuning_config),
+                plan_error,
+            )
             cache_key = AutoTuner._get_cache_key(
                 custom_op,
                 runner,
@@ -2984,6 +3324,7 @@ class AutoTuner:
 
             tensors = None
             input_preparation_oom = False
+            input_error = None
             try:
                 tensors = self._prepare_input_tensors(profile, inputs)
                 if tuning_config.inputs_pre_hook is not None:
@@ -2993,10 +3334,21 @@ class AutoTuner:
                     raise
                 input_preparation_oom = True
                 tensors = None
+            except _TuningGroupError:
+                raise
+            except Exception as exc:
+                if _tune_process_group is None:
+                    raise
+                input_error = f"{type(exc).__name__}: {exc}"
+                tensors = None
 
             # Ranking can run inside another runner's get_valid_tactics().
             # Every rank must leave preparation before nested timing reduces.
-            if _sync_oom_across_tune_group(input_preparation_oom):
+            if _sync_oom_across_tune_group(
+                input_preparation_oom,
+                phase=("ranking_inputs", custom_op),
+                error=input_error,
+            ):
                 tensors = None
                 raise MemoryError("OOM during tactic-ranking input preparation")
 
@@ -3011,9 +3363,34 @@ class AutoTuner:
                     profile_inputs=tensors,
                 )
             runner_preparation_oom = False
+            runner_error = None
+            valid_tactics = []
             try:
                 valid_tactics = runner.get_valid_tactics(tensors, profile)
                 valid_tactics = self._blocklist.filter(custom_op, runner, valid_tactics)
+            except (torch.cuda.OutOfMemoryError, MemoryError):
+                if _tune_process_group is None:
+                    raise
+                runner_preparation_oom = True
+                tensors = None
+            except _TuningGroupError:
+                raise
+            except Exception as exc:
+                if _tune_process_group is None:
+                    raise
+                runner_error = f"{type(exc).__name__}: {exc}"
+                tensors = None
+
+            if _sync_oom_across_tune_group(
+                runner_preparation_oom,
+                phase=("ranking_candidates", custom_op),
+                selection=valid_tactics,
+                error=runner_error,
+            ):
+                tensors = None
+                raise MemoryError("OOM during tactic-ranking candidate preparation")
+
+            try:
                 if valid_tactics and "do_preparation" in runner_arg_names:
                     runner(tensors, tactic=-1, do_preparation=True, **kwargs)
             except (torch.cuda.OutOfMemoryError, MemoryError):
@@ -3021,8 +3398,19 @@ class AutoTuner:
                     raise
                 runner_preparation_oom = True
                 tensors = None
+            except _TuningGroupError:
+                raise
+            except Exception as exc:
+                if _tune_process_group is None:
+                    raise
+                runner_error = f"{type(exc).__name__}: {exc}"
+                tensors = None
 
-            if _sync_oom_across_tune_group(runner_preparation_oom):
+            if _sync_oom_across_tune_group(
+                runner_preparation_oom,
+                phase=("ranking_prepared", custom_op),
+                error=runner_error,
+            ):
                 tensors = None
                 raise MemoryError("OOM during tactic-ranking runner preparation")
 
@@ -3102,9 +3490,10 @@ class AutoTuner:
 
         Returns:
             Execution time in milliseconds. Cold-L2 profiling returns the
-            median isolated-invocation latency (per launch for a cold chain);
-            hot profiling retains the
-            existing average over back-to-back invocations.
+            median isolated-invocation latency (per launch for a cold chain).
+            Hot graph profiling can opt
+            into individual-call intervals; otherwise hot profiling averages
+            back-to-back invocations.
 
         Note:
             The method performs warmup runs, then measures multiple iterations.
@@ -3121,6 +3510,8 @@ class AutoTuner:
             sees the same per-call allocation overhead, and the autotuner
             picks based on intrinsic kernel time.
         """
+        if self._v2_local.replay_report is not None:
+            raise RuntimeError("replay diagnostics forbid profiling")
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "autotune measurement cannot run inside a CUDA graph "
@@ -3386,6 +3777,25 @@ class AutoTuner:
                         f"profiler for faithful measurements."
                     )
             if not use_cupti:
+                delayed_events = tuning_config.use_cold_l2_cache or not (
+                    (
+                        tuning_config.use_cuda_graph
+                        and tuning_config.use_cuda_graph_individual_timing
+                    )
+                    or (
+                        measure_policy is not None
+                        and measure_policy.timer == "events_no_delay"
+                    )
+                )
+                delay_micro_secs = (
+                    self._CUDA_GRAPH_DELAY_MICRO_SECS
+                    if tuning_config.use_cuda_graph
+                    else self.stream_delay_micro_secs
+                )
+                if delayed_events and delay_micro_secs > 0:
+                    # Loading the delay helper after candidate warmup can skew
+                    # the first candidate. Initialize it before warming inputs.
+                    get_trtllm_utils_module()
                 # Rotating input batches (up to ~3x L2 of clones under
                 # cold_l2) are only used by the event path; allocating them
                 # before the routing decision would double the transient
@@ -3405,11 +3815,30 @@ class AutoTuner:
                     for _ in range(self.warmup):
                         runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
 
-                    avg_time = (
-                        cold_l2_profile(stream, profiling_repeat)
-                        if tuning_config.use_cold_l2_cache
-                        else pure_profile(stream, profiling_repeat)
-                    )
+                    if tuning_config.use_cold_l2_cache:
+                        avg_time = cold_l2_profile(stream, profiling_repeat)
+                    elif (
+                        tuning_config.use_cuda_graph
+                        and tuning_config.use_cuda_graph_individual_timing
+                    ):
+                        from ._graph_timing import profile_individual_graph_calls
+
+                        avg_time = profile_individual_graph_calls(
+                            lambda index: runner(
+                                input_tensor_batches[index % len(input_tensor_batches)],
+                                tactic=tactic,
+                                **kwargs,
+                            ),
+                            repeat=profiling_repeat,
+                            replays=tuning_config.cuda_graph_profile_replays,
+                            record_global_timer=(
+                                self._record_global_timer
+                                if self._use_global_timer
+                                else None
+                            ),
+                        )
+                    else:
+                        avg_time = pure_profile(stream, profiling_repeat)
         except BaseException as e:  # noqa: BLE001
             # Catch everything (incl. KeyboardInterrupt / SystemExit): this
             # rank must still reach the all-reduce below or peers already
@@ -3452,8 +3881,17 @@ class AutoTuner:
     ) -> tuple[TuningConfig, list[list[Any]]]:
         """Prepare one reusable input schedule shared by explicitly profiled tactics."""
         with self._lock:
-            if self._override_tuning_buckets is not None or self._override_round_up:
+            if (
+                self._override_tuning_buckets is not None
+                or self._override_round_up
+                or self._override_cuda_graph_profile_replays is not None
+            ):
                 tuning_config = self._apply_tuning_overrides(tuning_config)
+            measure_policy = self._effective_measure_policy
+            if measure_policy is not None:
+                tuning_config = self._apply_measure_policy(
+                    tuning_config, measure_policy
+                )
             batches = self._prepare_input_tensors_with_batches(inputs, tuning_config)
             return tuning_config, batches
 
@@ -3466,7 +3904,7 @@ class AutoTuner:
         input_batches: list[list[Any]],
         **kwargs,
     ) -> float:
-        """Measure one tactic against a caller-retained prepared input schedule."""
+        """Measure using the config and schedule from ``prepare_tactic_profile``."""
         with self._lock:
             return self._profile_single_kernel(
                 runner,
@@ -3726,7 +4164,7 @@ class AutoTuner:
     @staticmethod
     def _profiling_policy(tuning_config: TuningConfig) -> tuple:
         """Return measurement provenance that can change tactic ranking."""
-        return (
+        policy: tuple = (
             "cuda_graph_profile_replays",
             (
                 int(tuning_config.cuda_graph_profile_replays)
@@ -3736,6 +4174,15 @@ class AutoTuner:
             "l2_cache_policy",
             tuning_config.l2_cache_policy,
         )
+        # Preserve the existing provenance for all legacy callers. A tuning
+        # request with a different timing objective must remeasure its tactics.
+        if (
+            tuning_config.use_cuda_graph
+            and tuning_config.use_cuda_graph_individual_timing
+            and not tuning_config.use_cold_l2_cache
+        ):
+            policy += ("cuda_graph_timing_mode", "individual")
+        return policy
 
     @staticmethod
     def _default_profiling_policy(tuning_config: TuningConfig) -> tuple:

@@ -44,12 +44,14 @@ peaked variant):
 Arms (``--arms``): ``cake`` (this backend, a prepared runner over caller-owned
 outputs and workspace), ``cake_nosample`` (the same runner with
 ``sample_tiles_max=0``: the sampled first threshold off, same programs, same
-bits), ``cake_main`` / ``cake_main_nosample`` (a second copy of the package
+bits), ``cake_far`` (the same runner with ``far_sample=1``: the sampled first
+threshold ranks the far sample tiles only, same programs, same bits),
+``cake_main`` / ``cake_main_nosample`` (a second copy of the package
 loaded from ``--main-package DIR``, e.g. the ``flashinfer/experimental/cake_dsa_indexer``
 directory of a FlashInfer main checkout, in the same process: the package is
 self-contained -- relative imports, ``Path(__file__)`` manifest, JIT names
 salted by its own closure digests -- so both versions run on the same input
-tensors), ``cake_aa`` / ``cake_main_aa`` (the same arm prepared a second time:
+tensors), ``cake_aa`` / ``cake_far_aa`` / ``cake_main_aa`` (the same arm prepared a second time:
 the in-process A/A band), ``chunked_pipeline`` (a reconstruction of the current
 training-stack path: chunked BF16 coarse scoring, coarse top-``(K + 256)`` with
 ``flashinfer.top_k``, candidate gather, FP32 rescoring, sorting, padding) and
@@ -83,6 +85,7 @@ Usage::
         [--reps 20] [--strided-k] [--verify] [--json out.json]
     python benchmarks/bench_cake_dsa_indexer.py --rows sink --arms cake,cake_nosample,cake_main,cake_main_nosample
         --main-package /path/to/main/flashinfer/experimental/cake_dsa_indexer --cupti-required --json out.json
+    python benchmarks/bench_cake_dsa_indexer.py --rows sink --arms cake,cake_far,cake_aa,cake_far_aa --cupti-required --json out.json
 """
 
 import argparse
@@ -645,6 +648,8 @@ def plan_record(backend, inputs, knobs: dict) -> dict:
         check_period=int(plan.check_period),
         sample_tiles_max=int(plan.sample_tiles_max),
         sample_shift_permille=int(plan.sample_shift_permille),
+        # None: a main package without the knob
+        far_sample=getattr(plan, "far_sample", None),
         sample_fit=bool(plan.sample_fit),
     )
 
@@ -710,6 +715,7 @@ class MaterializedArm(Arm):
 
 
 NOSAMPLE = {"sample_tiles_max": 0}
+FAR = {"far_sample": 1}
 
 
 def _cake(name, backend=None, knobs=None):
@@ -724,12 +730,15 @@ def _cake(name, backend=None, knobs=None):
     return make
 
 
-# name -> factory(inputs) -> Arm.  ``cake_aa`` / ``cake_main_aa`` prepare the same arm a second time (the in-process
-# A/A band); the ``_nosample`` arms run the same programs with the sampled first threshold off.
+# name -> factory(inputs) -> Arm.  ``cake_aa`` / ``cake_far_aa`` / ``cake_main_aa`` prepare the same arm a second time (the
+# in-process A/A band); the ``_nosample`` arms run the same programs with the sampled first threshold off, ``cake_far`` with
+# the far-sample first threshold (``far_sample=1``; the main package has no such knob, so the arm has no main twin).
 ARMS = {
     "cake": _cake("cake"),
     "cake_nosample": _cake("cake_nosample", knobs=NOSAMPLE),
+    "cake_far": _cake("cake_far", knobs=FAR),
     "cake_aa": _cake("cake_aa"),
+    "cake_far_aa": _cake("cake_far_aa", knobs=FAR),
     "cake_main": _cake("cake_main", backend="main"),
     "cake_main_nosample": _cake("cake_main_nosample", backend="main", knobs=NOSAMPLE),
     "cake_main_aa": _cake("cake_main_aa", backend="main"),
@@ -1015,7 +1024,7 @@ def main():
         raise SystemExit(f"unknown arms {unknown}; known: {sorted(ARMS)}")
     if len(set(arms)) != len(arms):
         raise SystemExit(
-            f"an arm may be named once; use cake_aa / cake_main_aa for an A/A pair: {arms}"
+            f"an arm may be named once; use cake_aa / cake_far_aa / cake_main_aa for an A/A pair: {arms}"
         )
     args.rows = expand_rows(args.rows)
     unknown_rows = [r for r in args.rows if r not in ROWS]

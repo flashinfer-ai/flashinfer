@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Generic BF16 bindings to the shared legacy-compatible device bodies."""
+"""BF16/FP16 bindings to the shared legacy-compatible device bodies."""
 
 import torch
 import cutlass
@@ -78,12 +78,14 @@ def execute(inputs, config, tactic):
     if tactic not in [
         ("ffma", first, second) for first in (1, 2, 4, 8) for second in (1, 2, 4, 8)
     ]:
-        raise ValueError("BF16 Frost requires FMA FC1/FC2 output-column tactics")
+        raise ValueError("BF16/FP16 Frost requires FMA FC1/FC2 output-column tactics")
     x, ids, scores, w1, w2, mid, routes, output, narrow = inputs
     columns, down_columns = tactic[1:]
     finalize = config.finalize.do_finalize
     key = (
-        "bf16-ffi-v1",
+        "float16-ffi-v2",
+        x.dtype,
+        output.dtype,
         tuple(x.shape),
         tuple(w1.shape),
         tuple(w2.shape),
@@ -121,7 +123,7 @@ def execute(inputs, config, tactic):
                         narrow,
                         finalize,
                         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-                        options=f"--gpu-arch sm_{major}{minor}a --enable-tvm-ffi",
+                        options=f"--gpu-arch sm_{major}{minor}{'' if major == 8 else 'a'} --enable-tvm-ffi",
                     )
                     _COMPILED[key] = compiled
         compiled(*tensors)

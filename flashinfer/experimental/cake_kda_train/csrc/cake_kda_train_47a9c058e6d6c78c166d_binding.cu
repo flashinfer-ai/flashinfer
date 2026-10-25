@@ -66,9 +66,9 @@ void Run(TensorView a_dg_in, TensorView a_db_in, TensorView a_chunk_bos, TensorV
   check_same_device(a_dg_out, a_dg_in, "dg_out", "dg_in");
   check_contiguous(a_dbeta_out, "dbeta_out");
   check_same_device(a_dbeta_out, a_dg_in, "dbeta_out", "dg_in");
-  TVM_FFI_CHECK((a_num_heads > 0), ValueError)
+  TVM_FFI_CHECK((a_num_heads > 0LL), ValueError)
       << KERNEL_NAME << ": requires (num_heads > 0)";
-  TVM_FFI_CHECK((a_num_heads <= 262143), ValueError)
+  TVM_FFI_CHECK((a_num_heads <= 262143LL), ValueError)
       << KERNEL_NAME << ": requires (num_heads <= 262143)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";

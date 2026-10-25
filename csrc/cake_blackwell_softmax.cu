@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <flashinfer/cake_blackwell_softmax.cuh>
 #include <flashinfer/sampling.cuh>
@@ -29,13 +30,11 @@ namespace {
 constexpr int kBootstrapThreads = 256;
 constexpr int kRowwiseThreads = 512;
 constexpr int kWarpThreads = 128;
-constexpr int kMr515Threads = 512;
 constexpr int kWarpRowsPerCta = 4;
 constexpr int kMaxSplits = 64;
 constexpr size_t kBootstrapDynamicSmemBytes = 128;
 constexpr size_t kRowwiseDynamicSmemBytes = 128;
 constexpr size_t kWarpDynamicSmemBytes = 0;
-constexpr size_t kMr515DynamicSmemBytes = 128;
 constexpr int kCachedThreads = 256;
 constexpr int kCachedVectorElements = 8;
 constexpr int kCachedTileElements = kCachedThreads * kCachedVectorElements;
@@ -44,8 +43,20 @@ constexpr int kCachedMaxClusterSize = 16;
 constexpr int kCachedMaxTiles = 8;
 constexpr uint32_t kCachedMaxVocabSize =
     static_cast<uint32_t>(kCachedMaxClusterSize) * kCachedMaxTiles * kCachedTileElements;
-constexpr size_t kCachedDynamicSmemBytes = 128;
 constexpr uintptr_t kCachedAlignmentBytes = 32;
+// The persistent kernels keep the clusters resident and walk the rows. They
+// pay once every resident cluster has at least 2.5 rows (measured on GB300 and
+// B200): rows * 2 >= resident clusters * 5.
+constexpr uint64_t kPersistentRowsPerClusterNum = 5;
+constexpr uint64_t kPersistentRowsPerClusterDen = 2;
+// The shared-tile kernels (4 register tiles and up to 4 shared-memory tiles
+// per CTA, four resident CTAs per SM) take an 8-tile launch once the rows
+// exceed one wave of persistent clusters, when the chunk spans at most 5
+// tiles, below the persistent threshold, or from 4 rows per resident
+// shared-tile cluster on (measured on GB300 and B200).
+constexpr int kSharedTilesAnyRowsMaxTiles = 5;
+constexpr uint64_t kSharedTilesRowsPerCluster = 4;
+constexpr int kMaxDevices = 64;
 
 enum class ParameterKind : int {
   kNone = 0,
@@ -61,8 +72,10 @@ enum class SoftmaxRoute : int64_t {
   kWarp = 1,
   kRowwise = 2,
   kBootstrap = 3,
-  kMr515V32000T512 = 4,
+  // Value 4 is not assigned; the values stay stable for tests and benchmarks.
   kCachedCluster = 5,
+  kCachedClusterPersistent = 6,
+  kCachedClusterSharedTiles = 7,
 };
 
 struct CachedVariant {
@@ -70,40 +83,10 @@ struct CachedVariant {
   int max_tiles;
 };
 
-// The frozen sm_103a MR515 specialization keeps only the 32K rows where it
-// still measured ahead of the row-caching cluster family (Cake CAKE-626):
-// 128/512/1024 rows without temperature or PDL. The cluster family took over
-// the 16/32/64-row and scalar-temperature PDL shapes it used to own.
-bool use_mr515_none_row(uint32_t rows) {
-  switch (rows) {
-    case 128:
-    case 512:
-    case 1024:
-      return true;
-    default:
-      return false;
-  }
-}
-
-bool use_mr515_kernel(uint32_t rows, uint32_t vocab_size, ParameterKind parameter_kind,
-                      float temperature_val, bool enable_pdl, int device_major, int device_minor) {
-  (void)temperature_val;
-  if (device_major != 10 || device_minor != 3 || vocab_size != 32000) {
-    return false;
-  }
-  return parameter_kind == ParameterKind::kNone && !enable_pdl && use_mr515_none_row(rows);
-}
-
 // The row-caching cluster family needs 32-byte aligned rows: 256-bit
 // vector accesses on both buffers and a vocabulary that is a multiple of 8.
-// 129-384 rows of at most 32K without temperature tie between the rowwise
-// kernel and the cluster family on GB300 and B200; they keep the rowwise route.
-bool use_cached_cluster_kernel(uint32_t rows, uint32_t vocab_size, ParameterKind parameter_kind) {
-  const bool rowwise_mid_narrow_row = rows > 128 && rows <= 384 && vocab_size >= 24576 &&
-                                      vocab_size <= 32000 && vocab_size % 4 == 0 &&
-                                      parameter_kind == ParameterKind::kNone;
-  return vocab_size % kCachedVectorElements == 0 && vocab_size <= kCachedMaxVocabSize &&
-         !rowwise_mid_narrow_row;
+bool use_cached_cluster_kernel(uint32_t vocab_size) {
+  return vocab_size % kCachedVectorElements == 0 && vocab_size <= kCachedMaxVocabSize;
 }
 
 // Every generated route issues 128- or 256-bit vector accesses relative to
@@ -121,7 +104,7 @@ int cached_chunk_elements(uint32_t vocab_size, int cluster_ctas) {
                           kCachedTileElements);
 }
 
-// Shape policy measured on GB300/B200 (Cake CAKE-626): four resident 32 KiB
+// Shape policy measured on GB300/B200: four resident 32 KiB
 // CTAs per SM stream best, so a row is split into the smallest cluster (at most
 // 8 CTAs) whose 32 KiB chunks cover it; rows wider than 256 KiB fall back to
 // 64 KiB chunks so the cluster stays within 16 CTAs. Short grids (fewer CTAs
@@ -173,9 +156,10 @@ CachedVariant select_cached_variant(uint32_t rows, uint32_t vocab_size, int sm_c
 }
 
 const void* cached_cluster_kernel(CachedVariant variant) {
-#define FLASHINFER_CACHED_SOFTMAX_CASE(C, T)                                                      \
-  if (variant.cluster_ctas == C && variant.max_tiles == T) {                                      \
-    return reinterpret_cast<const void*>(kernel_flashinfer_blackwell_softmax_cached_c##C##_t##T); \
+#define FLASHINFER_CACHED_SOFTMAX_CASE(C, T)                             \
+  if (variant.cluster_ctas == C && variant.max_tiles == T) {             \
+    return reinterpret_cast<const void*>(                                \
+        kernel_flashinfer_blackwell_softmax_cached_cluster_c##C##_t##T); \
   }
   FLASHINFER_CACHED_SOFTMAX_CASE(1, 4)
   FLASHINFER_CACHED_SOFTMAX_CASE(2, 4)
@@ -186,6 +170,189 @@ const void* cached_cluster_kernel(CachedVariant variant) {
   FLASHINFER_CACHED_SOFTMAX_CASE(16, 8)
 #undef FLASHINFER_CACHED_SOFTMAX_CASE
   return nullptr;
+}
+
+// Dynamic shared memory of each generated kernel (its SMEM_TOTAL): the
+// exchange mbarrier, then from byte 1024 the CTA's table of 8 warp pairs and
+// the cluster's table of 8 * C pairs. The persistent kernels add the 8-tile
+// buffer and keep two of each table.
+size_t cached_dynamic_smem_bytes(int cluster_ctas) {
+  switch (cluster_ctas) {
+    case 1:
+      return 128;
+    case 2:
+      return 1280;
+    case 4:
+      return 1408;
+    case 8:
+      return 1664;
+    default:
+      return 2176;
+  }
+}
+
+size_t persistent_dynamic_smem_bytes(int cluster_ctas) { return cluster_ctas == 8 ? 67712 : 68736; }
+
+// The shared-tile kernels add the 4-tile buffer and its mbarriers.
+size_t shared_tiles_dynamic_smem_bytes(int cluster_ctas) {
+  return cluster_ctas == 8 ? 34432 : 34944;
+}
+
+// The persistent kernels serve the 8-tile variants of 8 and 16 CTAs.
+const void* cached_persistent_kernel(CachedVariant variant) {
+  if (variant.max_tiles != kCachedMaxTiles) {
+    return nullptr;
+  }
+  if (variant.cluster_ctas == 8) {
+    return reinterpret_cast<const void*>(
+        kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c8_t8);
+  }
+  if (variant.cluster_ctas == 16) {
+    return reinterpret_cast<const void*>(
+        kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c16_t8);
+  }
+  return nullptr;
+}
+
+// The shared-tile kernels serve the 8-tile variants of 8 and 16 CTAs.
+const void* cached_shared_tiles_kernel(CachedVariant variant) {
+  if (variant.max_tiles != kCachedMaxTiles) {
+    return nullptr;
+  }
+  if (variant.cluster_ctas == 8) {
+    return reinterpret_cast<const void*>(
+        kernel_flashinfer_blackwell_softmax_cached_cluster_c8_t4_s4);
+  }
+  if (variant.cluster_ctas == 16) {
+    return reinterpret_cast<const void*>(
+        kernel_flashinfer_blackwell_softmax_cached_cluster_c16_t4_s4);
+  }
+  return nullptr;
+}
+
+// Function attributes of a cluster launch: non-portable clusters above 8 CTAs,
+// and dynamic shared memory above the 48 KiB default.
+cudaError_t configure_cached_kernel(const void* kernel, int cluster_ctas,
+                                    size_t dynamic_smem_bytes) {
+  cudaError_t status = cudaSuccess;
+  if (cluster_ctas > kCachedPortableClusterSize) {
+    status = cudaFuncSetAttribute(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+  }
+  if (status == cudaSuccess && dynamic_smem_bytes > 48 * 1024) {
+    status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  static_cast<int>(dynamic_smem_bytes));
+  }
+  return status;
+}
+
+// Resident clusters per device of the persistent and shared-tile kernels of 8
+// and 16 CTAs, plus one (0: not yet queried). The query also sets the kernel's
+// function attributes on that device.
+enum ResidentKernel : int {
+  kResidentPersistent = 0,
+  kResidentSharedTiles = 1,
+};
+std::atomic<int> g_resident_clusters[kMaxDevices][2][2];
+
+cudaError_t resident_clusters(ResidentKernel which, const void* kernel, int cluster_ctas,
+                              size_t dynamic_smem_bytes, int device, int* clusters) {
+  std::atomic<int>* cached = device >= 0 && device < kMaxDevices
+                                 ? &g_resident_clusters[device][which][cluster_ctas == 16]
+                                 : nullptr;
+  if (cached != nullptr) {
+    const int value = cached->load(std::memory_order_relaxed);
+    if (value > 0) {
+      *clusters = value - 1;
+      return cudaSuccess;
+    }
+  }
+  cudaError_t status = configure_cached_kernel(kernel, cluster_ctas, dynamic_smem_bytes);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(static_cast<unsigned int>(cluster_ctas));
+  config.blockDim = dim3(kCachedThreads);
+  config.dynamicSmemBytes = dynamic_smem_bytes;
+  cudaLaunchAttribute attribute{};
+  attribute.id = cudaLaunchAttributeClusterDimension;
+  attribute.val.clusterDim.x = static_cast<unsigned int>(cluster_ctas);
+  attribute.val.clusterDim.y = 1;
+  attribute.val.clusterDim.z = 1;
+  config.attrs = &attribute;
+  config.numAttrs = 1;
+  int value = 0;
+  status = cudaOccupancyMaxActiveClusters(&value, kernel, &config);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  if (cached != nullptr) {
+    cached->store(value + 1, std::memory_order_relaxed);
+  }
+  *clusters = value;
+  return cudaSuccess;
+}
+
+struct CachedLaunch {
+  CachedVariant variant;
+  const void* kernel;
+  uint64_t clusters;
+  size_t dynamic_smem_bytes;
+  SoftmaxRoute route;
+};
+
+// One cluster per row. An 8-tile variant whose rows exceed the resident
+// persistent clusters takes the shared-tile kernel (one cluster per row) or
+// the persistent kernel on every resident cluster, by the rule above.
+cudaError_t select_cached_launch(uint32_t rows, uint32_t vocab_size, int device,
+                                 CachedLaunch* launch) {
+  int sm_count = 0;
+  cudaError_t status = cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  const CachedVariant variant = select_cached_variant(rows, vocab_size, sm_count);
+  *launch = {variant, cached_cluster_kernel(variant), rows,
+             cached_dynamic_smem_bytes(variant.cluster_ctas), SoftmaxRoute::kCachedCluster};
+  if (launch->kernel == nullptr) {
+    return cudaErrorNotSupported;
+  }
+  const void* persistent = cached_persistent_kernel(variant);
+  if (persistent == nullptr) {
+    return cudaSuccess;
+  }
+  const size_t persistent_smem = persistent_dynamic_smem_bytes(variant.cluster_ctas);
+  int resident = 0;
+  status = resident_clusters(kResidentPersistent, persistent, variant.cluster_ctas, persistent_smem,
+                             device, &resident);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  if (resident <= 0 || rows <= static_cast<uint32_t>(resident)) {
+    return cudaSuccess;
+  }
+  const void* shared_tiles = cached_shared_tiles_kernel(variant);
+  const size_t shared_tiles_smem = shared_tiles_dynamic_smem_bytes(variant.cluster_ctas);
+  int shared_resident = 0;
+  status = resident_clusters(kResidentSharedTiles, shared_tiles, variant.cluster_ctas,
+                             shared_tiles_smem, device, &shared_resident);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  const bool narrow_chunk = cached_chunk_elements(vocab_size, variant.cluster_ctas) <=
+                            kSharedTilesAnyRowsMaxTiles * kCachedTileElements;
+  const bool under_persistent = static_cast<uint64_t>(rows) * kPersistentRowsPerClusterDen <
+                                static_cast<uint64_t>(resident) * kPersistentRowsPerClusterNum;
+  const bool many_rows = shared_resident > 0 && static_cast<uint64_t>(rows) >=
+                                                    kSharedTilesRowsPerCluster * shared_resident;
+  if (shared_resident > 0 && (narrow_chunk || under_persistent || many_rows)) {
+    *launch = {variant, shared_tiles, rows, shared_tiles_smem,
+               SoftmaxRoute::kCachedClusterSharedTiles};
+  } else if (!under_persistent) {
+    *launch = {variant, persistent, static_cast<uint64_t>(resident), persistent_smem,
+               SoftmaxRoute::kCachedClusterPersistent};
+  }
+  return cudaSuccess;
 }
 
 bool use_warp_kernel(uint32_t rows, uint32_t vocab_size, ParameterKind parameter_kind) {
@@ -210,21 +377,16 @@ bool use_rowwise_kernel(uint32_t rows, uint32_t vocab_size, ParameterKind parame
 }
 
 SoftmaxRoute select_softmax_route(uint32_t rows, uint32_t vocab_size, ParameterKind parameter_kind,
-                                  float temperature_val, bool enable_pdl, int device_major,
-                                  int device_minor, bool aligned_buffers) {
+                                  bool aligned_buffers) {
   if (rows == 0 || vocab_size == 0 || !aligned_buffers ||
       static_cast<uint64_t>(rows) * vocab_size >
           static_cast<uint64_t>(std::numeric_limits<int>::max())) {
     return SoftmaxRoute::kFallback;
   }
-  if (use_mr515_kernel(rows, vocab_size, parameter_kind, temperature_val, enable_pdl, device_major,
-                       device_minor)) {
-    return SoftmaxRoute::kMr515V32000T512;
-  }
   if (use_warp_kernel(rows, vocab_size, parameter_kind)) {
     return SoftmaxRoute::kWarp;
   }
-  if (use_cached_cluster_kernel(rows, vocab_size, parameter_kind)) {
+  if (use_cached_cluster_kernel(vocab_size)) {
     return SoftmaxRoute::kCachedCluster;
   }
   if (use_rowwise_kernel(rows, vocab_size, parameter_kind)) {
@@ -255,9 +417,8 @@ cudaError_t launch_noncooperative_kernel(const void* kernel, dim3 grid, dim3 blo
 cudaError_t launch_cached_cluster_kernel(const void* kernel, int cluster_ctas, dim3 grid,
                                          dim3 block, void** args, size_t dynamic_smem_bytes,
                                          bool enable_pdl, cudaStream_t stream) {
-  if (cluster_ctas > kCachedPortableClusterSize) {
-    cudaError_t status =
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+  if (cluster_ctas > kCachedPortableClusterSize || dynamic_smem_bytes > 48 * 1024) {
+    cudaError_t status = configure_cached_kernel(kernel, cluster_ctas, dynamic_smem_bytes);
     if (status != cudaSuccess) {
       return status;
     }
@@ -318,8 +479,7 @@ cudaError_t launch_blackwell_softmax(float* logits, float* output, float* temper
                                      size_t workspace_bytes, bool enable_pdl, bool is_sm103,
                                      SoftmaxRoute* selected_route, cudaStream_t stream) {
   const SoftmaxRoute route =
-      select_softmax_route(rows, vocab_size, parameter_kind, temperature_val, enable_pdl,
-                           /*device_major=*/10, is_sm103 ? 3 : 0, buffers_aligned(logits, output));
+      select_softmax_route(rows, vocab_size, parameter_kind, buffers_aligned(logits, output));
   *selected_route = route;
   if (route == SoftmaxRoute::kFallback) {
     return cudaErrorNotSupported;
@@ -334,16 +494,6 @@ cudaError_t launch_blackwell_softmax(float* logits, float* output, float* temper
   const bool launch_with_pdl = is_sm103 && enable_pdl;
   int parameter_kind_i = static_cast<int>(parameter_kind) | (launch_with_pdl ? 4 : 0);
 
-  if (route == SoftmaxRoute::kMr515V32000T512) {
-    // TEMP_KIND=0 never dereferences this ABI slot. A null dummy tells the
-    // adapted frozen payload to execute the required PDL wait/signal pair.
-    float* mr515_temperature = launch_with_pdl ? nullptr : parameter;
-    void* args[] = {&logits, &mr515_temperature, &output, &temperature_val};
-    return launch_noncooperative_kernel(
-        reinterpret_cast<const void*>(kernel_mr474_manual_softmax_exp2_t512_vec4), dim3(rows),
-        dim3(kMr515Threads), args, kMr515DynamicSmemBytes, launch_with_pdl, stream);
-  }
-
   if (route == SoftmaxRoute::kWarp) {
     void* args[] = {&logits,       &parameter,        &output,         &rows_i,
                     &vocab_size_i, &parameter_kind_i, &temperature_val};
@@ -354,27 +504,26 @@ cudaError_t launch_blackwell_softmax(float* logits, float* output, float* temper
   }
 
   if (route == SoftmaxRoute::kCachedCluster) {
-    int sm_count = 0;
     int device = 0;
     cudaError_t status = cudaGetDevice(&device);
+    CachedLaunch launch{};
     if (status == cudaSuccess) {
-      status = cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
+      status = select_cached_launch(rows, vocab_size, device, &launch);
     }
     if (status != cudaSuccess) {
       return status;
     }
-    const CachedVariant variant = select_cached_variant(rows, vocab_size, sm_count);
-    const uint64_t grid = static_cast<uint64_t>(rows) * variant.cluster_ctas;
-    const void* kernel = cached_cluster_kernel(variant);
-    if (kernel == nullptr || grid > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+    *selected_route = launch.route;
+    const uint64_t grid = launch.clusters * launch.variant.cluster_ctas;
+    if (grid > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
       return cudaErrorNotSupported;
     }
-    int chunk_elements_i = cached_chunk_elements(vocab_size, variant.cluster_ctas);
+    int chunk_elements_i = cached_chunk_elements(vocab_size, launch.variant.cluster_ctas);
     void* args[] = {&logits,       &parameter,        &output,           &rows_i,
                     &vocab_size_i, &chunk_elements_i, &parameter_kind_i, &temperature_val};
-    return launch_cached_cluster_kernel(kernel, variant.cluster_ctas,
+    return launch_cached_cluster_kernel(launch.kernel, launch.variant.cluster_ctas,
                                         dim3(static_cast<unsigned int>(grid)), dim3(kCachedThreads),
-                                        args, kCachedDynamicSmemBytes, launch_with_pdl, stream);
+                                        args, launch.dynamic_smem_bytes, launch_with_pdl, stream);
   }
 
   if (route == SoftmaxRoute::kRowwise) {
@@ -493,10 +642,18 @@ SoftmaxRoute query_softmax_route(TensorView logits, Optional<TensorView> maybe_t
   if (device_major != 10 || (device_minor != 0 && device_minor != 3)) {
     return SoftmaxRoute::kFallback;
   }
-  return select_softmax_route(static_cast<uint32_t>(logits.size(0)),
-                              static_cast<uint32_t>(logits.size(1)), parameter_kind,
-                              static_cast<float>(temperature_val), enable_pdl, device_major,
-                              device_minor, buffers_aligned(logits.data_ptr(), /*output=*/nullptr));
+  const auto rows = static_cast<uint32_t>(logits.size(0));
+  const auto vocab_size = static_cast<uint32_t>(logits.size(1));
+  const SoftmaxRoute route = select_softmax_route(
+      rows, vocab_size, parameter_kind, buffers_aligned(logits.data_ptr(), /*output=*/nullptr));
+  if (route != SoftmaxRoute::kCachedCluster) {
+    return route;
+  }
+  CachedLaunch launch{};
+  status = select_cached_launch(rows, vocab_size, logits.device().device_id, &launch);
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "Blackwell Softmax route query failed with error code " << cudaGetErrorString(status);
+  return launch.route;
 }
 
 void blackwell_softmax_impl(TensorView workspace_buffer, TensorView logits, TensorView output,
@@ -523,9 +680,7 @@ void blackwell_softmax_impl(TensorView workspace_buffer, TensorView logits, Tens
       logits_ptr, output_ptr, temperature_ptr, static_cast<float>(temperature_val), parameter_kind,
       rows, vocab_size, workspace_buffer.data_ptr(), workspace_bytes, enable_pdl, is_sm103,
       &selected_route, stream);
-  // The promoted MR515 route is fail-closed: it must never be hidden by an
-  // OnlineSoftmax fallback if its actual launch fails.
-  if (status == cudaErrorNotSupported && selected_route != SoftmaxRoute::kMr515V32000T512) {
+  if (status == cudaErrorNotSupported) {
     status = sampling::OnlineSoftmax<float>(logits_ptr, output_ptr, rows, vocab_size,
                                             temperature_ptr, static_cast<float>(temperature_val),
                                             workspace_buffer.data_ptr(), workspace_bytes,

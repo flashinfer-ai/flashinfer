@@ -233,7 +233,7 @@ def sm110_gqa_decode(
         allocated tensor.
     """
 
-    from .experimental.sm110_gqa_decode import decode
+    from .experimental.sm110_gqa_decode.backend import sm110_gqa_decode as decode
 
     return decode(
         q,
@@ -260,12 +260,15 @@ def prepare_sm110_gqa_decode(
         to 1.0 and must be finite and positive.
     num_splits : Optional[int]
         ``None`` (or ``1``) selects the size-based route with one split: one
-        request over a 64-key cache uses the short kernel, over 65..128 keys
-        the long kernel, one or two requests over more than 128 keys the
-        one-split 64-token-tile build of the split-KV kernel and every other
-        shape its one-split 32-token-tile build. An explicit count in
-        ``{2, 4, 8, 10, 16}`` launches the run-time-split program of the
-        shape's tile with that many splits; any other value is rejected.
+        request over a 64-key cache uses the short kernel and over 65..128 keys
+        the long kernel; one request over 129..256 keys or two requests over at
+        most 512 keys use the one-split 64-token-tile build of the split-KV
+        kernel, one or two requests over longer caches its four-slot-ring
+        64-token-tile build, and three or more requests its one-split
+        32-token-tile build. An explicit count in ``{2, 4, 8, 10, 16}``
+        launches the run-time-split program of the shape's tile (64-token tiles
+        for one or two requests over at most 4095 keys, 32-token tiles
+        otherwise) with that many splits; any other value is rejected.
 
     Returns
     -------
@@ -285,7 +288,7 @@ def prepare_sm110_gqa_decode(
     Prepare and warm up before CUDA Graph capture. Retain the prepared state
     until all asynchronous work completes and captured Graphs are retired.
     """
-    from .experimental.sm110_gqa_decode import prepare_for_launch
+    from .experimental.sm110_gqa_decode.backend import prepare_for_launch
 
     return prepare_for_launch(inputs, num_splits=num_splits)
 
@@ -390,7 +393,7 @@ def launch_sm110_gqa_decode_prepared(prepared: dict[str, Any]) -> torch.Tensor:
     including event-ordered stream handoffs. No allocations or host reads of
     sequence lengths occur in this launch path.
     """
-    from .experimental.sm110_gqa_decode import launch_prepared
+    from .experimental.sm110_gqa_decode.backend import launch_prepared
 
     return launch_prepared(prepared)
 

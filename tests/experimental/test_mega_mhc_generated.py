@@ -44,6 +44,8 @@ H4096_TOKENS = (
     8192,
 )
 H4096_SM_COUNTS = (148, 152, 208, 212, 216)
+# The architectures every hidden-4096 program ships for, in the records' order.
+H4096_ARCHES = ["sm_107a", "sm_100a", "sm_103a"]
 # The hidden-4096 output layouts: the BF16 output alone, or the BF16 output beside
 # its quantization (vLLM's per-token-group FP8 of it; bitwise, the tests hold).
 H4096_LAYOUTS = ("bf16", "fp8_group128", "nvfp4")
@@ -749,6 +751,51 @@ H4096_SPLITS_208 = {
     1665: 13,
     2049: 16,
 }
+# The three BF16-output programs by the regime the host rule names (the loader's
+# route key): "tailpipe_wsmem" at WEIGHT_SMEM_MAX_SPLITS (16) splits or fewer
+# when the tasks run in WEIGHT_SMEM_MIN_WAVES (5) waves of the grid or more,
+# "tailpipe" at the other counts up to TAIL_PIPE_MAX_SPLITS (22: 22, 16 and the
+# two-wave counts below them), "bf16" at 32 and 64; the split rule yields no
+# count between 22 and 32. All three write bitwise the same output.
+BF16_PROGRAM = "cake_mega_mhc_f24c2f3f98bfe3356398"
+TAILPIPE_PROGRAM = "cake_mega_mhc_c549b064530c3765f9ba"
+WSMEM_PROGRAM = "cake_mega_mhc_41024b807c02040677b3"
+TAIL_PROGRAMS = {
+    "bf16": BF16_PROGRAM,
+    "tailpipe": TAILPIPE_PROGRAM,
+    "tailpipe_wsmem": WSMEM_PROGRAM,
+}
+# The first token count at which the rule leaves the BF16 program for the
+# tailpipe program (the split count's 32 -> 22 point) and the first at which it
+# leaves the tailpipe program for its weight-staging twin (16 splits over five
+# task waves of the full grid: the first m-block count with
+# ceil(16 m / num_sms) >= 5), per SM count (two switches each, never back), and
+# the token counts of the producer's own rules test, all as that test spells them.
+H4096_PROGRAM_SWITCH = {148: 257, 152: 257, 208: 385, 212: 385, 216: 385}
+H4096_WSMEM_SWITCH = {148: 2369, 152: 2433, 208: 3329, 212: 3393, 216: 3457}
+# The first token count at which the quantized variants take 8 splits: the
+# production count's tasks in seven waves of the full grid (the first m-block
+# count with ceil(16 m / num_sms) >= 7), past the weight-staging switch.
+H4096_VARIANT_SWITCH = {148: 3521, 152: 3649, 208: 4993, 212: 5057, 216: 5185}
+H4096_RULE_TOKENS = (
+    *(1, 2, 3, 4, 5, 7, 63, 64, 65, 127, 128, 129, 192, 193, 200, 255, 256, 257),
+    *(320, 321, 384, 385, 448, 449, 512, 513, 576, 577, 832, 833, 1000, 1024),
+    *(1025, 1153, 1216, 1280, 1281, 1665, 2048, 2049, 2496, 2497, 3520, 3521),
+    *(3648, 3649, 4096, 4992, 4993, 5056, 5057, 5184, 5185, 8192, 16263, 65536),
+    1 << 20,
+)
+
+
+def _bf16_routes(regime, arch="sm_107a"):
+    """The BF16-output routes of hidden 4096 keyed on ``regime`` on ``arch``."""
+    return [
+        route
+        for route in _runtime.ROUTES
+        if route["hidden"] == 4096
+        and route.get("sf_layout") == "bf16"
+        and _runtime.route_regime(route) == regime
+        and arch in _runtime.record_arches(_runtime.PROGRAMS[route["program"]])
+    ]
 
 
 def _deepgemm_splits(tokens, num_sms):
@@ -767,7 +814,8 @@ def test_h4096_host_rules(num_sms):
     count, one token less keeps the previous one), the count's bounds (at least
     ten, never above the deepgemm count of at least 16; a smaller count only
     where the tokens fit two tail rounds of the grid, its tasks in two waves),
-    a resident grid, the scratch size, and the deterministic mode's 16."""
+    a resident grid, the scratch size, and the deterministic mode's 16; the
+    quantized variants' count (8 from seven task waves of the production count on)."""
     points = _runtime.mhc_infer_switch_points(num_sms)
     assert points == H4096_SWITCH_POINTS[num_sms]
     assert points == _runtime.mhc_infer_switch_points(num_sms, max_tokens=1 << 14)
@@ -779,6 +827,7 @@ def test_h4096_host_rules(num_sms):
             64,
             65,
             *(p + d for p in points for d in (-1, 0)),
+            *(H4096_VARIANT_SWITCH[num_sms] + d for d in (-1, 0)),
             4096,
             8192,
             1 << 20,
@@ -809,6 +858,159 @@ def test_h4096_host_rules(num_sms):
     if num_sms == 208:
         table = {t: _runtime.mhc_infer_num_splits(t, num_sms) for t in H4096_SPLITS_208}
         assert table == H4096_SPLITS_208
+    # The quantized variants' count: the production count, except 8 where the
+    # BF16 output runs the weight-staging program and the tasks run in at least
+    # seven waves of the grid; 16 when deterministic. Its one switch of its own
+    # is that wave count's first token count (H4096_VARIANT_SWITCH).
+    for t in tokens:
+        splits = _runtime.mhc_infer_num_splits(t, num_sms)
+        variant = _runtime.mhc_infer_variant_num_splits(t, num_sms)
+        grid = _runtime.mhc_infer_num_ctas(t, num_sms, splits)
+        waves = ((t + 63) // 64 * splits + grid - 1) // grid
+        wsmem = _runtime.mhc_infer_tail_program(t, num_sms) == "tailpipe_wsmem"
+        plain = wsmem and waves >= _runtime.VARIANT_PLAIN_MIN_WAVES
+        assert variant == (_runtime.VARIANT_WSMEM_REGIME_SPLITS if plain else splits)
+        assert 8 <= variant <= splits and (variant != splits) == plain
+        assert (
+            _runtime.mhc_infer_variant_num_splits(t, num_sms, deterministic=True) == 16
+        )
+    assert _runtime.VARIANT_WSMEM_REGIME_SPLITS == 8
+    assert _runtime.VARIANT_PLAIN_MIN_WAVES == 7
+    switch = H4096_VARIANT_SWITCH[num_sms]
+    assert switch > H4096_WSMEM_SWITCH[num_sms]
+    assert _runtime.mhc_infer_variant_num_splits(switch - 1, num_sms) == 16
+    assert _runtime.mhc_infer_variant_num_splits(switch, num_sms) == 8
+    assert _runtime.mhc_infer_variant_num_splits(4096, num_sms) == (
+        8 if num_sms in (148, 152) else 16
+    )
+    assert _runtime.mhc_infer_variant_num_splits(8192, num_sms) == 8
+
+
+def _expected_h4096_program(t, num_sms, deterministic=False):
+    """The host rule restated as the producer's rules test spells it: the
+    weight-staging twin at <= 16 splits over >= 5 task waves of the grid, the
+    tailpipe program at the other counts <= 22, the BF16 program at 32 and 64."""
+    splits = _runtime.mhc_infer_num_splits(t, num_sms, deterministic)
+    grid = _runtime.mhc_infer_num_ctas(t, num_sms, splits)
+    waves = -(-((t + 63) // 64 * splits) // grid)
+    if splits <= 16 and waves >= 5:
+        return "tailpipe_wsmem"
+    return "tailpipe" if splits <= 22 else "bf16"
+
+
+@pytest.mark.parametrize("num_sms", H4096_SM_COUNTS)
+def test_h4096_tail_program_follows_the_split_count(num_sms):
+    """The BF16-output route launches exactly one program for every (T, SM count):
+    the host rule names the regime ("tailpipe_wsmem" at the split counts up to
+    WEIGHT_SMEM_MAX_SPLITS over WEIGHT_SMEM_MIN_WAVES task waves or more,
+    "tailpipe" at the other counts up to TAIL_PIPE_MAX_SPLITS, "bf16" at 32 and
+    64; the counts 23..31 are unreachable by the rule, asserted here), every
+    regime the rule names has exactly one route and no other route matches, and
+    a selection without the regime is refused; two program switches per SM
+    count, at the token counts the producer's rules test spells (the split
+    count's 32 -> 22 point, then the five-wave point at a constant 16 splits);
+    the deterministic 16 is the tailpipe program's below the wave switch and
+    the twin's from it."""
+    assert _runtime.TAIL_PIPE_MAX_SPLITS == 22
+    assert _runtime.WEIGHT_SMEM_MAX_SPLITS == 16
+    assert _runtime.WEIGHT_SMEM_MIN_WAVES == 5
+    by_regime = {
+        regime: [r for r in _runtime.ROUTES if r["program"] == program]
+        for regime, program in TAIL_PROGRAMS.items()
+    }
+    for regime, routes in by_regime.items():
+        assert len(routes) == 1 and routes[0]["num_splits"] == "runtime", regime
+        assert _runtime.route_regime(routes[0]) == routes[0]["regime"] == regime
+    keyed = [r for r in _runtime.ROUTES if _runtime.route_regime(r) is not None]
+    assert keyed == [routes[0] for routes in by_regime.values()], (
+        "only the BF16-output route is keyed on a regime"
+    )
+    assert all(
+        _runtime.route_regime(r) is None for r in _runtime.ROUTES if r not in keyed
+    )
+    points = _runtime.mhc_infer_switch_points(num_sms)
+    program_switch = H4096_PROGRAM_SWITCH[num_sms]
+    wsmem_switch = H4096_WSMEM_SWITCH[num_sms]
+    tokens = sorted(
+        {
+            *H4096_TOKENS,
+            *H4096_RULE_TOKENS,
+            *(p + d for p in points for d in (-1, 0)),
+            *(program_switch + d for d in (-1, 0)),
+            *(wsmem_switch + d for d in (-1, 0, 63, 64)),
+            2 * wsmem_switch,
+            1 << 14,
+        }
+    )
+    image, regimes = set(), set()
+    for t in tokens:
+        splits = _runtime.mhc_infer_num_splits(t, num_sms)
+        image.add(splits)
+        regime = _runtime.mhc_infer_tail_program(t, num_sms)
+        regimes.add(regime)
+        assert regime == _expected_h4096_program(t, num_sms)
+        assert regime == (
+            "tailpipe_wsmem"
+            if t >= wsmem_switch
+            else "tailpipe"
+            if t >= program_switch
+            else "bf16"
+        )
+        if regime == "tailpipe_wsmem":
+            assert splits == 16
+            assert _runtime.mhc_infer_num_ctas(t, num_sms, splits) == num_sms
+        fixed = _runtime.mhc_infer_tail_program(t, num_sms, deterministic=True)
+        assert fixed == _expected_h4096_program(t, num_sms, deterministic=True)
+        assert fixed == ("tailpipe_wsmem" if t >= wsmem_switch else "tailpipe")
+        routes = _bf16_routes(regime)
+        assert [r["program"] for r in routes] == [TAIL_PROGRAMS[regime]], (t, splits)
+        selected, defines = _runtime.select_program(
+            4096, splits, False, False, "bf16", "sm_107a", regime=regime
+        )
+        assert selected == TAIL_PROGRAMS[regime] and defines == {}
+        with pytest.raises(NotImplementedError, match="regime=None"):
+            _runtime.select_program(4096, splits, False, False, "bf16", "sm_107a")
+    # The split count is constant between its switch points, so the counts seen
+    # at the points and their predecessors are its whole image on this SM count;
+    # the regimes the rule names are exactly the routes' keys, each reached.
+    assert image <= {*range(10, 23), 32, 64} and {16, 32, 64} <= image
+    assert not image & set(range(23, 32))
+    assert regimes == set(TAIL_PROGRAMS) == {r["regime"] for r in keyed}
+    with pytest.raises(NotImplementedError, match="regime='other'"):
+        _runtime.select_program(
+            4096, 16, False, False, "bf16", "sm_107a", regime="other"
+        )
+    # The program changes only at m-block boundaries: scanning them to 2^14
+    # tokens finds exactly the two switches, each the first token count of its
+    # program; the wave switch lies beyond the last split-count switch point, at
+    # the first m-block count with ceil(16 m / num_sms) >= 5.
+    switches = [
+        t
+        for t in range(65, (1 << 14) + 1, 64)
+        if _runtime.mhc_infer_tail_program(t, num_sms)
+        != _runtime.mhc_infer_tail_program(t - 1, num_sms)
+    ]
+    assert switches == [program_switch, wsmem_switch]
+    assert points[-1] < wsmem_switch and wsmem_switch % 64 == 1
+    assert (wsmem_switch + 63) // 64 == (4 * num_sms) // 16 + 1
+    assert _runtime.mhc_infer_tail_program(1, num_sms) == "bf16"
+    assert _runtime.mhc_infer_tail_program(1 << 20, num_sms) == "tailpipe_wsmem"
+    assert _runtime.mhc_infer_tail_program(1, num_sms, deterministic=True) == "tailpipe"
+    matrix = _runtime._support_matrix()
+    assert all(
+        f"({regime}: {program})" in matrix for regime, program in TAIL_PROGRAMS.items()
+    )
+    if num_sms == 208:
+        spots = (256, 385, 512, 3328, 3329, 4096, 8192)
+        assert [_runtime.mhc_infer_tail_program(t, 208) for t in spots] == [
+            "bf16",
+            "tailpipe",
+            "tailpipe",
+            "tailpipe",
+            "tailpipe_wsmem",
+            "tailpipe_wsmem",
+            "tailpipe_wsmem",
+        ]
 
 
 def test_split_fn_is_the_exact_three_way_split():
@@ -848,10 +1050,21 @@ def test_h4096_values_and_replay(tokens, layout):
     kw = layout_kwargs(layout, values)
     plan = prepare_mega_mhc(**values, sf_layout=layout, **kw)
     _arch, sms = _runtime.device_facts(torch.cuda.current_device())
-    assert plan.config["num_splits"] == _runtime.mhc_infer_num_splits(tokens, sms)
+    rule = (
+        _runtime.mhc_infer_variant_num_splits
+        if layout in _runtime.QUANT_LAYOUTS
+        else _runtime.mhc_infer_num_splits
+    )
+    assert plan.config["num_splits"] == rule(tokens, sms)
     assert plan.config["num_launch_sms"] == _runtime.mhc_infer_num_ctas(
         tokens, sms, plan.config["num_splits"]
     )
+    if layout == "bf16":
+        regime = _runtime.mhc_infer_tail_program(tokens, sms)
+        assert plan.config["regime"] == regime
+        assert plan.program == plan.config["program"] == TAIL_PROGRAMS[regime]
+    else:
+        assert plan.program not in TAIL_PROGRAMS.values()
     assert set(plan.outputs) == {*BF16_OUTPUTS, *QUANT_OUTPUTS[layout]}
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -882,6 +1095,12 @@ def test_h4096_graph_replay_changed_inputs_and_update_fn(tokens, layout):
     values = inputs_h4096(tokens)
     kw = layout_kwargs(layout, values)
     plan = prepare_mega_mhc(**values, sf_layout=layout, **kw)
+    _arch, sms = _runtime.device_facts(torch.cuda.current_device())
+    if layout == "bf16":
+        # 1 and 200 tokens replay the BF16 program, 1025 the tailpipe program.
+        assert (
+            plan.program == TAIL_PROGRAMS[_runtime.mhc_infer_tail_program(tokens, sms)]
+        )
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -942,6 +1161,50 @@ def test_h4096_caller_held_fnp_and_deterministic_splits():
     check_h4096(plan.outputs, dict(values, fn=replacement))
 
 
+def test_h4096_tailpipe_programs_are_bitwise_the_bf16_program(monkeypatch):
+    """At every token count the rule dispatches to the tailpipe program or its
+    weight-staging twin, a plan forced onto the BF16 program (the route read as
+    the BF16 program's) writes bitwise the same four outputs over the same
+    inputs; the forced plan launches the same grid and split count, so the two
+    differ in the program alone. The candidates reach both tailpipe regimes on
+    the device (3329 is the twin's first token count on 208 SMs)."""
+    _skip_unless_exported(4096, "bf16")
+    _arch, sms = _runtime.device_facts(torch.cuda.current_device())
+    candidates = (385, 577, 1025, 1281, 2048, 3329, 4096, 8192)
+    regimes = {t: _runtime.mhc_infer_tail_program(t, sms) for t in candidates}
+    tokens = [t for t in candidates if regimes[t] != "bf16"]
+    assert {regimes[t] for t in tokens} == {"tailpipe", "tailpipe_wsmem"}, regimes
+    select = _runtime.select_program
+
+    def forced(hidden, splits, shifted, shared_sf, sf_layout, arch, regime=None):
+        assert (hidden, sf_layout) == (4096, "bf16") and regime != "bf16"
+        return select(
+            hidden, splits, shifted, shared_sf, sf_layout, arch, regime="bf16"
+        )
+
+    for t in tokens:
+        values = inputs_h4096(t)
+        dispatched = prepare_mega_mhc(**values, sf_layout="bf16")
+        assert dispatched.program == TAIL_PROGRAMS[regimes[t]]
+        assert dispatched.config["regime"] == regimes[t]
+        with monkeypatch.context() as patch:
+            patch.setattr(_runtime, "select_program", forced)
+            base = prepare_mega_mhc(**values, sf_layout="bf16")
+        assert base.program == BF16_PROGRAM
+        assert base.config["num_splits"] == dispatched.config["num_splits"]
+        assert base.config["num_launch_sms"] == dispatched.config["num_launch_sms"]
+        for plan in (dispatched, base):
+            poison(plan.outputs)
+            plan.run()
+        torch.cuda.synchronize()
+        check_h4096(dispatched.outputs, values)
+        for name in BF16_OUTPUTS:
+            assert bitwise_equal(dispatched.outputs[name], base.outputs[name]), (
+                t,
+                name,
+            )
+
+
 # ------------------------------------------------- the FP8 group-128 output variant (hidden 4096)
 
 
@@ -949,15 +1212,40 @@ def test_h4096_quant_routes_select_their_programs():
     """The hidden-4096 layouts dispatch on (hidden, output layout, architecture):
     each exported layout names its own program, an unexported pair is refused
     with the support matrix, and the support matrix names every exported pair."""
-    bf16 = _runtime.select_program(4096, 16, False, False, "bf16", "sm_107a")[0]
+    bf16 = _runtime.select_program(
+        4096, 32, False, False, "bf16", "sm_107a", regime="bf16"
+    )
+    tailpipe = _runtime.select_program(
+        4096, 16, False, False, "bf16", "sm_107a", regime="tailpipe"
+    )[0]
+    wsmem = _runtime.select_program(
+        4096, 16, False, False, "bf16", "sm_107a", regime="tailpipe_wsmem"
+    )[0]
+    assert (bf16[0], tailpipe, wsmem) == (BF16_PROGRAM, TAILPIPE_PROGRAM, WSMEM_PROGRAM)
+    bf16 = bf16[0]
     assert _runtime.supported("sm_107a", 4096, "bf16")
-    assert _runtime.PROGRAMS[bf16]["hidden"] == 4096
+    base = _runtime.PROGRAMS[bf16]
+    for program in (tailpipe, wsmem):
+        record = _runtime.PROGRAMS[program]
+        assert record["hidden"] == base["hidden"] == 4096
+        assert record["arg_plan"] == base["arg_plan"]
+        assert record["launch"]["block"] == base["launch"]["block"]
+        assert record["launch"]["cooperative"] == base["launch"]["cooperative"]
+        assert record["launch"]["use_pdl"] == base["launch"]["use_pdl"]
+    assert _runtime.PROGRAMS[tailpipe]["launch"] == base["launch"]
+    # The twin stages the RMSNorm weight (4096 BF16 values) in shared memory.
+    assert (
+        _runtime.PROGRAMS[wsmem]["launch"]["dynamic_smem_bytes"]
+        == base["launch"]["dynamic_smem_bytes"] + 4096 * 2
+    )
     matrix = _runtime._support_matrix()
-    assert "hidden=4096 output=bf16 on ['sm_107a']" in matrix
+    assert f"hidden=4096 output=bf16 on {H4096_ARCHES}" in matrix
     for layout in ("fp8_group128", "nvfp4"):
         exported = _runtime.supported("sm_107a", 4096, layout)
         assert not _runtime.supported("sm_107a", 5120, layout)
-        assert not _runtime.supported("sm_100a", 4096, layout)
+        assert _runtime.supported("sm_100a", 4096, layout) == exported
+        assert _runtime.supported("sm_103a", 4096, layout) == exported
+        assert not _runtime.supported("sm_120a", 4096, layout)
         if not exported:
             assert f"output={layout}" not in matrix
             with pytest.raises(NotImplementedError, match="(?i)exported:"):
@@ -966,15 +1254,55 @@ def test_h4096_quant_routes_select_their_programs():
         program, defines = _runtime.select_program(
             4096, 16, False, False, layout, "sm_107a"
         )
-        assert program != bf16 and defines == {}
+        assert program not in (bf16, tailpipe, wsmem) and defines == {}
+        for splits, regime in (
+            (64, "bf16"),
+            (16, "tailpipe"),
+            (16, "tailpipe_wsmem"),
+            (32, None),
+        ):
+            same = _runtime.select_program(
+                4096, splits, False, False, layout, "sm_107a", regime=regime
+            )
+            assert same[0] == program, "a single-program layout ignores the regime"
         record = _runtime.PROGRAMS[program]
-        assert record["hidden"] == 4096 and record["arches"] == ["sm_107a"]
+        assert record["hidden"] == 4096 and record["arches"] == H4096_ARCHES
         routes = [r for r in _runtime.ROUTES if r["program"] == program]
         assert [r["sf_layout"] for r in routes] == [layout]
-        assert f"hidden=4096 output={layout} on ['sm_107a']" in matrix
+        assert f"hidden=4096 output={layout} on {H4096_ARCHES}" in matrix
         names = [name for _kind, name in _runtime.record_arg_plan(record)]
         assert names[-3:] == ["grid_x", "grid_y", "grid_z"]
         assert set(QUANT_OUTPUTS[layout]) < set(names)
+
+
+def test_h4096_every_program_ships_for_every_listed_architecture():
+    """Each hidden-4096 record lists the same three architectures, sm_107a first,
+    and the routes select the same program on each of them; hidden 5120 stays
+    unexported on sm_107a."""
+    h4096 = [
+        name for name, record in _runtime.PROGRAMS.items() if record["hidden"] == 4096
+    ]
+    assert len(h4096) == 5
+    for name in h4096:
+        assert _runtime.record_arches(_runtime.PROGRAMS[name]) == H4096_ARCHES, name
+    for arch in H4096_ARCHES:
+        for splits, regime, program in (
+            (64, "bf16", BF16_PROGRAM),
+            (16, "tailpipe", TAILPIPE_PROGRAM),
+            (16, "tailpipe_wsmem", WSMEM_PROGRAM),
+        ):
+            assert _runtime.select_program(
+                4096, splits, False, False, "bf16", arch, regime=regime
+            ) == (program, {})
+        for layout in ("fp8_group128", "nvfp4"):
+            if _runtime.supported(arch, 4096, layout):
+                program, defines = _runtime.select_program(
+                    4096, 16, False, False, layout, arch
+                )
+                assert program not in (BF16_PROGRAM, TAILPIPE_PROGRAM, WSMEM_PROGRAM)
+                assert defines == {}
+        assert _runtime.supported(arch, 5120, "col") == (arch != "sm_107a")
+    assert _runtime.shipped_arches() == sorted(H4096_ARCHES)
 
 
 def test_h4096_quant_keyword_rules():
@@ -1117,7 +1445,7 @@ def test_h4096_shared_launch_epochs_must_launch_the_same_grid():
     epochs = torch.zeros((sms,), dtype=torch.uint64, device="cuda")
     small = prepare_mega_mhc(**inputs_h4096(64), sf_layout="bf16", launch_epochs=epochs)
     grid = small.config["num_launch_sms"]
-    assert grid < sms
+    assert grid < sms and small.program == BF16_PROGRAM
     with pytest.raises(
         ValueError, match=f"launching {grid} CTAs; this plan launches {sms}"
     ):
@@ -1129,12 +1457,32 @@ def test_h4096_shared_launch_epochs_must_launch_the_same_grid():
     torch.cuda.synchronize()
     counts = epochs.cpu().tolist()
     assert counts[:grid] == [3] * grid and counts[grid:] == [0] * (sms - grid)
+    full = TAIL_PROGRAMS[_runtime.mhc_infer_tail_program(4096, sms)]
+    assert full != BF16_PROGRAM
     other = prepare_mega_mhc(**inputs_h4096(4096), sf_layout="bf16")
     assert other.launch_epochs is not epochs and other.config["num_launch_sms"] == sms
+    assert other.program == full, "the guard spans the programs"
     del small, twin, plan
     gc.collect()
     big = prepare_mega_mhc(**inputs_h4096(4096), sf_layout="bf16", launch_epochs=epochs)
-    assert big.launch_epochs is epochs
+    assert big.launch_epochs is epochs and big.program == full
+    # Two full-grid plans share fresh storage (on 208 SMs the twin at 4096 tokens
+    # and the tailpipe program at 2048); every CTA advances in step. (The storage
+    # above is not launched again: its slots are no longer uniform after the
+    # smaller grid, and the kernel's epoch stamps must agree across the active
+    # CTAs.)
+    fresh = torch.zeros((sms,), dtype=torch.uint64, device="cuda")
+    pair = {
+        t: prepare_mega_mhc(**inputs_h4096(t), sf_layout="bf16", launch_epochs=fresh)
+        for t in (4096, 2048)
+    }
+    for t, plan in pair.items():
+        assert plan.program == TAIL_PROGRAMS[_runtime.mhc_infer_tail_program(t, sms)]
+        assert plan.program != BF16_PROGRAM and plan.launch_epochs is fresh
+        assert plan.config["num_launch_sms"] == sms
+        plan.run()
+    torch.cuda.synchronize()
+    assert fresh.cpu().tolist() == [2] * sms
 
 
 def test_h4096_a_plans_own_launch_epochs_is_guarded_like_a_caller_owned_one():
