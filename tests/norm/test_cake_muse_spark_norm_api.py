@@ -228,7 +228,7 @@ GAPS_SM107A = {
 # and keep the plain route's boundaries.
 GAPS_PDL = {
     ("sm_100a", f"{OP_A}_mode0_pdl", None): ((768, 4095),),
-    ("sm_103a", f"{OP_A}_mode0_pdl", None): ((768, 8191),),
+    ("sm_103a", f"{OP_A}_mode0_pdl", None): ((1024, 8191),),
     ("sm_100a", f"{OP_C}_bf16_pdl", 128): ((0, 1), (16, 64)),
     ("sm_100a", f"{OP_C}_bf16_pdl", 32): ((0, 1), (64, 128), (192, 257)),
     ("sm_100a", f"{OP_C}_bf16_pdl", 16): ((0, 1),),
@@ -265,7 +265,7 @@ OP_A_PDL_WINDOWS = {
         (128, "rsa"),
         (255, "pro"),
         (512, "psb"),
-        (768, "pro"),
+        (1024, "pro"),
         (8191, None),
         (None, "pro"),
     ),
@@ -1198,7 +1198,7 @@ def test_gated_residual_rmsnorm_routes_on_sm_107a():
 def test_gated_residual_rmsnorm_helpers_and_support(monkeypatch):
     """The variant of a gated residual RMSNorm call is its mode (``weight`` applied before the norm or absent) and
     its launch form; on the Blackwell architectures every variant's route is exported, the plain routes' windows
-    partition the positive row counts and the mode-0 PDL routes leave 769-4095 (sm_100a) / 769-8191 (sm_103a) rows
+    partition the positive row counts and the mode-0 PDL routes leave 769-4095 (sm_100a) / 1025-8191 (sm_103a) rows
     to the FlashInfer kernel under PDL; on sm_107a mode 0 leaves 129-256 rows to it in both launch forms."""
     assert pkg.GATED_RESIDUAL_RMSNORM == OP_A
     assert pkg.gated_residual_rmsnorm_variant(False, False) == "mode0"
