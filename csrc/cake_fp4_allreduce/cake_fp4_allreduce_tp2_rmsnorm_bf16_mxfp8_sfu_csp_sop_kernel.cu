@@ -169,7 +169,7 @@ __device__ __forceinline__ float mul_f32_rn_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(352, LAUNCH_MIN_BLOCKS) void
-cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_csp_sop_pf(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ res_in, __nv_bfloat16* __restrict__ w, uint8_t* __restrict__ outq, uint8_t* __restrict__ out_sf, float* __restrict__ gs_out, __nv_bfloat16* __restrict__ res_out, uint8_t* __restrict__ os_wire, uint8_t* __restrict__ os_rs, long long* __restrict__ peer_ptrs, unsigned int* __restrict__ ctrl, int rank, int rows, int cap, float eps, float wbias)
+cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_sfu_csp_sop(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ res_in, __nv_bfloat16* __restrict__ w, uint8_t* __restrict__ outq, uint8_t* __restrict__ out_sf, float* __restrict__ gs_out, __nv_bfloat16* __restrict__ res_out, uint8_t* __restrict__ os_wire, uint8_t* __restrict__ os_rs, long long* __restrict__ peer_ptrs, unsigned int* __restrict__ ctrl, int rank, int rows, int cap, float eps, float wbias)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -308,9 +308,6 @@ cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_csp_sop_pf(__nv_bfloat16* __restrict__
                 if (n > k) {
                     long long row64 = (long long)(r0 + warp_1 + 10 * k);
                     int ob_off = own_off + k % 2 * 3472;
-                    asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(reinterpret_cast<uint8_t*>(res_in) + (row64 * 12288 + (long long)(128 * lane_2)))));
-                    asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(reinterpret_cast<uint8_t*>(res_in) + (row64 * 12288 + (long long)(128 * (lane_2 + 32))))));
-                    asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(reinterpret_cast<uint8_t*>(res_in) + (row64 * 12288 + (long long)(128 * (lane_2 + 64))))));
                     if (k > 1) {
                         if (lane_2 == 0) {
                             asm volatile("cp.async.bulk.wait_group.read 1;");
@@ -3483,6 +3480,11 @@ cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_csp_sop_pf(__nv_bfloat16* __restrict__
                     float rcp6 = approx_rcp(six);
                     float rcp_gs = approx_rcp(gso);
                     float rcp448 = approx_rcp(e4m3_max);
+                    unsigned int row32 = (unsigned int)drow;
+                    unsigned int tile = row32 >> 7;
+                    unsigned int lanepart = ((unsigned int)lane_2 >> 2) * 512 + ((unsigned int)lane_2 & 3);
+                    unsigned int intile = row32 << 4 & 496 | row32 >> 3 & 12 | lanepart;
+                    long long sf_base = (long long)tile * 24576;
                     #pragma unroll 1
                     for (int j = 0; j < 6; j++) {
                         int pp_1 = lane_2 + 32 * j;
@@ -3647,6 +3649,7 @@ cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_csp_sop_pf(__nv_bfloat16* __restrict__
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(y[_lp*2 + 0], y[_lp*2+1 + 0]));
                             y_bf16[_lp] = *(uint32_t*)&_bf2;
                         }
+                        long long hoff = sf_base + (long long)(intile + (unsigned int)(4096 * j));
                         float yb[32];
                         yb[0] = __uint_as_float(y_bf16[0] << 16);
                         yb[1] = __uint_as_float(y_bf16[0] & 4294901760u);
@@ -3909,10 +3912,7 @@ cake_fp4_allreduce_tp2_rmsnorm_bf16_mxfp8_csp_sop_pf(__nv_bfloat16* __restrict__
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
                                 :: "l"((void*)(reinterpret_cast<float*>(outq + voff) + (0))), "r"(_stv8_190_0), "r"(_stv8_190_1), "r"(_stv8_190_2), "r"(_stv8_190_3), "r"(_stv8_190_4), "r"(_stv8_190_5), "r"(_stv8_190_6), "r"(_stv8_190_7) : "memory");
                         }
-                        long long rowpart = drow / 128 * 24576 + drow % 32 * 16 + drow % 128 / 32 * 4;
-                        int bpart = (pp_1 >> 2) * 512 + (pp_1 & 3);
-                        long long off = rowpart + (long long)bpart;
-                        *(reinterpret_cast<unsigned char*>(reinterpret_cast<uint8_t*>(out_sf + off)) + (0)) = (unsigned char)(e8);
+                        *(reinterpret_cast<unsigned char*>(reinterpret_cast<uint8_t*>(out_sf + hoff)) + (0)) = (unsigned char)(e8);
                     }
                 }
                 if (n > k + 1) {
