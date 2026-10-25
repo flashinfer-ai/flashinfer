@@ -117,8 +117,7 @@ prepared object and tensors alive until all work and captured Graphs finish.
 Order tensor updates before launch, and allocate separate prepared instances
 for concurrently executing streams or Graphs because workspace is mutable.
 The prepared state records `route` (the registry record), `num_splits` (the
-run-time split count), `grid`, `workspace`, `launch_names` and
-`workspace_bytes`.
+run-time split count), `grid`, `workspace` and `workspace_bytes`.
 
 This API is experimental because its tensor layout and fixed head geometry are
 serving-workload specific. Graduation requires broader workload validation,

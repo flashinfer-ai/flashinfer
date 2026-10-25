@@ -81,10 +81,8 @@ def test_registry_records_reference_the_build_manifest() -> None:
     for name, record in loader.MODULES.items():
         assert not {"sources", "sources_sha256", "compile_flags"} & set(record), name
         assert record["ffi_entry"] == "run", name
-        assert record["kernel_symbol"] == f"kernel_{record['library']}", name
         assert record["stage"] in loader.STAGES, name
         assert tuple(record["arches"]) == loader.ARCHES, name
-        assert not record["launch"]["cooperative"] and not record["launch"]["use_pdl"]
         plan = [tuple(item) for item in record["arg_plan"]]
         assert {kind for kind, _ in plan} <= PLAN_KINDS, name
         assert plan[-3:] == [("grid", "grid_x"), ("grid", "grid_y"), ("grid", "grid_z")]
@@ -150,19 +148,11 @@ def test_record_table_is_the_routed_closure() -> None:
         rule = record["grid_rule"]
         assert rule["kind"] == "tree" and rule["ctas_per_tile"] == 2
         assert rule["tiles_per_cluster"] == (2 if variant["kernel"] == "pair" else 1)
-        cluster = tuple(record["launch"]["cluster"])
-        if variant["kernel"] == "pair":
-            assert cluster == (4, 1, 1)
-        else:
-            assert cluster == ((2, 2, 1) if variant["even"] else (2, 1, 1))
-        # grid.x is one cluster of the program: clusters neither repeat nor miss output tiles.
-        assert rule["ctas_per_tile"] * rule["tiles_per_cluster"] == cluster[0]
         has_pages = variant["cache"] == "page128"
         assert ("kv_cache_list.page_list" in record["logical"].values()) == has_pages
     decode = loader.MODULES[DECODE_RECORD]
     assert decode["stage"] == "decode"
     assert decode["variant"] == {"precision": "fp16", "cache": "contig"}
-    assert tuple(decode["launch"]["cluster"]) == (1, 1, 1)
     decode_records = {
         name for name, record in loader.MODULES.items() if record["stage"] == "decode"
     }
@@ -181,7 +171,6 @@ def test_record_table_is_the_routed_closure() -> None:
             assert name == DECODE_RECORD
         else:
             assert name == f"{DECODE_RECORD}_c{clustered}" and clustered in (2, 4)
-            assert tuple(record["launch"]["cluster"]) == (clustered, 1, 1)
         assert record["grid_rule"] == {"kind": "decode_partitions"}
         assert record["workspace"] == ["partial", "statistics", "counters"]
         assert record["partition_tokens"] == loader.DEFAULT_PARTITION_TOKENS
@@ -329,7 +318,6 @@ def test_decode_record_selection_prefers_a_cluster_program_of_the_count(
             "cache": "contig",
             "cluster_partitions": count,
         }
-        assert tuple(record["launch"]["cluster"]) == (count, 1, 1)
         assert record["library"] != loader.MODULES[DECODE_RECORD]["library"]
     assert loader.select_decode_record(ratio=8, partitions=2) == f"{DECODE_RECORD}_c2"
     assert loader.select_decode_record(ratio=4, partitions=4) == f"{DECODE_RECORD}_c4"

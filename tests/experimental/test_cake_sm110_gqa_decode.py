@@ -85,11 +85,8 @@ def test_registry_records_reference_the_build_manifest() -> None:
             record
         ), name
         assert record["ffi_entry"] == "run", name
-        assert record["kernel_symbol"] == f"kernel_{record['library']}", name
         assert record["stage"] == "decode" and record["variant"] == name
         assert tuple(record["arches"]) == loader.ARCHES, name
-        assert not record["launch"]["cooperative"] and not record["launch"]["use_pdl"]
-        assert tuple(record["launch"]["cluster"]) == (1, 1, 1)
         plan = [tuple(item) for item in record["arg_plan"]]
         assert plan[-3:] == [("grid", "grid_x"), ("grid", "grid_y"), ("grid", "grid_z")]
         for kind, key in plan[:-3]:

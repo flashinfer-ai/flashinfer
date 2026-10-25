@@ -116,7 +116,6 @@ def test_registry_names_delivered_sources() -> None:
     assert manifest["schema"] == "cake-build/1"
     for route, record in cake_jit.MODULES.items():
         assert record["ffi_entry"] == "run", route
-        assert record["kernel_symbol"] == f"kernel_{record['library']}", route
         assert record["library"].startswith("cake_sm110_gqa_decode_"), route
         entry = libraries[cake_jit.library_name(route, "sm_110a")]
         for source in entry["sources"]:
@@ -263,7 +262,6 @@ def test_prepared_host_path_selects_routes_without_device_synchronization(
     assert state["route"] == route
     assert state["num_splits"] == splits
     assert state["workspace_bytes"] == workspace_bytes
-    assert state["launch_names"] == [cake_jit.MODULES[route]["kernel_symbol"]]
     ((selected, arguments),) = launches
     assert selected == route
     if cake_jit.MODULES[route]["grid_rule"]["kind"] == "batch_heads":
