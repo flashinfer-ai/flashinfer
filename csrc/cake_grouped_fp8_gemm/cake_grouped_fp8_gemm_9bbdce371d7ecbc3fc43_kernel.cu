@@ -234,7 +234,7 @@ __device__ __forceinline__ void tma_store_2d(
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_grouped_fp8_gemm_a53778c420d09178d935(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap A32, const __grid_constant__ CUtensorMap A64, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C_tma, const __grid_constant__ CUtensorMap SFA_packed, const __grid_constant__ CUtensorMap SFB_packed, int* __restrict__ m_indices, unsigned int shape_m, unsigned int shape_n, unsigned int k_tiles, unsigned int sf_cols)
+kernel_cake_grouped_fp8_gemm_9bbdce371d7ecbc3fc43(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap A32, const __grid_constant__ CUtensorMap A64, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C_tma, const __grid_constant__ CUtensorMap SFA_packed, const __grid_constant__ CUtensorMap SFB_packed, int* __restrict__ m_indices, unsigned int shape_m, unsigned int shape_n, unsigned int k_tiles, unsigned int sf_cols)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
