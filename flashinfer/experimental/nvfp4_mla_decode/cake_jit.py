@@ -20,10 +20,14 @@ persistent decode over a host work table and the split-KV combine behind it.
 
 Every record of ``MODULES`` is one mechanically exported program: a CUDA
 device translation unit plus a tvm-ffi binding, compiled once per
-architecture.  The records are keyed by the stage they fill (``decode``: the
-persistent decode, one cluster of CTAs per work unit; ``reduce``: the split-KV
-combine, launched only when the plan has more than one split), so a renamed
-program changes no host code.  A record carries the host plan only: the
+architecture.  The records are keyed by name and each names the stage it fills
+(``stage``, one of ``STAGES``: ``decode``, the persistent decode, one cluster
+of CTAs per work unit; ``reduce``, the split-KV combine, launched only when the
+plan has more than one split).  The decode stage has two records: ``decode``
+and ``decode_qk_ahead``, an SM100 decode (the QK MMAs issued two tiles ahead of
+PV) that the host's ``select_decode_record`` picks for long balanced plans; the
+two programs' outputs are bitwise identical.  A renamed program still changes
+no host code.  A record carries the host plan only: the
 program's ``library`` stem (its ``build.json`` entries are
 ``<library>_<arch>``), the architectures it is delivered for, the source
 ``module`` and ``build`` keywords it was rendered from, its launch record, the
@@ -55,7 +59,9 @@ is a literal: the exporter reads this file with ``ast.literal_eval``.
 The program name ``cake_nvfp4_mla_decode_<20 hex>`` is the first twenty hex
 digits of the SHA-256 of the compact JSON ``{"build": <build keywords, sorted,
 every default spelled>, "module": <dotted source module>}`` of the kernel the
-program was rendered from; a changed keyword is a new program.
+program was rendered from; a changed keyword is a new program.  The exception
+is a keyword at its implicit default (``qk_ahead`` at ``False``): the name
+omits it, so programs named before the keyword existed keep their names.
 """
 
 from __future__ import annotations
@@ -247,7 +253,9 @@ def device_arch(device_index: int) -> str:
 
 
 def program_available(arch: str) -> bool:
-    """True when the record of every stage is delivered for ``arch``."""
+    """True when the record named after every stage is delivered for ``arch``
+    (``decode_qk_ahead`` is an optional second decode the host selects only
+    where it is delivered)."""
     return all(
         stage in MODULES and arch in MODULES[stage]["arches"] for stage in STAGES
     )

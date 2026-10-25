@@ -69,6 +69,12 @@ MIN_TILES_PER_UNIT = 8  # balanced schedule: minimum pipeline tiles per cluster
 # per unit instead of tiles. Must match the Cake host plan.
 BOUNDARY_COST_TILES = 2.5
 BALANCED_MIN_KV = 8192  # auto schedule: balanced partition from this KV length on
+# Second SM100 decode program (``select_decode_record``): the QK-ahead program
+# pays off when every cluster streams a long range made of at least one long
+# piece. Both decode programs' outputs are bitwise identical.
+QK_AHEAD_RECORD = "decode_qk_ahead"
+QK_AHEAD_MIN_UNIT_TILES = 512  # pipeline tiles of every unit
+QK_AHEAD_MIN_PIECE_TILES = 257  # pipeline tiles of the longest piece of every unit
 WORKSPACE_ALIGNMENT = 256
 
 # Keyword names the two stages are bound with (arg plans refer to these names).
@@ -515,6 +521,30 @@ def build_work_plan(
     return plan
 
 
+def select_decode_record(plan: WorkPlan, arch: str) -> str:
+    """Registry record of the decode program that runs ``plan`` on ``arch``.
+
+    A pure host function of the plan, fixed at prepare time, so a captured
+    CUDA graph replays one fixed program. ``QK_AHEAD_RECORD`` (the same
+    kernel with the QK MMAs issued two tiles ahead of PV, delivered for SM100
+    only) runs a balanced plan when the registry delivers it for ``arch`` and
+    every unit holds at least ``QK_AHEAD_MIN_UNIT_TILES`` pipeline tiles with
+    a piece of at least ``QK_AHEAD_MIN_PIECE_TILES``; every other plan runs
+    ``"decode"``. The two programs' outputs are bitwise identical.
+    """
+    record = MODULES.get(QK_AHEAD_RECORD)
+    if record is None or arch not in record["arches"] or plan.schedule != "balanced":
+        return "decode"
+    for u in range(plan.num_units):
+        # One item per piece: both rows of a pair share the piece's tile range
+        # (item fields 3 and 4: tile_start, tile_end).
+        pieces = plan.items[plan.unit_first[u] : plan.unit_first[u + 1] : V_HALVES]
+        lens = [it[4] - it[3] for it in pieces]
+        if sum(lens) < QK_AHEAD_MIN_UNIT_TILES or max(lens) < QK_AHEAD_MIN_PIECE_TILES:
+            return "decode"
+    return QK_AHEAD_RECORD
+
+
 def work_table_rows(plan: WorkPlan) -> torch.Tensor:
     """Host int32 ``[num_items, ITEM_FIELDS]`` table for ``plan``.
 
@@ -736,7 +766,9 @@ class NVFP4MLADecodeRunner:
     ``(out, lse)`` when prepared with ``return_lse=True``). Prepare a new
     runner when sequence lengths, bindings or input values change.
     ``host_tables`` keeps the pinned host image of the plan tables alive
-    while its asynchronous upload may still be in flight.
+    while its asynchronous upload may still be in flight. ``main_program`` is
+    the library of the decode record ``select_decode_record`` picked for the
+    plan.
 
     Stream contract: ``prepare_nvfp4_batch_decode_with_kv_cache_mla`` issues
     the plan-table upload on the stream current at prepare time and
@@ -781,8 +813,9 @@ def generated_program_available(device: torch.device) -> bool:
     return arch is not None and program_available(arch)
 
 
-# The registry's host-plan constants of each stage record: the values this
-# host side writes into the work table and sizes the partials with.
+# The registry's host-plan constants of each stage, held by every record of
+# that stage: the values this host side writes into the work table and sizes
+# the partials with.
 _RECORD_CONSTANTS = {
     "decode": {
         "item_fields": ITEM_FIELDS,
@@ -800,22 +833,23 @@ _RECORD_CONSTANTS = {
 }
 
 
-def _check_record(stage: str) -> dict:
-    """The registry record of ``stage``, held to the host plan this module
-    assumes (its constants and its cluster launch)."""
-    record = MODULES[stage]
+def _check_record(name: str) -> dict:
+    """The registry record ``name``, held to the host plan this module assumes
+    for the record's ``stage`` (its constants and its cluster launch)."""
+    record = MODULES[name]
+    stage = record["stage"]
     expected = _RECORD_CONSTANTS[stage]
     actual = {key: record.get(key) for key in expected}
     if actual != expected:
         raise RuntimeError(
-            f"the registered {stage} record's host plan {actual} differs from "
+            f"the registered {name} record's host plan {actual} differs from "
             f"this backend's {expected}"
         )
     cluster = tuple(int(v) for v in record["launch"]["cluster"])
     want = (CLUSTER_PAIR, 1, 1) if stage == "decode" else (1, 1, 1)
     if cluster != want:
         raise RuntimeError(
-            f"the registered {stage} record launches clusters of {cluster}; "
+            f"the registered {name} record launches clusters of {cluster}; "
             f"this backend plans {want}"
         )
     return record
@@ -830,11 +864,17 @@ def bind_decode_payload(
     lse: torch.Tensor,
     return_lse: bool,
     host_tables: Optional[torch.Tensor] = None,
+    *,
+    decode_record: str = "decode",
 ) -> NVFP4MLADecodeRunner:
-    """Bind the prepared buffers to the generated programs' argument plans."""
-    main_record = _check_record("decode")
+    """Bind the prepared buffers to the generated programs' argument plans.
+
+    ``decode_record`` names the decode-stage record whose program runs the
+    plan (``select_decode_record``).
+    """
+    main_record = _check_record(decode_record)
     main_program = main_record["library"]
-    main_entry = getattr(load("decode", arch), main_record["ffi_entry"])
+    main_entry = getattr(load(decode_record, arch), main_record["ffi_entry"])
     main_arguments = launch_args(main_record, main_kwargs, main_kwargs["grid"])
     reduce_program = None
     reduce_entry = None
@@ -967,7 +1007,8 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
     neither. The upload is asynchronous on the current stream: launch on
     this stream, or have the launch stream ``wait_stream`` on it first (see
     ``NVFP4MLADecodeRunner``). ``schedule`` / ``tiles_per_split`` expose the
-    host work-plan policy for tests and benchmarks.
+    host work-plan policy for tests and benchmarks. The decode program is
+    picked here, once per plan (``select_decode_record``).
     """
     if backend != "cake":
         raise ValueError("NVFP4 MLA decode supports backend='cake'")
@@ -1021,6 +1062,7 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
         schedule=schedule,
         tiles_per_split=tiles_per_split,
     )
+    decode_record = select_decode_record(plan, arch)
     layout = workspace_layout(plan, batch=batch, num_heads=num_heads, q_len=q_len)
     flat = workspace_buffer.view(-1).view(torch.uint8)
     if flat.numel() < layout["total"]:
@@ -1104,7 +1146,7 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
         max_pages=max_pages,
         max_splits=max_splits,
         scale_log2=float(sm_scale) * LOG2E,
-        grid=launch_grid(MODULES["decode"], units=plan.num_units),
+        grid=launch_grid(MODULES[decode_record], units=plan.num_units),
     )
     reduce_kwargs = None
     if max_splits > 1:
@@ -1122,5 +1164,13 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
     assert tuple(main_kwargs) == MAIN_KWARGS
     assert reduce_kwargs is None or tuple(reduce_kwargs) == REDUCE_KWARGS
     return bind_decode_payload(
-        arch, plan, main_kwargs, reduce_kwargs, out, lse, return_lse, tables
+        arch,
+        plan,
+        main_kwargs,
+        reduce_kwargs,
+        out,
+        lse,
+        return_lse,
+        tables,
+        decode_record=decode_record,
     )
