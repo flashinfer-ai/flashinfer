@@ -95,12 +95,15 @@ _FP8PV_PROGRAMS = (KV_STATS, QUANTIZE, QUANTIZE_MB3, ATTENTION_BASE, ATTENTION_S
 _PREPROCESS_MIN_TOKENS = 2048
 _PREPROCESS_MAX_TOKENS = 16384
 # Every CTA of the fused pre-processing must be co-resident (its grid barrier waits for all of them): the grid
-# stays within the two CTAs per SM the kernel's launch bound guarantees.
-_PREPROCESS_CTAS_PER_SM = 2
+# stays within the three CTAs per SM the kernel's launch bound guarantees.
+_PREPROCESS_CTAS_PER_SM = 3
 # The attention launch takes the warp-specialised form (``ATTENTION_WS`` / ``ATTENTION_WS_NODELTA``) on parts of
 # at least 188 SMs when the mean segment (empty segments included) is at least 1536 tokens and, on the
-# compensated route, below 16384 tokens; else the base form (``ATTENTION`` / ``ATTENTION_NODELTA``).
+# compensated route, below 16384 tokens; the uncompensated route also takes it on parts of at least 170 SMs for a
+# plan of the fused pre-processing (2048 to 16384 padded tokens) with that mean segment; else the base form
+# (``ATTENTION`` / ``ATTENTION_NODELTA``).
 _WS_MIN_SMS = 188
+_WS_NODELTA_FUSED_MIN_SMS = 170
 _WS_MIN_MEAN_SEGMENT = 1536
 _WS_MAX_MEAN_SEGMENT = 16384
 _NVFP4_PROGRAMS = (
@@ -637,7 +640,8 @@ def minimax_h3_sm120_nvfp4_programs(
     plan of 2048 to 16384 padded tokens, else ``(STATS, QUANTIZE_KV)`` -- the statistics launch, which
     also quantizes Q, then the K / V quantizer -- with ``QUANTIZE_KV_HBLK64`` in place of ``QUANTIZE_KV``
     above 16384 padded tokens.  Attention: the warp-specialised form (``ATTENTION_WS``, or
-    ``ATTENTION_WS_NODELTA`` when ``delta`` is false) when ``num_sms >= 188`` and the mean segment length
+    ``ATTENTION_WS_NODELTA`` when ``delta`` is false; without ``delta`` also when ``num_sms >= 170``
+    for a plan of the fused pre-processing) when ``num_sms >= 188`` and the mean segment length
     ``tokens / segments`` (empty segments included) is at least 1536 tokens and, with ``delta``, below
     16384 tokens; else ``ATTENTION`` / ``ATTENTION_NODELTA``."""
     padded = int(plan.padded_tokens)
@@ -649,10 +653,10 @@ def minimax_h3_sm120_nvfp4_programs(
         pre = (STATS, QUANTIZE_KV)
     tokens, segments = int(plan.total_tokens), int(plan.num_segments)
     bound = _WS_MAX_MEAN_SEGMENT if delta else 0
-    ws = (
-        int(num_sms) >= _WS_MIN_SMS
-        and tokens >= _WS_MIN_MEAN_SEGMENT * segments
-        and (bound <= 0 or tokens < bound * segments)
+    fused = _PREPROCESS_MIN_TOKENS <= padded <= _PREPROCESS_MAX_TOKENS
+    ws = tokens >= _WS_MIN_MEAN_SEGMENT * segments and (
+        (int(num_sms) >= _WS_MIN_SMS and (bound <= 0 or tokens < bound * segments))
+        or (not delta and fused and int(num_sms) >= _WS_NODELTA_FUSED_MIN_SMS)
     )
     if ws:
         attention = ATTENTION_WS if delta else ATTENTION_WS_NODELTA
@@ -674,7 +678,7 @@ def minimax_h3_sm120_nvfp4_launch_grids(
     on a device of ``num_sms`` SMs, all grid-stride or persistent:
 
     * fused pre-processing: ``max(1, min(max(num_stats_tiles, padded_tokens // 32) * num_heads,
-      2 * num_sms))`` -- every CTA co-resident, within the kernel's launch bound of 2 CTAs per SM;
+      3 * num_sms))`` -- every CTA co-resident, within the kernel's launch bound of 3 CTAs per SM;
     * statistics: ``max(1, min((1 + q_slots) * num_stats_tiles * num_heads, 4 * num_sms))`` over the
       K item and the ``q_slots`` Q items of every (statistics tile, head);
     * quantizer: ``max(1, min((padded_tokens // 32) * num_heads, 8 * num_sms))`` over the
@@ -1327,7 +1331,7 @@ def minimax_h3_sm120_varlen_attention_nvfp4_nodelta(
       there;
     * latency: only the attention program differs (``ATTENTION_NODELTA`` / ``ATTENTION_WS_NODELTA``, which
       skip the compensation term); its warp-specialised form is taken from a mean segment of 1536 tokens
-      with no upper bound.
+      with no upper bound, and on parts of at least 170 SMs also for a plan of 2048 to 16384 padded tokens.
 
     Use the default route unless the extra error has been validated for the model in question.  Inputs,
     output, ``cu_seqlens`` handling, workspace and caching are exactly those of the default route.

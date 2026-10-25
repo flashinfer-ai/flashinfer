@@ -269,7 +269,13 @@ def _plan(bounds):
         ((0, 1920), 188, (STATS, QUANTIZE_KV), ATTENTION_WS, ATTENTION_WS_NODELTA),
         ((0, 1920), 170, (STATS, QUANTIZE_KV), ATTENTION, ATTENTION_NODELTA),
         ((0, 2048), 188, (PREPROCESS,), ATTENTION_WS, ATTENTION_WS_NODELTA),
-        ((0, 2049), 170, (PREPROCESS,), ATTENTION, ATTENTION_NODELTA),
+        # on 170 to 187 SMs only the uncompensated route of a fused pre-processing plan takes the
+        # warp-specialised form
+        ((0, 2049), 170, (PREPROCESS,), ATTENTION, ATTENTION_WS_NODELTA),
+        ((0, 16384), 170, (PREPROCESS,), ATTENTION, ATTENTION_WS_NODELTA),
+        ((0, 16385), 170, (STATS, QUANTIZE_KV_HBLK64), ATTENTION, ATTENTION_NODELTA),
+        ((0, 3000, 3000), 170, (PREPROCESS,), ATTENTION, ATTENTION_NODELTA),
+        ((0, 2049), 169, (PREPROCESS,), ATTENTION, ATTENTION_NODELTA),
         # the mean segment counts the empty segments
         ((0, 3000, 3000), 188, (PREPROCESS,), ATTENTION, ATTENTION_NODELTA),
         (
@@ -354,7 +360,7 @@ def test_q_slots_is_the_largest_statistics_tile_in_q_blocks(bounds, expected) ->
                 "padded_tokens": 33536,
                 "num_units": 14672,
             },
-            (376, 752, 1504, 188),
+            (564, 752, 1504, 188),
         ),
         (
             170,
@@ -365,7 +371,7 @@ def test_q_slots_is_the_largest_statistics_tile_in_q_blocks(bounds, expected) ->
                 "padded_tokens": 33536,
                 "num_units": 14672,
             },
-            (340, 680, 1360, 170),
+            (510, 680, 1360, 170),
         ),
         (188, 56, {"num_stats_tiles": 262, "q_slots": 1}, (None, 752, None, None)),
         (188, 56, {"padded_tokens": 33536}, (None, None, 1504, None)),
@@ -373,7 +379,7 @@ def test_q_slots_is_the_largest_statistics_tile_in_q_blocks(bounds, expected) ->
             188,
             56,
             {"num_stats_tiles": 262, "padded_tokens": 33536},
-            (376, None, 1504, None),
+            (564, None, 1504, None),
         ),
         (188, 56, {"num_units": 14672}, (None, None, None, 188)),
     ],
