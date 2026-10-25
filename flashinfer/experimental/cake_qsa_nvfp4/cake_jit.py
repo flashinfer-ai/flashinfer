@@ -14,15 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Registry and loader glue of the Cake QSA sparse paged GQA decode over an
-NVFP4 KV cache for SM80 through SM90: the split-KV decode (its plain K-first
-build, its whole-tile build delivered for ``sm_80`` alone, and its
-cooperative build, which merges the splits in the same launch) and the
-separate split-KV merge with the sigmoid output gate.
+NVFP4 KV cache for SM80, SM90, SM100 and SM103: two split-KV decode programs
+partitioning the architectures -- the ``mma.sync`` decode of ``sm_80`` and
+``sm_90a`` (its plain K-first build, its whole-tile build delivered for
+``sm_80`` alone, and its cooperative build, which merges the splits in the
+same launch) and the tcgen05 decode of ``sm_100a`` and ``sm_103a`` (its plain
+and its cooperative build; tensor memory, one CTA per SM) -- and the separate
+split-KV merge with the sigmoid output gate, delivered for every architecture.
 
 Every record of ``MODULES`` is one mechanically exported program: a CUDA
 device translation unit plus a tvm-ffi binding, compiled for each architecture
-of the record's ``arches`` (``sm_80`` and ``sm_90a`` from one source for three
-of the four programs; ``sm_80`` alone for the whole-tile decode).  A record
+of the record's ``arches`` (one source per program; ``sm_80`` and ``sm_90a``
+for the ``mma.sync`` decodes, ``sm_100a`` and ``sm_103a`` for the tcgen05
+decodes, all four for the merge, ``sm_80`` alone for the whole-tile decode).  A record
 carries the host plan only: the program's ``library`` stem (its ``build.json``
 entry is ``<library>_<arch>``), the architectures it is delivered for, the
 ``stage`` of the launch order it fills and its ``variant``, the
@@ -46,8 +50,10 @@ through a counter per (row, KV head)), the device's exported architecture
 grid: above one resident wave, ``DECODE_CTAS_PER_SM`` CTAs per SM times the
 SM count, with every CTA walking at least ``DECODE_LONG_STREAM_TILES``
 tiles), the row count ``rows``, the KV head count ``kv_heads``, the query
-head count ``qo_heads`` and the split count ``splits``.  A selection rule of
-kind ``form`` admits its form on every architecture; one of kind
+head count ``qo_heads`` and the split count ``splits``.  Only the records
+delivered for ``arch`` (``record["arches"]``) are candidates: each decode
+program has a ``form`` record per form.  A selection rule of kind ``form``
+admits its form on every architecture its record ships for; one of kind
 ``form_grid`` admits its form on one architecture at one grid class, and wins
 over a ``form`` rule when both admit (the whole-tile decode: the split form on
 ``sm_80`` on a wide grid).  No rule reads a tensor.  Which form a call takes,
@@ -67,29 +73,33 @@ from typing import Any, Callable
 
 import tvm_ffi
 
-# The two verified builds, each compiled with its exact ``-gencode`` flag set
+# The four verified builds, each compiled with its exact ``-gencode`` flag set
 # (``build.json`` ``arch_flags``): ``sm_80`` serves every compute capability
-# 8.x device, ``sm_90a`` the H100 (9.0).  No other capability is a target.  A
+# 8.x device, ``sm_90a`` the H100 (9.0), ``sm_100a`` the B200 / GB200 (10.0)
+# and ``sm_103a`` the B300 / GB300 (10.3).  No other capability is a target:
+# the table is capability-exact (10.7, 12.0 and 12.1 are not in it).  A
 # record lists the subset it is delivered for (``record["arches"]``).
-ARCHES = ("sm_80", "sm_90a")
+ARCHES = ("sm_80", "sm_90a", "sm_100a", "sm_103a")
 ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
     (8, 0): "sm_80",
     (8, 6): "sm_80",
     (8, 7): "sm_80",
     (8, 9): "sm_80",
     (9, 0): "sm_90a",
+    (10, 0): "sm_100a",
+    (10, 3): "sm_103a",
 }
 PREFIX = "cake_qsa_nvfp4"
 
-# The launch order of a call: the decode (one of its three builds) and, in the
-# split form with more than one split, the merge behind it.
+# The launch order of a call: the decode (one of the architecture's builds) and,
+# in the split form with more than one split, the merge behind it.
 STAGES = ("decode", "merge")
 # The two forms a call takes (``select_rule`` value of kinds ``form`` and
 # ``form_grid``).
 FORMS = ("split", "fused")
 # The selection rule kinds, least specific first: ``form`` admits its ``value``
-# form on every architecture; ``form_grid`` admits its ``value`` form on its
-# ``arch`` alone and only at the grid class its ``grid`` names
+# form on every architecture its record ships for; ``form_grid`` admits its
+# ``value`` form on its ``arch`` alone and only at the grid class its ``grid`` names
 # (``"multi_wave_long"``: a decode grid above one resident wave whose CTAs each
 # walk at least ``DECODE_LONG_STREAM_TILES`` tiles).  When both admit, the more
 # specific wins.
@@ -103,9 +113,21 @@ MAX_SPLITS = 128
 MERGE_WARPS = 4
 # The decode's tile: the selection is split into tiles of this many tokens.
 TILE_TOKENS = 64
-# The decode's block and the resident CTAs per SM its split rule counts on.
-DECODE_THREADS = 128
-DECODE_CTAS_PER_SM = 2
+# Per architecture: the block of its decode (128 threads for the ``mma.sync``
+# decode, 512 for the tcgen05 one), the resident CTAs per SM the split rule
+# counts on (the plain decode's launch bound: two for the ``mma.sync`` decode,
+# one for the tcgen05 decode, whose tensor memory and shared-memory pool hold
+# the SM) and the fused form's capacity per SM, the co-resident build's
+# launch bound: the form rule takes the fused form only below
+# ``DECODE_FUSED_CTAS_PER_SM[arch]`` x the SM count CTAs (``sm_80`` is absent:
+# its calls take the split form alone).  Within the capacity sm_90a always
+# takes the fused form; sm_100a / sm_103a take it under the host's eager rule
+# (``cake_backend.select_form``: an aarch64 host, rows <= 4, no capture).  The
+# exporter holds the launch-bound tables to the kernel files and the fused
+# table to its host policy.
+DECODE_THREADS = {"sm_80": 128, "sm_90a": 128, "sm_100a": 512, "sm_103a": 512}
+DECODE_CTAS_PER_SM = {"sm_80": 2, "sm_90a": 2, "sm_100a": 1, "sm_103a": 1}
+DECODE_FUSED_CTAS_PER_SM = {"sm_90a": 2, "sm_100a": 1, "sm_103a": 1}
 # The long-stream bound of the ``multi_wave_long`` grid class: the per-CTA tile
 # stream, ``ceil(tiles / splits)``, from which the whole-tile program measured
 # faster than the K-first one above one resident wave; 16 tiles = 1024 selected
@@ -233,10 +255,12 @@ MERGE_PARAMETERS = (
 # is written by hand.  Every value is a literal:
 # FlashInfer's manifest checker and the exporter read this file with
 # ``ast.literal_eval``.  Record names are the stages, suffixed with the variant
-# where a stage has several programs.  The decode's K-first builds (``decode``,
-# ``decode_coop``) and its whole-tile build (``decode_whole_tile``) differ in
-# the program text alone: same parameters, launch facts, grid and workspace
-# rules.
+# where a stage has several programs.  The ``mma.sync`` decode's K-first builds
+# (``decode``, ``decode_coop``) and its whole-tile build (``decode_whole_tile``)
+# differ in the program text alone: same parameters, launch facts, grid and
+# workspace rules.  The tcgen05 decode's builds (``decode_tcgen05``,
+# ``decode_tcgen05_coop``) take the same parameters, grid and workspace rules
+# with their own block (512 threads) and shared-memory pool.
 MODULES: dict[str, dict[str, Any]] = {
     "decode": {
         "arches": ["sm_80", "sm_90a"],
@@ -540,8 +564,206 @@ MODULES: dict[str, dict[str, Any]] = {
         "variant": "coop",
         "workspace_rule": {"kind": "fused_partials_counters"},
     },
+    "decode_tcgen05": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "k_data"],
+            ["buffer", "v_data"],
+            ["buffer", "k_sf"],
+            ["buffer", "v_sf"],
+            ["buffer", "indices"],
+            ["buffer", "block_table"],
+            ["buffer", "token_to_req"],
+            ["buffer", "gate"],
+            ["buffer", "out"],
+            ["buffer", "partial_out"],
+            ["buffer", "partial_lse"],
+            ["buffer", "merge_counters"],
+            ["parameter", "q_stride_row"],
+            ["parameter", "q_stride_head"],
+            ["parameter", "data_stride_block"],
+            ["parameter", "data_stride_token"],
+            ["parameter", "data_stride_head"],
+            ["parameter", "sf_stride_block"],
+            ["parameter", "sf_stride_token"],
+            ["parameter", "sf_stride_head"],
+            ["parameter", "indices_stride_row"],
+            ["parameter", "table_stride_req"],
+            ["parameter", "out_stride_row"],
+            ["parameter", "out_stride_head"],
+            ["parameter", "score_scale"],
+            ["parameter", "output_scale"],
+            ["parameter", "num_rows"],
+            ["parameter", "num_requests"],
+            ["parameter", "num_blocks"],
+            ["parameter", "page_div"],
+            ["parameter", "table_width"],
+            ["parameter", "topk"],
+            ["parameter", "group_size"],
+            ["parameter", "num_qo_heads"],
+            ["parameter", "num_tiles"],
+            ["parameter", "num_splits"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "rows_kv_heads_splits"},
+        "kernel_symbol": "kernel_cake_qsa_nvfp4_192803b3bb911a6cbae1",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 159872,
+            "use_pdl": False,
+        },
+        "library": "cake_qsa_nvfp4_192803b3bb911a6cbae1",
+        "logical": {
+            "block_table": "block_table",
+            "data_stride_block": "data_stride_block",
+            "data_stride_head": "data_stride_head",
+            "data_stride_token": "data_stride_token",
+            "gate": "gate",
+            "group_size": "group_size",
+            "indices": "indices",
+            "indices_stride_row": "indices_stride_row",
+            "k_data": "k_data",
+            "k_sf": "k_sf",
+            "merge_counters": "merge_counters",
+            "num_blocks": "num_blocks",
+            "num_qo_heads": "num_qo_heads",
+            "num_requests": "num_requests",
+            "num_rows": "num_rows",
+            "num_splits": "num_splits",
+            "num_tiles": "num_tiles",
+            "out": "out",
+            "out_stride_head": "out_stride_head",
+            "out_stride_row": "out_stride_row",
+            "output_scale": "output_scale",
+            "page_div": "page_div",
+            "partial_lse": "partial_lse",
+            "partial_out": "partial_out",
+            "q": "q",
+            "q_stride_head": "q_stride_head",
+            "q_stride_row": "q_stride_row",
+            "score_scale": "score_scale",
+            "sf_stride_block": "sf_stride_block",
+            "sf_stride_head": "sf_stride_head",
+            "sf_stride_token": "sf_stride_token",
+            "table_stride_req": "table_stride_req",
+            "table_width": "table_width",
+            "token_to_req": "token_to_req",
+            "topk": "topk",
+            "v_data": "v_data",
+            "v_sf": "v_sf",
+        },
+        "select_rule": {"kind": "form", "value": "split"},
+        "stage": "decode",
+        "variant": "tcgen05",
+        "workspace_rule": {"kind": "split_partials"},
+    },
+    "decode_tcgen05_coop": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "k_data"],
+            ["buffer", "v_data"],
+            ["buffer", "k_sf"],
+            ["buffer", "v_sf"],
+            ["buffer", "indices"],
+            ["buffer", "block_table"],
+            ["buffer", "token_to_req"],
+            ["buffer", "gate"],
+            ["buffer", "out"],
+            ["buffer", "partial_out"],
+            ["buffer", "partial_lse"],
+            ["buffer", "merge_counters"],
+            ["parameter", "q_stride_row"],
+            ["parameter", "q_stride_head"],
+            ["parameter", "data_stride_block"],
+            ["parameter", "data_stride_token"],
+            ["parameter", "data_stride_head"],
+            ["parameter", "sf_stride_block"],
+            ["parameter", "sf_stride_token"],
+            ["parameter", "sf_stride_head"],
+            ["parameter", "indices_stride_row"],
+            ["parameter", "table_stride_req"],
+            ["parameter", "out_stride_row"],
+            ["parameter", "out_stride_head"],
+            ["parameter", "score_scale"],
+            ["parameter", "output_scale"],
+            ["parameter", "num_rows"],
+            ["parameter", "num_requests"],
+            ["parameter", "num_blocks"],
+            ["parameter", "page_div"],
+            ["parameter", "table_width"],
+            ["parameter", "topk"],
+            ["parameter", "group_size"],
+            ["parameter", "num_qo_heads"],
+            ["parameter", "num_tiles"],
+            ["parameter", "num_splits"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "rows_kv_heads_splits"},
+        "kernel_symbol": "kernel_cake_qsa_nvfp4_0ceab6626450e29f384c",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": True,
+            "dynamic_smem_bytes": 159872,
+            "use_pdl": False,
+        },
+        "library": "cake_qsa_nvfp4_0ceab6626450e29f384c",
+        "logical": {
+            "block_table": "block_table",
+            "data_stride_block": "data_stride_block",
+            "data_stride_head": "data_stride_head",
+            "data_stride_token": "data_stride_token",
+            "gate": "gate",
+            "group_size": "group_size",
+            "indices": "indices",
+            "indices_stride_row": "indices_stride_row",
+            "k_data": "k_data",
+            "k_sf": "k_sf",
+            "merge_counters": "merge_counters",
+            "num_blocks": "num_blocks",
+            "num_qo_heads": "num_qo_heads",
+            "num_requests": "num_requests",
+            "num_rows": "num_rows",
+            "num_splits": "num_splits",
+            "num_tiles": "num_tiles",
+            "out": "out",
+            "out_stride_head": "out_stride_head",
+            "out_stride_row": "out_stride_row",
+            "output_scale": "output_scale",
+            "page_div": "page_div",
+            "partial_lse": "partial_lse",
+            "partial_out": "partial_out",
+            "q": "q",
+            "q_stride_head": "q_stride_head",
+            "q_stride_row": "q_stride_row",
+            "score_scale": "score_scale",
+            "sf_stride_block": "sf_stride_block",
+            "sf_stride_head": "sf_stride_head",
+            "sf_stride_token": "sf_stride_token",
+            "table_stride_req": "table_stride_req",
+            "table_width": "table_width",
+            "token_to_req": "token_to_req",
+            "topk": "topk",
+            "v_data": "v_data",
+            "v_sf": "v_sf",
+        },
+        "select_rule": {"kind": "form", "value": "fused"},
+        "stage": "decode",
+        "variant": "tcgen05_coop",
+        "workspace_rule": {"kind": "fused_partials_counters"},
+    },
     "merge": {
-        "arches": ["sm_80", "sm_90a"],
+        "arches": ["sm_80", "sm_90a", "sm_100a", "sm_103a"],
         "arg_plan": [
             ["buffer", "partial_out"],
             ["buffer", "partial_lse"],
@@ -557,7 +779,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "rows_head_groups", "warps": 4},
-        "kernel_symbol": "kernel_cake_qsa_nvfp4_fb94b71eaa79ef2379de",
+        "kernel_symbol": "kernel_cake_qsa_nvfp4_b7476d91de350347ab5a",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -565,7 +787,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_qsa_nvfp4_fb94b71eaa79ef2379de",
+        "library": "cake_qsa_nvfp4_b7476d91de350347ab5a",
         "logical": {
             "gate": "gate",
             "num_qo_heads": "num_qo_heads",
@@ -592,6 +814,8 @@ def records_of_stage(stage: str) -> tuple[str, ...]:
 
 
 def _admits(rule: dict[str, Any], *, form: str, arch: str, wide: bool) -> bool:
+    """Whether a record's selection rule admits the call; the caller has
+    already kept the records delivered for ``arch`` alone."""
     kind = rule["kind"]
     if kind == "form":
         return rule["value"] == form
@@ -613,9 +837,11 @@ def select_record(stage: str, *, form: str, arch: str, wide: bool) -> str:
     decode grid is wide -- above one resident wave with at least
     ``DECODE_LONG_STREAM_TILES`` tiles per CTA (both the host's:
     :mod:`.cake_backend`).
-    Of the records whose rule admits the call, the most specific rule kind
-    (``SELECT_RULES`` order) wins: on ``sm_80`` a wide split-form call selects
-    the whole-tile decode over the K-first one.  The ``merge`` stage has no
+    Only the records delivered for ``arch`` are candidates (the ``mma.sync``
+    decode's on ``sm_80`` / ``sm_90a``, the tcgen05 decode's on ``sm_100a`` /
+    ``sm_103a``); of those whose rule admits the call, the most specific rule
+    kind (``SELECT_RULES`` order) wins: on ``sm_80`` a wide split-form call
+    selects the whole-tile decode over the K-first one.  The ``merge`` stage has no
     record in the fused form (:func:`select_records` leaves it out); asking for
     one is an error.  Exactly one record remains, or the registry is
     inconsistent.
@@ -627,7 +853,8 @@ def select_record(stage: str, *, form: str, arch: str, wide: bool) -> str:
     admitted = [
         name
         for name in records_of_stage(stage)
-        if _admits(MODULES[name]["select_rule"], form=form, arch=arch, wide=wide)
+        if arch in MODULES[name]["arches"]
+        and _admits(MODULES[name]["select_rule"], form=form, arch=arch, wide=wide)
     ]
     if admitted:
         top = max(
@@ -908,6 +1135,7 @@ __all__ = [
     "ARCHES",
     "ARCH_BY_CAPABILITY",
     "DECODE_CTAS_PER_SM",
+    "DECODE_FUSED_CTAS_PER_SM",
     "DECODE_LONG_STREAM_TILES",
     "DECODE_PARAMETERS",
     "DECODE_THREADS",

@@ -2283,16 +2283,17 @@ class VariableBlockSparseAttentionWrapper:
         return (out, lse) if return_lse else out
 
 
-_QSA_CAKE_MAJORS = (8, 9)
-
-
 def _qsa_auto_backend(device: torch.device) -> str:
-    """The route ``backend="auto"`` takes: ``"cake"`` on SM80 through SM90, where the Cake
-    kernels run; ``"default"`` anywhere else, so the reference implementation reports the
-    device the way it always has."""
-    if device.type == "cuda" and get_compute_capability(device)[0] in _QSA_CAKE_MAJORS:
-        return "cake"
-    return "default"
+    """The route ``backend="auto"`` takes: ``"cake"`` on a compute capability the Cake package
+    exports a library for (``cake_jit.ARCH_BY_CAPABILITY``: 8.x, 9.0, 10.0 and 10.3, capability-exact);
+    ``"default"`` anywhere else, so the reference implementation reports the device the way it
+    always has (a 10.7 or 12.x device included, until the package ships for it)."""
+    if device.type != "cuda":
+        return "default"
+    from .experimental.cake_qsa_nvfp4.cake_jit import arch_for_capability
+
+    capability = get_compute_capability(device)
+    return "cake" if arch_for_capability(capability) is not None else "default"
 
 
 @flashinfer_experimental_api(feature="QSA NVFP4 sparse paged attention")
@@ -2313,7 +2314,7 @@ def qsa_sparse_paged_attention(
     v_sf: torch.Tensor,
     backend: str = "auto",
 ) -> torch.Tensor:
-    r"""Gated sparse paged GQA attention over an NVFP4 KV cache, for SM80 through SM90.
+    r"""Gated sparse paged GQA attention over an NVFP4 KV cache, for SM80 through SM103.
 
     This is vLLM's ``qsa_sparse_paged_attention`` (Qwen QSA) contract for an NVFP4 main KV
     cache: the same arguments in the same order, plus the block scales ``k_sf`` / ``v_sf``.
@@ -2345,9 +2346,11 @@ def qsa_sparse_paged_attention(
         E4M3 block scales ``[num_blocks, page_size, num_kv_heads, 16]``, one per 16 dims.
     backend : str
         ``"auto"`` (the default) runs the Cake kernels of
-        :mod:`flashinfer.experimental.cake_qsa_nvfp4` on SM80 through SM90, the
-        architectures this attention supports, and the reference implementation
-        anywhere else, which then reports the unsupported device. ``"cake"`` selects
+        :mod:`flashinfer.experimental.cake_qsa_nvfp4` on every compute capability the
+        package exports a library for (8.x, 9.0 on the ``mma.sync`` programs; 10.0 and
+        10.3 on the tcgen05 programs; the table is capability-exact, so 10.7 and 12.x
+        are not included), and the reference implementation anywhere else, which then
+        reports the unsupported device. ``"cake"`` selects
         the Cake kernels (the same contract, their own split and merge plan) and
         ``"default"`` the reference implementation explicitly. The Cake kernels'
         results agree with the reference implementation within the test tolerances

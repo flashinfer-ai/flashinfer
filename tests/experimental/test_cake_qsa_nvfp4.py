@@ -15,14 +15,14 @@ limitations under the License.
 
 Backend suite of the Cake QSA NVFP4 sparse paged attention package
 (``flashinfer.experimental.cake_qsa_nvfp4``): gated sparse paged GQA decode of BF16
-queries over an NVFP4 paged KV cache, for SM80 through SM90.
+queries over an NVFP4 paged KV cache, for SM80, SM90, SM100 and SM103.
 
 The reference and the fixtures are those of ``test_qsa_nvfp4.py``, the suite of the
 existing implementation: a float64 model of the kernel's arithmetic with its elementwise
 tolerance, the ``2^-6`` accuracy limit against exact attention, count-0 / count-1 rows,
 unmapped pages, blocks past the cache, rows without a request, NHD and HND caches and the
 group sizes 12, 16 and 1.  The split count the reference models is the package's host
-split rule (``num_splits``, decided by the device's SM count).  This suite adds the
+split rule (``num_splits``, decided by the device's architecture and SM count).  This suite adds the
 host rule itself (formula, measured table, tile and merge caps), a 33-split case, bitwise
 repeatability, CUDA-graph replay with and without a caller-owned workspace, the
 zero-allocation workspace path, and the ``build.json`` contract of the package.
@@ -61,11 +61,16 @@ NUM_BLOCKS = NUM_REQUESTS * TABLE_WIDTH + 20
 _E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 
 TILE = 64  # tokens per split tile
-# The decode's launch bound: the split formula's capacity is this many CTAs per SM.
-CTAS_PER_SM = 2
-# The decode's shared-memory pool, passed as dynamic shared memory by its binding; two
-# CTAs of it fit an SM (the launch bound).  The merge uses static shared memory alone.
+# The decodes' launch bounds: the split formula's capacity is this many CTAs per SM, per
+# architecture (two for the mma.sync decode of sm_80 / sm_90a, one for the tcgen05 decode
+# of sm_100a / sm_103a, whose tensor memory and shared-memory pool hold the SM).
+CTAS_PER_SM = {"sm_80": 2, "sm_90a": 2, "sm_100a": 1, "sm_103a": 1}
+# The mma.sync decode's shared-memory pool, passed as dynamic shared memory by its binding;
+# two CTAs of it fit an SM (the launch bound).  The merge uses static shared memory alone.
 DECODE_SMEM_BYTES = 49792
+# The tcgen05 decode's pool (four raw stages, 158,848 B, plus its barrier words), passed as
+# dynamic shared memory by its binding; one CTA of it holds an SM (the launch bound).
+DECODE_TCGEN05_SMEM_BYTES = 159872
 MAX_SPLITS = 128  # the merge kernel's split bound: the host rule never passes more
 ROWS = (1, 2, 4, 8, 16, 32, 64, 128)  # the decode row counts of the owner's shape list
 
@@ -142,7 +147,10 @@ def _sm_count(device) -> int:
 
 def _splits(rows, num_kv_heads, device) -> int:
     """The split count the package passes for ``rows`` on ``device``: its host split rule."""
-    return num_splits(rows, num_kv_heads, WIDTH, _sm_count(device))
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return num_splits(
+        rows, num_kv_heads, WIDTH, _sm_count(device), cake_jit.device_arch(index)
+    )
 
 
 def _dequant(data, sf, scale):
@@ -662,7 +670,12 @@ def test_rejects_invalid_inputs(monkeypatch):
     # device's SM count.
     one_tile = torch.full((4, TILE + 1), -1, dtype=torch.int32, device="cuda")
     one_tile[:, -1] = 0
-    assert num_splits(4, 2, TILE, _sm_count(q.device)) == 1
+    assert (
+        num_splits(
+            4, 2, TILE, _sm_count(q.device), cake_jit.device_arch(q.device.index)
+        )
+        == 1
+    )
     nbytes = cake_backend.qsa_workspace_bytes(4, 24, 2, 1)
     for buffer in (
         torch.zeros(nbytes, dtype=torch.uint8),
@@ -699,29 +712,89 @@ def test_rejects_invalid_inputs(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _formula(rows, num_kv_heads, width, sm_count):
+def _formula(rows, num_kv_heads, width, sm_count, arch):
     """The split formula alone: the most splits whose grid ``rows x kv_heads x splits``
-    stays within two CTAs per SM, at least 1 and at most the ``ceil(width / 64)`` tiles."""
+    stays within the architecture's CTAs per SM, at least 1 and at most the ``ceil(width /
+    64)`` tiles."""
     tiles = math.ceil(width / TILE)
-    return max(1, min(tiles, CTAS_PER_SM * sm_count // (rows * num_kv_heads)))
+    return max(1, min(tiles, CTAS_PER_SM[arch] * sm_count // (rows * num_kv_heads)))
 
 
 def test_split_formula_fills_the_device_capacity():
-    """``num_splits`` on an SM count the measured table does not name is the formula:
-    80 SMs (160 CTAs) and 66 SMs (132 CTAs) over the shape list's rows, the floor (more
-    CTAs than the capacity), one tile, the merge kernel's bound, and the sizes it refuses."""
-    assert [num_splits(r, 2, WIDTH, 80) for r in ROWS] == [33, 33, 20, 10, 5, 2, 1, 1]
-    assert [num_splits(r, 2, WIDTH, 66) for r in ROWS] == [33, 33, 16, 8, 4, 2, 1, 1]
-    for sm_count in (80, 66):
-        assert [num_splits(r, 2, WIDTH, sm_count) for r in ROWS] == [
-            _formula(r, 2, WIDTH, sm_count) for r in ROWS
+    """``num_splits`` on an SM count the measured table does not name is the formula at the
+    architecture's CTAs per SM: 80 SMs (160 CTAs) and 66 SMs (132 CTAs) on sm_80 over the
+    shape list's rows, 148 SMs on sm_100a (148 CTAs: the B200, one CTA per SM) and on
+    sm_103a, the floor (more CTAs than the capacity), one tile, the merge kernel's bound,
+    and the sizes it refuses."""
+    assert [num_splits(r, 2, WIDTH, 80, "sm_80") for r in ROWS] == [
+        33,
+        33,
+        20,
+        10,
+        5,
+        2,
+        1,
+        1,
+    ]
+    assert [num_splits(r, 2, WIDTH, 66, "sm_80") for r in ROWS] == [
+        33,
+        33,
+        16,
+        8,
+        4,
+        2,
+        1,
+        1,
+    ]
+    assert [num_splits(r, 2, WIDTH, 148, "sm_100a") for r in ROWS] == [
+        33,
+        33,
+        18,
+        9,
+        4,
+        2,
+        1,
+        1,
+    ]
+    assert [num_splits(r, 2, WIDTH, 148, "sm_103a") for r in ROWS] == [
+        33,
+        33,
+        18,
+        9,
+        4,
+        2,
+        1,
+        1,
+    ]
+    # At the same SM count the tcgen05 decode's capacity is half the mma.sync decode's.
+    assert [num_splits(r, 2, WIDTH, 148, "sm_90a") for r in ROWS] == [
+        33,
+        33,
+        33,
+        18,
+        9,
+        4,
+        2,
+        1,
+    ]
+    for sm_count, arch in (
+        (80, "sm_80"),
+        (66, "sm_80"),
+        (148, "sm_100a"),
+        (148, "sm_103a"),
+    ):
+        assert [num_splits(r, 2, WIDTH, sm_count, arch) for r in ROWS] == [
+            _formula(r, 2, WIDTH, sm_count, arch) for r in ROWS
         ]
-    assert num_splits(2048, 2, WIDTH, 132) == 1
-    assert num_splits(1, 1, TILE, 132) == 1
-    assert num_splits(1, 1, 200 * TILE, 10**6) == MAX_SPLITS
+    assert num_splits(2048, 2, WIDTH, 132, "sm_90a") == 1
+    assert num_splits(1, 1, TILE, 132, "sm_90a") == 1
+    assert num_splits(1, 1, 200 * TILE, 10**6, "sm_90a") == MAX_SPLITS
+    assert num_splits(1, 1, 200 * TILE, 10**6, "sm_100a") == MAX_SPLITS
     for rows, num_kv_heads, sm_count in ((0, 2, 132), (1, 0, 132), (1, 2, 0)):
         with pytest.raises(ValueError):
-            num_splits(rows, num_kv_heads, WIDTH, sm_count)
+            num_splits(rows, num_kv_heads, WIDTH, sm_count, "sm_90a")
+    with pytest.raises(ValueError, match="arch"):
+        num_splits(1, 2, WIDTH, 132, "sm_120a")
 
 
 def test_host_rule_applies_the_measured_table_within_the_caps():
@@ -735,19 +808,83 @@ def test_host_rule_applies_the_measured_table_within_the_caps():
     )
     table_132 = [33, 33, 16, 8, 8, 4, 2, 1]
     table_108 = [33, 33, 27, 13, 6, 3, 4, 2]
-    assert [num_splits(r, 2, WIDTH, 132) for r in ROWS] == table_132
-    assert [num_splits(r, 2, WIDTH, 108) for r in ROWS] == table_108
+    assert [num_splits(r, 2, WIDTH, 132, "sm_90a") for r in ROWS] == table_132
+    assert [num_splits(r, 2, WIDTH, 108, "sm_80") for r in ROWS] == table_108
     # Away from the table's rows the formula holds; at them the entry does.
-    for sm_count in (132, 108):
+    for sm_count, arch in ((132, "sm_90a"), (108, "sm_80")):
         for rows in ROWS:
-            formula = _formula(rows, 2, WIDTH, sm_count)
+            formula = _formula(rows, 2, WIDTH, sm_count, arch)
             want = SPLIT_OVERRIDES.get((sm_count, rows), formula)
-            assert num_splits(rows, 2, WIDTH, sm_count) == want, (sm_count, rows)
+            assert num_splits(rows, 2, WIDTH, sm_count, arch) == want, (sm_count, rows)
+    # No Blackwell SM count is in the table yet: 148 SMs run the formula on every row.
+    assert not any(sm_count == 148 for sm_count, _rows in SPLIT_OVERRIDES)
     # The table never exceeds the tile count ...
-    assert num_splits(4, 2, TILE, 132) == 1
-    assert num_splits(4, 2, 10 * TILE, 132) == 10
+    assert num_splits(4, 2, TILE, 132, "sm_90a") == 1
+    assert num_splits(4, 2, 10 * TILE, 132, "sm_90a") == 10
     # ... and the formula never exceeds the merge kernel's bound.
-    assert num_splits(1, 1, 200 * TILE, 1000) == MAX_SPLITS
+    assert num_splits(1, 1, 200 * TILE, 1000, "sm_90a") == MAX_SPLITS
+
+
+def test_form_rule_takes_the_fused_form_within_the_capacity_and_the_eager_rule(
+    monkeypatch,
+):
+    """``select_form``: never above one split or the device's fused capacity. Within
+    it, compute capability 9.0 takes the fused form on every host, eager or captured;
+    10.0 / 10.3 take it only on an ``aarch64`` host, at ``rows <= FUSED_MAX_ROWS`` and
+    outside capture (the captured call keeps the split form); 8.x is split alone.
+    GPU-free: the device facts are faked per device index."""
+    facts = {
+        800: ("sm_80", 108),
+        900: ("sm_90a", 132),
+        1000: ("sm_100a", 148),
+        1030: ("sm_103a", 152),
+    }
+    form = cake_backend.select_form
+    reads = cake_backend._reads_capture_state
+    monkeypatch.setattr(cake_backend, "_device_facts", lambda index: facts[index])
+    cake_backend.fused_capacity.cache_clear()
+    reads.cache_clear()
+    try:
+        assert cake_backend.FUSED_HOST_RULE_ARCHES == ("sm_100a", "sm_103a")
+        assert cake_backend.FUSED_HOSTS == ("aarch64",)
+        assert cake_backend.FUSED_MAX_ROWS == 4
+        capacity = [cake_backend.fused_capacity(i) for i in (800, 900, 1000, 1030)]
+        assert capacity == [0, 264, 148, 152]
+        for host in ("aarch64", "x86_64"):
+            monkeypatch.setattr(cake_backend, "HOST_MACHINE", host)
+            reads.cache_clear()
+            grace = host == "aarch64"
+            eager = "fused" if grace else "split"
+            for index, splits_at in (
+                (1000, (33, 33, 18)),
+                (1030, (33, 33, 19)),
+            ):
+                sm_count = facts[index][1]
+                for rows, splits in zip((1, 2, 4), splits_at, strict=True):
+                    assert rows * 2 * splits <= sm_count
+                    assert form(rows, 2, splits, index) == eager, (host, index, rows)
+                    assert form(rows, 2, splits, index, True) == "split"
+                    assert reads(rows, index) is grace
+                # Above FUSED_MAX_ROWS (rows 8 at 9 splits fit the capacity), with one
+                # split or above the capacity: split.
+                assert form(8, 2, 9, index) == "split"
+                assert form(16, 2, 4, index) == "split"
+                assert form(4, 2, 1, index) == "split"
+                assert form(4, 2, sm_count // 8 + 1, index) == "split"
+                assert reads(8, index) is False
+                assert reads(16, index) is False
+            # Compute capability 9.0: the fused form within 264 CTAs, whatever the host
+            # or the capture state; above it the split form.
+            for capturing in (False, True):
+                assert form(16, 2, 8, 900, capturing) == "fused"
+                assert form(16, 2, 9, 900, capturing) == "split"
+            assert reads(8, 900) is False
+            # Compute capability 8.x: the split form alone.
+            assert form(1, 2, 33, 800) == "split"
+            assert reads(1, 800) is False
+    finally:
+        cake_backend.fused_capacity.cache_clear()
+        reads.cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -759,28 +896,59 @@ def _manifest() -> dict:
     return json.loads((PACKAGE_DIR / "build.json").read_text())
 
 
-def test_capabilities_route_to_the_two_libraries():
-    assert cake_jit.ARCHES == ("sm_80", "sm_90a")
+def test_capabilities_route_to_the_four_libraries():
+    assert cake_jit.ARCHES == ("sm_80", "sm_90a", "sm_100a", "sm_103a")
     for capability in ((8, 0), (8, 6), (8, 7), (8, 9)):
         assert cake_jit.arch_for_capability(capability) == "sm_80"
     assert cake_jit.arch_for_capability((9, 0)) == "sm_90a"
-    assert cake_jit.arch_for_capability((7, 5)) is None
-    assert cake_jit.arch_for_capability((10, 0)) is None
+    assert cake_jit.arch_for_capability((10, 0)) == "sm_100a"
+    assert cake_jit.arch_for_capability((10, 3)) == "sm_103a"
+    # Capability-exact: no library is delivered for 10.7 or the 12.x devices.
+    for capability in ((7, 5), (10, 7), (12, 0), (12, 1)):
+        assert cake_jit.arch_for_capability(capability) is None
     assert set(cake_jit.ARCH_BY_CAPABILITY.values()) == set(cake_jit.ARCHES)
+    # The per-architecture launch-bound tables cover every architecture; the fused table every one but sm_80, with
+    # the co-resident build's one CTA per SM on the tcgen05 architectures (the eager host rule bounds the form there).
+    assert cake_jit.DECODE_THREADS == {
+        "sm_80": 128,
+        "sm_90a": 128,
+        "sm_100a": 512,
+        "sm_103a": 512,
+    }
+    assert cake_jit.DECODE_CTAS_PER_SM == CTAS_PER_SM
+    assert cake_jit.DECODE_FUSED_CTAS_PER_SM == {
+        "sm_90a": 2,
+        "sm_100a": 1,
+        "sm_103a": 1,
+    }
+    assert cake_backend.FUSED_CTAS_PER_SM == cake_jit.DECODE_FUSED_CTAS_PER_SM
 
 
 def test_registry_records_carry_the_launch_facts_and_the_argument_plans():
-    """Four programs: the plain decode, its whole-tile build delivered for sm_80 alone (the
-    split form on a multi-wave, long-stream grid), the cooperative decode that merges its
-    splits in the launch, and the separate merge; 128 threads each, no cluster; the decode's
-    shared-memory pool as dynamic shared memory, the merge's static; the argument plan
-    names every kernel parameter in order and then the grid."""
+    """Six programs: the mma.sync plain decode, its whole-tile build delivered for sm_80
+    alone (the split form on a multi-wave, long-stream grid), the mma.sync cooperative
+    decode that merges its splits in the launch, the tcgen05 plain and cooperative decodes
+    of sm_100a / sm_103a, and the separate merge; 128 threads for the mma.sync programs and
+    the merge, 512 for the tcgen05 ones, no cluster; the decodes' shared-memory pools as
+    dynamic shared memory, the merge's static; the argument plan names every kernel
+    parameter in order and then the grid (the five decodes take the same parameters)."""
     assert set(cake_jit.MODULES) == {
         "decode",
         "decode_whole_tile",
         "decode_coop",
+        "decode_tcgen05",
+        "decode_tcgen05_coop",
         "merge",
     }
+    arches = {
+        "decode": ("sm_80", "sm_90a"),
+        "decode_whole_tile": ("sm_80",),
+        "decode_coop": ("sm_80", "sm_90a"),
+        "decode_tcgen05": ("sm_100a", "sm_103a"),
+        "decode_tcgen05_coop": ("sm_100a", "sm_103a"),
+        "merge": ("sm_80", "sm_90a", "sm_100a", "sm_103a"),
+    }
+    tcgen05 = ("decode_tcgen05", "decode_tcgen05_coop")
     assert cake_jit.SELECT_RULES == ("form", "form_grid")
     whole_tile = cake_jit.MODULES["decode_whole_tile"]
     assert whole_tile["stage"] == "decode" and whole_tile["variant"] == "whole_tile"
@@ -792,11 +960,15 @@ def test_registry_records_carry_the_launch_facts_and_the_argument_plans():
     }
     for key in ("grid_rule", "workspace_rule", "launch", "arg_plan", "logical"):
         assert whole_tile[key] == cake_jit.MODULES["decode"][key], key
+    for name in tcgen05:
+        for key in ("grid_rule", "arg_plan", "logical"):
+            assert cake_jit.MODULES[name][key] == cake_jit.MODULES["decode"][key], (
+                name,
+                key,
+            )
     for name, record in cake_jit.MODULES.items():
         assert re.fullmatch(r"cake_qsa_nvfp4_[0-9a-f]{20}", record["library"]), name
-        assert tuple(record["arches"]) == (
-            ("sm_80",) if name == "decode_whole_tile" else cake_jit.ARCHES
-        ), name
+        assert tuple(record["arches"]) == arches[name], name
         assert record["ffi_entry"] == "run"
         assert record["kernel_symbol"] == "kernel_" + record["library"]
         assert isinstance(record["stage"], str) and record["stage"]
@@ -804,13 +976,21 @@ def test_registry_records_carry_the_launch_facts_and_the_argument_plans():
         assert record["select_rule"]["value"] in cake_jit.FORMS
         assert isinstance(record["grid_rule"]["kind"], str)
         launch = record["launch"]
-        assert tuple(launch["block"]) == (128, 1, 1), name
+        assert tuple(launch["block"]) == (
+            (512, 1, 1) if name in tcgen05 else (128, 1, 1)
+        ), name
         assert tuple(launch["cluster"]) == (1, 1, 1), name
         assert launch["dynamic_smem_bytes"] == (
-            0 if name == "merge" else DECODE_SMEM_BYTES
+            0
+            if name == "merge"
+            else DECODE_TCGEN05_SMEM_BYTES
+            if name in tcgen05
+            else DECODE_SMEM_BYTES
         ), name
         assert launch["use_pdl"] is False, name
-        assert launch["cooperative"] is (name == "decode_coop"), name
+        assert launch["cooperative"] is (
+            name in ("decode_coop", "decode_tcgen05_coop")
+        ), name
         parameters = MERGE_PARAMETERS if name == "merge" else DECODE_PARAMETERS
         plan = record["arg_plan"]
         assert [key for kind, key in plan if kind != "grid"] == list(parameters), name
@@ -848,6 +1028,8 @@ def test_manifest_holds_one_entry_per_program_and_architecture():
     assert manifest["arch_flags"] == {
         "sm_80": ["-gencode=arch=compute_80,code=sm_80"],
         "sm_90a": ["-gencode=arch=compute_90a,code=sm_90a"],
+        "sm_100a": ["-gencode=arch=compute_100a,code=sm_100a"],
+        "sm_103a": ["-gencode=arch=compute_103a,code=sm_103a"],
     }
     entries = {entry["name"]: entry for entry in manifest["libraries"]}
     assert len(entries) == len(manifest["libraries"])
