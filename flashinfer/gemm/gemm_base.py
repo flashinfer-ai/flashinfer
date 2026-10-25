@@ -1787,20 +1787,28 @@ _CAKE_BF16_BMM_SWAP_AB_ARGS = (
 )
 
 
+# Every row some target routes: a call off this set keeps the dispatcher before
+# any other test, so the shapes that keep it pay one set lookup.
+_CAKE_BF16_BMM_SWAP_AB_ROWS = frozenset(
+    row for routes in _CAKE_BF16_BMM_SWAP_AB_ROUTES.values() for row in routes
+)
+
+
 def _cake_bf16_bmm_swap_ab_route(
     A: torch.Tensor, B: torch.Tensor, out: torch.Tensor
 ) -> Optional[Tuple[str, _SwapAB]]:
     """The target and the generated swap-AB program serving the call, or ``None``."""
-    if os.environ.get("FLASHINFER_DISABLE_CAKE_BF16_BMM_SWAP_AB", "0") == "1":
-        return None
-    target = CAPABILITY_TARGET.get(get_compute_capability(A.device))
-    if target is None or target not in _CAKE_BF16_BMM_SWAP_AB_ROUTES:
-        return None
     if A.dim() != 3 or B.dim() != 3:
         return None
     batch, m, k = A.shape
     n = B.shape[2]
-    route = _CAKE_BF16_BMM_SWAP_AB_ROUTES[target].get((batch, m, n, k, out.dtype))
+    row = (batch, m, n, k, out.dtype)
+    if row not in _CAKE_BF16_BMM_SWAP_AB_ROWS:
+        return None
+    if os.environ.get("FLASHINFER_DISABLE_CAKE_BF16_BMM_SWAP_AB", "0") == "1":
+        return None
+    target = CAPABILITY_TARGET.get(get_compute_capability(A.device))
+    route = _CAKE_BF16_BMM_SWAP_AB_ROUTES.get(target, {}).get(row)
     if route is None:
         return None
     # The dispatcher's binding rejects dtypes, shapes and strides other than
