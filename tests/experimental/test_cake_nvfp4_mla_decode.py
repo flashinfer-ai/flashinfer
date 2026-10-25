@@ -1006,7 +1006,9 @@ def test_nvfp4_mla_decode(
     inputs = make_inputs(
         kv_lens, num_heads, q_len=q_len, enable_sink=enable_sink, device="cuda"
     )
-    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    num_sms = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
     if tiles_per_split is None:
         nbytes = nvfp4_mla_decode_workspace_size(
             kv_lens, num_heads, num_sms=num_sms, q_len=q_len, enable_sink=enable_sink
