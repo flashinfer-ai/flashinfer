@@ -527,6 +527,18 @@ def _select_candidate_schedule(
         lane_local=long_query and not warp_ranked_prefill,
     )
     candidate_capacity = _CANDIDATE_CAPACITY
+    if (
+        publication == "lane_local"
+        and _candidate_target(top_k) == _MAX_TARGET_CANDIDATES
+    ):
+        # Lane-local publication splits the row 32 * split_kv ways, so one
+        # full lane bank, not the row total, sets the overflow sentinel. At
+        # 6144 slots the 64 banks of split 2 hold 96 each and overflow near
+        # 4.6K candidates, inside the sampling spread of the capped 4096
+        # target (K >= 1024). The candidate arena is already repair-wide, so
+        # widen those lane banks; smaller targets keep 6144, where the wider
+        # PackedTopK costs more than the few overflows it would avoid.
+        candidate_capacity = _REPAIR_CAPACITY
     if warp_ranked_prefill and _h64_single_pool_topology(
         num_heads,
         head_dim,

@@ -8120,6 +8120,71 @@ def test_segmented_packed_topk(segments, top_k, capacity):
 
 
 @_requires_selective_sm100
+@pytest.mark.parametrize("top_k", [512, 1024, 2048])
+@pytest.mark.parametrize("ratio", [1, 4])
+def test_lane_local8192_changed_map_tail_graph(top_k, ratio, monkeypatch):
+    """K>=1024 H8 prefill lane banks use the repair-wide backing; K512 keeps 6144."""
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    physical, rows = 16387, 33
+    q, kv, scales, weights, _, _ = _inputs(rows, physical, 8)
+    cu_q = torch.tensor([0, rows], device="cuda", dtype=torch.int32)
+    cu_physical = torch.tensor([0, physical], device="cuda", dtype=torch.int32)
+    fused, table = _paged_inputs((q, kv, scales, weights, cu_q, cu_physical))
+    tokens = physical * ratio + ratio - 1
+    cu_tokens = torch.tensor([0, tokens], device="cuda", dtype=torch.int32)
+    raw = fused.flatten(1)
+    last = int(table[0, -1].item())
+    raw[last, : 128 * 128].view(128, 128)[physical % 128 :].fill_(0x7F)
+    wrapper = SelectiveEngineCase()
+    wrapper.plan(
+        q,
+        fused,
+        weights,
+        cu_q,
+        cu_tokens,
+        table,
+        top_k=top_k,
+        num_heads=8,
+        num_sms=4,
+        compression_ratio=ratio,
+    )
+    schedule = wrapper._candidate_schedule
+    assert schedule.publication == "lane_local"
+    assert schedule.candidate_capacity == (8192 if top_k >= 1024 else 6144)
+    assert wrapper._candidate_counts.shape[1] == 1 + 32 * schedule.split_kv
+    assert wrapper._candidate_values.shape[1] == 8192
+    assert wrapper._sample_threshold_launch[1][-2:] == (
+        6144,
+        schedule.sample_count_segments,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = wrapper.run(q, fused, weights, table)
+    for changed in (False, True):
+        if changed:
+            table[:, :2].copy_(table[:, :2].flip(1))
+            weights.mul_(0.75)
+        graph.replay()
+        torch.cuda.synchronize()
+        mapped = raw[table[0].long()]
+        keys = mapped[:, : 128 * 128].contiguous().view(q.dtype).reshape(-1, 128)
+        scale = mapped[:, 128 * 128 :].contiguous().view(torch.float32).reshape(-1)
+        for row in range(rows):
+            end = (tokens - rows + row + 1) // ratio
+            scores = (
+                (q[row].float() @ keys[:end].float().T).relu_() * weights[row, :, None]
+            ).sum(0) * scale[:end]
+            ids = output[row].long()
+            assert ((ids >= 0) & (ids < end)).all() and ids.unique().numel() == top_k
+            torch.testing.assert_close(
+                scores[ids].sort().values,
+                scores.topk(top_k).values.sort().values,
+                atol=5e-5,
+                rtol=1e-5,
+            )
+
+
+@_requires_selective_sm100
 @pytest.mark.parametrize("segments", [0, 4])
 @pytest.mark.parametrize("top_k", [7, 512, 2048])
 def test_finalizer_flags_only_incomplete_rows(segments, top_k):
