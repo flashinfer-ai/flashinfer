@@ -8905,6 +8905,77 @@ def test_engine_page_correlated_sampling(page_size, top_k, high_on_sampled):
 
 @_requires_selective_sm100
 @pytest.mark.parametrize("ratio", [1, 4])
+def test_benchmark_full_step_refreshes_lengths_and_page_maps(ratio):
+    """The separated layer consumes the last device-planned lengths and map."""
+    from flashinfer.attn_scores.fp8_kernel_config import FP8MQAKernelConfig
+    from flashinfer.attn_scores.query_group_metadata import FP8QueryGroups
+
+    spec = importlib.util.spec_from_file_location(
+        "bench_fp8_mqa_selective_logits",
+        os.path.join(
+            os.path.dirname(__file__),
+            "../../benchmarks/bench_fp8_mqa_selective_logits.py",
+        ),
+    )
+    assert spec is not None and spec.loader is not None
+    benchmark = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(benchmark)
+
+    inputs = _request_inputs([16, 16], [1024, 1024])
+    q, keys, scales, weights, qo_indptr, physical_kv = inputs
+    pool, table = _paged_inputs(inputs)
+    kv_indptr = physical_kv * ratio
+    groups = FP8QueryGroups.build(
+        qo_indptr.cpu().tolist(), kv_indptr.cpu().tolist(), ratio, 16
+    )
+    full = benchmark._FullGVR(
+        q,
+        pool,
+        weights,
+        table,
+        groups,
+        FP8MQAKernelConfig(128, 1, 160, 16, num_q_stages=3, num_kv_stages=3),
+        512,
+        qo_indptr=qo_indptr,
+        kv_indptr=kv_indptr,
+    )
+    full.step()
+    full.layer()
+    torch.cuda.synchronize()
+    step_graph, layer_graph = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+    with torch.cuda.graph(step_graph):
+        full.step()
+    with torch.cuda.graph(layer_graph):
+        full.layer()
+    for lengths in ([1024, 1024], [768, 512]):
+        kv_indptr.copy_(
+            torch.tensor(
+                [0, lengths[0] * ratio, sum(lengths) * ratio],
+                device=q.device,
+                dtype=torch.int32,
+            )
+        )
+        table.copy_(table.roll(1, dims=1))
+        step_graph.replay()
+        layer_graph.replay()
+        torch.cuda.synchronize()
+        oracle = []
+        for request, length in enumerate(lengths):
+            for local in range(16):
+                end = (length * ratio - 16 + local + 1) // ratio
+                slots = torch.arange(end, device=q.device)
+                page = pool.shape[0] - 1 - table[request, slots // 128].long()
+                physical = page * 128 + slots % 128
+                row = request * 16 + local
+                dots = q[row].float() @ keys[physical].float().T
+                oracle.append(
+                    (dots.relu() * weights[row, :, None]).sum(0) * scales[physical]
+                )
+        _check_selection(full.output, oracle, 512)
+
+
+@_requires_selective_sm100
+@pytest.mark.parametrize("ratio", [1, 4])
 def test_capacity_plan_capture_requires_prepared_pool(ratio):
     """A new wrapper must not capture a step before its first pool binding."""
     inputs = _request_inputs([2], [1024])
