@@ -49,6 +49,13 @@ constexpr uintptr_t kCachedAlignmentBytes = 32;
 // B200): rows * 2 >= resident clusters * 5.
 constexpr uint64_t kPersistentRowsPerClusterNum = 5;
 constexpr uint64_t kPersistentRowsPerClusterDen = 2;
+// The shared-tile kernels (4 register tiles and up to 4 shared-memory tiles
+// per CTA, four resident CTAs per SM) take an 8-tile launch once the rows
+// exceed one wave of persistent clusters, when the chunk spans at most 5
+// tiles, below the persistent threshold, or from 4 rows per resident
+// shared-tile cluster on (measured on GB300 and B200).
+constexpr int kSharedTilesAnyRowsMaxTiles = 5;
+constexpr uint64_t kSharedTilesRowsPerCluster = 4;
 constexpr int kMaxDevices = 64;
 
 enum class ParameterKind : int {
@@ -68,6 +75,7 @@ enum class SoftmaxRoute : int64_t {
   // Value 4 is not assigned; the values stay stable for tests and benchmarks.
   kCachedCluster = 5,
   kCachedClusterPersistent = 6,
+  kCachedClusterSharedTiles = 7,
 };
 
 struct CachedVariant {
@@ -185,6 +193,11 @@ size_t cached_dynamic_smem_bytes(int cluster_ctas) {
 
 size_t persistent_dynamic_smem_bytes(int cluster_ctas) { return cluster_ctas == 8 ? 67712 : 68736; }
 
+// The shared-tile kernels add the 4-tile buffer and its mbarriers.
+size_t shared_tiles_dynamic_smem_bytes(int cluster_ctas) {
+  return cluster_ctas == 8 ? 34432 : 34944;
+}
+
 // The persistent kernels serve the 8-tile variants of 8 and 16 CTAs.
 const void* cached_persistent_kernel(CachedVariant variant) {
   if (variant.max_tiles != kCachedMaxTiles) {
@@ -197,6 +210,22 @@ const void* cached_persistent_kernel(CachedVariant variant) {
   if (variant.cluster_ctas == 16) {
     return reinterpret_cast<const void*>(
         kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c16_t8);
+  }
+  return nullptr;
+}
+
+// The shared-tile kernels serve the 8-tile variants of 8 and 16 CTAs.
+const void* cached_shared_tiles_kernel(CachedVariant variant) {
+  if (variant.max_tiles != kCachedMaxTiles) {
+    return nullptr;
+  }
+  if (variant.cluster_ctas == 8) {
+    return reinterpret_cast<const void*>(
+        kernel_flashinfer_blackwell_softmax_cached_cluster_c8_t4_s4);
+  }
+  if (variant.cluster_ctas == 16) {
+    return reinterpret_cast<const void*>(
+        kernel_flashinfer_blackwell_softmax_cached_cluster_c16_t4_s4);
   }
   return nullptr;
 }
@@ -216,14 +245,19 @@ cudaError_t configure_cached_kernel(const void* kernel, int cluster_ctas,
   return status;
 }
 
-// Resident clusters of each persistent kernel per device, plus one (0: not yet
-// queried). The query also sets the kernel's function attributes on that device.
-std::atomic<int> g_persistent_resident_clusters[kMaxDevices][2];
+// Resident clusters per device of the persistent and shared-tile kernels of 8
+// and 16 CTAs, plus one (0: not yet queried). The query also sets the kernel's
+// function attributes on that device.
+enum ResidentKernel : int {
+  kResidentPersistent = 0,
+  kResidentSharedTiles = 1,
+};
+std::atomic<int> g_resident_clusters[kMaxDevices][2][2];
 
-cudaError_t persistent_resident_clusters(const void* kernel, int cluster_ctas,
-                                         size_t dynamic_smem_bytes, int device, int* clusters) {
+cudaError_t resident_clusters(ResidentKernel which, const void* kernel, int cluster_ctas,
+                              size_t dynamic_smem_bytes, int device, int* clusters) {
   std::atomic<int>* cached = device >= 0 && device < kMaxDevices
-                                 ? &g_persistent_resident_clusters[device][cluster_ctas == 16]
+                                 ? &g_resident_clusters[device][which][cluster_ctas == 16]
                                  : nullptr;
   if (cached != nullptr) {
     const int value = cached->load(std::memory_order_relaxed);
@@ -264,11 +298,12 @@ struct CachedLaunch {
   const void* kernel;
   uint64_t clusters;
   size_t dynamic_smem_bytes;
-  bool persistent;
+  SoftmaxRoute route;
 };
 
-// One cluster per row, or, for the 8-tile variants once the rows reach 2.5
-// times the resident clusters, the persistent kernel on every resident cluster.
+// One cluster per row. An 8-tile variant whose rows exceed the resident
+// persistent clusters takes the shared-tile kernel (one cluster per row) or
+// the persistent kernel on every resident cluster, by the rule above.
 cudaError_t select_cached_launch(uint32_t rows, uint32_t vocab_size, int device,
                                  CachedLaunch* launch) {
   int sm_count = 0;
@@ -278,7 +313,7 @@ cudaError_t select_cached_launch(uint32_t rows, uint32_t vocab_size, int device,
   }
   const CachedVariant variant = select_cached_variant(rows, vocab_size, sm_count);
   *launch = {variant, cached_cluster_kernel(variant), rows,
-             cached_dynamic_smem_bytes(variant.cluster_ctas), false};
+             cached_dynamic_smem_bytes(variant.cluster_ctas), SoftmaxRoute::kCachedCluster};
   if (launch->kernel == nullptr) {
     return cudaErrorNotSupported;
   }
@@ -288,14 +323,34 @@ cudaError_t select_cached_launch(uint32_t rows, uint32_t vocab_size, int device,
   }
   const size_t persistent_smem = persistent_dynamic_smem_bytes(variant.cluster_ctas);
   int resident = 0;
-  status = persistent_resident_clusters(persistent, variant.cluster_ctas, persistent_smem, device,
-                                        &resident);
+  status = resident_clusters(kResidentPersistent, persistent, variant.cluster_ctas, persistent_smem,
+                             device, &resident);
   if (status != cudaSuccess) {
     return status;
   }
-  if (resident > 0 && static_cast<uint64_t>(rows) * kPersistentRowsPerClusterDen >=
-                          static_cast<uint64_t>(resident) * kPersistentRowsPerClusterNum) {
-    *launch = {variant, persistent, static_cast<uint64_t>(resident), persistent_smem, true};
+  if (resident <= 0 || rows <= static_cast<uint32_t>(resident)) {
+    return cudaSuccess;
+  }
+  const void* shared_tiles = cached_shared_tiles_kernel(variant);
+  const size_t shared_tiles_smem = shared_tiles_dynamic_smem_bytes(variant.cluster_ctas);
+  int shared_resident = 0;
+  status = resident_clusters(kResidentSharedTiles, shared_tiles, variant.cluster_ctas,
+                             shared_tiles_smem, device, &shared_resident);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  const bool narrow_chunk = cached_chunk_elements(vocab_size, variant.cluster_ctas) <=
+                            kSharedTilesAnyRowsMaxTiles * kCachedTileElements;
+  const bool under_persistent = static_cast<uint64_t>(rows) * kPersistentRowsPerClusterDen <
+                                static_cast<uint64_t>(resident) * kPersistentRowsPerClusterNum;
+  const bool many_rows = shared_resident > 0 && static_cast<uint64_t>(rows) >=
+                                                    kSharedTilesRowsPerCluster * shared_resident;
+  if (shared_resident > 0 && (narrow_chunk || under_persistent || many_rows)) {
+    *launch = {variant, shared_tiles, rows, shared_tiles_smem,
+               SoftmaxRoute::kCachedClusterSharedTiles};
+  } else if (!under_persistent) {
+    *launch = {variant, persistent, static_cast<uint64_t>(resident), persistent_smem,
+               SoftmaxRoute::kCachedClusterPersistent};
   }
   return cudaSuccess;
 }
@@ -458,9 +513,7 @@ cudaError_t launch_blackwell_softmax(float* logits, float* output, float* temper
     if (status != cudaSuccess) {
       return status;
     }
-    if (launch.persistent) {
-      *selected_route = SoftmaxRoute::kCachedClusterPersistent;
-    }
+    *selected_route = launch.route;
     const uint64_t grid = launch.clusters * launch.variant.cluster_ctas;
     if (grid > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
       return cudaErrorNotSupported;
@@ -600,7 +653,7 @@ SoftmaxRoute query_softmax_route(TensorView logits, Optional<TensorView> maybe_t
   status = select_cached_launch(rows, vocab_size, logits.device().device_id, &launch);
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Blackwell Softmax route query failed with error code " << cudaGetErrorString(status);
-  return launch.persistent ? SoftmaxRoute::kCachedClusterPersistent : route;
+  return launch.route;
 }
 
 void blackwell_softmax_impl(TensorView workspace_buffer, TensorView logits, TensorView output,

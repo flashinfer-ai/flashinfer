@@ -196,8 +196,10 @@ def test_blackwell_scalar_one_pdl_b64_v32000_takes_cached_cluster_route():
         (256, 64000, None, False, 5),
         (1, 32000, None, False, 5),
         (1, 256000, None, False, 5),
-        (256, 256000, None, False, 6),
-        (512, 128000, 0.5, True, 6),
+        (48, 256000, None, False, 6),
+        (100, 128000, 0.5, True, 6),
+        (256, 256000, None, False, 7),
+        (512, 128000, 0.5, True, 7),
     ],
 )
 def test_blackwell_softmax_all_negative_infinity_matches_public_semantics(
@@ -237,21 +239,26 @@ def test_blackwell_route_observer_falls_back_off_blackwell():
 
 
 @pytest.mark.parametrize(
-    "rows,vocab_size,temperature_kind,enable_pdl,persistent",
+    "rows,vocab_size,temperature_kind,enable_pdl,expected_route",
     [
-        (1, 32000, "none", False, False),
-        (1, 262144, "none", False, False),  # widest cached row: 16 CTAs x 8 tiles
-        (8, 4096, "scalar", False, False),
-        (64, 32000, "scalar", True, False),
-        (16, 256000, "none", False, False),  # 8-tile rows under the threshold
-        (1024, 128000, "none", False, True),  # persistent 8-CTA clusters
-        (1024, 256000, "per_row", True, True),  # persistent 16-CTA clusters
-        (989, 128256, "per_row", True, True),  # rows not a multiple of the clusters
-        (600, 100008, "scalar", False, True),  # a partial last tile in every row
+        (1, 32000, "none", False, "row"),
+        (1, 262144, "none", False, "row"),  # widest cached row: 16 CTAs x 8 tiles
+        (8, 4096, "scalar", False, "row"),
+        (64, 32000, "scalar", True, "row"),
+        (8, 256000, "none", False, "row"),  # 8-tile rows in one wave
+        (16, 256000, "none", False, "shared_tiles"),  # under the persistent threshold
+        (40, 151936, "scalar", False, "shared_tiles"),  # 5-tile chunks
+        (48, 256000, "per_row", True, "persistent"),  # persistent 16-CTA clusters
+        (100, 128000, "none", False, "persistent"),  # persistent 8-CTA clusters
+        (96, 100008, "none", False, "persistent"),  # a partial last tile in every row
+        (1024, 128000, "none", False, "shared_tiles"),  # 4+ rows per cluster
+        (1024, 256000, "per_row", True, "shared_tiles"),
+        (989, 128256, "per_row", True, "shared_tiles"),  # rows not a multiple of 8
+        (600, 100008, "scalar", False, "shared_tiles"),  # the last tile unreached
     ],
 )
 def test_blackwell_cached_cluster_route_is_selected_and_correct(
-    rows, vocab_size, temperature_kind, enable_pdl, persistent
+    rows, vocab_size, temperature_kind, enable_pdl, expected_route
 ):
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("Blackwell Softmax routes require SM100 or SM103")
@@ -275,11 +282,12 @@ def test_blackwell_cached_cluster_route_is_selected_and_correct(
         logits, temperature=temperature, enable_pdl=enable_pdl
     )
 
-    assert route == (
-        flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_PERSISTENT
-        if persistent
-        else flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER
-    )
+    routes = {
+        "row": flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER,
+        "persistent": flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_PERSISTENT,
+        "shared_tiles": flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_SHARED_TILES,
+    }
+    assert route == routes[expected_route]
     assert probs.data_ptr() != logits.data_ptr()
     torch.testing.assert_close(probs, probs_ref, atol=1e-3, rtol=1e-3)
 
@@ -305,6 +313,7 @@ def test_blackwell_cached_cluster_route_declines_unaligned_rows(rows, vocab_size
         flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_FALLBACK,
         flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER,
         flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_PERSISTENT,
+        flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_SHARED_TILES,
     )
     torch.testing.assert_close(
         probs, torch.softmax(logits, dim=-1), atol=1e-3, rtol=1e-3
@@ -380,8 +389,9 @@ def test_softmax(
         (256, 64000, "none"),  # cached cluster route, 8-CTA clusters
         (512, 64000, "none"),  # cached cluster route, 8-CTA clusters
         (1024, 64000, "none"),  # cached cluster route, 8-CTA clusters
-        (1024, 256000, "none"),  # persistent 16-CTA non-portable clusters
-        (989, 128256, "per_row"),  # persistent 8-CTA clusters, per-row temperature
+        (48, 256000, "none"),  # persistent 16-CTA non-portable clusters
+        (1024, 256000, "none"),  # shared-tile 16-CTA non-portable clusters
+        (989, 128256, "per_row"),  # shared-tile 8-CTA clusters, per-row temperature
         (1, 32004, "none"),  # cooperative bootstrap route (vocab not a multiple of 8)
         (256, 32004, "none"),  # rowwise route (vocab not a multiple of 8)
         (1, 111, "scalar"),  # scalar-temperature warp-packed route
