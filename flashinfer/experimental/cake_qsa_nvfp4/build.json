@@ -64,32 +64,11 @@
     }
   },
   "generator": {
-    "cake_revision": "9f24aff58af4f5cefd28b52c3ac8acea3d117e50",
+    "cake_revision": "dc56661640b28d1f386630f0d60f878006ada8bb",
     "cuda": "13.4.92",
-    "rendered_at": "2026-10-24T06:17:08Z"
+    "rendered_at": "2026-10-25T16:26:43Z"
   },
   "libraries": [
-    {
-      "arch": "sm_103a",
-      "closure_sha256": "8a7ff3ac705f284429e999964a20177b233421a228a39b979c14b7d4abd0bff8",
-      "entry": "run",
-      "gencode": "-gencode=arch=compute_103a,code=sm_103a",
-      "min_cuda": "12.9",
-      "name": "cake_qsa_nvfp4_dfd8600d03040c9f808d_sm_103a",
-      "nvcc_flags": [
-        "--use_fast_math"
-      ],
-      "nvcc_flags_if": [],
-      "path": "aot/cake_qsa_nvfp4_dfd8600d03040c9f808d_sm_103a.so",
-      "sha256": {
-        "csrc/cake_qsa_nvfp4_dfd8600d03040c9f808d_binding.cu": "f2fb3f1a78d19da95530fc35283529fb492231ca6a630f0eb684ef7567060ddf",
-        "csrc/cake_qsa_nvfp4_dfd8600d03040c9f808d_kernel.cu": "e56bfe9c3968b6428ab17d8c34538ae9623ca17825397e1f8a8d311841555cfe"
-      },
-      "sources": [
-        "csrc/cake_qsa_nvfp4_dfd8600d03040c9f808d_kernel.cu",
-        "csrc/cake_qsa_nvfp4_dfd8600d03040c9f808d_binding.cu"
-      ]
-    },
     {
       "arch": "sm_120a",
       "closure_sha256": "4a4f9e0ee6e2d4f60641f1272ddc6da1adefa0f9e90d52895d492b3678e0e9cc",
@@ -406,8 +385,50 @@
       ]
     },
     {
+      "arch": "sm_103a",
+      "closure_sha256": "5daa1c94cd99b12b9494c58d28b8d4b8263ca8de24afd655cf44cbee36e1cbb6",
+      "entry": "run",
+      "gencode": "-gencode=arch=compute_103a,code=sm_103a",
+      "min_cuda": "12.9",
+      "name": "cake_qsa_nvfp4_dfd8600d03040c9f808d_sm_103a",
+      "nvcc_flags": [
+        "--use_fast_math"
+      ],
+      "nvcc_flags_if": [],
+      "path": "aot/cake_qsa_nvfp4_dfd8600d03040c9f808d_sm_103a.so",
+      "sha256": {
+        "csrc/cake_qsa_nvfp4_dfd8600d03040c9f808d_binding.cu": "f2fb3f1a78d19da95530fc35283529fb492231ca6a630f0eb684ef7567060ddf",
+        "csrc/cake_qsa_nvfp4_dfd8600d03040c9f808d_kernel.cu": "e56bfe9c3968b6428ab17d8c34538ae9623ca17825397e1f8a8d311841555cfe"
+      },
+      "sources": [
+        "csrc/cake_qsa_nvfp4_dfd8600d03040c9f808d_kernel.cu",
+        "csrc/cake_qsa_nvfp4_dfd8600d03040c9f808d_binding.cu"
+      ]
+    },
+    {
+      "arch": "sm_120a",
+      "closure_sha256": "486ced780ecd85f8b2188f53891bf999f0e2a05c92909b7841771228a9842938",
+      "entry": "run",
+      "gencode": "-gencode=arch=compute_120a,code=sm_120a",
+      "min_cuda": "12.8",
+      "name": "cake_qsa_nvfp4_ecb46ae2b040daa1c35d_sm_120a",
+      "nvcc_flags": [
+        "--use_fast_math"
+      ],
+      "nvcc_flags_if": [],
+      "path": "aot/cake_qsa_nvfp4_ecb46ae2b040daa1c35d_sm_120a.so",
+      "sha256": {
+        "csrc/cake_qsa_nvfp4_ecb46ae2b040daa1c35d_binding.cu": "f2d0cd883f73c1397820c561a3de78f3e650c9a6b2775189fa5d327fd4bc0faf",
+        "csrc/cake_qsa_nvfp4_ecb46ae2b040daa1c35d_kernel.cu": "efdb3ce2481db8d7ee58bab1e2a7bc03989533b0bcb09d95d0b682ba45097425"
+      },
+      "sources": [
+        "csrc/cake_qsa_nvfp4_ecb46ae2b040daa1c35d_kernel.cu",
+        "csrc/cake_qsa_nvfp4_ecb46ae2b040daa1c35d_binding.cu"
+      ]
+    },
+    {
       "arch": "sm_80",
-      "closure_sha256": "e0dd33cd0fac36d2851e792a07021c4e15890a3cea64884353d65149a59cc18f",
+      "closure_sha256": "9a16b10dc7ed741ac755bb278d5a3362b730d22b56404cf7a5a6a88ca51e4107",
       "entry": "run",
       "gencode": "-gencode=arch=compute_80,code=sm_80",
       "min_cuda": "12.8",
@@ -419,7 +440,7 @@
       "path": "aot/cake_qsa_nvfp4_ecb46ae2b040daa1c35d_sm_80.so",
       "sha256": {
         "csrc/cake_qsa_nvfp4_ecb46ae2b040daa1c35d_binding.cu": "f2d0cd883f73c1397820c561a3de78f3e650c9a6b2775189fa5d327fd4bc0faf",
-        "csrc/cake_qsa_nvfp4_ecb46ae2b040daa1c35d_kernel.cu": "8f854dc2dd0cf63501921d5e8df81880288c02ce9cddb349603be6f5898dbbc1"
+        "csrc/cake_qsa_nvfp4_ecb46ae2b040daa1c35d_kernel.cu": "efdb3ce2481db8d7ee58bab1e2a7bc03989533b0bcb09d95d0b682ba45097425"
       },
       "sources": [
         "csrc/cake_qsa_nvfp4_ecb46ae2b040daa1c35d_kernel.cu",
