@@ -2918,6 +2918,32 @@ def test_binding_cache_configure():
         BindingCache(capacity=0)
 
 
+def test_stage_names_and_gemm_scalars_return_fresh_dicts():
+    """``parse_stage`` and ``gemm_scalars`` remember their results per argument tuple; every call still returns a dict
+    of its own, so a caller that edits one changes nothing for the next call."""
+    stage = "gemm_dx_s_tn256"
+    base, knobs = cake_backend.parse_stage(stage)
+    assert base == "gemm_dx" and knobs["sliced"] is True and knobs["tile_n"] == 256
+    knobs["sliced"] = None
+    assert cake_backend.parse_stage(stage)[1]["sliced"] is True
+    with pytest.raises(ValueError, match="not a stage name"):
+        cake_backend.parse_stage("gemm_dx_bogus")
+    g = Geometry.from_record(None)
+    scalars = cake_backend.gemm_scalars(
+        "gemm_logits", g, hidden=DEFAULT_H, vocab=DEFAULT_V, rows_c=7
+    )
+    expect = dict(scalars)
+    scalars["M"] = -1
+    again = cake_backend.gemm_scalars(
+        "gemm_logits", g, hidden=DEFAULT_H, vocab=DEFAULT_V, rows_c=7
+    )
+    assert again == expect and again["M"] == 7 and again is not scalars
+    with pytest.raises(ValueError, match="group_m must be positive"):
+        cake_backend.gemm_scalars(
+            "gemm_logits", g, hidden=DEFAULT_H, vocab=DEFAULT_V, rows_c=7, group_m=0
+        )
+
+
 HOST_SHAPES = [(1, 16), (5, 4), (37, 16), (64, 64), (65, 64), (200, 64)]
 
 
@@ -4034,6 +4060,39 @@ def test_valid_rows_mask():
     all_ignored = torch.full((4,), IGNORE_INDEX)
     idx0, mask0 = cake_backend.valid_rows(all_ignored, mask=True)
     assert idx0.numel() == 0 and mask0.shape == (4,) and not mask0.any()
+
+
+def test_valid_rows_host_count_matches_the_device_count(monkeypatch):
+    """A CUDA call of at most ``HOST_COUNT_MAX_ROWS`` rows forms the valid-row index on the host from the mask's
+    readback, a longer one on the device: the same int64 index and bool mask (contiguous, on the labels' device) for
+    every row valid, some ignored and every row ignored, either side of the limit."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    limit = cake_backend.HOST_COUNT_MAX_ROWS
+    assert 1 <= limit < 2048
+    gen = torch.Generator().manual_seed(SEED)
+    cases = []
+    for T in (1, 2, 16, 128, limit, limit + 1, 3000):
+        labels = torch.randint(0, 1000, (T,), generator=gen)
+        some = labels.clone()
+        some[torch.randperm(T, generator=gen)[: max(1, T // 20)]] = IGNORE_INDEX
+        cases += [labels, some, torch.full((T,), IGNORE_INDEX)]
+    for labels in cases:
+        on_device = labels.to(CUDA)
+        out = {}
+        # the device path everywhere, the host path everywhere
+        for rows in (0, 1 << 20):
+            monkeypatch.setattr(cake_backend, "HOST_COUNT_MAX_ROWS", rows)
+            out[rows] = cake_backend.valid_rows(on_device, mask=True)
+            assert cake_backend.valid_rows(on_device)[1] is None
+        (device_idx, device_mask), (host_idx, host_mask) = out[0], out[1 << 20]
+        assert (device_idx is None) == (host_idx is None) == bool((labels >= 0).all())
+        if device_idx is None:
+            assert device_mask is None and host_mask is None
+            continue
+        for d, h in ((device_idx, host_idx), (device_mask, host_mask)):
+            assert torch.equal(d, h) and d.dtype == h.dtype and d.shape == h.shape
+            assert h.device == on_device.device and h.is_contiguous()
 
 
 def test_scale_cast_scatter_reference_matches_scatter_rows():
@@ -5863,6 +5922,53 @@ def test_device_fused_dw_cast_is_bitwise(glm_weight):
     runner.step(g3)
     torch.cuda.synchronize()
     assert torch.equal(runner.dw_out, _run(inp, 2048, backend="cake", scale=3.0)["dW"])
+
+
+def test_device_eager_casts_remember_their_launch(glm_weight):
+    """The output-boundary casts bind once per form while the binding cache is enabled and slot each call's tensors into
+    the remembered launch: bitwise the outputs of a fresh binding per call (cache disabled), one remembered form per
+    cast, no tensor held, and ``clear`` / ``enabled=False`` drop them."""
+    _require_program(entry="loss")
+    cache = cake_backend.BINDING_CACHE
+    gen = torch.Generator(device=CUDA).manual_seed(SEED + 71)
+    accs = [torch.randn((5, DEFAULT_H), device=CUDA, generator=gen) for _ in range(2)]
+    dzs = [
+        torch.randn((3, DEFAULT_V), device=CUDA, generator=gen).to(torch.bfloat16)
+        for _ in range(2)
+    ]
+    xs = [
+        torch.randn((3, DEFAULT_H), device=CUDA, generator=gen).to(torch.bfloat16)
+        for _ in range(2)
+    ]
+    grads = [torch.tensor(v, device=CUDA) for v in (1.5, -0.25)]
+
+    def casts():
+        out = []
+        for acc, dz, x, g in zip(accs, dzs, xs, grads, strict=True):
+            out.append(cake_backend.scale_cast(acc, g, torch.bfloat16))
+            out.append(cake_backend.scale_cast(acc, g, torch.float32))
+            out.append(cake_backend.dw_cast(dz, x, None, g, torch.bfloat16))
+        torch.cuda.synchronize()
+        return out
+
+    with _cache(False):
+        fresh = casts()
+    with _cache(True):
+        cache.clear()
+        remembered = casts()
+        forms = len(cache._eager)
+        assert forms == 3, list(cache._eager)
+        again = casts()
+        assert len(cache._eager) == forms
+        assert not any(
+            isinstance(a, torch.Tensor)
+            for _, launch in cache._eager.values()
+            for a in launch.arguments
+        )
+        cache.clear()
+        assert len(cache._eager) == 0
+    for a, b, c in zip(fresh, remembered, again, strict=True):
+        assert torch.equal(a, b) and torch.equal(a, c) and a.dtype == b.dtype
 
 
 def test_device_dx_finalize_is_bitwise(glm_weight, monkeypatch):

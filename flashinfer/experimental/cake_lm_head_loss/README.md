@@ -67,8 +67,12 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   valid-row tensor, default `False`): when some labels are `-100` the chunk loop runs over the valid rows
   only.  The int64 row index
   `(labels >= 0).nonzero()` is formed once per call (one device
-  synchronization: `nonzero` returns the count and the index together; the
-  log-probability backward reuses the forward's index), every chunk gathers its
+  synchronization: `nonzero` returns the count and the index together; a call
+  of at most `HOST_COUNT_MAX_ROWS` (1024) rows reads the bool mask back instead
+  and forms the same index on the host, without `nonzero`'s count and select kernels
+  (with some rows ignored, its index copy back makes this step a few microseconds
+  slower than `nonzero` from about 128 rows up);
+  the log-probability backward reuses the forward's index), every chunk gathers its
   rows of `X` into one reusable BF16 `[chunk_size, H]` buffer (`x_c`, a
   workspace region; a strided `X` then needs no contiguous copy), the row
   operands (`labels`, `infer_logp`, `loss_weights`, `dlogp`) are compacted to

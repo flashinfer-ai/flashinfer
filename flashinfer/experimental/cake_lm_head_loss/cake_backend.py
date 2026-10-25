@@ -58,8 +58,9 @@ Contract
   ``-100`` the chunk loop runs over the valid rows only -- the row index
   ``idx = (labels >= 0).nonzero()`` is formed once per call (one device
   synchronization, ``nonzero``'s count, for the count and the index together:
-  :func:`valid_rows`; the log-probability backward reuses the forward's
-  index), each chunk's rows of ``X`` are gathered into one reusable BF16 ``[C, H]`` buffer, the row operands
+  :func:`valid_rows`, which forms them on the host from the mask's readback
+  for calls of at most :data:`HOST_COUNT_MAX_ROWS` rows; the log-probability
+  backward reuses the forward's index), each chunk's rows of ``X`` are gathered into one reusable BF16 ``[C, H]`` buffer, the row operands
   are compacted to ``[T_v]``, the FP32 ``dX`` accumulator is ``[T_v, H]`` and
   ``logp`` / ``dX`` are scattered back to ``[T]`` with exact zeros on the
   ignored rows.  Ignored rows contribute exactly zero to the loss and both
@@ -205,6 +206,13 @@ ABI_CONTRACT = "lm_head_loss_v1"
 # plan on the count after the readback, the launches it orders) is hidden behind chunk 0's logits GEMM only from there; one- and
 # two-chunk calls measured 5-16 % slower with it than on the host-count path (same kernels, bitwise the same outputs).
 HIDDEN_COUNT_MIN_CHUNKS = 3
+# Calls of at most this many rows form the valid-row count and index of the host-count path on the host
+# (:func:`valid_rows`): the bool mask ``labels >= 0`` comes back in one copy of ``T`` bytes -- the call's one
+# synchronization -- and the index goes back in one copy, instead of ``nonzero``'s count, scan and select kernels and
+# their API calls.  Above it the device forms the index.  The same index and mask either way.  With some rows ignored,
+# the index copy back makes :func:`valid_rows` alone a few microseconds slower than the device path from about 128 rows
+# up (2-6 us measured at 512-1024 rows).
+HOST_COUNT_MAX_ROWS = 1024
 SUPPORTED_ABIS = (ABI_CONTRACT,)
 
 # Geometry the kernels of a record were built for (record field ``geometry``;
@@ -555,9 +563,11 @@ def stage_variant(
     return name
 
 
-def parse_stage(stage: str) -> tuple[str, dict[str, Any]]:
-    """``(base, {count, sliced, tile_n, stages, split, blocked, epi_store})`` of a stage name (the inverse of
-    :func:`stage_variant`; the knob keys are ``STAGE_KNOBS``)."""
+@functools.lru_cache(maxsize=1024)
+def _parse_stage(stage: str) -> tuple[str, tuple[tuple[str, Any], ...]]:
+    """:func:`parse_stage` with the knobs as an immutable tuple: the stage names of the records are a fixed set, so the
+    regular expression and the :func:`stage_variant` round trip run once per name (bounded; a failed parse is not
+    remembered)."""
     m = _STAGE_RE.fullmatch(stage)
     if m is None:
         raise ValueError(f"not a stage name of this backend: {stage!r}")
@@ -572,12 +582,19 @@ def parse_stage(stage: str) -> tuple[str, dict[str, Any]]:
     )
     if stage_variant(m["base"], **knobs) != stage:
         raise ValueError(f"not a stage name of this backend: {stage!r}")
-    return m["base"], knobs
+    return m["base"], tuple(knobs.items())
+
+
+def parse_stage(stage: str) -> tuple[str, dict[str, Any]]:
+    """``(base, {count, sliced, tile_n, stages, split, blocked, epi_store})`` of a stage name (the inverse of
+    :func:`stage_variant`; the knob keys are ``STAGE_KNOBS``)."""
+    base, knobs = _parse_stage(stage)
+    return base, dict(knobs)
 
 
 def base_stage(stage: str) -> str:
     """The base stage a (variant) stage name instantiates."""
-    return parse_stage(stage)[0]
+    return _parse_stage(stage)[0]
 
 
 def gemm_op(stage: str) -> str:
@@ -1100,7 +1117,37 @@ def gemm_scalars(
     the dX GEMM.  The logits GEMM always stores (``first_chunk`` 0 = no accumulate), the dX GEMM always stores its chunk's
     rows (1); ``first_chunk`` / ``ws_slab`` are taken from the arguments for the weight-gradient / dX GEMM only.  The
     form of ``stage`` must agree with the scalars (the ``_s`` form with ``k_slices > 1``, the ``_gn`` form with a
-    ``group_n``)."""
+    ``group_n``).  A pure function of its arguments, remembered per argument tuple (bounded; a rejected tuple is not
+    remembered); every call returns a fresh dict."""
+    return dict(
+        _gemm_scalars(
+            stage,
+            geometry,
+            hidden,
+            vocab,
+            rows_c,
+            k_slices,
+            group_m,
+            group_n,
+            first_chunk,
+            ws_slab,
+        )
+    )
+
+
+@functools.lru_cache(maxsize=4096)
+def _gemm_scalars(
+    stage: str,
+    geometry: "Geometry",
+    hidden: int,
+    vocab: int,
+    rows_c: int,
+    k_slices: int,
+    group_m: Optional[int],
+    group_n: Optional[int],
+    first_chunk: int,
+    ws_slab: int,
+) -> dict[str, int]:
     _base, knobs = parse_stage(stage)
     op = gemm_op(stage)
     hidden, vocab, rows_c = int(hidden), int(vocab), int(rows_c)
@@ -1680,11 +1727,19 @@ def valid_rows(
     count is the index's length (every row valid: the index is dropped).  ``mask=True`` (the fused dX finalize of a
     call that produces ``dX``) also returns the already materialized bool valid-row mask ``labels >= 0`` (``[T]``;
     :func:`finalize_dx` turns it into the inclusive int32 scan behind the backward's queued GEMMs, not here in the
-    synchronization shadow of ``nonzero``); ``None`` whenever ``row_index`` is."""
+    synchronization shadow of ``nonzero``); ``None`` whenever ``row_index`` is.  A CUDA call of at most
+    :data:`HOST_COUNT_MAX_ROWS` rows reads the mask back instead (the one synchronization) and forms the same index on
+    the host, copied back to the labels' device: no count or select kernels."""
     T = int(labels.numel())
     if T == 0:
         return None, None
     valid = labels >= 0
+    if T <= HOST_COUNT_MAX_ROWS and labels.is_cuda:
+        index = valid.cpu().nonzero().squeeze(1)
+        if int(index.numel()) == T:
+            return None, None
+        # pageable host memory: the copy is staged before it returns, so the host index may go right away
+        return index.to(labels.device, non_blocking=True), (valid if mask else None)
     index = valid.nonzero().squeeze(1)
     if int(index.numel()) == T:
         return None, None
@@ -2672,10 +2727,17 @@ def _grid_term(value, names: dict[str, int]) -> int:
     if isinstance(value, int):
         return int(value)
     try:
-        tree = ast.parse(str(value).strip(), mode="eval")
+        tree = _grid_tree(str(value).strip())
     except SyntaxError as exc:
         raise ValueError(f"grid rule entry {value!r} is not an expression") from exc
     return _grid_eval(tree, names)
+
+
+@functools.lru_cache(maxsize=512)
+def _grid_tree(text: str) -> ast.Expression:
+    """The parsed grid rule entry (the records carry a fixed set of rule texts; bounded, never mutated:
+    :func:`_grid_eval` only reads it)."""
+    return ast.parse(text, mode="eval")
 
 
 def _grid_eval(node, names: dict[str, int]) -> int:
@@ -3202,6 +3264,121 @@ def stage_values(
     else:
         raise ValueError(f"unknown stage {stage!r}")
     return values
+
+
+def _slot_values(stage: str, t: dict[str, Any], plan: Plan, index) -> dict[str, Any]:
+    """The tensor host values of :func:`stage_values` for chunk ``index`` -- the views a remembered launch slots in per
+    call (:meth:`_Launch.arguments_for`) and the operands of the ``gather_rows`` host step -- without the scalars and
+    the plan checks, which the binding fixed when it was prepared.  Any other host stage gets :func:`stage_values`.
+    :meth:`_Binding.from_runner` checks every remembered launch against :func:`stage_values` once."""
+    p = plan.problem
+    values: dict[str, Any] = {name: t.get(name) for name in COMMON_TENSORS}
+    if stage == "gather_rows":
+        if isinstance(index, str):
+            values.update(src=t[index + "_full"], idx=t["row_index"], out=t[index])
+            return values
+        row0, rows_c = plan.chunks[index]
+        values.update(
+            src=t["X"], idx=t["row_index"][row0 : row0 + rows_c], out=t["x_c"][:rows_c]
+        )
+        return values
+    if stage in ("scale_cast_bf16", "scale_cast_f32"):
+        acc = t["dx_acc"] if index == "dx" else t["dw_acc"]
+        out = t["dx_out"] if index == "dx" else t["dw_out"]
+        values.update(
+            acc=acc.reshape(-1),
+            g=t["grad_scale"] if p.entry == "loss" else t["unit_scale"],
+            out=out.reshape(-1),
+        )
+        return values
+    row0, rows_c = plan.chunks[index]
+    stop = row0 + rows_c
+    base = base_stage(stage) if stage in GEMM_STAGES else stage
+    logits = t["logits"]
+    if base in LOGITS_BASES or base == "gemm_dw_acc" or base in DW_CAST_STAGES:
+        x_chunk = t["x_c"][:rows_c] if plan.compact else t["X"][row0:stop]
+        if t.get("x_last") is not None and index == plan.num_chunks - 1:
+            x_chunk = t["x_last"]
+    if base in LOGITS_BASES:
+        values.update(
+            A=x_chunk,
+            B=t["W"],
+            C=logits[:rows_c],
+            STATS_OUT=t["stats"],
+            WS=t["f32_dummy"],
+        )
+        if base in (LOGPROB_DZ_STAGE, LOGPROB_LBL_STAGE):
+            values.update(labels=t["labels"])
+        if base == LOGPROB_DZ_STAGE:
+            values.update(lse=t["lse"], d_in=t["d_in"])
+    elif base == "gemm_dx":
+        values.update(
+            A=logits[:rows_c],
+            B=t["W"],
+            C=t["dx_acc"][row0:stop],
+            STATS_OUT=t["stats"],
+            WS=t["dx_ws"] if plan.dx_slices_of(index) > 1 else t["f32_dummy"],
+        )
+    elif stage == "slab_sum":
+        values.update(dx=t["dx_acc"][row0:stop], ws=t["dx_ws"])
+    elif base == "gemm_dw_acc":
+        values.update(
+            A=logits[:rows_c],
+            B=x_chunk,
+            C=t["dw_acc"],
+            STATS_OUT=t["stats"],
+            WS=t["f32_dummy"],
+        )
+    elif base in DW_CAST_STAGES:
+        values.update(
+            A=logits[:rows_c],
+            B=x_chunk,
+            C=t["dw_out"],
+            STATS_OUT=t["grad_scale"] if p.entry == "loss" else t["unit_scale"],
+            WS=t["dw_acc"] if plan.num_chunks > 1 else t["f32_dummy"],
+        )
+    elif stage == "row_finalize":
+        d = t["d"]
+        values.update(
+            stats=t["stats"],
+            z=logits,
+            labels=t["labels"],
+            infer_logp=d if t.get("infer_logp") is None else t["infer_logp"],
+            loss_weights=d if t.get("loss_weights") is None else t["loss_weights"],
+            d_in=d if t.get("d_in") is None else t["d_in"],
+            lse=t["lse"],
+            logp=t["logp"],
+            d=d,
+            term=t["term"],
+        )
+    elif stage == "loss_reduce":
+        values.update(term=t["term"], loss_acc=t["loss_acc"], loss_out=t["loss"])
+    elif stage == "row_grad":
+        values.update(
+            z=logits,
+            labels=t["labels"],
+            lse=t["lse"],
+            d=t["d_in"] if p.entry == "logprob" else t["d"],
+        )
+    else:
+        return stage_values(stage, t, plan, index)
+    return values
+
+
+def _same_view(a, b) -> bool:
+    """Whether two host values bind the same argument: the same object, or tensors with the same address, shape,
+    strides, dtype and device."""
+    if a is b:
+        return True
+    if not (isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor)):
+        return False
+    return (
+        a.data_ptr() == b.data_ptr()
+        and a.shape == b.shape
+        and a.stride() == b.stride()
+        and a.dtype == b.dtype
+        and a.device == b.device
+    )
 
 
 def forward_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
@@ -3739,6 +3916,43 @@ def _bind_all(
             )
         launches[key] = bind_stage(module_name, stage, values[key], grid)
     return launches
+
+
+def _eager_launch(
+    record, module_name: str, stage: str, values: dict[str, Any], device, geometry
+) -> tuple[_Launch, list]:
+    """``(launch, arguments)`` of one eager stage of the output boundary (:func:`scale_cast`, :func:`scale_cast_scatter`,
+    :func:`dw_cast`).  Bound by :func:`_bind_all`; while :data:`BINDING_CACHE` is enabled the templated launch is
+    remembered there per form -- the record, the stage, the device and every non-tensor host value, which fix the grid
+    and the scalar arguments -- and a later call of the same form slots its tensors into it: the same entry, grid and
+    arguments as a fresh binding."""
+    key = (stage, "eager")
+    cache = BINDING_CACHE
+    if not cache.enabled:
+        launch = _bind_all(
+            record, module_name, (key,), {key: values}, device, geometry
+        )[key]
+        return launch, list(launch.arguments)
+    form = (
+        module_name,
+        stage,
+        str(device),
+        tuple(
+            sorted(
+                (name, isinstance(value, torch.Tensor))
+                + ((None,) if isinstance(value, torch.Tensor) else (value,))
+                for name, value in values.items()
+            )
+        ),
+    )
+    launch = cache.eager_lookup(form, record)
+    if launch is None:
+        launch = _bind_all(
+            record, module_name, (key,), {key: values}, device, geometry
+        )[key]
+        cache.eager_remember(form, record, launch.templated())
+        return launch, list(launch.arguments)
+    return launch, launch.arguments_for(values)
 
 
 def prepare_lm_head_loss(
@@ -4280,6 +4494,14 @@ class _Binding:
             )
         # the hidden-count path drops the runner's chunk-0 gather / GEMM launches (not in either sequence)
         keep = None if hidden is None else set(forward_order) | set(backward_order)
+        # the per-call slots come from :func:`_slot_values`: check it against :func:`stage_values` on the runner's
+        # own tensors for every launch and host gather of this binding (fail closed)
+        for key, launch in runner.launches.items():
+            if keep is None or key in keep:
+                _check_slot_values(key, t, plan, [name for _, name in launch.slots])
+        for key in forward_order + backward_order:
+            if key[0] == "gather_rows":
+                _check_slot_values(key, t, plan, ["src", "idx", "out"])
         early = forward_early_keys(plan)
         split = next(
             (i for i, key in enumerate(early) if _reads_labels(key[0])), len(early)
@@ -4400,13 +4622,20 @@ class _Binding:
             t["row_index"] = row_index
 
     def _launch(self, keys: tuple, t: dict[str, Any], dw_stream: str = "auto") -> None:
+        plan, launches = self.plan, self.launches
+
         def run_key(key) -> None:
-            host = HOST_STAGES.get(key[0])
+            stage = key[0]
+            host = HOST_STAGES.get(stage)
             if host is not None:
-                host(stage_values(key[0], t, self.plan, key[1]))
+                host(
+                    _slot_values(stage, t, plan, key[1])
+                    if stage == "gather_rows"
+                    else stage_values(stage, t, plan, key[1])
+                )
                 return
-            launch = self.launches[key]
-            arguments = launch.arguments_for(stage_values(key[0], t, self.plan, key[1]))
+            launch = launches[key]
+            arguments = launch.arguments_for(_slot_values(stage, t, plan, key[1]))
             if (
                 launch.prepare is not None
             ):  # descriptors of a pointer-ABI stage see the fresh tensors
@@ -4540,6 +4769,17 @@ class _Binding:
         return dx, t.get("dw_out")
 
 
+def _check_slot_values(key, t: dict[str, Any], plan: Plan, names) -> None:
+    """:func:`_slot_values` binds what :func:`stage_values` binds for the host values ``names`` of launch ``key``."""
+    fast = _slot_values(key[0], t, plan, key[1])
+    full = stage_values(key[0], t, plan, key[1])
+    for name in names:
+        if not _same_view(fast.get(name), full.get(name)):
+            raise RuntimeError(
+                f"launch {key!r}: the per-call host value {name!r} differs from the stage's host values"
+            )
+
+
 def _deferred_operands(plan: Plan, t: dict[str, Any]) -> tuple:
     """``(dz_last, x_last, x_src, x_idx)`` of a deferred plan after its forward: the last chunk's BF16 ``dz`` rows of the
     chunk buffer and its ``X`` rows -- a view of the launched ``X`` (uncompacted) or the ``X`` plus the chunk's int64
@@ -4562,7 +4802,12 @@ class BindingCache:
     """Remembered input bindings of the eager entry points (least recently used, bounded).
 
     ``capacity`` (default :data:`BINDING_CACHE_DEFAULT_CAPACITY`, 64 bindings) bounds what is kept; ``enabled=False``
-    bypasses the cache (every call validates and binds).  :meth:`configure` changes both at runtime."""
+    bypasses the cache (every call validates and binds).  :meth:`configure` changes both at runtime.  The templated
+    launches of the eager output-boundary casts (:func:`_eager_launch`) are kept alongside, at most
+    :attr:`EAGER_CAPACITY` forms, and follow the same switch and :meth:`clear`."""
+
+    # templated launches of the eager output-boundary stages (:func:`_eager_launch`) kept alongside the bindings
+    EAGER_CAPACITY = 64
 
     def __init__(self, capacity: Optional[int] = None, enabled: bool = True):
         self.capacity = BINDING_CACHE_DEFAULT_CAPACITY
@@ -4570,6 +4815,7 @@ class BindingCache:
         self.hits = 0
         self.misses = 0
         self._bindings: OrderedDict[tuple, _Binding] = OrderedDict()
+        self._eager: OrderedDict[tuple, tuple] = OrderedDict()
         self.configure(enabled=enabled, capacity=capacity)
 
     def configure(
@@ -4594,7 +4840,7 @@ class BindingCache:
         if enabled is not None:
             self.enabled = bool(enabled)
             if not self.enabled:
-                self._bindings.clear()
+                self.clear()
         return self
 
     def __len__(self) -> int:
@@ -4606,6 +4852,21 @@ class BindingCache:
 
     def clear(self) -> None:
         self._bindings.clear()
+        self._eager.clear()
+
+    def eager_lookup(self, form: tuple, record) -> Optional[_Launch]:
+        """The templated eager launch remembered for ``form`` and this very ``record`` (:func:`_eager_launch`)."""
+        entry = self._eager.get(form)
+        if entry is None or entry[0] is not record:
+            return None
+        self._eager.move_to_end(form)
+        return entry[1]
+
+    def eager_remember(self, form: tuple, record, launch: _Launch) -> None:
+        self._eager.pop(form, None)
+        self._eager[form] = (record, launch)
+        while len(self._eager) > self.EAGER_CAPACITY:
+            self._eager.popitem(last=False)
 
     def lookup(self, key: tuple) -> Optional[_Binding]:
         binding = self._bindings.get(key)
@@ -4776,6 +5037,9 @@ def _hidden_count(
     :func:`valid_rows` path."""
     if not (compact and backend == "cake" and hidden_count):
         return None
+    rows, chunk = int(problem.num_rows), int(problem.chunk)
+    if rows <= 0 or (rows + chunk - 1) // chunk < HIDDEN_COUNT_MIN_CHUNKS:
+        return None  # the chunk rule of :func:`hidden_count_eligible`, ahead of the record lookup
     module_name, record = record_for(X.device)
     if not hidden_count_eligible(problem, X, record, module_name, stats=stats):
         return None
@@ -5036,15 +5300,9 @@ def scale_cast(
         num_vecs=int(acc.numel() // geometry.cast_vec),
         loss_div=1.0,
     )
-    launches = _bind_all(
-        record,
-        module_name,
-        ((stage, "eager"),),
-        {(stage, "eager"): values},
-        acc.device,
-        geometry,
+    launch, arguments = _eager_launch(
+        record, module_name, stage, values, acc.device, geometry
     )
-    launch = launches[(stage, "eager")]
     index = (
         acc.device.index
         if acc.device.index is not None
@@ -5052,8 +5310,8 @@ def scale_cast(
     )
     with _ffi_stream_context(int(index)):
         if launch.prepare is not None:
-            launch.prepare(*launch.arguments)
-        launch()
+            launch.prepare(*arguments)
+        launch.entry(*arguments)
     return out
 
 
@@ -5141,15 +5399,9 @@ def scale_cast_scatter(
         num_rows=num_rows,
         loss_div=1.0,
     )
-    launches = _bind_all(
-        record,
-        module_name,
-        ((stage, "eager"),),
-        {(stage, "eager"): values},
-        acc.device,
-        geometry,
+    launch, arguments = _eager_launch(
+        record, module_name, stage, values, acc.device, geometry
     )
-    launch = launches[(stage, "eager")]
     index = (
         acc.device.index
         if acc.device.index is not None
@@ -5157,8 +5409,8 @@ def scale_cast_scatter(
     )
     with _ffi_stream_context(int(index)):
         if launch.prepare is not None:
-            launch.prepare(*launch.arguments)
-        launch()
+            launch.prepare(*arguments)
+        launch.entry(*arguments)
     return out
 
 
@@ -5306,19 +5558,13 @@ def dw_cast(
             first_chunk=int(dw_acc is None),
         ),
     )
-    launches = _bind_all(
-        record,
-        module_name,
-        ((stage, "eager"),),
-        {(stage, "eager"): values},
-        device,
-        geometry,
+    launch, arguments = _eager_launch(
+        record, module_name, stage, values, device, geometry
     )
-    launch = launches[(stage, "eager")]
     with _ffi_stream_context(int(index)):
         if launch.prepare is not None:
-            launch.prepare(*launch.arguments)
-        launch()
+            launch.prepare(*arguments)
+        launch.entry(*arguments)
     return out
 
 
