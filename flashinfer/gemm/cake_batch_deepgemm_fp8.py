@@ -90,7 +90,7 @@ def serving_config(
     """
     if k == 7168:
         if expected_m <= 1:
-            return 5, 2, "evict_normal", 0, 8
+            return 6, 1, "evict_normal", 0, 2
         if expected_m <= 3:
             return 5, 2, "evict_normal", 16, 8
         if sm_count == 148:

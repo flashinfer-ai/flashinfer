@@ -1121,9 +1121,9 @@ MODULES: dict[str, dict[str, str]] = {
 
 SERVING_PROGRAMS: dict[str, str] = {
     "n4096_k7168_g32_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_1405732af0d574df0139",
-    "n4096_k7168_g32_s6e1_evict_normal_l1": "cake_batch_deepgemm_fp8_6762afe719bc00c74cb8",
+    "n4096_k7168_g32_s6e1_evict_normal_l2": "cake_batch_deepgemm_fp8_6762afe719bc00c74cb8",
     "n4096_k7168_g64_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_ce9db47474bd124735cc",
-    "n4096_k7168_g64_s6e1_evict_normal_l1": "cake_batch_deepgemm_fp8_26a4bc38b0aa6b7acaad",
+    "n4096_k7168_g64_s6e1_evict_normal_l2": "cake_batch_deepgemm_fp8_26a4bc38b0aa6b7acaad",
     "n7168_k2048_g32_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_8f4bdd22c19c1467e2e6",
     "n7168_k2048_g32_s5e3_evict_normal_l8": "cake_batch_deepgemm_fp8_a7617f8e2deb15f1eb4a",
     "sm_103a:n7168_k2048_g32_s5e3_evict_normal_l8": "cake_batch_deepgemm_fp8_646c28382e13d4a9eabe",
