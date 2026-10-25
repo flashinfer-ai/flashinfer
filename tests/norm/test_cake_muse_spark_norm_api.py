@@ -233,7 +233,8 @@ GAPS_PDL = {
 # place in the plain route (c2 / c4 / rsa the three small-M composites, pro the prologue whole-row program, psb the
 # parked whole-row program) stands for its PDL build; (program, "plain") for the plain build the PDL route borrows
 # (launched without the attribute: the PDL build measured slower than the CuTe DSL kernel under PDL there and the
-# plain build faster); None for a declared gap.
+# plain build faster; mode 0 on sm_100a alone, the mode-1 rows that first borrowed one re-measured in favour of the
+# PDL build); None for a declared gap.
 OP_A_PLAIN_ORDER = ("c2", "c4", "rsa", "pro", "psb")
 OP_A_PDL_WINDOWS = {
     ("sm_100a", 0): (
@@ -251,7 +252,6 @@ OP_A_PDL_WINDOWS = {
         (128, "rsa"),
         (383, "pro"),
         (1024, "psb"),
-        (2048, ("psb", "plain")),
         (None, "pro"),
     ),
     ("sm_103a", 0): (
@@ -270,15 +270,16 @@ OP_A_PDL_WINDOWS = {
         (128, "rsa"),
         (255, "pro"),
         (768, "psb"),
-        (1024, ("psb", "plain")),
         (None, "pro"),
     ),
 }
 # Op C's Blackwell PDL route per architecture: (heads, above, at_most) -> (the selecting keywords of the program, as
 # OP_C_WINDOWS spells them, its form): "pdl" the PDL build, "pdl_late" the late-signal PDL build of the two
 # token-cluster programs, "plain" the plain route's build borrowed (16 heads above 1024 tokens on both
-# architectures).  Contiguous over the token count per head count; every boundary of the plain route is one of
-# these (the pdl table splits a plain window between the pdl and the pdl_late build).
+# architectures; on sm_103a also 128 heads at 257-2048 tokens and 32 heads at 1025-8192 tokens, where the PDL build
+# is 1-6 % behind the plain build and no launch overlaps its predecessor).  Contiguous over the token count per head
+# count; every boundary of the plain route is one of these (the pdl table splits a plain window between the pdl and
+# the pdl_late build, or between the borrowed plain build and the pdl build).
 _C16, _CT16, _HM, _T256, _T128_CT16, _T128 = (
     OP_C_WINDOWS[key]
     for key in (
@@ -308,10 +309,12 @@ OP_C_PDL_WINDOWS = {
         (128, 0, 8): (_C16, "pdl"),
         (128, 8, 64): (_CT16, "pdl"),
         (128, 64, 256): (_CT16, "pdl_late"),
-        (128, 256, None): (_HM, "pdl"),
+        (128, 256, 2048): (_HM, "plain"),
+        (128, 2048, None): (_HM, "pdl"),
         (32, 0, 8): (_CT16, "pdl"),
         (32, 8, 1024): (_CT16, "pdl_late"),
-        (32, 1024, None): (_T256, "pdl"),
+        (32, 1024, 8192): (_T256, "plain"),
+        (32, 8192, None): (_T256, "pdl"),
         (16, 0, 8): (_T128_CT16, "pdl"),
         (16, 8, 64): (_T128_CT16, "pdl_late"),
         (16, 64, 1024): (_T128_CT16, "pdl"),
