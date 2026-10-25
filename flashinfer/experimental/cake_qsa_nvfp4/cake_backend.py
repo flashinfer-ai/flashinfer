@@ -40,6 +40,10 @@ per SM) the formula gives 33, 33, 33, 23, 11, 5, 2, 1 and the table replaces
 rows 4, 8, 16 and 32 with 16, 11, 5 and 3 (measured whole call in both forms,
 both layouts, both L2 flushes: +15 to +39 % at rows 4 and 8, +2 to +8 % at rows
 16 and 32; rows 1 and 2 keep 33, where 16 splits lose 7 % after a read flush).
+That is the *plain* split count (:func:`plain_splits`).  Where the persistent
+walk serves the call (:func:`select_walk`, below) ``num_splits`` is instead the
+walk's partial slots per (row, KV head), :func:`cake_jit.walk_splits` -- 2 for
+rows 128 on 152 SMs -- and the merge reads that many.
 
 Form rule (:func:`select_form`): with one split the plain decode writes the
 output itself.  Above one split the *fused* form -- the cooperative build of
@@ -79,16 +83,28 @@ tiles = 1024 selected tokens).  A wide call launches the whole-tile program
 the previous release's ``sm_80`` decode); every other call launches the
 K-first program (``decode``), and ``sm_90a`` / ``sm_120a`` always do; ``sm_100a``,
 ``sm_103a`` and ``sm_107a`` launch the tcgen05 program (``decode_tcgen05``) in
-the split form whatever the grid.  On 108 SMs at the owner's 24 x 2 heads and 2051 selections (33
+the split form whatever the grid, except that ``sm_103a`` launches the
+*persistent walk* (``decode_tcgen05_persistent``, :func:`select_walk`) on a
+split-form grid whose plain cut runs two resident waves
+(``1 < ceil(rows * num_kv_heads * plain_splits / sm_count) <=
+WALK_MAX_WAVES = 2``) and whose longest walked CTA is shorter than the plain
+program's longest (:func:`cake_jit.walk_applies`): one CTA per SM
+(:func:`cake_jit.walk_ctas` CTAs) walking a balanced, contiguous share of the
+(row, KV head) x tile slots, with :func:`cake_jit.walk_splits` partial slots
+per pair.  On a GB300 (152 SMs) at the owner's shape that is rows 128 alone
+(256 plain CTAs of 33 tiles in two waves -> 152 CTAs of 56-57 tiles, 2
+slots); rows 1-64 run one wave and rows 256 and above more than two, and
+keep the plain cut, as does every call on ``sm_100a`` / ``sm_107a`` (measured
+on a B200 the same two-wave grids tie).  On 108 SMs at the owner's 24 x 2 heads and 2051 selections (33
 tiles): rows 1-32 run at most one wave -> K-first; rows 64 (4 splits, 512
 CTAs, 9 tiles per CTA) -> K-first; rows 128 (2 splits, 512 CTAs, 17 tiles per
 CTA) -> whole-tile; the 2048-row single-split call (33 tiles per CTA) ->
 whole-tile.  Measured paired on two A100s (80 GB and 40 GB PCIe) under the
 memset flush, the K-first program is 1-7 % faster at rows 64 and the
 whole-tile program 6-8 % faster at rows 128, on both units.  The fused form
-is never wide: its grid is within the co-residency by the form rule.  The
-rule reads the architecture, the SM count and the call's tile and split
-counts alone.
+is never wide, and never walked: its grid is within the co-residency by the
+form rule.  The rule reads the architecture, the SM count and the call's
+tile and split counts alone.
 
 Workspace rule: the partials (``partial_out`` FP32 ``[splits, rows,
 num_qo_heads, 256]``, ``partial_lse`` FP32 ``[splits, rows, num_qo_heads]``)
@@ -154,6 +170,11 @@ FUSED_HOSTS = ("aarch64",)
 FUSED_MAX_ROWS = 4
 # Architectures whose cooperative build ships but whose eager call keeps the split form on every host.
 FUSED_SPLIT_ONLY_ARCHES = ("sm_107a",)
+# Architectures the persistent walk ships for (module docstring, "Program rule"): sm_103a alone, where the two-wave grids
+# of the owner's shape gain with the walk; the same grids tie on a B200, so sm_100a keeps the plain program everywhere.
+# Its wave bound is the kernel file's, spelled by the registry.
+WALK_ARCHES = ("sm_103a",)
+WALK_MAX_WAVES = cake_jit.WALK_MAX_WAVES
 HOST_MACHINE = platform.machine()
 # The program rule's long-stream bound: tiles per CTA from which an sm_80 multi-wave grid runs the whole-tile program.
 LONG_STREAM_TILES = cake_jit.DECODE_LONG_STREAM_TILES
@@ -187,11 +208,11 @@ def num_tiles(selection_width: int) -> int:
     return -(-int(selection_width) // TILE_TOKENS)
 
 
-def num_splits(
+def plain_splits(
     num_rows: int, num_kv_heads: int, selection_width: int, sm_count: int, arch: str
 ) -> int:
-    """The split count of a call on a device of ``sm_count`` SMs whose exported architecture is ``arch`` (module
-    docstring, "Split rule")."""
+    """The plain program's split count on a device of ``sm_count`` SMs whose exported architecture is ``arch``: the
+    formula, the measured table and the caps of the module docstring's "Split rule"."""
     if num_rows < 1 or num_kv_heads < 1 or sm_count < 1:
         raise ValueError(
             f"num_rows={num_rows}, num_kv_heads={num_kv_heads}, sm_count={sm_count} must all be at least 1"
@@ -210,6 +231,52 @@ def num_splits(
     )
     chosen = SPLIT_OVERRIDES.get((int(sm_count), int(num_rows)), formula)
     return max(1, min(tiles, MAX_SPLITS, chosen))
+
+
+def select_walk(
+    num_rows: int, num_kv_heads: int, num_tiles: int, sm_count: int, arch: str
+) -> int:
+    """The CTA count of the persistent walk when it serves a split-form call of ``num_tiles`` tiles on a device of
+    ``sm_count`` SMs and architecture ``arch``, else 0 (module docstring, "Program rule"): the architecture ships the
+    walk (:data:`WALK_ARCHES`) and the walk shortens the call's longest CTA at the plain split count
+    (:func:`cake_jit.walk_applies`: a two-wave plain grid).  Pure in its integers.  The fused form is never walked:
+    its grid is within one wave by the form rule, so the walk's two-wave condition excludes it."""
+    if int(num_rows) < 1 or int(num_kv_heads) < 1 or int(num_tiles) < 1 or int(sm_count) < 1:
+        raise ValueError(
+            f"num_rows={num_rows}, num_kv_heads={num_kv_heads}, num_tiles={num_tiles}, sm_count={sm_count} must all "
+            "be at least 1"
+        )
+    if arch not in CTAS_PER_SM:
+        raise ValueError(
+            f"unknown arch {arch!r}; the architectures are {cake_jit.ARCHES}"
+        )
+    if arch not in WALK_ARCHES:
+        return 0
+    plain = plain_splits(num_rows, num_kv_heads, int(num_tiles) * TILE_TOKENS, sm_count, arch)
+    if not cake_jit.walk_applies(num_rows, num_kv_heads, num_tiles, plain, sm_count):
+        return 0
+    return cake_jit.walk_ctas(sm_count, int(num_rows) * int(num_kv_heads), num_tiles)
+
+
+def _split_count(
+    num_rows: int, num_kv_heads: int, num_tiles: int, sm_count: int, arch: str, walk: int
+) -> int:
+    """The call's split count given its walk: the walk's partial slots per (row, KV head) where the walk serves it,
+    the plain program's split count otherwise."""
+    if walk:
+        return cake_jit.walk_splits(walk, int(num_rows) * int(num_kv_heads), num_tiles)
+    return plain_splits(num_rows, num_kv_heads, int(num_tiles) * TILE_TOKENS, sm_count, arch)
+
+
+def num_splits(
+    num_rows: int, num_kv_heads: int, selection_width: int, sm_count: int, arch: str
+) -> int:
+    """The split count of a call on a device of ``sm_count`` SMs whose exported architecture is ``arch`` (module
+    docstring, "Split rule"): :func:`plain_splits`, or the persistent walk's partial slots per (row, KV head) where
+    the walk serves the call (:func:`select_walk`).  The count :func:`qsa_workspace_bytes` sizes a workspace for."""
+    tiles = num_tiles(selection_width)
+    walk = select_walk(num_rows, num_kv_heads, tiles, sm_count, arch)
+    return _split_count(num_rows, num_kv_heads, tiles, sm_count, arch, walk)
 
 
 def is_supported(device: torch.device | int | None = None) -> bool:
@@ -566,12 +633,16 @@ def _resolve(
     capturing: bool,
 ) -> tuple[int, bool, tuple[Any, ...]]:
     """The plan of one call shape on one device, resolved once per key: ``(splits, fused, launches)`` from
-    the split rule, the form rule (``capturing``: the stream's capture state, read by the caller when the
-    form depends on it, else ``False``), the program rule and :func:`cake_jit.resolved_launches` (the loaded
-    FFI entries, their argument getters and grids, in launch order).  Pure in its host scalars."""
+    the walk rule and the split rule (the walk's slots where the walk serves the call), the form rule
+    (``capturing``: the stream's capture state, read by the caller when the form depends on it, else
+    ``False``), the program rule and :func:`cake_jit.resolved_launches` (the loaded FFI entries, their argument
+    getters and grids, in launch order).  Pure in its host scalars."""
     arch, sm_count = _device_facts(device_index)
-    splits = num_splits(num_rows, num_kv_heads, tiles * TILE_TOKENS, sm_count, arch)
+    walk = select_walk(num_rows, num_kv_heads, tiles, sm_count, arch)
+    splits = _split_count(num_rows, num_kv_heads, tiles, sm_count, arch, walk)
     form = select_form(num_rows, num_kv_heads, splits, device_index, capturing)
+    if form != "split":
+        walk = 0  # unreachable by the rules (a walked grid exceeds the fused capacity); the fused form is never walked
     wide = select_wide(num_rows, num_kv_heads, splits, tiles, form, sm_count, arch)
     launches = cake_jit.resolved_launches(
         form=form,
@@ -581,6 +652,7 @@ def _resolve(
         rows=num_rows,
         kv_heads=num_kv_heads,
         qo_heads=num_qo_heads,
+        walk=walk,
     )
     return splits, form == "fused", launches
 
@@ -913,13 +985,17 @@ __all__ = [
     "MAX_SPLITS",
     "SPLIT_OVERRIDES",
     "TILE_TOKENS",
+    "WALK_ARCHES",
+    "WALK_MAX_WAVES",
     "fused_capacity",
     "is_supported",
     "num_splits",
     "num_tiles",
+    "plain_splits",
     "qsa_sparse_paged_attention",
     "qsa_workspace_bytes",
     "reset_workspace",
     "select_form",
+    "select_walk",
     "select_wide",
 ]
