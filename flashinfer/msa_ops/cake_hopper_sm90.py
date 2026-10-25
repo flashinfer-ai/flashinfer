@@ -97,15 +97,11 @@ _HSTAGE_BYTES = (
 # classes the same-session ABBA proved (GQA 16x4 q1 b128: HALF STAGES 2 + VSEQ; b16 q1: HALF STAGES 4).  Both
 # forms are physical variants of their own: ``plan_sparse_decode`` serves them only when the delivered program set
 # has their route, otherwise the 128-key variant the latency model picked (``_route_available``).
-_PERSIST_RULE = True
-_HALF_RULE = True
-_HALF_RULE_NC16 = True  # planner rule C (decode round 4): NC 16 one-split class beyond the resident CTAs -> HALF STAGES 2 VSEQ
 _NC16_LEAN = (
     "qk",
     "v",
     "vlate",
 )  # register-lean levels of rule C (a different binary from the plain HALF VSEQ form)
-_NC16_MINB = None  # launch-bound override of rule C (None = SMEM-derived residency: four CTAs per SM)
 _IDENT_BYTES = 64 * _HEAD_DIM  # fp8 identity tile
 _WARPGROUP = 128  # threads per CTA
 _SMEM_PER_SM = 228 * 1024
@@ -117,16 +113,6 @@ _HINT_DEFAULT = "none"
 # Proxy-score decode program coordinates.
 _PROXY_HEADS = (1, 2, 4)
 _PROXY_QLENS = (1, 2, 3, 4)
-
-
-def is_hopper_msa_device(device: torch.device | str) -> bool:
-    """Return whether ``device`` is a compute-capability 9.0 MSA target."""
-
-    normalized = torch.device(device)
-    return (
-        normalized.type == "cuda"
-        and get_compute_capability(normalized) in _SUPPORTED_COMPUTE_CAPABILITIES
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -332,9 +318,8 @@ def preload_programs(kinds: Optional[Iterable[str]] = None) -> dict[str, int]:
     Explicit opt-in.  By default a program is built and loaded at the first eager use of its route -- nothing up
     front, and what a per-geometry eager warm-up before capture (vLLM's capture loop) relies on.  Preloading a kind
     costs one nvcc build per program not yet in the JIT cache (about 4 s each; the programs of a kind are read from
-    ``ROUTES``: 22 / 24 / 32 / 5 / 6 for sparse decode / proxy decode / top-k select / proxy prefill / sparse
-    prefill, 89 in all) and about 10 ms per prebuilt program.  Returns the number of programs this call loaded, per
-    kind.  Raises under capture and for an unknown kind.
+    ``ROUTES``) and about 10 ms per prebuilt program.  Returns the number of programs this call loaded, per kind.
+    Raises under capture and for an unknown kind.
     """
 
     selected = PROGRAM_KINDS if kinds is None else tuple(kinds)
@@ -398,7 +383,7 @@ def _int32_dummy(device: torch.device) -> torch.Tensor:
 
 @dataclass(frozen=True)
 class HopperDecodePlan:
-    """Physical decode variant: head fold, split count, ring depth, prologue issue, L2 policy, grid form.
+    """Physical decode variant: head fold, split count, ring depth, L2 policy, grid form.
 
     ``persist``: one CTA per residency slot walks the items (S = 1; launch grid ``(ctas, 1, 1)``, the item count is a
     kernel scalar, no split scratch).  ``half``: 64-key (16 KiB) ring stages, ``stages`` then counts 64-key stages
@@ -411,13 +396,11 @@ class HopperDecodePlan:
     chunks: int
     splits: int
     stages: int
-    pre: int
     hint: str
     persist: bool = False
     half: bool = False
     vseq: bool = False
     lean: tuple[str, ...] = ()
-    minb: Optional[int] = None
     ctas: int = 0
 
     @property
@@ -429,8 +412,6 @@ class HopperDecodePlan:
             form = ":half:vseq" if self.vseq else ":half"
         if self.lean:
             form += ":lean-" + "-".join(self.lean)
-        if self.minb is not None:
-            form += f":minb{int(self.minb)}"
         return f"decode_v5:nc{self.nc}:s{self.splits}:st{self.stages}:{self.hint}{form}:main"
 
     def grid(self, *, total_q: int, num_kv_heads: int) -> tuple[int, int, int]:
@@ -540,27 +521,18 @@ def plan_sparse_decode(
     grid_plain = base * splits
     half = vseq = False
     lean: tuple[str, ...] = ()
-    minb = None
-    if _HALF_RULE and nc == 8 and seqlen_q == 1 and splits == 1 and base > resident:
+    if nc == 8 and seqlen_q == 1 and splits == 1 and base > resident:
         # rule A: the q-len-1 one-split class beyond the resident 128-key CTAs (GQA 16x4 b128)
         half, stages, vseq = True, 2, True
         resident = _resident_ctas(num_sms, _decode_smem_bytes(nc, 2, half=True), 4)
-    elif _HALF_RULE and nc == 8 and splits == 8 and base * splits <= resident:
+    elif nc == 8 and splits == 8 and base * splits <= resident:
         # rule B: the 16-item eight-split class (b16 q1; MTP g16x2 q8 b1 / g16x4 q4 b1)
         half, stages = True, 4
         resident = _resident_ctas(num_sms, _decode_smem_bytes(nc, 4, half=True), 4)
-    if (
-        _HALF_RULE_NC16
-        and nc == 16
-        and seqlen_q == 1
-        and splits == 1
-        and base > resident
-    ):
+    if nc == 16 and seqlen_q == 1 and splits == 1 and base > resident:
         # rule C: the NC 16 one-split class beyond the resident 128-key CTAs (GQA 64x4 b128): register-lean HALF VSEQ
-        half, stages, vseq, lean, minb = True, 2, True, _NC16_LEAN, _NC16_MINB
-        resident = _resident_ctas(
-            num_sms, _decode_smem_bytes(nc, 2, half=True), minb or 4
-        )
+        half, stages, vseq, lean = True, 2, True, _NC16_LEAN
+        resident = _resident_ctas(num_sms, _decode_smem_bytes(nc, 2, half=True), 4)
     reuse = (seqlen_q * _TOPK) / max_pages if max_pages else 0.0
     hint = _HINT_DEFAULT if reuse >= _HINT_REUSE_THRESHOLD else _HINT_STREAM
     if (
@@ -572,19 +544,18 @@ def plan_sparse_decode(
         )
     ):
         hint = _HINT_DEFAULT
-    persist = _PERSIST_RULE and splits == 1 and base > resident and not half
+    persist = splits == 1 and base > resident and not half
     model = HopperDecodePlan(
         nc=nc,
         chunks=chunks,
         splits=splits,
         stages=best[2],
-        pre=1,
         hint=hint,
         ctas=base * splits,
     )
     plan = model
     if half:
-        plan = replace(model, stages=stages, half=True, vseq=vseq, lean=lean, minb=minb)
+        plan = replace(model, stages=stages, half=True, vseq=vseq, lean=lean)
     elif persist:
         slots = _resident_ctas(num_sms, _decode_smem_bytes_persistent(nc, stages), 2)
         plan = replace(model, persist=True, ctas=min(base, slots))
@@ -625,7 +596,6 @@ def _scratch(
                 torch.empty(
                     (items * splits * 2 * nc,), dtype=torch.float32, device=device
                 ),
-                torch.zeros((items,), dtype=torch.uint32, device=device),
                 torch.zeros((items,), dtype=torch.uint32, device=device),
             )
             _decode_scratch[key] = buffers
@@ -669,10 +639,10 @@ def _decode_template(
         # One CTA per residency slot loops over the items: the item count is a kernel scalar, no split scratch.
         constants["num_items"] = items
     else:
-        part_o, part_ml, counters, done = _scratch(
+        part_o, part_ml, counters = _scratch(
             device, items=items, splits=plan.splits, nc=plan.nc
         )
-        constants.update(part_o=part_o, part_ml=part_ml, counters=counters, done=done)
+        constants.update(part_o=part_o, part_ml=part_ml, counters=counters)
     return _program(plan.route).bind(
         plan.grid(total_q=total_q, num_kv_heads=num_kv_heads), constants
     )
@@ -1108,8 +1078,8 @@ _PXP_F16_W3_MAX_MTILES = 12  # chunk <= 1536 tokens in 128-row tiles
 _PXP_F16_W3_MAX_SPLIT = 8  # largest admissible one-CTA-per-SM split of the 192-row form
 _PXP_F16_W3_MIN_TILES_PER_CTA = 8  # key tiles per CTA that split must leave
 _PXP_VARIANT_F16_SHORT_NOFOLD = "f16t4"  # f16, FI's 128-row shape with FI's PLAIN grid order (no alternate-block fold)
-_PXP_F16_SHORT_FI_FOLD_GATE = 2  # perf round 5 Stage A (parent decision 10, adopted): 0 = always fold, 1 = fold-free
-#                                  wherever FI #6140 is, 2 = restricted to where the plain layout adds no SM-tile step
+_PXP_F16_SHORT_FI_FOLD_GATE = 2  # perf round 5 Stage A (parent decision 10, adopted): 0 = always fold, 2 = fold-free
+#                                  where FI itself is fold-free and the plain layout adds no SM-tile step
 # CTA shape of each production variant (``variant_bm`` / ``variant_slots_per_sm`` / the ``LPT`` knob of the module).
 _PXP_FORMS = {
     "wg4st": dict(bm=256, slots=1, lpt=False, f16=False),
@@ -1548,8 +1518,8 @@ def f16_short_form(
     ``_PXP_F16_W3_MAX_SPLIT`` and leaves at least ``_PXP_F16_W3_MIN_TILES_PER_CTA`` key tiles per CTA; otherwise FI's
     128-row shape with FI's split rule: the folded ``_PXP_VARIANT_F16_SHORT``, or -- Stage A of perf round 5,
     ``_PXP_F16_SHORT_FI_FOLD_GATE`` -- the fold-free ``_PXP_VARIANT_F16_SHORT_NOFOLD`` where FI itself is fold-free
-    (``fi_fold`` False; gate 1) and, for gate 2, the fold-free layout is admissible (``nofold_layout_admissible`` at
-    FI's split after the small-work lowering)."""
+    (``fi_fold`` False) and the fold-free layout is admissible (``nofold_layout_admissible`` at FI's split after the
+    small-work lowering)."""
     if -(-int(max_seqlen_q) // _PXP_WG_ROWS // 2) <= _PXP_F16_W3_MAX_MTILES:
         base = (
             -(-int(max_seqlen_q) // _PXP_FORMS[_PXP_VARIANT_F16_W3]["bm"])
@@ -1565,8 +1535,6 @@ def f16_short_form(
     gate = _PXP_F16_SHORT_FI_FOLD_GATE
     n_mt = -(-int(max_seqlen_q) // _PXP_BM)
     if gate and not fi_fold(n_mt, max_k_tiles):
-        if gate == 1:
-            return _PXP_VARIANT_F16_SHORT_NOFOLD, "fi"
         ns = select_proxy_prefill_nsplit_fi(
             n_mtiles=n_mt,
             hq=int(hq),
@@ -1900,7 +1868,6 @@ _TK_T32_MIN_ROWS = 17
 _TK_T32_MAX_ROWS = 32
 # Single-register-tile stream window of the module (``ONE_GEOMETRIES`` / ``one_default``, top-k round 4): the geometries
 # whose thread holds exactly one register tile stream it without the prefetch buffer / loop.  Measured, not derived.
-_TK_ONE_GEOMETRIES = frozenset({(8, 4), (2, 32), (8, 32), (16, 16), (2, 128)})
 _TK_INSTR_TILE32 = 620
 _TK_T_TILE32_US = 0.56
 _TK_W_CHOICES = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
@@ -1936,19 +1903,6 @@ class HopperTopkPlan:
             rows = -(-int(tiles) // self.w)
             return -(-rows // 32)
         return -(-int(tiles) // (_TK_CHUNK * self.w))
-
-    def one(self, tiles: int) -> bool:
-        """Module ``one_default``: the single-register-tile stream (no prefetch buffer / loop, the sorted tile is the
-        running list) for the geometries in ``_TK_ONE_GEOMETRIES`` when the thread holds exactly one register tile and
-        the host FILTER knob is off (always, in production).  Not part of the route key and not a launch argument:
-        the exported program is built with the same rule (the public ``topk_module`` resolves it), so this mirror
-        states the structure the binary behind the route carries."""
-        return (self.c, self.w) in _TK_ONE_GEOMETRIES and self.chunks(tiles) == 1
-
-    @property
-    def ilv(self) -> bool:
-        """Interleaved tile walk: a measured-off A/B knob of the module (round 4); False for every planner shape."""
-        return False
 
     @property
     def route(self) -> str:
@@ -2570,7 +2524,6 @@ __all__ = [
     "hopper_msa_sparse_attention",
     "hopper_msa_sparse_decode_attention",
     "hopper_msa_topk_select",
-    "is_hopper_msa_device",
     "plan_proxy_score",
     "plan_proxy_score_prefill",
     "plan_sparse_decode",
