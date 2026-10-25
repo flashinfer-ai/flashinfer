@@ -472,7 +472,8 @@ def test_thirty_three_splits(layout):
 
 
 def test_two_wave_walk_matches_the_plain_cut_and_replays(monkeypatch):
-    """On a GB300 (sm_103a, 152 SMs) rows 128 at two KV heads take the persistent walk:
+    """On a GB300 (sm_103a, 152 SMs) or an R200 (sm_107a, 212 SMs) rows 128 at two KV heads
+    take the persistent walk:
     one CTA per SM walking a contiguous share of the (row, KV head) x tile slots, 2 partial
     slots per pair, then the merge.  The walked call meets the contract of its own cut;
     forced onto the plain cut (one split, 256 CTAs in two waves: the host's walk rule off)
@@ -917,7 +918,9 @@ def test_split_formula_fills_the_device_capacity():
         1,
         2,
     ]
-    assert [num_splits(r, 2, WIDTH, 212, "sm_107a") for r in ROWS] == [
+    # sm_107a: the plain cut at rows 1-64; rows 128 (256 plain CTAs: two waves on 212 and 216
+    # SMs) take the persistent walk and its 2 partial slots replace the formula's 1.
+    assert [cake_backend.plain_splits(r, 2, WIDTH, 212, "sm_107a") for r in ROWS] == [
         33,
         33,
         26,
@@ -927,6 +930,16 @@ def test_split_formula_fills_the_device_capacity():
         1,
         1,
     ]
+    assert [num_splits(r, 2, WIDTH, 212, "sm_107a") for r in ROWS] == [
+        33,
+        33,
+        26,
+        13,
+        6,
+        3,
+        1,
+        2,
+    ]
     assert [num_splits(r, 2, WIDTH, 216, "sm_107a") for r in ROWS] == [
         33,
         33,
@@ -935,7 +948,7 @@ def test_split_formula_fills_the_device_capacity():
         6,
         3,
         1,
-        1,
+        2,
     ]
     # sm_120a (the RTX PRO 6000 Blackwell, 188 SMs): the mma.sync decode's two CTAs per SM; the table's rows 4, 8,
     # 16 and 32 (16, 11, 5, 3) replace the formula's 33, 23, 11, 5.
@@ -983,7 +996,7 @@ def test_split_formula_fills_the_device_capacity():
         assert [
             cake_backend.plain_splits(r, 2, WIDTH, sm_count, arch) for r in ROWS
         ] == [_formula(r, 2, WIDTH, sm_count, arch) for r in ROWS]
-        if arch != "sm_103a":
+        if arch not in cake_backend.WALK_ARCHES:
             assert [num_splits(r, 2, WIDTH, sm_count, arch) for r in ROWS] == [
                 _formula(r, 2, WIDTH, sm_count, arch) for r in ROWS
             ]
@@ -1185,7 +1198,7 @@ def test_registry_records_carry_the_launch_facts_and_the_argument_plans():
     """Seven programs: the mma.sync plain decode, its whole-tile build delivered for sm_80
     alone (the split form on a multi-wave, long-stream grid), the mma.sync cooperative
     decode that merges its splits in the launch, the tcgen05 plain and cooperative decodes
-    of sm_100a / sm_103a / sm_107a, the tcgen05 persistent walk delivered for sm_103a alone
+    of sm_100a / sm_103a / sm_107a, the tcgen05 persistent walk delivered for sm_103a and sm_107a
     (the split form on a two-wave grid, one CTA per SM), and the separate merge; 128
     threads for the mma.sync programs and the merge, 512 for the tcgen05 ones, no cluster;
     the decodes' shared-memory pools as dynamic shared memory, the merge's static; the
@@ -1206,7 +1219,7 @@ def test_registry_records_carry_the_launch_facts_and_the_argument_plans():
         "decode_coop": ("sm_80", "sm_90a", "sm_120a"),
         "decode_tcgen05": ("sm_100a", "sm_103a", "sm_107a"),
         "decode_tcgen05_coop": ("sm_100a", "sm_103a", "sm_107a"),
-        "decode_tcgen05_persistent": ("sm_103a",),
+        "decode_tcgen05_persistent": ("sm_103a", "sm_107a"),
         "merge": ("sm_80", "sm_90a", "sm_100a", "sm_103a", "sm_107a", "sm_120a"),
     }
     tcgen05 = ("decode_tcgen05", "decode_tcgen05_coop", "decode_tcgen05_persistent")
@@ -1218,7 +1231,7 @@ def test_registry_records_carry_the_launch_facts_and_the_argument_plans():
     assert persistent["select_rule"] == {
         "kind": "form_grid",
         "value": "split",
-        "grid": {"sm_103a": "two_wave_walk"},
+        "grid": {"sm_103a": "two_wave_walk", "sm_107a": "two_wave_walk"},
     }
     assert list(persistent["select_rule"]["grid"]) == persistent["arches"]
     assert persistent["grid_rule"] == {"kind": "walk_ctas"}

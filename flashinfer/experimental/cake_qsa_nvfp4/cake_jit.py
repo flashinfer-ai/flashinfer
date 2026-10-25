@@ -20,7 +20,7 @@ programs partitioning the architectures -- the ``mma.sync`` decode of ``sm_80``,
 ``sm_80`` and ``sm_120a``, and its cooperative build, which merges the splits in the
 same launch) and the tcgen05 decode of ``sm_100a``, ``sm_103a`` and ``sm_107a``
 (its plain and its cooperative build; tensor memory, one CTA per SM; and its
-persistent-walk build delivered for ``sm_103a`` alone) -- and the separate
+persistent-walk build delivered for ``sm_103a`` and ``sm_107a``) -- and the separate
 split-KV merge with the sigmoid output gate, delivered for every architecture.
 
 Every record of ``MODULES`` is one mechanically exported program: a CUDA
@@ -28,7 +28,7 @@ device translation unit plus a tvm-ffi binding, compiled for each architecture
 of the record's ``arches`` (one source per program; ``sm_80``, ``sm_90a`` and
 ``sm_120a`` for the ``mma.sync`` decodes, ``sm_100a``, ``sm_103a`` and ``sm_107a`` for the
 tcgen05 decodes, all six for the merge, ``sm_80`` and ``sm_120a`` for the
-whole-tile decode, ``sm_103a`` alone for the persistent walk).  A record
+whole-tile decode, ``sm_103a`` and ``sm_107a`` for the persistent walk).  A record
 carries the host plan only: the program's ``library`` stem (its ``build.json``
 entry is ``<library>_<arch>``), the architectures it is delivered for, the
 ``stage`` of the launch order it fills and its ``variant``, the
@@ -66,7 +66,8 @@ architecture its record ships for; one of kind ``form_grid`` admits its form
 on the architectures its ``grid`` map names, each at the grid bound the map
 gives it, and wins over a ``form`` rule when both admit (the whole-tile
 decode: the split form on ``sm_80`` / ``sm_120a`` on a wide call; the
-persistent walk: the split form on ``sm_103a`` on a walked grid).  No rule
+persistent walk: the split form on ``sm_103a`` / ``sm_107a`` on a walked
+grid).  No rule
 reads a tensor.  Which form a call takes, its split count, whether the call
 is wide and whether the walk serves it are the host's decisions
 (:mod:`.cake_backend`), not rules.
@@ -184,15 +185,17 @@ DECODE_LONG_STREAM_TILES = 16
 # selected tokens (rows 32 / 64 / 128 at 11 / 17 / 33 tiles per CTA favoured it
 # under both L2 flushes, rows 16 at 7 tiles did not).
 DECODE_STREAM_TILES = 11
-# The persistent walk's wave bound (the ``sm_103a`` kernel file's ``WALK_MAX_WAVES``,
-# held by the exporter): a split-form call whose plain decode grid runs more
-# than one resident wave and at most this many, and whose longest walked CTA is
-# shorter than the plain program's longest (:func:`walk_applies`), launches the
-# persistent walk (``select_rule`` kind ``form_grid``, grid ``two_wave_walk``)
-# on :func:`walk_ctas` CTAs with :func:`walk_splits` partial slots per (row, KV
-# head) instead of the plain split count.  Two: the class the paired
-# measurements cover (rows 128 of the owner's shapes on 148 / 152 SMs).
-WALK_MAX_WAVES = 2
+# The persistent walk's wave bound per architecture (the kernel file's
+# ``WALK_MAX_WAVES`` table, held by the exporter): a split-form call whose plain
+# decode grid runs more than one resident wave and at most this many, and whose
+# longest walked CTA is shorter than the plain program's longest
+# (:func:`walk_applies`), launches the persistent walk (``select_rule`` kind
+# ``form_grid``, grid ``two_wave_walk``) on :func:`walk_ctas` CTAs with
+# :func:`walk_splits` partial slots per (row, KV head) instead of the plain split
+# count.  The classes the paired measurements cover: two waves on ``sm_103a``
+# (rows 128 of the owner's shapes on 148 / 152 SMs), three on ``sm_107a`` (rows
+# 128 and 256 on an R200's 212 SMs).
+WALK_MAX_WAVES = {"sm_103a": 2, "sm_107a": 3}
 
 # Logical argument names the host backend binds: the kernels' own parameter
 # names (``record["logical"]`` is the identity map).  Decode: ``q`` BF16
@@ -821,7 +824,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "workspace_rule": {"kind": "fused_partials_counters"},
     },
     "decode_tcgen05_persistent": {
-        "arches": ["sm_103a"],
+        "arches": ["sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "q"],
             ["buffer", "k_data"],
@@ -915,7 +918,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "v_sf": "v_sf",
         },
         "select_rule": {
-            "grid": {"sm_103a": "two_wave_walk"},
+            "grid": {"sm_103a": "two_wave_walk", "sm_107a": "two_wave_walk"},
             "kind": "form_grid",
             "value": "split",
         },
@@ -1022,8 +1025,8 @@ def select_record(
     ``sm_100a`` / ``sm_103a`` / ``sm_107a``); of those whose rule admits the call, the most specific rule
     kind (``SELECT_RULES`` order) wins: on ``sm_80`` and ``sm_120a`` a wide
     split-form call selects the whole-tile decode over the K-first one, on
-    ``sm_103a`` a walked split-form call the persistent walk over the plain
-    tcgen05 decode.  A grid class no record of the architecture reads falls
+    ``sm_103a`` / ``sm_107a`` a walked split-form call the persistent walk over
+    the plain tcgen05 decode.  A grid class no record of the architecture reads falls
     through to its ``form`` record (``wide`` on ``sm_90a``, ``walk`` on
     ``sm_100a``; :func:`resolved_launches` refuses a walk the selected decode
     cannot launch).  The ``merge`` stage has no
@@ -1165,16 +1168,23 @@ def walk_splits(ctas: int, pairs: int, tiles: int) -> int:
 
 
 def walk_applies(
-    rows: int, kv_heads: int, tiles: int, splits: int, sm_count: int
+    rows: int, kv_heads: int, tiles: int, splits: int, sm_count: int, arch: str
 ) -> bool:
-    """Whether the walk shortens a split-form call (the kernel file's rule):
-    the plain program's grid ``rows x kv_heads x splits`` at the plain split
-    count ``splits`` runs more than one resident wave of ``sm_count`` CTAs
-    (``waves = ceil(rows x kv_heads x splits / sm_count) > 1``), at most
-    ``WALK_MAX_WAVES``, and the walk's longest CTA walks fewer tiles than the
-    plain program's longest, ``ceil(pairs x tiles / G) < waves x ceil(tiles /
+    """Whether the walk shortens a split-form call on an ``arch`` device (the
+    kernel file's rule): the plain program's grid ``rows x kv_heads x splits``
+    at the plain split count ``splits`` runs more than one resident wave of
+    ``sm_count`` CTAs (``waves = ceil(rows x kv_heads x splits / sm_count) >
+    1``), at most ``WALK_MAX_WAVES[arch]`` (the architecture's measured wave
+    range), and the walk's longest CTA walks fewer tiles than the plain
+    program's longest, ``ceil(pairs x tiles / G) < waves x ceil(tiles /
     splits)``.  Pure in its integers; whether the architecture ships the walk
-    is the host's (:func:`.cake_backend.select_walk`)."""
+    is the host's (:func:`.cake_backend.select_walk`); an architecture outside
+    ``WALK_MAX_WAVES`` is refused."""
+    if arch not in WALK_MAX_WAVES:
+        raise ValueError(
+            f"the persistent walk has no wave bound for {arch!r}; it ships for "
+            f"{tuple(WALK_MAX_WAVES)}"
+        )
     if (
         int(rows) < 1
         or int(kv_heads) < 1
@@ -1190,7 +1200,7 @@ def walk_applies(
     ctas = walk_ctas(sm_count, pairs, tiles)
     longest_walk = -(-(pairs * int(tiles)) // ctas)
     waves = -(-(pairs * int(splits)) // int(sm_count))
-    if waves <= 1 or waves > WALK_MAX_WAVES:
+    if waves <= 1 or waves > WALK_MAX_WAVES[arch]:
         return False
     return longest_walk < waves * -(-int(tiles) // int(splits))
 
