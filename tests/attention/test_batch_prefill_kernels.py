@@ -2954,8 +2954,10 @@ def test_batch_prefill_plan_max_lens(batch_size, page_size, seq_lens_dtype):
 def test_ragged_prefill_unchanged_running_max(dtype, q_val, head_dim):
     """An early dominant key keeps the online-softmax running max unchanged
     across KV tiles; the rescale must not produce NaNs or -inf LSE (#6907)."""
-    if head_dim > 256 and get_compute_capability(torch.device("cuda"))[0] < 8:
-        pytest.skip("16-bit FA2 head_dim > 256 is only supported on SM80 or newer")
+    if get_compute_capability(torch.device("cuda"))[0] < 8 and (
+        dtype == torch.bfloat16 or head_dim > 256
+    ):
+        pytest.skip("BF16 and 16-bit FA2 head_dim > 256 prefill require SM80 or newer")
 
     num_heads, kv_len = 1, 4096
     q = torch.full((1, num_heads, head_dim), q_val, dtype=dtype, device="cuda")
