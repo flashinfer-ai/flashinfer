@@ -198,8 +198,8 @@ def test_blackwell_scalar_one_pdl_b64_v32000_takes_cached_cluster_route():
         (1, 256000, None, False, 5),
         (48, 256000, None, False, 6),
         (100, 128000, 0.5, True, 6),
-        (256, 256000, None, False, 7),
-        (512, 128000, 0.5, True, 7),
+        (512, 256000, None, False, 7),
+        (1024, 128000, 0.5, True, 7),
     ],
 )
 def test_blackwell_softmax_all_negative_infinity_matches_public_semantics(
@@ -246,12 +246,14 @@ def test_blackwell_route_observer_falls_back_off_blackwell():
         (8, 4096, "scalar", False, "row"),
         (64, 32000, "scalar", True, "row"),
         (8, 256000, "none", False, "row"),  # 8-tile rows in one wave
-        (16, 256000, "none", False, "shared_tiles"),  # under the persistent threshold
+        (16, 256000, "none", False, "shared_tiles"),  # under 4/5 of persistent trips
         (40, 151936, "scalar", False, "shared_tiles"),  # 5-tile chunks
         (48, 256000, "per_row", True, "persistent"),  # persistent 16-CTA clusters
         (100, 128000, "none", False, "persistent"),  # persistent 8-CTA clusters
+        (64, 128000, "none", False, "persistent"),  # 4/5 of the persistent trips
+        (200, 256000, "per_row", True, "persistent"),  # < 8 rows per shared cluster
         (96, 100008, "none", False, "persistent"),  # a partial last tile in every row
-        (1024, 128000, "none", False, "shared_tiles"),  # 4+ rows per cluster
+        (1024, 128000, "none", False, "shared_tiles"),  # 7+ rows per C8 shared cluster
         (1024, 256000, "per_row", True, "shared_tiles"),
         (989, 128256, "per_row", True, "shared_tiles"),  # rows not a multiple of 8
         (600, 100008, "scalar", False, "shared_tiles"),  # the last tile unreached
