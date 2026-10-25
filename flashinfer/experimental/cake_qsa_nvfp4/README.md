@@ -214,5 +214,6 @@ The registry's derived leaves and everything under `csrc/`, `build.json` and
 
 Experimental. Validated against the default implementation's test suite with
 `backend="cake"` on compute capability 9.0 (`sm_90a`, H100) and 8.0 (`sm_80`,
-A100 80 GB and 40 GB PCIe); the tcgen05 programs (`sm_100a`, `sm_103a`)
-against the same suite on a B200 (10.0) and a GB300 (10.3).
+A100 80 GB and 40 GB PCIe); the tcgen05 programs (`sm_100a`, `sm_103a`,
+`sm_107a`) against the same suite on a B200 (10.0), a GB300 (10.3) and an R200
+(10.7).
