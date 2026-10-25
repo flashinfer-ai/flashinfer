@@ -1654,6 +1654,7 @@ class BlackwellBf16RankMajorSession:
             )
         active_grids = _active_stage_grids(active_tokens_per_rank)
         stream = torch.cuda.current_stream(self._device).cuda_stream
+        order: tuple[str, ...]
         if active_tokens_per_rank <= _LL_MAX_T:
             order = ("ll_recv", "gemm1_swiglu", "gemm2", "ll_unpermute", "ll_combine")
             if self._ll_push_deferred:
