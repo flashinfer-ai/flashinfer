@@ -1477,6 +1477,41 @@ def _make_direct_sequence_order(
     return order
 
 
+@cache
+def _make_direct_work_bins(
+    seq_lens: tuple[int, ...], *, num_heads: int, worker_count: int, chunk_tokens: int
+) -> tuple[tuple[int, ...], int]:
+    """Bin table of a direct M128 body built with work bins.
+
+    Each CTA of such a body runs one bin of (sequence, head) tasks back to
+    back.  Tasks go in descending chunk count (sequences in descending length,
+    stable in index; heads ascending) to the least-loaded bin, lowest bin
+    first; the bin count is ``min(tasks, worker_count)``.  The table holds the
+    bin offsets as absolute table indices, then the task ids
+    ``sequence * num_heads + head``.  Returns the table and the bin count.
+    """
+    if num_heads <= 0 or worker_count <= 0 or chunk_tokens <= 0:
+        raise ValueError("direct work-bin inputs must be positive")
+    if not seq_lens or min(seq_lens) <= 0:
+        raise ValueError("direct work bins require non-empty positive lengths")
+    num_bins = min(len(seq_lens) * num_heads, worker_count)
+    bins: list[list[int]] = [[] for _ in range(num_bins)]
+    loads = [(0, bin_idx) for bin_idx in range(num_bins)]
+    order = sorted(range(len(seq_lens)), key=lambda index: (-seq_lens[index], index))
+    for seq_idx in order:
+        chunks = (seq_lens[seq_idx] + chunk_tokens - 1) // chunk_tokens
+        for head_idx in range(num_heads):
+            load, bin_idx = heapq.heappop(loads)
+            bins[bin_idx].append(seq_idx * num_heads + head_idx)
+            heapq.heappush(loads, (load + chunks, bin_idx))
+    table = [num_bins + 1]
+    for tasks in bins:
+        table.append(table[-1] + len(tasks))
+    for tasks in bins:
+        table.extend(tasks)
+    return tuple(table), num_bins
+
+
 def _constrained_direct_m128_route(
     *,
     gpu_arch: str,
@@ -2909,6 +2944,25 @@ class FlashKDABlackwellBF16FusedLaunch:
             )
         self.early_n32_state_pack = use_early_n32_state_pack
         self.ir = self.module.schedule
+        num_work_bins = 0
+        if getattr(self.module, "work_bins", False):
+            # A body built with work bins reads its bin table through seq_order
+            # and runs one CTA per bin.
+            if route != BF16_ROUTE_DIRECT_M128:
+                raise NotImplementedError(
+                    "work bins are built for the direct M128 N32 body only"
+                )
+            work_bin_table, num_work_bins = _make_direct_work_bins(
+                tuple(offsets[index + 1] - offsets[index] for index in range(num_seqs)),
+                num_heads=num_heads,
+                worker_count=sm_count,
+                chunk_tokens=BF16_M128_CHUNK,
+            )
+            work_bin_upload = _upload_int32_batch(
+                q.device, {"seq_order": list(work_bin_table)}
+            )
+            self._work_bin_host = work_bin_upload["_host_pinned"]
+            seq_order = work_bin_upload["seq_order"]
         if use_tf32_owner_helper:
             OWNER_RING_STAGES = 21
             STAGE_BYTES = 74752
@@ -2982,6 +3036,12 @@ class FlashKDABlackwellBF16FusedLaunch:
         )
         if n32_value_rows == 64:
             self.grid = (2 * self.grid[0], 1, 1)
+        if num_work_bins:
+            if self.grid != (total_tasks, 1, 1):
+                raise NotImplementedError(
+                    "work bins replace the one-CTA-per-task direct grid only"
+                )
+            self.grid = (num_work_bins, 1, 1)
         self.prepare_grid = (bt16_prepare_total_ctas, 1, 1)
         qkv_carriers = self._qkv_carrier_names.get(id(self.module), ())
         self.args = {

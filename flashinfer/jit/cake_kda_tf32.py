@@ -4481,11 +4481,16 @@ class PreparedKernel:
     #: (``_RENDERED_HEAD_ROUTES``); ``None`` for every other module.
     ctas_per_head = None
 
+    #: The program runs bins of (sequence, head) tasks: its ``seq_order``
+    #: argument is a bin table and its grid is one CTA per bin.
+    work_bins = False
+
     def __init__(self, name, arch):
         record = MODULES[name]
         self.name = name
         self.arch = arch
         self.schedule = None
+        self.work_bins = bool(record.get("work_bins", False))
         native = load(name, arch)
         entry = record["ffi_entry"]
         workspace_bytes = record.get("tma_workspace_bytes", 0)
