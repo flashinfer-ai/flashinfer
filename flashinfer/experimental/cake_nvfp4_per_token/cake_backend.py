@@ -68,6 +68,7 @@ import tvm_ffi
 from ...utils import get_compute_capability, get_device_sm_count
 from .cake_jit import (
     ARG_PLANS,
+    KERNELS,
     MODULES,
     kernel_definitions,
     kernel_module_name,
@@ -102,6 +103,11 @@ STATIC_K: tuple[int, ...] = (2688, 4096, 7168)
 WIDE_MAX_M = 4096
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 ARCHES = tuple(sorted(set(SUPPORTED_COMPUTE_CAPABILITIES.values())))
+# SM count each architecture's GEMM dispatch was measured on (sm_100a: B200, sm_103a: GB300).
+# A part with another SM count (GB200: sm_100a with 152 SMs, B300: sm_103a with 148) runs the
+# tactic of the measured count where its own tactic selects a kernel the architecture does not
+# register (:func:`gemm_plan`).
+MEASURED_SM_COUNT = {"sm_100a": 148, "sm_103a": 152}
 # Co-resident clusters per cluster size on each part (``cuOccupancyMaxActiveClusters`` of the split-K
 # kernel at one CTA per SM), keyed by SM count.  A split-K launch is ``weight tiles x token tiles``
 # clusters and must fit in one wave; the capacity is the GPC placement limit, not ``sm_count // size``.
@@ -981,7 +987,36 @@ def gemm_plan(
     *,
     tactic: Optional[dict[str, Any]] = None,
 ) -> GemmPlan:
-    """Resolve tactic, tile geometry and grid exactly like the Cake ``launch_gemm``."""
+    """Resolve tactic, tile geometry and grid exactly like the Cake ``launch_gemm``.
+
+    Without an explicit ``tactic``, on an SM count other than ``arch``'s
+    :data:`MEASURED_SM_COUNT` a default tactic whose kernel ``arch`` does not
+    register falls back to the tactic of the measured SM count, planned (grid and
+    stream-K tail) for ``sm_count``."""
+    plan = _gemm_plan(m, n, k, out_f16, arch, sm_count, tactic=tactic)
+    measured = MEASURED_SM_COUNT.get(arch, int(sm_count))
+    if (
+        tactic is not None
+        or int(sm_count) == measured
+        or plan.kernel_key in KERNELS.get(arch, {})
+    ):
+        return plan
+    reference = _gemm_plan(m, n, k, out_f16, arch, measured)
+    fallback = _gemm_plan(m, n, k, out_f16, arch, sm_count, tactic=reference.tactic)
+    return fallback if fallback.kernel_key in KERNELS.get(arch, {}) else plan
+
+
+def _gemm_plan(
+    m: int,
+    n: int,
+    k: int,
+    out_f16: bool,
+    arch: str,
+    sm_count: int,
+    *,
+    tactic: Optional[dict[str, Any]] = None,
+) -> GemmPlan:
+    """The plan of ``tactic`` (default: :func:`default_tactic`) on ``sm_count`` SMs."""
     m, n, k = int(m), int(n), int(k)
     if m < 1 or n < 1:
         raise ValueError("M and N must be positive")
@@ -1005,7 +1040,7 @@ def gemm_plan(
                 two_cta_wave_cost=_TWO_CTA_TILE_WAVE_COST_K96,
             )
             if k96 != tactic:
-                plan = gemm_plan(m, n, k, out_f16, arch, sm_count, tactic=k96)
+                plan = _gemm_plan(m, n, k, out_f16, arch, sm_count, tactic=k96)
                 if plan.kernel_key in K96_KERNEL_KEYS:
                     return plan
     else:
