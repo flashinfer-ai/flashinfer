@@ -7,7 +7,8 @@ stored once and expanded into ``MODULES`` / ``FACTORIES`` at import. The host
 binding of every shipped module is rendered from ``cake_kda_prefill_binding``
 into the generated-source directory when its JIT spec is created; a generated
 program (``_RENDERED_MODULES``) ships its own binding, and ``_RENDERED_ROUTES``
-points the factory rows of the modules it replaces at it.
+points the factory rows of the modules it replaces at it (``_RENDERED_HEAD_ROUTES``
+per head count where a program's build depends on it).
 """
 
 from functools import cache
@@ -1292,9 +1293,10 @@ def _module_record(name, directory, digest, arches, plan, tma_workspace_bytes):
 
 # Generated programs, one record per program, written by the exporter: the device
 # unit and its host binding under csrc/kda/prefill/ (``sources``), the binding's
-# ``ffi_entry``, ``compile_flags``, ``arg_plan`` and ``arches``. A generated
-# binding encodes its TMA descriptors from the bound tensors on every call, so a
-# record carries no descriptor workspace and no cache name.
+# ``ffi_entry``, ``compile_flags``, ``arg_plan`` and ``arches``. A program that
+# takes tensor maps reads them from a host buffer the loader encodes when it
+# prepares a launch (the plan's ``("workspace", "tensor_maps")`` entry, see
+# ``PreparedKernel``); a record carries no cache name.
 _RENDERED_MODULES = {
     "cake_kda_prefill_04b23681db66fd43a05c": {
         "sources": [
@@ -2599,6 +2601,13 @@ _RENDERED_ROUTES = {
     },
 }
 
+# architecture -> shipped module -> head count -> [generated program, CTAs per
+# sequence-head]: a module whose generated build is one body per head count (the
+# banded split scans, one CTA per band of state rows). ``_factory`` prefers this
+# table when the call names its head count; another head count keeps the
+# ``_RENDERED_ROUTES`` program.
+_RENDERED_HEAD_ROUTES = {"sm_100a": {}, "sm_103a": {}}
+
 MODULES = {
     **{name: _module_record(name, *row) for name, row in _MODULE_ROWS.items()},
     **_RENDERED_MODULES,
@@ -3659,6 +3668,10 @@ class PreparedKernel:
     read nothing but their own ``*_tma`` tensor.
     """
 
+    #: CTAs per (sequence, head) of a program routed by head count
+    #: (``_RENDERED_HEAD_ROUTES``); ``None`` for every other module.
+    ctas_per_head = None
+
     def __init__(self, name, arch):
         record = MODULES[name]
         self.name = name
@@ -3804,7 +3817,13 @@ def prepare_descriptors(prepared):
             owner._descriptors_stale = False
 
 
-def _factory(name, *args, **kwargs):
+def _factory(name, *args, route_heads=None, **kwargs):
+    """The prepared module of one factory row, through the routes.
+
+    ``route_heads`` is the head count of the call: a module the head-count
+    routes name at that count resolves to that program, whose launch grid is
+    ``ctas_per_head`` CTAs per (sequence, head).
+    """
     arch = device_arch()
     variants = FACTORIES.get(arch, {}).get(name, {})
     key = _key(args, kwargs)
@@ -3813,4 +3832,10 @@ def _factory(name, *args, **kwargs):
             f"Unexported KDA schedule specialization: {(arch, name, *key)}"
         )
     module = variants[key]
+    by_heads = _RENDERED_HEAD_ROUTES.get(arch, {}).get(module, {})
+    if route_heads in by_heads:
+        program, ctas_per_head = by_heads[route_heads]
+        kernel = PreparedKernel(program, arch)
+        kernel.ctas_per_head = int(ctas_per_head)
+        return kernel
     return PreparedKernel(_RENDERED_ROUTES.get(arch, {}).get(module, module), arch)

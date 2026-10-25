@@ -4056,12 +4056,20 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         # The hi/lo carry variant is keyed only on the apply route so the
         # published plain scan programs (bf16 and tf32) keep their build key.
         scan_kwargs = dict(carry_hilo=True) if self._apply_route else {}
+        # A generated scan routed by head count (one body per band height)
+        # covers ``ctas_per_head`` row bands of each sequence-head; the other
+        # scan programs run 32 row-band CTAs per sequence-head.
         self._scan_module = _build_kda_module(
-            partial(_factory, "compiled_flashkda_split_scan_bf16_m128"),
+            partial(
+                _factory, "compiled_flashkda_split_scan_bf16_m128", route_heads=heads
+            ),
             use_pdl=True,
             compute_dtype=compute_dtype,
             backend=backend,
             **scan_kwargs,
+        )
+        self._scan_ctas_per_head = (
+            getattr(self._scan_module, "ctas_per_head", None) or 32
         )
         if not self._apply_route:
             # Unused by the plain schedule; the kernel ABI still carries the pointers.
@@ -4225,7 +4233,13 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             fire([(self._state_indices_long.copy_, (self._state_indices,))])
         if not map_first:
             fire(self._map_records())
-        scan_grid = (self._num_sequences * int(self._main_final.shape[1]) * 32, 1, 1)
+        scan_grid = (
+            self._num_sequences
+            * int(self._main_final.shape[1])
+            * self._scan_ctas_per_head,
+            1,
+            1,
+        )
         fire(
             [
                 _prepared_kernel_record(

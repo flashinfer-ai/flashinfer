@@ -85,6 +85,17 @@ def test_routes_point_shipped_modules_at_generated_programs():
             assert program in registry._RENDERED_MODULES, (arch, program)
             assert arch in registry._RENDERED_MODULES[program]["arches"]
             routed.add(program)
+    assert set(registry._RENDERED_HEAD_ROUTES) == set(registry.ARCHES)
+    for arch, modules in registry._RENDERED_HEAD_ROUTES.items():
+        for module, by_heads in modules.items():
+            # A head count the table lacks falls back to the module's route.
+            assert module in registry._RENDERED_ROUTES[arch], (arch, module)
+            for heads, (program, ctas_per_head) in by_heads.items():
+                assert type(heads) is int and heads > 0, (arch, module, heads)
+                assert type(ctas_per_head) is int and ctas_per_head > 0
+                assert program in registry._RENDERED_MODULES, (arch, program)
+                assert arch in registry._RENDERED_MODULES[program]["arches"]
+                routed.add(program)
     assert routed == set(GENERATED)
 
 
@@ -131,6 +142,34 @@ def test_generated_plans_bind_from_the_shipped_plans():
                 assert name in shipped, where
                 assert (kind in TENSOR_KINDS) == (shipped[name] in TENSOR_KINDS), where
                 assert (kind == "parameter") == (shipped[name] == "parameter"), where
+
+
+@requires_programs
+@pytest.mark.parametrize("arch", sorted(registry.ARCHES))
+def test_factory_resolves_a_head_count_through_the_head_routes(monkeypatch, arch):
+    monkeypatch.setattr(registry, "device_arch", lambda device=None: arch)
+    monkeypatch.setattr(
+        registry,
+        "PreparedKernel",
+        lambda name, target: SimpleNamespace(name=name, arch=target),
+    )
+    by_module = registry._RENDERED_HEAD_ROUTES[arch]
+    seen = set()
+    for family, variants in registry.FACTORIES[arch].items():
+        for (args, kwargs), module in variants.items():
+            if module not in by_module:
+                continue
+            seen.add(module)
+            for heads, (program, ctas_per_head) in by_module[module].items():
+                kernel = registry._factory(
+                    family, *args, route_heads=heads, **dict(kwargs)
+                )
+                assert (kernel.name, kernel.arch) == (program, arch)
+                assert kernel.ctas_per_head == ctas_per_head
+            other = registry._factory(family, *args, route_heads=7, **dict(kwargs))
+            assert other.name == registry._RENDERED_ROUTES[arch][module]
+            assert getattr(other, "ctas_per_head", None) is None
+    assert seen == set(by_module)
 
 
 @requires_programs
@@ -600,9 +639,8 @@ def unrouted(monkeypatch):
     """Clear the routes: every factory row builds its shipped module."""
 
     def clear():
-        monkeypatch.setattr(
-            registry, "_RENDERED_ROUTES", {arch: {} for arch in registry.ARCHES}
-        )
+        for table in ("_RENDERED_ROUTES", "_RENDERED_HEAD_ROUTES"):
+            monkeypatch.setattr(registry, table, {arch: {} for arch in registry.ARCHES})
 
     return clear
 
