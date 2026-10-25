@@ -441,6 +441,8 @@ def gather_key_sample(
     sample_scales : torch.Tensor, optional
         ``[requests, capacity, 8]``, output: the sampled keys' NVFP4 scales.
     """
+    if not is_cute_dsl_experimental_available():
+        raise RuntimeError("gather_key_sample needs CuTe DSL 4.7 or newer")
     from ..cute_dsl.launch import launch
     from .kernels import single_head_scorer
     from .kernels.single_head_scorer import PAGE, SCALES_PER_KEY, TILE
@@ -506,6 +508,8 @@ def thresholds_from_sample(
     counters : torch.Tensor
         int32 ``[rows, 2]``, output: zeroed.
     """
+    if not is_cute_dsl_experimental_available():
+        raise RuntimeError("thresholds_from_sample needs CuTe DSL 4.7 or newer")
     from ..cute_dsl.launch import launch
     from .kernels import single_head_scorer
     from .kernels.single_head_scorer import COUNTERS, THRESHOLD_ROWS_PER_CTA
