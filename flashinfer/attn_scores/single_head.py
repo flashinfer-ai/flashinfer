@@ -4,7 +4,6 @@
 """Single-head paged MQA logits, for sparse attention whose indexer scores keys
 with one query head and no head weights."""
 
-import math
 from typing import Optional
 
 import torch
@@ -98,7 +97,9 @@ def single_head_paged_mqa_logits(
     workers = max(CTAS_PER_SM * get_device_sm_count(query.device) // batch, runs, 1)
     keys = (query, query_scales, key_cache, key_scales)
     tables = (context_lengths, requests, block_table)
-    _score("decode", rows, keys, (*tables, None, None, scores, max_context, workers, 0))
+    _score(
+        "decode", rows, keys, (*tables, None, None, scores, max_context, workers, 0, 0)
+    )
 
 
 def _score(mode: str, rows: int, keys: tuple, args: tuple) -> None:
@@ -239,17 +240,16 @@ def single_head_paged_mqa_threshold_select(
         raise ValueError(
             "candidates must hold the top_k tie slots and at least one more"
         )
-    # CTAs per query tile: the fewest that give every SM the same number of CTAs
-    # and keep each CTA's run within SELECT_TILES_PER_CTA. tiles * workers is a
-    # multiple of the SM count exactly when workers is a multiple of unit.
+    # CTAs: the fewest whole waves (every SM the same number of CTAs) that keep
+    # each CTA's run within SELECT_TILES_PER_CTA, shared out so the first `wide`
+    # query tiles get one CTA more than the rest.
     sms = get_device_sm_count(query.device)
-    unit = sms // math.gcd(tiles, sms)
     runs = -(-key_tiles // SELECT_TILES_PER_CTA)
-    workers = unit * -(-runs // unit)
+    workers, wide = divmod(sms * -(-tiles * runs // sms), tiles)
     keys = (query, query_scales, key_cache, key_scales)
     tables = (row_ends, tile_requests, block_table)
     outputs = (thresholds, counters, candidates)
-    _score("select", TILE, keys, (*tables, *outputs, max_context, workers, top_k))
+    _score("select", TILE, keys, (*tables, *outputs, max_context, workers, wide, top_k))
 
 
 @flashinfer_api(trace=quantize_write_index_qk_nvfp4_trace)
