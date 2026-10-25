@@ -775,7 +775,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     }
 
     // Profile specific tactic. Assuming at least one preparation phase has been executed already.
-    mProfiler->runProfiler(num_rows, profile, static_cast<char*>(mProfileWorkspace.value().data_ptr()),
+    mProfiler->runProfiler(num_rows, profile,
+                           static_cast<char*>(mProfileWorkspace.value().data_ptr()),
                            expert_weights_ptr, enable_pdl, stream);
   }
 

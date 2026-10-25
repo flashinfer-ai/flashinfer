@@ -27,7 +27,7 @@ def _ffi_results(tensors):
 
 def _assert_views(actual, expected):
     assert len(actual) == len(expected)
-    for view, tensor in zip(actual, expected):
+    for view, tensor in zip(actual, expected, strict=True):
         assert view.data_ptr() == tensor.data_ptr()
         torch.testing.assert_close(view, tensor)
 

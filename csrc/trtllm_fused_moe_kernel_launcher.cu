@@ -1809,8 +1809,8 @@ class FusedMoeLauncher {
     moe_runner->run(*args, workspace, hidden_states.device().device_id, moe_stream, moe_tactic,
                     enable_pdl);
 
-    MoeRunResultBuffers result(
-        args->do_finalize, args->do_finalize ? output : Optional<Tensor>(gemm2_output));
+    MoeRunResultBuffers result(args->do_finalize,
+                               args->do_finalize ? output : Optional<Tensor>(gemm2_output));
     if (!args->do_finalize) {
       result.expert_weights = FusedMoeLauncher::expert_weights;
     }
@@ -4623,8 +4623,8 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     moe_runner->run(*args, workspace, hidden_states.device().device_id, moe_stream, moe_tactic,
                     enable_pdl);
 
-    MoeRunResultBuffers result(
-        args->do_finalize, args->do_finalize ? output : Optional<Tensor>(gemm2_output));
+    MoeRunResultBuffers result(args->do_finalize,
+                               args->do_finalize ? output : Optional<Tensor>(gemm2_output));
     if (!args->do_finalize) {
       result.expert_weights = FusedMoeLauncher::expert_weights;
     }
@@ -5327,8 +5327,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     moe_runner->run(*args, workspace, hidden_states.device().device_id, moe_stream, moe_tactic,
                     enable_pdl);
 
-    MoeRunResultBuffers result(
-        args->do_finalize, args->do_finalize ? output : Optional<Tensor>(gemm2_output));
+    MoeRunResultBuffers result(args->do_finalize,
+                               args->do_finalize ? output : Optional<Tensor>(gemm2_output));
     if (!args->do_finalize) {
       result.expert_weights = FusedMoeLauncher::expert_weights;
     }
