@@ -1,4 +1,14 @@
-"""Selected packed-input and workspace preparation; no compiler or oracle dependency."""
+"""Selected packed-input and workspace preparation; no compiler or oracle dependency.
+
+``prepare_pipeline_bindings`` packs one pipeline call. The caller's
+``intermediate`` is the model's logical width (a multiple of the 32-value scale
+group); the generated programs compute the intermediate in 128-wide steps, so
+the host pads the routed weights and their scales to the next multiple of 128
+with zero weights when the logical width is not one already. The padded
+columns add exact zeros, so the result is bit-identical to the unpadded
+arithmetic, and a width that already is a multiple of 128 is packed exactly as
+before (no copy).
+"""
 
 import math
 
@@ -9,6 +19,60 @@ CTA_GROUP = 2
 GRAN_OUT = 32
 ALIGN_M = 256
 DISP_NUM_EXPERTS_MAX = 384
+# The pipeline programs tile the intermediate width in 128-wide steps (two
+# 64-column store tiles per step); every scale covers 32 values.
+INTERMEDIATE_ALIGN = 128
+SF_GRAN = 32
+# Scale of the padded weight groups: float 1.0 packs to the UE8M0 byte 127.
+# The padded weights are zero, so any finite scale gives exact zero products;
+# 1.0 keeps the padded scale words away from the denormal exponents.
+PAD_SCALE = 1.0
+PIPELINE_KEY_FIELDS = (
+    "num_tokens",
+    "num_experts",
+    "top_k",
+    "hidden",
+    "intermediate",
+    "routed_weight_dtype",
+    "activation_clamp",
+)
+
+
+def physical_intermediate(intermediate) -> int:
+    """Physical intermediate width of the generated programs for a logical width.
+
+    The logical width must be a positive multiple of the scale group (32). The
+    physical width is the next multiple of 128 (the width the programs were
+    generated for and the route key names); a logical width that already is a
+    multiple of 128 is its own physical width.
+    """
+    intermediate = int(intermediate)
+    if intermediate < SF_GRAN or intermediate % SF_GRAN:
+        raise ValueError(
+            "MegaMoE requires a positive intermediate width that is a multiple of "
+            f"{SF_GRAN} (the scale group); got {intermediate}"
+        )
+    return -(-intermediate // INTERMEDIATE_ALIGN) * INTERMEDIATE_ALIGN
+
+
+def pipeline_route_args(inputs):
+    """The route-key fields of a pipeline call.
+
+    ``intermediate`` is the physical width the programs were generated for
+    (see ``physical_intermediate``), ``routed_weight_dtype`` defaults to
+    ``"fp4"`` and a numeric ``activation_clamp`` is a float: the route key is
+    JSON text, so ``10`` and ``10.0`` would otherwise name different routes.
+    """
+    clamp = inputs.get("activation_clamp")
+    return dict(
+        num_tokens=int(inputs["num_tokens"]),
+        num_experts=int(inputs["num_experts"]),
+        top_k=int(inputs["top_k"]),
+        hidden=int(inputs["hidden"]),
+        intermediate=physical_intermediate(inputs["intermediate"]),
+        routed_weight_dtype=inputs.get("routed_weight_dtype", "fp4"),
+        activation_clamp=None if clamp is None else float(clamp),
+    )
 
 
 def _source_block_m(num_tokens: int, num_experts: int, top_k: int) -> int:
@@ -87,6 +151,44 @@ def _interleave_gate_up(t, gran: int = 8):
     return torch.stack([gate, up], dim=2).reshape(g, n, *rest).contiguous()
 
 
+def _pad_intermediate(w1, w1_sf, w2, w2_sf, logical: int, physical: int, pack: int):
+    """Zero-pad the routed weights from the logical to the physical intermediate width.
+
+    W1 rows of both halves move apart (gate ``[0, I)`` to ``[0, I_phys)``, up
+    ``[I, 2I)`` to ``[I_phys, 2 I_phys)``) before the gate/up interleave; W2
+    gains zero columns ``[I, I_phys)`` (``pack`` values per byte); both scale
+    tensors grow alike with ``PAD_SCALE`` in the padded groups. Every padded
+    intermediate column activates to exactly 0 (gate and up are 0) and every
+    padded down-projection product is exactly 0. Equal widths return the
+    caller's tensors untouched.
+    """
+    import torch
+
+    if physical == logical:
+        return w1, w1_sf, w2, w2_sf
+    experts = w1.shape[0]
+
+    def rows(t, fill):
+        out = torch.full(
+            (experts, 2 * physical, *t.shape[2:]), fill, dtype=t.dtype, device=t.device
+        )
+        out[:, :logical] = t[:, :logical]
+        out[:, physical : physical + logical] = t[:, logical:]
+        return out
+
+    def cols(t, width, fill):
+        out = torch.full((*t.shape[:-1], width), fill, dtype=t.dtype, device=t.device)
+        out[..., : t.shape[-1]] = t
+        return out
+
+    return (
+        rows(w1, 0),
+        rows(w1_sf, PAD_SCALE),
+        cols(w2, physical // pack, 0),
+        cols(w2_sf, physical // SF_GRAN, PAD_SCALE),
+    )
+
+
 def _sf_float_to_u32_words(sf_float):
     """UE8M0 float SF [.., K/32] → packed u32 words [.., K/128] (4 exponent
     bytes per word, natural order) — the gran-32 SF ABI the GEMM load consumes."""
@@ -130,27 +232,38 @@ def build_tile_lists(per_expert_M, num_experts: int):
 
 
 def prepare_pipeline_bindings(inputs, num_sms):
-    """Pack ``inputs`` for the persistent grid of a ``num_sms``-SM catalogued route."""
+    """Pack ``inputs`` for the persistent grid of a ``num_sms``-SM catalogued route.
+
+    ``inputs["intermediate"]`` is the logical width; the weights and scales are
+    padded to the physical width of the route (``physical_intermediate``) when
+    the two differ, and the kernel scalars ``N1``/``K2`` name the physical width.
+    """
     import torch
 
+    args = pipeline_route_args(inputs)
     E, TK, T, H, I = (
-        inputs[k]
+        args[k]
         for k in ("num_experts", "top_k", "num_tokens", "hidden", "intermediate")
     )
-    weight_fmt = inputs.get("routed_weight_dtype", "fp4")
+    logical_I = int(inputs["intermediate"])
+    weight_fmt = args["routed_weight_dtype"]
     if weight_fmt not in ("fp4", "fp8"):
         raise ValueError("routed_weight_dtype must be 'fp4' or 'fp8'")
+    pack = 2 if weight_fmt == "fp4" else 1
     if not 1 <= E <= DISP_NUM_EXPERTS_MAX or not 1 <= TK <= min(E, 32):
         raise ValueError(
             "MegaMoE requires 1..384 experts and 1..min(experts,32) routes"
         )
-    if T < 1 or H % BLOCK_K or I % BLOCK_K:
-        raise ValueError("MegaMoE requires positive T and H/I divisible by 256")
+    if T < 1 or H % BLOCK_K:
+        raise ValueError("MegaMoE requires positive T and H divisible by 256")
+    assert I % INTERMEDIATE_ALIGN == 0, I
     source_block_m = _source_block_m(T, E, TK)
     source_blocks = E + (T * TK + source_block_m - 1) // source_block_m
     N1, K1, N2, K2 = (2 * I, H, H, I)
     grid_n1, K1_tiles = (N1 // BLOCK_N, K1 // BLOCK_K)
-    grid_n2, K2_tiles = (N2 // BLOCK_N, K2 // BLOCK_K)
+    # K2_tiles is a legacy term of the arrival-word bound and an unused kernel
+    # scalar; the physical width needs ceil(I / 256) of the 256-wide tiles.
+    grid_n2, K2_tiles = (N2 // BLOCK_N, -(-K2 // BLOCK_K))
     ref = _mega_dispatch_reference(inputs["topk_idx"], E)
     # A batch whose every slot is -1 routes no row; its pools keep one aligned
     # block so that their tensor maps stay valid.
@@ -166,12 +279,19 @@ def prepare_pipeline_bindings(inputs, num_sms):
         .contiguous()
     )
     x_sf = inputs["x_sf_packed"].contiguous().view(torch.int32).view(torch.uint32)
-    B1 = _interleave_gate_up(inputs[f"w1_{weight_fmt}"]).contiguous().view(torch.uint8)
-    SFB1 = _sf_float_to_u32_words(_interleave_gate_up(inputs["w1_sf"])).view(
-        torch.uint32
+    w1, w1_sf, w2, w2_sf = _pad_intermediate(
+        inputs[f"w1_{weight_fmt}"],
+        inputs["w1_sf"],
+        inputs[f"w2_{weight_fmt}"],
+        inputs["w2_sf"],
+        logical_I,
+        I,
+        pack,
     )
-    B2 = inputs[f"w2_{weight_fmt}"].contiguous().view(torch.uint8)
-    SFB2 = _sf_float_to_u32_words(inputs["w2_sf"]).view(torch.uint32)
+    B1 = _interleave_gate_up(w1).contiguous().view(torch.uint8)
+    SFB1 = _sf_float_to_u32_words(_interleave_gate_up(w1_sf)).view(torch.uint32)
+    B2 = w2.contiguous().view(torch.uint8)
+    SFB2 = _sf_float_to_u32_words(w2_sf).view(torch.uint32)
     pool_fp8 = torch.zeros(M_total, H // 4, dtype=torch.int32, device="cuda")
     pool_sf = torch.zeros(M_total, H // 128, dtype=torch.int32, device="cuda")
     routing_weight_pool = torch.zeros(M_total, dtype=torch.float32, device="cuda")
@@ -313,4 +433,5 @@ def prepare_pipeline_bindings(inputs, num_sms):
         grid=grid,
         M_total=M_total,
         total_m_tiles=total_m_tiles,
+        intermediate=I,
     )

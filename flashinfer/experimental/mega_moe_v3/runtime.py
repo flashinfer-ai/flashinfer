@@ -4,7 +4,11 @@ import json
 from pathlib import Path
 
 from ..deepgemm_common import load_catalog
-from .preparation import prepare_pipeline_bindings, build_tile_lists
+from .preparation import (
+    build_tile_lists,
+    pipeline_route_args,
+    prepare_pipeline_bindings,
+)
 
 LABEL = "Generated MegaMoE v3"
 
@@ -277,19 +281,23 @@ def prepare_pipeline(inputs):
     Required dictionary fields: num_experts/top_k/num_tokens/hidden/intermediate,
     routed_weight_dtype/activation_clamp, x_fp8_packed/x_sf_packed,
     topk_idx(int64)/topk_weights(FP32), w1_fp4/w2_fp4 (or w1_fp8/w2_fp8),
-    and w1_sf/w2_sf (FP32 powers-of-two, granularity32). Gate/up weights are
-    logical halves; preparation applies the selected 8-way interleave and
-    source-schedule scale permutation. No upstream library is imported. The
-    counter workspace is allocated zeroed and the self-cleaning kernel never
-    needs it zeroed again.
+    and w1_sf/w2_sf (FP32 powers-of-two, granularity32). ``intermediate`` is
+    the model's logical width (a multiple of 32): the route is the one
+    generated for the next multiple of 128, and preparation pads the weights
+    and scales to that physical width with exact zeros when the two differ.
+    Gate/up weights are logical halves; preparation applies the selected
+    8-way interleave and source-schedule scale permutation. No upstream
+    library is imported. The counter workspace is allocated zeroed and the
+    self-cleaning kernel never needs it zeroed again.
     """
     arch = device_arch(inputs["x_fp8_packed"].device)
-    route = _route(arch, "pipeline", inputs)
+    args = pipeline_route_args(inputs)
+    route = _route(arch, "pipeline", args)
     # The persistent grid derives from the SM count the route was generated for.
     data = prepare_pipeline_bindings(inputs, route["num_sms"][arch])
     return bind_prepared(
         "pipeline",
-        inputs,
+        args,
         {"pipeline": data["bindings"]},
         data["output"],
         reset_storage=data["reset_storage"],
