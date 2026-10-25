@@ -233,16 +233,16 @@ GAPS_PDL = {
 # place in the plain route (c2 / c4 / rsa the three small-M composites, pro the prologue whole-row program, psb the
 # parked whole-row program) stands for its PDL build; (program, "plain") for the plain build the PDL route borrows
 # (launched without the attribute: the PDL build measured slower than the CuTe DSL kernel under PDL there and the
-# plain build faster; mode 0 on sm_100a alone, the mode-1 rows that first borrowed one re-measured in favour of the
-# PDL build); None for a declared gap.
+# plain build faster; no op A window does so since the re-measurement, which gave every such row to the prologue
+# program's PDL build); None for a declared gap.
 OP_A_PLAIN_ORDER = ("c2", "c4", "rsa", "pro", "psb")
 OP_A_PDL_WINDOWS = {
     ("sm_100a", 0): (
         (16, "c2"),
         (64, "c4"),
         (128, "rsa"),
-        (512, "psb"),
-        (768, ("psb", "plain")),
+        (256, "psb"),
+        (768, "pro"),
         (4095, None),
         (None, "pro"),
     ),
@@ -250,8 +250,6 @@ OP_A_PDL_WINDOWS = {
         (16, "c2"),
         (64, "c4"),
         (128, "rsa"),
-        (383, "pro"),
-        (1024, "psb"),
         (None, "pro"),
     ),
     ("sm_103a", 0): (
@@ -902,9 +900,9 @@ def test_rmsnorm_sigmoid_gate_pdl_route_names_a_build_form_per_window():
                 assert record["arches"] == list(BLACKWELL) or record["arches"] == [arch]
                 assert name not in plain_names
         assert list(names) == order, arch
-        assert len(names) == 8, (
-            arch
-        )  # five pdl builds, two pdl_late builds, the borrowed plain build
+        # five pdl builds, two pdl_late builds and the borrowed plain builds: the 16-head tail-free program on both
+        # architectures, plus the two whole-row programs on sm_103a
+        assert len(names) == (10 if arch == "sm_103a" else 8), arch
         for heads, gaps in (
             (128, GAPS_PDL.get((arch, route, 128), ())),
             (32, GAPS_PDL.get((arch, route, 32), ())),
@@ -1507,9 +1505,8 @@ def test_rmsnorm_sigmoid_gate_support_follows_the_head_and_token_counts_through_
 def test_the_launch_attribute_follows_the_record():
     """A record's ``launch.use_pdl`` is its binding's programmatic-stream-serialization attribute: in the binding of
     every PDL build, absent from every plain build's -- the plain builds the PDL routes borrow included, so a call of
-    a PDL route in such a window launches without the attribute; on sm_100a op A's mode-0 route and op C's route
-    borrow one, on sm_103a op C's route alone (the mode-1 routes borrow nothing since the window re-measurement), on
-    sm_107a none."""
+    a PDL route in such a window launches without the attribute; op C's route alone borrows one on sm_100a and
+    sm_103a (the op A routes borrow nothing since the window re-measurement), on sm_107a none."""
     attribute = "cudaLaunchAttributeProgrammaticStreamSerialization"
     borrowed = {}
     for name, record in loader.MODULES.items():
@@ -1521,17 +1518,21 @@ def test_the_launch_attribute_follows_the_record():
             for arch in per_arch:
                 borrowed.setdefault(arch, set()).add(route)
     assert borrowed == {
-        "sm_100a": {
-            loader.route_key(OP_A, "mode0_pdl"),
-            loader.route_key(OP_C, "bf16_pdl"),
-        },
+        "sm_100a": {loader.route_key(OP_C, "bf16_pdl")},
         "sm_103a": {loader.route_key(OP_C, "bf16_pdl")},
     }
     for arch, routes in borrowed.items():
         for route in routes:
             names = loader.route_modules(arch, route)
             forms = [loader.MODULES[n]["launch"]["use_pdl"] for n in names]
-            assert forms.count(False) == 1 and forms.count(True) == len(names) - 1
+            plain = (
+                3
+                if (arch, route) == ("sm_103a", loader.route_key(OP_C, "bf16_pdl"))
+                else 1
+            )
+            assert (
+                forms.count(False) == plain and forms.count(True) == len(names) - plain
+            ), (arch, route)
 
 
 def test_launch_grid_and_args_follow_the_record(monkeypatch):
