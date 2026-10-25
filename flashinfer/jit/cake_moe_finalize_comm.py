@@ -40,63 +40,123 @@ _NVCC_FLAGS = {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}
 # symbol the binding launches, and the architectures that build it.
 MODULES: dict[str, dict[str, Any]] = {
     "cake_trtllm_moe_finalize_bfloat16_ws2_o110": {
-        "sources": ["cake_moe_finalize_kernels.cu"],
+        "sources": ["cake_trtllm_moe_finalize_bfloat16_ws2_o110_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o110",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_trtllm_moe_finalize_bfloat16_ws2_o110_small": {
+        "sources": ["cake_trtllm_moe_finalize_bfloat16_ws2_o110_small_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o110_small",
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_trtllm_moe_finalize_bfloat16_ws2_o111": {
-        "sources": ["cake_moe_finalize_kernels.cu"],
+        "sources": ["cake_trtllm_moe_finalize_bfloat16_ws2_o111_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o111",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_trtllm_moe_finalize_bfloat16_ws2_o111_small": {
+        "sources": ["cake_trtllm_moe_finalize_bfloat16_ws2_o111_small_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o111_small",
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_trtllm_moe_finalize_bfloat16_ws4_o110": {
-        "sources": ["cake_moe_finalize_kernels.cu"],
+        "sources": ["cake_trtllm_moe_finalize_bfloat16_ws4_o110_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_trtllm_moe_finalize_bfloat16_ws4_o110_small": {
+        "sources": ["cake_trtllm_moe_finalize_bfloat16_ws4_o110_small_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110_small",
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_trtllm_moe_finalize_bfloat16_ws4_o111": {
-        "sources": ["cake_moe_finalize_kernels.cu"],
+        "sources": ["cake_trtllm_moe_finalize_bfloat16_ws4_o111_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_trtllm_moe_finalize_bfloat16_ws4_o111_small": {
+        "sources": ["cake_trtllm_moe_finalize_bfloat16_ws4_o111_small_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_small",
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_trtllm_moe_finalize_bfloat16_ws8_o110": {
-        "sources": ["cake_moe_finalize_kernels.cu"],
+        "sources": ["cake_trtllm_moe_finalize_bfloat16_ws8_o110_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_trtllm_moe_finalize_bfloat16_ws8_o110_small": {
+        "sources": ["cake_trtllm_moe_finalize_bfloat16_ws8_o110_small_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_small",
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_trtllm_moe_finalize_bfloat16_ws8_o111": {
-        "sources": ["cake_moe_finalize_kernels.cu"],
+        "sources": ["cake_trtllm_moe_finalize_bfloat16_ws8_o111_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_trtllm_moe_finalize_bfloat16_ws8_o111_small": {
+        "sources": ["cake_trtllm_moe_finalize_bfloat16_ws8_o111_small_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_small",
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_trtllm_moe_finalize_float16_ws2_o110": {
-        "sources": ["cake_moe_finalize_kernels.cu"],
+        "sources": ["cake_trtllm_moe_finalize_float16_ws2_o110_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws2_o110",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_trtllm_moe_finalize_float16_ws2_o110_small": {
+        "sources": ["cake_trtllm_moe_finalize_float16_ws2_o110_small_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws2_o110_small",
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_trtllm_moe_finalize_float16_ws2_o111": {
-        "sources": ["cake_moe_finalize_kernels.cu"],
+        "sources": ["cake_trtllm_moe_finalize_float16_ws2_o111_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws2_o111",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_trtllm_moe_finalize_float16_ws2_o111_small": {
+        "sources": ["cake_trtllm_moe_finalize_float16_ws2_o111_small_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws2_o111_small",
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_trtllm_moe_finalize_float16_ws4_o110": {
-        "sources": ["cake_moe_finalize_kernels.cu"],
+        "sources": ["cake_trtllm_moe_finalize_float16_ws4_o110_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws4_o110",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_trtllm_moe_finalize_float16_ws4_o110_small": {
+        "sources": ["cake_trtllm_moe_finalize_float16_ws4_o110_small_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws4_o110_small",
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_trtllm_moe_finalize_float16_ws4_o111": {
-        "sources": ["cake_moe_finalize_kernels.cu"],
+        "sources": ["cake_trtllm_moe_finalize_float16_ws4_o111_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws4_o111",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_trtllm_moe_finalize_float16_ws4_o111_small": {
+        "sources": ["cake_trtllm_moe_finalize_float16_ws4_o111_small_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small",
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_trtllm_moe_finalize_float16_ws8_o110": {
-        "sources": ["cake_moe_finalize_kernels.cu"],
+        "sources": ["cake_trtllm_moe_finalize_float16_ws8_o110_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws8_o110",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_trtllm_moe_finalize_float16_ws8_o110_small": {
+        "sources": ["cake_trtllm_moe_finalize_float16_ws8_o110_small_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws8_o110_small",
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_trtllm_moe_finalize_float16_ws8_o111": {
-        "sources": ["cake_moe_finalize_kernels.cu"],
+        "sources": ["cake_trtllm_moe_finalize_float16_ws8_o111_kernel.cu"],
         "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws8_o111",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_moe_finalize_float16_ws8_o111_small": {
+        "sources": ["cake_trtllm_moe_finalize_float16_ws8_o111_small_kernel.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws8_o111_small",
         "arches": ["sm_100a", "sm_103a"],
     },
 }
