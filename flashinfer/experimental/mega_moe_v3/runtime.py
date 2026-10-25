@@ -4,7 +4,7 @@ import json
 from collections.abc import Mapping
 from pathlib import Path
 
-from ..deepgemm_common import load_catalog
+from ..deepgemm_common import UnsupportedDevice, load_catalog
 from .preparation import (
     build_tile_lists,
     pipeline_route_args,
@@ -27,8 +27,11 @@ def device_arch(device):
 
 
 def supported_num_sms(arch):
-    """SM counts with catalogued routes for ``arch``."""
-    return list(catalog().supported_num_sms(arch))
+    """SM counts with catalogued routes for ``arch`` (every count a route admits)."""
+    counts = set()
+    for route in catalog().routes(arch).values():
+        counts.update(route_admitted_num_sms(route, arch))
+    return sorted(counts)
 
 
 def stage_program(stage, arch):
@@ -114,26 +117,57 @@ def _per_arch(value, arch):
     return value[arch] if isinstance(value, Mapping) else value
 
 
-def route_num_sms(route, arch):
-    """The SM count ``route`` was generated for on ``arch``."""
-    return int(_per_arch(route["num_sms"], arch))
+def route_admitted_num_sms(route, arch):
+    """The physical SM counts ``route`` runs on for ``arch``.
+
+    A route names one count (``n``, or ``{arch: n}`` when it ships for several
+    architectures) or, for a program that takes the count from its compile
+    line, the list of counts it admits (``[n, ...]``).
+    """
+    admitted = _per_arch(route["num_sms"], arch)
+    if isinstance(admitted, (list, tuple)):
+        return tuple(int(n) for n in admitted)
+    return (int(admitted),)
 
 
-def route_grid(route, arch):
-    """The launch grid of ``route`` on ``arch``."""
-    return tuple(_per_arch(route["grid"], arch))
+def route_grid(route, arch, num_sms):
+    """The launch grid of ``route`` on ``arch`` at ``num_sms`` SMs.
+
+    A route states its grid (``[x, y, z]``, or ``{arch: [x, y, z]}``); a route
+    that admits several SM counts omits it and runs the persistent grid of one
+    CTA per SM.
+    """
+    grid = _per_arch(route.get("grid"), arch)
+    if grid is None:
+        return (int(num_sms), 1, 1)
+    return tuple(int(v) for v in grid)
+
+
+def _device_num_sms(device):
+    import torch
+
+    return int(
+        torch.cuda.get_device_properties(torch.device(device)).multi_processor_count
+    )
 
 
 def _route_arch(route, device):
-    """Architecture of ``device``; it must carry the SM count ``route`` was generated for."""
+    """``(arch, num_sms)`` of ``device``: its architecture and physical SM count,
+    which ``route`` must admit."""
     arch = device_arch(device)
-    sms = catalog().device_num_sms(device, arch)
-    if sms != route_num_sms(route, arch):
+    sms = _device_num_sms(device)
+    if sms not in supported_num_sms(arch):
+        raise UnsupportedDevice(
+            f"{LABEL}: the exported {arch} programs are specialized for "
+            f"{supported_num_sms(arch)} physical SMs; {device} has {sms}"
+        )
+    admitted = route_admitted_num_sms(route, arch)
+    if sms not in admitted:
         raise RuntimeError(
             f"The exported {arch} {route['metadata']['surface']} schedule was generated "
-            f"for {route_num_sms(route, arch)} physical SMs; this device has {sms}"
+            f"for {list(admitted)} physical SMs; this device has {sms}"
         )
-    return arch
+    return arch, sms
 
 
 class _Stage:
@@ -212,8 +246,7 @@ class V3Plan:
             for v in b.values()
             if isinstance(v, torch.Tensor)
         )
-        self.arch = _route_arch(route, t.device)
-        self.num_sms = route_num_sms(route, self.arch)
+        self.arch, self.num_sms = _route_arch(route, t.device)
         self.route, self.outputs = route, outputs
         self.reset_storage, self.reset_buffers = reset_storage, tuple(reset_buffers)
         # Declared per architecture by the exported catalog route; absent means
@@ -311,7 +344,8 @@ def bind_prepared(
     arch = device_arch(t.device)
     route = _route(arch, surface, args)
     main = stage_bindings[route["stages"][-1]["name"]]
-    if tuple(main["grid"]) != route_grid(route, arch):
+    _, num_sms = _route_arch(route, t.device)
+    if tuple(main["grid"]) != route_grid(route, arch, num_sms):
         raise ValueError("No exported scheduling specialization for this prepared grid")
     return V3Plan(
         route,
@@ -348,11 +382,10 @@ def prepare_pipeline(inputs):
         else f" (logical intermediate {logical} pads to {args['intermediate']})"
     )
     route = _route(arch, "pipeline", args, note=note)
-    # The persistent grid derives from the SM count the route was generated
-    # for; the route's metadata names the program's source-schedule form.
-    data = prepare_pipeline_bindings(
-        inputs, route_num_sms(route, arch), route_metadata=route["metadata"]
-    )
+    # The persistent grid derives from the device's SM count, which the route
+    # must admit; the route's metadata names the program's source-schedule form.
+    _, num_sms = _route_arch(route, inputs["x_fp8_packed"].device)
+    data = prepare_pipeline_bindings(inputs, num_sms, route_metadata=route["metadata"])
     return bind_prepared(
         "pipeline",
         args,
@@ -387,9 +420,10 @@ def prepare_grouped_l2(
     )
     arch = device_arch(A.device)
     route = _route(arch, "grouped_l2", args)
+    _, num_sms = _route_arch(route, A.device)
     tiles = te.numel()
     main = dict(
-        grid=route_grid(route, arch),
+        grid=route_grid(route, arch, num_sms),
         A=A.view(torch.uint8),
         B=B.view(torch.uint8),
         SFA=packed_a,

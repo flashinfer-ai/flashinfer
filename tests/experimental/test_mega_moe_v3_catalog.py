@@ -30,12 +30,14 @@ def test_every_route_resolves_its_programs_grid_and_sm_count(arch):
     for key, route in catalog.routes(arch).items():
         surface, args = json.loads(key)
         assert route["metadata"]["surface"] == surface
-        num_sms = catalog.route_num_sms(arch, key, route)
-        grid = route["grid"][arch]
-        assert len(grid) == 3
-        if surface != "grouped_l1":
-            # Persistent schedules fill the device: one CTA per physical SM.
-            assert grid == [num_sms, 1, 1]
+        admitted = runtime.route_admitted_num_sms(route, arch)
+        assert admitted and set(admitted) <= set(runtime.supported_num_sms(arch))
+        for num_sms in admitted:
+            grid = runtime.route_grid(route, arch, num_sms)
+            assert len(grid) == 3
+            if surface != "grouped_l1":
+                # Persistent schedules fill the device: one CTA per physical SM.
+                assert grid == (num_sms, 1, 1), (key, arch, num_sms)
         for stage in route["stages"]:
             name = runtime.stage_program(stage, arch)
             assert name in programs, (key, stage["name"], arch)
@@ -75,10 +77,13 @@ def test_programs_sources_symbols_and_compile_line_definitions():
                 and "#define NUM_CTAS" not in kernel_text
             )
         elif pipeline:
-            # A per-architecture pipeline schedule keeps its own SM count.
+            # A per-architecture pipeline schedule keeps its own SM count, one
+            # of the counts the architecture's routes run on.
             (arch,) = record["arches"]
-            (num_sms,) = catalog.supported_num_sms(arch)
-            assert f"#define NUM_CTAS {num_sms}\n" in kernel_text, name
+            assert any(
+                f"#define NUM_CTAS {num_sms}\n" in kernel_text
+                for num_sms in runtime.supported_num_sms(arch)
+            ), name
         else:
             assert "NUM_CTAS" not in kernel_text, name
         assert (
@@ -100,16 +105,16 @@ def test_load_program_supplies_the_route_sm_count_as_num_ctas():
     pytest.importorskip("torch")
     catalog = _catalog()
     for arch in catalog.arches:
-        (num_sms,) = catalog.supported_num_sms(arch)
-        for name, record in catalog.programs(arch).items():
-            spec = catalog.jit_spec(
-                arch, name, catalog.definitions(arch, name, {"NUM_CTAS": num_sms})
-            )
-            flags = spec.extra_cuda_cflags
-            if record.get("definitions"):
-                assert f"-DNUM_CTAS={num_sms}" in flags
-                assert spec.name == f"{name}_{arch}_num_ctas{num_sms}"
-            else:
-                assert not any(f.startswith("-DNUM_CTAS") for f in flags)
-            for flag in catalog.compile_flags(record, arch):
-                assert flag in flags
+        for num_sms in runtime.supported_num_sms(arch):
+            for name, record in catalog.programs(arch).items():
+                spec = catalog.jit_spec(
+                    arch, name, catalog.definitions(arch, name, {"NUM_CTAS": num_sms})
+                )
+                flags = spec.extra_cuda_cflags
+                if record.get("definitions"):
+                    assert f"-DNUM_CTAS={num_sms}" in flags
+                    assert spec.name == f"{name}_{arch}_num_ctas{num_sms}"
+                else:
+                    assert not any(f.startswith("-DNUM_CTAS") for f in flags)
+                for flag in catalog.compile_flags(record, arch):
+                    assert flag in flags
