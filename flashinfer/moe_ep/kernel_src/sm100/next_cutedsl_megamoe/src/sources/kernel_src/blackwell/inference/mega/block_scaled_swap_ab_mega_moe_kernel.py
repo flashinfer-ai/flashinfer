@@ -790,7 +790,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
 
         peer_rank_ptr_mapper = peer_rank_ptr_mapper_host.make_device_object()
         self._device_workspace.assign_device_members(local_workspace, shared_workspace)
-        if cutlass.const_expr(not self.reduce_topk_in_kernel and (self.skip_topk_reduce or self.combine_format.is_quantized)):
+        # Only external partial-output consumers need invalid rows cleared.
+        if cutlass.const_expr(not self.reduce_topk_in_kernel and self.skip_topk_reduce):
             self._route_reset(
                 topk_indices,
                 self.token_comm.pre_reduced_activation_tensor(self._device_workspace),

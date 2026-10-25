@@ -405,12 +405,13 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
         if self.supports_unfinalized_output:
             raise ValueError("finalize_mode=NONE requires compute_unfinalized()")
         if not workspace.config.use_custom_finalize:
-            return sm100_block_scaled_mega_moe(
+            view = sm100_block_scaled_mega_moe(
                 output,
                 *transformed_weights,
                 workspace,
                 fast_math=self._config.fast_math,
             )
+            return output if output is not None else view
         from flashinfer.jit.cake_megamoe_topk_reduce import (
             get_cake_megamoe_topk_reduce_module,
         )

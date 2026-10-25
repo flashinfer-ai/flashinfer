@@ -511,6 +511,28 @@ def test_blackwell_standard_backend_is_opt_in(kind, monkeypatch):
     assert hash(backend._workspace_pool_key(fleet))
 
 
+@pytest.mark.parametrize("supplied_output", [False, True])
+def test_standard_compute_returns_output(supplied_output, monkeypatch):
+    from types import SimpleNamespace
+    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+
+    backend, _, _ = _mxfp8_backend(kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl_next")
+    output = torch.empty(2, 128) if supplied_output else None
+    view = torch.full((2, 128), 3.0)
+
+    def launch(y, *args, **kwargs):
+        if y is None:
+            return view
+        y.copy_(view)
+        return None
+
+    monkeypatch.setattr(pkg, "sm100_block_scaled_mega_moe", launch)
+    workspace = SimpleNamespace(config=SimpleNamespace(use_custom_finalize=False))
+    result = backend.compute(workspace, (None, None), output=output)
+    assert result is (output if supplied_output else view)
+    torch.testing.assert_close(result, view)
+
+
 @pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
 @pytest.mark.parametrize("topk", [256, 257])
 def test_blackwell_standard_routing_bounds(kind, topk, monkeypatch):

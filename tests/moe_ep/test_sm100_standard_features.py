@@ -151,6 +151,15 @@ def test_standard_features(kind, activation, mode, early, wire, in_kernel, monke
     try:
         layer.warmup(current)
         ws = layer._ensure_workspace()
+        if mode != "NONE":
+            owned = layer.forward(current)
+            assert isinstance(owned, torch.Tensor)
+            check(owned, capacity)
+            current.output = torch.empty_like(owned)
+            supplied = layer.forward(current)
+            assert supplied is current.output
+            check(supplied, capacity)
+            current.output = None
         check(forward(current), capacity)
         graph = torch.cuda.CUDAGraph()
         stream = torch.cuda.Stream()

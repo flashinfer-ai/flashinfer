@@ -8,7 +8,7 @@ registering a global `sources` package or loading Rubin kernels.
 ## Source
 
 - Provider base: `228a02d`.
-- Source revision: `02b7b7ebbe0a518aac45a3f24f485a9f59404d33`.
+- Source revision: `24c773e2b13f68a7c490a7950722cdef04f1c636`.
 - Exporter revision: `f2d13b3cb8277398ff281fc80ae5f725cf1b2f10`.
 - Exporter SHA-256: `0e578237d416970d099750606a2489c0bfe2c0fd39bc86fa7c83bc7343d87814`.
 - Entry points: `BlackwellInferenceMegaMoE` and `BlackwellInferenceGenphaseMegaMoE`.
@@ -24,7 +24,8 @@ The exporter registers both entry points and generates lazy imports. The
 counted CTA barrier helper is retained for GenPhase.
 
 The shared reducer masks invalid routes in BF16 and quantized combine, in
-both static and persistent execution. Deferred and quantized combine reset unwritten slots before reuse.
+both static and persistent execution. Deferred output clears invalid slots
+for external consumers; quantized combine relies on the reducer mask.
 The standard router checks the packed rank and top-k bounds, and NVFP4 calls
 require all three global scales. FC1 scale views match AOT padding. Grid-stride
 scheduling requires one compute cluster per launched cluster.
