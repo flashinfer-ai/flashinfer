@@ -78,9 +78,6 @@ _EXACTMETA_HOST_TEMPLATE = (
 _CHUNKPAR3_HOST_TEMPLATE = (
     Path("generated") / "host" / "mamba_ssd_combined_chunk_parallel3_sequence.cpp"
 )
-# Module identities the Cake export has not filled yet carry this token; such
-# a program refuses to build (``_require_exported``).
-_PENDING_EXPORT = "PENDINGEXPORT"
 
 
 @dataclass(frozen=True)
@@ -342,7 +339,7 @@ _STATE_DTYPE_KEYS = {
     torch.float32: "f32",
 }
 # Dynamic shared memory (bytes) of each family's main kernel; refreshed by the
-# Cake export.  0 is the unfilled placeholder: the program refuses to build.
+# Cake export.
 _EXACTFUSED_SMEM_BYTES = 232320
 _CHUNKPAR_SMEM_BYTES = 231808
 _CHUNKPAR3_SMEM_BYTES = 232448
@@ -360,8 +357,7 @@ _EXACTONE_NORING_SMEM_BYTES = 232192
 _EXACT_SMEM_BYTES = 231808
 _EXACT_NORING_SMEM_BYTES = 232448
 # Main dynamic SMEM of the two-kernel exact-scan programs (``exactpre_*``);
-# refreshed by the Cake export with the ``exactpre_*`` table entries (0 = not
-# exported yet).
+# refreshed by the Cake export with the ``exactpre_*`` table entries.
 _EXACTPRE_SMEM_BYTES = 232320
 # Main dynamic SMEM of the tail-wave pair programs (``exactpre_*_tail``: the
 # two-kernel ring programs launched as 2-CTA clusters, with the hand-off
@@ -730,21 +726,6 @@ def _arch_program(name: str, arch: str) -> _Program:
     if module == program.main.module:
         return program
     return replace(program, main=_scan(module))
-
-
-def _require_exported(name: str, program: _Program, arch: str = "") -> None:
-    """Refuse a program whose table entries the Cake export has not filled;
-    ``arch`` names the architecture whose main module was looked up."""
-
-    if _PENDING_EXPORT in program.main.module or program.main_smem_bytes <= 0:
-        target = f" for {arch}" if arch else ""
-        raise RuntimeError(
-            f"Cake SSDCombined program {name}{target} is not exported yet (main module "
-            f"{program.main.module!r}, main dynamic shared memory "
-            f"{program.main_smem_bytes} bytes): run the Cake export "
-            "(tools/export_cake_mamba_ssd_combined.py with the chunk-parallel "
-            "programs) and fill this loader's program table from its summary"
-        )
 
 
 def _direct_preprocess_inputs(
@@ -1970,7 +1951,6 @@ def _load_generated_program(name: str, arch: str):
     """Build one program for ``arch``; the loaded module serves every device."""
 
     program = _arch_program(name, arch)
-    _require_exported(name, program, arch)
     source_dir = _source_dir()
     host_source = _render_host_source(
         (source_dir / program.host_template).read_text(encoding="utf-8"),
