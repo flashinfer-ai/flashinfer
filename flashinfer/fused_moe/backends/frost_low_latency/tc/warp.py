@@ -26,7 +26,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""Grouped BF16/FP16 SM120 projection, adapted from CUTLASS dense_gemm.py.
+"""Grouped BF16/FP16/per-tensor FP8 SM120 projection, adapted from CUTLASS dense_gemm.py.
 
 One CTA discovers up to eight live routes to one expert. Weight-only TMA
 feeds warp MMA while the producer warp gathers the small activation vectors.
@@ -43,6 +43,8 @@ import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from .route_members import route_members
 from ..fma.activations import apply_activation
+from ..quantization import _mul
+from .....cute_dsl.fp4_common import cvt_f32_to_e4m3
 
 
 class WarpGroupedProjection:
@@ -88,9 +90,14 @@ class WarpGroupedProjection:
             raise ValueError("CTA tile shape M must be 64/128")
         if self.tile_shape_mnk[1] not in [8, 16, 32, 64, 128, 256]:
             raise ValueError("CTA tile shape N must be 64/128/256")
-        op = cute.nvgpu.warp.MmaF16BF16Op(self.a_dtype, self.acc_dtype, (16, 8, 16))
+        if self.a_dtype == cutlass.Float8E4M3FN:
+            op = cute.nvgpu.warp.MmaFP8Op(self.a_dtype, self.acc_dtype, (16, 8, 32))
+            mma_k = 32
+        else:
+            op = cute.nvgpu.warp.MmaF16BF16Op(self.a_dtype, self.acc_dtype, (16, 8, 16))
+            mma_k = 16
         self.tiled_mma = cute.make_tiled_mma(
-            op, cute.make_layout((4, 1, 1)), permutation_mnk=(64, 8, 16)
+            op, cute.make_layout((4, 1, 1)), permutation_mnk=(64, 8, mma_k)
         )
         self.tile_shape_mnk = (
             self.tile_shape_mnk[0],
@@ -129,6 +136,8 @@ class WarpGroupedProjection:
         ids: cute.Tensor,
         output: cute.Tensor,
         stream: cuda.CUstream,
+        dequant=None,
+        mid_quant=None,
     ):
         a = cute.make_tensor(
             weights.iterator,
@@ -207,6 +216,8 @@ class WarpGroupedProjection:
             b,
             output,
             route_ids,
+            dequant,
+            mid_quant,
             tma_atom_a,
             tma_tensor_a,
             self.tiled_mma,
@@ -223,6 +234,8 @@ class WarpGroupedProjection:
         raw_b: cute.Tensor,
         output: cute.Tensor,
         route_ids: cute.Tensor,
+        dequant,
+        mid_quant,
         tma_atom_a: cute.CopyAtom,
         mA_mkl: cute.Tensor,
         tiled_mma: cute.TiledMma,
@@ -440,6 +453,9 @@ class WarpGroupedProjection:
                         mainloop_pipeline.producer_commit(mainloop_producer_state)
                         mainloop_producer_state.advance()
                 accumulators.fill(0.0)
+                if cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN):
+                    total = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
+                    total.fill(0.0)
                 consumer = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Consumer, self.ab_stage
                 )
@@ -462,6 +478,17 @@ class WarpGroupedProjection:
                             tCrB[None, None, kb],
                             accumulators,
                         )
+                        if cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN):
+                            # Promote at most K64 per native FP8 partial sum,
+                            # independent of the TMA tile's K64/K128 depth.
+                            if (kb + 1) % 2 == 0 or kb + 1 == cute.size(tCrA, mode=[2]):
+                                for element in cutlass.range_constexpr(
+                                    cute.size(accumulators)
+                                ):
+                                    total[element] = (
+                                        total[element] + accumulators[element]
+                                    )
+                                accumulators.fill(0.0)
                     cute.arch.sync_threads()
                     mainloop_pipeline.consumer_release(consumer)
                     consumer.advance()
@@ -526,35 +553,59 @@ class WarpGroupedProjection:
                     cute.arch.sync_threads()
                 thread_c = tiled_mma.get_slice(tidx).partition_C(sC[None, None, 0])
                 for element in cutlass.range_constexpr(cute.size(accumulators)):
-                    thread_c[element] = accumulators[element]
+                    if cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN):
+                        thread_c[element] = total[element]
+                    else:
+                        thread_c[element] = accumulators[element]
                 cute.arch.sync_threads()
                 lane = cute.arch.lane_idx()
                 for member in cutlass.range_constexpr(self.group_size):
                     if cutlass.const_expr(self.split_gate):
                         if warp_idx == member % 4 and members[member] >= 0:
-                            up = sC[lane, member, 0]
-                            gate = sC[lane + 32, member, 0]
-                            output[members[member], pid_m * 32 + lane] = (
-                                apply_activation(
-                                    up, gate, self.activation, False, self.parameters
-                                ).to(output.element_type)
+                            value = self.epilogue(
+                                sC[lane, member, 0],
+                                sC[lane + 32, member, 0],
+                                dequant,
+                                mid_quant,
+                                expert,
+                            )
+                            output[members[member], pid_m * 32 + lane] = value.to(
+                                output.element_type
                             )
                     else:
                         if warp_idx // 2 == member % 2 and members[member] >= 0:
                             row = (warp_idx % 2) * 32 + lane
-                            value = sC[row, member, 0]
-                            if cutlass.const_expr(self.fc1):
-                                value = apply_activation(
-                                    value,
-                                    cutlass.Float32(0),
-                                    self.activation,
-                                    False,
-                                    self.parameters,
-                                )
+                            value = self.epilogue(
+                                sC[row, member, 0],
+                                cutlass.Float32(0),
+                                dequant,
+                                mid_quant,
+                                expert,
+                            )
                             output[members[member], pid_m * 64 + row] = value.to(
                                 output.element_type
                             )
         return
+
+    @cute.jit
+    def epilogue(self, value, gate, dequant, mid_quant, expert):
+        if cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN):
+            value = _mul(value, dequant[expert])
+            if cutlass.const_expr(self.fc1):
+                gate = _mul(gate, dequant[expert])
+                value = value.to(cutlass.BFloat16).to(cutlass.Float32)
+                gate = gate.to(cutlass.BFloat16).to(cutlass.Float32)
+        if cutlass.const_expr(self.fc1):
+            value = apply_activation(
+                value, gate, self.activation, False, self.parameters
+            )
+            if cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN):
+                value = (
+                    cvt_f32_to_e4m3(_mul(value, mid_quant[0]))
+                    .to(cutlass.Uint8)
+                    .bitcast(cutlass.Float8E4M3FN)
+                )
+        return value
 
     @staticmethod
     def _make_smem_layouts(

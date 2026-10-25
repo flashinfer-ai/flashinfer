@@ -29,14 +29,20 @@ from flashinfer.fused_moe import (
     QuantFormat,
     RoutingConfig,
     SwiGLU,
+    ReLU2,
+    SiTU,
 )
 from flashinfer.fused_moe.backends.frost_low_latency.runner import FrostLowLatencyRunner
+from tests.moe.test_frost_low_latency_bf16 import _activation
 from flashinfer.fused_moe.core import cutlass_fused_moe, get_cutlass_fused_moe_module
 from flashinfer.testing import bench_gpu_time_with_cupti
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--activation", choices=("swiglu", "relu2", "situ"), default="swiglu"
+    )
     parser.add_argument("--route-seed", type=int, default=None)
     parser.add_argument("--tokens", type=int, default=1, choices=(1, 2, 4, 8))
     parser.add_argument("--hidden", type=int, default=2048)
@@ -80,8 +86,11 @@ def main():
         and args.validation_repeats > 0
     )
     torch.manual_seed(20261024)
+    activation = {"swiglu": SwiGLU, "relu2": ReLU2, "situ": SiTU}[args.activation]()
     x = torch.randn(t, h, device="cuda", dtype=torch.bfloat16)
-    w1 = (torch.randn(e, 2 * i, h, device="cuda") / h**0.5).bfloat16()
+    w1 = (
+        torch.randn(e, (2 if activation.is_gated else 1) * i, h, device="cuda") / h**0.5
+    ).bfloat16()
     w2 = (torch.randn(e, h, i, device="cuda") / i**0.5).bfloat16()
     ids = torch.arange(t * k, device="cuda", dtype=torch.int32).view(t, k)
     if args.expert_reuse == "shared":
@@ -102,6 +111,7 @@ def main():
         RoutingConfig(e, k),
         quant,
         ExpertConfig(i),
+        activation=activation,
         backend=BackendOptions((FrostLowLatencyConfig(max_num_tokens=8),)),
     )
     weights = MoEWeightPack()
@@ -117,6 +127,7 @@ def main():
             num_local_experts=min(32, e - begin),
             hidden_size=h,
             intermediate_size=i,
+            activation=activation,
         )
         for begin in range(0, e, 32)
     ]
@@ -149,12 +160,13 @@ def main():
     inputs = frost.pack_inputs(MoEActivationPack(x, None, ids, scores), weights)
     native_out = torch.empty_like(x, dtype=torch.bfloat16)
     result = {
+        "activation": repr(activation),
         "workload": vars(args) | {"output": str(args.output)},
         "gpu": torch.cuda.get_device_name(),
         "cc": torch.cuda.get_device_capability(),
         "scope": "Per-tensor FP8 routed-expert GPU pipeline with precomputed routing, including required adapters, activation and combine; excludes host enqueue, weight preparation, routing selection, shared experts, communication and serving",
         "timer": args.timer,
-        "numerical_contract": "Static E4M3 input/intermediate multipliers 32/128; identical quantized weights; BF16 FC1 preactivation before SwiGLU, E4M3 intermediate, BF16 expert/final outputs, BF16-rounded routing scores, ordered FP32 combine. TRTLLM has a different FC1 rounding boundary and is not measured by this harness.",
+        "numerical_contract": "Static E4M3 input/intermediate multipliers 32/128; identical quantized weights; BF16 FC1 preactivation before the configured activation, E4M3 intermediate, BF16 expert/final outputs, BF16-rounded routing scores, ordered FP32 combine. TRTLLM has a different FC1 rounding boundary and is not measured by this harness.",
         "timing_scope": (
             "First-to-last CUPTI activity span from a single-call graph replay"
             if args.timer == "cupti"
@@ -211,9 +223,13 @@ def main():
                     .bfloat16()
                     .float()
                 )
-                up, gate = values.chunk(2)
+                up, gate = (
+                    values.chunk(2)
+                    if activation.is_gated
+                    else (values, torch.zeros_like(values))
+                )
                 mid = (
-                    (up * torch.nn.functional.silu(gate) * view["fc2_act_quant_scale"])
+                    (_activation(up, gate, activation) * view["fc2_act_quant_scale"])
                     .clamp(-448, 448)
                     .to(torch.float8_e4m3fn)
                 )
@@ -328,7 +344,7 @@ def main():
         use_mxfp8_act_scaling=False,
         min_latency_mode=False,
         enable_pdl=True,
-        activation_type=SwiGLU().type,
+        activation_type=activation.type,
         use_packed_weights=False,
         use_fused_finalize=True,
         use_wfp4afp8_humming=False,
@@ -352,6 +368,7 @@ def main():
             profile_ids=list(tactic),
             tune_max_num_tokens=t,
             enable_pdl=True,
+            activation_type=activation.type,
         )
         return native_out
 

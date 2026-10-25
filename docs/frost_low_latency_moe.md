@@ -1666,29 +1666,48 @@ submission, router-network evaluation, shared experts, communication and model
 throughput are outside its scope. Keep each ratio within one paired checkpoint,
 shape, dtype, activation, routing and cache cohort.
 
-## Grouped per-tensor FP8 on Hopper
+## Grouped per-tensor FP8 on SM90 and SM120
 
-SM90 additionally offers a grouped E4M3 WGMMA candidate for default SwiGLU,
-H2048/I512/top-k10, finalized BF16 output and T4/T8. Both weights and inputs
-use the existing per-tensor FP8 contract. The candidate uses group2/stages4/K128;
-all sixteen FMA choices and the untuned default remain. Other shapes, activations,
+SM90 additionally offers a grouped E4M3 WGMMA candidate for default SwiGLU/SiTU
+at T4/T8 and ReLU2 at T8, H2048/I512/top-k10 and finalized BF16 output. Both weights and inputs
+use the existing per-tensor FP8 contract. SM90 uses group2/stages4/K128.
+SM120 offers native E4M3 warp MMA for default SwiGLU/SiTU/ReLU2 at T4/T8
+on that same shape, with group2 or group4, two stages and K128.
+All sixteen FMA choices and the untuned default remain. Other shapes, activations,
 T1/T2 and raw output retain existing choices. Representative routing and cache
 state must be profiled; shared-expert reuse does not establish a disjoint-route win.
 
-The shared Hopper projection keeps the original checkpoint layout and reads live
-per-expert dequantization and static intermediate quantization scales. Each FP8
-K-tile partial is completed and promoted through separate FP32 additions before
+The shared architecture-specific projections keep the original checkpoint layout and read live
+per-expert dequantization and static intermediate quantization scales. FP8 partials
+spanning at most K64 are completed and promoted through separate FP32 additions,
+independently of the TMA staging tile width, before
 the existing BF16 preactivation boundary, activation and E4M3 intermediate
-quantization. This avoids the numerical drift of a long WGMMA accumulation;
+quantization. This bounds the numerical drift of long native FP8 accumulation;
 FP16/BF16 retain their existing accumulation schedule. Expert partials are BF16
 and the shared finalizer preserves ordered FP32 multiplication/addition and
 skips invalid expert IDs before loading padding scores.
 
 Use the existing `benchmarks/bench_frost_low_latency_fp8.py` with `--tokens 4`
-or `8`, both `--cache-mode warm` and `cold`, and shared/disjoint expert reuse.
+or `8`, `--activation swiglu|relu2|situ`, both `--cache-mode warm` and `cold`,
+and shared/disjoint expert reuse. T4 ReLU2 remains FMA-only on SM90.
 Optional `--route-seed` shuffles expert addresses and slot order while preserving
 the reuse pattern and checkpoint; the default retains the original routing.
 The benchmark checks independent numerical references, tunes and freezes tactics
 before ABBA validation, and times the complete routed-expert CUDA Graph interval.
 It excludes host enqueue, preparation, router-network evaluation, shared experts
 and communication, and does not establish serving throughput.
+
+### Standalone vLLM device baseline routing
+
+The grouped Tensor Core reproducer's `--baseline vllm_device_triton` searches
+naive and expert-grouped route policies by default. The GEMM device functions
+remain unchanged at their pinned upstream commit. The standalone grouped wrapper
+uses FlashInfer GPU sorting and a padding adapter, both included in the timed
+call, alongside its existing activation/combine wrappers. It is not a stock
+vLLM or serving comparison. The two policies share the same checkpoint and
+native rounding reference. Use `--vllm-route-policy naive` to reproduce the
+earlier low-token policy, or `grouped` to isolate the grouped policy.
+
+Baseline routing can change the winner when several tokens select the same
+experts. A win over the naive policy or one native backend does not establish
+a win over the best expert-grouped implementation.

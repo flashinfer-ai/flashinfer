@@ -487,14 +487,26 @@ class HopperGroupedProjection:
                             accumulators,
                         )
                         tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
-                    cute.nvgpu.warpgroup.commit_group()
-                    if cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN):
-                        # Promote each completed FP8 K tile with FP32 arithmetic.
-                        # Long WGMMA accumulation changes preactivation rounding
-                        # enough to violate the existing FP8 numerical contract.
-                        cute.nvgpu.warpgroup.wait_group(0)
-                        for element in cutlass.range_constexpr(cute.size(accumulators)):
-                            total[element] = total[element] + accumulators[element]
+                        if cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN):
+                            # Native FP8 WGMMA K=32. Promote at most two instructions
+                            # at a time independently of the TMA staging tile width.
+                            if (
+                                k_block_idx + 1
+                            ) % 2 == 0 or k_block_idx + 1 == num_k_blocks:
+                                cute.nvgpu.warpgroup.commit_group()
+                                cute.nvgpu.warpgroup.wait_group(0)
+                                for element in cutlass.range_constexpr(
+                                    cute.size(accumulators)
+                                ):
+                                    total[element] = (
+                                        total[element] + accumulators[element]
+                                    )
+                                tiled_mma.set(
+                                    cute.nvgpu.warpgroup.Field.ACCUMULATE, False
+                                )
+                                cute.nvgpu.warpgroup.fence()
+                    if cutlass.const_expr(self.a_dtype != cutlass.Float8E4M3FN):
+                        cute.nvgpu.warpgroup.commit_group()
                     mainloop_consumer_read_state.advance()
                     peek_ab_full_status = cutlass.Boolean(1)
                     if mainloop_consumer_read_state.count < k_tile_cnt:
@@ -526,14 +538,25 @@ class HopperGroupedProjection:
                         )
                         if cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN):
                             tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
-                    cute.nvgpu.warpgroup.commit_group()
-                    if cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN):
-                        # Promote each completed FP8 K tile with FP32 arithmetic.
-                        # Long WGMMA accumulation changes preactivation rounding
-                        # enough to violate the existing FP8 numerical contract.
-                        cute.nvgpu.warpgroup.wait_group(0)
-                        for element in cutlass.range_constexpr(cute.size(accumulators)):
-                            total[element] = total[element] + accumulators[element]
+                            # Native FP8 WGMMA K=32. Promote at most two instructions
+                            # at a time independently of the TMA staging tile width.
+                            if (
+                                k_block_idx + 1
+                            ) % 2 == 0 or k_block_idx + 1 == num_k_blocks:
+                                cute.nvgpu.warpgroup.commit_group()
+                                cute.nvgpu.warpgroup.wait_group(0)
+                                for element in cutlass.range_constexpr(
+                                    cute.size(accumulators)
+                                ):
+                                    total[element] = (
+                                        total[element] + accumulators[element]
+                                    )
+                                tiled_mma.set(
+                                    cute.nvgpu.warpgroup.Field.ACCUMULATE, False
+                                )
+                                cute.nvgpu.warpgroup.fence()
+                    if cutlass.const_expr(self.a_dtype != cutlass.Float8E4M3FN):
+                        cute.nvgpu.warpgroup.commit_group()
                     cute.nvgpu.warpgroup.wait_group(k_pipe_mmas)
                     # WGMMA completion must precede producer reuse of this stage.
                     mainloop_pipeline.consumer_release(mainloop_consumer_release_state)

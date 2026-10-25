@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Grouped Hopper FP8: per-tensor scales, typed boundaries and live graph inputs."""
+"""Grouped SM90/SM120 FP8: per-tensor scales, typed boundaries and live graph inputs."""
 
 from dataclasses import replace
 
@@ -15,6 +15,7 @@ from flashinfer.fused_moe import (
     QuantConfig,
     QuantFormat,
     ReLU2,
+    SiTU,
     SwiGLU,
 )
 from flashinfer.fused_moe.backends.frost_low_latency.runner import FrostLowLatencyRunner
@@ -22,17 +23,17 @@ from tests.moe.test_frost_low_latency import _require_gpu
 from tests.moe.test_frost_low_latency_fp8_per_tensor import _check, _inputs, _reference
 
 
-def _require_hopper():
-    _require_gpu(allow_sm90=True)
-    if torch.cuda.get_device_capability() != (9, 0):
-        pytest.skip("Grouped E4M3 projection requires Hopper SM90")
+def _require_grouped_fp8():
+    _require_gpu(allow_sm90=True, allow_sm120=True)
+    if torch.cuda.get_device_capability() not in ((9, 0), (12, 0)):
+        pytest.skip("Grouped E4M3 projection requires SM90 or SM120")
 
 
 @pytest.mark.parametrize("index", [2, 3])
-@pytest.mark.parametrize("activation", [SwiGLU(), ReLU2()])
+@pytest.mark.parametrize("activation", [SwiGLU(), ReLU2(), SiTU()])
 @pytest.mark.parametrize("tile_k", [64, 128])
 def test_grouped_fp8_changing_graph_inputs_and_scales(index, activation, tile_k):
-    _require_hopper()
+    _require_grouped_fp8()
     from flashinfer.fused_moe.backends.frost_low_latency.tc.runtime import execute
 
     cfg, x, ids, scores, pack, view = _inputs(activation, index)
@@ -40,7 +41,8 @@ def test_grouped_fp8_changing_graph_inputs_and_scales(index, activation, tile_k)
     runner.check_support()
     runner.build()
     inputs = runner.pack_inputs(MoEActivationPack(x, None, ids, scores), pack)
-    tactic = ("wgmma", 2, 4, tile_k)
+    kind = "wgmma" if torch.cuda.get_device_capability() == (9, 0) else "warp_mma"
+    tactic = (kind, 2, 4, tile_k)
     execute(inputs, cfg, tactic)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -69,7 +71,7 @@ def test_grouped_fp8_changing_graph_inputs_and_scales(index, activation, tile_k)
 
 
 def _admitted_inputs(tokens=4, activation=None, hidden=2048, intermediate=512, topk=10):
-    _require_hopper()
+    _require_grouped_fp8()
     from tests.moe.test_frost_low_latency_bf16 import _inputs as dense_inputs
 
     activation = SwiGLU() if activation is None else activation
@@ -105,17 +107,39 @@ def _admitted_inputs(tokens=4, activation=None, hidden=2048, intermediate=512, t
     return cfg, x, ids, scores, pack, view
 
 
-@pytest.mark.parametrize("tokens", [4, 8])
-def test_grouped_fp8_admitted_tactic_and_graph(tokens):
-    cfg, x, ids, scores, pack, view = _admitted_inputs(tokens=tokens)
+@pytest.mark.parametrize(
+    "tokens,activation",
+    [
+        (4, SwiGLU()),
+        (8, SwiGLU()),
+        (4, SiTU()),
+        (8, SiTU()),
+        (4, ReLU2()),
+        (8, ReLU2()),
+    ],
+)
+@pytest.mark.parametrize("candidate", [0, 1])
+def test_grouped_fp8_admitted_tactic_and_graph(tokens, activation, candidate):
+    _require_grouped_fp8()
+    hopper = torch.cuda.get_device_capability() == (9, 0)
+    if hopper and (candidate == 1 or (tokens == 4 and activation == ReLU2())):
+        pytest.skip("Hopper has one FP8 candidate and retains FMA-only T4 ReLU2")
+    cfg, x, ids, scores, pack, view = _admitted_inputs(
+        tokens=tokens, activation=activation
+    )
     runner = FrostLowLatencyRunner(cfg, x.device)
     runner.check_support()
     runner.build()
     inputs = runner.pack_inputs(MoEActivationPack(x, None, ids, scores), pack)
     choices = runner.get_valid_tactics(inputs, None)
     assert len([v for v in choices if v[0] == "ffma"]) == 16
-    assert [v for v in choices if v[0] != "ffma"] == [("wgmma", 2, 4, 128)]
-    tactic = ("wgmma", 2, 4, 128)
+    expected_choices = (
+        [("wgmma", 2, 4, 128)]
+        if hopper
+        else [("warp_mma", group, 2, 128) for group in (2, 4)]
+    )
+    assert [v for v in choices if v[0] != "ffma"] == expected_choices
+    tactic = expected_choices[candidate]
     runner.forward(inputs, tactic)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -149,7 +173,13 @@ def test_grouped_fp8_unmeasured_cases_keep_fma(case):
     elif case == "topk":
         args["topk"] = 8
     elif case == "activation":
-        args["activation"] = ReLU2()
+        _require_grouped_fp8()
+        if torch.cuda.get_device_capability() == (9, 0):
+            args["activation"] = ReLU2()
+        else:
+            from flashinfer.fused_moe import SiLU
+
+            args["activation"] = SiLU()
     elif case == "custom_swiglu":
         args["activation"] = SwiGLU(alpha=1.702)
     cfg, x, ids, scores, pack, _ = _admitted_inputs(**args)

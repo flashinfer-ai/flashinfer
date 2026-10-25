@@ -227,7 +227,7 @@ class FrostLowLatencyRunner(MoERunner):
     def _cache_key_extras(self):
         return super()._cache_key_extras() + (
             # Do not reuse winners selected with the deferred individual-call timer.
-            "fp8-grouped-wgmma-v1"
+            "fp8-grouped-tc-v3"
             if self.config.quant.weight is QuantFormat.FP8PerTensor
             and self.config.quant.activation is QuantFormat.FP8PerTensor
             else "mxint4-load-width-v1"
@@ -324,7 +324,7 @@ class FrostLowLatencyRunner(MoERunner):
                 for second in (1, 2, 4, 8)
             ]
             if (
-                capability == (9, 0)
+                capability in ((9, 0), (12, 0))
                 and self.config.quant.weight is QuantFormat.FP8PerTensor
                 and self.config.quant.activation is QuantFormat.FP8PerTensor
                 and self.config.quant.output is QuantFormat.BF16
@@ -332,11 +332,21 @@ class FrostLowLatencyRunner(MoERunner):
                 and inputs[0].shape[1] == 2048
                 and self.config.experts.intermediate_size == 512
                 and self.config.routing.top_k == 10
-                and self.config.activation == SwiGLU()
+                and (
+                    self.config.activation in (SwiGLU(), SiTU())
+                    or (
+                        self.config.activation == ReLU2()
+                        and (capability == (12, 0) or inputs[0].shape[0] == 8)
+                    )
+                )
                 and self.config.finalize.do_finalize
             ):
-                # Shared routes amortize WGMMA setup; T2/disjoint favor FMA.
-                tactics.append(("wgmma", 2, 4, 128))
+                # Shared routes amortize TC setup. Preserve every FMA choice:
+                # cold/disjoint routes can still favor the scalar path.
+                if capability == (9, 0):
+                    tactics.append(("wgmma", 2, 4, 128))
+                else:
+                    tactics += [("warp_mma", group, 2, 128) for group in (2, 4)]
             if (
                 capability in ((8, 0), (9, 0), (12, 0))
                 and self.config.quant.weight in (QuantFormat.BF16, QuantFormat.FP16)

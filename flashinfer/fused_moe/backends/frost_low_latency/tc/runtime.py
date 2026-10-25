@@ -117,15 +117,25 @@ def launch_fp8(
     stream,
     architecture: cutlass.Constexpr = 90,
 ):
-    if cutlass.const_expr(architecture != 90):
-        raise ValueError("Grouped per-tensor FP8 requires SM90")
     top_k = cute.size(ids, mode=[1])
-    first = HopperGroupedProjection(
-        True, group_size, stages, tile_k, top_k, activation, gated, parameters
-    )
-    second = HopperGroupedProjection(False, group_size, stages, tile_k, top_k)
-    first(w1, x, ids, mid, stream, dq1, aq2)
-    second(w2, mid, ids, routes, stream, dq2, aq2)
+    if cutlass.const_expr(architecture == 90):
+        first_hopper = HopperGroupedProjection(
+            True, group_size, stages, tile_k, top_k, activation, gated, parameters
+        )
+        second_hopper = HopperGroupedProjection(
+            False, group_size, stages, tile_k, top_k
+        )
+        first_hopper(w1, x, ids, mid, stream, dq1, aq2)
+        second_hopper(w2, mid, ids, routes, stream, dq2, aq2)
+    elif cutlass.const_expr(architecture == 120):
+        first_warp = WarpGroupedProjection(
+            True, group_size, stages, tile_k, top_k, activation, gated, parameters
+        )
+        second_warp = WarpGroupedProjection(False, group_size, stages, tile_k, top_k)
+        first_warp(w1, x, ids, mid, stream, dq1, aq2)
+        second_warp(w2, mid, ids, routes, stream, dq2, aq2)
+    else:
+        raise ValueError("Grouped per-tensor FP8 requires SM90 or SM120")
     if cutlass.const_expr(finalize):
         combine_kernel(
             routes, ids, scores, output, cute.size(w1, mode=[0]), narrow
@@ -164,8 +174,8 @@ def execute(inputs, config, tactic):
         )
     x, ids, scores, w1, w2, mid, routes, output, narrow = inputs[:9]
     fp8 = x.dtype == torch.float8_e4m3fn
-    if fp8 and (tactic[0] != "wgmma" or len(inputs) != 12):
-        raise ValueError("Grouped FP8 requires Hopper and per-tensor scales")
+    if fp8 and (tactic[0] not in ("wgmma", "warp_mma") or len(inputs) != 12):
+        raise ValueError("Grouped FP8 requires SM90/SM120 and per-tensor scales")
     architecture = {"wgmma": 90, "warp_mma": 120, "ampere_mma": 80}[tactic[0]]
     expected = (architecture // 10, architecture % 10)
     if get_compute_capability(x.device) != expected:
@@ -186,7 +196,7 @@ def execute(inputs, config, tactic):
     if fp8:
         tensors += tuple(inputs[9:])
     key = (
-        "grouped-tc-ffi-v4",
+        "grouped-tc-ffi-v5",
         architecture,
         tuple((v.dtype, tuple(v.shape), tuple(v.stride()), v.device) for v in tensors),
         config.activation,
