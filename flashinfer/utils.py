@@ -197,9 +197,7 @@ def _check_kv_layout(kv_layout: str) -> None:
         raise KeyError("Invalid kv_layout {}".format(kv_layout))
 
 
-def _check_head_dim(
-    head_dim_qk: int, head_dim_vo: int, backend: str, kv_data_type: torch.dtype
-) -> None:
+def _check_head_dim(head_dim_qk: int, head_dim_vo: int, backend: str) -> None:
     """Validate the FA2 prefill head-dimension safety requirements."""
     if head_dim_qk <= 0 or head_dim_vo <= 0:
         raise ValueError(
@@ -225,21 +223,6 @@ def _check_head_dim(
             "head_dim_vo={}. The FA2 prefill kernels split the output into "
             "tiles of at most 256 dims, which must divide head_dim_vo.".format(
                 head_dim_vo
-            )
-        )
-    # One-byte KV (FP8, packed NVFP4) uses the 128B swizzle unless head_dim_vo
-    # is 64, and its K/V loads step through each row 128 elements at a time.
-    if kv_data_type.itemsize == 1 and not (
-        head_dim_qk == head_dim_vo == 64
-        or (head_dim_qk % 128 == 0 and head_dim_vo % 128 == 0)
-    ):
-        raise ValueError(
-            "With one-byte KV ({}), head_dim_qk and head_dim_vo must both be "
-            "multiples of 128 or both be 64, got head_dim_qk={}, "
-            "head_dim_vo={}. The FA2 prefill kernels load one-byte K and V "
-            "rows 128 elements at a time (64 when head_dim_vo is 64), so other "
-            "head dims are not fully loaded.".format(
-                kv_data_type, head_dim_qk, head_dim_vo
             )
         )
 

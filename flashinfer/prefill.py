@@ -1641,7 +1641,7 @@ def single_prefill_with_kv_cache(
             head_dim_qk=q.shape[-1],
             head_dim_vo=out_head_dim,
         )
-    _check_head_dim(q.shape[-1], out_head_dim, backend, k.dtype)
+    _check_head_dim(q.shape[-1], out_head_dim, backend)
 
     # Unpack NVFP4 scale factors
     k_sf, v_sf = None, None
@@ -3286,7 +3286,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             logits_soft_cap = 0.0
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
-        _check_head_dim(head_dim_qk, head_dim_vo, self._backend, kv_data_type)
+        _check_head_dim(head_dim_qk, head_dim_vo, self._backend)
         if fixed_split_size is None:
             fixed_split_size = -1
 
@@ -3342,6 +3342,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     head_dim_qk=head_dim_qk,
                     head_dim_vo=head_dim_vo,
                 )
+            # Re-check once "auto" has resolved to a concrete backend, before the
+            # module build.
+            _check_head_dim(head_dim_qk, head_dim_vo, backend)
             if backend == "cudnn":
                 raise NotImplementedError(
                     "workspace_size is not available for cudnn prefill backend"
@@ -3935,7 +3938,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     head_dim_vo=head_dim_vo,
                 )
             # Before the module build, which fails first for some invalid head dims.
-            _check_head_dim(head_dim_qk, head_dim_vo, self._backend, kv_data_type)
+            _check_head_dim(head_dim_qk, head_dim_vo, self._backend)
             if self._backend != "cudnn":
                 get_module_args = (
                     q_data_type,
@@ -3955,7 +3958,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._backend, *get_module_args
                 )
 
-        _check_head_dim(head_dim_qk, head_dim_vo, self._backend, kv_data_type)
+        _check_head_dim(head_dim_qk, head_dim_vo, self._backend)
 
         self._block_tables = block_tables
         if self._backend == "trtllm-gen":
@@ -6070,7 +6073,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                         self._backend = upgraded
 
             # Before the module build, which fails first for some invalid head dims.
-            _check_head_dim(head_dim_qk, head_dim_vo, self._backend, kv_data_type)
+            _check_head_dim(head_dim_qk, head_dim_vo, self._backend)
             get_module_args = (
                 q_data_type,
                 kv_data_type,
@@ -6251,7 +6254,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 *args,
             )
 
-        _check_head_dim(head_dim_qk, head_dim_vo, self._backend, kv_data_type)
+        _check_head_dim(head_dim_qk, head_dim_vo, self._backend)
 
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode
