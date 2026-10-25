@@ -36,7 +36,8 @@ grids and the cluster-launch-control tile scheduler for the largest rows), with 
 single-token-tile overrides: a 2-CTA
 256x64 pair for `M <= 128` over at most 40 narrow weight tiles, the 128-wide two-wave tile
 on the 148-SM part when more 128-wide weight tiles than SMs exist, and no L2 promotion
-when one wave of 128-wide tiles covers the row.  The quantizer's CTA
+when one wave of 128-wide tiles covers the row.  The 1-CTA 64-wide tile stages its output
+over the start of its mainloop ring, which takes one more stage.  The quantizer's CTA
 width and occupancy follow `cake_backend.cta_config`; for row sets of 512 tokens or more its fp4 and
 scale stores carry the L2 evict-last policy, so the outputs the dependent GEMM reads next stay
 resident instead of being written back into the quantizer's own read stream.  Every rule is a

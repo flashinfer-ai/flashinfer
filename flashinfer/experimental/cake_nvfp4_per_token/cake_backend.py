@@ -487,6 +487,10 @@ N8_WIDE_W_ROWS_ARCH = "sm_103a"
 # more 128-row weight tiles than SMs exist: 64-row tiles at one CTA per SM (twice the
 # tiles, about three waves) instead of 128-row tiles at two CTAs per SM.
 N8_WIDE_W_ROWS = 64
+# Width of the 1-CTA m-orientation tile whose output staging overlays the start of the
+# mainloop ring (``ring_overlay``): one more mainloop stage (7 -> 8); the overlaid
+# stages go back to the next tile's loads once the stores have read them.
+RING_OVERLAY_TILE_N = 64
 # 16-token-tile raster groups when the group's fp4 operands (16 token tiles of A plus every
 # weight tile it sweeps) fit the 126 MiB L2 and the group sweeps at least 24 weight tiles.
 RASTER16_MIN_W_TILES = 24
@@ -610,14 +614,15 @@ def default_tactic(
     :data:`CLC_MIN_TILES_PER_PAIR` tiles.  Unsplit deep-K swapped-orientation rows whose
     weight tiles fill at most half the SMs take cluster split-K 2; the 8-token tile
     on the 152-SM part with more weight tiles than SMs takes :data:`N8_WIDE_W_ROWS`-row
-    weight tiles at one CTA per SM.  Single-token-tile
-    rows (``M <= 128``) override the scorer three times: a 2-CTA 256x64 pair over at
-    most :data:`TWO_CTA_SINGLE_TILE_MAX_W_TILES` narrow weight tiles (the pair loads
-    the 128 real token rows once), the 128-wide two-wave tile on the 148-SM part when
-    more 128-wide weight tiles than SMs exist, and no 256 B L2 promotion on the
-    152-SM part when one wave of 128-wide tiles covers the row.  The swapped
-    orientation never splits the wide-``N`` rows (the persistent kernel is faster
-    unsplit there), unlike the CuTe-DSL rule it otherwise mirrors.
+    weight tiles at one CTA per SM; the :data:`RING_OVERLAY_TILE_N`-wide 1-CTA m tile
+    stages its output over the start of the mainloop ring (``ring_overlay``).
+    Single-token-tile rows (``M <= 128``) override the scorer three times: a 2-CTA
+    256x64 pair over at most :data:`TWO_CTA_SINGLE_TILE_MAX_W_TILES` narrow weight
+    tiles (the pair loads the 128 real token rows once), the 128-wide two-wave tile on
+    the 148-SM part when more 128-wide weight tiles than SMs exist, and no 256 B L2
+    promotion on the 152-SM part when one wave of 128-wide tiles covers the row.  The
+    swapped orientation never splits the wide-``N`` rows (the persistent kernel is
+    faster unsplit there), unlike the CuTe-DSL rule it otherwise mirrors.
     ``two_cta_wave_cost`` replaces the wave-cost table of the 2-CTA width re-pick
     (:func:`gemm_plan` passes the K = 96 table on sm_103a).  ``n8_wide_w_rows`` allows
     the 64-row weight tiles (:func:`gemm_plan` passes it on :data:`N8_WIDE_W_ROWS_ARCH`
@@ -765,6 +770,11 @@ def default_tactic(
     tok_tiles = (m + tile_m - 1) // tile_m
     if tok_tiles <= 2:
         tactic["a_hint"], tactic["b_hint"] = None, "evict_first"
+    if tile_m == BLOCK_M and tile_n == RING_OVERLAY_TILE_N:
+        # The 64-wide 1-CTA tile: the output staging overlays the mainloop ring, 8
+        # stages instead of 7 (18432x7168 and 28672x8192 M = 128: 2-3 % faster on both
+        # parts).
+        tactic["ring_overlay"] = True
     if _half_m_pair_rows(m, n, tile_n, sm_count, tactic):
         tactic["half_m"] = True
     if (
@@ -841,6 +851,8 @@ def gemm_kernel_key(tactic: dict[str, Any], out_f16: bool) -> str:
         parts.append(f"o{int(tactic['blocks_per_sm'])}")
     if int(tactic.get("w_rows", BLOCK_M)) != BLOCK_M:
         parts.append(f"w{int(tactic['w_rows'])}")
+    if tactic.get("ring_overlay"):
+        parts.append("ro")
     return "gemm:" + "_".join(parts)
 
 
@@ -947,6 +959,7 @@ KNOWN_TACTIC_KEYS = frozenset(
         "l2_promo",
         "num_stages",
         "raster_group",
+        "ring_overlay",
         "sched",
         "sk_split",
         "split_k",
@@ -1028,6 +1041,10 @@ def gemm_plan(
         raise ValueError("w_rows is a knob of the 1-CTA swapped orientation")
     if w_rows != BLOCK_M and blocks_per_sm != 1:
         raise ValueError("64-row weight tiles run at one CTA per SM")
+    if tactic.get("ring_overlay") and (
+        alpha_n or two_cta or split_k > 1 or blocks_per_sm != 1
+    ):
+        raise ValueError("ring_overlay is a knob of the 1-CTA m orientation")
     half_m = bool(tactic.get("half_m", False))
     if half_m and (not two_cta or sched_is_clc(tactic) or tactic.get("raster_group")):
         raise ValueError(

@@ -206,6 +206,38 @@ def test_n8_w64_rows():
         )
 
 
+def test_m64_ring_overlay_rows():
+    # The 64-wide 1-CTA m tile stages its output over the start of the mainloop ring on
+    # both parts: the single-token-tile rows over more than 40 64-wide weight tiles.
+    for arch, sm_count in (("sm_100a", 148), ("sm_103a", 152)):
+        for n, k in ((7168, 16384), (7168, 18432), (8192, 28672), (8192, 8192)):
+            t = cb.default_tactic(128, n, k, sm_count)
+            assert t["tile_n"] == 64 and "two_cta" not in t and t["ring_overlay"]
+            for out_f16, out in ((False, "bf16"), (True, "f16")):
+                plan = _registered(
+                    cb.gemm_plan(128, n, k, out_f16, arch, sm_count), arch
+                )
+                assert plan.kernel_key == f"gemm:m64_{out}_bF_l2256b_ro", (
+                    plan.kernel_key
+                )
+    # The 2-CTA 256x64 pair, the 128-wide tile and the swapped orientation keep their
+    # staging; the knob belongs to the 1-CTA m orientation.
+    for sm_count in (148, 152):
+        assert "ring_overlay" not in cb.default_tactic(128, 2112, 7168, sm_count)
+        assert "ring_overlay" not in cb.default_tactic(128, 18432, 7168, sm_count)
+        assert "ring_overlay" not in cb.default_tactic(8, 28672, 8192, sm_count)
+    with pytest.raises(ValueError, match="1-CTA m orientation"):
+        cb.gemm_plan(
+            8,
+            28672,
+            8192,
+            False,
+            "sm_103a",
+            152,
+            tactic={**cb.default_tactic(8, 28672, 8192, 152), "ring_overlay": True},
+        )
+
+
 def test_n16_split3_rows():
     # The 16-token tile with three K slices on the measured rows of each SM count and
     # output dtype: M = 17 stands for 17..24 and M = 32 for 25..32 where both dtypes
