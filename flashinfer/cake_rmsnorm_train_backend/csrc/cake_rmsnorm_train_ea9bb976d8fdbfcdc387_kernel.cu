@@ -52,14 +52,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_RED_FOLD_OFF 0
 #define SMEM_RED_FOLD_STAGE_BYTES 4096
 #define SMEM_RED_FOLD_STRIDE 4096
-#if __CUDA_ARCH__ == 1070
-#define SMEM_TOTAL 4096
-#else
 #define SMEM_STAGE_OFF 4096
 #define SMEM_STAGE_STAGE_BYTES 65536
 #define SMEM_STAGE_STRIDE 65536
 #define SMEM_TOTAL 69632
-#endif
 #define THREADS 256
 
 #include <math_constants.h>
@@ -90,11 +86,8 @@ kernel_cake_rmsnorm_train_ea9bb976d8fdbfcdc387(float* __restrict__ partial, floa
     // Kernel setup ops
     float* red_fold = reinterpret_cast<float*>(smem_raw + 0);
     const int red_fold_addr = smem + 0;
-#if __CUDA_ARCH__ == 1070
-#else
     uint8_t* stage = reinterpret_cast<uint8_t*>(smem_raw + 4096);
     const int stage_addr = smem + 4096;
-#endif
 
     // === Task calls (declaration order) ===
     asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -103,38 +96,14 @@ kernel_cake_rmsnorm_train_ea9bb976d8fdbfcdc387(float* __restrict__ partial, floa
     int rsub = tid / 8;
     int cg = tid - rsub * 8;
     int col = s * 32 + cg * 4;
-#if __CUDA_ARCH__ == 1070
-    float a4[4];
-    float c4[4];
-#else
     float a[4];
     float c[4];
-#endif
     #pragma unroll
     for (int e = 0; e < 4; e++) {
-#if __CUDA_ARCH__ == 1070
-        a4[e] = 0.0f;
-        c4[e] = 0.0f;
-#else
         a[e] = 0.0f;
         c[e] = 0.0f;
-#endif
     }
     int n_trips = (n_chunks + 31) / 32;
-#if __CUDA_ARCH__ == 1070
-    #pragma unroll 4
-    for (int k = 0; k < n_trips; k++) {
-        int cc = rsub + k * 32;
-        if (cc < n_chunks) {
-            float _vec_load_0[4];
-            {
-                float4 _v4 = *reinterpret_cast<const float4*>(partial + (unsigned long long)cc * 6144 + (unsigned long long)col);
-                _vec_load_0[0 + 0] = _v4.x;
-                _vec_load_0[0 + 1] = _v4.y;
-                _vec_load_0[0 + 2] = _v4.z;
-                _vec_load_0[0 + 3] = _v4.w;
-            }
-#else
     int n_waves = (n_trips + 7) / 8;
     unsigned int slot0 = (unsigned int)stage_addr + (unsigned int)tid * 16;
     unsigned int zero_off = 0;
@@ -161,15 +130,7 @@ kernel_cake_rmsnorm_train_ea9bb976d8fdbfcdc387(float* __restrict__ partial, floa
         for (int d_1 = 0; d_1 < 8; d_1++) {
             int cc_1 = rsub + (w * 8 + d_1) * 32;
             long long src_1 = (long long)cc_1 * 6144 + (long long)col;
-#endif
             #pragma unroll
-#if __CUDA_ARCH__ == 1070
-            for (int e_1 = 0; e_1 < 4; e_1++) {
-                float y = __fmaf_rn(_vec_load_0[e_1], 1.0f, -c4[e_1]);
-                float t = a4[e_1] + y;
-                c4[e_1] = t - a4[e_1] - y;
-                a4[e_1] = t;
-#else
             for (int q_1 = 0; q_1 < 1; q_1++) {
                 asm volatile(
                     "{\n\t"
@@ -237,66 +198,36 @@ kernel_cake_rmsnorm_train_ea9bb976d8fdbfcdc387(float* __restrict__ partial, floa
                 float t_1 = a[e_2] + y_1;
                 c[e_2] = t_1 - a[e_2] - y_1;
                 a[e_2] = t_1;
-#endif
             }
         }
     }
     #pragma unroll
-#if __CUDA_ARCH__ == 1070
-    for (int e_2 = 0; e_2 < 4; e_2++) {
-        red_fold[rsub * 32 + cg * 4 + e_2] = a4[e_2] - c4[e_2];
-#else
     for (int e_3 = 0; e_3 < 4; e_3++) {
         red_fold[rsub * 32 + cg * 4 + e_3] = a[e_3] - c[e_3];
-#endif
     }
     __syncthreads();
     if (tid < 8) {
         float o4[4];
         float oc4[4];
         #pragma unroll
-#if __CUDA_ARCH__ == 1070
-        for (int e_3 = 0; e_3 < 4; e_3++) {
-            o4[e_3] = 0.0f;
-            oc4[e_3] = 0.0f;
-#else
         for (int e_4 = 0; e_4 < 4; e_4++) {
             o4[e_4] = 0.0f;
             oc4[e_4] = 0.0f;
-#endif
         }
         #pragma unroll
-#if __CUDA_ARCH__ == 1070
-        for (int k_1 = 0; k_1 < 32; k_1++) {
-#else
         for (int k = 0; k < 32; k++) {
-#endif
             #pragma unroll
-#if __CUDA_ARCH__ == 1070
-            for (int e_4 = 0; e_4 < 4; e_4++) {
-                float d = red_fold[k_1 * 32 + tid * 4 + e_4];
-                float y_1 = __fmaf_rn(d, 1.0f, -oc4[e_4]);
-                float t_1 = o4[e_4] + y_1;
-                oc4[e_4] = t_1 - o4[e_4] - y_1;
-                o4[e_4] = t_1;
-#else
             for (int e_5 = 0; e_5 < 4; e_5++) {
                 float d_6 = red_fold[k * 32 + tid * 4 + e_5];
                 float y_2 = __fmaf_rn(d_6, 1.0f, -oc4[e_5]);
                 float t_2 = o4[e_5] + y_2;
                 oc4[e_5] = t_2 - o4[e_5] - y_2;
                 o4[e_5] = t_2;
-#endif
             }
         }
         #pragma unroll
-#if __CUDA_ARCH__ == 1070
-        for (int e_5 = 0; e_5 < 4; e_5++) {
-            o4[e_5] = o4[e_5] - oc4[e_5];
-#else
         for (int e_6 = 0; e_6 < 4; e_6++) {
             o4[e_6] = o4[e_6] - oc4[e_6];
-#endif
         }
         int ocol = s * 32 + tid * 4;
         {

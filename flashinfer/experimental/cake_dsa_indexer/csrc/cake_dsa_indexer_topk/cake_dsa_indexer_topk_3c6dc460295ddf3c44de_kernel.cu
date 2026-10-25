@@ -172,10 +172,14 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
 
     // ---- Role: load_q ----
     if (warp == 8) {
+#if TILE_UNROLL == 1
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
+#else
 #if __CUDA_ARCH__ == 1000
         asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
 #else
         asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
+#endif
 #endif
         { // load_q_main
             unsigned int _phase_q_empty = 1;
@@ -224,10 +228,14 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
         }
     // ---- Role: load_k ----
     } else if (warp == 9) {
+#if TILE_UNROLL == 1
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
+#else
 #if __CUDA_ARCH__ == 1000
         asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
 #else
         asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
+#endif
 #endif
         { // load_k_main
             unsigned int load_k_stage = 0;
@@ -348,10 +356,14 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
         }
     // ---- Role: mma ----
     } else if (warp == 10) {
+#if TILE_UNROLL == 1
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
+#else
 #if __CUDA_ARCH__ == 1000
         asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
 #else
         asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
+#endif
 #endif
         { // mma_main
 #if __CUDA_ARCH__ == 1000
@@ -514,20 +526,28 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
         }
     // ---- Role: spare ----
     } else if (warp == 11) {
+#if TILE_UNROLL == 1
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
+#else
 #if __CUDA_ARCH__ == 1000
         asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
 #else
         asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
+#endif
 #endif
         { // spare_main
             __syncwarp();
         }
     // ---- Role: math ----
     } else if (warp <= 7) {
+#if TILE_UNROLL == 1
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 232;");
+#else
 #if __CUDA_ARCH__ == 1000
         asm volatile("setmaxnreg.inc.sync.aligned.u32 232;");
 #else
         asm volatile("setmaxnreg.inc.sync.aligned.u32 224;");
+#endif
 #endif
         { // math_main
 #if __CUDA_ARCH__ == 1000
@@ -900,8 +920,28 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                         : "r"(wsc_addr + 496));
                                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                                     asm volatile("tcgen05.fence::before_thread_sync;");
+#if TILE_UNROLL == 1
                                     mbarrier_arrive(umma_empty_addr + (math_tmem_stage) * 8);
 #if __CUDA_ARCH__ == 1000
+                                    math_tmem_stage += 1;
+                                    if (math_tmem_stage >= 2) {
+                                        math_tmem_stage -= 2;
+                                        math_tmem_phase ^= 1;
+                                    }
+                                    uint32_t _mbar_token_0 = mbarrier_test_wait(umma_full_addr + (math_tmem_stage) * 8, math_tmem_phase);
+                                    acc_tok = _mbar_token_0;
+#endif
+#else
+#if __CUDA_ARCH__ == 1000
+                                    mbarrier_arrive(umma_empty_addr + (math_tmem_stage) * 8);
+#else
+                                    __syncwarp();
+                                    if (elect_sync()) {
+                                        asm volatile(
+                                            "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0], %1;"
+                                            :: "r"(umma_empty_addr + (math_tmem_stage) * 8), "r"((uint32_t)(32)) : "memory");
+                                    }
+#endif
                                     math_tmem_stage += 1;
                                     if (math_tmem_stage >= 2) {
                                         math_tmem_stage -= 2;
@@ -1015,6 +1055,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                         unsigned long long entry_3 = (unsigned long long)bits2[3] << 32 | (unsigned long long)(unsigned int)kid;
                                         Cand[slot_3] = (long long)entry_3;
                                     }
+#if TILE_UNROLL == 1
 #if __CUDA_ARCH__ == 1000
 #else
                                     math_tmem_stage += 1;
@@ -1024,6 +1065,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                     }
                                     uint32_t _mbar_token_0 = mbarrier_test_wait(umma_full_addr + (math_tmem_stage) * 8, math_tmem_phase);
                                     acc_tok = _mbar_token_0;
+#endif
 #endif
                                 }
                                 ti0 = ti0 + run_c;

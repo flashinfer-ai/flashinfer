@@ -26,9 +26,6 @@
 //   warp:      sha256:8bc9df2b57d4e6021d0add03110a11f0cbb3bab1218e94d00d92f4bbf597ee9e
 // Integration adds standard integer types, sm_103a-only PDL device control,
 // and a CUDA <12.9 2x128-bit fallback for bootstrap's 256-bit inline PTX.
-// The additive sm_103a 32K specialization comes from Cake f120b38798:
-//   mr515 exp2 t512/vec4 raw generated payload:
-//   sha256:8ca2513545faf9cb960c6393fb48f4c9f4598a781ad9c929e8d88ebda738a89b
 
 extern "C" {
 
@@ -46,47 +43,43 @@ __global__ void kernel_flashinfer_blackwell_softmax_followup_warp(float* logits,
                                                                   int parameter_kind,
                                                                   float scalar_temperature);
 
-// For this frozen TEMP_KIND==0 specialization only, a null temperature pointer
-// is an integration-private signal that PDL is enabled; the kernel never reads it.
-__global__ void kernel_mr474_manual_softmax_exp2_t512_vec4(float* logits, float* temperature,
-                                                           float* output, float scalar_temperature);
-
-// Row-caching cluster family (Cake CAKE-626): a row is split across a cluster
-// of C CTAs (256 threads) that each keep T tiles of 8 fp32 per thread in
-// registers, publish their local max/sum through DSM after one cluster
-// barrier, and write the normalized chunk. Clusters of 16 CTAs need
-// cudaFuncAttributeNonPortableClusterSizeAllowed. Dynamic shared memory is
-// 128 bytes for every variant. The sm_103a PDL flag rides in bit 2 of
-// parameter_kind, as for the other adapted kernels.
-__global__ void kernel_flashinfer_blackwell_softmax_cached_c1_t4(float* x, float* parameter,
-                                                                 float* output, int rows,
-                                                                 int vocab_size, int chunk_elements,
-                                                                 int parameter_kind,
-                                                                 float scalar_temperature);
-__global__ void kernel_flashinfer_blackwell_softmax_cached_c2_t4(float* x, float* parameter,
-                                                                 float* output, int rows,
-                                                                 int vocab_size, int chunk_elements,
-                                                                 int parameter_kind,
-                                                                 float scalar_temperature);
-__global__ void kernel_flashinfer_blackwell_softmax_cached_c4_t4(float* x, float* parameter,
-                                                                 float* output, int rows,
-                                                                 int vocab_size, int chunk_elements,
-                                                                 int parameter_kind,
-                                                                 float scalar_temperature);
-__global__ void kernel_flashinfer_blackwell_softmax_cached_c8_t4(float* x, float* parameter,
-                                                                 float* output, int rows,
-                                                                 int vocab_size, int chunk_elements,
-                                                                 int parameter_kind,
-                                                                 float scalar_temperature);
-__global__ void kernel_flashinfer_blackwell_softmax_cached_c8_t8(float* x, float* parameter,
-                                                                 float* output, int rows,
-                                                                 int vocab_size, int chunk_elements,
-                                                                 int parameter_kind,
-                                                                 float scalar_temperature);
-__global__ void kernel_flashinfer_blackwell_softmax_cached_c16_t4(
+// Row-caching cluster family: a row is split across a cluster of C CTAs (256
+// threads) that each keep T tiles of 8 fp32 per thread in registers. Every
+// warp's (max, sum) pair goes to every CTA of the cluster through st.async
+// pushes counted on an mbarrier, and each CTA writes its normalized chunk.
+// Clusters of 16 CTAs need cudaFuncAttributeNonPortableClusterSizeAllowed.
+// The sm_103a PDL flag rides in bit 2 of parameter_kind, as for the other
+// adapted kernels.
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c1_t4(
     float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
     int parameter_kind, float scalar_temperature);
-__global__ void kernel_flashinfer_blackwell_softmax_cached_c16_t8(
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c2_t4(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c4_t4(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c8_t4(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c8_t8(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c16_t4(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c16_t8(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+
+// Persistent row-caching cluster kernels of the 8-tile variants: a grid of at
+// most one cluster per row, each cluster walking rows k, k + n, ... with the
+// next row's chunk copied into shared memory by 1D bulk copies. Dynamic shared
+// memory exceeds 48 KiB and needs cudaFuncAttributeMaxDynamicSharedMemorySize.
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c8_t8(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c16_t8(
     float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
     int parameter_kind, float scalar_temperature);
 

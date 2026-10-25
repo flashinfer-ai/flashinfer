@@ -53,6 +53,8 @@ POLICY_FIELDS = (
     "candidate_multiplier_unsampled",  # capacity multiplier when the sampled first threshold is off
     "cand_mult_rule_unsampled",  # its [min mean unit tiles, multiplier] long-unit rule, or None
     "cand_cap_floor_unsampled",  # its minimum candidate slots, or None
+    "cand_cap_ceiling",  # most candidate slots the default multiplier requests per (warpgroup, query), or None; lowers the multiplier, the floor and top_k + slack still hold
+    "cand_cap_ceiling_unsampled",  # its ceiling when the sampled first threshold is off, or None
     "l6_rule",  # [max mean unit tiles, min top_k] of the three-warpgroup program, or None
     "wide_rule",  # [min wide rounds per CTA, min rounds x mean unit tiles] of the wide program
     "split_max",  # most key-range splits per unit
@@ -65,6 +67,7 @@ POLICY_FIELDS = (
     "tile_unroll_factor",  # tile-loop unroll when the rule applies
     "tile_unroll_rule",  # [program kinds, min top_k, yields to the snake order], or None
     "sample_fit_max_mean_tiles",  # sampled first threshold on buffer-fitting units up to this mean tile count
+    "sample_fit_kinds",  # physical scan kinds whose sampled-fit program the architecture registers; every other kind runs its plain program
     "sample_tiles_max",  # sample-tile cap of long units (0 = no sampling)
     "sample_tiles_short_units",  # sample-tile cap of short units
     "sample_dispatch_mean_tiles_max",  # mean unit tiles up to which the short-unit cap applies
@@ -106,6 +109,10 @@ POLICY_FIELDS = (
 
 KINDS = ("narrow", "wide", "l6", "split", "pair_narrow", "pair_wide", "pair_l6")
 UNITS = ("narrow", "wide", "l6")
+# Names of the compiled scan program kinds (the split program is one per unit geometry).
+PHYSICAL_KINDS = tuple(
+    sorted(set(KINDS) - {"split"} | {f"split_{unit}" for unit in UNITS})
+)
 MERGE_KEY = "merge"
 
 _INT = ("tile_keys", "block_q_narrow", "block_q_wide", "block_q_l6", "candidate_entry_bytes", "candidate_multiplier",
@@ -130,7 +137,12 @@ _NUMBER = (
     "sample_dispatch_mean_tiles_max",
     "sample_dispatch_tiny_tiles_max",
 )
-_OPTIONAL_INT = ("cand_cap_floor", "cand_cap_floor_unsampled")
+_OPTIONAL_INT = (
+    "cand_cap_floor",
+    "cand_cap_floor_unsampled",
+    "cand_cap_ceiling",
+    "cand_cap_ceiling_unsampled",
+)
 _OPTIONAL_RULE = (
     "cand_mult_rule",
     "cand_mult_rule_unsampled",
@@ -174,6 +186,8 @@ class DispatchPolicy:
     candidate_multiplier_unsampled: int
     cand_mult_rule_unsampled: Optional[list]
     cand_cap_floor_unsampled: Optional[int]
+    cand_cap_ceiling: Optional[int]
+    cand_cap_ceiling_unsampled: Optional[int]
     l6_rule: Optional[list]
     wide_rule: list
     split_max: int
@@ -186,6 +200,7 @@ class DispatchPolicy:
     tile_unroll_factor: int
     tile_unroll_rule: Optional[list]
     sample_fit_max_mean_tiles: float
+    sample_fit_kinds: list
     sample_tiles_max: int
     sample_tiles_short_units: int
     sample_dispatch_mean_tiles_max: float
@@ -332,6 +347,27 @@ class DispatchPolicy:
             raise ValueError(
                 "policy['rank_t16_slots'] must be an ascending list of positive sort-slot counts divisible by 16"
             )
+        for floor_name, ceiling_name in (
+            ("cand_cap_floor", "cand_cap_ceiling"),
+            ("cand_cap_floor_unsampled", "cand_cap_ceiling_unsampled"),
+        ):
+            ceiling = raw[ceiling_name]
+            if ceiling is not None and (
+                ceiling <= 0
+                or (raw[floor_name] is not None and ceiling < raw[floor_name])
+            ):
+                raise ValueError(
+                    f"policy[{ceiling_name!r}] must be a positive slot count at or above policy[{floor_name!r}], got {ceiling!r}"
+                )
+        fit_kinds = raw["sample_fit_kinds"]
+        if (
+            not isinstance(fit_kinds, (list, tuple))
+            or not all(isinstance(k, str) and k in PHYSICAL_KINDS for k in fit_kinds)
+            or list(fit_kinds) != sorted(set(fit_kinds))
+        ):
+            raise ValueError(
+                f"policy['sample_fit_kinds'] must be an ascending list of physical scan kinds {PHYSICAL_KINDS}, got {fit_kinds!r}"
+            )
         if raw["rank_bulk_align_bytes"] % 4:
             raise ValueError(
                 "policy['rank_bulk_align_bytes'] must be a multiple of the 4-byte output element"
@@ -377,6 +413,7 @@ class DispatchPolicy:
             int(v) for v in values["rank_two_level_window_variants"]
         ]
         values["rank_t16_slots"] = [int(v) for v in values["rank_t16_slots"]]
+        values["sample_fit_kinds"] = [str(k) for k in values["sample_fit_kinds"]]
         values["check_period_kind_overrides"] = {
             str(k): int(v) for k, v in values["check_period_kind_overrides"].items()
         }
@@ -442,18 +479,22 @@ class DispatchPolicy:
     ) -> int:
         """Capacity multiplier of a call: the sampled values by default, the ``*_unsampled`` values
         when the sampled first threshold is off (``sample_tiles_max=0``), whose larger buffers would
-        only delay the first selection."""
+        only delay the first selection.  The long-unit rule replaces the multiplier, the floor raises it
+        and the ceiling lowers it (``cand_cap_ceiling // top_k``, so the buffer stops growing with
+        ``top_k`` once it holds the ceiling)."""
         if sampled:
-            mult, rule, floor = (
+            mult, rule, floor, ceiling = (
                 self.candidate_multiplier,
                 self.cand_mult_rule,
                 self.cand_cap_floor,
+                self.cand_cap_ceiling,
             )
         else:
-            mult, rule, floor = (
+            mult, rule, floor, ceiling = (
                 self.candidate_multiplier_unsampled,
                 self.cand_mult_rule_unsampled,
                 self.cand_cap_floor_unsampled,
+                self.cand_cap_ceiling_unsampled,
             )
         if rule is not None:
             if (
@@ -463,6 +504,8 @@ class DispatchPolicy:
                 mult = int(rule[1])
         if floor is not None and int(top_k) * mult < int(floor):
             mult = -(-int(floor) // int(top_k))
+        if ceiling is not None and int(top_k) * mult > int(ceiling):
+            mult = max(1, int(ceiling) // int(top_k))
         return mult
 
     def candidate_capacity(self, top_k: int, multiplier: Optional[int] = None) -> int:
@@ -641,7 +684,13 @@ class DispatchPolicy:
         num_segments: int,
         ratio: int,
         cand_cap: int,
+        physical_kind: Optional[str] = None,
     ) -> bool:
+        """Sampled first threshold on buffer-fitting units: the mean unit is at most ``sample_fit_max_mean_tiles`` and
+        the mean segment offset leaves units that fit the capacity.  A program kind outside ``sample_fit_kinds`` has no
+        sampled-fit program registered and runs its plain program on every call (``physical_kind`` None: no kind gate)."""
+        if physical_kind is not None and physical_kind not in self.sample_fit_kinds:
+            return False
         mean_tiles = self.mean_unit_tiles(num_queries, num_keys, num_segments, ratio)
         offset_tiles = self.offset_tiles(num_queries, num_keys, num_segments, ratio)
         fit_tiles = int(cand_cap) // self.tile_keys - 1
@@ -1067,8 +1116,9 @@ def select_program(
     snake = policy.snake_for(kind, T, Tkv, S, r)
     unroll = policy.tile_unroll_for(kind, K, snake, block_q)
     grid_ctas = grid - grid % 2 if pair else grid
+    physical = physical_kind(kind, unit)
     cap = policy.candidate_capacity(K, mult)
-    fit = policy.sample_fit_for(T, Tkv, S, r, cap)
+    fit = policy.sample_fit_for(T, Tkv, S, r, cap, physical)
     if check_period is None:
         period = policy.check_period_for(K, cap, kind)
     else:
@@ -1126,7 +1176,7 @@ def select_program(
         split=split,
         pair=pair,
         kind=kind,
-        physical_kind=physical_kind(kind, unit),
+        physical_kind=physical,
         snake=snake,
         tile_unroll=unroll,
         sample_fit=fit,

@@ -346,7 +346,7 @@ LOCAL_STAGES_BWD = (
     "dav",
     "dqkg",
     "glm_intra",
-    "gate_epilogue",
+    "gate_epilogue",  # no launch where the plan's GLM intra program fuses it (glm_intra_v14 on sm_103a)
 )
 # The paths of the existing backend's plan the local stages take their records from (the forward without a saved
 # set, the checkpoint replay for both backward modes: :mod:`.cake_kcp_plan`) and the arena layouts they run on.
@@ -718,7 +718,8 @@ class KernelBackend(Backend):
 
     def stage(self, name: str, call: KcpCall, **extra: Any) -> None:
         """One local stage of :data:`LOCAL_STAGES_FWD` / :data:`LOCAL_STAGES_BWD`: the plan's record on the call's path
-        (or the direct WY record), the KCP-owned record of ``fwd_o`` / ``dav``."""
+        (or the direct WY record), the KCP-owned record of ``fwd_o`` / ``dav``; nothing for an optional stage the plan
+        does not launch on the path (``gate_epilogue`` where ``glm_intra_v14`` writes the gate gradients itself)."""
         values, views = call.local_values, call.scratch["views"]
         local = call.local
         p = local.plan
@@ -754,6 +755,12 @@ class KernelBackend(Backend):
                 device_index=local.device_index,
             )
             return
+        if (
+            name in cake_jit.OPTIONAL_STAGES
+            and name not in WY_DIRECT_RECORDS
+            and not p.dispatched(name, path)
+        ):
+            return  # the plan fuses the stage away on this device (the gate epilogue inside glm_intra_v14): no launch
         record, grid = _local_record(p, name, path)
         self._launch(call, record, grid, {**values, **extra})
         if name == "wy" and call.scratch.get("spec3_ref") is not None:

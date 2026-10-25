@@ -224,6 +224,10 @@ extern "C" {
 __global__ __launch_bounds__(320, LAUNCH_MIN_BLOCKS) void
 kernel_cake_kda_train_8ab0929b8154c90b5eff(const __grid_constant__ CUtensorMap w_tma, const __grid_constant__ CUtensorMap kg_tma, __nv_bfloat16* __restrict__ u, float* __restrict__ gk, const __grid_constant__ CUtensorMap h_out, const __grid_constant__ CUtensorMap v_new, int num_heads, int* __restrict__ seq_chunk_start, int num_seqs, int segments, float* h0, unsigned int* flags, float* __restrict__ ht_out, int use_h0, int write_tapes, int write_ht, const __grid_constant__ CUtensorMap qg_tma, const __grid_constant__ CUtensorMap aqk_tma, __nv_bfloat16* __restrict__ o_out, int* __restrict__ chunk_bos, int* __restrict__ chunk_len, float scale, int epoch)
 {
+    // Grid-dependency payloads: written while the kernel runs, read with coherent loads only.
+    asm volatile("" : "+l"(h0));
+    __builtin_assume(__isGlobal(h0));
+
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
     const int lane = tid % 32;

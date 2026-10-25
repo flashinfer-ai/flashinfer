@@ -140,20 +140,19 @@ def test_barrier_flag_pad_covers_epochs_and_double_buffered_peer_mailboxes():
 
 
 @pytest.mark.parametrize(
-    ("tokens", "route_blocks", "gemm_y"),
-    ((1, 1, 32), (4, 1, 35), (5, 2, 36), (127, 32, 158), (128, 32, 512)),
+    ("tokens", "gemm_y"),
+    ((1, 32), (4, 35), (5, 36), (127, 158), (128, 159)),
 )
-def test_active_stage_grids_are_bounded_by_capacity(tokens, route_blocks, gemm_y):
+def test_active_stage_grids_are_bounded_by_capacity(tokens, gemm_y):
     module = _session_module()
     grids = module._active_stage_grids(tokens)
 
     assert grids["dispatch"] == (8 * tokens, 1, 1)
-    assert grids["route_count"] == (route_blocks, 1, 1)
-    assert grids["route_scatter"] == (route_blocks, 1, 1)
+    assert "route_count" not in grids and "route_scatter" not in grids
     assert grids["gemm1_swiglu"] == (32, gemm_y, 1)
     assert grids["gemm2"] == (56, gemm_y, 1)
-    assert grids["local_unpermute"] == (8 * tokens, 1, 1)
-    assert grids["combine"] == (tokens, 1, 1)
+    assert grids["local_unpermute"] == (8 * tokens, 7, 1)
+    assert grids["combine"] == (tokens, 7, 1)
     for name, grid in grids.items():
         maximum = module._STAGE_LAUNCH_CONTRACTS[name][0]
         assert all(value <= bound for value, bound in zip(grid, maximum, strict=True))

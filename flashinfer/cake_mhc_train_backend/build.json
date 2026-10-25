@@ -315,6 +315,54 @@
     },
     {
       "arch": "sm_100a",
+      "closure_sha256": "9c9e39c701aee3b0c6e8c4c769204107e2b018e24dbacae2dabdf63af3598629",
+      "entry": "run",
+      "gencode": "-gencode=arch=compute_100a,code=sm_100a",
+      "min_cuda": "12.8",
+      "name": "cake_mhc_train_bwd_slab__dynr_sm_100a",
+      "nvcc_flags": [
+        "--prec-div=true",
+        "--prec-sqrt=true",
+        "--ftz=false",
+        "--ptxas-options=--maxrregcount=160"
+      ],
+      "nvcc_flags_if": [],
+      "path": "aot/cake_mhc_train_bwd_slab__dynr_sm_100a.so",
+      "sha256": {
+        "csrc/cake_mhc_train_bwd_slab__dynr_binding.cu": "ecde9ed23e3d81cf154490bfc9f2b6537cdd25ad0ebce6940c0787e3e3032b00",
+        "csrc/cake_mhc_train_bwd_slab__dynr_kernel.cu": "372d7f0dafb8bedaf4102b3a1f61657dba7a6a42f19c8f7046b896f810d409b8"
+      },
+      "sources": [
+        "csrc/cake_mhc_train_bwd_slab__dynr_kernel.cu",
+        "csrc/cake_mhc_train_bwd_slab__dynr_binding.cu"
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "closure_sha256": "570fddf84d28d652e28d42c1cb89e00468f6401c1e01b3b03db8e0bbde765fd9",
+      "entry": "run",
+      "gencode": "-gencode=arch=compute_103a,code=sm_103a",
+      "min_cuda": "12.9",
+      "name": "cake_mhc_train_bwd_slab__dynr_sm_103a",
+      "nvcc_flags": [
+        "--prec-div=true",
+        "--prec-sqrt=true",
+        "--ftz=false",
+        "--ptxas-options=--maxrregcount=160"
+      ],
+      "nvcc_flags_if": [],
+      "path": "aot/cake_mhc_train_bwd_slab__dynr_sm_103a.so",
+      "sha256": {
+        "csrc/cake_mhc_train_bwd_slab__dynr_binding.cu": "ecde9ed23e3d81cf154490bfc9f2b6537cdd25ad0ebce6940c0787e3e3032b00",
+        "csrc/cake_mhc_train_bwd_slab__dynr_kernel.cu": "372d7f0dafb8bedaf4102b3a1f61657dba7a6a42f19c8f7046b896f810d409b8"
+      },
+      "sources": [
+        "csrc/cake_mhc_train_bwd_slab__dynr_kernel.cu",
+        "csrc/cake_mhc_train_bwd_slab__dynr_binding.cu"
+      ]
+    },
+    {
+      "arch": "sm_100a",
       "closure_sha256": "395c2dfcca7f88448edbe071ae0ca6393698edccfd4c7067aa8db98f3f33bedb",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",

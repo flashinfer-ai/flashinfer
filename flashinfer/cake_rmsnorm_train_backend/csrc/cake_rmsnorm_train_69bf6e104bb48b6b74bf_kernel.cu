@@ -183,7 +183,7 @@ kernel_cake_rmsnorm_train_69bf6e104bb48b6b74bf(float* __restrict__ partial, floa
         int ocol2 = s * 32 + tid * 4;
         {
             float4 _v4 = make_float4(o2[0 + 0], o2[0 + 1], o2[0 + 2], o2[0 + 3]);
-            *reinterpret_cast<float4*>(dw + (unsigned long long)ocol2) = _v4;
+            *reinterpret_cast<float4*>((dw + (unsigned long long)ocol2) + 0) = _v4;
         }
     }
     __syncthreads();

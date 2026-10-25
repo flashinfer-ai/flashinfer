@@ -174,7 +174,7 @@ kernel_cake_rmsnorm_train_3feed5026e1156d2fba2(__nv_bfloat16* __restrict__ g, __
             sl = 1;
         }
         int share = (stages + sl - 1) / sl;
-        int tail = (share + 15) / 16;
+        int tail = (share + 11) / 12;
         if (tail < 1) {
             tail = 1;
         }

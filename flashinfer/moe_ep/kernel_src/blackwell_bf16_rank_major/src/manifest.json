@@ -19,18 +19,15 @@
   "kernel_symbols": [
     "kernel_rank_major_input_barrier_v1",
     "kernel_rank_major_dispatch_v1",
-    "kernel_rank_major_route_reset_exact_v1",
-    "kernel_rank_major_route_count_exact_v1",
-    "kernel_rank_major_route_finalize_exact_v1",
-    "kernel_rank_major_route_scatter_exact_v1",
+    "kernel_rank_major_route_fused_v1",
     "kernel_rank_major_exact_fc1_swiglu_v1",
     "kernel_trtllm_moe_bmm_tile_n64_fc2_bf16",
-    "kernel_rank_major_exact_unpermute_v1",
+    "kernel_rank_major_exact_unpermute_v2",
     "kernel_rank_major_partial_barrier_v1",
-    "kernel_rank_major_combine_v1"
+    "kernel_rank_major_combine_v2"
   ],
   "schema_version": 1,
-  "source_sha256": "cc75390cde89d3ba89829a4cad6d811a67565bead4b8226c779858ec89b17ac7",
+  "source_sha256": "252dbdd7d82545ce873aed9fad0cd774e169926e52d6f2d3e9729a7a75212c09",
   "stages": [
     {
       "bindings": [
@@ -39,7 +36,8 @@
         "active_tokens_per_rank",
         "pg_world",
         "pg_rank",
-        "pg_flags"
+        "pg_flags",
+        "routed_peers"
       ],
       "block": [
         32,
@@ -58,7 +56,7 @@
         1
       ],
       "name": "input_barrier",
-      "pdl_launch": false,
+      "pdl_launch": true,
       "pdl_sync": false,
       "scalar_bindings": [
         [
@@ -83,7 +81,8 @@
         "topk_ids",
         "topk_ids_peers",
         "topk_weights",
-        "topk_weights_peers"
+        "topk_weights_peers",
+        "routed"
       ],
       "block": [
         256,
@@ -102,8 +101,8 @@
         1
       ],
       "name": "dispatch",
-      "pdl_launch": false,
-      "pdl_sync": false,
+      "pdl_launch": true,
+      "pdl_sync": true,
       "scalar_bindings": [
         [
           "active_tokens_per_rank",
@@ -111,114 +110,24 @@
         ]
       ],
       "symbol": "kernel_rank_major_dispatch_v1",
-      "use_pdl": false
-    },
-    {
-      "bindings": [
-        "expert_scatter_offsets",
-        "zero_sentinel"
-      ],
-      "block": [
-        256,
-        1,
-        1
-      ],
-      "cluster": [
-        1,
-        1,
-        1
-      ],
-      "dynamic_smem_bytes": 0,
-      "grid": [
-        1,
-        1,
-        1
-      ],
-      "name": "route_reset",
-      "pdl_launch": false,
-      "pdl_sync": false,
-      "scalar_bindings": [],
-      "symbol": "kernel_rank_major_route_reset_exact_v1",
-      "use_pdl": false
+      "use_pdl": true
     },
     {
       "bindings": [
         "recv_local_ids",
         "expert_scatter_offsets",
         "token_to_permuted",
-        "active_tokens_per_rank"
-      ],
-      "block": [
-        256,
-        1,
-        1
-      ],
-      "cluster": [
-        1,
-        1,
-        1
-      ],
-      "dynamic_smem_bytes": 0,
-      "grid": [
-        32,
-        1,
-        1
-      ],
-      "name": "route_count",
-      "pdl_launch": false,
-      "pdl_sync": false,
-      "scalar_bindings": [
-        [
-          "active_tokens_per_rank",
-          128
-        ]
-      ],
-      "symbol": "kernel_rank_major_route_count_exact_v1",
-      "use_pdl": false
-    },
-    {
-      "bindings": [
-        "expert_scatter_offsets",
         "cta_to_expert",
         "cta_to_mn_limit",
         "expert_padded_row_offsets",
         "num_non_exiting_ctas",
         "total_padded_rows",
-        "route_map"
-      ],
-      "block": [
-        32,
-        1,
-        1
-      ],
-      "cluster": [
-        1,
-        1,
-        1
-      ],
-      "dynamic_smem_bytes": 0,
-      "grid": [
-        1,
-        1,
-        1
-      ],
-      "name": "route_finalize",
-      "pdl_launch": false,
-      "pdl_sync": false,
-      "scalar_bindings": [],
-      "symbol": "kernel_rank_major_route_finalize_exact_v1",
-      "use_pdl": false
-    },
-    {
-      "bindings": [
-        "recv_local_ids",
-        "expert_padded_row_offsets",
         "route_map",
-        "token_to_permuted",
+        "zero_sentinel",
         "active_tokens_per_rank"
       ],
       "block": [
-        256,
+        1024,
         1,
         1
       ],
@@ -229,21 +138,21 @@
       ],
       "dynamic_smem_bytes": 0,
       "grid": [
-        32,
+        1,
         1,
         1
       ],
-      "name": "route_scatter",
+      "name": "route_fused",
       "pdl_launch": true,
-      "pdl_sync": false,
+      "pdl_sync": true,
       "scalar_bindings": [
         [
           "active_tokens_per_rank",
           128
         ]
       ],
-      "symbol": "kernel_rank_major_route_scatter_exact_v1",
-      "use_pdl": false
+      "symbol": "kernel_rank_major_route_fused_v1",
+      "use_pdl": true
     },
     {
       "bindings": [
@@ -344,11 +253,11 @@
       "dynamic_smem_bytes": 128,
       "grid": [
         1024,
-        1,
+        7,
         1
       ],
       "name": "local_unpermute",
-      "pdl_launch": false,
+      "pdl_launch": true,
       "pdl_sync": true,
       "scalar_bindings": [
         [
@@ -360,7 +269,7 @@
           128
         ]
       ],
-      "symbol": "kernel_rank_major_exact_unpermute_v1",
+      "symbol": "kernel_rank_major_exact_unpermute_v2",
       "use_pdl": true
     },
     {
@@ -386,11 +295,11 @@
         1
       ],
       "name": "partial_barrier",
-      "pdl_launch": false,
-      "pdl_sync": false,
+      "pdl_launch": true,
+      "pdl_sync": true,
       "scalar_bindings": [],
       "symbol": "kernel_rank_major_partial_barrier_v1",
-      "use_pdl": false
+      "use_pdl": true
     },
     {
       "bindings": [
@@ -399,10 +308,11 @@
         "pg_rank",
         "pg_flags",
         "local_partials",
-        "local_partials_peers"
+        "local_partials_peers",
+        "topk_ids"
       ],
       "block": [
-        256,
+        128,
         1,
         1
       ],
@@ -411,18 +321,18 @@
         1,
         1
       ],
-      "dynamic_smem_bytes": 29696,
+      "dynamic_smem_bytes": 17408,
       "grid": [
         128,
-        1,
+        7,
         1
       ],
       "name": "combine",
       "pdl_launch": false,
-      "pdl_sync": false,
+      "pdl_sync": true,
       "scalar_bindings": [],
-      "symbol": "kernel_rank_major_combine_v1",
-      "use_pdl": false
+      "symbol": "kernel_rank_major_combine_v2",
+      "use_pdl": true
     }
   ]
 }

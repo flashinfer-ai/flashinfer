@@ -90,7 +90,7 @@
       "closure_sha256": "3361afbcbe6fb387b58c55d3eb82a433476caafbe25eb00d022a2d236fb041e1",
       "entry": "run",
       "gencode": "-gencode=arch=compute_107a,code=sm_107a",
-      "min_cuda": "13.0",
+      "min_cuda": "13.4",
       "name": "cake_tp_moe_finalize_rmsnorm_0357e2ae406a374a7aba_sm_107a",
       "nvcc_flags": [
         "--prec-div=true",
@@ -190,7 +190,7 @@
       "closure_sha256": "fd87e3d36b86147981edc40ba5881375bfbc5f576077baf65e7f6b4679956d7b",
       "entry": "run",
       "gencode": "-gencode=arch=compute_107a,code=sm_107a",
-      "min_cuda": "13.0",
+      "min_cuda": "13.4",
       "name": "cake_tp_moe_finalize_rmsnorm_2889b073fb565020a344_sm_107a",
       "nvcc_flags": [
         "--prec-div=true",
@@ -240,7 +240,7 @@
       "closure_sha256": "86795a866f582fee3ff66d4b694b71d97e496e9bda2e1a1be61228ee0e22601d",
       "entry": "run",
       "gencode": "-gencode=arch=compute_107a,code=sm_107a",
-      "min_cuda": "13.0",
+      "min_cuda": "13.4",
       "name": "cake_tp_moe_finalize_rmsnorm_37c457efef613ba3d1b9_sm_107a",
       "nvcc_flags": [
         "--prec-div=true",
@@ -590,7 +590,7 @@
       "closure_sha256": "42832fb0880bf004f0704d9a9190b94f5e232043a20e983d78b5eb3fb6e7508a",
       "entry": "run",
       "gencode": "-gencode=arch=compute_107a,code=sm_107a",
-      "min_cuda": "13.0",
+      "min_cuda": "13.4",
       "name": "cake_tp_moe_finalize_rmsnorm_bbe3f9577c1ca5a10baf_sm_107a",
       "nvcc_flags": [
         "--prec-div=true",
@@ -790,7 +790,7 @@
       "closure_sha256": "865ee5e23f86a7e9630b6bfd4680c3d98ecb2dd5d01165ae2cf127ba9a85d0ca",
       "entry": "run",
       "gencode": "-gencode=arch=compute_107a,code=sm_107a",
-      "min_cuda": "13.0",
+      "min_cuda": "13.4",
       "name": "cake_tp_moe_finalize_rmsnorm_e35a855d9bc25c5e38fe_sm_107a",
       "nvcc_flags": [
         "--prec-div=true",
@@ -840,7 +840,7 @@
       "closure_sha256": "969418a1591e48dd14b235dd81efa77e143481d1c500a1dcf5678239456c7a3b",
       "entry": "run",
       "gencode": "-gencode=arch=compute_107a,code=sm_107a",
-      "min_cuda": "13.0",
+      "min_cuda": "13.4",
       "name": "cake_tp_moe_finalize_rmsnorm_fa20c8c7ba0af0a5745e_sm_107a",
       "nvcc_flags": [
         "--prec-div=true",

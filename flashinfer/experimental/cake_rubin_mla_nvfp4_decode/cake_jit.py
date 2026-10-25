@@ -15,7 +15,7 @@ limitations under the License.
 
 Registry and loader glue of the Cake dense NVFP4 MLA decode on Rubin (SM107):
 the query quantizer, the mixed-cluster decode (its two builds) and the
-split-KV merge (its three warps-per-row instantiations).
+split-KV merge (its four warps-per-row instantiations).
 
 Every record of ``MODULES`` is one mechanically exported program: a CUDA
 device translation unit plus a tvm-ffi binding, compiled for ``sm_107a``.  A
@@ -417,7 +417,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "partial_o": "partial_o",
             "rows": "rows",
         },
-        "select_rule": {"kind": "rows_above", "value": 2048},
+        "select_rule": {
+            "kind": "rows_splits_within",
+            "boxes": [[1665, 2048, 1, 8], [2049, 0, 1, 64]],
+        },
         "stage": "merge",
         "variant": "w1",
     },
@@ -456,7 +459,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "partial_o": "partial_o",
             "rows": "rows",
         },
-        "select_rule": {"kind": "rows_between", "lo": 1025, "hi": 2048},
+        "select_rule": {
+            "kind": "rows_splits_within",
+            "boxes": [[385, 1664, 1, 16], [1665, 2048, 9, 16]],
+        },
         "stage": "merge",
         "variant": "w2",
     },
@@ -495,9 +501,54 @@ MODULES: dict[str, dict[str, Any]] = {
             "partial_o": "partial_o",
             "rows": "rows",
         },
-        "select_rule": {"kind": "rows_at_most", "value": 1024},
+        "select_rule": {
+            "kind": "rows_splits_within",
+            "boxes": [[385, 2048, 17, 32]],
+        },
         "stage": "merge",
         "variant": "w4",
+    },
+    "merge_w8": {
+        "arches": ["sm_107a"],
+        "arg_plan": [
+            ["buffer", "partial_o"],
+            ["buffer", "partial_lse"],
+            ["buffer", "O"],
+            ["buffer", "lse"],
+            ["parameter", "rows"],
+            ["parameter", "num_split"],
+            ["parameter", "has_lse"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "rows_per_cta", "rows": 1},
+        "kernel_symbol": "kernel_cake_rubin_mla_nvfp4_decode_0a9908735a1572f06f58",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 2048,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_rubin_mla_nvfp4_decode_0a9908735a1572f06f58",
+        "logical": {
+            "O": "O",
+            "has_lse": "has_lse",
+            "lse": "lse",
+            "num_split": "num_split",
+            "partial_lse": "partial_lse",
+            "partial_o": "partial_o",
+            "rows": "rows",
+        },
+        "select_rule": {
+            "kind": "rows_splits_within",
+            "boxes": [[1, 384, 1, 64], [385, 2048, 33, 64]],
+        },
+        "stage": "merge",
+        "variant": "w8",
     },
     "quantize": {
         "arches": ["sm_107a"],
@@ -553,8 +604,16 @@ def records_of_stage(stage: str) -> tuple[str, ...]:
     return tuple(name for name, rec in MODULES.items() if rec["stage"] == stage)
 
 
-def _admits(rule: dict[str, Any], *, rows: int, n_full: int, items: int) -> bool:
+def _admits(
+    rule: dict[str, Any], *, rows: int, n_full: int, items: int, splits: int = 0
+) -> bool:
     kind = rule["kind"]
+    if kind == "rows_splits_within":
+        # Inclusive boxes [rows_lo, rows_hi, splits_lo, splits_hi]; rows_hi 0 is unbounded.
+        return any(
+            int(lo) <= rows <= (int(hi) or rows) and int(slo) <= splits <= int(shi)
+            for lo, hi, slo, shi in rule["boxes"]
+        )
     if kind == "always":
         return True
     if kind == "all_full":
@@ -568,16 +627,19 @@ def _admits(rule: dict[str, Any], *, rows: int, n_full: int, items: int) -> bool
     raise ValueError(f"unknown Cake Rubin NVFP4 MLA decode selection rule: {kind!r}")
 
 
-def select_record(stage: str, *, rows: int, n_full: int, items: int) -> str:
+def select_record(
+    stage: str, *, rows: int, n_full: int, items: int, splits: int = 0
+) -> str:
     """The one record of ``stage`` the plan scalars select.
 
     ``rows`` is the packed (token, head) row count of the call, ``items`` the
     plan's work-item count and ``n_full`` how many of them are full-tile items
     (the plan lists those first).  The ``decode`` stage switches on
     ``all_full``: ``decode_full`` when ``n_full == items`` (no half tile),
-    else ``decode``.  The ``merge`` stage switches on the row count
-    (``rows_at_most`` / ``rows_between`` (inclusive) / ``rows_above``: four
-    warps per row up to 1024 rows, two up to 2048, one beyond); whether the
+    else ``decode``.  The ``merge`` stage switches on the row count and the
+    partials per row ``splits`` (``rows_splits_within``: inclusive boxes of rows and partials; eight warps per row up to 384 rows or, up to 2048 rows, over 32 partials; otherwise up to 2048 rows the fewest
+    warps whose one load round holds the partials, one up to 8, two up to 16, four up to 32, two staying up to
+    1664 rows; one warp above 2048 rows); whether the
     merge runs at all (``max_splits > 1``) is the host's decision, not a rule.
     ``always`` is the rule of a single-program stage.  Exactly one record
     admits every problem, or the registry is inconsistent.
@@ -592,6 +654,7 @@ def select_record(stage: str, *, rows: int, n_full: int, items: int) -> str:
             rows=int(rows),
             n_full=int(n_full),
             items=int(items),
+            splits=int(splits),
         )
     ]
     if len(admitted) != 1:
@@ -625,10 +688,21 @@ def launch_grid(name: str, *, items: int, rows: int) -> tuple[int, int, int]:
     raise ValueError(f"unknown Cake Rubin NVFP4 MLA decode grid rule: {kind!r}")
 
 
-def merge_warps_per_row(rows: int) -> int:
-    """Warps per row of the merge record ``select_record("merge", ...)`` picks for ``rows``: 4 up to 1024 rows, 2 up
-    to 2048, 1 beyond (each step keeps the grid near 512 CTAs)."""
-    return 4 if rows <= 1024 else 2 if rows <= 2048 else 1
+def merge_warps_per_row(rows: int, splits: int) -> int:
+    """Warps per row of the merge record ``select_record("merge", ...)`` picks for ``rows`` rows of ``splits``
+    partials each: eight warps per row up to 384 rows or, up to 2048 rows, over 32 partials; otherwise up to 2048 rows the fewest
+    warps whose one load round holds the partials, one up to 8, two up to 16, four up to 32, two staying up to
+    1664 rows; one warp above 2048 rows (fewer, longer CTAs measured faster under the decode's dependent launch
+    while their grid shrinks within one wave)."""
+    if rows > 2048:
+        return 1
+    if rows <= 384 or splits > 32:
+        return 8
+    if splits > 16:
+        return 4
+    if splits > 8 or rows <= 1664:
+        return 2
+    return 1
 
 
 def arch_for_capability(capability: tuple[int, int]) -> str | None:
