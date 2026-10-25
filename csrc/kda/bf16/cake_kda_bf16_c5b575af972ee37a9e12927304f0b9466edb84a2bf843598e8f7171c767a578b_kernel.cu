@@ -1378,7 +1378,7 @@ CAKE_KDA_KERNEL_SYMBOL(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma
         // u_inp_ready: 5 barriers, init_count=4
         // u2_acc_ready: 5 barriers, init_count=1
         // u2_inp_ready: 5 barriers, init_count=4
-        // final_ready: 5 barriers, init_count=1
+        // final_ready: 5 barriers, init_count=2
         // out_empty: 1 barriers, init_count=1
         // tmem_dealloc_ready: 1 barriers, init_count=2
         // --- pipeline 'checkpoint_pipe' ---
@@ -1397,7 +1397,7 @@ CAKE_KDA_KERNEL_SYMBOL(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_10_0) : "r"(lane), "n"(20), "r"((uint32_t)(1)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_10_0) : "r"(lane), "n"(5), "r"((uint32_t)(128)));
         mbarrier_init(smem + 0 + lane * 8, _mbarrier_init_count_10_0);
-        uint32_t _mbarrier_init_count_10_32 = 1;
+        uint32_t _mbarrier_init_count_10_32 = 2;
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_10_32) : "r"(lane), "n"(28), "r"((uint32_t)(4)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_10_32) : "r"(lane), "n"(23), "r"((uint32_t)(1)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_10_32) : "r"(lane), "n"(18), "r"((uint32_t)(4)));
@@ -1412,6 +1412,7 @@ CAKE_KDA_KERNEL_SYMBOL(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_10_64) : "r"(lane), "n"(5), "r"((uint32_t)(4)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_10_64) : "r"(lane), "n"(3), "r"((uint32_t)(2)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_10_64) : "r"(lane), "n"(2), "r"((uint32_t)(1)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_10_64) : "r"(lane), "n"(1), "r"((uint32_t)(2)));
         if (lane < 27) {
             mbarrier_init(smem + 512 + lane * 8, _mbarrier_init_count_10_64);
         }
@@ -2450,6 +2451,10 @@ CAKE_KDA_KERNEL_SYMBOL(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma
                     "}\n"
                     :: "r"(tmem_tmem_out), "r"(_mma_b_lo_10), "r"(tmem_tmem_u2_inp), "r"(1));
                 elect_commit(final_ready_addr + (mma_stage) * 8);
+                if (elect_sync()) {
+                    asm volatile("tcgen05.fence::before_thread_sync;");
+                    mbarrier_arrive(final_ready_addr + (mma_stage) * 8);
+                }
                 mma_stage += 1;
                 if (mma_stage == 5) { mma_stage = 0; _phase_qk_full_1 ^= 1; _phase_state_inp_ready ^= 1; _phase_u_inp_ready ^= 1; _phase_u2_inp_ready ^= 1; _phase_final_ready_2 ^= 1; }
             }
