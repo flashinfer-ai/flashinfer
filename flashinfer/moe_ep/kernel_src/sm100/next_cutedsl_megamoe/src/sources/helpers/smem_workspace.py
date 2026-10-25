@@ -121,7 +121,13 @@ _TopLevelDeclaration = Union[SmemRegion, SmemOverlay]
 
 
 class SmemWorkspace:
-    """Collect static SMEM declarations and finalize one physical placement."""
+    """Collect static SMEM declarations and finalize one physical placement.
+
+    A kernel whose CTAs take different roles builds one workspace per role and lays every resulting offset
+    table over the same arena. The tables overlap by design: a CTA only reads the table of the role it took,
+    so a region name a role never registers raises at trace time rather than silently reading another role's
+    bytes.
+    """
 
     def __init__(
         self,
@@ -389,6 +395,16 @@ class SmemWorkspace:
             ]
 
         return SmemStorage
+
+    def assert_fits_arena(self, arena_bytes: int) -> None:
+        """Check this role's placement against the arena every CTA of the launch allocates."""
+        self._require_finalized()
+        if self._total_bytes > arena_bytes:
+            raise ValueError(
+                f"SMEM workspace needs {self._total_bytes} bytes but the shared arena is only "
+                f"{arena_bytes} bytes. The arena is what every CTA allocates, so it cannot be widened for "
+                "one role without taking the difference away from every other role."
+            )
 
     @cute.jit
     def ptr(self, name: str, smem_base: cute.Pointer) -> cute.Pointer:

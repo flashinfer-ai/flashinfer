@@ -412,7 +412,29 @@ def create_fc12_task_mapping_state(
     expert_token_prefix_sum: Optional[cute.Tensor],
 ) -> Fc12TaskMappingState:
     """Create the register-resident state for one CTA's FC12 mapper."""
-    cursor_state = _Fc12TaskCursorState(
+    cursor_state = _make_initial_fc12_cursor()
+    mapping_cluster_tile_n = mapping_cluster_shape_mn[1] * mapping_cta_tile_shape_mnk[1]
+    num_fc1_intermediate_blocks = (intermediate_gateup_size + mapping_cluster_tile_n - 1) // mapping_cluster_tile_n
+    num_fc2_hidden_blocks = (hidden_size + mapping_cluster_tile_n - 1) // mapping_cluster_tile_n
+    return Fc12TaskMappingState(
+        expert_count=expert_count,
+        mapping_cta_tile_shape_mnk=mapping_cta_tile_shape_mnk,
+        mapping_cluster_shape_mn=mapping_cluster_shape_mn,
+        group_hint=group_hint,
+        token_padding_block=token_padding_block,
+        sf_padding_block=sf_padding_block,
+        is_swap_ab=is_swap_ab,
+        expert_token_sizes=expert_token_sizes,
+        expert_token_prefix_sum=expert_token_prefix_sum,
+        cursor_state=cursor_state,
+        num_fc1_intermediate_blocks=num_fc1_intermediate_blocks,
+        num_fc2_hidden_blocks=num_fc2_hidden_blocks,
+    )
+
+
+def _make_initial_fc12_cursor() -> _Fc12TaskCursorState:
+    """Cursor positioned before the first group; the mapper seeks forward from here."""
+    return _Fc12TaskCursorState(
         current_group_first_expert=Int32(0),
         current_group_last_expert_exclusive=Int32(0),
         current_phase=Int32(BlockPhase.Linear1),
@@ -432,23 +454,13 @@ def create_fc12_task_mapping_state(
         current_token_block_count=Int32(0),
         current_expert_token_count=Int32(0),
     )
-    mapping_cluster_tile_n = mapping_cluster_shape_mn[1] * mapping_cta_tile_shape_mnk[1]
-    num_fc1_intermediate_blocks = (intermediate_gateup_size + mapping_cluster_tile_n - 1) // mapping_cluster_tile_n
-    num_fc2_hidden_blocks = (hidden_size + mapping_cluster_tile_n - 1) // mapping_cluster_tile_n
-    return Fc12TaskMappingState(
-        expert_count=expert_count,
-        mapping_cta_tile_shape_mnk=mapping_cta_tile_shape_mnk,
-        mapping_cluster_shape_mn=mapping_cluster_shape_mn,
-        group_hint=group_hint,
-        token_padding_block=token_padding_block,
-        sf_padding_block=sf_padding_block,
-        is_swap_ab=is_swap_ab,
-        expert_token_sizes=expert_token_sizes,
-        expert_token_prefix_sum=expert_token_prefix_sum,
-        cursor_state=cursor_state,
-        num_fc1_intermediate_blocks=num_fc1_intermediate_blocks,
-        num_fc2_hidden_blocks=num_fc2_hidden_blocks,
-    )
+
+
+@cute.jit
+def rewind_fc12_mapping_cursor(mapping_state: Fc12TaskMappingState) -> Fc12TaskMappingState:
+    """Restart the forward-only cursor so a lower linear ID (a non-monotonic CLC ticket) can be mapped."""
+    mapping_state.cursor_state = _make_initial_fc12_cursor()
+    return mapping_state
 
 
 @cute.jit
@@ -1231,4 +1243,5 @@ __all__ = [
     "map_phase_interleaved_fc12_work_id",
     "peek_ready_bit",
     "resolve_phase_interleaved_fc1_claim_target",
+    "rewind_fc12_mapping_cursor",
 ]
