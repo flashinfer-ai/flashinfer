@@ -26,12 +26,10 @@ from ...cute_dsl.fp4_common import (
     fmax_f32,
     fp8_e4m3_to_f32,
 )
+from ..single_head_shapes import CTAS_PER_SM, DIM, MAX_ROWS, PAGE, TILE
 
 # Keys come in block-table pages of PAGE keys and are scored in tiles of TILE
-# keys (PAGES_PER_TILE pages). A key has DIM values, the MMA's K. A decode job is
-# up to MAX_ROWS query rows, the MMA's N (tcgen05's smallest). CTAS_PER_SM CTAs
-# share an SM when they fit.
-PAGE, TILE, DIM, MAX_ROWS, CTAS_PER_SM = 64, 128, 128, 8, 2
+# keys (PAGES_PER_TILE pages); see single_head_shapes.
 PAGES_PER_TILE = TILE // PAGE
 # Decode's warps: STORE_WARPS store scores (32 TMEM lanes each), then one issues
 # the MMAs and one loads the keys.

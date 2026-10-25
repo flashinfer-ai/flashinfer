@@ -563,6 +563,8 @@ def test_single_head_paged_mqa_logits_off_sm10x_rejects_bad_layouts(
             context,
             scores=torch.zeros(128, 4, device="cuda").T,
         )
+    with pytest.raises(ValueError, match="contiguous rows"):  # every other length
+        run(query, key_cache, table, context.repeat(2)[::2], scores=scores)
 
 
 @sm10x_only
