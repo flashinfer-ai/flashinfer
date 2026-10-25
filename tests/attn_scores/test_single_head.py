@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from flashinfer import nvfp4_kv_dequantize
+from flashinfer.attn_scores import single_head
 from flashinfer.attn_scores import (
     gather_key_sample,
     quantize_write_index_k_nvfp4,
@@ -16,10 +17,9 @@ from flashinfer.attn_scores import (
     thresholds_from_sample,
 )
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
-    reason="single_head_paged_mqa_logits requires SM10x",
-)
+SM10X = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+sm10x_only = pytest.mark.skipif(not SM10X, reason="requires SM10x")
 
 
 def rows_of(nvfp4: bool, rows: int) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -49,15 +49,20 @@ def dequantize(values: torch.Tensor, scales: torch.Tensor | None) -> torch.Tenso
     ],
 )
 @pytest.mark.parametrize("rows", [1, 3, 8])
-@pytest.mark.parametrize("keys", ["bf16", "nvfp4", "nvfp4_packed"])
+@pytest.mark.parametrize("keys", ["bf16", "bf16_triton", "nvfp4", "nvfp4_packed"])
 @torch.inference_mode()
 def test_single_head_paged_mqa_logits_match_reference_and_replay(
-    lengths, rows, keys
+    lengths, rows, keys, monkeypatch
 ) -> None:
     """Keys on shuffled pages; table entries past a length would fault if read,
     and scores past it stay unwritten. A replay sees new lengths and tables.
     nvfp4_packed: keys and scales are views of one cache, each page's 64 keys
     then their scales."""
+    if keys.startswith("nvfp4") and not SM10X:
+        pytest.skip("Off SM10x, keys are BF16 (scored by Triton)")
+    if keys == "bf16_triton":  # the path off SM10x, also on SM10x
+        monkeypatch.setattr(single_head, "get_compute_capability", lambda _: (9, 0))
+        keys = "bf16"
     torch.manual_seed(rows)
     nvfp4 = keys != "bf16"
     batch, capacity = len(lengths), max(lengths) + 300
@@ -129,6 +134,7 @@ def test_single_head_paged_mqa_logits_match_reference_and_replay(
     check(replayed)
 
 
+@sm10x_only
 @pytest.mark.parametrize(
     ("query_lens", "context_lens"),
     [
@@ -255,6 +261,7 @@ def test_single_head_paged_mqa_threshold_select_matches_reference_and_replay(
     check(scores, valid)
 
 
+@sm10x_only
 @pytest.mark.parametrize("far", [False, True])
 @pytest.mark.parametrize("keys", ["bf16", "nvfp4"])
 @torch.inference_mode()
@@ -311,6 +318,7 @@ def test_gather_key_sample_matches_reference(keys, far) -> None:
         assert torch.equal(got, expected[1].view(torch.uint8))
 
 
+@sm10x_only
 @torch.inference_mode()
 def test_thresholds_from_sample_matches_reference() -> None:
     """A row's threshold is the least of its sampled scores at its Top
@@ -340,6 +348,7 @@ def e2m1(x: torch.Tensor) -> torch.Tensor:
     return (grid[distance.argmin(-1)] * x.sign()).float()
 
 
+@sm10x_only
 @pytest.mark.parametrize("tokens", [1, 9, 300])
 @torch.inference_mode()
 def test_quantize_write_index_k_nvfp4_matches_reference(tokens: int) -> None:
@@ -373,6 +382,7 @@ def test_quantize_write_index_k_nvfp4_matches_reference(tokens: int) -> None:
     assert bool((rows[untouched] == 7).all())
 
 
+@sm10x_only
 @torch.inference_mode()
 def test_quantize_write_index_k_nvfp4_rejects_bad_inputs(monkeypatch) -> None:
     key = torch.zeros(1, 128, dtype=torch.bfloat16, device="cuda")
@@ -433,6 +443,7 @@ def test_single_head_paged_mqa_logits_rejects_bad_shapes() -> None:
         )
 
 
+@sm10x_only
 @torch.inference_mode()
 def test_single_head_paged_mqa_threshold_select_rejects_bad_shapes() -> None:
     query = torch.zeros(128, 128, dtype=torch.bfloat16, device="cuda")

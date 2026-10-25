@@ -40,6 +40,8 @@ def single_head_paged_mqa_logits(
     consecutive rows, such as a decode step's token and its draft tokens.
     It runs as one launch without host synchronization, so it can be captured in a
     CUDA graph (run it once before capture to compile it). Queries, keys, pages and lengths can change between replays.
+    On SM10x it runs a CuTe DSL kernel; on other GPUs (e.g. Hopper) it scores BF16
+    keys with a Triton kernel, and NVFP4 keys are not supported.
 
     Parameters
     ----------
@@ -70,15 +72,7 @@ def single_head_paged_mqa_logits(
         E4M3 ``[pages, 64, 8]`` for NVFP4 keys, paged like the keys. None for
         BF16.
     """
-    if not is_cute_dsl_experimental_available():
-        raise RuntimeError("single_head_paged_mqa_logits needs CuTe DSL 4.7 or newer")
-    from .kernels.single_head_scorer import (
-        CTAS_PER_SM,
-        MAX_ROWS,
-        PAGE,
-        TILE,
-        TILES_PER_CTA,
-    )
+    from .kernels.single_head_scorer import MAX_ROWS, PAGE
 
     max_context = scores.shape[1]
     batch, width = requests.shape[0], block_table.shape[1]
@@ -91,6 +85,34 @@ def single_head_paged_mqa_logits(
         raise ValueError("Mismatched query rows, scores, lengths or requests")
     if max_context > PAGE * width:
         raise ValueError("The block table must cover the context capacity")
+    if get_compute_capability(query.device)[0] != 10:
+        # The CuTe scorer needs SM10x (tcgen05); elsewhere, a Triton kernel scores
+        # BF16 keys: one program per request group and 64-key page.
+        if key_scales is not None or {query.dtype, key_cache.dtype} != {torch.bfloat16}:
+            raise ValueError(
+                "Off SM10x, queries and keys must be BF16 (NVFP4 needs SM10x)"
+            )
+        from ..triton.kernels.single_head_scorer import single_head_scorer_kernel
+
+        single_head_scorer_kernel[(batch, -(-max_context // PAGE))](
+            query,
+            query.stride(0),
+            key_cache,
+            key_cache.stride(0),
+            key_cache.stride(1),
+            block_table,
+            block_table.stride(0),
+            context_lengths,
+            requests,
+            scores,
+            scores.stride(0),
+            ROWS=rows,
+        )
+        return
+    if not is_cute_dsl_experimental_available():
+        raise RuntimeError("single_head_paged_mqa_logits needs CuTe DSL 4.7 or newer")
+    from .kernels.single_head_scorer import CTAS_PER_SM, TILE, TILES_PER_CTA
+
     # CTAs per request group: two per SM in all, and enough that a CTA's run over
     # the whole capacity fits the TILES_PER_CTA tiles whose pages it stages (the
     # lengths stay on the device). CTAs past a group's length exit right away.
