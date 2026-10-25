@@ -155,12 +155,12 @@ OWNER_STREAM = cake_program.CakeProgram(
 )
 
 OWNER_PIPELINED = cake_program.CakeProgram(
-    name="cake_fused_norm_combine_ea0f75f8e8b9fc871c9d",
+    name="cake_fused_norm_combine_41820a073fe8aa16387b",
     operator_dir="cake_fused_norm_combine",
-    kernel="kernel_cake_fused_norm_combine_ea0f75f8e8b9fc871c9d",
+    kernel="kernel_cake_fused_norm_combine_41820a073fe8aa16387b",
     sources=(
-        "cake_fused_norm_combine_ea0f75f8e8b9fc871c9d_kernel.cu",
-        "cake_fused_norm_combine_ea0f75f8e8b9fc871c9d_binding.cu",
+        "cake_fused_norm_combine_41820a073fe8aa16387b_kernel.cu",
+        "cake_fused_norm_combine_41820a073fe8aa16387b_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(("sm_100a", ("--fmad=true",)), ("sm_103a", ("--fmad=true",))),

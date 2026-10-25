@@ -61,7 +61,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(160, LAUNCH_MIN_BLOCKS) void
-kernel_cake_fused_norm_combine_ea0f75f8e8b9fc871c9d(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ residual, __nv_bfloat16* __restrict__ weight, __nv_bfloat16* __restrict__ norm_out, __nv_bfloat16* __restrict__ residual_out, __nv_bfloat16* __restrict__ collective_out, unsigned long long* __restrict__ workspace, int rank, int tokens, float epsilon)
+kernel_cake_fused_norm_combine_41820a073fe8aa16387b(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ residual, __nv_bfloat16* __restrict__ weight, __nv_bfloat16* __restrict__ norm_out, __nv_bfloat16* __restrict__ residual_out, __nv_bfloat16* __restrict__ collective_out, unsigned long long* __restrict__ workspace, int rank, int tokens, float epsilon)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -251,7 +251,7 @@ kernel_cake_fused_norm_combine_ea0f75f8e8b9fc871c9d(__nv_bfloat16* __restrict__ 
         __nv_bfloat16* owner_payload = reinterpret_cast<__nv_bfloat16*>(workspace[16 + owner]);
         long long offset_1 = data_base + ((long long)(rank * slots + token / 8) * 160 + (long long)tid) * 16;
         asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(owner_payload + offset_1), "r"((contribution_bf16)[0]), "r"((contribution_bf16)[1]), "r"((contribution_bf16)[2]), "r"((contribution_bf16)[3]), "r"((contribution_bf16)[4]), "r"((contribution_bf16)[5]), "r"((contribution_bf16)[6]), "r"((contribution_bf16)[7]) : "memory");
-        int previous = token - 2 * num_bids;
+        int previous = token - 3 * num_bids;
         if (previous >= 0) {
             if (previous % 8 == rank) {
                 int slot = previous / 8;
@@ -378,7 +378,7 @@ kernel_cake_fused_norm_combine_ea0f75f8e8b9fc871c9d(__nv_bfloat16* __restrict__ 
         asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(local_payload + (clear_base + (long long)clear_index * 16)), "r"((sentinel)[0]), "r"((sentinel)[1]), "r"((sentinel)[2]), "r"((sentinel)[3]), "r"((sentinel)[4]), "r"((sentinel)[5]), "r"((sentinel)[6]), "r"((sentinel)[7]) : "memory");
     }
     int last = bid + (tokens - 1 - bid) / num_bids * num_bids;
-    int pending = last - num_bids;
+    int pending = last - 2 * num_bids;
     if (pending >= 0) {
         if (pending % 8 == rank) {
             int slot_1 = pending / 8;
@@ -467,7 +467,7 @@ kernel_cake_fused_norm_combine_ea0f75f8e8b9fc871c9d(__nv_bfloat16* __restrict__ 
             }
         }
     }
-    int pending_1 = last;
+    int pending_1 = last - num_bids;
     if (pending_1 >= 0) {
         if (pending_1 % 8 == rank) {
             int slot_2 = pending_1 / 8;
@@ -556,35 +556,98 @@ kernel_cake_fused_norm_combine_ea0f75f8e8b9fc871c9d(__nv_bfloat16* __restrict__ 
             }
         }
     }
+    int pending_2 = last;
+    if (pending_2 >= 0) {
+        if (pending_2 % 8 == rank) {
+            int slot_3 = pending_2 / 8;
+            long long offset_11 = data_base + ((long long)slot_3 * 160 + (long long)tid) * 16;
+            long long offset_0_4 = data_base + ((long long)(slots + slot_3) * 160 + (long long)tid) * 16;
+            long long offset_1_4 = data_base + ((long long)(2 * slots + slot_3) * 160 + (long long)tid) * 16;
+            long long offset_2_3 = data_base + ((long long)(3 * slots + slot_3) * 160 + (long long)tid) * 16;
+            long long offset_3_3 = data_base + ((long long)(4 * slots + slot_3) * 160 + (long long)tid) * 16;
+            long long offset_4_3 = data_base + ((long long)(5 * slots + slot_3) * 160 + (long long)tid) * 16;
+            long long offset_5_3 = data_base + ((long long)(6 * slots + slot_3) * 160 + (long long)tid) * 16;
+            long long offset_6_3 = data_base + ((long long)(7 * slots + slot_3) * 160 + (long long)tid) * 16;
+            uint32_t _sysv_poll256_group_4[64];
+            do {
+                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_4[0]), "=r"(_sysv_poll256_group_4[1]), "=r"(_sysv_poll256_group_4[2]), "=r"(_sysv_poll256_group_4[3]), "=r"(_sysv_poll256_group_4[4]), "=r"(_sysv_poll256_group_4[5]), "=r"(_sysv_poll256_group_4[6]), "=r"(_sysv_poll256_group_4[7]) : "l"(local_payload + offset_11) : "memory");
+                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_4[8]), "=r"(_sysv_poll256_group_4[9]), "=r"(_sysv_poll256_group_4[10]), "=r"(_sysv_poll256_group_4[11]), "=r"(_sysv_poll256_group_4[12]), "=r"(_sysv_poll256_group_4[13]), "=r"(_sysv_poll256_group_4[14]), "=r"(_sysv_poll256_group_4[15]) : "l"(local_payload + offset_0_4) : "memory");
+                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_4[16]), "=r"(_sysv_poll256_group_4[17]), "=r"(_sysv_poll256_group_4[18]), "=r"(_sysv_poll256_group_4[19]), "=r"(_sysv_poll256_group_4[20]), "=r"(_sysv_poll256_group_4[21]), "=r"(_sysv_poll256_group_4[22]), "=r"(_sysv_poll256_group_4[23]) : "l"(local_payload + offset_1_4) : "memory");
+                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_4[24]), "=r"(_sysv_poll256_group_4[25]), "=r"(_sysv_poll256_group_4[26]), "=r"(_sysv_poll256_group_4[27]), "=r"(_sysv_poll256_group_4[28]), "=r"(_sysv_poll256_group_4[29]), "=r"(_sysv_poll256_group_4[30]), "=r"(_sysv_poll256_group_4[31]) : "l"(local_payload + offset_2_3) : "memory");
+                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_4[32]), "=r"(_sysv_poll256_group_4[33]), "=r"(_sysv_poll256_group_4[34]), "=r"(_sysv_poll256_group_4[35]), "=r"(_sysv_poll256_group_4[36]), "=r"(_sysv_poll256_group_4[37]), "=r"(_sysv_poll256_group_4[38]), "=r"(_sysv_poll256_group_4[39]) : "l"(local_payload + offset_3_3) : "memory");
+                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_4[40]), "=r"(_sysv_poll256_group_4[41]), "=r"(_sysv_poll256_group_4[42]), "=r"(_sysv_poll256_group_4[43]), "=r"(_sysv_poll256_group_4[44]), "=r"(_sysv_poll256_group_4[45]), "=r"(_sysv_poll256_group_4[46]), "=r"(_sysv_poll256_group_4[47]) : "l"(local_payload + offset_4_3) : "memory");
+                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_4[48]), "=r"(_sysv_poll256_group_4[49]), "=r"(_sysv_poll256_group_4[50]), "=r"(_sysv_poll256_group_4[51]), "=r"(_sysv_poll256_group_4[52]), "=r"(_sysv_poll256_group_4[53]), "=r"(_sysv_poll256_group_4[54]), "=r"(_sysv_poll256_group_4[55]) : "l"(local_payload + offset_5_3) : "memory");
+                asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_4[56]), "=r"(_sysv_poll256_group_4[57]), "=r"(_sysv_poll256_group_4[58]), "=r"(_sysv_poll256_group_4[59]), "=r"(_sysv_poll256_group_4[60]), "=r"(_sysv_poll256_group_4[61]), "=r"(_sysv_poll256_group_4[62]), "=r"(_sysv_poll256_group_4[63]) : "l"(local_payload + offset_6_3) : "memory");
+            } while (
+                (((_sysv_poll256_group_4[0] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[0] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[1] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[1] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[2] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[2] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[3] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[3] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[4] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[4] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[5] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[5] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[6] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[6] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[7] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[7] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[8] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[8] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[9] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[9] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[10] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[10] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[11] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[11] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[12] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[12] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[13] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[13] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[14] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[14] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[15] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[15] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[16] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[16] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[17] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[17] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[18] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[18] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[19] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[19] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[20] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[20] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[21] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[21] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[22] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[22] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[23] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[23] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[24] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[24] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[25] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[25] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[26] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[26] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[27] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[27] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[28] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[28] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[29] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[29] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[30] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[30] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[31] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[31] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[32] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[32] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[33] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[33] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[34] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[34] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[35] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[35] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[36] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[36] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[37] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[37] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[38] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[38] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[39] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[39] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[40] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[40] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[41] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[41] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[42] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[42] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[43] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[43] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[44] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[44] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[45] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[45] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[46] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[46] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[47] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[47] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[48] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[48] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[49] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[49] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[50] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[50] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[51] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[51] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[52] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[52] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[53] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[53] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[54] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[54] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[55] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[55] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[56] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[56] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[57] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[57] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[58] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[58] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[59] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[59] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[60] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[60] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[61] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[61] >> 16) & 0xffffu) == 0x8000u) ||
+                (((_sysv_poll256_group_4[62] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[62] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[63] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[63] >> 16) & 0xffffu) == 0x8000u)
+            );
+            float _unpack_bf16_7[16];
+            #pragma unroll
+            for (int _pair = 0; _pair < 8; _pair++) {
+                (&_unpack_bf16_7[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_4[_pair]) << 16);
+                (&_unpack_bf16_7[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_4[_pair]) & 0xffff0000u);
+            }
+            #pragma unroll
+            for (int peer_6 = 1; peer_6 < 8; peer_6++) {
+                float _unpack_bf16_8[16];
+                #pragma unroll
+                for (int _pair = 0; _pair < 8; _pair++) {
+                    (&_unpack_bf16_8[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((_sysv_poll256_group_4 + peer_6 * 8)[_pair]) << 16);
+                    (&_unpack_bf16_8[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((_sysv_poll256_group_4 + peer_6 * 8)[_pair]) & 0xffff0000u);
+                }
+                #pragma unroll
+                for (int element_7 = 0; element_7 < 16; element_7++) {
+                    _unpack_bf16_7[element_7] = (float)(__nv_bfloat16)(_unpack_bf16_7[element_7] + _unpack_bf16_8[element_7]);
+                }
+            }
+            unsigned int _unpack_bf16_7_bf16[8];
+            #pragma unroll
+            for (int _lp = 0; _lp < 8; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_unpack_bf16_7[_lp*2 + 0], _unpack_bf16_7[_lp*2+1 + 0]));
+                _unpack_bf16_7_bf16[_lp] = *(uint32_t*)&_bf2;
+            }
+            long long offset_7_3 = data_base + ((long long)(8 * slots + pending_2) * 160 + (long long)tid) * 16;
+            #pragma unroll
+            for (int peer_7 = 0; peer_7 < 8; peer_7++) {
+                __nv_bfloat16* peer_payload_3 = reinterpret_cast<__nv_bfloat16*>(workspace[16 + peer_7]);
+                asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(peer_payload_3 + offset_7_3), "r"((_unpack_bf16_7_bf16)[0]), "r"((_unpack_bf16_7_bf16)[1]), "r"((_unpack_bf16_7_bf16)[2]), "r"((_unpack_bf16_7_bf16)[3]), "r"((_unpack_bf16_7_bf16)[4]), "r"((_unpack_bf16_7_bf16)[5]), "r"((_unpack_bf16_7_bf16)[6]), "r"((_unpack_bf16_7_bf16)[7]) : "memory");
+            }
+        }
+    }
     int unfinished = last - 3 * num_bids;
     if (unfinished >= 0) {
-        long long offset_11 = data_base + ((long long)(8 * slots + unfinished) * 160 + (long long)tid) * 16;
-        uint32_t _sysv_poll256_group_4[8];
-        do {
-            asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_4[0]), "=r"(_sysv_poll256_group_4[1]), "=r"(_sysv_poll256_group_4[2]), "=r"(_sysv_poll256_group_4[3]), "=r"(_sysv_poll256_group_4[4]), "=r"(_sysv_poll256_group_4[5]), "=r"(_sysv_poll256_group_4[6]), "=r"(_sysv_poll256_group_4[7]) : "l"(local_payload + offset_11) : "memory");
-        } while (
-            (((_sysv_poll256_group_4[0] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[0] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[1] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[1] >> 16) & 0xffffu) == 0x8000u) ||
-            (((_sysv_poll256_group_4[2] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[2] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[3] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[3] >> 16) & 0xffffu) == 0x8000u) ||
-            (((_sysv_poll256_group_4[4] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[4] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[5] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[5] >> 16) & 0xffffu) == 0x8000u) ||
-            (((_sysv_poll256_group_4[6] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[6] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[7] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_4[7] >> 16) & 0xffffu) == 0x8000u)
-        );
-        float _unpack_bf16_7[16];
-        #pragma unroll
-        for (int _pair = 0; _pair < 8; _pair++) {
-            (&_unpack_bf16_7[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_4[_pair]) << 16);
-            (&_unpack_bf16_7[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_4[_pair]) & 0xffff0000u);
-        }
-        unsigned int _unpack_bf16_7_bf16[8];
-        #pragma unroll
-        for (int _lp = 0; _lp < 8; _lp++) {
-            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_unpack_bf16_7[_lp*2 + 0], _unpack_bf16_7[_lp*2+1 + 0]));
-            _unpack_bf16_7_bf16[_lp] = *(uint32_t*)&_bf2;
-        }
-        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(collective_out + (((long long)unfinished * 160 + (long long)tid) * 16)), "r"((_unpack_bf16_7_bf16)[0]), "r"((_unpack_bf16_7_bf16)[1]), "r"((_unpack_bf16_7_bf16)[2]), "r"((_unpack_bf16_7_bf16)[3]), "r"((_unpack_bf16_7_bf16)[4]), "r"((_unpack_bf16_7_bf16)[5]), "r"((_unpack_bf16_7_bf16)[6]), "r"((_unpack_bf16_7_bf16)[7]) : "memory");
-    }
-    int unfinished_2 = last - 2 * num_bids;
-    if (unfinished_2 >= 0) {
-        long long offset_12 = data_base + ((long long)(8 * slots + unfinished_2) * 160 + (long long)tid) * 16;
+        long long offset_12 = data_base + ((long long)(8 * slots + unfinished) * 160 + (long long)tid) * 16;
         uint32_t _sysv_poll256_group_5[8];
         do {
             asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_5[0]), "=r"(_sysv_poll256_group_5[1]), "=r"(_sysv_poll256_group_5[2]), "=r"(_sysv_poll256_group_5[3]), "=r"(_sysv_poll256_group_5[4]), "=r"(_sysv_poll256_group_5[5]), "=r"(_sysv_poll256_group_5[6]), "=r"(_sysv_poll256_group_5[7]) : "l"(local_payload + offset_12) : "memory");
@@ -594,21 +657,21 @@ kernel_cake_fused_norm_combine_ea0f75f8e8b9fc871c9d(__nv_bfloat16* __restrict__ 
             (((_sysv_poll256_group_5[4] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_5[4] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_5[5] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_5[5] >> 16) & 0xffffu) == 0x8000u) ||
             (((_sysv_poll256_group_5[6] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_5[6] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_5[7] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_5[7] >> 16) & 0xffffu) == 0x8000u)
         );
-        float _unpack_bf16_8[16];
+        float _unpack_bf16_9[16];
         #pragma unroll
         for (int _pair = 0; _pair < 8; _pair++) {
-            (&_unpack_bf16_8[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_5[_pair]) << 16);
-            (&_unpack_bf16_8[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_5[_pair]) & 0xffff0000u);
+            (&_unpack_bf16_9[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_5[_pair]) << 16);
+            (&_unpack_bf16_9[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_5[_pair]) & 0xffff0000u);
         }
-        unsigned int _unpack_bf16_8_bf16[8];
+        unsigned int _unpack_bf16_9_bf16[8];
         #pragma unroll
         for (int _lp = 0; _lp < 8; _lp++) {
-            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_unpack_bf16_8[_lp*2 + 0], _unpack_bf16_8[_lp*2+1 + 0]));
-            _unpack_bf16_8_bf16[_lp] = *(uint32_t*)&_bf2;
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_unpack_bf16_9[_lp*2 + 0], _unpack_bf16_9[_lp*2+1 + 0]));
+            _unpack_bf16_9_bf16[_lp] = *(uint32_t*)&_bf2;
         }
-        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(collective_out + (((long long)unfinished_2 * 160 + (long long)tid) * 16)), "r"((_unpack_bf16_8_bf16)[0]), "r"((_unpack_bf16_8_bf16)[1]), "r"((_unpack_bf16_8_bf16)[2]), "r"((_unpack_bf16_8_bf16)[3]), "r"((_unpack_bf16_8_bf16)[4]), "r"((_unpack_bf16_8_bf16)[5]), "r"((_unpack_bf16_8_bf16)[6]), "r"((_unpack_bf16_8_bf16)[7]) : "memory");
+        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(collective_out + (((long long)unfinished * 160 + (long long)tid) * 16)), "r"((_unpack_bf16_9_bf16)[0]), "r"((_unpack_bf16_9_bf16)[1]), "r"((_unpack_bf16_9_bf16)[2]), "r"((_unpack_bf16_9_bf16)[3]), "r"((_unpack_bf16_9_bf16)[4]), "r"((_unpack_bf16_9_bf16)[5]), "r"((_unpack_bf16_9_bf16)[6]), "r"((_unpack_bf16_9_bf16)[7]) : "memory");
     }
-    int unfinished_3 = last - num_bids;
+    int unfinished_3 = last - 2 * num_bids;
     if (unfinished_3 >= 0) {
         long long offset_13 = data_base + ((long long)(8 * slots + unfinished_3) * 160 + (long long)tid) * 16;
         uint32_t _sysv_poll256_group_6[8];
@@ -620,21 +683,21 @@ kernel_cake_fused_norm_combine_ea0f75f8e8b9fc871c9d(__nv_bfloat16* __restrict__ 
             (((_sysv_poll256_group_6[4] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_6[4] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_6[5] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_6[5] >> 16) & 0xffffu) == 0x8000u) ||
             (((_sysv_poll256_group_6[6] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_6[6] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_6[7] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_6[7] >> 16) & 0xffffu) == 0x8000u)
         );
-        float _unpack_bf16_9[16];
+        float _unpack_bf16_10[16];
         #pragma unroll
         for (int _pair = 0; _pair < 8; _pair++) {
-            (&_unpack_bf16_9[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_6[_pair]) << 16);
-            (&_unpack_bf16_9[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_6[_pair]) & 0xffff0000u);
+            (&_unpack_bf16_10[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_6[_pair]) << 16);
+            (&_unpack_bf16_10[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_6[_pair]) & 0xffff0000u);
         }
-        unsigned int _unpack_bf16_9_bf16[8];
+        unsigned int _unpack_bf16_10_bf16[8];
         #pragma unroll
         for (int _lp = 0; _lp < 8; _lp++) {
-            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_unpack_bf16_9[_lp*2 + 0], _unpack_bf16_9[_lp*2+1 + 0]));
-            _unpack_bf16_9_bf16[_lp] = *(uint32_t*)&_bf2;
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_unpack_bf16_10[_lp*2 + 0], _unpack_bf16_10[_lp*2+1 + 0]));
+            _unpack_bf16_10_bf16[_lp] = *(uint32_t*)&_bf2;
         }
-        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(collective_out + (((long long)unfinished_3 * 160 + (long long)tid) * 16)), "r"((_unpack_bf16_9_bf16)[0]), "r"((_unpack_bf16_9_bf16)[1]), "r"((_unpack_bf16_9_bf16)[2]), "r"((_unpack_bf16_9_bf16)[3]), "r"((_unpack_bf16_9_bf16)[4]), "r"((_unpack_bf16_9_bf16)[5]), "r"((_unpack_bf16_9_bf16)[6]), "r"((_unpack_bf16_9_bf16)[7]) : "memory");
+        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(collective_out + (((long long)unfinished_3 * 160 + (long long)tid) * 16)), "r"((_unpack_bf16_10_bf16)[0]), "r"((_unpack_bf16_10_bf16)[1]), "r"((_unpack_bf16_10_bf16)[2]), "r"((_unpack_bf16_10_bf16)[3]), "r"((_unpack_bf16_10_bf16)[4]), "r"((_unpack_bf16_10_bf16)[5]), "r"((_unpack_bf16_10_bf16)[6]), "r"((_unpack_bf16_10_bf16)[7]) : "memory");
     }
-    int unfinished_4 = last;
+    int unfinished_4 = last - num_bids;
     if (unfinished_4 >= 0) {
         long long offset_14 = data_base + ((long long)(8 * slots + unfinished_4) * 160 + (long long)tid) * 16;
         uint32_t _sysv_poll256_group_7[8];
@@ -646,19 +709,45 @@ kernel_cake_fused_norm_combine_ea0f75f8e8b9fc871c9d(__nv_bfloat16* __restrict__ 
             (((_sysv_poll256_group_7[4] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_7[4] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_7[5] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_7[5] >> 16) & 0xffffu) == 0x8000u) ||
             (((_sysv_poll256_group_7[6] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_7[6] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_7[7] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_7[7] >> 16) & 0xffffu) == 0x8000u)
         );
-        float _unpack_bf16_10[16];
+        float _unpack_bf16_11[16];
         #pragma unroll
         for (int _pair = 0; _pair < 8; _pair++) {
-            (&_unpack_bf16_10[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_7[_pair]) << 16);
-            (&_unpack_bf16_10[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_7[_pair]) & 0xffff0000u);
+            (&_unpack_bf16_11[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_7[_pair]) << 16);
+            (&_unpack_bf16_11[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_7[_pair]) & 0xffff0000u);
         }
-        unsigned int _unpack_bf16_10_bf16[8];
+        unsigned int _unpack_bf16_11_bf16[8];
         #pragma unroll
         for (int _lp = 0; _lp < 8; _lp++) {
-            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_unpack_bf16_10[_lp*2 + 0], _unpack_bf16_10[_lp*2+1 + 0]));
-            _unpack_bf16_10_bf16[_lp] = *(uint32_t*)&_bf2;
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_unpack_bf16_11[_lp*2 + 0], _unpack_bf16_11[_lp*2+1 + 0]));
+            _unpack_bf16_11_bf16[_lp] = *(uint32_t*)&_bf2;
         }
-        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(collective_out + (((long long)unfinished_4 * 160 + (long long)tid) * 16)), "r"((_unpack_bf16_10_bf16)[0]), "r"((_unpack_bf16_10_bf16)[1]), "r"((_unpack_bf16_10_bf16)[2]), "r"((_unpack_bf16_10_bf16)[3]), "r"((_unpack_bf16_10_bf16)[4]), "r"((_unpack_bf16_10_bf16)[5]), "r"((_unpack_bf16_10_bf16)[6]), "r"((_unpack_bf16_10_bf16)[7]) : "memory");
+        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(collective_out + (((long long)unfinished_4 * 160 + (long long)tid) * 16)), "r"((_unpack_bf16_11_bf16)[0]), "r"((_unpack_bf16_11_bf16)[1]), "r"((_unpack_bf16_11_bf16)[2]), "r"((_unpack_bf16_11_bf16)[3]), "r"((_unpack_bf16_11_bf16)[4]), "r"((_unpack_bf16_11_bf16)[5]), "r"((_unpack_bf16_11_bf16)[6]), "r"((_unpack_bf16_11_bf16)[7]) : "memory");
+    }
+    int unfinished_5 = last;
+    if (unfinished_5 >= 0) {
+        long long offset_15 = data_base + ((long long)(8 * slots + unfinished_5) * 160 + (long long)tid) * 16;
+        uint32_t _sysv_poll256_group_8[8];
+        do {
+            asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_8[0]), "=r"(_sysv_poll256_group_8[1]), "=r"(_sysv_poll256_group_8[2]), "=r"(_sysv_poll256_group_8[3]), "=r"(_sysv_poll256_group_8[4]), "=r"(_sysv_poll256_group_8[5]), "=r"(_sysv_poll256_group_8[6]), "=r"(_sysv_poll256_group_8[7]) : "l"(local_payload + offset_15) : "memory");
+        } while (
+            (((_sysv_poll256_group_8[0] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_8[0] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_8[1] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_8[1] >> 16) & 0xffffu) == 0x8000u) ||
+            (((_sysv_poll256_group_8[2] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_8[2] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_8[3] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_8[3] >> 16) & 0xffffu) == 0x8000u) ||
+            (((_sysv_poll256_group_8[4] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_8[4] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_8[5] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_8[5] >> 16) & 0xffffu) == 0x8000u) ||
+            (((_sysv_poll256_group_8[6] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_8[6] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_8[7] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_8[7] >> 16) & 0xffffu) == 0x8000u)
+        );
+        float _unpack_bf16_12[16];
+        #pragma unroll
+        for (int _pair = 0; _pair < 8; _pair++) {
+            (&_unpack_bf16_12[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_8[_pair]) << 16);
+            (&_unpack_bf16_12[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_sysv_poll256_group_8[_pair]) & 0xffff0000u);
+        }
+        unsigned int _unpack_bf16_12_bf16[8];
+        #pragma unroll
+        for (int _lp = 0; _lp < 8; _lp++) {
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_unpack_bf16_12[_lp*2 + 0], _unpack_bf16_12[_lp*2+1 + 0]));
+            _unpack_bf16_12_bf16[_lp] = *(uint32_t*)&_bf2;
+        }
+        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(collective_out + (((long long)unfinished_5 * 160 + (long long)tid) * 16)), "r"((_unpack_bf16_12_bf16)[0]), "r"((_unpack_bf16_12_bf16)[1]), "r"((_unpack_bf16_12_bf16)[2]), "r"((_unpack_bf16_12_bf16)[3]), "r"((_unpack_bf16_12_bf16)[4]), "r"((_unpack_bf16_12_bf16)[5]), "r"((_unpack_bf16_12_bf16)[6]), "r"((_unpack_bf16_12_bf16)[7]) : "memory");
     }
     if (bid == 0) {
         if (tid == 0) {
