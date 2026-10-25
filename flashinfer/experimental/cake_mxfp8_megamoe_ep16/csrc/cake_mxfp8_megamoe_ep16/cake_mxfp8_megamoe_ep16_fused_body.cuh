@@ -86,24 +86,26 @@ static __device__ __forceinline__ void cake_megamoe_dispatch_rows(
 #endif
 #ifndef CAKE_MEGAMOE_DISPATCH_ROWS_EARLY_DEFINED
 #define CAKE_MEGAMOE_DISPATCH_ROWS_EARLY_DEFINED
-// Early dispatch: lanes 0-7 load the token's route id and weight together; the warp votes on ownership before the
-// row claim, and issues the remote row loads before the claim's atomic, so an owned token waits for two NVLink round
-// trips (ids+weights, row) instead of four (ids, weight after the claim, two row passes).  Warps whose role holds 80
+// Early dispatch: lanes 0-7 load the token's route id and weight together from this rank's route mailbox; the warp
+// votes on ownership before the row claim, and issues the row loads (from this rank's row mailbox) before the claim's
+// atomic, so an owned token needs no NVLink round trip.  Warps whose role holds 80
 // registers (kOnePass) load the whole 6 KiB row at once; the 64-register roles keep two passes of six words.
 // Token slots: epilogue warps 0-3 -> 0-3, transform warps 8-11 -> 4-7, warps 4-7 -> 8-11.
 template <bool kOnePass>
 static __device__ __forceinline__ void cake_megamoe_dispatch_rows_early(
     int bid, int slot, int lane, int tokens_per_rank, int mega_pg_rank,
-    int* const* __restrict__ published_topk_ids_i32_peers,
-    float* const* __restrict__ published_topk_weights_f32_peers,
-    __nv_bfloat16* const* __restrict__ published_hidden_bf16_peers,
+    const int* __restrict__ route_ids_mailbox,
+    const float* __restrict__ route_weights_mailbox,
+    const __nv_bfloat16* __restrict__ row_mailbox,
     unsigned int* __restrict__ route_counts_u32, int* __restrict__ route_map_i32, float* __restrict__ route_scale_f32,
     __nv_bfloat16* __restrict__ activation_bf16_ptr) {
     const int source_rank = bid % 16;
     const int source_token_begin = bid / 16;
-    const int* remote_ids = reinterpret_cast<const int*>(published_topk_ids_i32_peers[source_rank]);
-    const float* remote_weights = reinterpret_cast<const float*>(published_topk_weights_f32_peers[source_rank]);
-    const uint4* remote_hidden = reinterpret_cast<const uint4*>(published_hidden_bf16_peers[source_rank]);
+    // The source rank's routes, pushed into this rank's mailbox slot before rank barrier 0 (local loads).
+    const int* mailbox_ids = route_ids_mailbox + source_rank * tokens_per_rank * 8;
+    const float* mailbox_weights = route_weights_mailbox + source_rank * tokens_per_rank * 8;
+    // The source rank's rows, pushed into this rank's row mailbox slot before rank barrier 0 (local loads).
+    const uint4* remote_hidden = reinterpret_cast<const uint4*>(row_mailbox + source_rank * tokens_per_rank * 3072);
     const int local_tokens = (tokens_per_rank - source_token_begin + 8) / 9;
     constexpr int kWords = kOnePass ? 12 : 6;
     #pragma unroll 1
@@ -114,8 +116,8 @@ static __device__ __forceinline__ void cake_megamoe_dispatch_rows_early(
         int global_expert = 0;
         unsigned int weight_bits = 0u;
         if (lane < 8) {
-            asm volatile("ld.global.b32 %0, [%1];" : "=r"(global_expert) : "l"(remote_ids + source_route_lane) : "memory");
-            asm volatile("ld.global.b32 %0, [%1];" : "=r"(weight_bits) : "l"(remote_weights + source_route_lane) : "memory");
+            asm volatile("ld.global.b32 %0, [%1];" : "=r"(global_expert) : "l"(mailbox_ids + source_route_lane) : "memory");
+            asm volatile("ld.global.b32 %0, [%1];" : "=r"(weight_bits) : "l"(mailbox_weights + source_route_lane) : "memory");
         }
         const bool owned = lane < 8 && global_expert / 32 == mega_pg_rank;
         if (__any_sync(0xFFFFFFFFu, owned)) {
@@ -393,8 +395,27 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                 asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(barrier_old_sense0) : "l"(barrier_local_flag0) : "memory");
                 asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(barrier_old_sense1) : "l"(barrier_local_flag1) : "memory");
             }
+            if (bid != 0 && warp == 0) {
+                // The other CTAs wait on this rank's barrier-0 flag themselves; its sense bit cannot flip before CTA 0's
+                // add, which follows this CTA's publication arrival below.
+                barrier_local_flag0 = mega_pg_flags[mega_pg_rank] + 0;
+                asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(barrier_old_sense0) : "l"(barrier_local_flag0) : "memory");
+            }
             int linear_thread = bid * 384 + tid;
             int thread_stride = num_bids * 384;
+            // Route push: this rank stores its routes (ids and weights) into its own slot of every rank's route
+            // mailbox (published_topk_*[source rank][route]) before the publication barrier, so dispatch reads them
+            // locally; the stores are issued first so that their NVLink latency overlaps the rest of the publication.
+            #pragma unroll 1
+            for (int push = linear_thread; push < 16 * tokens_per_rank * 8; push += thread_stride) {
+                const int push_dest = push / (tokens_per_rank * 8);
+                const int push_route = push - push_dest * (tokens_per_rank * 8);
+                const int push_slot = mega_pg_rank * tokens_per_rank * 8 + push_route;
+                int* ids_dst = push_dest == mega_pg_rank ? published_topk_ids_i32 : published_topk_ids_i32_peers[push_dest];
+                float* weights_dst = push_dest == mega_pg_rank ? published_topk_weights_f32 : published_topk_weights_f32_peers[push_dest];
+                ids_dst[push_slot] = (int)source_topk_ids_i64[push_route];
+                weights_dst[push_slot] = source_topk_weights_f32[push_route];
+            }
             #pragma unroll 1
             for (int index = linear_thread; index < 2048; index += thread_stride) {
                 route_map_i32[index] = -1;
@@ -439,15 +460,22 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                     _pk[1] = __floats2bfloat162_rn(_vec_load_10[0 + 2], _vec_load_10[0 + 3]);
                     _pk[2] = __floats2bfloat162_rn(_vec_load_10[0 + 4], _vec_load_10[0 + 5]);
                     _pk[3] = __floats2bfloat162_rn(_vec_load_10[0 + 6], _vec_load_10[0 + 7]);
-                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(reinterpret_cast<__nv_bfloat16*>(published_hidden_bf16) + index_1))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                    // Row push: this 16-byte chunk goes to this rank's slot of every rank that owns one of the token's routes
+                    // (published_hidden[source rank][token]); the stores precede the publication barrier.
+                    const uint4 push_chunk = *reinterpret_cast<uint4*>(&_pk[0]);
+                    const int push_token = index_1 / 3072;
+                    unsigned int push_owners = 0u;
+                    #pragma unroll
+                    for (int push_slot = 0; push_slot < 8; ++push_slot) {
+                        push_owners |= 1u << ((int)source_topk_ids_i64[push_token * 8 + push_slot] / 32);
+                    }
+                    while (push_owners != 0u) {
+                        const int push_dest = __ffs(push_owners) - 1;
+                        push_owners &= push_owners - 1u;
+                        __nv_bfloat16* rows_dst = push_dest == mega_pg_rank ? published_hidden_bf16 : published_hidden_bf16_peers[push_dest];
+                        *reinterpret_cast<uint4*>(rows_dst + mega_pg_rank * tokens_per_rank * 3072 + index_1) = push_chunk;
+                    }
                 }
-            }
-            #pragma unroll 1
-            for (int route = linear_thread; route < tokens_per_rank * 8; route += thread_stride) {
-                int route_id = (int)source_topk_ids_i64[route];
-                float route_weight = source_topk_weights_f32[route];
-                *(reinterpret_cast<int*>(reinterpret_cast<int*>(published_topk_ids_i32) + route) + (0)) = route_id;
-                *(reinterpret_cast<float*>(reinterpret_cast<float*>(published_topk_weights_f32) + route) + (0)) = route_weight;
             }
             // Route-term arrival words: before the publication barrier every 32-bit word of this rank's route_terms_bf16
             // is set to all ones (two BF16 NaNs that no conversion produces).  Peers store each word exactly once after
@@ -460,8 +488,10 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                                  :: "l"((void*)(route_terms_bf16 + arrival_word)), "r"(0xFFFFFFFFu) : "memory");
                 }
             }
+            // The publication stores and the first forward's arrival-word stores are ordered by this CTA barrier and
+            // the elected thread's gpu-scope release below, and CTA 0's system-scope fence before its rank-barrier adds
+            // (cumulative over what it acquired) orders them for the peers; no per-thread system-scope fence.
             asm volatile("barrier.sync 12, 384;" ::: "memory");
-            asm volatile("fence.release.sys;" ::: "memory");
             if (warp == 0) {
                 if (elect_sync()) {
                     {
@@ -528,21 +558,21 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                     }
                 }
             }
-            if (warp == 0) {
+            if (bid != 0 && warp == 0) {
                 if (elect_sync()) {
-                    {
-                        unsigned int* _gca_p = reinterpret_cast<unsigned int*>(publication_visible) + (0);
-                        while (true) {
-                            unsigned int _gca_v;
-                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_gca_v) : "l"(_gca_p));
-                            if (_gca_v >= (unsigned int)(launch_epoch + 1)) break;
-                        }
+                    // Rank barrier phase 0, seen directly by every CTA: the sense flip of this rank's flag (written by the
+                    // peers' system-scope adds after their publication).  No CTA reads CTA 0's publication_visible count.
+                    while (true) {
+                        unsigned __v;
+                        asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(barrier_local_flag0) : "memory");
+                        if (((barrier_old_sense0 ^ __v) & 0x80000000u) != 0u) break;
                     }
+                    asm volatile("fence.proxy.async.global;" ::: "memory");
                 }
             }
             asm volatile("barrier.sync 12, 384;" ::: "memory");
-            cake_megamoe_dispatch_rows_early<true>(bid, warp, lane, tokens_per_rank, mega_pg_rank, published_topk_ids_i32_peers,
-                published_topk_weights_f32_peers, published_hidden_bf16_peers, route_counts_u32, route_map_i32,
+            cake_megamoe_dispatch_rows_early<true>(bid, warp, lane, tokens_per_rank, mega_pg_rank, published_topk_ids_i32,
+                published_topk_weights_f32, published_hidden_bf16, route_counts_u32, route_map_i32,
                 route_scale_f32, activation_bf16_ptr);
             asm volatile("barrier.sync 12, 384;" ::: "memory");
             asm volatile("fence.release.gpu;" ::: "memory");
@@ -570,9 +600,10 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
             asm volatile("barrier.sync 12, 384;" ::: "memory");
             if (bid == 0 && warp == 0) {
                 if (elect_sync()) {
-                    // Rank barrier phase 1, arrival half: this rank's dispatch has read every peer's published rows
+                    // Rank barrier phase 1, arrival half: this rank's dispatch has read its route and row mailboxes
                     // (dispatch_done above), so it arrives now; the wait half runs at the end of the kernel, before the
-                    // next forward republishes.  The wait half's operands were loaded by every lane at the start.
+                    // next forward pushes routes and rows into the peers' mailboxes.  The wait half's operands were
+                    // loaded by every lane at the start.
                     {
                         const int __ws = mega_pg_world;
                         const int __me = mega_pg_rank;
@@ -1423,6 +1454,19 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
         { // mma_main
             int linear_thread_1 = bid * 384 + tid;
             int thread_stride_1 = num_bids * 384;
+            // Route push: this rank stores its routes (ids and weights) into its own slot of every rank's route
+            // mailbox (published_topk_*[source rank][route]) before the publication barrier, so dispatch reads them
+            // locally; the stores are issued first so that their NVLink latency overlaps the rest of the publication.
+            #pragma unroll 1
+            for (int push = linear_thread_1; push < 16 * tokens_per_rank * 8; push += thread_stride_1) {
+                const int push_dest = push / (tokens_per_rank * 8);
+                const int push_route = push - push_dest * (tokens_per_rank * 8);
+                const int push_slot = mega_pg_rank * tokens_per_rank * 8 + push_route;
+                int* ids_dst = push_dest == mega_pg_rank ? published_topk_ids_i32 : published_topk_ids_i32_peers[push_dest];
+                float* weights_dst = push_dest == mega_pg_rank ? published_topk_weights_f32 : published_topk_weights_f32_peers[push_dest];
+                ids_dst[push_slot] = (int)source_topk_ids_i64[push_route];
+                weights_dst[push_slot] = source_topk_weights_f32[push_route];
+            }
             #pragma unroll 1
             for (int index_2 = linear_thread_1; index_2 < 2048; index_2 += thread_stride_1) {
                 route_map_i32[index_2] = -1;
@@ -1467,15 +1511,22 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                     _pk[1] = __floats2bfloat162_rn(_vec_load_8[0 + 2], _vec_load_8[0 + 3]);
                     _pk[2] = __floats2bfloat162_rn(_vec_load_8[0 + 4], _vec_load_8[0 + 5]);
                     _pk[3] = __floats2bfloat162_rn(_vec_load_8[0 + 6], _vec_load_8[0 + 7]);
-                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(reinterpret_cast<__nv_bfloat16*>(published_hidden_bf16) + index_3))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                    // Row push: this 16-byte chunk goes to this rank's slot of every rank that owns one of the token's routes
+                    // (published_hidden[source rank][token]); the stores precede the publication barrier.
+                    const uint4 push_chunk = *reinterpret_cast<uint4*>(&_pk[0]);
+                    const int push_token = index_3 / 3072;
+                    unsigned int push_owners = 0u;
+                    #pragma unroll
+                    for (int push_slot = 0; push_slot < 8; ++push_slot) {
+                        push_owners |= 1u << ((int)source_topk_ids_i64[push_token * 8 + push_slot] / 32);
+                    }
+                    while (push_owners != 0u) {
+                        const int push_dest = __ffs(push_owners) - 1;
+                        push_owners &= push_owners - 1u;
+                        __nv_bfloat16* rows_dst = push_dest == mega_pg_rank ? published_hidden_bf16 : published_hidden_bf16_peers[push_dest];
+                        *reinterpret_cast<uint4*>(rows_dst + mega_pg_rank * tokens_per_rank * 3072 + index_3) = push_chunk;
+                    }
                 }
-            }
-            #pragma unroll 1
-            for (int route_1 = linear_thread_1; route_1 < tokens_per_rank * 8; route_1 += thread_stride_1) {
-                int route_id_1 = (int)source_topk_ids_i64[route_1];
-                float route_weight_1 = source_topk_weights_f32[route_1];
-                *(reinterpret_cast<int*>(reinterpret_cast<int*>(published_topk_ids_i32) + route_1) + (0)) = route_id_1;
-                *(reinterpret_cast<float*>(reinterpret_cast<float*>(published_topk_weights_f32) + route_1) + (0)) = route_weight_1;
             }
             // Route-term arrival words: before the publication barrier every 32-bit word of this rank's route_terms_bf16
             // is set to all ones (two BF16 NaNs that no conversion produces).  Peers store each word exactly once after
@@ -1488,8 +1539,10 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                                  :: "l"((void*)(route_terms_bf16 + arrival_word)), "r"(0xFFFFFFFFu) : "memory");
                 }
             }
+            // The publication stores and the first forward's arrival-word stores are ordered by this CTA barrier and
+            // the elected thread's gpu-scope release below, and CTA 0's system-scope fence before its rank-barrier adds
+            // (cumulative over what it acquired) orders them for the peers; no per-thread system-scope fence.
             asm volatile("barrier.sync 12, 384;" ::: "memory");
-            asm volatile("fence.release.sys;" ::: "memory");
             if (warp == 0) {
                 if (elect_sync()) {
                     {
@@ -1572,8 +1625,8 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                 }
             }
             asm volatile("barrier.sync 12, 384;" ::: "memory");
-            cake_megamoe_dispatch_rows_early<false>(bid, warp + 4, lane, tokens_per_rank, mega_pg_rank, published_topk_ids_i32_peers,
-                published_topk_weights_f32_peers, published_hidden_bf16_peers, route_counts_u32, route_map_i32,
+            cake_megamoe_dispatch_rows_early<false>(bid, warp + 4, lane, tokens_per_rank, mega_pg_rank, published_topk_ids_i32,
+                published_topk_weights_f32, published_hidden_bf16, route_counts_u32, route_map_i32,
                 route_scale_f32, activation_bf16_ptr);
             asm volatile("barrier.sync 12, 384;" ::: "memory");
             asm volatile("fence.release.gpu;" ::: "memory");
@@ -1753,6 +1806,19 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
         { // tma_a_scale_main
             int linear_thread_2 = bid * 384 + tid;
             int thread_stride_2 = num_bids * 384;
+            // Route push: this rank stores its routes (ids and weights) into its own slot of every rank's route
+            // mailbox (published_topk_*[source rank][route]) before the publication barrier, so dispatch reads them
+            // locally; the stores are issued first so that their NVLink latency overlaps the rest of the publication.
+            #pragma unroll 1
+            for (int push = linear_thread_2; push < 16 * tokens_per_rank * 8; push += thread_stride_2) {
+                const int push_dest = push / (tokens_per_rank * 8);
+                const int push_route = push - push_dest * (tokens_per_rank * 8);
+                const int push_slot = mega_pg_rank * tokens_per_rank * 8 + push_route;
+                int* ids_dst = push_dest == mega_pg_rank ? published_topk_ids_i32 : published_topk_ids_i32_peers[push_dest];
+                float* weights_dst = push_dest == mega_pg_rank ? published_topk_weights_f32 : published_topk_weights_f32_peers[push_dest];
+                ids_dst[push_slot] = (int)source_topk_ids_i64[push_route];
+                weights_dst[push_slot] = source_topk_weights_f32[push_route];
+            }
             #pragma unroll 1
             for (int index_4 = linear_thread_2; index_4 < 2048; index_4 += thread_stride_2) {
                 route_map_i32[index_4] = -1;
@@ -1797,15 +1863,22 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                     _pk[1] = __floats2bfloat162_rn(_vec_load_0[0 + 2], _vec_load_0[0 + 3]);
                     _pk[2] = __floats2bfloat162_rn(_vec_load_0[0 + 4], _vec_load_0[0 + 5]);
                     _pk[3] = __floats2bfloat162_rn(_vec_load_0[0 + 6], _vec_load_0[0 + 7]);
-                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(reinterpret_cast<__nv_bfloat16*>(published_hidden_bf16) + index_5))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                    // Row push: this 16-byte chunk goes to this rank's slot of every rank that owns one of the token's routes
+                    // (published_hidden[source rank][token]); the stores precede the publication barrier.
+                    const uint4 push_chunk = *reinterpret_cast<uint4*>(&_pk[0]);
+                    const int push_token = index_5 / 3072;
+                    unsigned int push_owners = 0u;
+                    #pragma unroll
+                    for (int push_slot = 0; push_slot < 8; ++push_slot) {
+                        push_owners |= 1u << ((int)source_topk_ids_i64[push_token * 8 + push_slot] / 32);
+                    }
+                    while (push_owners != 0u) {
+                        const int push_dest = __ffs(push_owners) - 1;
+                        push_owners &= push_owners - 1u;
+                        __nv_bfloat16* rows_dst = push_dest == mega_pg_rank ? published_hidden_bf16 : published_hidden_bf16_peers[push_dest];
+                        *reinterpret_cast<uint4*>(rows_dst + mega_pg_rank * tokens_per_rank * 3072 + index_5) = push_chunk;
+                    }
                 }
-            }
-            #pragma unroll 1
-            for (int route_2 = linear_thread_2; route_2 < tokens_per_rank * 8; route_2 += thread_stride_2) {
-                int route_id_2 = (int)source_topk_ids_i64[route_2];
-                float route_weight_2 = source_topk_weights_f32[route_2];
-                *(reinterpret_cast<int*>(reinterpret_cast<int*>(published_topk_ids_i32) + route_2) + (0)) = route_id_2;
-                *(reinterpret_cast<float*>(reinterpret_cast<float*>(published_topk_weights_f32) + route_2) + (0)) = route_weight_2;
             }
             // Route-term arrival words: before the publication barrier every 32-bit word of this rank's route_terms_bf16
             // is set to all ones (two BF16 NaNs that no conversion produces).  Peers store each word exactly once after
@@ -1818,8 +1891,10 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                                  :: "l"((void*)(route_terms_bf16 + arrival_word)), "r"(0xFFFFFFFFu) : "memory");
                 }
             }
+            // The publication stores and the first forward's arrival-word stores are ordered by this CTA barrier and
+            // the elected thread's gpu-scope release below, and CTA 0's system-scope fence before its rank-barrier adds
+            // (cumulative over what it acquired) orders them for the peers; no per-thread system-scope fence.
             asm volatile("barrier.sync 12, 384;" ::: "memory");
-            asm volatile("fence.release.sys;" ::: "memory");
             if (warp == 0) {
                 if (elect_sync()) {
                     {
@@ -1927,8 +2002,8 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                 }
             }
             asm volatile("barrier.sync 12, 384;" ::: "memory");
-            cake_megamoe_dispatch_rows_early<false>(bid, warp + 4, lane, tokens_per_rank, mega_pg_rank, published_topk_ids_i32_peers,
-                published_topk_weights_f32_peers, published_hidden_bf16_peers, route_counts_u32, route_map_i32,
+            cake_megamoe_dispatch_rows_early<false>(bid, warp + 4, lane, tokens_per_rank, mega_pg_rank, published_topk_ids_i32,
+                published_topk_weights_f32, published_hidden_bf16, route_counts_u32, route_map_i32,
                 route_scale_f32, activation_bf16_ptr);
             asm volatile("barrier.sync 12, 384;" ::: "memory");
             asm volatile("fence.release.gpu;" ::: "memory");
@@ -2014,6 +2089,19 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
         { // tma_b_main
             int linear_thread_3 = bid * 384 + tid;
             int thread_stride_3 = num_bids * 384;
+            // Route push: this rank stores its routes (ids and weights) into its own slot of every rank's route
+            // mailbox (published_topk_*[source rank][route]) before the publication barrier, so dispatch reads them
+            // locally; the stores are issued first so that their NVLink latency overlaps the rest of the publication.
+            #pragma unroll 1
+            for (int push = linear_thread_3; push < 16 * tokens_per_rank * 8; push += thread_stride_3) {
+                const int push_dest = push / (tokens_per_rank * 8);
+                const int push_route = push - push_dest * (tokens_per_rank * 8);
+                const int push_slot = mega_pg_rank * tokens_per_rank * 8 + push_route;
+                int* ids_dst = push_dest == mega_pg_rank ? published_topk_ids_i32 : published_topk_ids_i32_peers[push_dest];
+                float* weights_dst = push_dest == mega_pg_rank ? published_topk_weights_f32 : published_topk_weights_f32_peers[push_dest];
+                ids_dst[push_slot] = (int)source_topk_ids_i64[push_route];
+                weights_dst[push_slot] = source_topk_weights_f32[push_route];
+            }
             #pragma unroll 1
             for (int index_6 = linear_thread_3; index_6 < 2048; index_6 += thread_stride_3) {
                 route_map_i32[index_6] = -1;
@@ -2058,15 +2146,22 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                     _pk[1] = __floats2bfloat162_rn(_vec_load_2[0 + 2], _vec_load_2[0 + 3]);
                     _pk[2] = __floats2bfloat162_rn(_vec_load_2[0 + 4], _vec_load_2[0 + 5]);
                     _pk[3] = __floats2bfloat162_rn(_vec_load_2[0 + 6], _vec_load_2[0 + 7]);
-                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(reinterpret_cast<__nv_bfloat16*>(published_hidden_bf16) + index_7))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                    // Row push: this 16-byte chunk goes to this rank's slot of every rank that owns one of the token's routes
+                    // (published_hidden[source rank][token]); the stores precede the publication barrier.
+                    const uint4 push_chunk = *reinterpret_cast<uint4*>(&_pk[0]);
+                    const int push_token = index_7 / 3072;
+                    unsigned int push_owners = 0u;
+                    #pragma unroll
+                    for (int push_slot = 0; push_slot < 8; ++push_slot) {
+                        push_owners |= 1u << ((int)source_topk_ids_i64[push_token * 8 + push_slot] / 32);
+                    }
+                    while (push_owners != 0u) {
+                        const int push_dest = __ffs(push_owners) - 1;
+                        push_owners &= push_owners - 1u;
+                        __nv_bfloat16* rows_dst = push_dest == mega_pg_rank ? published_hidden_bf16 : published_hidden_bf16_peers[push_dest];
+                        *reinterpret_cast<uint4*>(rows_dst + mega_pg_rank * tokens_per_rank * 3072 + index_7) = push_chunk;
+                    }
                 }
-            }
-            #pragma unroll 1
-            for (int route_3 = linear_thread_3; route_3 < tokens_per_rank * 8; route_3 += thread_stride_3) {
-                int route_id_3 = (int)source_topk_ids_i64[route_3];
-                float route_weight_3 = source_topk_weights_f32[route_3];
-                *(reinterpret_cast<int*>(reinterpret_cast<int*>(published_topk_ids_i32) + route_3) + (0)) = route_id_3;
-                *(reinterpret_cast<float*>(reinterpret_cast<float*>(published_topk_weights_f32) + route_3) + (0)) = route_weight_3;
             }
             // Route-term arrival words: before the publication barrier every 32-bit word of this rank's route_terms_bf16
             // is set to all ones (two BF16 NaNs that no conversion produces).  Peers store each word exactly once after
@@ -2079,8 +2174,10 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                                  :: "l"((void*)(route_terms_bf16 + arrival_word)), "r"(0xFFFFFFFFu) : "memory");
                 }
             }
+            // The publication stores and the first forward's arrival-word stores are ordered by this CTA barrier and
+            // the elected thread's gpu-scope release below, and CTA 0's system-scope fence before its rank-barrier adds
+            // (cumulative over what it acquired) orders them for the peers; no per-thread system-scope fence.
             asm volatile("barrier.sync 12, 384;" ::: "memory");
-            asm volatile("fence.release.sys;" ::: "memory");
             if (warp == 0) {
                 if (elect_sync()) {
                     {
@@ -2163,8 +2260,8 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                 }
             }
             asm volatile("barrier.sync 12, 384;" ::: "memory");
-            cake_megamoe_dispatch_rows_early<false>(bid, warp + 4, lane, tokens_per_rank, mega_pg_rank, published_topk_ids_i32_peers,
-                published_topk_weights_f32_peers, published_hidden_bf16_peers, route_counts_u32, route_map_i32,
+            cake_megamoe_dispatch_rows_early<false>(bid, warp + 4, lane, tokens_per_rank, mega_pg_rank, published_topk_ids_i32,
+                published_topk_weights_f32, published_hidden_bf16, route_counts_u32, route_map_i32,
                 route_scale_f32, activation_bf16_ptr);
             asm volatile("barrier.sync 12, 384;" ::: "memory");
             asm volatile("fence.release.gpu;" ::: "memory");
@@ -2190,6 +2287,9 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                 }
             }
             asm volatile("barrier.sync 12, 384;" ::: "memory");
+            // Dispatch stored the activation rows through the generic proxy; the dispatch_done grid barrier orders them
+            // before this point, and this fence orders them before the TMA (async proxy) loads of activation_bf16.
+            asm volatile("fence.proxy.async.global;" ::: "memory");
             unsigned int b_stage_1 = 0;
             unsigned int _phase_b_free = 1;
             #pragma unroll
@@ -2230,6 +2330,9 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                                 }
                             }
                         }
+                        // The FC1 epilogue stored these fc1_workspace_bf16 rows through the generic proxy before its fc1_done
+                        // release; this fence orders them before the TMA (async proxy) loads below.
+                        asm volatile("fence.proxy.async.global;" ::: "memory");
                     }
                     int num_k_tiles_2 = ((phase_3 == 0) ? 24 : 40);
                     #pragma unroll 1
@@ -2280,6 +2383,19 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
         { // scheduler_main
             int linear_thread_4 = bid * 384 + tid;
             int thread_stride_4 = num_bids * 384;
+            // Route push: this rank stores its routes (ids and weights) into its own slot of every rank's route
+            // mailbox (published_topk_*[source rank][route]) before the publication barrier, so dispatch reads them
+            // locally; the stores are issued first so that their NVLink latency overlaps the rest of the publication.
+            #pragma unroll 1
+            for (int push = linear_thread_4; push < 16 * tokens_per_rank * 8; push += thread_stride_4) {
+                const int push_dest = push / (tokens_per_rank * 8);
+                const int push_route = push - push_dest * (tokens_per_rank * 8);
+                const int push_slot = mega_pg_rank * tokens_per_rank * 8 + push_route;
+                int* ids_dst = push_dest == mega_pg_rank ? published_topk_ids_i32 : published_topk_ids_i32_peers[push_dest];
+                float* weights_dst = push_dest == mega_pg_rank ? published_topk_weights_f32 : published_topk_weights_f32_peers[push_dest];
+                ids_dst[push_slot] = (int)source_topk_ids_i64[push_route];
+                weights_dst[push_slot] = source_topk_weights_f32[push_route];
+            }
             #pragma unroll 1
             for (int index_8 = linear_thread_4; index_8 < 2048; index_8 += thread_stride_4) {
                 route_map_i32[index_8] = -1;
@@ -2324,15 +2440,22 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                     _pk[1] = __floats2bfloat162_rn(_vec_load_4[0 + 2], _vec_load_4[0 + 3]);
                     _pk[2] = __floats2bfloat162_rn(_vec_load_4[0 + 4], _vec_load_4[0 + 5]);
                     _pk[3] = __floats2bfloat162_rn(_vec_load_4[0 + 6], _vec_load_4[0 + 7]);
-                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(reinterpret_cast<__nv_bfloat16*>(published_hidden_bf16) + index_9))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                    // Row push: this 16-byte chunk goes to this rank's slot of every rank that owns one of the token's routes
+                    // (published_hidden[source rank][token]); the stores precede the publication barrier.
+                    const uint4 push_chunk = *reinterpret_cast<uint4*>(&_pk[0]);
+                    const int push_token = index_9 / 3072;
+                    unsigned int push_owners = 0u;
+                    #pragma unroll
+                    for (int push_slot = 0; push_slot < 8; ++push_slot) {
+                        push_owners |= 1u << ((int)source_topk_ids_i64[push_token * 8 + push_slot] / 32);
+                    }
+                    while (push_owners != 0u) {
+                        const int push_dest = __ffs(push_owners) - 1;
+                        push_owners &= push_owners - 1u;
+                        __nv_bfloat16* rows_dst = push_dest == mega_pg_rank ? published_hidden_bf16 : published_hidden_bf16_peers[push_dest];
+                        *reinterpret_cast<uint4*>(rows_dst + mega_pg_rank * tokens_per_rank * 3072 + index_9) = push_chunk;
+                    }
                 }
-            }
-            #pragma unroll 1
-            for (int route_4 = linear_thread_4; route_4 < tokens_per_rank * 8; route_4 += thread_stride_4) {
-                int route_id_4 = (int)source_topk_ids_i64[route_4];
-                float route_weight_4 = source_topk_weights_f32[route_4];
-                *(reinterpret_cast<int*>(reinterpret_cast<int*>(published_topk_ids_i32) + route_4) + (0)) = route_id_4;
-                *(reinterpret_cast<float*>(reinterpret_cast<float*>(published_topk_weights_f32) + route_4) + (0)) = route_weight_4;
             }
             // Route-term arrival words: before the publication barrier every 32-bit word of this rank's route_terms_bf16
             // is set to all ones (two BF16 NaNs that no conversion produces).  Peers store each word exactly once after
@@ -2345,8 +2468,10 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                                  :: "l"((void*)(route_terms_bf16 + arrival_word)), "r"(0xFFFFFFFFu) : "memory");
                 }
             }
+            // The publication stores and the first forward's arrival-word stores are ordered by this CTA barrier and
+            // the elected thread's gpu-scope release below, and CTA 0's system-scope fence before its rank-barrier adds
+            // (cumulative over what it acquired) orders them for the peers; no per-thread system-scope fence.
             asm volatile("barrier.sync 12, 384;" ::: "memory");
-            asm volatile("fence.release.sys;" ::: "memory");
             if (warp == 0) {
                 if (elect_sync()) {
                     {
@@ -2429,8 +2554,8 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                 }
             }
             asm volatile("barrier.sync 12, 384;" ::: "memory");
-            cake_megamoe_dispatch_rows_early<false>(bid, warp + 4, lane, tokens_per_rank, mega_pg_rank, published_topk_ids_i32_peers,
-                published_topk_weights_f32_peers, published_hidden_bf16_peers, route_counts_u32, route_map_i32,
+            cake_megamoe_dispatch_rows_early<false>(bid, warp + 4, lane, tokens_per_rank, mega_pg_rank, published_topk_ids_i32,
+                published_topk_weights_f32, published_hidden_bf16, route_counts_u32, route_map_i32,
                 route_scale_f32, activation_bf16_ptr);
             asm volatile("barrier.sync 12, 384;" ::: "memory");
             asm volatile("fence.release.gpu;" ::: "memory");
@@ -2467,6 +2592,19 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
         { // transform_main
             int linear_thread_5 = bid * 384 + tid;
             int thread_stride_5 = num_bids * 384;
+            // Route push: this rank stores its routes (ids and weights) into its own slot of every rank's route
+            // mailbox (published_topk_*[source rank][route]) before the publication barrier, so dispatch reads them
+            // locally; the stores are issued first so that their NVLink latency overlaps the rest of the publication.
+            #pragma unroll 1
+            for (int push = linear_thread_5; push < 16 * tokens_per_rank * 8; push += thread_stride_5) {
+                const int push_dest = push / (tokens_per_rank * 8);
+                const int push_route = push - push_dest * (tokens_per_rank * 8);
+                const int push_slot = mega_pg_rank * tokens_per_rank * 8 + push_route;
+                int* ids_dst = push_dest == mega_pg_rank ? published_topk_ids_i32 : published_topk_ids_i32_peers[push_dest];
+                float* weights_dst = push_dest == mega_pg_rank ? published_topk_weights_f32 : published_topk_weights_f32_peers[push_dest];
+                ids_dst[push_slot] = (int)source_topk_ids_i64[push_route];
+                weights_dst[push_slot] = source_topk_weights_f32[push_route];
+            }
             #pragma unroll 1
             for (int index_10 = linear_thread_5; index_10 < 2048; index_10 += thread_stride_5) {
                 route_map_i32[index_10] = -1;
@@ -2511,15 +2649,22 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                     _pk[1] = __floats2bfloat162_rn(_vec_load_6[0 + 2], _vec_load_6[0 + 3]);
                     _pk[2] = __floats2bfloat162_rn(_vec_load_6[0 + 4], _vec_load_6[0 + 5]);
                     _pk[3] = __floats2bfloat162_rn(_vec_load_6[0 + 6], _vec_load_6[0 + 7]);
-                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(reinterpret_cast<__nv_bfloat16*>(published_hidden_bf16) + index_11))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                    // Row push: this 16-byte chunk goes to this rank's slot of every rank that owns one of the token's routes
+                    // (published_hidden[source rank][token]); the stores precede the publication barrier.
+                    const uint4 push_chunk = *reinterpret_cast<uint4*>(&_pk[0]);
+                    const int push_token = index_11 / 3072;
+                    unsigned int push_owners = 0u;
+                    #pragma unroll
+                    for (int push_slot = 0; push_slot < 8; ++push_slot) {
+                        push_owners |= 1u << ((int)source_topk_ids_i64[push_token * 8 + push_slot] / 32);
+                    }
+                    while (push_owners != 0u) {
+                        const int push_dest = __ffs(push_owners) - 1;
+                        push_owners &= push_owners - 1u;
+                        __nv_bfloat16* rows_dst = push_dest == mega_pg_rank ? published_hidden_bf16 : published_hidden_bf16_peers[push_dest];
+                        *reinterpret_cast<uint4*>(rows_dst + mega_pg_rank * tokens_per_rank * 3072 + index_11) = push_chunk;
+                    }
                 }
-            }
-            #pragma unroll 1
-            for (int route_5 = linear_thread_5; route_5 < tokens_per_rank * 8; route_5 += thread_stride_5) {
-                int route_id_5 = (int)source_topk_ids_i64[route_5];
-                float route_weight_5 = source_topk_weights_f32[route_5];
-                *(reinterpret_cast<int*>(reinterpret_cast<int*>(published_topk_ids_i32) + route_5) + (0)) = route_id_5;
-                *(reinterpret_cast<float*>(reinterpret_cast<float*>(published_topk_weights_f32) + route_5) + (0)) = route_weight_5;
             }
             // Route-term arrival words: before the publication barrier every 32-bit word of this rank's route_terms_bf16
             // is set to all ones (two BF16 NaNs that no conversion produces).  Peers store each word exactly once after
@@ -2532,8 +2677,10 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                                  :: "l"((void*)(route_terms_bf16 + arrival_word)), "r"(0xFFFFFFFFu) : "memory");
                 }
             }
+            // The publication stores and the first forward's arrival-word stores are ordered by this CTA barrier and
+            // the elected thread's gpu-scope release below, and CTA 0's system-scope fence before its rank-barrier adds
+            // (cumulative over what it acquired) orders them for the peers; no per-thread system-scope fence.
             asm volatile("barrier.sync 12, 384;" ::: "memory");
-            asm volatile("fence.release.sys;" ::: "memory");
             if (warp == 0) {
                 if (elect_sync()) {
                     {
@@ -2616,8 +2763,8 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                 }
             }
             asm volatile("barrier.sync 12, 384;" ::: "memory");
-            cake_megamoe_dispatch_rows_early<true>(bid, warp - 4, lane, tokens_per_rank, mega_pg_rank, published_topk_ids_i32_peers,
-                published_topk_weights_f32_peers, published_hidden_bf16_peers, route_counts_u32, route_map_i32,
+            cake_megamoe_dispatch_rows_early<true>(bid, warp - 4, lane, tokens_per_rank, mega_pg_rank, published_topk_ids_i32,
+                published_topk_weights_f32, published_hidden_bf16, route_counts_u32, route_map_i32,
                 route_scale_f32, activation_bf16_ptr);
             asm volatile("barrier.sync 12, 384;" ::: "memory");
             asm volatile("fence.release.gpu;" ::: "memory");
