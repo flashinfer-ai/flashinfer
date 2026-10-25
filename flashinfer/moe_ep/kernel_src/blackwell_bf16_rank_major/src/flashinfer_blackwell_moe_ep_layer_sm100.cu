@@ -461,41 +461,73 @@ __device__ __forceinline__ void tcgen05_commit_cg2_multicast(int mbar_addr, uint
 
 #define FLASHINFER_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
+#define THREADS 256
+
+extern "C" {
+
+__global__ __launch_bounds__(256) void
+kernel_rank_major_stage_inputs_v1(const __nv_bfloat16* __restrict__ hidden_in, const void* __restrict__ ids_in, const float* __restrict__ weights_in, __nv_bfloat16* __restrict__ hidden_states, int* __restrict__ topk_ids, float* __restrict__ topk_weights, int ids_is_int64, int hidden_copy, int active_tokens_per_rank)
+{
+    // One CTA per active token: the hidden row (7168 BF16 = 896 x 16 B) into the symmetric hidden_states row, the 8
+    // routing ids narrowed to int32 (same value as the int64 hop: (int)(long long)id) and the 8 weights.
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    const int tid = threadIdx.x;
+    const int token = blockIdx.x;
+    if (hidden_copy) {
+        const uint4* src = reinterpret_cast<const uint4*>(hidden_in + (unsigned long long)token * 7168);
+        uint4* dst = reinterpret_cast<uint4*>(hidden_states + (unsigned long long)token * 7168);
+        uint4 v[4];
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const int idx = tid + i * 256;
+            if (idx < 896) {
+                v[i] = src[idx];
+            }
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const int idx = tid + i * 256;
+            if (idx < 896) {
+                dst[idx] = v[i];
+            }
+        }
+    }
+    if (tid < 8) {
+        const int route = token * 8 + tid;
+        int id;
+        if (ids_is_int64) {
+            id = (int)(reinterpret_cast<const long long*>(ids_in)[route]);
+        } else {
+            id = (int)(long long)(reinterpret_cast<const int*>(ids_in)[route]);
+        }
+        topk_ids[route] = id;
+        topk_weights[route] = weights_in[route];
+    }
+}
+
+} // extern "C"
+
+#undef FLASHINFER_INF
+#undef NUM_MAIN_STAGES
+#undef THREADS
+
+#define FLASHINFER_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
 #define THREADS 32
 
 extern "C" {
 
 __global__ __launch_bounds__(32) void
-kernel_rank_major_input_barrier_v1(long long* __restrict__ expert_ids, int* __restrict__ topk_ids, int active_tokens_per_rank, int32_t pg_world, int32_t pg_rank, unsigned* const* __restrict__ pg_flags, unsigned* const* __restrict__ routed_peers)
+kernel_rank_major_input_arrive_v1(int* __restrict__ topk_ids, int active_tokens_per_rank, int32_t pg_world, int32_t pg_rank, unsigned* const* __restrict__ pg_flags, unsigned* const* __restrict__ routed_peers)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
     uint32_t lane;
     asm("mov.u32 %0, %%laneid;" : "=r"(lane));
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-
-
-    const int bid = blockIdx.x;
-    const int num_bids = gridDim.x;
+    asm volatile("griddepcontrol.wait;" ::: "memory");
 
     // === Task calls (dependency order) ===
-    {
-        // All loads in flight before the first store (at most 1024 routes = 32 per lane).
-        const int routes = active_tokens_per_rank * 8;
-        long long staged_ids[32];
-        #pragma unroll
-        for (int i = 0; i < 32; i++) {
-            const int route = tid + i * 32;
-            staged_ids[i] = route < routes ? expert_ids[route] : 0ll;
-        }
-        #pragma unroll
-        for (int i = 0; i < 32; i++) {
-            const int route = tid + i * 32;
-            if (route < routes) {
-                topk_ids[route] = (int)staged_ids[i];
-            }
-        }
-    }
     {
         // Owner masks of this rank's active tokens; lane o (< world) stores owner o's 4 words before releasing o.
         __syncwarp();
@@ -530,41 +562,29 @@ kernel_rank_major_input_barrier_v1(long long* __restrict__ expert_ids, int* __re
             }
         }
     }
-    // nvlink_barrier(pg_flags) phase=0 owner_warp=0
+    // nvlink_arrive(pg_flags) phase=0: publish this rank's epoch to every peer's mailbox; consumers wait per peer.
     {
         const int __ws = pg_world;
         const int __me = pg_rank;
-        const int __warp = warp;
         const int __lane = lane;
-        if (__warp == 0) {
-            unsigned* __local_epoch = pg_flags[__me] + 0;
-            unsigned __previous_epoch;
-            asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
-                : "=r"(__previous_epoch) : "l"(__local_epoch) : "memory");
-            const unsigned __epoch = __previous_epoch + 1u;
-            const int __bank = (int)(__epoch & 1u);
-            const int __mailbox_base = 2 + (0 * 2 + __bank) * __ws;
-            asm volatile("fence.proxy.async.global;" ::: "memory");
-            if (__lane < __ws) {
-                unsigned* __peer_mailbox = pg_flags[__lane] + __mailbox_base + __me;
-                asm volatile("st.release.sys.global.u32 [%0], %1;"
-                    :: "l"(__peer_mailbox), "r"(__epoch) : "memory");
-                unsigned* __local_mailbox = pg_flags[__me] + __mailbox_base + __lane;
-                while (true) {
-                    unsigned __v;
-                    asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_mailbox) : "memory");
-                    if (__v != __epoch) continue;
-                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_mailbox) : "memory");
-                    if (__v == __epoch) break;
-                }
-                asm volatile("fence.proxy.alias;" ::: "memory");
-            }
-            __syncwarp();
-            asm volatile("fence.proxy.async.global;" ::: "memory");
-            if (__lane == 0) {
-                asm volatile("st.release.sys.global.u32 [%0], %1;"
-                    :: "l"(__local_epoch), "r"(__epoch) : "memory");
-            }
+        unsigned* __local_epoch = pg_flags[__me] + 0;
+        unsigned __previous_epoch;
+        asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
+            : "=r"(__previous_epoch) : "l"(__local_epoch) : "memory");
+        const unsigned __epoch = __previous_epoch + 1u;
+        const int __bank = (int)(__epoch & 1u);
+        const int __mailbox_base = 2 + (0 * 2 + __bank) * __ws;
+        asm volatile("fence.proxy.async.global;" ::: "memory");
+        asm volatile("fence.proxy.alias;" ::: "memory");
+        if (__lane < __ws) {
+            unsigned* __peer_mailbox = pg_flags[__lane] + __mailbox_base + __me;
+            asm volatile("st.release.sys.global.u32 [%0], %1;"
+                :: "l"(__peer_mailbox), "r"(__epoch) : "memory");
+        }
+        __syncwarp();
+        if (__lane == 0) {
+            asm volatile("st.relaxed.gpu.global.u32 [%0], %1;"
+                :: "l"(__local_epoch), "r"(__epoch) : "memory");
         }
     }
 }
@@ -589,10 +609,127 @@ kernel_rank_major_input_barrier_v1(long long* __restrict__ expert_ids, int* __re
 #define SMEM_TOTAL 15488
 #define THREADS 256
 
+// RINA: for up to 16 active rows the route of this owner rank is computed by one extra dispatch CTA (block 0, 256
+// threads) straight from every source's symmetric topk ids, concurrently with the row pulls; same tables as
+// kernel_rank_major_route_fused_v1 (the compact row of a route inside its expert group may differ, which the bitwise
+// output does not depend on). recv_local_ids / recv_weights stay with the row CTAs, as in the separate route kernel.
+__device__ __noinline__ void rank_major_route_cta_ids(int active_tokens_per_rank, int32_t pg_world, int32_t pg_rank, unsigned* const* __restrict__ pg_flags, const int* __restrict__ topk_ids, int* const* __restrict__ topk_ids_peers, int* __restrict__ expert_scatter_offsets, int* __restrict__ token_to_permuted, int* __restrict__ cta_to_expert, int* __restrict__ cta_to_mn_limit, int* __restrict__ expert_padded_row_offsets, int* __restrict__ num_non_exiting_ctas, int* __restrict__ total_padded_rows, int* __restrict__ route_map, __nv_bfloat16* __restrict__ zero_sentinel, int wait_all)
+{
+    __shared__ int s_rows[32];
+    __shared__ int s_base[32];
+    const int tid = threadIdx.x;
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
+    if (wait_all && tid == 0) {
+        unsigned __epoch;
+        asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(__epoch) : "l"(pg_flags[pg_rank] + 0) : "memory");
+        const unsigned* __mailbox = pg_flags[pg_rank] + 2 + (0 * 2 + (int)(__epoch & 1u)) * pg_world;
+        for (int src = 0; src < pg_world; src++) {
+            while (true) {
+                unsigned __v;
+                asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__mailbox + src) : "memory");
+                if (__v != __epoch) continue;
+                asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__mailbox + src) : "memory");
+                if (__v == __epoch) break;
+            }
+        }
+    }
+    if (tid < 32) {
+        s_rows[tid] = 0;
+    }
+    #pragma unroll 1
+    for (int elem = tid; elem < 7168; elem += 256) {
+        zero_sentinel[elem] = 0.0f;
+    }
+    __syncthreads();
+    const int owner_begin = pg_rank * 32;
+    const int rows_total = 8 * active_tokens_per_rank;
+    // pass 1: per-expert row counters; token_to_permuted holds (1 << 30 | local << 16 | row) until pass 3
+    #pragma unroll 1
+    for (int r = tid; r < rows_total; r += 256) {
+        const int src = r / active_tokens_per_rank;
+        const int tok = r - src * active_tokens_per_rank;
+        const unsigned int* idp = reinterpret_cast<const unsigned int*>((src == pg_rank ? topk_ids : topk_ids_peers[src]) + tok * 8);
+        unsigned int iv[8];
+        asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(iv[0]), "=r"(iv[1]), "=r"(iv[2]), "=r"(iv[3]) : "l"(idp) : "memory");
+        asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(iv[4]), "=r"(iv[5]), "=r"(iv[6]), "=r"(iv[7]) : "l"(idp + 4) : "memory");
+        const int route_base = (src * 128 + tok) * 8;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const int global_expert = (int)iv[k];
+            if (global_expert >= owner_begin && global_expert < owner_begin + 32) {
+                const int local = global_expert - owner_begin;
+                token_to_permuted[route_base + k] = (1 << 30) | (local << 16) | atomicAdd(&s_rows[local], 1);
+            } else {
+                token_to_permuted[route_base + k] = 32768;
+            }
+        }
+    }
+    __syncthreads();
+    if (tid < 32) {
+        int expert = lane;
+        int rows = s_rows[expert];
+        expert_scatter_offsets[expert] = rows;
+        int groups = (rows + 64 - 1) / 64;
+        if (groups > 16) {
+            groups = 16;
+        }
+        int inclusive = groups;
+        #pragma unroll
+        for (int delta = 1; delta < 32; delta <<= 1) {
+            const int peer = __shfl_up_sync(0xFFFFFFFF, inclusive, delta, 32);
+            if ((int)lane >= delta) {
+                inclusive = inclusive + peer;
+            }
+        }
+        int write_base = inclusive - groups;
+        expert_padded_row_offsets[expert] = write_base * 64;
+        s_base[expert] = write_base * 64;
+        #pragma unroll
+        for (int local_group = 0; local_group < 16; local_group++) {
+            if (groups > local_group) {
+                int write_group = write_base + local_group;
+                int valid_end = (local_group + 1) * 64;
+                if (valid_end > rows) {
+                    valid_end = rows;
+                }
+                cta_to_expert[write_group] = expert;
+                cta_to_mn_limit[write_group] = write_base * 64 + valid_end;
+            }
+        }
+        int padded_end = groups * 64;
+        #pragma unroll 1
+        for (int padding_row = rows; padding_row < padded_end; padding_row++) {
+            route_map[write_base * 64 + padding_row] = 0;
+        }
+        if (expert == 31) {
+            num_non_exiting_ctas[0] = inclusive;
+            total_padded_rows[0] = inclusive * 64;
+        }
+    }
+    __syncthreads();
+    // pass 3: compact rows (the thread re-reads its own pass-1 entries)
+    #pragma unroll 1
+    for (int r = tid; r < rows_total; r += 256) {
+        const int src = r / active_tokens_per_rank;
+        const int tok = r - src * active_tokens_per_rank;
+        const int route_base = (src * 128 + tok) * 8;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const int v = token_to_permuted[route_base + k];
+            if (v & (1 << 30)) {
+                const int compact_row = s_base[(v >> 16) & 0xff] + (v & 0xffff);
+                route_map[compact_row] = route_base / 8;
+                token_to_permuted[route_base + k] = compact_row;
+            }
+        }
+    }
+}
+
 extern "C" {
 
-__global__ __launch_bounds__(256) void
-kernel_rank_major_dispatch_v1(__nv_bfloat16* __restrict__ recv_hidden, int* __restrict__ recv_local_ids, float* __restrict__ recv_weights, int active_tokens_per_rank, int32_t pg_world, int32_t pg_rank, unsigned* const* __restrict__ pg_flags, __nv_bfloat16* __restrict__ hidden_states, __nv_bfloat16* const* __restrict__ hidden_states_peers, int* __restrict__ topk_ids, int* const* __restrict__ topk_ids_peers, float* __restrict__ topk_weights, float* const* __restrict__ topk_weights_peers, const unsigned* __restrict__ routed)
+__global__ __launch_bounds__(256, 8) void
+kernel_rank_major_dispatch_v2(__nv_bfloat16* __restrict__ recv_hidden, int* __restrict__ recv_local_ids, float* __restrict__ recv_weights, int active_tokens_per_rank, int32_t pg_world, int32_t pg_rank, unsigned* const* __restrict__ pg_flags, __nv_bfloat16* __restrict__ hidden_states, __nv_bfloat16* const* __restrict__ hidden_states_peers, int* __restrict__ topk_ids, int* const* __restrict__ topk_ids_peers, float* __restrict__ topk_weights, float* const* __restrict__ topk_weights_peers, const unsigned* __restrict__ routed, int* __restrict__ expert_scatter_offsets, int* __restrict__ token_to_permuted, int* __restrict__ cta_to_expert, int* __restrict__ cta_to_mn_limit, int* __restrict__ expert_padded_row_offsets, int* __restrict__ num_non_exiting_ctas, int* __restrict__ total_padded_rows, int* __restrict__ route_map, __nv_bfloat16* __restrict__ zero_sentinel)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -631,13 +768,31 @@ kernel_rank_major_dispatch_v1(__nv_bfloat16* __restrict__ recv_hidden, int* __re
         }
     }
 
-    __syncthreads();
-
+    const int has_route_cta = num_bids == 8 * active_tokens_per_rank + 1;
+    if (has_route_cta && bid == 0) {
+        rank_major_route_cta_ids(active_tokens_per_rank, pg_world, pg_rank, pg_flags, topk_ids, topk_ids_peers, expert_scatter_offsets, token_to_permuted, cta_to_expert, cta_to_mn_limit, expert_padded_row_offsets, num_non_exiting_ctas, total_padded_rows, route_map, zero_sentinel, 1);
+        return;
+    }
     // === Task calls (dependency order) ===
-    int active_token = bid;
+    int active_token = bid - has_route_cta;
     int src_rank = active_token / active_tokens_per_rank;
     int src_token = active_token - src_rank * active_tokens_per_rank;
     int recv_token = src_rank * 128 + src_token;
+    if (tid == 0) {
+        // Point-to-point input barrier: wait until source src_rank has published this forward's inputs.
+        unsigned __epoch;
+        asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(__epoch) : "l"(pg_flags[pg_rank] + 0) : "memory");
+        const unsigned* __mailbox = pg_flags[pg_rank] + 2 + (0 * 2 + (int)(__epoch & 1u)) * pg_world + src_rank;
+        while (true) {
+            unsigned __v;
+            asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__mailbox) : "memory");
+            if (__v != __epoch) continue;
+            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__mailbox) : "memory");
+            if (__v == __epoch) break;
+        }
+        asm volatile("fence.proxy.async.global;" ::: "memory");
+    }
+    __syncthreads();
     {
         unsigned int routed_word;
         asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(routed_word) : "l"(routed + src_rank * 4 + (src_token >> 5)) : "memory");
@@ -655,10 +810,11 @@ kernel_rank_major_dispatch_v1(__nv_bfloat16* __restrict__ recv_hidden, int* __re
     unsigned long long routing_src_offset = (unsigned long long)src_token * 8 * 4;
     if (warp == 0) {
         if (elect_sync()) {
+            asm volatile("fence.proxy.async.global;" ::: "memory");
             mbarrier_arrive_expect_tx(row_full_addr, 14400);
             // nvlink_pull: smem(row_stage_addr) <- peers[src_rank] + hidden_src_offset, 14336B
             {
-                const void* __remote = (const void*)((const char*)((hidden_states_peers)[src_rank]) + (uint64_t)(hidden_src_offset));
+                const void* __remote = (const void*)((const char*)(src_rank == pg_rank ? (const void*)hidden_states : (const void*)(hidden_states_peers)[src_rank]) + (uint64_t)(hidden_src_offset));
                 asm volatile(
                     "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
                     " [%0], [%1], %2, [%3];"
@@ -667,7 +823,7 @@ kernel_rank_major_dispatch_v1(__nv_bfloat16* __restrict__ recv_hidden, int* __re
             }
             // nvlink_pull: smem(ids_stage_addr) <- peers[src_rank] + routing_src_offset, 32B
             {
-                const void* __remote = (const void*)((const char*)((topk_ids_peers)[src_rank]) + (uint64_t)(routing_src_offset));
+                const void* __remote = (const void*)((const char*)(src_rank == pg_rank ? (const void*)topk_ids : (const void*)(topk_ids_peers)[src_rank]) + (uint64_t)(routing_src_offset));
                 asm volatile(
                     "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
                     " [%0], [%1], %2, [%3];"
@@ -676,7 +832,7 @@ kernel_rank_major_dispatch_v1(__nv_bfloat16* __restrict__ recv_hidden, int* __re
             }
             // nvlink_pull: smem(weights_stage_addr) <- peers[src_rank] + routing_src_offset, 32B
             {
-                const void* __remote = (const void*)((const char*)((topk_weights_peers)[src_rank]) + (uint64_t)(routing_src_offset));
+                const void* __remote = (const void*)((const char*)(src_rank == pg_rank ? (const void*)topk_weights : (const void*)(topk_weights_peers)[src_rank]) + (uint64_t)(routing_src_offset));
                 asm volatile(
                     "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
                     " [%0], [%1], %2, [%3];"
@@ -3542,7 +3698,7 @@ kernel_rank_major_exact_unpermute_v2(__nv_bfloat16* __restrict__ expert_output, 
 extern "C" {
 
 __global__ __launch_bounds__(32) void
-kernel_rank_major_partial_barrier_v1(int32_t pg_world, int32_t pg_rank, unsigned* const* __restrict__ pg_flags)
+kernel_rank_major_partial_arrive_v1(int32_t pg_world, int32_t pg_rank, unsigned* const* __restrict__ pg_flags)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -3551,46 +3707,30 @@ kernel_rank_major_partial_barrier_v1(int32_t pg_world, int32_t pg_rank, unsigned
     asm volatile("griddepcontrol.wait;" ::: "memory");
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 
-
-    const int bid = blockIdx.x;
-    const int num_bids = gridDim.x;
-
     // === Task calls (dependency order) ===
-    // nvlink_barrier(pg_flags) phase=1 owner_warp=0
+    // nvlink_arrive(pg_flags) phase=1: publish this rank's epoch to every peer's mailbox; consumers wait per peer.
     {
         const int __ws = pg_world;
         const int __me = pg_rank;
-        const int __warp = warp;
         const int __lane = lane;
-        if (__warp == 0) {
-            unsigned* __local_epoch = pg_flags[__me] + 1;
-            unsigned __previous_epoch;
-            asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
-                : "=r"(__previous_epoch) : "l"(__local_epoch) : "memory");
-            const unsigned __epoch = __previous_epoch + 1u;
-            const int __bank = (int)(__epoch & 1u);
-            const int __mailbox_base = 2 + (1 * 2 + __bank) * __ws;
-            asm volatile("fence.proxy.async.global;" ::: "memory");
-            if (__lane < __ws) {
-                unsigned* __peer_mailbox = pg_flags[__lane] + __mailbox_base + __me;
-                asm volatile("st.release.sys.global.u32 [%0], %1;"
-                    :: "l"(__peer_mailbox), "r"(__epoch) : "memory");
-                unsigned* __local_mailbox = pg_flags[__me] + __mailbox_base + __lane;
-                while (true) {
-                    unsigned __v;
-                    asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_mailbox) : "memory");
-                    if (__v != __epoch) continue;
-                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_mailbox) : "memory");
-                    if (__v == __epoch) break;
-                }
-                asm volatile("fence.proxy.alias;" ::: "memory");
-            }
-            __syncwarp();
-            asm volatile("fence.proxy.async.global;" ::: "memory");
-            if (__lane == 0) {
-                asm volatile("st.release.sys.global.u32 [%0], %1;"
-                    :: "l"(__local_epoch), "r"(__epoch) : "memory");
-            }
+        unsigned* __local_epoch = pg_flags[__me] + 1;
+        unsigned __previous_epoch;
+        asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
+            : "=r"(__previous_epoch) : "l"(__local_epoch) : "memory");
+        const unsigned __epoch = __previous_epoch + 1u;
+        const int __bank = (int)(__epoch & 1u);
+        const int __mailbox_base = 2 + (1 * 2 + __bank) * __ws;
+        asm volatile("fence.proxy.async.global;" ::: "memory");
+        asm volatile("fence.proxy.alias;" ::: "memory");
+        if (__lane < __ws) {
+            unsigned* __peer_mailbox = pg_flags[__lane] + __mailbox_base + __me;
+            asm volatile("st.release.sys.global.u32 [%0], %1;"
+                :: "l"(__peer_mailbox), "r"(__epoch) : "memory");
+        }
+        __syncwarp();
+        if (__lane == 0) {
+            asm volatile("st.relaxed.gpu.global.u32 [%0], %1;"
+                :: "l"(__local_epoch), "r"(__epoch) : "memory");
         }
     }
 }
@@ -3612,7 +3752,7 @@ kernel_rank_major_partial_barrier_v1(int32_t pg_world, int32_t pg_rank, unsigned
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_rank_major_combine_v2(__nv_bfloat16* __restrict__ output, int32_t pg_world, int32_t pg_rank, unsigned* const* __restrict__ pg_flags, __nv_bfloat16* __restrict__ local_partials, __nv_bfloat16* const* __restrict__ local_partials_peers, const int* __restrict__ topk_ids)
+kernel_rank_major_combine_v3(__nv_bfloat16* __restrict__ output, int32_t pg_world, int32_t pg_rank, unsigned* const* __restrict__ pg_flags, __nv_bfloat16* __restrict__ local_partials, __nv_bfloat16* const* __restrict__ local_partials_peers, const int* __restrict__ topk_ids)
 {
     // One CTA per (token, 1024-column chunk): all owner pulls in flight at once, then the FP32 sum in owner order.
     const int tid = threadIdx.x;
@@ -3640,16 +3780,38 @@ kernel_rank_major_combine_v2(__nv_bfloat16* __restrict__ output, int32_t pg_worl
     }
     __syncthreads();
     if (tid == 0) {
-        #pragma unroll
-        for (int peer = 0; peer < 8; peer++) {
-            if ((owners >> peer) & 1u) {
-                mbarrier_arrive_expect_tx(smem + peer * 8, 2048);
-                const void* __remote = (const void*)((const char*)((local_partials_peers)[peer]) + (uint64_t)((unsigned long long)partial_row * 14336 + (unsigned long long)chunk * 2048));
-                asm volatile(
-                    "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
-                    " [%0], [%1], %2, [%3];"
-                    :: "r"(smem + 1024 + peer * 2048), "l"(__remote), "r"((uint32_t)(2048)), "r"(smem + peer * 8)
-                    : "memory");
+        // Point-to-point partial barrier: pull each routed owner's chunk as soon as that owner has published its
+        // partial rows; wait for every owner (the forward does not complete before all owners arrived).
+        unsigned __epoch;
+        asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(__epoch) : "l"(pg_flags[pg_rank] + 1) : "memory");
+        const unsigned* __mailbox = pg_flags[pg_rank] + 2 + (1 * 2 + (int)(__epoch & 1u)) * pg_world;
+        unsigned int pending = 0xffu;
+        while (pending != 0u) {
+            #pragma unroll 1
+            for (int peer = 0; peer < 8; peer++) {
+                if (((pending >> peer) & 1u) == 0u) {
+                    continue;
+                }
+                unsigned __v;
+                asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__mailbox + peer) : "memory");
+                if (__v != __epoch) {
+                    continue;
+                }
+                asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__mailbox + peer) : "memory");
+                if (__v != __epoch) {
+                    continue;
+                }
+                pending &= ~(1u << peer);
+                if ((owners >> peer) & 1u) {
+                    asm volatile("fence.proxy.async.global;" ::: "memory");
+                    mbarrier_arrive_expect_tx(smem + peer * 8, 2048);
+                    const void* __remote = (const void*)((const char*)(peer == pg_rank ? local_partials : (local_partials_peers)[peer]) + (uint64_t)((unsigned long long)partial_row * 14336 + (unsigned long long)chunk * 2048));
+                    asm volatile(
+                        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
+                        " [%0], [%1], %2, [%3];"
+                        :: "r"(smem + 1024 + peer * 2048), "l"(__remote), "r"((uint32_t)(2048)), "r"(smem + peer * 8)
+                        : "memory");
+                }
             }
         }
     }
