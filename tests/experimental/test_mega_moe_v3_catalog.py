@@ -85,8 +85,10 @@ def test_programs_sources_symbols_and_compile_line_definitions():
                 assert f"-DCAKE_PROGRAM_KERNEL=kernel_{name}" in flags, (name, arch)
         pipeline = "_pipeline_" in name
         if record.get("definitions"):
-            # Architecture-neutral pipeline schedule: the SM count comes from the compile line.
-            assert record["definitions"] == ["NUM_CTAS"] and len(record["arches"]) == 2
+            # Architecture-neutral pipeline schedule: the SM count comes from the
+            # compile line, one of the counts the record's architectures route on.
+            assert record["definitions"] == ["NUM_CTAS"]
+            assert all(runtime.supported_num_sms(arch) for arch in record["arches"]), name
             assert (
                 "#ifndef NUM_CTAS" in kernel_text
                 and "#define NUM_CTAS" not in kernel_text
