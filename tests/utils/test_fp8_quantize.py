@@ -698,6 +698,33 @@ def test_cake_grouped_mxfp8_quantize_program_selection(shape, expected, dtype):
     assert cake_grouped_mxfp8_quantize_program(dtype, *shape) is getattr(loader, name)
 
 
+@pytest.mark.parametrize(
+    ("shape", "padded_k", "expected"),
+    [
+        ((2, 128, 128), 128, "BULK"),  # round_up(K, 128): the bulk program
+        ((2, 128, 128), 4224, "ROW2D"),  # 132 blocks a row: a second CTA past K
+        ((3, 200, 160), 256, "BULK"),
+        ((3, 200, 160), 384, "ROW2D"),
+        ((16, 1024, 4096), 4096, "TILED"),
+        ((16, 1024, 4096), 4224, "ROW2D"),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_cake_grouped_mxfp8_quantize_program_selection_padded_rows(
+    shape, padded_k, expected, dtype
+):
+    """Rows padded wider than round_up(K, 128) keep the row-2D program."""
+    import flashinfer.jit.cake_grouped_mxfp8_quantize as loader
+    from flashinfer.quantization.fp8_quantization import (
+        cake_grouped_mxfp8_quantize_program,
+    )
+
+    suffix = "BF16" if dtype == torch.bfloat16 else "F16"
+    name = suffix if expected == "ROW2D" else f"{expected}_{suffix}"
+    program = cake_grouped_mxfp8_quantize_program(dtype, *shape, padded_k)
+    assert program is getattr(loader, name)
+
+
 def test_cake_grouped_mxfp8_quantize_grid_reads_the_program_block():
     """The CTA width comes from the program's block, not from a constant."""
     from flashinfer.jit.cake_grouped_mxfp8_quantize import BF16
@@ -802,6 +829,63 @@ def test_mxfp8_grouped_quantize_cake_exact_programs(batch_shape, dtype):
             atol=0,
         )
         got_scale = _unswizzle_mxfp8_scales_128x4(out_scale[group], m, padded_k)
+        expected_scale = _unswizzle_mxfp8_scales_128x4(ref_scale, m, padded_k)
+        torch.testing.assert_close(
+            got_scale[:valid_rows], expected_scale[:valid_rows], rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize(
+    ("batch_shape", "padded_k"),
+    [
+        ((2, 128, 128), 4224),  # 132 blocks a row: one CTA of each row past K
+        ((3, 200, 160), 384),
+        ((16, 1024, 256), 512),  # 16384 rows
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@torch.inference_mode()
+def test_cake_grouped_mxfp8_quantize_launch_wider_padded_rows(
+    batch_shape, padded_k, dtype
+):
+    """Caller-owned rows padded wider than round_up(K, 128) match the reference
+    of the zero-padded input on every valid row, the padding included."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    if not is_cake_grouped_mxfp8_available(dtype):
+        pytest.skip(
+            f"a generated Cake grouped MXFP8 profile for {dtype} is not installed"
+        )
+    from flashinfer.quantization.fp8_quantization import (
+        cake_grouped_mxfp8_quantize_launch,
+    )
+
+    torch.manual_seed(20261025)
+    b, m, k = batch_shape
+    padded_m = (m + 127) // 128 * 128
+    x = (torch.randn(batch_shape, dtype=torch.float32, device="cuda") * 16).to(dtype)
+    mask_values = _cake_mask_values(b, m)
+    mask = torch.tensor(mask_values, dtype=torch.int32, device="cuda")
+    quantized = torch.empty((b, m, padded_k), dtype=torch.float8_e4m3fn, device="cuda")
+    scales = torch.empty(
+        (b, padded_m, padded_k // 32), dtype=torch.uint8, device="cuda"
+    )
+    cake_grouped_mxfp8_quantize_launch(x, mask, quantized, scales)
+    scales = scales.view(b, padded_m // 128, padded_k // 128, 32, 4, 4)
+
+    for group, valid_rows in enumerate(mask_values):
+        if valid_rows == 0:
+            continue
+        ref, ref_scale = mxfp8_quantize_reference(
+            x[group], alignment=padded_k, sf_swizzle_layout=SfLayout.layout_128x4
+        )
+        torch.testing.assert_close(
+            quantized[group, :valid_rows].view(torch.uint8),
+            ref[:valid_rows].contiguous().view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+        got_scale = _unswizzle_mxfp8_scales_128x4(scales[group], m, padded_k)
         expected_scale = _unswizzle_mxfp8_scales_128x4(ref_scale, m, padded_k)
         torch.testing.assert_close(
             got_scale[:valid_rows], expected_scale[:valid_rows], rtol=0, atol=0

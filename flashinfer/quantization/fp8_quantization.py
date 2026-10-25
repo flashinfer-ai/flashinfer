@@ -557,10 +557,15 @@ def is_cake_grouped_mxfp8_quantize_available(
 
 
 def cake_grouped_mxfp8_quantize_program(
-    dtype: torch.dtype, b: int, m: int, k: int
+    dtype: torch.dtype, b: int, m: int, k: int, padded_k: Optional[int] = None
 ) -> CakeProgram:
     """The program that quantizes ``b`` groups of ``m`` rows of ``k`` elements of
-    ``dtype``, chosen from the shape alone (the host never reads the mask)."""
+    ``dtype`` into rows of ``padded_k`` codes (default ``round_up(k, 128)``),
+    chosen from the shape alone (the host never reads the mask).
+
+    The bulk and tiled programs take rows padded to ``round_up(k, 128)``; a wider
+    padded row keeps the row-2D program, whose CTAs past ``k`` read nothing.
+    """
     programs = (
         _CAKE_GROUPED_MXFP8_PROGRAMS,
         _CAKE_GROUPED_MXFP8_BULK_PROGRAMS,
@@ -570,6 +575,8 @@ def cake_grouped_mxfp8_quantize_program(
         raise TypeError(f"unsupported Cake grouped MXFP8 input dtype: {dtype}")
     row2d, bulk, tiled = (table[dtype] for table in programs)
     if k < _CAKE_QUANT_BLOCK:
+        return row2d
+    if padded_k is not None and padded_k != _round_up(k, _CAKE_SCALE_TILE):
         return row2d
     if b * m * k * dtype.itemsize <= _CAKE_BULK_MAX_INPUT_BYTES:
         return bulk
@@ -628,8 +635,6 @@ def cake_grouped_mxfp8_quantize_launch(
         raise ValueError(
             f"B and M must not exceed the CUDA grid limit {_CAKE_MAX_GRID_YZ}, got B={b}, M={m}"
         )
-    program = cake_grouped_mxfp8_quantize_program(a.dtype, b, m, k)
-    target = _cake_grouped_mxfp8_target(program, a.device)
     # The binding validates dtype, device, contiguity and scalar ranges; the
     # shapes the kernel's scalars are derived from are validated here.
     quantized_shape = tuple(quantized.shape)
@@ -657,6 +662,8 @@ def cake_grouped_mxfp8_quantize_launch(
             "scales must have shape [B, padded_M, padded_K / 32] with padded_M a "
             f"multiple of {_CAKE_SCALE_TILE} and >= M={m}, got {list(scales_shape)}"
         )
+    program = cake_grouped_mxfp8_quantize_program(a.dtype, b, m, k, padded_k)
+    target = _cake_grouped_mxfp8_target(program, a.device)
     pm_tiles = padded_m // _CAKE_SCALE_TILE
     pk_tiles = padded_k // _CAKE_SCALE_TILE
     grid_x, grid_y, grid_z = cake_grouped_mxfp8_quantize_grid(
