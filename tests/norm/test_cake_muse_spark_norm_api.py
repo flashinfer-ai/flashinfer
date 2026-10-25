@@ -222,15 +222,12 @@ GAPS_SM107A = {
 }
 # The declared gaps of the Blackwell PDL routes, keyed (arch, route, head count or None): the row counts where the
 # CuTe DSL kernel under PDL measured ahead of both the PDL build and the plain build of the routed program, so the
-# facade's auto keeps it there.
+# facade's auto keeps it there.  Op A's mode-0 routes alone declare gaps: op C's bf16_pdl tables are contiguous over
+# the token count for every head count (they mirror the plain route's boundaries), so an explicit cake call under
+# PDL never falls outside the launch form's windows.
 GAPS_PDL = {
     ("sm_100a", f"{OP_A}_mode0_pdl", None): ((768, 4095),),
     ("sm_103a", f"{OP_A}_mode0_pdl", None): ((768, 8191),),
-    ("sm_100a", f"{OP_C}_bf16_pdl", 128): ((0, 1), (8, 255)),
-    ("sm_100a", f"{OP_C}_bf16_pdl", 32): ((0, 1), (64, 1023)),
-    ("sm_100a", f"{OP_C}_bf16_pdl", 16): ((0, 7),),
-    ("sm_103a", f"{OP_C}_bf16_pdl", 128): ((0, 1),),
-    ("sm_103a", f"{OP_C}_bf16_pdl", 32): ((0, 1),),
 }
 # Op A's Blackwell PDL routes, (at_most, program) windows per (arch, mode), the last unbounded: a program named by its
 # place in the plain route (c2 / c4 / rsa the three small-M composites, pro the prologue whole-row program, psb the
@@ -278,8 +275,10 @@ OP_A_PDL_WINDOWS = {
     ),
 }
 # Op C's Blackwell PDL route per architecture: (heads, above, at_most) -> (the selecting keywords of the program, as
-# OP_C_WINDOWS spells them, its form): "pdl" the PDL build, "pdl_late" the late-signal PDL build (sm_103a alone),
-# "plain" the plain route's build borrowed (16 heads above 1024 tokens on both architectures).
+# OP_C_WINDOWS spells them, its form): "pdl" the PDL build, "pdl_late" the late-signal PDL build of the two
+# token-cluster programs, "plain" the plain route's build borrowed (16 heads above 1024 tokens on both
+# architectures).  Contiguous over the token count per head count; every boundary of the plain route is one of
+# these (the pdl table splits a plain window between the pdl and the pdl_late build).
 _C16, _CT16, _HM, _T256, _T128_CT16, _T128 = (
     OP_C_WINDOWS[key]
     for key in (
@@ -293,21 +292,24 @@ _C16, _CT16, _HM, _T256, _T128_CT16, _T128 = (
 )
 OP_C_PDL_WINDOWS = {
     "sm_100a": {
-        (128, 1, 8): (_C16, "pdl"),
-        (128, 255, 256): (_CT16, "pdl"),
+        (128, 0, 8): (_C16, "pdl"),
+        (128, 8, 256): (_CT16, "pdl_late"),
         (128, 256, None): (_HM, "pdl"),
-        (32, 1, 64): (_CT16, "pdl"),
-        (32, 1023, 1024): (_CT16, "pdl"),
+        (32, 0, 1): (_CT16, "pdl"),
+        (32, 1, 1024): (_CT16, "pdl_late"),
         (32, 1024, None): (_T256, "pdl"),
-        (16, 7, 1024): (_T128_CT16, "pdl"),
+        (16, 0, 1): (_T128_CT16, "pdl_late"),
+        (16, 1, 8): (_T128_CT16, "pdl"),
+        (16, 8, 256): (_T128_CT16, "pdl_late"),
+        (16, 256, 1024): (_T128_CT16, "pdl"),
         (16, 1024, None): (_T128, "plain"),
     },
     "sm_103a": {
-        (128, 1, 8): (_C16, "pdl"),
+        (128, 0, 8): (_C16, "pdl"),
         (128, 8, 64): (_CT16, "pdl"),
         (128, 64, 256): (_CT16, "pdl_late"),
         (128, 256, None): (_HM, "pdl"),
-        (32, 1, 8): (_CT16, "pdl"),
+        (32, 0, 8): (_CT16, "pdl"),
         (32, 8, 1024): (_CT16, "pdl_late"),
         (32, 1024, None): (_T256, "pdl"),
         (16, 0, 8): (_T128_CT16, "pdl"),
@@ -882,10 +884,12 @@ def test_rmsnorm_sigmoid_gate_pdl_route_names_a_build_form_per_window():
                 assert record["arches"] == list(BLACKWELL) or record["arches"] == [arch]
                 assert name not in plain_names
         assert list(names) == order, arch
-        assert len(names) == {"sm_100a": 6, "sm_103a": 8}[arch]
+        assert len(names) == 8, (
+            arch
+        )  # five pdl builds, two pdl_late builds, the borrowed plain build
         for heads, gaps in (
-            (128, GAPS_PDL[(arch, route, 128)]),
-            (32, GAPS_PDL[(arch, route, 32)]),
+            (128, GAPS_PDL.get((arch, route, 128), ())),
+            (32, GAPS_PDL.get((arch, route, 32), ())),
             (16, GAPS_PDL.get((arch, route, 16), ())),
         ):
             for low, high in gaps:

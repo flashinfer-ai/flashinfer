@@ -962,20 +962,21 @@ def rmsnorm_sigmoid_gate(
         Whether to launch with programmatic dependent launch. Defaults to
         ``True``; pass ``False`` to disable it. The CuTe DSL kernel takes the
         attribute directly; the Cake package serves the call from its PDL
-        route, whose windows name a PDL build, a plain build (launched without
-        the attribute where the PDL build measured slower) or no program (where
-        the CuTe DSL kernel under PDL measured ahead). The package ships that
-        route on SM100 and SM103; on SM107 ``"auto"`` runs the CuTe DSL kernel
-        with PDL and the Cake kernels serve ``enable_pdl=False`` calls.
+        route, whose windows name a PDL build, a late-signal PDL build or a
+        plain build (launched without the attribute where the PDL build
+        measured slower) and cover every token count the plain route covers.
+        The package ships that route on SM100 and SM103; on SM107 ``"auto"``
+        runs the CuTe DSL kernel with PDL and the Cake kernels serve
+        ``enable_pdl=False`` calls.
     backend : str
         ``"auto"`` (default) runs the Cake kernels
         (:mod:`flashinfer.cake_muse_spark_norm_backend`) where the package ships
         a program for the device, the call's launch form, head count and token
-        count (the package routes 128, 32 and 16 heads; its windows may leave
-        token-count gaps where the CuTe DSL kernel measured ahead), else the CuTe
-        DSL kernel; ``"cake"`` and ``"cute"`` select one and raise ``ValueError``
-        when it is not available (``"cake"`` at a head count or token count
-        outside the package's windows of the launch form raises too).
+        count (the package routes 128, 32 and 16 heads; on SM107 its windows
+        leave token-count gaps where the CuTe DSL kernel measured ahead), else
+        the CuTe DSL kernel; ``"cake"`` and ``"cute"`` select one and raise
+        ``ValueError`` when it is not available (``"cake"`` at a head count or
+        token count outside the package's windows raises too).
     """
     if input.ndim not in (2, 3) or gate.shape != input.shape:
         raise ValueError("input and gate must have matching 2-D or 3-D shapes")

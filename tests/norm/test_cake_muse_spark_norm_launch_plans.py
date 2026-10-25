@@ -236,10 +236,20 @@ def test_a_repeated_rmsnorm_sigmoid_gate_call_reuses_its_plan(plans):
     )
     assert loader.MODULES[borrowed]["launch"]["use_pdl"] is False
     assert loader.MODULES[borrowed]["build"]["pdl"] is False
-    # a gap of the PDL route (128 heads at one token on every Blackwell architecture) is the package's error; the
-    # plain route serves the call
+    # the PDL route has no gap: 128 heads at one token (the first window of both routes) runs the PDL build of the
+    # program the plain route selects there, the plain call that program's plain build
     one = torch.zeros(1, 128, HEAD_DIM, dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="admits 1 tokens of 128 heads"):
-        pkg.cake_rmsnorm_sigmoid_gate(one, one.clone(), eps=1e-5, enable_pdl=True)
+    pkg.cake_rmsnorm_sigmoid_gate(one, one.clone(), eps=1e-5, enable_pdl=True)
+    first_pdl = launched[-1][0]
+    assert first_pdl == loader.selected_module(ARCH, pdl_route, 1, 128)
+    assert loader.MODULES[first_pdl]["launch"]["use_pdl"] is True
     pkg.cake_rmsnorm_sigmoid_gate(one, one.clone(), eps=1e-5)
-    assert loader.MODULES[launched[-1][0]]["launch"]["use_pdl"] is False
+    first_plain = launched[-1][0]
+    assert first_plain == loader.selected_module(
+        ARCH, pkg.rmsnorm_sigmoid_gate_route(), 1, 128
+    )
+    assert loader.MODULES[first_plain]["launch"]["use_pdl"] is False
+    assert loader.MODULES[first_pdl]["build"] == {
+        **loader.MODULES[first_plain]["build"],
+        "pdl": True,
+    }

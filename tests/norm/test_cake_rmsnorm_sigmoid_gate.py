@@ -5,7 +5,7 @@ behind ``rmsnorm_sigmoid_gate(..., backend="cake")``: every routed program again
 its window edges for the three routed head counts in both launch forms (the plain route, and the PDL route whose
 windows name a PDL build, the plain build launched without the attribute, or no program), the Cake result bit for
 bit against the CuTe DSL kernel's, the strided gate view of a wider projection, the 2-D call (one head, which the
-package does not route), the empty batch, CUDA graph replay, the fall-back at a gap of the windows and the input
+package does not route), the empty batch, CUDA graph replay, the contiguous PDL route, the fall-back at a gap of the plain windows and the input
 checks."""
 
 import pytest
@@ -247,18 +247,12 @@ def test_a_borrowed_window_launches_the_plain_build_without_the_attribute():
         pkg._launch = original
 
 
-def test_a_gap_of_the_pdl_route_falls_to_the_cute_kernel():
-    """A token count the PDL route leaves to the CuTe DSL kernel while the plain route serves it: ``auto`` under
-    PDL launches no Cake program, an explicit ``"cake"`` raises, and ``enable_pdl=False`` runs the plain route."""
+def test_the_pdl_route_admits_every_token_count_the_plain_route_admits():
+    """The PDL route's table is contiguous over the token count for every head count the plain route names: an
+    explicit ``"cake"`` call under PDL runs a Cake program wherever ``enable_pdl=False`` does (no gap), from the
+    launch form the window names (its PDL build, its late-signal PDL build or the plain build without the
+    attribute)."""
     _skip_without_pdl_route()
-    gaps = [
-        (heads, tokens)
-        for heads in HEADS
-        for tokens in (1, 2, 9, 64, 100, 500, 1000, 1025)
-        if _admits(heads, tokens, False) and not _admits(heads, tokens, True)
-    ]
-    if not gaps:
-        pytest.skip("the PDL route leaves no gap the plain route serves on this device")
     launched = []
     original = pkg._launch
 
@@ -268,30 +262,27 @@ def test_a_gap_of_the_pdl_route_falls_to_the_cute_kernel():
 
     try:
         pkg._launch = spy
-        for heads, tokens in gaps:
-            x, gate, _ = _inputs(tokens, heads, seed=8000 + tokens)
-            expected = _reference(x, gate, 1e-5)
-            assert not supports_rmsnorm_sigmoid_gate(
-                torch.bfloat16, HEAD_DIM, backend="cake", enable_pdl=True
-            ) or not pkg.is_cake_rmsnorm_sigmoid_gate_supported(
-                _device(), heads=heads, tokens=tokens, enable_pdl=True
-            )
-            with pytest.raises(
-                ValueError, match=f"admits {tokens} tokens of {heads} heads"
+        for heads in HEADS:
+            for tokens in sorted(
+                {1, 2, 7, 8, 9, 64, 65, 255, 256, 257, 1023, 1024, 1025, 4096}
             ):
+                assert (
+                    _admits(heads, tokens, True)
+                    is _admits(heads, tokens, False)
+                    is True
+                ), (heads, tokens)
+            for tokens in (1, 257, 1025):
+                x, gate, _ = _inputs(tokens, heads, seed=8000 + tokens)
+                expected = _reference(x, gate, 1e-5)
                 rmsnorm_sigmoid_gate(x, gate, 1e-5, enable_pdl=True, backend="cake")
-            if _cute_available():
-                probe = x.clone()
-                rmsnorm_sigmoid_gate(probe, gate, 1e-5, enable_pdl=True, backend="auto")
                 torch.cuda.synchronize()
-                torch.testing.assert_close(probe, expected, atol=ATOL, rtol=RTOL)
-                assert launched == []
-            rmsnorm_sigmoid_gate(x, gate, 1e-5, enable_pdl=False, backend="cake")
-            torch.cuda.synchronize()
-            torch.testing.assert_close(x, expected, atol=ATOL, rtol=RTOL)
-            name = loader.selected_module(_arch(), _route(False), tokens, heads)
-            assert launched[-1] == (name, tokens)
-            launched.clear()
+                torch.testing.assert_close(x, expected, atol=ATOL, rtol=RTOL)
+                name = loader.selected_module(_arch(), _route(True), tokens, heads)
+                assert launched[-1] == (name, tokens)
+                assert loader.MODULES[name]["launch"]["use_pdl"] is _uses_pdl(
+                    name, True
+                )
+                launched.clear()
     finally:
         pkg._launch = original
 

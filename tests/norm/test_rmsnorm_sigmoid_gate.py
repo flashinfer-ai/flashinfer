@@ -68,7 +68,7 @@ def test_rmsnorm_sigmoid_gate_dispatch(monkeypatch, backend, shape):
     )
     monkeypatch.setattr(norm, "device_support_pdl", lambda *_: True)
 
-    def supported(device, *, heads=None, tokens=None):
+    def supported(device, *, heads=None, tokens=None, enable_pdl=None):
         return heads is None or heads == NUM_HEADS
 
     monkeypatch.setattr(
@@ -100,7 +100,8 @@ def test_rmsnorm_sigmoid_gate_dispatch(monkeypatch, backend, shape):
         if cake_expected:
             assert len(cake_calls) == 1 and not cute_calls
             args, keywords = cake_calls[0]
-            assert args == (x, gate) and keywords == {"eps": 1e-3}
+            # the facade hands the package the resolved launch form (device_support_pdl is True here)
+            assert args == (x, gate) and keywords == {"eps": 1e-3, "enable_pdl": True}
         else:
             assert not cake_calls and len(cute_calls) == 1
             args, keywords = cute_calls[0]
