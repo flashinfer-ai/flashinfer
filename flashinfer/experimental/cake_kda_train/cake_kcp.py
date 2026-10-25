@@ -2936,7 +2936,10 @@ class _Tables:
         SM count, knob, rule)`` of this table set and looked up on every later launch.  The rule's inputs are static per
         ``(ctx, H)`` (the walk lists and ``hp.seg_chunk_start`` are this set's, never mutated), so the lookup returns
         what a per-launch evaluation would; the evaluation itself (the ``fit`` rule list-schedules the chains in
-        Python) leaves the launch path.  Keyed by value: a fresh equal list finds the same entry."""
+        Python) leaves the launch path.  Keyed by value: a fresh equal list finds the same entry.  The first launch
+        per key of a context pays that one evaluation (milliseconds of Python for the ``fit`` rule on long chain
+        lists: the one-time cost of an eager first call, not a per-launch regression); every later launch pays a
+        dictionary lookup."""
         key = (str(name), tuple(walk), int(H), int(sm_count), str(knob), rule)
         cache = self.__dict__.setdefault("_walk_forms", {})
         form = cache.get(key)
