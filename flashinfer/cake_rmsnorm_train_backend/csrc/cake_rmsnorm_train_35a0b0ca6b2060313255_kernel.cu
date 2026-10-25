@@ -629,7 +629,11 @@ kernel_cake_rmsnorm_train_35a0b0ca6b2060313255(__nv_bfloat16* __restrict__ g, __
                         reinterpret_cast<int4*>(dx + (dx_base + (unsigned long long)dcol))[0] = reinterpret_cast<int4*>(_packed_0)[0];
                     }
                 }
+#if __CUDA_ARCH__ == 1030
+                if ((kc + i_1 + 1 & 15) == 0) {
+#else
                 if ((kc + i_1 + 1 & 7) == 0) {
+#endif
                     #pragma unroll
                     for (int jf = 0; jf < 16; jf++) {
                         float pf = part_sm[jf * 256 + tid];
@@ -855,7 +859,11 @@ kernel_cake_rmsnorm_train_35a0b0ca6b2060313255(__nv_bfloat16* __restrict__ g, __
                     reinterpret_cast<int4*>(dx + (dx_base_1 + (unsigned long long)dcol_1))[0] = reinterpret_cast<int4*>(_packed_1)[0];
                 }
             }
+#if __CUDA_ARCH__ == 1030
+            if ((kc + run + 1 & 15) == 0) {
+#else
             if ((kc + run + 1 & 7) == 0) {
+#endif
                 #pragma unroll
                 for (int jf_1 = 0; jf_1 < 16; jf_1++) {
                     float pf_1 = part_sm[jf_1 * 256 + tid];
