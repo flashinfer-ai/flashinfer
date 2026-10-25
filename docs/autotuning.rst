@@ -458,6 +458,13 @@ SM100/SM103 MXFP8 warp split-K runner at small N) puts a non-split runner
 first instead, and an ``autotune_v2`` tuning context does not race a
 non-invariant default tactic.
 
+.. note::
+
+   Coverage is limited to the SM100/SM103 ``mm_mxfp8(backend="cute-dsl")``
+   runners. On SM107 the untuned low-M default can still split K, so the mode
+   gives no bitwise guarantee there yet.
+
+
 Interaction with other autotuner features:
 
 * The setting is process-wide. Under ``set_autotune_process_group`` every rank
