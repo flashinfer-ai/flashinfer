@@ -44,17 +44,27 @@ constexpr int kCachedMaxTiles = 8;
 constexpr uint32_t kCachedMaxVocabSize =
     static_cast<uint32_t>(kCachedMaxClusterSize) * kCachedMaxTiles * kCachedTileElements;
 constexpr uintptr_t kCachedAlignmentBytes = 32;
-// The persistent kernels keep the clusters resident and walk the rows. They
-// pay once every resident cluster has at least 2.5 rows (measured on GB300 and
-// B200): rows * 2 >= resident clusters * 5.
+// An 8-tile launch whose rows exceed one wave of resident persistent clusters
+// R_P takes the persistent kernel (the clusters stay resident and walk the
+// rows) or the shared-tile kernel (4 register tiles and up to 4 shared-memory
+// tiles per CTA, four resident CTAs per SM, one cluster per row; R_S resident
+// clusters), by this rule (measured on GB300 and B200):
+// - a chunk of at most 5 tiles takes the shared-tile kernel;
+// - a full 8-tile chunk takes the persistent kernel, unless the rows fit one
+//   wave of shared-tile clusters while filling less than 4/5 of the
+//   persistent kernel's trips (rows * 5 < ceil(rows / R_P) * R_P * 4), or
+//   reach 8 (16-CTA clusters) or 7 (8-CTA clusters) rows per shared-tile
+//   cluster;
+// - a 6- or 7-tile chunk takes the persistent kernel below 4 rows per
+//   shared-tile cluster: on sm_100 unless the same trip rule holds, on sm_103
+//   from 2.5 rows per persistent cluster on (rows * 2 >= R_P * 5).
+constexpr int kSharedTilesAnyRowsMaxTiles = 5;
+constexpr uint64_t kPersistentTripFillNum = 4;
+constexpr uint64_t kPersistentTripFillDen = 5;
+constexpr uint64_t kSharedTilesRowsPerClusterFullChunkC16 = 8;
+constexpr uint64_t kSharedTilesRowsPerClusterFullChunkC8 = 7;
 constexpr uint64_t kPersistentRowsPerClusterNum = 5;
 constexpr uint64_t kPersistentRowsPerClusterDen = 2;
-// The shared-tile kernels (4 register tiles and up to 4 shared-memory tiles
-// per CTA, four resident CTAs per SM) take an 8-tile launch once the rows
-// exceed one wave of persistent clusters, when the chunk spans at most 5
-// tiles, below the persistent threshold, or from 4 rows per resident
-// shared-tile cluster on (measured on GB300 and B200).
-constexpr int kSharedTilesAnyRowsMaxTiles = 5;
 constexpr uint64_t kSharedTilesRowsPerCluster = 4;
 constexpr int kMaxDevices = 64;
 
@@ -339,17 +349,38 @@ cudaError_t select_cached_launch(uint32_t rows, uint32_t vocab_size, int device,
   if (status != cudaSuccess) {
     return status;
   }
-  const bool narrow_chunk = cached_chunk_elements(vocab_size, variant.cluster_ctas) <=
-                            kSharedTilesAnyRowsMaxTiles * kCachedTileElements;
-  const bool under_persistent = static_cast<uint64_t>(rows) * kPersistentRowsPerClusterDen <
-                                static_cast<uint64_t>(resident) * kPersistentRowsPerClusterNum;
-  const bool many_rows = shared_resident > 0 && static_cast<uint64_t>(rows) >=
-                                                    kSharedTilesRowsPerCluster * shared_resident;
-  if (shared_resident > 0 && (narrow_chunk || under_persistent || many_rows)) {
+  int device_minor = 0;
+  status = cudaDeviceGetAttribute(&device_minor, cudaDevAttrComputeCapabilityMinor, device);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  const uint32_t chunk_elements = cached_chunk_elements(vocab_size, variant.cluster_ctas);
+  const uint64_t rows64 = rows;
+  const uint64_t persistent_clusters = static_cast<uint64_t>(resident);
+  const uint64_t shared_clusters = static_cast<uint64_t>(shared_resident > 0 ? shared_resident : 0);
+  const bool under_persistent =
+      rows64 * kPersistentRowsPerClusterDen < persistent_clusters * kPersistentRowsPerClusterNum;
+  const uint64_t trips = (rows64 + persistent_clusters - 1) / persistent_clusters;
+  const bool short_last_trip =
+      rows64 <= shared_clusters &&
+      rows64 * kPersistentTripFillDen < trips * persistent_clusters * kPersistentTripFillNum;
+  bool use_shared_tiles = true;
+  if (chunk_elements <= kSharedTilesAnyRowsMaxTiles * kCachedTileElements) {
+    // A narrow chunk: the shared-tile kernel at any row count.
+  } else if (chunk_elements == kCachedMaxTiles * kCachedTileElements) {
+    const uint64_t rows_per_cluster = variant.cluster_ctas == 16
+                                          ? kSharedTilesRowsPerClusterFullChunkC16
+                                          : kSharedTilesRowsPerClusterFullChunkC8;
+    use_shared_tiles = short_last_trip || rows64 >= rows_per_cluster * shared_clusters;
+  } else {
+    use_shared_tiles = (device_minor == 0 ? short_last_trip : under_persistent) ||
+                       rows64 >= kSharedTilesRowsPerCluster * shared_clusters;
+  }
+  if (shared_resident > 0 && use_shared_tiles) {
     *launch = {variant, shared_tiles, rows, shared_tiles_smem,
                SoftmaxRoute::kCachedClusterSharedTiles};
-  } else if (!under_persistent) {
-    *launch = {variant, persistent, static_cast<uint64_t>(resident), persistent_smem,
+  } else if (shared_resident > 0 || !under_persistent) {
+    *launch = {variant, persistent, persistent_clusters, persistent_smem,
                SoftmaxRoute::kCachedClusterPersistent};
   }
   return cudaSuccess;
