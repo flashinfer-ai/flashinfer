@@ -147,8 +147,8 @@ def test_active_stage_grids_are_bounded_by_capacity(tokens, gemm_y):
     module = _session_module()
     grids = module._active_stage_grids(tokens)
 
-    # up to 16 active rows one extra dispatch CTA computes the route (no route kernel)
-    assert grids["dispatch"] == (8 * tokens + (1 if tokens <= 16 else 0), 1, 1)
+    # one extra dispatch CTA computes the route (no route kernel)
+    assert grids["dispatch"] == (8 * tokens + 1, 1, 1)
     assert grids["stage_inputs"] == (tokens, 1, 1)
     assert "route_count" not in grids and "route_scatter" not in grids
     assert grids["gemm1_swiglu"] == (32, gemm_y, 1)
@@ -158,6 +158,21 @@ def test_active_stage_grids_are_bounded_by_capacity(tokens, gemm_y):
     for name, grid in grids.items():
         maximum = module._STAGE_LAUNCH_CONTRACTS[name][0]
         assert all(value <= bound for value, bound in zip(grid, maximum, strict=True))
+
+
+@pytest.mark.parametrize("tokens", (1, 2, 4, 5, 8, 9, 32, 33, 128))
+def test_ll_path_grids_cover_only_small_active_counts(tokens):
+    module = _session_module()
+    grids = module._active_stage_grids(tokens)
+
+    if tokens <= module._LL_MAX_T:
+        splits = max(1, 8 // tokens)
+        assert grids["ll_push"] == (tokens, 8, splits)
+        assert grids["ll_recv"] == (8 * tokens * splits + 1, 1, 1)
+        assert grids["ll_unpermute"] == (8 * tokens, 7, 1)
+        assert grids["ll_combine"] == (tokens, 7, 1)
+    else:
+        assert not any(name.startswith("ll_") for name in grids)
 
 
 @pytest.mark.parametrize("tokens", (0, 129))
