@@ -335,7 +335,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "rows_kv_heads_splits"},
-        "kernel_symbol": "kernel_cake_qsa_nvfp4_ce0eb22c5279f0671378",
+        "kernel_symbol": "kernel_cake_qsa_nvfp4_f0ae7070812a3e062d6f",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -434,7 +434,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "rows_kv_heads_splits"},
-        "kernel_symbol": "kernel_cake_qsa_nvfp4_27ee9c3b4b04fb0a1cb3",
+        "kernel_symbol": "kernel_cake_qsa_nvfp4_ecb46ae2b040daa1c35d",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -538,7 +538,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "rows_kv_heads_splits"},
-        "kernel_symbol": "kernel_cake_qsa_nvfp4_69a1ca68c5e159455bc8",
+        "kernel_symbol": "kernel_cake_qsa_nvfp4_4f13e4710a51ac27ff6f",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -806,7 +806,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "rows_head_groups", "warps": 4},
-        "kernel_symbol": "kernel_cake_qsa_nvfp4_6a7c3a5082657fdef802",
+        "kernel_symbol": "kernel_cake_qsa_nvfp4_aa2349948b0a711974f9",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
