@@ -3622,12 +3622,41 @@ def load(name, arch):
     return spec(name, arch).build_and_load()
 
 
-class PreparedKernel:
-    """A native module plus caller-retained pointer-TMA descriptor storage.
+#: The argument-plan entry of a generated binding whose tensor maps the caller
+#: encodes: a host buffer of ``tensor_map_count()`` maps, 128 bytes each.
+TENSOR_MAP_PLAN_ENTRY = ("workspace", "tensor_maps")
+_TENSOR_MAP_BYTES = 128
+_TENSOR_MAP_ALIGNMENT = 64
 
-    A module without a descriptor workspace (every generated program) encodes
-    its tensor maps in ``run`` from the bound tensors: ``prepare`` has nothing
-    to upload and ``launch`` calls ``run`` directly.
+
+def _aligned_host_bytes(count):
+    """A CPU uint8 buffer of ``count`` bytes whose address is 64-byte aligned."""
+    raw = torch.zeros(count + _TENSOR_MAP_ALIGNMENT, dtype=torch.uint8)
+    offset = -raw.data_ptr() % _TENSOR_MAP_ALIGNMENT
+    return raw[offset : offset + count]
+
+
+class PreparedKernel:
+    """A native module plus caller-retained TMA descriptor storage.
+
+    A shipped module with a descriptor workspace encodes its descriptors into
+    device storage in ``prepare`` (``<entry>_prepare_tma``) and launches with
+    ``<entry>_prepared``.  A generated program whose argument plan names
+    :data:`TENSOR_MAP_PLAN_ENTRY` encodes its tensor maps into a host buffer
+    in ``prepare`` (the binding's ``encode_tensor_maps``, no device work) and
+    ``run`` passes those bytes as the kernel's by-value maps.  A generated
+    program without tensor maps has nothing to prepare.
+
+    The stored maps hold the addresses, extents and strides of the bound
+    descriptor sources (every ``*_tma`` argument), so ``prepare`` must run
+    again whenever one of them can differ.  The runtime does: a plan-cache
+    hit has the structural key of the prepared call (shape, strides, dtype,
+    device, 256-byte alignment and aliasing of every caller tensor), and its
+    rebind re-points each recorded view with the same shape, strides and
+    dtype, so only addresses move; every moved ``*_tma`` source marks its
+    launch stale, and a stale launch re-prepares before its next kernel
+    (under CUDA-graph capture every hit re-prepares).  The rendered encoders
+    read nothing but their own ``*_tma`` tensor.
     """
 
     def __init__(self, name, arch):
@@ -3638,17 +3667,36 @@ class PreparedKernel:
         native = load(name, arch)
         entry = record["ffi_entry"]
         workspace_bytes = record.get("tma_workspace_bytes", 0)
-        self._call = getattr(native, entry + "_prepared" if workspace_bytes else entry)
-        self._prepare = (
-            getattr(native, entry + "_prepare_tma") if workspace_bytes else None
-        )
-        self._ready = self._prepare is None
         self._arg_plan = record["arg_plan"]
-        self.descriptor_storage = (
-            torch.empty(workspace_bytes, dtype=torch.uint8, device="cuda")
-            if workspace_bytes
-            else None
-        )
+        plan = [tuple(pair) for pair in self._arg_plan]
+        self.encodes_on_host = TENSOR_MAP_PLAN_ENTRY in plan
+        self._encode_slots = None
+        if self.encodes_on_host:
+            self._call = getattr(native, entry)
+            self._prepare = native.encode_tensor_maps
+            # The encode entry takes run's arguments without the launch
+            # argument and the grid.
+            self._encode_slots = tuple(
+                slot
+                for slot, (kind, _name) in enumerate(plan)
+                if kind not in ("grid", "launch")
+            )
+            self.descriptor_storage = _aligned_host_bytes(
+                int(native.tensor_map_count()) * _TENSOR_MAP_BYTES
+            )
+        else:
+            self._call = getattr(
+                native, entry + "_prepared" if workspace_bytes else entry
+            )
+            self._prepare = (
+                getattr(native, entry + "_prepare_tma") if workspace_bytes else None
+            )
+            self.descriptor_storage = (
+                torch.empty(workspace_bytes, dtype=torch.uint8, device="cuda")
+                if workspace_bytes
+                else None
+            )
+        self._ready = self._prepare is None
 
     def _arguments(self, grid, bindings):
         # One list build per call: binding names resolve straight from the
@@ -3683,10 +3731,29 @@ class PreparedKernel:
                 names.append(name)
         return tuple(names), tuple(grid_slots), tuple(workspace_slots)
 
+    def _prepare_arguments(self, grid, bindings):
+        args = self._arguments(grid, bindings)
+        if self._encode_slots is not None:
+            args = [args[slot] for slot in self._encode_slots]
+        return args
+
     def prepare(self, *, grid, **bindings):
         if self._prepare is not None:
-            self._prepare(*self._arguments(grid, bindings))
+            self._prepare(*self._prepare_arguments(grid, bindings))
         self._ready = True
+
+    def encoded_tensor_maps(self, *, grid, **bindings):
+        """Fresh host-encoded maps of ``bindings``; the stored ones are kept."""
+        if not self.encodes_on_host:
+            raise TypeError(f"{self.name} does not encode tensor maps on the host")
+        stored = self.descriptor_storage
+        fresh = _aligned_host_bytes(stored.numel())
+        args = [
+            fresh if arg is stored else arg
+            for arg in self._prepare_arguments(grid, bindings)
+        ]
+        self._prepare(*args)
+        return fresh
 
     def launch(self, *, grid, **bindings):
         if not self._ready:

@@ -17,6 +17,11 @@ strided BF16 beta-logit slice, checkpoint rows every 64 tokens) with the routes
 in place and with the routes cleared, each against an FP32 token-by-token
 reference; replay the routed launch from a CUDA graph; and rebind it through a
 plan-cache hit.
+
+A program that takes tensor maps encodes them once per preparation into a host
+buffer (``("workspace", "tensor_maps")`` in its plan); the checks hold every
+stored map equal to a fresh encode of the bound tensors after preparation and
+after a plan-cache rebind to new tensors.
 """
 
 import re
@@ -33,13 +38,15 @@ from flashinfer import (
     kda_prefill_supports_fp32_checkpoints,
     prepare_bf16_kda_prefill,
 )
+from flashinfer.cake_kda_tf32_runtime import _MAP_FIRST_MODULES
 
 ROOT = Path(registry.__file__).resolve().parents[2]
 UNIT_DIR = "csrc/kda/prefill"
 NAME = re.compile(r"cake_kda_prefill_[0-9a-f]{20}")
 LEAN_KEYS = {"sources", "ffi_entry", "compile_flags", "arg_plan", "arches"}
 GRID = [["grid", "grid_x"], ["grid", "grid_y"], ["grid", "grid_z"]]
-PLAN_KINDS = {"buffer", "tma_buffer", "parameter", "grid"}
+PLAN_KINDS = {"buffer", "tma_buffer", "parameter", "workspace", "grid"}
+MAPS = list(registry.TENSOR_MAP_PLAN_ENTRY)
 TENSOR_KINDS = {"buffer", "tma_buffer"}
 
 HEAD_DIM = 128
@@ -99,6 +106,7 @@ def test_generated_record_is_lean_and_names_its_units(name):
     plan = record["arg_plan"]
     assert [list(slot) for slot in plan[-3:]] == GRID
     assert {kind for kind, _ in plan} <= PLAN_KINDS
+    assert [list(slot) for slot in plan if slot[0] == "workspace"] in ([], [MAPS])
     kernel = (ROOT / record["sources"][0]).read_text()
     binding = (ROOT / record["sources"][1]).read_text()
     symbol = re.compile(rf"\bkernel_{name}\s*\(")
@@ -117,7 +125,7 @@ def test_generated_plans_bind_from_the_shipped_plans():
                 name: kind for kind, name in registry.MODULES[module]["arg_plan"]
             }
             for kind, name in registry._RENDERED_MODULES[program]["arg_plan"]:
-                if kind == "grid":
+                if kind in ("grid", "workspace"):
                     continue
                 where = (arch, module, program, name)
                 assert name in shipped, where
@@ -164,15 +172,73 @@ def test_spec_compiles_the_generated_units(monkeypatch):
     assert Path(captured["extra_include_paths"][0]).name == "prefill"
 
 
+def _host_encoded(name):
+    plan = registry._RENDERED_MODULES[name]["arg_plan"]
+    return MAPS in [list(slot) for slot in plan]
+
+
+ENCODED = [name for name in GENERATED if _host_encoded(name)]
+PLAIN = [name for name in GENERATED if not _host_encoded(name)]
+
+
+def _function_body(text, signature):
+    start = text.index(signature)
+    return text[start : text.index("\n}\n", start)]
+
+
+@requires_programs
+@pytest.mark.parametrize("name", GENERATED)
+def test_a_program_with_tensor_maps_takes_them_from_the_loader(name):
+    """The binding of a program that takes tensor maps is the host-encoded form:
+    ``run`` copies the maps from the loader's buffer and encodes nothing, and
+    ``encode_tensor_maps`` encodes each map from its own ``*_tma`` tensor and
+    nothing else, so the stored bytes depend on that tensor's address, extents,
+    strides and dtype alone -- what a plan-cache rebind tracks."""
+    record = registry._RENDERED_MODULES[name]
+    plan = [list(slot) for slot in record["arg_plan"]]
+    binding = (ROOT / record["sources"][1]).read_text()
+    sources = [slot_name for kind, slot_name in plan if kind == "tma_buffer"]
+    assert all(source.endswith("_tma") for source in sources), sources
+    encoders = re.findall(r"^CUtensorMap EncodeTma_(\w+)\(", binding, re.M)
+    if not encoders:
+        assert name in PLAIN and "encode_tensor_maps" not in binding
+        assert not sources
+        return
+    assert name in ENCODED
+    # The buffer sits after the kernel's arguments, before the launch argument
+    # and the grid.
+    tail = [kind for kind, _ in plan[plan.index(MAPS) :]]
+    assert tail in (
+        ["workspace", "grid", "grid", "grid"],
+        ["workspace", "launch", "grid", "grid", "grid"],
+    )
+    assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(encode_tensor_maps," in binding
+    assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(tensor_map_count," in binding
+    run = _function_body(binding, "void Run(")
+    assert "EncodeTma_" not in run and "cuTensorMapEncodeTiled" not in run
+    encode = _function_body(binding, "void EncodeTensorMaps(")
+    stores = re.findall(
+        r"^  maps\[(\d+)\] = EncodeTma_(\w+)\(([^)]*)\);$", encode, re.M
+    )
+    assert [int(index) for index, _, _ in stores] == list(range(len(stores)))
+    assert sorted(map_name for _, map_name, _ in stores) == sorted(encoders)
+    count = re.search(r"int64_t TensorMapCount\(\) \{ return (\d+); \}", binding)
+    assert count and int(count.group(1)) == len(stores)
+    for _, map_name, arguments in stores:
+        assert re.fullmatch(r"a_\w+_tma", arguments), (map_name, arguments)
+        assert arguments[2:] in sources, (map_name, arguments)
+
+
 @requires_programs
 def test_prepared_kernel_calls_run_without_a_descriptor_workspace(monkeypatch):
-    name = GENERATED[0]
+    assert PLAIN, "every generated program takes tensor maps"
+    name = PLAIN[0]
     record = registry._RENDERED_MODULES[name]
     calls = []
     native = SimpleNamespace(run=lambda *args: calls.append(args))
     monkeypatch.setattr(registry, "load", lambda module, arch: native)
     kernel = registry.PreparedKernel(name, record["arches"][0])
-    assert kernel._prepare is None
+    assert kernel._prepare is None and not kernel.encodes_on_host
     assert kernel.descriptor_storage is None
     names = [slot_name for kind, slot_name in record["arg_plan"] if kind != "grid"]
     bindings = {slot_name: object() for slot_name in names}
@@ -181,6 +247,101 @@ def test_prepared_kernel_calls_run_without_a_descriptor_workspace(monkeypatch):
     assert calls == []
     kernel.launch(grid=(3, 2), **bindings)
     assert calls == [(*(bindings[slot_name] for slot_name in names), 3, 2, 1)]
+
+
+@requires_programs
+def test_prepared_kernel_encodes_the_maps_into_its_host_buffer(monkeypatch):
+    assert ENCODED, "no generated program takes tensor maps"
+    name = ENCODED[0]
+    record = registry._RENDERED_MODULES[name]
+    plan = [tuple(slot) for slot in record["arg_plan"]]
+    encodes, runs = [], []
+
+    def encode(*args):
+        encodes.append(args)
+        args[-1].fill_(len(encodes))
+
+    native = SimpleNamespace(
+        run=lambda *args: runs.append(args),
+        encode_tensor_maps=encode,
+        tensor_map_count=lambda: 3,
+    )
+    monkeypatch.setattr(registry, "load", lambda module, arch: native)
+    kernel = registry.PreparedKernel(name, record["arches"][0])
+    storage = kernel.descriptor_storage
+    assert kernel.encodes_on_host
+    assert storage.device.type == "cpu" and storage.dtype == torch.uint8
+    assert storage.numel() == 3 * 128 and storage.data_ptr() % 64 == 0
+    assert storage.is_contiguous()
+    names = [n for kind, n in plan if kind not in ("grid", "workspace")]
+    bindings = {n: object() for n in names}
+    with pytest.raises(RuntimeError, match="must be initialized during preparation"):
+        kernel.launch(grid=(5,), **bindings)
+    kernel.prepare(grid=(5,), **bindings)
+    # The encode entry takes run's arguments without the launch argument and
+    # the grid; the buffer is the plan's workspace slot.
+    expected = [
+        storage if kind == "workspace" else bindings[n]
+        for kind, n in plan
+        if kind not in ("grid", "launch")
+    ]
+    assert len(encodes) == 1 and len(encodes[0]) == len(expected)
+    assert all(a is b for a, b in zip(encodes[0], expected, strict=True))
+    assert bool((storage == 1).all())
+    kernel.launch(grid=(5,), **bindings)
+    launched = [
+        storage if kind == "workspace" else bindings[n]
+        for kind, n in plan
+        if kind != "grid"
+    ]
+    assert len(runs) == 1 and runs[0][-3:] == (5, 1, 1)
+    assert all(a is b for a, b in zip(runs[0][:-3], launched, strict=True))
+    # A fresh encode goes to a buffer of its own.
+    fresh = kernel.encoded_tensor_maps(grid=(5,), **bindings)
+    assert fresh.data_ptr() != storage.data_ptr() and bool((fresh == 2).all())
+    assert bool((storage == 1).all())
+
+
+@requires_programs
+def test_map_first_programs_wait_before_touching_memory():
+    """The chain route may launch a map program ahead of the index gather and
+    the main kernel (``_MAP_FIRST_MODULES``).  Its generated replacement keeps
+    that safe: every thread runs the grid-dependency wait before any memory
+    argument is used, and the main kernel's final state, bound as
+    ``initial_state_f32``, is never read."""
+    shipped = (
+        "cake_kda_bf16_f74a288bb51b335a1ccf",
+        "cake_kda_bf16_5639519f5c942ed86e4f",
+    )
+    assert set(shipped) <= _MAP_FIRST_MODULES
+    rendered = _MAP_FIRST_MODULES - set(shipped)
+    for arch, routes in registry._RENDERED_ROUTES.items():
+        for module in shipped:
+            if module in routes:
+                assert routes[module] in rendered, (arch, module, routes[module])
+    assert rendered <= set(GENERATED)
+    for name in sorted(rendered):
+        record = registry._RENDERED_MODULES[name]
+        text = (ROOT / record["sources"][0]).read_text()
+        match = re.search(rf"\bvoid\s+kernel_{name}\s*\(([^)]*)\)\s*\{{", text)
+        assert match, name
+        signature, body = match.group(1), text[match.end() :]
+        memory = {
+            parameter.split()[-1]
+            for parameter in signature.split(",")
+            if "*" in parameter or "CUtensorMap" in parameter
+        }
+        assert "initial_state_f32" in memory
+        wait = '\n    asm volatile("griddepcontrol.wait;" ::: "memory");\n'
+        assert body.count("griddepcontrol.wait") == 1 and wait in body, name
+        prologue = body[: body.index(wait)]
+        used = set(re.findall(r"\b[A-Za-z_]\w*\b", prologue)) & memory
+        assert not used, (name, sorted(used))
+        assert not re.search(
+            r"\b(?:ld|st)\.global|\bcp\.(?:async|reduce)|\b(?:atom|red|prefetch|multimem)\.",
+            prologue,
+        ), name
+        assert not re.search(r"\binitial_state_f32\b", body), name
 
 
 # ---------------------------------------------------------------- GPU numerics
@@ -522,3 +683,104 @@ def test_plan_cache_hit_matches_a_fresh_preparation(lengths, heads, lower_bound)
     got = hit.run()
     fresh = _Call(second, lower_bound)
     _assert_bitwise(got, fresh.run(), "plan-cache hit")
+
+
+def _host_encoded_parts(prepared):
+    """(module, grid, bindings) of every launch part whose module encodes its
+    tensor maps on the host: the part launches, their prepare kernels and, on
+    the apply route, the pair-map, prefix and fused apply kernels."""
+    parts = []
+    seen = set()
+
+    def add(module, grid, bindings):
+        if isinstance(module, registry.PreparedKernel) and module.encodes_on_host:
+            parts.append((module, grid, bindings))
+
+    def visit(obj, depth):
+        if depth > 7 or id(obj) in seen:
+            return
+        seen.add(id(obj))
+        if isinstance(obj, dict):
+            for value in obj.values():
+                visit(value, depth + 1)
+            return
+        if isinstance(obj, (list, tuple)):
+            for value in obj:
+                visit(value, depth + 1)
+            return
+        if not (
+            type(obj).__module__.startswith("flashinfer") and hasattr(obj, "__dict__")
+        ):
+            return
+        attrs = vars(obj)
+        for module, grid, bindings in (
+            ("module", "grid", "args"),
+            ("prepare_module", "prepare_grid", "prepare_args"),
+            ("_projection_module", "_projection_grid", "_projection_args"),
+        ):
+            if attrs.get(module) is not None:
+                add(attrs[module], attrs[grid], attrs[bindings])
+        if attrs.get("_apply_route"):
+            for part in ("pairmap", "prefix", "apply"):
+                add(
+                    attrs[f"_{part}_module"],
+                    attrs[f"_{part}_grid"],
+                    getattr(obj, f"_{part}_bindings")(),
+                )
+        for value in attrs.values():
+            visit(value, depth + 1)
+
+    visit(prepared, 0)
+    return parts
+
+
+def _assert_stored_maps_are_current(prepared, label):
+    parts = _host_encoded_parts(prepared)
+    assert parts, f"{label}: no part encodes its tensor maps on the host"
+    for module, grid, bindings in parts:
+        assert module._ready, (label, module.name)
+        fresh = module.encoded_tensor_maps(grid=grid, **bindings)
+        assert torch.equal(fresh, module.descriptor_storage), (
+            f"{label}: {module.name} launches with maps of other tensors"
+        )
+    return {id(module): module.descriptor_storage.clone() for module, _, _ in parts}
+
+
+STORED_MAP_ROWS = [
+    pytest.param([1024] * 4, 16, None, id="direct-h16"),
+    pytest.param([8192], 12, -5.0, id="affine-chain-h12-lb5"),
+    pytest.param([8392], 16, None, id="affine-tail-h16"),
+    pytest.param([17, 64, 65, 127, 128, 200, 255, 96] * 2, 12, None, id="mixed-h12"),
+]
+
+
+@requires_blackwell
+@pytest.mark.parametrize("lengths,heads,lower_bound", STORED_MAP_ROWS)
+def test_stored_tensor_maps_equal_a_fresh_encode_after_prepare_and_rebind(
+    lengths, heads, lower_bound
+):
+    """Every map a host-encoding module launches with is the map of the
+    tensors it is bound to: after preparation, after a plan-cache rebind to a
+    complete new tensor set (applied by the next launch, deferred parts
+    included) and after a hit that moves the output alone."""
+    cache = KDAPrefillPlanCache(8)
+    first = _inputs(lengths, heads, seed=3)
+    second = _inputs(lengths, heads, seed=4)
+    miss = _Call(first, lower_bound, plan_cache=cache)
+    before = _assert_stored_maps_are_current(miss.prepared, "prepared")
+    miss.run()
+    _assert_stored_maps_are_current(miss.prepared, "launched")
+    hit = _Call(second, lower_bound, plan_cache=cache)
+    assert (cache.misses, cache.hits) == (1, 1)
+    got = hit.run()
+    after = _assert_stored_maps_are_current(hit.prepared, "rebound")
+    assert any(
+        not torch.equal(before[key], after[key]) for key in before if key in after
+    ), "the rebind to new tensors re-encoded no map"
+    _assert_bitwise(got, _Call(second, lower_bound).run(), "plan-cache hit")
+    # Serving allocates the output per call: a hit that moves the output and
+    # the checkpoint rows (a _Call allocates both) and keeps every input.
+    again = _Call(second, lower_bound, plan_cache=cache)
+    assert (cache.misses, cache.hits) == (1, 2)
+    _assert_bitwise(again.run(), got, "output moved")
+    _assert_stored_maps_are_current(again.prepared, "output moved")

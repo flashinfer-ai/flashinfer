@@ -848,11 +848,16 @@ def _invalidate_launch_records(impl) -> None:
 # never dereferenced, and every data access follows the body's grid-dependency
 # wait.  The scan kernel waits on the main kernel at its first instruction and
 # reads the map state that the index gather (a plain launch after the map)
-# already ordered.
+# already ordered.  The generated programs the loader routes those two shipped
+# modules to on sm_100a and sm_103a keep the same contract: their only work
+# before the grid-dependency wait, which every thread runs, is barrier
+# initialization and tensor-memory allocation.
 _MAP_FIRST_MODULES = frozenset(
     (
         "cake_kda_bf16_f74a288bb51b335a1ccf",
         "cake_kda_bf16_5639519f5c942ed86e4f",
+        "cake_kda_prefill_d057d2f13a1cc539c368",
+        "cake_kda_prefill_75de35b15f3e0cf2f3f8",
     )
 )
 
@@ -4281,6 +4286,14 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                     grid=self._prefix_grid, **self._prefix_bindings()
                 )
                 self._apply_prefix_stale = False
+            elif getattr(self._pairmap_module, "encodes_on_host", False):
+                # A program whose maps the loader encodes on the host keeps
+                # every stored map current: the pair-map producer's maps
+                # include the caller's out_tma / rows_tma sources this rebind
+                # moved, and re-encoding them costs no device work.
+                self._pairmap_module.prepare(
+                    grid=self._pairmap_grid, **self._pairmap_bindings()
+                )
             self._apply_module.prepare(grid=self._apply_grid, **self._apply_bindings())
             self._apply_descriptors_stale = False
         if self._apply_route and self._lean_map:
