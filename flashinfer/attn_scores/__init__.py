@@ -21,6 +21,9 @@ from .attn_scores import (
     precompile_paged_mqa_logits,
 )
 from .single_head import single_head_paged_mqa_logits
+from .selective_logits import FP8PagedMQATopKWrapper
+from .fp8_kernel_config import FP8MQAKernelConfig
+from .query_group_metadata import FP8QueryGroups
 
 __all__ = [
     "fp8_paged_mqa_logits",
@@ -30,4 +33,7 @@ __all__ = [
     "padded_seq_len",
     "precompile_paged_mqa_logits",
     "single_head_paged_mqa_logits",
+    "FP8PagedMQATopKWrapper",
+    "FP8MQAKernelConfig",
+    "FP8QueryGroups",
 ]

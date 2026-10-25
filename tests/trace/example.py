@@ -66,6 +66,9 @@ gemma_rmsnorm_h4608.json
 gelu_and_mul_h16384.json
 gelu_tanh_and_mul_h16384.json
 fp8_paged_mqa_logits_nn2_H64_D128_bs64.json
+fp8_paged_mqa_topk_H8_D128_ps64_k512.json
+fp8_paged_mqa_selective_topk_H8_D128_ps64_k512.json
+fp8_paged_mqa_compressed_topk_H8_D128_ps64_k512_cr4.json
 fp4_paged_mqa_logits_nn2_H64_Dp64_bs64.json
 gqa_paged_decode_h32_kv8_d128_ps16.json
 gqa_paged_decode_h32_kv8_d128_ps64.json
@@ -3498,3 +3501,41 @@ single_head_paged_mqa_logits.fi_trace(
     requests=torch.arange(4, dtype=torch.int32),
     scores=torch.empty(8, 1024),
 )
+
+# Full FP8 scorer plus GVR-v2 with fixed payload bindings.
+with contextlib.suppress(Exception):
+    from flashinfer.trace.templates.attn_scores import (
+        fp8_paged_mqa_topk_trace as _fp8_selective_topk_trace,
+    )
+
+    _selective_in = _fp8_selective_topk_trace.init(
+        total_q=16,
+        batch_size=1,
+        num_heads=8,
+        head_dim=128,
+        page_size=64,
+        max_kv_len=8192,
+        top_k=512,
+        device=device,
+    )
+    _selective_topk = flashinfer.FP8PagedMQATopKWrapper(strategy="full")
+    _selective_topk.plan(**_selective_in["plan"])
+    _selective_topk.run(**_selective_in["run"])
+
+# Selective wrappers reserve capacities at construction; each step plans before layer runs.
+with contextlib.suppress(Exception):
+    from flashinfer.trace.templates.attn_scores import (
+        fp8_paged_mqa_selective_topk_trace,
+        fp8_paged_mqa_compressed_topk_trace,
+    )
+
+    for _template in (
+        fp8_paged_mqa_selective_topk_trace,
+        fp8_paged_mqa_compressed_topk_trace,
+    ):
+        _capacity_in = _template.init(device=device)
+        _capacity_topk = flashinfer.FP8PagedMQATopKWrapper(
+            **_capacity_in["constructor"]
+        )
+        _capacity_topk.plan(**_capacity_in["plan"])
+        _capacity_topk.run(**_capacity_in["run"])

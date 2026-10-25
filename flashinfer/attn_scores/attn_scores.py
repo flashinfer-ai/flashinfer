@@ -86,6 +86,8 @@ from typing import Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from .fp8_kernel_config import FP8MQAKernelConfig
+
 from ..api_logging import flashinfer_api
 from ..cute_dsl.availability import is_cute_dsl_available
 from ..trace.templates.attn_scores import (
@@ -98,31 +100,23 @@ from ..utils import (
     get_device_sm_count,
     supported_compute_capability,
 )
+from ._math_policy import _validate_math_mode
+from ._fp8_mqa_constants import (
+    _COMPUTE_BLOCK_KV,
+    _EPI_UNROLL as _EPI_SUBTILE_UNROLL,
+    _FP8_MMA_INST_K,
+    _MAX_BLOCKS_PER_MMA,
+)
 
 # FP8 kernel epilogue supports fp32/fp16 only (matches TRT-LLM's validated
 # surface); bf16 epi has no kernel branch and would silently miscompute.
 _FP8_DTYPES = (torch.float32, torch.float16)
 # FP4 kernel supports fp32/fp16/bf16 for epilogue and output.
 _FP4_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
-# FP8 UMMA instruction K. The kernel derives mma_inst_tile_k = head_dim // this
-# via integer division, so head_dim must be an exact multiple (see the guard in
-# fp8_paged_mqa_logits).
-_FP8_MMA_INST_K = 32
-# FP8 epilogue FMA unroll granularity.  The kernel's register and SMEM weight
-# paths both consume heads this many at a time (kernel-side _EPI_UNROLL), so
-# num_heads must be a multiple of it.  The UMMA N-mode rule below does not
-# imply it: next_n*num_heads % 8 == 0 admits e.g. next_n=4, num_heads=10.
-# Mirrored at the API boundary because the kernel constructor's own check is
-# phrased in terms of an internal compile-layer parameter (num_epi_subtiles)
-# the caller never sees, and fires only after the output has been allocated
-# and the schedule kernel compiled.
-_EPI_SUBTILE_UNROLL = 4
 # FP4 hardcodes these in FP4MQALogitsKernel.__init__ (asserts on head_dim and
 # num_heads); mirrored at the API boundary for a clearer error.
 _FP4_REQUIRED_HEAD_DIM = 128
 _FP4_REQUIRED_NUM_HEADS = 64
-# Max TMA sub-copies per compute tile (kernel: `num_blocks_per_mma <= 4`).
-_MAX_BLOCKS_PER_MMA = 4
 # UMMA N-mode limits, reported by the DSL as
 # "expects the N-mode to satisfy 8 <= N <= 256 and N % 8 == 0".
 # N here is next_n * num_heads.
@@ -485,6 +479,33 @@ def _validate_output_addressable(
         )
 
 
+def _fp8_output_index_bits(
+    rows: int,
+    padded_max_seq_len: int,
+    out: Optional[torch.Tensor],
+    element_size: int,
+) -> int:
+    """Select only store-offset width; logical coordinates remain Int32.
+
+    The flat output view spans the physical row pitch including aligned
+    trailing stores, not just the visible context columns. Python arithmetic
+    checks the signed byte span before any output allocation or DSL narrowing.
+    """
+    if not (0 <= rows < 2**31 and 0 <= padded_max_seq_len < 2**31):
+        raise ValueError(
+            "fp8_paged_mqa_logits: logical output dimensions must fit Int32"
+        )
+    if element_size not in (2, 4):
+        raise ValueError("fp8_paged_mqa_logits: unsupported output element size")
+    stride0 = out.stride(0) if out is not None else padded_max_seq_len
+    span = rows * max(stride0, padded_max_seq_len)
+    if span > (2**63 - 1) // element_size:
+        raise ValueError(
+            "fp8_paged_mqa_logits: physical output byte span exceeds signed Int64"
+        )
+    return 64 if span >= 2**31 else 32
+
+
 def _validate_out(
     out: torch.Tensor,
     rows: int,
@@ -664,24 +685,40 @@ def _validate_phys_block_kv(block_size: int, fn_name: str) -> None:
         )
 
 
-def _fp8_smem_bytes(block_kv: int, head_dim: int, n: int, epi_bytes: int) -> int:
+def _fp8_smem_bytes(
+    block_kv: int,
+    head_dim: int,
+    n: int,
+    epi_bytes: int,
+    num_q_stages: Optional[int] = None,
+    num_kv_stages: Optional[int] = None,
+) -> int:
     """Predict the FP8 kernel's per-CTA shared-memory usage, in bytes.
 
-    Mirrors ``FP8MQALogitsKernel.__init__`` for the configuration this wrapper
-    always builds (``max_kv_pipeline=False`` -> 3 KV stages, 3 Q stages, both
-    math groups resident).  Verified against the driver: head_dim=256 with
-    block_kv=128, n=64, fp32 epilogue predicts 249856 B and the launch reports
+    For the default configuration, mirrors ``FP8MQALogitsKernel.__init__``
+    with ``max_kv_pipeline=False``: 3 KV stages, 3 Q stages, both math groups
+    resident. Verified against the driver: head_dim=256 with block_kv=128,
+    n=64, fp32 epilogue predicts 249856 B and the launch reports
     "Allocated: 249856 bytes".
+
+    None keeps the ordinary 3/3, two-group, U1 path. The <=3-stage barrier
+    struct fits in 256 B; round each data allocation to its 128 B alignment.
+    Padding/subpartition and automatic pipeline selection are not enabled.
     """
-    num_kv_stages = 3
-    num_q_stages = 3
-    # KV + per-token fp32 scales, ×2 math groups.
-    kv_scale_per_stage = 2 * (block_kv * head_dim + block_kv * 4)
-    # Weights are padded to a 128 B stage stride for TMA alignment.
-    w_stage_stride = ((n * epi_bytes + 127) // 128 * 128) // epi_bytes
-    qw_per_stage = n * head_dim + w_stage_stride * epi_bytes
-    barriers = 256
-    return barriers + kv_scale_per_stage * num_kv_stages + qw_per_stage * num_q_stages
+    for stages in (num_q_stages, num_kv_stages):
+        if stages is not None and (type(stages) is not int or stages not in (2, 3)):
+            raise ValueError("explicit Q/KV stages must be 2 or 3")
+    q_stages = 3 if num_q_stages is None else num_q_stages
+    kv_stages = 3 if num_kv_stages is None else num_kv_stages
+    align = lambda size: (size + 127) // 128 * 128
+    weights = align(n * epi_bytes)
+    return (
+        256
+        + 2 * align(block_kv * head_dim * kv_stages)
+        + 2 * align(block_kv * 4 * kv_stages)
+        + align(n * head_dim * q_stages)
+        + align(weights * q_stages)
+    )
 
 
 @functools.cache
@@ -797,7 +834,6 @@ def _fp4_atom_decomposition(next_n: int, device: torch.device) -> "tuple[int, in
 # Schedule-metadata computation (pure Python, mirrors DeepGEMM scheduler)
 # ──────────────────────────────────────────────────────────────────────────────
 
-_COMPUTE_BLOCK_KV = 128  # kernel's fixed compute tile (immutable)
 _NUM_MATH_WG = 2  # warp groups per CTA; kernel multiplies col-1 by this
 
 _ATOM_OFFSETS_CACHE: dict = {}
@@ -933,8 +969,13 @@ if _CUTE_DSL_AVAILABLE:
 @functools.cache
 def _cached_fp8_source_files() -> Tuple[str, ...]:
     from .kernels import fp8_paged_mqa_logits as _m
+    from . import _math_policy
 
-    return (__file__, _m.__file__)
+    return (
+        __file__,
+        _m.__file__,
+        _math_policy.__file__,
+    )
 
 
 @functools.cache
@@ -957,7 +998,17 @@ def _cached_compile_fp8_kernel(
     num_epi_subtiles: int,
     w_cache_regs: Optional[int],
     arch: str,
+    output_index_bits: int,
+    math_mode: str,
+    compute_block_kv: int = 128,
+    explicit_query_bounds: bool = False,
+    num_q_stages: Optional[int] = None,
+    num_kv_stages: Optional[int] = None,
 ):
+    # The current ONE-CTA FP8 MMA path supports M128, not M256.
+    if type(compute_block_kv) is not int or compute_block_kv != 128:
+        raise ValueError("compute_block_kv must be 128 for the single-CTA scorer")
+    math_mode = _validate_math_mode(math_mode)
     from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
     from .kernels import FP8MQALogitsKernel
 
@@ -1018,7 +1069,7 @@ def _cached_compile_fp8_kernel(
     fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     kernel = FP8MQALogitsKernel(
-        block_kv=_COMPUTE_BLOCK_KV,
+        block_kv=compute_block_kv,
         phys_block_kv=block_size,  # kernel kwarg name is fixed (verbatim TRT-LLM port)
         num_heads=num_heads,
         head_dim=head_dim,
@@ -1032,6 +1083,18 @@ def _cached_compile_fp8_kernel(
         # Construction-time arch gates (is_rubin levers, TMEM columns) must
         # follow the compile target, not the DSL's ambient device-0 probe.
         arch=arch,
+        output_index_bits=output_index_bits,
+        math_mode=math_mode,
+        explicit_query_bounds=explicit_query_bounds,
+        num_q_stages=num_q_stages,
+        num_kv_stages=num_kv_stages,
+    )
+    query_meta_fake = (
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (sym_B, 2 + next_n), stride_order=(1, 0), assumed_align=4
+        )
+        if explicit_query_bounds
+        else None
     )
 
     def _compile_fn():
@@ -1047,14 +1110,25 @@ def _cached_compile_fp8_kernel(
             cutlass.Int32(1),
             cutlass.Int32(1),
             fake_stream,
+            query_meta_fake,
             options=f"--gpu-arch {arch} --enable-tvm-ffi",
         )
 
     tag = (
         f"fp8_bs{block_size}_H{num_heads}_D{head_dim}_nn{next_n}"
-        f"_sms{num_sms}_epi{epi_dtype}_acc{acc_dtype}_out{output_dtype}"
-        f"_sub{num_epi_subtiles}_w{w_cache_regs or 0}_{arch}"
+        + (
+            f"_m{compute_block_kv}_qends{int(explicit_query_bounds)}"
+            if explicit_query_bounds
+            or num_q_stages is not None
+            or num_kv_stages is not None
+            else ""
+        )
+        + f"_sms{num_sms}_epi{epi_dtype}_acc{acc_dtype}_out{output_dtype}"
+        f"_sub{num_epi_subtiles}_w{w_cache_regs or 0}_{arch}_oi{output_index_bits}"
+        f"_{math_mode}"
     )
+    if num_q_stages is not None or num_kv_stages is not None:
+        tag += f"_qs{num_q_stages}_kvs{num_kv_stages}"
     return build_and_load_cute_dsl_kernel(
         "attn_scores_fp8",
         tag,
@@ -1065,8 +1139,8 @@ def _cached_compile_fp8_kernel(
 
 # (num_epi_subtiles, w_cache_regs) for the FP8 kernel's epilogue, by shape.
 # None for w_cache_regs keeps the kernel's default register budget
-# (_MAX_W_CACHE_REGS = 160).  Deliberately an internal table, not a public
-# kwarg or env var: execution-strategy choices are made here from
+# (_MAX_W_CACHE_REGS = 160). This table selects defaults when kernel_config is
+# omitted; explicit FP8MQAKernelConfig values override it. Defaults come from
 # measurements on these kernels (graph-replay methodology of
 # benchmarks/bench_paged_mqa_logits.py, same node per arch), and neither knob
 # changes the head accumulation order, so every entry is bit-identical to the
@@ -1113,6 +1187,77 @@ def _fp8_epilogue_policy(num_heads: int, next_n: int, epi_dtype) -> "tuple":
             return (2, None) if next_n == 6 else _FP8_EPILOGUE_DEFAULT
         return (1, 96)
     return _FP8_EPILOGUE_DEFAULT
+
+
+def _validate_fp8_query_metadata(
+    metadata,
+    seq_lens,
+    groups,
+    query_tile,
+    output_rows,
+    device,
+    config,
+    max_seq_len=None,
+    block_tables=None,
+    page_size=128,
+):
+    if metadata is None:
+        if output_rows is not None or (config is not None and config.query_tile > 1):
+            raise ValueError("explicit grouped metadata required")
+        return groups * query_tile
+    if (
+        config is None
+        or config.query_tile != query_tile
+        or type(output_rows) is not int
+        or not 0 <= output_rows <= groups * query_tile
+    ):
+        raise ValueError("explicit group config/output rows required")
+    if (
+        metadata.dtype != torch.int32
+        or metadata.device != device
+        or tuple(metadata.shape) != (groups, 2 + query_tile)
+        or not metadata.is_contiguous()
+    ):
+        raise ValueError("query metadata must be contiguous device Int32 [groups,2+T]")
+    if not torch.cuda.is_current_stream_capturing():
+        from .query_group_metadata import validate_query_group_rows
+
+        ends = seq_lens.cpu().tolist()
+        validate_query_group_rows(
+            metadata.cpu().tolist(), ends, query_tile, output_rows
+        )
+        if max_seq_len is not None and (
+            max(ends, default=0) > max_seq_len
+            or block_tables.shape[1]
+            < (max(ends, default=0) + page_size - 1) // page_size
+        ):
+            raise ValueError("group bound exceeds score/table extent")
+    return output_rows
+
+
+def _resolve_explicit_fp8_config(
+    config, H, D, page, next_n, output_dtype, epi_dtype, acc_dtype, math_mode
+):
+    """Validate explicit scorer configurations without changing default dispatch."""
+    if config is None:
+        return None
+    if not isinstance(config, FP8MQAKernelConfig):
+        raise TypeError("kernel_config must be FP8MQAKernelConfig or None")
+    config.validate_geometry(heads=H, dimension=D, page=page, next_n=next_n)
+    config.require_dispatchable()
+    if (output_dtype, epi_dtype, acc_dtype, math_mode) != (
+        torch.float32,
+        torch.float32,
+        torch.float32,
+        "relu_strict",
+    ):
+        raise ValueError("explicit kernel configurations require strict all-FP32 math")
+    # Schedule ABI, store padding and compute geometry cannot drift apart.
+    if config.schedule_span != _SPLIT_KV:
+        raise ValueError(
+            "explicit compute tile lacks matching schedule/store ownership"
+        )
+    return config
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1463,8 +1608,12 @@ def _check_fp8_paged_mqa_logits_supported(
     output_dtype: torch.dtype = torch.float32,
     epi_dtype: torch.dtype = torch.float32,
     acc_dtype: torch.dtype = torch.float32,
+    math_mode: str = "relu_strict",
     schedule_meta: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    kernel_config: Optional[FP8MQAKernelConfig] = None,
+    query_metadata: Optional[torch.Tensor] = None,
+    output_rows: Optional[int] = None,
 ) -> bool:
     """Return True when the FP8 kernel supports this problem, else raise ``ValueError``.
 
@@ -1483,6 +1632,7 @@ def _check_fp8_paged_mqa_logits_supported(
     stay enforced even under ``skip_check=True`` because a too-small buffer is a
     silent out-of-bounds write.
     """
+    _validate_math_mode(math_mode)
     if q.dim() != 4:
         raise ValueError(
             f"fp8_paged_mqa_logits: q must be 4-D [batch_size, next_n, num_heads, "
@@ -1512,6 +1662,17 @@ def _check_fp8_paged_mqa_logits_supported(
     B, next_n, H, D = q.shape
     N = next_n * H
     block_size = kv_fused.shape[1]
+    explicit_config = _resolve_explicit_fp8_config(
+        kernel_config,
+        H,
+        D,
+        block_size,
+        next_n,
+        output_dtype,
+        epi_dtype,
+        acc_dtype,
+        math_mode,
+    )
 
     _validate_weights(weights, B, next_n, H, "fp8_paged_mqa_logits")
     if q.dtype != torch.float8_e4m3fn:
@@ -1550,7 +1711,12 @@ def _check_fp8_paged_mqa_logits_supported(
     #     config fails at launch with an opaque driver error. Measured on
     #     sm_100a: head_dim <= 192 fits, 256 does not (249856 B > 232448 B).
     _smem_needed = _fp8_smem_bytes(
-        _COMPUTE_BLOCK_KV, D, N, 2 if epi_dtype == torch.float16 else 4
+        explicit_config.compute_block_kv if explicit_config else _COMPUTE_BLOCK_KV,
+        D,
+        N,
+        2 if epi_dtype == torch.float16 else 4,
+        explicit_config.num_q_stages if explicit_config else None,
+        explicit_config.num_kv_stages if explicit_config else None,
     )
     _smem_limit = _cached_max_smem_per_block(get_device_index(q.device))
     if _smem_needed > _smem_limit:
@@ -1604,8 +1770,12 @@ def fp8_paged_mqa_logits(
     output_dtype: torch.dtype = torch.float32,
     epi_dtype: torch.dtype = torch.float32,
     acc_dtype: torch.dtype = torch.float32,
+    math_mode: str = "relu_strict",
     schedule_meta: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    kernel_config: Optional[FP8MQAKernelConfig] = None,
+    query_metadata: Optional[torch.Tensor] = None,
+    output_rows: Optional[int] = None,
 ) -> torch.Tensor:
     """FP8 paged MQA logits for Blackwell (SM100/SM103) and Rubin (SM107).
 
@@ -1770,6 +1940,35 @@ def fp8_paged_mqa_logits(
                          |logit| > 65504 -- long-sequence accumulations can
                          overflow to inf where float32 would not.
         acc_dtype:       MMA accumulator dtype (float32 or float16)
+        math_mode:       ``"relu_strict"`` (default) or ``"relu_fast"``.
+                         For float32 epilogues, fast uses packed x+abs(x)
+                         before weighting and halves the page scale once.
+                         Doubled accumulators/weighted partial sums can
+                         overflow before compensation; halving tiny scales
+                         can underflow. Strict uses NaN-aware max(x,0) and
+                         the original full scale, without those extra range
+                         losses. Fast maps -inf to NaN rather than zero;
+                         both propagate NaN, without a payload guarantee.
+                         Both local ReLUs map signed zero to +0, but results
+                         are not promised bit-identical. Float16 epilogue
+                         conversion, max/FMA/reduction and scaling remain
+                         unchanged in both modes. Output dtype alone does
+                         not select epilogue precision. Each mode has its
+                         own compiled specialization.
+        query_metadata: request-local Int32 [B,2+next_n] full-score metadata.
+                         Each row is real-output base, valid count, exact physical
+                         ends. seq_lens contains group maxima, never causal decrements.
+                         Immutable during captured replay; changing metadata requires
+                         revalidation and schedule rebuild. Requires explicit config
+                         and output_rows. Padded Q/weights must be allocated safe lanes.
+        output_rows:     real flattened output rows covered exactly by group metadata.
+        kernel_config:   optional immutable FP8MQAKernelConfig specifying tile,
+                         epilogue, query grouping and Q/KV pipeline depths.
+                         None preserves the existing
+                         per-shape epilogue policy. Explicit configs retain the
+                         kernel's geometry guards and require strict FP32 math.
+                         The prospective M256 definition rejects before compile;
+                         it is unsupported by the current single-CTA MMA path.
         schedule_meta:   optional pre-computed [num_sms+1, 2] int32 CTA
                          schedule, contiguous, on q's device.  Omit it (None,
                          recommended) unless profiling shows the per-call
@@ -1842,17 +2041,56 @@ def fp8_paged_mqa_logits(
         head_dim, num_heads and next_n together must fit per-CTA shared
                          memory: on SM100, head_dim <= 192 fits at num_heads=64,
                          next_n=1; 256 does not.
-        output size      batch_size*next_n * padded_seq_len(max_seq_len) must
-                         be < 2**31 elements -- the kernels index the output
-                         with 32-bit offsets.  With out=, batch_size*next_n *
-                         out.stride(0) must also be < 2**31 (a wider buffer
-                         widens the row stride the offsets multiply by).
+        output size      logical rows and padded columns must fit signed Int32.
+                         Store offsets specialize to Int64 when rows times
+                         physical row pitch is >= 2**31 elements, otherwise
+                         retaining Int32. The padded physical byte span must
+                         fit signed Int64, including a wider out= row pitch.
     """
+    math_mode = _validate_math_mode(math_mode)
     _require_cute_dsl(q.device, "fp8_paged_mqa_logits")
 
     B, next_n, H, D = q.shape
+    real_output_rows = _validate_fp8_query_metadata(
+        query_metadata,
+        seq_lens,
+        B,
+        next_n,
+        output_rows,
+        q.device,
+        kernel_config,
+        max_seq_len,
+        block_tables,
+        kv_fused.shape[1],
+    )
     block_size = kv_fused.shape[1]
+    # Also enforce under skip_check=True, before allocations/compilation.
+    explicit_config = _resolve_explicit_fp8_config(
+        kernel_config,
+        H,
+        D,
+        block_size,
+        next_n,
+        output_dtype,
+        epi_dtype,
+        acc_dtype,
+        math_mode,
+    )
     num_blocks = kv_fused.shape[0]
+    if explicit_config is not None:
+        # Explicit configurations require a shared-memory budget check even under skip_check.
+        needed = _fp8_smem_bytes(
+            explicit_config.compute_block_kv,
+            D,
+            H * next_n,
+            2 if epi_dtype == torch.float16 else 4,
+            explicit_config.num_q_stages,
+            explicit_config.num_kv_stages,
+        )
+        if needed > _cached_max_smem_per_block(get_device_index(q.device)):
+            raise ValueError(
+                f"explicit FP8 estimated shared allocation {needed} exceeds device cap"
+            )
     num_sms = _cached_num_sms(get_device_index(q.device))
 
     cutlass_epi = _to_cutlass(epi_dtype)
@@ -1874,23 +2112,28 @@ def fp8_paged_mqa_logits(
         num_blocks,
         "fp8_paged_mqa_logits",
     )
-    padded_max_seq_len = ((max_seq_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
-    _validate_output_addressable(
-        B * next_n, padded_max_seq_len, out, "fp8_paged_mqa_logits"
+    padded_max_seq_len = (
+        explicit_config.padded_columns(max_seq_len)
+        if explicit_config
+        else ((max_seq_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
     )
     if out is not None:
         _validate_out(
             out,
-            B * next_n,
+            real_output_rows,
             padded_max_seq_len,
             q.device,
             output_dtype,
             "fp8_paged_mqa_logits",
         )
-        logits = out[: B * next_n, :max_seq_len]
+    output_index_bits = _fp8_output_index_bits(
+        real_output_rows, padded_max_seq_len, out, cutlass_out.width // 8
+    )
+    if out is not None:
+        logits = out[:real_output_rows, :max_seq_len]
     else:
         logits_full = torch.empty(
-            (B * next_n, padded_max_seq_len), device=q.device, dtype=output_dtype
+            (real_output_rows, padded_max_seq_len), device=q.device, dtype=output_dtype
         )
         logits = logits_full[:, :max_seq_len]
 
@@ -1927,6 +2170,11 @@ def fp8_paged_mqa_logits(
     )
     dev_index = get_device_index(q.device)
     num_epi_subtiles, w_cache_regs = _fp8_epilogue_policy(H, next_n, cutlass_epi)
+    if explicit_config is not None:
+        num_epi_subtiles, w_cache_regs = (
+            explicit_config.num_epi_subtiles,
+            explicit_config.w_cache_regs,
+        )
     with _on_device(dev_index):
         compiled = _cached_compile_fp8_kernel(
             block_size,
@@ -1940,6 +2188,12 @@ def fp8_paged_mqa_logits(
             num_epi_subtiles,
             w_cache_regs,
             _arch_for_launch(dev_index, "fp8_paged_mqa_logits"),
+            output_index_bits,
+            math_mode,
+            explicit_config.compute_block_kv if explicit_config else _COMPUTE_BLOCK_KV,
+            query_metadata is not None,
+            explicit_config.num_q_stages if explicit_config else None,
+            explicit_config.num_kv_stages if explicit_config else None,
         )
         compiled(
             kv_flat,
@@ -1951,6 +2205,7 @@ def fp8_paged_mqa_logits(
             schedule_meta,
             num_blocks,
             B,
+            query_metadata,
         )
     return logits
 
@@ -2586,6 +2841,8 @@ def precompile_paged_mqa_logits(
     variants: Tuple[str, ...] = ("fp8", "fp4"),
     output_dtypes: Optional[Tuple[torch.dtype, ...]] = None,
     batch_sizes: Optional[Sequence[int]] = None,
+    *,
+    math_mode: str = "relu_strict",
 ) -> None:
     """Pre-compile paged MQA logits kernels for common static configs.
 
@@ -2630,7 +2887,10 @@ def precompile_paged_mqa_logits(
                        buckets -- a deployment that captures CUDA graphs for a
                        known set of batch sizes should pass them, or the first
                        capture of each bucket pays compilation.
+        math_mode:     FP8 epilogue policy to precompile: ``"relu_strict"``
+                       (default) or ``"relu_fast"``. FP4 is unchanged.
     """
+    math_mode = _validate_math_mode(math_mode)
     if not _CUTE_DSL_AVAILABLE:
         warnings.warn(
             "precompile_paged_mqa_logits: nvidia-cutlass-dsl is not installed; "
@@ -2700,6 +2960,12 @@ def precompile_paged_mqa_logits(
                             num_epi_subtiles,
                             w_cache_regs,
                             arch,
+                            32,  # Common warm set; wide output compiles on demand.
+                            math_mode,
+                            _COMPUTE_BLOCK_KV,
+                            False,
+                            None,
+                            None,
                         )
 
         if "fp4" in variants:

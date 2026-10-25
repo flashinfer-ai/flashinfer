@@ -68,6 +68,361 @@ Paged MQA Logits
 
 .. autofunction:: fp4_paged_mqa_logits
 
+Explicit FP8 scorer configuration
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``fp8_paged_mqa_logits(..., kernel_config=None)`` keeps the default scorer
+policy. For explicit tuning, import the immutable ``FP8MQAKernelConfig`` from
+``flashinfer.attn_scores``. Explicit configurations require
+``math_mode="relu_strict"`` and FP32 accumulation, epilogue and output.
+Configuration legality is separate from performance selection: a legal setting
+is not necessarily faster for a particular workload.
+
+.. list-table:: Configuration fields
+   :header-rows: 1
+   :widths: 25 15 60
+
+   * - Field
+     - Default
+     - Meaning
+   * - ``compute_block_kv``
+     - Required
+     - KV extent per math group. The callable currently dispatches only 128;
+       prospective 64 and 256 geometries are rejected before compilation.
+   * - ``num_epi_subtiles``
+     - Required
+     - Number of head subdivisions in the epilogue. It must divide the head
+       count, and heads per subdivision must be divisible by four.
+   * - ``w_cache_regs``
+     - Required
+     - Positive register budget for cached epilogue weights, not the total
+       kernel register count. Remaining weights use shared memory.
+   * - ``query_tile``
+     - 1
+     - Number of query slots per request-local group. Values above one require
+       explicit grouped metadata and must match the input's ``next_n``.
+   * - ``num_q_stages``
+     - ``None``
+     - Query pipeline depth; ``None`` keeps the constructor default of three.
+       Explicit values are two or three.
+   * - ``num_kv_stages``
+     - ``None``
+     - KV pipeline depth; ``None`` keeps the ordinary constructor default of
+       three. Explicit values are two or three.
+
+The page/compute-tile relationship, head dimension, MMA geometry and actual
+shared-memory capacity must also be valid. More stages consume more shared
+memory; they do not imply a throughput improvement. ``smem_bytes`` is a
+conservative allocation estimate, not a compiled resource measurement.
+
+.. _fp8-query-group-recipe:
+
+Request-local grouped metadata
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``FP8QueryGroups.build`` constructs host metadata from cumulative query and
+original-token prefixes. It groups within each request, never across requests.
+For example, two requests with three and one queries can be described as:
+
+.. code-block:: python
+
+   from flashinfer.attn_scores import FP8MQAKernelConfig, FP8QueryGroups
+
+   groups = FP8QueryGroups.build(
+       q_prefix=(0, 3, 4), token_prefix=(0, 16, 24), ratio=4, query_tile=2
+   )
+   # rows: (output base, valid query count, physical end for each slot)
+   assert groups.rows == ((0, 2, 3, 3), (2, 1, 4, 0), (3, 1, 2, 0))
+
+For a scorer call, gather query and weight rows using ``gather_rows`` and zero
+``invalid_queries``. Reshape queries to ``[groups, 2, heads, dimension]``;
+weights remain flattened as ``[groups * 2, heads]``.
+Select each group's page-table row using ``request_ids``. Transfer ``rows`` as
+contiguous device Int32 ``query_metadata`` and ``group_ends`` as device Int32
+``seq_lens``; pass ``output_rows=4`` and a matching explicit configuration.
+The helper does not allocate device tensors or compress KV. The caller supplies
+already-compressed KV and valid padded query/weight storage.
+
+Each valid slot uses its explicit exclusive physical end, not the ordinary
+``seq_len - next_n + slot + 1`` formula. Consume only that valid score prefix;
+dummy slots are not output rows. Validate and build the schedule before capture,
+keep grouped metadata immutable during replay, and revalidate/rebuild when it
+changes. Grouped metadata export through ``fi_trace`` is unsupported and raises;
+ordinary calls without grouped metadata retain trace support.
+
+FP8 MQA TopK
+------------
+
+The selective strategy supports SM100 and SM103 GPUs and requires CuTe DSL
+and CUDA 12.4 or newer. Construction rejects other compute capabilities before
+allocating its workspace.
+
+The TopK wrapper has an explicit, lifetime-fixed ``strategy`` with distinct
+planning contracts. Selective reserves capacities at construction, updates
+shared metadata with ``plan`` once per step and calls ``run`` for each layer. Full
+plans address-bound payloads outside capture and runs those planned payloads.
+``"full"`` composes paged logits with public
+GVR-v2 TopK512, TopK1024 or TopK2048; ``"selective"`` uses bounded candidate publication and
+exact repair with fixed internal selectors. There is no automatic backend
+selection or fallback. Full owns GVR-v2 scratch; separate wrappers own
+separate buffers across graph capture/replay.
+Both the wrapper constructor and :func:`fp8_paged_mqa_logits` accept
+``math_mode="relu_strict"`` (default) or ``"relu_fast"``. The wrapper's
+read-only policy applies to every scoring phase and cannot change across
+plan/replan or graph replay. Fast FP32 epilogues use packed ``x + abs(x)``
+and one half-scale compensation; intermediate overflow, tiny-scale underflow
+and exceptional-value behavior can differ from the default strict NaN-aware
+ReLU with the full scale. Fast is an explicit opt-in to those tradeoffs. FP16
+epilogue arithmetic is unchanged in either mode; FP16 output alone does not
+select FP16 arithmetic. TopK is exact for the selected scoring recipe, not
+a promise of bitwise equality between recipes.
+The FP8 logits trace reference models FP32 epilogue and accumulation with
+FP32 or FP16 final output storage. It rejects other traced epilogue or
+accumulator precisions; the public scorer still supports its documented
+FP16 arithmetic independently of that trace-reference restriction.
+The selective sampling, candidate, repair, radix, and
+finalization phases remain private implementation details that are independently
+testable and profileable. Packed ragged batches are supported, with TopK512/1024/2048
+for full and every integer TopK from 1 through 2048 for selective. Rows
+shorter than K retain all causal keys and pad the fixed-width suffix with
+``-1``, as ``top_k_varlen`` does. Query and KV sequence lengths
+remain runtime metadata rather than CuTe compile-cache keys.
+
+The immutable ``compression_ratio`` constructor option defaults to 1 and
+accepts 4 for the selective strategy (not full). Ratio 4 consumes KV and
+scales that the caller has already compressed; it neither compresses inputs
+nor reduces the number of query rows. ``kv_indptr`` still counts original tokens.
+For each request with original length L and Q queries, physical length is
+``L // 4`` and query row i sees compressed slots
+``[0, (L - Q + i + 1) // 4)``. Each request is floored independently before
+forming physical prefixes. Page maps and returned indices address compressed
+slots; incomplete trailing blocks are excluded. Only the first
+``min(top_k, eligible_slots)`` entries are valid, and the remaining suffix is
+``-1``. Empty rows are entirely ``-1``.
+
+Selective specializes heads, dimension, page size, TopK and math at construction,
+which also reserves the step workspace for fixed capacities and one KV pool layout.
+Pass the layout as a ``kv_layout`` exemplar, whose shape, strides, dtype and device
+are read without retaining the tensor, or as ``num_pages`` and ``device`` for a
+contiguous pool with standard strides. Per-step ``plan()`` binds the device
+prefixes and page map once; serialized layer calls share one scoring workspace
+without host prefix-value reads::
+
+    wrapper = FP8PagedMQATopKWrapper(
+        strategy="selective", num_heads=8, head_dim=128, page_size=128,
+        top_k=512, compression_ratio=4,
+        max_context_length=1048576, max_chunk_size=148, max_batch_size=148,
+        kv_layout=kv_layer_0,  # or num_pages=..., device=...
+    )
+    wrapper.prepare_pool(kv_layer_0)  # once, outside capture: optional warmup
+    wrapper.plan(qo_indptr, kv_indptr, block_table, num_query_rows=148)
+    wrapper.run(q0, weights0, kv_layer_0, out=indices0)
+    wrapper.run(q1, weights1, kv_layer_1, out=indices1)
+
+For serving integration, allocate the indexer KV cache first, then construct
+the selective wrapper and prepare it once, with ``prepare_pool`` on any layer
+pool or one eager ``run``, before graph capture. Recreate the wrapper when the
+engine reallocates its cache. For same-layout layer-pool swaps within an
+allocation, discard the old caller graphs, call ``clear_pools()`` and recapture.
+Equal layout includes shape, strides, dtype and device.
+A caller graph captured over ``plan``/``run`` addresses the wrapper's workspace
+and the pools it captured. Keep the wrapper and those pools alive for as long as
+the graph may replay; replaying it after the wrapper is released reads and
+writes memory the allocator may have handed to another owner.
+
+Construction requires CUDA and allocates staging, metadata, output and status
+buffers without compiling kernels. The first ``prepare_pool`` (also called by
+an eager ``run``) compiles metadata kernels and allocates/compiles the shared
+scoring workspace. A ``plan`` before that first preparation stages inputs only;
+pool preparation validates them before scoring. Prepare a pool before reading
+the initial step's status or capturing ``plan``. Subsequent ``plan`` calls
+refresh and validate metadata immediately. The ``num_pages``/``device`` form
+uses standard contiguous strides, including singleton axes; use ``kv_layout``
+to describe a different contiguous singleton-axis layout.
+
+``max_chunk_size`` bounds the total supplied query rows, not rows per request.
+``max_context_length`` counts original tokens per request; the page table has
+``max_batch_size`` rows and enough columns for each request's physical capacity.
+Every layer pool must have the constructed layout's shape, strides, dtype and
+device, including the same physical page count. Each run validates that layout.
+Kernels compile once per layout, at the first ``prepare_pool`` or eager ``run``.
+After that, caller capture binds any unseen equal-layout pool by building its
+launch arguments, with no compilation, host value read or allocation, so later
+layers need no per-pool preparation. Eager ``run`` lazily builds an owned graph
+per pool, keyed on address plus layout, and keeps those pools alive until
+``clear_pools()`` or wrapper destruction; ``prepare_pool`` builds that eager
+graph ahead of time and is otherwise optional. Pools seen only under capture
+add no owned graph. For same-layout layer-pool swaps, discard caller graphs
+using the old pools and call ``clear_pools()`` outside capture. This
+synchronizes outstanding device work and releases all cached pool graphs,
+launch owners and pool tensors while preserving the compiled kernels, tensor
+workspace and step status; then recapture.
+The graph configuration is selected from capacities, not active lengths.
+Sampling stays enabled when physical context capacity exceeds 6144, including
+for shorter steps. Device prefixes may change in place, but each step must
+call ``plan()`` or replay a graph that includes it before running its layers.
+Changing prefixes alone is insufficient when replaying a run-only graph.
+Inactive output rows and short-row suffixes are ``-1``.
+
+Use a wrapper per batch bucket rather than one global maximum. Metadata refresh
+work depends on planned row/request capacities and page-table width as well as
+the active step. Oversized buckets can therefore increase work even when only
+a few rows are active. Eager run also includes staging and host enqueue work;
+its CUDA-event envelope may include host-launch gaps and is not a sum of kernel
+durations. Caller graph replay and direct staging-buffer use have different
+costs and should be measured separately for the intended deployment.
+
+``input_buffers()`` exposes owned Q, weight, prefix and page-table staging tensors.
+Pass matching views to run/plan to avoid their copies. Optional ``out`` is a non-overlapping
+contiguous int32 tensor with the supplied query extent and TopK width.
+``error``, ``repair_error`` and ``active_shape`` are device buffers; inspect them
+after a dependency or synchronization. Invalid step metadata suppresses scoring
+and produces ``-1`` rows rather than a synchronous host exception. The validation
+status persists across layers; ``repair_error`` is an OR-accumulated flag,
+with zero indicating no error, rather than a count of failed rows. It persists across layer
+calls. Both statuses reset only at the next ``plan``. Its
+``num_query_rows`` defaults to ``max_chunk_size``; each layer must supply that
+many Q rows, while the final device prefix may be smaller.
+
+Sampling is selected from the physical capacity:
+``max_context_length // compression_ratio > 6144``. Smaller buckets publish
+all eligible keys without SAMPLE or the threshold ladder. Larger buckets keep
+sampling enabled on shorter steps; changing lengths does not change the
+captured route. Capacity validation bounds every admitted physical row.
+
+The device validation ``error`` word uses these bits:
+
+.. list-table:: Selective step validation
+   :header-rows: 1
+
+   * - Bit
+     - Meaning
+   * - 1
+     - Staged query-row or batch extent exceeds the planned bounds, or is negative.
+   * - 2
+     - Prefixes do not start at zero, are negative/decreasing, or a request has
+       fewer original KV tokens than query rows.
+   * - 4
+     - A query prefix exceeds the supplied row extent, a request exceeds its
+       original-context capacity, or its physical pages exceed the table width.
+   * - 8
+     - A live page-map index is outside ``[0, pool_page_count)``.
+
+Bit 1 suppresses all further checks. Bits 2 and 4 may combine; page IDs are
+checked only after those checks pass. Any device error publishes zero active
+rows and sanitized prefixes, and selection fails closed to ``-1``. Tensor
+layout/type/shape and alias errors instead raise on the host before staging
+copies. ``repair_error`` is a separate OR-accumulated flag, not this bit field
+or a count of failed rows.
+
+``FLASHINFER_VALIDATE_INPUTS=1`` enables additional synchronized value checks
+in the prepared selective launch entrypoints outside capture. It is a developer
+debugging option, not a replacement for the capacity API's always-active
+device-side step validation.
+
+Both strategies use ``run(q, weights, kv_fused, ...)``. Full additionally
+requires ``block_table=...``; its host-reading planning signature remains
+``plan(q, kv_fused, weights, cu_q, cu_kv, block_table, ...)``. Use named payload
+arguments when switching between the full plan and run calls.
+
+Capacities and the pool layout are fixed for the wrapper's lifetime; construct
+another wrapper to change them, and capture new caller graphs for it. Pool
+changes do not allocate another tensor workspace. Results and staging views
+stay valid for the wrapper's lifetime, but later runs overwrite their contents. Supply a separate ``out`` per layer, or
+consume a plan-owned result before the next layer. Use one wrapper per concurrent
+stream; calls sharing a workspace must not overlap. Eager calls replay each
+pool's owned graph. Caller capture emits plan/run operations directly,
+including any staging copies; captured source addresses and supplied extents
+are fixed until recapture. For complete single-layer benchmarks include
+plan in the captured workload. Multi-layer timing should include it once
+per step, not once per layer.
+
+Full retains its payload/prefix plan and address-bound run API, supports ratio1
+and TopK512/1024/2048, and reads plan prefixes on the host. Selective traces use
+separate ordinary/compressed schemas with constructor, plan and run
+input initializers, plus strict reference/check functions.
+
+Unlike planners that read device prefixes on the host, selective ``plan()``
+has no host value reads or synchronization and may run inside a caller's CUDA
+graph. Construct the selective wrapper outside capture before the first step.
+
+The native sample-ladder and conditional-repair helpers can load from an
+installed architecture-specific JIT-cache provider. These helper artifacts
+do not contain every CuTe-DSL specialization used by the wrapper. In
+particular, ``FLASHINFER_DISABLE_JIT=1`` also rejects a missing cached
+CuTe-DSL radix module. Installing the two native helpers alone therefore
+does not enable a cold-cache, compilation-free wrapper deployment; matching
+CuTe artifacts must already be available through their cache mechanism.
+
+.. autosummary::
+
+  FP8PagedMQATopKWrapper
+
+.. autoclass:: FP8PagedMQATopKWrapper
+  :members:
+
+Reproduce full/GVR-v2 versus selective comparisons
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+From the repository root, the in-tree benchmark composes the public FP8 scorer
+and ``top_k_varlen(backend="gvr_2")`` for its full arm. This supports TopK512
+TopK1024 and TopK2048 with ratio1 or ratio4 without expanding the full wrapper's
+ratio1 API. For example::
+
+    # H8 ratio-4 prefill, then request-local decode.
+    python benchmarks/bench_fp8_mqa_selective_logits.py --q 8192 \
+        --kv 8192 --num-heads 8 --top-k 512 --compression-ratio 4
+    python benchmarks/bench_fp8_mqa_selective_logits.py --batch-size 148 --q 1 \
+        --kv 8192 --num-heads 8 --top-k 512 --compression-ratio 4
+
+    # H64 ratio-1 prefill, then request-local decode.
+    python benchmarks/bench_fp8_mqa_selective_logits.py --q 8192 \
+        --kv 8192 --num-heads 64 --top-k 2048
+    python benchmarks/bench_fp8_mqa_selective_logits.py --batch-size 148 --q 1 \
+        --kv 8192 --num-heads 64 --top-k 2048
+
+``--kv`` accepts multiple original-token context lengths. Ratio4 generates
+already-compressed independent KV per request; it does not run a compressor.
+The full arm groups queries only within each uniform request, refreshes all
+group page tables with one batched gather per step, and passes a natural-width
+score view to GVR-v2 while preserving padded allocation/row pitch. Prefill
+defaults to H8/T16 or H64/T4 when Q is divisible by that tile; otherwise T1.
+``--full-query-tile``, ``--full-epi-subtiles`` and ``--full-w-cache-regs`` expose
+explicit scorer configuration. Unsupported geometry fails rather than falling
+back. A single output row requires physical width divisible by four for the
+public GVR-v2 route.
+
+The benchmark records separate matched per-step and per-layer graph pairs.
+The full layer contains the public scorer and GVR-v2; the selective layer contains
+``run()``, including counter resets, publication, selection, repair and output.
+The full step derives row/group bounds and request IDs from device prefixes,
+gathers the live page table and invokes the capturable public schedule builder.
+The selective step invokes ``plan()``, including the caller page-table copy and
+metadata/schedule refresh. Q, weight and prefix staging copies are outside both
+pairs. Query topology is uniform and fixed within a cell; capacities fit the
+declared row, batch and context dimensions exactly.
+Every row is checked against
+chunked independent FP32 score math with TF32 disabled before and after timing,
+including distinct indices, request-local bounds and ratio-specific suffixes.
+Reference generation, wrapper construction, pool preparation and JIT are outside
+timing; per-step planning is timed. JSON includes all
+raw samples, inclusive interpolated p10/p90, configuration, source hashes and
+Torch/CUDA versions. Score-arena bytes describe that tensor alone, excluding
+other workspace and inputs; they are not allocator or device peaks.
+
+See the benchmark's module documentation and ``--help`` for its measurement
+protocol and reporting options. Derived multi-layer estimates are not directly
+measured multi-layer latency.
+
+Successful clean-source benchmarks print the validated Markdown report in the
+same invocation, while ``--output`` retains raw JSON. Dirty-source runs keep
+their raw data but omit the report. Regenerate the report from existing
+block-protocol result files with
+``python benchmarks/bench_fp8_mqa_selective_logits.py --summarize results/*.json``.
+This reporting mode requires neither Torch nor CUDA. It checks raw sample
+statistics and pauses, rejects mixed sources/environments/GPUs or duplicate
+cells, and labels partial successful prefixes explicitly.
+
 Scheduling and Setup
 --------------------
 
