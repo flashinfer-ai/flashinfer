@@ -941,7 +941,6 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
             unsigned int a_seq = worker;
             unsigned int coeff_seq_1 = 0;
             unsigned int first_row = warp % 4 * 16 + lane_in_warp / 4;
-            unsigned int stats_phase = 1;
             unsigned int offs[8];
             unsigned int atom = worker;
             unsigned int pair = (unsigned int)(atom * 8) + lane_in_warp % 4 * 2;
@@ -965,6 +964,7 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
             offs[6] = row_9 * 32 + (pair_8 / 4 ^ row_9 & 7) * 4 + pair_8 % 4;
             unsigned int row_10 = first_row + 8;
             offs[7] = row_10 * 32 + (pair_8 / 4 ^ row_10 & 7) * 4 + pair_8 % 4;
+            unsigned int _phase_empty_stats_0 = 1;
             #pragma unroll 1
             for (unsigned int task_3 = (unsigned int)bid; task_3 < (num_tokens + 63) / 64 * num_splits; task_3 += num_ctas) {
                 uint32_t _fast_div_q_6 = (split_div.divisor != 1) ? (__umulhi((uint32_t)(task_3), split_div.multiplier) >> split_div.shift_right) : (uint32_t)(task_3);
@@ -1892,8 +1892,8 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
                     }
                     io_seq_1 += 1;
                 }
-                mbarrier_wait(empty_stats_addr, stats_phase);
-                stats_phase ^= 1;
+                mbarrier_wait(empty_stats_addr, _phase_empty_stats_0);
+                _phase_empty_stats_0 ^= 1;
                 unsigned int row_1_1 = first_row;
                 float _sub_8;
                 asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_8) : "f"(hc_acc[0]), "f"(hc_comp[0]));
