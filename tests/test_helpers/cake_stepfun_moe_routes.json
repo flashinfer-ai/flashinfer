@@ -239,6 +239,26 @@
       "fp8_t8_l7"
     ]
   },
+  "fc1_mxfp8_n128": {
+    "kind": "fc1",
+    "family": "mxfp8",
+    "tile_n": 128,
+    "variant": null,
+    "tokens": 1024,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_b398b040e1b8ef869e3c"
+      }
+    ],
+    "shapes": [
+      "mxfp8_t1024_l7"
+    ]
+  },
   "fc1_mxfp8_n16": {
     "kind": "fc1",
     "family": "mxfp8",
@@ -767,6 +787,26 @@
     ],
     "shapes": [
       "fc2_fp8_n8"
+    ]
+  },
+  "fc2_mxfp8_n128": {
+    "kind": "fc2",
+    "family": "mxfp8",
+    "tile_n": 128,
+    "variant": null,
+    "tokens": 1024,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_ae6ca81a0800a8c71538"
+      }
+    ],
+    "shapes": [
+      "fc2_mxfp8_n128"
     ]
   },
   "fc2_mxfp8_n16": {
@@ -1555,6 +1595,42 @@
     ],
     "shapes": [
       "full_fp8_t8_l7"
+    ]
+  },
+  "full_mxfp8_n128": {
+    "kind": "full",
+    "family": "mxfp8",
+    "tile_n": 128,
+    "variant": null,
+    "tokens": 1024,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing_pre",
+        "program": "cake_stepfun_moe_5144f41bbd707c277a10"
+      },
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_85e03fcd251dde9ebf18"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_b398b040e1b8ef869e3c"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_ae6ca81a0800a8c71538"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_73af683d678f64679a42"
+      }
+    ],
+    "shapes": [
+      "full_mxfp8_t1024_l7"
     ]
   },
   "full_mxfp8_n16": {

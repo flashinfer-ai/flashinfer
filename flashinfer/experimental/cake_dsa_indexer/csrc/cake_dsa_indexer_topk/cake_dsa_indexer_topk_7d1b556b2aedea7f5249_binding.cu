@@ -38,7 +38,7 @@
 #define CAKE_PROGRAM_SHIM cake_host_shim_fb5d9f98ceb869c6
 #endif
 
-extern "C" __global__ void CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap W, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, long long* __restrict__ q_offsets, int* __restrict__ Indices, float* __restrict__ Scores, long long* __restrict__ Cand, int num_segments, int top_k, int ratio, int has_offsets, int cand_cap, int first_cap, int sample_tiles_max, int sample_shift_permille, int check_period, int grid_ctas, float softmax_scale, int n_split);
+extern "C" __global__ void CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap W, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, long long* __restrict__ q_offsets, int* __restrict__ Indices, float* __restrict__ Scores, long long* __restrict__ Cand, int num_segments, int top_k, int ratio, int has_offsets, int cand_cap, int first_cap, int sample_tiles_max, int sample_shift_permille, int far_sample, int check_period, int grid_ctas, float softmax_scale, int n_split);
 
 
 namespace CAKE_PROGRAM_SHIM {
@@ -57,7 +57,7 @@ using tvm::ffi::TensorView;
 #define CAKE_HOST_COMMON_PART 7  // EncodeTma_W, box {32u, 6u}
 #include "cake_dsa_indexer_topk_host_common.cuh"
 
-void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_W, TensorView arg_cu_seqlens_q, TensorView arg_cu_seqlens_k, TensorView arg_q_offsets, TensorView arg_Indices, TensorView arg_Scores, TensorView arg_Cand, int64_t arg_num_segments, int64_t arg_top_k, int64_t arg_ratio, int64_t arg_has_offsets, int64_t arg_cand_cap, int64_t arg_first_cap, int64_t arg_sample_tiles_max, int64_t arg_sample_shift_permille, int64_t arg_check_period, int64_t arg_grid_ctas, double arg_softmax_scale, int64_t arg_n_split, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_W, TensorView arg_cu_seqlens_q, TensorView arg_cu_seqlens_k, TensorView arg_q_offsets, TensorView arg_Indices, TensorView arg_Scores, TensorView arg_Cand, int64_t arg_num_segments, int64_t arg_top_k, int64_t arg_ratio, int64_t arg_has_offsets, int64_t arg_cand_cap, int64_t arg_first_cap, int64_t arg_sample_tiles_max, int64_t arg_sample_shift_permille, int64_t arg_far_sample, int64_t arg_check_period, int64_t arg_grid_ctas, double arg_softmax_scale, int64_t arg_n_split, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = arg_Q.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   {
@@ -116,6 +116,9 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_W, TensorView arg_cu
   TVM_FFI_CHECK(arg_sample_shift_permille >= -2147483648LL && arg_sample_shift_permille <= 2147483647LL, ValueError)
       << "scalar 'sample_shift_permille' value " << arg_sample_shift_permille
       << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_far_sample >= -2147483648LL && arg_far_sample <= 2147483647LL, ValueError)
+      << "scalar 'far_sample' value " << arg_far_sample
+      << " is outside i32 range [-2147483648, 2147483647]";
   TVM_FFI_CHECK(arg_check_period >= -2147483648LL && arg_check_period <= 2147483647LL, ValueError)
       << "scalar 'check_period' value " << arg_check_period
       << " is outside i32 range [-2147483648, 2147483647]";
@@ -158,11 +161,12 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_W, TensorView arg_cu
   int32_t v_first_cap = (int32_t)arg_first_cap;
   int32_t v_sample_tiles_max = (int32_t)arg_sample_tiles_max;
   int32_t v_sample_shift_permille = (int32_t)arg_sample_shift_permille;
+  int32_t v_far_sample = (int32_t)arg_far_sample;
   int32_t v_check_period = (int32_t)arg_check_period;
   int32_t v_grid_ctas = (int32_t)arg_grid_ctas;
   float v_softmax_scale = (float)arg_softmax_scale;
   int32_t v_n_split = (int32_t)arg_n_split;
-  void* kargs[] = {&p_Q, &p_K, &p_W, &p_cu_seqlens_q, &p_cu_seqlens_k, &p_q_offsets, &p_Indices, &p_Scores, &p_Cand, &v_num_segments, &v_top_k, &v_ratio, &v_has_offsets, &v_cand_cap, &v_first_cap, &v_sample_tiles_max, &v_sample_shift_permille, &v_check_period, &v_grid_ctas, &v_softmax_scale, &v_n_split};
+  void* kargs[] = {&p_Q, &p_K, &p_W, &p_cu_seqlens_q, &p_cu_seqlens_k, &p_q_offsets, &p_Indices, &p_Scores, &p_Cand, &v_num_segments, &v_top_k, &v_ratio, &v_has_offsets, &v_cand_cap, &v_first_cap, &v_sample_tiles_max, &v_sample_shift_permille, &v_far_sample, &v_check_period, &v_grid_ctas, &v_softmax_scale, &v_n_split};
 
   static const bool smem_ready = CakeSetMaxDynamicSmem(
       reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL), 207104);

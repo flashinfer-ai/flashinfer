@@ -51,7 +51,10 @@ the Q stage, no metadata buffer; not a ``:short`` shape,
 blocks) or -- where the catalog carries ``policy.dense_kvsplit`` -- the
 production text under its in-kernel KV-split plan (the ``:kvsplit`` routes:
 ``K > dense_kvsplit.min_kv`` and fewer query blocks than the architecture's
-catalogued SM count ``dense_kvsplit.sm_count[arch]``; the plan text of the
+catalogued SM count ``dense_kvsplit.sm_count[arch]``, or -- where
+``dense_kvsplit.fullgrid[arch]`` -- ``K > dense_kvsplit.fullgrid_min_kv`` and
+``sm_count[arch] <= ceil(Q / 2) <= dense_kvsplit.max_q_blocks``, the ``qle2048``
+plan's whole-grid band; the plan text of the
 query count -- ``q1`` / ``qle128`` / ``qle2048`` -- recomputes the tiered
 schedule in every CTA and writes it into the plan's own ``metadata`` buffer,
 launch grid = the SM count).  The KV-split gate is the only SM-count dependent
@@ -67,7 +70,7 @@ import json
 from pathlib import Path
 
 _ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
-CATALOG_SCHEMA = "dense_mqa.v12"
+CATALOG_SCHEMA = "dense_mqa.v13"
 NUM_HEADS = 32  # default head count of the public helpers
 BLOCK_QH = 128  # query rows x heads per MMA tile
 BLOCK_Q = BLOCK_QH // NUM_HEADS
@@ -506,9 +509,11 @@ def h64_kvsplit_plan(queries, keys, num_heads=64, *, arch):
     count of ``arch`` (``dense_kvsplit.sm_count[arch]``; no device query -- a device whose SM count differs from its
     architecture's entry is routed as the catalogue says, the program takes the launch grid at runtime): the plan
     text (``q1`` / ``qle128`` / ``qle2048``, the inclusive query bands ``dense_kvsplit.plans``) when
-    ``K > dense_kvsplit.min_kv`` and ``ceil(Q / block_q) < sm_count``, else ``None`` (the grid-stride route).
-    ``None`` as well for 32 heads, when the catalog has no ``dense_kvsplit`` policy, or when the catalogued SM count
-    exceeds ``dense_kvsplit.max_sms`` (the plan's CTA bound)."""
+    ``K > dense_kvsplit.min_kv`` and ``ceil(Q / block_q) < sm_count``, or -- the whole-grid band, where
+    ``dense_kvsplit.fullgrid[arch]`` -- ``K > dense_kvsplit.fullgrid_min_kv`` and
+    ``sm_count <= ceil(Q / block_q) <= dense_kvsplit.max_q_blocks`` (the ``qle2048`` plan: the same program at grid =
+    the SM count); else ``None`` (the grid-stride route).  ``None`` as well for 32 heads, when the catalog has no
+    ``dense_kvsplit`` policy, or when the catalogued SM count exceeds ``dense_kvsplit.max_sms`` (the plan's CTA bound)."""
     gate = _catalog()["policy"].get("dense_kvsplit")
     if gate is None or num_heads == NUM_HEADS:
         return None
@@ -520,8 +525,19 @@ def h64_kvsplit_plan(queries, keys, num_heads=64, *, arch):
         return None
     bq = block_q(num_heads)
     blocks = (queries + bq - 1) // bq
-    if blocks >= sm_count or keys <= int(gate["min_kv"]):
+    if keys <= int(gate["min_kv"]):
         return None
+    if blocks >= sm_count:
+        # the whole-grid band of the qle2048 plan (per architecture; its KV bound is the ``:ts`` routes' bound, so the
+        # ``:ts`` gate keeps 256 < K <= fullgrid_min_kv at these block counts)
+        fullgrid = gate["fullgrid"]
+        enabled = fullgrid[arch] if isinstance(fullgrid, dict) else bool(fullgrid)
+        if not (
+            enabled
+            and blocks <= int(gate["max_q_blocks"])
+            and keys > int(gate["fullgrid_min_kv"])
+        ):
+            return None
     for plan, (low, high) in gate["plans"].items():
         if int(low) <= queries <= int(high):
             return plan

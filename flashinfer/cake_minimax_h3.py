@@ -32,9 +32,16 @@ class MiniMaxH3Mxfp8PreAttention:
     """Prepare and run the fixed MiniMax-H3 MXFP8 pre-attention pipeline.
 
     All outputs, intermediate tensors, and workspaces are supplied by the
-    caller. Preparation resolves the exact SM100a or SM103a route and selects
-    the CUTLASS MXFP8 GEMM tactic. :meth:`run` performs no tensor allocation and
-    can be captured by a CUDA Graph after preparation.
+    caller. Preparation resolves the exact SM100a or SM103a target and binds
+    its two generated programs: the RMSNorm + AdaLN + MXFP8 quantize stage and
+    the fused MXFP8 QKV GEMM whose epilogue applies the Q/K RMSNorm, the RoPE
+    and the destination-major MXFP8 pack. Any token count ``M`` and every
+    ``P`` in ``(1, 2, 4, 8)`` are supported. ``qkv_bf16`` and
+    ``gemm_workspace`` are validated and kept for API stability; the fused
+    GEMM does not use them. The data pointers of the accessed tensors must be
+    16-byte aligned (``adaln_index`` and ``out_sf``: 4-byte aligned);
+    preparation raises ``ValueError`` otherwise. :meth:`run` performs no tensor allocation and can
+    be captured by a CUDA Graph after preparation.
 
     The tensors passed to :meth:`run` must be the same objects supplied here.
     Their contents may be updated between launches, including on independent

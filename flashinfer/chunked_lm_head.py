@@ -14,14 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
 import json
 import os
+from types import ModuleType
 from typing import Any, Dict, Optional, Union
 
 import torch
 
 from .api_logging import flashinfer_experimental_api
-from .experimental.cake_lm_head_loss import cake_backend
 
 # Thin experimental entry points; validation of the backend contract, the
 # chunk plans, the workspace, launch binding, autograd wrappers and JIT
@@ -31,7 +32,9 @@ from .experimental.cake_lm_head_loss import cake_backend
 # environment variable.  The FLASHINFER_CAKE_LM_HEAD_LOSS_* variables below
 # are this wrapper's A/B knobs: a switch keyword left at ``None`` falls back
 # to its variable here, and the resolved value is passed down.  The two
-# binding-cache variables are applied once, when this module is imported.
+# binding-cache variables are read once, when this module is imported, and
+# applied to the backend's cache on first use (the first call of either
+# entry point).
 
 _FEATURE = "chunked LM-head + loss training kernels (SM100/SM103)"
 
@@ -49,10 +52,11 @@ HIDDEN_COUNT_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT"
 # A JSON object of explicit per-GEMM knobs (``gemm_tuning``); unset / empty:
 # none.
 GEMM_TUNING_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING"
-# "0" disables the backend's binding cache (applied at import).
+# "0" disables the backend's binding cache (read at import, applied on first
+# use).
 BINDING_CACHE_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE"
-# Positive integer: the binding cache's capacity (applied at import; unset /
-# blank: the backend's default of 64 bindings).
+# Positive integer: the binding cache's capacity (read at import, applied on
+# first use; unset / blank: the backend's default of 64 bindings).
 BINDING_CACHE_CAPACITY_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE_CAPACITY"
 
 _DW_STREAM_OFF = ("0", "false", "off", "no")
@@ -142,9 +146,12 @@ def _binding_cache_settings() -> Dict[str, Any]:
     return dict(enabled=enabled, capacity=capacity)
 
 
-def _configure_binding_cache() -> None:
-    """Apply the binding-cache variables to ``cake_backend.BINDING_CACHE`` (at import)."""
-    settings = _binding_cache_settings()
+def _configure_binding_cache(
+    cake_backend: ModuleType, settings: Dict[str, Any]
+) -> None:
+    """Apply ``settings`` (``enabled`` / ``capacity`` as returned by
+    :func:`_binding_cache_settings`) to ``cake_backend.BINDING_CACHE`` in place;
+    a ``capacity`` of ``None`` is the backend's default."""
     capacity = settings["capacity"]
     cake_backend.BINDING_CACHE.configure(
         enabled=settings["enabled"],
@@ -152,6 +159,17 @@ def _configure_binding_cache() -> None:
         if capacity is None
         else capacity,
     )
+
+
+@functools.cache
+def _cake_backend() -> ModuleType:
+    # The backend is imported on first use (experimental containment: core
+    # reaches kernels and their dependencies through a deferred import) and
+    # the binding-cache settings read at import are applied to it once.
+    from .experimental.cake_lm_head_loss import cake_backend
+
+    _configure_binding_cache(cake_backend, _BINDING_CACHE_SETTINGS)
+    return cake_backend
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
@@ -310,10 +328,11 @@ def chunked_lm_head_loss(
     options); later calls with the same binding launch from the remembered
     argument plans
     (``flashinfer.experimental.cake_lm_head_loss.cake_backend.BINDING_CACHE``).
-    When this module is imported, ``FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE=0``
-    disables that cache and ``FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE_CAPACITY``
-    (a positive integer; default 64) sets its capacity, through
-    ``BINDING_CACHE.configure``.  Peak temporary memory is reported separately
+    ``FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE=0`` disables that cache and
+    ``FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE_CAPACITY`` (a positive
+    integer; default 64) sets its capacity: both are read when this module is
+    imported and applied through ``BINDING_CACHE.configure`` on the first call
+    of either entry point.  Peak temporary memory is reported separately
     from the weights, the outputs and the FP32 accumulators by
     ``cake_backend.memory_report``.
 
@@ -328,7 +347,7 @@ def chunked_lm_head_loss(
         raise ValueError(
             "the chunked LM-head + loss kernels currently support backend='cake'"
         )
-    return cake_backend.chunked_lm_head_loss(
+    return _cake_backend().chunked_lm_head_loss(
         X,
         W,
         labels,
@@ -389,7 +408,7 @@ def chunked_lm_head_logprob(
         raise ValueError(
             "the chunked LM-head + loss kernels currently support backend='cake'"
         )
-    return cake_backend.chunked_lm_head_logprob(
+    return _cake_backend().chunked_lm_head_logprob(
         X,
         W,
         labels,
@@ -407,4 +426,6 @@ def chunked_lm_head_logprob(
     )
 
 
-_configure_binding_cache()
+# Read once at import: a malformed value fails here, naming the variable, not
+# on the first call.  Applied to the backend's cache by ``_cake_backend``.
+_BINDING_CACHE_SETTINGS: Dict[str, Any] = _binding_cache_settings()

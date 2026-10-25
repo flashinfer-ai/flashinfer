@@ -95,18 +95,25 @@ _COMMON = dict(
     candidate_slack=128,
     cand_mult_rule=[384.0, 8],
     cand_cap_floor=8192,
+    candidate_multiplier_unsampled=4,
+    cand_mult_rule_unsampled=[384.0, 8],
+    cand_cap_floor_unsampled=8192,
+    cand_cap_ceiling=None,
+    cand_cap_ceiling_unsampled=None,
     split_max=32,
     split_min_range_tiles=64,
     snake_default=False,
     tile_unroll_default=1,
     tile_unroll_factor=2,
     sample_fit_max_mean_tiles=512,
+    sample_fit_kinds=["l6", "narrow", "pair_l6", "pair_narrow", "pair_wide", "wide"],
     sample_tiles_max=32,
     sample_tiles_short_units=16,
     sample_dispatch_mean_tiles_max=640,
     sample_tiles_tiny_units=8,
     sample_dispatch_tiny_tiles_max=128,
     sample_shift_permille=250,
+    far_sample=0,
     check_period_max=32,
     check_period_knob_max=64,
     check_period_cap_divisor=512,
@@ -615,6 +622,22 @@ def test_policy_record_round_trip_and_validation():
         dict(rank_persist_max_k=-1),  # round 39: lever FRP-K fields
         dict(rank_persist_max_k=2048.5),
         dict(rank_persist_ctas_per_sm=0),
+        dict(far_sample=2),  # the far-sample first threshold switch: 0 or 1
+        dict(far_sample=-1),
+        dict(far_sample=True),
+        dict(candidate_multiplier_unsampled=0),  # the unsampled capacity values
+        dict(cand_mult_rule_unsampled=384),
+        dict(cand_cap_floor_unsampled=8192.5),
+        # the capacity ceilings: positive, at or above the floor
+        dict(cand_cap_ceiling=0),
+        dict(cand_cap_ceiling=4096),
+        dict(cand_cap_ceiling=32768.5),
+        dict(cand_cap_ceiling_unsampled=4096),
+        # the kinds with a sampled-fit program: an ascending list of physical kinds
+        dict(sample_fit_kinds="l6"),
+        dict(sample_fit_kinds=["split"]),
+        dict(sample_fit_kinds=["wide", "l6"]),
+        dict(sample_fit_kinds=["l6", "l6"]),
     ):
         with pytest.raises(ValueError):
             DispatchPolicy.from_record(dict(record, **bad))
@@ -645,6 +668,50 @@ def test_policy_capacity_period_and_finalize():
     assert p.cand_cap_multiplier_for(8192, 1048576, 1, 1, 2048) == 8
     assert p.cand_cap_multiplier_for(65536, 65536, 1, 1, 256) == 32
     assert p.cand_cap_multiplier_for(65536, 65536, 1, 1, 4096) == 4
+    # the unsampled capacity values stand in when the sampled first threshold is off
+    raised = DispatchPolicy.from_record(
+        dict(p.record(), candidate_multiplier=16, cand_cap_floor=16384)
+    )
+    assert raised.cand_cap_multiplier_for(65536, 65536, 1, 1, 2048) == 16
+    assert raised.cand_cap_multiplier_for(65536, 65536, 1, 1, 2048, sampled=False) == 4
+    assert raised.cand_cap_multiplier_for(65536, 65536, 1, 1, 256, sampled=False) == 32
+    geometry = dict(
+        num_queries=65536, num_keys=65536, num_segments=1, ratio=1, top_k=2048, grid=148
+    )
+    sampled = cake_policy.select_program(raised, **geometry)
+    unsampled = cake_policy.select_program(raised, sample_tiles_max=0, **geometry)
+    assert sampled.cand_cap == 32768 and sampled.sample_tiles_max > 0
+    assert unsampled.cand_cap == 8192 and unsampled.sample_tiles_max == 0
+    assert (
+        unsampled.cand_cap
+        == cake_policy.select_program(p, sample_tiles_max=0, **geometry).cand_cap
+    )
+    assert (unsampled.scan_key, unsampled.n_split) == (
+        sampled.scan_key,
+        sampled.n_split,
+    )
+    # the ceiling lowers the multiplier once multiplier x top_k would exceed it: 16 x top_k up to 32768 slots, long units
+    # and the floor untouched
+    capped = DispatchPolicy.from_record(
+        dict(
+            p.record(),
+            candidate_multiplier=16,
+            cand_cap_floor=16384,
+            cand_cap_ceiling=32768,
+        )
+    )
+    assert capped.cand_cap_multiplier_for(65536, 65536, 1, 1, 2048) == 16
+    assert capped.cand_cap_multiplier_for(65536, 65536, 1, 1, 4096) == 8
+    assert capped.cand_cap_multiplier_for(65536, 65536, 1, 1, 3000) == 10
+    assert capped.cand_cap_multiplier_for(65536, 65536, 1, 1, 256) == 64
+    assert capped.cand_cap_multiplier_for(8192, 1048576, 1, 1, 2048) == 8
+    assert capped.cand_cap_multiplier_for(65536, 65536, 1, 1, 2048, sampled=False) == 4
+    assert [
+        capped.candidate_capacity(
+            k, capped.cand_cap_multiplier_for(65536, 65536, 1, 1, k)
+        )
+        for k in (256, 2048, 3000, 4096)
+    ] == [16384, 32768, 30080, 32768]
     # right-sized finalize programs for small top_k, 256 threads up to 2048, 512 above
     assert [p.finalize_threads_for(k) for k in (1, 256, 257, 512, 513, 1024, 1025, 2048, 2049, 4096)] == [
         32, 32, 64, 64, 128, 128, 256, 256, 512, 512,
@@ -1042,14 +1109,23 @@ def test_select_program_narrow_pair_policy():
         candidate_multiplier=2,
         check_period=1,
         sample_tiles_max=0,
+        far_sample=1,
         finalize_threads=512,
     )
-    assert (c.cand_cap, c.check_period, c.sample_tiles_max, c.finalize_key) == (
+    assert (
+        c.cand_cap,
+        c.check_period,
+        c.sample_tiles_max,
+        c.far_sample,
+        c.finalize_key,
+    ) == (
         4096,
         1,
         0,
+        1,
         "finalize_rank:t512:w16384",
     )
+    assert _select(p, 8192, 8192).far_sample == p.far_sample == 0  # record default
     assert (
         _select(p, 8192, 1048576, finalize_threads=512).finalize_key == "finalize:t512"
     )
@@ -1113,6 +1189,8 @@ def test_select_program_narrow_pair_policy():
         _select(p, 8192, 8192, finalize_threads=32)
     with pytest.raises(ValueError, match="grid_ctas"):
         _select(p, 8192, 8192, grid=0)
+    with pytest.raises(ValueError, match="far_sample"):
+        _select(p, 8192, 8192, far_sample=2)
 
 
 def test_select_program_snake_unroll_policy():
@@ -1212,6 +1290,72 @@ def test_policy_selects_registered_programs_on_a_dense_geometry_grid():
                             bound,
                             key,
                         )
+
+
+def test_sample_fit_kinds_name_exactly_the_registered_sampled_fit_programs():
+    """``sample_fit_kinds`` is the registry's own list: every scan kind with a registered ``:f1`` program and no other, so
+    the dispatch never composes a sampled-fit key the architecture does not ship (round 3: a 32768-slot capacity made
+    split units of 22k-42k keys fit the buffer and selected ``scan:split_l6:u1:s0:f1``, which has no program)."""
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    for arch, keys in cake_jit.PROGRAM_KEYS.items():
+        registered = sorted(
+            {
+                key.split(":")[1]
+                for key in keys
+                if key.startswith("scan:") and key.endswith(":f1")
+            }
+        )
+        assert policy_for(arch).sample_fit_kinds == registered, arch
+    # a split unit that fits a 32768-slot buffer keeps the plain split program; the gate, not the geometry, decides
+    p = policy_for("sm_103a")
+    geometry = dict(
+        num_queries=4, num_keys=22018, num_segments=1, ratio=1, top_k=2048, grid=148
+    )
+    c = select_program(p, candidate_multiplier=16, **geometry)
+    assert (c.scan_key, c.n_split, c.cand_cap) == ("scan:split_l6:u1:s0:f0", 2, 32768)
+    assert c.physical_kind == "split_l6" and not c.sample_fit
+    assert (
+        select_program(p, **geometry).cand_cap == 32768
+    )  # the record's own multiplier reaches the same plan
+    wider = DispatchPolicy.from_record(
+        dict(p.record(), sample_fit_kinds=sorted(p.sample_fit_kinds + ["split_l6"]))
+    )
+    c = select_program(wider, candidate_multiplier=16, **geometry)
+    assert c.scan_key == "scan:split_l6:u1:s0:f1" and c.sample_fit
+    assert p.sample_fit_for(4, 22018, 1, 1, 32768) and not p.sample_fit_for(
+        4, 22018, 1, 1, 32768, "split_l6"
+    )
+
+
+def test_shipped_capacity_rules_by_architecture():
+    """sm_103a: short units (under 384 mean tiles) take 16 x top_k slots up to the 32768-slot ceiling, long units keep
+    8 x top_k above the 16384-slot floor; sm_100a keeps 4 x top_k above the floor; the unsampled values (``sample_tiles_max=0``)
+    are the 8192-slot rule on both."""
+    short = dict(
+        num_queries=65536, num_keys=65536, num_segments=1, ratio=1, grid=148
+    )  # 256 mean tiles
+    long = dict(
+        num_queries=16384, num_keys=270336, num_segments=2, ratio=1, grid=148
+    )  # 1024 mean tiles
+    p103, p100 = policy_for("sm_103a"), policy_for("sm_100a")
+    caps = lambda p, g, **kw: [
+        select_program(p, top_k=k, **g, **kw).cand_cap for k in (256, 2048, 4096)
+    ]  # noqa: E731
+    assert caps(p103, short) == [16384, 32768, 32768]
+    assert caps(p103, long) == [16384, 16384, 32768]
+    assert caps(p100, short) == [16384, 16384, 16384]
+    assert caps(p100, long) == [16384, 16384, 32768]
+    assert (
+        caps(p103, short, sample_tiles_max=0)
+        == caps(p100, short, sample_tiles_max=0)
+        == [8192, 8192, 16384]
+    )
+    assert (
+        caps(p103, long, sample_tiles_max=0)
+        == caps(p100, long, sample_tiles_max=0)
+        == [8192, 16384, 32768]
+    )
 
 
 def test_program_keys_and_slugs():
@@ -1966,12 +2110,36 @@ def test_repeatability_bitwise():
     assert ref.same_bits(a, b) and ref.same_bits(a, c)
 
 
+def test_far_sample_knob_is_validated_on_the_host():
+    """``far_sample`` is ``0`` or ``1`` and defaults to the architecture's record; the check reads no device."""
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    for arch in cake_jit.ARCHES:
+        grid = _FROZEN_GRIDS[arch][0]
+        plan = plan_dsa_indexer_topk(1024, 4096, 1, top_k=256, arch=arch, num_sms=grid)
+        assert plan.far_sample in (0, 1)
+        assert plan.far_sample == policy_for(arch).far_sample
+        for value in (0, 1):
+            assert (
+                plan_dsa_indexer_topk(
+                    1024, 4096, 1, top_k=256, arch=arch, num_sms=grid, far_sample=value
+                ).far_sample
+                == value
+            )
+        for bad in (2, -1, True):
+            with pytest.raises(ValueError, match="far_sample"):
+                plan_dsa_indexer_topk(
+                    1024, 4096, 1, top_k=256, arch=arch, num_sms=grid, far_sample=bad
+                )
+
+
 PARTITION_KNOBS = (
     {"grid_ctas": 37},
     {"candidate_multiplier": 2},
     {"check_period": 1},
     {"sample_tiles_max": 0},
     {"sample_shift_permille": -500},
+    {"far_sample": 1},
     {
         "finalize_threads": 512
     },  # the 512-thread finalize program (the rank form where the policy admits the call)
@@ -1990,6 +2158,91 @@ def test_partition_knobs_do_not_change_results(knobs):
     _judge_ok(base, ref.select_reference(inputs))
     other = _run(inputs, **knobs)
     assert ref.same_bits(base, other), f"partition knob {knobs} changed the result"
+
+
+# -- the attention-sink + local-band distribution (flashinfer-ai/flashinfer#7042) ----------------------------------
+# Small context-parallel geometries whose long units overflow the candidate buffer and run the sampled first
+# threshold (the issue's regime: the nearest key tile of every unit -- the diagonal -- holds a hot band of top-k
+# keys), judged like the random rows against the FP64 / FP32 reference under both settings of the far-sample
+# switch and compared bitwise with the sampled threshold switched off and with the forced re-stream.  Host plan,
+# hand-evaluated from the registry policies (the test asserts the host-visible parts): narrow units (l6 on sm_107a for ``cp16_16k``), ``cand_cap`` 8192,
+# ``check_period`` 16; ``cp16_16k`` (mean unit tiles 64) samples 8 tiles at stride 16 on its 125-128-tile units,
+# ``tail_30848`` (mean 239) samples 16 tiles at stride 15 / 16 on its 238-241-tile units.  The 241-tile units of
+# ``tail_30848`` satisfy ``(n_tiles - 1) % stride == 0``, so both tile orders sample the same tiles, the diagonal
+# and the sink tile included.  The 16384-token document of ``cp16_16k`` is the issue's 262144-token zigzag at 1/16
+# (``cp16_16k`` = ``cp_zigzag_rank0(16384)``: queries ``[0, 512)`` and ``[15872, 16384)``).
+SINK_GEOMETRIES = {
+    "cp16_16k": dict(seg_q_len=[512, 512], seg_k_len=[512, 16384], top_k=256),
+    "tail_30848": dict(seg_q_len=[512], seg_k_len=[30848], top_k=256),
+}
+
+
+def _longest_unit_samples(inputs, plan) -> bool:
+    """The kernel's ``sample_plan`` conditions for the longest unit, from host-visible numbers only: its key tiles
+    overflow the candidate buffer and the plan admits at least two sample tiles."""
+    tile = policy_for(arch_for(inputs.device)).tile_keys
+    tiles = -(-max(inputs.seg_k_len) // tile)
+    max_tiles = min(plan.sample_tiles_max, plan.cand_cap // tile - plan.check_period)
+    return tiles * tile + tile > plan.cand_cap and max_tiles >= 2
+
+
+@pytest.mark.parametrize("far_sample", [0, 1])
+@pytest.mark.parametrize("name", list(SINK_GEOMETRIES))
+def test_sink_distribution_is_exact_and_knob_invariant(name, far_sample):
+    _require_program()
+    inputs = ref.make_sink_inputs(
+        **SINK_GEOMETRIES[name], seed=ref.SINK_SEED, device="cuda", label=name
+    )
+    plan = _plan(inputs, far_sample=far_sample)
+    assert plan.sample_tiles_max > 0 and _longest_unit_samples(inputs, plan), plan
+    assert plan.far_sample == far_sample
+    base = _run(inputs, far_sample=far_sample)
+    verdict = _judge_ok(base, ref.select_reference(inputs))
+    assert (
+        verdict.max_fp32_error_over_bound <= 1.0
+        and verdict.max_fp64_error_over_bound <= 1.0
+    )
+    # the sink: most rows select key 0 (the issue reports 94-100 %; an iid row selects it with probability
+    # ~ top_k / visible)
+    assert float((base[0] == 0).any(dim=1).float().mean()) > 0.5
+    nosample = _run(inputs, sample_tiles_max=0)
+    assert ref.same_bits(base, nosample), (
+        "sample_tiles_max=0 changed the result on the sink distribution"
+    )
+    restream = _run(inputs, sample_shift_permille=-500)
+    assert ref.same_bits(base, restream), (
+        "the forced re-stream changed the result on the sink distribution"
+    )
+
+
+def test_sink_issue_geometry_full():
+    """The issue's call: one 262144-token document, CP16 zigzag rank 0, top-k 2048, ``max_seqlen_k`` 262144.
+    ``FLASHINFER_CAKE_DSA_INDEXER_FULL=1`` only: 2.1 G visible pairs through the matmul-order reference (minutes)."""
+    _require_program()
+    if not FULL:
+        pytest.skip("set FLASHINFER_CAKE_DSA_INDEXER_FULL=1 for the 262k sink geometry")
+    inputs = ref.make_sink_inputs(
+        [8192, 8192],
+        [8192, 262144],
+        top_k=2048,
+        seed=ref.SINK_SEED,
+        device="cuda",
+        label="Z1",
+    )
+    plan = _plan(inputs, max_seqlen_k=262144)
+    # unsplit units, 32 sample tiles, 16384-entry candidate buffers checked every 32 tiles: the plan the issue
+    # prints (the unit kind is the architecture's: wide on sm_100a, the l6 CTA pair on sm_103a)
+    assert plan.n_split == 1 and _longest_unit_samples(inputs, plan), plan
+    assert plan.sample_tiles_max == 32 and plan.cand_cap == 16384, plan
+    assert plan.check_period == 32, plan
+    base = _run(inputs, max_seqlen_k=262144)
+    _judge_ok(base, ref.select_reference(inputs))
+    nosample = _run(inputs, max_seqlen_k=262144, sample_tiles_max=0)
+    assert ref.same_bits(base, nosample)
+    far = _run(inputs, max_seqlen_k=262144, far_sample=1)
+    assert ref.same_bits(base, far)
+    unbounded = _run(inputs)
+    assert ref.same_bits(base, unbounded)
 
 
 # ---------------------------------------------------------------------------

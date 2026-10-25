@@ -66,6 +66,105 @@ def test_paged_auto_requires_qualified_runtime(
         prefill._cudnn_supports_paged_auto.cache_clear()
 
 
+def test_attention_handle_binds_current_stream_by_device(monkeypatch):
+    import concurrent.futures
+    import contextlib
+    import itertools
+    import threading
+    from flashinfer.cudnn import utils
+
+    current = threading.local()
+    handles, bound, queries, contexts = itertools.count(1), [], [], []
+
+    def raw_stream(index):
+        queries.append(index)
+        return current.stream
+
+    @contextlib.contextmanager
+    def device_context(device):
+        contexts.append(device)
+        yield
+
+    backend = SimpleNamespace(
+        create_handle=lambda: next(handles),
+        destroy_handle=lambda handle: None,
+        set_stream=lambda handle, stream: bound.append((handle, stream)),
+    )
+    monkeypatch.setattr(utils, "_attention_handles", threading.local())
+    monkeypatch.setattr(utils, "_get_current_raw_stream", raw_stream)
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device", device_context)
+    device = torch.device("cuda", 1)
+    current.stream = 101
+    first = utils.get_cudnn_attention_handle(backend, device=device)
+    assert bound[-1] == (first, 101) and queries[-1] == 1
+    current.stream = 202
+    assert utils.get_cudnn_attention_handle(backend, device=device) == first
+    assert bound[-1] == (first, 202)
+    second = utils.get_cudnn_attention_handle(backend, device=torch.device("cuda", 0))
+    assert second != first and queries[-1] == 0
+    assert contexts == [device, torch.device("cuda", 0)]
+
+    # An explicit Stream remains authoritative, independent of current state.
+    explicit = SimpleNamespace(device=device, cuda_stream=303)
+    assert utils.get_cudnn_attention_handle(backend, explicit) == first
+    assert bound[-1] == (first, 303)
+
+    def other_thread():
+        current.stream = 404
+        return utils.get_cudnn_attention_handle(backend, device=device)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        other = pool.submit(other_thread).result()
+    assert other not in (first, second) and bound[-1] == (other, 404)
+    assert utils.get_cudnn_attention_handle(backend, device=device) == first
+    assert bound[-1] == (first, 202)
+    with pytest.raises(ValueError, match="either stream or device"):
+        utils.get_cudnn_attention_handle(backend, explicit, device=device)
+
+
+@pytest.mark.parametrize("fallback", ["cold", "missing", "implicit", "default"])
+def test_attention_handle_keeps_torch_stream_fallback(monkeypatch, fallback):
+    import contextlib
+    import threading
+    from flashinfer.cudnn import utils
+
+    calls = []
+    resolved = torch.device("cuda", 1)
+    requested = (
+        None
+        if fallback == "default"
+        else torch.device("cuda")
+        if fallback == "implicit"
+        else resolved
+    )
+
+    def current_stream(device):
+        calls.append(device)
+        return SimpleNamespace(device=resolved, cuda_stream=515)
+
+    def raw_stream(index):
+        raise AssertionError("fallback must retain Torch lazy-init/device resolution")
+
+    bound = []
+    backend = SimpleNamespace(
+        create_handle=lambda: 17,
+        destroy_handle=lambda handle: None,
+        set_stream=lambda handle, stream: bound.append((handle, stream)),
+    )
+    monkeypatch.setattr(utils, "_attention_handles", threading.local())
+    monkeypatch.setattr(
+        utils, "_get_current_raw_stream", None if fallback == "missing" else raw_stream
+    )
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: fallback != "cold")
+    monkeypatch.setattr(torch.cuda, "current_stream", current_stream)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: contextlib.nullcontext())
+    assert utils.get_cudnn_attention_handle(backend, device=requested) == 17
+    expected_index = 1 if fallback in ("cold", "missing") else None
+    assert calls == [expected_index] and bound == [(17, 515)]
+    assert set(utils._attention_handles.handles) == {resolved}
+
+
 def test_ordered_execution_feature_detection():
     class Legacy:
         def execute(self, tensor_dict, workspace=None, handle=None):
@@ -149,7 +248,9 @@ def test_ordered_execution_errors_are_not_retried(monkeypatch):
             calls.append((buffers, kwargs))
             raise RuntimeError("invalid binding")
 
-    monkeypatch.setattr(decode, "_create_cudnn_handle", lambda stream: 17)
+    monkeypatch.setattr(
+        decode, "_create_cudnn_handle", lambda stream=None, **kwargs: 17
+    )
     monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: None)
     tensor = torch.empty(1)
     with pytest.raises(RuntimeError, match="invalid binding"):
@@ -176,7 +277,9 @@ def test_ordered_execution_errors_are_not_retried(monkeypatch):
 @pytest.mark.parametrize("ordered", [False, True])
 def test_planned_prefill_rebinds_tensors_and_metadata(monkeypatch, ordered):
     monkeypatch.setattr(prefill, "_cudnn_supports_shape_override", lambda: False)
-    monkeypatch.setattr(prefill, "_create_cudnn_handle", lambda stream: 23)
+    monkeypatch.setattr(
+        prefill, "_create_cudnn_handle", lambda stream=None, **kwargs: 23
+    )
     monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: None)
     calls = []
 
@@ -273,7 +376,9 @@ def test_decode_public_allocation_and_copy_prepared_boundary(
         lambda **kw: (SimpleNamespace(execute=execute), []),
         raising=False,
     )
-    monkeypatch.setattr(decode, "_create_cudnn_handle", lambda stream: None)
+    monkeypatch.setattr(
+        decode, "_create_cudnn_handle", lambda stream=None, **kwargs: None
+    )
     monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: None)
     out, lse = decode.cudnn_batch_decode_with_kv_cache(
         q,
@@ -398,7 +503,9 @@ def test_decode_binding_is_per_call_and_lse_is_base2(
     monkeypatch.setattr(
         decode, "_build_decode_graph", lambda *a, **kw: (graph, []), raising=False
     )
-    monkeypatch.setattr(decode, "_create_cudnn_handle", lambda stream: None)
+    monkeypatch.setattr(
+        decode, "_create_cudnn_handle", lambda stream=None, **kwargs: None
+    )
     monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: None)
     plan = decode.prepare_cudnn_batch_decode(
         q, k, v, 0.5, max_sequence_kv=8, window_left=-1, **kwargs
@@ -487,7 +594,9 @@ def test_prefill_metadata_rebind_and_lse_base(monkeypatch, lse_base, expected):
         seen.append(pack)
         pack[prefill.UIDs.STATS_UID.value].fill_(1)
 
-    monkeypatch.setattr(prefill, "_create_cudnn_handle", lambda stream: None)
+    monkeypatch.setattr(
+        prefill, "_create_cudnn_handle", lambda stream=None, **kwargs: None
+    )
     monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: None)
     plan = prefill.CudnnPrefillGraph(
         None, SimpleNamespace(execute=execute), override_cache=None, return_lse=True
@@ -600,7 +709,9 @@ def test_prefill_hn_same_plan_rebinds_current_output_stride(
 ):
     monkeypatch.setattr(prefill, "_CUDNN_NATIVE_HN_SUPPORTED", True)
     monkeypatch.setattr(prefill, "_cudnn_supports_shape_override", lambda: True)
-    monkeypatch.setattr(prefill, "_create_cudnn_handle", lambda stream: 23)
+    monkeypatch.setattr(
+        prefill, "_create_cudnn_handle", lambda stream=None, **kwargs: 23
+    )
     monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: None)
     q = torch.empty(3, 4, 8, dtype=torch.bfloat16)
     kv = torch.empty(7, 2, 8, dtype=q.dtype)

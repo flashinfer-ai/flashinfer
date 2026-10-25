@@ -67,6 +67,9 @@ def _kernel(
     ids: cute.Tensor,
     scores: cute.Tensor,
     out: cute.Tensor,
+    unified: cutlass.Constexpr = False,
+    finalize: cutlass.Constexpr = True,
+    narrow_scores: cutlass.Constexpr = False,
 ):
     bid, _, _ = cute.arch.block_idx()
     tid, _, _ = cute.arch.thread_idx()
@@ -83,6 +86,8 @@ def _kernel(
     expert = cutlass.Int32(-1)
     if slot < topk:
         expert = ids[token, slot]
+    if cutlass.const_expr(unified):
+        expert = expert.to(cutlass.Int64)
     shared = utils.SmemAllocator().allocate_tensor(
         cutlass.Float32, cute.make_layout(topk * 4), byte_alignment=16
     )
@@ -143,14 +148,22 @@ def _kernel(
         acc2 = cute.arch.warp_reduction_sum(acc2)
         acc3 = cute.arch.warp_reduction_sum(acc3)
         if lane == 0:
+            score = scores[token, slot].to(cutlass.Float32)
+            if cutlass.const_expr(narrow_scores):
+                score = score.to(cutlass.BFloat16).to(cutlass.Float32)
             v0 = (acc0 * alpha[expert]).to(cutlass.BFloat16).to(cutlass.Float32)
-            shared[warp * 4 + 0] = _mul(v0, scores[token, slot])
+            shared[warp * 4 + 0] = _mul(v0, score)
             v1 = (acc1 * alpha[expert]).to(cutlass.BFloat16).to(cutlass.Float32)
-            shared[warp * 4 + 1] = _mul(v1, scores[token, slot])
+            shared[warp * 4 + 1] = _mul(v1, score)
             v2 = (acc2 * alpha[expert]).to(cutlass.BFloat16).to(cutlass.Float32)
-            shared[warp * 4 + 2] = _mul(v2, scores[token, slot])
+            shared[warp * 4 + 2] = _mul(v2, score)
             v3 = (acc3 * alpha[expert]).to(cutlass.BFloat16).to(cutlass.Float32)
-            shared[warp * 4 + 3] = _mul(v3, scores[token, slot])
+            shared[warp * 4 + 3] = _mul(v3, score)
+            if cutlass.const_expr(not finalize):
+                out[route, row + 0] = v0.to(cutlass.BFloat16)
+                out[route, row + 1] = v1.to(cutlass.BFloat16)
+                out[route, row + 2] = v2.to(cutlass.BFloat16)
+                out[route, row + 3] = v3.to(cutlass.BFloat16)
     else:
         if lane == 0:
             shared[warp * 4 + 0] = cutlass.Float32(0.0)
@@ -158,7 +171,7 @@ def _kernel(
             shared[warp * 4 + 2] = cutlass.Float32(0.0)
             shared[warp * 4 + 3] = cutlass.Float32(0.0)
     cute.arch.sync_threads()
-    if tid == 0:
+    if tid == 0 and cutlass.const_expr(finalize):
         total0 = cutlass.Float32(0.0)
         total1 = cutlass.Float32(0.0)
         total2 = cutlass.Float32(0.0)

@@ -58,7 +58,8 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 #   register-resident row) for one CTA width, launch-bounds occupancy, input
 #   dtype and folded output scale (``cake_backend.quant_plan``); the
 #   ``_k<K>`` keys of the small-row tier share one program per CTA shape whose
-#   row width is the compile-line definition ``K_STATIC`` (``DEFINITIONS``);
+#   row width is the compile-line definition ``K_STATIC`` (``DEFINITIONS``),
+#   and the ``_cs<C>`` keys split each token row over a cluster of ``C`` CTAs;
 # * ``gemm:<orientation><tile>[_k512][_2cta][_hm][_sk<split>]_<bf16|f16>
 #   [_a<hint>][_b<hint>][_l2<promo>][_g<group>][_clc][_s<stages>][_o<ctas>]``
 #   the persistent block-scaled tcgen05 GEMM with the per-token alpha epilogue
@@ -168,6 +169,19 @@ ARG_PLANS: dict[str, list[list[str]]] = {
 # Row vocabulary: the path stem of the generated sources under ``csrc/``.
 _SOURCE_PREFIX = "cake_nvfp4_per_token/cake_nvfp4_per_token_"
 _PROGRAMS: dict[str, dict[str, Any]] = {
+    "0588831a72930146a0e8": {
+        "arg_plan": "quant",
+        "closure_sha256": {
+            "sm_100a": "77ce100a9abc61b1d14f5c698984cc1e99c4af3967a775c200dcd007879dac87",
+            "sm_103a": "890b7e20915425f65acb664f581c701f2a41a84add1312a1f7cc1aa088e2c0bf",
+        },
+    },
+    "05cdc205d9b471f666a1": {
+        "arg_plan": "gemm_2cta",
+        "closure_sha256": {
+            "sm_103a": "583e63c82275f33f0355e4e1a585405c7f92488309a0ab857fbea3bf910647ac",
+        },
+    },
     "062311ac440fbaf37629": {
         "kernel": "266051f22af995b10bc8",
         "binding": "266051f22af995b10bc8",
@@ -208,6 +222,18 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         "closure_sha256": {
             "sm_100a": "290e9680cb806e06b82c06cea77f801acf9a83a6cdd79126df149bffa79514e9",
             "sm_103a": "669982b77295f313419364eb2ec4993a931beae132cb206483022fbec90efae8",
+        },
+    },
+    "0ee9b811105da3e1e757": {
+        "arg_plan": "gemm_2cta",
+        "closure_sha256": {
+            "sm_103a": "97a0fb4240ac01069994665ccbe60bf45b90a48753fe397a913b94843364247a",
+        },
+    },
+    "102a58d983738fb4ba20": {
+        "arg_plan": "gemm_2cta",
+        "closure_sha256": {
+            "sm_103a": "230e64f8a56c6ff88f0481be81e7786956138b87b250d08b8e5d9fcffbc30790",
         },
     },
     "12c633607bd8e310fc7c": {
@@ -251,6 +277,12 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "sm_103a": "f59107660f0794fa5322ca7cc44ddfe904b3a3c5bea7a7ff8a2a7a3dcca2614a",
         },
     },
+    "1957cf0620e9be66eee8": {
+        "arg_plan": "gemm_2cta",
+        "closure_sha256": {
+            "sm_103a": "490e6740f512ea51994314e9826670fd8477af6c705970709bbe13c042bd08f8",
+        },
+    },
     "1bc4fe20d5d1fa219ea4": {
         "kernel": "288adcab31da85191a26",
         "compile_flags": [
@@ -289,6 +321,12 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         "closure_sha256": {
             "sm_100a": "fac93ca816c8718d15439008c2b99df8d44e9eaba1ec85f033db753ebd751431",
             "sm_103a": "101b472a66502cdcafe147e0c5cf32ab1e80f71213dee3ce6d1dd3e608c90bfa",
+        },
+    },
+    "1fa4a36589c5c72b1efd": {
+        "arg_plan": "gemm_2cta",
+        "closure_sha256": {
+            "sm_103a": "fe424a59ccf6a3766b385a918010c58ab43471d149453ea80429101d4c38302a",
         },
     },
     "1fa625dd627403d62d62": {
@@ -344,19 +382,6 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "sm_100a": "c07fb7bfdeebcba23999e54128513adc8ca0b4debf95ffdf4b83d191e7c6ee77",
         },
     },
-    "2db9273326bd94259cd1": {
-        "kernel": "fff83b2919d87c3723b3",
-        "compile_flags": [
-            "-DCAKE_OUT_F16=1",
-            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_2db9273326bd94259cd1",
-            "-DCAKE_PROGRAM_SHIM=cake_host_shim_016f27f7345b34a5",
-        ],
-        "arg_plan": "gemm",
-        "closure_sha256": {
-            "sm_100a": "696dcbee0ad12e6e44bb12d7f384049b951aabb6f98b38c1eea723c1e7b6ee3c",
-            "sm_103a": "42538824b82d7a0f98ce1af9fc34ab2b678eabff3fe007ddad827b0f103bd516",
-        },
-    },
     "2e26ffc7ce8d8fa6f128": {
         "kernel": "266051f22af995b10bc8",
         "binding": "266051f22af995b10bc8",
@@ -369,6 +394,13 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         "closure_sha256": {
             "sm_100a": "fd12facae6267d925e668deb464743d518cee351d8ffe22853d001ead90d0490",
             "sm_103a": "26993c89cf9a8a9213021ba28e913c67229bb409485ff6adc1d83cd8440f735c",
+        },
+    },
+    "30cc10800fc253a813ab": {
+        "arg_plan": "quant",
+        "closure_sha256": {
+            "sm_100a": "24165ed32a2c7a510fdafe18c611311b6f77aa7028c1d84c3b48ba4b1c754297",
+            "sm_103a": "8af47477ea2aea820113d4140dd2e8eaefb4ee61fccf8bd846b27176c9213a34",
         },
     },
     "310dce04e62dc4479f2f": {
@@ -391,6 +423,19 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "sm_103a": "85c68987e141528ec440d74a3bd5bb1f4261915ec581554a417f96f43cd8ed8e",
         },
     },
+    "33b08b7620357f6c712c": {
+        "arg_plan": "quant",
+        "closure_sha256": {
+            "sm_100a": "7d64bc50b81b54759f87995eff31af32b49e228e00e11d8a34ca4605c9f9e25b",
+            "sm_103a": "4f79fca801f6410e8f3eb71aac88405ff12331c6755d49cc74f6d02912c8ff68",
+        },
+    },
+    "34d44d8d6d4e632aea8c": {
+        "arg_plan": "gemm_2cta",
+        "closure_sha256": {
+            "sm_103a": "935c7dd0944a0f93b4a185e0db6cebdb800456f1b2d25a9be3d63b74062dff6a",
+        },
+    },
     "34e066f626b4be154822": {
         "kernel": "266051f22af995b10bc8",
         "binding": "266051f22af995b10bc8",
@@ -407,6 +452,13 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         "closure_sha256": {
             "sm_100a": "516bdd6f4300f5ec5805ef380a6d01b2d535c46066c1086d817dd8a16cea6e01",
             "sm_103a": "ea39078648f81ed5049a0a61546cb710af7e0f7b9f033a5f91405d65fe69695e",
+        },
+    },
+    "38827385d2d509e25ed9": {
+        "arg_plan": "quant",
+        "closure_sha256": {
+            "sm_100a": "24ee80090cd379fc16517511516b4a0921870e75ec33937a6d56e2fdb6e1eec6",
+            "sm_103a": "2e610e08a4e6d5711e90be2e849097767f603beb7007cff522500391ed9d7073",
         },
     },
     "3b069158e5efd68b3d56": {
@@ -469,11 +521,30 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "sm_103a": "67f2352f97fb87a756f65dbc5a57de215e1250d4599674b675905e4e55a397e6",
         },
     },
+    "3d599fcf35ef012e3839": {
+        "arg_plan": "gemm",
+        "closure_sha256": {
+            "sm_103a": "dd4193d2fee920107df1b6152de3657e0e0b78231c329c17cf482bf732e4acde",
+        },
+    },
+    "3deb92b0859de2875bd4": {
+        "arg_plan": "gemm_2cta",
+        "closure_sha256": {
+            "sm_103a": "89d3e825b4bb9eeaf9e58603ab14a5f164c3c8b2dc8535ace594706bd4fb2aa5",
+        },
+    },
     "3eae14c9d3c4c24cc180": {
         "arg_plan": "gemm",
         "closure_sha256": {
             "sm_100a": "b3014000bd72842c5e522926e3254eed5a5b0b741babdd07e6b6dbf621f080a0",
             "sm_103a": "5411391eff3284eb3e9a8d0db3a06993f8d3ee17c212a9e4ac6edf265262878d",
+        },
+    },
+    "4176a2a2dd451c295fdb": {
+        "arg_plan": "gemm",
+        "closure_sha256": {
+            "sm_100a": "4efd1c3decd7b2ba9e3a7d0bee8a2fa6c40680cea8f77facb5823acd4321217d",
+            "sm_103a": "c6cae1447ce513765283bc4da360e313d12f44ac5f0d35512e844c62078e90a7",
         },
     },
     "455c60a5c10aa2bcece8": {
@@ -558,6 +629,27 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "sm_103a": "1cc92ae3db4e8eabd1efe6b35f1935cbf858a0b8f001426d7b1bcc878b13b9e0",
         },
     },
+    "4dfd2b6475da344471f9": {
+        "arg_plan": "quant",
+        "closure_sha256": {
+            "sm_100a": "86f8518cc7b0575389c9dd96842ddb835b53bfb8ffc1580e4caf37bc7babbcc7",
+            "sm_103a": "41f221a1db95f1d117dc496c5e74ffdf6cc47deb204f9a8e4571e246e451fe10",
+        },
+    },
+    "52f7cc1603bc0a530734": {
+        "arg_plan": "quant",
+        "closure_sha256": {
+            "sm_100a": "32dbd7e4479114782a938c7cc211be0dcef0008d2a354dbf4a7460e785a2c6b9",
+            "sm_103a": "54401a6a0a4f03d160cb85e5f06c3be325b7c61cb7105fbb59b5abdc52babffb",
+        },
+    },
+    "53d256c5ac8ab022399f": {
+        "arg_plan": "gemm",
+        "closure_sha256": {
+            "sm_100a": "c72a28ce2a3d294624c97f9307820c1271ab81e7a870978f2c6b618c29f3d83d",
+            "sm_103a": "d6ffeacda4eb0b31a7e749fdd207dd9a860e1bf59bd0e334034c800ec2018d70",
+        },
+    },
     "53e1454ac0d533cefcda": {
         "kernel": "266051f22af995b10bc8",
         "binding": "266051f22af995b10bc8",
@@ -585,6 +677,13 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         "closure_sha256": {
             "sm_100a": "84b92983b41856e1ae56fefea252001090a8359f35d8a95de17a8b359850f08f",
             "sm_103a": "6bece1c4be39820596d8d05fd96f82862de91894c701ed006cd0359a52a9c682",
+        },
+    },
+    "580e9edbb66ac9359718": {
+        "arg_plan": "quant",
+        "closure_sha256": {
+            "sm_100a": "0817202b6068d9fbe5ab4ad43e3bd47b5f467042b5af7c27f11fef896f1adb7c",
+            "sm_103a": "b1e615c6b78275a294e46cff41aeeb76ba69e74cc92c7c2476b19f64cd8e4dfc",
         },
     },
     "5872000a0bd8bd391059": {
@@ -620,6 +719,13 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "sm_103a": "790457f84372490c4d21399cedc5db8e85fa553c2bef5b5488e360caa456e8cd",
         },
     },
+    "5d204df721cd13c47fdb": {
+        "arg_plan": "gemm",
+        "closure_sha256": {
+            "sm_100a": "00ff895de2de49e07db01349dba089f9d66785e3a5f928212bfdb13bb1d0f2b8",
+            "sm_103a": "cb15fc9aa75927fa0c23d79710727de46bd4ef3be02bcf6eec51435b8e7e0523",
+        },
+    },
     "5d8bea1558154053d314": {
         "kernel": "18fd61a4a764c2d1ab3e",
         "binding": "18fd61a4a764c2d1ab3e",
@@ -632,6 +738,19 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         "closure_sha256": {
             "sm_100a": "6c7bee81cc7d06593f6c9076c30331b84f3faf5799da958eebb0654d2421eec8",
             "sm_103a": "cdf067254284d95839de11c3bf1a88cbc3f4c93b313f800e5b4a038a93b66e3a",
+        },
+    },
+    "60a084e22436164149fc": {
+        "arg_plan": "gemm_2cta",
+        "closure_sha256": {
+            "sm_103a": "cd18569048a540bce77229c8635e6ea65a22ef1d3f0457eecdf8e0633614459c",
+        },
+    },
+    "640c33b699a8478f60bb": {
+        "arg_plan": "quant",
+        "closure_sha256": {
+            "sm_100a": "ffb94cd40727ed5410f3f460c6d0afb416134280ac804c4f504eda06608afe75",
+            "sm_103a": "4ce8202ce4f80af3955aefa7ac62d0ad00d1ac01836705bcadadb457ac5c0a88",
         },
     },
     "64313df7982791417a2b": {
@@ -788,6 +907,13 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         "closure_sha256": {
             "sm_100a": "97f92d4a67e4af06b75a05ee6f01a0817b787bc87a338c9d8203be9a02c4e83d",
             "sm_103a": "9bc0e7c33db47ca69d05af0c28b97da012affb47457a622763d3aa479ad541a4",
+        },
+    },
+    "6c716dab52bbcbf07637": {
+        "arg_plan": "quant",
+        "closure_sha256": {
+            "sm_100a": "6a64b591c02c8a971288e0ec052920951332a8f3c106981725fedf8adb57dabd",
+            "sm_103a": "071d313ffa28826f59fce81d4091804888be23e93eae4ca9d6a391f4047c0b64",
         },
     },
     "6fed99e520aa239db6c9": {
@@ -1151,11 +1277,24 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "sm_103a": "7be8344dfe56d89470d8d67f84f01add78fcdb7f8cf115182c8d3381ad83e666",
         },
     },
+    "9db9fb4fa9cbe2095158": {
+        "arg_plan": "gemm_2cta",
+        "closure_sha256": {
+            "sm_103a": "ccacc9634e547137a01569ee81146540dbef854164d19dd0437d016a1022f44e",
+        },
+    },
     "a1674da021d7fdb5e3d0": {
         "arg_plan": "gemm_2cta",
         "closure_sha256": {
             "sm_100a": "9bf3c50cf90ae566146d89ed16bd496c18e5171ccea5e731cf87a17f5b142df3",
             "sm_103a": "c5e5efbd1bb2c6e6615e6218192eb036c27bbdd928e78a78ff36275f5baa6bf4",
+        },
+    },
+    "a4bbe5462ed597845cd8": {
+        "arg_plan": "gemm",
+        "closure_sha256": {
+            "sm_100a": "4073c2a3f7546e54a6925995849ddebb4a0a4f79411ad72db9e38e37d6e4561a",
+            "sm_103a": "5694df004ec15a67026e51c98acf0c09d8cb80a0f44b516556595f3c36ee0fea",
         },
     },
     "a6cf54d2fb100c00ad63": {
@@ -1178,6 +1317,12 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         "closure_sha256": {
             "sm_100a": "f66c5868adec926d36751ffcd741813ab631f64cbd22b304c02dd25ba2d0aa28",
             "sm_103a": "fc932b547fa68ada83869e0b0314a78a8029f68f638d40adddcedcb5ef578301",
+        },
+    },
+    "a75cac9d0f7ccaf8b0ca": {
+        "arg_plan": "gemm",
+        "closure_sha256": {
+            "sm_103a": "34238fbc0f1f444e69b6ebfd5863423187023e7ab14d7024c5e559289d6410fa",
         },
     },
     "aa069aa70914114fa1c5": {
@@ -1253,6 +1398,12 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "sm_103a": "2b7cf314026180ae8270fa182a34227e52e0f489fb63e9504db7cf0dbd1fdecb",
         },
     },
+    "ae447cd8c8a488cbe10c": {
+        "arg_plan": "gemm_2cta",
+        "closure_sha256": {
+            "sm_103a": "d5b0896f45b2a35983e7cd5aefed236d550a68bb6d2e693b39581bbcbd2b8cda",
+        },
+    },
     "b0b95c4118991384623d": {
         "kernel": "12c633607bd8e310fc7c",
         "compile_flags": [
@@ -1264,6 +1415,12 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         "closure_sha256": {
             "sm_100a": "a834848c1b5040c60d27bfacd337b30ceef5ca36af27cc83de56147f35289690",
             "sm_103a": "cc5f06d8158bff008518c62ce7ce8de94af3248f37ede1fcc1a56228e79428b7",
+        },
+    },
+    "b2d58d85b71b2423a3dc": {
+        "arg_plan": "gemm",
+        "closure_sha256": {
+            "sm_103a": "35b3661e3307087e79fe95dc130bc73df423a58767ce82bec9a7c29f2082fa99",
         },
     },
     "b649171f6e9e74551522": {
@@ -1300,6 +1457,20 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "sm_103a": "06b41ce47a4dbb8f27eb59ce912591b6d87d1130814393016d05b4004fa650de",
         },
     },
+    "c002f42b63a48a7bd2b9": {
+        "arg_plan": "quant",
+        "closure_sha256": {
+            "sm_100a": "f901759873cfd520a54dd70d4861daadde4dd3c3b1f678c822ec7fbd5dfcaedd",
+            "sm_103a": "ba712a54d52900d679a65f1b395aafaa859cb560bc6c62036a4b0166411bb888",
+        },
+    },
+    "c0d5ca54ebf1dd9afedc": {
+        "arg_plan": "gemm",
+        "closure_sha256": {
+            "sm_100a": "d904cbb66c2a48ac30d3c99a955c013b848992f9f82799dab882561f17b85f28",
+            "sm_103a": "4b7444601f05cf44090a1e503ce830f2e8ce653e961b3a7faab29f5e58d21f28",
+        },
+    },
     "c253402ceb2f05cb709c": {
         "kernel": "266051f22af995b10bc8",
         "binding": "266051f22af995b10bc8",
@@ -1334,6 +1505,13 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "sm_103a": "fc99f82a24b39f84ba15be626badbd8b93811ed6cfa6c26623b175f10c048507",
         },
     },
+    "c6923d9ce04d6f662377": {
+        "arg_plan": "quant",
+        "closure_sha256": {
+            "sm_100a": "75123f12e227cd9163e576e242d5f89698f7bd11fd085a3c8aeb3e78d0f4a3be",
+            "sm_103a": "49ee0d21a0808874f9f6b1d23a957e8e6bb330618dcf91345b0b4a651eb29c9d",
+        },
+    },
     "cce6da2b9b938e36636e": {
         "kernel": "e51e19d19bcf42ae3ee0",
         "compile_flags": [
@@ -1344,6 +1522,12 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "gemm",
         "closure_sha256": {
             "sm_103a": "b44ca8ce5bf856e1b661b2a8364982774dca4794d72331246ac22e865bac4efd",
+        },
+    },
+    "cf1cb7fc1bc0e3d2e586": {
+        "arg_plan": "gemm_2cta",
+        "closure_sha256": {
+            "sm_103a": "eff8cc905c52661b30d22b55bf89457a8b532780c6e0d8fc4f42a8e33dd08845",
         },
     },
     "cf59fa0f9ceb0c7f38f8": {
@@ -1415,18 +1599,18 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "sm_103a": "4cb0fa00f0200b0625f7ba22864a3c09f0bb8080b44404c9bb5a04d99b838ac3",
         },
     },
+    "d83d1f0932f5d546ad7f": {
+        "arg_plan": "gemm",
+        "closure_sha256": {
+            "sm_100a": "62b99ed96aae75cc6526623c103b35df6f0d841b9ca023a22984fdf93a5f9166",
+            "sm_103a": "ac977b45dac4b34dc463110c0602ab343cc24dca6160b8102672315d17a3f328",
+        },
+    },
     "da7c611282ca76f06547": {
         "arg_plan": "gemm",
         "closure_sha256": {
             "sm_100a": "075d224a0c0b7db511c9ccd504ac15d003aba6abc6d20a6c91277eaa7d0d9a15",
             "sm_103a": "598a80395fa29d35e8456d385b53133b98bb5461e010b6fd572fae2d3d89e62f",
-        },
-    },
-    "dbd1cac20715c4715cd3": {
-        "arg_plan": "gemm",
-        "closure_sha256": {
-            "sm_100a": "4a3ba504dccf1657619aca9d0e0dd8ffb2d700f1222e769566ff2098baf0221c",
-            "sm_103a": "d60c154203a703ec4881fd879ca8023927a59d65adbf090e72bf3b915a2e6941",
         },
     },
     "dcd89b2e097fbee53eb7": {
@@ -1469,6 +1653,12 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "sm_103a": "099643cf57c2162a7b69aaf0be2754560f792a986eacdfc5d019a7d8ed84e795",
         },
     },
+    "e072ba3ae8ee0ec40034": {
+        "arg_plan": "gemm",
+        "closure_sha256": {
+            "sm_103a": "40b9da1b25b299689c3f770ff8b64208c1aaa325887513c6644ece129071afb1",
+        },
+    },
     "e101e3ffad576f12a678": {
         "kernel": "266051f22af995b10bc8",
         "binding": "266051f22af995b10bc8",
@@ -1509,17 +1699,11 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "sm_103a": "ae567b113a6cf52f096ec93edc193502f541ce14833f124f34e34ad428cfad30",
         },
     },
-    "e933d7e9cbe827e25d3e": {
-        "kernel": "dbd1cac20715c4715cd3",
-        "compile_flags": [
-            "-DCAKE_OUT_F16=1",
-            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_e933d7e9cbe827e25d3e",
-            "-DCAKE_PROGRAM_SHIM=cake_host_shim_470caa285468bca0",
-        ],
+    "e7ab2ede404f583e4f47": {
         "arg_plan": "gemm",
         "closure_sha256": {
-            "sm_100a": "e94196159dfad2b352edec1e1eb349b39c42a24a64995eae884bdf4d85494dd7",
-            "sm_103a": "feb8a81febe1ea5a6c657c55074d72e81ddb393abee8b153a80c363a522fbb5a",
+            "sm_100a": "4a99a6f0ee4a3938bc69fa67405d4b18a69242e72a21202210cd30969e22afa5",
+            "sm_103a": "aec043464933befecefcd9e23dcd050803835441e6103a61662df0ec24b14f0c",
         },
     },
     "e98c42f779ed53e68b30": {
@@ -1543,11 +1727,31 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "sm_103a": "b4fbcbff04023bce2013ec40f33c73b7da820b566f7ae572bb84c2a8efa93f3a",
         },
     },
+    "eb92c19102b3704c9256": {
+        "arg_plan": "quant",
+        "closure_sha256": {
+            "sm_100a": "2822dc08f74ebcf3e060bc6da10bd6ad8c2de5bd6b172f7b9bc849133cc17398",
+            "sm_103a": "43bf22f6d82afd7a3adf9313a72bcd4c1256fc2275610eed56dc21db3969f60f",
+        },
+    },
+    "ed1f7ddf3b4e31cb9644": {
+        "arg_plan": "gemm_2cta",
+        "closure_sha256": {
+            "sm_103a": "f482139c4673208ddda04a7b53ea990db83720e4d7b7c86b6ac7d208d93554df",
+        },
+    },
     "ed87ebc67c2bc540d361": {
         "arg_plan": "gemm",
         "closure_sha256": {
             "sm_100a": "c6cfe5e649409f451f2d009cb35776d221057c96a03909129e5b61c745a6c71d",
             "sm_103a": "a415e68d1bad80bd5011af0913c82ff94add4ade3583c99eff4120e1561a631c",
+        },
+    },
+    "f49a91181a33939d1759": {
+        "arg_plan": "gemm",
+        "closure_sha256": {
+            "sm_100a": "d130e3ee94fca0217763c28e4134d5bb65bdc12e16dffe7c361112269513d0b0",
+            "sm_103a": "9458ccf10f2e4acde4523822b7594275e5af6082fe0ad04e54461de8f2d29baa",
         },
     },
     "f53911591c205d67bcce": {
@@ -1629,13 +1833,6 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "sm_103a": "ace3617d84c448fa0fa3557ffdd2b2afedee8398187b6ce8b51d51a55c7b2a76",
         },
     },
-    "fff83b2919d87c3723b3": {
-        "arg_plan": "gemm",
-        "closure_sha256": {
-            "sm_100a": "92fba97fdd24e4a40afe972ad3e63a5a4d64788dba6a200bf4a0e5a8087f9272",
-            "sm_103a": "261a302bd127813c2e6de206da3a3aa13bfd4b824290d68e1d2e2b295e339e26",
-        },
-    },
 }
 
 # Logical kernel key -> program: the assignments both architectures share,
@@ -1649,38 +1846,30 @@ _KERNELS_SHARED: dict[str, str] = {
     "gemm:m128_2cta_f16_bF_l2256b": "cake_nvfp4_per_token_3b069158e5efd68b3d56",
     "gemm:m128_bf16_bF": "cake_nvfp4_per_token_795f9ce57ce7e6812b6c",
     "gemm:m128_f16_bF": "cake_nvfp4_per_token_d37bd37aefbd1c2663ce",
-    "gemm:m192_2cta_bf16_aL_bL_l2256b": "cake_nvfp4_per_token_a1674da021d7fdb5e3d0",
     "gemm:m192_2cta_bf16_aL_bL_l2256b_g8": "cake_nvfp4_per_token_6fed99e520aa239db6c9",
-    "gemm:m192_2cta_f16_aL_bL_l2256b": "cake_nvfp4_per_token_1fa625dd627403d62d62",
     "gemm:m192_2cta_f16_aL_bL_l2256b_g8": "cake_nvfp4_per_token_f53911591c205d67bcce",
-    "gemm:m256_2cta_bf16_aL_bL_l2256b": "cake_nvfp4_per_token_a6fc65c9fcae34137fec",
-    "gemm:m256_2cta_bf16_aL_bL_l2256b_clc": "cake_nvfp4_per_token_18fd61a4a764c2d1ab3e",
-    "gemm:m256_2cta_bf16_aL_bL_l2256b_g16_clc": "cake_nvfp4_per_token_455c60a5c10aa2bcece8",
-    "gemm:m256_2cta_bf16_aL_bL_l2256b_g8": "cake_nvfp4_per_token_139c3fab2a0249e02c3e",
-    "gemm:m256_2cta_bf16_aL_bL_l2256b_g8_clc": "cake_nvfp4_per_token_5d8bea1558154053d314",
     "gemm:m256_2cta_bf16_bF_l2256b": "cake_nvfp4_per_token_8c27d1a9b8f95d84ea63",
-    "gemm:m256_2cta_f16_aL_bL_l2256b": "cake_nvfp4_per_token_1de51aa8fd0339bfc55c",
-    "gemm:m256_2cta_f16_aL_bL_l2256b_clc": "cake_nvfp4_per_token_64313df7982791417a2b",
-    "gemm:m256_2cta_f16_aL_bL_l2256b_g16_clc": "cake_nvfp4_per_token_45fc8d20d916671c5f36",
-    "gemm:m256_2cta_f16_aL_bL_l2256b_g8": "cake_nvfp4_per_token_72a49b93eb629736017a",
-    "gemm:m256_2cta_f16_aL_bL_l2256b_g8_clc": "cake_nvfp4_per_token_a6cf54d2fb100c00ad63",
     "gemm:m256_2cta_f16_bF_l2256b": "cake_nvfp4_per_token_9069465975d6f1ca6311",
     "gemm:m64_2cta_bf16_bF_l2256b": "cake_nvfp4_per_token_78fcd21adb756e3fddc9",
     "gemm:m64_2cta_f16_bF_l2256b": "cake_nvfp4_per_token_1d6630a145ff559d1fa3",
     "gemm:m64_2cta_hm_bf16_bF_l2256b": "cake_nvfp4_per_token_becd24cbb8333dc48dcb",
     "gemm:m64_2cta_hm_f16_bF_l2256b": "cake_nvfp4_per_token_66c17b2c6c8645cc5a76",
     "gemm:m64_bf16_bF_l2256b": "cake_nvfp4_per_token_17270a6f1bb78bfd8f92",
+    "gemm:m64_bf16_bF_l2256b_ro": "cake_nvfp4_per_token_a4bbe5462ed597845cd8",
     "gemm:m64_f16_bF_l2256b": "cake_nvfp4_per_token_6791cd4bf5cc9b5e088b",
+    "gemm:m64_f16_bF_l2256b_ro": "cake_nvfp4_per_token_f49a91181a33939d1759",
     "gemm:n16_bf16_aF_l2256b": "cake_nvfp4_per_token_3eae14c9d3c4c24cc180",
     "gemm:n16_k512_bf16_aF_l2256b_s3": "cake_nvfp4_per_token_eac184768fafd7b7da36",
     "gemm:n16_sk2_bf16_aF_l2256b": "cake_nvfp4_per_token_da7c611282ca76f06547",
+    "gemm:n16_sk3_bf16_l2256b": "cake_nvfp4_per_token_e7ab2ede404f583e4f47",
+    "gemm:n16_sk3_f16_l2256b": "cake_nvfp4_per_token_c0d5ca54ebf1dd9afedc",
     "gemm:n16_sk4_bf16_l2256b": "cake_nvfp4_per_token_adf05dbe9f624ff487d0",
     "gemm:n32_bf16_aF_l2256b": "cake_nvfp4_per_token_6a8f0bd74f7f517d1b11",
     "gemm:n32_f16_aF_l2256b": "cake_nvfp4_per_token_cf59fa0f9ceb0c7f38f8",
     "gemm:n32_k512_bf16_aF_l2256b_s3": "cake_nvfp4_per_token_267ea66edacba2a365e7",
     "gemm:n32_k512_f16_aF_l2256b_s3": "cake_nvfp4_per_token_d7bad35e46134c38d973",
-    "gemm:n32_sk2_bf16_aF_l2256b": "cake_nvfp4_per_token_dbd1cac20715c4715cd3",
-    "gemm:n32_sk2_f16_aF_l2256b": "cake_nvfp4_per_token_e933d7e9cbe827e25d3e",
+    "gemm:n32_sk2_bf16_aF_l2256b": "cake_nvfp4_per_token_d83d1f0932f5d546ad7f",
+    "gemm:n32_sk2_f16_aF_l2256b": "cake_nvfp4_per_token_5d204df721cd13c47fdb",
     "gemm:n8_bf16_aF_l2256b": "cake_nvfp4_per_token_925e8165fab2f00266d9",
     "gemm:n8_bf16_aF_l2256b_o2": "cake_nvfp4_per_token_12c633607bd8e310fc7c",
     "gemm:n8_f16_aF_l2256b": "cake_nvfp4_per_token_310dce04e62dc4479f2f",
@@ -1691,20 +1880,26 @@ _KERNELS_SHARED: dict[str, str] = {
     "gemm:n8_sk2_bf16_l2256b": "cake_nvfp4_per_token_07b0189c8953c02acff3",
     "gemm:n8_sk2_f16_aF_l2256b": "cake_nvfp4_per_token_93b60320bbfa3449a921",
     "gemm:n8_sk2_f16_l2256b": "cake_nvfp4_per_token_942b39aa9ca66fb980e8",
-    "gemm:n8_sk3_bf16_l2256b": "cake_nvfp4_per_token_b649171f6e9e74551522",
-    "gemm:n8_sk3_f16_l2256b": "cake_nvfp4_per_token_ed87ebc67c2bc540d361",
-    "gemm:n8_sk4_bf16_l2256b": "cake_nvfp4_per_token_fff83b2919d87c3723b3",
-    "gemm:n8_sk4_f16_l2256b": "cake_nvfp4_per_token_2db9273326bd94259cd1",
+    "gemm:n8_sk4_bf16_l2256b": "cake_nvfp4_per_token_4176a2a2dd451c295fdb",
+    "gemm:n8_sk4_f16_l2256b": "cake_nvfp4_per_token_53d256c5ac8ab022399f",
+    "quant:t128_b1_mb1_bf16_cs4": "cake_nvfp4_per_token_33b08b7620357f6c712c",
+    "quant:t128_b1_mb1_bf16_cs4_k7168": "cake_nvfp4_per_token_580e9edbb66ac9359718",
+    "quant:t128_b1_mb1_bf16_fold_cs4": "cake_nvfp4_per_token_0588831a72930146a0e8",
+    "quant:t128_b1_mb1_bf16_fold_cs4_k7168": "cake_nvfp4_per_token_6c716dab52bbcbf07637",
     "quant:t128_b2_mb8_bf16_fold_sl": "cake_nvfp4_per_token_98c1d7945ad0dcb98963",
     "quant:t128_b2_mb8_bf16_sl": "cake_nvfp4_per_token_fa93c77677bea4179924",
     "quant:t128_b4_mb8_bf16_fold_sl": "cake_nvfp4_per_token_8499e042c80c6cf6a00f",
     "quant:t128_b4_mb8_bf16_sl": "cake_nvfp4_per_token_b6b2ef866ed5f8f91335",
     "quant:t128_b8_mb5_bf16_fold_sl": "cake_nvfp4_per_token_996c7fd21642f288f697",
     "quant:t128_b8_mb5_bf16_sl": "cake_nvfp4_per_token_68ee524b89f5e289133c",
+    "quant:t256_b1_mb1_bf16_cs4": "cake_nvfp4_per_token_30cc10800fc253a813ab",
+    "quant:t256_b1_mb1_bf16_fold_cs4": "cake_nvfp4_per_token_c002f42b63a48a7bd2b9",
     "quant:t256_b1_mb1_bf16_fold_k2688": "cake_nvfp4_per_token_dcd89b2e097fbee53eb7",
     "quant:t256_b1_mb1_bf16_fold_k4096": "cake_nvfp4_per_token_dcd89b2e097fbee53eb7",
     "quant:t256_b1_mb1_bf16_k2688": "cake_nvfp4_per_token_53e1454ac0d533cefcda",
     "quant:t256_b1_mb1_bf16_k4096": "cake_nvfp4_per_token_53e1454ac0d533cefcda",
+    "quant:t256_b1_mb3_bf16_cs4": "cake_nvfp4_per_token_640c33b699a8478f60bb",
+    "quant:t256_b1_mb3_bf16_fold_cs4": "cake_nvfp4_per_token_52f7cc1603bc0a530734",
     "quant:t256_b1_mb3_bf16_fold_k2688": "cake_nvfp4_per_token_0d13de6f1682e55c1373",
     "quant:t256_b1_mb3_bf16_fold_k4096": "cake_nvfp4_per_token_0d13de6f1682e55c1373",
     "quant:t256_b1_mb3_bf16_k2688": "cake_nvfp4_per_token_4d85976d6c18ce148ca4",
@@ -1714,7 +1909,9 @@ _KERNELS_SHARED: dict[str, str] = {
     "quant:t256_b1_mb4_bf16_sl_k2688": "cake_nvfp4_per_token_96e142849dcfaaf7c1a4",
     "quant:t256_b1_mb4_bf16_sl_k4096": "cake_nvfp4_per_token_96e142849dcfaaf7c1a4",
     "quant:t256_b2_mb3_bf16": "cake_nvfp4_per_token_266051f22af995b10bc8",
+    "quant:t256_b2_mb3_bf16_cs4": "cake_nvfp4_per_token_4dfd2b6475da344471f9",
     "quant:t256_b2_mb3_bf16_fold": "cake_nvfp4_per_token_2e26ffc7ce8d8fa6f128",
+    "quant:t256_b2_mb3_bf16_fold_cs4": "cake_nvfp4_per_token_eb92c19102b3704c9256",
     "quant:t256_b2_mb3_bf16_fold_k7168": "cake_nvfp4_per_token_e98c42f779ed53e68b30",
     "quant:t256_b2_mb3_bf16_k7168": "cake_nvfp4_per_token_f7ff78ec5855b9b22ea7",
     "quant:t256_b2_mb3_f16_k7168": "cake_nvfp4_per_token_318ddeeecf4e9addca1e",
@@ -1732,7 +1929,9 @@ _KERNELS_SHARED: dict[str, str] = {
     "quant:t256_b7_mb3_bf16_fold_sl": "cake_nvfp4_per_token_6717875e66a6fcec8341",
     "quant:t256_b7_mb3_bf16_sl": "cake_nvfp4_per_token_83fec50b7af0311f8244",
     "quant:t512_b1_mb1_bf16": "cake_nvfp4_per_token_58eeece815f48fd1d43a",
+    "quant:t512_b1_mb1_bf16_cs4": "cake_nvfp4_per_token_c6923d9ce04d6f662377",
     "quant:t512_b1_mb1_bf16_fold": "cake_nvfp4_per_token_69f8274b12662366ecb8",
+    "quant:t512_b1_mb1_bf16_fold_cs4": "cake_nvfp4_per_token_38827385d2d509e25ed9",
     "quant:t512_b1_mb1_bf16_fold_k7168": "cake_nvfp4_per_token_2126ed4021a5df3e8461",
     "quant:t512_b1_mb1_bf16_k7168": "cake_nvfp4_per_token_3c0a0335f02050ebb60e",
     "quant:t512_b2_mb1_bf16": "cake_nvfp4_per_token_7652be76af016751909c",
@@ -1750,19 +1949,49 @@ _KERNELS_SHARED: dict[str, str] = {
 }
 _KERNELS_ONLY: dict[str, dict[str, str]] = {
     "sm_100a": {
+        "gemm:m192_2cta_bf16_aL_bL_l2256b": "cake_nvfp4_per_token_a1674da021d7fdb5e3d0",
+        "gemm:m192_2cta_f16_aL_bL_l2256b": "cake_nvfp4_per_token_1fa625dd627403d62d62",
         "gemm:m192_2cta_skt6_bf16_aL_bL_l2256b": "cake_nvfp4_per_token_288adcab31da85191a26",
         "gemm:m192_2cta_skt6_bf16_bF_l2256b": "cake_nvfp4_per_token_5872000a0bd8bd391059",
         "gemm:m192_2cta_skt6_f16_aL_bL_l2256b": "cake_nvfp4_per_token_aa069aa70914114fa1c5",
         "gemm:m192_2cta_skt6_f16_bF_l2256b": "cake_nvfp4_per_token_1bc4fe20d5d1fa219ea4",
+        "gemm:m256_2cta_bf16_aL_bL_l2256b": "cake_nvfp4_per_token_a6fc65c9fcae34137fec",
+        "gemm:m256_2cta_bf16_aL_bL_l2256b_clc": "cake_nvfp4_per_token_18fd61a4a764c2d1ab3e",
+        "gemm:m256_2cta_bf16_aL_bL_l2256b_g16_clc": "cake_nvfp4_per_token_455c60a5c10aa2bcece8",
+        "gemm:m256_2cta_bf16_aL_bL_l2256b_g8": "cake_nvfp4_per_token_139c3fab2a0249e02c3e",
+        "gemm:m256_2cta_bf16_aL_bL_l2256b_g8_clc": "cake_nvfp4_per_token_5d8bea1558154053d314",
+        "gemm:m256_2cta_f16_aL_bL_l2256b": "cake_nvfp4_per_token_1de51aa8fd0339bfc55c",
+        "gemm:m256_2cta_f16_aL_bL_l2256b_clc": "cake_nvfp4_per_token_64313df7982791417a2b",
+        "gemm:m256_2cta_f16_aL_bL_l2256b_g16_clc": "cake_nvfp4_per_token_45fc8d20d916671c5f36",
+        "gemm:m256_2cta_f16_aL_bL_l2256b_g8": "cake_nvfp4_per_token_72a49b93eb629736017a",
+        "gemm:m256_2cta_f16_aL_bL_l2256b_g8_clc": "cake_nvfp4_per_token_a6cf54d2fb100c00ad63",
+        "gemm:n8_sk3_bf16_l2256b": "cake_nvfp4_per_token_b649171f6e9e74551522",
+        "gemm:n8_sk3_f16_l2256b": "cake_nvfp4_per_token_ed87ebc67c2bc540d361",
     },
     "sm_103a": {
+        "gemm:m192_2cta_bf16_aL_bL_l2256b": "cake_nvfp4_per_token_1fa4a36589c5c72b1efd",
         "gemm:m192_2cta_bf16_bF_l2256b": "cake_nvfp4_per_token_90f233fd2ad0ca2fdd38",
+        "gemm:m192_2cta_f16_aL_bL_l2256b": "cake_nvfp4_per_token_ed1f7ddf3b4e31cb9644",
         "gemm:m192_2cta_f16_bF_l2256b": "cake_nvfp4_per_token_6659f7757bcb7bae97b1",
         "gemm:m192_bf16_bF_l2256b": "cake_nvfp4_per_token_e51e19d19bcf42ae3ee0",
         "gemm:m192_f16_bF_l2256b": "cake_nvfp4_per_token_cce6da2b9b938e36636e",
+        "gemm:m256_2cta_bf16_aL_bL_l2256b": "cake_nvfp4_per_token_ae447cd8c8a488cbe10c",
+        "gemm:m256_2cta_bf16_aL_bL_l2256b_clc": "cake_nvfp4_per_token_05cdc205d9b471f666a1",
+        "gemm:m256_2cta_bf16_aL_bL_l2256b_g16_clc": "cake_nvfp4_per_token_1957cf0620e9be66eee8",
+        "gemm:m256_2cta_bf16_aL_bL_l2256b_g8": "cake_nvfp4_per_token_102a58d983738fb4ba20",
+        "gemm:m256_2cta_bf16_aL_bL_l2256b_g8_clc": "cake_nvfp4_per_token_0ee9b811105da3e1e757",
+        "gemm:m256_2cta_f16_aL_bL_l2256b": "cake_nvfp4_per_token_60a084e22436164149fc",
+        "gemm:m256_2cta_f16_aL_bL_l2256b_clc": "cake_nvfp4_per_token_34d44d8d6d4e632aea8c",
+        "gemm:m256_2cta_f16_aL_bL_l2256b_g16_clc": "cake_nvfp4_per_token_3deb92b0859de2875bd4",
+        "gemm:m256_2cta_f16_aL_bL_l2256b_g8": "cake_nvfp4_per_token_9db9fb4fa9cbe2095158",
+        "gemm:m256_2cta_f16_aL_bL_l2256b_g8_clc": "cake_nvfp4_per_token_cf1cb7fc1bc0e3d2e586",
         "gemm:n16_bf16_aF_l2256b_o2": "cake_nvfp4_per_token_183e28bdf124c263ecfb",
         "gemm:n32_bf16_aF_l2256b_o2": "cake_nvfp4_per_token_7d87cdf4f15f1439b3e0",
         "gemm:n32_f16_aF_l2256b_o2": "cake_nvfp4_per_token_3cd58718ee867217608b",
+        "gemm:n8_bf16_aF_l2256b_w64": "cake_nvfp4_per_token_a75cac9d0f7ccaf8b0ca",
+        "gemm:n8_f16_aF_l2256b_w64": "cake_nvfp4_per_token_3d599fcf35ef012e3839",
+        "gemm:n8_sk3_bf16_l2256b": "cake_nvfp4_per_token_b2d58d85b71b2423a3dc",
+        "gemm:n8_sk3_f16_l2256b": "cake_nvfp4_per_token_e072ba3ae8ee0ec40034",
     },
 }
 KERNELS: dict[str, dict[str, str]] = {
@@ -1771,6 +2000,8 @@ KERNELS: dict[str, dict[str, str]] = {
 }
 
 DEFINITIONS: dict[str, dict[str, int]] = {
+    "quant:t128_b1_mb1_bf16_cs4_k7168": {"K_STATIC": 7168},
+    "quant:t128_b1_mb1_bf16_fold_cs4_k7168": {"K_STATIC": 7168},
     "quant:t256_b1_mb1_bf16_fold_k2688": {"K_STATIC": 2688},
     "quant:t256_b1_mb1_bf16_fold_k4096": {"K_STATIC": 4096},
     "quant:t256_b1_mb1_bf16_k2688": {"K_STATIC": 2688},
