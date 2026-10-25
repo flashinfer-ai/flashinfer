@@ -1190,6 +1190,73 @@ def test_radix_return_values(dtype):
 
 
 @requires_blackwell
+@pytest.mark.parametrize("input_stride", [1, 2])
+@pytest.mark.parametrize("ctas_per_group", [1, 2])
+@pytest.mark.parametrize("use_mask", [False, True])
+def test_radix_device_active_rows_cuda_graph(input_stride, ctas_per_group, use_mask):
+    """A compact queue can grow and shrink without touching inactive output rows."""
+    import cutlass
+    from flashinfer.topk_varlen.topk_varlen import _compile_radix, _RADIX_STATE_SIZE
+
+    rows, width, top_k, num_sms = 33, 8192, 512, 8
+    torch.manual_seed(1)
+    storage = torch.randint(
+        -1000, 1000, (rows, width * input_stride), device="cuda"
+    ).float()
+    logits = storage[:, input_stride - 1 :: input_stride]
+    lengths = torch.randint(
+        top_k + 1, width + 1, (rows,), device="cuda", dtype=torch.int32
+    )
+    masked = logits.masked_fill(
+        torch.arange(width, device="cuda")[None, :] >= lengths[:, None], -float("inf")
+    )
+    expected = torch.topk(masked, top_k, dim=1).values.sort(1).values
+    states = torch.zeros(
+        (num_sms // ctas_per_group, _RADIX_STATE_SIZE), device="cuda", dtype=torch.int32
+    )
+    output = torch.empty((rows, top_k), device="cuda", dtype=torch.int32)
+    count = torch.zeros(rows if use_mask else 1, device="cuda", dtype=torch.int32)
+    compiled = _compile_radix(
+        cutlass.Float32,
+        top_k,
+        1,
+        1,
+        width,
+        False,
+        ctas_per_group,
+        width // ctas_per_group,
+        num_sms,
+        input_stride,
+        width * input_stride,
+        has_active_rows=not use_mask,
+        has_active_mask=use_mask,
+    )
+    compiled(logits, states, lengths, output, None, count)
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        compiled(logits, states, lengths, output, None, count)
+    for active in (0, 1, 17, rows, 3, 0, rows + 5, -1):
+        output.fill_(-1)
+        count.fill_(active)
+        valid = min(rows, max(active, 0))
+        enabled = torch.arange(rows, device="cuda") < valid
+        if use_mask:
+            # Sparse original row IDs, including persistent groups with holes.
+            enabled = enabled.roll(rows // 2)
+            count.copy_(enabled)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert bool((output[~enabled] == -1).all())
+        selected = output[enabled].long()
+        assert bool(((selected >= 0) & (selected < lengths[enabled, None])).all())
+        ordered = selected.sort(1).values
+        assert bool((ordered[:, 1:] != ordered[:, :-1]).all())
+        actual = logits[enabled].gather(1, selected).sort(1).values
+        torch.testing.assert_close(actual, expected[enabled], rtol=0, atol=0)
+
+
+@requires_blackwell
 @pytest.mark.parametrize("return_values", [True, False])
 def test_radix_preallocated_outputs(return_values):
     """radix backend: out_indices written in-place; out_values honoured iff return_values=True.
