@@ -1,4 +1,35 @@
-"""Independent BF16/FP32 W4A16 oracle shared by dense, MegaMoE, and split tests."""
+"""Bit-exact, zero-tolerance reference for the following W4A16 contracts.
+
+``assert_w4a16_bits`` requires finite BF16 outputs with identical storage bits
+(including signed zero): ``atol=0`` and ``rtol=0`` on their integer views.
+
+Supported production backends and APIs:
+
+* Dense: ``flashinfer.mm_bf16_fp4(..., backend="cute-dsl")`` on
+  SM100/103/107, using standard full-K tactics and the prepared six-dimensional
+  scale layout. ``dense_w4a16_reference`` applies FP32 alpha after the GEMM
+  and rounds the result to BF16.
+* Split MoE: ``flashinfer.cute_dsl_fused_moe`` and
+  ``flashinfer.CuteDslMoEWrapper`` with ``quant_mode="w4a16"`` and
+  ``use_fused_finalize=False``. The same contract covers
+  ``flashinfer.fused_moe.MoELayer`` with ``CuteDslConfig`` (backend key
+  ``"cute_dsl"``), NVFP4 weights/BF16 activations, and unfused finalization.
+* MegaMoE W4A16: ``bf16_nvfp4_mega_moe`` in
+  ``flashinfer.moe_ep.cute_dsl.megamoe.bf16_nvfp4``, and
+  ``flashinfer.moe_ep.MoEEpMegaLayer`` with ``MegaConfig`` and
+  ``Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig``, using deterministic combine
+  (``in_kernel_fc2_reduce=False``).
+
+Dense split-K, stream-K, SM11x/SM12x kernels, GEMV, CAKE, and other backend
+implementations are outside this exact contract. Split MoE fused TMA-reduce
+finalization is also excluded. With MegaMoE ``in_kernel_fc2_reduce=True``, the
+reference returns BF16 per-route terms, not an exact final atomic sum; tests
+retain their existing tolerance band for the atomic BF16 combine.
+
+All covered GEMMs share BF16 decoded weights, FP32 accumulation and separate
+FP32 alpha scaling. The oracle disables reduced-precision reduction/split-K
+in cuBLASLt; it requires PyTorch's BF16 split-K control and Triton for MoE.
+"""
 
 from __future__ import annotations
 
