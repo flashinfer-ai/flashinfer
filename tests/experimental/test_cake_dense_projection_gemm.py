@@ -623,9 +623,9 @@ def _registered(arch):
 
 
 # the knob tokens ``instance_symbol`` emits after ``_ht`` (the transposed store, the epilogue, the tail policies, the
-# raster forms, the load-warp prelude and the pair prologue form)
+# raster forms, the load-warp prelude, the whole-tile tile resolve and the pair prologue form)
 _AFTER_HT = re.compile(
-    r"^(t|tma\d+|s\d+|box\d+|skx|skf|sks|stt|sb\d|bf|bg\d+|so[a-z]|pd\d+|sh\d+|c1|cg|or|lw|pro\d+)$"
+    r"^(t|tma\d+|s\d+|box\d+|skx|skf|sks|stt|sb\d|bf|bg\d+|so[a-z]|pd\d+|sh\d+|c1|cg|or|lw|mg|pro\d+)$"
 )
 
 
@@ -1460,7 +1460,7 @@ def test_round15_pd_sh_knobs():
     # family (1 = in-tile chunk pipelining, 2 = cross-tile prefetch, 3 = both chunks in flight; ``_pd<n>``) and the
     # suspend-time hint of the free-running waits in ns (``_sh<n>``); both 0 when off, validated like the Cake kernel
     key = instance_key(a_mn=False, b_mn=True, epi="tma", slots=2, pd=2)
-    assert len(key) == 34 and key[23] == 2 and key[24] == 0
+    assert len(key) == 35 and key[23] == 2 and key[24] == 0
     assert instance_symbol(key) == "dense_proj_gemm_kn_n256_tma2_pd2"
     assert (
         instance_key(a_mn=False, b_mn=True)[23:]
@@ -1476,8 +1476,9 @@ def test_round15_pd_sh_knobs():
             0,
             False,
             False,
+            False,
         )
-    )  # ... followed by the round-18 sk_sync flag, the round-19 sk_slab / cta1 fields, the round-21 cgrp flag, the round-24 ovr flag, the round-27 stt flag, the round-33 pro knob (0 = off) and the round-2 shapes tranche's sk_first / lw flags
+    )  # ... followed by the round-18 sk_sync flag, the round-19 sk_slab / cta1 fields, the round-21 cgrp flag, the round-24 ovr flag, the round-27 stt flag, the round-33 pro knob (0 = off), the round-2 shapes tranche's sk_first / lw flags and the whole-tile tile resolve flag mg
     assert (
         instance_symbol(
             instance_key(a_mn=False, b_mn=True, epi="tma", slots=2, pd=2, sh=1000)
@@ -3001,11 +3002,12 @@ def test_round33_rules_plan_like_the_cake_launcher(T):
     # 18 existing rules re-valued with pro 15 (24 rules at pro 15 with the six inserted), the sm_100a shared_down input gradient bf16 pinned to pro 0 and the sm_107a kv_a weight
     # gradient fp32-out moved to the cheaper slab path of its synchronised stream-K fixup (sk_slab 2); no key removed
     # round 33 left 109 keys (51 sm_100a, 58 sm_107a; six inserted, none removed); the shapes tranche adds 79 sm_100a and
-    # 86 sm_103a keys and re-values seven round-33 sm_100a keys (MEASURED_SHAPE_ROWS)
-    assert len(ROW_RULES) == 109 + 79 + 86
+    # 86 sm_103a keys and re-values seven round-33 sm_100a keys (MEASURED_SHAPE_ROWS); the whole-tile tile resolve
+    # adds one sm_103a key (the kv_a input gradient, test_mg_rules_plan_the_whole_tile_programs)
+    assert len(ROW_RULES) == 109 + 79 + 86 + 1
     assert sum(k[0] == "sm_100a" for k in ROW_RULES) == 51 + 79
     assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 58
-    assert sum(k[0] == "sm_103a" for k in ROW_RULES) == 86
+    assert sum(k[0] == "sm_103a" for k in ROW_RULES) == 86 + 1
     assert ARCH_RULE_DEFAULTS == {
         "sm_107a": {"pro": 7},
         "sm_100a": {"pro": 7},
@@ -3816,7 +3818,7 @@ def test_instance_key_rejects_bad_configurations():
     # arguments in round 11): pf, hints, f32_v8, quad_store, park, ovl, htail, b_swz, sk_exact, batch_group, store_ef,
     # store_hint, pd, sh, sk_sync (26 fields since round 18), sk_slab, cta1 (28 fields since round 19), cgrp (29 fields
     # since round 21), ovr (30 fields since round 24)
-    assert len(key) == 34 and key[11:] == (
+    assert len(key) == 35 and key[11:] == (
         0,
         ("none", "none"),
         False,
@@ -3840,6 +3842,7 @@ def test_instance_key_rejects_bad_configurations():
         0,  # pro (32 fields since round 33)
         False,  # sk_first (33 fields: the round-2 shapes tranche)
         False,  # lw (34 fields: the round-2 shapes tranche)
+        False,  # mg (35 fields: the whole-tile tile resolve)
     )
     # the promotion is validated where it is resolved, by the planner
     v = _views("proj", "o_proj", "fwd", "bf16", 257)
@@ -6450,8 +6453,8 @@ MEASURED_SHAPE_ROWS = (
     (('sm_103a', False, True, False, False, False, 4096, 64, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_lw_pro15'),
     (('sm_103a', False, True, False, False, False, 4096, 128, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_lw_pro15'),
     (('sm_103a', False, True, False, False, False, 4096, 128, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_lw_pro15'),
-    (('sm_103a', False, True, False, False, False, 4096, 512, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_lw_pro15'),
-    (('sm_103a', False, True, False, False, False, 4096, 512, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_lw_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 512, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_lw_mg_pro15'),
+    (('sm_103a', False, True, False, False, False, 4096, 512, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_lw_mg_pro15'),
     (('sm_103a', False, True, False, False, False, 4096, 1024, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
     (('sm_103a', False, True, False, False, False, 4096, 1024, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
     (('sm_103a', False, True, False, False, False, 4096, 4096, None), 16231, 152, 'dense_proj_gemm_kn_n256_ht_cg_pro15'),
@@ -6466,8 +6469,8 @@ MEASURED_SHAPE_ROWS = (
     (('sm_103a', False, True, False, False, False, 5120, 64, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd3_c1'),
     (('sm_103a', False, True, False, False, False, 5120, 128, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_lw_pro15'),
     (('sm_103a', False, True, False, False, False, 5120, 128, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma2_pd2_lw_pro15'),
-    (('sm_103a', False, True, False, False, False, 5120, 512, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
-    (('sm_103a', False, True, False, False, False, 5120, 512, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
+    (('sm_103a', False, True, False, False, False, 5120, 512, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_mg_pro15'),
+    (('sm_103a', False, True, False, False, False, 5120, 512, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_mg_pro15'),
     (('sm_103a', False, True, False, False, False, 5120, 1024, None), 16231, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
     (('sm_103a', False, True, False, False, False, 5120, 1024, None), 16384, 152, 'dense_proj_gemm_kn_n256_tma1_pd2_pro15'),
     (('sm_103a', False, True, False, False, False, 5120, 5120, None), 16231, 152, 'dense_proj_gemm_kn_n256_cg_pro15'),
@@ -6855,7 +6858,7 @@ def test_round2_knobs_name_their_programs():
     key = cake_backend.instance_key(
         **nn, cta_rows=256, sk_exact=True, sk_first=True, pro=7
     )
-    assert len(key) == 34 and key[32] is True and key[33] is False
+    assert len(key) == 35 and key[32] is True and key[33] is False and key[34] is False
     assert (
         cake_backend.instance_symbol(key) == "dense_proj_gemm_nn_n256_m256_skx_skf_pro7"
     )
@@ -7088,13 +7091,13 @@ def test_round2_rules_plan_their_knobs():
     v = _class_views("kn", False, False, 16384, 4096, 512)
     plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **a)
     assert (
-        plan.template == "dense_proj_gemm_kn_n256_tma1_pd2_lw_pro15"
+        plan.template == "dense_proj_gemm_kn_n256_tma1_pd2_lw_mg_pro15"
         and plan.promo == "l2_256b"
-    )
+    )  # + the whole-tile tile resolve (test_mg_rules_plan_the_whole_tile_programs)
     v = _class_views("kn", False, False, 16384, 5120, 512)
     plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **a)
     assert (
-        plan.template == "dense_proj_gemm_kn_n256_tma1_pd2_pro15"
+        plan.template == "dense_proj_gemm_kn_n256_tma1_pd2_mg_pro15"
         and plan.promo == "l2_256b"
         and plan.group_m == 8
     )
@@ -7125,6 +7128,167 @@ def test_round2_rules_plan_their_knobs():
         and plan.cgrp
     )
     assert not wgrad_swapped(1024, 4096, arch="sm_100a", out_f32=False)
+
+
+@pytest.mark.parametrize("T", [16172, 16231, 16384])
+def test_mg_rules_plan_the_whole_tile_programs(T):
+    """The whole-tile tile resolve (``mg``, instance-key field 35, ``_mg`` directly after ``_lw``): the three sm_103a
+    input-gradient rules that carry it (4096 -> 512 with the load-warp form, 5120 -> 512, the kv_a 6144 -> 576) plan
+    the ``_mg`` twin of the row's program and nothing else changes (every other plan field equals the plan with ``mg``
+    forced off); the rows measured flat (4096 -> 1024, 5120 -> 1024), the fp32 twins and sm_100a keep their programs.
+    A rule's ``mg`` yields where the plan carries stream-K units or a caller forces a form the program excludes; a
+    caller-forced ``mg`` is refused there (``instance_key`` for the forms, the planner for the stream-K units)."""
+    kw = dict(sm_count=152, l2_bytes=L2_BYTES, _fallback=False)
+    a = dict(kw, arch="sm_103a")
+    rows = (
+        (
+            4096,
+            512,
+            "dense_proj_gemm_kn_n256_tma1_pd2_lw_mg_pro15",
+            16,
+            "l2_256b",
+            True,
+        ),
+        (5120, 512, "dense_proj_gemm_kn_n256_tma1_pd2_mg_pro15", 8, "l2_256b", False),
+        (6144, 576, "dense_proj_gemm_kn_n256_tma1_pd2_mg_pro15", 8, "none", False),
+    )
+    for K_layer, N_layer, template, group_m, promo, lw in rows:
+        key = ("sm_103a", False, True, False, False, False, K_layer, N_layer, None)
+        rule = ROW_RULES[key]
+        assert rule["mg"] is True and rule["sk"] is False, key
+        assert {k: v for k, v in rule.items() if k not in ("mg", "sk")} == {
+            k: v
+            for k, v in cake_backend._measured_row_rule(
+                "sm_100a" if (K_layer, N_layer) == (6144, 576) else "sm_103a",
+                *key[1:6],
+                K_layer,
+                N_layer,
+                T,
+            ).items()
+            if k not in ("mg", "sk")
+        }, (
+            key
+        )  # the kv_a rule restates the inherited sm_100a knobs; the others extend their own rule
+        v = _class_views("kn", False, False, T, K_layer, N_layer)
+        plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **a)
+        assert plan.template == template, (key, T, plan.template)
+        assert plan.mg and plan.lw == lw and plan.pd == 2
+        assert (plan.epi, plan.slots, plan.group_m, plan.promo, plan.pro) == (
+            "tma",
+            1,
+            group_m,
+            promo,
+            15,
+        ), key
+        assert plan.sk_units == 0 and plan.tail_tiles == 0
+        assert plan.num_full == plan.pair_tiles and plan.ws_f32_elems == 0
+        assert plan.grid == (2 * plan.pair_tiles, 1, 1) and not plan.cta1
+        # the twin without the resolve: the same plan, only the program differs
+        plain, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], mg=False, **a)
+        assert not plain.mg and plain.template == template.replace("_mg", "")
+        assert {**_plan_signature(plan), "template": None, "mg": None} == {
+            **_plan_signature(plain),
+            "template": None,
+            "mg": None,
+        }, key
+        # the symbol decoder reads the knob back (the registry fallback's inverse) and names the program again
+        knobs = cake_backend._template_knobs(template)
+        assert knobs is not None and knobs["mg"] and knobs["lw"] == lw, template
+        key_knobs = {k: v for k, v in knobs.items() if v is not None}
+        key_knobs["sk_exact"] = bool(knobs["sk_exact"])
+        assert (
+            cake_backend.instance_symbol(
+                cake_backend.instance_key(a_mn=False, b_mn=True, **key_knobs)
+            )
+            == template
+        )
+        # a caller forcing a form the program excludes: the rule's mg yields and the forced form plans
+        forced, *_ = plan_dense_projection_gemm(
+            v["A"], v["B"], v["out"], cta1=True, **a
+        )
+        assert not forced.mg and forced.template.endswith("_c1"), forced.template
+        forced, *_ = plan_dense_projection_gemm(
+            v["A"], v["B"], v["out"], cgrp=True, **a
+        )
+        assert not forced.mg and forced.cgrp and "_mg" not in forced.template
+        assert "_cg" in forced.template
+        with pytest.raises(ValueError, match=r"mg \(whole-tile"):
+            plan_dense_projection_gemm(
+                v["A"], v["B"], v["out"], cgrp=True, mg=True, **a
+            )
+    # the K 512 rows: ``sk=True`` admits no split (8 K steps = SK_MIN_ITERS: 36 units over the 36 tail tiles of the
+    # 4096 -> 512 row), so the plan stays whole tiles and the resolve stays; kv_a (9 K steps, 1536 tiles on 76 pairs):
+    # 18 units over the 16 tail tiles, so the rule's mg yields to the plain program, and forcing mg on that plan is
+    # refused
+    v = _class_views("kn", False, False, T, 4096, 512)
+    sk, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], sk=True, **a)
+    assert sk.sk_units == 0 and sk.mg
+    assert sk.template == "dense_proj_gemm_kn_n256_tma1_pd2_lw_mg_pro15"
+    v = _class_views("kn", False, False, T, 6144, 576)
+    sk, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], sk=True, **a)
+    assert (sk.sk_units, sk.tail_tiles, sk.iters_per_unit) == (18, 16, 8)
+    assert not sk.mg and sk.template == "dense_proj_gemm_kn_n256_tma1_pd2_pro15"
+    with pytest.raises(ValueError, match="whole-tile plan"):
+        plan_dense_projection_gemm(v["A"], v["B"], v["out"], sk=True, mg=True, **a)
+    # the rows measured flat keep their program, the fp32 twins and sm_100a never carry the resolve
+    for K_layer, N_layer in ((4096, 1024), (5120, 1024)):
+        v = _class_views("kn", False, False, T, K_layer, N_layer)
+        plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **a)
+        assert not plan.mg, (K_layer, N_layer)
+        assert plan.template == "dense_proj_gemm_kn_n256_tma1_pd2_pro15", (
+            K_layer,
+            N_layer,
+        )
+        assert (
+            "mg"
+            not in ROW_RULES[
+                ("sm_103a", False, True, False, False, False, K_layer, N_layer, None)
+            ]
+        )
+    for K_layer, N_layer, _t, _g, _p, _lw in rows:
+        f = _class_views("kn", True, False, T, K_layer, N_layer)
+        plan, *_ = plan_dense_projection_gemm(f["A"], f["B"], f["out"], **a)
+        assert not plan.mg and "_mg" not in plan.template, (K_layer, N_layer, "f32")
+        v = _class_views("kn", False, False, T, K_layer, N_layer)
+        plan, *_ = plan_dense_projection_gemm(
+            v["A"], v["B"], v["out"], **dict(kw, arch="sm_100a")
+        )
+        assert not plan.mg and "_mg" not in plan.template, (K_layer, N_layer, "sm_100a")
+    for key in ROW_RULES:
+        assert key[0] == "sm_103a" or "mg" not in ROW_RULES[key], key
+    # the key: field 35, the symbol token after ``_lw``; the forms the program excludes are refused with it
+    kn = dict(a_mn=False, b_mn=True, epi="tma", slots=1, pd=2, pro=15)
+    key = cake_backend.instance_key(**kn, mg=True)
+    assert len(key) == 35 and key[34] is True and key[33] is False
+    assert (
+        cake_backend.instance_symbol(key) == "dense_proj_gemm_kn_n256_tma1_pd2_mg_pro15"
+    )
+    assert (
+        cake_backend.instance_symbol(cake_backend.instance_key(**kn, lw=True, mg=True))
+        == "dense_proj_gemm_kn_n256_tma1_pd2_lw_mg_pro15"
+    )
+    assert cake_backend.instance_key(**kn)[34] is False
+    plain = dict(a_mn=False, b_mn=True, pro=15)
+    for bad in (
+        dict(batch_group=4),
+        dict(cgrp=True),
+        dict(sk_exact=True),
+        dict(sk_sync=True),
+        dict(sk_sync=True, sk_slab=1),
+    ):
+        with pytest.raises(ValueError, match=r"mg \(whole-tile"):
+            cake_backend.instance_key(**plain, mg=True, **bad)
+    for bad in (dict(htail=True), dict(sk_exact=True, sk_first=True), dict(stt=True)):
+        with pytest.raises(ValueError):
+            cake_backend.instance_key(**plain, mg=True, **bad)
+    # the single-CTA form admits the knob in the key (the planner keeps the measured pair programs' rules off it)
+    assert (
+        cake_backend.instance_symbol(
+            cake_backend.instance_key(a_mn=False, b_mn=True, cta1=True, mg=True)
+        )
+        == "dense_proj_gemm_kn_n256_c1_mg"
+    )
+    assert "mg" not in cake_backend._CTA1_CLEARED
 
 
 def _n224_rule_rows():
