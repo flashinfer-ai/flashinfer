@@ -4795,17 +4795,32 @@ def test_source_program_table_names_shipped_sources():
     assert set(module._CHUNKPAR3_MODULES) == {
         name for name in module._PROGRAMS if name.startswith("chunkpar3_")
     }
-    # The sm_107a (Rubin) module table: every exported program except the
-    # retained start ``exact_*`` programs, each entry the fold module's stem
-    # under its own identity (the export's content hash, or the pending token
-    # before the export fills it); an ``exactmeta_*`` entry equals its
-    # ``exactfused_*`` varlen twin, and the ``exactone_*`` entry of the suffix
-    # is a source of its own (the one-launch render beside the SM100-form
-    # render), as on SM103.
+    # The sm_107a (Rubin) module table: the programs whose Rubin render was
+    # regenerated with its own geometry -- the fused and one-launch varlen
+    # scans, the look-back chunk-parallel program and the two-kernel varlen
+    # ring program -- each entry the fold module's stem under its own
+    # identity (the export's content hash).  Every other program builds its
+    # fold module on sm_107a too: the retained start ``exact_*`` programs,
+    # the SM100-only ``exactmeta_*`` programs and the programs whose Rubin
+    # render differed from the fold only by the descriptor mask (an
+    # ``__CUDA_ARCH__`` branch of the fold source).  The ``exactone_*`` entry
+    # of a suffix is a source of its own (the one-launch render beside the
+    # SM100-form render), as on SM103.
     assert set(module._SM107_MODULES) == {
-        name for name in module._PROGRAMS if not name.startswith("exact_")
+        f"{family}_{state}_{mode}{variant}"
+        for family, mode, variants in (
+            ("exactfused", "varlen", ("", "_noring")),
+            ("exactone", "varlen", ("", "_noring")),
+            ("exactpre", "varlen", ("",)),
+            ("chunkpar", "batched", ("",)),
+            ("chunkpar", "varlen", ("",)),
+        )
+        for variant in variants
+        for state in ("bf16", "f16", "f32")
+        if (variant, state) != ("_noring", "f32")
     }
-    assert len(module._SM107_MODULES) == 45
+    assert len(module._SM107_MODULES) == 19
+    assert set(module._SM107_MODULES) <= set(module._PROGRAMS)
     for name, own in module._SM107_MODULES.items():
         if name.startswith("exactone_"):
             twin = module._SM107_MODULES[name.replace("exactone_", "exactfused_", 1)]
@@ -4816,24 +4831,13 @@ def test_source_program_table_names_shipped_sources():
             for identity in module._SM107_MODULES.values()
             if module._PENDING_EXPORT not in identity
         }
-    ) == len(module._SM107_MODULES) - sum(
-        1 for name in module._SM107_MODULES if name.startswith("exactmeta_")
-    )
+    ) == len(module._SM107_MODULES)
     for name, identity in module._SM107_MODULES.items():
         stem, suffix = identity.rsplit("_", 1)
         assert stem == module._PROGRAMS[name].main.module.rsplit("_", 1)[0], name
         assert suffix == module._PENDING_EXPORT or re.fullmatch(r"[0-9a-f]+", suffix), (
             name
         )
-    assert {
-        name.replace("exactfused_", "exactmeta_", 1): shared
-        for name, shared in module._SM107_MODULES.items()
-        if name.startswith("exactfused_") and "_varlen" in name
-    } == {
-        name: shared
-        for name, shared in module._SM107_MODULES.items()
-        if name.startswith("exactmeta_")
-    }
     pending = sorted(
         name
         for name, program in module._PROGRAMS.items()
@@ -5012,15 +5016,13 @@ def test_source_program_table_names_shipped_sources():
     # main sources (six ring + five ``_noring``), eleven fused ``exactfused``
     # main sources (the five varlen ones also serving ``exactmeta``), five
     # one-launch ``exactone`` main sources (the SM103 render of the fused
-    # varlen entries; on sm_107a that render serves ``exactfused`` and
-    # ``exactmeta`` too), twelve
-    # two-kernel ``exactpre`` main sources (six ring, six ``_tail``), six
-    # look-back (``chunkpar``) and six three-phase (``chunkpar3``)
-    # chunk-parallel main sources plus the segment preprocess and the
-    # packed-varlen metadata kernel; plus one sm_107a (Rubin) render per
-    # filled ``_SM107_MODULES`` identity (an ``exactmeta`` entry shares its
-    # ``exactfused`` varlen twin's file; the nine retired programs have no
-    # sm_107a entry either), no other architecture copies and no orphans.
+    # varlen entries), twelve two-kernel ``exactpre`` main sources (six ring,
+    # six ``_tail``), six look-back (``chunkpar``) and six three-phase
+    # (``chunkpar3``) chunk-parallel main sources plus the segment preprocess
+    # and the packed-varlen metadata kernel; plus one sm_107a (Rubin) render
+    # per ``_SM107_MODULES`` identity (a program without an entry builds its
+    # fold source on sm_107a, whose descriptor mask is an ``__CUDA_ARCH__``
+    # branch), no other architecture copies and no orphans.
     rubin_sources = {
         identity
         for identity in module._SM107_MODULES.values()
@@ -5830,8 +5832,10 @@ def test_source_sm107_lookup_shadows_the_fold_main_module():
     ``_SM107_MODULES`` builds the table module -- the same kernel symbol,
     thread count and build flags behind the shared preprocess, host template
     and SMEM literal -- and every other program (the retained start
-    ``exact_*`` programs) its fold module; sm_100a and sm_103a always build
-    the fold module.  ``_TARGET_ARCHS`` names the three capabilities, the
+    ``exact_*`` programs, the SM100-only ``exactmeta_*`` programs and the
+    programs whose fold source selects the Rubin descriptor mask by
+    ``__CUDA_ARCH__``) its fold module; sm_100a and sm_103a always build the
+    fold module.  ``_TARGET_ARCHS`` names the three capabilities, the
     seq_idx triple form deriving its table routes SM107 like SM103 (the
     one-launch ``exactone`` render), the look-back program
     balances against Rubin's 212 SMs capped at the device's SM count and the
@@ -5869,8 +5873,9 @@ def test_source_sm107_lookup_shadows_the_fold_main_module():
             assert module._main_module(name, arch) == program.main.module
             assert module._arch_program(name, arch) is program
         rubin = module._arch_program(name, "sm_107a")
-        if name.startswith("exact_"):
+        if name.startswith(("exact_", "exactmeta_")):
             assert name not in module._SM107_MODULES
+        if name not in module._SM107_MODULES:
             assert module._main_module(name, "sm_107a") == program.main.module
             assert rubin is program
             continue

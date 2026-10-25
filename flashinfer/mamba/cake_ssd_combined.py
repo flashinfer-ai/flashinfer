@@ -39,8 +39,9 @@ _DSTATE = 128
 
 _TARGET_ARCHS = {(10, 0): "sm_100a", (10, 3): "sm_103a", (10, 7): "sm_107a"}
 _ARCH_CAPABILITIES = {arch: capability for capability, arch in _TARGET_ARCHS.items()}
-# The Rubin target (capability (10, 7)): its main kernels are separate device
-# modules (``_SM107_MODULES``, looked up by :func:`_main_module`) and its
+# The Rubin target (capability (10, 7)): the main kernels regenerated with a
+# Rubin geometry are separate device modules (``_SM107_MODULES``, looked up
+# by :func:`_main_module`; every other program builds its fold module) and its
 # routing is SM103's (``_ONE_LAUNCH_CAPABILITIES``: the seq_idx triple form
 # without a caller table runs the one-launch ``exactone_*`` render, which
 # derives the sequence table in-kernel; the fused varlen calls with one run
@@ -269,59 +270,37 @@ _EXACTONE_MODULES = {
     "exactone_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_1100526c71",
     "exactone_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_948223063c",
 }
-# sm_107a (Rubin) device modules of the exported programs, filled by the Cake
-# export: the tcgen05 SMEM descriptor address field is 15 bits on sm_107a
-# (mask 0x7FFF), so every main program's device text differs from the
-# Blackwell fold; the loader builds these modules for capability (10, 7)
-# (:func:`_main_module`).  Programs absent here -- the retained start
-# ``exact_*`` programs -- build their fold module; the preprocess and
+# sm_107a (Rubin) device modules of the programs whose Rubin render was
+# regenerated with its own geometry (the fused and one-launch varlen scans,
+# the look-back chunk-parallel program and the two-kernel varlen ring
+# program), filled by the Cake export; the loader builds these modules for
+# capability (10, 7) (:func:`_main_module`).  Every other program builds its
+# fold module on every architecture: the retained start ``exact_*``
+# programs, the ``exactmeta_*`` programs (SM100 only,
+# ``_LIGHT_STAGE_CAPABILITIES``) and the programs whose Rubin render differed
+# from the fold only by the tcgen05 SMEM descriptor address mask (15 bits on
+# sm_107a, ``0x7FFF``; 14 bits, ``0x3FFF``, on sm_100a and sm_103a), which
+# the fold source now selects by ``__CUDA_ARCH__``.  The preprocess and
 # metadata kernels are shared.  A fused varlen suffix has two sm_107a
 # sources, as SM103 has two texts: the ``exactfused_*`` varlen entry names
 # the render of the SM100 form (the caller-table and cu_seqlens forms) and
 # the ``exactone_*`` entry the one-launch render, which derives the sequence
-# table in-kernel; an ``exactmeta_*`` entry always equals its ``exactfused_*``
-# varlen twin.
+# table in-kernel.
 _SM107_MODULES = {
-    "exactfused_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_100dc8e269",
     "exactfused_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_09cfaa7d95",
-    "exactfused_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_25d35c0e5e",
     "exactfused_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_963449dd82",
-    "exactfused_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_07dd4b7294",
     "exactfused_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_4055fb7a96",
-    "exactfused_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_noring_8ba4668b69",
     "exactfused_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_ded2a71f22",
-    "exactfused_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_noring_afda1f5e56",
     "exactfused_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_ebe1153e72",
-    "exactfused_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_6fc0aa6820",
     "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_v3_bf16_batched_d8bcac8052",
     "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_v3_bf16_varlen_1ac41d4988",
     "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_v3_f16_batched_3e4982bea4",
     "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_v3_f16_varlen_043d7b5645",
     "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_v3_f32_batched_1f694d38d5",
     "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_v3_f32_varlen_e925221730",
-    "exactpre_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_3b705e14ef",
     "exactpre_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_cfc501cc89",
-    "exactpre_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_b42c33f5c7",
     "exactpre_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_655d231457",
-    "exactpre_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_fd1935e9ef",
     "exactpre_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_97f655eea0",
-    "exactpre_bf16_batched_tail": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_tail_3fd9e931b6",
-    "exactpre_bf16_varlen_tail": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tail_27bbc1baeb",
-    "exactpre_f16_batched_tail": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_tail_e999a6d69e",
-    "exactpre_f16_varlen_tail": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_tail_a4fea4e834",
-    "exactpre_f32_batched_tail": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_tail_13208c67e3",
-    "exactpre_f32_varlen_tail": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_tail_4717832a2d",
-    "chunkpar3_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_749b4edb36",
-    "chunkpar3_bf16_varlen": "mamba_ssd_chunk_parallel_bf16_varlen_5eeb718279",
-    "chunkpar3_f16_batched": "mamba_ssd_chunk_parallel_f16_batched_d12003e26c",
-    "chunkpar3_f16_varlen": "mamba_ssd_chunk_parallel_f16_varlen_61d13103d0",
-    "chunkpar3_f32_batched": "mamba_ssd_chunk_parallel_f32_batched_d6b16f8316",
-    "chunkpar3_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_a10f24bf56",
-    "exactmeta_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_09cfaa7d95",
-    "exactmeta_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_963449dd82",
-    "exactmeta_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_4055fb7a96",
-    "exactmeta_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_ded2a71f22",
-    "exactmeta_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_ebe1153e72",
     "exactone_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_5b650e6211",
     "exactone_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_e0ec22c79d",
     "exactone_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_75d76aff25",
