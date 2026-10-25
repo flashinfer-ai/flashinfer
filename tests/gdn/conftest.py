@@ -36,19 +36,28 @@ def multidist_randu(num_dists, dim, mean_mean=0.0, mean_std=1.0, lower=-1.0, upp
 
 
 def gen_qkv(
-    seq_lens, num_q_heads, num_k_heads, num_v_heads, head_size, dtype=torch.float16
+    seq_lens,
+    num_q_heads,
+    num_k_heads,
+    num_v_heads,
+    head_size,
+    dtype=torch.float16,
+    head_size_v=None,
 ):
+    """Generate q/k/v. ``head_size_v`` defaults to ``head_size`` (square state)."""
     # qkv_rng = functools.partial(multidist_randn, mean_std=0.1)
     qkv_rng = functools.partial(multidist_randu, mean_std=0.05, lower=-0.25, upper=0.25)
 
+    if head_size_v is None:
+        head_size_v = head_size
     total_seq_lens = sum(seq_lens)
     q = qkv_rng(total_seq_lens * num_q_heads, head_size)
     k = qkv_rng(total_seq_lens * num_k_heads, head_size)
-    v = qkv_rng(total_seq_lens * num_v_heads, head_size)
+    v = qkv_rng(total_seq_lens * num_v_heads, head_size_v)
 
     q = q.reshape(total_seq_lens, num_q_heads, head_size).to(dtype).contiguous()
     k = k.reshape(total_seq_lens, num_k_heads, head_size).to(dtype).contiguous()
-    v = v.reshape(total_seq_lens, num_v_heads, head_size).to(dtype).contiguous()
+    v = v.reshape(total_seq_lens, num_v_heads, head_size_v).to(dtype).contiguous()
 
     return q, k, v
 

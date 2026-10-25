@@ -71,7 +71,6 @@ def _mark_slot_dynamic(torch_t: torch.Tensor, *, assumed_align: int = 16):
 #   B=8:   TILE_V=16 (balance between parallelism and efficiency)
 #   B>=16: TILE_V=32 (fewer blocks, better efficiency for large batches)
 
-TILE_K_MTP = 128  # Full K dimension (shared across all configs)
 NUM_THREADS_MTP = 128  # 4 warps
 
 
@@ -80,6 +79,8 @@ def get_mtp_config(
     seq_len: int,
     num_v_heads: int = 64,
     v_dim: int = 128,
+    *,
+    k_dim: int = 128,
     disable_state_update: bool = False,
 ) -> tuple:
     """Unified MTP config selection based on CTA work units.
@@ -102,7 +103,7 @@ def get_mtp_config(
     *smem_v=False if state_update ON + T≤2; ilp=8 if tile_v≥64 + state_update ON + T≤2.
     """
     work_units = batch_size * num_v_heads
-    vec_size = 4  # Always 4 (full warp shuffle)
+    vec_size = get_vec_size_mtp(k_dim=k_dim)
 
     if work_units <= 64:
         tile_v, ilp_rows, use_smem_v = 8, 2, False
@@ -131,13 +132,14 @@ def get_mtp_config(
     return tile_v, vec_size, ilp_rows, use_smem_v
 
 
-def get_vec_size_mtp(batch_size: int, seq_len: int = 1) -> int:
+def get_vec_size_mtp(*, k_dim: int) -> int:
     """Select vec_size for MTP kernel.
 
-    Always use vec_size=4 (32 threads per group = full warp, 4 groups per block).
-    Full warp shuffle is more efficient and achieves >= 1.0x speedup vs Triton.
+    We select a size that guarantees full warp shuffle (32 threads per group).
+    Keyword-only: an earlier signature took (batch_size, seq_len) positionally.
     """
-    return 4
+    threads_per_group = 32
+    return k_dim // threads_per_group
 
 
 def get_tile_v_mtp(
@@ -162,7 +164,11 @@ def get_ilp_rows(
 ) -> int:
     """Select number of ILP rows for the MTP kernel. Delegates to get_mtp_config()."""
     _, _, ilp_rows, _ = get_mtp_config(
-        batch_size, seq_len, num_v_heads, v_dim, disable_state_update
+        batch_size,
+        seq_len,
+        num_v_heads,
+        v_dim,
+        disable_state_update=disable_state_update,
     )
     return ilp_rows
 
@@ -177,7 +183,11 @@ def get_use_smem_v(
 ) -> bool:
     """Decide whether to preload v values into SMEM. Delegates to get_mtp_config()."""
     _, _, _, use_smem_v = get_mtp_config(
-        batch_size, seq_len, num_v_heads, v_dim, disable_state_update
+        batch_size,
+        seq_len,
+        num_v_heads,
+        v_dim,
+        disable_state_update=disable_state_update,
     )
     return use_smem_v
 
@@ -398,7 +408,7 @@ def gdn_verify_kernel_mtp(
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
-    # Thread grouping: vec_size=4, so 32 threads/group (full warp), 4 groups/block
+    # Thread grouping: vec_size = K // 32, so 32 threads/group (full warp), 4 groups/block
     threads_per_group: cutlass.Constexpr[int] = K // vec_size  # 32
     groups_per_warp: cutlass.Constexpr[int] = 32 // threads_per_group  # 1
     num_groups: cutlass.Constexpr[int] = 4 * groups_per_warp
@@ -572,7 +582,7 @@ def gdn_verify_kernel_mtp(
                         sum_q += r_q[i] * r_q[i]
                         sum_k += r_k[i] * r_k[i]
 
-                    # Full warp reduction (threads_per_group=32, vec_size=4)
+                    # Full warp reduction (threads_per_group=32, vec_size=K // 32)
                     for offset in [16, 8, 4, 2, 1]:
                         sum_q += cute.arch.shuffle_sync_bfly(
                             sum_q, offset=offset, mask=-1, mask_and_clamp=31
@@ -591,8 +601,7 @@ def gdn_verify_kernel_mtp(
                     for i in cutlass.range_constexpr(vec_size):
                         r_q[i] = r_q[i] * scale
 
-                # Warp 0 writes to SMEM — with vec_size=8, only first 16 threads
-                # cover full K (16*8=128). Threads 16-31 write redundantly (same values).
+                # Warp 0 writes to SMEM: 32 threads x vec_size = K covers each row once.
                 for i in cutlass.range_constexpr(vec_size):
                     sQ[(i_t, k_start + i)] = r_q[i]
                     sK[(i_t, k_start + i)] = r_k[i]
@@ -1765,7 +1774,7 @@ def run_gdn_verify_kernel_mtp(
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],  # TILE_V - configurable for batch size
-    vec_size: cutlass.Constexpr[int],  # 4 for full warp, 8 for half-warp
+    vec_size: cutlass.Constexpr[int],  # K // 32: one full warp per K row
     use_initial_state: cutlass.Constexpr[bool],
     use_qk_l2norm: cutlass.Constexpr[bool],
     is_varlen: cutlass.Constexpr[bool],
@@ -1924,7 +1933,7 @@ def gdn_verify_kernel_mtp_inline(
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
-    # Thread grouping: vec_size=4, so 32 threads/group (full warp), 4 groups/block
+    # Thread grouping: vec_size = K // 32, so 32 threads/group (full warp), 4 groups/block
     threads_per_group: cutlass.Constexpr[int] = K // vec_size  # 32
     groups_per_warp: cutlass.Constexpr[int] = 32 // threads_per_group  # 1
     num_groups: cutlass.Constexpr[int] = 4 * groups_per_warp  # 4
@@ -2688,7 +2697,7 @@ def run_gdn_verify_kernel_mtp_inline(
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],  # TILE_V - configurable for batch size
-    vec_size: cutlass.Constexpr[int],  # 4 for full warp, 8 for half-warp
+    vec_size: cutlass.Constexpr[int],  # K // 32: one full warp per K row
     use_initial_state: cutlass.Constexpr[bool],
     use_qk_l2norm: cutlass.Constexpr[bool],
     is_varlen: cutlass.Constexpr[bool],
@@ -2901,7 +2910,6 @@ def run_mtp_decode(
     pool_size: int,
     cache_steps: int,
     tile_v: int,
-    vec_size: int,
     scale: float,
     use_qk_l2norm: bool,
     disable_state_update: bool,
@@ -2937,7 +2945,6 @@ def run_mtp_decode(
         pool_size: Number of states in the pool.
         cache_steps: Number of intermediate state cache slots.
         tile_v: Tile size for V dimension.
-        vec_size: Vector size for K dimension loads.
         scale: Query scaling factor.
         use_qk_l2norm: Whether to apply L2 normalization to q and k.
         disable_state_update: If True, do not write back updated state.
@@ -2960,7 +2967,9 @@ def run_mtp_decode(
         output = output_writeback.to(torch.bfloat16)
 
     # Dispatch between inline kernel and warp-specialized kernel based on CTA work units
-    tile_v, _, ilp_rows, use_smem_v = get_mtp_config(B, T, HV, V, disable_state_update)
+    tile_v, vec_size, ilp_rows, use_smem_v = get_mtp_config(
+        B, T, HV, V, k_dim=K, disable_state_update=disable_state_update
+    )
     use_inline_kernel = (B * HV) <= 128
     target = gdn_device_target(q.device)
     use_packed_fma = target.use_packed_fma

@@ -1065,6 +1065,7 @@ def _test_verify_kernel_mtp(
     cache_intermediate_states: bool = True,
     disable_state_update: bool = True,
     seed: int = 0,
+    head_size_v: int | None = None,
 ):
     """Test gated_delta_rule_mtp API (MTP version) against reference."""
     _skip_if_not_sm90_or_later()
@@ -1082,12 +1083,16 @@ def _test_verify_kernel_mtp(
     H = num_q_heads
     HV = num_v_heads
     K = head_size
-    V = head_size
+    # Rectangular state: values may be narrower than keys.
+    V = head_size if head_size_v is None else head_size_v
 
-    # Generate test inputs
+    # Generate test inputs.  q and k are L2-normalized below, so v and the
+    # initial state set the output's size.  At unit scale the output is ~3e-2
+    # RMS, ~0.2 max, and an all-zero output fails atol_o; with v * 0.1 and the
+    # state * 0.01 it was ~5e-4 RMS, and an all-zero output passed.
     q = torch.randn(B, T, H, K, dtype=torch_dtype, device="cuda") * 0.1
     k = torch.randn(B, T, num_k_heads, K, dtype=torch_dtype, device="cuda") * 0.1
-    v = torch.randn(B, T, HV, V, dtype=torch_dtype, device="cuda") * 0.1
+    v = torch.randn(B, T, HV, V, dtype=torch_dtype, device="cuda")
 
     # GDN parameters
     A_log = (
@@ -1113,9 +1118,7 @@ def _test_verify_kernel_mtp(
 
     # Initial state: [pool_size, HV, V, K] for MTP version (K-last layout)
     pool_size = B
-    initial_state = (
-        torch.randn(pool_size, HV, V, K, dtype=torch.float32, device="cuda") * 0.01
-    )
+    initial_state = torch.randn(pool_size, HV, V, K, dtype=torch.float32, device="cuda")
     initial_state_indices = torch.arange(B, dtype=torch.int32, device="cuda")
 
     # Intermediate states buffer (optional)
@@ -1235,12 +1238,17 @@ def _test_verify_kernel_mtp(
     print(f"✓ MTP kernel test passed (batch={B}, seq_len={T}, dtype={dtype})")
 
 
+@pytest.mark.parametrize("disable_state_update", [True, False])
 @pytest.mark.parametrize("cache_intermediate_states", [True, False])
 @pytest.mark.parametrize("beta", [True])
 @pytest.mark.parametrize("alpha", [True])
-@pytest.mark.parametrize("scale", [1.0])
+@pytest.mark.parametrize("scale", ["auto"])
 @pytest.mark.parametrize("seq_len", [2, 4, 8])
-@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize(
+    "head_size, head_size_v",
+    [(128, 128), (128, 64), (64, 64)],
+    ids=["dk128-dv128", "dk128-dv64", "dk64-dv64"],
+)
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
@@ -1254,12 +1262,14 @@ def test_verify_kernel_mtp(
     num_k_heads: int,
     num_v_heads: int,
     head_size: int,
+    head_size_v: int,
     batch_size: int,
     seq_len: int,
     scale: float | str,
     alpha: bool,
     beta: bool,
     cache_intermediate_states: bool,
+    disable_state_update: bool,
     seed: int = int(os.environ.get("SEED", "0")),
 ):
     scale_val = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
@@ -1275,8 +1285,35 @@ def test_verify_kernel_mtp(
         alpha,
         beta,
         cache_intermediate_states,
-        seed,
+        disable_state_update=disable_state_update,
+        seed=seed,
+        head_size_v=head_size_v,
     )
+
+
+@pytest.mark.parametrize("K, V", [(96, 128), (64, 128)])
+def test_mtp_rejects_unsupported_head_sizes(K, V):
+    """An unsupported pair raises NotImplementedError, not an assert."""
+    _skip_if_not_sm90_or_later()
+    B, T, H, HV = 1, 2, 1, 1
+    device = torch.device("cuda")
+    q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    v = torch.randn(B, T, HV, V, dtype=torch.bfloat16, device=device)
+    state = torch.zeros(B, HV, V, K, dtype=torch.float32, device=device)
+    gate = torch.zeros(B, T, HV, device=device)
+    with pytest.raises(NotImplementedError, match="head_size"):
+        gated_delta_rule_mtp(
+            q,
+            q,
+            v,
+            state,
+            torch.zeros(B, dtype=torch.int32, device=device),
+            torch.zeros(HV, device=device),
+            gate,
+            torch.zeros(HV, device=device),
+            gate,
+            disable_state_update=True,
+        )
 
 
 @pytest.mark.parametrize(

@@ -126,6 +126,7 @@ from ..delta_rule_dsl.varlen_helper import (
     varlen_chunk_valid_len,
 )
 from ..delta_rule_dsl.custom_compile_cache import KeyedCompileMixin
+from .gated_delta_net_chunked import state_gmem_tile, state_tmem_copy
 
 
 # ---------------------------------------------------------------------------
@@ -147,8 +148,11 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         io_dtype   : input/output dtype (Float16)
         acc_dtype  : accumulator dtype  (Float32)
         b_t        : fixed chunk size / block tile (64)
-        DK         : key/query hidden dim     (128)
-        DV         : value hidden dim         (128)
+        DK         : key/query hidden dim     (64 or 128)
+        DV         : value hidden dim         (64 or 128, DV <= DK)
+
+    DK and DV are carried by the MMA tilers: ``DK = mma_tiler_qk[2]`` and
+    ``DV = mma_tiler_qkv[0]`` (the M/lane extent of every value-shaped result).
     """
 
     # TMA descriptor size in bytes
@@ -326,8 +330,9 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         self.tmem_cg1_shared_acc_stages = 1
 
         self.tmem_state_offset = 0
+        # The (M=DV, N=DK) state reserves DK columns; DV only sets lanes.
         self.tmem_q_state_offset = (
-            self.tmem_state_offset + self.tmem_kv_acc_stages * 128
+            self.tmem_state_offset + self.tmem_kv_acc_stages * self.mma_tiler_kv[1]
         )
         self.tmem_state_inp_offset = (
             self.tmem_q_state_offset + self.tmem_q_state_acc_stages * 64
@@ -365,21 +370,28 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
             raise testing.CantImplementError(
                 f"acc_dtype={acc_dtype} not supported; only Float32 is supported"
             )
-        if mma_tiler_qk != (64, 64, 128):
+        DK = mma_tiler_qk[2]
+        DV = mma_tiler_qkv[0]
+        if DK not in (64, 128) or DV not in (64, 128) or DV > DK:
             raise testing.CantImplementError(
-                f"mma_tiler_qk={mma_tiler_qk} not supported; only (64, 64, 128) is supported"
+                f"(head_size_k, head_size_v)={(DK, DV)} not supported; "
+                "DK and DV must be 64 or 128 with DV <= DK"
             )
-        if mma_tiler_qs != (128, 64, 128):
+        if mma_tiler_qk != (64, 64, DK):
             raise testing.CantImplementError(
-                f"mma_tiler_qs={mma_tiler_qs} not supported; only (128, 64, 128) is supported"
+                f"mma_tiler_qk={mma_tiler_qk} not supported"
             )
-        if mma_tiler_qkv != (128, 64, 64):
+        if mma_tiler_qs != (DV, 64, DK):
             raise testing.CantImplementError(
-                f"mma_tiler_qkv={mma_tiler_qkv} not supported; only (128, 64, 64) is supported"
+                f"mma_tiler_qs={mma_tiler_qs} not supported"
             )
-        if mma_tiler_kv != (128, 128, 64):
+        if mma_tiler_qkv != (DV, 64, 64):
             raise testing.CantImplementError(
-                f"mma_tiler_kv={mma_tiler_kv} not supported; only (128, 128, 64) is supported"
+                f"mma_tiler_qkv={mma_tiler_qkv} not supported"
+            )
+        if mma_tiler_kv != (DV, DK, 64):
+            raise testing.CantImplementError(
+                f"mma_tiler_kv={mma_tiler_kv} not supported"
             )
 
     # -----------------------------------------------------------------------
@@ -2360,13 +2372,8 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         tCtState_mn_view = utils.gemm.sm100.transform_partitioned_tensor_layout(
             tCtState
         )
-        state_r2t_atom = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
-        )
         cState = cute.make_identity_tensor((self.mma_tiler_kv[0], self.mma_tiler_kv[1]))
-        tiled_state_r2t = tcgen05.make_tmem_copy(
-            state_r2t_atom, tCtState[(None, None), 0, 0, 0]
-        )
+        tiled_state_r2t = state_tmem_copy(self.acc_dtype, False, tCtState_mn_view)
         thr_state_r2t = tiled_state_r2t.get_slice(cg1_tidx)
         tRT_tCtState = thr_state_r2t.partition_D(tCtState_mn_view)
         tRT_tCcState = thr_state_r2t.partition_S(cState)
@@ -2377,8 +2384,8 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         for sub in cutlass.range(rState.shape[2]):
             cute.copy(
                 tiled_state_r2t,
-                rState[None, 0, sub],
-                tRT_tCtState[None, 0, sub, kv_acc_handle.index],
+                rState[None, None, sub],
+                tRT_tCtState[None, None, sub, kv_acc_handle.index],
             )
         cute.arch.fence_view_async_tmem_store()
         self.init_state_store_barrier.arrive_and_wait()
@@ -2420,55 +2427,34 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         tCtState_mn_view = utils.gemm.sm100.transform_partitioned_tensor_layout(
             tCtState
         )
-        state_r2t_atom = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
-        )
         cState = cute.make_identity_tensor((self.mma_tiler_kv[0], self.mma_tiler_kv[1]))
-        tCtState_for_r2t = tCtState[(None, None), 0, 0, 0]
-        tiled_state_r2t = tcgen05.make_tmem_copy(state_r2t_atom, tCtState_for_r2t)
+        tiled_state_r2t = state_tmem_copy(self.acc_dtype, False, tCtState_mn_view)
         thr_state_r2t = tiled_state_r2t.get_slice(cg1_tidx)
         tRT_tCtState = thr_state_r2t.partition_D(tCtState_mn_view)
         tRT_tCcState = thr_state_r2t.partition_S(cState)
         tRT_tCrState = cute.make_rmem_tensor_like(tRT_tCcState, self.acc_dtype)
         tGR_tCrState = cute.make_rmem_tensor_like(tRT_tCcState, mS_init.element_type)
-        state_g2r_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyG2ROp(),
-            mS_init.element_type,
-            num_bits_per_copy=128,
-            invariant=True,
-        )
 
         if cutlass.const_expr(mS_indices is not None):
             state_idx = mS_indices[batch_idx]
         else:
             state_idx = batch_idx
-        gS_init = cute.flat_divide(
-            mS_init[None, None, head_idx, state_idx],
-            (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
-        )[None, None, 0, 0]
+        gS_init = state_gmem_tile(
+            self.mma_tiler_kv, tiled_mma_kv, mS_init[None, None, head_idx, state_idx]
+        )
         tGR_tCgState = thr_state_r2t.partition_S(gS_init)
         kv_acc_handle = kv_acc_producer.acquire_and_advance()
         for sub in cutlass.range(tGR_tCrState.shape[2]):
-            # 1. Load S_init state_dtype GMEM -> state_dtype registers
-            state_src = tGR_tCgState[None, 0, sub]
-            state_src_ptr = state_src.iterator
-            state_src_aligned = cute.make_tensor(
-                cute.make_ptr(
-                    state_src_ptr.dtype,
-                    state_src_ptr.toint(),
-                    state_src_ptr.memspace,
-                    assumed_align=16,
-                ),
-                state_src.layout,
-            )
-            cute.copy(
-                state_g2r_atom,
-                state_src_aligned,
-                tGR_tCrState[None, 0, sub],
+            # 1. Load S_init state_dtype GMEM -> state_dtype registers.  The
+            # 16x256b fragment holds column pairs, so no 128-bit vectors.
+            cute.autovec_copy(
+                tGR_tCgState[None, None, sub],
+                tGR_tCrState[None, None, sub],
+                l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
             )
             if cutlass.const_expr(self.acc_dtype != mS_init.element_type):
-                tRT_tCrState[None, 0, sub].store(
-                    tGR_tCrState[None, 0, sub].load().to(self.acc_dtype)
+                tRT_tCrState[None, None, sub].store(
+                    tGR_tCrState[None, None, sub].load().to(self.acc_dtype)
                 )
             else:
                 tRT_tCrState = tGR_tCrState
@@ -2476,8 +2462,8 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
             # 2. fp32 registers -> state TMEM; the state update accumulates on top.
             cute.copy(
                 tiled_state_r2t,
-                tRT_tCrState[None, 0, sub],
-                tRT_tCtState[None, 0, sub, kv_acc_handle.index],
+                tRT_tCrState[None, None, sub],
+                tRT_tCtState[None, None, sub, kv_acc_handle.index],
             )
         cute.arch.fence_view_async_tmem_store()
 
@@ -2535,20 +2521,12 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
             (self.mma_tiler_kv[0], self.mma_tiler_kv[1])
         )
 
-        # TMEM -> registers  (Ld32x32b)
-        atom_state_t2r = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
-        )
-        tCtState_for_t2r = tCtState[(None, None), 0, 0, 0]
-        tiled_state_t2r = tcgen05.make_tmem_copy(atom_state_t2r, tCtState_for_t2r)
+        tiled_state_t2r = state_tmem_copy(self.acc_dtype, True, tCtState_mn_view)
         thr_state_t2r = tiled_state_t2r.get_slice(cg1_tidx)
         tTR_tCtState = thr_state_t2r.partition_S(tCtState_mn_view)
         tTR_tCcState = thr_state_t2r.partition_D(tCcState)
         tTR_rState = cute.make_rmem_tensor_like(tTR_tCcState, self.acc_dtype)
-        atom_state_r2t = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
-        )
-        tiled_state_r2t = tcgen05.make_tmem_copy(atom_state_r2t, tCtState_for_t2r)
+        tiled_state_r2t = state_tmem_copy(self.acc_dtype, False, tCtState_mn_view)
         thr_state_r2t = tiled_state_r2t.get_slice(cg1_tidx)
         tRT_tCcState = thr_state_r2t.partition_S(tCcState)
         tGR_rFixedState = cute.make_rmem_tensor_like(tRT_tCcState, self.acc_dtype)
@@ -2556,10 +2534,11 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         tRC_rCheckpoint = cute.make_rmem_tensor_like(
             tTR_tCcState, self.checkpoint_dtype
         )
-        gFixedCheckpoint = cute.flat_divide(
+        gFixedCheckpoint = state_gmem_tile(
+            self.mma_tiler_kv,
+            tiled_mma_kv,
             mFixedState[None, None, head_idx, fixed_state_idx],
-            (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
-        )[None, None, 0, 0]
+        )
         tGR_tCgFixedState = thr_state_r2t.partition_S(gFixedCheckpoint)
 
         # Wait for last GEMM-7 to finish.
@@ -2568,38 +2547,39 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         for sub in cutlass.range(tTR_rState.shape[2]):
             cute.copy(
                 tiled_state_t2r,
-                tTR_tCtState[None, 0, sub, kv_acc_handle.index],
-                tTR_rState[None, 0, sub],
+                tTR_tCtState[None, None, sub, kv_acc_handle.index],
+                tTR_rState[None, None, sub],
             )
             if cutlass.const_expr(self.acc_dtype != self.state_dtype):
-                tRG_rState[None, 0, sub].store(
-                    tTR_rState[None, 0, sub].load().to(self.state_dtype)
+                tRG_rState[None, None, sub].store(
+                    tTR_rState[None, None, sub].load().to(self.state_dtype)
                 )
             else:
                 tRG_rState = tTR_rState
             if cutlass.const_expr(self.enable_checkpoints):
                 if checkpoint_token % checkpoint_every_n_tokens == 0:
                     cute.autovec_copy(
-                        tGR_tCgFixedState[None, 0, sub],
-                        tGR_rFixedState[None, 0, sub],
+                        tGR_tCgFixedState[None, None, sub],
+                        tGR_rFixedState[None, None, sub],
                         l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
                     )
-                    gS_checkpoints = cute.flat_divide(
+                    gS_checkpoints = state_gmem_tile(
+                        self.mma_tiler_kv,
+                        tiled_mma_kv,
                         mS_checkpoints[None, None, head_idx, checkpoint_offset],
-                        (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
-                    )[None, None, 0, 0]
+                    )
                     tSgCheckpoints = thr_state_t2r.partition_D(gS_checkpoints)
                     if cutlass.const_expr(self.acc_dtype != self.checkpoint_dtype):
-                        tRC_rCheckpoint[None, 0, sub].store(
-                            tGR_rFixedState[None, 0, sub]
+                        tRC_rCheckpoint[None, None, sub].store(
+                            tGR_rFixedState[None, None, sub]
                             .load()
                             .to(self.checkpoint_dtype)
                         )
                     else:
                         tRC_rCheckpoint = tGR_rFixedState
                     cute.autovec_copy(
-                        tRC_rCheckpoint[None, 0, sub],
-                        tSgCheckpoints[None, 0, sub],
+                        tRC_rCheckpoint[None, None, sub],
+                        tSgCheckpoints[None, None, sub],
                         l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
                     )
             if cutlass.const_expr(self.store_final_state):
@@ -2608,14 +2588,15 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
                         state_idx = mS_indices[batch_idx]
                     else:
                         state_idx = batch_idx
-                    gS_out = cute.flat_divide(
+                    gS_out = state_gmem_tile(
+                        self.mma_tiler_kv,
+                        tiled_mma_kv,
                         mS_out[None, None, head_idx, state_idx],
-                        (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
-                    )[None, None, 0, 0]
+                    )
                     tRG_tCgState = thr_state_t2r.partition_D(gS_out)
                     cute.autovec_copy(
-                        tRG_rState[None, 0, sub],
-                        tRG_tCgState[None, 0, sub],
+                        tRG_rState[None, None, sub],
+                        tRG_tCgState[None, None, sub],
                         l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
                     )
         kv_acc_handle.release()
@@ -2881,15 +2862,25 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         tCcState = cute.make_identity_tensor(
             (self.mma_tiler_kv[0], self.mma_tiler_kv[1])
         )
-        atom_state_t2r = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
-        )
-        atom_state_r2t = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
-        )
-        tCtState_for_t2r = tCtState[(None, None), 0, 0, 0]
-        tiled_state_t2r = tcgen05.make_tmem_copy(atom_state_t2r, tCtState_for_t2r)
-        tiled_state_r2t = tcgen05.make_tmem_copy(atom_state_r2t, tCtState_for_t2r)
+        # The per-chunk state round trip keeps 32x32b at M = 128, as in
+        # GatedDeltaNetChunkedKernel.compute_group_1_chunk: the 16-datapath
+        # atoms of state_tmem_copy are slower there.  M = 64 needs them.
+        if cutlass.const_expr(self.mma_tiler_kv[0] == 64):
+            tiled_state_t2r = state_tmem_copy(self.acc_dtype, True, tCtState_mn_view)
+            tiled_state_r2t = state_tmem_copy(self.acc_dtype, False, tCtState_mn_view)
+        else:
+            tiled_state_t2r = tcgen05.make_tmem_copy(
+                cute.make_copy_atom(
+                    tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
+                ),
+                tCtState[(None, None), 0, 0, 0],
+            )
+            tiled_state_r2t = tcgen05.make_tmem_copy(
+                cute.make_copy_atom(
+                    tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
+                ),
+                tCtState[(None, None), 0, 0, 0],
+            )
         thr_state_t2r = tiled_state_t2r.get_slice(cg1_tidx)
         thr_state_r2t = tiled_state_r2t.get_slice(cg1_tidx)
         tTR_tCtState = thr_state_t2r.partition_S(tCtState_mn_view)
@@ -2916,9 +2907,18 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         tCcState_inp = cute.make_identity_tensor(
             (self.mma_tiler_qs[0], self.mma_tiler_qs[2])
         )
-        atom_state_inp_r2t = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)), self.io_dtype
-        )
+        # tRT_rState_inp is filled from tTR_rState element by element, so the
+        # register value layouts must match: St16x128b(Rep 8) pairs with
+        # Ld16x256b(Rep 8) at M=64, St32x32b(Rep 16) with Ld32x32b(Rep 32).
+        # Same test as tiled_state_t2r above, so the pair cannot diverge.
+        if cutlass.const_expr(self.mma_tiler_kv[0] == 64):
+            atom_state_inp_r2t = cute.make_copy_atom(
+                tcgen05.copy.St16x128bOp(tcgen05.copy.Repetition(8)), self.io_dtype
+            )
+        else:
+            atom_state_inp_r2t = cute.make_copy_atom(
+                tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)), self.io_dtype
+            )
         tCtState_inp_for_r2t = tCtState_inp_mn_view[None, None, 0]
         tiled_state_inp_r2t = tcgen05.make_tmem_copy(
             atom_state_inp_r2t, tCtState_inp_for_r2t
@@ -3096,16 +3096,16 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
             state_inp_ready_producer.advance()
             cute.copy(
                 tiled_state_t2r,
-                tTR_tCtState[None, 0, None, kv_prev_handle.index],
-                tTR_rState[None, 0, None],
+                tTR_tCtState[None, None, None, kv_prev_handle.index],
+                tTR_rState[None, None, None],
             )
-            tRT_rState_inp[None, 0, None].store(
-                tTR_rState[None, 0, None].load().to(self.io_dtype)
+            tRT_rState_inp[None, None, None].store(
+                tTR_rState[None, None, None].load().to(self.io_dtype)
             )
             cute.copy(
                 tiled_state_inp_r2t,
-                tRT_rState_inp[None, 0, None],
-                tRT_tCtState_inp[None, 0, None, state_inp_handle.index],
+                tRT_rState_inp[None, None, None],
+                tRT_tCtState_inp[None, None, None, state_inp_handle.index],
             )
             cute.arch.fence_view_async_tmem_store()
             state_inp_handle.commit()
@@ -3114,40 +3114,38 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
                 if chunk_iter > 0:
                     if checkpoint_token < seq_token_offset + seqlen_b:
                         if checkpoint_token % checkpoint_every_n_tokens == 0:
-                            gS_checkpoints = cute.flat_divide(
+                            gS_checkpoints = state_gmem_tile(
+                                self.mma_tiler_kv,
+                                tiled_mma_kv,
                                 mS_checkpoints[
                                     None,
                                     None,
                                     head_idx,
                                     checkpoint_offset,
                                 ],
-                                (
-                                    self.mma_tiler_kv[0],
-                                    self.mma_tiler_kv[1],
-                                ),
-                            )[None, None, 0, 0]
+                            )
                             tSgCheckpoints = thr_state_t2r.partition_D(gS_checkpoints)
                             if cutlass.const_expr(
                                 self.checkpoint_dtype != self.acc_dtype
                             ):
-                                tRC_rCheckpoint[None, 0, None].store(
-                                    tTR_rState[None, 0, None]
+                                tRC_rCheckpoint[None, None, None].store(
+                                    tTR_rState[None, None, None]
                                     .load()
                                     .to(self.checkpoint_dtype)
                                 )
                             else:
                                 tRC_rCheckpoint = tTR_rState
                             cute.autovec_copy(
-                                tRC_rCheckpoint[None, 0, None],
-                                tSgCheckpoints[None, 0, None],
+                                tRC_rCheckpoint[None, None, None],
+                                tSgCheckpoints[None, None, None],
                                 l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
                             )
             for k in cutlass.range(cute.size(tTR_rState), vectorize=True):
                 tTR_rState[k] = tTR_rState[k] * cumprod_total
             cute.copy(
                 tiled_state_r2t,
-                tTR_rState[None, 0, None],
-                tRT_tCtState[None, 0, None, kv_prev_handle.index],
+                tTR_rState[None, None, None],
+                tRT_tCtState[None, None, None, kv_prev_handle.index],
             )
             if cutlass.const_expr(self.enable_checkpoints):
                 if chunk_iter > 0:

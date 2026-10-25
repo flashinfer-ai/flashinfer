@@ -67,7 +67,8 @@ def _skip_if_not_supported(backend, use_cp):
         pytest.skip(f"SM100 GDN prefill requires CUDA 13+, got {torch.version.cuda}")
 
 
-def _make_inputs(seq_lens, H, D, dtype, device, seed):
+def _make_inputs(seq_lens, H, D, dtype, device, seed, DV=None):
+    DV = D if DV is None else DV
     torch.manual_seed(seed)
     total = sum(seq_lens)
     num_seqs = len(seq_lens)
@@ -90,7 +91,7 @@ def _make_inputs(seq_lens, H, D, dtype, device, seed):
         .to(dtype)
         .contiguous()
     )
-    v = torch.randn(total, H, D, dtype=dtype, device=device).contiguous()
+    v = torch.randn(total, H, DV, dtype=dtype, device=device).contiguous()
     # FlashInfer consumes linear-space alpha = exp(log_g)
     g_log = -F.softplus(
         torch.randn(total, H, dtype=torch.float32, device=device) * 0.5 - 2.0
@@ -101,7 +102,7 @@ def _make_inputs(seq_lens, H, D, dtype, device, seed):
         torch.float32 if get_compute_capability(device)[0] in (9, 12) else dtype
     )
     init_state = torch.randn(
-        num_seqs, H, D, D, dtype=state_dtype, device=device
+        num_seqs, H, DV, D, dtype=state_dtype, device=device
     ).contiguous()
     return q, k, v, g, beta, cu_seqlens, init_state
 
@@ -119,8 +120,8 @@ def _run(
     use_cp,
     backend,
 ):
-    total, H, D = q.shape
-    out = torch.empty(total, H, D, dtype=q.dtype, device=q.device)
+    total, H, _ = q.shape
+    out = torch.empty(total, H, v.shape[-1], dtype=q.dtype, device=q.device)
     output, final = chunk_gated_delta_rule(
         q,
         k,
@@ -149,18 +150,18 @@ def _make_pool(init_state, perm, n_pool, pad, dtype, device, inner_stride=1):
     pool packed with other per-slot data. ``inner_stride > 1`` additionally
     exercises a fully strided ``[H, V, K]`` view.
     """
-    _, H, D, _ = init_state.shape
+    _, H, DV, DK = init_state.shape
     if pad == 0 and inner_stride == 1:
-        pool = torch.zeros(n_pool, H, D, D, dtype=dtype, device=device)
+        pool = torch.zeros(n_pool, H, DV, DK, dtype=dtype, device=device)
     else:
-        slot_stride = H * D * D * inner_stride + pad
+        slot_stride = H * DV * DK * inner_stride + pad
         storage = torch.zeros(n_pool * slot_stride, dtype=dtype, device=device)
         pool = storage.as_strided(
-            (n_pool, H, D, D),
+            (n_pool, H, DV, DK),
             (
                 slot_stride,
-                D * D * inner_stride,
-                D * inner_stride,
+                DV * DK * inner_stride,
+                DK * inner_stride,
                 inner_stride,
             ),
         )
@@ -195,16 +196,34 @@ def test_prefill_state_indices_matches_packed(dtype, seq_lens, H, pad, backend, 
     sequence-ordered baseline bitwise (the kernel math is identical; only the
     addressed gmem row differs)."""
     _skip_if_not_supported(backend, use_cp)
+    _check_matches_packed(dtype, seq_lens, H, pad, backend, use_cp, 128, 128)
+
+
+@pytest.mark.parametrize(
+    "D, DV", [(128, 64), (64, 64)], ids=["dk128-dv64", "dk64-dv64"]
+)
+@pytest.mark.parametrize("use_cp", [False, True], ids=["non-cp", "cp"])
+@pytest.mark.parametrize("pad", [0, 96])
+def test_prefill_state_indices_rectangular_state(D, DV, use_cp, pad):
+    """state_indices addresses a [N_pool, H, DV, DK] pool at DV != DK too."""
+    _skip_if_not_supported("flashinfer", use_cp)
+    if get_compute_capability(torch.device("cuda"))[0] == 12:
+        pytest.skip("the SM12x kernels only implement DK == DV == 128")
+    _check_matches_packed(
+        torch.bfloat16, [128, 192, 64], 8, pad, "flashinfer", use_cp, D, DV
+    )
+
+
+def _check_matches_packed(dtype, seq_lens, H, pad, backend, use_cp, D, DV):
     device = torch.device("cuda")
-    D = 128
     num_seqs = len(seq_lens)
     q, k, v, g, beta, cu_seqlens, init_state = _make_inputs(
-        seq_lens, H, D, dtype, device, seed=0
+        seq_lens, H, D, dtype, device, seed=0, DV=DV
     )
 
     # (a) packed baseline, no state_indices
     state_dtype = init_state.dtype
-    out_state_a = torch.empty(num_seqs, H, D, D, dtype=state_dtype, device=device)
+    out_state_a = torch.empty(num_seqs, H, DV, D, dtype=state_dtype, device=device)
     output_a, final_a = _run(
         q,
         k,
