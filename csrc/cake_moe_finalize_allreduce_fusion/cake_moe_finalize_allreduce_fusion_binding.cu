@@ -118,11 +118,11 @@ int sm_count(int device_id) {
   return cache[device_id];
 }
 
-constexpr int kMaxCtasPerSm = 4;
+constexpr int kMaxCtasPerSm = 5;
 
 // Resident CTAs per SM for one kernel (register/shared-memory occupancy), capped at kMaxCtasPerSm.
-// Measured on B200: 4 saturates the byte paths at tokens >= 128; 6 (no longer co-resident
-// for the ws8 kernels) is slower again.  Cached per (device, kernel).
+// The persistent programs are bound by the bytes each SM keeps in flight: 5 CTAs per SM (the
+// 56-register programs) is faster than 4, and 3 is slower.  Cached per (device, kernel).
 int64_t ctas_per_sm(int device_id, const void* kernel) {
   static std::mutex mutex;
   static std::map<std::pair<int, const void*>, int64_t> cache;
@@ -138,6 +138,27 @@ int64_t ctas_per_sm(int device_id, const void* kernel) {
   const int64_t ctas = std::min<int64_t>(blocks, kMaxCtasPerSm);
   cache[{device_id, kernel}] = ctas;
   return ctas;
+}
+
+// Four-CTA clusters of one kernel that the device holds resident at once (cluster placement can
+// leave SMs unused, so this can be below ctas_per_sm * sm_count / 4).  Every cluster of a launch
+// must be resident together: a cluster waits for its peer ranks' clusters, and a cluster left for
+// a second wave would wait on a rank whose resident clusters wait on it.  Cached per device and
+// kernel.
+int64_t max_active_clusters(int device_id, const void* kernel, cudaLaunchConfig_t config) {
+  static std::mutex mutex;
+  static std::map<std::pair<int, const void*>, int64_t> cache;
+  std::lock_guard<std::mutex> guard(mutex);
+  auto it = cache.find({device_id, kernel});
+  if (it != cache.end()) return it->second;
+  config.gridDim = dim3(CAKE_MOE_FINALIZE_CLUSTER_CTAS, 1, 1);
+  int clusters = 0;
+  cudaError_t status = cudaOccupancyMaxActiveClusters(&clusters, kernel, &config);
+  TVM_FFI_CHECK(status == cudaSuccess && clusters > 0, RuntimeError)
+      << "cudaOccupancyMaxActiveClusters failed for cuda:" << device_id << ": "
+      << cudaGetErrorString(status);
+  cache[{device_id, kernel}] = clusters;
+  return clusters;
 }
 
 void check_activation(const TensorView& t, const TensorView& ref, const char* name, int64_t rows) {
@@ -259,13 +280,12 @@ void cake_moe_finalize_allreduce_fusion(
   // Persistent grid: enough four-CTA clusters to keep every SM at its resident CTA count (occupancy-derived,
   // capped at kMaxCtasPerSm), never more clusters than tokens.  One CTA per SM leaves the HBM/NVLink paths
   // 3-5x under-subscribed for tokens >= 128 (measured on B200: 1.9x at 128 tokens, 2.8x at 2048 with four).
-  // The occupancy is the selected program's own.
-  const int64_t clusters =
+  // The occupancy is the selected program's own.  The launch further caps the cluster count at
+  // the device's active-cluster capacity for the program (max_active_clusters).
+  const int64_t wanted_clusters =
       std::min<int64_t>(ctas_per_sm(device.device_id, kernel) * sm_count(device.device_id),
                         tokens * CAKE_MOE_FINALIZE_CLUSTER_CTAS) /
       CAKE_MOE_FINALIZE_CLUSTER_CTAS;
-  TVM_FFI_CHECK(clusters > 0, RuntimeError)
-      << "Cake MoE finalize requires one complete four-CTA cluster";
 
   void* p_allreduce_in = allreduce_in.data_ptr();
   void* p_inverse_indices = expanded_idx_to_permuted_idx.data_ptr();
@@ -308,12 +328,16 @@ void cake_moe_finalize_allreduce_fusion(
     ++n;
   }
   cudaLaunchConfig_t config{};
-  config.gridDim = dim3(static_cast<unsigned>(clusters * CAKE_MOE_FINALIZE_CLUSTER_CTAS), 1, 1);
   config.blockDim = dim3(CAKE_MOE_FINALIZE_THREADS, 1, 1);
   config.dynamicSmemBytes = CAKE_MOE_FINALIZE_DYNAMIC_SMEM_BYTES;
   config.stream = get_stream(device);
   config.attrs = attrs;
   config.numAttrs = n;
+  const int64_t clusters = std::min<int64_t>(
+      wanted_clusters, max_active_clusters(device.device_id, kernel, config));
+  TVM_FFI_CHECK(clusters > 0, RuntimeError)
+      << "Cake MoE finalize requires one complete four-CTA cluster";
+  config.gridDim = dim3(static_cast<unsigned>(clusters * CAKE_MOE_FINALIZE_CLUSTER_CTAS), 1, 1);
   cudaError_t status = cudaLaunchKernelExC(&config, kernel, args);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
       << "Cake MoE finalize launch failed: " << cudaGetErrorString(status);
