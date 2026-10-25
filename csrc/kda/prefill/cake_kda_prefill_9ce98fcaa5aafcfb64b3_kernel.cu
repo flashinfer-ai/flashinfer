@@ -1110,6 +1110,7 @@ kernel_cake_kda_prefill_9ce98fcaa5aafcfb64b3(int* __restrict__ items, int num_he
                         }
                         int zero_rows = 32 - valid_tokens;
                         if (zero_rows > 0) {
+                            asm volatile("barrier.sync 1, 128;" ::: "memory");
                             unsigned int zero_word = 0;
                             int zero_chunks = zero_rows * 16;
                             #pragma unroll
@@ -2165,6 +2166,7 @@ kernel_cake_kda_prefill_9ce98fcaa5aafcfb64b3(int* __restrict__ items, int num_he
                         }
                         int zero_rows_1 = 32 - valid_tokens_1;
                         if (zero_rows_1 > 0) {
+                            asm volatile("barrier.sync 2, 128;" ::: "memory");
                             unsigned int zero_word_1 = 0;
                             int zero_chunks_1 = zero_rows_1 * 16;
                             #pragma unroll
