@@ -172,11 +172,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
 
     // ---- Role: load_q ----
     if (warp == 8) {
-#if __CUDA_ARCH__ == 1000
         asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
-#else
-        asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
-#endif
         { // load_q_main
             unsigned int _phase_q_empty = 1;
             if (elect_sync()) {
@@ -224,11 +220,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
         }
     // ---- Role: load_k ----
     } else if (warp == 9) {
-#if __CUDA_ARCH__ == 1000
         asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
-#else
-        asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
-#endif
         { // load_k_main
             unsigned int load_k_stage = 0;
 #if __CUDA_ARCH__ == 1000
@@ -361,11 +353,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
         }
     // ---- Role: mma ----
     } else if (warp == 10) {
-#if __CUDA_ARCH__ == 1000
         asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
-#else
-        asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
-#endif
         { // mma_main
 #if __CUDA_ARCH__ == 1000
 #else
@@ -527,21 +515,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
         }
     // ---- Role: spare ----
     } else if (warp == 11) {
-#if __CUDA_ARCH__ == 1000
         asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
-#else
-        asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
-#endif
         { // spare_main
             __syncwarp();
         }
     // ---- Role: math ----
     } else if (warp <= 7) {
-#if __CUDA_ARCH__ == 1000
         asm volatile("setmaxnreg.inc.sync.aligned.u32 232;");
-#else
-        asm volatile("setmaxnreg.inc.sync.aligned.u32 224;");
-#endif
         { // math_main
 #if __CUDA_ARCH__ == 1000
 #else
