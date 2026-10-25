@@ -17,7 +17,7 @@ limitations under the License.
 import functools
 import math
 from collections import OrderedDict
-from typing import Optional, Sequence
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
 import tvm_ffi
@@ -31,7 +31,14 @@ from ..jit.cake_minimax_h3_sm120_nvfp4_fp8pv_varlen_attention import (
     QUANTIZE_MB3,
 )
 from ..jit.cake_minimax_h3_sm120_nvfp4_varlen_attention import (
-    gen_minimax_h3_sm120_nvfp4_varlen_attention_module,
+    ATTENTION,
+    ATTENTION_NODELTA,
+    ATTENTION_WS,
+    ATTENTION_WS_NODELTA,
+    PREPROCESS,
+    QUANTIZE_KV,
+    QUANTIZE_KV_HBLK64,
+    STATS,
 )
 from ..jit.cake_program import CakeProgram
 from ..utils import register_custom_op, register_fake_op
@@ -39,12 +46,15 @@ from .cake_minimax_h3_sm120_quant_varlen_attention import (
     _BLOCK_M,
     _BLOCK_N,
     _MAX_HEADS,
+    _MAX_PLANS,
     _MAX_WORKSPACE_SETS,
     MINIMAX_H3_HEAD_DIM,
     MINIMAX_H3_NUM_HEADS,
     _ceil_div,
     _check_thd,
+    _current_stream,
     _device_index,
+    _ffi_device,
     _plan,
     _sm_count,
     _workspace,
@@ -76,10 +86,33 @@ _QUANT_SMALL_MAX_TOKENS = 1024
 _ATTN_SHORT_MAX_TOKENS = 4096
 _FP8PV_PROGRAMS = (KV_STATS, QUANTIZE, QUANTIZE_MB3, ATTENTION_BASE, ATTENTION_SHORT)
 
-
-@functools.cache
-def _get_module():
-    return gen_minimax_h3_sm120_nvfp4_varlen_attention_module().build_and_load()
+# The NVFP4 route (``pv_mode="fp4"`` and the uncompensated entry): eight generated programs, two or three
+# programmatic-dependent launches per call (``minimax_h3_sm120_nvfp4_programs``).  A plan of 2048 to 16384
+# padded tokens runs the fused pre-processing (``PREPROCESS``: statistics, a software grid barrier, then the
+# quantizer, in one cooperative launch); every other plan runs the statistics launch, which also quantizes Q
+# (``STATS``), then the K / V quantizer (``QUANTIZE_KV``; ``QUANTIZE_KV_HBLK64``, the same items in 64-block
+# head runs, above 16384 padded tokens).
+_PREPROCESS_MIN_TOKENS = 2048
+_PREPROCESS_MAX_TOKENS = 16384
+# Every CTA of the fused pre-processing must be co-resident (its grid barrier waits for all of them): the grid
+# stays within the two CTAs per SM the kernel's launch bound guarantees.
+_PREPROCESS_CTAS_PER_SM = 2
+# The attention launch takes the warp-specialised form (``ATTENTION_WS`` / ``ATTENTION_WS_NODELTA``) on parts of
+# at least 188 SMs when the mean segment (empty segments included) is at least 1536 tokens and, on the
+# compensated route, below 16384 tokens; else the base form (``ATTENTION`` / ``ATTENTION_NODELTA``).
+_WS_MIN_SMS = 188
+_WS_MIN_MEAN_SEGMENT = 1536
+_WS_MAX_MEAN_SEGMENT = 16384
+_NVFP4_PROGRAMS = (
+    PREPROCESS,
+    STATS,
+    QUANTIZE_KV,
+    QUANTIZE_KV_HBLK64,
+    ATTENTION,
+    ATTENTION_NODELTA,
+    ATTENTION_WS,
+    ATTENTION_WS_NODELTA,
+)
 
 
 def workspace_bytes_nvfp4(tokens: int, num_heads: int, num_segments: int) -> int:
@@ -579,6 +612,326 @@ def _run_fp8pv(
     return out
 
 
+# The K / V scale tiles as 16-byte rows: the attention binding's tensor-map view of them.
+_SCALE_ROW_BYTES = 16
+
+
+def _q_slots(bounds: Sequence[int]) -> int:
+    """The most 128-row Q batches of one statistics tile of the plan (at least 1): a segment of up to
+    ``_STATS_DIRECT_MAX_TOKENS`` tokens is one tile of its whole length, a longer one is split into
+    ``_BLOCK_M``-token tiles (``_plan_rows``)."""
+    slots = 1
+    for a, b in zip(bounds[:-1], bounds[1:], strict=False):
+        length = int(b) - int(a)
+        if 0 < length <= _STATS_DIRECT_MAX_TOKENS:
+            slots = max(slots, _ceil_div(length, _BLOCK_M))
+    return slots
+
+
+def minimax_h3_sm120_nvfp4_programs(
+    plan, num_sms: int, *, delta: bool = True
+) -> Tuple[CakeProgram, ...]:
+    """The programs one call launches for ``plan`` on a device of ``num_sms`` SMs, in launch order.
+
+    Pre-processing: ``(PREPROCESS,)`` (the fused statistics and quantizer, one cooperative launch) for a
+    plan of 2048 to 16384 padded tokens, else ``(STATS, QUANTIZE_KV)`` -- the statistics launch, which
+    also quantizes Q, then the K / V quantizer -- with ``QUANTIZE_KV_HBLK64`` in place of ``QUANTIZE_KV``
+    above 16384 padded tokens.  Attention: the warp-specialised form (``ATTENTION_WS``, or
+    ``ATTENTION_WS_NODELTA`` when ``delta`` is false) when ``num_sms >= 188`` and the mean segment length
+    ``tokens / segments`` (empty segments included) is at least 1536 tokens and, with ``delta``, below
+    16384 tokens; else ``ATTENTION`` / ``ATTENTION_NODELTA``."""
+    padded = int(plan.padded_tokens)
+    if _PREPROCESS_MIN_TOKENS <= padded <= _PREPROCESS_MAX_TOKENS:
+        pre: Tuple[CakeProgram, ...] = (PREPROCESS,)
+    elif padded > _PREPROCESS_MAX_TOKENS:
+        pre = (STATS, QUANTIZE_KV_HBLK64)
+    else:
+        pre = (STATS, QUANTIZE_KV)
+    tokens, segments = int(plan.total_tokens), int(plan.num_segments)
+    bound = _WS_MAX_MEAN_SEGMENT if delta else 0
+    ws = (
+        int(num_sms) >= _WS_MIN_SMS
+        and tokens >= _WS_MIN_MEAN_SEGMENT * segments
+        and (bound <= 0 or tokens < bound * segments)
+    )
+    if ws:
+        attention = ATTENTION_WS if delta else ATTENTION_WS_NODELTA
+    else:
+        attention = ATTENTION if delta else ATTENTION_NODELTA
+    return (*pre, attention)
+
+
+def minimax_h3_sm120_nvfp4_launch_grids(
+    num_sms: int,
+    *,
+    num_heads: int,
+    num_stats_tiles: Optional[int] = None,
+    q_slots: Optional[int] = None,
+    padded_tokens: Optional[int] = None,
+    num_units: Optional[int] = None,
+) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
+    """The ``(fused pre-processing, statistics, quantizer, attention)`` launch grids of the NVFP4 route
+    on a device of ``num_sms`` SMs, all grid-stride or persistent:
+
+    * fused pre-processing: ``max(1, min(max(num_stats_tiles, padded_tokens // 32) * num_heads,
+      2 * num_sms))`` -- every CTA co-resident, within the kernel's launch bound of 2 CTAs per SM;
+    * statistics: ``max(1, min((1 + q_slots) * num_stats_tiles * num_heads, 4 * num_sms))`` over the
+      K item and the ``q_slots`` Q items of every (statistics tile, head);
+    * quantizer: ``max(1, min((padded_tokens // 32) * num_heads, 8 * num_sms))`` over the
+      (32-token block, head) items;
+    * attention: one persistent CTA per SM up to the unit count, ``max(1, min(num_sms,
+      max(num_units, 1)))`` (the plan's own grid).
+
+    A component whose facts are ``None`` is ``None``."""
+    sms, heads = int(num_sms), int(num_heads)
+    if sms <= 0 or heads <= 0:
+        raise ValueError(
+            f"num_sms and num_heads must be positive, got {num_sms}, {num_heads}"
+        )
+    blocks = None if padded_tokens is None else int(padded_tokens) // _QUANT_TOKENS
+    preprocess = (
+        None
+        if num_stats_tiles is None or blocks is None
+        else max(
+            1,
+            min(
+                max(int(num_stats_tiles), blocks) * heads,
+                _PREPROCESS_CTAS_PER_SM * sms,
+            ),
+        )
+    )
+    stats = (
+        None
+        if num_stats_tiles is None or q_slots is None
+        else max(
+            1,
+            min(
+                (1 + int(q_slots)) * int(num_stats_tiles) * heads,
+                _STATS_CTAS_PER_SM * sms,
+            ),
+        )
+    )
+    quantize = (
+        None
+        if blocks is None
+        else max(1, min(blocks * heads, _QUANT_CTAS_PER_SM * sms))
+    )
+    attention = None if num_units is None else max(1, min(sms, max(int(num_units), 1)))
+    return preprocess, stats, quantize, attention
+
+
+@functools.cache
+def _nvfp4_target(index: int) -> str:
+    """The exact target (``"sm_120a"``) every NVFP4 program ships for device ``index``."""
+    capability = tuple(int(value) for value in torch.cuda.get_device_capability(index))
+    target = PREPROCESS.target_for((capability[0], capability[1]))
+    if target is None or any(
+        target not in program.targets for program in _NVFP4_PROGRAMS
+    ):
+        raise RuntimeError(
+            "minimax_h3_sm120_varlen_attention_nvfp4 requires exact compute capability 12.0 "
+            f"(SM120), got {capability[0]}.{capability[1]}"
+        )
+    return target
+
+
+_NVFP4_ENTRIES: Dict[Tuple[str, int], Any] = {}
+
+
+def _nvfp4_entry(target: str, slot: int) -> Any:
+    """The ``run`` entry of ``_NVFP4_PROGRAMS[slot]`` on ``target`` (built on first use)."""
+    entry = _NVFP4_ENTRIES.get((target, slot))
+    if entry is None:
+        entry = _NVFP4_ENTRIES[(target, slot)] = _NVFP4_PROGRAMS[slot].entry(target)
+    return entry
+
+
+def _nvfp4_buffers(plan, num_stats_tiles: int, index: int) -> Tuple[torch.Tensor, ...]:
+    """The grow-only workspace buffers a call of ``plan`` needs: the quantized operands, scales and
+    statistics of the (device, current stream) set (``_workspace``), then the per-device arrival counters
+    and grid-barrier word (``_zero_workspace``), which start zeroed and are reset by the kernels."""
+    tokens, heads, hd = plan.total_tokens, plan.num_heads, MINIMAX_H3_HEAD_DIM
+    qtiles = max(1, plan.num_tiles)
+    n_rows4 = tokens * heads * _ROW_BYTES4
+    n_sf = heads * plan.num_kblocks * _SCALE_TILE_BYTES
+    return (
+        _workspace(index, "q4", n_rows4, torch.uint8),
+        _workspace(index, "k4", n_rows4, torch.uint8),
+        _workspace(index, "q_sf", tokens * heads * _BLOCKS_PER_ROW, torch.uint8),
+        _workspace(index, "k_sf", n_sf, torch.uint8),
+        _workspace(index, "qm4", qtiles * heads * _ROW_BYTES4, torch.uint8),
+        _workspace(index, "qm_sf", qtiles * heads * _BLOCKS_PER_ROW, torch.uint8),
+        _workspace(index, "vt4", heads * hd * (plan.padded_tokens // 2), torch.uint8),
+        _workspace(index, "v_sf", n_sf, torch.uint8),
+        _workspace(index, "q_mean", qtiles * heads * hd, torch.float32),
+        _workspace(index, "mean_k", plan.num_segments * heads * hd, torch.float32),
+        _workspace(
+            index, "partials", max(1, num_stats_tiles * heads * hd), torch.float32
+        ),
+        _zero_workspace(
+            index, "counters", max(1, plan.num_segments) * heads, torch.uint32
+        ),
+        _zero_workspace(index, "barrier", 4, torch.uint32),
+    )
+
+
+class _Nvfp4Launch:
+    """One plan's launches of one route on one set of workspace buffers: ``args`` are the custom op's
+    arguments from ``tok_seg`` through ``attention_grid``, every tensor among them sliced to the plan's
+    exact size (the bindings encode their tensor maps from the shapes handed in) and already converted to
+    a tvm-ffi tensor, so a call converts nothing but Q, K, V and the output."""
+
+    __slots__ = ("args",)
+    args: Tuple[Any, ...]
+
+    def __init__(
+        self,
+        plan,
+        delta: bool,
+        buffers: Tuple[torch.Tensor, ...],
+        index: int,
+        target: str,
+    ):
+        tokens, heads, hd = plan.total_tokens, plan.num_heads, MINIMAX_H3_HEAD_DIM
+        device = torch.device("cuda", index)
+        tile_rows, num_stats_tiles, unit_rows = _plan_rows(plan, device)
+        qtiles = max(1, plan.num_tiles)
+        n_rows4 = tokens * heads * _ROW_BYTES4
+        n_q_sf = tokens * heads * _BLOCKS_PER_ROW
+        n_sf = heads * plan.num_kblocks * _SCALE_TILE_BYTES
+        n_qm4 = qtiles * heads * _ROW_BYTES4
+        n_qm_sf = qtiles * heads * _BLOCKS_PER_ROW
+        n_vt4 = heads * hd * (plan.padded_tokens // 2)
+        n_q_mean = qtiles * heads * hd
+        n_mean_k = plan.num_segments * heads * hd
+        n_partials = max(1, num_stats_tiles * heads * hd)
+        n_counters = max(1, plan.num_segments) * heads
+        sizes = (
+            n_rows4,
+            n_rows4,
+            n_q_sf,
+            n_sf,
+            n_qm4,
+            n_qm_sf,
+            n_vt4,
+            n_sf,
+            n_q_mean,
+            n_mean_k,
+            n_partials,
+            n_counters,
+            4,
+        )
+        (
+            q4,
+            k4,
+            q_sf,
+            k_sf,
+            qm4,
+            qm_sf,
+            vt4,
+            v_sf,
+            q_mean,
+            mean_k,
+            partials,
+            counters,
+            barrier,
+        ) = (buffer[:size] for buffer, size in zip(buffers, sizes, strict=True))
+        q_slots = _q_slots(plan.bounds)
+        sms = _sm_count(index)
+        programs = minimax_h3_sm120_nvfp4_programs(plan, sms, delta=delta)
+        slots = tuple(_NVFP4_PROGRAMS.index(program) for program in programs)
+        for slot in slots:
+            _nvfp4_entry(target, slot)  # build / load before the first launch of a call
+        preprocess_grid, stats_grid, quantize_grid, attention_grid = (
+            minimax_h3_sm120_nvfp4_launch_grids(
+                sms,
+                num_heads=heads,
+                num_stats_tiles=num_stats_tiles,
+                q_slots=q_slots,
+                padded_tokens=plan.padded_tokens,
+                num_units=plan.num_units,
+            )
+        )
+        fused = programs[0] is PREPROCESS
+        u32 = torch.uint32
+        tensors = (
+            _token_segment_ids(plan.bounds, plan.padded_tokens, device),
+            plan.cu_seqlens,
+            plan.seg_tile_begin,
+            tile_rows,
+            unit_rows,
+            q4.view(u32),
+            k4.view(u32),
+            q_sf,
+            k_sf,
+            qm4.view(u32),
+            qm_sf,
+            vt4.view(u32),
+            v_sf,
+            q_mean,
+            mean_k,
+            partials,
+            counters,
+            barrier,
+            q4.view(tokens, heads, _ROW_BYTES4),
+            k4.view(tokens, heads, _ROW_BYTES4),
+            k_sf.view(-1, _SCALE_ROW_BYTES),
+            vt4.view(heads, hd, plan.padded_tokens // 2),
+            v_sf.view(-1, _SCALE_ROW_BYTES),
+            q_sf.view(u32),
+            qm_sf.view(u32),
+        )
+        self.args = (
+            *(tvm_ffi.from_dlpack(t) for t in tensors),
+            num_stats_tiles,
+            q_slots,
+            plan.padded_tokens,
+            plan.num_kblocks,
+            plan.num_units,
+            slots[0],
+            -1 if fused else slots[1],
+            slots[-1],
+            preprocess_grid if fused else stats_grid,
+            quantize_grid,
+            attention_grid,
+        )
+
+
+# Per (device, stream): the workspace buffers the cached launches slice and the launches per (plan, route).
+# A grown buffer (of this route or of ``pv_mode="fp8"``, which shares the names) drops every launch of the
+# set; the most recent ``_MAX_WORKSPACE_SETS`` sets and ``_MAX_PLANS`` launches per set are kept.
+_NVFP4_LAUNCHES: "OrderedDict[Tuple[int, int], Tuple[Tuple[torch.Tensor, ...], OrderedDict]]" = OrderedDict()
+
+
+def _nvfp4_launch(
+    plan, delta: bool, index: int, stream: int, target: str
+) -> _Nvfp4Launch:
+    _, num_stats_tiles, _ = _plan_rows(plan, torch.device("cuda", index))
+    buffers = _nvfp4_buffers(plan, num_stats_tiles, index)
+    key = (index, stream)
+    cached = _NVFP4_LAUNCHES.get(key)
+    if cached is None or any(
+        a is not b for a, b in zip(cached[0], buffers, strict=True)
+    ):
+        _NVFP4_LAUNCHES.pop(key, None)
+        while len(_NVFP4_LAUNCHES) >= _MAX_WORKSPACE_SETS:
+            _NVFP4_LAUNCHES.popitem(last=False)
+        cached = _NVFP4_LAUNCHES[key] = (buffers, OrderedDict())
+    elif next(reversed(_NVFP4_LAUNCHES)) != key:
+        _NVFP4_LAUNCHES.move_to_end(key)
+    launches = cached[1]
+    launch_key = (plan.key, delta)
+    launch = launches.get(launch_key)
+    if launch is None:
+        launch = _Nvfp4Launch(plan, delta, buffers, index, target)
+        while len(launches) >= _MAX_PLANS:
+            launches.popitem(last=False)
+        launches[launch_key] = launch
+    return launch
+
+
+# One custom op serves both routes: the attention program slot it is handed selects the compensated or the
+# uncompensated attention.
 @register_custom_op(
     "flashinfer::minimax_h3_sm120_varlen_attention_nvfp4",
     mutates_args=(
@@ -602,62 +955,152 @@ def _minimax_h3_sm120_varlen_attention_nvfp4_impl(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    tok_seg: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    seg_tile_begin: torch.Tensor,
     out: torch.Tensor,
-    tile_table: torch.Tensor,
-    unit_table: torch.Tensor,
-    q4: torch.Tensor,
-    k4: torch.Tensor,
-    q_sf: torch.Tensor,
-    k_sf: torch.Tensor,
-    qm4: torch.Tensor,
-    qm_sf: torch.Tensor,
-    vt4: torch.Tensor,
-    v_sf: torch.Tensor,
-    q_mean: torch.Tensor,
-    mean_k: torch.Tensor,
-    partials: torch.Tensor,
-    counters: torch.Tensor,
-    barrier: torch.Tensor,
-    num_segments: int,
-    num_tiles: int,
-    num_qtiles: int,
+    tok_seg: Any,
+    cu_seqlens: Any,
+    seg_tile_begin: Any,
+    tile_table: Any,
+    unit_table: Any,
+    q4: Any,
+    k4: Any,
+    q_sf: Any,
+    k_sf: Any,
+    qm4: Any,
+    qm_sf: Any,
+    vt4: Any,
+    v_sf: Any,
+    q_mean: Any,
+    mean_k: Any,
+    partials: Any,
+    counters: Any,
+    barrier: Any,
+    q4_rows: Any,
+    k4_rows: Any,
+    k_sf_rows: Any,
+    vt4_rows: Any,
+    v_sf_rows: Any,
+    q_sf_words: Any,
+    qm_sf_words: Any,
+    num_stats_tiles: int,
+    q_slots: int,
+    padded_tokens: int,
+    num_kblocks: int,
     num_units: int,
+    first: int,
+    second: int,
+    attention: int,
+    first_grid: int,
+    second_grid: int,
     attention_grid: int,
-    softmax_scale: float,
+    softmax_scale_log2: float,
+    stream: int,
+    target: str,
 ) -> None:
-    _get_module().minimax_h3_sm120_varlen_attention_nvfp4(
-        q,
-        k,
-        v,
-        tok_seg,
-        cu_seqlens,
-        seg_tile_begin,
-        out,
-        tile_table,
-        unit_table,
-        q4,
-        k4,
-        q_sf,
-        k_sf,
-        qm4,
-        qm_sf,
-        vt4,
-        v_sf,
-        q_mean,
-        mean_k,
-        partials,
-        counters,
-        barrier,
-        num_segments,
-        num_tiles,
-        num_qtiles,
-        num_units,
-        attention_grid,
-        softmax_scale,
-    )
+    # Two or three programmatic-dependent launches on ``stream`` (the current torch stream): the fused
+    # pre-processing (``second < 0``), or the statistics (which also quantize Q) and the K / V quantizer;
+    # then the attention of either route.  ``first`` / ``second`` / ``attention`` index
+    # ``_NVFP4_PROGRAMS``.  The bindings take the host arguments in the kernels' signature order followed
+    # by the grid triple; the attention binding encodes its five tensor maps from the byte tensors handed
+    # in its descriptor positions (``*_rows``, views of the quantized operands and scales).
+    tokens, heads = int(q.shape[0]), int(q.shape[1])
+    with tvm_ffi.use_raw_stream(_ffi_device(q.device.index), stream):
+        if second < 0:
+            _nvfp4_entry(target, first)(
+                q,
+                k,
+                v,
+                tile_table,
+                seg_tile_begin,
+                tok_seg,
+                cu_seqlens,
+                partials,
+                counters,
+                mean_k,
+                q_mean,
+                q4,
+                k4,
+                q_sf,
+                k_sf,
+                qm4,
+                qm_sf,
+                vt4,
+                v_sf,
+                barrier,
+                num_stats_tiles,
+                tokens,
+                padded_tokens,
+                heads,
+                num_kblocks,
+                first_grid,
+                1,
+                1,
+            )
+        else:
+            _nvfp4_entry(target, first)(
+                q,
+                k,
+                tile_table,
+                seg_tile_begin,
+                partials,
+                counters,
+                mean_k,
+                q_mean,
+                q4,
+                q_sf,
+                qm4,
+                qm_sf,
+                num_stats_tiles,
+                heads,
+                q_slots,
+                first_grid,
+                1,
+                1,
+            )
+            _nvfp4_entry(target, second)(
+                q,
+                k,
+                v,
+                tok_seg,
+                cu_seqlens,
+                seg_tile_begin,
+                mean_k,
+                q_mean,
+                q4,
+                k4,
+                q_sf,
+                k_sf,
+                qm4,
+                qm_sf,
+                vt4,
+                v_sf,
+                tokens,
+                padded_tokens,
+                heads,
+                num_kblocks,
+                second_grid,
+                1,
+                1,
+            )
+        _nvfp4_entry(target, attention)(
+            q4_rows,
+            k4_rows,
+            k_sf_rows,
+            vt4_rows,
+            v_sf_rows,
+            out,
+            q_sf_words,
+            qm4,
+            qm_sf_words,
+            seg_tile_begin,
+            unit_table,
+            num_units,
+            heads,
+            num_kblocks,
+            softmax_scale_log2,
+            attention_grid,
+            1,
+            1,
+        )
 
 
 @register_fake_op("flashinfer::minimax_h3_sm120_varlen_attention_nvfp4")
@@ -665,148 +1108,75 @@ def _minimax_h3_sm120_varlen_attention_nvfp4_fake(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    tok_seg: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    seg_tile_begin: torch.Tensor,
     out: torch.Tensor,
-    tile_table: torch.Tensor,
-    unit_table: torch.Tensor,
-    q4: torch.Tensor,
-    k4: torch.Tensor,
-    q_sf: torch.Tensor,
-    k_sf: torch.Tensor,
-    qm4: torch.Tensor,
-    qm_sf: torch.Tensor,
-    vt4: torch.Tensor,
-    v_sf: torch.Tensor,
-    q_mean: torch.Tensor,
-    mean_k: torch.Tensor,
-    partials: torch.Tensor,
-    counters: torch.Tensor,
-    barrier: torch.Tensor,
-    num_segments: int,
-    num_tiles: int,
-    num_qtiles: int,
+    tok_seg: Any,
+    cu_seqlens: Any,
+    seg_tile_begin: Any,
+    tile_table: Any,
+    unit_table: Any,
+    q4: Any,
+    k4: Any,
+    q_sf: Any,
+    k_sf: Any,
+    qm4: Any,
+    qm_sf: Any,
+    vt4: Any,
+    v_sf: Any,
+    q_mean: Any,
+    mean_k: Any,
+    partials: Any,
+    counters: Any,
+    barrier: Any,
+    q4_rows: Any,
+    k4_rows: Any,
+    k_sf_rows: Any,
+    vt4_rows: Any,
+    v_sf_rows: Any,
+    q_sf_words: Any,
+    qm_sf_words: Any,
+    num_stats_tiles: int,
+    q_slots: int,
+    padded_tokens: int,
+    num_kblocks: int,
     num_units: int,
+    first: int,
+    second: int,
+    attention: int,
+    first_grid: int,
+    second_grid: int,
     attention_grid: int,
-    softmax_scale: float,
+    softmax_scale_log2: float,
+    stream: int,
+    target: str,
 ) -> None:
     pass
 
 
-@register_custom_op(
-    "flashinfer::minimax_h3_sm120_varlen_attention_nvfp4_nodelta",
-    mutates_args=(
-        "out",
-        "q4",
-        "k4",
-        "q_sf",
-        "k_sf",
-        "qm4",
-        "qm_sf",
-        "vt4",
-        "v_sf",
-        "q_mean",
-        "mean_k",
-        "partials",
-        "counters",
-        "barrier",
-    ),
-)
-def _minimax_h3_sm120_varlen_attention_nvfp4_nodelta_impl(
+def _run_nvfp4(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    tok_seg: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    seg_tile_begin: torch.Tensor,
     out: torch.Tensor,
-    tile_table: torch.Tensor,
-    unit_table: torch.Tensor,
-    q4: torch.Tensor,
-    k4: torch.Tensor,
-    q_sf: torch.Tensor,
-    k_sf: torch.Tensor,
-    qm4: torch.Tensor,
-    qm_sf: torch.Tensor,
-    vt4: torch.Tensor,
-    v_sf: torch.Tensor,
-    q_mean: torch.Tensor,
-    mean_k: torch.Tensor,
-    partials: torch.Tensor,
-    counters: torch.Tensor,
-    barrier: torch.Tensor,
-    num_segments: int,
-    num_tiles: int,
-    num_qtiles: int,
-    num_units: int,
-    attention_grid: int,
+    plan,
+    delta: bool,
     softmax_scale: float,
-) -> None:
-    _get_module().minimax_h3_sm120_varlen_attention_nvfp4_nodelta(
+) -> torch.Tensor:
+    """The NVFP4 body of both routes: the plan's cached launch on the (device, stream) workspace set,
+    then the two or three launches."""
+    index = _device_index(q.device)
+    target = _nvfp4_target(index)
+    stream = _current_stream(index)
+    _minimax_h3_sm120_varlen_attention_nvfp4_impl(
         q,
         k,
         v,
-        tok_seg,
-        cu_seqlens,
-        seg_tile_begin,
         out,
-        tile_table,
-        unit_table,
-        q4,
-        k4,
-        q_sf,
-        k_sf,
-        qm4,
-        qm_sf,
-        vt4,
-        v_sf,
-        q_mean,
-        mean_k,
-        partials,
-        counters,
-        barrier,
-        num_segments,
-        num_tiles,
-        num_qtiles,
-        num_units,
-        attention_grid,
-        softmax_scale,
+        *_nvfp4_launch(plan, delta, index, stream, target).args,
+        _softmax_scale_log2(softmax_scale),
+        stream,
+        target,
     )
-
-
-@register_fake_op("flashinfer::minimax_h3_sm120_varlen_attention_nvfp4_nodelta")
-def _minimax_h3_sm120_varlen_attention_nvfp4_nodelta_fake(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    tok_seg: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    seg_tile_begin: torch.Tensor,
-    out: torch.Tensor,
-    tile_table: torch.Tensor,
-    unit_table: torch.Tensor,
-    q4: torch.Tensor,
-    k4: torch.Tensor,
-    q_sf: torch.Tensor,
-    k_sf: torch.Tensor,
-    qm4: torch.Tensor,
-    qm_sf: torch.Tensor,
-    vt4: torch.Tensor,
-    v_sf: torch.Tensor,
-    q_mean: torch.Tensor,
-    mean_k: torch.Tensor,
-    partials: torch.Tensor,
-    counters: torch.Tensor,
-    barrier: torch.Tensor,
-    num_segments: int,
-    num_tiles: int,
-    num_qtiles: int,
-    num_units: int,
-    attention_grid: int,
-    softmax_scale: float,
-) -> None:
-    pass
+    return out
 
 
 @flashinfer_api
@@ -835,29 +1205,25 @@ def minimax_h3_sm120_varlen_attention_nvfp4(
     as E2M1 codes with one UE4M3 scale per 16 elements (block amax / 6; V transposed with per-16-key
     scales), QK^T and PV both run ``mma.sync.m16n8k64 kind::mxf4nvf4 block_scale scale_vec::4X``,
     and the probabilities use Sage3's two-level scheme (row maximum brought to 448 * 6, one UE4M3
-    scale per 16 keys, E2M1 codes); the output is rounded to BF16 once.  One runtime-variable
-    kernel set serves any ``tokens`` and any segment lengths (including empty segments and lengths
-    below one tile); the quantized operands live in a grow-only per-device workspace
-    (``workspace_bytes_nvfp4``) shared with :func:`minimax_h3_sm120_varlen_attention_fp8`.
+    scale per 16 keys, E2M1 codes); the output is rounded to BF16 once.  Runtime-variable
+    generated programs serve any ``tokens`` and any segment lengths (including empty segments and
+    lengths below one tile), two or three programmatic-dependent launches per call on the current
+    stream (``minimax_h3_sm120_nvfp4_programs``; grids ``minimax_h3_sm120_nvfp4_launch_grids``): a
+    plan of 2048 to 16384 padded tokens runs the fused pre-processing (K sums and Q block means, a
+    grid barrier, then the quantized operands, in one cooperative launch); any other plan runs the
+    statistics launch, which also quantizes Q and the block-mean rows, then the K / V quantizer.
+    The attention launch takes the warp-specialised form on parts of at least 188 SMs when the mean
+    segment (empty segments included) is at least 1536 and below 16384 tokens.  The quantized
+    operands live in a grow-only workspace per (device, stream) (``workspace_bytes_nvfp4``) whose
+    buffer names are shared with ``pv_mode="fp8"``.  The programs ship for ``sm_120a`` alone: a call
+    with a non-empty segment on a device of another compute capability than 12.0 raises
+    ``RuntimeError``.
 
     The E2M1 scores and probabilities carry a larger quantization error than the FP8 operator
     (about 4x the relative L2 error on Gaussian inputs, the same as SageAttention3's own); this
     route is an experimental precision/latency trade-off and is validated against the FP32 oracle
     with the FP4 block-scaled tolerance ``atol = 1.0, rtol = 0.1`` (see the tests), not the FP8
     operator's ``0.1``.
-
-    Performance ceiling of the attention launch (measured on RTX 5090 and RTX PRO 6000 Blackwell,
-    both GB202): the kernel needs 246 registers per thread, so one 8-warp CTA is resident per SM
-    (two warps per SM sub-partition) and each warp alternates a ~1400-cycle ``mxf4nvf4`` MMA burst
-    with a ~2700-cycle FP32 softmax / P-quantization phase that only the other warp's burst can
-    overlap.  The tensor pipe is therefore active ~58 % of the time and the launch runs at ~60 %
-    of the tensor-pipe floor on production plans (~55 % on 4096-token plans), against 84-88 % for
-    the MMA-only skeleton; L2 and DRAM are idle (L2 hit > 99 %).  Ping-pong barrier placement,
-    softmax emission order, FMA-pipe exp2, power-of-two P block scales, packed f16x2 P conversions,
-    a precomputed ``qm K^T`` compensation table, K/V multicast / DSM sharing, a 64-key 3-CTA
-    geometry and split-KV were each measured or bounded on both SKUs and none is faster within the
-    FP4 error budget, so the attention kernel is unchanged; the softmax dependency chain under the
-    two-warps-per-sub-partition register budget is the binding resource.
 
     Parameters
     ----------
@@ -922,62 +1288,7 @@ def minimax_h3_sm120_varlen_attention_nvfp4(
         return out  # every segment is empty: nothing to write
     if fp8pv_target is not None:
         return _run_fp8pv(q, k, v, out, plan, float(softmax_scale), fp8pv_target)
-    tile_rows, num_stats_tiles, unit_rows = _plan_rows(plan, q.device)
-    index = _device_index(q.device)
-    hd = MINIMAX_H3_HEAD_DIM
-    qtiles = max(1, plan.num_tiles)
-    q4 = _workspace(index, "q4", tokens * heads * _ROW_BYTES4, torch.uint8)
-    k4 = _workspace(index, "k4", tokens * heads * _ROW_BYTES4, torch.uint8)
-    q_sf = _workspace(index, "q_sf", tokens * heads * _BLOCKS_PER_ROW, torch.uint8)
-    k_sf = _workspace(
-        index, "k_sf", heads * plan.num_kblocks * _SCALE_TILE_BYTES, torch.uint8
-    )
-    qm4 = _workspace(index, "qm4", qtiles * heads * _ROW_BYTES4, torch.uint8)
-    qm_sf = _workspace(index, "qm_sf", qtiles * heads * _BLOCKS_PER_ROW, torch.uint8)
-    vt4 = _workspace(index, "vt4", heads * hd * (plan.padded_tokens // 2), torch.uint8)
-    v_sf = _workspace(
-        index, "v_sf", heads * plan.num_kblocks * _SCALE_TILE_BYTES, torch.uint8
-    )
-    q_mean = _workspace(index, "q_mean", qtiles * heads * hd, torch.float32)
-    mean_k = _workspace(index, "mean_k", plan.num_segments * heads * hd, torch.float32)
-    partials = _workspace(
-        index, "partials", max(1, num_stats_tiles * heads * hd), torch.float32
-    )
-    counters = _zero_workspace(
-        index, "counters", max(1, plan.num_segments) * heads, torch.uint32
-    )
-    barrier = _zero_workspace(index, "barrier", 4, torch.uint32)
-    _minimax_h3_sm120_varlen_attention_nvfp4_impl(
-        q,
-        k,
-        v,
-        _token_segment_ids(plan.bounds, plan.padded_tokens, q.device),
-        plan.cu_seqlens,
-        plan.seg_tile_begin,
-        out,
-        tile_rows,
-        unit_rows,
-        q4,
-        k4,
-        q_sf,
-        k_sf,
-        qm4,
-        qm_sf,
-        vt4,
-        v_sf,
-        q_mean,
-        mean_k,
-        partials,
-        counters,
-        barrier,
-        plan.num_segments,
-        num_stats_tiles,
-        plan.num_tiles,
-        plan.num_units,
-        plan.grid,
-        float(softmax_scale),
-    )
-    return out
+    return _run_nvfp4(q, k, v, out, plan, True, float(softmax_scale))
 
 
 @flashinfer_api
@@ -1014,9 +1325,9 @@ def minimax_h3_sm120_varlen_attention_nvfp4_nodelta(
       tolerance on this route** (max-abs 1.2-2.7 at 2-6 tokens; a 1-token segment is exact by construction),
       so do not use it for streams that contain such segments -- the default route stays within tolerance
       there;
-    * measured latency: the attention launch runs about 9-15 % faster on both GB202 SKUs (RTX 5090 and
-      RTX PRO 6000 Blackwell; 220 registers instead of 246), the complete call proportionally less on
-      short plans where pre-processing dominates.
+    * latency: only the attention program differs (``ATTENTION_NODELTA`` / ``ATTENTION_WS_NODELTA``, which
+      skip the compensation term); its warp-specialised form is taken from a mean segment of 1536 tokens
+      with no upper bound.
 
     Use the default route unless the extra error has been validated for the model in question.  Inputs,
     output, ``cu_seqlens`` handling, workspace and caching are exactly those of the default route.
@@ -1069,62 +1380,7 @@ def minimax_h3_sm120_varlen_attention_nvfp4_nodelta(
     plan = _plan(bounds, heads, q.device)
     if plan.num_units == 0:
         return out  # every segment is empty: nothing to write
-    tile_rows, num_stats_tiles, unit_rows = _plan_rows(plan, q.device)
-    index = _device_index(q.device)
-    hd = MINIMAX_H3_HEAD_DIM
-    qtiles = max(1, plan.num_tiles)
-    q4 = _workspace(index, "q4", tokens * heads * _ROW_BYTES4, torch.uint8)
-    k4 = _workspace(index, "k4", tokens * heads * _ROW_BYTES4, torch.uint8)
-    q_sf = _workspace(index, "q_sf", tokens * heads * _BLOCKS_PER_ROW, torch.uint8)
-    k_sf = _workspace(
-        index, "k_sf", heads * plan.num_kblocks * _SCALE_TILE_BYTES, torch.uint8
-    )
-    qm4 = _workspace(index, "qm4", qtiles * heads * _ROW_BYTES4, torch.uint8)
-    qm_sf = _workspace(index, "qm_sf", qtiles * heads * _BLOCKS_PER_ROW, torch.uint8)
-    vt4 = _workspace(index, "vt4", heads * hd * (plan.padded_tokens // 2), torch.uint8)
-    v_sf = _workspace(
-        index, "v_sf", heads * plan.num_kblocks * _SCALE_TILE_BYTES, torch.uint8
-    )
-    q_mean = _workspace(index, "q_mean", qtiles * heads * hd, torch.float32)
-    mean_k = _workspace(index, "mean_k", plan.num_segments * heads * hd, torch.float32)
-    partials = _workspace(
-        index, "partials", max(1, num_stats_tiles * heads * hd), torch.float32
-    )
-    counters = _zero_workspace(
-        index, "counters", max(1, plan.num_segments) * heads, torch.uint32
-    )
-    barrier = _zero_workspace(index, "barrier", 4, torch.uint32)
-    _minimax_h3_sm120_varlen_attention_nvfp4_nodelta_impl(
-        q,
-        k,
-        v,
-        _token_segment_ids(plan.bounds, plan.padded_tokens, q.device),
-        plan.cu_seqlens,
-        plan.seg_tile_begin,
-        out,
-        tile_rows,
-        unit_rows,
-        q4,
-        k4,
-        q_sf,
-        k_sf,
-        qm4,
-        qm_sf,
-        vt4,
-        v_sf,
-        q_mean,
-        mean_k,
-        partials,
-        counters,
-        barrier,
-        plan.num_segments,
-        num_stats_tiles,
-        plan.num_tiles,
-        plan.num_units,
-        plan.grid,
-        float(softmax_scale),
-    )
-    return out
+    return _run_nvfp4(q, k, v, out, plan, False, float(softmax_scale))
 
 
 __all__ = [
@@ -1132,6 +1388,8 @@ __all__ = [
     "MINIMAX_H3_NUM_HEADS",
     "minimax_h3_sm120_nvfp4_fp8pv_launch_grids",
     "minimax_h3_sm120_nvfp4_fp8pv_programs",
+    "minimax_h3_sm120_nvfp4_launch_grids",
+    "minimax_h3_sm120_nvfp4_programs",
     "minimax_h3_sm120_varlen_attention_nvfp4",
     "minimax_h3_sm120_varlen_attention_nvfp4_nodelta",
     "workspace_bytes_nvfp4",
