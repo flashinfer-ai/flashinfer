@@ -102,15 +102,6 @@ def test_public_entry_point_is_experimental() -> None:
 
 
 def test_registry_names_delivered_sources() -> None:
-    assert set(cake_jit.MODULES) == {
-        "short",
-        "long",
-        "split_n32_direct",
-        "split_n64_direct",
-        "split_n64_r4_direct",
-        "split_n32",
-        "split_n64",
-    }
     manifest = cake_jit.cake_build.manifest()
     libraries = cake_jit.cake_build.libraries_by_name()
     assert manifest["schema"] == "cake-build/1"

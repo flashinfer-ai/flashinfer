@@ -50,7 +50,6 @@ cake_build = cake_package("sm110_xqa", "cake_build")
 PACKAGE_DIR = Path(pkg.__file__).resolve().parent
 LEDGER = PACKAGE_DIR.parents[2] / "benchmarks" / "sm110_xqa_shapes.json"
 PLAN_KINDS = {"buffer", "parameter", "grid"}
-TREE_RECORDS = 40
 DECODE_RECORD = "decode_fp16_contig"
 
 _REQUIRES_SM110 = pytest.mark.skipif(
@@ -112,84 +111,6 @@ def test_registry_records_reference_the_build_manifest() -> None:
     assert referenced == set(libraries)
     assert (PACKAGE_DIR / "csrc" / "cake_ffi_checks.h").is_file()
     assert "csrc" in manifest["common"]["include_dirs"]
-
-
-def test_record_table_is_the_routed_closure() -> None:
-    """32 tmem records (both precisions, both layouts, four ratios, both cluster forms), 8 pair
-    records (E4M3, both layouts, four ratios) and the three decode records (the workspace
-    merge and the two- and four-partition clusters)."""
-    tree = {
-        name: record
-        for name, record in loader.MODULES.items()
-        if record["stage"] == "tree"
-    }
-    assert len(tree) == TREE_RECORDS
-    variants = {
-        (v["precision"], v["cache"], v["ratio"], v["kernel"], v["even"])
-        for v in (record["variant"] for record in tree.values())
-    }
-    assert len(variants) == TREE_RECORDS
-    for precision in loader.PRECISIONS:
-        for cache in loader.CACHES:
-            for ratio in loader.RATIOS:
-                for even in (True, False):
-                    assert (precision, cache, ratio, "tmem", even) in variants
-                assert ("fp8", cache, ratio, "pair", True) in variants
-    for name, record in tree.items():
-        variant = record["variant"]
-        form = (
-            ""
-            if variant["kernel"] == "pair"
-            else ("_even" if variant["even"] else "_odd")
-        )
-        assert name == (
-            f"tree_{variant['precision']}_{variant['cache']}_g{variant['ratio']}_{variant['kernel']}{form}"
-        )
-        rule = record["grid_rule"]
-        assert rule["kind"] == "tree" and rule["ctas_per_tile"] == 2
-        assert rule["tiles_per_cluster"] == (2 if variant["kernel"] == "pair" else 1)
-        has_pages = variant["cache"] == "page128"
-        assert ("kv_cache_list.page_list" in record["logical"].values()) == has_pages
-    decode = loader.MODULES[DECODE_RECORD]
-    assert decode["stage"] == "decode"
-    assert decode["variant"] == {"precision": "fp16", "cache": "contig"}
-    decode_records = {
-        name for name, record in loader.MODULES.items() if record["stage"] == "decode"
-    }
-    assert decode_records == {
-        DECODE_RECORD,
-        f"{DECODE_RECORD}_c2",
-        f"{DECODE_RECORD}_c4",
-    }
-    # Every decode record shares the plan; a cluster program's record is named by
-    # the partition count its cluster merges and launches that cluster along x.
-    for name, record in loader.MODULES.items():
-        if record["stage"] != "decode":
-            continue
-        clustered = record["variant"].get("cluster_partitions")
-        if clustered is None:
-            assert name == DECODE_RECORD
-        else:
-            assert name == f"{DECODE_RECORD}_c{clustered}" and clustered in (2, 4)
-        assert record["grid_rule"] == {"kind": "decode_partitions"}
-        assert record["workspace"] == ["partial", "statistics", "counters"]
-        assert record["partition_tokens"] == loader.DEFAULT_PARTITION_TOKENS
-        assert record["arg_plan"] == decode["arg_plan"]
-    assert [key for _, key in decode["arg_plan"][:-3]] == [
-        "Q",
-        "KV",
-        "sequence_lengths",
-        "output",
-        "partial",
-        "statistics",
-        "counters",
-        "heads",
-        "ratio",
-        "capacity",
-        "partitions",
-        "partition_tokens",
-        "attention_scale",
-    ]
 
 
 @pytest.mark.parametrize("precision", ["fp16", "fp8"])

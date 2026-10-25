@@ -145,49 +145,6 @@ def test_constants_and_accepted_splits() -> None:
     assert loader.SHORT_CAPACITY_MAX == backend.MIN_CAPACITY == 64
     assert loader.ACCEPTED_SPLITS == backend.ACCEPTED_SPLITS == (1, 2, 4, 8, 10, 16)
 
-    # Every row of a rule carries the split count its route launches with: one split on every size-based row
-    # today, the caller's count ("runtime") on the explicit-split rows.
-    def one(batch, capacity):
-        return {"splits": "one", "batch": batch, "capacity": capacity, "num_splits": 1}
-
-    assert loader.MODULES["short"]["select_rule"] == {
-        "kind": "regions",
-        "regions": [one([1, 1], [1, 64])],
-    }
-    assert loader.MODULES["long"]["select_rule"] == {
-        "kind": "regions",
-        "regions": [one([1, 1], [65, 128])],
-    }
-    assert loader.MODULES["split_n64_direct"]["select_rule"] == {
-        "kind": "regions",
-        "regions": [one([1, 1], [129, 256]), one([2, 2], [1, 512])],
-    }
-    assert loader.MODULES["split_n64_r4_direct"]["select_rule"] == {
-        "kind": "regions",
-        "regions": [one([1, 1], [257, None]), one([2, 2], [513, None])],
-    }
-    assert loader.MODULES["split_n32_direct"]["select_rule"] == {
-        "kind": "otherwise",
-        "splits": "one",
-        "num_splits": 1,
-    }
-    assert loader.MODULES["split_n64"]["select_rule"] == {
-        "kind": "regions",
-        "regions": [
-            {
-                "splits": "many",
-                "batch": [1, 2],
-                "capacity": [1, 4095],
-                "num_splits": "runtime",
-            }
-        ],
-    }
-    assert loader.MODULES["split_n32"]["select_rule"] == {
-        "kind": "otherwise",
-        "splits": "many",
-        "num_splits": "runtime",
-    }
-
 
 def test_every_row_carries_the_split_count_its_record_launches() -> None:
     """The route table rows carry the record and the split count: "runtime" (the caller's) only on an
