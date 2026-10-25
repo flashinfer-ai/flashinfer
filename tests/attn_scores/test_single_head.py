@@ -580,3 +580,47 @@ def test_thresholds_from_sample_rejects_bad_counters() -> None:
             thresholds=thresholds,
             counters=torch.zeros(4, 1, dtype=torch.int32, device="cuda"),
         )
+
+
+@sm10x_only
+@torch.inference_mode()
+def test_gather_key_sample_rejects_bad_shapes() -> None:
+    """Sample scales short of slots or of scales per key, and keys or scales not
+    64 to a page, are refused: the kernel would write or read past them. (No
+    request has samples, so a call let through writes nothing.)"""
+    zeros = partial(torch.zeros, device="cuda")
+    args = dict(
+        key_cache=zeros(4, 64, 64, dtype=torch.uint8),
+        key_scales=zeros(4, 64, 8, dtype=torch.float8_e4m3fn),
+        sample_keys=zeros(2, 128, 64, dtype=torch.uint8),
+        sample_scales=zeros(2, 128, 8, dtype=torch.float8_e4m3fn),
+    )
+
+    def run(**changes) -> None:
+        call = dict(args, **changes)
+        gather_key_sample(
+            call.pop("key_cache"),
+            zeros(2, 2, dtype=torch.int32),  # block table
+            zeros(128, dtype=torch.uint8),  # offsets
+            zeros(2, dtype=torch.int32),  # sample ends
+            samples_per_run=1,
+            pages_per_run=2,
+            **call,
+        )
+
+    run()
+    for wrong in (
+        dict(sample_scales=args["sample_scales"][:, :64]),  # fewer slots
+        dict(sample_scales=args["sample_scales"][..., :4]),  # fewer scales a key
+        dict(key_scales=args["key_scales"][:, :32]),  # 32 keys a page
+    ):
+        with pytest.raises(ValueError, match="Scales must be"):
+            run(**wrong)
+    with pytest.raises(ValueError, match="Mismatched"):  # BF16 keys, 32 a page
+        run(
+            key_cache=zeros(4, 32, 128, dtype=torch.bfloat16),
+            sample_keys=zeros(2, 128, 128, dtype=torch.bfloat16),
+            key_scales=None,
+            sample_scales=None,
+        )
+

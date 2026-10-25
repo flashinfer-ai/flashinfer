@@ -488,15 +488,24 @@ def gather_key_sample(
     """
     from ..cute_dsl.launch import launch
     from .kernels import single_head_scorer
-    from .kernels.single_head_scorer import PAGE, TILE
+    from .kernels.single_head_scorer import PAGE, SCALES_PER_KEY, TILE
 
     requests, capacity, width = sample_keys.shape
     if capacity % TILE or (key_scales is None) != (sample_scales is None):
         raise ValueError(
             f"Sample rows hold whole {TILE}-key tiles, with scales if NVFP4"
         )
+    # The kernel writes SCALES_PER_KEY scales to every slot below a sample end.
+    if key_scales is not None and (
+        key_scales.shape != (key_cache.shape[0], PAGE, SCALES_PER_KEY)
+        or sample_scales.shape != (requests, capacity, SCALES_PER_KEY)
+    ):
+        raise ValueError(
+            f"Scales must be [pages, {PAGE}, {SCALES_PER_KEY}] and "
+            f"[requests, capacity, {SCALES_PER_KEY}]"
+        )
     if (
-        width != key_cache.shape[2]
+        key_cache.shape[1:] != (PAGE, width)
         or sample_ends.shape[0] != requests
         or offsets.shape[0] < capacity
         or block_table.shape[0] < requests
