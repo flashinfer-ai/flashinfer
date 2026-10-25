@@ -972,7 +972,9 @@ def cake_mhc_train_backward_finish(
     # The fn split writes the transposed operand layout only (``want_t = 1`` is
     # the record's own scalar); its forward-layout pointer is bound to the same
     # region.  The column-slab pass describes the ``[T, 4, 4096]`` tensors as
-    # ``[T, 16384]`` and reads the first ``T`` rows of the padded ``dz'`` record.
+    # ``[T, 16384]`` and reads the first ``T`` rows of the padded ``dz'`` record;
+    # its dynamic-schedule form draws its work units from the workspace's
+    # self-resetting ticket word.
     values: dict[str, Any] = {
         "fn": fn,
         "fnTp": ws["fnTp"],
@@ -995,6 +997,7 @@ def cake_mhc_train_backward_finish(
         "dzp_rows": ws["dzp_rows"],
         "dx_flat": dX.view(rows, HIDDEN_TOTAL),
         "dfn_part": ws["dfn_part"],
+        "ticket": ws["ticket"],
         "parts": plan["parts"],
         "rows_per_chunk": plan["rows_per_chunk"],
         "dfn": dfn,
