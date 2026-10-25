@@ -30,13 +30,18 @@ import os
 from datetime import timedelta
 
 import pytest
+import torch
 
 from tests.test_helpers.w4a16_reference import assert_w4a16_bits
 
 pytestmark = [
     pytest.mark.nvep,
     pytest.mark.gpu_4,
-    pytest.mark.arch_blackwell,
+    pytest.mark.skipif(
+        not torch.cuda.is_available()
+        or torch.cuda.get_device_capability(0) not in ((10, 0), (10, 3), (10, 7)),
+        reason="W4A16 split MoE requires SM100, SM103, or SM107",
+    ),
     pytest.mark.usefixtures("require_split_backend"),
 ]
 
