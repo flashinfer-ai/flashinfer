@@ -4,8 +4,10 @@ One kernel source serves both architectures where the generated bodies agree
 (architecture-specific lowering sits under exact ``__CUDA_ARCH__`` guards); each
 architecture still compiles its own module. Argument plans and factory kwargs are
 stored once and expanded into ``MODULES`` / ``FACTORIES`` at import. The host
-binding of every module is rendered from ``cake_kda_prefill_binding`` into the
-generated-source directory when its JIT spec is created.
+binding of every shipped module is rendered from ``cake_kda_prefill_binding``
+into the generated-source directory when its JIT spec is created; a generated
+program (``_RENDERED_MODULES``) ships its own binding, and ``_RENDERED_ROUTES``
+points the factory rows of the modules it replaces at it.
 """
 
 from functools import cache
@@ -1288,7 +1290,22 @@ def _module_record(name, directory, digest, arches, plan, tma_workspace_bytes):
     }
 
 
-MODULES = {name: _module_record(name, *row) for name, row in _MODULE_ROWS.items()}
+# Generated programs, one record per program, written by the exporter: the device
+# unit and its host binding under csrc/kda/prefill/ (``sources``), the binding's
+# ``ffi_entry``, ``compile_flags``, ``arg_plan`` and ``arches``. A generated
+# binding encodes its TMA descriptors from the bound tensors on every call, so a
+# record carries no descriptor workspace and no cache name.
+_RENDERED_MODULES = {}
+
+# architecture -> shipped module -> the generated program that replaces it on
+# that architecture. ``_factory`` resolves a factory row's module through this
+# table; the shipped module stays registered (a module no route names is used as is).
+_RENDERED_ROUTES = {"sm_100a": {}, "sm_103a": {}}
+
+MODULES = {
+    **{name: _module_record(name, *row) for name, row in _MODULE_ROWS.items()},
+    **_RENDERED_MODULES,
+}
 
 # Factory specializations per schedule family. A row is
 # (positional args, kwarg-signature index, kwargs that differ from the family
@@ -2278,16 +2295,21 @@ def spec(name, arch):
     if not include.is_dir():
         include = Path(__file__).resolve().parents[2] / "include"
     sources = [_source_path(path) for path in record["sources"]]
-    spec_name = f"{record['cache_name']}_{arch}"
-    binding = (
-        jit_env.FLASHINFER_GEN_SRC_DIR
-        / spec_name
-        / f"{record['cache_name']}_binding.cu"
-    )
-    write_if_different(binding, render_binding(name))
+    if name in _RENDERED_MODULES:
+        # A generated program ships its own host binding beside its device unit.
+        spec_name = f"{name}_{arch}"
+    else:
+        spec_name = f"{record['cache_name']}_{arch}"
+        binding = (
+            jit_env.FLASHINFER_GEN_SRC_DIR
+            / spec_name
+            / f"{record['cache_name']}_binding.cu"
+        )
+        write_if_different(binding, render_binding(name))
+        sources = [*sources, binding]
     return gen_jit_spec(
         name=spec_name,
-        sources=[*sources, binding],
+        sources=sources,
         extra_cuda_cflags=[*_NVCC_FLAGS[arch], *record["compile_flags"]],
         extra_include_paths=[
             sources[0].parent,
@@ -2304,7 +2326,12 @@ def load(name, arch):
 
 
 class PreparedKernel:
-    """A native module plus caller-retained pointer-TMA descriptor storage."""
+    """A native module plus caller-retained pointer-TMA descriptor storage.
+
+    A module without a descriptor workspace (every generated program) encodes
+    its tensor maps in ``run`` from the bound tensors: ``prepare`` has nothing
+    to upload and ``launch`` calls ``run`` directly.
+    """
 
     def __init__(self, name, arch):
         record = MODULES[name]
@@ -2313,18 +2340,17 @@ class PreparedKernel:
         self.schedule = None
         native = load(name, arch)
         entry = record["ffi_entry"]
-        self._call = getattr(
-            native, entry + "_prepared" if record["tma_workspace_bytes"] else entry
-        )
+        workspace_bytes = record.get("tma_workspace_bytes", 0)
+        self._call = getattr(native, entry + "_prepared" if workspace_bytes else entry)
         self._prepare = (
-            getattr(native, entry + "_prepare_tma")
-            if record["tma_workspace_bytes"]
-            else None
+            getattr(native, entry + "_prepare_tma") if workspace_bytes else None
         )
         self._ready = self._prepare is None
         self._arg_plan = record["arg_plan"]
-        self.descriptor_storage = torch.empty(
-            record["tma_workspace_bytes"], dtype=torch.uint8, device="cuda"
+        self.descriptor_storage = (
+            torch.empty(workspace_bytes, dtype=torch.uint8, device="cuda")
+            if workspace_bytes
+            else None
         )
 
     def _arguments(self, grid, bindings):
@@ -2422,4 +2448,5 @@ def _factory(name, *args, **kwargs):
         raise NotImplementedError(
             f"Unexported KDA schedule specialization: {(arch, name, *key)}"
         )
-    return PreparedKernel(variants[key], arch)
+    module = variants[key]
+    return PreparedKernel(_RENDERED_ROUTES.get(arch, {}).get(module, module), arch)
