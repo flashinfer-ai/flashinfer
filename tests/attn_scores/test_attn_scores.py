@@ -5447,6 +5447,56 @@ def test_engine_compact_repair_queue_changes_cuda_graph():
 
 
 @_requires_selective_sm100
+@pytest.mark.parametrize("top_k", [512, 2048])
+@pytest.mark.parametrize("heads", [8, 64])
+def test_engine_underfilled_causal_rows_skip_repair(top_k, heads):
+    """Complete short rows skip both selected repair layouts."""
+
+    q, kv, scale, weights, _cu_q, _cu_kv = _inputs(
+        q_rows=16, kv_rows=128, num_heads=heads
+    )
+    cu_q = torch.tensor([0, 16], device="cuda", dtype=torch.int32)
+    cu_kv = torch.tensor([0, 128], device="cuda", dtype=torch.int32)
+    inputs = (q, kv, scale, weights, cu_q, cu_kv)
+    kv_fused, block_table = _paged_inputs(inputs)
+
+    wrapper = SelectiveEngineCase()
+    wrapper.plan(
+        q,
+        kv_fused,
+        weights,
+        cu_q,
+        cu_kv,
+        block_table,
+        top_k=top_k,
+        num_heads=heads,
+        num_sms=4,
+    )
+    _assert_repair_position_storage(wrapper)
+    for _ in range(3):
+        # Every row is shorter than TopK and publishes all of its keys, so no
+        # row is flagged and the conditional repair body must not run: the
+        # stale ranks of a previous compact turn stay untouched.
+        wrapper._ranks.fill_(top_k)
+        selected = wrapper.run(q, kv_fused, weights, block_table).long()
+        torch.cuda.synchronize()
+        assert bool((wrapper._ranks == top_k).all())
+
+    assert wrapper._compact_repair == (heads == 8)
+    assert int(wrapper._exact_error.item()) == 0
+    assert torch.count_nonzero(wrapper._repair_flags).item() == 0
+    if heads == 8:
+        assert int(wrapper._second_active_count.item()) == 0
+    for row, valid in enumerate(_valid_lengths(cu_q, cu_kv)):
+        indices = selected[row, :valid]
+        assert ((indices >= 0) & (indices < valid)).all()
+        assert (selected[row, valid:] == -1).all()
+        assert torch.equal(
+            torch.unique(indices).cpu(), torch.arange(valid, dtype=torch.int64)
+        )
+
+
+@_requires_selective_sm100
 @pytest.mark.parametrize(
     ("num_heads", "query_tile"),
     [(128, 1), (64, 2), (32, 4), (8, 16)],
@@ -7974,6 +8024,144 @@ def test_cuda_sample_ladder_refined_rank_and_graph():
 
 
 # Segmented candidate selection
+
+
+@pytest.mark.parametrize("capacity", [6144, 8192])
+@pytest.mark.parametrize("segments", [1, 4, 8, 12, 16, 32, 64, 128])
+@pytest.mark.parametrize("top_k", [1, 8, 32, 128, 512, 2048])
+def test_segmented_packed_topk(segments, top_k, capacity):
+    if not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("Requires SM100a")
+    # One pool is H64-only at 8192; lane-local banks use 8192 split 32..128 ways.
+    if capacity % segments or (segments == 1 and capacity != 8192):
+        pytest.skip("not a production capacity/segment layout")
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+
+    from flashinfer.attn_scores.kernels.selective_logits_metadata import (
+        SelectivePackedTopKKernel,
+    )
+
+    torch.manual_seed(1)
+    rows = 9
+    bank = capacity // segments
+    scores = torch.randn(rows, capacity, device="cuda")
+    scores[5].zero_()
+    indices = torch.arange(capacity, device="cuda", dtype=torch.int64).expand(rows, -1)
+    values = (scores.view(torch.int32).long() << 32) | indices
+    counts = torch.zeros((rows, segments + 1), dtype=torch.int32, device="cuda")
+    counts[1, 1] = min(top_k - 1, bank)
+    counts[2, 1:] = bank
+    counts[3, 1] = bank + 1  # Segment overflow even below global capacity.
+    counts[4, 1:] = bank // 2
+    counts[5, 1:] = bank
+    counts[6, 1:] = 1  # Inactive slots must never participate.
+    short = min(top_k - 1, bank)
+    counts[7, 1] = short  # Short causal row that published all of its keys.
+    counts[8, 1] = short  # Short causal row missing its last key.
+    row_ends = torch.full((rows,), 1 << 30, dtype=torch.int32, device="cuda")
+    row_ends[7] = short
+    row_ends[8] = short + 1
+    lengths = torch.empty(rows, dtype=torch.int32, device="cuda")
+    flags = torch.empty_like(lengths)
+    selected = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+    kernel = SelectivePackedTopKKernel(top_k, capacity, segments)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    args = (
+        from_dlpack(values, assumed_align=16),
+        from_dlpack(lengths, assumed_align=16),
+        from_dlpack(selected, assumed_align=16),
+        cutlass.Int32(rows),
+        from_dlpack(counts, assumed_align=16),
+        from_dlpack(flags, assumed_align=16),
+        from_dlpack(row_ends, assumed_align=16),
+    )
+    compiled = cute.compile(kernel.segmented, *args, stream)
+    compiled(*args, stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        compiled(*args, cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+    for replay in range(2):
+        if replay:
+            counts[:, 1:].zero_()
+        graph.replay()
+        keep = counts[:, 1:].clamp(max=bank)
+        total = counts[:, 1:].sum(1)
+        overflow = (counts[:, 1:] > bank).any(1)
+        torch.testing.assert_close(lengths.long(), keep.sum(1))
+        torch.testing.assert_close(
+            counts[:, 0].long(), torch.where(overflow, capacity + 1, total)
+        )
+        # Only rows short of min(top_k, row_end) need repair.
+        required = row_ends.long().clamp(max=top_k)
+        expected_flags = (total < required) | (total > capacity) | overflow
+        torch.testing.assert_close(flags.bool(), expected_flags)
+        if not replay:
+            # total < top_k alone would send the complete short row to repair.
+            assert int(flags[7]) == 0 and int(flags[8]) == 1
+        for row in range(rows):
+            valid = (torch.arange(capacity, device="cuda") % bank) < keep[
+                row
+            ].repeat_interleave(bank)
+            valid_indices = valid.nonzero().flatten()
+            n = min(top_k, valid_indices.numel())
+            got = selected[row, :n].long()
+            assert got.unique().numel() == n
+            assert valid[got].all()
+            torch.testing.assert_close(
+                scores[row, got].sort().values,
+                scores[row, valid].topk(n).values.sort().values,
+                atol=0,
+                rtol=0,
+            )
+            assert (selected[row, n:] == -1).all()
+
+
+@_requires_selective_sm100
+@pytest.mark.parametrize("segments", [0, 4])
+@pytest.mark.parametrize("top_k", [7, 512, 2048])
+def test_finalizer_flags_only_incomplete_rows(segments, top_k):
+    """Single-row plans finalize candidates; short complete rows stay unflagged."""
+    from flashinfer.attn_scores.selective_logits import (
+        _finalize_fp8_mqa_packed_candidates,
+    )
+
+    from flashinfer.attn_scores._selective_contract import _REPAIR_CAPACITY
+
+    capacity, rows = _REPAIR_CAPACITY, 6
+    span = capacity // max(segments, 1)
+    totals = [0, top_k - 1, top_k - 1, top_k, top_k + 3, 0]
+    ends = [0, top_k - 1, top_k, 1 << 30, 1 << 30, 1 << 30]
+    counts = torch.zeros((rows, segments + 1), dtype=torch.int32, device="cuda")
+    for row, total in enumerate(totals):
+        if segments:
+            counts[row, 1] = min(total, span)
+            counts[row, 2] = total - min(total, span)
+        else:
+            counts[row, 0] = total
+    row_ends = torch.tensor(ends, dtype=torch.int32, device="cuda")
+    expected_new = [t < min(top_k, e) for t, e in zip(totals, ends, strict=True)]
+    expected_old = [t < top_k for t in totals]
+    # The short complete row distinguishes the two conditions.
+    assert expected_new[1] != expected_old[1]
+    for ends_arg, expected in ((row_ends, expected_new), (None, expected_old)):
+        values = torch.zeros((rows, capacity), dtype=torch.int64, device="cuda")
+        lengths = torch.empty(rows, dtype=torch.int32, device="cuda")
+        flags = torch.empty(rows, dtype=torch.int32, device="cuda")
+        _finalize_fp8_mqa_packed_candidates(
+            counts.clone(),
+            values,
+            lengths,
+            flags,
+            rows=rows,
+            capacity=capacity,
+            top_k=top_k,
+            row_ends=ends_arg,
+        )
+        torch.cuda.synchronize()
+        assert flags.bool().tolist() == expected
 
 
 # Exact repair

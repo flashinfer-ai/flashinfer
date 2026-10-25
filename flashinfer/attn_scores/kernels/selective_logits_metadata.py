@@ -805,8 +805,9 @@ class SelectivePackedTopKKernel:
     on short rows. The ordinary entry reads a compacted prefix bounded by lengths.
     The segmented entry reads each bank's count, keeps records in their existing
     slices, and writes the total retained count to lengths; that count is not a
-    compacted-prefix certificate. Overflow/underfill flags select repair instead
-    of certifying a partial candidate result. Both entries support graph capture.
+    compacted-prefix certificate. Overflow and underfill below
+    ``min(top_k, row_end)`` flag repair instead of certifying a partial result.
+    Both entries support graph capture.
     """
 
     _THREADS = 512
@@ -844,9 +845,12 @@ class SelectivePackedTopKKernel:
         rows: cutlass.Int32,
         counts: cute.Tensor,
         flags: cute.Tensor,
+        row_ends: cute.Tensor,
         stream: cuda.CUstream,
     ):
-        self.kernel(packed_values, lengths, selected, rows, counts, flags).launch(
+        self.kernel(
+            packed_values, lengths, selected, rows, counts, flags, row_ends
+        ).launch(
             grid=(rows, 1, 1),
             block=(self._THREADS, 1, 1),
             stream=stream,
@@ -917,6 +921,7 @@ class SelectivePackedTopKKernel:
         rows: cutlass.Int32,
         counts: cute.Tensor = None,
         flags: cute.Tensor = None,
+        row_ends: cute.Tensor = None,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
@@ -991,8 +996,11 @@ class SelectivePackedTopKKernel:
                 segment_meta[2 * self.num_segments] = retained
                 counts[(row, 0)] = self.capacity + 1 if overflow else total
                 lengths[row] = retained
+                # A row needs repair only below min(TopK, row_end): a causal
+                # row shorter than TopK is complete once every key is retained.
+                required = min(cutlass.Int32(self.top_k), row_ends[row])
                 flags[row] = cutlass.Int32(
-                    (total < self.top_k) | (total > self.capacity) | overflow
+                    (total < required) | (total > self.capacity) | overflow
                 )
             cute.arch.sync_threads()
             length = segment_meta[2 * self.num_segments]
@@ -1562,7 +1570,12 @@ class SelectiveTopKCombineExactKernel:
 
 
 class SelectiveLogitsFinalizeKernel:
-    """Convert logical candidate counts into packed length/repair flags."""
+    """Convert logical candidate counts into packed length/repair flags.
+
+    With ``row_ends``, a row is underfilled only below ``min(top_k, row_end)``:
+    a complete causal row shorter than TopK needs no repair. Without it
+    (repair-stage counts), every total below TopK is flagged.
+    """
 
     def __init__(
         self,
@@ -1587,10 +1600,13 @@ class SelectiveLogitsFinalizeKernel:
         flags: cute.Tensor,
         rows: cutlass.Int32,
         capacity: cutlass.Int32,
+        row_ends: cute.Tensor,
         stream: cuda.CUstream,
     ):
         if cutlass.const_expr(self.num_segments == 0):
-            self.kernel(counts, values, lengths, flags, rows, capacity).launch(
+            self.kernel(
+                counts, values, lengths, flags, rows, capacity, row_ends
+            ).launch(
                 grid=(cute.ceil_div(rows, self.threads), 1, 1),
                 block=(self.threads, 1, 1),
                 stream=stream,
@@ -1598,7 +1614,7 @@ class SelectiveLogitsFinalizeKernel:
             )
         elif cutlass.const_expr(self.num_segments == 64):
             self.lane_segmented_kernel(
-                counts, values, lengths, flags, rows, capacity
+                counts, values, lengths, flags, rows, capacity, row_ends
             ).launch(
                 grid=(rows, 1, 1),
                 block=(512, 1, 1),
@@ -1607,13 +1623,20 @@ class SelectiveLogitsFinalizeKernel:
             )
         else:
             self.segmented_kernel(
-                counts, values, lengths, flags, rows, capacity
+                counts, values, lengths, flags, rows, capacity, row_ends
             ).launch(
                 grid=(rows, 1, 1),
                 block=(self.threads, 1, 1),
                 stream=stream,
                 use_pdl=True,
             )
+
+    @cute.jit
+    def _required(self, row, row_ends):
+        required = cutlass.Int32(self.top_k)
+        if cutlass.const_expr(row_ends is not None):
+            required = min(required, row_ends[row])
+        return required
 
     @cute.kernel
     def kernel(
@@ -1624,6 +1647,7 @@ class SelectiveLogitsFinalizeKernel:
         flags: cute.Tensor,
         rows: cutlass.Int32,
         capacity: cutlass.Int32,
+        row_ends: cute.Tensor,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         block_idx, _, _ = cute.arch.block_idx()
@@ -1633,7 +1657,9 @@ class SelectiveLogitsFinalizeKernel:
         if row < rows:
             total = counts[(row, 0)]
             lengths[row] = min(total, capacity)
-            flags[row] = cutlass.Int32((total < self.top_k) | (total > capacity))
+            flags[row] = cutlass.Int32(
+                (total < self._required(row, row_ends)) | (total > capacity)
+            )
         cute.arch.griddepcontrol_launch_dependents()
 
     @cute.kernel
@@ -1645,6 +1671,7 @@ class SelectiveLogitsFinalizeKernel:
         flags: cute.Tensor,
         rows: cutlass.Int32,
         capacity: cutlass.Int32,
+        row_ends: cute.Tensor,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
@@ -1710,7 +1737,7 @@ class SelectiveLogitsFinalizeKernel:
             counts[(row, 0)] = published
             lengths[row] = retained
             flags[row] = cutlass.Int32(
-                (total < self.top_k) | (total > capacity) | overflow
+                (total < self._required(row, row_ends)) | (total > capacity) | overflow
             )
         cute.arch.griddepcontrol_launch_dependents()
 
@@ -1723,6 +1750,7 @@ class SelectiveLogitsFinalizeKernel:
         flags: cute.Tensor,
         rows: cutlass.Int32,
         capacity: cutlass.Int32,
+        row_ends: cute.Tensor,
     ):
         """Compact fixed store-lane vector slices through shared memory."""
         tidx, _, _ = cute.arch.thread_idx()
@@ -1814,7 +1842,7 @@ class SelectiveLogitsFinalizeKernel:
             counts[(row, 0)] = published
             lengths[row] = retained_total
             flags[row] = cutlass.Int32(
-                (total < self.top_k) | (total > capacity) | overflow
+                (total < self._required(row, row_ends)) | (total > capacity) | overflow
             )
         cute.arch.griddepcontrol_launch_dependents()
 

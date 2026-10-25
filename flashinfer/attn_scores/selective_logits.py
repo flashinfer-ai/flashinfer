@@ -1910,6 +1910,7 @@ def _finalize_fp8_mqa_packed_candidates(
     top_k: int = _DEFAULT_TOP_K,
     _compile_only: bool = False,
     _candidate_prepared: _PreparedFP8MQASelectiveLogits | None = None,
+    row_ends: torch.Tensor | None = None,
 ) -> None:
     """Compact segmented candidates and publish exact count/repair metadata.
 
@@ -1927,6 +1928,9 @@ def _finalize_fp8_mqa_packed_candidates(
         rows: Number of logical rows to finalize.
         capacity: Candidate capacity per row; divisible by the segment count.
         top_k: Minimum retained candidates required before exact repair.
+        row_ends: Optional contiguous int32 CUDA per-row exclusive ends. When
+            given, a complete row shorter than ``top_k`` is not flagged; only a
+            total below ``min(top_k, row_end)`` (or an overflow) is.
 
     The function compacts retained segment prefixes in place. Column zero is
     set to the exact logical count, or ``capacity + 1`` when any segment
@@ -1934,6 +1938,7 @@ def _finalize_fp8_mqa_packed_candidates(
     """
     _require_cute()
     tensors = (index_counts, values, lengths, repair_flags)
+    identity_tensors = tensors if row_ends is None else (*tensors, row_ends)
     single_pool = (
         _candidate_prepared is not None
         and index_counts.dim() == 2
@@ -1968,12 +1973,12 @@ def _finalize_fp8_mqa_packed_candidates(
         if single_pool
         else ()
     )
-    if all(isinstance(tensor, torch.Tensor) for tensor in tensors):
+    if all(isinstance(tensor, torch.Tensor) for tensor in identity_tensors):
         identity = (
             rows,
             top_k,
             *layout_identity,
-            *_selective_logits_launch_identity(tensors, capacity),
+            *_selective_logits_launch_identity(identity_tensors, capacity),
         )
         cached = getattr(values, "_flashinfer_packed_finalize_launch", None)
         if cached is not None and cached.identity == identity:
@@ -2036,6 +2041,15 @@ def _finalize_fp8_mqa_packed_candidates(
         for right in range(left + 1, len(ranges))
     ):
         raise ValueError("candidate finalizer tensors must not alias")
+    if row_ends is not None and (
+        not isinstance(row_ends, torch.Tensor)
+        or row_ends.dtype != torch.int32
+        or row_ends.device != index_counts.device
+        or row_ends.dim() != 1
+        or row_ends.numel() < rows
+        or not row_ends.is_contiguous()
+    ):
+        raise ValueError("row_ends must be contiguous int32 CUDA storage per row")
     _require_aligned(tensors)
 
     args = (
@@ -2049,10 +2063,23 @@ def _finalize_fp8_mqa_packed_candidates(
         ),
         cutlass.Int32(rows),
         cutlass.Int32(capacity),
+        (
+            from_dlpack(row_ends, assumed_align=16).mark_compact_shape_dynamic(
+                mode=0, divisibility=1
+            )
+            if row_ends is not None
+            else None
+        ),
     )
     stream = _current_stream(index_counts.device)
     capability = torch.cuda.get_device_capability(index_counts.device)
-    key: Tuple[int, ...] = (*capability, capacity, num_segments, top_k)
+    key: Tuple[int, ...] = (
+        *capability,
+        capacity,
+        num_segments,
+        top_k,
+        row_ends is not None,
+    )
     compiled = _FINALIZE_COMPILED.get(key)
     if compiled is None:
         from .kernels.selective_logits_metadata import SelectiveLogitsFinalizeKernel
@@ -2071,9 +2098,9 @@ def _finalize_fp8_mqa_packed_candidates(
             rows,
             top_k,
             *layout_identity,
-            *_selective_logits_launch_identity(tensors, capacity),
+            *_selective_logits_launch_identity(identity_tensors, capacity),
         ),
-        tensors=tensors,
+        tensors=identity_tensors,
         compiled=compiled,
         args=args,
     )
@@ -3113,6 +3140,7 @@ class _FP8PagedMQASelectiveTopKEngine:
             top_k=self._top_k,
             _compile_only=True,
             _candidate_prepared=self._candidate_prepared,
+            row_ends=self._row_ends,
         )
         _fp8_mqa_selective_logits(
             repair_q,
@@ -3267,6 +3295,9 @@ class _FP8PagedMQASelectiveTopKEngine:
                 ).mark_layout_dynamic(leading_dim=1),
                 from_dlpack(
                     self._repair_flags, assumed_align=16
+                ).mark_compact_shape_dynamic(mode=0, divisibility=1),
+                from_dlpack(
+                    self._row_ends, assumed_align=16
                 ).mark_compact_shape_dynamic(mode=0, divisibility=1),
             )
         packed_topk_compiled = _PACKED_TOPK_COMPILED.get(packed_topk_key)
@@ -3672,6 +3703,7 @@ class _FP8PagedMQASelectiveTopKEngine:
                 capacity=self._candidate_schedule.candidate_capacity,
                 top_k=self._top_k,
                 _candidate_prepared=self._candidate_prepared,
+                row_ends=self._row_ends,
             )
         packed_topk_compiled, packed_topk_args = self._packed_topk_launch
         packed_topk_compiled(*packed_topk_args, stream)
