@@ -75,19 +75,19 @@
       "entry": "run",
       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
       "min_cuda": "12.9",
-      "name": "cake_qsa_nvfp4_097d6404dd678ef3f3e5_sm_103a",
+      "name": "cake_qsa_nvfp4_dfd8600d03040c9f808d_sm_103a",
       "nvcc_flags": [
         "--use_fast_math"
       ],
       "nvcc_flags_if": [],
-      "path": "aot/cake_qsa_nvfp4_097d6404dd678ef3f3e5_sm_103a.so",
+      "path": "aot/cake_qsa_nvfp4_dfd8600d03040c9f808d_sm_103a.so",
       "sha256": {
-        "csrc/cake_qsa_nvfp4_097d6404dd678ef3f3e5_binding.cu": "9d53157df9bd027765f3bf046e135e6b904a57ad479d00d58d1553b0f2263da3",
-        "csrc/cake_qsa_nvfp4_097d6404dd678ef3f3e5_kernel.cu": "7017e9deac08ceeee12cacd3eb764cc4001d28cc5d175be2ba87c8fd58592222"
+        "csrc/cake_qsa_nvfp4_dfd8600d03040c9f808d_binding.cu": "f2fb3f1a78d19da95530fc35283529fb492231ca6a630f0eb684ef7567060ddf",
+        "csrc/cake_qsa_nvfp4_dfd8600d03040c9f808d_kernel.cu": "e56bfe9c3968b6428ab17d8c34538ae9623ca17825397e1f8a8d311841555cfe"
       },
       "sources": [
-        "csrc/cake_qsa_nvfp4_097d6404dd678ef3f3e5_kernel.cu",
-        "csrc/cake_qsa_nvfp4_097d6404dd678ef3f3e5_binding.cu"
+        "csrc/cake_qsa_nvfp4_dfd8600d03040c9f808d_kernel.cu",
+        "csrc/cake_qsa_nvfp4_dfd8600d03040c9f808d_binding.cu"
       ]
     },
     {
