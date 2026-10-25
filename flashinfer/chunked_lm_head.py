@@ -260,7 +260,8 @@ def chunked_lm_head_loss(
         run over different chunk boundaries and differ by FP32 rounding).
         ``None`` (default) reads ``FLASHINFER_CAKE_LM_HEAD_LOSS_COMPACT_ROWS``
         (on unless set to ``0``; the backend's own default is ``True``).
-        Compaction costs two device synchronizations per call.
+        Compaction costs one device synchronization per call, the valid-row
+        count (the log-probability backward reuses the forward's index).
     fuse_dw_cast : bool, optional
         Run the last chunk's weight-gradient GEMM in the backward, where the
         upstream scalar gradient is known, with the scale and the output cast
@@ -392,9 +393,10 @@ def chunked_lm_head_logprob(
     Returns the FP32 ``logp [T]`` (``logp_t = z[t, y_t] - logsumexp_v z[t, v]``
     for valid rows, 0 for rows whose label is ``-100``) of the projection
     ``z = X @ W^T`` for arbitrary downstream losses; the per-row gradient
-    ``dlogp`` arrives from autograd.  The forward saves only FP32 row
-    statistics (the log-sum-exp and the selected logit); the backward
-    recomputes each chunk's logits (four GEMMs per chunk) and produces BF16
+    ``dlogp`` arrives from autograd.  The forward saves the FP32 log-sum-exp
+    and the valid-row index; the backward recomputes each chunk's logits (four
+    GEMMs per chunk; the recompute writes the logit gradient from its
+    epilogue) and produces BF16
     ``dX`` and ``dW`` through FP32 accumulators with one cast each (with
     ``fuse_dw_cast`` the last chunk's weight-gradient GEMM writes the BF16
     ``dW`` from its epilogue).  Arguments as in :func:`chunked_lm_head_loss`,
