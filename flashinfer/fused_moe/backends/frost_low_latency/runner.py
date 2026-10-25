@@ -11,6 +11,9 @@ from ....autotuner import TuningConfig
 from ...api import (
     FrostLowLatencyConfig,
     GeGLU,
+    GeGLUTanh,
+    SiTU,
+    SwiGLUStep,
     QuantFormat,
     ReLU2,
     RoutingInputMode,
@@ -224,7 +227,12 @@ class FrostLowLatencyRunner(MoERunner):
     def _cache_key_extras(self):
         return super()._cache_key_extras() + (
             # Do not reuse winners selected with the deferred individual-call timer.
-            "mxint4-load-width-v1"
+            "fp8-grouped-tc-v3"
+            if self.config.quant.weight is QuantFormat.FP8PerTensor
+            and self.config.quant.activation is QuantFormat.FP8PerTensor
+            else "block-fp8-grouped-tc-v1"
+            if self.config.quant.weight is QuantFormat.DeepSeekFp8
+            else "mxint4-load-width-v1"
             if self.config.quant.weight is QuantFormat.MXINT4
             else (
                 "fp4-route-reuse-load-width-lut-fp16-v8"
@@ -235,10 +243,10 @@ class FrostLowLatencyRunner(MoERunner):
                     and self.config.quant.activation
                     in (QuantFormat.BF16, QuantFormat.FP16)
                     else (
-                        "bf16-grouped-tc-v5"
+                        "bf16-grouped-tc-v6"
                         if self.config.quant.weight is QuantFormat.BF16
                         else (
-                            "fp16-grouped-tc-v3"
+                            "fp16-grouped-tc-v4"
                             if self.config.quant.weight is QuantFormat.FP16
                             else "unified-fma-tc-standard-timing-v5"
                         )
@@ -318,6 +326,57 @@ class FrostLowLatencyRunner(MoERunner):
                 for second in (1, 2, 4, 8)
             ]
             if (
+                capability in ((9, 0), (12, 0))
+                and self.config.quant.weight is QuantFormat.FP8PerTensor
+                and self.config.quant.activation is QuantFormat.FP8PerTensor
+                and self.config.quant.output is QuantFormat.BF16
+                and inputs[0].shape[0] in (4, 8)
+                and inputs[0].shape[1] == 2048
+                and self.config.experts.intermediate_size == 512
+                and self.config.routing.top_k == 10
+                and (
+                    self.config.activation in (SwiGLU(), SiTU())
+                    or (
+                        self.config.activation == ReLU2()
+                        and (capability == (12, 0) or inputs[0].shape[0] == 8)
+                    )
+                )
+                and self.config.finalize.do_finalize
+            ):
+                # Shared routes amortize TC setup. Preserve every FMA choice:
+                # cold/disjoint routes can still favor the scalar path.
+                if capability == (9, 0):
+                    tactics.append(("wgmma", 2, 4, 128))
+                else:
+                    tactics += [("warp_mma", group, 2, 128) for group in (2, 4)]
+            if (
+                capability in ((9, 0), (12, 0))
+                and self.config.quant.weight is QuantFormat.DeepSeekFp8
+                and self.config.quant.activation is QuantFormat.DeepSeekFp8
+                and self.config.quant.output is QuantFormat.BF16
+                and inputs[0].shape[0] in (4, 8)
+                and inputs[0].shape[1] == 2048
+                and self.config.experts.intermediate_size == 512
+                and self.config.routing.top_k == 10
+                and (
+                    self.config.activation == SwiGLU()
+                    or (
+                        inputs[0].shape[0] == 8
+                        and self.config.activation in (ReLU2(), SiLU())
+                    )
+                )
+                and self.config.finalize.do_finalize
+            ):
+                # Weight reuse can amortize block-scale promotion and TC setup.
+                # Keep all FMA choices for cold and disjoint-route workloads.
+                if capability == (9, 0):
+                    groups = (2, 4) if self.config.activation == SwiGLU() else (2,)
+                    tactics += [("wgmma", group, 4, 128) for group in groups]
+                else:
+                    tactics += [("warp_mma", group, 2, 128) for group in (2, 4)]
+                    if inputs[0].shape[0] == 4:
+                        tactics.append(("warp_mma", 4, 4, 128))
+            if (
                 capability in ((8, 0), (9, 0), (12, 0))
                 and self.config.quant.weight in (QuantFormat.BF16, QuantFormat.FP16)
                 and self.config.quant.activation is self.config.quant.weight
@@ -358,6 +417,11 @@ class FrostLowLatencyRunner(MoERunner):
                         == (2048, 512, 10)
                         and (
                             self.config.activation in (SwiGLU(), GeGLU())
+                            or (
+                                capability == (12, 0)
+                                and self.config.activation
+                                in (GeGLUTanh(), SiTU(), SwiGLUStep())
+                            )
                             or (
                                 self.config.activation in (ReLU2(), SiLU())
                                 and (capability == (12, 0) or inputs[0].shape[0] == 8)

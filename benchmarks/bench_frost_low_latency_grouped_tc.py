@@ -39,6 +39,9 @@ from flashinfer.fused_moe import (
     SwiGLU,
     ReLU2,
     GeGLU,
+    GeGLUTanh,
+    SiTU,
+    SwiGLUStep,
     SiLU,
 )
 from flashinfer.fused_moe.backends.frost_low_latency.runner import FrostLowLatencyRunner
@@ -90,10 +93,26 @@ def main():
         type=Path,
         help="Pinned vLLM fused_moe.py for the standalone device comparator",
     )
+    parser.add_argument(
+        "--vllm-route-policy",
+        choices=("both", "naive", "grouped"),
+        default="both",
+        help="Standalone vLLM device comparison: include expert grouping with timed FI sorting, or reproduce the naive upstream low-token policy",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
     parser.add_argument(
-        "--activation", choices=("swiglu", "relu2", "geglu", "silu"), default="swiglu"
+        "--activation",
+        choices=(
+            "swiglu",
+            "relu2",
+            "geglu",
+            "silu",
+            "geglu_tanh",
+            "situ",
+            "swiglu_step",
+        ),
+        default="swiglu",
     )
     args = parser.parse_args()
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
@@ -103,6 +122,9 @@ def main():
         "relu2": ReLU2,
         "geglu": GeGLU,
         "silu": SiLU,
+        "geglu_tanh": GeGLUTanh,
+        "situ": SiTU,
+        "swiglu_step": SwiGLUStep,
     }[args.activation]()
     arch = torch.cuda.get_device_capability()
     if arch not in ((8, 0), (9, 0), (12, 0)):
@@ -178,7 +200,14 @@ def main():
         )
 
         native_runner = VllmTritonComparator(
-            x, w1, w2, ids, scores, args.vllm_source, gated=args.activation == "swiglu"
+            x,
+            w1,
+            w2,
+            ids,
+            scores,
+            args.vllm_source,
+            gated=args.activation == "swiglu",
+            route_policy=args.vllm_route_policy,
         )
         native_initial = native_runner.tactics[0]
         native_selected = native_initial
@@ -334,7 +363,7 @@ def main():
         "timing": "CUPTI CUDA Graph complete routed-expert interval",
         "native_backend": args.baseline,
         "native_search": (
-            "27 shared FC1/FC2 configurations; not exhaustive independent-stage pairs"
+            f"{len(native_runner.tactics)} shared FC1/FC2 configurations across the requested {args.vllm_route_policy} route policies; not exhaustive independent-stage pairs"
             if standalone
             else (
                 "Per-stage top two, their Cartesian product plus heuristic; not exhaustive"
@@ -344,7 +373,7 @@ def main():
         ),
         "baseline_contract": (
             "Unmodified vLLM matmul device functions with standalone Triton activation/combine "
-            "and upstream naive route policy. Native typed preactivation and weighted-before-cast "
+            "and the requested naive/grouped route policy. Grouped execution includes FI GPU sorting and a padding adapter in timing. Native typed preactivation and weighted-before-cast "
             "expert rounding differ from Frost; independent references. Not stock vLLM or serving."
             if standalone
             else "FlashInfer native runner; same checkpoint, backend-specific rounding"
@@ -356,6 +385,7 @@ def main():
 
     if standalone:
         result["vllm_device_source"] = {
+            "route_policy": args.vllm_route_policy,
             "commit": VLLM_COMMIT,
             "sha256": VLLM_SOURCE_SHA256,
         }

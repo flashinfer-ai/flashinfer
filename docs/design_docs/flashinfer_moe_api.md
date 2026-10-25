@@ -1229,3 +1229,15 @@ crosses the Python API.
 | [ ] | Keep FP8, MXFP4, and additional backend families out of this PR. | Track as follow-up runners after the NVFP4 path is solid. |
 | [ ] | Keep general routing unification out of this PR. | This MVP assumes pre-routed inputs through `MoEActivationPack`. |
 | [ ] | Keep broader public API ergonomics separate from MVP correctness. | Backend discovery, pipe-operator sugar, repro replay, and a full eager functional API can evolve after the MVP contract is stable. |
+
+
+### Frost grouped DeepSeek block-FP8 candidates
+
+The existing `DeepSeekFp8` preparation and activation packs also serve the SM90
+and SM120 grouped Tensor Core paths. The bounded candidate region is finalized
+H2048/I512/top-k10, default SwiGLU T4/T8 and default ReLU2/SiLU T8. BF16 entry
+and prequantized E4M3 entry retain the same dynamic block-scale contract.
+All sixteen FMA choices remain available; other shapes and custom parameters
+retain FMA. No new public configuration or cross-backend auto-dispatch rule is
+introduced. See [the Frost guide](../frost_low_latency_moe.md#grouped-deepseek-block-fp8-on-sm90-and-sm120)
+for numerical boundaries and a full routed-expert GPU-time reproducer.

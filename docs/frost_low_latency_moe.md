@@ -42,7 +42,10 @@ BF16 and FP16 ReLU2 are additionally offered at T8 on Hopper (group2/stages4/K12
 and T4/T8 on SM120 using the same bounded warp-MMA choices.
 BF16/FP16 GeGLU also uses T4/T8; Hopper uses group2/stages4 with K128 at T4
 and K64 at T8. SiLU follows the ReLU2 bounds: Hopper T8, SM120 T4/T8.
-Mixed output dtypes and other activations retain FMA-only candidates.
+SM120 additionally offers BF16/FP16 GeGLUTanh and default SiTU/SwiGLUStep
+at T4/T8 with the same bounded warp-MMA choices. Supported custom SwiGLU/
+SwiGLUStep parameters, mixed output dtypes and other activations retain FMA-only
+candidates. Custom SiTU parameters remain unsupported by both paths.
 The grouped implementation, typed epilogues and buffer ownership are shared;
 on SM90/SM120 this extension changes candidate admission, not the device pipeline.
 The original 16 FMA choices remain available and the untuned default remains FMA.
@@ -1662,3 +1665,95 @@ The timed interval includes FC1, activation, FC2 and combine. Preparation, host
 submission, router-network evaluation, shared experts, communication and model
 throughput are outside its scope. Keep each ratio within one paired checkpoint,
 shape, dtype, activation, routing and cache cohort.
+
+## Grouped per-tensor FP8 on SM90 and SM120
+
+SM90 additionally offers a grouped E4M3 WGMMA candidate for default SwiGLU/SiTU
+at T4/T8 and ReLU2 at T8, H2048/I512/top-k10 and finalized BF16 output. Both weights and inputs
+use the existing per-tensor FP8 contract. SM90 uses group2/stages4/K128.
+SM120 offers native E4M3 warp MMA for default SwiGLU/SiTU/ReLU2 at T4/T8
+on that same shape, with group2 or group4, two stages and K128.
+All sixteen FMA choices and the untuned default remain. Other shapes, activations,
+T1/T2 and raw output retain existing choices. Representative routing and cache
+state must be profiled; shared-expert reuse does not establish a disjoint-route win.
+
+The shared architecture-specific projections keep the original checkpoint layout and read live
+per-expert dequantization and static intermediate quantization scales. FP8 partials
+spanning at most K64 are completed and promoted through separate FP32 additions,
+independently of the TMA staging tile width, before
+the existing BF16 preactivation boundary, activation and E4M3 intermediate
+quantization. This bounds the numerical drift of long native FP8 accumulation;
+FP16/BF16 retain their existing accumulation schedule. Expert partials are BF16
+and the shared finalizer preserves ordered FP32 multiplication/addition and
+skips invalid expert IDs before loading padding scores.
+
+Use the existing `benchmarks/bench_frost_low_latency_fp8.py` with `--tokens 4`
+or `8`, `--activation swiglu|relu2|situ`, both `--cache-mode warm` and `cold`,
+and shared/disjoint expert reuse. T4 ReLU2 remains FMA-only on SM90.
+Optional `--route-seed` shuffles expert addresses and slot order while preserving
+the reuse pattern and checkpoint; the default retains the original routing.
+The benchmark checks independent numerical references, tunes and freezes tactics
+before ABBA validation, and times the complete routed-expert CUDA Graph interval.
+It excludes host enqueue, preparation, router-network evaluation, shared experts
+and communication, and does not establish serving throughput.
+
+### Standalone vLLM device baseline routing
+
+The grouped Tensor Core reproducer's `--baseline vllm_device_triton` searches
+naive and expert-grouped route policies by default. The GEMM device functions
+remain unchanged at their pinned upstream commit. The standalone grouped wrapper
+uses FlashInfer GPU sorting and a padding adapter, both included in the timed
+call, alongside its existing activation/combine wrappers. It is not a stock
+vLLM or serving comparison. The two policies share the same checkpoint and
+native rounding reference. Use `--vllm-route-policy naive` to reproduce the
+earlier low-token policy, or `grouped` to isolate the grouped policy.
+
+Baseline routing can change the winner when several tokens select the same
+experts. A win over the naive policy or one native backend does not establish
+a win over the best expert-grouped implementation.
+
+
+## Grouped DeepSeek block-FP8 on SM90 and SM120
+
+The `DeepSeekFp8` weight/activation contract additionally offers grouped Tensor
+Core tactics on SM90 and SM120 for finalized `H=2048, I=512, top_k=10` calls.
+Default SwiGLU is admitted at T=4/8, and default ReLU2/SiLU at T=8. T=1/2,
+T=4 ReLU2/SiLU, custom activation parameters, other geometries and raw expert
+output retain their existing FMA candidates. All sixteen FMA tactics remain
+available inside the measured region; routing reuse and cache conditions can
+still favor FMA. This does not change cross-backend `auto` selection.
+
+Both BF16 input and prequantized E4M3 input with live FP32 `[H/128,T]` scales use
+the existing preparation API. The shared projection preserves 128x128 weight
+scales, promotes native FP8 partial accumulators at most every K64, applies the
+weight and input block scales, and accumulates in FP32. FC1 preactivation stays
+FP32 through activation and the existing dynamic 128-value quantizer. FC2
+produces BF16 expert values followed by the existing ordered FP32 weighted
+combine. Per-tensor FP8 and block-FP8 share the architecture-specific projection,
+with their different scaling and intermediate-rounding contracts explicit.
+
+SM90 candidates use group2/4, four stages and K128 for SwiGLU; ReLU2/SiLU use
+group2. SM120 uses group2/4, two stages and K128, with an additional group4,
+four-stage T4 SwiGLU choice. Compiled executables cache immutable metadata only;
+input pointers, scales, route values, scratch and streams are bound per call.
+
+The full-call reproducer now supports SM90 CUTLASS block-FP8 and SM120 native FP8,
+plus every advertised Frost FMA/grouped tactic. It includes input quantization,
+FC1, activation/requantization, FC2 and combine in the GPU interval. Each native
+backend is checked against its own documented typed boundaries. Hopper CUTLASS
+rounds FC1 and activation to BF16 before requantization; this is not bitwise
+identity with Frost's FP32 preactivation. SM120 native supports only SwiGLU in
+this harness, so ReLU2/SiLU reports explicitly contain an FMA-only comparison.
+The Hopper search uses the runner's per-stage top-two candidates plus its
+heuristic, not an exhaustive Cartesian search of all underlying GEMM configs.
+
+```bash
+python benchmarks/bench_frost_low_latency_deepseek_fp8.py \
+  --tokens 8 --activation swiglu --expert-reuse shared --route-seed 7223 \
+  --cache-mode warm --output block-fp8.json
+```
+
+Use `--expert-reuse paired` or `disjoint` and `--cache-mode cold` to probe reuse
+and cache boundaries. This measures routed-expert kernel GPU time with
+precomputed routes; it does not measure router evaluation, shared experts,
+communication, host enqueue or model token throughput.
