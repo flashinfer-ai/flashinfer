@@ -2068,14 +2068,18 @@ class _FP8MQAEngineMixin(_FP8MQALayoutMixin):
                 store_pipeline_0.consumer_wait(store_cons_state_0, store_ready_0)
                 if store_warp >= q_valid:
                     store_pipeline_1.consumer_wait(store_cons_state_1, store_ready_1)
+                # Row ends span causal_base+1 .. causal_base+q_valid, so with
+                # an odd tile block count a short final block leaves early
+                # rows ending inside the previous pair. Bound every pair
+                # that reaches past the first row's end, not only the last.
                 needs_bounds = (q_valid < num_q_groups * NUM_STORE_WARPS) | (
-                    kv_idx + NUM_MATH_WG >= num_kv
+                    (kv_idx + NUM_MATH_WG) * block_kv_val > cached_causal_base + 1
                 )
                 if cutlass.const_expr(not self.candidate_uses_causal_bounds):
                     needs_bounds = cutlass.Boolean(True)
                 if needs_bounds:
-                    # Peel partial-Q tiles and the final KV pair so the
-                    # causal steady-state path carries no row/logical predicates.
+                    # Peel partial-Q tiles and pairs crossing a causal row end
+                    # so the steady-state path carries no row/logical predicates.
                     # Explicit bounds can cut any interior tile, not just tails.
                     for q_group in cutlass.range_constexpr(num_q_groups):
                         row = store_warp + q_group * NUM_STORE_WARPS

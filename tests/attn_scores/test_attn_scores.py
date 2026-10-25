@@ -9851,6 +9851,47 @@ def test_q1_owner_pool_removes_only_local_vector_overflow(heads, record_property
 
 @_requires_selective_sm100
 @pytest.mark.parametrize(
+    ("heads", "q_len", "kv_len"),
+    [
+        (8, 4, 257),
+        (8, 16, 257),
+        (8, 16, 8193),
+        (64, 8, 513),
+        (64, 8, 514),
+        (64, 8, 8193),
+    ],
+)
+@pytest.mark.parametrize("top_k", [64, 512])
+def test_full_query_tile_causal_end_inside_penultimate_kv_pair(
+    heads, q_len, kv_len, top_k
+):
+    """Full Q tiles must bound every KV pair that crosses a row's causal end.
+
+    With an odd tile KV-block count and a context just past an even block
+    boundary, early rows end inside the second-to-last 256-token KV pair.
+    """
+    inputs = _request_inputs([q_len], [kv_len], heads=heads)
+    q, _, _, weights, cu_q, cu_kv = inputs
+    fused, table = _paged_inputs(inputs)
+    wrapper = SelectiveEngineCase()
+    wrapper.plan(
+        q,
+        fused,
+        weights,
+        cu_q,
+        cu_kv,
+        table,
+        top_k=top_k,
+        num_heads=heads,
+        head_dim=128,
+    )
+    selected = wrapper.run(q, fused, weights, table)
+    torch.cuda.synchronize()
+    _check_selection(selected, _oracle_rows(inputs), top_k)
+
+
+@_requires_selective_sm100
+@pytest.mark.parametrize(
     ("heads", "q_lengths", "kv_lengths"),
     [
         (8, [1, 1, 1], [600, 9000, 20000]),
