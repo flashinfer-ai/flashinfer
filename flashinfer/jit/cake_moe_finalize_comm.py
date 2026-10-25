@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import functools
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 
@@ -35,6 +35,75 @@ _ARCH_BY_CAPABILITY: dict[tuple[int, int], CakeMoeFinalizeArch] = {
     (10, 3): "sm_103a",
 }
 _NVCC_FLAGS = {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}
+
+# One record per program: its sources (under csrc/<SOURCE_PACKAGE>), the kernel
+# symbol the binding launches, and the architectures that build it.
+MODULES: dict[str, dict[str, Any]] = {
+    "cake_trtllm_moe_finalize_bfloat16_ws2_o110": {
+        "sources": ["cake_moe_finalize_kernels.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o110",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_moe_finalize_bfloat16_ws2_o111": {
+        "sources": ["cake_moe_finalize_kernels.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o111",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_moe_finalize_bfloat16_ws4_o110": {
+        "sources": ["cake_moe_finalize_kernels.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_moe_finalize_bfloat16_ws4_o111": {
+        "sources": ["cake_moe_finalize_kernels.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_moe_finalize_bfloat16_ws8_o110": {
+        "sources": ["cake_moe_finalize_kernels.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_moe_finalize_bfloat16_ws8_o111": {
+        "sources": ["cake_moe_finalize_kernels.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_moe_finalize_float16_ws2_o110": {
+        "sources": ["cake_moe_finalize_kernels.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws2_o110",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_moe_finalize_float16_ws2_o111": {
+        "sources": ["cake_moe_finalize_kernels.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws2_o111",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_moe_finalize_float16_ws4_o110": {
+        "sources": ["cake_moe_finalize_kernels.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws4_o110",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_moe_finalize_float16_ws4_o111": {
+        "sources": ["cake_moe_finalize_kernels.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws4_o111",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_moe_finalize_float16_ws8_o110": {
+        "sources": ["cake_moe_finalize_kernels.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws8_o110",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_moe_finalize_float16_ws8_o111": {
+        "sources": ["cake_moe_finalize_kernels.cu"],
+        "kernel": "kernel_cake_trtllm_moe_finalize_float16_ws8_o111",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+}
+
+# The largest token count that runs the small-token program, at every world size;
+# larger batches run the persistent program.
+SMALL_TOKEN_MAX = 64
 
 
 def _source_dir() -> Path:
@@ -65,13 +134,16 @@ def target_arch(device_index: int) -> CakeMoeFinalizeArch:
 
 @functools.cache
 def gen_cake_moe_finalize_module(arch: CakeMoeFinalizeArch) -> JitSpec:
-    """One JIT module per architecture: the templated kernel source plus the dispatch binding.
-
-    The kernel source instantiates all twelve kernels and is architecture independent;
-    SM103 builds it with the sm_103a flags.
-    """
+    """One JIT module per architecture: the sources of every ``MODULES`` record that
+    lists ``arch`` (each file once, in table order), plus the dispatch binding."""
     source_dir = _source_dir()
-    sources = [source_dir / "cake_moe_finalize_kernels.cu"]
+    names = dict.fromkeys(
+        source
+        for record in MODULES.values()
+        if arch in record["arches"]
+        for source in record["sources"]
+    )
+    sources = [source_dir / name for name in names]
     sources.append(source_dir / f"{SOURCE_PACKAGE}_binding.cu")
     return gen_jit_spec(
         name=f"{SOURCE_PACKAGE}_{arch}",
@@ -109,7 +181,8 @@ def run_cake_moe_finalize(
 
     Tensor shapes, dtypes and the workspace table are validated once, in the
     binding. ``quant_out`` / ``scale_out`` are byte buffers (packed FP4 and E4M3
-    scales in SWIZZLED_128x4 layout) and may use any element type.
+    scales in SWIZZLED_128x4 layout) and may use any element type. Batches of at
+    most ``SMALL_TOKEN_MAX`` tokens run the small-token program.
     """
     if norm_out is None or residual_out is None:
         raise ValueError('norm_out and residual_out are required when backend="cake"')
@@ -133,6 +206,7 @@ def run_cake_moe_finalize(
         workspace_ptrs,
         world_rank,
         world_size,
+        SMALL_TOKEN_MAX,
         float(eps),
         1.0 if routed_scaling_factor is None else float(routed_scaling_factor),
         0.0 if weight_bias is None else float(weight_bias),
@@ -142,6 +216,8 @@ def run_cake_moe_finalize(
 
 __all__ = [
     "HIDDEN_DIM",
+    "MODULES",
+    "SMALL_TOKEN_MAX",
     "SOURCE_PACKAGE",
     "gen_cake_moe_finalize_module",
     "get_cake_moe_finalize_module",
