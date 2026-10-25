@@ -96,7 +96,14 @@ From the repository root:
 
 ```bash
 pytest -q tests/experimental/test_generated_mega_moe.py
+pytest -q tests/experimental/test_mega_moe_v3_catalog.py tests/experimental/test_mega_moe_v3_preparation.py
 ```
+
+The second line needs no GPU: `test_mega_moe_v3_catalog.py` checks the
+catalog (every route's programs, grid and SM counts, the sources and their
+seals, and the TP/EP route matrix with its metadata) and
+`test_mega_moe_v3_preparation.py` the host contract (logical width padding,
+the expert window, the source-schedule form and the dispatch reference).
 
 The public tests use independent PyTorch math on the exact packed inputs,
 check valid dispatch metadata and reusable counters, poison outputs between
