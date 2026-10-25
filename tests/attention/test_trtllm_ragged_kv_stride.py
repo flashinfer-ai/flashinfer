@@ -284,18 +284,43 @@ def test_trtllm_ragged_strided_query_matches_packed(layout, is_causal):
 
 
 @pytest.mark.cuda
-def test_trtllm_ragged_rejects_noncontiguous_query_head_dim():
-    """A non-contiguous query head dimension must raise."""
+@pytest.mark.parametrize(
+    "layout,error",
+    [
+        pytest.param(
+            "transposed", "query head dimension must be contiguous", id="transposed"
+        ),
+        pytest.param(
+            "expanded_heads", "query head stride must be non-zero", id="expanded_heads"
+        ),
+        pytest.param(
+            "expanded_tokens",
+            "query token stride must be non-zero",
+            id="expanded_tokens",
+        ),
+    ],
+)
+def test_trtllm_ragged_rejects_unsupported_query_strides(layout, error):
+    """Query layouts the kernel cannot address must raise instead of being misread."""
     device = torch.device("cuda")
     _require_trtllm_ragged(device)
 
     q_lens = torch.tensor([8], device=device, dtype=torch.int32)
     q_indptr = _indptr(q_lens)
-    q = torch.randn(8, 192, 16, device=device, dtype=torch.bfloat16).transpose(1, 2)
+    if layout == "transposed":
+        q = torch.randn(8, 192, 16, device=device, dtype=torch.bfloat16).transpose(1, 2)
+    elif layout == "expanded_heads":
+        q = torch.randn(8, 1, 192, device=device, dtype=torch.bfloat16).expand(
+            8, 16, 192
+        )
+    else:
+        q = torch.randn(1, 16, 192, device=device, dtype=torch.bfloat16).expand(
+            8, 16, 192
+        )
     k = torch.randn(8, 16, 192, device=device, dtype=torch.bfloat16)
     v = torch.randn(8, 16, 128, device=device, dtype=torch.bfloat16)
 
-    with pytest.raises(RuntimeError, match="query head dimension must be contiguous"):
+    with pytest.raises(RuntimeError, match=error):
         _run_trtllm_ragged(q, k, v, q_indptr, q_indptr, q_lens)
 
 

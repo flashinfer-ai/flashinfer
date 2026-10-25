@@ -953,6 +953,14 @@ void trtllm_ragged_attention(
   int head_dim_qk = query.size(2);
   int head_dim_v = value.size(2);
   TVM_FFI_ICHECK_EQ(query.stride(2), 1) << "query head dimension must be contiguous";
+  // A zero stride selects the kernel's packed layout, so an expanded query would be
+  // misread; a size-1 dimension never uses its stride.
+  TVM_FFI_ICHECK(sum_seq_q <= 1 || query.stride(0) != 0)
+      << "query token stride must be non-zero, got " << query.stride(0)
+      << "; call .contiguous() on an expanded query";
+  TVM_FFI_ICHECK(num_qo_heads <= 1 || query.stride(1) != 0)
+      << "query head stride must be non-zero, got " << query.stride(1)
+      << "; call .contiguous() on an expanded query";
   // Query stride: [num_tokens, num_heads, head_dim]
   int q_stride_tokens = query.stride(0);  // stride between tokens
   int q_stride_heads = query.stride(1);   // stride between heads
