@@ -122,6 +122,27 @@ def _order_programs():
     return sorted(classes)
 
 
+def _cg1s_classes(arch):
+    """``(world_size, dtype, b_layout, form)`` classes with a delivered last-pass
+    N-split twin of the one-CTA N256 main on ``arch``, read from the emitted
+    table."""
+
+    return {
+        (int(world_size), str(dtype_name), str(b_layout), str(form))
+        for world_size, dtype_name, b_layout, form in loader.CG1S_CLASSES[arch]
+    }
+
+
+def _cg1s_programs():
+    """Every class with a delivered last-pass N-split twin (union over the
+    architectures)."""
+
+    classes = set()
+    for arch in loader.ARCH_FLAGS:
+        classes |= _cg1s_classes(arch)
+    return sorted(classes)
+
+
 def _spill_point_form(arch, world_size, dtype_name, b_layout, padded, n):
     """Form of the emitted spill point naming the class, padded rows and ``n`` on
     ``arch``, or ``None`` when no point does."""
@@ -197,6 +218,20 @@ def test_route_table_covers_every_world_size_dtype_layout_and_phase():
         f"main_{dtype_name}_ws{world_size}_{b_layout}_{form}"
         for world_size, dtype_name, b_layout, form in _order_programs()
     }
+    # One last-pass N-split twin of the one-CTA main per class of the delivered
+    # class table, each a program of its own; no other ``_cg1s2`` route exists.
+    splits = set()
+    for world_size, dtype_name, b_layout, form in _cg1s_programs():
+        program = loader.main_program(world_size, dtype_name, b_layout, form=form)
+        assert program in loader.PROGRAMS
+        assert program not in mains | twins | pairs | spills | orders
+        splits.add(program)
+    assert len(splits) == len(_cg1s_programs())
+    split_keys = {key for key in loader.ROUTES if key.endswith("_cg1s2")}
+    assert split_keys == {
+        f"main_{dtype_name}_ws{world_size}_{b_layout}_{form}"
+        for world_size, dtype_name, b_layout, form in _cg1s_programs()
+    }
     kslice_routes = {key for key in loader.ROUTES if loader._is_kslice_stage(key)}
     expected_routes = (
         2
@@ -206,6 +241,7 @@ def test_route_table_covers_every_world_size_dtype_layout_and_phase():
         + len(pairs)
         + len(spills)
         + len(orders)
+        + len(splits)
         + len(kslice_routes)
     )
     assert len(loader.ROUTES) == expected_routes
@@ -382,9 +418,10 @@ def test_cg2_tables_list_the_measured_pair_regions_and_classes_per_architecture(
 
     assert set(loader.CG2_CLASSES) == set(loader.CG2_REGIONS) == set(loader.ARCH_FLAGS)
     assert loader.CG2_REGIONS == _CG2_REGIONS
-    assert loader.MAIN_FORMS == ("cg1", "cg2", "cg2s1", "cg2s2", "po", "pi")
+    assert loader.MAIN_FORMS == ("cg1", "cg2", "cg2s1", "cg2s2", "po", "pi", "cg1s2")
     assert loader.PAIR_FORMS == ("cg2", "cg2s1", "cg2s2")
     assert loader.ORDER_FORMS == ("po", "pi")
+    assert loader.ONE_CTA_SPLIT_FORMS == ("cg1s2",)
     assert loader.CG2_CLUSTER_DIMS == (2, 1, 1)
     for arch in loader.ARCH_FLAGS:
         classes = _cg2_classes(arch)
@@ -472,6 +509,7 @@ def test_cg2_spill_point_table_lists_the_measured_points_per_architecture():
         3,
         4,
         5,
+        6,
     ]
     with pytest.raises(ValueError, match="form"):
         loader.main_form_code("pair")
@@ -622,6 +660,165 @@ def test_tile_order_point_table_lists_the_ws4_bf16_k_major_point_on_sm_103a_and_
         loader._order_classes("sm_90a")
 
 
+# ``[world_size, dtype, b_layout, padded_rows, n, form]`` one-CTA last-pass
+# N-split points: the one-CTA N256 main's ``cg1s2`` twin (its last persistent
+# pass runs each output tile as two 128-wide half items on otherwise idle CTAs;
+# the one-CTA launch and grid) on exact padded rows and exact N. One point is
+# delivered, on sm_103a alone: the eight-rank bf16 K-major calls of 1152 padded
+# rows at N = 1280 (1025..1152 rows) run the ``cg1s2`` twin; sm_100a lists none.
+_CG1S_POINTS = {
+    "sm_100a": [],
+    "sm_103a": [[8, "bfloat16", "k_major", 1152, 1280, "cg1s2"]],
+}
+_CG1S_CLASSES = {"sm_100a": set(), "sm_103a": {(8, "bfloat16", "k_major", "cg1s2")}}
+_CG1S_POINT_ROUTE = "main_bfloat16_ws8_k_major_cg1s2"
+# ``(rows, n, world_size)`` bf16 K-major calls at the point (1025..1152 rows pad
+# to 1152) and off it (1024 pads to 1024, the SM push band row; 1153 pads to
+# 1280; the next column multiple; the four-rank call, inside the sm_103a pair
+# rectangle of its class; a two-rank call).
+_CG1S_POINT_CALLS = ((1025, 1280, 8), (1100, 1280, 8), (1152, 1280, 8))
+_CG1S_OFF_POINT_CALLS = (
+    (1024, 1280, 8),
+    (1153, 1280, 8),
+    (1025, 1536, 8),
+    (1025, 1280, 4),
+    (1025, 1280, 2),
+)
+# The off-point calls a pair rectangle of their class takes, per architecture
+# (the four-rank call on sm_103a); every other off-point call stays on cg1.
+_CG1S_OFF_POINT_PAIRED = {"sm_100a": set(), "sm_103a": {(1025, 1280, 4)}}
+
+
+def test_cg1s_point_table_lists_the_ws8_bf16_k_major_point_on_sm_103a_and_the_form_takes_the_one_cta_grid():
+    """The one-CTA main's last-pass N-split twin (``cg1s2``) is form code 6 of
+    the host sequence. One point is delivered, on sm_103a alone: ``main_form``
+    selects ``cg1s2`` for exactly the eight-rank bf16 K-major calls of 1152
+    padded rows at N = 1280 there, one ``_cg1s2`` route ships (a program of its
+    own next to the one-CTA main of the class, delivered for sm_103a only) and
+    ``main_program`` refuses the form for every other class and at the 128-wide
+    tile; sm_100a keeps every call of the point geometry on the one-CTA program.
+    The twin's grid is the one-CTA grid at the public width."""
+
+    assert set(loader.CG1S_POINTS) == set(loader.ARCH_FLAGS)
+    assert set(loader.CG1S_CLASSES) == set(loader.ARCH_FLAGS)
+    assert loader.CG1S_POINTS == _CG1S_POINTS
+    for arch in loader.ARCH_FLAGS:
+        assert _cg1s_classes(arch) == _CG1S_CLASSES[arch], arch
+        assert loader._cg1s_classes(arch) == frozenset(_CG1S_CLASSES[arch]), arch
+        on_point = "cg1s2" if arch == "sm_103a" else None
+        for rows, n, world_size in _CG1S_POINT_CALLS:
+            padded = loader.padded_rows(rows)
+            assert (
+                loader._cg1s_point(arch, world_size, "bfloat16", "k_major", padded, n)
+                == on_point
+            ), (arch, rows)
+            # The point is no tile-order point: one form per one-CTA call.
+            assert (
+                loader._tile_order_point(
+                    arch, world_size, "bfloat16", "k_major", padded, n
+                )
+                is None
+            ), (arch, rows)
+            assert loader.main_form(
+                rows,
+                n,
+                world_size=world_size,
+                arch=arch,
+                dtype_name="bfloat16",
+                b_layout="k_major",
+                block_n=256,
+            ) == (on_point or "cg1"), (arch, rows)
+        for rows, n, world_size in _CG1S_OFF_POINT_CALLS:
+            assert (
+                loader._cg1s_point(
+                    arch, world_size, "bfloat16", "k_major", loader.padded_rows(rows), n
+                )
+                is None
+            ), (arch, rows, n, world_size)
+            paired = (rows, n, world_size) in _CG1S_OFF_POINT_PAIRED[arch]
+            assert loader.main_form(
+                rows,
+                n,
+                world_size=world_size,
+                arch=arch,
+                dtype_name="bfloat16",
+                b_layout="k_major",
+                block_n=256,
+            ) == ("cg2" if paired else "cg1"), (arch, rows, n, world_size)
+        # The other layout and dtype of the point geometry, and the 128-wide call,
+        # stay on the one-CTA program on both architectures.
+        for dtype_name, b_layout, block_n in (
+            ("bfloat16", "n_major", 256),
+            ("float16", "k_major", 256),
+            ("bfloat16", "k_major", 128),
+        ):
+            assert (
+                loader.main_form(
+                    1025,
+                    1280,
+                    world_size=8,
+                    arch=arch,
+                    dtype_name=dtype_name,
+                    b_layout=b_layout,
+                    block_n=block_n,
+                )
+                == "cg1"
+            ), (arch, dtype_name, b_layout, block_n)
+    # Exactly one last-pass N-split route: the ``_cg1s2`` twin of the ws8 bf16
+    # k_major class, a program of its own next to the class's one-CTA main,
+    # delivered for sm_103a alone and compiled into that architecture's host
+    # sequence of the class only.
+    assert {key for key in loader.ROUTES if key.endswith("_cg1s2")} == {
+        _CG1S_POINT_ROUTE
+    }
+    twin = loader.main_program(8, "bfloat16", "k_major", form="cg1s2")
+    assert twin == loader.ROUTES[_CG1S_POINT_ROUTE]
+    assert twin in loader.PROGRAMS
+    assert twin != loader.main_program(8, "bfloat16", "k_major")
+    assert loader.PROGRAMS[twin]["arches"] == ["sm_103a"]
+    for arch in loader.ARCH_FLAGS:
+        sequence = loader.sequence_name(8, "bfloat16", "k_major", arch)
+        delivered = (8, "bfloat16", "k_major", "cg1s2") in _CG1S_CLASSES[arch]
+        assert (twin in loader.sequence_programs(sequence)) == delivered, arch
+        assert ("main_cg1s2" in loader.SEQUENCES[sequence]["programs"]) == delivered
+    assert len(loader.MAIN_FORMS) == 7
+    for form in loader.ONE_CTA_SPLIT_FORMS:
+        assert loader.main_form_code(form) == 6
+        assert form not in loader.PAIR_FORMS and form not in loader.ORDER_FORMS
+        for sm_count, grid in ((148, (148, 1, 1)), (105, (105, 1, 1))):
+            assert (
+                loader.main_grid(1025, 1280, world_size=8, sm_count=sm_count, form=form)
+                == loader.main_grid(1025, 1280, world_size=8, sm_count=sm_count)
+                == grid
+            )
+        with pytest.raises(ValueError, match="block_n=256 only"):
+            loader.main_grid(
+                1025, 1280, world_size=8, sm_count=148, block_n=128, form=form
+            )
+        with pytest.raises(ValueError, match="block_n=256 only"):
+            loader._main_route_key(8, "bfloat16", "k_major", 128, form)
+        with pytest.raises(ValueError, match="block_n=256 only"):
+            loader.main_program(8, "bfloat16", "k_major", block_n=128, form=form)
+    # Code 7 names no form.
+    with pytest.raises(ValueError, match="form"):
+        loader.main_form_code("cg1s3")
+    # The twin is delivered for the point's class alone.
+    for world_size, dtype_name, b_layout in (
+        (4, "bfloat16", "k_major"),
+        (8, "bfloat16", "n_major"),
+        (8, "float16", "k_major"),
+        (2, "bfloat16", "k_major"),
+    ):
+        with pytest.raises(
+            ValueError, match="no all-gather matmul main program is delivered"
+        ):
+            loader.main_program(world_size, dtype_name, b_layout, form="cg1s2")
+    with pytest.raises(ValueError, match="no entry for arch 'sm_90a'"):
+        loader._cg1s_point("sm_90a", 8, "bfloat16", "k_major", 1152, 1280)
+    with pytest.raises(ValueError, match="no entry for arch 'sm_90a'"):
+        loader._cg1s_classes("sm_90a")
+
+
 def test_every_program_lists_its_device_source_only():
     for program, row in loader.PROGRAMS.items():
         assert len(row["sources"]) == 1, program
@@ -737,6 +934,20 @@ def test_every_route_has_one_host_sequence_per_architecture():
                     assert row["programs"][f"main_{form}"] == order_twin
                     assert arch in loader.PROGRAMS[order_twin]["arches"]
                     route.add(order_twin)
+            # The one-CTA main's last-pass N-split twin likewise, for the classes
+            # with a delivered point of that form on this architecture (the ws8
+            # bf16 k_major ``cg1s2`` class on sm_103a, none on sm_100a).
+            for form in loader.ONE_CTA_SPLIT_FORMS:
+                split_class = (world_size, dtype_name, b_layout, form)
+                split_delivered = split_class in loader._cg1s_classes(arch)
+                assert (f"main_{form}" in row["programs"]) is split_delivered
+                if split_delivered:
+                    split_twin = loader.main_program(
+                        world_size, dtype_name, b_layout, form=form
+                    )
+                    assert row["programs"][f"main_{form}"] == split_twin
+                    assert arch in loader.PROGRAMS[split_twin]["arches"]
+                    route.add(split_twin)
             # The per-K-slice readiness twins of the class's slice points on this
             # architecture travel with the sequence under their ``_ks<S>`` stage
             # names: the push twin of each point's launched program family and the
@@ -853,6 +1064,19 @@ def test_every_program_is_delivered_for_both_architectures():
             arch
             for arch in loader.ARCH_FLAGS
             if (world_size, dtype_name, b_layout, form) in _order_classes(arch)
+        ), twin
+        assert loader.PROGRAMS[twin]["arches"] == ["sm_103a"], twin
+    # The one-CTA main's last-pass N-split twin likewise (the pinned class: the
+    # ws8 bf16 k_major ``cg1s2`` twin on sm_103a alone).
+    assert sorted(_cg1s_programs()) == sorted(
+        {cls for classes in _CG1S_CLASSES.values() for cls in classes}
+    )
+    for world_size, dtype_name, b_layout, form in _cg1s_programs():
+        twin = loader.main_program(world_size, dtype_name, b_layout, form=form)
+        assert loader.PROGRAMS[twin]["arches"] == sorted(
+            arch
+            for arch in loader.ARCH_FLAGS
+            if (world_size, dtype_name, b_layout, form) in _cg1s_classes(arch)
         ), twin
         assert loader.PROGRAMS[twin]["arches"] == ["sm_103a"], twin
     sm103_sequence = loader.sequence_name(8, "bfloat16", "n_major", "sm_103a")
@@ -1181,6 +1405,18 @@ def test_main_programs_share_one_block_and_dynamic_shared_memory_contract():
     assert spill_blocks == {(loader.MAIN_THREADS, 1, 1)}
     for form, values in spill_smem.items():
         assert len(values) == 1 and values.pop() > 0, form
+    # The one-CTA main's last-pass N-split twin shares the N256 block as well
+    # and, per form, one dynamic shared memory value of its own read from the
+    # twin's build receipt.
+    split_blocks = set()
+    split_smem = {}
+    for world_size, dtype_name, b_layout, form in _cg1s_programs():
+        program = loader.main_program(world_size, dtype_name, b_layout, form=form)
+        split_blocks.add(loader.launch_block(program))
+        split_smem.setdefault(form, set()).add(loader.dynamic_smem_bytes(program))
+    assert split_blocks == {(loader.MAIN_THREADS, 1, 1)}
+    for form, values in split_smem.items():
+        assert len(values) == 1 and values.pop() > 0, form
 
 
 @pytest.mark.parametrize(
@@ -1465,6 +1701,14 @@ _INVENTORY_ROWS = (
         (1024, 1280, 8, "bfloat16", "k_major"),
         _N256,
     ),
+    # 360 N256 tiles = three waves: beyond the cap of both architectures; on
+    # sm_103a its 1152 padded rows at N = 1280 are the one-CTA main's last-pass
+    # N-split point.
+    (
+        "llama_tp8_qkv_bf16_m1025_kmajor",
+        (1025, 1280, 8, "bfloat16", "k_major"),
+        _N256,
+    ),
     # 224 N256 tiles: 2 * ceil(224 / 148) = 4 = ceil(448 / 148), no idle slot saved.
     (
         "llama_tp8_gate_up_bf16_m125_kmajor",
@@ -1669,8 +1913,10 @@ def test_main_form_routes_the_inventory_rows_by_the_region_table(label, shape, w
     llama_tp4_qkv_bf16_m1024_kmajor stays on the CTA-pair twin. Of the one-CTA
     rows, llama_tp4_gate_up_bf16_m125_kmajor on sm_103a (128 padded rows at
     N = 14336: the one tile-order point) runs the ``po`` tile-order twin of the
-    one-CTA program; every other row, and that row on sm_100a, runs the
-    one-CTA program itself."""
+    one-CTA program and llama_tp8_qkv_bf16_m1025_kmajor on sm_103a (1152 padded
+    rows at N = 1280: the one last-pass N-split point) runs the ``cg1s2``
+    last-pass N-split twin of the one-CTA program; every other row, and those
+    rows on sm_100a, runs the one-CTA program itself."""
 
     rows, n, world_size, dtype_name, b_layout = shape
     for arch, block_n in widths.items():
@@ -1701,13 +1947,29 @@ def test_main_form_routes_the_inventory_rows_by_the_region_table(label, shape, w
         order_delivered = (world_size, dtype_name, b_layout, order) in _order_classes(
             arch
         )
+        split = loader._cg1s_point(arch, world_size, dtype_name, b_layout, padded, n)
+        split_delivered = (world_size, dtype_name, b_layout, split) in _cg1s_classes(
+            arch
+        )
         if qualifies and delivered:
             expected_form = point or "cg2"
         elif block_n == 256 and order is not None and order_delivered:
             expected_form = order
+        elif block_n == 256 and split is not None and split_delivered:
+            expected_form = split
         else:
             expected_form = "cg1"
         assert form == expected_form, (label, arch)
+        expected_split = (
+            label
+            in {
+                "sm_103a": {"llama_tp8_qkv_bf16_m1025_kmajor"},
+                "sm_100a": set(),
+            }[arch]
+        )
+        assert (split is not None) is expected_split, (label, arch)
+        assert (form in loader.ONE_CTA_SPLIT_FORMS) is expected_split, (label, arch)
+        assert (form == "cg1s2") is expected_split, (label, arch)
         expected_order = (
             arch == "sm_103a" and label == "llama_tp4_gate_up_bf16_m125_kmajor"
         )
@@ -1958,11 +2220,14 @@ def test_main_form_selects_the_pair_twin_only_inside_a_measured_region_at_the_pu
                 # to 640, 1025 to 1152); every N = 1280 call stays one-CTA. The
                 # 512 point is the spill point (llama_tp8_gate_up m512): the
                 # spill-wave N-split pair twin of its form; the 1024 point keeps
-                # the CTA-pair twin.
+                # the CTA-pair twin. No last-pass N-split point on sm_100a: the
+                # M=1025 QKV call (1152 padded rows at N = 1280) keeps the one-CTA
+                # program.
                 cls = (8, "bfloat16", "k_major")
                 assert (dtype_name, b_layout) == cls[1:]
                 p_ws8 = _spill_point_form(arch, *cls, 512, 7168)
                 assert p_ws8 in loader.PAIR_FORMS[1:]
+                assert loader._cg1s_point(arch, *cls, 1152, 1280) is None
                 assert [rule(rows) for rows in (1, 512, 1024, 1025, 2048, 4096)] == [
                     "cg1"
                 ] * 6
@@ -2102,12 +2367,21 @@ def test_main_form_selects_the_pair_twin_only_inside_a_measured_region_at_the_pu
             # (8, bfloat16, k_major), the gate_up point (llama_tp8_gate_up m512):
             # exactly 512 padded rows at exactly N = 7168, the spill-wave N-split
             # pair twin; the class has no other rectangle, so the M=2048 row (not
-            # routed) and every N = 1280 call stay cg1.
+            # routed) and every N = 1280 call stay off the pair forms.
             p_ws8 = _spill_point_form(arch, 8, "bfloat16", "k_major", 512, 7168)
             assert p_ws8 in loader.PAIR_FORMS[1:]
-            assert [rule(rows) for rows in (1, 512, 1024, 1025, 2048, 4096)] == [
+            # The last-pass N-split point (llama_tp8_qkv m1025): exactly 1152
+            # padded rows at exactly N = 1280 run the ``cg1s2`` twin of the
+            # one-CTA program (1025..1152 pad onto it; 1024 and 1153 leave); the
+            # neighbouring column multiples and the 128-wide call stay cg1.
+            p_split = loader._cg1s_point(arch, 8, "bfloat16", "k_major", 1152, 1280)
+            assert p_split == "cg1s2" and p_split in loader.ONE_CTA_SPLIT_FORMS
+            assert [rule(rows) for rows in (1, 512, 1024, 1153, 2048, 4096)] == [
                 "cg1"
             ] * 6
+            assert [rule(rows) for rows in (1025, 1100, 1152)] == ["cg1s2"] * 3
+            assert rule(1152, n=1024) == "cg1" and rule(1152, n=1536) == "cg1"
+            assert rule(1152, block_n=128) == "cg1"
             assert [rule(rows, n=7168) for rows in (500, 511, 512)] == [p_ws8] * 3
             assert [
                 rule(rows, n=7168)
@@ -3236,6 +3510,23 @@ def _pinned_order_code(world_size, dtype_name, b_layout, padded, n):
 _ORDER_WS4_CODE = _pinned_order_code(4, "bfloat16", "k_major", 128, 14336)
 
 
+def _pinned_cg1s_code(world_size, dtype_name, b_layout, padded, n):
+    """Host-sequence form code of the pinned sm_103a last-pass N-split point
+    naming the class, padded rows and ``n`` (``_CG1S_POINTS``): the launch rows
+    below follow the pinned table when a point's form changes."""
+
+    [form] = [
+        entry[5]
+        for entry in _CG1S_POINTS["sm_103a"]
+        if tuple(entry[:5]) == (world_size, dtype_name, b_layout, padded, n)
+    ]
+    return loader.main_form_code(form)
+
+
+# The sm_103a last-pass N-split point: the ws8 QKV M=1025 row (1152 padded rows).
+_CG1S_WS8_CODE = _pinned_cg1s_code(8, "bfloat16", "k_major", 1152, 1280)
+
+
 @pytest.mark.parametrize(
     (
         "rows",
@@ -3293,6 +3584,14 @@ _ORDER_WS4_CODE = _pinned_order_code(4, "bfloat16", "k_major", 128, 14336)
         (128, 14336, 4, "sm_103a", "bfloat16", "k_major", "run", 256, _ORDER_WS4_CODE),
         (129, 14336, 4, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
         (125, 14336, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
+        # The sm_103a last-pass N-split point: ws8 bf16 k_major at exactly 1152
+        # padded rows and N = 1280 (1025 pads to 1152; 1153 pads to 1280 and
+        # leaves) selects the ``cg1s2`` twin of the one-CTA program (form code 6)
+        # on the copy-engine route with the one-CTA grid; sm_100a has no point.
+        (1025, 1280, 8, "sm_103a", "bfloat16", "k_major", "run", 256, _CG1S_WS8_CODE),
+        (1152, 1280, 8, "sm_103a", "bfloat16", "k_major", "run", 256, _CG1S_WS8_CODE),
+        (1153, 1280, 8, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
+        (1025, 1280, 8, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
         (512, 7168, 8, "sm_103a", "bfloat16", "k_major", "run", 256, _GATE_WS8_CODE),
         (2048, 7168, 8, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
         (513, 7168, 8, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
@@ -3459,8 +3758,9 @@ def test_launch_passes_the_loader_tile_width_and_form_after_grid_z_on_both_route
     four-tile split, 3 for the two-tile split -- when the call also names a
     delivered spill-wave N-split point of its class; 4 / 5 for an N256 call the
     pair rule leaves on the one-CTA program that names a delivered tile-order
-    point of its class; 0 otherwise) positionally after ``grid_z``, with the
-    grid of that width and form."""
+    point of its class; 6 for such a call that names a delivered last-pass
+    N-split point of its class; 0 otherwise) positionally after ``grid_z``, with
+    the grid of that width and form."""
 
     call, state, workspace, sequence = _launch_fixture(
         monkeypatch,
@@ -3484,7 +3784,7 @@ def test_launch_passes_the_loader_tile_width_and_form_after_grid_z_on_both_route
     assert args[grid_z - 2 : grid_z + 1] == grid
     if form in backend.loader.PAIR_FORMS:
         assert grid[0] % 2 == 0
-    if form in backend.loader.ORDER_FORMS:
+    if form in backend.loader.ORDER_FORMS or form in backend.loader.ONE_CTA_SPLIT_FORMS:
         assert grid == backend.loader.main_grid(
             rows, n, world_size=world_size, sm_count=148
         )
