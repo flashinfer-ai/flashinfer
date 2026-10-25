@@ -2814,7 +2814,7 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation):
     layer._select_winner = lambda *_: (runner, -1)
     actual = layer(act_pack, weight_pack)
     if quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16):
-        from tests.test_helpers.w4a16_reference import (
+        from tests.moe_ep.w4a16_reference import (
             assert_w4a16_bits,
             split_w4a16_reference_from_tensors,
         )

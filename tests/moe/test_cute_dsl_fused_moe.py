@@ -53,7 +53,7 @@ from flashinfer.fused_moe.cute_dsl.moe_utils import (
 from flashinfer.cute_dsl import is_cute_dsl_available
 from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
 from flashinfer.utils import get_compute_capability
-from tests.test_helpers.w4a16_reference import (
+from tests.moe_ep.w4a16_reference import (
     assert_w4a16_bits,
     prepare_split_w4a16_exact_fused,
     split_w4a16_reference_from_tensors,

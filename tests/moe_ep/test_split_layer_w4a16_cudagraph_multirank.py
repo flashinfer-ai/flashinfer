@@ -31,7 +31,7 @@ from datetime import timedelta
 
 import pytest
 
-from tests.test_helpers.w4a16_reference import assert_w4a16_bits
+from .w4a16_reference import assert_w4a16_bits
 
 pytestmark = [
     pytest.mark.nvep,
