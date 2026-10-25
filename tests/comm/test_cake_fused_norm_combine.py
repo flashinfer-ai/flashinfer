@@ -39,35 +39,65 @@ from flashinfer.jit import cake_fused_norm_combine as loader
 api = importlib.import_module("flashinfer.comm.cake_fused_norm_combine")
 
 # Every dispatch band, both sides of every band edge, and the band interiors.
-TOKENS_UNDER_TEST = (1, 2, 3, 4, 8, 39, 40, 64, 256, 479, 480, 1024, 2048)
+TOKENS_UNDER_TEST = (
+    1,
+    2,
+    3,
+    4,
+    8,
+    39,
+    40,
+    64,
+    256,
+    479,
+    480,
+    592,
+    593,
+    1024,
+    1772,
+    1773,
+    2048,
+)
 ATOL = 1e-2
 RTOL = 1e-2
 WORKER_TIMEOUT_SECONDS = 20 * 60
 
 
 @pytest.mark.parametrize(
-    "tokens,expected",
+    "tokens,sm_count,expected",
     [
-        (1, api.VARIANT_PARALLEL),
-        (api.SPLIT_MIN_TOKENS - 1, api.VARIANT_PARALLEL),
-        (api.SPLIT_MIN_TOKENS, api.VARIANT_PARALLEL_SPLIT),
-        (api.STREAM_MIN_TOKENS - 1, api.VARIANT_PARALLEL_SPLIT),
-        (api.STREAM_MIN_TOKENS, api.VARIANT_OWNER_STREAM),
-        (api.PIPELINED_MIN_TOKENS - 1, api.VARIANT_OWNER_STREAM),
-        (api.PIPELINED_MIN_TOKENS, api.VARIANT_OWNER_PIPELINED),
-        (2048, api.VARIANT_OWNER_PIPELINED),
+        (1, 148, api.VARIANT_PARALLEL_SINGLE),
+        (2, 148, api.VARIANT_PARALLEL),
+        (api.SPLIT_MIN_TOKENS - 1, 148, api.VARIANT_PARALLEL),
+        (api.SPLIT_MIN_TOKENS, 148, api.VARIANT_PARALLEL_SPLIT),
+        (api.STREAM_MIN_TOKENS - 1, 148, api.VARIANT_PARALLEL_SPLIT),
+        (api.STREAM_MIN_TOKENS, 148, api.VARIANT_OWNER_STREAM),
+        (api.PIPELINED_MIN_TOKENS - 1, 148, api.VARIANT_OWNER_STREAM),
+        (api.PIPELINED_MIN_TOKENS, 148, api.VARIANT_OWNER_PIPELINED),
+        # 148 SMs: four CTAs per SM hold 592 tokens in one step; the
+        # three-CTA grid of 443 CTAs covers 1772 tokens in four steps.
+        (592, 148, api.VARIANT_OWNER_PIPELINED),
+        (593, 148, api.VARIANT_OWNER_PIPELINED_EARLY),
+        (1772, 148, api.VARIANT_OWNER_PIPELINED_EARLY),
+        (1773, 148, api.VARIANT_OWNER_PIPELINED),
+        (2048, 148, api.VARIANT_OWNER_PIPELINED),
+        # 152 SMs: 608 tokens in one step, a 455-CTA grid for four steps.
+        (608, 152, api.VARIANT_OWNER_PIPELINED),
+        (609, 152, api.VARIANT_OWNER_PIPELINED_EARLY),
+        (1820, 152, api.VARIANT_OWNER_PIPELINED_EARLY),
+        (1821, 152, api.VARIANT_OWNER_PIPELINED),
     ],
 )
-def test_token_dispatch(tokens: int, expected: str) -> None:
+def test_token_dispatch(tokens: int, sm_count: int, expected: str) -> None:
     assert 1 < api.SPLIT_MIN_TOKENS < api.STREAM_MIN_TOKENS < api.PIPELINED_MIN_TOKENS
-    assert api.select_variant(tokens) == expected
+    assert api.select_variant(tokens, sm_count) == expected
     assert expected in api.VARIANTS
 
 
-@pytest.mark.parametrize("tokens", [0, -1, True])
-def test_token_dispatch_rejects_non_positive_counts(tokens) -> None:
+@pytest.mark.parametrize("tokens,sm_count", [(0, 148), (-1, 148), (True, 148), (8, 0)])
+def test_token_dispatch_rejects_non_positive_counts(tokens, sm_count) -> None:
     with pytest.raises(ValueError):
-        api.select_variant(tokens)
+        api.select_variant(tokens, sm_count)
 
 
 @pytest.mark.parametrize(
@@ -89,12 +119,15 @@ def test_persistent_grid_is_every_token_or_the_largest_odd_co_resident_grid(
 
 
 def test_grid_rules() -> None:
+    assert api.launch_grid_x(api.VARIANT_PARALLEL_SINGLE, 1, 148) == 1
     assert api.launch_grid_x(api.VARIANT_PARALLEL, 2, 148) == 2
     assert api.launch_grid_x(api.VARIANT_PARALLEL_SPLIT, 8, 148) == 64
     assert api.launch_grid_x(api.VARIANT_OWNER_STREAM, 64, 148) == 64
     assert api.launch_grid_x(api.VARIANT_OWNER_STREAM, 256, 148) == 147
     assert api.launch_grid_x(api.VARIANT_OWNER_PIPELINED, 512, 148) == 512
     assert api.launch_grid_x(api.VARIANT_OWNER_PIPELINED, 2048, 148) == 591
+    assert api.launch_grid_x(api.VARIANT_OWNER_PIPELINED_EARLY, 593, 148) == 443
+    assert api.launch_grid_x(api.VARIANT_OWNER_PIPELINED_EARLY, 1772, 148) == 443
     with pytest.raises(ValueError):
         api.launch_grid_x("unknown", 8, 148)
     with pytest.raises(ValueError):
@@ -314,6 +347,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
 
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
+    sm_count = torch.cuda.get_device_properties(rank).multi_processor_count
     dist.init_process_group(
         backend="nccl",
         init_method=f"tcp://127.0.0.1:{port}",
@@ -376,7 +410,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                 epsilon=epsilon,
             )
             torch.cuda.synchronize(device)
-            variant = api.select_variant(tokens)
+            variant = api.select_variant(tokens, sm_count)
             _assert_close_all_ranks(
                 norm_out, normalized, label=f"norm_out T={tokens} {variant}"
             )

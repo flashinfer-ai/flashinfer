@@ -63,7 +63,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(320) void
-kernel_cake_fused_norm_combine_f0f0fd407a1de987d19e(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ residual, __nv_bfloat16* __restrict__ weight, __nv_bfloat16* __restrict__ norm_out, __nv_bfloat16* __restrict__ residual_out, __nv_bfloat16* __restrict__ collective_out, unsigned long long* __restrict__ workspace, int rank, int tokens, float epsilon)
+kernel_cake_fused_norm_combine_102ff2a7592bbb88f200(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ residual, __nv_bfloat16* __restrict__ weight, __nv_bfloat16* __restrict__ norm_out, __nv_bfloat16* __restrict__ residual_out, __nv_bfloat16* __restrict__ collective_out, unsigned long long* __restrict__ workspace, int rank, int tokens, float epsilon)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -255,35 +255,70 @@ kernel_cake_fused_norm_combine_f0f0fd407a1de987d19e(__nv_bfloat16* __restrict__ 
             mean[element_4] = __fmaf_rn(other_track, 0.5f, mean[element_4]);
         }
     }
-    float contribution[16];
-    #pragma unroll
-    for (int element_5 = 0; element_5 < 16; element_5++) {
-        float _cvt_f32_0 = (float)(__nv_bfloat16)mean[element_5];
-        contribution[element_5] = ((_cvt_f32_0 == 0.0f) ? 0.0f : _cvt_f32_0);
-    }
-    unsigned int contribution_bf16[8];
-    #pragma unroll
-    for (int _lp = 0; _lp < 8; _lp++) {
-        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(contribution[_lp*2 + 0], contribution[_lp*2+1 + 0]));
-        contribution_bf16[_lp] = *(uint32_t*)&_bf2;
-    }
     if (tid < 160) {
+        unsigned int mean_bf16[8];
+        #pragma unroll
+        for (int _lp = 0; _lp < 8; _lp++) {
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(mean[_lp*2 + 0], mean[_lp*2+1 + 0]));
+            mean_bf16[_lp] = *(uint32_t*)&_bf2;
+        }
+        unsigned int positive_zero = 0;
+        unsigned int contribution_words[8];
+        uint32_t _bf16x2_add_8;
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_8) : "r"(mean_bf16[0]), "r"(positive_zero));
+        contribution_words[0] = _bf16x2_add_8;
+        uint32_t _bf16x2_add_9;
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_9) : "r"(mean_bf16[1]), "r"(positive_zero));
+        contribution_words[1] = _bf16x2_add_9;
+        uint32_t _bf16x2_add_10;
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_10) : "r"(mean_bf16[2]), "r"(positive_zero));
+        contribution_words[2] = _bf16x2_add_10;
+        uint32_t _bf16x2_add_11;
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_11) : "r"(mean_bf16[3]), "r"(positive_zero));
+        contribution_words[3] = _bf16x2_add_11;
+        uint32_t _bf16x2_add_12;
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_12) : "r"(mean_bf16[4]), "r"(positive_zero));
+        contribution_words[4] = _bf16x2_add_12;
+        uint32_t _bf16x2_add_13;
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_13) : "r"(mean_bf16[5]), "r"(positive_zero));
+        contribution_words[5] = _bf16x2_add_13;
+        uint32_t _bf16x2_add_14;
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_14) : "r"(mean_bf16[6]), "r"(positive_zero));
+        contribution_words[6] = _bf16x2_add_14;
+        uint32_t _bf16x2_add_15;
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_15) : "r"(mean_bf16[7]), "r"(positive_zero));
+        contribution_words[7] = _bf16x2_add_15;
         long long publish_offset = data_base + ((long long)rank * (long long)total_vectors + (long long)vector_index) * 16;
         #pragma unroll
         for (int peer = 0; peer < 8; peer++) {
             __nv_bfloat16* peer_payload = reinterpret_cast<__nv_bfloat16*>(workspace[16 + peer]);
-            asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(peer_payload + publish_offset), "r"((contribution_bf16)[0]), "r"((contribution_bf16)[1]), "r"((contribution_bf16)[2]), "r"((contribution_bf16)[3]), "r"((contribution_bf16)[4]), "r"((contribution_bf16)[5]), "r"((contribution_bf16)[6]), "r"((contribution_bf16)[7]) : "memory");
+            asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(peer_payload + publish_offset), "r"((contribution_words)[0]), "r"((contribution_words)[1]), "r"((contribution_words)[2]), "r"((contribution_words)[3]), "r"((contribution_words)[4]), "r"((contribution_words)[5]), "r"((contribution_words)[6]), "r"((contribution_words)[7]) : "memory");
         }
+        asm volatile("barrier.arrive 1, 320;" ::: "memory");
     }
-    unsigned int sentinel[8];
-    #pragma unroll
-    for (int word = 0; word < 8; word++) {
-        sentinel[word] = 2147516416;
-    }
-    int clear_start = bid * 320 + tid;
-    #pragma unroll 1
-    for (int clear_index = clear_start; clear_index < control_clear_word / 32; clear_index += num_bids * 320) {
-        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(local_payload + (clear_base + (long long)clear_index * 16)), "r"((sentinel)[0]), "r"((sentinel)[1]), "r"((sentinel)[2]), "r"((sentinel)[3]), "r"((sentinel)[4]), "r"((sentinel)[5]), "r"((sentinel)[6]), "r"((sentinel)[7]) : "memory");
+    if (tid >= 160) {
+        asm volatile("barrier.sync 1, 320;" ::: "memory");
+        if (bid == 0) {
+            if (tid == 160) {
+                {
+                    volatile int* _sysv_wait_p_4 = reinterpret_cast<volatile int*>(reinterpret_cast<unsigned int*>(control_0)) + (0);
+                    while (*_sysv_wait_p_4 != static_cast<int>(num_bids)) {}
+                }
+                control_0[2] = (control_current_word + 1) % 3;
+                control_0[4] = tokens * 2560 * 8 * 2;
+                reinterpret_cast<unsigned int*>(control_0)[0] = 0;
+            }
+        }
+        unsigned int sentinel[8];
+        #pragma unroll
+        for (int word = 0; word < 8; word++) {
+            sentinel[word] = 2147516416;
+        }
+        int clear_start = bid * 160 + (tid - 160);
+        #pragma unroll 1
+        for (int clear_index = clear_start; clear_index < control_clear_word / 32; clear_index += num_bids * 160) {
+            asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(local_payload + (clear_base + (long long)clear_index * 16)), "r"((sentinel)[0]), "r"((sentinel)[1]), "r"((sentinel)[2]), "r"((sentinel)[3]), "r"((sentinel)[4]), "r"((sentinel)[5]), "r"((sentinel)[6]), "r"((sentinel)[7]) : "memory");
+        }
     }
     if (tid < 160) {
         uint32_t _sysv_poll256_group_0[64];
@@ -339,186 +374,175 @@ kernel_cake_fused_norm_combine_f0f0fd407a1de987d19e(__nv_bfloat16* __restrict__ 
         result_words[5] = _sysv_poll256_group_0[5];
         result_words[6] = _sysv_poll256_group_0[6];
         result_words[7] = _sysv_poll256_group_0[7];
-        uint32_t _bf16x2_add_8;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_8) : "r"(result_words[0]), "r"(_sysv_poll256_group_0[8]));
-        result_words[0] = _bf16x2_add_8;
-        uint32_t _bf16x2_add_9;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_9) : "r"(result_words[1]), "r"(_sysv_poll256_group_0[9]));
-        result_words[1] = _bf16x2_add_9;
-        uint32_t _bf16x2_add_10;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_10) : "r"(result_words[2]), "r"(_sysv_poll256_group_0[10]));
-        result_words[2] = _bf16x2_add_10;
-        uint32_t _bf16x2_add_11;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_11) : "r"(result_words[3]), "r"(_sysv_poll256_group_0[11]));
-        result_words[3] = _bf16x2_add_11;
-        uint32_t _bf16x2_add_12;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_12) : "r"(result_words[4]), "r"(_sysv_poll256_group_0[12]));
-        result_words[4] = _bf16x2_add_12;
-        uint32_t _bf16x2_add_13;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_13) : "r"(result_words[5]), "r"(_sysv_poll256_group_0[13]));
-        result_words[5] = _bf16x2_add_13;
-        uint32_t _bf16x2_add_14;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_14) : "r"(result_words[6]), "r"(_sysv_poll256_group_0[14]));
-        result_words[6] = _bf16x2_add_14;
-        uint32_t _bf16x2_add_15;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_15) : "r"(result_words[7]), "r"(_sysv_poll256_group_0[15]));
-        result_words[7] = _bf16x2_add_15;
         uint32_t _bf16x2_add_16;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_16) : "r"(result_words[0]), "r"(_sysv_poll256_group_0[16]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_16) : "r"(result_words[0]), "r"(_sysv_poll256_group_0[8]));
         result_words[0] = _bf16x2_add_16;
         uint32_t _bf16x2_add_17;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_17) : "r"(result_words[1]), "r"(_sysv_poll256_group_0[17]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_17) : "r"(result_words[1]), "r"(_sysv_poll256_group_0[9]));
         result_words[1] = _bf16x2_add_17;
         uint32_t _bf16x2_add_18;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_18) : "r"(result_words[2]), "r"(_sysv_poll256_group_0[18]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_18) : "r"(result_words[2]), "r"(_sysv_poll256_group_0[10]));
         result_words[2] = _bf16x2_add_18;
         uint32_t _bf16x2_add_19;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_19) : "r"(result_words[3]), "r"(_sysv_poll256_group_0[19]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_19) : "r"(result_words[3]), "r"(_sysv_poll256_group_0[11]));
         result_words[3] = _bf16x2_add_19;
         uint32_t _bf16x2_add_20;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_20) : "r"(result_words[4]), "r"(_sysv_poll256_group_0[20]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_20) : "r"(result_words[4]), "r"(_sysv_poll256_group_0[12]));
         result_words[4] = _bf16x2_add_20;
         uint32_t _bf16x2_add_21;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_21) : "r"(result_words[5]), "r"(_sysv_poll256_group_0[21]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_21) : "r"(result_words[5]), "r"(_sysv_poll256_group_0[13]));
         result_words[5] = _bf16x2_add_21;
         uint32_t _bf16x2_add_22;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_22) : "r"(result_words[6]), "r"(_sysv_poll256_group_0[22]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_22) : "r"(result_words[6]), "r"(_sysv_poll256_group_0[14]));
         result_words[6] = _bf16x2_add_22;
         uint32_t _bf16x2_add_23;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_23) : "r"(result_words[7]), "r"(_sysv_poll256_group_0[23]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_23) : "r"(result_words[7]), "r"(_sysv_poll256_group_0[15]));
         result_words[7] = _bf16x2_add_23;
         uint32_t _bf16x2_add_24;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_24) : "r"(result_words[0]), "r"(_sysv_poll256_group_0[24]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_24) : "r"(result_words[0]), "r"(_sysv_poll256_group_0[16]));
         result_words[0] = _bf16x2_add_24;
         uint32_t _bf16x2_add_25;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_25) : "r"(result_words[1]), "r"(_sysv_poll256_group_0[25]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_25) : "r"(result_words[1]), "r"(_sysv_poll256_group_0[17]));
         result_words[1] = _bf16x2_add_25;
         uint32_t _bf16x2_add_26;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_26) : "r"(result_words[2]), "r"(_sysv_poll256_group_0[26]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_26) : "r"(result_words[2]), "r"(_sysv_poll256_group_0[18]));
         result_words[2] = _bf16x2_add_26;
         uint32_t _bf16x2_add_27;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_27) : "r"(result_words[3]), "r"(_sysv_poll256_group_0[27]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_27) : "r"(result_words[3]), "r"(_sysv_poll256_group_0[19]));
         result_words[3] = _bf16x2_add_27;
         uint32_t _bf16x2_add_28;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_28) : "r"(result_words[4]), "r"(_sysv_poll256_group_0[28]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_28) : "r"(result_words[4]), "r"(_sysv_poll256_group_0[20]));
         result_words[4] = _bf16x2_add_28;
         uint32_t _bf16x2_add_29;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_29) : "r"(result_words[5]), "r"(_sysv_poll256_group_0[29]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_29) : "r"(result_words[5]), "r"(_sysv_poll256_group_0[21]));
         result_words[5] = _bf16x2_add_29;
         uint32_t _bf16x2_add_30;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_30) : "r"(result_words[6]), "r"(_sysv_poll256_group_0[30]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_30) : "r"(result_words[6]), "r"(_sysv_poll256_group_0[22]));
         result_words[6] = _bf16x2_add_30;
         uint32_t _bf16x2_add_31;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_31) : "r"(result_words[7]), "r"(_sysv_poll256_group_0[31]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_31) : "r"(result_words[7]), "r"(_sysv_poll256_group_0[23]));
         result_words[7] = _bf16x2_add_31;
         uint32_t _bf16x2_add_32;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_32) : "r"(result_words[0]), "r"(_sysv_poll256_group_0[32]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_32) : "r"(result_words[0]), "r"(_sysv_poll256_group_0[24]));
         result_words[0] = _bf16x2_add_32;
         uint32_t _bf16x2_add_33;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_33) : "r"(result_words[1]), "r"(_sysv_poll256_group_0[33]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_33) : "r"(result_words[1]), "r"(_sysv_poll256_group_0[25]));
         result_words[1] = _bf16x2_add_33;
         uint32_t _bf16x2_add_34;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_34) : "r"(result_words[2]), "r"(_sysv_poll256_group_0[34]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_34) : "r"(result_words[2]), "r"(_sysv_poll256_group_0[26]));
         result_words[2] = _bf16x2_add_34;
         uint32_t _bf16x2_add_35;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_35) : "r"(result_words[3]), "r"(_sysv_poll256_group_0[35]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_35) : "r"(result_words[3]), "r"(_sysv_poll256_group_0[27]));
         result_words[3] = _bf16x2_add_35;
         uint32_t _bf16x2_add_36;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_36) : "r"(result_words[4]), "r"(_sysv_poll256_group_0[36]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_36) : "r"(result_words[4]), "r"(_sysv_poll256_group_0[28]));
         result_words[4] = _bf16x2_add_36;
         uint32_t _bf16x2_add_37;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_37) : "r"(result_words[5]), "r"(_sysv_poll256_group_0[37]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_37) : "r"(result_words[5]), "r"(_sysv_poll256_group_0[29]));
         result_words[5] = _bf16x2_add_37;
         uint32_t _bf16x2_add_38;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_38) : "r"(result_words[6]), "r"(_sysv_poll256_group_0[38]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_38) : "r"(result_words[6]), "r"(_sysv_poll256_group_0[30]));
         result_words[6] = _bf16x2_add_38;
         uint32_t _bf16x2_add_39;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_39) : "r"(result_words[7]), "r"(_sysv_poll256_group_0[39]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_39) : "r"(result_words[7]), "r"(_sysv_poll256_group_0[31]));
         result_words[7] = _bf16x2_add_39;
         uint32_t _bf16x2_add_40;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_40) : "r"(result_words[0]), "r"(_sysv_poll256_group_0[40]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_40) : "r"(result_words[0]), "r"(_sysv_poll256_group_0[32]));
         result_words[0] = _bf16x2_add_40;
         uint32_t _bf16x2_add_41;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_41) : "r"(result_words[1]), "r"(_sysv_poll256_group_0[41]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_41) : "r"(result_words[1]), "r"(_sysv_poll256_group_0[33]));
         result_words[1] = _bf16x2_add_41;
         uint32_t _bf16x2_add_42;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_42) : "r"(result_words[2]), "r"(_sysv_poll256_group_0[42]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_42) : "r"(result_words[2]), "r"(_sysv_poll256_group_0[34]));
         result_words[2] = _bf16x2_add_42;
         uint32_t _bf16x2_add_43;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_43) : "r"(result_words[3]), "r"(_sysv_poll256_group_0[43]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_43) : "r"(result_words[3]), "r"(_sysv_poll256_group_0[35]));
         result_words[3] = _bf16x2_add_43;
         uint32_t _bf16x2_add_44;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_44) : "r"(result_words[4]), "r"(_sysv_poll256_group_0[44]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_44) : "r"(result_words[4]), "r"(_sysv_poll256_group_0[36]));
         result_words[4] = _bf16x2_add_44;
         uint32_t _bf16x2_add_45;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_45) : "r"(result_words[5]), "r"(_sysv_poll256_group_0[45]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_45) : "r"(result_words[5]), "r"(_sysv_poll256_group_0[37]));
         result_words[5] = _bf16x2_add_45;
         uint32_t _bf16x2_add_46;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_46) : "r"(result_words[6]), "r"(_sysv_poll256_group_0[46]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_46) : "r"(result_words[6]), "r"(_sysv_poll256_group_0[38]));
         result_words[6] = _bf16x2_add_46;
         uint32_t _bf16x2_add_47;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_47) : "r"(result_words[7]), "r"(_sysv_poll256_group_0[47]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_47) : "r"(result_words[7]), "r"(_sysv_poll256_group_0[39]));
         result_words[7] = _bf16x2_add_47;
         uint32_t _bf16x2_add_48;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_48) : "r"(result_words[0]), "r"(_sysv_poll256_group_0[48]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_48) : "r"(result_words[0]), "r"(_sysv_poll256_group_0[40]));
         result_words[0] = _bf16x2_add_48;
         uint32_t _bf16x2_add_49;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_49) : "r"(result_words[1]), "r"(_sysv_poll256_group_0[49]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_49) : "r"(result_words[1]), "r"(_sysv_poll256_group_0[41]));
         result_words[1] = _bf16x2_add_49;
         uint32_t _bf16x2_add_50;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_50) : "r"(result_words[2]), "r"(_sysv_poll256_group_0[50]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_50) : "r"(result_words[2]), "r"(_sysv_poll256_group_0[42]));
         result_words[2] = _bf16x2_add_50;
         uint32_t _bf16x2_add_51;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_51) : "r"(result_words[3]), "r"(_sysv_poll256_group_0[51]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_51) : "r"(result_words[3]), "r"(_sysv_poll256_group_0[43]));
         result_words[3] = _bf16x2_add_51;
         uint32_t _bf16x2_add_52;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_52) : "r"(result_words[4]), "r"(_sysv_poll256_group_0[52]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_52) : "r"(result_words[4]), "r"(_sysv_poll256_group_0[44]));
         result_words[4] = _bf16x2_add_52;
         uint32_t _bf16x2_add_53;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_53) : "r"(result_words[5]), "r"(_sysv_poll256_group_0[53]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_53) : "r"(result_words[5]), "r"(_sysv_poll256_group_0[45]));
         result_words[5] = _bf16x2_add_53;
         uint32_t _bf16x2_add_54;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_54) : "r"(result_words[6]), "r"(_sysv_poll256_group_0[54]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_54) : "r"(result_words[6]), "r"(_sysv_poll256_group_0[46]));
         result_words[6] = _bf16x2_add_54;
         uint32_t _bf16x2_add_55;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_55) : "r"(result_words[7]), "r"(_sysv_poll256_group_0[55]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_55) : "r"(result_words[7]), "r"(_sysv_poll256_group_0[47]));
         result_words[7] = _bf16x2_add_55;
         uint32_t _bf16x2_add_56;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_56) : "r"(result_words[0]), "r"(_sysv_poll256_group_0[56]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_56) : "r"(result_words[0]), "r"(_sysv_poll256_group_0[48]));
         result_words[0] = _bf16x2_add_56;
         uint32_t _bf16x2_add_57;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_57) : "r"(result_words[1]), "r"(_sysv_poll256_group_0[57]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_57) : "r"(result_words[1]), "r"(_sysv_poll256_group_0[49]));
         result_words[1] = _bf16x2_add_57;
         uint32_t _bf16x2_add_58;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_58) : "r"(result_words[2]), "r"(_sysv_poll256_group_0[58]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_58) : "r"(result_words[2]), "r"(_sysv_poll256_group_0[50]));
         result_words[2] = _bf16x2_add_58;
         uint32_t _bf16x2_add_59;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_59) : "r"(result_words[3]), "r"(_sysv_poll256_group_0[59]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_59) : "r"(result_words[3]), "r"(_sysv_poll256_group_0[51]));
         result_words[3] = _bf16x2_add_59;
         uint32_t _bf16x2_add_60;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_60) : "r"(result_words[4]), "r"(_sysv_poll256_group_0[60]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_60) : "r"(result_words[4]), "r"(_sysv_poll256_group_0[52]));
         result_words[4] = _bf16x2_add_60;
         uint32_t _bf16x2_add_61;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_61) : "r"(result_words[5]), "r"(_sysv_poll256_group_0[61]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_61) : "r"(result_words[5]), "r"(_sysv_poll256_group_0[53]));
         result_words[5] = _bf16x2_add_61;
         uint32_t _bf16x2_add_62;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_62) : "r"(result_words[6]), "r"(_sysv_poll256_group_0[62]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_62) : "r"(result_words[6]), "r"(_sysv_poll256_group_0[54]));
         result_words[6] = _bf16x2_add_62;
         uint32_t _bf16x2_add_63;
-        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_63) : "r"(result_words[7]), "r"(_sysv_poll256_group_0[63]));
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_63) : "r"(result_words[7]), "r"(_sysv_poll256_group_0[55]));
         result_words[7] = _bf16x2_add_63;
+        uint32_t _bf16x2_add_64;
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_64) : "r"(result_words[0]), "r"(_sysv_poll256_group_0[56]));
+        result_words[0] = _bf16x2_add_64;
+        uint32_t _bf16x2_add_65;
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_65) : "r"(result_words[1]), "r"(_sysv_poll256_group_0[57]));
+        result_words[1] = _bf16x2_add_65;
+        uint32_t _bf16x2_add_66;
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_66) : "r"(result_words[2]), "r"(_sysv_poll256_group_0[58]));
+        result_words[2] = _bf16x2_add_66;
+        uint32_t _bf16x2_add_67;
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_67) : "r"(result_words[3]), "r"(_sysv_poll256_group_0[59]));
+        result_words[3] = _bf16x2_add_67;
+        uint32_t _bf16x2_add_68;
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_68) : "r"(result_words[4]), "r"(_sysv_poll256_group_0[60]));
+        result_words[4] = _bf16x2_add_68;
+        uint32_t _bf16x2_add_69;
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_69) : "r"(result_words[5]), "r"(_sysv_poll256_group_0[61]));
+        result_words[5] = _bf16x2_add_69;
+        uint32_t _bf16x2_add_70;
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_70) : "r"(result_words[6]), "r"(_sysv_poll256_group_0[62]));
+        result_words[6] = _bf16x2_add_70;
+        uint32_t _bf16x2_add_71;
+        asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_71) : "r"(result_words[7]), "r"(_sysv_poll256_group_0[63]));
+        result_words[7] = _bf16x2_add_71;
         asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(collective_out + ((long long)vector_index * 16)), "r"((result_words)[0]), "r"((result_words)[1]), "r"((result_words)[2]), "r"((result_words)[3]), "r"((result_words)[4]), "r"((result_words)[5]), "r"((result_words)[6]), "r"((result_words)[7]) : "memory");
-    }
-    if (bid == 0) {
-        if (tid == 0) {
-            {
-                volatile int* _sysv_wait_p_4 = reinterpret_cast<volatile int*>(reinterpret_cast<unsigned int*>(control_0)) + (0);
-                while (*_sysv_wait_p_4 != static_cast<int>(num_bids)) {}
-            }
-            control_0[2] = (control_current_word + 1) % 3;
-            control_0[4] = tokens * 2560 * 8 * 2;
-            reinterpret_cast<unsigned int*>(control_0)[0] = 0;
-        }
     }
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 }
