@@ -299,6 +299,8 @@ class PreparedMiniMaxH3Nvfp4PreAttention:
         self._derived = derived
         self.out_q = out_q
         self.out_sf = out_sf
+        self._device = out_q.device
+        self._ffi_device = tvm_ffi.device(str(out_q.device))
 
     def __call__(self) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         # The NVFP4 output scale tile pads rows to 128 per destination: the
@@ -306,7 +308,11 @@ class PreparedMiniMaxH3Nvfp4PreAttention:
         # GEMM then writes every live scale, so the padding bytes are
         # deterministic without a separate clear. The norm stage zero-pads the
         # activation scale tile as well. The e4m3 output has no scale tile.
-        with tvm_ffi.use_torch_stream():
+        # The converted arguments carry no stream, so both launches use the
+        # current torch stream of the tensors' device, which need not be the
+        # current device.
+        stream = torch.cuda.current_stream(self._device).cuda_stream
+        with tvm_ffi.use_raw_stream(self._ffi_device, stream):
             self._norm_run(*self._norm_args)
             self._gemm_run(*self._gemm_args)
         return self.out_q, self.out_sf

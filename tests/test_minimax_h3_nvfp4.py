@@ -330,6 +330,65 @@ def test_prepared_instances_run_on_independent_streams() -> None:
     assert torch.count_nonzero(second_sf).item() > 0
 
 
+def test_prepared_api_runs_on_the_tensors_device_stream() -> None:
+    """Tensors on a device that is not the current one launch on that device's
+    current torch stream: the stages wait for the input written there and a
+    consumer on that stream sees the finished outputs, byte-identical to a run
+    with the tensors' device current."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two GPUs")
+    capability = torch.cuda.get_device_capability(1)
+    if capability not in ((10, 0), (10, 3)):
+        pytest.skip("requires SM100a or SM103a")
+    pytest.importorskip("flashinfer.jit.cake_minimax_h3_nvfp4_pre_attention")
+
+    M, P = 129, 8
+    device = torch.device("cuda", 1)
+    values = _make_numerical_values(M, P, device)
+    activation_q = torch.empty((M, _HIDDEN // 2), dtype=torch.uint8, device=device)
+    activation_sf = torch.empty(
+        (_round_up(M, 128) * (_HIDDEN // _FP4_BLOCK),), dtype=torch.uint8, device=device
+    )
+    with torch.cuda.device(device):
+        operation = MiniMaxH3Nvfp4PreAttention(
+            **values, activation_q=activation_q, activation_sf=activation_sf, P=P
+        )
+        operation.run(**values)
+        torch.cuda.synchronize()
+    expected_q = values["out_q"].clone()
+    expected_sf = values["out_sf"].clone()
+
+    x = values["x"]
+    x_input = x.clone()
+    x.zero_()
+    values["out_q"].fill_(0x7F)
+    values["out_sf"].fill_(0xA5)
+    torch.cuda.synchronize(device)
+    stream = torch.cuda.Stream(device=device)
+    with torch.cuda.device(device):
+        previous = torch.cuda.current_stream()
+        torch.cuda.set_stream(stream)
+    try:
+        with torch.cuda.device(0):
+            assert torch.cuda.current_stream(device) == stream
+            # The input arrives late on the stream; a launch on any other
+            # stream of the device would read the zeroed input.
+            with torch.cuda.stream(stream):
+                torch.cuda._sleep(200_000_000)
+                x.copy_(x_input)
+            out_q, out_sf = operation.run(**values)
+            with torch.cuda.stream(stream):
+                actual_q = out_q.clone()
+                actual_sf = out_sf.clone()
+        stream.synchronize()
+    finally:
+        with torch.cuda.device(device):
+            torch.cuda.set_stream(previous)
+
+    assert torch.equal(actual_q, expected_q)
+    assert torch.equal(actual_sf, expected_sf)
+
+
 @pytest.mark.parametrize(
     ("M", "P", "expected_norm", "expected_gemm", "expected_row_tiles"),
     [
