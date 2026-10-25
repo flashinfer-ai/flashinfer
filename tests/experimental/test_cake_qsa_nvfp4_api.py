@@ -26,8 +26,9 @@ implementation, an unknown value is refused -- device runs of the route and of t
 default against the package, bit for bit, and
 the NVFP4 paged writer against the torch port the backend suite fills its caches with.
 It also holds the host's program rule on the CPU: which records a call launches for its
-form, architecture and grid classes, when a grid is wide (above one resident wave with
-at least 16 tiles per CTA) and when the sm_103a persistent walk serves it (a two-wave
+form, architecture and grid classes, when a call is wide (on sm_80 above one resident
+wave with at least 16 tiles per CTA; on sm_120a at least 11 tiles per CTA whatever the
+grid) and when the sm_103a persistent walk serves it (a two-wave
 split-form grid whose longest walked CTA is shorter than the plain program's).
 """
 
@@ -280,10 +281,11 @@ def test_generated_sources_are_declared_as_package_data():
 
 def test_program_rule_selects_the_records_of_a_call():
     """The records are filtered by the device's architecture first: the ``mma.sync`` decode's
-    on sm_80 / sm_90a / sm_120a, the tcgen05 decode's on sm_100a / sm_103a / sm_107a.  On sm_80 a
-    wide (multi-wave, long-stream) split-form call launches the whole-tile decode, every
-    other call the K-first decode; the tcgen05 architectures launch the tcgen05 decode
-    whatever the grid, except that on sm_103a a walked split-form call (``walk`` = the
+    on sm_80 / sm_90a / sm_120a, the tcgen05 decode's on sm_100a / sm_103a / sm_107a.  On sm_80
+    and sm_120a a wide split-form call launches the whole-tile decode (sm_80: a multi-wave,
+    long-stream grid; sm_120a: a long per-CTA stream), every other call the K-first decode
+    (sm_90a never selects the whole-tile record); the tcgen05 architectures launch the
+    tcgen05 decode whatever the grid, except that on sm_103a a walked split-form call (``walk`` = the
     persistent walk's CTA count) launches the persistent walk;
     the merge follows above one split on every architecture; the fused form is the
     architecture's cooperative decode alone; an unknown form, architecture or split count is
@@ -301,13 +303,24 @@ def test_program_rule_selects_the_records_of_a_call():
         "decode_whole_tile",
     )
     assert select(form="split", splits=1, arch="sm_80", wide=False) == ("decode",)
+    assert select(form="split", splits=3, arch="sm_120a", wide=True) == (
+        "decode_whole_tile",
+        "merge",
+    )
+    assert select(form="split", splits=1, arch="sm_120a", wide=True) == (
+        "decode_whole_tile",
+    )
+    assert select(form="split", splits=5, arch="sm_120a", wide=False) == (
+        "decode",
+        "merge",
+    )
+    assert select(form="split", splits=1, arch="sm_120a", wide=False) == ("decode",)
     for wide in (False, True):
-        for arch in ("sm_90a", "sm_120a"):
-            assert select(form="split", splits=4, arch=arch, wide=wide) == (
-                "decode",
-                "merge",
-            )
-            assert select(form="split", splits=1, arch=arch, wide=wide) == ("decode",)
+        assert select(form="split", splits=4, arch="sm_90a", wide=wide) == (
+            "decode",
+            "merge",
+        )
+        assert select(form="split", splits=1, arch="sm_90a", wide=wide) == ("decode",)
         for arch in ("sm_80", "sm_90a", "sm_120a"):
             assert select(form="fused", splits=4, arch=arch, wide=wide) == (
                 "decode_coop",
@@ -487,12 +500,21 @@ def test_wide_grid_is_multi_wave_with_long_streams():
     bound inclusive: 16 tiles per CTA (1024 selected tokens) above one wave is wide, 15 is
     not.  The wave is the architecture's: on sm_100a at 148 SMs (one CTA per SM) the rows
     128 single-split grid of 256 CTAs is wide too, which selects nothing there (the tcgen05
-    decode has one split-form record)."""
+    decode has one split-form record).  On sm_120a the bound is the stream alone
+    (``long_stream``): at 188 SMs (376 resident CTAs) rows 32 (3 splits, 11 tiles per CTA),
+    64 (2 splits, 17) and 128 (1 split, 33) are wide within one wave, rows 1-16 (at most 7
+    tiles per CTA) are not; the stream bound is inclusive at 11 tiles."""
     sm_count, arch = 108, "sm_80"
     tiles = cake_backend.num_tiles(2051)
     assert tiles == 33
     assert cake_jit.DECODE_LONG_STREAM_TILES == 16
     assert cake_backend.LONG_STREAM_TILES == cake_jit.DECODE_LONG_STREAM_TILES
+    assert cake_jit.DECODE_STREAM_TILES == 11
+    assert cake_backend.STREAM_TILES == cake_jit.DECODE_STREAM_TILES
+    assert cake_backend.WIDE_BOUNDS == {
+        "sm_80": "multi_wave_long",
+        "sm_120a": "long_stream",
+    }
     assert cake_backend.CTAS_PER_SM == {
         "sm_80": 2,
         "sm_90a": 2,
@@ -539,6 +561,30 @@ def test_wide_grid_is_multi_wave_with_long_streams():
     assert cake_jit.select_records(
         form="split", splits=1, arch="sm_100a", wide=True
     ) == ("decode_tcgen05",)
+    # sm_120a at 188 SMs: the stream alone decides; every owner grid is within one wave of 376.
+    splits_188 = {
+        rows: cake_backend.num_splits(rows, 2, 2051, 188, "sm_120a")
+        for rows in (1, 2, 4, 8, 16, 32, 64, 128)
+    }
+    assert [splits_188[rows] for rows in (16, 32, 64, 128)] == [5, 3, 2, 1]
+    for rows in (1, 2, 4, 8, 16):
+        splits = splits_188[rows]
+        assert -(-tiles // splits) < 11, rows
+        assert not wide(rows, 2, splits, tiles, "split", 188, "sm_120a"), rows
+    for rows in (32, 64, 128):
+        splits = splits_188[rows]
+        assert rows * 2 * splits <= 376, rows
+        assert wide(rows, 2, splits, tiles, "split", 188, "sm_120a"), rows
+        assert not wide(rows, 2, splits, tiles, "fused", 188, "sm_120a"), rows
+    assert wide(2048, 2, 1, tiles, "split", 188, "sm_120a")
+    # The stream bound is inclusive at 11 tiles per CTA and reads ceil(tiles / splits).
+    assert wide(1, 1, 1, 11, "split", 188, "sm_120a")
+    assert not wide(1, 1, 1, 10, "split", 188, "sm_120a")
+    assert wide(64, 2, 2, 21, "split", 188, "sm_120a")  # ceil(21 / 2) = 11
+    assert not wide(64, 2, 2, 20, "split", 188, "sm_120a")  # 10
+    assert cake_jit.select_records(
+        form="split", splits=3, arch="sm_120a", wide=True
+    ) == ("decode_whole_tile", "merge")
     for bad in (
         (0, 2, 1, tiles, "split", sm_count, arch),
         (1, 0, 1, tiles, "split", sm_count, arch),
