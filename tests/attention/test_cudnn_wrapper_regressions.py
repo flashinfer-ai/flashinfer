@@ -1547,8 +1547,15 @@ def test_paged_capture_replan_changes_indices_and_lengths(
 @pytest.mark.parametrize("lse_layout", ["NH", "HN"])
 @pytest.mark.parametrize("device_lengths", [False, True])
 @pytest.mark.parametrize("external_table", [False, True])
+@pytest.mark.parametrize("capture_backend", ["cudnn", "fa2"])
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
 def test_paged_auto_fallback_refreshes_retained_capture(
-    monkeypatch, lse_layout, device_lengths, external_table
+    monkeypatch,
+    lse_layout,
+    device_lengths,
+    external_table,
+    capture_backend,
+    use_cuda_graph,
 ):
     if (
         not prefill._cudnn_supports_paged_auto()
@@ -1558,8 +1565,10 @@ def test_paged_auto_fallback_refreshes_retained_capture(
     # Override shape admission only after checking the real runtime capability:
     # older backends can reject the reserved page table before capture begins.
     # Control admission to exercise the transition independently of performance
-    # heuristics. A captured cuDNN call still reads its original owned table.
-    admitted = [True]
+    # heuristics. Exercise both initial providers: graph wrappers must keep
+    # refreshing a retained FA2 schedule, while eager wrappers may switch freely.
+    initially_cudnn = capture_backend == "cudnn"
+    admitted = [initially_cudnn]
     monkeypatch.setattr(
         flashinfer.prefill, "_blackwell_paged_auto_cudnn", lambda *a: admitted[0]
     )
@@ -1571,7 +1580,7 @@ def test_paged_auto_fallback_refreshes_retained_capture(
         torch.empty(128 << 20, device=q.device, dtype=torch.uint8),
         kv_layout="HND",
         backend="auto",
-        use_cuda_graph=True,
+        use_cuda_graph=use_cuda_graph,
         qo_indptr_buf=torch.empty_like(qo, device=q.device),
         paged_kv_indptr_buf=torch.empty_like(ip, device=q.device),
         paged_kv_indices_buf=torch.empty_like(ix),
@@ -1615,30 +1624,38 @@ def test_paged_auto_fallback_refreshes_retained_capture(
         )
 
     plan()
-    assert wrapper._backend == "cudnn"
+    assert wrapper._backend == capture_backend
     run()
     check()
     torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
+    graph = torch.cuda.CUDAGraph() if use_cuda_graph else None
     try:
-        with torch.cuda.graph(graph):
-            run()
-        for selected in (False, True):
+        if graph is not None:
+            with torch.cuda.graph(graph):
+                run()
+        for selected in (not initially_cudnn, initially_cudnn):
             admitted[0] = selected
             qo = torch.tensor([0, 2, 5], dtype=torch.int32)
             ip = torch.tensor([0, 2, 5], dtype=torch.int32)
             ix = torch.tensor([5, 2, 4, 3, 1], device=q.device, dtype=torch.int32)
             plan(external_table)
-            assert wrapper._backend == ("cudnn" if selected else "fa2")
+            # Both sequences reach FA2 before the first retained replay.
+            # Graph wrappers keep its planner; eager wrappers may switch back.
+            expected_backend = "cudnn" if selected and not use_cuda_graph else "fa2"
+            assert wrapper._backend == expected_backend
             run()
             check()
             v.mul_(0.75)
             out.fill_(torch.nan)
             lse.fill_(torch.nan)
-            graph.replay()
+            if graph is not None:
+                graph.replay()
+            else:
+                run()
             check()
     finally:
-        graph.reset()
+        if graph is not None:
+            graph.reset()
 
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")

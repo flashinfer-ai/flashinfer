@@ -286,6 +286,12 @@ Replay an old capture only with lengths inside its declared bounds and compatibl
 buffers. Keep numerical and lifetime tests independent of heuristic winners and
 timing thresholds.
 
+FA2 captures also bind CPU-generated scheduling metadata, including output and
+merge prefixes. Updating only Q/KV indptr tensors after switching to cuDNN leaves
+that schedule stale when requests exchange query rows. In graph mode, keep FA2
+once it has been planned; eager auto selection can still change providers. Test
+FA2-first as well as cuDNN-first with changed Q partitions and page IDs.
+
 Auto dispatch must preserve run-time calibration scales for half-precision as
 well as FP8 inputs. Test non-unit Q/K scales with nontrivial logits, V scales
 against O and unchanged LSE, and GPU scalar changes before replay. A plan-time
