@@ -141,7 +141,7 @@ __device__ __forceinline__ float approx_rcp(float x) {
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
-kernel_cake_minimax_h3_sm120_quant_varlen_attention_f61ce025db98a842ef62(const __grid_constant__ CUtensorMap Q_map, const __grid_constant__ CUtensorMap K_map, const __grid_constant__ CUtensorMap V_map, __nv_bfloat16* __restrict__ O, float* __restrict__ q_scale, float* __restrict__ k_scale, float* __restrict__ v_scale, int* __restrict__ seg_begin, int* __restrict__ seg_len, int* __restrict__ unit_table, int total_units, int num_heads, int num_kblocks, float softmax_scale_log2)
+kernel_cake_minimax_h3_sm120_quant_varlen_attention_7c1e7479b71d9454c3f5(const __grid_constant__ CUtensorMap Q_map, const __grid_constant__ CUtensorMap K_map, const __grid_constant__ CUtensorMap V_map, __nv_bfloat16* __restrict__ O, float* __restrict__ q_scale, float* __restrict__ k_scale, float* __restrict__ v_scale, int* __restrict__ seg_begin, int* __restrict__ seg_len, int* __restrict__ unit_table, int total_units, int num_heads, int num_kblocks, float softmax_scale_log2)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -222,50 +222,62 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_f61ce025db98a842ef62(const _
         int q_row0 = seg_begin_v + q_tile * 128;
         int kb_first = seg_begin_v / 128;
         int kb_last = (seg_end_v - 1) / 128;
-        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-        if (warp == 0) {
-            if (elect_sync()) {
-                mbarrier_arrive_expect_tx(q_full_addr, 16384);
-                asm volatile(
-                    "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-                    " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                    :: "r"(Q_addr), "l"((&Q_map)), "r"(0), "r"(q_row0), "r"(head),
-                       "r"(q_full_addr), "l"(0x12F0000000000000ULL) : "memory");
-            }
-        }
-        if (kb_first <= kb_last) {
+        int nslot = slot + num_bids;
+        int has_next = ((nslot < total_units) ? 1 : 0);
+        int nslot_c = ((nslot < total_units) ? nslot : slot);
+        int nseg = unit_table[2 * nslot_c];
+        int npacked = unit_table[2 * nslot_c + 1];
+        int next_head = npacked >> 16;
+        int nseg_begin = seg_begin[nseg];
+        int next_q_row0 = nseg_begin + (npacked & 65535) * 128;
+        int next_kb_first = nseg_begin / 128;
+        int next_kb_last = (nseg_begin + seg_len[nseg] - 1) / 128;
+        if (slot == bid) {
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             if (warp == 0) {
                 if (elect_sync()) {
-                    mbarrier_arrive_expect_tx(k_full_addr + (kv_stage) * 8, 16384);
+                    mbarrier_arrive_expect_tx(q_full_addr, 16384);
                     asm volatile(
                         "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                         " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                        :: "r"(K_stage_addr + kv_stage * 16384), "l"((&K_map)), "r"(0), "r"(kb_first * 128), "r"(head),
-                           "r"(k_full_addr + (kv_stage) * 8), "l"(0x14F0000000000000ULL) : "memory");
-                    mbarrier_arrive_expect_tx(v_full_addr + (kv_stage) * 8, 16384);
-                    asm volatile(
-                        "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-                        " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                        :: "r"(V_stage_addr + kv_stage * 16384), "l"((&V_map)), "r"(kb_first * 128), "r"(0), "r"(head),
-                           "r"(v_full_addr + (kv_stage) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(Q_addr), "l"((&Q_map)), "r"(0), "r"(q_row0), "r"(head),
+                           "r"(q_full_addr), "l"(0x12F0000000000000ULL) : "memory");
                 }
             }
-        }
-        if (kb_last >= kb_first + 1) {
-            if (warp == 0) {
-                if (elect_sync()) {
-                    mbarrier_arrive_expect_tx(k_full_addr + ((kv_stage + 1) % 2) * 8, 16384);
-                    asm volatile(
-                        "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-                        " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                        :: "r"(K_stage_addr + (kv_stage + 1) % 2 * 16384), "l"((&K_map)), "r"(0), "r"((kb_first + 1) * 128), "r"(head),
-                           "r"(k_full_addr + ((kv_stage + 1) % 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
-                    mbarrier_arrive_expect_tx(v_full_addr + ((kv_stage + 1) % 2) * 8, 16384);
-                    asm volatile(
-                        "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-                        " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                        :: "r"(V_stage_addr + (kv_stage + 1) % 2 * 16384), "l"((&V_map)), "r"((kb_first + 1) * 128), "r"(0), "r"(head),
-                           "r"(v_full_addr + ((kv_stage + 1) % 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
+            if (kb_first <= kb_last) {
+                if (warp == 0) {
+                    if (elect_sync()) {
+                        mbarrier_arrive_expect_tx(k_full_addr + (kv_stage) * 8, 16384);
+                        asm volatile(
+                            "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                            :: "r"(K_stage_addr + kv_stage * 16384), "l"((&K_map)), "r"(0), "r"(kb_first * 128), "r"(head),
+                               "r"(k_full_addr + (kv_stage) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                        mbarrier_arrive_expect_tx(v_full_addr + (kv_stage) * 8, 16384);
+                        asm volatile(
+                            "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                            :: "r"(V_stage_addr + kv_stage * 16384), "l"((&V_map)), "r"(kb_first * 128), "r"(0), "r"(head),
+                               "r"(v_full_addr + (kv_stage) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                    }
+                }
+            }
+            if (kb_last >= kb_first + 1) {
+                if (warp == 0) {
+                    if (elect_sync()) {
+                        mbarrier_arrive_expect_tx(k_full_addr + ((kv_stage + 1) % 2) * 8, 16384);
+                        asm volatile(
+                            "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                            :: "r"(K_stage_addr + (kv_stage + 1) % 2 * 16384), "l"((&K_map)), "r"(0), "r"((kb_first + 1) * 128), "r"(head),
+                               "r"(k_full_addr + ((kv_stage + 1) % 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                        mbarrier_arrive_expect_tx(v_full_addr + ((kv_stage + 1) % 2) * 8, 16384);
+                        asm volatile(
+                            "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                            :: "r"(V_stage_addr + (kv_stage + 1) % 2 * 16384), "l"((&V_map)), "r"((kb_first + 1) * 128), "r"(0), "r"(head),
+                               "r"(v_full_addr + ((kv_stage + 1) % 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                    }
                 }
             }
         }
@@ -1565,6 +1577,7 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_f61ce025db98a842ef62(const _
             asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                 : "+f"(o_acc[52]), "+f"(o_acc[(52) + 1]), "+f"(o_acc[(52) + 2]), "+f"(o_acc[(52) + 3])
                 : "r"(p_frag[12]), "r"(p_frag[(12) + 1]), "r"(p_frag[(12) + 2]), "r"(p_frag[(12) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]), "r"((uint32_t)(fp8_unit_sfa_main[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_main[0])), "h"((uint16_t)0), "h"((uint16_t)0));
+            asm volatile("barrier.arrive %0, 256;" :: "r"(2 - warp / 4) : "memory");
             asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                 : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
                 : "r"(V_stage_addr + kv_stage * 16384 + (unsigned int)((112 + (lane >> 4 & 1) * 8 + (lane & 7)) * 128) + (unsigned int)(96 + (lane >> 3 & 1) * 16 ^ (112 + (lane >> 4 & 1) * 8 + (lane & 7) & 7) << 4))
@@ -1575,7 +1588,6 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_f61ce025db98a842ef62(const _
             asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                 : "+f"(o_acc[60]), "+f"(o_acc[(60) + 1]), "+f"(o_acc[(60) + 2]), "+f"(o_acc[(60) + 3])
                 : "r"(p_frag[12]), "r"(p_frag[(12) + 1]), "r"(p_frag[(12) + 2]), "r"(p_frag[(12) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]), "r"((uint32_t)(fp8_unit_sfa_main[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(fp8_unit_sfb_main[0])), "h"((uint16_t)0), "h"((uint16_t)0));
-            asm volatile("barrier.arrive %0, 256;" :: "r"(2 - warp / 4) : "memory");
             __syncwarp();
             if (elect_sync()) {
                 mbarrier_arrive(v_empty_addr + (kv_stage) * 8);
@@ -1595,6 +1607,43 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_f61ce025db98a842ef62(const _
                     }
                 }
             }
+            if (kb == kb_last && has_next == 1) {
+                if (warp == 0) {
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                }
+                if (warp == 0) {
+                    if (elect_sync()) {
+                        mbarrier_arrive_expect_tx(q_full_addr, 16384);
+                        asm volatile(
+                            "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                            :: "r"(Q_addr), "l"((&Q_map)), "r"(0), "r"(next_q_row0), "r"(next_head),
+                               "r"(q_full_addr), "l"(0x12F0000000000000ULL) : "memory");
+                    }
+                }
+                if (warp == 0) {
+                    if (elect_sync()) {
+                        mbarrier_arrive_expect_tx(k_full_addr + ((kv_stage + 1) % 2) * 8, 16384);
+                        asm volatile(
+                            "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                            :: "r"(K_stage_addr + (kv_stage + 1) % 2 * 16384), "l"((&K_map)), "r"(0), "r"(next_kb_first * 128), "r"(next_head),
+                               "r"(k_full_addr + ((kv_stage + 1) % 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                    }
+                }
+                if (next_kb_last >= next_kb_first + 1) {
+                    if (warp == 0) {
+                        if (elect_sync()) {
+                            mbarrier_arrive_expect_tx(k_full_addr + (kv_stage) * 8, 16384);
+                            asm volatile(
+                                "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                :: "r"(K_stage_addr + kv_stage * 16384), "l"((&K_map)), "r"(0), "r"((next_kb_first + 1) * 128), "r"(next_head),
+                                   "r"(k_full_addr + (kv_stage) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                        }
+                    }
+                }
+            }
             if (warp == 4) {
                 mbarrier_wait(v_empty_addr + (kv_stage) * 8, kv_phase);
             }
@@ -1607,6 +1656,30 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_f61ce025db98a842ef62(const _
                             " [%0], [%1, {%2, %3, %4}], [%5], %6;"
                             :: "r"(V_stage_addr + kv_stage * 16384), "l"((&V_map)), "r"((kb + 2) * 128), "r"(0), "r"(head),
                                "r"(v_full_addr + (kv_stage) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                    }
+                }
+            }
+            if (kb == kb_last && has_next == 1) {
+                if (warp == 4) {
+                    if (elect_sync()) {
+                        mbarrier_arrive_expect_tx(v_full_addr + ((kv_stage + 1) % 2) * 8, 16384);
+                        asm volatile(
+                            "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                            :: "r"(V_stage_addr + (kv_stage + 1) % 2 * 16384), "l"((&V_map)), "r"(next_kb_first * 128), "r"(0), "r"(next_head),
+                               "r"(v_full_addr + ((kv_stage + 1) % 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                    }
+                }
+                if (next_kb_last >= next_kb_first + 1) {
+                    if (warp == 4) {
+                        if (elect_sync()) {
+                            mbarrier_arrive_expect_tx(v_full_addr + (kv_stage) * 8, 16384);
+                            asm volatile(
+                                "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                :: "r"(V_stage_addr + kv_stage * 16384), "l"((&V_map)), "r"((next_kb_first + 1) * 128), "r"(0), "r"(next_head),
+                                   "r"(v_full_addr + (kv_stage) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                        }
                     }
                 }
             }
@@ -2073,7 +2146,6 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_f61ce025db98a842ef62(const _
             }
             reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 120))[0] = reinterpret_cast<unsigned*>(_packed_31)[0];
         }
-        __syncthreads();
     }
     if (warp < 4) {
         asm volatile("barrier.sync 1, 256;" ::: "memory");
