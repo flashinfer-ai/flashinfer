@@ -108,6 +108,7 @@ def _cudnn_single_token_gqa_ragged_stats_broken() -> bool:
     return cudnn.backend_version() < 92700
 
 
+@functools.cache
 def _cudnn_version_supports_shape_override() -> bool:
     """SDPA shape override needs the unified engine's support (cuDNN 9.22+) and a
     cudnn-frontend whose pygraph takes is_override_shape_enabled (1.29+)."""
