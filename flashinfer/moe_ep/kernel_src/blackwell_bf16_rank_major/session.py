@@ -38,10 +38,7 @@ _SOURCE_NAME = "flashinfer_blackwell_moe_ep_layer_sm100.cu"
 _STAGE_NAMES = (
     "input_barrier",
     "dispatch",
-    "route_reset",
-    "route_count",
-    "route_finalize",
-    "route_scatter",
+    "route_fused",
     "gemm1_swiglu",
     "gemm2",
     "local_unpermute",
@@ -56,6 +53,7 @@ _STAGE_BINDINGS = {
         "pg_world",
         "pg_rank",
         "pg_flags",
+        "routed_peers",
     ),
     "dispatch": (
         "recv_hidden",
@@ -71,28 +69,19 @@ _STAGE_BINDINGS = {
         "topk_ids_peers",
         "topk_weights",
         "topk_weights_peers",
+        "routed",
     ),
-    "route_reset": ("expert_scatter_offsets", "zero_sentinel"),
-    "route_count": (
+    "route_fused": (
         "recv_local_ids",
         "expert_scatter_offsets",
         "token_to_permuted",
-        "active_tokens_per_rank",
-    ),
-    "route_finalize": (
-        "expert_scatter_offsets",
         "cta_to_expert",
         "cta_to_mn_limit",
         "expert_padded_row_offsets",
         "num_non_exiting_ctas",
         "total_padded_rows",
         "route_map",
-    ),
-    "route_scatter": (
-        "recv_local_ids",
-        "expert_padded_row_offsets",
-        "route_map",
-        "token_to_permuted",
+        "zero_sentinel",
         "active_tokens_per_rank",
     ),
     "gemm1_swiglu": (
@@ -130,6 +119,7 @@ _STAGE_BINDINGS = {
         "pg_flags",
         "local_partials",
         "local_partials_peers",
+        "topk_ids",
     ),
 }
 _STAGE_LAUNCH_CONTRACTS = {
@@ -140,7 +130,7 @@ _STAGE_LAUNCH_CONTRACTS = {
         0,
         (("active_tokens_per_rank", 128),),
         False,
-        False,
+        True,
         False,
     ),
     "dispatch": (
@@ -149,49 +139,19 @@ _STAGE_LAUNCH_CONTRACTS = {
         (1, 1, 1),
         15488,
         (("active_tokens_per_rank", 128),),
-        False,
-        False,
-        False,
-    ),
-    "route_reset": (
-        (1, 1, 1),
-        (256, 1, 1),
-        (1, 1, 1),
-        0,
-        (),
-        False,
-        False,
-        False,
-    ),
-    "route_count": (
-        (32, 1, 1),
-        (256, 1, 1),
-        (1, 1, 1),
-        0,
-        (("active_tokens_per_rank", 128),),
-        False,
-        False,
-        False,
-    ),
-    "route_finalize": (
-        (1, 1, 1),
-        (32, 1, 1),
-        (1, 1, 1),
-        0,
-        (),
-        False,
-        False,
-        False,
-    ),
-    "route_scatter": (
-        (32, 1, 1),
-        (256, 1, 1),
-        (1, 1, 1),
-        0,
-        (("active_tokens_per_rank", 128),),
-        False,
         True,
-        False,
+        True,
+        True,
+    ),
+    "route_fused": (
+        (1, 1, 1),
+        (1024, 1, 1),
+        (1, 1, 1),
+        0,
+        (("active_tokens_per_rank", 128),),
+        True,
+        True,
+        True,
     ),
     "gemm1_swiglu": (
         (32, 512, 1),
@@ -214,35 +174,17 @@ _STAGE_LAUNCH_CONTRACTS = {
         True,
     ),
     "local_unpermute": (
-        (1024, 1, 1),
+        (1024, 7, 1),
         (128, 1, 1),
         (1, 1, 1),
         128,
         (("hidden_size", 7168), ("active_tokens_per_rank", 128)),
         True,
-        False,
+        True,
         True,
     ),
-    "partial_barrier": (
-        (1, 1, 1),
-        (32, 1, 1),
-        (1, 1, 1),
-        0,
-        (),
-        False,
-        False,
-        False,
-    ),
-    "combine": (
-        (128, 1, 1),
-        (256, 1, 1),
-        (1, 1, 1),
-        29696,
-        (),
-        False,
-        False,
-        False,
-    ),
+    "partial_barrier": ((1, 1, 1), (32, 1, 1), (1, 1, 1), 0, (), True, True, True),
+    "combine": ((128, 7, 1), (128, 1, 1), (1, 1, 1), 17408, (), True, False, True),
 }
 
 
@@ -262,25 +204,17 @@ def _active_stage_grids(
         raise ValueError(
             f"active tokens per rank must be in [1, 128], got {active_tokens_per_rank}"
         )
-    active_routes = _WORLD_SIZE * active_tokens_per_rank * _TOP_K
-    route_blocks = (active_routes + 255) // 256
     # One local expert group needs at most 64 routed rows.  With 32 local
     # experts, spreading the first row across every expert costs 32 groups;
     # each further group needs another 64 routes, so N + 31 bounds the active
-    # y-groups.  Keep the published capacity coordinate exactly at y=512.
-    gemm_y = (
-        _MAX_Y_GROUPS
-        if active_tokens_per_rank == _TOKENS_PER_RANK
-        else active_tokens_per_rank + _LOCAL_EXPERTS - 1
-    )
+    # y-groups, which stays below the y=512 capacity for every active prefix.
+    gemm_y = min(_MAX_Y_GROUPS, active_tokens_per_rank + _LOCAL_EXPERTS - 1)
     return {
         "dispatch": (_WORLD_SIZE * active_tokens_per_rank, 1, 1),
-        "route_count": (route_blocks, 1, 1),
-        "route_scatter": (route_blocks, 1, 1),
         "gemm1_swiglu": (32, gemm_y, 1),
         "gemm2": (56, gemm_y, 1),
-        "local_unpermute": (_WORLD_SIZE * active_tokens_per_rank, 1, 1),
-        "combine": (active_tokens_per_rank, 1, 1),
+        "local_unpermute": (_WORLD_SIZE * active_tokens_per_rank, 7, 1),
+        "combine": (active_tokens_per_rank, 7, 1),
     }
 
 
@@ -744,11 +678,18 @@ class BlackwellBf16RankMajorSession:
             group_name=name,
         )
         self._flags.local.zero_()
+        self._routed = _alloc_symmetric(
+            (_WORLD_SIZE * 4,),
+            torch.int32,
+            device=self._device,
+            group_name=name,
+        )
+        self._routed.local.zero_()
 
         self._expert_ids_i64 = torch.empty(
             (_TOKENS_PER_RANK, _TOP_K), dtype=torch.int64, device=self._device
         )
-        self._recv_hidden = torch.empty(
+        self._recv_hidden = torch.zeros(
             (_RANK_MAJOR_TOKENS, _HIDDEN_SIZE),
             dtype=torch.bfloat16,
             device=self._device,
@@ -1003,6 +944,7 @@ class BlackwellBf16RankMajorSession:
                     active_tokens_per_rank,
                     *world_rank,
                     p(self._flags.peers),
+                    p(self._routed.peers),
                 ),
                 (
                     ctypes.c_void_p,
@@ -1010,6 +952,7 @@ class BlackwellBf16RankMajorSession:
                     ctypes.c_int32,
                     ctypes.c_int32,
                     ctypes.c_int32,
+                    ctypes.c_void_p,
                     ctypes.c_void_p,
                 ),
             )
@@ -1027,6 +970,7 @@ class BlackwellBf16RankMajorSession:
                 p(self._topk_ids.peers),
                 p(self._topk_weights.local),
                 p(self._topk_weights.peers),
+                p(self._routed.local),
             )
             return values, (
                 ctypes.c_void_p,
@@ -1042,39 +986,24 @@ class BlackwellBf16RankMajorSession:
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.c_void_p,
+                ctypes.c_void_p,
             )
-        if name == "route_reset":
+        if name == "route_fused":
             sentinel = self._gemm2_output[_FIXED_EXPERT_ROWS]
-            values = (p(self._expert_scatter_offsets), p(sentinel))
-            return values, self._pointer_types(2)
-        if name == "route_count":
             values = (
                 p(self._recv_local_ids),
                 p(self._expert_scatter_offsets),
                 p(self._token_to_permuted),
-                active_tokens_per_rank,
-            )
-            return values, (*self._pointer_types(3), ctypes.c_int32)
-        if name == "route_finalize":
-            values = (
-                p(self._expert_scatter_offsets),
                 p(self._cta_to_expert),
                 p(self._cta_to_mn_limit),
                 p(self._expert_padded_row_offsets),
                 p(self._num_non_exiting_ctas),
                 p(self._total_padded_rows),
                 p(self._route_map),
-            )
-            return values, self._pointer_types(7)
-        if name == "route_scatter":
-            values = (
-                p(self._recv_local_ids),
-                p(self._expert_padded_row_offsets),
-                p(self._route_map),
-                p(self._token_to_permuted),
+                p(sentinel),
                 active_tokens_per_rank,
             )
-            return values, (*self._pointer_types(4), ctypes.c_int32)
+            return values, (*self._pointer_types(10), ctypes.c_int32)
         if name == "gemm1_swiglu":
             values = (
                 self._descriptors["fc1_weights"],
@@ -1120,11 +1049,13 @@ class BlackwellBf16RankMajorSession:
                 p(self._flags.peers),
                 p(self._local_partials.local),
                 p(self._local_partials.peers),
+                p(self._topk_ids.local),
             )
             return values, (
                 ctypes.c_void_p,
                 ctypes.c_int32,
                 ctypes.c_int32,
+                ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.c_void_p,
