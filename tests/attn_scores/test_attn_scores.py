@@ -22,6 +22,7 @@ import os
 import shutil
 import subprocess
 import sys
+import functools
 
 import torch
 
@@ -477,6 +478,90 @@ def test_fp8_paged_mqa_logits(batch_size, next_n, avg_ctx, block_size, output_dt
 
     diff = _calc_cosine_diff(out_clean, ref_clean)
     assert diff < 0.02, f"cosine diff {diff:.3e} too large"
+
+
+@pytest.mark.parametrize("num_heads", [8, 64])
+@pytest.mark.parametrize("early_tmem_copy", [False, True])
+@pytest.mark.parametrize("remove_kv_wait", [False, True])
+def test_fp8_scale_reads_precede_stage_reuse(
+    monkeypatch, num_heads, early_tmem_copy, remove_kv_wait
+):
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("FP8 paged MQA logits requires SM100a")
+
+    from flashinfer.attn_scores import attn_scores as scores
+    from flashinfer.attn_scores import kernels
+
+    monkeypatch.setenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", "1")
+    monkeypatch.setattr(scores, "_cached_num_sms", lambda _device: 4)
+    monkeypatch.setattr(
+        kernels,
+        "FP8MQALogitsKernel",
+        functools.partial(
+            kernels.FP8MQALogitsKernel,
+            early_tmem_copy=early_tmem_copy,
+            remove_kv_wait_in_epilogue=remove_kv_wait,
+        ),
+    )
+    scores._cached_compile_fp8_kernel.cache_clear()
+    try:
+        batch_size, next_n, head_dim, block_size, kv_rows = 7, 2, 128, 128, 32768
+        device = "cuda"
+        q = torch.ones((batch_size, next_n, num_heads, head_dim), device=device).to(
+            torch.float8_e4m3fn
+        )
+        kv = torch.ones(
+            (kv_rows // block_size, block_size, head_dim), device=device
+        ).to(torch.float8_e4m3fn)
+        # Distinct stage scales make premature TMA reuse observable in logits.
+        scales = torch.pow(
+            2.0, (torch.arange(kv_rows, device=device) // block_size) % 7 - 3
+        ).reshape(-1, block_size)
+        fused = _make_fused_kv_fp8(kv, scales, block_size, head_dim)
+        weights = torch.ones((batch_size * next_n, num_heads), device=device)
+        context_lens = kv_rows - 129 * torch.arange(
+            batch_size, dtype=torch.int32, device=device
+        )
+        block_table = (
+            torch.arange(kv_rows // block_size, dtype=torch.int32, device=device)[
+                None, :
+            ]
+            + 17 * torch.arange(batch_size, dtype=torch.int32, device=device)[:, None]
+        ) % (kv_rows // block_size)
+        expected = (
+            scales[block_table.long()].reshape(batch_size, kv_rows)
+            * head_dim
+            * num_heads
+        ).repeat_interleave(next_n, dim=0)
+        ends = (
+            context_lens.repeat_interleave(next_n)
+            - next_n
+            + torch.arange(batch_size * next_n, device=device) % next_n
+        )
+        valid = torch.arange(kv_rows, device=device)[None, :] <= ends[:, None]
+        out = torch.empty_like(expected)
+
+        def run():
+            return scores.fp8_paged_mqa_logits(
+                q,
+                fused,
+                weights,
+                block_table,
+                context_lens,
+                kv_rows,
+                out=out,
+            )
+
+        run()
+        torch.testing.assert_close(out[valid], expected[valid], rtol=0, atol=0)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        for _ in range(5):
+            graph.replay()
+            torch.testing.assert_close(out[valid], expected[valid], rtol=0, atol=0)
+    finally:
+        scores._cached_compile_fp8_kernel.cache_clear()
 
 
 @pytest.mark.parametrize("next_n", [1, 2])

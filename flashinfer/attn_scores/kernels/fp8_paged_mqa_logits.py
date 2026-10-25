@@ -1765,6 +1765,8 @@ class FP8MQALogitsKernel:
                             if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
                                 sc_stage_0 = kv_cons_state_math_0.index
                                 scale_val = sScales_0[(m_coord, sc_stage_0)]
+                            # Order scale reads before the TMA producer reuses the stage.
+                            cute.arch.fence_view_async_shared()
                             kv_pipeline_0.consumer_release(kv_cons_state_math_0)
                             kv_cons_state_math_0.advance()
                             cute.arch.fence_view_async_tmem_load()
@@ -1773,6 +1775,8 @@ class FP8MQALogitsKernel:
                             if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
                                 sc_stage_0 = kv_cons_state_math_0.index
                                 scale_val = sScales_0[(m_coord, sc_stage_0)]
+                            # Order scale reads before the TMA producer reuses the stage.
+                            cute.arch.fence_view_async_shared()
                             kv_pipeline_0.consumer_release(kv_cons_state_math_0)
                             kv_cons_state_math_0.advance()
                             cute.copy(
@@ -2185,6 +2189,8 @@ class FP8MQALogitsKernel:
                             if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
                                 sc_stage_1 = kv_cons_state_math_1.index
                                 scale_val = sScales_1[(m_coord, sc_stage_1)]
+                            # Order scale reads before the TMA producer reuses the stage.
+                            cute.arch.fence_view_async_shared()
                             kv_pipeline_1.consumer_release(kv_cons_state_math_1)
                             kv_cons_state_math_1.advance()
                             cute.arch.fence_view_async_tmem_load()
@@ -2192,6 +2198,8 @@ class FP8MQALogitsKernel:
                             if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
                                 sc_stage_1 = kv_cons_state_math_1.index
                                 scale_val = sScales_1[(m_coord, sc_stage_1)]
+                            # Order scale reads before the TMA producer reuses the stage.
+                            cute.arch.fence_view_async_shared()
                             kv_pipeline_1.consumer_release(kv_cons_state_math_1)
                             kv_cons_state_math_1.advance()
                             cute.copy(
