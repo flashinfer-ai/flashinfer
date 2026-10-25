@@ -330,3 +330,36 @@ def test_single_head_paged_mqa_logits_rejects_bad_shapes() -> None:
             query_scales=torch.zeros(4, 8, device="cuda"),
             key_scales=torch.zeros(4, 64, 8, device="cuda"),
         )
+
+
+@torch.inference_mode()
+def test_single_head_paged_mqa_threshold_select_rejects_bad_shapes() -> None:
+    query = torch.zeros(128, 128, dtype=torch.bfloat16, device="cuda")
+    key_cache = torch.zeros(4, 64, 128, dtype=torch.bfloat16, device="cuda")
+    ends = torch.ones(128, dtype=torch.int32, device="cuda")
+    requests = torch.zeros(1, dtype=torch.int32, device="cuda")
+    table = torch.zeros(1, 4, dtype=torch.int32, device="cuda")
+    outputs = dict(
+        thresholds=torch.zeros(128, device="cuda"),
+        counters=torch.zeros(128, 2, dtype=torch.int32, device="cuda"),
+        candidates=torch.zeros(128, 64, 2, dtype=torch.int32, device="cuda"),
+    )
+    # Each shape alone is wrong, though together they hold (2, 2) after the rows.
+    bad = dict(
+        outputs,
+        counters=torch.zeros(128, 2, 2, dtype=torch.int32, device="cuda"),
+        candidates=torch.zeros(128, 64, dtype=torch.int32, device="cuda"),
+    )
+    run = single_head_paged_mqa_threshold_select
+    for wrong in (bad, dict(outputs, candidates=bad["candidates"])):
+        with pytest.raises(ValueError, match="counters must be"):
+            run(
+                query,
+                key_cache,
+                ends,
+                requests,
+                table,
+                **wrong,
+                max_context=128,
+                top_k=8,
+            )

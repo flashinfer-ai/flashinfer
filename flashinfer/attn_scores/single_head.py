@@ -227,11 +227,12 @@ def single_head_paged_mqa_threshold_select(
     if min(tiles, key_cache.shape[0], width, key_tiles) <= 0:
         raise ValueError("queries, keys, the block table and context must be nonempty")
     per_row = {t.shape[0] for t in (query, row_ends, thresholds, counters, candidates)}
-    if per_row != {tiles * TILE} or counters.shape[1:] + candidates.shape[2:] != (
-        COUNTERS,
-        2,
-    ):
+    if per_row != {tiles * TILE}:
         raise ValueError(f"Mismatched query rows ({TILE} per tile) and per-row outputs")
+    if counters.shape[1:] != (COUNTERS,) or candidates.shape[2:] != (2,):
+        raise ValueError(
+            f"counters must be [rows, {COUNTERS}] and candidates [rows, slots, 2]"
+        )
     if max_context > PAGE * width:
         raise ValueError("The block table must cover the context capacity")
     if not 0 <= top_k < candidates.shape[1]:
