@@ -1282,6 +1282,7 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         },
         "1,28,4096": {
             "decode:t32_p3_fused_r5_q4_tso": "decode:t32_p3_fused_r5_q4_tso_xef",
+            "decode:t32_p3_fused_r5_q4": "decode:t32_p3_fused_r5_q4_xef",
         },
         "1,28,16384": {
             "decode:t64_p2_fused_w16_r3_xh_qe_q4_pf4_px1_tso_pi2": "decode:t64_p2_fused_w16_r3_xh_qe_q4_pf4_px1_tso_pi2_xef",
@@ -1551,6 +1552,7 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         },
         "1,28,4096": {
             "decode:t32_p3_fused_r5_q4_tso": "decode:t32_p3_fused_r5_q4_tso_xef",
+            "decode:t32_p3_fused_r5_q4": "decode:t32_p3_fused_r5_q4_xef",
         },
         "1,28,16384": {
             "decode:t64_p2_fused_w16_r3_xh_qe_q4_pf4_px1_pi2": "decode:t64_p2_fused_w16_r3_xh_qe_q4_pf4_px1_pi2_xef",
