@@ -30,9 +30,11 @@ with 96 to 256 (batch x KV heads) CTAs, where the d256 decode tile measures at
 takes cuDNN only with a caller-owned ``block_tables`` (the auto-built table cannot
 grow once captured), and the resolution is frozen after the first plan. The
 performance-driven choice also requires that the frontend's FROST engines can run
-on the install: its own CuTe-DSL check (``nvidia-cutlass-dsl`` 4.7.0 or newer,
-above the 4.6.2 the packages' dependency metadata admit) must pass, otherwise the
-backend engine would serve the graph and fa2 is kept. Callers passing
+on the install. FlashInfer's base requirements and cudnn-frontend's dependency
+metadata permit ``nvidia-cutlass-dsl`` 4.6.2, but FROST's own runtime check
+currently requires 4.7.0 or newer. An install can therefore satisfy the package
+dependencies while still being unable to use FROST; in that case the backend
+engine would serve the graph and ``auto`` keeps fa2. Callers passing
 ``fixed_split_size`` or ``disable_split_kv`` (fa2's batch-invariance controls)
 keep fa2 wherever fa2 can serve the rows. A CUDA-graph wrapper also tells
 cudnn-frontend 1.31+ that the graph is replayed

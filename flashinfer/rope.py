@@ -443,9 +443,9 @@ def apply_rope_inplace(
     r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor) in place.
     cos/sin values are computed on the fly inside the kernel.
 
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
+    We use :attr:`indptr` to denote the start pointer of each segment in the batch. The query
+    of the i-th segment is ``q[indptr[i]:indptr[i+1]]``, and its key is
+    ``k[indptr[i]:indptr[i+1]]``. The first element of :attr:`indptr` is always
     0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
     Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
     ragged tensor.
@@ -530,10 +530,7 @@ def apply_rope_pos_ids_inplace(
     r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor) in place.
     cos/sin values are computed on the fly inside the kernel.
 
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
-    0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
+    Each element of :attr:`pos_ids` gives the position of the corresponding query/key row.
     Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
     ragged tensor.
 
@@ -593,9 +590,9 @@ def apply_llama31_rope_inplace(
     r"""Apply Llama 3.1-style rotary embedding to a batch of queries/keys (stored as
     RaggedTensor) in place. cos/sin values are computed on the fly inside the kernel.
 
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
+    We use :attr:`indptr` to denote the start pointer of each segment in the batch. The query
+    of the i-th segment is ``q[indptr[i]:indptr[i+1]]``, and its key is
+    ``k[indptr[i]:indptr[i+1]]``. The first element of :attr:`indptr` is always
     0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
     Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
     ragged tensor.
@@ -701,10 +698,7 @@ def apply_llama31_rope_pos_ids_inplace(
     r"""Apply Llama 3.1-style rotary embedding to a batch of queries/keys (stored as
     RaggedTensor) in place. cos/sin values are computed on the fly inside the kernel.
 
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
-    0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
+    Each element of :attr:`pos_ids` gives the position of the corresponding query/key row.
     Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
     ragged tensor.
 
@@ -778,9 +772,9 @@ def apply_rope(
     r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor).
     cos/sin values are computed on the fly inside the kernel.
 
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
+    We use :attr:`indptr` to denote the start pointer of each segment in the batch. The query
+    of the i-th segment is ``q[indptr[i]:indptr[i+1]]``, and its key is
+    ``k[indptr[i]:indptr[i+1]]``. The first element of :attr:`indptr` is always
     0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
     Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
     ragged tensor.
@@ -888,10 +882,7 @@ def apply_rope_pos_ids(
     r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor).
     cos/sin values are computed on the fly inside the kernel.
 
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
-    0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
+    Each element of :attr:`pos_ids` gives the position of the corresponding query/key row.
     Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
     ragged tensor.
 
@@ -961,9 +952,9 @@ def apply_llama31_rope(
     r"""Apply Llama 3.1-style rotary embedding to a batch of queries/keys (stored as
     RaggedTensor). cos/sin values are computed on the fly inside the kernel.
 
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
+    We use :attr:`indptr` to denote the start pointer of each segment in the batch. The query
+    of the i-th segment is ``q[indptr[i]:indptr[i+1]]``, and its key is
+    ``k[indptr[i]:indptr[i+1]]``. The first element of :attr:`indptr` is always
     0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
     Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
     ragged tensor.
@@ -1083,10 +1074,7 @@ def apply_llama31_rope_pos_ids(
     r"""Apply Llama 3.1-style rotary embedding to a batch of queries/keys (stored as
     RaggedTensor). cos/sin values are computed on the fly inside the kernel.
 
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
-    0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
+    Each element of :attr:`pos_ids` gives the position of the corresponding query/key row.
     Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
     ragged tensor.
 
