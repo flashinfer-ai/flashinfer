@@ -380,8 +380,9 @@ def _rest_workspace(kind: str, device: torch.device) -> torch.Tensor:
         words = torch.zeros(int(c["sched_words"]), dtype=torch.int32, device=device)
         for index, value in enumerate(c["sched_rest"]):
             if value:
-                # Two's-complement spelling of the u32 rest word in the int32 view.
-                words[index] = (
+                # Two's-complement spelling of the u32 rest word in the int32 view,
+                # written by a device fill so the set-up is legal under graph capture.
+                words.narrow(0, index, 1).fill_(
                     int(value) - (1 << 32) if value >= 1 << 31 else int(value)
                 )
         return words.view(torch.uint32)
