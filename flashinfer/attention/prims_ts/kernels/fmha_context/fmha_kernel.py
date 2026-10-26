@@ -1779,6 +1779,11 @@ def build_context_task_manager(
             )
         )
     smem_allocator.compute_layout()
+    if smem_allocator.total_smem_bytes > cfg.smem_capacity_kib * 1024:
+        raise ValueError(
+            f"context requires {smem_allocator.total_smem_bytes} bytes of SMEM, "
+            f"exceeding the target's {cfg.smem_capacity_kib} KiB budget"
+        )
     kv_stages = cfg.kv_stage_k + (cfg.kv_stage_v if cfg.split_kv_pipelines else 0)
     expected_barrier_bytes = (
         sum(
@@ -1876,6 +1881,61 @@ def _should_use_tmem_p_pipeline(cfg: FmhaConfig) -> bool:
 
 _Q_ROW_SMEM_ALIGNMENT_BYTES = 128
 _PIPELINE_BARRIER_BYTES_PER_STAGE = 2 * cutlass.Int64.width // 8
+
+
+def context_smem_capacity_kib(compute_capability: tuple[int, int]) -> int:
+    """Use Rubin's oversized SMEM only with native CUTLASS target support.
+
+    DSL 4.7's sm_100f compatibility target retains the standard SM100 budget.
+    Native SM107 launch support configures oversized SMEM when needed.
+    """
+    from flashinfer.cute_dsl.availability import is_cute_dsl_arch_supported
+
+    if tuple(compute_capability) == (10, 7) and is_cute_dsl_arch_supported(
+        10, 7, native_only=True
+    ):
+        try:
+            return utils.get_smem_capacity_in_bytes("sm_107") // 1024
+        except ValueError:
+            pass
+    return utils.get_smem_capacity_in_bytes("sm_100") // 1024
+
+
+def sm107_context_kv_stages(cfg: FmhaConfig) -> int | None:
+    """Select a shared K/V ring depth for Rubin's contiguous query-paired path.
+
+    Counts are physical slots shared by K and V, including head-dimension
+    slices. These profiles depend on the generated topology, not request sizes.
+    Other layouts retain the capacity-derived SM100 policy.
+    """
+    if (
+        cfg.smem_capacity_kib != 327
+        or cfg.head_paired
+        or cfg.two_cta_umma
+        or cfg.use_paged_kv
+        or cfg.has_variable_window
+        or cfg.causal_single_kv_tile
+        or cfg.vc_attention
+        or cfg.sage_scale_layout is not None
+        or cfg.qk_mma_tiler[:2] != (128, 128)
+        or cfg.logical_head_dim_qk not in (128, 256)
+        or cfg.pv_mma_tiler[1] != cfg.logical_head_dim_qk
+        or not (cfg.q_dtype == cfg.k_dtype == cfg.v_dtype == cfg.o_dtype)
+    ):
+        return None
+    if cfg.q_dtype == cutlass.Float8E4M3FN:
+        # D256 already stages 128-wide slices: four slots cover one complete
+        # K/V cadence. Deeper rings regress the causal kernel on Rubin.
+        if cfg.logical_head_dim_qk == 256:
+            return 4
+        return 11 if cfg.is_causal else 10
+    if cfg.q_dtype == cutlass.BFloat16:
+        # D128 benefits from the oversized-SMEM ring, especially with causal
+        # work. D256 dense needs one extra slot; causal retains four.
+        if cfg.logical_head_dim_qk == 128:
+            return 6 if cfg.is_causal else 4
+        return 4 if cfg.is_causal else 5
+    return None
 
 
 def _context_pipeline_stage_counts(
@@ -2004,7 +2064,14 @@ def _kv_ring_smem_budget_bytes(
         + (control_bytes + 7) // 8 * 8
         + fixed_barrier_stages * _PIPELINE_BARRIER_BYTES_PER_STAGE
     )
-    return utils.get_smem_capacity_in_bytes("sm_100") - fixed_smem_bytes
+    # Capacity and tuning are separate: only the Rubin profile uses oversized
+    # SMEM. Filling every available byte can hurt occupancy and L1 capacity.
+    capacity_bytes = (
+        cfg.smem_capacity_kib * 1024
+        if sm107_context_kv_stages(cfg) is not None
+        else utils.get_smem_capacity_in_bytes("sm_100")
+    )
+    return capacity_bytes - fixed_smem_bytes
 
 
 def _infer_single_instance_kv_stages(
@@ -2055,6 +2122,17 @@ def _configure_kv_ring_depths(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None:
     cfg.kv_stage_k = cfg.kv_stage
     cfg.kv_stage_v = cfg.kv_stage
     if not cfg.split_kv_pipelines:
+        tuned_stages = sm107_context_kv_stages(cfg)
+        if tuned_stages is not None:
+            max_stages = _infer_single_instance_kv_stages(
+                cfg, is_clc_dynamic=is_clc_dynamic
+            )
+            # Keep complete K/V cadences and every fixed/barrier allocation in
+            # the fit check, even when a profile requests a shallower ring.
+            cadence = cfg.num_head_dim_stages_k + cfg.num_head_dim_stages_v
+            n_stages = max(cadence, min(tuned_stages, max_stages))
+            cfg.kv_stage = cfg.kv_stage_k = cfg.kv_stage_v = n_stages
+            return
         # Same-width K and V share one ring: deepen it to what the SMEM budget
         # allows after every other buffer, as FA4 does.
         n_stages = max(
@@ -2976,6 +3054,7 @@ class FmhaTs:
         vc_attention: str | None = None,
         use_blackwell_tma_oob_workaround: bool = False,
         sage_scale_layout: _SageScaleLayout | None = None,
+        smem_capacity_kib: int = 227,
     ) -> None:
         """Initialize mode-specific tiling, dtype, and schedule configuration."""
         head_paired = resolve_head_paired_mode(
@@ -3042,6 +3121,11 @@ class FmhaTs:
         # Global Q/K rows stay compact; TMA zero-fills partial shared tiles.
         padded_d = 1 << (max(d, 64) - 1).bit_length()
         cfg = FmhaConfig()
+        if smem_capacity_kib not in (227, 327):
+            raise ValueError("context SMEM capacity must be 227 or 327 KiB")
+        if smem_capacity_kib == 327 and context_smem_capacity_kib((10, 7)) != 327:
+            raise ValueError("Expanded SM107 SMEM requires native CUTLASS support")
+        cfg.smem_capacity_kib = smem_capacity_kib
         cfg.logical_head_dim_qk = d
         if two_cta_umma and (
             is_persistent

@@ -326,13 +326,14 @@ def _make_context_kernel(
 
     import cutlass
 
-    from .kernels.fmha_context.fmha_kernel import FmhaTs
+    from .kernels.fmha_context.fmha_kernel import FmhaTs, context_smem_capacity_kib
 
     use_paged_kv = page_size is not None
     if use_paged_kv != (max_kv_len is not None):
         raise ValueError("paged context requires both page geometry values")
     is_persistent = scheduler != "nonpersistent"
     is_clc_dynamic = scheduler == "clc_dynamic_persistent"
+    device_cc = torch.cuda.get_device_capability(device_index)
     paged_kwargs = (
         {
             "use_paged_kv": True,
@@ -371,9 +372,8 @@ def _make_context_kernel(
         uses_ldtm_stat=uses_ldtm_stat,
         causal_single_kv_tile=(causal_single_kv_tile and not use_paged_kv),
         vc_attention=vc_attention,
-        use_blackwell_tma_oob_workaround=(
-            torch.cuda.get_device_capability(device_index) in ((10, 0), (10, 3))
-        ),
+        use_blackwell_tma_oob_workaround=(device_cc in ((10, 0), (10, 3))),
+        smem_capacity_kib=context_smem_capacity_kib(device_cc),
         sage_scale_layout=sage_scale_layout,
         **paged_kwargs,
     )

@@ -2031,12 +2031,16 @@ def exercise_explicit_decode_profile(
 
     original_make_decode_config = fmha_decode_config.make_decode_config
 
-    explicit_profile = dict(explicit_profile) if explicit_profile is not None else {
-        "use_keeps_mma_ab": True,
-        "tile_size_q": 64,
-        "tile_size_kv": 256,
-        "groups_tokens_heads_q": True,
-    }
+    explicit_profile = (
+        dict(explicit_profile)
+        if explicit_profile is not None
+        else {
+            "use_keeps_mma_ab": True,
+            "tile_size_q": 64,
+            "tile_size_kv": 256,
+            "groups_tokens_heads_q": True,
+        }
+    )
     if config_args is not None:
         explicit_profile.update(config_args)
 
@@ -2065,27 +2069,6 @@ def exercise_explicit_decode_profile(
     finally:
         decode_module._resolve_decode_launch_spec.cache_clear()
         decode_module._get_compiled_decode.cache_clear()
-
-
-def _exercise_explicit_kv256_case(
-    monkeypatch: pytest.MonkeyPatch,
-    case: _DecodeCase,
-    *,
-    exercise_all_paths: bool = False,
-) -> dict[str, object]:
-    """Run a public path with the qualified logical KV256 profile pinned."""
-
-    return exercise_explicit_decode_profile(
-        monkeypatch,
-        case,
-        {
-            "use_keeps_mma_ab": True,
-            "tile_size_q": 64,
-            "tile_size_kv": 256,
-            "groups_tokens_heads_q": True,
-        },
-        exercise_all_paths=exercise_all_paths,
-    )
 
 
 @torch.no_grad()
