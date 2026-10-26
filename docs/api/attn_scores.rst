@@ -43,9 +43,11 @@ arguments. Paging arguments, the output contract, and
 
 FP8 selects 64-bit store offsets when the physical output span, including row
 padding, reaches ``2**31`` elements. Logical dimensions still fit int32. This
-specialization has small-output and lowering coverage; outputs at that scale
-have not been validated. FP4 continues to reject spans of ``2**31`` elements
-or larger.
+specialization has small-output and lowering coverage. The H64/Q8192/1M
+benchmark uses a full-score buffer of ``2**33`` FP32 elements (about 8.6 billion),
+selects the Int64 store path, and passes all-row FP32 checks before and after
+timing. There is no dedicated unit test at that scale. FP4 continues to reject
+spans of ``2**31`` elements or larger.
 
 .. note::
 
