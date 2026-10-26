@@ -449,6 +449,17 @@ def local_buffers(g: Geometry) -> dict[str, tuple[tuple[int, ...], torch.dtype]]
     }
 
 
+#: The id / weight publications: no program reads them once the route tables
+#: carry the routing and the combine is fused, so the fused program's argument
+#: list and ``symmetric_buffers`` drop them together.
+_PUBLISHED_ROUTING_ARGS: Tuple[str, ...] = (
+    "published_ids",
+    "published_ids_peers",
+    "published_weights",
+    "published_weights_peers",
+)
+
+
 # Argument names this host supplies to the fused program (any subset, any
 # order): the caller's rows, the canonical weights (TMA descriptors encoded by
 # the binding from the tensors), the local buffers, every symmetric buffer as
@@ -457,8 +468,11 @@ def local_buffers(g: Geometry) -> dict[str, tuple[tuple[int, ...], torch.dtype]]
 def fused_args(
     *, route_tables: bool = ROUTE_TABLES, fused_combine: bool = FUSED_COMBINE
 ) -> Tuple[str, ...]:
+    base = FUSED_BASE_ARGS[: -len(GRID_ARGS)]
+    if route_tables and fused_combine:
+        base = tuple(name for name in base if name not in _PUBLISHED_ROUTING_ARGS)
     return (
-        *FUSED_BASE_ARGS[: -len(GRID_ARGS)],
+        *base,
         *(
             ("route_offs", "route_offs_peers", "route_list", "route_list_peers")
             if route_tables

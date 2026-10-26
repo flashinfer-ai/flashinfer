@@ -393,12 +393,17 @@ def test_preprocess_weights_refuses_unquantized_and_misshaped_packs() -> None:
 
 def test_program_identifiers_cover_every_cell_and_h_max() -> None:
     # 4 cells x 2 known hidden sizes (default h_max 6144, the 7168 variant) + 1 combine
-    assert len(PROGRAM_IDENTIFIERS) == 2 * len(CELLS) + 1
-    assert cake_plan.program_identifiers(fused_combine=False) == PROGRAM_IDENTIFIERS
+    # unless the combine is fused into the tail (the shipped switch decides).
+    separate = cake_plan.program_identifiers(fused_combine=False)
+    assert len(separate) == 2 * len(CELLS) + 1 and separate[-1] == COMBINE
+    assert cake_plan.program_identifiers() == PROGRAM_IDENTIFIERS
+    assert len(PROGRAM_IDENTIFIERS) == 2 * len(CELLS) + (
+        0 if cake_plan.FUSED_COMBINE else 1
+    )
     # The fused combine retires the combine program: eight fused programs remain.
     fused_only = cake_plan.program_identifiers(fused_combine=True)
     assert len(fused_only) == 2 * len(CELLS) and COMBINE not in fused_only
-    assert fused_only == PROGRAM_IDENTIFIERS[:-1]
+    assert fused_only == separate[:-1]
     assert program_identifier(FUSED, Cell(32)) == "FUSED_N32"
     assert program_identifier(FUSED, Cell(32), 6144) == "FUSED_N32"
     assert program_identifier(FUSED, Cell(32), 1024) == "FUSED_N32"
@@ -491,7 +496,14 @@ def test_buffer_tables_follow_the_geometry() -> None:
     g = Geometry(8, 3, 256, 6144, 2048, 8, 512, sm_count=148)
     sym = symmetric_buffers(g)
     assert sym["published_hidden"] == ((512, 6144), torch.bfloat16)
-    assert sym["published_ids"] == ((512, 8), torch.int32)
+    # The published routing retires once the route tables and the fused combine
+    # both ship; the route tables come with the first.
+    published = not (cake_plan.ROUTE_TABLES and cake_plan.FUSED_COMBINE)
+    assert ("published_ids" in sym) is published
+    assert ("published_weights" in sym) is published
+    if published:
+        assert sym["published_ids"] == ((512, 8), torch.int32)
+    assert ("route_offs" in sym) is cake_plan.ROUTE_TABLES
     assert sym["route_terms"] == ((512, 8, 6144), torch.bfloat16)
     assert sym["completion"][1] == torch.uint32
     loc = local_buffers(g)
@@ -507,9 +519,23 @@ def test_buffer_tables_follow_the_geometry() -> None:
     assert (g.fc1_m_tiles, g.fc2_m_tiles) == (32, 48)
     for name in FUSED_ARGS:
         assert name.isidentifier()
-    assert set(COMBINE_ARGS) - set(FUSED_ARGS) == {"output", "tokens_per_rank"}
+    # The combine program's own arguments: the live count, and the output unless
+    # the fused tail writes it.
+    # ... less what the both-switches form retires from the fused list (the
+    # publications; the combine program, which took them too, no longer ships).
+    retired = set(cake_plan.fused_args(route_tables=False, fused_combine=False))
+    retired -= set(FUSED_ARGS)
+    assert set(COMBINE_ARGS) - set(FUSED_ARGS) - retired == (
+        {"tokens_per_rank"}
+        if cake_plan.FUSED_COMBINE
+        else {"output", "tokens_per_rank"}
+    )
     assert tuple(FUSED_ARGS[-3:]) == GRID_ARGS == tuple(COMBINE_ARGS[-3:])
-    assert cake_plan.fused_args(route_tables=False, fused_combine=False) == FUSED_ARGS
+    assert cake_plan.fused_args() == FUSED_ARGS  # the shipped switches
+    assert (
+        cake_plan.fused_args(route_tables=False, fused_combine=False)
+        == cake_plan.FUSED_BASE_ARGS
+    )
 
 
 def test_program_form_switches_shape_the_tables() -> None:
@@ -557,6 +583,19 @@ def test_program_form_switches_shape_the_tables() -> None:
     assert cake_plan.fused_args(route_tables=True, fused_combine=True)[-4:] == (
         "output",
         *GRID_ARGS,
+    )
+    # The both-switches form's argument list agrees with its buffer table: the
+    # publications are gone from both, every remaining buffer crosses as
+    # (local, peers); the fused combine alone keeps the publications.
+    both_args = cake_plan.fused_args(route_tables=True, fused_combine=True)
+    assert (
+        "published_ids" not in both_args and "published_weights_peers" not in both_args
+    )
+    assert "published_ids" in cake_plan.fused_args(
+        route_tables=False, fused_combine=True
+    )
+    assert set(both) < set(both_args) and {f"{name}_peers" for name in both} < set(
+        both_args
     )
     # Geometry rules behind the switches: the global expert bound at a world
     # size above one with route tables; the combine slice rule drops with the
@@ -784,7 +823,13 @@ def _inputs(tokens: int, *, ids_dtype=torch.int32, seed: int = 0) -> MoEEpTensor
     )
 
 
-def test_host_path_binds_direct_inputs_and_launches_two_programs(host_path) -> None:
+def _launch_names(cell: Cell) -> list[str]:
+    """The programs one forward launches, in order: the fused program of the
+    cell, then the combine program unless the combine is fused into the tail."""
+    return [f"FUSED_{cell.suffix}", *([] if cake_plan.FUSED_COMBINE else ["COMBINE"])]
+
+
+def test_host_path_binds_direct_inputs_and_launches_the_route(host_path) -> None:
     backend, ws, weights, table = host_path
     t = _inputs(40)
     backend.stage_inputs(t, ws, quantize_input=True)
@@ -793,10 +838,7 @@ def test_host_path_binds_direct_inputs_and_launches_two_programs(host_path) -> N
     out = backend.compute(ws, weights, output=None)
     assert out.shape == (40, HIDDEN) and out.data_ptr() == ws.output.data_ptr()
     cell = select_cell(ws.capacity, 8, TOP_K, EXPERTS)
-    assert [name for name, _ in table.calls] == [
-        f"FUSED_{cell.suffix}",
-        "COMBINE",
-    ]
+    assert [name for name, _ in table.calls] == _launch_names(cell)
     fused = table.calls[0][1]
     assert fused["hidden"] is t.hidden_states
     assert fused["topk_ids"] is t.topk_ids and fused["topk_weights"] is t.topk_weights
@@ -829,15 +871,21 @@ def test_host_path_binds_direct_inputs_and_launches_two_programs(host_path) -> N
         assert fused[name].data_ptr() == ws.local[name].data_ptr()
         assert fused[name].shape == (tiles,) and fused[name].dtype == torch.uint32
     assert (fused["grid_x"], fused["grid_y"], fused["grid_z"]) == (148, 1, 1)
-    combine = table.calls[1][1]
-    assert combine["output"] is ws.output and combine["T_r"] == 40
-    assert combine["tokens_per_rank"] is ws.symmetric["published_meta"].local
-    assert combine["epoch"] is ws.local["epoch"]
-    assert combine["route_terms"] is ws.symmetric["route_terms"].local
-    assert (combine["grid_x"], combine["grid_y"], combine["grid_z"]) == combine_grid(
-        ws.capacity, HIDDEN
-    )
-    assert combine["hidden"] == HIDDEN  # the i32 size; the fused "hidden" is the rows
+    if cake_plan.FUSED_COMBINE:
+        # The fused tail writes the caller's output; no combine program runs.
+        assert fused["output"] is ws.output and len(table.calls) == 1
+    else:
+        combine = table.calls[1][1]
+        assert combine["output"] is ws.output and combine["T_r"] == 40
+        assert combine["tokens_per_rank"] is ws.symmetric["published_meta"].local
+        assert combine["epoch"] is ws.local["epoch"]
+        assert combine["route_terms"] is ws.symmetric["route_terms"].local
+        assert (
+            combine["grid_x"],
+            combine["grid_y"],
+            combine["grid_z"],
+        ) == combine_grid(ws.capacity, HIDDEN)
+        assert combine["hidden"] == HIDDEN  # the i32 size; the fused one is the rows
     assert ws.launches == 1
 
 
@@ -861,8 +909,9 @@ def test_host_path_stages_int64_ids_and_buckets(host_path) -> None:
     assert out.eq(2.0).all()
     fused = table.calls[0][1]
     assert fused["T_r"] == 32 and fused["hidden"] is staged.hidden
-    assert table.calls[1][1]["output"] is ws.output
-    assert table.calls[1][1]["grid_y"] == ws.capacity
+    assert table.calls[-1][1]["output"] is ws.output
+    if not cake_plan.FUSED_COMBINE:
+        assert table.calls[1][1]["grid_y"] == ws.capacity
 
 
 def test_host_path_writes_a_bound_sized_caller_output_in_place(host_path) -> None:
@@ -872,16 +921,20 @@ def test_host_path_writes_a_bound_sized_caller_output_in_place(host_path) -> Non
     output = torch.empty(16, HIDDEN, dtype=torch.bfloat16)
     out = backend.compute(ws, weights, output=output)
     assert out.data_ptr() == output.data_ptr()
-    assert table.calls[1][1]["output"] is output
+    assert table.calls[-1][1]["output"] is output
 
 
-def test_host_path_zero_tokens_still_launches_both_programs(host_path) -> None:
+def test_host_path_zero_tokens_still_launches_the_route(host_path) -> None:
     backend, ws, weights, table = host_path
     backend.stage_inputs(_inputs(0), ws, quantize_input=True)
     out = backend.compute(ws, weights, output=None)
     assert out.shape == (0, HIDDEN)
     assert table.calls[0][1]["T_r"] == 0
-    assert table.calls[1][1]["grid_y"] == ws.capacity > 0
+    assert len(table.calls) == (1 if cake_plan.FUSED_COMBINE else 2)
+    if not cake_plan.FUSED_COMBINE:
+        assert len(table.calls) == (1 if cake_plan.FUSED_COMBINE else 2)
+    if not cake_plan.FUSED_COMBINE:
+        assert table.calls[1][1]["grid_y"] == ws.capacity > 0
 
 
 def test_host_path_one_launch_under_the_fused_combine_switch(
@@ -966,7 +1019,7 @@ def test_host_path_pins_a_cell_and_caches_plans_per_bound(host_path) -> None:
         backend.stage_inputs(_inputs(tokens, seed=tokens), ws, quantize_input=True)
         backend.compute(ws, weights, output=None)
     names = [name for name, _ in table.calls]
-    assert names == ["FUSED_N128_CG2", "COMBINE"] * 3
+    assert names == _launch_names(Cell(128, 2)) * 3
     assert table.calls[0][1]["grid_x"] == 148 // 2 * 2
     assert set(ws.plans) == {
         (id(weights), 8, "N128_CG2"),
