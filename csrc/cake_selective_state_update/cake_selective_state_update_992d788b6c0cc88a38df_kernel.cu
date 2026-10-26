@@ -385,6 +385,8 @@ kernel_cake_selective_state_update_992d788b6c0cc88a38df(const __grid_constant__ 
             float c_values[2];
             asm volatile("cp.async.wait_group 0;");
             asm volatile("barrier.sync 1, 256;" ::: "memory");
+            unsigned int full_pos = 0;
+            unsigned int _phase_state_full = 0;
             #pragma unroll 1
             for (int head_offset = 0; head_offset < work_heads; head_offset++) {
                 int head = first_head + head_offset;
@@ -399,15 +401,13 @@ kernel_cake_selective_state_update_992d788b6c0cc88a38df(const __grid_constant__ 
                 int x_row = head_offset * 256 + row_in_stage;
                 int out_row = (token_base * 64 + head) * 128 + row_in_stage;
                 int ring_base = head_offset % 3 * 4;
-                int ring_lap = head_offset / 3;
                 #pragma unroll
                 for (int stage = 0; stage < 4; stage++) {
                     int ring_stage = ring_base + stage;
                     float x_value_0 = s_x[x_row + stage * 32];
                     unsigned int state_carriers[8];
                     float state_values[16];
-                    int _parity_state_full = (int)((unsigned int)ring_lap % 2);
-                    mbarrier_wait(state_full_addr + (ring_stage) * 8, _parity_state_full);
+                    mbarrier_wait(state_full_addr + (full_pos) * 8, _phase_state_full);
                     if (pad_tile == 0) {
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&state_carriers[0])), "=r"(*reinterpret_cast<uint32_t*>(&state_carriers[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&state_carriers[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&state_carriers[(0) + 3]))
@@ -723,8 +723,10 @@ kernel_cake_selective_state_update_992d788b6c0cc88a38df(const __grid_constant__ 
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     __syncwarp();
                     if (elect_sync()) {
-                        mbarrier_arrive(state_updated_addr + (ring_stage) * 8);
+                        mbarrier_arrive(state_updated_addr + (full_pos) * 8);
                     }
+                    full_pos += 1;
+                    if (full_pos == 12) { full_pos = 0; _phase_state_full ^= 1; }
                     float partial = projection_pair.x + projection_pair.y;
                     float _shfl_xor_sync_11 = __shfl_xor_sync(0xFFFFFFFF, partial, 4);
                     partial += _shfl_xor_sync_11;
@@ -769,6 +771,8 @@ kernel_cake_selective_state_update_992d788b6c0cc88a38df(const __grid_constant__ 
             if (source_slot_1 == pad_slot_id) {
                 live = 0;
             }
+            unsigned int updated_pos = 0;
+            unsigned int _phase_state_updated = 0;
             if (elect_sync()) {
                 if (work_heads_1 > 0) {
                     #pragma unroll
@@ -810,13 +814,11 @@ kernel_cake_selective_state_update_992d788b6c0cc88a38df(const __grid_constant__ 
                 for (int head_offset_1 = 0; head_offset_1 < work_heads_1; head_offset_1++) {
                     int head_1 = first_head_1 + head_offset_1;
                     int ring_base_1 = head_offset_1 % 3 * 4;
-                    int ring_lap_1 = head_offset_1 / 3;
                     int next_head_valid = ((work_heads_1 > head_offset_1 + 3) ? 1 : 0);
                     #pragma unroll
                     for (int stage_4 = 0; stage_4 < 4; stage_4++) {
                         int ring_stage_1 = ring_base_1 + stage_4;
-                        int _parity_state_updated = (int)((unsigned int)ring_lap_1 % 2);
-                        mbarrier_wait(state_updated_addr + (ring_stage_1) * 8, _parity_state_updated);
+                        mbarrier_wait(state_updated_addr + (updated_pos) * 8, _phase_state_updated);
                         if (live != 0) {
                             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                             tma_store_4d((&state_tma), 0, stage_4 * 32, head_1, slot, s_state_addr + (unsigned int)(ring_stage_1 * 8192));
@@ -825,12 +827,14 @@ kernel_cake_selective_state_update_992d788b6c0cc88a38df(const __grid_constant__ 
                         }
                         if (next_head_valid != 0) {
                             if (live != 0) {
-                                tma_4d_gmem2smem(s_state_addr + (unsigned int)(ring_stage_1 * 8192), (&state_tma), 0, stage_4 * 32, head_1 + 3, slot, state_full_addr + (ring_stage_1) * 8);
-                                mbarrier_arrive_expect_tx(state_full_addr + (ring_stage_1) * 8, 8192);
+                                tma_4d_gmem2smem(s_state_addr + (unsigned int)(ring_stage_1 * 8192), (&state_tma), 0, stage_4 * 32, head_1 + 3, slot, state_full_addr + (((updated_pos + 12 >= 12) ? updated_pos + 12 - 12 : updated_pos + 12)) * 8);
+                                mbarrier_arrive_expect_tx(state_full_addr + (((updated_pos + 12 >= 12) ? updated_pos + 12 - 12 : updated_pos + 12)) * 8, 8192);
                             } else {
-                                mbarrier_arrive(state_full_addr + (ring_stage_1) * 8);
+                                mbarrier_arrive(state_full_addr + (((updated_pos + 12 >= 12) ? updated_pos + 12 - 12 : updated_pos + 12)) * 8);
                             }
                         }
+                        updated_pos += 1;
+                        if (updated_pos == 12) { updated_pos = 0; _phase_state_updated ^= 1; }
                     }
                 }
                 asm volatile("cp.async.bulk.wait_group 0;");

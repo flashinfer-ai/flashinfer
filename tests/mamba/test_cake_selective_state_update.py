@@ -573,7 +573,7 @@ def test_raw_decode_layout_matches_flashinfer(case, cake_hits) -> None:
     plan = _route(dict(candidate, x=candidate["x"]), output_like=candidate["x"])
     assert plan is not None
     if _routes_as_measured():
-        assert plan.program == program
+        assert plan.program == cake.lean_program(program, plan.arch)
     _assert_split_grid(plan)
     out_candidate = torch.empty(
         (batch_size, 128, 64), dtype=torch.bfloat16, device="cuda"
@@ -773,7 +773,8 @@ def test_hd64_routes_capture_into_cuda_graph(case_name, cake_hits) -> None:
 def test_hd64_route_falls_back_for_non_dense_rows(cake_hits) -> None:
     """Rows with a non-unit inner stride are outside the programs' addressing; the call runs on FlashInfer."""
     inputs = _make_case(_case("stp_hd64_paired_rows"))
-    assert _route(inputs).program == "stp_hd64_paired_hpc2"
+    plan = _route(inputs)
+    assert plan.program == cake.lean_program("stp_hd64_paired_hpc2", plan.arch)
     batch_size, nheads, dim = inputs["x"].shape
     wide = torch.zeros(
         (batch_size, nheads, 2 * dim), dtype=torch.bfloat16, device="cuda"
@@ -934,6 +935,150 @@ def test_split_programs_follow_the_work() -> None:
     assert cake.dim128_split_program(4096, 8, 152, "sm_103a", False) is None
 
 
+def test_four_head_split_takes_the_nearly_full_waves() -> None:
+    """A launch of the two-head build at three CTAs per SM (groups of a multiple of four program heads) runs four
+    heads per CTA split two ways when its CTAs end in the last quarter (sm_100a) or the last 40 % (sm_103a) of a
+    third or fourth wave of four CTAs per SM; a fifth wave, groups of six heads and the other launches keep their
+    build."""
+
+    def hd64(rg, hpg=8, sms=148, arch="sm_100a", raw=False):
+        return cake.hd64_split_program(rg, hpg, sms, arch, raw)
+
+    c4 = ("stp_hd64_paired_hpc4_s2w4", 4, 2)
+    gb300 = {"sms": 152, "arch": "sm_103a"}
+    # (batch x groups[, program heads per group]); comments count the two-head build's CTAs.
+    assert hd64(407) is None  # 1628: 2.75 waves of four CTAs per SM
+    assert hd64(408) == c4  # 1632
+    assert hd64(444) == c4  # 1776: three whole waves
+    assert hd64(445) is None  # 1780
+    assert hd64(555) is None and hd64(556) == c4  # 2220 / 2224
+    assert hd64(592) == c4 and hd64(593) is None  # 2368 / 2372
+    assert hd64(740) is None  # 2960: five whole waves
+    assert hd64(395, **gb300) is None and hd64(396, **gb300) == c4  # 1580 / 1584
+    assert hd64(456, **gb300) == c4 and hd64(457, **gb300) is None  # 1824 / 1828
+    assert hd64(547, **gb300) is None and hd64(548, **gb300) == c4  # 2188 / 2192
+    assert hd64(608, **gb300) == c4 and hd64(609, **gb300) is None  # 2432 / 2436
+    assert hd64(880, 4) == c4  # 1760 CTAs of four program heads per group
+    assert hd64(587, 6) is None  # 1761 CTAs in groups of six program heads
+    assert hd64(440, raw=True) == (f"{c4[0]}_bf16_i32", 4, 2)
+
+
+def test_unsplit_program_takes_four_heads_in_the_band() -> None:
+    """The two-head build at three CTAs per SM runs four heads per CTA from 3.05 to 3.46 waves of three CTAs per
+    SM on sm_100a and to 3.7 on sm_103a, for groups of a multiple of four program heads; every other launch keeps
+    :func:`hd64_paired_program`'s build."""
+
+    def unsplit(rg, hpg=8, sms=148, arch="sm_100a", raw=False):
+        return cake.hd64_unsplit_program(rg, hpg, sms, arch, raw)
+
+    hpc2, hpc4 = ("stp_hd64_paired_hpc2", 2), ("stp_hd64_paired_hpc4", 4)
+    gb300 = {"sms": 152, "arch": "sm_103a"}
+    # (batch x groups[, program heads per group]); comments count the two-head build's CTAs.
+    # sm_100a: 1352 / 1356 (3.05 waves: 1354.2), 1536 / 1540 (3.46 waves: 1536.2), 1600.
+    assert unsplit(338) == hpc2 and unsplit(339) == hpc4
+    assert unsplit(384) == hpc4 and unsplit(385) == hpc2
+    assert unsplit(400) == hpc2
+    # sm_103a: 1388 / 1392 (3.05 waves: 1390.8), 1684 / 1688 (3.7 waves: 1687.2).
+    assert unsplit(347, **gb300) == hpc2 and unsplit(348, **gb300) == hpc4
+    assert unsplit(421, **gb300) == hpc4 and unsplit(422, **gb300) == hpc2
+    assert unsplit(700, 4) == hpc4  # 1400 CTAs of four program heads per group
+    assert unsplit(233, 6) == ("stp_hd64_paired_hpc2", 2)  # 699 CTAs in groups of six
+    assert unsplit(360, raw=True) == ("stp_hd64_paired_hpc4_bf16_i32", 4)
+    # An architecture without the band.
+    assert unsplit(360, sms=148, arch="sm_120a") == hpc2
+    # Below six program heads per SM the band is not reached: hd64_paired_program's build.
+    for rg in (40, 111, 114, 150, 221, 222):
+        assert unsplit(rg) == cake.hd64_paired_program(rg, 8, 148, False)
+
+
+def test_lean_builds_follow_the_architecture() -> None:
+    """A launch runs the ``_lean`` build (consumer proxy fence after the full-stage wait dropped) of the programs its
+    architecture lists, in either ABI; the loader ships every ``_lean`` build for exactly those architectures and
+    never the plain build an architecture replaces."""
+    lean = cake.lean_program
+    assert lean("stp_hd64_paired_hpc2", "sm_100a") == "stp_hd64_paired_hpc2_lean"
+    assert (
+        lean("stp_hd64_paired_hpc2_bf16_i32", "sm_100a")
+        == "stp_hd64_paired_hpc2_lean_bf16_i32"
+    )
+    assert lean("stp_hd64_paired_hpc2", "sm_103a") == "stp_hd64_paired_hpc2"
+    assert lean("stp_hd64_paired_hpc1_s4w2", "sm_100a") == "stp_hd64_paired_hpc1_s4w2"
+    assert (
+        lean("stp_hd64_paired_hpc1_s4w2", "sm_103a") == "stp_hd64_paired_hpc1_s4w2_lean"
+    )
+    assert lean("stp_dim128_hpc1_s2w4", "sm_100a") == "stp_dim128_hpc1_s2w4"
+    assert lean("stp_dim128_hpc1_s2w4", "sm_103a") == "stp_dim128_hpc1_s2w4_lean"
+    for arch in ("sm_100a", "sm_103a"):
+        assert lean("stp_dim128_z_balanced", arch) == "stp_dim128_z_balanced_lean"
+        assert (
+            lean("stp_hd64_paired_hpc4_s2w4", arch) == "stp_hd64_paired_hpc4_s2w4_lean"
+        )
+        for kept in (
+            "stp_hd64_paired_hpc1",
+            "stp_hd64_paired_hpc1_ratio8_bf16_i32",
+            "stp_dim128_hpc1_mb4",
+            "stp_dim128_z_gated",
+            "stp_hd64_rows_bf16_dt8",
+            "dynamic_lanes16",
+        ):
+            assert lean(kept, arch) == kept
+        for name, module in cake.PROGRAMS.items():
+            arches = cake.MODULES[module].get("arches", ["sm_100a", "sm_103a"])
+            base = name.removesuffix("_bf16_i32")
+            if base.endswith("_lean"):
+                takes = base.removesuffix("_lean") in cake._LEAN_PROGRAMS[arch]
+                assert (arch in arches) == takes, (name, arch)
+            elif base in cake._LEAN_PROGRAMS[arch]:
+                assert arch not in arches, (name, arch)
+    assert lean("stp_hd64_paired_hpc4_s2w4", "sm_120a") == "stp_hd64_paired_hpc4_s2w4"
+
+
+def test_dynamic_program_follows_the_token_count() -> None:
+    """The dynamic program's build: 16 lanes per row below eight batch rows of a multi-token call, its
+    pipelined-reduction build for one batch row at 4 to 8 tokens on sm_100a and 5 to 8 on sm_103a."""
+    pr = {"sm_100a": (4, 5, 6, 7, 8), "sm_103a": (5, 6, 7, 8)}
+    for arch, steps in pr.items():
+        for batch in range(1, 12):
+            for tokens in range(1, 9):
+                if tokens < 2 or batch >= 8:
+                    want = "dynamic_lanes8"
+                elif batch == 1 and tokens in steps:
+                    want = "dynamic_lanes16_pr"
+                else:
+                    want = "dynamic_lanes16"
+                assert cake.dynamic_program(batch, tokens, arch) == want
+
+
+def test_every_route_build_ships_for_its_architecture() -> None:
+    """Every build the single-token and dynamic routes can name on an architecture is a program the loader
+    delivers there (a narrowed or retired build is never routed)."""
+    for arch, sms in (("sm_100a", 148), ("sm_103a", 152)):
+        named = set()
+        for hpg in (1, 2, 3, 4, 6, 8, 16, 64):
+            for rg in range(1, 3000):
+                if rg * hpg < sms:
+                    continue  # the row-owner tile
+                for raw in (False, True):
+                    split = cake.hd64_split_program(rg, hpg, sms, arch, raw)
+                    named.add(
+                        split[0]
+                        if split
+                        else cake.hd64_unsplit_program(rg, hpg, sms, arch, raw)[0]
+                    )
+        for hpg in (1, 2, 8):
+            for rg in range(1, 3000):
+                split = cake.dim128_split_program(rg, hpg, sms, arch, False)
+                named.add(split[0] if split else cake.dim128_program(hpg, False)[0])
+        named |= {"stp_dim128_z_gated", "stp_dim128_z_balanced"}
+        named |= {
+            cake.dynamic_program(b, t, arch) for b in range(1, 9) for t in range(1, 9)
+        }
+        for program in named:
+            build = cake.lean_program(program, arch)
+            module = cake.PROGRAMS[build]
+            assert arch in cake.MODULES[module].get("arches", [arch]), (build, arch)
+
+
 @requires_blackwell
 @pytest.mark.parametrize("batch_size", (221, 222))
 def test_dim128_two_head_split_starts_at_sixteen_waves(batch_size) -> None:
@@ -947,7 +1092,8 @@ def test_dim128_two_head_split_starts_at_sixteen_waves(batch_size) -> None:
         pytest.skip("the split floor is measured on B200 and GB300 only")
     b200 = cake._sm_count(plan.device_index) == 148 and plan.arch == "sm_100a"
     split = b200 and batch_size == 222
-    assert plan.program == ("stp_dim128_hpc2_s2w4_mb5" if split else "stp_dim128_hpc2")
+    program = "stp_dim128_hpc2_s2w4_mb5" if split else "stp_dim128_hpc2"
+    assert plan.program == cake.lean_program(program, plan.arch)
     assert plan.grid == (batch_size * 8 * 4 * (2 if split else 1), 1, 1)
 
 
@@ -979,6 +1125,9 @@ _PAIRED_ROWS_CASES = (
     (("hd64_four_s4", 20, 128, 8, 64, 128, 0), False, "stp_hd64_paired_hpc4_s4w2"),
     (("hd64_two_heads_wide", 64, 128, 8, 64, 128, 0), False, "stp_hd64_paired_hpc2"),
     (("hd64_mb5", 32, 128, 8, 64, 128, 0), False, "stp_hd64_paired_hpc2_s2w4_mb5"),
+    # 1760 two-head CTAs: a nearly full third wave of four CTAs per SM (c4), and 1472 in the four-head band.
+    (("hd64_c4", 55, 128, 8, 64, 128, 0), False, "stp_hd64_paired_hpc4_s2w4"),
+    (("hd64_h4", 46, 128, 8, 64, 128, 0), False, "stp_hd64_paired_hpc4"),
 )
 
 
@@ -999,7 +1148,7 @@ def test_paired_rows_routes_match_flashinfer(case, gated, program, cake_hits) ->
     plan = _route(inputs)
     assert plan is not None
     if _routes_as_measured():
-        assert plan.program == program
+        assert plan.program == cake.lean_program(program, plan.arch)
     _assert_split_grid(plan)
     reference, candidate = _split_arms(inputs)
     out_reference = selective_state_update(**reference, backend="flashinfer")
@@ -1046,7 +1195,9 @@ _SPLIT_CASES = [
 
 def _assert_split_grid(plan) -> None:
     """A P-split plan launches ``p_split`` CTAs on every work tile of its heads per CTA."""
-    split = _SPLIT_UNSPLIT.get(plan.program.removesuffix("_bf16_i32"))
+    split = _SPLIT_UNSPLIT.get(
+        plan.program.removesuffix("_bf16_i32").removesuffix("_lean")
+    )
     if split is None:
         return
     _, heads_per_cta, p_split = split
@@ -1104,6 +1255,16 @@ def _vary(inputs, variant):
     return inputs
 
 
+def _delivered(program, arch):
+    """The ``PROGRAMS`` key of the build a launch of ``program`` runs on ``arch`` (:func:`cake.lean_program`), or
+    ``None`` when no build of it ships for that architecture."""
+    name = cake.lean_program(program, arch)
+    module = cake.PROGRAMS.get(name)
+    if module is None or arch not in cake.MODULES[module].get("arches", [arch]):
+        return None
+    return name
+
+
 def _launch_paired(plan, program, heads_per_cta, p_split) -> None:
     """Launch one paired row-major build on a route's bindings: ``p_split`` CTAs per work tile of
     ``heads_per_cta`` program heads of one (batch, group)."""
@@ -1130,12 +1291,19 @@ def test_split_programs_are_bitwise_the_unsplit_builds(program, variant) -> None
     if variant == "raw":
         program, unsplit = f"{program}_bf16_i32", f"{unsplit}_bf16_i32"
     arch = cake._device_arch(torch.cuda.current_device())
-    module = cake.PROGRAMS[program]
-    arches = cake.MODULES[module].get("arches", [arch])
-    if arch not in arches:
-        with pytest.raises(ValueError, match="not delivered"):
-            cake.jit_spec(module, arch)
-        pytest.skip(f"{program} is delivered for {arches} only")
+    build = _delivered(program, arch)
+    if build is None:
+        # Every build of the program the loader records ships for another architecture only.
+        builds = [
+            name for name in (program, f"{program}_lean") if name in cake.PROGRAMS
+        ]
+        assert builds
+        for name in builds:
+            with pytest.raises(ValueError, match="not delivered"):
+                cake.jit_spec(cake.PROGRAMS[name], arch)
+        pytest.skip(f"{program} is not delivered for {arch}")
+    program, unsplit = build, _delivered(unsplit, arch)
+    assert unsplit is not None
     initial_state = inputs["state"].clone()
     split_arm, unsplit_arm = _split_arms(inputs)
     if variant == "raw":
@@ -1163,6 +1331,77 @@ def test_split_programs_are_bitwise_the_unsplit_builds(program, variant) -> None
     )
     if variant == "disable":
         assert torch.equal(split_arm["state"], initial_state)
+
+
+# (name, batch, nheads, ngroups, the build the route takes, its heads per CTA and CTAs per work tile): launches of
+# the two-head build at three CTAs per SM that the four-head rules take on B200 and GB300 (eight program heads per
+# group: 1760 two-head CTAs, a nearly full third wave of four CTAs per SM; 1472 in the four-head band).
+_FOUR_HEAD_CASES = (
+    ("c4", 55, 128, 8, "stp_hd64_paired_hpc4_s2w4", 4, 2),
+    ("c4_raw", 55, 128, 8, "stp_hd64_paired_hpc4_s2w4_bf16_i32", 4, 2),
+    ("h4", 46, 128, 8, "stp_hd64_paired_hpc4", 4, 1),
+    ("h4_raw", 46, 128, 8, "stp_hd64_paired_hpc4_bf16_i32", 4, 1),
+)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("case", _FOUR_HEAD_CASES, ids=lambda case: case[0])
+def test_four_head_routes_are_bitwise_the_two_head_build(case) -> None:
+    """The four-head builds the c4 / h4 rules route a launch to write the output and state of the two-head build
+    the launch ran before, bit for bit, on the same bindings."""
+    name, batch, nheads, ngroups, program, heads_per_cta, p_split = case
+    if not _routes_as_measured():
+        pytest.skip("the four-head bands are measured on B200 and GB300 only")
+    raw = name.endswith("_raw")
+    bf16 = torch.bfloat16
+    if raw:
+        inputs = _raw_decode_case(batch, bf16, nheads, ngroups)
+    else:
+        inputs = _make_case(
+            (name, batch, nheads, ngroups, 64, 128, 0, bf16, "auto", False, None)
+        )
+    four_arm, two_arm = _split_arms(inputs)
+    four_plan, two_plan = _route(four_arm), _route(two_arm)
+    assert four_plan is not None and two_plan is not None
+    arch = four_plan.arch
+    assert four_plan.program == cake.lean_program(program, arch)
+    assert four_plan.bindings["head_tiles"] == -(
+        -(nheads // 2 // ngroups) // heads_per_cta
+    )
+    _launch_paired(four_plan, four_plan.program, heads_per_cta, p_split)
+    two = cake.lean_program(f"stp_hd64_paired_hpc2{'_bf16_i32' if raw else ''}", arch)
+    _launch_paired(two_plan, two, 2, 1)
+    assert torch.equal(four_plan.bindings["output"], two_plan.bindings["output"])
+    assert torch.equal(four_arm["state"], two_arm["state"])
+
+
+@requires_blackwell
+@pytest.mark.parametrize("token_steps", (4, 5, 6, 7, 8))
+def test_pipelined_reduction_build_is_bitwise_the_dynamic_build(token_steps) -> None:
+    """The dynamic program's pipelined-reduction build writes the output and state of the 16-lane build, bit
+    for bit, on the same bindings (one batch row, a destination table), and matches FlashInfer."""
+    case = ("pr", 1, 16, 1, 64, 128, token_steps, torch.float32, "simple", False, 1)
+    inputs = _make_case(case)
+    reference = dict(inputs, state=inputs["state"].clone())
+    out_reference = selective_state_update(**reference, backend="flashinfer")
+    pr_arm, plain_arm = _split_arms(inputs)
+    pr_plan, plain_plan = _route(pr_arm), _route(plain_arm)
+    assert pr_plan is not None and plain_plan is not None
+    arch = pr_plan.arch
+    assert pr_plan.program == cake.dynamic_program(1, token_steps, arch)
+    with torch.cuda.device(pr_plan.device_index):
+        for plan, program in (
+            (pr_plan, "dynamic_lanes16_pr"),
+            (plain_plan, "dynamic_lanes16"),
+        ):
+            cake._program(program, arch, ()).launch(plan.grid, plan.bindings)
+    out_pr, out_plain = pr_plan.bindings["output"], plain_plan.bindings["output"]
+    assert torch.equal(out_pr, out_plain)
+    assert torch.equal(pr_arm["state"], plain_arm["state"])
+    torch.testing.assert_close(out_pr, out_reference, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        pr_arm["state"], reference["state"], atol=1e-2, rtol=1e-2
+    )
 
 
 # (batch, nheads, ngroups) of z-gated 128x128 calls inside the persistent build's domain on B200 and GB300: one
@@ -1199,7 +1438,9 @@ def test_balanced_program_is_bitwise_the_z_gated_build(shape, variant) -> None:
     balanced_arm, gated_arm = _split_arms(inputs)
     balanced_plan, gated_plan = _route(balanced_arm), _route(gated_arm)
     assert balanced_plan is not None and gated_plan is not None
-    if balanced_plan.program != "stp_dim128_z_balanced":
+    if balanced_plan.program != cake.lean_program(
+        "stp_dim128_z_balanced", balanced_plan.arch
+    ):
         pytest.skip(f"the route takes {balanced_plan.program} on this device")
     units = batch * nheads
     sm_count = cake._sm_count(balanced_plan.device_index)
@@ -1235,7 +1476,8 @@ def test_balanced_program_stays_off_the_raw_abi() -> None:
     inputs["z"] = z.to(bf16)
     plan = _route(inputs)
     assert plan is not None
-    if plan.program != "stp_dim128_z_balanced":
+    balanced = cake.lean_program("stp_dim128_z_balanced", plan.arch)
+    if plan.program != balanced:
         pytest.skip(f"the route takes {plan.program} on this device")
     nheads, dim = inputs["D"].shape
     raw = dict(inputs)
@@ -1246,7 +1488,7 @@ def test_balanced_program_stays_off_the_raw_abi() -> None:
         raw[key] = rows.as_strided((nheads, dim), (1, 0))
     raw["state_batch_indices"] = inputs["state_batch_indices"].to(torch.int32)
     raw_plan = _route(raw)
-    assert raw_plan is None or raw_plan.program != "stp_dim128_z_balanced"
+    assert raw_plan is None or raw_plan.program != balanced
 
 
 @requires_blackwell
@@ -1702,10 +1944,15 @@ def test_horizontal_route_falls_back_for_mismatched_shapes() -> None:
     assert _route(dict(inputs, C=inputs["C"][..., :64].contiguous())) is None
 
 
-# (case, program, grid): the multi-token routes' builds and launch grids.
+# (case, program or {arch: program}, grid): the multi-token routes' builds and launch grids.
 _MULTI_TOKEN_ROUTES = (
     ("dynamic0", "dynamic_lanes8", (1, 16, 4)),
-    ("dynamic1", "dynamic_lanes16", (1, 16, 8)),
+    (
+        "dynamic1",
+        {"sm_100a": "dynamic_lanes16_pr", "sm_103a": "dynamic_lanes16"},
+        (1, 16, 8),
+    ),
+    ("dynamic3", "dynamic_lanes16_pr", (1, 16, 8)),
     ("dynamic0_b8", "dynamic_lanes8", (8, 16, 4)),
     ("mtp_cache", "mtp_cache_groups8_heads64", (1, 64, 4)),
     ("mtp_cache_g1", "mtp_cache_groups1_heads64", (1, 64, 4)),
@@ -1727,12 +1974,15 @@ _MULTI_TOKEN_ROUTES = (
     ids=[route[0] for route in _MULTI_TOKEN_ROUTES],
 )
 def test_routes_pick_the_build_and_grid(case_name, program, grid) -> None:
-    """The dynamic program runs 16 lanes per row below eight batch rows of a multi-token call; the horizontal
-    producer runs one CTA per work group, the early-index build up to eight work groups per SM; the short
-    program's TMA ring runs one CTA per (batch row, group) inside its domain, the build folding 64 heads of 8
-    groups one CTA per (batch row, head) outside it."""
+    """The dynamic program runs 16 lanes per row below eight batch rows of a multi-token call, one batch row at
+    the token counts of the architecture its pipelined-reduction build; the horizontal producer runs one CTA per
+    work group, the early-index build up to eight work groups per SM; the short program's TMA ring runs one CTA
+    per (batch row, group) inside its domain, the build folding 64 heads of 8 groups one CTA per (batch row,
+    head) outside it."""
     plan = _route(_make_case(_case(case_name)))
     assert plan is not None
+    if isinstance(program, dict):
+        program = program[plan.arch]
     if _routes_as_measured():
         assert (plan.program, plan.grid, plan.defines) == (program, grid, ())
 
@@ -1911,23 +2161,51 @@ def test_aot_table_names_every_delivered_build() -> None:
 
 
 def test_registry_names_every_program() -> None:
-    hd64_unsplit = ("hpc1_ratio8", "hpc1", "hpc2_mb2", "hpc2", "hpc4")
-    paired_rows = {
-        f"stp_hd64_paired_{variant}{abi}"
-        for variant in hd64_unsplit
-        for abi in ("", "_bf16_i32")
-    } | {
-        "stp_dim128_hpc2",
-        "stp_dim128_hpc1_mb4",
-        "stp_dim128_z_gated",
-        "stp_dim128_z_balanced",
+    both, b200, gb300 = ["sm_100a", "sm_103a"], ["sm_100a"], ["sm_103a"]
+    # The builds of the paired row-major module by the architectures they ship for: the plain build where the
+    # architecture runs it, the ``_lean`` build where it runs that one; the headdim-64 builds in both ABIs.
+    hd64 = {
+        "hpc1_ratio8": (both, None),
+        "hpc1": (both, None),
+        "hpc2_mb2": (None, both),
+        "hpc2": (gb300, b200),
+        "hpc4": (None, both),
+        "hpc1_ratio8_s4w2": (b200, gb300),
+        "hpc1_s4w2": (b200, gb300),
+        "hpc2_ratio8_s2w4": (None, both),
+        "hpc2_s2w4": (None, both),
+        "hpc4_s2w4": (None, both),
+        "hpc4_s4w2": (None, both),
+        "hpc2_s2w4_mb5": (None, both),
     }
-    # The P-split builds of the headdim-64 pairs in both ABIs, and of the 128x128 heads.
-    split = {
-        f"{program}{abi}" for program in _SPLIT_UNSPLIT for abi in ("", "_bf16_i32")
+    dim128 = {
+        "hpc2": (None, both),
+        "hpc1_mb4": (both, None),
+        "z_gated": (both, None),
+        "z_balanced": (None, both),
+        "hpc1_s2w4": (b200, gb300),
+        "hpc2_s2w4_mb5": (None, b200),
     }
-    split -= {"stp_dim128_hpc1_s2w4_bf16_i32", "stp_dim128_hpc2_s2w4_mb5_bf16_i32"}
-    assert len(split) == 16
+    paired_rows = {}
+    for variant, (plain, lean) in hd64.items():
+        for abi in ("", "_bf16_i32"):
+            if plain:
+                paired_rows[f"stp_hd64_paired_{variant}{abi}"] = plain
+            if lean:
+                paired_rows[f"stp_hd64_paired_{variant}_lean{abi}"] = lean
+    for variant, (plain, lean) in dim128.items():
+        if plain:
+            paired_rows[f"stp_dim128_{variant}"] = plain
+        if lean:
+            paired_rows[f"stp_dim128_{variant}_lean"] = lean
+    assert len(paired_rows) == 37
+    for arch in both:
+        lean = {
+            name
+            for name, arches in paired_rows.items()
+            if "_lean" in name and arch in arches
+        }
+        assert len(lean) == {"sm_100a": 19, "sm_103a": 21}[arch]
     rows = {
         f"stp_hd64_rows_{band}{abi}"
         for band in ("bf16_dt8", "bf16_dt4_od", "fp32_dt8", "fp32_dt1_large")
@@ -1945,6 +2223,7 @@ def test_registry_names_every_program() -> None:
     multi_token = {
         "dynamic_lanes8",
         "dynamic_lanes16",
+        "dynamic_lanes16_pr",
         "mtp_cache_groups1",
         "mtp_cache_groups8",
         "mtp_cache_bf16_i32",
@@ -1961,13 +2240,12 @@ def test_registry_names_every_program() -> None:
     # build) and the six-token cache producer instantiated per projection layout (layouts beyond the rendered
     # three).
     carried = {"stp_hd64_rows_fp32", "mtp_cache_c4_t6"}
-    assert set(cake.PROGRAMS) == paired_rows | split | rows | multi_token | carried
-    assert len(cake.PROGRAMS) == 61
-    # The two-head 128x128 build split two ways at five CTAs per SM ships for sm_100a alone.
-    narrowed = {p for p, m in cake.PROGRAMS.items() if "arches" in cake.MODULES[m]}
-    assert narrowed == {"stp_dim128_hpc2_s2w4_mb5"}
-    mb5 = cake.MODULES[cake.PROGRAMS["stp_dim128_hpc2_s2w4_mb5"]]
-    assert mb5["arches"] == ["sm_100a"]
+    assert set(cake.PROGRAMS) == set(paired_rows) | rows | multi_token | carried
+    assert len(cake.PROGRAMS) == 69
+    # A build shipping on one architecture spells it; every other record serves both.
+    for program, module in cake.PROGRAMS.items():
+        arches = cake.MODULES[module].get("arches", both)
+        assert arches == paired_rows.get(program, both), program
     for program in carried:
         assert cake.MODULES[cake.PROGRAMS[program]]["defines"]
     for program in set(cake.PROGRAMS) - carried:
