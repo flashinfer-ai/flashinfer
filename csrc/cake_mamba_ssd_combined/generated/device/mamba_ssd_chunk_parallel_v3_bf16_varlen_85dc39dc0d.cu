@@ -1,7 +1,19 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 by FlashInfer team.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
+
 typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
@@ -241,7 +253,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap b_map, const __grid_constant__ CUtensorMap c_map, const __grid_constant__ CUtensorMap out_map, const __grid_constant__ CUtensorMap h_map, __nv_bfloat16* __restrict__ x, float* __restrict__ dt, __half* __restrict__ delta_precomputed, float* __restrict__ cumsum_precomputed, float* __restrict__ A, __nv_bfloat16* __restrict__ B_tensor, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ D, __nv_bfloat16* __restrict__ z, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ initial_states, __nv_bfloat16* __restrict__ final_states, __nv_bfloat16* __restrict__ checkpoint_states, int* __restrict__ checkpoint_token_indices, int* __restrict__ checkpoint_state_slots, int* __restrict__ seq_idx_i32, long long* __restrict__ seq_idx_i64, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, int* __restrict__ seq_chunk_cumsum, __nv_bfloat16* __restrict__ out_native, float* __restrict__ s_work, float* __restrict__ agg_work, unsigned int* __restrict__ h_words, unsigned int* __restrict__ grid_barrier, int nheads, int ngroups, int batch, int seqlen, int nchunks, int sequence_count, int num_logical_chunks, int mode_varlen, int D_mode, int has_z, int has_initial, int dt_softplus, float dt_min, float dt_max, int write_final_states, int checkpoint_state_count, int vcount)
+kernel_mamba_ssd_chunk_parallel_v3_bf16_varlen(const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap b_map, const __grid_constant__ CUtensorMap c_map, const __grid_constant__ CUtensorMap out_map, const __grid_constant__ CUtensorMap h_map, __nv_bfloat16* __restrict__ x, float* __restrict__ dt, __half* __restrict__ delta_precomputed, float* __restrict__ cumsum_precomputed, float* __restrict__ A, __nv_bfloat16* __restrict__ B_tensor, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ D, __nv_bfloat16* __restrict__ z, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ initial_states, __nv_bfloat16* __restrict__ final_states, __nv_bfloat16* __restrict__ checkpoint_states, int* __restrict__ checkpoint_token_indices, int* __restrict__ checkpoint_state_slots, int* __restrict__ seq_idx_i32, long long* __restrict__ seq_idx_i64, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, int* __restrict__ seq_chunk_cumsum, __nv_bfloat16* __restrict__ out_native, float* __restrict__ s_work, float* __restrict__ agg_work, unsigned int* __restrict__ h_words, unsigned int* __restrict__ grid_barrier, int nheads, int ngroups, int batch, int seqlen, int nchunks, int sequence_count, int num_logical_chunks, int mode_varlen, int D_mode, int has_z, int has_initial, int dt_softplus, float dt_min, float dt_max, int write_final_states, int checkpoint_state_count, int vcount)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -410,9 +422,14 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
     const int tmem_state_delta_tmem = taddr + 384;
     const int tmem_inter_tmem = taddr + 448;
     const int tmem_s_tmem = taddr;
-
-    // ---- Ordered hardware-WG register redistribution ----
-    // Dec phase frees registers before any WG attempts inc.
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.wait;" ::: "memory");
     if (warp >= 0 && warp <= 3) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 24;");
     }
@@ -424,7 +441,7 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
             unsigned int stage3 = 0;
             unsigned int sstage = 0;
             int tot[1];
-            tot[0] = sequence_count * nchunks * nheads;
+            tot[0] = seq_chunk_cumsum[sequence_count] * nheads;
             int veff[1];
             int total = tot[0];
             int g = 1;
@@ -450,10 +467,9 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
             while (1) {
                 if (warp == 0) {
                     if (elect_sync()) {
-                        uint32_t _atomic_inc_old_0;
+                        uint32_t claimed;
                         asm volatile("atom.acq_rel.gpu.global.inc.u32 %0, [%1], %2;"
-                            : "=r"(_atomic_inc_old_0) : "l"(&grid_barrier[0]), "r"(static_cast<uint32_t>(claim_limit)) : "memory");
-                        unsigned int claimed = _atomic_inc_old_0;
+                            : "=r"(claimed) : "l"(&grid_barrier[0]), "r"(static_cast<uint32_t>(claim_limit)) : "memory");
                         if (claimed == claim_limit) {
                             asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(grid_barrier) + (1))), "r"(static_cast<unsigned int>(1)) : "memory");
                         }
@@ -484,8 +500,14 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                     int sequence = 0;
                     int s_base = 0;
                     int n_item = nchunks;
-                    sequence = xa / (nchunks * nheads);
-                    s_base = sequence * nchunks;
+                    #pragma unroll 1
+                    for (int q = 0; q < sequence_count; q++) {
+                        if (xa >= seq_chunk_cumsum[q + 1] * nheads) {
+                            sequence = q + 1;
+                        }
+                    }
+                    s_base = seq_chunk_cumsum[sequence];
+                    n_item = seq_chunk_cumsum[sequence + 1] - s_base;
                     int rem = xa - s_base * nheads;
                     int head = rem / n_item;
                     int chunk = rem - head * n_item;
@@ -515,10 +537,10 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         int t_range = xa - a_b + (logical - first);
                         unsigned int s_slot = (unsigned int)(t_range % 8);
-                        int _mma_a_lo_2 = make_warp_uniform((((smem_scaled_b_addr) >> 4) & 0x7FFF) + (0) * 2048);
+                        int _mma_a_lo_1 = make_warp_uniform((((smem_scaled_b_addr) >> 4) & 0x7FFF) + (0) * 2048);
                         int _mma_b_lo_2 = make_warp_uniform(((((smem_x_addr) >> 4) & 0x7FFF) | 0x4000000) + (stage1) * 1024);
                         {
-                            uint64_t _mma_ss_a_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_2);
+                            uint64_t _mma_ss_a_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_1);
                             uint64_t _mma_ss_b_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_2);
                             if (elect_sync()) {
                                 tcgen05_mma_f16((tmem_s_tmem + (s_slot * 64)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 135333008, 0);
@@ -576,8 +598,14 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                     int sequence_1 = 0;
                     int s_base_1 = 0;
                     int n_item_1 = nchunks;
-                    sequence_1 = xc / (nchunks * nheads);
-                    s_base_1 = sequence_1 * nchunks;
+                    #pragma unroll 1
+                    for (int q_1 = 0; q_1 < sequence_count; q_1++) {
+                        if (xc >= seq_chunk_cumsum[q_1 + 1] * nheads) {
+                            sequence_1 = q_1 + 1;
+                        }
+                    }
+                    s_base_1 = seq_chunk_cumsum[sequence_1];
+                    n_item_1 = seq_chunk_cumsum[sequence_1 + 1] - s_base_1;
                     int rem_1 = xc - s_base_1 * nheads;
                     int head_1 = rem_1 / n_item_1;
                     int chunk_1 = rem_1 - head_1 * n_item_1;
@@ -606,10 +634,10 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         mbarrier_wait(outputs_empty_addr, _phase_outputs_empty_0);
                         _phase_outputs_empty_0 ^= 1;
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        int _mma_a_lo_3 = make_warp_uniform((((smem_c_addr) >> 4) & 0x7FFF) + (stage3) * 2048);
+                        int _mma_a_lo_2 = make_warp_uniform((((smem_c_addr) >> 4) & 0x7FFF) + (stage3) * 2048);
                         int _mma_b_lo_3 = make_warp_uniform((((smem_state_addr) >> 4) & 0x7FFF) + (sstage) * 1024);
                         {
-                            uint64_t _mma_ss_a_desc_1 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_3);
+                            uint64_t _mma_ss_a_desc_1 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_2);
                             uint64_t _mma_ss_b_desc_1 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_3);
                             if (elect_sync()) {
                                 tcgen05_mma_f16(tmem_inter_tmem, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 135267472, 0);
@@ -669,7 +697,7 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
             unsigned int stage3_1 = 0;
             unsigned int acc_stage = 0;
             int tot_1[1];
-            tot_1[0] = sequence_count * nchunks * nheads;
+            tot_1[0] = seq_chunk_cumsum[sequence_count] * nheads;
             int veff_1[1];
             int total_1 = tot_1[0];
             int g_1 = 1;
@@ -687,7 +715,6 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
             unsigned int _phase_cb_empty = 1;
             unsigned int _phase_q_full_0 = 0;
             unsigned int _phase_outputs_empty_0_1 = 1;
-            unsigned int _phase_x3_full = 0;
             while (1) {
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 asm volatile("barrier.sync 11, 512;" ::: "memory");
@@ -714,8 +741,14 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                     int sequence_2 = 0;
                     int s_base_2 = 0;
                     int n_item_2 = nchunks;
-                    sequence_2 = xa_1 / (nchunks * nheads);
-                    s_base_2 = sequence_2 * nchunks;
+                    #pragma unroll 1
+                    for (int q_2 = 0; q_2 < sequence_count; q_2++) {
+                        if (xa_1 >= seq_chunk_cumsum[q_2 + 1] * nheads) {
+                            sequence_2 = q_2 + 1;
+                        }
+                    }
+                    s_base_2 = seq_chunk_cumsum[sequence_2];
+                    n_item_2 = seq_chunk_cumsum[sequence_2 + 1] - s_base_2;
                     int rem_2 = xa_1 - s_base_2 * nheads;
                     int head_2 = rem_2 / n_item_2;
                     int chunk_2 = rem_2 - head_2 * n_item_2;
@@ -792,7 +825,7 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         _phase_q_full_0 ^= 1;
                         mbarrier_wait(outputs_empty_addr, _phase_outputs_empty_0_1);
                         _phase_outputs_empty_0_1 ^= 1;
-                        mbarrier_wait(x3_full_addr + (stage3_1) * 8, _phase_x3_full);
+                        mbarrier_wait(x3_full_addr + (stage3_1) * 8, _phase_bc_full_1);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         int _mma_b_lo_1 = make_warp_uniform(((((smem_x_addr) >> 4) & 0x7FFF) | 0x4000000) + (stage3_1) * 1024);
                         asm volatile(
@@ -839,12 +872,12 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_intra_tmem), "r"(_mma_b_lo_1), "r"(tmem_q_tmem), "r"(0));
+                    :: "r"(tmem_intra_tmem), "r"(_mma_b_lo_1), "r"(tmem_q_tmem), "r"(0) : "memory");
                         elect_commit(intra_full_addr);
                         elect_commit(q_empty_addr);
                         elect_commit(x3_empty_addr + (stage3_1) * 8);
                         stage3_1 += 1;
-                        if (stage3_1 == 2) { stage3_1 = 0; _phase_bc_full_1 ^= 1; _phase_x3_full ^= 1; }
+                        if (stage3_1 == 2) { stage3_1 = 0; _phase_bc_full_1 ^= 1; }
                         acc_stage += 1;
                         if (acc_stage == 2) { acc_stage = 0; _phase_cb_empty ^= 1; }
                     }
@@ -860,7 +893,7 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
             unsigned int stage3_2 = 0;
             unsigned int sstage_1 = 0;
             int tot_2[1];
-            tot_2[0] = sequence_count * nchunks * nheads;
+            tot_2[0] = seq_chunk_cumsum[sequence_count] * nheads;
             int veff_2[1];
             int total_2 = tot_2[0];
             int g_2 = 1;
@@ -900,8 +933,14 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                     int sequence_3 = 0;
                     int s_base_3 = 0;
                     int n_item_3 = nchunks;
-                    sequence_3 = xa_2 / (nchunks * nheads);
-                    s_base_3 = sequence_3 * nchunks;
+                    #pragma unroll 1
+                    for (int q_3 = 0; q_3 < sequence_count; q_3++) {
+                        if (xa_2 >= seq_chunk_cumsum[q_3 + 1] * nheads) {
+                            sequence_3 = q_3 + 1;
+                        }
+                    }
+                    s_base_3 = seq_chunk_cumsum[sequence_3];
+                    n_item_3 = seq_chunk_cumsum[sequence_3 + 1] - s_base_3;
                     int rem_3 = xa_2 - s_base_3 * nheads;
                     int head_3 = rem_3 / n_item_3;
                     int chunk_3 = rem_3 - head_3 * n_item_3;
@@ -928,8 +967,7 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         int group = head_0_3 * ngroups / nheads;
                         int physical_chunk = 0;
                         int physical_batch = 0;
-                        physical_batch = logical_3 / nchunks;
-                        physical_chunk = logical_3 - physical_batch * nchunks;
+                        physical_chunk = chunk_indices[logical_3];
                         int token_in_batch = physical_chunk * 128;
                         mbarrier_wait(b1_empty_addr + (stage1_1) * 8, _phase_b1_empty);
                         if (elect_sync()) {
@@ -951,8 +989,14 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                     int sequence_4 = 0;
                     int s_base_4 = 0;
                     int n_item_4 = nchunks;
-                    sequence_4 = xc_1 / (nchunks * nheads);
-                    s_base_4 = sequence_4 * nchunks;
+                    #pragma unroll 1
+                    for (int q_4 = 0; q_4 < sequence_count; q_4++) {
+                        if (xc_1 >= seq_chunk_cumsum[q_4 + 1] * nheads) {
+                            sequence_4 = q_4 + 1;
+                        }
+                    }
+                    s_base_4 = seq_chunk_cumsum[sequence_4];
+                    n_item_4 = seq_chunk_cumsum[sequence_4 + 1] - s_base_4;
                     int rem_4 = xc_1 - s_base_4 * nheads;
                     int head_4 = rem_4 / n_item_4;
                     int chunk_4 = rem_4 - head_4 * n_item_4;
@@ -980,8 +1024,7 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         int group_1 = head_0_4 * ngroups / nheads;
                         int physical_chunk_1 = 0;
                         int physical_batch_1 = 0;
-                        physical_batch_1 = logical_4 / nchunks;
-                        physical_chunk_1 = logical_4 - physical_batch_1 * nchunks;
+                        physical_chunk_1 = chunk_indices[logical_4];
                         int token_in_batch_1 = physical_chunk_1 * 128;
                         mbarrier_wait(bc_empty_addr + (stage3_2) * 8, _phase_bc_empty);
                         if (elect_sync()) {
@@ -1013,7 +1056,7 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
             unsigned int stage1_2 = 0;
             unsigned int stage3_3 = 0;
             int tot_3[1];
-            tot_3[0] = sequence_count * nchunks * nheads;
+            tot_3[0] = seq_chunk_cumsum[sequence_count] * nheads;
             int veff_3[1];
             int total_3 = tot_3[0];
             int g_3 = 1;
@@ -1028,9 +1071,7 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
             int vcount_eff_3 = veff_3[0];
             unsigned int total_u_3 = (unsigned int)vcount_eff_3;
             unsigned int _phase_aux1_empty = 1;
-            unsigned int _phase_x1_empty = 1;
             unsigned int _phase_aux3_empty = 1;
-            unsigned int _phase_x3_empty = 1;
             while (1) {
                 asm volatile("barrier.sync 11, 512;" ::: "memory");
                 unsigned int ticket_u_3 = ctrl[0];
@@ -1054,8 +1095,14 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                     int sequence_5 = 0;
                     int s_base_5 = 0;
                     int n_item_5 = nchunks;
-                    sequence_5 = xa_3 / (nchunks * nheads);
-                    s_base_5 = sequence_5 * nchunks;
+                    #pragma unroll 1
+                    for (int q_5 = 0; q_5 < sequence_count; q_5++) {
+                        if (xa_3 >= seq_chunk_cumsum[q_5 + 1] * nheads) {
+                            sequence_5 = q_5 + 1;
+                        }
+                    }
+                    s_base_5 = seq_chunk_cumsum[sequence_5];
+                    n_item_5 = seq_chunk_cumsum[sequence_5 + 1] - s_base_5;
                     int rem_5 = xa_3 - s_base_5 * nheads;
                     int head_5 = rem_5 / n_item_5;
                     int chunk_5 = rem_5 - head_5 * n_item_5;
@@ -1084,14 +1131,23 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         int physical_batch_2 = 0;
                         int segment_offset = 0;
                         int segment_limit = 128;
-                        physical_batch_2 = logical_5 / nchunks;
-                        physical_chunk_2 = logical_5 - physical_batch_2 * nchunks;
+                        physical_chunk_2 = chunk_indices[logical_5];
+                        segment_offset = chunk_offsets[logical_5];
+                        if (logical_5 + 1 < num_logical_chunks) {
+                            int next_chunk = chunk_indices[logical_5 + 1];
+                            if (next_chunk == physical_chunk_2) {
+                                segment_limit = chunk_offsets[logical_5 + 1];
+                            }
+                        }
                         int chunk_tokens = seqlen - physical_chunk_2 * 128;
                         if (chunk_tokens > 128) {
                             chunk_tokens = 128;
                         }
+                        if (segment_limit > chunk_tokens) {
+                            segment_limit = chunk_tokens;
+                        }
                         mbarrier_wait(aux1_empty_addr + (stage1_2) * 8, _phase_aux1_empty);
-                        mbarrier_wait(x1_empty_addr + (stage1_2) * 8, _phase_x1_empty);
+                        mbarrier_wait(x1_empty_addr + (stage1_2) * 8, _phase_aux1_empty);
                         int token_in_batch_2 = physical_chunk_2 * 128;
                         if (elect_sync()) {
                             tma_4d_gmem2smem(smem_x_tma_addr + stage1_2 * 16384, (&x_map), 0, head_0_5, token_in_batch_2, physical_batch_2, x1_full_addr + (stage1_2) * 8);
@@ -1104,14 +1160,9 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                             int factor_token = physical_token - segment_offset;
                             float cumsum_value = 0.0f;
                             float delta_value = 0.0f;
-                            int source_token = physical_token;
-                            if (source_token >= chunk_tokens) {
-                                source_token = chunk_tokens - 1;
-                            }
-                            cumsum_value = cumsum_precomputed[tile_row_1 * 128 + source_token];
-                            if (physical_token < chunk_tokens) {
-                                float _cvt_f32_0 = (float)delta_precomputed[tile_row_1 * 128 + physical_token];
-                                delta_value = _cvt_f32_0;
+                            if (physical_token >= segment_offset && physical_token < segment_limit) {
+                                cumsum_value = cumsum_precomputed[tile_row_1 * 128 + factor_token];
+                                delta_value = (float)delta_precomputed[tile_row_1 * 128 + factor_token];
                             }
                             smem_cumsum_all[stage1_2 * 128 + (unsigned int)physical_token] = cumsum_value;
                             smem_delta_all[stage1_2 * 128 + (unsigned int)physical_token] = delta_value;
@@ -1122,7 +1173,7 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         }
                         mbarrier_arrive(aux1_full_addr + (stage1_2) * 8);
                         stage1_2 += 1;
-                        if (stage1_2 == 2) { stage1_2 = 0; _phase_aux1_empty ^= 1; _phase_x1_empty ^= 1; }
+                        if (stage1_2 == 2) { stage1_2 = 0; _phase_aux1_empty ^= 1; }
                     }
                     xa_3 = xa_3 + seg_len_5;
                 }
@@ -1134,8 +1185,14 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                     int sequence_6 = 0;
                     int s_base_6 = 0;
                     int n_item_6 = nchunks;
-                    sequence_6 = xc_2 / (nchunks * nheads);
-                    s_base_6 = sequence_6 * nchunks;
+                    #pragma unroll 1
+                    for (int q_6 = 0; q_6 < sequence_count; q_6++) {
+                        if (xc_2 >= seq_chunk_cumsum[q_6 + 1] * nheads) {
+                            sequence_6 = q_6 + 1;
+                        }
+                    }
+                    s_base_6 = seq_chunk_cumsum[sequence_6];
+                    n_item_6 = seq_chunk_cumsum[sequence_6 + 1] - s_base_6;
                     int rem_6 = xc_2 - s_base_6 * nheads;
                     int head_6 = rem_6 / n_item_6;
                     int chunk_6 = rem_6 - head_6 * n_item_6;
@@ -1164,14 +1221,23 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         int physical_batch_3 = 0;
                         int segment_offset_1 = 0;
                         int segment_limit_1 = 128;
-                        physical_batch_3 = logical_6 / nchunks;
-                        physical_chunk_3 = logical_6 - physical_batch_3 * nchunks;
+                        physical_chunk_3 = chunk_indices[logical_6];
+                        segment_offset_1 = chunk_offsets[logical_6];
+                        if (logical_6 + 1 < num_logical_chunks) {
+                            int next_chunk_1 = chunk_indices[logical_6 + 1];
+                            if (next_chunk_1 == physical_chunk_3) {
+                                segment_limit_1 = chunk_offsets[logical_6 + 1];
+                            }
+                        }
                         int chunk_tokens_1 = seqlen - physical_chunk_3 * 128;
                         if (chunk_tokens_1 > 128) {
                             chunk_tokens_1 = 128;
                         }
+                        if (segment_limit_1 > chunk_tokens_1) {
+                            segment_limit_1 = chunk_tokens_1;
+                        }
                         mbarrier_wait(aux3_empty_addr + (stage3_3) * 8, _phase_aux3_empty);
-                        mbarrier_wait(x3_empty_addr + (stage3_3) * 8, _phase_x3_empty);
+                        mbarrier_wait(x3_empty_addr + (stage3_3) * 8, _phase_aux3_empty);
                         int token_in_batch_3 = physical_chunk_3 * 128;
                         if (elect_sync()) {
                             tma_4d_gmem2smem(smem_x_tma_addr + stage3_3 * 16384, (&x_map), 0, head_0_6, token_in_batch_3, physical_batch_3, x3_full_addr + (stage3_3) * 8);
@@ -1184,14 +1250,9 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                             int factor_token_1 = physical_token_1 - segment_offset_1;
                             float cumsum_value_1 = 0.0f;
                             float delta_value_1 = 0.0f;
-                            int source_token_1 = physical_token_1;
-                            if (source_token_1 >= chunk_tokens_1) {
-                                source_token_1 = chunk_tokens_1 - 1;
-                            }
-                            cumsum_value_1 = cumsum_precomputed[tile_row_2 * 128 + source_token_1];
-                            if (physical_token_1 < chunk_tokens_1) {
-                                float _cvt_f32_1 = (float)delta_precomputed[tile_row_2 * 128 + physical_token_1];
-                                delta_value_1 = _cvt_f32_1;
+                            if (physical_token_1 >= segment_offset_1 && physical_token_1 < segment_limit_1) {
+                                cumsum_value_1 = cumsum_precomputed[tile_row_2 * 128 + factor_token_1];
+                                delta_value_1 = (float)delta_precomputed[tile_row_2 * 128 + factor_token_1];
                             }
                             smem_cumsum_all[stage3_3 * 128 + (unsigned int)physical_token_1] = cumsum_value_1;
                             smem_delta_all[stage3_3 * 128 + (unsigned int)physical_token_1] = delta_value_1;
@@ -1202,7 +1263,7 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         }
                         mbarrier_arrive(aux3_full_addr + (stage3_3) * 8);
                         stage3_3 += 1;
-                        if (stage3_3 == 2) { stage3_3 = 0; _phase_aux3_empty ^= 1; _phase_x3_empty ^= 1; }
+                        if (stage3_3 == 2) { stage3_3 = 0; _phase_aux3_empty ^= 1; }
                     }
                     xc_2 = xc_2 + seg_len_6;
                 }
@@ -1217,7 +1278,7 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
             unsigned int stage1_3 = 0;
             int chain_tid = (warp - 4) * 32 + lane;
             int tot_4[1];
-            tot_4[0] = sequence_count * nchunks * nheads;
+            tot_4[0] = seq_chunk_cumsum[sequence_count] * nheads;
             int veff_4[1];
             int total_4 = tot_4[0];
             int g_4 = 1;
@@ -1232,7 +1293,6 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
             int vcount_eff_4 = veff_4[0];
             unsigned int total_u_4 = (unsigned int)vcount_eff_4;
             unsigned int _phase_aux1_full = 0;
-            unsigned int _phase_b1_full = 0;
             unsigned int _phase_scaled_b_empty_0 = 1;
             unsigned int _phase_state_delta_full_0 = 0;
             while (1) {
@@ -1259,8 +1319,14 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                     int sequence_7 = 0;
                     int s_base_7 = 0;
                     int n_item_7 = nchunks;
-                    sequence_7 = xa_4 / (nchunks * nheads);
-                    s_base_7 = sequence_7 * nchunks;
+                    #pragma unroll 1
+                    for (int q_7 = 0; q_7 < sequence_count; q_7++) {
+                        if (xa_4 >= seq_chunk_cumsum[q_7 + 1] * nheads) {
+                            sequence_7 = q_7 + 1;
+                        }
+                    }
+                    s_base_7 = seq_chunk_cumsum[sequence_7];
+                    n_item_7 = seq_chunk_cumsum[sequence_7 + 1] - s_base_7;
                     int rem_7 = xa_4 - s_base_7 * nheads;
                     int head_7 = rem_7 / n_item_7;
                     int chunk_7 = rem_7 - head_7 * n_item_7;
@@ -1290,14 +1356,23 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         int physical_chunk_4 = 0;
                         int segment_offset_2 = 0;
                         int segment_limit_2 = 128;
-                        int sequence_0 = logical_7 / nchunks;
-                        physical_chunk_4 = logical_7 - sequence_0 * nchunks;
+                        physical_chunk_4 = chunk_indices[logical_7];
+                        segment_offset_2 = chunk_offsets[logical_7];
+                        if (logical_7 + 1 < num_logical_chunks) {
+                            int next_chunk_2 = chunk_indices[logical_7 + 1];
+                            if (next_chunk_2 == physical_chunk_4) {
+                                segment_limit_2 = chunk_offsets[logical_7 + 1];
+                            }
+                        }
                         int chunk_tokens_2 = seqlen - physical_chunk_4 * 128;
                         if (chunk_tokens_2 > 128) {
                             chunk_tokens_2 = 128;
                         }
+                        if (segment_limit_2 > chunk_tokens_2) {
+                            segment_limit_2 = chunk_tokens_2;
+                        }
                         mbarrier_wait(aux1_full_addr + (stage1_3) * 8, _phase_aux1_full);
-                        mbarrier_wait(b1_full_addr + (stage1_3) * 8, _phase_b1_full);
+                        mbarrier_wait(b1_full_addr + (stage1_3) * 8, _phase_aux1_full);
                         float last_cumsum = smem_cumsum_all[stage1_3 * 128 + (unsigned int)segment_limit_2 - 1];
                         mbarrier_wait(scaled_b_empty_addr, _phase_scaled_b_empty_0);
                         _phase_scaled_b_empty_0 ^= 1;
@@ -1319,20 +1394,12 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                                     (&scaled_b_values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(b_packed[_pair]) << 16);
                                     (&scaled_b_values[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(b_packed[_pair]) & 0xffff0000u);
                                 }
-                                float _exp2_14 = approx_exp2((last_cumsum - smem_cumsum_all[stage1_3 * 128 + (unsigned int)col]) * 1.4426950408889634f);
-                                float b_scale = _exp2_14;
+                                float b_scale = approx_exp2((last_cumsum - smem_cumsum_all[stage1_3 * 128 + (unsigned int)col]) * 1.442695f);
                                 b_scale *= smem_delta_all[stage1_3 * 128 + (unsigned int)col];
-                                #if __CUDA_ARCH__ >= 1000
                                 const float2 _scale2_0 = {b_scale, b_scale};
                                 #pragma unroll
                                 for (int _ls = 0; _ls < 4; _ls++)
                                     mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(scaled_b_values)[_ls], _scale2_0);
-                                #else
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 8; _ls++) {
-                                    scaled_b_values[_ls] = scaled_b_values[_ls] * b_scale;
-                                }
-                                #endif
                             }
                             #pragma unroll
                             for (int b_local_1 = 0; b_local_1 < 8; b_local_1++) {
@@ -1383,7 +1450,7 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                             }
                         }
                         stage1_3 += 1;
-                        if (stage1_3 == 2) { stage1_3 = 0; _phase_aux1_full ^= 1; _phase_b1_full ^= 1; }
+                        if (stage1_3 == 2) { stage1_3 = 0; _phase_aux1_full ^= 1; }
                     }
                     xa_4 = xa_4 + seg_len_7;
                 }
@@ -1423,8 +1490,14 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                     int sequence_8 = 0;
                     int s_base_8 = 0;
                     int n_item_8 = nchunks;
-                    sequence_8 = (a_end_4 - 1) / (nchunks * nheads);
-                    s_base_8 = sequence_8 * nchunks;
+                    #pragma unroll 1
+                    for (int q_8 = 0; q_8 < sequence_count; q_8++) {
+                        if (seq_chunk_cumsum[q_8 + 1] * nheads <= a_end_4 - 1) {
+                            sequence_8 = q_8 + 1;
+                        }
+                    }
+                    s_base_8 = seq_chunk_cumsum[sequence_8];
+                    n_item_8 = seq_chunk_cumsum[sequence_8 + 1] - s_base_8;
                     int rem_8 = a_end_4 - 1 - s_base_8 * nheads;
                     int head_8 = rem_8 / n_item_8;
                     int chunk_8 = rem_8 - head_8 * n_item_8;
@@ -1452,17 +1525,28 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         int look_physical = 0;
                         int look_offset = 0;
                         int look_limit = 128;
-                        look_physical = agg_first - l_sequence * nchunks;
+                        look_physical = chunk_indices[agg_first];
+                        look_offset = chunk_offsets[agg_first];
+                        if (agg_first + 1 < num_logical_chunks) {
+                            int look_next = chunk_indices[agg_first + 1];
+                            if (look_next == look_physical) {
+                                look_limit = chunk_offsets[agg_first + 1];
+                            }
+                        }
                         int look_tokens = seqlen - look_physical * 128;
                         if (look_tokens > 128) {
                             look_tokens = 128;
                         }
-                        int source_token_2 = look_tokens - 1;
-                        float last_cumsum_1 = cumsum_precomputed[look_tile * 128 + source_token_2];
+                        int source_token = look_tokens - 1;
+                        if (look_limit > look_tokens) {
+                            look_limit = look_tokens;
+                        }
+                        source_token = look_limit - 1 - look_offset;
+                        float last_cumsum_1 = cumsum_precomputed[look_tile * 128 + source_token];
                         lc_ring[0] = last_cumsum_1;
                         float segment_base = 0.0f;
-                        float _exp2_15 = approx_exp2((last_cumsum_1 - segment_base) * 1.4426950408889634f);
-                        d_ring[0] = _exp2_15;
+                        float _exp2_2 = approx_exp2((last_cumsum_1 - segment_base) * 1.442695f);
+                        d_ring[0] = _exp2_2;
                         int look_t = agg_first + s_t_off;
                         if (look_t >= s_resident_from) {
                             asm volatile(
@@ -1473,33 +1557,43 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                             asm volatile("tcgen05.wait::ld.sync.aligned;");
                         } else {
                             #pragma unroll
-                            for (int q = 0; q < 8; q++) {
+                            for (int q_9 = 0; q_9 < 8; q_9++) {
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile * 8192 + s_work_row + 4 * q);
-                                    s_a[4 * q + 0] = _v4.x;
-                                    s_a[4 * q + 1] = _v4.y;
-                                    s_a[4 * q + 2] = _v4.z;
-                                    s_a[4 * q + 3] = _v4.w;
+                                    float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile * 8192 + s_work_row + 4 * q_9);
+                                    s_a[4 * q_9 + 0] = _v4.x;
+                                    s_a[4 * q_9 + 1] = _v4.y;
+                                    s_a[4 * q_9 + 2] = _v4.z;
+                                    s_a[4 * q_9 + 3] = _v4.w;
                                 }
                             }
                         }
-                        int _min_6 = ((agg_first + 1) < (agg_last) ? (agg_first + 1) : (agg_last));
-                        int agg_look1 = _min_6;
+                        int agg_look1 = ((agg_first + 1) < (agg_last) ? (agg_first + 1) : (agg_last));
                         int look_tile_0 = agg_look1 * nheads + l_head;
                         int look_physical_1 = 0;
                         int look_offset_2 = 0;
                         int look_limit_3 = 128;
-                        look_physical_1 = agg_look1 - l_sequence * nchunks;
+                        look_physical_1 = chunk_indices[agg_look1];
+                        look_offset_2 = chunk_offsets[agg_look1];
+                        if (agg_look1 + 1 < num_logical_chunks) {
+                            int look_next_1 = chunk_indices[agg_look1 + 1];
+                            if (look_next_1 == look_physical_1) {
+                                look_limit_3 = chunk_offsets[agg_look1 + 1];
+                            }
+                        }
                         int look_tokens_4 = seqlen - look_physical_1 * 128;
                         if (look_tokens_4 > 128) {
                             look_tokens_4 = 128;
                         }
                         int source_token_5 = look_tokens_4 - 1;
+                        if (look_limit_3 > look_tokens_4) {
+                            look_limit_3 = look_tokens_4;
+                        }
+                        source_token_5 = look_limit_3 - 1 - look_offset_2;
                         float last_cumsum_6 = cumsum_precomputed[look_tile_0 * 128 + source_token_5];
                         lc_ring[1] = last_cumsum_6;
                         float segment_base_7 = 0.0f;
-                        float _exp2_16 = approx_exp2((last_cumsum_6 - segment_base_7) * 1.4426950408889634f);
-                        d_ring[1] = _exp2_16;
+                        float _exp2_4 = approx_exp2((last_cumsum_6 - segment_base_7) * 1.442695f);
+                        d_ring[1] = _exp2_4;
                         int look_t_8 = agg_look1 + s_t_off;
                         if (look_t_8 >= s_resident_from) {
                             asm volatile(
@@ -1510,13 +1604,13 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                             asm volatile("tcgen05.wait::ld.sync.aligned;");
                         } else {
                             #pragma unroll
-                            for (int q_1 = 0; q_1 < 8; q_1++) {
+                            for (int q_10 = 0; q_10 < 8; q_10++) {
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_0 * 8192 + s_work_row + 4 * q_1);
-                                    s_b[4 * q_1 + 0] = _v4.x;
-                                    s_b[4 * q_1 + 1] = _v4.y;
-                                    s_b[4 * q_1 + 2] = _v4.z;
-                                    s_b[4 * q_1 + 3] = _v4.w;
+                                    float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_0 * 8192 + s_work_row + 4 * q_10);
+                                    s_b[4 * q_10 + 0] = _v4.x;
+                                    s_b[4 * q_10 + 1] = _v4.y;
+                                    s_b[4 * q_10 + 2] = _v4.z;
+                                    s_b[4 * q_10 + 3] = _v4.w;
                                 }
                             }
                         }
@@ -1524,39 +1618,42 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         for (int c = agg_first; c < agg_last + 1; c += 2) {
                             float agg_decay_a = d_ring[0];
                             lsum = lsum + lc_ring[0];
-                            #if __CUDA_ARCH__ >= 1000
-                            const float2 _scale2_4 = {agg_decay_a, agg_decay_a};
+                            const float2 _scale2_6 = {agg_decay_a, agg_decay_a};
                             #pragma unroll
                             for (int _ls = 0; _ls < 16; _ls++)
-                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h)[_ls], _scale2_4);
-                            #else
-                            #pragma unroll
-                            for (int _ls = 0; _ls < 32; _ls++) {
-                                h[_ls] = h[_ls] * agg_decay_a;
-                            }
-                            #endif
+                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h)[_ls], _scale2_6);
                             #pragma unroll
                             for (int k_1 = 0; k_1 < 16; k_1++) {
                                 h[2 * k_1] = h[2 * k_1] + s_a[2 * k_1];
                                 h[2 * k_1 + 1] = h[2 * k_1 + 1] + s_a[2 * k_1 + 1];
                             }
-                            int _min_7 = ((c + 2) < (agg_last) ? (c + 2) : (agg_last));
-                            int agg_look_a = _min_7;
+                            int agg_look_a = ((c + 2) < (agg_last) ? (c + 2) : (agg_last));
                             int look_tile_1 = agg_look_a * nheads + l_head;
                             int look_physical_2 = 0;
                             int look_offset_3 = 0;
                             int look_limit_4 = 128;
-                            look_physical_2 = agg_look_a - l_sequence * nchunks;
+                            look_physical_2 = chunk_indices[agg_look_a];
+                            look_offset_3 = chunk_offsets[agg_look_a];
+                            if (agg_look_a + 1 < num_logical_chunks) {
+                                int look_next_2 = chunk_indices[agg_look_a + 1];
+                                if (look_next_2 == look_physical_2) {
+                                    look_limit_4 = chunk_offsets[agg_look_a + 1];
+                                }
+                            }
                             int look_tokens_5 = seqlen - look_physical_2 * 128;
                             if (look_tokens_5 > 128) {
                                 look_tokens_5 = 128;
                             }
                             int source_token_6 = look_tokens_5 - 1;
+                            if (look_limit_4 > look_tokens_5) {
+                                look_limit_4 = look_tokens_5;
+                            }
+                            source_token_6 = look_limit_4 - 1 - look_offset_3;
                             float last_cumsum_7 = cumsum_precomputed[look_tile_1 * 128 + source_token_6];
                             lc_ring[0] = last_cumsum_7;
                             float segment_base_8 = 0.0f;
-                            float _exp2_17 = approx_exp2((last_cumsum_7 - segment_base_8) * 1.4426950408889634f);
-                            d_ring[0] = _exp2_17;
+                            float _exp2_7 = approx_exp2((last_cumsum_7 - segment_base_8) * 1.442695f);
+                            d_ring[0] = _exp2_7;
                             int look_t_9 = agg_look_a + s_t_off;
                             if (look_t_9 >= s_resident_from) {
                                 asm volatile(
@@ -1567,13 +1664,13 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                                 asm volatile("tcgen05.wait::ld.sync.aligned;");
                             } else {
                                 #pragma unroll
-                                for (int q_2 = 0; q_2 < 8; q_2++) {
+                                for (int q_11 = 0; q_11 < 8; q_11++) {
                                     {
-                                        float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_1 * 8192 + s_work_row + 4 * q_2);
-                                        s_a[4 * q_2 + 0] = _v4.x;
-                                        s_a[4 * q_2 + 1] = _v4.y;
-                                        s_a[4 * q_2 + 2] = _v4.z;
-                                        s_a[4 * q_2 + 3] = _v4.w;
+                                        float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_1 * 8192 + s_work_row + 4 * q_11);
+                                        s_a[4 * q_11 + 0] = _v4.x;
+                                        s_a[4 * q_11 + 1] = _v4.y;
+                                        s_a[4 * q_11 + 2] = _v4.z;
+                                        s_a[4 * q_11 + 3] = _v4.w;
                                     }
                                 }
                             }
@@ -1581,39 +1678,42 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                             if (agg_current_b <= agg_last) {
                                 float agg_decay_b = d_ring[1];
                                 lsum = lsum + lc_ring[1];
-                                #if __CUDA_ARCH__ >= 1000
-                                const float2 _scale2_6 = {agg_decay_b, agg_decay_b};
+                                const float2 _scale2_9 = {agg_decay_b, agg_decay_b};
                                 #pragma unroll
                                 for (int _ls = 0; _ls < 16; _ls++)
-                                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h)[_ls], _scale2_6);
-                                #else
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 32; _ls++) {
-                                    h[_ls] = h[_ls] * agg_decay_b;
-                                }
-                                #endif
+                                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h)[_ls], _scale2_9);
                                 #pragma unroll
                                 for (int k_2 = 0; k_2 < 16; k_2++) {
                                     h[2 * k_2] = h[2 * k_2] + s_b[2 * k_2];
                                     h[2 * k_2 + 1] = h[2 * k_2 + 1] + s_b[2 * k_2 + 1];
                                 }
-                                int _min_8 = ((c + 3) < (agg_last) ? (c + 3) : (agg_last));
-                                int agg_look_b = _min_8;
+                                int agg_look_b = ((c + 3) < (agg_last) ? (c + 3) : (agg_last));
                                 int look_tile_2 = agg_look_b * nheads + l_head;
                                 int look_physical_3 = 0;
                                 int look_offset_4 = 0;
                                 int look_limit_5 = 128;
-                                look_physical_3 = agg_look_b - l_sequence * nchunks;
+                                look_physical_3 = chunk_indices[agg_look_b];
+                                look_offset_4 = chunk_offsets[agg_look_b];
+                                if (agg_look_b + 1 < num_logical_chunks) {
+                                    int look_next_3 = chunk_indices[agg_look_b + 1];
+                                    if (look_next_3 == look_physical_3) {
+                                        look_limit_5 = chunk_offsets[agg_look_b + 1];
+                                    }
+                                }
                                 int look_tokens_6 = seqlen - look_physical_3 * 128;
                                 if (look_tokens_6 > 128) {
                                     look_tokens_6 = 128;
                                 }
                                 int source_token_7 = look_tokens_6 - 1;
+                                if (look_limit_5 > look_tokens_6) {
+                                    look_limit_5 = look_tokens_6;
+                                }
+                                source_token_7 = look_limit_5 - 1 - look_offset_4;
                                 float last_cumsum_8 = cumsum_precomputed[look_tile_2 * 128 + source_token_7];
                                 lc_ring[1] = last_cumsum_8;
                                 float segment_base_9 = 0.0f;
-                                float _exp2_18 = approx_exp2((last_cumsum_8 - segment_base_9) * 1.4426950408889634f);
-                                d_ring[1] = _exp2_18;
+                                float _exp2_10 = approx_exp2((last_cumsum_8 - segment_base_9) * 1.442695f);
+                                d_ring[1] = _exp2_10;
                                 int look_t_10 = agg_look_b + s_t_off;
                                 if (look_t_10 >= s_resident_from) {
                                     asm volatile(
@@ -1624,13 +1724,13 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                                     asm volatile("tcgen05.wait::ld.sync.aligned;");
                                 } else {
                                     #pragma unroll
-                                    for (int q_3 = 0; q_3 < 8; q_3++) {
+                                    for (int q_12 = 0; q_12 < 8; q_12++) {
                                         {
-                                            float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_2 * 8192 + s_work_row + 4 * q_3);
-                                            s_b[4 * q_3 + 0] = _v4.x;
-                                            s_b[4 * q_3 + 1] = _v4.y;
-                                            s_b[4 * q_3 + 2] = _v4.z;
-                                            s_b[4 * q_3 + 3] = _v4.w;
+                                            float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_2 * 8192 + s_work_row + 4 * q_12);
+                                            s_b[4 * q_12 + 0] = _v4.x;
+                                            s_b[4 * q_12 + 1] = _v4.y;
+                                            s_b[4 * q_12 + 2] = _v4.z;
+                                            s_b[4 * q_12 + 3] = _v4.w;
                                         }
                                     }
                                 }
@@ -1662,15 +1762,21 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         }
                     }
                     int first_loc[6];
-                    int sequence_0_1 = 0;
+                    int sequence_0 = 0;
                     int s_base_1_1 = 0;
                     int n_item_2_1 = nchunks;
-                    sequence_0_1 = a_b_4 / (nchunks * nheads);
-                    s_base_1_1 = sequence_0_1 * nchunks;
+                    #pragma unroll 1
+                    for (int q_13 = 0; q_13 < sequence_count; q_13++) {
+                        if (a_b_4 >= seq_chunk_cumsum[q_13 + 1] * nheads) {
+                            sequence_0 = q_13 + 1;
+                        }
+                    }
+                    s_base_1_1 = seq_chunk_cumsum[sequence_0];
+                    n_item_2_1 = seq_chunk_cumsum[sequence_0 + 1] - s_base_1_1;
                     int rem_3_1 = a_b_4 - s_base_1_1 * nheads;
                     int head_4_1 = rem_3_1 / n_item_2_1;
                     int chunk_5_1 = rem_3_1 - head_4_1 * n_item_2_1;
-                    first_loc[0] = sequence_0_1;
+                    first_loc[0] = sequence_0;
                     first_loc[1] = head_4_1;
                     first_loc[2] = chunk_5_1;
                     first_loc[3] = n_item_2_1;
@@ -1747,39 +1853,25 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         #pragma unroll 1
                         for (int bq_1 = b_lo; bq_1 < ticket_4; bq_1 += 2) {
                             float lsum_a = lsum_ring[0];
-                            float y = lsum_a * 1.4426950408889634f;
+                            float y = lsum_a * 1.442695f;
                             float a_lo = 0.0f;
                             float a_hi = 1.0f;
                             if (y > -100.0f) {
-                                float _exp2_19 = approx_exp2(y);
-                                a_lo = _exp2_19;
+                                float _exp2_14 = approx_exp2(y);
+                                a_lo = _exp2_14;
                             } else {
-                                float _exp2_20 = approx_exp2(y + 100.0f);
-                                a_lo = _exp2_20;
-                                a_hi = 7.888609052210118e-31f;
+                                float _exp2_15 = approx_exp2(y + 100.0f);
+                                a_lo = _exp2_15;
+                                a_hi = 7.888609e-31f;
                             }
-                            #if __CUDA_ARCH__ >= 1000
-                            const float2 _scale2_10 = {a_lo, a_lo};
+                            const float2 _scale2_16 = {a_lo, a_lo};
                             #pragma unroll
                             for (int _ls = 0; _ls < 16; _ls++)
-                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h)[_ls], _scale2_10);
-                            #else
-                            #pragma unroll
-                            for (int _ls = 0; _ls < 32; _ls++) {
-                                h[_ls] = h[_ls] * a_lo;
-                            }
-                            #endif
-                            #if __CUDA_ARCH__ >= 1000
-                            const float2 _scale2_11 = {a_hi, a_hi};
+                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h)[_ls], _scale2_16);
+                            const float2 _scale2_17 = {a_hi, a_hi};
                             #pragma unroll
                             for (int _ls = 0; _ls < 16; _ls++)
-                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h)[_ls], _scale2_11);
-                            #else
-                            #pragma unroll
-                            for (int _ls = 0; _ls < 32; _ls++) {
-                                h[_ls] = h[_ls] * a_hi;
-                            }
-                            #endif
+                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h)[_ls], _scale2_17);
                             #pragma unroll
                             for (int k_5 = 0; k_5 < 16; k_5++) {
                                 h[2 * k_5] = h[2 * k_5] + s_a[2 * k_5];
@@ -1803,39 +1895,25 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                             int bq_b = bq_1 + 1;
                             if (bq_b < ticket_4) {
                                 float lsum_b = lsum_ring[1];
-                                float y_0 = lsum_b * 1.4426950408889634f;
+                                float y_0 = lsum_b * 1.442695f;
                                 float a_lo_1 = 0.0f;
                                 float a_hi_2 = 1.0f;
                                 if (y_0 > -100.0f) {
-                                    float _exp2_21 = approx_exp2(y_0);
-                                    a_lo_1 = _exp2_21;
+                                    float _exp2_19 = approx_exp2(y_0);
+                                    a_lo_1 = _exp2_19;
                                 } else {
-                                    float _exp2_22 = approx_exp2(y_0 + 100.0f);
-                                    a_lo_1 = _exp2_22;
-                                    a_hi_2 = 7.888609052210118e-31f;
+                                    float _exp2_20 = approx_exp2(y_0 + 100.0f);
+                                    a_lo_1 = _exp2_20;
+                                    a_hi_2 = 7.888609e-31f;
                                 }
-                                #if __CUDA_ARCH__ >= 1000
-                                const float2 _scale2_13 = {a_lo_1, a_lo_1};
+                                const float2 _scale2_21 = {a_lo_1, a_lo_1};
                                 #pragma unroll
                                 for (int _ls = 0; _ls < 16; _ls++)
-                                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h)[_ls], _scale2_13);
-                                #else
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 32; _ls++) {
-                                    h[_ls] = h[_ls] * a_lo_1;
-                                }
-                                #endif
-                                #if __CUDA_ARCH__ >= 1000
-                                const float2 _scale2_14 = {a_hi_2, a_hi_2};
+                                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h)[_ls], _scale2_21);
+                                const float2 _scale2_22 = {a_hi_2, a_hi_2};
                                 #pragma unroll
                                 for (int _ls = 0; _ls < 16; _ls++)
-                                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h)[_ls], _scale2_14);
-                                #else
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 32; _ls++) {
-                                    h[_ls] = h[_ls] * a_hi_2;
-                                }
-                                #endif
+                                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h)[_ls], _scale2_22);
                                 #pragma unroll
                                 for (int k_6 = 0; k_6 < 16; k_6++) {
                                     h[2 * k_6] = h[2 * k_6] + s_b[2 * k_6];
@@ -1865,8 +1943,14 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         int sequence_1_1 = 0;
                         int s_base_2_1 = 0;
                         int n_item_3_1 = nchunks;
-                        sequence_1_1 = x_6 / (nchunks * nheads);
-                        s_base_2_1 = sequence_1_1 * nchunks;
+                        #pragma unroll 1
+                        for (int q_14 = 0; q_14 < sequence_count; q_14++) {
+                            if (x_6 >= seq_chunk_cumsum[q_14 + 1] * nheads) {
+                                sequence_1_1 = q_14 + 1;
+                            }
+                        }
+                        s_base_2_1 = seq_chunk_cumsum[sequence_1_1];
+                        n_item_3_1 = seq_chunk_cumsum[sequence_1_1 + 1] - s_base_2_1;
                         int rem_4_1 = x_6 - s_base_2_1 * nheads;
                         int head_5_1 = rem_4_1 / n_item_3_1;
                         int chunk_6_1 = rem_4_1 - head_5_1 * n_item_3_1;
@@ -1909,17 +1993,28 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         int look_physical_4 = 0;
                         int look_offset_1 = 0;
                         int look_limit_1 = 128;
-                        look_physical_4 = first_8 - sequence_7_1 * nchunks;
+                        look_physical_4 = chunk_indices[first_8];
+                        look_offset_1 = chunk_offsets[first_8];
+                        if (first_8 + 1 < num_logical_chunks) {
+                            int look_next_4 = chunk_indices[first_8 + 1];
+                            if (look_next_4 == look_physical_4) {
+                                look_limit_1 = chunk_offsets[first_8 + 1];
+                            }
+                        }
                         int look_tokens_1 = seqlen - look_physical_4 * 128;
                         if (look_tokens_1 > 128) {
                             look_tokens_1 = 128;
                         }
-                        int source_token_3 = look_tokens_1 - 1;
-                        float last_cumsum_2 = cumsum_precomputed[look_tile_3 * 128 + source_token_3];
+                        int source_token_1 = look_tokens_1 - 1;
+                        if (look_limit_1 > look_tokens_1) {
+                            look_limit_1 = look_tokens_1;
+                        }
+                        source_token_1 = look_limit_1 - 1 - look_offset_1;
+                        float last_cumsum_2 = cumsum_precomputed[look_tile_3 * 128 + source_token_1];
                         lc_ring[0] = last_cumsum_2;
                         float segment_base_1 = 0.0f;
-                        float _exp2_23 = approx_exp2((last_cumsum_2 - segment_base_1) * 1.4426950408889634f);
-                        d_ring[0] = _exp2_23;
+                        float _exp2_24 = approx_exp2((last_cumsum_2 - segment_base_1) * 1.442695f);
+                        d_ring[0] = _exp2_24;
                         int look_t_1 = first_8 + s_t_off;
                         if (look_t_1 >= s_resident_from) {
                             asm volatile(
@@ -1930,33 +2025,43 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                             asm volatile("tcgen05.wait::ld.sync.aligned;");
                         } else {
                             #pragma unroll
-                            for (int q_4 = 0; q_4 < 8; q_4++) {
+                            for (int q_15 = 0; q_15 < 8; q_15++) {
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_3 * 8192 + s_work_row + 4 * q_4);
-                                    s_a[4 * q_4 + 0] = _v4.x;
-                                    s_a[4 * q_4 + 1] = _v4.y;
-                                    s_a[4 * q_4 + 2] = _v4.z;
-                                    s_a[4 * q_4 + 3] = _v4.w;
+                                    float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_3 * 8192 + s_work_row + 4 * q_15);
+                                    s_a[4 * q_15 + 0] = _v4.x;
+                                    s_a[4 * q_15 + 1] = _v4.y;
+                                    s_a[4 * q_15 + 2] = _v4.z;
+                                    s_a[4 * q_15 + 3] = _v4.w;
                                 }
                             }
                         }
-                        int _min_9 = ((first_8 + 1) < (last) ? (first_8 + 1) : (last));
-                        int look1 = _min_9;
+                        int look1 = ((first_8 + 1) < (last) ? (first_8 + 1) : (last));
                         int look_tile_10 = look1 * nheads + head_8_1;
                         int look_physical_11 = 0;
                         int look_offset_12 = 0;
                         int look_limit_13 = 128;
-                        look_physical_11 = look1 - sequence_7_1 * nchunks;
+                        look_physical_11 = chunk_indices[look1];
+                        look_offset_12 = chunk_offsets[look1];
+                        if (look1 + 1 < num_logical_chunks) {
+                            int look_next_5 = chunk_indices[look1 + 1];
+                            if (look_next_5 == look_physical_11) {
+                                look_limit_13 = chunk_offsets[look1 + 1];
+                            }
+                        }
                         int look_tokens_14 = seqlen - look_physical_11 * 128;
                         if (look_tokens_14 > 128) {
                             look_tokens_14 = 128;
                         }
                         int source_token_15 = look_tokens_14 - 1;
+                        if (look_limit_13 > look_tokens_14) {
+                            look_limit_13 = look_tokens_14;
+                        }
+                        source_token_15 = look_limit_13 - 1 - look_offset_12;
                         float last_cumsum_16 = cumsum_precomputed[look_tile_10 * 128 + source_token_15];
                         lc_ring[1] = last_cumsum_16;
                         float segment_base_17 = 0.0f;
-                        float _exp2_24 = approx_exp2((last_cumsum_16 - segment_base_17) * 1.4426950408889634f);
-                        d_ring[1] = _exp2_24;
+                        float _exp2_26 = approx_exp2((last_cumsum_16 - segment_base_17) * 1.442695f);
+                        d_ring[1] = _exp2_26;
                         int look_t_18 = look1 + s_t_off;
                         if (look_t_18 >= s_resident_from) {
                             asm volatile(
@@ -1967,13 +2072,13 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                             asm volatile("tcgen05.wait::ld.sync.aligned;");
                         } else {
                             #pragma unroll
-                            for (int q_5 = 0; q_5 < 8; q_5++) {
+                            for (int q_16 = 0; q_16 < 8; q_16++) {
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_10 * 8192 + s_work_row + 4 * q_5);
-                                    s_b[4 * q_5 + 0] = _v4.x;
-                                    s_b[4 * q_5 + 1] = _v4.y;
-                                    s_b[4 * q_5 + 2] = _v4.z;
-                                    s_b[4 * q_5 + 3] = _v4.w;
+                                    float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_10 * 8192 + s_work_row + 4 * q_16);
+                                    s_b[4 * q_16 + 0] = _v4.x;
+                                    s_b[4 * q_16 + 1] = _v4.y;
+                                    s_b[4 * q_16 + 2] = _v4.z;
+                                    s_b[4 * q_16 + 3] = _v4.w;
                                 }
                             }
                         }
@@ -1986,23 +2091,16 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         #pragma unroll
                         for (int i = 0; i < 16; i++) {
                             unsigned int sent = h_bf16[i] >> h_half_shift & 65535;
-                            unsigned int _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, sent, 1);
-                            h_words[(first_8 * nheads + head_8_1) * 4096 + pair_base + i * 128] = h_bf16[i] & h_mask_mine | _shfl_xor_3 << h_half_shift;
+                            unsigned int _shfl_xor_sync_28 = __shfl_xor_sync(0xFFFFFFFF, sent, 1);
+                            h_words[(first_8 * nheads + head_8_1) * 4096 + pair_base + i * 128] = h_bf16[i] & h_mask_mine | _shfl_xor_sync_28 << h_half_shift;
                         }
                         #pragma unroll 1
                         for (int c_1 = first_8; c_1 < first_8 + seg_len_8; c_1 += 2) {
                             float decay_a = d_ring[0];
-                            #if __CUDA_ARCH__ >= 1000
-                            const float2 _scale2_18 = {decay_a, decay_a};
+                            const float2 _scale2_29 = {decay_a, decay_a};
                             #pragma unroll
                             for (int _ls = 0; _ls < 16; _ls++)
-                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h)[_ls], _scale2_18);
-                            #else
-                            #pragma unroll
-                            for (int _ls = 0; _ls < 32; _ls++) {
-                                h[_ls] = h[_ls] * decay_a;
-                            }
-                            #endif
+                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h)[_ls], _scale2_29);
                             #pragma unroll
                             for (int k_9 = 0; k_9 < 16; k_9++) {
                                 h[2 * k_9] = h[2 * k_9] + s_a[2 * k_9];
@@ -2018,17 +2116,26 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                                 #pragma unroll
                                 for (int i_1 = 0; i_1 < 16; i_1++) {
                                     unsigned int sent_1 = h_bf16_0[i_1] >> h_half_shift & 65535;
-                                    unsigned int _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, sent_1, 1);
-                                    h_words[((c_1 + 1) * nheads + head_8_1) * 4096 + pair_base + i_1 * 128] = h_bf16_0[i_1] & h_mask_mine | _shfl_xor_4 << h_half_shift;
+                                    unsigned int _shfl_xor_sync_30 = __shfl_xor_sync(0xFFFFFFFF, sent_1, 1);
+                                    h_words[((c_1 + 1) * nheads + head_8_1) * 4096 + pair_base + i_1 * 128] = h_bf16_0[i_1] & h_mask_mine | _shfl_xor_sync_30 << h_half_shift;
                                 }
                             }
                             if (checkpoint_state_count > 0) {
                                 int cur_physical = 0;
                                 int cur_limit = 128;
-                                cur_physical = c_1 - sequence_7_1 * nchunks;
+                                cur_physical = chunk_indices[c_1];
+                                if (c_1 + 1 < num_logical_chunks) {
+                                    int cur_next = chunk_indices[c_1 + 1];
+                                    if (cur_next == cur_physical) {
+                                        cur_limit = chunk_offsets[c_1 + 1];
+                                    }
+                                }
                                 int cur_tokens = seqlen - cur_physical * 128;
                                 if (cur_tokens > 128) {
                                     cur_tokens = 128;
+                                }
+                                if (cur_limit > cur_tokens) {
+                                    cur_limit = cur_tokens;
                                 }
                                 int segment_end = cur_physical * 128 + cur_limit;
                                 if (segment_end > seqlen) {
@@ -2045,23 +2152,33 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                                     }
                                 }
                             }
-                            int _min_10 = ((c_1 + 2) < (last) ? (c_1 + 2) : (last));
-                            int look_a = _min_10;
+                            int look_a = ((c_1 + 2) < (last) ? (c_1 + 2) : (last));
                             int look_tile_0_1 = look_a * nheads + head_8_1;
                             int look_physical_1_1 = 0;
                             int look_offset_2_1 = 0;
                             int look_limit_3_1 = 128;
-                            look_physical_1_1 = look_a - sequence_7_1 * nchunks;
+                            look_physical_1_1 = chunk_indices[look_a];
+                            look_offset_2_1 = chunk_offsets[look_a];
+                            if (look_a + 1 < num_logical_chunks) {
+                                int look_next_6 = chunk_indices[look_a + 1];
+                                if (look_next_6 == look_physical_1_1) {
+                                    look_limit_3_1 = chunk_offsets[look_a + 1];
+                                }
+                            }
                             int look_tokens_4_1 = seqlen - look_physical_1_1 * 128;
                             if (look_tokens_4_1 > 128) {
                                 look_tokens_4_1 = 128;
                             }
                             int source_token_5_1 = look_tokens_4_1 - 1;
+                            if (look_limit_3_1 > look_tokens_4_1) {
+                                look_limit_3_1 = look_tokens_4_1;
+                            }
+                            source_token_5_1 = look_limit_3_1 - 1 - look_offset_2_1;
                             float last_cumsum_6_1 = cumsum_precomputed[look_tile_0_1 * 128 + source_token_5_1];
                             lc_ring[0] = last_cumsum_6_1;
                             float segment_base_7_1 = 0.0f;
-                            float _exp2_25 = approx_exp2((last_cumsum_6_1 - segment_base_7_1) * 1.4426950408889634f);
-                            d_ring[0] = _exp2_25;
+                            float _exp2_31 = approx_exp2((last_cumsum_6_1 - segment_base_7_1) * 1.442695f);
+                            d_ring[0] = _exp2_31;
                             int look_t_8_1 = look_a + s_t_off;
                             if (look_t_8_1 >= s_resident_from) {
                                 asm volatile(
@@ -2072,30 +2189,23 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                                 asm volatile("tcgen05.wait::ld.sync.aligned;");
                             } else {
                                 #pragma unroll
-                                for (int q_6 = 0; q_6 < 8; q_6++) {
+                                for (int q_17 = 0; q_17 < 8; q_17++) {
                                     {
-                                        float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_0_1 * 8192 + s_work_row + 4 * q_6);
-                                        s_a[4 * q_6 + 0] = _v4.x;
-                                        s_a[4 * q_6 + 1] = _v4.y;
-                                        s_a[4 * q_6 + 2] = _v4.z;
-                                        s_a[4 * q_6 + 3] = _v4.w;
+                                        float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_0_1 * 8192 + s_work_row + 4 * q_17);
+                                        s_a[4 * q_17 + 0] = _v4.x;
+                                        s_a[4 * q_17 + 1] = _v4.y;
+                                        s_a[4 * q_17 + 2] = _v4.z;
+                                        s_a[4 * q_17 + 3] = _v4.w;
                                     }
                                 }
                             }
                             int current_b = c_1 + 1;
                             if (current_b <= last) {
                                 float decay_b = d_ring[1];
-                                #if __CUDA_ARCH__ >= 1000
-                                const float2 _scale2_20 = {decay_b, decay_b};
+                                const float2 _scale2_33 = {decay_b, decay_b};
                                 #pragma unroll
                                 for (int _ls = 0; _ls < 16; _ls++)
-                                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h)[_ls], _scale2_20);
-                                #else
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 32; _ls++) {
-                                    h[_ls] = h[_ls] * decay_b;
-                                }
-                                #endif
+                                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h)[_ls], _scale2_33);
                                 #pragma unroll
                                 for (int k_11 = 0; k_11 < 16; k_11++) {
                                     h[2 * k_11] = h[2 * k_11] + s_b[2 * k_11];
@@ -2111,17 +2221,26 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                                     #pragma unroll
                                     for (int i_2 = 0; i_2 < 16; i_2++) {
                                         unsigned int sent_2 = h_bf16_0_1[i_2] >> h_half_shift & 65535;
-                                        unsigned int _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, sent_2, 1);
-                                        h_words[((current_b + 1) * nheads + head_8_1) * 4096 + pair_base + i_2 * 128] = h_bf16_0_1[i_2] & h_mask_mine | _shfl_xor_5 << h_half_shift;
+                                        unsigned int _shfl_xor_sync_34 = __shfl_xor_sync(0xFFFFFFFF, sent_2, 1);
+                                        h_words[((current_b + 1) * nheads + head_8_1) * 4096 + pair_base + i_2 * 128] = h_bf16_0_1[i_2] & h_mask_mine | _shfl_xor_sync_34 << h_half_shift;
                                     }
                                 }
                                 if (checkpoint_state_count > 0) {
                                     int cur_physical_1 = 0;
                                     int cur_limit_1 = 128;
-                                    cur_physical_1 = current_b - sequence_7_1 * nchunks;
+                                    cur_physical_1 = chunk_indices[current_b];
+                                    if (current_b + 1 < num_logical_chunks) {
+                                        int cur_next_1 = chunk_indices[current_b + 1];
+                                        if (cur_next_1 == cur_physical_1) {
+                                            cur_limit_1 = chunk_offsets[current_b + 1];
+                                        }
+                                    }
                                     int cur_tokens_1 = seqlen - cur_physical_1 * 128;
                                     if (cur_tokens_1 > 128) {
                                         cur_tokens_1 = 128;
+                                    }
+                                    if (cur_limit_1 > cur_tokens_1) {
+                                        cur_limit_1 = cur_tokens_1;
                                     }
                                     int segment_end_1 = cur_physical_1 * 128 + cur_limit_1;
                                     if (segment_end_1 > seqlen) {
@@ -2138,23 +2257,33 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                                         }
                                     }
                                 }
-                                int _min_11 = ((c_1 + 3) < (last) ? (c_1 + 3) : (last));
-                                int look_b = _min_11;
+                                int look_b = ((c_1 + 3) < (last) ? (c_1 + 3) : (last));
                                 int look_tile_1_1 = look_b * nheads + head_8_1;
                                 int look_physical_2_1 = 0;
                                 int look_offset_3_1 = 0;
                                 int look_limit_4_1 = 128;
-                                look_physical_2_1 = look_b - sequence_7_1 * nchunks;
+                                look_physical_2_1 = chunk_indices[look_b];
+                                look_offset_3_1 = chunk_offsets[look_b];
+                                if (look_b + 1 < num_logical_chunks) {
+                                    int look_next_7 = chunk_indices[look_b + 1];
+                                    if (look_next_7 == look_physical_2_1) {
+                                        look_limit_4_1 = chunk_offsets[look_b + 1];
+                                    }
+                                }
                                 int look_tokens_5_1 = seqlen - look_physical_2_1 * 128;
                                 if (look_tokens_5_1 > 128) {
                                     look_tokens_5_1 = 128;
                                 }
                                 int source_token_6_1 = look_tokens_5_1 - 1;
+                                if (look_limit_4_1 > look_tokens_5_1) {
+                                    look_limit_4_1 = look_tokens_5_1;
+                                }
+                                source_token_6_1 = look_limit_4_1 - 1 - look_offset_3_1;
                                 float last_cumsum_7_1 = cumsum_precomputed[look_tile_1_1 * 128 + source_token_6_1];
                                 lc_ring[1] = last_cumsum_7_1;
                                 float segment_base_8_1 = 0.0f;
-                                float _exp2_26 = approx_exp2((last_cumsum_7_1 - segment_base_8_1) * 1.4426950408889634f);
-                                d_ring[1] = _exp2_26;
+                                float _exp2_35 = approx_exp2((last_cumsum_7_1 - segment_base_8_1) * 1.442695f);
+                                d_ring[1] = _exp2_35;
                                 int look_t_9_1 = look_b + s_t_off;
                                 if (look_t_9_1 >= s_resident_from) {
                                     asm volatile(
@@ -2165,13 +2294,13 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                                     asm volatile("tcgen05.wait::ld.sync.aligned;");
                                 } else {
                                     #pragma unroll
-                                    for (int q_7 = 0; q_7 < 8; q_7++) {
+                                    for (int q_18 = 0; q_18 < 8; q_18++) {
                                         {
-                                            float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_1_1 * 8192 + s_work_row + 4 * q_7);
-                                            s_b[4 * q_7 + 0] = _v4.x;
-                                            s_b[4 * q_7 + 1] = _v4.y;
-                                            s_b[4 * q_7 + 2] = _v4.z;
-                                            s_b[4 * q_7 + 3] = _v4.w;
+                                            float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_1_1 * 8192 + s_work_row + 4 * q_18);
+                                            s_b[4 * q_18 + 0] = _v4.x;
+                                            s_b[4 * q_18 + 1] = _v4.y;
+                                            s_b[4 * q_18 + 2] = _v4.z;
+                                            s_b[4 * q_18 + 3] = _v4.w;
                                         }
                                     }
                                 }
@@ -2190,6 +2319,27 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                 }
                 __threadfence();
                 asm volatile("fence.proxy.async;" ::: "memory");
+                if (write_final_states != 0) {
+                    int items = sequence_count * nheads;
+                    int sweep_count = (items - ticket_4 + vcount_eff_4 - 1) / vcount_eff_4;
+                    #pragma unroll 1
+                    for (int i_3 = 0; i_3 < sweep_count; i_3++) {
+                        int item = ticket_4 + i_3 * vcount_eff_4;
+                        int e_sequence = item / nheads;
+                        int e_n = seq_chunk_cumsum[e_sequence + 1] - seq_chunk_cumsum[e_sequence];
+                        if (e_n == 0) {
+                            int e_base = item * 8192;
+                            #pragma unroll
+                            for (int k_14 = 0; k_14 < 32; k_14++) {
+                                float e_value = 0.0f;
+                                if (has_initial != 0) {
+                                    e_value = (float)initial_states[e_base + elem_base + k_14 * 128];
+                                }
+                                final_states[e_base + elem_base + k_14 * 128] = e_value;
+                            }
+                        }
+                    }
+                }
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 asm volatile("barrier.sync 11, 512;" ::: "memory");
             }
@@ -2207,7 +2357,7 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
             int row_tmem_base = warp % 4 * 32 << 16;
             int chain_tid_1 = (warp - 4) * 32 + lane;
             int tot_5[1];
-            tot_5[0] = sequence_count * nchunks * nheads;
+            tot_5[0] = seq_chunk_cumsum[sequence_count] * nheads;
             int veff_5[1];
             int total_5 = tot_5[0];
             int g_5 = 1;
@@ -2222,7 +2372,6 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
             int vcount_eff_5 = veff_5[0];
             unsigned int total_u_5 = (unsigned int)vcount_eff_5;
             unsigned int _phase_aux1_full_1 = 0;
-            unsigned int _phase_b1_full_1 = 0;
             unsigned int _phase_scaled_b_empty_0_1 = 1;
             unsigned int _phase_state_delta_full_0_1 = 0;
             unsigned int _phase_cb_full = 0;
@@ -2252,8 +2401,14 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                     int sequence_9 = 0;
                     int s_base_9 = 0;
                     int n_item_10 = nchunks;
-                    sequence_9 = xa_5 / (nchunks * nheads);
-                    s_base_9 = sequence_9 * nchunks;
+                    #pragma unroll 1
+                    for (int q_19 = 0; q_19 < sequence_count; q_19++) {
+                        if (xa_5 >= seq_chunk_cumsum[q_19 + 1] * nheads) {
+                            sequence_9 = q_19 + 1;
+                        }
+                    }
+                    s_base_9 = seq_chunk_cumsum[sequence_9];
+                    n_item_10 = seq_chunk_cumsum[sequence_9 + 1] - s_base_9;
                     int rem_9 = xa_5 - s_base_9 * nheads;
                     int head_9 = rem_9 / n_item_10;
                     int chunk_9 = rem_9 - head_9 * n_item_10;
@@ -2283,14 +2438,23 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         int physical_chunk_5 = 0;
                         int segment_offset_3 = 0;
                         int segment_limit_3 = 128;
-                        int sequence_0_2 = logical_8 / nchunks;
-                        physical_chunk_5 = logical_8 - sequence_0_2 * nchunks;
+                        physical_chunk_5 = chunk_indices[logical_8];
+                        segment_offset_3 = chunk_offsets[logical_8];
+                        if (logical_8 + 1 < num_logical_chunks) {
+                            int next_chunk_3 = chunk_indices[logical_8 + 1];
+                            if (next_chunk_3 == physical_chunk_5) {
+                                segment_limit_3 = chunk_offsets[logical_8 + 1];
+                            }
+                        }
                         int chunk_tokens_3 = seqlen - physical_chunk_5 * 128;
                         if (chunk_tokens_3 > 128) {
                             chunk_tokens_3 = 128;
                         }
+                        if (segment_limit_3 > chunk_tokens_3) {
+                            segment_limit_3 = chunk_tokens_3;
+                        }
                         mbarrier_wait(aux1_full_addr + (stage1_4) * 8, _phase_aux1_full_1);
-                        mbarrier_wait(b1_full_addr + (stage1_4) * 8, _phase_b1_full_1);
+                        mbarrier_wait(b1_full_addr + (stage1_4) * 8, _phase_aux1_full_1);
                         float last_cumsum_3 = smem_cumsum_all[stage1_4 * 128 + (unsigned int)segment_limit_3 - 1];
                         mbarrier_wait(scaled_b_empty_addr, _phase_scaled_b_empty_0_1);
                         _phase_scaled_b_empty_0_1 ^= 1;
@@ -2312,20 +2476,12 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                                     (&scaled_b_values_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(b_packed_1[_pair]) << 16);
                                     (&scaled_b_values_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(b_packed_1[_pair]) & 0xffff0000u);
                                 }
-                                float _exp2_0 = approx_exp2((last_cumsum_3 - smem_cumsum_all[stage1_4 * 128 + (unsigned int)col_1]) * 1.4426950408889634f);
-                                float b_scale_1 = _exp2_0;
+                                float b_scale_1 = approx_exp2((last_cumsum_3 - smem_cumsum_all[stage1_4 * 128 + (unsigned int)col_1]) * 1.442695f);
                                 b_scale_1 *= smem_delta_all[stage1_4 * 128 + (unsigned int)col_1];
-                                #if __CUDA_ARCH__ >= 1000
                                 const float2 _scale2_0 = {b_scale_1, b_scale_1};
                                 #pragma unroll
                                 for (int _ls = 0; _ls < 4; _ls++)
                                     mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(scaled_b_values_1)[_ls], _scale2_0);
-                                #else
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 8; _ls++) {
-                                    scaled_b_values_1[_ls] = scaled_b_values_1[_ls] * b_scale_1;
-                                }
-                                #endif
                             }
                             #pragma unroll
                             for (int b_local_3 = 0; b_local_3 < 8; b_local_3++) {
@@ -2376,7 +2532,7 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                             }
                         }
                         stage1_4 += 1;
-                        if (stage1_4 == 2) { stage1_4 = 0; _phase_aux1_full_1 ^= 1; _phase_b1_full_1 ^= 1; }
+                        if (stage1_4 == 2) { stage1_4 = 0; _phase_aux1_full_1 ^= 1; }
                     }
                     xa_5 = xa_5 + seg_len_9;
                 }
@@ -2408,16 +2564,22 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                 lc_ring_1[0] = 0.0f;
                 lc_ring_1[1] = 0.0f;
                 #pragma unroll
-                for (int k_14 = 0; k_14 < 32; k_14++) {
-                    h_1[k_14] = 0.0f;
+                for (int k_15 = 0; k_15 < 32; k_15++) {
+                    h_1[k_15] = 0.0f;
                 }
                 if (a_b_5 < a_end_5) {
                     int last_loc_1[6];
                     int sequence_10 = 0;
                     int s_base_10 = 0;
                     int n_item_11 = nchunks;
-                    sequence_10 = (a_end_5 - 1) / (nchunks * nheads);
-                    s_base_10 = sequence_10 * nchunks;
+                    #pragma unroll 1
+                    for (int q_20 = 0; q_20 < sequence_count; q_20++) {
+                        if (seq_chunk_cumsum[q_20 + 1] * nheads <= a_end_5 - 1) {
+                            sequence_10 = q_20 + 1;
+                        }
+                    }
+                    s_base_10 = seq_chunk_cumsum[sequence_10];
+                    n_item_11 = seq_chunk_cumsum[sequence_10 + 1] - s_base_10;
                     int rem_10 = a_end_5 - 1 - s_base_10 * nheads;
                     int head_10 = rem_10 / n_item_11;
                     int chunk_10 = rem_10 - head_10 * n_item_11;
@@ -2445,17 +2607,28 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         int look_physical_5 = 0;
                         int look_offset_5 = 0;
                         int look_limit_2 = 128;
-                        look_physical_5 = agg_first_1 - l_sequence_1 * nchunks;
+                        look_physical_5 = chunk_indices[agg_first_1];
+                        look_offset_5 = chunk_offsets[agg_first_1];
+                        if (agg_first_1 + 1 < num_logical_chunks) {
+                            int look_next_8 = chunk_indices[agg_first_1 + 1];
+                            if (look_next_8 == look_physical_5) {
+                                look_limit_2 = chunk_offsets[agg_first_1 + 1];
+                            }
+                        }
                         int look_tokens_2 = seqlen - look_physical_5 * 128;
                         if (look_tokens_2 > 128) {
                             look_tokens_2 = 128;
                         }
-                        int source_token_4 = look_tokens_2 - 1;
-                        float last_cumsum_4 = cumsum_precomputed[look_tile_4 * 128 + source_token_4];
+                        int source_token_2 = look_tokens_2 - 1;
+                        if (look_limit_2 > look_tokens_2) {
+                            look_limit_2 = look_tokens_2;
+                        }
+                        source_token_2 = look_limit_2 - 1 - look_offset_5;
+                        float last_cumsum_4 = cumsum_precomputed[look_tile_4 * 128 + source_token_2];
                         lc_ring_1[0] = last_cumsum_4;
                         float segment_base_2 = 0.0f;
-                        float _exp2_1 = approx_exp2((last_cumsum_4 - segment_base_2) * 1.4426950408889634f);
-                        d_ring_1[0] = _exp2_1;
+                        float _exp2_2_1 = approx_exp2((last_cumsum_4 - segment_base_2) * 1.442695f);
+                        d_ring_1[0] = _exp2_2_1;
                         int look_t_2 = agg_first_1 + s_t_off_1;
                         if (look_t_2 >= s_resident_from_1) {
                             asm volatile(
@@ -2466,33 +2639,43 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                             asm volatile("tcgen05.wait::ld.sync.aligned;");
                         } else {
                             #pragma unroll
-                            for (int q_8 = 0; q_8 < 8; q_8++) {
+                            for (int q_21 = 0; q_21 < 8; q_21++) {
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_4 * 8192 + s_work_row_1 + 4 * q_8);
-                                    s_a_1[4 * q_8 + 0] = _v4.x;
-                                    s_a_1[4 * q_8 + 1] = _v4.y;
-                                    s_a_1[4 * q_8 + 2] = _v4.z;
-                                    s_a_1[4 * q_8 + 3] = _v4.w;
+                                    float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_4 * 8192 + s_work_row_1 + 4 * q_21);
+                                    s_a_1[4 * q_21 + 0] = _v4.x;
+                                    s_a_1[4 * q_21 + 1] = _v4.y;
+                                    s_a_1[4 * q_21 + 2] = _v4.z;
+                                    s_a_1[4 * q_21 + 3] = _v4.w;
                                 }
                             }
                         }
-                        int _min_0 = ((agg_first_1 + 1) < (agg_last_1) ? (agg_first_1 + 1) : (agg_last_1));
-                        int agg_look1_1 = _min_0;
+                        int agg_look1_1 = ((agg_first_1 + 1) < (agg_last_1) ? (agg_first_1 + 1) : (agg_last_1));
                         int look_tile_0_2 = agg_look1_1 * nheads + l_head_1;
                         int look_physical_1_2 = 0;
                         int look_offset_2_2 = 0;
                         int look_limit_3_2 = 128;
-                        look_physical_1_2 = agg_look1_1 - l_sequence_1 * nchunks;
+                        look_physical_1_2 = chunk_indices[agg_look1_1];
+                        look_offset_2_2 = chunk_offsets[agg_look1_1];
+                        if (agg_look1_1 + 1 < num_logical_chunks) {
+                            int look_next_9 = chunk_indices[agg_look1_1 + 1];
+                            if (look_next_9 == look_physical_1_2) {
+                                look_limit_3_2 = chunk_offsets[agg_look1_1 + 1];
+                            }
+                        }
                         int look_tokens_4_2 = seqlen - look_physical_1_2 * 128;
                         if (look_tokens_4_2 > 128) {
                             look_tokens_4_2 = 128;
                         }
                         int source_token_5_2 = look_tokens_4_2 - 1;
+                        if (look_limit_3_2 > look_tokens_4_2) {
+                            look_limit_3_2 = look_tokens_4_2;
+                        }
+                        source_token_5_2 = look_limit_3_2 - 1 - look_offset_2_2;
                         float last_cumsum_6_2 = cumsum_precomputed[look_tile_0_2 * 128 + source_token_5_2];
                         lc_ring_1[1] = last_cumsum_6_2;
                         float segment_base_7_2 = 0.0f;
-                        float _exp2_2 = approx_exp2((last_cumsum_6_2 - segment_base_7_2) * 1.4426950408889634f);
-                        d_ring_1[1] = _exp2_2;
+                        float _exp2_4_1 = approx_exp2((last_cumsum_6_2 - segment_base_7_2) * 1.442695f);
+                        d_ring_1[1] = _exp2_4_1;
                         int look_t_8_2 = agg_look1_1 + s_t_off_1;
                         if (look_t_8_2 >= s_resident_from_1) {
                             asm volatile(
@@ -2503,13 +2686,13 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                             asm volatile("tcgen05.wait::ld.sync.aligned;");
                         } else {
                             #pragma unroll
-                            for (int q_9 = 0; q_9 < 8; q_9++) {
+                            for (int q_22 = 0; q_22 < 8; q_22++) {
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_0_2 * 8192 + s_work_row_1 + 4 * q_9);
-                                    s_b_1[4 * q_9 + 0] = _v4.x;
-                                    s_b_1[4 * q_9 + 1] = _v4.y;
-                                    s_b_1[4 * q_9 + 2] = _v4.z;
-                                    s_b_1[4 * q_9 + 3] = _v4.w;
+                                    float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_0_2 * 8192 + s_work_row_1 + 4 * q_22);
+                                    s_b_1[4 * q_22 + 0] = _v4.x;
+                                    s_b_1[4 * q_22 + 1] = _v4.y;
+                                    s_b_1[4 * q_22 + 2] = _v4.z;
+                                    s_b_1[4 * q_22 + 3] = _v4.w;
                                 }
                             }
                         }
@@ -2517,39 +2700,42 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         for (int c_2 = agg_first_1; c_2 < agg_last_1 + 1; c_2 += 2) {
                             float agg_decay_a_1 = d_ring_1[0];
                             lsum_1 = lsum_1 + lc_ring_1[0];
-                            #if __CUDA_ARCH__ >= 1000
-                            const float2 _scale2_4 = {agg_decay_a_1, agg_decay_a_1};
+                            const float2 _scale2_6 = {agg_decay_a_1, agg_decay_a_1};
                             #pragma unroll
                             for (int _ls = 0; _ls < 16; _ls++)
-                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h_1)[_ls], _scale2_4);
-                            #else
+                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h_1)[_ls], _scale2_6);
                             #pragma unroll
-                            for (int _ls = 0; _ls < 32; _ls++) {
-                                h_1[_ls] = h_1[_ls] * agg_decay_a_1;
+                            for (int k_16 = 0; k_16 < 16; k_16++) {
+                                h_1[2 * k_16] = h_1[2 * k_16] + s_a_1[2 * k_16];
+                                h_1[2 * k_16 + 1] = h_1[2 * k_16 + 1] + s_a_1[2 * k_16 + 1];
                             }
-                            #endif
-                            #pragma unroll
-                            for (int k_15 = 0; k_15 < 16; k_15++) {
-                                h_1[2 * k_15] = h_1[2 * k_15] + s_a_1[2 * k_15];
-                                h_1[2 * k_15 + 1] = h_1[2 * k_15 + 1] + s_a_1[2 * k_15 + 1];
-                            }
-                            int _min_1 = ((c_2 + 2) < (agg_last_1) ? (c_2 + 2) : (agg_last_1));
-                            int agg_look_a_1 = _min_1;
+                            int agg_look_a_1 = ((c_2 + 2) < (agg_last_1) ? (c_2 + 2) : (agg_last_1));
                             int look_tile_1_2 = agg_look_a_1 * nheads + l_head_1;
                             int look_physical_2_2 = 0;
                             int look_offset_3_2 = 0;
                             int look_limit_4_2 = 128;
-                            look_physical_2_2 = agg_look_a_1 - l_sequence_1 * nchunks;
+                            look_physical_2_2 = chunk_indices[agg_look_a_1];
+                            look_offset_3_2 = chunk_offsets[agg_look_a_1];
+                            if (agg_look_a_1 + 1 < num_logical_chunks) {
+                                int look_next_10 = chunk_indices[agg_look_a_1 + 1];
+                                if (look_next_10 == look_physical_2_2) {
+                                    look_limit_4_2 = chunk_offsets[agg_look_a_1 + 1];
+                                }
+                            }
                             int look_tokens_5_2 = seqlen - look_physical_2_2 * 128;
                             if (look_tokens_5_2 > 128) {
                                 look_tokens_5_2 = 128;
                             }
                             int source_token_6_2 = look_tokens_5_2 - 1;
+                            if (look_limit_4_2 > look_tokens_5_2) {
+                                look_limit_4_2 = look_tokens_5_2;
+                            }
+                            source_token_6_2 = look_limit_4_2 - 1 - look_offset_3_2;
                             float last_cumsum_7_2 = cumsum_precomputed[look_tile_1_2 * 128 + source_token_6_2];
                             lc_ring_1[0] = last_cumsum_7_2;
                             float segment_base_8_2 = 0.0f;
-                            float _exp2_3 = approx_exp2((last_cumsum_7_2 - segment_base_8_2) * 1.4426950408889634f);
-                            d_ring_1[0] = _exp2_3;
+                            float _exp2_7_1 = approx_exp2((last_cumsum_7_2 - segment_base_8_2) * 1.442695f);
+                            d_ring_1[0] = _exp2_7_1;
                             int look_t_9_2 = agg_look_a_1 + s_t_off_1;
                             if (look_t_9_2 >= s_resident_from_1) {
                                 asm volatile(
@@ -2560,13 +2746,13 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                                 asm volatile("tcgen05.wait::ld.sync.aligned;");
                             } else {
                                 #pragma unroll
-                                for (int q_10 = 0; q_10 < 8; q_10++) {
+                                for (int q_23 = 0; q_23 < 8; q_23++) {
                                     {
-                                        float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_1_2 * 8192 + s_work_row_1 + 4 * q_10);
-                                        s_a_1[4 * q_10 + 0] = _v4.x;
-                                        s_a_1[4 * q_10 + 1] = _v4.y;
-                                        s_a_1[4 * q_10 + 2] = _v4.z;
-                                        s_a_1[4 * q_10 + 3] = _v4.w;
+                                        float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_1_2 * 8192 + s_work_row_1 + 4 * q_23);
+                                        s_a_1[4 * q_23 + 0] = _v4.x;
+                                        s_a_1[4 * q_23 + 1] = _v4.y;
+                                        s_a_1[4 * q_23 + 2] = _v4.z;
+                                        s_a_1[4 * q_23 + 3] = _v4.w;
                                     }
                                 }
                             }
@@ -2574,39 +2760,42 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                             if (agg_current_b_1 <= agg_last_1) {
                                 float agg_decay_b_1 = d_ring_1[1];
                                 lsum_1 = lsum_1 + lc_ring_1[1];
-                                #if __CUDA_ARCH__ >= 1000
-                                const float2 _scale2_6 = {agg_decay_b_1, agg_decay_b_1};
+                                const float2 _scale2_9 = {agg_decay_b_1, agg_decay_b_1};
                                 #pragma unroll
                                 for (int _ls = 0; _ls < 16; _ls++)
-                                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h_1)[_ls], _scale2_6);
-                                #else
+                                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h_1)[_ls], _scale2_9);
                                 #pragma unroll
-                                for (int _ls = 0; _ls < 32; _ls++) {
-                                    h_1[_ls] = h_1[_ls] * agg_decay_b_1;
+                                for (int k_17 = 0; k_17 < 16; k_17++) {
+                                    h_1[2 * k_17] = h_1[2 * k_17] + s_b_1[2 * k_17];
+                                    h_1[2 * k_17 + 1] = h_1[2 * k_17 + 1] + s_b_1[2 * k_17 + 1];
                                 }
-                                #endif
-                                #pragma unroll
-                                for (int k_16 = 0; k_16 < 16; k_16++) {
-                                    h_1[2 * k_16] = h_1[2 * k_16] + s_b_1[2 * k_16];
-                                    h_1[2 * k_16 + 1] = h_1[2 * k_16 + 1] + s_b_1[2 * k_16 + 1];
-                                }
-                                int _min_2 = ((c_2 + 3) < (agg_last_1) ? (c_2 + 3) : (agg_last_1));
-                                int agg_look_b_1 = _min_2;
+                                int agg_look_b_1 = ((c_2 + 3) < (agg_last_1) ? (c_2 + 3) : (agg_last_1));
                                 int look_tile_2_1 = agg_look_b_1 * nheads + l_head_1;
                                 int look_physical_3_1 = 0;
                                 int look_offset_4_1 = 0;
                                 int look_limit_5_1 = 128;
-                                look_physical_3_1 = agg_look_b_1 - l_sequence_1 * nchunks;
+                                look_physical_3_1 = chunk_indices[agg_look_b_1];
+                                look_offset_4_1 = chunk_offsets[agg_look_b_1];
+                                if (agg_look_b_1 + 1 < num_logical_chunks) {
+                                    int look_next_11 = chunk_indices[agg_look_b_1 + 1];
+                                    if (look_next_11 == look_physical_3_1) {
+                                        look_limit_5_1 = chunk_offsets[agg_look_b_1 + 1];
+                                    }
+                                }
                                 int look_tokens_6_1 = seqlen - look_physical_3_1 * 128;
                                 if (look_tokens_6_1 > 128) {
                                     look_tokens_6_1 = 128;
                                 }
                                 int source_token_7_1 = look_tokens_6_1 - 1;
+                                if (look_limit_5_1 > look_tokens_6_1) {
+                                    look_limit_5_1 = look_tokens_6_1;
+                                }
+                                source_token_7_1 = look_limit_5_1 - 1 - look_offset_4_1;
                                 float last_cumsum_8_1 = cumsum_precomputed[look_tile_2_1 * 128 + source_token_7_1];
                                 lc_ring_1[1] = last_cumsum_8_1;
                                 float segment_base_9_1 = 0.0f;
-                                float _exp2_4 = approx_exp2((last_cumsum_8_1 - segment_base_9_1) * 1.4426950408889634f);
-                                d_ring_1[1] = _exp2_4;
+                                float _exp2_10_1 = approx_exp2((last_cumsum_8_1 - segment_base_9_1) * 1.442695f);
+                                d_ring_1[1] = _exp2_10_1;
                                 int look_t_10_1 = agg_look_b_1 + s_t_off_1;
                                 if (look_t_10_1 >= s_resident_from_1) {
                                     asm volatile(
@@ -2617,13 +2806,13 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                                     asm volatile("tcgen05.wait::ld.sync.aligned;");
                                 } else {
                                     #pragma unroll
-                                    for (int q_11 = 0; q_11 < 8; q_11++) {
+                                    for (int q_24 = 0; q_24 < 8; q_24++) {
                                         {
-                                            float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_2_1 * 8192 + s_work_row_1 + 4 * q_11);
-                                            s_b_1[4 * q_11 + 0] = _v4.x;
-                                            s_b_1[4 * q_11 + 1] = _v4.y;
-                                            s_b_1[4 * q_11 + 2] = _v4.z;
-                                            s_b_1[4 * q_11 + 3] = _v4.w;
+                                            float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_2_1 * 8192 + s_work_row_1 + 4 * q_24);
+                                            s_b_1[4 * q_24 + 0] = _v4.x;
+                                            s_b_1[4 * q_24 + 1] = _v4.y;
+                                            s_b_1[4 * q_24 + 2] = _v4.z;
+                                            s_b_1[4 * q_24 + 3] = _v4.w;
                                         }
                                     }
                                 }
@@ -2645,20 +2834,26 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         asm volatile("barrier.sync 12, 256;" ::: "memory");
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         #pragma unroll
-                        for (int k_17 = 0; k_17 < 32; k_17++) {
-                            h_1[k_17] = 0.0f;
+                        for (int k_18 = 0; k_18 < 32; k_18++) {
+                            h_1[k_18] = 0.0f;
                         }
                     }
                     int first_loc_1[6];
-                    int sequence_0_3 = 0;
+                    int sequence_0_1 = 0;
                     int s_base_1_2 = 0;
                     int n_item_2_2 = nchunks;
-                    sequence_0_3 = a_b_5 / (nchunks * nheads);
-                    s_base_1_2 = sequence_0_3 * nchunks;
+                    #pragma unroll 1
+                    for (int q_25 = 0; q_25 < sequence_count; q_25++) {
+                        if (a_b_5 >= seq_chunk_cumsum[q_25 + 1] * nheads) {
+                            sequence_0_1 = q_25 + 1;
+                        }
+                    }
+                    s_base_1_2 = seq_chunk_cumsum[sequence_0_1];
+                    n_item_2_2 = seq_chunk_cumsum[sequence_0_1 + 1] - s_base_1_2;
                     int rem_3_2 = a_b_5 - s_base_1_2 * nheads;
                     int head_4_2 = rem_3_2 / n_item_2_2;
                     int chunk_5_2 = rem_3_2 - head_4_2 * n_item_2_2;
-                    first_loc_1[0] = sequence_0_3;
+                    first_loc_1[0] = sequence_0_1;
                     first_loc_1[1] = head_4_2;
                     first_loc_1[2] = chunk_5_2;
                     first_loc_1[3] = n_item_2_2;
@@ -2671,8 +2866,8 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                     if (has_initial != 0) {
                         int f_state_base_1 = (f_sequence_1 * nheads + f_head_1) * 8192;
                         #pragma unroll
-                        for (int k_18 = 0; k_18 < 32; k_18++) {
-                            h_1[k_18] = (float)initial_states[f_state_base_1 + elem_base_1 + k_18 * 128];
+                        for (int k_19 = 0; k_19 < 32; k_19++) {
+                            h_1[k_19] = (float)initial_states[f_state_base_1 + elem_base_1 + k_19 * 128];
                         }
                     }
                     if (f_chunk_1 > 0) {
@@ -2710,43 +2905,29 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         #pragma unroll 1
                         for (int bq_2 = b_lo_1; bq_2 < ticket_5; bq_2 += 2) {
                             float lsum_a_1 = lsum_ring_1[0];
-                            float y_1 = lsum_a_1 * 1.4426950408889634f;
+                            float y_1 = lsum_a_1 * 1.442695f;
                             float a_lo_2 = 0.0f;
                             float a_hi_1 = 1.0f;
                             if (y_1 > -100.0f) {
-                                float _exp2_5 = approx_exp2(y_1);
-                                a_lo_2 = _exp2_5;
+                                float _exp2_14_1 = approx_exp2(y_1);
+                                a_lo_2 = _exp2_14_1;
                             } else {
-                                float _exp2_6 = approx_exp2(y_1 + 100.0f);
-                                a_lo_2 = _exp2_6;
-                                a_hi_1 = 7.888609052210118e-31f;
+                                float _exp2_15_1 = approx_exp2(y_1 + 100.0f);
+                                a_lo_2 = _exp2_15_1;
+                                a_hi_1 = 7.888609e-31f;
                             }
-                            #if __CUDA_ARCH__ >= 1000
-                            const float2 _scale2_10 = {a_lo_2, a_lo_2};
+                            const float2 _scale2_16 = {a_lo_2, a_lo_2};
                             #pragma unroll
                             for (int _ls = 0; _ls < 16; _ls++)
-                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h_1)[_ls], _scale2_10);
-                            #else
-                            #pragma unroll
-                            for (int _ls = 0; _ls < 32; _ls++) {
-                                h_1[_ls] = h_1[_ls] * a_lo_2;
-                            }
-                            #endif
-                            #if __CUDA_ARCH__ >= 1000
-                            const float2 _scale2_11 = {a_hi_1, a_hi_1};
+                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h_1)[_ls], _scale2_16);
+                            const float2 _scale2_17 = {a_hi_1, a_hi_1};
                             #pragma unroll
                             for (int _ls = 0; _ls < 16; _ls++)
-                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h_1)[_ls], _scale2_11);
-                            #else
+                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h_1)[_ls], _scale2_17);
                             #pragma unroll
-                            for (int _ls = 0; _ls < 32; _ls++) {
-                                h_1[_ls] = h_1[_ls] * a_hi_1;
-                            }
-                            #endif
-                            #pragma unroll
-                            for (int k_19 = 0; k_19 < 16; k_19++) {
-                                h_1[2 * k_19] = h_1[2 * k_19] + s_a_1[2 * k_19];
-                                h_1[2 * k_19 + 1] = h_1[2 * k_19 + 1] + s_a_1[2 * k_19 + 1];
+                            for (int k_20 = 0; k_20 < 16; k_20++) {
+                                h_1[2 * k_20] = h_1[2 * k_20] + s_a_1[2 * k_20];
+                                h_1[2 * k_20 + 1] = h_1[2 * k_20 + 1] + s_a_1[2 * k_20 + 1];
                             }
                             int bq_a_1 = bq_2 + 2;
                             if (bq_a_1 < ticket_5) {
@@ -2766,43 +2947,29 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                             int bq_b_1 = bq_2 + 1;
                             if (bq_b_1 < ticket_5) {
                                 float lsum_b_1 = lsum_ring_1[1];
-                                float y_0_1 = lsum_b_1 * 1.4426950408889634f;
+                                float y_0_1 = lsum_b_1 * 1.442695f;
                                 float a_lo_1_1 = 0.0f;
                                 float a_hi_2_1 = 1.0f;
                                 if (y_0_1 > -100.0f) {
-                                    float _exp2_7 = approx_exp2(y_0_1);
-                                    a_lo_1_1 = _exp2_7;
+                                    float _exp2_19_1 = approx_exp2(y_0_1);
+                                    a_lo_1_1 = _exp2_19_1;
                                 } else {
-                                    float _exp2_8 = approx_exp2(y_0_1 + 100.0f);
-                                    a_lo_1_1 = _exp2_8;
-                                    a_hi_2_1 = 7.888609052210118e-31f;
+                                    float _exp2_20_1 = approx_exp2(y_0_1 + 100.0f);
+                                    a_lo_1_1 = _exp2_20_1;
+                                    a_hi_2_1 = 7.888609e-31f;
                                 }
-                                #if __CUDA_ARCH__ >= 1000
-                                const float2 _scale2_13 = {a_lo_1_1, a_lo_1_1};
+                                const float2 _scale2_21 = {a_lo_1_1, a_lo_1_1};
                                 #pragma unroll
                                 for (int _ls = 0; _ls < 16; _ls++)
-                                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h_1)[_ls], _scale2_13);
-                                #else
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 32; _ls++) {
-                                    h_1[_ls] = h_1[_ls] * a_lo_1_1;
-                                }
-                                #endif
-                                #if __CUDA_ARCH__ >= 1000
-                                const float2 _scale2_14 = {a_hi_2_1, a_hi_2_1};
+                                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h_1)[_ls], _scale2_21);
+                                const float2 _scale2_22 = {a_hi_2_1, a_hi_2_1};
                                 #pragma unroll
                                 for (int _ls = 0; _ls < 16; _ls++)
-                                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h_1)[_ls], _scale2_14);
-                                #else
+                                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h_1)[_ls], _scale2_22);
                                 #pragma unroll
-                                for (int _ls = 0; _ls < 32; _ls++) {
-                                    h_1[_ls] = h_1[_ls] * a_hi_2_1;
-                                }
-                                #endif
-                                #pragma unroll
-                                for (int k_20 = 0; k_20 < 16; k_20++) {
-                                    h_1[2 * k_20] = h_1[2 * k_20] + s_b_1[2 * k_20];
-                                    h_1[2 * k_20 + 1] = h_1[2 * k_20 + 1] + s_b_1[2 * k_20 + 1];
+                                for (int k_21 = 0; k_21 < 16; k_21++) {
+                                    h_1[2 * k_21] = h_1[2 * k_21] + s_b_1[2 * k_21];
+                                    h_1[2 * k_21 + 1] = h_1[2 * k_21 + 1] + s_b_1[2 * k_21 + 1];
                                 }
                                 int bq_b2_1 = bq_2 + 3;
                                 if (bq_b2_1 < ticket_5) {
@@ -2828,8 +2995,14 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         int sequence_1_2 = 0;
                         int s_base_2_2 = 0;
                         int n_item_3_2 = nchunks;
-                        sequence_1_2 = x_6_1 / (nchunks * nheads);
-                        s_base_2_2 = sequence_1_2 * nchunks;
+                        #pragma unroll 1
+                        for (int q_26 = 0; q_26 < sequence_count; q_26++) {
+                            if (x_6_1 >= seq_chunk_cumsum[q_26 + 1] * nheads) {
+                                sequence_1_2 = q_26 + 1;
+                            }
+                        }
+                        s_base_2_2 = seq_chunk_cumsum[sequence_1_2];
+                        n_item_3_2 = seq_chunk_cumsum[sequence_1_2 + 1] - s_base_2_2;
                         int rem_4_2 = x_6_1 - s_base_2_2 * nheads;
                         int head_5_2 = rem_4_2 / n_item_3_2;
                         int chunk_6_2 = rem_4_2 - head_5_2 * n_item_3_2;
@@ -2858,13 +3031,13 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         s_t_off_1 = x_6_1 - a_b_5 - first_10;
                         if (x_6_1 > a_b_5) {
                             #pragma unroll
-                            for (int k_21 = 0; k_21 < 32; k_21++) {
-                                h_1[k_21] = 0.0f;
+                            for (int k_22 = 0; k_22 < 32; k_22++) {
+                                h_1[k_22] = 0.0f;
                             }
                             if (has_initial != 0) {
                                 #pragma unroll
-                                for (int k_22 = 0; k_22 < 32; k_22++) {
-                                    h_1[k_22] = (float)initial_states[state_head_base_1 + elem_base_1 + k_22 * 128];
+                                for (int k_23 = 0; k_23 < 32; k_23++) {
+                                    h_1[k_23] = (float)initial_states[state_head_base_1 + elem_base_1 + k_23 * 128];
                                 }
                             }
                         }
@@ -2872,17 +3045,28 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         int look_physical_6 = 0;
                         int look_offset_6 = 0;
                         int look_limit_6 = 128;
-                        look_physical_6 = first_10 - sequence_7_2 * nchunks;
+                        look_physical_6 = chunk_indices[first_10];
+                        look_offset_6 = chunk_offsets[first_10];
+                        if (first_10 + 1 < num_logical_chunks) {
+                            int look_next_12 = chunk_indices[first_10 + 1];
+                            if (look_next_12 == look_physical_6) {
+                                look_limit_6 = chunk_offsets[first_10 + 1];
+                            }
+                        }
                         int look_tokens_3 = seqlen - look_physical_6 * 128;
                         if (look_tokens_3 > 128) {
                             look_tokens_3 = 128;
                         }
-                        int source_token_8 = look_tokens_3 - 1;
-                        float last_cumsum_5 = cumsum_precomputed[look_tile_5 * 128 + source_token_8];
+                        int source_token_3 = look_tokens_3 - 1;
+                        if (look_limit_6 > look_tokens_3) {
+                            look_limit_6 = look_tokens_3;
+                        }
+                        source_token_3 = look_limit_6 - 1 - look_offset_6;
+                        float last_cumsum_5 = cumsum_precomputed[look_tile_5 * 128 + source_token_3];
                         lc_ring_1[0] = last_cumsum_5;
                         float segment_base_3 = 0.0f;
-                        float _exp2_9 = approx_exp2((last_cumsum_5 - segment_base_3) * 1.4426950408889634f);
-                        d_ring_1[0] = _exp2_9;
+                        float _exp2_24_1 = approx_exp2((last_cumsum_5 - segment_base_3) * 1.442695f);
+                        d_ring_1[0] = _exp2_24_1;
                         int look_t_3 = first_10 + s_t_off_1;
                         if (look_t_3 >= s_resident_from_1) {
                             asm volatile(
@@ -2893,33 +3077,43 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                             asm volatile("tcgen05.wait::ld.sync.aligned;");
                         } else {
                             #pragma unroll
-                            for (int q_12 = 0; q_12 < 8; q_12++) {
+                            for (int q_27 = 0; q_27 < 8; q_27++) {
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_5 * 8192 + s_work_row_1 + 4 * q_12);
-                                    s_a_1[4 * q_12 + 0] = _v4.x;
-                                    s_a_1[4 * q_12 + 1] = _v4.y;
-                                    s_a_1[4 * q_12 + 2] = _v4.z;
-                                    s_a_1[4 * q_12 + 3] = _v4.w;
+                                    float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_5 * 8192 + s_work_row_1 + 4 * q_27);
+                                    s_a_1[4 * q_27 + 0] = _v4.x;
+                                    s_a_1[4 * q_27 + 1] = _v4.y;
+                                    s_a_1[4 * q_27 + 2] = _v4.z;
+                                    s_a_1[4 * q_27 + 3] = _v4.w;
                                 }
                             }
                         }
-                        int _min_3 = ((first_10 + 1) < (last_1) ? (first_10 + 1) : (last_1));
-                        int look1_1 = _min_3;
+                        int look1_1 = ((first_10 + 1) < (last_1) ? (first_10 + 1) : (last_1));
                         int look_tile_10_1 = look1_1 * nheads + head_8_2;
                         int look_physical_11_1 = 0;
                         int look_offset_12_1 = 0;
                         int look_limit_13_1 = 128;
-                        look_physical_11_1 = look1_1 - sequence_7_2 * nchunks;
+                        look_physical_11_1 = chunk_indices[look1_1];
+                        look_offset_12_1 = chunk_offsets[look1_1];
+                        if (look1_1 + 1 < num_logical_chunks) {
+                            int look_next_13 = chunk_indices[look1_1 + 1];
+                            if (look_next_13 == look_physical_11_1) {
+                                look_limit_13_1 = chunk_offsets[look1_1 + 1];
+                            }
+                        }
                         int look_tokens_14_1 = seqlen - look_physical_11_1 * 128;
                         if (look_tokens_14_1 > 128) {
                             look_tokens_14_1 = 128;
                         }
                         int source_token_15_1 = look_tokens_14_1 - 1;
+                        if (look_limit_13_1 > look_tokens_14_1) {
+                            look_limit_13_1 = look_tokens_14_1;
+                        }
+                        source_token_15_1 = look_limit_13_1 - 1 - look_offset_12_1;
                         float last_cumsum_16_1 = cumsum_precomputed[look_tile_10_1 * 128 + source_token_15_1];
                         lc_ring_1[1] = last_cumsum_16_1;
                         float segment_base_17_1 = 0.0f;
-                        float _exp2_10 = approx_exp2((last_cumsum_16_1 - segment_base_17_1) * 1.4426950408889634f);
-                        d_ring_1[1] = _exp2_10;
+                        float _exp2_26_1 = approx_exp2((last_cumsum_16_1 - segment_base_17_1) * 1.442695f);
+                        d_ring_1[1] = _exp2_26_1;
                         int look_t_18_1 = look1_1 + s_t_off_1;
                         if (look_t_18_1 >= s_resident_from_1) {
                             asm volatile(
@@ -2930,13 +3124,13 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                             asm volatile("tcgen05.wait::ld.sync.aligned;");
                         } else {
                             #pragma unroll
-                            for (int q_13 = 0; q_13 < 8; q_13++) {
+                            for (int q_28 = 0; q_28 < 8; q_28++) {
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_10_1 * 8192 + s_work_row_1 + 4 * q_13);
-                                    s_b_1[4 * q_13 + 0] = _v4.x;
-                                    s_b_1[4 * q_13 + 1] = _v4.y;
-                                    s_b_1[4 * q_13 + 2] = _v4.z;
-                                    s_b_1[4 * q_13 + 3] = _v4.w;
+                                    float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_10_1 * 8192 + s_work_row_1 + 4 * q_28);
+                                    s_b_1[4 * q_28 + 0] = _v4.x;
+                                    s_b_1[4 * q_28 + 1] = _v4.y;
+                                    s_b_1[4 * q_28 + 2] = _v4.z;
+                                    s_b_1[4 * q_28 + 3] = _v4.w;
                                 }
                             }
                         }
@@ -2947,29 +3141,22 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                             h_bf16_1[_lp] = *(uint32_t*)&_bf2;
                         }
                         #pragma unroll
-                        for (int i_3 = 0; i_3 < 16; i_3++) {
-                            unsigned int sent_3 = h_bf16_1[i_3] >> h_half_shift_1 & 65535;
-                            unsigned int _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, sent_3, 1);
-                            h_words[(first_10 * nheads + head_8_2) * 4096 + pair_base_1 + i_3 * 128] = h_bf16_1[i_3] & h_mask_mine_1 | _shfl_xor_0 << h_half_shift_1;
+                        for (int i_4 = 0; i_4 < 16; i_4++) {
+                            unsigned int sent_3 = h_bf16_1[i_4] >> h_half_shift_1 & 65535;
+                            unsigned int _shfl_xor_sync_28_1 = __shfl_xor_sync(0xFFFFFFFF, sent_3, 1);
+                            h_words[(first_10 * nheads + head_8_2) * 4096 + pair_base_1 + i_4 * 128] = h_bf16_1[i_4] & h_mask_mine_1 | _shfl_xor_sync_28_1 << h_half_shift_1;
                         }
                         #pragma unroll 1
                         for (int c_3 = first_10; c_3 < first_10 + seg_len_10; c_3 += 2) {
                             float decay_a_1 = d_ring_1[0];
-                            #if __CUDA_ARCH__ >= 1000
-                            const float2 _scale2_18 = {decay_a_1, decay_a_1};
+                            const float2 _scale2_29 = {decay_a_1, decay_a_1};
                             #pragma unroll
                             for (int _ls = 0; _ls < 16; _ls++)
-                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h_1)[_ls], _scale2_18);
-                            #else
+                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h_1)[_ls], _scale2_29);
                             #pragma unroll
-                            for (int _ls = 0; _ls < 32; _ls++) {
-                                h_1[_ls] = h_1[_ls] * decay_a_1;
-                            }
-                            #endif
-                            #pragma unroll
-                            for (int k_23 = 0; k_23 < 16; k_23++) {
-                                h_1[2 * k_23] = h_1[2 * k_23] + s_a_1[2 * k_23];
-                                h_1[2 * k_23 + 1] = h_1[2 * k_23 + 1] + s_a_1[2 * k_23 + 1];
+                            for (int k_24 = 0; k_24 < 16; k_24++) {
+                                h_1[2 * k_24] = h_1[2 * k_24] + s_a_1[2 * k_24];
+                                h_1[2 * k_24 + 1] = h_1[2 * k_24 + 1] + s_a_1[2 * k_24 + 1];
                             }
                             if (last_1 > c_3) {
                                 unsigned int h_bf16_0_2[16];
@@ -2979,19 +3166,28 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                                     h_bf16_0_2[_lp] = *(uint32_t*)&_bf2;
                                 }
                                 #pragma unroll
-                                for (int i_4 = 0; i_4 < 16; i_4++) {
-                                    unsigned int sent_4 = h_bf16_0_2[i_4] >> h_half_shift_1 & 65535;
-                                    unsigned int _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, sent_4, 1);
-                                    h_words[((c_3 + 1) * nheads + head_8_2) * 4096 + pair_base_1 + i_4 * 128] = h_bf16_0_2[i_4] & h_mask_mine_1 | _shfl_xor_1 << h_half_shift_1;
+                                for (int i_5 = 0; i_5 < 16; i_5++) {
+                                    unsigned int sent_4 = h_bf16_0_2[i_5] >> h_half_shift_1 & 65535;
+                                    unsigned int _shfl_xor_sync_30_1 = __shfl_xor_sync(0xFFFFFFFF, sent_4, 1);
+                                    h_words[((c_3 + 1) * nheads + head_8_2) * 4096 + pair_base_1 + i_5 * 128] = h_bf16_0_2[i_5] & h_mask_mine_1 | _shfl_xor_sync_30_1 << h_half_shift_1;
                                 }
                             }
                             if (checkpoint_state_count > 0) {
                                 int cur_physical_2 = 0;
                                 int cur_limit_2 = 128;
-                                cur_physical_2 = c_3 - sequence_7_2 * nchunks;
+                                cur_physical_2 = chunk_indices[c_3];
+                                if (c_3 + 1 < num_logical_chunks) {
+                                    int cur_next_2 = chunk_indices[c_3 + 1];
+                                    if (cur_next_2 == cur_physical_2) {
+                                        cur_limit_2 = chunk_offsets[c_3 + 1];
+                                    }
+                                }
                                 int cur_tokens_2 = seqlen - cur_physical_2 * 128;
                                 if (cur_tokens_2 > 128) {
                                     cur_tokens_2 = 128;
+                                }
+                                if (cur_limit_2 > cur_tokens_2) {
+                                    cur_limit_2 = cur_tokens_2;
                                 }
                                 int segment_end_2 = cur_physical_2 * 128 + cur_limit_2;
                                 if (segment_end_2 > seqlen) {
@@ -3002,29 +3198,39 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                                     if (checkpoint_slot_2 >= 0 && checkpoint_slot_2 < checkpoint_state_count) {
                                         int checkpoint_head_base_2 = (checkpoint_slot_2 * nheads + head_8_2) * 8192;
                                         #pragma unroll
-                                        for (int k_24 = 0; k_24 < 32; k_24++) {
-                                            checkpoint_states[checkpoint_head_base_2 + elem_base_1 + k_24 * 128] = h_1[k_24];
+                                        for (int k_25 = 0; k_25 < 32; k_25++) {
+                                            checkpoint_states[checkpoint_head_base_2 + elem_base_1 + k_25 * 128] = h_1[k_25];
                                         }
                                     }
                                 }
                             }
-                            int _min_4 = ((c_3 + 2) < (last_1) ? (c_3 + 2) : (last_1));
-                            int look_a_1 = _min_4;
+                            int look_a_1 = ((c_3 + 2) < (last_1) ? (c_3 + 2) : (last_1));
                             int look_tile_0_3 = look_a_1 * nheads + head_8_2;
                             int look_physical_1_3 = 0;
                             int look_offset_2_3 = 0;
                             int look_limit_3_3 = 128;
-                            look_physical_1_3 = look_a_1 - sequence_7_2 * nchunks;
+                            look_physical_1_3 = chunk_indices[look_a_1];
+                            look_offset_2_3 = chunk_offsets[look_a_1];
+                            if (look_a_1 + 1 < num_logical_chunks) {
+                                int look_next_14 = chunk_indices[look_a_1 + 1];
+                                if (look_next_14 == look_physical_1_3) {
+                                    look_limit_3_3 = chunk_offsets[look_a_1 + 1];
+                                }
+                            }
                             int look_tokens_4_3 = seqlen - look_physical_1_3 * 128;
                             if (look_tokens_4_3 > 128) {
                                 look_tokens_4_3 = 128;
                             }
                             int source_token_5_3 = look_tokens_4_3 - 1;
+                            if (look_limit_3_3 > look_tokens_4_3) {
+                                look_limit_3_3 = look_tokens_4_3;
+                            }
+                            source_token_5_3 = look_limit_3_3 - 1 - look_offset_2_3;
                             float last_cumsum_6_3 = cumsum_precomputed[look_tile_0_3 * 128 + source_token_5_3];
                             lc_ring_1[0] = last_cumsum_6_3;
                             float segment_base_7_3 = 0.0f;
-                            float _exp2_11 = approx_exp2((last_cumsum_6_3 - segment_base_7_3) * 1.4426950408889634f);
-                            d_ring_1[0] = _exp2_11;
+                            float _exp2_31_1 = approx_exp2((last_cumsum_6_3 - segment_base_7_3) * 1.442695f);
+                            d_ring_1[0] = _exp2_31_1;
                             int look_t_8_3 = look_a_1 + s_t_off_1;
                             if (look_t_8_3 >= s_resident_from_1) {
                                 asm volatile(
@@ -3035,34 +3241,27 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                                 asm volatile("tcgen05.wait::ld.sync.aligned;");
                             } else {
                                 #pragma unroll
-                                for (int q_14 = 0; q_14 < 8; q_14++) {
+                                for (int q_29 = 0; q_29 < 8; q_29++) {
                                     {
-                                        float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_0_3 * 8192 + s_work_row_1 + 4 * q_14);
-                                        s_a_1[4 * q_14 + 0] = _v4.x;
-                                        s_a_1[4 * q_14 + 1] = _v4.y;
-                                        s_a_1[4 * q_14 + 2] = _v4.z;
-                                        s_a_1[4 * q_14 + 3] = _v4.w;
+                                        float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_0_3 * 8192 + s_work_row_1 + 4 * q_29);
+                                        s_a_1[4 * q_29 + 0] = _v4.x;
+                                        s_a_1[4 * q_29 + 1] = _v4.y;
+                                        s_a_1[4 * q_29 + 2] = _v4.z;
+                                        s_a_1[4 * q_29 + 3] = _v4.w;
                                     }
                                 }
                             }
                             int current_b_1 = c_3 + 1;
                             if (current_b_1 <= last_1) {
                                 float decay_b_1 = d_ring_1[1];
-                                #if __CUDA_ARCH__ >= 1000
-                                const float2 _scale2_20 = {decay_b_1, decay_b_1};
+                                const float2 _scale2_33 = {decay_b_1, decay_b_1};
                                 #pragma unroll
                                 for (int _ls = 0; _ls < 16; _ls++)
-                                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h_1)[_ls], _scale2_20);
-                                #else
+                                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(h_1)[_ls], _scale2_33);
                                 #pragma unroll
-                                for (int _ls = 0; _ls < 32; _ls++) {
-                                    h_1[_ls] = h_1[_ls] * decay_b_1;
-                                }
-                                #endif
-                                #pragma unroll
-                                for (int k_25 = 0; k_25 < 16; k_25++) {
-                                    h_1[2 * k_25] = h_1[2 * k_25] + s_b_1[2 * k_25];
-                                    h_1[2 * k_25 + 1] = h_1[2 * k_25 + 1] + s_b_1[2 * k_25 + 1];
+                                for (int k_26 = 0; k_26 < 16; k_26++) {
+                                    h_1[2 * k_26] = h_1[2 * k_26] + s_b_1[2 * k_26];
+                                    h_1[2 * k_26 + 1] = h_1[2 * k_26 + 1] + s_b_1[2 * k_26 + 1];
                                 }
                                 if (current_b_1 < last_1) {
                                     unsigned int h_bf16_0_3[16];
@@ -3072,19 +3271,28 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                                         h_bf16_0_3[_lp] = *(uint32_t*)&_bf2;
                                     }
                                     #pragma unroll
-                                    for (int i_5 = 0; i_5 < 16; i_5++) {
-                                        unsigned int sent_5 = h_bf16_0_3[i_5] >> h_half_shift_1 & 65535;
-                                        unsigned int _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, sent_5, 1);
-                                        h_words[((current_b_1 + 1) * nheads + head_8_2) * 4096 + pair_base_1 + i_5 * 128] = h_bf16_0_3[i_5] & h_mask_mine_1 | _shfl_xor_2 << h_half_shift_1;
+                                    for (int i_6 = 0; i_6 < 16; i_6++) {
+                                        unsigned int sent_5 = h_bf16_0_3[i_6] >> h_half_shift_1 & 65535;
+                                        unsigned int _shfl_xor_sync_34_1 = __shfl_xor_sync(0xFFFFFFFF, sent_5, 1);
+                                        h_words[((current_b_1 + 1) * nheads + head_8_2) * 4096 + pair_base_1 + i_6 * 128] = h_bf16_0_3[i_6] & h_mask_mine_1 | _shfl_xor_sync_34_1 << h_half_shift_1;
                                     }
                                 }
                                 if (checkpoint_state_count > 0) {
                                     int cur_physical_3 = 0;
                                     int cur_limit_3 = 128;
-                                    cur_physical_3 = current_b_1 - sequence_7_2 * nchunks;
+                                    cur_physical_3 = chunk_indices[current_b_1];
+                                    if (current_b_1 + 1 < num_logical_chunks) {
+                                        int cur_next_3 = chunk_indices[current_b_1 + 1];
+                                        if (cur_next_3 == cur_physical_3) {
+                                            cur_limit_3 = chunk_offsets[current_b_1 + 1];
+                                        }
+                                    }
                                     int cur_tokens_3 = seqlen - cur_physical_3 * 128;
                                     if (cur_tokens_3 > 128) {
                                         cur_tokens_3 = 128;
+                                    }
+                                    if (cur_limit_3 > cur_tokens_3) {
+                                        cur_limit_3 = cur_tokens_3;
                                     }
                                     int segment_end_3 = cur_physical_3 * 128 + cur_limit_3;
                                     if (segment_end_3 > seqlen) {
@@ -3095,29 +3303,39 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                                         if (checkpoint_slot_3 >= 0 && checkpoint_slot_3 < checkpoint_state_count) {
                                             int checkpoint_head_base_3 = (checkpoint_slot_3 * nheads + head_8_2) * 8192;
                                             #pragma unroll
-                                            for (int k_26 = 0; k_26 < 32; k_26++) {
-                                                checkpoint_states[checkpoint_head_base_3 + elem_base_1 + k_26 * 128] = h_1[k_26];
+                                            for (int k_27 = 0; k_27 < 32; k_27++) {
+                                                checkpoint_states[checkpoint_head_base_3 + elem_base_1 + k_27 * 128] = h_1[k_27];
                                             }
                                         }
                                     }
                                 }
-                                int _min_5 = ((c_3 + 3) < (last_1) ? (c_3 + 3) : (last_1));
-                                int look_b_1 = _min_5;
+                                int look_b_1 = ((c_3 + 3) < (last_1) ? (c_3 + 3) : (last_1));
                                 int look_tile_1_3 = look_b_1 * nheads + head_8_2;
                                 int look_physical_2_3 = 0;
                                 int look_offset_3_3 = 0;
                                 int look_limit_4_3 = 128;
-                                look_physical_2_3 = look_b_1 - sequence_7_2 * nchunks;
+                                look_physical_2_3 = chunk_indices[look_b_1];
+                                look_offset_3_3 = chunk_offsets[look_b_1];
+                                if (look_b_1 + 1 < num_logical_chunks) {
+                                    int look_next_15 = chunk_indices[look_b_1 + 1];
+                                    if (look_next_15 == look_physical_2_3) {
+                                        look_limit_4_3 = chunk_offsets[look_b_1 + 1];
+                                    }
+                                }
                                 int look_tokens_5_3 = seqlen - look_physical_2_3 * 128;
                                 if (look_tokens_5_3 > 128) {
                                     look_tokens_5_3 = 128;
                                 }
                                 int source_token_6_3 = look_tokens_5_3 - 1;
+                                if (look_limit_4_3 > look_tokens_5_3) {
+                                    look_limit_4_3 = look_tokens_5_3;
+                                }
+                                source_token_6_3 = look_limit_4_3 - 1 - look_offset_3_3;
                                 float last_cumsum_7_3 = cumsum_precomputed[look_tile_1_3 * 128 + source_token_6_3];
                                 lc_ring_1[1] = last_cumsum_7_3;
                                 float segment_base_8_3 = 0.0f;
-                                float _exp2_12 = approx_exp2((last_cumsum_7_3 - segment_base_8_3) * 1.4426950408889634f);
-                                d_ring_1[1] = _exp2_12;
+                                float _exp2_35_1 = approx_exp2((last_cumsum_7_3 - segment_base_8_3) * 1.442695f);
+                                d_ring_1[1] = _exp2_35_1;
                                 int look_t_9_3 = look_b_1 + s_t_off_1;
                                 if (look_t_9_3 >= s_resident_from_1) {
                                     asm volatile(
@@ -3128,13 +3346,13 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                                     asm volatile("tcgen05.wait::ld.sync.aligned;");
                                 } else {
                                     #pragma unroll
-                                    for (int q_15 = 0; q_15 < 8; q_15++) {
+                                    for (int q_30 = 0; q_30 < 8; q_30++) {
                                         {
-                                            float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_1_3 * 8192 + s_work_row_1 + 4 * q_15);
-                                            s_b_1[4 * q_15 + 0] = _v4.x;
-                                            s_b_1[4 * q_15 + 1] = _v4.y;
-                                            s_b_1[4 * q_15 + 2] = _v4.z;
-                                            s_b_1[4 * q_15 + 3] = _v4.w;
+                                            float4 _v4 = *reinterpret_cast<const float4*>(s_work + look_tile_1_3 * 8192 + s_work_row_1 + 4 * q_30);
+                                            s_b_1[4 * q_30 + 0] = _v4.x;
+                                            s_b_1[4 * q_30 + 1] = _v4.y;
+                                            s_b_1[4 * q_30 + 2] = _v4.z;
+                                            s_b_1[4 * q_30 + 3] = _v4.w;
                                         }
                                     }
                                 }
@@ -3143,8 +3361,8 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         if (first_10 + seg_len_10 == item_end_1) {
                             if (write_final_states != 0) {
                                 #pragma unroll
-                                for (int k_27 = 0; k_27 < 32; k_27++) {
-                                    final_states[state_head_base_1 + elem_base_1 + k_27 * 128] = h_1[k_27];
+                                for (int k_28 = 0; k_28 < 32; k_28++) {
+                                    final_states[state_head_base_1 + elem_base_1 + k_28 * 128] = h_1[k_28];
                                 }
                             }
                         }
@@ -3153,6 +3371,27 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                 }
                 __threadfence();
                 asm volatile("fence.proxy.async;" ::: "memory");
+                if (write_final_states != 0) {
+                    int items_1 = sequence_count * nheads;
+                    int sweep_count_1 = (items_1 - ticket_5 + vcount_eff_5 - 1) / vcount_eff_5;
+                    #pragma unroll 1
+                    for (int i_7 = 0; i_7 < sweep_count_1; i_7++) {
+                        int item_1 = ticket_5 + i_7 * vcount_eff_5;
+                        int e_sequence_1 = item_1 / nheads;
+                        int e_n_1 = seq_chunk_cumsum[e_sequence_1 + 1] - seq_chunk_cumsum[e_sequence_1];
+                        if (e_n_1 == 0) {
+                            int e_base_1 = item_1 * 8192;
+                            #pragma unroll
+                            for (int k_29 = 0; k_29 < 32; k_29++) {
+                                float e_value_1 = 0.0f;
+                                if (has_initial != 0) {
+                                    e_value_1 = (float)initial_states[e_base_1 + elem_base_1 + k_29 * 128];
+                                }
+                                final_states[e_base_1 + elem_base_1 + k_29 * 128] = e_value_1;
+                            }
+                        }
+                    }
+                }
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 asm volatile("barrier.sync 11, 512;" ::: "memory");
                 int xc_3 = a_b_5;
@@ -3161,8 +3400,14 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                     int sequence_11 = 0;
                     int s_base_11 = 0;
                     int n_item_12 = nchunks;
-                    sequence_11 = xc_3 / (nchunks * nheads);
-                    s_base_11 = sequence_11 * nchunks;
+                    #pragma unroll 1
+                    for (int q_31 = 0; q_31 < sequence_count; q_31++) {
+                        if (xc_3 >= seq_chunk_cumsum[q_31 + 1] * nheads) {
+                            sequence_11 = q_31 + 1;
+                        }
+                    }
+                    s_base_11 = seq_chunk_cumsum[sequence_11];
+                    n_item_12 = seq_chunk_cumsum[sequence_11 + 1] - s_base_11;
                     int rem_11 = xc_3 - s_base_11 * nheads;
                     int head_11 = rem_11 / n_item_12;
                     int chunk_11 = rem_11 - head_11 * n_item_12;
@@ -3189,11 +3434,20 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         int physical_chunk_6 = 0;
                         int segment_offset_4 = 0;
                         int segment_limit_4 = 128;
-                        int sequence_0_4 = logical_9 / nchunks;
-                        physical_chunk_6 = logical_9 - sequence_0_4 * nchunks;
+                        physical_chunk_6 = chunk_indices[logical_9];
+                        segment_offset_4 = chunk_offsets[logical_9];
+                        if (logical_9 + 1 < num_logical_chunks) {
+                            int next_chunk_4 = chunk_indices[logical_9 + 1];
+                            if (next_chunk_4 == physical_chunk_6) {
+                                segment_limit_4 = chunk_offsets[logical_9 + 1];
+                            }
+                        }
                         int chunk_tokens_4 = seqlen - physical_chunk_6 * 128;
                         if (chunk_tokens_4 > 128) {
                             chunk_tokens_4 = 128;
+                        }
+                        if (segment_limit_4 > chunk_tokens_4) {
+                            segment_limit_4 = chunk_tokens_4;
                         }
                         mbarrier_wait(cb_full_addr + (acc_stage_1) * 8, _phase_cb_full);
                         mbarrier_wait(aux3_full_addr + (stage3_4) * 8, _phase_aux3_full);
@@ -3232,8 +3486,7 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                                 int col_2 = col_chunk * 32 + local_col;
                                 float q_value = 0.0f;
                                 if (row >= segment_offset_4 && row < segment_limit_4 && col_2 >= segment_offset_4 && col_2 <= row) {
-                                    float _exp2_13 = approx_exp2((row_cumsum - cumsum_values[local_col]) * 1.4426950408889634f);
-                                    float decay = _exp2_13;
+                                    float decay = approx_exp2((row_cumsum - cumsum_values[local_col]) * 1.442695f);
                                     q_value = decay * delta_values[local_col];
                                     q_value *= _tmem_load_1[local_col];
                                 }
@@ -3281,7 +3534,7 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
             int row_tmem_base_1 = warp % 4 * 32 << 16;
             int taddr_0_2 = taddr;
             int tot_6[1];
-            tot_6[0] = sequence_count * nchunks * nheads;
+            tot_6[0] = seq_chunk_cumsum[sequence_count] * nheads;
             int veff_6[1];
             int total_6 = tot_6[0];
             int g_6 = 1;
@@ -3298,7 +3551,6 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
             unsigned int _phase_intra_full_0 = 0;
             unsigned int _phase_inter_full_0 = 0;
             unsigned int _phase_aux3_full_1 = 0;
-            unsigned int _phase_x3_full_1 = 0;
             while (1) {
                 asm volatile("barrier.sync 11, 512;" ::: "memory");
                 unsigned int ticket_u_6 = ctrl[0];
@@ -3324,8 +3576,14 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                     int sequence_12 = 0;
                     int s_base_12 = 0;
                     int n_item_13 = nchunks;
-                    sequence_12 = xa_6 / (nchunks * nheads);
-                    s_base_12 = sequence_12 * nchunks;
+                    #pragma unroll 1
+                    for (int q_32 = 0; q_32 < sequence_count; q_32++) {
+                        if (xa_6 >= seq_chunk_cumsum[q_32 + 1] * nheads) {
+                            sequence_12 = q_32 + 1;
+                        }
+                    }
+                    s_base_12 = seq_chunk_cumsum[sequence_12];
+                    n_item_13 = seq_chunk_cumsum[sequence_12 + 1] - s_base_12;
                     int rem_12 = xa_6 - s_base_12 * nheads;
                     int head_12 = rem_12 / n_item_13;
                     int chunk_12 = rem_12 - head_12 * n_item_13;
@@ -3357,26 +3615,39 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         int physical_batch_4 = 0;
                         int segment_offset_5 = 0;
                         int segment_limit_5 = 128;
-                        physical_batch_4 = logical_10 / nchunks;
-                        physical_chunk_7 = logical_10 - physical_batch_4 * nchunks;
+                        physical_chunk_7 = chunk_indices[logical_10];
+                        segment_offset_5 = chunk_offsets[logical_10];
+                        if (logical_10 + 1 < num_logical_chunks) {
+                            int next_chunk_5 = chunk_indices[logical_10 + 1];
+                            if (next_chunk_5 == physical_chunk_7) {
+                                segment_limit_5 = chunk_offsets[logical_10 + 1];
+                            }
+                        }
                         int chunk_tokens_5 = seqlen - physical_chunk_7 * 128;
                         if (chunk_tokens_5 > 128) {
                             chunk_tokens_5 = 128;
+                        }
+                        if (segment_limit_5 > chunk_tokens_5) {
+                            segment_limit_5 = chunk_tokens_5;
                         }
                         mbarrier_wait(intra_full_addr, _phase_intra_full_0);
                         _phase_intra_full_0 ^= 1;
                         mbarrier_wait(inter_full_addr, _phase_inter_full_0);
                         _phase_inter_full_0 ^= 1;
                         mbarrier_wait(aux3_full_addr + (stage3_5) * 8, _phase_aux3_full_1);
-                        mbarrier_wait(x3_full_addr + (stage3_5) * 8, _phase_x3_full_1);
+                        mbarrier_wait(x3_full_addr + (stage3_5) * 8, _phase_aux3_full_1);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         float segment_base_5 = 0.0f;
                         if (segment_offset_5 > 0) {
                             segment_base_5 = smem_cumsum_all[stage3_5 * 128 + (unsigned int)(segment_offset_5 - 1)];
                         }
                         int full_chunk = 1;
+                        full_chunk = 0;
+                        if (segment_offset_5 == 0 && segment_limit_5 == chunk_tokens_5) {
+                            full_chunk = 1;
+                        }
                         if (full_chunk != 0 && output_issued >= 2) {
-                            int warp_id_in_role = (warp - 12);
+                            int warp_id_in_role = warp - 12;
                             if (warp_id_in_role == 0) {
                                 asm volatile("cp.async.bulk.wait_group.read 1;");
                             }
@@ -3412,8 +3683,7 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                             if (row_1 >= segment_offset_5 && row_1 < segment_limit_5) {
                                 int token_in_batch_4 = physical_chunk_7 * 128 + row_1;
                                 int token = physical_batch_4 * seqlen + token_in_batch_4;
-                                float _exp2_27 = approx_exp2((smem_cumsum_all[stage3_5 * 128 + (unsigned int)row_1] - segment_base_5) * 1.4426950408889634f);
-                                float decay_1 = _exp2_27;
+                                float decay_1 = approx_exp2((smem_cumsum_all[stage3_5 * 128 + (unsigned int)row_1] - segment_base_5) * 1.442695f);
                                 int z_token = token;
                                 if (row_1 >= chunk_tokens_5) {
                                     z_token = physical_batch_4 * seqlen + physical_chunk_7 * 128 + chunk_tokens_5 - 1;
@@ -3473,9 +3743,9 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                                         #pragma unroll
                                         for (int group_dim_1 = 0; group_dim_1 < 8; group_dim_1++) {
                                             float z_value = z_scale[group_dim_1];
-                                            float _expf_0 = __expf(-z_value);
-                                            float _rcp_0 = approx_rcp(1.0f + _expf_0);
-                                            z_scale[group_dim_1] = z_value * _rcp_0;
+                                            float _exp_3 = __expf(-z_value);
+                                            float _rcp_2 = approx_rcp(1.0f + _exp_3);
+                                            z_scale[group_dim_1] = z_value * _rcp_2;
                                         }
                                     } else {
                                         #pragma unroll
@@ -3487,13 +3757,11 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                                     #pragma unroll
                                     for (int group_dim_3 = 0; group_dim_3 < 8; group_dim_3++) {
                                         int local_dim = local_group * 8 + group_dim_3;
-                                        float _fma_0 = __fmaf_rn(_tmem_load_4[local_dim], decay_1, _tmem_load_3[local_dim]);
-                                        float value = _fma_0;
+                                        float value = __fmaf_rn(_tmem_load_4[local_dim], decay_1, _tmem_load_3[local_dim]);
                                         float x_value = _unpack_bf16_0[group_dim_3];
                                         float d_value = d_values[group_dim_3];
                                         if (D_mode != 0) {
-                                            float _fma_1 = __fmaf_rn(x_value, d_value, value);
-                                            value = _fma_1;
+                                            value = __fmaf_rn(x_value, d_value, value);
                                         }
                                         float z_mul = z_scale[group_dim_3];
                                         value = value * z_mul;
@@ -3521,7 +3789,7 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                         if (full_chunk != 0) {
                             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                             asm volatile("barrier.sync 10, 128;" ::: "memory");
-                            int warp_id_in_role_1 = (warp - 12);
+                            int warp_id_in_role_1 = warp - 12;
                             if (warp_id_in_role_1 == 0) {
                                 if (elect_sync()) {
                                     tma_store_4d((&out_map), 0, head_0_10, physical_chunk_7 * 128, physical_batch_4, smem_y_addr + output_stage * 16384);
@@ -3539,12 +3807,12 @@ kernel_mamba_ssd_chunk_parallel_v3_bf16_batched(const __grid_constant__ CUtensor
                             }
                         }
                         stage3_5 += 1;
-                        if (stage3_5 == 2) { stage3_5 = 0; _phase_aux3_full_1 ^= 1; _phase_x3_full_1 ^= 1; }
+                        if (stage3_5 == 2) { stage3_5 = 0; _phase_aux3_full_1 ^= 1; }
                     }
                     xa_6 = xa_6 + seg_len_12;
                 }
             }
-            int warp_id_in_role_2 = (warp - 12);
+            int warp_id_in_role_2 = warp - 12;
             if (warp_id_in_role_2 == 0) {
                 asm volatile("cp.async.bulk.wait_group.read 0;");
             }
