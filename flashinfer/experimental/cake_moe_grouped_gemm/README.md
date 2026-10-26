@@ -110,6 +110,12 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
 - Grid: one 2-CTA cluster per SM pair, capped by the tile count
   (`persistent_grid`); for `fwd` / `dgrad` the tile count bound lets every
   group add one partial 256-row tile (`max_cluster_tiles_upper_bound`).
+- `fwd` / `dgrad` output tile (`fwd_dgrad_tile_n`): 512 columns
+  (`wide_block_n`) when the output columns (`N` for `fwd`, `K` for `dgrad`)
+  are a multiple of 512 and the architecture is listed in `wide_archs`, 256
+  (`block_n`) otherwise. The 512-column programs are the routes' `main_wide`
+  stage; every output element accumulates its k steps in the same order in
+  both tiles, so both give the same bits.
 - `fwd` / `dgrad` tile order on `sm_100a` / `sm_103a`: the column tiles of
   every 256-row block are split between two claim queues, one per locality
   domain of the device, in proportion to the clusters that claim each queue
@@ -131,10 +137,17 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
   runs. The tile raster inside a group follows the per-wave operand footprint
   (`wgrad_raster_rows`).
 - Weight-gradient wave sync: when `K` reaches `wave_sync_min_k` (the
-  gate-up-shaped rows) and the route has a `main_wave` stage on the
-  architecture (`sm_100a`, `sm_103a`), the main kernel is the wave-synchronized
+  gate-up-shaped rows), the architecture is listed in `wave_sync_archs` and the
+  route has a `main_wave` stage on it, the main kernel is the wave-synchronized
   build, launched with `wave_mode = wave_sync_mode`; otherwise the plain build
   (`wave_mode = 0`). Both builds give the same output bits for a given route.
+- Weight-gradient accumulator release: with the 512-wide k tile on the
+  architectures listed in `k512_release_archs`, the main kernel is the build
+  that hands the tensor-memory accumulator to the epilogue in two halves
+  (stage `main_halves`, or `main_wave_halves` for the wave-synchronized build),
+  so the next tile's MMAs start on the first half while the epilogue drains the
+  second. Its output is bitwise that of the build that drains the whole
+  accumulator at once.
 - Workspaces (allocated at preparation, retained by the launch object): the
   per-CTA TMA descriptor slots of the weight gradient (a ring of nine
   descriptor pairs per CTA: a group switch edits the next pair and warms the
@@ -155,34 +168,46 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
   one.
 
 `GroupedGemmLaunch.plan` exposes `grid`, `tile_k`, `tail_splits`,
-`raster_rows`, `launches` and, for `fwd` / `dgrad`, `clusters`, `c0` and `c1`,
-for `wgrad` `wave_mode`, for inspection and tests; `GroupedGemmLaunch.stages`
+`raster_rows`, `launches` and, for `fwd` / `dgrad`, `tile_n`, `clusters`, `c0`
+and `c1`, for `wgrad` `wave_mode`, for inspection and tests; `GroupedGemmLaunch.stages`
 names the bound stages in launch order.
 
 ## Build targets and layout
 
 The programs are exact-architecture tcgen05 payloads built for the exact
 targets `sm_100a`, `sm_103a` and `sm_107a` (`build.json` `arch_flags`).
-`cake_jit.PROGRAMS` lists nine libraries, one per kernel and build, each a
+`cake_jit.PROGRAMS` lists sixteen libraries, one per kernel and build, each a
 kernel and a host-binding translation unit under `csrc/cake_moe_grouped_gemm/`
 shared by the architectures it is built for (an architecture-dependent line is
 folded under `__CUDA_ARCH__`):
 
-- `fwd` and `dgrad` in two builds each: the domain-scheduled build for
-  `sm_100a` and `sm_103a`, and the static-schedule build for `sm_107a`. A
-  route spells both as two `main` stages on disjoint architectures, and
+- `fwd` and `dgrad` in four builds each: the domain-scheduled build for
+  `sm_100a` and `sm_103a` and the static-schedule build for `sm_107a`, each
+  with the 256-column output tile (the routes' `main` stage) and with the
+  512-column one (`main_wide`). A route spells the two builds of a stage as
+  two stages of one name on disjoint architectures, and
   `cake_jit.stage_binding(name, stage, arch)` returns the one built for the
   architecture.
 - the wave-synchronized weight-gradient main kernel with a 256- or 512-wide
-  k tile, for `sm_100a` and `sm_103a` (the routes' `main_wave` stage).
+  k tile, for `sm_100a`, `sm_103a` and `sm_107a` (the routes' `main_wave`
+  stage).
+- the 512-wide k tile's main kernel and wave-synchronized main kernel that
+  release the accumulator in two halves, for `sm_100a` and `sm_103a`
+  (`main_halves`, `main_wave_halves`).
+- the 512-wide k tile's main kernel for `sm_107a`, a second `main` stage
+  beside the one built for `sm_100a` and `sm_103a`.
 - the weight-gradient main kernel with a 256- or 512-wide k tile and the
   weight-gradient tail-reduce, as the previous delivery shipped them.
 
+The host launches a stage only where the constants above list the
+architecture, so a library may be built for an architecture its stage is not
+launched on.
+
 A specialization is a compile-line definition on its `build.json` entries:
 the tail-reduce k tile (`-DWGRAD_TILE=256|512`) and the fp32 weight-gradient
-output (`-DWGRAD_OUT=32` on the previous kernels, `-DCAKE_WGRAD_OUT=32` on the
-wave-synchronized ones; the bf16 output is the default). `cake_jit.ROUTES`
-maps each public route (operation, output dtype, k tile) to its stage programs
+output (`-DWGRAD_OUT=32` on the kernels of the last list item,
+`-DCAKE_WGRAD_OUT=32` on the other weight-gradient kernels; the bf16 output is
+the default). `cake_jit.ROUTES` maps each public route (operation, output dtype, k tile) to its stage programs
 and specializations. `build.json` (schema `cake-build/1`, written by the
 export) is the only record of what to compile: one entry per build
 `<library>[<specialization tag>]_<arch>` -- the tag is `_wgrad_tile256` /
@@ -199,9 +224,13 @@ and the closure digest; FlashInfer's build-target rules --
 only). The bindings include the package's `csrc/cake_ffi_checks.h`, no
 FlashInfer header.
 
-The domain-scheduled, static-schedule and wave-synchronized translation units
-are self-contained. The previous weight-gradient and tail-reduce kernels share
-one device header, `cake_moe_grouped_gemm_device.cuh` (their common preamble:
+The kernel translation units of the first four list items are
+self-contained. Programs whose bindings differ only in the kernel they launch,
+its block size and its dynamic shared memory share one binding, which a
+member's entries compile under `-DCAKE_KERNEL_SYMBOL`, `-DCAKE_PROGRAM_SHIM`
+and, where they differ from the owner's, `-DCAKE_BINDING_THREADS` /
+`-DCAKE_BINDING_SMEM`. The previous weight-gradient and tail-reduce kernels
+share one device header, `cake_moe_grouped_gemm_device.cuh` (their common preamble:
 typedefs, tensor-map ABI, math constants and the tcgen05 helpers behind
 need-guards), and their bindings share the dynamic shared-memory opt-in and
 TMA descriptor encoders through the fragment headers

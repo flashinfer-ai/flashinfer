@@ -46,12 +46,21 @@ from . import cake_build
 # for fp32, from the route's output dtype instead of carrying one source per
 # output dtype).  A stage serves the architectures its program is built for
 # among the route's: a route may name two stages of one name whose programs
-# serve disjoint architectures (the forward and data-gradient ``main`` stages:
-# the domain-scheduled program on sm_100a / sm_103a, the static program on
-# sm_107a), so a stage is looked up per architecture (``stage_binding``).  The
+# serve disjoint architectures (the forward and data-gradient ``main`` and
+# ``main_wide`` stages: the domain-scheduled program on sm_100a / sm_103a, the
+# static program on sm_107a; the 512-wide k tile's weight-gradient ``main``
+# stage: one build on sm_100a / sm_103a, another on sm_107a), so a stage is
+# looked up per architecture (``stage_binding``).  The
+# host chooses among the stages a route serves by ``HOST_PLAN_CONSTANTS``:
+# the forward and data-gradient ``main_wide`` stage is the program with the
+# 512-column output tile (``wide_block_n``), launched on the architectures of
+# ``wide_archs`` when the output columns are a multiple of it; the
 # weight-gradient ``main_wave`` stage is the main program with wave
-# synchronisation, which the host selects by ``HOST_PLAN_CONSTANTS``
-# (``wave_sync_min_k``) where the route serves it.
+# synchronisation, launched from ``wave_sync_min_k`` on the architectures of
+# ``wave_sync_archs``; the 512-wide k tile's ``main_halves`` and
+# ``main_wave_halves`` stages are the twins of ``main`` and ``main_wave`` that
+# release the accumulator in two halves, launched on the architectures of
+# ``k512_release_archs``.
 PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_moe_grouped_gemm_0669888e0651eb5ac046": {
         "library": "cake_moe_grouped_gemm_0669888e0651eb5ac046",
@@ -611,6 +620,8 @@ ROUTES: dict[str, dict[str, Any]] = {
 }
 HOST_PLAN_CONSTANTS: dict[str, Any] = {
     "block_n": 256,
+    "wide_block_n": 512,
+    "wide_archs": ["sm_100a", "sm_103a"],
     "block_k": 64,
     "cta_group": 2,
     "cluster_m": 256,
@@ -618,8 +629,10 @@ HOST_PLAN_CONSTANTS: dict[str, Any] = {
     "tmap_slot_bytes": 128,
     "tmap_slots_per_cta": 18,
     "k512_archs": ["sm_100a", "sm_103a"],
+    "k512_release_archs": ["sm_100a", "sm_103a"],
     "k512_min_rows_per_group": 8192,
     "wave_sync_min_k": 4096,
+    "wave_sync_archs": ["sm_100a", "sm_103a"],
     "wave_sync_mode": 2,
     "wave_sync_words": 2,
     "sched_words": 4224,
