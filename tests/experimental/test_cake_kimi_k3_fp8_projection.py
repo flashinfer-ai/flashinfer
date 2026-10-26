@@ -899,8 +899,9 @@ def test_decode_config_round6_continuation_rules(arch):
     # ``tstore`` on the 24,2,512 cell of both architectures (27 / 29); see the Cake design record, round 8 (R8-14 and
     # the pass records).  Round 9 (K2, rule-5 packets): the sm_103a 5,28,512 cell moved to a 3-CTA cluster split-K route,
     # which has no TMA-store epilogue, so its ``tstore`` flag is 0 (27 / 28).  Round 10 (S1): the sm_103a 5,28,2048 cell
-    # moved to the cluster split-K GEMM route (``gemm_cs`` 2), leaving the decode table (27 / 27).
-    assert n_tstore == {"sm_100a": 27, "sm_103a": 27}[arch]
+    # moved to the cluster split-K GEMM route (``gemm_cs`` 2), leaving the decode table (27 / 27).  Round 12: the sm_100a
+    # 18,6,2048 cell (tp8:q_b:2048) left the GEMM route for the persistent decode with the TMA-store epilogue (28 / 27).
+    assert n_tstore == {"sm_100a": 28, "sm_103a": 27}[arch]
     # Round-6 next loop (lever PX-S): eight small fused buckets per architecture prefetch their BF16 token tile one stage
     # ahead of its TMA load (``pfx: 1`` -> the ``_px1`` program); a prefetch changes no data path and no launch argument.
     n_pfx = 0
@@ -1098,7 +1099,9 @@ def test_decode_config_round6_continuation_rules(arch):
     # Round 11 C17 (CAKE-985 T3, Tier A'): the sm_100a 56,48,1024 cell (tp1:o_proj:1024) carries ``gemm_bn`` 192 next to its
     # ``gemm_bk`` 128 + ``gemm_skf`` 1 (B200 node alone, R8-3 step cb326b20 on tree 5d76afd2: quiet 1.0651, shared 1.0675 / 1.0675,
     # controls in band; rule-5 refined 5(a) packet PASS step acc7795e), program ``gemm_tstore_n192_k128_skf`` -- the program the
-    # 5,28,16384 cell launches on both GPUs, so no new instance.
+    # 5,28,16384 cell launches on both GPUs, so no new instance.  Round 12: the sm_103a 48,28,1024 cell (tp8:fused_qkvg:1024)
+    # left the 384-wide tile for ``gemm_bn`` 192 + ``gemm_bk`` 128 + ``gemm_pf`` 1 (bit-exact; 1.0375 against the 384-wide record
+    # on GB300), the ``gemm_tstore_n192_k128_pf1`` program the sm_103a plan already holds, so no new instance.
     assert (
         n192
         == n192_common
@@ -1106,6 +1109,7 @@ def test_decode_config_round6_continuation_rules(arch):
             "sm_100a": {"48,28,1024", "56,48,1024"},
             "sm_103a": {
                 "24,2,4096",
+                "48,28,1024",
                 "5,28,2048",
                 "50,28,4096",
                 "56,48,512",
@@ -1127,7 +1131,7 @@ def test_decode_config_round6_continuation_rules(arch):
         n384
         == {
             "sm_100a": {"96,28,512", "384,28,16384", "386,28,16384"},
-            "sm_103a": {"96,28,512", "48,28,1024", "96,28,16384", "56,48,16384"},
+            "sm_103a": {"96,28,512", "96,28,16384", "56,48,16384"},
         }[arch]
     )
     for key in sorted(n384):
@@ -1344,7 +1348,8 @@ def test_decode_config_round6_continuation_rules(arch):
         "gemm_tstore_k128_gs" in required
     )  # C20: both GPUs (sm_103a through 18,6,2048)
     # C20 pins: both cells are 128-K without prefetch on sm_103a; sm_100a keeps 12,1,2048 on gemm_bk 128 + gemm_static 1 (no prefetch) and
-    # 18,6,2048 on the record defaults (256-K, no prefetch)
+    # 18,6,2048 on the record defaults (256-K, no prefetch; since round 12 the cell takes the decode route there, so these GEMM
+    # tile rules serve its untabulated neighbours alone)
     assert (
         cb.gemm_prefetch_distance(2048, 12, 1, arch) == 0
         and cb.gemm_block_k(2048, 12, 1, arch) == 128
