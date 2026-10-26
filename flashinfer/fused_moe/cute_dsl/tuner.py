@@ -409,10 +409,18 @@ def _extract_tactic_params(tactic: Tuple) -> Dict[str, Any]:
             "gemm2_raster_along_m": gemm2_raster_along_m,
             "gemm2_mma_tiler": gemm2_mma_tiler,
             "gemm2_mma_inst_shape": gemm2_mma_inst_shape,
+            "gemm2_epilogue": None,
         }
     else:
         gemm1_mma_tiler_mn, gemm1_cluster_shape_mn, gemm1_raster_along_m = gemm1_tactic
-        gemm2_mma_tiler_mn, gemm2_cluster_shape_mn, gemm2_raster_along_m = gemm2_tactic
+        # An optional 4th element selects the GEMM2 store-warp epilogue:
+        # (num_c_stage, num_store_warps, swizzle_size).
+        (
+            gemm2_mma_tiler_mn,
+            gemm2_cluster_shape_mn,
+            gemm2_raster_along_m,
+            *gemm2_extra,
+        ) = gemm2_tactic
         return {
             "tile_size": tile_size,
             "is_rubin": False,
@@ -426,6 +434,7 @@ def _extract_tactic_params(tactic: Tuple) -> Dict[str, Any]:
             "gemm2_raster_along_m": gemm2_raster_along_m,
             "gemm2_mma_tiler": None,
             "gemm2_mma_inst_shape": None,
+            "gemm2_epilogue": tuple(gemm2_extra[0]) if gemm2_extra else None,
         }
 
 
@@ -953,7 +962,7 @@ class CuteDslFusedMoERunner(TunableRunner):
                 )
 
                 gemm1_mma_tiler_mn, gemm1_cluster_shape_mn, _ = gemm1_tactic
-                gemm2_mma_tiler_mn, gemm2_cluster_shape_mn, _ = gemm2_tactic
+                gemm2_mma_tiler_mn, gemm2_cluster_shape_mn = gemm2_tactic[:2]
 
                 gemm1_ok = BlockScaledContiguousGatherGroupedGemmKernel.can_implement(
                     a_dtype=a_dtype,
@@ -1107,6 +1116,13 @@ class CuteDslFusedMoERunner(TunableRunner):
                 localized_memset_stream=self.localized_memset_stream,
                 sm_count=self.localized_sm_count,
                 localized_options=self.localized_options,
+            )
+        if params["gemm2_epilogue"] is not None:
+            # Only forwarded when requested, so forward_impls without these
+            # parameters keep working with the plain 3-element tactics.
+            kwargs.update(
+                gemm2_raster_along_m=params["gemm2_raster_along_m"],
+                gemm2_epilogue=params["gemm2_epilogue"],
             )
 
         if self.routing_weights_before_fc2:
