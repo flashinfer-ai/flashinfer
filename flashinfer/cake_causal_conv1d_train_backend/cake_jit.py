@@ -73,7 +73,9 @@ of it with ``dtype_flags`` (the ``dw`` store form), ``bias`` (the fifth, dbias,
 slab and ``db``) and ``fp64`` (the ``_fp32g`` routes' FP64 sums).
 
 The host plan is the three functions :func:`plan` (the kernel scalars, with
-the channel tile rule :func:`channel_split`), :func:`launch_grid` (the grid:
+the channel tile rule :func:`channel_split` of the record's role: the forward
+and the backward rules differ where no multiple of 32 divides the channel
+vectors), :func:`launch_grid` (the grid:
 ``co_resident`` records launch ``ctas_per_sm x SM count`` CTAs, ``occupancy``
 records ``grid_mult x ctas_per_sm x SM count``, ``channels_per_cta`` records
 ``ceil(C / channels_per_cta)``) and :func:`partial_rows` (the backward
@@ -2469,35 +2471,57 @@ def _ceil_div(numerator: int, denominator: int) -> int:
     return -(-int(numerator) // int(denominator))
 
 
+# The roles whose programs plan their channel tiles with :func:`channel_split`
+# (a reduce program runs on its backward record's plan): each has its own rule.
+SPLIT_ROLES = ("fwd", "bwd")
+
+
 def channel_split(
-    C: int, *, geometry: dict[str, int], legacy: bool = False
+    C: int,
+    *,
+    geometry: dict[str, int],
+    role: str | None = None,
+    legacy: bool = False,
 ) -> tuple[int, int, int]:
-    """``(ct_vec, n_sub, n_ch_tiles)`` of ``C`` channels under a record's build geometry.
+    """``(ct_vec, n_sub, n_ch_tiles)`` of ``C`` channels under a record's build geometry and role.
 
     ``ct_vec`` channel vectors per channel tile (one thread each), ``n_sub =
     threads // ct_vec`` token sub-tiles per CTA and ``n_ch_tiles = ceil(C / vec
-    / ct_vec)`` channel tiles.  With ``cv = C / vec`` channel vectors: ``ct_vec
-    = cv`` when ``cv <= threads``; above that, the multiple of 32 dividing
-    ``cv`` (at most ``threads``) with the highest lane use ``ct_vec x (threads
-    // ct_vec)``, the larger ``ct_vec`` on a tie, and ``threads`` when no
-    multiple of 32 divides ``cv``.  So C = 1280 (160 vectors) runs five
-    32-vector tiles with four token sub-tiles each, (32, 4, 5), and C = 1536
-    (64, 2, 3) -- every lane busy -- instead of two 128-vector tiles at 62 % /
-    75 % lane use; C <= 1024 and 2048 / 4096 / 8192 are unchanged; C = 1344
-    (168 vectors, no divisor) keeps the legacy form (128, 1, 2).  The per
-    element arithmetic does not depend on the tiling, so ``y`` and ``dx`` are
-    bitwise the legacy plan's; ``dweight``'s fixed summation order follows the
-    tiling, so its bits differ from the legacy plan's (both are reproducible).
-    ``legacy=True`` is the rule the package shipped before round 6, ``ct_vec =
-    min(cv, threads)``; the KCP path keeps it (its kernels pick the grouped
-    path from ``ct_vec`` on the device and are measured under this rule).
-    This function is one of four copies kept in sync (the two tart kernel
-    modules, the kernel-tests reference and this one).
+    / ct_vec)`` channel tiles.  ``role`` is the record's, ``"fwd"`` or
+    ``"bwd"`` (a ``ValueError`` without one unless ``legacy``): the two rules
+    agree except in the fallback below.  With ``cv = C / vec`` channel
+    vectors: ``ct_vec = cv`` when ``cv <= threads``; above that, the multiple
+    of 32 dividing ``cv`` (at most ``threads``) with the highest lane use
+    ``ct_vec x (threads // ct_vec)``, the larger ``ct_vec`` on a tie.  So C =
+    1280 (160 vectors) runs five 32-vector tiles with four token sub-tiles
+    each, (32, 4, 5), and C = 1536 (64, 2, 3) -- every lane busy -- instead of
+    two 128-vector tiles at 62 % / 75 % lane use; C <= 1024 and 2048 / 4096 /
+    8192 are unchanged.  When no multiple of 32 divides ``cv``, the role's
+    fallback picks the ``ct_vec`` of the highest lane use over the launch,
+    ``cv / (n_ch_tiles x ct_vec) x (ct_vec x (threads // ct_vec) / threads)``
+    rounded to 9 decimals (the larger on a tie), among every multiple of 32 at
+    most ``threads`` (the last tile partial) and, for the forward, every
+    divisor of ``cv`` from 40 to ``threads`` (whole tiles).  At 128 x 8 the
+    backward runs C = 1160 as (32, 4, 5), 1344 as (64, 2, 3) and 1600 as (32,
+    4, 7), the forward 1160 as (32, 4, 5), 1344 as (42, 3, 4) and 1600 as (40,
+    3, 5); both run 1920 as (128, 1, 2).  The per element arithmetic does not
+    depend on the tiling, so ``y`` and ``dx`` are bitwise the legacy plan's;
+    ``dweight``'s fixed summation order follows the tiling, so its bits differ
+    from the legacy plan's (both are reproducible).  ``legacy=True`` is the
+    rule the package shipped before round 6, ``ct_vec = min(cv, threads)``,
+    for either role; the KCP path keeps it (its kernels pick the grouped path
+    from ``ct_vec`` on the device and are measured under this rule).  Each
+    role's rule is kept in sync with its copies (the tart kernel module of
+    that role and the kernel-tests plan of that kind).
     """
 
     C = int(C)
     vec = int(geometry["vec"])
     threads = int(geometry["threads"])
+    if (role is None and not legacy) or (role is not None and role not in SPLIT_ROLES):
+        raise ValueError(
+            f"role must be one of {SPLIT_ROLES} (or legacy=True), got {role!r}"
+        )
     if C <= 0 or C % vec:
         raise ValueError(f"C={C} must be a positive multiple of {vec}")
     channel_vectors = C // vec
@@ -2512,32 +2536,76 @@ def channel_split(
         ct_vec = (
             max(candidates, key=lambda width: (width * (threads // width), width))
             if candidates
-            else threads
+            else _fallback_split(channel_vectors, threads, role)
         )
     return ct_vec, threads // ct_vec, _ceil_div(channel_vectors, ct_vec)
 
 
+def _fallback_split(channel_vectors: int, threads: int, role: str) -> int:
+    """``ct_vec`` of :func:`channel_split` above ``threads`` vectors with no 32-multiple divisor.
+
+    The candidates are every multiple of 32 at most ``threads`` (the last tile
+    partial: its copies and stores stop at channel ``C``) and, for the
+    forward, every divisor of ``channel_vectors`` from 40 to ``threads`` (whole
+    tiles); the one of the highest :func:`_lane_use`, rounded to 9 decimals,
+    wins, the larger on a tie.  No tile is narrower than a warp's 32 vectors
+    and no whole forward tile narrower than 40.
+    """
+
+    candidates = set(range(32, threads + 1, 32))
+    if role == "fwd":
+        candidates |= {
+            width for width in range(40, threads + 1) if channel_vectors % width == 0
+        }
+    return max(
+        candidates,
+        key=lambda width: (
+            round(_lane_use(channel_vectors, width, threads), 9),
+            width,
+        ),
+    )
+
+
+def _lane_use(channel_vectors: int, width: int, threads: int) -> float:
+    """The busy share of a CTA's lanes over ``ceil(channel_vectors / width)`` tiles of ``width``."""
+
+    return (
+        channel_vectors
+        / (_ceil_div(channel_vectors, width) * width)
+        * (width * (threads // width) / threads)
+    )
+
+
 def plan(
-    S: int, C: int, num_docs: int, *, geometry: dict[str, int], legacy: bool = False
+    S: int,
+    C: int,
+    num_docs: int,
+    *,
+    geometry: dict[str, int],
+    role: str | None = None,
+    legacy: bool = False,
 ) -> dict[str, int]:
-    """The kernel's launch scalars for one problem under a record's build geometry.
+    """The kernel's launch scalars for one problem under a record's build geometry and role.
 
     ``geometry`` is ``record["grid_rule"]["geometry"]``: ``threads`` per CTA
-    and ``vec`` BF16 channels per thread.  The scalars are ``S``, ``C``,
-    ``num_docs``, :func:`channel_split`'s ``ct_vec`` / ``n_sub`` /
-    ``n_ch_tiles`` (``legacy`` is passed on) and ``search_steps``, the number
-    of halvings of the device-side binary search over ``cu_seqlens`` (``max(1,
-    ceil(log2 num_docs))``).  Every value is a pure function of ``(S, C,
-    num_docs)`` and the geometry: the host never reads ``cu_seqlens``, and the
-    kernel derives its token ranges from ``S`` and the grid.  The ``flags``
-    scalar of the ``dtype_flags`` programs is not a plan value: the host
-    derives it from the tensors of the call.
+    and ``vec`` BF16 channels per thread; ``role`` is ``record["role"]``
+    (``"fwd"`` or ``"bwd"``).  The scalars are ``S``, ``C``, ``num_docs``,
+    :func:`channel_split`'s ``ct_vec`` / ``n_sub`` / ``n_ch_tiles`` (``role``
+    and ``legacy`` are passed on) and ``search_steps``, the number of halvings
+    of the device-side binary search over ``cu_seqlens`` (``max(1, ceil(log2
+    num_docs))``).  Every value is a pure function of ``(S, C, num_docs)``, the
+    geometry and the role: the host never reads ``cu_seqlens``, and the kernel
+    derives its token ranges from ``S`` and the grid.  The ``flags`` scalar of
+    the ``dtype_flags`` programs is not a plan value: the host derives it from
+    the tensors of the call.
     """
 
     S, C, num_docs = int(S), int(C), int(num_docs)
     if S < 0 or num_docs < 0:
         raise ValueError(f"S and num_docs must be non-negative, got {(S, num_docs)}")
-    ct_vec, n_sub, n_ch_tiles = channel_split(C, geometry=geometry, legacy=legacy)
+    ct_vec, n_sub, n_ch_tiles = channel_split(
+        C, geometry=geometry, role=role, legacy=legacy
+    )
     return {
         "S": S,
         "C": C,
@@ -2634,7 +2702,9 @@ def workspace_layout(
     """
 
     grid_x = launch_grid(record, device_index=device_index)[0]
-    _, _, n_ch_tiles = channel_split(C, geometry=record["grid_rule"]["geometry"])
+    _, _, n_ch_tiles = channel_split(
+        C, geometry=record["grid_rule"]["geometry"], role=record["role"]
+    )
     rows = partial_rows(grid_x, n_ch_tiles)
     return {
         "grid": grid_x,

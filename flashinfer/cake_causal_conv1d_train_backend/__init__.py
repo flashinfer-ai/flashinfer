@@ -336,7 +336,13 @@ def _launch(
     x threads x vec`` channels is refused rather than left partly unwritten.
     """
 
-    scalars = plan(S, C, num_docs, geometry=record["grid_rule"]["geometry"])
+    scalars = plan(
+        S,
+        C,
+        num_docs,
+        geometry=record["grid_rule"]["geometry"],
+        role=record["role"],
+    )
     grid_x = launch_grid(record, device_index=device_index)[0]
     if scalars["n_ch_tiles"] > grid_x:
         raise ValueError(

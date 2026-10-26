@@ -29,7 +29,8 @@ counts 1, 5, 63, 64, 65, 1000 and 4097 with documents of lengths 1, 2 and 3
 and empty documents before, between and after others, channel counts 128,
 136, 256, 384, 512, 768, 1024, 1280, 1344, 1536, 1600, 2048 and 2560 (the
 round-6 tile rule splits 1280 as five 32-vector tiles of four token sub-tiles,
-1536 and 2560 as 64-vector tiles of two; 1344 and 1600 keep the legacy form),
+1536 and 2560 as 64-vector tiles of two; 1344 and 1600, with no 32-multiple
+divisor, take the forward's and the backward's own fallback tiles),
 the ``[1, S, C]`` layout, document isolation, bitwise reproducibility of the
 gradients, CUDA Graph capture and replay of changing shapes, argument
 validation, the workspace helpers and one ``S x C > 2^31`` case guarded by free
@@ -64,6 +65,7 @@ from __future__ import annotations
 
 import re
 import statistics
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
@@ -119,9 +121,11 @@ SEED = 2033
 # one eight-token stage of the big-channel backward program) and at the new
 # tile geometries; C = 1280 (160 vectors: five 32-vector tiles, four token
 # sub-tiles each), 1536 (192: three 64-vector tiles of two sub-tiles), 2560
-# (320: five 64-vector tiles of two), 1344 (168: no 32-multiple divisor, the
-# legacy form with warp 1 clipped and warps 2-3 idle) and 1600 (200: 128 + 72,
-# two whole warps plus eight lanes).
+# (320: five 64-vector tiles of two), and on the fallbacks (no 32-multiple
+# divisor), forward | backward, 1344 (168: four whole 42-vector tiles of three
+# sub-tiles | three 64-vector tiles of two, the last 40 vectors) and 1600 (200:
+# five whole 40-vector tiles of three | seven 32-vector tiles of four, the last
+# eight vectors).
 CASES = (
     (1, 128, None),
     (5, 136, (2, 0, 3)),
@@ -167,23 +171,34 @@ GRAPH_CASES = (
     (4097, 2560, (1000, 0, 3, 3094)),
 )
 GRAPH_REPLAYS = 4
-# The literal channel-split table of CONTRACT §3 at the backward's geometry (128
-# threads x 8 channels): C -> (ct_vec, n_sub, n_ch_tiles) under the round-6 rule
-# and under the legacy rule the KCP path keeps.
+# The literal channel-split tables of CONTRACT §3 at 128 threads x 8 channels:
+# C -> (ct_vec, n_sub, n_ch_tiles) under the forward's and the backward's rule
+# (D1 wherever cv <= 128 or a multiple of 32 divides cv, the role's fallback at
+# C 1032, 1152, 1160, 1344, 1408, 1600, 1920, 2176, 2688 and 3200) and under the
+# legacy rule the KCP path keeps.
 CHANNEL_SPLIT_TABLE = {
-    128: ((16, 8, 1), (16, 8, 1)),
-    256: ((32, 4, 1), (32, 4, 1)),
-    512: ((64, 2, 1), (64, 2, 1)),
-    768: ((96, 1, 1), (96, 1, 1)),
-    1024: ((128, 1, 1), (128, 1, 1)),
-    1160: ((128, 1, 2), (128, 1, 2)),
-    1280: ((32, 4, 5), (128, 1, 2)),
-    1344: ((128, 1, 2), (128, 1, 2)),
-    1536: ((64, 2, 3), (128, 1, 2)),
-    2048: ((128, 1, 2), (128, 1, 2)),
-    2560: ((64, 2, 5), (128, 1, 3)),
-    4096: ((128, 1, 4), (128, 1, 4)),
-    8192: ((128, 1, 8), (128, 1, 8)),
+    128: ((16, 8, 1), (16, 8, 1), (16, 8, 1)),
+    256: ((32, 4, 1), (32, 4, 1), (32, 4, 1)),
+    384: ((48, 2, 1), (48, 2, 1), (48, 2, 1)),
+    512: ((64, 2, 1), (64, 2, 1), (64, 2, 1)),
+    768: ((96, 1, 1), (96, 1, 1), (96, 1, 1)),
+    1024: ((128, 1, 1), (128, 1, 1), (128, 1, 1)),
+    1032: ((32, 4, 5), (32, 4, 5), (128, 1, 2)),
+    1152: ((32, 4, 5), (32, 4, 5), (128, 1, 2)),
+    1160: ((32, 4, 5), (32, 4, 5), (128, 1, 2)),
+    1280: ((32, 4, 5), (32, 4, 5), (128, 1, 2)),
+    1344: ((42, 3, 4), (64, 2, 3), (128, 1, 2)),
+    1408: ((64, 2, 3), (64, 2, 3), (128, 1, 2)),
+    1536: ((64, 2, 3), (64, 2, 3), (128, 1, 2)),
+    1600: ((40, 3, 5), (32, 4, 7), (128, 1, 2)),
+    1920: ((128, 1, 2), (128, 1, 2), (128, 1, 2)),
+    2048: ((128, 1, 2), (128, 1, 2), (128, 1, 2)),
+    2176: ((32, 4, 9), (32, 4, 9), (128, 1, 3)),
+    2560: ((64, 2, 5), (64, 2, 5), (128, 1, 3)),
+    2688: ((42, 3, 8), (32, 4, 11), (128, 1, 3)),
+    3200: ((32, 4, 13), (32, 4, 13), (128, 1, 4)),
+    4096: ((128, 1, 4), (128, 1, 4), (128, 1, 4)),
+    8192: ((128, 1, 8), (128, 1, 8), (128, 1, 8)),
 }
 # The call settings that resolve to each backward route (the forward route
 # follows: fwd, fwd_dt, fwd_bias, fwd, fwd_bias).
@@ -619,37 +634,73 @@ def _backward(x, w, cu, dy, b, policy, **kwargs):
     return grads[0], grads[1], (grads[2] if b is not None else None)
 
 
+def _fallback_of_record(cv: int, role: str) -> int:
+    """The role's fallback at 128 threads in exact arithmetic: of every multiple of 32 (and, for the forward, every
+    divisor of cv from 40 to 128), the highest lane use cv / (n_ch_tiles x ct_vec) x (ct_vec x (128 // ct_vec) /
+    128), n_ch_tiles = ceil(cv / ct_vec), the larger on a tie."""
+
+    candidates = set(range(32, 129, 32))
+    if role == "fwd":
+        candidates |= {d for d in range(40, 129) if cv % d == 0}
+    return max(
+        candidates,
+        key=lambda d: (Fraction(cv * (128 // d), -(-cv // d) * 128), d),
+    )
+
+
 def test_channel_split_literal_table() -> None:
-    """The host tile rule against the literal table of CONTRACT §3 (round-6 and legacy forms), and its
-    invariants over every multiple of eight up to 8192."""
+    """The host tile rule of each role against the literal table of CONTRACT §3 (the forward's, the backward's and
+    the legacy forms), and its invariants over every multiple of eight up to 8192."""
 
     geometry = {"threads": 128, "vec": 8}
-    for C, (new, legacy) in CHANNEL_SPLIT_TABLE.items():
-        assert loader.channel_split(C, geometry=geometry) == new, C
+    for C, (fwd, bwd, legacy) in CHANNEL_SPLIT_TABLE.items():
+        assert loader.channel_split(C, geometry=geometry, role="fwd") == fwd, C
+        assert loader.channel_split(C, geometry=geometry, role="bwd") == bwd, C
         assert loader.channel_split(C, geometry=geometry, legacy=True) == legacy, C
+        for role in ("fwd", "bwd"):
+            assert (
+                loader.channel_split(C, geometry=geometry, role=role, legacy=True)
+                == legacy
+            ), (C, role)
     for C in range(8, 8193, 8):
         cv = C // 8
-        for legacy in (False, True):
-            ct_vec, n_sub, n_ch_tiles = loader.channel_split(
-                C, geometry=geometry, legacy=legacy
-            )
-            assert 1 <= ct_vec <= 128 and n_sub == 128 // ct_vec, (C, legacy)
-            assert n_ch_tiles == -(-cv // ct_vec), (C, legacy)
-            if cv <= 128 or legacy:
-                assert ct_vec == min(cv, 128), (C, legacy)
-            else:
-                # A multiple of 32 dividing cv with the highest lane use, else 128.
-                assert ct_vec == 128 or (ct_vec % 32 == 0 and cv % ct_vec == 0), C
-                assert all(
-                    ct_vec * n_sub >= width * (128 // width)
-                    for width in range(32, 129, 32)
-                    if cv % width == 0
-                ), C
+        divisors = [d for d in range(32, 129, 32) if cv % d == 0]
+        splits = {
+            role: loader.channel_split(C, geometry=geometry, role=role)
+            for role in ("fwd", "bwd")
+        }
+        splits["legacy"] = loader.channel_split(C, geometry=geometry, legacy=True)
+        for key, (ct_vec, n_sub, n_ch_tiles) in splits.items():
+            assert 1 <= ct_vec <= 128 and n_sub == 128 // ct_vec, (C, key)
+            assert n_ch_tiles == -(-cv // ct_vec), (C, key)
+        assert splits["legacy"][0] == min(cv, 128), C
+        if cv <= 128:
+            assert splits["fwd"][0] == splits["bwd"][0] == cv, C
+        elif divisors:
+            # D1: a multiple of 32 dividing cv with the highest lane use, the same for both roles.
+            ct_vec = max(divisors, key=lambda d: (d * (128 // d), d))
+            assert splits["fwd"][0] == splits["bwd"][0] == ct_vec, C
+        else:
+            for role in ("fwd", "bwd"):
+                assert splits[role][0] == _fallback_of_record(cv, role), (C, role)
+            assert splits["bwd"][0] % 32 == 0, C
+            assert splits["fwd"][0] % 32 == 0 or (
+                splits["fwd"][0] >= 40 and cv % splits["fwd"][0] == 0
+            ), C
     with pytest.raises(ValueError):
-        loader.channel_split(12, geometry=geometry)
-    assert loader.plan(5, 1280, 3, geometry=geometry)["ct_vec"] == 32
+        loader.channel_split(12, geometry=geometry, role="bwd")
+    for role in (None, "reduce", "dx"):
+        with pytest.raises(ValueError):
+            loader.channel_split(1280, geometry=geometry, role=role)
+        with pytest.raises(ValueError):
+            loader.plan(5, 1280, 3, geometry=geometry, role=role)
+    assert loader.plan(5, 1280, 3, geometry=geometry, role="bwd")["ct_vec"] == 32
+    assert loader.plan(5, 1344, 3, geometry=geometry, role="fwd")["ct_vec"] == 42
+    assert loader.plan(5, 1344, 3, geometry=geometry, role="bwd")["ct_vec"] == 64
     assert loader.plan(5, 1280, 3, geometry=geometry, legacy=True)["ct_vec"] == 128
-    assert set(loader.plan(5, 1280, 3, geometry=geometry)) == set(loader.PLAN_SCALARS)
+    assert set(loader.plan(5, 1280, 3, geometry=geometry, role="bwd")) == set(
+        loader.PLAN_SCALARS
+    )
     assert "flags" in loader.LOGICAL_SCALARS and "flags" not in loader.PLAN_SCALARS
 
 
@@ -825,7 +876,11 @@ def test_routed_rows_match_fallback_dx_bitwise(case) -> None:
     dx, dw = cake_causal_conv1d_train_backward(x, w, cu, dy)
     record = loader.MODULES[fallback]
     scalars = loader.plan(
-        S, C, int(cu.numel()) - 1, geometry=record["grid_rule"]["geometry"]
+        S,
+        C,
+        int(cu.numel()) - 1,
+        geometry=record["grid_rule"]["geometry"],
+        role=record["role"],
     )
     grid_x = loader.launch_grid(record, device_index=device.index)[0]
     rows = loader.partial_rows(grid_x, scalars["n_ch_tiles"])
@@ -1010,7 +1065,9 @@ def test_backward_launches_the_selected_program_then_its_reduce(monkeypatch) -> 
     values, reduce_values = launched[0][1], launched[1][1]
     assert reduce_values == values, "both launches see one argument set"
     grid_x = loader.launch_grid(record, device_index=device.index)[0]
-    _, _, n_ch_tiles = loader.channel_split(C, geometry=record["grid_rule"]["geometry"])
+    _, _, n_ch_tiles = loader.channel_split(
+        C, geometry=record["grid_rule"]["geometry"], role=record["role"]
+    )
     assert values["main_ctas"] == grid_x
     assert tuple(values["partial"].shape) == (
         loader.partial_rows(grid_x, n_ch_tiles),
@@ -1332,7 +1389,11 @@ def test_dt_route_with_f32_taps_matches_default_route_bitwise(case) -> None:
         name = _fallback_program(arch, kind)
         record = loader.MODULES[name]
         scalars = loader.plan(
-            S, C, int(cu.numel()) - 1, geometry=record["grid_rule"]["geometry"]
+            S,
+            C,
+            int(cu.numel()) - 1,
+            geometry=record["grid_rule"]["geometry"],
+            role=record["role"],
         )
         grid_x = loader.launch_grid(record, device_index=device.index)[0]
         rows = loader.partial_rows(grid_x, scalars["n_ch_tiles"])
@@ -1409,7 +1470,9 @@ def test_workspace_bytes_and_layout() -> None:
         large = cake_causal_conv1d_train_backward_workspace_bytes(262401, C, device)
         assert small == large > 0, "the workspace is independent of S"
         layout = loader.workspace_layout(record, C, device_index=device.index)
-        _, _, n_ch_tiles = loader.channel_split(C, geometry=geometry)
+        _, _, n_ch_tiles = loader.channel_split(
+            C, geometry=geometry, role=record["role"]
+        )
         assert layout["grid"] == grid
         assert (
             layout["rows"]
@@ -1439,7 +1502,9 @@ def test_workspace_bytes_and_layout() -> None:
             for C in (T - 8, T, 8192):
                 selected = loader.MODULES[loader.selected_modules(arch, kind, C=C)[0]]
                 _, _, n_ch_tiles = loader.channel_split(
-                    C, geometry=selected["grid_rule"]["geometry"]
+                    C,
+                    geometry=selected["grid_rule"]["geometry"],
+                    role=selected["role"],
                 )
                 rows = loader.partial_rows(
                     loader.launch_grid(selected, device_index=device.index)[0],
@@ -1455,13 +1520,17 @@ def test_workspace_bytes_and_layout() -> None:
     # One channel tile holds up to threads x vec channels (a partial row per CTA): 1024 for the backward's eight
     # channels per thread; 8192 channels are eight tiles; C = 136 is 17 channel vectors (seven sub-tiles of 17).
     vec, threads = geometry["vec"], geometry["threads"]
-    assert loader.channel_split(threads * vec, geometry=geometry) == (threads, 1, 1)
-    assert loader.channel_split(8192, geometry=geometry) == (
+    assert loader.channel_split(threads * vec, geometry=geometry, role="bwd") == (
+        threads,
+        1,
+        1,
+    )
+    assert loader.channel_split(8192, geometry=geometry, role="bwd") == (
         threads,
         1,
         8192 // (threads * vec),
     )
-    assert loader.channel_split(136, geometry=geometry) == (
+    assert loader.channel_split(136, geometry=geometry, role="bwd") == (
         136 // vec,
         threads // (136 // vec),
         1,
