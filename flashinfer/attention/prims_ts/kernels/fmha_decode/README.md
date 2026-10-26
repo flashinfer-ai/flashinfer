@@ -175,8 +175,9 @@ Prepared launches also accept BF16 output buffers. Both 16-bit output types
 share split/reduction eligibility, including cluster SMEM reduction and the
 standalone reducer; the existing shape and layout restrictions still apply.
 
-Current accuracy and performance signoff is on SM100a/B200. SM103a/B300 is
-admitted by the runtime architecture guard but remains to be qualified.
+Current accuracy and performance signoff covers SM100a/B200 and the SM107a/Rubin
+FP8 subset listed above. SM103a/B300 is admitted by the runtime architecture
+guard but remains to be qualified.
 
 The public paths require compact, 16-byte-aligned Q and output storage. Native
 K/V views have logical HND shape with unit head-dimension stride and positive,
@@ -261,7 +262,9 @@ CUDA 13.4 with native DSL 4.8 support. Explicit `max_tmem_alloc_cols` /
 `smem_capacity_kib` overrides remain tuning budgets, distinct from the
 512-column non-exclusive TMEM allocation limit. Lower 512-column/227-KiB
 budgets remain available for tuning ordinary placement, where larger profiles
-can be slower. Memory placement is not a configuration or dispatch input.
+can be slower. Direct generator callers must select budgets for their compilation
+target; the expanded budgets require SM107. Memory placement is not a
+configuration or dispatch input.
 
 For homogeneous FP8 Q/K/V/output, SM107 selects the following long-KV,
 nonsplit pipeline defaults. KV depth counts raw K/V slots in total;
