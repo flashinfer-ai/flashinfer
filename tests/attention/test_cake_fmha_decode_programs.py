@@ -130,7 +130,7 @@ def test_cake_fmha_decode_program_tables_match_the_generated_loaders() -> None:
         assert program.name == name, key
         assert served[key] <= set(program.targets), key
         assert tuple(program.args) == (
-            *cake_api._DECODE_PROGRAM_HOST_PARAMS[family],
+            *cake_api._decode_program_host_params(family, launch),
             *GRID_ARGS,
         ), key
         assert (launch == "reduce") == (key in reducers), key
@@ -182,6 +182,15 @@ def test_cake_fmha_decode_launch_grid() -> None:
     assert grid("reduce", None, **shape(4, 8), sm_count=148) == (128, 1, 1)
     assert grid("split", None, **shape(1, 9, 1), sm_count=148) == (9, 1, 1)
     assert grid("split", None, **shape(2, 74, 1), sm_count=148) == (148, 1, 1)
+    # Stream-K: whole groups of q_len x num_kv_heads CTAs over the SMs, at
+    # least two requests per group.
+    assert grid("streamk", None, **shape(128), sm_count=148) == (148, 1, 1)
+    assert grid("streamk", None, **shape(128), sm_count=152) == (152, 1, 1)
+    assert grid("streamk", None, **shape(128), sm_count=150) == (148, 1, 1)
+    assert grid("streamk", None, **shape(74), sm_count=148) == (148, 1, 1)
+    for batch, sm_count in ((73, 148), (75, 152), (8, 148)):
+        with pytest.raises(RuntimeError, match="admits batch_size >= 2 x its CTA"):
+            grid("streamk", None, **shape(batch), sm_count=sm_count)
     with pytest.raises(ValueError, match="unknown Cake FMHA decode program launch"):
         grid("stream", None, **shape(1), sm_count=148)
 
@@ -853,7 +862,7 @@ def _program_values(
 
     def record(key):
         name, launch = cake_api._DECODE_PROGRAMS[key]
-        args = (*cake_api._DECODE_PROGRAM_HOST_PARAMS[key[0]], *GRID_ARGS)
+        args = (*cake_api._decode_program_host_params(key[0], launch), *GRID_ARGS)
         cluster = tuple(getattr(_loader(key[0]), key[1]).cluster)
         program = SimpleNamespace(name=name, args=args, cluster=cluster)
         return launch, program, lambda *values: calls.append((name, args, values))
@@ -1627,6 +1636,45 @@ def test_cake_fmha_decode_exact_sink_member_finishes_or_takes_compat(
 
 @pytest.mark.parametrize("device_scales", (False, True))
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+def test_cake_fmha_decode_bf16_streamk_program_admission(
+    decode_target, target, device_scales
+) -> None:
+    """The stream-K B128 program cuts each request into at most two parts on
+    adjacent CTA groups (one CTA per SM, four per group): it needs two
+    requests per group, and a workspace holding its split scratch and
+    counters after the LSE scratch.  Otherwise the launch keeps the module's
+    route."""
+
+    identifier = "DEC_B128_DS" if device_scales else "DEC_B128"
+    kwargs = _row_kwargs("bf16_b128_s4096", device_scales=device_scales)
+    decode_target(target, sm_count=259)  # 64 groups: 128 requests admitted
+    assert _select(kwargs).program == ("decode_bf16", identifier)
+    decode_target(target, sm_count=260)  # 65 groups
+    route = _select(kwargs)
+    assert route is None or route.program is None, route
+    decode_target(target)
+    grid = _SM_COUNT[target]
+    rows = 128 * 32
+    end = cake_api._decode_streamk_layout(128, rows, grid)[2]
+    assert (
+        end
+        == ((128 * 4 + 15) // 16 * 16 + rows * 4 + 255) // 256 * 256
+        + grid * 2 * 1056 * 4
+        + grid * 4
+    )
+    fits = _row_kwargs(
+        "bf16_b128_s4096", device_scales=device_scales, workspace_bytes=end
+    )
+    assert _select(fits).program == ("decode_bf16", identifier)
+    short = _row_kwargs(
+        "bf16_b128_s4096", device_scales=device_scales, workspace_bytes=end - 1
+    )
+    route = _select(short)
+    assert route is None or route.program is None, route
+
+
+@pytest.mark.parametrize("device_scales", (False, True))
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
 def test_cake_fmha_decode_bf16_cluster_program_needs_a_cluster_per_tile(
     decode_target, target, device_scales
 ) -> None:
@@ -1751,14 +1799,80 @@ def test_cake_decode_bf16_program_values(monkeypatch, row, grid, device_scales) 
     assert (values["num_q_heads"], values["num_kv_heads"]) == (32, 4)
     assert values["batch_size"] == batch
     assert (values["grid_x"], values["grid_y"], values["grid_z"]) == grid
+    if row == "bf16_b128_s4096":
+        # The stream-K split scratch after the LSE scratch, and one counter
+        # per CTA in the workspace (no caller buffer), zeroed for the launch.
+        split_ws, counters, _ = cake_api._decode_streamk_layout(
+            batch, batch * 32, grid[0]
+        )
+        assert values["split_ws"].data_ptr() == workspace + split_ws
+        assert values["split_ws"].dtype == torch.float32
+        assert values["split_ws"].numel() == grid[0] * 2 * 1056
+        assert values["split_counter"].data_ptr() == workspace + counters
+        assert values["split_counter"].dtype == torch.uint32
+        assert values["split_counter"].numel() == grid[0]
+        assert not values["split_counter"].view(torch.int32).any()
+    else:
+        assert "split_ws" not in values and "split_counter" not in values
+
+
+@pytest.mark.parametrize("counters", ("caller", "small_caller", "workspace"))
+@pytest.mark.parametrize("sm_count", (148, 152))
+def test_cake_decode_bf16_streamk_counters_follow_the_buffers(
+    monkeypatch, counters, sm_count
+) -> None:
+    """The split counters live in the caller's counter buffer when it holds
+    one per CTA (the kernel leaves them zero), else in the workspace, zeroed
+    before every launch.  The module keeps the views for the same buffers and
+    rebuilds them for others."""
+
+    caller = {
+        "caller": torch.zeros(sm_count * 4, dtype=torch.uint8),
+        "small_caller": torch.zeros(sm_count * 4 - 4, dtype=torch.uint8),
+        "workspace": None,
+    }[counters]
+    kwargs, launches, launch = _program_values(
+        monkeypatch,
+        "bf16_b128_s4096",
+        device_scales=False,
+        sm_count=sm_count,
+        counter_buffer=caller,
+        rerun=True,
+    )
+    ((_, values),) = launches
+    assert values["grid_x"] == sm_count and values["split_counter"].numel() == sm_count
+    workspace = kwargs["workspace_buffer"]
+    split_ws, offset, _ = cake_api._decode_streamk_layout(128, 128 * 32, sm_count)
+    if counters == "caller":
+        assert values["split_counter"].data_ptr() == caller.data_ptr()
+    else:
+        assert values["split_counter"].data_ptr() == workspace.data_ptr() + offset
+    assert values["split_ws"].data_ptr() == workspace.data_ptr() + split_ws
+    # Launch again after poisoning the workspace: the same views, and the
+    # workspace counters zeroed again.
+    workspace.fill_(0xA5)
+    ((_, again),) = launch()
+    assert again["split_counter"].data_ptr() == values["split_counter"].data_ptr()
+    assert again["split_ws"].data_ptr() == values["split_ws"].data_ptr()
+    if counters == "caller":
+        assert workspace[offset : offset + sm_count * 4].eq(0xA5).all()
+    else:
+        assert not again["split_counter"].view(torch.int32).any()
+    # Another workspace: new views.
+    other = torch.zeros_like(workspace)
+    ((_, moved),) = launch(workspace_buffer=other)
+    assert moved["split_ws"].data_ptr() == other.data_ptr() + split_ws
+    if counters != "caller":
+        assert moved["split_counter"].data_ptr() == other.data_ptr() + offset
 
 
 # --- GPU: BF16 ---------------------------------------------------------------
 
 _BF16_GPU_ROWS = ("bf16_b128_s4096", "bf16_b4_s1024", "bf16_b256_s4096_sink")
 # The programs whose host-scale form is the module's JIT member bit for bit
-# (the four-CTA cluster program splits a tile's KV four ways instead of two).
-_BF16_JIT_BITWISE = ("DEC_B128", "DEC_SINK")
+# (the four-CTA cluster program splits a tile's KV four ways instead of two,
+# and the stream-K program merges the two parts of a split request).
+_BF16_JIT_BITWISE = ("DEC_SINK",)
 
 
 def _bf16_gpu_case(row, *, seed, device_scales=False, lengths=None):
@@ -1821,6 +1935,9 @@ def test_cake_decode_bf16_programs_match_reference_and_the_jit_route(
     identifier = SHAPE_ROWS[row][-1][target]
     assert served_programs == [("decode_bf16", identifier)]
     batches = sorted({0, 1, 2, 3, batch - 1})
+    if identifier == "DEC_B128":
+        # every request: the stream-K cuts fall between and inside requests
+        batches = list(range(batch))
     reference = _bf16_reference(case, batches)
     for b in batches:
         torch.testing.assert_close(
@@ -1854,6 +1971,54 @@ def test_cake_decode_bf16_program_is_sync_free_and_replays(
     _check_hit_is_sync_free_and_replays(case, lengths)
     identifier = SHAPE_ROWS[row][-1][target] + ("_DS" if device_scales else "")
     assert set(served_programs) == {("decode_bf16", identifier)}
+
+
+@_GPU
+@pytest.mark.parametrize("counter", (True, False))
+def test_cake_decode_bf16_streamk_counters_are_graph_safe(
+    served_programs, counter
+) -> None:
+    """The stream-K program's split counters are zero after every launch (the
+    second part of a split request resets its counter): the caller's buffer
+    reads zero after direct and replayed launches.  Without it the counters
+    live in the workspace, zeroed inside the captured work.  A graph captured
+    once replays new in-place lengths bitwise to direct launches, replay after
+    replay."""
+
+    _require_full_device()
+    case = _bf16_gpu_case("bf16_b128_s4096", seed=20261102)
+    if not counter:
+        case.counter = None
+        case.workspace.fill_(0xA5)
+    seq_lens = case.seq_lens.clone()
+    out = torch.empty_like(case.out)
+    _run_bf16(case, seq_lens=seq_lens, out=out)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _run_bf16(case, seq_lens=seq_lens, out=out)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run_bf16(case, seq_lens=seq_lens, out=out)
+    generator = torch.Generator(device="cuda").manual_seed(20261103)
+    for _ in range(3):
+        lengths = torch.randint(
+            1,
+            case.max_seq_len + 1,
+            (seq_lens.numel(),),
+            generator=generator,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        seq_lens.copy_(lengths)
+        graph.replay()
+        direct = _run_bf16(case, seq_lens=lengths)
+        torch.cuda.synchronize()
+        assert torch.equal(_bits(out), _bits(direct))
+        if counter:
+            assert not case.counter.any()
+    assert set(served_programs) == {("decode_bf16", "DEC_B128")}
 
 
 # --- FP8 boundaries (host-only) ----------------------------------------------

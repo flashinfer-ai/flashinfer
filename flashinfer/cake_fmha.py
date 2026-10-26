@@ -1439,8 +1439,30 @@ _DECODE_PROGRAMS: dict[tuple[str, str], tuple[str, str]] = {}
 _DECODE_PROGRAM_REDUCERS: dict[tuple[str, str], tuple[str, str]] = {}
 
 # family -> the host parameters of its programs' bindings, in call order,
-# without the grid (every program of a family shares one kernel ABI).
+# without the grid (every program of a family shares one kernel ABI, which a
+# launch in ``_DECODE_LAUNCH_EXTRA_PARAMS`` extends).
 _DECODE_PROGRAM_HOST_PARAMS: dict[str, tuple[str, ...]] = {}
+
+# launch -> ``(the family parameter they follow, the parameters)`` a program
+# of that launch adds to its family's: a stream-K program's split counters
+# and split scratch follow the sinks.
+_DECODE_LAUNCH_EXTRA_PARAMS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "streamk": ("sinks_ptr", ("split_counter", "split_ws")),
+}
+
+
+def _decode_program_host_params(family: str, launch: str) -> tuple[str, ...]:
+    """The host parameters of a ``launch`` program of ``family``, in call
+    order, without the grid."""
+
+    params = _DECODE_PROGRAM_HOST_PARAMS[family]
+    extra = _DECODE_LAUNCH_EXTRA_PARAMS.get(launch)
+    if extra is None:
+        return params
+    after, names = extra
+    cut = params.index(after) + 1
+    return (*params[:cut], *names, *params[cut:])
+
 
 # ``CakeFmhaTarget`` -> the exact ``CakeProgram`` target of the same device.
 _DECODE_PROGRAM_TARGET: dict[str, str] = {"sm100a": "sm_100a", "sm103a": "sm_103a"}
@@ -1566,7 +1588,10 @@ def cake_fmha_decode_launch_grid(
     * ``reduce``: one warp per (request, query head), ``(batch * num_q_heads,
       1, 1)``;
     * ``split``: one resident wave of ``batch * num_kv_heads * num_splits``
-      CTAs (the clusters, if any, along x).
+      CTAs (the clusters, if any, along x);
+    * ``streamk``: one persistent CTA per SM in whole groups of ``q_len *
+      num_kv_heads`` CTAs (:func:`_decode_streamk_groups`); a launch the
+      kernel does not admit (``batch < 2 * groups``) raises.
     """
 
     batch_size, q_len = int(batch_size), int(q_len)
@@ -1591,7 +1616,54 @@ def cake_fmha_decode_launch_grid(
         return batch_size * int(num_q_heads), 1, 1
     if launch == "split":
         return batch_size * num_kv_heads * num_splits, 1, 1
+    if launch == "streamk":
+        groups = _decode_streamk_groups(batch_size, q_len, num_kv_heads, sm_count)
+        if groups == 0:
+            raise RuntimeError(
+                "a stream-K decode program admits batch_size >= 2 x its CTA groups "
+                f"of {q_len * num_kv_heads} CTAs; {batch_size} requests on "
+                f"{int(sm_count)} SMs"
+            )
+        return groups * q_len * num_kv_heads, 1, 1
     raise ValueError(f"unknown Cake FMHA decode program launch {launch!r}")
+
+
+# FP32 words of one part of a stream-K split tile: 8 x 128 partial O, 8 row
+# maxima and 8 row sums, padded to 128-byte lines.
+_DECODE_STREAMK_PART_WORDS = 1056
+
+
+def _decode_streamk_groups(
+    batch_size: int, q_len: int, num_kv_heads: int, sm_count: int
+) -> int:
+    """The CTA groups of a stream-K launch, or 0 when the kernel does not
+    admit it.  A group is ``q_len * num_kv_heads`` CTAs (one per tile of a
+    request) and the grid holds as many whole groups as the SMs; the kernel
+    cuts the requests' KV block pairs evenly over the groups, so a request
+    has at most two parts only with ``batch >= 2 * groups``."""
+
+    unit = int(q_len) * int(num_kv_heads)
+    if unit <= 0:
+        return 0
+    groups = min(int(sm_count), int(batch_size) * unit) // unit
+    return groups if groups >= 1 and int(batch_size) >= 2 * groups else 0
+
+
+def _decode_streamk_layout(
+    batch_size: int, rows: int, grid: int
+) -> tuple[int, int, int]:
+    """``(split scratch offset, counter offset, end)`` of a stream-K launch's
+    workspace, after the BF16 programs' LSE scratch: two split-tile parts per
+    CTA, then one u32 counter per CTA (used when the caller's counter buffer
+    cannot hold them)."""
+
+    def align(value: int) -> int:
+        return (value + 255) // 256 * 256
+
+    lse_offset = (int(batch_size) * 4 + 15) // 16 * 16
+    split_ws = align(lse_offset + int(rows) * 4)
+    counters = align(split_ws + int(grid) * 2 * _DECODE_STREAMK_PART_WORDS * 4)
+    return split_ws, counters, counters + int(grid) * 4
 
 
 @dataclass(frozen=True)
@@ -1643,13 +1715,13 @@ def _decode_program_constant(family: str, identifier: str, target: str):
             f"{program.name} ships no {target!r} build; its targets are "
             f"{list(program.targets)}"
         )
-    expected = (*_DECODE_PROGRAM_HOST_PARAMS[family], *GRID_ARGS)
+    launch = pinned[1]
+    expected = (*_decode_program_host_params(family, launch), *GRID_ARGS)
     if tuple(program.args) != expected:
         raise RuntimeError(
             f"the generated {program.name} binding takes {list(program.args)}; "
             f"the host spells {list(expected)}"
         )
-    launch = pinned[1]
     clustered = tuple(program.cluster) != (1, 1, 1)
     if launch != "split" and clustered != (launch == "cluster"):
         raise RuntimeError(
@@ -1735,6 +1807,12 @@ def _decode_program_bytes(workspace_buffer: torch.Tensor) -> torch.Tensor:
     if workspace_buffer.dtype == torch.uint8 and workspace_buffer.dim() == 1:
         return workspace_buffer
     return workspace_buffer.view(-1).view(torch.uint8)
+
+
+def _decode_program_bytes_of(buffer: torch.Tensor) -> int:
+    """The byte size of a contiguous workspace or counter buffer."""
+
+    return buffer.numel() * buffer.element_size()
 
 
 def _decode_program_workspace(
@@ -2483,8 +2561,11 @@ _DECODE_PROGRAM_VALUES["decode_smallm"] = _decode_smallm_program_values
 # softmax scale as a kernel scalar (bmm2 1); a device-scale twin reads the
 # log2-domain bmm1 and the bmm2 FP32 scalars in the kernel.  The key is
 # ``(scale form, batch, q_len, num_q_heads, num_kv_heads, page_size, sink,
-# retain_kv_l2)``.  The families are tried in order, so a family of
-# per-target programs can take a key ahead of this one.
+# retain_kv_l2)``.  The 128-request programs are stream-K: one CTA per SM,
+# each group of ``q_len * num_kv_heads`` CTAs walking a contiguous range of
+# the requests' KV block pairs, a request cut between two groups merged
+# through the split counters and scratch.  The families are tried in order,
+# so a family of per-target programs can take a key ahead of this one.
 _DECODE_BF16_FAMILIES = ("decode_bf16",)
 
 _DECODE_PROGRAM_HOST_PARAMS["decode_bf16"] = (
@@ -2529,12 +2610,12 @@ _DECODE_PROGRAM_ROUTES["sm103a"].update(
 _DECODE_PROGRAMS.update(
     {
         ("decode_bf16", "DEC_B128"): (
-            "cake_fmha_decode_bf16_265a74c9c9384d1e9e07",
-            "persistent",
+            "cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5",
+            "streamk",
         ),
         ("decode_bf16", "DEC_B128_DS"): (
-            "cake_fmha_decode_bf16_69ec51fc7b583178a053",
-            "persistent",
+            "cake_fmha_decode_bf16_4771b35b3b41de52fc15",
+            "streamk",
         ),
         ("decode_bf16", "DEC_B4C4"): (
             "cake_fmha_decode_bf16_da0b91411447542f0766",
@@ -2608,7 +2689,10 @@ def _decode_bf16_program_select(
     (eight pages per evened 128-token block, at least four blocks), int32
     lengths (the kernels derive each request's causal prefix from them), no
     LSE, window, block scales or output scale, one scale form (host: bmm2 1)
-    and a workspace holding the kernels' LSE scratch.
+    and a workspace holding the kernels' LSE scratch.  A stream-K program
+    also needs a batch of at least two requests per CTA group and a
+    workspace holding its split scratch and counters
+    (:func:`_decode_streamk_layout`).
     """
 
     num_q_heads = int(query.shape[1])
@@ -2661,14 +2745,27 @@ def _decode_bf16_program_select(
     for family in _DECODE_BF16_FAMILIES:
         program = _decode_program_lookup(device, family, key)
         if program is not None:
+            launch = _DECODE_PROGRAMS[program][1]
             # A cluster program gives each tile its own cluster and arms its
             # reduction barrier once: a device with fewer SMs than tiles (a
             # partition) would hand a cluster a second tile and hang.
             if (
-                _DECODE_PROGRAMS[program][1] == "cluster"
+                launch == "cluster"
                 and _smallm_sm_count(device) < batch_size * q_len * num_kv_heads
             ):
                 return None
+            # A stream-K program cuts each request into at most two parts on
+            # adjacent CTA groups, which needs two requests per group; its
+            # split scratch follows the LSE scratch in the workspace.
+            if launch == "streamk":
+                groups = _decode_streamk_groups(
+                    batch_size, q_len, num_kv_heads, _smallm_sm_count(device)
+                )
+                grid = groups * q_len * num_kv_heads
+                rows = int(query.shape[0]) * num_q_heads
+                end = _decode_streamk_layout(batch_size, rows, grid)[2]
+                if groups == 0 or _decode_program_bytes_of(workspace_buffer) < end:
+                    return None
             return program, form == "device"
     return None
 
@@ -2681,6 +2778,7 @@ def _decode_bf16_program_values(
     value_cache: torch.Tensor,
     out: torch.Tensor,
     workspace_buffer: torch.Tensor,
+    counter_buffer: torch.Tensor | None,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     max_seq_len: int,
@@ -2695,7 +2793,9 @@ def _decode_bf16_program_values(
     prefix is the length less the query length) and write the per-row LSE
     to scratch in the workspace (the JIT route's offset).  A pointer the
     program does not read (a host-scale program's scales, an absent sink)
-    points at the lengths, as the JIT route's do."""
+    points at the lengths, as the JIT route's do.  A stream-K program also
+    takes its split scratch and split counters
+    (:func:`_decode_streamk_launch_args`)."""
 
     route = module.route
     rows = int(query.shape[0]) * int(query.shape[1])
@@ -2738,11 +2838,99 @@ def _decode_bf16_program_values(
         "num_kv_heads": route.num_kv_heads,
         "batch_size": route.batch_size,
     }
+    if module.launch == "streamk":
+        values.update(
+            _decode_streamk_launch_args(
+                module,
+                query=query,
+                workspace_buffer=workspace_buffer,
+                counter_buffer=counter_buffer,
+                sm_count=sm_count,
+            )
+        )
+        return [(module.program, module.entry, values)]
     grid = _decode_program_grid(
         module, module.program, module.launch, sm_count=sm_count
     )
     values.update(grid)
     return [(module.program, module.entry, values)]
+
+
+def _decode_streamk_launch_args(
+    module: CakeFmhaDecodeProgramModule,
+    *,
+    query: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    counter_buffer: torch.Tensor | None,
+    sm_count: int,
+) -> dict[str, Any]:
+    """The split scratch, the split counters and the grid of a stream-K
+    launch.  The scratch holds two split-tile parts per CTA after the LSE
+    scratch.  The counters (one u32 per CTA) live in the caller's zeroed
+    counter buffer when it can hold them (the kernel's second arrival at a
+    split tile resets its counter, so they are zero after every launch),
+    else in the workspace, zeroed on the stream first.
+
+    These depend only on the buffers' addresses and sizes and the SM count,
+    so the module keeps them from its last launch (on a CUDA device as FFI
+    tensors, converted once)."""
+
+    counter_key = None
+    if counter_buffer is not None:
+        counter_key = (
+            counter_buffer.data_ptr(),
+            _decode_program_bytes_of(counter_buffer),
+            counter_buffer.is_contiguous(),
+        )
+    key = (
+        workspace_buffer.data_ptr(),
+        _decode_program_bytes_of(workspace_buffer),
+        counter_key,
+        sm_count,
+    )
+    cached = module.launch_args.get("streamk")
+    if cached is None or cached[0] != key:
+        route = module.route
+        grid = _decode_program_grid(
+            module, module.program, module.launch, sm_count=sm_count
+        )
+        ctas = grid["grid_x"]
+        rows = int(query.shape[0]) * int(query.shape[1])
+        split_ws_offset, counters_offset, _ = _decode_streamk_layout(
+            route.batch_size, rows, ctas
+        )
+        flat = _decode_program_bytes(workspace_buffer)
+        args: dict[str, Any] = {
+            "split_ws": _decode_program_workspace(
+                flat,
+                split_ws_offset,
+                ctas * 2 * _DECODE_STREAMK_PART_WORDS * 4,
+                torch.float32,
+            ),
+        }
+        zero = None
+        if (
+            counter_buffer is not None
+            and counter_buffer.device == query.device
+            and counter_buffer.is_contiguous()
+            and _decode_program_bytes_of(counter_buffer) >= ctas * 4
+            and counter_buffer.data_ptr() % 4 == 0
+        ):
+            counter_flat = counter_buffer.view(-1).view(torch.uint8)
+            args["split_counter"] = counter_flat[: ctas * 4].view(torch.uint32)
+        else:
+            args["split_counter"] = zero = _decode_program_workspace(
+                flat, counters_offset, ctas * 4, torch.uint32
+            )
+        if query.device.type == "cuda":
+            args = {name: tvm_ffi.from_dlpack(view) for name, view in args.items()}
+        args.update(grid)
+        cached = (key, (args, zero))
+        module.launch_args["streamk"] = cached
+    args, zero = cached[1]
+    if zero is not None:
+        zero.zero_()
+    return args
 
 
 _DECODE_PROGRAM_VALUES["decode_bf16"] = _decode_bf16_program_values

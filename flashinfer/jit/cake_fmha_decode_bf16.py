@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Generated programs of the BF16 paged decode of the cake_fmha module (head dim 128,
-16-token HND pages, eight query heads per KV head): the persistent 128-request program,
+16-token HND pages, eight query heads per KV head): the stream-K 128-request program,
 the four-request program with 4-CTA clusters and the 256-request attention-sink program,
 each with host scales and with FP32 device scales, shipped for sm_100a and sm_103a. The
 host module ``flashinfer.cake_fmha`` selects the program from the batch, the head
@@ -30,12 +30,12 @@ from . import cake_program
 from .core import JitSpec
 
 DEC_B128 = cake_program.CakeProgram(
-    name="cake_fmha_decode_bf16_265a74c9c9384d1e9e07",
+    name="cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5",
     operator_dir="cake_fmha_decode_bf16",
-    kernel="kernel_cake_fmha_decode_bf16_265a74c9c9384d1e9e07",
+    kernel="kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5",
     sources=(
-        "cake_fmha_decode_bf16_265a74c9c9384d1e9e07_kernel.cu",
-        "cake_fmha_decode_bf16_265a74c9c9384d1e9e07_binding.cu",
+        "cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5_kernel.cu",
+        "cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(
@@ -53,6 +53,8 @@ DEC_B128 = cake_program.CakeProgram(
         "scale_log2_ptr",
         "bmm2_ptr",
         "sinks_ptr",
+        "split_counter",
+        "split_ws",
         "max_pages_per_seq",
         "max_local_seq_len",
         "softmax_scale_log2",
@@ -75,22 +77,24 @@ DEC_B128 = cake_program.CakeProgram(
         "scale_log2_ptr",
         "bmm2_ptr",
         "sinks_ptr",
+        "split_counter",
+        "split_ws",
     ),
     block=(512, 1, 1),
     cluster=(1, 1, 1),
-    dynamic_smem_bytes=145408,
+    dynamic_smem_bytes=210944,
     use_pdl=False,
     cooperative=False,
     needs_device_linking=False,
 )
 
 DEC_B128_DS = cake_program.CakeProgram(
-    name="cake_fmha_decode_bf16_69ec51fc7b583178a053",
+    name="cake_fmha_decode_bf16_4771b35b3b41de52fc15",
     operator_dir="cake_fmha_decode_bf16",
-    kernel="kernel_cake_fmha_decode_bf16_69ec51fc7b583178a053",
+    kernel="kernel_cake_fmha_decode_bf16_4771b35b3b41de52fc15",
     sources=(
-        "cake_fmha_decode_bf16_69ec51fc7b583178a053_kernel.cu",
-        "cake_fmha_decode_bf16_69ec51fc7b583178a053_binding.cu",
+        "cake_fmha_decode_bf16_4771b35b3b41de52fc15_kernel.cu",
+        "cake_fmha_decode_bf16_4771b35b3b41de52fc15_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(
@@ -108,6 +112,8 @@ DEC_B128_DS = cake_program.CakeProgram(
         "scale_log2_ptr",
         "bmm2_ptr",
         "sinks_ptr",
+        "split_counter",
+        "split_ws",
         "max_pages_per_seq",
         "max_local_seq_len",
         "softmax_scale_log2",
@@ -130,10 +136,12 @@ DEC_B128_DS = cake_program.CakeProgram(
         "scale_log2_ptr",
         "bmm2_ptr",
         "sinks_ptr",
+        "split_counter",
+        "split_ws",
     ),
     block=(512, 1, 1),
     cluster=(1, 1, 1),
-    dynamic_smem_bytes=145408,
+    dynamic_smem_bytes=210944,
     use_pdl=False,
     cooperative=False,
     needs_device_linking=False,
