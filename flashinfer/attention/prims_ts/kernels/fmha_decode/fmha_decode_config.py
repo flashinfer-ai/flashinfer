@@ -45,7 +45,7 @@ from ...sage.layout import (
 )
 from ...sage.modes import SageScoreScaling
 from ...split_kv_mode_policy import select_split_kv_modes
-from ..tcgen05_compat import ldtm_stat_supported
+from ..tcgen05_compat import dsl_supports_exclusive_tmem, ldtm_stat_supported
 from .fmha_decode_constants import (
     E4M3_MAX,
     SOFTMAX_RESCALE_THRESHOLD_LOG2,
@@ -80,6 +80,10 @@ from .fmha_decode_constants import (
     Q_ROW_ALIGNMENT_BYTES,
     REDUCTION_BYTES_PER_SLICE,
     REDUCTION_THREADS_PER_CTA,
+    SMEM_CAPACITY_KIB,
+    SM107_SMEM_CAPACITY_KIB,
+    SM107_TMEM_ALLOCATION_COLUMNS,
+    SM107_FP8_KV256_FIFO_STAGES,
     SPLIT_KV_MIN_TOKENS_PER_CTA,
     SWIZZLE_128B_ROW_BYTES,
     TMEM_COLUMNS_PER_ROW,
@@ -1059,6 +1063,13 @@ class FmhaDecodeConfig:
         return (self.headdim + fragment - 1) // fragment * fragment
 
     @property
+    def pipeline_smem_budget_kib(self) -> int:
+        # Preserve the existing alignment/barrier reserve when opting into
+        # Rubin's oversized shared-memory mode. The builder checks the entire
+        # allocation, including P, metadata and synchronization state.
+        return TOTAL_SMEM_BUDGET_KIB + self.smem_capacity_kib - SMEM_CAPACITY_KIB
+
+    @property
     def smem_q_tile_bytes(self) -> int:
         """SMEM bytes for one Q tile, including TMA-filled head padding."""
         return self.tile_size_q * self.smem_q_head_dim * self.q_dtype_bytes
@@ -1308,9 +1319,13 @@ class FmhaDecodeConfig:
 
     @property
     def tmem_alloc_cols(self) -> int:
-        """TMEM allocation rounded up to a power of two and at least 32,
-        matching the hardware TMEM allocator's granularity."""
-        return max(32, 1 << (self.tmem_total_cols - 1).bit_length())
+        """Round to a standard TMEM allocation or Rubin's exclusive 576."""
+        return round_tmem_columns(self.tmem_total_cols, self.max_tmem_alloc_cols)
+
+    @property
+    def uses_exclusive_tmem(self) -> bool:
+        """The allocation and release must use the same exclusive qualifier."""
+        return self.tmem_alloc_cols == SM107_TMEM_ALLOCATION_COLUMNS
 
     @property
     def threads_per_cta(self) -> int:
@@ -1557,6 +1572,10 @@ class FmhaDecodeConfig:
     # Reduce streamed score-fragment maxima inside the TMEM load
     # (tcgen05.ld.red); ``arch_config_args`` supplies it.
     uses_ldtm_stat: bool = False
+    # Explicit SM107 resource limits; automatic plans retain SM100 budgets.
+    # TMEM accepts 512/576 columns and SMEM accepts 227/327 KiB.
+    max_tmem_alloc_cols: int = 512
+    smem_capacity_kib: int = SMEM_CAPACITY_KIB
     use_cluster_smem_reduction: bool = False
     use_separate_reduction_kernel: bool = False
     # Compile-time attention-mask selection. Public APIs normalize the string
@@ -2016,7 +2035,7 @@ class FmhaDecodeConfig:
         # above this budget for alignment, barriers, and scheduler state.
         kv_budget_bytes = min(
             MAX_KV_STAGE_SMEM_KIB * BYTES_PER_KIB,
-            TOTAL_SMEM_BUDGET_KIB * BYTES_PER_KIB - fixed_bytes,
+            self.pipeline_smem_budget_kib * BYTES_PER_KIB - fixed_bytes,
         )
         inferred_stages = max(1, kv_budget_bytes * BITS_PER_BYTE // kv_tile_bits)
         return inferred_stages
@@ -2505,6 +2524,10 @@ class FmhaDecodeConfig:
             return False
         if self.ordered_softmax_barrier_mode == 2:
             return True
+        # Rubin's complete Q128/SMEM-P path benefits from independent
+        # softmax groups. Mode 2 remains available to force ordering.
+        if self.uses_exclusive_tmem and self.tile_size_q == 128:
+            return False
         return self.ordered_softmax_barrier_mode == 1 and (
             self.headdim == 128 and self.tile_size_q in (32, 64, 128)
         )
@@ -2886,11 +2909,19 @@ class FmhaDecodeConfig:
             and self.o_stages == 2
         ):
             return False
+        # Sparse and Sage fragment paths require the <=512-column TMEM-P layout.
+        tmem_limit = (
+            self.max_tmem_alloc_cols
+            if self.max_seq_len_q > 1
+            and not self.use_block_sparse
+            and not self.use_sage_attention
+            else TMEM_MAX_ALLOCATION_COLUMNS
+        )
         return (
             2 * self.tmem_s_cols
             + 2 * self.tmem_stats_cols
             + self.tmem_o_stage_cols * self.o_stages
-            <= 512
+            <= tmem_limit
         )
 
     @property
@@ -3448,6 +3479,15 @@ def _finalize_static_decode_config(
     """Fill dtype-dependent, profile-dependent, and SMEM-derived defaults."""
     cfg.validate_boolean_fields()
     cfg.validate_dtypes()
+    if cfg.max_tmem_alloc_cols not in (512, SM107_TMEM_ALLOCATION_COLUMNS):
+        raise ValueError("max_tmem_alloc_cols must be 512 or 576")
+    if cfg.smem_capacity_kib not in (SMEM_CAPACITY_KIB, SM107_SMEM_CAPACITY_KIB):
+        raise ValueError("smem_capacity_kib must be 227 or 327")
+    if (
+        cfg.max_tmem_alloc_cols > TMEM_MAX_ALLOCATION_COLUMNS
+        or cfg.smem_capacity_kib > SMEM_CAPACITY_KIB
+    ) and not dsl_supports_exclusive_tmem():
+        raise ValueError("Expanded SM107 resources require native DSL 4.8 support")
 
     use_keeps_mma_ab = cfg.use_keeps_mma_ab
     if not use_keeps_mma_ab and cfg.headdim > 128:
@@ -3471,13 +3511,30 @@ def _finalize_static_decode_config(
             # effective configuration is supported by the kernel.
             for field_name, value in _KV_TILE_256_PHYSICAL_DEFAULTS.items():
                 _set_if_implicit(cfg, field_name, value, explicit_fields)
-            # The K/V ring depth follows the element width and stays tunable.
+            # Rubin's larger opt-in SMEM budget can sustain eight FP8 slots.
+            # The same profile serves ordinary and domain-local allocations;
+            # placement never participates in kernel configuration.
+            kv_stages = (
+                KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES
+                if cfg.k_dtype.width == 8 and cfg.v_dtype.width == 8
+                else KV_TILE_256_SHARED_FIFO_STAGES
+            )
+            if (
+                cfg.smem_capacity_kib >= SM107_SMEM_CAPACITY_KIB
+                and not cfg.use_block_sparse
+                and cfg.headdim == 128
+                and cfg.tile_size_q == 64
+                and cfg.q_dtype
+                == cfg.k_dtype
+                == cfg.v_dtype
+                == cfg.out_dtype
+                == Float8E4M3FN
+            ):
+                kv_stages = SM107_FP8_KV256_FIFO_STAGES
             _set_if_implicit(
                 cfg,
                 "kv_stages",
-                KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES
-                if cfg.k_dtype.width == 8 and cfg.v_dtype.width == 8
-                else KV_TILE_256_SHARED_FIFO_STAGES,
+                kv_stages,
                 explicit_fields,
             )
             for field_name, value in _KV_TILE_256_TASK_TOPOLOGY_DEFAULTS.items():
@@ -3608,7 +3665,7 @@ def _validate_kv256_static_config(cfg: FmhaDecodeConfig) -> None:
     pipeline_smem_bytes = (
         cfg.q_stages * cfg.smem_q_tile_bytes + cfg.kv_stages * cfg.smem_kv_tile_bytes
     )
-    pipeline_smem_budget_bytes = TOTAL_SMEM_BUDGET_KIB * BYTES_PER_KIB
+    pipeline_smem_budget_bytes = cfg.pipeline_smem_budget_kib * BYTES_PER_KIB
     if pipeline_smem_bytes > pipeline_smem_budget_bytes:
         raise ValueError(
             "KV256 shared-memory pipeline exceeds the static SMEM budget: "
@@ -5445,6 +5502,20 @@ def validate_storage_page_size(
         )
 
 
+def round_tmem_columns(
+    num_columns: int, max_columns: int = TMEM_MAX_ALLOCATION_COLUMNS
+) -> int:
+    """Resolve a legal allocation size, rejecting overflow before compilation."""
+    allocation = max(32, 1 << (num_columns - 1).bit_length())
+    if TMEM_MAX_ALLOCATION_COLUMNS < num_columns <= SM107_TMEM_ALLOCATION_COLUMNS:
+        allocation = SM107_TMEM_ALLOCATION_COLUMNS
+    if allocation > max_columns:
+        raise ValueError(
+            f"TMEM allocation requires {allocation} columns, limit is {max_columns}"
+        )
+    return allocation
+
+
 def arch_config_args(compute_capability: tuple[int, int]) -> dict[str, object]:
     """Return the config fields whose value depends on the GPU architecture.
 
@@ -5456,11 +5527,12 @@ def arch_config_args(compute_capability: tuple[int, int]) -> dict[str, object]:
     SM clock), so the polynomials only add instructions there and every
     exponential stays on MUFU. GPUs whose TMEM loads return score maxima
     (LDTM.STAT) take them from the load, which replaces the max pass's
-    register reduction; the context kernel shares that gate.
+    register reduction; the context kernel shares that gate. SM107 also uses
+    native EX2 because the emulation adds instructions on its tested FP8 paths.
     """
-    is_sm103 = tuple(compute_capability) == (10, 3)
+    native_ex2 = tuple(compute_capability) in ((10, 3), (10, 7))
     return {
-        "ex2_emulated_pairs": 0 if is_sm103 else 6,
+        "ex2_emulated_pairs": 0 if native_ex2 else 6,
         "uses_ldtm_stat": ldtm_stat_supported(compute_capability),
     }
 

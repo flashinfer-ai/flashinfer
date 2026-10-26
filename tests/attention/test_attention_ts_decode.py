@@ -2001,23 +2001,33 @@ def _exercise_auto_case(
     return policy
 
 
-def _exercise_explicit_profile_case(
+def exercise_explicit_decode_profile(
     monkeypatch: pytest.MonkeyPatch,
     case: _DecodeCase,
-    explicit_profile: dict[str, object],
+    explicit_profile: dict[str, object] | None = None,
     *,
     qo_indptr: Optional[torch.Tensor] = None,
     max_seq_len_q: Optional[int] = None,
+    config_args: dict[str, object] | None = None,
     exercise_all_paths: bool = False,
 ) -> dict[str, object]:
-    """Run a public path with ``explicit_profile`` pinned over automatic selection."""
+    """Check numerical output with an explicit generator profile."""
 
     from flashinfer.attention.prims_ts import decode as decode_module
     from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
 
     original_make_decode_config = fmha_decode_config.make_decode_config
 
-    def _make_explicit_config(*args, **kwargs):
+    explicit_profile = dict(explicit_profile) if explicit_profile is not None else {
+        "use_keeps_mma_ab": True,
+        "tile_size_q": 64,
+        "tile_size_kv": 256,
+        "groups_tokens_heads_q": True,
+    }
+    if config_args is not None:
+        explicit_profile.update(config_args)
+
+    def make_explicit_config(*args, **kwargs):
         source = kwargs.get("args")
         kwargs["args"] = (
             explicit_profile if source is None else (source, explicit_profile)
@@ -2027,7 +2037,7 @@ def _exercise_explicit_profile_case(
     monkeypatch.setattr(
         fmha_decode_config,
         "make_decode_config",
-        _make_explicit_config,
+        make_explicit_config,
     )
     decode_module._resolve_decode_launch_spec.cache_clear()
     decode_module._get_compiled_decode.cache_clear()
@@ -2051,7 +2061,7 @@ def _exercise_explicit_kv256_case(
 ) -> dict[str, object]:
     """Run a public path with the qualified logical KV256 profile pinned."""
 
-    return _exercise_explicit_profile_case(
+    return exercise_explicit_decode_profile(
         monkeypatch,
         case,
         {
@@ -3983,7 +3993,7 @@ def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
 
 
 def test_attention_ts_decode_arch_config_args_follow_softmax_hardware() -> None:
-    """SM103 keeps exponentials on MUFU and takes score maxima from LDTM.STAT.
+    """SM103 and SM107 keep exponentials on MUFU when configured by device.
 
     SM103 doubles the MUFU ex2 rate, so FMA polynomials only add
     instructions there, and its TMEM loads can return the fragment maximum.
@@ -3995,6 +4005,10 @@ def test_attention_ts_decode_arch_config_args_follow_softmax_hardware() -> None:
     assert arch_args((10, 3)) == {
         "ex2_emulated_pairs": 0,
         "uses_ldtm_stat": tcgen05_compat.dsl_supports_ldtm_stat(),
+    }
+    assert arch_args((10, 7)) == {
+        "ex2_emulated_pairs": 0,
+        "uses_ldtm_stat": tcgen05_compat.ldtm_stat_supported((10, 7)),
     }
     cfg = _make_contiguous_kv256_config(persistent=False)
     assert cfg.ex2_emulated_pairs == 6 and not cfg.uses_ldtm_stat
@@ -8135,7 +8149,7 @@ def test_attention_ts_decode_q64_kv256_split_launch(
         seed=20260805,
     )
 
-    policy = _exercise_explicit_kv256_case(monkeypatch, case)
+    policy = exercise_explicit_decode_profile(monkeypatch, case)
 
     assert policy["tile_size_kv"] == 256
     assert policy["use_split_kv"] is True
@@ -8217,7 +8231,7 @@ def test_attention_ts_decode_q64_kv256_boundaries(
         seed=20260804 + max(kv_lens),
     )
 
-    policy = _exercise_explicit_kv256_case(monkeypatch, case)
+    policy = exercise_explicit_decode_profile(monkeypatch, case)
 
     assert policy["tile_size_q"] == 64
     assert policy["tile_size_kv"] == 256
@@ -8311,7 +8325,7 @@ def test_attention_ts_decode_explicit_16bit_paged_keeps_q128(
     if q_lens is not None:
         case, qo_indptr = _pack_decode_case(case, q_lens)
 
-    policy = _exercise_explicit_profile_case(
+    policy = exercise_explicit_decode_profile(
         monkeypatch,
         case,
         _EXPLICIT_PAGED_16BIT_Q128_PROFILE,
@@ -8356,6 +8370,45 @@ def test_attention_ts_decode_16bit_paged_keeps_q128_automatic_scope(
     assert automatic.use_keeps_mma_ab
     assert automatic.tile_size_q == 128
     assert automatic.groups_tokens_heads_q
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(("tile_size_q", "tile_size_kv"), ((128, 128), (64, 256)))
+def test_attention_ts_decode_sm107_expanded_resources(
+    monkeypatch: pytest.MonkeyPatch, tile_size_q: int, tile_size_kv: int
+):
+    """Check exclusive TMEM and deeper FP8 rings across ragged KV tails."""
+
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("Expanded resource profiles require SM107")
+    if not tcgen05_compat.dsl_supports_exclusive_tmem():
+        pytest.skip("Expanded resource profiles require native DSL support")
+
+    case = _make_decode_case(
+        kv_lens=(3073, 2637),
+        num_qo_heads=64,
+        num_kv_heads=4,
+        head_dim=128,
+        seq_len_q=tile_size_q // 16,
+        page_size=32,
+        qkv_dtype=_FP8,
+        output_dtype=_FP8,
+        cache_form="tuple",
+        mask_type="causal",
+        device="cuda",
+        seed=20261025,
+    )
+    exercise_explicit_decode_profile(
+        monkeypatch,
+        case,
+        config_args={
+            "tile_size_q": tile_size_q,
+            "tile_size_kv": tile_size_kv,
+            "max_tmem_alloc_cols": 576,
+            "smem_capacity_kib": 327,
+        },
+        exercise_all_paths=True,
+    )
 
 
 @_REQUIRES_PRIMTS_GPU
