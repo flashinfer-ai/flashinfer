@@ -348,8 +348,9 @@ SM103_NARROW_ROUTES = [
 # sm_107a: the narrow tile up to 8 rows over the measured windows (inside points,
 # the nearest measured shapes the windows exclude and an input that is not a
 # multiple of 64), PACKED on 8 rows without a bias and 9 to 16 with one from 3584
-# output features, and with a bias 28 to 32 rows from 2048 output features; the M=64
-# tiles at 2048 to 3072 output features (corners, and the measured shapes past them).
+# output features, with a bias 28 to 32 rows from 2048 output features, without one
+# 9 to 16 rows from 1728; the M=64 tiles at 2048 to 3072 output features (corners,
+# and the measured shapes past them).
 SM107_ROUTES = [
     (4, 384, 16384, True, "PACKED_NARROW_U4"),
     (3, 512, 16384, True, "PACKED_NARROW_U4"),
@@ -412,6 +413,10 @@ SM107_ROUTES = [
     (16, 2048, 2048, False, "PACKED_M64_N16"),
     (9, 3072, 10240, False, "PACKED_M64_N16"),
     (12, 2880, 4096, False, "PACKED"),
+    (12, 1600, 4096, False, None),
+    (16, 1664, 6144, False, None),
+    (9, 1728, 4096, False, "PACKED"),
+    (17, 1536, 4096, False, "PACKED"),
     (28, 1536, 4096, False, "PACKED"),
     (28, 1536, 4096, True, None),
     (32, 2048, 3072, True, "PACKED"),
