@@ -60,6 +60,7 @@ class WarpGroupedProjection:
         gated=True,
         parameters=None,
         block_scaled=False,
+        weight_first=False,
     ):
         if (
             group_size not in (2, 4, 8)
@@ -78,6 +79,7 @@ class WarpGroupedProjection:
         self.activation = activation
         self.parameters = parameters
         self.block_scaled = block_scaled
+        self.weight_first = weight_first
         self.rows_per_tile = 32 if self.split_gate else 64
         self.acc_dtype = cutlass.Float32
         self.cluster_shape_mn = (1, 1)
@@ -87,6 +89,25 @@ class WarpGroupedProjection:
         self.num_threads_per_warp_group = 128
         self.threads_per_cta = 128
         self.buffer_align_bytes = 1024
+
+    @cute.jit
+    def _gather_activations(self, raw_b, sB, members, tidx, k_tile, stage):
+        for bn in cutlass.range_constexpr(8):
+            for segment in cutlass.range_constexpr(self.tile_shape_mnk[2] // 32):
+                bk = tidx % 32 + segment * 32
+                bv = self.b_dtype(0)
+                if cutlass.const_expr(bn < self.group_size):
+                    if members[bn] >= 0 and k_tile * self.tile_shape_mnk[
+                        2
+                    ] + bk < cute.size(raw_b, mode=[1]):
+                        bv = raw_b[
+                            0,
+                            k_tile * self.tile_shape_mnk[2] + bk,
+                            members[bn] // self.input_route_divisor,
+                        ]
+                sB[bn, bk, stage] = bv
+        cute.arch.fence_proxy("async.shared", space="cta")
+        cute.arch.sync_warp()
 
     def _setup_attributes(self):
         if self.tile_shape_mnk[0] not in [64, 128]:
@@ -410,30 +431,15 @@ class WarpGroupedProjection:
                         )
                         tAgA_k = tAgA_mkl[None, mainloop_producer_state.count]
                         tAsA_pipe = tAsA[None, mainloop_producer_state.index]
-                        for bn in cutlass.range_constexpr(8):
-                            for segment in cutlass.range_constexpr(
-                                self.tile_shape_mnk[2] // 32
-                            ):
-                                bk = tidx % 32 + segment * 32
-                                bv = self.b_dtype(0)
-                                if cutlass.const_expr(bn < self.group_size):
-                                    if (
-                                        members[bn] >= 0
-                                        and mainloop_producer_state.count
-                                        * self.tile_shape_mnk[2]
-                                        + bk
-                                        < cute.size(raw_b, mode=[1])
-                                    ):
-                                        bv = raw_b[
-                                            0,
-                                            mainloop_producer_state.count
-                                            * self.tile_shape_mnk[2]
-                                            + bk,
-                                            members[bn] // self.input_route_divisor,
-                                        ]
-                                sB[bn, bk, mainloop_producer_state.index] = bv
-                        cute.arch.fence_proxy("async.shared", space="cta")
-                        cute.arch.sync_warp()
+                        if cutlass.const_expr(not self.weight_first):
+                            self._gather_activations(
+                                raw_b,
+                                sB,
+                                members,
+                                tidx,
+                                mainloop_producer_state.count,
+                                mainloop_producer_state.index,
+                            )
                         mainloop_pipeline.producer_acquire(
                             mainloop_producer_state, cutlass.Boolean(True)
                         )
@@ -456,6 +462,15 @@ class WarpGroupedProjection:
                                 ),
                                 mcast_mask=a_mcast_mask,
                             )
+                        if cutlass.const_expr(self.weight_first):
+                            self._gather_activations(
+                                raw_b,
+                                sB,
+                                members,
+                                tidx,
+                                mainloop_producer_state.count,
+                                mainloop_producer_state.index,
+                            )
                         mainloop_pipeline.producer_commit(mainloop_producer_state)
                         mainloop_producer_state.advance()
                 accumulators.fill(0.0)
@@ -467,6 +482,9 @@ class WarpGroupedProjection:
                 )
                 for _k_tile in cutlass.range(k_tile_cnt, unroll=1):
                     mainloop_pipeline.consumer_wait(consumer)
+                    # The TMA barrier orders weights only. This CTA barrier also
+                    # waits for the producer warp's software activation stores,
+                    # including when weight TMA was issued before that gather.
                     cute.arch.sync_threads()
                     cute.copy(
                         copy_a, copy_sa[None, None, None, consumer.index], copy_ra
@@ -523,30 +541,15 @@ class WarpGroupedProjection:
                         )
                         tAgA_k = tAgA_mkl[None, mainloop_producer_state.count]
                         tAsA_pipe = tAsA[None, mainloop_producer_state.index]
-                        for bn in cutlass.range_constexpr(8):
-                            for segment in cutlass.range_constexpr(
-                                self.tile_shape_mnk[2] // 32
-                            ):
-                                bk = tidx % 32 + segment * 32
-                                bv = self.b_dtype(0)
-                                if cutlass.const_expr(bn < self.group_size):
-                                    if (
-                                        members[bn] >= 0
-                                        and mainloop_producer_state.count
-                                        * self.tile_shape_mnk[2]
-                                        + bk
-                                        < cute.size(raw_b, mode=[1])
-                                    ):
-                                        bv = raw_b[
-                                            0,
-                                            mainloop_producer_state.count
-                                            * self.tile_shape_mnk[2]
-                                            + bk,
-                                            members[bn] // self.input_route_divisor,
-                                        ]
-                                sB[bn, bk, mainloop_producer_state.index] = bv
-                        cute.arch.fence_proxy("async.shared", space="cta")
-                        cute.arch.sync_warp()
+                        if cutlass.const_expr(not self.weight_first):
+                            self._gather_activations(
+                                raw_b,
+                                sB,
+                                members,
+                                tidx,
+                                mainloop_producer_state.count,
+                                mainloop_producer_state.index,
+                            )
                         mainloop_pipeline.producer_acquire(
                             mainloop_producer_state, cutlass.Boolean(True)
                         )
@@ -568,6 +571,15 @@ class WarpGroupedProjection:
                                     mainloop_producer_state
                                 ),
                                 mcast_mask=a_mcast_mask,
+                            )
+                        if cutlass.const_expr(self.weight_first):
+                            self._gather_activations(
+                                raw_b,
+                                sB,
+                                members,
+                                tidx,
+                                mainloop_producer_state.count,
+                                mainloop_producer_state.index,
                             )
                         mainloop_pipeline.producer_commit(mainloop_producer_state)
                         mainloop_producer_state.advance()

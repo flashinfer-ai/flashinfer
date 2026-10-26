@@ -56,6 +56,7 @@ def launch(
     finalize: cutlass.Constexpr,
     stream,
     architecture: cutlass.Constexpr = 90,
+    weight_first: cutlass.Constexpr = False,
 ):
     top_k = cute.size(ids, mode=[1])
     if cutlass.const_expr(architecture == 80):
@@ -78,9 +79,19 @@ def launch(
         second_hopper(w2, mid, ids, routes, stream)
     else:
         first_warp = WarpGroupedProjection(
-            True, group_size, stages, tile_k, top_k, activation, gated, parameters
+            True,
+            group_size,
+            stages,
+            tile_k,
+            top_k,
+            activation,
+            gated,
+            parameters,
+            weight_first=weight_first,
         )
-        second_warp = WarpGroupedProjection(False, group_size, stages, tile_k, top_k)
+        second_warp = WarpGroupedProjection(
+            False, group_size, stages, tile_k, top_k, weight_first=weight_first
+        )
         first_warp(w1, x, ids, mid, stream)
         second_warp(w2, mid, ids, routes, stream)
     if cutlass.const_expr(finalize):
@@ -160,6 +171,15 @@ _TACTICS = tuple(
 )
 
 
+# Preserve the original four-element tactics and their scheduling. Weight-first
+# overlap is an additional dense-only choice: cold weights can benefit while
+# cache-resident weights favor the original gather-first order.
+_WEIGHT_FIRST_TACTICS = tuple(
+    ("warp_mma", *choice, True)
+    for choice in ((8, 2, 128), (4, 2, 64), (2, 2, 64), (2, 2, 128))
+)
+
+
 def execute(inputs, config, tactic):
     """Bind live buffers to a compiled projection pair."""
     import torch
@@ -168,7 +188,7 @@ def execute(inputs, config, tactic):
     from ..runtime import _COMPILED, _COMPILE_LOCK
     from .....utils import get_compute_capability
 
-    if tactic not in _TACTICS:
+    if tactic not in _TACTICS and tactic not in _WEIGHT_FIRST_TACTICS:
         raise ValueError(
             "Grouped decode requires a valid architecture/group/stage/K tactic"
         )
@@ -190,7 +210,23 @@ def execute(inputs, config, tactic):
         )
     if x.shape[0] > 8 or ids.shape[1] > 32 or mid.shape[1] % 128 or x.shape[1] % 128:
         raise ValueError("Grouped TC decode requires T<=8, top-k<=32 and aligned H/I")
-    group_size, stages, tile_k = tactic[1:]
+    group_size, stages, tile_k = tactic[1:4]
+    weight_first = len(tactic) == 5
+    if weight_first:
+        from ....api import SwiGLU
+
+        if (
+            fp8
+            or (x.shape[0], x.shape[1], mid.shape[1], ids.shape[1])
+            != (8, 2048, 512, 10)
+            or output.dtype != x.dtype
+            or config.activation != SwiGLU()
+            or not config.finalize.do_finalize
+        ):
+            raise ValueError(
+                "Weight-first grouped decode requires dense BF16/FP16 SwiGLU, "
+                "T8/H2048/I512/top-k10, matching output dtype and finalization"
+            )
     finalize = config.finalize.do_finalize
     tensors = (x, w1, ids, mid, w2, routes, scores, output)
     if fp8:
@@ -235,6 +271,7 @@ def execute(inputs, config, tactic):
                         finalize,
                         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
                         architecture,
+                        **({"weight_first": True} if weight_first else {}),
                         options=f"--gpu-arch sm_{architecture}{'' if architecture == 80 else 'a'} --enable-tvm-ffi",
                     )
                     _COMPILED[key] = compiled
