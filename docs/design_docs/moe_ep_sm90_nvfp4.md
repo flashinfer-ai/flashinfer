@@ -178,3 +178,28 @@ five attempts retain the first block passing the rank-skew rule. Three rounds
 in one process are not three independent fresh-process runs. Use separate
 `torchrun` processes to measure process-to-process variation, and account for
 actual GPU clock and power states when interpreting results.
+
+## Two-slot scale ring
+
+`nvfp4_sf_stages=0` follows the AB pipeline's scale-buffer stage count.
+Eligible non-pingpong M256N64K256 tactics can instead use
+`nvfp4_sf_stages=2`, `compact_pull_buffer=True`, lane LUT mapping, and one
+or two LUT replicas. Two scale slots reduce shared-memory use; the supplied
+profiles use four AB stages. The AB and scale-ring barriers use their own
+slot counts. This changes buffering, not the numerical operation: same-core
+sf0/sf2 output remains byte-identical.
+
+The candidate table includes five measured SF2 profiles: R1/R2 variants
+of the T512 and T1024 seeds, and one R1 variant of the T2048 seed. Their
+admission uses geometry, protocol and shared-memory legality, without GPU
+product-name or live-token restrictions. T512/T1024 reference capacity
+buckets use R1 SF2 defaults; the other eleven reference defaults use SF0.
+Autotuning can select any legal profile by measurement, including with
+FC1 overlap explicitly disabled. Explicit token-back selection without
+`knobs` uses manual configuration rather than inheriting an SF2 default.
+
+A complete manual tactic can set `"nvfp4_sf_stages": 2`. The AB stage count
+must be a multiple of twice the scale-ring depth, and rounding must not
+reduce it below the corresponding SF0 stage count. Illegal resource
+combinations are rejected before launch. SF1 remains available for legal
+manual configurations that meet this rule.
