@@ -434,11 +434,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_100a"],
     },
-    "cake_batch_deepgemm_fp8_66c78f32b0e641be5c00": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_66c78f32b0e641be5c00",
+    "cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4",
         "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_66c78f32b0e641be5c00_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_66c78f32b0e641be5c00_binding.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -446,11 +446,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4",
+    "cake_batch_deepgemm_fp8_802de3de969a71fa24ba": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_802de3de969a71fa24ba",
         "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4_binding.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_802de3de969a71fa24ba_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_802de3de969a71fa24ba_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -953,14 +953,6 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_100a",
         "program": "cake_batch_deepgemm_fp8_5c5bed387a6f65778b39",
     },
-    "cake_batch_deepgemm_fp8_66c78f32b0e641be5c00_sm_100a": {
-        "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_66c78f32b0e641be5c00",
-    },
-    "cake_batch_deepgemm_fp8_66c78f32b0e641be5c00_sm_103a": {
-        "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_66c78f32b0e641be5c00",
-    },
     "cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4_sm_100a": {
         "arch": "sm_100a",
         "program": "cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4",
@@ -968,6 +960,14 @@ MODULES: dict[str, dict[str, str]] = {
     "cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4_sm_103a": {
         "arch": "sm_103a",
         "program": "cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4",
+    },
+    "cake_batch_deepgemm_fp8_802de3de969a71fa24ba_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_802de3de969a71fa24ba",
+    },
+    "cake_batch_deepgemm_fp8_802de3de969a71fa24ba_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_802de3de969a71fa24ba",
     },
     "cake_batch_deepgemm_fp8_87a3c50a96af69fbae87_sm_100a": {
         "arch": "sm_100a",
@@ -1472,7 +1472,7 @@ _ROUTES: tuple[_Route, ...] = (
     _point("sm_100a", "seed_swap_bm__bm192",
            ((1, 8192, 4096, 7168), (4, 1024, 7168, 2048), (8, 256, 7168, 2048),
             (8, 1024, 4096, 7168), (8, 1024, 7168, 2048)), None,
-           (("cake_batch_deepgemm_fp8_66c78f32b0e641be5c00", "masked_bn", 128, 128),),
+           (("cake_batch_deepgemm_fp8_802de3de969a71fa24ba", "masked_bn", 128, 128),),
            parent="seed_swap_bm"),
     _point("sm_100a", "seed_swap_bm__bm224",
            ((1, 1024, 4096, 7168), (1, 8192, 7168, 2048), (1, 16384, 4096, 7168),
@@ -1494,7 +1494,7 @@ _ROUTES: tuple[_Route, ...] = (
            parent="seed_swap_bm"),
     _point("sm_103a", "seed_swap_bm__bm192",
            ((4, 1024, 4096, 7168), (4, 1024, 7168, 2048), (8, 1024, 4096, 7168)), None,
-           (("cake_batch_deepgemm_fp8_66c78f32b0e641be5c00", "masked_bn", 128, 128),),
+           (("cake_batch_deepgemm_fp8_802de3de969a71fa24ba", "masked_bn", 128, 128),),
            parent="seed_swap_bm"),
     _point("sm_103a", "seed_swap_bm__bm208",
            ((1, 16384, 4096, 7168), (1, 16384, 7168, 2048),

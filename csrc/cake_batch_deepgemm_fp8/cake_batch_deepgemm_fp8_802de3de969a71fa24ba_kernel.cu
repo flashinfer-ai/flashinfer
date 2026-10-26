@@ -191,7 +191,7 @@ __device__ __forceinline__ void tma_store_3d(
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_batch_deepgemm_fp8_66c78f32b0e641be5c00(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, int* __restrict__ SFA_bits, int* __restrict__ SFB_bits, int* __restrict__ masked_m, const __grid_constant__ CUtensorMap C_tma, unsigned int num_groups, unsigned int shape_m, unsigned int shape_n, unsigned int grid_n, unsigned int k_tiles, unsigned int sf_cols)
+kernel_cake_batch_deepgemm_fp8_802de3de969a71fa24ba(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, int* __restrict__ SFA_bits, int* __restrict__ SFB_bits, int* __restrict__ masked_m, const __grid_constant__ CUtensorMap C_tma, unsigned int num_groups, unsigned int shape_m, unsigned int shape_n, unsigned int grid_n, unsigned int k_tiles, unsigned int sf_cols)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -389,6 +389,7 @@ kernel_cake_batch_deepgemm_fp8_66c78f32b0e641be5c00(const __grid_constant__ CUte
             unsigned int max_scheduler_iters_1 = (max_total_tiles_1 + num_bids_u_1 - 1) / num_bids_u_1;
             unsigned int _phase_epilogue_done = 1;
             unsigned int _phase_scale_ready = 0;
+            unsigned int _phase_tma_full = 0;
             if (cta_rank == 0) {
                 #pragma unroll 1
                 for (int current_iter_1 = 0; current_iter_1 < max_scheduler_iters_1; current_iter_1++) {
@@ -426,7 +427,7 @@ kernel_cake_batch_deepgemm_fp8_66c78f32b0e641be5c00(const __grid_constant__ CUte
                     #pragma unroll 4
                     for (int iter_k_1 = 0; iter_k_1 < k_tiles; iter_k_1++) {
                         mbarrier_wait_hint(scale_ready_addr + (tma_stage) * 8, _phase_scale_ready, 10000000);
-                        mbarrier_wait_hint(tma_full_addr + (tma_stage) * 8, _phase_scale_ready, 10000000);
+                        mbarrier_wait_hint(tma_full_addr + (tma_stage) * 8, _phase_tma_full, 10000000);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         int init_flag = ((iter_k_1 == 0) ? 1 : 0);
                         if (elect_sync()) {
@@ -453,7 +454,7 @@ kernel_cake_batch_deepgemm_fp8_66c78f32b0e641be5c00(const __grid_constant__ CUte
                         }
                         elect_commit_cg2_multicast(tma_free_addr + (tma_stage) * 8, (uint16_t)(3));
                         tma_stage += 1;
-                        if (tma_stage == 7) { tma_stage = 0; _phase_scale_ready ^= 1; }
+                        if (tma_stage == 7) { tma_stage = 0; _phase_scale_ready ^= 1; _phase_tma_full ^= 1; }
                     }
                     elect_commit_cg2_multicast(mainloop_done_addr + (epi_stage) * 8, (uint16_t)(3));
                     epi_stage += 1;
