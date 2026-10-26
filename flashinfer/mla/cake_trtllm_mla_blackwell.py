@@ -87,7 +87,7 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_trtllm_mla_blackwell_74250d91903d28576cba": {
         "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_74250d91903d28576cba_kernel.cu",
         "compile_flags": ["--use_fast_math"],
-        "arches": ["sm_100a"],
+        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_trtllm_mla_blackwell_79e49e216298d59fce33": {
         "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_79e49e216298d59fce33_kernel.cu",
@@ -98,11 +98,6 @@ MODULES: dict[str, dict[str, Any]] = {
         "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_88179fe5ff3ecd4952de_kernel.cu",
         "compile_flags": ["--use_fast_math"],
         "arches": ["sm_103a"],
-    },
-    "cake_trtllm_mla_blackwell_c343762a5d3d9f326db2": {
-        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_c343762a5d3d9f326db2_kernel.cu",
-        "compile_flags": ["--use_fast_math"],
-        "arches": ["sm_100a"],
     },
     "cake_trtllm_mla_blackwell_d1a68c90cbc4aa0fcd6e": {
         "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_d1a68c90cbc4aa0fcd6e_kernel.cu",
@@ -163,7 +158,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
             "-DCAKE_FAMILY_NAME=cake_trtllm_mla_blackwell_family_35a4a08ccde422e44143",
             "-DCAKE_PROGRAM_SHIM=cake_host_shim_94b32302211ab127",
             "-DCAKE_VARIANT_NS=variant_cake_trtllm_mla_blackwell_f2fc000e792120064e14_sm_103a_c0b88736d8c7",
-            "-DCAKE_PROGRAM_KERNEL=kernel_cake_trtllm_mla_blackwell_f2fc000e792120064e14",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_trtllm_mla_blackwell_db7296c6a9103fe793bf",
         ],
         "dependencies": ["cake_trtllm_mla_blackwell_f2fc000e792120064e14"],
         "compile_flags": ["-std=c++17"],
@@ -185,6 +180,19 @@ FAMILIES: dict[str, dict[str, Any]] = {
         "compile_flags": ["-std=c++17"],
         "domain": "mla_bf16_native_split8_pdl",
     },
+    "cake_trtllm_mla_blackwell_family_4bb31097f149a035c68b": {
+        "arch": "sm_103a",
+        "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_df17a573e48e469242d2_binding.cu",
+        "binding_flags": [
+            "-DCAKE_FAMILY_NAME=cake_trtllm_mla_blackwell_family_4bb31097f149a035c68b",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_568ab767e82408d1",
+            "-DCAKE_VARIANT_NS=variant_cake_trtllm_mla_blackwell_74250d91903d28576cba_sm_103a_619a0eadc032",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_trtllm_mla_blackwell_6e07f00469cd68db34b5",
+        ],
+        "dependencies": ["cake_trtllm_mla_blackwell_74250d91903d28576cba"],
+        "compile_flags": ["-std=c++17"],
+        "domain": "mla_bf16_clc",
+    },
     "cake_trtllm_mla_blackwell_family_58aaa55b459e12fb35b8": {
         "arch": "sm_100a",
         "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_58aaa55b459e12fb35b8_binding.cu",
@@ -203,7 +211,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
             "-DCAKE_PROGRAM_SHIM=cake_host_shim_c465664ad1dad4f5",
             "-DCAKE_VARIANT_NS_0=variant_cake_trtllm_mla_blackwell_88179fe5ff3ecd4952de_sm_103a_24d3bb8e20ac",
             "-DCAKE_VARIANT_NS_1=variant_cake_trtllm_mla_blackwell_4de3d4bf2f8c5467bf29_sm_103a_475cfbbf5b57",
-            "-DCAKE_PROGRAM_KERNEL_1=kernel_cake_trtllm_mla_blackwell_88179fe5ff3ecd4952de",
+            "-DCAKE_PROGRAM_KERNEL_1=kernel_cake_trtllm_mla_blackwell_989e1e1ed03c93435753",
         ],
         "dependencies": [
             "cake_trtllm_mla_blackwell_88179fe5ff3ecd4952de",
@@ -250,6 +258,19 @@ FAMILIES: dict[str, dict[str, Any]] = {
         "compile_flags": ["-std=c++17"],
         "domain": "mla_bf16_vquarter",
     },
+    "cake_trtllm_mla_blackwell_family_964007a10127ad82351f": {
+        "arch": "sm_103a",
+        "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_df17a573e48e469242d2_binding.cu",
+        "binding_flags": [
+            "-DCAKE_FAMILY_NAME=cake_trtllm_mla_blackwell_family_964007a10127ad82351f",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_e7a3b284513206b0",
+            "-DCAKE_VARIANT_NS=variant_cake_trtllm_mla_blackwell_74250d91903d28576cba_sm_103a_c68808045858",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_trtllm_mla_blackwell_14fd33b4738fd4437f0b",
+        ],
+        "dependencies": ["cake_trtllm_mla_blackwell_74250d91903d28576cba"],
+        "compile_flags": ["-std=c++17"],
+        "domain": "mla_bf16_clc",
+    },
     "cake_trtllm_mla_blackwell_family_964aa840394fcd0656c0": {
         "arch": "sm_100a",
         "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_964aa840394fcd0656c0_binding.cu",
@@ -271,12 +292,18 @@ FAMILIES: dict[str, dict[str, Any]] = {
         "compile_flags": ["-std=c++17"],
         "domain": "mla_bf16_clc_exact007826",
     },
-    "cake_trtllm_mla_blackwell_family_a77fd5c07db49c791e35": {
+    "cake_trtllm_mla_blackwell_family_b63c3e2976629b83c0fd": {
         "arch": "sm_100a",
-        "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_a77fd5c07db49c791e35_binding.cu",
-        "dependencies": ["cake_trtllm_mla_blackwell_c343762a5d3d9f326db2"],
+        "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_df17a573e48e469242d2_binding.cu",
+        "binding_flags": [
+            "-DCAKE_FAMILY_NAME=cake_trtllm_mla_blackwell_family_b63c3e2976629b83c0fd",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_095cc002cd67dd9c",
+            "-DCAKE_VARIANT_NS=variant_cake_trtllm_mla_blackwell_74250d91903d28576cba_sm_100a_7457914cd525",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_trtllm_mla_blackwell_0738dc80fead18e5c948",
+        ],
+        "dependencies": ["cake_trtllm_mla_blackwell_74250d91903d28576cba"],
         "compile_flags": ["-std=c++17"],
-        "domain": "mla_bf16_clc_exact007826",
+        "domain": "mla_bf16_clc",
     },
     "cake_trtllm_mla_blackwell_family_c325c9f98ac456facec0": {
         "arch": "sm_103a",
@@ -357,10 +384,14 @@ FAMILIES: dict[str, dict[str, Any]] = {
 ROUTES: dict[str, str] = {
     "mla_bf16_clc__sm_100a": "cake_trtllm_mla_blackwell_family_df17a573e48e469242d2",
     "mla_bf16_clc__sm_103a": "cake_trtllm_mla_blackwell_family_e958fd69e74d907885f3",
+    "mla_bf16_clc__sm_103a__152": "cake_trtllm_mla_blackwell_family_964007a10127ad82351f",
     "mla_bf16_clc_exact007790__sm_100a": "cake_trtllm_mla_blackwell_family_f0c36de00f7e55ccf2c2",
     "mla_bf16_clc_exact007790__sm_103a": "cake_trtllm_mla_blackwell_family_35a4a08ccde422e44143",
-    "mla_bf16_clc_exact007826__sm_100a": "cake_trtllm_mla_blackwell_family_a77fd5c07db49c791e35",
+    "mla_bf16_clc_exact007826__sm_100a": "cake_trtllm_mla_blackwell_family_df17a573e48e469242d2",
     "mla_bf16_clc_exact007826__sm_103a": "cake_trtllm_mla_blackwell_family_9eb0e53aa4b05afa531b",
+    "mla_bf16_clc_exact007826__sm_103a__152": "cake_trtllm_mla_blackwell_family_964007a10127ad82351f",
+    "mla_bf16_clc_one_wave__sm_100a__148": "cake_trtllm_mla_blackwell_family_b63c3e2976629b83c0fd",
+    "mla_bf16_clc_one_wave__sm_103a__152": "cake_trtllm_mla_blackwell_family_4bb31097f149a035c68b",
     "mla_bf16_native_split8_pdl__sm_100a": "cake_trtllm_mla_blackwell_family_58aaa55b459e12fb35b8",
     "mla_bf16_native_split8_pdl__sm_103a": "cake_trtllm_mla_blackwell_family_3fa9fe12db6254809466",
     "mla_bf16_tail__sm_100a": "cake_trtllm_mla_blackwell_family_69765950411de111b0b4",
@@ -454,18 +485,49 @@ def get_cake_trtllm_mla_blackwell_family(name: str):
     return gen_cake_trtllm_mla_blackwell_family(name).build_and_load()
 
 
-def route_key(domain: str, arch: str) -> str:
-    return f"{domain}__{arch}"
+def route_key(domain: str, arch: str, num_sms: Optional[int] = None) -> str:
+    if num_sms is None:
+        return f"{domain}__{arch}"
+    return f"{domain}__{arch}__{num_sms}"
 
 
 @functools.cache
-def family_for(domain: str, arch: str) -> str:
+def family_for(domain: str, arch: str, num_sms: Optional[int] = None) -> str:
+    """The family serving ``domain`` on ``arch``.
+
+    A route keyed by the SM count as well (``<domain>__<arch>__<num_sms>``) takes
+    precedence on a device of that count: the sm_103a CLC schedule of the 148-SM
+    B300 is slower on the 152-SM GB300 than the sm_100a schedule built for sm_103a,
+    which also serves the 512x16x1024 geometry there faster than its exact program.
+    """
+    if num_sms is not None:
+        family = ROUTES.get(route_key(domain, arch, num_sms))
+        if family is not None:
+            return family
     try:
         return ROUTES[route_key(domain, arch)]
     except KeyError as exc:
         raise ValueError(
             f"TRT-LLM MLA Blackwell has no generated family for domain {domain!r} on {arch}"
         ) from exc
+
+
+def launch_family(domain: str, arch: str, num_sms: int, work_items: int) -> str:
+    """The family launching ``work_items`` work items of ``domain`` on ``arch``.
+
+    A generic CLC launch whose work items all start in the first wave of clusters
+    (``work_items <= num_sms // 2``) takes the one-wave CLC program where one is
+    generated for the device (route ``mla_bf16_clc_one_wave__<arch>__<num_sms>``):
+    its idle scheduler warp prefetches the first work item's query rows, KV length
+    and page-table entries to L2 at kernel entry.  It is a separate program because
+    that code slows the generic program's multi-wave launches.  Every other launch
+    takes ``family_for``.
+    """
+    if domain == DOMAIN_BF16_CLC and work_items <= max(1, num_sms // _CLUSTER_SIZE):
+        family = ROUTES.get(route_key(DOMAIN_BF16_CLC_ONE_WAVE, arch, num_sms))
+        if family is not None:
+            return family
+    return family_for(domain, arch, num_sms)
 
 
 # --- Device facts (cached once per device index) ------------------------------------
@@ -505,6 +567,8 @@ DOMAIN_BF16_VHALF = "mla_bf16_vhalf"
 DOMAIN_BF16_CLC = "mla_bf16_clc"
 DOMAIN_BF16_CLC_EXACT007790 = "mla_bf16_clc_exact007790"
 DOMAIN_BF16_CLC_EXACT007826 = "mla_bf16_clc_exact007826"
+# Route domain of the one-wave CLC programs (``launch_family``).
+DOMAIN_BF16_CLC_ONE_WAVE = "mla_bf16_clc_one_wave"
 _CLC_DOMAINS = (
     DOMAIN_BF16_CLC,
     DOMAIN_BF16_CLC_EXACT007790,
@@ -1178,7 +1242,9 @@ def trtllm_mla_blackwell_decode(
     )
     row_batches, row_seq_lens = plan["row_batches"], plan["row_seq_lens"]
     stream = int(torch.cuda.current_stream(device).cuda_stream)
-    run = get_cake_trtllm_mla_blackwell_family(family_for(domain, arch)).run
+    run = get_cake_trtllm_mla_blackwell_family(
+        launch_family(domain, arch, num_sms, total_q)
+    ).run
     softmax_scale_log2 = bmm1 * log2e
 
     if domain == DOMAIN_BF16_NATIVE_SPLIT8:
@@ -1381,6 +1447,7 @@ __all__ = [
     "ROUTES",
     "exact_route_candidate",
     "gen_cake_trtllm_mla_blackwell_family",
+    "launch_family",
     "plan_num_split",
     "row_metadata",
     "select_domain",
