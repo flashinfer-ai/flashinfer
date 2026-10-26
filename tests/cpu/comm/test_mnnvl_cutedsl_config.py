@@ -85,6 +85,7 @@ def _target(protocol: ProtocolKind, preset: str) -> KernelTarget[str]:
     return KernelTarget(protocol=protocol, preset=preset)
 
 
+@pytest.mark.cpu_only
 def test_static_profile_rejects_hidden_size_without_vector_alignment():
     routes = MRangeDispatch(
         upper_bounds=(None,),
@@ -101,6 +102,7 @@ def test_static_profile_rejects_hidden_size_without_vector_alignment():
         )
 
 
+@pytest.mark.cpu_only
 def test_m_range_dispatch_selects_contiguous_ranges():
     dispatch = MRangeDispatch(
         upper_bounds=(4, 64, None),
@@ -119,6 +121,7 @@ def test_m_range_dispatch_selects_contiguous_ranges():
     assert dispatch.select(8192).preset == "ht"
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "upper_bounds",
     [(), (0,), (8, 8), (None, 8)],
@@ -132,6 +135,7 @@ def test_m_range_dispatch_rejects_invalid_ranges(upper_bounds):
         MRangeDispatch(upper_bounds=upper_bounds, targets=targets)
 
 
+@pytest.mark.cpu_only
 def test_config_derives_protocol_capacities():
     profile = StaticProfile(
         tp_size=8,
@@ -169,6 +173,7 @@ def test_config_derives_protocol_capacities():
     assert resolved.protocol_capacity(ProtocolKind.HT, capacity_m=8192) == 8192
 
 
+@pytest.mark.cpu_only
 def test_static_profile_supports_protocol_internal_preset_switch():
     profile = StaticProfile(
         tp_size=8,
@@ -192,6 +197,7 @@ def test_static_profile_supports_protocol_internal_preset_switch():
     assert profile.finalize_routes.select(9).preset == "preset-1"
 
 
+@pytest.mark.cpu_only
 def test_bounded_only_config_rejects_larger_capacity():
     bt = _target(ProtocolKind.BT, "bt")
     profile = StaticProfile(
@@ -221,6 +227,7 @@ def test_bounded_only_config_rejects_larger_capacity():
         )
 
 
+@pytest.mark.cpu_only
 def test_default_protocol_and_preset_boundaries():
     expected = {
         8: {
@@ -280,6 +287,7 @@ def test_default_protocol_and_preset_boundaries():
                     assert target.preset is expected_preset
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("tp_size", [8, 16])
 def test_default_finalize_presets_use_safe_shared_expert_ordering(tp_size):
     profile = DEFAULT_CONFIG.resolve(
@@ -295,6 +303,7 @@ def test_default_finalize_presets_use_safe_shared_expert_ordering(tp_size):
             assert target.preset.load_shared_expert_before_pdl is False
 
 
+@pytest.mark.cpu_only
 def test_kimi_k3_default_protocol_and_preset_boundaries():
     expected = {
         4: {
@@ -440,6 +449,7 @@ def _tp4_h8192(config, compute_capability):
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "compute_capability,norm",
     tuple(_TP4_H8192_ROUTES),
@@ -460,6 +470,7 @@ def test_tp4_h8192_protocol_and_preset_boundaries(compute_capability, norm):
             assert target.preset is preset
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("compute_capability", (_RUBIN, _GB300))
 def test_tp4_h8192_norm_routes_avoid_two_shot(compute_capability):
     """The norm-on routes also serve dynamic FP8, which two-shot rejects."""
@@ -468,6 +479,7 @@ def test_tp4_h8192_norm_routes_avoid_two_shot(compute_capability):
         assert not getattr(target.preset, "two_shot", False)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("compute_capability", (_RUBIN, _GB300))
 def test_tp4_h8192_no_norm_routes_avoid_ht(compute_capability):
     """HT cannot compile the norm out, so norm-free routes never reach it."""
@@ -475,6 +487,7 @@ def test_tp4_h8192_no_norm_routes_avoid_ht(compute_capability):
     assert ProtocolKind.HT not in profile.referenced_protocols
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("compute_capability", (None, (10, 0), (12, 0)))
 def test_tp4_h8192_has_no_profile_for_other_architectures(compute_capability):
     for config in (DEFAULT_CONFIG, NO_NORM_CONFIG):
@@ -509,6 +522,7 @@ def _resolved_preset(config: MNNVLCuteDSLConfig, compute_capability) -> str:
     return profile.all_reduce_routes.select(1).preset
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("agnostic_first", (True, False))
 def test_resolve_prefers_architecture_specific_profile(agnostic_first):
     agnostic = _single_route_profile("any")
@@ -522,6 +536,7 @@ def test_resolve_prefers_architecture_specific_profile(agnostic_first):
     assert _resolved_preset(config, None) == "any"
 
 
+@pytest.mark.cpu_only
 def test_architecture_specific_profile_needs_a_matching_device():
     config = MNNVLCuteDSLConfig(profiles=(_single_route_profile("rubin", _RUBIN),))
     assert _resolved_preset(config, _RUBIN) == "rubin"
@@ -540,6 +555,7 @@ def test_architecture_specific_profile_needs_a_matching_device():
         )
 
 
+@pytest.mark.cpu_only
 def test_config_rejects_duplicate_profile_per_architecture():
     MNNVLCuteDSLConfig(
         profiles=(_single_route_profile("a"), _single_route_profile("b", _RUBIN))
@@ -557,11 +573,13 @@ def test_config_rejects_duplicate_profile_per_architecture():
         )
 
 
+@pytest.mark.cpu_only
 def test_static_profile_rejects_malformed_compute_capability():
     with pytest.raises(ValueError, match="compute_capability"):
         _single_route_profile("a", (10,))  # type: ignore[arg-type]
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "config,expected_protocol,tp_sizes",
     [
@@ -585,6 +603,7 @@ def test_kimi_k3_only_configs_select_one_protocol(config, expected_protocol, tp_
             )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "config,expected_protocol,capacity_m",
     [
@@ -609,6 +628,7 @@ def test_only_configs_select_one_protocol(
         assert all(target.protocol is expected_protocol for target in routes.targets)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "compute_capability,capacity_m,expected",
     (

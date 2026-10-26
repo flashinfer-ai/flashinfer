@@ -18,6 +18,7 @@ import pytest
 from flashinfer.comm import mnnvl
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "fabric_uuid,state,supported,expected",
     [

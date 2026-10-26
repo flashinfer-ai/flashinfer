@@ -66,12 +66,14 @@ def _local_status(monkeypatch, reason=None, uuid=CLUSTER):
     monkeypatch.setattr(mnnvl, "_local_fabric_status", lambda dev_id: (reason, uuid))
 
 
+@pytest.mark.cpu_only
 def test_single_host_prefers_fabric(monkeypatch):
     _local_status(monkeypatch)
     comm = _status_comm([("node0", None, b""), ("node0", None, b"")])
     assert mnnvl.choose_mnnvl_handle_type(comm, 0) == (FABRIC, True)
 
 
+@pytest.mark.cpu_only
 def test_single_host_uses_posix_when_any_rank_lacks_fabric(monkeypatch):
     _local_status(monkeypatch)
     comm = _status_comm(
@@ -80,12 +82,14 @@ def test_single_host_uses_posix_when_any_rank_lacks_fabric(monkeypatch):
     assert mnnvl.choose_mnnvl_handle_type(comm, 0) == (POSIX, True)
 
 
+@pytest.mark.cpu_only
 def test_multi_host_needs_one_fabric_cluster(monkeypatch):
     _local_status(monkeypatch)
     comm = _status_comm([("node0", None, CLUSTER), ("node1", None, CLUSTER)])
     assert mnnvl.choose_mnnvl_handle_type(comm, 0) == (FABRIC, False)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("peer", "message"),
     [
@@ -133,6 +137,7 @@ def _allocate():
     return mnnvl.allocate_mnnvl_handles(None, 0, lambda handle_type: (handle_type, 64))
 
 
+@pytest.mark.cpu_only
 def test_allocation_uses_the_chosen_type(monkeypatch):
     _choose(monkeypatch, FABRIC, single_host=True)
     attempts = _attempts(monkeypatch, [_SUCCEEDS])
@@ -140,6 +145,7 @@ def test_allocation_uses_the_chosen_type(monkeypatch):
     assert attempts == [FABRIC]
 
 
+@pytest.mark.cpu_only
 def test_single_host_falls_back_to_posix_on_every_allocation(monkeypatch, caplog):
     # Nothing is remembered between allocations, so ranks that allocate over
     # different groups always decide alike; each allocation tries FABRIC again.
@@ -153,6 +159,7 @@ def test_single_host_falls_back_to_posix_on_every_allocation(monkeypatch, caplog
     assert levels == [logging.WARNING, logging.DEBUG]
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("handle_type", "single_host"), [(FABRIC, False), (POSIX, True)]
 )
@@ -233,6 +240,7 @@ def _two_rank_comm(peer_error=None):
     return _GroupComm(0, peers)
 
 
+@pytest.mark.cpu_only
 def test_attempt_imports_every_peer(fake_driver):
     driver = fake_driver()
     prop = SimpleNamespace(requestedHandleTypes=FABRIC)
@@ -241,6 +249,7 @@ def test_attempt_imports_every_peer(fake_driver):
     assert driver.released == []
 
 
+@pytest.mark.cpu_only
 def test_attempt_releases_its_allocation_when_a_peer_fails(fake_driver):
     driver = fake_driver()
     prop = SimpleNamespace(requestedHandleTypes=FABRIC)
@@ -251,6 +260,7 @@ def test_attempt_releases_its_allocation_when_a_peer_fails(fake_driver):
     assert driver.released == [101]
 
 
+@pytest.mark.cpu_only
 def test_attempt_votes_on_a_local_import_failure(fake_driver):
     driver = fake_driver(fail_import=True)
     prop = SimpleNamespace(requestedHandleTypes=FABRIC)
@@ -259,6 +269,7 @@ def test_attempt_votes_on_a_local_import_failure(fake_driver):
     assert driver.released == [101]
 
 
+@pytest.mark.cpu_only
 def test_attempt_releases_its_allocation_when_the_fd_exchange_fails(
     fake_driver, monkeypatch
 ):
@@ -276,6 +287,7 @@ def test_attempt_releases_its_allocation_when_the_fd_exchange_fails(
     assert driver.released == [101] and closed == [1101]
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("granularities", "expected"),
     [

@@ -146,6 +146,7 @@ def _run_workers(target: Callable[..., None], size: int, *extra: Any) -> dict[in
     return results
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("size", [1, 2, 3, 4])
 def test_exchange_fds_all_to_all(size: int) -> None:
     results = _run_workers(_worker_exchange, size)
@@ -157,6 +158,7 @@ def test_exchange_fds_all_to_all(size: int) -> None:
         assert own_slot_is_original, f"rank {rank} own slot was not its original fd"
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "size,root",
     [(2, 0), (2, 1), (3, 0), (3, 2), (4, 0), (4, 3)],
@@ -170,6 +172,7 @@ def test_broadcast_fd(size: int, root: int) -> None:
         )
 
 
+@pytest.mark.cpu_only
 def test_broadcast_fd_single_rank_returns_local() -> None:
     comm = _MPComm(0, 1, None, None)  # size==1 short-circuits before any sync
     fd, path = _make_file(0)
@@ -180,6 +183,7 @@ def test_broadcast_fd_single_rank_returns_local() -> None:
         os.unlink(path)
 
 
+@pytest.mark.cpu_only
 def test_dgram_send_recv_roundtrip(tmp_path: Path) -> None:
     recv_path = str(tmp_path / "recv.sock")
     send_path = str(tmp_path / "send.sock")
@@ -204,6 +208,7 @@ def test_dgram_send_recv_roundtrip(tmp_path: Path) -> None:
         send_sock.close()
 
 
+@pytest.mark.cpu_only
 def test_recv_fd_dgram_without_fd_raises(tmp_path: Path) -> None:
     recv_path = str(tmp_path / "recv.sock")
     send_path = str(tmp_path / "send.sock")
@@ -221,6 +226,7 @@ def test_recv_fd_dgram_without_fd_raises(tmp_path: Path) -> None:
         send_sock.close()
 
 
+@pytest.mark.cpu_only
 def test_fd_ancillary_extract_roundtrip() -> None:
     anc = _fd_ancillary(7)
     assert isinstance(anc, tuple) and len(anc) == 1
@@ -231,6 +237,7 @@ def test_fd_ancillary_extract_roundtrip() -> None:
     assert _extract_fd([(socket.SOL_SOCKET, socket.SCM_RIGHTS, buf.tobytes())]) == 7
 
 
+@pytest.mark.cpu_only
 def test_fd_ancillary_annotation_is_not_evaluated() -> None:
     """``array.array[int]`` is only subscriptable on Python 3.12+, so evaluating
     this annotation would break ``import flashinfer.comm`` on 3.10/3.11.
@@ -238,6 +245,7 @@ def test_fd_ancillary_annotation_is_not_evaluated() -> None:
     assert isinstance(_fd_ancillary.__annotations__["return"], str)
 
 
+@pytest.mark.cpu_only
 def test_extract_fd_ignores_unrelated_control_messages() -> None:
     assert _extract_fd([]) is None
     wrong = array.array("i", [123]).tobytes()
