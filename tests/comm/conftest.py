@@ -29,6 +29,24 @@ if _REPO_ROOT not in sys.path:
 import pytest
 import torch.distributed as dist
 
+from tests.test_helpers.ulysses import rendezvous_path
+
+
+@pytest.fixture
+def gloo_pg():
+    """Single-rank gloo group: no GPU or NCCL needed."""
+    with rendezvous_path() as rendezvous:
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"file://{rendezvous}",
+            rank=0,
+            world_size=1,
+        )
+        try:
+            yield dist.group.WORLD
+        finally:
+            dist.destroy_process_group()
+
 
 def pytest_sessionfinish(session, exitstatus):
     """Cleanup torch.distributed at the end of pytest session.

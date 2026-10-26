@@ -2616,7 +2616,7 @@ def precompile_paged_mqa_logits(
                        still compiles on first use.  Defaults to each
                        variant's common set: float32 for FP8, and both
                        bfloat16 and float32 for FP4 -- the API default plus
-                       the dtype consumers with a float logits ABI require.
+                       the dtypes required by consumers with a float-logits ABI.
                        Pass an explicit tuple to build only what you run.
         batch_sizes:   Batch sizes whose GPU schedule kernel should be warmed,
                        in caller units.  The schedule kernel specialises on

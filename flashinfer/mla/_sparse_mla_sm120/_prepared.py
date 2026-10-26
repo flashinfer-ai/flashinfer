@@ -218,6 +218,7 @@ class PreparedCall:
         mid=None,
         mlse=None,
         lse=None,
+        lse_scale=1.0,
     ):
         self.execute_fn(
             self.plan,
@@ -234,6 +235,7 @@ class PreparedCall:
             extra,
             extra_indices,
             extra_lengths,
+            lse_scale,
         )
 
 
@@ -360,10 +362,16 @@ def wrapper_run(
     mid_lse=None,
     prefill_impl=None,
     return_lse=False,
+    lse_scale=1.0,
 ):
+    from ._execution import check_inline_scale_caches
     from ._execution import resolve_model_type as _resolve_model_type
 
     is_dsv4_nvfp4 = wrapper._kv_cache_format == "nvfp4"
+    if not is_dsv4_nvfp4:
+        check_inline_scale_caches(
+            wrapper._kv_scale_format, cache, extra_kv_cache, wrapper._extra_kv_fp4
+        )
     q = q.squeeze(1) if q.ndim == 4 and q.shape[1] == 1 else q
     output = output.squeeze(1) if output.ndim == 4 and output.shape[1] == 1 else output
     indices = (
@@ -467,6 +475,7 @@ def wrapper_run(
         mid_out,
         mid_lse,
         result_lse,
+        lse_scale,
     )
     return result_lse if return_lse else None
 
@@ -550,6 +559,7 @@ def caller_run(
     mlse,
     extra_fp4,
     decode_only=False,
+    lse_scale=1.0,
 ):
     indices = (
         indices.squeeze(1) if indices.ndim == 3 and indices.shape[1] == 1 else indices
@@ -603,6 +613,7 @@ def caller_run(
         mid,
         mlse,
         lse[: q.shape[0], : q.shape[1]],
+        lse_scale,
     )
 
 
@@ -623,9 +634,13 @@ def functional_run(
     kv_scale_format="auto",
     is_dsv4_nvfp4=False,
     extra_fp4=False,
+    lse_scale=1.0,
 ):
+    from ._execution import check_inline_scale_caches
     from ._execution import resolve_model_type as _resolve_model_type
 
+    if not is_dsv4_nvfp4:
+        check_inline_scale_caches(kv_scale_format, cache, extra, extra_fp4)
     model = 1 if is_dsv4_nvfp4 else _resolve_model_type(q.shape[-1], kv_scale_format)
     tensors = (
         q,
@@ -675,5 +690,6 @@ def functional_run(
         mid,
         mlse,
         result,
+        lse_scale,
     )
     return result

@@ -1,4 +1,5 @@
-"""Regression tests for _get_cubin_dir() priority — issue #2976.
+"""Regression tests for _get_cubin_dir() priority — issue #2976 — and its
+handling of a mismatched flashinfer-cubin package — issue #5886.
 
 env.py imports CompilationContext (CUDA deps), so we load it in isolation
 with lightweight stubs to keep tests runnable without a GPU.
@@ -109,6 +110,42 @@ def test_default_when_nothing_set(monkeypatch):
     monkeypatch.delenv("FLASHINFER_CUBIN_DIR", raising=False)
     monkeypatch.setattr(_env, "has_flashinfer_cubin", lambda: False)
     assert _env._get_cubin_dir() == _env.FLASHINFER_CACHE_DIR / "cubins"
+
+
+# -- version mismatch (regression for #5886) --------------------------------
+
+
+def _install_cubin_pkg(monkeypatch, path, version):
+    monkeypatch.delenv("FLASHINFER_CUBIN_DIR", raising=False)
+    monkeypatch.setattr(_env, "flashinfer_version", "0.7.0.post1")
+    monkeypatch.setattr(_env, "has_flashinfer_cubin", lambda: True)
+    pkg = _fake_cubin_pkg(path)
+    pkg.__version__ = version
+    monkeypatch.setitem(sys.modules, "flashinfer_cubin", pkg)
+
+
+def test_matching_package_used(monkeypatch, caplog, tmp_path):
+    pkg_dir = str(tmp_path / "pkg_cubins")
+    monkeypatch.delenv("FLASHINFER_DISABLE_VERSION_CHECK", raising=False)
+    _install_cubin_pkg(monkeypatch, pkg_dir, "0.7.0.post1")
+    assert _env._get_cubin_dir() == pathlib.Path(pkg_dir)
+    assert not caplog.records
+
+
+def test_mismatched_package_ignored(monkeypatch, caplog, tmp_path):
+    """A stale package must not break the import that replaces it."""
+    monkeypatch.delenv("FLASHINFER_DISABLE_VERSION_CHECK", raising=False)
+    _install_cubin_pkg(monkeypatch, str(tmp_path / "pkg_cubins"), "0.7.0")
+    assert _env._get_cubin_dir() == _env.FLASHINFER_CACHE_DIR / "cubins"
+    assert "Ignoring incompatible flashinfer-cubin package" in caplog.text
+    assert "flashinfer download-kernels" in caplog.text
+
+
+def test_mismatched_package_used_when_check_disabled(monkeypatch, tmp_path):
+    pkg_dir = str(tmp_path / "pkg_cubins")
+    monkeypatch.setenv("FLASHINFER_DISABLE_VERSION_CHECK", "1")
+    _install_cubin_pkg(monkeypatch, pkg_dir, "0.7.0")
+    assert _env._get_cubin_dir() == pathlib.Path(pkg_dir)
 
 
 def test_aot_artifacts_select_each_heterogeneous_target(monkeypatch, tmp_path):

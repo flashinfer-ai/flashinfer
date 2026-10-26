@@ -34,13 +34,15 @@ CakeKDAPackedT1Variant = Literal[
     "cpasync_tile64",
     "cpasync_tile128_ilp4",
     "cpasync_tile64_register_pipeline",
+    "cpasync_tile64_register_pipeline_early_publish",
+    "cpasync_tile64_register_pipeline_early_publish_bulk1",
     "cpasync_tile128_packed_state_v_private_prefetch",
     "cpasync_tile128_v_private_prefetch",
     "cpasync_tile128_paired_row_pipeline",
     "cpasync_tile128_register_pipeline",
-    "cpasync_tile128_ilp2",
+    "cpasync_tile128_register_pipeline_pair_publish",
 ]
-CakeKDAPackedT1Target = Literal["sm100a", "sm100f"]
+CakeKDAPackedT1Target = Literal["sm100a", "sm100f", "sm107a"]
 
 CAKE_KDA_PACKED_T1_VARIANTS: tuple[CakeKDAPackedT1Variant, ...] = (
     "register_tile16",
@@ -50,18 +52,21 @@ CAKE_KDA_PACKED_T1_VARIANTS: tuple[CakeKDAPackedT1Variant, ...] = (
     "cpasync_tile64",
     "cpasync_tile128_ilp4",
     "cpasync_tile64_register_pipeline",
+    "cpasync_tile64_register_pipeline_early_publish",
+    "cpasync_tile64_register_pipeline_early_publish_bulk1",
     "cpasync_tile128_packed_state_v_private_prefetch",
     "cpasync_tile128_v_private_prefetch",
     "cpasync_tile128_paired_row_pipeline",
     "cpasync_tile128_register_pipeline",
-    "cpasync_tile128_ilp2",
+    "cpasync_tile128_register_pipeline_pair_publish",
 )
 
 _CAKE_KDA_PACKED_T1_TARGETS: tuple[CakeKDAPackedT1Target, ...] = (
     "sm100a",
     "sm100f",
+    "sm107a",
 )
-_CAKE_KDA_PACKED_T1_TARGET_KIND = {"sm100a": 1000, "sm100f": 100}
+_CAKE_KDA_PACKED_T1_TARGET_KIND = {"sm100a": 1000, "sm100f": 100, "sm107a": 1070}
 
 
 class CakeKDAPackedT1VariantMetadata(NamedTuple):
@@ -72,6 +77,10 @@ class CakeKDAPackedT1VariantMetadata(NamedTuple):
     smem_bytes: int
     requires_aux_vec4: bool
     extra_cuda_flags: tuple[str, ...] = ("--maxrregcount=128",)
+    # The variant publishes the two output rows a thread group owns as one
+    # 32-bit BF16x2 store (same bytes as two scalar stores); the binding then
+    # requires a 4-byte-aligned output base.
+    pair_publish: bool = False
 
 
 CAKE_KDA_PACKED_T1_VARIANT_METADATA: dict[
@@ -134,6 +143,29 @@ CAKE_KDA_PACKED_T1_VARIANT_METADATA: dict[
         smem_bytes=16384,
         requires_aux_vec4=True,
     ),
+    "cpasync_tile64_register_pipeline_early_publish": CakeKDAPackedT1VariantMetadata(
+        body="cake_kda_packed_t1_cpasync_tile64_register_pipeline_early_publish.cu",
+        symbol="kernel_flashinfer_packed_kda_t1_cpasync_tile64_register_pipeline_early_publish",
+        value_tiles=2,
+        threads=128,
+        smem_bytes=16384,
+        requires_aux_vec4=True,
+    ),
+    # The same early-publish schedule with the 16 KiB state prologue issued as
+    # one cp.async.bulk transaction completed on an mbarrier instead of the
+    # four-stage cp.async ring (17408 B of smem: a 1 KiB control prefix for the
+    # barrier, the 16 KiB state tile, the V staging); bitwise identical to the
+    # four-stage body.  Qualified for compute capability 10.7 only, where it
+    # serves the top of the B19-B63 band (1.8-2.2 % faster at B56 on both
+    # measured seeds, tied or slower at B20-B48).
+    "cpasync_tile64_register_pipeline_early_publish_bulk1": CakeKDAPackedT1VariantMetadata(
+        body="cake_kda_packed_t1_cpasync_tile64_register_pipeline_early_publish_bulk1.cu",
+        symbol="kernel_flashinfer_packed_kda_t1_cpasync_tile64_register_pipeline_early_publish_bulk1",
+        value_tiles=2,
+        threads=128,
+        smem_bytes=17408,
+        requires_aux_vec4=True,
+    ),
     "cpasync_tile128_packed_state_v_private_prefetch": CakeKDAPackedT1VariantMetadata(
         body="cake_kda_packed_t1_cpasync_tile128_packed_state_v_private_prefetch.cu",
         symbol=(
@@ -169,45 +201,108 @@ CAKE_KDA_PACKED_T1_VARIANT_METADATA: dict[
         smem_bytes=20480,
         requires_aux_vec4=True,
     ),
-    "cpasync_tile128_ilp2": CakeKDAPackedT1VariantMetadata(
-        body="cake_kda_packed_t1_cpasync_tile128_ilp2.cu",
-        symbol="kernel_flashinfer_packed_kda_t1_cpasync_tile128",
+    "cpasync_tile128_register_pipeline_pair_publish": CakeKDAPackedT1VariantMetadata(
+        body="cake_kda_packed_t1_cpasync_tile128_register_pipeline_pair_publish.cu",
+        symbol=(
+            "kernel_flashinfer_packed_kda_t1_cpasync_tile128_register_pipeline_"
+            "pair_publish"
+        ),
         value_tiles=1,
         threads=128,
         smem_bytes=20480,
         requires_aux_vec4=True,
+        pair_publish=True,
     ),
+}
+
+
+# Aligned-row selector bands per compute capability: ``(max_batch, variant)``
+# with an open last band.  SM100 (10.0 / 10.3) keeps the bands qualified on
+# B200.  SM107 (10.7, 212 SMs) is re-banded from the R200 variant
+# sweep: the register tile-16 kernel stays ahead through B18, the
+# cp.async tile-64 register pipeline carries the mid batches, and the tile-128
+# register pipeline takes over from B64, where the two tie.  The mid band
+# runs the early-publish build of the tile-64 register pipeline: the same
+# schedule with the output row published before the state write-back and
+# the state stored with an evict-last L2 hint, which is bitwise identical to
+# the tile-64 register pipeline and 1-3 % faster across B19-B63 on R200
+# (band geomean 0.987 of the plain pipeline's time, no row slower).  No
+# SM100 band selects it.  Every variant is an exact kernel; the selector only
+# moves the batch bands.
+_CAKE_KDA_PACKED_T1_ALIGNED_BANDS_SM100: tuple[
+    tuple[Optional[int], CakeKDAPackedT1Variant], ...
+] = (
+    (14, "register_tile16"),
+    (29, "register_tile8_interleaved"),
+    (38, "register_tile16_warp"),
+    (41, "cpasync_tile64_register_pipeline"),
+    (80, "cpasync_tile128_packed_state_v_private_prefetch"),
+    (101, "cpasync_tile128_v_private_prefetch"),
+    (152, "cpasync_tile128_paired_row_pipeline"),
+    (None, "cpasync_tile128_register_pipeline"),
+)
+# The 10.7 register tile-16 band ends at B17: at B18 the native tile-64
+# early-publish body is 10-11 % faster than the register tile-16 kernel on both
+# measured seeds, its native and family compiles produce the same bits, and
+# its output/state errors against an fp64 reference are no worse than the
+# tile-16 kernel's on every metric (max abs, relative, rms; the two kernels'
+# outputs differ by at most one bf16 ulp).  The tile-64 band is split at B48:
+# the four-stage cp.async ring body carries B18-B48 and the single-transaction
+# cp.async.bulk sibling carries B49-B63.  That edge is the last measured row
+# where the ring body is not slower (B48; the bulk body is 1.8-2.2 % faster at
+# B56 on both seeds, native cubin, same output bits); B57-B63 follow B56.
+# From B64 the tile-128 register pipeline runs its pair-publish build: the same
+# schedule with the two output rows a thread group owns stored as one 32-bit
+# BF16x2 word instead of two 16-bit stores (same output bits; 2.6-3.2 % faster
+# at B64 and B72 on R200 on both measured seeds, family cubin).  It needs a
+# 4-byte-aligned output base; the facade falls back to the scalar-publish body
+# otherwise.  No SM100 band selects it.
+_CAKE_KDA_PACKED_T1_ALIGNED_BANDS_SM107: tuple[
+    tuple[Optional[int], CakeKDAPackedT1Variant], ...
+] = (
+    (17, "register_tile16"),
+    (48, "cpasync_tile64_register_pipeline_early_publish"),
+    (63, "cpasync_tile64_register_pipeline_early_publish_bulk1"),
+    (None, "cpasync_tile128_register_pipeline_pair_publish"),
+)
+CAKE_KDA_PACKED_T1_ALIGNED_BANDS: dict[
+    tuple[int, ...], tuple[tuple[Optional[int], CakeKDAPackedT1Variant], ...]
+] = {
+    (10, 0): _CAKE_KDA_PACKED_T1_ALIGNED_BANDS_SM100,
+    (10, 3): _CAKE_KDA_PACKED_T1_ALIGNED_BANDS_SM100,
+    (10, 7): _CAKE_KDA_PACKED_T1_ALIGNED_BANDS_SM107,
 }
 
 
 def select_cake_kda_packed_t1_variant(
     batch: int,
     *,
+    compute_capability: tuple[int, int],
     state_aligned: bool,
     aux_vec4_aligned: bool,
 ) -> Optional[CakeKDAPackedT1Variant]:
-    """Return the qualified final selector, or ``None`` for the legacy route."""
+    """Return the qualified final selector, or ``None`` for the legacy route.
+
+    The aligned-row bands are keyed by compute capability
+    (``CAKE_KDA_PACKED_T1_ALIGNED_BANDS``); the scalar-aux bands are shared by
+    every supported capability and fail closed outside their qualified batches.
+    """
 
     if batch <= 0:
         raise ValueError(f"packed KDA T=1 batch must be positive, got {batch}")
+    bands = CAKE_KDA_PACKED_T1_ALIGNED_BANDS.get(tuple(compute_capability))
+    if bands is None:
+        raise ValueError(
+            "packed KDA T=1 has no qualified selector bands for compute capability "
+            f"{compute_capability[0]}.{compute_capability[1]}"
+        )
     if not state_aligned:
         return None
     if aux_vec4_aligned:
-        if batch <= 14:
-            return "register_tile16"
-        if batch <= 29:
-            return "register_tile8_interleaved"
-        if batch <= 38:
-            return "register_tile16_warp"
-        if batch <= 41:
-            return "cpasync_tile64_register_pipeline"
-        if batch <= 80:
-            return "cpasync_tile128_packed_state_v_private_prefetch"
-        if batch <= 101:
-            return "cpasync_tile128_v_private_prefetch"
-        if batch <= 152:
-            return "cpasync_tile128_paired_row_pipeline"
-        return "cpasync_tile128_register_pipeline"
+        for max_batch, variant in bands:
+            if max_batch is None or batch <= max_batch:
+                return variant
+        raise AssertionError("packed KDA T=1 selector bands must end open")
     if batch <= 24:
         return "cpasync_tile64_ilp4"
     if batch <= 37:
@@ -241,6 +336,7 @@ def _get_binding_cu(metadata: CakeKDAPackedT1VariantMetadata) -> str:
 #define CAKE_KDA_PACKED_T1_THREADS {metadata.threads}
 #define CAKE_KDA_PACKED_T1_SMEM_BYTES {metadata.smem_bytes}
 #define CAKE_KDA_PACKED_T1_REQUIRES_AUX_VEC4 {int(metadata.requires_aux_vec4)}
+#define CAKE_KDA_PACKED_T1_PAIR_PUBLISH {int(metadata.pair_publish)}
 
 #include "cake_kda_packed_t1_binding.cuh"
 """
@@ -306,6 +402,7 @@ def get_cake_kda_packed_t1_module(
 
 
 __all__ = [
+    "CAKE_KDA_PACKED_T1_ALIGNED_BANDS",
     "CAKE_KDA_PACKED_T1_VARIANTS",
     "CAKE_KDA_PACKED_T1_VARIANT_METADATA",
     "CakeKDAPackedT1Target",

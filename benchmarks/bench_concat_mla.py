@@ -95,7 +95,7 @@ def verify_correctness():
             f"num_mismatches={torch.sum(abs_delta != 0).item()}"
         )
 
-    if torch.cuda.get_device_capability() in ((10, 0), (10, 3)):
+    if torch.cuda.get_device_capability() in ((10, 0), (10, 3), (10, 7)):
         output_cake = execute_and_get_output(fn_flashinfer_cake, data)
         if not torch.equal(output_ref.view(torch.uint8), output_cake.view(torch.uint8)):
             raise AssertionError("FlashInfer Cake output is not byte-exact")
@@ -111,7 +111,7 @@ def benchmark():
         ("torch_compiled", fn_torch_compiled),
         ("flashinfer", fn_flashinfer),
     ]
-    if torch.cuda.get_device_capability() in ((10, 0), (10, 3)):
+    if torch.cuda.get_device_capability() in ((10, 0), (10, 3), (10, 7)):
         providers.append(("flashinfer_cake", fn_flashinfer_cake))
 
     # Warmup torch_compiled

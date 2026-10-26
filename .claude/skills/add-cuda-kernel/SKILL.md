@@ -717,7 +717,7 @@ Key rules:
 ### 6b. Attach the template to the API
 
 ```python
-# flashinfer/norm.py  (real file)
+# flashinfer/norm/__init__.py  (real file)
 from .trace.templates.norm import rmsnorm_trace
 
 @flashinfer_api(trace=rmsnorm_trace)

@@ -1,0 +1,2939 @@
+{
+ "commit": "d8b0a7ed5",
+ "fe": "cudnn_frontend",
+ "runs": {
+  "host_declare_cpu": {
+   "n_cudnn_modules": 52,
+   "facts": {
+    "lower_to_cpp_calls": 0,
+    "create_handle_calls": 0,
+    "lower_to_cpp_stages": [],
+    "create_handle_stages": []
+   },
+   "forms": {
+    "prefill": {},
+    "extend": {},
+    "decode": {}
+   }
+  },
+  "node_exec_decode_flagset": {
+   "n_cudnn_modules": 94,
+   "facts": {
+    "lower_to_cpp_calls": 0,
+    "create_handle_calls": 0,
+    "lower_to_cpp_stages": [],
+    "create_handle_stages": []
+   },
+   "forms": {
+    "decode": {
+     "check_support": {
+      "ok": true,
+      "s": 0.077
+     },
+     "compile": {
+      "ok": true,
+      "s": 14.338
+     },
+     "workspace": {
+      "ok": true,
+      "s": 0.001
+     },
+     "execute": {
+      "ok": true,
+      "s": 0.004
+     },
+     "synchronize": {
+      "ok": true,
+      "s": 0.215
+     },
+     "execute2": {
+      "ok": true
+     }
+    }
+   }
+  },
+  "node_exec_decode_unset": {
+   "n_cudnn_modules": 93,
+   "facts": {
+    "lower_to_cpp_calls": 2,
+    "create_handle_calls": 1,
+    "lower_to_cpp_stages": [
+     "decode.compile",
+     "decode.compile"
+    ],
+    "create_handle_stages": [
+     "decode.compile"
+    ]
+   },
+   "forms": {
+    "decode": {
+     "check_support": {
+      "ok": true,
+      "s": 0.349
+     },
+     "compile": {
+      "ok": true,
+      "s": 9.885
+     },
+     "workspace": {
+      "ok": true,
+      "s": 0.001
+     },
+     "execute": {
+      "ok": true,
+      "s": 0.02
+     },
+     "synchronize": {
+      "ok": true,
+      "s": 0.406
+     },
+     "execute2": {
+      "ok": true
+     }
+    }
+   }
+  },
+  "node_exec_extend_unset": {
+   "n_cudnn_modules": 89,
+   "facts": {
+    "lower_to_cpp_calls": 1,
+    "create_handle_calls": 1,
+    "lower_to_cpp_stages": [
+     "extend.compile"
+    ],
+    "create_handle_stages": [
+     "extend.compile"
+    ]
+   },
+   "forms": {
+    "extend": {
+     "check_support": {
+      "ok": true,
+      "s": 0.414
+     },
+     "compile": {
+      "ok": true,
+      "s": 12.085
+     },
+     "workspace": {
+      "ok": true,
+      "s": 0.0
+     },
+     "execute": {
+      "ok": true,
+      "s": 0.003
+     },
+     "synchronize": {
+      "ok": true,
+      "s": 0.221
+     },
+     "execute2": {
+      "ok": true
+     }
+    }
+   }
+  },
+  "node_exec_prefill_unset": {
+   "n_cudnn_modules": 85,
+   "facts": {
+    "lower_to_cpp_calls": 1,
+    "create_handle_calls": 1,
+    "lower_to_cpp_stages": [
+     "prefill.compile"
+    ],
+    "create_handle_stages": [
+     "prefill.compile"
+    ]
+   },
+   "forms": {
+    "prefill": {
+     "check_support": {
+      "ok": true,
+      "s": 0.258
+     },
+     "compile": {
+      "ok": true,
+      "s": 13.823
+     },
+     "workspace": {
+      "ok": true,
+      "s": 0.0
+     },
+     "execute": {
+      "ok": true,
+      "s": 0.003
+     },
+     "synchronize": {
+      "ok": true,
+      "s": 0.237
+     },
+     "execute2": {
+      "ok": true
+     }
+    }
+   }
+  }
+ },
+ "n_files": 102,
+ "total_bytes": 5201980,
+ "total_lines": 96176,
+ "by_group": {
+  "root": {
+   "files": 14,
+   "bytes": 349542,
+   "lines": 7562
+  },
+  "engines": {
+   "files": 5,
+   "bytes": 57713,
+   "lines": 1299
+  },
+  "frost": {
+   "files": 8,
+   "bytes": 96736,
+   "lines": 2169
+  },
+  "frost.tile_dsl": {
+   "files": 15,
+   "bytes": 263613,
+   "lines": 5393
+  },
+  "gated_attention_block": {
+   "files": 12,
+   "bytes": 1308852,
+   "lines": 21646
+  },
+  "gemm": {
+   "files": 1,
+   "bytes": 1570,
+   "lines": 42
+  },
+  "gemm.frost": {
+   "files": 16,
+   "bytes": 347769,
+   "lines": 7719
+  },
+  "gemm.frost.sm100": {
+   "files": 4,
+   "bytes": 436524,
+   "lines": 8985
+  },
+  "sdpa": {
+   "files": 5,
+   "bytes": 275268,
+   "lines": 5051
+  },
+  "sdpa.fwd": {
+   "files": 11,
+   "bytes": 1471127,
+   "lines": 24806
+  },
+  "sdpa.fwd.kernels": {
+   "files": 11,
+   "bytes": 593266,
+   "lines": 11504
+  }
+ },
+ "licenses": {
+  "Apache-2.0": 43,
+  "MIT": 58,
+  "Apache-2.0 AND MIT": 1
+ },
+ "files": [
+  {
+   "path": "python/cudnn/_cutlass_compat.py",
+   "module": "cudnn._cutlass_compat",
+   "group": "root",
+   "bytes": 1442,
+   "lines": 35,
+   "sha256": "502447c3fb9fba3e2ab6cca619a668ccfdd5cd793f9cac898742f5c105a79cda",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/_device.py",
+   "module": "cudnn._device",
+   "group": "root",
+   "bytes": 8936,
+   "lines": 225,
+   "sha256": "50f9f0c914498ff1d61b90e608e2843a0132279599448845c8785d77f3e12696",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn"
+   ],
+   "lazy_cudnn_imports": [
+    "cudnn._env (in oversized_shared_memory_per_block)"
+   ],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": [
+    "cudnn"
+   ]
+  },
+  {
+   "path": "python/cudnn/_env.py",
+   "module": "cudnn._env",
+   "group": "root",
+   "bytes": 1978,
+   "lines": 51,
+   "sha256": "f8cbc0546db2d152dcb82d606de2fcbded1cdbfd29c572bb0e2ec113598143ec",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn._device"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/_experimental_warnings.py",
+   "module": "cudnn._experimental_warnings",
+   "group": "root",
+   "bytes": 700,
+   "lines": 21,
+   "sha256": "ea0938326aa97ee9c0052529b1b2495fbcd04288d7def57935031ff6ea628e06",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/_gemm_validate.py",
+   "module": "cudnn._gemm_validate",
+   "group": "root",
+   "bytes": 9260,
+   "lines": 196,
+   "sha256": "71e3d2a3578f9420d2b5230cf95c761679605cfe7c8d79db8ee054481e426add",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.graph_types"
+   ],
+   "lazy_cudnn_imports": [
+    "cudnn (in _not_supported)"
+   ],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": [
+    "cudnn"
+   ]
+  },
+  {
+   "path": "python/cudnn/_handle.py",
+   "module": "cudnn._handle",
+   "group": "root",
+   "bytes": 4296,
+   "lines": 82,
+   "sha256": "f227ade1f2add86fe9fda3bc523fc829851bb98e806bfbe138bbdf79655e86c5",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn._device"
+   ],
+   "lazy_cudnn_imports": [
+    "cudnn.frost.device (in device)"
+   ],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/_pygraph.py",
+   "module": "cudnn._pygraph",
+   "group": "root",
+   "bytes": 208455,
+   "lines": 4163,
+   "sha256": "2c343ec91c302c7e99596742092f0cae41fc989e5b9189581578c67a6c8762e9",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn",
+    "cudnn._device",
+    "cudnn._handle",
+    "cudnn.datatypes",
+    "cudnn.engines.base",
+    "cudnn.engines.engine_ids",
+    "cudnn.graph_types",
+    "cudnn.nodes"
+   ],
+   "lazy_cudnn_imports": [
+    "cudnn (in _create_backend_plans)",
+    "cudnn (in _device_pointer)",
+    "cudnn (in _finalize_backend_layout)",
+    "cudnn (in _lower_to_cpp)",
+    "cudnn (in _native_var_pack._ptr)",
+    "cudnn (in _wrap_callback.wrapped)",
+    "cudnn (in backend_plan_entries)",
+    "cudnn (in build_plans)",
+    "cudnn (in cudnn_graph_not_supported)",
+    "cudnn (in deserialize)",
+    "cudnn.datatypes (in _lower_to_cpp)",
+    "cudnn.datatypes (in _native_var_pack)",
+    "cudnn.datatypes (in tensor_like)",
+    "cudnn.engines.base (in _materialize_backend_plan)",
+    "cudnn.engines.base (in backend_plan_entries)",
+    "cudnn.engines.base (in build_plans)",
+    "cudnn.engines.base (in check_support)",
+    "cudnn.engines.base (in create_execution_plan)",
+    "cudnn.engines.base (in get_plan_name_at_index)",
+    "cudnn.engines.engine_ids (in _materialize_backend_plan)",
+    "cudnn.engines.engine_ids (in backend_plan_entries)",
+    "cudnn.engines.engine_ids (in create_execution_plan)",
+    "cudnn.engines.engine_ids (in create_execution_plans)",
+    "cudnn.engines.engine_ids (in get_engine_and_knobs_at_index)",
+    "cudnn.engines.heuristics (in _create_backend_plans)",
+    "cudnn.engines.heuristics (in create_execution_plans)",
+    "cudnn.engines.manifest (in _attach_facts)",
+    "cudnn.engines.manifest (in _backend_guard_reason)",
+    "cudnn.engines.manifest (in _candidate_engines)",
+    "cudnn.engines.manifest (in _owners_for_id)",
+    "cudnn.engines.manifest (in _python_native_validator)",
+    "cudnn.frost.buffers (in _describe)",
+    "cudnn.frost.device (in _default_backend_handle)"
+   ],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": [
+    "cudnn"
+   ]
+  },
+  {
+   "path": "python/cudnn/_sdpa_tail.py",
+   "module": "cudnn._sdpa_tail",
+   "group": "root",
+   "bytes": 5409,
+   "lines": 122,
+   "sha256": "afa16530005c82f57c4dbf900477c1698facea89ba1c1e944f83bc270b748a5c",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.graph_types"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/_torch_stream.py",
+   "module": "cudnn._torch_stream",
+   "group": "root",
+   "bytes": 7656,
+   "lines": 177,
+   "sha256": "a2a0627244019056927f9345c822c156c617592d70a871df5cf315d9e739f972",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/api_base.py",
+   "module": "cudnn.api_base",
+   "group": "root",
+   "bytes": 54241,
+   "lines": 1251,
+   "sha256": "6b138157b0d9af9dfd3191b7deeff4817db75daaa460c59a6ad831ac37896ddd",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn._experimental_warnings",
+    "cudnn.datatypes",
+    "cudnn.tensor_adapter"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/datatypes.py",
+   "module": "cudnn.datatypes",
+   "group": "root",
+   "bytes": 15475,
+   "lines": 393,
+   "sha256": "0e97c7c659cafd74244babc0fad4a5dd6495838e98169270e0e59698e57424d9",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [
+    "cudnn (in _library_type)",
+    "cudnn.frost.buffers (in _init_dlpack_dtype_tables)"
+   ],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": [
+    "cudnn"
+   ]
+  },
+  {
+   "path": "python/cudnn/engines/__init__.py",
+   "module": "cudnn.engines",
+   "group": "engines",
+   "bytes": 2116,
+   "lines": 60,
+   "sha256": "33c64053d74b05068a1e6897372aeb2f5cf3cdc1cb071bc438532a3b5ed00c64",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.engines.base",
+    "cudnn.engines.engine_ids",
+    "cudnn.engines.manifest"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/engines/base.py",
+   "module": "cudnn.engines.base",
+   "group": "engines",
+   "bytes": 22072,
+   "lines": 484,
+   "sha256": "2fd8ada79485a394aafb11a7d23aaf835d2a51b27d6440cc7fc75366e4dec6b2",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.engines.engine_ids"
+   ],
+   "lazy_cudnn_imports": [
+    "cudnn (in decline_types)",
+    "cudnn.datatypes (in _view_over_address)",
+    "cudnn.frost.buffers (in _view_over_address)",
+    "cudnn.frost.device (in device)"
+   ],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": [
+    "cudnn"
+   ]
+  },
+  {
+   "path": "python/cudnn/engines/engine_ids.py",
+   "module": "cudnn.engines.engine_ids",
+   "group": "engines",
+   "bytes": 3419,
+   "lines": 66,
+   "sha256": "b36b7c4274f28502117acc52d4fc9286ea5239ebf920022afe1c73103a9bc50b",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/engines/heuristics.py",
+   "module": "cudnn.engines.heuristics",
+   "group": "engines",
+   "bytes": 10115,
+   "lines": 210,
+   "sha256": "05d801d9ba91039aee9508fb98c3da89c11b8bfd54c4c005d770e8320ae390e5",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.engines.base",
+    "cudnn.engines.engine_ids"
+   ],
+   "lazy_cudnn_imports": [
+    "cudnn (in _assemble)",
+    "cudnn (in default_modes)",
+    "cudnn.engines.engine_ids (in rank)",
+    "cudnn.engines.manifest (in rank)"
+   ],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": [
+    "cudnn"
+   ]
+  },
+  {
+   "path": "python/cudnn/engines/manifest.py",
+   "module": "cudnn.engines.manifest",
+   "group": "engines",
+   "bytes": 19991,
+   "lines": 479,
+   "sha256": "9506f11437e264fe1b3e726a6dbfbf9bc459d520d90b6aaa9411c5e258e87162",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.engines.engine_ids"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/frost/__init__.py",
+   "module": "cudnn.frost",
+   "group": "frost",
+   "bytes": 3263,
+   "lines": 65,
+   "sha256": "994f51b75d27f333786ff3bd713c682f24f16433779389f144081f42f3bdb0d9",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [
+    "cudnn.frost.buffers (in cutedsl_runtime_available)"
+   ],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/frost/buffers.py",
+   "module": "cudnn.frost.buffers",
+   "group": "frost",
+   "bytes": 30729,
+   "lines": 755,
+   "sha256": "20dc1d21904e3d0434735dd7b4e7b212966382c1dd7dd5ea0702bc4a23966cad",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn"
+   ],
+   "lazy_cudnn_imports": [
+    "cudnn.frost.device (in _dlpack_geometry)"
+   ],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": [
+    "cudnn"
+   ]
+  },
+  {
+   "path": "python/cudnn/frost/capture.py",
+   "module": "cudnn.frost.capture",
+   "group": "frost",
+   "bytes": 5067,
+   "lines": 86,
+   "sha256": "cea4cc808e1fbc02858257544a08550efd15c1a10bffff5e7c211445f58aba56",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [
+    "cudnn._device (in capture_state)"
+   ],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/frost/compiled_cache.py",
+   "module": "cudnn.frost.compiled_cache",
+   "group": "frost",
+   "bytes": 32300,
+   "lines": 690,
+   "sha256": "2bfd2a597b8b00bee4d6b00b3c7ddf9b0148a8136a2ba357e563f96b251570c2",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [
+    "cudnn (in _cudnn_source_digest)",
+    "cudnn (in environment_manifest)",
+    "cudnn.frost.device (in _memo_device)",
+    "cudnn.frost.device (in environment_manifest)"
+   ],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": [
+    "cudnn"
+   ]
+  },
+  {
+   "path": "python/cudnn/frost/device.py",
+   "module": "cudnn.frost.device",
+   "group": "frost",
+   "bytes": 6152,
+   "lines": 160,
+   "sha256": "0e984253316f0a14d5f8977daf8c6e36c3b1c696e6bff41f3640f68601f65fc1",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn._device"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/frost/occupancy.py",
+   "module": "cudnn.frost.occupancy",
+   "group": "frost",
+   "bytes": 4360,
+   "lines": 104,
+   "sha256": "2e656eb8f7fd4c73258e19fc28dd971a2eece99f761495224d0f7d439906b0ec",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.device"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/frost/template_loader.py",
+   "module": "cudnn.frost.template_loader",
+   "group": "frost",
+   "bytes": 4671,
+   "lines": 97,
+   "sha256": "d5d8d4f2bc14cf1980b663586fa357e458455bd8afaf986a7158d42cce183384",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/frost/tile_dsl/__init__.py",
+   "module": "cudnn.frost.tile_dsl",
+   "group": "frost.tile_dsl",
+   "bytes": 186,
+   "lines": 4,
+   "sha256": "ca5aa1a8c37c4fad19938dbd57f084b2540a084260b0ada94cd161341884c887",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/frost/tile_dsl/barrier.py",
+   "module": "cudnn.frost.tile_dsl.barrier",
+   "group": "frost.tile_dsl",
+   "bytes": 27529,
+   "lines": 465,
+   "sha256": "975935618e5389c61ab3f7991d4ac99a13960613bbb01bf3ffc5c9bd46501280",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/frost/tile_dsl/constants.py",
+   "module": "cudnn.frost.tile_dsl.constants",
+   "group": "frost.tile_dsl",
+   "bytes": 1000,
+   "lines": 28,
+   "sha256": "148320fef6d9497ae0a189654af72a5a6629c7682ba13471a30097f700d3b8dd",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/frost/tile_dsl/handles.py",
+   "module": "cudnn.frost.tile_dsl.handles",
+   "group": "frost.tile_dsl",
+   "bytes": 8505,
+   "lines": 260,
+   "sha256": "5e694d248da07b535b8d98df7003518cc61565c3fcb89eec93ff93a75c08eca7",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/frost/tile_dsl/mask.py",
+   "module": "cudnn.frost.tile_dsl.mask",
+   "group": "frost.tile_dsl",
+   "bytes": 26839,
+   "lines": 526,
+   "sha256": "a1da90f9a141d76d55797573d6ea79af3316a9ecb56f66f6a17e583a611de52a",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.tile_dsl.constants"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/frost/tile_dsl/mma.py",
+   "module": "cudnn.frost.tile_dsl.mma",
+   "group": "frost.tile_dsl",
+   "bytes": 22856,
+   "lines": 636,
+   "sha256": "645a653d4104a72e6c058d2ffa8c2d1950bd862e6191bc3d0ec65fea77521c65",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.tile_dsl.swizzle"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/frost/tile_dsl/pointwise.py",
+   "module": "cudnn.frost.tile_dsl.pointwise",
+   "group": "frost.tile_dsl",
+   "bytes": 69159,
+   "lines": 1245,
+   "sha256": "dcfd2ca268f0ccd5d10bfe2a8e8647dd2fe61f90d078e1221926c6e868cbff29",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.tile_dsl.regtile"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/frost/tile_dsl/regtile.py",
+   "module": "cudnn.frost.tile_dsl.regtile",
+   "group": "frost.tile_dsl",
+   "bytes": 4732,
+   "lines": 154,
+   "sha256": "4138a3641d5841c94e4b0ed6eeb4b219382e76723a12b41953e27717457098dc",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/frost/tile_dsl/requirements.py",
+   "module": "cudnn.frost.tile_dsl.requirements",
+   "group": "frost.tile_dsl",
+   "bytes": 3325,
+   "lines": 48,
+   "sha256": "eaa8e6c0f7bbd431d75fbfb6720a4775645b52cc61189462110417c696d82a58",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.buffers"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/frost/tile_dsl/scheduler.py",
+   "module": "cudnn.frost.tile_dsl.scheduler",
+   "group": "frost.tile_dsl",
+   "bytes": 24363,
+   "lines": 437,
+   "sha256": "6eaa7c9e8b67619a0c25fb7c3d4dcbe58be94d34d76ae3a0c0033c5f837f17f5",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.tile_dsl.barrier",
+    "cudnn.frost.tile_dsl.constants"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/frost/tile_dsl/sf_layout.py",
+   "module": "cudnn.frost.tile_dsl.sf_layout",
+   "group": "frost.tile_dsl",
+   "bytes": 3838,
+   "lines": 57,
+   "sha256": "08001532f9f55986b5a782d3548c8eb34d59d454618fbc0a5dbfcc9a906a62f4",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/frost/tile_dsl/swizzle.py",
+   "module": "cudnn.frost.tile_dsl.swizzle",
+   "group": "frost.tile_dsl",
+   "bytes": 2273,
+   "lines": 62,
+   "sha256": "826acae44e34f87d46510272762db864f007777306175fe411c570fade354f4c",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/frost/tile_dsl/thd.py",
+   "module": "cudnn.frost.tile_dsl.thd",
+   "group": "frost.tile_dsl",
+   "bytes": 31816,
+   "lines": 647,
+   "sha256": "5c5ab52a587312eae70e894fb6b1c6779a99539e8fa6afa45d6b739012c6adfe",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/frost/tile_dsl/tma.py",
+   "module": "cudnn.frost.tile_dsl.tma",
+   "group": "frost.tile_dsl",
+   "bytes": 35539,
+   "lines": 780,
+   "sha256": "eed7c12de34aff9dad7a286709d175b91c7d52c578cb923f1dd08f45d92c2776",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.tile_dsl.requirements",
+    "cudnn.frost.tile_dsl.swizzle"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/frost/tile_dsl/tmem.py",
+   "module": "cudnn.frost.tile_dsl.tmem",
+   "group": "frost.tile_dsl",
+   "bytes": 1653,
+   "lines": 44,
+   "sha256": "7eaedce61960ab4d8a59b9b4b5172d9f8e1b9301b6dac10978216dc528377160",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/frost/workspace.py",
+   "module": "cudnn.frost.workspace",
+   "group": "frost",
+   "bytes": 10194,
+   "lines": 212,
+   "sha256": "4c5c6344208282266a25b01974c76c7bd358ed7348291c1bc8a2b7f05bc1acdb",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn",
+    "cudnn.frost.buffers"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": [
+    "cudnn"
+   ]
+  },
+  {
+   "path": "python/cudnn/gated_attention_block/__init__.py",
+   "module": "cudnn.gated_attention_block",
+   "group": "gated_attention_block",
+   "bytes": 2107,
+   "lines": 86,
+   "sha256": "8722a51b096715621e77bdcafdc5dbb1231353160c5dc9c3eedf38fa61fe073f",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.gated_attention_block.api",
+    "cudnn.gated_attention_block.api_bwd"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/gated_attention_block/api.py",
+   "module": "cudnn.gated_attention_block.api",
+   "group": "gated_attention_block",
+   "bytes": 623394,
+   "lines": 9504,
+   "sha256": "ef48a876820f977ef1ef43209f3ad94ee18a721ba094755acfa7d3f3bb3b854b",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn._torch_stream",
+    "cudnn.api_base",
+    "cudnn.frost.workspace"
+   ],
+   "lazy_cudnn_imports": [
+    "cudnn (in sf_cudnn_dtype)",
+    "cudnn.frost.buffers (in check_support)",
+    "cudnn.frost.buffers (in serving_envelope)",
+    "cudnn.frost.device (in _sched_policy)",
+    "cudnn.frost.device (in resolve_impl)",
+    "cudnn.frost.tile_dsl.constants (in _build_impl)",
+    "cudnn.frost.tile_dsl.constants (in _sched_policy)",
+    "cudnn.frost.tile_dsl.constants (in check_support)",
+    "cudnn.gated_attention_block.cache_write_contract (in _check_cache_write_args)",
+    "cudnn.gated_attention_block.cache_write_contract (in _check_serving_declaration)",
+    "cudnn.gated_attention_block.kernels.cache_write (in check_support)",
+    "cudnn.gated_attention_block.kernels.cache_write (in compile)",
+    "cudnn.gated_attention_block.kernels.cache_write (in execute)",
+    "cudnn.gated_attention_block.kernels.cache_write (in moved_bytes)",
+    "cudnn.gated_attention_block.kernels.elementwise (in _run)",
+    "cudnn.gated_attention_block.kernels.elementwise (in check_support)",
+    "cudnn.gated_attention_block.kernels.elementwise (in compile)",
+    "cudnn.gated_attention_block.kernels.elementwise (in moved_bytes)",
+    "cudnn.gated_attention_block.kernels.proj_gemm (in __init__)",
+    "cudnn.gated_attention_block.kernels.proj_gemm (in _check_mxfp8_declaration)",
+    "cudnn.gated_attention_block.kernels.proj_gemm (in _check_sf_blob)",
+    "cudnn.gated_attention_block.kernels.proj_gemm (in _fork_supports_field)",
+    "cudnn.gated_attention_block.kernels.proj_gemm (in _fork_supports_qk_norm)",
+    "cudnn.gated_attention_block.kernels.proj_gemm (in _fp4_o_views)",
+    "cudnn.gated_attention_block.kernels.proj_gemm (in _fp8_fork_available)",
+    "cudnn.gated_attention_block.kernels.proj_gemm (in _mxfp8_fork_available)",
+    "cudnn.gated_attention_block.kernels.proj_gemm (in _o_fp4_slots)",
+    "cudnn.gated_attention_block.kernels.proj_gemm (in _runner_writes_compact_qkv)",
+    "cudnn.gated_attention_block.kernels.proj_gemm (in check_support)",
+    "cudnn.gated_attention_block.kernels.proj_gemm (in compile)",
+    "cudnn.gated_attention_block.kernels.proj_gemm (in execute)",
+    "cudnn.gated_attention_block.kernels.proj_gemm (in execute_fp8)",
+    "cudnn.gated_attention_block.kernels.proj_gemm (in execute_mxfp8)",
+    "cudnn.gated_attention_block.kernels.proj_gemm (in params)",
+    "cudnn.gated_attention_block.kernels.proj_gemm (in sf_bytes)",
+    "cudnn.gated_attention_block.kernels.proj_gemm (in sf_bytes_second)",
+    "cudnn.gated_attention_block.kernels.qk_norm_rope (in check_support)",
+    "cudnn.gated_attention_block.kernels.qk_norm_rope (in compile)",
+    "cudnn.gated_attention_block.kernels.qk_norm_rope (in execute)",
+    "cudnn.gated_attention_block.kernels.qk_norm_rope (in moved_bytes)",
+    "cudnn.gated_attention_block.kernels.qk_norm_rope_tma (in _resolve_cache_write_small_m)",
+    "cudnn.gated_attention_block.kernels.qk_norm_rope_tma (in check_support)",
+    "cudnn.gated_attention_block.kernels.qk_norm_rope_tma (in compile)",
+    "cudnn.gated_attention_block.kernels.qk_norm_rope_tma (in execute)",
+    "cudnn.gated_attention_block.kernels.qk_norm_rope_tma (in resolve_impl)",
+    "cudnn.gated_attention_block.kernels.qsa_kv_upcast (in check_support)",
+    "cudnn.gated_attention_block.kernels.qsa_kv_upcast (in compile)",
+    "cudnn.gated_attention_block.kernels.qsa_kv_upcast (in execute)",
+    "cudnn.gated_attention_block.kernels.quantize (in check_support)",
+    "cudnn.gated_attention_block.kernels.quantize (in compile)",
+    "cudnn.gated_attention_block.kernels.quantize (in execute)",
+    "cudnn.gated_attention_block.kernels.quantize (in moved_bytes)",
+    "cudnn.gated_attention_block.kernels.quantize_fp4 (in _format)",
+    "cudnn.gated_attention_block.kernels.quantize_fp4 (in check_support)",
+    "cudnn.gated_attention_block.kernels.quantize_fp4 (in compile)",
+    "cudnn.gated_attention_block.kernels.quantize_fp4 (in execute)",
+    "cudnn.gated_attention_block.kernels.quantize_fp4 (in moved_bytes)",
+    "cudnn.gated_attention_block.kernels.quantize_mxfp8 (in _sf_slot_bytes_packed)",
+    "cudnn.gated_attention_block.kernels.quantize_mxfp8 (in check_support)",
+    "cudnn.gated_attention_block.kernels.quantize_mxfp8 (in compile)",
+    "cudnn.gated_attention_block.kernels.quantize_mxfp8 (in execute)",
+    "cudnn.gated_attention_block.kernels.quantize_mxfp8 (in moved_bytes)",
+    "cudnn.sdpa.fwd.api_dsl (in _build_impl)",
+    "cudnn.sdpa.fwd.api_dsl (in check_support)",
+    "cudnn.sdpa.fwd.config_sm100 (in decode_route)",
+    "cudnn.sdpa.fwd.config_sm107 (in _resolve_decode_q_tile_max)",
+    "cudnn.sdpa.fwd.config_sm107 (in decode_route)",
+    "cudnn.sdpa.fwd.engines (in _row_capabilities)",
+    "cudnn.sdpa.fwd.heuristics (in decode_split_choice)",
+    "cudnn.sdpa.fwd.sparse_gqa_sm107 (in _operands)",
+    "cudnn.sdpa.fwd.sparse_gqa_sm107 (in _sparse_record)",
+    "cudnn.sdpa.fwd.sparse_gqa_sm107 (in check_support)",
+    "cudnn.sdpa.graph_analyzer (in _check_gate_geometry)",
+    "cudnn.sdpa.graph_analyzer (in _sparse_record_torch_dtypes)"
+   ],
+   "lazy_outside_closure": [
+    "cudnn.gated_attention_block.kernels.qsa_kv_upcast (in check_support)",
+    "cudnn.gated_attention_block.kernels.qsa_kv_upcast (in compile)",
+    "cudnn.gated_attention_block.kernels.qsa_kv_upcast (in execute)",
+    "cudnn.gated_attention_block.kernels.quantize_fp4 (in _format)",
+    "cudnn.gated_attention_block.kernels.quantize_fp4 (in check_support)",
+    "cudnn.gated_attention_block.kernels.quantize_fp4 (in compile)",
+    "cudnn.gated_attention_block.kernels.quantize_fp4 (in execute)",
+    "cudnn.gated_attention_block.kernels.quantize_fp4 (in moved_bytes)",
+    "cudnn.sdpa.fwd.sparse_gqa_sm107 (in _operands)",
+    "cudnn.sdpa.fwd.sparse_gqa_sm107 (in _sparse_record)",
+    "cudnn.sdpa.fwd.sparse_gqa_sm107 (in check_support)"
+   ],
+   "root_cudnn_imports": [
+    "cudnn"
+   ]
+  },
+  {
+   "path": "python/cudnn/gated_attention_block/cache_write_contract.py",
+   "module": "cudnn.gated_attention_block.cache_write_contract",
+   "group": "gated_attention_block",
+   "bytes": 3881,
+   "lines": 57,
+   "sha256": "873935262303f7cfffc5556b9af5ae89356c211c570af682267d4eee67214699",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/gated_attention_block/kernels/__init__.py",
+   "module": "cudnn.gated_attention_block.kernels",
+   "group": "gated_attention_block",
+   "bytes": 3665,
+   "lines": 47,
+   "sha256": "647e6e11188d8d4bfabce73dfe4edcfb4df28431b56f32db2aed8c76dcf9bce9",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/gated_attention_block/kernels/cache_write.py",
+   "module": "cudnn.gated_attention_block.kernels.cache_write",
+   "group": "gated_attention_block",
+   "bytes": 21302,
+   "lines": 401,
+   "sha256": "761a82161908aecf42fb6ede9b6d9e556ce72d3656735123542c050d79c12158",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": true,
+   "why": "the separate paged write-through launch (_CacheWrite): what runs when the write-through is folded neither into the fused projection's epilogue nor into the norm + RoPE launch (fuse_cache_write=False, or 128+ rows with q_len > 1 on the lowered decode chain); also a module-level dependency of the TMA norm + RoPE kernel's pool-write arm",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.compiled_cache",
+    "cudnn.frost.device",
+    "cudnn.frost.tile_dsl.barrier",
+    "cudnn.frost.tile_dsl.tma",
+    "cudnn.gated_attention_block.cache_write_contract",
+    "cudnn.gated_attention_block.kernels.elementwise",
+    "cudnn.gated_attention_block.kernels.qk_norm_rope"
+   ],
+   "lazy_cudnn_imports": [
+    "cudnn.datatypes (in _fake_pool)"
+   ],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/gated_attention_block/kernels/elementwise.py",
+   "module": "cudnn.gated_attention_block.kernels.elementwise",
+   "group": "gated_attention_block",
+   "bytes": 15694,
+   "lines": 326,
+   "sha256": "54ecd92b82cc99afff049d42d57bd958f40fec9e7eb64ce6b7d8c38f4c44f31b",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": true,
+   "why": "the sigmoid-gate launch (_SigmoidGate): what the DECODE form runs when the decode tile runs unsplit (decode_split_kv=1), where the gate cannot ride the split combine",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.compiled_cache",
+    "cudnn.frost.device",
+    "cudnn.frost.tile_dsl.barrier",
+    "cudnn.frost.tile_dsl.pointwise",
+    "cudnn.frost.tile_dsl.tma",
+    "cudnn.gated_attention_block.kernels.qk_norm_rope"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/gated_attention_block/kernels/proj_gemm.py",
+   "module": "cudnn.gated_attention_block.kernels.proj_gemm",
+   "group": "gated_attention_block",
+   "bytes": 168604,
+   "lines": 2661,
+   "sha256": "a2b931295e045f77364192cface57b4ccf6a85eefb129dbb663f7f2ed63a151a",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [
+    "cudnn (in _cudnn_dtype)",
+    "cudnn (in _sf_torch_dtype)",
+    "cudnn (in block_scale_pairing)",
+    "cudnn (in build_proj_gemm)",
+    "cudnn (in handle_for_stream)",
+    "cudnn (in run_proj_gemm)",
+    "cudnn._torch_stream (in device_alpha)",
+    "cudnn.frost.capture (in _refuse_compile_under_capture)",
+    "cudnn.frost.capture (in handle_for_stream)",
+    "cudnn.frost.template_loader (in build_fused_proj_gemm)",
+    "cudnn.frost.workspace (in run_proj_gemm)",
+    "cudnn.gated_attention_block.cache_write_contract (in run_fused_proj_gemm)",
+    "cudnn.gated_attention_block.kernels.quantize_mxfp8 (in run_fused_proj_gemm_mxfp8)",
+    "cudnn.gemm.frost (in build_proj_gemm)",
+    "cudnn.gemm.frost.arch_family (in _auto_tile_name)",
+    "cudnn.gemm.frost.compiler (in _auto_tile_config)",
+    "cudnn.gemm.frost.compiler (in build_proj_gemm)",
+    "cudnn.gemm.frost.graph_analyzer (in _auto_tile_config)",
+    "cudnn.gemm.frost.graph_analyzer (in _resolved_pack)",
+    "cudnn.gemm.frost.graph_analyzer (in build_proj_gemm)",
+    "cudnn.gemm.frost.kernel_registry (in _why_no_frost_plan)",
+    "cudnn.gemm.frost.kernel_registry (in build_proj_gemm)",
+    "cudnn.gemm.frost.tile_config (in build_proj_gemm)",
+    "cudnn.gemm.frost.tile_config (in small_m_tile_config)"
+   ],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": [
+    "cudnn"
+   ]
+  },
+  {
+   "path": "python/cudnn/gated_attention_block/kernels/proj_gemm_norm_rope.py",
+   "module": "cudnn.gated_attention_block.kernels.proj_gemm_norm_rope",
+   "group": "gated_attention_block",
+   "bytes": 103860,
+   "lines": 2008,
+   "sha256": "ad9ff55f005a3942498af234adc00a4bf1b8dcfaeddc3eb7841122cfe7ce1345",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": false,
+   "opened_by_path": true,
+   "why": "template file executed by path",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.compiled_cache",
+    "cudnn.frost.tile_dsl.pointwise",
+    "cudnn.frost.tile_dsl.tma",
+    "cudnn.gated_attention_block.kernels.proj_gemm",
+    "cudnn.gemm.frost.tile_helpers"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/gated_attention_block/kernels/qk_norm_rope.py",
+   "module": "cudnn.gated_attention_block.kernels.qk_norm_rope",
+   "group": "gated_attention_block",
+   "bytes": 42144,
+   "lines": 884,
+   "sha256": "9b6b2fc324db1f01811d25aee2d116959f25dde50bb069a5a3ad09d109eb4f4f",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "the shared helpers of the two launches above (ACCESS_BYTES, lanes_per_row, vec_chunks, ...) and the ldg norm + RoPE arm of the unfused chain",
+   "top_level_cudnn_imports": [
+    "cudnn.datatypes",
+    "cudnn.frost.device",
+    "cudnn.frost.tile_dsl.barrier",
+    "cudnn.frost.tile_dsl.pointwise",
+    "cudnn.frost.tile_dsl.tma"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/gated_attention_block/kernels/qk_norm_rope_tma.py",
+   "module": "cudnn.gated_attention_block.kernels.qk_norm_rope_tma",
+   "group": "gated_attention_block",
+   "bytes": 127821,
+   "lines": 2268,
+   "sha256": "a37c41f6e024b5af4d786014d02fbff3945c80c3bf585e5d91c8d9b4bb3504bc",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": true,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.datatypes",
+    "cudnn.frost.compiled_cache",
+    "cudnn.frost.device",
+    "cudnn.frost.tile_dsl.barrier",
+    "cudnn.frost.tile_dsl.handles",
+    "cudnn.frost.tile_dsl.pointwise",
+    "cudnn.frost.tile_dsl.sf_layout",
+    "cudnn.frost.tile_dsl.tma",
+    "cudnn.gated_attention_block.cache_write_contract",
+    "cudnn.gated_attention_block.kernels.cache_write",
+    "cudnn.gated_attention_block.kernels.qk_norm_rope",
+    "cudnn.gated_attention_block.kernels.quantize",
+    "cudnn.gated_attention_block.kernels.quantize_mxfp8"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/gated_attention_block/kernels/quantize.py",
+   "module": "cudnn.gated_attention_block.kernels.quantize",
+   "group": "gated_attention_block",
+   "bytes": 91364,
+   "lines": 1678,
+   "sha256": "fc8770e69941c3bd22d108f6b410e15a9f93638294cc8206aa98bf1afef45b9e",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.datatypes",
+    "cudnn.frost.device",
+    "cudnn.frost.tile_dsl.barrier",
+    "cudnn.frost.tile_dsl.pointwise",
+    "cudnn.frost.tile_dsl.tma",
+    "cudnn.gated_attention_block.kernels.qk_norm_rope"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/gated_attention_block/kernels/quantize_mxfp8.py",
+   "module": "cudnn.gated_attention_block.kernels.quantize_mxfp8",
+   "group": "gated_attention_block",
+   "bytes": 105016,
+   "lines": 1726,
+   "sha256": "6ac57eadeb0d1d01f1928bd56055055dd93078151ab42609171aa9c7685910bb",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.datatypes",
+    "cudnn.frost.device",
+    "cudnn.frost.tile_dsl.pointwise",
+    "cudnn.frost.tile_dsl.sf_layout",
+    "cudnn.frost.tile_dsl.tma",
+    "cudnn.gated_attention_block.kernels.proj_gemm",
+    "cudnn.gated_attention_block.kernels.qk_norm_rope"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/gemm/__init__.py",
+   "module": "cudnn.gemm",
+   "group": "gemm",
+   "bytes": 1570,
+   "lines": 42,
+   "sha256": "8e2be8964988d64dd469ce85980d1553c6a79b3482f6469437f37b976751b621",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/gemm/frost/__init__.py",
+   "module": "cudnn.gemm.frost",
+   "group": "gemm.frost",
+   "bytes": 544,
+   "lines": 13,
+   "sha256": "6c45af3d84855a39f56ce00c99c83e91f5cd52028939cd7f646efa07a0501a64",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.gemm.frost.graph_analyzer"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/gemm/frost/arch_family.py",
+   "module": "cudnn.gemm.frost.arch_family",
+   "group": "gemm.frost",
+   "bytes": 4869,
+   "lines": 116,
+   "sha256": "bfe209674efe025e8772684e3f48c9520a0970e26bd7115f665a5bbcc3cab5a2",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [
+    "cudnn.frost.device (in current_arch)"
+   ],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/gemm/frost/compiler.py",
+   "module": "cudnn.gemm.frost.compiler",
+   "group": "gemm.frost",
+   "bytes": 1528,
+   "lines": 32,
+   "sha256": "ffb1a3b83fb999d2bfd368a7d72854aca502fb8b4e8d8cb43466ff7e1025f2ce",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.gemm.frost.arch_family"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/gemm/frost/dtypes.py",
+   "module": "cudnn.gemm.frost.dtypes",
+   "group": "gemm.frost",
+   "bytes": 13597,
+   "lines": 304,
+   "sha256": "b5b9303b05e1963ca979ae9a675052c2d6fd358375a1dc997d194dc0adf8e59b",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn",
+    "cudnn.gemm.frost.fusion_ir"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": [
+    "cudnn"
+   ]
+  },
+  {
+   "path": "python/cudnn/gemm/frost/engine.py",
+   "module": "cudnn.gemm.frost.engine",
+   "group": "gemm.frost",
+   "bytes": 7796,
+   "lines": 164,
+   "sha256": "8804aefd033b0419b3b300e2304922d04668bfdf0aceefec972e38967ec011fa",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn",
+    "cudnn.engines.base",
+    "cudnn.frost.workspace"
+   ],
+   "lazy_cudnn_imports": [
+    "cudnn.frost.device (in build_plan)",
+    "cudnn.gemm.frost.compiler (in check_support)",
+    "cudnn.gemm.frost.graph_analyzer (in build_plan)",
+    "cudnn.gemm.frost.graph_analyzer (in check_support)",
+    "cudnn.gemm.frost.knobs (in knobs_from_public)",
+    "cudnn.gemm.frost.knobs (in knobs_to_public)"
+   ],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": [
+    "cudnn"
+   ]
+  },
+  {
+   "path": "python/cudnn/gemm/frost/epilogue_codegen.py",
+   "module": "cudnn.gemm.frost.epilogue_codegen",
+   "group": "gemm.frost",
+   "bytes": 903,
+   "lines": 22,
+   "sha256": "1a8343be53beb144b079329d57c3da1289323d987e2d09a5c4c24d1528db2c4c",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": false,
+   "opened_by_path": false,
+   "why": "the facade twin of gemm.frost.compiler (22 lines); kept so the facade pair stays intact",
+   "top_level_cudnn_imports": [
+    "cudnn.gemm.frost.arch_family"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/gemm/frost/fusion_ir.py",
+   "module": "cudnn.gemm.frost.fusion_ir",
+   "group": "gemm.frost",
+   "bytes": 50827,
+   "lines": 1081,
+   "sha256": "c2ffbdd5364a9df96306a787195997c1917e46af118eac2fc05b04a3fedeaa16",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/gemm/frost/graph_analyzer.py",
+   "module": "cudnn.gemm.frost.graph_analyzer",
+   "group": "gemm.frost",
+   "bytes": 96579,
+   "lines": 2237,
+   "sha256": "d92a46ce14c54ffe90a9ea73ea212e9297c52d750d2cc9280fc867a51a9b68b3",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn",
+    "cudnn.gemm.frost.dtypes",
+    "cudnn.gemm.frost.fusion_ir"
+   ],
+   "lazy_cudnn_imports": [
+    "cudnn.gemm.frost.compiler (in build_gemm_plan)",
+    "cudnn.gemm.frost.compiler (in probe_gemm_plan)",
+    "cudnn.gemm.frost.fusion_ir (in _build_multi_gemm_chain)",
+    "cudnn.gemm.frost.fusion_ir (in _build_multi_moe_chain)",
+    "cudnn.gemm.frost.kernel_registry (in _build_multi_moe_chain)"
+   ],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": [
+    "cudnn"
+   ]
+  },
+  {
+   "path": "python/cudnn/gemm/frost/heuristics.py",
+   "module": "cudnn.gemm.frost.heuristics",
+   "group": "gemm.frost",
+   "bytes": 3087,
+   "lines": 80,
+   "sha256": "4bd3820f772979d7aee31b40cbf0780cd6b0f629def8ddc3238b1431a841ee1a",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.engines.base",
+    "cudnn.gemm.frost.knobs"
+   ],
+   "lazy_cudnn_imports": [
+    "cudnn.gemm.frost.compiler (in analyze_facts)",
+    "cudnn.gemm.frost.compiler (in recommend)",
+    "cudnn.gemm.frost.graph_analyzer (in analyze_facts)",
+    "cudnn.gemm.frost.planning (in recommend)"
+   ],
+   "lazy_outside_closure": [
+    "cudnn.gemm.frost.planning (in recommend)"
+   ],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/gemm/frost/kernel_registry.py",
+   "module": "cudnn.gemm.frost.kernel_registry",
+   "group": "gemm.frost",
+   "bytes": 49267,
+   "lines": 1017,
+   "sha256": "89582406b4818d1028a1947d9e5b79c2c57b4a85a9fd40c409d006f80fe041aa",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.gemm.frost.arch_family",
+    "cudnn.gemm.frost.fusion_ir",
+    "cudnn.gemm.frost.tile_config"
+   ],
+   "lazy_cudnn_imports": [
+    "cudnn.gemm.frost.compiler (in _config_reject)",
+    "cudnn.gemm.frost.compiler (in _other_reject)",
+    "cudnn.gemm.frost.compiler (in arch_active_reject)",
+    "cudnn.gemm.frost.compiler (in mma_arch_reject)",
+    "cudnn.gemm.frost.compiler (in preferred_mma_tile_k_bytes)",
+    "cudnn.gemm.frost.compiler (in preferred_pipeline)",
+    "cudnn.gemm.frost.dtypes (in _extra_reject)",
+    "cudnn.gemm.frost.dtypes (in multi_gemm_ab_stages)",
+    "cudnn.gemm.frost.dtypes (in multi_gemm_smem_bytes)",
+    "cudnn.gemm.frost.sm120.compiler (in block_quant_reject)",
+    "cudnn.gemm.frost.tile_config (in _config_reject)",
+    "cudnn.gemm.frost.tile_config (in multi_gemm_ab_stages)",
+    "cudnn.gemm.frost.tile_config (in multi_gemm_smem_bytes)"
+   ],
+   "lazy_outside_closure": [
+    "cudnn.gemm.frost.sm120.compiler (in block_quant_reject)"
+   ],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/gemm/frost/kernel_templates/dynamic_scheduler_counter_initialization.py",
+   "module": "cudnn.gemm.frost.kernel_templates.dynamic_scheduler_counter_initialization",
+   "group": "gemm.frost",
+   "bytes": 575,
+   "lines": 17,
+   "sha256": "8309728115d45abc42e87e0ed2d7a8c584383d806394e08c2c470c32335ec6a7",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": false,
+   "opened_by_path": false,
+   "why": "17 lines; the kernel_templates package's second shared template (imported by rendered sources of other pipelines; kept so the package is whole)",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/gemm/frost/kernel_templates/split_k_reduction_epilogue_fusion.py",
+   "module": "cudnn.gemm.frost.kernel_templates.split_k_reduction_epilogue_fusion",
+   "group": "gemm.frost",
+   "bytes": 5531,
+   "lines": 130,
+   "sha256": "9047b774fc18eac0c6a640e3191b01508af591422d910ba960227acda37a3670",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/gemm/frost/knobs.py",
+   "module": "cudnn.gemm.frost.knobs",
+   "group": "gemm.frost",
+   "bytes": 7636,
+   "lines": 168,
+   "sha256": "56f64c8b75fc816057b27d4307ea8180f5c5f37436cfa8cf5a70275ecd607365",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn",
+    "cudnn.gemm.frost.tile_config"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": [
+    "cudnn"
+   ]
+  },
+  {
+   "path": "python/cudnn/gemm/frost/recipe.py",
+   "module": "cudnn.gemm.frost.recipe",
+   "group": "gemm.frost",
+   "bytes": 27994,
+   "lines": 631,
+   "sha256": "5e218191cdd7382f4168fdc785eca9870bfd47c8a1eded7bbed3bed802a64aa8",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.buffers",
+    "cudnn.gemm.frost.dtypes",
+    "cudnn.gemm.frost.fusion_ir"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/gemm/frost/sm100/__init__.py",
+   "module": "cudnn.gemm.frost.sm100",
+   "group": "gemm.frost.sm100",
+   "bytes": 581,
+   "lines": 10,
+   "sha256": "a4cb20b913e86c989a12135da7a51cf77fdf715d5da4d11ba6b70e16894f0b8b",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/gemm/frost/sm100/compiler.py",
+   "module": "cudnn.gemm.frost.sm100.compiler",
+   "group": "gemm.frost.sm100",
+   "bytes": 279805,
+   "lines": 5604,
+   "sha256": "15e0d8df2f878c88d5dba82b32f507560a47eceb1d430d58c8ec72c87fcaab10",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn",
+    "cudnn.frost.buffers",
+    "cudnn.frost.device",
+    "cudnn.frost.workspace",
+    "cudnn.gemm.frost.arch_family",
+    "cudnn.gemm.frost.dtypes",
+    "cudnn.gemm.frost.fusion_ir",
+    "cudnn.gemm.frost.graph_analyzer",
+    "cudnn.gemm.frost.recipe",
+    "cudnn.gemm.frost.sm100.epilogue_codegen",
+    "cudnn.gemm.frost.tile_config"
+   ],
+   "lazy_cudnn_imports": [
+    "cudnn.frost.buffers (in _supports_gpu_arch_option)",
+    "cudnn.frost.device (in _frost_compile_options)",
+    "cudnn.frost.occupancy (in _grid_num_clusters)",
+    "cudnn.gemm.frost.fusion_ir (in jit_from_cudnn_graph)",
+    "cudnn.gemm.frost.fusion_ir (in probe_chain)",
+    "cudnn.gemm.frost.kernel_registry (in _baseline_config)",
+    "cudnn.gemm.frost.kernel_registry (in _call_variant_pack)",
+    "cudnn.gemm.frost.kernel_registry (in _check_block_scale_supported)",
+    "cudnn.gemm.frost.kernel_registry (in _check_mma_k_dim)",
+    "cudnn.gemm.frost.kernel_registry (in _check_supported)",
+    "cudnn.gemm.frost.kernel_registry (in _jit_block_scale)",
+    "cudnn.gemm.frost.kernel_registry (in _jit_moe_block_scale)",
+    "cudnn.gemm.frost.kernel_registry (in _precheck_block_scale)",
+    "cudnn.gemm.frost.kernel_registry (in _precheck_moe)",
+    "cudnn.gemm.frost.kernel_registry (in _precheck_moe_block_scale)",
+    "cudnn.gemm.frost.kernel_registry (in _precheck_plain)",
+    "cudnn.gemm.frost.kernel_registry (in _render_block_scale_template)",
+    "cudnn.gemm.frost.kernel_registry (in _render_template)",
+    "cudnn.gemm.frost.kernel_registry (in _template_reads_fallback_cluster)",
+    "cudnn.gemm.frost.kernel_registry (in jit_from_cudnn_graph)",
+    "cudnn.gemm.frost.kernel_registry (in probe_chain)",
+    "cudnn.gemm.frost.planning (in plan_config)",
+    "cudnn.gemm.frost.planning (in plan_configs)",
+    "cudnn.gemm.frost.tile_config (in _baseline_config)",
+    "cudnn.gemm.frost.tile_config (in _l2_swizzle_budget_bytes)",
+    "cudnn.gemm.frost.tile_config (in _render_block_scale_tile_constants)",
+    "cudnn.graph_types (in _declared_storage)"
+   ],
+   "lazy_outside_closure": [
+    "cudnn.gemm.frost.planning (in plan_config)",
+    "cudnn.gemm.frost.planning (in plan_configs)"
+   ],
+   "root_cudnn_imports": [
+    "cudnn"
+   ]
+  },
+  {
+   "path": "python/cudnn/gemm/frost/sm100/epilogue_codegen.py",
+   "module": "cudnn.gemm.frost.sm100.epilogue_codegen",
+   "group": "gemm.frost.sm100",
+   "bytes": 86534,
+   "lines": 1844,
+   "sha256": "26d22a4afff1270cecc5dbbc86109199e19bc997cb91500d09e33d4d8f5b9d53",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.gemm.frost.dtypes",
+    "cudnn.gemm.frost.fusion_ir"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/gemm/frost/sm100/kernel_templates/sm100_matmul.py",
+   "module": "cudnn.gemm.frost.sm100.kernel_templates.sm100_matmul",
+   "group": "gemm.frost.sm100",
+   "bytes": 69604,
+   "lines": 1527,
+   "sha256": "9aad7f400b8f00f6794c23e50c18330e8b45d83c0ac75f73c016f2836699b95c",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": false,
+   "opened_by_path": true,
+   "why": "template file executed by path",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.compiled_cache",
+    "cudnn.gemm.frost.kernel_templates.split_k_reduction_epilogue_fusion",
+    "cudnn.gemm.frost.tile_helpers"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/gemm/frost/tile_config.py",
+   "module": "cudnn.gemm.frost.tile_config",
+   "group": "gemm.frost",
+   "bytes": 60911,
+   "lines": 1264,
+   "sha256": "aa2d560a1bc35cbf7a1cb3b5f1763b6b626a2a15eea6b07c828148df40f3b7a5",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.occupancy"
+   ],
+   "lazy_cudnn_imports": [
+    "cudnn.frost.device (in _l2_swizzle_budget_bytes_of)",
+    "cudnn.frost.device (in _sm120_smem_cap_bytes)",
+    "cudnn.frost.device (in _sm_count)",
+    "cudnn.frost.device (in _sm_smem_budget_bytes)",
+    "cudnn.frost.device (in _sm_smem_budget_bytes_of)",
+    "cudnn.frost.device (in l2_swizzle_budget_bytes)",
+    "cudnn.gemm.frost.compiler (in _mma_inst_k64)",
+    "cudnn.gemm.frost.compiler (in validate_block_scale_config_sm100)",
+    "cudnn.gemm.frost.kernel_registry (in _mma_inst_k64)",
+    "cudnn.gemm.frost.kernel_registry (in validate_block_scale_config_sm100)"
+   ],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/gemm/frost/tile_helpers.py",
+   "module": "cudnn.gemm.frost.tile_helpers",
+   "group": "gemm.frost",
+   "bytes": 16125,
+   "lines": 443,
+   "sha256": "5064a832461248d6f2b55e7ffaca48283dfd1debf8598c9231562c9213ddbf77",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/graph_types.py",
+   "module": "cudnn.graph_types",
+   "group": "root",
+   "bytes": 13298,
+   "lines": 360,
+   "sha256": "15a387cb7cc0f4eae8604be1b171ae9562198ab7b8da0a8f558c1e8b986dbe07",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [
+    "cudnn (in _fp4_enum)",
+    "cudnn.datatypes (in byte_size)",
+    "cudnn.datatypes (in get_data_type)",
+    "cudnn.datatypes (in storage_slot_bytes)",
+    "cudnn.frost.buffers (in byte_size)",
+    "cudnn.frost.buffers (in storage_slot_bytes)"
+   ],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": [
+    "cudnn"
+   ]
+  },
+  {
+   "path": "python/cudnn/nodes.py",
+   "module": "cudnn.nodes",
+   "group": "root",
+   "bytes": 7233,
+   "lines": 183,
+   "sha256": "b6d237cf5e696e86b45cf689703bde190df1a3060af79d58a89cc7d0c77ec32d",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.graph_types"
+   ],
+   "lazy_cudnn_imports": [
+    "cudnn._compiled_module (in infer_properties)"
+   ],
+   "lazy_outside_closure": [
+    "cudnn._compiled_module (in infer_properties)"
+   ],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/sdpa/__init__.py",
+   "module": "cudnn.sdpa",
+   "group": "sdpa",
+   "bytes": 1725,
+   "lines": 41,
+   "sha256": "2aa227ae8c7080ae09eaf359899a70bdfcb97ddd0241c2e4ac0b8f317bf8b255",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/sdpa/bwd/__init__.py",
+   "module": "cudnn.sdpa.bwd",
+   "group": "sdpa",
+   "bytes": 2102,
+   "lines": 49,
+   "sha256": "f84b1a1eec4d5e856884381cbcdbf8a9eecb335d0649ad8d5729929dc1b1292d",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/sdpa/bwd/config_sm100.py",
+   "module": "cudnn.sdpa.bwd.config_sm100",
+   "group": "sdpa",
+   "bytes": 79768,
+   "lines": 1324,
+   "sha256": "386a8b00e5fe049ffb5c39568ae93ef0a4a7c59243b81c20d96e3664941e00c8",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.tile_dsl.constants"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/sdpa/bwd/config_sm107.py",
+   "module": "cudnn.sdpa.bwd.config_sm107",
+   "group": "sdpa",
+   "bytes": 119780,
+   "lines": 2166,
+   "sha256": "4af070630b87758b9dde39a1465d6556c99aec509a8f9a5981a01f9173937127",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.tile_dsl.constants",
+    "cudnn.sdpa.bwd.config_sm100"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/sdpa/fwd/__init__.py",
+   "module": "cudnn.sdpa.fwd",
+   "group": "sdpa.fwd",
+   "bytes": 1708,
+   "lines": 44,
+   "sha256": "c8b86826c62dd33584419d4f9d6a7655db9967071dfe75f052e088b62febfb89",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/sdpa/fwd/api_dsl.py",
+   "module": "cudnn.sdpa.fwd.api_dsl",
+   "group": "sdpa.fwd",
+   "bytes": 406528,
+   "lines": 7150,
+   "sha256": "6e7a12355d16307f5864da766935ee8a1b7cea66bdfe9931fa5682b4f73e608d",
+   "license": "Apache-2.0 AND MIT",
+   "copyright": "# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn._device",
+    "cudnn._torch_stream",
+    "cudnn.api_base",
+    "cudnn.frost.buffers",
+    "cudnn.frost.template_loader",
+    "cudnn.frost.tile_dsl.constants",
+    "cudnn.sdpa.fwd.config_sm100",
+    "cudnn.sdpa.fwd.config_sm107",
+    "cudnn.sdpa.fwd.config_sm120",
+    "cudnn.sdpa.fwd.config_sm80",
+    "cudnn.sdpa.fwd.config_sm90"
+   ],
+   "lazy_cudnn_imports": [
+    "cudnn (in _binders_serve_the_paged_gate)",
+    "cudnn (in _prepared_operand_layout)",
+    "cudnn (in _thd_binder_serves_the_gate)",
+    "cudnn (in check_support)",
+    "cudnn (in template_params)",
+    "cudnn._cutlass_compat (in check_support)",
+    "cudnn.frost.buffers (in check_support)",
+    "cudnn.frost.buffers (in sdpa_fwd_wrapper_sm80)",
+    "cudnn.frost.tile_dsl.thd (in _compile_thd_meta)",
+    "cudnn.frost.tile_dsl.thd (in _execute_thd)",
+    "cudnn.frost.tile_dsl.thd (in _thd_meta_words)",
+    "cudnn.frost.tile_dsl.thd (in _thd_plan)",
+    "cudnn.frost.tile_dsl.thd (in scratch_workspace_bytes)",
+    "cudnn.graph_types (in _prepared_operand_layout)",
+    "cudnn.sdpa.bwd.kernels.thd_helpers (in _compile_thd_meta)",
+    "cudnn.sdpa.fwd.config_sm100 (in _load_kernel_template)",
+    "cudnn.sdpa.fwd.config_sm100 (in _prepared_operand_layout)",
+    "cudnn.sdpa.fwd.config_sm107 (in __init__)",
+    "cudnn.sdpa.fwd.config_sm107 (in _load_kernel_template)",
+    "cudnn.sdpa.fwd.config_sm80 (in _execute_thd)",
+    "cudnn.sdpa.fwd.config_sm80 (in _sm80_thd_forward)",
+    "cudnn.sdpa.fwd.config_sm80 (in compile)",
+    "cudnn.sdpa.fwd.heuristics (in template_params)",
+    "cudnn.sdpa.fwd.kernels.sm80.prepared_host (in compile)",
+    "cudnn.sdpa.fwd.prepared (in _build_prepared_specs)",
+    "cudnn.sdpa.fwd.prepared (in _execute_dense_prepared_on_stream)",
+    "cudnn.sdpa.fwd.prepared (in _execute_fp8_prepared)",
+    "cudnn.sdpa.fwd.prepared (in _execute_thd)",
+    "cudnn.sdpa.fwd.prepared (in _thd_workspace_layout)",
+    "cudnn.sdpa.fwd.prepared (in compile)",
+    "cudnn.sdpa.fwd.prepared (in execute)",
+    "cudnn.sdpa.fwd.prepared_sm80 (in compile)",
+    "cudnn.sdpa.fwd.prepared_sm80 (in execute)",
+    "cudnn.sdpa.fwd.prepared_sm80 (in scratch_workspace_bytes)",
+    "cudnn.sdpa.fwd.prepared_sm80_thd (in _sm80_thd_forward)",
+    "cudnn.sdpa.fwd.prepared_staged_forward (in compile)",
+    "cudnn.sdpa.fwd.prepared_staged_forward (in execute)",
+    "cudnn.sdpa.fwd.prepared_staged_forward (in scratch_workspace_bytes)",
+    "cudnn.sdpa.fwd.prepared_staged_sm80 (in compile)",
+    "cudnn.sdpa.fwd.prepared_staged_sm80 (in execute)",
+    "cudnn.sdpa.fwd.prepared_staged_sm80 (in scratch_workspace_bytes)",
+    "cudnn.sdpa.graph_analyzer (in check_support)",
+    "cudnn.sdpa.packed_copy_sm80 (in _sm80_thd_forward)"
+   ],
+   "lazy_outside_closure": [
+    "cudnn.sdpa.bwd.kernels.thd_helpers (in _compile_thd_meta)",
+    "cudnn.sdpa.fwd.kernels.sm80.prepared_host (in compile)",
+    "cudnn.sdpa.fwd.prepared_sm80 (in compile)",
+    "cudnn.sdpa.fwd.prepared_sm80 (in execute)",
+    "cudnn.sdpa.fwd.prepared_sm80 (in scratch_workspace_bytes)",
+    "cudnn.sdpa.fwd.prepared_sm80_thd (in _sm80_thd_forward)",
+    "cudnn.sdpa.fwd.prepared_staged_forward (in compile)",
+    "cudnn.sdpa.fwd.prepared_staged_forward (in execute)",
+    "cudnn.sdpa.fwd.prepared_staged_forward (in scratch_workspace_bytes)",
+    "cudnn.sdpa.fwd.prepared_staged_sm80 (in compile)",
+    "cudnn.sdpa.fwd.prepared_staged_sm80 (in execute)",
+    "cudnn.sdpa.fwd.prepared_staged_sm80 (in scratch_workspace_bytes)",
+    "cudnn.sdpa.packed_copy_sm80 (in _sm80_thd_forward)"
+   ],
+   "root_cudnn_imports": [
+    "cudnn"
+   ]
+  },
+  {
+   "path": "python/cudnn/sdpa/fwd/config_d128_family.py",
+   "module": "cudnn.sdpa.fwd.config_d128_family",
+   "group": "sdpa.fwd",
+   "bytes": 71281,
+   "lines": 1106,
+   "sha256": "b067d555e5a589e66eeb76e2f6f268dc700fea969b935d726d8bcd56481c35f3",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.tile_dsl.constants",
+    "cudnn.sdpa.bwd.config_sm107"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/sdpa/fwd/config_sm100.py",
+   "module": "cudnn.sdpa.fwd.config_sm100",
+   "group": "sdpa.fwd",
+   "bytes": 218521,
+   "lines": 3879,
+   "sha256": "1407bb555d3f29d983923c852e76f33bea427b0aa83c6c903c225497466898a2",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.tile_dsl.constants",
+    "cudnn.sdpa.fwd.config_d128_family"
+   ],
+   "lazy_cudnn_imports": [
+    "cudnn.frost.tile_dsl.mask (in canonicalize_d192_lowering)"
+   ],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/sdpa/fwd/config_sm107.py",
+   "module": "cudnn.sdpa.fwd.config_sm107",
+   "group": "sdpa.fwd",
+   "bytes": 252648,
+   "lines": 3849,
+   "sha256": "842052337e36909af50a0e0097d150be767bf496c4e39891af968792c7da0256",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.tile_dsl.constants",
+    "cudnn.sdpa.bwd.config_sm107",
+    "cudnn.sdpa.fwd.config_d128_family",
+    "cudnn.sdpa.fwd.config_sm100"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/sdpa/fwd/config_sm120.py",
+   "module": "cudnn.sdpa.fwd.config_sm120",
+   "group": "sdpa.fwd",
+   "bytes": 13211,
+   "lines": 256,
+   "sha256": "f65c48b15576853434ff85e65fc48e0e755686384ee734476edad2c4d2f93b61",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.tile_dsl.constants",
+    "cudnn.frost.tile_dsl.sf_layout"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/sdpa/fwd/config_sm80.py",
+   "module": "cudnn.sdpa.fwd.config_sm80",
+   "group": "sdpa.fwd",
+   "bytes": 7996,
+   "lines": 158,
+   "sha256": "c7dd36462cbaaf0b3828cf8ccc5e15b2130a8adea9cf70c924d5ebd672472fd5",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.tile_dsl.constants"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/sdpa/fwd/config_sm90.py",
+   "module": "cudnn.sdpa.fwd.config_sm90",
+   "group": "sdpa.fwd",
+   "bytes": 6147,
+   "lines": 121,
+   "sha256": "02832d19ec996756a28b43505172bcadeab249ee1eb6d51fcece4b2baeef8a8f",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.tile_dsl.constants"
+   ],
+   "lazy_cudnn_imports": [
+    "cudnn.sdpa.graph_analyzer (in dense_bind_strides)"
+   ],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/sdpa/fwd/engines.py",
+   "module": "cudnn.sdpa.fwd.engines",
+   "group": "sdpa.fwd",
+   "bytes": 226192,
+   "lines": 3630,
+   "sha256": "85ed5eb23399a882e689e0f83a4ada4b4533088f76e2e4389b4f233c0ee64086",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn",
+    "cudnn.frost.buffers",
+    "cudnn.frost.tile_dsl.constants",
+    "cudnn.sdpa.fwd.config_d128_family",
+    "cudnn.sdpa.fwd.config_sm100",
+    "cudnn.sdpa.fwd.config_sm107",
+    "cudnn.sdpa.fwd.config_sm120",
+    "cudnn.sdpa.graph_analyzer"
+   ],
+   "lazy_cudnn_imports": [
+    "cudnn.graph_types (in _prepared_decline_reason)",
+    "cudnn.graph_types (in _resident_arm_layout_decline)",
+    "cudnn.graph_types (in lower_dsl_prefill._layout)",
+    "cudnn.sdpa.fwd.api_dsl (in _adapter)",
+    "cudnn.sdpa.fwd.api_dsl (in lower_dsl_prefill)",
+    "cudnn.sdpa.fwd.config_sm100 (in _prepared_decline_reason)",
+    "cudnn.sdpa.fwd.config_sm100 (in _resident_arm_layout_decline)",
+    "cudnn.sdpa.fwd.config_sm107 (in _bias_arm_decline)",
+    "cudnn.sdpa.fwd.config_sm120 (in _sm120_fp8_spec)",
+    "cudnn.sdpa.fwd.config_sm120 (in _sm120_mxfp8_spec)",
+    "cudnn.sdpa.fwd.config_sm120 (in _sm120_spec)",
+    "cudnn.sdpa.fwd.config_sm90 (in _prepared_decline_reason)",
+    "cudnn.sdpa.fwd.config_sm90 (in _sm90_spec)",
+    "cudnn.sdpa.fwd.prepared (in lower_dsl_prefill)",
+    "cudnn.sdpa.fwd.prepared_sm80 (in lower_dsl_prefill)"
+   ],
+   "lazy_outside_closure": [
+    "cudnn.sdpa.fwd.prepared_sm80 (in lower_dsl_prefill)"
+   ],
+   "root_cudnn_imports": [
+    "cudnn"
+   ]
+  },
+  {
+   "path": "python/cudnn/sdpa/fwd/heuristics.py",
+   "module": "cudnn.sdpa.fwd.heuristics",
+   "group": "sdpa.fwd",
+   "bytes": 173208,
+   "lines": 2925,
+   "sha256": "d1ef6f4115889616fd189381765cf2581bd1a464991a17ea8552d0e1397a2535",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn",
+    "cudnn.engines.base",
+    "cudnn.frost.tile_dsl.constants",
+    "cudnn.sdpa.fwd.config_sm100",
+    "cudnn.sdpa.fwd.config_sm107",
+    "cudnn.sdpa.fwd.config_sm120",
+    "cudnn.sdpa.fwd.engines"
+   ],
+   "lazy_cudnn_imports": [
+    "cudnn.engines.heuristics (in propose)",
+    "cudnn.engines.manifest (in propose)",
+    "cudnn.sdpa.fwd.placement (in propose)"
+   ],
+   "lazy_outside_closure": [
+    "cudnn.sdpa.fwd.placement (in propose)"
+   ],
+   "root_cudnn_imports": [
+    "cudnn"
+   ]
+  },
+  {
+   "path": "python/cudnn/sdpa/fwd/kernels/__init__.py",
+   "module": "cudnn.sdpa.fwd.kernels",
+   "group": "sdpa.fwd.kernels",
+   "bytes": 3570,
+   "lines": 61,
+   "sha256": "bb609f72322c9804996aba3860f3a25678674a86a65276683b0cb47bb1a23096",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/sdpa/fwd/kernels/_common_blackwell.py",
+   "module": "cudnn.sdpa.fwd.kernels._common_blackwell",
+   "group": "sdpa.fwd.kernels",
+   "bytes": 100984,
+   "lines": 1760,
+   "sha256": "49c37fd0da51bbc458b2a42ada8fe7f2fe4f0332be305ddb7a957c89408aeb0b",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.tile_dsl.barrier",
+    "cudnn.frost.tile_dsl.mask",
+    "cudnn.frost.tile_dsl.pointwise",
+    "cudnn.frost.tile_dsl.scheduler",
+    "cudnn.frost.tile_dsl.thd",
+    "cudnn.frost.tile_dsl.tma",
+    "cudnn.sdpa.fwd.config_sm100"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/sdpa/fwd/kernels/_quantized.py",
+   "module": "cudnn.sdpa.fwd.kernels._quantized",
+   "group": "sdpa.fwd.kernels",
+   "bytes": 1780,
+   "lines": 53,
+   "sha256": "c5c171383455cb514afce07ed8794b010b31bc46d9c8b74bc4a631b61c5238a7",
+   "license": "MIT",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/sdpa/fwd/kernels/_thd_split_host.py",
+   "module": "cudnn.sdpa.fwd.kernels._thd_split_host",
+   "group": "sdpa.fwd.kernels",
+   "bytes": 6061,
+   "lines": 167,
+   "sha256": "d2002b93154243954905e0b41b9e5b9db665bb0bab06ae12345306de34476308",
+   "license": "MIT",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.compiled_cache",
+    "cudnn.sdpa.fwd.kernels.sm100.split_combine"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/sdpa/fwd/kernels/sm100/__init__.py",
+   "module": "cudnn.sdpa.fwd.kernels.sm100",
+   "group": "sdpa.fwd.kernels",
+   "bytes": 245,
+   "lines": 4,
+   "sha256": "9f81aff85d3a225015389f08df4af77c169c6d7a6a12dcfa3e528aa24349b7a4",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/sdpa/fwd/kernels/sm100/prefill_d256_f16.py",
+   "module": "cudnn.sdpa.fwd.kernels.sm100.prefill_d256_f16",
+   "group": "sdpa.fwd.kernels",
+   "bytes": 117289,
+   "lines": 2440,
+   "sha256": "764e34c1b32265b27a8495cdbd66a841463195370d9bda97f9d6d26819b3395a",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": false,
+   "opened_by_path": true,
+   "why": "template file executed by path",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.compiled_cache",
+    "cudnn.frost.tile_dsl.barrier",
+    "cudnn.frost.tile_dsl.handles",
+    "cudnn.frost.tile_dsl.mask",
+    "cudnn.frost.tile_dsl.mma",
+    "cudnn.frost.tile_dsl.pointwise",
+    "cudnn.frost.tile_dsl.regtile",
+    "cudnn.frost.tile_dsl.scheduler",
+    "cudnn.frost.tile_dsl.thd",
+    "cudnn.frost.tile_dsl.tma",
+    "cudnn.frost.tile_dsl.tmem",
+    "cudnn.sdpa.fwd.config_sm100",
+    "cudnn.sdpa.fwd.kernels._common_blackwell",
+    "cudnn.sdpa.fwd.kernels._thd_split_host",
+    "cudnn.sdpa.fwd.kernels.thd_helpers"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/sdpa/fwd/kernels/sm100/split_combine.py",
+   "module": "cudnn.sdpa.fwd.kernels.sm100.split_combine",
+   "group": "sdpa.fwd.kernels",
+   "bytes": 157935,
+   "lines": 2829,
+   "sha256": "7eb370a32b64211719d042877fc8f348cf63588b90f52339ba19a60b0c9913cf",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": true,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn._cutlass_compat",
+    "cudnn.frost.compiled_cache",
+    "cudnn.frost.tile_dsl.barrier",
+    "cudnn.frost.tile_dsl.pointwise",
+    "cudnn.frost.tile_dsl.tma",
+    "cudnn.sdpa.fwd.heuristics",
+    "cudnn.sdpa.fwd.kernels._quantized"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/sdpa/fwd/kernels/sm107/__init__.py",
+   "module": "cudnn.sdpa.fwd.kernels.sm107",
+   "group": "sdpa.fwd.kernels",
+   "bytes": 235,
+   "lines": 4,
+   "sha256": "278dd7bc01468af7e61e2e9aa4804a318b0a64a02b988756bd7062080d590d4e",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": false,
+   "opened_by_path": false,
+   "why": "package __init__ on the import path of a closure module",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/sdpa/fwd/kernels/sm107/decode_d256_f16.py",
+   "module": "cudnn.sdpa.fwd.kernels.sm107.decode_d256_f16",
+   "group": "sdpa.fwd.kernels",
+   "bytes": 69800,
+   "lines": 1430,
+   "sha256": "88fa401150ca9fcbe731cf33ced71033915cbbeb2e4a3d67e63bd01258c50021",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": false,
+   "opened_by_path": true,
+   "why": "template file executed by path",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.buffers",
+    "cudnn.frost.compiled_cache",
+    "cudnn.frost.tile_dsl.barrier",
+    "cudnn.frost.tile_dsl.handles",
+    "cudnn.frost.tile_dsl.mask",
+    "cudnn.frost.tile_dsl.mma",
+    "cudnn.frost.tile_dsl.pointwise",
+    "cudnn.frost.tile_dsl.tma",
+    "cudnn.frost.tile_dsl.tmem",
+    "cudnn.sdpa.fwd.config_sm107",
+    "cudnn.sdpa.fwd.kernels._common_blackwell"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/sdpa/fwd/kernels/sm107/prefill_d256_f16.py",
+   "module": "cudnn.sdpa.fwd.kernels.sm107.prefill_d256_f16",
+   "group": "sdpa.fwd.kernels",
+   "bytes": 118433,
+   "lines": 2420,
+   "sha256": "ff113a6f57c4068ce4d5262b55aff302dad45db46e12f94e069726e0948e410d",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": false,
+   "opened_by_path": true,
+   "why": "template file executed by path",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.compiled_cache",
+    "cudnn.frost.tile_dsl.barrier",
+    "cudnn.frost.tile_dsl.handles",
+    "cudnn.frost.tile_dsl.mask",
+    "cudnn.frost.tile_dsl.mma",
+    "cudnn.frost.tile_dsl.pointwise",
+    "cudnn.frost.tile_dsl.regtile",
+    "cudnn.frost.tile_dsl.scheduler",
+    "cudnn.frost.tile_dsl.tma",
+    "cudnn.frost.tile_dsl.tmem",
+    "cudnn.sdpa.fwd.config_sm107",
+    "cudnn.sdpa.fwd.kernels._common_blackwell",
+    "cudnn.sdpa.fwd.kernels.thd_helpers"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/sdpa/fwd/kernels/thd_helpers.py",
+   "module": "cudnn.sdpa.fwd.kernels.thd_helpers",
+   "group": "sdpa.fwd.kernels",
+   "bytes": 16934,
+   "lines": 336,
+   "sha256": "23c88df6adf1a30cbd0c9e5b3f55dda0ec962cde182407932f4ae563f4700289",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.tile_dsl.swizzle",
+    "cudnn.frost.tile_dsl.thd"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/sdpa/fwd/prepared.py",
+   "module": "cudnn.sdpa.fwd.prepared",
+   "group": "sdpa.fwd",
+   "bytes": 93687,
+   "lines": 1688,
+   "sha256": "7974a282d151982460e0ea233b6eb422cf78644e113ab81ee2e907e40bcbc73e",
+   "license": "MIT",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.datatypes",
+    "cudnn.frost.buffers",
+    "cudnn.frost.compiled_cache"
+   ],
+   "lazy_cudnn_imports": [
+    "cudnn (in __init__)",
+    "cudnn (in _native_pack_from_facts)",
+    "cudnn (in build_dense_spec)",
+    "cudnn (in build_thd_spec)",
+    "cudnn (in execute_native_dense_tensors)",
+    "cudnn (in execute_native_thd_tensors)",
+    "cudnn.sdpa.fwd.api_dsl (in build_dense_spec)",
+    "cudnn.sdpa.fwd.config_sm100 (in _dense_role_layout)",
+    "cudnn.sdpa.fwd.config_sm100 (in _paged_pool_layout)",
+    "cudnn.sdpa.fwd.config_sm107 (in _kv_mask_role)",
+    "cudnn.sdpa.fwd.config_sm90 (in _dense_role_layout)",
+    "cudnn.sdpa.fwd.heuristics (in _split_combine_decode_grid)",
+    "cudnn.sdpa.fwd.kernels.sm100.split_combine (in _split_combine_decode_grid)",
+    "cudnn.sdpa.fwd.kernels.sm100.split_combine (in build_dense_spec)",
+    "cudnn.sdpa.graph_analyzer (in _dense_role_layout)",
+    "cudnn.sdpa.graph_analyzer (in _ragged_lse_layout)"
+   ],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": [
+    "cudnn"
+   ]
+  },
+  {
+   "path": "python/cudnn/sdpa/graph_analyzer.py",
+   "module": "cudnn.sdpa.graph_analyzer",
+   "group": "sdpa",
+   "bytes": 71893,
+   "lines": 1471,
+   "sha256": "df3514c27f90ad22bd287c034225d44f1fabf98986131940b859951dfbdece01",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn",
+    "cudnn._sdpa_tail"
+   ],
+   "lazy_cudnn_imports": [
+    "cudnn.api_base (in tensor_desc_from_ir)",
+    "cudnn.frost.buffers (in _device_props)",
+    "cudnn.sdpa.fwd.config_sm100 (in gate_layout_ok)"
+   ],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": [
+    "cudnn"
+   ]
+  },
+  {
+   "path": "python/cudnn/tensor_adapter.py",
+   "module": "cudnn.tensor_adapter",
+   "group": "root",
+   "bytes": 11163,
+   "lines": 303,
+   "sha256": "fc06e9876ad13958396bdcbc6a764e4cd26dc5223ab275ce3139daa700d66356",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.datatypes"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  }
+ ],
+ "templates_executed_by_path": [
+  "python/cudnn/gated_attention_block/kernels/cache_write.py",
+  "python/cudnn/gated_attention_block/kernels/elementwise.py",
+  "python/cudnn/gated_attention_block/kernels/proj_gemm_norm_rope.py",
+  "python/cudnn/gated_attention_block/kernels/qk_norm_rope_tma.py",
+  "python/cudnn/gemm/frost/sm100/kernel_templates/sm100_matmul.py",
+  "python/cudnn/sdpa/fwd/kernels/sm100/prefill_d256_f16.py",
+  "python/cudnn/sdpa/fwd/kernels/sm100/split_combine.py",
+  "python/cudnn/sdpa/fwd/kernels/sm107/decode_d256_f16.py",
+  "python/cudnn/sdpa/fwd/kernels/sm107/prefill_d256_f16.py"
+ ],
+ "data_files": [],
+ "test_helpers": [
+  {
+   "path": "test/python/gated_attention_block/cutedsl/gated_block_reference.py",
+   "bytes": 159625,
+   "lines": 2672,
+   "sha256": "acab05f2fcd7cb70414fee3f2a22b130356d8b151e35a481207da7750e6ff212",
+   "license": "Apache-2.0",
+   "why": "the fp32 oracle (gated_attention_block_reference), build_rope_tables, make_inputs, RefGeometry: what a FlashInfer correctness test compares against (the quantized / backward refs inside import test-tree siblings lazily and are not used)"
+  }
+ ],
+ "extra_files": [
+  {
+   "path": "test/python/sdpa/frost/sdpa_binding_reference.py",
+   "bytes": 56226,
+   "lines": 1003,
+   "sha256": "58bf1c41ba20ca9cb26eba266d3eeb65577cede813c00f10c1b2b948f0cb5063",
+   "license": "MIT",
+   "why": "the retired Python frame implementation of the SDPA launch binder (bind_dense / bind_dense_split / bind_thd, the paged pools and tables, the split combine): the frame logic the FlashInfer-side Python binder delegates to, vendored as sdpa/fwd/_binding_reference.py"
+  }
+ ],
+ "excluded": {
+  "cudnn": "the package root: loads the nanobind extension; the vendored root is written fresh (shim)",
+  "cudnn._compiled_module": "the nanobind extension (.so): NOT vendored; its Python-visible surface is shimmed",
+  "cudnn.graph": "the classic graph API facade (graph / jit / graph_cache): the block never uses it",
+  "cudnn.gated_attention_block.api_bwd": "the training half (backward); dropped from the vendored package __init__ (patch P0)"
+ },
+ "holes_module_level": [
+  [
+   "gated_attention_block/__init__.py",
+   "cudnn.gated_attention_block.api_bwd"
+  ]
+ ],
+ "lazy_imports_outside_closure": [
+  [
+   "gated_attention_block/api.py",
+   "cudnn.gated_attention_block.kernels.qsa_kv_upcast",
+   "check_support"
+  ],
+  [
+   "gated_attention_block/api.py",
+   "cudnn.gated_attention_block.kernels.qsa_kv_upcast",
+   "compile"
+  ],
+  [
+   "gated_attention_block/api.py",
+   "cudnn.gated_attention_block.kernels.qsa_kv_upcast",
+   "execute"
+  ],
+  [
+   "gated_attention_block/api.py",
+   "cudnn.gated_attention_block.kernels.quantize_fp4",
+   "_format"
+  ],
+  [
+   "gated_attention_block/api.py",
+   "cudnn.gated_attention_block.kernels.quantize_fp4",
+   "check_support"
+  ],
+  [
+   "gated_attention_block/api.py",
+   "cudnn.gated_attention_block.kernels.quantize_fp4",
+   "compile"
+  ],
+  [
+   "gated_attention_block/api.py",
+   "cudnn.gated_attention_block.kernels.quantize_fp4",
+   "execute"
+  ],
+  [
+   "gated_attention_block/api.py",
+   "cudnn.gated_attention_block.kernels.quantize_fp4",
+   "moved_bytes"
+  ],
+  [
+   "gated_attention_block/api.py",
+   "cudnn.sdpa.fwd.sparse_gqa_sm107",
+   "_operands"
+  ],
+  [
+   "gated_attention_block/api.py",
+   "cudnn.sdpa.fwd.sparse_gqa_sm107",
+   "_sparse_record"
+  ],
+  [
+   "gated_attention_block/api.py",
+   "cudnn.sdpa.fwd.sparse_gqa_sm107",
+   "check_support"
+  ],
+  [
+   "gemm/frost/heuristics.py",
+   "cudnn.gemm.frost.planning",
+   "recommend"
+  ],
+  [
+   "gemm/frost/kernel_registry.py",
+   "cudnn.gemm.frost.sm120.compiler",
+   "block_quant_reject"
+  ],
+  [
+   "gemm/frost/sm100/compiler.py",
+   "cudnn.gemm.frost.planning",
+   "plan_config"
+  ],
+  [
+   "gemm/frost/sm100/compiler.py",
+   "cudnn.gemm.frost.planning",
+   "plan_configs"
+  ],
+  [
+   "nodes.py",
+   "cudnn._compiled_module",
+   "infer_properties"
+  ],
+  [
+   "sdpa/fwd/api_dsl.py",
+   "cudnn.sdpa.bwd.kernels.thd_helpers",
+   "_compile_thd_meta"
+  ],
+  [
+   "sdpa/fwd/api_dsl.py",
+   "cudnn.sdpa.fwd.kernels.sm80.prepared_host",
+   "compile"
+  ],
+  [
+   "sdpa/fwd/api_dsl.py",
+   "cudnn.sdpa.fwd.prepared_sm80",
+   "compile"
+  ],
+  [
+   "sdpa/fwd/api_dsl.py",
+   "cudnn.sdpa.fwd.prepared_sm80",
+   "execute"
+  ],
+  [
+   "sdpa/fwd/api_dsl.py",
+   "cudnn.sdpa.fwd.prepared_sm80",
+   "scratch_workspace_bytes"
+  ],
+  [
+   "sdpa/fwd/api_dsl.py",
+   "cudnn.sdpa.fwd.prepared_sm80_thd",
+   "_sm80_thd_forward"
+  ],
+  [
+   "sdpa/fwd/api_dsl.py",
+   "cudnn.sdpa.fwd.prepared_staged_forward",
+   "compile"
+  ],
+  [
+   "sdpa/fwd/api_dsl.py",
+   "cudnn.sdpa.fwd.prepared_staged_forward",
+   "execute"
+  ],
+  [
+   "sdpa/fwd/api_dsl.py",
+   "cudnn.sdpa.fwd.prepared_staged_forward",
+   "scratch_workspace_bytes"
+  ],
+  [
+   "sdpa/fwd/api_dsl.py",
+   "cudnn.sdpa.fwd.prepared_staged_sm80",
+   "compile"
+  ],
+  [
+   "sdpa/fwd/api_dsl.py",
+   "cudnn.sdpa.fwd.prepared_staged_sm80",
+   "execute"
+  ],
+  [
+   "sdpa/fwd/api_dsl.py",
+   "cudnn.sdpa.fwd.prepared_staged_sm80",
+   "scratch_workspace_bytes"
+  ],
+  [
+   "sdpa/fwd/api_dsl.py",
+   "cudnn.sdpa.packed_copy_sm80",
+   "_sm80_thd_forward"
+  ],
+  [
+   "sdpa/fwd/engines.py",
+   "cudnn.sdpa.fwd.prepared_sm80",
+   "lower_dsl_prefill"
+  ],
+  [
+   "sdpa/fwd/heuristics.py",
+   "cudnn.sdpa.fwd.placement",
+   "propose"
+  ]
+ ],
+ "native_attrs": {
+  "_SdpaDenseBinder": [
+   "cudnn.sdpa.fwd.api_dsl @ extend.check_support",
+   "cudnn.sdpa.fwd.prepared @ decode.compile",
+   "cudnn.sdpa.fwd.prepared @ prefill.compile"
+  ],
+  "_read_buffer_sequence": [
+   "cudnn.sdpa.fwd.prepared @ decode.execute",
+   "cudnn.sdpa.fwd.prepared @ decode.execute2",
+   "cudnn.sdpa.fwd.prepared @ extend.execute",
+   "cudnn.sdpa.fwd.prepared @ extend.execute2",
+   "cudnn.sdpa.fwd.prepared @ prefill.execute",
+   "cudnn.sdpa.fwd.prepared @ prefill.execute2"
+  ],
+  "make_operand_buffer": [
+   "cudnn.frost.workspace @ decode.execute",
+   "cudnn.frost.workspace @ decode.execute2",
+   "cudnn.frost.workspace @ extend.execute",
+   "cudnn.frost.workspace @ extend.execute2"
+  ],
+  "create_handle": [
+   "cudnn @ decode.compile",
+   "cudnn @ extend.compile",
+   "cudnn @ prefill.compile"
+  ],
+  "get_stream": [
+   "cudnn @ decode.compile",
+   "cudnn @ extend.compile",
+   "cudnn @ prefill.compile"
+  ],
+  "backend_graph": [
+   "cudnn._pygraph @ decode.compile",
+   "cudnn._pygraph @ extend.compile",
+   "cudnn._pygraph @ prefill.compile"
+  ],
+  "_SdpaThdBinder": [
+   "cudnn.sdpa.fwd.api_dsl @ extend.check_support",
+   "cudnn.sdpa.fwd.prepared @ extend.compile"
+  ]
+ },
+ "git_blob_mismatch": []
+}

@@ -210,6 +210,34 @@ def _serial(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("backend", ["auto", "cudnn"])
+@pytest.mark.parametrize("num_heads", [6, 16])
+@pytest.mark.parametrize("amplitude", [0.0, 1e-6, 1e-4, 1.0])
+def test_kda_additive_normalization_matches_serial(backend, num_heads, amplitude):
+    inputs = _make_inputs([17, 48], num_heads, initial_state=True, seed=11)
+    inputs["q"].mul_(amplitude)
+    inputs["k"].mul_(amplitude)
+    reference = dict(inputs)
+    for name in ("q", "k"):
+        value = inputs[name].float()
+        reference[name] = value * torch.rsqrt(
+            value.square().sum(dim=-1, keepdim=True) + 1e-6
+        )
+    expected_out, expected_state = _serial(reference, l2norm=False)
+    out, state = recurrent_kda(
+        inputs["q"],
+        inputs["k"],
+        inputs["v"],
+        inputs["g"],
+        inputs["beta"],
+        backend=backend,
+        initial_state=inputs["initial_state"].clone(),
+        **_gate_kwargs(inputs, output_final_state=True),
+    )
+    assert_rel_close("output", out, expected_out, KERNEL_TOLERANCE)
+    assert_rel_close("final_state", state, expected_state, KERNEL_TOLERANCE)
+
+
 @pytest.mark.parametrize("seq_lens", [[512], [256, 320], [64, 1, 1024]])
 @pytest.mark.parametrize("num_heads", [4])
 @pytest.mark.parametrize("use_initial_state", [False, True])
@@ -549,11 +577,13 @@ def test_cudnn_backend_updates_initial_state_in_place():
     inputs = _make_inputs([384], 4, initial_state=True, seed=7)
     state = inputs["initial_state"]
     before = state.clone()
+    before_version = state._version
     _, final_state = _run(
         inputs, initial_state=state, **_gate_kwargs(inputs, output_final_state=True)
     )
     assert final_state.data_ptr() == state.data_ptr()
     assert not torch.equal(state, before)
+    assert state._version > before_version
 
 
 def test_cudnn_backend_advances_initial_state_without_returning_it():
@@ -561,13 +591,18 @@ def test_cudnn_backend_advances_initial_state_without_returning_it():
     inputs = _make_inputs([384], 4, initial_state=True, seed=17)
     state = inputs["initial_state"]
     before = state.clone()
+    before_version = state._version
     out, final_state = _run(inputs, initial_state=state, **_gate_kwargs(inputs))
     assert final_state is None
     assert not torch.equal(state, before)
+    assert state._version > before_version
     assert out.isfinite().all()
 
 
-def test_cudnn_backend_writes_a_separate_output_state_without_touching_the_input():
+@pytest.mark.parametrize("output_final_state", [False, True])
+def test_cudnn_backend_writes_a_separate_output_state_without_touching_the_input(
+    output_final_state,
+):
     inputs = _make_inputs([384], 4, initial_state=True, seed=19)
     device = torch.device("cuda")
     state = inputs["initial_state"]
@@ -575,14 +610,64 @@ def test_cudnn_backend_writes_a_separate_output_state_without_touching_the_input
     output_state = torch.empty(
         1, 4, HEAD_DIM, HEAD_DIM, dtype=state.dtype, device=device
     )
-    _, final_state = _run_direct(
+    ref_out, ref_state = _serial(inputs)
+    out, final_state = _run_direct(
         inputs,
         initial_state=state,
         output_state=output_state,
-        **_gate_kwargs(inputs, output_final_state=True),
+        **_gate_kwargs(inputs, output_final_state=output_final_state),
     )
-    assert final_state.data_ptr() == output_state.data_ptr()
+    if output_final_state:
+        assert final_state.data_ptr() == output_state.data_ptr()
+    else:
+        assert final_state is None
     assert torch.equal(state, before), "initial_state was advanced anyway"
+    assert_rel_close("output", out, ref_out, SERIAL_TOLERANCE)
+    assert_rel_close("final_state", output_state, ref_state, SERIAL_TOLERANCE)
+
+
+@pytest.mark.parametrize("separate_state", [False, True])
+@pytest.mark.parametrize("strided_state", [False, True])
+def test_cudnn_backend_reads_fresh_buffers_on_a_warm_graph(
+    separate_state, strided_state
+):
+    """Same descriptors, new pointers and sequence boundaries on each call."""
+    retained = []
+    for seed, lengths in ((107, [128, 192]), (109, [192, 128])):
+        inputs = _make_inputs(lengths, 4, seed=seed, initial_state=True)
+        if strided_state:
+            inputs["initial_state"] = widened_view(inputs["initial_state"], axis=1)
+        before = inputs["initial_state"].clone()
+        ref_out, ref_state = _serial(inputs)
+        out = torch.empty_like(inputs["v"])
+        state = (
+            torch.empty_like(inputs["initial_state"])
+            if separate_state
+            else inputs["initial_state"]
+        )
+        kwargs = _gate_kwargs(
+            inputs,
+            initial_state=inputs["initial_state"],
+            output=out,
+            output_final_state=True,
+        )
+        if separate_state:
+            kwargs["output_state"] = state
+            returned_out, returned_state = _run_direct(inputs, **kwargs)
+            assert torch.equal(inputs["initial_state"], before)
+        else:
+            returned_out, returned_state = _run(inputs, **kwargs)
+        assert returned_out.data_ptr() == out.data_ptr()
+        assert returned_state.data_ptr() == state.data_ptr()
+        assert_rel_close("output", out, ref_out, SERIAL_TOLERANCE)
+        assert_rel_close("final_state", state, ref_state, SERIAL_TOLERANCE)
+        for _, old_out, old_state, saved_out, saved_state in retained:
+            assert torch.equal(old_out, saved_out), "a later call wrote an old output"
+            assert torch.equal(old_state, saved_state), (
+                "a later call wrote an old state"
+            )
+        # Keep the old inputs as well: allocator reuse must not hide stale bindings.
+        retained.append((inputs, out, state, out.clone(), state.clone()))
 
 
 def test_cudnn_backend_honors_output_buffer():
@@ -651,6 +736,59 @@ def test_cudnn_backend_replays_under_cuda_graph_capture():
     assert torch.equal(state, eager_state)
 
 
+@pytest.mark.parametrize("output_final_state", [False, True])
+def test_cudnn_backend_replays_incoming_state_with_changed_inputs(output_final_state):
+    """Capture preserves the public state-update contract and reads fresh data."""
+    inputs = _make_inputs([256, 128], 4, seed=113, initial_state=True)
+    initial_state = inputs["initial_state"]
+    seed_state = initial_state.clone()
+    out = torch.empty_like(inputs["v"])
+    call = _gate_kwargs(
+        inputs,
+        initial_state=initial_state,
+        output=out,
+        output_final_state=output_final_state,
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _run(inputs, **call)
+    stream.synchronize()
+    initial_state.copy_(seed_state)
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            returned_out, returned_state = _run(inputs, **call)
+        assert returned_out.data_ptr() == out.data_ptr()
+        if output_final_state:
+            assert returned_state.data_ptr() == initial_state.data_ptr()
+        else:
+            assert returned_state is None
+        for changed in (False, True):
+            if changed:
+                inputs["q"].mul_(0.875).add_(0.03125)
+                inputs["v"].mul_(-0.75)
+                seed_state.add_(0.0625)
+            initial_state.copy_(seed_state)
+            reference_state = torch.empty_like(seed_state)
+            reference_out, _ = _run_direct(
+                inputs,
+                initial_state=seed_state,
+                output_state=reference_state,
+                **_gate_kwargs(inputs, output_final_state=True),
+            )
+            # Poison only O. The incoming state is an input, not scratch space.
+            out.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(out, reference_out)
+            assert torch.equal(initial_state, reference_state)
+    finally:
+        torch.cuda.synchronize()
+        graph.reset()
+
+
 # ---------------------------------------------------------------------------
 # Routing
 # ---------------------------------------------------------------------------
@@ -665,7 +803,6 @@ def test_cudnn_backend_replays_under_cuda_graph_capture():
         "initial_state_indices",
         "seq_order",
         "prefill_workspace",
-        "ssm_state_indices",
         "state_checkpoints",
         "checkpoint_cu_starts",
         "checkpoint_every_n_tokens",
@@ -689,7 +826,6 @@ def test_cudnn_backend_names_the_unsupported_argument(argument):
         "initial_state_indices": indices,
         "seq_order": indices,
         "prefill_workspace": RecurrentKDAPrefillWorkspace(device),
-        "ssm_state_indices": indices,
         "state_checkpoints": checkpoints,
         "checkpoint_cu_starts": cu_starts,
         "checkpoint_every_n_tokens": 64,
@@ -750,3 +886,169 @@ def test_cudnn_entry_point_requires_cu_seqlens():
         cudnn_recurrent_kda(
             inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
         )
+
+
+# Native pool addressing must preserve KDA's implicit input-state mutation.
+def _require_state_pool_frontend():
+    import cudnn
+
+    if tuple(map(int, cudnn.__version__.split(".")[:2])) < (1, 31):
+        pytest.skip("state pools require cuDNN frontend 1.31+")
+
+
+def _make_kda_pool(heads, dtype, padding=0):
+    row_size = heads * HEAD_DIM * HEAD_DIM
+    storage = torch.randn(7 * (row_size + padding), device="cuda", dtype=dtype)
+    pool = storage.as_strided(
+        (7, heads, HEAD_DIM, HEAD_DIM),
+        (row_size + padding, HEAD_DIM * HEAD_DIM, HEAD_DIM, 1),
+    )
+    pool.mul_(0.01)
+    return pool
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("padding", [0, 96])
+@pytest.mark.parametrize("return_state", [False, True])
+def test_cudnn_kda_pool_updates_only_selected_rows(state_dtype, padding, return_state):
+    _require_state_pool_frontend()
+    inputs = _make_inputs([17, 0, 31], 4, seed=311)
+    pool = _make_kda_pool(4, state_dtype, padding)
+    for slot_values in ([5, 2, 4], [1, 6, 3]):
+        slots = torch.tensor(slot_values, device="cuda", dtype=torch.int32)
+        before = pool.clone()
+        expected_out, expected_state = _serial(
+            inputs, initial_state=pool.index_select(0, slots)
+        )
+        version = pool._version
+        actual, returned = _run(
+            inputs,
+            initial_state=pool,
+            ssm_state_indices=slots,
+            output_final_state=return_state,
+            **_gate_kwargs(inputs),
+        )
+        assert pool._version > version
+        assert (returned is pool) if return_state else (returned is None)
+        assert_rel_close("pool output", actual, expected_out, SERIAL_TOLERANCE)
+        assert_rel_close(
+            "pool state", pool.index_select(0, slots), expected_state, SERIAL_TOLERANCE
+        )
+        untouched = [i for i in range(7) if i not in slot_values]
+        assert torch.equal(pool[untouched], before[untouched])
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_cudnn_kda_pool_long_prefill_matches_serial(state_dtype):
+    _require_state_pool_frontend()
+    inputs = _make_inputs([2049, 0, 1023], 4, seed=319)
+    pool = _make_kda_pool(4, state_dtype, 96)
+    slots = torch.tensor([5, 2, 4], device="cuda", dtype=torch.int32)
+    before = pool.clone()
+    expected_out, expected_state = _serial(
+        inputs, initial_state=pool.index_select(0, slots)
+    )
+    actual, returned = _run(
+        inputs,
+        initial_state=pool,
+        ssm_state_indices=slots,
+        output_final_state=False,
+        **_gate_kwargs(inputs),
+    )
+    assert returned is None
+    assert_rel_close("long pool output", actual, expected_out, SERIAL_TOLERANCE)
+    assert_rel_close(
+        "long pool state", pool.index_select(0, slots), expected_state, SERIAL_TOLERANCE
+    )
+    assert torch.equal(pool[[0, 1, 3, 6]], before[[0, 1, 3, 6]])
+
+
+@pytest.mark.parametrize("return_state", [False, True])
+@pytest.mark.parametrize("identical", [False, True])
+def test_cudnn_kda_pool_explicit_output_state(return_state, identical):
+    _require_state_pool_frontend()
+    inputs = _make_inputs([17, 31], 4, seed=313)
+    pool = _make_kda_pool(4, torch.float32, 96)
+    slots = torch.tensor([5, 2], device="cuda", dtype=torch.int32)
+    destination = pool if identical else torch.full_like(pool, 17)
+    before, before_dest = pool.clone(), destination.clone()
+    expected_out, expected_state = _serial(
+        inputs, initial_state=pool.index_select(0, slots)
+    )
+    version = pool._version
+    actual, returned = _run_direct(
+        inputs,
+        initial_state=pool,
+        output_state=destination,
+        state_indices=slots,
+        output_final_state=return_state,
+        **_gate_kwargs(inputs),
+    )
+    assert (returned is destination) if return_state else (returned is None)
+    assert_rel_close("separate pool output", actual, expected_out, SERIAL_TOLERANCE)
+    assert_rel_close(
+        "separate pool state",
+        destination.index_select(0, slots),
+        expected_state,
+        SERIAL_TOLERANCE,
+    )
+    assert torch.equal(destination[[0, 1, 3, 4, 6]], before_dest[[0, 1, 3, 4, 6]])
+    if identical:
+        assert pool._version > version
+    else:
+        assert torch.equal(pool, before)
+
+
+def test_cudnn_kda_pool_capture_observes_changed_slots_and_contents():
+    _require_state_pool_frontend()
+    inputs = _make_inputs([17, 31], 4, seed=317)
+    pool = _make_kda_pool(4, torch.bfloat16, 96)
+    seed = pool.clone()
+    slots = torch.tensor([5, 2], device="cuda", dtype=torch.int32)
+    output = torch.empty_like(inputs["v"])
+
+    def run():
+        return _run(
+            inputs,
+            initial_state=pool,
+            ssm_state_indices=slots,
+            output=output,
+            output_final_state=False,
+            **_gate_kwargs(inputs),
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    stream.synchronize()
+    pool.copy_(seed)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured, returned = run()
+    assert returned is None
+    for slot_values in ([5, 2], [1, 6]):
+        slots.copy_(torch.tensor(slot_values, device="cuda", dtype=torch.int32))
+        pool.copy_(seed)
+        inputs["v"].mul_(0.9)
+        expected_out, expected_state = _serial(
+            inputs, initial_state=pool.index_select(0, slots)
+        )
+        graph.replay()
+        torch.cuda.synchronize()
+        assert captured.data_ptr() == output.data_ptr()
+        assert_rel_close("captured pool output", output, expected_out, SERIAL_TOLERANCE)
+        assert_rel_close(
+            "captured pool state",
+            pool.index_select(0, slots),
+            expected_state,
+            SERIAL_TOLERANCE,
+        )
+        untouched = [i for i in range(7) if i not in slot_values]
+        assert torch.equal(pool[untouched], seed[untouched])
+    old_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        run()
+    finally:
+        torch.cuda.set_sync_debug_mode(old_mode)

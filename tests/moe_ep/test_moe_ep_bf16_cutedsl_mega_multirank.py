@@ -10,7 +10,7 @@ import os
 
 import pytest
 
-pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
+pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
 
 
 def _require_cuda():
@@ -166,7 +166,7 @@ def _reference_bf16_mega_moe(
     from flashinfer.moe_ep.backends.mega.kernel.sm100.common.bf16_staging import (
         stage_mega_moe_inputs,
     )
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         bf16_mega_moe,
         get_symm_buffer_for_bf16_mega_moe,
     )
@@ -318,7 +318,7 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
         stage_mega_moe_inputs,
     )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         bf16_mega_moe,
         compute_megamoe_reference_bf16,
         get_symm_buffer_for_bf16_mega_moe,
@@ -395,7 +395,7 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
                 fc2_weight=_all_gather_stack(transformed_l2[0]),
                 ref_compute_graph="deepgemm",
                 gate_up_clamp=problem["gate_up_clamp"],
-                apply_topk_in_fc1=True,
+                apply_routing_weights_before_fc2=True,
             )
             yk = y_kernel.to(torch.float32)
             y_ref = combine_ref[rank].to(torch.float32).sum(dim=1)
@@ -423,7 +423,9 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
     ("epi_warps", "standalone_warps", "reuse_dispatch_warps"),
 )
 def test_bf16_multirank_modes_are_constructible(load_balance_mode, token_back_mode):
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.bf16 import MegaMoEBf16Config
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.bf16 import (
+        MegaMoEBf16Config,
+    )
 
     config = MegaMoEBf16Config(
         rank=0,
