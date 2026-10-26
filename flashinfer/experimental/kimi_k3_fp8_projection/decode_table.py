@@ -34,6 +34,7 @@ limitations under the License.
 
 from __future__ import annotations
 
+import functools
 from typing import Any
 
 ARCHES = ("sm_100a", "sm_103a")
@@ -1242,6 +1243,7 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
 }
 
 
+@functools.cache
 def decode_table(arch: str) -> dict[str, dict[str, Any]]:
     """The measured table of ``arch``: the shared cells with the overrides of that architecture."""
     overrides = DECODE_TABLE_OVERRIDES.get(arch)

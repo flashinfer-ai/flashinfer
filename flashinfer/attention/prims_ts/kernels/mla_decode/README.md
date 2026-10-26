@@ -76,6 +76,7 @@ metadata directly in `run()`.
 | Mask | Dense or bottom-right causal |
 | Scheduling | Automatic nonpersistent, static-persistent, or CLC-persistent selection by kernel family and work shape |
 | Accumulation | FP32 QK/PV and softmax state |
+| Skip correction | Opt-in `softmax_rescale_threshold_log2` (binades), passed as `tuning=MLAAttentionTuning(...)` to `plan()` and the one-shot helpers; `0.0` rescales on every new row maximum, which is also what dense `None` (default) does. The name and the FP8 P scale follow the Prims-TS FMHA decode option of the same name; the bounds (8 for FP8, 32 for BF16) follow the trtllm-gen FMHA `skipCorrThreshold`. A positive value T keeps a row's anchor while a K tile raises its maximum by at most T binades, skipping that tile's O rescale. FP8 P is then quantized at `448 * 2**-T` instead of 448 (1.75 at T = 8, the trtllm-gen scale), so E4M3 P loses precision from about `10.3 - 0.69 * T` nats below the anchor and flushes to zero in the PV numerator below about `13 - 0.69 * T` nats (rows with an early attention sink and a long low-probability tail are the most exposed). Without split-KV the loss covers the whole row. Check model accuracy when enabling it for FP8. The value is compiled into the kernel. Both the 1CTA and 2CTA kernels support it, for dense and sparse attention. On the sparse API, `None` keeps each schedule's existing behavior (several BF16 schedules defer the maximum update by six binades); an explicit value, including `0.0`, replaces that on every schedule |
 
 Current accuracy and performance signoff is on SM100a/B200. SM103a/B300 is
 admitted by the runtime architecture guard but remains to be qualified.
@@ -192,7 +193,19 @@ synchronization contract for CLC replay and runtime pruning.
 For BF16 2-CTA paged K/V, the TMA warp holds one 32-page-ID register window.
 It refreshes the window after `32 / pages_per_k_tile` logical K tiles, when the
 next 32 page-table entries are needed. This period follows directly from page
-and tile geometry and is internal to the task schedule.
+and tile geometry and is internal to the task schedule. The window must hold
+whole K tiles, so the config builder requires `pages_per_k_tile` to divide 32;
+every supported page size meets this with the 128-token K tile.
+
+The FP8 2-CTA dense K and V loader warps each hold their own window of the same
+shape. They read it before waiting for a free K/V slot and issue the next
+window's load at the start of the current one (only when the next window starts
+inside the current work tile), so no page-table load sits between a released
+slot and its TMA. The compiled loop copies that register at the next K tile, so
+the load has at least one K tile, not a whole window, to land. The first window
+of each work tile is loaded synchronously. Like the BF16 window, indices past
+the page table clamp to its last column; those fragments are masked by the
+runtime K/V length.
 
 | Source | Responsibility |
 | --- | --- |
@@ -306,8 +319,10 @@ compact, 16-byte-aligned `out` tensor to avoid allocation.
 - The latent/RoPE dimensions are fixed at 512/64.
 - Output is `torch.bfloat16` even when query/cache input is
   `torch.float8_e4m3fn`.
-- Only dense paged MLA cache addressing is exposed; sparse/indexed MLA,
-  sliding windows, attention sinks, and custom masks are not public features.
+- `BatchMLADecodePagedTSWrapper` exposes only dense paged MLA cache
+  addressing; sparse/indexed MLA is available through
+  `BatchSparseMLADecodePagedTSWrapper`. Sliding windows, attention sinks, and
+  custom masks are not public features of the dense wrapper.
 - Query and cache dtypes must match.
 - Automatic kernel selection is intentionally not user-selectable through the
   public wrapper.

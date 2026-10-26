@@ -219,6 +219,11 @@ worker counts without GPU topology or measured memory capacity.
 Run the CPU-only coordinator suite with
 `pytest --confcutdir=tests/test_sharding tests/test_sharding/`.
 
+Collection stdout/stderr, including best-effort JIT prewarm warnings, is retained
+under `junit/collection-*/*.log` and uploaded with the public CI telemetry. Each
+collection gets a separate directory so concurrent collectors or later attempts
+preserve earlier diagnostics. Collection metadata remains temporary.
+
 Communication-test wrappers optionally emit cache-publication completion reports
 when `UNIT_TEST_RUN_STATUS_DIR` is set to a fresh directory unique to that wrapper
 and container/rank. `test_run_status.sh` records each pytest invocation, and
@@ -282,6 +287,10 @@ storage row stride and pointer. Include a backend-only provider control in
 capacity-lifetime tests, since FROST can accept an oversized descriptor that the
 backend rejects. Table capacity must cover initialized
 indices and rounded graph bounds; also test a fallback beyond cuDNN admission.
+An explicit KV maximum may be looser than the caller table's capacity. Intersect
+these two upper bounds when declaring the graph, using the same effective bound
+for the attention attribute and table slice; actual device lengths still mask
+the live tokens, without a host readback.
 Replay an old capture only with lengths inside its declared bounds and compatible
 buffers. Keep numerical and lifetime tests independent of heuristic winners and
 timing thresholds.
@@ -302,6 +311,12 @@ no-readback path. Declining cuDNN can itself cause FA2 to stage KV metadata back
 to the host. Use per-request work only when its lengths are already on CPU;
 otherwise retain the existing bound-based policy. Check with a busy GPU stream
 and synchronization debugging, not just a predicate-level test.
+
+Full-prefill admission requires each request's Q length to equal its KV length;
+equal batch maxima do not establish that contract. Prove it using existing CPU
+metadata, and decline the full-prefill extension when independent query-length
+overrides or device-only KV lengths prevent that proof. Preserve the existing
+prefix policy without adding a device readback just for dispatch.
 
 ## Benchmarking
 
@@ -811,13 +826,31 @@ match what the code uses today; values are strings unless noted.
 | `FLASHINFER_JIT_CACHE_PROVIDER_ARCH` | required | `flashinfer-jit-cache-provider/package_config.py` | Select exactly one architecture, such as `9.0a` or `sm120f`, when building a binary provider wheel. |
 
 Release/nightly JIT-cache provider builds run sccache in server-side mode and
-wrap the complete wheel build with a no-output watchdog. After 90 minutes with
+wrap the complete wheel build with a no-output watchdog. They build in the
+container's torch-pinned interpreter rather than a PEP 517 isolated environment
+(`scripts/build_jit_cache_wheel.py`): an isolated environment's random path
+reaches every compile command through the tvm_ffi include directory and changes
+the sccache key of each translation unit that includes tvm_ffi on every run.
+Before compiling, the same script gives every installed header one fixed mtime:
+GCC's `#pragma once` skips a header whose size, contents and mtime match an
+already included file, and torch ships byte-identical `#pragma once` headers
+(the `ATen/ops/*_native.h` stubs), so otherwise the preprocessed output of each
+torch-including translation unit depends on pip's install timing. After 90 minutes with
 no build output, the watchdog captures system, process, compiler, and sccache
 state; terminates the wrapped build process group (TERM, then KILL after a
 two-minute grace period); and exits with status 124. Compiler discovery scans
 the whole build container, so diagnostics include compiler processes owned by
 the sccache daemon even though they are outside the wrapped process group. The
 CI `docker run --rm` boundary provides final cleanup for those processes.
+
+PR GPU test lanes run their test script through `scripts/run_with_test_sccache.sh`,
+which routes JIT compiles through the same S3 cache and prefix as the AOT lanes
+and uploads `sccache-stats-<kind>-<cuda>-<index>` artifacts. Set the repository
+variable `FLASHINFER_GPU_TEST_SCCACHE=0` to turn this off for A/B timing. If the
+sccache install fails, the wrapper runs the lane uncached. Compiles run in the
+sccache server, so a timed-out unit's process-group kill does not reach them, and
+per-unit memory telemetry excludes nvcc. Locally:
+`scripts/run_with_test_sccache.sh scripts/task_run_unit_tests.sh` (read-only without AWS credentials).
 
 ##### Cubin / Artifact Loader
 
@@ -832,6 +865,7 @@ CI `docker run --rm` boundary provides final cleanup for those processes.
 | `FLASHINFER_DSL_FMHA_LOCAL_DIR` | unset | `flashinfer/attention/cute_dsl/fmha.py` | Path to a local checkout of the CuTe-DSL FMHA kernel sources. The loader checks here before downloading. |
 | `FLASHINFER_LOGGING_LEVEL` | `INFO` | `flashinfer/artifacts.py`, `flashinfer/jit/core.py` | Python logging level for the artifacts/cubin loader and the JIT compiler (`DEBUG`/`INFO`/`WARNING`/`ERROR`). Distinct from `FLASHINFER_LOGLEVEL`. |
 | `FLASHINFER_DISABLE_TINYGEMM2_SM100` | `0` | `flashinfer/gemm/routergemm.py` | Set to `1` to disable the generated SM100/SM103 `tinygemm2` backend and force the dispatcher to fall back to the legacy implementation. Useful as an escape hatch when debugging backend-selection or kernel issues on Blackwell systems. |
+| `FLASHINFER_DISABLE_TINYGEMM2_TCGEN05` | `0` | `flashinfer/gemm/routergemm.py` | Set to `1` to disable the generated SM100/SM103/SM107 tcgen05 `tinygemm2` programs and let the existing `tinygemm2` routes handle eligible shapes. Useful as an escape hatch when debugging backend-selection or kernel issues on Blackwell systems. |
 | `FLASHINFER_DISABLE_CAKE_BF16_BMM_SWAP_AB` | `0` | `flashinfer/gemm/gemm_base.py` | Set to `1` to keep `bmm_bf16(..., backend="cake")` on its mma.sync dispatcher for every shape, instead of the generated SM100/SM103 tcgen05 swap-AB programs that serve the decode shapes of its route table. Useful as an escape hatch when debugging backend-selection or kernel issues on Blackwell systems. |
 
 ##### API Dump / Logging Extensions
@@ -869,6 +903,7 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_SM107_FUSED_ROUTE_CHECK` | `1` | `flashinfer/moe_ep/backends/mega/kernel/sm107/validation.py` | `0` uses Torch routing checks instead of the fused checker. Both paths check expert IDs, duplicates, and finite scores, including during graph replay. |
 | `FLASHINFER_SM107_PREP_TVM_FFI` | `1` | `flashinfer/moe_ep/backends/mega/kernel/sm107/routing_validation.py` | `0` launches the fused routing checker through CuTe's DLPack bindings instead of TVM-FFI. Set before warmup; each mode needs its own compiled kernel. |
 | `FLASHINFER_MEGAMOE_LOG_COMPILE_SPEC` | unset | `flashinfer/moe_ep/kernel_src/sm120/split_cutedsl_megakernel/shim/runtime.py` | Exactly `1` prints MegaMoE split-kernel compile choices, workspace memory diagnostics, and frontend compile/capture timings; other values leave these diagnostics off. |
+| `FLASHINFER_MEGAMOE_SPIN_DEBUG` | `0` | `flashinfer/jit/megamoe.py` | Exactly `1` passes `spin_debug=True` to the SM90 NVFP4 fused MegaMoE JIT template; other values leave it false. |
 | `FLASHINFER_DA_DISTRIBUTIONS` | built-in distribution catalog | `flashinfer/fused_moe/da_config.py` | Comma-separated training distributions used by the experimental TRT-LLM distribution-aware MoE autotuner. |
 | `FLASHINFER_PRIMS_TS_DEBUG_CHECKS` | `0` | `flashinfer/prims_ts/batched_gemm/batched_gemm_kernel.py`, `batched_gemm_run.py`, `flashinfer/prims_ts/gemm/kernel.py` | `1`/`true`/`yes`/`on` enables exhaustive deadlock/race checks and TaskManager verification in Prims-TS batched GEMM and dense GEMM. Production JIT leaves both off. `tests/prims_ts` turns the variable on for `test_batched_gemm_*` and `test_gemm_*`. |
 | `FLASHINFER_PRIMS_TS_COMPILE_OPTIONS` | `--opt-level 2` | `flashinfer/prims_ts/utils.py`, `batched_gemm_run.py` | Extra CuTe-DSL / nvc compile options passed when building Prims-TS kernels. |

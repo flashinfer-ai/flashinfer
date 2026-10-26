@@ -554,7 +554,7 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                                     :: "r"(ks_dst_1 + 128), "l"((&Ks)), "r"(ub_1 * 4), "r"(head_k),
                                        "r"(k_full_addr + (stage) * 8), "l"(pol_b_1) : "memory");
                             }
-                            int ipk = i + 2;
+                            int ipk = i + 1;
                             if (ipk < n_seq_k) {
                                 int swp = meta_smem[mb_k + 8 + ipk];
                                 int pblk_a = swp << 16 >> 16;
@@ -655,7 +655,7 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                                     :: "r"(vl_dst_1 + 8192), "l"((&V)), "r"(0), "r"(kv_base_v + vub_1 * 64),
                                        "r"(v_land_full_addr + (ls_v) * 8), "l"(vpol_b_1) : "memory");
                             }
-                            int ipv = i_1 + 2;
+                            int ipv = i_1 + 1;
                             if (ipv < n_seq_v) {
                                 int svp = meta_smem[mb_v + 8 + ipv];
                                 int pvblk_a = svp << 16 >> 16;
@@ -685,7 +685,7 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                 int st_row = t_dl * 128;
                 int t_mih = t_mi >> 1;
                 int t_dl7 = t_dl & 7;
-                unsigned int tw[16];
+                unsigned int tw[4];
                 unsigned int tpw[4];
                 int gt = 0;
                 int n_hdr_t = hdr[hb + 4];
@@ -705,18 +705,6 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                             : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
                             : "r"(vl_smem_addr + (unsigned int)(land_off + ld_row + ((t_rr ^ 0) << 4)))
                             : "memory");
-                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                            : "=r"(tw[4]), "=r"(tw[5]), "=r"(tw[6]), "=r"(tw[7])
-                            : "r"(vl_smem_addr + (unsigned int)(land_off + ld_row + ((t_rr ^ 1) << 4)))
-                            : "memory");
-                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                            : "=r"(tw[8]), "=r"(tw[9]), "=r"(tw[10]), "=r"(tw[11])
-                            : "r"(vl_smem_addr + (unsigned int)(land_off + ld_row + ((t_rr ^ 2) << 4)))
-                            : "memory");
-                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                            : "=r"(tw[12]), "=r"(tw[13]), "=r"(tw[14]), "=r"(tw[15])
-                            : "r"(vl_smem_addr + (unsigned int)(land_off + ld_row + ((t_rr ^ 3) << 4)))
-                            : "memory");
                         uint32_t _prmt_2;
                         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_2) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                         tpw[0] = _prmt_2;
@@ -733,49 +721,61 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                             :: "r"(_stmatrix_addr_6), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                             : "memory");
+                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                            : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                            : "r"(vl_smem_addr + (unsigned int)(land_off + ld_row + ((t_rr ^ 1) << 4)))
+                            : "memory");
                         uint32_t _prmt_7;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_7) : "r"(tw[4]), "r"(tw[5]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_7) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                         tpw[0] = _prmt_7;
                         uint32_t _prmt_8;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_8) : "r"(tw[4]), "r"(tw[5]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_8) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                         tpw[1] = _prmt_8;
                         uint32_t _prmt_9;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_9) : "r"(tw[6]), "r"(tw[7]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_9) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                         tpw[2] = _prmt_9;
                         uint32_t _prmt_10;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_10) : "r"(tw[6]), "r"(tw[7]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_10) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                         tpw[3] = _prmt_10;
                         uint32_t _stmatrix_addr_11 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off + 2048 + st_row + ((t_mih ^ t_dl7) << 4)));
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                             :: "r"(_stmatrix_addr_11), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                             : "memory");
+                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                            : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                            : "r"(vl_smem_addr + (unsigned int)(land_off + ld_row + ((t_rr ^ 2) << 4)))
+                            : "memory");
                         uint32_t _prmt_12;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_12) : "r"(tw[8]), "r"(tw[9]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_12) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                         tpw[0] = _prmt_12;
                         uint32_t _prmt_13;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_13) : "r"(tw[8]), "r"(tw[9]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_13) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                         tpw[1] = _prmt_13;
                         uint32_t _prmt_14;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_14) : "r"(tw[10]), "r"(tw[11]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_14) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                         tpw[2] = _prmt_14;
                         uint32_t _prmt_15;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_15) : "r"(tw[10]), "r"(tw[11]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_15) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                         tpw[3] = _prmt_15;
                         uint32_t _stmatrix_addr_16 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off + 4096 + st_row + ((t_mih ^ t_dl7) << 4)));
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                             :: "r"(_stmatrix_addr_16), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                             : "memory");
+                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                            : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                            : "r"(vl_smem_addr + (unsigned int)(land_off + ld_row + ((t_rr ^ 3) << 4)))
+                            : "memory");
                         uint32_t _prmt_17;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_17) : "r"(tw[12]), "r"(tw[13]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_17) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                         tpw[0] = _prmt_17;
                         uint32_t _prmt_18;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_18) : "r"(tw[12]), "r"(tw[13]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_18) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                         tpw[1] = _prmt_18;
                         uint32_t _prmt_19;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_19) : "r"(tw[14]), "r"(tw[15]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_19) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                         tpw[2] = _prmt_19;
                         uint32_t _prmt_20;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_20) : "r"(tw[14]), "r"(tw[15]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_20) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                         tpw[3] = _prmt_20;
                         uint32_t _stmatrix_addr_21 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off + 6144 + st_row + ((t_mih ^ t_dl7) << 4)));
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
@@ -784,18 +784,6 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
                             : "r"(vl_smem_addr + (unsigned int)(land_off + ld_row + ((t_rr ^ 4) << 4)))
-                            : "memory");
-                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                            : "=r"(tw[4]), "=r"(tw[5]), "=r"(tw[6]), "=r"(tw[7])
-                            : "r"(vl_smem_addr + (unsigned int)(land_off + ld_row + ((t_rr ^ 5) << 4)))
-                            : "memory");
-                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                            : "=r"(tw[8]), "=r"(tw[9]), "=r"(tw[10]), "=r"(tw[11])
-                            : "r"(vl_smem_addr + (unsigned int)(land_off + ld_row + ((t_rr ^ 6) << 4)))
-                            : "memory");
-                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                            : "=r"(tw[12]), "=r"(tw[13]), "=r"(tw[14]), "=r"(tw[15])
-                            : "r"(vl_smem_addr + (unsigned int)(land_off + ld_row + ((t_rr ^ 7) << 4)))
                             : "memory");
                         uint32_t _prmt_22;
                         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_22) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
@@ -813,49 +801,61 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                             :: "r"(_stmatrix_addr_26), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                             : "memory");
+                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                            : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                            : "r"(vl_smem_addr + (unsigned int)(land_off + ld_row + ((t_rr ^ 5) << 4)))
+                            : "memory");
                         uint32_t _prmt_27;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_27) : "r"(tw[4]), "r"(tw[5]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_27) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                         tpw[0] = _prmt_27;
                         uint32_t _prmt_28;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_28) : "r"(tw[4]), "r"(tw[5]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_28) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                         tpw[1] = _prmt_28;
                         uint32_t _prmt_29;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_29) : "r"(tw[6]), "r"(tw[7]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_29) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                         tpw[2] = _prmt_29;
                         uint32_t _prmt_30;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_30) : "r"(tw[6]), "r"(tw[7]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_30) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                         tpw[3] = _prmt_30;
                         uint32_t _stmatrix_addr_31 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off + 10240 + st_row + ((t_mih ^ t_dl7) << 4)));
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                             :: "r"(_stmatrix_addr_31), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                             : "memory");
+                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                            : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                            : "r"(vl_smem_addr + (unsigned int)(land_off + ld_row + ((t_rr ^ 6) << 4)))
+                            : "memory");
                         uint32_t _prmt_32;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_32) : "r"(tw[8]), "r"(tw[9]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_32) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                         tpw[0] = _prmt_32;
                         uint32_t _prmt_33;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_33) : "r"(tw[8]), "r"(tw[9]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_33) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                         tpw[1] = _prmt_33;
                         uint32_t _prmt_34;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_34) : "r"(tw[10]), "r"(tw[11]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_34) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                         tpw[2] = _prmt_34;
                         uint32_t _prmt_35;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_35) : "r"(tw[10]), "r"(tw[11]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_35) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                         tpw[3] = _prmt_35;
                         uint32_t _stmatrix_addr_36 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off + 12288 + st_row + ((t_mih ^ t_dl7) << 4)));
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                             :: "r"(_stmatrix_addr_36), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                             : "memory");
+                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                            : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                            : "r"(vl_smem_addr + (unsigned int)(land_off + ld_row + ((t_rr ^ 7) << 4)))
+                            : "memory");
                         uint32_t _prmt_37;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_37) : "r"(tw[12]), "r"(tw[13]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_37) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                         tpw[0] = _prmt_37;
                         uint32_t _prmt_38;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_38) : "r"(tw[12]), "r"(tw[13]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_38) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                         tpw[1] = _prmt_38;
                         uint32_t _prmt_39;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_39) : "r"(tw[14]), "r"(tw[15]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_39) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                         tpw[2] = _prmt_39;
                         uint32_t _prmt_40;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_40) : "r"(tw[14]), "r"(tw[15]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_40) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                         tpw[3] = _prmt_40;
                         uint32_t _stmatrix_addr_41 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off + 14336 + st_row + ((t_mih ^ t_dl7) << 4)));
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
@@ -864,18 +864,6 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
                             : "r"(vl_smem_addr + (unsigned int)(land_off + 4096 + ld_row + ((t_rr ^ 0) << 4)))
-                            : "memory");
-                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                            : "=r"(tw[4]), "=r"(tw[5]), "=r"(tw[6]), "=r"(tw[7])
-                            : "r"(vl_smem_addr + (unsigned int)(land_off + 4096 + ld_row + ((t_rr ^ 1) << 4)))
-                            : "memory");
-                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                            : "=r"(tw[8]), "=r"(tw[9]), "=r"(tw[10]), "=r"(tw[11])
-                            : "r"(vl_smem_addr + (unsigned int)(land_off + 4096 + ld_row + ((t_rr ^ 2) << 4)))
-                            : "memory");
-                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                            : "=r"(tw[12]), "=r"(tw[13]), "=r"(tw[14]), "=r"(tw[15])
-                            : "r"(vl_smem_addr + (unsigned int)(land_off + 4096 + ld_row + ((t_rr ^ 3) << 4)))
                             : "memory");
                         uint32_t _prmt_42;
                         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_42) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
@@ -893,49 +881,61 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                             :: "r"(_stmatrix_addr_46), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                             : "memory");
+                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                            : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                            : "r"(vl_smem_addr + (unsigned int)(land_off + 4096 + ld_row + ((t_rr ^ 1) << 4)))
+                            : "memory");
                         uint32_t _prmt_47;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_47) : "r"(tw[4]), "r"(tw[5]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_47) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                         tpw[0] = _prmt_47;
                         uint32_t _prmt_48;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_48) : "r"(tw[4]), "r"(tw[5]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_48) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                         tpw[1] = _prmt_48;
                         uint32_t _prmt_49;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_49) : "r"(tw[6]), "r"(tw[7]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_49) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                         tpw[2] = _prmt_49;
                         uint32_t _prmt_50;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_50) : "r"(tw[6]), "r"(tw[7]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_50) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                         tpw[3] = _prmt_50;
                         uint32_t _stmatrix_addr_51 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off + 2048 + st_row + ((2 + t_mih ^ t_dl7) << 4)));
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                             :: "r"(_stmatrix_addr_51), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                             : "memory");
+                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                            : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                            : "r"(vl_smem_addr + (unsigned int)(land_off + 4096 + ld_row + ((t_rr ^ 2) << 4)))
+                            : "memory");
                         uint32_t _prmt_52;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_52) : "r"(tw[8]), "r"(tw[9]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_52) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                         tpw[0] = _prmt_52;
                         uint32_t _prmt_53;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_53) : "r"(tw[8]), "r"(tw[9]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_53) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                         tpw[1] = _prmt_53;
                         uint32_t _prmt_54;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_54) : "r"(tw[10]), "r"(tw[11]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_54) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                         tpw[2] = _prmt_54;
                         uint32_t _prmt_55;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_55) : "r"(tw[10]), "r"(tw[11]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_55) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                         tpw[3] = _prmt_55;
                         uint32_t _stmatrix_addr_56 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off + 4096 + st_row + ((2 + t_mih ^ t_dl7) << 4)));
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                             :: "r"(_stmatrix_addr_56), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                             : "memory");
+                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                            : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                            : "r"(vl_smem_addr + (unsigned int)(land_off + 4096 + ld_row + ((t_rr ^ 3) << 4)))
+                            : "memory");
                         uint32_t _prmt_57;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_57) : "r"(tw[12]), "r"(tw[13]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_57) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                         tpw[0] = _prmt_57;
                         uint32_t _prmt_58;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_58) : "r"(tw[12]), "r"(tw[13]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_58) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                         tpw[1] = _prmt_58;
                         uint32_t _prmt_59;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_59) : "r"(tw[14]), "r"(tw[15]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_59) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                         tpw[2] = _prmt_59;
                         uint32_t _prmt_60;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_60) : "r"(tw[14]), "r"(tw[15]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_60) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                         tpw[3] = _prmt_60;
                         uint32_t _stmatrix_addr_61 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off + 6144 + st_row + ((2 + t_mih ^ t_dl7) << 4)));
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
@@ -944,18 +944,6 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
                             : "r"(vl_smem_addr + (unsigned int)(land_off + 4096 + ld_row + ((t_rr ^ 4) << 4)))
-                            : "memory");
-                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                            : "=r"(tw[4]), "=r"(tw[5]), "=r"(tw[6]), "=r"(tw[7])
-                            : "r"(vl_smem_addr + (unsigned int)(land_off + 4096 + ld_row + ((t_rr ^ 5) << 4)))
-                            : "memory");
-                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                            : "=r"(tw[8]), "=r"(tw[9]), "=r"(tw[10]), "=r"(tw[11])
-                            : "r"(vl_smem_addr + (unsigned int)(land_off + 4096 + ld_row + ((t_rr ^ 6) << 4)))
-                            : "memory");
-                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                            : "=r"(tw[12]), "=r"(tw[13]), "=r"(tw[14]), "=r"(tw[15])
-                            : "r"(vl_smem_addr + (unsigned int)(land_off + 4096 + ld_row + ((t_rr ^ 7) << 4)))
                             : "memory");
                         uint32_t _prmt_62;
                         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_62) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
@@ -973,49 +961,61 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                             :: "r"(_stmatrix_addr_66), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                             : "memory");
+                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                            : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                            : "r"(vl_smem_addr + (unsigned int)(land_off + 4096 + ld_row + ((t_rr ^ 5) << 4)))
+                            : "memory");
                         uint32_t _prmt_67;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_67) : "r"(tw[4]), "r"(tw[5]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_67) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                         tpw[0] = _prmt_67;
                         uint32_t _prmt_68;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_68) : "r"(tw[4]), "r"(tw[5]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_68) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                         tpw[1] = _prmt_68;
                         uint32_t _prmt_69;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_69) : "r"(tw[6]), "r"(tw[7]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_69) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                         tpw[2] = _prmt_69;
                         uint32_t _prmt_70;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_70) : "r"(tw[6]), "r"(tw[7]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_70) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                         tpw[3] = _prmt_70;
                         uint32_t _stmatrix_addr_71 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off + 10240 + st_row + ((2 + t_mih ^ t_dl7) << 4)));
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                             :: "r"(_stmatrix_addr_71), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                             : "memory");
+                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                            : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                            : "r"(vl_smem_addr + (unsigned int)(land_off + 4096 + ld_row + ((t_rr ^ 6) << 4)))
+                            : "memory");
                         uint32_t _prmt_72;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_72) : "r"(tw[8]), "r"(tw[9]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_72) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                         tpw[0] = _prmt_72;
                         uint32_t _prmt_73;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_73) : "r"(tw[8]), "r"(tw[9]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_73) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                         tpw[1] = _prmt_73;
                         uint32_t _prmt_74;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_74) : "r"(tw[10]), "r"(tw[11]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_74) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                         tpw[2] = _prmt_74;
                         uint32_t _prmt_75;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_75) : "r"(tw[10]), "r"(tw[11]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_75) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                         tpw[3] = _prmt_75;
                         uint32_t _stmatrix_addr_76 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off + 12288 + st_row + ((2 + t_mih ^ t_dl7) << 4)));
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                             :: "r"(_stmatrix_addr_76), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                             : "memory");
+                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                            : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                            : "r"(vl_smem_addr + (unsigned int)(land_off + 4096 + ld_row + ((t_rr ^ 7) << 4)))
+                            : "memory");
                         uint32_t _prmt_77;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_77) : "r"(tw[12]), "r"(tw[13]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_77) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                         tpw[0] = _prmt_77;
                         uint32_t _prmt_78;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_78) : "r"(tw[12]), "r"(tw[13]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_78) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                         tpw[1] = _prmt_78;
                         uint32_t _prmt_79;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_79) : "r"(tw[14]), "r"(tw[15]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_79) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                         tpw[2] = _prmt_79;
                         uint32_t _prmt_80;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_80) : "r"(tw[14]), "r"(tw[15]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_80) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                         tpw[3] = _prmt_80;
                         uint32_t _stmatrix_addr_81 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off + 14336 + st_row + ((2 + t_mih ^ t_dl7) << 4)));
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
@@ -1025,18 +1025,6 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                             asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                                 : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
                                 : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + ld_row + ((t_rr ^ 0) << 4)))
-                                : "memory");
-                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                                : "=r"(tw[4]), "=r"(tw[5]), "=r"(tw[6]), "=r"(tw[7])
-                                : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + ld_row + ((t_rr ^ 1) << 4)))
-                                : "memory");
-                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                                : "=r"(tw[8]), "=r"(tw[9]), "=r"(tw[10]), "=r"(tw[11])
-                                : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + ld_row + ((t_rr ^ 2) << 4)))
-                                : "memory");
-                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                                : "=r"(tw[12]), "=r"(tw[13]), "=r"(tw[14]), "=r"(tw[15])
-                                : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + ld_row + ((t_rr ^ 3) << 4)))
                                 : "memory");
                             uint32_t _prmt_82;
                             asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_82) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
@@ -1054,49 +1042,61 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                 :: "r"(_stmatrix_addr_86), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                                 : "memory");
+                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                                : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + ld_row + ((t_rr ^ 1) << 4)))
+                                : "memory");
                             uint32_t _prmt_87;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_87) : "r"(tw[4]), "r"(tw[5]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_87) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                             tpw[0] = _prmt_87;
                             uint32_t _prmt_88;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_88) : "r"(tw[4]), "r"(tw[5]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_88) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                             tpw[1] = _prmt_88;
                             uint32_t _prmt_89;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_89) : "r"(tw[6]), "r"(tw[7]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_89) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                             tpw[2] = _prmt_89;
                             uint32_t _prmt_90;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_90) : "r"(tw[6]), "r"(tw[7]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_90) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                             tpw[3] = _prmt_90;
                             uint32_t _stmatrix_addr_91 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off + 2048 + st_row + ((4 + t_mih ^ t_dl7) << 4)));
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                 :: "r"(_stmatrix_addr_91), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                                 : "memory");
+                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                                : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + ld_row + ((t_rr ^ 2) << 4)))
+                                : "memory");
                             uint32_t _prmt_92;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_92) : "r"(tw[8]), "r"(tw[9]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_92) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                             tpw[0] = _prmt_92;
                             uint32_t _prmt_93;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_93) : "r"(tw[8]), "r"(tw[9]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_93) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                             tpw[1] = _prmt_93;
                             uint32_t _prmt_94;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_94) : "r"(tw[10]), "r"(tw[11]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_94) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                             tpw[2] = _prmt_94;
                             uint32_t _prmt_95;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_95) : "r"(tw[10]), "r"(tw[11]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_95) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                             tpw[3] = _prmt_95;
                             uint32_t _stmatrix_addr_96 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off + 4096 + st_row + ((4 + t_mih ^ t_dl7) << 4)));
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                 :: "r"(_stmatrix_addr_96), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                                 : "memory");
+                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                                : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + ld_row + ((t_rr ^ 3) << 4)))
+                                : "memory");
                             uint32_t _prmt_97;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_97) : "r"(tw[12]), "r"(tw[13]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_97) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                             tpw[0] = _prmt_97;
                             uint32_t _prmt_98;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_98) : "r"(tw[12]), "r"(tw[13]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_98) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                             tpw[1] = _prmt_98;
                             uint32_t _prmt_99;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_99) : "r"(tw[14]), "r"(tw[15]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_99) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                             tpw[2] = _prmt_99;
                             uint32_t _prmt_100;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_100) : "r"(tw[14]), "r"(tw[15]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_100) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                             tpw[3] = _prmt_100;
                             uint32_t _stmatrix_addr_101 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off + 6144 + st_row + ((4 + t_mih ^ t_dl7) << 4)));
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
@@ -1105,18 +1105,6 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                             asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                                 : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
                                 : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + ld_row + ((t_rr ^ 4) << 4)))
-                                : "memory");
-                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                                : "=r"(tw[4]), "=r"(tw[5]), "=r"(tw[6]), "=r"(tw[7])
-                                : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + ld_row + ((t_rr ^ 5) << 4)))
-                                : "memory");
-                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                                : "=r"(tw[8]), "=r"(tw[9]), "=r"(tw[10]), "=r"(tw[11])
-                                : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + ld_row + ((t_rr ^ 6) << 4)))
-                                : "memory");
-                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                                : "=r"(tw[12]), "=r"(tw[13]), "=r"(tw[14]), "=r"(tw[15])
-                                : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + ld_row + ((t_rr ^ 7) << 4)))
                                 : "memory");
                             uint32_t _prmt_102;
                             asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_102) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
@@ -1134,49 +1122,61 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                 :: "r"(_stmatrix_addr_106), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                                 : "memory");
+                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                                : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + ld_row + ((t_rr ^ 5) << 4)))
+                                : "memory");
                             uint32_t _prmt_107;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_107) : "r"(tw[4]), "r"(tw[5]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_107) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                             tpw[0] = _prmt_107;
                             uint32_t _prmt_108;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_108) : "r"(tw[4]), "r"(tw[5]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_108) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                             tpw[1] = _prmt_108;
                             uint32_t _prmt_109;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_109) : "r"(tw[6]), "r"(tw[7]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_109) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                             tpw[2] = _prmt_109;
                             uint32_t _prmt_110;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_110) : "r"(tw[6]), "r"(tw[7]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_110) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                             tpw[3] = _prmt_110;
                             uint32_t _stmatrix_addr_111 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off + 10240 + st_row + ((4 + t_mih ^ t_dl7) << 4)));
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                 :: "r"(_stmatrix_addr_111), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                                 : "memory");
+                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                                : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + ld_row + ((t_rr ^ 6) << 4)))
+                                : "memory");
                             uint32_t _prmt_112;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_112) : "r"(tw[8]), "r"(tw[9]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_112) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                             tpw[0] = _prmt_112;
                             uint32_t _prmt_113;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_113) : "r"(tw[8]), "r"(tw[9]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_113) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                             tpw[1] = _prmt_113;
                             uint32_t _prmt_114;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_114) : "r"(tw[10]), "r"(tw[11]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_114) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                             tpw[2] = _prmt_114;
                             uint32_t _prmt_115;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_115) : "r"(tw[10]), "r"(tw[11]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_115) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                             tpw[3] = _prmt_115;
                             uint32_t _stmatrix_addr_116 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off + 12288 + st_row + ((4 + t_mih ^ t_dl7) << 4)));
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                 :: "r"(_stmatrix_addr_116), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                                 : "memory");
+                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                                : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + ld_row + ((t_rr ^ 7) << 4)))
+                                : "memory");
                             uint32_t _prmt_117;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_117) : "r"(tw[12]), "r"(tw[13]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_117) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                             tpw[0] = _prmt_117;
                             uint32_t _prmt_118;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_118) : "r"(tw[12]), "r"(tw[13]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_118) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                             tpw[1] = _prmt_118;
                             uint32_t _prmt_119;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_119) : "r"(tw[14]), "r"(tw[15]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_119) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                             tpw[2] = _prmt_119;
                             uint32_t _prmt_120;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_120) : "r"(tw[14]), "r"(tw[15]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_120) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                             tpw[3] = _prmt_120;
                             uint32_t _stmatrix_addr_121 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off + 14336 + st_row + ((4 + t_mih ^ t_dl7) << 4)));
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
@@ -1185,18 +1185,6 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                             asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                                 : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
                                 : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + 4096 + ld_row + ((t_rr ^ 0) << 4)))
-                                : "memory");
-                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                                : "=r"(tw[4]), "=r"(tw[5]), "=r"(tw[6]), "=r"(tw[7])
-                                : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + 4096 + ld_row + ((t_rr ^ 1) << 4)))
-                                : "memory");
-                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                                : "=r"(tw[8]), "=r"(tw[9]), "=r"(tw[10]), "=r"(tw[11])
-                                : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + 4096 + ld_row + ((t_rr ^ 2) << 4)))
-                                : "memory");
-                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                                : "=r"(tw[12]), "=r"(tw[13]), "=r"(tw[14]), "=r"(tw[15])
-                                : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + 4096 + ld_row + ((t_rr ^ 3) << 4)))
                                 : "memory");
                             uint32_t _prmt_122;
                             asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_122) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
@@ -1214,49 +1202,61 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                 :: "r"(_stmatrix_addr_126), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                                 : "memory");
+                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                                : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + 4096 + ld_row + ((t_rr ^ 1) << 4)))
+                                : "memory");
                             uint32_t _prmt_127;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_127) : "r"(tw[4]), "r"(tw[5]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_127) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                             tpw[0] = _prmt_127;
                             uint32_t _prmt_128;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_128) : "r"(tw[4]), "r"(tw[5]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_128) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                             tpw[1] = _prmt_128;
                             uint32_t _prmt_129;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_129) : "r"(tw[6]), "r"(tw[7]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_129) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                             tpw[2] = _prmt_129;
                             uint32_t _prmt_130;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_130) : "r"(tw[6]), "r"(tw[7]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_130) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                             tpw[3] = _prmt_130;
                             uint32_t _stmatrix_addr_131 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off + 2048 + st_row + ((6 + t_mih ^ t_dl7) << 4)));
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                 :: "r"(_stmatrix_addr_131), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                                 : "memory");
+                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                                : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + 4096 + ld_row + ((t_rr ^ 2) << 4)))
+                                : "memory");
                             uint32_t _prmt_132;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_132) : "r"(tw[8]), "r"(tw[9]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_132) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                             tpw[0] = _prmt_132;
                             uint32_t _prmt_133;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_133) : "r"(tw[8]), "r"(tw[9]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_133) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                             tpw[1] = _prmt_133;
                             uint32_t _prmt_134;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_134) : "r"(tw[10]), "r"(tw[11]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_134) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                             tpw[2] = _prmt_134;
                             uint32_t _prmt_135;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_135) : "r"(tw[10]), "r"(tw[11]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_135) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                             tpw[3] = _prmt_135;
                             uint32_t _stmatrix_addr_136 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off + 4096 + st_row + ((6 + t_mih ^ t_dl7) << 4)));
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                 :: "r"(_stmatrix_addr_136), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                                 : "memory");
+                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                                : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + 4096 + ld_row + ((t_rr ^ 3) << 4)))
+                                : "memory");
                             uint32_t _prmt_137;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_137) : "r"(tw[12]), "r"(tw[13]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_137) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                             tpw[0] = _prmt_137;
                             uint32_t _prmt_138;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_138) : "r"(tw[12]), "r"(tw[13]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_138) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                             tpw[1] = _prmt_138;
                             uint32_t _prmt_139;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_139) : "r"(tw[14]), "r"(tw[15]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_139) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                             tpw[2] = _prmt_139;
                             uint32_t _prmt_140;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_140) : "r"(tw[14]), "r"(tw[15]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_140) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                             tpw[3] = _prmt_140;
                             uint32_t _stmatrix_addr_141 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off + 6144 + st_row + ((6 + t_mih ^ t_dl7) << 4)));
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
@@ -1265,18 +1265,6 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                             asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                                 : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
                                 : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + 4096 + ld_row + ((t_rr ^ 4) << 4)))
-                                : "memory");
-                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                                : "=r"(tw[4]), "=r"(tw[5]), "=r"(tw[6]), "=r"(tw[7])
-                                : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + 4096 + ld_row + ((t_rr ^ 5) << 4)))
-                                : "memory");
-                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                                : "=r"(tw[8]), "=r"(tw[9]), "=r"(tw[10]), "=r"(tw[11])
-                                : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + 4096 + ld_row + ((t_rr ^ 6) << 4)))
-                                : "memory");
-                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                                : "=r"(tw[12]), "=r"(tw[13]), "=r"(tw[14]), "=r"(tw[15])
-                                : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + 4096 + ld_row + ((t_rr ^ 7) << 4)))
                                 : "memory");
                             uint32_t _prmt_142;
                             asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_142) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
@@ -1294,49 +1282,61 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                 :: "r"(_stmatrix_addr_146), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                                 : "memory");
+                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                                : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + 4096 + ld_row + ((t_rr ^ 5) << 4)))
+                                : "memory");
                             uint32_t _prmt_147;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_147) : "r"(tw[4]), "r"(tw[5]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_147) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                             tpw[0] = _prmt_147;
                             uint32_t _prmt_148;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_148) : "r"(tw[4]), "r"(tw[5]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_148) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                             tpw[1] = _prmt_148;
                             uint32_t _prmt_149;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_149) : "r"(tw[6]), "r"(tw[7]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_149) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                             tpw[2] = _prmt_149;
                             uint32_t _prmt_150;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_150) : "r"(tw[6]), "r"(tw[7]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_150) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                             tpw[3] = _prmt_150;
                             uint32_t _stmatrix_addr_151 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off + 10240 + st_row + ((6 + t_mih ^ t_dl7) << 4)));
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                 :: "r"(_stmatrix_addr_151), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                                 : "memory");
+                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                                : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + 4096 + ld_row + ((t_rr ^ 6) << 4)))
+                                : "memory");
                             uint32_t _prmt_152;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_152) : "r"(tw[8]), "r"(tw[9]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_152) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                             tpw[0] = _prmt_152;
                             uint32_t _prmt_153;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_153) : "r"(tw[8]), "r"(tw[9]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_153) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                             tpw[1] = _prmt_153;
                             uint32_t _prmt_154;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_154) : "r"(tw[10]), "r"(tw[11]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_154) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                             tpw[2] = _prmt_154;
                             uint32_t _prmt_155;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_155) : "r"(tw[10]), "r"(tw[11]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_155) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                             tpw[3] = _prmt_155;
                             uint32_t _stmatrix_addr_156 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off + 12288 + st_row + ((6 + t_mih ^ t_dl7) << 4)));
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                 :: "r"(_stmatrix_addr_156), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                                 : "memory");
+                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                                : "r"(vl_smem_addr + (unsigned int)(land_off + 8192 + 4096 + ld_row + ((t_rr ^ 7) << 4)))
+                                : "memory");
                             uint32_t _prmt_157;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_157) : "r"(tw[12]), "r"(tw[13]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_157) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                             tpw[0] = _prmt_157;
                             uint32_t _prmt_158;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_158) : "r"(tw[12]), "r"(tw[13]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_158) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                             tpw[1] = _prmt_158;
                             uint32_t _prmt_159;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_159) : "r"(tw[14]), "r"(tw[15]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_159) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                             tpw[2] = _prmt_159;
                             uint32_t _prmt_160;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_160) : "r"(tw[14]), "r"(tw[15]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_160) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                             tpw[3] = _prmt_160;
                             uint32_t _stmatrix_addr_161 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off + 14336 + st_row + ((6 + t_mih ^ t_dl7) << 4)));
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
@@ -1379,18 +1379,6 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                             : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
                             : "r"(vl_smem_addr + (unsigned int)(land_off_1 + ld_row + ((t_rr ^ 0) << 4)))
                             : "memory");
-                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                            : "=r"(tw[4]), "=r"(tw[5]), "=r"(tw[6]), "=r"(tw[7])
-                            : "r"(vl_smem_addr + (unsigned int)(land_off_1 + ld_row + ((t_rr ^ 1) << 4)))
-                            : "memory");
-                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                            : "=r"(tw[8]), "=r"(tw[9]), "=r"(tw[10]), "=r"(tw[11])
-                            : "r"(vl_smem_addr + (unsigned int)(land_off_1 + ld_row + ((t_rr ^ 2) << 4)))
-                            : "memory");
-                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                            : "=r"(tw[12]), "=r"(tw[13]), "=r"(tw[14]), "=r"(tw[15])
-                            : "r"(vl_smem_addr + (unsigned int)(land_off_1 + ld_row + ((t_rr ^ 3) << 4)))
-                            : "memory");
                         uint32_t _prmt_162;
                         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_162) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                         tpw[0] = _prmt_162;
@@ -1407,49 +1395,61 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                             :: "r"(_stmatrix_addr_166), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                             : "memory");
+                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                            : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                            : "r"(vl_smem_addr + (unsigned int)(land_off_1 + ld_row + ((t_rr ^ 1) << 4)))
+                            : "memory");
                         uint32_t _prmt_167;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_167) : "r"(tw[4]), "r"(tw[5]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_167) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                         tpw[0] = _prmt_167;
                         uint32_t _prmt_168;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_168) : "r"(tw[4]), "r"(tw[5]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_168) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                         tpw[1] = _prmt_168;
                         uint32_t _prmt_169;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_169) : "r"(tw[6]), "r"(tw[7]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_169) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                         tpw[2] = _prmt_169;
                         uint32_t _prmt_170;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_170) : "r"(tw[6]), "r"(tw[7]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_170) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                         tpw[3] = _prmt_170;
                         uint32_t _stmatrix_addr_171 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off_1 + 2048 + st_row + ((t_mih ^ t_dl7) << 4)));
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                             :: "r"(_stmatrix_addr_171), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                             : "memory");
+                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                            : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                            : "r"(vl_smem_addr + (unsigned int)(land_off_1 + ld_row + ((t_rr ^ 2) << 4)))
+                            : "memory");
                         uint32_t _prmt_172;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_172) : "r"(tw[8]), "r"(tw[9]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_172) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                         tpw[0] = _prmt_172;
                         uint32_t _prmt_173;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_173) : "r"(tw[8]), "r"(tw[9]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_173) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                         tpw[1] = _prmt_173;
                         uint32_t _prmt_174;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_174) : "r"(tw[10]), "r"(tw[11]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_174) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                         tpw[2] = _prmt_174;
                         uint32_t _prmt_175;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_175) : "r"(tw[10]), "r"(tw[11]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_175) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                         tpw[3] = _prmt_175;
                         uint32_t _stmatrix_addr_176 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off_1 + 4096 + st_row + ((t_mih ^ t_dl7) << 4)));
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                             :: "r"(_stmatrix_addr_176), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                             : "memory");
+                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                            : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                            : "r"(vl_smem_addr + (unsigned int)(land_off_1 + ld_row + ((t_rr ^ 3) << 4)))
+                            : "memory");
                         uint32_t _prmt_177;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_177) : "r"(tw[12]), "r"(tw[13]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_177) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                         tpw[0] = _prmt_177;
                         uint32_t _prmt_178;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_178) : "r"(tw[12]), "r"(tw[13]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_178) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                         tpw[1] = _prmt_178;
                         uint32_t _prmt_179;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_179) : "r"(tw[14]), "r"(tw[15]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_179) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                         tpw[2] = _prmt_179;
                         uint32_t _prmt_180;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_180) : "r"(tw[14]), "r"(tw[15]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_180) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                         tpw[3] = _prmt_180;
                         uint32_t _stmatrix_addr_181 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off_1 + 6144 + st_row + ((t_mih ^ t_dl7) << 4)));
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
@@ -1458,18 +1458,6 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
                             : "r"(vl_smem_addr + (unsigned int)(land_off_1 + ld_row + ((t_rr ^ 4) << 4)))
-                            : "memory");
-                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                            : "=r"(tw[4]), "=r"(tw[5]), "=r"(tw[6]), "=r"(tw[7])
-                            : "r"(vl_smem_addr + (unsigned int)(land_off_1 + ld_row + ((t_rr ^ 5) << 4)))
-                            : "memory");
-                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                            : "=r"(tw[8]), "=r"(tw[9]), "=r"(tw[10]), "=r"(tw[11])
-                            : "r"(vl_smem_addr + (unsigned int)(land_off_1 + ld_row + ((t_rr ^ 6) << 4)))
-                            : "memory");
-                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                            : "=r"(tw[12]), "=r"(tw[13]), "=r"(tw[14]), "=r"(tw[15])
-                            : "r"(vl_smem_addr + (unsigned int)(land_off_1 + ld_row + ((t_rr ^ 7) << 4)))
                             : "memory");
                         uint32_t _prmt_182;
                         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_182) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
@@ -1487,49 +1475,61 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                             :: "r"(_stmatrix_addr_186), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                             : "memory");
+                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                            : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                            : "r"(vl_smem_addr + (unsigned int)(land_off_1 + ld_row + ((t_rr ^ 5) << 4)))
+                            : "memory");
                         uint32_t _prmt_187;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_187) : "r"(tw[4]), "r"(tw[5]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_187) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                         tpw[0] = _prmt_187;
                         uint32_t _prmt_188;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_188) : "r"(tw[4]), "r"(tw[5]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_188) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                         tpw[1] = _prmt_188;
                         uint32_t _prmt_189;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_189) : "r"(tw[6]), "r"(tw[7]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_189) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                         tpw[2] = _prmt_189;
                         uint32_t _prmt_190;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_190) : "r"(tw[6]), "r"(tw[7]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_190) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                         tpw[3] = _prmt_190;
                         uint32_t _stmatrix_addr_191 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off_1 + 10240 + st_row + ((t_mih ^ t_dl7) << 4)));
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                             :: "r"(_stmatrix_addr_191), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                             : "memory");
+                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                            : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                            : "r"(vl_smem_addr + (unsigned int)(land_off_1 + ld_row + ((t_rr ^ 6) << 4)))
+                            : "memory");
                         uint32_t _prmt_192;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_192) : "r"(tw[8]), "r"(tw[9]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_192) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                         tpw[0] = _prmt_192;
                         uint32_t _prmt_193;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_193) : "r"(tw[8]), "r"(tw[9]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_193) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                         tpw[1] = _prmt_193;
                         uint32_t _prmt_194;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_194) : "r"(tw[10]), "r"(tw[11]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_194) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                         tpw[2] = _prmt_194;
                         uint32_t _prmt_195;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_195) : "r"(tw[10]), "r"(tw[11]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_195) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                         tpw[3] = _prmt_195;
                         uint32_t _stmatrix_addr_196 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off_1 + 12288 + st_row + ((t_mih ^ t_dl7) << 4)));
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                             :: "r"(_stmatrix_addr_196), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                             : "memory");
+                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                            : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                            : "r"(vl_smem_addr + (unsigned int)(land_off_1 + ld_row + ((t_rr ^ 7) << 4)))
+                            : "memory");
                         uint32_t _prmt_197;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_197) : "r"(tw[12]), "r"(tw[13]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_197) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                         tpw[0] = _prmt_197;
                         uint32_t _prmt_198;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_198) : "r"(tw[12]), "r"(tw[13]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_198) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                         tpw[1] = _prmt_198;
                         uint32_t _prmt_199;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_199) : "r"(tw[14]), "r"(tw[15]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_199) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                         tpw[2] = _prmt_199;
                         uint32_t _prmt_200;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_200) : "r"(tw[14]), "r"(tw[15]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_200) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                         tpw[3] = _prmt_200;
                         uint32_t _stmatrix_addr_201 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off_1 + 14336 + st_row + ((t_mih ^ t_dl7) << 4)));
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
@@ -1538,18 +1538,6 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
                             : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 4096 + ld_row + ((t_rr ^ 0) << 4)))
-                            : "memory");
-                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                            : "=r"(tw[4]), "=r"(tw[5]), "=r"(tw[6]), "=r"(tw[7])
-                            : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 4096 + ld_row + ((t_rr ^ 1) << 4)))
-                            : "memory");
-                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                            : "=r"(tw[8]), "=r"(tw[9]), "=r"(tw[10]), "=r"(tw[11])
-                            : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 4096 + ld_row + ((t_rr ^ 2) << 4)))
-                            : "memory");
-                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                            : "=r"(tw[12]), "=r"(tw[13]), "=r"(tw[14]), "=r"(tw[15])
-                            : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 4096 + ld_row + ((t_rr ^ 3) << 4)))
                             : "memory");
                         uint32_t _prmt_202;
                         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_202) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
@@ -1567,49 +1555,61 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                             :: "r"(_stmatrix_addr_206), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                             : "memory");
+                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                            : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                            : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 4096 + ld_row + ((t_rr ^ 1) << 4)))
+                            : "memory");
                         uint32_t _prmt_207;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_207) : "r"(tw[4]), "r"(tw[5]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_207) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                         tpw[0] = _prmt_207;
                         uint32_t _prmt_208;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_208) : "r"(tw[4]), "r"(tw[5]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_208) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                         tpw[1] = _prmt_208;
                         uint32_t _prmt_209;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_209) : "r"(tw[6]), "r"(tw[7]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_209) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                         tpw[2] = _prmt_209;
                         uint32_t _prmt_210;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_210) : "r"(tw[6]), "r"(tw[7]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_210) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                         tpw[3] = _prmt_210;
                         uint32_t _stmatrix_addr_211 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off_1 + 2048 + st_row + ((2 + t_mih ^ t_dl7) << 4)));
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                             :: "r"(_stmatrix_addr_211), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                             : "memory");
+                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                            : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                            : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 4096 + ld_row + ((t_rr ^ 2) << 4)))
+                            : "memory");
                         uint32_t _prmt_212;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_212) : "r"(tw[8]), "r"(tw[9]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_212) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                         tpw[0] = _prmt_212;
                         uint32_t _prmt_213;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_213) : "r"(tw[8]), "r"(tw[9]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_213) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                         tpw[1] = _prmt_213;
                         uint32_t _prmt_214;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_214) : "r"(tw[10]), "r"(tw[11]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_214) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                         tpw[2] = _prmt_214;
                         uint32_t _prmt_215;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_215) : "r"(tw[10]), "r"(tw[11]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_215) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                         tpw[3] = _prmt_215;
                         uint32_t _stmatrix_addr_216 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off_1 + 4096 + st_row + ((2 + t_mih ^ t_dl7) << 4)));
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                             :: "r"(_stmatrix_addr_216), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                             : "memory");
+                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                            : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                            : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 4096 + ld_row + ((t_rr ^ 3) << 4)))
+                            : "memory");
                         uint32_t _prmt_217;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_217) : "r"(tw[12]), "r"(tw[13]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_217) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                         tpw[0] = _prmt_217;
                         uint32_t _prmt_218;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_218) : "r"(tw[12]), "r"(tw[13]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_218) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                         tpw[1] = _prmt_218;
                         uint32_t _prmt_219;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_219) : "r"(tw[14]), "r"(tw[15]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_219) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                         tpw[2] = _prmt_219;
                         uint32_t _prmt_220;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_220) : "r"(tw[14]), "r"(tw[15]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_220) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                         tpw[3] = _prmt_220;
                         uint32_t _stmatrix_addr_221 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off_1 + 6144 + st_row + ((2 + t_mih ^ t_dl7) << 4)));
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
@@ -1618,18 +1618,6 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
                             : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 4096 + ld_row + ((t_rr ^ 4) << 4)))
-                            : "memory");
-                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                            : "=r"(tw[4]), "=r"(tw[5]), "=r"(tw[6]), "=r"(tw[7])
-                            : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 4096 + ld_row + ((t_rr ^ 5) << 4)))
-                            : "memory");
-                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                            : "=r"(tw[8]), "=r"(tw[9]), "=r"(tw[10]), "=r"(tw[11])
-                            : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 4096 + ld_row + ((t_rr ^ 6) << 4)))
-                            : "memory");
-                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                            : "=r"(tw[12]), "=r"(tw[13]), "=r"(tw[14]), "=r"(tw[15])
-                            : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 4096 + ld_row + ((t_rr ^ 7) << 4)))
                             : "memory");
                         uint32_t _prmt_222;
                         asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_222) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
@@ -1647,49 +1635,61 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                             :: "r"(_stmatrix_addr_226), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                             : "memory");
+                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                            : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                            : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 4096 + ld_row + ((t_rr ^ 5) << 4)))
+                            : "memory");
                         uint32_t _prmt_227;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_227) : "r"(tw[4]), "r"(tw[5]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_227) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                         tpw[0] = _prmt_227;
                         uint32_t _prmt_228;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_228) : "r"(tw[4]), "r"(tw[5]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_228) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                         tpw[1] = _prmt_228;
                         uint32_t _prmt_229;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_229) : "r"(tw[6]), "r"(tw[7]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_229) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                         tpw[2] = _prmt_229;
                         uint32_t _prmt_230;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_230) : "r"(tw[6]), "r"(tw[7]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_230) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                         tpw[3] = _prmt_230;
                         uint32_t _stmatrix_addr_231 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off_1 + 10240 + st_row + ((2 + t_mih ^ t_dl7) << 4)));
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                             :: "r"(_stmatrix_addr_231), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                             : "memory");
+                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                            : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                            : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 4096 + ld_row + ((t_rr ^ 6) << 4)))
+                            : "memory");
                         uint32_t _prmt_232;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_232) : "r"(tw[8]), "r"(tw[9]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_232) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                         tpw[0] = _prmt_232;
                         uint32_t _prmt_233;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_233) : "r"(tw[8]), "r"(tw[9]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_233) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                         tpw[1] = _prmt_233;
                         uint32_t _prmt_234;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_234) : "r"(tw[10]), "r"(tw[11]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_234) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                         tpw[2] = _prmt_234;
                         uint32_t _prmt_235;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_235) : "r"(tw[10]), "r"(tw[11]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_235) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                         tpw[3] = _prmt_235;
                         uint32_t _stmatrix_addr_236 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off_1 + 12288 + st_row + ((2 + t_mih ^ t_dl7) << 4)));
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                             :: "r"(_stmatrix_addr_236), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                             : "memory");
+                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                            : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                            : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 4096 + ld_row + ((t_rr ^ 7) << 4)))
+                            : "memory");
                         uint32_t _prmt_237;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_237) : "r"(tw[12]), "r"(tw[13]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_237) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                         tpw[0] = _prmt_237;
                         uint32_t _prmt_238;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_238) : "r"(tw[12]), "r"(tw[13]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_238) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                         tpw[1] = _prmt_238;
                         uint32_t _prmt_239;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_239) : "r"(tw[14]), "r"(tw[15]), "r"(sel_a));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_239) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                         tpw[2] = _prmt_239;
                         uint32_t _prmt_240;
-                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_240) : "r"(tw[14]), "r"(tw[15]), "r"(sel_b));
+                        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_240) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                         tpw[3] = _prmt_240;
                         uint32_t _stmatrix_addr_241 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off_1 + 14336 + st_row + ((2 + t_mih ^ t_dl7) << 4)));
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
@@ -1699,18 +1699,6 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                             asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                                 : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
                                 : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + ld_row + ((t_rr ^ 0) << 4)))
-                                : "memory");
-                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                                : "=r"(tw[4]), "=r"(tw[5]), "=r"(tw[6]), "=r"(tw[7])
-                                : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + ld_row + ((t_rr ^ 1) << 4)))
-                                : "memory");
-                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                                : "=r"(tw[8]), "=r"(tw[9]), "=r"(tw[10]), "=r"(tw[11])
-                                : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + ld_row + ((t_rr ^ 2) << 4)))
-                                : "memory");
-                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                                : "=r"(tw[12]), "=r"(tw[13]), "=r"(tw[14]), "=r"(tw[15])
-                                : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + ld_row + ((t_rr ^ 3) << 4)))
                                 : "memory");
                             uint32_t _prmt_242;
                             asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_242) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
@@ -1728,49 +1716,61 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                 :: "r"(_stmatrix_addr_246), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                                 : "memory");
+                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                                : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + ld_row + ((t_rr ^ 1) << 4)))
+                                : "memory");
                             uint32_t _prmt_247;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_247) : "r"(tw[4]), "r"(tw[5]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_247) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                             tpw[0] = _prmt_247;
                             uint32_t _prmt_248;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_248) : "r"(tw[4]), "r"(tw[5]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_248) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                             tpw[1] = _prmt_248;
                             uint32_t _prmt_249;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_249) : "r"(tw[6]), "r"(tw[7]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_249) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                             tpw[2] = _prmt_249;
                             uint32_t _prmt_250;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_250) : "r"(tw[6]), "r"(tw[7]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_250) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                             tpw[3] = _prmt_250;
                             uint32_t _stmatrix_addr_251 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off_1 + 2048 + st_row + ((4 + t_mih ^ t_dl7) << 4)));
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                 :: "r"(_stmatrix_addr_251), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                                 : "memory");
+                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                                : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + ld_row + ((t_rr ^ 2) << 4)))
+                                : "memory");
                             uint32_t _prmt_252;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_252) : "r"(tw[8]), "r"(tw[9]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_252) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                             tpw[0] = _prmt_252;
                             uint32_t _prmt_253;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_253) : "r"(tw[8]), "r"(tw[9]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_253) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                             tpw[1] = _prmt_253;
                             uint32_t _prmt_254;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_254) : "r"(tw[10]), "r"(tw[11]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_254) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                             tpw[2] = _prmt_254;
                             uint32_t _prmt_255;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_255) : "r"(tw[10]), "r"(tw[11]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_255) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                             tpw[3] = _prmt_255;
                             uint32_t _stmatrix_addr_256 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off_1 + 4096 + st_row + ((4 + t_mih ^ t_dl7) << 4)));
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                 :: "r"(_stmatrix_addr_256), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                                 : "memory");
+                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                                : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + ld_row + ((t_rr ^ 3) << 4)))
+                                : "memory");
                             uint32_t _prmt_257;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_257) : "r"(tw[12]), "r"(tw[13]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_257) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                             tpw[0] = _prmt_257;
                             uint32_t _prmt_258;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_258) : "r"(tw[12]), "r"(tw[13]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_258) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                             tpw[1] = _prmt_258;
                             uint32_t _prmt_259;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_259) : "r"(tw[14]), "r"(tw[15]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_259) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                             tpw[2] = _prmt_259;
                             uint32_t _prmt_260;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_260) : "r"(tw[14]), "r"(tw[15]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_260) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                             tpw[3] = _prmt_260;
                             uint32_t _stmatrix_addr_261 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off_1 + 6144 + st_row + ((4 + t_mih ^ t_dl7) << 4)));
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
@@ -1779,18 +1779,6 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                             asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                                 : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
                                 : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + ld_row + ((t_rr ^ 4) << 4)))
-                                : "memory");
-                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                                : "=r"(tw[4]), "=r"(tw[5]), "=r"(tw[6]), "=r"(tw[7])
-                                : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + ld_row + ((t_rr ^ 5) << 4)))
-                                : "memory");
-                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                                : "=r"(tw[8]), "=r"(tw[9]), "=r"(tw[10]), "=r"(tw[11])
-                                : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + ld_row + ((t_rr ^ 6) << 4)))
-                                : "memory");
-                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                                : "=r"(tw[12]), "=r"(tw[13]), "=r"(tw[14]), "=r"(tw[15])
-                                : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + ld_row + ((t_rr ^ 7) << 4)))
                                 : "memory");
                             uint32_t _prmt_262;
                             asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_262) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
@@ -1808,49 +1796,61 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                 :: "r"(_stmatrix_addr_266), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                                 : "memory");
+                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                                : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + ld_row + ((t_rr ^ 5) << 4)))
+                                : "memory");
                             uint32_t _prmt_267;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_267) : "r"(tw[4]), "r"(tw[5]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_267) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                             tpw[0] = _prmt_267;
                             uint32_t _prmt_268;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_268) : "r"(tw[4]), "r"(tw[5]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_268) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                             tpw[1] = _prmt_268;
                             uint32_t _prmt_269;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_269) : "r"(tw[6]), "r"(tw[7]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_269) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                             tpw[2] = _prmt_269;
                             uint32_t _prmt_270;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_270) : "r"(tw[6]), "r"(tw[7]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_270) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                             tpw[3] = _prmt_270;
                             uint32_t _stmatrix_addr_271 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off_1 + 10240 + st_row + ((4 + t_mih ^ t_dl7) << 4)));
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                 :: "r"(_stmatrix_addr_271), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                                 : "memory");
+                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                                : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + ld_row + ((t_rr ^ 6) << 4)))
+                                : "memory");
                             uint32_t _prmt_272;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_272) : "r"(tw[8]), "r"(tw[9]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_272) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                             tpw[0] = _prmt_272;
                             uint32_t _prmt_273;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_273) : "r"(tw[8]), "r"(tw[9]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_273) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                             tpw[1] = _prmt_273;
                             uint32_t _prmt_274;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_274) : "r"(tw[10]), "r"(tw[11]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_274) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                             tpw[2] = _prmt_274;
                             uint32_t _prmt_275;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_275) : "r"(tw[10]), "r"(tw[11]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_275) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                             tpw[3] = _prmt_275;
                             uint32_t _stmatrix_addr_276 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off_1 + 12288 + st_row + ((4 + t_mih ^ t_dl7) << 4)));
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                 :: "r"(_stmatrix_addr_276), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                                 : "memory");
+                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                                : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + ld_row + ((t_rr ^ 7) << 4)))
+                                : "memory");
                             uint32_t _prmt_277;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_277) : "r"(tw[12]), "r"(tw[13]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_277) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                             tpw[0] = _prmt_277;
                             uint32_t _prmt_278;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_278) : "r"(tw[12]), "r"(tw[13]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_278) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                             tpw[1] = _prmt_278;
                             uint32_t _prmt_279;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_279) : "r"(tw[14]), "r"(tw[15]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_279) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                             tpw[2] = _prmt_279;
                             uint32_t _prmt_280;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_280) : "r"(tw[14]), "r"(tw[15]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_280) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                             tpw[3] = _prmt_280;
                             uint32_t _stmatrix_addr_281 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off_1 + 14336 + st_row + ((4 + t_mih ^ t_dl7) << 4)));
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
@@ -1859,18 +1859,6 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                             asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                                 : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
                                 : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + 4096 + ld_row + ((t_rr ^ 0) << 4)))
-                                : "memory");
-                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                                : "=r"(tw[4]), "=r"(tw[5]), "=r"(tw[6]), "=r"(tw[7])
-                                : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + 4096 + ld_row + ((t_rr ^ 1) << 4)))
-                                : "memory");
-                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                                : "=r"(tw[8]), "=r"(tw[9]), "=r"(tw[10]), "=r"(tw[11])
-                                : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + 4096 + ld_row + ((t_rr ^ 2) << 4)))
-                                : "memory");
-                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                                : "=r"(tw[12]), "=r"(tw[13]), "=r"(tw[14]), "=r"(tw[15])
-                                : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + 4096 + ld_row + ((t_rr ^ 3) << 4)))
                                 : "memory");
                             uint32_t _prmt_282;
                             asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_282) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
@@ -1888,49 +1876,61 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                 :: "r"(_stmatrix_addr_286), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                                 : "memory");
+                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                                : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + 4096 + ld_row + ((t_rr ^ 1) << 4)))
+                                : "memory");
                             uint32_t _prmt_287;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_287) : "r"(tw[4]), "r"(tw[5]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_287) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                             tpw[0] = _prmt_287;
                             uint32_t _prmt_288;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_288) : "r"(tw[4]), "r"(tw[5]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_288) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                             tpw[1] = _prmt_288;
                             uint32_t _prmt_289;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_289) : "r"(tw[6]), "r"(tw[7]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_289) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                             tpw[2] = _prmt_289;
                             uint32_t _prmt_290;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_290) : "r"(tw[6]), "r"(tw[7]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_290) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                             tpw[3] = _prmt_290;
                             uint32_t _stmatrix_addr_291 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off_1 + 2048 + st_row + ((6 + t_mih ^ t_dl7) << 4)));
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                 :: "r"(_stmatrix_addr_291), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                                 : "memory");
+                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                                : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + 4096 + ld_row + ((t_rr ^ 2) << 4)))
+                                : "memory");
                             uint32_t _prmt_292;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_292) : "r"(tw[8]), "r"(tw[9]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_292) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                             tpw[0] = _prmt_292;
                             uint32_t _prmt_293;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_293) : "r"(tw[8]), "r"(tw[9]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_293) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                             tpw[1] = _prmt_293;
                             uint32_t _prmt_294;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_294) : "r"(tw[10]), "r"(tw[11]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_294) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                             tpw[2] = _prmt_294;
                             uint32_t _prmt_295;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_295) : "r"(tw[10]), "r"(tw[11]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_295) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                             tpw[3] = _prmt_295;
                             uint32_t _stmatrix_addr_296 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off_1 + 4096 + st_row + ((6 + t_mih ^ t_dl7) << 4)));
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                 :: "r"(_stmatrix_addr_296), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                                 : "memory");
+                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                                : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + 4096 + ld_row + ((t_rr ^ 3) << 4)))
+                                : "memory");
                             uint32_t _prmt_297;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_297) : "r"(tw[12]), "r"(tw[13]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_297) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                             tpw[0] = _prmt_297;
                             uint32_t _prmt_298;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_298) : "r"(tw[12]), "r"(tw[13]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_298) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                             tpw[1] = _prmt_298;
                             uint32_t _prmt_299;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_299) : "r"(tw[14]), "r"(tw[15]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_299) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                             tpw[2] = _prmt_299;
                             uint32_t _prmt_300;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_300) : "r"(tw[14]), "r"(tw[15]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_300) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                             tpw[3] = _prmt_300;
                             uint32_t _stmatrix_addr_301 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off_1 + 6144 + st_row + ((6 + t_mih ^ t_dl7) << 4)));
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
@@ -1939,18 +1939,6 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                             asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                                 : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
                                 : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + 4096 + ld_row + ((t_rr ^ 4) << 4)))
-                                : "memory");
-                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                                : "=r"(tw[4]), "=r"(tw[5]), "=r"(tw[6]), "=r"(tw[7])
-                                : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + 4096 + ld_row + ((t_rr ^ 5) << 4)))
-                                : "memory");
-                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                                : "=r"(tw[8]), "=r"(tw[9]), "=r"(tw[10]), "=r"(tw[11])
-                                : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + 4096 + ld_row + ((t_rr ^ 6) << 4)))
-                                : "memory");
-                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                                : "=r"(tw[12]), "=r"(tw[13]), "=r"(tw[14]), "=r"(tw[15])
-                                : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + 4096 + ld_row + ((t_rr ^ 7) << 4)))
                                 : "memory");
                             uint32_t _prmt_302;
                             asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_302) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
@@ -1968,49 +1956,61 @@ kernel_cake_vsa_sm90_c4be0774255356629c4e(const __grid_constant__ CUtensorMap Q,
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                 :: "r"(_stmatrix_addr_306), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                                 : "memory");
+                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                                : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + 4096 + ld_row + ((t_rr ^ 5) << 4)))
+                                : "memory");
                             uint32_t _prmt_307;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_307) : "r"(tw[4]), "r"(tw[5]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_307) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                             tpw[0] = _prmt_307;
                             uint32_t _prmt_308;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_308) : "r"(tw[4]), "r"(tw[5]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_308) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                             tpw[1] = _prmt_308;
                             uint32_t _prmt_309;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_309) : "r"(tw[6]), "r"(tw[7]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_309) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                             tpw[2] = _prmt_309;
                             uint32_t _prmt_310;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_310) : "r"(tw[6]), "r"(tw[7]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_310) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                             tpw[3] = _prmt_310;
                             uint32_t _stmatrix_addr_311 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off_1 + 10240 + st_row + ((6 + t_mih ^ t_dl7) << 4)));
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                 :: "r"(_stmatrix_addr_311), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                                 : "memory");
+                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                                : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + 4096 + ld_row + ((t_rr ^ 6) << 4)))
+                                : "memory");
                             uint32_t _prmt_312;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_312) : "r"(tw[8]), "r"(tw[9]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_312) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                             tpw[0] = _prmt_312;
                             uint32_t _prmt_313;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_313) : "r"(tw[8]), "r"(tw[9]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_313) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                             tpw[1] = _prmt_313;
                             uint32_t _prmt_314;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_314) : "r"(tw[10]), "r"(tw[11]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_314) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                             tpw[2] = _prmt_314;
                             uint32_t _prmt_315;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_315) : "r"(tw[10]), "r"(tw[11]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_315) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                             tpw[3] = _prmt_315;
                             uint32_t _stmatrix_addr_316 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off_1 + 12288 + st_row + ((6 + t_mih ^ t_dl7) << 4)));
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                 :: "r"(_stmatrix_addr_316), "r"(*reinterpret_cast<const uint32_t*>(&tpw[0])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[1])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[2])), "r"(*reinterpret_cast<const uint32_t*>(&tpw[3]))
                                 : "memory");
+                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                : "=r"(tw[0]), "=r"(tw[1]), "=r"(tw[2]), "=r"(tw[3])
+                                : "r"(vl_smem_addr + (unsigned int)(land_off_1 + 8192 + 4096 + ld_row + ((t_rr ^ 7) << 4)))
+                                : "memory");
                             uint32_t _prmt_317;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_317) : "r"(tw[12]), "r"(tw[13]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_317) : "r"(tw[0]), "r"(tw[1]), "r"(sel_a));
                             tpw[0] = _prmt_317;
                             uint32_t _prmt_318;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_318) : "r"(tw[12]), "r"(tw[13]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_318) : "r"(tw[0]), "r"(tw[1]), "r"(sel_b));
                             tpw[1] = _prmt_318;
                             uint32_t _prmt_319;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_319) : "r"(tw[14]), "r"(tw[15]), "r"(sel_a));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_319) : "r"(tw[2]), "r"(tw[3]), "r"(sel_a));
                             tpw[2] = _prmt_319;
                             uint32_t _prmt_320;
-                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_320) : "r"(tw[14]), "r"(tw[15]), "r"(sel_b));
+                            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_320) : "r"(tw[2]), "r"(tw[3]), "r"(sel_b));
                             tpw[3] = _prmt_320;
                             uint32_t _stmatrix_addr_321 = static_cast<uint32_t>(vt_smem_addr + (unsigned int)(vt_off_1 + 14336 + st_row + ((6 + t_mih ^ t_dl7) << 4)));
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"

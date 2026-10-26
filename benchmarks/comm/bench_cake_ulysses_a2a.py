@@ -6,15 +6,18 @@ Run on an SM100/SM103 NVLink node with, for example:
 
 Three arms share the same input and caller-owned output tensors: the Cake
 package route of the NVLink backend (``cake``), FlashInfer's portable NVLink
-kernel (``portable``) and the NCCL backend (``nccl``).  Each sample is one
+kernel (``portable``) and the NCCL backend (``nccl``).  A fourth arm,
+``cake_registered``, reads the same inputs and writes outputs from the
+communicator's ``allocate_output`` (the Cake direct route).  Each sample is one
 ``PreparedCase.run`` (three ``scatter_heads`` and one ``gather_heads``) and
 includes every copy the arm's kernel issues.  Every sample starts rank-aligned:
 the ranks synchronize their devices and meet at a host-side (gloo) barrier
 before each call, so the synchronizing kernels are not timed against another
 rank's launch skew; the per-sample statistic is the rank maximum, the row's the
 median.  CUPTI unavailability is an error.  Add ``--all-shapes`` to measure
-every portfolio row of the launched world.  The ``cake`` arm is reported as
-``null`` with a reason where the package delivers no route for the device.
+every portfolio row of the launched world.  The ``cake`` and
+``cake_registered`` arms are reported as ``null`` with a reason where the
+package delivers no route for the device.
 """
 
 import argparse
@@ -33,7 +36,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from flashinfer.testing import bench_gpu_time_with_cupti
 
-from tests.comm.cake_ulysses_a2a_fixture import cake_route_available, prepare, shapes
+from tests.comm.cake_ulysses_a2a_fixture import (
+    cake_direct_available,
+    cake_route_available,
+    prepare,
+    shapes,
+)
 
 
 def _aligned(case, barrier_group):
@@ -92,6 +100,7 @@ def main():
         if not selected:
             raise ValueError(f"no portfolio shapes for world size {world}")
         cake_available = cake_route_available(world)
+        direct_available = cake_available and cake_direct_available(world)
         for shape in selected:
             portable = prepare(shape, backend="nvlink", nvlink_kernel="portable")
             cases = {"portable": portable}
@@ -103,6 +112,14 @@ def main():
                         nvlink_kernel="cake",
                         inputs=portable.inputs,
                         outputs=portable.outputs,
+                    )
+                if direct_available:
+                    cases["cake_registered"] = prepare(
+                        shape,
+                        backend="nvlink",
+                        nvlink_kernel="cake",
+                        inputs=portable.inputs,
+                        registered=True,
                     )
                 cases["nccl"] = prepare(
                     shape,
@@ -117,6 +134,8 @@ def main():
                     results[name] = _measure(case, barrier_group, args)
                 if not cake_available:
                     results["cake"] = None
+                if not direct_available:
+                    results["cake_registered"] = None
                 row = {
                     "shape": shape,
                     "correctness": "bit_exact",
@@ -138,6 +157,19 @@ def main():
                 else:
                     row["cake_unavailable"] = (
                         "the package delivers no route for this device and dtype"
+                    )
+                if direct_available:
+                    row["speedup_cake_registered_over_nccl"] = (
+                        results["nccl"]["median_ms"]
+                        / results["cake_registered"]["median_ms"]
+                    )
+                    row["speedup_cake_registered_over_cake"] = (
+                        results["cake"]["median_ms"]
+                        / results["cake_registered"]["median_ms"]
+                    )
+                else:
+                    row["cake_registered_unavailable"] = (
+                        "the package delivers no direct route for this device and dtype"
                     )
                 rows.append(row)
             finally:

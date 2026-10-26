@@ -704,6 +704,7 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                 mx[6] = s[6];
                 s[7] = ((ok != 0) ? sv_next[7] * score_scale : -1e+20f);
                 mx[7] = s[7];
+#if __CUDA_ARCH__ == 1070
                 float send8 = ((b3) ? mx[0] : mx[4]);
                 float keep8 = ((b3) ? mx[4] : mx[0]);
                 float _shfl_xor_sync_0 = __shfl_xor_sync(0xFFFFFFFF, send8, 8);
@@ -734,12 +735,87 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                 float red = fmaxf(keep2, _shfl_xor_sync_6);
                 float _shfl_xor_sync_7 = __shfl_xor_sync(0xFFFFFFFF, red, 1);
                 red = fmaxf(red, _shfl_xor_sync_7);
+#else
+                float r16[16];
+                float rv = ((half == 0) ? mx[0] : -1e+20f);
+                float _warp_redux_0;
+                asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_0) : "f"(rv));
+                r16[0] = _warp_redux_0;
+                float rv_0 = ((half == 0) ? mx[1] : -1e+20f);
+                float _warp_redux_1;
+                asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_1) : "f"(rv_0));
+                r16[1] = _warp_redux_1;
+                float rv_1 = ((half == 0) ? mx[2] : -1e+20f);
+                float _warp_redux_2;
+                asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_2) : "f"(rv_1));
+                r16[2] = _warp_redux_2;
+                float rv_2 = ((half == 0) ? mx[3] : -1e+20f);
+                float _warp_redux_3;
+                asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_3) : "f"(rv_2));
+                r16[3] = _warp_redux_3;
+                float rv_3 = ((half == 0) ? mx[4] : -1e+20f);
+                float _warp_redux_4;
+                asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_4) : "f"(rv_3));
+                r16[4] = _warp_redux_4;
+                float rv_4 = ((half == 0) ? mx[5] : -1e+20f);
+                float _warp_redux_5;
+                asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_5) : "f"(rv_4));
+                r16[5] = _warp_redux_5;
+                float rv_5 = ((half == 0) ? mx[6] : -1e+20f);
+                float _warp_redux_6;
+                asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_6) : "f"(rv_5));
+                r16[6] = _warp_redux_6;
+                float rv_6 = ((half == 0) ? mx[7] : -1e+20f);
+                float _warp_redux_7;
+                asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_7) : "f"(rv_6));
+                r16[7] = _warp_redux_7;
+                float rv_7 = ((half == 1) ? mx[0] : -1e+20f);
+                float _warp_redux_8;
+                asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_8) : "f"(rv_7));
+                r16[8] = _warp_redux_8;
+                float rv_8 = ((half == 1) ? mx[1] : -1e+20f);
+                float _warp_redux_9;
+                asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_9) : "f"(rv_8));
+                r16[9] = _warp_redux_9;
+                float rv_9 = ((half == 1) ? mx[2] : -1e+20f);
+                float _warp_redux_10;
+                asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_10) : "f"(rv_9));
+                r16[10] = _warp_redux_10;
+                float rv_10 = ((half == 1) ? mx[3] : -1e+20f);
+                float _warp_redux_11;
+                asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_11) : "f"(rv_10));
+                r16[11] = _warp_redux_11;
+                float rv_11 = ((half == 1) ? mx[4] : -1e+20f);
+                float _warp_redux_12;
+                asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_12) : "f"(rv_11));
+                r16[12] = _warp_redux_12;
+                float rv_12 = ((half == 1) ? mx[5] : -1e+20f);
+                float _warp_redux_13;
+                asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_13) : "f"(rv_12));
+                r16[13] = _warp_redux_13;
+                float rv_13 = ((half == 1) ? mx[6] : -1e+20f);
+                float _warp_redux_14;
+                asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_14) : "f"(rv_13));
+                r16[14] = _warp_redux_14;
+                float rv_14 = ((half == 1) ? mx[7] : -1e+20f);
+                float _warp_redux_15;
+                asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_15) : "f"(rv_14));
+                r16[15] = _warp_redux_15;
+#endif
                 unsigned int xb = xchg_max + (unsigned int)(n & 1) * 768;
+#if __CUDA_ARCH__ == 1070
                 if (pub_lane) {
                     {
                         uint32_t _addr_8 = static_cast<uint32_t>(xb + pub_off);
                         asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_8), "f"(red) : "memory");
                     }
+#else
+                if (lane_1 == 0) {
+                    asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(xb + (unsigned int)(64 * warp_1)), "f"(r16[0]), "f"(r16[1]), "f"(r16[2]), "f"(r16[3]) : "memory");
+                    asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(xb + (unsigned int)(64 * warp_1 + 16)), "f"(r16[4]), "f"(r16[5]), "f"(r16[6]), "f"(r16[7]) : "memory");
+                    asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(xb + (unsigned int)(64 * warp_1 + 32)), "f"(r16[8]), "f"(r16[9]), "f"(r16[10]), "f"(r16[11]) : "memory");
+                    asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(xb + (unsigned int)(64 * warp_1 + 48)), "f"(r16[12]), "f"(r16[13]), "f"(r16[14]), "f"(r16[15]) : "memory");
+#endif
                 }
                 asm volatile("barrier.sync 2, 128;" ::: "memory");
                 unsigned int xb_half = xb + xb_half_off;
@@ -768,22 +844,135 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                     : "=r"(*reinterpret_cast<uint32_t*>(&mw[28])), "=r"(*reinterpret_cast<uint32_t*>(&mw[(28) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&mw[(28) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&mw[(28) + 3]))
                     : "r"(xb_half + 192 + 16));
                 bool moved = 0;
+#if __CUDA_ARCH__ == 1070
                 m_new[0] = fmaxf(fmaxf(m[0], mw[0]), fmaxf(fmaxf(mw[8], mw[16]), mw[24]));
+#else
+                float _max3_17;
+                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                #endif
+                asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_17) : "f"(m[0]), "f"(mw[0]), "f"(mw[8]));
+                float _max3_16;
+                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                #endif
+                asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_16) : "f"(_max3_17), "f"(mw[16]), "f"(mw[24]));
+                m_new[0] = _max3_16;
+#endif
                 moved = moved || m_new[0] != m[0];
+#if __CUDA_ARCH__ == 1070
                 m_new[1] = fmaxf(fmaxf(m[1], mw[1]), fmaxf(fmaxf(mw[9], mw[17]), mw[25]));
+#else
+                float _max3_19;
+                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                #endif
+                asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_19) : "f"(m[1]), "f"(mw[1]), "f"(mw[9]));
+                float _max3_18;
+                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                #endif
+                asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_18) : "f"(_max3_19), "f"(mw[17]), "f"(mw[25]));
+                m_new[1] = _max3_18;
+#endif
                 moved = moved || m_new[1] != m[1];
+#if __CUDA_ARCH__ == 1070
                 m_new[2] = fmaxf(fmaxf(m[2], mw[2]), fmaxf(fmaxf(mw[10], mw[18]), mw[26]));
+#else
+                float _max3_21;
+                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                #endif
+                asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_21) : "f"(m[2]), "f"(mw[2]), "f"(mw[10]));
+                float _max3_20;
+                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                #endif
+                asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_20) : "f"(_max3_21), "f"(mw[18]), "f"(mw[26]));
+                m_new[2] = _max3_20;
+#endif
                 moved = moved || m_new[2] != m[2];
+#if __CUDA_ARCH__ == 1070
                 m_new[3] = fmaxf(fmaxf(m[3], mw[3]), fmaxf(fmaxf(mw[11], mw[19]), mw[27]));
+#else
+                float _max3_23;
+                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                #endif
+                asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_23) : "f"(m[3]), "f"(mw[3]), "f"(mw[11]));
+                float _max3_22;
+                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                #endif
+                asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_22) : "f"(_max3_23), "f"(mw[19]), "f"(mw[27]));
+                m_new[3] = _max3_22;
+#endif
                 moved = moved || m_new[3] != m[3];
+#if __CUDA_ARCH__ == 1070
                 m_new[4] = fmaxf(fmaxf(m[4], mw[4]), fmaxf(fmaxf(mw[12], mw[20]), mw[28]));
+#else
+                float _max3_25;
+                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                #endif
+                asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_25) : "f"(m[4]), "f"(mw[4]), "f"(mw[12]));
+                float _max3_24;
+                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                #endif
+                asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_24) : "f"(_max3_25), "f"(mw[20]), "f"(mw[28]));
+                m_new[4] = _max3_24;
+#endif
                 moved = moved || m_new[4] != m[4];
+#if __CUDA_ARCH__ == 1070
                 m_new[5] = fmaxf(fmaxf(m[5], mw[5]), fmaxf(fmaxf(mw[13], mw[21]), mw[29]));
+#else
+                float _max3_27;
+                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                #endif
+                asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_27) : "f"(m[5]), "f"(mw[5]), "f"(mw[13]));
+                float _max3_26;
+                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                #endif
+                asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_26) : "f"(_max3_27), "f"(mw[21]), "f"(mw[29]));
+                m_new[5] = _max3_26;
+#endif
                 moved = moved || m_new[5] != m[5];
+#if __CUDA_ARCH__ == 1070
                 m_new[6] = fmaxf(fmaxf(m[6], mw[6]), fmaxf(fmaxf(mw[14], mw[22]), mw[30]));
+#else
+                float _max3_29;
+                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                #endif
+                asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_29) : "f"(m[6]), "f"(mw[6]), "f"(mw[14]));
+                float _max3_28;
+                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                #endif
+                asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_28) : "f"(_max3_29), "f"(mw[22]), "f"(mw[30]));
+                m_new[6] = _max3_28;
+#endif
                 moved = moved || m_new[6] != m[6];
+#if __CUDA_ARCH__ == 1070
                 m_new[7] = fmaxf(fmaxf(m[7], mw[7]), fmaxf(fmaxf(mw[15], mw[23]), mw[31]));
+#else
+                float _max3_31;
+                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                #endif
+                asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_31) : "f"(m[7]), "f"(mw[7]), "f"(mw[15]));
+                float _max3_30;
+                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                #endif
+                asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_30) : "f"(_max3_31), "f"(mw[23]), "f"(mw[31]));
+                m_new[7] = _max3_30;
+#endif
                 moved = moved || m_new[7] != m[7];
+#if __CUDA_ARCH__ == 1070
                 int _warp_vote_9 = __any_sync(0xFFFFFFFF, moved);
                 bool any_rescale = _warp_vote_9;
                 float _exp2_10 = approx_exp2(s[0] - m_new[0]);
@@ -802,30 +991,90 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                 p[6] = ((ok != 0) ? _exp2_16 : 0.0f);
                 float _exp2_17 = approx_exp2(s[7] - m_new[7]);
                 p[7] = ((ok != 0) ? _exp2_17 : 0.0f);
+#else
+                int _warp_vote_32 = __any_sync(0xFFFFFFFF, moved);
+                bool any_rescale = _warp_vote_32;
+                float _exp2_33 = approx_exp2(s[0] - m_new[0]);
+                p[0] = ((ok != 0) ? _exp2_33 : 0.0f);
+                float _exp2_34 = approx_exp2(s[1] - m_new[1]);
+                p[1] = ((ok != 0) ? _exp2_34 : 0.0f);
+                float _exp2_35 = approx_exp2(s[2] - m_new[2]);
+                p[2] = ((ok != 0) ? _exp2_35 : 0.0f);
+                float _exp2_36 = approx_exp2(s[3] - m_new[3]);
+                p[3] = ((ok != 0) ? _exp2_36 : 0.0f);
+                float _exp2_37 = approx_exp2(s[4] - m_new[4]);
+                p[4] = ((ok != 0) ? _exp2_37 : 0.0f);
+                float _exp2_38 = approx_exp2(s[5] - m_new[5]);
+                p[5] = ((ok != 0) ? _exp2_38 : 0.0f);
+                float _exp2_39 = approx_exp2(s[6] - m_new[6]);
+                p[6] = ((ok != 0) ? _exp2_39 : 0.0f);
+                float _exp2_40 = approx_exp2(s[7] - m_new[7]);
+                p[7] = ((ok != 0) ? _exp2_40 : 0.0f);
+#endif
                 if (any_rescale) {
+#if __CUDA_ARCH__ == 1070
                     float _exp2_18 = approx_exp2(m[0] - m_new[0]);
                     alpha[0] = _exp2_18;
+#else
+                    float _exp2_41 = approx_exp2(m[0] - m_new[0]);
+                    alpha[0] = _exp2_41;
+#endif
                     l[0] = __fmaf_rn(l[0], alpha[0], p[0]);
+#if __CUDA_ARCH__ == 1070
                     float _exp2_19 = approx_exp2(m[1] - m_new[1]);
                     alpha[1] = _exp2_19;
+#else
+                    float _exp2_42 = approx_exp2(m[1] - m_new[1]);
+                    alpha[1] = _exp2_42;
+#endif
                     l[1] = __fmaf_rn(l[1], alpha[1], p[1]);
+#if __CUDA_ARCH__ == 1070
                     float _exp2_20 = approx_exp2(m[2] - m_new[2]);
                     alpha[2] = _exp2_20;
+#else
+                    float _exp2_43 = approx_exp2(m[2] - m_new[2]);
+                    alpha[2] = _exp2_43;
+#endif
                     l[2] = __fmaf_rn(l[2], alpha[2], p[2]);
+#if __CUDA_ARCH__ == 1070
                     float _exp2_21 = approx_exp2(m[3] - m_new[3]);
                     alpha[3] = _exp2_21;
+#else
+                    float _exp2_44 = approx_exp2(m[3] - m_new[3]);
+                    alpha[3] = _exp2_44;
+#endif
                     l[3] = __fmaf_rn(l[3], alpha[3], p[3]);
+#if __CUDA_ARCH__ == 1070
                     float _exp2_22 = approx_exp2(m[4] - m_new[4]);
                     alpha[4] = _exp2_22;
+#else
+                    float _exp2_45 = approx_exp2(m[4] - m_new[4]);
+                    alpha[4] = _exp2_45;
+#endif
                     l[4] = __fmaf_rn(l[4], alpha[4], p[4]);
+#if __CUDA_ARCH__ == 1070
                     float _exp2_23 = approx_exp2(m[5] - m_new[5]);
                     alpha[5] = _exp2_23;
+#else
+                    float _exp2_46 = approx_exp2(m[5] - m_new[5]);
+                    alpha[5] = _exp2_46;
+#endif
                     l[5] = __fmaf_rn(l[5], alpha[5], p[5]);
+#if __CUDA_ARCH__ == 1070
                     float _exp2_24 = approx_exp2(m[6] - m_new[6]);
                     alpha[6] = _exp2_24;
+#else
+                    float _exp2_47 = approx_exp2(m[6] - m_new[6]);
+                    alpha[6] = _exp2_47;
+#endif
                     l[6] = __fmaf_rn(l[6], alpha[6], p[6]);
+#if __CUDA_ARCH__ == 1070
                     float _exp2_25 = approx_exp2(m[7] - m_new[7]);
                     alpha[7] = _exp2_25;
+#else
+                    float _exp2_48 = approx_exp2(m[7] - m_new[7]);
+                    alpha[7] = _exp2_48;
+#endif
                     l[7] = __fmaf_rn(l[7], alpha[7], p[7]);
                 } else {
                     l[0] = l[0] + p[0];
@@ -852,6 +1101,7 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                 }
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_p_addr + (unsigned int)(ss * 2048) + (unsigned int)(tok * 32 + 16 * half ^ (tok * 32 + 16 * half >> 7 & 1) << 4))), "r"(__as_u32(__float22bfloat162_rn(make_float2(p[0], p[1])))), "r"(__as_u32(__float22bfloat162_rn(make_float2(p[2], p[3])))), "r"(__as_u32(__float22bfloat162_rn(make_float2(p[4], p[5])))), "r"(__as_u32(__float22bfloat162_rn(make_float2(p[6], p[7])))) : "memory");
                 if (n > 0 && any_rescale) {
+#if __CUDA_ARCH__ == 1070
                     float _shfl_xor_sync_26 = __shfl_xor_sync(0xFFFFFFFF, alpha[0], 16);
                     other[0] = _shfl_xor_sync_26;
                     float _shfl_xor_sync_27 = __shfl_xor_sync(0xFFFFFFFF, alpha[1], 16);
@@ -868,6 +1118,24 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                     other[6] = _shfl_xor_sync_32;
                     float _shfl_xor_sync_33 = __shfl_xor_sync(0xFFFFFFFF, alpha[7], 16);
                     other[7] = _shfl_xor_sync_33;
+#else
+                    float _shfl_xor_sync_49 = __shfl_xor_sync(0xFFFFFFFF, alpha[0], 16);
+                    other[0] = _shfl_xor_sync_49;
+                    float _shfl_xor_sync_50 = __shfl_xor_sync(0xFFFFFFFF, alpha[1], 16);
+                    other[1] = _shfl_xor_sync_50;
+                    float _shfl_xor_sync_51 = __shfl_xor_sync(0xFFFFFFFF, alpha[2], 16);
+                    other[2] = _shfl_xor_sync_51;
+                    float _shfl_xor_sync_52 = __shfl_xor_sync(0xFFFFFFFF, alpha[3], 16);
+                    other[3] = _shfl_xor_sync_52;
+                    float _shfl_xor_sync_53 = __shfl_xor_sync(0xFFFFFFFF, alpha[4], 16);
+                    other[4] = _shfl_xor_sync_53;
+                    float _shfl_xor_sync_54 = __shfl_xor_sync(0xFFFFFFFF, alpha[5], 16);
+                    other[5] = _shfl_xor_sync_54;
+                    float _shfl_xor_sync_55 = __shfl_xor_sync(0xFFFFFFFF, alpha[6], 16);
+                    other[6] = _shfl_xor_sync_55;
+                    float _shfl_xor_sync_56 = __shfl_xor_sync(0xFFFFFFFF, alpha[7], 16);
+                    other[7] = _shfl_xor_sync_56;
+#endif
                     int _stage_pv_done_1 = (int)((unsigned int)(n - 1) % 2);
                     int _parity_pv_done_1 = (int)((unsigned int)(n - 1) / 2 % 2);
                     mbarrier_wait(pv_done_addr + (_stage_pv_done_1) * 8, _parity_pv_done_1);
@@ -991,6 +1259,7 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
             if (elect_sync()) {
                 mbarrier_arrive(tmem_dead_addr);
             }
+#if __CUDA_ARCH__ == 1070
             float _shfl_xor_sync_34 = __shfl_xor_sync(0xFFFFFFFF, l[0], 1);
             l[0] = l[0] + _shfl_xor_sync_34;
             float _shfl_xor_sync_35 = __shfl_xor_sync(0xFFFFFFFF, l[1], 1);
@@ -1055,6 +1324,72 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
             l[6] = l[6] + _shfl_xor_sync_64;
             float _shfl_xor_sync_65 = __shfl_xor_sync(0xFFFFFFFF, l[7], 8);
             l[7] = l[7] + _shfl_xor_sync_65;
+#else
+            float _shfl_xor_sync_57 = __shfl_xor_sync(0xFFFFFFFF, l[0], 1);
+            l[0] = l[0] + _shfl_xor_sync_57;
+            float _shfl_xor_sync_58 = __shfl_xor_sync(0xFFFFFFFF, l[1], 1);
+            l[1] = l[1] + _shfl_xor_sync_58;
+            float _shfl_xor_sync_59 = __shfl_xor_sync(0xFFFFFFFF, l[2], 1);
+            l[2] = l[2] + _shfl_xor_sync_59;
+            float _shfl_xor_sync_60 = __shfl_xor_sync(0xFFFFFFFF, l[3], 1);
+            l[3] = l[3] + _shfl_xor_sync_60;
+            float _shfl_xor_sync_61 = __shfl_xor_sync(0xFFFFFFFF, l[4], 1);
+            l[4] = l[4] + _shfl_xor_sync_61;
+            float _shfl_xor_sync_62 = __shfl_xor_sync(0xFFFFFFFF, l[5], 1);
+            l[5] = l[5] + _shfl_xor_sync_62;
+            float _shfl_xor_sync_63 = __shfl_xor_sync(0xFFFFFFFF, l[6], 1);
+            l[6] = l[6] + _shfl_xor_sync_63;
+            float _shfl_xor_sync_64 = __shfl_xor_sync(0xFFFFFFFF, l[7], 1);
+            l[7] = l[7] + _shfl_xor_sync_64;
+            float _shfl_xor_sync_65 = __shfl_xor_sync(0xFFFFFFFF, l[0], 2);
+            l[0] = l[0] + _shfl_xor_sync_65;
+            float _shfl_xor_sync_66 = __shfl_xor_sync(0xFFFFFFFF, l[1], 2);
+            l[1] = l[1] + _shfl_xor_sync_66;
+            float _shfl_xor_sync_67 = __shfl_xor_sync(0xFFFFFFFF, l[2], 2);
+            l[2] = l[2] + _shfl_xor_sync_67;
+            float _shfl_xor_sync_68 = __shfl_xor_sync(0xFFFFFFFF, l[3], 2);
+            l[3] = l[3] + _shfl_xor_sync_68;
+            float _shfl_xor_sync_69 = __shfl_xor_sync(0xFFFFFFFF, l[4], 2);
+            l[4] = l[4] + _shfl_xor_sync_69;
+            float _shfl_xor_sync_70 = __shfl_xor_sync(0xFFFFFFFF, l[5], 2);
+            l[5] = l[5] + _shfl_xor_sync_70;
+            float _shfl_xor_sync_71 = __shfl_xor_sync(0xFFFFFFFF, l[6], 2);
+            l[6] = l[6] + _shfl_xor_sync_71;
+            float _shfl_xor_sync_72 = __shfl_xor_sync(0xFFFFFFFF, l[7], 2);
+            l[7] = l[7] + _shfl_xor_sync_72;
+            float _shfl_xor_sync_73 = __shfl_xor_sync(0xFFFFFFFF, l[0], 4);
+            l[0] = l[0] + _shfl_xor_sync_73;
+            float _shfl_xor_sync_74 = __shfl_xor_sync(0xFFFFFFFF, l[1], 4);
+            l[1] = l[1] + _shfl_xor_sync_74;
+            float _shfl_xor_sync_75 = __shfl_xor_sync(0xFFFFFFFF, l[2], 4);
+            l[2] = l[2] + _shfl_xor_sync_75;
+            float _shfl_xor_sync_76 = __shfl_xor_sync(0xFFFFFFFF, l[3], 4);
+            l[3] = l[3] + _shfl_xor_sync_76;
+            float _shfl_xor_sync_77 = __shfl_xor_sync(0xFFFFFFFF, l[4], 4);
+            l[4] = l[4] + _shfl_xor_sync_77;
+            float _shfl_xor_sync_78 = __shfl_xor_sync(0xFFFFFFFF, l[5], 4);
+            l[5] = l[5] + _shfl_xor_sync_78;
+            float _shfl_xor_sync_79 = __shfl_xor_sync(0xFFFFFFFF, l[6], 4);
+            l[6] = l[6] + _shfl_xor_sync_79;
+            float _shfl_xor_sync_80 = __shfl_xor_sync(0xFFFFFFFF, l[7], 4);
+            l[7] = l[7] + _shfl_xor_sync_80;
+            float _shfl_xor_sync_81 = __shfl_xor_sync(0xFFFFFFFF, l[0], 8);
+            l[0] = l[0] + _shfl_xor_sync_81;
+            float _shfl_xor_sync_82 = __shfl_xor_sync(0xFFFFFFFF, l[1], 8);
+            l[1] = l[1] + _shfl_xor_sync_82;
+            float _shfl_xor_sync_83 = __shfl_xor_sync(0xFFFFFFFF, l[2], 8);
+            l[2] = l[2] + _shfl_xor_sync_83;
+            float _shfl_xor_sync_84 = __shfl_xor_sync(0xFFFFFFFF, l[3], 8);
+            l[3] = l[3] + _shfl_xor_sync_84;
+            float _shfl_xor_sync_85 = __shfl_xor_sync(0xFFFFFFFF, l[4], 8);
+            l[4] = l[4] + _shfl_xor_sync_85;
+            float _shfl_xor_sync_86 = __shfl_xor_sync(0xFFFFFFFF, l[5], 8);
+            l[5] = l[5] + _shfl_xor_sync_86;
+            float _shfl_xor_sync_87 = __shfl_xor_sync(0xFFFFFFFF, l[6], 8);
+            l[6] = l[6] + _shfl_xor_sync_87;
+            float _shfl_xor_sync_88 = __shfl_xor_sync(0xFFFFFFFF, l[7], 8);
+            l[7] = l[7] + _shfl_xor_sync_88;
+#endif
             if ((lane_1 & 15) == 0) {
                 unsigned int pub_l = xchg_addr + (unsigned int)(4 * (64 + 16 * warp_1 + 8 * half));
                 asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(pub_l), "f"(l[0]), "f"(l[1]), "f"(l[2]), "f"(l[3]) : "memory");
@@ -1125,8 +1460,13 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                     : "=r"(*reinterpret_cast<uint32_t*>(&v[12])), "=r"(*reinterpret_cast<uint32_t*>(&v[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&v[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&v[(12) + 3]))
                     : "r"(o_src + 48));
                 bool has_values = l_r > 0.0f;
+#if __CUDA_ARCH__ == 1070
                 float _rcp_66 = approx_rcp(fmaxf(l_r, 1e-20f));
                 float inv = output_scale * _rcp_66;
+#else
+                float _rcp_89 = approx_rcp(fmaxf(l_r, 1e-20f));
+                float inv = output_scale * _rcp_89;
+#endif
                 v[0] = ((has_values) ? v[0] * inv : 0.0f);
                 v[1] = ((has_values) ? v[1] * inv : 0.0f);
                 v[2] = ((has_values) ? v[2] * inv : 0.0f);
@@ -1149,50 +1489,105 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                     long long out_off = row_i64 * out_stride_row + qo_head * out_stride_head + (long long)dim0;
                     float _vec_load_8[8];
                     {
+#if __CUDA_ARCH__ == 1070
                         const uint4* _vptr_67 = reinterpret_cast<const uint4*>(gate + gate_off + 0);
                         uint4 _vld_67[1];
+#else
+                        const uint4* _vptr_90 = reinterpret_cast<const uint4*>(gate + gate_off + 0);
+                        uint4 _vld_90[1];
+#endif
                         #pragma unroll
                         for (int _blk = 0; _blk < 1; _blk++) {
+#if __CUDA_ARCH__ == 1070
                             _vld_67[_blk] = _vptr_67[_blk];
                             uint32_t* _vpairs_67 = reinterpret_cast<uint32_t*>(&_vld_67[_blk]);
+#else
+                            _vld_90[_blk] = _vptr_90[_blk];
+                            uint32_t* _vpairs_90 = reinterpret_cast<uint32_t*>(&_vld_90[_blk]);
+#endif
                             #pragma unroll
                             for (int _pair = 0; _pair < 4; _pair++) {
+#if __CUDA_ARCH__ == 1070
                                 (&_vec_load_8[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_67[_pair]) << 16);
                                 (&_vec_load_8[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_67[_pair]) & 0xffff0000u);
+#else
+                                (&_vec_load_8[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_90[_pair]) << 16);
+                                (&_vec_load_8[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_90[_pair]) & 0xffff0000u);
+#endif
                             }
                         }
                     }
                     float attn = (float)(__nv_bfloat16)v[0];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_68 = approx_exp2((-_vec_load_8[0]) * 1.442695f);
                     float sigmoid = approx_rcp(1.0f + _exp2_68);
+#else
+                    float _exp2_91 = approx_exp2((-_vec_load_8[0]) * 1.442695f);
+                    float sigmoid = approx_rcp(1.0f + _exp2_91);
+#endif
                     gated[0] = attn * sigmoid;
                     float attn_0 = (float)(__nv_bfloat16)v[1];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_69 = approx_exp2((-_vec_load_8[1]) * 1.442695f);
                     float sigmoid_1 = approx_rcp(1.0f + _exp2_69);
+#else
+                    float _exp2_92 = approx_exp2((-_vec_load_8[1]) * 1.442695f);
+                    float sigmoid_1 = approx_rcp(1.0f + _exp2_92);
+#endif
                     gated[1] = attn_0 * sigmoid_1;
                     float attn_2 = (float)(__nv_bfloat16)v[2];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_70 = approx_exp2((-_vec_load_8[2]) * 1.442695f);
                     float sigmoid_3 = approx_rcp(1.0f + _exp2_70);
+#else
+                    float _exp2_93 = approx_exp2((-_vec_load_8[2]) * 1.442695f);
+                    float sigmoid_3 = approx_rcp(1.0f + _exp2_93);
+#endif
                     gated[2] = attn_2 * sigmoid_3;
                     float attn_4 = (float)(__nv_bfloat16)v[3];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_71 = approx_exp2((-_vec_load_8[3]) * 1.442695f);
                     float sigmoid_5 = approx_rcp(1.0f + _exp2_71);
+#else
+                    float _exp2_94 = approx_exp2((-_vec_load_8[3]) * 1.442695f);
+                    float sigmoid_5 = approx_rcp(1.0f + _exp2_94);
+#endif
                     gated[3] = attn_4 * sigmoid_5;
                     float attn_6 = (float)(__nv_bfloat16)v[4];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_72 = approx_exp2((-_vec_load_8[4]) * 1.442695f);
                     float sigmoid_7 = approx_rcp(1.0f + _exp2_72);
+#else
+                    float _exp2_95 = approx_exp2((-_vec_load_8[4]) * 1.442695f);
+                    float sigmoid_7 = approx_rcp(1.0f + _exp2_95);
+#endif
                     gated[4] = attn_6 * sigmoid_7;
                     float attn_8 = (float)(__nv_bfloat16)v[5];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_73 = approx_exp2((-_vec_load_8[5]) * 1.442695f);
                     float sigmoid_9 = approx_rcp(1.0f + _exp2_73);
+#else
+                    float _exp2_96 = approx_exp2((-_vec_load_8[5]) * 1.442695f);
+                    float sigmoid_9 = approx_rcp(1.0f + _exp2_96);
+#endif
                     gated[5] = attn_8 * sigmoid_9;
                     float attn_10 = (float)(__nv_bfloat16)v[6];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_74 = approx_exp2((-_vec_load_8[6]) * 1.442695f);
                     float sigmoid_11 = approx_rcp(1.0f + _exp2_74);
+#else
+                    float _exp2_97 = approx_exp2((-_vec_load_8[6]) * 1.442695f);
+                    float sigmoid_11 = approx_rcp(1.0f + _exp2_97);
+#endif
                     gated[6] = attn_10 * sigmoid_11;
                     float attn_12 = (float)(__nv_bfloat16)v[7];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_75 = approx_exp2((-_vec_load_8[7]) * 1.442695f);
                     float sigmoid_13 = approx_rcp(1.0f + _exp2_75);
+#else
+                    float _exp2_98 = approx_exp2((-_vec_load_8[7]) * 1.442695f);
+                    float sigmoid_13 = approx_rcp(1.0f + _exp2_98);
+#endif
                     gated[7] = attn_12 * sigmoid_13;
                     unsigned int _packed_0[4];
                     #pragma unroll
@@ -1218,50 +1613,105 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                     reinterpret_cast<int4*>(out + out_off)[0] = reinterpret_cast<int4*>(_packed_0)[0];
                     float _vec_load_9[8];
                     {
+#if __CUDA_ARCH__ == 1070
                         const uint4* _vptr_76 = reinterpret_cast<const uint4*>(gate + (gate_off + 8) + 0);
                         uint4 _vld_76[1];
+#else
+                        const uint4* _vptr_99 = reinterpret_cast<const uint4*>(gate + (gate_off + 8) + 0);
+                        uint4 _vld_99[1];
+#endif
                         #pragma unroll
                         for (int _blk = 0; _blk < 1; _blk++) {
+#if __CUDA_ARCH__ == 1070
                             _vld_76[_blk] = _vptr_76[_blk];
                             uint32_t* _vpairs_76 = reinterpret_cast<uint32_t*>(&_vld_76[_blk]);
+#else
+                            _vld_99[_blk] = _vptr_99[_blk];
+                            uint32_t* _vpairs_99 = reinterpret_cast<uint32_t*>(&_vld_99[_blk]);
+#endif
                             #pragma unroll
                             for (int _pair = 0; _pair < 4; _pair++) {
+#if __CUDA_ARCH__ == 1070
                                 (&_vec_load_9[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_76[_pair]) << 16);
                                 (&_vec_load_9[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_76[_pair]) & 0xffff0000u);
+#else
+                                (&_vec_load_9[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_99[_pair]) << 16);
+                                (&_vec_load_9[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_99[_pair]) & 0xffff0000u);
+#endif
                             }
                         }
                     }
                     float attn_14 = (float)(__nv_bfloat16)v[8];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_77 = approx_exp2((-_vec_load_9[0]) * 1.442695f);
                     float sigmoid_15 = approx_rcp(1.0f + _exp2_77);
+#else
+                    float _exp2_100 = approx_exp2((-_vec_load_9[0]) * 1.442695f);
+                    float sigmoid_15 = approx_rcp(1.0f + _exp2_100);
+#endif
                     gated[0] = attn_14 * sigmoid_15;
                     float attn_16 = (float)(__nv_bfloat16)v[9];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_78 = approx_exp2((-_vec_load_9[1]) * 1.442695f);
                     float sigmoid_17 = approx_rcp(1.0f + _exp2_78);
+#else
+                    float _exp2_101 = approx_exp2((-_vec_load_9[1]) * 1.442695f);
+                    float sigmoid_17 = approx_rcp(1.0f + _exp2_101);
+#endif
                     gated[1] = attn_16 * sigmoid_17;
                     float attn_18 = (float)(__nv_bfloat16)v[10];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_79 = approx_exp2((-_vec_load_9[2]) * 1.442695f);
                     float sigmoid_19 = approx_rcp(1.0f + _exp2_79);
+#else
+                    float _exp2_102 = approx_exp2((-_vec_load_9[2]) * 1.442695f);
+                    float sigmoid_19 = approx_rcp(1.0f + _exp2_102);
+#endif
                     gated[2] = attn_18 * sigmoid_19;
                     float attn_20 = (float)(__nv_bfloat16)v[11];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_80 = approx_exp2((-_vec_load_9[3]) * 1.442695f);
                     float sigmoid_21 = approx_rcp(1.0f + _exp2_80);
+#else
+                    float _exp2_103 = approx_exp2((-_vec_load_9[3]) * 1.442695f);
+                    float sigmoid_21 = approx_rcp(1.0f + _exp2_103);
+#endif
                     gated[3] = attn_20 * sigmoid_21;
                     float attn_22 = (float)(__nv_bfloat16)v[12];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_81 = approx_exp2((-_vec_load_9[4]) * 1.442695f);
                     float sigmoid_23 = approx_rcp(1.0f + _exp2_81);
+#else
+                    float _exp2_104 = approx_exp2((-_vec_load_9[4]) * 1.442695f);
+                    float sigmoid_23 = approx_rcp(1.0f + _exp2_104);
+#endif
                     gated[4] = attn_22 * sigmoid_23;
                     float attn_24 = (float)(__nv_bfloat16)v[13];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_82 = approx_exp2((-_vec_load_9[5]) * 1.442695f);
                     float sigmoid_25 = approx_rcp(1.0f + _exp2_82);
+#else
+                    float _exp2_105 = approx_exp2((-_vec_load_9[5]) * 1.442695f);
+                    float sigmoid_25 = approx_rcp(1.0f + _exp2_105);
+#endif
                     gated[5] = attn_24 * sigmoid_25;
                     float attn_26 = (float)(__nv_bfloat16)v[14];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_83 = approx_exp2((-_vec_load_9[6]) * 1.442695f);
                     float sigmoid_27 = approx_rcp(1.0f + _exp2_83);
+#else
+                    float _exp2_106 = approx_exp2((-_vec_load_9[6]) * 1.442695f);
+                    float sigmoid_27 = approx_rcp(1.0f + _exp2_106);
+#endif
                     gated[6] = attn_26 * sigmoid_27;
                     float attn_28 = (float)(__nv_bfloat16)v[15];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_84 = approx_exp2((-_vec_load_9[7]) * 1.442695f);
                     float sigmoid_29 = approx_rcp(1.0f + _exp2_84);
+#else
+                    float _exp2_107 = approx_exp2((-_vec_load_9[7]) * 1.442695f);
+                    float sigmoid_29 = approx_rcp(1.0f + _exp2_107);
+#endif
                     gated[7] = attn_28 * sigmoid_29;
                     unsigned int _packed_1[4];
                     #pragma unroll
@@ -1305,9 +1755,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                         *reinterpret_cast<float4*>((partial_out + (partial_off + 12)) + 0) = _v4;
                     }
                     if (warp_1 == 0 && t == 0) {
+#if __CUDA_ARCH__ == 1070
                         float _log2_85;
                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_85) : "f"(l_r));
                         *(reinterpret_cast<float*>(partial_lse + partial_row) + (0)) = ((has_values) ? m_r + _log2_85 : -CUDART_INF_F);
+#else
+                        float _log2_108;
+                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_108) : "f"(l_r));
+                        *(reinterpret_cast<float*>(partial_lse + partial_row) + (0)) = ((has_values) ? m_r + _log2_108 : -CUDART_INF_F);
+#endif
                     }
                 }
             }
@@ -1332,8 +1788,13 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                     : "=r"(*reinterpret_cast<uint32_t*>(&v[12])), "=r"(*reinterpret_cast<uint32_t*>(&v[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&v[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&v[(12) + 3]))
                     : "r"(o_src_1 + 48));
                 bool has_values_1 = l_r_1 > 0.0f;
+#if __CUDA_ARCH__ == 1070
                 float _rcp_86 = approx_rcp(fmaxf(l_r_1, 1e-20f));
                 float inv_1 = output_scale * _rcp_86;
+#else
+                float _rcp_109 = approx_rcp(fmaxf(l_r_1, 1e-20f));
+                float inv_1 = output_scale * _rcp_109;
+#endif
                 v[0] = ((has_values_1) ? v[0] * inv_1 : 0.0f);
                 v[1] = ((has_values_1) ? v[1] * inv_1 : 0.0f);
                 v[2] = ((has_values_1) ? v[2] * inv_1 : 0.0f);
@@ -1356,50 +1817,105 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                     long long out_off_1 = row_i64 * out_stride_row + qo_head_1 * out_stride_head + (long long)dim0;
                     float _vec_load_10[8];
                     {
+#if __CUDA_ARCH__ == 1070
                         const uint4* _vptr_87 = reinterpret_cast<const uint4*>(gate + gate_off_1 + 0);
                         uint4 _vld_87[1];
+#else
+                        const uint4* _vptr_110 = reinterpret_cast<const uint4*>(gate + gate_off_1 + 0);
+                        uint4 _vld_110[1];
+#endif
                         #pragma unroll
                         for (int _blk = 0; _blk < 1; _blk++) {
+#if __CUDA_ARCH__ == 1070
                             _vld_87[_blk] = _vptr_87[_blk];
                             uint32_t* _vpairs_87 = reinterpret_cast<uint32_t*>(&_vld_87[_blk]);
+#else
+                            _vld_110[_blk] = _vptr_110[_blk];
+                            uint32_t* _vpairs_110 = reinterpret_cast<uint32_t*>(&_vld_110[_blk]);
+#endif
                             #pragma unroll
                             for (int _pair = 0; _pair < 4; _pair++) {
+#if __CUDA_ARCH__ == 1070
                                 (&_vec_load_10[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_87[_pair]) << 16);
                                 (&_vec_load_10[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_87[_pair]) & 0xffff0000u);
+#else
+                                (&_vec_load_10[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_110[_pair]) << 16);
+                                (&_vec_load_10[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_110[_pair]) & 0xffff0000u);
+#endif
                             }
                         }
                     }
                     float attn_1 = (float)(__nv_bfloat16)v[0];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_88 = approx_exp2((-_vec_load_10[0]) * 1.442695f);
                     float sigmoid_2 = approx_rcp(1.0f + _exp2_88);
+#else
+                    float _exp2_111 = approx_exp2((-_vec_load_10[0]) * 1.442695f);
+                    float sigmoid_2 = approx_rcp(1.0f + _exp2_111);
+#endif
                     gated[0] = attn_1 * sigmoid_2;
                     float attn_0_1 = (float)(__nv_bfloat16)v[1];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_89 = approx_exp2((-_vec_load_10[1]) * 1.442695f);
                     float sigmoid_1_1 = approx_rcp(1.0f + _exp2_89);
+#else
+                    float _exp2_112 = approx_exp2((-_vec_load_10[1]) * 1.442695f);
+                    float sigmoid_1_1 = approx_rcp(1.0f + _exp2_112);
+#endif
                     gated[1] = attn_0_1 * sigmoid_1_1;
                     float attn_2_1 = (float)(__nv_bfloat16)v[2];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_90 = approx_exp2((-_vec_load_10[2]) * 1.442695f);
                     float sigmoid_3_1 = approx_rcp(1.0f + _exp2_90);
+#else
+                    float _exp2_113 = approx_exp2((-_vec_load_10[2]) * 1.442695f);
+                    float sigmoid_3_1 = approx_rcp(1.0f + _exp2_113);
+#endif
                     gated[2] = attn_2_1 * sigmoid_3_1;
                     float attn_4_1 = (float)(__nv_bfloat16)v[3];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_91 = approx_exp2((-_vec_load_10[3]) * 1.442695f);
                     float sigmoid_5_1 = approx_rcp(1.0f + _exp2_91);
+#else
+                    float _exp2_114 = approx_exp2((-_vec_load_10[3]) * 1.442695f);
+                    float sigmoid_5_1 = approx_rcp(1.0f + _exp2_114);
+#endif
                     gated[3] = attn_4_1 * sigmoid_5_1;
                     float attn_6_1 = (float)(__nv_bfloat16)v[4];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_92 = approx_exp2((-_vec_load_10[4]) * 1.442695f);
                     float sigmoid_7_1 = approx_rcp(1.0f + _exp2_92);
+#else
+                    float _exp2_115 = approx_exp2((-_vec_load_10[4]) * 1.442695f);
+                    float sigmoid_7_1 = approx_rcp(1.0f + _exp2_115);
+#endif
                     gated[4] = attn_6_1 * sigmoid_7_1;
                     float attn_8_1 = (float)(__nv_bfloat16)v[5];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_93 = approx_exp2((-_vec_load_10[5]) * 1.442695f);
                     float sigmoid_9_1 = approx_rcp(1.0f + _exp2_93);
+#else
+                    float _exp2_116 = approx_exp2((-_vec_load_10[5]) * 1.442695f);
+                    float sigmoid_9_1 = approx_rcp(1.0f + _exp2_116);
+#endif
                     gated[5] = attn_8_1 * sigmoid_9_1;
                     float attn_10_1 = (float)(__nv_bfloat16)v[6];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_94 = approx_exp2((-_vec_load_10[6]) * 1.442695f);
                     float sigmoid_11_1 = approx_rcp(1.0f + _exp2_94);
+#else
+                    float _exp2_117 = approx_exp2((-_vec_load_10[6]) * 1.442695f);
+                    float sigmoid_11_1 = approx_rcp(1.0f + _exp2_117);
+#endif
                     gated[6] = attn_10_1 * sigmoid_11_1;
                     float attn_12_1 = (float)(__nv_bfloat16)v[7];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_95 = approx_exp2((-_vec_load_10[7]) * 1.442695f);
                     float sigmoid_13_1 = approx_rcp(1.0f + _exp2_95);
+#else
+                    float _exp2_118 = approx_exp2((-_vec_load_10[7]) * 1.442695f);
+                    float sigmoid_13_1 = approx_rcp(1.0f + _exp2_118);
+#endif
                     gated[7] = attn_12_1 * sigmoid_13_1;
                     unsigned int _packed_2[4];
                     #pragma unroll
@@ -1425,50 +1941,105 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                     reinterpret_cast<int4*>(out + out_off_1)[0] = reinterpret_cast<int4*>(_packed_2)[0];
                     float _vec_load_11[8];
                     {
+#if __CUDA_ARCH__ == 1070
                         const uint4* _vptr_96 = reinterpret_cast<const uint4*>(gate + (gate_off_1 + 8) + 0);
                         uint4 _vld_96[1];
+#else
+                        const uint4* _vptr_119 = reinterpret_cast<const uint4*>(gate + (gate_off_1 + 8) + 0);
+                        uint4 _vld_119[1];
+#endif
                         #pragma unroll
                         for (int _blk = 0; _blk < 1; _blk++) {
+#if __CUDA_ARCH__ == 1070
                             _vld_96[_blk] = _vptr_96[_blk];
                             uint32_t* _vpairs_96 = reinterpret_cast<uint32_t*>(&_vld_96[_blk]);
+#else
+                            _vld_119[_blk] = _vptr_119[_blk];
+                            uint32_t* _vpairs_119 = reinterpret_cast<uint32_t*>(&_vld_119[_blk]);
+#endif
                             #pragma unroll
                             for (int _pair = 0; _pair < 4; _pair++) {
+#if __CUDA_ARCH__ == 1070
                                 (&_vec_load_11[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_96[_pair]) << 16);
                                 (&_vec_load_11[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_96[_pair]) & 0xffff0000u);
+#else
+                                (&_vec_load_11[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_119[_pair]) << 16);
+                                (&_vec_load_11[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_119[_pair]) & 0xffff0000u);
+#endif
                             }
                         }
                     }
                     float attn_14_1 = (float)(__nv_bfloat16)v[8];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_97 = approx_exp2((-_vec_load_11[0]) * 1.442695f);
                     float sigmoid_15_1 = approx_rcp(1.0f + _exp2_97);
+#else
+                    float _exp2_120 = approx_exp2((-_vec_load_11[0]) * 1.442695f);
+                    float sigmoid_15_1 = approx_rcp(1.0f + _exp2_120);
+#endif
                     gated[0] = attn_14_1 * sigmoid_15_1;
                     float attn_16_1 = (float)(__nv_bfloat16)v[9];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_98 = approx_exp2((-_vec_load_11[1]) * 1.442695f);
                     float sigmoid_17_1 = approx_rcp(1.0f + _exp2_98);
+#else
+                    float _exp2_121 = approx_exp2((-_vec_load_11[1]) * 1.442695f);
+                    float sigmoid_17_1 = approx_rcp(1.0f + _exp2_121);
+#endif
                     gated[1] = attn_16_1 * sigmoid_17_1;
                     float attn_18_1 = (float)(__nv_bfloat16)v[10];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_99 = approx_exp2((-_vec_load_11[2]) * 1.442695f);
                     float sigmoid_19_1 = approx_rcp(1.0f + _exp2_99);
+#else
+                    float _exp2_122 = approx_exp2((-_vec_load_11[2]) * 1.442695f);
+                    float sigmoid_19_1 = approx_rcp(1.0f + _exp2_122);
+#endif
                     gated[2] = attn_18_1 * sigmoid_19_1;
                     float attn_20_1 = (float)(__nv_bfloat16)v[11];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_100 = approx_exp2((-_vec_load_11[3]) * 1.442695f);
                     float sigmoid_21_1 = approx_rcp(1.0f + _exp2_100);
+#else
+                    float _exp2_123 = approx_exp2((-_vec_load_11[3]) * 1.442695f);
+                    float sigmoid_21_1 = approx_rcp(1.0f + _exp2_123);
+#endif
                     gated[3] = attn_20_1 * sigmoid_21_1;
                     float attn_22_1 = (float)(__nv_bfloat16)v[12];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_101 = approx_exp2((-_vec_load_11[4]) * 1.442695f);
                     float sigmoid_23_1 = approx_rcp(1.0f + _exp2_101);
+#else
+                    float _exp2_124 = approx_exp2((-_vec_load_11[4]) * 1.442695f);
+                    float sigmoid_23_1 = approx_rcp(1.0f + _exp2_124);
+#endif
                     gated[4] = attn_22_1 * sigmoid_23_1;
                     float attn_24_1 = (float)(__nv_bfloat16)v[13];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_102 = approx_exp2((-_vec_load_11[5]) * 1.442695f);
                     float sigmoid_25_1 = approx_rcp(1.0f + _exp2_102);
+#else
+                    float _exp2_125 = approx_exp2((-_vec_load_11[5]) * 1.442695f);
+                    float sigmoid_25_1 = approx_rcp(1.0f + _exp2_125);
+#endif
                     gated[5] = attn_24_1 * sigmoid_25_1;
                     float attn_26_1 = (float)(__nv_bfloat16)v[14];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_103 = approx_exp2((-_vec_load_11[6]) * 1.442695f);
                     float sigmoid_27_1 = approx_rcp(1.0f + _exp2_103);
+#else
+                    float _exp2_126 = approx_exp2((-_vec_load_11[6]) * 1.442695f);
+                    float sigmoid_27_1 = approx_rcp(1.0f + _exp2_126);
+#endif
                     gated[6] = attn_26_1 * sigmoid_27_1;
                     float attn_28_1 = (float)(__nv_bfloat16)v[15];
+#if __CUDA_ARCH__ == 1070
                     float _exp2_104 = approx_exp2((-_vec_load_11[7]) * 1.442695f);
                     float sigmoid_29_1 = approx_rcp(1.0f + _exp2_104);
+#else
+                    float _exp2_127 = approx_exp2((-_vec_load_11[7]) * 1.442695f);
+                    float sigmoid_29_1 = approx_rcp(1.0f + _exp2_127);
+#endif
                     gated[7] = attn_28_1 * sigmoid_29_1;
                     unsigned int _packed_3[4];
                     #pragma unroll
@@ -1512,9 +2083,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                         *reinterpret_cast<float4*>((partial_out + (partial_off_1 + 12)) + 0) = _v4;
                     }
                     if (warp_1 == 0 && t == 0) {
+#if __CUDA_ARCH__ == 1070
                         float _log2_105;
                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_105) : "f"(l_r_1));
                         *(reinterpret_cast<float*>(partial_lse + partial_row_1) + (0)) = ((has_values_1) ? m_r_1 + _log2_105 : -CUDART_INF_F);
+#else
+                        float _log2_128;
+                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_128) : "f"(l_r_1));
+                        *(reinterpret_cast<float*>(partial_lse + partial_row_1) + (0)) = ((has_values_1) ? m_r_1 + _log2_128 : -CUDART_INF_F);
+#endif
                     }
                 }
             }
@@ -1533,6 +2110,7 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                             : "=r"(old) : "l"(&merge_counters[cidx]), "r"(static_cast<uint32_t>(nb)) : "memory");
                         unsigned int target = (old ^ flip) & flip;
                         {
+#if __CUDA_ARCH__ == 1070
                             unsigned int _poll_v_106;
                             unsigned long long _poll_t0_106;
                             asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(_poll_t0_106) :: "memory");
@@ -1541,9 +2119,23 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 unsigned long long _poll_now_106;
                                 asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(_poll_now_106) :: "memory");
                                 if (_poll_now_106 - _poll_t0_106 > 4000000000ull) {
+#else
+                            unsigned int _poll_v_129;
+                            unsigned long long _poll_t0_129;
+                            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(_poll_t0_129) :: "memory");
+                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_poll_v_129) : "l"((reinterpret_cast<unsigned int*>(merge_counters) + (cidx))) : "memory");
+                            while (((_poll_v_129 ^ static_cast<unsigned int>(target)) & static_cast<unsigned int>(2147483648)) != 0) {
+                                unsigned long long _poll_now_129;
+                                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(_poll_now_129) :: "memory");
+                                if (_poll_now_129 - _poll_t0_129 > 4000000000ull) {
+#endif
                                     asm volatile("trap;" ::: "memory");
                                 }
+#if __CUDA_ARCH__ == 1070
                                 asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_poll_v_106) : "l"((reinterpret_cast<unsigned int*>(merge_counters) + (cidx))) : "memory");
+#else
+                                asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_poll_v_129) : "l"((reinterpret_cast<unsigned int*>(merge_counters) + (cidx))) : "memory");
+#endif
                             }
                         }
                     }
@@ -1576,6 +2168,7 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                             for (int s_1 = lane_1; s_1 < num_splits; s_1 += 32) {
                                 hmax = fmaxf(hmax, lse_tab[h_1 * num_splits + s_1]);
                             }
+#if __CUDA_ARCH__ == 1070
                             float _shfl_xor_sync_107 = __shfl_xor_sync(0xFFFFFFFF, hmax, 16);
                             hmax = fmaxf(hmax, _shfl_xor_sync_107);
                             float _shfl_xor_sync_108 = __shfl_xor_sync(0xFFFFFFFF, hmax, 8);
@@ -1586,6 +2179,18 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                             hmax = fmaxf(hmax, _shfl_xor_sync_110);
                             float _shfl_xor_sync_111 = __shfl_xor_sync(0xFFFFFFFF, hmax, 1);
                             hmax = fmaxf(hmax, _shfl_xor_sync_111);
+#else
+                            float _shfl_xor_sync_130 = __shfl_xor_sync(0xFFFFFFFF, hmax, 16);
+                            hmax = fmaxf(hmax, _shfl_xor_sync_130);
+                            float _shfl_xor_sync_131 = __shfl_xor_sync(0xFFFFFFFF, hmax, 8);
+                            hmax = fmaxf(hmax, _shfl_xor_sync_131);
+                            float _shfl_xor_sync_132 = __shfl_xor_sync(0xFFFFFFFF, hmax, 4);
+                            hmax = fmaxf(hmax, _shfl_xor_sync_132);
+                            float _shfl_xor_sync_133 = __shfl_xor_sync(0xFFFFFFFF, hmax, 2);
+                            hmax = fmaxf(hmax, _shfl_xor_sync_133);
+                            float _shfl_xor_sync_134 = __shfl_xor_sync(0xFFFFFFFF, hmax, 1);
+                            hmax = fmaxf(hmax, _shfl_xor_sync_134);
+#endif
                             if (lane_1 == 0) {
                                 max_tab[h_1] = hmax;
                             }
@@ -1635,10 +2240,17 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                             lse_max[0] = max_tab[head_0 - head_first];
                             float _vec_load_12[2];
                             {
+#if __CUDA_ARCH__ == 1070
                                 uint32_t _bf16x2_bits_112;
                                 _bf16x2_bits_112 = *reinterpret_cast<const uint32_t*>(gate + (row_head[0] * 256 + dim[0]) + 0);
                                 (&_vec_load_12[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_112) << 16);
                                 (&_vec_load_12[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_112) & 0xffff0000u);
+#else
+                                uint32_t _bf16x2_bits_135;
+                                _bf16x2_bits_135 = *reinterpret_cast<const uint32_t*>(gate + (row_head[0] * 256 + dim[0]) + 0);
+                                (&_vec_load_12[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_135) << 16);
+                                (&_vec_load_12[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_135) & 0xffff0000u);
+#endif
                             }
                             gate0[0] = _vec_load_12[0];
                             gate1[0] = _vec_load_12[1];
@@ -1650,9 +2262,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row = (long long)base * split_pitch + row_head[0];
                                     float _vec_load_13[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_113 = *reinterpret_cast<const float2*>(partial_out + (part_row * 256 + dim[0]) + 0);
                                         _vec_load_13[0] = _v2_113.x;
                                         _vec_load_13[0 + 1] = _v2_113.y;
+#else
+                                        float2 _v2_136 = *reinterpret_cast<const float2*>(partial_out + (part_row * 256 + dim[0]) + 0);
+                                        _vec_load_13[0] = _v2_136.x;
+                                        _vec_load_13[0 + 1] = _v2_136.y;
+#endif
                                     }
                                     p0[0] = _vec_load_13[0];
                                     p1[0] = _vec_load_13[1];
@@ -1661,9 +2279,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_1 = (long long)(base + 1) * split_pitch + row_head[0];
                                     float _vec_load_14[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_114 = *reinterpret_cast<const float2*>(partial_out + (part_row_1 * 256 + dim[0]) + 0);
                                         _vec_load_14[0] = _v2_114.x;
                                         _vec_load_14[0 + 1] = _v2_114.y;
+#else
+                                        float2 _v2_137 = *reinterpret_cast<const float2*>(partial_out + (part_row_1 * 256 + dim[0]) + 0);
+                                        _vec_load_14[0] = _v2_137.x;
+                                        _vec_load_14[0 + 1] = _v2_137.y;
+#endif
                                     }
                                     p0[1] = _vec_load_14[0];
                                     p1[1] = _vec_load_14[1];
@@ -1672,9 +2296,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_2 = (long long)(base + 2) * split_pitch + row_head[0];
                                     float _vec_load_15[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_115 = *reinterpret_cast<const float2*>(partial_out + (part_row_2 * 256 + dim[0]) + 0);
                                         _vec_load_15[0] = _v2_115.x;
                                         _vec_load_15[0 + 1] = _v2_115.y;
+#else
+                                        float2 _v2_138 = *reinterpret_cast<const float2*>(partial_out + (part_row_2 * 256 + dim[0]) + 0);
+                                        _vec_load_15[0] = _v2_138.x;
+                                        _vec_load_15[0 + 1] = _v2_138.y;
+#endif
                                     }
                                     p0[2] = _vec_load_15[0];
                                     p1[2] = _vec_load_15[1];
@@ -1683,9 +2313,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_3 = (long long)(base + 3) * split_pitch + row_head[0];
                                     float _vec_load_16[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_116 = *reinterpret_cast<const float2*>(partial_out + (part_row_3 * 256 + dim[0]) + 0);
                                         _vec_load_16[0] = _v2_116.x;
                                         _vec_load_16[0 + 1] = _v2_116.y;
+#else
+                                        float2 _v2_139 = *reinterpret_cast<const float2*>(partial_out + (part_row_3 * 256 + dim[0]) + 0);
+                                        _vec_load_16[0] = _v2_139.x;
+                                        _vec_load_16[0 + 1] = _v2_139.y;
+#endif
                                     }
                                     p0[3] = _vec_load_16[0];
                                     p1[3] = _vec_load_16[1];
@@ -1694,9 +2330,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_4 = (long long)(base + 4) * split_pitch + row_head[0];
                                     float _vec_load_17[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_117 = *reinterpret_cast<const float2*>(partial_out + (part_row_4 * 256 + dim[0]) + 0);
                                         _vec_load_17[0] = _v2_117.x;
                                         _vec_load_17[0 + 1] = _v2_117.y;
+#else
+                                        float2 _v2_140 = *reinterpret_cast<const float2*>(partial_out + (part_row_4 * 256 + dim[0]) + 0);
+                                        _vec_load_17[0] = _v2_140.x;
+                                        _vec_load_17[0 + 1] = _v2_140.y;
+#endif
                                     }
                                     p0[4] = _vec_load_17[0];
                                     p1[4] = _vec_load_17[1];
@@ -1705,9 +2347,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_5 = (long long)(base + 5) * split_pitch + row_head[0];
                                     float _vec_load_18[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_118 = *reinterpret_cast<const float2*>(partial_out + (part_row_5 * 256 + dim[0]) + 0);
                                         _vec_load_18[0] = _v2_118.x;
                                         _vec_load_18[0 + 1] = _v2_118.y;
+#else
+                                        float2 _v2_141 = *reinterpret_cast<const float2*>(partial_out + (part_row_5 * 256 + dim[0]) + 0);
+                                        _vec_load_18[0] = _v2_141.x;
+                                        _vec_load_18[0 + 1] = _v2_141.y;
+#endif
                                     }
                                     p0[5] = _vec_load_18[0];
                                     p1[5] = _vec_load_18[1];
@@ -1716,9 +2364,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_6 = (long long)(base + 6) * split_pitch + row_head[0];
                                     float _vec_load_19[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_119 = *reinterpret_cast<const float2*>(partial_out + (part_row_6 * 256 + dim[0]) + 0);
                                         _vec_load_19[0] = _v2_119.x;
                                         _vec_load_19[0 + 1] = _v2_119.y;
+#else
+                                        float2 _v2_142 = *reinterpret_cast<const float2*>(partial_out + (part_row_6 * 256 + dim[0]) + 0);
+                                        _vec_load_19[0] = _v2_142.x;
+                                        _vec_load_19[0 + 1] = _v2_142.y;
+#endif
                                     }
                                     p0[6] = _vec_load_19[0];
                                     p1[6] = _vec_load_19[1];
@@ -1727,9 +2381,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_7 = (long long)(base + 7) * split_pitch + row_head[0];
                                     float _vec_load_20[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_120 = *reinterpret_cast<const float2*>(partial_out + (part_row_7 * 256 + dim[0]) + 0);
                                         _vec_load_20[0] = _v2_120.x;
                                         _vec_load_20[0 + 1] = _v2_120.y;
+#else
+                                        float2 _v2_143 = *reinterpret_cast<const float2*>(partial_out + (part_row_7 * 256 + dim[0]) + 0);
+                                        _vec_load_20[0] = _v2_143.x;
+                                        _vec_load_20[0 + 1] = _v2_143.y;
+#endif
                                     }
                                     p0[7] = _vec_load_20[0];
                                     p1[7] = _vec_load_20[1];
@@ -1738,9 +2398,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_8 = (long long)(base + 8) * split_pitch + row_head[0];
                                     float _vec_load_21[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_121 = *reinterpret_cast<const float2*>(partial_out + (part_row_8 * 256 + dim[0]) + 0);
                                         _vec_load_21[0] = _v2_121.x;
                                         _vec_load_21[0 + 1] = _v2_121.y;
+#else
+                                        float2 _v2_144 = *reinterpret_cast<const float2*>(partial_out + (part_row_8 * 256 + dim[0]) + 0);
+                                        _vec_load_21[0] = _v2_144.x;
+                                        _vec_load_21[0 + 1] = _v2_144.y;
+#endif
                                     }
                                     p0[8] = _vec_load_21[0];
                                     p1[8] = _vec_load_21[1];
@@ -1749,9 +2415,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_9 = (long long)(base + 9) * split_pitch + row_head[0];
                                     float _vec_load_22[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_122 = *reinterpret_cast<const float2*>(partial_out + (part_row_9 * 256 + dim[0]) + 0);
                                         _vec_load_22[0] = _v2_122.x;
                                         _vec_load_22[0 + 1] = _v2_122.y;
+#else
+                                        float2 _v2_145 = *reinterpret_cast<const float2*>(partial_out + (part_row_9 * 256 + dim[0]) + 0);
+                                        _vec_load_22[0] = _v2_145.x;
+                                        _vec_load_22[0 + 1] = _v2_145.y;
+#endif
                                     }
                                     p0[9] = _vec_load_22[0];
                                     p1[9] = _vec_load_22[1];
@@ -1760,9 +2432,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_10 = (long long)(base + 10) * split_pitch + row_head[0];
                                     float _vec_load_23[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_123 = *reinterpret_cast<const float2*>(partial_out + (part_row_10 * 256 + dim[0]) + 0);
                                         _vec_load_23[0] = _v2_123.x;
                                         _vec_load_23[0 + 1] = _v2_123.y;
+#else
+                                        float2 _v2_146 = *reinterpret_cast<const float2*>(partial_out + (part_row_10 * 256 + dim[0]) + 0);
+                                        _vec_load_23[0] = _v2_146.x;
+                                        _vec_load_23[0 + 1] = _v2_146.y;
+#endif
                                     }
                                     p0[10] = _vec_load_23[0];
                                     p1[10] = _vec_load_23[1];
@@ -1771,9 +2449,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_11 = (long long)(base + 11) * split_pitch + row_head[0];
                                     float _vec_load_24[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_124 = *reinterpret_cast<const float2*>(partial_out + (part_row_11 * 256 + dim[0]) + 0);
                                         _vec_load_24[0] = _v2_124.x;
                                         _vec_load_24[0 + 1] = _v2_124.y;
+#else
+                                        float2 _v2_147 = *reinterpret_cast<const float2*>(partial_out + (part_row_11 * 256 + dim[0]) + 0);
+                                        _vec_load_24[0] = _v2_147.x;
+                                        _vec_load_24[0 + 1] = _v2_147.y;
+#endif
                                     }
                                     p0[11] = _vec_load_24[0];
                                     p1[11] = _vec_load_24[1];
@@ -1782,9 +2466,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_12 = (long long)(base + 12) * split_pitch + row_head[0];
                                     float _vec_load_25[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_125 = *reinterpret_cast<const float2*>(partial_out + (part_row_12 * 256 + dim[0]) + 0);
                                         _vec_load_25[0] = _v2_125.x;
                                         _vec_load_25[0 + 1] = _v2_125.y;
+#else
+                                        float2 _v2_148 = *reinterpret_cast<const float2*>(partial_out + (part_row_12 * 256 + dim[0]) + 0);
+                                        _vec_load_25[0] = _v2_148.x;
+                                        _vec_load_25[0 + 1] = _v2_148.y;
+#endif
                                     }
                                     p0[12] = _vec_load_25[0];
                                     p1[12] = _vec_load_25[1];
@@ -1793,9 +2483,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_13 = (long long)(base + 13) * split_pitch + row_head[0];
                                     float _vec_load_26[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_126 = *reinterpret_cast<const float2*>(partial_out + (part_row_13 * 256 + dim[0]) + 0);
                                         _vec_load_26[0] = _v2_126.x;
                                         _vec_load_26[0 + 1] = _v2_126.y;
+#else
+                                        float2 _v2_149 = *reinterpret_cast<const float2*>(partial_out + (part_row_13 * 256 + dim[0]) + 0);
+                                        _vec_load_26[0] = _v2_149.x;
+                                        _vec_load_26[0 + 1] = _v2_149.y;
+#endif
                                     }
                                     p0[13] = _vec_load_26[0];
                                     p1[13] = _vec_load_26[1];
@@ -1804,9 +2500,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_14 = (long long)(base + 14) * split_pitch + row_head[0];
                                     float _vec_load_27[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_127 = *reinterpret_cast<const float2*>(partial_out + (part_row_14 * 256 + dim[0]) + 0);
                                         _vec_load_27[0] = _v2_127.x;
                                         _vec_load_27[0 + 1] = _v2_127.y;
+#else
+                                        float2 _v2_150 = *reinterpret_cast<const float2*>(partial_out + (part_row_14 * 256 + dim[0]) + 0);
+                                        _vec_load_27[0] = _v2_150.x;
+                                        _vec_load_27[0 + 1] = _v2_150.y;
+#endif
                                     }
                                     p0[14] = _vec_load_27[0];
                                     p1[14] = _vec_load_27[1];
@@ -1815,9 +2517,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_15 = (long long)(base + 15) * split_pitch + row_head[0];
                                     float _vec_load_28[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_128 = *reinterpret_cast<const float2*>(partial_out + (part_row_15 * 256 + dim[0]) + 0);
                                         _vec_load_28[0] = _v2_128.x;
                                         _vec_load_28[0 + 1] = _v2_128.y;
+#else
+                                        float2 _v2_151 = *reinterpret_cast<const float2*>(partial_out + (part_row_15 * 256 + dim[0]) + 0);
+                                        _vec_load_28[0] = _v2_151.x;
+                                        _vec_load_28[0 + 1] = _v2_151.y;
+#endif
                                     }
                                     p0[15] = _vec_load_28[0];
                                     p1[15] = _vec_load_28[1];
@@ -1943,9 +2651,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_16 = (long long)base_1 * split_pitch + row_head[0];
                                     float _vec_load_29[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_129 = *reinterpret_cast<const float2*>(partial_out + (part_row_16 * 256 + dim[0]) + 0);
                                         _vec_load_29[0] = _v2_129.x;
                                         _vec_load_29[0 + 1] = _v2_129.y;
+#else
+                                        float2 _v2_152 = *reinterpret_cast<const float2*>(partial_out + (part_row_16 * 256 + dim[0]) + 0);
+                                        _vec_load_29[0] = _v2_152.x;
+                                        _vec_load_29[0 + 1] = _v2_152.y;
+#endif
                                     }
                                     p0[0] = _vec_load_29[0];
                                     p1[0] = _vec_load_29[1];
@@ -1954,9 +2668,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_17 = (long long)(base_1 + 1) * split_pitch + row_head[0];
                                     float _vec_load_30[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_130 = *reinterpret_cast<const float2*>(partial_out + (part_row_17 * 256 + dim[0]) + 0);
                                         _vec_load_30[0] = _v2_130.x;
                                         _vec_load_30[0 + 1] = _v2_130.y;
+#else
+                                        float2 _v2_153 = *reinterpret_cast<const float2*>(partial_out + (part_row_17 * 256 + dim[0]) + 0);
+                                        _vec_load_30[0] = _v2_153.x;
+                                        _vec_load_30[0 + 1] = _v2_153.y;
+#endif
                                     }
                                     p0[1] = _vec_load_30[0];
                                     p1[1] = _vec_load_30[1];
@@ -1965,9 +2685,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_18 = (long long)(base_1 + 2) * split_pitch + row_head[0];
                                     float _vec_load_31[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_131 = *reinterpret_cast<const float2*>(partial_out + (part_row_18 * 256 + dim[0]) + 0);
                                         _vec_load_31[0] = _v2_131.x;
                                         _vec_load_31[0 + 1] = _v2_131.y;
+#else
+                                        float2 _v2_154 = *reinterpret_cast<const float2*>(partial_out + (part_row_18 * 256 + dim[0]) + 0);
+                                        _vec_load_31[0] = _v2_154.x;
+                                        _vec_load_31[0 + 1] = _v2_154.y;
+#endif
                                     }
                                     p0[2] = _vec_load_31[0];
                                     p1[2] = _vec_load_31[1];
@@ -1976,9 +2702,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_19 = (long long)(base_1 + 3) * split_pitch + row_head[0];
                                     float _vec_load_32[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_132 = *reinterpret_cast<const float2*>(partial_out + (part_row_19 * 256 + dim[0]) + 0);
                                         _vec_load_32[0] = _v2_132.x;
                                         _vec_load_32[0 + 1] = _v2_132.y;
+#else
+                                        float2 _v2_155 = *reinterpret_cast<const float2*>(partial_out + (part_row_19 * 256 + dim[0]) + 0);
+                                        _vec_load_32[0] = _v2_155.x;
+                                        _vec_load_32[0 + 1] = _v2_155.y;
+#endif
                                     }
                                     p0[3] = _vec_load_32[0];
                                     p1[3] = _vec_load_32[1];
@@ -1987,9 +2719,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_20 = (long long)(base_1 + 4) * split_pitch + row_head[0];
                                     float _vec_load_33[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_133 = *reinterpret_cast<const float2*>(partial_out + (part_row_20 * 256 + dim[0]) + 0);
                                         _vec_load_33[0] = _v2_133.x;
                                         _vec_load_33[0 + 1] = _v2_133.y;
+#else
+                                        float2 _v2_156 = *reinterpret_cast<const float2*>(partial_out + (part_row_20 * 256 + dim[0]) + 0);
+                                        _vec_load_33[0] = _v2_156.x;
+                                        _vec_load_33[0 + 1] = _v2_156.y;
+#endif
                                     }
                                     p0[4] = _vec_load_33[0];
                                     p1[4] = _vec_load_33[1];
@@ -1998,9 +2736,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_21 = (long long)(base_1 + 5) * split_pitch + row_head[0];
                                     float _vec_load_34[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_134 = *reinterpret_cast<const float2*>(partial_out + (part_row_21 * 256 + dim[0]) + 0);
                                         _vec_load_34[0] = _v2_134.x;
                                         _vec_load_34[0 + 1] = _v2_134.y;
+#else
+                                        float2 _v2_157 = *reinterpret_cast<const float2*>(partial_out + (part_row_21 * 256 + dim[0]) + 0);
+                                        _vec_load_34[0] = _v2_157.x;
+                                        _vec_load_34[0 + 1] = _v2_157.y;
+#endif
                                     }
                                     p0[5] = _vec_load_34[0];
                                     p1[5] = _vec_load_34[1];
@@ -2009,9 +2753,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_22 = (long long)(base_1 + 6) * split_pitch + row_head[0];
                                     float _vec_load_35[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_135 = *reinterpret_cast<const float2*>(partial_out + (part_row_22 * 256 + dim[0]) + 0);
                                         _vec_load_35[0] = _v2_135.x;
                                         _vec_load_35[0 + 1] = _v2_135.y;
+#else
+                                        float2 _v2_158 = *reinterpret_cast<const float2*>(partial_out + (part_row_22 * 256 + dim[0]) + 0);
+                                        _vec_load_35[0] = _v2_158.x;
+                                        _vec_load_35[0 + 1] = _v2_158.y;
+#endif
                                     }
                                     p0[6] = _vec_load_35[0];
                                     p1[6] = _vec_load_35[1];
@@ -2020,9 +2770,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_23 = (long long)(base_1 + 7) * split_pitch + row_head[0];
                                     float _vec_load_36[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_136 = *reinterpret_cast<const float2*>(partial_out + (part_row_23 * 256 + dim[0]) + 0);
                                         _vec_load_36[0] = _v2_136.x;
                                         _vec_load_36[0 + 1] = _v2_136.y;
+#else
+                                        float2 _v2_159 = *reinterpret_cast<const float2*>(partial_out + (part_row_23 * 256 + dim[0]) + 0);
+                                        _vec_load_36[0] = _v2_159.x;
+                                        _vec_load_36[0 + 1] = _v2_159.y;
+#endif
                                     }
                                     p0[7] = _vec_load_36[0];
                                     p1[7] = _vec_load_36[1];
@@ -2031,9 +2787,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_24 = (long long)(base_1 + 8) * split_pitch + row_head[0];
                                     float _vec_load_37[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_137 = *reinterpret_cast<const float2*>(partial_out + (part_row_24 * 256 + dim[0]) + 0);
                                         _vec_load_37[0] = _v2_137.x;
                                         _vec_load_37[0 + 1] = _v2_137.y;
+#else
+                                        float2 _v2_160 = *reinterpret_cast<const float2*>(partial_out + (part_row_24 * 256 + dim[0]) + 0);
+                                        _vec_load_37[0] = _v2_160.x;
+                                        _vec_load_37[0 + 1] = _v2_160.y;
+#endif
                                     }
                                     p0[8] = _vec_load_37[0];
                                     p1[8] = _vec_load_37[1];
@@ -2042,9 +2804,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_25 = (long long)(base_1 + 9) * split_pitch + row_head[0];
                                     float _vec_load_38[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_138 = *reinterpret_cast<const float2*>(partial_out + (part_row_25 * 256 + dim[0]) + 0);
                                         _vec_load_38[0] = _v2_138.x;
                                         _vec_load_38[0 + 1] = _v2_138.y;
+#else
+                                        float2 _v2_161 = *reinterpret_cast<const float2*>(partial_out + (part_row_25 * 256 + dim[0]) + 0);
+                                        _vec_load_38[0] = _v2_161.x;
+                                        _vec_load_38[0 + 1] = _v2_161.y;
+#endif
                                     }
                                     p0[9] = _vec_load_38[0];
                                     p1[9] = _vec_load_38[1];
@@ -2053,9 +2821,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_26 = (long long)(base_1 + 10) * split_pitch + row_head[0];
                                     float _vec_load_39[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_139 = *reinterpret_cast<const float2*>(partial_out + (part_row_26 * 256 + dim[0]) + 0);
                                         _vec_load_39[0] = _v2_139.x;
                                         _vec_load_39[0 + 1] = _v2_139.y;
+#else
+                                        float2 _v2_162 = *reinterpret_cast<const float2*>(partial_out + (part_row_26 * 256 + dim[0]) + 0);
+                                        _vec_load_39[0] = _v2_162.x;
+                                        _vec_load_39[0 + 1] = _v2_162.y;
+#endif
                                     }
                                     p0[10] = _vec_load_39[0];
                                     p1[10] = _vec_load_39[1];
@@ -2064,9 +2838,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_27 = (long long)(base_1 + 11) * split_pitch + row_head[0];
                                     float _vec_load_40[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_140 = *reinterpret_cast<const float2*>(partial_out + (part_row_27 * 256 + dim[0]) + 0);
                                         _vec_load_40[0] = _v2_140.x;
                                         _vec_load_40[0 + 1] = _v2_140.y;
+#else
+                                        float2 _v2_163 = *reinterpret_cast<const float2*>(partial_out + (part_row_27 * 256 + dim[0]) + 0);
+                                        _vec_load_40[0] = _v2_163.x;
+                                        _vec_load_40[0 + 1] = _v2_163.y;
+#endif
                                     }
                                     p0[11] = _vec_load_40[0];
                                     p1[11] = _vec_load_40[1];
@@ -2075,9 +2855,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_28 = (long long)(base_1 + 12) * split_pitch + row_head[0];
                                     float _vec_load_41[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_141 = *reinterpret_cast<const float2*>(partial_out + (part_row_28 * 256 + dim[0]) + 0);
                                         _vec_load_41[0] = _v2_141.x;
                                         _vec_load_41[0 + 1] = _v2_141.y;
+#else
+                                        float2 _v2_164 = *reinterpret_cast<const float2*>(partial_out + (part_row_28 * 256 + dim[0]) + 0);
+                                        _vec_load_41[0] = _v2_164.x;
+                                        _vec_load_41[0 + 1] = _v2_164.y;
+#endif
                                     }
                                     p0[12] = _vec_load_41[0];
                                     p1[12] = _vec_load_41[1];
@@ -2086,9 +2872,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_29 = (long long)(base_1 + 13) * split_pitch + row_head[0];
                                     float _vec_load_42[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_142 = *reinterpret_cast<const float2*>(partial_out + (part_row_29 * 256 + dim[0]) + 0);
                                         _vec_load_42[0] = _v2_142.x;
                                         _vec_load_42[0 + 1] = _v2_142.y;
+#else
+                                        float2 _v2_165 = *reinterpret_cast<const float2*>(partial_out + (part_row_29 * 256 + dim[0]) + 0);
+                                        _vec_load_42[0] = _v2_165.x;
+                                        _vec_load_42[0 + 1] = _v2_165.y;
+#endif
                                     }
                                     p0[13] = _vec_load_42[0];
                                     p1[13] = _vec_load_42[1];
@@ -2097,9 +2889,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_30 = (long long)(base_1 + 14) * split_pitch + row_head[0];
                                     float _vec_load_43[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_143 = *reinterpret_cast<const float2*>(partial_out + (part_row_30 * 256 + dim[0]) + 0);
                                         _vec_load_43[0] = _v2_143.x;
                                         _vec_load_43[0 + 1] = _v2_143.y;
+#else
+                                        float2 _v2_166 = *reinterpret_cast<const float2*>(partial_out + (part_row_30 * 256 + dim[0]) + 0);
+                                        _vec_load_43[0] = _v2_166.x;
+                                        _vec_load_43[0 + 1] = _v2_166.y;
+#endif
                                     }
                                     p0[14] = _vec_load_43[0];
                                     p1[14] = _vec_load_43[1];
@@ -2108,9 +2906,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_31 = (long long)(base_1 + 15) * split_pitch + row_head[0];
                                     float _vec_load_44[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_144 = *reinterpret_cast<const float2*>(partial_out + (part_row_31 * 256 + dim[0]) + 0);
                                         _vec_load_44[0] = _v2_144.x;
                                         _vec_load_44[0 + 1] = _v2_144.y;
+#else
+                                        float2 _v2_167 = *reinterpret_cast<const float2*>(partial_out + (part_row_31 * 256 + dim[0]) + 0);
+                                        _vec_load_44[0] = _v2_167.x;
+                                        _vec_load_44[0 + 1] = _v2_167.y;
+#endif
                                     }
                                     p0[15] = _vec_load_44[0];
                                     p1[15] = _vec_load_44[1];
@@ -2236,9 +3040,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_32 = (long long)base_2 * split_pitch + row_head[0];
                                     float _vec_load_45[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_145 = *reinterpret_cast<const float2*>(partial_out + (part_row_32 * 256 + dim[0]) + 0);
                                         _vec_load_45[0] = _v2_145.x;
                                         _vec_load_45[0 + 1] = _v2_145.y;
+#else
+                                        float2 _v2_168 = *reinterpret_cast<const float2*>(partial_out + (part_row_32 * 256 + dim[0]) + 0);
+                                        _vec_load_45[0] = _v2_168.x;
+                                        _vec_load_45[0 + 1] = _v2_168.y;
+#endif
                                     }
                                     p0[0] = _vec_load_45[0];
                                     p1[0] = _vec_load_45[1];
@@ -2247,9 +3057,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_33 = (long long)(base_2 + 1) * split_pitch + row_head[0];
                                     float _vec_load_46[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_146 = *reinterpret_cast<const float2*>(partial_out + (part_row_33 * 256 + dim[0]) + 0);
                                         _vec_load_46[0] = _v2_146.x;
                                         _vec_load_46[0 + 1] = _v2_146.y;
+#else
+                                        float2 _v2_169 = *reinterpret_cast<const float2*>(partial_out + (part_row_33 * 256 + dim[0]) + 0);
+                                        _vec_load_46[0] = _v2_169.x;
+                                        _vec_load_46[0 + 1] = _v2_169.y;
+#endif
                                     }
                                     p0[1] = _vec_load_46[0];
                                     p1[1] = _vec_load_46[1];
@@ -2258,9 +3074,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_34 = (long long)(base_2 + 2) * split_pitch + row_head[0];
                                     float _vec_load_47[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_147 = *reinterpret_cast<const float2*>(partial_out + (part_row_34 * 256 + dim[0]) + 0);
                                         _vec_load_47[0] = _v2_147.x;
                                         _vec_load_47[0 + 1] = _v2_147.y;
+#else
+                                        float2 _v2_170 = *reinterpret_cast<const float2*>(partial_out + (part_row_34 * 256 + dim[0]) + 0);
+                                        _vec_load_47[0] = _v2_170.x;
+                                        _vec_load_47[0 + 1] = _v2_170.y;
+#endif
                                     }
                                     p0[2] = _vec_load_47[0];
                                     p1[2] = _vec_load_47[1];
@@ -2269,9 +3091,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_35 = (long long)(base_2 + 3) * split_pitch + row_head[0];
                                     float _vec_load_48[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_148 = *reinterpret_cast<const float2*>(partial_out + (part_row_35 * 256 + dim[0]) + 0);
                                         _vec_load_48[0] = _v2_148.x;
                                         _vec_load_48[0 + 1] = _v2_148.y;
+#else
+                                        float2 _v2_171 = *reinterpret_cast<const float2*>(partial_out + (part_row_35 * 256 + dim[0]) + 0);
+                                        _vec_load_48[0] = _v2_171.x;
+                                        _vec_load_48[0 + 1] = _v2_171.y;
+#endif
                                     }
                                     p0[3] = _vec_load_48[0];
                                     p1[3] = _vec_load_48[1];
@@ -2280,9 +3108,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_36 = (long long)(base_2 + 4) * split_pitch + row_head[0];
                                     float _vec_load_49[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_149 = *reinterpret_cast<const float2*>(partial_out + (part_row_36 * 256 + dim[0]) + 0);
                                         _vec_load_49[0] = _v2_149.x;
                                         _vec_load_49[0 + 1] = _v2_149.y;
+#else
+                                        float2 _v2_172 = *reinterpret_cast<const float2*>(partial_out + (part_row_36 * 256 + dim[0]) + 0);
+                                        _vec_load_49[0] = _v2_172.x;
+                                        _vec_load_49[0 + 1] = _v2_172.y;
+#endif
                                     }
                                     p0[4] = _vec_load_49[0];
                                     p1[4] = _vec_load_49[1];
@@ -2291,9 +3125,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_37 = (long long)(base_2 + 5) * split_pitch + row_head[0];
                                     float _vec_load_50[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_150 = *reinterpret_cast<const float2*>(partial_out + (part_row_37 * 256 + dim[0]) + 0);
                                         _vec_load_50[0] = _v2_150.x;
                                         _vec_load_50[0 + 1] = _v2_150.y;
+#else
+                                        float2 _v2_173 = *reinterpret_cast<const float2*>(partial_out + (part_row_37 * 256 + dim[0]) + 0);
+                                        _vec_load_50[0] = _v2_173.x;
+                                        _vec_load_50[0 + 1] = _v2_173.y;
+#endif
                                     }
                                     p0[5] = _vec_load_50[0];
                                     p1[5] = _vec_load_50[1];
@@ -2302,9 +3142,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_38 = (long long)(base_2 + 6) * split_pitch + row_head[0];
                                     float _vec_load_51[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_151 = *reinterpret_cast<const float2*>(partial_out + (part_row_38 * 256 + dim[0]) + 0);
                                         _vec_load_51[0] = _v2_151.x;
                                         _vec_load_51[0 + 1] = _v2_151.y;
+#else
+                                        float2 _v2_174 = *reinterpret_cast<const float2*>(partial_out + (part_row_38 * 256 + dim[0]) + 0);
+                                        _vec_load_51[0] = _v2_174.x;
+                                        _vec_load_51[0 + 1] = _v2_174.y;
+#endif
                                     }
                                     p0[6] = _vec_load_51[0];
                                     p1[6] = _vec_load_51[1];
@@ -2313,9 +3159,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_39 = (long long)(base_2 + 7) * split_pitch + row_head[0];
                                     float _vec_load_52[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_152 = *reinterpret_cast<const float2*>(partial_out + (part_row_39 * 256 + dim[0]) + 0);
                                         _vec_load_52[0] = _v2_152.x;
                                         _vec_load_52[0 + 1] = _v2_152.y;
+#else
+                                        float2 _v2_175 = *reinterpret_cast<const float2*>(partial_out + (part_row_39 * 256 + dim[0]) + 0);
+                                        _vec_load_52[0] = _v2_175.x;
+                                        _vec_load_52[0 + 1] = _v2_175.y;
+#endif
                                     }
                                     p0[7] = _vec_load_52[0];
                                     p1[7] = _vec_load_52[1];
@@ -2324,9 +3176,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_40 = (long long)(base_2 + 8) * split_pitch + row_head[0];
                                     float _vec_load_53[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_153 = *reinterpret_cast<const float2*>(partial_out + (part_row_40 * 256 + dim[0]) + 0);
                                         _vec_load_53[0] = _v2_153.x;
                                         _vec_load_53[0 + 1] = _v2_153.y;
+#else
+                                        float2 _v2_176 = *reinterpret_cast<const float2*>(partial_out + (part_row_40 * 256 + dim[0]) + 0);
+                                        _vec_load_53[0] = _v2_176.x;
+                                        _vec_load_53[0 + 1] = _v2_176.y;
+#endif
                                     }
                                     p0[8] = _vec_load_53[0];
                                     p1[8] = _vec_load_53[1];
@@ -2335,9 +3193,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_41 = (long long)(base_2 + 9) * split_pitch + row_head[0];
                                     float _vec_load_54[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_154 = *reinterpret_cast<const float2*>(partial_out + (part_row_41 * 256 + dim[0]) + 0);
                                         _vec_load_54[0] = _v2_154.x;
                                         _vec_load_54[0 + 1] = _v2_154.y;
+#else
+                                        float2 _v2_177 = *reinterpret_cast<const float2*>(partial_out + (part_row_41 * 256 + dim[0]) + 0);
+                                        _vec_load_54[0] = _v2_177.x;
+                                        _vec_load_54[0 + 1] = _v2_177.y;
+#endif
                                     }
                                     p0[9] = _vec_load_54[0];
                                     p1[9] = _vec_load_54[1];
@@ -2346,9 +3210,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_42 = (long long)(base_2 + 10) * split_pitch + row_head[0];
                                     float _vec_load_55[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_155 = *reinterpret_cast<const float2*>(partial_out + (part_row_42 * 256 + dim[0]) + 0);
                                         _vec_load_55[0] = _v2_155.x;
                                         _vec_load_55[0 + 1] = _v2_155.y;
+#else
+                                        float2 _v2_178 = *reinterpret_cast<const float2*>(partial_out + (part_row_42 * 256 + dim[0]) + 0);
+                                        _vec_load_55[0] = _v2_178.x;
+                                        _vec_load_55[0 + 1] = _v2_178.y;
+#endif
                                     }
                                     p0[10] = _vec_load_55[0];
                                     p1[10] = _vec_load_55[1];
@@ -2357,9 +3227,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_43 = (long long)(base_2 + 11) * split_pitch + row_head[0];
                                     float _vec_load_56[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_156 = *reinterpret_cast<const float2*>(partial_out + (part_row_43 * 256 + dim[0]) + 0);
                                         _vec_load_56[0] = _v2_156.x;
                                         _vec_load_56[0 + 1] = _v2_156.y;
+#else
+                                        float2 _v2_179 = *reinterpret_cast<const float2*>(partial_out + (part_row_43 * 256 + dim[0]) + 0);
+                                        _vec_load_56[0] = _v2_179.x;
+                                        _vec_load_56[0 + 1] = _v2_179.y;
+#endif
                                     }
                                     p0[11] = _vec_load_56[0];
                                     p1[11] = _vec_load_56[1];
@@ -2368,9 +3244,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_44 = (long long)(base_2 + 12) * split_pitch + row_head[0];
                                     float _vec_load_57[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_157 = *reinterpret_cast<const float2*>(partial_out + (part_row_44 * 256 + dim[0]) + 0);
                                         _vec_load_57[0] = _v2_157.x;
                                         _vec_load_57[0 + 1] = _v2_157.y;
+#else
+                                        float2 _v2_180 = *reinterpret_cast<const float2*>(partial_out + (part_row_44 * 256 + dim[0]) + 0);
+                                        _vec_load_57[0] = _v2_180.x;
+                                        _vec_load_57[0 + 1] = _v2_180.y;
+#endif
                                     }
                                     p0[12] = _vec_load_57[0];
                                     p1[12] = _vec_load_57[1];
@@ -2379,9 +3261,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_45 = (long long)(base_2 + 13) * split_pitch + row_head[0];
                                     float _vec_load_58[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_158 = *reinterpret_cast<const float2*>(partial_out + (part_row_45 * 256 + dim[0]) + 0);
                                         _vec_load_58[0] = _v2_158.x;
                                         _vec_load_58[0 + 1] = _v2_158.y;
+#else
+                                        float2 _v2_181 = *reinterpret_cast<const float2*>(partial_out + (part_row_45 * 256 + dim[0]) + 0);
+                                        _vec_load_58[0] = _v2_181.x;
+                                        _vec_load_58[0 + 1] = _v2_181.y;
+#endif
                                     }
                                     p0[13] = _vec_load_58[0];
                                     p1[13] = _vec_load_58[1];
@@ -2390,9 +3278,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_46 = (long long)(base_2 + 14) * split_pitch + row_head[0];
                                     float _vec_load_59[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_159 = *reinterpret_cast<const float2*>(partial_out + (part_row_46 * 256 + dim[0]) + 0);
                                         _vec_load_59[0] = _v2_159.x;
                                         _vec_load_59[0 + 1] = _v2_159.y;
+#else
+                                        float2 _v2_182 = *reinterpret_cast<const float2*>(partial_out + (part_row_46 * 256 + dim[0]) + 0);
+                                        _vec_load_59[0] = _v2_182.x;
+                                        _vec_load_59[0 + 1] = _v2_182.y;
+#endif
                                     }
                                     p0[14] = _vec_load_59[0];
                                     p1[14] = _vec_load_59[1];
@@ -2401,9 +3295,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_47 = (long long)(base_2 + 15) * split_pitch + row_head[0];
                                     float _vec_load_60[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_160 = *reinterpret_cast<const float2*>(partial_out + (part_row_47 * 256 + dim[0]) + 0);
                                         _vec_load_60[0] = _v2_160.x;
                                         _vec_load_60[0 + 1] = _v2_160.y;
+#else
+                                        float2 _v2_183 = *reinterpret_cast<const float2*>(partial_out + (part_row_47 * 256 + dim[0]) + 0);
+                                        _vec_load_60[0] = _v2_183.x;
+                                        _vec_load_60[0 + 1] = _v2_183.y;
+#endif
                                     }
                                     p0[15] = _vec_load_60[0];
                                     p1[15] = _vec_load_60[1];
@@ -2529,9 +3429,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_48 = (long long)base_3 * split_pitch + row_head[0];
                                     float _vec_load_61[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_161 = *reinterpret_cast<const float2*>(partial_out + (part_row_48 * 256 + dim[0]) + 0);
                                         _vec_load_61[0] = _v2_161.x;
                                         _vec_load_61[0 + 1] = _v2_161.y;
+#else
+                                        float2 _v2_184 = *reinterpret_cast<const float2*>(partial_out + (part_row_48 * 256 + dim[0]) + 0);
+                                        _vec_load_61[0] = _v2_184.x;
+                                        _vec_load_61[0 + 1] = _v2_184.y;
+#endif
                                     }
                                     p0[0] = _vec_load_61[0];
                                     p1[0] = _vec_load_61[1];
@@ -2540,9 +3446,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_49 = (long long)(base_3 + 1) * split_pitch + row_head[0];
                                     float _vec_load_62[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_162 = *reinterpret_cast<const float2*>(partial_out + (part_row_49 * 256 + dim[0]) + 0);
                                         _vec_load_62[0] = _v2_162.x;
                                         _vec_load_62[0 + 1] = _v2_162.y;
+#else
+                                        float2 _v2_185 = *reinterpret_cast<const float2*>(partial_out + (part_row_49 * 256 + dim[0]) + 0);
+                                        _vec_load_62[0] = _v2_185.x;
+                                        _vec_load_62[0 + 1] = _v2_185.y;
+#endif
                                     }
                                     p0[1] = _vec_load_62[0];
                                     p1[1] = _vec_load_62[1];
@@ -2551,9 +3463,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_50 = (long long)(base_3 + 2) * split_pitch + row_head[0];
                                     float _vec_load_63[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_163 = *reinterpret_cast<const float2*>(partial_out + (part_row_50 * 256 + dim[0]) + 0);
                                         _vec_load_63[0] = _v2_163.x;
                                         _vec_load_63[0 + 1] = _v2_163.y;
+#else
+                                        float2 _v2_186 = *reinterpret_cast<const float2*>(partial_out + (part_row_50 * 256 + dim[0]) + 0);
+                                        _vec_load_63[0] = _v2_186.x;
+                                        _vec_load_63[0 + 1] = _v2_186.y;
+#endif
                                     }
                                     p0[2] = _vec_load_63[0];
                                     p1[2] = _vec_load_63[1];
@@ -2562,9 +3480,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_51 = (long long)(base_3 + 3) * split_pitch + row_head[0];
                                     float _vec_load_64[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_164 = *reinterpret_cast<const float2*>(partial_out + (part_row_51 * 256 + dim[0]) + 0);
                                         _vec_load_64[0] = _v2_164.x;
                                         _vec_load_64[0 + 1] = _v2_164.y;
+#else
+                                        float2 _v2_187 = *reinterpret_cast<const float2*>(partial_out + (part_row_51 * 256 + dim[0]) + 0);
+                                        _vec_load_64[0] = _v2_187.x;
+                                        _vec_load_64[0 + 1] = _v2_187.y;
+#endif
                                     }
                                     p0[3] = _vec_load_64[0];
                                     p1[3] = _vec_load_64[1];
@@ -2573,9 +3497,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_52 = (long long)(base_3 + 4) * split_pitch + row_head[0];
                                     float _vec_load_65[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_165 = *reinterpret_cast<const float2*>(partial_out + (part_row_52 * 256 + dim[0]) + 0);
                                         _vec_load_65[0] = _v2_165.x;
                                         _vec_load_65[0 + 1] = _v2_165.y;
+#else
+                                        float2 _v2_188 = *reinterpret_cast<const float2*>(partial_out + (part_row_52 * 256 + dim[0]) + 0);
+                                        _vec_load_65[0] = _v2_188.x;
+                                        _vec_load_65[0 + 1] = _v2_188.y;
+#endif
                                     }
                                     p0[4] = _vec_load_65[0];
                                     p1[4] = _vec_load_65[1];
@@ -2584,9 +3514,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_53 = (long long)(base_3 + 5) * split_pitch + row_head[0];
                                     float _vec_load_66[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_166 = *reinterpret_cast<const float2*>(partial_out + (part_row_53 * 256 + dim[0]) + 0);
                                         _vec_load_66[0] = _v2_166.x;
                                         _vec_load_66[0 + 1] = _v2_166.y;
+#else
+                                        float2 _v2_189 = *reinterpret_cast<const float2*>(partial_out + (part_row_53 * 256 + dim[0]) + 0);
+                                        _vec_load_66[0] = _v2_189.x;
+                                        _vec_load_66[0 + 1] = _v2_189.y;
+#endif
                                     }
                                     p0[5] = _vec_load_66[0];
                                     p1[5] = _vec_load_66[1];
@@ -2595,9 +3531,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_54 = (long long)(base_3 + 6) * split_pitch + row_head[0];
                                     float _vec_load_67[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_167 = *reinterpret_cast<const float2*>(partial_out + (part_row_54 * 256 + dim[0]) + 0);
                                         _vec_load_67[0] = _v2_167.x;
                                         _vec_load_67[0 + 1] = _v2_167.y;
+#else
+                                        float2 _v2_190 = *reinterpret_cast<const float2*>(partial_out + (part_row_54 * 256 + dim[0]) + 0);
+                                        _vec_load_67[0] = _v2_190.x;
+                                        _vec_load_67[0 + 1] = _v2_190.y;
+#endif
                                     }
                                     p0[6] = _vec_load_67[0];
                                     p1[6] = _vec_load_67[1];
@@ -2606,9 +3548,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_55 = (long long)(base_3 + 7) * split_pitch + row_head[0];
                                     float _vec_load_68[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_168 = *reinterpret_cast<const float2*>(partial_out + (part_row_55 * 256 + dim[0]) + 0);
                                         _vec_load_68[0] = _v2_168.x;
                                         _vec_load_68[0 + 1] = _v2_168.y;
+#else
+                                        float2 _v2_191 = *reinterpret_cast<const float2*>(partial_out + (part_row_55 * 256 + dim[0]) + 0);
+                                        _vec_load_68[0] = _v2_191.x;
+                                        _vec_load_68[0 + 1] = _v2_191.y;
+#endif
                                     }
                                     p0[7] = _vec_load_68[0];
                                     p1[7] = _vec_load_68[1];
@@ -2617,9 +3565,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_56 = (long long)(base_3 + 8) * split_pitch + row_head[0];
                                     float _vec_load_69[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_169 = *reinterpret_cast<const float2*>(partial_out + (part_row_56 * 256 + dim[0]) + 0);
                                         _vec_load_69[0] = _v2_169.x;
                                         _vec_load_69[0 + 1] = _v2_169.y;
+#else
+                                        float2 _v2_192 = *reinterpret_cast<const float2*>(partial_out + (part_row_56 * 256 + dim[0]) + 0);
+                                        _vec_load_69[0] = _v2_192.x;
+                                        _vec_load_69[0 + 1] = _v2_192.y;
+#endif
                                     }
                                     p0[8] = _vec_load_69[0];
                                     p1[8] = _vec_load_69[1];
@@ -2628,9 +3582,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_57 = (long long)(base_3 + 9) * split_pitch + row_head[0];
                                     float _vec_load_70[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_170 = *reinterpret_cast<const float2*>(partial_out + (part_row_57 * 256 + dim[0]) + 0);
                                         _vec_load_70[0] = _v2_170.x;
                                         _vec_load_70[0 + 1] = _v2_170.y;
+#else
+                                        float2 _v2_193 = *reinterpret_cast<const float2*>(partial_out + (part_row_57 * 256 + dim[0]) + 0);
+                                        _vec_load_70[0] = _v2_193.x;
+                                        _vec_load_70[0 + 1] = _v2_193.y;
+#endif
                                     }
                                     p0[9] = _vec_load_70[0];
                                     p1[9] = _vec_load_70[1];
@@ -2639,9 +3599,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_58 = (long long)(base_3 + 10) * split_pitch + row_head[0];
                                     float _vec_load_71[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_171 = *reinterpret_cast<const float2*>(partial_out + (part_row_58 * 256 + dim[0]) + 0);
                                         _vec_load_71[0] = _v2_171.x;
                                         _vec_load_71[0 + 1] = _v2_171.y;
+#else
+                                        float2 _v2_194 = *reinterpret_cast<const float2*>(partial_out + (part_row_58 * 256 + dim[0]) + 0);
+                                        _vec_load_71[0] = _v2_194.x;
+                                        _vec_load_71[0 + 1] = _v2_194.y;
+#endif
                                     }
                                     p0[10] = _vec_load_71[0];
                                     p1[10] = _vec_load_71[1];
@@ -2650,9 +3616,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_59 = (long long)(base_3 + 11) * split_pitch + row_head[0];
                                     float _vec_load_72[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_172 = *reinterpret_cast<const float2*>(partial_out + (part_row_59 * 256 + dim[0]) + 0);
                                         _vec_load_72[0] = _v2_172.x;
                                         _vec_load_72[0 + 1] = _v2_172.y;
+#else
+                                        float2 _v2_195 = *reinterpret_cast<const float2*>(partial_out + (part_row_59 * 256 + dim[0]) + 0);
+                                        _vec_load_72[0] = _v2_195.x;
+                                        _vec_load_72[0 + 1] = _v2_195.y;
+#endif
                                     }
                                     p0[11] = _vec_load_72[0];
                                     p1[11] = _vec_load_72[1];
@@ -2661,9 +3633,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_60 = (long long)(base_3 + 12) * split_pitch + row_head[0];
                                     float _vec_load_73[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_173 = *reinterpret_cast<const float2*>(partial_out + (part_row_60 * 256 + dim[0]) + 0);
                                         _vec_load_73[0] = _v2_173.x;
                                         _vec_load_73[0 + 1] = _v2_173.y;
+#else
+                                        float2 _v2_196 = *reinterpret_cast<const float2*>(partial_out + (part_row_60 * 256 + dim[0]) + 0);
+                                        _vec_load_73[0] = _v2_196.x;
+                                        _vec_load_73[0 + 1] = _v2_196.y;
+#endif
                                     }
                                     p0[12] = _vec_load_73[0];
                                     p1[12] = _vec_load_73[1];
@@ -2672,9 +3650,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_61 = (long long)(base_3 + 13) * split_pitch + row_head[0];
                                     float _vec_load_74[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_174 = *reinterpret_cast<const float2*>(partial_out + (part_row_61 * 256 + dim[0]) + 0);
                                         _vec_load_74[0] = _v2_174.x;
                                         _vec_load_74[0 + 1] = _v2_174.y;
+#else
+                                        float2 _v2_197 = *reinterpret_cast<const float2*>(partial_out + (part_row_61 * 256 + dim[0]) + 0);
+                                        _vec_load_74[0] = _v2_197.x;
+                                        _vec_load_74[0 + 1] = _v2_197.y;
+#endif
                                     }
                                     p0[13] = _vec_load_74[0];
                                     p1[13] = _vec_load_74[1];
@@ -2683,9 +3667,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_62 = (long long)(base_3 + 14) * split_pitch + row_head[0];
                                     float _vec_load_75[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_175 = *reinterpret_cast<const float2*>(partial_out + (part_row_62 * 256 + dim[0]) + 0);
                                         _vec_load_75[0] = _v2_175.x;
                                         _vec_load_75[0 + 1] = _v2_175.y;
+#else
+                                        float2 _v2_198 = *reinterpret_cast<const float2*>(partial_out + (part_row_62 * 256 + dim[0]) + 0);
+                                        _vec_load_75[0] = _v2_198.x;
+                                        _vec_load_75[0 + 1] = _v2_198.y;
+#endif
                                     }
                                     p0[14] = _vec_load_75[0];
                                     p1[14] = _vec_load_75[1];
@@ -2694,9 +3684,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_63 = (long long)(base_3 + 15) * split_pitch + row_head[0];
                                     float _vec_load_76[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_176 = *reinterpret_cast<const float2*>(partial_out + (part_row_63 * 256 + dim[0]) + 0);
                                         _vec_load_76[0] = _v2_176.x;
                                         _vec_load_76[0 + 1] = _v2_176.y;
+#else
+                                        float2 _v2_199 = *reinterpret_cast<const float2*>(partial_out + (part_row_63 * 256 + dim[0]) + 0);
+                                        _vec_load_76[0] = _v2_199.x;
+                                        _vec_load_76[0 + 1] = _v2_199.y;
+#endif
                                     }
                                     p0[15] = _vec_load_76[0];
                                     p1[15] = _vec_load_76[1];
@@ -2829,11 +3825,17 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 acc1_k = acc1_k + acc1[3];
                                 float inv_2 = 0.0f;
                                 if (den_k > 0.0f) {
+#if __CUDA_ARCH__ == 1070
                                     float _rcp_177 = approx_rcp(den_k);
                                     inv_2 = _rcp_177;
+#else
+                                    float _rcp_200 = approx_rcp(den_k);
+                                    inv_2 = _rcp_200;
+#endif
                                 }
                                 float attn0 = (float)(__nv_bfloat16)(acc0_k * inv_2);
                                 float attn1 = (float)(__nv_bfloat16)(acc1_k * inv_2);
+#if __CUDA_ARCH__ == 1070
                                 float _exp2_179 = approx_exp2((-gate0[0]) * 1.442695f);
                                 float _rcp_178 = approx_rcp(1.0f + _exp2_179);
                                 float result0 = attn0 * _rcp_178;
@@ -2842,6 +3844,16 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 float result1 = attn1 * _rcp_180;
                                 __nv_bfloat162 _bit_cast_src_182 = __float22bfloat162_rn(make_float2(result0, result1));
                                 word[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_182)[0];
+#else
+                                float _exp2_202 = approx_exp2((-gate0[0]) * 1.442695f);
+                                float _rcp_201 = approx_rcp(1.0f + _exp2_202);
+                                float result0 = attn0 * _rcp_201;
+                                float _exp2_204 = approx_exp2((-gate1[0]) * 1.442695f);
+                                float _rcp_203 = approx_rcp(1.0f + _exp2_204);
+                                float result1 = attn1 * _rcp_203;
+                                __nv_bfloat162 _bit_cast_src_205 = __float22bfloat162_rn(make_float2(result0, result1));
+                                word[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_205)[0];
+#endif
                                 long long out_offset = row_i64 * out_stride_row + qo_head_2[0] * out_stride_head + dim[0];
                                 *(reinterpret_cast<unsigned int*>(out + out_offset) + (0)) = word[0];
                             }
@@ -2895,10 +3907,17 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                             lse_max_1[0] = -CUDART_INF_F;
                             float _vec_load_77[2];
                             {
+#if __CUDA_ARCH__ == 1070
                                 uint32_t _bf16x2_bits_183;
                                 _bf16x2_bits_183 = *reinterpret_cast<const uint32_t*>(gate + (row_head_1[0] * 256 + dim_1[0]) + 0);
                                 (&_vec_load_77[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_183) << 16);
                                 (&_vec_load_77[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_183) & 0xffff0000u);
+#else
+                                uint32_t _bf16x2_bits_206;
+                                _bf16x2_bits_206 = *reinterpret_cast<const uint32_t*>(gate + (row_head_1[0] * 256 + dim_1[0]) + 0);
+                                (&_vec_load_77[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_206) << 16);
+                                (&_vec_load_77[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_206) & 0xffff0000u);
+#endif
                             }
                             gate0_1[0] = _vec_load_77[0];
                             gate1_1[0] = _vec_load_77[1];
@@ -2908,9 +3927,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[0] = partial_lse[part_row_64];
                                 float _vec_load_78[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_184 = *reinterpret_cast<const float2*>(partial_out + (part_row_64 * 256 + dim_1[0]) + 0);
                                     _vec_load_78[0] = _v2_184.x;
                                     _vec_load_78[0 + 1] = _v2_184.y;
+#else
+                                    float2 _v2_207 = *reinterpret_cast<const float2*>(partial_out + (part_row_64 * 256 + dim_1[0]) + 0);
+                                    _vec_load_78[0] = _v2_207.x;
+                                    _vec_load_78[0 + 1] = _v2_207.y;
+#endif
                                 }
                                 p0_1[0] = _vec_load_78[0];
                                 p1_1[0] = _vec_load_78[1];
@@ -2921,9 +3946,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[1] = partial_lse[part_row_65];
                                 float _vec_load_79[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_185 = *reinterpret_cast<const float2*>(partial_out + (part_row_65 * 256 + dim_1[0]) + 0);
                                     _vec_load_79[0] = _v2_185.x;
                                     _vec_load_79[0 + 1] = _v2_185.y;
+#else
+                                    float2 _v2_208 = *reinterpret_cast<const float2*>(partial_out + (part_row_65 * 256 + dim_1[0]) + 0);
+                                    _vec_load_79[0] = _v2_208.x;
+                                    _vec_load_79[0 + 1] = _v2_208.y;
+#endif
                                 }
                                 p0_1[1] = _vec_load_79[0];
                                 p1_1[1] = _vec_load_79[1];
@@ -2934,9 +3965,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[2] = partial_lse[part_row_66];
                                 float _vec_load_80[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_186 = *reinterpret_cast<const float2*>(partial_out + (part_row_66 * 256 + dim_1[0]) + 0);
                                     _vec_load_80[0] = _v2_186.x;
                                     _vec_load_80[0 + 1] = _v2_186.y;
+#else
+                                    float2 _v2_209 = *reinterpret_cast<const float2*>(partial_out + (part_row_66 * 256 + dim_1[0]) + 0);
+                                    _vec_load_80[0] = _v2_209.x;
+                                    _vec_load_80[0 + 1] = _v2_209.y;
+#endif
                                 }
                                 p0_1[2] = _vec_load_80[0];
                                 p1_1[2] = _vec_load_80[1];
@@ -2947,9 +3984,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[3] = partial_lse[part_row_67];
                                 float _vec_load_81[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_187 = *reinterpret_cast<const float2*>(partial_out + (part_row_67 * 256 + dim_1[0]) + 0);
                                     _vec_load_81[0] = _v2_187.x;
                                     _vec_load_81[0 + 1] = _v2_187.y;
+#else
+                                    float2 _v2_210 = *reinterpret_cast<const float2*>(partial_out + (part_row_67 * 256 + dim_1[0]) + 0);
+                                    _vec_load_81[0] = _v2_210.x;
+                                    _vec_load_81[0 + 1] = _v2_210.y;
+#endif
                                 }
                                 p0_1[3] = _vec_load_81[0];
                                 p1_1[3] = _vec_load_81[1];
@@ -2960,9 +4003,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[4] = partial_lse[part_row_68];
                                 float _vec_load_82[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_188 = *reinterpret_cast<const float2*>(partial_out + (part_row_68 * 256 + dim_1[0]) + 0);
                                     _vec_load_82[0] = _v2_188.x;
                                     _vec_load_82[0 + 1] = _v2_188.y;
+#else
+                                    float2 _v2_211 = *reinterpret_cast<const float2*>(partial_out + (part_row_68 * 256 + dim_1[0]) + 0);
+                                    _vec_load_82[0] = _v2_211.x;
+                                    _vec_load_82[0 + 1] = _v2_211.y;
+#endif
                                 }
                                 p0_1[4] = _vec_load_82[0];
                                 p1_1[4] = _vec_load_82[1];
@@ -2973,9 +4022,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[5] = partial_lse[part_row_69];
                                 float _vec_load_83[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_189 = *reinterpret_cast<const float2*>(partial_out + (part_row_69 * 256 + dim_1[0]) + 0);
                                     _vec_load_83[0] = _v2_189.x;
                                     _vec_load_83[0 + 1] = _v2_189.y;
+#else
+                                    float2 _v2_212 = *reinterpret_cast<const float2*>(partial_out + (part_row_69 * 256 + dim_1[0]) + 0);
+                                    _vec_load_83[0] = _v2_212.x;
+                                    _vec_load_83[0 + 1] = _v2_212.y;
+#endif
                                 }
                                 p0_1[5] = _vec_load_83[0];
                                 p1_1[5] = _vec_load_83[1];
@@ -2986,9 +4041,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[6] = partial_lse[part_row_70];
                                 float _vec_load_84[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_190 = *reinterpret_cast<const float2*>(partial_out + (part_row_70 * 256 + dim_1[0]) + 0);
                                     _vec_load_84[0] = _v2_190.x;
                                     _vec_load_84[0 + 1] = _v2_190.y;
+#else
+                                    float2 _v2_213 = *reinterpret_cast<const float2*>(partial_out + (part_row_70 * 256 + dim_1[0]) + 0);
+                                    _vec_load_84[0] = _v2_213.x;
+                                    _vec_load_84[0 + 1] = _v2_213.y;
+#endif
                                 }
                                 p0_1[6] = _vec_load_84[0];
                                 p1_1[6] = _vec_load_84[1];
@@ -2999,9 +4060,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[7] = partial_lse[part_row_71];
                                 float _vec_load_85[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_191 = *reinterpret_cast<const float2*>(partial_out + (part_row_71 * 256 + dim_1[0]) + 0);
                                     _vec_load_85[0] = _v2_191.x;
                                     _vec_load_85[0 + 1] = _v2_191.y;
+#else
+                                    float2 _v2_214 = *reinterpret_cast<const float2*>(partial_out + (part_row_71 * 256 + dim_1[0]) + 0);
+                                    _vec_load_85[0] = _v2_214.x;
+                                    _vec_load_85[0 + 1] = _v2_214.y;
+#endif
                                 }
                                 p0_1[7] = _vec_load_85[0];
                                 p1_1[7] = _vec_load_85[1];
@@ -3012,9 +4079,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[8] = partial_lse[part_row_72];
                                 float _vec_load_86[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_192 = *reinterpret_cast<const float2*>(partial_out + (part_row_72 * 256 + dim_1[0]) + 0);
                                     _vec_load_86[0] = _v2_192.x;
                                     _vec_load_86[0 + 1] = _v2_192.y;
+#else
+                                    float2 _v2_215 = *reinterpret_cast<const float2*>(partial_out + (part_row_72 * 256 + dim_1[0]) + 0);
+                                    _vec_load_86[0] = _v2_215.x;
+                                    _vec_load_86[0 + 1] = _v2_215.y;
+#endif
                                 }
                                 p0_1[8] = _vec_load_86[0];
                                 p1_1[8] = _vec_load_86[1];
@@ -3025,9 +4098,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[9] = partial_lse[part_row_73];
                                 float _vec_load_87[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_193 = *reinterpret_cast<const float2*>(partial_out + (part_row_73 * 256 + dim_1[0]) + 0);
                                     _vec_load_87[0] = _v2_193.x;
                                     _vec_load_87[0 + 1] = _v2_193.y;
+#else
+                                    float2 _v2_216 = *reinterpret_cast<const float2*>(partial_out + (part_row_73 * 256 + dim_1[0]) + 0);
+                                    _vec_load_87[0] = _v2_216.x;
+                                    _vec_load_87[0 + 1] = _v2_216.y;
+#endif
                                 }
                                 p0_1[9] = _vec_load_87[0];
                                 p1_1[9] = _vec_load_87[1];
@@ -3038,9 +4117,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[10] = partial_lse[part_row_74];
                                 float _vec_load_88[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_194 = *reinterpret_cast<const float2*>(partial_out + (part_row_74 * 256 + dim_1[0]) + 0);
                                     _vec_load_88[0] = _v2_194.x;
                                     _vec_load_88[0 + 1] = _v2_194.y;
+#else
+                                    float2 _v2_217 = *reinterpret_cast<const float2*>(partial_out + (part_row_74 * 256 + dim_1[0]) + 0);
+                                    _vec_load_88[0] = _v2_217.x;
+                                    _vec_load_88[0 + 1] = _v2_217.y;
+#endif
                                 }
                                 p0_1[10] = _vec_load_88[0];
                                 p1_1[10] = _vec_load_88[1];
@@ -3051,9 +4136,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[11] = partial_lse[part_row_75];
                                 float _vec_load_89[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_195 = *reinterpret_cast<const float2*>(partial_out + (part_row_75 * 256 + dim_1[0]) + 0);
                                     _vec_load_89[0] = _v2_195.x;
                                     _vec_load_89[0 + 1] = _v2_195.y;
+#else
+                                    float2 _v2_218 = *reinterpret_cast<const float2*>(partial_out + (part_row_75 * 256 + dim_1[0]) + 0);
+                                    _vec_load_89[0] = _v2_218.x;
+                                    _vec_load_89[0 + 1] = _v2_218.y;
+#endif
                                 }
                                 p0_1[11] = _vec_load_89[0];
                                 p1_1[11] = _vec_load_89[1];
@@ -3064,9 +4155,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[12] = partial_lse[part_row_76];
                                 float _vec_load_90[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_196 = *reinterpret_cast<const float2*>(partial_out + (part_row_76 * 256 + dim_1[0]) + 0);
                                     _vec_load_90[0] = _v2_196.x;
                                     _vec_load_90[0 + 1] = _v2_196.y;
+#else
+                                    float2 _v2_219 = *reinterpret_cast<const float2*>(partial_out + (part_row_76 * 256 + dim_1[0]) + 0);
+                                    _vec_load_90[0] = _v2_219.x;
+                                    _vec_load_90[0 + 1] = _v2_219.y;
+#endif
                                 }
                                 p0_1[12] = _vec_load_90[0];
                                 p1_1[12] = _vec_load_90[1];
@@ -3077,9 +4174,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[13] = partial_lse[part_row_77];
                                 float _vec_load_91[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_197 = *reinterpret_cast<const float2*>(partial_out + (part_row_77 * 256 + dim_1[0]) + 0);
                                     _vec_load_91[0] = _v2_197.x;
                                     _vec_load_91[0 + 1] = _v2_197.y;
+#else
+                                    float2 _v2_220 = *reinterpret_cast<const float2*>(partial_out + (part_row_77 * 256 + dim_1[0]) + 0);
+                                    _vec_load_91[0] = _v2_220.x;
+                                    _vec_load_91[0 + 1] = _v2_220.y;
+#endif
                                 }
                                 p0_1[13] = _vec_load_91[0];
                                 p1_1[13] = _vec_load_91[1];
@@ -3090,9 +4193,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[14] = partial_lse[part_row_78];
                                 float _vec_load_92[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_198 = *reinterpret_cast<const float2*>(partial_out + (part_row_78 * 256 + dim_1[0]) + 0);
                                     _vec_load_92[0] = _v2_198.x;
                                     _vec_load_92[0 + 1] = _v2_198.y;
+#else
+                                    float2 _v2_221 = *reinterpret_cast<const float2*>(partial_out + (part_row_78 * 256 + dim_1[0]) + 0);
+                                    _vec_load_92[0] = _v2_221.x;
+                                    _vec_load_92[0 + 1] = _v2_221.y;
+#endif
                                 }
                                 p0_1[14] = _vec_load_92[0];
                                 p1_1[14] = _vec_load_92[1];
@@ -3103,9 +4212,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[15] = partial_lse[part_row_79];
                                 float _vec_load_93[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_199 = *reinterpret_cast<const float2*>(partial_out + (part_row_79 * 256 + dim_1[0]) + 0);
                                     _vec_load_93[0] = _v2_199.x;
                                     _vec_load_93[0 + 1] = _v2_199.y;
+#else
+                                    float2 _v2_222 = *reinterpret_cast<const float2*>(partial_out + (part_row_79 * 256 + dim_1[0]) + 0);
+                                    _vec_load_93[0] = _v2_222.x;
+                                    _vec_load_93[0 + 1] = _v2_222.y;
+#endif
                                 }
                                 p0_1[15] = _vec_load_93[0];
                                 p1_1[15] = _vec_load_93[1];
@@ -3116,9 +4231,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[16] = partial_lse[part_row_80];
                                 float _vec_load_94[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_200 = *reinterpret_cast<const float2*>(partial_out + (part_row_80 * 256 + dim_1[0]) + 0);
                                     _vec_load_94[0] = _v2_200.x;
                                     _vec_load_94[0 + 1] = _v2_200.y;
+#else
+                                    float2 _v2_223 = *reinterpret_cast<const float2*>(partial_out + (part_row_80 * 256 + dim_1[0]) + 0);
+                                    _vec_load_94[0] = _v2_223.x;
+                                    _vec_load_94[0 + 1] = _v2_223.y;
+#endif
                                 }
                                 p0_1[16] = _vec_load_94[0];
                                 p1_1[16] = _vec_load_94[1];
@@ -3129,9 +4250,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[17] = partial_lse[part_row_81];
                                 float _vec_load_95[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_201 = *reinterpret_cast<const float2*>(partial_out + (part_row_81 * 256 + dim_1[0]) + 0);
                                     _vec_load_95[0] = _v2_201.x;
                                     _vec_load_95[0 + 1] = _v2_201.y;
+#else
+                                    float2 _v2_224 = *reinterpret_cast<const float2*>(partial_out + (part_row_81 * 256 + dim_1[0]) + 0);
+                                    _vec_load_95[0] = _v2_224.x;
+                                    _vec_load_95[0 + 1] = _v2_224.y;
+#endif
                                 }
                                 p0_1[17] = _vec_load_95[0];
                                 p1_1[17] = _vec_load_95[1];
@@ -3142,9 +4269,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[18] = partial_lse[part_row_82];
                                 float _vec_load_96[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_202 = *reinterpret_cast<const float2*>(partial_out + (part_row_82 * 256 + dim_1[0]) + 0);
                                     _vec_load_96[0] = _v2_202.x;
                                     _vec_load_96[0 + 1] = _v2_202.y;
+#else
+                                    float2 _v2_225 = *reinterpret_cast<const float2*>(partial_out + (part_row_82 * 256 + dim_1[0]) + 0);
+                                    _vec_load_96[0] = _v2_225.x;
+                                    _vec_load_96[0 + 1] = _v2_225.y;
+#endif
                                 }
                                 p0_1[18] = _vec_load_96[0];
                                 p1_1[18] = _vec_load_96[1];
@@ -3155,9 +4288,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[19] = partial_lse[part_row_83];
                                 float _vec_load_97[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_203 = *reinterpret_cast<const float2*>(partial_out + (part_row_83 * 256 + dim_1[0]) + 0);
                                     _vec_load_97[0] = _v2_203.x;
                                     _vec_load_97[0 + 1] = _v2_203.y;
+#else
+                                    float2 _v2_226 = *reinterpret_cast<const float2*>(partial_out + (part_row_83 * 256 + dim_1[0]) + 0);
+                                    _vec_load_97[0] = _v2_226.x;
+                                    _vec_load_97[0 + 1] = _v2_226.y;
+#endif
                                 }
                                 p0_1[19] = _vec_load_97[0];
                                 p1_1[19] = _vec_load_97[1];
@@ -3168,9 +4307,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[20] = partial_lse[part_row_84];
                                 float _vec_load_98[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_204 = *reinterpret_cast<const float2*>(partial_out + (part_row_84 * 256 + dim_1[0]) + 0);
                                     _vec_load_98[0] = _v2_204.x;
                                     _vec_load_98[0 + 1] = _v2_204.y;
+#else
+                                    float2 _v2_227 = *reinterpret_cast<const float2*>(partial_out + (part_row_84 * 256 + dim_1[0]) + 0);
+                                    _vec_load_98[0] = _v2_227.x;
+                                    _vec_load_98[0 + 1] = _v2_227.y;
+#endif
                                 }
                                 p0_1[20] = _vec_load_98[0];
                                 p1_1[20] = _vec_load_98[1];
@@ -3181,9 +4326,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[21] = partial_lse[part_row_85];
                                 float _vec_load_99[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_205 = *reinterpret_cast<const float2*>(partial_out + (part_row_85 * 256 + dim_1[0]) + 0);
                                     _vec_load_99[0] = _v2_205.x;
                                     _vec_load_99[0 + 1] = _v2_205.y;
+#else
+                                    float2 _v2_228 = *reinterpret_cast<const float2*>(partial_out + (part_row_85 * 256 + dim_1[0]) + 0);
+                                    _vec_load_99[0] = _v2_228.x;
+                                    _vec_load_99[0 + 1] = _v2_228.y;
+#endif
                                 }
                                 p0_1[21] = _vec_load_99[0];
                                 p1_1[21] = _vec_load_99[1];
@@ -3194,9 +4345,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[22] = partial_lse[part_row_86];
                                 float _vec_load_100[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_206 = *reinterpret_cast<const float2*>(partial_out + (part_row_86 * 256 + dim_1[0]) + 0);
                                     _vec_load_100[0] = _v2_206.x;
                                     _vec_load_100[0 + 1] = _v2_206.y;
+#else
+                                    float2 _v2_229 = *reinterpret_cast<const float2*>(partial_out + (part_row_86 * 256 + dim_1[0]) + 0);
+                                    _vec_load_100[0] = _v2_229.x;
+                                    _vec_load_100[0 + 1] = _v2_229.y;
+#endif
                                 }
                                 p0_1[22] = _vec_load_100[0];
                                 p1_1[22] = _vec_load_100[1];
@@ -3207,9 +4364,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[23] = partial_lse[part_row_87];
                                 float _vec_load_101[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_207 = *reinterpret_cast<const float2*>(partial_out + (part_row_87 * 256 + dim_1[0]) + 0);
                                     _vec_load_101[0] = _v2_207.x;
                                     _vec_load_101[0 + 1] = _v2_207.y;
+#else
+                                    float2 _v2_230 = *reinterpret_cast<const float2*>(partial_out + (part_row_87 * 256 + dim_1[0]) + 0);
+                                    _vec_load_101[0] = _v2_230.x;
+                                    _vec_load_101[0 + 1] = _v2_230.y;
+#endif
                                 }
                                 p0_1[23] = _vec_load_101[0];
                                 p1_1[23] = _vec_load_101[1];
@@ -3220,9 +4383,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[24] = partial_lse[part_row_88];
                                 float _vec_load_102[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_208 = *reinterpret_cast<const float2*>(partial_out + (part_row_88 * 256 + dim_1[0]) + 0);
                                     _vec_load_102[0] = _v2_208.x;
                                     _vec_load_102[0 + 1] = _v2_208.y;
+#else
+                                    float2 _v2_231 = *reinterpret_cast<const float2*>(partial_out + (part_row_88 * 256 + dim_1[0]) + 0);
+                                    _vec_load_102[0] = _v2_231.x;
+                                    _vec_load_102[0 + 1] = _v2_231.y;
+#endif
                                 }
                                 p0_1[24] = _vec_load_102[0];
                                 p1_1[24] = _vec_load_102[1];
@@ -3233,9 +4402,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[25] = partial_lse[part_row_89];
                                 float _vec_load_103[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_209 = *reinterpret_cast<const float2*>(partial_out + (part_row_89 * 256 + dim_1[0]) + 0);
                                     _vec_load_103[0] = _v2_209.x;
                                     _vec_load_103[0 + 1] = _v2_209.y;
+#else
+                                    float2 _v2_232 = *reinterpret_cast<const float2*>(partial_out + (part_row_89 * 256 + dim_1[0]) + 0);
+                                    _vec_load_103[0] = _v2_232.x;
+                                    _vec_load_103[0 + 1] = _v2_232.y;
+#endif
                                 }
                                 p0_1[25] = _vec_load_103[0];
                                 p1_1[25] = _vec_load_103[1];
@@ -3246,9 +4421,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[26] = partial_lse[part_row_90];
                                 float _vec_load_104[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_210 = *reinterpret_cast<const float2*>(partial_out + (part_row_90 * 256 + dim_1[0]) + 0);
                                     _vec_load_104[0] = _v2_210.x;
                                     _vec_load_104[0 + 1] = _v2_210.y;
+#else
+                                    float2 _v2_233 = *reinterpret_cast<const float2*>(partial_out + (part_row_90 * 256 + dim_1[0]) + 0);
+                                    _vec_load_104[0] = _v2_233.x;
+                                    _vec_load_104[0 + 1] = _v2_233.y;
+#endif
                                 }
                                 p0_1[26] = _vec_load_104[0];
                                 p1_1[26] = _vec_load_104[1];
@@ -3259,9 +4440,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[27] = partial_lse[part_row_91];
                                 float _vec_load_105[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_211 = *reinterpret_cast<const float2*>(partial_out + (part_row_91 * 256 + dim_1[0]) + 0);
                                     _vec_load_105[0] = _v2_211.x;
                                     _vec_load_105[0 + 1] = _v2_211.y;
+#else
+                                    float2 _v2_234 = *reinterpret_cast<const float2*>(partial_out + (part_row_91 * 256 + dim_1[0]) + 0);
+                                    _vec_load_105[0] = _v2_234.x;
+                                    _vec_load_105[0 + 1] = _v2_234.y;
+#endif
                                 }
                                 p0_1[27] = _vec_load_105[0];
                                 p1_1[27] = _vec_load_105[1];
@@ -3272,9 +4459,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[28] = partial_lse[part_row_92];
                                 float _vec_load_106[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_212 = *reinterpret_cast<const float2*>(partial_out + (part_row_92 * 256 + dim_1[0]) + 0);
                                     _vec_load_106[0] = _v2_212.x;
                                     _vec_load_106[0 + 1] = _v2_212.y;
+#else
+                                    float2 _v2_235 = *reinterpret_cast<const float2*>(partial_out + (part_row_92 * 256 + dim_1[0]) + 0);
+                                    _vec_load_106[0] = _v2_235.x;
+                                    _vec_load_106[0 + 1] = _v2_235.y;
+#endif
                                 }
                                 p0_1[28] = _vec_load_106[0];
                                 p1_1[28] = _vec_load_106[1];
@@ -3285,9 +4478,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[29] = partial_lse[part_row_93];
                                 float _vec_load_107[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_213 = *reinterpret_cast<const float2*>(partial_out + (part_row_93 * 256 + dim_1[0]) + 0);
                                     _vec_load_107[0] = _v2_213.x;
                                     _vec_load_107[0 + 1] = _v2_213.y;
+#else
+                                    float2 _v2_236 = *reinterpret_cast<const float2*>(partial_out + (part_row_93 * 256 + dim_1[0]) + 0);
+                                    _vec_load_107[0] = _v2_236.x;
+                                    _vec_load_107[0 + 1] = _v2_236.y;
+#endif
                                 }
                                 p0_1[29] = _vec_load_107[0];
                                 p1_1[29] = _vec_load_107[1];
@@ -3298,9 +4497,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[30] = partial_lse[part_row_94];
                                 float _vec_load_108[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_214 = *reinterpret_cast<const float2*>(partial_out + (part_row_94 * 256 + dim_1[0]) + 0);
                                     _vec_load_108[0] = _v2_214.x;
                                     _vec_load_108[0 + 1] = _v2_214.y;
+#else
+                                    float2 _v2_237 = *reinterpret_cast<const float2*>(partial_out + (part_row_94 * 256 + dim_1[0]) + 0);
+                                    _vec_load_108[0] = _v2_237.x;
+                                    _vec_load_108[0 + 1] = _v2_237.y;
+#endif
                                 }
                                 p0_1[30] = _vec_load_108[0];
                                 p1_1[30] = _vec_load_108[1];
@@ -3311,9 +4516,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[31] = partial_lse[part_row_95];
                                 float _vec_load_109[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_215 = *reinterpret_cast<const float2*>(partial_out + (part_row_95 * 256 + dim_1[0]) + 0);
                                     _vec_load_109[0] = _v2_215.x;
                                     _vec_load_109[0 + 1] = _v2_215.y;
+#else
+                                    float2 _v2_238 = *reinterpret_cast<const float2*>(partial_out + (part_row_95 * 256 + dim_1[0]) + 0);
+                                    _vec_load_109[0] = _v2_238.x;
+                                    _vec_load_109[0 + 1] = _v2_238.y;
+#endif
                                 }
                                 p0_1[31] = _vec_load_109[0];
                                 p1_1[31] = _vec_load_109[1];
@@ -3324,9 +4535,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[32] = partial_lse[part_row_96];
                                 float _vec_load_110[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_216 = *reinterpret_cast<const float2*>(partial_out + (part_row_96 * 256 + dim_1[0]) + 0);
                                     _vec_load_110[0] = _v2_216.x;
                                     _vec_load_110[0 + 1] = _v2_216.y;
+#else
+                                    float2 _v2_239 = *reinterpret_cast<const float2*>(partial_out + (part_row_96 * 256 + dim_1[0]) + 0);
+                                    _vec_load_110[0] = _v2_239.x;
+                                    _vec_load_110[0 + 1] = _v2_239.y;
+#endif
                                 }
                                 p0_1[32] = _vec_load_110[0];
                                 p1_1[32] = _vec_load_110[1];
@@ -3337,9 +4554,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[33] = partial_lse[part_row_97];
                                 float _vec_load_111[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_217 = *reinterpret_cast<const float2*>(partial_out + (part_row_97 * 256 + dim_1[0]) + 0);
                                     _vec_load_111[0] = _v2_217.x;
                                     _vec_load_111[0 + 1] = _v2_217.y;
+#else
+                                    float2 _v2_240 = *reinterpret_cast<const float2*>(partial_out + (part_row_97 * 256 + dim_1[0]) + 0);
+                                    _vec_load_111[0] = _v2_240.x;
+                                    _vec_load_111[0 + 1] = _v2_240.y;
+#endif
                                 }
                                 p0_1[33] = _vec_load_111[0];
                                 p1_1[33] = _vec_load_111[1];
@@ -3350,9 +4573,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[34] = partial_lse[part_row_98];
                                 float _vec_load_112[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_218 = *reinterpret_cast<const float2*>(partial_out + (part_row_98 * 256 + dim_1[0]) + 0);
                                     _vec_load_112[0] = _v2_218.x;
                                     _vec_load_112[0 + 1] = _v2_218.y;
+#else
+                                    float2 _v2_241 = *reinterpret_cast<const float2*>(partial_out + (part_row_98 * 256 + dim_1[0]) + 0);
+                                    _vec_load_112[0] = _v2_241.x;
+                                    _vec_load_112[0 + 1] = _v2_241.y;
+#endif
                                 }
                                 p0_1[34] = _vec_load_112[0];
                                 p1_1[34] = _vec_load_112[1];
@@ -3363,9 +4592,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[35] = partial_lse[part_row_99];
                                 float _vec_load_113[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     float2 _v2_219 = *reinterpret_cast<const float2*>(partial_out + (part_row_99 * 256 + dim_1[0]) + 0);
                                     _vec_load_113[0] = _v2_219.x;
                                     _vec_load_113[0 + 1] = _v2_219.y;
+#else
+                                    float2 _v2_242 = *reinterpret_cast<const float2*>(partial_out + (part_row_99 * 256 + dim_1[0]) + 0);
+                                    _vec_load_113[0] = _v2_242.x;
+                                    _vec_load_113[0 + 1] = _v2_242.y;
+#endif
                                 }
                                 p0_1[35] = _vec_load_113[0];
                                 p1_1[35] = _vec_load_113[1];
@@ -4249,11 +5484,17 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 acc1_k_1 = acc1_k_1 + acc1_1[3];
                                 float inv_3 = 0.0f;
                                 if (den_k_1 > 0.0f) {
+#if __CUDA_ARCH__ == 1070
                                     float _rcp_220 = approx_rcp(den_k_1);
                                     inv_3 = _rcp_220;
+#else
+                                    float _rcp_243 = approx_rcp(den_k_1);
+                                    inv_3 = _rcp_243;
+#endif
                                 }
                                 float attn0_1 = (float)(__nv_bfloat16)(acc0_k_1 * inv_3);
                                 float attn1_1 = (float)(__nv_bfloat16)(acc1_k_1 * inv_3);
+#if __CUDA_ARCH__ == 1070
                                 float _exp2_222 = approx_exp2((-gate0_1[0]) * 1.442695f);
                                 float _rcp_221 = approx_rcp(1.0f + _exp2_222);
                                 float result0_1 = attn0_1 * _rcp_221;
@@ -4262,6 +5503,16 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 float result1_1 = attn1_1 * _rcp_223;
                                 __nv_bfloat162 _bit_cast_src_225 = __float22bfloat162_rn(make_float2(result0_1, result1_1));
                                 word_1[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_225)[0];
+#else
+                                float _exp2_245 = approx_exp2((-gate0_1[0]) * 1.442695f);
+                                float _rcp_244 = approx_rcp(1.0f + _exp2_245);
+                                float result0_1 = attn0_1 * _rcp_244;
+                                float _exp2_247 = approx_exp2((-gate1_1[0]) * 1.442695f);
+                                float _rcp_246 = approx_rcp(1.0f + _exp2_247);
+                                float result1_1 = attn1_1 * _rcp_246;
+                                __nv_bfloat162 _bit_cast_src_248 = __float22bfloat162_rn(make_float2(result0_1, result1_1));
+                                word_1[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_248)[0];
+#endif
                                 long long out_offset_1 = row_i64 * out_stride_row + qo_head_3[0] * out_stride_head + dim_1[0];
                                 *(reinterpret_cast<unsigned int*>(out + out_offset_1) + (0)) = word_1[0];
                             }
@@ -4316,10 +5567,17 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_max_2[0] = -CUDART_INF_F;
                                 float _vec_load_114[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     uint32_t _bf16x2_bits_226;
                                     _bf16x2_bits_226 = *reinterpret_cast<const uint32_t*>(gate + (row_head_2[0] * 256 + dim_2[0]) + 0);
                                     (&_vec_load_114[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_226) << 16);
                                     (&_vec_load_114[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_226) & 0xffff0000u);
+#else
+                                    uint32_t _bf16x2_bits_249;
+                                    _bf16x2_bits_249 = *reinterpret_cast<const uint32_t*>(gate + (row_head_2[0] * 256 + dim_2[0]) + 0);
+                                    (&_vec_load_114[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_249) << 16);
+                                    (&_vec_load_114[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_249) & 0xffff0000u);
+#endif
                                 }
                                 gate0_2[0] = _vec_load_114[0];
                                 gate1_2[0] = _vec_load_114[1];
@@ -4344,10 +5602,17 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_max_2[1] = -CUDART_INF_F;
                                 float _vec_load_115[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     uint32_t _bf16x2_bits_227;
                                     _bf16x2_bits_227 = *reinterpret_cast<const uint32_t*>(gate + (row_head_2[1] * 256 + dim_2[1]) + 0);
                                     (&_vec_load_115[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_227) << 16);
                                     (&_vec_load_115[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_227) & 0xffff0000u);
+#else
+                                    uint32_t _bf16x2_bits_250;
+                                    _bf16x2_bits_250 = *reinterpret_cast<const uint32_t*>(gate + (row_head_2[1] * 256 + dim_2[1]) + 0);
+                                    (&_vec_load_115[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_250) << 16);
+                                    (&_vec_load_115[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_250) & 0xffff0000u);
+#endif
                                 }
                                 gate0_2[1] = _vec_load_115[0];
                                 gate1_2[1] = _vec_load_115[1];
@@ -4357,9 +5622,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[0] = partial_lse[part_row_100];
                                     float _vec_load_116[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_228 = *reinterpret_cast<const float2*>(partial_out + (part_row_100 * 256 + dim_2[0]) + 0);
                                         _vec_load_116[0] = _v2_228.x;
                                         _vec_load_116[0 + 1] = _v2_228.y;
+#else
+                                        float2 _v2_251 = *reinterpret_cast<const float2*>(partial_out + (part_row_100 * 256 + dim_2[0]) + 0);
+                                        _vec_load_116[0] = _v2_251.x;
+                                        _vec_load_116[0 + 1] = _v2_251.y;
+#endif
                                     }
                                     p0_2[0] = _vec_load_116[0];
                                     p1_2[0] = _vec_load_116[1];
@@ -4370,9 +5641,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[1] = partial_lse[part_row_101];
                                     float _vec_load_117[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_229 = *reinterpret_cast<const float2*>(partial_out + (part_row_101 * 256 + dim_2[0]) + 0);
                                         _vec_load_117[0] = _v2_229.x;
                                         _vec_load_117[0 + 1] = _v2_229.y;
+#else
+                                        float2 _v2_252 = *reinterpret_cast<const float2*>(partial_out + (part_row_101 * 256 + dim_2[0]) + 0);
+                                        _vec_load_117[0] = _v2_252.x;
+                                        _vec_load_117[0 + 1] = _v2_252.y;
+#endif
                                     }
                                     p0_2[1] = _vec_load_117[0];
                                     p1_2[1] = _vec_load_117[1];
@@ -4383,9 +5660,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[2] = partial_lse[part_row_102];
                                     float _vec_load_118[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_230 = *reinterpret_cast<const float2*>(partial_out + (part_row_102 * 256 + dim_2[0]) + 0);
                                         _vec_load_118[0] = _v2_230.x;
                                         _vec_load_118[0 + 1] = _v2_230.y;
+#else
+                                        float2 _v2_253 = *reinterpret_cast<const float2*>(partial_out + (part_row_102 * 256 + dim_2[0]) + 0);
+                                        _vec_load_118[0] = _v2_253.x;
+                                        _vec_load_118[0 + 1] = _v2_253.y;
+#endif
                                     }
                                     p0_2[2] = _vec_load_118[0];
                                     p1_2[2] = _vec_load_118[1];
@@ -4396,9 +5679,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[3] = partial_lse[part_row_103];
                                     float _vec_load_119[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_231 = *reinterpret_cast<const float2*>(partial_out + (part_row_103 * 256 + dim_2[0]) + 0);
                                         _vec_load_119[0] = _v2_231.x;
                                         _vec_load_119[0 + 1] = _v2_231.y;
+#else
+                                        float2 _v2_254 = *reinterpret_cast<const float2*>(partial_out + (part_row_103 * 256 + dim_2[0]) + 0);
+                                        _vec_load_119[0] = _v2_254.x;
+                                        _vec_load_119[0 + 1] = _v2_254.y;
+#endif
                                     }
                                     p0_2[3] = _vec_load_119[0];
                                     p1_2[3] = _vec_load_119[1];
@@ -4409,9 +5698,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[4] = partial_lse[part_row_104];
                                     float _vec_load_120[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_232 = *reinterpret_cast<const float2*>(partial_out + (part_row_104 * 256 + dim_2[0]) + 0);
                                         _vec_load_120[0] = _v2_232.x;
                                         _vec_load_120[0 + 1] = _v2_232.y;
+#else
+                                        float2 _v2_255 = *reinterpret_cast<const float2*>(partial_out + (part_row_104 * 256 + dim_2[0]) + 0);
+                                        _vec_load_120[0] = _v2_255.x;
+                                        _vec_load_120[0 + 1] = _v2_255.y;
+#endif
                                     }
                                     p0_2[4] = _vec_load_120[0];
                                     p1_2[4] = _vec_load_120[1];
@@ -4422,9 +5717,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[5] = partial_lse[part_row_105];
                                     float _vec_load_121[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_233 = *reinterpret_cast<const float2*>(partial_out + (part_row_105 * 256 + dim_2[0]) + 0);
                                         _vec_load_121[0] = _v2_233.x;
                                         _vec_load_121[0 + 1] = _v2_233.y;
+#else
+                                        float2 _v2_256 = *reinterpret_cast<const float2*>(partial_out + (part_row_105 * 256 + dim_2[0]) + 0);
+                                        _vec_load_121[0] = _v2_256.x;
+                                        _vec_load_121[0 + 1] = _v2_256.y;
+#endif
                                     }
                                     p0_2[5] = _vec_load_121[0];
                                     p1_2[5] = _vec_load_121[1];
@@ -4435,9 +5736,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[6] = partial_lse[part_row_106];
                                     float _vec_load_122[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_234 = *reinterpret_cast<const float2*>(partial_out + (part_row_106 * 256 + dim_2[0]) + 0);
                                         _vec_load_122[0] = _v2_234.x;
                                         _vec_load_122[0 + 1] = _v2_234.y;
+#else
+                                        float2 _v2_257 = *reinterpret_cast<const float2*>(partial_out + (part_row_106 * 256 + dim_2[0]) + 0);
+                                        _vec_load_122[0] = _v2_257.x;
+                                        _vec_load_122[0 + 1] = _v2_257.y;
+#endif
                                     }
                                     p0_2[6] = _vec_load_122[0];
                                     p1_2[6] = _vec_load_122[1];
@@ -4448,9 +5755,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[7] = partial_lse[part_row_107];
                                     float _vec_load_123[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_235 = *reinterpret_cast<const float2*>(partial_out + (part_row_107 * 256 + dim_2[0]) + 0);
                                         _vec_load_123[0] = _v2_235.x;
                                         _vec_load_123[0 + 1] = _v2_235.y;
+#else
+                                        float2 _v2_258 = *reinterpret_cast<const float2*>(partial_out + (part_row_107 * 256 + dim_2[0]) + 0);
+                                        _vec_load_123[0] = _v2_258.x;
+                                        _vec_load_123[0 + 1] = _v2_258.y;
+#endif
                                     }
                                     p0_2[7] = _vec_load_123[0];
                                     p1_2[7] = _vec_load_123[1];
@@ -4461,9 +5774,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[8] = partial_lse[part_row_108];
                                     float _vec_load_124[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_236 = *reinterpret_cast<const float2*>(partial_out + (part_row_108 * 256 + dim_2[0]) + 0);
                                         _vec_load_124[0] = _v2_236.x;
                                         _vec_load_124[0 + 1] = _v2_236.y;
+#else
+                                        float2 _v2_259 = *reinterpret_cast<const float2*>(partial_out + (part_row_108 * 256 + dim_2[0]) + 0);
+                                        _vec_load_124[0] = _v2_259.x;
+                                        _vec_load_124[0 + 1] = _v2_259.y;
+#endif
                                     }
                                     p0_2[8] = _vec_load_124[0];
                                     p1_2[8] = _vec_load_124[1];
@@ -4474,9 +5793,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[9] = partial_lse[part_row_109];
                                     float _vec_load_125[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_237 = *reinterpret_cast<const float2*>(partial_out + (part_row_109 * 256 + dim_2[0]) + 0);
                                         _vec_load_125[0] = _v2_237.x;
                                         _vec_load_125[0 + 1] = _v2_237.y;
+#else
+                                        float2 _v2_260 = *reinterpret_cast<const float2*>(partial_out + (part_row_109 * 256 + dim_2[0]) + 0);
+                                        _vec_load_125[0] = _v2_260.x;
+                                        _vec_load_125[0 + 1] = _v2_260.y;
+#endif
                                     }
                                     p0_2[9] = _vec_load_125[0];
                                     p1_2[9] = _vec_load_125[1];
@@ -4487,9 +5812,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[10] = partial_lse[part_row_110];
                                     float _vec_load_126[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_238 = *reinterpret_cast<const float2*>(partial_out + (part_row_110 * 256 + dim_2[0]) + 0);
                                         _vec_load_126[0] = _v2_238.x;
                                         _vec_load_126[0 + 1] = _v2_238.y;
+#else
+                                        float2 _v2_261 = *reinterpret_cast<const float2*>(partial_out + (part_row_110 * 256 + dim_2[0]) + 0);
+                                        _vec_load_126[0] = _v2_261.x;
+                                        _vec_load_126[0 + 1] = _v2_261.y;
+#endif
                                     }
                                     p0_2[10] = _vec_load_126[0];
                                     p1_2[10] = _vec_load_126[1];
@@ -4500,9 +5831,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[11] = partial_lse[part_row_111];
                                     float _vec_load_127[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_239 = *reinterpret_cast<const float2*>(partial_out + (part_row_111 * 256 + dim_2[0]) + 0);
                                         _vec_load_127[0] = _v2_239.x;
                                         _vec_load_127[0 + 1] = _v2_239.y;
+#else
+                                        float2 _v2_262 = *reinterpret_cast<const float2*>(partial_out + (part_row_111 * 256 + dim_2[0]) + 0);
+                                        _vec_load_127[0] = _v2_262.x;
+                                        _vec_load_127[0 + 1] = _v2_262.y;
+#endif
                                     }
                                     p0_2[11] = _vec_load_127[0];
                                     p1_2[11] = _vec_load_127[1];
@@ -4513,9 +5850,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[12] = partial_lse[part_row_112];
                                     float _vec_load_128[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_240 = *reinterpret_cast<const float2*>(partial_out + (part_row_112 * 256 + dim_2[0]) + 0);
                                         _vec_load_128[0] = _v2_240.x;
                                         _vec_load_128[0 + 1] = _v2_240.y;
+#else
+                                        float2 _v2_263 = *reinterpret_cast<const float2*>(partial_out + (part_row_112 * 256 + dim_2[0]) + 0);
+                                        _vec_load_128[0] = _v2_263.x;
+                                        _vec_load_128[0 + 1] = _v2_263.y;
+#endif
                                     }
                                     p0_2[12] = _vec_load_128[0];
                                     p1_2[12] = _vec_load_128[1];
@@ -4526,9 +5869,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[13] = partial_lse[part_row_113];
                                     float _vec_load_129[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_241 = *reinterpret_cast<const float2*>(partial_out + (part_row_113 * 256 + dim_2[0]) + 0);
                                         _vec_load_129[0] = _v2_241.x;
                                         _vec_load_129[0 + 1] = _v2_241.y;
+#else
+                                        float2 _v2_264 = *reinterpret_cast<const float2*>(partial_out + (part_row_113 * 256 + dim_2[0]) + 0);
+                                        _vec_load_129[0] = _v2_264.x;
+                                        _vec_load_129[0 + 1] = _v2_264.y;
+#endif
                                     }
                                     p0_2[13] = _vec_load_129[0];
                                     p1_2[13] = _vec_load_129[1];
@@ -4539,9 +5888,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[14] = partial_lse[part_row_114];
                                     float _vec_load_130[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_242 = *reinterpret_cast<const float2*>(partial_out + (part_row_114 * 256 + dim_2[0]) + 0);
                                         _vec_load_130[0] = _v2_242.x;
                                         _vec_load_130[0 + 1] = _v2_242.y;
+#else
+                                        float2 _v2_265 = *reinterpret_cast<const float2*>(partial_out + (part_row_114 * 256 + dim_2[0]) + 0);
+                                        _vec_load_130[0] = _v2_265.x;
+                                        _vec_load_130[0 + 1] = _v2_265.y;
+#endif
                                     }
                                     p0_2[14] = _vec_load_130[0];
                                     p1_2[14] = _vec_load_130[1];
@@ -4552,9 +5907,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[15] = partial_lse[part_row_115];
                                     float _vec_load_131[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_243 = *reinterpret_cast<const float2*>(partial_out + (part_row_115 * 256 + dim_2[0]) + 0);
                                         _vec_load_131[0] = _v2_243.x;
                                         _vec_load_131[0 + 1] = _v2_243.y;
+#else
+                                        float2 _v2_266 = *reinterpret_cast<const float2*>(partial_out + (part_row_115 * 256 + dim_2[0]) + 0);
+                                        _vec_load_131[0] = _v2_266.x;
+                                        _vec_load_131[0 + 1] = _v2_266.y;
+#endif
                                     }
                                     p0_2[15] = _vec_load_131[0];
                                     p1_2[15] = _vec_load_131[1];
@@ -4565,9 +5926,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[16] = partial_lse[part_row_116];
                                     float _vec_load_132[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_244 = *reinterpret_cast<const float2*>(partial_out + (part_row_116 * 256 + dim_2[1]) + 0);
                                         _vec_load_132[0] = _v2_244.x;
                                         _vec_load_132[0 + 1] = _v2_244.y;
+#else
+                                        float2 _v2_267 = *reinterpret_cast<const float2*>(partial_out + (part_row_116 * 256 + dim_2[1]) + 0);
+                                        _vec_load_132[0] = _v2_267.x;
+                                        _vec_load_132[0 + 1] = _v2_267.y;
+#endif
                                     }
                                     p0_2[16] = _vec_load_132[0];
                                     p1_2[16] = _vec_load_132[1];
@@ -4578,9 +5945,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[17] = partial_lse[part_row_117];
                                     float _vec_load_133[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_245 = *reinterpret_cast<const float2*>(partial_out + (part_row_117 * 256 + dim_2[1]) + 0);
                                         _vec_load_133[0] = _v2_245.x;
                                         _vec_load_133[0 + 1] = _v2_245.y;
+#else
+                                        float2 _v2_268 = *reinterpret_cast<const float2*>(partial_out + (part_row_117 * 256 + dim_2[1]) + 0);
+                                        _vec_load_133[0] = _v2_268.x;
+                                        _vec_load_133[0 + 1] = _v2_268.y;
+#endif
                                     }
                                     p0_2[17] = _vec_load_133[0];
                                     p1_2[17] = _vec_load_133[1];
@@ -4591,9 +5964,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[18] = partial_lse[part_row_118];
                                     float _vec_load_134[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_246 = *reinterpret_cast<const float2*>(partial_out + (part_row_118 * 256 + dim_2[1]) + 0);
                                         _vec_load_134[0] = _v2_246.x;
                                         _vec_load_134[0 + 1] = _v2_246.y;
+#else
+                                        float2 _v2_269 = *reinterpret_cast<const float2*>(partial_out + (part_row_118 * 256 + dim_2[1]) + 0);
+                                        _vec_load_134[0] = _v2_269.x;
+                                        _vec_load_134[0 + 1] = _v2_269.y;
+#endif
                                     }
                                     p0_2[18] = _vec_load_134[0];
                                     p1_2[18] = _vec_load_134[1];
@@ -4604,9 +5983,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[19] = partial_lse[part_row_119];
                                     float _vec_load_135[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_247 = *reinterpret_cast<const float2*>(partial_out + (part_row_119 * 256 + dim_2[1]) + 0);
                                         _vec_load_135[0] = _v2_247.x;
                                         _vec_load_135[0 + 1] = _v2_247.y;
+#else
+                                        float2 _v2_270 = *reinterpret_cast<const float2*>(partial_out + (part_row_119 * 256 + dim_2[1]) + 0);
+                                        _vec_load_135[0] = _v2_270.x;
+                                        _vec_load_135[0 + 1] = _v2_270.y;
+#endif
                                     }
                                     p0_2[19] = _vec_load_135[0];
                                     p1_2[19] = _vec_load_135[1];
@@ -4617,9 +6002,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[20] = partial_lse[part_row_120];
                                     float _vec_load_136[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_248 = *reinterpret_cast<const float2*>(partial_out + (part_row_120 * 256 + dim_2[1]) + 0);
                                         _vec_load_136[0] = _v2_248.x;
                                         _vec_load_136[0 + 1] = _v2_248.y;
+#else
+                                        float2 _v2_271 = *reinterpret_cast<const float2*>(partial_out + (part_row_120 * 256 + dim_2[1]) + 0);
+                                        _vec_load_136[0] = _v2_271.x;
+                                        _vec_load_136[0 + 1] = _v2_271.y;
+#endif
                                     }
                                     p0_2[20] = _vec_load_136[0];
                                     p1_2[20] = _vec_load_136[1];
@@ -4630,9 +6021,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[21] = partial_lse[part_row_121];
                                     float _vec_load_137[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_249 = *reinterpret_cast<const float2*>(partial_out + (part_row_121 * 256 + dim_2[1]) + 0);
                                         _vec_load_137[0] = _v2_249.x;
                                         _vec_load_137[0 + 1] = _v2_249.y;
+#else
+                                        float2 _v2_272 = *reinterpret_cast<const float2*>(partial_out + (part_row_121 * 256 + dim_2[1]) + 0);
+                                        _vec_load_137[0] = _v2_272.x;
+                                        _vec_load_137[0 + 1] = _v2_272.y;
+#endif
                                     }
                                     p0_2[21] = _vec_load_137[0];
                                     p1_2[21] = _vec_load_137[1];
@@ -4643,9 +6040,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[22] = partial_lse[part_row_122];
                                     float _vec_load_138[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_250 = *reinterpret_cast<const float2*>(partial_out + (part_row_122 * 256 + dim_2[1]) + 0);
                                         _vec_load_138[0] = _v2_250.x;
                                         _vec_load_138[0 + 1] = _v2_250.y;
+#else
+                                        float2 _v2_273 = *reinterpret_cast<const float2*>(partial_out + (part_row_122 * 256 + dim_2[1]) + 0);
+                                        _vec_load_138[0] = _v2_273.x;
+                                        _vec_load_138[0 + 1] = _v2_273.y;
+#endif
                                     }
                                     p0_2[22] = _vec_load_138[0];
                                     p1_2[22] = _vec_load_138[1];
@@ -4656,9 +6059,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[23] = partial_lse[part_row_123];
                                     float _vec_load_139[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_251 = *reinterpret_cast<const float2*>(partial_out + (part_row_123 * 256 + dim_2[1]) + 0);
                                         _vec_load_139[0] = _v2_251.x;
                                         _vec_load_139[0 + 1] = _v2_251.y;
+#else
+                                        float2 _v2_274 = *reinterpret_cast<const float2*>(partial_out + (part_row_123 * 256 + dim_2[1]) + 0);
+                                        _vec_load_139[0] = _v2_274.x;
+                                        _vec_load_139[0 + 1] = _v2_274.y;
+#endif
                                     }
                                     p0_2[23] = _vec_load_139[0];
                                     p1_2[23] = _vec_load_139[1];
@@ -4669,9 +6078,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[24] = partial_lse[part_row_124];
                                     float _vec_load_140[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_252 = *reinterpret_cast<const float2*>(partial_out + (part_row_124 * 256 + dim_2[1]) + 0);
                                         _vec_load_140[0] = _v2_252.x;
                                         _vec_load_140[0 + 1] = _v2_252.y;
+#else
+                                        float2 _v2_275 = *reinterpret_cast<const float2*>(partial_out + (part_row_124 * 256 + dim_2[1]) + 0);
+                                        _vec_load_140[0] = _v2_275.x;
+                                        _vec_load_140[0 + 1] = _v2_275.y;
+#endif
                                     }
                                     p0_2[24] = _vec_load_140[0];
                                     p1_2[24] = _vec_load_140[1];
@@ -4682,9 +6097,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[25] = partial_lse[part_row_125];
                                     float _vec_load_141[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_253 = *reinterpret_cast<const float2*>(partial_out + (part_row_125 * 256 + dim_2[1]) + 0);
                                         _vec_load_141[0] = _v2_253.x;
                                         _vec_load_141[0 + 1] = _v2_253.y;
+#else
+                                        float2 _v2_276 = *reinterpret_cast<const float2*>(partial_out + (part_row_125 * 256 + dim_2[1]) + 0);
+                                        _vec_load_141[0] = _v2_276.x;
+                                        _vec_load_141[0 + 1] = _v2_276.y;
+#endif
                                     }
                                     p0_2[25] = _vec_load_141[0];
                                     p1_2[25] = _vec_load_141[1];
@@ -4695,9 +6116,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[26] = partial_lse[part_row_126];
                                     float _vec_load_142[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_254 = *reinterpret_cast<const float2*>(partial_out + (part_row_126 * 256 + dim_2[1]) + 0);
                                         _vec_load_142[0] = _v2_254.x;
                                         _vec_load_142[0 + 1] = _v2_254.y;
+#else
+                                        float2 _v2_277 = *reinterpret_cast<const float2*>(partial_out + (part_row_126 * 256 + dim_2[1]) + 0);
+                                        _vec_load_142[0] = _v2_277.x;
+                                        _vec_load_142[0 + 1] = _v2_277.y;
+#endif
                                     }
                                     p0_2[26] = _vec_load_142[0];
                                     p1_2[26] = _vec_load_142[1];
@@ -4708,9 +6135,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[27] = partial_lse[part_row_127];
                                     float _vec_load_143[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_255 = *reinterpret_cast<const float2*>(partial_out + (part_row_127 * 256 + dim_2[1]) + 0);
                                         _vec_load_143[0] = _v2_255.x;
                                         _vec_load_143[0 + 1] = _v2_255.y;
+#else
+                                        float2 _v2_278 = *reinterpret_cast<const float2*>(partial_out + (part_row_127 * 256 + dim_2[1]) + 0);
+                                        _vec_load_143[0] = _v2_278.x;
+                                        _vec_load_143[0 + 1] = _v2_278.y;
+#endif
                                     }
                                     p0_2[27] = _vec_load_143[0];
                                     p1_2[27] = _vec_load_143[1];
@@ -4721,9 +6154,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[28] = partial_lse[part_row_128];
                                     float _vec_load_144[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_256 = *reinterpret_cast<const float2*>(partial_out + (part_row_128 * 256 + dim_2[1]) + 0);
                                         _vec_load_144[0] = _v2_256.x;
                                         _vec_load_144[0 + 1] = _v2_256.y;
+#else
+                                        float2 _v2_279 = *reinterpret_cast<const float2*>(partial_out + (part_row_128 * 256 + dim_2[1]) + 0);
+                                        _vec_load_144[0] = _v2_279.x;
+                                        _vec_load_144[0 + 1] = _v2_279.y;
+#endif
                                     }
                                     p0_2[28] = _vec_load_144[0];
                                     p1_2[28] = _vec_load_144[1];
@@ -4734,9 +6173,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[29] = partial_lse[part_row_129];
                                     float _vec_load_145[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_257 = *reinterpret_cast<const float2*>(partial_out + (part_row_129 * 256 + dim_2[1]) + 0);
                                         _vec_load_145[0] = _v2_257.x;
                                         _vec_load_145[0 + 1] = _v2_257.y;
+#else
+                                        float2 _v2_280 = *reinterpret_cast<const float2*>(partial_out + (part_row_129 * 256 + dim_2[1]) + 0);
+                                        _vec_load_145[0] = _v2_280.x;
+                                        _vec_load_145[0 + 1] = _v2_280.y;
+#endif
                                     }
                                     p0_2[29] = _vec_load_145[0];
                                     p1_2[29] = _vec_load_145[1];
@@ -4747,9 +6192,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[30] = partial_lse[part_row_130];
                                     float _vec_load_146[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_258 = *reinterpret_cast<const float2*>(partial_out + (part_row_130 * 256 + dim_2[1]) + 0);
                                         _vec_load_146[0] = _v2_258.x;
                                         _vec_load_146[0 + 1] = _v2_258.y;
+#else
+                                        float2 _v2_281 = *reinterpret_cast<const float2*>(partial_out + (part_row_130 * 256 + dim_2[1]) + 0);
+                                        _vec_load_146[0] = _v2_281.x;
+                                        _vec_load_146[0 + 1] = _v2_281.y;
+#endif
                                     }
                                     p0_2[30] = _vec_load_146[0];
                                     p1_2[30] = _vec_load_146[1];
@@ -4760,9 +6211,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[31] = partial_lse[part_row_131];
                                     float _vec_load_147[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_259 = *reinterpret_cast<const float2*>(partial_out + (part_row_131 * 256 + dim_2[1]) + 0);
                                         _vec_load_147[0] = _v2_259.x;
                                         _vec_load_147[0 + 1] = _v2_259.y;
+#else
+                                        float2 _v2_282 = *reinterpret_cast<const float2*>(partial_out + (part_row_131 * 256 + dim_2[1]) + 0);
+                                        _vec_load_147[0] = _v2_282.x;
+                                        _vec_load_147[0 + 1] = _v2_282.y;
+#endif
                                     }
                                     p0_2[31] = _vec_load_147[0];
                                     p1_2[31] = _vec_load_147[1];
@@ -5550,11 +7007,17 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     acc1_k_2 = acc1_k_2 + acc1_2[3];
                                     float inv_4 = 0.0f;
                                     if (den_k_2 > 0.0f) {
+#if __CUDA_ARCH__ == 1070
                                         float _rcp_260 = approx_rcp(den_k_2);
                                         inv_4 = _rcp_260;
+#else
+                                        float _rcp_283 = approx_rcp(den_k_2);
+                                        inv_4 = _rcp_283;
+#endif
                                     }
                                     float attn0_2 = (float)(__nv_bfloat16)(acc0_k_2 * inv_4);
                                     float attn1_2 = (float)(__nv_bfloat16)(acc1_k_2 * inv_4);
+#if __CUDA_ARCH__ == 1070
                                     float _exp2_262 = approx_exp2((-gate0_2[0]) * 1.442695f);
                                     float _rcp_261 = approx_rcp(1.0f + _exp2_262);
                                     float result0_2 = attn0_2 * _rcp_261;
@@ -5563,6 +7026,16 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     float result1_2 = attn1_2 * _rcp_263;
                                     __nv_bfloat162 _bit_cast_src_265 = __float22bfloat162_rn(make_float2(result0_2, result1_2));
                                     word_2[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_265)[0];
+#else
+                                    float _exp2_285 = approx_exp2((-gate0_2[0]) * 1.442695f);
+                                    float _rcp_284 = approx_rcp(1.0f + _exp2_285);
+                                    float result0_2 = attn0_2 * _rcp_284;
+                                    float _exp2_287 = approx_exp2((-gate1_2[0]) * 1.442695f);
+                                    float _rcp_286 = approx_rcp(1.0f + _exp2_287);
+                                    float result1_2 = attn1_2 * _rcp_286;
+                                    __nv_bfloat162 _bit_cast_src_288 = __float22bfloat162_rn(make_float2(result0_2, result1_2));
+                                    word_2[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_288)[0];
+#endif
                                     long long out_offset_2 = row_i64 * out_stride_row + qo_head_4[0] * out_stride_head + dim_2[0];
                                     *(reinterpret_cast<unsigned int*>(out + out_offset_2) + (0)) = word_2[0];
                                 }
@@ -5581,11 +7054,17 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     acc1_k_3 = acc1_k_3 + acc1_2[7];
                                     float inv_5 = 0.0f;
                                     if (den_k_3 > 0.0f) {
+#if __CUDA_ARCH__ == 1070
                                         float _rcp_266 = approx_rcp(den_k_3);
                                         inv_5 = _rcp_266;
+#else
+                                        float _rcp_289 = approx_rcp(den_k_3);
+                                        inv_5 = _rcp_289;
+#endif
                                     }
                                     float attn0_3 = (float)(__nv_bfloat16)(acc0_k_3 * inv_5);
                                     float attn1_3 = (float)(__nv_bfloat16)(acc1_k_3 * inv_5);
+#if __CUDA_ARCH__ == 1070
                                     float _exp2_268 = approx_exp2((-gate0_2[1]) * 1.442695f);
                                     float _rcp_267 = approx_rcp(1.0f + _exp2_268);
                                     float result0_3 = attn0_3 * _rcp_267;
@@ -5594,6 +7073,16 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     float result1_3 = attn1_3 * _rcp_269;
                                     __nv_bfloat162 _bit_cast_src_271 = __float22bfloat162_rn(make_float2(result0_3, result1_3));
                                     word_2[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_271)[0];
+#else
+                                    float _exp2_291 = approx_exp2((-gate0_2[1]) * 1.442695f);
+                                    float _rcp_290 = approx_rcp(1.0f + _exp2_291);
+                                    float result0_3 = attn0_3 * _rcp_290;
+                                    float _exp2_293 = approx_exp2((-gate1_2[1]) * 1.442695f);
+                                    float _rcp_292 = approx_rcp(1.0f + _exp2_293);
+                                    float result1_3 = attn1_3 * _rcp_292;
+                                    __nv_bfloat162 _bit_cast_src_294 = __float22bfloat162_rn(make_float2(result0_3, result1_3));
+                                    word_2[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_294)[0];
+#endif
                                     long long out_offset_3 = row_i64 * out_stride_row + qo_head_4[1] * out_stride_head + dim_2[1];
                                     *(reinterpret_cast<unsigned int*>(out + out_offset_3) + (0)) = word_2[0];
                                 }
@@ -5647,10 +7136,17 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_max_3[0] = -CUDART_INF_F;
                                 float _vec_load_148[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     uint32_t _bf16x2_bits_272;
                                     _bf16x2_bits_272 = *reinterpret_cast<const uint32_t*>(gate + (row_head_3[0] * 256 + dim_3[0]) + 0);
                                     (&_vec_load_148[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_272) << 16);
                                     (&_vec_load_148[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_272) & 0xffff0000u);
+#else
+                                    uint32_t _bf16x2_bits_295;
+                                    _bf16x2_bits_295 = *reinterpret_cast<const uint32_t*>(gate + (row_head_3[0] * 256 + dim_3[0]) + 0);
+                                    (&_vec_load_148[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_295) << 16);
+                                    (&_vec_load_148[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_295) & 0xffff0000u);
+#endif
                                 }
                                 gate0_3[0] = _vec_load_148[0];
                                 gate1_3[0] = _vec_load_148[1];
@@ -5675,10 +7171,17 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_max_3[1] = -CUDART_INF_F;
                                 float _vec_load_149[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     uint32_t _bf16x2_bits_273;
                                     _bf16x2_bits_273 = *reinterpret_cast<const uint32_t*>(gate + (row_head_3[1] * 256 + dim_3[1]) + 0);
                                     (&_vec_load_149[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_273) << 16);
                                     (&_vec_load_149[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_273) & 0xffff0000u);
+#else
+                                    uint32_t _bf16x2_bits_296;
+                                    _bf16x2_bits_296 = *reinterpret_cast<const uint32_t*>(gate + (row_head_3[1] * 256 + dim_3[1]) + 0);
+                                    (&_vec_load_149[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_296) << 16);
+                                    (&_vec_load_149[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_296) & 0xffff0000u);
+#endif
                                 }
                                 gate0_3[1] = _vec_load_149[0];
                                 gate1_3[1] = _vec_load_149[1];
@@ -5688,9 +7191,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[0] = partial_lse[part_row_132];
                                     float _vec_load_150[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_274 = *reinterpret_cast<const float2*>(partial_out + (part_row_132 * 256 + dim_3[0]) + 0);
                                         _vec_load_150[0] = _v2_274.x;
                                         _vec_load_150[0 + 1] = _v2_274.y;
+#else
+                                        float2 _v2_297 = *reinterpret_cast<const float2*>(partial_out + (part_row_132 * 256 + dim_3[0]) + 0);
+                                        _vec_load_150[0] = _v2_297.x;
+                                        _vec_load_150[0 + 1] = _v2_297.y;
+#endif
                                     }
                                     p0_3[0] = _vec_load_150[0];
                                     p1_3[0] = _vec_load_150[1];
@@ -5701,9 +7210,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[1] = partial_lse[part_row_133];
                                     float _vec_load_151[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_275 = *reinterpret_cast<const float2*>(partial_out + (part_row_133 * 256 + dim_3[0]) + 0);
                                         _vec_load_151[0] = _v2_275.x;
                                         _vec_load_151[0 + 1] = _v2_275.y;
+#else
+                                        float2 _v2_298 = *reinterpret_cast<const float2*>(partial_out + (part_row_133 * 256 + dim_3[0]) + 0);
+                                        _vec_load_151[0] = _v2_298.x;
+                                        _vec_load_151[0 + 1] = _v2_298.y;
+#endif
                                     }
                                     p0_3[1] = _vec_load_151[0];
                                     p1_3[1] = _vec_load_151[1];
@@ -5714,9 +7229,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[2] = partial_lse[part_row_134];
                                     float _vec_load_152[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_276 = *reinterpret_cast<const float2*>(partial_out + (part_row_134 * 256 + dim_3[0]) + 0);
                                         _vec_load_152[0] = _v2_276.x;
                                         _vec_load_152[0 + 1] = _v2_276.y;
+#else
+                                        float2 _v2_299 = *reinterpret_cast<const float2*>(partial_out + (part_row_134 * 256 + dim_3[0]) + 0);
+                                        _vec_load_152[0] = _v2_299.x;
+                                        _vec_load_152[0 + 1] = _v2_299.y;
+#endif
                                     }
                                     p0_3[2] = _vec_load_152[0];
                                     p1_3[2] = _vec_load_152[1];
@@ -5727,9 +7248,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[3] = partial_lse[part_row_135];
                                     float _vec_load_153[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_277 = *reinterpret_cast<const float2*>(partial_out + (part_row_135 * 256 + dim_3[0]) + 0);
                                         _vec_load_153[0] = _v2_277.x;
                                         _vec_load_153[0 + 1] = _v2_277.y;
+#else
+                                        float2 _v2_300 = *reinterpret_cast<const float2*>(partial_out + (part_row_135 * 256 + dim_3[0]) + 0);
+                                        _vec_load_153[0] = _v2_300.x;
+                                        _vec_load_153[0 + 1] = _v2_300.y;
+#endif
                                     }
                                     p0_3[3] = _vec_load_153[0];
                                     p1_3[3] = _vec_load_153[1];
@@ -5740,9 +7267,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[4] = partial_lse[part_row_136];
                                     float _vec_load_154[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_278 = *reinterpret_cast<const float2*>(partial_out + (part_row_136 * 256 + dim_3[0]) + 0);
                                         _vec_load_154[0] = _v2_278.x;
                                         _vec_load_154[0 + 1] = _v2_278.y;
+#else
+                                        float2 _v2_301 = *reinterpret_cast<const float2*>(partial_out + (part_row_136 * 256 + dim_3[0]) + 0);
+                                        _vec_load_154[0] = _v2_301.x;
+                                        _vec_load_154[0 + 1] = _v2_301.y;
+#endif
                                     }
                                     p0_3[4] = _vec_load_154[0];
                                     p1_3[4] = _vec_load_154[1];
@@ -5753,9 +7286,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[5] = partial_lse[part_row_137];
                                     float _vec_load_155[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_279 = *reinterpret_cast<const float2*>(partial_out + (part_row_137 * 256 + dim_3[0]) + 0);
                                         _vec_load_155[0] = _v2_279.x;
                                         _vec_load_155[0 + 1] = _v2_279.y;
+#else
+                                        float2 _v2_302 = *reinterpret_cast<const float2*>(partial_out + (part_row_137 * 256 + dim_3[0]) + 0);
+                                        _vec_load_155[0] = _v2_302.x;
+                                        _vec_load_155[0 + 1] = _v2_302.y;
+#endif
                                     }
                                     p0_3[5] = _vec_load_155[0];
                                     p1_3[5] = _vec_load_155[1];
@@ -5766,9 +7305,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[6] = partial_lse[part_row_138];
                                     float _vec_load_156[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_280 = *reinterpret_cast<const float2*>(partial_out + (part_row_138 * 256 + dim_3[0]) + 0);
                                         _vec_load_156[0] = _v2_280.x;
                                         _vec_load_156[0 + 1] = _v2_280.y;
+#else
+                                        float2 _v2_303 = *reinterpret_cast<const float2*>(partial_out + (part_row_138 * 256 + dim_3[0]) + 0);
+                                        _vec_load_156[0] = _v2_303.x;
+                                        _vec_load_156[0 + 1] = _v2_303.y;
+#endif
                                     }
                                     p0_3[6] = _vec_load_156[0];
                                     p1_3[6] = _vec_load_156[1];
@@ -5779,9 +7324,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[7] = partial_lse[part_row_139];
                                     float _vec_load_157[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_281 = *reinterpret_cast<const float2*>(partial_out + (part_row_139 * 256 + dim_3[0]) + 0);
                                         _vec_load_157[0] = _v2_281.x;
                                         _vec_load_157[0 + 1] = _v2_281.y;
+#else
+                                        float2 _v2_304 = *reinterpret_cast<const float2*>(partial_out + (part_row_139 * 256 + dim_3[0]) + 0);
+                                        _vec_load_157[0] = _v2_304.x;
+                                        _vec_load_157[0 + 1] = _v2_304.y;
+#endif
                                     }
                                     p0_3[7] = _vec_load_157[0];
                                     p1_3[7] = _vec_load_157[1];
@@ -5792,9 +7343,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[8] = partial_lse[part_row_140];
                                     float _vec_load_158[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_282 = *reinterpret_cast<const float2*>(partial_out + (part_row_140 * 256 + dim_3[1]) + 0);
                                         _vec_load_158[0] = _v2_282.x;
                                         _vec_load_158[0 + 1] = _v2_282.y;
+#else
+                                        float2 _v2_305 = *reinterpret_cast<const float2*>(partial_out + (part_row_140 * 256 + dim_3[1]) + 0);
+                                        _vec_load_158[0] = _v2_305.x;
+                                        _vec_load_158[0 + 1] = _v2_305.y;
+#endif
                                     }
                                     p0_3[8] = _vec_load_158[0];
                                     p1_3[8] = _vec_load_158[1];
@@ -5805,9 +7362,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[9] = partial_lse[part_row_141];
                                     float _vec_load_159[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_283 = *reinterpret_cast<const float2*>(partial_out + (part_row_141 * 256 + dim_3[1]) + 0);
                                         _vec_load_159[0] = _v2_283.x;
                                         _vec_load_159[0 + 1] = _v2_283.y;
+#else
+                                        float2 _v2_306 = *reinterpret_cast<const float2*>(partial_out + (part_row_141 * 256 + dim_3[1]) + 0);
+                                        _vec_load_159[0] = _v2_306.x;
+                                        _vec_load_159[0 + 1] = _v2_306.y;
+#endif
                                     }
                                     p0_3[9] = _vec_load_159[0];
                                     p1_3[9] = _vec_load_159[1];
@@ -5818,9 +7381,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[10] = partial_lse[part_row_142];
                                     float _vec_load_160[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_284 = *reinterpret_cast<const float2*>(partial_out + (part_row_142 * 256 + dim_3[1]) + 0);
                                         _vec_load_160[0] = _v2_284.x;
                                         _vec_load_160[0 + 1] = _v2_284.y;
+#else
+                                        float2 _v2_307 = *reinterpret_cast<const float2*>(partial_out + (part_row_142 * 256 + dim_3[1]) + 0);
+                                        _vec_load_160[0] = _v2_307.x;
+                                        _vec_load_160[0 + 1] = _v2_307.y;
+#endif
                                     }
                                     p0_3[10] = _vec_load_160[0];
                                     p1_3[10] = _vec_load_160[1];
@@ -5831,9 +7400,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[11] = partial_lse[part_row_143];
                                     float _vec_load_161[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_285 = *reinterpret_cast<const float2*>(partial_out + (part_row_143 * 256 + dim_3[1]) + 0);
                                         _vec_load_161[0] = _v2_285.x;
                                         _vec_load_161[0 + 1] = _v2_285.y;
+#else
+                                        float2 _v2_308 = *reinterpret_cast<const float2*>(partial_out + (part_row_143 * 256 + dim_3[1]) + 0);
+                                        _vec_load_161[0] = _v2_308.x;
+                                        _vec_load_161[0 + 1] = _v2_308.y;
+#endif
                                     }
                                     p0_3[11] = _vec_load_161[0];
                                     p1_3[11] = _vec_load_161[1];
@@ -5844,9 +7419,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[12] = partial_lse[part_row_144];
                                     float _vec_load_162[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_286 = *reinterpret_cast<const float2*>(partial_out + (part_row_144 * 256 + dim_3[1]) + 0);
                                         _vec_load_162[0] = _v2_286.x;
                                         _vec_load_162[0 + 1] = _v2_286.y;
+#else
+                                        float2 _v2_309 = *reinterpret_cast<const float2*>(partial_out + (part_row_144 * 256 + dim_3[1]) + 0);
+                                        _vec_load_162[0] = _v2_309.x;
+                                        _vec_load_162[0 + 1] = _v2_309.y;
+#endif
                                     }
                                     p0_3[12] = _vec_load_162[0];
                                     p1_3[12] = _vec_load_162[1];
@@ -5857,9 +7438,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[13] = partial_lse[part_row_145];
                                     float _vec_load_163[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_287 = *reinterpret_cast<const float2*>(partial_out + (part_row_145 * 256 + dim_3[1]) + 0);
                                         _vec_load_163[0] = _v2_287.x;
                                         _vec_load_163[0 + 1] = _v2_287.y;
+#else
+                                        float2 _v2_310 = *reinterpret_cast<const float2*>(partial_out + (part_row_145 * 256 + dim_3[1]) + 0);
+                                        _vec_load_163[0] = _v2_310.x;
+                                        _vec_load_163[0 + 1] = _v2_310.y;
+#endif
                                     }
                                     p0_3[13] = _vec_load_163[0];
                                     p1_3[13] = _vec_load_163[1];
@@ -5870,9 +7457,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[14] = partial_lse[part_row_146];
                                     float _vec_load_164[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_288 = *reinterpret_cast<const float2*>(partial_out + (part_row_146 * 256 + dim_3[1]) + 0);
                                         _vec_load_164[0] = _v2_288.x;
                                         _vec_load_164[0 + 1] = _v2_288.y;
+#else
+                                        float2 _v2_311 = *reinterpret_cast<const float2*>(partial_out + (part_row_146 * 256 + dim_3[1]) + 0);
+                                        _vec_load_164[0] = _v2_311.x;
+                                        _vec_load_164[0 + 1] = _v2_311.y;
+#endif
                                     }
                                     p0_3[14] = _vec_load_164[0];
                                     p1_3[14] = _vec_load_164[1];
@@ -5883,9 +7476,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[15] = partial_lse[part_row_147];
                                     float _vec_load_165[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_289 = *reinterpret_cast<const float2*>(partial_out + (part_row_147 * 256 + dim_3[1]) + 0);
                                         _vec_load_165[0] = _v2_289.x;
                                         _vec_load_165[0 + 1] = _v2_289.y;
+#else
+                                        float2 _v2_312 = *reinterpret_cast<const float2*>(partial_out + (part_row_147 * 256 + dim_3[1]) + 0);
+                                        _vec_load_165[0] = _v2_312.x;
+                                        _vec_load_165[0 + 1] = _v2_312.y;
+#endif
                                     }
                                     p0_3[15] = _vec_load_165[0];
                                     p1_3[15] = _vec_load_165[1];
@@ -6289,11 +7888,17 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     acc1_k_4 = acc1_k_4 + acc1_3[3];
                                     float inv_6 = 0.0f;
                                     if (den_k_4 > 0.0f) {
+#if __CUDA_ARCH__ == 1070
                                         float _rcp_290 = approx_rcp(den_k_4);
                                         inv_6 = _rcp_290;
+#else
+                                        float _rcp_313 = approx_rcp(den_k_4);
+                                        inv_6 = _rcp_313;
+#endif
                                     }
                                     float attn0_4 = (float)(__nv_bfloat16)(acc0_k_4 * inv_6);
                                     float attn1_4 = (float)(__nv_bfloat16)(acc1_k_4 * inv_6);
+#if __CUDA_ARCH__ == 1070
                                     float _exp2_292 = approx_exp2((-gate0_3[0]) * 1.442695f);
                                     float _rcp_291 = approx_rcp(1.0f + _exp2_292);
                                     float result0_4 = attn0_4 * _rcp_291;
@@ -6302,6 +7907,16 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     float result1_4 = attn1_4 * _rcp_293;
                                     __nv_bfloat162 _bit_cast_src_295 = __float22bfloat162_rn(make_float2(result0_4, result1_4));
                                     word_3[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_295)[0];
+#else
+                                    float _exp2_315 = approx_exp2((-gate0_3[0]) * 1.442695f);
+                                    float _rcp_314 = approx_rcp(1.0f + _exp2_315);
+                                    float result0_4 = attn0_4 * _rcp_314;
+                                    float _exp2_317 = approx_exp2((-gate1_3[0]) * 1.442695f);
+                                    float _rcp_316 = approx_rcp(1.0f + _exp2_317);
+                                    float result1_4 = attn1_4 * _rcp_316;
+                                    __nv_bfloat162 _bit_cast_src_318 = __float22bfloat162_rn(make_float2(result0_4, result1_4));
+                                    word_3[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_318)[0];
+#endif
                                     long long out_offset_4 = row_i64 * out_stride_row + qo_head_5[0] * out_stride_head + dim_3[0];
                                     *(reinterpret_cast<unsigned int*>(out + out_offset_4) + (0)) = word_3[0];
                                 }
@@ -6320,11 +7935,17 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     acc1_k_5 = acc1_k_5 + acc1_3[7];
                                     float inv_7 = 0.0f;
                                     if (den_k_5 > 0.0f) {
+#if __CUDA_ARCH__ == 1070
                                         float _rcp_296 = approx_rcp(den_k_5);
                                         inv_7 = _rcp_296;
+#else
+                                        float _rcp_319 = approx_rcp(den_k_5);
+                                        inv_7 = _rcp_319;
+#endif
                                     }
                                     float attn0_5 = (float)(__nv_bfloat16)(acc0_k_5 * inv_7);
                                     float attn1_5 = (float)(__nv_bfloat16)(acc1_k_5 * inv_7);
+#if __CUDA_ARCH__ == 1070
                                     float _exp2_298 = approx_exp2((-gate0_3[1]) * 1.442695f);
                                     float _rcp_297 = approx_rcp(1.0f + _exp2_298);
                                     float result0_5 = attn0_5 * _rcp_297;
@@ -6333,6 +7954,16 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     float result1_5 = attn1_5 * _rcp_299;
                                     __nv_bfloat162 _bit_cast_src_301 = __float22bfloat162_rn(make_float2(result0_5, result1_5));
                                     word_3[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_301)[0];
+#else
+                                    float _exp2_321 = approx_exp2((-gate0_3[1]) * 1.442695f);
+                                    float _rcp_320 = approx_rcp(1.0f + _exp2_321);
+                                    float result0_5 = attn0_5 * _rcp_320;
+                                    float _exp2_323 = approx_exp2((-gate1_3[1]) * 1.442695f);
+                                    float _rcp_322 = approx_rcp(1.0f + _exp2_323);
+                                    float result1_5 = attn1_5 * _rcp_322;
+                                    __nv_bfloat162 _bit_cast_src_324 = __float22bfloat162_rn(make_float2(result0_5, result1_5));
+                                    word_3[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_324)[0];
+#endif
                                     long long out_offset_5 = row_i64 * out_stride_row + qo_head_5[1] * out_stride_head + dim_3[1];
                                     *(reinterpret_cast<unsigned int*>(out + out_offset_5) + (0)) = word_3[0];
                                 }
@@ -6386,10 +8017,17 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_max_4[0] = -CUDART_INF_F;
                                 float _vec_load_166[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     uint32_t _bf16x2_bits_302;
                                     _bf16x2_bits_302 = *reinterpret_cast<const uint32_t*>(gate + (row_head_4[0] * 256 + dim_4[0]) + 0);
                                     (&_vec_load_166[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_302) << 16);
                                     (&_vec_load_166[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_302) & 0xffff0000u);
+#else
+                                    uint32_t _bf16x2_bits_325;
+                                    _bf16x2_bits_325 = *reinterpret_cast<const uint32_t*>(gate + (row_head_4[0] * 256 + dim_4[0]) + 0);
+                                    (&_vec_load_166[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_325) << 16);
+                                    (&_vec_load_166[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_325) & 0xffff0000u);
+#endif
                                 }
                                 gate0_4[0] = _vec_load_166[0];
                                 gate1_4[0] = _vec_load_166[1];
@@ -6414,10 +8052,17 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_max_4[1] = -CUDART_INF_F;
                                 float _vec_load_167[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     uint32_t _bf16x2_bits_303;
                                     _bf16x2_bits_303 = *reinterpret_cast<const uint32_t*>(gate + (row_head_4[1] * 256 + dim_4[1]) + 0);
                                     (&_vec_load_167[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_303) << 16);
                                     (&_vec_load_167[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_303) & 0xffff0000u);
+#else
+                                    uint32_t _bf16x2_bits_326;
+                                    _bf16x2_bits_326 = *reinterpret_cast<const uint32_t*>(gate + (row_head_4[1] * 256 + dim_4[1]) + 0);
+                                    (&_vec_load_167[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_326) << 16);
+                                    (&_vec_load_167[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_326) & 0xffff0000u);
+#endif
                                 }
                                 gate0_4[1] = _vec_load_167[0];
                                 gate1_4[1] = _vec_load_167[1];
@@ -6442,10 +8087,17 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_max_4[2] = -CUDART_INF_F;
                                 float _vec_load_168[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     uint32_t _bf16x2_bits_304;
                                     _bf16x2_bits_304 = *reinterpret_cast<const uint32_t*>(gate + (row_head_4[2] * 256 + dim_4[2]) + 0);
                                     (&_vec_load_168[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_304) << 16);
                                     (&_vec_load_168[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_304) & 0xffff0000u);
+#else
+                                    uint32_t _bf16x2_bits_327;
+                                    _bf16x2_bits_327 = *reinterpret_cast<const uint32_t*>(gate + (row_head_4[2] * 256 + dim_4[2]) + 0);
+                                    (&_vec_load_168[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_327) << 16);
+                                    (&_vec_load_168[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_327) & 0xffff0000u);
+#endif
                                 }
                                 gate0_4[2] = _vec_load_168[0];
                                 gate1_4[2] = _vec_load_168[1];
@@ -6470,10 +8122,17 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_max_4[3] = -CUDART_INF_F;
                                 float _vec_load_169[2];
                                 {
+#if __CUDA_ARCH__ == 1070
                                     uint32_t _bf16x2_bits_305;
                                     _bf16x2_bits_305 = *reinterpret_cast<const uint32_t*>(gate + (row_head_4[3] * 256 + dim_4[3]) + 0);
                                     (&_vec_load_169[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_305) << 16);
                                     (&_vec_load_169[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_305) & 0xffff0000u);
+#else
+                                    uint32_t _bf16x2_bits_328;
+                                    _bf16x2_bits_328 = *reinterpret_cast<const uint32_t*>(gate + (row_head_4[3] * 256 + dim_4[3]) + 0);
+                                    (&_vec_load_169[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_328) << 16);
+                                    (&_vec_load_169[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_328) & 0xffff0000u);
+#endif
                                 }
                                 gate0_4[3] = _vec_load_169[0];
                                 gate1_4[3] = _vec_load_169[1];
@@ -6483,9 +8142,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[0] = partial_lse[part_row_148];
                                     float _vec_load_170[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_306 = *reinterpret_cast<const float2*>(partial_out + (part_row_148 * 256 + dim_4[0]) + 0);
                                         _vec_load_170[0] = _v2_306.x;
                                         _vec_load_170[0 + 1] = _v2_306.y;
+#else
+                                        float2 _v2_329 = *reinterpret_cast<const float2*>(partial_out + (part_row_148 * 256 + dim_4[0]) + 0);
+                                        _vec_load_170[0] = _v2_329.x;
+                                        _vec_load_170[0 + 1] = _v2_329.y;
+#endif
                                     }
                                     p0_4[0] = _vec_load_170[0];
                                     p1_4[0] = _vec_load_170[1];
@@ -6496,9 +8161,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[1] = partial_lse[part_row_149];
                                     float _vec_load_171[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_307 = *reinterpret_cast<const float2*>(partial_out + (part_row_149 * 256 + dim_4[0]) + 0);
                                         _vec_load_171[0] = _v2_307.x;
                                         _vec_load_171[0 + 1] = _v2_307.y;
+#else
+                                        float2 _v2_330 = *reinterpret_cast<const float2*>(partial_out + (part_row_149 * 256 + dim_4[0]) + 0);
+                                        _vec_load_171[0] = _v2_330.x;
+                                        _vec_load_171[0 + 1] = _v2_330.y;
+#endif
                                     }
                                     p0_4[1] = _vec_load_171[0];
                                     p1_4[1] = _vec_load_171[1];
@@ -6509,9 +8180,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[2] = partial_lse[part_row_150];
                                     float _vec_load_172[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_308 = *reinterpret_cast<const float2*>(partial_out + (part_row_150 * 256 + dim_4[0]) + 0);
                                         _vec_load_172[0] = _v2_308.x;
                                         _vec_load_172[0 + 1] = _v2_308.y;
+#else
+                                        float2 _v2_331 = *reinterpret_cast<const float2*>(partial_out + (part_row_150 * 256 + dim_4[0]) + 0);
+                                        _vec_load_172[0] = _v2_331.x;
+                                        _vec_load_172[0 + 1] = _v2_331.y;
+#endif
                                     }
                                     p0_4[2] = _vec_load_172[0];
                                     p1_4[2] = _vec_load_172[1];
@@ -6522,9 +8199,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[3] = partial_lse[part_row_151];
                                     float _vec_load_173[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_309 = *reinterpret_cast<const float2*>(partial_out + (part_row_151 * 256 + dim_4[0]) + 0);
                                         _vec_load_173[0] = _v2_309.x;
                                         _vec_load_173[0 + 1] = _v2_309.y;
+#else
+                                        float2 _v2_332 = *reinterpret_cast<const float2*>(partial_out + (part_row_151 * 256 + dim_4[0]) + 0);
+                                        _vec_load_173[0] = _v2_332.x;
+                                        _vec_load_173[0 + 1] = _v2_332.y;
+#endif
                                     }
                                     p0_4[3] = _vec_load_173[0];
                                     p1_4[3] = _vec_load_173[1];
@@ -6535,9 +8218,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[4] = partial_lse[part_row_152];
                                     float _vec_load_174[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_310 = *reinterpret_cast<const float2*>(partial_out + (part_row_152 * 256 + dim_4[1]) + 0);
                                         _vec_load_174[0] = _v2_310.x;
                                         _vec_load_174[0 + 1] = _v2_310.y;
+#else
+                                        float2 _v2_333 = *reinterpret_cast<const float2*>(partial_out + (part_row_152 * 256 + dim_4[1]) + 0);
+                                        _vec_load_174[0] = _v2_333.x;
+                                        _vec_load_174[0 + 1] = _v2_333.y;
+#endif
                                     }
                                     p0_4[4] = _vec_load_174[0];
                                     p1_4[4] = _vec_load_174[1];
@@ -6548,9 +8237,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[5] = partial_lse[part_row_153];
                                     float _vec_load_175[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_311 = *reinterpret_cast<const float2*>(partial_out + (part_row_153 * 256 + dim_4[1]) + 0);
                                         _vec_load_175[0] = _v2_311.x;
                                         _vec_load_175[0 + 1] = _v2_311.y;
+#else
+                                        float2 _v2_334 = *reinterpret_cast<const float2*>(partial_out + (part_row_153 * 256 + dim_4[1]) + 0);
+                                        _vec_load_175[0] = _v2_334.x;
+                                        _vec_load_175[0 + 1] = _v2_334.y;
+#endif
                                     }
                                     p0_4[5] = _vec_load_175[0];
                                     p1_4[5] = _vec_load_175[1];
@@ -6561,9 +8256,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[6] = partial_lse[part_row_154];
                                     float _vec_load_176[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_312 = *reinterpret_cast<const float2*>(partial_out + (part_row_154 * 256 + dim_4[1]) + 0);
                                         _vec_load_176[0] = _v2_312.x;
                                         _vec_load_176[0 + 1] = _v2_312.y;
+#else
+                                        float2 _v2_335 = *reinterpret_cast<const float2*>(partial_out + (part_row_154 * 256 + dim_4[1]) + 0);
+                                        _vec_load_176[0] = _v2_335.x;
+                                        _vec_load_176[0 + 1] = _v2_335.y;
+#endif
                                     }
                                     p0_4[6] = _vec_load_176[0];
                                     p1_4[6] = _vec_load_176[1];
@@ -6574,9 +8275,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[7] = partial_lse[part_row_155];
                                     float _vec_load_177[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_313 = *reinterpret_cast<const float2*>(partial_out + (part_row_155 * 256 + dim_4[1]) + 0);
                                         _vec_load_177[0] = _v2_313.x;
                                         _vec_load_177[0 + 1] = _v2_313.y;
+#else
+                                        float2 _v2_336 = *reinterpret_cast<const float2*>(partial_out + (part_row_155 * 256 + dim_4[1]) + 0);
+                                        _vec_load_177[0] = _v2_336.x;
+                                        _vec_load_177[0 + 1] = _v2_336.y;
+#endif
                                     }
                                     p0_4[7] = _vec_load_177[0];
                                     p1_4[7] = _vec_load_177[1];
@@ -6587,9 +8294,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[8] = partial_lse[part_row_156];
                                     float _vec_load_178[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_314 = *reinterpret_cast<const float2*>(partial_out + (part_row_156 * 256 + dim_4[2]) + 0);
                                         _vec_load_178[0] = _v2_314.x;
                                         _vec_load_178[0 + 1] = _v2_314.y;
+#else
+                                        float2 _v2_337 = *reinterpret_cast<const float2*>(partial_out + (part_row_156 * 256 + dim_4[2]) + 0);
+                                        _vec_load_178[0] = _v2_337.x;
+                                        _vec_load_178[0 + 1] = _v2_337.y;
+#endif
                                     }
                                     p0_4[8] = _vec_load_178[0];
                                     p1_4[8] = _vec_load_178[1];
@@ -6600,9 +8313,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[9] = partial_lse[part_row_157];
                                     float _vec_load_179[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_315 = *reinterpret_cast<const float2*>(partial_out + (part_row_157 * 256 + dim_4[2]) + 0);
                                         _vec_load_179[0] = _v2_315.x;
                                         _vec_load_179[0 + 1] = _v2_315.y;
+#else
+                                        float2 _v2_338 = *reinterpret_cast<const float2*>(partial_out + (part_row_157 * 256 + dim_4[2]) + 0);
+                                        _vec_load_179[0] = _v2_338.x;
+                                        _vec_load_179[0 + 1] = _v2_338.y;
+#endif
                                     }
                                     p0_4[9] = _vec_load_179[0];
                                     p1_4[9] = _vec_load_179[1];
@@ -6613,9 +8332,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[10] = partial_lse[part_row_158];
                                     float _vec_load_180[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_316 = *reinterpret_cast<const float2*>(partial_out + (part_row_158 * 256 + dim_4[2]) + 0);
                                         _vec_load_180[0] = _v2_316.x;
                                         _vec_load_180[0 + 1] = _v2_316.y;
+#else
+                                        float2 _v2_339 = *reinterpret_cast<const float2*>(partial_out + (part_row_158 * 256 + dim_4[2]) + 0);
+                                        _vec_load_180[0] = _v2_339.x;
+                                        _vec_load_180[0 + 1] = _v2_339.y;
+#endif
                                     }
                                     p0_4[10] = _vec_load_180[0];
                                     p1_4[10] = _vec_load_180[1];
@@ -6626,9 +8351,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[11] = partial_lse[part_row_159];
                                     float _vec_load_181[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_317 = *reinterpret_cast<const float2*>(partial_out + (part_row_159 * 256 + dim_4[2]) + 0);
                                         _vec_load_181[0] = _v2_317.x;
                                         _vec_load_181[0 + 1] = _v2_317.y;
+#else
+                                        float2 _v2_340 = *reinterpret_cast<const float2*>(partial_out + (part_row_159 * 256 + dim_4[2]) + 0);
+                                        _vec_load_181[0] = _v2_340.x;
+                                        _vec_load_181[0 + 1] = _v2_340.y;
+#endif
                                     }
                                     p0_4[11] = _vec_load_181[0];
                                     p1_4[11] = _vec_load_181[1];
@@ -6639,9 +8370,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[12] = partial_lse[part_row_160];
                                     float _vec_load_182[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_318 = *reinterpret_cast<const float2*>(partial_out + (part_row_160 * 256 + dim_4[3]) + 0);
                                         _vec_load_182[0] = _v2_318.x;
                                         _vec_load_182[0 + 1] = _v2_318.y;
+#else
+                                        float2 _v2_341 = *reinterpret_cast<const float2*>(partial_out + (part_row_160 * 256 + dim_4[3]) + 0);
+                                        _vec_load_182[0] = _v2_341.x;
+                                        _vec_load_182[0 + 1] = _v2_341.y;
+#endif
                                     }
                                     p0_4[12] = _vec_load_182[0];
                                     p1_4[12] = _vec_load_182[1];
@@ -6652,9 +8389,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[13] = partial_lse[part_row_161];
                                     float _vec_load_183[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_319 = *reinterpret_cast<const float2*>(partial_out + (part_row_161 * 256 + dim_4[3]) + 0);
                                         _vec_load_183[0] = _v2_319.x;
                                         _vec_load_183[0 + 1] = _v2_319.y;
+#else
+                                        float2 _v2_342 = *reinterpret_cast<const float2*>(partial_out + (part_row_161 * 256 + dim_4[3]) + 0);
+                                        _vec_load_183[0] = _v2_342.x;
+                                        _vec_load_183[0 + 1] = _v2_342.y;
+#endif
                                     }
                                     p0_4[13] = _vec_load_183[0];
                                     p1_4[13] = _vec_load_183[1];
@@ -6665,9 +8408,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[14] = partial_lse[part_row_162];
                                     float _vec_load_184[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_320 = *reinterpret_cast<const float2*>(partial_out + (part_row_162 * 256 + dim_4[3]) + 0);
                                         _vec_load_184[0] = _v2_320.x;
                                         _vec_load_184[0 + 1] = _v2_320.y;
+#else
+                                        float2 _v2_343 = *reinterpret_cast<const float2*>(partial_out + (part_row_162 * 256 + dim_4[3]) + 0);
+                                        _vec_load_184[0] = _v2_343.x;
+                                        _vec_load_184[0 + 1] = _v2_343.y;
+#endif
                                     }
                                     p0_4[14] = _vec_load_184[0];
                                     p1_4[14] = _vec_load_184[1];
@@ -6678,9 +8427,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[15] = partial_lse[part_row_163];
                                     float _vec_load_185[2];
                                     {
+#if __CUDA_ARCH__ == 1070
                                         float2 _v2_321 = *reinterpret_cast<const float2*>(partial_out + (part_row_163 * 256 + dim_4[3]) + 0);
                                         _vec_load_185[0] = _v2_321.x;
                                         _vec_load_185[0 + 1] = _v2_321.y;
+#else
+                                        float2 _v2_344 = *reinterpret_cast<const float2*>(partial_out + (part_row_163 * 256 + dim_4[3]) + 0);
+                                        _vec_load_185[0] = _v2_344.x;
+                                        _vec_load_185[0 + 1] = _v2_344.y;
+#endif
                                     }
                                     p0_4[15] = _vec_load_185[0];
                                     p1_4[15] = _vec_load_185[1];
@@ -7084,11 +8839,17 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     acc1_k_6 = acc1_k_6 + acc1_4[3];
                                     float inv_8 = 0.0f;
                                     if (den_k_6 > 0.0f) {
+#if __CUDA_ARCH__ == 1070
                                         float _rcp_322 = approx_rcp(den_k_6);
                                         inv_8 = _rcp_322;
+#else
+                                        float _rcp_345 = approx_rcp(den_k_6);
+                                        inv_8 = _rcp_345;
+#endif
                                     }
                                     float attn0_6 = (float)(__nv_bfloat16)(acc0_k_6 * inv_8);
                                     float attn1_6 = (float)(__nv_bfloat16)(acc1_k_6 * inv_8);
+#if __CUDA_ARCH__ == 1070
                                     float _exp2_324 = approx_exp2((-gate0_4[0]) * 1.442695f);
                                     float _rcp_323 = approx_rcp(1.0f + _exp2_324);
                                     float result0_6 = attn0_6 * _rcp_323;
@@ -7097,6 +8858,16 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     float result1_6 = attn1_6 * _rcp_325;
                                     __nv_bfloat162 _bit_cast_src_327 = __float22bfloat162_rn(make_float2(result0_6, result1_6));
                                     word_4[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_327)[0];
+#else
+                                    float _exp2_347 = approx_exp2((-gate0_4[0]) * 1.442695f);
+                                    float _rcp_346 = approx_rcp(1.0f + _exp2_347);
+                                    float result0_6 = attn0_6 * _rcp_346;
+                                    float _exp2_349 = approx_exp2((-gate1_4[0]) * 1.442695f);
+                                    float _rcp_348 = approx_rcp(1.0f + _exp2_349);
+                                    float result1_6 = attn1_6 * _rcp_348;
+                                    __nv_bfloat162 _bit_cast_src_350 = __float22bfloat162_rn(make_float2(result0_6, result1_6));
+                                    word_4[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_350)[0];
+#endif
                                     long long out_offset_6 = row_i64 * out_stride_row + qo_head_6[0] * out_stride_head + dim_4[0];
                                     *(reinterpret_cast<unsigned int*>(out + out_offset_6) + (0)) = word_4[0];
                                 }
@@ -7115,11 +8886,17 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     acc1_k_7 = acc1_k_7 + acc1_4[7];
                                     float inv_9 = 0.0f;
                                     if (den_k_7 > 0.0f) {
+#if __CUDA_ARCH__ == 1070
                                         float _rcp_328 = approx_rcp(den_k_7);
                                         inv_9 = _rcp_328;
+#else
+                                        float _rcp_351 = approx_rcp(den_k_7);
+                                        inv_9 = _rcp_351;
+#endif
                                     }
                                     float attn0_7 = (float)(__nv_bfloat16)(acc0_k_7 * inv_9);
                                     float attn1_7 = (float)(__nv_bfloat16)(acc1_k_7 * inv_9);
+#if __CUDA_ARCH__ == 1070
                                     float _exp2_330 = approx_exp2((-gate0_4[1]) * 1.442695f);
                                     float _rcp_329 = approx_rcp(1.0f + _exp2_330);
                                     float result0_7 = attn0_7 * _rcp_329;
@@ -7128,6 +8905,16 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     float result1_7 = attn1_7 * _rcp_331;
                                     __nv_bfloat162 _bit_cast_src_333 = __float22bfloat162_rn(make_float2(result0_7, result1_7));
                                     word_4[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_333)[0];
+#else
+                                    float _exp2_353 = approx_exp2((-gate0_4[1]) * 1.442695f);
+                                    float _rcp_352 = approx_rcp(1.0f + _exp2_353);
+                                    float result0_7 = attn0_7 * _rcp_352;
+                                    float _exp2_355 = approx_exp2((-gate1_4[1]) * 1.442695f);
+                                    float _rcp_354 = approx_rcp(1.0f + _exp2_355);
+                                    float result1_7 = attn1_7 * _rcp_354;
+                                    __nv_bfloat162 _bit_cast_src_356 = __float22bfloat162_rn(make_float2(result0_7, result1_7));
+                                    word_4[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_356)[0];
+#endif
                                     long long out_offset_7 = row_i64 * out_stride_row + qo_head_6[1] * out_stride_head + dim_4[1];
                                     *(reinterpret_cast<unsigned int*>(out + out_offset_7) + (0)) = word_4[0];
                                 }
@@ -7146,11 +8933,17 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     acc1_k_8 = acc1_k_8 + acc1_4[11];
                                     float inv_10 = 0.0f;
                                     if (den_k_8 > 0.0f) {
+#if __CUDA_ARCH__ == 1070
                                         float _rcp_334 = approx_rcp(den_k_8);
                                         inv_10 = _rcp_334;
+#else
+                                        float _rcp_357 = approx_rcp(den_k_8);
+                                        inv_10 = _rcp_357;
+#endif
                                     }
                                     float attn0_8 = (float)(__nv_bfloat16)(acc0_k_8 * inv_10);
                                     float attn1_8 = (float)(__nv_bfloat16)(acc1_k_8 * inv_10);
+#if __CUDA_ARCH__ == 1070
                                     float _exp2_336 = approx_exp2((-gate0_4[2]) * 1.442695f);
                                     float _rcp_335 = approx_rcp(1.0f + _exp2_336);
                                     float result0_8 = attn0_8 * _rcp_335;
@@ -7159,6 +8952,16 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     float result1_8 = attn1_8 * _rcp_337;
                                     __nv_bfloat162 _bit_cast_src_339 = __float22bfloat162_rn(make_float2(result0_8, result1_8));
                                     word_4[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_339)[0];
+#else
+                                    float _exp2_359 = approx_exp2((-gate0_4[2]) * 1.442695f);
+                                    float _rcp_358 = approx_rcp(1.0f + _exp2_359);
+                                    float result0_8 = attn0_8 * _rcp_358;
+                                    float _exp2_361 = approx_exp2((-gate1_4[2]) * 1.442695f);
+                                    float _rcp_360 = approx_rcp(1.0f + _exp2_361);
+                                    float result1_8 = attn1_8 * _rcp_360;
+                                    __nv_bfloat162 _bit_cast_src_362 = __float22bfloat162_rn(make_float2(result0_8, result1_8));
+                                    word_4[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_362)[0];
+#endif
                                     long long out_offset_8 = row_i64 * out_stride_row + qo_head_6[2] * out_stride_head + dim_4[2];
                                     *(reinterpret_cast<unsigned int*>(out + out_offset_8) + (0)) = word_4[0];
                                 }
@@ -7177,11 +8980,17 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     acc1_k_9 = acc1_k_9 + acc1_4[15];
                                     float inv_11 = 0.0f;
                                     if (den_k_9 > 0.0f) {
+#if __CUDA_ARCH__ == 1070
                                         float _rcp_340 = approx_rcp(den_k_9);
                                         inv_11 = _rcp_340;
+#else
+                                        float _rcp_363 = approx_rcp(den_k_9);
+                                        inv_11 = _rcp_363;
+#endif
                                     }
                                     float attn0_9 = (float)(__nv_bfloat16)(acc0_k_9 * inv_11);
                                     float attn1_9 = (float)(__nv_bfloat16)(acc1_k_9 * inv_11);
+#if __CUDA_ARCH__ == 1070
                                     float _exp2_342 = approx_exp2((-gate0_4[3]) * 1.442695f);
                                     float _rcp_341 = approx_rcp(1.0f + _exp2_342);
                                     float result0_9 = attn0_9 * _rcp_341;
@@ -7190,6 +8999,16 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     float result1_9 = attn1_9 * _rcp_343;
                                     __nv_bfloat162 _bit_cast_src_345 = __float22bfloat162_rn(make_float2(result0_9, result1_9));
                                     word_4[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_345)[0];
+#else
+                                    float _exp2_365 = approx_exp2((-gate0_4[3]) * 1.442695f);
+                                    float _rcp_364 = approx_rcp(1.0f + _exp2_365);
+                                    float result0_9 = attn0_9 * _rcp_364;
+                                    float _exp2_367 = approx_exp2((-gate1_4[3]) * 1.442695f);
+                                    float _rcp_366 = approx_rcp(1.0f + _exp2_367);
+                                    float result1_9 = attn1_9 * _rcp_366;
+                                    __nv_bfloat162 _bit_cast_src_368 = __float22bfloat162_rn(make_float2(result0_9, result1_9));
+                                    word_4[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_368)[0];
+#endif
                                     long long out_offset_9 = row_i64 * out_stride_row + qo_head_6[3] * out_stride_head + dim_4[3];
                                     *(reinterpret_cast<unsigned int*>(out + out_offset_9) + (0)) = word_4[0];
                                 }

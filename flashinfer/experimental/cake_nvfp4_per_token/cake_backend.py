@@ -68,6 +68,7 @@ import tvm_ffi
 from ...utils import get_compute_capability, get_device_sm_count
 from .cake_jit import (
     ARG_PLANS,
+    KERNELS,
     MODULES,
     kernel_definitions,
     kernel_module_name,
@@ -102,6 +103,11 @@ STATIC_K: tuple[int, ...] = (2688, 4096, 7168)
 WIDE_MAX_M = 4096
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 ARCHES = tuple(sorted(set(SUPPORTED_COMPUTE_CAPABILITIES.values())))
+# SM count each architecture's GEMM dispatch was measured on (sm_100a: B200, sm_103a: GB300).
+# A part with another SM count (GB200: sm_100a with 152 SMs, B300: sm_103a with 148) runs the
+# tactic of the measured count where its own tactic selects a kernel the architecture does not
+# register (:func:`gemm_plan`).
+MEASURED_SM_COUNT = {"sm_100a": 148, "sm_103a": 152}
 # Co-resident clusters per cluster size on each part (``cuOccupancyMaxActiveClusters`` of the split-K
 # kernel at one CTA per SM), keyed by SM count.  A split-K launch is ``weight tiles x token tiles``
 # clusters and must fit in one wave; the capacity is the GPC placement limit, not ``sm_count // size``.
@@ -491,6 +497,11 @@ N8_WIDE_W_ROWS = 64
 # mainloop ring (``ring_overlay``): one more mainloop stage (7 -> 8); the overlaid
 # stages go back to the next tile's loads once the stores have read them.
 RING_OVERLAY_TILE_N = 64
+# The architecture whose loader registers the overlay programs of the 128-wide 1-CTA m tile
+# (``_ro`` m128 keys): one token tile over more 128-wide weight tiles than SMs takes them
+# (8192x28672 M = 128 on B200: 224 tiles on 148 CTAs; a CTA's later tiles reuse the overlaid
+# stages once the previous tile's stores have read them).
+M128_RING_OVERLAY_ARCH = "sm_100a"
 # 16-token-tile raster groups when the group's fp4 operands (16 token tiles of A plus every
 # weight tile it sweeps) fit the 126 MiB L2 and the group sweeps at least 24 weight tiles.
 RASTER16_MIN_W_TILES = 24
@@ -524,6 +535,44 @@ _TWO_CTA_TILE_WAVE_COST_K96 = {128: 0.575, 192: 0.82, 256: 1.0}
 # Cluster split-K 2 for the unsplit swapped-orientation rows whose 128-row weight-tile
 # grid fills at most half the SMs at K >= SPLITK2_MIN_K.
 SPLITK2_MIN_K = 16384
+# Entry L2 prefetch of the weight tiles in the quantize + GEMM chain (``ep_stages`` programs,
+# ``_ep4`` keys): the GEMM's idle prefetch warp streams the weight operand and its block scales
+# of the CTA's first tile, for its first CHAIN_EP_STAGES K tiles, into L2 before the grid
+# dependency wait, so they load while the quantizer still runs.  Per architecture, the program
+# families (kernel key without the output dtype) and the token-count range where the chain
+# (:func:`prepare_nvfp4_per_token_chain`) takes them; the GEMM alone never does.
+CHAIN_EP_STAGES = 4
+CHAIN_EP_RULES: dict[str, dict[str, tuple[int, int]]] = {
+    "sm_100a": {
+        "m128_bF": (128, 128),
+        "m64_bF_l2256b_ro": (128, 128),
+        "n16_sk3_l2256b": (17, 32),
+        "n32_aF_l2256b": (17, 32),
+        "n32_k512_aF_l2256b_s3": (17, 32),
+        "n32_sk2_aF_l2256b": (17, 17),
+        "n8_aF_l2256b": (1, 8),
+        "n8_aF_l2256b_o2": (8, 8),
+        "n8_k512_aF_l2256b_s3": (8, 8),
+        "n8_sk2_aF_l2256b": (1, 32),
+        "n8_sk2_l2256b": (1, 32),
+        "n8_sk3_l2256b": (17, 17),
+        "n8_sk4_l2256b": (1, 8),
+    },
+    "sm_103a": {
+        "m128_bF": (128, 128),
+        "n16_sk3_l2256b": (17, 32),
+        "n32_aF_l2256b": (17, 32),
+        "n32_aF_l2256b_o2": (17, 17),
+        "n32_k512_aF_l2256b_s3": (17, 32),
+        "n32_sk2_aF_l2256b": (17, 17),
+        "n8_aF_l2256b": (1, 8),
+        "n8_aF_l2256b_w64": (1, 8),
+        "n8_k512_aF_l2256b_s3": (8, 8),
+        "n8_sk2_aF_l2256b": (1, 8),
+        "n8_sk3_l2256b": (17, 17),
+        "n8_sk4_l2256b": (1, 8),
+    },
+}
 
 
 def _two_cta_wave_time(
@@ -597,6 +646,7 @@ def default_tactic(
     out_f16: bool = False,
     two_cta_wave_cost: Optional[dict[int, float]] = None,
     n8_wide_w_rows: bool = True,
+    m128_ring_overlay: bool = False,
 ) -> dict[str, Any]:
     """Untuned GEMM tactic (port of ``default_tactic`` of the Cake GEMM launcher).
 
@@ -626,7 +676,9 @@ def default_tactic(
     ``two_cta_wave_cost`` replaces the wave-cost table of the 2-CTA width re-pick
     (:func:`gemm_plan` passes the K = 96 table on sm_103a).  ``n8_wide_w_rows`` allows
     the 64-row weight tiles (:func:`gemm_plan` passes it on :data:`N8_WIDE_W_ROWS_ARCH`
-    only).
+    only).  ``m128_ring_overlay`` allows the overlay on the 128-wide 1-CTA m tile of one
+    token tile when its tiles outnumber the SMs (:func:`gemm_plan` passes it on
+    :data:`M128_RING_OVERLAY_ARCH` only).
     """
     if 1 <= m <= N_ORIENTATION_MAX_M and n % 8 == 0:
         tile_n = 8 if m <= 8 else 16 if m <= 16 else 32
@@ -775,6 +827,17 @@ def default_tactic(
         # stages instead of 7 (18432x7168 and 28672x8192 M = 128: 2-3 % faster on both
         # parts).
         tactic["ring_overlay"] = True
+    if (
+        m128_ring_overlay
+        and m <= BLOCK_M
+        and tile_m == BLOCK_M
+        and tile_n == 128
+        and (n + tile_n - 1) // tile_n > sm_count
+    ):
+        # One token tile over more 128-wide weight tiles than SMs: 6 mainloop stages instead
+        # of 5, the overlaid stages handed back per tile by the epilogue (the program of the
+        # single-token-tile 128-wide rows, no L2 promotion).
+        tactic["ring_overlay"] = True
     if _half_m_pair_rows(m, n, tile_n, sm_count, tactic):
         tactic["half_m"] = True
     if (
@@ -853,6 +916,8 @@ def gemm_kernel_key(tactic: dict[str, Any], out_f16: bool) -> str:
         parts.append(f"w{int(tactic['w_rows'])}")
     if tactic.get("ring_overlay"):
         parts.append("ro")
+    if int(tactic.get("ep_stages", 0)):
+        parts.append(f"ep{int(tactic['ep_stages'])}")
     return "gemm:" + "_".join(parts)
 
 
@@ -955,6 +1020,7 @@ KNOWN_TACTIC_KEYS = frozenset(
         "b_hint",
         "blocks_per_sm",
         "deep_k",
+        "ep_stages",
         "half_m",
         "l2_promo",
         "num_stages",
@@ -981,7 +1047,36 @@ def gemm_plan(
     *,
     tactic: Optional[dict[str, Any]] = None,
 ) -> GemmPlan:
-    """Resolve tactic, tile geometry and grid exactly like the Cake ``launch_gemm``."""
+    """Resolve tactic, tile geometry and grid exactly like the Cake ``launch_gemm``.
+
+    Without an explicit ``tactic``, on an SM count other than ``arch``'s
+    :data:`MEASURED_SM_COUNT` a default tactic whose kernel ``arch`` does not
+    register falls back to the tactic of the measured SM count, planned (grid and
+    stream-K tail) for ``sm_count``."""
+    plan = _gemm_plan(m, n, k, out_f16, arch, sm_count, tactic=tactic)
+    measured = MEASURED_SM_COUNT.get(arch, int(sm_count))
+    if (
+        tactic is not None
+        or int(sm_count) == measured
+        or plan.kernel_key in KERNELS.get(arch, {})
+    ):
+        return plan
+    reference = _gemm_plan(m, n, k, out_f16, arch, measured)
+    fallback = _gemm_plan(m, n, k, out_f16, arch, sm_count, tactic=reference.tactic)
+    return fallback if fallback.kernel_key in KERNELS.get(arch, {}) else plan
+
+
+def _gemm_plan(
+    m: int,
+    n: int,
+    k: int,
+    out_f16: bool,
+    arch: str,
+    sm_count: int,
+    *,
+    tactic: Optional[dict[str, Any]] = None,
+) -> GemmPlan:
+    """The plan of ``tactic`` (default: :func:`default_tactic`) on ``sm_count`` SMs."""
     m, n, k = int(m), int(n), int(k)
     if m < 1 or n < 1:
         raise ValueError("M and N must be positive")
@@ -993,6 +1088,7 @@ def gemm_plan(
             int(sm_count),
             out_f16=bool(out_f16),
             n8_wide_w_rows=arch == N8_WIDE_W_ROWS_ARCH,
+            m128_ring_overlay=arch == M128_RING_OVERLAY_ARCH,
         )
         if arch == K96_ARCH and int(sm_count) == K96_WIDTH_SM_COUNT:
             # The 2-CTA width re-pick of the K = 96 programs (K96_KERNEL_KEYS).
@@ -1005,7 +1101,7 @@ def gemm_plan(
                 two_cta_wave_cost=_TWO_CTA_TILE_WAVE_COST_K96,
             )
             if k96 != tactic:
-                plan = gemm_plan(m, n, k, out_f16, arch, sm_count, tactic=k96)
+                plan = _gemm_plan(m, n, k, out_f16, arch, sm_count, tactic=k96)
                 if plan.kernel_key in K96_KERNEL_KEYS:
                     return plan
     else:
@@ -1045,6 +1141,10 @@ def gemm_plan(
         alpha_n or two_cta or split_k > 1 or blocks_per_sm != 1
     ):
         raise ValueError("ring_overlay is a knob of the 1-CTA m orientation")
+    if int(tactic.get("ep_stages", 0)) and (two_cta or (split_k > 1 and not alpha_n)):
+        raise ValueError(
+            "ep_stages is a knob of the 1-CTA program and the swapped-orientation split-K program"
+        )
     half_m = bool(tactic.get("half_m", False))
     if half_m and (not two_cta or sched_is_clc(tactic) or tactic.get("raster_group")):
         raise ValueError(
@@ -1694,6 +1794,26 @@ def mm_fp4_per_token(
 # ---------------------------------------------------------------------------
 
 
+def chain_gemm_tactic(plan: GemmPlan) -> Optional[dict[str, Any]]:
+    """The GEMM tactic of the quantize + GEMM chain whose GEMM alone resolves to ``plan``:
+    the plan's tactic with the entry L2 prefetch (``ep_stages`` = :data:`CHAIN_EP_STAGES`)
+    when its program family (kernel key without the output dtype) and token count lie in a
+    cell of :data:`CHAIN_EP_RULES` on its architecture and that program is registered, else
+    ``None`` (the plan's own program)."""
+    family = "_".join(
+        part
+        for part in plan.kernel_key.removeprefix("gemm:").split("_")
+        if part not in ("bf16", "f16")
+    )
+    cell = CHAIN_EP_RULES.get(plan.arch, {}).get(family)
+    if cell is None or not cell[0] <= plan.M <= cell[1]:
+        return None
+    tactic = {**plan.tactic, "ep_stages": CHAIN_EP_STAGES}
+    if gemm_kernel_key(tactic, plan.out_f16) not in KERNELS.get(plan.arch, {}):
+        return None
+    return tactic
+
+
 @dataclass(frozen=True)
 class NVFP4PerTokenChainRunner:
     """Quantizer followed by the GEMM: one ``launch()`` runs both generated programs
@@ -1737,11 +1857,28 @@ def prepare_nvfp4_per_token_chain(
 ) -> NVFP4PerTokenChainRunner:
     """Bind ``out = mm_fp4(quantize(x), b, ...)`` with the per-token scale (times
     ``out_scale`` when given) as the GEMM alpha; ``workspace`` holds the quantized
-    activation (:func:`allocate_nvfp4_per_token_quantize_outputs` for ``x``)."""
+    activation (:func:`allocate_nvfp4_per_token_quantize_outputs` for ``x``).  The GEMM
+    runs the program of :func:`chain_gemm_tactic` (the entry L2 prefetch of the weight
+    tiles on the cells of :data:`CHAIN_EP_RULES`), else the one ``mm_fp4`` runs."""
     quantize = prepare_nvfp4_per_token_quantize(
         x, global_scale_inv, workspace, out_scale=out_scale
     )
+    device = workspace.fp4.device
+    plan = gemm_plan(
+        int(workspace.fp4.shape[0]),
+        int(b_fp4.shape[0]),
+        2 * int(workspace.fp4.shape[1]),
+        out.dtype == torch.float16,
+        _device_arch(device),
+        _sm_count(device),
+    )
     gemm = prepare_mm_fp4_per_token(
-        workspace.fp4, workspace.sf, b_fp4, b_sf, workspace.scale, out
+        workspace.fp4,
+        workspace.sf,
+        b_fp4,
+        b_sf,
+        workspace.scale,
+        out,
+        tactic=chain_gemm_tactic(plan),
     )
     return NVFP4PerTokenChainRunner(quantize, gemm)

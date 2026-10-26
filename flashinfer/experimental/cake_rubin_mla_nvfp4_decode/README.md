@@ -134,7 +134,12 @@ hold are handed out by cluster launch control. The host plan cuts every
 (request, 256-row tile) into key ranges -- the pair of split counts (full
 tiles, half tiles whose rows past the first 128 are padding) with the least
 modelled makespan over the device's clusters and pairs -- and emits the work
-items (full-tile items first). A plan without half tiles launches the
+items (full-tile items first). One wave of nearly as many full tiles as
+clusters over 1024 key tiles or more also prices a shaved plan -- every tile
+a long range and a short one of 48 tiles, the long ranges emitted first and
+the short ones left to the clusters the wave does not fill and the pairs as
+they free -- and takes it when the model puts it under the equal-length plan
+by more than the slack. A plan without half tiles launches the
 `decode_full` build (the same kernel without the double-item test at each
 item's end); otherwise `decode`. The one plan whose scalars (rows, full-tile
 items, items, splits) lie in the `decode_full_pairpipe` record's box launches

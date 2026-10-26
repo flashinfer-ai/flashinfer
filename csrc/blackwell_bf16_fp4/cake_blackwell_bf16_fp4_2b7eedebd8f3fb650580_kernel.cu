@@ -179,6 +179,7 @@ kernel_cake_blackwell_bf16_fp4_2b7eedebd8f3fb650580(const __grid_constant__ CUte
 
     const int mbar_base = smem;
     #define full_addr (mbar_base + 0)
+    #define sf_full_addr (mbar_base + 16)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -199,8 +200,8 @@ kernel_cake_blackwell_bf16_fp4_2b7eedebd8f3fb650580(const __grid_constant__ CUte
     int* smk_flag = reinterpret_cast<int*>(smem_raw + 84992);
     const int smk_flag_addr = smem + 84992;
 
-    // Mbarrier init (1 pipeline groups, 0 ordered-sequence groups, 2 barriers)
-    // Mbarriers at smem_raw[0..16)
+    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 3 barriers)
+    // Mbarriers at smem_raw[0..24)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -208,6 +209,8 @@ kernel_cake_blackwell_bf16_fp4_2b7eedebd8f3fb650580(const __grid_constant__ CUte
             // full: 2 barriers, init_count=1
             mbarrier_init(smem + 0, 1);
             mbarrier_init(smem + 8, 1);
+            // sf_full: 1 barriers, init_count=1
+            mbarrier_init(smem + 16, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -218,27 +221,28 @@ kernel_cake_blackwell_bf16_fp4_2b7eedebd8f3fb650580(const __grid_constant__ CUte
     int off_n = blockIdx.x * 64;
     if (warp == 0) {
         if (elect_sync()) {
-            mbarrier_arrive_expect_tx(full_addr, 25600);
+            mbarrier_arrive_expect_tx(sf_full_addr, 2048);
+            asm volatile(
+                "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                " [%0], [%1, {%2, %3}], [%4], %5;"
+                :: "r"(smk_sf_addr), "l"((&B_descale)), "r"(off_n), "r"(blockIdx.z * 32),
+                   "r"(sf_full_addr), "l"(0x12F0000000000000ULL) : "memory");
+            asm volatile(
+                "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                " [%0], [%1, {%2, %3}], [%4], %5;"
+                :: "r"(smk_sf_addr + 25600), "l"((&B_descale)), "r"(off_n), "r"(blockIdx.z * 32 + 16),
+                   "r"(sf_full_addr), "l"(0x12F0000000000000ULL) : "memory");
+            mbarrier_arrive_expect_tx(full_addr, 24576);
             asm volatile(
                 "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1, {%2, %3}], [%4], %5;"
                 :: "r"(smk_b_addr), "l"((&B)), "r"(off_n * 2), "r"(blockIdx.z * 32),
                    "r"(full_addr), "l"(0x12F0000000000000ULL) : "memory");
-            asm volatile(
-                "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-                " [%0], [%1, {%2, %3}], [%4], %5;"
-                :: "r"(smk_sf_addr), "l"((&B_descale)), "r"(off_n), "r"(blockIdx.z * 32),
-                   "r"(full_addr), "l"(0x12F0000000000000ULL) : "memory");
-            mbarrier_arrive_expect_tx(full_addr + 8, 25600);
+            mbarrier_arrive_expect_tx(full_addr + 8, 24576);
             asm volatile(
                 "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1, {%2, %3}], [%4], %5;"
                 :: "r"(smk_b_addr + 25600), "l"((&B)), "r"(off_n * 2), "r"(blockIdx.z * 32 + 16),
-                   "r"(full_addr + 8), "l"(0x12F0000000000000ULL) : "memory");
-            asm volatile(
-                "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-                " [%0], [%1, {%2, %3}], [%4], %5;"
-                :: "r"(smk_sf_addr + 25600), "l"((&B_descale)), "r"(off_n), "r"(blockIdx.z * 32 + 16),
                    "r"(full_addr + 8), "l"(0x12F0000000000000ULL) : "memory");
         }
     }
@@ -310,7 +314,7 @@ kernel_cake_blackwell_bf16_fp4_2b7eedebd8f3fb650580(const __grid_constant__ CUte
     int sf_lane_off = nw * 8 + (lane_g & 4);
     int sf_shift = (lane_g & 3) * 8;
     int sfx_lane_off = (nw * 8 + lane_g) * 16;
-    mbarrier_wait(full_addr, 0);
+    mbarrier_wait(sf_full_addr, 0);
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     int sfx_rec = tid;
     int sfx_kb = sfx_rec >> 4;
@@ -390,7 +394,87 @@ kernel_cake_blackwell_bf16_fp4_2b7eedebd8f3fb650580(const __grid_constant__ CUte
         asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(sfx_carrier_3) : "r"(_fp4_x16x2), "r"(_scale_x16x2));
     }
     smk_sfx[sfx_dst + 3] = sfx_carrier_3;
+    int sfx_rec_4 = tid;
+    int sfx_kb_5 = sfx_rec_4 >> 4;
+    int sfx_nlo_6 = sfx_rec_4 & 15;
+    int sfx_src_7 = smk_sf_addr + 25600 + (unsigned int)(sfx_kb_5 * 64) + (unsigned int)(sfx_nlo_6 & 12);
+    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfx_word[0])) : "r"(sfx_src_7));
+    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfx_word[1])) : "r"(sfx_src_7 + 16));
+    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfx_word[2])) : "r"(sfx_src_7 + 32));
+    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfx_word[3])) : "r"(sfx_src_7 + 48));
+    int sfx_shift_8 = (sfx_nlo_6 & 3) * 8;
+    int sfx_dst_9 = (sfx_kb_5 * 16 + sfx_nlo_6) * 4 + 1024;
+    uint32_t sfx_carrier_10;
+    {
+        uint32_t _fp4_x16x2 = cvt_bf16x2_e2m1x2(34);
+        uint32_t _scale_byte = ((uint32_t)(sfx_word[0] >> (unsigned int)sfx_shift_8)) & 0xFFu;
+        uint32_t _scale_f16x2;
+        asm("mul.lo.u32 %0, %1, 0x00800080;" : "=r"(_scale_f16x2) : "r"(_scale_byte));
+        uint32_t _scale_x16x2;
+        uint16_t _scale_h0 = (uint16_t)(_scale_f16x2 & 0xFFFFu);
+        uint16_t _scale_h1 = (uint16_t)((_scale_f16x2 >> 16) & 0xFFFFu);
+        float _scale_f0;
+        float _scale_f1;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f0) : "h"(_scale_h0));
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f1) : "h"(_scale_h1));
+        asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_scale_x16x2) : "f"(_scale_f1), "f"(_scale_f0));
+        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(sfx_carrier_10) : "r"(_fp4_x16x2), "r"(_scale_x16x2));
+    }
+    smk_sfx[sfx_dst_9] = sfx_carrier_10;
+    uint32_t sfx_carrier_11;
+    {
+        uint32_t _fp4_x16x2 = cvt_bf16x2_e2m1x2(34);
+        uint32_t _scale_byte = ((uint32_t)(sfx_word[1] >> (unsigned int)sfx_shift_8)) & 0xFFu;
+        uint32_t _scale_f16x2;
+        asm("mul.lo.u32 %0, %1, 0x00800080;" : "=r"(_scale_f16x2) : "r"(_scale_byte));
+        uint32_t _scale_x16x2;
+        uint16_t _scale_h0 = (uint16_t)(_scale_f16x2 & 0xFFFFu);
+        uint16_t _scale_h1 = (uint16_t)((_scale_f16x2 >> 16) & 0xFFFFu);
+        float _scale_f0;
+        float _scale_f1;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f0) : "h"(_scale_h0));
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f1) : "h"(_scale_h1));
+        asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_scale_x16x2) : "f"(_scale_f1), "f"(_scale_f0));
+        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(sfx_carrier_11) : "r"(_fp4_x16x2), "r"(_scale_x16x2));
+    }
+    smk_sfx[sfx_dst_9 + 1] = sfx_carrier_11;
+    uint32_t sfx_carrier_12;
+    {
+        uint32_t _fp4_x16x2 = cvt_bf16x2_e2m1x2(34);
+        uint32_t _scale_byte = ((uint32_t)(sfx_word[2] >> (unsigned int)sfx_shift_8)) & 0xFFu;
+        uint32_t _scale_f16x2;
+        asm("mul.lo.u32 %0, %1, 0x00800080;" : "=r"(_scale_f16x2) : "r"(_scale_byte));
+        uint32_t _scale_x16x2;
+        uint16_t _scale_h0 = (uint16_t)(_scale_f16x2 & 0xFFFFu);
+        uint16_t _scale_h1 = (uint16_t)((_scale_f16x2 >> 16) & 0xFFFFu);
+        float _scale_f0;
+        float _scale_f1;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f0) : "h"(_scale_h0));
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f1) : "h"(_scale_h1));
+        asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_scale_x16x2) : "f"(_scale_f1), "f"(_scale_f0));
+        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(sfx_carrier_12) : "r"(_fp4_x16x2), "r"(_scale_x16x2));
+    }
+    smk_sfx[sfx_dst_9 + 2] = sfx_carrier_12;
+    uint32_t sfx_carrier_13;
+    {
+        uint32_t _fp4_x16x2 = cvt_bf16x2_e2m1x2(34);
+        uint32_t _scale_byte = ((uint32_t)(sfx_word[3] >> (unsigned int)sfx_shift_8)) & 0xFFu;
+        uint32_t _scale_f16x2;
+        asm("mul.lo.u32 %0, %1, 0x00800080;" : "=r"(_scale_f16x2) : "r"(_scale_byte));
+        uint32_t _scale_x16x2;
+        uint16_t _scale_h0 = (uint16_t)(_scale_f16x2 & 0xFFFFu);
+        uint16_t _scale_h1 = (uint16_t)((_scale_f16x2 >> 16) & 0xFFFFu);
+        float _scale_f0;
+        float _scale_f1;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f0) : "h"(_scale_h0));
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f1) : "h"(_scale_h1));
+        asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_scale_x16x2) : "f"(_scale_f1), "f"(_scale_f0));
+        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(sfx_carrier_13) : "r"(_fp4_x16x2), "r"(_scale_x16x2));
+    }
+    smk_sfx[sfx_dst_9 + 3] = sfx_carrier_13;
     __syncthreads();
+    mbarrier_wait(full_addr, 0);
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
         : "r"((smk_a_addr + (unsigned int)((pair * 16 + a_col) / 64 * 4096 + a_row * 128 + (pair * 16 + a_col) % 64 * 2 ^ ((pair * 16 + a_col) / 64 * 4096 + a_row * 128 + (pair * 16 + a_col) % 64 * 2 >> 7 & 7) << 4)))
@@ -1025,85 +1109,6 @@ kernel_cake_blackwell_bf16_fp4_2b7eedebd8f3fb650580(const __grid_constant__ CUte
         : "r"(a_frag_hi[0]), "r"(a_frag_hi[1]), "r"(a_frag_hi[2]), "r"(a_frag_hi[3]), "r"(b_frag[0]), "r"(b_frag[1]));
     mbarrier_wait(full_addr + 8, 0);
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-    int sfx_rec_4 = tid;
-    int sfx_kb_5 = sfx_rec_4 >> 4;
-    int sfx_nlo_6 = sfx_rec_4 & 15;
-    int sfx_src_7 = smk_sf_addr + 25600 + (unsigned int)(sfx_kb_5 * 64) + (unsigned int)(sfx_nlo_6 & 12);
-    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfx_word[0])) : "r"(sfx_src_7));
-    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfx_word[1])) : "r"(sfx_src_7 + 16));
-    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfx_word[2])) : "r"(sfx_src_7 + 32));
-    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfx_word[3])) : "r"(sfx_src_7 + 48));
-    int sfx_shift_8 = (sfx_nlo_6 & 3) * 8;
-    int sfx_dst_9 = (sfx_kb_5 * 16 + sfx_nlo_6) * 4 + 1024;
-    uint32_t sfx_carrier_10;
-    {
-        uint32_t _fp4_x16x2 = cvt_bf16x2_e2m1x2(34);
-        uint32_t _scale_byte = ((uint32_t)(sfx_word[0] >> (unsigned int)sfx_shift_8)) & 0xFFu;
-        uint32_t _scale_f16x2;
-        asm("mul.lo.u32 %0, %1, 0x00800080;" : "=r"(_scale_f16x2) : "r"(_scale_byte));
-        uint32_t _scale_x16x2;
-        uint16_t _scale_h0 = (uint16_t)(_scale_f16x2 & 0xFFFFu);
-        uint16_t _scale_h1 = (uint16_t)((_scale_f16x2 >> 16) & 0xFFFFu);
-        float _scale_f0;
-        float _scale_f1;
-        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f0) : "h"(_scale_h0));
-        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f1) : "h"(_scale_h1));
-        asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_scale_x16x2) : "f"(_scale_f1), "f"(_scale_f0));
-        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(sfx_carrier_10) : "r"(_fp4_x16x2), "r"(_scale_x16x2));
-    }
-    smk_sfx[sfx_dst_9] = sfx_carrier_10;
-    uint32_t sfx_carrier_11;
-    {
-        uint32_t _fp4_x16x2 = cvt_bf16x2_e2m1x2(34);
-        uint32_t _scale_byte = ((uint32_t)(sfx_word[1] >> (unsigned int)sfx_shift_8)) & 0xFFu;
-        uint32_t _scale_f16x2;
-        asm("mul.lo.u32 %0, %1, 0x00800080;" : "=r"(_scale_f16x2) : "r"(_scale_byte));
-        uint32_t _scale_x16x2;
-        uint16_t _scale_h0 = (uint16_t)(_scale_f16x2 & 0xFFFFu);
-        uint16_t _scale_h1 = (uint16_t)((_scale_f16x2 >> 16) & 0xFFFFu);
-        float _scale_f0;
-        float _scale_f1;
-        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f0) : "h"(_scale_h0));
-        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f1) : "h"(_scale_h1));
-        asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_scale_x16x2) : "f"(_scale_f1), "f"(_scale_f0));
-        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(sfx_carrier_11) : "r"(_fp4_x16x2), "r"(_scale_x16x2));
-    }
-    smk_sfx[sfx_dst_9 + 1] = sfx_carrier_11;
-    uint32_t sfx_carrier_12;
-    {
-        uint32_t _fp4_x16x2 = cvt_bf16x2_e2m1x2(34);
-        uint32_t _scale_byte = ((uint32_t)(sfx_word[2] >> (unsigned int)sfx_shift_8)) & 0xFFu;
-        uint32_t _scale_f16x2;
-        asm("mul.lo.u32 %0, %1, 0x00800080;" : "=r"(_scale_f16x2) : "r"(_scale_byte));
-        uint32_t _scale_x16x2;
-        uint16_t _scale_h0 = (uint16_t)(_scale_f16x2 & 0xFFFFu);
-        uint16_t _scale_h1 = (uint16_t)((_scale_f16x2 >> 16) & 0xFFFFu);
-        float _scale_f0;
-        float _scale_f1;
-        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f0) : "h"(_scale_h0));
-        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f1) : "h"(_scale_h1));
-        asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_scale_x16x2) : "f"(_scale_f1), "f"(_scale_f0));
-        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(sfx_carrier_12) : "r"(_fp4_x16x2), "r"(_scale_x16x2));
-    }
-    smk_sfx[sfx_dst_9 + 2] = sfx_carrier_12;
-    uint32_t sfx_carrier_13;
-    {
-        uint32_t _fp4_x16x2 = cvt_bf16x2_e2m1x2(34);
-        uint32_t _scale_byte = ((uint32_t)(sfx_word[3] >> (unsigned int)sfx_shift_8)) & 0xFFu;
-        uint32_t _scale_f16x2;
-        asm("mul.lo.u32 %0, %1, 0x00800080;" : "=r"(_scale_f16x2) : "r"(_scale_byte));
-        uint32_t _scale_x16x2;
-        uint16_t _scale_h0 = (uint16_t)(_scale_f16x2 & 0xFFFFu);
-        uint16_t _scale_h1 = (uint16_t)((_scale_f16x2 >> 16) & 0xFFFFu);
-        float _scale_f0;
-        float _scale_f1;
-        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f0) : "h"(_scale_h0));
-        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f1) : "h"(_scale_h1));
-        asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_scale_x16x2) : "f"(_scale_f1), "f"(_scale_f0));
-        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(sfx_carrier_13) : "r"(_fp4_x16x2), "r"(_scale_x16x2));
-    }
-    smk_sfx[sfx_dst_9 + 3] = sfx_carrier_13;
-    __syncthreads();
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
         : "r"((smk_a_addr + 25600 + (unsigned int)((pair * 16 + a_col) / 64 * 4096 + a_row * 128 + (pair * 16 + a_col) % 64 * 2 ^ ((pair * 16 + a_col) / 64 * 4096 + a_row * 128 + (pair * 16 + a_col) % 64 * 2 >> 7 & 7) << 4)))

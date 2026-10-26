@@ -242,16 +242,16 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         ``torch.float16``. Every :meth:`run` then supplies the scale tensors as
         :class:`SageAttentionParams`.
 
-        ``softmax_rescale_threshold_log2`` (0 to 8, default 8) applies to
-        block-sparse plans on the Q64/KV256 and Q128/KV128 profiles and to
-        dense Q64/KV256 plans: a row keeps its softmax exponent anchor while a
-        tile raises the row maximum by at most this many binades, which skips
-        the rescale of the accumulated output. Probabilities then reach
-        ``2**threshold``, so Sage FP8 P is quantized at ``448 * 2**-threshold``
-        and probabilities far below the anchor lose E4M3 precision; rows whose
-        largest scores come first, such as attention sinks in the first
-        blocks, are the most exposed. 0 rescales on every new row maximum and
-        quantizes FP8 P at 448.
+        ``softmax_rescale_threshold_log2`` (0 to 8, default 8) applies to the
+        Q64/KV256 and Q128/KV128 profiles of dense and block-sparse plans: a
+        row keeps its softmax exponent anchor while a tile raises the row
+        maximum by at most this many binades, which skips the rescale of the
+        accumulated output. Probabilities then reach ``2**threshold``, so Sage
+        FP8 P is quantized at ``448 * 2**-threshold`` and probabilities far
+        below the anchor lose E4M3 precision; rows whose largest scores come
+        first, such as attention sinks in the first blocks, are the most
+        exposed. 0 rescales on every new row maximum and quantizes FP8 P at
+        448.
         """
 
         if use_block_sparse:

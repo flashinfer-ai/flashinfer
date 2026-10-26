@@ -922,10 +922,16 @@ def _use_tinygemm2_sm100(device: torch.device) -> bool:
 # with the reference's output bits.  They keep the reference's four K chains, the
 # K16 order within a chain and its +0 start, and sum the chains and the bias in the
 # reference's order, so a routed call returns exactly what the reference returns.
-# Three tiles, each with and without the bias and with and without programmatic
-# dependent launch, as (output features, batch rows) per CTA:
+# Five tiles, each with and without the bias and with and without programmatic
+# dependent launch, as (output features, batch rows) per CTA.  The three narrow
+# tiles differ only in their loops: PACKED_NARROW unrolls them by two rounds, faster
+# on sm_100a; PACKED_NARROW_U4 unrolls its MMA loop by four, faster on sm_107a;
+# PACKED_NARROW_FULL_STAGES also issues a full stage's MMAs without a per-step K
+# test, faster on sm_103a.
 _TINYGEMM2_TCGEN05_TILES = {
     "PACKED_NARROW": (8, 2),
+    "PACKED_NARROW_U4": (8, 2),
+    "PACKED_NARROW_FULL_STAGES": (8, 2),
     "PACKED": (32, 16),
     "ACCUMULATORS": (32, 64),
 }
@@ -969,16 +975,16 @@ class _Tcgen05Window(NamedTuple):
 # window admitting a shape selects its tile, and every other shape keeps that
 # kernel.  The bounds are the measured ranges.  Small weights stay on that kernel:
 # the tensor-memory allocation adds a fixed half microsecond to a launch that
-# takes four.  The narrow tile serves 32 to 128 output features over long inputs
-# without a bias, and with one on 3 to 8 rows at an input of 4096 or from 16384.
-# PACKED serves eight rows or fewer only without a bias and from 2880 output
-# features (90 CTAs).  With a bias, tinygemm2_sm100 stays faster up to 27 rows
-# except for PACKED on 9 to 16 rows from 2880 output features and an input of
-# 2112, and up to 32 rows below 1536 output features.  From 9 rows without a bias
-# (28 with one) PACKED serves while its grid fits one wave; past that ACCUMULATORS
-# (64 rows per CTA) does.  On sm_107a the narrow tile starts at 64 output features
-# and serves a bias only at an input of 4096, no PACKED window covers 16 rows or
-# fewer, and with a bias 28 to 32 rows start at 2048 output features.
+# takes four.  The narrow tiles serve up to 8 rows and up to 512 output features
+# over long inputs; their windows differ per architecture.  PACKED serves eight rows
+# or fewer only without a bias and from 2880 output features (90 CTAs).  With a
+# bias, tinygemm2_sm100 stays faster up to 27 rows except for PACKED on 9 to 16 rows
+# from 2880 output features and an input of 2112, and up to 32 rows below 1536
+# output features.  From 9 rows without a bias (28 with one) PACKED serves while its
+# grid fits one wave; past that ACCUMULATORS (64 rows per CTA) does.  On sm_107a
+# PACKED serves only 8 rows without a bias and 9 to 16 rows with one, from 3584
+# output features at inputs of 2112 to 6144, and with a bias 28 to 32 rows start at
+# 2048 output features.
 _LARGE_WEIGHT = 6_000_000
 _MANY_ROWS_NOBIAS = (
     _Tcgen05Window(
@@ -1014,26 +1020,74 @@ def _many_rows_bias(low: int) -> Tuple[_Tcgen05Window, ...]:
     )
 
 
-_SM100_SM103 = (
-    _Tcgen05Window("PACKED_NARROW", 1, 2, False, 32, 128, 10240, 20480),
-    _Tcgen05Window("PACKED_NARROW", 3, 8, False, 32, 128, 6144, 20480),
-    _Tcgen05Window("PACKED_NARROW", 3, 8, True, 32, 128, 4096, 4096),
-    _Tcgen05Window("PACKED_NARROW", 3, 8, True, 64, 128, 16384, 20480),
+_PACKED_FEW_ROWS = (
     _Tcgen05Window("PACKED", 1, 8, False, 2880, 4096, None, 6144, _LARGE_WEIGHT),
     _Tcgen05Window("PACKED", 9, 16, True, 2880, 4096, 2112, 6144, _LARGE_WEIGHT),
+)
+_SM100 = (
+    _Tcgen05Window("PACKED_NARROW", 1, 4, True, 32, 512, 10240, 20480),
+    _Tcgen05Window("PACKED_NARROW", 1, 8, True, 32, 128, 8192, 20480),
+    _Tcgen05Window("PACKED_NARROW", 3, 8, True, 32, 256, 3584, 4096),
+    _Tcgen05Window("PACKED_NARROW", 3, 6, True, 32, 256, 7168, 20480),
+    _Tcgen05Window("PACKED_NARROW", 4, 8, True, 32, 64, 3584, 20480),
+    _Tcgen05Window("PACKED_NARROW", 1, 4, True, 32, 320, 8192, 20480),
+    _Tcgen05Window("PACKED_NARROW", 1, 6, True, 32, 384, 11264, 20480),
+    _Tcgen05Window("PACKED_NARROW", 2, 6, True, 256, 320, 3584, 4096),
+    _Tcgen05Window("PACKED_NARROW", 1, 4, False, 32, 512, 8192, 20480),
+    _Tcgen05Window("PACKED_NARROW", 2, 8, False, 32, 256, 6144, 20480),
+    _Tcgen05Window("PACKED_NARROW", 1, 6, False, 32, 384, 8192, 20480),
+    _Tcgen05Window("PACKED_NARROW", 6, 8, False, 64, 128, 3584, 20480),
+    _Tcgen05Window("PACKED_NARROW", 3, 8, False, 32, 128, 3584, 3584),
+    _Tcgen05Window("PACKED_NARROW", 3, 6, False, 32, 320, 6144, 20480),
+    _Tcgen05Window("PACKED_NARROW", 3, 8, False, 32, 64, 5120, 20480),
+    _Tcgen05Window("PACKED_NARROW", 1, 8, False, 32, 256, 7168, 20480),
+    *_PACKED_FEW_ROWS,
+    *_MANY_ROWS_NOBIAS,
+    *_many_rows_bias(1536),
+)
+_SM103 = (
+    _Tcgen05Window("PACKED_NARROW_FULL_STAGES", 1, 6, True, 32, 384, 8192, 20480),
+    _Tcgen05Window("PACKED_NARROW_FULL_STAGES", 3, 8, True, 32, 256, 7168, 20480),
+    _Tcgen05Window("PACKED_NARROW_FULL_STAGES", 3, 8, True, 32, 256, 3072, 4096),
+    _Tcgen05Window("PACKED_NARROW_FULL_STAGES", 1, 2, True, 32, 512, 8192, 20480),
+    _Tcgen05Window("PACKED_NARROW_FULL_STAGES", 1, 6, True, 32, 384, 3584, 3584),
+    _Tcgen05Window("PACKED_NARROW_FULL_STAGES", 4, 4, True, 32, 512, 8192, 20480),
+    _Tcgen05Window("PACKED_NARROW_FULL_STAGES", 3, 6, True, 256, 320, 2560, 4096),
+    _Tcgen05Window("PACKED_NARROW_FULL_STAGES", 3, 8, True, 128, 256, 6144, 20480),
+    _Tcgen05Window("PACKED_NARROW_FULL_STAGES", 1, 6, False, 32, 320, 7168, 20480),
+    _Tcgen05Window("PACKED_NARROW_FULL_STAGES", 1, 6, False, 32, 384, 8192, 20480),
+    _Tcgen05Window("PACKED_NARROW_FULL_STAGES", 1, 4, False, 32, 512, 8192, 20480),
+    _Tcgen05Window("PACKED_NARROW_FULL_STAGES", 2, 8, False, 32, 256, 6144, 20480),
+    _Tcgen05Window("PACKED_NARROW_FULL_STAGES", 3, 8, False, 32, 256, 3584, 3584),
+    _Tcgen05Window("PACKED_NARROW_FULL_STAGES", 4, 8, False, 64, 256, 5120, 20480),
+    _Tcgen05Window("PACKED_NARROW_FULL_STAGES", 4, 6, False, 32, 64, 3584, 20480),
+    _Tcgen05Window("PACKED_NARROW_FULL_STAGES", 1, 6, False, 320, 320, 6144, 20480),
+    _Tcgen05Window("PACKED_NARROW_FULL_STAGES", 1, 2, False, 32, 512, 7168, 20480),
+    *_PACKED_FEW_ROWS,
     *_MANY_ROWS_NOBIAS,
     *_many_rows_bias(1536),
 )
 _SM107 = (
-    _Tcgen05Window("PACKED_NARROW", 1, 2, False, 64, 128, 10240, 20480),
-    _Tcgen05Window("PACKED_NARROW", 3, 8, False, 64, 128, 6144, 20480),
-    _Tcgen05Window("PACKED_NARROW", 3, 8, True, 64, 128, 4096, 4096),
+    _Tcgen05Window("PACKED_NARROW_U4", 1, 8, True, 64, 384, 10240, 20480),
+    _Tcgen05Window("PACKED_NARROW_U4", 1, 6, True, 32, 512, 13312, 20480),
+    _Tcgen05Window("PACKED_NARROW_U4", 3, 6, True, 64, 448, 8192, 20480),
+    _Tcgen05Window("PACKED_NARROW_U4", 3, 8, True, 64, 256, 3072, 4096),
+    _Tcgen05Window("PACKED_NARROW_U4", 6, 8, True, 128, 320, 7168, 20480),
+    _Tcgen05Window("PACKED_NARROW_U4", 1, 6, True, 64, 512, 4096, 4096),
+    _Tcgen05Window("PACKED_NARROW_U4", 1, 6, False, 32, 512, 8192, 20480),
+    _Tcgen05Window("PACKED_NARROW_U4", 1, 8, False, 64, 384, 6144, 20480),
+    _Tcgen05Window("PACKED_NARROW_U4", 3, 8, False, 32, 384, 7168, 20480),
+    _Tcgen05Window("PACKED_NARROW_U4", 1, 4, False, 64, 512, 6144, 20480),
+    _Tcgen05Window("PACKED_NARROW_U4", 3, 8, False, 64, 128, 5120, 20480),
+    _Tcgen05Window("PACKED_NARROW_U4", 1, 6, False, 64, 512, 7168, 20480),
+    _Tcgen05Window("PACKED", 8, 8, False, 3584, 4096, 2112, 6144),
+    _Tcgen05Window("PACKED", 9, 16, True, 3584, 4096, 2112, 6144),
     *_MANY_ROWS_NOBIAS,
     *_many_rows_bias(2048),
 )
 _TINYGEMM2_TCGEN05_WINDOWS = {
-    (10, 0): _SM100_SM103,
-    (10, 3): _SM100_SM103,
+    (10, 0): _SM100,
+    (10, 3): _SM103,
     (10, 7): _SM107,
 }
 
@@ -1072,14 +1126,33 @@ def _tinygemm2_tcgen05_program(
         or weight.data_ptr() % 16 != 0
     ):
         return None
-    sms = _multiprocessor_count(input.device.index)
+    tile = _tinygemm2_tcgen05_tile(
+        capability,
+        batch,
+        out_features,
+        in_features,
+        has_bias,
+        _multiprocessor_count(input.device.index),
+    )
+    if tile is None:
+        return None
+    return tile + ("" if has_bias else "_NOBIAS") + ("_PDL" if use_pdl else "")
+
+
+@functools.cache
+def _tinygemm2_tcgen05_tile(
+    capability: Tuple[int, int],
+    batch: int,
+    out_features: int,
+    in_features: int,
+    has_bias: bool,
+    sms: int,
+) -> Optional[str]:
+    """The tile of the first window admitting the shape, or ``None``: evaluated
+    once per shape, so a call does not scan the windows."""
     for window in _TINYGEMM2_TCGEN05_WINDOWS[capability]:
         if window.admits(batch, out_features, in_features, has_bias, sms):
-            return (
-                window.tile
-                + ("" if has_bias else "_NOBIAS")
-                + ("_PDL" if use_pdl else "")
-            )
+            return window.tile
     return None
 
 

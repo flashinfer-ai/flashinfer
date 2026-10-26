@@ -330,10 +330,10 @@ def _rmsnorm_sigmoid_gate_backend(
 ) -> Optional[str]:
     """The backend one call runs on: ``"cake"`` when the Cake package ships a
     program for the device, the call's launch form (its PDL route under
-    ``enable_pdl``, which the package ships on the Blackwell architectures
-    alone) and (with ``heads`` and ``tokens``) the call's head count and token
-    count (preferred under ``"auto"``; a head count the package's windows do
-    not name, or a token count in a gap of them, falls to the CuTe DSL kernel),
+    ``enable_pdl``) and (with ``heads`` and ``tokens``) the call's head count
+    and token count (preferred under ``"auto"``; a head count the package's
+    windows do not name, or a token count in a gap of them, falls to the CuTe
+    DSL kernel),
     else ``"cute"`` when the CuTe DSL kernel targets the device; ``None`` when
     the requested backend is not available."""
     if backend not in _GATED_RESIDUAL_NEXT_BACKENDS:
@@ -364,9 +364,8 @@ def supports_rmsnorm_sigmoid_gate(
 ) -> bool:
     """Whether a BF16, head-dimension-64 call can run on ``device`` (the current
     one when ``None``) through ``backend`` (``"auto"``: the Cake package or the
-    CuTe DSL kernel) in the launch form ``enable_pdl`` selects (the package's
-    PDL route exists on the Blackwell architectures alone).  The package routes
-    on the head count and the token count of a call as well;
+    CuTe DSL kernel) in the launch form ``enable_pdl`` selects.  The package
+    routes on the head count and the token count of a call as well;
     ``rmsnorm_sigmoid_gate`` falls to the CuTe DSL kernel where they lie outside
     its windows."""
     if dtype != torch.bfloat16 or head_dim != _RMSNORM_SIGMOID_GATE_HEAD_DIM:
@@ -964,16 +963,15 @@ def rmsnorm_sigmoid_gate(
         attribute directly; the Cake package serves the call from its PDL
         route, whose windows name a PDL build, a late-signal PDL build or a
         plain build (launched without the attribute where the PDL build
-        measured slower) and cover every token count the plain route covers.
-        The package ships that route on SM100 and SM103; on SM107 ``"auto"``
-        runs the CuTe DSL kernel with PDL and the Cake kernels serve
-        ``enable_pdl=False`` calls.
+        measured slower) or leave a token count to the CuTe DSL kernel under
+        PDL (a declared gap).  The package ships that route on SM100, SM103
+        and SM107.
     backend : str
         ``"auto"`` (default) runs the Cake kernels
         (:mod:`flashinfer.cake_muse_spark_norm_backend`) where the package ships
         a program for the device, the call's launch form, head count and token
-        count (the package routes 128, 32 and 16 heads; on SM107 its windows
-        leave token-count gaps where the CuTe DSL kernel measured ahead), else
+        count (the package routes 128, 32 and 16 heads; its windows leave
+        token-count gaps where the CuTe DSL kernel measured ahead), else
         the CuTe DSL kernel; ``"cake"`` and ``"cute"`` select one and raise
         ``ValueError`` when it is not available (``"cake"`` at a head count or
         token count outside the package's windows raises too).
@@ -1258,7 +1256,7 @@ def fused_add_rmsnorm_quant(
     ``residual[i] += input[i]``
 
     Step 2:
-    ``input[i] = ((residual[i] / RMS(residual)) * weight[i]).to(fp8)``
+    ``out[i] = (((residual[i] / RMS(residual)) * weight[i]) / scale).to(fp8)``
 
     Parameters
     ----------

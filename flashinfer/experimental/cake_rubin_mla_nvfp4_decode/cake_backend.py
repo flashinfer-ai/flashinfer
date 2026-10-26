@@ -127,6 +127,7 @@ WORKSPACE_SLOTS = ("partial_o", "partial_lse", "lse_scratch", "plan_block")
 
 # The decode cost model's constants (:func:`mla2_plan`).
 MLA2_ITEM_COST = 7  # the mixed-cluster kernel's ramp and epilogue per item in 128-key tile times (fitted on sweeps)
+MLA2_SHAVE_TILES = 48  # a shaved one-wave plan's short range per full tile, in 128-key tiles (:func:`mla2_plan`)
 
 # Clusters of four the GPU holds at once and pair clusters on the SMs the fours leave, by SM count, for devices
 # whose occupancy cannot be queried (:func:`device_units_pairs`): R200 boards measured 50 fours and 4 pairs at 208 SMs
@@ -155,6 +156,7 @@ def mla2_plan(
     slack=0.03,
     pair_cost=1.4,
     split=0,
+    shave=MLA2_SHAVE_TILES,
 ):
     """The work items of the mixed-cluster decode (128-key tiles). A (request, row tile) whose
     rows past the first 128 are padding (H96 x 4 = 384 rows: the second tile) is a half tile; its items are double
@@ -174,7 +176,11 @@ def mla2_plan(
     1`` rows of 1 KB per query row with ``n`` partials, at ``merge_rows_per_tile`` rows per tile-time; the merge
     variant is chosen to load every row in one round, so no second-batch term); the
     plan within ``slack`` of the least cost with equal lengths, else two, then the smallest counts, and at those counts
-    the couples' scale the model puts at least 1 % under equal lengths.
+    the couples' scale the model puts at least 1 % under equal lengths. One wave of at least ``0.8 units`` full tiles
+    of 1024 key tiles or more also prices the shaved plan: every tile in a long range and a short one of ``shave``
+    tiles, the long ranges emitted first (the clusters' wave) and the short ones after them, which the clusters the
+    wave leaves and the couples take as they free (48 tiles on 50 clusters and 2 couples otherwise leave 16 of 208
+    SMs idle for the whole decode); it replaces the choice when the model puts it under that by more than ``slack``.
     Returns the items (page ranges ``(request, row tile, first page, end page, split, split count, flags, 0)``,
     ``flags & 1`` a direct item that writes ``O`` / ``LSE``), the kernel's ``item_table`` rows ``(request, row tile,
     first 128-key tile, tiles, z, split count)``, ``max_splits`` (a row of a full tile has ``s_f`` partials, of a
@@ -292,8 +298,27 @@ def mla2_plan(
         ]
         return ranges, order
 
-    def cost(s_f, s_h, scale, s_t=0):
-        ranges, order = full_ranges(s_f, scale) if not s_t else mixed_ranges(s_t)
+    def shaved_ranges(x):
+        """Each full tile in a long range and a short one of ``x`` tiles, the long ranges emitted first (the
+        clusters' wave) and the short ones after them, for the clusters the wave leaves and the couples to take as
+        they free."""
+        ranges = [
+            [(0, tiles_of[b] - x, False), (tiles_of[b] - x, x, False)]
+            for b, _m, _h in full_tiles
+        ]
+        n_tiles = len(full_tiles)
+        return ranges, [(t, 0) for t in range(n_tiles)] + [
+            (t, 1) for t in range(n_tiles)
+        ]
+
+    def cost(s_f, s_h, scale, s_t=0, x=0):
+        ranges, order = (
+            shaved_ranges(x)
+            if x
+            else full_ranges(s_f, scale)
+            if not s_t
+            else mixed_ranges(s_t)
+        )
         tps_h = -(-k_max // s_h) if half_tiles else 0
         costs = [(ranges[t][i][1] + item_cost, False) for t, i in order]
         costs += [(0.6 * tps_h + item_cost, True)] * (len(half_tiles) * s_h)
@@ -312,6 +337,7 @@ def mla2_plan(
 
     scales = (1.0, 1.0 / pair_cost, pair_cost)
     s_t = 0  # a mixed plan's tail split (0: every full tile cut alike)
+    x_s = 0  # a shaved plan's short range (0: none)
     if isinstance(split, tuple) and split and split[0] == "mixed":
         s_f, s_h, s_t, scale = 1, 1, int(split[1]), 1.0
     elif split:
@@ -368,7 +394,26 @@ def mla2_plan(
             st_best = min(mixed, key=lambda st: (mixed[st], st))
             if mixed[st_best] < costs[((s_f, s_h), scale)] / (1 + slack):
                 s_f, s_h, s_t, scale = 1, s_h_m, st_best, 1.0
-    ranges, order = full_ranges(s_f, scale) if not s_t else mixed_ranges(s_t)
+        # One wave of nearly as many full tiles as clusters at long key counts (1024 key tiles, 128K, and up: the rows
+        # the family was measured on): the shaved plan, each tile a long range and a short one of ``shave`` tiles for
+        # the clusters the wave leaves and the couples, when the model puts it under the chosen plan by more than the
+        # slack (it is not held to the equal-lengths order above).
+        if (
+            one_wave
+            and shave
+            and len(full_tiles) >= 0.8 * units
+            and min(tiles_of[b] for b, _m, _h in full_tiles) >= max(1024, 2 * shave)
+        ):
+            shaved = cost(2, 1, 1.0, x=shave)
+            if shaved < costs[((s_f, s_h), scale)] / (1 + slack):
+                s_f, s_h, scale, x_s = 2, 1, 1.0, shave
+    ranges, order = (
+        shaved_ranges(x_s)
+        if x_s
+        else full_ranges(s_f, scale)
+        if not s_t
+        else mixed_ranges(s_t)
+    )
     tps_h = -(-k_max // s_h)
     n_f = (s_t or s_f) if full_tiles else 0
     n_h = 2 * s_h if half_tiles else 0
