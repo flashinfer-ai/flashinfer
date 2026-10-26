@@ -1256,6 +1256,78 @@ def test_radix_device_active_rows_cuda_graph(input_stride, ctas_per_group, use_m
         torch.testing.assert_close(actual, expected[enabled], rtol=0, atol=0)
 
 
+@pytest.mark.parametrize(
+    "width,col_stride,row_stride,match",
+    [
+        (8, 0, 8, "positive"),
+        (8, -1, 8, "positive"),
+        (8, 1, 16, "compact rows"),
+        (2**30 + 1, 2, None, "fit int32"),
+    ],
+)
+def test_radix_rejects_unsupported_input_layout(width, col_stride, row_stride, match):
+    from flashinfer.topk_varlen.topk_varlen import _compile_radix
+
+    with pytest.raises(ValueError, match=match):
+        _compile_radix(None, 512, 1, 1, width, False, 1, 512, 8, col_stride, row_stride)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("ctas_per_group", [1, 2])
+def test_radix_strided_short_rows_return_values(dtype, ctas_per_group):
+    """Odd-element views exercise dtype alignment and identity-path values."""
+    import cutlass
+    from flashinfer.topk_varlen.topk_varlen import _compile_radix, _RADIX_STATE_SIZE
+
+    rows, width, top_k, sms = 3, 1024, 512, 8
+    storage = torch.arange(rows * width * 2, device="cuda").to(dtype).reshape(rows, -1)
+    logits = storage[:, 1::2]
+    lengths = torch.tensor([0, 127, top_k], dtype=torch.int32, device="cuda")
+    states = None
+    if ctas_per_group > 1:
+        states = torch.zeros(
+            (sms // ctas_per_group, _RADIX_STATE_SIZE), dtype=torch.int32, device="cuda"
+        )
+    indices = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+    values = torch.empty((rows, top_k), dtype=dtype, device="cuda")
+    cute_dtype = {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+    }[dtype]
+    compiled = _compile_radix(
+        cute_dtype,
+        top_k,
+        1,
+        1,
+        width,
+        True,
+        ctas_per_group,
+        width // ctas_per_group,
+        sms,
+        2,
+        width * 2,
+    )
+    compiled(logits, states, lengths, indices, values)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        compiled(logits, states, lengths, indices, values)
+    for _ in range(2):
+        logits.add_(1)
+        graph.replay()
+        torch.cuda.synchronize()
+        for row, length in enumerate((0, 127, top_k)):
+            torch.testing.assert_close(
+                indices[row, :length],
+                torch.arange(length, device="cuda", dtype=torch.int32),
+            )
+            torch.testing.assert_close(
+                values[row, :length], logits[row, :length], rtol=0, atol=0
+            )
+            assert bool((indices[row, length:] == -1).all())
+
+
 @requires_blackwell
 @pytest.mark.parametrize("return_values", [True, False])
 def test_radix_preallocated_outputs(return_values):

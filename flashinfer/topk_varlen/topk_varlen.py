@@ -891,6 +891,25 @@ def _compile_radix(
     has_active_rows=False,
     has_active_mask=False,
 ):
+    """Compile a radix specialization for compact or column-strided rows.
+
+    ``input_col_stride`` and ``input_row_stride`` count input elements, not
+    bytes. Unit-column inputs must have compact rows; strided inputs require
+    only dtype alignment. Column offsets must fit signed int32 arithmetic.
+    ``has_active_rows`` accepts a device scalar queue length; ``has_active_mask``
+    accepts a device int32 mask indexed by original row. They are exclusive,
+    and either leaves inactive output rows untouched across graph replays.
+    """
+    if input_col_stride <= 0:
+        raise ValueError("radix input column stride must be positive")
+    if input_row_stride is None:
+        input_row_stride = N * input_col_stride
+    if input_col_stride == 1 and input_row_stride != N:
+        raise ValueError("unit-column radix inputs must have compact rows")
+    if N <= 0 or (N - 1) * input_col_stride >= 2**31:
+        raise ValueError("radix input column offsets must fit int32")
+    if has_active_rows and has_active_mask:
+        raise ValueError("active row count and mask are mutually exclusive")
     # N (vocab size) is static: it feeds the fake input tensor's column extent so
     # the kernel is specialized per vocab width. chunk_size (the per-CTA SMEM
     # span) is passed explicitly — computed once by _radix_get_chunk_config so
@@ -917,8 +936,6 @@ def _compile_radix(
     max_num_groups = max(1, num_sms // ctas_per_group)
 
     dtype_name = str(cute_dtype).split(".")[-1]
-    if input_row_stride is None:
-        input_row_stride = N * input_col_stride
     kernel_name = (
         f"{dtype_name}_topk{top_k}_nextn{next_n}_cr{compress_ratio}"
         f"_N{N}_rv{int(return_output_values)}_cta{ctas_per_group}_chunk{chunk_size}_sms{num_sms}"
@@ -927,8 +944,6 @@ def _compile_radix(
     if has_active_rows:
         kernel_name += "_active"
     if has_active_mask:
-        if has_active_rows:
-            raise ValueError("active row count and mask are mutually exclusive")
         kernel_name += "_masked"
 
     def _compile_fn():
@@ -944,7 +959,7 @@ def _compile_radix(
                 cute_dtype,
                 (sym_rows, sym_n),
                 stride=(input_row_stride, input_col_stride),
-                assumed_align=4,
+                assumed_align=cute_dtype.width // 8,
             )
         active_args = (
             {
