@@ -477,9 +477,14 @@ void LaunchOne(const KernelLaunch& launch, void* opaque_context) {
   std::array<cudaLaunchAttribute, 6> attributes{};
   uint32_t attribute_count = 0;
 
-  attributes[attribute_count].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attributes[attribute_count].val.programmaticStreamSerializationAllowed = 1;
-  ++attribute_count;
+  // The chain's first kernel reads caller inputs, such as the routing indices,
+  // before it could wait on the previous grid, so it is submitted in stream
+  // order. Later kernels keep programmatic dependent launch.
+  if (context->launch_count > 0) {
+    attributes[attribute_count].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attributes[attribute_count].val.programmaticStreamSerializationAllowed = 1;
+    ++attribute_count;
+  }
 
   const bool clustered = launch.cluster.x > 1 || launch.cluster.y > 1 || launch.cluster.z > 1;
   if (clustered) {
