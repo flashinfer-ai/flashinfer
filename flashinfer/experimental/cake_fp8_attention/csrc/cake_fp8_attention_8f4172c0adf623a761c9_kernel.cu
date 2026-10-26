@@ -57,7 +57,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
-kernel_cake_fp8_attention_3d93e4fe65e62bf146ce(float* __restrict__ partials, float* __restrict__ mean_k, float* __restrict__ v_scale, int seqlen, int num_tiles)
+kernel_cake_fp8_attention_8f4172c0adf623a761c9(float* __restrict__ partials, float* __restrict__ mean_k, float* __restrict__ v_scale, int seqlen, int num_tiles)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -76,7 +76,7 @@ kernel_cake_fp8_attention_3d93e4fe65e62bf146ce(float* __restrict__ partials, flo
     int is_max = tid >> 7;
     int base = bid * num_tiles * 256 + is_max * 128 + chan;
     float acc = 0.0f;
-    #pragma unroll 1
+    #pragma unroll 8
     for (int tile = 0; tile < num_tiles; tile++) {
         float value = partials[base + tile * 256];
         acc = ((is_max == 0) ? acc + value : fmaxf(acc, value));
