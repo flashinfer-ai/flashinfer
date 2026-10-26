@@ -285,17 +285,17 @@ def test_plan_route_policy(arch, M, K, pdl, kind, schedule_id, grid_x, sm_count)
 @pytest.mark.parametrize(
     "M,K,early",
     (
-        # K2: the early-release band M768..2048 (+ the M4096 cell); held below, between and above.
+        # K2: the early-release band M768..2048; held below, between and above.
         # Round 2 at 148 SMs: M768 / M1536 run the early register-carry programs, M2048 the held one
         # (``persistent:k2_nc4_d2_f011010000000000``; early again at 152 SMs), M3072 / M6144 the held
-        # register-carry program.
+        # register-carry program; M4096 runs the held fast-math nc3 program without the fence.
         (767, 2, False),
         (768, 2, True),
         (1536, 2, True),
         (2048, 2, False),
         (2049, 2, False),
         (3072, 2, False),
-        (4096, 2, True),
+        (4096, 2, False),
         (4097, 2, False),
         (6144, 2, False),
         # K4: the nc5 band M513..1023 + the pow2 cells {512, 2048, 4096}; held at 1024..2047 and above 4096.
@@ -320,8 +320,8 @@ def test_plan_route_sm103_k2_k4_consumed_release_bands(M, K, pdl, early):
     flag is the release policy; the band edges are the dispatcher / evaluator / FI mirror constants."""
     plan = plan_route("sm_103a", SM_COUNT, M, K, pdl)
     assert plan.kind == "persistent", plan
-    # round r5: the fast-math axis (``_fm``) follows the flag tuple in the kernel key
-    flags = plan.kernel_key.removesuffix("_fm").rsplit("_f", 1)[1]
+    # round r5: the fast-math axis (``_fm``) and the later suffixes follow the flag tuple
+    flags = re.match(r"^persistent:k\d+_nc\d+_d\d+_f([01]+)", plan.kernel_key).group(1)
     assert (flags[0] == "1") is early, (plan.kernel_key, early)
     if (M, K) == (2048, 2):
         at_152 = plan_route("sm_103a", 152, M, K, pdl)
@@ -408,11 +408,13 @@ def test_round_2_cells_take_their_table_program():
             }
             assert (dense.kernel_key == key) is on_dense, (dense, key)
             seen += 1
-    # Round 6 adds the (256, 4), (256, 7), (1024, 1) and (1024, 7) write cells (sm_100a: (256, 7),
-    # (1024, 1) and (1024, 7); sm_103a: (256, 4), (256, 7) and (1024, 7)).
+    # Rounds 6 and 17 add the (256, 4), (256, 7), (1024, 1), (1024, 4) and (1024, 7) write cells
+    # (sm_100a: (256, 7), (1024, 1), (1024, 4) and (1024, 7); sm_103a: (256, 4), (256, 7) and
+    # (1024, 7)).
     assert list(_r2_cells("WRITE_PERSISTENT_KEY_CELLS")) == [
         ("sm_100a", 148, 256, 7, "persistent:k7_nc4_d2_f111000000000000_fm"),
         ("sm_100a", 148, 1024, 1, "persistent:k1_nc2_d3_f110000000000000_fm"),
+        ("sm_100a", 148, 1024, 4, "persistent:k4_nc3_d2_f111000000000000"),
         ("sm_100a", 148, 1024, 7, "persistent:k7_nc4_d2_f111000000000000_fm"),
         ("sm_100a", 148, 4096, 4, "persistent:k4_nc3_d2_f111000000000000"),
         ("sm_103a", 148, 256, 4, "persistent:k4_nc3_d2_f111000000000000_fm"),
@@ -490,7 +492,7 @@ def test_round_2_cells_take_their_table_program():
     )
     assert (
         plan_route("sm_103a", 148, 4096, 2, False).kernel_key
-        == "persistent:k2_nc3_d2_f111010000000000_crfnone"
+        == "persistent:k2_nc3_d2_f011010000000000_fm_crfnone"
     )
     # Round 3: the sm_103a K5 cells M = 192 / 256 / 768 and the sm_100a K5 cells M = 192 / 256 / 384 /
     # 768 / 1024 / 1536 / 2048 run the native K5 port (one CTA per SM, one two-architecture program)
@@ -582,7 +584,7 @@ def test_round_2_cells_take_their_table_program():
             assert not plan.kernel_key.endswith("_crfnone"), (M, K, pdl, plan)
             assert not plan.schedule_id.endswith("_authored_fences")
     round_6 = {
-        (148, 4096, 2): "persistent:k2_nc3_d2_f111010000000000_crfnone",
+        (148, 4096, 2): "persistent:k2_nc3_d2_f011010000000000_fm_crfnone",
         (148, 16384, 2): "persistent:k2_nc3_d2_f011010000000000_crfnone",
         (152, 8192, 2): "persistent:k2_nc3_d2_f011010000000000_crfnone",
         (152, 12288, 2): "persistent:k2_nc3_d2_f011010000000000_crfnone",
