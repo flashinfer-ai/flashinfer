@@ -193,8 +193,9 @@ cudaError_t select_cached_variant(uint32_t rows, uint32_t vocab_size, int sm_cou
   return cudaSuccess;
 }
 
-// Each generated kernel NAME has a twin NAME_pdl for PDL launches: it waits
-// on the prerequisite grid at entry and triggers its dependents at exit.
+// Each row-caching cluster kernel NAME has a twin NAME_pdl for PDL launches:
+// it waits on the prerequisite grid at entry and triggers its dependents at
+// exit.
 const void* cached_cluster_kernel(CachedVariant variant, bool pdl) {
 #define FLASHINFER_CACHED_SOFTMAX_CASE(C, T)                                               \
   if (variant.cluster_ctas == C && variant.max_tiles == T) {                               \
@@ -241,21 +242,17 @@ size_t shared_tiles_dynamic_smem_bytes(int cluster_ctas) {
 }
 
 // The persistent kernels serve the 8-tile variants of 8 and 16 CTAs.
-const void* cached_persistent_kernel(CachedVariant variant, bool pdl) {
+const void* cached_persistent_kernel(CachedVariant variant) {
   if (variant.max_tiles != kCachedMaxTiles) {
     return nullptr;
   }
   if (variant.cluster_ctas == 8) {
-    return pdl ? reinterpret_cast<const void*>(
-                     kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c8_t8_pdl)
-               : reinterpret_cast<const void*>(
-                     kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c8_t8);
+    return reinterpret_cast<const void*>(
+        kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c8_t8);
   }
   if (variant.cluster_ctas == 16) {
-    return pdl ? reinterpret_cast<const void*>(
-                     kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c16_t8_pdl)
-               : reinterpret_cast<const void*>(
-                     kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c16_t8);
+    return reinterpret_cast<const void*>(
+        kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c16_t8);
   }
   return nullptr;
 }
@@ -296,7 +293,8 @@ cudaError_t configure_cached_kernel(const void* kernel, int cluster_ctas,
 }
 
 // Resident clusters per device of the persistent and shared-tile kernels of 8
-// and 16 CTAs and their PDL twins, plus one (0: not yet queried). The query
+// and 16 CTAs per PDL mode (a shared-tile kernel or its _pdl twin; the same
+// persistent kernel in both modes), plus one (0: not yet queried). The query
 // also sets the kernel's function attributes on that device.
 enum ResidentKernel : int {
   kResidentPersistent = 0,
@@ -390,7 +388,7 @@ cudaError_t select_cached_launch(uint32_t rows, uint32_t vocab_size, bool pdl, i
   if (launch->kernel == nullptr) {
     return cudaErrorNotSupported;
   }
-  const void* persistent = cached_persistent_kernel(variant, pdl);
+  const void* persistent = cached_persistent_kernel(variant);
   if (persistent == nullptr) {
     return cudaSuccess;
   }
@@ -584,7 +582,7 @@ cudaError_t launch_blackwell_softmax(float* logits, float* output, float* temper
   int vocab_size_i = static_cast<int>(vocab_size);
   // Keep the existing sm_100a launch path unchanged. The high bit is an
   // sm_103a integration-only PDL flag; adapted kernels strip it before
-  // evaluating the original 0/1/2 parameter-kind ABI. The cached-cluster
+  // evaluating the original 0/1/2 parameter-kind ABI. The row-caching cluster
   // kernels instead have _pdl twins and take the plain parameter kind.
   const bool launch_with_pdl = is_sm103 && enable_pdl;
   int parameter_kind_i = static_cast<int>(parameter_kind) | (launch_with_pdl ? 4 : 0);
@@ -614,8 +612,11 @@ cudaError_t launch_blackwell_softmax(float* logits, float* output, float* temper
       return cudaErrorNotSupported;
     }
     int chunk_elements_i = cached_chunk_elements(vocab_size, launch.variant.cluster_ctas);
-    // The cached-cluster kernels take PDL as their _pdl twins, not as a flag.
-    int cached_parameter_kind_i = static_cast<int>(parameter_kind);
+    // The row-caching cluster kernels take PDL as their _pdl twins, the
+    // persistent kernels as the flag.
+    int cached_parameter_kind_i = launch.route == SoftmaxRoute::kCachedClusterPersistent
+                                      ? parameter_kind_i
+                                      : static_cast<int>(parameter_kind);
     void* args[] = {&logits,
                     &parameter,
                     &output,

@@ -290,12 +290,14 @@ def test_blackwell_cached_cluster_route_is_selected_and_correct(
         "shared_tiles": flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_SHARED_TILES,
     }
     assert route == routes[expected_route]
-    # Only sm_103a launches with PDL, and then through the kernel's _pdl twin.
+    # Only sm_103a launches with PDL: the row-caching and shared-tile kernels
+    # through their _pdl twins, the persistent kernels through a flag.
     kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
         logits, temperature=temperature, enable_pdl=enable_pdl
     )
     on_sm103 = torch.cuda.get_device_capability() == (10, 3)
-    assert kernel[2] == int(enable_pdl and on_sm103)
+    pdl_twin = enable_pdl and on_sm103 and expected_route != "persistent"
+    assert kernel[2] == int(pdl_twin)
     assert probs.data_ptr() != logits.data_ptr()
     torch.testing.assert_close(probs, probs_ref, atol=1e-3, rtol=1e-3)
 
@@ -303,11 +305,15 @@ def test_blackwell_cached_cluster_route_is_selected_and_correct(
 @pytest.mark.parametrize(
     "rows,vocab_size",
     [
+        (31, 32000),  # B200: as many rows as resident 16-CTA clusters
         (32, 32000),  # B200: fewer resident 16-CTA clusters than rows
+        (33, 32000),  # GB300: as many rows as resident 16-CTA clusters
         (34, 32000),  # B200 and GB300
         (36, 64000),
+        (71, 24576),  # B200: as many rows as resident 8-CTA clusters
         (72, 24576),  # B200: fewer resident 8-CTA clusters than rows
         (73, 24576),
+        (74, 24576),  # GB300: as many rows as resident 8-CTA clusters
         (75, 24576),  # GB300: fewer resident 8-CTA clusters than rows
     ],
 )
@@ -334,6 +340,35 @@ def test_blackwell_cached_cluster_spread_keeps_rows_resident(
     assert rows <= resident_clusters
     assert rows > next_resident_clusters
     assert pdl_twin == int(enable_pdl and on_sm103)
+    torch.testing.assert_close(
+        probs, torch.softmax(logits / 0.5, dim=-1), atol=1e-3, rtol=1e-3
+    )
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size,cluster_ctas",
+    [
+        (36, 80000, 16),  # 5-tile 8-CTA chunks
+        (36, 128000, 16),  # 8-tile 8-CTA chunks
+        (73, 32000, 8),  # 4-tile 4-CTA chunks; B200: past the resident 8-CTA clusters
+    ],
+)
+def test_blackwell_cached_cluster_spread_of_wide_chunks_ignores_residency(
+    rows, vocab_size, cluster_ctas
+):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    torch.manual_seed(7)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        logits, temperature=0.5
+    )
+    probs = flashinfer.sampling.softmax(logits, temperature=0.5)
+
+    # Rows whose chunks are wider than the capped spreads allow keep spreading
+    # even when some clusters then run in a second wave, as measured faster.
+    assert kernel[:2] == (cluster_ctas, 4)
     torch.testing.assert_close(
         probs, torch.softmax(logits / 0.5, dim=-1), atol=1e-3, rtol=1e-3
     )
