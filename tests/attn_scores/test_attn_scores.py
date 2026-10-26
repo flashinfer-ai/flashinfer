@@ -5305,6 +5305,29 @@ def test_unified_wrapper_full_strategy_ragged_causal_topk(monkeypatch, top_k):
 
 
 @_requires_selective_sm100
+def test_full_wrapper_plan_rejects_capture_without_invalidating_plan():
+    """Reject host-reading full planning before capture or plan state is changed."""
+    inputs = _request_inputs((2,), (1024,))
+    q, _, _, weights, qo_indptr, kv_indptr = inputs
+    fused, table = _paged_inputs(inputs)
+    wrapper = FP8PagedMQATopKWrapper(strategy="full")
+    wrapper.plan(q, fused, weights, qo_indptr, kv_indptr, table)
+    oracle = _oracle_rows(inputs)
+    graph = torch.cuda.CUDAGraph()
+    with (
+        torch.cuda.graph(graph),
+        pytest.raises(
+            RuntimeError,
+            match="full strategy plan must be called outside CUDA graph capture",
+        ),
+    ):
+        wrapper.plan(q, fused, weights, qo_indptr, kv_indptr, table)
+    selected = wrapper.run(q, weights, fused, block_table=table)
+    torch.cuda.synchronize()
+    _check_selection(selected, oracle, 512)
+
+
+@_requires_selective_sm100
 def test_full_wrapper_gvr2_workspace_capture_and_replan(monkeypatch):
     """The full prefill route owns scratch across eager and graph streams."""
     from flashinfer.topk_varlen.kernels import gvr2_topk_host

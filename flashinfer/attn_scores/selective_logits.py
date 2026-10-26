@@ -4485,6 +4485,10 @@ class FP8PagedMQATopKWrapper:
         previous_plan = tuple(self.__dict__.values())
         try:
             with torch.cuda.device(device):
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "full strategy plan must be called outside CUDA graph capture"
+                    )
                 self._allocate_full_plan(
                     q,
                     kv_fused,
