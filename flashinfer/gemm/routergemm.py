@@ -1154,7 +1154,11 @@ def _tinygemm2_tcgen05_enabled(
 
 
 def _tinygemm2_tcgen05_program(
-    input: torch.Tensor, weight: torch.Tensor, has_bias: bool, use_pdl: bool
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    has_bias: bool,
+    use_pdl: bool,
 ) -> Optional[str]:
     """The identifier of the generated program serving the call, or ``None``."""
     capability = get_compute_capability(input.device)
@@ -1182,6 +1186,11 @@ def _tinygemm2_tcgen05_program(
         _multiprocessor_count(input.device.index),
     )
     if tile is None:
+        return None
+    # ACCUMULATORS writes a lane's 16 output features as one 32-byte store: a
+    # 32-byte aligned ``out`` (its rows then start aligned, the output features
+    # being a multiple of 16).
+    if tile == "ACCUMULATORS" and out.data_ptr() % 32 != 0:
         return None
     return tile + ("" if has_bias else "_NOBIAS") + ("_PDL" if use_pdl else "")
 
@@ -1323,7 +1332,7 @@ def tinygemm_bf16(
     reference's (``flashinfer.jit.cake_tinygemm2_tcgen05``).  Set
     ``FLASHINFER_DISABLE_TINYGEMM2_TCGEN05=1`` to keep the kernels above.
     """
-    program = _tinygemm2_tcgen05_program(input, weight, bias is not None, use_pdl)
+    program = _tinygemm2_tcgen05_program(input, weight, out, bias is not None, use_pdl)
     if program is not None:
         _tinygemm_bf16_cake(program, input, weight, bias, out, backend="cake")
     elif bias is None:

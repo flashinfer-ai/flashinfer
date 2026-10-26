@@ -457,7 +457,10 @@ def test_tinygemm2_tcgen05_windows(
     monkeypatch.delenv("FLASHINFER_DISABLE_TINYGEMM2_TCGEN05", raising=False)
     input = torch.empty(batch_size, input_features, dtype=torch.bfloat16)
     weight = torch.empty(output_features, input_features, dtype=torch.bfloat16)
-    program = routergemm._tinygemm2_tcgen05_program(input, weight, has_bias, use_pdl)
+    out = torch.empty(batch_size, output_features, dtype=torch.bfloat16)
+    program = routergemm._tinygemm2_tcgen05_program(
+        input, weight, out, has_bias, use_pdl
+    )
     expected = (
         None
         if tile is None
@@ -467,29 +470,72 @@ def test_tinygemm2_tcgen05_windows(
 
 
 def test_tinygemm2_tcgen05_disabled_and_unaligned(monkeypatch):
-    """The escape hatch and a tensor-map-unaligned operand keep the kernels the
-    call runs otherwise."""
+    """The escape hatch, a tensor-map-unaligned operand and, for ACCUMULATORS, an
+    output that is not 32-byte aligned keep the kernels the call runs otherwise."""
     import flashinfer.gemm.routergemm as routergemm
 
     monkeypatch.setattr(routergemm, "get_compute_capability", lambda _: (10, 0))
+    monkeypatch.setattr(routergemm, "_multiprocessor_count", lambda _: 148)
     input = torch.empty(64, 4096, dtype=torch.bfloat16)
     weight = torch.empty(4096, 4096, dtype=torch.bfloat16)
-    assert routergemm._tinygemm2_tcgen05_program(input, weight, True, False)
+    out = torch.empty(64, 4096, dtype=torch.bfloat16)
+    assert (
+        routergemm._tinygemm2_tcgen05_program(input, weight, out, True, False)
+        == "ACCUMULATORS"
+    )
     monkeypatch.setenv("FLASHINFER_DISABLE_TINYGEMM2_TCGEN05", "1")
-    assert routergemm._tinygemm2_tcgen05_program(input, weight, True, False) is None
+    assert (
+        routergemm._tinygemm2_tcgen05_program(input, weight, out, True, False) is None
+    )
     monkeypatch.delenv("FLASHINFER_DISABLE_TINYGEMM2_TCGEN05")
     storage = torch.empty(64 * 4096 + 1, dtype=torch.bfloat16)
     shifted = storage[1:].view(64, 4096)
-    assert routergemm._tinygemm2_tcgen05_program(shifted, weight, True, False) is None
+    assert (
+        routergemm._tinygemm2_tcgen05_program(shifted, weight, out, True, False) is None
+    )
     assert (
         routergemm._tinygemm2_tcgen05_program(
             torch.empty(64, 4100, dtype=torch.bfloat16),
             torch.empty(4096, 4100, dtype=torch.bfloat16),
+            out,
             True,
             False,
         )
         is None
     )
+    out_storage = torch.empty(64 * 4096 + 16, dtype=torch.bfloat16)
+    assert out_storage.data_ptr() % 32 == 0
+    aligned = out_storage[16:].view(64, 4096)
+    unaligned = out_storage[8 : 8 + 64 * 4096].view(64, 4096)
+    assert (
+        routergemm._tinygemm2_tcgen05_program(input, weight, aligned, True, False)
+        == "ACCUMULATORS"
+    )
+    assert (
+        routergemm._tinygemm2_tcgen05_program(input, weight, unaligned, True, False)
+        is None
+    )
+
+
+@pytest.mark.parametrize("has_bias", [True, False])
+def test_tinygemm_bf16_unaligned_out_bitwise(has_bias):
+    """An output that is not 32-byte aligned on a shape ACCUMULATORS serves gets
+    the reference's bits from the kernel the call runs otherwise."""
+    _target()
+    from flashinfer.gemm.routergemm import tinygemm_bf16
+
+    input, weight, bias = _make_case(64, 4096, 4096)
+    if not has_bias:
+        bias = None
+    out_ref = _reference(input, weight, bias, False)
+    storage = torch.full(
+        (64 * 4096 + 8,), float("nan"), device="cuda", dtype=torch.bfloat16
+    )
+    out = storage[8:].view(64, 4096)
+    assert out.data_ptr() % 32 != 0
+    tinygemm_bf16(input, weight, out, bias=bias)
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_ref)
 
 
 @pytest.mark.parametrize(
