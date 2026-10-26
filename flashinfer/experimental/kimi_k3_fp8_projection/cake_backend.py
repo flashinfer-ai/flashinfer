@@ -33,9 +33,10 @@ runs as one or two generated Cake programs on the current stream:
 * ``gemm_tstore`` / ``gemm`` -- the persistent 2-CTA block-scaled tcgen05 GEMM
   (M > 256 unless tabulated below) with the TMA-store epilogue for a 16-byte
   aligned output view whose row stride is a multiple of 8 elements, or the
-  register epilogue for other strides (``_n192``: the 192-wide N-tile instance
-  of the tabulated ``gemm_bn`` rows, e.g. the N = 576 ``kv_a`` family at
-  M > 256, whose three 192-column tiles stream no padded columns; ``_skf``:
+  register epilogue for other strides (``_n<bn>``: the bn-wide N-tile instance
+  of the tabulated ``gemm_bn`` rows -- 192, e.g. the N = 576 ``kv_a`` family at
+  M > 256, whose three 192-column tiles stream no padded columns, 224, 352 and
+  384; ``_skf``:
   the fix-up stream-K instance of the tabulated ``gemm_skf`` rows, whose last
   wave plus fraction is cut into one contiguous K range per resident pair and
   whose finishing pair adds the other pairs' FP32 partials in ordinal order --
@@ -121,6 +122,13 @@ GEMM_N192_SUFFIX = (
 GEMM_K128_SUFFIX = "_k128"  # round 8 (lever L8): the 128-K operand hand-off instance of the TMA-store / staged-register programs (table key ``gemm_bk``; stem position after _n192, before the stream-K suffixes)
 GEMM_BLOCK_N_WIDE = 384  # round 10 (CAKE-985 S3): the 128 x 384 pair-tile GEMM instance (table key ``gemm_bn`` 384; TMA-store / staged-register programs only, always the 128-K ring)
 GEMM_N384_SUFFIX = "_n384"  # kernel-key suffix of the 384-wide instance (stem position of _n192; always followed by _k128, never by the stage / stream-K / prefetch tokens)
+GEMM_TSTORE_ONLY_BLOCK_N = (
+    224,
+    352,
+)  # round 12 (FTP-N / FTP-W): pair-tile widths whose instances ship the TMA-store epilogue only (``_n224``: the 192 / 256 forms' two-block scale layout; ``_n352``: the 384-wide form's three-block layout); a staged-register or register-epilogue view of their cells keeps the 256-wide program
+_GEMM_BN_TOKEN = re.compile(
+    r"_n(\d+)"
+)  # the bn token ``_n<bn>`` of a GEMM program stem, right after the epilogue base (none: 256)
 GEMM_G64_SUFFIX = "_g64"  # round 10 (CAKE-985 S3): the 64-row-tile raster group of the TMA-store / staged-register programs (table key ``gemm_gm``; stem position after the bn token, before _k128)
 GEMM_GROUP_M = (
     32  # raster group (row tiles per group) of every program without the _g64 token
@@ -1177,18 +1185,23 @@ def gemm_block_n(
 ) -> int:
     """Round 6 (lever L5): output columns per CTA pair of the GEMM route, from the shape's table row (key
     ``gemm_bn``: 192 on the tabulated N = 576 ``kv_a`` rows at M > 256, whose 256-wide tiles stream and multiply
-    768 padded columns; round 10 S3: 384, the 128 x 384 pair tile; 256 otherwise).  192 is taken only where
+    768 padded columns; round 10 S3: 384, the 128 x 384 pair tile; round 12: 224 and 352; 256 otherwise).  ``bn`` is
+    a parameter of the launch, not of a row: the launch takes ``n_tiles = ceil(n_valid / bn)`` (:func:`gemm_n_tiles`),
+    the ``bn``-wide B scale tiles viewed ``(-1, weight_scale_sf_rows(bn), 128)`` and the grid of its form (one CTA
+    pair per tile, or ``min(T, sm_count // 2)`` pairs of the grid-stride form), and a table value is any positive
+    multiple of 32 up to 384 (the :func:`weight_scale_tiles_bn` layouts).  192 is taken only where
     :func:`gemm_n192_admissible` holds (the 192-padded N fits the stored 256-padded weight rows, or -- round 11 T3 --
-    every 32-row B box of the partial last tile is stored or fully out of range), 256 otherwise; 384 keeps no
-    storage-fit rule (the parts of its partial last N tile past the stored 128-row weight tiles are fully
-    out-of-range TMA boxes, zero-filled, whose accumulator columns are never stored)."""
+    every 32-row B box of the partial last tile is stored or fully out of range), 256 otherwise; the other widths keep
+    no storage-fit rule (the parts of a partial last N tile past the stored 128-row weight tiles are fully
+    out-of-range TMA boxes, zero-filled, whose accumulator columns are never stored: the 384-wide tile loads 128-row
+    parts, the 224- and 352-wide tiles 16-row boxes from 16-row boundaries)."""
     entry = decode_table_entry(M, n_tiles128, num_k_iters, arch)
     if entry is None or entry.get("route") != "gemm":
         return BLOCK_N
     bn = int(entry.get("gemm_bn", BLOCK_N))
-    if bn not in (GEMM_BLOCK_N_NARROW, BLOCK_N, GEMM_BLOCK_N_WIDE):
+    if bn <= 0 or bn % 32 or bn > WIDE_TILE_ROWS:
         raise ValueError(
-            f"decode table entry gemm_bn must be 192, 256 or 384 (got {entry})"
+            f"decode table entry gemm_bn must be a positive multiple of 32 up to {WIDE_TILE_ROWS} (got {entry})"
         )
     if bn == GEMM_BLOCK_N_NARROW and not gemm_n192_admissible(
         n_valid, n_pad, n_tiles128
@@ -1237,12 +1250,45 @@ def gemm_pdlb(M: int, n_tiles128: int, num_k_iters: int, arch: str) -> bool:
     return _entry_gemm_pdlb(entry)
 
 
+def gemm_bn_suffix(bn: int) -> str:
+    """Round 12: the kernel-key token of the ``bn``-wide pair-tile instance of a TMA-store / staged-register
+    program -- none for 256, ``_n<bn>`` otherwise (``_n192``, ``_n224``, ``_n352``, ``_n384``), right after the epilogue
+    base."""
+    bn = int(bn)
+    return "" if bn == BLOCK_N else f"_n{bn}"
+
+
+def gemm_bn_wide(bn: int) -> bool:
+    """Round 12: whether the ``bn``-wide pair tile is a wide form (``bn`` > 256: the 384-wide tile of round 10
+    S3 and the 352-wide tile): three 128-lane scale blocks, always the 128-K ring and the plain CLC schedule, no weight
+    prefetch, stage / slot, stream-K, ``_pdlb``, ``_st`` or ``_gs`` composition (:func:`gemm_n384_cell_conflicts`)."""
+    return int(bn) > BLOCK_N
+
+
+def gemm_bn_rstaged(bn: int) -> bool:
+    """Round 12: whether the ``bn``-wide pair tile has a staged-register instance; the 224- and 352-wide tiles
+    ship the TMA-store epilogue only (:data:`GEMM_TSTORE_ONLY_BLOCK_N`), so a staged-register view of their cells takes
+    the 256-wide program."""
+    return int(bn) not in GEMM_TSTORE_ONLY_BLOCK_N
+
+
+def _stem_block_n(stem: str) -> int:
+    """The pair-tile width a GEMM program stem names: its ``_n<bn>`` token right after the epilogue base, 256 without
+    one."""
+    for base in (GEMM_TSTORE_KERNEL_KEY, GEMM_RSTAGED_KERNEL_KEY, GEMM_KERNEL_KEY):
+        if stem.startswith(base):
+            m = _GEMM_BN_TOKEN.match(stem, len(base))
+            return int(m.group(1)) if m else BLOCK_N
+    raise ValueError(f"{stem!r} is not a GEMM program stem")
+
+
 def gemm_n384_cell_conflicts(entry: Optional[dict[str, Any]]) -> list[str]:
     """Round 10 (S3): the GEMM-cell keys a ``gemm_bn`` 384 cell may not carry -- the 384-wide instance implies
     ``gemm_bk`` 128, the plain CLC schedule, no weight prefetch and its own ring / staging geometry, so a non-default
     ``gemm_pf`` / ``gemm_sk`` / ``gemm_skf`` / ``gemm_sks`` / ``gemm_stages`` / ``gemm_ts_slots`` / ``gemm_pdlb`` (round 11
     T1a) or a ``gemm_bk`` of 256 names no program (the Cake launcher's ``gemm_n384_cell_conflicts``; both hosts refuse such
-    a cell)."""
+    a cell).  Round 12: the rule of every wide cell (:func:`gemm_bn_wide`; the 352-wide tile is the 384-wide form with a
+    96-wide third part)."""
     entry = entry or {}
     defaults = {"gemm_stages": GEMM_NUM_STAGES, "gemm_ts_slots": GEMM_TS_SLOTS}
     conflicts = [
@@ -1257,25 +1303,26 @@ def gemm_n384_cell_conflicts(entry: Optional[dict[str, Any]]) -> list[str]:
 
 def _g64_stem(stem: str) -> str:
     """The ``_g64`` raster form of a TMA-store / staged-register program stem: the token sits after the bn token
-    (``_n192`` / ``_n384``) and before ``_k128`` and the later tokens."""
+    (``_n<bn>``) and before ``_k128`` and the later tokens."""
     for base in (GEMM_TSTORE_KERNEL_KEY, GEMM_RSTAGED_KERNEL_KEY):
         if stem.startswith(base):
             rest = stem[len(base) :]
-            for bn in (GEMM_N192_SUFFIX, GEMM_N384_SUFFIX):
-                if rest.startswith(bn):
-                    return base + bn + GEMM_G64_SUFFIX + rest[len(bn) :]
-            return base + GEMM_G64_SUFFIX + rest
+            m = _GEMM_BN_TOKEN.match(rest)
+            bn = m.group(0) if m else ""
+            return base + bn + GEMM_G64_SUFFIX + rest[len(bn) :]
     raise ValueError(f"GEMM program {stem!r} has no _g64 form (register epilogue)")
 
 
 def _pdlb_stem(stem: str) -> str:
     """The ``_pdlb`` form of a TMA-store / staged-register program stem (round 11, CAKE-985 T1a): the token closes the stem,
     after the stream-K / ``_skp`` slot (``gemm_kernel_key`` appends ``_pf<D>`` behind it); the register epilogue and the
-    384-wide programs have none."""
+    wide (384- and 352-wide) programs have none."""
     if not stem.startswith((GEMM_TSTORE_KERNEL_KEY, GEMM_RSTAGED_KERNEL_KEY)):
         raise ValueError(f"GEMM program {stem!r} has no _pdlb form (register epilogue)")
-    if GEMM_N384_SUFFIX in stem:
-        raise ValueError(f"GEMM program {stem!r} has no _pdlb form (384-wide program)")
+    if gemm_bn_wide(_stem_block_n(stem)):
+        raise ValueError(
+            f"GEMM program {stem!r} has no _pdlb form ({_stem_block_n(stem)}-wide program)"
+        )
     if stem.endswith(GEMM_ST_SUFFIX):
         raise ValueError(
             f"GEMM program {stem!r} has no _pdlb form (static one-tile program)"
@@ -1385,7 +1432,8 @@ def _st_stem(stem: str) -> str:
 
 def _entry_gemm_gs(entry: dict[str, Any]) -> bool:
     """The ``gemm_gs`` key of a table cell (0 / 1; round 11, CAKE-985 T6): whether the cell's plain 128-K TMA-store GEMM
-    launches at bn 192 / 256 take the static grid-stride ``_gs`` programs (``route_plan`` / ``required_kernel_keys``)."""
+    launches at bn 192 / 256 (round 12: any width up to 256, e.g. 224) take the static grid-stride ``_gs`` programs
+    (``route_plan`` / ``required_kernel_keys``)."""
     on = int(entry.get("gemm_gs", 0))
     if on not in (0, 1):
         raise ValueError(f"decode table entry gemm_gs must be 0 or 1 (got {entry})")
@@ -1395,9 +1443,9 @@ def _entry_gemm_gs(entry: dict[str, Any]) -> bool:
 def gemm_gs_cell_conflicts(entry: Optional[dict[str, Any]]) -> list[str]:
     """Round 11 (CAKE-985 T6): the GEMM-cell keys a ``gemm_gs`` 1 cell may not carry -- the static grid-stride form is the
     plain 128-K TMA-store schedule at bn 192 / 256, so a non-default ``gemm_pf`` / ``gemm_sk`` / ``gemm_skf`` / ``gemm_sks`` /
-    ``gemm_skp`` / ``gemm_cs`` / ``gemm_stages`` / ``gemm_ts_slots`` / ``gemm_pdlb`` / ``gemm_static``, a ``gemm_bn`` other than
-    192 / 256 or a ``gemm_bk`` other than 128 (absent = 256) names no program (the Cake launcher's ``gemm_gs_cell_conflicts``;
-    both hosts refuse such a cell)."""
+    ``gemm_skp`` / ``gemm_cs`` / ``gemm_stages`` / ``gemm_ts_slots`` / ``gemm_pdlb`` / ``gemm_static``, a wide ``gemm_bn``
+    (> 256; round 12: every width up to 256 has the form, e.g. 224) or a ``gemm_bk`` other than 128 (absent = 256) names no
+    program (the Cake launcher's ``gemm_gs_cell_conflicts``; both hosts refuse such a cell)."""
     entry = entry or {}
     defaults = {"gemm_stages": GEMM_NUM_STAGES, "gemm_ts_slots": GEMM_TS_SLOTS}
     conflicts = [
@@ -1405,7 +1453,7 @@ def gemm_gs_cell_conflicts(entry: Optional[dict[str, Any]]) -> list[str]:
         for k in GEMM_GS_CELL_CONFLICTS
         if entry.get(k) is not None and int(entry[k]) != defaults.get(k, 0)
     ]
-    if int(entry.get("gemm_bn", BLOCK_N)) not in (GEMM_BLOCK_N_NARROW, BLOCK_N):
+    if gemm_bn_wide(entry.get("gemm_bn", BLOCK_N)):
         conflicts.append("gemm_bn")
     if int(entry.get("gemm_bk", BLOCK_K)) != 128:
         conflicts.append("gemm_bk")
@@ -1441,7 +1489,7 @@ def gemm_gs_launch_pairs(
     192 / 256 carry the ``_gs`` token -- pair p of 2 P' CTAs owns tiles p + i P', no cluster-launch-control work ring; same MMA
     sequence, bit-identical output), 0 otherwise.  The Cake launcher's ``gemm_gs_enabled`` rule: the cell may carry no key the
     form has no composition with (``gemm_gs_cell_conflicts``) and the launch must be the plain 128-K TMA-store program at bn 192
-    / 256 (``applicable``; the staged-register and register epilogues keep the record's program, as for the stream-K forms); a
+    / 256 (round 12: any width up to 256, e.g. 224; ``applicable``; the staged-register and register epilogues keep the record's program, as for the stream-K forms); a
     cell asking for the form elsewhere is refused on both hosts, never routed around.  The Cake launch additionally asserts P'
     against the driver's co-resident cluster capacity (``gemm_gs_capacity_check``); the mirror applies the measured rule."""
     entry = decode_table_entry(M, n_tiles128, num_k_iters, arch)
@@ -1452,40 +1500,38 @@ def gemm_gs_launch_pairs(
         raise ValueError(
             f"{arch}: decode table cell of M={M} n_tiles128={n_tiles128} num_k_iters={num_k_iters} carries gemm_gs "
             f"together with {conflicts}, which names no GEMM instance (the static grid-stride form is the plain 128-K "
-            "TMA-store schedule at bn 192 / 256)"
+            "TMA-store schedule at a width up to 256)"
         )
     if not applicable:
         raise ValueError(
             f"{arch}: decode table cell of M={M} n_tiles128={n_tiles128} num_k_iters={num_k_iters} carries gemm_gs "
-            "but the launch is not the plain 128-K TMA-store program at bn 192 / 256 (the static grid-stride form has no "
-            "other instance)"
+            "but the launch is not the plain 128-K TMA-store program at a width up to 256 (the static grid-stride form has "
+            "no other instance)"
         )
     return _gs_pairs(sm_count, m_tiles, gemm_n_tiles)
 
 
 def _gs_eligible(stem: str) -> bool:
-    """Whether a program stem has a static grid-stride form (round 11): the plain ``_k128`` / ``_n192_k128`` (or
-    their ``_g64`` raster twins) TMA-store stems; never the 384-wide, staged-register or register-epilogue programs."""
-    return (
-        stem.startswith(GEMM_TSTORE_KERNEL_KEY)
-        and GEMM_N384_SUFFIX not in stem
-        and stem.endswith(GEMM_K128_SUFFIX)
-        and stem[len(GEMM_TSTORE_KERNEL_KEY) :]
-        in (
-            GEMM_K128_SUFFIX,
-            GEMM_N192_SUFFIX + GEMM_K128_SUFFIX,
-            GEMM_G64_SUFFIX + GEMM_K128_SUFFIX,
-            GEMM_N192_SUFFIX + GEMM_G64_SUFFIX + GEMM_K128_SUFFIX,
-        )
-    )
+    """Whether a program stem has a static grid-stride form (round 11): the plain ``_k128`` / ``_n<bn>_k128`` (or
+    their ``_g64`` raster twins) TMA-store stems of a width up to 256 (``_n192``; round 12: ``_n224``); never the wide
+    (384- / 352-wide), staged-register or register-epilogue programs."""
+    if not stem.startswith(GEMM_TSTORE_KERNEL_KEY):
+        return False
+    rest = stem[len(GEMM_TSTORE_KERNEL_KEY) :]
+    m = _GEMM_BN_TOKEN.match(rest)
+    if m is not None:
+        if gemm_bn_wide(int(m.group(1))):
+            return False
+        rest = rest[m.end() :]
+    return rest in (GEMM_K128_SUFFIX, GEMM_G64_SUFFIX + GEMM_K128_SUFFIX)
 
 
 def _gs_stem(stem: str) -> str:
-    """The ``_gs`` static grid-stride form of a plain ``_k128`` / ``_n192_k128`` TMA-store program stem (round 11, CAKE-985 T6):
-    the token takes the ``_cs<S>`` / ``_st`` slot, right after ``_k128``; every other stem has none."""
+    """The ``_gs`` static grid-stride form of a plain ``_k128`` / ``_n<bn>_k128`` TMA-store program stem (round 11;
+    ``bn`` up to 256): the token takes the ``_cs<S>`` / ``_st`` slot, right after ``_k128``; every other stem has none."""
     if not _gs_eligible(stem):
         raise ValueError(
-            f"GEMM program {stem!r} has no _gs form (the static grid-stride form is the plain _k128 / _n192_k128 TMA-store program)"
+            f"GEMM program {stem!r} has no _gs form (the static grid-stride form is the plain _k128 / _n<bn>_k128 TMA-store program, bn <= 256)"
         )
     return stem + GEMM_GS_SUFFIX
 
@@ -2211,19 +2257,20 @@ class StreamKPrefetchPlan(NamedTuple):
 def gemm_stream_k_prefetch(M: int, n_tiles128: int, num_k_iters: int, arch: str) -> int:
     """Round 10 (CAKE-985, lever SKP): the shape's table row's ``gemm_skp`` slot bound (1 / 4 / 8) when the GEMM-routed
     row asks for the prefetched stream-K instance, else 0.  The key is exclusive with ``gemm_sk`` / ``gemm_skf`` /
-    ``gemm_sks`` on one cell and with the 384-wide form (``gemm_bn`` 384, round 10 S3: no ``_skp`` instance of it);
-    the Cake table loader refuses such a table, the mirror refuses the cell."""
+    ``gemm_sks`` on one cell and with the 384-wide form (``gemm_bn`` 384, round 10 S3: no ``_skp`` instance of it;
+    round 12: every wide form, :func:`gemm_bn_wide`); the Cake table loader refuses such a table, the mirror refuses
+    the cell."""
     entry = decode_table_entry(M, n_tiles128, num_k_iters, arch)
     if entry is None or entry.get("route") != "gemm":
         return 0
     cap = int(entry.get("gemm_skp", 0))
     if cap and (
         any(entry.get(key) for key in ("gemm_sk", "gemm_skf", "gemm_sks"))
-        or int(entry.get("gemm_bn", BLOCK_N)) == GEMM_BLOCK_N_WIDE
+        or gemm_bn_wide(entry.get("gemm_bn", BLOCK_N))
     ):
         raise ValueError(
             "decode table: gemm_skp is exclusive with gemm_sk / gemm_skf / gemm_sks "
-            f"and with gemm_bn 384 (got {entry})"
+            f"and with a wide gemm_bn (> 256) (got {entry})"
         )
     return cap
 
@@ -2472,35 +2519,50 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
                         _m_tiles(M),
                         _cell_gemm_n_tiles(n_tiles128, num_k_iters, gbn),
                         int(entry.get("gemm_bk", BLOCK_K)) == 128
-                        and gbn in (GEMM_BLOCK_N_NARROW, BLOCK_N),
+                        and not gemm_bn_wide(gbn),
                     )
-            if gbn == GEMM_BLOCK_N_WIDE:
+            if gemm_bn_wide(gbn):
                 # round 10 (S3): the 384-wide pair-tile programs of the epilogues the cell's rows launch -- always the
                 # ``_k128`` form, never with stage / stream-K / prefetch tokens (a cell naming one is refused, as in the
-                # Cake launcher); the fallbacks stay registered through the base list
+                # Cake launcher); the fallbacks stay registered through the base list.  Round 12: every wide width (the
+                # 352-wide tile); a TMA-store-only width's staged-register rows take the 256-wide program of the cell's
+                # raster group and hand-off (``gemm_bn_rstaged``)
                 conflicts = gemm_n384_cell_conflicts(entry)
                 if conflicts:
                     raise ValueError(
-                        f"decode table cell {key} carries gemm_bn 384 together with {conflicts}, which names no GEMM "
+                        f"decode table cell {key} carries gemm_bn {gbn} together with {conflicts}, which names no GEMM "
                         f"instance (got {entry})"
                     )
-                n384_tstore, n384_rstaged = gemm_k128_cell_epilogues(
+                wide_tstore, wide_rstaged = gemm_k128_cell_epilogues(
                     n_tiles128, num_k_iters, bucket
                 )
                 for base, launched in (
-                    (GEMM_TSTORE_KERNEL_KEY, n384_tstore),
-                    (GEMM_RSTAGED_KERNEL_KEY, n384_rstaged),
+                    (GEMM_TSTORE_KERNEL_KEY, wide_tstore),
+                    (GEMM_RSTAGED_KERNEL_KEY, wide_rstaged),
                 ):
-                    gkey = base + GEMM_N384_SUFFIX + gsfx + GEMM_K128_SUFFIX
+                    gkey = base + gemm_bn_suffix(gbn) + gsfx + GEMM_K128_SUFFIX
+                    if base == GEMM_RSTAGED_KERNEL_KEY and not gemm_bn_rstaged(gbn):
+                        gkey = (
+                            base
+                            + gsfx
+                            + (
+                                GEMM_K128_SUFFIX
+                                if int(entry.get("gemm_bk", BLOCK_K)) == 128
+                                else ""
+                            )
+                        )
                     if launched and gkey not in keys:
                         keys.append(gkey)
             else:
-                sfx = GEMM_N192_SUFFIX if gbn != BLOCK_N else ""
+                sfx = gemm_bn_suffix(gbn)
                 tsfx = (
                     sfx + gsfx
                 )  # the bn token then the raster token (stem order; round 10 S3)
+                # round 12: the staged-register programs' tokens -- a TMA-store-only width (``gemm_bn_rstaged``) has no
+                # staged-register instance, so the cell's staged-register rows take the 256-wide program
+                rtsfx = (sfx if gemm_bn_rstaged(gbn) else "") + gsfx
                 # round 8 (lever L8): the 128-K operand hand-off form of the cell's programs (table key ``gemm_bk``); the token
-                # sits in the stem after ``_n192`` and before the stream-K suffixes
+                # sits in the stem after the bn token (``_n<bn>``) and before the stream-K suffixes
                 gbk = int(entry.get("gemm_bk", BLOCK_K))
                 if gbk not in (128, BLOCK_K):
                     raise ValueError(
@@ -2540,7 +2602,7 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
                         )
                     if k128_rstaged:
                         gkeys.append(
-                            GEMM_RSTAGED_KERNEL_KEY + tsfx + ksfx + ssfx + psfx
+                            GEMM_RSTAGED_KERNEL_KEY + rtsfx + ksfx + ssfx + psfx
                         )
                 elif isfx:
                     # round 9 (K6 arm G1): the cell's TMA-store program in its tokened form (the perf row's launch when the
@@ -2555,7 +2617,7 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
                                 GEMM_TSTORE_KERNEL_KEY + tsfx + isfx + psfx, gpf
                             )
                         )
-                    if sfx:
+                    if sfx and gemm_bn_rstaged(gbn):
                         gkeys.append(GEMM_RSTAGED_KERNEL_KEY + tsfx + psfx)
                 else:
                     if gpf > 0:
@@ -2571,10 +2633,12 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
                         # names a stream-K lever -- the Cake export plan (``stage_kernels``) launches the ``_pf<D>`` form on every
                         # TMA-store row of a prefetching cell (``gpf`` is the cell's key on each of them) and the ``_skp`` / ``_skf``
                         # form where the lever engages, so no row of such a cell launches the plain program (the gate of
-                        # the ``_k128`` branch above); the staged-register program reads neither key and stays listed
+                        # the ``_k128`` branch above); the staged-register program reads neither key and stays listed.
+                        # Round 12: the 224-wide tile (TMA store only, ``gemm_bn_rstaged``) lists its TMA-store programs alone
                         if gpf == 0 and not (gskf or gskp):
                             gkeys.append(GEMM_TSTORE_KERNEL_KEY + tsfx + psfx)
-                        gkeys.append(GEMM_RSTAGED_KERNEL_KEY + tsfx + psfx)
+                        if gemm_bn_rstaged(gbn):
+                            gkeys.append(GEMM_RSTAGED_KERNEL_KEY + tsfx + psfx)
                 if gskp:
                     # round 10 (CAKE-985, lever SKP): the prefetched stream-K instance of the row's TMA-store program
                     # (``_skp`` / ``_skp4`` / ``_skp8`` by the cell's slot bound); launches whose geometry admits no
@@ -2631,7 +2695,7 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
                         )
                     if g64_rstaged:
                         gkeys.append(
-                            GEMM_RSTAGED_KERNEL_KEY + tsfx + ksfx + ssfx + psfx
+                            GEMM_RSTAGED_KERNEL_KEY + rtsfx + ksfx + ssfx + psfx
                         )
                 if psfx:
                     # round 11 (CAKE-985 T1a, _pdlb): the _pdlb form of the plain programs the cell's rows launch (the base
@@ -2648,7 +2712,7 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
                             )
                         )
                     if pdlb_rstaged:
-                        gkeys.append(GEMM_RSTAGED_KERNEL_KEY + tsfx + ksfx + psfx)
+                        gkeys.append(GEMM_RSTAGED_KERNEL_KEY + rtsfx + ksfx + psfx)
                 for gkey in gkeys:
                     if gkey not in keys:
                         keys.append(gkey)
@@ -3190,18 +3254,23 @@ def route_plan(
             prepared.n_valid,
             prepared.n_pad,
         )
+        # round 12: a TMA-store-only width (224 / 352, ``gemm_bn_rstaged``) has no staged-register or
+        # register-epilogue instance, so those views of its cells take the 256-wide program, as a cell without ``gemm_bn``
+        if base != GEMM_TSTORE_KERNEL_KEY and not gemm_bn_rstaged(gbn):
+            gbn = BLOCK_N
         # round 10 (S3): the 384-wide pair-tile form the table row asks for (TMA-store and staged-register epilogues only;
         # the predicated register epilogue keeps the 256-wide program).  It implies the 128-K ring, one staging tile, no
         # weight prefetch and the plain CLC schedule; a cell naming a conflicting key is refused, as in the Cake launcher.
-        n384 = gbn == GEMM_BLOCK_N_WIDE and base != GEMM_KERNEL_KEY
-        if n384:
+        # Round 12: every wide width (``gemm_bn_wide``: the 352-wide tile too).
+        wide = gemm_bn_wide(gbn) and base != GEMM_KERNEL_KEY
+        if wide:
             conflicts = gemm_n384_cell_conflicts(
                 decode_table_entry(M, prepared.n_tiles128, prepared.num_k_iters, arch)
             )
             if conflicts:
                 raise ValueError(
                     f"{arch}: decode table cell of M={M} n_tiles128={prepared.n_tiles128} num_k_iters="
-                    f"{prepared.num_k_iters} carries gemm_bn 384 together with {conflicts}, which names no GEMM instance"
+                    f"{prepared.num_k_iters} carries gemm_bn {gbn} together with {conflicts}, which names no GEMM instance"
                 )
             gpf, gbk, isfx = 0, 128, ""
         else:
@@ -3231,7 +3300,7 @@ def route_plan(
         # ``gemm_pdlb_enabled`` applicability; the predicated register epilogue keeps the record's order)
         pdlb = (
             gemm_pdlb(M, prepared.n_tiles128, prepared.num_k_iters, arch)
-            if base != GEMM_KERNEL_KEY and not n384
+            if base != GEMM_KERNEL_KEY and not wide
             else False
         )
         # round 11 (CAKE-985 T2-e, _st): the static one-tile form the table row asks for (TMA-store and staged-register
@@ -3250,22 +3319,23 @@ def route_plan(
                 gemm_n_tiles(prepared, gbn),
                 gbn,
             )
-            if base != GEMM_KERNEL_KEY and not n384
+            if base != GEMM_KERNEL_KEY and not wide
             else False
         )
         # round 6 (lever GP): the prefetching program ships with the TMA-store epilogue only (Cake rule); use it when
         # registered.  Round 6 (lever L5): the 192-wide instance of the row's epilogue program when the table row asks
-        # for it and the program is registered; every fallback keeps the row on a registered program.
+        # for it and the program is registered; every fallback keeps the row on a registered program.  Round 12: the
+        # ``bn``-wide instance of any width (``_n<bn>``, :func:`gemm_bn_suffix`), at the same stem position.
         stems: list[tuple[str, int, int]] = []  # (program stem, prefetch distance, bn)
-        if n384:
-            # round 10 (S3): the only 384-wide program of the epilogue (always ``_k128``), then the 256-wide fallbacks
-            stems.append((base + GEMM_N384_SUFFIX + GEMM_K128_SUFFIX, 0, gbn))
+        if wide:
+            # round 10 (S3): the only wide program of the epilogue (always ``_k128``), then the 256-wide fallbacks
+            stems.append((base + gemm_bn_suffix(gbn) + GEMM_K128_SUFFIX, 0, gbn))
         elif gbn != BLOCK_N and base != GEMM_KERNEL_KEY:
             # round 7: the 192-wide form ships for the TMA-store and staged-register epilogues only (Cake
             # launcher rule); the predicated register epilogue keeps the 256-wide program
-            stems.append((base + GEMM_N192_SUFFIX, gpf, gbn))
+            stems.append((base + gemm_bn_suffix(gbn), gpf, gbn))
             if gpf:
-                stems.append((base + GEMM_N192_SUFFIX, 0, gbn))
+                stems.append((base + gemm_bn_suffix(gbn), 0, gbn))
         if gpf:
             stems.append((base, gpf, BLOCK_N))
         stems.append((base, 0, BLOCK_N))
@@ -3275,7 +3345,7 @@ def route_plan(
             stems = [
                 v for s, pf, bn in stems for v in ((_g64_stem(s), pf, bn), (s, pf, bn))
             ]
-        if gbk == 128 and base != GEMM_KERNEL_KEY and not n384:
+        if gbk == 128 and base != GEMM_KERNEL_KEY and not wide:
             # round 8 (lever L8): each stem in its _k128 form first, then as today, so a missing program falls back at the
             # same geometry onto a base-list program
             stems = [
@@ -3297,7 +3367,8 @@ def route_plan(
                 )
             ]
         # round 11 (CAKE-985 T6, _gs): the static grid-stride form the table row asks for (the plain 128-K TMA-store program at bn
-        # 192 / 256 of the two-launch route only: the Cake launcher's ``gemm_gs_enabled`` rule -- a cell naming a key the form has
+        # 192 / 256 -- round 12: any width up to 256 -- of the two-launch route only: the Cake launcher's ``gemm_gs_enabled``
+        # rule -- a cell naming a key the form has
         # no composition with, or a launch that is not that program, is refused; the staged-register and register epilogues keep
         # the record's program, as for the stream-K forms)
         gs_pairs = (
@@ -3310,13 +3381,13 @@ def route_plan(
                 _m_tiles(M),
                 gemm_n_tiles(prepared, gbn),
                 gbk == 128
-                and gbn in (GEMM_BLOCK_N_NARROW, BLOCK_N)
+                and not gemm_bn_wide(gbn)
                 and not isfx
                 and not gpf
                 and not pdlb
                 and not static,
             )
-            if base == GEMM_TSTORE_KERNEL_KEY and not n384
+            if base == GEMM_TSTORE_KERNEL_KEY and not wide
             else 0
         )
         if gs_pairs:

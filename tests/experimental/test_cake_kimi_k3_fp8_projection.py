@@ -483,6 +483,23 @@ def test_n384_cell_rules_and_g64_stems():
     )  # tp8:kv_b:1024 (m_tiles 8): bn 256 / 192, T <= resident pairs -> P' = T
     with pytest.raises(ValueError, match="at least one pair tile"):
         cb._gs_pairs(148, 0, 3)
+    # round 12: the bn token of any width sits at the _n192 / _n384 position; the 224-wide tile composes like the
+    # 192-wide one (_g64, _pdlb, _gs), the 352-wide tile like the 384-wide one (no _pdlb / _gs form, a wide cell's conflicts)
+    assert cb._g64_stem("gemm_tstore_n224_k128") == "gemm_tstore_n224_g64_k128"
+    assert cb._g64_stem("gemm_tstore_n352_k128") == "gemm_tstore_n352_g64_k128"
+    assert cb._pdlb_stem("gemm_tstore_n224") == "gemm_tstore_n224_pdlb"
+    with pytest.raises(ValueError, match="no _pdlb form"):
+        cb._pdlb_stem("gemm_tstore_n352_k128")
+    assert cb._gs_eligible("gemm_tstore_n224_k128") and (
+        cb._gs_stem("gemm_tstore_n224_k128") == "gemm_tstore_n224_k128_gs"
+    )
+    assert not cb._gs_eligible("gemm_tstore_n352_k128")
+    assert (
+        cb.gemm_gs_cell_conflicts({"gemm_bn": 224, "gemm_bk": 128, "gemm_gs": 1}) == []
+    )
+    assert cb.gemm_gs_cell_conflicts({"gemm_bn": 352, "gemm_bk": 128}) == ["gemm_bn"]
+    assert cb.gemm_n384_cell_conflicts({"gemm_bn": 352, "gemm_pf": 2}) == ["gemm_pf"]
+
 
 
 def test_sk_bindings_carry_no_split_scalars(monkeypatch):

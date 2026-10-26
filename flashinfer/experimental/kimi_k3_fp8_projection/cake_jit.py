@@ -71,8 +71,10 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # * ``gemm`` / ``gemm_rstaged`` / ``gemm_tstore``   the persistent 2-CTA
 #   block-scaled tcgen05 GEMM (256 output columns per CTA pair, M > 256) with
 #   the register, staged-register or TMA-store epilogue; the instance tokens
-#   follow the stem in the order ``[_n192|_n384][_g64][_k128][_cs<S>|_st|_gs][_s<n>][_ts<n>][_sk|_skf<n>][_pdlb][_pf<D>]``
-#   (``_n384``: the 128 x 384 pair-tile form of the TMA-store / staged-register
+#   follow the stem in the order ``[_n<bn>][_g64][_k128][_cs<S>|_st|_gs][_s<n>][_ts<n>][_sk|_skf<n>][_pdlb][_pf<D>]``
+#   (``_n<bn>``: the bn-wide pair-tile form, 192, 224, 352 or 384 output columns
+#   per CTA pair -- ``_n224`` / ``_n352`` TMA-store programs only, round 12;
+#   ``_n384``: the 128 x 384 pair-tile form of the TMA-store / staged-register
 #   programs on the tabulated ``gemm_bn`` 384 rows, round 10 -- three 128-wide
 #   accumulators share one activation stage; always ``_k128``, never with the
 #   stage / stream-K / prefetch tokens; same output bits; ``_g64``: the 64-row-tile
@@ -3383,7 +3385,7 @@ def decode_kernel_key(
 
 
 def gemm_kernel_key(base: str, pf: int = 0) -> str:
-    """``gemm`` / ``gemm_tstore`` / ``gemm_rstaged`` (with the ``_n192`` / ``_n384`` / ``_g64`` / ``_k128`` /
+    """``gemm`` / ``gemm_tstore`` / ``gemm_rstaged`` (with the ``_n<bn>`` (``_n192`` / ``_n224`` / ``_n352`` / ``_n384``) / ``_g64`` / ``_k128`` /
     ``_cs<S>[r]`` / ``_st`` / ``_gs`` / ``_s<n>`` / ``_ts<n>`` / ``_sk`` / ``_skf`` / ``_pdlb`` instance suffixes, in that stem order; ``_n384`` /
     ``_g64`` are the round-10 384-wide pair tile (table key ``gemm_bn`` 384) and 64-row-tile raster group (table key
     ``gemm_gm``); ``_k128`` is the 128-K operand hand-off form, table key ``gemm_bk``; ``_cs<S>[r]`` the cluster
