@@ -24,6 +24,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import tvm_ffi
 
 import flashinfer.cake_fmha as cake_api
 import flashinfer.prefill as prefill
@@ -299,6 +300,9 @@ def test_cake_fmha_context_widened_classes_route_to_the_row_program(
     [
         ("bf16_b128_q64_k2048", {"is_causal": False}),
         ("bf16_b128_q64_k2048", {"lse": "lse"}),
+        ("bf16_b128_q64_k2048", {"sinks": "sinks"}),
+        ("fp8_b256_q32_k1024", {"lse": "lse"}),
+        ("nvfp4_b4_q511_k2047", {"sinks": "sinks"}),
         ("bf16_b128_q64_k2048", {"max_q_len": 32}),
         ("bf16_b128_q64_k2048", {"max_q_len": 65}),
         ("bf16_b1_q8192_k8192", {"max_q_len": 8160}),
@@ -322,6 +326,10 @@ def test_cake_fmha_context_routes_outside_the_programs_keep_the_jit_module(
             dtype=torch.float32,
             device="meta",
         )
+    if mutation.pop("sinks", None):
+        kwargs["sinks"] = torch.empty(
+            (kwargs["query"].shape[1],), dtype=torch.float32, device="meta"
+        )
     if "num_kv_heads" in mutation:
         key = kwargs["key_cache"]
         kwargs["key_cache"] = torch.empty(
@@ -338,11 +346,23 @@ def test_cake_fmha_context_routes_outside_the_programs_keep_the_jit_module(
 # --- The page tables a launch passes (host-only) -----------------------------
 
 
-def _launch_values(monkeypatch, block_tables, *, shared, batch=3):
-    """The argument values a stand-in ``B128`` program record receives from
-    ``cake_paged_attention_context`` on CPU tensors, by name."""
+def _launch_values(
+    monkeypatch,
+    block_tables,
+    *,
+    shared,
+    batch=3,
+    component="context_bf16",
+    identifier="B128",
+    device_scales=False,
+    device=None,
+    **overrides,
+):
+    """The argument values a stand-in program record (``B128`` unless
+    ``component`` / ``identifier`` name another) receives from
+    ``cake_paged_attention_context`` on CPU tensors, by name; ``overrides``
+    replace launch keywords (e.g. device-scale tensors)."""
 
-    component, identifier = "context_bf16", "B128"
     name, num_m_blocks, _ = cake_api._CONTEXT_PROGRAMS[(component, identifier)]
     args = (*cake_api._CONTEXT_HOST_PARAMS[component], "grid_x", "grid_y", "grid_z")
     calls = []
@@ -361,24 +381,26 @@ def _launch_values(monkeypatch, block_tables, *, shared, batch=3):
         is_causal=True,
         return_lse=False,
         enable_sink=False,
+        device_scales=device_scales,
         program=identifier,
     )
     module = cake_api.CakeFmhaContextProgramModule(route, record, "sm_100a")
     monkeypatch.setattr(
         cake_api, "_torch_stream_context", lambda device: contextlib.nullcontext()
     )
-    query = torch.zeros((batch * 64, 32, 128), dtype=torch.bfloat16)
-    key = torch.zeros((8, 4, 16, 128), dtype=torch.bfloat16)
-    module.cake_paged_attention_context(
+    dtype = torch.bfloat16 if component == "context_bf16" else torch.float8_e4m3fn
+    query = torch.zeros((batch * 64, 32, 128), dtype=dtype, device=device)
+    key = torch.zeros((8, 4, 16, 128), dtype=dtype, device=device)
+    keywords = dict(
         out=torch.empty_like(query),
         out_scale_factor=None,
         query=query,
         key_cache=key,
         value_cache=torch.empty_like(key),
-        workspace_buffer=torch.zeros(64, dtype=torch.uint8),
-        multi_ctas_kv_counter_buffer=torch.zeros(16, dtype=torch.uint8),
+        workspace_buffer=torch.zeros(64, dtype=torch.uint8, device=device),
+        multi_ctas_kv_counter_buffer=torch.zeros(16, dtype=torch.uint8, device=device),
         block_tables=block_tables,
-        seq_lens=torch.full((batch,), 64, dtype=torch.int32),
+        seq_lens=torch.full((batch,), 64, dtype=torch.int32, device=device),
         max_q_len=64,
         max_kv_len=64,
         bmm1_scale=0.125,
@@ -388,8 +410,12 @@ def _launch_values(monkeypatch, block_tables, *, shared, batch=3):
         o_sf_start_index=0,
         batch_size=batch,
         window_left=-1,
-        cum_seq_lens_q=torch.arange(0, 64 * (batch + 1), 64, dtype=torch.int32),
-        cum_seq_lens_kv=torch.arange(0, 64 * (batch + 1), 64, dtype=torch.int32),
+        cum_seq_lens_q=torch.arange(
+            0, 64 * (batch + 1), 64, dtype=torch.int32, device=device
+        ),
+        cum_seq_lens_kv=torch.arange(
+            0, 64 * (batch + 1), 64, dtype=torch.int32, device=device
+        ),
         sm_count=148,
         enable_pdl=None,
         workspace_size=64,
@@ -405,8 +431,14 @@ def _launch_values(monkeypatch, block_tables, *, shared, batch=3):
         lse_stride_tokens=0,
         lse_stride_heads=0,
     )
+    keywords.update(overrides)
+    module.cake_paged_attention_context(**keywords)
     (values,) = calls
-    return dict(zip(args, values, strict=True))
+    # the unread pointers arrive as FFI tensors: read them back as torch views
+    return {
+        name: torch.from_dlpack(value) if isinstance(value, tvm_ffi.Tensor) else value
+        for name, value in zip(args, values, strict=True)
+    }
 
 
 @pytest.mark.parametrize("shared", (True, False))
@@ -467,6 +499,123 @@ def test_cake_context_program_arguments_follow_the_binding_order(monkeypatch) ->
         values["Q"].shape == (batch * 64, 32, 128)
         and values["O_ptr"].dtype == torch.bfloat16
     )
+
+
+def _placeholder(device):
+    """The data pointer of the per-device placeholder buffer."""
+
+    return torch.from_dlpack(cake_api._unread_pointers(device)[0]).data_ptr()
+
+
+def test_cake_context_program_unread_pointers_are_per_device_placeholders(
+    monkeypatch,
+) -> None:
+    """The arguments a program never reads are FFI tensors on one small
+    buffer per device, converted once (no DLPack conversion per launch): two
+    devices in a row get two buffers, each the same objects on every call.
+    Without a second GPU, two distinct CPU device keys stand in."""
+
+    monkeypatch.setattr(cake_api, "_UNREAD_POINTERS", {})
+    if torch.cuda.device_count() >= 2:
+        devices = [torch.device("cuda", 0), torch.device("cuda", 1)]
+    else:
+        devices = [torch.device("cpu"), torch.device("cpu", 0)]
+    seen = []
+    for device in devices + devices:
+        f32, i32 = cake_api._unread_pointers(device)
+        assert isinstance(f32, tvm_ffi.Tensor) and isinstance(i32, tvm_ffi.Tensor)
+        as_f32, as_i32 = torch.from_dlpack(f32), torch.from_dlpack(i32)
+        assert (as_f32.dtype, as_i32.dtype) == (torch.float32, torch.int32)
+        assert as_f32.data_ptr() == as_i32.data_ptr()
+        assert as_f32.device.type == device.type
+        seen.append((f32, i32, as_f32.data_ptr()))
+    assert seen[2][0] is seen[0][0] and seen[2][1] is seen[0][1]
+    assert seen[3][0] is seen[1][0] and seen[3][1] is seen[1][1]
+    assert seen[0][2] != seen[1][2]
+    assert len(cake_api._UNREAD_POINTERS) == 2
+
+
+def test_cake_context_program_device_scales_reach_the_binding_as_given(
+    monkeypatch,
+) -> None:
+    """The placeholder stands only for arguments the program never reads.
+    Launches in a row -- FP8 host scales, FP8 device scales, BF16 -- pass the
+    caller's own tensors: the device-scale program reads the caller's bmm1
+    and bmm2 tensors (a 0-d scale as a 1-element view of its storage), and
+    Q / K / V / O are byte views of the caller's storage."""
+
+    batch = 3
+    tables = torch.arange(batch * 4, dtype=torch.int32).view(batch, 4)
+    unread = _placeholder(torch.device("cpu"))
+
+    host = _launch_values(
+        monkeypatch,
+        tables,
+        shared=True,
+        batch=batch,
+        component="context_fp8",
+        identifier="B256",
+    )
+    assert host["bmm1_scale_ptr"].data_ptr() == unread
+    assert host["bmm2_scale_ptr"].data_ptr() == unread
+    assert host["bmm1_is_log2"] == 0
+    assert host["softmax_scale_log2"] == pytest.approx(0.125 * cake_api.log2e)
+    assert host["output_scale"] == pytest.approx(1.0)
+
+    bmm1 = torch.tensor([0.25], dtype=torch.float32)
+    bmm2 = torch.tensor(0.5, dtype=torch.float32)
+    query = torch.zeros((batch * 64, 32, 128), dtype=torch.float8_e4m3fn)
+    out = torch.empty_like(query)
+    scaled = _launch_values(
+        monkeypatch,
+        tables,
+        shared=True,
+        batch=batch,
+        component="context_fp8",
+        identifier="B256_SCALE_PTR",
+        device_scales=True,
+        bmm1_scale=bmm1,
+        bmm2_scale=bmm2,
+        query=query,
+        out=out,
+    )
+    assert scaled["bmm1_scale_ptr"].data_ptr() == bmm1.data_ptr() != unread
+    assert scaled["bmm2_scale_ptr"].data_ptr() == bmm2.data_ptr() != unread
+    assert scaled["bmm1_scale_ptr"].shape == scaled["bmm2_scale_ptr"].shape == (1,)
+    assert scaled["bmm1_is_log2"] == 1
+    assert scaled["Q"].dtype == scaled["O_ptr"].dtype == torch.uint8
+    assert scaled["Q"].data_ptr() == query.data_ptr()
+    assert scaled["O_ptr"].data_ptr() == out.data_ptr()
+    for name in ("LSE_ptr", "sinks", "seq_lens_q"):
+        assert scaled[name].data_ptr() == unread
+
+    plain = _launch_values(monkeypatch, tables, shared=True, batch=batch)
+    assert plain["LSE_ptr"].data_ptr() == plain["seq_lens_q"].data_ptr() == unread
+
+
+@pytest.mark.parametrize("given", ("lse", "attention_sinks"))
+def test_cake_context_program_refuses_an_lse_or_sinks(monkeypatch, given) -> None:
+    """A program writes no LSE and reads no sinks: a launch that carries
+    either is refused rather than served with the unread placeholder (route
+    selection keeps such calls on the JIT module)."""
+
+    tables = torch.arange(12, dtype=torch.int32).view(3, 4)
+    tensor = torch.zeros((3 * 64, 32) if given == "lse" else (32,))
+    with pytest.raises(RuntimeError, match="writes no LSE and takes no sinks"):
+        _launch_values(monkeypatch, tables, shared=True, **{given: tensor})
+
+
+def test_cake_context_program_passes_a_contiguous_shared_table_itself(
+    monkeypatch,
+) -> None:
+    """A contiguous shared table reaches the binding as the caller's tensor
+    (the binding reads its address): no view is built per launch."""
+
+    batch = 3
+    tables = torch.arange(batch * 4, dtype=torch.int32).view(batch, 4)
+    values = _launch_values(monkeypatch, tables, shared=True, batch=batch)
+    assert values["page_table_k"] is tables and values["page_table_v"] is tables
+    assert values["page_row_stride"] == 4
 
 
 def test_cake_context_program_refuses_a_strided_page_column(monkeypatch) -> None:

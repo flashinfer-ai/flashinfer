@@ -2722,6 +2722,12 @@ class CakeFmhaContextProgramModule:
             raise RuntimeError(
                 "Cake FMHA context launch does not match its selected route"
             )
+        if lse is not None or attention_sinks is not None:
+            # route selection keeps such calls on the JIT module: the unread
+            # pointers below never stand in for a caller's LSE or sinks
+            raise RuntimeError(
+                "a Cake FMHA context program writes no LSE and takes no sinks"
+            )
         total_bh = int(batch_size) * self.units_per_batch
         tiles = self.num_m_blocks * total_bh
         num_ctas = tiles if self.one_tile else min(int(sm_count), tiles)
@@ -2740,16 +2746,21 @@ class CakeFmhaContextProgramModule:
             raise RuntimeError(
                 "Cake FMHA context page tables need a unit stride along the pages"
             )
-        shape = tables.shape
         row_stride = strides[0]
-        span = (shape[0] - 1) * row_stride + shape[-1]
-        offset = tables.storage_offset()
-        page_table_k = tables.as_strided((span,), (1,), offset)
-        page_table_v = (
-            page_table_k
-            if uses_shared_paged_kv_idx
-            else tables.as_strided((span,), (1,), offset + strides[1])
-        )
+        if uses_shared_paged_kv_idx and tables.is_contiguous():
+            # the binding reads only the table's address: a contiguous table
+            # is its own span
+            page_table_k = page_table_v = tables
+        else:
+            shape = tables.shape
+            span = (shape[0] - 1) * row_stride + shape[-1]
+            offset = tables.storage_offset()
+            page_table_k = tables.as_strided((span,), (1,), offset)
+            page_table_v = (
+                page_table_k
+                if uses_shared_paged_kv_idx
+                else tables.as_strided((span,), (1,), offset + strides[1])
+            )
         counter = multi_ctas_kv_counter_buffer
         if counter.dim() != 1:
             counter = counter.view(-1)
@@ -2872,18 +2883,27 @@ def _ffi_call_takes_the_torch_stream() -> bool:
 
 
 _FFI_DEVICES: dict[int, Any] = {}
-_UNREAD_POINTERS: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
+_UNREAD_POINTERS: dict[torch.device, tuple[Any, Any, torch.Tensor]] = {}
 
 
-def _unread_pointers(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    """A 16-byte buffer on ``device`` as float32 and int32, for the binding
-    arguments a context program never reads (allocated once per device)."""
+def _unread_pointers(device: torch.device) -> tuple[Any, Any]:
+    """A 16-byte buffer on ``device`` as float32 and int32 FFI tensors, for
+    the binding arguments a context program never reads.
+
+    The buffer is allocated and converted to FFI tensors once per device: an
+    argument that already is an FFI tensor skips the per-call DLPack
+    conversion a torch tensor argument costs (up to five per launch).
+    """
 
     pointers = _UNREAD_POINTERS.get(device)
     if pointers is None:
         buffer = torch.empty(4, dtype=torch.float32, device=device)
-        pointers = _UNREAD_POINTERS[device] = (buffer, buffer.view(torch.int32))
-    return pointers
+        pointers = _UNREAD_POINTERS[device] = (
+            tvm_ffi.from_dlpack(buffer),
+            tvm_ffi.from_dlpack(buffer.view(torch.int32)),
+            buffer,
+        )
+    return pointers[0], pointers[1]
 
 
 def _torch_stream_context(device: torch.device):
