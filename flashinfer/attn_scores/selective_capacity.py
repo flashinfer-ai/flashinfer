@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from ._selective_contract import _LAST_SAMPLE_BIN
+from ._selective_contract import _SAMPLE_HISTOGRAM_BINS
 
 if TYPE_CHECKING:
     from .selective_logits import _FP8PagedMQASelectiveTopKEngine
@@ -612,7 +612,7 @@ class _CapacitySelectiveTopKPlan:
             # read them. Their all-key policy therefore survives every layer.
             engine._thresholds.fill_(float("-inf"))
             engine._sample_ladder.fill_(float("-inf"))
-            engine._selected_bins.fill_(_LAST_SAMPLE_BIN)
+            engine._selected_bins.fill_(_SAMPLE_HISTOGRAM_BINS - 1)
         engine._candidate_prepared = replace(
             engine._candidate_prepared, causal_bounds=False
         )

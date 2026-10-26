@@ -19,6 +19,8 @@ import cuda.bindings.driver as cuda
 from cutlass._mlir.dialects import llvm
 from cutlass.utils.smem_allocator import SmemAllocator
 
+from .._selective_contract import _SAMPLE_HISTOGRAM_BINS
+
 _KV_PAIR_TOKENS = 256
 # Request-count bound for the shared tile prefix of the explicit schedule.
 _OWNER_PREFIX_CAP = 4096
@@ -525,7 +527,7 @@ class SelectiveRepairThresholdKernel:
                     threshold = cutlass.Float32(float("-inf"))
                 elif candidate_counts[(row, 0)] < self.top_k:
                     refined = min(
-                        cutlass.Int32(2047),
+                        cutlass.Int32(_SAMPLE_HISTOGRAM_BINS - 1),
                         selected_bins[row] + self.underflow_bin_step,
                     )
                     # Refinement beyond the negative finite range means -inf,

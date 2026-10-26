@@ -46,9 +46,9 @@ from ._math_policy import _MathMode, _validate_math_mode
 from ._selective_contract import (
     _CANDIDATE_CAPACITY,
     _COUNT_SEGMENTS,
-    _LAST_SAMPLE_BIN,
     _MAX_STRIPED_SPLIT_KV,
     _REPAIR_CAPACITY,
+    _SAMPLE_HISTOGRAM_BINS,
     _SPLIT_KV_CHOICES,
     _SelectiveLogitsMode,
     _h64_single_pool_topology,
@@ -3810,7 +3810,7 @@ class _FP8PagedMQASelectiveTopKEngine:
         elif not _sampling_policy_initialized:
             self._thresholds.fill_(float("-inf"))
             self._sample_ladder.fill_(float("-inf"))
-            self._selected_bins.fill_(_LAST_SAMPLE_BIN)
+            self._selected_bins.fill_(_SAMPLE_HISTOGRAM_BINS - 1)
 
         _fp8_mqa_selective_logits(
             q,
