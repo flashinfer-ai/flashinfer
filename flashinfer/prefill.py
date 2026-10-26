@@ -8781,13 +8781,20 @@ def trtllm_batch_context_with_kv_cache(
             # skip-softmax probe. Both exact routes and compat_v1 consume the
             # disabled form at the FFI boundary.
             skip_softmax_threshold_scale_factor = None
-        # All context adapters consume host scalar scales. Device scalar
-        # values are resolved only after exact route selection, preserving
-        # their public value while converting bmm1 back from log2 form.
-        if isinstance(bmm1_scale, torch.Tensor):
-            bmm1_scale = float(bmm1_scale.item()) / log2e
-        if isinstance(bmm2_scale, torch.Tensor):
-            bmm2_scale = float(bmm2_scale.item())
+        # A device-scale program reads both scales through device pointers
+        # (bmm1 in log2 form). The other context adapters consume host scalar
+        # scales: device scalar values are resolved only after route
+        # selection, preserving their public value while converting bmm1 back
+        # from log2 form.
+        if (
+            cake_route is None
+            or cake_route.program is None
+            or not cake_route.device_scales
+        ):
+            if isinstance(bmm1_scale, torch.Tensor):
+                bmm1_scale = float(bmm1_scale.item()) / log2e
+            if isinstance(bmm2_scale, torch.Tensor):
+                bmm2_scale = float(bmm2_scale.item())
         run_func = get_cake_fmha_context_module(
             query.device, cake_route
         ).cake_paged_attention_context

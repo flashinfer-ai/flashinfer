@@ -121,6 +121,12 @@ class CakeFmhaContextRoute:
     return_lse: bool
     enable_sink: bool
     exact_profile: Literal["q511", "q257"] | None = None
+    # Both scales are device tensors (FP8 / NVFP4): the program reads them
+    # through device pointers instead of host scalars.
+    device_scales: bool = False
+    # The generated program serving the route (an identifier of
+    # ``_CONTEXT_PROGRAMS``), or ``None`` for the component's JIT module.
+    program: str | None = None
 
 
 # These are the exact optimized routes in the pinned 57,280-cell matrix.  Keep
@@ -260,6 +266,216 @@ _ALIGNED_HOST_PARAMS = (
     "num_kv_heads",
     "batch_size",
 )
+
+
+# The generated paged context programs: the units ``csrc/cake_fmha_context_bf16/``,
+# ``csrc/cake_fmha_context_fp8/`` and ``csrc/cake_fmha_context_nvfp4/`` whose
+# loaders ``flashinfer.jit.cake_fmha_context_{bf16,fp8,nvfp4}`` publish one
+# ``CakeProgram`` constant per program.  Every program is causal, without LSE
+# or sink.  Per target, a route key ``(component, scale form, num_q_heads,
+# num_kv_heads, pack_g, num_m_blocks, page_size, exact class)`` names the
+# program serving it.  The scale form is ``"host"`` (host-scalar scales; the
+# BF16 output scale is 1) or ``"device"`` (both FP8 / NVFP4 scales are device
+# tensors).  The key holds neither the batch size nor the L2 section: a program
+# serves any batch (when the work units do not fill the last L2 section, the
+# program walks that section in another order, which changes the tile order
+# only, not a tile's arithmetic).  The exact class names a one-tile BF16 launch
+# class (``_context_bf16_exact_profile``); ``None`` serves any batch.  A key
+# without a program keeps the component's JIT module.
+_CONTEXT_PROGRAM_ROUTES: dict[
+    str, dict[tuple[str, str, int, int, int, int, int, str | None], str]
+] = {
+    "sm100a": {
+        ("context_bf16", "host", 64, 8, 8, 256, 16, None): "Q8192",
+        ("context_bf16", "host", 32, 4, 8, 2, 16, None): "B128",
+        ("context_bf16", "host", 10, 2, 5, 11, 32, "q511"): "Q511_SM100A",
+        ("context_bf16", "host", 10, 2, 5, 6, 1024, "q257"): "Q257_SM100A",
+        ("context_fp8", "host", 32, 4, 8, 1, 64, None): "B256",
+        ("context_fp8", "device", 32, 4, 8, 1, 64, None): "B256_SCALE_PTR",
+        ("context_nvfp4", "host", 32, 4, 8, 16, 16, None): "Q511_SM100A",
+        ("context_nvfp4", "device", 32, 4, 8, 16, 16, None): "Q511_SCALE_PTR_SM100A",
+    },
+    "sm103a": {
+        ("context_bf16", "host", 64, 8, 8, 256, 16, None): "Q8192",
+        ("context_bf16", "host", 32, 4, 8, 2, 16, None): "B128",
+        ("context_bf16", "host", 10, 2, 5, 11, 32, "q511"): "Q511_SM103A",
+        ("context_bf16", "host", 10, 2, 5, 6, 1024, "q257"): "Q257_SM103A",
+        ("context_fp8", "host", 32, 4, 8, 1, 64, None): "B256",
+        ("context_fp8", "device", 32, 4, 8, 1, 64, None): "B256_SCALE_PTR",
+        ("context_nvfp4", "host", 32, 4, 8, 16, 16, None): "Q511_SM103A",
+        ("context_nvfp4", "device", 32, 4, 8, 16, 16, None): "Q511_SCALE_PTR_SM103A",
+    },
+}
+# ``(component, identifier)`` -> the delivered record the host pins: the
+# program name, the m-block count of its shape class and whether it launches
+# one CTA per tile (otherwise at most one persistent CTA per SM).  A loader
+# whose record differs fails closed at load.
+_CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int, bool]] = {
+    ("context_bf16", "Q8192"): (
+        "cake_fmha_context_bf16_40ad2438607d5cb26a81",
+        256,
+        False,
+    ),
+    ("context_bf16", "B128"): ("cake_fmha_context_bf16_c0c57df0792f14445bcc", 2, False),
+    ("context_bf16", "Q511_SM100A"): (
+        "cake_fmha_context_bf16_7a391c24f1bd3cac5168",
+        11,
+        True,
+    ),
+    ("context_bf16", "Q511_SM103A"): (
+        "cake_fmha_context_bf16_94e3b4da4beb6bd678bd",
+        11,
+        True,
+    ),
+    ("context_bf16", "Q257_SM100A"): (
+        "cake_fmha_context_bf16_652eb396dd951593fe4a",
+        6,
+        True,
+    ),
+    ("context_bf16", "Q257_SM103A"): (
+        "cake_fmha_context_bf16_90d7ee85f49d09a3bcca",
+        6,
+        True,
+    ),
+    ("context_fp8", "B256"): ("cake_fmha_context_fp8_6f7e8b77c2309a9c63a2", 1, False),
+    ("context_fp8", "B256_SCALE_PTR"): (
+        "cake_fmha_context_fp8_a586c83f6eca2799c39e",
+        1,
+        False,
+    ),
+    ("context_nvfp4", "Q511_SM100A"): (
+        "cake_fmha_context_nvfp4_41e0f7b224fcc4acfc54",
+        16,
+        False,
+    ),
+    ("context_nvfp4", "Q511_SM103A"): (
+        "cake_fmha_context_nvfp4_c916619510183749b162",
+        16,
+        False,
+    ),
+    ("context_nvfp4", "Q511_SCALE_PTR_SM100A"): (
+        "cake_fmha_context_nvfp4_ab413a0149f11e7a8463",
+        16,
+        False,
+    ),
+    ("context_nvfp4", "Q511_SCALE_PTR_SM103A"): (
+        "cake_fmha_context_nvfp4_1b4750660638d644a971",
+        16,
+        False,
+    ),
+}
+# The binding's host parameters per component, in the kernel's order (then the
+# grid).  The quantized programs take the device-scale parameters in every
+# build; a host-scalar program never reads them.
+_CONTEXT_COMMON_PARAMS = (
+    "LSE_ptr",
+    "sinks",
+    "page_table_k",
+    "page_table_v",
+    "seq_lens_q",
+    "seq_lens_kv",
+    "cu_seq_lens_q",
+    "softmax_scale_log2",
+)
+_CONTEXT_HOST_PARAMS: dict[str, tuple[str, ...]] = {
+    "context_bf16": (
+        "Q",
+        "K",
+        "V",
+        "O_ptr",
+        *_CONTEXT_COMMON_PARAMS,
+        "total_bh",
+        "page_row_stride",
+        "num_ctas",
+        "dynamic_counter",
+    ),
+    "context_fp8": (
+        "Q",
+        "K",
+        "V",
+        "O_ptr",
+        *_CONTEXT_COMMON_PARAMS,
+        "output_scale",
+        "total_bh",
+        "page_row_stride",
+        "num_ctas",
+        "dynamic_counter",
+        "bmm1_scale_ptr",
+        "bmm2_scale_ptr",
+        "bmm1_is_log2",
+    ),
+    "context_nvfp4": (
+        "Q",
+        "Kp",
+        "Vp",
+        "Ksf",
+        "Vsf",
+        "O_ptr",
+        *_CONTEXT_COMMON_PARAMS,
+        "output_scale",
+        "total_bh",
+        "page_row_stride",
+        "num_ctas",
+        "dynamic_counter",
+        "bmm1_scale_ptr",
+        "bmm2_scale_ptr",
+        "bmm1_is_log2",
+    ),
+}
+
+
+def _context_route_program(
+    target: str,
+    component: str,
+    *,
+    scale_form: str,
+    num_q_heads: int,
+    num_kv_heads: int,
+    pack_g: int,
+    num_m_blocks: int,
+    page_size: int,
+    exact_profile: str | None,
+    is_causal: bool,
+    return_lse: bool,
+    enable_sink: bool,
+) -> str | None:
+    """The generated program serving a context route on ``target``, or
+    ``None`` when the route keeps its component's JIT module."""
+
+    if not is_causal or return_lse or enable_sink:
+        return None
+    key = (
+        component,
+        scale_form,
+        num_q_heads,
+        num_kv_heads,
+        pack_g,
+        num_m_blocks,
+        page_size,
+        exact_profile,
+    )
+    return _CONTEXT_PROGRAM_ROUTES.get(target, {}).get(key)
+
+
+def _context_program_facts(program_name: str) -> tuple[str, int, bool]:
+    for (component, _), (name, num_m_blocks, one_tile) in _CONTEXT_PROGRAMS.items():
+        if name == program_name:
+            return component, num_m_blocks, one_tile
+    raise RuntimeError(f"{program_name} is not a Cake FMHA context program")
+
+
+def cake_fmha_context_launch_grid(
+    program, total_bh: int, sm_count: int
+) -> tuple[int, int, int]:
+    """The launch grid of one generated context program: a one-tile program
+    launches one CTA per tile (``num_m_blocks x total_bh`` tiles, ``total_bh``
+    the work units ``batch_size x num_q_heads / pack_g``), a persistent program
+    ``min(sm_count, tiles)`` CTAs.  ``program`` is the generated loader's
+    ``CakeProgram`` record."""
+
+    _, num_m_blocks, one_tile = _context_program_facts(program.name)
+    tiles = num_m_blocks * int(total_bh)
+    return (tiles if one_tile else min(int(sm_count), tiles)), 1, 1
 
 
 def _aligned_program_id(cluster_size: int, dtype: str) -> str:
@@ -2086,6 +2302,17 @@ def _context_nvfp4_workspace_supported(
     return workspace_buffer.numel() * workspace_buffer.element_size() >= required
 
 
+# How the host selects the one-tile BF16 launch classes.  ``False`` (the
+# default): from host-visible facts alone; the programs read every request's KV
+# length and query offsets at run time, so any request lengths up to the
+# planned maxima are served, during CUDA graph capture too.  ``True``: as
+# before the generated programs, the host also reads ``seq_lens`` and
+# ``cum_seq_lens_q`` (a device synchronization, skipped during capture) and
+# selects the class only when every request has the planned maximum lengths;
+# other batches keep the generic JIT route.
+_CONTEXT_EXACT_PROFILE_NEEDS_UNIFORM_LENGTHS = False
+
+
 def _context_bf16_exact_profile(
     query: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -2103,7 +2330,13 @@ def _context_bf16_exact_profile(
     enable_sink: bool,
     kv_layout: str,
 ) -> Literal["q511", "q257"] | None:
-    """Resolve the two measured mask-loop bodies from exact runtime lengths."""
+    """Resolve the two one-tile mask-loop programs.
+
+    ``query`` holds ``batch_size x max_q_len`` rows, which makes every request
+    ``max_q_len`` tokens long; any KV length up to ``max_kv_len`` is served.
+    Unless ``_CONTEXT_EXACT_PROFILE_NEEDS_UNIFORM_LENGTHS``, no tensor value is
+    read.
+    """
 
     common = (
         batch_size == 4
@@ -2127,8 +2360,6 @@ def _context_bf16_exact_profile(
         and query.shape[0] == 4 * 511
     ):
         profile = "q511"
-        expected_q_len = 511
-        expected_kv_len = 2047
     elif (
         max_q_len == 257
         and max_kv_len == 1024
@@ -2137,10 +2368,10 @@ def _context_bf16_exact_profile(
         and query.shape[0] == 4 * 257
     ):
         profile = "q257"
-        expected_q_len = 257
-        expected_kv_len = 1024
     else:
         return None
+    if not _CONTEXT_EXACT_PROFILE_NEEDS_UNIFORM_LENGTHS:
+        return profile
     if query.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
         return None
     try:
@@ -2148,9 +2379,9 @@ def _context_bf16_exact_profile(
         q_indptr = [int(value) for value in cum_seq_lens_q.detach().cpu().tolist()]
     except RuntimeError:
         return None
-    if kv_lengths != [expected_kv_len] * batch_size:
+    if kv_lengths != [max_kv_len] * batch_size:
         return None
-    if q_indptr != [index * expected_q_len for index in range(batch_size + 1)]:
+    if q_indptr != [index * max_q_len for index in range(batch_size + 1)]:
         return None
     return profile
 
@@ -2402,8 +2633,26 @@ def select_cake_fmha_context_route(
         )
     ):
         return None
+    target = _cake_fmha_target(device)
+    device_scales = component in ("context_fp8", "context_nvfp4") and (
+        isinstance(bmm1_scale, torch.Tensor) and isinstance(bmm2_scale, torch.Tensor)
+    )
+    program = _context_route_program(
+        target,
+        component,
+        scale_form="device" if device_scales else "host",
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        pack_g=pack_g,
+        num_m_blocks=num_m_blocks,
+        page_size=page_size,
+        exact_profile=exact_profile,
+        is_causal=is_causal,
+        return_lse=lse is not None,
+        enable_sink=sinks is not None,
+    )
     return CakeFmhaContextRoute(
-        target=_cake_fmha_target(device),
+        target=target,
         component=component,
         num_m_blocks=num_m_blocks,
         num_q_heads=num_q_heads,
@@ -2415,7 +2664,209 @@ def select_cake_fmha_context_route(
         return_lse=lse is not None,
         enable_sink=sinks is not None,
         exact_profile=exact_profile,
+        device_scales=device_scales,
+        program=program,
     )
+
+
+class CakeFmhaContextProgramModule:
+    """One loaded generated context program behind the context FFI ABI
+    (``cake_paged_attention_context``, the arguments ``trtllm_batch_context_
+    with_kv_cache`` passes): the route it serves, the ``CakeProgram`` record,
+    its exact target and the binding's ``run`` entry."""
+
+    def __init__(self, route: CakeFmhaContextRoute, program: Any, target: str):
+        self.route = route
+        self.program = program
+        self.target = target
+        self.entry = program.entry(target)
+        self.units_per_batch = route.num_q_heads // route.pack_g
+        self.quantized = route.component != "context_bf16"
+
+    def cake_paged_attention_context(
+        self,
+        out: torch.Tensor,
+        out_scale_factor: torch.Tensor | None,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        multi_ctas_kv_counter_buffer: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_q_len: int,
+        max_kv_len: int,
+        bmm1_scale: float | torch.Tensor,
+        bmm2_scale: float | torch.Tensor,
+        o_sf_scale: float,
+        o_sf_vec_size: int,
+        o_sf_start_index: int,
+        batch_size: int,
+        window_left: int,
+        cum_seq_lens_q: torch.Tensor,
+        cum_seq_lens_kv: torch.Tensor,
+        sm_count: int,
+        enable_pdl: bool | None,
+        workspace_size: int,
+        attention_sinks: torch.Tensor | None,
+        key_block_scales: torch.Tensor | None,
+        value_block_scales: torch.Tensor | None,
+        skip_softmax_threshold_scale_factor: float | None,
+        uses_shared_paged_kv_idx: bool,
+        use_fp16_softmax: bool,
+        uses_spcompress: bool,
+        is_causal: bool,
+        lse: torch.Tensor | None,
+        lse_stride_tokens: int,
+        lse_stride_heads: int,
+    ) -> None:
+        """Launch the program on the current torch stream.
+
+        The kernel reads every request's KV length (``seq_lens``) and query
+        offsets (``cum_seq_lens_q``) itself; ``total_bh`` is the work-unit
+        count ``batch_size x num_q_heads / pack_g``.  A device-scale program
+        reads the log2-domain bmm1 scale and the bmm2 scale through device
+        pointers; a host-scalar program takes them as scalars and never reads
+        the pointers.  The LSE, sink and Q-length pointers are unread (the
+        programs write no LSE, take no sink and derive the query lengths from
+        ``cum_seq_lens_q``): they point into the workspace.
+        """
+
+        route = self.route
+        if query.shape[1] != route.num_q_heads or key_cache.shape[1] != (
+            route.num_kv_heads
+        ):
+            raise RuntimeError(
+                "Cake FMHA context launch does not match its selected route"
+            )
+        total_bh = int(batch_size) * self.units_per_batch
+        grid = cake_fmha_context_launch_grid(self.program, total_bh, sm_count)
+        unread = workspace_buffer.view(-1).view(torch.uint8)[:16]
+        # The kernel reads page ``p`` of request ``b`` at ``page_table[b x
+        # page_row_stride + p]``: pass 1-D views over the caller's own table
+        # storage (no copy) that span every row, and its true row stride.
+        tables = block_tables.view(torch.int32)
+        if tables.stride(-1) != 1:
+            raise RuntimeError(
+                "Cake FMHA context page tables need a unit stride along the pages"
+            )
+        row_stride = int(tables.stride(0))
+        span = (int(tables.shape[0]) - 1) * row_stride + int(tables.shape[-1])
+        page_table_k = tables.as_strided((span,), (1,), tables.storage_offset())
+        page_table_v = (
+            page_table_k
+            if uses_shared_paged_kv_idx
+            else tables.as_strided(
+                (span,), (1,), tables.storage_offset() + int(tables.stride(1))
+            )
+        )
+        values: dict[str, Any] = {
+            "Q": query.view(torch.uint8) if self.quantized else query,
+            "O_ptr": out.view(torch.uint8) if self.quantized else out,
+            "LSE_ptr": unread.view(torch.float32),
+            "sinks": unread.view(torch.float32),
+            "page_table_k": page_table_k,
+            "page_table_v": page_table_v,
+            "seq_lens_q": unread.view(torch.int32),
+            "seq_lens_kv": seq_lens,
+            "cu_seq_lens_q": cum_seq_lens_q,
+            "total_bh": total_bh,
+            "page_row_stride": row_stride,
+            "num_ctas": grid[0],
+            "dynamic_counter": multi_ctas_kv_counter_buffer.view(-1).view(torch.uint32),
+            "grid_x": grid[0],
+            "grid_y": grid[1],
+            "grid_z": grid[2],
+        }
+        if route.device_scales:
+            # bmm1 arrives in log2 units (trtllm_batch_context_with_kv_cache
+            # multiplies a device bmm1 scale by log2e).
+            if not isinstance(bmm1_scale, torch.Tensor) or not isinstance(
+                bmm2_scale, torch.Tensor
+            ):
+                raise RuntimeError(
+                    "a device-scale Cake FMHA context program takes tensor scales"
+                )
+            values["softmax_scale_log2"] = 1.0
+            values["output_scale"] = 1.0
+            values["bmm1_scale_ptr"] = bmm1_scale.reshape(1)
+            values["bmm2_scale_ptr"] = bmm2_scale.reshape(1)
+            values["bmm1_is_log2"] = 1
+        else:
+            values["softmax_scale_log2"] = float(bmm1_scale) * log2e
+            values["output_scale"] = float(bmm2_scale)
+            values["bmm1_scale_ptr"] = unread.view(torch.float32)
+            values["bmm2_scale_ptr"] = unread.view(torch.float32)
+            values["bmm1_is_log2"] = 0
+        if route.component == "context_nvfp4":
+            values["Kp"] = key_cache
+            values["Vp"] = value_cache
+            values["Ksf"] = key_block_scales.view(torch.uint8)
+            values["Vsf"] = value_block_scales.view(torch.uint8)
+        else:
+            values["K"] = key_cache.view(torch.uint8) if self.quantized else key_cache
+            values["V"] = (
+                value_cache.view(torch.uint8) if self.quantized else value_cache
+            )
+        arguments = [values[name] for name in self.program.args]
+        with torch.cuda.device(query.device), tvm_ffi.use_torch_stream():
+            self.entry(*arguments)
+
+
+_CONTEXT_PROGRAM_MODULES: dict[tuple[str, str, str], CakeFmhaContextProgramModule] = {}
+
+
+def _load_cake_fmha_context_program(
+    route: CakeFmhaContextRoute,
+) -> CakeFmhaContextProgramModule:
+    """Build and load the generated program of ``route`` on the route's target.
+
+    The loaders ``flashinfer.jit.cake_fmha_context_{bf16,fp8,nvfp4}`` are
+    generated by the Cake export beside ``csrc/cake_fmha_context_*/``; they are
+    imported here, lazily, so route selection never needs them.  The record's
+    name, target and argument names are checked against the host once, at
+    load.
+    """
+
+    key = (route.target, route.component, route.program)
+    module = _CONTEXT_PROGRAM_MODULES.get(key)
+    if module is not None:
+        return module
+    import importlib
+
+    from .jit.cake_program import GRID_ARGS, CakeProgram
+
+    pinned = _CONTEXT_PROGRAMS.get((route.component, route.program))
+    if pinned is None:
+        raise RuntimeError(
+            f"Cake FMHA {route.component} names no generated program {route.program!r}"
+        )
+    loader_name = f"cake_fmha_{route.component}"
+    loader = importlib.import_module(f".jit.{loader_name}", __package__)
+    program = getattr(loader, route.program, None)
+    if not isinstance(program, CakeProgram):
+        raise RuntimeError(
+            f"flashinfer.jit.{loader_name} publishes no CakeProgram {route.program!r}"
+        )
+    if program.name != pinned[0]:
+        raise RuntimeError(
+            f"flashinfer.jit.{loader_name}.{route.program} is {program.name}; "
+            f"this module pins {pinned[0]}"
+        )
+    target = _ALIGNED_PROGRAM_TARGET[route.target]
+    if target not in program.targets:
+        raise RuntimeError(
+            f"{program.name} ships no {target!r} build; its targets are {list(program.targets)}"
+        )
+    params = _CONTEXT_HOST_PARAMS[route.component]
+    if tuple(program.args) != (*params, *GRID_ARGS):
+        raise RuntimeError(
+            f"the generated {program.name} binding takes {list(program.args)}; "
+            f"the host spells {[*params, *GRID_ARGS]}"
+        )
+    module = CakeFmhaContextProgramModule(route, program, target)
+    _CONTEXT_PROGRAM_MODULES[key] = module
+    return module
 
 
 def get_cake_fmha_context_module(
@@ -2427,6 +2878,13 @@ def get_cake_fmha_context_module(
         return load_cake_fmha_compat_module(_cake_fmha_target(device))
     if route.target != _cake_fmha_target(device):
         raise RuntimeError("Cake FMHA context route target does not match the device")
+    if route.program is not None:
+        return _load_cake_fmha_context_program(route)
+    if route.exact_profile is not None:
+        raise RuntimeError(
+            f"Cake FMHA context exact profile {route.exact_profile} has no program "
+            f"on {route.target}"
+        )
     if route.component == "context_fp16_hd256":
         return load_cake_fmha_context_fp16_hd256_module(
             route.target,
@@ -2476,11 +2934,7 @@ def get_cake_fmha_context_module(
         "enable_sink": route.enable_sink,
     }
     if route.component == "context_bf16":
-        return load_cake_fmha_context_bf16_module(
-            *common_args,
-            **common_kwargs,
-            exact_profile=route.exact_profile,
-        )
+        return load_cake_fmha_context_bf16_module(*common_args, **common_kwargs)
     return load_cake_fmha_context_fp8_module(*common_args, **common_kwargs)
 
 
