@@ -1,469 +1,835 @@
-"""MoE Expert-Parallel benchmark: dispatch → compute → combine.
+"""Benchmark one MoE expert-parallel layer: dispatch, expert computation and combine.
 
-Canonical cases mirror the NCCL-EP ``ep_bench`` reference
-(``contrib/nccl_ep/README.md`` in the NCCL repo): **128 tokens/rank, hidden 7168,
-top-k 8, 256 experts, BF16**, swept over **8/16/32/64 GPUs** and over the two EP
-**algorithms — Low-Latency (LL) and High-Throughput (HT)** (one table each).
-Select that geometry with ``--reference`` and the algorithm with
-``--algorithm {ll,ht}``; the GPU count comes from the torchrun world size.
+Times ``MoEEpSplitLayer.forward()`` for one model profile, one communication
+backend and one expert-compute backend over a sweep of local batch sizes. The
+layer runs four stages (``MoEEpSplitLayer.STAGES``): ``quantize`` turns the
+BF16 hidden states into the dispatch payload, ``dispatch`` and ``combine`` run
+the all-to-all, and ``compute`` runs the routed experts.
 
-Launch (one process per GPU; 4 GPU/node on GB200 → N nodes = GPUs/4):
+What is reported has three levels of detail, each chosen on its own:
 
-    # LL, EXPERT_MAJOR (default), reference geometry, 8 GPUs (2 GB200 nodes):
-    torchrun --nnodes 2 --nproc_per_node 4 --rdzv_backend c10d \\
-        --rdzv_endpoint $HOST:$PORT benchmarks/moe_ep/bench_moe_ep.py \\
-        --reference --algorithm ll --backend nccl_ep --quant bf16
+- ``--timing_scope`` picks the span of the forward. ``dispatch_compute_combine``
+  (default) runs from the first dispatch kernel to the last combine kernel, the
+  part a fused dispatch-experts-combine kernel replaces, so it leaves out the
+  quantization before dispatch; ``forward`` runs from the first quantize kernel
+  to the last combine kernel.
+- ``--stage_breakdown`` reports the stages inside that span instead of the span:
+  ``dispatch``, ``compute`` and ``combine``, and also ``quantize`` for the
+  ``forward`` scope.
+- ``--kernel_breakdown`` adds the time of every kernel inside each reported span
+  or stage, C++ kernel names demangled by the ``cxxfilt`` package.
 
-    # LL, RANK_MAJOR variant: add --layout rank_major
-    # HT variant: --algorithm ht
-    # Ad-hoc (non-reference) sizing still works via --tokens / --tokens-per-rank.
+A time is a CUPTI kernel span: first kernel start to last kernel end inside a
+window delimited by two CUDA events. The events, recorded by the benchmark
+around the forward and by the layer's ``stage_hook`` at stage boundaries, only
+delimit the windows; without cupti-python>=13.4 the times fall back to the
+events themselves and benchmark_metadata.warning records the reason. Every
+event node in a replayed graph delays the kernel after it by several
+microseconds, so events sit only where the chosen level needs them: the
+default scope has one boundary inside the forward, where dispatch starts, and
+``--stage_breakdown`` puts one at every stage boundary. Those also stop a
+kernel of one stage from overlapping the next through programmatic dependent
+launch, so the stages add up to more than the span they split, which is why
+the span itself is not reported with them. ``--kernel_breakdown`` reads the
+same trace and changes no time.
 
-``--tokens-per-rank`` (the reference uses 128) fixes per-rank work as GPUs scale
-and takes precedence over the global ``--tokens``. Rank 0 prints one CSV row
-(prefixed with the algorithm + layout). ``--baseline`` times the comm-only
-identity path. Weights are random but correctly shaped/typed — this measures
-latency, not accuracy (correctness is covered by tests/moe_ep/).
+To time the all-to-all alone, use ``bench_moe_ep_comm.py``, which reports the
+same dispatch and combine spans. ``benchmarks/moe_ep/requirements.txt`` lists
+the optional packages of both (``cupti-python``, ``cxxfilt``).
 
-Note: NCCL-EP HT uses the FLAT receive layout; the LL path supports two layouts,
-selected with ``--layout {expert_major,rank_major}``:
-  * EXPERT_MAJOR — recv [num_local_experts, per_rank*world, hidden]; every padded
-    row is pre-assigned to one expert (the inner compute is a top_k=1 batch).
-  * RANK_MAJOR — recv [world, per_rank, hidden]; tokens grouped by source rank.
-    The inner compute is driven by the library's received per-token routing at the
-    model's real top_k (do_finalize pre-reduce), with non-local picks masked to
-    weight 0 — far less padded work than EXPERT_MAJOR, which is the point of
-    measuring it.
-``--algorithm ht`` exercises HT FLAT (``--layout`` ignored). For the HT
-``nccl_ep_b200_ib`` config, add ``--ep-test-geometry`` (rank-derived
-top_k=min(8,world), num_experts=min(256, top_k*world), per contrib/nccl_ep/
-ep_test.py) and sweep ``--tokens-per-rank {4096,8192}``.
+Warmup and timed iterations are captured in one CUDA graph and replayed once
+(``--no_cuda_graph`` runs them eagerly); every iteration flushes L2 first. One
+layer, whose workspace holds the largest batch (``--max_num_tokens_per_rank``),
+serves the whole sweep: each step passes its largest local batch over the ranks
+as ``MoEEpTensors.runtime_max_tokens_per_rank``, so the all-to-all and the
+experts run with that token count, as ``bench_moe_ep_comm.py`` runs the
+communication. The first, untimed forward of every batch size profiles the
+expert kernels' tactics with ``flashinfer.autotune`` (``--no_autotune`` keeps
+their fallback tactics; ``--autotune_cache`` reuses the profiles across runs).
 
-The CSV reports BOTH per-stage latency (µs) and dispatch/combine bandwidth (GB/s,
-ep_bench send-side convention: unique (token,node) selections × hidden × dtype /
-stage time; ``*_rdma_*`` = remote-node only).
+Launch on one node, for example:
 
-Per-stage GPU times come from ``MoEEpSplitLayer.enable_timing`` (opt-in CUDA
-events; off by default in production forwards).
+    # DeepSeek-V4-Pro experts (MXFP4 weights, MXFP8 activations) behind the
+    # one-sided all-to-all on its fence transport, local batches 1..1024.
+    torchrun --standalone --nproc-per-node=8 benchmarks/moe_ep/bench_moe_ep.py \\
+        --comm nvlink_one_sided --cft off --compute trtllm \\
+        --profile deepseek_v4_pro --perfect_router -b 1 -e 1024 -f 2 \\
+        --kernel_breakdown --output_file out.json
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import json
 import os
-import sys
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-_here = os.path.dirname(os.path.abspath(__file__))
-sys.path[:] = [p for p in sys.path if os.path.abspath(p or os.getcwd()) != _here]
+import torch
+import torch.distributed as dist
 
-
-# Canonical benchmark cases, mirroring the NCCL-EP `ep_bench` reference
-# (contrib/nccl_ep/README.md): BF16 dispatch+combine, LL mode, 128 tokens/rank,
-# hidden 7168, top-k 8, 256 experts, swept over 8/16/32/64 GPUs (1/2/4/8 nodes @
-# 8 GPU/node; on GB200 that's 2/4/8/16 nodes @ 4 GPU/node). `--reference` selects
-# this geometry; the GPU count comes from the launcher (torchrun world size).
-#
-# Algorithm: NCCL-EP supports two algorithms — Low-Latency (LL) and
-# High-Throughput (HT). The reference table is LL-only. `--algorithm {ll,ht}`
-# selects which to benchmark; run once per algorithm to produce the LL and HT
-# tables. (HT requires the backend's FLAT-layout handle path.)
-_REFERENCE = dict(
-    num_experts=256, top_k=8, hidden=7168, intermediate=2048, tokens_per_rank=128
+from moe_ep_bench_utils import (
+    PROFILES,
+    add_profile_args,
+    add_sweep_args,
+    agree_on_cupti,
+    allgather,
+    first_error,
+    gather_kernel_breakdown,
+    gather_per_rank,
+    kernel_spans_cupti,
+    l2_flush_buffer,
+    local_batch_sizes,
+    make_routing,
+    print_rank0,
+    rank_mean,
+    start_cupti,
+    sync,
+    warn_if_kernel_names_mangled,
+    warn_kernel_span_unavailable,
 )
 
+_TAG = "bench_moe_ep"
 
-def _parse_args() -> argparse.Namespace:
-    """Parse the CLI, resolving the geometry presets that are not plain flags.
+# The flashinfer.fused_moe.QuantFormat of each --quant / --weight_quant choice.
+QUANT_FORMATS = {
+    "bf16": "BF16",
+    "fp8_block_scale": "DeepSeekFp8",
+    "mxfp8": "MXFP8",
+    "mxfp4": "MXFP4",
+    "nvfp4": "NVFP4",
+}
+ACTIVATION_FORMATS = ("bf16", "fp8_block_scale", "mxfp8", "nvfp4")
+COMM_BACKENDS = ("nvlink_one_sided", "cake", "nvlink_two_sided")
+COMPUTE_BACKENDS = ("trtllm", "cutedsl")
+# NVLinkOneSidedConfig.cft for each --cft choice.
+_CFT_MODES = {"auto": None, "on": True, "off": False}
+TIMING_SCOPES = ("dispatch_compute_combine", "forward")
+# The stage a fused dispatch-experts-combine kernel starts at.
+_DISPATCH_STAGE = "dispatch"
 
-    ``--reference`` overwrites ``--num-experts`` / ``--top-k`` / ``--hidden`` /
-    ``--intermediate`` (and ``--tokens-per-rank`` if unset) in place with the
-    ep_bench reference case, so everything downstream can read those attributes
-    unconditionally. ``--ep-test-geometry`` is deliberately left unresolved here:
-    it derives from the world size, which only exists after
-    ``dist.init_process_group`` in :func:`main`.
+
+def _comm_config(args: argparse.Namespace):
+    from flashinfer.moe_ep import (
+        CakeAlltoAllConfig,
+        NVLinkOneSidedConfig,
+        NVLinkTwoSidedConfig,
+    )
+
+    low_precision = bool(args.use_low_precision_combine)
+    if args.comm == "nvlink_one_sided":
+        return NVLinkOneSidedConfig(
+            use_low_precision_combine=low_precision, cft=_CFT_MODES[args.cft]
+        )
+    if args.comm == "cake":
+        return CakeAlltoAllConfig(use_low_precision_combine=low_precision)
+    return NVLinkTwoSidedConfig()
+
+
+def _compute_candidate(compute: str, weight_quant: str):
+    """The fused_moe backend config of a --compute choice.
+
+    The layer rejects a candidate that cannot serve the quantization; the
+    benchmark reports that error instead of keeping its own support table.
     """
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--backend", choices=["nccl_ep", "nixl_ep"], default="nccl_ep")
-    p.add_argument(
-        "--algorithm",
-        choices=["ll", "ht"],
-        default="ll",
-        help="EP algorithm: ll = Low-Latency, ht = High-Throughput",
+    from flashinfer.fused_moe.api import (
+        CuteDslConfig,
+        TrtllmBf16Config,
+        TrtllmFp4Config,
+        TrtllmFp8BlockConfig,
     )
-    p.add_argument(
-        "--quant",
-        choices=["nvfp4", "bf16", "w4a16"],
-        default="bf16",
-        help="w4a16 = NVFP4 weights x BF16 activations (weight-only quant)",
-    )
-    p.add_argument(
-        "--layout",
-        choices=["expert_major", "rank_major"],
-        default="expert_major",
-        help="LL receive layout (ll only; ht always uses FLAT). expert_major: "
-        "recv [num_local_experts, per_rank*world, hidden]; rank_major: recv "
-        "[world, per_rank, hidden] (far less padded compute)",
-    )
-    p.add_argument(
-        "--reference",
-        action="store_true",
-        help="use the ep_bench reference geometry (hidden=7168, experts=256, "
-        "top_k=8, 128 tokens/rank)",
-    )
-    p.add_argument(
-        "--ep-test-geometry",
-        action="store_true",
-        help="derive top_k / num_experts from world size like contrib/nccl_ep/"
-        "ep_test.py: top_k=min(8,world), num_experts=min(256, top_k*world). This is "
-        "the geometry the nccl_ep_b200_ib HT benchmark uses (resolved in main() once "
-        "world size is known); overrides --num-experts / --top-k.",
-    )
-    # Sizing. --tokens-per-rank (preferred, matches the reference) wins over the
-    # global --tokens; the reference uses 128 tokens/rank.
-    p.add_argument("--tokens-per-rank", type=int, default=None)
-    p.add_argument("--tokens", type=int, default=8192, help="global token count")
-    p.add_argument("--num-experts", type=int, default=256)
-    p.add_argument("--top-k", type=int, default=8)
-    p.add_argument("--hidden", type=int, default=7168)
-    p.add_argument("--intermediate", type=int, default=2048)
-    p.add_argument("--repeat", type=int, default=30)
-    p.add_argument("--warmup", type=int, default=5)
-    p.add_argument(
-        "--baseline",
-        action="store_true",
-        help="time the comm-only identity path (no compute_config)",
-    )
-    p.add_argument(
-        "--cuda-graph",
-        action="store_true",
-        help=(
-            "capture the forward into a CUDA graph and time replays instead of "
-            "eager calls (split layers only; uses create_graph_state)"
-        ),
-    )
-    args = p.parse_args()
-    if args.reference:
-        args.num_experts = _REFERENCE["num_experts"]
-        args.top_k = _REFERENCE["top_k"]
-        args.hidden = _REFERENCE["hidden"]
-        args.intermediate = _REFERENCE["intermediate"]
-        if args.tokens_per_rank is None:
-            args.tokens_per_rank = _REFERENCE["tokens_per_rank"]
-    return args
+
+    if compute == "cutedsl":
+        return CuteDslConfig()
+    if weight_quant == "bf16":
+        return TrtllmBf16Config()
+    if weight_quant in ("nvfp4", "mxfp4"):
+        return TrtllmFp4Config()
+    return TrtllmFp8BlockConfig()
 
 
-def _build_compute(args, *, local_num_experts, local_expert_offset, max_tokens, device):
-    """Build (MoEConfig, MoEWeightPack) for the requested quant, or (None, None)."""
-    import torch
+class _Windows:
+    """External CUDA events delimiting named windows of every timed iteration.
 
+    ``iteration`` is the timed iteration being recorded; outside one (None)
+    nothing is recorded, so warmup iterations carry no events.
+    """
+
+    def __init__(self, names: Sequence[str], iters: int) -> None:
+        self.names = tuple(names)
+        self._index = {name: k for k, name in enumerate(self.names)}
+        # External events become event-record nodes when captured into a CUDA
+        # graph, so they stay queryable with elapsed_time() after replay.
+        self.events = [
+            [
+                (
+                    torch.cuda.Event(enable_timing=True, external=True),
+                    torch.cuda.Event(enable_timing=True, external=True),
+                )
+                for _ in self.names
+            ]
+            for _ in range(iters)
+        ]
+        # A CUDA event handle is created lazily on its first record().
+        for pairs in self.events:
+            for start, end in pairs:
+                start.record()
+                end.record()
+        torch.cuda.synchronize()
+        self.iteration: Optional[int] = None
+
+    def mark(self, name: str, end: bool) -> None:
+        """Record the start or end of window ``name`` in the current iteration."""
+        if self.iteration is None:
+            return
+        if name not in self._index:
+            raise RuntimeError(f"no timing window {name!r}; windows: {self.names}")
+        self.events[self.iteration][self._index[name]][int(end)].record()
+
+    @contextlib.contextmanager
+    def window(self, name: str):
+        self.mark(name, False)
+        yield
+        self.mark(name, True)
+
+    def cupti_ids(self, cupti) -> List[Tuple[int, ...]]:
+        return [
+            tuple(
+                cupti.get_cuda_event_id(event.cuda_event)
+                for pair in pairs
+                for event in pair
+            )
+            for pairs in self.events
+        ]
+
+    def elapsed_us(self) -> Dict[str, List[float]]:
+        """Per-iteration CUDA-event time of every window."""
+        return {
+            name: [pairs[k][0].elapsed_time(pairs[k][1]) * 1e3 for pairs in self.events]
+            for k, name in enumerate(self.names)
+        }
+
+
+def _reported(scope: str, stage_breakdown: bool, stages: Sequence[str]) -> List[str]:
+    """The reported windows, each under its own name: the scope, or with
+    ``stage_breakdown`` the stages inside it."""
+    if not stage_breakdown:
+        return [scope]
+    first = stages.index(_DISPATCH_STAGE) if scope == "dispatch_compute_combine" else 0
+    return list(stages[first:])
+
+
+def _window_names(
+    scope: str, stage_breakdown: bool, stages: Sequence[str]
+) -> Tuple[str, ...]:
+    """Every event window of one timed forward, in execution order."""
+    if stage_breakdown:
+        return tuple(stages)
+    if scope == "dispatch_compute_combine":
+        return ("before_dispatch", "dispatch_compute_combine")
+    return ("forward",)
+
+
+def _scope_windows(
+    scope: str, stage_breakdown: bool, stages: Sequence[str], iters: int
+):
+    """Windows, layer stage hook and per-forward bracket of one timed forward.
+
+    Returns the :class:`_Windows`, the ``stage_hook`` to install (or None) and
+    a context manager factory entered around each timed forward.
+    """
+    windows = _Windows(_window_names(scope, stage_breakdown, stages), iters)
+    if stage_breakdown:
+        return windows, windows.window, contextlib.nullcontext
+    if scope == "dispatch_compute_combine":
+
+        @contextlib.contextmanager
+        def boundary(stage: str):
+            if stage == _DISPATCH_STAGE:
+                windows.mark("before_dispatch", True)
+                windows.mark("dispatch_compute_combine", False)
+            yield
+
+        @contextlib.contextmanager
+        def around():
+            windows.mark("before_dispatch", False)
+            yield
+            windows.mark("dispatch_compute_combine", True)
+
+        return windows, boundary, around
+    return windows, None, lambda: windows.window("forward")
+
+
+def _merge_kernels(*kernel_lists: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Per-kernel statistics of several windows as one list, by kernel name."""
+    times: Dict[str, List[float]] = {}
+    for kernels in kernel_lists:
+        for kernel in kernels:
+            times.setdefault(kernel["name"], []).extend(kernel["_times"])
+    merged = [
+        {"name": name, "count": len(values), "_times": values}
+        for name, values in times.items()
+    ]
+    merged.sort(key=lambda k: sum(k["_times"]) / len(k["_times"]), reverse=True)
+    return merged
+
+
+def _time_scope(
+    layer: Any,
+    t: Any,
+    forward_kwargs: Dict[str, Any],
+    l2_buffer: torch.Tensor,
+    *,
+    scope: str,
+    stage_breakdown: bool,
+    stages: Sequence[str],
+    warmup: int,
+    iters: int,
+    use_cuda_graph: bool,
+    cupti_ctx: Optional[Any],
+) -> Tuple[Dict[str, List[float]], Dict[str, Any]]:
+    """Time the forward; returns the event times and CUPTI statistics of every
+    window."""
+    windows, hook, around = _scope_windows(scope, stage_breakdown, stages, iters)
+    window_event_ids = windows.cupti_ids(cupti_ctx[0]) if cupti_ctx else []
+
+    def _run_iterations() -> None:
+        for _ in range(warmup):
+            l2_buffer.zero_()
+            layer.forward(t, **forward_kwargs)
+        for i in range(iters):
+            l2_buffer.zero_()
+            windows.iteration = i
+            with around():
+                layer.forward(t, **forward_kwargs)
+            windows.iteration = None
+
+    graph = None
+    layer.stage_hook = hook
+    try:
+        if use_cuda_graph:
+            # One replay covers warmup and timed iterations, so no host gaps remain.
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                _run_iterations()
+        if cupti_ctx is not None:
+            cupti, cupti_kernels, cupti_events = cupti_ctx
+            cupti.activity_flush_all(0)
+            cupti_kernels.clear()
+            cupti_events.clear()
+        sync()
+        if graph is not None:
+            graph.replay()
+        else:
+            _run_iterations()
+        sync()
+    finally:
+        layer.stage_hook = None
+    stats: Dict[str, Any] = {}
+    if cupti_ctx is not None:
+        cupti.activity_flush_all(0)
+        try:
+            stats = kernel_spans_cupti(
+                cupti_kernels,
+                cupti_events,
+                windows.names,
+                window_event_ids,
+                # The payload of an unquantized dispatch needs no kernel.
+                optional_phases=("quantize", "before_dispatch"),
+            )
+        except RuntimeError as exc:
+            # Keep every rank on the same collective sequence even if one trace is incomplete.
+            stats["cupti_error"] = str(exc)
+    del graph
+    return windows.elapsed_us(), stats
+
+
+def _time_layer(
+    layer: Any,
+    t: Any,
+    *,
+    scope: str,
+    stage_breakdown: bool,
+    stages: Sequence[str],
+    warmup: int,
+    iters: int,
+    use_cuda_graph: bool,
+    cupti_ctx: Optional[Any],
+    tune: bool,
+    autotune_cache: Optional[str],
+    expert_rows: int,
+) -> Tuple[Dict[str, List[float]], Dict[str, List[float]], Dict[str, Any]]:
+    """Per-iteration times (µs) of every reported window (see :func:`_reported`).
+
+    One eager forward first builds the expert kernels, picks their tactics
+    and warms the transport; it is never timed. With ``tune`` it runs inside
+    ``flashinfer.autotune``, which profiles the tactics of the step's
+    ``expert_rows`` (the token rows the experts receive) unless
+    ``autotune_cache`` (a tactic file, read and then extended) covers them;
+    without it the kernels take their cached or fallback tactics.
+    Returns the CUDA-event times, the CUPTI kernel spans and the per-kernel
+    statistics of the reported windows, every other kernel in
+    ``other_kernels`` (with ``cupti_error`` when a trace was incomplete).
+    """
+    from flashinfer.autotuner import autotune
+
+    l2_buffer = l2_flush_buffer(t.hidden_states.device)
+    graph_state = layer.create_graph_state(t) if use_cuda_graph else None
+    forward_kwargs = {"graph_state": graph_state} if use_cuda_graph else {}
+    # Only the step's own row count is profiled, not every bucket up to the
+    # layer's tuning ceiling.
+    with autotune(tune, cache=autotune_cache, tuning_buckets=(expert_rows,)):
+        layer.forward(t, **forward_kwargs)
+    sync()
+
+    times, stats = _time_scope(
+        layer,
+        t,
+        forward_kwargs,
+        l2_buffer,
+        scope=scope,
+        stage_breakdown=stage_breakdown,
+        stages=stages,
+        warmup=warmup,
+        iters=iters,
+        use_cuda_graph=use_cuda_graph,
+        cupti_ctx=cupti_ctx,
+    )
+    names = _reported(scope, stage_breakdown, stages)
+    event_times = {name: times[name] for name in names}
+    span_times = {
+        name: stats[f"{name}_us_kernel_span"]
+        for name in names
+        if f"{name}_us_kernel_span" in stats
+    }
+    kernels = {
+        f"{name}_kernels": stats[f"{name}_kernels"]
+        for name in names
+        if f"{name}_kernels" in stats
+    }
+    if "other_kernels" in stats:
+        unreported = [
+            stats.get(f"{window}_kernels", [])
+            for window in _window_names(scope, stage_breakdown, stages)
+            if window not in names
+        ]
+        kernels["other_kernels"] = _merge_kernels(stats["other_kernels"], *unreported)
+    if "cupti_error" in stats:
+        kernels["cupti_error"] = stats["cupti_error"]
+    if graph_state is not None:
+        # A layer holds one live graph state; the next batch size needs its own.
+        graph_state.destroy()
+    return event_times, span_times, kernels
+
+
+def _random_weights(
+    num_local_experts: int, hidden_size: int, intermediate_size: int, device
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """BF16 gate/up and down projections of this rank's experts."""
+    w13 = torch.randn(
+        num_local_experts,
+        2 * intermediate_size,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    w2 = torch.randn(
+        num_local_experts,
+        hidden_size,
+        intermediate_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    return w13.mul_(hidden_size**-0.5), w2.mul_(intermediate_size**-0.5)
+
+
+def _build_layer(
+    args: argparse.Namespace,
+    *,
+    rank: int,
+    ep_size: int,
+    local_rank: int,
+    shape: Dict[str, Any],
+    max_tokens_per_rank: int,
+    weights: Tuple[torch.Tensor, torch.Tensor],
+):
     from flashinfer.fused_moe.api import (
         BackendOptions,
-        CuteDslConfig,
         ExecutionConfig,
         ExpertConfig,
         MoEConfig,
         QuantConfig,
         QuantFormat,
         RoutingConfig,
-        TrtllmBf16Config,
-        TrtllmFp4Config,
     )
-    from flashinfer.moe_ep import MoEWeightPack
-
-    routing = RoutingConfig(num_experts=args.num_experts, top_k=args.top_k)
-    experts = ExpertConfig(
-        intermediate_size=args.intermediate,
-        local_expert_offset=local_expert_offset,
-        local_num_experts=local_num_experts,
-    )
-    execution = ExecutionConfig(tune_max_num_tokens=max_tokens)
-
-    w13 = torch.randn(
-        local_num_experts,
-        2 * args.intermediate,
-        args.hidden,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    w2 = torch.randn(
-        local_num_experts,
-        args.hidden,
-        args.intermediate,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    canonical = MoEWeightPack(w13=w13, w2=w2)
-
-    if args.quant == "nvfp4":
-        cfg = MoEConfig(
-            routing=routing,
-            quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
-            experts=experts,
-            backend=BackendOptions(candidates=(CuteDslConfig(), TrtllmFp4Config())),
-            execution=execution,
-        )
-    elif args.quant == "w4a16":
-        # Weight-only quantization: 4-bit weights, BF16 activations. On SM100
-        # CuteDslRunner is the only runner that serves this pair -- the CUTLASS
-        # W4A16 path is Hopper-only and the CuTile one omits 100.
-        cfg = MoEConfig(
-            routing=routing,
-            quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
-            experts=experts,
-            backend=BackendOptions(candidates=(CuteDslConfig(),)),
-            execution=execution,
-        )
-    else:
-        cfg = MoEConfig(
-            routing=routing,
-            quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
-            experts=experts,
-            backend=BackendOptions(candidates=(TrtllmBf16Config(),)),
-            execution=execution,
-        )
-    return cfg, canonical
-
-
-def _comm_config(backend: str):
-    from flashinfer.moe_ep import NcclEpConfig, NvepConfig
-
-    return NcclEpConfig() if backend == "nccl_ep" else NvepConfig()
-
-
-def main() -> int:
-    """Run one rank of the benchmark; rank 0 prints the ``BENCH_CSV`` row.
-
-    The two timing modes differ in more than where the timer sits. Eager mode
-    times ``layer.forward`` directly and reports per-stage CUDA-event times.
-    Graph mode captures one forward against a ``MoEEpSplitGraphState`` and times
-    replays, which forces two separate warmups -- a mandatory eager one before
-    the capture (see the comment at the capture site) and an optional one over
-    the replay path -- and reports e2e only, because reading the per-stage events
-    needs a device sync that is illegal inside a capture.
-    """
-    args = _parse_args()
-
-    import torch
-    import torch.distributed as dist
-
     from flashinfer.moe_ep import (
         BootstrapConfig,
         EpAlgorithm,
         EpLayout,
         FleetParams,
-        dummy_moe_weights,
         FusedMoeKernelConfig,
-        IdentityConfig,
         MoEEpLayer,
-        MoEEpTensors,
+        MoEWeightPack,
         SplitConfig,
     )
 
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
-    dist.init_process_group(backend=backend)
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    num_local_experts = shape["num_experts"] // ep_size
+    moe_config = MoEConfig(
+        routing=RoutingConfig(num_experts=shape["num_experts"], top_k=shape["top_k"]),
+        quant=QuantConfig(
+            weight=QuantFormat[QUANT_FORMATS[shape["weight_quant"]]],
+            activation=QuantFormat[QUANT_FORMATS[shape["quant"]]],
+        ),
+        experts=ExpertConfig(
+            intermediate_size=shape["intermediate_size"],
+            local_expert_offset=rank * num_local_experts,
+            local_num_experts=num_local_experts,
+        ),
+        backend=BackendOptions(
+            candidates=(_compute_candidate(args.compute, shape["weight_quant"]),)
+        ),
+        # The rank-major exchange hands the experts every rank's tokens.
+        execution=ExecutionConfig(tune_max_num_tokens=max_tokens_per_rank * ep_size),
+    )
+    w13, w2 = weights
+    return MoEEpLayer(
+        BootstrapConfig(world_size=ep_size, rank=rank, device=local_rank),
+        FleetParams(
+            num_experts=shape["num_experts"],
+            max_tokens_per_rank=max_tokens_per_rank,
+            token_hidden_size=shape["hidden_size"],
+            algorithm=EpAlgorithm.LOW_LATENCY,
+            layout=EpLayout.RANK_MAJOR,
+        ),
+        MoEWeightPack(w13=w13, w2=w2),
+        backend=SplitConfig(
+            comm=_comm_config(args),
+            kernel=FusedMoeKernelConfig(moe_config=moe_config),
+        ),
+    )
+
+
+def _write_report(
+    path: Optional[str], metadata: Dict[str, Any], results: List[Dict[str, Any]]
+) -> None:
+    if not path:
+        return
+    output_dir = os.path.dirname(path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump({"benchmark_metadata": metadata, "results": results}, f, indent=2)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--comm",
+        type=str.lower,
+        default="nvlink_one_sided",
+        choices=COMM_BACKENDS,
+        help="Communication backend of the layer.",
+    )
+    parser.add_argument(
+        "--compute",
+        type=str.lower,
+        default="trtllm",
+        choices=COMPUTE_BACKENDS,
+        help="Expert computation: the TRT-LLM-Gen or the CuTe DSL fused MoE.",
+    )
+    add_profile_args(parser)
+    parser.add_argument(
+        "--intermediate_size", type=int, default=None, help="Override the profile."
+    )
+    parser.add_argument(
+        "--quant",
+        default=None,
+        choices=ACTIVATION_FORMATS,
+        help="Override the profile's activation (dispatch) format.",
+    )
+    parser.add_argument(
+        "--weight_quant",
+        default=None,
+        choices=sorted(QUANT_FORMATS),
+        help="Override the profile's expert weight format.",
+    )
+    add_sweep_args(parser)
+    parser.add_argument(
+        "--max_num_tokens_per_rank",
+        type=int,
+        default=None,
+        help="Workspace capacity per rank (default: the largest scanned local batch).",
+    )
+    parser.add_argument("--iters", type=int, default=200, help="Timed iterations.")
+    parser.add_argument("--warmup", type=int, default=20, help="Warmup iterations.")
+    parser.add_argument(
+        "--kernel_breakdown",
+        action="store_true",
+        help="Also report the time of every kernel inside each reported span "
+        "(C++ kernel names demangled when the cxxfilt package is installed).",
+    )
+    parser.add_argument(
+        "--iter_stats",
+        action="store_true",
+        help="Report mean/median/stdev/min/max over iterations instead of the mean.",
+    )
+    parser.add_argument("--output_file", default=None, help="Write a JSON report here.")
+    parser.add_argument(
+        "--random_seed",
+        type=int,
+        default=1234,
+        help="Input and weight seed (rank r uses seed + r).",
+    )
+    parser.add_argument(
+        "--perfect_router",
+        action="store_true",
+        help="Deterministic balanced routing, removing load imbalance across ranks.",
+    )
+    parser.add_argument(
+        "--use_low_precision_combine",
+        action="store_true",
+        help="Send combine payloads as FP8 (nvlink_one_sided and cake).",
+    )
+    parser.add_argument(
+        "--cft",
+        choices=sorted(_CFT_MODES),
+        default="auto",
+        help="CFT counted writes of nvlink_one_sided: auto (where supported, up "
+        "to its token-count limits), on (every supported step) or off.",
+    )
+    parser.add_argument(
+        "--no_cuda_graph",
+        action="store_true",
+        help="Run eagerly instead of replaying one CUDA graph.",
+    )
+    parser.add_argument(
+        "--no_autotune",
+        action="store_true",
+        help="Run the expert kernels with their cached or fallback tactics "
+        "instead of profiling them in the untimed first forward.",
+    )
+    parser.add_argument(
+        "--autotune_cache",
+        default=None,
+        help="Tactic file prefix; rank r reads and extends <prefix>.rank<r>.json, "
+        "so repeated runs skip the profiling.",
+    )
+    parser.add_argument(
+        "--timing_scope",
+        choices=TIMING_SCOPES,
+        default="dispatch_compute_combine",
+        help="Span of the forward to time: dispatch_compute_combine (first "
+        "dispatch to last combine kernel) or forward.",
+    )
+    parser.add_argument(
+        "--stage_breakdown",
+        action="store_true",
+        help="Report the stages inside the timing scope instead of its span.",
+    )
+    args = parser.parse_args()
+    return args
+
+
+def main() -> None:
+    args = parse_args()
+
+    cupti_ctx, cupti_error = start_cupti()
+
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
+    dist.init_process_group(backend="nccl", device_id=device)
+    rank, ep_size = dist.get_rank(), dist.get_world_size()
+    cupti_ctx, cupti_warning = agree_on_cupti(cupti_ctx, cupti_error, _TAG)
+    if args.kernel_breakdown:
+        warn_if_kernel_names_mangled(_TAG)
 
-    if args.tokens_per_rank is not None:
-        per_rank = args.tokens_per_rank
-        args.tokens = per_rank * world_size
-    else:
-        per_rank = args.tokens // world_size
-    if args.ep_test_geometry:
-        args.top_k = min(8, world_size)
-        args.num_experts = min(256, args.top_k * world_size)
-    local_num_experts = args.num_experts // world_size
-    local_expert_offset = rank * local_num_experts
-    ep_algorithm = (
-        EpAlgorithm.HIGH_THROUGHPUT
-        if args.algorithm == "ht"
-        else EpAlgorithm.LOW_LATENCY
-    )
-    ep_layout = (
-        EpLayout.RANK_MAJOR if args.layout == "rank_major" else EpLayout.EXPERT_MAJOR
-    )
-    if ep_algorithm is EpAlgorithm.HIGH_THROUGHPUT:
-        ep_layout = EpLayout.EXPERT_MAJOR
+    from flashinfer.moe_ep import MoEEpSplitLayer, MoEEpTensors
 
-    g = torch.Generator(device="cuda").manual_seed(42 + rank)
-    x = torch.randn(
-        per_rank, args.hidden, dtype=torch.bfloat16, device=device, generator=g
-    )
-    _scores = torch.randn(per_rank, args.num_experts, device=device, generator=g)
-    topk_ids = _scores.topk(args.top_k, dim=-1).indices.to(torch.int64)
-    topk_weights = torch.softmax(
-        torch.randn(per_rank, args.top_k, device=device, generator=g), dim=-1
-    )
-
-    tcp_store = None
-    if args.backend == "nixl_ep":
-        master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
-        master_port = int(os.environ.get("MASTER_PORT", "29500"))
-        tcp_store = dist.TCPStore(
-            host_name=master_addr,
-            port=master_port + 1,
-            world_size=world_size,
-            is_master=(rank == 0),
+    profile = PROFILES[args.profile]
+    shape = {
+        "hidden_size": int(args.hidden_size or profile.hidden_size),
+        "top_k": int(args.top_k or profile.top_k),
+        "num_experts": int(args.num_experts or profile.num_experts),
+        "intermediate_size": int(args.intermediate_size or profile.intermediate_size),
+        "quant": args.quant or profile.quant,
+        "weight_quant": args.weight_quant or profile.weight_quant,
+    }
+    if shape["num_experts"] % ep_size:
+        raise ValueError(
+            f"num_experts ({shape['num_experts']}) must be divisible by EP size ({ep_size})"
         )
+    batch_sizes = local_batch_sizes(args)
+    max_num_tokens_per_rank = int(args.max_num_tokens_per_rank or max(batch_sizes))
+    if max_num_tokens_per_rank < max(batch_sizes):
+        raise ValueError(
+            "--max_num_tokens_per_rank must cover the largest scanned batch"
+        )
+    stages = MoEEpSplitLayer.STAGES
+    names = _reported(args.timing_scope, args.stage_breakdown, stages)
 
-    bootstrap = BootstrapConfig(
-        world_size=world_size,
-        rank=rank,
-        stream=torch.cuda.current_stream().cuda_stream,
-        tcp_store=tcp_store,
+    metadata: Dict[str, Any] = {
+        "bench": _TAG,
+        "profile": args.profile,
+        "comm": args.comm,
+        "compute": args.compute,
+        "ep_size": ep_size,
+        **shape,
+        "experts_per_rank": shape["num_experts"] // ep_size,
+        "local_batch_size": batch_sizes,
+        "max_num_tokens_per_rank": max_num_tokens_per_rank,
+        "perfect_router": bool(args.perfect_router),
+        "use_low_precision_combine": bool(args.use_low_precision_combine),
+        "cft": args.cft,
+        "random_seed": int(args.random_seed),
+        "device": torch.cuda.get_device_name(device),
+        "cuda_graph": not args.no_cuda_graph,
+        "autotune": not args.no_autotune,
+        "autotune_cache": args.autotune_cache,
+        "timing_scope": args.timing_scope,
+        "stage_breakdown": bool(args.stage_breakdown),
+        "stages": list(stages),
+        "reported": names,
+        "cupti_enabled": cupti_ctx is not None,
+        "warning": cupti_warning,
+    }
+    print_rank0(json.dumps(metadata, indent=2))
+
+    torch.manual_seed(int(args.random_seed) + rank)
+    torch.cuda.manual_seed_all(int(args.random_seed) + rank)
+    weights = _random_weights(
+        shape["num_experts"] // ep_size,
+        shape["hidden_size"],
+        shape["intermediate_size"],
+        device,
     )
-    if ep_layout is EpLayout.RANK_MAJOR:
-        compute_max_tokens = per_rank * world_size
-    else:
-        compute_max_tokens = local_num_experts * per_rank * world_size
+    results: List[Dict[str, Any]] = []
+    autotune_cache = (
+        f"{args.autotune_cache}.rank{rank}.json" if args.autotune_cache else None
+    )
 
-    comm = _comm_config(args.backend)
-    if args.baseline:
-        layer_backend: SplitConfig | str = SplitConfig(
-            comm=comm, kernel=IdentityConfig()
-        )
-        layer_weights = dummy_moe_weights(
-            num_local_experts=local_num_experts,
-            hidden=args.hidden,
-            device=device,
-        )
-    else:
-        moe_config, canonical_weights = _build_compute(
+    layer, error = None, None
+    try:
+        # Construction is local to the rank; the transport comes up on the
+        # first forward.
+        layer = _build_layer(
             args,
-            local_num_experts=local_num_experts,
-            local_expert_offset=local_expert_offset,
-            max_tokens=compute_max_tokens,
-            device=device,
+            rank=rank,
+            ep_size=ep_size,
+            local_rank=local_rank,
+            shape=shape,
+            max_tokens_per_rank=max_num_tokens_per_rank,
+            weights=weights,
         )
-        layer_backend = SplitConfig(
-            comm=comm,
-            kernel=FusedMoeKernelConfig(moe_config=moe_config),
+    except (RuntimeError, ValueError, TypeError, NotImplementedError) as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    error = first_error(error)
+    if error is not None:
+        print_rank0(f"[{_TAG}] Cannot build {args.comm} + {args.compute}: {error}")
+        batch_sizes = []
+    use_cuda_graph = not args.no_cuda_graph
+
+    for local_num_tokens in batch_sizes:
+        label = f"{args.comm} + {args.compute} @ local_batch_size={local_num_tokens}"
+        hidden_states = torch.randn(
+            local_num_tokens, shape["hidden_size"], dtype=torch.bfloat16, device=device
         )
-        layer_weights = canonical_weights
-
-    fleet_params = FleetParams(
-        num_experts=args.num_experts,
-        max_tokens_per_rank=per_rank,
-        token_hidden_size=args.hidden,
-        dtype_bytes=2,
-        algorithm=ep_algorithm,
-        layout=ep_layout,
-    )
-    layer = MoEEpLayer(
-        bootstrap, fleet_params, weights=layer_weights, backend=layer_backend
-    )
-    t = MoEEpTensors(hidden_states=x, topk_ids=topk_ids, topk_weights=topk_weights)
-
-    from statistics import median
-    from time import perf_counter
-
-    e2e_us_samples: list[float] = []
-    disp_us: list[float] = []
-    comp_us: list[float] = []
-    comb_us: list[float] = []
-
-    if args.cuda_graph:
-        # Per-stage CUDA events need a device sync to read, which is illegal
-        # inside a capture, so graph mode reports e2e only.
-        layer.enable_timing = False
-        graph_state = layer.create_graph_state(t)
-        # At least one EAGER forward before the capture, even under --warmup 0.
-        # create_graph_state() only builds the fleet and the persistent handle;
-        # it is the first forward that builds the lazy inner MoE kernel (a JIT
-        # compile) and runs its backend selection, which times its candidates in
-        # a CUDA graph of its own -- a nested capture is illegal and aborts the
-        # outer one from deep inside the tuner, with an error that says nothing
-        # about --warmup. That first forward is also what drives the transport
-        # to the steady state the capture is supposed to record. See the "warmup
-        # forward is not optional" rule in docs/design_docs/moe_ep_runbook.md.
-        # max() also covers the negative counts argparse still accepts.
-        for _ in range(max(1, args.warmup)):
-            layer.forward(t, graph_state=graph_state)
-        torch.cuda.synchronize()
-        dist.barrier()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            layer.forward(t, graph_state=graph_state)
-        torch.cuda.synchronize()
-        dist.barrier()
-        # Warm the replay path too: the first replay pays one-time costs.
-        for _ in range(args.warmup):
-            graph.replay()
-        torch.cuda.synchronize()
-        dist.barrier()
-        for _ in range(args.repeat):
-            dist.barrier()
-            torch.cuda.synchronize()
-            t0 = perf_counter()
-            graph.replay()
-            torch.cuda.synchronize()
-            e2e_us_samples.append((perf_counter() - t0) * 1e6)
-        disp_us.append(0.0)
-        comp_us.append(0.0)
-        comb_us.append(0.0)
-    else:
-        layer.enable_timing = True
-
-        for _ in range(args.warmup):
-            layer.forward(t)
-        torch.cuda.synchronize()
-        dist.barrier()
-
-        for _ in range(args.repeat):
-            dist.barrier()
-            torch.cuda.synchronize()
-            t0 = perf_counter()
-            layer.forward(t)
-            torch.cuda.synchronize()
-            e2e_us_samples.append((perf_counter() - t0) * 1e6)
-            tm = layer.last_timings_ms
-            # The payload packing runs as its own "quantize" stage.
-            disp_us.append((tm.get("quantize", 0.0) + tm.get("dispatch", 0.0)) * 1e3)
-            comp_us.append(tm.get("compute", 0.0) * 1e3)
-            comb_us.append(tm.get("combine", 0.0) * 1e3)
-
-    e2e_us = median(e2e_us_samples)
-    d_us, cp_us, cb_us = median(disp_us), median(comp_us), median(comb_us)
-    tok_s = (args.tokens / (e2e_us * 1e-6)) if e2e_us > 0 else float("nan")
-
-    ranks_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", min(world_size, 8)))
-    num_nodes = max(1, world_size // ranks_per_node)
-    experts_per_node = max(1, args.num_experts // num_nodes)
-    my_node = rank // ranks_per_node
-    node_of_expert = (topk_ids // experts_per_node).clamp_(0, num_nodes - 1)
-    onehot = torch.zeros(per_rank, num_nodes, dtype=torch.bool, device=device)
-    onehot.scatter_(1, node_of_expert, True)
-    send_tokens = int(onehot.sum().item())
-    remote = onehot.clone()
-    remote[:, my_node] = False
-    rdma_tokens = int(remote.sum().item())
-    send_bytes = send_tokens * args.hidden * 2
-    rdma_bytes = rdma_tokens * args.hidden * 2
-    disp_s, comb_s = d_us * 1e-6, cb_us * 1e-6
-
-    def _gbps(b, s):
-        return (b / 1e9) / s if s > 0 else 0.0
-
-    disp_gbps, disp_rdma = _gbps(send_bytes, disp_s), _gbps(rdma_bytes, disp_s)
-    comb_gbps, comb_rdma = _gbps(send_bytes, comb_s), _gbps(rdma_bytes, comb_s)
-
-    dist.barrier()
-    if rank == 0:
-        mode = "identity" if args.baseline else args.quant
-        layout_name = "ht_flat" if args.algorithm == "ht" else args.layout
-        print(
-            "BENCH_CSV,algo,layout,tokens,gpus,backend,quant,mode,dispatch_us,compute_us,combine_us,e2e_us,tok_s,disp_gbps,disp_rdma_gbps,comb_gbps,comb_rdma_gbps\n"
-            f"BENCH_CSV,{args.algorithm},{layout_name},{args.tokens},{world_size},{args.backend},{mode},"
-            f"{'graph' if args.cuda_graph else 'eager'},"
-            f"{d_us:.1f},{cp_us:.1f},{cb_us:.1f},{e2e_us:.1f},{tok_s:.1f},"
-            f"{disp_gbps:.1f},{disp_rdma:.1f},{comb_gbps:.1f},{comb_rdma:.1f}"
+        topk_ids, topk_weights = make_routing(
+            local_num_tokens,
+            shape["top_k"],
+            shape["num_experts"],
+            ep_size,
+            bool(args.perfect_router),
+            device,
         )
-    layer.destroy()
+        step_max_tokens = max(allgather(int(local_num_tokens)))
+        t = MoEEpTensors(
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            runtime_max_tokens_per_rank=step_max_tokens,
+        )
+        timings, error = None, None
+        try:
+            timings = _time_layer(
+                layer,
+                t,
+                scope=args.timing_scope,
+                stage_breakdown=bool(args.stage_breakdown),
+                stages=stages,
+                warmup=int(args.warmup),
+                iters=int(args.iters),
+                use_cuda_graph=use_cuda_graph,
+                cupti_ctx=cupti_ctx,
+                tune=not args.no_autotune,
+                autotune_cache=autotune_cache,
+                # The rank-major exchange hands the experts every rank's rows.
+                expert_rows=step_max_tokens * ep_size,
+            )
+        except (RuntimeError, ValueError, NotImplementedError) as exc:
+            # Kernel selection rejects an unsupported configuration identically
+            # on every rank, before the transport's first collective returns.
+            error = f"{type(exc).__name__}: {exc}"
+        error = first_error(error)
+        if error is not None:
+            # A failed forward may leave the transport mid-round, so the sweep
+            # stops here.
+            print_rank0(f"[{_TAG}] Stopping at {label}: {error}")
+            break
+        times, span_times, stats = timings
+
+        cupti_errors = first_error(stats.get("cupti_error"))
+        if cupti_errors is not None:
+            warning = warn_kernel_span_unavailable(f"{label}: {cupti_errors}", _TAG)
+            metadata["warning"] = (
+                f"{metadata['warning']}\n{warning}" if metadata["warning"] else warning
+            )
+        elif cupti_ctx is not None:
+            # Every rank reports the same timing source for this measurement.
+            times = span_times
+
+        output: Dict[str, Any] = {
+            "comm": args.comm,
+            "compute": args.compute,
+            "local_batch_size": int(local_num_tokens),
+            "cuda_graph": use_cuda_graph,
+            **{
+                f"{name}_us": gather_per_rank(times[name], bool(args.iter_stats))
+                for name in names
+            },
+        }
+        if args.kernel_breakdown:
+            output.update(
+                gather_kernel_breakdown(
+                    stats,
+                    (*(f"{name}_kernels" for name in names), "other_kernels"),
+                    bool(args.iter_stats),
+                )
+            )
+        if rank == 0:
+            summary = ", ".join(
+                f"{name} {rank_mean(output[f'{name}_us']):.1f}" for name in names
+            )
+            print(
+                f"[{_TAG}] local_batch_size={local_num_tokens}: {summary} us",
+                flush=True,
+            )
+            results.append(output)
+            # Rewritten after every batch size, so a later failure keeps the
+            # points already measured.
+            _write_report(args.output_file, metadata, results)
+
+    if layer is not None:
+        sync()
+        layer.destroy()
+
+    if rank == 0 and results:
+        _write_report(args.output_file, metadata, results)
+        if args.output_file:
+            print(f"Report written to {args.output_file}", flush=True)
+
     dist.destroy_process_group()
-    return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

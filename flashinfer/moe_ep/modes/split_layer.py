@@ -421,14 +421,14 @@ class MoEEpSplitLayer(nn.Module):
         # Opt-in per-stage profiling. When True, forward() records CUDA events
         # around each stage (see STAGES) and stores elapsed GPU time (ms) in
         # ``last_timings_ms`` after a device sync. Off by default (zero
-        # overhead on the hot path). Used by benchmarks/moe_ep/bench_moe_ep.py.
+        # overhead on the hot path). Used by benchmarks/moe_ep/bench_moe_ep_fleet.py.
         self.enable_timing = False
         self.last_timings_ms: dict[str, float] = {}
         # Optional per-stage callback: ``stage_hook(stage)`` returns a context
         # manager that forward() enters around each stage, on the current
         # stream. Unlike enable_timing it never synchronizes, so it may record
         # CUDA events while a graph is being captured; the caller reads them
-        # after the replay.
+        # after the replay. Used by benchmarks/moe_ep/bench_moe_ep.py.
         self.stage_hook: Optional[
             Callable[[str], contextlib.AbstractContextManager[None]]
         ] = None
