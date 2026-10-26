@@ -28,7 +28,9 @@ output is compared against the independent BF16 / FP32 route of
 against an optional second oracle named by ``CAKE_W4A16_ORACLE_MODULE``
 (``module:function(problem, local_weights) -> bf16 [T, H]``). Repeated forwards
 on the same inputs are bitwise identical; a captured graph replays with new
-inputs and without host state.
+inputs and without host state. The layer fixture runs the tests at both hidden
+sizes of the route (6144 and 7168 columns); one EP world 1 case runs 600 tokens,
+past the kernel's redundant id scan, on a layer whose capacity holds them.
 """
 
 from __future__ import annotations
@@ -41,10 +43,13 @@ import pytest
 import torch
 
 HIDDEN = 6144
+HIDDEN_SIZES = (6144, 7168)
 INTERMEDIATE = 512
 EXPERTS = 32
 TOP_K = 8
 CAPACITY = 96
+WIDE_TOKENS = 600
+WIDE_CAPACITY = 640
 GATE_UP_CLAMP = 7.0
 ATOL_FRACTION = 2e-3
 RTOL = 0.05
@@ -147,11 +152,16 @@ def make_problem(
     masked_slots: float = 0.0,
     all_masked: bool = False,
     ids_dtype: torch.dtype = torch.int64,
+    hidden: int | None = None,
 ) -> Problem:
     device = torch.device("cuda", torch.cuda.current_device())
     g = torch.Generator(device=device).manual_seed(seed * 1000 + rank)
-    hidden = torch.randn(
-        tokens, HIDDEN, dtype=torch.bfloat16, device=device, generator=g
+    states = torch.randn(
+        tokens,
+        HIDDEN if hidden is None else hidden,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=g,
     )
     scores = torch.rand(tokens, EXPERTS, device=device, generator=g)
     ids = scores.topk(TOP_K, dim=-1).indices.to(torch.int64)
@@ -163,7 +173,7 @@ def make_problem(
     elif masked_slots > 0:
         mask = torch.rand(tokens, TOP_K, device=device, generator=g) < masked_slots
         ids[mask] = -1
-    return Problem(hidden, ids.to(ids_dtype).contiguous(), weights.contiguous())
+    return Problem(states, ids.to(ids_dtype).contiguous(), weights.contiguous())
 
 
 def reference(problem: Problem, weights) -> torch.Tensor:
@@ -202,7 +212,15 @@ def check_band(actual: torch.Tensor, expected: torch.Tensor, what: str) -> None:
 # ---------------------------------------------------------------------- layer
 
 
-def make_layer(rank: int, world_size: int, weights, *, knobs=None):
+def make_layer(
+    rank: int,
+    world_size: int,
+    weights,
+    *,
+    hidden: int | None = None,
+    capacity: int | None = None,
+    knobs=None,
+):
     from flashinfer.moe_ep import (
         BootstrapConfig,
         FleetParams,
@@ -217,8 +235,8 @@ def make_layer(rank: int, world_size: int, weights, *, knobs=None):
         ),
         fleet_params=FleetParams(
             num_experts=EXPERTS,
-            max_tokens_per_rank=CAPACITY,
-            token_hidden_size=HIDDEN,
+            max_tokens_per_rank=CAPACITY if capacity is None else capacity,
+            token_hidden_size=HIDDEN if hidden is None else hidden,
         ),
         weights=weights,
         backend=MegaConfig(
@@ -234,18 +252,22 @@ def make_layer(rank: int, world_size: int, weights, *, knobs=None):
     )
 
 
-@pytest.fixture(scope="module")
-def ep_layer(tmp_path_factory):
+@pytest.fixture(scope="module", params=HIDDEN_SIZES, ids=lambda hidden: f"h{hidden}")
+def ep_layer(request, tmp_path_factory):
+    """``(rank, world_size, layer, weights, hidden)``: one layer per hidden size of
+    the route, shared by the tests at that size (a layer pins its hidden size)."""
+
     import torch.distributed as dist
 
     from .w4a16_reference import make_w4a16_weights
 
+    hidden = request.param
     rank, world_size = init_distributed(tmp_path_factory)
-    weights = make_w4a16_weights(HIDDEN, INTERMEDIATE, EXPERTS // world_size, rank)
-    layer = make_layer(rank, world_size, weights)
-    layer.warmup(make_problem(16, rank=rank, seed=1).tensors())
+    weights = make_w4a16_weights(hidden, INTERMEDIATE, EXPERTS // world_size, rank)
+    layer = make_layer(rank, world_size, weights, hidden=hidden)
+    layer.warmup(make_problem(16, rank=rank, seed=1, hidden=hidden).tensors())
     torch.cuda.synchronize()
-    yield rank, world_size, layer, weights
+    yield rank, world_size, layer, weights, hidden
     layer.destroy()
     dist.barrier()
 
@@ -258,7 +280,7 @@ def _forward(layer, problem: Problem) -> torch.Tensor:
 
 def _check(layer, problem: Problem, weights, what: str) -> torch.Tensor:
     out = _forward(layer, problem)
-    assert tuple(out.shape) == (problem.hidden_states.shape[0], HIDDEN)
+    assert tuple(out.shape) == tuple(problem.hidden_states.shape)
     check_band(out, reference(problem, weights), f"{what} vs w4a16_reference")
     other = second_oracle(problem, weights)
     if other is not None:
@@ -270,13 +292,23 @@ def _check(layer, problem: Problem, weights, what: str) -> torch.Tensor:
 
 
 def test_uniform_rows_match_the_reference(ep_layer) -> None:
-    rank, world_size, layer, weights = ep_layer
-    _check(layer, make_problem(64, rank=rank, seed=100), weights, "uniform 64")
+    rank, world_size, layer, weights, hidden = ep_layer
+    _check(
+        layer,
+        make_problem(64, rank=rank, seed=100, hidden=hidden),
+        weights,
+        "uniform 64",
+    )
 
 
 def test_capacity_rows_match_the_reference(ep_layer) -> None:
-    rank, world_size, layer, weights = ep_layer
-    _check(layer, make_problem(CAPACITY, rank=rank, seed=110), weights, "capacity")
+    rank, world_size, layer, weights, hidden = ep_layer
+    _check(
+        layer,
+        make_problem(CAPACITY, rank=rank, seed=110, hidden=hidden),
+        weights,
+        "capacity",
+    )
 
 
 def test_int32_ids_bind_directly_and_match(ep_layer) -> None:
@@ -286,13 +318,17 @@ def test_int32_ids_bind_directly_and_match(ep_layer) -> None:
 
     import torch.distributed as dist
 
-    rank, world_size, _, weights = ep_layer
-    layer = make_layer(rank, world_size, weights)
+    rank, world_size, _, weights, hidden = ep_layer
+    layer = make_layer(rank, world_size, weights, hidden=hidden)
     try:
         layer.warmup(
-            make_problem(16, rank=rank, seed=1, ids_dtype=torch.int32).tensors()
+            make_problem(
+                16, rank=rank, seed=1, hidden=hidden, ids_dtype=torch.int32
+            ).tensors()
         )
-        problem = make_problem(48, rank=rank, seed=120, ids_dtype=torch.int32)
+        problem = make_problem(
+            48, rank=rank, seed=120, hidden=hidden, ids_dtype=torch.int32
+        )
         _check(layer, problem, weights, "int32 ids")
         # the same rows through int64 ids on the shared layer agree bitwise
         shared = ep_layer[2]
@@ -312,39 +348,42 @@ def test_int32_ids_bind_directly_and_match(ep_layer) -> None:
 def test_heterogeneous_rows_including_an_empty_rank(ep_layer) -> None:
     """Per-rank row counts differ in one call; a rank may hold no token."""
 
-    rank, world_size, layer, weights = ep_layer
+    rank, world_size, layer, weights, hidden = ep_layer
     pattern = (17, 0, 96, 1, 33, 64, 2, 80)
     rows = pattern[rank % len(pattern)] if world_size > 1 else 0
     out = _check(
-        layer, make_problem(rows, rank=rank, seed=130), weights, "heterogeneous"
+        layer,
+        make_problem(rows, rank=rank, seed=130, hidden=hidden),
+        weights,
+        "heterogeneous",
     )
     assert out.shape[0] == rows
 
 
 def test_masked_slots_contribute_zero(ep_layer) -> None:
-    rank, world_size, layer, weights = ep_layer
+    rank, world_size, layer, weights, hidden = ep_layer
     _check(
         layer,
-        make_problem(40, rank=rank, seed=140, masked_slots=0.3),
+        make_problem(40, rank=rank, seed=140, hidden=hidden, masked_slots=0.3),
         weights,
         "masked slots",
     )
 
 
 def test_fully_masked_rank_returns_zeros(ep_layer) -> None:
-    rank, world_size, layer, weights = ep_layer
+    rank, world_size, layer, weights, hidden = ep_layer
     masked = rank == world_size - 1
-    problem = make_problem(24, rank=rank, seed=150, all_masked=masked)
+    problem = make_problem(24, rank=rank, seed=150, hidden=hidden, all_masked=masked)
     out = _check(layer, problem, weights, "fully masked")
     if masked:
         assert torch.equal(out.float(), torch.zeros_like(out.float()))
 
 
 def test_repeated_forwards_are_bitwise_identical(ep_layer) -> None:
-    rank, world_size, layer, weights = ep_layer
-    problem = make_problem(50, rank=rank, seed=160)
+    rank, world_size, layer, weights, hidden = ep_layer
+    problem = make_problem(50, rank=rank, seed=160, hidden=hidden)
     first = _forward(layer, problem).clone()
-    other = make_problem(31, rank=rank, seed=161)
+    other = make_problem(31, rank=rank, seed=161, hidden=hidden)
     _forward(layer, other)
     again = _forward(layer, problem)
     assert torch.equal(first.view(torch.int16), again.view(torch.int16))
@@ -354,18 +393,45 @@ def test_repeated_forwards_are_bitwise_identical(ep_layer) -> None:
 def test_stale_rows_beyond_the_live_count_are_ignored(ep_layer) -> None:
     """After a full-capacity forward, a shorter forward must not read stale rows."""
 
-    rank, world_size, layer, weights = ep_layer
-    _forward(layer, make_problem(CAPACITY, rank=rank, seed=170))
+    rank, world_size, layer, weights, hidden = ep_layer
+    _forward(layer, make_problem(CAPACITY, rank=rank, seed=170, hidden=hidden))
     _check(
-        layer, make_problem(CAPACITY - 3, rank=rank, seed=171), weights, "stale rows"
+        layer,
+        make_problem(CAPACITY - 3, rank=rank, seed=171, hidden=hidden),
+        weights,
+        "stale rows",
     )
 
 
+def test_world1_rows_past_the_scan_bound_match_the_reference(ep_layer) -> None:
+    """An EP world 1 rank with more than 512 tokens (4096 routing ids at top-8) is
+    past the kernel's redundant id scan: that forward exchanges the histogram, on
+    a layer whose capacity holds the rows."""
+
+    import torch.distributed as dist
+
+    rank, world_size, _, weights, hidden = ep_layer
+    if world_size != 1:
+        pytest.skip("the id-scan bound is an EP world 1 path")
+    layer = make_layer(rank, world_size, weights, hidden=hidden, capacity=WIDE_CAPACITY)
+    try:
+        layer.warmup(make_problem(16, rank=rank, seed=1, hidden=hidden).tensors())
+        _check(
+            layer,
+            make_problem(WIDE_TOKENS, rank=rank, seed=220, hidden=hidden),
+            weights,
+            f"{WIDE_TOKENS} rows at world 1",
+        )
+    finally:
+        layer.destroy()
+        dist.barrier()
+
+
 def test_output_view_is_the_workspace_output(ep_layer) -> None:
-    rank, world_size, layer, weights = ep_layer
+    rank, world_size, layer, weights, hidden = ep_layer
     if not layer.supports_output_view:
         pytest.skip("backend without output views")
-    problem = make_problem(20, rank=rank, seed=180)
+    problem = make_problem(20, rank=rank, seed=180, hidden=hidden)
     view = layer.forward(problem.tensors(), return_workspace_view=True)
     torch.cuda.synchronize()
     assert view.data_ptr() == layer.output_buffer.data_ptr()
@@ -375,18 +441,18 @@ def test_output_view_is_the_workspace_output(ep_layer) -> None:
 
 
 def test_compile_bucket_bounds_the_rows(ep_layer) -> None:
-    rank, world_size, layer, weights = ep_layer
-    problem = make_problem(21, rank=rank, seed=190)
+    rank, world_size, layer, weights, hidden = ep_layer
+    problem = make_problem(21, rank=rank, seed=190, hidden=hidden)
     layer.stage_inputs(problem.tensors(), compile_tokens_per_rank=64)
     out = layer.compute_staged(output=None)
     torch.cuda.synchronize()
-    assert tuple(out.shape) == (21, HIDDEN)
+    assert tuple(out.shape) == (21, hidden)
     check_band(out.clone(), reference(problem, weights), "bucket 64 vs w4a16_reference")
 
 
 def test_cuda_graph_replays_without_host_state(ep_layer) -> None:
-    rank, world_size, layer, weights = ep_layer
-    problem = make_problem(40, rank=rank, seed=200)
+    rank, world_size, layer, weights, hidden = ep_layer
+    problem = make_problem(40, rank=rank, seed=200, hidden=hidden)
     tensors = problem.tensors()
     # Warm the bound and the launch plan eagerly, then capture one forward.
     eager = layer(tensors).clone()
@@ -399,7 +465,7 @@ def test_cuda_graph_replays_without_host_state(ep_layer) -> None:
     torch.cuda.synchronize()
     assert torch.equal(captured.view(torch.int16), eager.view(torch.int16))
     # New inputs in place: the replay computes them (no host-side state).
-    fresh = make_problem(40, rank=rank, seed=201)
+    fresh = make_problem(40, rank=rank, seed=201, hidden=hidden)
     problem.hidden_states.copy_(fresh.hidden_states)
     problem.topk_ids.copy_(fresh.topk_ids)
     problem.topk_weights.copy_(fresh.topk_weights)
@@ -419,13 +485,15 @@ def test_pinned_cells_match_the_reference(ep_layer) -> None:
 
     from flashinfer.moe_ep.backends.mega.kernel.sm103.bf16_nvfp4_bf16_cake import CELLS
 
-    rank, world_size, layer, weights = ep_layer
-    problem = make_problem(32, rank=rank, seed=210)
+    rank, world_size, layer, weights, hidden = ep_layer
+    problem = make_problem(32, rank=rank, seed=210, hidden=hidden)
     expected = reference(problem, weights)
     for cell in CELLS:
-        pinned = make_layer(rank, world_size, weights, knobs=cell.as_knobs())
+        pinned = make_layer(
+            rank, world_size, weights, hidden=hidden, knobs=cell.as_knobs()
+        )
         try:
-            pinned.warmup(make_problem(8, rank=rank, seed=2).tensors())
+            pinned.warmup(make_problem(8, rank=rank, seed=2, hidden=hidden).tensors())
             out = _forward(pinned, problem)
             check_band(out, expected, f"cell {cell.suffix}")
         finally:
