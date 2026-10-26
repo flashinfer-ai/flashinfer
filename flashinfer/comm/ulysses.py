@@ -347,6 +347,8 @@ class UlyssesCommunicator:
         ``"auto"`` | ``"nvlink"`` | ``"pcie"`` | ``"nccl"`` (see above).
     nvlink_kernel : str
         ``"auto"`` | ``"cake"`` | ``"portable"``; relevant when NVLink is used.
+        ``"portable"`` names the in-tree CUDA kernel's architecture coverage,
+        not a slow path: it uses the optimized vector mover when eligible.
     device : torch.device or str or int, optional
         CUDA device of this rank; normalized to an explicit index (bare
         ``"cuda"`` means the current device, an int is a CUDA ordinal).
@@ -399,7 +401,8 @@ class UlyssesCommunicator:
         nvlink_kernel : str, default = "auto"
             ``"auto"`` uses Cake when an export exists, otherwise portable.
             ``"portable"`` forces the portable NVLink kernel; ``"cake"``
-            requires a Cake export. All ranks must select the same value.
+            requires a Cake export. Portable includes the optimized vector
+            mover when eligible. All ranks must select the same value.
         device : Optional[Union[torch.device, str, int]], optional
             CUDA device bound to this rank. ``None`` uses the current CUDA
             device. Strings and integers are normalized to an explicit CUDA
