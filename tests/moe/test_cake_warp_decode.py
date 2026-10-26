@@ -1139,8 +1139,10 @@ _GPU_GEOMETRIES = (
         3072,
         128,
         4,
-        # T4: first packed row. T5: sm100 FC1 5312a738 and FC2 8acc0c77; sm103 FC2 8acc0c77.
-        (1, 3, 4, 5, 32),
+        # T4: first sm100 packed row. T5: sm100 FC1 5312a738 and FC2 8acc0c77.
+        # sm103: fused route-pack FC1 dec95a54 (T1..T15) or 89860cc8 (T16..T32),
+        # then FC2 372605d6.
+        (1, 3, 4, 5, 15, 16, 32),
         SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
     ),
     _GpuGeometry(

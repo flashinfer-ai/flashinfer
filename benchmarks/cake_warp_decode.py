@@ -146,7 +146,7 @@ GEOMETRIES = (
         3072,
         128,
         4,
-        (1, 3, 4, 32),
+        (1, 3, 4, 15, 16, 32),
         SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
     ),
     Geometry(
