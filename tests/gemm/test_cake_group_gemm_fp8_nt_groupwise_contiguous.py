@@ -27,15 +27,36 @@ from flashinfer.gemm.cake_grouped_fp8_gemm import (
     BS_SWAP_ROUTES,
     BS_SWAP_RUN32_ROUTE,
     BS_SWAP_S16_ROUTE,
+    DEEPK_C2_AB6_SCALE1_DIRECT_STORE_ROUTE,
+    DEEPK_C2_AB6_SCALE1_ROUTE,
+    DEEPK_C2_KG1_DIRECT_STORE_ROUTE,
+    DEEPK_C2_KG1_EXPERT_ALIGNED_ROUTE,
+    DEEPK_C2_KG1_ROUTE,
+    DEEPK_C2_ROUTE,
+    DEEPK_C2_SCALAR_OUTPUT_ROUTE,
+    DEEPK_CG2_AB7_BSCALE_PREFETCH_ROUTE,
     DEEPK_CG2_FOUR_LOAD_GRID128_ROUTE,
+    DEEPK_CG2_FOUR_LOAD_ROUTE,
     DEEPK_CG2_RECURRENCE_ROUTE,
+    DEEPK_N256_ROUTE,
+    EXPERT_ALIGNED_MAX_GROUPS,
+    K128_ROUTE,
+    K384_ROUTE,
+    _launch_plan,
+    _route,
+    _tile_starts,
+    _validate_indices,
     bs_route_for_shape,
     bs_store16,
     bs_swap_route_for_shape,
+    device_sm_count,
     is_group_gemm_fp8_nt_groupwise_contiguous_prepared_available,
     launch_plan,
+    route_for_shape,
+    route_geometry,
 )
 from flashinfer.jit.gemm.cake_grouped_fp8_gemm import (
+    PROGRAMS,
     ROUTES,
     SUPPORTED_COMPUTE_CAPABILITIES,
     device_arch,
@@ -571,6 +592,249 @@ def test_launch_rebinds_per_call_operands():
         )
 
 
+# --- validated layout: the expert-aligned route (a speed choice only) ---------
+
+
+def _expert_aligned_registered(device):
+    arch = SUPPORTED_COMPUTE_CAPABILITIES[torch.cuda.get_device_capability(device)]
+    program = ROUTES.get(DEEPK_C2_KG1_EXPERT_ALIGNED_ROUTE)
+    return program is not None and arch in PROGRAMS[program]["arches"]
+
+
+def _layout(group_counts, tile_m):
+    """Host reference of the validated layout: (expert runs starting at a row that
+    is not a multiple of ``tile_m``, expert runs starting after row 0, 128-row
+    tiles when no tile spans two experts, the largest offset of such an inner
+    start within its tile)."""
+    m = sum(group_counts)
+    starts, row = set(), 0
+    for count in group_counts[:-1]:
+        row += count
+        if 0 < row < m:
+            starts.add(row)
+    offsets = [row % tile_m for row in starts if row % tile_m]
+    tiles = sum((count + 127) // 128 for count in group_counts)
+    return len(offsets), len(starts), tiles, max(offsets, default=0)
+
+
+def _aligned(group_counts, tile_m=256):
+    """Host reference of the validated alignment: every non-empty expert starts
+    on a multiple of ``tile_m`` rows."""
+    row = 0
+    for count in group_counts:
+        if count and row % tile_m:
+            return False
+        row += count
+    return True
+
+
+def _tile_starts_ref(group_counts):
+    """Host reference of the per-tile expert starts: for 128- and 256-row M tiles,
+    how many non-empty experts start inside each tile, off its first row."""
+    m = sum(group_counts)
+    out = {}
+    for tile_m in (128, 256):
+        per_tile, row = [0] * -(-m // tile_m), 0
+        for count in group_counts:
+            if count and row % tile_m:
+                per_tile[row // tile_m] += 1
+            row += count
+        out[tile_m] = tuple(per_tile)
+    return out
+
+
+def _validated_plan(group_counts, n, k, sm_count):
+    """The shape route's plan once the layout alignment is known (no expert-aligned
+    program)."""
+    return _launch_plan(
+        sum(group_counts),
+        n,
+        k,
+        sm_count=sm_count,
+        scalar_output=False,
+        block_scaled=False,
+        alignment=128,
+        num_groups=len(group_counts),
+        arch=None,
+        aligned=_aligned(group_counts),
+        tile_starts=_tile_starts_ref(group_counts),
+    )
+
+
+LAYOUT_CASES = [
+    [128, 256, 128, 256],
+    [64, 1],
+    [0, 128, 1],
+    [129],
+    [1],
+    [0] * 16 + [1],
+    [128, 0, 0, 256, 1, 0],
+    [200, 56, 128],
+    [256, 256, 128, 384],
+    *(_random_token_counts(random.Random(seed), 3001, 12) for seed in range(4)),
+]
+
+
+@pytest.mark.parametrize("group_counts", LAYOUT_CASES)
+@pytest.mark.parametrize("tile_m", [128, 256])
+def test_validated_layout_counts_runs_and_tiles(group_counts, tile_m):
+    device = torch.device("cuda")
+    counts = torch.tensor(group_counts, dtype=torch.int64, device=device)
+    m_indices = torch.repeat_interleave(
+        torch.arange(len(group_counts), dtype=torch.int32, device=device), counts
+    ).contiguous()
+    assert _validate_indices(m_indices, len(group_counts)) == (None, None)
+    layout, aligned = _validate_indices(
+        m_indices, len(group_counts), layout_tile_m=tile_m
+    )
+    assert layout == _layout(group_counts, tile_m) and aligned is None
+    assert _validate_indices(
+        m_indices, len(group_counts), layout_tile_m=tile_m, read_alignment=True
+    ) == (layout, _aligned(group_counts))
+    assert _tile_starts(m_indices) == _tile_starts_ref(group_counts)
+
+
+ROUTING_CASES = [
+    pytest.param([128, 256, 128, 256], 256, 128, id="aligned_k128"),
+    pytest.param([64, 1], 128, 128, id="unaligned_k128"),
+    pytest.param([256] * 16, 2048, 4096, id="aligned_cg2"),
+    pytest.param([257] + [256] * 14 + [255], 2048, 4096, id="unaligned_cg2"),
+    pytest.param([256] * 7 + [257, 255] + [256] * 7, 2048, 4096, id="one_inner_cg2"),
+    pytest.param([384, 128] * 8, 2048, 4096, id="aligned128_cg2"),
+    pytest.param([129, 255, 128, 256], 256, 128, id="one_inner_of_three_k128"),
+    pytest.param([200, 56, 128], 256, 1024, id="unaligned_ab6"),
+    pytest.param([128, 127], 256, 1152, id="aligned_kg1"),
+    pytest.param([60, 73, 711, 292, 620, 138, 1107], 512, 640, id="unaligned_kg1"),
+    pytest.param([129, 128, 128, 128], 256, 128, id="one_row_in_k128"),
+    pytest.param([192, 320] * 8, 2048, 4096, id="half_inner_cg2"),
+    pytest.param(
+        _random_token_counts(random.Random(4790), 4096, 16), 2048, 4096, id="random_cg2"
+    ),
+    pytest.param([100, 100, 100, 212], 1024, 512, id="inner_k512"),
+]
+
+
+@pytest.mark.parametrize("group_counts,n,k", ROUTING_CASES)
+def test_validated_layout_selects_the_expert_aligned_route(group_counts, n, k):
+    """Without ``validate_indices`` the route is the shape rule's; with it, a layout in
+    which at least 90% of the expert runs start inside a tile of that route, one of them
+    at least half a tile in, selects the expert-aligned program (when one is
+    registered); every other layout keeps the shape rule's route and grid for its
+    256-row alignment."""
+    device = torch.device("cuda")
+    a, b, a_scale, b_scale, m_indices = _make_inputs(
+        group_counts, n, k, seed=4750 + len(group_counts) + n + k, device=device
+    )
+    m = sum(group_counts)
+    sm_count = device_sm_count(torch.cuda.current_device())
+    shape_plan = launch_plan(m, n, k, sm_count=sm_count, scalar_output=False)
+    plain = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+        a, b, a_scale, b_scale, m_indices
+    )
+    assert (plain.route, plain.grid) == shape_plan
+    validated = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+        a, b, a_scale, b_scale, m_indices, validate_indices=True
+    )
+    tile_m = route_geometry(route_for_shape(m, n, k))[0]
+    inner, starts, tiles, max_offset = _layout(group_counts, tile_m)
+    preferred = inner and 10 * inner >= 9 * starts and 2 * max_offset >= tile_m
+    if preferred and _expert_aligned_registered(device):
+        assert validated.route == DEEPK_C2_KG1_EXPERT_ALIGNED_ROUTE
+        assert validated.grid == (min(tiles * (n // 128), sm_count), 1, 1)
+    else:
+        assert (validated.route, validated.grid) == _validated_plan(
+            group_counts, n, k, sm_count
+        )
+    out = validated.launch()
+    torch.cuda.synchronize()
+    assert torch.equal(out, plain.launch())
+    _assert_close(out, _reference(a, b, a_scale, b_scale, m_indices))
+
+
+def test_validated_layout_keeps_the_shape_route_outside_the_program_contract():
+    """More experts than the expert-aligned program holds, padding rows and a
+    scalar-store output keep the shape rule's route."""
+    device = torch.device("cuda")
+    groups = EXPERT_ALIGNED_MAX_GROUPS + 1
+    a, b, a_scale, b_scale, m_indices = _make_inputs(
+        [1] * groups, 128, 512, seed=4760, device=device
+    )
+    sm_count = device_sm_count(torch.cuda.current_device())
+    prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+        a, b, a_scale, b_scale, m_indices, validate_indices=True
+    )
+    assert (prepared.route, prepared.grid) == launch_plan(
+        groups, 128, 512, sm_count=sm_count, scalar_output=False
+    )
+    a, b, a_scale, b_scale, m_indices = _make_inputs(
+        [64, 1], 128, 512, seed=4761, device=device
+    )
+    padded = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+        a, b, a_scale, b_scale, m_indices, validate_indices=True, fill_padding=True
+    )
+    assert padded.route == route_for_shape(65, 128, 512)
+    storage = torch.empty(65 * 128 + 8, dtype=torch.bfloat16, device=device)
+    scalar = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        m_indices,
+        storage[1 : 1 + 65 * 128].view(65, 128),
+        validate_indices=True,
+    )
+    assert scalar.route == DEEPK_C2_SCALAR_OUTPUT_ROUTE
+
+
+@pytest.mark.parametrize("k", [128, 1024])
+def test_route_choice_keeps_results_when_indices_change(k):
+    """The route chosen from the prepared layout is a speed choice: rebinding
+    ``m_indices`` to another layout, or rewriting it before a graph replay, gives
+    the bits of a launch prepared for the new layout."""
+    device = torch.device("cuda")
+    aligned, unaligned = [128, 256, 0, 128], [200, 120, 72, 120]
+    a, b, a_scale, b_scale, idx_aligned = _make_inputs(
+        aligned, 256, k, seed=4770 + k, device=device, arbitrary_scales=True
+    )
+    idx_unaligned = torch.repeat_interleave(
+        torch.arange(4, dtype=torch.int32, device=device),
+        torch.tensor(unaligned, dtype=torch.int64, device=device),
+    ).contiguous()
+    # Expected bits: the shape rule's route, prepared without the layout read.
+    expect_aligned = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+        a, b, a_scale, b_scale, idx_aligned
+    ).launch()
+    expect_unaligned = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+        a, b, a_scale, b_scale, idx_unaligned
+    ).launch()
+    torch.cuda.synchronize()
+    _assert_close(expect_unaligned, _reference(a, b, a_scale, b_scale, idx_unaligned))
+    for prepared_layout, other, expect_other, expect_own in (
+        (idx_aligned, idx_unaligned, expect_unaligned, expect_aligned),
+        (idx_unaligned, idx_aligned, expect_aligned, expect_unaligned),
+    ):
+        prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+            a, b, a_scale, b_scale, prepared_layout.clone(), validate_indices=True
+        )
+        out = torch.empty_like(expect_own)
+        prepared.launch(m_indices=other, out=out)
+        torch.cuda.synchronize()
+        assert torch.equal(out, expect_other), prepared.route
+        indices = prepared_layout.clone()
+        replay_out = torch.empty_like(expect_own)
+        prepared.launch(m_indices=indices, out=replay_out)  # warm up outside capture
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            prepared.launch(m_indices=indices, out=replay_out)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(replay_out, expect_own), prepared.route
+        indices.copy_(other)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(replay_out, expect_other), prepared.route
+
+
 def test_fill_padding_accepts_compact_layout():
     """-1 padding rows (compact MoE layout) are forward-filled onto the preceding expert."""
     device = torch.device("cuda")
@@ -1103,6 +1367,232 @@ def test_launch_plan_below_128_ctas_uses_a_registered_route():
         assert grid == ((sm_count // 2) * 2, 1, 1)
         assert route == DEEPK_CG2_RECURRENCE_ROUTE
         assert route in ROUTES
+
+
+def test_route_rule_reads_the_layout_alignment():
+    aligned = [256] * 16
+    unaligned = [255, 257] + [256] * 14
+    assert _aligned(aligned) and _aligned([256, 0, 512, 0, 255])
+    assert not _aligned(unaligned) and not _aligned([0, 128, 128])
+    # Selected shapes: a layout unknown or aligned to the 256-row tiles keeps the two-CTA routes.
+    for known in (None, True):
+        assert (
+            _route(4096, 2048, 4096, aligned=known)
+            == DEEPK_CG2_AB7_BSCALE_PREFETCH_ROUTE
+        )
+        assert _route(4096, 4096, 1024, aligned=known) == DEEPK_CG2_FOUR_LOAD_ROUTE
+    assert route_for_shape(16384, 2048, 4096) == DEEPK_CG2_AB7_BSCALE_PREFETCH_ROUTE
+    assert route_for_shape(16384, 4096, 1024) == DEEPK_CG2_RECURRENCE_ROUTE
+    # A known unaligned layout without its per-tile starts runs a single-CTA route on all SMs.
+    assert _route(4096, 2048, 4096, aligned=False) == DEEPK_C2_AB6_SCALE1_ROUTE
+    assert _route(4096, 4096, 1024, aligned=False) == DEEPK_N256_ROUTE
+    plan = _launch_plan(
+        4096,
+        2048,
+        4096,
+        sm_count=148,
+        scalar_output=False,
+        block_scaled=False,
+        alignment=128,
+        num_groups=16,
+        arch=None,
+        aligned=False,
+    )
+    assert plan == (DEEPK_C2_AB6_SCALE1_ROUTE, (148, 1, 1))
+    # The block-scaled family keeps its plan, including the 128-CTA cap of the selected shapes.
+    route, grid = launch_plan(
+        4096, 4096, 1024, sm_count=148, scalar_output=False, block_scaled=True
+    )
+    assert route in BS_ROUTES and grid[0] <= 128
+    # An aligned layout one row off the selected M keeps the two-CTA route.
+    assert _route(4095, 2048, 4096, aligned=True) == DEEPK_CG2_AB7_BSCALE_PREFETCH_ROUTE
+    assert _route(16385, 4096, 1024, aligned=True) == DEEPK_CG2_RECURRENCE_ROUTE
+    assert route_for_shape(4095, 2048, 4096) == DEEPK_C2_AB6_SCALE1_ROUTE
+    # K=128 keeps its static-K route; K=384 runs the K-loop route for at most
+    # four 128x128 tiles.
+    assert _route(1, 128, 128, sm_count=148) == K128_ROUTE
+    assert _route(131072, 4096, 128, sm_count=152) == K128_ROUTE
+    assert _route(64, 256, 384, sm_count=148) == DEEPK_C2_KG1_ROUTE
+    assert _route(256, 256, 384, sm_count=152) == DEEPK_C2_KG1_ROUTE
+    assert _route(256, 384, 384, sm_count=148) == K384_ROUTE
+    assert _route(1234, 384, 384, sm_count=148) == K384_ROUTE
+    assert _route(16384, 4096, 384, sm_count=148) == K384_ROUTE
+    assert route_for_shape(64, 256, 384) == K384_ROUTE
+    assert route_for_shape(128, 128, 512) == DEEPK_C2_AB6_SCALE1_ROUTE
+    assert route_for_shape(256, 384, 1280) == DEEPK_C2_KG1_ROUTE
+    # K=512 keeps the K-multiple-of-512 route from two 128x128 tiles on, except at
+    # N=256 or M=4096, with or without the SM count.
+    for sm_count in (None, 148, 152):
+        assert _route(64, 1536, 512, sm_count=sm_count) == DEEPK_C2_ROUTE
+        assert _route(1024, 1024, 512, sm_count=sm_count) == DEEPK_C2_ROUTE
+        assert _route(128, 256, 512, sm_count=sm_count) == DEEPK_C2_AB6_SCALE1_ROUTE
+        assert _route(129, 256, 512, sm_count=sm_count) == DEEPK_C2_AB6_SCALE1_ROUTE
+        assert _route(4096, 1024, 512, sm_count=sm_count) == DEEPK_C2_AB6_SCALE1_ROUTE
+    assert route_for_shape(129, 128, 512) == DEEPK_C2_ROUTE
+    assert route_for_shape(1024, 1024, 1024) == DEEPK_C2_AB6_SCALE1_ROUTE
+
+
+UNALIGNED_CG2_CASES = [
+    # A start off both tile heights adds a segment to both routes: the two-CTA route stays.
+    pytest.param(
+        16384, 4096, 1024, [64, 16320], DEEPK_CG2_RECURRENCE_ROUTE, id="pair_kept"
+    ),
+    # The pair route stays when the single-CTA route saves its busiest worker only one
+    # segment (14 against 15), and leaves at two (14 against 16).
+    pytest.param(
+        16384,
+        4096,
+        1024,
+        [128, 16256],
+        DEEPK_CG2_RECURRENCE_ROUTE,
+        id="pair_kept_one_fewer",
+    ),
+    pytest.param(
+        16384, 4096, 1024, [128, 960, 15296], DEEPK_N256_ROUTE, id="pair_to_n256"
+    ),
+    pytest.param(
+        4096, 4096, 1024, [64, 4032], DEEPK_CG2_FOUR_LOAD_ROUTE, id="four_kept"
+    ),
+    pytest.param(
+        4096, 2048, 4096, [64, 4032], DEEPK_CG2_AB7_BSCALE_PREFETCH_ROUTE, id="ab7_kept"
+    ),
+    # A start on a 128-row boundary only burdens the 256-row tiles: the single-CTA route.
+    pytest.param(4096, 4096, 1024, [128, 3968], DEEPK_N256_ROUTE, id="four_to_n256"),
+    pytest.param(
+        4096, 2048, 4096, [128, 3968], DEEPK_C2_AB6_SCALE1_ROUTE, id="ab7_to_ab6"
+    ),
+]
+
+
+@pytest.mark.parametrize("m,n,k,group_counts,expected", UNALIGNED_CG2_CASES)
+@pytest.mark.parametrize("sm_count", [148, 152])
+def test_unaligned_layout_keeps_the_two_cta_route_unless_one_cta_is_shorter(
+    m, n, k, group_counts, expected, sm_count
+):
+    """At a shape whose shape route is two-CTA, a known unaligned layout takes the
+    single-CTA route only when its busiest worker runs fewer expert segments (at
+    least two fewer for the pair route; at N=2048, K=4096: at most 1.5 times as
+    many)."""
+    assert sum(group_counts) == m and not _aligned(group_counts)
+    route = _route(
+        m,
+        n,
+        k,
+        sm_count=sm_count,
+        aligned=False,
+        tile_starts=_tile_starts_ref(group_counts),
+    )
+    assert route == expected
+
+
+def test_unaligned_layout_rule_reads_the_sm_count():
+    """The same layout can keep the two-CTA route on 148 SMs and leave it on 152."""
+    group_counts = [257] + [256] * 14 + [255]
+    starts = _tile_starts_ref(group_counts)
+    plans = {
+        sm_count: _route(
+            4096, 2048, 4096, sm_count=sm_count, aligned=False, tile_starts=starts
+        )
+        for sm_count in (148, 152)
+    }
+    assert plans == {
+        148: DEEPK_CG2_AB7_BSCALE_PREFETCH_ROUTE,
+        152: DEEPK_C2_AB6_SCALE1_ROUTE,
+    }
+
+
+def test_routing_aware_routes_are_bitwise_equal():
+    """The layout selects among programs with one accumulation order: identical output bits."""
+    device = torch.device("cuda")
+    rng = random.Random(4796)
+    group_counts = _random_token_counts(rng, 4096, 16)
+    assert not _aligned(group_counts)
+    a, b, a_scale, b_scale, m_indices = _make_inputs(
+        group_counts, 4096, 1024, seed=4796, device=device, arbitrary_scales=True
+    )
+    unknown = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+        a, b, a_scale, b_scale, m_indices
+    )
+    validated = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+        a, b, a_scale, b_scale, m_indices, validate_indices=True
+    )
+    if torch.cuda.get_device_properties(device).multi_processor_count >= 128:
+        assert unknown.route == DEEPK_CG2_FOUR_LOAD_GRID128_ROUTE
+    assert validated.route in (
+        DEEPK_N256_ROUTE,
+        DEEPK_C2_KG1_EXPERT_ALIGNED_ROUTE,
+        unknown.route,
+    )
+    outs = [p.launch() for p in (unknown, validated)]
+    torch.cuda.synchronize()
+    _assert_close(outs[1], _reference(a, b, a_scale, b_scale, m_indices))
+    assert torch.equal(outs[0].view(torch.int16), outs[1].view(torch.int16))
+
+
+def test_direct_store_route_only_when_every_tile_is_small():
+    # At most 32 rows on at most 16 CTAs: the direct-store program of the KG1 / AB6 route.
+    for (m, n, k), plan in (
+        ((1, 128, 256), (DEEPK_C2_KG1_DIRECT_STORE_ROUTE, (1, 1, 1))),
+        ((32, 256, 384), (DEEPK_C2_KG1_DIRECT_STORE_ROUTE, (2, 1, 1))),
+        ((32, 2048, 640), (DEEPK_C2_KG1_DIRECT_STORE_ROUTE, (16, 1, 1))),
+        ((1, 128, 512), (DEEPK_C2_AB6_SCALE1_DIRECT_STORE_ROUTE, (1, 1, 1))),
+        ((32, 2048, 4096), (DEEPK_C2_AB6_SCALE1_DIRECT_STORE_ROUTE, (16, 1, 1))),
+    ):
+        assert launch_plan(m, n, k, sm_count=148, scalar_output=False) == plan
+        assert plan[0] in ROUTES
+    # A full tile, more than 16 CTAs or another route keeps the route's program.
+    for (m, n, k), plan in (
+        ((33, 128, 256), (DEEPK_C2_KG1_ROUTE, (1, 1, 1))),
+        ((64, 256, 384), (DEEPK_C2_KG1_ROUTE, (2, 1, 1))),
+        ((32, 2176, 640), (DEEPK_C2_KG1_ROUTE, (17, 1, 1))),
+        ((129, 256, 512), (DEEPK_C2_AB6_SCALE1_ROUTE, (4, 1, 1))),
+        ((32, 4096, 512), (DEEPK_C2_ROUTE, (32, 1, 1))),
+        ((32, 128, 128), (K128_ROUTE, (1, 1, 1))),
+    ):
+        assert launch_plan(m, n, k, sm_count=148, scalar_output=False) == plan
+    assert launch_plan(32, 128, 256, sm_count=148, scalar_output=True) == (
+        DEEPK_C2_SCALAR_OUTPUT_ROUTE,
+        (1, 1, 1),
+    )
+
+
+@pytest.mark.parametrize(
+    "group_counts,n,k",
+    [
+        pytest.param([1], 256, 640, id="kg1_m1"),
+        pytest.param([5, 0, 27], 2048, 640, id="kg1_m32_three_experts"),
+        pytest.param([16], 256, 512, id="ab6_m16"),
+        pytest.param([3, 29], 256, 4096, id="ab6_m32_two_experts"),
+    ],
+)
+def test_direct_store_programs_match_the_route_programs(group_counts, n, k):
+    """A launch of at most 32 rows runs the direct-store program; its output equals
+    the same rows of a 33-row launch, which runs the route's TMA-store program."""
+    device = torch.device("cuda")
+    m = sum(group_counts)
+    longer = [*group_counts[:-1], group_counts[-1] + 33 - m]
+    a, b, a_scale, b_scale, m_indices = _make_inputs(
+        longer, n, k, seed=4800 + m + n + k, device=device, arbitrary_scales=True
+    )
+    short = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+        a[:m], b, a_scale[:m], b_scale, m_indices[:m]
+    )
+    full = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+        a, b, a_scale, b_scale, m_indices
+    )
+    assert full.route in (DEEPK_C2_KG1_ROUTE, DEEPK_C2_AB6_SCALE1_ROUTE)
+    assert (
+        short.route
+        == {
+            DEEPK_C2_KG1_ROUTE: DEEPK_C2_KG1_DIRECT_STORE_ROUTE,
+            DEEPK_C2_AB6_SCALE1_ROUTE: DEEPK_C2_AB6_SCALE1_DIRECT_STORE_ROUTE,
+        }[full.route]
+    )
+    out = short.launch()
+    expect = full.launch()
+    torch.cuda.synchronize()
+    assert torch.equal(out, expect[:m])
+    _assert_close(out, _reference(a[:m], b, a_scale[:m], b_scale, m_indices[:m]))
 
 
 def test_rejects_invalid_inputs():
