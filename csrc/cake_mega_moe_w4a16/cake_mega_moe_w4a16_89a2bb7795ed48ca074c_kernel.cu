@@ -785,26 +785,39 @@ kernel_cake_mega_moe_w4a16_89a2bb7795ed48ca074c(__nv_bfloat16* __restrict__ hidd
                         expert = ident - rank * E_local;
                     }
                 }
-                unsigned int pending = __ballot_sync(0xFFFFFFFF, local != 0);
+                int key = ((local != 0) ? expert : -1);
+                unsigned int live = __ballot_sync(0xFFFFFFFF, local != 0);
+                int _count_leading_zeros_7 = __clz(live);
+                int trips = 32 - _count_leading_zeros_7;
+                unsigned int peers = 0;
                 #pragma unroll 1
-                for (int _round = 0; _round < 32; _round++) {
-                    if (pending != 0) {
-                        int _find_first_set_7 = __ffs(pending);
-                        int leader = (int)_find_first_set_7 - 1;
-                        int e_lead = __shfl_sync(0xFFFFFFFF, expert, leader);
-                        unsigned int group = __ballot_sync(0xFFFFFFFF, local != 0 && expert == e_lead);
-                        if (lane == leader) {
-                            unsigned int count_addr = hist_s_addr + (unsigned int)((fw * 256 + e_lead) * 4);
-                            int counted = hist_s[fw * 256 + e_lead];
-                            {
-                                uint32_t _ival_8 = static_cast<uint32_t>(counted + (int)(unsigned int)__popc(group));
-                                uint32_t _addr_8 = static_cast<uint32_t>(count_addr);
-                                asm volatile("st.shared.u32 [%0], %1;" :: "r"(_addr_8), "r"(_ival_8) : "memory");
-                            }
-                        }
-                        pending = pending & (group ^ 4294967295u);
+                for (int lane0 = 0; lane0 < trips; lane0 += 4) {
+                    int held_0 = __shfl_sync(0xFFFFFFFF, key, lane0 + 0);
+                    unsigned int same_0 = ((held_0 == key) ? 1 : 0);
+                    peers = peers | same_0 << (unsigned int)(lane0 + 0);
+                    int held_1 = __shfl_sync(0xFFFFFFFF, key, lane0 + 1);
+                    unsigned int same_1 = ((held_1 == key) ? 1 : 0);
+                    peers = peers | same_1 << (unsigned int)(lane0 + 1);
+                    int held_2 = __shfl_sync(0xFFFFFFFF, key, lane0 + 2);
+                    unsigned int same_2 = ((held_2 == key) ? 1 : 0);
+                    peers = peers | same_2 << (unsigned int)(lane0 + 2);
+                    int held_3 = __shfl_sync(0xFFFFFFFF, key, lane0 + 3);
+                    unsigned int same_3 = ((held_3 == key) ? 1 : 0);
+                    peers = peers | same_3 << (unsigned int)(lane0 + 3);
+                }
+                unsigned int group = peers & live;
+                int members = (int)(unsigned int)__popc(group);
+                int lower = (int)(unsigned int)__popc(group & lane_lt);
+                if (local != 0 && lower == 0) {
+                    unsigned int count_addr = hist_s_addr + (unsigned int)((fw * 256 + expert) * 4);
+                    int counted = hist_s[fw * 256 + expert];
+                    {
+                        uint32_t _ival_8 = static_cast<uint32_t>(counted + members);
+                        uint32_t _addr_8 = static_cast<uint32_t>(count_addr);
+                        asm volatile("st.shared.u32 [%0], %1;" :: "r"(_addr_8), "r"(_ival_8) : "memory");
                     }
                 }
+                __syncwarp();
             }
             if (scan_all != 0) {
                 #pragma unroll 1
@@ -1218,31 +1231,44 @@ kernel_cake_mega_moe_w4a16_89a2bb7795ed48ca074c(__nv_bfloat16* __restrict__ hidd
                         expert_3 = ident_3 - rank * E_local;
                     }
                 }
-                unsigned int pending_1 = __ballot_sync(0xFFFFFFFF, local_3 != 0);
+                int key_1 = ((local_3 != 0) ? expert_3 : -1);
+                unsigned int live_1 = __ballot_sync(0xFFFFFFFF, local_3 != 0);
+                int _count_leading_zeros_31 = __clz(live_1);
+                int trips_1 = 32 - _count_leading_zeros_31;
+                unsigned int peers_1 = 0;
                 #pragma unroll 1
-                for (int _round_1 = 0; _round_1 < 32; _round_1++) {
-                    if (pending_1 != 0) {
-                        int _find_first_set_31 = __ffs(pending_1);
-                        int leader_1 = (int)_find_first_set_31 - 1;
-                        int e_lead_1 = __shfl_sync(0xFFFFFFFF, expert_3, leader_1);
-                        unsigned int group_1 = __ballot_sync(0xFFFFFFFF, local_3 != 0 && expert_3 == e_lead_1);
-                        int running_1 = hist_s[fw * 256 + e_lead_1];
-                        if (local_3 != 0 && expert_3 == e_lead_1) {
-                            int my_row = seg_s[e_lead_1] + cbase_s[e_lead_1] + wbase_s[fw * 256 + e_lead_1] + running_1 + (int)(unsigned int)__popc(group_1 & lane_lt);
-                            route_src[my_row] = g_3;
-                        }
-                        __syncwarp();
-                        if (lane == leader_1) {
-                            {
-                                uint32_t _ival_32 = static_cast<uint32_t>(running_1 + (int)(unsigned int)__popc(group_1));
-                                uint32_t _addr_32 = static_cast<uint32_t>(hist_s_addr + (unsigned int)((fw * 256 + e_lead_1) * 4));
-                                asm volatile("st.shared.u32 [%0], %1;" :: "r"(_addr_32), "r"(_ival_32) : "memory");
-                            }
-                        }
-                        __syncwarp();
-                        pending_1 = pending_1 & (group_1 ^ 4294967295u);
+                for (int lane0_1 = 0; lane0_1 < trips_1; lane0_1 += 4) {
+                    int held_0_1 = __shfl_sync(0xFFFFFFFF, key_1, lane0_1 + 0);
+                    unsigned int same_0_1 = ((held_0_1 == key_1) ? 1 : 0);
+                    peers_1 = peers_1 | same_0_1 << (unsigned int)(lane0_1 + 0);
+                    int held_1_1 = __shfl_sync(0xFFFFFFFF, key_1, lane0_1 + 1);
+                    unsigned int same_1_1 = ((held_1_1 == key_1) ? 1 : 0);
+                    peers_1 = peers_1 | same_1_1 << (unsigned int)(lane0_1 + 1);
+                    int held_2_1 = __shfl_sync(0xFFFFFFFF, key_1, lane0_1 + 2);
+                    unsigned int same_2_1 = ((held_2_1 == key_1) ? 1 : 0);
+                    peers_1 = peers_1 | same_2_1 << (unsigned int)(lane0_1 + 2);
+                    int held_3_1 = __shfl_sync(0xFFFFFFFF, key_1, lane0_1 + 3);
+                    unsigned int same_3_1 = ((held_3_1 == key_1) ? 1 : 0);
+                    peers_1 = peers_1 | same_3_1 << (unsigned int)(lane0_1 + 3);
+                }
+                unsigned int group_1 = peers_1 & live_1;
+                int members_1 = (int)(unsigned int)__popc(group_1);
+                int lower_1 = (int)(unsigned int)__popc(group_1 & lane_lt);
+                int running_1 = 0;
+                if (local_3 != 0) {
+                    running_1 = hist_s[fw * 256 + expert_3];
+                    int my_row = seg_s[expert_3] + cbase_s[expert_3] + wbase_s[fw * 256 + expert_3] + running_1 + lower_1;
+                    route_src[my_row] = g_3;
+                }
+                __syncwarp();
+                if (local_3 != 0 && lower_1 == 0) {
+                    {
+                        uint32_t _ival_32 = static_cast<uint32_t>(running_1 + members_1);
+                        uint32_t _addr_32 = static_cast<uint32_t>(hist_s_addr + (unsigned int)((fw * 256 + expert_3) * 4));
+                        asm volatile("st.shared.u32 [%0], %1;" :: "r"(_addr_32), "r"(_ival_32) : "memory");
                     }
                 }
+                __syncwarp();
             }
             asm volatile("barrier.sync 11, 192;" ::: "memory");
             if (warp == 0) {
@@ -1262,7 +1288,20 @@ kernel_cake_mega_moe_w4a16_89a2bb7795ed48ca074c(__nv_bfloat16* __restrict__ hidd
             asm volatile("barrier.sync 12, 512;" ::: "memory");
             int tiles_1 = tile_count[0];
             int fc1_items = tiles_1 * (fc1_m_tiles >> 1);
-            int end = fc1_items + tiles_1 * (fc2_m_tiles >> 1);
+            int wl_b = (int)cluster_id;
+            int wl_P = (int)num_clusters;
+            int wl_fc2 = tiles_1 * (fc2_m_tiles >> 1);
+            int wl_r = fc1_items % wl_P;
+            int wl_L = wl_P - wl_r;
+            int wl_delta = (H / 256 + I / 256 / 2) / (I / 256);
+            int wl_n1 = wl_delta * wl_L;
+            if (wl_n1 > wl_fc2) {
+                wl_n1 = wl_fc2;
+            }
+            int wl_c1 = (fc1_items - wl_b + wl_P - 1) / wl_P;
+            int wl_p1 = ((wl_b >= wl_r) ? (wl_n1 - (wl_b - wl_r) + wl_L - 1) / wl_L : 0);
+            int wl_p2 = (wl_fc2 - wl_n1 - wl_b + wl_P - 1) / wl_P;
+            int wl_items = wl_c1 + wl_p1 + wl_p2;
             const unsigned long long H64 = (unsigned long long)H;
             const int routes_per_rank = cap * 8;
             const int quarter = warp % 4;
@@ -1282,8 +1321,18 @@ kernel_cake_mega_moe_w4a16_89a2bb7795ed48ca074c(__nv_bfloat16* __restrict__ hidd
             unsigned int piece[8];
             unsigned int _phase_acc_full = 0;
             #pragma unroll 1
-            for (unsigned int w = cluster_id; w < end; w += num_clusters) {
+            for (int w = 0; w < wl_items; w++) {
                 int w_i = (int)w;
+                int wl_cb = (int)cluster_id;
+                int wl_cP = (int)num_clusters;
+                int wl_j = w_i - wl_c1;
+                if (wl_j < 0) {
+                    w_i = wl_cb + w_i * wl_cP;
+                } else if (wl_j < wl_p1) {
+                    w_i = fc1_items + wl_j * (wl_cP - wl_r) + (wl_cb - wl_r);
+                } else {
+                    w_i = fc1_items + wl_n1 + (wl_j - wl_p1) * wl_cP + wl_cb;
+                }
                 int is_fc1 = 0;
                 int local_4 = w_i - fc1_items;
                 if (w_i < fc1_items) {
@@ -1713,7 +1762,7 @@ kernel_cake_mega_moe_w4a16_89a2bb7795ed48ca074c(__nv_bfloat16* __restrict__ hidd
                 } else {
                     float alpha_e_1 = fc2_alpha[expert_4];
                     int col_m = m * 128;
-                    int live = tile_mn_limit[t_1] - row0;
+                    int live_2 = tile_mn_limit[t_1] - row0;
                     #pragma unroll
                     for (int sub_1 = 0; sub_1 < 8; sub_1++) {
                         unsigned int col_1 = acc_cur * 128 + (unsigned int)(sub_1 * 16);
@@ -1828,7 +1877,7 @@ kernel_cake_mega_moe_w4a16_89a2bb7795ed48ca074c(__nv_bfloat16* __restrict__ hidd
                         asm volatile("tcgen05.fence::before_thread_sync;");
                         asm volatile("barrier.sync 1, 128;" ::: "memory");
                         int sub_row = sub_1 * 16 + piece_row;
-                        if (sub_row < live) {
+                        if (sub_row < live_2) {
                             unsigned int piece_addr = base_1 + (unsigned int)(piece_row * 256 + piece_off);
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                 : "=r"(*reinterpret_cast<uint32_t*>(&piece[0])), "=r"(*reinterpret_cast<uint32_t*>(&piece[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&piece[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&piece[(0) + 3]))
@@ -1899,7 +1948,20 @@ kernel_cake_mega_moe_w4a16_89a2bb7795ed48ca074c(__nv_bfloat16* __restrict__ hidd
             asm volatile("barrier.sync 12, 512;" ::: "memory");
             int tiles_2 = tile_count[0];
             int fc1_items_1 = tiles_2 * (fc1_m_tiles >> 1);
-            int end_1 = fc1_items_1 + tiles_2 * (fc2_m_tiles >> 1);
+            int wl_b_1 = (int)cluster_id;
+            int wl_P_1 = (int)num_clusters;
+            int wl_fc2_1 = tiles_2 * (fc2_m_tiles >> 1);
+            int wl_r_1 = fc1_items_1 % wl_P_1;
+            int wl_L_1 = wl_P_1 - wl_r_1;
+            int wl_delta_1 = (H / 256 + I / 256 / 2) / (I / 256);
+            int wl_n1_1 = wl_delta_1 * wl_L_1;
+            if (wl_n1_1 > wl_fc2_1) {
+                wl_n1_1 = wl_fc2_1;
+            }
+            int wl_c1_1 = (fc1_items_1 - wl_b_1 + wl_P_1 - 1) / wl_P_1;
+            int wl_p1_1 = ((wl_b_1 >= wl_r_1) ? (wl_n1_1 - (wl_b_1 - wl_r_1) + wl_L_1 - 1) / wl_L_1 : 0);
+            int wl_p2_1 = (wl_fc2_1 - wl_n1_1 - wl_b_1 + wl_P_1 - 1) / wl_P_1;
+            int wl_items_1 = wl_c1_1 + wl_p1_1 + wl_p2_1;
             unsigned int a_cur = 0;
             unsigned int b_cur = 0;
             unsigned int acc_cur_1 = 0;
@@ -1909,8 +1971,18 @@ kernel_cake_mega_moe_w4a16_89a2bb7795ed48ca074c(__nv_bfloat16* __restrict__ hidd
             if (cta_rank == 0) {
                 if (elect_sync()) {
                     #pragma unroll 1
-                    for (unsigned int w_1 = cluster_id; w_1 < end_1; w_1 += num_clusters) {
+                    for (int w_1 = 0; w_1 < wl_items_1; w_1++) {
                         int w_i_1 = (int)w_1;
+                        int wl_cb_1 = (int)cluster_id;
+                        int wl_cP_1 = (int)num_clusters;
+                        int wl_j_1 = w_i_1 - wl_c1_1;
+                        if (wl_j_1 < 0) {
+                            w_i_1 = wl_cb_1 + w_i_1 * wl_cP_1;
+                        } else if (wl_j_1 < wl_p1_1) {
+                            w_i_1 = fc1_items_1 + wl_j_1 * (wl_cP_1 - wl_r_1) + (wl_cb_1 - wl_r_1);
+                        } else {
+                            w_i_1 = fc1_items_1 + wl_n1_1 + (wl_j_1 - wl_p1_1) * wl_cP_1 + wl_cb_1;
+                        }
                         int is_fc1_1 = 0;
                         int local_5 = w_i_1 - fc1_items_1;
                         if (w_i_1 < fc1_items_1) {
@@ -2174,26 +2246,39 @@ kernel_cake_mega_moe_w4a16_89a2bb7795ed48ca074c(__nv_bfloat16* __restrict__ hidd
                         expert_5 = ident_4 - rank_1 * E_local;
                     }
                 }
-                unsigned int pending_2 = __ballot_sync(0xFFFFFFFF, local_6 != 0);
+                int key_2 = ((local_6 != 0) ? expert_5 : -1);
+                unsigned int live_3 = __ballot_sync(0xFFFFFFFF, local_6 != 0);
+                int _count_leading_zeros_5 = __clz(live_3);
+                int trips_2 = 32 - _count_leading_zeros_5;
+                unsigned int peers_2 = 0;
                 #pragma unroll 1
-                for (int _round_2 = 0; _round_2 < 32; _round_2++) {
-                    if (pending_2 != 0) {
-                        int _find_first_set_5 = __ffs(pending_2);
-                        int leader_2 = (int)_find_first_set_5 - 1;
-                        int e_lead_2 = __shfl_sync(0xFFFFFFFF, expert_5, leader_2);
-                        unsigned int group_2 = __ballot_sync(0xFFFFFFFF, local_6 != 0 && expert_5 == e_lead_2);
-                        if (lane == leader_2) {
-                            unsigned int count_addr_1 = hist_s_addr + (unsigned int)((fw_1 * 256 + e_lead_2) * 4);
-                            int counted_1 = hist_s[fw_1 * 256 + e_lead_2];
-                            {
-                                uint32_t _ival_6 = static_cast<uint32_t>(counted_1 + (int)(unsigned int)__popc(group_2));
-                                uint32_t _addr_6 = static_cast<uint32_t>(count_addr_1);
-                                asm volatile("st.shared.u32 [%0], %1;" :: "r"(_addr_6), "r"(_ival_6) : "memory");
-                            }
-                        }
-                        pending_2 = pending_2 & (group_2 ^ 4294967295u);
+                for (int lane0_2 = 0; lane0_2 < trips_2; lane0_2 += 4) {
+                    int held_0_2 = __shfl_sync(0xFFFFFFFF, key_2, lane0_2 + 0);
+                    unsigned int same_0_2 = ((held_0_2 == key_2) ? 1 : 0);
+                    peers_2 = peers_2 | same_0_2 << (unsigned int)(lane0_2 + 0);
+                    int held_1_2 = __shfl_sync(0xFFFFFFFF, key_2, lane0_2 + 1);
+                    unsigned int same_1_2 = ((held_1_2 == key_2) ? 1 : 0);
+                    peers_2 = peers_2 | same_1_2 << (unsigned int)(lane0_2 + 1);
+                    int held_2_2 = __shfl_sync(0xFFFFFFFF, key_2, lane0_2 + 2);
+                    unsigned int same_2_2 = ((held_2_2 == key_2) ? 1 : 0);
+                    peers_2 = peers_2 | same_2_2 << (unsigned int)(lane0_2 + 2);
+                    int held_3_2 = __shfl_sync(0xFFFFFFFF, key_2, lane0_2 + 3);
+                    unsigned int same_3_2 = ((held_3_2 == key_2) ? 1 : 0);
+                    peers_2 = peers_2 | same_3_2 << (unsigned int)(lane0_2 + 3);
+                }
+                unsigned int group_2 = peers_2 & live_3;
+                int members_2 = (int)(unsigned int)__popc(group_2);
+                int lower_2 = (int)(unsigned int)__popc(group_2 & lane_lt_1);
+                if (local_6 != 0 && lower_2 == 0) {
+                    unsigned int count_addr_1 = hist_s_addr + (unsigned int)((fw_1 * 256 + expert_5) * 4);
+                    int counted_1 = hist_s[fw_1 * 256 + expert_5];
+                    {
+                        uint32_t _ival_6 = static_cast<uint32_t>(counted_1 + members_2);
+                        uint32_t _addr_6 = static_cast<uint32_t>(count_addr_1);
+                        asm volatile("st.shared.u32 [%0], %1;" :: "r"(_addr_6), "r"(_ival_6) : "memory");
                     }
                 }
+                __syncwarp();
             }
             if (scan_all_1 != 0) {
                 #pragma unroll 1
@@ -2541,31 +2626,44 @@ kernel_cake_mega_moe_w4a16_89a2bb7795ed48ca074c(__nv_bfloat16* __restrict__ hidd
                         expert_8 = ident_7 - rank_1 * E_local;
                     }
                 }
-                unsigned int pending_3 = __ballot_sync(0xFFFFFFFF, local_9 != 0);
+                int key_3 = ((local_9 != 0) ? expert_8 : -1);
+                unsigned int live_4 = __ballot_sync(0xFFFFFFFF, local_9 != 0);
+                int _count_leading_zeros_26 = __clz(live_4);
+                int trips_3 = 32 - _count_leading_zeros_26;
+                unsigned int peers_3 = 0;
                 #pragma unroll 1
-                for (int _round_3 = 0; _round_3 < 32; _round_3++) {
-                    if (pending_3 != 0) {
-                        int _find_first_set_26 = __ffs(pending_3);
-                        int leader_3 = (int)_find_first_set_26 - 1;
-                        int e_lead_3 = __shfl_sync(0xFFFFFFFF, expert_8, leader_3);
-                        unsigned int group_3 = __ballot_sync(0xFFFFFFFF, local_9 != 0 && expert_8 == e_lead_3);
-                        int running_3 = hist_s[fw_1 * 256 + e_lead_3];
-                        if (local_9 != 0 && expert_8 == e_lead_3) {
-                            int my_row_1 = seg_s[e_lead_3] + cbase_s[e_lead_3] + wbase_s[fw_1 * 256 + e_lead_3] + running_3 + (int)(unsigned int)__popc(group_3 & lane_lt_1);
-                            route_src[my_row_1] = g_11;
-                        }
-                        __syncwarp();
-                        if (lane == leader_3) {
-                            {
-                                uint32_t _ival_27 = static_cast<uint32_t>(running_3 + (int)(unsigned int)__popc(group_3));
-                                uint32_t _addr_27 = static_cast<uint32_t>(hist_s_addr + (unsigned int)((fw_1 * 256 + e_lead_3) * 4));
-                                asm volatile("st.shared.u32 [%0], %1;" :: "r"(_addr_27), "r"(_ival_27) : "memory");
-                            }
-                        }
-                        __syncwarp();
-                        pending_3 = pending_3 & (group_3 ^ 4294967295u);
+                for (int lane0_3 = 0; lane0_3 < trips_3; lane0_3 += 4) {
+                    int held_0_3 = __shfl_sync(0xFFFFFFFF, key_3, lane0_3 + 0);
+                    unsigned int same_0_3 = ((held_0_3 == key_3) ? 1 : 0);
+                    peers_3 = peers_3 | same_0_3 << (unsigned int)(lane0_3 + 0);
+                    int held_1_3 = __shfl_sync(0xFFFFFFFF, key_3, lane0_3 + 1);
+                    unsigned int same_1_3 = ((held_1_3 == key_3) ? 1 : 0);
+                    peers_3 = peers_3 | same_1_3 << (unsigned int)(lane0_3 + 1);
+                    int held_2_3 = __shfl_sync(0xFFFFFFFF, key_3, lane0_3 + 2);
+                    unsigned int same_2_3 = ((held_2_3 == key_3) ? 1 : 0);
+                    peers_3 = peers_3 | same_2_3 << (unsigned int)(lane0_3 + 2);
+                    int held_3_3 = __shfl_sync(0xFFFFFFFF, key_3, lane0_3 + 3);
+                    unsigned int same_3_3 = ((held_3_3 == key_3) ? 1 : 0);
+                    peers_3 = peers_3 | same_3_3 << (unsigned int)(lane0_3 + 3);
+                }
+                unsigned int group_3 = peers_3 & live_4;
+                int members_3 = (int)(unsigned int)__popc(group_3);
+                int lower_3 = (int)(unsigned int)__popc(group_3 & lane_lt_1);
+                int running_3 = 0;
+                if (local_9 != 0) {
+                    running_3 = hist_s[fw_1 * 256 + expert_8];
+                    int my_row_1 = seg_s[expert_8] + cbase_s[expert_8] + wbase_s[fw_1 * 256 + expert_8] + running_3 + lower_3;
+                    route_src[my_row_1] = g_11;
+                }
+                __syncwarp();
+                if (local_9 != 0 && lower_3 == 0) {
+                    {
+                        uint32_t _ival_27 = static_cast<uint32_t>(running_3 + members_3);
+                        uint32_t _addr_27 = static_cast<uint32_t>(hist_s_addr + (unsigned int)((fw_1 * 256 + expert_8) * 4));
+                        asm volatile("st.shared.u32 [%0], %1;" :: "r"(_addr_27), "r"(_ival_27) : "memory");
                     }
                 }
+                __syncwarp();
             }
             asm volatile("barrier.sync 11, 192;" ::: "memory");
             asm volatile("barrier.sync 11, 192;" ::: "memory");
@@ -2627,13 +2725,36 @@ kernel_cake_mega_moe_w4a16_89a2bb7795ed48ca074c(__nv_bfloat16* __restrict__ hidd
             asm volatile("barrier.sync 12, 512;" ::: "memory");
             int tiles_4 = tile_count[0];
             int fc1_items_2 = tiles_4 * (fc1_m_tiles >> 1);
-            int end_2 = fc1_items_2 + tiles_4 * (fc2_m_tiles >> 1);
+            int wl_b_2 = (int)cluster_id;
+            int wl_P_2 = (int)num_clusters;
+            int wl_fc2_2 = tiles_4 * (fc2_m_tiles >> 1);
+            int wl_r_2 = fc1_items_2 % wl_P_2;
+            int wl_L_2 = wl_P_2 - wl_r_2;
+            int wl_delta_2 = (H / 256 + I / 256 / 2) / (I / 256);
+            int wl_n1_2 = wl_delta_2 * wl_L_2;
+            if (wl_n1_2 > wl_fc2_2) {
+                wl_n1_2 = wl_fc2_2;
+            }
+            int wl_c1_2 = (fc1_items_2 - wl_b_2 + wl_P_2 - 1) / wl_P_2;
+            int wl_p1_2 = ((wl_b_2 >= wl_r_2) ? (wl_n1_2 - (wl_b_2 - wl_r_2) + wl_L_2 - 1) / wl_L_2 : 0);
+            int wl_p2_2 = (wl_fc2_2 - wl_n1_2 - wl_b_2 + wl_P_2 - 1) / wl_P_2;
+            int wl_items_2 = wl_c1_2 + wl_p1_2 + wl_p2_2;
             unsigned int raw_cur = 0;
             unsigned int _phase_raw_empty = 1;
             if (elect_sync()) {
                 #pragma unroll 1
-                for (unsigned int w_2 = cluster_id; w_2 < end_2; w_2 += num_clusters) {
+                for (int w_2 = 0; w_2 < wl_items_2; w_2++) {
                     int w_i_2 = (int)w_2;
+                    int wl_cb_2 = (int)cluster_id;
+                    int wl_cP_2 = (int)num_clusters;
+                    int wl_j_2 = w_i_2 - wl_c1_2;
+                    if (wl_j_2 < 0) {
+                        w_i_2 = wl_cb_2 + w_i_2 * wl_cP_2;
+                    } else if (wl_j_2 < wl_p1_2) {
+                        w_i_2 = fc1_items_2 + wl_j_2 * (wl_cP_2 - wl_r_2) + (wl_cb_2 - wl_r_2);
+                    } else {
+                        w_i_2 = fc1_items_2 + wl_n1_2 + (wl_j_2 - wl_p1_2) * wl_cP_2 + wl_cb_2;
+                    }
                     int is_fc1_2 = 0;
                     int local_10 = w_i_2 - fc1_items_2;
                     if (w_i_2 < fc1_items_2) {
@@ -2854,26 +2975,39 @@ kernel_cake_mega_moe_w4a16_89a2bb7795ed48ca074c(__nv_bfloat16* __restrict__ hidd
                         expert_10 = ident_8 - rank_2 * E_local;
                     }
                 }
-                unsigned int pending_4 = __ballot_sync(0xFFFFFFFF, local_11 != 0);
+                int key_4 = ((local_11 != 0) ? expert_10 : -1);
+                unsigned int live_5 = __ballot_sync(0xFFFFFFFF, local_11 != 0);
+                int _count_leading_zeros_5_1 = __clz(live_5);
+                int trips_4 = 32 - _count_leading_zeros_5_1;
+                unsigned int peers_4 = 0;
                 #pragma unroll 1
-                for (int _round_4 = 0; _round_4 < 32; _round_4++) {
-                    if (pending_4 != 0) {
-                        int _find_first_set_5_1 = __ffs(pending_4);
-                        int leader_4 = (int)_find_first_set_5_1 - 1;
-                        int e_lead_4 = __shfl_sync(0xFFFFFFFF, expert_10, leader_4);
-                        unsigned int group_4 = __ballot_sync(0xFFFFFFFF, local_11 != 0 && expert_10 == e_lead_4);
-                        if (lane == leader_4) {
-                            unsigned int count_addr_2 = hist_s_addr + (unsigned int)((fw_2 * 256 + e_lead_4) * 4);
-                            int counted_2 = hist_s[fw_2 * 256 + e_lead_4];
-                            {
-                                uint32_t _ival_6 = static_cast<uint32_t>(counted_2 + (int)(unsigned int)__popc(group_4));
-                                uint32_t _addr_6 = static_cast<uint32_t>(count_addr_2);
-                                asm volatile("st.shared.u32 [%0], %1;" :: "r"(_addr_6), "r"(_ival_6) : "memory");
-                            }
-                        }
-                        pending_4 = pending_4 & (group_4 ^ 4294967295u);
+                for (int lane0_4 = 0; lane0_4 < trips_4; lane0_4 += 4) {
+                    int held_0_4 = __shfl_sync(0xFFFFFFFF, key_4, lane0_4 + 0);
+                    unsigned int same_0_4 = ((held_0_4 == key_4) ? 1 : 0);
+                    peers_4 = peers_4 | same_0_4 << (unsigned int)(lane0_4 + 0);
+                    int held_1_4 = __shfl_sync(0xFFFFFFFF, key_4, lane0_4 + 1);
+                    unsigned int same_1_4 = ((held_1_4 == key_4) ? 1 : 0);
+                    peers_4 = peers_4 | same_1_4 << (unsigned int)(lane0_4 + 1);
+                    int held_2_4 = __shfl_sync(0xFFFFFFFF, key_4, lane0_4 + 2);
+                    unsigned int same_2_4 = ((held_2_4 == key_4) ? 1 : 0);
+                    peers_4 = peers_4 | same_2_4 << (unsigned int)(lane0_4 + 2);
+                    int held_3_4 = __shfl_sync(0xFFFFFFFF, key_4, lane0_4 + 3);
+                    unsigned int same_3_4 = ((held_3_4 == key_4) ? 1 : 0);
+                    peers_4 = peers_4 | same_3_4 << (unsigned int)(lane0_4 + 3);
+                }
+                unsigned int group_4 = peers_4 & live_5;
+                int members_4 = (int)(unsigned int)__popc(group_4);
+                int lower_4 = (int)(unsigned int)__popc(group_4 & lane_lt_2);
+                if (local_11 != 0 && lower_4 == 0) {
+                    unsigned int count_addr_2 = hist_s_addr + (unsigned int)((fw_2 * 256 + expert_10) * 4);
+                    int counted_2 = hist_s[fw_2 * 256 + expert_10];
+                    {
+                        uint32_t _ival_6 = static_cast<uint32_t>(counted_2 + members_4);
+                        uint32_t _addr_6 = static_cast<uint32_t>(count_addr_2);
+                        asm volatile("st.shared.u32 [%0], %1;" :: "r"(_addr_6), "r"(_ival_6) : "memory");
                     }
                 }
+                __syncwarp();
             }
             if (scan_all_2 != 0) {
                 #pragma unroll 1
@@ -3221,44 +3355,80 @@ kernel_cake_mega_moe_w4a16_89a2bb7795ed48ca074c(__nv_bfloat16* __restrict__ hidd
                         expert_13 = ident_11 - rank_2 * E_local;
                     }
                 }
-                unsigned int pending_5 = __ballot_sync(0xFFFFFFFF, local_14 != 0);
+                int key_5 = ((local_14 != 0) ? expert_13 : -1);
+                unsigned int live_6 = __ballot_sync(0xFFFFFFFF, local_14 != 0);
+                int _count_leading_zeros_26_1 = __clz(live_6);
+                int trips_5 = 32 - _count_leading_zeros_26_1;
+                unsigned int peers_5 = 0;
                 #pragma unroll 1
-                for (int _round_5 = 0; _round_5 < 32; _round_5++) {
-                    if (pending_5 != 0) {
-                        int _find_first_set_26_1 = __ffs(pending_5);
-                        int leader_5 = (int)_find_first_set_26_1 - 1;
-                        int e_lead_5 = __shfl_sync(0xFFFFFFFF, expert_13, leader_5);
-                        unsigned int group_5 = __ballot_sync(0xFFFFFFFF, local_14 != 0 && expert_13 == e_lead_5);
-                        int running_5 = hist_s[fw_2 * 256 + e_lead_5];
-                        if (local_14 != 0 && expert_13 == e_lead_5) {
-                            int my_row_2 = seg_s[e_lead_5] + cbase_s[e_lead_5] + wbase_s[fw_2 * 256 + e_lead_5] + running_5 + (int)(unsigned int)__popc(group_5 & lane_lt_2);
-                            route_src[my_row_2] = g_19;
-                        }
-                        __syncwarp();
-                        if (lane == leader_5) {
-                            {
-                                uint32_t _ival_27 = static_cast<uint32_t>(running_5 + (int)(unsigned int)__popc(group_5));
-                                uint32_t _addr_27 = static_cast<uint32_t>(hist_s_addr + (unsigned int)((fw_2 * 256 + e_lead_5) * 4));
-                                asm volatile("st.shared.u32 [%0], %1;" :: "r"(_addr_27), "r"(_ival_27) : "memory");
-                            }
-                        }
-                        __syncwarp();
-                        pending_5 = pending_5 & (group_5 ^ 4294967295u);
+                for (int lane0_5 = 0; lane0_5 < trips_5; lane0_5 += 4) {
+                    int held_0_5 = __shfl_sync(0xFFFFFFFF, key_5, lane0_5 + 0);
+                    unsigned int same_0_5 = ((held_0_5 == key_5) ? 1 : 0);
+                    peers_5 = peers_5 | same_0_5 << (unsigned int)(lane0_5 + 0);
+                    int held_1_5 = __shfl_sync(0xFFFFFFFF, key_5, lane0_5 + 1);
+                    unsigned int same_1_5 = ((held_1_5 == key_5) ? 1 : 0);
+                    peers_5 = peers_5 | same_1_5 << (unsigned int)(lane0_5 + 1);
+                    int held_2_5 = __shfl_sync(0xFFFFFFFF, key_5, lane0_5 + 2);
+                    unsigned int same_2_5 = ((held_2_5 == key_5) ? 1 : 0);
+                    peers_5 = peers_5 | same_2_5 << (unsigned int)(lane0_5 + 2);
+                    int held_3_5 = __shfl_sync(0xFFFFFFFF, key_5, lane0_5 + 3);
+                    unsigned int same_3_5 = ((held_3_5 == key_5) ? 1 : 0);
+                    peers_5 = peers_5 | same_3_5 << (unsigned int)(lane0_5 + 3);
+                }
+                unsigned int group_5 = peers_5 & live_6;
+                int members_5 = (int)(unsigned int)__popc(group_5);
+                int lower_5 = (int)(unsigned int)__popc(group_5 & lane_lt_2);
+                int running_5 = 0;
+                if (local_14 != 0) {
+                    running_5 = hist_s[fw_2 * 256 + expert_13];
+                    int my_row_2 = seg_s[expert_13] + cbase_s[expert_13] + wbase_s[fw_2 * 256 + expert_13] + running_5 + lower_5;
+                    route_src[my_row_2] = g_19;
+                }
+                __syncwarp();
+                if (local_14 != 0 && lower_5 == 0) {
+                    {
+                        uint32_t _ival_27 = static_cast<uint32_t>(running_5 + members_5);
+                        uint32_t _addr_27 = static_cast<uint32_t>(hist_s_addr + (unsigned int)((fw_2 * 256 + expert_13) * 4));
+                        asm volatile("st.shared.u32 [%0], %1;" :: "r"(_addr_27), "r"(_ival_27) : "memory");
                     }
                 }
+                __syncwarp();
             }
             asm volatile("barrier.sync 11, 192;" ::: "memory");
             asm volatile("barrier.sync 11, 192;" ::: "memory");
             asm volatile("barrier.sync 12, 512;" ::: "memory");
             int tiles_6 = tile_count[0];
             int fc1_items_3 = tiles_6 * (fc1_m_tiles >> 1);
-            int end_3 = fc1_items_3 + tiles_6 * (fc2_m_tiles >> 1);
+            int wl_b_3 = (int)cluster_id;
+            int wl_P_3 = (int)num_clusters;
+            int wl_fc2_3 = tiles_6 * (fc2_m_tiles >> 1);
+            int wl_r_3 = fc1_items_3 % wl_P_3;
+            int wl_L_3 = wl_P_3 - wl_r_3;
+            int wl_delta_3 = (H / 256 + I / 256 / 2) / (I / 256);
+            int wl_n1_3 = wl_delta_3 * wl_L_3;
+            if (wl_n1_3 > wl_fc2_3) {
+                wl_n1_3 = wl_fc2_3;
+            }
+            int wl_c1_3 = (fc1_items_3 - wl_b_3 + wl_P_3 - 1) / wl_P_3;
+            int wl_p1_3 = ((wl_b_3 >= wl_r_3) ? (wl_n1_3 - (wl_b_3 - wl_r_3) + wl_L_3 - 1) / wl_L_3 : 0);
+            int wl_p2_3 = (wl_fc2_3 - wl_n1_3 - wl_b_3 + wl_P_3 - 1) / wl_P_3;
+            int wl_items_3 = wl_c1_3 + wl_p1_3 + wl_p2_3;
             unsigned int b_cur_1 = 0;
             unsigned int _phase_b_empty = 1;
             if (elect_sync()) {
                 #pragma unroll 1
-                for (unsigned int w_3 = cluster_id; w_3 < end_3; w_3 += num_clusters) {
+                for (int w_3 = 0; w_3 < wl_items_3; w_3++) {
                     int w_i_3 = (int)w_3;
+                    int wl_cb_3 = (int)cluster_id;
+                    int wl_cP_3 = (int)num_clusters;
+                    int wl_j_3 = w_i_3 - wl_c1_3;
+                    if (wl_j_3 < 0) {
+                        w_i_3 = wl_cb_3 + w_i_3 * wl_cP_3;
+                    } else if (wl_j_3 < wl_p1_3) {
+                        w_i_3 = fc1_items_3 + wl_j_3 * (wl_cP_3 - wl_r_3) + (wl_cb_3 - wl_r_3);
+                    } else {
+                        w_i_3 = fc1_items_3 + wl_n1_3 + (wl_j_3 - wl_p1_3) * wl_cP_3 + wl_cb_3;
+                    }
                     int is_fc1_3 = 0;
                     int local_15 = w_i_3 - fc1_items_3;
                     if (w_i_3 < fc1_items_3) {
@@ -3282,12 +3452,12 @@ kernel_cake_mega_moe_w4a16_89a2bb7795ed48ca074c(__nv_bfloat16* __restrict__ hidd
                     }
                     int row0_1 = t_6 * 128 + cta_rank * 64;
                     if (is_fc1_3 != 0) {
-                        int live_1 = tile_mn_limit[t_6] - t_6 * 128;
+                        int live_7 = tile_mn_limit[t_6] - t_6 * 128;
                         {
                         unsigned int _acquire_observed;
                         do {
                         asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_acquire_observed) : "l"((reinterpret_cast<unsigned int*>(fc1_ready) + (t_6))) : "memory");
-                        } while (static_cast<unsigned int>(_acquire_observed - static_cast<unsigned int>((unsigned int)live_1)) >= static_cast<unsigned int>(2147483648u));
+                        } while (static_cast<unsigned int>(_acquire_observed - static_cast<unsigned int>((unsigned int)live_7)) >= static_cast<unsigned int>(2147483648u));
                         }
                         asm volatile("fence.proxy.async.global;" ::: "memory");
                         #pragma unroll 1
@@ -3345,7 +3515,20 @@ kernel_cake_mega_moe_w4a16_89a2bb7795ed48ca074c(__nv_bfloat16* __restrict__ hidd
             asm volatile("barrier.sync 12, 512;" ::: "memory");
             int tiles_7 = tile_count[0];
             int fc1_items_4 = tiles_7 * (fc1_m_tiles >> 1);
-            int end_4 = fc1_items_4 + tiles_7 * (fc2_m_tiles >> 1);
+            int wl_b_4 = (int)cluster_id;
+            int wl_P_4 = (int)num_clusters;
+            int wl_fc2_4 = tiles_7 * (fc2_m_tiles >> 1);
+            int wl_r_4 = fc1_items_4 % wl_P_4;
+            int wl_L_4 = wl_P_4 - wl_r_4;
+            int wl_delta_4 = (H / 256 + I / 256 / 2) / (I / 256);
+            int wl_n1_4 = wl_delta_4 * wl_L_4;
+            if (wl_n1_4 > wl_fc2_4) {
+                wl_n1_4 = wl_fc2_4;
+            }
+            int wl_c1_4 = (fc1_items_4 - wl_b_4 + wl_P_4 - 1) / wl_P_4;
+            int wl_p1_4 = ((wl_b_4 >= wl_r_4) ? (wl_n1_4 - (wl_b_4 - wl_r_4) + wl_L_4 - 1) / wl_L_4 : 0);
+            int wl_p2_4 = (wl_fc2_4 - wl_n1_4 - wl_b_4 + wl_P_4 - 1) / wl_P_4;
+            int wl_items_4 = wl_c1_4 + wl_p1_4 + wl_p2_4;
             const int quarter_1 = warp % 4;
             const int half = warp / 4 - 2;
             const int fc1_row = ((lane < 16) ? quarter_1 * 16 + lane : 48 + quarter_1 * 16 + lane);
@@ -3358,8 +3541,18 @@ kernel_cake_mega_moe_w4a16_89a2bb7795ed48ca074c(__nv_bfloat16* __restrict__ hidd
             unsigned int _phase_raw_full = 0;
             unsigned int _phase_a_empty = 1;
             #pragma unroll 1
-            for (unsigned int w_4 = cluster_id; w_4 < end_4; w_4 += num_clusters) {
+            for (int w_4 = 0; w_4 < wl_items_4; w_4++) {
                 int w_i_4 = (int)w_4;
+                int wl_cb_4 = (int)cluster_id;
+                int wl_cP_4 = (int)num_clusters;
+                int wl_j_4 = w_i_4 - wl_c1_4;
+                if (wl_j_4 < 0) {
+                    w_i_4 = wl_cb_4 + w_i_4 * wl_cP_4;
+                } else if (wl_j_4 < wl_p1_4) {
+                    w_i_4 = fc1_items_4 + wl_j_4 * (wl_cP_4 - wl_r_4) + (wl_cb_4 - wl_r_4);
+                } else {
+                    w_i_4 = fc1_items_4 + wl_n1_4 + (wl_j_4 - wl_p1_4) * wl_cP_4 + wl_cb_4;
+                }
                 int is_fc1_4 = 0;
                 int local_16 = w_i_4 - fc1_items_4;
                 if (w_i_4 < fc1_items_4) {
