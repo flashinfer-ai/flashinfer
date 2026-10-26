@@ -120,7 +120,8 @@ and run one CTA per query token and 64 heads (128 heads run as two row tiles
 of the same token).  Below 96 such CTAs the entries split every token's top-k
 list into S in {16, 8, 4, 2} contiguous 128-key tile ranges, the largest S
 that keeps the grid within one wave of SMs and leaves each CTA at least one
-tile (NVFP4) or two tiles (FP8, trtllm-gen's MLA generation rule).  While a
+tile (NVFP4) or two tiles (FP8, trtllm-gen's MLA generation rule; a top-k of
+one tile pair splits per tile while the V split below applies).  While a
 split FP8 grid still fills at most a half or a quarter of the SMs, it also
 splits the 512 V columns over 2 or 4 CTAs that repeat QK / softmax (B200,
 top-k 2048: one token runs 8 x 4 CTAs).  The CTAs write BF16 partial O / LSE

@@ -109,6 +109,8 @@ _FP8_CASES = [
     Case("two-waves", total_q=300),
     Case("lens-zero", total_q=4, ragged=True, zero_len_token=True),
     Case("topk136", total_q=3, top_k=136),
+    Case("topk256-ragged", total_q=3, top_k=256, ragged=True),
+    Case("topk136-unsplit", total_q=40, top_k=136),
 ]
 
 
@@ -603,8 +605,9 @@ def test_prims_ts_dsa_split_kv_policy() -> None:
 
 
 def test_prims_ts_dsa_fp8_split_policy() -> None:
-    """E4M3 follows trtllm-gen: at least two tiles per split CTA within one wave,
-    then a V head-dim split while the grid fills at most a quarter / half of the SMs."""
+    """E4M3 follows trtllm-gen: at least two tiles per split CTA within one wave
+    (one tile for a top-k of one tile pair), then a V head-dim split while the
+    grid fills at most a quarter / half of the SMs."""
     select = dsa_module._select_fp8_split
     ctas = (1, 4, 5, 8, 9, 16, 18, 19, 37, 38, 74, 75, 96)
     assert [select(t, 2048, 148) for t in ctas] == [
@@ -623,7 +626,16 @@ def test_prims_ts_dsa_fp8_split_policy() -> None:
         (1, 1),
     ]
     assert select(1, 512, 148) == (2, 4)  # two tile pairs
-    assert select(1, 256, 148) == (1, 1)  # one tile pair: no split, no V split
+    # One tile pair: one tile per CTA while the V split applies, else no split.
+    assert [select(t, 256, 148) for t in (1, 18, 32, 37, 38, 64)] == [
+        (2, 4),
+        (2, 4),
+        (2, 2),
+        (2, 2),
+        (1, 1),
+        (1, 1),
+    ]
+    assert select(1, 128, 148) == (1, 1)  # a single tile
     assert select(48, 2048, 148) == (2, 1)  # e.g. 24 tokens with 128 heads
 
 

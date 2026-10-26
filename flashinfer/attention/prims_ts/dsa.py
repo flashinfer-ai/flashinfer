@@ -108,8 +108,9 @@ def _select_fp8_split(
     """Return ``(split_kv, head_dim_split)`` for an E4M3 launch of ``num_ctas`` CTAs.
 
     trtllm-gen's MLA generation rule: split the top-k list so every CTA keeps
-    at least two 128-key tiles within one wave, then, while fewer than half
-    the SMs have work, split the 512 V columns over 4 (or 2) CTAs.  Each V
+    at least two 128-key tiles within one wave (a top-k of one tile pair:
+    one tile, if the V split then applies), then, while fewer than half the
+    SMs have work, split the 512 V columns over 4 (or 2) CTAs.  Each V
     slice repeats the QK / softmax of its tiles, but a one- or two-tile CTA is
     bound by its fixed latency (Q load, first gather, the single QK-softmax-PV
     chain, the partial-O store), which the slice cuts.  B200, K=2048: B1 is
@@ -120,6 +121,12 @@ def _select_fp8_split(
     pairs = -(-sparse_mla_top_k // 256)
     limit = min(pairs, sm_count // num_ctas)
     split = next((s for s in SPLIT_KV_CHOICES if s <= limit), 1)
+    if split == 1 and sparse_mla_top_k > 128 and num_ctas * 4 <= sm_count:
+        # A single tile pair (top-k <= 256): one tile per CTA, so the V split
+        # below can apply.  B200, top-k 256: B1 9.77 -> 7.52 us (trtllm-gen
+        # 8.13), B32 9.78 -> 9.35; without the V split (B64) one-tile CTAs
+        # are slower (10.6 -> 12.0), hence the quarter-wave bound.
+        split = 2
     if split == 1:
         return 1, 1
     total = num_ctas * split
