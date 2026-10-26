@@ -727,16 +727,18 @@ routine_cc_to_supported_backends = {
         # NOTE: specialized = the CUDA fused pack kernel; auto = the library's
         #       per-head-count pick (mla_kv_pack.py _backend_order). Device guard:
         #       mla_kv_pack.py _device_supported (cc >= allowlist min_cc = 10.0).
+        #       auto is left off where it can resolve to the Cake kernel (observed on
+        #       10.0 / 10.3 for head counts other than 12); Cake is out of scope here.
         "7.5": [],
         "8.0": [],
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["specialized", "auto"],
-        "10.3": ["specialized", "auto"],
+        "10.0": ["specialized"],
+        "10.3": ["specialized"],
         "10.7": ["specialized", "auto"],
-        "12.0": ["specialized", "auto"],
-        "12.1": ["specialized", "auto"],
+        "12.0": ["specialized"],
+        "12.1": ["specialized"],
     },
     "append_paged_kv_cache": {
         # NOTE: cuda = flashinfer.page.append_paged_kv_cache and its MLA / NVFP4
