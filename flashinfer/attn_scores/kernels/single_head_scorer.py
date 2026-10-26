@@ -15,7 +15,9 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.experimental.primitives import exit as exit_thread
 
 from ...cute_dsl.fp4_common import (
@@ -76,6 +78,24 @@ LANE_VALUES = DIM // KEY_LANES
 LANES_PER_SCALE = SCALE_VECTOR // LANE_VALUES
 WRITE_ROWS_PER_CTA = TILE // KEY_LANES
 THRESHOLD_ROWS_PER_CTA = 4  # thresholds_kernel: a warp per row
+
+
+@dsl_user_op
+def evict_first(*, loc=None, ip=None) -> cutlass.Int64:
+    """An L2 cache policy that evicts first what it loads."""
+    return cutlass.Int64(
+        llvm.inline_asm(
+            T.i64(),
+            [],
+            "createpolicy.fractional.L2::evict_first.b64 $0, 1.0;",
+            "=l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @cute.jit
@@ -744,8 +764,13 @@ class PagedScorer:
                 load_query_dst[None, 0],
                 tma_bar_ptr=query_empty.barrier,
             )
+            # Decode reads each key once, so its keys leave L2 first. (Select's
+            # query tiles read the same keys, so they keep the default.)
+            policy = evict_first()
             for tile in cutlass.range(tile_count):
-                self.load_keys(key_producer.acquire_and_advance(), key_loads, 0, tile)
+                self.load_keys(
+                    key_producer.acquire_and_advance(), key_loads, 0, tile, policy
+                )
         elif warp == MMA_WARP:
             query_consumer.wait_and_advance()
             for tile in cutlass.range(tile_count):
@@ -792,9 +817,11 @@ class PagedScorer:
         tmem.free(base)
 
     @cute.jit
-    def load_keys(self, key_empty, loads: tuple, sweep, tile: cutlass.Int32):
+    def load_keys(
+        self, key_empty, loads: tuple, sweep, tile: cutlass.Int32, policy=None
+    ):
         """Decode's warp 5, select's warp 0: TMA the sweep's tile `tile` into
-        the stage `key_empty`."""
+        the stage `key_empty`, with L2 cache policy `policy` if one is given."""
         tma_key, sources, destinations, paging = loads
         for part in cutlass.range(PAGES_PER_TILE, unroll_full=True):
             cute.copy(
@@ -804,6 +831,7 @@ class PagedScorer:
                 ],
                 destinations[None, part, key_empty.index],
                 tma_bar_ptr=key_empty.barrier,
+                cache_policy=policy,
             )
 
     @cute.jit
