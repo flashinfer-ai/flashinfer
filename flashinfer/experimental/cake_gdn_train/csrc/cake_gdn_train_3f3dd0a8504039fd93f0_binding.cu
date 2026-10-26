@@ -62,6 +62,17 @@ int64_t NumelAbove(const TensorView& t, int trailing) {
   return product;
 }
 
+[[noreturn]] void NoInt64(int64_t a, const char* op, int64_t b) {
+  TVM_FFI_THROW(ValueError) << KERNEL_NAME << ": " << a << " " << op << " " << b
+                            << " has no int64 value in a host check";
+}
+
+int64_t CheckedMul(int64_t a, int64_t b) {
+  int64_t product;
+  if (__builtin_mul_overflow(a, b, &product)) NoInt64(a, "*", b);
+  return product;
+}
+
 cuuint64_t Extent(int64_t value, const char* descriptor) {
   TVM_FFI_CHECK(value > 0, ValueError)
       << KERNEL_NAME << ": an extent of descriptor '" << descriptor << "' resolves to " << value;
@@ -181,11 +192,11 @@ void Run(TensorView a_do_tma, TensorView a_aqk_tma, TensorView a_do_ptr, TensorV
   check_same_device(a_chunk_len, a_do_tma, "chunk_len", "do_tma");
   check_contiguous(a_ticket, "ticket");
   check_same_device(a_ticket, a_do_tma, "ticket", "do_tma");
-  TVM_FFI_CHECK((a_num_heads >= 1), ValueError)
+  TVM_FFI_CHECK((a_num_heads >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (num_heads >= 1)";
-  TVM_FFI_CHECK((a_num_seqs >= 0), ValueError)
+  TVM_FFI_CHECK((a_num_seqs >= 0LL), ValueError)
       << KERNEL_NAME << ": requires (num_seqs >= 0)";
-  TVM_FFI_CHECK((a_do_tstride >= (a_num_heads * 128)), ValueError)
+  TVM_FFI_CHECK((a_do_tstride >= CheckedMul(a_num_heads, 128LL)), ValueError)
       << KERNEL_NAME << ": requires (do_tstride >= (num_heads * 128))";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
