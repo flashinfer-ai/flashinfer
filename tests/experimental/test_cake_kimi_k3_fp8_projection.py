@@ -1248,10 +1248,8 @@ def test_decode_config_round6_continuation_rules(arch):
     assert cb.gemm_block_n(384, 96, 28, arch, 12288, 12288) == cb.gemm_block_n(
         512, 96, 28, arch, 12288, 12288
     )  # the 512 bucket (M 257-512) is one cell
-    assert (
-        cb.gemm_block_n(1024, 48, 28, arch, 6144, 6144)
-        == {"sm_100a": 192, "sm_103a": 384}[arch]
-    )
+    # the sm_103a fused_qkvg M 1024 cell is 192-wide since 33aeb5c35 (was 384)
+    assert cb.gemm_block_n(1024, 48, 28, arch, 6144, 6144) == 192
     assert (
         cb.gemm_block_n(4096, 12, 28, arch, 1536, 1536)
         == {"sm_100a": 256, "sm_103a": 192}[arch]
