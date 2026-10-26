@@ -111,6 +111,47 @@ __global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c16_t4_s4_pdl
     float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
     int parameter_kind, float scalar_temperature);
 
+// Wide row-caching cluster kernels of 10 and 12 CTAs: each CTA keeps up to 13
+// (10 CTAs) or 11 (12 CTAs) tiles of its chunk in registers at one resident
+// CTA per SM, so that a batch with one row more than 16-CTA clusters fit one
+// CTA per SM keeps every CTA on its own SM.
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c10_t8(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c10_t8_pdl(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c10_t10(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c10_t10_pdl(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c10_t13(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c10_t13_pdl(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c12_t8(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c12_t8_pdl(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c12_t10(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c12_t10_pdl(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c12_t11(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c12_t11_pdl(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+
 // Persistent row-caching cluster kernels of the 8-tile variants: a grid of at
 // most one cluster per row, each cluster walking rows k, k + n, ... with the
 // next row's chunk copied into shared memory by 1D bulk copies. Dynamic shared

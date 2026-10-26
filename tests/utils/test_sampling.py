@@ -323,7 +323,7 @@ def test_blackwell_route_observer_falls_back_off_blackwell():
         (64, 32000, "scalar", True, "row"),
         (8, 256000, "none", False, "row"),  # 8-tile rows in one wave
         (16, 256000, "none", False, "shared_tiles"),  # under 4/5 of persistent trips
-        (40, 151936, "scalar", False, "shared_tiles"),  # 5-tile chunks
+        (48, 151936, "scalar", False, "shared_tiles"),  # 5-tile chunks
         (48, 256000, "per_row", True, "persistent"),  # persistent 16-CTA clusters
         (100, 128000, "none", False, "persistent"),  # persistent 8-CTA clusters
         (64, 128000, "none", False, "persistent"),  # 4/5 of the persistent trips
@@ -445,6 +445,125 @@ def test_blackwell_cached_cluster_spread_of_wide_chunks_ignores_residency(
     # Rows whose chunks are wider than the capped spreads allow keep spreading
     # even when some clusters then run in a second wave, as measured faster.
     assert kernel[:2] == (cluster_ctas, 4)
+    torch.testing.assert_close(
+        probs, torch.softmax(logits / 0.5, dim=-1), atol=1e-3, rtol=1e-3
+    )
+
+
+@pytest.mark.parametrize(
+    "vocab_size",
+    [
+        151936,  # 7-tile 12-CTA chunks, 5-tile 16-CTA chunks
+        196608,  # 8-tile 12-CTA chunks, 6-tile 16-CTA chunks
+        204800,  # 9-tile 12-CTA chunks, 10-tile 10-CTA chunks
+        229376,  # 10-tile 12-CTA chunks, 12-tile 10-CTA chunks
+        262144,  # 11-tile 12-CTA chunks, 13-tile 10-CTA chunks
+    ],
+)
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_blackwell_cached_cluster_one_row_over_takes_wide_kernel(
+    vocab_size, enable_pdl
+):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    torch.manual_seed(7)
+    kernels = {}
+    for rows in range(4, 13):
+        logits = torch.randn(rows, vocab_size, device="cuda")
+        kernels[rows] = (
+            flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+                logits, temperature=0.5, enable_pdl=enable_pdl
+            )
+        )
+    # A batch with one row more than 16-CTA clusters fit one CTA per SM takes
+    # the wide kernel of 12 CTAs, or of 10 CTAs when the 16-CTA chunk exceeds
+    # 6 tiles, with the narrowest register chunk that covers the row; one row
+    # fewer or more keeps 16 CTAs.
+    wide = [rows for rows, kernel in kernels.items() if kernel[0] in (10, 12)]
+    assert len(wide) <= 1
+    sixteen_chunk = -(-vocab_size // 16)
+    sixteen_tiles = -(-sixteen_chunk // 2048)
+    if torch.cuda.get_device_properties(0).multi_processor_count in (148, 152):
+        # B200 and GB300 fit seven 16-CTA clusters one CTA per SM; GB300 fits
+        # eight 12-CTA clusters, B200 eight 10-CTA clusters.
+        if torch.cuda.get_device_capability() == (10, 3) or sixteen_tiles > 6:
+            assert wide == [8]
+        else:
+            assert wide == []
+    for rows, kernel in kernels.items():
+        if rows not in wide:
+            assert kernel[:2] == (16, 8)
+    for rows in wide:
+        cluster_ctas, max_tiles = kernels[rows][:2]
+        assert cluster_ctas == 12 or sixteen_tiles > 6
+        chunk = -(-vocab_size // cluster_ctas)
+        tiles = -(-chunk // 2048)
+        narrowest = (
+            8 if tiles <= 8 else 10 if tiles <= 10 else {12: 11, 10: 13}[cluster_ctas]
+        )
+        assert max_tiles == narrowest
+        assert rows <= kernels[rows][3]
+        logits = torch.randn(rows, vocab_size, device="cuda")
+        probs = flashinfer.sampling.softmax(
+            logits, temperature=0.5, enable_pdl=enable_pdl
+        )
+        torch.testing.assert_close(
+            probs, torch.softmax(logits / 0.5, dim=-1), atol=1e-3, rtol=1e-3
+        )
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size,sm100_route,sm103_route",
+    [
+        # 8-tile 8-CTA chunks: the 4-tile 16-CTA kernel in two waves.
+        (40, 128000, "row", "row"),
+        # 7-tile 8-CTA chunks: two waves on sm_100, the shared-tile kernel on sm_103.
+        (40, 100000, "row", "shared_tiles"),
+        # 7-tile chunks past one wave of shared-tile clusters: the persistent kernel.
+        (84, 100000, "persistent", "persistent"),
+        # 6-tile chunks: the trip rule on sm_100, under 2.5 rows per persistent cluster on sm_103.
+        (80, 90000, "persistent", "shared_tiles"),
+        # 7-tile 16-CTA chunks: the trip rule on sm_100, under 2.5 rows per persistent cluster on sm_103.
+        (24, 212992, "persistent", "shared_tiles"),
+        # 5-tile 8-CTA chunks from 2.5 rows per persistent cluster on.
+        (256, 80000, "persistent", "persistent"),
+        # ... whose fifth tile is more than 1/4 (sm_100) or at least 3/8 (sm_103) full.
+        (160, 70000, "persistent", "shared_tiles"),
+        (128, 68000, "shared_tiles", "shared_tiles"),
+        (320, 69632, "shared_tiles", "shared_tiles"),
+        (160, 71680, "persistent", "persistent"),
+        # 5-tile 16-CTA chunks filling 9/10 of three persistent trips.
+        (40, 151936, "persistent", "persistent"),
+        # Full 16-CTA chunks: 10 (sm_100) or 8 (sm_103) rows per shared-tile cluster.
+        (288, 256000, "persistent", "shared_tiles"),
+    ],
+)
+def test_blackwell_cached_cluster_route_rules_per_arch(
+    rows, vocab_size, sm100_route, sm103_route
+):
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    torch.manual_seed(7)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    expected = sm100_route if capability == (10, 0) else sm103_route
+    routes = {
+        "row": flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER,
+        "persistent": flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_PERSISTENT,
+        "shared_tiles": flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_SHARED_TILES,
+    }
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=0.5
+    )
+    assert route == routes[expected]
+    kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        logits, temperature=0.5
+    )
+    if expected == "row":
+        assert kernel[:2] == (16, 4)
+    probs = flashinfer.sampling.softmax(logits, temperature=0.5)
     torch.testing.assert_close(
         probs, torch.softmax(logits / 0.5, dim=-1), atol=1e-3, rtol=1e-3
     )
