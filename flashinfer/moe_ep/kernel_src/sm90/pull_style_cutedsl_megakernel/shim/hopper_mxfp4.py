@@ -46,11 +46,13 @@ from typing import (
 
 import torch
 
+from flashinfer.moe_ep._compat import deprecated_aliases
 from flashinfer.moe_ep.sm90_routing import (
     SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
     normalize_sm90_routing_profile,
 )
 
+from ..src.moe_hopper_fp8.mxfp4_policy import resolve_mxfp4_optimizations
 from .comm import (
     _CompiledMega,
     _compute_peer_offsets,
@@ -66,8 +68,6 @@ from .hopper_fp8 import (
     _kind_to_cutlass_dtype,
     _sym_zeros_byte_view_1b,
 )
-from ..src.moe_hopper_fp8.mxfp4_policy import resolve_mxfp4_optimizations
-
 
 _Fp4Buffer = TypeVar("_Fp4Buffer", bound="MegaMoEHopperMxfp4SymmBuffer")
 _Fp4Inputs = TypeVar("_Fp4Inputs", bound="MegaMoEHopperMxfp4Inputs")
@@ -488,7 +488,6 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
 
         import cutlass.cute as cute
         import cutlass.utils as cutlass_utils
-
         from common.megamoe_constants import Fp8E8M0SfVecSize, SfPaddingBlock
 
         self._assert_mirrored_constants()
@@ -534,7 +533,7 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
             max_tokens_per_rank=c.num_tokens_per_rank,
             hidden=c.hidden,
             fc2_in_kernel_topk_reduce=c.in_kernel_fc2_reduce,
-            apply_topk_in_fc1=c.apply_topk_in_fc1,
+            apply_topk_in_fc1=c.apply_routing_weights_before_fc2,
             token_back_mode=c.resolved_token_back_mode,
             epi_flag_batch=c.epi_flag_batch,
             flag_batch=c.flag_batch,
@@ -861,8 +860,8 @@ def resolve_hopper_mxfp4_knobs(
 
     from .knob_cache import lookup_knobs
     from .mxfp4_tuner import (
-        hopper_mxfp4_cache_provenance_sha256,
         _ordered_base_candidates,
+        hopper_mxfp4_cache_provenance_sha256,
         is_hopper_mxfp4_tactic_shape_compatible,
         require_hopper_mxfp4_fused_tuning_device,
     )
@@ -912,6 +911,7 @@ def resolve_hopper_mxfp4_knobs(
     )
 
 
+@deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
 def _resolve_hopper_mxfp4_mega_moe_config(
     num_total_experts: int,
     num_max_tokens: int,
@@ -944,7 +944,7 @@ def _resolve_hopper_mxfp4_mega_moe_config(
     fc1_early_done_publish: Optional[bool] = None,
     fold_producer_warps: Optional[bool] = None,
     compact_pull_buffer: bool = False,
-    apply_topk_in_fc1: bool = True,
+    apply_routing_weights_before_fc2: bool = True,
     group_hint: Optional[int] = None,
     clc_bundle_size: Optional[int] = None,
     num_sched_stages: Optional[int] = None,
@@ -1060,7 +1060,7 @@ def _resolve_hopper_mxfp4_mega_moe_config(
             else fold_producer_warps
         ),
         compact_pull_buffer=compact_pull_buffer,
-        apply_topk_in_fc1=apply_topk_in_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         group_hint=group_hint,
         clc_bundle_size=clc_bundle_size,
         num_sched_stages=num_sched_stages,
@@ -1080,6 +1080,7 @@ def _resolve_hopper_mxfp4_mega_moe_config(
     return config
 
 
+@deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
 def get_symm_buffer_for_hopper_mxfp4_mega_moe(
     num_total_experts: int,
     num_max_tokens: int,
@@ -1112,7 +1113,7 @@ def get_symm_buffer_for_hopper_mxfp4_mega_moe(
     fc1_early_done_publish: Optional[bool] = None,
     fold_producer_warps: Optional[bool] = None,
     compact_pull_buffer: bool = False,
-    apply_topk_in_fc1: bool = True,
+    apply_routing_weights_before_fc2: bool = True,
     group_hint: Optional[int] = None,
     clc_bundle_size: Optional[int] = None,
     num_sched_stages: Optional[int] = None,
@@ -1160,7 +1161,7 @@ def get_symm_buffer_for_hopper_mxfp4_mega_moe(
         fc1_early_done_publish=fc1_early_done_publish,
         fold_producer_warps=fold_producer_warps,
         compact_pull_buffer=compact_pull_buffer,
-        apply_topk_in_fc1=apply_topk_in_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         group_hint=group_hint,
         clc_bundle_size=clc_bundle_size,
         num_sched_stages=num_sched_stages,

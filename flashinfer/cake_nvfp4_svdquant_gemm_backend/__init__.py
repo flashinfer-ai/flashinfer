@@ -57,13 +57,14 @@ def is_supported(
     *, m: int, n: int, k: int, rank: int, has_bias: bool, device: torch.device
 ) -> bool:
     """Whether ``device`` is an exported target and ``(M, N, K, rank, has_bias)``
-    has a route (the shape rule of :func:`cake_jit.select_record`)."""
+    has a route on its architecture (the shape rule of
+    :func:`cake_jit.select_record`)."""
     device = torch.device(device)
     if device.type != "cuda":
         return False
     try:
-        _loader.device_arch(_device_index(device))
-        select_record(m=m, n=n, k=k, rank=rank, has_bias=has_bias)
+        arch = _loader.device_arch(_device_index(device))
+        select_record(m=m, n=n, k=k, rank=rank, has_bias=has_bias, arch=arch)
         return True
     except (RuntimeError, ValueError):
         return False
@@ -84,26 +85,33 @@ def run(
 ) -> torch.Tensor:
     """Launch the routed program for one problem and return ``out``.
 
-    The route is :func:`cake_jit.select_record` over the host scalars; the
-    arguments are :func:`cake_jit.plan_values` (scale-factor views, bias
-    carrier, kernel scalars, grid).  ``enable_pdl`` must be ``None`` or equal
-    to the selected program's launch attribute; a program's programmatic
-    dependent launch is a property of its rendered binding, not a runtime
-    toggle.
+    The route is :func:`cake_jit.select_record` over the host scalars and the
+    device's architecture; the arguments are :func:`cake_jit.plan_values`
+    (scale-factor views, bias carrier, kernel scalars, grid).  ``enable_pdl``
+    must be ``None`` or equal to the selected program's launch attribute; a
+    program's programmatic dependent launch is a property of its rendered
+    binding, not a runtime toggle.
     """
     m, k_packed = (int(value) for value in a.shape)
     n = int(b.shape[0])
     k = 2 * k_packed
     rank = int(d.shape[1])
     has_bias = bias is not None
-    name = select_record(m=m, n=n, k=k, rank=rank, has_bias=has_bias)
+    device_index = _device_index(a.device)
+    name = select_record(
+        m=m,
+        n=n,
+        k=k,
+        rank=rank,
+        has_bias=has_bias,
+        arch=_loader.device_arch(device_index),
+    )
     record = MODULES[name]
     program_pdl = bool(record["launch"]["use_pdl"])
     if enable_pdl is not None and bool(enable_pdl) is not program_pdl:
         raise ValueError(
             f"the selected Cake program requires enable_pdl={program_pdl}, got {enable_pdl}"
         )
-    device_index = _device_index(a.device)
     values = plan_values(
         record,
         a=a,

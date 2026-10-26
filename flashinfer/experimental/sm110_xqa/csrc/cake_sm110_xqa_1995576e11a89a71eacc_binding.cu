@@ -24,23 +24,7 @@
 #include <cstdint>
 #include <cstring>
 
-#if !defined(__CUDACC_RTC__)
-#include <stddef.h>
-#endif
-struct __align__(8) KVCacheList {
-    void* pool;
-    const int* page_list;
-    const int* sequence_lengths;
-    unsigned int max_pages;
-};
-static_assert(sizeof(KVCacheList) == 32, "KVCacheList size");
-static_assert(__alignof__(KVCacheList) == 8, "KVCacheList alignment");
-#if !defined(__CUDACC_RTC__)
-static_assert(offsetof(KVCacheList, pool) == 0, "KVCacheList.pool offset");
-static_assert(offsetof(KVCacheList, page_list) == 8, "KVCacheList.page_list offset");
-static_assert(offsetof(KVCacheList, sequence_lengths) == 16, "KVCacheList.sequence_lengths offset");
-static_assert(offsetof(KVCacheList, max_pages) == 24, "KVCacheList.max_pages offset");
-#endif
+#include "cake_sm110_xqa_kv_cache_list_page128.h"
 
 extern "C" __global__ void kernel_cake_sm110_xqa_1995576e11a89a71eacc(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap KVV, unsigned int q_seq_len, unsigned int num_kv_heads, unsigned int head_group_size, const unsigned int* __restrict__ q_cu_seq_lens, float attention_scale, __half* __restrict__ output, const unsigned int* __restrict__ mask, KVCacheList kv_cache_list, unsigned int batch_size, float k_cache_scale, float v_cache_scale);
 
@@ -50,58 +34,7 @@ using tvm::ffi::TensorView;
 
 constexpr const char* KERNEL_NAME = "kernel_cake_sm110_xqa_1995576e11a89a71eacc";
 
-void CheckCuda(cudaError_t status, const char* what) {
-  TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
-      << KERNEL_NAME << ": " << what << " failed: " << cudaGetErrorString(status);
-}
-
-void CheckCu(CUresult result, const char* what) {
-  if (result != CUDA_SUCCESS) {
-    const char* name = nullptr;
-    const char* message = nullptr;
-    cuGetErrorName(result, &name);
-    cuGetErrorString(result, &message);
-    TVM_FFI_THROW(RuntimeError) << KERNEL_NAME << ": " << what << " failed with "
-                                << (name ? name : "an unknown CUresult") << " (" << static_cast<int>(result)
-                                << "): " << (message ? message : "");
-  }
-}
-
-void* DataPtr(const TensorView& t) { return static_cast<char*>(t.data_ptr()) + t.byte_offset(); }
-
-void CheckUnitInnerStride(const TensorView& t, const char* name) {
-  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
-      << KERNEL_NAME << ": '" << name << "' needs a unit innermost stride, got " << t.stride(-1);
-}
-
-// The product of the extents above the trailing `trailing` dims.
-int64_t NumelAbove(const TensorView& t, int trailing) {
-  int64_t product = 1;
-  for (int axis = 0; axis < t.ndim() - trailing; ++axis) product *= t.size(axis);
-  return product;
-}
-
-cuuint64_t Extent(int64_t value, const char* descriptor) {
-  TVM_FFI_CHECK(value > 0, ValueError)
-      << KERNEL_NAME << ": an extent of descriptor '" << descriptor << "' resolves to " << value;
-  return static_cast<cuuint64_t>(value);
-}
-
-cuuint64_t Stride(int64_t value, const char* descriptor) {
-  TVM_FFI_CHECK(value >= 0, ValueError)
-      << KERNEL_NAME << ": a stride of descriptor '" << descriptor << "' resolves to " << value;
-  return static_cast<cuuint64_t>(value);
-}
-
-template <int N, int A>
-struct alignas(A) CakeRecord {
-  unsigned char bytes[N];
-};
-
-template <int N, int A, typename T>
-void PutField(CakeRecord<N, A>& record, int offset, T value) {
-  std::memcpy(record.bytes + offset, &value, sizeof(T));
-}
+#include "cake_sm110_xqa_binding_helpers_tma_record.h"
 
 CUtensorMap EncodeTma_Q(const TensorView& t) {
   TVM_FFI_CHECK(t.ndim() >= 3, ValueError)

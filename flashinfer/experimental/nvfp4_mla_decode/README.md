@@ -79,6 +79,27 @@ query block, optional sinks, at least 128 packed query rows per batch
 and SM103 (B300) only (SM120/SM121 lack the block-scaled tensor-core path).
 At most 64 KV splits per request.
 
+## Package layout
+
+The backend is a self-contained package. `cake_jit.py` holds the registry of
+the generated programs and the loader glue (`launch_grid`, `launch_args`,
+`load`). The registry's `MODULES` holds one record per program, each naming
+the stage it fills: `decode`, the persistent decode, and `reduce`, the split-KV
+combine. On SM100 the decode stage has a second program, `decode_qk_ahead`,
+which the host selects once per plan for long balanced plans; both decode
+programs give bitwise-identical outputs. Each record carries the host plan: the
+architectures it is delivered for, its launch record, the argument plan of its
+`run` entry, the grid rule a launch follows, the kernel-parameter to
+logical-argument map and the work-table and partial-buffer constants the
+kernels read. What to compile is recorded once in `build.json`: per program,
+the kernel and binding units under `csrc/cake_nvfp4_mla_decode/`, their
+digests and nvcc flags, one entry per (program, architecture). `cake_build.py`
+loads a prebuilt library from `aot/` when a builder compiled one and otherwise
+JIT-builds the manifest entry through FlashInfer from the same sources and
+flags.
+`cake_backend.py` holds the host work plan, the workspace carve and the
+runner, which binds each program's `run` entry through its record.
+
 See `tests/experimental/test_cake_nvfp4_mla_decode.py` for the torch
 reference and validated shape set and `benchmarks/bench_cake_nvfp4_mla_decode.py`
 for the timing harness.

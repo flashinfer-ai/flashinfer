@@ -14,40 +14,8 @@
  * limitations under the License.
  */
 
-typedef signed char        int8_t;
-typedef unsigned char      uint8_t;
-typedef unsigned short     uint16_t;
-typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
-typedef unsigned long long uint64_t;
-#else
-typedef unsigned long      uint64_t;
-#endif
-static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
-typedef signed int         int32_t;
-typedef short int          int16_t;
-struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
-static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
-static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+#include "cake_sm110_xqa_device_abi.cuh"
 
-#if defined(__CUDACC_RTC__)
-typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
-#else
-#include <cuda.h>
-#endif
-
-static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-
-__device__ __forceinline__ int make_warp_uniform(int x) {
-    int result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
-                 : "=r"(result) : "r"(x));
-    return result;
-}
-
-#define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 256
 #define TMEM_SCORES_OFFSET 0
 #define TMEM_ACC_OFFSET 128
@@ -72,168 +40,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
-
-__device__ __forceinline__ uint32_t elect_sync() {
-    uint32_t pred = 0;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred %%px;\n\t"
-        "elect.sync _|%%px, %1;\n\t"
-        "@%%px mov.s32 %0, 1;\n\t"
-        "}\n"
-        : "+r"(pred)
-        : "r"(0xFFFFFFFF));
-    return pred;
-}
-
-
-__device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
-        :: "r"(mbar_addr), "r"(count) : "memory");
-}
-
-
-__device__ __forceinline__ void mbarrier_expect_tx(int mbar_addr, uint32_t bytes) {
-    asm volatile(
-        "mbarrier.expect_tx.relaxed.cta.shared::cta.b64 [%0], %1;"
-        :: "r"(mbar_addr), "r"(bytes) : "memory");
-}
-
-
-
-// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
-// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
-// explicit loop still makes this helper blocking until acquire succeeds.
-__device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1;\n\t"
-        "@P1 bra.uni DONE;\n\t"
-        "bra.uni LAB_WAIT;\n\t"
-        "DONE:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER_HINT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_CLUSTER_HINT;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER_HINT;\n\t"
-        "DONE_CLUSTER_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-
-
-
-union MmaSmemDesc {
-    uint64_t u64;
-    uint32_t u32[2];
-};
-
-
-
-__device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
-    asm volatile(
-        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
-        :: "r"(mbar_addr) : "memory");
-}
-
-
-__device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
-    asm volatile(
-        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
-        :: "r"(mbar_addr), "r"(bytes) : "memory");
-}
-
-
-
-__device__ __forceinline__ float approx_exp2(float x) {
-    float y;
-    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
-    return y;
-}
-
-
-__device__ __forceinline__ float max_noftz(float a, float b) {
-    float c;
-    asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
-    return c;
-}
-
-
-
-
-__device__ __forceinline__ float row_max_reduce(float2 acc) {
-    return max_noftz(acc.x, acc.y);
-}
-
-
-
-
-
-
-__device__ __forceinline__ void mul_f32x2_inplace(float2* a, float2 b) {
-    asm("mul.rn.ftz.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-__device__ __forceinline__ void mul_f32x2_noftz_inplace(float2* a, float2 b) {
-    asm("mul.rn.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-__device__ __forceinline__ float2 add_f32x2(float2 a, float2 b) {
-    float2 r;
-    asm("add.rn.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b),
-          "l"(*(unsigned long long*)&c));
-    return r;
-}
-
-
-// ex2_emulation_f32x2 defined in softmax_frag_exp2_cast helper (or standalone)
-
-
-
-
-__device__ __forceinline__ void tma_3d_gmem2smem(
-    int dst, const void *tmap_ptr, int x, int y, int z, int mbar_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.3d.shared::cta.global"
-        ".mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3, %4}], [%5];"
-        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z),
-           "r"(mbar_addr) : "memory");
-}
-
-
-__device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
-    asm volatile(
-        "tcgen05.commit.cta_group::1.mbarrier::arrive::one"
-        ".shared::cluster.b64 [%0];"
-        :: "r"(mbar_addr) : "memory");
-}
-
+#include "cake_sm110_xqa_device_helpers.cuh"
 extern "C" {
 
 __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) __cluster_dims__(4,1,1) void
@@ -408,7 +215,7 @@ kernel_cake_sm110_xqa_3e8ea029d502882b2294(const __grid_constant__ CUtensorMap Q
             unsigned int my_row = lane_1 % 16;
             unsigned int col_half = lane_1 / 16;
             int row_valid = ((my_row < ratio) ? 1 : 0);
-            float scale_log2 = attention_scale * 1.4426950408889634f;
+            float scale_log2 = attention_scale * 1.442695f;
             float m_used = -CUDART_INF_F;
             float row_sum = 0.0f;
             unsigned int _phase_s_full_0 = 0;
@@ -909,15 +716,15 @@ kernel_cake_sm110_xqa_3e8ea029d502882b2294(const __grid_constant__ CUtensorMap Q
                 unsigned int k_stage = kv_stage;
                 kv_stage += 1;
                 if (kv_stage == 4) { kv_stage = 0; kv_phase ^= 1; }
-                if (elect_sync()) {
-                    int _smem_desc_lo_1 = ((q_smem_addr) >> 4) & 0x3FFF;
-                    int _smem_desc_lo_2 = (((kv_smem_addr) >> 4) & 0x3FFF) + (k_stage) * 1024;
-                    asm volatile(
+                uint32_t _elected_1 = elect_sync();
+                int _smem_desc_lo_2 = ((q_smem_addr) >> 4) & 0x3FFF;
+                int _smem_desc_lo_3 = (((kv_smem_addr) >> 4) & 0x3FFF) + (k_stage) * 1024;
+                asm volatile(
                     "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
                     ".reg .b64 da, db;\n\t"
-                    ""
+                    "setp.ne.b32 leader, %4, 0;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
@@ -928,47 +735,46 @@ kernel_cake_sm110_xqa_3e8ea029d502882b2294(const __grid_constant__ CUtensorMap Q
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 506;\n\t"
                     "add.u32 blo, blo, 506;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_1), "r"(_smem_desc_lo_2), "r"(tmem_scores), "r"(0) : "memory");
-                    tcgen05_commit(s_full_addr);
-                    tcgen05_commit(kv_empty_addr + (k_stage) * 8);
-                }
+                    :: "r"(_smem_desc_lo_2), "r"(_smem_desc_lo_3), "r"(tmem_scores), "r"(0), "r"(_elected_1) : "memory");
+                tcgen05_commit_leader(s_full_addr, _elected_1);
+                tcgen05_commit_leader(kv_empty_addr + (k_stage) * 8, _elected_1);
                 mbarrier_wait(kv_full_addr + (kv_stage) * 8, kv_phase);
                 unsigned int v_stage = kv_stage;
                 kv_stage += 1;
@@ -987,7 +793,7 @@ kernel_cake_sm110_xqa_3e8ea029d502882b2294(const __grid_constant__ CUtensorMap Q
                 _phase_p_full_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 if (elect_sync()) {
-                    int _smem_desc_lo_3 = ((((v_smem_addr) >> 4) & 0x3FFF) | 0x2000000) + (v_stage) * 1024;
+                    int _smem_desc_lo_4 = ((((v_smem_addr) >> 4) & 0x3FFF) | 0x2000000) + (v_stage) * 1024;
                     asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"
@@ -1016,7 +822,7 @@ kernel_cake_sm110_xqa_3e8ea029d502882b2294(const __grid_constant__ CUtensorMap Q
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_acc), "r"(_smem_desc_lo_3), "r"(tmem_scores + 32), "r"(((first_pv) ? 0 : 1)) : "memory");
+                    :: "r"(tmem_acc), "r"(_smem_desc_lo_4), "r"(tmem_scores + 32), "r"(((first_pv) ? 0 : 1)) : "memory");
                     if (tile_3 + 1 == tile_count_1) {
                         tcgen05_commit(o_full_addr);
                     }
@@ -1027,8 +833,7 @@ kernel_cake_sm110_xqa_3e8ea029d502882b2294(const __grid_constant__ CUtensorMap Q
             unsigned int _phase_tmem_retire_0 = 0;
             mbarrier_wait(tmem_retire_addr, _phase_tmem_retire_0);
             _phase_tmem_retire_0 ^= 1;
-            int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
-            asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(_tmem_dealloc_addr), "r"(256));
+            asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(256));
             asm volatile("tcgen05.fence::before_thread_sync;");
             unsigned int rank_1 = (unsigned int)cta_rank;
             if (rank_1 == 0) {
@@ -1133,14 +938,14 @@ kernel_cake_sm110_xqa_3e8ea029d502882b2294(const __grid_constant__ CUtensorMap Q
                             numerator_1[element_7] = __fmaf_rn(shard_values_7_1[element_7], weight_8_1, numerator_1[element_7]);
                         }
                         denominator_1 = __fmaf_rn(sums_1[3], weight_8_1, denominator_1);
-                        float _rcp_4 = __frcp_rn(denominator_1);
-                        float inverse_1 = ((denominator_1 > 0.0f) ? _rcp_4 : 0.0f);
+                        float _rcp_5 = __frcp_rn(denominator_1);
+                        float inverse_1 = ((denominator_1 > 0.0f) ? _rcp_5 : 0.0f);
                         {
-                            const float2 _prescale2_5 = {inverse_1, inverse_1};
+                            const float2 _prescale2_6 = {inverse_1, inverse_1};
                             #if __CUDA_ARCH__ >= 1000
                             #pragma unroll
                             for (int _ps = 0; _ps < 4; _ps++)
-                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(&numerator_1[0])[_ps], _prescale2_5);
+                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(&numerator_1[0])[_ps], _prescale2_6);
                             #else
                             #pragma unroll
                             for (int _ps = 0; _ps < 8; _ps++)

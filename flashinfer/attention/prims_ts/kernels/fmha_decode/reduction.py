@@ -230,6 +230,8 @@ def _reduce_exact_splits_body(
             reduce_row_idx,
             seq_len_q,
         )
+        # Empty producers intentionally leave scratch and output untouched.
+        valid_reduce_row = valid_reduce_row & (Int32(g_seqlens_kv[b_idx]) > Int32(0))
 
     if valid_reduce_row:
         # The workspace retains configured-max strides, but only the runtime
@@ -585,6 +587,8 @@ def decode_gen_parallel_separate_reduction_kernel(
             reduce_row_idx,
             seq_len_q,
         )
+        # Empty producers intentionally leave scratch and output untouched.
+        valid_reduce_row = valid_reduce_row & (Int32(g_seqlens_kv[b_idx]) > Int32(0))
 
     for split_base_i in cutlass.range_constexpr(
         0, lane_splits, PARALLEL_REDUCTION_LOAD_BATCH

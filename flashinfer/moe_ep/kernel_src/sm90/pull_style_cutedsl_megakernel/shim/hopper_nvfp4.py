@@ -41,6 +41,7 @@ from typing import Any, Callable, ClassVar, Dict, Literal, Optional, Protocol, T
 
 import torch
 
+from flashinfer.moe_ep._compat import deprecated_aliases
 from flashinfer.moe_ep.sm90_routing import (
     SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
     normalize_sm90_routing_profile,
@@ -128,6 +129,7 @@ def _validate_complete_nvfp4_tactic(
         raise ValueError(f"{source}: {exc}") from exc
 
 
+@deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
 @dataclasses.dataclass(frozen=True)
 class MegaMoEHopperNvfp4Config(MegaMoEHopperMxfp4Config):
     """Compile/launch configuration for fused NVFP4 x FP8.
@@ -690,6 +692,7 @@ def resolve_hopper_nvfp4_knobs(
     )
 
 
+@deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
 def _resolve_hopper_nvfp4_mega_moe_config(
     num_total_experts: int,
     num_max_tokens: int,
@@ -721,7 +724,7 @@ def _resolve_hopper_nvfp4_mega_moe_config(
     fc1_store_offload: Optional[bool] = None,
     fc1_early_done_publish: Optional[bool] = None,
     fold_producer_warps: Optional[bool] = None,
-    apply_topk_in_fc1: bool = True,
+    apply_routing_weights_before_fc2: bool = True,
     group_hint: Optional[int] = None,
     clc_bundle_size: Optional[int] = None,
     num_sched_stages: Optional[int] = None,
@@ -848,7 +851,7 @@ def _resolve_hopper_nvfp4_mega_moe_config(
             if fold_producer_warps is None
             else fold_producer_warps
         ),
-        apply_topk_in_fc1=apply_topk_in_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         group_hint=group_hint,
         clc_bundle_size=clc_bundle_size,
         num_sched_stages=num_sched_stages,
@@ -891,6 +894,7 @@ def _resolve_hopper_nvfp4_mega_moe_config(
     return config
 
 
+@deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
 def get_symm_buffer_for_hopper_nvfp4_mega_moe(
     num_total_experts: int,
     num_max_tokens: int,
@@ -922,7 +926,7 @@ def get_symm_buffer_for_hopper_nvfp4_mega_moe(
     fc1_store_offload: Optional[bool] = None,
     fc1_early_done_publish: Optional[bool] = None,
     fold_producer_warps: Optional[bool] = None,
-    apply_topk_in_fc1: bool = True,
+    apply_routing_weights_before_fc2: bool = True,
     group_hint: Optional[int] = None,
     clc_bundle_size: Optional[int] = None,
     num_sched_stages: Optional[int] = None,
@@ -976,7 +980,7 @@ def get_symm_buffer_for_hopper_nvfp4_mega_moe(
         fc1_store_offload=fc1_store_offload,
         fc1_early_done_publish=fc1_early_done_publish,
         fold_producer_warps=fold_producer_warps,
-        apply_topk_in_fc1=apply_topk_in_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         group_hint=group_hint,
         clc_bundle_size=clc_bundle_size,
         num_sched_stages=num_sched_stages,
