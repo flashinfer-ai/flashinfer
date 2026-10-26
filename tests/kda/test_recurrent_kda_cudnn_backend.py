@@ -394,7 +394,7 @@ def test_cudnn_backend_accepts_gate_dtypes(gate_dtype):
     assert_rel_close("final_state", final_state, ref_state, SERIAL_TOLERANCE)
 
 
-@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16, torch.float16])
 def test_cudnn_backend_carries_state_dtype(state_dtype):
     """An fp32 state pool crosses too, which FlashInfer's own backends reject."""
     device = torch.device("cuda")
@@ -853,6 +853,46 @@ def test_cudnn_backend_names_every_unsupported_argument_at_once():
     assert "num_spec_tokens" in message and "seq_order" in message
 
 
+@pytest.mark.parametrize("entry", ["public", "direct"])
+def test_cudnn_backend_rejects_the_unbounded_softplus_gate(entry):
+    """cuDNN's in-kernel gate is ``lower_bound * sigmoid(...)``; the softplus
+    form FlashInfer means by ``lower_bound=None`` is not served and must not
+    run as the bounded gate (the frontend would substitute -5)."""
+    inputs = _make_inputs([256], 4, seed=5)
+    run = _run if entry == "public" else _run_direct
+    with pytest.raises(NotImplementedError, match="softplus"):
+        run(inputs, **_gate_kwargs(inputs, lower_bound=None))
+
+
+def test_cudnn_backend_takes_a_precomputed_softplus_gate():
+    """The softplus model's route to cuDNN: the log-space gate as ``g`` with
+    ``use_gate_in_kernel=False``, where the bound is unused."""
+    inputs = _make_inputs([256], 4, seed=6)
+    g_log = (
+        -inputs["A_log"].float()[None, None, :, None]
+        * F.softplus(inputs["g"].float() + inputs["dt_bias"].float()[None, None])
+    ).to(torch.bfloat16)
+    output, _ = _run(
+        inputs,
+        g=g_log,
+        output_final_state=True,
+        **_gate_kwargs(
+            inputs, use_gate_in_kernel=False, lower_bound=None, A_log=None, dt_bias=None
+        ),
+    )
+    reference, _ = serial_delta_rule(
+        inputs["q"][0],
+        inputs["k"][0],
+        inputs["v"][0],
+        inputs["cu_seqlens"],
+        alpha=g_log[0].float().exp(),
+        beta=torch.sigmoid(inputs["beta"][0].float()),
+        scale=1.0 / math.sqrt(HEAD_DIM),
+        l2norm=True,
+    )
+    assert rel_err(output[0], reference) < SERIAL_TOLERANCE
+
+
 def test_backend_argument_is_validated():
     inputs = _make_inputs([128], 4, seed=1)
     with pytest.raises(ValueError, match="backend"):
@@ -907,7 +947,7 @@ def _make_kda_pool(heads, dtype, padding=0):
     return pool
 
 
-@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("padding", [0, 96])
 @pytest.mark.parametrize("return_state", [False, True])
 def test_cudnn_kda_pool_updates_only_selected_rows(state_dtype, padding, return_state):
@@ -938,7 +978,7 @@ def test_cudnn_kda_pool_updates_only_selected_rows(state_dtype, padding, return_
         assert torch.equal(pool[untouched], before[untouched])
 
 
-@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16, torch.float16])
 def test_cudnn_kda_pool_long_prefill_matches_serial(state_dtype):
     _require_state_pool_frontend()
     inputs = _make_inputs([2049, 0, 1023], 4, seed=319)
@@ -1052,3 +1092,133 @@ def test_cudnn_kda_pool_capture_observes_changed_slots_and_contents():
         run()
     finally:
         torch.cuda.set_sync_debug_mode(old_mode)
+
+
+@pytest.mark.parametrize("prefer", [True, False])
+def test_auto_follows_the_cudnn_policy(prefer, monkeypatch):
+    """``backend="auto"`` runs cuDNN ahead of every native route when
+    ``_prefer_cudnn_kda_prefill`` says so and stays native otherwise; both
+    match the serial oracle. The policy is patched rather than driven by
+    shape so this test does not move with the measured region."""
+    from flashinfer import kda as kda_module
+    from flashinfer.cudnn import linear_attention
+
+    if not linear_attention._linear_attention_auto_available():
+        pytest.skip("auto needs cudnn-frontend 1.31+ and CuTe DSL 4.7+")
+    monkeypatch.setattr(
+        kda_module, "_prefer_cudnn_kda_prefill", lambda *args, **kwargs: prefer
+    )
+    inputs = _make_inputs([1024], 4, seed=137, initial_state=True)
+    executions = []
+    run = linear_attention._run_la_graph
+
+    def observe(*args, **kwargs):
+        executions.append(args[0])
+        return run(*args, **kwargs)
+
+    monkeypatch.setattr(linear_attention, "_run_la_graph", observe)
+    out, state = recurrent_kda(
+        inputs["q"],
+        inputs["k"],
+        inputs["v"],
+        inputs["g"],
+        inputs["beta"],
+        initial_state=inputs["initial_state"].clone(),
+        **_gate_kwargs(inputs, output_final_state=True),
+    )
+    assert executions == (["kda"] if prefer else [])
+    expected_out, expected_state = _serial(inputs)
+    assert_rel_close("output", out, expected_out, SERIAL_TOLERANCE)
+    assert_rel_close("final_state", state, expected_state, SERIAL_TOLERANCE)
+
+
+@pytest.mark.parametrize("prefer", [True, False])
+def test_auto_serves_state_pools(prefer, monkeypatch):
+    """A pool call follows the same auto policy as its compact form: cuDNN when
+    the policy says so, the native pool route otherwise; both update only the
+    selected slots in place and match the serial oracle."""
+    from flashinfer import kda as kda_module
+    from flashinfer.cudnn import linear_attention
+
+    _require_state_pool_frontend()
+    if not linear_attention._linear_attention_auto_available():
+        pytest.skip("auto needs cudnn-frontend 1.31+ and CuTe DSL 4.7+")
+    monkeypatch.setattr(
+        kda_module, "_prefer_cudnn_kda_prefill", lambda *args, **kwargs: prefer
+    )
+    inputs = _make_inputs([1024, 512], 4, seed=331)
+    pool = _make_kda_pool(4, torch.bfloat16)
+    slots = torch.tensor([5, 2], device="cuda", dtype=torch.int32)
+    before = pool.clone()
+    expected_out, expected_state = _serial(
+        inputs, initial_state=pool.index_select(0, slots)
+    )
+    executions = []
+    run = linear_attention._run_la_graph
+
+    def observe(*args, **kwargs):
+        executions.append(args[0])
+        return run(*args, **kwargs)
+
+    monkeypatch.setattr(linear_attention, "_run_la_graph", observe)
+    out, returned = recurrent_kda(
+        inputs["q"],
+        inputs["k"],
+        inputs["v"],
+        inputs["g"],
+        inputs["beta"],
+        initial_state=pool,
+        ssm_state_indices=slots,
+        **_gate_kwargs(inputs, output_final_state=True),
+    )
+    assert executions == (["kda"] if prefer else [])
+    assert returned.shape == pool.shape
+    assert_rel_close("pool output", out, expected_out, SERIAL_TOLERANCE)
+    assert_rel_close(
+        "pool state", pool.index_select(0, slots), expected_state, SERIAL_TOLERANCE
+    )
+    untouched = [0, 1, 3, 4, 6]
+    assert torch.equal(pool[untouched], before[untouched])
+
+
+def test_pool_clause_premise_small_bh_declines_pools():
+    """The KDA pool clause of the auto policy rests on FlashInfer's small-BH
+    kernel declining pool calls; should it learn them, the 64-tile pool cells
+    need measuring again before the clause stays."""
+    from flashinfer.kda_prefill_cute_small_bh import (
+        _is_kda_prefill_cute_small_bh_eligible,
+    )
+    from tests.test_helpers.kda_prefill import packed_prefill_inputs
+
+    inputs = packed_prefill_inputs("cuda", seq_lens=[1024], num_heads=4, seed=17)
+    args = dict(
+        q=inputs["q"],
+        k=inputs["k"],
+        v=inputs["v"],
+        g=inputs["g"],
+        beta=inputs["beta"],
+        A_log=inputs["A_log"],
+        dt_bias=inputs["dt_bias"],
+        initial_state=torch.zeros(1, 4, 128, 128, device="cuda", dtype=torch.bfloat16),
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        lower_bound=-5.0,
+        cu_seqlens=inputs["cu_seqlens"],
+        seq_order=None,
+        ssm_state_indices=None,
+        num_spec_tokens=None,
+        num_accepted_tokens=None,
+        output=None,
+        initial_state_source=None,
+        initial_state_indices=None,
+        beta_is_logit=True,
+        state_checkpoints=None,
+        checkpoint_cu_starts=None,
+        checkpoint_every_n_tokens=0,
+    )
+    assert _is_kda_prefill_cute_small_bh_eligible(**args)
+    pool = torch.zeros(6, 4, 128, 128, device="cuda", dtype=torch.bfloat16)
+    slots = torch.tensor([3], device="cuda", dtype=torch.int32)
+    assert not _is_kda_prefill_cute_small_bh_eligible(
+        **dict(args, initial_state=pool, ssm_state_indices=slots)
+    )

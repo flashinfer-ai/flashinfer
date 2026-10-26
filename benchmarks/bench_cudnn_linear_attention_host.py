@@ -51,7 +51,13 @@ def main():
     torch.manual_seed(42)
     shape = (1, args.batch * args.tokens, args.heads, 128)
     q = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
-    k, v, gate = torch.randn_like(q), torch.randn_like(q), torch.randn_like(q)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    # All-ones decay: the raw gate logit at the sigmoid floor, where the
+    # in-kernel safe gate (lower_bound = -5, A_log = dt_bias = 0) gives
+    # exp(-5 sigmoid(g)) = 1 exactly. Write strengths (beta) stay random.
+    gate = torch.full_like(
+        q, float(torch.special.logit(torch.tensor(1e-20, dtype=torch.float64)))
+    )
     beta = torch.randn(shape[:-1], device="cuda", dtype=torch.bfloat16)
     seed = (
         torch.randn(args.batch, args.heads, 128, 128, device="cuda", dtype=q.dtype)

@@ -5,4 +5,5 @@ from .linear_attention import (
     cudnn_chunk_gated_delta_rule,
     cudnn_chunk_gated_delta_rule2,
     cudnn_recurrent_kda,
+    cudnn_ssd_combined_fwd,
 )
