@@ -183,11 +183,14 @@ def plan_stages(
     cluster: int = 1,
     extra_bytes: int = 0,
     land_alias: bool = False,
+    split_fin: bool = False,
 ) -> int:
     stage_bytes = (BLOCK_ROWS + n_pad) * CHUNK_K * 2 * kdepth
     # Cluster mode: the DSMEM landing zone of the K-split combine owns smem unless it aliases the drained A ring
-    # (``land_alias``); single-CTA instances keep the 1 KiB flag/landing prefix.
-    red_alloc = (0 if land_alias else n_pad * BLOCK_ROWS * 4) if cluster == 2 else 1024
+    # (``land_alias``); with the split finalize (``split_fin``) each CTA receives half the partial, so the zone is
+    # half as large.  Single-CTA instances keep the 1 KiB flag/landing prefix.
+    land_bytes = n_pad * BLOCK_ROWS * (2 if split_fin else 4)
+    red_alloc = (0 if land_alias else land_bytes) if cluster == 2 else 1024
     return max(
         1,
         min(
@@ -235,6 +238,7 @@ def choose_config(
     k_chunks: tuple[int, ...],
     sm_count: int,
     land_alias: bool = False,
+    split_fin: bool = False,
 ) -> tuple[int, int, int, int]:
     """``(kdepth, grid, stages, cluster)`` of the production rule: depth 1 (ring takes all smem);
     the front stage takes depth 2 while its ring keeps ``FRONT_KD2_MIN_STAGES[cluster]`` stages."""
@@ -250,7 +254,11 @@ def choose_config(
     )
     if stage == "front" and all(k % 2 == 0 for k in k_chunks):
         stages2 = plan_stages(
-            n_pad=n_pad, kdepth=2, cluster=part["cluster"], land_alias=land_alias
+            n_pad=n_pad,
+            kdepth=2,
+            cluster=part["cluster"],
+            land_alias=land_alias,
+            split_fin=split_fin,
         )
         if stages2 >= FRONT_KD2_MIN_STAGES[part["cluster"]]:
             part2 = plan_partition(
@@ -266,7 +274,11 @@ def choose_config(
         kd,
         part["grid"],
         plan_stages(
-            n_pad=n_pad, kdepth=kd, cluster=part["cluster"], land_alias=land_alias
+            n_pad=n_pad,
+            kdepth=kd,
+            cluster=part["cluster"],
+            land_alias=land_alias,
+            split_fin=split_fin,
         ),
         part["cluster"],
     )
@@ -288,6 +300,7 @@ def decode_front_plan(
     tiles = r_tiles + l_tiles + s_tiles
     k_chunks = HIDDEN // CHUNK_K
     land_alias = land_alias_auto(n_pad, k_chunks)
+    split_fin = split_fin_route("front", n_pad)
     kdepth, grid, stages, cluster = choose_config(
         "front",
         tiles=tiles,
@@ -295,8 +308,10 @@ def decode_front_plan(
         k_chunks=(k_chunks,),
         sm_count=sm_count,
         land_alias=land_alias,
+        split_fin=split_fin,
     )
     land_alias = land_alias and cluster == 2
+    split_fin = split_fin and cluster == 2
     l2_promotion = (
         i_local == i_local_for_tp(FRONT_L2_PROMOTION_TP)
         and n_pad <= FRONT_L2_PROMOTION_MAX_N_PAD
@@ -333,6 +348,9 @@ def decode_front_plan(
         land_alias=bool(land_alias),
         a_evict_first=DECODE_A_EVICT_FIRST,
         a_l2_promotion=DECODE_A_L2_PROMOTION if l2_promotion else "none",
+        split_fin=bool(split_fin),
+        early_arrive=False,
+        up_prefetch=False,
         tiles=tiles,
     )
 
@@ -353,6 +371,7 @@ def decode_tail_plan(
         raise ValueError("K slices must be multiples of 64")
     k1, k2 = k_up // CHUNK_K, i_local // CHUNK_K
     land_alias = land_alias_auto(n_pad, k1 + k2)
+    split_fin = split_fin_route("tail", n_pad, num_partials)
     kdepth, grid, stages, cluster = choose_config(
         "tail",
         tiles=tiles,
@@ -360,8 +379,10 @@ def decode_tail_plan(
         k_chunks=(k1, k2),
         sm_count=sm_count,
         land_alias=land_alias,
+        split_fin=split_fin,
     )
     land_alias = land_alias and cluster == 2
+    split_fin = split_fin and cluster == 2
     k1_macros = k1 // kdepth
     cl_u0 = (k1_macros + 1) // 2 if cluster == 2 else k1_macros
     bn_units = max(cl_u0, k1_macros - cl_u0) if cluster == 2 else k1_macros
@@ -381,6 +402,7 @@ def decode_tail_plan(
             cluster=cluster,
             extra_bytes=bn_bytes + (rows_bytes if use_rows else 0),
             land_alias=land_alias,
+            split_fin=split_fin,
         )
         if bn_stages < SMEM_B1_MIN_STAGES_RS and use_rows:
             use_rows = False
@@ -392,6 +414,7 @@ def decode_tail_plan(
                 cluster=cluster,
                 extra_bytes=bn_bytes,
                 land_alias=land_alias,
+                split_fin=split_fin,
             )
         if use_bn and bn_stages < (
             SMEM_B1_MIN_STAGES_RS if use_rows else SMEM_B1_MIN_STAGES
@@ -407,6 +430,14 @@ def decode_tail_plan(
             if use_rows
             else (SMEM_B1_MIN_STAGES if use_bn else 2),
         )
+    # The global-y protocol's levers (the resident-B instances normalise in smem and take neither).
+    early_arrive = split_fin and not use_bn and tp == TAIL_EARLY_ARRIVE_TP
+    up_prefetch = (
+        split_fin
+        and not use_bn
+        and tp == TAIL_UP_PREFETCH_TP
+        and n_pad in TAIL_UP_PREFETCH_N_PAD
+    )
     return dict(
         grid=grid,
         n_pad=n_pad,
@@ -441,6 +472,9 @@ def decode_tail_plan(
         land_alias=bool(land_alias),
         a_evict_first=bool(DECODE_A_EVICT_FIRST and tp == 1),
         a_l2_promotion=DECODE_A_L2_PROMOTION if tp == TAIL_L2_PROMOTION_TP else "none",
+        split_fin=bool(split_fin),
+        early_arrive=bool(early_arrive),
+        up_prefetch=bool(up_prefetch),
         tiles=tiles,
         k1=k1,
         k2=k2,
@@ -460,6 +494,30 @@ DECODE_A_L2_PROMOTION = "l2_256b"
 TAIL_L2_PROMOTION_TP = 1
 FRONT_L2_PROMOTION_TP = 8
 FRONT_L2_PROMOTION_MAX_N_PAD = 64
+# Split finalize (``split_fin``, symbol suffix ``_sf``): both CTAs of a cluster pair finalize half the values -- each
+# pushes the partial quads its peer finalizes into the peer's landing zone and adds the quads it receives -- so the pair
+# combine, the epilogue math and the output stores are split over the pair and each landing zone holds half the partial
+# (one more ring stage for the TP8 tail at N_PAD 128).  Every value is still rank 0's partial plus rank 1's, so the
+# outputs are bitwise those of the single-finisher instance.  The cluster-pair instances take it: the TP8 front from
+# N_PAD 16 and the fused-norm tails of one routed partial from N_PAD 32 (P >= 2 keeps the single finisher; at N_PAD 16
+# the tails measured within run-to-run noise of the single finisher).
+SPLIT_FIN_MIN_N_PAD = 16
+TAIL_SPLIT_FIN_MIN_N_PAD = 32
+# With it, the TP1 tail's epilogue warp 0 arrives on the fused norm's grid counter as soon as the CTA's normalised rows
+# are written (``early_arrive``, ``_ea``) instead of its TMA warp at the first up-segment unit, and the TP8 tail's TMA
+# warp at N_PAD 32 and 64 prefetches the weight tiles of its first up-segment units into L2 while the grid's rows are
+# pending (``up_prefetch``, ``_upf``).
+TAIL_EARLY_ARRIVE_TP = 1
+TAIL_UP_PREFETCH_TP = 8
+TAIL_UP_PREFETCH_N_PAD = (32, 64)
+
+
+def split_fin_route(stage: str, n_pad: int, num_partials: int = 1) -> bool:
+    """Whether the decode instance of ``stage`` at ``n_pad`` (and, for the tail, ``num_partials`` routed partials)
+    takes the split finalize when it runs as cluster pairs."""
+    if stage != "tail":
+        return int(n_pad) >= SPLIT_FIN_MIN_N_PAD
+    return int(n_pad) >= TAIL_SPLIT_FIN_MIN_N_PAD and int(num_partials) == 1
 
 
 def decode_symbol(plan: dict[str, Any]) -> str:
@@ -480,6 +538,8 @@ def decode_symbol(plan: dict[str, Any]) -> str:
         f"{'_ww' if plan['wait_warps'] else ''}{'_la' if plan['land_alias'] else ''}"
         f"{'_ef' if plan.get('a_evict_first') else ''}"
         f"{_l2_promotion_suffix(plan.get('a_l2_promotion', 'none'))}"
+        f"{'_sf' if plan.get('split_fin') else ''}{'_ea' if plan.get('early_arrive') else ''}"
+        f"{'_upf' if plan.get('up_prefetch') else ''}"
     )
 
 
@@ -1638,6 +1698,7 @@ __all__ = [
     "prepare_kimi_k3_latent_moe_tail",
     "required_kernel_keys",
     "route_kernel_keys",
+    "split_fin_route",
     "split_plan",
     "tail_gemm_config",
     "tail_gemm_final_ts",

@@ -92,7 +92,7 @@ def test_decode_plan_rules():
     assert decode_front_plan(16, i_local_for_tp(8))["kdepth"] == 2
     assert decode_front_plan(32, i_local_for_tp(8))["kdepth"] == 1
     assert decode_front_plan(32, i_local_for_tp(8))["stages"] == cb.plan_stages(
-        n_pad=32, kdepth=1, cluster=2
+        n_pad=32, kdepth=1, cluster=2, split_fin=True
     )
     # Tail: 56 output tiles -> 112 cluster-pair CTAs; the fused norm is always on.
     for tp in SUPPORTED_TP:
@@ -150,13 +150,13 @@ def test_decode_plan_rules():
     assert decode_front_plan(8, i_local_for_tp(1))["a_evict_first"]
     assert decode_tail_plan(64, i_local_for_tp(1), 1)["a_evict_first"]
     assert la_tail["a_evict_first"]
-    assert decode_kernel_key(la_tail).endswith("_f_la_ef_p256b")
+    assert decode_kernel_key(la_tail).endswith("_f_la_ef_p256b_sf_ea")
     assert not decode_tail_plan(64, i_local_for_tp(8), 8)["a_evict_first"]
     # 256-byte L2 promotion of the weight maps: the TP1 tail at every N_PAD and the TP8 front up to N_PAD 64.
     for tokens in (1, 16, 64, 128):
         tail1 = decode_tail_plan(tokens, i_local_for_tp(1), 1)
         assert tail1["a_l2_promotion"] == "l2_256b"
-        assert decode_kernel_key(tail1).endswith("_ef_p256b")
+        assert "_ef_p256b" in decode_kernel_key(tail1)
         tail8 = decode_tail_plan(tokens, i_local_for_tp(8), 8)
         assert tail8["a_l2_promotion"] == "none"
         assert "_p256b" not in decode_kernel_key(tail8)
@@ -166,13 +166,79 @@ def test_decode_plan_rules():
     for tokens in (1, 16, 32, 64):
         front8 = decode_front_plan(tokens, i_local_for_tp(8))
         assert front8["a_l2_promotion"] == "l2_256b"
-        assert decode_kernel_key(front8).endswith("_ef_p256b")
+        assert "_ef_p256b" in decode_kernel_key(front8)
     assert la_front["a_l2_promotion"] == "none"
-    assert decode_kernel_key(la_front).endswith("_la_ef")
+    assert decode_kernel_key(la_front).endswith("_la_ef_sf")
     # A second routed partial disables the staged rows (P == 1 only).
     assert not decode_tail_plan(1, i_local_for_tp(8), 8, num_partials=2)["rows_smem"]
     with pytest.raises(ValueError):
         cb.n_pad_for(DECODE_MAX_T + 1)
+
+
+def test_decode_split_finalize_rules():
+    """Split finalize (``_sf``): the cluster-pair decode instances -- the TP8 front from N_PAD 16 and the fused-norm
+    tails of one routed partial from N_PAD 32, on both qualified SM counts -- with the early grid arrival on the TP1
+    tail (``_ea``) and the up-unit L2 prefetch on the TP8 tail at N_PAD 32 / 64 (``_upf``); each CTA's landing zone
+    holds half the partial."""
+    assert cb.SPLIT_FIN_MIN_N_PAD == 16 and cb.TAIL_SPLIT_FIN_MIN_N_PAD == 32
+    for sm_count in QUALIFIED_SM_COUNTS:
+        for tokens in (1, 8):
+            assert not decode_front_plan(tokens, i_local_for_tp(8), sm_count)[
+                "split_fin"
+            ]
+            for tp in SUPPORTED_TP:
+                plan = decode_tail_plan(tokens, i_local_for_tp(tp), tp, 1, sm_count)
+                assert not plan["split_fin"]
+        for tokens in (9, 16, 32, 64, 128):
+            front8 = decode_front_plan(tokens, i_local_for_tp(8), sm_count)
+            assert front8["split_fin"] and front8["cluster"] == 2
+            assert not (front8["early_arrive"] or front8["up_prefetch"])
+            assert decode_kernel_key(front8).endswith("_sf")
+            front1 = decode_front_plan(tokens, i_local_for_tp(1), sm_count)
+            assert front1["cluster"] == 1 and not front1["split_fin"]
+            tail1 = decode_tail_plan(tokens, i_local_for_tp(1), 1, 1, sm_count)
+            split1 = tail1["n_pad"] > 16
+            assert tail1["split_fin"] == tail1["early_arrive"] == split1
+            assert not tail1["up_prefetch"]
+            assert decode_kernel_key(tail1).endswith(
+                "_ef_p256b_sf_ea" if split1 else "_ef_p256b"
+            )
+            tail8 = decode_tail_plan(tokens, i_local_for_tp(8), 8, 1, sm_count)
+            assert tail8["split_fin"] == (tail8["n_pad"] > 16)
+            assert not tail8["early_arrive"]
+            assert tail8["up_prefetch"] == (tail8["n_pad"] in (32, 64))
+            assert decode_kernel_key(tail8).endswith(
+                "_sf_upf"
+                if tail8["up_prefetch"]
+                else "_sf"
+                if tail8["split_fin"]
+                else "_ww"
+            )
+            for tp in SUPPORTED_TP:
+                for num_partials in (2, 4):
+                    many = decode_tail_plan(
+                        tokens, i_local_for_tp(tp), tp, num_partials, sm_count
+                    )
+                    assert not (
+                        many["split_fin"] or many["early_arrive"] or many["up_prefetch"]
+                    )
+                    assert "_sf" not in decode_kernel_key(many)
+        # The tails at N_PAD 16 keep the single finisher, the staged-rows TP8 tail its 5 stages.
+        t16 = decode_tail_plan(16, i_local_for_tp(8), 8, 1, sm_count)
+        assert t16["rows_smem"] and t16["stages"] == 5 and not t16["split_fin"]
+        assert decode_kernel_key(t16).endswith("_sb_rs_np_st2_ww")
+        t16_tp1 = decode_tail_plan(16, i_local_for_tp(1), 1, 1, sm_count)
+        assert decode_kernel_key(t16_tp1).endswith("_ef_p256b")
+    # Half the landing zone buys the TP8 tail at N_PAD 128 a sixth ring stage; the other instances keep their depth.
+    assert cb.plan_stages(n_pad=128, cluster=2) == 5
+    assert cb.plan_stages(n_pad=128, cluster=2, split_fin=True) == 6
+    assert decode_tail_plan(128, i_local_for_tp(8), 8)["stages"] == 6
+    assert decode_tail_plan(128, i_local_for_tp(8), 8, 2)["stages"] == 5
+    for tp, tokens in ((1, 16), (1, 32), (1, 64), (1, 128), (8, 32), (8, 64)):
+        assert (
+            decode_tail_plan(tokens, i_local_for_tp(tp), tp)["stages"]
+            == decode_tail_plan(tokens, i_local_for_tp(tp), tp, 2)["stages"]
+        )
 
 
 def test_split_plan_rules():
@@ -512,9 +578,10 @@ def test_route_rules_select_the_expected_programs():
     assert one["rows_smem"] and one["stagger"] == cb.TAIL_ROWS_STAGGER
     assert not two["rows_smem"] and not two["smem_b1"] and two["stagger"] == 0
     assert decode_kernel_key(one) != decode_kernel_key(two)
-    assert decode_kernel_key(
-        decode_tail_plan(32, i_local_for_tp(8), 8, 1)
-    ) == decode_kernel_key(decode_tail_plan(32, i_local_for_tp(8), 8, 2))
+    # From N_PAD 32 one routed partial also takes the split finalize; P >= 2 keeps the single finisher.
+    assert decode_kernel_key(decode_tail_plan(32, i_local_for_tp(8), 8, 1)) == (
+        decode_kernel_key(decode_tail_plan(32, i_local_for_tp(8), 8, 2)) + "_sf_upf"
+    )
 
 
 def test_tp1_tail_prefill_routes():

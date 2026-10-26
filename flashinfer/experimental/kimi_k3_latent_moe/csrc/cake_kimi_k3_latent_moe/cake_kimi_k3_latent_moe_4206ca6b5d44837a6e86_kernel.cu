@@ -53,27 +53,27 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define NUM_TMA_PIPE_STAGES 6
 #define NUM_EPI_PIPE_STAGES 1
 #define SMEM_LAND_OFF 2048
-#define SMEM_LAND_STAGE_BYTES 8192
-#define SMEM_LAND_STRIDE 8192
+#define SMEM_LAND_STAGE_BYTES 4096
+#define SMEM_LAND_STRIDE 4096
 #define SMEM_FREE_WORD_OFF 1536
 #define SMEM_FREE_WORD_STAGE_BYTES 8
 #define SMEM_FREE_WORD_STRIDE 8
-#define SMEM_SMEM_A_OFF 10240
+#define SMEM_SMEM_A_OFF 6144
 #define SMEM_SMEM_A_STAGE_BYTES 32768
 #define SMEM_SMEM_A_STRIDE 32768
-#define SMEM_SMEM_B_OFF 206848
+#define SMEM_SMEM_B_OFF 202752
 #define SMEM_SMEM_B_STAGE_BYTES 4096
 #define SMEM_SMEM_B_STRIDE 4096
-#define SMEM_SMEM_BN_OFF 206848
+#define SMEM_SMEM_BN_OFF 202752
 #define SMEM_SMEM_BN_STAGE_BYTES 4096
 #define SMEM_SMEM_BN_STRIDE 4096
-#define SMEM_SMEM_AG_OFF 10240
+#define SMEM_SMEM_AG_OFF 6144
 #define SMEM_SMEM_AG_STAGE_BYTES 16384
 #define SMEM_SMEM_AG_STRIDE 32768
-#define SMEM_SMEM_AU_OFF 26624
+#define SMEM_SMEM_AU_OFF 22528
 #define SMEM_SMEM_AU_STAGE_BYTES 16384
 #define SMEM_SMEM_AU_STRIDE 32768
-#define SMEM_TOTAL 231424
+#define SMEM_TOTAL 227328
 
 #include <math_constants.h>
 
@@ -214,7 +214,7 @@ __device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
 extern "C" {
 
 __global__ __launch_bounds__(192) __cluster_dims__(2,1,1) void
-kernel_cake_kimi_k3_latent_moe_4c467c25477a83b05c96(const __grid_constant__ CUtensorMap A_R, const __grid_constant__ CUtensorMap A_L, const __grid_constant__ CUtensorMap A_S, const __grid_constant__ CUtensorMap A_2, const __grid_constant__ CUtensorMap B_1, const __grid_constant__ CUtensorMap B_2, float* __restrict__ out_r, __nv_bfloat16* __restrict__ out_l, __nv_bfloat16* __restrict__ out_s, unsigned int* __restrict__ counters, __nv_bfloat16* __restrict__ routed, __nv_bfloat16* __restrict__ norm_w, __nv_bfloat16* __restrict__ y_out, unsigned long long* __restrict__ tl, int num_tokens, int k1_off, int num_partials, float eps)
+kernel_cake_kimi_k3_latent_moe_4206ca6b5d44837a6e86(const __grid_constant__ CUtensorMap A_R, const __grid_constant__ CUtensorMap A_L, const __grid_constant__ CUtensorMap A_S, const __grid_constant__ CUtensorMap A_2, const __grid_constant__ CUtensorMap B_1, const __grid_constant__ CUtensorMap B_2, float* __restrict__ out_r, __nv_bfloat16* __restrict__ out_l, __nv_bfloat16* __restrict__ out_s, unsigned int* __restrict__ counters, __nv_bfloat16* __restrict__ routed, __nv_bfloat16* __restrict__ norm_w, __nv_bfloat16* __restrict__ y_out, unsigned long long* __restrict__ tl, int num_tokens, int k1_off, int num_partials, float eps)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -253,16 +253,16 @@ kernel_cake_kimi_k3_latent_moe_4c467c25477a83b05c96(const __grid_constant__ CUte
     const int land_addr = smem + 2048;
     unsigned int* free_word = reinterpret_cast<unsigned int*>(smem_raw + 1536);
     const int free_word_addr = smem + 1536;
-    __nv_bfloat16* smem_a = reinterpret_cast<__nv_bfloat16*>(smem_raw + 10240);
-    const int smem_a_addr = smem + 10240;
-    __nv_bfloat16* smem_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + 206848);
-    const int smem_b_addr = smem + 206848;
-    __nv_bfloat16* smem_bn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 206848);
-    const int smem_bn_addr = smem + 206848;
-    __nv_bfloat16* smem_ag = reinterpret_cast<__nv_bfloat16*>(smem_raw + 10240);
-    const int smem_ag_addr = smem + 10240;
-    __nv_bfloat16* smem_au = reinterpret_cast<__nv_bfloat16*>(smem_raw + 26624);
-    const int smem_au_addr = smem + 26624;
+    __nv_bfloat16* smem_a = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
+    const int smem_a_addr = smem + 6144;
+    __nv_bfloat16* smem_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + 202752);
+    const int smem_b_addr = smem + 202752;
+    __nv_bfloat16* smem_bn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 202752);
+    const int smem_bn_addr = smem + 202752;
+    __nv_bfloat16* smem_ag = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
+    const int smem_ag_addr = smem + 6144;
+    __nv_bfloat16* smem_au = reinterpret_cast<__nv_bfloat16*>(smem_raw + 22528);
+    const int smem_au_addr = smem + 22528;
 
     // Mbarrier init (8 pipeline groups, 0 ordered-sequence groups, 18 barriers)
     // Mbarriers at smem_raw[0..144)
@@ -299,7 +299,7 @@ kernel_cake_kimi_k3_latent_moe_4c467c25477a83b05c96(const __grid_constant__ CUte
             // bn_bar: 1 barriers, init_count=1
             mbarrier_init(smem + 136, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-            mbarrier_expect_tx(smem + 112, 8192);
+            mbarrier_expect_tx(smem + 112, 4096);
         }
     }
 
@@ -406,269 +406,328 @@ kernel_cake_kimi_k3_latent_moe_4c467c25477a83b05c96(const __grid_constant__ CUte
                     mbarrier_arrive(acc_empty_addr);
                 }
             }
-            if (slot == 1) {
+            if (slot == 0) {
                 uint32_t _mapa_0;
                 asm volatile(
                     "mapa.shared::cluster.u32 %0, %1, %2;"
-                    : "=r"(_mapa_0) : "r"(red_bar_addr), "r"(0));
+                    : "=r"(_mapa_0) : "r"(red_bar_addr), "r"(1));
                 uint32_t _mapa_1;
                 asm volatile(
                     "mapa.shared::cluster.u32 %0, %1, %2;"
-                    : "=r"(_mapa_1) : "r"(land_addr + (unsigned int)(tid_1 * 16)), "r"(0));
-                asm volatile(
-                    "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                    :: "r"(_mapa_1), "r"(__float_as_uint(red[0])), "r"(__float_as_uint(red[1])), "r"(__float_as_uint(red[2])), "r"(__float_as_uint(red[3])), "r"(_mapa_0) : "memory");
-                asm volatile(
-                    "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                    :: "r"(_mapa_1 + 2048), "r"(__float_as_uint(red[4])), "r"(__float_as_uint(red[5])), "r"(__float_as_uint(red[6])), "r"(__float_as_uint(red[7])), "r"(_mapa_0) : "memory");
-                asm volatile(
-                    "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                    :: "r"(_mapa_1 + 4096), "r"(__float_as_uint(red[8])), "r"(__float_as_uint(red[9])), "r"(__float_as_uint(red[10])), "r"(__float_as_uint(red[11])), "r"(_mapa_0) : "memory");
-                asm volatile(
-                    "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                    :: "r"(_mapa_1 + 6144), "r"(__float_as_uint(red[12])), "r"(__float_as_uint(red[13])), "r"(__float_as_uint(red[14])), "r"(__float_as_uint(red[15])), "r"(_mapa_0) : "memory");
-                fin = 0;
-            } else {
-                if (warp == 0) {
-                    if (elect_sync()) {
-                        mbarrier_arrive(red_bar_addr);
-                    }
+                    : "=r"(_mapa_1) : "r"(land_addr + (unsigned int)(tid_1 * 16)), "r"(1));
+                if (cls == 2) {
+                    asm volatile(
+                        "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                        :: "r"(_mapa_1), "r"(__float_as_uint(red[4])), "r"(__float_as_uint(red[5])), "r"(__float_as_uint(red[6])), "r"(__float_as_uint(red[7])), "r"(_mapa_0) : "memory");
+                    asm volatile(
+                        "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                        :: "r"(_mapa_1 + 2048), "r"(__float_as_uint(red[12])), "r"(__float_as_uint(red[13])), "r"(__float_as_uint(red[14])), "r"(__float_as_uint(red[15])), "r"(_mapa_0) : "memory");
+                } else {
+                    asm volatile(
+                        "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                        :: "r"(_mapa_1), "r"(__float_as_uint(red[8])), "r"(__float_as_uint(red[9])), "r"(__float_as_uint(red[10])), "r"(__float_as_uint(red[11])), "r"(_mapa_0) : "memory");
+                    asm volatile(
+                        "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                        :: "r"(_mapa_1 + 2048), "r"(__float_as_uint(red[12])), "r"(__float_as_uint(red[13])), "r"(__float_as_uint(red[14])), "r"(__float_as_uint(red[15])), "r"(_mapa_0) : "memory");
                 }
-                mbarrier_wait_cluster_hint(red_bar_addr, 0, 10000000);
-                red[0] = red[0] + land[tid_1 * 4];
-                red[1] = red[1] + land[tid_1 * 4 + 1];
-                red[2] = red[2] + land[tid_1 * 4 + 2];
-                red[3] = red[3] + land[tid_1 * 4 + 3];
-                red[4] = red[4] + land[(128 + tid_1) * 4];
-                red[5] = red[5] + land[(128 + tid_1) * 4 + 1];
-                red[6] = red[6] + land[(128 + tid_1) * 4 + 2];
-                red[7] = red[7] + land[(128 + tid_1) * 4 + 3];
-                red[8] = red[8] + land[(256 + tid_1) * 4];
-                red[9] = red[9] + land[(256 + tid_1) * 4 + 1];
-                red[10] = red[10] + land[(256 + tid_1) * 4 + 2];
-                red[11] = red[11] + land[(256 + tid_1) * 4 + 3];
-                red[12] = red[12] + land[(384 + tid_1) * 4];
-                red[13] = red[13] + land[(384 + tid_1) * 4 + 1];
-                red[14] = red[14] + land[(384 + tid_1) * 4 + 2];
-                red[15] = red[15] + land[(384 + tid_1) * 4 + 3];
+            }
+            if (slot == 1) {
+                uint32_t _mapa_2;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_mapa_2) : "r"(red_bar_addr), "r"(0));
+                uint32_t _mapa_3;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_mapa_3) : "r"(land_addr + (unsigned int)(tid_1 * 16)), "r"(0));
+                if (cls == 2) {
+                    asm volatile(
+                        "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                        :: "r"(_mapa_3), "r"(__float_as_uint(red[0])), "r"(__float_as_uint(red[1])), "r"(__float_as_uint(red[2])), "r"(__float_as_uint(red[3])), "r"(_mapa_2) : "memory");
+                    asm volatile(
+                        "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                        :: "r"(_mapa_3 + 2048), "r"(__float_as_uint(red[8])), "r"(__float_as_uint(red[9])), "r"(__float_as_uint(red[10])), "r"(__float_as_uint(red[11])), "r"(_mapa_2) : "memory");
+                } else {
+                    asm volatile(
+                        "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                        :: "r"(_mapa_3), "r"(__float_as_uint(red[0])), "r"(__float_as_uint(red[1])), "r"(__float_as_uint(red[2])), "r"(__float_as_uint(red[3])), "r"(_mapa_2) : "memory");
+                    asm volatile(
+                        "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                        :: "r"(_mapa_3 + 2048), "r"(__float_as_uint(red[4])), "r"(__float_as_uint(red[5])), "r"(__float_as_uint(red[6])), "r"(__float_as_uint(red[7])), "r"(_mapa_2) : "memory");
+                }
+            }
+            if (warp == 0) {
+                if (elect_sync()) {
+                    mbarrier_arrive(red_bar_addr);
+                }
+            }
+            mbarrier_wait_cluster_hint(red_bar_addr, 0, 10000000);
+            if (slot == 0) {
+                if (cls == 2) {
+                    red[0] = red[0] + land[tid_1 * 4];
+                    red[1] = red[1] + land[tid_1 * 4 + 1];
+                    red[2] = red[2] + land[tid_1 * 4 + 2];
+                    red[3] = red[3] + land[tid_1 * 4 + 3];
+                    red[8] = red[8] + land[(128 + tid_1) * 4];
+                    red[9] = red[9] + land[(128 + tid_1) * 4 + 1];
+                    red[10] = red[10] + land[(128 + tid_1) * 4 + 2];
+                    red[11] = red[11] + land[(128 + tid_1) * 4 + 3];
+                } else {
+                    red[0] = red[0] + land[tid_1 * 4];
+                    red[1] = red[1] + land[tid_1 * 4 + 1];
+                    red[2] = red[2] + land[tid_1 * 4 + 2];
+                    red[3] = red[3] + land[tid_1 * 4 + 3];
+                    red[4] = red[4] + land[(128 + tid_1) * 4];
+                    red[5] = red[5] + land[(128 + tid_1) * 4 + 1];
+                    red[6] = red[6] + land[(128 + tid_1) * 4 + 2];
+                    red[7] = red[7] + land[(128 + tid_1) * 4 + 3];
+                }
+            }
+            if (slot == 1) {
+                if (cls == 2) {
+                    red[4] = red[4] + land[tid_1 * 4];
+                    red[5] = red[5] + land[tid_1 * 4 + 1];
+                    red[6] = red[6] + land[tid_1 * 4 + 2];
+                    red[7] = red[7] + land[tid_1 * 4 + 3];
+                    red[12] = red[12] + land[(128 + tid_1) * 4];
+                    red[13] = red[13] + land[(128 + tid_1) * 4 + 1];
+                    red[14] = red[14] + land[(128 + tid_1) * 4 + 2];
+                    red[15] = red[15] + land[(128 + tid_1) * 4 + 3];
+                } else {
+                    red[8] = red[8] + land[tid_1 * 4];
+                    red[9] = red[9] + land[tid_1 * 4 + 1];
+                    red[10] = red[10] + land[tid_1 * 4 + 2];
+                    red[11] = red[11] + land[tid_1 * 4 + 3];
+                    red[12] = red[12] + land[(128 + tid_1) * 4];
+                    red[13] = red[13] + land[(128 + tid_1) * 4 + 1];
+                    red[14] = red[14] + land[(128 + tid_1) * 4 + 2];
+                    red[15] = red[15] + land[(128 + tid_1) * 4 + 3];
+                }
             }
             if (fin == 1) {
-                if (cls == 2) {
-                    int tok = lane_pair * 2;
-                    int frow = row_base;
-                    if (tok < num_tokens) {
-                        float gk = (float)(__nv_bfloat16)red[0];
-                        float uk = (float)(__nv_bfloat16)red[8];
-                        float _exp2_0 = approx_exp2((-gk) * 1.442695f);
-                        float sig = approx_rcp(1.0f + _exp2_0);
-                        float _tanh_1 = tanhf(gk * 0.25f);
-                        float aa = 4.0f * _tanh_1 * sig;
-                        float _tanh_2 = tanhf(uk * 0.04f);
-                        float bb = 25.0f * _tanh_2;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok * 768 + row_s + frow)) + (0)) = (__nv_bfloat16)(aa * bb);
-                    }
-                    int tok_0 = lane_pair * 2 + 1;
-                    int frow_1 = row_base;
-                    if (tok_0 < num_tokens) {
-                        float gk_1 = (float)(__nv_bfloat16)red[1];
-                        float uk_1 = (float)(__nv_bfloat16)red[9];
-                        float _exp2_3 = approx_exp2((-gk_1) * 1.442695f);
-                        float sig_1 = approx_rcp(1.0f + _exp2_3);
-                        float _tanh_4 = tanhf(gk_1 * 0.25f);
-                        float aa_1 = 4.0f * _tanh_4 * sig_1;
-                        float _tanh_5 = tanhf(uk_1 * 0.04f);
-                        float bb_1 = 25.0f * _tanh_5;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_0 * 768 + row_s + frow_1)) + (0)) = (__nv_bfloat16)(aa_1 * bb_1);
-                    }
-                    int tok_2 = lane_pair * 2;
-                    int frow_3 = row_base + 8;
-                    if (tok_2 < num_tokens) {
-                        float gk_2 = (float)(__nv_bfloat16)red[2];
-                        float uk_2 = (float)(__nv_bfloat16)red[10];
-                        float _exp2_6 = approx_exp2((-gk_2) * 1.442695f);
-                        float sig_2 = approx_rcp(1.0f + _exp2_6);
-                        float _tanh_7 = tanhf(gk_2 * 0.25f);
-                        float aa_2 = 4.0f * _tanh_7 * sig_2;
-                        float _tanh_8 = tanhf(uk_2 * 0.04f);
-                        float bb_2 = 25.0f * _tanh_8;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_2 * 768 + row_s + frow_3)) + (0)) = (__nv_bfloat16)(aa_2 * bb_2);
-                    }
-                    int tok_4 = lane_pair * 2 + 1;
-                    int frow_5 = row_base + 8;
-                    if (tok_4 < num_tokens) {
-                        float gk_3 = (float)(__nv_bfloat16)red[3];
-                        float uk_3 = (float)(__nv_bfloat16)red[11];
-                        float _exp2_9 = approx_exp2((-gk_3) * 1.442695f);
-                        float sig_3 = approx_rcp(1.0f + _exp2_9);
-                        float _tanh_10 = tanhf(gk_3 * 0.25f);
-                        float aa_3 = 4.0f * _tanh_10 * sig_3;
-                        float _tanh_11 = tanhf(uk_3 * 0.04f);
-                        float bb_3 = 25.0f * _tanh_11;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_4 * 768 + row_s + frow_5)) + (0)) = (__nv_bfloat16)(aa_3 * bb_3);
-                    }
-                    int tok_6 = 8 + lane_pair * 2;
-                    int frow_7 = row_base;
-                    if (tok_6 < num_tokens) {
-                        float gk_4 = (float)(__nv_bfloat16)red[4];
-                        float uk_4 = (float)(__nv_bfloat16)red[12];
-                        float _exp2_12 = approx_exp2((-gk_4) * 1.442695f);
-                        float sig_4 = approx_rcp(1.0f + _exp2_12);
-                        float _tanh_13 = tanhf(gk_4 * 0.25f);
-                        float aa_4 = 4.0f * _tanh_13 * sig_4;
-                        float _tanh_14 = tanhf(uk_4 * 0.04f);
-                        float bb_4 = 25.0f * _tanh_14;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_6 * 768 + row_s + frow_7)) + (0)) = (__nv_bfloat16)(aa_4 * bb_4);
-                    }
-                    int tok_8 = 8 + lane_pair * 2 + 1;
-                    int frow_9 = row_base;
-                    if (tok_8 < num_tokens) {
-                        float gk_5 = (float)(__nv_bfloat16)red[5];
-                        float uk_5 = (float)(__nv_bfloat16)red[13];
-                        float _exp2_15 = approx_exp2((-gk_5) * 1.442695f);
-                        float sig_5 = approx_rcp(1.0f + _exp2_15);
-                        float _tanh_16 = tanhf(gk_5 * 0.25f);
-                        float aa_5 = 4.0f * _tanh_16 * sig_5;
-                        float _tanh_17 = tanhf(uk_5 * 0.04f);
-                        float bb_5 = 25.0f * _tanh_17;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_8 * 768 + row_s + frow_9)) + (0)) = (__nv_bfloat16)(aa_5 * bb_5);
-                    }
-                    int tok_10 = 8 + lane_pair * 2;
-                    int frow_11 = row_base + 8;
-                    if (tok_10 < num_tokens) {
-                        float gk_6 = (float)(__nv_bfloat16)red[6];
-                        float uk_6 = (float)(__nv_bfloat16)red[14];
-                        float _exp2_18 = approx_exp2((-gk_6) * 1.442695f);
-                        float sig_6 = approx_rcp(1.0f + _exp2_18);
-                        float _tanh_19 = tanhf(gk_6 * 0.25f);
-                        float aa_6 = 4.0f * _tanh_19 * sig_6;
-                        float _tanh_20 = tanhf(uk_6 * 0.04f);
-                        float bb_6 = 25.0f * _tanh_20;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_10 * 768 + row_s + frow_11)) + (0)) = (__nv_bfloat16)(aa_6 * bb_6);
-                    }
-                    int tok_12 = 8 + lane_pair * 2 + 1;
-                    int frow_13 = row_base + 8;
-                    if (tok_12 < num_tokens) {
-                        float gk_7 = (float)(__nv_bfloat16)red[7];
-                        float uk_7 = (float)(__nv_bfloat16)red[15];
-                        float _exp2_21 = approx_exp2((-gk_7) * 1.442695f);
-                        float sig_7 = approx_rcp(1.0f + _exp2_21);
-                        float _tanh_22 = tanhf(gk_7 * 0.25f);
-                        float aa_7 = 4.0f * _tanh_22 * sig_7;
-                        float _tanh_23 = tanhf(uk_7 * 0.04f);
-                        float bb_7 = 25.0f * _tanh_23;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_12 * 768 + row_s + frow_13)) + (0)) = (__nv_bfloat16)(aa_7 * bb_7);
-                    }
-                } else {
-                    if (num_tokens > 0) {
-                        if (cls == 0) {
-                            *(reinterpret_cast<float*>(out_r + (row_r + tid_1)) + (0)) = red[0];
-                        } else {
-                            *(reinterpret_cast<__nv_bfloat16*>(out_l + (row_l + tid_1)) + (0)) = (__nv_bfloat16)red[0];
+                if (slot == 0) {
+                    if (cls == 2) {
+                        int sf_tok = lane_pair * 2;
+                        int sf_frow = row_base;
+                        if (sf_tok < num_tokens) {
+                            float sf_gk = (float)(__nv_bfloat16)red[0];
+                            float sf_uk = (float)(__nv_bfloat16)red[8];
+                            float _exp2_0 = approx_exp2((-sf_gk) * 1.442695f);
+                            float sf_sig = approx_rcp(1.0f + _exp2_0);
+                            float _tanh_1 = tanhf(sf_gk * 0.25f);
+                            float sf_aa = 4.0f * _tanh_1 * sf_sig;
+                            float _tanh_2 = tanhf(sf_uk * 0.04f);
+                            float sf_bb = 25.0f * _tanh_2;
+                            *(reinterpret_cast<__nv_bfloat16*>(out_s + (sf_tok * 768 + row_s + sf_frow)) + (0)) = (__nv_bfloat16)(sf_aa * sf_bb);
+                        }
+                        int sf_tok_0 = lane_pair * 2 + 1;
+                        int sf_frow_1 = row_base;
+                        if (sf_tok_0 < num_tokens) {
+                            float sf_gk_1 = (float)(__nv_bfloat16)red[1];
+                            float sf_uk_1 = (float)(__nv_bfloat16)red[9];
+                            float _exp2_3 = approx_exp2((-sf_gk_1) * 1.442695f);
+                            float sf_sig_1 = approx_rcp(1.0f + _exp2_3);
+                            float _tanh_4 = tanhf(sf_gk_1 * 0.25f);
+                            float sf_aa_1 = 4.0f * _tanh_4 * sf_sig_1;
+                            float _tanh_5 = tanhf(sf_uk_1 * 0.04f);
+                            float sf_bb_1 = 25.0f * _tanh_5;
+                            *(reinterpret_cast<__nv_bfloat16*>(out_s + (sf_tok_0 * 768 + row_s + sf_frow_1)) + (0)) = (__nv_bfloat16)(sf_aa_1 * sf_bb_1);
+                        }
+                        int sf_tok_2 = lane_pair * 2;
+                        int sf_frow_3 = row_base + 8;
+                        if (sf_tok_2 < num_tokens) {
+                            float sf_gk_2 = (float)(__nv_bfloat16)red[2];
+                            float sf_uk_2 = (float)(__nv_bfloat16)red[10];
+                            float _exp2_6 = approx_exp2((-sf_gk_2) * 1.442695f);
+                            float sf_sig_2 = approx_rcp(1.0f + _exp2_6);
+                            float _tanh_7 = tanhf(sf_gk_2 * 0.25f);
+                            float sf_aa_2 = 4.0f * _tanh_7 * sf_sig_2;
+                            float _tanh_8 = tanhf(sf_uk_2 * 0.04f);
+                            float sf_bb_2 = 25.0f * _tanh_8;
+                            *(reinterpret_cast<__nv_bfloat16*>(out_s + (sf_tok_2 * 768 + row_s + sf_frow_3)) + (0)) = (__nv_bfloat16)(sf_aa_2 * sf_bb_2);
+                        }
+                        int sf_tok_4 = lane_pair * 2 + 1;
+                        int sf_frow_5 = row_base + 8;
+                        if (sf_tok_4 < num_tokens) {
+                            float sf_gk_3 = (float)(__nv_bfloat16)red[3];
+                            float sf_uk_3 = (float)(__nv_bfloat16)red[11];
+                            float _exp2_9 = approx_exp2((-sf_gk_3) * 1.442695f);
+                            float sf_sig_3 = approx_rcp(1.0f + _exp2_9);
+                            float _tanh_10 = tanhf(sf_gk_3 * 0.25f);
+                            float sf_aa_3 = 4.0f * _tanh_10 * sf_sig_3;
+                            float _tanh_11 = tanhf(sf_uk_3 * 0.04f);
+                            float sf_bb_3 = 25.0f * _tanh_11;
+                            *(reinterpret_cast<__nv_bfloat16*>(out_s + (sf_tok_4 * 768 + row_s + sf_frow_5)) + (0)) = (__nv_bfloat16)(sf_aa_3 * sf_bb_3);
+                        }
+                    } else {
+                        if (num_tokens > 0) {
+                            if (cls == 0) {
+                                *(reinterpret_cast<float*>(out_r + (row_r + tid_1)) + (0)) = red[0];
+                            } else {
+                                *(reinterpret_cast<__nv_bfloat16*>(out_l + (row_l + tid_1)) + (0)) = (__nv_bfloat16)red[0];
+                            }
+                        }
+                        if (num_tokens > 1) {
+                            if (cls == 0) {
+                                *(reinterpret_cast<float*>(out_r + (896 + row_r + tid_1)) + (0)) = red[1];
+                            } else {
+                                *(reinterpret_cast<__nv_bfloat16*>(out_l + (3584 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[1];
+                            }
+                        }
+                        if (num_tokens > 2) {
+                            if (cls == 0) {
+                                *(reinterpret_cast<float*>(out_r + (1792 + row_r + tid_1)) + (0)) = red[2];
+                            } else {
+                                *(reinterpret_cast<__nv_bfloat16*>(out_l + (7168 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[2];
+                            }
+                        }
+                        if (num_tokens > 3) {
+                            if (cls == 0) {
+                                *(reinterpret_cast<float*>(out_r + (2688 + row_r + tid_1)) + (0)) = red[3];
+                            } else {
+                                *(reinterpret_cast<__nv_bfloat16*>(out_l + (10752 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[3];
+                            }
+                        }
+                        if (num_tokens > 4) {
+                            if (cls == 0) {
+                                *(reinterpret_cast<float*>(out_r + (3584 + row_r + tid_1)) + (0)) = red[4];
+                            } else {
+                                *(reinterpret_cast<__nv_bfloat16*>(out_l + (14336 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[4];
+                            }
+                        }
+                        if (num_tokens > 5) {
+                            if (cls == 0) {
+                                *(reinterpret_cast<float*>(out_r + (4480 + row_r + tid_1)) + (0)) = red[5];
+                            } else {
+                                *(reinterpret_cast<__nv_bfloat16*>(out_l + (17920 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[5];
+                            }
+                        }
+                        if (num_tokens > 6) {
+                            if (cls == 0) {
+                                *(reinterpret_cast<float*>(out_r + (5376 + row_r + tid_1)) + (0)) = red[6];
+                            } else {
+                                *(reinterpret_cast<__nv_bfloat16*>(out_l + (21504 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[6];
+                            }
+                        }
+                        if (num_tokens > 7) {
+                            if (cls == 0) {
+                                *(reinterpret_cast<float*>(out_r + (6272 + row_r + tid_1)) + (0)) = red[7];
+                            } else {
+                                *(reinterpret_cast<__nv_bfloat16*>(out_l + (25088 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[7];
+                            }
                         }
                     }
-                    if (num_tokens > 1) {
-                        if (cls == 0) {
-                            *(reinterpret_cast<float*>(out_r + (896 + row_r + tid_1)) + (0)) = red[1];
-                        } else {
-                            *(reinterpret_cast<__nv_bfloat16*>(out_l + (3584 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[1];
+                }
+                if (slot == 1) {
+                    if (cls == 2) {
+                        int sf_tok_1 = 8 + lane_pair * 2;
+                        int sf_frow_2 = row_base;
+                        if (sf_tok_1 < num_tokens) {
+                            float sf_gk_4 = (float)(__nv_bfloat16)red[4];
+                            float sf_uk_4 = (float)(__nv_bfloat16)red[12];
+                            float _exp2_12 = approx_exp2((-sf_gk_4) * 1.442695f);
+                            float sf_sig_4 = approx_rcp(1.0f + _exp2_12);
+                            float _tanh_13 = tanhf(sf_gk_4 * 0.25f);
+                            float sf_aa_4 = 4.0f * _tanh_13 * sf_sig_4;
+                            float _tanh_14 = tanhf(sf_uk_4 * 0.04f);
+                            float sf_bb_4 = 25.0f * _tanh_14;
+                            *(reinterpret_cast<__nv_bfloat16*>(out_s + (sf_tok_1 * 768 + row_s + sf_frow_2)) + (0)) = (__nv_bfloat16)(sf_aa_4 * sf_bb_4);
                         }
-                    }
-                    if (num_tokens > 2) {
-                        if (cls == 0) {
-                            *(reinterpret_cast<float*>(out_r + (1792 + row_r + tid_1)) + (0)) = red[2];
-                        } else {
-                            *(reinterpret_cast<__nv_bfloat16*>(out_l + (7168 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[2];
+                        int sf_tok_0_1 = 8 + lane_pair * 2 + 1;
+                        int sf_frow_1_1 = row_base;
+                        if (sf_tok_0_1 < num_tokens) {
+                            float sf_gk_5 = (float)(__nv_bfloat16)red[5];
+                            float sf_uk_5 = (float)(__nv_bfloat16)red[13];
+                            float _exp2_15 = approx_exp2((-sf_gk_5) * 1.442695f);
+                            float sf_sig_5 = approx_rcp(1.0f + _exp2_15);
+                            float _tanh_16 = tanhf(sf_gk_5 * 0.25f);
+                            float sf_aa_5 = 4.0f * _tanh_16 * sf_sig_5;
+                            float _tanh_17 = tanhf(sf_uk_5 * 0.04f);
+                            float sf_bb_5 = 25.0f * _tanh_17;
+                            *(reinterpret_cast<__nv_bfloat16*>(out_s + (sf_tok_0_1 * 768 + row_s + sf_frow_1_1)) + (0)) = (__nv_bfloat16)(sf_aa_5 * sf_bb_5);
                         }
-                    }
-                    if (num_tokens > 3) {
-                        if (cls == 0) {
-                            *(reinterpret_cast<float*>(out_r + (2688 + row_r + tid_1)) + (0)) = red[3];
-                        } else {
-                            *(reinterpret_cast<__nv_bfloat16*>(out_l + (10752 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[3];
+                        int sf_tok_2_1 = 8 + lane_pair * 2;
+                        int sf_frow_3_1 = row_base + 8;
+                        if (sf_tok_2_1 < num_tokens) {
+                            float sf_gk_6 = (float)(__nv_bfloat16)red[6];
+                            float sf_uk_6 = (float)(__nv_bfloat16)red[14];
+                            float _exp2_18 = approx_exp2((-sf_gk_6) * 1.442695f);
+                            float sf_sig_6 = approx_rcp(1.0f + _exp2_18);
+                            float _tanh_19 = tanhf(sf_gk_6 * 0.25f);
+                            float sf_aa_6 = 4.0f * _tanh_19 * sf_sig_6;
+                            float _tanh_20 = tanhf(sf_uk_6 * 0.04f);
+                            float sf_bb_6 = 25.0f * _tanh_20;
+                            *(reinterpret_cast<__nv_bfloat16*>(out_s + (sf_tok_2_1 * 768 + row_s + sf_frow_3_1)) + (0)) = (__nv_bfloat16)(sf_aa_6 * sf_bb_6);
                         }
-                    }
-                    if (num_tokens > 4) {
-                        if (cls == 0) {
-                            *(reinterpret_cast<float*>(out_r + (3584 + row_r + tid_1)) + (0)) = red[4];
-                        } else {
-                            *(reinterpret_cast<__nv_bfloat16*>(out_l + (14336 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[4];
+                        int sf_tok_4_1 = 8 + lane_pair * 2 + 1;
+                        int sf_frow_5_1 = row_base + 8;
+                        if (sf_tok_4_1 < num_tokens) {
+                            float sf_gk_7 = (float)(__nv_bfloat16)red[7];
+                            float sf_uk_7 = (float)(__nv_bfloat16)red[15];
+                            float _exp2_21 = approx_exp2((-sf_gk_7) * 1.442695f);
+                            float sf_sig_7 = approx_rcp(1.0f + _exp2_21);
+                            float _tanh_22 = tanhf(sf_gk_7 * 0.25f);
+                            float sf_aa_7 = 4.0f * _tanh_22 * sf_sig_7;
+                            float _tanh_23 = tanhf(sf_uk_7 * 0.04f);
+                            float sf_bb_7 = 25.0f * _tanh_23;
+                            *(reinterpret_cast<__nv_bfloat16*>(out_s + (sf_tok_4_1 * 768 + row_s + sf_frow_5_1)) + (0)) = (__nv_bfloat16)(sf_aa_7 * sf_bb_7);
                         }
-                    }
-                    if (num_tokens > 5) {
-                        if (cls == 0) {
-                            *(reinterpret_cast<float*>(out_r + (4480 + row_r + tid_1)) + (0)) = red[5];
-                        } else {
-                            *(reinterpret_cast<__nv_bfloat16*>(out_l + (17920 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[5];
+                    } else {
+                        if (num_tokens > 8) {
+                            if (cls == 0) {
+                                *(reinterpret_cast<float*>(out_r + (7168 + row_r + tid_1)) + (0)) = red[8];
+                            } else {
+                                *(reinterpret_cast<__nv_bfloat16*>(out_l + (28672 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[8];
+                            }
                         }
-                    }
-                    if (num_tokens > 6) {
-                        if (cls == 0) {
-                            *(reinterpret_cast<float*>(out_r + (5376 + row_r + tid_1)) + (0)) = red[6];
-                        } else {
-                            *(reinterpret_cast<__nv_bfloat16*>(out_l + (21504 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[6];
+                        if (num_tokens > 9) {
+                            if (cls == 0) {
+                                *(reinterpret_cast<float*>(out_r + (8064 + row_r + tid_1)) + (0)) = red[9];
+                            } else {
+                                *(reinterpret_cast<__nv_bfloat16*>(out_l + (32256 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[9];
+                            }
                         }
-                    }
-                    if (num_tokens > 7) {
-                        if (cls == 0) {
-                            *(reinterpret_cast<float*>(out_r + (6272 + row_r + tid_1)) + (0)) = red[7];
-                        } else {
-                            *(reinterpret_cast<__nv_bfloat16*>(out_l + (25088 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[7];
+                        if (num_tokens > 10) {
+                            if (cls == 0) {
+                                *(reinterpret_cast<float*>(out_r + (8960 + row_r + tid_1)) + (0)) = red[10];
+                            } else {
+                                *(reinterpret_cast<__nv_bfloat16*>(out_l + (35840 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[10];
+                            }
                         }
-                    }
-                    if (num_tokens > 8) {
-                        if (cls == 0) {
-                            *(reinterpret_cast<float*>(out_r + (7168 + row_r + tid_1)) + (0)) = red[8];
-                        } else {
-                            *(reinterpret_cast<__nv_bfloat16*>(out_l + (28672 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[8];
+                        if (num_tokens > 11) {
+                            if (cls == 0) {
+                                *(reinterpret_cast<float*>(out_r + (9856 + row_r + tid_1)) + (0)) = red[11];
+                            } else {
+                                *(reinterpret_cast<__nv_bfloat16*>(out_l + (39424 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[11];
+                            }
                         }
-                    }
-                    if (num_tokens > 9) {
-                        if (cls == 0) {
-                            *(reinterpret_cast<float*>(out_r + (8064 + row_r + tid_1)) + (0)) = red[9];
-                        } else {
-                            *(reinterpret_cast<__nv_bfloat16*>(out_l + (32256 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[9];
+                        if (num_tokens > 12) {
+                            if (cls == 0) {
+                                *(reinterpret_cast<float*>(out_r + (10752 + row_r + tid_1)) + (0)) = red[12];
+                            } else {
+                                *(reinterpret_cast<__nv_bfloat16*>(out_l + (43008 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[12];
+                            }
                         }
-                    }
-                    if (num_tokens > 10) {
-                        if (cls == 0) {
-                            *(reinterpret_cast<float*>(out_r + (8960 + row_r + tid_1)) + (0)) = red[10];
-                        } else {
-                            *(reinterpret_cast<__nv_bfloat16*>(out_l + (35840 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[10];
+                        if (num_tokens > 13) {
+                            if (cls == 0) {
+                                *(reinterpret_cast<float*>(out_r + (11648 + row_r + tid_1)) + (0)) = red[13];
+                            } else {
+                                *(reinterpret_cast<__nv_bfloat16*>(out_l + (46592 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[13];
+                            }
                         }
-                    }
-                    if (num_tokens > 11) {
-                        if (cls == 0) {
-                            *(reinterpret_cast<float*>(out_r + (9856 + row_r + tid_1)) + (0)) = red[11];
-                        } else {
-                            *(reinterpret_cast<__nv_bfloat16*>(out_l + (39424 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[11];
+                        if (num_tokens > 14) {
+                            if (cls == 0) {
+                                *(reinterpret_cast<float*>(out_r + (12544 + row_r + tid_1)) + (0)) = red[14];
+                            } else {
+                                *(reinterpret_cast<__nv_bfloat16*>(out_l + (50176 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[14];
+                            }
                         }
-                    }
-                    if (num_tokens > 12) {
-                        if (cls == 0) {
-                            *(reinterpret_cast<float*>(out_r + (10752 + row_r + tid_1)) + (0)) = red[12];
-                        } else {
-                            *(reinterpret_cast<__nv_bfloat16*>(out_l + (43008 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[12];
-                        }
-                    }
-                    if (num_tokens > 13) {
-                        if (cls == 0) {
-                            *(reinterpret_cast<float*>(out_r + (11648 + row_r + tid_1)) + (0)) = red[13];
-                        } else {
-                            *(reinterpret_cast<__nv_bfloat16*>(out_l + (46592 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[13];
-                        }
-                    }
-                    if (num_tokens > 14) {
-                        if (cls == 0) {
-                            *(reinterpret_cast<float*>(out_r + (12544 + row_r + tid_1)) + (0)) = red[14];
-                        } else {
-                            *(reinterpret_cast<__nv_bfloat16*>(out_l + (50176 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[14];
-                        }
-                    }
-                    if (num_tokens > 15) {
-                        if (cls == 0) {
-                            *(reinterpret_cast<float*>(out_r + (13440 + row_r + tid_1)) + (0)) = red[15];
-                        } else {
-                            *(reinterpret_cast<__nv_bfloat16*>(out_l + (53760 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[15];
+                        if (num_tokens > 15) {
+                            if (cls == 0) {
+                                *(reinterpret_cast<float*>(out_r + (13440 + row_r + tid_1)) + (0)) = red[15];
+                            } else {
+                                *(reinterpret_cast<__nv_bfloat16*>(out_l + (53760 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[15];
+                            }
                         }
                     }
                 }
