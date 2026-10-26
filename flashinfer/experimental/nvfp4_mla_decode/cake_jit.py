@@ -20,10 +20,14 @@ persistent decode over a host work table and the split-KV combine behind it.
 
 Every record of ``MODULES`` is one mechanically exported program: a CUDA
 device translation unit plus a tvm-ffi binding, compiled once per
-architecture.  The records are keyed by the stage they fill (``decode``: the
-persistent decode, one cluster of CTAs per work unit; ``reduce``: the split-KV
-combine, launched only when the plan has more than one split), so a renamed
-program changes no host code.  A record carries the host plan only: the
+architecture.  The records are keyed by name and each names the stage it fills
+(``stage``, one of ``STAGES``: ``decode``, the persistent decode, one cluster
+of CTAs per work unit; ``reduce``, the split-KV combine, launched only when the
+plan has more than one split).  The decode stage has two records: ``decode``
+and ``decode_qk_ahead``, an SM100 decode (the QK MMAs issued two tiles ahead of
+PV) that the host's ``select_decode_record`` picks for long balanced plans; the
+two programs' outputs are bitwise identical.  A renamed program still changes
+no host code.  A record carries the host plan only: the
 program's ``library`` stem (its ``build.json`` entries are
 ``<library>_<arch>``), the architectures it is delivered for, the source
 ``module`` and ``build`` keywords it was rendered from, its launch record, the
@@ -55,7 +59,9 @@ is a literal: the exporter reads this file with ``ast.literal_eval``.
 The program name ``cake_nvfp4_mla_decode_<20 hex>`` is the first twenty hex
 digits of the SHA-256 of the compact JSON ``{"build": <build keywords, sorted,
 every default spelled>, "module": <dotted source module>}`` of the kernel the
-program was rendered from; a changed keyword is a new program.
+program was rendered from; a changed keyword is a new program.  The exception
+is a keyword at its implicit default (``qk_ahead`` at ``False``): the name
+omits it, so programs named before the keyword existed keep their names.
 """
 
 from __future__ import annotations
@@ -171,6 +177,92 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "decode",
         "tile_kv": 128,
     },
+    "decode_qk_ahead": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["tma_buffer", "Q"],
+            ["tma_buffer", "QS"],
+            ["tma_buffer", "KV"],
+            ["tma_buffer", "KVS"],
+            ["tma_buffer", "OT"],
+            ["tma_buffer", "PO"],
+            ["buffer", "O"],
+            ["buffer", "LSE"],
+            ["buffer", "partial_o"],
+            ["buffer", "partial_lse"],
+            ["buffer", "work_table"],
+            ["buffer", "unit_first"],
+            ["buffer", "page_table"],
+            ["buffer", "seq_lens"],
+            ["buffer", "q_indptr"],
+            ["buffer", "sinks"],
+            ["parameter", "rows_total"],
+            ["parameter", "num_heads"],
+            ["parameter", "q_len"],
+            ["parameter", "max_pages"],
+            ["parameter", "max_splits"],
+            ["parameter", "scale_log2"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "lazy_rescale": True,
+            "num_p_stages": 2,
+            "num_raw_stages": 3,
+            "num_v_stages": 2,
+            "qk_ahead": True,
+        },
+        "ffi_entry": "run",
+        "flag_direct_out": 2,
+        "flag_seed_sink": 1,
+        "grid_rule": {
+            "ctas": 2,
+            "kind": "units_by_cluster",
+        },
+        "item_fields": 8,
+        "kernel": "cake_nvfp4_mla_decode_48db04e5f7665bc25adb",
+        "kernel_symbol": "kernel_cake_nvfp4_mla_decode_48db04e5f7665bc25adb",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (2, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 222208,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_mla_decode_48db04e5f7665bc25adb",
+        "logical": {
+            "KV": "KV",
+            "KVS": "KVS",
+            "LSE": "LSE",
+            "O": "O",
+            "OT": "OT",
+            "PO": "PO",
+            "Q": "Q",
+            "QS": "QS",
+            "max_pages": "max_pages",
+            "max_splits": "max_splits",
+            "num_heads": "num_heads",
+            "page_table": "page_table",
+            "partial_lse": "partial_lse",
+            "partial_o": "partial_o",
+            "q_indptr": "q_indptr",
+            "q_len": "q_len",
+            "rows_total": "rows_total",
+            "scale_log2": "scale_log2",
+            "seq_lens": "seq_lens",
+            "sinks": "sinks",
+            "unit_first": "unit_first",
+            "work_table": "work_table",
+        },
+        "module": "tart.mla_decode_dsv4_dense_nvfp4.sm100_sm103.dsv4_nvfp4_fmha_decode",
+        "page_size": 64,
+        "rows_per_tile": 128,
+        "stage": "decode",
+        "tile_kv": 128,
+    },
     "reduce": {
         "arches": [
             "sm_100a",
@@ -247,7 +339,9 @@ def device_arch(device_index: int) -> str:
 
 
 def program_available(arch: str) -> bool:
-    """True when the record of every stage is delivered for ``arch``."""
+    """True when the record named after every stage is delivered for ``arch``
+    (``decode_qk_ahead`` is an optional second decode the host selects only
+    where it is delivered)."""
     return all(
         stage in MODULES and arch in MODULES[stage]["arches"] for stage in STAGES
     )

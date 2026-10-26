@@ -22,7 +22,7 @@
 
 #include <cstdint>
 
-extern "C" __global__ void kernel_cake_nvfp4_mla_decode_32bd3b7e232d00a5d04e(__nv_bfloat16* __restrict__ o, float* __restrict__ lse, __nv_bfloat16* __restrict__ partial_o, float* __restrict__ partial_lse, int* __restrict__ row_splits, int total_q, int num_heads, int max_splits);
+extern "C" __global__ void kernel_cake_nvfp4_mla_decode_32bd3b7e232d00a5d04e(__nv_bfloat16* __restrict__ o, float* __restrict__ lse, __nv_bfloat16* partial_o, float* partial_lse, int* __restrict__ row_splits, int total_q, int num_heads, int max_splits);
 
 namespace cake_binding_kernel_cake_nvfp4_mla_decode_32bd3b7e232d00a5d04e {
 
