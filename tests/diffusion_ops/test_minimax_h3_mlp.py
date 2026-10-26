@@ -118,6 +118,8 @@ MAX_FASTMATH_ROW_FLOOR = 4
 # One row, one partial pair of 128-row tiles (129 -> 2 tiles, 257 -> 3 tiles padded to 4) and the
 # production token count of one rank at sequence-parallel degree 8.  On a 148-SM / 160-SM part the
 # FC2 tail split-K is active for M = 1, 129 and 4824 (21 / 21 / 399 pair tiles) and off for 257.
+# The persistent NVFP4 norm launches ceil(M / 8) CTAs for M = 1, 129 and 257 and one CTA per SM
+# for 4824.
 M_VALUES = [1, 129, 257, 4824]
 # Engine modulation projection: the three tables are the shift_mlp / scale_mlp / gate_mlp column
 # chunks (3 / 4 / 5) of a [rows, 6 * 5376] buffer with rows = 3 x unique timesteps (3 or 6 in the
