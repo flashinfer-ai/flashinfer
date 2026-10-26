@@ -15,10 +15,20 @@ with per-variant SASS equivalence checks against the generated originals.
   out its own `defines`: the decode bodies that bake their constants in-file
   take none, and some bodies take only a subset of the keys), and the
   template, kernel symbol and parameters of its host shim (`host_binding`).
+  Five fields are not stored: `flashinfer/jit/cake_gdn.py` derives them when
+  it loads the manifest, so the record name `<domain>_<schedule>_<12 hex>`
+  is load-bearing for the resolver key. `domain` is its first token,
+  `source_schedule` is `flashinfer.cake_gdn.generated.<domain>:<schedule>`,
+  `tma_abi` is `grid_constant` for prefill and `pointer` for decode,
+  `host_binding.entry` is `run_<name>`, and the record-level
+  `architectures` is the sorted union of its outputs' `architectures`. An
+  entry that spells one of these out must agree with the derived value; the
+  loader refuses a disagreeing entry.
 - `cuda/` holds one file per distinct kernel body. Kernels that run on
   several architectures carry each in `outputs[].architectures`; the
-  outputs of a record partition its `architectures`, and the loader
-  compiles the one output that lists the device's architecture. Genuine
+  outputs of a record are disjoint and their union is the record's derived
+  `architectures`; the loader compiles the one output that lists the
+  device's architecture. Genuine
   lowering differences sit behind exact `__CUDA_ARCH__` guards (SM107a takes
   the generic shared-address form, as Cake lowers it for every SM100-family
   target other than exact SM100a; the eight `fullgrid_vhold` prefill variants
