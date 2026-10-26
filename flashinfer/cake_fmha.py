@@ -11,6 +11,7 @@ import copy
 import functools
 import warnings
 from dataclasses import dataclass
+from dataclasses import replace as dataclass_replace
 from typing import Any, Literal
 
 import torch
@@ -1195,23 +1196,25 @@ def _pinned_noop_skip_softmax_supported(scale_factor: float | None) -> bool:
     return scale_factor in (None, 0.0, 1e-30)
 
 
-def _decode_quant_fp8_seq_lens_supported(
-    seq_lens: torch.Tensor, max_seq_len: int
+def _decode_quant_fp8_fixed_split(
+    batch_size: int, num_kv_heads: int, max_seq_len: int, sm_count: int
 ) -> bool:
-    """Resolve the exact full-block/even-bucket route domain, or fail closed."""
+    """Whether the FP8 decode's host split plan is the fixed-plan member's 8 x 16.
 
-    if seq_lens.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+    Mirrors ``ResolveSplitPlanHost`` of the JIT binding: host scalars only.
+    """
+
+    even_bucket = max(2, (max_seq_len + 127) // 128 + ((max_seq_len + 127) // 128) % 2)
+    total_tiles = batch_size * num_kv_heads
+    if total_tiles >= sm_count or even_bucket < 8:
         return False
-    try:
-        lengths = [int(value) for value in seq_lens.detach().cpu().tolist()]
-    except (RuntimeError, TypeError, ValueError):
-        return False
-    if not lengths or max(lengths) != max_seq_len:
-        return False
-    if any(length < 512 or length % 128 for length in lengths):
-        return False
-    evened_buckets = {((length + 127) // 128 + 1) // 2 * 2 for length in lengths}
-    return len(evened_buckets) == 1
+    target = max(1, sm_count // total_tiles)
+    blocks_per_split = (even_bucket + target - 1) // target
+    blocks_per_split = max(4, blocks_per_split + blocks_per_split % 2)
+    while blocks_per_split < even_bucket and even_bucket % blocks_per_split == 2:
+        blocks_per_split += 2
+    num_splits = (even_bucket + blocks_per_split - 1) // blocks_per_split
+    return (num_splits, blocks_per_split) == (8, 16)
 
 
 def _decode_quant_fp8_workspace_supported(
@@ -1255,20 +1258,6 @@ def _decode_quant_fp8_workspace_supported(
     return workspace_bytes >= cursor
 
 
-def _decode_quant_nvfp4_seq_lens_supported(
-    seq_lens: torch.Tensor, max_seq_len: int
-) -> bool:
-    """Resolve NVFP4 runtime split inputs on the host, or fail closed."""
-
-    if seq_lens.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
-        return False
-    try:
-        lengths = [int(value) for value in seq_lens.detach().cpu().tolist()]
-    except (RuntimeError, TypeError, ValueError):
-        return False
-    return bool(lengths) and min(lengths) > 0 and max(lengths) == max_seq_len
-
-
 def _decode_quant_nvfp4_workspace_supported(
     workspace_buffer: torch.Tensor,
     query: torch.Tensor,
@@ -1288,6 +1277,7 @@ def _decode_quant_nvfp4_workspace_supported(
         return False
     even_kv_blocks = (max_seq_len + 127) // 128
     even_kv_blocks += even_kv_blocks % 2
+    even_kv_blocks = max(even_kv_blocks, 2)
     max_splits = max(1, (even_kv_blocks + 3) // 4)
     required_pages = even_kv_blocks * (128 // page_size)
     source_pages = int(block_tables.shape[-1])
@@ -1921,8 +1911,6 @@ def select_cake_fmha_decode_route(
         and no_block_scales
         and quant_extensions_absent
         and max_seq_len >= 512
-        and max_seq_len % 128 == 0
-        and _decode_quant_fp8_seq_lens_supported(seq_lens, max_seq_len)
         and _tma_paged_kv_strides_supported(key_cache)
         and _tma_paged_kv_strides_supported(value_cache)
         and query.data_ptr() % 16 == 0
@@ -1941,7 +1929,11 @@ def select_cake_fmha_decode_route(
             bmm2_scale=bmm2_scale,
         )
     ):
-        return route("decode_quant_fp8")
+        # num_split=8 selects the fixed 8 x 16 split-plan member (decode -> reducer PDL).
+        fixed = _decode_quant_fp8_fixed_split(
+            batch_size, num_kv_heads, max_seq_len, _smallm_sm_count(device)
+        )
+        return dataclass_replace(route("decode_quant_fp8"), num_split=8 if fixed else 0)
 
     if (
         dtypes
@@ -2008,7 +2000,6 @@ def select_cake_fmha_decode_route(
         and key_block_scales.device == query.device
         and value_block_scales.device == query.device
         and num_q_heads // num_kv_heads <= 8
-        and _decode_quant_nvfp4_seq_lens_supported(seq_lens, max_seq_len)
         and _tma_nvfp4_paged_kv_strides_supported(key_cache)
         and _tma_nvfp4_paged_kv_strides_supported(value_cache)
         and _tma_nvfp4_scale_strides_supported(key_block_scales)
@@ -2251,7 +2242,16 @@ def _resolve_cake_fmha_decode_module(
     if route.component == "decode_quant_bf16q":
         return loader(*common_args, route.page_size), True
     if route.component == "decode_quant_fp8":
-        return loader(*common_args, route.page_size, full_blocks=True), True
+        # The host does not read seq_lens: the kernel masks every tail at run time.
+        return (
+            loader(
+                *common_args,
+                route.page_size,
+                full_blocks=False,
+                fixed_split=route.num_split == 8,
+            ),
+            True,
+        )
     if route.component == "decode_quant_nvfp4":
         try:
             return loader(*common_args, route.page_size), True
