@@ -54,14 +54,14 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_SCRATCH_STRIDE 128
 #define SMEM_TOTAL 128
 #define THREADS 160
-#define LAUNCH_MIN_BLOCKS 4
+#define LAUNCH_MIN_BLOCKS 3
 
 #include <math_constants.h>
 
 extern "C" {
 
 __global__ __launch_bounds__(160, LAUNCH_MIN_BLOCKS) void
-kernel_cake_fused_norm_combine_986ac9f50a9e95d43781(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ residual, __nv_bfloat16* __restrict__ weight, __nv_bfloat16* __restrict__ norm_out, __nv_bfloat16* __restrict__ residual_out, __nv_bfloat16* __restrict__ collective_out, unsigned long long* __restrict__ workspace, int rank, int tokens, float epsilon)
+kernel_cake_fused_norm_combine_8d72efaafce77c1ae5f9(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ residual, __nv_bfloat16* __restrict__ weight, __nv_bfloat16* __restrict__ norm_out, __nv_bfloat16* __restrict__ residual_out, __nv_bfloat16* __restrict__ collective_out, unsigned long long* __restrict__ workspace, int rank, int tokens, float epsilon)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -87,30 +87,14 @@ kernel_cake_fused_norm_combine_986ac9f50a9e95d43781(__nv_bfloat16* __restrict__ 
 
     // === Task calls (declaration order) ===
     asm volatile("griddepcontrol.wait;" ::: "memory");
-    unsigned long long control_address = workspace[24];
-    int* control_0 = reinterpret_cast<int*>(control_address);
-    int control_current_word = control_0[2];
-    int control_bytes_per_buffer_word = control_0[3];
-    int control_clear_word = control_0[4];
-    int control_current = control_current_word % 3;
-    int control_dirty = (control_current_word + 2) % 3;
-    __nv_bfloat16* local_payload = reinterpret_cast<__nv_bfloat16*>(workspace[16 + rank]);
-    long long data_base = (long long)control_current * (long long)control_bytes_per_buffer_word / 2;
-    long long clear_base = (long long)control_dirty * (long long)control_bytes_per_buffer_word / 2;
-    int total_vectors = tokens * 160;
-    int vector_index = bid * 160 + tid;
-    __syncthreads();
-    if (tid == 0) {
-        asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(control_0)) + (0))), "r"(static_cast<unsigned int>(1)) : "memory");
-    }
-    int slots = (tokens + 7) / 8;
-    #pragma unroll 1
-    for (int token = bid; token < tokens; token += num_bids) {
-        long long base = (long long)token * 5120 + (long long)(tid * 16);
-        unsigned int x0[8];
-        unsigned int r0[8];
-        unsigned int x1[8];
-        unsigned int r1[8];
+    unsigned int x0[8];
+    unsigned int r0[8];
+    unsigned int x1[8];
+    unsigned int r1[8];
+    unsigned int gamma_words0[8];
+    unsigned int gamma_words1[8];
+    if (bid < tokens) {
+        long long base = (long long)bid * 5120 + (long long)(tid * 16);
         {
             asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
                 : "=r"(x0[0 + 0]), "=r"(x0[0 + 1]), "=r"(x0[0 + 2]), "=r"(x0[0 + 3]), "=r"(x0[0 + 4]), "=r"(x0[0 + 5]), "=r"(x0[0 + 6]), "=r"(x0[0 + 7]) : "l"((const void*)((const char*)(x + base + 0) + 0)) : "memory");
@@ -127,8 +111,6 @@ kernel_cake_fused_norm_combine_986ac9f50a9e95d43781(__nv_bfloat16* __restrict__ 
             asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
                 : "=r"(r1[0 + 0]), "=r"(r1[0 + 1]), "=r"(r1[0 + 2]), "=r"(r1[0 + 3]), "=r"(r1[0 + 4]), "=r"(r1[0 + 5]), "=r"(r1[0 + 6]), "=r"(r1[0 + 7]) : "l"((const void*)((const char*)(residual + (base + 2560) + 0) + 0)) : "memory");
         }
-        unsigned int gamma_words0[8];
-        unsigned int gamma_words1[8];
         {
             asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
                 : "=r"(gamma_words0[0 + 0]), "=r"(gamma_words0[0 + 1]), "=r"(gamma_words0[0 + 2]), "=r"(gamma_words0[0 + 3]), "=r"(gamma_words0[0 + 4]), "=r"(gamma_words0[0 + 5]), "=r"(gamma_words0[0 + 6]), "=r"(gamma_words0[0 + 7]) : "l"((const void*)((const char*)(weight + (tid * 16) + 0) + 0)) : "memory");
@@ -137,6 +119,26 @@ kernel_cake_fused_norm_combine_986ac9f50a9e95d43781(__nv_bfloat16* __restrict__ 
             asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
                 : "=r"(gamma_words1[0 + 0]), "=r"(gamma_words1[0 + 1]), "=r"(gamma_words1[0 + 2]), "=r"(gamma_words1[0 + 3]), "=r"(gamma_words1[0 + 4]), "=r"(gamma_words1[0 + 5]), "=r"(gamma_words1[0 + 6]), "=r"(gamma_words1[0 + 7]) : "l"((const void*)((const char*)(weight + (2560 + tid * 16) + 0) + 0)) : "memory");
         }
+    }
+    unsigned long long control_address = workspace[24];
+    int* control_0 = reinterpret_cast<int*>(control_address);
+    int control_current_word = control_0[2];
+    int control_bytes_per_buffer_word = control_0[3];
+    int control_clear_word = control_0[4];
+    int control_current = control_current_word % 3;
+    int control_dirty = (control_current_word + 2) % 3;
+    __nv_bfloat16* local_payload = reinterpret_cast<__nv_bfloat16*>(workspace[16 + rank]);
+    long long data_base = (long long)control_current * (long long)control_bytes_per_buffer_word / 2;
+    long long clear_base = (long long)control_dirty * (long long)control_bytes_per_buffer_word / 2;
+    int total_vectors = tokens * 160;
+    __syncthreads();
+    if (tid == 0) {
+        asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(control_0)) + (0))), "r"(static_cast<unsigned int>(1)) : "memory");
+    }
+    int slots = (tokens + 7) / 8;
+    #pragma unroll 1
+    for (int token = bid; token < tokens; token += num_bids) {
+        long long base_1 = (long long)token * 5120 + (long long)(tid * 16);
         unsigned int propagated_words[8];
         uint32_t _bf16x2_add_0;
         asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_0) : "r"(x0[0]), "r"(r0[0]));
@@ -173,7 +175,7 @@ kernel_cake_fused_norm_combine_986ac9f50a9e95d43781(__nv_bfloat16* __restrict__ 
         for (int element = 0; element < 16; element++) {
             square_sum = __fmaf_rn(_unpack_bf16_0[element], _unpack_bf16_0[element], square_sum);
         }
-        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(residual_out + base), "r"((propagated_words)[0]), "r"((propagated_words)[1]), "r"((propagated_words)[2]), "r"((propagated_words)[3]), "r"((propagated_words)[4]), "r"((propagated_words)[5]), "r"((propagated_words)[6]), "r"((propagated_words)[7]) : "memory");
+        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(residual_out + base_1), "r"((propagated_words)[0]), "r"((propagated_words)[1]), "r"((propagated_words)[2]), "r"((propagated_words)[3]), "r"((propagated_words)[4]), "r"((propagated_words)[5]), "r"((propagated_words)[6]), "r"((propagated_words)[7]) : "memory");
         unsigned int propagated_words_0[8];
         uint32_t _bf16x2_add_8;
         asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_8) : "r"(x1[0]), "r"(r1[0]));
@@ -210,7 +212,7 @@ kernel_cake_fused_norm_combine_986ac9f50a9e95d43781(__nv_bfloat16* __restrict__ 
         for (int element_1 = 0; element_1 < 16; element_1++) {
             square_sum_1 = __fmaf_rn(_unpack_bf16_1[element_1], _unpack_bf16_1[element_1], square_sum_1);
         }
-        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(residual_out + (base + 2560)), "r"((propagated_words_0)[0]), "r"((propagated_words_0)[1]), "r"((propagated_words_0)[2]), "r"((propagated_words_0)[3]), "r"((propagated_words_0)[4]), "r"((propagated_words_0)[5]), "r"((propagated_words_0)[6]), "r"((propagated_words_0)[7]) : "memory");
+        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(residual_out + (base_1 + 2560)), "r"((propagated_words_0)[0]), "r"((propagated_words_0)[1]), "r"((propagated_words_0)[2]), "r"((propagated_words_0)[3]), "r"((propagated_words_0)[4]), "r"((propagated_words_0)[5]), "r"((propagated_words_0)[6]), "r"((propagated_words_0)[7]) : "memory");
         float _warp_reduce_0 = square_sum;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
@@ -272,7 +274,7 @@ kernel_cake_fused_norm_combine_986ac9f50a9e95d43781(__nv_bfloat16* __restrict__ 
             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(normalized_values[_lp*2 + 0], normalized_values[_lp*2+1 + 0]));
             normalized_values_bf16[_lp] = *(uint32_t*)&_bf2;
         }
-        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(norm_out + base), "r"((normalized_values_bf16)[0]), "r"((normalized_values_bf16)[1]), "r"((normalized_values_bf16)[2]), "r"((normalized_values_bf16)[3]), "r"((normalized_values_bf16)[4]), "r"((normalized_values_bf16)[5]), "r"((normalized_values_bf16)[6]), "r"((normalized_values_bf16)[7]) : "memory");
+        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(norm_out + base_1), "r"((normalized_values_bf16)[0]), "r"((normalized_values_bf16)[1]), "r"((normalized_values_bf16)[2]), "r"((normalized_values_bf16)[3]), "r"((normalized_values_bf16)[4]), "r"((normalized_values_bf16)[5]), "r"((normalized_values_bf16)[6]), "r"((normalized_values_bf16)[7]) : "memory");
         float _unpack_bf16_4[16];
         #pragma unroll
         for (int _pair = 0; _pair < 8; _pair++) {
@@ -307,7 +309,7 @@ kernel_cake_fused_norm_combine_986ac9f50a9e95d43781(__nv_bfloat16* __restrict__ 
             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(normalized_values_2[_lp*2 + 0], normalized_values_2[_lp*2+1 + 0]));
             normalized_values_2_bf16[_lp] = *(uint32_t*)&_bf2;
         }
-        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(norm_out + (base + 2560)), "r"((normalized_values_2_bf16)[0]), "r"((normalized_values_2_bf16)[1]), "r"((normalized_values_2_bf16)[2]), "r"((normalized_values_2_bf16)[3]), "r"((normalized_values_2_bf16)[4]), "r"((normalized_values_2_bf16)[5]), "r"((normalized_values_2_bf16)[6]), "r"((normalized_values_2_bf16)[7]) : "memory");
+        asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(norm_out + (base_1 + 2560)), "r"((normalized_values_2_bf16)[0]), "r"((normalized_values_2_bf16)[1]), "r"((normalized_values_2_bf16)[2]), "r"((normalized_values_2_bf16)[3]), "r"((normalized_values_2_bf16)[4]), "r"((normalized_values_2_bf16)[5]), "r"((normalized_values_2_bf16)[6]), "r"((normalized_values_2_bf16)[7]) : "memory");
         float _unpack_bf16_7[16];
         #pragma unroll
         for (int _pair = 0; _pair < 8; _pair++) {
@@ -609,6 +611,34 @@ kernel_cake_fused_norm_combine_986ac9f50a9e95d43781(__nv_bfloat16* __restrict__ 
             final_words[6] = _sysv_poll256_group_1[6];
             final_words[7] = _sysv_poll256_group_1[7];
             asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(collective_out + (((long long)earlier * 160 + (long long)tid) * 16)), "r"((final_words)[0]), "r"((final_words)[1]), "r"((final_words)[2]), "r"((final_words)[3]), "r"((final_words)[4]), "r"((final_words)[5]), "r"((final_words)[6]), "r"((final_words)[7]) : "memory");
+        }
+        int following = token + num_bids;
+        if (following < tokens) {
+            long long base_0 = (long long)following * 5120 + (long long)(tid * 16);
+            {
+                asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                    : "=r"(x0[0 + 0]), "=r"(x0[0 + 1]), "=r"(x0[0 + 2]), "=r"(x0[0 + 3]), "=r"(x0[0 + 4]), "=r"(x0[0 + 5]), "=r"(x0[0 + 6]), "=r"(x0[0 + 7]) : "l"((const void*)((const char*)(x + base_0 + 0) + 0)) : "memory");
+            }
+            {
+                asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                    : "=r"(r0[0 + 0]), "=r"(r0[0 + 1]), "=r"(r0[0 + 2]), "=r"(r0[0 + 3]), "=r"(r0[0 + 4]), "=r"(r0[0 + 5]), "=r"(r0[0 + 6]), "=r"(r0[0 + 7]) : "l"((const void*)((const char*)(residual + base_0 + 0) + 0)) : "memory");
+            }
+            {
+                asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                    : "=r"(x1[0 + 0]), "=r"(x1[0 + 1]), "=r"(x1[0 + 2]), "=r"(x1[0 + 3]), "=r"(x1[0 + 4]), "=r"(x1[0 + 5]), "=r"(x1[0 + 6]), "=r"(x1[0 + 7]) : "l"((const void*)((const char*)(x + (base_0 + 2560) + 0) + 0)) : "memory");
+            }
+            {
+                asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                    : "=r"(r1[0 + 0]), "=r"(r1[0 + 1]), "=r"(r1[0 + 2]), "=r"(r1[0 + 3]), "=r"(r1[0 + 4]), "=r"(r1[0 + 5]), "=r"(r1[0 + 6]), "=r"(r1[0 + 7]) : "l"((const void*)((const char*)(residual + (base_0 + 2560) + 0) + 0)) : "memory");
+            }
+            {
+                asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                    : "=r"(gamma_words0[0 + 0]), "=r"(gamma_words0[0 + 1]), "=r"(gamma_words0[0 + 2]), "=r"(gamma_words0[0 + 3]), "=r"(gamma_words0[0 + 4]), "=r"(gamma_words0[0 + 5]), "=r"(gamma_words0[0 + 6]), "=r"(gamma_words0[0 + 7]) : "l"((const void*)((const char*)(weight + (tid * 16) + 0) + 0)) : "memory");
+            }
+            {
+                asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                    : "=r"(gamma_words1[0 + 0]), "=r"(gamma_words1[0 + 1]), "=r"(gamma_words1[0 + 2]), "=r"(gamma_words1[0 + 3]), "=r"(gamma_words1[0 + 4]), "=r"(gamma_words1[0 + 5]), "=r"(gamma_words1[0 + 6]), "=r"(gamma_words1[0 + 7]) : "l"((const void*)((const char*)(weight + (2560 + tid * 16) + 0) + 0)) : "memory");
+            }
         }
     }
     unsigned int sentinel[8];
@@ -1417,8 +1447,8 @@ kernel_cake_fused_norm_combine_986ac9f50a9e95d43781(__nv_bfloat16* __restrict__ 
         if (tid == 0) {
             int clear_bytes = (8 * slots + tokens) * 5120;
             {
-                volatile int* _sysv_wait_p_6 = reinterpret_cast<volatile int*>(reinterpret_cast<unsigned int*>(control_0)) + (0);
-                while (*_sysv_wait_p_6 != static_cast<int>(num_bids)) {}
+                volatile int* _sysv_wait_p_12 = reinterpret_cast<volatile int*>(reinterpret_cast<unsigned int*>(control_0)) + (0);
+                while (*_sysv_wait_p_12 != static_cast<int>(num_bids)) {}
             }
             control_0[2] = (control_current_word + 1) % 3;
             control_0[4] = clear_bytes;

@@ -30,12 +30,12 @@ from . import cake_program
 from .core import JitSpec
 
 PARALLEL_SINGLE = cake_program.CakeProgram(
-    name="cake_fused_norm_combine_102ff2a7592bbb88f200",
+    name="cake_fused_norm_combine_7778a9a131a0653e5671",
     operator_dir="cake_fused_norm_combine",
-    kernel="kernel_cake_fused_norm_combine_102ff2a7592bbb88f200",
+    kernel="kernel_cake_fused_norm_combine_7778a9a131a0653e5671",
     sources=(
-        "cake_fused_norm_combine_102ff2a7592bbb88f200_kernel.cu",
-        "cake_fused_norm_combine_102ff2a7592bbb88f200_binding.cu",
+        "cake_fused_norm_combine_7778a9a131a0653e5671_kernel.cu",
+        "cake_fused_norm_combine_7778a9a131a0653e5671_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(("sm_100a", ("--fmad=true",)), ("sm_103a", ("--fmad=true",))),
@@ -72,12 +72,12 @@ PARALLEL_SINGLE = cake_program.CakeProgram(
 )
 
 PARALLEL = cake_program.CakeProgram(
-    name="cake_fused_norm_combine_997eebeeff40e290e056",
+    name="cake_fused_norm_combine_f745596d3f90db224372",
     operator_dir="cake_fused_norm_combine",
-    kernel="kernel_cake_fused_norm_combine_997eebeeff40e290e056",
+    kernel="kernel_cake_fused_norm_combine_f745596d3f90db224372",
     sources=(
-        "cake_fused_norm_combine_997eebeeff40e290e056_kernel.cu",
-        "cake_fused_norm_combine_997eebeeff40e290e056_binding.cu",
+        "cake_fused_norm_combine_f745596d3f90db224372_kernel.cu",
+        "cake_fused_norm_combine_f745596d3f90db224372_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(("sm_100a", ("--fmad=true",)), ("sm_103a", ("--fmad=true",))),
@@ -114,12 +114,12 @@ PARALLEL = cake_program.CakeProgram(
 )
 
 PARALLEL_SPLIT = cake_program.CakeProgram(
-    name="cake_fused_norm_combine_45d4f681e01eef5ea0d0",
+    name="cake_fused_norm_combine_3def0164ca6263e62e56",
     operator_dir="cake_fused_norm_combine",
-    kernel="kernel_cake_fused_norm_combine_45d4f681e01eef5ea0d0",
+    kernel="kernel_cake_fused_norm_combine_3def0164ca6263e62e56",
     sources=(
-        "cake_fused_norm_combine_45d4f681e01eef5ea0d0_kernel.cu",
-        "cake_fused_norm_combine_45d4f681e01eef5ea0d0_binding.cu",
+        "cake_fused_norm_combine_3def0164ca6263e62e56_kernel.cu",
+        "cake_fused_norm_combine_3def0164ca6263e62e56_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(("sm_100a", ("--fmad=true",)), ("sm_103a", ("--fmad=true",))),
@@ -198,12 +198,12 @@ OWNER_STREAM = cake_program.CakeProgram(
 )
 
 OWNER_PIPELINED = cake_program.CakeProgram(
-    name="cake_fused_norm_combine_986ac9f50a9e95d43781",
+    name="cake_fused_norm_combine_3e5044114a64d435bf4e",
     operator_dir="cake_fused_norm_combine",
-    kernel="kernel_cake_fused_norm_combine_986ac9f50a9e95d43781",
+    kernel="kernel_cake_fused_norm_combine_3e5044114a64d435bf4e",
     sources=(
-        "cake_fused_norm_combine_986ac9f50a9e95d43781_kernel.cu",
-        "cake_fused_norm_combine_986ac9f50a9e95d43781_binding.cu",
+        "cake_fused_norm_combine_3e5044114a64d435bf4e_kernel.cu",
+        "cake_fused_norm_combine_3e5044114a64d435bf4e_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(("sm_100a", ("--fmad=true",)), ("sm_103a", ("--fmad=true",))),
@@ -240,12 +240,12 @@ OWNER_PIPELINED = cake_program.CakeProgram(
 )
 
 OWNER_PIPELINED_EARLY = cake_program.CakeProgram(
-    name="cake_fused_norm_combine_5550b992bddbdf98a615",
+    name="cake_fused_norm_combine_8d72efaafce77c1ae5f9",
     operator_dir="cake_fused_norm_combine",
-    kernel="kernel_cake_fused_norm_combine_5550b992bddbdf98a615",
+    kernel="kernel_cake_fused_norm_combine_8d72efaafce77c1ae5f9",
     sources=(
-        "cake_fused_norm_combine_5550b992bddbdf98a615_kernel.cu",
-        "cake_fused_norm_combine_5550b992bddbdf98a615_binding.cu",
+        "cake_fused_norm_combine_8d72efaafce77c1ae5f9_kernel.cu",
+        "cake_fused_norm_combine_8d72efaafce77c1ae5f9_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(("sm_100a", ("--fmad=true",)), ("sm_103a", ("--fmad=true",))),

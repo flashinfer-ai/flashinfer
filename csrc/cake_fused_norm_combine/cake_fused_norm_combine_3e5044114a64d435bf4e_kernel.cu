@@ -54,14 +54,14 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_SCRATCH_STRIDE 128
 #define SMEM_TOTAL 128
 #define THREADS 160
-#define LAUNCH_MIN_BLOCKS 3
+#define LAUNCH_MIN_BLOCKS 4
 
 #include <math_constants.h>
 
 extern "C" {
 
 __global__ __launch_bounds__(160, LAUNCH_MIN_BLOCKS) void
-kernel_cake_fused_norm_combine_5550b992bddbdf98a615(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ residual, __nv_bfloat16* __restrict__ weight, __nv_bfloat16* __restrict__ norm_out, __nv_bfloat16* __restrict__ residual_out, __nv_bfloat16* __restrict__ collective_out, unsigned long long* __restrict__ workspace, int rank, int tokens, float epsilon)
+kernel_cake_fused_norm_combine_3e5044114a64d435bf4e(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ residual, __nv_bfloat16* __restrict__ weight, __nv_bfloat16* __restrict__ norm_out, __nv_bfloat16* __restrict__ residual_out, __nv_bfloat16* __restrict__ collective_out, unsigned long long* __restrict__ workspace, int rank, int tokens, float epsilon)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -87,6 +87,14 @@ kernel_cake_fused_norm_combine_5550b992bddbdf98a615(__nv_bfloat16* __restrict__ 
 
     // === Task calls (declaration order) ===
     asm volatile("griddepcontrol.wait;" ::: "memory");
+    unsigned long long control_root = workspace[24];
+    unsigned long long local_root = workspace[16 + rank];
+    int* control_0 = reinterpret_cast<int*>(control_root);
+    int control_current_word = control_0[2];
+    int control_bytes_per_buffer_word = control_0[3];
+    int control_clear_word = control_0[4];
+    int control_current = control_current_word % 3;
+    int control_dirty = (control_current_word + 2) % 3;
     unsigned int x0[8];
     unsigned int r0[8];
     unsigned int x1[8];
@@ -120,17 +128,9 @@ kernel_cake_fused_norm_combine_5550b992bddbdf98a615(__nv_bfloat16* __restrict__ 
                 : "=r"(gamma_words1[0 + 0]), "=r"(gamma_words1[0 + 1]), "=r"(gamma_words1[0 + 2]), "=r"(gamma_words1[0 + 3]), "=r"(gamma_words1[0 + 4]), "=r"(gamma_words1[0 + 5]), "=r"(gamma_words1[0 + 6]), "=r"(gamma_words1[0 + 7]) : "l"((const void*)((const char*)(weight + (2560 + tid * 16) + 0) + 0)) : "memory");
         }
     }
-    unsigned long long control_address = workspace[24];
-    int* control_0 = reinterpret_cast<int*>(control_address);
-    int control_current_word = control_0[2];
-    int control_bytes_per_buffer_word = control_0[3];
-    int control_clear_word = control_0[4];
-    int control_current = control_current_word % 3;
-    int control_dirty = (control_current_word + 2) % 3;
-    __nv_bfloat16* local_payload = reinterpret_cast<__nv_bfloat16*>(workspace[16 + rank]);
+    __nv_bfloat16* local_payload = reinterpret_cast<__nv_bfloat16*>(local_root);
     long long data_base = (long long)control_current * (long long)control_bytes_per_buffer_word / 2;
     long long clear_base = (long long)control_dirty * (long long)control_bytes_per_buffer_word / 2;
-    int total_vectors = tokens * 160;
     __syncthreads();
     if (tid == 0) {
         asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(control_0)) + (0))), "r"(static_cast<unsigned int>(1)) : "memory");
@@ -639,6 +639,55 @@ kernel_cake_fused_norm_combine_5550b992bddbdf98a615(__nv_bfloat16* __restrict__ 
                 asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
                     : "=r"(gamma_words1[0 + 0]), "=r"(gamma_words1[0 + 1]), "=r"(gamma_words1[0 + 2]), "=r"(gamma_words1[0 + 3]), "=r"(gamma_words1[0 + 4]), "=r"(gamma_words1[0 + 5]), "=r"(gamma_words1[0 + 6]), "=r"(gamma_words1[0 + 7]) : "l"((const void*)((const char*)(weight + (2560 + tid * 16) + 0) + 0)) : "memory");
             }
+        } else {
+            x0[0] = 0;
+            r0[0] = 0;
+            x1[0] = 0;
+            r1[0] = 0;
+            gamma_words0[0] = 0;
+            gamma_words1[0] = 0;
+            x0[1] = 0;
+            r0[1] = 0;
+            x1[1] = 0;
+            r1[1] = 0;
+            gamma_words0[1] = 0;
+            gamma_words1[1] = 0;
+            x0[2] = 0;
+            r0[2] = 0;
+            x1[2] = 0;
+            r1[2] = 0;
+            gamma_words0[2] = 0;
+            gamma_words1[2] = 0;
+            x0[3] = 0;
+            r0[3] = 0;
+            x1[3] = 0;
+            r1[3] = 0;
+            gamma_words0[3] = 0;
+            gamma_words1[3] = 0;
+            x0[4] = 0;
+            r0[4] = 0;
+            x1[4] = 0;
+            r1[4] = 0;
+            gamma_words0[4] = 0;
+            gamma_words1[4] = 0;
+            x0[5] = 0;
+            r0[5] = 0;
+            x1[5] = 0;
+            r1[5] = 0;
+            gamma_words0[5] = 0;
+            gamma_words1[5] = 0;
+            x0[6] = 0;
+            r0[6] = 0;
+            x1[6] = 0;
+            r1[6] = 0;
+            gamma_words0[6] = 0;
+            gamma_words1[6] = 0;
+            x0[7] = 0;
+            r0[7] = 0;
+            x1[7] = 0;
+            r1[7] = 0;
+            gamma_words0[7] = 0;
+            gamma_words1[7] = 0;
         }
     }
     unsigned int sentinel[8];
