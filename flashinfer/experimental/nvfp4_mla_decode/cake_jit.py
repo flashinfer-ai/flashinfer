@@ -23,11 +23,18 @@ device translation unit plus a tvm-ffi binding, compiled once per
 architecture.  The records are keyed by name and each names the stage it fills
 (``stage``, one of ``STAGES``: ``decode``, the persistent decode, one cluster
 of CTAs per work unit; ``reduce``, the split-KV combine, launched only when the
-plan has more than one split).  The decode stage has two records: ``decode``
-and ``decode_qk_ahead``, an SM100 decode (the QK MMAs issued two tiles ahead of
-PV) that the host's ``select_decode_record`` picks for long balanced plans; the
-two programs' outputs are bitwise identical.  A renamed program still changes
-no host code.  A record carries the host plan only: the
+plan has more than one split).  Each stage may have further records, which
+the host picks once per plan; the programs of one stage give bitwise
+identical outputs.  The decode stage's are ``decode_qk_ahead``, an SM100
+decode (the QK MMAs issued two tiles ahead of PV) that
+``select_decode_record`` picks for long balanced plans, and
+``decode_short``, a decode that reads its unit range in the kernel setup and
+frees its tensor memory once the last epilogue has read it, which
+``select_decode_record`` picks for plans of short units; the combine's is
+``reduce_general``, a combine that reads the first pair of splits of a row
+from its top loads, which ``select_reduce_record`` picks for plans of more
+than two splits per row.  A renamed program still changes no host code.  A
+record carries the host plan only: the
 program's ``library`` stem (its ``build.json`` entries are
 ``<library>_<arch>``), the architectures it is delivered for, the source
 ``module`` and ``build`` keywords it was rendered from, its launch record, the
@@ -60,8 +67,9 @@ The program name ``cake_nvfp4_mla_decode_<20 hex>`` is the first twenty hex
 digits of the SHA-256 of the compact JSON ``{"build": <build keywords, sorted,
 every default spelled>, "module": <dotted source module>}`` of the kernel the
 program was rendered from; a changed keyword is a new program.  The exception
-is a keyword at its implicit default (``qk_ahead`` at ``False``): the name
-omits it, so programs named before the keyword existed keep their names.
+is a keyword at its implicit default (``qk_ahead``, ``short_rows`` and
+``general_splits`` at ``False``): the name omits it, so programs named before
+the keyword existed keep their names.
 """
 
 from __future__ import annotations
@@ -340,8 +348,8 @@ def device_arch(device_index: int) -> str:
 
 def program_available(arch: str) -> bool:
     """True when the record named after every stage is delivered for ``arch``
-    (``decode_qk_ahead`` is an optional second decode the host selects only
-    where it is delivered)."""
+    (a stage's further records are optional programs the host selects only
+    where they are delivered)."""
     return all(
         stage in MODULES and arch in MODULES[stage]["arches"] for stage in STAGES
     )
