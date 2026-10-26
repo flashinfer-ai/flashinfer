@@ -343,10 +343,12 @@ def test_allreduce_nccl_local(
     )
 
 
-def _mock_nccl_group(monkeypatch, *, world_size: int = 4, rank: int = 1):
+def _mock_nccl_group(
+    monkeypatch, *, world_size: int = 4, rank: int = 1, backend: str = "nccl"
+):
     group = object()
     monkeypatch.setattr(dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(dist, "get_backend", lambda candidate: "nccl")
+    monkeypatch.setattr(dist, "get_backend", lambda candidate: backend)
     monkeypatch.setattr(dist, "get_world_size", lambda candidate: world_size)
     monkeypatch.setattr(dist, "get_rank", lambda candidate: rank)
     return group
@@ -363,6 +365,38 @@ def test_nccl_local_workspace_accepts_matching_group_metadata(monkeypatch):
         group=group,
     )
     assert workspace.group is group
+
+
+@pytest.mark.parametrize("backend", ["cpu:gloo,cuda:nccl", "cuda:nccl,cpu:gloo"])
+def test_nccl_local_workspace_accepts_device_mapped_nccl_group(
+    monkeypatch, backend: str
+):
+    group = _mock_nccl_group(monkeypatch, backend=backend)
+    workspace = NCCLLocalAllReduceFusionWorkspace(
+        world_size=4,
+        rank=1,
+        max_token_num=8,
+        hidden_dim=16,
+        dtype=torch.float16,
+        group=group,
+    )
+    assert workspace.group is group
+
+
+@pytest.mark.parametrize("backend", ["gloo", "cpu:gloo", "cpu:gloo,cuda:gloo"])
+def test_nccl_local_workspace_rejects_group_without_cuda_nccl(
+    monkeypatch, backend: str
+):
+    group = _mock_nccl_group(monkeypatch, backend=backend)
+    with pytest.raises(ValueError, match="CUDA collectives use NCCL"):
+        NCCLLocalAllReduceFusionWorkspace(
+            world_size=4,
+            rank=1,
+            max_token_num=8,
+            hidden_dim=16,
+            dtype=torch.float16,
+            group=group,
+        )
 
 
 @pytest.mark.parametrize("world_size,rank", [(3, 1), (4, 0)])

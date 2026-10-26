@@ -281,6 +281,23 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         self._destroyed = True
 
 
+def _cuda_backend_is_nccl(backend: str) -> bool:
+    """Whether a ``dist.get_backend(group)`` string routes CUDA tensors to NCCL.
+
+    Accepts a plain ``"nccl"`` group and device-mapped groups such as
+    ``"cpu:gloo,cuda:nccl"`` (what ``init_process_group`` without a backend, or
+    with that mapping, creates); nccl_local only runs collectives on CUDA tensors.
+    """
+    backend = str(backend).lower()
+    if backend == "nccl":
+        return True
+    for entry in backend.split(","):
+        device, sep, name = entry.partition(":")
+        if sep and device.strip() == "cuda" and name.strip() == "nccl":
+            return True
+    return False
+
+
 class NCCLLocalAllReduceFusionWorkspace(AllReduceFusionWorkspace):
     """NCCL collective followed by allocation-free local fusion kernels.
 
@@ -301,8 +318,11 @@ class NCCLLocalAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         super().__init__(world_size, rank)
         if not dist.is_initialized():
             raise RuntimeError("nccl_local requires an initialized process group")
-        if dist.get_backend(group) != "nccl":
-            raise ValueError("nccl_local requires a ProcessGroupNCCL group")
+        if not _cuda_backend_is_nccl(dist.get_backend(group)):
+            raise ValueError(
+                "nccl_local requires a group whose CUDA collectives use NCCL "
+                f"(got backend {dist.get_backend(group)!r})"
+            )
         group_world_size = dist.get_world_size(group)
         group_rank = dist.get_rank(group)
         if (world_size, rank) != (group_world_size, group_rank):
