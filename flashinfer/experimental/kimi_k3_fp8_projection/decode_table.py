@@ -35,7 +35,10 @@ limitations under the License.
 # time changes that keep every output bit (the L2 eviction-priority hints
 # ``_wef`` / ``_xef`` of a decode program's weight / token stream, ``_bef`` of a
 # GEMM program's weight stream, ``_xef_qel`` of the quantization launch's
-# activation reads and hand-off stores), measured faster on that
+# activation reads and hand-off stores; ``_k128`` an unfused decode program's
+# 256-K TMA stages loaded as two 128-K halves, ``_sko<N>`` a 16-token cluster
+# split-K decode program's partial-sum exchange bounded to the first N rows, in
+# cells of at most N rows), measured faster on that
 # architecture's rows of the cell; ``route_twins(arch)`` reads it.  Generated
 # from the Cake measurement sweeps recorded in the source repository; do not
 # edit by hand.
@@ -724,7 +727,17 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "qwarps": 8,
             "tstore": True,
         },
-        "18,6,2048": {"route": "gemm"},
+        "18,6,2048": {
+            "route": "decode",
+            "tok": 128,
+            "split": 1,
+            "fused": False,
+            "persist": True,
+            "qlanes": 16,
+            "stages": 3,
+            "qwarps": 8,
+            "tstore": True,
+        },
         "18,6,16384": {"route": "gemm"},
         "24,2,1": {
             "route": "decode",
@@ -1094,7 +1107,7 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
         },
         "24,2,4096": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128},
         "48,28,512": {"route": "gemm", "gemm_bn": 192, "gemm_pf": 2, "gemm_bk": 128},
-        "48,28,1024": {"route": "gemm", "gemm_bn": 384},
+        "48,28,1024": {"route": "gemm", "gemm_bn": 192, "gemm_pf": 1, "gemm_bk": 128},
         "50,28,512": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128},
         "50,28,1024": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128, "gemm_pdlb": 1},
         "50,28,4096": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128},
@@ -1253,6 +1266,12 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
 
 ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
     "sm_100a": {
+        "1,28,1": {
+            "decode:t16_p3_fused_cs14_px1_xp": "decode:t16_p3_fused_cs14_px1_xp_sko1",
+        },
+        "1,28,8": {
+            "decode:t16_p3_fused_cs14_px1_xp": "decode:t16_p3_fused_cs14_px1_xp_sko8",
+        },
         "1,28,512": {
             "quant:u2": "quant:u2_xef_qel",
         },
@@ -1265,6 +1284,12 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         "1,28,16384": {
             "decode:t64_p2_fused_w16_r3_xh_qe_q4_pf4_px1_tso_pi2": "decode:t64_p2_fused_w16_r3_xh_qe_q4_pf4_px1_tso_pi2_xef",
             "decode:t64_p2_fused_w16_r3_xh_qe_q4_pf4_px1_pi2": "decode:t64_p2_fused_w16_r3_xh_qe_q4_pf4_px1_pi2_xef",
+        },
+        "5,28,1": {
+            "decode:t16_p3_fused_cs14_xp": "decode:t16_p3_fused_cs14_xp_sko1",
+        },
+        "5,28,8": {
+            "decode:t16_p3_fused_cs14_px1": "decode:t16_p3_fused_cs14_px1_sko8",
         },
         "5,28,64": {
             "quant:u1": "quant:u1_xef_qel",
@@ -1322,9 +1347,13 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         },
         "18,6,512": {
             "quant:u1": "quant:u1_xef_qel",
+            "decode:t64_p4_tso": "decode:t64_p4_tso_k128",
         },
         "18,6,1024": {
             "quant:u2": "quant:u2_xef_qel",
+        },
+        "18,6,2048": {
+            "decode:t128_p3_tso": "decode:t128_p3_tso_k128",
         },
         "18,6,4096": {
             "quant:u4": "quant:u4_xef_qel",
@@ -1346,7 +1375,7 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         },
         "48,28,256": {
             "quant:u1": "quant:u1_xef_qel",
-            "decode:t128_p3_mc2_pf3_tso": "decode:t128_p3_mc2_pf3_tso_wef",
+            "decode:t128_p3_mc2_pf3_tso": "decode:t128_p3_mc2_pf3_tso_k128_wef",
         },
         "48,28,512": {
             "quant:u4": "quant:u4_xef_qel",
@@ -1371,7 +1400,7 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         },
         "50,28,256": {
             "quant:u1": "quant:u1_xef_qel",
-            "decode:t128_p3_mc2_pf3": "decode:t128_p3_mc2_pf3_wef",
+            "decode:t128_p3_mc2_pf3": "decode:t128_p3_mc2_pf3_k128_wef",
         },
         "50,28,512": {
             "quant:u4": "quant:u4_xef_qel",
@@ -1503,6 +1532,12 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         },
     },
     "sm_103a": {
+        "1,28,1": {
+            "decode:t16_p3_fused_cs14_px1_xp": "decode:t16_p3_fused_cs14_px1_xp_sko1",
+        },
+        "1,28,8": {
+            "decode:t16_p3_fused_cs14_px1_xp": "decode:t16_p3_fused_cs14_px1_xp_sko8",
+        },
         "1,28,512": {
             "quant:u2": "quant:u2_xef_qel",
         },
@@ -1514,6 +1549,12 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         },
         "1,28,16384": {
             "decode:t64_p2_fused_w16_r3_xh_qe_q4_pf4_px1_pi2": "decode:t64_p2_fused_w16_r3_xh_qe_q4_pf4_px1_pi2_xef",
+        },
+        "5,28,1": {
+            "decode:t16_p3_fused_cs14_xp": "decode:t16_p3_fused_cs14_xp_sko1",
+        },
+        "5,28,8": {
+            "decode:t16_p3_fused_cs14_px1": "decode:t16_p3_fused_cs14_px1_sko8",
         },
         "5,28,64": {
             "quant:u1": "quant:u1_xef_qel",

@@ -58,13 +58,16 @@ generated from the Cake sweeps and mirrors the production dispatcher row for
 row. Families outside the table take the quantization + GEMM route (the Cake
 dispatcher falls back to a calibrated cost model there; every representative
 Kimi-K3 family is covered on both architectures). `ROUTE_TWINS[arch]` names,
-per cell, the L2-hint twin a launch takes instead of the key the table selects
+per cell, the twin a launch takes instead of the key the table selects
 (`route_twins(arch)`): the same program with L2 eviction-priority hints --
 `_wef` (decode: weight and weight-scale loads evict-first), `_xef` (fused
 decode: BF16 activation loads evict-first), `_bef` (GEMM: B / SFB loads
 evict-first), `_xef_qel` (quantization: activation loads evict-first, E4M3 /
-scale stores evict-last) -- built for the architectures it was measured faster
-on; the output bits are the plain program's.
+scale stores evict-last) -- or with a schedule change -- `_k128` (unfused
+decode: each 256-K TMA stage loaded as two 128-K halves), `_sko<N>` (16-token
+cluster split-K decode: the partial-sum exchange bounded to the first N rows,
+taken only by cells of at most N rows) -- built for the architectures it was
+measured faster on; the output bits are the plain program's.
 
 | Tensor | Shape | dtype |
 | --- | --- | --- |

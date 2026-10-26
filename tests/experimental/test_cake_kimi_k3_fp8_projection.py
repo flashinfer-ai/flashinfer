@@ -1829,23 +1829,31 @@ def test_required_kernel_keys_are_registered_when_programs_exist(arch):
 
 
 _ROUTE_TWIN_HINTS = ("_wef", "_xef", "_bef", "_xef_qel")
+_ROUTE_TWIN_FORMS = ("_k128", "_k128_wef")
+_ROUTE_TWIN_SKO = re.compile(r"_sko(\d+)")
 
 
 @pytest.mark.parametrize("arch", ARCHES)
 def test_route_twins_are_registered_hint_instances(arch):
-    # ``decode_table.ROUTE_TWINS``: a cell's launch takes the L2-hint twin of the key the table selects -- the same
-    # key with one hint suffix (decode ``_wef`` / ``_xef``, GEMM ``_bef``, quantization ``_xef_qel``) -- on the
-    # architecture the twin was measured on; the twin is a required key, its program is registered for that
-    # architecture once generated, and a quantization twin compiles at its plain key's width.
+    # ``decode_table.ROUTE_TWINS``: a cell's launch takes a twin of the key the table selects -- the same key with
+    # one twin suffix: an L2 hint (decode ``_wef`` / ``_xef``, GEMM ``_bef``, quantization ``_xef_qel``), the decode
+    # half-stage form ``_k128`` (with its rows' hint, ``_k128_wef``) or the decode bounded exchange ``_sko<n>``, which
+    # carries the first ``n`` rows only and so serves a cell whose M bucket is at most ``n`` -- on the architecture
+    # the twin was measured on; the twin is a required key, its program is registered for that architecture once
+    # generated, and a quantization twin compiles at its plain key's width.
     required = set(required_kernel_keys(arch, SM_COUNT))
     twins = route_twins(arch)
     assert twins, f"{arch} routes no twin"
     for cell, pairs in twins.items():
         assert len(cell.split(",")) == 3, cell
         for key, twin in pairs.items():
-            assert (
-                twin.startswith(key + "_") and twin[len(key) :] in _ROUTE_TWIN_HINTS
+            suffix = twin[len(key) :] if twin.startswith(key + "_") else None
+            sko = _ROUTE_TWIN_SKO.fullmatch(suffix or "")
+            assert suffix in _ROUTE_TWIN_HINTS + _ROUTE_TWIN_FORMS or (
+                sko and key.startswith("decode:")
             ), (cell, key, twin)
+            if sko:
+                assert int(cell.split(",")[2]) <= int(sko.group(1)), (cell, twin)
             assert twin in required, (cell, twin)
             if MODULES:
                 assert route_available(arch, (twin,)), (arch, twin)
