@@ -181,6 +181,17 @@ class _Program:
 # inside the fused window reaches the pair program's chunk floor, so the fused
 # family ships none.
 _SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_2904ce6fee"
+# The sm_107a (Rubin) render of the segment preprocess: the same kernel symbol,
+# arguments, launch grid and bitwise outputs, with the Rubin load and store
+# schedule; the loader builds it on capability (10, 7) in place of the shared
+# module (:func:`_arch_program`).  Refreshed by the Cake export.
+_SM107_SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_2904ce6fee"
+# Its twin that triggers the dependent launch at its start
+# (``griddepcontrol.launch_dependents``), the sm_107a preprocess of the
+# ``_PDL_TRIGGER_FAMILIES`` programs.  Refreshed by the Cake export.
+_SM107_SEGMENT_PREPROCESS_TRIGGER_MODULE = (
+    "factorized_persistent_segment_preprocess_2904ce6fee"
+)
 # Retained start programs (the FlashInfer 36fd76859292 files): a literal the
 # Cake export does not fill.
 _SCAN_MODULES = {
@@ -277,8 +288,11 @@ _EXACTONE_MODULES = {
 # ``_LIGHT_STAGE_CAPABILITIES``) and the programs whose Rubin render differed
 # from the fold only by the tcgen05 SMEM descriptor address mask (15 bits on
 # sm_107a, ``0x7FFF``; 14 bits, ``0x3FFF``, on sm_100a and sm_103a), which
-# the fold source now selects by ``__CUDA_ARCH__``.  The preprocess and
-# metadata kernels are shared.  A fused varlen suffix has two sm_107a
+# the fold source now selects by ``__CUDA_ARCH__``.  The metadata kernel is
+# shared; the segment preprocess builds its own sm_107a render
+# (``_SM107_SEGMENT_PREPROCESS``, or its early-trigger twin
+# ``_SM107_SEGMENT_PREPROCESS_TRIGGER`` for the ``_PDL_TRIGGER_FAMILIES``
+# programs).  A fused varlen suffix has two sm_107a
 # sources, as SM103 has two texts: the ``exactfused_*`` varlen entry names
 # the render of the SM100 form (the caller-table and cu_seqlens forms) and
 # the ``exactone_*`` entry the one-launch render, which derives the sequence
@@ -307,6 +321,18 @@ _SM107_MODULES = {
 
 _SEGMENT_PREPROCESS = _Kernel(
     _SEGMENT_PREPROCESS_MODULE,
+    "kernel_factorized_persistent_segment_preprocess",
+    threads=256,
+    fast_math=False,
+)
+_SM107_SEGMENT_PREPROCESS = _Kernel(
+    _SM107_SEGMENT_PREPROCESS_MODULE,
+    "kernel_factorized_persistent_segment_preprocess",
+    threads=256,
+    fast_math=False,
+)
+_SM107_SEGMENT_PREPROCESS_TRIGGER = _Kernel(
+    _SM107_SEGMENT_PREPROCESS_TRIGGER_MODULE,
     "kernel_factorized_persistent_segment_preprocess",
     threads=256,
     fast_math=False,
@@ -718,14 +744,55 @@ def _main_module(name: str, arch: str) -> str:
 
 def _arch_program(name: str, arch: str) -> _Program:
     """Program ``name`` as built for ``arch``: the table binding with its main
-    kernel rebound to :func:`_main_module` (the same symbol, thread count and
-    build flags; only the module identity, hence the device source, differs)."""
+    kernel rebound to :func:`_main_module` and, on sm_107a, its segment
+    preprocess rebound to ``_SM107_SEGMENT_PREPROCESS`` -- or to its
+    early-trigger twin ``_SM107_SEGMENT_PREPROCESS_TRIGGER`` when the main
+    kernel launches with programmatic dependent launch (:func:`_main_pdl`) and
+    the family is in ``_PDL_TRIGGER_FAMILIES`` (the same symbol, thread count
+    and build flags; only the module identity, hence the device source,
+    differs)."""
 
     program = _PROGRAMS[name]
     module = _main_module(name, arch)
-    if module == program.main.module:
+    rebound: dict[str, _Kernel] = {}
+    if module != program.main.module:
+        rebound["main"] = _scan(module)
+    if arch == _SM107_ARCH and program.preprocess is _SEGMENT_PREPROCESS:
+        rebound["preprocess"] = (
+            _SM107_SEGMENT_PREPROCESS_TRIGGER
+            if _main_pdl(name, arch) and program.family in _PDL_TRIGGER_FAMILIES
+            else _SM107_SEGMENT_PREPROCESS
+        )
+    if not rebound:
         return program
-    return replace(program, main=_scan(module))
+    return replace(program, **rebound)
+
+
+# The sm_107a two-kernel programs whose main kernel waits on the preprocess
+# grid (``griddepcontrol.wait`` ahead of its first access to the preprocess
+# outputs): their main stage launches with programmatic dependent launch, so
+# the main grid's launch and CTA prologue overlap the preprocess tail.  Every
+# other program, and every program on sm_100a and sm_103a, launches its main
+# kernel stream-ordered as before.
+_PDL_FAMILIES = frozenset({"exactpre", "chunkpar", "chunkpar3"})
+# The PDL families whose preprocess triggers the dependent launch at its start
+# (``_SM107_SEGMENT_PREPROCESS_TRIGGER``), so the main grid launches while the
+# preprocess still runs: the chunk-parallel three-phase programs.  The
+# ``exactpre`` and look-back (``chunkpar``) main kernels measured no gain with
+# the early launch and keep the preprocess that triggers at CTA exit.
+_PDL_TRIGGER_FAMILIES = frozenset({"chunkpar3"})
+
+
+def _main_pdl(name: str, arch: str) -> bool:
+    """Whether program ``name`` launches its main kernel with programmatic
+    dependent launch on ``arch``: the sm_107a render (``_SM107_MODULES``) of a
+    two-kernel family."""
+
+    return (
+        arch == _SM107_ARCH
+        and _PROGRAMS[name].family in _PDL_FAMILIES
+        and name in _SM107_MODULES
+    )
 
 
 def _direct_preprocess_inputs(
@@ -973,15 +1040,22 @@ _THREE_PHASE_MIN_CHUNKS = 64
 # chunk-parallel regime (three-phase / look-back 0.90-0.97 at 8 items x
 # 64-128 chunks, 16 items x 32-128 chunks and 32 items x 32 chunks, main
 # kernel, cold L2); the look-back stays ahead only at 32 items x 16 chunks
-# (1.01-1.02) and 8 items x 256 chunks (1.01).  Its rule: three-phase for
-# batched calls with at most ``_THREE_PHASE_MAX_TILES`` tiles or at least
-# ``_RUBIN_THREE_PHASE_MIN_CHUNKS`` chunks per item, except calls of at most
+# (1.01-1.02) and 8 items x 256 chunks (1.01).  With the PDL-triggered
+# preprocess (forced routes on R200, whole call, cold
+# L2) the look-back leads between ``_RUBIN_LOOKBACK_TILES`` tiles (more than
+# 512, at most 2048: 1.04-1.14x at 8-32 items x 32-128 chunks) and the
+# three-phase program on both sides (512 tiles at 32 chunks 0.97, 4096
+# tiles 0.96).  Its rule: three-phase for batched calls with at most
+# ``_THREE_PHASE_MAX_TILES`` tiles or at least
+# ``_RUBIN_THREE_PHASE_MIN_CHUNKS`` chunks per item, except calls inside
+# the ``_RUBIN_LOOKBACK_TILES`` band and calls of at most
 # ``_RUBIN_LOOKBACK_MAX_ITEMS`` items with at least
 # ``_RUBIN_LOOKBACK_MIN_CHUNKS`` chunks; varlen calls stay on the look-back.
 _RUBIN_THREE_PHASE_CAPABILITIES = ((10, 7),)
 _RUBIN_THREE_PHASE_MIN_CHUNKS = 32
 _RUBIN_LOOKBACK_MAX_ITEMS = 8
 _RUBIN_LOOKBACK_MIN_CHUNKS = 256
+_RUBIN_LOOKBACK_TILES = (512, 2048)  # exclusive lower, inclusive upper bound
 # Chunk-parallel workspace per (chunk, head) tile: the f32 [64, 128] state
 # increments (32 KB) plus the bf16 [64, 128] state operand (16 KB).
 _CHUNK_PARALLEL_WORKSPACE_BYTES_PER_TILE = _HEADDIM * _DSTATE * (4 + 2)
@@ -1310,14 +1384,18 @@ def three_phase_preferred(
     chunks per item; the look-back family otherwise.  On the
     ``_RUBIN_THREE_PHASE_CAPABILITIES`` the three-phase family also serves
     every batched call of at least ``_RUBIN_THREE_PHASE_MIN_CHUNKS`` chunks
-    per item, except at most ``_RUBIN_LOOKBACK_MAX_ITEMS`` items with at
-    least ``_RUBIN_LOOKBACK_MIN_CHUNKS`` chunks."""
+    per item, except calls whose tiles lie in the ``_RUBIN_LOOKBACK_TILES``
+    band and at most ``_RUBIN_LOOKBACK_MAX_ITEMS`` items with at least
+    ``_RUBIN_LOOKBACK_MIN_CHUNKS`` chunks."""
 
     if mode_varlen:
         return False
     if int(tiles) <= _THREE_PHASE_MAX_TILES:
         return True
     if tuple(capability) in _RUBIN_THREE_PHASE_CAPABILITIES:
+        low, high = _RUBIN_LOOKBACK_TILES
+        if low < int(tiles) <= high:
+            return False
         if (
             int(work_items) <= _RUBIN_LOOKBACK_MAX_ITEMS
             and int(chunks) >= _RUBIN_LOOKBACK_MIN_CHUNKS
@@ -1451,6 +1529,13 @@ _FUSED_ROUTE_MAX_CHUNK_ITEMS_VARLEN = 512
 # repaid only where the item spans several chunks; one-chunk items keep the
 # retained start program ``exact_*``.
 _TWO_KERNEL_ROUTE_MIN_CHUNKS = 2
+# sm_107a (R200, 212 SMs) only: one-chunk items take ``exactpre`` too where
+# the call has more items than SMs and at most this many (sequence, head)
+# items and runs the ring schedule (the ``noring`` start schedule exists for
+# the retained program only).  Forced routes on R200:
+# 512-2048 items 1.015-1.06x faster than ``exact``; 8192-20480 items
+# 0.99-1.02x (kept).
+_TWO_KERNEL_ONE_CHUNK_MAX_ITEMS = {(10, 7): 2048}
 
 
 def fused_selected(
@@ -1505,7 +1590,16 @@ def host_chunks_per_item(*, mode_varlen: bool, num_sequences: int, seqlen: int) 
     return -(-mean_tokens // _CHUNK_SIZE)
 
 
-def two_kernel_family(*, mode_varlen: bool, num_sequences: int, seqlen: int) -> str:
+def two_kernel_family(
+    *,
+    mode_varlen: bool,
+    num_sequences: int,
+    seqlen: int,
+    nheads: Optional[int] = None,
+    sm_count: Optional[int] = None,
+    capability: Optional[tuple[int, int]] = None,
+    variant: str = "",
+) -> str:
     """Two-kernel program family of a call the chunk-parallel and fused routes
     left on the two-kernel form: ``"exactpre"`` (the round-6 render) where the
     host-known chunks per work item reach ``_TWO_KERNEL_ROUTE_MIN_CHUNKS``,
@@ -1518,12 +1612,28 @@ def two_kernel_family(*, mode_varlen: bool, num_sequences: int, seqlen: int) -> 
     per-sequence lengths live in ``cu_seqlens`` / ``seq_idx`` on the device
     and are not read), and the mean chunk count per item is what the table's
     fixed cost is amortized over.  A ``num_sequences`` of 0 counts as 1.
+    On a ``capability`` of ``_TWO_KERNEL_ONE_CHUNK_MAX_ITEMS`` one-chunk
+    items take ``exactpre`` as well when the call's ``num_sequences x
+    nheads`` items exceed ``sm_count`` and are at most that bound and its
+    scan ``variant`` is the ring schedule (``""``).
     """
 
     chunks = host_chunks_per_item(
         mode_varlen=mode_varlen, num_sequences=num_sequences, seqlen=seqlen
     )
-    return "exactpre" if chunks >= _TWO_KERNEL_ROUTE_MIN_CHUNKS else "exact"
+    if chunks >= _TWO_KERNEL_ROUTE_MIN_CHUNKS:
+        return "exactpre"
+    max_items = (
+        None
+        if capability is None or nheads is None or sm_count is None
+        else _TWO_KERNEL_ONE_CHUNK_MAX_ITEMS.get(
+            (int(capability[0]), int(capability[1]))
+        )
+    )
+    items = max(int(num_sequences), 1) * int(nheads or 0)
+    if max_items is not None and not variant and sm_count < items <= max_items:
+        return "exactpre"
+    return "exact"
 
 
 # Tail-wave pair program (``_tail``): the two-kernel exact-scan kernel launched
@@ -1766,12 +1876,18 @@ def _nvcc() -> Path:
     return Path(candidate).resolve()
 
 
-def _render_host_source(template: str, name: str, program: _Program) -> str:
+def _render_host_source(
+    template: str, name: str, program: _Program, *, main_pdl: bool = False
+) -> str:
     """Substitute one program's table values into the shared launcher.
 
     The program name becomes part of the launcher namespace so the inline
     launch helpers (and their function-local static kernel handles) of one
-    loaded program library are never unified with another's.
+    loaded program library are never unified with another's.  A template
+    with the ``CAKE_SSD_MAIN_PDL_LAUNCH`` statement ahead of its stream-ordered
+    main launch gets, with ``main_pdl`` (:func:`_main_pdl`), the same launch
+    through the extended launch API with the programmatic stream
+    serialization attribute (and returns), else a comment.
     """
 
     values = {
@@ -1785,6 +1901,27 @@ def _render_host_source(template: str, name: str, program: _Program) -> str:
         "CAKE_SSD_STATE_DTYPE_BITS": str(program.state_dtype_bits),
         "CAKE_SSD_MAIN_SMEM_BYTES": str(program.main_smem_bytes),
     }
+    if main_pdl or "CAKE_SSD_MAIN_PDL_LAUNCH" in template:
+        values["CAKE_SSD_MAIN_PDL_LAUNCH"] = (
+            "{\n"
+            "    // Programmatic dependent launch after the preprocess stage: the main\n"
+            "    // kernel's griddepcontrol.wait orders its accesses to the preprocess outputs.\n"
+            "    tvm::ffi::cuda_api::LaunchConfig config{};\n"
+            "    tvm::ffi::cuda_api::LaunchAttrType attr{};\n"
+            "    tvm::ffi::cuda_api::ConstructLaunchConfig(prepared.kernel->GetHandle(), "
+            f"stream, {program.main_smem_bytes}u, prepared.grid, prepared.block, 1, "
+            "config, attr);\n"
+            "    attr.id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;\n"
+            "    attr.value.programmaticStreamSerializationAllowed = 1;\n"
+            "    config.attrs = &attr;\n"
+            "    config.numAttrs = 1;\n"
+            "    TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(\n"
+            "        prepared.kernel->LaunchEx(prepared.kargs, config));\n"
+            "    return;\n"
+            "  }"
+            if main_pdl
+            else "// Stream-ordered main launch."
+        )
     source = template
     for placeholder in sorted(values, key=len, reverse=True):
         if placeholder not in source:
@@ -1951,11 +2088,13 @@ def _load_generated_program(name: str, arch: str):
     """Build one program for ``arch``; the loaded module serves every device."""
 
     program = _arch_program(name, arch)
+    main_pdl = _main_pdl(name, arch)
     source_dir = _source_dir()
     host_source = _render_host_source(
         (source_dir / program.host_template).read_text(encoding="utf-8"),
         name,
         program,
+        main_pdl=main_pdl,
     )
     nvcc = _nvcc()
     digest = hashlib.sha256()
@@ -1965,8 +2104,19 @@ def _load_generated_program(name: str, arch: str):
     device_sources: list[tuple[_Kernel, Path]] = []
     for kernel in program.kernels:
         source_path = source_dir / _DEVICE_DIR / kernel.source
+        source_bytes = source_path.read_bytes()
+        if (
+            main_pdl
+            and kernel is program.main
+            and b"griddepcontrol.wait" not in source_bytes
+        ):
+            raise RuntimeError(
+                f"Cake SSDCombined {name} ({arch}) launches its main kernel "
+                f"with programmatic dependent launch, but {kernel.source} "
+                "never waits on the preprocess grid"
+            )
         digest.update(kernel.module.encode())
-        digest.update(source_path.read_bytes())
+        digest.update(source_bytes)
         digest.update("\0".join(kernel.compile_flags).encode())
         device_sources.append((kernel, source_path))
 
@@ -2499,6 +2649,10 @@ class CakeSSDCombined:
                 num_sequences=num_sequences,
                 # packed varlen: x is [1, total tokens, nheads, 64]
                 seqlen=batch * seqlen if self.has_varlen else seqlen,
+                nheads=self.nheads,
+                sm_count=sm_count,
+                capability=capability,
+                variant=variant,
             )
         workspace: dict[str, Any] = {
             "program": _program_name(
@@ -3322,6 +3476,13 @@ class CakeSSDCombined:
             dt_bias_float = workspace["dt_bias_float"]
             pending_copies.append((dt_bias_float, dt_bias))
         preprocess_status = self._preprocess_status_buffer(x.device)
+        # The sm_107a preprocess loads the dt rows of an aligned segment table
+        # before it reads the table, bounded by its ``seqlen`` argument; the
+        # batched form uses ``seqlen`` for nothing else, so there it is the
+        # token count of all rows.
+        preprocess_seqlen = seqlen
+        if arch == _SM107_ARCH and not mode_varlen:
+            preprocess_seqlen = batch * seqlen
         preprocess_values, preprocess_grid = _direct_preprocess_inputs(
             dt=dt_float,
             A=A,
@@ -3334,7 +3495,7 @@ class CakeSSDCombined:
             cumsum=workspace["cumsum"],
             num_segments=num_segments,
             nheads=self.nheads,
-            seqlen=seqlen,
+            seqlen=preprocess_seqlen,
             mode_varlen=mode_varlen,
             dt_softplus=bool(dt_softplus),
             dt_limit=(dt_min, dt_max),
