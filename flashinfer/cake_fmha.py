@@ -96,6 +96,16 @@ class CakeFmhaDecodeRoute:
     # (``flashinfer.jit.cake_fmha_aligned.ALIGNED_C<cluster>_<DTYPE>``) whose
     # cluster size ``aligned_cluster_size`` selected; ``None`` on every other route.
     aligned_program: str | None = None
+    # Generated decode program: ``(family, identifier)`` of the in-tree program
+    # (``flashinfer.jit.cake_fmha_<family>.<identifier>``) the route launches,
+    # selected from host scalars by ``_DECODE_PROGRAM_ROUTES``; ``None`` keeps
+    # the route's JIT member.  A ``return_lse`` route keeps the program of the
+    # same launch without LSE but runs the JIT member (the BF16 programs write
+    # no caller LSE): see :func:`_decode_route_runs_program`.
+    program: tuple[str, str] | None = None
+    # The bmm1 (base 2) and bmm2 scales are FP32 device scalars the program
+    # reads in the kernel (no host read).
+    device_scales: bool = False
 
 
 CakeFmhaContextComponent = Literal[
@@ -593,6 +603,9 @@ def _route_components(
         and route.component in _ALIGNED_COMPONENTS
     ):
         return (route.aligned_program,) if route.aligned_program is not None else ()
+    if isinstance(route, CakeFmhaDecodeRoute) and _decode_route_runs_program(route):
+        assert route.program is not None
+        return (":".join(route.program),)
     if isinstance(route, CakeFmhaDecodeRoute):
         route_name = {
             "decode_balanced_bf16": "decode_balanced_bf16_v1",
@@ -633,6 +646,9 @@ def cake_fmha_route_is_optimized(
         and route.component in _ALIGNED_COMPONENTS
     ):
         return _aligned_route_program(route) is not None
+    if isinstance(route, CakeFmhaDecodeRoute) and _decode_route_runs_program(route):
+        # A generated decode program needs no JIT member of the route.
+        return _decode_program_record(route) is not None
     if (
         isinstance(route, CakeFmhaDecodeRoute)
         and route.component == "decode_native_bf16"
@@ -691,10 +707,21 @@ def _tma_nvfp4_scale_strides_supported(tensor: torch.Tensor) -> bool:
 _SMALLM_MIN_SUPPORTED_SM_COUNT = 148  # B200; used only for non-CUDA capability replays
 
 
+# CUDA device index -> its SM count (fixed for the process; a launch asks
+# more than once).
+_SM_COUNTS: dict[int, int] = {}
+
+
 def _smallm_sm_count(device: torch.device) -> int:
     if device.type != "cuda":
         return _SMALLM_MIN_SUPPORTED_SM_COUNT
-    return int(torch.cuda.get_device_properties(device).multi_processor_count)
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    count = _SM_COUNTS.get(index)
+    if count is None:
+        count = _SM_COUNTS[index] = int(
+            torch.cuda.get_device_properties(index).multi_processor_count
+        )
+    return count
 
 
 # On-device load-balanced split-KV decode (Cake routes ``decode_balanced_bf16_v1``
@@ -1333,10 +1360,24 @@ def _manifest_authenticated_route_accounting() -> tuple[int, int]:
     return authenticated, total
 
 
-def _cake_fmha_target(device: torch.device) -> CakeFmhaTarget:
-    """Resolve the exact Blackwell cubin target without cross-arch fallback."""
+# CUDA device index -> its Cake FMHA target (the capability and the toolkit
+# version are fixed for the process).
+_CAKE_FMHA_TARGETS: dict[int, CakeFmhaTarget] = {}
 
-    return _cake_fmha_target_of(get_compute_capability(device))
+
+def _cake_fmha_target(device: torch.device) -> CakeFmhaTarget:
+    """Resolve the exact Blackwell cubin target without cross-arch fallback,
+    once per CUDA device (a launch asks several times)."""
+
+    index = device.index if device.type == "cuda" else None
+    if index is not None:
+        target = _CAKE_FMHA_TARGETS.get(index)
+        if target is not None:
+            return target
+    target = _cake_fmha_target_of(get_compute_capability(device))
+    if index is not None:
+        _CAKE_FMHA_TARGETS[index] = target
+    return target
 
 
 @functools.lru_cache(maxsize=None)
@@ -1367,6 +1408,426 @@ def get_cake_fmha_module(device: torch.device):
     return load_cake_fmha_compat_module(target)
 
 
+# ---------------------------------------------------------------------------
+# Generated decode programs.
+#
+# The decode programs exported into the in-tree units
+# ``csrc/cake_fmha_decode_<family>/`` (loaders
+# ``flashinfer.jit.cake_fmha_decode_<family>``, one ``CakeProgram`` constant
+# per program).  A route names its program as ``(family, identifier)`` in
+# ``CakeFmhaDecodeRoute.program``; the selector looks it up from host scalars
+# only (the launch shape, the scale form, ``max_seq_len`` and the SM count),
+# never from device tensors, so a hit launches without a host synchronization
+# and can be captured in a CUDA graph.  A launch outside the tables keeps the
+# module's JIT route.
+
+# FlashInfer target -> ``(family, *route key)`` -> program identifier.  A
+# family's key is its generator's route key without the target (the export's
+# parity lane holds this table to the generator's).
+_DECODE_PROGRAM_ROUTES: dict[str, dict[tuple[Any, ...], str]] = {
+    "sm100a": {},
+    "sm103a": {},
+}
+
+# ``(family, identifier)`` -> ``(program name, launch)``: the delivered record
+# of each program; a loader whose constant has another name fails closed at
+# load.  ``launch`` names the grid (:func:`cake_fmha_decode_launch_grid`).
+_DECODE_PROGRAMS: dict[tuple[str, str], tuple[str, str]] = {}
+
+# ``(family, identifier)`` of a decode program -> ``(family, identifier)`` of
+# the split-KV reducer launched right after it.
+_DECODE_PROGRAM_REDUCERS: dict[tuple[str, str], tuple[str, str]] = {}
+
+# family -> the host parameters of its programs' bindings, in call order,
+# without the grid (every program of a family shares one kernel ABI).
+_DECODE_PROGRAM_HOST_PARAMS: dict[str, tuple[str, ...]] = {}
+
+# ``CakeFmhaTarget`` -> the exact ``CakeProgram`` target of the same device.
+_DECODE_PROGRAM_TARGET: dict[str, str] = {"sm100a": "sm_100a", "sm103a": "sm_103a"}
+
+
+def _decode_route_runs_program(route: CakeFmhaDecodeRoute) -> bool:
+    """Whether ``route`` launches its generated program: a route naming one
+    without LSE.  A ``return_lse`` route names the program of the same launch
+    without LSE and runs its JIT member, which writes the caller's LSE."""
+
+    return route.program is not None and not route.return_lse
+
+
+def _decode_program_record(route: CakeFmhaDecodeRoute) -> tuple[str, str] | None:
+    """``(program name, launch)`` the module pins for the route's program, or
+    ``None`` when the route names no program or one this module does not
+    route on its target."""
+
+    if route.program is None:
+        return None
+    family, identifier = route.program
+    routes = _DECODE_PROGRAM_ROUTES.get(route.target, {})
+    if not any(
+        key[0] == family and served == identifier for key, served in routes.items()
+    ):
+        return None
+    return _DECODE_PROGRAMS.get((family, identifier))
+
+
+def _decode_program_lookup(
+    device: torch.device, family: str, key: tuple[Any, ...]
+) -> tuple[str, str] | None:
+    """``(family, identifier)`` of the program serving ``key`` on the device's
+    target, or ``None``."""
+
+    routes = _DECODE_PROGRAM_ROUTES[_cake_fmha_target(device)]
+    identifier = routes.get((family, *key))
+    if identifier is None or (family, identifier) not in _DECODE_PROGRAMS:
+        return None
+    return family, identifier
+
+
+def _decode_program_scale_tensor(scale: Any, query: torch.Tensor) -> bool:
+    """A device scale a program reads in the kernel: one contiguous FP32
+    element on the query's device, 4-byte aligned."""
+
+    return (
+        isinstance(scale, torch.Tensor)
+        and scale.device == query.device
+        and scale.dtype == torch.float32
+        and scale.numel() == 1
+        and scale.is_contiguous()
+        and scale.data_ptr() % 4 == 0
+    )
+
+
+def _decode_program_scale_form(
+    bmm1_scale: Any, bmm2_scale: Any, query: torch.Tensor
+) -> str | None:
+    """``"device"`` when both scales are device scalars a program reads,
+    ``"host"`` when both are host numbers, ``None`` for a mixed or
+    unsupported pair (it keeps the module's JIT route)."""
+
+    device_bmm1 = _decode_program_scale_tensor(bmm1_scale, query)
+    if device_bmm1 and _decode_program_scale_tensor(bmm2_scale, query):
+        return "device"
+    if isinstance(bmm1_scale, (int, float)) and isinstance(bmm2_scale, (int, float)):
+        return "host"
+    return None
+
+
+def _decode_program_quant_plan(
+    batch_size: int, num_kv_heads: int, max_seq_len: int, sm_count: int
+) -> tuple[int, int]:
+    """``(num_splits, blocks_per_split)`` the quantized decode plans from host
+    scalars (``ResolveSplitPlanHost`` of the JIT binding)."""
+
+    blocks = (max_seq_len + 127) // 128
+    even = max(2, blocks + blocks % 2)
+    tiles = batch_size * num_kv_heads
+    if tiles >= sm_count or even < 8:
+        return 1, even
+    target = max(1, sm_count // tiles)
+    per_split = max(4, (even + target - 1) // target)
+    per_split += per_split % 2
+    while per_split < even and even % per_split == 2:
+        per_split += 2
+    return (even + per_split - 1) // per_split, per_split
+
+
+def _decode_program_plan_label(plan: tuple[int, int]) -> str:
+    """The split plan label of a route key: ``split1`` for one split,
+    ``split<N>x<blocks>`` otherwise."""
+
+    num_splits, per_split = plan
+    return "split1" if num_splits == 1 else f"split{num_splits}x{per_split}"
+
+
+def cake_fmha_decode_launch_grid(
+    launch: str,
+    program,
+    *,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    num_splits: int,
+    sm_count: int,
+) -> tuple[int, int, int]:
+    """The launch grid of one generated decode program.
+
+    ``launch`` is the program's pinned launch (``_DECODE_PROGRAMS``):
+
+    * ``persistent``: ``(min(sm_count, tiles), 1, 1)`` CTAs striding over the
+      ``batch * q_len * num_kv_heads`` tiles;
+    * ``cluster``: one cluster of ``program.cluster[0]`` CTAs per resident
+      tile, ``(cluster * min(sm_count, tiles), 1, 1)``;
+    * ``bhq``: one CTA per (query, KV head, request), ``(q_len, num_kv_heads,
+      batch)``;
+    * ``quant``: one CTA per (request, KV head, split), ``(batch *
+      num_kv_heads * num_splits, 1, 1)``;
+    * ``quant128``: the same tiles over at most 128 persistent CTAs;
+    * ``reduce``: one warp per (request, query head), ``(batch * num_q_heads,
+      1, 1)``;
+    * ``split``: one resident wave of ``batch * num_kv_heads * num_splits``
+      CTAs (the clusters, if any, along x).
+    """
+
+    batch_size, q_len = int(batch_size), int(q_len)
+    num_kv_heads, num_splits = int(num_kv_heads), int(num_splits)
+    tiles = batch_size * q_len * num_kv_heads
+    if launch == "persistent":
+        return min(int(sm_count), tiles), 1, 1
+    if launch == "cluster":
+        if int(sm_count) < tiles:
+            raise RuntimeError(
+                f"a cluster decode program gives each of its {tiles} tiles its own "
+                f"cluster; {int(sm_count)} SMs cannot"
+            )
+        return int(program.cluster[0]) * tiles, 1, 1
+    if launch == "bhq":
+        return q_len, num_kv_heads, batch_size
+    if launch == "quant":
+        return batch_size * num_kv_heads * num_splits, 1, 1
+    if launch == "quant128":
+        return min(batch_size * num_kv_heads * num_splits, 128), 1, 1
+    if launch == "reduce":
+        return batch_size * int(num_q_heads), 1, 1
+    if launch == "split":
+        return batch_size * num_kv_heads * num_splits, 1, 1
+    raise ValueError(f"unknown Cake FMHA decode program launch {launch!r}")
+
+
+@dataclass(frozen=True)
+class CakeFmhaDecodeProgramModule:
+    """The loaded generated program of one decode program route: the route,
+    the family and identifier, the pinned launch, the ``CakeProgram`` record,
+    its exact target and the binding's ``run`` entry; ``reducer`` is the
+    ``(family, identifier, launch, program, entry)`` of the split-KV reducer
+    launched right after it (``None`` when it launches none)."""
+
+    route: CakeFmhaDecodeRoute
+    family: str
+    identifier: str
+    launch: str
+    program: Any
+    target: str
+    entry: Any
+    reducer: tuple[str, str, str, Any, Any] | None = None
+
+
+def _decode_program_constant(family: str, identifier: str, target: str):
+    """The checked ``CakeProgram`` constant ``identifier`` of the family's
+    generated loader on ``target``: the name this module pins, the target
+    shipped and the binding's host parameters the ones this module passes."""
+
+    import importlib
+
+    from .jit.cake_program import GRID_ARGS, CakeProgram
+
+    loader_name = f"cake_fmha_{family}"
+    loader = importlib.import_module(f".jit.{loader_name}", __package__)
+    program = getattr(loader, identifier, None)
+    if not isinstance(program, CakeProgram):
+        raise RuntimeError(
+            f"flashinfer.jit.{loader_name} publishes no CakeProgram {identifier!r}"
+        )
+    pinned = _DECODE_PROGRAMS.get((family, identifier))
+    if pinned is None or program.name != pinned[0]:
+        raise RuntimeError(
+            f"flashinfer.jit.{loader_name}.{identifier} is {program.name}; "
+            f"this module pins {None if pinned is None else pinned[0]}"
+        )
+    if target not in program.targets:
+        raise RuntimeError(
+            f"{program.name} ships no {target!r} build; its targets are "
+            f"{list(program.targets)}"
+        )
+    expected = (*_DECODE_PROGRAM_HOST_PARAMS[family], *GRID_ARGS)
+    if tuple(program.args) != expected:
+        raise RuntimeError(
+            f"the generated {program.name} binding takes {list(program.args)}; "
+            f"the host spells {list(expected)}"
+        )
+    launch = pinned[1]
+    clustered = tuple(program.cluster) != (1, 1, 1)
+    if launch != "split" and clustered != (launch == "cluster"):
+        raise RuntimeError(
+            f"{program.name} launches cluster {tuple(program.cluster)}; its "
+            f"launch is {launch!r}"
+        )
+    return program
+
+
+# route -> its loaded program (a launch loads its route's program once).
+_DECODE_PROGRAM_MODULES: dict[CakeFmhaDecodeRoute, CakeFmhaDecodeProgramModule] = {}
+
+
+def _load_cake_fmha_decode_program(
+    route: CakeFmhaDecodeRoute,
+) -> CakeFmhaDecodeProgramModule:
+    """Build and load the generated program of ``route`` (and its reducer) on
+    the route's target, once per route.  The loaders are imported here,
+    lazily, so route selection never needs them."""
+
+    module = _DECODE_PROGRAM_MODULES.get(route)
+    if module is not None:
+        return module
+    record = _decode_program_record(route)
+    if record is None:
+        raise RuntimeError(
+            f"Cake FMHA decode route names no program: {route.program!r}"
+        )
+    family, identifier = route.program
+    target = _DECODE_PROGRAM_TARGET[route.target]
+    program = _decode_program_constant(family, identifier, target)
+    reducer = None
+    reducer_key = _DECODE_PROGRAM_REDUCERS.get((family, identifier))
+    if reducer_key is not None:
+        reducer_program = _decode_program_constant(*reducer_key, target)
+        reducer = (
+            *reducer_key,
+            _DECODE_PROGRAMS[reducer_key][1],
+            reducer_program,
+            reducer_program.entry(target),
+        )
+    module = CakeFmhaDecodeProgramModule(
+        route=route,
+        family=family,
+        identifier=identifier,
+        launch=record[1],
+        program=program,
+        target=target,
+        entry=program.entry(target),
+        reducer=reducer,
+    )
+    _DECODE_PROGRAM_MODULES[route] = module
+    return module
+
+
+def _decode_program_grid(
+    module: CakeFmhaDecodeProgramModule,
+    program,
+    launch: str,
+    *,
+    sm_count: int,
+    num_splits: int = 1,
+) -> dict[str, int]:
+    """The grid arguments of one launch of ``module``'s route."""
+
+    route = module.route
+    grid = cake_fmha_decode_launch_grid(
+        launch,
+        program,
+        batch_size=route.batch_size,
+        q_len=route.q_len,
+        num_q_heads=route.num_q_heads,
+        num_kv_heads=route.num_kv_heads,
+        num_splits=num_splits,
+        sm_count=sm_count,
+    )
+    return {"grid_x": grid[0], "grid_y": grid[1], "grid_z": grid[2]}
+
+
+def _decode_program_bytes(workspace_buffer: torch.Tensor) -> torch.Tensor:
+    """The workspace's flat byte view (the buffer itself when it is one)."""
+
+    if workspace_buffer.dtype == torch.uint8 and workspace_buffer.dim() == 1:
+        return workspace_buffer
+    return workspace_buffer.view(-1).view(torch.uint8)
+
+
+def _decode_program_workspace(
+    flat: torch.Tensor, offset: int, nbytes: int, dtype: torch.dtype
+) -> torch.Tensor:
+    """A ``dtype`` view of ``nbytes`` bytes at ``offset`` of the workspace's
+    flat byte view ``flat`` (:func:`_decode_program_bytes`, taken once per
+    launch)."""
+
+    if offset + nbytes > flat.numel():
+        raise RuntimeError(
+            f"Cake FMHA decode program workspace holds {flat.numel()} bytes; "
+            f"the launch needs {offset + nbytes}"
+        )
+    return flat[offset : offset + nbytes].view(dtype)
+
+
+# family -> the builder of its launches (see
+# :func:`cake_fmha_decode_program_launches`).
+_DECODE_PROGRAM_VALUES: dict[str, Any] = {}
+
+
+def cake_fmha_decode_program_launches(
+    module: CakeFmhaDecodeProgramModule,
+    *,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    out: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    counter_buffer: torch.Tensor | None,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    bmm1_scale: float | torch.Tensor,
+    bmm2_scale: float | torch.Tensor,
+    sinks: torch.Tensor | None,
+    lse: torch.Tensor | None,
+    key_block_scales: torch.Tensor | None,
+    value_block_scales: torch.Tensor | None,
+    sm_count: int,
+) -> list[tuple[Any, Any, dict[str, Any]]]:
+    """The launches of one program route, in stream order: ``(program, entry,
+    values)`` per launch, ``values`` naming every host parameter of the
+    binding and the grid.  Nothing here reads a device tensor: the values are
+    views of the caller's tensors and the workspace, and host scalars."""
+
+    route = module.route
+    if (
+        query.shape[0] != route.batch_size * route.q_len
+        or query.shape[1] != route.num_q_heads
+        or key_cache.shape[1] != route.num_kv_heads
+        or block_tables.shape[0] != route.batch_size
+    ):
+        raise RuntimeError(
+            "Cake FMHA decode program launch does not match its selected route"
+        )
+    builder = _DECODE_PROGRAM_VALUES[module.family]
+    return builder(
+        module,
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        out=out,
+        workspace_buffer=workspace_buffer,
+        counter_buffer=counter_buffer,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=int(max_seq_len),
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=bmm2_scale,
+        sinks=sinks,
+        lse=lse,
+        key_block_scales=key_block_scales,
+        value_block_scales=value_block_scales,
+        sm_count=int(sm_count),
+    )
+
+
+def _run_cake_fmha_decode_program(
+    module: CakeFmhaDecodeProgramModule, **kwargs: Any
+) -> None:
+    """Launch one decode program route on the current torch stream (see
+    :func:`cake_fmha_decode_program_launches`)."""
+
+    query = kwargs["query"]
+    launches = cake_fmha_decode_program_launches(module, **kwargs)
+    if _ffi_call_takes_the_torch_stream():
+        # each launch's first tensor argument is a torch tensor
+        for program, entry, values in launches:
+            entry(*[values[name] for name in program.args])
+        return
+    with _torch_stream_context(query.device):
+        for program, entry, values in launches:
+            entry(*[values[name] for name in program.args])
+
+
 def select_cake_fmha_decode_route(
     device: torch.device,
     *,
@@ -1394,8 +1855,13 @@ def select_cake_fmha_decode_route(
     enable_block_sparse_attention: bool,
     lse: torch.Tensor | None = None,
     multi_ctas_kv_counter_buffer: torch.Tensor | None = None,
+    enable_pdl: bool | None = None,
 ) -> CakeFmhaDecodeRoute | None:
-    """Select an exact product decode route without broadening its contract."""
+    """Select an exact product decode route without broadening its contract.
+
+    ``enable_pdl`` is the caller's launch mode; a generated program whose split-KV
+    reducer waits on the decode grid serves only a call that asks for it.
+    """
 
     if q_len is None or q_len <= 0 or batch_size <= 0 or max_seq_len <= 0:
         return None
@@ -2160,16 +2626,29 @@ def _resolve_cake_fmha_decode_module(
 
     An aligned hd128 q1 route resolves to a :class:`CakeFmhaAlignedDecodeModule`
     (a generated ``CakeProgram`` binding launched by
-    :func:`_run_cake_fmha_aligned_decode`), every other optimized route to a
+    :func:`_run_cake_fmha_aligned_decode`), a generated decode program route to a
+    :class:`CakeFmhaDecodeProgramModule` (launched by
+    :func:`_run_cake_fmha_decode_program`), every other optimized route to a
     module exposing ``cake_paged_attention_decode``.
     """
 
+    if route is not None:
+        # A route's program was checked when it loaded: later launches reuse it.
+        program_module = _DECODE_PROGRAM_MODULES.get(route)
+        if program_module is not None and _decode_route_runs_program(route):
+            if route.target != _cake_fmha_target(device):
+                raise RuntimeError(
+                    "Cake FMHA decode route target does not match the device"
+                )
+            return program_module, True
     if route is None or not cake_fmha_route_is_optimized(route):
         return load_cake_fmha_compat_module(_cake_fmha_target(device)), False
     if route.target != _cake_fmha_target(device):
         raise RuntimeError("Cake FMHA decode route target does not match the device")
     if route.component in _ALIGNED_COMPONENTS:
         return _load_cake_fmha_aligned_decode_module(route), True
+    if _decode_route_runs_program(route):
+        return _load_cake_fmha_decode_program(route), True
     loader = {
         "decode_balanced_bf16": load_cake_fmha_decode_balanced_bf16_module,
         "decode_balanced_fp16": load_cake_fmha_decode_balanced_fp16_module,
