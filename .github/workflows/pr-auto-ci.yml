@@ -34,7 +34,7 @@ permissions:
   contents: read
   pull-requests: write
   statuses: write   # publish ci/test-scope-N commit statuses
-  actions: read
+  actions: write    # cancel stale runs on synchronize
 
 jobs:
   auto-ci:
@@ -126,16 +126,52 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
         run: |
-          EXISTING=$(gh run list \
+          # Check if this SHA already has a passing or active run.
+          PASSED=$(gh run list \
             --repo "${{ github.repository }}" \
             --workflow "pr-test.yml" \
             --commit "$HEAD_SHA" \
-            --json databaseId,status,conclusion \
-            --jq '[.[] | select(.status == "in_progress" or .status == "queued" or .conclusion == "success")] | length' \
-            2>/dev/null) || EXISTING=0
+            --json databaseId,conclusion \
+            --jq '[.[] | select(.conclusion == "success")] | length' \
+            2>/dev/null) || PASSED=0
 
-          if [[ "${EXISTING:-0}" -gt 0 ]]; then
-            echo "CI already active or passed for $HEAD_SHA ($EXISTING run(s))"
+          if [[ "${PASSED:-0}" -gt 0 ]]; then
+            echo "CI already passed for $HEAD_SHA"
+            echo "needs_ci=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # For synchronize events (new push), cancel any stale runs from the
+          # previous HEAD. The new commit supersedes the old one, so letting
+          # those runs finish wastes GPU time and blocks runners.
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            PR_NUMBER="${{ steps.pr.outputs.number }}"
+            STALE_RUNS=$(gh run list \
+              --repo "${{ github.repository }}" \
+              --workflow "pr-test.yml" \
+              --branch "${{ github.event.pull_request.head.ref }}" \
+              --json databaseId,status,headSha \
+              --jq "[.[] | select(.headSha != \"${HEAD_SHA}\" and (.status == \"in_progress\" or .status == \"queued\"))] | .[].databaseId" \
+              2>/dev/null) || STALE_RUNS=""
+
+            for RUN_ID in $STALE_RUNS; do
+              echo "Cancelling stale run $RUN_ID (previous commit)"
+              gh run cancel "$RUN_ID" --repo "${{ github.repository }}" 2>/dev/null || true
+            done
+          fi
+
+          # Also check if a run is already active for THIS SHA — no need to
+          # re-trigger if one is already queued or in-progress.
+          ACTIVE=$(gh run list \
+            --repo "${{ github.repository }}" \
+            --workflow "pr-test.yml" \
+            --commit "$HEAD_SHA" \
+            --json databaseId,status \
+            --jq '[.[] | select(.status == "in_progress" or .status == "queued")] | length' \
+            2>/dev/null) || ACTIVE=0
+
+          if [[ "${ACTIVE:-0}" -gt 0 ]]; then
+            echo "CI already active for $HEAD_SHA ($ACTIVE run(s))"
             echo "needs_ci=false" >> "$GITHUB_OUTPUT"
           else
             echo "No CI run for $HEAD_SHA"
