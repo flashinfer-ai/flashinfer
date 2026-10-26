@@ -27,10 +27,11 @@ import warnings
 import pytest
 import torch
 
+# Version strings are unreliable (internal builds report 0.x), so detect the
+# task-scheduling API the PrimTS kernels need instead.
 pytest.importorskip(
-    "cutlass",
-    minversion="4.7.0a0",
-    reason="PrimTS attention tests require nvidia-cutlass-dsl>=4.7.0a0",
+    "cutlass.experimental.task_scheduling",
+    reason="PrimTS attention tests require nvidia-cutlass-dsl>=4.7.0",
 )
 
 from cutlass import BFloat16, Float16, Float32, Float8E4M3FN
