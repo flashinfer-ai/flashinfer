@@ -28,12 +28,12 @@ from . import cake_program
 from .core import JitSpec
 
 NORM = cake_program.CakeProgram(
-    name="cake_minimax_h3_nvfp4_pre_attention_44c090bc6141c321687f",
+    name="cake_minimax_h3_nvfp4_pre_attention_20e84bf6e3b060b63b42",
     operator_dir="cake_minimax_h3_nvfp4_pre_attention",
-    kernel="kernel_cake_minimax_h3_nvfp4_pre_attention_44c090bc6141c321687f",
+    kernel="kernel_cake_minimax_h3_nvfp4_pre_attention_20e84bf6e3b060b63b42",
     sources=(
-        "cake_minimax_h3_nvfp4_pre_attention_44c090bc6141c321687f_kernel.cu",
-        "cake_minimax_h3_nvfp4_pre_attention_44c090bc6141c321687f_binding.cu",
+        "cake_minimax_h3_nvfp4_pre_attention_20e84bf6e3b060b63b42_kernel.cu",
+        "cake_minimax_h3_nvfp4_pre_attention_20e84bf6e3b060b63b42_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(
@@ -53,6 +53,10 @@ NORM = cake_program.CakeProgram(
         "write_debug",
         "eps",
         "M",
+        "out_sf",
+        "HEADS_PER_DESTINATION",
+        "ROWS_PER_DESTINATION",
+        "SCALE_STRIDE",
         "grid_x",
         "grid_y",
         "grid_z",
@@ -67,6 +71,7 @@ NORM = cake_program.CakeProgram(
         "activation_q",
         "activation_sf",
         "debug_adaln_bf16",
+        "out_sf",
     ),
     block=(128, 1, 1),
     cluster=(1, 1, 1),
