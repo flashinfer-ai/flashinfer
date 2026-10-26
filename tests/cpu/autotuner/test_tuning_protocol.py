@@ -6,7 +6,7 @@ import pytest
 from flashinfer import autotune
 from flashinfer.autotuner import AutoTuner, TuningResult
 
-from .utils import reset_autotuner
+from tests.autotuner.utils import reset_autotuner
 
 
 @pytest.fixture
@@ -35,6 +35,7 @@ class RecordingProtocol:
         return TuningResult("deferred")
 
 
+@pytest.mark.cpu_only
 def test_protocol_uses_shared_controls_and_statistics():
     tuner = reset_autotuner()
     protocol = RecordingProtocol()
@@ -51,6 +52,7 @@ def test_protocol_uses_shared_controls_and_statistics():
     assert not tuner.is_tuning_mode
 
 
+@pytest.mark.cpu_only
 def test_explicit_search_overrides_cache_and_disabled_mode():
     tuner = reset_autotuner()
     protocol = RecordingProtocol()
@@ -63,6 +65,7 @@ def test_explicit_search_overrides_cache_and_disabled_mode():
     assert not tuner.is_tuning_mode
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "mode,skipped,persist",
     [
@@ -108,6 +111,7 @@ def test_forced_search_preserves_ambient_persistence(
     )
 
 
+@pytest.mark.cpu_only
 def test_protocol_scope_restores_after_nested_context_exception():
     tuner = reset_autotuner()
     protocol = RecordingProtocol()
@@ -124,6 +128,7 @@ def test_protocol_scope_restores_after_nested_context_exception():
     assert protocol.contexts[-1].scope is None
 
 
+@pytest.mark.cpu_only
 def test_skip_ops_delegates_but_quarantines_existing_results():
     from flashinfer import autotune_v2
 
@@ -146,6 +151,7 @@ def test_skip_ops_delegates_but_quarantines_existing_results():
     assert len(protocol.contexts) == 3
 
 
+@pytest.mark.cpu_only
 def test_protocol_memory_is_separate_from_v1_json(tmp_path):
     tuner = reset_autotuner()
     path = str(tmp_path / "cache.json")
@@ -162,6 +168,7 @@ def test_protocol_memory_is_separate_from_v1_json(tmp_path):
     tuner.clear_cache()
 
 
+@pytest.mark.cpu_only
 def test_protocol_managed_persistence_replay_and_root_isolation(managed, tmp_path):
     from flashinfer import autotune_v2
 
@@ -198,6 +205,7 @@ def test_protocol_managed_persistence_replay_and_root_isolation(managed, tmp_pat
         )
 
 
+@pytest.mark.cpu_only
 def test_protocol_memory_only_and_reload(managed, tmp_path):
     from flashinfer import autotune_v2
     from flashinfer.autotune_cache import autotune_v2_reload
@@ -237,6 +245,7 @@ def test_protocol_memory_only_and_reload(managed, tmp_path):
     )
 
 
+@pytest.mark.cpu_only
 def test_protocol_policy_partition_and_inherited_controls(managed):
     from flashinfer import autotune_v2
     from flashinfer.autotune_cache import MeasurementPolicy
@@ -268,6 +277,7 @@ def test_protocol_policy_partition_and_inherited_controls(managed):
         ] == [128, 256]
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("graph_timing", [None, "amortized", "individual"])
 def test_protocol_policy_is_preserved_after_persistent_context(managed, graph_timing):
     from flashinfer import autotune_v2
@@ -285,13 +295,14 @@ def test_protocol_policy_is_preserved_after_persistent_context(managed, graph_ti
         assert managed.protocol_context("test.protocol").measurement_policy is None
 
 
+@pytest.mark.cpu_only
 def test_protocol_and_runner_entries_share_store(managed, tmp_path, monkeypatch):
     import torch
 
     from flashinfer import autotune_v2
     from flashinfer.autotuner import TuningConfig
 
-    from .utils import DummyRunner
+    from tests.autotuner.utils import DummyRunner
 
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     tactic = (2, (4, 8))
@@ -331,6 +342,7 @@ def test_protocol_and_runner_entries_share_store(managed, tmp_path, monkeypatch)
         assert not managed.protocol_context("test.absent").records()
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("mode", ["replay", "write_failure"])
 def test_protocol_keeps_unpersisted_result_in_memory(
     managed, tmp_path, monkeypatch, mode
@@ -353,6 +365,7 @@ def test_protocol_keeps_unpersisted_result_in_memory(
     assert managed.protocol_context("test.protocol").lookup("shape") is None
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "fields,runner",
     [
@@ -376,6 +389,7 @@ def test_malformed_protocol_entry_does_not_hide_valid_entries(managed, fields, r
     assert context.lookup("bad") is None
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("local_failure", [False, True])
 def test_collective_cupti_initialization_precedes_launch(monkeypatch, local_failure):
     import importlib

@@ -88,24 +88,29 @@ def _populate_cache(tuner, runner, custom_op, profile, tactic, extras=()):
 
 
 class TestTacticConversion:
+    @pytest.mark.cpu_only
     def test_int_tactic_roundtrip(self):
         assert _tactic_to_json(5) == 5
         assert _json_to_tactic(5) == 5
 
+    @pytest.mark.cpu_only
     def test_tuple_tactic_to_json(self):
         tactic = (128, (64, 64), (2, 1), True)
         result = _tactic_to_json(tactic)
         assert result == [128, [64, 64], [2, 1], True]
 
+    @pytest.mark.cpu_only
     def test_json_to_tuple_tactic(self):
         json_val = [128, [64, 64], [2, 1], True]
         result = _json_to_tactic(json_val)
         assert result == (128, (64, 64), (2, 1), True)
 
+    @pytest.mark.cpu_only
     def test_nested_roundtrip(self):
         tactic = (256, (128, 128), (1, 2), False)
         assert _json_to_tactic(_tactic_to_json(tactic)) == tactic
 
+    @pytest.mark.cpu_only
     def test_simple_int_list_roundtrip(self):
         """A tactic that is a tuple of ints."""
         tactic = (1, 2, 3)
@@ -128,6 +133,7 @@ class TestSaveLoadRoundTrip:
     def teardown_method(self):
         AutoTuner._instance = None
 
+    @pytest.mark.cpu_only
     def test_save_and_load_basic(self):
         runner = FakeRunnerA(value=42)
         profile = (
@@ -172,6 +178,7 @@ class TestSaveLoadRoundTrip:
         finally:
             os.unlink(tmp_path)
 
+    @pytest.mark.cpu_only
     def test_cold_policy_roundtrip_and_legacy_replacement(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
             autotuner_module, "_collect_metadata", lambda: dict(_FAKE_META)
@@ -226,6 +233,7 @@ class TestSaveLoadRoundTrip:
             1,
         )
 
+    @pytest.mark.cpu_only
     def test_save_and_load_tuple_tactic(self):
         """Round-trip with a compound tuple tactic (CuteDSL-style)."""
         runner = FakeRunnerA(value=1)
@@ -252,6 +260,7 @@ class TestSaveLoadRoundTrip:
         finally:
             os.unlink(tmp_path)
 
+    @pytest.mark.cpu_only
     def test_save_multiple_entries(self):
         runner_a = FakeRunnerA(value=1)
         runner_b = FakeRunnerB(value=2)
@@ -274,6 +283,7 @@ class TestSaveLoadRoundTrip:
         finally:
             os.unlink(tmp_path)
 
+    @pytest.mark.cpu_only
     def test_save_empty_cache(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             tmp_path = f.name
@@ -301,10 +311,12 @@ class TestLoadConfigsErrors:
     def teardown_method(self):
         AutoTuner._instance = None
 
+    @pytest.mark.cpu_only
     def test_load_nonexistent_file_raises(self):
         with pytest.raises(FileNotFoundError):
             self.tuner.load_configs("/nonexistent/path/config.json")
 
+    @pytest.mark.cpu_only
     def test_load_invalid_json_raises(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             f.write("not valid json {{{")
@@ -330,6 +342,7 @@ class TestSearchCacheFallbackChain:
     def teardown_method(self):
         AutoTuner._instance = None
 
+    @pytest.mark.cpu_only
     def test_in_memory_cache_has_priority(self):
         """In-memory cache should be checked before file configs."""
         runner = FakeRunnerA(value=1)
@@ -348,6 +361,7 @@ class TestSearchCacheFallbackChain:
         assert is_hit
         assert tactic == 99  # in-memory, not file's 55
 
+    @pytest.mark.cpu_only
     def test_file_configs_used_on_memory_miss(self):
         """File configs should be used when in-memory cache misses."""
         runner = FakeRunnerA(value=1)
@@ -364,6 +378,7 @@ class TestSearchCacheFallbackChain:
         assert tactic == 42
         assert runner_id == 0
 
+    @pytest.mark.cpu_only
     def test_runner_name_resolution(self):
         """File config runner name should resolve to correct index in runners list."""
         runner_a = FakeRunnerA(value=1)
@@ -383,6 +398,7 @@ class TestSearchCacheFallbackChain:
         assert runner_id == 1  # FakeRunnerB is at index 1
         assert tactic == 11
 
+    @pytest.mark.cpu_only
     def test_fallback_when_nothing_cached(self):
         """Should return fallback when no source has a match."""
         runner = FakeRunnerA(value=1)
@@ -393,6 +409,7 @@ class TestSearchCacheFallbackChain:
         assert runner_id == 0
         assert tactic == -1
 
+    @pytest.mark.cpu_only
     def test_clear_cache_resets_all(self):
         """clear_cache should reset in-memory cache and file configs."""
         runner = FakeRunnerA(value=1)
@@ -418,6 +435,7 @@ class TestEndToEnd:
     def teardown_method(self):
         AutoTuner._instance = None
 
+    @pytest.mark.cpu_only
     def test_save_then_load_then_search(self):
         """Full workflow: tune -> save -> clear -> load -> search hits."""
         runner = FakeRunnerA(value=10)
@@ -449,6 +467,7 @@ class TestEndToEnd:
         finally:
             os.unlink(tmp_path)
 
+    @pytest.mark.cpu_only
     def test_save_merges_loaded_and_profiled_configs(self):
         """save_configs should include both loaded file configs and in-memory profiled configs."""
         runner_b = FakeRunnerB(value=2)
@@ -481,6 +500,7 @@ class TestEndToEnd:
         finally:
             os.unlink(tmp_path)
 
+    @pytest.mark.cpu_only
     def test_save_profiled_overrides_loaded_for_same_key(self):
         """In-memory profiled results should override loaded file configs for the same key."""
         runner = FakeRunnerA(value=1)
@@ -532,6 +552,7 @@ class TestFileCacheKeyCollision:
     def teardown_method(self):
         AutoTuner._instance = None
 
+    @pytest.mark.cpu_only
     def test_different_extras_produce_different_file_keys(self):
         """Two entries with same op/runner/profile but different extras must not collide."""
         runner = FakeRunnerA(value=1)
@@ -560,6 +581,7 @@ class TestFileCacheKeyCollision:
         finally:
             os.unlink(tmp_path)
 
+    @pytest.mark.cpu_only
     def test_save_load_roundtrip_with_extras(self):
         """Save two entries with different extras, load them back, verify both are found."""
         runner = FakeRunnerA(value=1)
@@ -597,6 +619,7 @@ class TestAutotuneCache:
     def teardown_method(self):
         AutoTuner._instance = None
 
+    @pytest.mark.cpu_only
     def test_autotune_cache_loads_on_entry(self):
         """autotune(cache=path) should load configs from the file on entry."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
@@ -612,6 +635,7 @@ class TestAutotuneCache:
         finally:
             os.unlink(tmp_path)
 
+    @pytest.mark.cpu_only
     def test_autotune_cache_saves_on_exit_when_tuning(self):
         """autotune(True, cache=path) should save configs on exit."""
         tmp_dir = tempfile.mkdtemp()
@@ -637,6 +661,7 @@ class TestAutotuneCache:
                 os.unlink(tmp_path)
             os.rmdir(tmp_dir)
 
+    @pytest.mark.cpu_only
     def test_autotune_cache_no_save_when_not_tuning(self):
         """autotune(False, cache=path) should NOT save on exit."""
         # Write a valid JSON file with a known marker config
@@ -664,6 +689,7 @@ class TestAutotuneCache:
                 os.unlink(tmp_path)
             os.rmdir(tmp_dir)
 
+    @pytest.mark.cpu_only
     def test_autotune_cache_nonexistent_file_creates_on_exit(self):
         """First run: cache file doesn't exist yet, should be created on exit."""
         tmp_dir = tempfile.mkdtemp()
@@ -689,6 +715,7 @@ class TestAutotuneCache:
                 os.unlink(cache_path)
             os.rmdir(tmp_dir)
 
+    @pytest.mark.cpu_only
     def test_autotune_cache_no_cache_param(self):
         """autotune() without cache= should behave as before (no file I/O)."""
         tuner = AutoTuner.get()
@@ -700,6 +727,7 @@ class TestAutotuneCache:
         # No file configs loaded, no errors
         assert len(tuner._file_configs) == 0
 
+    @pytest.mark.cpu_only
     def test_full_workflow_tune_then_inference(self):
         """End-to-end: autotune(True, cache=) then autotune(False, cache=)."""
         tmp_dir = tempfile.mkdtemp()
@@ -730,6 +758,7 @@ class TestAutotuneCache:
                 os.unlink(tmp_path)
             os.rmdir(tmp_dir)
 
+    @pytest.mark.cpu_only
     def test_incremental_cache_across_blocks(self):
         """Multiple autotune(True, cache=) blocks should accumulate configs."""
         tmp_dir = tempfile.mkdtemp()
@@ -763,6 +792,7 @@ class TestAutotuneCache:
                 os.unlink(tmp_path)
             os.rmdir(tmp_dir)
 
+    @pytest.mark.cpu_only
     def test_cache_hit_skips_profiling_during_tune(self):
         """Loaded configs should be used even during autotune(True), skipping profiling."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
@@ -808,6 +838,7 @@ class TestAtomicWrite:
     def teardown_method(self):
         AutoTuner._instance = None
 
+    @pytest.mark.cpu_only
     def test_save_does_not_leave_partial_file_on_success(self):
         """After a successful save, only the target file should exist (no temp files)."""
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -828,6 +859,7 @@ class TestAtomicWrite:
             files = os.listdir(tmp_dir)
             assert files == ["configs.json"], f"Unexpected files: {files}"
 
+    @pytest.mark.cpu_only
     def test_save_creates_parent_directories(self):
         """save_configs should create intermediate directories."""
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -839,6 +871,7 @@ class TestAtomicWrite:
             tuner.save_configs(target)
             assert os.path.isfile(target)
 
+    @pytest.mark.cpu_only
     def test_save_is_atomic_for_concurrent_readers(self):
         """A reader should never see a partially-written file.
 
@@ -863,6 +896,7 @@ class TestAtomicWrite:
                 data = json.load(f)
             assert len(_config_entries(data)) == 2
 
+    @pytest.mark.cpu_only
     def test_save_merges_with_existing_file(self):
         """save_configs re-reads the disk file and merges entries."""
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -900,6 +934,7 @@ class TestThreadSafety:
     def teardown_method(self):
         AutoTuner._instance = None
 
+    @pytest.mark.cpu_only
     def test_singleton_is_thread_safe(self):
         """Multiple threads calling AutoTuner.get() should get the same instance."""
         import threading
@@ -920,6 +955,7 @@ class TestThreadSafety:
         # All threads should get the same singleton instance
         assert len(set(results)) == 1
 
+    @pytest.mark.cpu_only
     def test_concurrent_search_cache(self):
         """Multiple threads reading from search_cache should not crash."""
         import threading
@@ -952,6 +988,7 @@ class TestThreadSafety:
 
         assert len(errors) == 0, f"Errors in threads: {errors}"
 
+    @pytest.mark.cpu_only
     def test_concurrent_load_and_search(self):
         """One thread loading configs while others search should not crash."""
         import threading
@@ -998,6 +1035,7 @@ class TestThreadSafety:
         finally:
             os.unlink(tmp_path)
 
+    @pytest.mark.cpu_only
     def test_autotune_mode_flag_thread_safety(self):
         """Concurrent autotune() contexts should not corrupt is_tuning_mode.
 
@@ -1071,54 +1109,64 @@ class _RecordingHandler(logging.Handler):
 
 
 class TestClassifyMetadataMismatches:
+    @pytest.mark.cpu_only
     def test_exact_match(self):
         hard, soft = autotuner_module._classify_metadata_mismatches(
             dict(_FAKE_META), dict(_FAKE_META)
         )
         assert hard == {} and soft == {}
 
+    @pytest.mark.cpu_only
     def test_wildcard_matches_anything(self):
         saved = dict(_FAKE_META, cudnn_version="*")
         hard, soft = autotuner_module._classify_metadata_mismatches(saved, _FAKE_META)
         assert hard == {} and soft == {}
 
+    @pytest.mark.cpu_only
     def test_definite_conflict_is_hard(self):
         saved = dict(_FAKE_META, cudnn_version="91900")
         hard, soft = autotuner_module._classify_metadata_mismatches(saved, _FAKE_META)
         assert set(hard) == {"cudnn_version"} and soft == {}
 
+    @pytest.mark.cpu_only
     def test_unknown_is_soft(self):
         saved = dict(_FAKE_META, cudnn_version="unknown")
         hard, soft = autotuner_module._classify_metadata_mismatches(saved, _FAKE_META)
         assert hard == {} and set(soft) == {"cudnn_version"}
 
+    @pytest.mark.cpu_only
     def test_stringified_none_is_soft(self):
         saved = dict(_FAKE_META, cudnn_version="None")
         hard, soft = autotuner_module._classify_metadata_mismatches(saved, _FAKE_META)
         assert hard == {} and set(soft) == {"cudnn_version"}
 
+    @pytest.mark.cpu_only
     def test_missing_key_is_soft(self):
         saved = dict(_FAKE_META)
         del saved["cudnn_frontend_version"]
         hard, soft = autotuner_module._classify_metadata_mismatches(saved, _FAKE_META)
         assert hard == {} and set(soft) == {"cudnn_frontend_version"}
 
+    @pytest.mark.cpu_only
     def test_unknown_matches_unknown(self):
         saved = dict(_FAKE_META, cudnn_version="unknown")
         current = dict(_FAKE_META, cudnn_version="unknown")
         hard, soft = autotuner_module._classify_metadata_mismatches(saved, current)
         assert hard == {} and soft == {}
 
+    @pytest.mark.cpu_only
     def test_extra_saved_key_ignored(self):
         saved = dict(_FAKE_META, future_field="whatever")
         hard, soft = autotuner_module._classify_metadata_mismatches(saved, _FAKE_META)
         assert hard == {} and soft == {}
 
+    @pytest.mark.cpu_only
     def test_hard_and_soft_split(self):
         saved = dict(_FAKE_META, cudnn_version="unknown", gpu="NVIDIA H100")
         hard, soft = autotuner_module._classify_metadata_mismatches(saved, _FAKE_META)
         assert set(hard) == {"gpu"} and set(soft) == {"cudnn_version"}
 
+    @pytest.mark.cpu_only
     def test_non_dict_metadata_is_all_soft(self):
         hard, soft = autotuner_module._classify_metadata_mismatches(
             "garbage", _FAKE_META
@@ -1143,6 +1191,7 @@ class TestMetadataCompatibility:
     def _populate_new_entry(self):
         _populate_cache(self.tuner, FakeRunnerA(), "new_op", ((4, 8),), tactic=5)
 
+    @pytest.mark.cpu_only
     def test_corrupt_metadata_rejected_on_load_then_healed_on_save(self):
         """A file whose _metadata is not a dict (corruption) must be rejected
         gracefully on load — not crash — and replaced on save."""
@@ -1160,6 +1209,7 @@ class TestMetadataCompatibility:
             assert data[_METADATA_KEY] == _FAKE_META
             assert _OLD_KEY not in data
 
+    @pytest.mark.cpu_only
     def test_soft_mismatch_rejected_on_load_then_healed_on_save(self):
         """A cache poisoned with cudnn_version="unknown" is ignored, but the
         next save replaces it with fresh configs + real metadata."""
@@ -1183,6 +1233,7 @@ class TestMetadataCompatibility:
             assert tuner2.load_configs(path) is True
             assert len(tuner2._file_configs) == 1
 
+    @pytest.mark.cpu_only
     def test_hard_mismatch_rejected_on_load_and_never_overwritten(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = os.path.join(tmp_dir, "configs.json")
@@ -1200,6 +1251,7 @@ class TestMetadataCompatibility:
             assert _OLD_KEY in data
             assert len(_config_entries(data)) == 1
 
+    @pytest.mark.cpu_only
     def test_missing_metadata_key_is_healed_on_save(self):
         """Files from flashinfer versions predating a metadata field are
         rejected on load but replaced (not stranded) on save."""
@@ -1218,6 +1270,7 @@ class TestMetadataCompatibility:
             assert data[_METADATA_KEY] == _FAKE_META
             assert _OLD_KEY not in data
 
+    @pytest.mark.cpu_only
     def test_matching_metadata_merges_and_preserves_record(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = os.path.join(tmp_dir, "configs.json")
@@ -1234,6 +1287,7 @@ class TestMetadataCompatibility:
             assert _OLD_KEY in data
             assert len(_config_entries(data)) == 2
 
+    @pytest.mark.cpu_only
     def test_wildcard_metadata_loads(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = os.path.join(tmp_dir, "configs.json")
@@ -1241,6 +1295,7 @@ class TestMetadataCompatibility:
             assert self.tuner.load_configs(path) is True
             assert len(self.tuner._file_configs) == 1
 
+    @pytest.mark.cpu_only
     def test_autotune_context_heals_poisoned_cache(self):
         """End-to-end regression for the poisoned-cache deadlock: previously
         the exit save was suppressed on any metadata mismatch, so a file
@@ -1263,6 +1318,7 @@ class TestMetadataCompatibility:
             with autotune(False, cache=path):
                 assert len(tuner2._file_configs) == 1
 
+    @pytest.mark.cpu_only
     def test_mismatch_warning_logged_once_per_process(self):
         handler = _RecordingHandler()
         tuner_logger = autotuner_module.logger
@@ -1288,23 +1344,27 @@ class TestMetadataCompatibility:
 
 
 class TestCudnnVersionDetection:
+    @pytest.mark.cpu_only
     def test_falls_back_to_cudnn_frontend(self, monkeypatch):
         monkeypatch.setattr(torch.backends.cudnn, "version", lambda: None)
         fake = types.SimpleNamespace(backend_version=lambda: 92101)
         monkeypatch.setitem(sys.modules, "cudnn", fake)
         assert autotuner_module._get_cudnn_backend_version() == "92101"
 
+    @pytest.mark.cpu_only
     def test_prefers_torch_report(self, monkeypatch):
         monkeypatch.setattr(torch.backends.cudnn, "version", lambda: 91900)
         fake = types.SimpleNamespace(backend_version=lambda: 92101)
         monkeypatch.setitem(sys.modules, "cudnn", fake)
         assert autotuner_module._get_cudnn_backend_version() == "91900"
 
+    @pytest.mark.cpu_only
     def test_unknown_when_undeterminable(self, monkeypatch):
         monkeypatch.setattr(torch.backends.cudnn, "version", lambda: None)
         monkeypatch.setitem(sys.modules, "cudnn", None)
         assert autotuner_module._get_cudnn_backend_version() == "unknown"
 
+    @pytest.mark.cpu_only
     def test_never_records_stringified_none(self, monkeypatch):
         monkeypatch.setattr(torch.backends.cudnn, "version", lambda: None)
         monkeypatch.setitem(sys.modules, "cudnn", None)
