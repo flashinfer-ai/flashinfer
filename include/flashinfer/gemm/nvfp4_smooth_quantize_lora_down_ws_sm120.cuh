@@ -48,17 +48,23 @@ namespace quant = smooth_quantize_detail;
 
 constexpr int kRank = 128;
 
-/// Convert a pointer in CTA shared memory to the 32-bit address used by PTX.
+/**
+ * @brief Convert a pointer in CTA shared memory to the 32-bit address used by PTX.
+ */
 __device__ __forceinline__ std::uint32_t smem_u32(void const* ptr) {
   return static_cast<std::uint32_t>(__cvta_generic_to_shared(ptr));
 }
 
-/// Initialize a shared barrier's arrival count before any producer or consumer uses it.
+/**
+ * @brief Initialize a shared barrier's arrival count before any producer or consumer uses it.
+ */
 __device__ __forceinline__ void mbar_init(std::uint64_t* bar, int count) {
   asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(smem_u32(bar)), "r"(count));
 }
 
-/// Acquire completion of the shared barrier phase identified by parity.
+/**
+ * @brief Acquire completion of the shared barrier phase identified by parity.
+ */
 __device__ __forceinline__ void mbar_wait(std::uint64_t* bar, std::uint32_t parity) {
   std::uint32_t const address = smem_u32(bar);
   std::uint32_t done = 0;
@@ -75,7 +81,9 @@ __device__ __forceinline__ void mbar_wait(std::uint64_t* bar, std::uint32_t pari
   } while (!done);
 }
 
-/// Release one arrival to let the producer reuse a stage after consumers finish.
+/**
+ * @brief Release one arrival to let the producer reuse a stage after consumers finish.
+ */
 __device__ __forceinline__ void mbar_arrive(std::uint64_t* bar) {
   asm volatile(
       "{\n"
@@ -87,7 +95,9 @@ __device__ __forceinline__ void mbar_arrive(std::uint64_t* bar) {
       : "memory");
 }
 
-/// Arrive as the producer and register the byte count its asynchronous copies complete.
+/**
+ * @brief Arrive as the producer and register the byte count its asynchronous copies complete.
+ */
 __device__ __forceinline__ void mbar_arrive_expect_tx(std::uint64_t* bar, std::uint32_t bytes) {
   asm volatile(
       "{\n"
@@ -99,23 +109,29 @@ __device__ __forceinline__ void mbar_arrive_expect_tx(std::uint64_t* bar, std::u
       : "memory");
 }
 
-/// Prefer evicting streaming X loads before the repeatedly read L2T and scale data.
+/**
+ * @brief Prefer evicting streaming X loads before the repeatedly read L2T and scale data.
+ */
 __device__ __forceinline__ std::uint64_t make_l2_policy_evict_first() {
   std::uint64_t policy;
   asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(policy));
   return policy;
 }
 
-/// L2T and the smoothing scale are re-read by every CTA, but evict_normal already keeps
-/// them resident against the evict_first X stream. evict_last would outlive the kernel:
-/// those lines survive later cold-L2 flushes and pin each layer's L2T in L2.
+/**
+ * @brief L2T and the smoothing scale are re-read by every CTA, but evict_normal already keeps
+ * them resident against the evict_first X stream. evict_last would outlive the kernel:
+ * those lines survive later cold-L2 flushes and pin each layer's L2T in L2.
+ */
 __device__ __forceinline__ std::uint64_t make_l2_policy_evict_normal() {
   std::uint64_t policy;
   asm volatile("createpolicy.fractional.L2::evict_normal.b64 %0, 1.0;\n" : "=l"(policy));
   return policy;
 }
 
-/// One contiguous global -> shared bulk copy, completing `bytes` on `bar`.
+/**
+ * @brief One contiguous global -> shared bulk copy, completing `bytes` on `bar`.
+ */
 __device__ __forceinline__ void bulk_copy_g2s(void* dst, void const* src, std::uint32_t bytes,
                                               std::uint64_t* bar, std::uint64_t policy) {
   asm volatile(
@@ -126,7 +142,9 @@ __device__ __forceinline__ void bulk_copy_g2s(void* dst, void const* src, std::u
       : "memory");
 }
 
-/// One 2-D TMA box (inner coordinate c0 in elements, outer c1 in rows).
+/**
+ * @brief One 2-D TMA box (inner coordinate c0 in elements, outer c1 in rows).
+ */
 __device__ __forceinline__ void tma_load_2d(void* dst, CUtensorMap const* map, int c0, int c1,
                                             std::uint64_t* bar, std::uint64_t policy) {
   asm volatile(
@@ -138,14 +156,18 @@ __device__ __forceinline__ void tma_load_2d(void* dst, CUtensorMap const* map, i
       : "memory");
 }
 
-/// 128-byte swizzle (CU_TENSOR_MAP_SWIZZLE_128B) of a tile whose rows are
-/// exactly 128 bytes and whose base is 1024-byte aligned: 16-byte chunk c of
-/// row r lives at chunk c ^ (r & 7).
+/**
+ * @brief 128-byte swizzle (CU_TENSOR_MAP_SWIZZLE_128B) of a tile whose rows are
+ * exactly 128 bytes and whose base is 1024-byte aligned: 16-byte chunk c of
+ * row r lives at chunk c ^ (r & 7).
+ */
 __device__ __forceinline__ int swz128(int row, int chunk) {
   return row * 128 + ((chunk ^ (row & 7)) << 4);
 }
 
-/// Collectively load four BF16 8x8 matrices from shared memory into warp MMA fragments.
+/**
+ * @brief Collectively load four BF16 8x8 matrices from shared memory into warp MMA fragments.
+ */
 __device__ __forceinline__ void ldmatrix_x4(std::uint32_t& r0, std::uint32_t& r1, std::uint32_t& r2,
                                             std::uint32_t& r3, void const* ptr) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
@@ -153,7 +175,9 @@ __device__ __forceinline__ void ldmatrix_x4(std::uint32_t& r0, std::uint32_t& r1
                : "r"(smem_u32(ptr)));
 }
 
-/// Accumulate one BF16 m16n8k16 warp MMA into the four FP32 registers in d.
+/**
+ * @brief Accumulate one BF16 m16n8k16 warp MMA into the four FP32 registers in d.
+ */
 __device__ __forceinline__ void mma_bf16_16816(float* d, std::uint32_t a0, std::uint32_t a1,
                                                std::uint32_t a2, std::uint32_t a3, std::uint32_t b0,
                                                std::uint32_t b1) {
@@ -208,9 +232,11 @@ struct WsConfig {
   static_assert(kXBytes % 1024 == 0 && kBBytes % 1024 == 0);
 };
 
-/// Run a persistent TMA stage ring with separate quantize and LoRA-down consumers.
-/// The tensor maps describe BF16 X and rank-128 K-major L2T; consumers release
-/// each stage only after both computations finish reading it.
+/**
+ * @brief Run a persistent TMA stage ring with separate quantize and LoRA-down consumers.
+ * The tensor maps describe BF16 X and rank-128 K-major L2T; consumers release
+ * each stage only after both computations finish reading it.
+ */
 template <class Cfg>
 __global__ void __launch_bounds__(Cfg::kThreads, 1)
     nvfp4_smooth_quantize_lora_down_ws_sm120_kernel(__grid_constant__ CUtensorMap const x_map,
@@ -458,26 +484,31 @@ __global__ void __launch_bounds__(Cfg::kThreads, 1)
 #endif
 }
 
-/// Cache the tensor-map encoder entry point, or nullptr when the driver lacks it.
+/**
+ * @brief Cache the tensor-map encoder entry point, or nullptr when the driver lacks it.
+ */
 inline PFN_cuTensorMapEncodeTiled_v12000 ws_encode_fn() {
   static PFN_cuTensorMapEncodeTiled_v12000 fn = [] {
     void* ptr = nullptr;
-    cudaDriverEntryPointQueryResult status;
+    cudaDriverEntryPointQueryResult status = cudaDriverEntryPointSymbolNotFound;
 #if CUDA_VERSION >= 12050
-    cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &ptr, 12000, cudaEnableDefault,
-                                     &status);
+    cudaError_t const call_status = cudaGetDriverEntryPointByVersion(
+        "cuTensorMapEncodeTiled", &ptr, 12000, cudaEnableDefault, &status);
 #else
-    cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &ptr, cudaEnableDefault, &status);
+    cudaError_t const call_status =
+        cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &ptr, cudaEnableDefault, &status);
 #endif
-    return status == cudaDriverEntryPointSuccess
+    return call_status == cudaSuccess && status == cudaDriverEntryPointSuccess
                ? reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(ptr)
                : nullptr;
   }();
   return fn;
 }
 
-/// Encode row-major BF16 [rows, cols] with a 64 x box_rows box and 128-byte swizzle.
-/// Return false for unsupported drivers, misaligned buffers, or encoding failures.
+/**
+ * @brief Encode row-major BF16 [rows, cols] with a 64 x box_rows box and 128-byte swizzle.
+ * Return false for unsupported drivers, misaligned buffers, or encoding failures.
+ */
 inline bool ws_make_map(CUtensorMap* map, void const* base, int rows, int cols, int box_rows) {
   auto const encode = ws_encode_fn();
   if (encode == nullptr) return false;
@@ -493,7 +524,9 @@ inline bool ws_make_map(CUtensorMap* map, void const* base, int rows, int cols, 
   return result == CUDA_SUCCESS;
 }
 
-/// Cache SM counts by current device; return zero if the device query cannot be served.
+/**
+ * @brief Cache SM counts by current device; return zero if the device query cannot be served.
+ */
 inline int ws_device_sm_count() {
   static int cached[64] = {};
   int device = 0;
@@ -508,10 +541,12 @@ inline int ws_device_sm_count() {
   return cached[device];
 }
 
-/// Validate geometry and buffers, encode TMA maps, and launch on the current device.
-/// Configure dynamic shared memory on each launch so switching devices is safe.
-/// grid_mode 0 uses one CTA per SM capped by 16-row units; mode 1 uses TileM
-/// chunks capped by the SM count.
+/**
+ * @brief Validate geometry and buffers, encode TMA maps, and launch on the current device.
+ * Configure dynamic shared memory on each launch so switching devices is safe.
+ * grid_mode 0 uses one CTA per SM capped by 16-row units; mode 1 uses TileM
+ * chunks capped by the SM count.
+ */
 template <int TileM, int TileK, int Stages, int QuantWarps, int DownWarpsM, int DownWarpsN>
 inline cudaError_t launch_ws_kernel(void const* x, void const* pre_quant_scale,
                                     float const* global_scale, void* xq, void* sf,
@@ -572,9 +607,11 @@ inline cudaError_t launch_ws_kernel(void const* x, void const* pre_quant_scale,
   X(32, 64, 4, 2, 0)                  \
   X(32, 64, 4, 4, 0)
 
-/// Dispatch a compiled rank-128 warp-specialized geometry using K-major L2T.
-/// Decode packed_tiling as down layout * 1000 + stages * 100 + quantize warps.
-/// Return cudaErrorInvalidValue for unsupported tilings or launch preconditions.
+/**
+ * @brief Dispatch a compiled rank-128 warp-specialized geometry using K-major L2T.
+ * Decode packed_tiling as down layout * 1000 + stages * 100 + quantize warps.
+ * Return cudaErrorInvalidValue for unsupported tilings or launch preconditions.
+ */
 template <int Rank>
 inline cudaError_t nvfp4_smooth_quantize_lora_down_ws_rank128_sm120(
     void const* x, void const* pre_quant_scale, float const* global_scale, void* xq, void* sf,

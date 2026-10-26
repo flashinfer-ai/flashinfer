@@ -1,5 +1,7 @@
 """Prepared SVDQuant weights retain captured addresses across weight updates."""
 
+import gc
+import weakref
 from contextlib import nullcontext
 
 import pytest
@@ -47,7 +49,50 @@ def test_reprepare_updates_existing_layout(rank: int, inference: bool) -> None:
 
 @pytest.mark.parametrize("rank", [32, 128])
 @pytest.mark.parametrize("inference", [False, True])
-def test_prepared_graph_observes_reprepare(rank: int, inference: bool) -> None:
+def test_prepared_aliases_retain_independent_layouts(
+    rank: int, inference: bool
+) -> None:
+    """Preparing a storage alias must not evict another live source's layout."""
+    with torch.inference_mode() if inference else nullcontext():
+        source = torch.zeros((3072, rank), dtype=torch.bfloat16)
+        alias = source.detach()
+        layout = "m537" if rank == 32 else "kmajor"
+        backend.prepare_sm120_l2t(source)
+        packed = backend._prepared_l2t_layout(source, layout)
+        assert packed is not None
+        original = weakref.ref(packed)
+        address = packed.data_ptr()
+        del packed
+
+        backend.prepare_sm120_l2t(alias)
+        assert original() is not None
+        assert backend._prepared_l2t_layout(source, layout) is original()
+        alias_packed = backend._prepared_l2t_layout(alias, layout)
+        assert alias_packed is not None and alias_packed is not original()
+        alias_ref = weakref.ref(alias_packed)
+        del alias_packed
+
+        source.fill_(1)
+        backend.prepare_sm120_l2t(source)
+        refreshed = backend._prepared_l2t_layout(source, layout)
+        assert refreshed is not None and refreshed.data_ptr() == address
+        torch.testing.assert_close(refreshed, torch.ones_like(refreshed))
+        del refreshed
+
+        del alias
+        gc.collect()
+        assert alias_ref() is None and original() is not None
+        del source
+        gc.collect()
+        assert original() is None
+
+
+@pytest.mark.parametrize("rank", [32, 128])
+@pytest.mark.parametrize("inference", [False, True])
+@pytest.mark.parametrize("prepare_alias", [False, True])
+def test_prepared_graph_observes_reprepare(
+    rank: int, inference: bool, prepare_alias: bool
+) -> None:
     """An existing graph must read updated weights without recapturing addresses."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("requires SM120")
@@ -64,6 +109,10 @@ def test_prepared_graph_observes_reprepare(rank: int, inference: bool) -> None:
         torch.cuda.synchronize()
         with torch.cuda.graph(graph):
             result = read(source).clone()
+
+        if prepare_alias:
+            alias = source.detach()
+            prepare_svdquant_l2t(alias)
 
         # When: reprepare follows an in-place update outside capture.
         source.fill_(1)

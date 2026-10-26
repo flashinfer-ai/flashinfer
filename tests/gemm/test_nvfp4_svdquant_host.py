@@ -3224,6 +3224,57 @@ def _run_ubsan(tmp_path: Path, source: str) -> None:
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.parametrize("cuda_version", [12040, 12050])
+@pytest.mark.parametrize("lookup_mode", [0, 1, 2])
+def test_ws_encoder_lookup_checks_both_statuses(
+    tmp_path: Path, cuda_version: int, lookup_mode: int
+) -> None:
+    """Both CUDA lookup APIs must reject call errors and unsuccessful query status."""
+    header = (
+        REPO_ROOT
+        / "include/flashinfer/gemm/nvfp4_smooth_quantize_lora_down_ws_sm120.cuh"
+    )
+    body = _function(header.read_text(), "ws_encode_fn()")
+    program = (
+        f"#define CUDA_VERSION {cuda_version}\n#define LOOKUP_MODE {lookup_mode}\n"
+    )
+    program += r"""
+#include <cassert>
+using cudaError_t = int;
+constexpr int cudaSuccess = 0;
+constexpr int cudaEnableDefault = 0;
+enum cudaDriverEntryPointQueryResult {
+  cudaDriverEntryPointSuccess, cudaDriverEntryPointSymbolNotFound
+};
+using PFN_cuTensorMapEncodeTiled_v12000 = void (*)();
+void encoder() {}
+int lookup(void** ptr, cudaDriverEntryPointQueryResult* status) {
+  *ptr = reinterpret_cast<void*>(&encoder);
+  *status = LOOKUP_MODE == 2 ? cudaDriverEntryPointSymbolNotFound
+                            : cudaDriverEntryPointSuccess;
+  return LOOKUP_MODE == 1 ? 1 : cudaSuccess;
+}
+int cudaGetDriverEntryPointByVersion(char const*, void** ptr, int, int,
+                                    cudaDriverEntryPointQueryResult* status) {
+  return lookup(ptr, status);
+}
+int cudaGetDriverEntryPoint(char const*, void** ptr, int,
+                           cudaDriverEntryPointQueryResult* status) {
+  return lookup(ptr, status);
+}
+inline PFN_cuTensorMapEncodeTiled_v12000
+"""
+    program += body
+    program += r"""
+int main() {
+  auto expected = LOOKUP_MODE == 0 ? &encoder : nullptr;
+  assert(ws_encode_fn() == expected);
+  assert(ws_encode_fn() == expected);
+}
+"""
+    _run_ubsan(tmp_path, program)
+
+
 @pytest.mark.parametrize("rank", (32, 64, 128))
 def test_dynamic_prefix_offsets_cross_int32_boundary(tmp_path: Path, rank: int) -> None:
     """UBSan must accept production offsets exceeding signed 32-bit range."""

@@ -27,9 +27,11 @@ __device__ __forceinline__ std::uint32_t load_bf16_pair(quant::Type const* ptr) 
   return *reinterpret_cast<std::uint32_t const*>(ptr);
 }
 
-/// Four 8x8 bf16 matrices from shared memory; lane l supplies the 16-byte row
-/// address of row l % 8 of matrix l / 8, and r[j] receives matrix j in the mma
-/// fragment layout (row = lane / 4, columns 2 * (lane % 4) and +1).
+/**
+ * @brief Four 8x8 bf16 matrices from shared memory; lane l supplies the 16-byte row
+ * address of row l % 8 of matrix l / 8, and r[j] receives matrix j in the mma
+ * fragment layout (row = lane / 4, columns 2 * (lane % 4) and +1).
+ */
 __device__ __forceinline__ void ldmatrix_x4(std::uint32_t& r0, std::uint32_t& r1, std::uint32_t& r2,
                                             std::uint32_t& r3, quant::Type const* row) {
   std::uint32_t const address = static_cast<std::uint32_t>(__cvta_generic_to_shared(row));
@@ -286,9 +288,11 @@ inline cudaError_t launch_m537_mixed_kernel(void const* x, void const* pre_quant
   return cudaGetLastError();
 }
 
-/// Quantize CTAs of the row-major small-M kernel. Ranks 32/64 give each CTA
-/// RowsPerQuantBlock rows; rank 128 gives each thread one (row, scale column)
-/// item of the 128-row-padded SF tile, so the count follows M x K rather than M.
+/**
+ * @brief Quantize CTAs of the row-major small-M kernel. Ranks 32/64 give each CTA
+ * RowsPerQuantBlock rows; rank 128 gives each thread one (row, scale column)
+ * item of the 128-row-padded SF tile, so the count follows M x K rather than M.
+ */
 template <int BlockThreads, int RowsPerQuantBlock, int Rank>
 __host__ __device__ __forceinline__ int small_m_quant_blocks(int m, int sf_cols) {
   if constexpr (Rank > 64) {
@@ -300,9 +304,11 @@ __host__ __device__ __forceinline__ int small_m_quant_blocks(int m, int sf_cols)
   }
 }
 
-/// Fuse smoothing, NVFP4 quantization, and LoRA-down with separate CTA groups.
-/// Rank 128 reads K-major L2T; lower ranks use row-major or explicitly packed L2T.
-/// Optional PDL signaling publishes quantize stores before the down CTAs finish.
+/**
+ * @brief Fuse smoothing, NVFP4 quantization, and LoRA-down with separate CTA groups.
+ * Rank 128 reads K-major L2T; lower ranks use row-major or explicitly packed L2T.
+ * Optional PDL signaling publishes quantize stores before the down CTAs finish.
+ */
 template <int BlockThreads, int DownTileCols, int RowsPerQuantBlock, bool PackedL2T = false,
           bool SignalLaunch = false, int Rank = 32, bool GateLaunchOnQuant = false, int KSplit = 1>
 __global__
@@ -616,9 +622,11 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
 #endif
 }
 
-/// Runtime-M/K small-M launch. Only the tiling stays in the type; the shape and
-/// everything derived from it are arguments, so one instantiation per tiling
-/// serves every shape whose K divides the warp split.
+/**
+ * @brief Runtime-M/K small-M launch. Only the tiling stays in the type; the shape and
+ * everything derived from it are arguments, so one instantiation per tiling
+ * serves every shape whose K divides the warp split.
+ */
 template <int BlockThreads, int DownTileCols, int RowsPerQuantBlock, bool PackedL2T = false,
           bool SignalLaunch = false, int Rank = 32, bool GateLaunchOnQuant = false, int KSplit = 1>
 inline cudaError_t launch_small_m_dyn_kernel(void const* x, void const* pre_quant_scale,
@@ -700,17 +708,21 @@ __device__ __forceinline__ std::uint64_t make_l2_evict_first_policy() {
   return policy;
 }
 
-/// LoRA-down warps of the large-M producer. Up to rank 64 every warp owns one
-/// n8 column fragment (Rank / 8 warps). Wider ranks keep eight down warps and
-/// give each one Rank / 64 adjacent fragments, so the CTA keeps room for its
-/// quantize warps and one A fragment load feeds several MMAs.
+/**
+ * @brief LoRA-down warps of the large-M producer. Up to rank 64 every warp owns one
+ * n8 column fragment (Rank / 8 warps). Wider ranks keep eight down warps and
+ * give each one Rank / 64 adjacent fragments, so the CTA keeps room for its
+ * quantize warps and one A fragment load feeds several MMAs.
+ */
 constexpr int large_m_down_warps(int rank) { return rank <= 64 ? rank / 8 : 8; }
 
-/// Wide ranks read L2T from a K-major copy, l2[rank][K] stored in the [K, rank]
-/// tensor. Row-major L2T makes each B-fragment pair two bf16 reads 2*Rank bytes
-/// apart, so a warp's load touches 32 lines for 64 useful bytes.
-/// K-major turns each pair into one aligned 32-bit read and a warp
-/// load into eight 16-byte segments. Rank 32/64 keep the row-major layout.
+/**
+ * @brief Wide ranks read L2T from a K-major copy, l2[rank][K] stored in the [K, rank]
+ * tensor. Row-major L2T makes each B-fragment pair two bf16 reads 2*Rank bytes
+ * apart, so a warp's load touches 32 lines for 64 useful bytes.
+ * K-major turns each pair into one aligned 32-bit read and a warp
+ * load into eight 16-byte segments. Rank 32/64 keep the row-major layout.
+ */
 constexpr bool large_m_kmajor_l2(int rank) { return rank > 64; }
 
 template <bool UsePackedStore>
@@ -741,8 +753,10 @@ __device__ __forceinline__ void wait_x_tile_async() {
 // shape, and it is measured rather than assumed.
 enum class DynAddress { kRecompute, kAccumulate };
 
-/// Stage an X tile with cp.async and zero-fill rows outside M.
-/// The caller commits and waits for the copy group before reading shared memory.
+/**
+ * @brief Stage an X tile with cp.async and zero-fill rows outside M.
+ * The caller commits and waits for the copy group before reading shared memory.
+ */
 template <int BlockThreads, bool LongK, int KernelTileM, int KernelTileK = 128,
           DynAddress Policy = DynAddress::kRecompute, int Rank = 32>
 __device__ __forceinline__ void copy_x_tile_async_dyn(quant::Type const* __restrict__ x,
@@ -817,7 +831,9 @@ __device__ __forceinline__ void copy_x_tile_async_dyn(quant::Type const* __restr
   }
 }
 
-/// Stage one K tile of smoothing scales; the caller commits and waits for copies.
+/**
+ * @brief Stage one K tile of smoothing scales; the caller commits and waits for copies.
+ */
 template <bool LongK, int KernelTileK = 128, int Rank = 32>
 __device__ __forceinline__ void copy_pre_quant_scale_tile_async_dyn(
     quant::Type const* __restrict__ pre_quant_scale, quant::Type* __restrict__ scale_tile,
@@ -837,8 +853,10 @@ __device__ __forceinline__ void copy_pre_quant_scale_tile_async_dyn(
   }
 }
 
-/// Fuse quantization and LoRA-down using double-buffered X tiles.
-/// Rank 128 loads B fragments from K-major L2T; ranks 32/64 use row-major L2T.
+/**
+ * @brief Fuse quantization and LoRA-down using double-buffered X tiles.
+ * Rank 128 loads B fragments from K-major L2T; ranks 32/64 use row-major L2T.
+ */
 template <int BlockThreads, bool LongK, int KernelTileM, int KernelTileK = 128,
           DynAddress Policy = DynAddress::kRecompute, int Rank = 32>
 __global__
@@ -1193,16 +1211,18 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_large_m_dyn
 #endif
 }
 
-/// Wide ranks with a K64 tile stage B (the K-major L2T) in shared memory.
-///
-/// The K128 wide-rank path above reads its B fragments with per-fragment global
-/// loads at the start of every k tile, so those loads -- their latency and the
-/// L2 traffic of every CTA re-reading the whole L2T -- sit on the down warps'
-/// critical path once per tile. Here each
-/// down warp copies its own B slice of the next tile with cp.async while it runs
-/// the current one, and reads the current one from shared memory. A K128 tile's
-/// 32 KB B tile does not fit next to two x buffers at two CTAs per SM, which is
-/// why this is the K64 path; the K128 kernel is left untouched.
+/**
+ * @brief Wide ranks with a K64 tile stage B (the K-major L2T) in shared memory.
+ *
+ * The K128 wide-rank path above reads its B fragments with per-fragment global
+ * loads at the start of every k tile, so those loads -- their latency and the
+ * L2 traffic of every CTA re-reading the whole L2T -- sit on the down warps'
+ * critical path once per tile. Here each
+ * down warp copies its own B slice of the next tile with cp.async while it runs
+ * the current one, and reads the current one from shared memory. A K128 tile's
+ * 32 KB B tile does not fit next to two x buffers at two CTAs per SM, which is
+ * why this is the K64 path; the K128 kernel is left untouched.
+ */
 constexpr bool large_m_stages_b(int rank, int tile_k) { return rank > 64 && tile_k == 64; }
 // One down warp's slice: its 16 columns (two n8 fragments), K-major, 64 k per
 // row padded by eight bf16 so the eight fragment groups hit distinct bank quads.
@@ -1210,23 +1230,31 @@ constexpr int kStagedBCols = 16;
 constexpr int kStagedBStride = 64 + 8;
 constexpr int kStagedBSliceBytes = kStagedBCols * kStagedBStride * 2;
 constexpr int kStagedBSlices = 8;  // Rank / kStagedBCols column groups at rank 128
-/// A row tile above 80 rows is split between two sets of eight down warps that
-/// share each column group's B slice: the CTA reads L2T once for twice the rows,
-/// halving the L2T traffic per row (one CTA per SM, dynamic shared memory).
+/**
+ * @brief A row tile above 80 rows is split between two sets of eight down warps that
+ * share each column group's B slice: the CTA reads L2T once for twice the rows,
+ * halving the L2T traffic per row (one CTA per SM, dynamic shared memory).
+ */
 constexpr int staged_b_row_split(int tile_m) { return tile_m > 80 ? 2 : 1; }
-/// Allocate one down warp per B column group and row partition.
+/**
+ * @brief Allocate one down warp per B column group and row partition.
+ */
 constexpr int staged_b_down_warps(int tile_m) {
   return kStagedBSlices * staged_b_row_split(tile_m);
 }
-/// Size the two X/scale buffers, aligned SF scratch, and shared B slices in bytes.
+/**
+ * @brief Size the two X/scale buffers, aligned SF scratch, and shared B slices in bytes.
+ */
 constexpr int staged_b_shared_bytes(int tile_m, int tile_k, bool long_k) {
   return 2 * tile_m * (tile_k + 8) * 2 + 2 * tile_k * 2 +
          (2 * (long_k ? tile_m * (tile_k / 16) : 1) + 15) / 16 * 16 +
          kStagedBSlices * kStagedBSliceBytes;
 }
 
-/// Stage part of one column group's K-major B slice with cp.async.
-/// The caller commits and waits for the group before reading the shared slice.
+/**
+ * @brief Stage part of one column group's K-major B slice with cp.async.
+ * The caller commits and waits for the group before reading the shared slice.
+ */
 template <int Parts>
 __device__ __forceinline__ void copy_b_slice_async(quant::Type const* __restrict__ l2t_kmajor,
                                                    quant::Type* __restrict__ slice, int col_group,
@@ -1248,9 +1276,11 @@ __device__ __forceinline__ void copy_b_slice_async(quant::Type const* __restrict
   }
 }
 
-/// Fuse quantization and LoRA-down with shared B slices and double-buffered X.
-/// Down warps share K-major L2T slices across row partitions; larger row tiles
-/// use one CTA per SM, while smaller tiles allow two.
+/**
+ * @brief Fuse quantization and LoRA-down with shared B slices and double-buffered X.
+ * Down warps share K-major L2T slices across row partitions; larger row tiles
+ * use one CTA per SM, while smaller tiles allow two.
+ */
 template <int BlockThreads, bool LongK, int KernelTileM, int KernelTileK, DynAddress Policy,
           int Rank>
 __global__
@@ -1501,9 +1531,11 @@ __launch_bounds__(BlockThreads, 3 - staged_b_row_split(KernelTileM)) void nvfp4_
 #endif
 }
 
-/// Runtime-M/K launch. The geometry stays a template parameter -- shared memory
-/// and every unroll constant come from it -- while M and K become arguments, so
-/// one instantiation serves every shape whose K divides the tile.
+/**
+ * @brief Runtime-M/K launch. The geometry stays a template parameter -- shared memory
+ * and every unroll constant come from it -- while M and K become arguments, so
+ * one instantiation serves every shape whose K divides the tile.
+ */
 template <int BlockThreads, bool LongK, int TileM, int TileK, DynAddress Policy, int Rank = 32>
 inline cudaError_t launch_large_m_dyn_kernel(void const* x, void const* pre_quant_scale,
                                              float const* global_scale, void* xq, void* sf,
@@ -1634,8 +1666,10 @@ inline cudaError_t launch_large_m_dyn_kernel(void const* x, void const* pre_quan
   X(768, 160, 64)                              \
   X(832, 160, 64)
 
-/// Dispatch a compiled large-M geometry, returning cudaErrorInvalidValue if absent.
-/// Each launcher validates runtime dimensions before enqueueing work on stream.
+/**
+ * @brief Dispatch a compiled large-M geometry, returning cudaErrorInvalidValue if absent.
+ * Each launcher validates runtime dimensions before enqueueing work on stream.
+ */
 template <int Rank = 32>
 inline cudaError_t nvfp4_smooth_quantize_lora_down_dyn_sm120(
     void const* x, void const* pre_quant_scale, float const* global_scale, void* xq, void* sf,
@@ -1676,19 +1710,21 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_dyn_sm120(
   return cudaErrorInvalidValue;
 }
 
-/// Producer launch by family and tiling, with no shape lookup at all. The caller
-/// enumerates what a shape may run from the same constraints the launchers check,
-/// so this switch selects compiled families and tilings, and a shape
-/// nobody wrote down reaches the same kernels as one that was.
-///   family 0 large-M (geometry a, b, c = block threads, tile M, tile K)
-///   family 1 row-major small-M (a, b, c = block threads, down tile cols, rows/quant block)
-///   family 2 fixed-M537 with packed L2T (a, b, c = block threads, down warps, rows/quant block)
-///   family 4 packed small-M (same tiling fields as family 1)
-///   family 5 warp-specialized rank-128 large-M (a, b, c = tile M, tile K,
-///            down layout * 1000 + stages * 100 + quantize warps;
-///            address_policy = grid mode)
-///   family 6 split-K rank-128 small-M (a, b, c = block threads, down tile cols, K splits)
-/// Family 3 uses the separate cuBLASLt prefix entry.
+/**
+ * @brief Producer launch by family and tiling, with no shape lookup at all. The caller
+ * enumerates what a shape may run from the same constraints the launchers check,
+ * so this switch selects compiled families and tilings, and a shape
+ * nobody wrote down reaches the same kernels as one that was.
+ *   family 0 large-M (geometry a, b, c = block threads, tile M, tile K)
+ *   family 1 row-major small-M (a, b, c = block threads, down tile cols, rows/quant block)
+ *   family 2 fixed-M537 with packed L2T (a, b, c = block threads, down warps, rows/quant block)
+ *   family 4 packed small-M (same tiling fields as family 1)
+ *   family 5 warp-specialized rank-128 large-M (a, b, c = tile M, tile K,
+ *            down layout * 1000 + stages * 100 + quantize warps;
+ *            address_policy = grid mode)
+ *   family 6 split-K rank-128 small-M (a, b, c = block threads, down tile cols, K splits)
+ * Family 3 uses the separate cuBLASLt prefix entry.
+ */
 template <int Rank = 32>
 inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
     void const* x, void const* pre_quant_scale, float const* global_scale, void* xq, void* sf,
@@ -1796,9 +1832,11 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
                                                          address_policy);
 }
 
-/// Try compiled default geometries until one accepts the runtime dimensions.
-/// Excludes packed-L2T families; callers must provide the rank's default layout.
-/// Returns cudaErrorInvalidValue when no candidate accepts the shape.
+/**
+ * @brief Try compiled default geometries until one accepts the runtime dimensions.
+ * Excludes packed-L2T families; callers must provide the rank's default layout.
+ * Returns cudaErrorInvalidValue when no candidate accepts the shape.
+ */
 template <int Rank = 32>
 inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
     void const* x, void const* pre_quant_scale, float const* global_scale, void* xq, void* sf,

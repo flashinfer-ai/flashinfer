@@ -232,9 +232,11 @@ void nvfp4_quantize_smooth_lora_down_geometry_sm120(TensorView x, TensorView pqs
                                              false, geometry_variant);
 }
 
-/// Validate prefix operands and launch the requested producer family and geometry.
-/// The caller supplies the matching L2T layout and owns all output buffers.
-/// An optional quantize barrier publishes XQ/SF before LoRA-down completes.
+/**
+ * @brief Validate prefix operands and launch the requested producer family and geometry.
+ * The caller supplies the matching L2T layout and owns all output buffers.
+ * An optional quantize barrier publishes XQ/SF before LoRA-down completes.
+ */
 void nvfp4_quantize_smooth_lora_down_dyn_sm120_impl(
     TensorView x, TensorView pqs, TensorView global_scale, TensorView l2t_smoothed, TensorView xq,
     TensorView sf, TensorView down, int family, int tiling0, int tiling1, int tiling2,

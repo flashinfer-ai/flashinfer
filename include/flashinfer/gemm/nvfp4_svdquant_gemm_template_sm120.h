@@ -727,9 +727,11 @@ bool can_implement_tactic(RuntimeTacticSm120 const& rt, int m, int n, int k, int
   return gemm.can_implement(args) == cutlass::Status::kSuccess;
 }
 
-/// Validate a runtime tactic, initialize caller-owned scratch, and enqueue GEMM.
-/// Operand roles follow Config::SwapAB; the optional quantize barrier is passed
-/// to the mainloop. Invalid rank, shape, or workspace raises an exception.
+/**
+ * @brief Validate a runtime tactic, initialize caller-owned scratch, and enqueue GEMM.
+ * Operand roles follow Config::SwapAB; the optional quantize barrier is passed
+ * to the mainloop. Invalid rank, shape, or workspace raises an exception.
+ */
 template <class Config, bool CompileInlineDown>
 void run_tactic_impl(RuntimeTacticSm120 const& rt, void* out, void const* A, void const* B,
                      void const* sfa, void const* sfb, float const* alpha, void const* D,

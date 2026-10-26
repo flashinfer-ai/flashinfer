@@ -154,7 +154,7 @@ def _pack_sm120_m537_l2t(l2t_smoothed: torch.Tensor) -> torch.Tensor:
     )
 
 
-# Layouts built once by prepare_svdquant_l2t(), keyed by the source storage.
+# Layouts built once by prepare_svdquant_l2t(), keyed by source identity and storage.
 # A hit needs the same live tensor object and, for tensors that carry one, the
 # version it was prepared at; inference tensors carry none, and preparing one is
 # the caller's promise to prepare again after changing it.
@@ -164,8 +164,9 @@ _SM120_PREPARED_L2T: dict[
 
 
 def _prepared_l2t_key(l2t_smoothed: torch.Tensor) -> tuple:
-    """Key prepared layouts by the source's device, address, shape, strides and dtype."""
+    """Identify a live source and its storage metadata, keeping aliases independent."""
     return (
+        id(l2t_smoothed),
         l2t_smoothed.device,
         l2t_smoothed.data_ptr(),
         tuple(l2t_smoothed.shape),

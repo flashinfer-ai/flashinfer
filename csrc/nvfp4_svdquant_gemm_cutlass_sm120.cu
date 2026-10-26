@@ -205,9 +205,11 @@ int nvfp4_svdquant_gemm_fallback_tactic(int m, int n, int k, int lora_rank) {
   return -1;
 }
 
-/// Launch residual NVFP4 GEMM with BF16 LoRA-up at the module's compiled rank.
-/// L1 includes 1/alpha so the epilogue scales the residual and LoRA terms together.
-/// The fused linear route can supply a quantize barrier to overlap LoRA-down.
+/**
+ * @brief Launch residual NVFP4 GEMM with BF16 LoRA-up at the module's compiled rank.
+ * L1 includes 1/alpha so the epilogue scales the residual and LoRA terms together.
+ * The fused linear route can supply a quantize barrier to overlap LoRA-down.
+ */
 void nvfp4_svdquant_gemm_run_sm120(void* out, void const* A, void const* B, void const* sfa,
                                    void const* sfb, float const* alpha, void const* D,
                                    void const* L1, void const* bias, int m, int n, int k,
@@ -232,7 +234,9 @@ void nvfp4_svdquant_gemm_run_sm120(void* out, void const* A, void const* B, void
       })
 }
 
-/// Run standalone SM120 SVDQuant GEMM without a producer quantize barrier.
+/**
+ * @brief Run standalone SM120 SVDQuant GEMM without a producer quantize barrier.
+ */
 void nvfp4_svdquant_gemm_run(void* out, void const* A, void const* B, void const* sfa,
                              void const* sfb, float const* alpha, void const* D, void const* L1,
                              void const* bias, int m, int n, int k, int lora_rank, char* ws,
@@ -572,11 +576,13 @@ void nvfp4_quantize_smooth_lora_down_cublaslt_sm120(TensorView x, TensorView pqs
 }
 #endif
 
-/// Validate and launch GEMM using packed E2M1 A/B and swizzled UE4M3 block scales.
-/// D [m, rank] and L1 [n, rank] are BF16; L1 includes 1/alpha so scaling the
-/// accumulator produces the unscaled LoRA contribution plus alpha * residual.
-/// The caller owns BF16 out [m, n] and workspace. Ranks other than the module's
-/// compiled rank are rejected; bias is optional.
+/**
+ * @brief Validate and launch GEMM using packed E2M1 A/B and swizzled UE4M3 block scales.
+ * D [m, rank] and L1 [n, rank] are BF16; L1 includes 1/alpha so scaling the
+ * accumulator produces the unscaled LoRA contribution plus alpha * residual.
+ * The caller owns BF16 out [m, n] and workspace. Ranks other than the module's
+ * compiled rank are rejected; bias is optional.
+ */
 void nvfp4_svdquant_gemm_impl(
     TensorView a, TensorView b, TensorView a_sf, TensorView b_sf, TensorView alpha, TensorView d,
     TensorView l1, Optional<TensorView> const& bias, TensorView out, TensorView workspace_buffer,
@@ -707,9 +713,11 @@ void nvfp4_svdquant_gemm(TensorView a, TensorView b, TensorView a_sf, TensorView
 }
 
 #if defined(FLASHINFER_ENABLE_SVDQ_SM120_K1_K2_FUSION)
-/// Dispatch the producer half of a runtime tactic using its matching L2T layout.
-/// A negative family selects the default prefix; explicit families own their
-/// geometry validation and optional quantize-ready signaling.
+/**
+ * @brief Dispatch the producer half of a runtime tactic using its matching L2T layout.
+ * A negative family selects the default prefix; explicit families own their
+ * geometry validation and optional quantize-ready signaling.
+ */
 void dispatch_svdquant_producer_sm120(
     TensorView x, TensorView pqs, TensorView global_scale, TensorView l2t_smoothed, TensorView xq,
     TensorView a_sf, TensorView down, TensorView workspace_buffer, int producer_family = -1,
@@ -732,10 +740,12 @@ void dispatch_svdquant_producer_sm120(
                                                  0);
 }
 
-/// Launch the selected quantize/LoRA-down prefix followed by SVDQuant GEMM.
-/// Inputs, intermediate outputs, final output, and scratch are caller-owned.
-/// PDL may use an aligned counter outside GEMM scratch to publish XQ/SF early;
-/// exact-sized workspaces retain the full producer-grid wait.
+/**
+ * @brief Launch the selected quantize/LoRA-down prefix followed by SVDQuant GEMM.
+ * Inputs, intermediate outputs, final output, and scratch are caller-owned.
+ * PDL may use an aligned counter outside GEMM scratch to publish XQ/SF early;
+ * exact-sized workspaces retain the full producer-grid wait.
+ */
 void nvfp4_svdquant_linear_sm120(TensorView x, TensorView pqs, TensorView global_scale,
                                  TensorView l2t_smoothed, TensorView b, TensorView b_sf,
                                  TensorView alpha, TensorView l1, Optional<TensorView> const& bias,
