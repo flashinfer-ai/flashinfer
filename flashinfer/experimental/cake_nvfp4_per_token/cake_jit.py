@@ -916,6 +916,12 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "sm_103a": "071d313ffa28826f59fce81d4091804888be23e93eae4ca9d6a391f4047c0b64",
         },
     },
+    "6ec904d235f4962b4dbe": {
+        "arg_plan": "gemm",
+        "closure_sha256": {
+            "sm_100a": "107f41b905f9c1f75f50aa0dd1aa2142f75a51d78e78bafb3372f0d96d82831f",
+        },
+    },
     "6fed99e520aa239db6c9": {
         "kernel": "a1674da021d7fdb5e3d0",
         "binding": "a1674da021d7fdb5e3d0",
@@ -1613,6 +1619,12 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "sm_103a": "598a80395fa29d35e8456d385b53133b98bb5461e010b6fd572fae2d3d89e62f",
         },
     },
+    "dca186ac52f7eddf9913": {
+        "arg_plan": "gemm",
+        "closure_sha256": {
+            "sm_100a": "dd1d39a54cf8eefc740d79c373b197ac26df6bac007dea989fcc746757a347e4",
+        },
+    },
     "dcd89b2e097fbee53eb7": {
         "kernel": "266051f22af995b10bc8",
         "binding": "266051f22af995b10bc8",
@@ -1949,6 +1961,8 @@ _KERNELS_SHARED: dict[str, str] = {
 }
 _KERNELS_ONLY: dict[str, dict[str, str]] = {
     "sm_100a": {
+        "gemm:m128_bf16_bF_ro": "cake_nvfp4_per_token_dca186ac52f7eddf9913",
+        "gemm:m128_f16_bF_ro": "cake_nvfp4_per_token_6ec904d235f4962b4dbe",
         "gemm:m192_2cta_bf16_aL_bL_l2256b": "cake_nvfp4_per_token_a1674da021d7fdb5e3d0",
         "gemm:m192_2cta_f16_aL_bL_l2256b": "cake_nvfp4_per_token_1fa625dd627403d62d62",
         "gemm:m192_2cta_skt6_bf16_aL_bL_l2256b": "cake_nvfp4_per_token_288adcab31da85191a26",
