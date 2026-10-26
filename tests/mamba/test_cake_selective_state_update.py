@@ -1499,7 +1499,10 @@ def test_hd64_split_layout_outside_the_paired_programs_runs_the_row_owner_tile(
     is outside the paired programs' addressing: it runs the direct row-owner tile."""
     inputs = _make_case(_case("stp_hd64_rows_bf16"))
     if _routes_as_measured():
-        assert _route(inputs).program == "stp_hd64_paired_hpc1_ratio8_s4w2"
+        plan = _route(inputs)
+        assert plan.program == cake.lean_program(
+            "stp_hd64_paired_hpc1_ratio8_s4w2", plan.arch
+        )
     nheads, dim = inputs["D"].shape
     D_rows = inputs["D"][:, 0].contiguous()
     D_wide = torch.zeros(2 * nheads, dtype=D_rows.dtype, device="cuda")
