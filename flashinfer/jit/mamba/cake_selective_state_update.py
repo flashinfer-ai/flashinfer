@@ -3409,8 +3409,8 @@ def hd64_unsplit_program(
     """``(program, heads_per_cta)`` of the unsplit paired headdim-64 build for one launch: the build
     :func:`hd64_paired_program` gives it, except that a launch it gives the two-head build at three CTAs per SM, with
     groups of a multiple of four program heads and that build's CTAs inside the architecture's band
-    (``_HD64_HPC4_BAND_HUNDREDTHS``: from 3.05 to 3.46 waves of three CTAs per SM on sm_100a, to 3.7 on sm_103a),
-    runs the four-head build."""
+    (``_HD64_HPC4_BAND_HUNDREDTHS``: from 3.05 to 3.46 waves of three CTAs per SM on sm_100a, from 3.09 to 3.37 on
+    sm_103a), runs the four-head build."""
     program, heads_per_cta = hd64_paired_program(
         row_groups, program_heads_per_group, sm_count, raw_abi
     )
@@ -3477,7 +3477,7 @@ _HD64_C4_WAVES = {"sm_100a": (3, 4), "sm_103a": (3, 4)}
 _HD64_C4_TAIL_HUNDREDTHS = {"sm_100a": 25, "sm_103a": 40}
 # The band of the two-head build at three CTAs per SM in which a headdim-64 launch runs the four-head build instead,
 # per architecture: inclusive bounds in hundredths of a wave of three CTAs per SM.
-_HD64_HPC4_BAND_HUNDREDTHS = {"sm_100a": (305, 346), "sm_103a": (305, 370)}
+_HD64_HPC4_BAND_HUNDREDTHS = {"sm_100a": (305, 346), "sm_103a": (309, 337)}
 # The builds whose consumers skip the proxy fence after their wait on a full state stage, per architecture: a
 # launch of one of these programs (either ABI of a headdim-64 build) runs its ``_lean`` build, whose output and state
 # are bitwise the plain build's.

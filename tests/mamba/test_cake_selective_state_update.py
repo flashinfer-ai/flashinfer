@@ -965,8 +965,8 @@ def test_four_head_split_takes_the_nearly_full_waves() -> None:
 
 def test_unsplit_program_takes_four_heads_in_the_band() -> None:
     """The two-head build at three CTAs per SM runs four heads per CTA from 3.05 to 3.46 waves of three CTAs per
-    SM on sm_100a and to 3.7 on sm_103a, for groups of a multiple of four program heads; every other launch keeps
-    :func:`hd64_paired_program`'s build."""
+    SM on sm_100a and from 3.09 to 3.37 on sm_103a, for groups of a multiple of four program heads; every other
+    launch keeps :func:`hd64_paired_program`'s build."""
 
     def unsplit(rg, hpg=8, sms=148, arch="sm_100a", raw=False):
         return cake.hd64_unsplit_program(rg, hpg, sms, arch, raw)
@@ -978,9 +978,9 @@ def test_unsplit_program_takes_four_heads_in_the_band() -> None:
     assert unsplit(338) == hpc2 and unsplit(339) == hpc4
     assert unsplit(384) == hpc4 and unsplit(385) == hpc2
     assert unsplit(400) == hpc2
-    # sm_103a: 1388 / 1392 (3.05 waves: 1390.8), 1684 / 1688 (3.7 waves: 1687.2).
-    assert unsplit(347, **gb300) == hpc2 and unsplit(348, **gb300) == hpc4
-    assert unsplit(421, **gb300) == hpc4 and unsplit(422, **gb300) == hpc2
+    # sm_103a: 1408 / 1412 (3.09 waves: 1409.0), 1536 / 1540 (3.37 waves: 1536.7).
+    assert unsplit(352, **gb300) == hpc2 and unsplit(353, **gb300) == hpc4
+    assert unsplit(384, **gb300) == hpc4 and unsplit(385, **gb300) == hpc2
     assert unsplit(700, 4) == hpc4  # 1400 CTAs of four program heads per group
     assert unsplit(233, 6) == ("stp_hd64_paired_hpc2", 2)  # 699 CTAs in groups of six
     assert unsplit(360, raw=True) == ("stp_hd64_paired_hpc4_bf16_i32", 4)
