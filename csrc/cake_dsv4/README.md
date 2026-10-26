@@ -37,8 +37,11 @@ out = trtllm_batch_decode_sparse_mla_dsv4(
 
 `flashinfer/jit/cake_dsv4.py` registers each variant per architecture: its
 sources, nvcc flags, an identity that names the JIT module, and the `arg_plan`
-the host binds by name. `flashinfer/mla/cake_dsv4.py` resolves the sparse
-metadata, carves the caller-owned workspace, picks the route (`_route`, or
+the host binds by name. The BF16 / FP8 registrations are read from three literal
+tables: `ARG_PLANS` (the argument plans), `MODULES` (one record per program:
+sources, flags, plan, architectures, identity per architecture) and `VARIANTS`
+(architecture -> variant key -> program). `flashinfer/mla/cake_dsv4.py` resolves
+the sparse metadata, carves the caller-owned workspace, picks the route (`_route`, or
 `_nvfp4_plan` for the NVFP4 cache) and launches the variant kernels directly,
 reducers included; shapes without an exported kernel are rejected before any
 launch. Bindings perform no device allocation.
