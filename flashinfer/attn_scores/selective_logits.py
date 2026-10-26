@@ -46,6 +46,7 @@ from ._math_policy import _MathMode, _validate_math_mode
 from ._selective_contract import (
     _CANDIDATE_CAPACITY,
     _COUNT_SEGMENTS,
+    _LAST_SAMPLE_BIN,
     _MAX_STRIPED_SPLIT_KV,
     _REPAIR_CAPACITY,
     _SPLIT_KV_CHOICES,
@@ -144,7 +145,7 @@ class _CandidateSchedule:
     publication: _CandidatePublication
     count_segments: int
     sample_count_segments: int
-    # Publication budget is independent of the original sample-ladder budget.
+    # Publication capacity and bank count also bound the sampled ladder policy.
     candidate_capacity: int = _CANDIDATE_CAPACITY
     # Single-pool H64 prefill published by the specialized H64 candidate
     # variant, one query row per math warpgroup in four warp segments.
@@ -3368,8 +3369,8 @@ class _FP8PagedMQASelectiveTopKEngine:
             self._sample_ladder,
             self._sample_populations,
             self._top_k,
-            _CANDIDATE_CAPACITY,
-            self._candidate_schedule.sample_count_segments,
+            self._candidate_schedule.candidate_capacity,
+            self._candidate_schedule.count_segments,
         )
         self._sample_threshold_launch = (
             sample_threshold_compiled,
@@ -3794,6 +3795,7 @@ class _FP8PagedMQASelectiveTopKEngine:
         elif not _sampling_policy_initialized:
             self._thresholds.fill_(float("-inf"))
             self._sample_ladder.fill_(float("-inf"))
+            self._selected_bins.fill_(_LAST_SAMPLE_BIN)
 
         _fp8_mqa_selective_logits(
             q,

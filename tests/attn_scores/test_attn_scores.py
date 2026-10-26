@@ -8376,7 +8376,10 @@ def test_single_pool8192_changed_map_tail_graph(
     assert wrapper._candidate_schedule.h64_candidate is h64_candidate
     assert wrapper._candidate_counts.shape[1] == (5 if h64_candidate else 2)
     assert wrapper._candidate_values.shape[1] == 8192
-    assert wrapper._sample_threshold_launch[1][-2:] == (6144, 32)
+    assert wrapper._sample_threshold_launch[1][-2:] == (
+        wrapper._candidate_schedule.candidate_capacity,
+        wrapper._candidate_schedule.count_segments,
+    )
     assert not wrapper._compact_repair
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -8440,8 +8443,8 @@ def test_lane_local8192_changed_map_tail_graph(top_k, ratio, monkeypatch):
     assert wrapper._candidate_counts.shape[1] == 1 + 32 * schedule.split_kv
     assert wrapper._candidate_values.shape[1] == 8192
     assert wrapper._sample_threshold_launch[1][-2:] == (
-        6144,
-        schedule.sample_count_segments,
+        schedule.candidate_capacity,
+        schedule.count_segments,
     )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -9467,6 +9470,8 @@ def test_capacity_sampling_physical_boundary(ratio, physical_capacity, monkeypat
     wrapper.prepare_pool(fused)
     engine = wrapper._capacity_plan._engine
     assert engine._needs_sampling == (physical_capacity > 6144)
+    if not engine._needs_sampling:
+        assert bool((engine._selected_bins == 2047).all())
     wrapper.plan(qo, kv, table)
     wrapper.run(q, weights, fused)
     graph = torch.cuda.CUDAGraph()

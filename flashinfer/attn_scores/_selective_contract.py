@@ -15,6 +15,10 @@
 
 from enum import IntEnum
 
+# The native FP16 sample histogram uses 2048 descending bins; its last bin
+# represents the conservative all-key (-inf) threshold.
+_LAST_SAMPLE_BIN = 2047
+
 _COUNT_SEGMENTS = (4, 8, 12, 16, 32, 64, 128)
 _SPLIT_KV_CHOICES = (1, 2, 4, 8, 16, 32, 64)
 _MAX_STRIPED_SPLIT_KV = 8
