@@ -208,6 +208,7 @@ kernel_cake_blackwell_bf16_fp4_26f4a8214b8e11b048c5(const __grid_constant__ CUte
     const int mbar_base = smem;
     #define full_addr (mbar_base + 0)
     #define mail_bar_addr (mbar_base + 8)
+    #define sf_full_addr (mbar_base + 16)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -232,8 +233,8 @@ kernel_cake_blackwell_bf16_fp4_26f4a8214b8e11b048c5(const __grid_constant__ CUte
     float* smk_mail = reinterpret_cast<float*>(smem_raw + 34816);
     const int smk_mail_addr = smem + 34816;
 
-    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 2 barriers)
-    // Mbarriers at smem_raw[0..16)
+    // Mbarrier init (3 pipeline groups, 0 ordered-sequence groups, 3 barriers)
+    // Mbarriers at smem_raw[0..24)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -242,28 +243,28 @@ kernel_cake_blackwell_bf16_fp4_26f4a8214b8e11b048c5(const __grid_constant__ CUte
             mbarrier_init(smem + 0, 1);
             // mail_bar: 1 barriers, init_count=1
             mbarrier_init(smem + 8, 1);
+            // sf_full: 1 barriers, init_count=1
+            mbarrier_init(smem + 16, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
             mbarrier_expect_tx(smem + 8, 12288);
         }
     }
 
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-
     // === Task calls (declaration order) ===
     int off_n = blockIdx.x * 64;
     if (warp == 0) {
         if (elect_sync()) {
-            mbarrier_arrive_expect_tx(full_addr, 17408);
-            asm volatile(
-                "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-                " [%0], [%1, {%2, %3}], [%4], %5;"
-                :: "r"(smk_b_addr), "l"((&B)), "r"(off_n * 2), "r"(blockIdx.z * 16),
-                   "r"(full_addr), "l"(0x12F0000000000000ULL) : "memory");
+            mbarrier_arrive_expect_tx(sf_full_addr, 1024);
             asm volatile(
                 "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1, {%2, %3}], [%4], %5;"
                 :: "r"(smk_sf_addr), "l"((&B_descale)), "r"(off_n), "r"(blockIdx.z * 16),
+                   "r"(sf_full_addr), "l"(0x12F0000000000000ULL) : "memory");
+            mbarrier_arrive_expect_tx(full_addr, 16384);
+            asm volatile(
+                "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                " [%0], [%1, {%2, %3}], [%4], %5;"
+                :: "r"(smk_b_addr), "l"((&B)), "r"(off_n * 2), "r"(blockIdx.z * 16),
                    "r"(full_addr), "l"(0x12F0000000000000ULL) : "memory");
         }
     }
@@ -279,6 +280,8 @@ kernel_cake_blackwell_bf16_fp4_26f4a8214b8e11b048c5(const __grid_constant__ CUte
                    "r"(full_addr), "l"(0x14F0000000000000ULL) : "memory");
         }
     }
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     if (warp == 0) {
         if (elect_sync()) {
             mbarrier_arrive(mail_bar_addr);
@@ -318,7 +321,7 @@ kernel_cake_blackwell_bf16_fp4_26f4a8214b8e11b048c5(const __grid_constant__ CUte
     int sf_lane_off = nw * 8 + (lane_g & 4);
     int sf_shift = (lane_g & 3) * 8;
     int sfx_lane_off = (nw * 8 + lane_g) * 16;
-    mbarrier_wait(full_addr, 0);
+    mbarrier_wait(sf_full_addr, 0);
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     int sfx_rec = tid;
     int sfx_kb = sfx_rec >> 4;
@@ -399,6 +402,8 @@ kernel_cake_blackwell_bf16_fp4_26f4a8214b8e11b048c5(const __grid_constant__ CUte
     }
     smk_sfx[sfx_dst + 3] = sfx_carrier_3;
     __syncthreads();
+    mbarrier_wait(full_addr, 0);
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
         : "r"((smk_a_addr + (unsigned int)((pair * 16 + a_col) / 64 * 2048 + a_row * 128 + (pair * 16 + a_col) % 64 * 2 ^ ((pair * 16 + a_col) / 64 * 2048 + a_row * 128 + (pair * 16 + a_col) % 64 * 2 >> 7 & 7) << 4)))
