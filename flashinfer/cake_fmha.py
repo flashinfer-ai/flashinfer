@@ -308,10 +308,10 @@ _CONTEXT_PROGRAM_ROUTES: dict[
     },
 }
 # ``(component, identifier)`` -> the delivered record the host pins: the
-# program name, the m-block count of its shape class and whether it launches
-# one CTA per tile (otherwise at most one persistent CTA per SM).  A loader
-# whose record differs fails closed at load.
-_CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int, bool]] = {
+# program name, the m-block count of its shape class (``None``: the launch
+# passes it) and whether it launches one CTA per tile (otherwise at most one
+# persistent CTA per SM).  A loader whose record differs fails closed at load.
+_CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
     ("context_bf16", "Q8192"): (
         "cake_fmha_context_bf16_eb5b942877557703876d",
         256,
@@ -364,7 +364,82 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int, bool]] = {
         16,
         False,
     ),
+    # The FP8 runtime-size programs: the m-block count is a launch argument.
+    ("context_fp8", "RUNTIME_PACK8"): (
+        "cake_fmha_context_fp8_3fd021cb557d23a90ca8",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4"): (
+        "cake_fmha_context_fp8_be3f7f385a3af5fe43b8",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2"): (
+        "cake_fmha_context_fp8_caade70bb69e18537405",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1"): (
+        "cake_fmha_context_fp8_ce1b2c2352f741d468e8",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_PAGE64"): (
+        "cake_fmha_context_fp8_1930bf723069ae9f5446",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_PAGE64"): (
+        "cake_fmha_context_fp8_91a83484d11d796aaf30",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_PAGE64"): (
+        "cake_fmha_context_fp8_d427125833943a3251b5",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1_PAGE64"): (
+        "cake_fmha_context_fp8_34939d99183a1a6e0baa",
+        None,
+        False,
+    ),
 }
+# The FP8 runtime-size context programs: every length, head count, m-block
+# count and page size is a launch argument, so one program serves every causal
+# FP8 call without LSE or sink whose GQA group its pack (the query heads one
+# 128-row tile stage holds) divides; pack 1 serves every group.  Per target,
+# ``(pack_g, page_size)`` names the program: a page-64 program folds the page
+# arithmetic into constants, ``None`` serves every page size 16 .. 1024.  The
+# host consults them only for a call no exact route serves, and only where
+# they are not slower than the component's JIT module
+# (:func:`_context_fp8_runtime_serves`).
+_CONTEXT_FP8_RUNTIME_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
+    "sm100a": {
+        (8, 64): "RUNTIME_PACK8_PAGE64",
+        (4, 64): "RUNTIME_PACK4_PAGE64",
+        (2, 64): "RUNTIME_PACK2_PAGE64",
+        (1, 64): "RUNTIME_PACK1_PAGE64",
+        (8, None): "RUNTIME_PACK8",
+        (4, None): "RUNTIME_PACK4",
+        (2, None): "RUNTIME_PACK2",
+        (1, None): "RUNTIME_PACK1",
+    },
+    "sm103a": {
+        (8, 64): "RUNTIME_PACK8_PAGE64",
+        (4, 64): "RUNTIME_PACK4_PAGE64",
+        (2, 64): "RUNTIME_PACK2_PAGE64",
+        (1, 64): "RUNTIME_PACK1_PAGE64",
+        (8, None): "RUNTIME_PACK8",
+        (4, None): "RUNTIME_PACK4",
+        (2, None): "RUNTIME_PACK2",
+        (1, None): "RUNTIME_PACK1",
+    },
+}
+# The packs the runtime programs ship besides 1: a pack serves every GQA group
+# it divides.
+_CONTEXT_FP8_RUNTIME_PACKS = (8, 4, 2)
 # The binding's host parameters per component, in the kernel's order (then the
 # grid).  The quantized programs take the device-scale parameters in every
 # build; a host-scalar program never reads them.
@@ -423,9 +498,34 @@ _CONTEXT_HOST_PARAMS: dict[str, tuple[str, ...]] = {
         "bmm1_is_log2",
     ),
 }
+# A runtime-size FP8 program takes the sizes after the FP8 parameters: the
+# scale source (0: the host scalars, 1: the device scalars), the m-block count,
+# the whole 8-unit L2 sections of the tile order (``total_bh // 8``), the work
+# units per request, the query heads, the GQA group and the log2 page size.
+_CONTEXT_FP8_RUNTIME_PARAMS = (
+    *_CONTEXT_HOST_PARAMS["context_fp8"],
+    "scale_source",
+    "num_m_blocks",
+    "full_sections",
+    "num_bh_units",
+    "num_q_heads",
+    "heads_per_group",
+    "page_shift",
+)
 
 
-def _context_program_facts(program_name: str) -> tuple[str, int, bool]:
+def _context_program_params(
+    component: str, num_m_blocks: int | None
+) -> tuple[str, ...]:
+    """The host parameters of a pinned program's binding, in the kernel's order
+    (then the grid)."""
+
+    if num_m_blocks is None:
+        return _CONTEXT_FP8_RUNTIME_PARAMS
+    return _CONTEXT_HOST_PARAMS[component]
+
+
+def _context_program_facts(program_name: str) -> tuple[str, int | None, bool]:
     for (component, _), (name, num_m_blocks, one_tile) in _CONTEXT_PROGRAMS.items():
         if name == program_name:
             return component, num_m_blocks, one_tile
@@ -433,16 +533,24 @@ def _context_program_facts(program_name: str) -> tuple[str, int, bool]:
 
 
 def cake_fmha_context_launch_grid(
-    program, total_bh: int, sm_count: int
+    program, total_bh: int, sm_count: int, num_m_blocks: int | None = None
 ) -> tuple[int, int, int]:
     """The launch grid of one generated context program: a one-tile program
     launches one CTA per tile (``num_m_blocks x total_bh`` tiles, ``total_bh``
     the work units ``batch_size x num_q_heads / pack_g``), a persistent program
     ``min(sm_count, tiles)`` CTAs.  ``program`` is the generated loader's
-    ``CakeProgram`` record."""
+    ``CakeProgram`` record; ``num_m_blocks`` is the launch's m-block count,
+    required for a runtime-size program and else, when given, its pinned one."""
 
-    _, num_m_blocks, one_tile = _context_program_facts(program.name)
-    tiles = num_m_blocks * int(total_bh)
+    _, pinned, one_tile = _context_program_facts(program.name)
+    if pinned is None:
+        if num_m_blocks is None:
+            raise RuntimeError(f"{program.name} takes the m-block count per launch")
+    elif num_m_blocks is None:
+        num_m_blocks = pinned
+    elif int(num_m_blocks) != pinned:
+        raise RuntimeError(f"{program.name} runs {pinned} m-blocks, not {num_m_blocks}")
+    tiles = int(num_m_blocks) * int(total_bh)
     return (tiles if one_tile else min(int(sm_count), tiles)), 1, 1
 
 
@@ -2217,6 +2325,52 @@ def _context_pack_g(
     return group if packed < unpacked else 1
 
 
+def _context_fp8_runtime_pack(pack_g: int) -> int:
+    """The runtime-size FP8 program's pack for the JIT pack ``pack_g``
+    (:func:`_context_pack_g`): the largest shipped pack dividing it, else 1."""
+
+    for pack in _CONTEXT_FP8_RUNTIME_PACKS:
+        if pack_g % pack == 0:
+            return pack
+    return 1
+
+
+@functools.lru_cache(maxsize=1024)
+def _context_fp8_runtime_serves(
+    target: str,
+    batch_size: int,
+    max_q_len: int,
+    max_kv_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    pack_g: int,
+) -> bool:
+    """Whether a runtime-size FP8 program serves a causal call without LSE or
+    sink that no exact route serves (``False`` keeps the JIT module, whose
+    pack is ``pack_g``; a pure function of its arguments, cached like
+    :func:`_context_pack_g`)."""
+
+    pack = _context_fp8_runtime_pack(pack_g)
+    # A shipped pack below the JIT pack holds fewer query heads per tile: it
+    # may run more tile work than the JIT pack.
+    if pack != pack_g and (num_q_heads // pack) * _context_tile_mma_work(
+        max_q_len, max_kv_len, 2 * (128 // pack)
+    ) > (num_q_heads // pack_g) * _context_tile_mma_work(
+        max_q_len, max_kv_len, 2 * (128 // pack_g)
+    ):
+        return False
+    # sm100a: calls this long run back to back at the board power limit, where
+    # the runtime program's SM clock drops below the JIT module's: many
+    # (request, KV head) streams, or many query rows at long query lengths.
+    return not (
+        target == "sm100a"
+        and (
+            batch_size * num_kv_heads >= 2048
+            or (max_q_len >= 128 and batch_size * num_q_heads * max_q_len >= 1 << 20)
+        )
+    )
+
+
 def _context_hd256_workspace_supported(
     workspace_buffer: torch.Tensor | None,
     query: torch.Tensor,
@@ -2633,6 +2787,33 @@ def select_cake_fmha_context_route(
                 exact_profile,
             )
         )
+        # An FP8 call no exact route serves: the runtime-size program of its
+        # pack and page size, where it is not slower than the JIT module.
+        runtime = _CONTEXT_FP8_RUNTIME_ROUTES.get(target)
+        if (
+            program is None
+            and component == "context_fp8"
+            and runtime
+            and _context_fp8_runtime_serves(
+                target,
+                batch_size,
+                max_q_len,
+                max_kv_len,
+                num_q_heads,
+                num_kv_heads,
+                pack_g,
+            )
+        ):
+            pack = _context_fp8_runtime_pack(pack_g)
+            program = runtime.get((pack, page_size)) or runtime.get((pack, None))
+            if program is not None:
+                pack_g = pack
+                tok_per_stage = 128 // pack
+                num_m_blocks = (max_q_len + 2 * tok_per_stage - 1) // (
+                    2 * tok_per_stage
+                )
+                total_bh = batch_size * (num_q_heads // pack)
+                l2_swizzle = 8 if total_bh % 8 == 0 else 1
     return CakeFmhaContextRoute(
         target=target,
         component=component,
@@ -2665,6 +2846,12 @@ class CakeFmhaContextProgramModule:
         self.units_per_batch = route.num_q_heads // route.pack_g
         self.quantized = route.component != "context_bf16"
         _, self.num_m_blocks, self.one_tile = _context_program_facts(program.name)
+        # A runtime-size program serves every head count, page size and query
+        # length of its pack (the route's): the launch reads them off its
+        # tensors and lengths, and the scale form off its scale arguments.
+        self.runtime = self.num_m_blocks is None
+        self.pack_g = route.pack_g
+        self.m_block_tokens = 2 * (128 // route.pack_g)
 
     def cake_paged_attention_context(
         self,
@@ -2712,24 +2899,39 @@ class CakeFmhaContextProgramModule:
         pointers; a host-scalar program takes them as scalars and never reads
         the pointers.  The LSE, sink and Q-length pointers are unread (the
         programs write no LSE, take no sink and derive the query lengths from
-        ``cum_seq_lens_q``): they point at a small per-device buffer.
+        ``cum_seq_lens_q``): they point at a small per-device buffer.  A
+        runtime-size program also takes the scale source, the m-block count of
+        ``max_q_len``, the head counts, the GQA group and the log2 page size of
+        this launch.
         """
 
         route = self.route
-        if query.shape[1] != route.num_q_heads or key_cache.shape[1] != (
-            route.num_kv_heads
-        ):
-            raise RuntimeError(
-                "Cake FMHA context launch does not match its selected route"
-            )
         if lse is not None or attention_sinks is not None:
             # route selection keeps such calls on the JIT module: the unread
             # pointers below never stand in for a caller's LSE or sinks
             raise RuntimeError(
                 "a Cake FMHA context program writes no LSE and takes no sinks"
             )
-        total_bh = int(batch_size) * self.units_per_batch
-        tiles = self.num_m_blocks * total_bh
+        if self.runtime:
+            num_q_heads = query.shape[1]
+            units_per_batch = num_q_heads // self.pack_g
+            num_m_blocks = (int(max_q_len) + self.m_block_tokens - 1) // (
+                self.m_block_tokens
+            )
+            # the scale form of this call (one program serves both)
+            device_scales = isinstance(bmm1_scale, torch.Tensor)
+        elif query.shape[1] != route.num_q_heads or key_cache.shape[1] != (
+            route.num_kv_heads
+        ):
+            raise RuntimeError(
+                "Cake FMHA context launch does not match its selected route"
+            )
+        else:
+            units_per_batch = self.units_per_batch
+            num_m_blocks = self.num_m_blocks
+            device_scales = route.device_scales
+        total_bh = int(batch_size) * units_per_batch
+        tiles = num_m_blocks * total_bh
         num_ctas = tiles if self.one_tile else min(int(sm_count), tiles)
         device = query.device
         unread_f32, unread_i32 = _unread_pointers(device)
@@ -2766,7 +2968,7 @@ class CakeFmhaContextProgramModule:
             counter = counter.view(-1)
         if counter.dtype != torch.uint32:
             counter = counter.view(torch.uint32)
-        if route.device_scales:
+        if device_scales:
             # bmm1 arrives in log2 units (trtllm_batch_context_with_kv_cache
             # multiplies a device bmm1 scale by log2e).
             if not isinstance(bmm1_scale, torch.Tensor) or not isinstance(
@@ -2783,8 +2985,9 @@ class CakeFmhaContextProgramModule:
             output_scale, bmm1_is_log2 = float(bmm2_scale), 0
             bmm1_ptr = bmm2_ptr = unread_f32
         # The arguments in the binding's order: ``_CONTEXT_HOST_PARAMS`` of the
-        # component (LSE_ptr, sinks and seq_lens_q unread), then the grid; the
-        # order is checked against the record at load.
+        # component (LSE_ptr, sinks and seq_lens_q unread; a runtime-size
+        # program's sizes after them), then the grid; the order is checked
+        # against the record at load.
         if not self.quantized:
             arguments: tuple[Any, ...] = (
                 query,
@@ -2831,6 +3034,39 @@ class CakeFmhaContextProgramModule:
                 bmm1_ptr,
                 bmm2_ptr,
                 bmm1_is_log2,
+                num_ctas,
+                1,
+                1,
+            )
+        elif self.runtime:
+            arguments = (
+                query.view(torch.uint8),
+                key_cache.view(torch.uint8),
+                value_cache.view(torch.uint8),
+                out.view(torch.uint8),
+                unread_f32,
+                unread_f32,
+                page_table_k,
+                page_table_v,
+                unread_i32,
+                seq_lens,
+                cum_seq_lens_q,
+                softmax_scale_log2,
+                output_scale,
+                total_bh,
+                row_stride,
+                num_ctas,
+                counter,
+                bmm1_ptr,
+                bmm2_ptr,
+                bmm1_is_log2,
+                1 if device_scales else 0,
+                num_m_blocks,
+                total_bh // 8,
+                units_per_batch,
+                num_q_heads,
+                num_q_heads // key_cache.shape[1],
+                key_cache.shape[2].bit_length() - 1,
                 num_ctas,
                 1,
                 1,
@@ -2988,7 +3224,7 @@ def _load_cake_fmha_context_program(
         raise RuntimeError(
             f"{program.name} ships no {target!r} build; its targets are {list(program.targets)}"
         )
-    params = _CONTEXT_HOST_PARAMS[route.component]
+    params = _context_program_params(route.component, pinned[1])
     if tuple(program.args) != (*params, *GRID_ARGS):
         raise RuntimeError(
             f"the generated {program.name} binding takes {list(program.args)}; "

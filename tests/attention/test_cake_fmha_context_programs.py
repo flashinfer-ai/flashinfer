@@ -4,7 +4,9 @@ Host-only: the pinned program table against the generated loaders, the launch
 grid, the shape rows and their widened classes (any batch, every query length
 of the same m-block count) through ``select_cake_fmha_context_route`` on both
 targets (host and device scales), the routes that keep the components' JIT
-modules and the page tables the launch passes (views of the caller's storage).
+modules, the FP8 runtime-size route (every measured shape on both targets),
+the page tables the launch passes (views of the caller's storage) and the
+sizes a runtime-size program takes per launch.
 GPU: the BF16 programs (the one-tile ones at uniform query lengths, the
 persistent one at ragged query lengths; ragged KV lengths, CUDA graph replay
 with new lengths) against an FP32 reference; the FP8 / NVFP4 programs (host
@@ -63,12 +65,42 @@ SHAPE_ROWS = {
         "context_nvfp4", 4, 511, 2047, 32, 4, 16, True,
         {"sm100a": "Q511_SM100A", "sm103a": "Q511_SM103A"},
     ),
+    # FP8 calls no exact route serves: the runtime-size program of the pack
+    # (the largest shipped pack dividing the JIT pack) and the page size.
+    "fp8_b64_q32_k1024_g4": (
+        "context_fp8", 64, 32, 1024, 32, 8, 64, True,
+        {"sm100a": "RUNTIME_PACK4_PAGE64", "sm103a": "RUNTIME_PACK4_PAGE64"},
+    ),
+    "fp8_b16_q32_k1024_g16_page16": (
+        "context_fp8", 16, 32, 1024, 32, 2, 16, False,
+        {"sm100a": "RUNTIME_PACK8", "sm103a": "RUNTIME_PACK8"},
+    ),
+    "fp8_b2_q256_k2048_g3_page32": (
+        "context_fp8", 2, 256, 2048, 30, 10, 32, True,
+        {"sm100a": "RUNTIME_PACK1", "sm103a": "RUNTIME_PACK1"},
+    ),
+    "fp8_b4_q128_k1024_g6_page16": (
+        "context_fp8", 4, 128, 1024, 30, 5, 16, True,
+        {"sm100a": "RUNTIME_PACK2", "sm103a": "RUNTIME_PACK2"},
+    ),
 }  # fmt: skip
+# The device-scale program of a host-scale one; a runtime-size program serves
+# both scale forms itself.
 _DEVICE_SCALE_PROGRAM = {
     "B256": "B256_SCALE_PTR",
     "Q511_SM100A": "Q511_SCALE_PTR_SM100A",
     "Q511_SM103A": "Q511_SCALE_PTR_SM103A",
 }
+# runtime-size program identifier -> its pack
+_RUNTIME_PACK = {
+    identifier: pack
+    for routes in cake_api._CONTEXT_FP8_RUNTIME_ROUTES.values()
+    for (pack, _), identifier in routes.items()
+}
+
+
+def _device_scale_program(program):
+    return _DEVICE_SCALE_PROGRAM.get(program, program)
 
 
 def _loader(component):
@@ -90,6 +122,11 @@ def test_cake_fmha_context_program_table_matches_the_generated_loaders() -> None
     for target, routes in cake_api._CONTEXT_PROGRAM_ROUTES.items():
         for key, identifier in routes.items():
             served.setdefault((key[0], identifier), set()).add(_TARGET_ARCH[target])
+    for target, routes in cake_api._CONTEXT_FP8_RUNTIME_ROUTES.items():
+        for identifier in routes.values():
+            served.setdefault(("context_fp8", identifier), set()).add(
+                _TARGET_ARCH[target]
+            )
     assert set(served) == set(cake_api._CONTEXT_PROGRAMS)
     for (component, identifier), (
         name,
@@ -100,13 +137,17 @@ def test_cake_fmha_context_program_table_matches_the_generated_loaders() -> None
         assert isinstance(program, CakeProgram), identifier
         assert program.name == name, identifier
         assert served[(component, identifier)] <= set(program.targets), identifier
-        assert tuple(program.args) == (
-            *cake_api._CONTEXT_HOST_PARAMS[component],
-            *GRID_ARGS,
-        ), identifier
+        # a runtime-size program (no pinned m-block count) takes the sizes
+        params = (
+            cake_api._CONTEXT_FP8_RUNTIME_PARAMS
+            if num_m_blocks is None
+            else cake_api._CONTEXT_HOST_PARAMS[component]
+        )
+        assert tuple(program.args) == (*params, *GRID_ARGS), identifier
         assert tuple(program.block) == (512, 1, 1), identifier
         assert program.use_pdl is False and program.cooperative is False
         assert one_tile == (component == "context_bf16" and num_m_blocks in (11, 6))
+        assert (num_m_blocks is None) == (identifier in _RUNTIME_PACK), identifier
     for component in _COMPONENTS:
         pinned = {
             name
@@ -142,17 +183,39 @@ def test_cake_fmha_context_launch_grid() -> None:
     assert grid("B128", 4, 148) == (8, 1, 1)
     with pytest.raises(RuntimeError, match="not a Cake FMHA context program"):
         cake_api.cake_fmha_context_launch_grid(SimpleNamespace(name="x"), 1, 1)
+    # the pinned m-block count, given or not; another is refused
+    b128 = SimpleNamespace(name=names["B128"])
+    assert cake_api.cake_fmha_context_launch_grid(b128, 4, 148, 2) == (8, 1, 1)
+    with pytest.raises(RuntimeError, match="runs 2 m-blocks, not 3"):
+        cake_api.cake_fmha_context_launch_grid(b128, 4, 148, 3)
+
+    # A runtime-size program launches at most one persistent CTA per SM over
+    # the launch's own m-block count, which it requires.
+    runtime = SimpleNamespace(
+        name=cake_api._CONTEXT_PROGRAMS[("context_fp8", "RUNTIME_PACK8")][0]
+    )
+    assert cake_api.cake_fmha_context_launch_grid(runtime, 12, 148, 2) == (24, 1, 1)
+    assert cake_api.cake_fmha_context_launch_grid(runtime, 512, 148, 3) == (
+        148,
+        1,
+        1,
+    )
+    with pytest.raises(RuntimeError, match="takes the m-block count per launch"):
+        cake_api.cake_fmha_context_launch_grid(runtime, 12, 148)
 
 
 # --- The shape rows through route selection (host-only) ----------------------
 
 
 def _context_kwargs(row, *, device_scales=False, device="cpu", batch=None, q_len=None):
-    """Host-side ``select_cake_fmha_context_route`` inputs of one shape row
-    (``batch`` / ``q_len`` override the row's): empty tensors of the row's
-    shapes (the selector reads shapes, strides and dtypes only)."""
+    """Host-side ``select_cake_fmha_context_route`` inputs of one shape row (a
+    ``SHAPE_ROWS`` name or such a tuple; ``batch`` / ``q_len`` override the
+    row's): empty tensors of the row's shapes (the selector reads shapes,
+    strides and dtypes only)."""
 
-    component, row_batch, row_q_len, kv_len, hq, hkv, page, shared, _ = SHAPE_ROWS[row]
+    component, row_batch, row_q_len, kv_len, hq, hkv, page, shared, _ = (
+        SHAPE_ROWS[row] if isinstance(row, str) else row
+    )
     batch = row_batch if batch is None else batch
     q_len = row_q_len if q_len is None else q_len
     pages = (kv_len + page - 1) // page
@@ -233,12 +296,18 @@ def test_cake_fmha_context_route_serves_shape_rows_as_pinned(
             {"Q511": "q511", "Q257": "q257"}.get(program[:4])
         )
         return
+    if program in _RUNTIME_PACK:
+        # the runtime-size program's pack and the m-block count of the call
+        pack = _RUNTIME_PACK[program]
+        q_len = SHAPE_ROWS[row][2]
+        assert route.pack_g == pack
+        assert route.num_m_blocks == -(-q_len // (2 * (128 // pack)))
     device_route = cake_api.select_cake_fmha_context_route(
         torch.device("meta"), **_context_kwargs(row, device_scales=True, device="meta")
     )
     assert device_route is not None
     assert device_route.device_scales is True
-    assert device_route.program == _DEVICE_SCALE_PROGRAM[program]
+    assert device_route.program == _device_scale_program(program)
     # One device scale and one host scale: the host-scalar program (the
     # prefill host path resolves the device value first).
     mixed = cake_api.select_cake_fmha_context_route(
@@ -274,6 +343,9 @@ WIDENED_ROWS = {
     "nvfp4_q511_class_b127": ("nvfp4_b4_q511_k2047", 127, 511),
     "nvfp4_q511_class_b255": ("nvfp4_b4_q511_k2047", 255, 511),
     "nvfp4_q511_class_q481": ("nvfp4_b4_q511_k2047", 4, 481),
+    "fp8_runtime_g4_class_b1": ("fp8_b64_q32_k1024_g4", 1, 32),
+    "fp8_runtime_g4_class_b255": ("fp8_b64_q32_k1024_g4", 255, 32),
+    "fp8_runtime_g3_class_b5": ("fp8_b2_q256_k2048_g3_page32", 5, 256),
 }
 
 
@@ -291,7 +363,7 @@ def test_cake_fmha_context_widened_classes_route_to_the_row_program(
         )
         route = cake_api.select_cake_fmha_context_route(torch.device("meta"), **kwargs)
         assert route is not None and route.device_scales is device_scales
-        expected = _DEVICE_SCALE_PROGRAM[program] if device_scales else program
+        expected = _device_scale_program(program) if device_scales else program
         assert route.program == expected, (name, route)
 
 
@@ -302,12 +374,15 @@ def test_cake_fmha_context_widened_classes_route_to_the_row_program(
         ("bf16_b128_q64_k2048", {"lse": "lse"}),
         ("bf16_b128_q64_k2048", {"sinks": "sinks"}),
         ("fp8_b256_q32_k1024", {"lse": "lse"}),
+        ("fp8_b64_q32_k1024_g4", {"lse": "lse"}),
+        ("fp8_b64_q32_k1024_g4", {"sinks": "sinks"}),
+        ("fp8_b64_q32_k1024_g4", {"is_causal": False}),
+        ("fp8_b4_q128_k1024_g6_page16", {"is_causal": False}),
         ("nvfp4_b4_q511_k2047", {"sinks": "sinks"}),
         ("bf16_b128_q64_k2048", {"max_q_len": 32}),
         ("bf16_b128_q64_k2048", {"max_q_len": 65}),
         ("bf16_b1_q8192_k8192", {"max_q_len": 8160}),
         ("nvfp4_b4_q511_k2047", {"max_q_len": 480}),
-        ("fp8_b256_q32_k1024", {"max_q_len": 33}),
         ("bf16_b4_q511_k2047", {"max_kv_len": 2048}),
         ("bf16_b4_q511_k2047", {"kv_layout": "NHD"}),
         ("bf16_b4_q257_k1024_page1024", {"max_q_len": 256}),
@@ -343,7 +418,288 @@ def test_cake_fmha_context_routes_outside_the_programs_keep_the_jit_module(
     assert route is None or route.program is None, (row, mutation, route)
 
 
+# --- The FP8 runtime-size route (host-only) ---------------------------------
+
+# Every measured FP8 shape: (target, shape, batch, max_q_len, max_kv_len,
+# num_q_heads, num_kv_heads, the JIT pack, served by the runtime-size
+# program).  Each shape was timed against the JIT module in three fresh
+# back-to-back processes with an A/A band; a shape within 2 % of it counts as
+# a win only when it also wins under five seeded memory layouts.  The route
+# gives every measured loss to the JIT module, and every measured win but
+# three to the runtime-size program (sm100a ``g4_q4`` under the sm100a stream
+# rule, ``e_g5_causal`` on both targets under the tile-work rule).
+_FP8_RUNTIME_ROUTE_ROWS = [
+    ("sm103a", "g1_q4", 256, 4, 1024, 32, 32, 1, True),
+    ("sm103a", "g1_q32", 256, 32, 1024, 32, 32, 1, True),
+    ("sm103a", "g1_q256", 16, 256, 2048, 32, 32, 1, True),
+    ("sm103a", "g2_q4", 256, 4, 1024, 32, 16, 2, True),
+    ("sm103a", "g2_q32", 256, 32, 1024, 32, 16, 2, True),
+    ("sm103a", "g2_q256", 16, 256, 2048, 32, 16, 2, True),
+    ("sm103a", "g3_q4", 256, 4, 1024, 30, 10, 3, False),
+    ("sm103a", "g3_q32", 256, 32, 1024, 30, 10, 3, False),
+    ("sm103a", "g3_q256", 16, 256, 2048, 30, 10, 1, True),
+    ("sm103a", "g4_q4", 256, 4, 1024, 32, 8, 4, True),
+    ("sm103a", "g4_q32", 256, 32, 1024, 32, 8, 4, True),
+    ("sm103a", "g4_q256", 16, 256, 2048, 32, 8, 4, True),
+    ("sm103a", "g5_q4", 256, 4, 1024, 30, 6, 5, False),
+    ("sm103a", "g5_q32", 256, 32, 1024, 30, 6, 5, False),
+    ("sm103a", "g5_q256", 16, 256, 2048, 30, 6, 1, True),
+    ("sm103a", "g6_q4", 256, 4, 1024, 30, 5, 6, False),
+    ("sm103a", "g6_q32", 256, 32, 1024, 30, 5, 6, False),
+    ("sm103a", "g6_q256", 16, 256, 2048, 30, 5, 1, True),
+    ("sm103a", "g7_q4", 256, 4, 1024, 28, 4, 7, False),
+    ("sm103a", "g7_q32", 256, 32, 1024, 28, 4, 7, False),
+    ("sm103a", "g7_q256", 16, 256, 2048, 28, 4, 1, True),
+    ("sm103a", "g8_q4", 256, 4, 1024, 32, 4, 8, True),
+    ("sm103a", "g8_q32", 256, 32, 1024, 32, 4, 8, True),
+    ("sm103a", "g8_q256", 16, 256, 2048, 32, 4, 8, True),
+    ("sm103a", "g16_q4", 256, 4, 1024, 32, 2, 16, False),
+    ("sm103a", "g16_q32", 256, 32, 1024, 32, 2, 16, True),
+    ("sm103a", "g16_q256", 16, 256, 2048, 32, 2, 16, True),
+    ("sm103a", "g32_q4", 256, 4, 1024, 32, 1, 32, False),
+    ("sm103a", "g32_q32", 256, 32, 1024, 32, 1, 32, True),
+    ("sm103a", "g32_q256", 16, 256, 2048, 32, 1, 32, True),
+    ("sm103a", "g64_q4", 256, 4, 1024, 64, 1, 64, False),
+    ("sm103a", "g64_q32", 256, 32, 1024, 64, 1, 64, True),
+    ("sm103a", "g64_q256", 16, 256, 2048, 64, 1, 64, True),
+    ("sm103a", "g128_q4", 256, 4, 1024, 128, 1, 128, False),
+    ("sm103a", "g128_q32", 256, 32, 1024, 128, 1, 128, True),
+    ("sm103a", "g128_q256", 16, 256, 2048, 128, 1, 128, True),
+    ("sm103a", "contract", 256, 32, 1024, 32, 4, 8, True),
+    ("sm103a", "s_b256_g4", 256, 32, 1024, 32, 8, 4, True),
+    ("sm103a", "s_b256_g2", 256, 32, 1024, 32, 16, 2, True),
+    ("sm103a", "s_b64_q16_g8", 64, 16, 2048, 32, 4, 8, True),
+    ("sm103a", "s_b32_q128_g8", 32, 128, 4096, 32, 4, 8, True),
+    ("sm103a", "n_q1_b255_p64", 255, 1, 1024, 32, 4, 8, True),
+    ("sm103a", "n_g8_h64_q32_b3", 3, 32, 2000, 64, 8, 8, True),
+    ("sm103a", "e_g5_causal", 2, 200, 700, 10, 2, 5, False),
+    ("sm103a", "n_g4_q8_b6", 6, 8, 1024, 16, 4, 4, True),
+    ("sm103a", "n_q300_b2_p16", 2, 300, 1500, 32, 4, 8, True),
+    ("sm103a", "e_tail_h64", 1, 1000, 1333, 64, 8, 8, True),
+    ("sm103a", "g1_q64", 256, 64, 1024, 32, 32, 1, True),
+    ("sm103a", "g1_q128", 256, 128, 1024, 32, 32, 1, True),
+    ("sm103a", "g2_q64", 256, 64, 1024, 32, 16, 2, True),
+    ("sm103a", "g2_q128", 256, 128, 1024, 32, 16, 2, True),
+    ("sm103a", "g4_q64", 256, 64, 1024, 32, 8, 4, True),
+    ("sm103a", "g4_q128", 256, 128, 1024, 32, 8, 4, True),
+    ("sm103a", "g8_q64", 256, 64, 1024, 32, 4, 8, True),
+    ("sm103a", "g8_q128", 256, 128, 1024, 32, 4, 8, True),
+    ("sm103a", "g3_q64", 256, 64, 1024, 30, 10, 3, False),
+    ("sm103a", "g3_q128", 256, 128, 1024, 30, 10, 3, False),
+    ("sm103a", "g5_q64", 256, 64, 1024, 30, 6, 5, False),
+    ("sm103a", "g5_q128", 256, 128, 1024, 30, 6, 5, False),
+    ("sm103a", "g5_q192", 256, 192, 1024, 30, 6, 5, False),
+    ("sm103a", "g6_q64", 256, 64, 1024, 30, 5, 6, False),
+    ("sm103a", "g6_q128", 256, 128, 1024, 30, 5, 6, True),
+    ("sm103a", "g7_q64", 256, 64, 1024, 28, 4, 7, False),
+    ("sm103a", "g7_q128", 256, 128, 1024, 28, 4, 7, False),
+    ("sm103a", "g7_q192", 256, 192, 1024, 28, 4, 7, False),
+    ("sm103a", "g16_q16", 256, 16, 1024, 32, 2, 16, False),
+    ("sm103a", "g32_q16", 256, 16, 1024, 32, 1, 32, False),
+    ("sm100a", "g1_q4", 256, 4, 1024, 32, 32, 1, False),
+    ("sm100a", "g1_q32", 256, 32, 1024, 32, 32, 1, False),
+    ("sm100a", "g1_q256", 16, 256, 2048, 32, 32, 1, True),
+    ("sm100a", "g2_q4", 256, 4, 1024, 32, 16, 2, False),
+    ("sm100a", "g2_q32", 256, 32, 1024, 32, 16, 2, False),
+    ("sm100a", "g2_q256", 16, 256, 2048, 32, 16, 2, True),
+    ("sm100a", "g3_q4", 256, 4, 1024, 30, 10, 3, False),
+    ("sm100a", "g3_q32", 256, 32, 1024, 30, 10, 3, False),
+    ("sm100a", "g3_q256", 16, 256, 2048, 30, 10, 1, True),
+    ("sm100a", "g4_q4", 256, 4, 1024, 32, 8, 4, False),
+    ("sm100a", "g4_q32", 256, 32, 1024, 32, 8, 4, False),
+    ("sm100a", "g4_q256", 16, 256, 2048, 32, 8, 4, True),
+    ("sm100a", "g5_q4", 256, 4, 1024, 30, 6, 5, False),
+    ("sm100a", "g5_q32", 256, 32, 1024, 30, 6, 5, False),
+    ("sm100a", "g5_q256", 16, 256, 2048, 30, 6, 1, True),
+    ("sm100a", "g6_q4", 256, 4, 1024, 30, 5, 6, False),
+    ("sm100a", "g6_q32", 256, 32, 1024, 30, 5, 6, False),
+    ("sm100a", "g6_q256", 16, 256, 2048, 30, 5, 1, True),
+    ("sm100a", "g7_q4", 256, 4, 1024, 28, 4, 7, False),
+    ("sm100a", "g7_q32", 256, 32, 1024, 28, 4, 7, False),
+    ("sm100a", "g7_q256", 16, 256, 2048, 28, 4, 1, True),
+    ("sm100a", "g8_q4", 256, 4, 1024, 32, 4, 8, True),
+    ("sm100a", "g8_q32", 256, 32, 1024, 32, 4, 8, True),
+    ("sm100a", "g8_q256", 16, 256, 2048, 32, 4, 8, True),
+    ("sm100a", "g16_q4", 256, 4, 1024, 32, 2, 16, False),
+    ("sm100a", "g16_q32", 256, 32, 1024, 32, 2, 16, True),
+    ("sm100a", "g16_q256", 16, 256, 2048, 32, 2, 16, True),
+    ("sm100a", "g32_q4", 256, 4, 1024, 32, 1, 32, False),
+    ("sm100a", "g32_q32", 256, 32, 1024, 32, 1, 32, True),
+    ("sm100a", "g32_q256", 16, 256, 2048, 32, 1, 32, True),
+    ("sm100a", "g64_q4", 256, 4, 1024, 64, 1, 64, False),
+    ("sm100a", "g64_q32", 256, 32, 1024, 64, 1, 64, True),
+    ("sm100a", "g64_q256", 16, 256, 2048, 64, 1, 64, True),
+    ("sm100a", "g128_q4", 256, 4, 1024, 128, 1, 128, False),
+    ("sm100a", "g128_q32", 256, 32, 1024, 128, 1, 128, True),
+    ("sm100a", "g128_q256", 16, 256, 2048, 128, 1, 128, True),
+    ("sm100a", "contract", 256, 32, 1024, 32, 4, 8, True),
+    ("sm100a", "s_b256_g4", 256, 32, 1024, 32, 8, 4, False),
+    ("sm100a", "s_b256_g2", 256, 32, 1024, 32, 16, 2, False),
+    ("sm100a", "s_b64_q16_g8", 64, 16, 2048, 32, 4, 8, True),
+    ("sm100a", "s_b32_q128_g8", 32, 128, 4096, 32, 4, 8, True),
+    ("sm100a", "n_q1_b255_p64", 255, 1, 1024, 32, 4, 8, True),
+    ("sm100a", "n_g8_h64_q32_b3", 3, 32, 2000, 64, 8, 8, True),
+    ("sm100a", "e_g5_causal", 2, 200, 700, 10, 2, 5, False),
+    ("sm100a", "n_g4_q8_b6", 6, 8, 1024, 16, 4, 4, True),
+    ("sm100a", "n_q300_b2_p16", 2, 300, 1500, 32, 4, 8, True),
+    ("sm100a", "e_tail_h64", 1, 1000, 1333, 64, 8, 8, True),
+    ("sm100a", "g1_q64", 256, 64, 1024, 32, 32, 1, False),
+    ("sm100a", "g1_q128", 256, 128, 1024, 32, 32, 1, False),
+    ("sm100a", "g2_q64", 256, 64, 1024, 32, 16, 2, False),
+    ("sm100a", "g2_q128", 256, 128, 1024, 32, 16, 2, False),
+    ("sm100a", "g4_q64", 256, 64, 1024, 32, 8, 4, False),
+    ("sm100a", "g4_q128", 256, 128, 1024, 32, 8, 4, False),
+    ("sm100a", "g8_q64", 256, 64, 1024, 32, 4, 8, True),
+    ("sm100a", "g8_q128", 256, 128, 1024, 32, 4, 8, False),
+    ("sm100a", "g1_q32_b64", 64, 32, 1024, 32, 32, 1, False),
+    ("sm100a", "g1_q32_b128", 128, 32, 1024, 32, 32, 1, False),
+    ("sm100a", "g2_q32_b64", 64, 32, 1024, 32, 16, 2, True),
+    ("sm100a", "g2_q32_b128", 128, 32, 1024, 32, 16, 2, False),
+    ("sm100a", "g4_q32_b64", 64, 32, 1024, 32, 8, 4, True),
+    ("sm100a", "g4_q32_b128", 128, 32, 1024, 32, 8, 4, True),
+    ("sm100a", "g8_q128_b64", 64, 128, 1024, 32, 4, 8, True),
+    ("sm100a", "g8_q128_b128", 128, 128, 1024, 32, 4, 8, True),
+    ("sm100a", "g4_q128_b64", 64, 128, 1024, 32, 8, 4, True),
+    ("sm100a", "g4_q128_b128", 128, 128, 1024, 32, 8, 4, True),
+    ("sm100a", "g3_q64", 256, 64, 1024, 30, 10, 3, False),
+    ("sm100a", "g3_q128", 256, 128, 1024, 30, 10, 3, False),
+    ("sm100a", "g5_q64", 256, 64, 1024, 30, 6, 5, False),
+    ("sm100a", "g5_q128", 256, 128, 1024, 30, 6, 5, False),
+    ("sm100a", "g5_q192", 256, 192, 1024, 30, 6, 5, False),
+    ("sm100a", "g6_q64", 256, 64, 1024, 30, 5, 6, False),
+    ("sm100a", "g6_q128", 256, 128, 1024, 30, 5, 6, True),
+    ("sm100a", "g7_q64", 256, 64, 1024, 28, 4, 7, False),
+    ("sm100a", "g7_q128", 256, 128, 1024, 28, 4, 7, False),
+    ("sm100a", "g7_q192", 256, 192, 1024, 28, 4, 7, False),
+    ("sm100a", "g16_q16", 256, 16, 1024, 32, 2, 16, False),
+    ("sm100a", "g32_q16", 256, 16, 1024, 32, 1, 32, False),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    (
+        "target",
+        "shape",
+        "batch",
+        "max_q",
+        "max_kv",
+        "num_q_heads",
+        "num_kv_heads",
+        "pack_g",
+        "serves",
+    ),
+    _FP8_RUNTIME_ROUTE_ROWS,
+    ids=[f"{row[0]}-{row[1]}" for row in _FP8_RUNTIME_ROUTE_ROWS],
+)
+def test_cake_fmha_context_fp8_runtime_route(
+    monkeypatch,
+    target,
+    shape,
+    batch,
+    max_q,
+    max_kv,
+    num_q_heads,
+    num_kv_heads,
+    pack_g,
+    serves,
+) -> None:
+    """The row's JIT pack, the predicate's route and the route selection
+    takes for a causal FP8 call of the row's shape with 16-token pages (no
+    exact route): the runtime-size program of the largest shipped pack
+    dividing the JIT pack, or the JIT module."""
+
+    assert cake_api._context_pack_g(max_q, max_kv, num_q_heads, num_kv_heads) == pack_g
+    assert (
+        cake_api._context_fp8_runtime_serves(
+            target, batch, max_q, max_kv, num_q_heads, num_kv_heads, pack_g
+        )
+        is serves
+    )
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    row = (
+        "context_fp8",
+        batch,
+        max_q,
+        max_kv,
+        num_q_heads,
+        num_kv_heads,
+        16,
+        True,
+        None,
+    )
+    route = cake_api.select_cake_fmha_context_route(
+        torch.device("meta"), **_context_kwargs(row, device="meta")
+    )
+    assert route is not None and route.component == "context_fp8"
+    if serves:
+        pack = cake_api._context_fp8_runtime_pack(pack_g)
+        assert pack_g % pack == 0 and pack in (1, 2, 4, 8)
+        assert route.program == f"RUNTIME_PACK{pack}" and route.pack_g == pack
+    else:
+        assert route.program is None and route.pack_g == pack_g
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+def test_cake_fmha_context_fp8_exact_routes_come_first(monkeypatch, target) -> None:
+    """The exact routes keep their keys; a call of the exact class off its
+    m-block count takes the runtime-size program of its pack and page size,
+    for host and device scales alike."""
+
+    routes = cake_api._CONTEXT_PROGRAM_ROUTES[target]
+    assert routes[("context_fp8", "host", 32, 4, 8, 1, 64, None)] == "B256"
+    assert routes[("context_fp8", "device", 32, 4, 8, 1, 64, None)] == "B256_SCALE_PTR"
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    pack = cake_api._context_fp8_runtime_pack(cake_api._context_pack_g(33, 1024, 32, 4))
+    for device_scales in (False, True):
+        kwargs = _context_kwargs(
+            "fp8_b256_q32_k1024", device_scales=device_scales, device="meta", q_len=33
+        )
+        route = cake_api.select_cake_fmha_context_route(torch.device("meta"), **kwargs)
+        assert route is not None and route.device_scales is device_scales
+        assert route.program == f"RUNTIME_PACK{pack}_PAGE64", route
+        assert route.num_m_blocks == -(-33 // (2 * (128 // pack)))
+
+
 # --- The page tables a launch passes (host-only) -----------------------------
+
+
+def _stand_in_module(
+    component="context_bf16", identifier="B128", *, device_scales=False
+):
+    """The program module of a stand-in record (``B128`` unless ``component``
+    / ``identifier`` name another) for 32 query heads over 4 KV heads and
+    16-token pages, whose entry keeps every call's arguments
+    (``module.calls``)."""
+
+    name, num_m_blocks, _ = cake_api._CONTEXT_PROGRAMS[(component, identifier)]
+    args = (
+        *cake_api._context_program_params(component, num_m_blocks),
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    )
+    calls = []
+    record = SimpleNamespace(
+        name=name, args=args, entry=lambda target: lambda *values: calls.append(values)
+    )
+    route = cake_api.CakeFmhaContextRoute(
+        target="sm100a",
+        component=component,
+        num_m_blocks=2 if num_m_blocks is None else num_m_blocks,
+        num_q_heads=32,
+        num_kv_heads=4,
+        pack_g=_RUNTIME_PACK.get(identifier, 8),
+        page_size=16,
+        l2_swizzle=1,
+        is_causal=True,
+        return_lse=False,
+        enable_sink=False,
+        device_scales=device_scales,
+        program=identifier,
+    )
+    module = cake_api.CakeFmhaContextProgramModule(route, record, "sm_100a")
+    module.calls = calls
+    return module
 
 
 def _launch_values(
@@ -356,35 +712,17 @@ def _launch_values(
     identifier="B128",
     device_scales=False,
     device=None,
+    module=None,
     **overrides,
 ):
     """The argument values a stand-in program record (``B128`` unless
-    ``component`` / ``identifier`` name another) receives from
-    ``cake_paged_attention_context`` on CPU tensors, by name; ``overrides``
-    replace launch keywords (e.g. device-scale tensors)."""
+    ``component`` / ``identifier`` name another, or the record of ``module``)
+    receives from one ``cake_paged_attention_context`` on CPU tensors, by name;
+    ``overrides`` replace launch keywords (e.g. device-scale tensors)."""
 
-    name, num_m_blocks, _ = cake_api._CONTEXT_PROGRAMS[(component, identifier)]
-    args = (*cake_api._CONTEXT_HOST_PARAMS[component], "grid_x", "grid_y", "grid_z")
-    calls = []
-    record = SimpleNamespace(
-        name=name, args=args, entry=lambda target: lambda *values: calls.append(values)
-    )
-    route = cake_api.CakeFmhaContextRoute(
-        target="sm100a",
-        component=component,
-        num_m_blocks=num_m_blocks,
-        num_q_heads=32,
-        num_kv_heads=4,
-        pack_g=8,
-        page_size=16,
-        l2_swizzle=1,
-        is_causal=True,
-        return_lse=False,
-        enable_sink=False,
-        device_scales=device_scales,
-        program=identifier,
-    )
-    module = cake_api.CakeFmhaContextProgramModule(route, record, "sm_100a")
+    if module is None:
+        module = _stand_in_module(component, identifier, device_scales=device_scales)
+    component = module.route.component
     monkeypatch.setattr(
         cake_api, "_torch_stream_context", lambda device: contextlib.nullcontext()
     )
@@ -432,12 +770,13 @@ def _launch_values(
         lse_stride_heads=0,
     )
     keywords.update(overrides)
+    calls = len(module.calls)
     module.cake_paged_attention_context(**keywords)
-    (values,) = calls
+    assert len(module.calls) == calls + 1
     # the unread pointers arrive as FFI tensors: read them back as torch views
     return {
         name: torch.from_dlpack(value) if isinstance(value, tvm_ffi.Tensor) else value
-        for name, value in zip(args, values, strict=True)
+        for name, value in zip(module.program.args, module.calls[-1], strict=True)
     }
 
 
@@ -591,6 +930,79 @@ def test_cake_context_program_device_scales_reach_the_binding_as_given(
 
     plain = _launch_values(monkeypatch, tables, shared=True, batch=batch)
     assert plain["LSE_ptr"].data_ptr() == plain["seq_lens_q"].data_ptr() == unread
+
+
+def test_cake_context_runtime_program_takes_the_sizes_of_each_launch(
+    monkeypatch,
+) -> None:
+    """One runtime-size program serves launches of other head counts, page
+    sizes, query lengths, batches and scale forms in a row: each passes its
+    own sizes (the m-blocks of ``max_q_len``, the whole 8-unit sections, the
+    units per request, the GQA group, the log2 page size) and scale source,
+    and the device scales are the caller's tensors."""
+
+    module = _stand_in_module("context_fp8", "RUNTIME_PACK8")
+    unread = _placeholder(torch.device("cpu"))
+
+    # 3 requests of 64 query tokens, 32 query heads over 4 KV heads, 16-token
+    # pages, host scales
+    batch = 3
+    tables = torch.arange(batch * 4, dtype=torch.int32).view(batch, 4)
+    first = _launch_values(monkeypatch, tables, shared=True, batch=batch, module=module)
+    assert (first["num_q_heads"], first["heads_per_group"]) == (32, 8)
+    assert (first["num_bh_units"], first["total_bh"], first["full_sections"]) == (
+        4,
+        12,
+        1,
+    )
+    assert first["num_m_blocks"] == 2 and first["page_shift"] == 4
+    assert (first["scale_source"], first["bmm1_is_log2"]) == (0, 0)
+    assert first["num_ctas"] == first["grid_x"] == 24
+    assert first["softmax_scale_log2"] == pytest.approx(0.125 * cake_api.log2e)
+    assert first["bmm1_scale_ptr"].data_ptr() == unread
+    assert first["bmm2_scale_ptr"].data_ptr() == unread
+
+    # 5 requests of 100 query tokens, 16 query heads over 2 KV heads, 64-token
+    # pages, device scales
+    batch, q_len = 5, 100
+    query = torch.zeros((batch * q_len, 16, 128), dtype=torch.float8_e4m3fn)
+    key = torch.zeros((8, 2, 64, 128), dtype=torch.float8_e4m3fn)
+    bmm1 = torch.tensor([0.25], dtype=torch.float32)
+    bmm2 = torch.tensor(0.5, dtype=torch.float32)
+    offsets = torch.arange(0, q_len * (batch + 1), q_len, dtype=torch.int32)
+    second = _launch_values(
+        monkeypatch,
+        torch.arange(batch * 2, dtype=torch.int32).view(batch, 2),
+        shared=True,
+        batch=batch,
+        module=module,
+        query=query,
+        out=torch.empty_like(query),
+        key_cache=key,
+        value_cache=torch.empty_like(key),
+        seq_lens=torch.full((batch,), q_len, dtype=torch.int32),
+        max_q_len=q_len,
+        max_kv_len=q_len,
+        cum_seq_lens_q=offsets,
+        cum_seq_lens_kv=offsets,
+        bmm1_scale=bmm1,
+        bmm2_scale=bmm2,
+    )
+    assert (second["num_q_heads"], second["heads_per_group"]) == (16, 8)
+    assert (second["num_bh_units"], second["total_bh"], second["full_sections"]) == (
+        2,
+        10,
+        1,
+    )
+    assert second["num_m_blocks"] == 4 and second["page_shift"] == 6
+    assert (second["scale_source"], second["bmm1_is_log2"]) == (1, 1)
+    assert second["num_ctas"] == second["grid_x"] == 40
+    assert second["bmm1_scale_ptr"].data_ptr() == bmm1.data_ptr()
+    assert second["bmm2_scale_ptr"].data_ptr() == bmm2.data_ptr()
+    assert second["Q"].data_ptr() == query.data_ptr()
+    for name in ("LSE_ptr", "sinks", "seq_lens_q"):
+        assert second[name].data_ptr() == unread
+    assert len(module.calls) == 2
 
 
 @pytest.mark.parametrize("given", ("lse", "attention_sinks"))
@@ -822,6 +1234,16 @@ def test_cake_context_bf16_programs_match_reference_and_replay(
                  page_size=16, max_q_len=511, max_kv_len=1536, device_scale=True),
             "Q511_SCALE_PTR",
         ),
+        (
+            dict(q_dtype="fp8", o_dtype="fp8", kv_dtype="fp8", batch_size=2,
+                 page_size=16, max_q_len=32, max_kv_len=159, device_scale=False),
+            "RUNTIME_PACK",
+        ),
+        (
+            dict(q_dtype="fp8", o_dtype="fp8", kv_dtype="fp8", batch_size=3,
+                 page_size=16, max_q_len=200, max_kv_len=700, device_scale=True),
+            "RUNTIME_PACK",
+        ),
     ],
 )  # fmt: skip
 def test_cake_context_quantized_programs_match_reference(
@@ -852,6 +1274,13 @@ def test_cake_context_quantized_programs_match_reference(
         uses_shared_paged_kv_idx=True,
         **case,
     )
+    if program == "RUNTIME_PACK":
+        # 16-token pages: no exact route; a runtime-size program of any page
+        assert served_programs and all(
+            served in _RUNTIME_PACK and not served.endswith("_PAGE64")
+            for served in served_programs
+        ), served_programs
+        return
     assert program in served_programs
 
 
@@ -864,6 +1293,10 @@ BITWISE_ROWS = {
     "bf16_b128_q64_k2048": ("bf16_b128_q64_k2048", 128, 64),
     "fp8_b256_q32_k1024": ("fp8_b256_q32_k1024", 256, 32),
     "nvfp4_b4_q511_k2047": ("nvfp4_b4_q511_k2047", 4, 511),
+    "fp8_b64_q32_k1024_g4": ("fp8_b64_q32_k1024_g4", 64, 32),
+    "fp8_b16_q32_k1024_g16_page16": ("fp8_b16_q32_k1024_g16_page16", 16, 32),
+    "fp8_b2_q256_k2048_g3_page32": ("fp8_b2_q256_k2048_g3_page32", 2, 256),
+    "fp8_b4_q128_k1024_g6_page16": ("fp8_b4_q128_k1024_g6_page16", 4, 128),
     **WIDENED_ROWS,
 }
 _SCALES = {"context_bf16": (128**-0.5, 1.0)}
@@ -999,8 +1432,9 @@ def test_cake_context_programs_match_the_jit_route_bitwise(
     monkeypatch, served_programs, name
 ) -> None:
     """The program's output is bitwise the component's JIT route's (the route
-    without the program table) on its row and its widened class; with device
-    scales the device-scale program's output is bitwise the host-scale one."""
+    without the program tables; for a runtime-size program, the JIT module at
+    its own pack) on its row and its widened class; with device scales the
+    device-scale program's output is bitwise the host-scale one."""
 
     row, batch, max_q = BITWISE_ROWS[name]
     case = _context_case(row, batch, max_q)
@@ -1009,9 +1443,10 @@ def test_cake_context_programs_match_the_jit_route_bitwise(
     assert served_programs == [program]
     if case.component != "context_bf16":
         device_out = _run_context(case, device_scales=True)
-        assert served_programs[-1] == _DEVICE_SCALE_PROGRAM[program]
+        assert served_programs[-1] == _device_scale_program(program)
         assert torch.equal(_bits(device_out), _bits(out))
     monkeypatch.setattr(cake_api, "_CONTEXT_PROGRAM_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_FP8_RUNTIME_ROUTES", {})
     served = len(served_programs)
     jit_out = _run_context(case)
     assert len(served_programs) == served
@@ -1021,10 +1456,57 @@ def test_cake_context_programs_match_the_jit_route_bitwise(
     )
 
 
+#: FP8 rows with requests that hold fewer keys than query tokens: (batch,
+#: max_q, KV lengths).  Under the bottom-right causal mask the first query
+#: rows of such a request see no key.
+SHORT_KV_ROWS = {
+    "fp8_b256_q32_k1024": (3, 32, (1024, 17, 1)),
+    "fp8_b64_q32_k1024_g4": (3, 32, (1024, 17, 1)),
+    "fp8_b16_q32_k1024_g16_page16": (3, 32, (1024, 5, 31)),
+    "fp8_b2_q256_k2048_g3_page32": (2, 256, (2048, 100)),
+    "fp8_b4_q128_k1024_g6_page16": (3, 128, (1024, 40, 127)),
+}
+
+
+@_GPU
+@pytest.mark.parametrize("name", sorted(SHORT_KV_ROWS))
+def test_cake_context_programs_match_the_jit_route_with_fewer_keys_than_queries(
+    monkeypatch, served_programs, name
+) -> None:
+    """A batch whose requests hold fewer keys than query tokens (the first
+    query rows of such a request see no key): the program's output, those
+    rows included, is bitwise the component's JIT route's."""
+
+    batch, max_q, kv_lens = SHORT_KV_ROWS[name]
+    case = _context_case(name, batch, max_q)
+    case.seq_lens = torch.tensor(kv_lens, dtype=torch.int32, device="cuda")
+    case.cum_kv = torch.cat(
+        (
+            torch.zeros(1, dtype=torch.int32, device="cuda"),
+            case.seq_lens.cumsum(0, dtype=torch.int32),
+        )
+    )
+    program = case.programs[cake_api._cake_fmha_target(torch.device("cuda"))]
+    out = _run_context(case)
+    assert served_programs == [program]
+    monkeypatch.setattr(cake_api, "_CONTEXT_PROGRAM_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_FP8_RUNTIME_ROUTES", {})
+    jit_out = _run_context(case)
+    assert served_programs == [program]
+    assert torch.equal(_bits(jit_out), _bits(out)), (
+        f"{name}: max abs difference "
+        f"{(jit_out.float() - out.float()).abs().nan_to_num(posinf=1e9).max().item()}"
+    )
+
+
 @_GPU
 @pytest.mark.parametrize(
     ("row", "batch", "max_q"),
-    [("bf16_b128_q64_k2048", 3, 64), ("fp8_b256_q32_k1024", 3, 32)],
+    [
+        ("bf16_b128_q64_k2048", 3, 64),
+        ("fp8_b256_q32_k1024", 3, 32),
+        ("fp8_b64_q32_k1024_g4", 3, 32),
+    ],
 )
 def test_cake_context_program_launch_invariances_are_bitwise(
     served_programs, row, batch, max_q
@@ -1102,7 +1584,11 @@ def test_cake_context_program_launch_invariances_are_bitwise(
 @pytest.mark.parametrize("explicit_stream", (False, True))
 @pytest.mark.parametrize(
     ("row", "batch", "max_q"),
-    [("bf16_b128_q64_k2048", 3, 64), ("fp8_b256_q32_k1024", 3, 32)],
+    [
+        ("bf16_b128_q64_k2048", 3, 64),
+        ("fp8_b256_q32_k1024", 3, 32),
+        ("fp8_b64_q32_k1024_g4", 3, 32),
+    ],
 )
 def test_cake_context_program_launches_on_the_current_torch_stream(
     monkeypatch, served_programs, row, batch, max_q, explicit_stream
