@@ -251,7 +251,11 @@ Cake-generated parametric persistent kernel per deployment, JIT-compiled from
 `flashinfer/moe_ep/kernel_src/sm120/cake_mxfp4_megamoe/`) has its own target,
 `bash tests/moe_ep/run_tests.sh mega_sm120_cake` (4 GPUs; `NPROC_CAKE_SM120=8`
 for a full host). It needs NCCL 2.30.7 with the Device API (`NCCL_HOME`), and on
-multi-GPU PCIe hosts a pinned `NCCL_TOPO_FILE`. Sixteen ranks over two hosts run
+multi-GPU PCIe hosts a pinned `NCCL_TOPO_FILE`. The target is not part of `all`; PR CI runs only
+this script's `unit` target, which covers the backend's host tests
+(`test_sm120_w4a8_cake_host.py`) but none of its multi-GPU tests, so run
+`mega_sm120_cake` by hand on such a host before changing the backend, its kernel
+package or the shared moe_ep layer code it uses. Sixteen ranks over two hosts run
 the same modules under a two-node torchrun (`--nnodes 2 --nproc_per_node 8`,
 `NCCL_GIN_ENABLE=1`); cross-host pairs use GIN, the transport table may keep LSA
 inside each host. Each EP-rank pair moves dispatch payloads and expert results over

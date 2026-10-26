@@ -16,20 +16,42 @@ limitations under the License.
 
 import torch
 
-from flashinfer.prefill import prepare_nvfp4_attention
+from flashinfer.prefill import nvfp4_attention_workspace_bytes, prepare_nvfp4_attention
 
 
 def main():
     torch.manual_seed(42)
-    q = torch.randn((4, 8, 4096, 128), dtype=torch.bfloat16, device="cuda")
-    k, v = torch.randn_like(q), torch.randn_like(q)
-    output = torch.empty_like(q)
-    attention = prepare_nvfp4_attention(q, k, v, output, backend="cake")
-    attention()
+    batch, heads, seqlen = 1, 40, 4800
+    # An [B, S, H, 128] activation buffer, passed as its logical [B, H, S, 128] view and read in place.
+    storage = torch.randn(
+        (batch, seqlen, heads, 128), dtype=torch.bfloat16, device="cuda"
+    )
+    q = storage.transpose(1, 2)
+    k, v = (
+        torch.randn_like(storage).transpose(1, 2),
+        torch.randn_like(storage).transpose(1, 2),
+    )
+    output = torch.empty_like(storage).transpose(1, 2)
+    # One workspace per problem size; a caller may pool one of the largest size.
+    workspace = torch.empty(
+        nvfp4_attention_workspace_bytes(batch, heads, seqlen, q.device),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    attention = prepare_nvfp4_attention(
+        q, k, v, output, backend="cake", workspace=workspace
+    )
+    # The whole chain: statistics, quantization, on SM100 / SM103 the block-mean compensation table, attention.
+    attention()  # values are re-read on every launch
     torch.cuda.synchronize()
     reference = torch.nn.functional.scaled_dot_product_attention(q, k, v)
     torch.testing.assert_close(output, reference, atol=1.0, rtol=0.1)
-    print("NVFP4 attention output:", tuple(output.shape), output.dtype)
+    print(
+        "NVFP4 attention output:",
+        tuple(output.shape),
+        output.dtype,
+        attention.route_metadata["arch"],
+    )
 
 
 if __name__ == "__main__":

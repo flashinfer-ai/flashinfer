@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 import torch
+import tvm_ffi
 
 from .jit.cake_fmha import (
     CakeFmhaTarget,
@@ -48,7 +49,7 @@ from .cake_fmha_request_ordered import (
 from .cake_fmha_request_ordered import (
     _run_cake_fmha_request_ordered_paged_decode as _run_cake_fmha_request_ordered_paged_decode,
 )
-from .utils import get_compute_capability
+from .utils import get_compute_capability, log2e
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,8 @@ class CakeFmhaDecodeRoute:
     use_scale_ptr: bool
     retain_kv_l2: bool
     component: Literal[
+        "decode_aligned_bf16",
+        "decode_aligned_fp16",
         "decode_balanced_bf16",
         "decode_balanced_fp16",
         "decode_balanced_fp8",
@@ -87,6 +90,10 @@ class CakeFmhaDecodeRoute:
     # The caller passed an ``lse`` output.  The exact-shape decode-native BF16
     # members never write it, so such a route is served by the generic member.
     return_lse: bool = False
+    # Aligned hd128 q1 decode: the identifier of the generated program
+    # (``flashinfer.jit.cake_fmha_aligned.ALIGNED_C<cluster>_<DTYPE>``) whose
+    # cluster size ``aligned_cluster_size`` selected; ``None`` on every other route.
+    aligned_program: str | None = None
 
 
 CakeFmhaContextComponent = Literal[
@@ -217,10 +224,82 @@ _AUTHENTICATED_JIT_COMPONENTS = frozenset(
     }
 )
 
+# The aligned hd128 q1 decode programs are not registry components: they ship
+# as the generated in-tree unit ``csrc/cake_fmha_aligned/`` whose loader
+# ``flashinfer.jit.cake_fmha_aligned`` publishes one ``CakeProgram`` constant
+# per cluster size and dtype, authenticated by the program's content digest.
+# A route's component chain is its one program identifier, and the route is
+# optimized exactly when that identifier is one of these.  The table pins the
+# delivered record of each identifier: ``(cluster_size, dtype, program name)``;
+# a loader whose record differs fails closed at load.
+_ALIGNED_PROGRAMS: dict[str, tuple[int, str, str]] = {
+    "ALIGNED_C8_BF16": (8, "bf16", "cake_fmha_aligned_a9cc814b948505a2cc1b"),
+    "ALIGNED_C4_BF16": (4, "bf16", "cake_fmha_aligned_2bd88c52bb7a16a1814f"),
+    "ALIGNED_C2_BF16": (2, "bf16", "cake_fmha_aligned_1052b6ae93d516e78ed6"),
+    "ALIGNED_C1_BF16": (1, "bf16", "cake_fmha_aligned_6f88390dacdd946afa74"),
+    "ALIGNED_C8_FP16": (8, "fp16", "cake_fmha_aligned_8d67475a5eaad8c4abc2"),
+    "ALIGNED_C4_FP16": (4, "fp16", "cake_fmha_aligned_b100f226ebd9ce6884cc"),
+    "ALIGNED_C2_FP16": (2, "fp16", "cake_fmha_aligned_6b02ec3e27916ce5eee5"),
+    "ALIGNED_C1_FP16": (1, "fp16", "cake_fmha_aligned_300f2001dc3a9f642eeb"),
+}
+_ALIGNED_COMPONENTS = ("decode_aligned_bf16", "decode_aligned_fp16")
+# ``CakeFmhaTarget`` -> the exact ``CakeProgram`` target of the same device.
+_ALIGNED_PROGRAM_TARGET: dict[str, str] = {"sm100a": "sm_100a", "sm103a": "sm_103a"}
+# The binding's host parameters, in the kernel's order (then the grid).
+_ALIGNED_HOST_PARAMS = (
+    "Qt",
+    "K",
+    "V",
+    "O",
+    "page_table",
+    "seq_lens_kv",
+    "uniform_seq_len",
+    "max_pages_per_seq",
+    "softmax_scale_log2",
+    "num_q_heads",
+    "num_kv_heads",
+    "batch_size",
+)
+
+
+def _aligned_program_id(cluster_size: int, dtype: str) -> str:
+    return f"ALIGNED_C{cluster_size}_{dtype.upper()}"
+
+
+def _aligned_route_program(
+    route: CakeFmhaDecodeRoute,
+) -> tuple[int, str, str] | None:
+    """``(cluster_size, dtype, program name)`` of an aligned route's program, or
+    ``None`` when the route's program identifier is not one of the module's or
+    not of its dtype."""
+
+    if route.component not in _ALIGNED_COMPONENTS or route.aligned_program is None:
+        return None
+    program = _ALIGNED_PROGRAMS.get(route.aligned_program)
+    if program is None or route.component != f"decode_aligned_{program[1]}":
+        return None
+    return program
+
+
+def cake_fmha_aligned_launch_grid(
+    program, batch_size: int, num_kv_heads: int
+) -> tuple[int, int, int]:
+    """The launch grid of one aligned hd128 q1 decode: ``(batch_size *
+    num_kv_heads, 1, cluster_size)``, one cluster of the program's CTAs along z
+    per (request, KV head) tile.  ``program`` is the generated loader's
+    ``CakeProgram`` record; its ``cluster`` is ``(1, 1, cluster_size)``."""
+
+    return int(batch_size) * int(num_kv_heads), 1, int(program.cluster[2])
+
 
 def _route_components(
     route: CakeFmhaDecodeRoute | CakeFmhaContextRoute,
 ) -> tuple[str, ...]:
+    if (
+        isinstance(route, CakeFmhaDecodeRoute)
+        and route.component in _ALIGNED_COMPONENTS
+    ):
+        return (route.aligned_program,) if route.aligned_program is not None else ()
     if isinstance(route, CakeFmhaDecodeRoute):
         route_name = {
             "decode_balanced_bf16": "decode_balanced_bf16_v1",
@@ -256,6 +335,11 @@ def cake_fmha_route_is_optimized(
 
     if route is None:
         return False
+    if (
+        isinstance(route, CakeFmhaDecodeRoute)
+        and route.component in _ALIGNED_COMPONENTS
+    ):
+        return _aligned_route_program(route) is not None
     if (
         isinstance(route, CakeFmhaDecodeRoute)
         and route.component == "decode_native_bf16"
@@ -490,6 +574,180 @@ def _balanced_route_supported(
         if counter_bytes < cake_fmha_balanced_counter_bytes(sm_count, q_len, head_dim):
             return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Aligned hd128 q1 decode selector: a Python mirror of the source selector.
+#
+# Source of truth: the kernel source's selector (module
+# ``trtllm_fmha_tgv_bf16`` of the ``attention_decode_bf16_paged_static_g``
+# family, source revision ``ea3a718663acd2818814c2444aa00537f6b604d6``:
+# ``SEL_BAND_*``, ``_c1_balanced`` .. ``_c8_balanced``, ``aligned_cluster_size``).  The
+# constants are copied verbatim (names and values) and the function keeps the
+# source's signature and semantics; change the source first, then re-copy.
+# ``tests/attention/test_cake_fmha_aligned.py`` holds the source selector
+# test's expectations.  In this module ``None`` keeps the module's present
+# route (``decode_native_bf16`` below the balanced band for BF16,
+# ``decode_balanced_fp16`` for FP16); in the source it is the persistent
+# balanced program.
+# ---------------------------------------------------------------------------
+TILE_Q = 8
+QKV_DTYPES = ("bf16", "fp16")
+# The bands of aligned_cluster_size, on tiles = batch_size * num_kv_heads and max_kv = max_seq_len_kv.
+SEL_BAND_C8_TILES_MAX = 8
+SEL_BAND_C4_TILES_MAX = 32
+SEL_BAND_C2_TILES_MAX = 64
+SEL_BAND_MID_TILES_MAX = 128
+SEL_BAND_WIDE_TILES_MIN = 512
+SEL_BAND_LONG_KV_MIN = 32768
+SEL_BAND_LONG_KV_MAX = 65536
+# Carve-outs: the shapes of a band on which the persistent balanced program
+# measured faster than the band's aligned program on both targets (the rule: no
+# regression at any probed point of the carve-out, >= 2 % faster at two thirds
+# of them).  ``None`` keeps the aligned program on the whole band.  Lengths are
+# ``max_kv``.
+# c1: the balanced program for SEL_BAND_C1_BALANCED_KV_MIN <= max_kv <= SEL_BAND_C1_BALANCED_KV_MAX.
+SEL_BAND_C1_BALANCED_KV_MAX: int | None = 2048
+SEL_BAND_C1_BALANCED_KV_MIN: int | None = 512
+# c2: the balanced program for lo <= max_kv <= hi; the wide form (t, lo, hi) adds tiles >= t with lo <= max_kv <= hi.
+SEL_BAND_C2_BALANCED_KV: tuple[int, int] | None = (6144, 8192)
+SEL_BAND_C2_BALANCED_WIDE: tuple[int, int, int] | None = (56, 4096, 6143)
+# c4: the balanced program for max_kv >= the bound (the band's 32768 upper bound stays).
+SEL_BAND_C4_BALANCED_KV_MIN: int | None = 16384
+# c8: the balanced program for max_kv >= the bound.
+SEL_BAND_C8_BALANCED_KV_MIN: int | None = 65536
+
+
+def _c1_balanced(max_kv: int) -> bool:
+    hi, lo = SEL_BAND_C1_BALANCED_KV_MAX, SEL_BAND_C1_BALANCED_KV_MIN
+    return hi is not None and (lo or 0) <= max_kv <= hi
+
+
+def _c2_balanced(tiles: int, max_kv: int) -> bool:
+    win, wide = SEL_BAND_C2_BALANCED_KV, SEL_BAND_C2_BALANCED_WIDE
+    if win is not None and win[0] <= max_kv <= win[1]:
+        return True
+    return wide is not None and tiles >= wide[0] and wide[1] <= max_kv <= wide[2]
+
+
+def _c4_balanced(max_kv: int) -> bool:
+    lo = SEL_BAND_C4_BALANCED_KV_MIN
+    return lo is not None and max_kv >= lo
+
+
+def _c8_balanced(max_kv: int) -> bool:
+    lo = SEL_BAND_C8_BALANCED_KV_MIN
+    return lo is not None and max_kv >= lo
+
+
+def aligned_cluster_size(
+    batch_size: int,
+    num_kv_heads: int,
+    max_seq_len_kv: int,
+    *,
+    q_len: int,
+    num_q_heads: int,
+    dtype: str,
+) -> int | None:
+    """The cluster size (8, 4, 2 or 1) of the aligned program for one launch, or
+    ``None`` for the persistent balanced program (this module's present route),
+    from host metadata only.
+
+    A shape that is not the aligned programs' (``q_len != 1``, Q heads not exactly
+    ``TILE_Q`` per KV head, or a dtype not in ``QKV_DTYPES``) takes the persistent
+    program.  Otherwise the bands on ``tiles = batch_size * num_kv_heads`` and
+    ``max_kv = max_seq_len_kv`` select:
+
+    * 8: ``tiles <= 8`` below ``SEL_BAND_C8_BALANCED_KV_MIN``;
+    * 4: ``8 < tiles <= 32`` with ``max_kv <= 32768`` below
+      ``SEL_BAND_C4_BALANCED_KV_MIN``, or ``tiles > 64`` with
+      ``32768 <= max_kv <= 65536`` except ``tiles >= 512`` with ``max_kv > 32768``;
+    * 2: ``32 < tiles <= 64`` with ``max_kv <= 32768`` outside the c2 carve-outs
+      (``SEL_BAND_C2_BALANCED_KV``, ``SEL_BAND_C2_BALANCED_WIDE``), or
+      ``tiles >= 512`` with ``32768 < max_kv <= 65536``;
+    * ``None``: ``8 < tiles <= 64`` with ``max_kv > 32768``, ``tiles > 64`` with
+      ``max_kv > 65536``, ``64 < tiles <= 128`` with ``max_kv < 32768``, and the
+      carve-outs of the c8 / c4 / c2 / c1 bands where the balanced program
+      measured faster;
+    * 1: ``tiles > 128`` with ``max_kv < 32768`` outside
+      ``SEL_BAND_C1_BALANCED_KV_MIN .. SEL_BAND_C1_BALANCED_KV_MAX``.
+
+    The bands are complete and disjoint: exactly one holds, or the function
+    raises.  Selection is a performance choice only: every program handles any
+    length up to ``max_pages_per_seq * PAGE_SIZE``.
+    """
+    if not (
+        q_len == 1 and num_q_heads == TILE_Q * num_kv_heads and dtype in QKV_DTYPES
+    ):
+        return None
+    tiles = batch_size * num_kv_heads
+    max_kv = max_seq_len_kv
+    sel_c8 = tiles <= SEL_BAND_C8_TILES_MAX and not _c8_balanced(max_kv)
+    sel_c4 = (
+        SEL_BAND_C8_TILES_MAX < tiles <= SEL_BAND_C4_TILES_MAX
+        and max_kv <= SEL_BAND_LONG_KV_MIN
+        and not _c4_balanced(max_kv)
+    ) or (
+        tiles > SEL_BAND_C2_TILES_MAX
+        and SEL_BAND_LONG_KV_MIN <= max_kv <= SEL_BAND_LONG_KV_MAX
+        and not (tiles >= SEL_BAND_WIDE_TILES_MIN and max_kv > SEL_BAND_LONG_KV_MIN)
+    )
+    sel_c2 = (
+        SEL_BAND_C4_TILES_MAX < tiles <= SEL_BAND_C2_TILES_MAX
+        and max_kv <= SEL_BAND_LONG_KV_MIN
+        and not _c2_balanced(tiles, max_kv)
+    ) or (
+        tiles >= SEL_BAND_WIDE_TILES_MIN
+        and SEL_BAND_LONG_KV_MIN < max_kv <= SEL_BAND_LONG_KV_MAX
+    )
+    sel_p = (
+        (tiles > SEL_BAND_C2_TILES_MAX and max_kv > SEL_BAND_LONG_KV_MAX)
+        or (
+            SEL_BAND_C2_TILES_MAX < tiles <= SEL_BAND_MID_TILES_MAX
+            and max_kv < SEL_BAND_LONG_KV_MIN
+        )
+        or (
+            SEL_BAND_C8_TILES_MAX < tiles <= SEL_BAND_C2_TILES_MAX
+            and max_kv > SEL_BAND_LONG_KV_MIN
+        )
+        or (tiles <= SEL_BAND_C8_TILES_MAX and _c8_balanced(max_kv))
+        or (
+            SEL_BAND_C8_TILES_MAX < tiles <= SEL_BAND_C4_TILES_MAX
+            and max_kv <= SEL_BAND_LONG_KV_MIN
+            and _c4_balanced(max_kv)
+        )
+        or (
+            SEL_BAND_C4_TILES_MAX < tiles <= SEL_BAND_C2_TILES_MAX
+            and max_kv <= SEL_BAND_LONG_KV_MIN
+            and _c2_balanced(tiles, max_kv)
+        )
+        or (
+            tiles > SEL_BAND_MID_TILES_MAX
+            and max_kv < SEL_BAND_LONG_KV_MIN
+            and _c1_balanced(max_kv)
+        )
+    )
+    sel_c1 = (
+        tiles > SEL_BAND_MID_TILES_MAX
+        and max_kv < SEL_BAND_LONG_KV_MIN
+        and not _c1_balanced(max_kv)
+    )
+    hits = [
+        size
+        for size, hit in (
+            (8, sel_c8),
+            (4, sel_c4),
+            (2, sel_c2),
+            (None, sel_p),
+            (1, sel_c1),
+        )
+        if hit
+    ]
+    if len(hits) != 1:
+        raise ValueError(
+            f"the selector bands must locate exactly one program for tiles={tiles} max_kv={max_kv}, got {hits}"
+        )
+    return hits[0]
 
 
 def _smallm_tile_rows(packed_rows: int) -> int | None:
@@ -932,7 +1190,12 @@ def select_cake_fmha_decode_route(
     page_size = int(key_cache.shape[2])
     local_blocks = max(1, (max_seq_len + 127) // 128)
 
-    def route(component, *, selected_page_size: int = page_size):
+    def route(
+        component,
+        *,
+        selected_page_size: int = page_size,
+        aligned_program: str | None = None,
+    ):
         candidate = CakeFmhaDecodeRoute(
             target=_cake_fmha_target(device),
             batch_size=batch_size,
@@ -946,6 +1209,7 @@ def select_cake_fmha_decode_route(
             component=component,
             page_size=selected_page_size,
             return_lse=lse is not None,
+            aligned_program=aligned_program,
         )
         if component == "decode_native_bf16" and not cake_fmha_route_is_optimized(
             candidate
@@ -955,6 +1219,58 @@ def select_cake_fmha_decode_route(
 
     dtypes = (query.dtype, key_cache.dtype, value_cache.dtype, out.dtype)
     no_block_scales = key_block_scales is None and value_block_scales is None
+
+    def aligned_route(dtype: str):
+        """The aligned hd128 q1 route of ``dtype`` (``"bf16"`` / ``"fp16"``), or
+        ``None`` when the launch is outside the programs' contract or
+        ``aligned_cluster_size`` keeps the module's present route.
+
+        The programs read the query as ``[batch, num_q_heads, 128]`` rows and
+        K / V as separate contiguous ``[pages, num_kv_heads, 16, 128]`` pools
+        (their TMA maps derive every stride from the shape), the int32 page table
+        as ``[batch, max_pages_per_seq]`` and the int32 lengths on device; they
+        write ``out`` in the query dtype and take no workspace, counters, LSE,
+        sinks, window, device scales or output scale.
+        """
+
+        if not (
+            query.is_contiguous()
+            and query.shape[2] == 128
+            and key_cache.shape[2:] == (16, 128)
+            and key_cache.is_contiguous()
+            and value_cache.is_contiguous()
+            and kv_layout == "HND"
+            and uses_shared_paged_kv_idx
+            and q_len == 1
+            and num_q_heads == 8 * num_kv_heads
+            and block_tables.dtype == torch.int32
+            and seq_lens.dtype == torch.int32
+            and sinks is None
+            and window_left < 0
+            and lse is None
+            and not isinstance(bmm1_scale, torch.Tensor)
+            and no_block_scales
+            and not isinstance(bmm2_scale, torch.Tensor)
+            and float(bmm2_scale) == 1.0
+            and (o_scale is None or float(o_scale) == 1.0)
+        ):
+            return None
+        cluster_size = aligned_cluster_size(
+            batch_size,
+            num_kv_heads,
+            max_seq_len,
+            q_len=q_len,
+            num_q_heads=num_q_heads,
+            dtype=dtype,
+        )
+        if cluster_size is None:
+            return None
+        return route(
+            f"decode_aligned_{dtype}",
+            selected_page_size=16,
+            aligned_program=_aligned_program_id(cluster_size, dtype),
+        )
+
     if dtypes == (torch.bfloat16,) * 4:
         group = num_q_heads // num_kv_heads
         smallm_rows = _smallm_tile_rows_for(q_len, group)
@@ -1080,6 +1396,12 @@ def select_cake_fmha_decode_route(
             # query row is its own tile (uniform q_len 1..8) on the on-device
             # balanced scheduler, one program per page size (16 / 32 / 64).
             return route("decode_balanced_bf16_hd256")
+        # Aligned hd128 q1 decode: one 8/4/2/1-CTA cluster per (request, KV
+        # head) tile, selected by ``aligned_cluster_size`` ahead of the present
+        # hd128 routes; ``None`` keeps them.
+        aligned = aligned_route("bf16")
+        if aligned is not None:
+            return aligned
         if (
             query.is_contiguous()
             and query.shape[2] == 128
@@ -1139,6 +1461,11 @@ def select_cake_fmha_decode_route(
         return None
 
     if dtypes == (torch.float16,) * 4:
+        # Aligned hd128 q1 decode in FP16: the same programs traced with FP16
+        # Q/K/V/O, ahead of the balanced FP16 route; ``None`` keeps it.
+        aligned = aligned_route("fp16")
+        if aligned is not None:
+            return aligned
         if (
             query.is_contiguous()
             and query.shape[2] == 128
@@ -1412,15 +1739,147 @@ def select_cake_fmha_decode_route(
     return None
 
 
+@dataclass(frozen=True)
+class CakeFmhaAlignedDecodeModule:
+    """One loaded aligned hd128 q1 decode program: the route it serves, the
+    ``CakeProgram`` record, its exact target, the cluster size the launch grid
+    spans along z and the binding's ``run`` entry."""
+
+    route: CakeFmhaDecodeRoute
+    program: Any
+    target: str
+    cluster_size: int
+    entry: Any
+
+
+def _load_cake_fmha_aligned_decode_module(
+    route: CakeFmhaDecodeRoute,
+) -> CakeFmhaAlignedDecodeModule:
+    """Build and load the aligned program of ``route`` on the route's target.
+
+    The loader ``flashinfer.jit.cake_fmha_aligned`` is generated by the Cake
+    export beside ``csrc/cake_fmha_aligned/``; it is imported here, lazily, so
+    route selection never needs it.  The record's launch facts and argument
+    names are checked against the host launch once, at load.
+    """
+
+    from .jit import cake_fmha_aligned
+    from .jit.cake_program import GRID_ARGS, CakeProgram
+
+    program_facts = _aligned_route_program(route)
+    if program_facts is None:
+        raise RuntimeError(
+            f"Cake FMHA aligned decode route names no program: {route.aligned_program!r}"
+        )
+    cluster_size, _, program_name = program_facts
+    program = getattr(cake_fmha_aligned, route.aligned_program, None)
+    if not isinstance(program, CakeProgram):
+        raise RuntimeError(
+            f"flashinfer.jit.cake_fmha_aligned publishes no CakeProgram {route.aligned_program!r}"
+        )
+    if program.name != program_name:
+        raise RuntimeError(
+            f"flashinfer.jit.cake_fmha_aligned.{route.aligned_program} is "
+            f"{program.name}; this module pins {program_name}"
+        )
+    target = _ALIGNED_PROGRAM_TARGET[route.target]
+    if target not in program.targets:
+        raise RuntimeError(
+            f"{program.name} ships no {target!r} build; its targets are {list(program.targets)}"
+        )
+    if tuple(program.args) != (*_ALIGNED_HOST_PARAMS, *GRID_ARGS):
+        raise RuntimeError(
+            f"the generated {program.name} binding takes {list(program.args)}; "
+            f"the host spells {[*_ALIGNED_HOST_PARAMS, *GRID_ARGS]}"
+        )
+    if tuple(program.cluster) != (1, 1, cluster_size):
+        raise RuntimeError(
+            f"{program.name} launches cluster {tuple(program.cluster)}; the route "
+            f"expects (1, 1, {cluster_size})"
+        )
+    return CakeFmhaAlignedDecodeModule(
+        route=route,
+        program=program,
+        target=target,
+        cluster_size=cluster_size,
+        entry=program.entry(target),
+    )
+
+
+def _run_cake_fmha_aligned_decode(
+    module: CakeFmhaAlignedDecodeModule,
+    *,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    out: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    bmm1_scale: float,
+) -> None:
+    """Launch one aligned hd128 q1 decode on the current torch stream.
+
+    The binding's host parameters, in the kernel's order: the query rows
+    (``Qt``, TMA source, ``[batch x num_kv_heads x 8, 128]``), the K and V pools
+    (TMA sources), the output, the page table, the device lengths,
+    ``uniform_seq_len`` (0: every CTA reads its request's length from
+    ``seq_lens_kv``, so a captured launch follows new lengths),
+    ``max_pages_per_seq`` (the page table's row width; the kernel clamps its
+    page-id reads to the row), the log2-domain softmax scale, the head counts
+    and the batch size; then the grid of :func:`cake_fmha_aligned_launch_grid`.
+    """
+
+    route = module.route
+    if (
+        tuple(query.shape) != (route.batch_size, route.num_q_heads, 128)
+        or key_cache.shape[1] != route.num_kv_heads
+        or tuple(block_tables.shape[:1]) != (route.batch_size,)
+    ):
+        raise RuntimeError(
+            "Cake FMHA aligned decode launch does not match its selected route"
+        )
+    grid = cake_fmha_aligned_launch_grid(
+        module.program, route.batch_size, route.num_kv_heads
+    )
+    values = {
+        "Qt": query.view(-1, 128),
+        "K": key_cache,
+        "V": value_cache,
+        "O": out,
+        "page_table": block_tables,
+        "seq_lens_kv": seq_lens,
+        "uniform_seq_len": 0,
+        "max_pages_per_seq": int(block_tables.shape[1]),
+        "softmax_scale_log2": float(bmm1_scale) * log2e,
+        "num_q_heads": route.num_q_heads,
+        "num_kv_heads": route.num_kv_heads,
+        "batch_size": route.batch_size,
+        "grid_x": grid[0],
+        "grid_y": grid[1],
+        "grid_z": grid[2],
+    }
+    arguments = [values[name] for name in module.program.args]
+    with torch.cuda.device(query.device), tvm_ffi.use_torch_stream():
+        module.entry(*arguments)
+
+
 def _resolve_cake_fmha_decode_module(
     device: torch.device, route: CakeFmhaDecodeRoute | None
 ) -> tuple[Any, bool]:
-    """Resolve a decode module and whether its optimized ABI remains active."""
+    """Resolve a decode module and whether its optimized ABI remains active.
+
+    An aligned hd128 q1 route resolves to a :class:`CakeFmhaAlignedDecodeModule`
+    (a generated ``CakeProgram`` binding launched by
+    :func:`_run_cake_fmha_aligned_decode`), every other optimized route to a
+    module exposing ``cake_paged_attention_decode``.
+    """
 
     if route is None or not cake_fmha_route_is_optimized(route):
         return load_cake_fmha_compat_module(_cake_fmha_target(device)), False
     if route.target != _cake_fmha_target(device):
         raise RuntimeError("Cake FMHA decode route target does not match the device")
+    if route.component in _ALIGNED_COMPONENTS:
+        return _load_cake_fmha_aligned_decode_module(route), True
     loader = {
         "decode_balanced_bf16": load_cake_fmha_decode_balanced_bf16_module,
         "decode_balanced_fp16": load_cake_fmha_decode_balanced_fp16_module,

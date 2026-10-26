@@ -58,7 +58,14 @@ def is_sm90a_device(device: torch.device) -> bool:
     The helper re-parses the CUDA version string (two ``packaging.version.Version``
     constructions) on every call; the public MSA entries call it per op, i.e.
     three times per MiniMax-M3 layer on the decode path.
+
+    A non-CUDA device is "not SM90" rather than an error, like
+    ``is_blackwell_msa_device``: the surfaces consult this predicate before
+    their own raise rules (``out=``, dtype), and ``get_compute_capability``
+    raises ``ValueError`` for a host tensor, which would pre-empt them.
     """
+    if device.type != "cuda":
+        return False
     from ..utils import is_sm90a_supported
 
     return bool(is_sm90a_supported(device))

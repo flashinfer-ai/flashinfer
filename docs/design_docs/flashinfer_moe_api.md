@@ -175,7 +175,7 @@ NVFP4 "4over6" is a two-candidate block-scale search inside the quantizer: next 
 
 - **One public type.** The field is `Optional[NVFP44Over6Config]`; "defer to the environment" is the default value (a private `_UNSET` sentinel that callers never spell), not a third public type. Retiring the shim later means flipping the default to `None` with no signature change.
 - **One resolution boundary.** `resolve_nvfp4_4over6()` is the only Python code that reads the variables. Below it every kernel driver takes the resolved value under the name `nvfp4_4over6_config`, so an unresolved value cannot reach a `@functools.cache`-d kernel getter unnoticed. The FFI receives a packed `int64`, decoded by `resolveNVFP4Recipe()` in `csrc/nv_internal/tensorrt_llm/kernels/nvfp4Recipe.h`.
-- **An explicit setting is never silently ignored.** Support is opt-in per runner via `MoERunner.supports_nvfp4_4over6`; `MoERunner._check_support()` rejects any explicit value (including `None`, which a runner that still reads the environment could not honour) on a runner that has not opted in. `CuteDslRunner` honours a pinned recipe only with `per_token_scale=True`, the one path where it quantizes the GEMM2 input itself. `MoELayer` names the runners that do support it in its "no usable backend" error.
+- **An explicit setting is never silently ignored.** Support is opt-in per runner via `MoERunner.supports_nvfp4_4over6`; `MoERunner._check_support()` rejects any explicit value (including `None`, which a runner that still reads the environment could not honour) on a runner that has not opted in. `CuteDslRunner` and `TrtllmFp4RoutedRunner` honour a pinned recipe only for NVFP4×NVFP4 with `per_token_scale=True`, the one path where each quantizes the GEMM2 input itself; `CutlassNvfp4Runner` honours it on its standard path, whose activation quantizers have 4over6 variants. `PrimsTsRunner` has no GEMM2-input requantization step (its FC1 epilogue emits NVFP4 on every tactic), so it keeps rejecting explicit values. `MoELayer` names the runners that do support it in its "no usable backend" error.
 - **Activations only.** The field governs the runtime activation quantization; weights are quantized by the caller ahead of the call. `QuantConfig.__post_init__` rejects an explicit setting when `activation` is not `QuantFormat.NVFP4`, so the mistake is named where the config is written rather than swallowed by the candidate filter.
 - **Flat and unified APIs take the same value.** `nvfp4_quantize(..., nvfp4_4over6=...)`, `make_nvfp4_global_scale(..., nvfp4_4over6_config=...)`, `CuteDslConfig.prepare_weights(..., nvfp4_4over6=...)` and `QuantConfig.nvfp4_4over6` all accept one `NVFP44Over6Config` object.
 
@@ -833,7 +833,7 @@ order. MXFP8 and NVFP4 additionally use 128x4 weight-scale layouts. BF16 and
 MXFP8 traces retain `use_shuffled_weight` to select the row order. Serialized
 references restore these layouts using PyTorch.
 
-`PowLU` (CUTLASS only) rides the generic slots with changed meaning:
+For CUTLASS, per-expert `PowLU` overrides use the generic slots with changed meaning:
 `gemm1_alpha` carries the exponent `m` (not a sigmoid slope) and
 `gemm1_clamp_limit` the post-activation clamp on the gate plus the symmetric
 clamp on the linear branch; `gemm1_beta` has no PowLU meaning and per-expert
@@ -922,6 +922,21 @@ python scripts/generate_moe_activation_matrix.py --write
 | `cutlass_nvfp4` | `CutlassNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutlass_w4a16` | `CutlassW4A16Config` | `MXFP4×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutlass_w4a8` | `CutlassW4A8Config` | `INT4×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `BF16×BF16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `FP16×FP16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `FP8PerTensor×BF16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `FP8PerTensor×FP16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP4×BF16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP4×FP16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP4×MXFP8` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP8×MXFP8` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `MXINT4×BF16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `MXINT4×FP16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `NVFP4×BF16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `NVFP4×FP16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `NVFP4×NVFP4` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
 | `prims_ts` | `PrimsTsConfig` | `BF16×BF16` | `SwiGLU`, `ReLU2` |
 | `prims_ts` | `PrimsTsConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
 | `prims_ts` | `PrimsTsConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `ReLU2` |
@@ -942,6 +957,9 @@ python scripts/generate_moe_activation_matrix.py --write
 | `trtllm_fp8_per_tensor` | `TrtllmFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `ReLU2` |
 | `trtllm_mxint4_routed` | `TrtllmMxInt4Config` | `MXINT4×BF16` | `SwiGLU` |
 <!-- END GENERATED MOE ACTIVATION MATRIX -->
+
+For the explicit SM100/SM103/SM107 low-token `frost_low_latency` backend, see the
+[usage, qualification and extension guide](../frost_low_latency_moe.md).
 
 This table records activation classes, not every accepted scalar value. For
 example, TRT-LLM FP8 per-tensor and b12x accept only default-scalar `SwiGLU`,
@@ -1211,3 +1229,15 @@ crosses the Python API.
 | [ ] | Keep FP8, MXFP4, and additional backend families out of this PR. | Track as follow-up runners after the NVFP4 path is solid. |
 | [ ] | Keep general routing unification out of this PR. | This MVP assumes pre-routed inputs through `MoEActivationPack`. |
 | [ ] | Keep broader public API ergonomics separate from MVP correctness. | Backend discovery, pipe-operator sugar, repro replay, and a full eager functional API can evolve after the MVP contract is stable. |
+
+
+### Frost grouped DeepSeek block-FP8 candidates
+
+The existing `DeepSeekFp8` preparation and activation packs also serve the SM90
+and SM120 grouped Tensor Core paths. The bounded candidate region is finalized
+H2048/I512/top-k10, default SwiGLU T4/T8 and default ReLU2/SiLU T8. BF16 entry
+and prequantized E4M3 entry retain the same dynamic block-scale contract.
+All sixteen FMA choices remain available; other shapes and custom parameters
+retain FMA. No new public configuration or cross-backend auto-dispatch rule is
+introduced. See [the Frost guide](../frost_low_latency_moe.md#grouped-deepseek-block-fp8-on-sm90-and-sm120)
+for numerical boundaries and a full routed-expert GPU-time reproducer.

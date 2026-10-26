@@ -161,3 +161,40 @@ def validate_nvfp4_forward_inputs(
             f"scales.shape[1] ({scales.shape[1]}) must be >= {hidden_sf_cols} "
             f"for hidden={hidden}"
         )
+
+
+def validate_fc1_activation_per_token_scale(
+    scale: torch.Tensor | None,
+    *,
+    num_tokens: int,
+    enabled: bool,
+) -> None:
+    """Check ``MoEEpTensors.fc1_activation_per_token_scale`` against the config.
+
+    The per-token scale is a compile-time kernel switch
+    (``enable_fc1_activation_per_token_scale``), so the tensor must be present
+    iff the switch is on; when present it is ``(num_tokens,)`` fp32 CUDA.
+    """
+    if not enabled:
+        if scale is not None:
+            raise MoEEpConfigError(
+                "MoEEpTensors.fc1_activation_per_token_scale was provided but the "
+                "kernel config has enable_fc1_activation_per_token_scale=False"
+            )
+        return
+    if scale is None:
+        raise MoEEpConfigError(
+            "MoEEpTensors.fc1_activation_per_token_scale is required when "
+            "enable_fc1_activation_per_token_scale=True"
+        )
+    if not scale.is_cuda:
+        raise MoEEpConfigError("fc1_activation_per_token_scale must be a CUDA tensor")
+    if scale.dtype != torch.float32:
+        raise MoEEpConfigError(
+            f"fc1_activation_per_token_scale must be float32, got {scale.dtype}"
+        )
+    if scale.shape != (num_tokens,):
+        raise MoEEpConfigError(
+            f"fc1_activation_per_token_scale must have shape ({num_tokens},), "
+            f"got {tuple(scale.shape)}"
+        )

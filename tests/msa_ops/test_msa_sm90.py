@@ -41,6 +41,15 @@ sm90_only = pytest.mark.skipif(
 )
 
 
+def test_sm90_predicate_is_false_for_a_host_tensor():
+    """A CPU device is "not SM90", not an error: the public MSA surfaces consult
+    this predicate before their own raise rules (``out=``, dtype), which the host
+    tests of ``test_msa_nvfp4_decode_sm100`` reach without a GPU."""
+    from flashinfer.msa_ops._sm90_dispatch import is_sm90a_device
+
+    assert is_sm90a_device(torch.device("cpu")) is False
+
+
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------

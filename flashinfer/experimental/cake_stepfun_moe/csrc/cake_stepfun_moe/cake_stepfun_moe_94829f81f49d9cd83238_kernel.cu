@@ -69,7 +69,7 @@ kernel_cake_stepfun_moe_94829f81f49d9cd83238(int* __restrict__ topk_ids, __nv_bf
     int* warp_totals2 = reinterpret_cast<int*>(smem_raw + 4736);
     const int warp_totals2_addr = smem + 4736;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int thread_idx = (int)tid;
     int lane_idx = (int)lane;
     int warp_idx = (int)warp;
@@ -98,18 +98,16 @@ kernel_cake_stepfun_moe_94829f81f49d9cd83238(int* __restrict__ topk_ids, __nv_bf
     int stride_mask = (1 << local_experts_stride_log2) - 1;
     int is_local = ((local_idx >= 0 && local_idx < extent && (local_idx & stride_mask) == 0) ? 1 : 0);
     int acc_count = 0;
-    int slot_e = 0;
     int kidx_e = 0;
     if (thread_idx < 128) {
         if (is_local != 0) {
-            slot_e = expert;
             for (int j = 0; j < num_tokens; j++) {
+                int slot_e = expert + j * 128;
                 kidx_e = (int)smem_kidx[slot_e];
                 if (kidx_e >= 0) {
                     smem_offset16[slot_e] = (uint16_t)acc_count;
                     acc_count = acc_count + 1;
                 }
-                slot_e = slot_e + 128;
             }
         }
     }
@@ -323,13 +321,11 @@ kernel_cake_stepfun_moe_94829f81f49d9cd83238(int* __restrict__ topk_ids, __nv_bf
                 int mn_limit2 = scaled_0 + acc_count;
                 int _min_0 = ((scaled_1) < (mn_limit2) ? (scaled_1) : (mn_limit2));
                 cta_idx_xy_to_mn_limit[exclusive + cta] = _min_0;
-                int _min_1 = ((scaled_1) < (_min_0 + (-_min_0 & 3)) ? (scaled_1) : (_min_0 + (-_min_0 & 3)));
-                int head_end = _min_1;
+                int head_end = ((scaled_1) < (_min_0 + (-_min_0 & 3)) ? (scaled_1) : (_min_0 + (-_min_0 & 3)));
                 for (int head = _min_0; head < head_end; head++) {
                     permuted_idx_to_token_idx[head] = -1;
                 }
-                int _max_0 = ((scaled_1 - head_end) > (0) ? (scaled_1 - head_end) : (0));
-                int body_len = _max_0;
+                int body_len = ((scaled_1 - head_end) > (0) ? (scaled_1 - head_end) : (0));
                 int tail_begin = head_end + (body_len >> 2 << 2);
                 for (int body = head_end; body < tail_begin; body += 4) {
                     {

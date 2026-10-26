@@ -9,7 +9,7 @@ caller-owned outputs and NCCL fallback:
 
     from flashinfer.comm import UlyssesCommunicator
 
-    with UlyssesCommunicator(group, max_elems=q.numel(), dtype=q.dtype) as comm:
+    with UlyssesCommunicator(group, max_bytes=q.nbytes, dtype=q.dtype) as comm:
         q_global = comm.scatter_heads(q)
         k_global = comm.scatter_heads(k)
         v_global = comm.scatter_heads(v)
@@ -578,7 +578,7 @@ def prepare(
     with route:
         communicator = UlyssesCommunicator(
             group,
-            max_elems=batch * sequence * heads * head_dim,
+            max_bytes=batch * sequence * heads * head_dim * dtype.itemsize,
             dtype=dtype,
             backend=backend,
         )

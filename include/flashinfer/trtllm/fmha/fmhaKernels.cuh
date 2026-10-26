@@ -354,6 +354,9 @@ class TllmGenFmhaKernel {
   }
 
   uint64_t hashID(KernelMeta const& kernelMeta) const {
+    // flashInferMetaInfo.h and the TRTLLM_GEN_FMHA cubins are distributed as one versioned
+    // artifact. Requiring the semantic field names here intentionally makes a mismatched legacy
+    // header fail at compile time instead of interpreting different metadata.
     return hashID(
         kernelMeta.mQkvLayout, kernelMeta.mMaskType, kernelMeta.mKernelType,
         kernelMeta.mTileScheduler, kernelMeta.mMultiCtasKvMode, kernelMeta.mHeadDimPerCtaV,
@@ -722,13 +725,17 @@ class TllmGenFmhaKernel {
       // Some of the tilesKv will be skipped if the sliding window attention or chunked attention is
       // used.
       if (isSlidingOrChunkedCausalMask(selectKernelParams.mMaskType)) {
-        if (params.mMaxSeqLenKv > params.mAttentionWindowSize) {
+        if (params.mChunkedAttentionSize > 0) {
+          maxAttentionWindow = std::min(params.mMaxSeqLenKv, params.mChunkedAttentionSize);
+        } else {
+          FLASHINFER_CHECK(params.mLeftSlidingWindow >= 0 && params.mRightSlidingWindow >= 0,
+                           "Sliding-window attention requires both window bounds to be >= 0 when "
+                           "chunked attention is disabled.");
           // Consider that the first tileKv might contain tokensKv that is out of the attention
           // window.
           maxAttentionWindow =
-              std::min(params.mMaxSeqLenKv, params.mAttentionWindowSize + kernelMeta.mStepKv - 1);
-        } else {
-          maxAttentionWindow = std::min(params.mMaxSeqLenKv, params.mChunkedAttentionSize);
+              std::min(params.mMaxSeqLenKv, params.mLeftSlidingWindow + params.mRightSlidingWindow +
+                                                1 + kernelMeta.mStepKv - 1);
         }
       }
 
@@ -756,8 +763,9 @@ class TllmGenFmhaKernel {
               std::min(maxNumCtasPerSeqKv, std::min(maxKvSplitsPerCgaCluster, residentSplitBudget));
           if (targetMaxNumCtasPerSeqKv > 1 && targetMaxNumCtasPerSeqKv < maxNumCtasPerSeqKv) {
             int const targetTileSizePerCtaKv =
-                isSlidingOrChunkedCausalMask(selectKernelParams.mMaskType)
-                    ? flashinfer::ceil_div(params.mAttentionWindowSize,
+                isSlidingOrChunkedCausalMask(selectKernelParams.mMaskType) &&
+                        params.mLeftSlidingWindow >= 0
+                    ? flashinfer::ceil_div(params.mLeftSlidingWindow + 1,
                                            targetMaxNumCtasPerSeqKv - 1)
                     : flashinfer::ceil_div(maxAttentionWindow, targetMaxNumCtasPerSeqKv);
             if (targetTileSizePerCtaKv <= 1024) {
@@ -1326,10 +1334,11 @@ class TllmGenFmhaKernel {
 
   // Select a kernel based on the heuristic.
   void selectKernel(RunnerParams const& params, SelectKernelParams& selectKernelParams) const {
+    bool const isMlaGeneration = isGenerationKernel(params.mKernelType) && isMlaGenKernel(params);
+
     // Normalize this before heuristic probing; some GQA-generation heuristics load candidate
     // kernels while selecting tileSizeQ.
     selectNumTokensPerPage(params, selectKernelParams);
-    bool const isMlaGeneration = isGenerationKernel(params.mKernelType) && isMlaGenKernel(params);
 
     // Select the kernel based on the kernel type.
     if (isMlaGeneration) {
@@ -1340,9 +1349,16 @@ class TllmGenFmhaKernel {
       selectKernelParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
       if (!isSparseMla(params.mSparseMlaType)) {
         FLASHINFER_CHECK(
-            params.mMaxSeqLenKv <= params.mAttentionWindowSize &&
-                params.mChunkedAttentionSize == INT_MAX,
-            "TRTLLM-GEN MLA generation does not support sliding-window or chunked attention.");
+            (params.mLeftSlidingWindow == -1 ||
+             params.mMaxSeqLenKv <= params.mLeftSlidingWindow + 1) &&
+                params.mRightSlidingWindow <= 0 && params.mChunkedAttentionSize == 0,
+            std::string(
+                "TRTLLM-GEN MLA generation requires a window that covers the whole KV sequence "
+                "(maxSeqLenKv=") +
+                std::to_string(params.mMaxSeqLenKv) +
+                ", leftSlidingWindow=" + std::to_string(params.mLeftSlidingWindow) +
+                ", rightSlidingWindow=" + std::to_string(params.mRightSlidingWindow) +
+                ", chunkedAttentionSize=" + std::to_string(params.mChunkedAttentionSize) + ").");
       }
     } else if (isGenerationKernel(params.mKernelType)) {
       selectGqGenerationKernel(params, selectKernelParams);
@@ -1356,20 +1372,8 @@ class TllmGenFmhaKernel {
       selectKernelParams.mHeadDimPerCtaV = 256;
     }
 
-    // Enable sliding window or chunked causal if the max kv sequence length exceeds attention
-    // window size or chunked attention size. This is supported by causal-mask context kernels and
-    // generation-phase kernels.
-    if (!isSparseMla(params.mSparseMlaType) &&
-        (selectKernelParams.mMaskType == TrtllmGenAttentionMaskType::Causal ||
-         !isContextKernel(params.mKernelType)) &&
-        (params.mMaxSeqLenKv > params.mAttentionWindowSize ||
-         params.mChunkedAttentionSize != INT_MAX)) {
-      FLASHINFER_CHECK(
-          params.mMaxSeqLenKv <= params.mAttentionWindowSize ||
-              params.mMaxSeqLenKv <= params.mChunkedAttentionSize,
-          "Sliding window attention and chunked attention should not be used together");
-      selectKernelParams.mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
-    }
+    // The caller supplies the final mask type. Window parameters are runtime values and must not
+    // silently rewrite Dense/Causal selection because the producer validates those combinations.
   }
 
   std::pair<uint64_t, std::string> hashFromRunnerParams(

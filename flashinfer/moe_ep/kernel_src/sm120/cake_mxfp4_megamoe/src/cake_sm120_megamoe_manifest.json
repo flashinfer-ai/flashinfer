@@ -2,7 +2,7 @@
  "arch": "sm_120a",
  "binding": {
   "path": "cake_sm120_megamoe_binding.cu",
-  "sha256": "7d5fc70247b391e28fd72473828e8b1ece9488a6a39dea5d52d8b13c75214c17"
+  "sha256": "16a644216f3065f829317ee22dcf71309428862e142cb18cdac9f638e2fd1372"
  },
  "device": {
   "entry": "cake_sm120_megamoe_kernel.cuh",
@@ -70,10 +70,10 @@
    "cake_sm120_megamoe_kernel_part003.cuh": "9c32dc62e5049b24ce5e7b816bf69b94a4623a68bfd709878d5306bb0ae73c55",
    "cake_sm120_megamoe_kernel_part004.cuh": "0c41ad6021a6d3b9acd32029e5bc6366ba9122aa97100523d180f1e180d1e1e8",
    "cake_sm120_megamoe_kernel_part005.cuh": "8b5fcac0535eaf2207ece4971e4170e860169568d4518c27f4589f04d5d5b043",
-   "cake_sm120_megamoe_kernel_part006.cuh": "5097d0710176d160d5bc013e88886cd292f14230c26d58bf54a3df9ea8fd99d1",
-   "cake_sm120_megamoe_kernel_part007.cuh": "a3a38ef4ebe8fa99a1190801e57bc3a8e75540dcce0234a0a46dcddc7d3094f7",
-   "cake_sm120_megamoe_kernel_part008.cuh": "c039855b56e5f029915380dabbe0d211ba66fce54b37dcb15ea5c02b3bd5072a",
-   "cake_sm120_megamoe_kernel_part009.cuh": "25d15769421963f406e7ac163bd07ba4582093b1157c7de9ca789b450eeaccf9",
+   "cake_sm120_megamoe_kernel_part006.cuh": "14b10ac25517444ee5cc445ec0828306b0074dddc01995c552223f942b0d0156",
+   "cake_sm120_megamoe_kernel_part007.cuh": "c72b36fffe34c4043fadba3c368ea04db9bf773a30b14b9f8cb2fbe2e7a6c27e",
+   "cake_sm120_megamoe_kernel_part008.cuh": "80e56a59e0f34ae1a2098f4bb8b9b168aa29140e0e7cfa0477d86874b7ec7610",
+   "cake_sm120_megamoe_kernel_part009.cuh": "5f1c0d73db7a0200403d70dac6932c4d86d1206261f1de0cbfdb1d0a876b1d4e",
    "cake_sm120_megamoe_kernel_part010.cuh": "93138bb4022db7fedc6fbddfd7f4973f5956bf3af2021fee0218d89284571d73",
    "cake_sm120_megamoe_kernel_part011.cuh": "4914fd68d32a807be5ea87b8cfd97bd321b106547f394d1d85d025c071703f77",
    "cake_sm120_megamoe_kernel_part012.cuh": "2b48e3f060e24f7ca262780cb0491dc3f0817849a1e562fa84b4086621e4afc5"
@@ -83,12 +83,12 @@
  "format": "cake-sm120-megamoe-manifest/3",
  "geometry": {
   "path": "cake_sm120_megamoe_geometry.json",
-  "sha256": "f9154d53638b0258770f6cb967a13a302da1201bba3373b25538d2cb78332f94"
+  "sha256": "95c161d89a5f2cfc5e0ad4c4b14cc49e14fa65a99a01370032e19485f624daf6"
  },
  "provenance": {
-  "generator_commit": "0729d2f1d",
-  "geometry_module_sha256": "1426697803676662b5bbe0a0fcdd68c808aa33d016e9c43e77bad788a16765c2",
-  "single_file_sha256": "b43d46163a340421284d7efe830eafe98a861aa7461df300e36ea25377c5b44f",
-  "unrenamed_sha256": "629936d9bb3c01f9972c8593a77efa8637b8f5d70cb4b6a34f2f1cfe122dd625"
+  "generator_commit": "81d9149b4",
+  "geometry_module_sha256": "95c95541c9db64fda35ec927b31c8a593878c0674020c6aa8f29132a1d7d54c9",
+  "single_file_sha256": "bfe188bf116c5843706f2e44c724638f5a3cf5d59f53809b94f148e9b2f7717e",
+  "unrenamed_sha256": "c42ea17cfd1e0764b7422cbfd0de00b64a58b1e018bf6d62adafd7a4607eba19"
  }
 }

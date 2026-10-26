@@ -23,6 +23,7 @@ from .fp8_quantization import (
     mxfp8_grouped_quantize,
     mxfp8_dequantize_host,
     per_token_group_quant_8bit,
+    silu_and_mul_mxfp8_experts_quantize,
 )
 
 # Re-export FP4 quantization (all public symbols)
@@ -91,6 +92,7 @@ __all__ = [
     "mxfp8_grouped_quantize",
     "mxfp8_dequantize_host",
     "per_token_group_quant_8bit",
+    "silu_and_mul_mxfp8_experts_quantize",
     # FP4
     "SfLayout",
     "block_scale_interleave",
