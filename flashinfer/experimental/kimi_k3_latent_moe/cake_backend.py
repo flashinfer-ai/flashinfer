@@ -37,17 +37,24 @@ norm PDL trigger) are re-implemented here byte-for-byte from the Cake modules
 ``kimi_k3_latent_moe_tail``; every plan names the physical generated kernel
 through a logical key resolved in ``cake_jit.KERNELS``.  Weights are read in
 the model layout (``nn.Linear`` ``[out, in]`` BF16); nothing is copied or
-packed and nothing is allocated at launch, so a prepared runner is CUDA Graph
-safe.  Every plan is derived from the device's own SM count (``QUALIFIED_SM_COUNTS``
+packed, and a prepared runner is CUDA Graph safe.  Distinct runners share no
+mutable device state: each prepared runner owns its zero-initialised control
+words (``_CtrlSlab``), and a split prefill plan takes its FP32 stream-K partial
+workspace per launch from PyTorch's caching allocator on the launch stream (from
+the graph's memory pool under capture), the only allocation at launch.  Every
+plan is derived from the device's own SM count (``QUALIFIED_SM_COUNTS``
 names the physical counts the programs are qualified on; other counts are refused).
-See ``README.md`` in this package.
+See ``README.md`` in this package (section "Concurrency").
 """
 
 from __future__ import annotations
 
+import ctypes
 import functools
+import os
+import threading
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 import torch
 import tvm_ffi
@@ -898,7 +905,7 @@ def weights_evict_first(gemm_ctas: int, sm_count: int) -> bool:
 
 FUSED_MIN_K2_ITERS = 48
 # u32 words of the fused-norm counter buffer: two row-release semaphores, the claim ticket and the
-# retirement count of the claimed instances (``_tail_workspace``).
+# retirement count of the claimed instances (per-runner control words, ``_control_words``).
 NORM_COUNTER_WORDS = 4
 
 
@@ -1136,82 +1143,180 @@ def generated_program_available(
 
 
 # ---------------------------------------------------------------------------
-# Per-device scratch (the decode kernels' fixed ABI buffers)
+# Device scratch: per-runner control words, per-launch partial workspace
 # ---------------------------------------------------------------------------
+#
+# The programs use two kinds of mutable device scratch, owned so that distinct runners never share any:
+#
+# * Control words: the self-resetting arrival words -- the decode grid counter (``counters``, ``atom.inc``
+#   with limit grid - 1), the prefill stream-K arrival counters (one per split tile and CTA rank; the last
+#   contributor zeroes its counter) and the fused-norm words (``norm_counter``: two row-release semaphores,
+#   the claimed instances' item ticket and their retirement count, which the last CTA to retire resets).
+#   They must read zero before a launch and every launch returns them to zero, so they are zeroed once.
+#   Each prepared runner takes its own words from the device's ``_CtrlSlab``; a slot is never returned or
+#   reused, so a CUDA Graph that captured a runner replays into valid private words after the runner is
+#   dropped, and a third-party PDL kernel between two runners cannot make them share a word.
+# * Partials: the FP32 stream-K workspace of split plans, written before it is read inside one launch.
+#   Each launch takes it from PyTorch's caching allocator on the launch stream (``torch.empty``: reuse is
+#   stream-ordered; under CUDA Graph capture the block comes from the graph's pool).  A program that binds a
+#   per-launch workspace must not trigger ``griddepcontrol.launch_dependents`` (a dependent launched early
+#   could receive the recycled block while the program still writes it); the package test checks it.
+#   Whole plans bind ``_READ_NEVER``.
 
-_SCRATCH: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
-_TAIL_WS: dict[
-    tuple[int, int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+#: Control words are handed out in 128-byte slots of 32 four-byte words.
+CTRL_SLOT_WORDS = 32
+#: Four-byte words of one slab chunk (256 KiB): one zero fill and one device synchronisation for hundreds of runners.
+CTRL_CHUNK_WORDS = 1 << 16
+#: u32 words of the decode programs' grid counter buffer (only ``[0]`` is used).
+DECODE_COUNTER_WORDS = 4
+
+
+class _CtrlSlab:
+    """Zero-initialised control words of one device, handed out in 128-byte slots and never reused.
+
+    A chunk is allocated outside CUDA Graph capture, zeroed, and made visible to every stream by one
+    device synchronisation at creation; every chunk stays referenced for the life of the process, so a slot
+    stays valid (and private to its owner) for every launch and every graph that bound it.  ``take`` under
+    capture with no free slot left zeroes new words inside the capture instead: one zero-fill kernel node in that
+    graph, and the words stay pinned for good as well.
+    """
+
+    def __init__(self, index: int) -> None:
+        self.index = index
+        self._lock = threading.Lock()
+        self._chunk: Optional[torch.Tensor] = None
+        self._used = 0
+        self._pinned: list[torch.Tensor] = []
+
+    def take(self, words: int) -> torch.Tensor:
+        """``words`` (a multiple of ``CTRL_SLOT_WORDS``) zero int32 words owned by the caller for good."""
+        with self._lock:
+            chunk = self._chunk
+            if chunk is not None and self._used + words <= chunk.numel():
+                slot = chunk[self._used : self._used + words]
+                self._used += words
+                return slot
+            device = torch.device("cuda", self.index)
+            if torch.cuda.is_current_stream_capturing():
+                slot = torch.zeros(words, dtype=torch.int32, device=device)
+                self._pinned.append(slot)
+                return slot
+            chunk = torch.zeros(
+                max(CTRL_CHUNK_WORDS, words), dtype=torch.int32, device=device
+            )
+            torch.cuda.synchronize(self.index)
+            self._pinned.append(chunk)
+            self._chunk, self._used = chunk, words
+            return chunk[:words]
+
+
+_CTRL_LOCK = threading.Lock()
+_CTRL_SLABS: dict[int, _CtrlSlab] = {}
+# One-shot functional calls: the (int32, uint32) views of one slot per (device, stream handle, int32 words,
+# uint32 words).
+_CTRL_LANES: dict[
+    tuple[int, int, int, int], tuple[Optional[torch.Tensor], Optional[torch.Tensor]]
 ] = {}
-_FRONT_WS: dict[tuple[int, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+_READ_NEVER: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+# The raw handle of a device's current stream without building a ``torch.cuda.Stream``.
+_RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
 
 
-def _scratch(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``(fp32 dummy, u32 arrival counters, u64 timeline buffer)`` per device.
+def _current_stream_handle(index: int) -> int:
+    if _RAW_STREAM is not None:
+        return int(_RAW_STREAM(index))
+    return int(torch.cuda.current_stream(index).cuda_stream)
 
-    The counters are zeroed once: the fused-norm protocol wraps them back to 0
-    on every launch (``atom.inc`` with limit GRID-1), so eager launches and
-    graph replays share one zero-initialised counter.  The timeline buffer is
-    written only by diagnostic instances (never registered here).
+
+def _ctrl_layout(n_i32: int, n_u32: int) -> tuple[int, int]:
+    """``(uint32 offset, slot words)`` of a control-word slot: ``n_i32`` int32 words first, then ``n_u32``
+    uint32 words from the next 128-byte boundary, rounded up to whole 128-byte slots."""
+    u32_off = -(-int(n_i32) // CTRL_SLOT_WORDS) * CTRL_SLOT_WORDS
+    words = -(-(u32_off + int(n_u32)) // CTRL_SLOT_WORDS) * CTRL_SLOT_WORDS
+    return u32_off, max(words, CTRL_SLOT_WORDS)
+
+
+def _ctrl_slab(index: int) -> _CtrlSlab:
+    slab = _CTRL_SLABS.get(index)
+    if slab is None:
+        with _CTRL_LOCK:
+            slab = _CTRL_SLABS.setdefault(index, _CtrlSlab(index))
+    return slab
+
+
+def _control_words(
+    index: int, n_i32: int, n_u32: int, *, lane: bool = False
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Zero control words on ``cuda:index``: an int32 view of ``n_i32`` words and a uint32 view of ``n_u32``
+    words (``None`` for a zero count), in one slot.
+
+    ``lane=False`` (``prepare_*``): a fresh slot owned by the runner.  ``lane=True`` (the one-shot functional
+    entry points): eager calls share one slot per (device, current stream, word counts) -- calls on one stream
+    are stream-ordered and every launch returns the words to zero -- while a call under CUDA Graph capture
+    takes a fresh slot, so concurrently replayed graphs never share words.
     """
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    entry = _SCRATCH.get(index)
+    slab = _ctrl_slab(index)  # outside ``_CTRL_LOCK``, which creating the slab takes
+    if lane and not torch.cuda.is_current_stream_capturing():
+        key = (index, _current_stream_handle(index), int(n_i32), int(n_u32))
+        views = _CTRL_LANES.get(key)
+        if views is None:
+            with _CTRL_LOCK:
+                views = _CTRL_LANES.get(key)
+                if views is None:
+                    views = _CTRL_LANES[key] = _slot_views(slab, n_i32, n_u32)
+        return views
+    return _slot_views(slab, n_i32, n_u32)
+
+
+def _slot_views(
+    slab: _CtrlSlab, n_i32: int, n_u32: int
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """The int32 and uint32 views of a fresh control-word slot of ``slab``."""
+    u32_off, words = _ctrl_layout(n_i32, n_u32)
+    slot = slab.take(words)
+    i32 = slot[: int(n_i32)] if n_i32 else None
+    u32 = slot[u32_off : u32_off + int(n_u32)].view(torch.uint32) if n_u32 else None
+    return i32, u32
+
+
+def _read_never(index: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(fp32 [1024], uint64 timeline)`` of ``cuda:index``, bound where no registered program reads or
+    writes: the decode tail's ``out_r``, every decode ``tl`` (written only by diagnostic instances, which are
+    never registered) and the ``ws`` of whole prefill plans (only multi-segment items touch it; a split plan's
+    per-launch workspace replaces it at launch).  Never initialised and never written."""
+    entry = _READ_NEVER.get(index)
     if entry is None:
         dev = torch.device("cuda", index)
-        entry = (
-            torch.empty(1024, dtype=torch.float32, device=dev),
-            torch.zeros(4, dtype=torch.uint32, device=dev),
-            torch.zeros(TL_MAX_GRID * TL_SLOTS, dtype=torch.uint64, device=dev),
-        )
-        _SCRATCH[index] = entry
+        with _CTRL_LOCK:
+            entry = _READ_NEVER.get(index)
+            if entry is None:
+                entry = (
+                    torch.empty(1024, dtype=torch.float32, device=dev),
+                    torch.empty(TL_MAX_GRID * TL_SLOTS, dtype=torch.uint64, device=dev),
+                )
+                _READ_NEVER[index] = entry
     return entry
 
 
-def _tail_workspace(
-    device: torch.device, sk_tiles: int, max_seg: int, block_n: int = BLOCK_N
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Stream-K fp32 partial workspace, self-resetting arrival counters and the fused-norm words per
-    device and plan class.
+def _partial_ws_numel(stage: str, plan: dict[str, Any]) -> int:
+    """FP32 elements of one launch's stream-K partial workspace (0: a whole plan, which writes none).
 
-    The ``NORM_COUNTER_WORDS`` u32 words are zeroed once and never written by the host again:
-    ``[0]`` / ``[1]`` are the row-release semaphores (``atom.inc`` with limit grid - 1, so the
-    last arrival of a launch wraps each back to 0), ``[2]`` is the claimed instances' item ticket
-    and ``[3]`` their retirement count, which the last CTA to retire resets to 0 with ``[2]``.
-    Eager launches and graph replays therefore share one zero-initialised buffer.
+    One ``128 x block_n`` slot per contributor CTA: ``sk_tiles`` split tiles of ``sk_max_seg`` segments of
+    ``CTA_GROUP`` CTAs (the front's slot is 256 wide, the tail's follows the plan's tile).  A plan that
+    carries partials between its items states its slots the same way (the front lane form: ``sk_tiles``
+    clusters of ``sk_max_seg`` 1, one carry slot per CTA).
     """
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    key = (index, int(sk_tiles), int(max_seg), int(block_n))
-    entry = _TAIL_WS.get(key)
-    if entry is None:
-        dev = torch.device("cuda", index)
-        n = max(1, sk_tiles * max_seg * CTA_GROUP)
-        entry = (
-            torch.empty(n * BLOCK_M * block_n, dtype=torch.float32, device=dev),
-            torch.zeros(max(2, sk_tiles * CTA_GROUP), dtype=torch.int32, device=dev),
-            torch.zeros(NORM_COUNTER_WORDS, dtype=torch.uint32, device=dev),
-        )
-        _TAIL_WS[key] = entry
-    return entry
+    sk_tiles = int(plan.get("sk_tiles", 0))
+    if sk_tiles == 0:
+        return 0
+    block_n = FRONT_BLOCK_N if stage == "front" else int(plan["block_n"])
+    return sk_tiles * int(plan["sk_max_seg"]) * CTA_GROUP * BLOCK_M * block_n
 
 
-def _front_workspace(
-    device: torch.device, sk_tiles: int, max_seg: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Front stream-K fp32 partial slots (one ``128 x 256`` slot per contributor CTA) and the
-    self-resetting arrival counters per (split tile, CTA rank), per device and plan class; the
-    package owns them (nothing is reset between launches: the last contributor zeroes its counter)."""
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    key = (index, int(sk_tiles), int(max_seg))
-    entry = _FRONT_WS.get(key)
-    if entry is None:
-        dev = torch.device("cuda", index)
-        n = max(1, sk_tiles * max_seg * CTA_GROUP)
-        entry = (
-            torch.empty(n * BLOCK_M * FRONT_BLOCK_N, dtype=torch.float32, device=dev),
-            torch.zeros(max(2, sk_tiles * CTA_GROUP), dtype=torch.int32, device=dev),
-        )
-        _FRONT_WS[key] = entry
-    return entry
+def _arrival_counter_words(plan: dict[str, Any]) -> int:
+    """int32 stream-K arrival counters of a prefill plan: one per split tile and CTA rank, at least two (the
+    front lane form: one carry counter per CTA of its ``sk_tiles`` clusters)."""
+    return max(2, int(plan.get("sk_tiles", 0)) * CTA_GROUP)
 
 
 # ---------------------------------------------------------------------------
@@ -1221,16 +1326,26 @@ def _front_workspace(
 
 def _bind(
     arch: str, key: str, kwargs: dict[str, Any]
-) -> tuple[Callable[..., Any], tuple]:
-    """Order ``kwargs`` by the argument plan of the program serving ``key`` and load its entry."""
+) -> tuple[Callable[..., Any], tuple, int, int]:
+    """Order ``kwargs`` by the argument plan of the program serving ``key`` and load its entry; also
+    return the position of its ``ws`` buffer argument (-1 when it has none) and the CTA count of its
+    cooperative launch (0 when the program does not launch cooperatively)."""
     module_name = kernel_module_name(arch, key)
     record = MODULES[module_name]
     grid = dict(zip(("grid_x", "grid_y", "grid_z"), kwargs["grid"], strict=True))
+    cooperative_ctas = (
+        grid["grid_x"] * grid["grid_y"] * grid["grid_z"]
+        if record.get("launch", {}).get("cooperative")
+        else 0
+    )
     arguments = []
+    ws_slot = -1
     for kind, name in record["arg_plan"]:
         if kind == "grid":
             arguments.append(grid[name])
         elif name in kwargs:
+            if kind == "buffer" and name == "ws":
+                ws_slot = len(arguments)
             arguments.append(kwargs[name])
         else:
             raise KeyError(
@@ -1238,7 +1353,39 @@ def _bind(
                 f"host binding provides {sorted(kwargs)}"
             )
     module = load_cake_kimi_k3_latent_moe_module(arch, key)
-    return getattr(module, record["ffi_entry"]), tuple(arguments)
+    return (
+        getattr(module, record["ffi_entry"]),
+        tuple(arguments),
+        ws_slot,
+        cooperative_ctas,
+    )
+
+
+# ``cudaGetErrorString(cudaErrorCooperativeLaunchTooLarge)``, which the bindings report when a cooperative grid
+# does not fit the SMs the launch stream offers (a smaller green context, for one).
+_COOPERATIVE_TOO_LARGE = "too many blocks in cooperative launch"
+
+
+def _clear_cuda_last_error() -> None:
+    """Reset the CUDA runtime's last error after a refused launch.  The refusal is not sticky, but the runtime
+    keeps it as the calling thread's last error, which the next PyTorch launch check would raise once.  The
+    bindings share the process's ``libcudart`` with PyTorch (cuda-python's runtime module may load another
+    copy), so this calls ``cudaGetLastError`` in every ``libcudart`` the process has loaded."""
+    paths = set()
+    try:
+        with open("/proc/self/maps") as maps:
+            for line in maps:
+                fields = line.split(None, 5)
+                if len(fields) == 6 and "/libcudart.so" in fields[5]:
+                    paths.add(fields[5].strip())
+    except OSError:
+        return
+    for path in sorted(paths):
+        try:  # already loaded: the same instance, never a new copy
+            lib = ctypes.CDLL(path, mode=os.RTLD_NOLOAD | os.RTLD_LAZY)
+        except OSError:
+            continue
+        lib.cudaGetLastError()
 
 
 @dataclass(frozen=True)
@@ -1249,9 +1396,81 @@ class _Launch:
     kwargs: dict[str, Any] = field(repr=False)
     entry: Callable[..., Any] = field(repr=False)
     arguments: tuple = field(repr=False)
+    # Split prefill plans: FP32 elements of the per-launch partial workspace that replaces the ``ws``
+    # argument at position ``ws_slot`` (``kwargs["ws"]`` is then the never-read placeholder).
+    ws_slot: int = -1
+    ws_numel: int = 0
+    device: Optional[torch.device] = field(default=None, repr=False)
+    # CTAs of a cooperative launch (0: not cooperative); all of them must be resident at once.
+    cooperative_ctas: int = 0
 
     def __call__(self) -> None:
-        self.entry(*self.arguments)
+        arguments: Sequence[Any] = self.arguments
+        if self.ws_numel:
+            with_ws = list(arguments)
+            # Written before it is read inside this launch, so never initialised.  The block returns to the
+            # launch stream's cache when the reference drops (stream-ordered reuse); under capture it is a
+            # block of the graph's memory pool.
+            with_ws[self.ws_slot] = torch.empty(
+                self.ws_numel, dtype=torch.float32, device=self.device
+            )
+            arguments = with_ws
+        try:
+            self.entry(*arguments)
+        except Exception as exc:
+            if not self.cooperative_ctas or _COOPERATIVE_TOO_LARGE not in str(exc):
+                raise
+            # Nothing ran.  Clear the runtime's last error, so the caller's next CUDA work does not fail on it.
+            _clear_cuda_last_error()
+            raise RuntimeError(
+                f"{self.key} ({self.stage}): the cooperative launch of {self.cooperative_ctas} CTAs needs at "
+                f"least {self.min_sms()} SMs resident at once, more than the launch stream offers (a smaller "
+                "green context or a partitioned device); launch it on a stream with that many SMs "
+                f"(CUDA: {_COOPERATIVE_TOO_LARGE})"
+            ) from None
+
+    def min_sms(self) -> int:
+        """SMs a cooperative launch needs: its CTAs, as many per SM as the program's shared memory allows
+        (one for every registered cooperative program)."""
+        if not self.cooperative_ctas:
+            return 0
+        smem = int(MODULES[self.module]["launch"]["dynamic_smem_bytes"])
+        per_sm_smem = getattr(
+            torch.cuda.get_device_properties(self.device),
+            "shared_memory_per_multiprocessor",
+            0,
+        )
+        # 1 KiB of each SM's shared memory is reserved per resident CTA.
+        per_sm = max(1, int(per_sm_smem) // (smem + 1024))
+        return -(-self.cooperative_ctas // per_sm)
+
+
+def _make_launch(
+    stage: str,
+    arch: str,
+    key: str,
+    kwargs: dict[str, Any],
+    *,
+    ws_numel: int = 0,
+    device_index: int = 0,
+) -> _Launch:
+    entry, arguments, ws_slot, cooperative_ctas = _bind(arch, key, kwargs)
+    if ws_numel and ws_slot < 0:
+        raise RuntimeError(
+            f"{key!r} has no 'ws' argument for its {ws_numel}-element partial workspace"
+        )
+    return _Launch(
+        stage,
+        key,
+        kernel_module_name(arch, key),
+        kwargs,
+        entry,
+        arguments,
+        ws_slot,
+        int(ws_numel),
+        torch.device("cuda", device_index),
+        cooperative_ctas,
+    )
 
 
 @dataclass(frozen=True)
@@ -1259,10 +1478,19 @@ class KimiK3LatentMoeRunner:
     """The prepared launch sequence of one front or tail call.
 
     ``launch()`` submits the bound programs in order on the current torch
-    stream with no CUDA allocation and no host synchronisation; the kernels
+    stream of the runner's device with no host synchronisation; the kernels
     read every operand on device at launch, so the runner (or a CUDA Graph
     capturing it) replays for new values written into the same buffers.
     Prepare a new runner when a shape or a tensor binding changes.
+
+    The runner owns its control words (never freed, so a graph that captured
+    it stays valid after the runner is dropped); a split prefill plan takes
+    its FP32 partial workspace per launch from PyTorch's caching allocator on
+    the launch stream (from the graph's memory pool under capture).  Distinct
+    runners share no mutable device state, so their launches on any streams or
+    graphs never mix control words or partials; a runner must not run
+    concurrently with itself, and graphs that share one memory pool must not
+    replay concurrently.
     """
 
     stage: str
@@ -1275,6 +1503,7 @@ class KimiK3LatentMoeRunner:
     plan: dict[str, Any] = field(repr=False)
     launches: tuple[_Launch, ...] = field(repr=False)
     outputs: tuple[torch.Tensor, ...] = field(repr=False)
+    device_index: int = field(repr=False)
 
     @property
     def kernel_keys(self) -> tuple[str, ...]:
@@ -1288,11 +1517,19 @@ class KimiK3LatentMoeRunner:
     def launch_count(self) -> int:
         return len(self.launches)
 
-    def launch(self) -> tuple[torch.Tensor, ...]:
+    def _submit(self) -> tuple[torch.Tensor, ...]:
         with tvm_ffi.use_torch_stream():
             for launch in self.launches:
                 launch()
         return self.outputs
+
+    def launch(self) -> tuple[torch.Tensor, ...]:
+        # The bindings launch on the stream of the runner's device that ``use_torch_stream`` sets for the
+        # current device, and the partial workspace comes from that device's current stream: enter it.
+        if torch.cuda.current_device() != self.device_index:
+            with torch.cuda.device(self.device_index):
+                return self._submit()
+        return self._submit()
 
     __call__ = launch
 
@@ -1338,8 +1575,32 @@ def prepare_kimi_k3_latent_moe_front(
 
     ``shared_gate_up_weight`` is the rank-local ``[2 * I_local, 7168]`` concatenation of the
     shared experts' gate rows followed by their up rows (``I_local = 6144 / TP``).  The JIT
-    module(s) are built and loaded here; prepare outside CUDA Graph capture.
+    module(s) are built and loaded and the runner's control words are taken here: prepare
+    before CUDA Graph capture, once per layer and shape (the words are never freed).
     """
+    return _prepare_front(
+        x,
+        gate_weight,
+        down_weight,
+        shared_gate_up_weight,
+        logits,
+        latent,
+        shared_act,
+        lane=False,
+    )
+
+
+def _prepare_front(
+    x: torch.Tensor,
+    gate_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    shared_gate_up_weight: torch.Tensor,
+    logits: torch.Tensor,
+    latent: torch.Tensor,
+    shared_act: torch.Tensor,
+    *,
+    lane: bool,
+) -> KimiK3LatentMoeRunner:
     T = int(x.shape[0]) if x.dim() == 2 else -1
     _check(x, (T, HIDDEN), "x")
     i_local = (
@@ -1378,7 +1639,8 @@ def prepare_kimi_k3_latent_moe_front(
         if T <= DECODE_MAX_T:
             plan = decode_front_plan(T, i_local, sm_count)
             key = decode_kernel_key(plan)
-            f32_dummy, counters, tl = _scratch(device)
+            _, counters = _control_words(index, 0, DECODE_COUNTER_WORDS, lane=lane)
+            _, tl = _read_never(index)
             kwargs = dict(
                 A_R=gate_weight,
                 A_L=down_weight,
@@ -1401,16 +1663,17 @@ def prepare_kimi_k3_latent_moe_front(
                 grid=(int(plan["grid"]), 1, 1),
             )
             assert tuple(kwargs) == DECODE_KWARGS
-            module = kernel_module_name(arch, key)
-            entry, arguments = _bind(arch, key, kwargs)
-            launches = (_Launch("front_decode", key, module, kwargs, entry, arguments),)
+            launches = (
+                _make_launch("front_decode", arch, key, kwargs, device_index=index),
+            )
             route = "decode"
         else:
             plan = prefill_front_plan(T, i_local, sm_count)
             key = front_kernel_key(i_local, plan["evict_first"])
-            ws, counters = _front_workspace(
-                device, plan["sk_tiles"], plan["sk_max_seg"]
+            counters, _ = _control_words(
+                index, _arrival_counter_words(plan), 0, lane=lane
             )
+            ws, _ = _read_never(index)  # a split plan's partials replace it per launch
             kwargs = dict(
                 A=x,
                 WG=gate_weight,
@@ -1431,9 +1694,16 @@ def prepare_kimi_k3_latent_moe_front(
                 grid=(int(plan["grid"]), 1, 1),
             )
             assert tuple(kwargs) == FRONT_KWARGS
-            module = kernel_module_name(arch, key)
-            entry, arguments = _bind(arch, key, kwargs)
-            launches = (_Launch("front_gemm", key, module, kwargs, entry, arguments),)
+            launches = (
+                _make_launch(
+                    "front_gemm",
+                    arch,
+                    key,
+                    kwargs,
+                    ws_numel=_partial_ws_numel("front", plan),
+                    device_index=index,
+                ),
+            )
             route = "prefill"
     return KimiK3LatentMoeRunner(
         "front",
@@ -1446,6 +1716,7 @@ def prepare_kimi_k3_latent_moe_front(
         plan,
         launches,
         (logits, latent, shared_act),
+        index,
     )
 
 
@@ -1458,9 +1729,20 @@ def kimi_k3_latent_moe_front(
     latent: torch.Tensor,
     shared_act: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Complete front operator for one rank into the caller-owned ``logits`` / ``latent`` / ``shared_act``."""
-    return prepare_kimi_k3_latent_moe_front(
-        x, gate_weight, down_weight, shared_gate_up_weight, logits, latent, shared_act
+    """Complete front operator for one rank into the caller-owned ``logits`` / ``latent`` / ``shared_act``.
+
+    Eager calls share one set of control words per device, stream and size (calls on one stream are
+    stream-ordered); a call under CUDA Graph capture takes fresh words, which are never freed.
+    """
+    return _prepare_front(
+        x,
+        gate_weight,
+        down_weight,
+        shared_gate_up_weight,
+        logits,
+        latent,
+        shared_act,
+        lane=True,
     )()
 
 
@@ -1487,8 +1769,36 @@ def prepare_kimi_k3_latent_moe_tail(
     device); ``y_workspace`` is a caller-owned BF16 ``[T, 3584]`` buffer that receives the
     normalised latent (the GEMM's B operand).  ``up_weight`` is the full ``[7168, 3584]``
     replicated up-projection; this rank multiplies its ``3584 / tp`` column slice.
-    ``shared_down_weight`` is the rank-local ``[7168, 6144 / tp]`` shard.
+    ``shared_down_weight`` is the rank-local ``[7168, 6144 / tp]`` shard.  Prepare before
+    CUDA Graph capture, once per layer and shape (the runner's control words are never freed).
     """
+    return _prepare_tail(
+        routed,
+        norm_weight,
+        up_weight,
+        shared_act,
+        shared_down_weight,
+        out,
+        tp=tp,
+        rank=rank,
+        y_workspace=y_workspace,
+        lane=False,
+    )
+
+
+def _prepare_tail(
+    routed: torch.Tensor,
+    norm_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    shared_act: torch.Tensor,
+    shared_down_weight: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    tp: int,
+    rank: int,
+    y_workspace: torch.Tensor,
+    lane: bool,
+) -> KimiK3LatentMoeRunner:
     tp, rank = int(tp), int(rank)
     if tp not in SUPPORTED_TP:
         raise ValueError(f"tp must be one of {SUPPORTED_TP}, got {tp}")
@@ -1524,7 +1834,8 @@ def prepare_kimi_k3_latent_moe_tail(
         if T <= DECODE_MAX_T:
             plan = decode_tail_plan(T, i_local, tp, P, sm_count)
             key = decode_kernel_key(plan)
-            f32_dummy, counters, tl = _scratch(device)
+            _, counters = _control_words(index, 0, DECODE_COUNTER_WORDS, lane=lane)
+            f32_dummy, tl = _read_never(index)
             kwargs = dict(
                 A_R=up_weight,
                 A_L=up_weight,
@@ -1547,17 +1858,18 @@ def prepare_kimi_k3_latent_moe_tail(
                 grid=(int(plan["grid"]), 1, 1),
             )
             assert tuple(kwargs) == DECODE_KWARGS
-            module = kernel_module_name(arch, key)
-            entry, arguments = _bind(arch, key, kwargs)
             launches = (
-                _Launch("tail_decode_fused", key, module, kwargs, entry, arguments),
+                _make_launch(
+                    "tail_decode_fused", arch, key, kwargs, device_index=index
+                ),
             )
             route = "decode"
         else:
             plan = prefill_tail_plan(T, tp, sm_count, P)
-            ws, counters, norm_counter = _tail_workspace(
-                device, plan["sk_tiles"], plan["sk_max_seg"], plan["block_n"]
+            counters, norm_counter = _control_words(
+                index, _arrival_counter_words(plan), NORM_COUNTER_WORDS, lane=lane
             )
+            ws, _ = _read_never(index)  # a split plan's partials replace it per launch
             gemm_key = tail_gemm_kernel_key(
                 tp,
                 plan["weights_evict_first"],
@@ -1596,15 +1908,13 @@ def prepare_kimi_k3_latent_moe_tail(
                 grid=(int(plan["gemm_grid"]), 1, 1),
             )
             assert tuple(gemm_kwargs) == TAIL_GEMM_KWARGS
-            gemm_module = kernel_module_name(arch, gemm_key)
-            gemm_entry, gemm_arguments = _bind(arch, gemm_key, gemm_kwargs)
-            gemm_launch = _Launch(
+            gemm_launch = _make_launch(
                 "tail_gemm",
+                arch,
                 gemm_key,
-                gemm_module,
                 gemm_kwargs,
-                gemm_entry,
-                gemm_arguments,
+                ws_numel=_partial_ws_numel("tail", plan),
+                device_index=index,
             )
             if plan["fused_norm"]:
                 # One launch: the GEMM's epilogue warps normalise the latent rows into
@@ -1622,22 +1932,25 @@ def prepare_kimi_k3_latent_moe_tail(
                     grid=(int(plan["norm_grid"]), 1, 1),
                 )
                 assert tuple(norm_kwargs) == NORM_KWARGS
-                norm_module = kernel_module_name(arch, norm_key)
-                norm_entry, norm_arguments = _bind(arch, norm_key, norm_kwargs)
                 launches = (
-                    _Launch(
-                        "tail_norm",
-                        norm_key,
-                        norm_module,
-                        norm_kwargs,
-                        norm_entry,
-                        norm_arguments,
+                    _make_launch(
+                        "tail_norm", arch, norm_key, norm_kwargs, device_index=index
                     ),
                     gemm_launch,
                 )
             route = "prefill"
     return KimiK3LatentMoeRunner(
-        "tail", tp, rank, T, arch, sm_count, route, plan, launches, (y_workspace, out)
+        "tail",
+        tp,
+        rank,
+        T,
+        arch,
+        sm_count,
+        route,
+        plan,
+        launches,
+        (y_workspace, out),
+        index,
     )
 
 
@@ -1653,8 +1966,12 @@ def kimi_k3_latent_moe_tail(
     rank: int,
     y_workspace: torch.Tensor,
 ) -> torch.Tensor:
-    """Complete tail for one rank into the caller-owned ``out`` (``y_workspace`` receives the normalised latent)."""
-    prepare_kimi_k3_latent_moe_tail(
+    """Complete tail for one rank into the caller-owned ``out`` (``y_workspace`` receives the normalised latent).
+
+    Eager calls share one set of control words per device, stream and size (calls on one stream are
+    stream-ordered); a call under CUDA Graph capture takes fresh words, which are never freed.
+    """
+    _prepare_tail(
         routed,
         norm_weight,
         up_weight,
@@ -1664,6 +1981,7 @@ def kimi_k3_latent_moe_tail(
         tp=tp,
         rank=rank,
         y_workspace=y_workspace,
+        lane=True,
     )()
     return out
 

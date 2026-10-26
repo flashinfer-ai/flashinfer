@@ -55,10 +55,9 @@ programs rely on every CTA of their grid being resident and the plan rules were
 validated on those parts only.  `generated_program_available(device, stage, tp,
 num_tokens, num_partials)` answers for the exact route `prepare_*` would
 require (the decode tail instance and the TP8 prefill norm instance depend on the routed-partial count `P`).
-Plans are memoised per shape, nothing is planned per launch and nothing is
-allocated at launch (per-device scratch buffers are created at preparation), so
-a prepared runner (or a CUDA Graph capturing it) replays for new values written
-into the bound buffers.
+Plans are memoised per shape and nothing is planned per launch, so a prepared
+runner (or a CUDA Graph capturing it) replays for new values written into the
+bound buffers (see "Concurrency" for the per-runner device state).
 
 ```python
 import torch
@@ -85,6 +84,53 @@ out = torch.empty(T, 7168, device=dev, dtype=torch.bfloat16)
 y = torch.empty(T, 3584, device=dev, dtype=torch.bfloat16)
 kimi_k3_latent_moe_tail(routed, norm_weight, up_weight, shared_act, shared_down, out, tp=tp, rank=rank, y_workspace=y)
 ```
+
+## Concurrency
+
+The programs keep two kinds of mutable device scratch beside the caller's
+buffers, and the package owns them so that distinct runners never share any:
+
+- **Control words** (the decode grid counter, the prefill stream-K arrival
+  counters and the fused-norm semaphores / claim ticket / retirement count) must
+  read zero before a launch, and every launch returns them to zero.  Each
+  `prepare_*` call takes its own words (at most 1 KiB) from a per-device slab
+  that is zeroed and synchronised once; they are never freed or reused, so a
+  CUDA Graph that captured a runner stays valid after the runner is dropped.
+  Prepare once per layer and shape, before capture: preparing under capture
+  takes a free slab slot (no graph node), or, with the slab exhausted, zeroes
+  new words inside the capture (one zero-fill kernel node in that graph).
+- **Partials** (the FP32 stream-K workspace of split prefill plans: one
+  `128 x block_n` slot per contributor CTA of every split tile, written before it
+  is read inside one launch) are taken per launch with
+  `torch.empty` from PyTorch's caching allocator on the launch stream: reuse is
+  stream-ordered, and under CUDA Graph capture the block belongs to that graph's
+  memory pool.  This is the only allocation at launch (whole plans and the
+  decode route allocate nothing), so an out-of-memory error can surface at a
+  split-plan launch.
+
+Contract:
+
+- Distinct runners share no mutable device state: launches of distinct
+  runners on any streams, host threads, green contexts or CUDA Graphs never mix
+  their control words or partials.
+- A runner must not run concurrently with itself (its outputs, `y_workspace` and
+  control words are its own): use one runner per concurrent stream.
+- CUDA Graphs that share one PyTorch memory pool (`pool=`) must not replay
+  concurrently (PyTorch's rule for any graph that allocates).
+- `runner()` launches on the current stream of the runner's device; it enters
+  that device when another one is current.
+- The one-shot `kimi_k3_latent_moe_front` / `kimi_k3_latent_moe_tail` calls
+  prepare per call: eager calls share one set of control words per device,
+  stream and size (calls on one stream are stream-ordered), and a call under
+  capture takes fresh words, which are never freed.  Prefer prepared runners
+  under capture and where a PDL kernel that never waits on its predecessor can
+  sit between two calls on one stream.
+- A cooperative route (the decode routes and the claimed tail) needs its whole
+  grid resident at once, one CTA per SM.  Launched eagerly on a stream that
+  offers fewer SMs (a smaller green context), it runs nothing and raises a
+  `RuntimeError` naming the route and the SMs it needs; the CUDA runtime's last
+  error is cleared, so later work in the process is unaffected.  Captured on
+  such a stream, the launch fails the capture, again with no lasting error.
 
 ## Tested physical configurations
 
