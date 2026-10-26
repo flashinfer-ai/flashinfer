@@ -34,9 +34,14 @@
         "cuda_symbol": "kernel_gdn_decode_nontranspose_fp32_t1",
         "entry": "run_decode_gdn_decode_nontranspose_fp32_t1_04ea5bbb4571",
         "module_ident": "gdn_decode_nontranspose_fp32_t1_11cc3bed2d",
-        "params": {},
+        "params": {
+          "CTAS_PER_BATCH_ROW": 32,
+          "H": 16,
+          "HV": 32,
+          "HV_MINUS_1": 31
+        },
         "shim_namespace": "07573fccd092a28c",
-        "template": "host/templates/decode_fp32_t1.cc.in"
+        "template": "host/templates/decode_fp32_t1_x2.cc.in"
       },
       "name": "decode_gdn_decode_nontranspose_fp32_t1_04ea5bbb4571",
       "outputs": [
@@ -69,9 +74,14 @@
         "cuda_symbol": "kernel_gdn_decode_nontranspose_fp32_t1",
         "entry": "run_decode_gdn_decode_nontranspose_fp32_t1_969139ab9b0b",
         "module_ident": "gdn_decode_nontranspose_fp32_t1_613cef84ab",
-        "params": {},
+        "params": {
+          "CTAS_PER_BATCH_ROW": 32,
+          "H": 16,
+          "HV": 32,
+          "HV_MINUS_1": 31
+        },
         "shim_namespace": "5b4b87bf377f20a9",
-        "template": "host/templates/decode_fp32_t1.cc.in"
+        "template": "host/templates/decode_fp32_t1_x2.cc.in"
       },
       "name": "decode_gdn_decode_nontranspose_fp32_t1_969139ab9b0b",
       "outputs": [
@@ -102,7 +112,9 @@
         "entry": "run_decode_gdn_decode_nontranspose_fp32_t1_small_9ad0d4c44c87",
         "module_ident": "gdn_decode_nontranspose_fp32_t1_small_2e105cc41e",
         "params": {
+          "BLOCK_THREADS": 128,
           "CTAS_PER_BATCH_ROW": 64,
+          "DYNAMIC_SMEM_BYTES": 11392,
           "H": 4,
           "HV": 8,
           "HV_MINUS_1": 7
@@ -139,7 +151,9 @@
         "entry": "run_decode_gdn_decode_nontranspose_fp32_t1_small_eafa0e0ed1b3",
         "module_ident": "gdn_decode_nontranspose_fp32_t1_small_b4d09b88f0",
         "params": {
+          "BLOCK_THREADS": 128,
           "CTAS_PER_BATCH_ROW": 256,
+          "DYNAMIC_SMEM_BYTES": 11392,
           "H": 16,
           "HV": 32,
           "HV_MINUS_1": 31
@@ -176,7 +190,9 @@
         "entry": "run_decode_gdn_decode_nontranspose_fp32_t1_small_4d99ceef01d7",
         "module_ident": "gdn_decode_nontranspose_fp32_t1_small_bfaa32c11b",
         "params": {
+          "BLOCK_THREADS": 128,
           "CTAS_PER_BATCH_ROW": 256,
+          "DYNAMIC_SMEM_BYTES": 11392,
           "H": 16,
           "HV": 32,
           "HV_MINUS_1": 31
@@ -9980,9 +9996,14 @@
         "cuda_symbol": "kernel_cake_gdn_81649f746c136e3ee3d3",
         "entry": "run_decode_gdn_decode_nontranspose_fp32_t1_hqsplit_2f5b2615dc27",
         "module_ident": "cake_gdn_81649f746c136e3ee3d3_c8acdb5feb",
-        "params": {},
+        "params": {
+          "CTAS_PER_BATCH_ROW": 32,
+          "H": 16,
+          "HV": 32,
+          "HV_MINUS_1": 31
+        },
         "shim_namespace": "68fc2724334b57cd",
-        "template": "host/templates/decode_fp32_t1.cc.in"
+        "template": "host/templates/decode_fp32_t1_x2.cc.in"
       },
       "name": "decode_gdn_decode_nontranspose_fp32_t1_hqsplit_2f5b2615dc27",
       "outputs": [
@@ -10010,9 +10031,14 @@
         "cuda_symbol": "kernel_cake_gdn_81649f746c136e3ee3d3",
         "entry": "run_decode_gdn_decode_nontranspose_fp32_t1_hqsplit_41f955324042",
         "module_ident": "cake_gdn_81649f746c136e3ee3d3_849bbcc5aa",
-        "params": {},
+        "params": {
+          "CTAS_PER_BATCH_ROW": 32,
+          "H": 16,
+          "HV": 32,
+          "HV_MINUS_1": 31
+        },
         "shim_namespace": "a38d41f117d8a3c7",
-        "template": "host/templates/decode_fp32_t1.cc.in"
+        "template": "host/templates/decode_fp32_t1_x2.cc.in"
       },
       "name": "decode_gdn_decode_nontranspose_fp32_t1_hqsplit_41f955324042",
       "outputs": [
@@ -10041,13 +10067,15 @@
         "entry": "run_decode_gdn_decode_nontranspose_fp32_t1_mid4_83af09e0327b",
         "module_ident": "cake_gdn_af638a7731c59099399e_7d445f1e9f",
         "params": {
+          "BLOCK_THREADS": 256,
           "CTAS_PER_BATCH_ROW": 32,
+          "DYNAMIC_SMEM_BYTES": 19584,
           "H": 4,
           "HV": 8,
           "HV_MINUS_1": 7
         },
         "shim_namespace": "625b0e9f9952a414",
-        "template": "host/templates/decode_fp32_t1_small_b256.cc.in"
+        "template": "host/templates/decode_fp32_t1_small.cc.in"
       },
       "name": "decode_gdn_decode_nontranspose_fp32_t1_mid4_83af09e0327b",
       "outputs": [
@@ -10076,13 +10104,15 @@
         "entry": "run_decode_gdn_decode_nontranspose_fp32_t1_mid4_b6c9bf4604ba",
         "module_ident": "cake_gdn_af638a7731c59099399e_a0c943e675",
         "params": {
+          "BLOCK_THREADS": 256,
           "CTAS_PER_BATCH_ROW": 128,
+          "DYNAMIC_SMEM_BYTES": 19584,
           "H": 16,
           "HV": 32,
           "HV_MINUS_1": 31
         },
         "shim_namespace": "8a955686ce2e16e8",
-        "template": "host/templates/decode_fp32_t1_small_b256.cc.in"
+        "template": "host/templates/decode_fp32_t1_small.cc.in"
       },
       "name": "decode_gdn_decode_nontranspose_fp32_t1_mid4_b6c9bf4604ba",
       "outputs": [
@@ -10111,13 +10141,15 @@
         "entry": "run_decode_gdn_decode_nontranspose_fp32_t1_mid4_cf7d25ce6e3f",
         "module_ident": "cake_gdn_af638a7731c59099399e_a7e4bd2e8c",
         "params": {
+          "BLOCK_THREADS": 256,
           "CTAS_PER_BATCH_ROW": 128,
+          "DYNAMIC_SMEM_BYTES": 19584,
           "H": 16,
           "HV": 32,
           "HV_MINUS_1": 31
         },
         "shim_namespace": "bae2f2c65fed572c",
-        "template": "host/templates/decode_fp32_t1_small_b256.cc.in"
+        "template": "host/templates/decode_fp32_t1_small.cc.in"
       },
       "name": "decode_gdn_decode_nontranspose_fp32_t1_mid4_cf7d25ce6e3f",
       "outputs": [
@@ -10929,7 +10961,7 @@
           "TILES_PER_SEQ": 128
         },
         "shim_namespace": "d39c6ab1e43409c8",
-        "template": "host/templates/prefill_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_07755dcc79e1",
@@ -10975,7 +11007,7 @@
           "TILES_PER_SEQ": 64
         },
         "shim_namespace": "b9be751bfcfe3cbc",
-        "template": "host/templates/prefill_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_0ba1a8f6eca6",
@@ -11016,7 +11048,7 @@
           "HV": 1
         },
         "shim_namespace": "dcebaa2048a09337",
-        "template": "host/templates/prefill_final_state_fixed_heads_checkpoints_i64meta.cc.in"
+        "template": "host/templates/prefill_final_state_fixed_heads_checkpoints.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_2b0ba806c460",
@@ -11062,7 +11094,7 @@
           "TILES_PER_SEQ": 8
         },
         "shim_namespace": "9686d46c2b345afe",
-        "template": "host/templates/prefill_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_59e85be8077f",
@@ -11108,7 +11140,7 @@
           "TILES_PER_SEQ": 2
         },
         "shim_namespace": "3986ac9fcbfe6969",
-        "template": "host/templates/prefill_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_8093137a4f6c",
@@ -11151,7 +11183,7 @@
           "TILES_PER_SEQ": 2
         },
         "shim_namespace": "8a31953049ce894f",
-        "template": "host/templates/prefill_single_chunk_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_single_chunk_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_8d4bc9b15eb5",
@@ -11191,7 +11223,7 @@
           "IO_TMA_DTYPE": "CU_TENSOR_MAP_DATA_TYPE_FLOAT16"
         },
         "shim_namespace": "8ee28cce339796fe",
-        "template": "host/templates/prefill_final_state_dynamic_heads_mod_i64meta.cc.in"
+        "template": "host/templates/prefill_final_state_dynamic_heads_mod.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_c41dc09d9aa9",
@@ -11231,7 +11263,7 @@
           "IO_TMA_DTYPE": "CU_TENSOR_MAP_DATA_TYPE_FLOAT16"
         },
         "shim_namespace": "a66f4a4e80ebaaa4",
-        "template": "host/templates/prefill_final_state_dynamic_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_final_state_dynamic_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_c7933f9b15de",
@@ -11277,7 +11309,7 @@
           "TILES_PER_SEQ": 4
         },
         "shim_namespace": "2e1bbe8213929eb6",
-        "template": "host/templates/prefill_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_d846f27e312b",
@@ -11318,7 +11350,7 @@
           "HV": 4
         },
         "shim_namespace": "3a3aef140219d174",
-        "template": "host/templates/prefill_final_state_fixed_heads_checkpoints_i64meta.cc.in"
+        "template": "host/templates/prefill_final_state_fixed_heads_checkpoints.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_ee3d5a47f47f",
@@ -11364,7 +11396,7 @@
           "TILES_PER_SEQ": 8
         },
         "shim_namespace": "11dde556e40d994a",
-        "template": "host/templates/prefill_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_sm107a_l7_vec2_f84a26b89605",
@@ -11406,7 +11438,7 @@
           "STATE_DL_CODE": 4
         },
         "shim_namespace": "5b0728ca42cf046a",
-        "template": "host/templates/prefill_initial_final_state_dynamic_heads_mod_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_dynamic_heads_mod.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_00bd866b100e",
@@ -11448,7 +11480,7 @@
           "TILES_PER_SEQ": 64
         },
         "shim_namespace": "91598090e4a54f4c",
-        "template": "host/templates/prefill_indexed_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_indexed_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_086fa1f39a1b",
@@ -11494,7 +11526,7 @@
           "TILES_PER_SEQ": 64
         },
         "shim_namespace": "818864cf85821d37",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_0ebaac19d59c",
@@ -11531,7 +11563,7 @@
         "module_ident": "cake_gdn_b304bd0238c73e54cac9_3efe3977b2",
         "params": {},
         "shim_namespace": "134c08b29bb2b9e2",
-        "template": "host/templates/prefill_indexed_state_fixed_heads_checkpoints_i64meta.cc.in"
+        "template": "host/templates/prefill_indexed_state_fixed_heads_checkpoints.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_0f4d9cc10344",
@@ -11577,7 +11609,7 @@
           "TILES_PER_SEQ": 32
         },
         "shim_namespace": "b619fc58f1221b1b",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_25f5b9ea1e56",
@@ -11623,7 +11655,7 @@
           "TILES_PER_SEQ": 2
         },
         "shim_namespace": "5220834ab535b13e",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_520a53610811",
@@ -11669,7 +11701,7 @@
           "TILES_PER_SEQ": 32
         },
         "shim_namespace": "d0d4930e800b5931",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_79082f16bd95",
@@ -11715,7 +11747,7 @@
           "TILES_PER_SEQ": 16
         },
         "shim_namespace": "5bb5ceb01982fe08",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_92bd4a9cb855",
@@ -11761,7 +11793,7 @@
           "TILES_PER_SEQ": 32
         },
         "shim_namespace": "a40331d4d6656be7",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_9958cc0ee23b",
@@ -11807,7 +11839,7 @@
           "TILES_PER_SEQ": 64
         },
         "shim_namespace": "0edc6792baca2b87",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_9a88f173a2ef",
@@ -11849,7 +11881,7 @@
           "TILES_PER_SEQ": 32
         },
         "shim_namespace": "404d1d0cd3fcf58c",
-        "template": "host/templates/prefill_indexed_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_indexed_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_9f0cd8139b4e",
@@ -11891,7 +11923,7 @@
           "TILES_PER_SEQ": 16
         },
         "shim_namespace": "78cb47a2a11da158",
-        "template": "host/templates/prefill_indexed_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_indexed_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_dc0a334f8396",
@@ -11937,7 +11969,7 @@
           "TILES_PER_SEQ": 16
         },
         "shim_namespace": "c16838ac4cfe714b",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_f9173f558be4",
@@ -11979,7 +12011,7 @@
           "STATE_DL_CODE": 10
         },
         "shim_namespace": "fb78e7ee39f74ca8",
-        "template": "host/templates/prefill_initial_final_state_dynamic_heads_mod_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_dynamic_heads_mod.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_e4m3state_sm107a_st8s_pack_670358a2c3c7",
@@ -12025,7 +12057,7 @@
           "TILES_PER_SEQ": 2
         },
         "shim_namespace": "9cae818e2d8aadcb",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_e4m3state_sm107a_st8s_pack_c5f6eaa84898",
@@ -12071,7 +12103,7 @@
           "TILES_PER_SEQ": 64
         },
         "shim_namespace": "4de22ec7df9c5c05",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_e4m3state_sm107a_st8s_pack_ed9d07afb0c6",
@@ -12126,7 +12158,7 @@
           "STATE_DL_CODE": 12
         },
         "shim_namespace": "32b2f5b6bfc508f3",
-        "template": "host/templates/prefill_initial_final_state_dynamic_heads_mod_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_dynamic_heads_mod.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_e5m2state_sm107a_st8s_pack_3c43908da7ee",
@@ -12185,7 +12217,7 @@
           "TILES_PER_SEQ": 2
         },
         "shim_namespace": "72e6a3f3ed09d905",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_e5m2state_sm107a_st8s_pack_43df81209a60",
@@ -12244,7 +12276,7 @@
           "TILES_PER_SEQ": 64
         },
         "shim_namespace": "9e38321aae3252c6",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_e5m2state_sm107a_st8s_pack_5c53d8aa04e3",
@@ -12290,7 +12322,7 @@
           "TILES_PER_SEQ": 32
         },
         "shim_namespace": "34fa5a4b0d91c066",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_07db4380c362",
@@ -12336,7 +12368,7 @@
           "TILES_PER_SEQ": 64
         },
         "shim_namespace": "fada7f2ca8fc324d",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_0bbc67fee836",
@@ -12382,7 +12414,7 @@
           "TILES_PER_SEQ": 8
         },
         "shim_namespace": "2cbd9d49f9d1417b",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_2dcc250c24b8",
@@ -12428,7 +12460,7 @@
           "TILES_PER_SEQ": 64
         },
         "shim_namespace": "f42c11cbf5f03bc7",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_32804ca12569",
@@ -12474,7 +12506,7 @@
           "TILES_PER_SEQ": 32
         },
         "shim_namespace": "7f660891fbf0cdfe",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_38fa956a1e8f",
@@ -12513,7 +12545,7 @@
           "TILES_PER_HEAD": 2
         },
         "shim_namespace": "3ffd32b04c0b8a0a",
-        "template": "host/templates/prefill_initial_final_state_dynamic_heads_gqa_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_dynamic_heads_gqa.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_903c026f3418",
@@ -12559,7 +12591,7 @@
           "TILES_PER_SEQ": 16
         },
         "shim_namespace": "37f1cf09245f6f85",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_9b69259a5dff",
@@ -12605,7 +12637,7 @@
           "TILES_PER_SEQ": 64
         },
         "shim_namespace": "fad9e4e471fa12d0",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_b68cf72b1398",
@@ -12647,7 +12679,7 @@
           "STATE_DL_CODE": 2
         },
         "shim_namespace": "1244cd5b90149289",
-        "template": "host/templates/prefill_initial_final_state_dynamic_heads_mod_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_dynamic_heads_mod.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_sm107a_l7_vec2_dd05359db36b",
@@ -12693,7 +12725,7 @@
           "TILES_PER_SEQ": 64
         },
         "shim_namespace": "01a0cd1907cd807d",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_2a3fd653b6d5",
@@ -12739,7 +12771,7 @@
           "TILES_PER_SEQ": 64
         },
         "shim_namespace": "f5d845b5a740c4c6",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_3c6af6b0a114",
@@ -12785,7 +12817,7 @@
           "TILES_PER_SEQ": 64
         },
         "shim_namespace": "ef4aba63ae5548d8",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_5e4264fc928e",
@@ -12831,7 +12863,7 @@
           "TILES_PER_SEQ": 32
         },
         "shim_namespace": "1a1dc0a2e44eddf1",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_865d26cf5d50",
@@ -12873,7 +12905,7 @@
           "STATE_DL_CODE": 2
         },
         "shim_namespace": "63a19ec73b1d1f61",
-        "template": "host/templates/prefill_initial_final_state_dynamic_heads_mod_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_dynamic_heads_mod.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_897fad4b341a",
@@ -12919,7 +12951,7 @@
           "TILES_PER_SEQ": 8
         },
         "shim_namespace": "ba2bf47c335af397",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_96dfe30edab9",
@@ -12965,7 +12997,7 @@
           "TILES_PER_SEQ": 128
         },
         "shim_namespace": "baf3ab107c597cd6",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_a10ac7097ac8",
@@ -13011,7 +13043,7 @@
           "TILES_PER_SEQ": 16
         },
         "shim_namespace": "2cfaf098dfe991e3",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_b5fe63834663",
@@ -13057,7 +13089,7 @@
           "TILES_PER_SEQ": 32
         },
         "shim_namespace": "cef98a98a7b98a52",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm107a_l7_vec2_fa12c713e224",
@@ -13103,7 +13135,7 @@
           "TILES_PER_SEQ": 64
         },
         "shim_namespace": "5b5bd38ac2683770",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state_sm107a_st2s_vec2lp_1c761e36d1dd",
@@ -13149,7 +13181,7 @@
           "TILES_PER_SEQ": 2
         },
         "shim_namespace": "43b498044945f292",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state_sm107a_st2s_vec2lp_28f2f2ae33ac",
@@ -13191,7 +13223,7 @@
           "STATE_DL_CODE": 2
         },
         "shim_namespace": "f06ba055f012fde7",
-        "template": "host/templates/prefill_initial_final_state_dynamic_heads_mod_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_dynamic_heads_mod.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state_sm107a_st2s_vec2lp_c1eb93505ad3",
@@ -13237,7 +13269,7 @@
           "TILES_PER_SEQ": 64
         },
         "shim_namespace": "b941247f57ce719f",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_0b662e48299a",
@@ -13283,7 +13315,7 @@
           "TILES_PER_SEQ": 32
         },
         "shim_namespace": "4941b97bb857faf5",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_5d5e7cd3bb78",
@@ -13325,7 +13357,7 @@
           "STATE_DL_CODE": 2
         },
         "shim_namespace": "af66c15e12643f79",
-        "template": "host/templates/prefill_initial_final_state_dynamic_heads_mod_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_dynamic_heads_mod.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_805fd7f7b98d",
@@ -13371,7 +13403,7 @@
           "TILES_PER_SEQ": 128
         },
         "shim_namespace": "9fdbd66021f99fec",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_9618789b4fa0",
@@ -13417,7 +13449,7 @@
           "TILES_PER_SEQ": 64
         },
         "shim_namespace": "d51dff0a8a5449e6",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_9d051157bbf3",
@@ -13463,7 +13495,7 @@
           "TILES_PER_SEQ": 16
         },
         "shim_namespace": "7c1d7a5b01a8efa1",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_aa51e505aec0",
@@ -13509,7 +13541,7 @@
           "TILES_PER_SEQ": 32
         },
         "shim_namespace": "74dfe2979712154e",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_d04755b8fc11",
@@ -13555,7 +13587,7 @@
           "TILES_PER_SEQ": 16
         },
         "shim_namespace": "0a5d871ec3f130d0",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_def1226b2f12",
@@ -13601,7 +13633,7 @@
           "TILES_PER_SEQ": 8
         },
         "shim_namespace": "b64b0055ae0bd619",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_e5e48bfdef0b",
@@ -13657,7 +13689,7 @@
           "TILES_PER_SEQ": 16
         },
         "shim_namespace": "20cfda64678d880e",
-        "template": "host/templates/prefill_single_chunk_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_single_chunk_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_single_chunk_sm107a_i64meta_4e6dfa2cb622",
@@ -13703,7 +13735,7 @@
           "TILES_PER_SEQ": 8
         },
         "shim_namespace": "6ced26eb643f0393",
-        "template": "host/templates/prefill_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_2838d017424c",
@@ -13743,7 +13775,7 @@
           "IO_TMA_DTYPE": "CU_TENSOR_MAP_DATA_TYPE_BFLOAT16"
         },
         "shim_namespace": "93835c8d286763f3",
-        "template": "host/templates/prefill_final_state_dynamic_heads_mod_i64meta.cc.in"
+        "template": "host/templates/prefill_final_state_dynamic_heads_mod.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_2e85138c2c19",
@@ -13789,7 +13821,7 @@
           "TILES_PER_SEQ": 8
         },
         "shim_namespace": "fb075edc002362be",
-        "template": "host/templates/prefill_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_45687be1dc10",
@@ -13835,7 +13867,7 @@
           "TILES_PER_SEQ": 128
         },
         "shim_namespace": "0a36c03a7045d634",
-        "template": "host/templates/prefill_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_50abdc8a949c",
@@ -13881,7 +13913,7 @@
           "TILES_PER_SEQ": 2
         },
         "shim_namespace": "2f97c014fd3e4456",
-        "template": "host/templates/prefill_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_545801c23e3b",
@@ -13927,7 +13959,7 @@
           "TILES_PER_SEQ": 4
         },
         "shim_namespace": "cd71a3d1aed15498",
-        "template": "host/templates/prefill_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_5a5b03cd8bdc",
@@ -13973,7 +14005,7 @@
           "TILES_PER_SEQ": 64
         },
         "shim_namespace": "5e6875f15dd5b12c",
-        "template": "host/templates/prefill_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_5fa86f1bbd8f",
@@ -14016,7 +14048,7 @@
           "TILES_PER_SEQ": 2
         },
         "shim_namespace": "b54fd642e222f8e4",
-        "template": "host/templates/prefill_single_chunk_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_single_chunk_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_d21fbffa8c3f",
@@ -14056,7 +14088,7 @@
           "IO_TMA_DTYPE": "CU_TENSOR_MAP_DATA_TYPE_BFLOAT16"
         },
         "shim_namespace": "1bc910283f6bc2d3",
-        "template": "host/templates/prefill_final_state_dynamic_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_final_state_dynamic_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm107a_l7_vec2_da9151333224",
@@ -14115,7 +14147,7 @@
           "TILES_PER_SEQ": 64
         },
         "shim_namespace": "5f6876518f203ddd",
-        "template": "host/templates/prefill_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_f16io_sm107a_i64meta_5f580e8943b2",
@@ -14171,7 +14203,7 @@
           "TILES_PER_SEQ": 64
         },
         "shim_namespace": "a4e0e0664741f3fe",
-        "template": "host/templates/prefill_single_chunk_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_single_chunk_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_f16io_sm107a_i64meta_856b795695d5",
@@ -14230,7 +14262,7 @@
           "TILES_PER_SEQ": 32
         },
         "shim_namespace": "7d10134fcd83aa22",
-        "template": "host/templates/prefill_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_f16io_sm107a_i64meta_f912f70c9363",
@@ -14276,7 +14308,7 @@
           "TILES_PER_SEQ": 8
         },
         "shim_namespace": "70be991235d46156",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_bf16state_gatestream_full_sm107a_i64meta_2823fc6b0b00",
@@ -14322,7 +14354,7 @@
           "TILES_PER_SEQ": 32
         },
         "shim_namespace": "ef98a8dfa134ab28",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_bf16state_gatestream_full_sm107a_i64meta_aeb81abb92c2",
@@ -14368,7 +14400,7 @@
           "TILES_PER_SEQ": 16
         },
         "shim_namespace": "1c5b76a734036b20",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_bf16state_gatestream_full_sm107a_i64meta_c13e8b260387",
@@ -14414,7 +14446,7 @@
           "TILES_PER_SEQ": 32
         },
         "shim_namespace": "664b377739356fa3",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_bf16state_gatestream_full_sm107a_i64meta_de5b0a2a25bc",
@@ -14460,7 +14492,7 @@
           "TILES_PER_SEQ": 16
         },
         "shim_namespace": "7debd8e81fb07470",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_bf16state_gatestream_full_sm107a_i64meta_ec15e343fd9a",
@@ -14519,7 +14551,7 @@
           "TILES_PER_SEQ": 8
         },
         "shim_namespace": "c8128f1ef62a9cc9",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_bf16state_sm107a_i64meta_2b366d2f6068",
@@ -14578,7 +14610,7 @@
           "TILES_PER_SEQ": 32
         },
         "shim_namespace": "44c8edd50f228288",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_bf16state_sm107a_i64meta_3c7173ca62a8",
@@ -14637,7 +14669,7 @@
           "TILES_PER_SEQ": 32
         },
         "shim_namespace": "a0dff590fa2e1137",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_bf16state_sm107a_i64meta_5a0866d39001",
@@ -14692,7 +14724,7 @@
           "TILES_PER_SEQ": 32
         },
         "shim_namespace": "0ca5f706085a6d34",
-        "template": "host/templates/prefill_indexed_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_indexed_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_bf16state_sm107a_i64meta_66ec6c93f14a",
@@ -14751,7 +14783,7 @@
           "TILES_PER_SEQ": 16
         },
         "shim_namespace": "535c403ac99e7e60",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_bf16state_sm107a_i64meta_84e4af0d3fe8",
@@ -14810,7 +14842,7 @@
           "TILES_PER_SEQ": 16
         },
         "shim_namespace": "9b454bd5cad76145",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_bf16state_sm107a_i64meta_b1b9eaa2476a",
@@ -14869,7 +14901,7 @@
           "TILES_PER_SEQ": 8
         },
         "shim_namespace": "ea3cf104e1a10908",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_bf16state_sm107a_i64meta_d5225057d28d",
@@ -14928,7 +14960,7 @@
           "TILES_PER_SEQ": 32
         },
         "shim_namespace": "0b0227b3352dede3",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_sm107a_i64meta_0a518d13901e",
@@ -14987,7 +15019,7 @@
           "TILES_PER_SEQ": 32
         },
         "shim_namespace": "bf332c727cc0adab",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_sm107a_i64meta_31dac57f676c",
@@ -15046,7 +15078,7 @@
           "TILES_PER_SEQ": 16
         },
         "shim_namespace": "e020f83aa191fe81",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_sm107a_i64meta_4806529ee52a",
@@ -15098,7 +15130,7 @@
           "TILES_PER_HEAD": 1
         },
         "shim_namespace": "688c1f3cb8b4a2b5",
-        "template": "host/templates/prefill_initial_final_state_dynamic_heads_gqa_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_dynamic_heads_gqa.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_sm107a_i64meta_508dc12724e5",
@@ -15157,7 +15189,7 @@
           "TILES_PER_SEQ": 8
         },
         "shim_namespace": "83546372c2e0ae3a",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_sm107a_i64meta_6b1531103546",
@@ -15216,7 +15248,7 @@
           "TILES_PER_SEQ": 16
         },
         "shim_namespace": "220a8a3f7c75f15a",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_sm107a_i64meta_6fe2e96200a2",
@@ -15275,7 +15307,7 @@
           "TILES_PER_SEQ": 64
         },
         "shim_namespace": "6a4ebeec056646f3",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_sm107a_i64meta_723b365a5ec7",
@@ -15334,7 +15366,7 @@
           "TILES_PER_SEQ": 32
         },
         "shim_namespace": "678f155574615069",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_sm107a_i64meta_7dadd112e990",
@@ -15380,7 +15412,7 @@
           "TILES_PER_SEQ": 16
         },
         "shim_namespace": "bb4d67e8d77b8f21",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_gatestream_full_sm107a_i64meta_0d87019ece0a",
@@ -15426,7 +15458,7 @@
           "TILES_PER_SEQ": 8
         },
         "shim_namespace": "2c7c2778398f79e0",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_gatestream_full_sm107a_i64meta_45673a694e2c",
@@ -15472,7 +15504,7 @@
           "TILES_PER_SEQ": 32
         },
         "shim_namespace": "620f19bc1db11c2b",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_gatestream_full_sm107a_i64meta_846324002788",
@@ -15518,7 +15550,7 @@
           "TILES_PER_SEQ": 32
         },
         "shim_namespace": "a5b2e8c0c2202e06",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_sm107a_i64meta_1ad6187c4781",
@@ -15564,7 +15596,7 @@
           "TILES_PER_SEQ": 64
         },
         "shim_namespace": "04f78879b2fe07ef",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_sm107a_i64meta_22f5617c19cb",
@@ -15610,7 +15642,7 @@
           "TILES_PER_SEQ": 4
         },
         "shim_namespace": "1989a88456403965",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_sm107a_i64meta_3c744e7058ae",
@@ -15656,7 +15688,7 @@
           "TILES_PER_SEQ": 32
         },
         "shim_namespace": "3b429174f10ce076",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_sm107a_i64meta_73606292b9c9",
@@ -15702,7 +15734,7 @@
           "TILES_PER_SEQ": 8
         },
         "shim_namespace": "1f81c59b111ec295",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_sm107a_i64meta_a4094b019dd7",
@@ -15748,7 +15780,7 @@
           "TILES_PER_SEQ": 16
         },
         "shim_namespace": "73ef3ad3e5470229",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_sm107a_i64meta_df3cde37e265",
@@ -15794,7 +15826,7 @@
           "TILES_PER_SEQ": 8
         },
         "shim_namespace": "03c5febcf9485a5e",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_sm107a_i64meta_f11f48fee0a6",
@@ -15840,7 +15872,7 @@
           "TILES_PER_SEQ": 16
         },
         "shim_namespace": "dc3a2acdde8d2e45",
-        "template": "host/templates/prefill_initial_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_initial_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_initial_sm107a_i64meta_f16a8d42d552",
@@ -15899,7 +15931,7 @@
           "TILES_PER_SEQ": 64
         },
         "shim_namespace": "3dda8fcd1a9f65fa",
-        "template": "host/templates/prefill_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_sm107a_i64meta_aae66f84064c",
@@ -15958,7 +15990,7 @@
           "TILES_PER_SEQ": 32
         },
         "shim_namespace": "25ee065fdf13589b",
-        "template": "host/templates/prefill_final_state_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_final_state_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_sm107a_i64meta_b4bb2b73838b",
@@ -16014,7 +16046,7 @@
           "TILES_PER_SEQ": 64
         },
         "shim_namespace": "aee7f819063b7411",
-        "template": "host/templates/prefill_single_chunk_fixed_heads_i64meta.cc.in"
+        "template": "host/templates/prefill_single_chunk_fixed_heads.cc.in"
       },
       "metadata_i64": true,
       "name": "prefill_flashinfer_blackwell_gdn_prefill_sm107a_i64meta_f71552471c01",

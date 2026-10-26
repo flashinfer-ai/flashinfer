@@ -283,12 +283,18 @@ def compile_cake_gdn_cubin(name: str, arch: CakeGDNArch) -> Path:
 
 
 _HOST_SHIM_PLACEHOLDER = re.compile(r"@([A-Z][A-Z0-9_]*)@")
+_HOST_SHIM_CONDITIONAL = re.compile(
+    r"^//@if (\w+)\n(.*?)^//@else\n(.*?)^//@endif\n", re.S | re.M
+)
 
 
 def render_cake_gdn_host_shim(record: dict[str, Any]) -> str:
     """Render the TVM-FFI host shim of one variant from its class template.
 
     ``host_binding.template`` names the template under ``host/templates/``.
+    A ``//@if metadata_i64`` / ``//@else`` / ``//@endif`` block of lines keeps
+    its first arm for a record whose ``metadata_i64`` is true and its second
+    arm otherwise; the directive lines are dropped before the placeholders.
     ``@ENTRY@``, ``@MODULE_IDENT@``, ``@CUDA_SYMBOL@`` and ``@SHIM_NAMESPACE@``
     come from ``host_binding``; every other ``@NAME@`` placeholder takes the
     value of ``host_binding.params[NAME]``.  The result is byte-identical to
@@ -297,6 +303,13 @@ def render_cake_gdn_host_shim(record: dict[str, Any]) -> str:
 
     host = record["host_binding"]
     template = (_source_dir() / host["template"]).read_text(encoding="utf-8")
+    flags = {"metadata_i64": bool(record.get("metadata_i64", False))}
+    template = _HOST_SHIM_CONDITIONAL.sub(
+        lambda match: match.group(2) if flags[match.group(1)] else match.group(3),
+        template,
+    )
+    if "//@" in template:
+        raise RuntimeError(f"{host['template']} has an unresolved host-shim directive")
     values = {
         "ENTRY": host["entry"],
         "MODULE_IDENT": host["module_ident"],

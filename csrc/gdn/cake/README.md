@@ -63,7 +63,11 @@ with per-variant SASS equivalence checks against the generated originals.
   the templates take as `@NAME@` placeholders: `@ENTRY@`, `@MODULE_IDENT@`,
   `@CUDA_SYMBOL@` and `@SHIM_NAMESPACE@` come from `host_binding` (`entry`,
   `module_ident`, `cuda_symbol`, `shim_namespace`), every other placeholder
-  from `host_binding.params`. `flashinfer/jit/cake_gdn.py` renders the shim
+  from `host_binding.params`. A `//@if metadata_i64` / `//@else` / `//@endif`
+  block of lines keeps its first arm for a record whose `metadata_i64` is true
+  and its second arm otherwise, so the int32-or-int64 metadata checks of the
+  SM107a prefill records render from their base's template; the directive
+  lines are dropped. `flashinfer/jit/cake_gdn.py` renders the shim
   text at load time; it is byte-identical to the former file
   (`tests/gdn/cake_gdn_host_shim_sha256.json` pins it per variant). The
   helpers the launchers share (device guard, tensor checks, dynamic
