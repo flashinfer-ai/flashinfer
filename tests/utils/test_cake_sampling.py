@@ -1811,9 +1811,11 @@ def test_spec_sample_build_matches_default_build():
     """Every streaming variant whose launches can take the plain speculative sample ships a speculative-sample twin
     (`_sp`, launch_flags bit 6): its first register chunk doubles as the sample (no separate sampled read), the exact
     passes and fallbacks are the same, and the slab / samples / renorm are bitwise identical to the default build on
-    adversarial rows for every k regime.  The bit is rejected on register-resident variants and together with
-    bits 3 / 4; the host sets it for every ept-16 stream and for ept-32 streams at one chunk, two chunks on a cluster
-    of 8, or at least 16 register chunks per CTA, and never together with bit 4.  The (8, 16) stream takes the sample
+    adversarial rows for every k regime.  The bit is rejected on register-resident variants, together with bit 4,
+    and together with bit 3 on a variant without the speculative-sample whole-CTA-tail build (the cluster-1 ept-32
+    stream ships one, ``test_spec_block_tail_matches_two_launch_form``); the host sets it for every ept-16 stream and
+    for ept-32 streams at one chunk, two chunks on a cluster of 8, or at least 16 register chunks per CTA, and never
+    together with bit 4.  The (8, 16) stream takes the sample
     only on the capabilities of `_SPEC_SAMPLE_ALL_STREAMS_CAPABILITIES`, where every multi-CTA ept-16 launch takes the
     leader-push form of the build (bit 9 precedence), so its plain `_sp` build is never launched and is not built."""
     _require_supported_device()
@@ -1823,7 +1825,10 @@ def test_spec_sample_build_matches_default_build():
     spec = [
         v
         for v in _stage1_builds(man)
-        if v["spec_sample"] and not v["slab_tail"] and not v["leader_push"]
+        if v["spec_sample"]
+        and not v["slab_tail"]
+        and not v["leader_push"]
+        and not v["fused_block_tail"]
     ]
     defaults = {
         (v["cluster"], v["ept"], bool(v["stream"])): v
@@ -2066,7 +2071,13 @@ def test_spec_sample_build_matches_default_build():
                             base_f.renorm[r, :kr].view(np.uint32),
                             spec_f.renorm[r, :kr].view(np.uint32),
                         )
-    # bit 6 on a register-resident variant and together with bit 3 or bit 4 is rejected
+    # bit 6 on a register-resident variant, together with bit 4, and together with bit 3 on a variant without the
+    # speculative-sample whole-CTA-tail build is rejected
+    assert not any(
+        v["fused_block_tail"] and v["spec_sample"]
+        for v in _stage1_builds(man)
+        if (v["cluster"], v["ept"]) == streams[0]
+    )
     module = load_cake_sampling_module()
     probs2 = _probs(2, 32768, seed=5)
     vals, idxs, cnt = _ws(2)
@@ -2302,10 +2313,13 @@ def test_block_tail_matches_two_launch_form(monkeypatch):
         and not v["coarse_push"]
         and not v["leader_push"]
     ]
+    # (the cluster-1 speculative-sample whole-CTA-tail builds: test_spec_block_tail_matches_two_launch_form)
     twins = [
         v
         for v in _stage1_builds(man)
-        if v["fused_block_tail"] and not v.get("int_tail", False)
+        if v["fused_block_tail"]
+        and not v.get("int_tail", False)
+        and not v["spec_sample"]
     ]
     default_keys = {(v["cluster"], v["ept"], v["stream"]) for v in defaults}
     assert len(default_keys) == len(defaults)
@@ -2430,6 +2444,108 @@ def test_block_tail_matches_two_launch_form(monkeypatch):
     if streams_ok:
         probs = _probs(600, 32768, seed=7)
         _run_and_check(probs, 1000, 0.9, 0x748, 3)
+
+
+def test_spec_block_tail_matches_two_launch_form(monkeypatch):
+    """The cluster-1 ept-32 stream ships the speculative-sample build with the whole-CTA tail (`c1_e32s_bt_sp`, and
+    `c1_e32s_bt_sp_tia` with the integer-tested tail of launch_flags bit 11), which the host takes through launch_flags
+    bits 3 + 6 for the cells of `_C1_BLOCK_TAIL_CELLS` above k = 768; outputs are bitwise identical to the two-launch
+    form on adversarial rows, per-row k (mixing k <= 64 rows) and per-row p."""
+    _require_supported_device()
+    import flashinfer.cake_sampling as cs
+
+    man = load_manifest()
+    kcap = int(man["fused_block_tail_kcap"])
+    builds = [
+        v for v in _stage1_builds(man) if v["fused_block_tail"] and v["spec_sample"]
+    ]
+    assert [v["symbol"] for v in builds] == [
+        "kernel_cake_radix_topk_c1_e32s_bt_sp",
+        "kernel_cake_radix_topk_c1_e32s_bt_sp_tia",
+    ]
+    assert [v["int_tail"] for v in builds] == [False, True]
+    assert all(
+        (v["cluster"], v["ept"], v["stream"], v["fused_tail"]) == (1, 32, True, True)
+        and not (v["coarse_sample"] or v["slab_tail"] or v["leader_push"])
+        for v in builds
+    )
+    assert cs._stage1_has_fused_block_tail(1, 32, True)
+    assert not cs._stage1_has_fused_block_tail(1, 16, True)
+    # the policy: (V, batch) of the capability's cells, a cluster-1 stream, 768 < top_k_max <= the slab
+    for cc in ((10, 0), (10, 3), (10, 7)):
+        assert cs._c1_block_tail(128, 262144, 1, 32, True, 1000, cc)
+        assert cs._c1_block_tail(128, 262144, 1, 32, True, kcap, cc)
+        assert not cs._c1_block_tail(128, 262144, 1, 32, True, 768, cc)
+        assert not cs._c1_block_tail(128, 262144, 1, 32, True, kcap + 1, cc)
+        assert not cs._c1_block_tail(128, 262144, 1, 32, True, None, cc)
+        assert not cs._c1_block_tail(64, 262144, 1, 32, True, 1000, cc)
+        assert not cs._c1_block_tail(128, 151936, 1, 32, True, 1000, cc)
+        assert not cs._c1_block_tail(128, 262144, 2, 32, True, 1000, cc)
+        assert not cs._c1_block_tail(128, 262144, 1, 32, False, 1000, cc)
+    for cc in ((9, 0), (11, 0), (12, 0)):
+        assert not cs._c1_block_tail(128, 262144, 1, 32, True, 1000, cc)
+    fused_flags = cs._FLAG_FUSE_BLOCK_TAIL | cs._FLAG_SPEC_SAMPLE
+    assert cs._int_tail_flag(1, 32, True, fused_flags, (10, 3)) == cs._FLAG_INT_TAIL
+    assert cs._int_tail_flag(1, 32, True, fused_flags, (10, 0)) == 0
+    assert cs._int_tail_flag(1, 32, True, fused_flags, (10, 7)) == 0
+    device = torch.cuda.current_device()
+    capability = cs._device_capability(device)
+    if capability not in cs._C1_BLOCK_TAIL_CELLS or not _device_streams():
+        return
+    batch, vocab = 128, 262144
+    assert (vocab, batch) in cs._C1_BLOCK_TAIL_CELLS[capability]
+    probs = _probs(batch, vocab, seed=1368)
+    pn = probs.cpu().numpy()
+    pn[0, (np.arange(1200) * 13) % vocab] = np.float32(
+        2**-11
+    )  # ties across the k cut and the p boundary
+    pn[1, [7, 4096]] = np.inf
+    pn[2, : vocab // 2] = 0.0  # a half-zero row
+    probs.copy_(torch.tensor(pn, device="cuda"))
+    k_row = torch.randint(1, kcap + 1, (batch,), device="cuda", dtype=torch.int32)
+    k_row[0] = kcap
+    k_row[-1] = 32
+    p_row = torch.linspace(0.3, 1.0, batch, device="cuda", dtype=torch.float32)
+    for k, p in (
+        (1000, 0.9),
+        (kcap, 0.5),
+        (cs._BLOCK_TAIL_MIN_K + 1, 1e-6),
+        (k_row, p_row),
+    ):
+        top_k_max = k if isinstance(k, int) else int(k.max().item())
+        with monkeypatch.context() as m:
+            m.setattr(cs, "_c1_block_tail", lambda *a, **kw: False)
+            cs._launch_plan.cache_clear()
+            plan = cs._launch_plan(device, batch, vocab, top_k_max)
+            assert plan.launch_flags & cs._FLAG_FUSE_BLOCK_TAIL == 0, plan
+            two, _ = _run_and_check(probs, k, p, 0x1368, 3)
+        cs._launch_plan.cache_clear()
+        plan = cs._launch_plan(device, batch, vocab, top_k_max)
+        assert (plan.cluster, plan.ept, plan.stream, plan.one_launch) == (
+            1,
+            32,
+            True,
+            True,
+        ), plan
+        assert plan.launch_flags & fused_flags == fused_flags, plan
+        assert plan.launch_flags & cs._FLAG_INT_TAIL == cs._int_tail_flag(
+            1, 32, True, fused_flags, capability
+        )
+        fused, _ = _run_and_check(probs, k, p, 0x1368, 3)
+        label = k if isinstance(k, int) else "row"
+        assert np.array_equal(two.samples, fused.samples), label
+        assert np.array_equal(two.count, fused.count), label
+        for r in range(batch):
+            kr = int(two.count[r])
+            assert np.array_equal(two.idx[r, :kr], fused.idx[r, :kr]), (label, r)
+            assert np.array_equal(
+                two.vals[r, :kr].view(np.uint32), fused.vals[r, :kr].view(np.uint32)
+            ), (label, r)
+            assert np.array_equal(
+                two.renorm[r, :kr].view(np.uint32),
+                fused.renorm[r, :kr].view(np.uint32),
+            ), (label, r)
+    cs._launch_plan.cache_clear()
 
 
 def test_fused_tail_matches_two_launch_form():

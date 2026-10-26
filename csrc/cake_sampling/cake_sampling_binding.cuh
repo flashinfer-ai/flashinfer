@@ -433,8 +433,8 @@ void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64
   const int32_t want_spec = (launch_flags & kFlagSpecSample) != 0 ? 1 : 0;
   TVM_FFI_ICHECK(!(want_spec && stream_variant == 0))
       << "the speculative-sample build (launch_flags bit 6) exists for streaming variants only";
-  TVM_FFI_ICHECK(!(want_spec && (want_block_tail || want_coarse)))
-      << "launch_flags bit 6 (speculative sample) is exclusive with bits 3 and 4";
+  TVM_FFI_ICHECK(!(want_spec && want_coarse))
+      << "launch_flags bit 6 (speculative sample) is exclusive with bit 4";
   const int32_t want_slab = (launch_flags & kFlagSlabTail) != 0 ? 1 : 0;
   TVM_FFI_ICHECK(!(want_slab && !(want_spec || want_coarse)))
       << "launch_flags bit 7 (slab tail) selects a sample build's twin: it needs bit 4 or bit 6";

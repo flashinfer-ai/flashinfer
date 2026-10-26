@@ -382,7 +382,8 @@ def _fused_block_tail_kcap() -> int:
 def _stage1_has_fused_block_tail(cluster: int, ept: int, stream: bool) -> bool:
     """Whether the frozen variant ships a whole-CTA-tail build (a manifest entry with ``fused_block_tail``): the
     kernel taken by launch_flags bit 3, built for the cluster-8 streams the host can fuse it into
-    (``_fuse_block_tail``).  The default build of every variant carries only the two-warp tail --
+    (``_fuse_block_tail``) and, as a speculative-sample build (bits 3 + 6), for the cluster-1 ept-32 stream
+    (``_c1_block_tail``).  The default build of every variant carries only the two-warp tail --
     compiling the whole-CTA tail into it slowed every k <= 64 launch on sm_103a / sm_107a by 13-33 %."""
     found = False
     for v in load_manifest()["stage1"]:
@@ -415,6 +416,39 @@ _BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY: dict[tuple[int, int], Optional[int]] = {
     (10, 0): None,
     (10, 3): 196608,
 }
+
+
+# Cluster-1 cells whose spec-sample stream takes the whole-CTA tail (launch_flags bits 3 + 6) per capability: one CTA
+# per row, so every row's tail runs beside the others in a one-wave grid.
+_C1_BLOCK_TAIL_CELLS: dict[tuple[int, int], frozenset[tuple[int, int]]] = {
+    (10, 0): frozenset({(262144, 128)}),
+    (10, 3): frozenset({(262144, 128)}),
+    (10, 7): frozenset({(262144, 128)}),
+}
+
+
+def _c1_block_tail(
+    batch: int,
+    vocab: int,
+    cluster: int,
+    ept: int,
+    stream: bool,
+    top_k_max: Optional[int],
+    capability: tuple[int, int],
+) -> bool:
+    """Whether a cluster-1 stream launch runs the spec-sample whole-CTA tail (``_C1_BLOCK_TAIL_CELLS``)."""
+    if top_k_max is None or not (
+        _BLOCK_TAIL_MIN_K < top_k_max <= _fused_block_tail_kcap()
+    ):
+        return False
+    if not (stream and int(cluster) == 1):
+        return False
+    cells = _C1_BLOCK_TAIL_CELLS.get(
+        (int(capability[0]), int(capability[1])), frozenset()
+    )
+    if (int(vocab), int(batch)) not in cells:
+        return False
+    return _stage1_has_fused_block_tail(cluster, ept, stream)
 
 
 def _block_tail_for_capability(capability: tuple[int, int]) -> bool:
@@ -1795,16 +1829,22 @@ def _launch_plan(
     )
     # Larger top-k up to the slab: the whole-CTA tail, on the capabilities where it beats the chain, for a
     # one-wave stage-1 grid.
-    fused_block = not fused and _fuse_block_tail(
-        batch,
-        cluster,
-        ept,
-        stream,
-        sm_count,
-        top_k_max,
-        not _block_tail_enabled(device_index),
-        vocab,
-        capability,
+    c1_block = not fused and _c1_block_tail(
+        batch, vocab, cluster, ept, stream, top_k_max, capability
+    )
+    fused_block = c1_block or (
+        not fused
+        and _fuse_block_tail(
+            batch,
+            cluster,
+            ept,
+            stream,
+            sm_count,
+            top_k_max,
+            not _block_tail_enabled(device_index),
+            vocab,
+            capability,
+        )
     )
     if fused:
         sample_flag = _sample_build_flag(
@@ -1832,7 +1872,7 @@ def _launch_plan(
             cluster, ept, stream, launch_flags, top_k_max, capability, vocab
         )
     elif fused_block:
-        launch_flags = _FLAG_FUSE_BLOCK_TAIL
+        launch_flags = _FLAG_FUSE_BLOCK_TAIL | (_FLAG_SPEC_SAMPLE if c1_block else 0)
         launch_flags |= _int_tail_flag(cluster, ept, stream, launch_flags, capability)
     else:
         # Two launches: stage 2/3 may start early only when its CTAs fit beside the last stage-1 wave; a
