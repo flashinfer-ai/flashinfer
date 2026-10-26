@@ -112,10 +112,11 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
   group add one partial 256-row tile (`max_cluster_tiles_upper_bound`).
 - `fwd` / `dgrad` output tile (`fwd_dgrad_tile_n`): 512 columns
   (`wide_block_n`) when the output columns (`N` for `fwd`, `K` for `dgrad`)
-  are a multiple of 512 and the architecture is listed in `wide_archs`, 256
-  (`block_n`) otherwise. The 512-column programs are the routes' `main_wide`
-  stage; every output element accumulates its k steps in the same order in
-  both tiles, so both give the same bits.
+  are a multiple of 512 and the architecture is listed in `wide_fwd_archs`
+  (`fwd`) or `wide_dgrad_archs` (`dgrad`), 256 (`block_n`) otherwise. The
+  512-column programs are the routes' `main_wide` stage; every output element
+  accumulates its k steps in the same order in both tiles, so both give the
+  same bits.
 - `fwd` / `dgrad` tile order on `sm_100a` / `sm_103a`: the column tiles of
   every 256-row block are split between two claim queues, one per locality
   domain of the device, in proportion to the clusters that claim each queue
@@ -137,10 +138,11 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
   runs. The tile raster inside a group follows the per-wave operand footprint
   (`wgrad_raster_rows`).
 - Weight-gradient wave sync: when `K` reaches `wave_sync_min_k` (the
-  gate-up-shaped rows), the architecture is listed in `wave_sync_archs` and the
-  route has a `main_wave` stage on it, the main kernel is the wave-synchronized
-  build, launched with `wave_mode = wave_sync_mode`; otherwise the plain build
-  (`wave_mode = 0`). Both builds give the same output bits for a given route.
+  gate-up-shaped rows), `wave_sync_archs` lists the architecture for the
+  selected k tile and the route has a `main_wave` stage on it, the main kernel
+  is the wave-synchronized build, launched with the architecture's
+  `wave_sync_mode` as `wave_mode`; otherwise the plain build (`wave_mode = 0`).
+  Both builds give the same output bits for a given route.
 - Weight-gradient accumulator release: with the 512-wide k tile on the
   architectures listed in `k512_release_archs`, the main kernel is the build
   that hands the tensor-memory accumulator to the epilogue in two halves

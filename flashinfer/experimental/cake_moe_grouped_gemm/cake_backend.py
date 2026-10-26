@@ -33,10 +33,11 @@ decisions exactly from ``HOST_PLAN_CONSTANTS``.
 
 Program choice.  ``fwd`` and ``dgrad`` launch the 512-column output tile (the
 route's ``main_wide`` stage) when the output columns are a multiple of
-``wide_block_n`` and the architecture is listed in ``wide_archs``, else the
-256-column tile (``main``).  The weight gradient launches the
-wave-synchronised build (``main_wave``) from ``wave_sync_min_k`` on the
-architectures listed in ``wave_sync_archs``; with the 512-wide k tile on the
+``wide_block_n`` and the architecture is listed in ``wide_fwd_archs`` /
+``wide_dgrad_archs``, else the 256-column tile (``main``).  The weight gradient
+launches the wave-synchronised build (``main_wave``) from ``wave_sync_min_k``
+on the architectures ``wave_sync_archs`` lists for its k tile, with the
+architecture's ``wave_sync_mode``; with the 512-wide k tile on the
 architectures listed in ``k512_release_archs`` it launches the twin of that
 build that releases the accumulator in two halves (``main_halves`` /
 ``main_wave_halves``).  Every choice falls back to the plain stage where the
@@ -160,11 +161,12 @@ def fwd_dgrad_tile_n(
     constants: Optional[dict[str, Any]] = None,
 ) -> int:
     """Output-column tile of ``fwd`` / ``dgrad``: ``wide_block_n`` when the output columns are a
-    multiple of it on the architectures of ``wide_archs``, else ``block_n``."""
+    multiple of it on the architectures of the operation's ``wide_fwd_archs`` /
+    ``wide_dgrad_archs``, else ``block_n``."""
     c = constants or host_plan_constants()
     cols = n if op == "fwd" else k
     wide = int(c["wide_block_n"])
-    if cols % wide == 0 and arch in c["wide_archs"]:
+    if cols % wide == 0 and arch in c[f"wide_{op}_archs"]:
         return wide
     return int(c["block_n"])
 
@@ -400,7 +402,7 @@ def select_wgrad_stage(
     c = constants or host_plan_constants()
     wave = (
         k >= int(c["wave_sync_min_k"])
-        and arch in c["wave_sync_archs"]
+        and arch in c["wave_sync_archs"][tile_k]
         and stage_served(name, "main_wave", arch)
     )
     stage = "main_wave" if wave else "main"
@@ -777,7 +779,7 @@ def prepare_grouped_gemm_fwd(
     ``x``: ``[sum_m, K]`` bf16; ``w``: ``[E, N, K]`` bf16; ``offs``: int32
     ``[E]`` device end offsets; ``N % 256 == 0``, ``K % 64 == 0`` (the
     512-column tile when ``N % 512 == 0`` on the architectures of
-    ``wide_archs``).  ``out`` may be row-padded (any row stride, unit column
+    ``wide_fwd_archs``).  ``out`` may be row-padded (any row stride, unit column
     stride).
     """
     return _prepare_row_op("fwd", x, w, offs, out)
@@ -794,7 +796,7 @@ def prepare_grouped_gemm_dgrad(
     ``g``: ``[sum_m, N]`` bf16; ``w``: ``[E, N, K]`` bf16; ``offs``: int32
     ``[E]`` device end offsets; ``K % 256 == 0``, ``N % 64 == 0`` (the
     512-column tile when ``K % 512 == 0`` on the architectures of
-    ``wide_archs``).
+    ``wide_dgrad_archs``).
     """
     return _prepare_row_op("dgrad", g, w, offs, out)
 
@@ -886,7 +888,7 @@ def prepare_grouped_gemm_wgrad(
         constants=c,
     )
     main_stage, wave = select_wgrad_stage(name, k, tile_k, arch, c)
-    plan["wave_mode"] = int(c["wave_sync_mode"]) if wave else 0
+    plan["wave_mode"] = int(c["wave_sync_mode"][arch]) if wave else 0
     if sum_m == 0:
         return _finish("wgrad", name, plan, out, (), [], [], zero_fill=True)
     grid_x, clusters, splits = plan["grid"][0], plan["clusters"], plan["tail_splits"]

@@ -54,10 +54,11 @@ from . import cake_build
 # host chooses among the stages a route serves by ``HOST_PLAN_CONSTANTS``:
 # the forward and data-gradient ``main_wide`` stage is the program with the
 # 512-column output tile (``wide_block_n``), launched on the architectures of
-# ``wide_archs`` when the output columns are a multiple of it; the
-# weight-gradient ``main_wave`` stage is the main program with wave
-# synchronisation, launched from ``wave_sync_min_k`` on the architectures of
-# ``wave_sync_archs``; the 512-wide k tile's ``main_halves`` and
+# ``wide_fwd_archs`` / ``wide_dgrad_archs`` when the output columns are a
+# multiple of it; the weight-gradient ``main_wave`` stage is the main program
+# with wave synchronisation, launched from ``wave_sync_min_k`` on the
+# architectures ``wave_sync_archs`` lists for the k tile, with the
+# architecture's ``wave_sync_mode``; the 512-wide k tile's ``main_halves`` and
 # ``main_wave_halves`` stages are the twins of ``main`` and ``main_wave`` that
 # release the accumulator in two halves, launched on the architectures of
 # ``k512_release_archs``.
@@ -621,19 +622,23 @@ ROUTES: dict[str, dict[str, Any]] = {
 HOST_PLAN_CONSTANTS: dict[str, Any] = {
     "block_n": 256,
     "wide_block_n": 512,
-    "wide_archs": ["sm_100a", "sm_103a"],
+    "wide_fwd_archs": ["sm_100a", "sm_103a", "sm_107a"],
+    "wide_dgrad_archs": ["sm_100a", "sm_103a"],
     "block_k": 64,
     "cta_group": 2,
     "cluster_m": 256,
     "epi_chunk": 16,
     "tmap_slot_bytes": 128,
     "tmap_slots_per_cta": 18,
-    "k512_archs": ["sm_100a", "sm_103a"],
+    "k512_archs": ["sm_100a", "sm_103a", "sm_107a"],
     "k512_release_archs": ["sm_100a", "sm_103a"],
     "k512_min_rows_per_group": 8192,
     "wave_sync_min_k": 4096,
-    "wave_sync_archs": ["sm_100a", "sm_103a"],
-    "wave_sync_mode": 2,
+    "wave_sync_archs": {
+        256: ["sm_100a", "sm_103a"],
+        512: ["sm_100a", "sm_103a", "sm_107a"],
+    },
+    "wave_sync_mode": {"sm_100a": 2, "sm_103a": 2, "sm_107a": 1},
     "wave_sync_words": 2,
     "sched_words": 4224,
     "sched_rest": [0, 2147483648, 0],

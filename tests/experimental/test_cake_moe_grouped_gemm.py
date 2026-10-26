@@ -219,34 +219,38 @@ def test_stage_bindings_are_unique_per_architecture():
 
 
 def test_program_choice_follows_the_host_plan_constants():
-    """``wide_archs`` selects the 512-column tile of ``fwd`` / ``dgrad`` when the
-    output columns are a multiple of ``wide_block_n``; ``wave_sync_archs`` the wave
-    build from ``wave_sync_min_k``; ``k512_release_archs`` the twin releasing the
-    512-wide accumulator in halves.  Each listed architecture's routes serve the
-    stage the constant selects."""
+    """``wide_fwd_archs`` / ``wide_dgrad_archs`` select the 512-column tile of
+    ``fwd`` / ``dgrad`` when the output columns are a multiple of
+    ``wide_block_n``; ``wave_sync_archs`` the wave build of each k tile from
+    ``wave_sync_min_k``, launched with the architecture's ``wave_sync_mode``;
+    ``k512_release_archs`` the twin releasing the 512-wide accumulator in halves.
+    Each listed architecture's routes serve the stage the constant selects."""
     c = HOST_PLAN_CONSTANTS
     block_n, wide_n = int(c["block_n"]), int(c["wide_block_n"])
     assert wide_n == 2 * block_n
-    for key in ("wide_archs", "wave_sync_archs", "k512_release_archs"):
+    for key in ("wide_fwd_archs", "wide_dgrad_archs", "k512_archs"):
         assert set(c[key]) <= set(cake_jit.ARCHES), key
     assert set(c["k512_release_archs"]) <= set(c["k512_archs"])
+    assert set(c["wave_sync_archs"]) == {256, 512}
+    for archs in c["wave_sync_archs"].values():
+        assert set(archs) <= set(cake_jit.ARCHES)
+        assert all(int(c["wave_sync_mode"][arch]) > 0 for arch in archs)
     for op in ("fwd", "dgrad"):
         name = cake_jit.record_name(op)
+        wide_archs = c[f"wide_{op}_archs"]
         for arch in ROUTES[name]["arches"]:
             served = cake_jit.stage_served(name, "main_wide", arch)
-            if arch in c["wide_archs"]:
+            if arch in wide_archs:
                 assert served, (name, arch)
             for cols in (4096, 4096 - block_n, block_n):
                 n, k = (cols, 512) if op == "fwd" else (512, cols)
                 stage, tile_n = cb.select_row_stage(name, op, n, k, arch, c)
-                wide = cols % wide_n == 0 and arch in c["wide_archs"] and served
+                wide = cols % wide_n == 0 and arch in wide_archs and served
                 assert (stage, tile_n) == (
                     ("main_wide", wide_n) if wide else ("main", block_n)
                 ), (op, arch, cols)
                 assert cb.fwd_dgrad_tile_n(op, n, k, arch, c) == (
-                    wide_n
-                    if cols % wide_n == 0 and arch in c["wide_archs"]
-                    else block_n
+                    wide_n if cols % wide_n == 0 and arch in wide_archs else block_n
                 )
     min_k = int(c["wave_sync_min_k"])
     for out_dtype in ("bfloat16", "float32"):
@@ -254,11 +258,15 @@ def test_program_choice_follows_the_host_plan_constants():
             name = cake_jit.record_name("wgrad", out_dtype=out_dtype, tile_k=tile_k)
             assert name in ROUTES, name
             for arch in ROUTES[name]["arches"]:
+                if tile_k == 512 and arch in c["k512_archs"]:
+                    assert cake_jit.stage_served(name, "main", arch), (name, arch)
+                if arch in c["wave_sync_archs"][tile_k]:
+                    assert cake_jit.stage_served(name, "main_wave", arch), (name, arch)
                 for k in (min_k, min_k // 2):
                     stage, wave = cb.select_wgrad_stage(name, k, tile_k, arch, c)
                     expect_wave = (
                         k >= min_k
-                        and arch in c["wave_sync_archs"]
+                        and arch in c["wave_sync_archs"][tile_k]
                         and cake_jit.stage_served(name, "main_wave", arch)
                     )
                     base = "main_wave" if expect_wave else "main"
@@ -463,21 +471,22 @@ def test_scheduler_workspace_rests_after_every_launch(op):
 
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
 def test_wgrad_wave_sync_route_and_rest_state(out_dtype, monkeypatch):
-    """From ``wave_sync_min_k`` on, an architecture of ``wave_sync_archs`` whose route
-    has a ``main_wave`` stage launches the wave build with ``wave_mode =
-    wave_sync_mode``; it leaves its counters at zero and gives the plain build's
-    output bits."""
+    """From ``wave_sync_min_k`` on, an architecture ``wave_sync_archs`` lists for the
+    k tile, whose route has a ``main_wave`` stage, launches the wave build with
+    its ``wave_sync_mode`` as ``wave_mode``; it leaves its counters at zero and
+    gives the plain build's output bits."""
     device = _require_program("wgrad", out_dtype)
     c = HOST_PLAN_CONSTANTS
     arch = SUPPORTED_COMPUTE_CAPABILITIES[torch.cuda.get_device_capability(device)]
     n, k = 256, int(c["wave_sync_min_k"])
     x, _w, g, offs = _inputs(RAGGED_E4, n, k, device, seed=7)
     launch = prepare_grouped_gemm_wgrad(g, x, offs, out_dtype=out_dtype)
-    wave = arch in c["wave_sync_archs"] and cake_jit.stage_served(
+    tile_k = launch.plan["tile_k"]
+    wave = arch in c["wave_sync_archs"][tile_k] and cake_jit.stage_served(
         launch.record_name, "main_wave", arch
     )
     assert launch.stages[0] == ("main_wave" if wave else "main")
-    assert launch.plan["wave_mode"] == (int(c["wave_sync_mode"]) if wave else 0)
+    assert launch.plan["wave_mode"] == (int(c["wave_sync_mode"][arch]) if wave else 0)
     assert ("wave_sync" in _workspace_kinds(launch)) == wave
     ref = _reference("wgrad", g, x, RAGGED_E4)
     for _ in range(3):
@@ -508,16 +517,16 @@ def test_wgrad_wave_sync_route_and_rest_state(out_dtype, monkeypatch):
 
 @pytest.mark.parametrize("op", ["fwd", "dgrad"])
 def test_wide_tile_gives_the_256_column_tile_bits(op, monkeypatch):
-    """On an architecture of ``wide_archs`` an output width that is a multiple of
-    ``wide_block_n`` launches the 512-column tile; it leaves ``sched`` at rest and
-    gives the 256-column tile's output bits (both accumulate each element's k steps
-    in order and round once)."""
+    """On an architecture of ``wide_fwd_archs`` / ``wide_dgrad_archs`` an output
+    width that is a multiple of ``wide_block_n`` launches the 512-column tile; it
+    leaves ``sched`` at rest and gives the 256-column tile's output bits (both
+    accumulate each element's k steps in order and round once)."""
     device = _require_program(op)
     c = HOST_PLAN_CONSTANTS
     arch = SUPPORTED_COMPUTE_CAPABILITIES[torch.cuda.get_device_capability(device)]
     n, k = (1536, 512) if op == "fwd" else (512, 1536)
     launch, ref = _prepare_row_op(op, RAGGED_E6, n, k, device)
-    wide = arch in c["wide_archs"] and cake_jit.stage_served(
+    wide = arch in c[f"wide_{op}_archs"] and cake_jit.stage_served(
         launch.record_name, "main_wide", arch
     )
     assert launch.stages[0] == ("main_wide" if wide else "main")
@@ -531,7 +540,7 @@ def test_wide_tile_gives_the_256_column_tile_bits(op, monkeypatch):
     sched = cb.stream_workspace("sched", device)
     assert sched is not None
     assert _u32_words(sched[:3]) == [int(v) for v in c["sched_rest"]]
-    monkeypatch.setitem(HOST_PLAN_CONSTANTS, "wide_archs", [])
+    monkeypatch.setitem(HOST_PLAN_CONSTANTS, f"wide_{op}_archs", [])
     narrow, _ = _prepare_row_op(op, RAGGED_E6, n, k, device)
     assert narrow.stages[0] == "main"
     assert narrow.plan["tile_n"] == int(c["block_n"])
@@ -560,7 +569,7 @@ def test_wgrad_k512_halves_gives_the_drain_build_bits(out_dtype, wave, monkeypat
     base = "main_wave" if launch.plan["wave_mode"] else "main"
     assert (base == "main_wave") == (
         wave
-        and arch in c["wave_sync_archs"]
+        and arch in c["wave_sync_archs"][512]
         and cake_jit.stage_served(name, "main_wave", arch)
     )
     halves = arch in c["k512_release_archs"]
