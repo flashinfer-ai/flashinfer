@@ -42,11 +42,12 @@ their combination -- each with a NaN-poisoned workspace, run-to-run bitwise
 gradients and graph replay; a route an architecture has not rendered yet
 skips its tests, and the registry test fails until every route's libraries
 are in ``build.json``.  An architecture whose route ships several programs
-selects one by the channel count: the suite checks that exactly one runs per
-call, that every program of the route runs for some channel count on both
-sides of its threshold, that the workspace is sized for the largest partial
-buffer over every route, and that a routed row's ``dx`` equals the fallback
-program's bits.  The backward is two launches on one stream -- the selected
+(every backward route; the forward routes on sm_107a) selects one by the
+channel count: the suite checks that exactly one runs per call, that every
+program of the route runs for some channel count on both sides of its
+threshold, that the workspace is sized for the largest partial buffer over
+every route, and that a routed row's ``dx`` (forward: ``y``) equals the
+fallback program's bits.  The backward is two launches on one stream -- the selected
 program, then its ``reduce`` program with programmatic dependent launch -- and
 the suite holds the launch order, the registry's grid-rule kinds and
 FlashInfer issue #7038's recipe: a kernel resident on another stream does not
@@ -870,6 +871,71 @@ def test_backward_programs_switch_on_channel_count(kind) -> None:
     assert launched == set(names), f"never launched {set(names) - launched}"
 
 
+@pytest.mark.parametrize("kind", ("fwd", "fwd_dt", "fwd_bias"))
+def test_forward_programs_switch_on_channel_count(kind) -> None:
+    """Exactly one forward program of the route runs per call, every program of the route runs for some channel
+    count, and on both sides of each channel threshold ``y`` matches the reference and equals, bit for bit, the
+    route's fallback program launched on its own (every forward program rounds ``y`` as the static one does)."""
+
+    _require_route(kind)
+    arch = _arch()
+    names = loader.route_modules(arch, kind)
+    thresholds = _backward_thresholds(arch, kind)
+    if not thresholds:
+        pytest.skip(
+            f"the {kind} route on {arch} ships one program ({names[0]}); nothing switches"
+        )
+    fallback = _fallback_program(arch, kind)
+    record = loader.MODULES[fallback]
+    device = _device()
+    channels = sorted({C for T in thresholds for C in (T - 8, T, T + 8)} | {8192})
+    launched = set()
+    for S, docs in ((5, (2, 0, 3)), (1000, "perf")):
+        for C in channels:
+            selected = loader.selected_modules(arch, kind, C=C, S=S)
+            assert len(selected) == 1, f"S={S} C={C}: {selected}"
+            launched.add(selected[0])
+            x, w, cu, _, b, _ = _route_inputs(S, C, docs, FORWARD_ROUTE_SETTINGS[kind])
+            label = f"{kind} S={S} C={C} docs={docs} program={selected[0]}"
+            y = cake_causal_conv1d_train_forward(x, w, cu, bias=b)
+            _assert_within(
+                y,
+                reference_forward(x, w, cu, b),
+                atol=Y_ATOL,
+                rtol=Y_RTOL,
+                label=f"y {label}",
+            )
+            scalars = loader.plan(
+                S,
+                C,
+                int(cu.numel()) - 1,
+                geometry=record["grid_rule"]["geometry"],
+                role=record["role"],
+            )
+            y_fallback = torch.full_like(y, float("nan"))
+            values = {
+                "x": x,
+                "w": w,
+                "cu": cu,
+                "y": y_fallback,
+                "work": torch.zeros(
+                    loader.counter_words(record, scalars["n_ch_tiles"]),
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                **{key: int(scalars[key]) for key in loader.PLAN_SCALARS},
+                "flags": pkg._flags(w, b=b),
+            }
+            if b is not None:
+                values["b"] = b
+            loader.run_module(fallback, values, device_index=device.index)
+            torch.cuda.synchronize(device)
+            assert torch.equal(y, y_fallback), (
+                f"y of {selected[0]} differs from the fallback program {fallback}: {label}"
+            )
+    assert launched == set(names), f"never launched {set(names) - launched}"
+
+
 @pytest.mark.parametrize("case", CASES, ids=_case_id)
 def test_routed_rows_match_fallback_dx_bitwise(case) -> None:
     """A row the channel count routes to a selected program gets the same ``dx`` bits as the fallback program
@@ -1056,7 +1122,7 @@ def test_cuda_graph_replays_match_eager_per_route(kind) -> None:
 def test_backward_launches_the_selected_program_then_its_reduce(monkeypatch) -> None:
     """A backward call is two launches: the program ``C`` selects, then that record's ``reduce`` program with
     the main grid's CTA count as its ``main_ctas`` scalar, a partial view of that grid's rows and ``ceil(C / 4)``
-    CTAs; the forward launches its route in order."""
+    CTAs; the forward launches the one program its route selects for ``C``."""
 
     S, C, docs = 1000, 512, "perf"
     device = _device()
@@ -1092,7 +1158,9 @@ def test_backward_launches_the_selected_program_then_its_reduce(monkeypatch) -> 
         loader.launch_grid(reduce, device_index=device.index)
     launched.clear()
     cake_causal_conv1d_train_forward(x, w, cu)
-    assert [name for name, _, _ in launched] == list(loader.route_modules(arch, "fwd"))
+    assert [name for name, _, _ in launched] == list(
+        loader.selected_modules(arch, "fwd", C=C, S=S)
+    )
     # The forward passes its token-chunk counters: int32, at least two words per channel tile of its plan.
     forward = loader.MODULES[launched[0][0]]
     work = launched[0][1]["work"]
@@ -2086,13 +2154,11 @@ def test_registry_records_reference_the_build_manifest() -> None:
         ), name
         if "b" in logical:
             assert "flags" in logical, name
-        # The selection vocabulary: forward records carry no rule; a backward rule is
-        # ``channels_at_least`` with one positive multiple-of-8 threshold per architecture it names.
+        # The selection vocabulary: a forward or backward rule is ``channels_at_least`` with one positive
+        # multiple-of-8 threshold per architecture it names.
         rule = loader.select_rule(record)
-        if record["role"] == "fwd":
-            assert rule is None, name
         if rule is not None:
-            assert record["role"] == "bwd", name
+            assert record["role"] in ("fwd", "bwd"), name
             assert set(rule) == {"kind", "channels"}, name
             assert rule["kind"] in loader.SELECT_KINDS, name
             assert set(rule["channels"]) <= set(record["arches"]), name
@@ -2133,19 +2199,15 @@ def test_registry_records_reference_the_build_manifest() -> None:
             assert "--prec-div=true" in entry["nvcc_flags"]
     assert referenced == set(libraries)
     assert (package / "csrc" / "cake_ffi_checks.h").is_file()
-    # Per architecture and backward route: exactly one fallback record, every routed record's rule names
-    # the architecture with its own threshold (distinct thresholds, at most three routed programs), one
-    # program selected per channel count -- the highest threshold at most C, the fallback below the
-    # lowest -- and a forward route selects nothing.
+    # Per architecture and route, forward or backward: exactly one fallback record, every routed record's
+    # rule names the architecture with its own threshold (distinct thresholds, at most three routed
+    # programs), one program selected per channel count -- the highest threshold at most C, the fallback
+    # below the lowest.
     for arch in loader.ARCHES:
         for kind in loader.KINDS:
             if kind not in loader.ROUTES[arch]:
                 continue
             names = loader.route_modules(arch, kind)
-            if loader.route_role(kind) == "fwd":
-                assert loader.selected_modules(arch, kind, C=512) == names
-                assert all(loader.select_rule(loader.MODULES[n]) is None for n in names)
-                continue
             rules = {name: loader.select_rule(loader.MODULES[name]) for name in names}
             fallbacks = [name for name, rule in rules.items() if rule is None]
             assert len(fallbacks) == 1, (arch, kind, fallbacks)

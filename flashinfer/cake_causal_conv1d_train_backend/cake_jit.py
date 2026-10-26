@@ -37,9 +37,9 @@ gradient, SiLU' at the BF16-rounded preactivation), ``bwd_dt`` (BF16 taps and
 FP32 preactivation for the weight gradient) and ``bwd_bias_fp32g``;
 :func:`forward_route` / :func:`backward_route` map a call's arguments to its
 route and the ``flags`` bit mask (``FLAG_*``) tells a route's programs which
-of ``w``, ``dw``, ``b``, ``db`` are BF16.  A forward route launches its
-programs in order.  A backward route may carry several programs of the kernel
-and selects exactly one per call, chosen by the channel count: a record's
+of ``w``, ``dw``, ``b``, ``db`` are BF16.  A route, forward or backward, may
+carry several programs of its kernel and selects exactly one per call,
+chosen by the channel count: a record's
 ``select_rule`` (``channels_at_least``: ``C >= channels[arch]``) names the
 channel counts it owns, of several owners the one of the highest threshold
 runs, the record without a rule is the route's fallback, and
@@ -50,10 +50,15 @@ recompiles anything; building every library of the architecture
 (:func:`specs_for_arch`) before a CUDA Graph capture keeps the JIT out of the
 capture.
 
-A forward call is one ordinary launch of its route's program, the dynamic
-token-chunk forward (round 9): the co-resident CTAs of a channel tile take the
-tile's token chunks in order from a device counter, so the CTAs that finish
-first take the tail instead of an equal share fixed at launch.  The counters
+A forward call is one ordinary launch of the program its route selects, a
+dynamic token-chunk forward (round 9): the co-resident CTAs of a channel tile
+take the tile's token chunks in order from a device counter, so the CTAs that
+finish first take the tail instead of an equal share fixed at launch.  Each
+forward route ships the program of one eight-token stage per sub-tile and
+chunk for every channel count on sm_100a and sm_103a and, on sm_107a, below
+a per-route channel count (the fallback); from that count (C = 256 on
+``fwd``, 512 on ``fwd_dt``, 1024 on ``fwd_bias``) sm_107a runs the program
+of two stages per chunk.  The counters
 are the forward workspace ``work`` (``workspace_rule`` ``tile_counters``:
 :func:`counter_words`, two int32 words per channel tile), zero before the first
 launch; the last CTA of each tile resets them, so the buffer is zero after
@@ -107,7 +112,9 @@ keywords and the forward programs with ``fast=True, sched="dynamic",
 chunk_stages=1, pair_math=True`` (the dynamic token-chunk schedule of one
 eight-token stage per sub-tile and chunk, the f32x2 pair math, the
 branch-free in-document stage; ``y`` is bitwise the default build's) plus
-the route's keywords; every backward program carries ``revision=6`` (the
+the route's keywords, the sm_107a programs the channel count selects with
+``chunk_stages=2`` instead (two eight-token stages per sub-tile and chunk);
+every backward program carries ``revision=6`` (the
 build revision of the split that retired the cooperative form; the exporter
 hashes it so the split programs replaced the cooperative ones under new names)
 and is built with ``vec=8, copy="tma2d"`` (eight channels, 16-byte vectors, per
@@ -151,7 +158,11 @@ MODULES: dict[str, dict[str, Any]] = {
     # next-chunk counter and the done-CTA counter), zero before the first launch;
     # the last CTA of each tile resets them, so ``work`` is zero again after every
     # launch and every CUDA Graph replay, and one buffer serves every later launch
-    # of one stream (two launches that may overlap need two buffers).
+    # of one stream (two launches that may overlap need two buffers).  Where a CTA
+    # holds several sub-tiles, a chunk's three history rows come from the stage's
+    # slot (the halo rows its copy brings), not from global memory.  It is the
+    # route's fallback (no ``select_rule``): every channel count on sm_100a and
+    # sm_103a, and C < 256 on sm_107a.
     # ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows
     # the kernel (the exporter's ``KERNEL_SMEM_PROGRAMS``): the first render writes the
     # kernel's figure, the kernel symbol, the argument plan and the logical names it keeps.
@@ -655,7 +666,8 @@ MODULES: dict[str, dict[str, Any]] = {
     # ``dtype_flags`` (the ``flags`` scalar selects the tap load form: bit 0 set
     # reads BF16 taps), built with ``dtype_flags=True, fast=True,
     # sched="dynamic", chunk_stages=1, pair_math=True``; ``work`` as the ``fwd``
-    # record's.
+    # record's.  The route's fallback: every channel count on sm_100a and
+    # sm_103a, and C < 512 on sm_107a.
     # ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows
     # the kernel (the exporter's ``KERNEL_SMEM_PROGRAMS``): the first render writes the
     # kernel's figure, the kernel symbol, the argument plan and the logical names it keeps.
@@ -728,7 +740,8 @@ MODULES: dict[str, dict[str, Any]] = {
     # per-channel bias ``b`` added after the four taps (FLA's order) and
     # ``dtype_flags`` (bit 0: BF16 taps, bit 2: BF16 bias), built with ``bias=True,
     # dtype_flags=True, fast=True, sched="dynamic", chunk_stages=1,
-    # pair_math=True``; ``work`` as the ``fwd`` record's.
+    # pair_math=True``; ``work`` as the ``fwd`` record's.  The route's fallback:
+    # every channel count on sm_100a and sm_103a, and C < 1024 on sm_107a.
     # ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows
     # the kernel (the exporter's ``KERNEL_SMEM_PROGRAMS``): the first render writes the
     # kernel's figure, the kernel symbol, the argument plan and the logical names it keeps.
@@ -794,6 +807,237 @@ MODULES: dict[str, dict[str, Any]] = {
             "y": "y",
         },
         "role": "fwd",
+        "workspace_rule": {
+            "kind": "tile_counters",
+            "words_per_tile": 2,
+        },
+    },
+    # Route ``fwd`` on sm_107a from C = 256 (round 9): the dynamic token-chunk
+    # forward of two eight-token stages per sub-tile and chunk, built with
+    # ``fast=True, sched="dynamic", chunk_stages=2, pair_math=True``.  On R200 the
+    # one-stage program loses to the shipped forward from C = 2048 (one sub-tile
+    # per CTA over several channel tiles) and wins at C = 128, where two stages
+    # lose; this program runs from the smallest measured C where it beats the
+    # one-stage program.  ``work`` as the ``fwd`` record's.
+    # ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows
+    # the kernel (the exporter's ``KERNEL_SMEM_PROGRAMS``): the first render writes the
+    # kernel's figure, the kernel symbol, the argument plan and the logical names it keeps.
+    "cake_causal_conv1d_train_8665d0756b8240ecb4d0": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "y"],
+            ["buffer", "work"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 4,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "kind": "co_resident",
+        },
+        "kernel": "cake_causal_conv1d_train_8665d0756b8240ecb4d0",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_8665d0756b8240ecb4d0",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_train_8665d0756b8240ecb4d0",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "search_steps": "search_steps",
+            "w": "w",
+            "work": "work",
+            "x": "x",
+            "y": "y",
+        },
+        "role": "fwd",
+        "select_rule": {
+            "channels": {
+                "sm_107a": 256,
+            },
+            "kind": "channels_at_least",
+        },
+        "workspace_rule": {
+            "kind": "tile_counters",
+            "words_per_tile": 2,
+        },
+    },
+    # Route ``fwd_dt`` on sm_107a from C = 512 (round 9): the two-stage dynamic
+    # token-chunk forward with ``dtype_flags``, built with ``dtype_flags=True,
+    # fast=True, sched="dynamic", chunk_stages=2, pair_math=True``; ``work`` as
+    # the ``fwd`` record's.
+    # ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows
+    # the kernel (the exporter's ``KERNEL_SMEM_PROGRAMS``): the first render writes the
+    # kernel's figure, the kernel symbol, the argument plan and the logical names it keeps.
+    "cake_causal_conv1d_train_176ebb3e14f7ad9c94dc": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "y"],
+            ["buffer", "work"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["parameter", "flags"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 4,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "kind": "co_resident",
+        },
+        "kernel": "cake_causal_conv1d_train_176ebb3e14f7ad9c94dc",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_176ebb3e14f7ad9c94dc",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_train_176ebb3e14f7ad9c94dc",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "flags": "flags",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "search_steps": "search_steps",
+            "w": "w",
+            "work": "work",
+            "x": "x",
+            "y": "y",
+        },
+        "role": "fwd",
+        "select_rule": {
+            "channels": {
+                "sm_107a": 512,
+            },
+            "kind": "channels_at_least",
+        },
+        "workspace_rule": {
+            "kind": "tile_counters",
+            "words_per_tile": 2,
+        },
+    },
+    # Route ``fwd_bias`` on sm_107a from C = 1024 (round 9): the two-stage dynamic
+    # token-chunk forward with the per-channel bias, built with ``bias=True,
+    # dtype_flags=True, fast=True, sched="dynamic", chunk_stages=2,
+    # pair_math=True``; ``work`` as the ``fwd`` record's.
+    # ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows
+    # the kernel (the exporter's ``KERNEL_SMEM_PROGRAMS``): the first render writes the
+    # kernel's figure, the kernel symbol, the argument plan and the logical names it keeps.
+    "cake_causal_conv1d_train_d829c95e1d610bc14b23": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "y"],
+            ["buffer", "b"],
+            ["buffer", "work"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["parameter", "flags"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 4,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "kind": "co_resident",
+        },
+        "kernel": "cake_causal_conv1d_train_d829c95e1d610bc14b23",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_d829c95e1d610bc14b23",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_train_d829c95e1d610bc14b23",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "b": "b",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "flags": "flags",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "search_steps": "search_steps",
+            "w": "w",
+            "work": "work",
+            "x": "x",
+            "y": "y",
+        },
+        "role": "fwd",
+        "select_rule": {
+            "channels": {
+                "sm_107a": 1024,
+            },
+            "kind": "channels_at_least",
+        },
         "workspace_rule": {
             "kind": "tile_counters",
             "words_per_tile": 2,
@@ -2069,10 +2313,11 @@ MODULES: dict[str, dict[str, Any]] = {
     },
 }
 
-# Architecture -> route -> the records the route launches, in launch order.  The
-# default routes ``fwd`` / ``bwd`` are the shipped programs; the six round-6
-# routes each hold their hand-written fallback (above) and, once rendered, the
-# routed programs the exporter scaffolds from it.
+# Architecture -> route -> the records a call of the route selects from (the
+# fallback first).  The default routes ``fwd`` / ``bwd`` are the shipped
+# programs; the six round-6 routes each hold their hand-written fallback
+# (above) and, once rendered, the routed programs the exporter scaffolds from
+# it; the forward routes' sm_107a two-stage programs are hand-written records.
 ROUTES: dict[str, dict[str, list[str]]] = {
     "sm_100a": {
         "bwd": [
@@ -2162,12 +2407,15 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         ],
         "fwd": [
             "cake_causal_conv1d_train_f5497330bfd286211643",
+            "cake_causal_conv1d_train_8665d0756b8240ecb4d0",
         ],
         "fwd_bias": [
             "cake_causal_conv1d_train_08880ca12e4064bc8cdb",
+            "cake_causal_conv1d_train_d829c95e1d610bc14b23",
         ],
         "fwd_dt": [
             "cake_causal_conv1d_train_9c1e7ee9f37e3102660e",
+            "cake_causal_conv1d_train_176ebb3e14f7ad9c94dc",
         ],
     },
 }
@@ -2216,10 +2464,10 @@ ROLES = ("fwd", "bwd", "reduce")
 # architecture of its record); ``channels_per_cta`` launches ``ceil(C /
 # channels_per_cta)`` CTAs (the reduce programs).
 GRID_KINDS = ("co_resident", "occupancy", "channels_per_cta")
-# The selection-rule vocabulary of a backward record (``record["select_rule"]
-# ["kind"]``); of the records whose rule admits a call the one of the highest
-# threshold runs, a backward record without a rule is its route's fallback and
-# a forward record never carries one.
+# The selection-rule vocabulary of a forward or backward record
+# (``record["select_rule"]["kind"]``); of the records whose rule admits a call
+# the one of the highest threshold runs, and a record without a rule is its
+# route's fallback.  A reduce record never carries one.
 SELECT_KINDS = ("channels_at_least",)
 # The ``flags`` bit mask of the ``dtype_flags`` programs (every program of the
 # six round-6 routes): the host derives it from the tap tensor, the ACTUAL
@@ -2336,8 +2584,8 @@ def backward_route(*, bias: bool, fp32_grad: bool, bf16_taps_or_dweight: bool) -
 def route_modules(arch: str, kind: str) -> tuple[str, ...]:
     """Ordered module names of one route on ``arch`` (every program the route may launch).
 
-    A forward route launches them all, in order; a backward route launches the
-    one :func:`selected_modules` picks for the call's channel count.
+    A call launches the one :func:`selected_modules` picks for its channel
+    count.
     """
 
     route_role(kind)
@@ -2353,12 +2601,12 @@ def route_modules(arch: str, kind: str) -> tuple[str, ...]:
 def select_rule(record: dict[str, Any]) -> dict[str, Any] | None:
     """The selection rule of one module record, ``None`` when the record carries none.
 
-    A backward record without a rule (no ``select_rule`` key, or ``None``) is
-    its route's fallback program.  ``{"kind": "channels_at_least", "channels":
+    A record without a rule (no ``select_rule`` key, or ``None``) is its
+    route's fallback program.  ``{"kind": "channels_at_least", "channels":
     {arch: C_min, ...}}`` owns the calls whose channel count is at least
     ``channels[arch]`` on the architectures it names and never hits on the
     others; when several records own a call, the one of the highest threshold
-    runs.  Forward records carry no rule.
+    runs.
     """
 
     return record.get("select_rule")
@@ -2390,22 +2638,19 @@ def selected_modules(
 ) -> tuple[str, ...]:
     """Ordered module names one public call launches on ``arch`` for ``C`` channels.
 
-    A forward route launches every program of its route (:func:`route_modules`).
-    A backward route may carry several programs of the kernel and launches
-    exactly one: of the records whose :func:`select_rule` admits ``C`` on
-    ``arch`` the one of the highest threshold, else the route's single fallback
-    record (the one without a rule).  The choice is a pure function of the
-    architecture, the route and the channel count -- ``S`` is accepted and
-    unused, and the host never reads the data -- so a given ``(S, C, device)``
-    always runs the same program of a route and ``dweight`` stays bitwise
-    reproducible.  Two admitting records of one threshold, or zero or several
-    fallbacks, are registry errors (``RuntimeError``); an unknown rule kind is
-    a ``ValueError``.
+    A route may carry several programs of its kernel and launches exactly one:
+    of the records whose :func:`select_rule` admits ``C`` on ``arch`` the one
+    of the highest threshold, else the route's single fallback record (the one
+    without a rule).  The choice is a pure function of the architecture, the
+    route and the channel count -- ``S`` is accepted and unused, and the host
+    never reads the data -- so a given ``(S, C, device)`` always runs the same
+    program of a route and ``dweight`` stays bitwise reproducible.  Two
+    admitting records of one threshold, or zero or several fallbacks, are
+    registry errors (``RuntimeError``); an unknown rule kind is a
+    ``ValueError``.
     """
 
     names = route_modules(arch, kind)
-    if route_role(kind) == "fwd":
-        return names
     positive: list[tuple[int, str]] = []
     fallback: list[str] = []
     for name in names:
@@ -2416,7 +2661,7 @@ def selected_modules(
             positive.append((_threshold(rule, arch=arch), name))
     if len(fallback) != 1:
         raise RuntimeError(
-            f"the exported backward route {kind!r} on {arch} declares {len(fallback)} "
+            f"the exported route {kind!r} on {arch} declares {len(fallback)} "
             "fallback programs (records without a select_rule); expected exactly one"
         )
     if not positive:
@@ -2425,7 +2670,7 @@ def selected_modules(
     if len(positive) > 1 and positive[0][0] == positive[1][0]:
         tied = [name for threshold, name in positive if threshold == positive[0][0]]
         raise RuntimeError(
-            f"the exported backward route {kind!r} on {arch} selects {len(tied)} "
+            f"the exported route {kind!r} on {arch} selects {len(tied)} "
             f"programs for C={int(C)} at one threshold {positive[0][0]} ({tied}); "
             "thresholds must be distinct"
         )
