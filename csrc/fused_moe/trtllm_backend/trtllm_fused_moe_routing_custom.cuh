@@ -19,7 +19,7 @@
 // Kernel inventory:
 //   1. routingIndicesBlockKernel      — single-block fused kernel (≤4 tokens)
 //   1c. routingIndicesSmallBatchKernel / routingIndicesSmallBatchClusterKernel — single-launch
-//       kernels for 256 experts / top-8, ≤64 tokens (SM90+)
+//       kernels for 256 experts / top-8, ≤64 tokens (SM10x only)
 //   2. routingIndicesClusterKernel    — single-cluster fused kernel (≤256 tokens, SM90+)
 //   3. routingIndicesHistogramScoresKernel — TopK + histogram from raw scores
 //   4. routingIndicesCoopKernel       — cooperative histogram + offsets (defined in
@@ -2185,13 +2185,13 @@ inline bool smallBatchKernelEnabled() {
   return !(v == "0" || v == "off" || v == "OFF");
 }
 
-// Whether the small-batch kernels (section 1c) serve this call: SM90+, 256 experts, top-8,
-// 1-64 tokens, BF16 weights, and either precomputed top-k or logits with DeepSeek-V3-style
-// SigmoidBias + ScaledSumNormalize routing.
+// Whether the small-batch kernels (section 1c) serve this call: SM10x only (other architectures
+// keep the existing kernels), 256 experts, top-8, 1-64 tokens, BF16 weights, and either
+// precomputed top-k or logits with DeepSeek-V3-style SigmoidBias + ScaledSumNormalize routing.
 inline bool canUseSmallBatchKernel(Data const& data) {
   static int const smMajor = tensorrt_llm::common::getSMVersion() / 10;
   bool const fromScores = data.mPtrTopKIds == nullptr && data.mPtrScores != nullptr;
-  bool const shapeOk = smMajor >= 9 && data.mNumExperts == SmallBatchKernelNumExperts &&
+  bool const shapeOk = smMajor == 10 && data.mNumExperts == SmallBatchKernelNumExperts &&
                        data.mTopK == SmallBatchKernelTopK && data.mNumTokens >= 1 &&
                        data.mNumTokens <= SmallBatchKernelMaxNumTokens &&
                        data.mNumFusedSharedExperts == 0 && data.mDtypeOutput == tg::Dtype::Bfloat16;

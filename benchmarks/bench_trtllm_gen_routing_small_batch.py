@@ -244,6 +244,10 @@ def main():
     print(
         f"device: {torch.cuda.get_device_name()}, inter {args.inter}, tile {args.tile}"
     )
+    if torch.cuda.get_device_capability()[0] != 10:
+        print(
+            "note: the small-batch kernels run on SM10x only; both columns time the same kernels"
+        )
     print("op,tokens,old_us,new_us,saved_us,old_spread_us,new_spread_us")
     moe = Fp4Moe(args.inter) if any(o.startswith("moe") for o in args.ops) else None
     for op in args.ops:
