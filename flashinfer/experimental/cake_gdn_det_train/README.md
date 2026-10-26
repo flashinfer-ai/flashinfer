@@ -28,7 +28,7 @@ o, final_state = chunk_gated_delta_rule(
     scale=None,                          # 1 / sqrt(128) when None
     initial_state=None,                  # [N, HV, 128, 128] fp32 or None
     output_final_state=False,
-    cu_seqlens=cu_seqlens,               # packed batch (B == 1): int64 offsets on the device
+    cu_seqlens=cu_seqlens,               # packed batch (B == 1): int32 / int64 offsets on the device
     cu_seqlens_cpu=cu_seqlens_cpu,       # the same offsets on the host: host-table route; None: device route
     use_qk_l2norm_in_kernel=True,
 )
