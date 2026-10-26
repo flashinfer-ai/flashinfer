@@ -278,17 +278,15 @@ _EXACTONE_MODULES = {
     "exactone_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_1100526c71",
     "exactone_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_948223063c",
 }
-# sm_107a (Rubin) device modules of the programs whose Rubin render was
-# regenerated with its own geometry (the fused and one-launch varlen scans,
-# the look-back chunk-parallel program and the two-kernel varlen ring
-# program), filled by the Cake export; the loader builds these modules for
-# capability (10, 7) (:func:`_main_module`).  Every other program builds its
-# fold module on every architecture: the retained start ``exact_*``
-# programs, the ``exactmeta_*`` programs (SM100 only,
-# ``_LIGHT_STAGE_CAPABILITIES``) and the programs whose Rubin render differed
-# from the fold only by the tcgen05 SMEM descriptor address mask (15 bits on
-# sm_107a, ``0x7FFF``; 14 bits, ``0x3FFF``, on sm_100a and sm_103a), which
-# the fold source now selects by ``__CUDA_ARCH__``.  The metadata kernel is
+# sm_107a (Rubin) device modules, filled by the Cake export: every
+# ``exactfused_*``, ``exactone_*``, ``exactpre_*`` (tail included),
+# ``chunkpar_*`` and ``chunkpar3_*`` program builds its own sm_107a render for
+# capability (10, 7) (:func:`_main_module`).  The retained start ``exact_*``
+# programs and the ``exactmeta_*`` programs (SM100 only,
+# ``_LIGHT_STAGE_CAPABILITIES``) build their fold module on every
+# architecture; the fold source selects the tcgen05 SMEM descriptor address
+# mask by ``__CUDA_ARCH__`` (15 bits on sm_107a, ``0x7FFF``; 14 bits,
+# ``0x3FFF``, on sm_100a and sm_103a).  The metadata kernel is
 # shared; the segment preprocess builds its own sm_107a render
 # (``_SM107_SEGMENT_PREPROCESS``, or its early-trigger twin
 # ``_SM107_SEGMENT_PREPROCESS_TRIGGER`` for the ``_PDL_TRIGGER_FAMILIES``
