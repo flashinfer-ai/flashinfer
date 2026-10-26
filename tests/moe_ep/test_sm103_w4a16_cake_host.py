@@ -25,6 +25,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import random
+import types
 from typing import Any
 
 import pytest
@@ -463,6 +464,22 @@ def test_combine_grid_covers_the_capacity() -> None:
     assert combine_grid(1, 6144) == (6, 1, 1)
     assert combine_grid(64, 7168) == (7, 64, 1)
     assert combine_grid(512, 6144) == (6, 512, 1)
+    # One token per CTA up to COMBINE_MAX_ROWS rows; above it every CTA of row y
+    # walks the tokens y, y + rows, ... (4 per CTA at a capacity of 4096).
+    assert cake_plan.COMBINE_MAX_ROWS == 1024
+    assert combine_grid(1024, 6144) == (6, 1024, 1)
+    assert combine_grid(1025, 6144) == (6, 1024, 1)
+    assert combine_grid(4096, 7168) == (7, 1024, 1)
+
+
+def test_cta_hist_scratch_covers_the_programs_rounds_of_32_ctas() -> None:
+    # The fused program reads the per-CTA histogram in rounds of 32 CTAs, so the
+    # scratch holds at least round_up(grid, 32) rows of E_local words; the grid is
+    # at most one CTA per SM.
+    for sm_count in (32, 72, 100, 132, 148, 160, 192):
+        g = Geometry(8, 0, 256, 6144, 2048, 8, 64, sm_count=sm_count)
+        rows = local_buffers(g)["cta_hist"][0][0]
+        assert rows == g.max_grid_ctas >= -(-sm_count // 32) * 32 >= sm_count
 
 
 def test_buffer_tables_follow_the_geometry() -> None:
@@ -504,6 +521,46 @@ def test_peer_tables_are_capacity_padded_cpu_int64() -> None:
         cake_symmetric.peer_table([0x10, 0], world_size=2)
     with pytest.raises(ValueError):
         cake_symmetric.peer_table([0x10] * 9, world_size=9)
+
+
+def _fake_loader(identifiers) -> types.SimpleNamespace:
+    """A loader module publishing one program constant per identifier, shipped
+    for both exact targets (only the attributes ``available`` / ``targets`` read)."""
+    return types.SimpleNamespace(
+        **{
+            identifier: types.SimpleNamespace(targets=("sm_100a", "sm_103a"))
+            for identifier in identifiers
+        }
+    )
+
+
+def test_shipped_programs_require_every_program_of_the_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Every program the plan enumerates (the fused program of every cell at every
+    # known pull-slot row, and the combine program) must ship for the route to be
+    # available; a missing one is named when it is loaded.
+    complete = _fake_loader(PROGRAM_IDENTIFIERS)
+    monkeypatch.setattr(
+        cake_programs.ShippedPrograms, "loader", staticmethod(lambda: complete)
+    )
+    assert cake_programs.ShippedPrograms.available()
+    assert cake_programs.ShippedPrograms().targets() == ((10, 0), (10, 3))
+    missing = program_identifier(FUSED, Cell(32), 7168)
+    partial = _fake_loader(
+        [identifier for identifier in PROGRAM_IDENTIFIERS if identifier != missing]
+    )
+    monkeypatch.setattr(
+        cake_programs.ShippedPrograms, "loader", staticmethod(lambda: partial)
+    )
+    assert not cake_programs.ShippedPrograms.available()
+    assert cake_programs.ShippedPrograms().targets() == ()
+    with pytest.raises(RuntimeError, match="FUSED_N32_H7168"):
+        cake_programs.ShippedPrograms().handle(
+            FUSED, Cell(32), torch.device("cpu"), 7168
+        )
+    # The default-row program of the same cell is still served by name.
+    assert getattr(partial, program_identifier(FUSED, Cell(32), 6144)) is not None
 
 
 def test_program_handle_refuses_unknown_argument_names() -> None:

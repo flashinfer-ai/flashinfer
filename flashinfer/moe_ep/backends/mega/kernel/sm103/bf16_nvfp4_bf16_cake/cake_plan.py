@@ -84,13 +84,21 @@ SYNC_WORDS = 8
 EPOCH_WORDS = 16
 TILE_COUNT_WORDS = 4
 # CTAs of the per-CTA route histogram scratch: the largest grid any device
-# can launch (one CTA per SM, two per cluster slot at most).
+# can launch (one CTA per SM, two per cluster slot at most). The fused program
+# reads the histogram in rounds of 32 CTAs, so the scratch holds at least
+# ``round_up(grid, 32)`` rows; two rows per SM cover that for every SM count
+# of 32 or more.
 MAX_CTAS_PER_SM = 2
 # The combine program: ``COMBINE_THREADS`` threads of one 16-byte BF16 vector each,
-# one CTA per (token, ``COMBINE_HIDDEN_PER_CTA``-column slice); its hidden size is a
-# build constant, so it ships for exactly these hidden sizes.
+# one CTA per (token row, ``COMBINE_HIDDEN_PER_CTA``-column slice); its hidden size
+# is a run-time argument, a multiple of the slice.
 COMBINE_THREADS = 128
 COMBINE_HIDDEN_PER_CTA = COMBINE_THREADS * 8
+# The combine grid's row cap: the CTA of grid row ``y`` walks the tokens ``y, y + rows,
+# ...`` below the rank's live count, so a capacity above this many rows gives every
+# CTA several tokens behind one completion wait (4 at a capacity of 4096), and one
+# token per CTA stays the rule up to it.
+COMBINE_MAX_ROWS = 1024
 #: The fused program's ``h_max`` build keyword (the pull slot's row): its default,
 #: its step and its limit. A hidden size above the default selects an ``h_max``
 #: variant of every fused program (identifier suffix ``_H{h_max}``).
@@ -207,13 +215,19 @@ def pool_rows(world_size: int, capacity: int, local_experts: int, n: int) -> int
 
 
 def combine_grid(capacity: int, hidden: int) -> Tuple[int, int, int]:
-    """Grid of the combine program: ``(hidden / 1024, cap, 1)`` -- one CTA per
-    (``COMBINE_HIDDEN_PER_CTA``-column slice, token slot of the capacity). A CTA
-    whose token is at or past the rank's live count exits, so the launch is the
-    same for every token bound (at least one token row, so a capacity of zero
-    never happens here)."""
+    """Grid of the combine program: ``(hidden / 1024, min(cap, 1024), 1)`` -- one
+    CTA per (``COMBINE_HIDDEN_PER_CTA``-column slice, token row); the CTA of row
+    ``y`` combines the tokens ``y, y + rows, ...`` below the rank's live count
+    (one token per CTA up to a capacity of ``COMBINE_MAX_ROWS``). A CTA whose
+    first token is at or past the live count exits, so the launch is the same
+    for every token bound (at least one token row, so a capacity of zero never
+    happens here)."""
 
-    return (hidden // COMBINE_HIDDEN_PER_CTA, max(capacity, 1), 1)
+    return (
+        hidden // COMBINE_HIDDEN_PER_CTA,
+        min(max(capacity, 1), COMBINE_MAX_ROWS),
+        1,
+    )
 
 
 def fused_grid(
@@ -521,6 +535,7 @@ __all__ = [
     "COMBINE",
     "COMBINE_ARGS",
     "COMBINE_HIDDEN_PER_CTA",
+    "COMBINE_MAX_ROWS",
     "COMBINE_PER_FORWARD_ARGS",
     "DEFAULT_FUSED_H_MAX",
     "COMBINE_THREADS",
