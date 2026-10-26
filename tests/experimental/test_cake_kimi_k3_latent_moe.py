@@ -389,6 +389,7 @@ def test_prefill_tail_plan_and_trigger():
     )
     assert not n128["final_ts"]
     assert cb.tail_gemm_final_ts(1024, 8) and not cb.tail_gemm_final_ts(512, 8)
+    assert not cb.tail_gemm_final_ts(1024, 8, 152)
     # Fused norm: TP1 T = 256 / 512 on the single-wave grid (K2 = 96 blocks), larger TP1 rows on the claimed resident
     # grid; TP8 (K2 = 12) does not fuse.
     assert tp1["fused_norm"] and prefill_tail_plan(512, 1)["fused_norm"]
@@ -521,8 +522,12 @@ def test_plans_follow_the_device_sm_count():
             same_tail = route_kernel_keys("tail", tp, tokens, 148) == route_kernel_keys(
                 "tail", tp, tokens, 152
             )
-            # The 256 x 512 tail tile starts at 4096 TP1 tokens on 152 SMs, at 8192 on 148.
-            assert same_tail == (tp != 1 or not 4096 <= tokens < 8192)
+            # The 256 x 512 tail tile starts at 4096 TP1 tokens on 152 SMs, at 8192 on 148; the 128-wide TP8 tile
+            # serves T=1024 on 152 SMs only.
+            assert same_tail == (
+                not (tp == 1 and 4096 <= tokens < 8192)
+                and not (tp == 8 and tokens == 1024)
+            )
 
 
 def test_generated_program_available_follows_partials_and_sm_count(monkeypatch):
@@ -562,6 +567,20 @@ def test_route_rules_select_the_expected_programs():
     assert cb.tail_gemm_num_stages(256, 1) == 6 and cb.tail_gemm_num_stages(512, 1) == 7
     assert cb.tail_gemm_config(512, 8) == (9, 128, False)
     assert cb.tail_gemm_config(512, 1) == (7, 256, True)
+    # Round-4 R128: the 128-wide TP8 tile also serves T=1024 on 152 SMs (3 waves of 76 clusters); 148 SMs keep 256.
+    assert cb.tail_n128_tokens(152) == (512, 1024)
+    assert cb.tail_n128_tokens(148) == (512,)
+    assert cb.tail_gemm_config(1024, 8, 152) == (9, 128, False)
+    assert cb.tail_gemm_config(1024, 8, 148) == (7, 256, True)
+    assert cb.tail_gemm_config(512, 8, 152) == (9, 128, False)
+    n128_1024 = cb.prefill_tail_plan(1024, 8, 152)
+    assert n128_1024["cluster_tiles"] == 224 and n128_1024["gemm_grid"] == 448
+    assert n128_1024["sk_tiles"] == 0 and n128_1024["early_trigger"]
+    assert not n128_1024["weights_evict_first"] and not n128_1024["fused_norm"]
+    assert route_kernel_keys("tail", 8, 1024, 152) == (
+        "tail_norm:e1",
+        "tail_gemm:tp8e0f0s9n128",
+    )
     for tokens in (300, 511):
         plan = cb.prefill_tail_plan(tokens, 8)
         assert not plan["fused_norm"] and not plan["early_trigger"]

@@ -755,18 +755,28 @@ TAIL_NUM_STAGES = 7
 TAIL_RING6_TP = 1
 TAIL_RING6_MAX_T = 256
 TAIL_RING6_STAGES = 6
-# Round-7 lever 7 (Cake ``tail_gemm_config_for`` N128 rule): the TP8 T=512 row takes the 128-wide pair tile (56 column
-# tiles, 224 CTAs) with a 9-deep ring; every other row keeps the 256-wide tile.
+# Round-7 lever 7 (TP8 T=512) and round-4 R128 (TP8 T=1024 on 152 SMs): the 128-wide pair tile (56 column tiles) with
+# a 9-deep ring; every other row keeps the 256-wide tile.  T=1024 on 152 SMs: 224 pair tiles in 3 waves of 76 clusters
+# (3 x 19 x 256 clk) instead of 112 in 2 waves (2 x 19 x 512 clk); on 148 SMs 224 / 74 = 3.03 -> 4 waves, the MMA path
+# ties, so 148-SM parts keep the 256-wide tile there.
 TAIL_N128_TP = 8
 TAIL_N128_T = 512
 TAIL_N128_BLOCK_N = 128
 TAIL_N128_STAGES = 9
+TAIL_N128_TOKENS_BY_SM_COUNT = {152: (512, 1024)}
+
+
+def tail_n128_tokens(sm_count: int = SM_COUNT) -> tuple[int, ...]:
+    """TP8 token counts of the 128-wide pair tile on a ``sm_count``-SM device."""
+    return TAIL_N128_TOKENS_BY_SM_COUNT.get(int(sm_count), (TAIL_N128_T,))
+
+
 # Round-10 lever L1c (Cake ``tail_gemm_config_for`` ``FINAL_TS`` rule): every 256-wide tail GEMM instance stages the
 # CTA's final item (its last stream-K segment) through one TMA store per epilogue warp out of the drained TMA ring
 # instead of the direct pointer stores -- a separate kernel instance (key suffix ``t1``) with the same accumulator
 # values and the same round-to-nearest bf16 conversion, so ``out`` is bit-identical; every earlier item of a CTA keeps
 # the direct stores.  The instance takes the bf16 tensor map of ``out`` as one extra argument (``out_map``, bound by
-# value from the same tensor as the ``out`` pointer).  The 128-wide TP8 T=512 instance keeps the direct stores (one
+# value from the same tensor as the ``out`` pointer).  The 128-wide TP8 instance keeps the direct stores (one
 # 64-column pass per warp: the slab's fixed cost exceeds the exposed store it replaces).
 TAIL_FINAL_TS = True
 
@@ -796,7 +806,7 @@ def tail_gemm_config(
         return TAIL_RING6_STAGES, BLOCK_N, TAIL_FINAL_TS
     if int(tp) == TAIL_WIDE_TP and int(M) >= tail_wide_min_tokens(sm_count):
         return TAIL_WIDE_STAGES, TAIL_WIDE_BLOCK_N, TAIL_FINAL_TS
-    if int(tp) == TAIL_N128_TP and int(M) == TAIL_N128_T:
+    if int(tp) == TAIL_N128_TP and int(M) in tail_n128_tokens(sm_count):
         return TAIL_N128_STAGES, TAIL_N128_BLOCK_N, False
     return TAIL_NUM_STAGES, BLOCK_N, TAIL_FINAL_TS
 
