@@ -44,11 +44,13 @@ def _band(
     )
 
 
+@pytest.mark.cpu_only
 def test_band_constants():
     assert _CAKE_GDN_CP_SM100_BAND_WORK_FACTOR == 4
     assert _CAKE_GDN_CP_SM100_BAND_MIN_MAX_SEQLEN == 4096
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("max_seqlen", "total", "num_seqs", "expected"),
     [
@@ -66,6 +68,7 @@ def test_band_bound_is_the_hint_or_the_balanced_estimate(
     assert _cake_gdn_cp_band_max_seqlen(max_seqlen, total, num_seqs) == expected
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("num_sms", [148, 152])
 def test_balanced_short_batches_stay_outside_the_band_without_a_hint(num_sms):
     # 4 x 2048 with Ho=8 (4*4*8 = 128 < 148): the packed length 8192 would enter the band, the estimate 2048 does not.
@@ -99,6 +102,7 @@ def test_balanced_short_batches_stay_outside_the_band_without_a_hint(num_sms):
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("num_sms", [148, 152, 160])
 def test_band_membership_of_the_contract_rows(num_sms):
     # 17 band rows per architecture of the 66-row qwen_tp_fp32state contract: 1x16384 and 1x4096 for every geometry,
@@ -127,6 +131,7 @@ def test_band_membership_of_the_contract_rows(num_sms):
     assert members == 17
 
 
+@pytest.mark.cpu_only
 def test_band_requires_sm100_or_sm103_and_fp32_state():
     assert not _band(num_seqs=1, hq=8, hv=16, max_seqlen=16384, capability=(10, 7))
     assert not _band(num_seqs=1, hq=8, hv=16, max_seqlen=16384, capability=(9, 0))

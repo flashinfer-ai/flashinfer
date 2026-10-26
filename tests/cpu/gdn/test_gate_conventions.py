@@ -24,6 +24,7 @@ from flashinfer.gdn_prefill import chunk_gated_delta_rule
 from flashinfer.trace.templates.gdn import gdn_prefill_trace
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_raw_gates_preserve_beta_storage_rounding(dtype):
     g = torch.tensor([[-20.0, 0.0, 20.0], [0.2, -0.7, 0.4]], dtype=dtype)
@@ -49,6 +50,7 @@ def test_raw_gates_preserve_beta_storage_rounding(dtype):
     torch.testing.assert_close(log_alpha, expected)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "problem",
     [
@@ -88,6 +90,7 @@ def test_invalid_gate_metadata(problem):
         validate_gate_inputs(q, v, g, beta, domain, raw, a_log, bias, logits)
 
 
+@pytest.mark.cpu_only
 def test_transformed_trace_preserves_default_definition_and_runs_standalone():
     default = gdn_prefill_trace()
     transformed = gdn_prefill_trace(use_gate_in_kernel=True)
@@ -140,6 +143,7 @@ def test_transformed_trace_preserves_default_definition_and_runs_standalone():
     assert replay["use_gate_in_kernel"] and replay["beta_is_logit"]
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("definition_source", ["generated", "checked_in"])
 def test_gate_trace_requires_beta_for_logit_transform(definition_source):
     if definition_source == "generated":
@@ -150,7 +154,7 @@ def test_gate_trace_requires_beta_for_logit_transform(definition_source):
     else:
         definition = json.loads(
             (
-                Path(__file__).parents[1]
+                Path(__file__).parents[2]
                 / "trace/fi_trace_out/gdn_prefill_gates_q4_k4_v8_d128.json"
             ).read_text()
         )
@@ -169,6 +173,7 @@ def test_gate_trace_requires_beta_for_logit_transform(definition_source):
         validate_gate_inputs(q, q, None, None, "linear", False, None, None, True)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("heads", [(4, 2, 2), (2, 2, 4)])
 @pytest.mark.parametrize("empty_sequence", [False, True])
 def test_gate_trace_reference_grouping_and_state_pool(heads, empty_sequence):
@@ -233,6 +238,7 @@ def test_gate_trace_reference_grouping_and_state_pool(heads, empty_sequence):
     assert torch.equal(pool[[0, 2, 3, 4]], args["output_state"][[0, 2, 3, 4]])
 
 
+@pytest.mark.cpu_only
 def test_pool_only_trace_selects_slot_aware_schema_and_reference():
     from tests.test_helpers.cudnn_linear_attention import serial_delta_rule
 
@@ -295,6 +301,7 @@ def test_pool_only_trace_selects_slot_aware_schema_and_reference():
     torch.testing.assert_close(pool[[0, 2, 3, 4]], args["output_state"][[0, 2, 3, 4]])
 
 
+@pytest.mark.cpu_only
 def test_auto_fallback_signal_is_limited_to_plan_build(monkeypatch):
     from flashinfer.cudnn import linear_attention as adapter
 

@@ -67,6 +67,7 @@ def _decode(**overrides):
     return cake_gdn.select_cake_gdn_decode_variant(**params)
 
 
+@pytest.mark.cpu_only
 def test_manifest_lists_loadable_source_only_variants() -> None:
     # The manifest is the only registry: every variant names one kernel source
     # (shared with the other specializations of the same body), the -D defines
@@ -116,6 +117,7 @@ def test_manifest_lists_loadable_source_only_variants() -> None:
     assert included_headers == header_names
 
 
+@pytest.mark.cpu_only
 def test_host_shims_render_to_the_former_per_variant_text() -> None:
     # Every variant's host shim is rendered from a class template under
     # host/templates/; the sidecar pins the rendered text to the sha256 of the
@@ -139,6 +141,7 @@ def test_host_shims_render_to_the_former_per_variant_text() -> None:
         assert digest == pinned[record["name"]], record["name"]
 
 
+@pytest.mark.cpu_only
 def test_manifest_defines_default_to_specializations() -> None:
     # The -D flags of a record are its specializations unless it spells out
     # ``defines``: the decode bodies that bake their constants in-file take
@@ -162,6 +165,7 @@ def test_manifest_defines_default_to_specializations() -> None:
     assert 0 < explicit < len(variants)
 
 
+@pytest.mark.cpu_only
 def test_prefill_resolver_selects_dvsplit_full_and_single_chunk() -> None:
     dvsplit = _prefill()
     assert dvsplit.route_id == "flashinfer.gdn_prefill.noncp.dvsplit"
@@ -194,6 +198,7 @@ def test_prefill_resolver_selects_dvsplit_full_and_single_chunk() -> None:
     assert "single_chunk" in single.variant_name
 
 
+@pytest.mark.cpu_only
 def test_prefill_resolver_selects_frozen_dynamic_head_specializations() -> None:
     dynamic_heads = _prefill(
         num_seqs=1,
@@ -221,6 +226,7 @@ def test_prefill_resolver_selects_frozen_dynamic_head_specializations() -> None:
     assert group_record["specializations"]["HEAD_GROUP_LOG2"] == -1
 
 
+@pytest.mark.cpu_only
 def test_prefill_resolver_selects_sglang_tp4_bf16_indexed_row() -> None:
     route = _prefill(
         arch="sm_103a",
@@ -252,6 +258,7 @@ def test_prefill_resolver_selects_sglang_tp4_bf16_indexed_row() -> None:
     }
 
 
+@pytest.mark.cpu_only
 def test_prefill_resolver_selects_exact_sglang_tp4_checkpoint_row() -> None:
     route = _prefill(
         arch="sm_103a",
@@ -284,6 +291,7 @@ def test_prefill_resolver_selects_exact_sglang_tp4_checkpoint_row() -> None:
     }
 
 
+@pytest.mark.cpu_only
 def test_prefill_resolver_fails_closed_for_unpromoted_rows() -> None:
     with pytest.raises(
         cake_gdn.CakeGDNUnsupportedError,
@@ -324,6 +332,7 @@ def test_prefill_resolver_fails_closed_for_unpromoted_rows() -> None:
         _prefill(state_dtype="float16")
 
 
+@pytest.mark.cpu_only
 def test_prefill_resolver_takes_no_device_derived_lengths() -> None:
     """The resolver reads nothing back from the device.
 
@@ -359,6 +368,7 @@ def test_prefill_resolver_takes_no_device_derived_lengths() -> None:
         _prefill(**common, max_seq_len=107, seq_lens=(52, 93, 15, 107, 72, 61, 21))
 
 
+@pytest.mark.cpu_only
 def test_prefill_resolver_single_chunk_follows_the_host_bound() -> None:
     """``single_chunk`` needs a bound of at most 64 tokens, not device lengths.
 
@@ -388,6 +398,7 @@ def test_prefill_resolver_single_chunk_follows_the_host_bound() -> None:
         _prefill(**common, max_seq_len=4 * 64)
 
 
+@pytest.mark.cpu_only
 def test_kernel_loader_fails_closed_for_unsupported_architecture() -> None:
     with pytest.raises(
         cake_gdn.CakeGDNUnsupportedError,
@@ -396,6 +407,7 @@ def test_kernel_loader_fails_closed_for_unsupported_architecture() -> None:
         cake_gdn.load_cake_gdn_kernel("unused", "sm_90a")  # type: ignore[arg-type]
 
 
+@pytest.mark.cpu_only
 def test_decode_resolver_selects_all_promoted_physical_routes() -> None:
     small = _decode()
     assert small.route_id.endswith("nontranspose_small")
@@ -411,6 +423,7 @@ def test_decode_resolver_selects_all_promoted_physical_routes() -> None:
     assert "pretranspose_splitv8" in pretranspose.variant_name
 
 
+@pytest.mark.cpu_only
 def test_decode_resolver_selects_exact_promoted_fp32_mtp_rows() -> None:
     rows = (
         (
@@ -448,6 +461,7 @@ def test_decode_resolver_selects_exact_promoted_fp32_mtp_rows() -> None:
         assert variant_fragment in route.variant_name
 
 
+@pytest.mark.cpu_only
 def test_decode_resolver_fails_closed_for_unpromoted_fp32_mtp_rows() -> None:
     base = {
         "layout": "pretranspose",
@@ -470,6 +484,7 @@ def test_decode_resolver_fails_closed_for_unpromoted_fp32_mtp_rows() -> None:
             _decode(**(base | overrides))
 
 
+@pytest.mark.cpu_only
 def test_decode_resolver_selects_exact_promoted_bf16_rows() -> None:
     rows = (
         (
@@ -622,6 +637,7 @@ _SGLANG_GRAPH_BATCHES = (
 )
 
 
+@pytest.mark.cpu_only
 def test_bf16_t1_route_rule_follows_the_state_head_count() -> None:
     bands = cake_gdn.CAKE_GDN_BF16_T1_ROUTE_BANDS
     bounds = [band[0] for band in bands]
@@ -721,6 +737,7 @@ def test_bf16_t1_route_rule_follows_the_state_head_count() -> None:
         )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("heads", _QWEN35_BF16_T1_GEOMETRIES)
 @pytest.mark.parametrize("arch", ("sm_100a", "sm_103a", "sm_107a"))
 def test_decode_resolver_admits_every_qwen35_bf16_t1_geometry_at_any_batch(
@@ -774,6 +791,7 @@ def test_decode_resolver_admits_every_qwen35_bf16_t1_geometry_at_any_batch(
             assert arch in record["architectures"]
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ("sm_100a", "sm_103a", "sm_107a"))
 def test_decode_resolver_routes_the_bf16_verify_tile16_body_per_architecture(
     arch,
@@ -829,6 +847,7 @@ def test_decode_resolver_routes_the_bf16_verify_tile16_body_per_architecture(
         )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
 def test_decode_resolver_routes_the_fp32_mtp_bodies_per_architecture(arch) -> None:
     # The promoted fp32-state MTP update row (B4 T4, cache) runs the `_pro` twin of
@@ -889,6 +908,7 @@ def test_decode_resolver_routes_the_fp32_mtp_bodies_per_architecture(arch) -> No
         )
 
 
+@pytest.mark.cpu_only
 def test_fp32_t1_route_rule_follows_the_state_head_count() -> None:
     # Two thresholds, one table (sm_107a only): the shipped `splitv8` body up to 64 state
     # heads, the register-direct `splitv8_reg_ost` body (the out-store twin of `splitv8_reg`) below 256, the `splitv8_tilev32` twin
@@ -935,6 +955,7 @@ def test_fp32_t1_route_rule_follows_the_state_head_count() -> None:
     assert rule(512, 32, "sm_107a") == "splitv8_tilev32"
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
 def test_decode_resolver_routes_the_fp32_t1_pretranspose_body_per_state_head_band(
     arch,
@@ -978,6 +999,7 @@ def test_decode_resolver_routes_the_fp32_t1_pretranspose_body_per_state_head_ban
         cake_gdn.cake_gdn_fp32_t1_ctas_per_state(nontranspose.variant_name)
 
 
+@pytest.mark.cpu_only
 def test_nontranspose_fp32_t1_body_rule_follows_the_batch_band() -> None:
     # One table (sm_107a only): the `mid4` twin in the small band (B < 32), the
     # `tilev32_x2` twin in the large band's wave-fit range (32 <= B < 37), the `hqsplit`
@@ -1053,6 +1075,7 @@ def test_nontranspose_fp32_t1_body_rule_follows_the_batch_band() -> None:
         assert rule(batch_size, "sm_107a") == hqsplit
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
 def test_decode_resolver_routes_the_fp32_nontranspose_t1_body_per_batch_band(
     arch,
@@ -1118,6 +1141,7 @@ def test_decode_resolver_routes_the_fp32_nontranspose_t1_body_per_batch_band(
         cake_gdn.cake_gdn_nontranspose_fp32_t1_ctas_per_state(pretranspose.variant_name)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
 def test_decode_resolver_routes_the_bf16_wide_body_per_architecture(arch) -> None:
     # The multi-token rows outside the tile16 verify kernel run the wide
@@ -1259,6 +1283,7 @@ def test_decode_resolver_routes_the_bf16_wide_body_per_architecture(arch) -> Non
         )
 
 
+@pytest.mark.cpu_only
 def test_decode_resolver_fails_closed_for_unlisted_bf16_t1_geometry_and_controls() -> (
     None
 ):
@@ -1299,6 +1324,7 @@ def test_decode_resolver_fails_closed_for_unlisted_bf16_t1_geometry_and_controls
         )
 
 
+@pytest.mark.cpu_only
 def test_decode_resolver_fails_closed_for_unpromoted_bf16_shape() -> None:
     with pytest.raises(
         cake_gdn.CakeGDNUnsupportedError,
@@ -1319,6 +1345,7 @@ def test_decode_resolver_fails_closed_for_unpromoted_bf16_shape() -> None:
         )
 
 
+@pytest.mark.cpu_only
 def test_decode_resolver_fails_closed_outside_child_contract() -> None:
     with pytest.raises(
         cake_gdn.CakeGDNUnsupportedError,
@@ -1333,6 +1360,7 @@ def test_decode_resolver_fails_closed_outside_child_contract() -> None:
         _decode(use_qk_l2norm=False)
 
 
+@pytest.mark.cpu_only
 def test_architecture_mapping_is_exact() -> None:
     assert cake_gdn.arch_for_compute_capability(10, 0) == "sm_100a"
     assert cake_gdn.arch_for_compute_capability(10, 3) == "sm_103a"
@@ -1344,6 +1372,7 @@ def test_architecture_mapping_is_exact() -> None:
         cake_gdn.arch_for_compute_capability(12, 0)
 
 
+@pytest.mark.cpu_only
 def test_prefill_resolver_selects_exact_gated_physical_schedules() -> None:
     gatepipe = _prefill(gates_present=True)
     gatepipe_record = cake_gdn._kernel_record(gatepipe.variant_name)
@@ -1365,6 +1394,7 @@ def test_prefill_resolver_selects_exact_gated_physical_schedules() -> None:
     assert fullgrid_record["specializations"]["UNIT_GATES"] == 0
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("state_dtype", ("float32", "bfloat16"))
 def test_prefill_resolver_routes_the_bf16_dvsplit_bodies_to_the_sm100a_late_state_inp_twins(
     state_dtype: str,
@@ -1394,6 +1424,7 @@ def test_prefill_resolver_routes_the_bf16_dvsplit_bodies_to_the_sm100a_late_stat
     assert late_record["source_schedule"] == f"{base}_sm100a_state_inp_late"
 
 
+@pytest.mark.cpu_only
 def test_prefill_schedule_attr_pins_the_sm100a_late_state_inp_twin_names() -> None:
     for use_initial_state in (False, True):
         for state_dtype in ("float32", "bfloat16"):
@@ -1481,6 +1512,7 @@ _HQ16_HV16_F16_STATEFUL_128_TILES = dict(
 )
 
 
+@pytest.mark.cpu_only
 def test_prefill_resolver_routes_the_sm103a_hq16_hv16_fp16_stateful_key_to_the_role_rebalanced_twin(
     monkeypatch,
 ) -> None:
@@ -1535,6 +1567,7 @@ def test_prefill_resolver_routes_the_sm103a_hq16_hv16_fp16_stateful_key_to_the_r
         assert "role_rebalanced" not in attr, (change, attr)
 
 
+@pytest.mark.cpu_only
 def test_prefill_schedule_attr_pins_the_sm103a_role_rebalanced_twin_name() -> None:
     kwargs = dict(
         dvsplit=True,
@@ -1576,6 +1609,7 @@ _HQ16_HV32_BF16_STATEFUL_32X256 = dict(
 )
 
 
+@pytest.mark.cpu_only
 def test_prefill_resolver_routes_many_short_full_dv_tiles_to_the_gatestream_twin(
     monkeypatch,
 ) -> None:
@@ -1673,6 +1707,7 @@ def test_prefill_resolver_routes_many_short_full_dv_tiles_to_the_gatestream_twin
         assert attr == expected, (change, attr)
 
 
+@pytest.mark.cpu_only
 def test_prefill_resolver_runs_the_base_record_where_no_gatestream_twin_ships() -> None:
     """The ``_gatestream_full`` twin is exported for the head geometries the representative rows reach; a key
     whose twin is not in the manifest (here the Qwen3.5-397B TP4 Hq4/Hv16 FP32-state record, 64 x 256 full-DV
@@ -1728,6 +1763,7 @@ def test_prefill_resolver_runs_the_base_record_where_no_gatestream_twin_ships() 
     assert "sm_107a" not in cake_gdn._kernel_record(base.variant_name)["architectures"]
 
 
+@pytest.mark.cpu_only
 def test_prefill_resolver_runs_an_i64_metadata_twin_for_every_key_on_sm_107a() -> None:
     """P1-I64META: on CC 10.7 every non-CP prefill key resolves to an sm_107a-only twin record that
     declares ``metadata_i64`` (the routed vec2 bodies and the ``i64meta`` default alike); on the
@@ -1786,6 +1822,7 @@ def test_prefill_resolver_runs_an_i64_metadata_twin_for_every_key_on_sm_107a() -
             assert record["architectures"] == ["sm_107a"], record["name"]
 
 
+@pytest.mark.cpu_only
 def test_prefill_schedule_attr_pins_the_gatestream_twin_names() -> None:
     kwargs = dict(
         dvsplit=False,
@@ -1850,6 +1887,7 @@ def test_prefill_schedule_attr_pins_the_gatestream_twin_names() -> None:
     assert cake_gdn._cake_gdn_prefill_grid_x(128, 148, True, 1024) == 128
 
 
+@pytest.mark.cpu_only
 def test_prefill_resolver_accepts_dynamic_sglang_tp4_checkpoint_batches() -> None:
     common = {
         "arch": "sm_103a",
@@ -1884,6 +1922,7 @@ def test_prefill_resolver_accepts_dynamic_sglang_tp4_checkpoint_batches() -> Non
     assert frozen.variant_name == live.variant_name
 
 
+@pytest.mark.cpu_only
 def test_prefill_resolver_keeps_sglang_tp4_checkpoint_family_fail_closed() -> None:
     with pytest.raises(
         cake_gdn.CakeGDNUnsupportedError,
@@ -1964,6 +2003,7 @@ def _prefill_geometry_of(route):
     return (specs["HEAD_GROUP_LOG2"], specs["IS_GQA"], specs["NUM_O_HEADS_LOG2"])
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ("sm_100a", "sm_103a"))
 def test_prefill_fp32_state_contract_covers_every_qwen_tp_geometry(arch) -> None:
     contract = {
@@ -2002,6 +2042,7 @@ def test_prefill_fp32_state_contract_covers_every_qwen_tp_geometry(arch) -> None
             assert _prefill_geometry_of(route) == geometry
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ("sm_100a", "sm_103a", "sm_107a"))
 def test_prefill_geometries_mirror_the_resolver(arch) -> None:
     # The helper tabulates nothing: every power-of-two triple it lists for a
@@ -2055,6 +2096,7 @@ def test_prefill_geometries_mirror_the_resolver(arch) -> None:
                     assert _prefill_geometry_of(route) == geometry, route
 
 
+@pytest.mark.cpu_only
 def test_variant_resolution_fails_closed_for_an_unlisted_architecture(
     monkeypatch,
 ) -> None:
@@ -2120,6 +2162,7 @@ def test_variant_resolution_fails_closed_for_an_unlisted_architecture(
     assert cake_gdn.cake_gdn_prefill_geometries(arch="sm_103a", **contract) == set()
 
 
+@pytest.mark.cpu_only
 def test_nvcc_identity_captures_resolved_path_and_exact_version_output(
     tmp_path, monkeypatch
 ) -> None:
@@ -2158,6 +2201,7 @@ def test_nvcc_identity_captures_resolved_path_and_exact_version_output(
     ]
 
 
+@pytest.mark.cpu_only
 def test_compile_cache_digest_isolated_by_nvcc_identity(tmp_path) -> None:
     common = {
         "arch": "sm_100a",
@@ -2186,6 +2230,7 @@ def test_compile_cache_digest_isolated_by_nvcc_identity(tmp_path) -> None:
     assert len({baseline[:16], changed_path[:16], changed_version[:16]}) == 3
 
 
+@pytest.mark.cpu_only
 def test_compile_cubin_adds_manifest_header_include_paths(
     tmp_path, monkeypatch
 ) -> None:

@@ -41,6 +41,7 @@ _CPU_OFFSETS_CASES = (
 )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("values,dtype", _CPU_OFFSETS_CASES)
 def test_host_offsets_accept_cpu_tensor_and_int_sequences(values, dtype) -> None:
     host_copy = values if dtype is None else torch.tensor(values, dtype=dtype)
@@ -51,6 +52,7 @@ def test_host_offsets_accept_cpu_tensor_and_int_sequences(values, dtype) -> None
     assert all(type(value) is int for value in offsets)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "host_copy,match",
     (
@@ -125,6 +127,7 @@ _RAGGED_GRID_CASES = (
 )
 
 
+@pytest.mark.cpu_only
 def test_grid_rule_mirrors_the_launch_contract() -> None:
     """The single host-known persistent-grid rule (LANE_CONTRACT v1 + the ragged route).
 
@@ -303,6 +306,7 @@ def _random_batch(rng):
     return tuple(lens)
 
 
+@pytest.mark.cpu_only
 def test_grid_rule_matches_the_per_tile_reference_on_random_batches() -> None:
     """The per-sequence rule (equal-length short-circuit, endpoint-sweep strided path, makespan
     bounds, group-wise dispatch simulation) and the per-tile reference give identical
@@ -341,6 +345,7 @@ def test_grid_rule_matches_the_per_tile_reference_on_random_batches() -> None:
     assert simulated > 10_000
 
 
+@pytest.mark.cpu_only
 def test_grid_rule_is_the_only_grid_text_in_the_route() -> None:
     # The route must call the mirrored rule and nothing else decides grid_x
     # (the exporter's AST mirror test compares this function with Cake's).
@@ -354,6 +359,7 @@ def test_grid_rule_is_the_only_grid_text_in_the_route() -> None:
     assert ".item()" not in source
 
 
+@pytest.mark.cpu_only
 def test_int32_metadata_is_passed_through_and_int64_is_cast_per_call() -> None:
     i32 = torch.tensor([0, 64, 128], dtype=torch.int32)
     assert gdn_prefill._cake_gdn_prefill_i32(i32) is i32
@@ -374,6 +380,7 @@ def test_int32_metadata_is_passed_through_and_int64_is_cast_per_call() -> None:
         assert not hasattr(gdn_prefill, name), name
 
 
+@pytest.mark.cpu_only
 def test_launch_metadata_is_passed_as_given_only_for_metadata_i64_records() -> None:
     launch = gdn_prefill._cake_gdn_prefill_launch_metadata
     i32 = torch.tensor([0, 64, 128], dtype=torch.int32)
@@ -418,6 +425,7 @@ def _route_public_cake_non_cp(monkeypatch: pytest.MonkeyPatch) -> dict:
     return captured
 
 
+@pytest.mark.cpu_only
 def test_public_api_forwards_cu_seqlens_cpu_and_the_bound(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -440,6 +448,7 @@ def test_public_api_forwards_cu_seqlens_cpu_and_the_bound(
     assert captured["cu_seqlens"] is cu_seqlens
 
 
+@pytest.mark.cpu_only
 def test_public_api_defaults_the_bound_to_the_packed_length(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -452,6 +461,7 @@ def test_public_api_defaults_the_bound_to_the_packed_length(
     assert captured["max_seqlen"] == 2048
 
 
+@pytest.mark.cpu_only
 def test_cu_seqlens_cpu_is_keyword_only() -> None:
     import inspect
 
@@ -462,6 +472,7 @@ def test_cu_seqlens_cpu_is_keyword_only() -> None:
     assert "cu_seqlens_cpu :" in gdn_prefill.chunk_gated_delta_rule.__doc__
 
 
+@pytest.mark.cpu_only
 def test_resolver_signature_has_no_device_derived_lengths() -> None:
     import inspect
 
@@ -470,6 +481,7 @@ def test_resolver_signature_has_no_device_derived_lengths() -> None:
     assert "max_seq_len" in parameters
 
 
+@pytest.mark.cpu_only
 def test_resolver_gate_stream_twin_follows_the_routed_grid() -> None:
     """The gate-stream twin (a CTA owning at least two tiles, mean length at most
     512 tokens) follows the grid the rule launches.
