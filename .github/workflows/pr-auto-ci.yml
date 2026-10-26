@@ -1,0 +1,282 @@
+# Auto-trigger CI for approved PRs authored by NVIDIA employees.
+#
+# When a PR from a flashinfer-ci org member receives an approval (or a new
+# commit is pushed to an already-approved PR), this workflow applies the
+# run-ci label to start CI — the same mechanism used by @flashinfer-bot run.
+#
+# This eliminates the common case where approved PRs sit idle because nobody
+# issued @flashinfer-bot run for the current commit.
+#
+# Scope preservation:
+#   If the PR's comment history contains a previous `@flashinfer-bot run <paths>`
+#   command, the auto-trigger reuses that scope (the most recent one wins).
+#   If no scoped run was ever requested, the full suite runs.
+#   The scope is published as ci/test-scope-N commit statuses on the HEAD SHA,
+#   exactly as ci-bot-commands.yml does, so pr-test.yml reads it the same way.
+#
+# Guards:
+#   - PR author must be a member of the flashinfer-ci GitHub org.
+#   - At least one approving review must exist for the PR.
+#   - A CI run must not already be in-flight or passed for the HEAD SHA.
+#   - The run-ci label is applied via the bot PAT so the labeled event
+#     triggers pr-test.yml (GITHUB_TOKEN events don't trigger workflows).
+
+name: Auto CI on Approval
+
+on:
+  pull_request_review:
+    types: [submitted]
+  pull_request:
+    branches: [main]
+    types: [synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write   # publish ci/test-scope-N commit statuses
+  actions: read
+
+jobs:
+  auto-ci:
+    name: Auto-trigger CI
+    # For review events, only fire on approval. For synchronize, always fire
+    # (the job itself checks whether an approval exists).
+    if: >-
+      (github.event_name == 'pull_request_review' && github.event.review.state == 'approved')
+      || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Resolve PR metadata
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+          PR_JSON=$(gh pr view "$PR_NUMBER" \
+            --repo "${{ github.repository }}" \
+            --json headRefOid,author,labels)
+
+          HEAD_SHA=$(echo "$PR_JSON" | jq -r '.headRefOid')
+          AUTHOR=$(echo "$PR_JSON" | jq -r '.author.login')
+          HAS_RUN_CI=$(echo "$PR_JSON" | jq '[.labels[].name] | index("run-ci") != null')
+
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "author=$AUTHOR" >> "$GITHUB_OUTPUT"
+          echo "has_run_ci=$HAS_RUN_CI" >> "$GITHUB_OUTPUT"
+
+      - name: Check author is flashinfer-ci org member
+        id: org-check
+        env:
+          # Needs org:read scope to check membership.
+          GH_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN }}
+          AUTHOR: ${{ steps.pr.outputs.author }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::error::FLASHINFER_GITHUB_TOKEN secret is not set"
+            echo "is_member=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 204 = member, 404 = not a member, 302 = requester lacks org admin
+          # (falls back to public membership check).
+          HTTP_CODE=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/orgs/flashinfer-ci/members/${AUTHOR}" \
+            --silent -i 2>/dev/null | head -1 | awk '{print $2}') || HTTP_CODE="000"
+
+          if [[ "$HTTP_CODE" == "204" ]]; then
+            echo "$AUTHOR is a flashinfer-ci org member"
+            echo "is_member=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "$AUTHOR is NOT a flashinfer-ci org member (HTTP $HTTP_CODE)"
+            echo "is_member=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check PR has an approval
+        id: approval-check
+        if: steps.org-check.outputs.is_member == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          APPROVED=$(gh pr view "$PR_NUMBER" \
+            --repo "${{ github.repository }}" \
+            --json reviews \
+            --jq '[.reviews[] | select(.state == "APPROVED")] | length')
+
+          if [[ "${APPROVED:-0}" -gt 0 ]]; then
+            echo "PR has $APPROVED approval(s)"
+            echo "approved=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "PR has no approvals"
+            echo "approved=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check for existing CI run on this SHA
+        id: ci-check
+        if: steps.org-check.outputs.is_member == 'true' && steps.approval-check.outputs.approved == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        run: |
+          EXISTING=$(gh run list \
+            --repo "${{ github.repository }}" \
+            --workflow "pr-test.yml" \
+            --commit "$HEAD_SHA" \
+            --json databaseId,status,conclusion \
+            --jq '[.[] | select(.status == "in_progress" or .status == "queued" or .conclusion == "success")] | length' \
+            2>/dev/null) || EXISTING=0
+
+          if [[ "${EXISTING:-0}" -gt 0 ]]; then
+            echo "CI already active or passed for $HEAD_SHA ($EXISTING run(s))"
+            echo "needs_ci=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "No CI run for $HEAD_SHA"
+            echo "needs_ci=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Scan the PR's comment history for the most recent `@flashinfer-bot run <paths>`
+      # command. If found, publish the same ci/test-scope-N commit statuses that
+      # ci-bot-commands.yml would have, so pr-test.yml picks up the scope. If no scoped
+      # run was ever requested (only bare `@flashinfer-bot run` or no bot command at
+      # all), no scope statuses are published and pr-test.yml runs the full suite.
+      #
+      # Comments are fetched newest-first; the first match wins (most recent command).
+      - name: Detect previous scoped run from comments
+        id: scope
+        if: >-
+          steps.org-check.outputs.is_member == 'true'
+          && steps.approval-check.outputs.approved == 'true'
+          && steps.ci-check.outputs.needs_ci == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          # Fetch all issue comments, newest first. GitHub's list endpoint
+          # returns oldest-first by default; reverse after fetching.
+          COMMENTS=$(gh api --paginate \
+            "/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            --jq '.[].body' 2>/dev/null) || COMMENTS=""
+
+          # Walk comments in reverse (newest first) to find the most recent
+          # `@flashinfer-bot run <paths>` command. A bare `@flashinfer-bot run`
+          # (no paths) means "full suite" — treat the same as no match.
+          SCOPE_ARGS=""
+          while IFS= read -r line; do
+            # Strip fenced code blocks to match ci-bot-commands.yml behaviour
+            MATCH=$(printf '%s' "$line" | tr -d '\r' \
+              | awk '
+                  /^[[:space:]]*```/ { if (!f) { f = 1; d = "b" } else if (d == "b") { f = 0 }; next }
+                  /^[[:space:]]*~~~/ { if (!f) { f = 1; d = "t" } else if (d == "t") { f = 0 }; next }
+                  !f
+                ' \
+              | grep -iEm1 '^[[:space:]]*@flashinfer-bot[[:space:]]+run[[:space:]]+\S' \
+              | sed -E 's/^[[:space:]]*@[Ff]lashinfer-bot[[:space:]]+run[[:space:]]+//' \
+              | sed -E 's/[[:space:]]+$//') || MATCH=""
+            if [[ -n "$MATCH" ]]; then
+              SCOPE_ARGS="$MATCH"
+              break
+            fi
+          done < <(printf '%s\n' "$COMMENTS" | tac)
+
+          if [[ -z "$SCOPE_ARGS" ]]; then
+            echo "No previous scoped run found; full suite will run"
+            echo "scope_args=" >> "$GITHUB_OUTPUT"
+          else
+            echo "Found previous scope: $SCOPE_ARGS"
+            echo "scope_args=$SCOPE_ARGS" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Publish the scope as ci/test-scope-N commit statuses, mirroring
+      # ci-bot-commands.yml exactly so pr-test.yml reads it the same way.
+      # Uses the validated-and-chunked output from experimental_test_scope.py.
+      - name: Publish test scope
+        id: publish-scope
+        if: >-
+          steps.org-check.outputs.is_member == 'true'
+          && steps.approval-check.outputs.approved == 'true'
+          && steps.ci-check.outputs.needs_ci == 'true'
+          && steps.scope.outputs.scope_args != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          SCOPE_ARGS: ${{ steps.scope.outputs.scope_args }}
+        run: |
+          # Validate and chunk the scope paths using the same script as
+          # ci-bot-commands.yml. If validation fails, fall back to the full suite
+          # rather than blocking — the author can always re-scope with
+          # @flashinfer-bot run <paths>.
+          if ! SCOPE=$(python3 scripts/pr_checks/experimental_test_scope.py \
+                --targets "$SCOPE_ARGS" --root tests/ --no-check-exists --test-path \
+                2>/tmp/scope_err); then
+            echo "::warning::Previous scope failed validation ($(cat /tmp/scope_err)); running full suite"
+            exit 0
+          fi
+
+          if ! CHUNKED=$(python3 scripts/pr_checks/experimental_test_scope.py \
+                --targets "$SCOPE" --root tests/ --no-check-exists --chunk 140 \
+                2>/tmp/scope_err); then
+            echo "::warning::Scope chunking failed ($(cat /tmp/scope_err)); running full suite"
+            exit 0
+          fi
+
+          mapfile -t CHUNKS <<< "$CHUNKED"
+
+          # Clear any stale scope statuses from a previous run on this SHA.
+          PREV_MAX=$(gh api "/repos/${{ github.repository }}/commits/${HEAD_SHA}/status" \
+            --jq '[.statuses[].context
+              | select(test("^ci/test-scope-[0-9]+$"))
+              | sub("^ci/test-scope-"; "") | tonumber] | max // 0') \
+            || PREV_MAX=0
+          PREV_MAX=${PREV_MAX:-0}
+
+          publish_chunk() {
+            gh api -X POST "/repos/${{ github.repository }}/statuses/${HEAD_SHA}" \
+              -f state=success \
+              -f context="ci/test-scope-$1" \
+              -f description="$2" > /dev/null
+          }
+
+          for i in "${!CHUNKS[@]}"; do
+            publish_chunk "$((i + 1))" "${CHUNKS[$i]}"
+          done
+          # Blank out any leftover higher-numbered chunks from a previous scope.
+          for ((i = ${#CHUNKS[@]} + 1; i <= PREV_MAX; i++)); do
+            publish_chunk "$i" ""
+          done
+
+          echo "Published scope in ${#CHUNKS[@]} chunk(s): ${CHUNKS[*]}"
+
+      - name: Apply run-ci label
+        if: >-
+          steps.org-check.outputs.is_member == 'true'
+          && steps.approval-check.outputs.approved == 'true'
+          && steps.ci-check.outputs.needs_ci == 'true'
+        env:
+          # Use the bot PAT so the labeled event triggers pr-test.yml.
+          # (Events from GITHUB_TOKEN do not trigger other workflows.)
+          GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HAS_RUN_CI: ${{ steps.pr.outputs.has_run_ci }}
+        run: |
+          echo "Auto-triggering CI for PR #$PR_NUMBER"
+
+          # Remove first if present (re-applying emits no event).
+          if [[ "$HAS_RUN_CI" == "true" ]]; then
+            gh pr edit "$PR_NUMBER" \
+              --repo "${{ github.repository }}" \
+              --remove-label "run-ci"
+          fi
+
+          gh pr edit "$PR_NUMBER" \
+            --repo "${{ github.repository }}" \
+            --add-label "run-ci"
+
+          echo "::notice::Auto-applied run-ci label — CI will start for $(echo "${{ steps.pr.outputs.head_sha }}" | cut -c1-8)"
