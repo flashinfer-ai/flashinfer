@@ -243,10 +243,10 @@ class FrostLowLatencyRunner(MoERunner):
                     and self.config.quant.activation
                     in (QuantFormat.BF16, QuantFormat.FP16)
                     else (
-                        "bf16-grouped-tc-v6"
+                        "bf16-grouped-tc-v7"
                         if self.config.quant.weight is QuantFormat.BF16
                         else (
-                            "fp16-grouped-tc-v4"
+                            "fp16-grouped-tc-v5"
                             if self.config.quant.weight is QuantFormat.FP16
                             else "unified-fma-tc-standard-timing-v5"
                         )
