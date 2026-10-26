@@ -1272,6 +1272,7 @@ def test_trtllm_gen_mxint4_routed_fused_moe(
         pytest.param(ActivationType.Swiglu.value, id="Swiglu"),
         pytest.param(ActivationType.Geglu.value, id="Geglu"),
         pytest.param(ActivationType.Relu2.value, id="Relu2"),
+        pytest.param(ActivationType.ClampedRelu2.value, id="ClampedRelu2"),
     ],
 )
 @pytest.mark.parametrize("routing_format", ["packed", "unpacked_fp32"])
@@ -1319,6 +1320,19 @@ def test_trtllm_gen_fp8_mxfp8_routed_activation_parity(
         device=device,
         dtype=torch.bfloat16,
     )
+
+    clamp_limit = None
+    if activation_type == ActivationType.ClampedRelu2.value:
+        # Exact input/weight values isolate activation, per-expert scales, and routing.
+        # Each MXFP8 block holds one value, avoiding cancellation or underflow.
+        values = torch.tensor([-4, 0, 0.5, 1, 2, 4, 8, 32], device=device)
+        hidden_states = (
+            values.repeat_interleave(64).repeat(num_tokens, 1).to(torch.bfloat16)
+        )
+        eye = torch.eye(hidden_size, device=device, dtype=torch.bfloat16)
+        gemm1_weights = (0.5 * eye).repeat(num_experts, 1, 1)
+        gemm2_weights = (0.25 * eye).repeat(num_experts, 1, 1)
+        clamp_limit = (1 + torch.arange(num_experts, device=device) % 4).float()
 
     quant_impl = FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8)
     quant_weights = quant_impl.quantize_weights(
@@ -1395,6 +1409,7 @@ def test_trtllm_gen_fp8_mxfp8_routed_activation_parity(
         enable_pdl=enable_pdl,
         fp8_quantization_type=Fp8QuantizationType.MxFp8,
         activation_type=activation_type,
+        gemm1_clamp_limit=clamp_limit,
     ).to(torch.float)
 
     permute_info, expert_weights_full = routing_reference_renormalize(
@@ -1413,30 +1428,36 @@ def test_trtllm_gen_fp8_mxfp8_routed_activation_parity(
         else (topk_ids, expert_weights.to(torch.float32))
     )
 
-    output_routed = trtllm_fp8_block_scale_routed_moe(
-        topk_ids=routing_input,
-        routing_bias=None,
-        hidden_states=quant_inputs["hidden_states"],
-        hidden_states_scale=quant_inputs["hidden_states_scale"],
-        gemm1_weights=gemm1_weights_kernel,
-        gemm1_weights_scale=gemm1_scales_kernel,
-        gemm2_weights=gemm2_weights_kernel,
-        gemm2_weights_scale=gemm2_scales_kernel,
-        num_experts=num_experts,
-        top_k=top_k,
-        n_group=None,
-        topk_group=None,
-        intermediate_size=intermediate_size,
-        local_expert_offset=0,
-        local_num_experts=num_experts,
-        routed_scaling_factor=None,
-        routing_method_type=routing_method_type.value,
-        use_shuffled_weight=True,
-        weight_layout=WeightLayout.MajorK.value,
-        enable_pdl=enable_pdl,
-        fp8_quantization_type=Fp8QuantizationType.MxFp8,
-        activation_type=activation_type,
-    ).to(torch.float)
+    def run_routed(**overrides):
+        kwargs = dict(
+            topk_ids=routing_input,
+            routing_bias=None,
+            hidden_states=quant_inputs["hidden_states"],
+            hidden_states_scale=quant_inputs["hidden_states_scale"],
+            gemm1_weights=gemm1_weights_kernel,
+            gemm1_weights_scale=gemm1_scales_kernel,
+            gemm2_weights=gemm2_weights_kernel,
+            gemm2_weights_scale=gemm2_scales_kernel,
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=intermediate_size,
+            local_expert_offset=0,
+            local_num_experts=num_experts,
+            routed_scaling_factor=None,
+            routing_method_type=routing_method_type.value,
+            use_shuffled_weight=True,
+            weight_layout=WeightLayout.MajorK.value,
+            enable_pdl=enable_pdl,
+            fp8_quantization_type=Fp8QuantizationType.MxFp8,
+            activation_type=activation_type,
+            gemm1_clamp_limit=clamp_limit,
+        )
+        kwargs.update(overrides)
+        return trtllm_fp8_block_scale_routed_moe(**kwargs)
+
+    output_routed = run_routed().float()
 
     close = torch.isclose(output_ref, output_routed, atol=1e-2, rtol=1e-2)
     mismatch_pct = (~close).float().mean().item() * 100
@@ -1444,6 +1465,40 @@ def test_trtllm_gen_fp8_mxfp8_routed_activation_parity(
         f"Mismatch percentage is {mismatch_pct:.2f}%"
         f"{routing_format} mismatch percentage is {mismatch_pct:.2f}%"
     )
+
+    if clamp_limit is not None:
+        with pytest.raises(ValueError, match="requires gemm1_clamp_limit"):
+            run_routed(gemm1_clamp_limit=None)
+        with pytest.raises(ValueError, match="float32"):
+            run_routed(gemm1_clamp_limit=clamp_limit.bfloat16())
+        with pytest.raises(ValueError, match="accepts gemm1_clamp_limit only"):
+            run_routed(gemm1_alpha=clamp_limit)
+        with pytest.raises(Exception, match="must have shape"):
+            run_routed(gemm1_clamp_limit=clamp_limit[:-1])
+
+        def reference():
+            scales = clamp_limit[topk_ids.long()].unsqueeze(-1)
+            fc1 = hidden_states.float().unsqueeze(1) * 0.5
+            activated = (scales * torch.tanh(fc1.relu() / scales)).square()
+            return (activated * expert_weights.float().unsqueeze(-1)).sum(1) * 0.25
+
+        # One intermediate E4M3 rounding (<= 1/16 relative) plus BF16 output.
+        torch.testing.assert_close(output_ref, reference(), rtol=0.07, atol=1e-4)
+        torch.testing.assert_close(output_routed, reference(), rtol=0.07, atol=1e-4)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = run_routed()
+        for shift in (1, 3):
+            clamp_limit.mul_(0.5)
+            topk_ids.copy_((topk_ids + shift) % num_experts)
+            packed_topk_ids.copy_(
+                (topk_ids << 16) | expert_weights.view(torch.int16).to(torch.int32)
+            )
+            graph.replay()
+            torch.testing.assert_close(
+                captured.float(), reference(), rtol=0.07, atol=1e-4
+            )
+            torch.testing.assert_close(captured, run_routed(), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("num_tokens", [1, 7, 32])

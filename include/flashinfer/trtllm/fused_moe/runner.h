@@ -174,8 +174,9 @@ enum class ActivationType : int64_t {
   Identity = 9,
   Situ = 10,
   InvalidType = 11,  // Must be last among the normally-sequential members
-  // CUTLASS-backend only. Keep these after InvalidType so the existing values
-  // consumed by the TRT-LLM backend remain stable.
+  // Keep these after InvalidType to preserve existing backend enum values.
+  // ClampedRelu2 also supports TRTLLM MXFP8 with a matching generator artifact.
+  // PowLU is CUTLASS-only.
   ClampedRelu2 = 12,
   PowLU = 13,
 };

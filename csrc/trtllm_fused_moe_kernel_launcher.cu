@@ -1000,6 +1000,15 @@ inline std::string fp8QuantizationTypeToString(Fp8QuantizationType quantization_
 }
 
 inline ActivationType validateAndCastActivationType(int64_t act_type) {
+  if (act_type == static_cast<int64_t>(ActivationType::ClampedRelu2)) {
+#ifdef FLASHINFER_TRTLLM_CLAMPED_RELU2
+    return ActivationType::ClampedRelu2;
+#else
+    TVM_FFI_ICHECK(false)
+        << "TRTLLM ClampedRelu2 requires a published TRTLLM-gen artifact with "
+           "ClampedRelu2 headers and MXFP8 kernels; the installed artifact lacks support.";
+#endif
+  }
   TVM_FFI_ICHECK(act_type >= 0 && act_type < static_cast<int64_t>(ActivationType::InvalidType))
       << "Invalid activation type: " << act_type;
   return static_cast<ActivationType>(act_type);
@@ -1028,6 +1037,15 @@ inline void validateFp8BlockScaleGemm1ActivationParams(
     Optional<TensorView> const& gemm1_alpha, Optional<TensorView> const& gemm1_beta,
     Optional<TensorView> const& gemm1_clamp_limit, Fp8QuantizationType quantization_type,
     ActivationType activation_type) {
+  if (activation_type == ActivationType::ClampedRelu2) {
+    TVM_FFI_ICHECK(quantization_type == Fp8QuantizationType::MxFp8)
+        << "TRTLLM ClampedRelu2 requires MXFP8.";
+    TVM_FFI_ICHECK(gemm1_clamp_limit.has_value())
+        << "ClampedRelu2 requires gemm1_clamp_limit.";
+    TVM_FFI_ICHECK(!gemm1_alpha.has_value() && !gemm1_beta.has_value())
+        << "ClampedRelu2 accepts gemm1_clamp_limit only.";
+    return;
+  }
   validateStepGemm1ActivationParams(gemm1_alpha, gemm1_beta, activation_type);
   TVM_FFI_ICHECK(activation_type != ActivationType::SwigluStep ||
                  quantization_type == Fp8QuantizationType::MxFp8)
@@ -1600,6 +1618,9 @@ class FusedMoeLauncher {
   }
 
   void check_moe_common(bool allow_bias_with_none_type = false) const {
+    TVM_FFI_ICHECK(activation_type != ActivationType::ClampedRelu2 ||
+                   (mDtypeAct == btg::Dtype::MxE4m3 && !args->mUseDeepSeekFp8))
+        << "TRTLLM ClampedRelu2 requires MXFP8.";
     // Hidden states [num_tokens, hidden_size]
     TVM_FFI_ICHECK_EQ(hidden_states.ndim(), 2) << "hidden_states must be 2D.";
     check_gemm1_bias_mn(gemm1_bias, gemm1_bias_type, args->num_tokens, args->top_k,
