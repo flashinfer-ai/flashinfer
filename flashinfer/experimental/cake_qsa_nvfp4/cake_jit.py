@@ -144,9 +144,10 @@ TILE_TOKENS = 64
 # its calls take the split form alone).  Within the capacity sm_90a always
 # takes the fused form and sm_120a does except on a wide call (the whole-tile
 # program's long-stream window, which ships in the split form alone); sm_100a /
-# sm_103a take it under the host's eager rule, sm_107a never (the split form on
-# every host) (``cake_backend.select_form``: an aarch64 host, rows <= 4, no
-# capture).  The
+# sm_103a take it under the host's eager rule (``cake_backend.select_form``: a
+# host of ``FUSED_HOSTS``, rows <= 4, no capture -- and that list is empty, so
+# they keep the split form on every host), sm_107a never (the split form on
+# every host).  The
 # exporter holds the launch-bound tables to the kernel files and the fused
 # table to its host policy.
 DECODE_THREADS = {

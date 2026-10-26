@@ -98,25 +98,30 @@ board of 212 SMs). Within it, compute capability 9.0 always takes the fused
 form, and 12.0 does except on a *wide* call (the program rule below: the
 whole-tile program ships in the split form alone, so a wide call takes the
 split form there). Compute capability 10.0 and 10.3 take it under the eager host rule
-alone: on an `aarch64` host (`FUSED_HOSTS`), at `rows <= 4` (`FUSED_MAX_ROWS`)
-and when the current stream is not capturing. Compute capability 10.7 keeps
+alone: on a host of `FUSED_HOSTS`, at `rows <= 4` (`FUSED_MAX_ROWS`) and when
+the current stream is not capturing -- and `FUSED_HOSTS` lists no host, so
+they keep the split form everywhere (below). Compute capability 10.7 keeps
 the split form on every host (`FUSED_SPLIT_ONLY_ARCHES`): on an R200 system the
 split route's eager whole call is the shorter one at every row. Everywhere else -- compute
-capability 8.x, an x86 host, rows above 4, a capturing stream, a call on a
+capability 8.x, a capturing stream, a call on a
 device other than the current one -- the *split* form: the plain decode, then
 the separate merge (`(rows, ceil(num_qo_heads / heads_per_cta))` CTAs, one
 head per CTA above four splits, four at or below).
 
-Why the eager rule: on the `aarch64` host of a GB200 / GB300 or an R200 system
-the eager path leaves
-a gap of several microseconds between the decode launch and the merge launch,
-and at rows 1-4 that gap costs more than the fused form's in-kernel merge tail
-(measured on a GB300: the fused form is 1.1-1.6x faster whole-call than the
-split form in eager mode at rows 1-4, and 0.7-0.9x under CUDA-graph replay,
-where no gap exists). A captured call is replayed without the gap, so under
-capture the split form is kept; graph replay, x86 hosts and rows above 4 are
-unchanged by the rule. The two forms agree bit for bit: the graph tests
-compare an eager (fused) call with its captured (split) replay at `atol=0`.
+Why `FUSED_HOSTS` is empty: the rule once named the `aarch64` host of a GB200 /
+GB300, where an event-timed measurement (CUDA events around each call, an L2
+flush between samples) had the fused form 1.1-1.6x faster whole-call than the
+split form at rows 1-4. That measurement timed the gap the split form's
+second launch leaves on the GPU but not the fused form's longer host path
+before its launch. Timed host-inclusively on a GB300 -- calls back to back,
+calls behind an L2 flush enqueued in the stream, and lone synchronous calls --
+the split form's whole call is the shorter one at rows 1-4 (1.07-1.14x,
+1.21-1.40x and 1.08-1.14x) and the two forms tie at rows 8-128, so 10.0 and
+10.3 take the split form on every host. CUDA-graph replay is unchanged (a
+captured call takes the split form either way), and the cooperative build
+and the rule stay for a host that measures otherwise. The two forms agree
+bit for bit: the graph tests compare an eager call with its captured replay
+at `atol=0`.
 
 **Program rule.** The records are filtered by the device's architecture
 first: the `mma.sync` decode's records on 8.x / 9.0 / 12.0, the tcgen05
@@ -238,8 +243,9 @@ environment-stream context.
 - `decode_tcgen05_coop` (cooperative build, `sm_100a` / `sm_103a` /
   `sm_107a`): the tcgen05 decode launched cooperatively, its softmax warps running the same
   counter and slice merge as `decode_coop`; one CTA per SM. The host selects
-  it under the form rule's eager rule alone (10.0 / 10.3 on an `aarch64` host, `rows <= 4`,
-  no capture; never on 10.7); every other 10.0 / 10.3 / 10.7 call takes `decode_tcgen05`.
+  it under the form rule's eager rule alone (10.0 / 10.3 on a host of `FUSED_HOSTS`,
+  `rows <= 4`, no capture; never on 10.7), and that list is empty: every 10.0 / 10.3 /
+  10.7 call takes `decode_tcgen05` (the build ships for a host that measures otherwise).
 - `decode_tcgen05_persistent` (persistent build, `sm_103a` / `sm_107a`): the tcgen05
   decode's body on a grid of `walk_ctas = min(sm_count, rows * num_kv_heads *
   tiles)` CTAs, each walking a contiguous range of the (row, KV head) x tile

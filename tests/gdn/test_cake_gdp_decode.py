@@ -779,7 +779,8 @@ def _program_cases() -> list:
             and loader.max_num_tokens(arch, n, use_qk_l2norm) > T
         ):
             T = loader.max_num_tokens(arch, n, use_qk_l2norm)
-        # 27 x 24 = 648 lies in the one-wave-of-5 T = 1 band of SM100 / SM103 on 132-160 SMs.
+        # 27 x 24 = 648 lies in the T = 1 tail-wave rows (4 x sm, 5 x sm] of SM100 / SM103 on
+        # 132-160 SMs (l8r4 since the band rule change); 257 x 80 covers the many-wave rows.
         for B, H in itertools.product((1, 3, 7, 16, 64, 257, 27), (6, 12, 20, 24, 80)):
             if build["t_steps"] is None:
                 # The runtime program is the fallback: a T no static program owns selects it.
@@ -1101,6 +1102,7 @@ def test_alignment_constants_match_the_kernel_sources() -> None:
 
     widths = {
         "uint16_t": 2,
+        "unsigned": 4,
         "__nv_bfloat162": 4,
         "int2": 8,
         "uint2": 8,
@@ -1178,22 +1180,21 @@ def _static_pick(
 @pytest.mark.parametrize("sm", (148, 152))
 def test_t1_band_edges_follow_the_sm_count(sm: int) -> None:
     """T = 1, three Householder steps, on `sm` SMs: the row-partition program up to 160
-    state heads; on SM100 / SM103 the one-wave program l8r4p takes (160, 4 x sm], the
-    one-wave-of-5 program l8r4w5 takes (4 x sm, 5 x sm], l8r4 resumes above it up to
-    64 x sm (inclusive) and l8r4w5 takes every count above 64 x sm, while SM90 ships
-    neither of the two and keeps l8r4 above 160.  The choice depends on
+    state heads; on SM100 / SM103 the one-wave program l8r4p takes (160, 4 x sm], l8r4
+    takes (4 x sm, 64 x sm] (the tail-wave rows (4 x sm, 5 x sm] included: the
+    one-wave-of-5 band is off) and l8r4w5 takes every count above 64 x sm, while SM90
+    ships neither of the two and keeps l8r4 above 160.  The choice depends on
     (arch, T, B x HV, sm_count) only."""
     assert set(loader.ROUTES) == {"sm_90a", "sm_100a", "sm_103a"}
     for arch in loader.ROUTES:
         one_wave = "l8r4" if arch == "sm_90a" else "l8r4p"
-        tail_wave = "l8r4" if arch == "sm_90a" else "l8r4w5"
         many_wave = "l8r4" if arch == "sm_90a" else "l8r4w5"
         expected = {
             160: ("splitv", "splitv8_tile8"),
             161: ("lanerow", one_wave),
             4 * sm: ("lanerow", one_wave),
-            4 * sm + 1: ("lanerow", tail_wave),
-            5 * sm: ("lanerow", tail_wave),
+            4 * sm + 1: ("lanerow", "l8r4"),
+            5 * sm: ("lanerow", "l8r4"),
             5 * sm + 1: ("lanerow", "l8r4"),
             32 * sm - 1: ("lanerow", "l8r4"),
             32 * sm: ("lanerow", "l8r4"),

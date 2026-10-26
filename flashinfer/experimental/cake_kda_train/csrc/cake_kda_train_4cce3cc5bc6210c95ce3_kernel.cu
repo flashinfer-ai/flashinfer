@@ -305,8 +305,8 @@ kernel_cake_kda_train_4cce3cc5bc6210c95ce3(const __grid_constant__ CUtensorMap w
             mbarrier_init(smem + 48, 128);
             // dec_done: 1 barriers, init_count=128
             mbarrier_init(smem + 56, 128);
-            // h_ready: 1 barriers, init_count=1
-            mbarrier_init(smem + 64, 1);
+            // h_ready: 1 barriers, init_count=2
+            mbarrier_init(smem + 64, 2);
             // h_tape_read: 1 barriers, init_count=1
             mbarrier_init(smem + 72, 1);
             // bv_tape_read: 1 barriers, init_count=1
@@ -935,6 +935,8 @@ kernel_cake_kda_train_4cce3cc5bc6210c95ce3(const __grid_constant__ CUtensorMap w
                     _phase_bv_ready_0_1 ^= 1;
                     mbarrier_wait(dec_done_addr, _phase_dec_done_0);
                     _phase_dec_done_0 ^= 1;
+                    asm volatile("tcgen05.fence::before_thread_sync;");
+                    mbarrier_arrive(h_ready_addr);
                     asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                     int _mma_a_lo_1 = ((((kg_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (stage_1) * 1024;

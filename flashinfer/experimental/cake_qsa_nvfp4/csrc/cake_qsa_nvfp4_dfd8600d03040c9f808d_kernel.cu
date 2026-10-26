@@ -798,6 +798,7 @@ kernel_cake_qsa_nvfp4_dfd8600d03040c9f808d(__nv_bfloat16* __restrict__ q, uint8_
                     mx[6] = s[6];
                     s[7] = ((ok != 0) ? sv_next[7] * score_scale : -1e+20f);
                     mx[7] = s[7];
+#if __CUDA_ARCH__ == 1070
                     float send8 = ((b3) ? mx[0] : mx[4]);
                     float keep8 = ((b3) ? mx[4] : mx[0]);
                     float _shfl_xor_sync_5 = __shfl_xor_sync(0xFFFFFFFF, send8, 8);
@@ -828,12 +829,87 @@ kernel_cake_qsa_nvfp4_dfd8600d03040c9f808d(__nv_bfloat16* __restrict__ q, uint8_
                     float red = fmaxf(keep2, _shfl_xor_sync_11);
                     float _shfl_xor_sync_12 = __shfl_xor_sync(0xFFFFFFFF, red, 1);
                     red = fmaxf(red, _shfl_xor_sync_12);
+#else
+                    float r16[16];
+                    float rv = ((half == 0) ? mx[0] : -1e+20f);
+                    float _warp_redux_5;
+                    asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_5) : "f"(rv));
+                    r16[0] = _warp_redux_5;
+                    float rv_0 = ((half == 0) ? mx[1] : -1e+20f);
+                    float _warp_redux_6;
+                    asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_6) : "f"(rv_0));
+                    r16[1] = _warp_redux_6;
+                    float rv_1 = ((half == 0) ? mx[2] : -1e+20f);
+                    float _warp_redux_7;
+                    asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_7) : "f"(rv_1));
+                    r16[2] = _warp_redux_7;
+                    float rv_2 = ((half == 0) ? mx[3] : -1e+20f);
+                    float _warp_redux_8;
+                    asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_8) : "f"(rv_2));
+                    r16[3] = _warp_redux_8;
+                    float rv_3 = ((half == 0) ? mx[4] : -1e+20f);
+                    float _warp_redux_9;
+                    asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_9) : "f"(rv_3));
+                    r16[4] = _warp_redux_9;
+                    float rv_4 = ((half == 0) ? mx[5] : -1e+20f);
+                    float _warp_redux_10;
+                    asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_10) : "f"(rv_4));
+                    r16[5] = _warp_redux_10;
+                    float rv_5 = ((half == 0) ? mx[6] : -1e+20f);
+                    float _warp_redux_11;
+                    asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_11) : "f"(rv_5));
+                    r16[6] = _warp_redux_11;
+                    float rv_6 = ((half == 0) ? mx[7] : -1e+20f);
+                    float _warp_redux_12;
+                    asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_12) : "f"(rv_6));
+                    r16[7] = _warp_redux_12;
+                    float rv_7 = ((half == 1) ? mx[0] : -1e+20f);
+                    float _warp_redux_13;
+                    asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_13) : "f"(rv_7));
+                    r16[8] = _warp_redux_13;
+                    float rv_8 = ((half == 1) ? mx[1] : -1e+20f);
+                    float _warp_redux_14;
+                    asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_14) : "f"(rv_8));
+                    r16[9] = _warp_redux_14;
+                    float rv_9 = ((half == 1) ? mx[2] : -1e+20f);
+                    float _warp_redux_15;
+                    asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_15) : "f"(rv_9));
+                    r16[10] = _warp_redux_15;
+                    float rv_10 = ((half == 1) ? mx[3] : -1e+20f);
+                    float _warp_redux_16;
+                    asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_16) : "f"(rv_10));
+                    r16[11] = _warp_redux_16;
+                    float rv_11 = ((half == 1) ? mx[4] : -1e+20f);
+                    float _warp_redux_17;
+                    asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_17) : "f"(rv_11));
+                    r16[12] = _warp_redux_17;
+                    float rv_12 = ((half == 1) ? mx[5] : -1e+20f);
+                    float _warp_redux_18;
+                    asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_18) : "f"(rv_12));
+                    r16[13] = _warp_redux_18;
+                    float rv_13 = ((half == 1) ? mx[6] : -1e+20f);
+                    float _warp_redux_19;
+                    asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_19) : "f"(rv_13));
+                    r16[14] = _warp_redux_19;
+                    float rv_14 = ((half == 1) ? mx[7] : -1e+20f);
+                    float _warp_redux_20;
+                    asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_20) : "f"(rv_14));
+                    r16[15] = _warp_redux_20;
+#endif
                     unsigned int xb = xchg_max + (unsigned int)(nt & 1) * 768;
+#if __CUDA_ARCH__ == 1070
                     if (pub_lane) {
                         {
                             uint32_t _addr_13 = static_cast<uint32_t>(xb + pub_off);
                             asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_13), "f"(red) : "memory");
                         }
+#else
+                    if (lane_1 == 0) {
+                        asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(xb + (unsigned int)(64 * warp_1)), "f"(r16[0]), "f"(r16[1]), "f"(r16[2]), "f"(r16[3]) : "memory");
+                        asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(xb + (unsigned int)(64 * warp_1 + 16)), "f"(r16[4]), "f"(r16[5]), "f"(r16[6]), "f"(r16[7]) : "memory");
+                        asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(xb + (unsigned int)(64 * warp_1 + 32)), "f"(r16[8]), "f"(r16[9]), "f"(r16[10]), "f"(r16[11]) : "memory");
+                        asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(xb + (unsigned int)(64 * warp_1 + 48)), "f"(r16[12]), "f"(r16[13]), "f"(r16[14]), "f"(r16[15]) : "memory");
+#endif
                     }
                     asm volatile("barrier.sync 2, 128;" ::: "memory");
                     unsigned int xb_half = xb + xb_half_off;
@@ -862,22 +938,135 @@ kernel_cake_qsa_nvfp4_dfd8600d03040c9f808d(__nv_bfloat16* __restrict__ q, uint8_
                         : "=r"(*reinterpret_cast<uint32_t*>(&mw[28])), "=r"(*reinterpret_cast<uint32_t*>(&mw[(28) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&mw[(28) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&mw[(28) + 3]))
                         : "r"(xb_half + 192 + 16));
                     bool moved = 0;
+#if __CUDA_ARCH__ == 1070
                     m_new[0] = fmaxf(fmaxf(m[0], mw[0]), fmaxf(fmaxf(mw[8], mw[16]), mw[24]));
+#else
+                    float _max3_22;
+                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                    #endif
+                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_22) : "f"(m[0]), "f"(mw[0]), "f"(mw[8]));
+                    float _max3_21;
+                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                    #endif
+                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_21) : "f"(_max3_22), "f"(mw[16]), "f"(mw[24]));
+                    m_new[0] = _max3_21;
+#endif
                     moved = moved || m_new[0] != m[0];
+#if __CUDA_ARCH__ == 1070
                     m_new[1] = fmaxf(fmaxf(m[1], mw[1]), fmaxf(fmaxf(mw[9], mw[17]), mw[25]));
+#else
+                    float _max3_24;
+                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                    #endif
+                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_24) : "f"(m[1]), "f"(mw[1]), "f"(mw[9]));
+                    float _max3_23;
+                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                    #endif
+                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_23) : "f"(_max3_24), "f"(mw[17]), "f"(mw[25]));
+                    m_new[1] = _max3_23;
+#endif
                     moved = moved || m_new[1] != m[1];
+#if __CUDA_ARCH__ == 1070
                     m_new[2] = fmaxf(fmaxf(m[2], mw[2]), fmaxf(fmaxf(mw[10], mw[18]), mw[26]));
+#else
+                    float _max3_26;
+                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                    #endif
+                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_26) : "f"(m[2]), "f"(mw[2]), "f"(mw[10]));
+                    float _max3_25;
+                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                    #endif
+                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_25) : "f"(_max3_26), "f"(mw[18]), "f"(mw[26]));
+                    m_new[2] = _max3_25;
+#endif
                     moved = moved || m_new[2] != m[2];
+#if __CUDA_ARCH__ == 1070
                     m_new[3] = fmaxf(fmaxf(m[3], mw[3]), fmaxf(fmaxf(mw[11], mw[19]), mw[27]));
+#else
+                    float _max3_28;
+                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                    #endif
+                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_28) : "f"(m[3]), "f"(mw[3]), "f"(mw[11]));
+                    float _max3_27;
+                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                    #endif
+                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_27) : "f"(_max3_28), "f"(mw[19]), "f"(mw[27]));
+                    m_new[3] = _max3_27;
+#endif
                     moved = moved || m_new[3] != m[3];
+#if __CUDA_ARCH__ == 1070
                     m_new[4] = fmaxf(fmaxf(m[4], mw[4]), fmaxf(fmaxf(mw[12], mw[20]), mw[28]));
+#else
+                    float _max3_30;
+                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                    #endif
+                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_30) : "f"(m[4]), "f"(mw[4]), "f"(mw[12]));
+                    float _max3_29;
+                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                    #endif
+                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_29) : "f"(_max3_30), "f"(mw[20]), "f"(mw[28]));
+                    m_new[4] = _max3_29;
+#endif
                     moved = moved || m_new[4] != m[4];
+#if __CUDA_ARCH__ == 1070
                     m_new[5] = fmaxf(fmaxf(m[5], mw[5]), fmaxf(fmaxf(mw[13], mw[21]), mw[29]));
+#else
+                    float _max3_32;
+                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                    #endif
+                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_32) : "f"(m[5]), "f"(mw[5]), "f"(mw[13]));
+                    float _max3_31;
+                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                    #endif
+                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_31) : "f"(_max3_32), "f"(mw[21]), "f"(mw[29]));
+                    m_new[5] = _max3_31;
+#endif
                     moved = moved || m_new[5] != m[5];
+#if __CUDA_ARCH__ == 1070
                     m_new[6] = fmaxf(fmaxf(m[6], mw[6]), fmaxf(fmaxf(mw[14], mw[22]), mw[30]));
+#else
+                    float _max3_34;
+                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                    #endif
+                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_34) : "f"(m[6]), "f"(mw[6]), "f"(mw[14]));
+                    float _max3_33;
+                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                    #endif
+                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_33) : "f"(_max3_34), "f"(mw[22]), "f"(mw[30]));
+                    m_new[6] = _max3_33;
+#endif
                     moved = moved || m_new[6] != m[6];
+#if __CUDA_ARCH__ == 1070
                     m_new[7] = fmaxf(fmaxf(m[7], mw[7]), fmaxf(fmaxf(mw[15], mw[23]), mw[31]));
+#else
+                    float _max3_36;
+                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                    #endif
+                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_36) : "f"(m[7]), "f"(mw[7]), "f"(mw[15]));
+                    float _max3_35;
+                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                    #endif
+                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_35) : "f"(_max3_36), "f"(mw[23]), "f"(mw[31]));
+                    m_new[7] = _max3_35;
+#endif
                     moved = moved || m_new[7] != m[7];
+#if __CUDA_ARCH__ == 1070
                     int _warp_vote_14 = __any_sync(0xFFFFFFFF, moved);
                     bool any_rescale = _warp_vote_14;
                     float _exp2_15 = approx_exp2(s[0] - m_new[0]);
@@ -896,30 +1085,90 @@ kernel_cake_qsa_nvfp4_dfd8600d03040c9f808d(__nv_bfloat16* __restrict__ q, uint8_
                     p[6] = ((ok != 0) ? _exp2_21 : 0.0f);
                     float _exp2_22 = approx_exp2(s[7] - m_new[7]);
                     p[7] = ((ok != 0) ? _exp2_22 : 0.0f);
+#else
+                    int _warp_vote_37 = __any_sync(0xFFFFFFFF, moved);
+                    bool any_rescale = _warp_vote_37;
+                    float _exp2_38 = approx_exp2(s[0] - m_new[0]);
+                    p[0] = ((ok != 0) ? _exp2_38 : 0.0f);
+                    float _exp2_39 = approx_exp2(s[1] - m_new[1]);
+                    p[1] = ((ok != 0) ? _exp2_39 : 0.0f);
+                    float _exp2_40 = approx_exp2(s[2] - m_new[2]);
+                    p[2] = ((ok != 0) ? _exp2_40 : 0.0f);
+                    float _exp2_41 = approx_exp2(s[3] - m_new[3]);
+                    p[3] = ((ok != 0) ? _exp2_41 : 0.0f);
+                    float _exp2_42 = approx_exp2(s[4] - m_new[4]);
+                    p[4] = ((ok != 0) ? _exp2_42 : 0.0f);
+                    float _exp2_43 = approx_exp2(s[5] - m_new[5]);
+                    p[5] = ((ok != 0) ? _exp2_43 : 0.0f);
+                    float _exp2_44 = approx_exp2(s[6] - m_new[6]);
+                    p[6] = ((ok != 0) ? _exp2_44 : 0.0f);
+                    float _exp2_45 = approx_exp2(s[7] - m_new[7]);
+                    p[7] = ((ok != 0) ? _exp2_45 : 0.0f);
+#endif
                     if (any_rescale) {
+#if __CUDA_ARCH__ == 1070
                         float _exp2_23 = approx_exp2(m[0] - m_new[0]);
                         alpha[0] = _exp2_23;
+#else
+                        float _exp2_46 = approx_exp2(m[0] - m_new[0]);
+                        alpha[0] = _exp2_46;
+#endif
                         l[0] = __fmaf_rn(l[0], alpha[0], p[0]);
+#if __CUDA_ARCH__ == 1070
                         float _exp2_24 = approx_exp2(m[1] - m_new[1]);
                         alpha[1] = _exp2_24;
+#else
+                        float _exp2_47 = approx_exp2(m[1] - m_new[1]);
+                        alpha[1] = _exp2_47;
+#endif
                         l[1] = __fmaf_rn(l[1], alpha[1], p[1]);
+#if __CUDA_ARCH__ == 1070
                         float _exp2_25 = approx_exp2(m[2] - m_new[2]);
                         alpha[2] = _exp2_25;
+#else
+                        float _exp2_48 = approx_exp2(m[2] - m_new[2]);
+                        alpha[2] = _exp2_48;
+#endif
                         l[2] = __fmaf_rn(l[2], alpha[2], p[2]);
+#if __CUDA_ARCH__ == 1070
                         float _exp2_26 = approx_exp2(m[3] - m_new[3]);
                         alpha[3] = _exp2_26;
+#else
+                        float _exp2_49 = approx_exp2(m[3] - m_new[3]);
+                        alpha[3] = _exp2_49;
+#endif
                         l[3] = __fmaf_rn(l[3], alpha[3], p[3]);
+#if __CUDA_ARCH__ == 1070
                         float _exp2_27 = approx_exp2(m[4] - m_new[4]);
                         alpha[4] = _exp2_27;
+#else
+                        float _exp2_50 = approx_exp2(m[4] - m_new[4]);
+                        alpha[4] = _exp2_50;
+#endif
                         l[4] = __fmaf_rn(l[4], alpha[4], p[4]);
+#if __CUDA_ARCH__ == 1070
                         float _exp2_28 = approx_exp2(m[5] - m_new[5]);
                         alpha[5] = _exp2_28;
+#else
+                        float _exp2_51 = approx_exp2(m[5] - m_new[5]);
+                        alpha[5] = _exp2_51;
+#endif
                         l[5] = __fmaf_rn(l[5], alpha[5], p[5]);
+#if __CUDA_ARCH__ == 1070
                         float _exp2_29 = approx_exp2(m[6] - m_new[6]);
                         alpha[6] = _exp2_29;
+#else
+                        float _exp2_52 = approx_exp2(m[6] - m_new[6]);
+                        alpha[6] = _exp2_52;
+#endif
                         l[6] = __fmaf_rn(l[6], alpha[6], p[6]);
+#if __CUDA_ARCH__ == 1070
                         float _exp2_30 = approx_exp2(m[7] - m_new[7]);
                         alpha[7] = _exp2_30;
+#else
+                        float _exp2_53 = approx_exp2(m[7] - m_new[7]);
+                        alpha[7] = _exp2_53;
+#endif
                         l[7] = __fmaf_rn(l[7], alpha[7], p[7]);
                     } else {
                         l[0] = l[0] + p[0];
@@ -946,6 +1195,7 @@ kernel_cake_qsa_nvfp4_dfd8600d03040c9f808d(__nv_bfloat16* __restrict__ q, uint8_
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_p_addr + (unsigned int)(ss * 2048) + (unsigned int)(tok * 32 + 16 * half ^ (tok * 32 + 16 * half >> 7 & 1) << 4))), "r"(__as_u32(__float22bfloat162_rn(make_float2(p[0], p[1])))), "r"(__as_u32(__float22bfloat162_rn(make_float2(p[2], p[3])))), "r"(__as_u32(__float22bfloat162_rn(make_float2(p[4], p[5])))), "r"(__as_u32(__float22bfloat162_rn(make_float2(p[6], p[7])))) : "memory");
                     if (n > 0 && any_rescale) {
+#if __CUDA_ARCH__ == 1070
                         float _shfl_xor_sync_31 = __shfl_xor_sync(0xFFFFFFFF, alpha[0], 16);
                         other[0] = _shfl_xor_sync_31;
                         float _shfl_xor_sync_32 = __shfl_xor_sync(0xFFFFFFFF, alpha[1], 16);
@@ -962,6 +1212,24 @@ kernel_cake_qsa_nvfp4_dfd8600d03040c9f808d(__nv_bfloat16* __restrict__ q, uint8_
                         other[6] = _shfl_xor_sync_37;
                         float _shfl_xor_sync_38 = __shfl_xor_sync(0xFFFFFFFF, alpha[7], 16);
                         other[7] = _shfl_xor_sync_38;
+#else
+                        float _shfl_xor_sync_54 = __shfl_xor_sync(0xFFFFFFFF, alpha[0], 16);
+                        other[0] = _shfl_xor_sync_54;
+                        float _shfl_xor_sync_55 = __shfl_xor_sync(0xFFFFFFFF, alpha[1], 16);
+                        other[1] = _shfl_xor_sync_55;
+                        float _shfl_xor_sync_56 = __shfl_xor_sync(0xFFFFFFFF, alpha[2], 16);
+                        other[2] = _shfl_xor_sync_56;
+                        float _shfl_xor_sync_57 = __shfl_xor_sync(0xFFFFFFFF, alpha[3], 16);
+                        other[3] = _shfl_xor_sync_57;
+                        float _shfl_xor_sync_58 = __shfl_xor_sync(0xFFFFFFFF, alpha[4], 16);
+                        other[4] = _shfl_xor_sync_58;
+                        float _shfl_xor_sync_59 = __shfl_xor_sync(0xFFFFFFFF, alpha[5], 16);
+                        other[5] = _shfl_xor_sync_59;
+                        float _shfl_xor_sync_60 = __shfl_xor_sync(0xFFFFFFFF, alpha[6], 16);
+                        other[6] = _shfl_xor_sync_60;
+                        float _shfl_xor_sync_61 = __shfl_xor_sync(0xFFFFFFFF, alpha[7], 16);
+                        other[7] = _shfl_xor_sync_61;
+#endif
                         int _stage_pv_done_1 = (int)((unsigned int)(nt - 1) % 2);
                         int _parity_pv_done_1 = (int)((unsigned int)(nt - 1) / 2 % 2);
                         mbarrier_wait(pv_done_addr + (_stage_pv_done_1) * 8, _parity_pv_done_1);
@@ -1082,6 +1350,7 @@ kernel_cake_qsa_nvfp4_dfd8600d03040c9f808d(__nv_bfloat16* __restrict__ q, uint8_
                     o_acc[30] = 0.0f;
                     o_acc[31] = 0.0f;
                 }
+#if __CUDA_ARCH__ == 1070
                 float _shfl_xor_sync_39 = __shfl_xor_sync(0xFFFFFFFF, l[0], 1);
                 l[0] = l[0] + _shfl_xor_sync_39;
                 float _shfl_xor_sync_40 = __shfl_xor_sync(0xFFFFFFFF, l[1], 1);
@@ -1146,6 +1415,72 @@ kernel_cake_qsa_nvfp4_dfd8600d03040c9f808d(__nv_bfloat16* __restrict__ q, uint8_
                 l[6] = l[6] + _shfl_xor_sync_69;
                 float _shfl_xor_sync_70 = __shfl_xor_sync(0xFFFFFFFF, l[7], 8);
                 l[7] = l[7] + _shfl_xor_sync_70;
+#else
+                float _shfl_xor_sync_62 = __shfl_xor_sync(0xFFFFFFFF, l[0], 1);
+                l[0] = l[0] + _shfl_xor_sync_62;
+                float _shfl_xor_sync_63 = __shfl_xor_sync(0xFFFFFFFF, l[1], 1);
+                l[1] = l[1] + _shfl_xor_sync_63;
+                float _shfl_xor_sync_64 = __shfl_xor_sync(0xFFFFFFFF, l[2], 1);
+                l[2] = l[2] + _shfl_xor_sync_64;
+                float _shfl_xor_sync_65 = __shfl_xor_sync(0xFFFFFFFF, l[3], 1);
+                l[3] = l[3] + _shfl_xor_sync_65;
+                float _shfl_xor_sync_66 = __shfl_xor_sync(0xFFFFFFFF, l[4], 1);
+                l[4] = l[4] + _shfl_xor_sync_66;
+                float _shfl_xor_sync_67 = __shfl_xor_sync(0xFFFFFFFF, l[5], 1);
+                l[5] = l[5] + _shfl_xor_sync_67;
+                float _shfl_xor_sync_68 = __shfl_xor_sync(0xFFFFFFFF, l[6], 1);
+                l[6] = l[6] + _shfl_xor_sync_68;
+                float _shfl_xor_sync_69 = __shfl_xor_sync(0xFFFFFFFF, l[7], 1);
+                l[7] = l[7] + _shfl_xor_sync_69;
+                float _shfl_xor_sync_70 = __shfl_xor_sync(0xFFFFFFFF, l[0], 2);
+                l[0] = l[0] + _shfl_xor_sync_70;
+                float _shfl_xor_sync_71 = __shfl_xor_sync(0xFFFFFFFF, l[1], 2);
+                l[1] = l[1] + _shfl_xor_sync_71;
+                float _shfl_xor_sync_72 = __shfl_xor_sync(0xFFFFFFFF, l[2], 2);
+                l[2] = l[2] + _shfl_xor_sync_72;
+                float _shfl_xor_sync_73 = __shfl_xor_sync(0xFFFFFFFF, l[3], 2);
+                l[3] = l[3] + _shfl_xor_sync_73;
+                float _shfl_xor_sync_74 = __shfl_xor_sync(0xFFFFFFFF, l[4], 2);
+                l[4] = l[4] + _shfl_xor_sync_74;
+                float _shfl_xor_sync_75 = __shfl_xor_sync(0xFFFFFFFF, l[5], 2);
+                l[5] = l[5] + _shfl_xor_sync_75;
+                float _shfl_xor_sync_76 = __shfl_xor_sync(0xFFFFFFFF, l[6], 2);
+                l[6] = l[6] + _shfl_xor_sync_76;
+                float _shfl_xor_sync_77 = __shfl_xor_sync(0xFFFFFFFF, l[7], 2);
+                l[7] = l[7] + _shfl_xor_sync_77;
+                float _shfl_xor_sync_78 = __shfl_xor_sync(0xFFFFFFFF, l[0], 4);
+                l[0] = l[0] + _shfl_xor_sync_78;
+                float _shfl_xor_sync_79 = __shfl_xor_sync(0xFFFFFFFF, l[1], 4);
+                l[1] = l[1] + _shfl_xor_sync_79;
+                float _shfl_xor_sync_80 = __shfl_xor_sync(0xFFFFFFFF, l[2], 4);
+                l[2] = l[2] + _shfl_xor_sync_80;
+                float _shfl_xor_sync_81 = __shfl_xor_sync(0xFFFFFFFF, l[3], 4);
+                l[3] = l[3] + _shfl_xor_sync_81;
+                float _shfl_xor_sync_82 = __shfl_xor_sync(0xFFFFFFFF, l[4], 4);
+                l[4] = l[4] + _shfl_xor_sync_82;
+                float _shfl_xor_sync_83 = __shfl_xor_sync(0xFFFFFFFF, l[5], 4);
+                l[5] = l[5] + _shfl_xor_sync_83;
+                float _shfl_xor_sync_84 = __shfl_xor_sync(0xFFFFFFFF, l[6], 4);
+                l[6] = l[6] + _shfl_xor_sync_84;
+                float _shfl_xor_sync_85 = __shfl_xor_sync(0xFFFFFFFF, l[7], 4);
+                l[7] = l[7] + _shfl_xor_sync_85;
+                float _shfl_xor_sync_86 = __shfl_xor_sync(0xFFFFFFFF, l[0], 8);
+                l[0] = l[0] + _shfl_xor_sync_86;
+                float _shfl_xor_sync_87 = __shfl_xor_sync(0xFFFFFFFF, l[1], 8);
+                l[1] = l[1] + _shfl_xor_sync_87;
+                float _shfl_xor_sync_88 = __shfl_xor_sync(0xFFFFFFFF, l[2], 8);
+                l[2] = l[2] + _shfl_xor_sync_88;
+                float _shfl_xor_sync_89 = __shfl_xor_sync(0xFFFFFFFF, l[3], 8);
+                l[3] = l[3] + _shfl_xor_sync_89;
+                float _shfl_xor_sync_90 = __shfl_xor_sync(0xFFFFFFFF, l[4], 8);
+                l[4] = l[4] + _shfl_xor_sync_90;
+                float _shfl_xor_sync_91 = __shfl_xor_sync(0xFFFFFFFF, l[5], 8);
+                l[5] = l[5] + _shfl_xor_sync_91;
+                float _shfl_xor_sync_92 = __shfl_xor_sync(0xFFFFFFFF, l[6], 8);
+                l[6] = l[6] + _shfl_xor_sync_92;
+                float _shfl_xor_sync_93 = __shfl_xor_sync(0xFFFFFFFF, l[7], 8);
+                l[7] = l[7] + _shfl_xor_sync_93;
+#endif
                 if ((lane_1 & 15) == 0) {
                     unsigned int pub_l = xchg_addr + (unsigned int)(4 * (64 + 16 * warp_1 + 8 * half));
                     asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(pub_l), "f"(l[0]), "f"(l[1]), "f"(l[2]), "f"(l[3]) : "memory");
@@ -1216,8 +1551,13 @@ kernel_cake_qsa_nvfp4_dfd8600d03040c9f808d(__nv_bfloat16* __restrict__ q, uint8_
                         : "=r"(*reinterpret_cast<uint32_t*>(&v[12])), "=r"(*reinterpret_cast<uint32_t*>(&v[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&v[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&v[(12) + 3]))
                         : "r"(o_src + 48));
                     bool has_values = l_r > 0.0f;
+#if __CUDA_ARCH__ == 1070
                     float _rcp_71 = approx_rcp(fmaxf(l_r, 1e-20f));
                     float inv = output_scale * _rcp_71;
+#else
+                    float _rcp_94 = approx_rcp(fmaxf(l_r, 1e-20f));
+                    float inv = output_scale * _rcp_94;
+#endif
                     v[0] = ((has_values) ? v[0] * inv : 0.0f);
                     v[1] = ((has_values) ? v[1] * inv : 0.0f);
                     v[2] = ((has_values) ? v[2] * inv : 0.0f);
@@ -1240,50 +1580,105 @@ kernel_cake_qsa_nvfp4_dfd8600d03040c9f808d(__nv_bfloat16* __restrict__ q, uint8_
                         long long out_off = row_i64_2 * out_stride_row + qo_head * out_stride_head + (long long)dim0;
                         float _vec_load_8[8];
                         {
+#if __CUDA_ARCH__ == 1070
                             const uint4* _vptr_72 = reinterpret_cast<const uint4*>(gate + gate_off + 0);
                             uint4 _vld_72[1];
+#else
+                            const uint4* _vptr_95 = reinterpret_cast<const uint4*>(gate + gate_off + 0);
+                            uint4 _vld_95[1];
+#endif
                             #pragma unroll
                             for (int _blk = 0; _blk < 1; _blk++) {
+#if __CUDA_ARCH__ == 1070
                                 _vld_72[_blk] = _vptr_72[_blk];
                                 uint32_t* _vpairs_72 = reinterpret_cast<uint32_t*>(&_vld_72[_blk]);
+#else
+                                _vld_95[_blk] = _vptr_95[_blk];
+                                uint32_t* _vpairs_95 = reinterpret_cast<uint32_t*>(&_vld_95[_blk]);
+#endif
                                 #pragma unroll
                                 for (int _pair = 0; _pair < 4; _pair++) {
+#if __CUDA_ARCH__ == 1070
                                     (&_vec_load_8[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_72[_pair]) << 16);
                                     (&_vec_load_8[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_72[_pair]) & 0xffff0000u);
+#else
+                                    (&_vec_load_8[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_95[_pair]) << 16);
+                                    (&_vec_load_8[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_95[_pair]) & 0xffff0000u);
+#endif
                                 }
                             }
                         }
                         float attn = (float)(__nv_bfloat16)v[0];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_73 = approx_exp2((-_vec_load_8[0]) * 1.442695f);
                         float sigmoid = approx_rcp(1.0f + _exp2_73);
+#else
+                        float _exp2_96 = approx_exp2((-_vec_load_8[0]) * 1.442695f);
+                        float sigmoid = approx_rcp(1.0f + _exp2_96);
+#endif
                         gated[0] = attn * sigmoid;
                         float attn_0 = (float)(__nv_bfloat16)v[1];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_74 = approx_exp2((-_vec_load_8[1]) * 1.442695f);
                         float sigmoid_1 = approx_rcp(1.0f + _exp2_74);
+#else
+                        float _exp2_97 = approx_exp2((-_vec_load_8[1]) * 1.442695f);
+                        float sigmoid_1 = approx_rcp(1.0f + _exp2_97);
+#endif
                         gated[1] = attn_0 * sigmoid_1;
                         float attn_2 = (float)(__nv_bfloat16)v[2];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_75 = approx_exp2((-_vec_load_8[2]) * 1.442695f);
                         float sigmoid_3 = approx_rcp(1.0f + _exp2_75);
+#else
+                        float _exp2_98 = approx_exp2((-_vec_load_8[2]) * 1.442695f);
+                        float sigmoid_3 = approx_rcp(1.0f + _exp2_98);
+#endif
                         gated[2] = attn_2 * sigmoid_3;
                         float attn_4 = (float)(__nv_bfloat16)v[3];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_76 = approx_exp2((-_vec_load_8[3]) * 1.442695f);
                         float sigmoid_5 = approx_rcp(1.0f + _exp2_76);
+#else
+                        float _exp2_99 = approx_exp2((-_vec_load_8[3]) * 1.442695f);
+                        float sigmoid_5 = approx_rcp(1.0f + _exp2_99);
+#endif
                         gated[3] = attn_4 * sigmoid_5;
                         float attn_6 = (float)(__nv_bfloat16)v[4];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_77 = approx_exp2((-_vec_load_8[4]) * 1.442695f);
                         float sigmoid_7 = approx_rcp(1.0f + _exp2_77);
+#else
+                        float _exp2_100 = approx_exp2((-_vec_load_8[4]) * 1.442695f);
+                        float sigmoid_7 = approx_rcp(1.0f + _exp2_100);
+#endif
                         gated[4] = attn_6 * sigmoid_7;
                         float attn_8 = (float)(__nv_bfloat16)v[5];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_78 = approx_exp2((-_vec_load_8[5]) * 1.442695f);
                         float sigmoid_9 = approx_rcp(1.0f + _exp2_78);
+#else
+                        float _exp2_101 = approx_exp2((-_vec_load_8[5]) * 1.442695f);
+                        float sigmoid_9 = approx_rcp(1.0f + _exp2_101);
+#endif
                         gated[5] = attn_8 * sigmoid_9;
                         float attn_10 = (float)(__nv_bfloat16)v[6];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_79 = approx_exp2((-_vec_load_8[6]) * 1.442695f);
                         float sigmoid_11 = approx_rcp(1.0f + _exp2_79);
+#else
+                        float _exp2_102 = approx_exp2((-_vec_load_8[6]) * 1.442695f);
+                        float sigmoid_11 = approx_rcp(1.0f + _exp2_102);
+#endif
                         gated[6] = attn_10 * sigmoid_11;
                         float attn_12 = (float)(__nv_bfloat16)v[7];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_80 = approx_exp2((-_vec_load_8[7]) * 1.442695f);
                         float sigmoid_13 = approx_rcp(1.0f + _exp2_80);
+#else
+                        float _exp2_103 = approx_exp2((-_vec_load_8[7]) * 1.442695f);
+                        float sigmoid_13 = approx_rcp(1.0f + _exp2_103);
+#endif
                         gated[7] = attn_12 * sigmoid_13;
                         unsigned int _packed_0[4];
                         #pragma unroll
@@ -1309,50 +1704,105 @@ kernel_cake_qsa_nvfp4_dfd8600d03040c9f808d(__nv_bfloat16* __restrict__ q, uint8_
                         reinterpret_cast<int4*>(out + out_off)[0] = reinterpret_cast<int4*>(_packed_0)[0];
                         float _vec_load_9[8];
                         {
+#if __CUDA_ARCH__ == 1070
                             const uint4* _vptr_81 = reinterpret_cast<const uint4*>(gate + (gate_off + 8) + 0);
                             uint4 _vld_81[1];
+#else
+                            const uint4* _vptr_104 = reinterpret_cast<const uint4*>(gate + (gate_off + 8) + 0);
+                            uint4 _vld_104[1];
+#endif
                             #pragma unroll
                             for (int _blk = 0; _blk < 1; _blk++) {
+#if __CUDA_ARCH__ == 1070
                                 _vld_81[_blk] = _vptr_81[_blk];
                                 uint32_t* _vpairs_81 = reinterpret_cast<uint32_t*>(&_vld_81[_blk]);
+#else
+                                _vld_104[_blk] = _vptr_104[_blk];
+                                uint32_t* _vpairs_104 = reinterpret_cast<uint32_t*>(&_vld_104[_blk]);
+#endif
                                 #pragma unroll
                                 for (int _pair = 0; _pair < 4; _pair++) {
+#if __CUDA_ARCH__ == 1070
                                     (&_vec_load_9[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_81[_pair]) << 16);
                                     (&_vec_load_9[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_81[_pair]) & 0xffff0000u);
+#else
+                                    (&_vec_load_9[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_104[_pair]) << 16);
+                                    (&_vec_load_9[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_104[_pair]) & 0xffff0000u);
+#endif
                                 }
                             }
                         }
                         float attn_14 = (float)(__nv_bfloat16)v[8];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_82 = approx_exp2((-_vec_load_9[0]) * 1.442695f);
                         float sigmoid_15 = approx_rcp(1.0f + _exp2_82);
+#else
+                        float _exp2_105 = approx_exp2((-_vec_load_9[0]) * 1.442695f);
+                        float sigmoid_15 = approx_rcp(1.0f + _exp2_105);
+#endif
                         gated[0] = attn_14 * sigmoid_15;
                         float attn_16 = (float)(__nv_bfloat16)v[9];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_83 = approx_exp2((-_vec_load_9[1]) * 1.442695f);
                         float sigmoid_17 = approx_rcp(1.0f + _exp2_83);
+#else
+                        float _exp2_106 = approx_exp2((-_vec_load_9[1]) * 1.442695f);
+                        float sigmoid_17 = approx_rcp(1.0f + _exp2_106);
+#endif
                         gated[1] = attn_16 * sigmoid_17;
                         float attn_18 = (float)(__nv_bfloat16)v[10];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_84 = approx_exp2((-_vec_load_9[2]) * 1.442695f);
                         float sigmoid_19 = approx_rcp(1.0f + _exp2_84);
+#else
+                        float _exp2_107 = approx_exp2((-_vec_load_9[2]) * 1.442695f);
+                        float sigmoid_19 = approx_rcp(1.0f + _exp2_107);
+#endif
                         gated[2] = attn_18 * sigmoid_19;
                         float attn_20 = (float)(__nv_bfloat16)v[11];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_85 = approx_exp2((-_vec_load_9[3]) * 1.442695f);
                         float sigmoid_21 = approx_rcp(1.0f + _exp2_85);
+#else
+                        float _exp2_108 = approx_exp2((-_vec_load_9[3]) * 1.442695f);
+                        float sigmoid_21 = approx_rcp(1.0f + _exp2_108);
+#endif
                         gated[3] = attn_20 * sigmoid_21;
                         float attn_22 = (float)(__nv_bfloat16)v[12];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_86 = approx_exp2((-_vec_load_9[4]) * 1.442695f);
                         float sigmoid_23 = approx_rcp(1.0f + _exp2_86);
+#else
+                        float _exp2_109 = approx_exp2((-_vec_load_9[4]) * 1.442695f);
+                        float sigmoid_23 = approx_rcp(1.0f + _exp2_109);
+#endif
                         gated[4] = attn_22 * sigmoid_23;
                         float attn_24 = (float)(__nv_bfloat16)v[13];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_87 = approx_exp2((-_vec_load_9[5]) * 1.442695f);
                         float sigmoid_25 = approx_rcp(1.0f + _exp2_87);
+#else
+                        float _exp2_110 = approx_exp2((-_vec_load_9[5]) * 1.442695f);
+                        float sigmoid_25 = approx_rcp(1.0f + _exp2_110);
+#endif
                         gated[5] = attn_24 * sigmoid_25;
                         float attn_26 = (float)(__nv_bfloat16)v[14];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_88 = approx_exp2((-_vec_load_9[6]) * 1.442695f);
                         float sigmoid_27 = approx_rcp(1.0f + _exp2_88);
+#else
+                        float _exp2_111 = approx_exp2((-_vec_load_9[6]) * 1.442695f);
+                        float sigmoid_27 = approx_rcp(1.0f + _exp2_111);
+#endif
                         gated[6] = attn_26 * sigmoid_27;
                         float attn_28 = (float)(__nv_bfloat16)v[15];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_89 = approx_exp2((-_vec_load_9[7]) * 1.442695f);
                         float sigmoid_29 = approx_rcp(1.0f + _exp2_89);
+#else
+                        float _exp2_112 = approx_exp2((-_vec_load_9[7]) * 1.442695f);
+                        float sigmoid_29 = approx_rcp(1.0f + _exp2_112);
+#endif
                         gated[7] = attn_28 * sigmoid_29;
                         unsigned int _packed_1[4];
                         #pragma unroll
@@ -1396,9 +1846,15 @@ kernel_cake_qsa_nvfp4_dfd8600d03040c9f808d(__nv_bfloat16* __restrict__ q, uint8_
                             *reinterpret_cast<float4*>((partial_out + (partial_off + 12)) + 0) = _v4;
                         }
                         if (warp_1 == 0 && t == 0) {
+#if __CUDA_ARCH__ == 1070
                             float _log2_90;
                             asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_90) : "f"(l_r));
                             *(reinterpret_cast<float*>(partial_lse + partial_row) + (0)) = ((has_values) ? m_r + _log2_90 : -CUDART_INF_F);
+#else
+                            float _log2_113;
+                            asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_113) : "f"(l_r));
+                            *(reinterpret_cast<float*>(partial_lse + partial_row) + (0)) = ((has_values) ? m_r + _log2_113 : -CUDART_INF_F);
+#endif
                         }
                         if (last_11) {
                             v[0] = 0.0f;
@@ -1466,8 +1922,13 @@ kernel_cake_qsa_nvfp4_dfd8600d03040c9f808d(__nv_bfloat16* __restrict__ q, uint8_
                         : "=r"(*reinterpret_cast<uint32_t*>(&v[12])), "=r"(*reinterpret_cast<uint32_t*>(&v[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&v[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&v[(12) + 3]))
                         : "r"(o_src_1 + 48));
                     bool has_values_1 = l_r_1 > 0.0f;
+#if __CUDA_ARCH__ == 1070
                     float _rcp_91 = approx_rcp(fmaxf(l_r_1, 1e-20f));
                     float inv_1 = output_scale * _rcp_91;
+#else
+                    float _rcp_114 = approx_rcp(fmaxf(l_r_1, 1e-20f));
+                    float inv_1 = output_scale * _rcp_114;
+#endif
                     v[0] = ((has_values_1) ? v[0] * inv_1 : 0.0f);
                     v[1] = ((has_values_1) ? v[1] * inv_1 : 0.0f);
                     v[2] = ((has_values_1) ? v[2] * inv_1 : 0.0f);
@@ -1490,50 +1951,105 @@ kernel_cake_qsa_nvfp4_dfd8600d03040c9f808d(__nv_bfloat16* __restrict__ q, uint8_
                         long long out_off_1 = row_i64_2 * out_stride_row + qo_head_1 * out_stride_head + (long long)dim0;
                         float _vec_load_10[8];
                         {
+#if __CUDA_ARCH__ == 1070
                             const uint4* _vptr_92 = reinterpret_cast<const uint4*>(gate + gate_off_1 + 0);
                             uint4 _vld_92[1];
+#else
+                            const uint4* _vptr_115 = reinterpret_cast<const uint4*>(gate + gate_off_1 + 0);
+                            uint4 _vld_115[1];
+#endif
                             #pragma unroll
                             for (int _blk = 0; _blk < 1; _blk++) {
+#if __CUDA_ARCH__ == 1070
                                 _vld_92[_blk] = _vptr_92[_blk];
                                 uint32_t* _vpairs_92 = reinterpret_cast<uint32_t*>(&_vld_92[_blk]);
+#else
+                                _vld_115[_blk] = _vptr_115[_blk];
+                                uint32_t* _vpairs_115 = reinterpret_cast<uint32_t*>(&_vld_115[_blk]);
+#endif
                                 #pragma unroll
                                 for (int _pair = 0; _pair < 4; _pair++) {
+#if __CUDA_ARCH__ == 1070
                                     (&_vec_load_10[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_92[_pair]) << 16);
                                     (&_vec_load_10[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_92[_pair]) & 0xffff0000u);
+#else
+                                    (&_vec_load_10[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_115[_pair]) << 16);
+                                    (&_vec_load_10[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_115[_pair]) & 0xffff0000u);
+#endif
                                 }
                             }
                         }
                         float attn_1 = (float)(__nv_bfloat16)v[0];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_93 = approx_exp2((-_vec_load_10[0]) * 1.442695f);
                         float sigmoid_2 = approx_rcp(1.0f + _exp2_93);
+#else
+                        float _exp2_116 = approx_exp2((-_vec_load_10[0]) * 1.442695f);
+                        float sigmoid_2 = approx_rcp(1.0f + _exp2_116);
+#endif
                         gated[0] = attn_1 * sigmoid_2;
                         float attn_0_1 = (float)(__nv_bfloat16)v[1];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_94 = approx_exp2((-_vec_load_10[1]) * 1.442695f);
                         float sigmoid_1_1 = approx_rcp(1.0f + _exp2_94);
+#else
+                        float _exp2_117 = approx_exp2((-_vec_load_10[1]) * 1.442695f);
+                        float sigmoid_1_1 = approx_rcp(1.0f + _exp2_117);
+#endif
                         gated[1] = attn_0_1 * sigmoid_1_1;
                         float attn_2_1 = (float)(__nv_bfloat16)v[2];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_95 = approx_exp2((-_vec_load_10[2]) * 1.442695f);
                         float sigmoid_3_1 = approx_rcp(1.0f + _exp2_95);
+#else
+                        float _exp2_118 = approx_exp2((-_vec_load_10[2]) * 1.442695f);
+                        float sigmoid_3_1 = approx_rcp(1.0f + _exp2_118);
+#endif
                         gated[2] = attn_2_1 * sigmoid_3_1;
                         float attn_4_1 = (float)(__nv_bfloat16)v[3];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_96 = approx_exp2((-_vec_load_10[3]) * 1.442695f);
                         float sigmoid_5_1 = approx_rcp(1.0f + _exp2_96);
+#else
+                        float _exp2_119 = approx_exp2((-_vec_load_10[3]) * 1.442695f);
+                        float sigmoid_5_1 = approx_rcp(1.0f + _exp2_119);
+#endif
                         gated[3] = attn_4_1 * sigmoid_5_1;
                         float attn_6_1 = (float)(__nv_bfloat16)v[4];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_97 = approx_exp2((-_vec_load_10[4]) * 1.442695f);
                         float sigmoid_7_1 = approx_rcp(1.0f + _exp2_97);
+#else
+                        float _exp2_120 = approx_exp2((-_vec_load_10[4]) * 1.442695f);
+                        float sigmoid_7_1 = approx_rcp(1.0f + _exp2_120);
+#endif
                         gated[4] = attn_6_1 * sigmoid_7_1;
                         float attn_8_1 = (float)(__nv_bfloat16)v[5];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_98 = approx_exp2((-_vec_load_10[5]) * 1.442695f);
                         float sigmoid_9_1 = approx_rcp(1.0f + _exp2_98);
+#else
+                        float _exp2_121 = approx_exp2((-_vec_load_10[5]) * 1.442695f);
+                        float sigmoid_9_1 = approx_rcp(1.0f + _exp2_121);
+#endif
                         gated[5] = attn_8_1 * sigmoid_9_1;
                         float attn_10_1 = (float)(__nv_bfloat16)v[6];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_99 = approx_exp2((-_vec_load_10[6]) * 1.442695f);
                         float sigmoid_11_1 = approx_rcp(1.0f + _exp2_99);
+#else
+                        float _exp2_122 = approx_exp2((-_vec_load_10[6]) * 1.442695f);
+                        float sigmoid_11_1 = approx_rcp(1.0f + _exp2_122);
+#endif
                         gated[6] = attn_10_1 * sigmoid_11_1;
                         float attn_12_1 = (float)(__nv_bfloat16)v[7];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_100 = approx_exp2((-_vec_load_10[7]) * 1.442695f);
                         float sigmoid_13_1 = approx_rcp(1.0f + _exp2_100);
+#else
+                        float _exp2_123 = approx_exp2((-_vec_load_10[7]) * 1.442695f);
+                        float sigmoid_13_1 = approx_rcp(1.0f + _exp2_123);
+#endif
                         gated[7] = attn_12_1 * sigmoid_13_1;
                         unsigned int _packed_2[4];
                         #pragma unroll
@@ -1559,50 +2075,105 @@ kernel_cake_qsa_nvfp4_dfd8600d03040c9f808d(__nv_bfloat16* __restrict__ q, uint8_
                         reinterpret_cast<int4*>(out + out_off_1)[0] = reinterpret_cast<int4*>(_packed_2)[0];
                         float _vec_load_11[8];
                         {
+#if __CUDA_ARCH__ == 1070
                             const uint4* _vptr_101 = reinterpret_cast<const uint4*>(gate + (gate_off_1 + 8) + 0);
                             uint4 _vld_101[1];
+#else
+                            const uint4* _vptr_124 = reinterpret_cast<const uint4*>(gate + (gate_off_1 + 8) + 0);
+                            uint4 _vld_124[1];
+#endif
                             #pragma unroll
                             for (int _blk = 0; _blk < 1; _blk++) {
+#if __CUDA_ARCH__ == 1070
                                 _vld_101[_blk] = _vptr_101[_blk];
                                 uint32_t* _vpairs_101 = reinterpret_cast<uint32_t*>(&_vld_101[_blk]);
+#else
+                                _vld_124[_blk] = _vptr_124[_blk];
+                                uint32_t* _vpairs_124 = reinterpret_cast<uint32_t*>(&_vld_124[_blk]);
+#endif
                                 #pragma unroll
                                 for (int _pair = 0; _pair < 4; _pair++) {
+#if __CUDA_ARCH__ == 1070
                                     (&_vec_load_11[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_101[_pair]) << 16);
                                     (&_vec_load_11[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_101[_pair]) & 0xffff0000u);
+#else
+                                    (&_vec_load_11[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_124[_pair]) << 16);
+                                    (&_vec_load_11[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_124[_pair]) & 0xffff0000u);
+#endif
                                 }
                             }
                         }
                         float attn_14_1 = (float)(__nv_bfloat16)v[8];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_102 = approx_exp2((-_vec_load_11[0]) * 1.442695f);
                         float sigmoid_15_1 = approx_rcp(1.0f + _exp2_102);
+#else
+                        float _exp2_125 = approx_exp2((-_vec_load_11[0]) * 1.442695f);
+                        float sigmoid_15_1 = approx_rcp(1.0f + _exp2_125);
+#endif
                         gated[0] = attn_14_1 * sigmoid_15_1;
                         float attn_16_1 = (float)(__nv_bfloat16)v[9];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_103 = approx_exp2((-_vec_load_11[1]) * 1.442695f);
                         float sigmoid_17_1 = approx_rcp(1.0f + _exp2_103);
+#else
+                        float _exp2_126 = approx_exp2((-_vec_load_11[1]) * 1.442695f);
+                        float sigmoid_17_1 = approx_rcp(1.0f + _exp2_126);
+#endif
                         gated[1] = attn_16_1 * sigmoid_17_1;
                         float attn_18_1 = (float)(__nv_bfloat16)v[10];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_104 = approx_exp2((-_vec_load_11[2]) * 1.442695f);
                         float sigmoid_19_1 = approx_rcp(1.0f + _exp2_104);
+#else
+                        float _exp2_127 = approx_exp2((-_vec_load_11[2]) * 1.442695f);
+                        float sigmoid_19_1 = approx_rcp(1.0f + _exp2_127);
+#endif
                         gated[2] = attn_18_1 * sigmoid_19_1;
                         float attn_20_1 = (float)(__nv_bfloat16)v[11];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_105 = approx_exp2((-_vec_load_11[3]) * 1.442695f);
                         float sigmoid_21_1 = approx_rcp(1.0f + _exp2_105);
+#else
+                        float _exp2_128 = approx_exp2((-_vec_load_11[3]) * 1.442695f);
+                        float sigmoid_21_1 = approx_rcp(1.0f + _exp2_128);
+#endif
                         gated[3] = attn_20_1 * sigmoid_21_1;
                         float attn_22_1 = (float)(__nv_bfloat16)v[12];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_106 = approx_exp2((-_vec_load_11[4]) * 1.442695f);
                         float sigmoid_23_1 = approx_rcp(1.0f + _exp2_106);
+#else
+                        float _exp2_129 = approx_exp2((-_vec_load_11[4]) * 1.442695f);
+                        float sigmoid_23_1 = approx_rcp(1.0f + _exp2_129);
+#endif
                         gated[4] = attn_22_1 * sigmoid_23_1;
                         float attn_24_1 = (float)(__nv_bfloat16)v[13];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_107 = approx_exp2((-_vec_load_11[5]) * 1.442695f);
                         float sigmoid_25_1 = approx_rcp(1.0f + _exp2_107);
+#else
+                        float _exp2_130 = approx_exp2((-_vec_load_11[5]) * 1.442695f);
+                        float sigmoid_25_1 = approx_rcp(1.0f + _exp2_130);
+#endif
                         gated[5] = attn_24_1 * sigmoid_25_1;
                         float attn_26_1 = (float)(__nv_bfloat16)v[14];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_108 = approx_exp2((-_vec_load_11[6]) * 1.442695f);
                         float sigmoid_27_1 = approx_rcp(1.0f + _exp2_108);
+#else
+                        float _exp2_131 = approx_exp2((-_vec_load_11[6]) * 1.442695f);
+                        float sigmoid_27_1 = approx_rcp(1.0f + _exp2_131);
+#endif
                         gated[6] = attn_26_1 * sigmoid_27_1;
                         float attn_28_1 = (float)(__nv_bfloat16)v[15];
+#if __CUDA_ARCH__ == 1070
                         float _exp2_109 = approx_exp2((-_vec_load_11[7]) * 1.442695f);
                         float sigmoid_29_1 = approx_rcp(1.0f + _exp2_109);
+#else
+                        float _exp2_132 = approx_exp2((-_vec_load_11[7]) * 1.442695f);
+                        float sigmoid_29_1 = approx_rcp(1.0f + _exp2_132);
+#endif
                         gated[7] = attn_28_1 * sigmoid_29_1;
                         unsigned int _packed_3[4];
                         #pragma unroll
@@ -1646,9 +2217,15 @@ kernel_cake_qsa_nvfp4_dfd8600d03040c9f808d(__nv_bfloat16* __restrict__ q, uint8_
                             *reinterpret_cast<float4*>((partial_out + (partial_off_1 + 12)) + 0) = _v4;
                         }
                         if (warp_1 == 0 && t == 0) {
+#if __CUDA_ARCH__ == 1070
                             float _log2_110;
                             asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_110) : "f"(l_r_1));
                             *(reinterpret_cast<float*>(partial_lse + partial_row_1) + (0)) = ((has_values_1) ? m_r_1 + _log2_110 : -CUDART_INF_F);
+#else
+                            float _log2_133;
+                            asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_133) : "f"(l_r_1));
+                            *(reinterpret_cast<float*>(partial_lse + partial_row_1) + (0)) = ((has_values_1) ? m_r_1 + _log2_133 : -CUDART_INF_F);
+#endif
                         }
                         if (last_11) {
                             v[0] = 0.0f;

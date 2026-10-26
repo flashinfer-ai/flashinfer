@@ -20,7 +20,11 @@ import torch
 from flashinfer import SfLayout, mm_fp4, nvfp4_quantize
 from flashinfer.experimental.cake_nvfp4_per_token import cake_backend as cb
 from flashinfer.experimental.cake_nvfp4_per_token.cake_jit import KERNELS
-from tests.test_helpers.cake_nvfp4_per_token import required_kernel_keys
+from tests.test_helpers.cake_nvfp4_per_token import (
+    VALIDATED_GEMM_FAMILIES,
+    VALIDATED_OFF_MATRIX_FAMILY,
+    required_kernel_keys,
+)
 
 GLOBAL_SCALE_INV = 1.0 / (448.0 * 6.0)
 
@@ -236,6 +240,24 @@ def test_m64_ring_overlay_rows():
             152,
             tactic={**cb.default_tactic(8, 28672, 8192, 152), "ring_overlay": True},
         )
+
+
+def test_m128_ring_overlay_rows():
+    # One 128-token tile over more 128-wide weight tiles than SMs (8192x28672 M = 128 on
+    # 148 SMs: 224 tiles) takes the overlay program of the 128-wide 1-CTA m tile, which
+    # only sm_100a registers; one wave of 128-wide tiles keeps its staging.
+    for out_f16, out in ((False, "bf16"), (True, "f16")):
+        plan = _registered(
+            cb.gemm_plan(128, 28672, 8192, out_f16, "sm_100a", 148), "sm_100a"
+        )
+        assert plan.kernel_key == f"gemm:m128_{out}_bF_ro", plan.kernel_key
+        plan = cb.gemm_plan(128, 18432, 7168, out_f16, "sm_100a", 148)
+        assert plan.kernel_key == f"gemm:m128_{out}_bF", plan.kernel_key
+    t = cb.default_tactic(128, 28672, 8192, 148, m128_ring_overlay=True)
+    assert t["tile_n"] == 128 and "two_cta" not in t and t["ring_overlay"]
+    assert "ring_overlay" not in cb.default_tactic(128, 28672, 8192, 148)
+    t = cb.default_tactic(128, 18432, 7168, 148, m128_ring_overlay=True)
+    assert "ring_overlay" not in t
 
 
 def test_n16_split3_rows():
@@ -463,6 +485,87 @@ def test_required_gemm_keys_registered_when_programs_exist(arch):
     if arch in KERNELS:
         missing = sorted(set(required) - set(KERNELS[arch]))
         assert not missing, f"{arch} lacks {missing}"
+
+
+# Token counts at the edges of the dispatch rules: the swapped-orientation tiles, the
+# single-token-tile and 2-CTA limits, the validated rows and their neighbours.
+_EDGE_M = (1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 127, 128, 129, 130, 255, 256)
+_EDGE_M += (257, 511, 512, 513, 1000, 1024, 2047, 2048, 2049, 4096, 4097, 8191, 8192)
+_EDGE_M += (8193, 16384)
+
+
+@pytest.mark.parametrize("sm_count", (148, 152))
+@pytest.mark.parametrize("arch", cb.ARCHES)
+def test_plans_resolve_on_148_and_152_sms(arch, sm_count):
+    # Each architecture ships on a 148- and a 152-SM part (sm_100a: B200 / GB200,
+    # sm_103a: B300 / GB300) and registers the kernels of its measured part.  The
+    # validated matrix resolves on both parts; on the other part an edge row whose own
+    # tactic selects an unregistered kernel runs the measured part's kernel, and every
+    # other row keeps its own.
+    registered = KERNELS[arch]
+    missing = sorted(set(required_kernel_keys(arch, sm_count)) - set(registered))
+    assert not missing, f"{arch} with {sm_count} SMs lacks {missing}"
+    measured = cb.MEASURED_SM_COUNT[arch]
+    served = 0
+    for k, n in (*VALIDATED_GEMM_FAMILIES, VALIDATED_OFF_MATRIX_FAMILY):
+        for m in _EDGE_M:
+            for out_f16 in (False, True):
+                reference = cb.gemm_plan(m, n, k, out_f16, arch, measured)
+                if reference.kernel_key not in registered:
+                    continue  # outside the registered matrix on the measured part too
+                served += 1
+                plan = cb.gemm_plan(m, n, k, out_f16, arch, sm_count)
+                key = plan.kernel_key
+                assert key in registered, (m, n, k, out_f16, key)
+                assert plan.sm_count == sm_count
+                if sm_count == measured:
+                    continue
+                own = cb.default_tactic(
+                    m,
+                    n,
+                    k,
+                    sm_count,
+                    out_f16=out_f16,
+                    n8_wide_w_rows=arch == cb.N8_WIDE_W_ROWS_ARCH,
+                )
+                own_key = cb.gemm_plan(
+                    m, n, k, out_f16, arch, sm_count, tactic=own
+                ).kernel_key
+                if own_key in registered:
+                    assert key == own_key, (m, n, k, out_f16)
+                else:
+                    assert key == reference.kernel_key, (m, n, k, out_f16)
+    assert served
+
+
+def test_other_sm_count_runs_the_measured_kernel():
+    # GB200 (sm_100a, 152 SMs): two CTAs per SM on the 16 / 32-token tiles, the
+    # 128 x 192 one-CTA tile and the plain 192-wide 2-CTA pair are registered for
+    # sm_103a only.  B300 (sm_103a, 148 SMs): the stream-K tail programs are registered
+    # for sm_100a only.  These rows run the measured part's kernel with the grid of
+    # their own SM count.
+    rows = (
+        ("sm_100a", 152, 16, 28672, 8192, "gemm:n16_bf16_aF_l2256b", 152),
+        ("sm_100a", 152, 32, 28672, 8192, "gemm:n32_bf16_aF_l2256b", 152),
+        ("sm_100a", 152, 128, 28672, 8192, "gemm:m128_bf16_bF_ro", 152),
+        ("sm_100a", 152, 257, 7168, 16384, "gemm:m256_2cta_bf16_bF_l2256b", 112),
+        ("sm_103a", 148, 512, 28672, 8192, "gemm:m256_2cta_bf16_bF_l2256b", 148),
+        ("sm_103a", 148, 2048, 7168, 16384, "gemm:m256_2cta_bf16_aL_bL_l2256b_g8", 148),
+    )
+    for arch, sm_count, m, n, k, key, grid in rows:
+        own = cb.default_tactic(
+            m, n, k, sm_count, n8_wide_w_rows=arch == cb.N8_WIDE_W_ROWS_ARCH
+        )
+        own_key = cb.gemm_plan(m, n, k, False, arch, sm_count, tactic=own).kernel_key
+        assert own_key not in KERNELS[arch], own_key
+        plan = cb.gemm_plan(m, n, k, False, arch, sm_count)
+        measured = cb.gemm_plan(m, n, k, False, arch, cb.MEASURED_SM_COUNT[arch])
+        assert plan.kernel_key == measured.kernel_key == key, plan.kernel_key
+        assert plan.sm_count == sm_count and plan.grid == grid, plan.grid
+    # An explicit tactic is planned as given.
+    t = cb.default_tactic(32, 28672, 8192, 152)
+    plan = cb.gemm_plan(32, 28672, 8192, False, "sm_100a", 152, tactic=t)
+    assert plan.kernel_key == "gemm:n32_bf16_aF_l2256b_o2"
 
 
 # ---------------------------------------------------------------------------

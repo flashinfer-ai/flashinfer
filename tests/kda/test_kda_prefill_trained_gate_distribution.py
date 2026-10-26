@@ -426,9 +426,19 @@ CHECKPOINT_BY_ARCH = {
 }
 
 
+def _routed(module):
+    """The program the loader runs for shipped ``module`` on this device: the
+    generated program its route names, else the module itself."""
+    from flashinfer.jit import cake_kda_tf32 as registry
+
+    return registry._RENDERED_ROUTES.get(registry.device_arch(), {}).get(module, module)
+
+
 def _assert_selected(selected, expected):
     if isinstance(expected, dict):
         expected = expected[torch.cuda.get_device_capability()]
+    schedule, module = expected
+    expected = (schedule, _routed(module))
     assert selected == expected, f"selected {selected}, expected {expected}"
 
 

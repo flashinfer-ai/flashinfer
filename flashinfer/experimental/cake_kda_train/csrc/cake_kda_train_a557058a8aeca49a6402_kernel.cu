@@ -446,6 +446,7 @@ kernel_cake_kda_train_a557058a8aeca49a6402(const __grid_constant__ CUtensorMap a
             unsigned int _phase_vp_ready_0 = 0;
             unsigned int _phase_h_tape_read_0 = 0;
             unsigned int _phase_h_ready_0 = 0;
+            unsigned int _phase_dec_done_0 = 0;
             #pragma unroll 1
             for (int c = 0; c < nc; c++) {
                 float _tmem_load_16[16];
@@ -606,6 +607,8 @@ kernel_cake_kda_train_a557058a8aeca49a6402(const __grid_constant__ CUtensorMap a
                 }
                 mbarrier_wait(h_ready_addr, _phase_h_ready_0);
                 _phase_h_ready_0 ^= 1;
+                mbarrier_wait(dec_done_addr, _phase_dec_done_0);
+                _phase_dec_done_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
             }
             asm volatile("tcgen05.fence::before_thread_sync;");
@@ -1107,18 +1110,19 @@ kernel_cake_kda_train_a557058a8aeca49a6402(const __grid_constant__ CUtensorMap a
             unsigned int wst_m = 0;
             unsigned int mst = 0;
             unsigned int _phase_wy_full = 0;
+            unsigned int _phase_vb_ready = 0;
             unsigned int _phase_tiles_full = 0;
             unsigned int _phase_w_ready = 0;
             unsigned int _phase_hs_ready_0_2 = 0;
             unsigned int _phase_qg_full_0 = 0;
             unsigned int _phase_o_drained_0 = 1;
             unsigned int _phase_bv_ready_0_1 = 0;
-            unsigned int _phase_dec_done_0 = 0;
+            unsigned int _phase_dec_done_0_1 = 0;
             unsigned int _phase_aqk_full_0 = 0;
             if (elect_sync()) {
                 if (nc_3 > 0) {
                     mbarrier_wait(wy_full_addr + (wst_m) * 8, _phase_wy_full);
-                    mbarrier_wait(vb_ready_addr + (wst_m) * 8, _phase_wy_full);
+                    mbarrier_wait(vb_ready_addr + (wst_m) * 8, _phase_vb_ready);
                     asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                     int _smem_desc_lo_0 = ((((kb_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (wst_m) * 1024;
@@ -1207,7 +1211,7 @@ kernel_cake_kda_train_a557058a8aeca49a6402(const __grid_constant__ CUtensorMap a
                     ubuf_1 += 1;
                     if (ubuf_1 == 2) { ubuf_1 = 0; }
                     wst_m += 1;
-                    if (wst_m == 2) { wst_m = 0; _phase_wy_full ^= 1; }
+                    if (wst_m == 2) { wst_m = 0; _phase_wy_full ^= 1; _phase_vb_ready ^= 1; }
                 }
                 #pragma unroll 1
                 for (int c_3 = 0; c_3 < nc_3; c_3++) {
@@ -1282,7 +1286,7 @@ kernel_cake_kda_train_a557058a8aeca49a6402(const __grid_constant__ CUtensorMap a
                     if (mst == 2) { mst = 0; _phase_w_ready ^= 1; }
                     if (nc_3 > c_3 + 1) {
                         mbarrier_wait(wy_full_addr + (wst_m) * 8, _phase_wy_full);
-                        mbarrier_wait(vb_ready_addr + (wst_m) * 8, _phase_wy_full);
+                        mbarrier_wait(vb_ready_addr + (wst_m) * 8, _phase_vb_ready);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_4 = ((((kb_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (wst_m) * 1024;
@@ -1371,7 +1375,7 @@ kernel_cake_kda_train_a557058a8aeca49a6402(const __grid_constant__ CUtensorMap a
                         ubuf_1 += 1;
                         if (ubuf_1 == 2) { ubuf_1 = 0; }
                         wst_m += 1;
-                        if (wst_m == 2) { wst_m = 0; _phase_wy_full ^= 1; }
+                        if (wst_m == 2) { wst_m = 0; _phase_wy_full ^= 1; _phase_vb_ready ^= 1; }
                     }
                     mbarrier_wait(qg_full_addr, _phase_qg_full_0);
                     _phase_qg_full_0 ^= 1;
@@ -1440,8 +1444,8 @@ kernel_cake_kda_train_a557058a8aeca49a6402(const __grid_constant__ CUtensorMap a
                     tcgen05_commit(qg_empty_addr);
                     mbarrier_wait(bv_ready_addr, _phase_bv_ready_0_1);
                     _phase_bv_ready_0_1 ^= 1;
-                    mbarrier_wait(dec_done_addr, _phase_dec_done_0);
-                    _phase_dec_done_0 ^= 1;
+                    mbarrier_wait(dec_done_addr, _phase_dec_done_0_1);
+                    _phase_dec_done_0_1 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                     int _mma_a_lo_1 = ((((kg_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (stage_1) * 1024;

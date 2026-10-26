@@ -531,6 +531,11 @@ if CUDNN_AVAILABLE:
         graph_total_q = _prefill_graph_total_q(override_cache, max_total_num_rows)
         if override_cache is not None:
             graph_b, graph_s_qo, graph_s_kv = override_cache
+        if block_tables is not None:
+            # A loose caller bound can exceed the table's physical capacity.
+            # Both bound the live KV lengths; use their intersection consistently
+            # for the attention attribute and the page-table descriptor.
+            graph_s_kv = min(graph_s_kv, block_tables.shape[1] * k_cache.shape[2])
 
         def indptr_tensor(like: torch.Tensor):
             # (b+1)-row int32 buffers (ragged offsets, cu_seq_lens). Declared at

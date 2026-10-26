@@ -219,6 +219,11 @@ worker counts without GPU topology or measured memory capacity.
 Run the CPU-only coordinator suite with
 `pytest --confcutdir=tests/test_sharding tests/test_sharding/`.
 
+Collection stdout/stderr, including best-effort JIT prewarm warnings, is retained
+under `junit/collection-*/*.log` and uploaded with the public CI telemetry. Each
+collection gets a separate directory so concurrent collectors or later attempts
+preserve earlier diagnostics. Collection metadata remains temporary.
+
 Communication-test wrappers optionally emit cache-publication completion reports
 when `UNIT_TEST_RUN_STATUS_DIR` is set to a fresh directory unique to that wrapper
 and container/rank. `test_run_status.sh` records each pytest invocation, and
@@ -282,6 +287,10 @@ storage row stride and pointer. Include a backend-only provider control in
 capacity-lifetime tests, since FROST can accept an oversized descriptor that the
 backend rejects. Table capacity must cover initialized
 indices and rounded graph bounds; also test a fallback beyond cuDNN admission.
+An explicit KV maximum may be looser than the caller table's capacity. Intersect
+these two upper bounds when declaring the graph, using the same effective bound
+for the attention attribute and table slice; actual device lengths still mask
+the live tokens, without a host readback.
 Replay an old capture only with lengths inside its declared bounds and compatible
 buffers. Keep numerical and lifetime tests independent of heuristic winners and
 timing thresholds.
@@ -302,6 +311,12 @@ no-readback path. Declining cuDNN can itself cause FA2 to stage KV metadata back
 to the host. Use per-request work only when its lengths are already on CPU;
 otherwise retain the existing bound-based policy. Check with a busy GPU stream
 and synchronization debugging, not just a predicate-level test.
+
+Full-prefill admission requires each request's Q length to equal its KV length;
+equal batch maxima do not establish that contract. Prove it using existing CPU
+metadata, and decline the full-prefill extension when independent query-length
+overrides or device-only KV lengths prevent that proof. Preserve the existing
+prefix policy without adding a device readback just for dispatch.
 
 ## Benchmarking
 
