@@ -4409,6 +4409,7 @@ class TestRubinMultiCtaTacticRejected:
 
 
 def _rubin_tactic_with(predicate):
+    """Return the first enumerated Rubin MoE tactic matching ``predicate``."""
     from flashinfer.fused_moe.cute_dsl.tuner import ALL_RUBIN_MOE_TACTICS
 
     return next(t for t in ALL_RUBIN_MOE_TACTICS if predicate(t))
@@ -4445,6 +4446,7 @@ class TestRubinTwoCtaAndClusterNTacticsAccuracy:
         ],
     )
     def test_accuracy(self, pick, routing: str):
+        """Run the picked plan end to end and compare to the FP4 reference."""
         from flashinfer import CuteDslMoEWrapper
         from flashinfer.cute_dsl.utils import is_rubin_cute_dsl_available
 
