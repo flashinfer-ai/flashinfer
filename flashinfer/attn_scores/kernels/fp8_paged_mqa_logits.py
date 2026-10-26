@@ -1926,6 +1926,12 @@ class _FP8MQAEngineMixin(_FP8MQALayoutMixin):
                         mTileMeta=mTileMeta,
                     )
                 )
+        if cutlass.const_expr(request_tiled):
+            # All math warps must finish their TMEM reads before its allocation
+            # is returned; the final task can differ between warp groups.
+            pipeline.NamedBarrier(
+                barrier_id=2, num_threads=self.num_math_threads
+            ).arrive_and_wait()
         tmem.relinquish_alloc_permit()
         if cutlass.const_expr(request_tiled):
             tmem.free(tmem_ptr)
