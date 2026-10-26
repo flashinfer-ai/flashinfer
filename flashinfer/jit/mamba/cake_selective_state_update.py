@@ -3027,13 +3027,35 @@ def hd64_paired_program(
 
 def dim128_program(heads_per_group: int, gated: bool) -> tuple[str, int]:
     """``(program, heads_per_cta)`` of the headdim-128 / dstate-128 single-token route: the z-gated build at four
-    CTAs per SM for a call with ``z``, otherwise the early-input build at one head per CTA (four CTAs per SM) for
-    one head per group and at two heads per CTA for more."""
+    CTAs per SM for a call with ``z`` (outside the persistent build's domain, :func:`dim128_balanced_units`),
+    otherwise the early-input build at one head per CTA (four CTAs per SM) for one head per group and at two heads
+    per CTA for more."""
     if gated:
         return "stp_dim128_z_gated", 2
     if heads_per_group == 1:
         return "stp_dim128_hpc1_mb4", 1
     return "stp_dim128_hpc2", 2
+
+
+# The persistent build of the z-gated 128x128 single-token program: per (architecture, SM count) the inclusive
+# intervals of ``batch x nheads`` in which a call with ``z`` runs it, and its CTAs per SM.
+_DIM128_BALANCED_UNITS: dict[tuple[str, int], tuple[tuple[int, int], ...]] = {
+    ("sm_100a", 148): ((64, 384), (1280, 1664), (2560, 2816), (3328, 4096)),
+    ("sm_103a", 152): ((64, 448), (1280, 1792), (2560, 3328), (3840, 4352)),
+}
+_DIM128_BALANCED_CTAS_PER_SM = 3
+
+
+def dim128_balanced_units(
+    batch_size: int, nheads: int, sm_count: int, arch: str
+) -> int:
+    """The heads (``batch_size x nheads``) a z-gated headdim-128 / dstate-128 single-token launch hands the
+    persistent build, or 0 when the launch keeps the z-gated build: the build runs inside the measured intervals
+    of the architecture at its SM count (``_DIM128_BALANCED_UNITS``), one launch of at most three CTAs per SM, each
+    CTA streaming whole heads."""
+    units = batch_size * nheads
+    intervals = _DIM128_BALANCED_UNITS.get((arch, sm_count), ())
+    return units if any(low <= units <= high for low, high in intervals) else 0
 
 
 # CTAs per SM of the two-head build from which a launch runs that build split two ways at five CTAs per SM, per
@@ -3167,7 +3189,9 @@ def _plan_stp_rows(
     program head and the tensor map covers the state as passed.  ``dt``, ``A``, ``D`` and ``dt_bias`` carry one
     value per head at a unit head stride; slot tables are contiguous and cover the batch.  A launch the P-split
     rule takes (:func:`hd64_split_program`, :func:`dim128_split_program`) runs the split build under the same
-    bindings, ``p_split`` CTAs per work tile.  One ``shape`` / ``stride()`` read per tensor.
+    bindings, ``p_split`` CTAs per work tile.  A call with ``z`` inside the persistent build's domain
+    (:func:`dim128_balanced_units`) runs that build: the same bindings with ``units`` (the batch's heads) for the
+    head tiles, at most three CTAs per SM.  One ``shape`` / ``stride()`` read per tensor.
     """
     x_shape = x.shape
     batch_size = x_shape[0]
@@ -3247,6 +3271,11 @@ def _plan_stp_rows(
     p_split = 1
     if split is not None:
         program, heads_per_cta, p_split = split
+    units = (
+        dim128_balanced_units(batch_size, nheads, sms, arch)
+        if not paired and z is not None
+        else 0
+    )
     head_tiles = (heads_per_group + heads_per_cta - 1) // heads_per_cta
     bindings = dict(
         state_tma=state_tma,
@@ -3274,6 +3303,18 @@ def _plan_stp_rows(
         disable_state_update=int(disable_state_update),
         pad_slot_id=pad_slot_id,
     )
+    if units:
+        # The persistent build: CTA ``c`` of the grid streams heads ``c``, ``c + grid``, ... of the batch.
+        del bindings["head_tiles"]
+        bindings["units"] = units
+        return RoutePlan(
+            "stp_dim128_z_balanced",
+            (),
+            (min(units, _DIM128_BALANCED_CTAS_PER_SM * sms), 1, 1),
+            bindings,
+            arch,
+            device_index,
+        )
     # ``p_split`` CTAs per work tile of ``heads_per_cta`` program heads of one (batch, group).
     return RoutePlan(
         program,
