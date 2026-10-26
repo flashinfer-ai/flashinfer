@@ -40,7 +40,8 @@ limitations under the License.
 # split-K decode program's partial-sum exchange bounded to the first N rows, in
 # cells of at most N rows; ``_cv100`` the quantization launch with a preferred
 # shared-memory carveout of 100 percent, which the decode launch starting beside
-# it under PDL uses), measured faster on that
+# it under PDL uses; ``_csrt`` a 4-way cluster split-K decode program's closing
+# cluster barrier arriving relaxed after a tcgen05 fence), measured faster on that
 # architecture's rows of the cell; ``route_twins(arch)`` reads it.  Generated
 # from the Cake measurement sweeps recorded in the source repository; do not
 # edit by hand.
@@ -1315,6 +1316,9 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         "12,1,4096": {
             "quant:u1": "quant:u1_xef_qel",
         },
+        "12,28,64": {
+            "decode:t32_p4_cs4_pf1": "decode:t32_p4_cs4_pf1_csrt",
+        },
         "12,28,256": {
             "quant:u1": "quant:u1_xef_qel",
         },
@@ -1583,6 +1587,9 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         },
         "12,1,4096": {
             "quant:u1": "quant:u1_xef_qel",
+        },
+        "12,28,64": {
+            "decode:t32_p4_cs4_pf1": "decode:t32_p4_cs4_pf1_csrt",
         },
         "12,28,256": {
             "quant:u1": "quant:u1_xef_qel",
