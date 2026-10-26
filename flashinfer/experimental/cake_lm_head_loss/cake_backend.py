@@ -2276,6 +2276,19 @@ def make_plan(
             )
             for _, rows_c in chunks
         )
+    if need_dx and dx_tuning.get("split"):
+        # the ``_split`` grid carries ``W + F`` clusters and runs those from ``W - F`` on as the half items of the last
+        # ``F`` wide items: ``F < 0`` leaves wide items unrun, ``F > W`` maps half items to negative items
+        explicit_f = int(dx_tuning["split"])
+        for i, (_, rows_c) in enumerate(chunks):
+            wide, _ = dx_wide_items(
+                rows_c, problem.hidden, num_sms, slices[i] if slices else 1, geometry
+            )
+            if not 1 <= explicit_f <= wide:
+                raise ValueError(
+                    f"gemm_tuning dx split={explicit_f}: the split-tail form runs 1 .. W of a chunk's W wide dX items "
+                    f"as half items; the chunk of {rows_c} rows has W = {wide}"
+                )
     variants: tuple[ChunkVariants, ...] = ()
     if arch is not None or tuning:
         variants = tuple(

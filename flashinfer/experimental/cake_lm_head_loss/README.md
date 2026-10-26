@@ -466,7 +466,7 @@ workspace; the logits GEMM's output descriptor covers the chunk's rows only.
 The registry holds one record per architecture (`sm_100a`, `sm_103a`),
 `cake_lm_head_loss_<arch>`, geometry-free (`H` / `V` and the rules' outputs are
 launch scalars: every `H` a multiple of 512 and `V` a multiple of 256 runs on
-it), with the sixteen base stages above plus the fifteen structural forms the
+it), with the sixteen base stages above plus the thirteen structural forms the
 rules can reach (`abi = lm_head_loss_v1`), exported from the kernel snapshot
 named in the pull request.
 

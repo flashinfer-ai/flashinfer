@@ -2197,6 +2197,49 @@ def test_make_plan_explicit_gemm_tuning_wins_over_the_rules():
     ) == {"dw": {"epi_store": "tma", "group_m": None}}
 
 
+def test_make_plan_explicit_dx_split_runs_1_to_w_wide_items():
+    """An explicit dX ``split`` runs 1 .. W of the chunk's W wide items as half items (the ``_split`` grid carries
+    ``W + F`` clusters): ``F = 1`` and ``F = W`` plan the split-tail form, a value below 1 or above W raises, ``None``
+    and 0 plan the plain form."""
+    g = Geometry.from_record({"geometry": {"hidden": 7168, "vocab": 129280}})
+    kw = dict(
+        need_dx=True,
+        need_dw=True,
+        geometry=g,
+        dx_max_slices=4,
+        num_sms=148,
+        dx_resident=74,
+        fuse_dw_cast=True,
+        arch="sm_100a",
+    )
+    problem = _problem(3943, 7168, 129280, 4096)  # one chunk of 3943 rows
+    k = cake_backend.make_plan(problem, **kw).dx_slices_of(0)
+    wide, _ = cake_backend.dx_wide_items(3943, 7168, 148, k, g)
+    assert (
+        k > 1 and wide == 16 * 14 * k
+    )  # 16 row-tile pairs x 14 column tiles of 512 x k slices
+    for split in (1, wide):
+        plan = cake_backend.make_plan(
+            problem, gemm_tuning={"dx": {"split": split}}, **kw
+        )
+        assert plan.chunks == ((0, 3943),) and plan.variants_of(0).dx_split == split
+        assert plan.dx_stage_of(0).endswith("_split")
+    for split in (-1, wide + 1):
+        with pytest.raises(ValueError, match=rf"split={split}:.* W = {wide}$"):
+            cake_backend.make_plan(problem, gemm_tuning={"dx": {"split": split}}, **kw)
+    for split in (None, 0):
+        plain = cake_backend.make_plan(
+            problem, gemm_tuning={"dx": {"split": split}}, **kw
+        )
+        assert plain.variants_of(0).dx_split is None
+        assert not plain.dx_stage_of(0).endswith("_split")
+    # a plan without dX (the log-probability forward, a frozen X) runs no split form and does not check the knob
+    # against a one-slice chunk's items: W of k > 1 slices exceeds them
+    cake_backend.make_plan(
+        problem, gemm_tuning={"dx": {"split": wide}}, **{**kw, "need_dx": False}
+    )
+
+
 def test_gemm_tuning_default_is_no_knob():
     """``gemm_tuning`` is a keyword: ``None`` (the default) pins nothing and the backend reads no environment variable;
     the knobs are part of the binding key; an explicit knob plans the pinned variant on the reference path."""
