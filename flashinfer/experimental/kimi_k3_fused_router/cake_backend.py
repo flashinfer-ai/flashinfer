@@ -76,7 +76,9 @@ THREADS = 224
 NUM_WARPS = THREADS // 32
 OWNER_CTAS = NUM_EXPERTS // NUM_WARPS
 # Arms L / LP: one-join plan builder; admits at most this many tokens and
-# launches at least ARM_L_MIN_GRID CTAs (the plan owners) whatever num_tokens is.
+# launches ARM_L_MIN_GRID CTAs (the plan owners) whatever num_tokens is, or the
+# persistent grid cap if that is smaller: the owners stride over the experts by
+# the owner count, so any grid publishes the whole plan.
 ARM_L_MAX_TOKENS = 128
 ARM_L_MIN_GRID = 128
 # Arm LP: the L body with the bias and first-row logits loads issued before the
@@ -94,7 +96,9 @@ ARM_LC_TOKENS = (1, 2, 4, 8, 16)
 ARM_GW_CTAS_PER_SM = {(10, 0): 4, (10, 3): 4}
 # Arm M: one-join bitmap plan builder.  Its owner scratch is sized per
 # architecture: 256 rows on SM100 (the kernel measured at the 256-token cell),
-# 2048 rows on SM103.
+# 2048 rows on SM103.  CTA b < OWNER_CTAS publishes experts 7b to 7b + 6 and no
+# other CTA does, so the launch needs OWNER_CTAS co-resident CTAs (as the Q4S
+# family does).
 ARM_M_MAX_TOKENS = {(10, 0): 256, (10, 3): 2048}
 # Arm Q4S: 4-CTA clusters, kernel compiled with __launch_bounds__(224, 4); grid =
 # min(num_tokens, 4 x SM count, co-resident cluster capacity) in whole clusters.
@@ -326,6 +330,11 @@ def launch_grid(
             raise RuntimeError(
                 f"arm M admits {OWNER_CTAS} <= num_tokens <= {max_tokens} on compute "
                 f"capability {compute_capability}"
+            )
+        if grid_x < OWNER_CTAS:
+            raise RuntimeError(
+                f"arm M needs {OWNER_CTAS} co-resident owner CTAs; the device admits "
+                f"{cap} persistent CTAs"
             )
         return grid_x
     if arm in ARM_Q4S_FAMILY:

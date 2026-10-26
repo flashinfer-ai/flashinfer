@@ -16,6 +16,11 @@ limitations under the License.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import torch
 import torch.nn.functional as F
 import pytest
@@ -55,8 +60,10 @@ def _skip_if_not_supported(backend, use_cp):
         pytest.skip("cake_gdn prefill requires SM100, SM103 or SM107")
     if backend == "cake_gdn" and use_cp is True and (major, minor) == (10, 7):
         pytest.skip("Cake GDN CP prefill is not provided on SM107")
-    if major not in (9, 10, 12):
-        pytest.skip("state_indices GDN prefill path requires SM90, SM100, or SM120")
+    if major not in (8, 9, 10, 12):
+        pytest.skip(
+            "state_indices GDN prefill path requires SM8x, SM90, SM100, or SM120"
+        )
     cuda_version = tuple(
         int(part) for part in (torch.version.cuda or "0.0").split(".")[:2]
     )
@@ -640,3 +647,78 @@ def test_prefill_state_indices_none_is_default(backend, use_cp):
     torch.cuda.synchronize()
     assert torch.equal(o1, o2)
     assert torch.equal(f1, f2)
+
+
+@pytest.mark.parametrize("use_cp", [False, True])
+def test_prefill_state_indices_pools_of_different_sizes(use_cp):
+    """Separate initial and output pools keep their own size, padding and strides."""
+    _skip_if_not_supported("flashinfer", use_cp)
+    device = torch.device("cuda")
+    *inputs, init_state = _make_inputs([256, 512], 8, 128, torch.bfloat16, device, 0)
+    packed_output, packed_final = _run(
+        *inputs, init_state, torch.empty_like(init_state), None, use_cp, "flashinfer"
+    )
+
+    perm = [3, 1]
+    in_pool = _make_pool(init_state, perm, 9, 96, init_state.dtype, device)
+    out_pool = _make_pool(
+        torch.zeros_like(init_state), [], 5, 0, init_state.dtype, device, 2
+    )
+    idx = torch.tensor(perm, dtype=torch.int32, device=device)
+    output, _ = _run(*inputs, in_pool, out_pool, idx, use_cp, "flashinfer")
+    assert torch.equal(packed_output, output)
+    assert torch.equal(packed_final, out_pool[perm])
+    assert not out_pool[[0, 2, 4]].any()
+
+
+def _run_invalid_slot_child(use_cp):
+    """Launch with a slot past the pool, in a child: the device assert poisons CUDA."""
+    device = torch.device("cuda")
+    q, k, v, g, beta, cu_seqlens, init_state = _make_inputs(
+        [128], 8, 128, torch.bfloat16, device, seed=0
+    )
+    pool = _make_pool(init_state, [1], 3, 0, torch.float32, device)
+    idx = torch.tensor([pool.shape[0]], dtype=torch.int32, device=device)
+    _run(q, k, v, g, beta, cu_seqlens, pool, pool, idx, use_cp, "flashinfer")
+    torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("use_cp", [False, True])
+def test_prefill_state_indices_out_of_pool_fails_in_isolated_process(use_cp):
+    """An id past the pool is caught; unchecked, it silently hits a neighbour tensor."""
+    repo_root = Path(__file__).resolve().parents[2]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(repo_root), *([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])]
+    )
+    env["FLASHINFER_CAKE_GDN_VALIDATE_SLOTS"] = "1"
+    completed = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), "--invalid-slot", str(use_cp)],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        env=env,
+    )
+    combined = completed.stdout + completed.stderr
+    # Only a line starting with the marker is a skip.
+    skips = [ln for ln in combined.splitlines() if ln.startswith("SKIP:")]
+    if skips:
+        pytest.skip(skips[-1])
+    assert completed.returncode != 0, combined
+    assert "_assert_async_cuda_kernel" in combined, combined
+    assert "GDN prefill state_indices must contain slots in" in combined, combined
+
+
+if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--invalid-slot":
+    # A plain script: the parent turns this marker into the skip.
+    if not torch.cuda.is_available():
+        print("SKIP: no CUDA device")
+    elif get_compute_capability(torch.device("cuda"))[0] not in (8, 9, 10, 12):
+        print("SKIP: no GDN prefill kernel for this device")
+    elif (
+        is_sm100a_supported(torch.device("cuda"))
+        and (int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0) < 13
+    ):
+        print("SKIP: SM100 GDN prefill requires CUDA 13+")
+    else:
+        _run_invalid_slot_child(sys.argv[2] == "True")

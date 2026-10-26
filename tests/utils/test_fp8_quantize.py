@@ -626,19 +626,177 @@ def test_mxfp8_grouped_quantize_cake_fake_op_metadata(batch_shape):
 )
 def test_cake_grouped_mxfp8_quantize_grid_formula(b, m, blocks_per_row, expected_x):
     """The public grid helper spells the launch: ceil(blocks / CTA width) CTAs per
-    row, one CTA row per M and one grid slice per group, for both programs."""
+    row, one CTA row per M and one grid slice per group, for every program that
+    is not row-tiled."""
     from flashinfer.jit.cake_grouped_mxfp8_quantize import PROGRAMS
     from flashinfer.quantization.fp8_quantization import (
         cake_grouped_mxfp8_quantize_grid,
     )
 
-    assert len(PROGRAMS) == 2
-    for program in PROGRAMS:
+    assert len(PROGRAMS) == 12
+    untiled = [program for program in PROGRAMS if "ROWS" not in program.args]
+    assert len(untiled) == 4
+    for program in untiled:
         threads = program.block[0]
         assert threads == 128
         grid = cake_grouped_mxfp8_quantize_grid(program, b, m, blocks_per_row)
         assert grid == (expected_x, m, b)
         assert (grid[0] - 1) * threads < blocks_per_row <= grid[0] * threads
+
+
+@pytest.mark.parametrize(
+    ("b", "m", "blocks_per_row", "expected"),
+    [
+        (32, 1024, 224, (2, 512, 32)),  # two rows a thread, one row a CTA
+        (32, 1024, 128, (1, 512, 32)),
+        (32, 1024, 8, (1, 32, 32)),  # 16 rows side by side, 32 rows a CTA
+        (17, 1000, 36, (1, 167, 17)),  # 3 rows side by side: the last CTA runs past M
+        (4, 1, 4, (1, 1, 4)),
+    ],
+)
+def test_cake_grouped_mxfp8_quantize_grid_of_the_tiled_programs(
+    b, m, blocks_per_row, expected
+):
+    """A tiled program's CTA row covers two rows a thread times the rows side by
+    side (128 // blocks_per_row for rows of fewer than 128 blocks)."""
+    from flashinfer.jit.cake_grouped_mxfp8_quantize import TILED_BF16, TILED_F16
+    from flashinfer.quantization.fp8_quantization import (
+        cake_grouped_mxfp8_quantize_grid,
+    )
+
+    for program in (TILED_BF16, TILED_F16):
+        assert "ROWS" in program.args and "SUBROWS" in program.args
+        assert (
+            cake_grouped_mxfp8_quantize_grid(program, b, m, blocks_per_row) == expected
+        )
+
+
+@pytest.mark.parametrize(
+    ("b", "m", "blocks_per_row", "expected"),
+    [
+        (32, 1024, 224, (1, 512, 32)),  # two rows a thread, one 224-thread CTA a row
+        (16, 1025, 224, (1, 513, 16)),
+        (32, 1024, 200, (1, 512, 32)),  # 24 threads idle
+        (32, 1024, 256, (2, 512, 32)),  # a second, partial CTA a row
+        (32, 1024, 8, (1, 19, 32)),  # 28 rows side by side, 56 rows a CTA
+        (17, 1000, 36, (1, 84, 17)),  # 6 rows side by side: the last CTA runs past M
+    ],
+)
+def test_cake_grouped_mxfp8_quantize_grid_of_the_wide_programs(
+    b, m, blocks_per_row, expected
+):
+    """A wide tiled program has 224-thread CTAs: rows of fewer than 224 blocks sit
+    224 // blocks_per_row side by side."""
+    from flashinfer.jit.cake_grouped_mxfp8_quantize import (
+        TILED_BF16,
+        TILED_WIDE_BF16,
+        TILED_WIDE_F16,
+    )
+    from flashinfer.quantization.fp8_quantization import (
+        cake_grouped_mxfp8_quantize_grid,
+    )
+
+    for program in (TILED_WIDE_BF16, TILED_WIDE_F16):
+        assert program.block == (224, 1, 1) and program.args == TILED_BF16.args
+        assert (
+            cake_grouped_mxfp8_quantize_grid(program, b, m, blocks_per_row) == expected
+        )
+
+
+@pytest.mark.parametrize(
+    ("stem", "threads", "b", "m", "blocks_per_row", "expected"),
+    [
+        ("TILED_K4096", 256, 16, 1024, 128, (1, 256, 16)),  # 2 rows side by side
+        ("TILED_K4096", 256, 32, 1025, 128, (1, 257, 32)),
+        ("TILED_K2048", 128, 32, 1024, 64, (1, 256, 32)),  # 2 rows side by side
+        ("TILED_K2048", 128, 16, 1023, 64, (1, 256, 16)),
+    ],
+)
+def test_cake_grouped_mxfp8_quantize_grid_of_the_k_routed_programs(
+    stem, threads, b, m, blocks_per_row, expected
+):
+    """The K = 4096 and K = 2048 tiled programs take the tiled kernel's
+    arguments; their CTAs hold two rows of their K side by side."""
+    import flashinfer.jit.cake_grouped_mxfp8_quantize as loader
+    from flashinfer.quantization.fp8_quantization import (
+        cake_grouped_mxfp8_quantize_grid,
+    )
+
+    for suffix in ("BF16", "F16"):
+        program = getattr(loader, f"{stem}_{suffix}")
+        assert program.block == (threads, 1, 1)
+        assert program.args == loader.TILED_BF16.args
+        assert (
+            cake_grouped_mxfp8_quantize_grid(program, b, m, blocks_per_row) == expected
+        )
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected"),
+    [
+        ((2, 256, 4096), "BULK"),  # 4 MiB of input: the largest bulk problem
+        ((3, 200, 160), "BULK"),
+        ((2, 257, 4096), "ROW2D"),  # one row past 4 MiB
+        ((8, 512, 2048), "ROW2D"),
+        ((64, 128, 4096), "ROW2D"),
+        ((16, 1024, 4096), "TILED_K4096"),  # 16384 rows
+        ((32, 1024, 4096), "TILED_K4096"),
+        ((16, 1024, 2048), "TILED_K2048"),
+        ((32, 1024, 2048), "TILED_K2048"),
+        ((32, 1024, 4128), "TILED"),  # the K-routed programs take their K only
+        ((32, 1024, 8192), "TILED"),
+        ((32, 1024, 7168), "TILED_WIDE"),  # 224 blocks a row: one 224-thread CTA
+        ((16, 1024, 7168), "TILED_WIDE"),
+        ((16, 1023, 7168), "ROW2D"),  # one row short of 16384
+        ((32, 1024, 6144), "TILED"),
+        ((32, 1024, 7136), "TILED"),
+        ((32, 1024, 7200), "TILED"),
+        ((1, 16384, 256), "TILED"),
+        ((4, 4, 0), "ROW2D"),  # no K block: the row-2D kernel writes the padding
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_cake_grouped_mxfp8_quantize_program_selection(shape, expected, dtype):
+    """The host selects the program from B, M, K and the dtype alone."""
+    import flashinfer.jit.cake_grouped_mxfp8_quantize as loader
+    from flashinfer.quantization.fp8_quantization import (
+        cake_grouped_mxfp8_quantize_program,
+    )
+
+    suffix = "BF16" if dtype == torch.bfloat16 else "F16"
+    name = suffix if expected == "ROW2D" else f"{expected}_{suffix}"
+    assert cake_grouped_mxfp8_quantize_program(dtype, *shape) is getattr(loader, name)
+
+
+@pytest.mark.parametrize(
+    ("shape", "padded_k", "expected"),
+    [
+        ((2, 128, 128), 128, "BULK"),  # round_up(K, 128): the bulk program
+        ((2, 128, 128), 4224, "ROW2D"),  # 132 blocks a row: a second CTA past K
+        ((3, 200, 160), 256, "BULK"),
+        ((3, 200, 160), 384, "ROW2D"),
+        ((16, 1024, 4096), 4096, "TILED_K4096"),
+        ((16, 1024, 4096), 4224, "ROW2D"),
+        ((16, 1024, 2048), 2048, "TILED_K2048"),
+        ((16, 1024, 2048), 2176, "ROW2D"),
+        ((16, 1024, 7168), 7168, "TILED_WIDE"),
+        ((16, 1024, 7168), 7296, "ROW2D"),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_cake_grouped_mxfp8_quantize_program_selection_padded_rows(
+    shape, padded_k, expected, dtype
+):
+    """Rows padded wider than round_up(K, 128) keep the row-2D program."""
+    import flashinfer.jit.cake_grouped_mxfp8_quantize as loader
+    from flashinfer.quantization.fp8_quantization import (
+        cake_grouped_mxfp8_quantize_program,
+    )
+
+    suffix = "BF16" if dtype == torch.bfloat16 else "F16"
+    name = suffix if expected == "ROW2D" else f"{expected}_{suffix}"
+    program = cake_grouped_mxfp8_quantize_program(dtype, *shape, padded_k)
+    assert program is getattr(loader, name)
 
 
 def test_cake_grouped_mxfp8_quantize_grid_reads_the_program_block():
@@ -688,6 +846,122 @@ def test_mxfp8_grouped_quantize_cake_exact(batch_shape, dtype):
             atol=0,
         )
         got_scale = _unswizzle_mxfp8_scales_128x4(out_scale[group], m, padded_k)
+        expected_scale = _unswizzle_mxfp8_scales_128x4(ref_scale, m, padded_k)
+        torch.testing.assert_close(
+            got_scale[:valid_rows], expected_scale[:valid_rows], rtol=0, atol=0
+        )
+
+
+def _cake_mask_values(b: int, m: int) -> list:
+    """Full, half, nearly full, empty and single-row groups in turn."""
+    pattern = [m, m // 2, max(1, m - 7), 0, 1]
+    return [pattern[group % len(pattern)] for group in range(b)]
+
+
+@pytest.mark.parametrize(
+    "batch_shape",
+    [
+        (8, 512, 2048),  # row-2D
+        (16, 1024, 4096),  # K = 4096, two rows side by side
+        (17, 1000, 1056),  # tiled, three rows side by side, the last CTA past M
+        (32, 1024, 256),  # tiled, sixteen rows side by side
+        (16, 1024, 8192),  # tiled, two K tiles a row
+        (16, 1025, 7168),  # wide, one CTA a row, odd M
+        (16, 1024, 2048),  # K = 2048, two rows side by side
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@torch.inference_mode()
+def test_mxfp8_grouped_quantize_cake_exact_programs(batch_shape, dtype):
+    """The row-2D and row-tiled programs match the reference's valid output bits
+    and scale bytes (the bulk program is test_mxfp8_grouped_quantize_cake_exact's)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    if not is_cake_grouped_mxfp8_available(dtype):
+        pytest.skip(
+            f"a generated Cake grouped MXFP8 profile for {dtype} is not installed"
+        )
+
+    torch.manual_seed(20261025)
+    b, m, k = batch_shape
+    x = (torch.randn(batch_shape, dtype=torch.float32, device="cuda") * 16).to(dtype)
+    mask_values = _cake_mask_values(b, m)
+    mask = torch.tensor(mask_values, dtype=torch.int32, device="cuda")
+    out, out_scale = mxfp8_grouped_quantize(x, mask, backend="cake")
+    out = out.permute(2, 0, 1)
+    out_scale = out_scale.permute(5, 2, 4, 0, 1, 3)
+    padded_k = (k + 127) // 128 * 128
+
+    for group, valid_rows in enumerate(mask_values):
+        if valid_rows == 0:
+            continue
+        ref, ref_scale = mxfp8_quantize_reference(
+            x[group], alignment=128, sf_swizzle_layout=SfLayout.layout_128x4
+        )
+        torch.testing.assert_close(
+            out[group, :valid_rows].contiguous().view(torch.uint8),
+            ref[:valid_rows].contiguous().view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+        got_scale = _unswizzle_mxfp8_scales_128x4(out_scale[group], m, padded_k)
+        expected_scale = _unswizzle_mxfp8_scales_128x4(ref_scale, m, padded_k)
+        torch.testing.assert_close(
+            got_scale[:valid_rows], expected_scale[:valid_rows], rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize(
+    ("batch_shape", "padded_k"),
+    [
+        ((2, 128, 128), 4224),  # 132 blocks a row: one CTA of each row past K
+        ((3, 200, 160), 384),
+        ((16, 1024, 256), 512),  # 16384 rows
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@torch.inference_mode()
+def test_cake_grouped_mxfp8_quantize_launch_wider_padded_rows(
+    batch_shape, padded_k, dtype
+):
+    """Caller-owned rows padded wider than round_up(K, 128) match the reference
+    of the zero-padded input on every valid row, the padding included."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    if not is_cake_grouped_mxfp8_available(dtype):
+        pytest.skip(
+            f"a generated Cake grouped MXFP8 profile for {dtype} is not installed"
+        )
+    from flashinfer.quantization.fp8_quantization import (
+        cake_grouped_mxfp8_quantize_launch,
+    )
+
+    torch.manual_seed(20261025)
+    b, m, k = batch_shape
+    padded_m = (m + 127) // 128 * 128
+    x = (torch.randn(batch_shape, dtype=torch.float32, device="cuda") * 16).to(dtype)
+    mask_values = _cake_mask_values(b, m)
+    mask = torch.tensor(mask_values, dtype=torch.int32, device="cuda")
+    quantized = torch.empty((b, m, padded_k), dtype=torch.float8_e4m3fn, device="cuda")
+    scales = torch.empty(
+        (b, padded_m, padded_k // 32), dtype=torch.uint8, device="cuda"
+    )
+    cake_grouped_mxfp8_quantize_launch(x, mask, quantized, scales)
+    scales = scales.view(b, padded_m // 128, padded_k // 128, 32, 4, 4)
+
+    for group, valid_rows in enumerate(mask_values):
+        if valid_rows == 0:
+            continue
+        ref, ref_scale = mxfp8_quantize_reference(
+            x[group], alignment=padded_k, sf_swizzle_layout=SfLayout.layout_128x4
+        )
+        torch.testing.assert_close(
+            quantized[group, :valid_rows].view(torch.uint8),
+            ref[:valid_rows].contiguous().view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+        got_scale = _unswizzle_mxfp8_scales_128x4(scales[group], m, padded_k)
         expected_scale = _unswizzle_mxfp8_scales_128x4(ref_scale, m, padded_k)
         torch.testing.assert_close(
             got_scale[:valid_rows], expected_scale[:valid_rows], rtol=0, atol=0

@@ -112,7 +112,7 @@ kernel_cake_kimi_k3_attn_res_d303ab9caf060fc8ad8d(__nv_bfloat16* __restrict__ ou
     float* output_norm_scalar = reinterpret_cast<float*>(smem_raw + 160);
     const int output_norm_scalar_addr = smem + 160;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     asm volatile("griddepcontrol.wait;" ::: "memory");
     unsigned long long row = (unsigned long long)bid;
     unsigned long long out_base = row * out_stride;

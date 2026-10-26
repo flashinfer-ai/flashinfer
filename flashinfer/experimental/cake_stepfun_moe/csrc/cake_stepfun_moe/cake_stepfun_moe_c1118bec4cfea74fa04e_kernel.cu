@@ -159,9 +159,6 @@ kernel_cake_stepfun_moe_c1118bec4cfea74fa04e(const __grid_constant__ CUtensorMap
 
     // Kernel post-init ops
     const int tmem_accum = taddr;
-
-    // ---- Ordered hardware-WG register redistribution ----
-    // Dec phase frees registers before any WG attempts inc.
     if (warp >= 4 && warp <= 7) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 96;");
     }
@@ -576,8 +573,7 @@ kernel_cake_stepfun_moe_c1118bec4cfea74fa04e(const __grid_constant__ CUtensorMap
                         :: "r"(exit_bar_addr), "r"(0) : "memory");
                     mbarrier_wait(exit_bar_addr, 0);
                 }
-                int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
-                asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;" :: "r"(_tmem_dealloc_addr), "r"(128));
+                asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(128));
             }
         }
     }
@@ -661,7 +657,7 @@ kernel_cake_stepfun_moe_c1118bec4cfea74fa04e(const __grid_constant__ CUtensorMap
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"((tmem_accum + (acc_stage_1 * 64))), "r"(((((iter_k == 0) ? 1 : 0)) ? 0 : 1)));
+                    :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"((tmem_accum + (acc_stage_1 * 64))), "r"(((((iter_k == 0) ? 1 : 0)) ? 0 : 1)) : "memory");
                                 elect_commit_cg2_multicast(k_done_addr + (stage) * 8, (uint16_t)(3));
                                 if (iter_k + 1 == K_tiles) {
                                     elect_commit_cg2_multicast(mma_full_addr + (acc_stage_1) * 8, (uint16_t)(3));

@@ -38,7 +38,7 @@ kernel_cake_stepfun_moe_7517857ff7d76e0dc9b8(const __nv_bfloat16* in_ptr, const 
 
     const int cta_rank = 0;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     asm volatile("griddepcontrol.wait;" ::: "memory");
     int hidden_start = tid + blockDim.x * blockIdx.x;
     int hidden_stride = blockDim.x * gridDim.x;
@@ -202,44 +202,44 @@ kernel_cake_stepfun_moe_7517857ff7d76e0dc9b8(const __nv_bfloat16* in_ptr, const 
                 value[7] = _vec_load_15[0];
             }
             if (permuted[0] != -1) {
-                float _fma_0;
-                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_0) : "f"(scale[0]), "f"(value[0]), "f"(data));
-                data = _fma_0;
+                float _fma_8;
+                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_8) : "f"(scale[0]), "f"(value[0]), "f"(data));
+                data = _fma_8;
             }
             if (permuted[1] != -1) {
-                float _fma_1;
-                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_1) : "f"(scale[1]), "f"(value[1]), "f"(data));
-                data = _fma_1;
+                float _fma_9;
+                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_9) : "f"(scale[1]), "f"(value[1]), "f"(data));
+                data = _fma_9;
             }
             if (permuted[2] != -1) {
-                float _fma_2;
-                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_2) : "f"(scale[2]), "f"(value[2]), "f"(data));
-                data = _fma_2;
+                float _fma_10;
+                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_10) : "f"(scale[2]), "f"(value[2]), "f"(data));
+                data = _fma_10;
             }
             if (permuted[3] != -1) {
-                float _fma_3;
-                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_3) : "f"(scale[3]), "f"(value[3]), "f"(data));
-                data = _fma_3;
+                float _fma_11;
+                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_11) : "f"(scale[3]), "f"(value[3]), "f"(data));
+                data = _fma_11;
             }
             if (permuted[4] != -1) {
-                float _fma_4;
-                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_4) : "f"(scale[4]), "f"(value[4]), "f"(data));
-                data = _fma_4;
+                float _fma_12;
+                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_12) : "f"(scale[4]), "f"(value[4]), "f"(data));
+                data = _fma_12;
             }
             if (permuted[5] != -1) {
-                float _fma_5;
-                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_5) : "f"(scale[5]), "f"(value[5]), "f"(data));
-                data = _fma_5;
+                float _fma_13;
+                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_13) : "f"(scale[5]), "f"(value[5]), "f"(data));
+                data = _fma_13;
             }
             if (permuted[6] != -1) {
-                float _fma_6;
-                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_6) : "f"(scale[6]), "f"(value[6]), "f"(data));
-                data = _fma_6;
+                float _fma_14;
+                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_14) : "f"(scale[6]), "f"(value[6]), "f"(data));
+                data = _fma_14;
             }
             if (permuted[7] != -1) {
-                float _fma_7;
-                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_7) : "f"(scale[7]), "f"(value[7]), "f"(data));
-                data = _fma_7;
+                float _fma_15;
+                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_15) : "f"(scale[7]), "f"(value[7]), "f"(data));
+                data = _fma_15;
             }
             *(reinterpret_cast<__nv_bfloat16*>(out_ptr + (token_idx * hidden_dim + hidden_idx)) + (0)) = __float2bfloat16_rn(data);
         }

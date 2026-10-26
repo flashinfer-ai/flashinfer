@@ -669,6 +669,7 @@ def _sorted_gemm_tile(
     WRITE_AMAX: ConstBool,
     GRID_N: ConstInt,
     assignments,
+    K: ConstInt,
 ):
     padded = ct.load(POST_PAD, (0,), (1,)).item()
     if mblock * TM < padded:
@@ -676,7 +677,13 @@ def _sorted_gemm_tile(
         accumulator = ct.full((TM, TN), 0, ct.float32)
         up_accumulator = ct.full((TM, TN), 0, ct.float32)
         num_output_blocks = ct.cdiv(OUT.shape[1], TN)
-        for ktile in range(ct.cdiv(X.shape[1], TK)):
+        # Preserve the existing normal-index schedule. Wide-index entry points
+        # pass model K explicitly to avoid an int64 tensor-shape loop bound.
+        if K == 0:
+            k_tiles = ct.cdiv(X.shape[1], TK)
+        else:
+            k_tiles = ct.cdiv(K, TK)
+        for ktile in range(k_tiles):
             a = ct.load(
                 X,
                 (mblock, ktile),
@@ -904,6 +911,7 @@ def _sorted_grouped_impl(
     WRITE_AMAX: ConstBool,
     GRID_N: ConstInt,
     assignments,
+    K: ConstInt,
 ):
     _sorted_gemm_tile(
         X,
@@ -933,6 +941,7 @@ def _sorted_grouped_impl(
         WRITE_AMAX,
         GRID_N,
         assignments,
+        K,
     )
 
 
@@ -963,6 +972,7 @@ def _sorted_grouped(
     WRITE_AMAX: ConstBool,
     GRID_N: ConstInt,
     assignments,
+    K: ConstInt,
 ):
     _sorted_grouped_impl(
         X,
@@ -990,6 +1000,7 @@ def _sorted_grouped(
         WRITE_AMAX,
         GRID_N,
         assignments,
+        K,
     )
 
 
@@ -1020,6 +1031,7 @@ def _sorted_grouped_i64(
     WRITE_AMAX: ConstBool,
     GRID_N: ConstInt,
     assignments,
+    K: ConstInt,
 ):
     _sorted_grouped_impl(
         X,
@@ -1047,6 +1059,7 @@ def _sorted_grouped_i64(
         WRITE_AMAX,
         GRID_N,
         assignments,
+        K,
     )
 
 
@@ -1078,6 +1091,7 @@ def _sorted_grouped_persistent(
     WRITE_AMAX: ConstBool,
     GRID_N: ConstInt,
     assignments,
+    K: ConstInt,
 ):
     padded = ct.load(POST_PAD, (0,), (1,)).item()
     iterations = (ct.cdiv(padded, TM) - ct.bid(0) + grid_m - 1) // grid_m
@@ -1110,6 +1124,7 @@ def _sorted_grouped_persistent(
             WRITE_AMAX,
             GRID_N,
             assignments,
+            K,
         )
 
 
@@ -1132,6 +1147,7 @@ def _sorted_grouped_gemm1_fused_mx_impl(
     P1: ConstFloat,
     P2: ConstFloat,
     P3: ConstFloat,
+    K: ConstInt,
 ):
     mblock = ct.bid(0)
     iblock = ct.bid(1)
@@ -1141,7 +1157,13 @@ def _sorted_grouped_gemm1_fused_mx_impl(
         num_intermediate_blocks = ct.cdiv(OUT.shape[1], TI)
         gate_accumulator = ct.zeros((TM, TI), dtype=ct.float32)
         up_accumulator = ct.zeros((TM, TI), dtype=ct.float32)
-        for ktile in range(ct.cdiv(X.shape[1], TK)):
+        # Preserve the existing normal-index schedule. Wide-index entry points
+        # pass model K explicitly to avoid an int64 tensor-shape loop bound.
+        if K == 0:
+            k_tiles = ct.cdiv(X.shape[1], TK)
+        else:
+            k_tiles = ct.cdiv(K, TK)
+        for ktile in range(k_tiles):
             activation = ct.load(
                 X,
                 (mblock, ktile),
@@ -1279,6 +1301,7 @@ def _sorted_grouped_gemm1_fused_mx(
     P1: ConstFloat,
     P2: ConstFloat,
     P3: ConstFloat,
+    K: ConstInt,
 ):
     _sorted_grouped_gemm1_fused_mx_impl(
         X,
@@ -1298,6 +1321,7 @@ def _sorted_grouped_gemm1_fused_mx(
         P1,
         P2,
         P3,
+        K,
     )
 
 
@@ -1320,6 +1344,7 @@ def _sorted_grouped_gemm1_fused_mx_i64(
     P1: ConstFloat,
     P2: ConstFloat,
     P3: ConstFloat,
+    K: ConstInt,
 ):
     _sorted_grouped_gemm1_fused_mx_impl(
         X,
@@ -1339,6 +1364,7 @@ def _sorted_grouped_gemm1_fused_mx_i64(
         P1,
         P2,
         P3,
+        K,
     )
 
 
@@ -1816,6 +1842,7 @@ def sorted_grouped_gemm(
             write_amax,
             grid_n,
             assignments,
+            x.shape[1] if use_i64 else 0,
         ),
     )
     if write_amax:
@@ -1842,9 +1869,10 @@ def sorted_grouped_gemm1_fused_mx(
     config,
     weight_fp4,
 ):
+    use_i64 = needs_int64_indexing(x, xs, w, ws, out, out_scale)
     kernel = (
         _sorted_grouped_gemm1_fused_mx_i64
-        if needs_int64_indexing(x, xs, w, ws, out, out_scale)
+        if use_i64
         else _sorted_grouped_gemm1_fused_mx
     )
     kernel = cached_replace_hints(kernel, occupancy=config.occupancy)
@@ -1870,6 +1898,7 @@ def sorted_grouped_gemm1_fused_mx(
             weight_fp4,
             activation.is_gated,
             *_activation_kernel_args(activation),
+            x.shape[1] if use_i64 else 0,
         ),
     )
 

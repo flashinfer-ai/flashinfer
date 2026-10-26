@@ -119,8 +119,11 @@ RANKS = (32, 64, 96, 128)
 # Coverage rows: the programs the two lists above do not reach under the
 # current route table (tactic 25: K 12288 at rank 32 between M 256 and 4095;
 # the rank 64 / 96 tail-split builds; the hinted-store persistent builds of
-# ranks 64 / 96 / 128 at a deep K).  Update them when the route table changes;
-# ``test_matrix_reaches_every_program`` says when a program is missed.
+# ranks 64 / 96 / 128 at a deep K; the K12288 form of the 64-row program at
+# M 129, whose K 12288 rows the split-K program takes; the form-A biased
+# 64-row program at M 129 on sm_103a, whose K 3072 rows the L2-promoted
+# builds take there -- a K 6144 row).  Update them when the route table
+# changes; ``test_matrix_reaches_every_program`` says when a program is missed.
 COVERAGE_ROWS: tuple[tuple[int, int, int, int, bool], ...] = (
     (333, 3072, 12288, 32, True),
     (6912, 3072, 12288, 64, True),
@@ -128,6 +131,9 @@ COVERAGE_ROWS: tuple[tuple[int, int, int, int, bool], ...] = (
     (4096, 3072, 12288, 64, True),
     (4096, 3072, 12288, 96, True),
     (4096, 3072, 12288, 128, True),
+    (129, 3072, 12544, 32, True),
+    (129, 3072, 12544, 32, False),
+    (129, 3072, 6144, 32, True),
 )
 CONTRACT_ROWS: tuple[tuple[int, int, int, int, bool], ...] = tuple(
     (m, CONTRACT_N, CONTRACT_K, rank, bias)
@@ -135,8 +141,11 @@ CONTRACT_ROWS: tuple[tuple[int, int, int, int, bool], ...] = tuple(
     for rank in RANKS
     for bias in (False, True)
 )
-# The exact-dispatch rows of the convergence finals per architecture:
-# (M, N, K, rank, bias) -> the program it dispatches to there (the shipped
+# The exact-dispatch rows per architecture: the split-K rows (the M 129 K 12288
+# rows of the architectures where the swap-AB split-K program measured faster),
+# the sm_103a M 129 K 3072 rows (the 64-row builds with the TMA L2 promotion of
+# the weight descriptors, shipped for sm_103a only) and the convergence finals'
+# rows; (M, N, K, rank, bias) -> the program it dispatches to there (the shipped
 # cake_r1 two-CTA r32 build on the held rows), the build keywords of those
 # programs, and the programs only one architecture's rows reach.
 _P = "cake_nvfp4_svdquant_gemm_"
@@ -144,21 +153,32 @@ EXACT_ROWS: dict[str, dict[tuple[int, int, int, int, bool], str]] = {
     "sm_100a": {
         (129, 3072, 3072, 128, False): _P + "8c21118cf9b080867cf1",
         (129, 3072, 3072, 128, True): _P + "2270204930b79b8caef7",
+        (129, 3072, 12288, 32, False): _P + "0a3a28f6f508e7d75146",
+        (129, 3072, 12288, 32, True): _P + "8958df827006875b2512",
+        (129, 3072, 12288, 128, False): _P + "0a3a28f6f508e7d75146",
+        (129, 3072, 12288, 128, True): _P + "8958df827006875b2512",
         (4096, 3072, 3072, 32, True): _P + "1d78f2bd5722fb02b75a",
         (4096, 12288, 3072, 32, True): _P + "2ca0cf40f7bbfca9df92",
         (6889, 3072, 3072, 32, True): _P + "fdcf777b3acd972f8841",
         (6912, 3072, 3072, 32, True): _P + "fdcf777b3acd972f8841",
         (6912, 3072, 3072, 64, True): _P + "d16d801db12c7bdde4dc",
-        (6912, 3072, 3072, 96, True): _P + "96eddeb7b3a643b34a21",
+        (6912, 3072, 3072, 96, True): _P + "0f7f27a483c337265bf9",
         (6912, 3072, 3072, 128, True): _P + "aa5225a75028cbb32391",
         (9216, 3072, 3072, 32, True): _P + "b4be925d9e1e6959b702",
-        (16384, 3072, 3072, 32, True): _P + "c832b08a912e4c58112b",
+        (16384, 3072, 3072, 32, True): _P + "c80322ffcfa97a956474",
         (16384, 12288, 3072, 32, True): _P + "b4be925d9e1e6959b702",
     },
     "sm_103a": {
-        (129, 3072, 3072, 96, True): _P + "44ec820136bf5bcde86e",
-        (129, 3072, 3072, 128, False): _P + "fed389c9e9cb9293bd29",
-        (129, 3072, 3072, 128, True): _P + "44ec820136bf5bcde86e",
+        (129, 3072, 3072, 32, False): _P + "8319e1548886614ab273",
+        (129, 3072, 3072, 32, True): _P + "99bdf6e03d704178faf9",
+        (129, 3072, 3072, 64, True): _P + "99bdf6e03d704178faf9",
+        (129, 3072, 3072, 96, True): _P + "01405277c4bbc4031fbd",
+        (129, 3072, 3072, 128, False): _P + "23bfc212699bbb4e6214",
+        (129, 3072, 3072, 128, True): _P + "01405277c4bbc4031fbd",
+        (129, 3072, 12288, 32, False): _P + "0a3a28f6f508e7d75146",
+        (129, 3072, 12288, 32, True): _P + "8958df827006875b2512",
+        (129, 3072, 12288, 128, False): _P + "0a3a28f6f508e7d75146",
+        (129, 3072, 12288, 128, True): _P + "8958df827006875b2512",
         (4096, 3072, 3072, 32, True): _P + "b4be925d9e1e6959b702",
         (6889, 3072, 3072, 32, True): _P + "fdcf777b3acd972f8841",
         (6912, 3072, 3072, 32, True): _P + "fdcf777b3acd972f8841",
@@ -169,6 +189,18 @@ EXACT_ROWS: dict[str, dict[tuple[int, int, int, int, bool], str]] = {
     },
 }
 EXACT_BUILDS: dict[str, dict[str, object]] = {
+    _P + "0a3a28f6f508e7d75146": {
+        "bias": False,
+        "split_k": 4,
+    },
+    _P + "8958df827006875b2512": {
+        "bias": True,
+        "split_k": 4,
+    },
+    _P + "0f7f27a483c337265bf9": {
+        "bias_path": "regs",
+        "rank": 96,
+    },
     _P + "1d78f2bd5722fb02b75a": {
         "clc_lead_kb": 8,
         "rank": 32,
@@ -184,10 +216,17 @@ EXACT_BUILDS: dict[str, dict[str, object]] = {
         "out_store": "v8hint",
         "rank": 32,
     },
-    _P + "44ec820136bf5bcde86e": {
+    _P + "99bdf6e03d704178faf9": {
+        "bias": True,
+        "epi": "fused64",
+        "l2_promotion": "l2_256b",
+        "prologue": "overlap",
+    },
+    _P + "01405277c4bbc4031fbd": {
         "bias": True,
         "epi": "fused64",
         "epi_alias": True,
+        "l2_promotion": "l2_256b",
         "prologue": "overlap",
         "stages": 16,
     },
@@ -202,10 +241,6 @@ EXACT_BUILDS: dict[str, dict[str, object]] = {
         "prologue": "overlap",
         "stages": 15,
     },
-    _P + "96eddeb7b3a643b34a21": {
-        "bias_path": "regs",
-        "rank": 96,
-    },
     _P + "aa5225a75028cbb32391": {
         "out_hint": "on",
         "out_store": "v8hint",
@@ -214,7 +249,7 @@ EXACT_BUILDS: dict[str, dict[str, object]] = {
     _P + "b4be925d9e1e6959b702": {
         "rank": 32,
     },
-    _P + "c832b08a912e4c58112b": {
+    _P + "c80322ffcfa97a956474": {
         "bias_path": "regs",
         "rank": 32,
     },
@@ -228,10 +263,17 @@ EXACT_BUILDS: dict[str, dict[str, object]] = {
         "out_store": "v8hint",
         "rank": 32,
     },
-    _P + "fed389c9e9cb9293bd29": {
+    _P + "8319e1548886614ab273": {
+        "bias": False,
+        "epi": "fused64",
+        "l2_promotion": "l2_256b",
+        "prologue": "overlap",
+    },
+    _P + "23bfc212699bbb4e6214": {
         "bias": False,
         "epi": "fused64",
         "epi_alias": True,
+        "l2_promotion": "l2_256b",
         "prologue": "overlap",
         "stages": 16,
     },
@@ -242,13 +284,15 @@ ARCH_ONLY: dict[str, set[str]] = {
         _P + "2270204930b79b8caef7",
         _P + "2ca0cf40f7bbfca9df92",
         _P + "8c21118cf9b080867cf1",
-        _P + "96eddeb7b3a643b34a21",
-        _P + "c832b08a912e4c58112b",
+        _P + "0f7f27a483c337265bf9",
+        _P + "c80322ffcfa97a956474",
     },
     "sm_103a": {
-        _P + "44ec820136bf5bcde86e",
+        _P + "01405277c4bbc4031fbd",
+        _P + "23bfc212699bbb4e6214",
         _P + "5dc32691ea15528b11be",
-        _P + "fed389c9e9cb9293bd29",
+        _P + "8319e1548886614ab273",
+        _P + "99bdf6e03d704178faf9",
     },
 }
 # (M, N, K, rank, bias) -> the substring of the ValueError the shape rule raises.
@@ -521,10 +565,18 @@ def test_registry_records_reference_the_build_manifest() -> None:
         assert plan["variant"] in loader.VARIANTS
         assert plan["grid_rule"] in loader.GRID_RULES
         assert plan["scale_elems"] in loader.SCALE_ELEMS
-        # M tiles are a multiple of the 128-row tensor-map box (the pair programs) or an even divisor of it (the
-        # 64-row programs).
+        # M tiles are a multiple of the 128-row tensor-map box (the pair programs), an even divisor of it (the
+        # 64-row programs) or the 136-row activation box of the split-K program, whose cluster is its
+        # ``split_k``.
         block_m = plan["block_m"]
-        assert block_m % loader.BLOCK_M == 0 or loader.BLOCK_M % block_m == 0, name
+        if plan["grid_rule"] == "splitk_cluster":
+            assert block_m == 136 and tuple(launch["cluster"]) == (
+                plan["split_k"],
+                1,
+                1,
+            ), name
+        else:
+            assert block_m % loader.BLOCK_M == 0 or loader.BLOCK_M % block_m == 0, name
         assert plan["block_n"] > 0
         assert plan["block_k"] % 64 == 0
         storage = plan["rank_storage"]
@@ -725,6 +777,8 @@ def test_launch_grid_follows_the_record_rule(m, n) -> None:
             assert units == full + (tiles - full) * 2 and split in (1, 2), name
             with pytest.raises(ValueError, match="sm_count"):
                 loader.launch_grid(record, m=m, n=n, k=3072)
+        elif rule == "splitk_cluster":
+            assert grid == (plan["split_k"] * grid_n, 1, 1), name
         else:
             pytest.fail(f"{name}: unknown grid rule {rule!r}")
         assert all(axis >= 1 for axis in grid), name
@@ -807,9 +861,10 @@ def test_two_cta_routes_pick_the_store_form_of_the_launch() -> None:
         record = loader.MODULES[name]
         assert record["plan"]["grid_rule"] == "pair_persistent", (n, k)
         assert record["build"]["out_store"] == form, (n, k, record["build"])
-    # Every tail-split route is a hinted launch, so the program ships hinted only.
-    for record in loader.MODULES.values():
-        if record["plan"]["grid_rule"] == "pair_tailsplit":
+    # The tail-split rows by rank are hinted launches, so those builds ship hinted;
+    # the exact-dispatch rows pin their own tail-split builds (EXACT_BUILDS).
+    for name, record in loader.MODULES.items():
+        if record["plan"]["grid_rule"] == "pair_tailsplit" and name not in EXACT_BUILDS:
             assert record["build"]["out_store"] == "v8hint"
 
 
@@ -825,12 +880,44 @@ def test_exact_rows_dispatch_per_architecture() -> None:
     assert reachable >= set(EXACT_ROWS[_arch()].values())
 
 
+def test_splitk_rows_fill_one_cluster_wave() -> None:
+    """Every exact row routed to a split-K record on this architecture meets the
+    kernel's K rule (``K_tiles = K / block_k`` a multiple of ``split_k``) and
+    launches ``N / 128`` clusters of ``split_k`` CTAs; the record ships for both
+    architectures and its other-architecture route is the form of that architecture."""
+    seen = 0
+    for row, name in EXACT_ROWS[_arch()].items():
+        record = loader.MODULES[name]
+        plan = record["plan"]
+        if plan["grid_rule"] != "splitk_cluster":
+            continue
+        seen += 1
+        m, n, k, rank, bias = row
+        assert (k // plan["block_k"]) % plan["split_k"] == 0, (row, name)
+        assert m <= plan["block_m"] and n % plan["block_n"] == 0, (row, name)
+        assert loader.launch_grid(record, m=m, n=n, k=k) == (
+            plan["split_k"] * (n // 128),
+            1,
+            1,
+        ), (row, name)
+        assert set(record["arches"]) == set(loader.ARCHES), name
+        assert record["build"] == {"bias": bias, "split_k": plan["split_k"]}, (
+            row,
+            name,
+        )
+    if seen == 0:
+        pytest.skip(f"no split-K route on {_arch()}")
+
+
 @pytest.mark.parametrize("bias", [False, True], ids=["nobias", "bias"])
 def test_m129_rows_route_by_k_class(bias) -> None:
     """The M 129 / N 3072 rows take the 64-row tactic-14 build of their K class:
     the K12288 form for K >= 12288 with K % 256 == 0, the K3072 form otherwise
     (including K % 256 != 0 and the K between the two classes); the bias form
-    follows the problem."""
+    follows the problem.  On an architecture whose exact rows name the split-K
+    program for K 12288, that row takes it instead; an exact row naming a
+    64-row build (the sm_103a K 3072 rows, whose builds promote the weight
+    loads to 256-byte L2 lines) takes that build of its K class."""
     for k, form in (
         (3072, M129_FORM_K3072),
         (3200, M129_FORM_K3072),
@@ -843,9 +930,26 @@ def test_m129_rows_route_by_k_class(bias) -> None:
             m=129, n=3072, k=k, rank=32, has_bias=bias, arch=_arch()
         )
         record = loader.MODULES[name]
-        assert record["build"] == {"bias": bias, **form}, (k, bias, record["build"])
+        exact = EXACT_ROWS[_arch()].get((129, 3072, k, 32, bias))
+        if exact is not None and record["plan"]["grid_rule"] == "splitk_cluster":
+            assert name == exact and record["build"] == EXACT_BUILDS[exact], (
+                k,
+                bias,
+                name,
+            )
+            assert record["plan"]["block_m"] == 136 and record["plan"]["block_k"] == 128
+        elif exact is not None:
+            assert name == exact and record["build"] == EXACT_BUILDS[exact], (
+                k,
+                bias,
+                name,
+            )
+            assert record["build"] == {"bias": bias, **form, "l2_promotion": "l2_256b"}
+            assert record["plan"]["block_m"] == 64 and record["plan"]["block_k"] == 128
+        else:
+            assert record["build"] == {"bias": bias, **form}, (k, bias, record["build"])
+            assert record["plan"]["block_m"] == 64 and record["plan"]["block_k"] == 128
         assert record["plan"]["variant"] == ("bias" if bias else "nobias")
-        assert record["plan"]["block_m"] == 64 and record["plan"]["block_k"] == 128
 
 
 def test_out_ptr_binds_the_out_tensor() -> None:

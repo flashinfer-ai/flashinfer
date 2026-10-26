@@ -154,7 +154,7 @@ def _nvfp4_impl(
     act_q: torch.Tensor,
     act_sf: torch.Tensor,
     out: torch.Tensor,
-    alpha: float,
+    o_weight_global_scale: torch.Tensor,
 ) -> None:
     _get_module().minimax_h3_sm120_nvfp4_out_proj(
         attn_out,
@@ -167,7 +167,7 @@ def _nvfp4_impl(
         act_q,
         act_sf,
         out,
-        alpha,
+        o_weight_global_scale,
     )
 
 
@@ -183,7 +183,7 @@ def _nvfp4_fake(
     act_q,
     act_sf,
     out,
-    alpha,
+    o_weight_global_scale,
 ) -> None:
     pass
 
@@ -416,7 +416,9 @@ def minimax_h3_nvfp4_out_proj(
     o_weight_sf : torch.Tensor
         uint8 UE4M3 block-16 weight scales in the FlashInfer 128x4 swizzled layout.
     o_weight_global_scale : float or torch.Tensor
-        FP32 per-tensor weight global scale ``448 * 6 / amax(W)``.
+        FP32 per-tensor weight global scale ``448 * 6 / amax(W)``.  The kernel reads both global
+        scales on the device and computes ``alpha = 1 / (act_global_scale * o_weight_global_scale)``
+        in FP64, rounded once to FP32, so the call does not synchronize with the host.
     act_global_scale : torch.Tensor
         FP32 ``[1]`` CUDA tensor, the calibrated activation global scale ``448 * 6 / amax``.
     gate : torch.Tensor
@@ -461,12 +463,14 @@ def minimax_h3_nvfp4_out_proj(
     if isinstance(o_weight_global_scale, torch.Tensor):
         if o_weight_global_scale.numel() != 1:
             raise ValueError("o_weight_global_scale must be a single value")
-        w_gs = float(o_weight_global_scale.item())
+        w_gs = o_weight_global_scale.reshape(1).to(device=device, dtype=torch.float32)
     else:
-        w_gs = float(o_weight_global_scale)
+        w_gs = torch.full(
+            (1,), float(o_weight_global_scale), dtype=torch.float32, device=device
+        )
+    w_gs = w_gs.contiguous()
     act_gs = act_global_scale.reshape(1).to(torch.float32).contiguous()
     _require("act_global_scale", act_gs, torch.float32, (1,), device)
-    alpha = 1.0 / (float(act_gs.item()) * w_gs)
     if act_q is None:
         act_q = torch.empty(
             (rows, MINIMAX_H3_ATTN_DIM // 2), dtype=torch.uint8, device=device
@@ -486,7 +490,7 @@ def minimax_h3_nvfp4_out_proj(
         act_q,
         act_sf,
         out,
-        alpha,
+        w_gs,
     )
     return out
 

@@ -310,6 +310,10 @@ void Run(TensorView a_A, TensorView a_B, TensorView a_SFA, TensorView a_SFB, Ten
   check_same_device(a_bias, a_A, "bias", "A");
   check_contiguous(a_out, "out");
   check_same_device(a_out, a_A, "out", "A");
+  TVM_FFI_CHECK((a_grid_n >= 1), ValueError)
+      << KERNEL_NAME << ": requires (grid_n >= 1)";
+  TVM_FFI_CHECK((a_N >= (a_grid_n * 128)), ValueError)
+      << KERNEL_NAME << ": requires (N >= (grid_n * 128))";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
   TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)

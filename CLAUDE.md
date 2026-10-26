@@ -122,6 +122,26 @@ Caveats:
 - The cache is per-devcontainer by design: sccache's local storage supports a
   single server at a time, so two containers must not share one cache directory.
 
+GitHub PR Test GPU jobs keep a different, per-runner cache: they set
+`CI_COMPILE_CACHE_DIR` to a directory under the runner's work directory, and
+`ci/bash.sh` namespaces it by runner and the pulled image's immutable ID.
+`CI_COMPILE_CACHE_MODE=read-only` (the default) mounts a read-only seed and runs
+against a private writable copy, discarded even after test failures. The PR Test
+workflow selects `read-write` only for pushes to `main`. A stable per-runner lock
+protects maintenance and execution, including accidentally shared workspaces.
+Other `ci/bash.sh` callers leave caching unset and run cold.
+Before each trusted writable job its runner's cache is cleared when it exceeds
+`CI_COMPILE_CACHE_MAX_MB`
+(default 40960) or its volume has less than `CI_COMPILE_CACHE_MIN_FREE_MB`
+(default 20480) free. Only content-keyed artifacts survive between jobs: CuTe-DSL (with
+`FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY=1`), TIRx, KDA PTX, Triton and downloaded
+cubins. nvcc modules, tuning results and the generated-source tree are pruned,
+since a fresh checkout rebuilds nvcc modules anyway. Each test job's
+`FLASHINFER_JIT_BUILD_LOG` is summarized per toolchain by
+`scripts/summarize_jit_builds.py` in the job summary.
+See [`ci/COMPILE_CACHE.md`](ci/COMPILE_CACHE.md) for lifecycle tests and trust
+boundaries.
+
 ## cuDNN linear attention
 
 Use `nvidia-cudnn-frontend>=1.31.0`; KDA and GDN normalization use additive
@@ -199,6 +219,11 @@ worker counts without GPU topology or measured memory capacity.
 Run the CPU-only coordinator suite with
 `pytest --confcutdir=tests/test_sharding tests/test_sharding/`.
 
+Collection stdout/stderr, including best-effort JIT prewarm warnings, is retained
+under `junit/collection-*/*.log` and uploaded with the public CI telemetry. Each
+collection gets a separate directory so concurrent collectors or later attempts
+preserve earlier diagnostics. Collection metadata remains temporary.
+
 Communication-test wrappers optionally emit cache-publication completion reports
 when `UNIT_TEST_RUN_STATUS_DIR` is set to a fresh directory unique to that wrapper
 and container/rank. `test_run_status.sh` records each pytest invocation, and
@@ -247,6 +272,51 @@ def test_hopper_attention():
 | FP8 GEMM | SM89+ | `get_compute_capability()[0] >= 9` |
 
 **Note:** `tests/conftest.py` auto-skips tests that trigger OOM, but tests should be written to avoid OOM by using appropriate problem sizes.
+
+### Attention plan and CUDA Graph lifetime
+
+When `auto` changes providers, an older captured call can still hold the previous
+provider's metadata pointers. Keep wrapper-owned tables and length buffers alive
+and refresh them in `plan()` whenever replay can still use them; `run()` must not
+rebuild or repack metadata. Validate transitions with changed page IDs as well as
+changed lengths, including replacing an owned table with a caller-supplied table
+of a different width. Shortening a KV prefix without changing page IDs can accidentally
+pass while the captured table is stale. A reserved page table can be wider than
+one graph's declared KV range: declare only that range while preserving the
+storage row stride and pointer. Include a backend-only provider control in
+capacity-lifetime tests, since FROST can accept an oversized descriptor that the
+backend rejects. Table capacity must cover initialized
+indices and rounded graph bounds; also test a fallback beyond cuDNN admission.
+An explicit KV maximum may be looser than the caller table's capacity. Intersect
+these two upper bounds when declaring the graph, using the same effective bound
+for the attention attribute and table slice; actual device lengths still mask
+the live tokens, without a host readback.
+Replay an old capture only with lengths inside its declared bounds and compatible
+buffers. Keep numerical and lifetime tests independent of heuristic winners and
+timing thresholds.
+
+FA2 captures also bind CPU-generated scheduling metadata, including output and
+merge prefixes. Updating only Q/KV indptr tensors after switching to cuDNN leaves
+that schedule stale when requests exchange query rows. In graph mode, keep FA2
+once it has been planned; eager auto selection can still change providers. Test
+FA2-first as well as cuDNN-first with changed Q partitions and page IDs.
+
+Auto dispatch must preserve run-time calibration scales for half-precision as
+well as FP8 inputs. Test non-unit Q/K scales with nontrivial logits, V scales
+against O and unchanged LSE, and GPU scalar changes before replay. A plan-time
+predicate cannot exclude arguments supplied only to `run()`.
+
+Refining auto admission must also preserve the explicit-bound, device-length
+no-readback path. Declining cuDNN can itself cause FA2 to stage KV metadata back
+to the host. Use per-request work only when its lengths are already on CPU;
+otherwise retain the existing bound-based policy. Check with a busy GPU stream
+and synchronization debugging, not just a predicate-level test.
+
+Full-prefill admission requires each request's Q length to equal its KV length;
+equal batch maxima do not establish that contract. Prove it using existing CPU
+metadata, and decline the full-prefill extension when independent query-length
+overrides or device-only KV lengths prevent that proof. Preserve the existing
+prefix policy without adding a device readback just for dispatch.
 
 ## Benchmarking
 
@@ -602,10 +672,30 @@ directory per op family — `cached_ops/<module>_<arch>_cute_dsl/` (e.g.
 `nvfp4_quantize_sm100a_cute_dsl/`) holding one `meta.json` plus one `.o` per
 specialization. The arch comes from the DSL's compile target (`CUTE_DSL_ARCH` or the
 current device) since the artifacts are single-arch, unlike nvcc fatbins.
-Invalidation is module-granular: a changed nvidia-cutlass-dsl version or
+Invalidation is module-granular: changed DSL/Torch/TVM-FFI distributions, Python
+ABI, or
 kernel-source SHA256 wipes and lazily rebuilds the module. Reference usage:
 `flashinfer/quantization/kernels/nvfp4_quantize.py`. Disable with
-`FLASHINFER_CUTE_DSL_DISABLE_CACHE=1`.
+`FLASHINFER_CUTE_DSL_DISABLE_CACHE=1`. The SHA256 covers only the files a caller
+passes as `extra_key_files` (often just `__file__`); with
+`FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY=1` it also covers every flashinfer module
+those files can run. Source analysis and hashing live in
+`flashinfer/jit/_cute_dsl_source.py`; `cute_dsl_core.py` manages compilation and
+cached artifacts. Plain modules are keyed by content with everything they
+import, including literal `importlib.import_module` calls. Package initializers
+are resolved name by name: a name looked up in a package follows the binding
+that defines it (a re-export to its source, a function into its body, a module
+through the attributes read from it) plus the submodule of that name. The code
+an initializer runs at import, including evaluated function annotations, is
+followed for every keyed file in its package. Star imports remain covered when
+they can replace an earlier binding; lazy fallbacks are followed when a binding
+may be absent.
+Each initializer is keyed by that code and the import lines of used names, so a
+new re-export or `__all__` entry invalidates nothing. Not keyed: import-time
+side effects of modules that keyed code neither imports nor uses, nonliteral
+dynamic imports, and runtime file reads; list the latter in `extra_key_files`.
+`version.py` and `_build_meta.py` are excluded to avoid keying on the checkout
+commit. This is intended for long-lived caches shared across commits.
 Task-scheduled attention shares this cache through
 `flashinfer/attention/prims_ts/_compile_cache.py`; its keys cover compile specs,
 options, and embedded device-capacity constants. It hashes the attention source
@@ -707,6 +797,8 @@ match what the code uses today; values are strings unless noted.
 |----------|---------|---------|--------|
 | `FLASHINFER_DISABLE_JIT` | unset | `flashinfer/jit/core.py` | If set (any non-empty value), JIT compilation is refused and modules must already exist in the cache or be provided via AOT packages. |
 | `FLASHINFER_CUTE_DSL_DISABLE_CACHE` | `0` | `flashinfer/jit/cute_dsl_core.py` | `1` disables the on-disk cache for JIT-compiled CuTe-DSL kernels (every process recompiles via `cute.compile`). |
+| `FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY` | `0` | `flashinfer/jit/cute_dsl_core.py` | `1` extends each CuTe-DSL disk-cache key from the caller's `extra_key_files` to their in-package import closure, so editing an imported helper invalidates the kernel. Changes every key, so the first run after enabling recompiles. Set by CI's persistent compile cache. |
+| `FLASHINFER_JIT_BUILD_LOG` | unset | `flashinfer/jit/core.py` | Path of a JSONL file that gets one record (`toolchain`, `name`, `seconds`) per build made through `JitSpec.build_and_load()` or a bulk `build_jit_specs()` prebuild: nvcc modules (ninja no-ops included), CuTe-DSL kernels and TIRx modules. Triton, cuTile and the cake nvcc/NVRTC side paths are not recorded. Summarize with `scripts/summarize_jit_builds.py`. |
 | `FLASHINFER_CUDNN_FROST_PTXAS` | unset | `flashinfer/fused_moe/backends/cudnn_frost/compiler.py` | Select an external PTXAS executable path for all Frost dtypes; unset or empty uses the bundled assembler. The executable path, version, and SHA-256 participate in compiler and tactic cache identities. MoE engines snapshot this configuration at build time; call `layer.refresh_backends()` or reconstruct the layer to adopt changes. |
 | `FLASHINFER_DISABLE_VERSION_CHECK` | unset | `flashinfer/jit/env.py` | Skip the check that pins flashinfer-cubin and flashinfer-jit-cache to the installed flashinfer-python. Without it, mismatched kernel wheels (typically left behind by an upgrade) are ignored with a warning at import, falling back to on-demand cubin downloads and JIT compilation until `flashinfer download-kernels` installs matching ones. Set it only when you intentionally mix versions. |
 | `FLASHINFER_JIT_LINEINFO` | `0` | `flashinfer/jit/core.py` | `1` adds `-lineinfo` to nvcc so profiler / `cuda-gdb` can map PTX back to CUDA source. |
@@ -728,19 +820,37 @@ match what the code uses today; values are strings unless noted.
 | `FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM` | `auto` | `flashinfer/chunked_lm_head.py` | Fallback of the `dw_stream` keyword when it is `None` (`0` / `false` / `off` / `no` -> never, `1` / `true` / `on` / `yes` -> every multi-chunk call, anything else -> `auto` = calls of three or more chunks): launches each chunk's weight-gradient accumulate GEMM on a per-device side stream (forked after the chunk's row gradients, joined before the chunk buffer is reused and before the call returns) so it overlaps the tail of the chunk's dX GEMM. Same kernels in the same per-kernel order; bitwise the same outputs. |
 | `FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT` | `1` | `flashinfer/chunked_lm_head.py` | Fallback of the `hidden_count` keyword when it is `None`: `0` turns off the hidden valid-row count of the eager entry points (served to calls of three or more chunks): a compacted call then counts its valid rows and forms their index on the host before its first launch instead of on the device with chunk 0's gather kernel and device-count logits GEMM queued ahead of the read-back. Bitwise the same outputs. |
 | `FLASHINFER_CAKE_LM_HEAD_LOSS_COMPACT_ROWS` | `1` | `flashinfer/chunked_lm_head.py` | Fallback of the `compact_rows` keyword when it is `None`: `0` turns off valid-row compaction (the chunk loop then covers every row instead of only the rows whose label is not `-100`). |
-| `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE` | `1` | `flashinfer/chunked_lm_head.py` | Read once when `flashinfer.chunked_lm_head` is imported and applied through `cake_backend.BINDING_CACHE.configure`: `0` disables the per-process LRU cache of compiled bindings. Direct users of the package call `configure` themselves. |
-| `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE_CAPACITY` | `64` | `flashinfer/chunked_lm_head.py` | Capacity of that binding cache (a positive integer), read once at the same import and applied through `configure`. |
+| `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE` | `1` | `flashinfer/chunked_lm_head.py` | Read once when `flashinfer.chunked_lm_head` is imported and applied through `cake_backend.BINDING_CACHE.configure` when the wrapper first reaches the backend (the first call of either entry point): `0` disables the per-process LRU cache of compiled bindings. Direct users of the package call `configure` themselves. |
+| `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE_CAPACITY` | `64` | `flashinfer/chunked_lm_head.py` | Capacity of that binding cache, read once at the same import (a value that is not a positive integer raises `ValueError`; unset or blank keeps the default) and applied through `configure` on the same first use. |
 | `FLASHINFER_JIT_CACHE_PROVIDER_ARCHS` | required | `flashinfer-jit-cache/build_backend.py` | Space-separated provider architectures added to a shim wheel's exact `Requires-Dist` metadata. |
 | `FLASHINFER_JIT_CACHE_PROVIDER_ARCH` | required | `flashinfer-jit-cache-provider/package_config.py` | Select exactly one architecture, such as `9.0a` or `sm120f`, when building a binary provider wheel. |
 
 Release/nightly JIT-cache provider builds run sccache in server-side mode and
-wrap the complete wheel build with a no-output watchdog. After 90 minutes with
+wrap the complete wheel build with a no-output watchdog. They build in the
+container's torch-pinned interpreter rather than a PEP 517 isolated environment
+(`scripts/build_jit_cache_wheel.py`): an isolated environment's random path
+reaches every compile command through the tvm_ffi include directory and changes
+the sccache key of each translation unit that includes tvm_ffi on every run.
+Before compiling, the same script gives every installed header one fixed mtime:
+GCC's `#pragma once` skips a header whose size, contents and mtime match an
+already included file, and torch ships byte-identical `#pragma once` headers
+(the `ATen/ops/*_native.h` stubs), so otherwise the preprocessed output of each
+torch-including translation unit depends on pip's install timing. After 90 minutes with
 no build output, the watchdog captures system, process, compiler, and sccache
 state; terminates the wrapped build process group (TERM, then KILL after a
 two-minute grace period); and exits with status 124. Compiler discovery scans
 the whole build container, so diagnostics include compiler processes owned by
 the sccache daemon even though they are outside the wrapped process group. The
 CI `docker run --rm` boundary provides final cleanup for those processes.
+
+PR GPU test lanes run their test script through `scripts/run_with_test_sccache.sh`,
+which routes JIT compiles through the same S3 cache and prefix as the AOT lanes
+and uploads `sccache-stats-<kind>-<cuda>-<index>` artifacts. Set the repository
+variable `FLASHINFER_GPU_TEST_SCCACHE=0` to turn this off for A/B timing. If the
+sccache install fails, the wrapper runs the lane uncached. Compiles run in the
+sccache server, so a timed-out unit's process-group kill does not reach them, and
+per-unit memory telemetry excludes nvcc. Locally:
+`scripts/run_with_test_sccache.sh scripts/task_run_unit_tests.sh` (read-only without AWS credentials).
 
 ##### Cubin / Artifact Loader
 
@@ -755,6 +865,7 @@ CI `docker run --rm` boundary provides final cleanup for those processes.
 | `FLASHINFER_DSL_FMHA_LOCAL_DIR` | unset | `flashinfer/attention/cute_dsl/fmha.py` | Path to a local checkout of the CuTe-DSL FMHA kernel sources. The loader checks here before downloading. |
 | `FLASHINFER_LOGGING_LEVEL` | `INFO` | `flashinfer/artifacts.py`, `flashinfer/jit/core.py` | Python logging level for the artifacts/cubin loader and the JIT compiler (`DEBUG`/`INFO`/`WARNING`/`ERROR`). Distinct from `FLASHINFER_LOGLEVEL`. |
 | `FLASHINFER_DISABLE_TINYGEMM2_SM100` | `0` | `flashinfer/gemm/routergemm.py` | Set to `1` to disable the generated SM100/SM103 `tinygemm2` backend and force the dispatcher to fall back to the legacy implementation. Useful as an escape hatch when debugging backend-selection or kernel issues on Blackwell systems. |
+| `FLASHINFER_DISABLE_CAKE_BF16_BMM_SWAP_AB` | `0` | `flashinfer/gemm/gemm_base.py` | Set to `1` to keep `bmm_bf16(..., backend="cake")` on its mma.sync dispatcher for every shape, instead of the generated SM100/SM103 tcgen05 swap-AB programs that serve the decode shapes of its route table. Useful as an escape hatch when debugging backend-selection or kernel issues on Blackwell systems. |
 
 ##### API Dump / Logging Extensions
 
@@ -829,7 +940,7 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_B12X_FORCE_MOE_W4A16` | unset | `flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py` | `1` forces the SM12x MoE dispatcher onto the W4A16 path with BF16 activations. Internal/experimental — used to reproduce W4A16-specific issues. |
 | `FLASHINFER_B12X_STATIC_COMPACT_CUTOVER_PAIRS` | shape/device-dependent | `flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py` | Override the routed-pair threshold between static and dynamic MoE for device/workload tuning. Set before first use; the decision is cached. A nonnegative integer, with `0` disabling the static band. Legacy aliases, in decreasing precedence: `B12X_STATIC_COMPACT_CUTOVER_PAIRS`, `B12X_DYNAMIC_STATIC_CUTOVER_PAIRS`, `B12X_LEVEL10_STATIC_CUTOVER_PAIRS`. |
 | `FLASHINFER_TACTICS_BLOCKLIST` | unset | `flashinfer/autotuner/autotuner.py` | Path to a JSON tactics-blocklist file generated by `flashinfer tactics-blocklist generate` (or `python -m flashinfer tactics-blocklist generate`). When set, the autotuner loads the file at startup and skips any kernel tactics listed as invalid for the current GPU/driver environment, preventing hang or crash on known-bad tactics. |
-| `FLASHINFER_CUDNN_PREFILL_SHAPE_OVERRIDE` | `1` | `flashinfer/cudnn/prefill.py` (ragged token-indptr path) | `0` makes the cuDNN ragged prefill graph declare the exact `(batch, max_seq_len)` per call instead of building one override-enabled graph per length class (declared max_len 128 or 65536+, batch 4096+) and passing the real shapes at execute time via cuDNN's shape override. With matching FE 1.31+ Python/native support, BF16 SM100 MLA prefixes (D192/V128, equal 4–64 heads, B1–4, Q64–1024, KV2K–32K at least 4x Q) use bounded power-of-two batch/Q/KV classes and a packed-Q capacity instead; this preserves reuse within each class while exposing useful plan-time occupancy and workspace bounds. Crossing a class builds one cached plan. Override exists because cuDNN finalizes one execution plan per declared shape (55-70 ms, ~1 s with a kernel compile) and serving changes the shape every step; needs cuDNN 9.22+ and cudnn-frontend 1.29+, otherwise the exact declaration is used. Disable only to bisect a suspected override regression. |
+| `FLASHINFER_CUDNN_PREFILL_SHAPE_OVERRIDE` | `1` | `flashinfer/cudnn/prefill.py` (ragged token-indptr path) | `0` makes the cuDNN ragged prefill graph declare the exact `(batch, max_seq_len)` per call instead of building one override-enabled graph per length class (declared max_len 128 or 65536+, batch 4096+) and passing the real shapes at execute time via cuDNN's shape override. With matching FE 1.31+ Python/native support, SM100/SM107 packed prefixes (BF16 D192/V128 with equal heads, or FP16/BF16 D128/V128 with integral GQA1/2/4/8/16; 4–64 query heads, B1–4, Q2–1024, KV2K–32K at least 4x Q) use bounded power-of-two batch/Q/KV classes and a packed-Q capacity instead; this preserves reuse within each class while exposing useful plan-time occupancy and workspace bounds. Q2–128 share the Q128 class; Q=1 retains the separate decode class. Crossing a class builds one cached plan. Override exists because cuDNN finalizes one execution plan per declared shape (55-70 ms, ~1 s with a kernel compile) and serving changes the shape every step; needs cuDNN 9.22+ and cudnn-frontend 1.29+, otherwise the exact declaration is used. Disable only to bisect a suspected override regression. |
 | `FLASHINFER_ALLOW_CUDNN_PLAN_BUILD_IN_CAPTURE` | `0` | `flashinfer/gemm/gemm_base.py` (read once at import) | `1` downgrades the refusal to build a cuDNN execution plan during CUDA graph capture from a `CudnnPlanBuildInCaptureError` to a warning. Set it only if you have verified your cuDNN version tolerates plan build under capture; the supported alternative is to run each shape once eagerly outside the capture region, which populates the per-shape plan cache the captured call then reuses. |
 | `FLASHINFER_DECODE_AUTO_CUDNN` | unset | `flashinfer/decode.py` (`_auto_decode_prefers_cudnn`) | `BatchDecodeWithPagedKVCacheWrapper(backend="auto")`: unset applies the measured rule (SM100/SM103 with cudnn-frontend 1.30+, fp16/bf16 head_dim 128, GQA group dividing 128, `2 <= q_len_per_req <= 4` with `q_len_per_req * group` in [32, 128] rows per CTA and `batch_size * num_kv_heads >= 64` CTAs, no RoPE / soft-cap / window resolve to `cudnn`, whose default SM100 engine runs those multi-token rows on its FROST decode tile at 0.35-0.95x fa2; single-token decode stays on fa2 except head_dim-256 GQA models with group 4 / 8 / 16 and `batch_size * num_kv_heads` in [96, 256], where the d256 decode tile measures at 0.5-0.95x fa2, from 64 under `use_cuda_graph=True` with a caller-owned table on cudnn-frontend 1.31+, which the wrapper tells the graph is replayed (`is_cuda_graph_replay_expected`) so the tile splits KV; multi-token rows without tensor cores, which have no fa2 kernel, take cudnn whenever its decode path can run them); `0` never resolves to cudnn; `1` applies the rule on an older frontend too (benchmarking; the backend engine is ~8x slower there). Under CUDA graphs `auto` takes cudnn only with a caller-owned `block_tables` (the auto-built table cannot grow once captured) or for multi-token rows without tensor cores, and the resolution is frozen after the first plan. A caller-owned table narrower than 2048 tokens keeps fa2 on cudnn-frontend 1.30 (its placement ranks the backend's prefill-class engine first below that; 1.31+ lifts the limit). `auto` takes cudnn only where the frontend's FROST engines can run (its own CuTe-DSL check: `nvidia-cutlass-dsl` >= 4.7.0, above the 4.6.2 the dependency metadata admits; the `1` override and the no-fa2 route are not gated), and callers passing `fixed_split_size` / `disable_split_kv` (fa2's batch-invariance controls) keep fa2 wherever fa2 can serve the rows. `wrapper.resolved_backend` reports the choice. |
 | `FLASHINFER_CAKE_SSD_CHUNK_PARALLEL` | `auto` | `flashinfer/mamba/cake_ssd_combined.py` (`SSDCombined(backend="cake")`, read on every call) | Chooses between the two exact Mamba2 SSD prefill program families of the Cake backend: `auto` applies the calibrated rule (`chunk_parallel_selected`: the chunk-parallel family only when the call has fewer `(sequence, head)` work items than SMs, its per-tile S/H workspace fits in 256 MiB and its predicted main-kernel time beats the exact scan's by the selection margin), `always` forces the chunk-parallel family, `never` forces the exact scan. Both families run the same exact-scan arithmetic. Any other value raises `ValueError`. |
@@ -838,6 +949,16 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH` | unset | `flashinfer/quantization/nvfp4_quantization_utils.py`, `csrc/nv_internal/cpp/common/envUtils.cpp` | **Legacy.** `1` evaluates the 4over6 candidate error in fp16 (a packed `f16x2` dequant of each candidate) instead of exactly in fp32. Cheaper, and on near-ties it can pick the other candidate, so it is a distinct recipe rather than a pure speed knob. Same gating as `FLASHINFER_NVFP4_4OVER6_ERR_MODE`. Parameter spelling: `NVFP44Over6Config(err_use_fast_math=True)`. |
 | `FLASHINFER_NVFP4_4OVER6_E4M3_USE_256` | unset | `flashinfer/quantization/nvfp4_quantization_utils.py`, `csrc/nv_internal/cpp/common/envUtils.cpp` | **Legacy.** `1` treats 256, not the full-range 448, as the top of the E4M3 block-scale range: the per-tensor global scale becomes `256 * 6 / amax` (per-token: `1 / (256 * 6)`) and the kernel's error normalization follows. This is what keeps the 1.5x-larger `amax / 4` candidate representable — `256 * 1.5 = 384` still fits E4M3, whereas a 448-based scale would need `672` and saturate for blocks near the tensor amax. The global scale **must** be built from the same recipe (`make_nvfp4_global_scale(..., nvfp4_4over6_config=...)`); a mismatch silently rescales the whole tensor. Same gating as `FLASHINFER_NVFP4_4OVER6_ERR_MODE`. Parameter spelling: `NVFP44Over6Config(e4m3_max=256)`. |
 | `FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH` | unset | `flashinfer/quantization/kernels/nvfp4_quantize.py`, `csrc/nv_internal/cpp/common/envUtils.cpp` | `1` makes the NVFP4 quantizer derive its block/global scales with IEEE round-to-nearest arithmetic (`fdiv_rn`, `nvfp4_scale_from_amax_rn`) instead of the default fast approximate reciprocal (`rcp_approx_ftz`). Slower, but reproduces a reference implementation bit-exactly — use it when bisecting an NVFP4 accuracy mismatch. The flag is part of the CuTe-DSL specialization name (`_nofastmath` suffix), so toggling it compiles a separate kernel rather than reusing the cached one. The C++ side (`getEnvDisableFP4QuantFastMath()`) also accepts TRT-LLM's `TRTLLM_DISABLE_FP4_QUANT_FAST_MATH` as an alias. |
+
+##### Ulysses PCIe / RDMA Transport (experimental)
+
+Read when `UlyssesCommunicator` uses the PCIe backend -- named explicitly, or selected by `backend="auto"` where NVLink is unavailable and `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1` is set. Every rank must set these identically (rank-ordered lists take one comma-separated value per rank).
+
+| Variable | Default | Read in | Effect |
+|----------|---------|---------|--------|
+| `FLASHINFER_ULYSSES_PCIE_NICS` | unset (auto) | `flashinfer/comm/ulysses_topology.py` | Override automatic PCI-distance NIC routing for the RDMA routes: mlx5 device names, one per rank in rank order. |
+| `FLASHINFER_ULYSSES_PCIE_GID_INDICES` | unset (auto) | `flashinfer/comm/ulysses_topology.py` | Pick one GID table index per rank when a chosen NIC has several usable IPv4 RoCE v2 entries. |
+| `FLASHINFER_ULYSSES_PCIE_ROUTE` | `auto` | `flashinfer/comm/ulysses_topology.py` | `p2p` forces the all-P2P route; `rdma` forces all-RDMA (per-rank mlx5 to every peer) at world size 2/4/8; `hybrid` forces the eight-rank 4+4 NUMA hybrid; forced RDMA routes fall back to all-P2P with a `RuntimeWarning` when their requirements are unmet; `auto` prefers the all-RDMA route at world sizes 4 and 8. |
 
 ##### Experimental KDA Output-Only Decode Tuning
 

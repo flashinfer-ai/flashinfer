@@ -68,6 +68,39 @@ are designed to co-exist, and neither supersedes the other.
     .. automethod:: __init__
     .. automethod:: __call__
 
+Frost low-latency backend
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``FrostLowLatencyConfig`` is an explicit candidate for SM100/SM103/SM107.
+It admits at most two tokens by default; ``max_num_tokens`` may be raised to
+8. Prepare another backend view to allow fallback beyond that ceiling.
+Precomputed routing is required; routing from logits, shared experts and
+expert-parallel communication are outside this backend.
+
+Supported weight/input pairs are MXFP4/MXFP8, MXFP8/MXFP8, BF16/BF16 and
+NVFP4/NVFP4. All four pairs accept SwiGLU, SwiGLUStep, SiTU, GeGLU,
+GeGLUTanh, ReLU, ReLU2, SiLU, GELU and Identity. SwiGLU alpha/beta/limit
+and SwiGLUStep limit are configurable; other activations require defaults.
+Pass the same activation to weight preparation and ``MoEConfig``.
+
+MX uses one prepared weight view for Tensor Core and FMA tactics, with
+FP32 activation followed by MXFP8 requantization. BF16 and NVFP4 use FMA,
+round the activation and expert results to BF16, and combine with ordered
+separate FP32 multiplication and addition. FMA requires top-k at most 32.
+NVFP4 additionally requires H divisible by 512 and I by 128 and does not
+support the 4over6 recipe. Use ``prepare_nvfp4_weights`` with canonical BF16
+source weights; input quantization is shared with
+``TrtllmFp4Config.prepare_activations``.
+
+These are multi-kernel pipelines. The MX Tensor Core path uses PDL between
+its fused projection/activation/quantizer and down projection. Prepare and
+warm up before CUDA Graph capture. CuTe DSL 4.8 or newer is required.
+
+.. autosummary::
+    :toctree: ../generated
+
+    FrostLowLatencyConfig
+
 cuDNN Frost backend
 ~~~~~~~~~~~~~~~~~~~
 
@@ -735,6 +768,18 @@ CuteDSL Fused MoE
 
 The CuteDSL backends are conditionally available when the
 ``nvidia-cutlass-dsl`` package is installed.
+
+With NVFP4 expert weights on Blackwell, :func:`cute_dsl_fused_moe` and
+:class:`CuteDslMoEWrapper` support two activation-precision choices:
+
+* ``quant_mode="w4a4"`` uses packed NVFP4 activations and FP4 MMA.
+* ``quant_mode="w4a16"`` keeps activations in BF16 and dequantizes packed
+  NVFP4 weights online for BF16 MMA. The FC1-to-FC2 activation handoff also
+  remains BF16.
+
+For more on the W4A16 design and performance, see
+`Faster-than-light NVFP4 decode—with precision
+<https://humansand.ai/blog/faster-than-light-nvfp4-decode>`_ by Ziang Li at humans& ai.
 
 .. autosummary::
     :toctree: ../generated
