@@ -222,10 +222,7 @@ def _route(
         }:
             return _CG2_ALIGNED_ROUTE[(n, k)]
     if k == 128:
-        if (
-            sm_count is not None
-            and math.ceil(m / 128) * math.ceil(n / 128) <= sm_count
-        ):
+        if sm_count is not None and math.ceil(m / 128) * math.ceil(n / 128) <= sm_count:
             return DEEPK_C2_KG1_ROUTE
         return K128_ROUTE
     if k == 384:
@@ -409,9 +406,13 @@ BS_SWAP_SM100_MAX_TILES = 74
 # The 32-row-block swap-AB program (each 32-row M block holds one group's
 # rows) serves the 32- and 64-row-aligned layouts of at most 1536 rows on
 # these architectures, in place of BS_SWAP_RUN32_ROUTE.
-BS_SWAP_RP32_ARCHS = frozenset({"sm_103a"})
+BS_SWAP_RP32_ARCHS = frozenset({"sm_100a", "sm_103a"})
 BS_SWAP_RP32_MAX_ALIGNMENT = 64
 BS_SWAP_RP32_MAX_ROWS = 1536
+# On these architectures the program also needs at most one 32 x 256 tile per
+# SM, ``ceil(m / 32) * (n / 256) <= sm_count``; without ``sm_count`` they keep
+# BS_SWAP_RUN32_ROUTE.
+BS_SWAP_RP32_TILE_BOUND_ARCHS = frozenset({"sm_100a"})
 
 
 def bs_swap_route_for_shape(
@@ -422,6 +423,7 @@ def bs_swap_route_for_shape(
     alignment: int,
     num_groups: int | None,
     arch: str,
+    sm_count: int | None = None,
 ) -> str | None:
     """Select the swap-AB route for packed UE8M0 scales, or ``None`` for :func:`bs_route_for_shape`.
 
@@ -435,7 +437,10 @@ def bs_swap_route_for_shape(
       multi-run layouts) through ``BS_SWAP_RUN32_ROUTE``; on
       ``BS_SWAP_RP32_ARCHS``, an alignment of at most
       ``BS_SWAP_RP32_MAX_ALIGNMENT`` with ``m`` at most
-      ``BS_SWAP_RP32_MAX_ROWS`` takes ``BS_SWAP_RP32_ROUTE`` instead.
+      ``BS_SWAP_RP32_MAX_ROWS`` takes ``BS_SWAP_RP32_ROUTE`` instead.  On
+      ``BS_SWAP_RP32_TILE_BOUND_ARCHS`` it also needs
+      ``ceil(m / 32) * n / 256`` tiles of at most ``sm_count``; with
+      ``sm_count`` ``None`` those architectures keep ``BS_SWAP_RUN32_ROUTE``.
     - For K <= 512, swap at 2 <= rows <= 20, and at 1 <= rows < 2 when K <= 256.
     - For longer K, keep below 0.75 rows and swap below 100 rows.  From 100
       rows, sm_100a swaps for N >= 1024, or for K >= 2048 when the BLOCK_N
@@ -459,6 +464,13 @@ def bs_swap_route_for_shape(
             arch in BS_SWAP_RP32_ARCHS
             and alignment <= BS_SWAP_RP32_MAX_ALIGNMENT
             and m <= BS_SWAP_RP32_MAX_ROWS
+            and (
+                arch not in BS_SWAP_RP32_TILE_BOUND_ARCHS
+                or (
+                    sm_count is not None
+                    and math.ceil(m / BS_SUB_ROWS) * (n // 256) <= sm_count
+                )
+            )
         ):
             return BS_SWAP_RP32_ROUTE
         return BS_SWAP_RUN32_ROUTE
@@ -608,7 +620,13 @@ def _launch_plan(
         if arch is not None:
             route = (
                 bs_swap_route_for_shape(
-                    m, n, k, alignment=alignment, num_groups=num_groups, arch=arch
+                    m,
+                    n,
+                    k,
+                    alignment=alignment,
+                    num_groups=num_groups,
+                    arch=arch,
+                    sm_count=sm_count,
                 )
                 or route
             )
