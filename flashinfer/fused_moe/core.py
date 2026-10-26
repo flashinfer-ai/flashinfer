@@ -87,7 +87,7 @@ from .shared.inputs import (
     unpack_trtllm_moe_output as _unpack_trtllm_moe_output,
 )
 from .shared.validation import (
-    validate_bf16_gemm1_activation_params as _validate_bf16_gemm1_activation_params,
+    validate_bf16_gemm1_activation_params as _validate_shared_bf16_gemm1_activation_params,
 )
 
 # Aliased to avoid clashing with the CUTLASS runner class of the same name that
@@ -4866,6 +4866,58 @@ def _validate_fp8_per_tensor_step_limit(
     )
 
 
+def _validate_clamped_relu2_params(
+    gemm1_alpha: Optional[torch.Tensor],
+    gemm1_beta: Optional[torch.Tensor],
+    gemm1_clamp_limit: Optional[torch.Tensor],
+) -> None:
+    if gemm1_alpha is not None or gemm1_beta is not None:
+        raise ValueError("ClampedRelu2 accepts gemm1_clamp_limit only.")
+    if gemm1_clamp_limit is None:
+        raise ValueError("ClampedRelu2 requires gemm1_clamp_limit.")
+    if (
+        gemm1_clamp_limit.dtype != torch.float32
+        or gemm1_clamp_limit.ndim != 1
+        or not gemm1_clamp_limit.is_cuda
+        or not gemm1_clamp_limit.is_contiguous()
+    ):
+        raise ValueError(
+            "ClampedRelu2 gemm1_clamp_limit must be a contiguous 1D CUDA "
+            "float32 tensor, with one positive finite scale per local expert."
+        )
+    # Do not read device values here: this validation also runs during capture.
+    # C++ checks the expert count and device; positive finite values are the
+    # caller's responsibility.
+
+
+def _validate_bf16_gemm1_activation_params(
+    activation_type: int,
+    gemm1_alpha: Optional[torch.Tensor],
+    gemm1_beta: Optional[torch.Tensor],
+    gemm1_clamp_limit: Optional[torch.Tensor],
+    local_num_experts: int,
+    device: torch.device,
+) -> None:
+    if int(activation_type) == int(ActivationType.ClampedRelu2):
+        _validate_clamped_relu2_params(gemm1_alpha, gemm1_beta, gemm1_clamp_limit)
+        check_shape_dtype_device(
+            gemm1_clamp_limit,
+            (local_num_experts,),
+            torch.float32,
+            device,
+            "gemm1_clamp_limit",
+        )
+        return
+    _validate_shared_bf16_gemm1_activation_params(
+        activation_type,
+        gemm1_alpha,
+        gemm1_beta,
+        gemm1_clamp_limit,
+        local_num_experts,
+        device,
+    )
+
+
 def _validate_fp8_block_scale_gemm1_activation_params(
     fp8_quantization_type: Fp8QuantizationType,
     activation_type: int,
@@ -4876,23 +4928,7 @@ def _validate_fp8_block_scale_gemm1_activation_params(
     if int(activation_type) == int(ActivationType.ClampedRelu2):
         if Fp8QuantizationType(fp8_quantization_type) != Fp8QuantizationType.MxFp8:
             raise ValueError("TRTLLM ClampedRelu2 requires MXFP8.")
-        if gemm1_alpha is not None or gemm1_beta is not None:
-            raise ValueError("ClampedRelu2 accepts gemm1_clamp_limit only.")
-        if gemm1_clamp_limit is None:
-            raise ValueError("ClampedRelu2 requires gemm1_clamp_limit.")
-        if (
-            gemm1_clamp_limit.dtype != torch.float32
-            or gemm1_clamp_limit.ndim != 1
-            or not gemm1_clamp_limit.is_cuda
-            or not gemm1_clamp_limit.is_contiguous()
-        ):
-            raise ValueError(
-                "ClampedRelu2 gemm1_clamp_limit must be a contiguous 1D CUDA "
-                "float32 tensor, with one positive finite scale per local expert."
-            )
-        # Do not read device values here: this validation also runs during capture.
-        # C++ checks the expert count and device; positive finite values are the
-        # caller's responsibility.
+        _validate_clamped_relu2_params(gemm1_alpha, gemm1_beta, gemm1_clamp_limit)
         return
     if int(activation_type) == int(ActivationType.SwigluStep):
         if Fp8QuantizationType(fp8_quantization_type) != Fp8QuantizationType.MxFp8:
@@ -5034,6 +5070,7 @@ def trtllm_bf16_moe(
     activation_type : int
         Activation type (default ``3`` — Swiglu).  ``3`` Swiglu;
         ``6`` Relu2 (non-gated); ``7`` SwigluStep.
+        ``12`` selects ClampedRelu2 and requires ``gemm1_clamp_limit``.
     norm_topk_prob : bool
         Whether to normalize the top-k probabilities (default ``True``).
     routing_replay_out : Optional[torch.Tensor]
@@ -5064,6 +5101,11 @@ def trtllm_bf16_moe(
         With ``SwigluStep``, clamps ``X1`` to ``[-limit, limit]`` and
         ``silu(X2)`` from above.  ``None`` uses a physical limit of ``7``.
         BF16 uses physical and raw accumulator units interchangeably.
+        With ``ClampedRelu2``, required: contiguous CUDA float32 positive finite
+        scales ``s``, one per local expert. FC1 applies
+        ``(s * tanh(relu(x) / s)) ** 2`` before conversion to BF16.
+        ``gemm1_alpha`` and ``gemm1_beta`` must be absent. Requires a matching
+        kernel artifact. Scale values are a caller contract; no host readback.
     output : Optional[torch.Tensor]
         Optional in-place output tensor of shape ``[seq_len, hidden_size]``.
         Allocated internally when ``None`` (default).
@@ -5261,6 +5303,7 @@ def trtllm_bf16_routed_moe(
         Maximum number of tokens for autotuning (default ``8192``).
     activation_type : int
         Activation type (default ``3`` — Swiglu). ``7`` selects SwigluStep.
+        ``12`` selects ClampedRelu2 and requires ``gemm1_clamp_limit``.
     routing_replay_out : Optional[torch.Tensor]
         Optional ``int16`` tensor of shape ``(num_tokens_or_larger, top_k)``
         used to capture the selected expert IDs during routing.  Column
@@ -5291,6 +5334,11 @@ def trtllm_bf16_routed_moe(
         BF16 has no global FC1 dequant scale, so raw accumulator and
         physical limits coincide. SwigluStep rejects ``gemm1_alpha`` and
         ``gemm1_beta``.
+        With ``ClampedRelu2``, required: contiguous CUDA float32 positive finite
+        scales ``s``, one per local expert. FC1 applies
+        ``(s * tanh(relu(x) / s)) ** 2`` before conversion to BF16.
+        ``gemm1_alpha`` and ``gemm1_beta`` must be absent. Requires a matching
+        kernel artifact. Scale values are a caller contract; no host readback.
     output : Optional[torch.Tensor]
         Optional in-place output tensor of shape ``[seq_len, hidden_size]``.
         Allocated internally when ``None`` (default).

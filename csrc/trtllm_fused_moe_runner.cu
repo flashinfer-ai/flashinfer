@@ -158,7 +158,8 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
 #ifdef FLASHINFER_TRTLLM_CLAMPED_RELU2
   validActivation = validActivation ||
                     (activationType == ActivationType::ClampedRelu2 &&
-                     dtypeAct == btg::Dtype::MxE4m3 && dtypeWeights == btg::Dtype::MxE4m3 &&
+                     ((dtypeAct == btg::Dtype::MxE4m3 && dtypeWeights == btg::Dtype::MxE4m3) ||
+                      (dtypeAct == btg::Dtype::Bfloat16 && dtypeWeights == btg::Dtype::Bfloat16)) &&
                      !useDeepSeekFp8);
 #endif
   FLASHINFER_CHECK(validActivation, "Unknown or unsupported activation type",

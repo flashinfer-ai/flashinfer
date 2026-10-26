@@ -175,7 +175,7 @@ enum class ActivationType : int64_t {
   Situ = 10,
   InvalidType = 11,  // Must be last among the normally-sequential members
   // Keep these after InvalidType to preserve existing backend enum values.
-  // ClampedRelu2 also supports TRTLLM MXFP8 with a matching kernel artifact.
+  // ClampedRelu2 also supports TRTLLM BF16 and MXFP8 with a matching kernel artifact.
   // PowLU is CUTLASS-only.
   ClampedRelu2 = 12,
   PowLU = 13,
