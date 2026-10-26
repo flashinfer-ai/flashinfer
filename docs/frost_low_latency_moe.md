@@ -1822,7 +1822,7 @@ Other activations, T1/T2/T4, other shapes, mixed output types and
 raw expert outputs keep their previous candidate sets.
 
 Use `benchmarks/bench_frost_low_latency_w8a16.py --baseline frost_fma
---dtype fp16 --tokens 8 --expert-reuse shared` and repeat with warm/cold caches
+--dtype fp16 --tokens 8 --expert-reuse shared --output result.json` and repeat with warm/cold caches
 and half/disjoint routes; add `--activation geglu` for GeGLU. The native cuTile
 W8A16 adapter accepts BF16 only; this command compares the available matching
 FP16 pipelines. For BF16 SwiGLU, use `--dtype bf16` and compare with
@@ -1872,7 +1872,7 @@ geometries retain their existing candidate sets.
 
 Use `benchmarks/bench_frost_low_latency_w8a16.py --baseline frost_fma
 --dtype fp16 --tokens 8 --hidden 7168 --intermediate 2048 --experts 256
---top-k 8`, with warm/cold cache settings and shared/half/disjoint routes.
+--top-k 8 --output result.json`, with warm/cold cache settings and shared/half/disjoint routes.
 For BF16, use `--dtype bf16` and compare with `--baseline cutile_w8a16` as well as
 `--baseline frost_fma`. The interval includes both projections, activation
 and final combine.
