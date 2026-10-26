@@ -41,17 +41,6 @@ def test_jit_spec_is_target_specific(target):
     assert loader.gen_blackwell_msa_module(name, target) is spec
 
 
-def test_unbuilt_target_is_rejected():
-    rejected = 0
-    for name, record in loader.MODULES.items():
-        for target, arch in loader._TARGET_ARCH.items():
-            if arch not in record["arches"]:
-                with pytest.raises(ValueError):
-                    loader.gen_blackwell_msa_module(name, target)
-                rejected += 1
-    assert rejected, "every program is built for both targets"
-
-
 def test_every_record_names_a_registered_arg_plan():
     """Every program names one ``ARG_PLANS`` entry and every plan is named."""
     named = set()

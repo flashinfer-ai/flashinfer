@@ -77,11 +77,10 @@ _MODULE_ROWS: tuple[dict[str, Any], ...] = (
     {"id": "b5e804da75b24237502b", "plan": "topk_select", "compile_flags": [], "binding": "cake_blackwell_msa_topk_select", "defines": ["-DCAKE_BIND_SMEM=75648"]},
     {"id": "bae868b83abdfe541640", "plan": "kmaj_p_main", "binding": "cake_blackwell_msa_kmaj_p_main", "defines": ["-DCAKE_BIND_SMEM=197632", "-DCAKE_BIND_PAGED=1", "-DCAKE_BIND_GQA=8"]},
     {"id": "c1141bb98fe0a1e6789a", "plan": "prefill_union", "binding": "cake_blackwell_msa_prefill_union", "defines": ["-DCAKE_BIND_SMEM=205824", "-DCAKE_BIND_PAGED=1", "-DCAKE_BIND_KV_FP8=0", "-DCAKE_BIND_Q_FP16=0", "-DCAKE_BIND_GQA=8"]},
-    {"id": "cc6b5108eb89b35d1f64", "plan": "topk_select", "arches": ["sm_103a"], "compile_flags": [], "binding": "cake_blackwell_msa_topk_select", "defines": ["-DCAKE_BIND_SMEM=75648"]},
     {"id": "cc9f8c16164bac3958eb", "plan": "decode_m16", "binding": "cake_blackwell_msa_decode_m16", "defines": ["-DCAKE_BIND_SMEM=216704", "-DCAKE_BIND_PAGED=0", "-DCAKE_BIND_KV_FP8=0", "-DCAKE_BIND_Q_FP16=0"]},
     {"id": "cd19e83ad952065bc779", "plan": "prefill_union", "binding": "cake_blackwell_msa_prefill_union", "defines": ["-DCAKE_BIND_SMEM=205824", "-DCAKE_BIND_PAGED=0", "-DCAKE_BIND_KV_FP8=0", "-DCAKE_BIND_Q_FP16=0", "-DCAKE_BIND_GQA=16"]},
     {"id": "d28ef1a700e18456846d", "plan": "prefill_union", "binding": "cake_blackwell_msa_prefill_union", "defines": ["-DCAKE_BIND_SMEM=224256", "-DCAKE_BIND_PAGED=1", "-DCAKE_BIND_KV_FP8=0", "-DCAKE_BIND_Q_FP16=0", "-DCAKE_BIND_GQA=16"]},
-    {"id": "dce0ec63212385c16c81", "plan": "topk_select", "arches": ["sm_100a"], "compile_flags": [], "binding": "cake_blackwell_msa_topk_select", "defines": ["-DCAKE_BIND_SMEM=75520"]},
+    {"id": "dce0ec63212385c16c81", "plan": "topk_select", "compile_flags": [], "binding": "cake_blackwell_msa_topk_select", "target_compile_flags": {"sm100a": ["-DCAKE_BIND_SMEM=75520"], "sm103a": ["-DCAKE_BIND_SMEM=75648"]}},
     {"id": "e272f321506e704d7720", "plan": "kmaj_p_main", "binding": "cake_blackwell_msa_kmaj_p_main", "defines": ["-DCAKE_BIND_SMEM=197632", "-DCAKE_BIND_PAGED=0", "-DCAKE_BIND_GQA=16"]},
     {"id": "e635b4b314bb670500b5", "plan": "decode_fp8_q1_paged_xform2"},
     {"id": "ec5682e5fca1b9f91612", "plan": "kmaj_p_main", "binding": "cake_blackwell_msa_kmaj_p_main", "defines": ["-DCAKE_BIND_SMEM=197632", "-DCAKE_BIND_PAGED=1", "-DCAKE_BIND_GQA=16"]},
@@ -472,7 +471,7 @@ _ROUTES_COMMON: dict[str, str] = {
 }
 _ROUTE_OVERRIDES: dict[str, dict[str, str]] = {
     "sm100a": {},
-    "sm103a": {"topk_select:main": "cake_blackwell_msa_cc6b5108eb89b35d1f64"},
+    "sm103a": {},
 }
 ROUTES: dict[str, dict[str, str]] = {
     target: {**_ROUTES_COMMON, **_ROUTE_OVERRIDES[target]} for target in _TARGET_ARCH
