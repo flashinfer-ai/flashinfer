@@ -50,6 +50,17 @@ recompiles anything; building every library of the architecture
 (:func:`specs_for_arch`) before a CUDA Graph capture keeps the JIT out of the
 capture.
 
+A forward call is one ordinary launch of its route's program, the dynamic
+token-chunk forward (round 9): the co-resident CTAs of a channel tile take the
+tile's token chunks in order from a device counter, so the CTAs that finish
+first take the tail instead of an equal share fixed at launch.  The counters
+are the forward workspace ``work`` (``workspace_rule`` ``tile_counters``:
+:func:`counter_words`, two int32 words per channel tile), zero before the first
+launch; the last CTA of each tile resets them, so the buffer is zero after
+every launch and every CUDA Graph replay and serves every later launch of one
+stream.  Two launches that may run at once (two streams, two graphs replayed
+concurrently) need two buffers.
+
 A backward call is two ordinary launches on one stream.  The selected program
 (persistent, ``grid_mult x ctas_per_sm x SM count`` CTAs) writes ``dx`` and
 one FP32 partial row of ``dweight`` (and, on the bias routes, of ``dbias``)
@@ -78,19 +89,25 @@ and the backward rules differ where no multiple of 32 divides the channel
 vectors), :func:`launch_grid` (the grid:
 ``co_resident`` records launch ``ctas_per_sm x SM count`` CTAs, ``occupancy``
 records ``grid_mult x ctas_per_sm x SM count``, ``channels_per_cta`` records
-``ceil(C / channels_per_cta)``) and :func:`partial_rows` (the backward
-workspace rows); everything else derives from them.  The public workspace is
+``ceil(C / channels_per_cta)``), :func:`partial_rows` (the backward
+workspace rows) and :func:`counter_words` (the forward's ``work`` words);
+everything else derives from them.  The public workspace is
 sized by the backward program of the largest ``grid_mult x ctas_per_sm x
 taps`` over every backward route (:func:`workspace_record`, the capacity
 owner; the bias programs' partials carry a fifth, dbias, slab); each program
 writes the leading rows of its own grid and its reduce program sums exactly
-those.
+those.  The forward workspace is sized by the forward program of the most
+counter words over every forward route (:func:`forward_workspace_words`).
 
 The program name ``cake_causal_conv1d_train_<20 hex>`` is the first twenty hex
 digits of the SHA-256 of the compact JSON ``{"build": <build keywords, sorted>,
 "module": <dotted kernel module>}`` of the kernel the program was rendered
-from; the forward and the default reduce program are built with their kernel
-files' default keywords; every backward program carries ``revision=6`` (the
+from; the default reduce program is built with its kernel file's default
+keywords and the forward programs with ``fast=True, sched="dynamic",
+chunk_stages=1, pair_math=True`` (the dynamic token-chunk schedule of one
+eight-token stage per sub-tile and chunk, the f32x2 pair math, the
+branch-free in-document stage; ``y`` is bitwise the default build's) plus
+the route's keywords; every backward program carries ``revision=6`` (the
 build revision of the split that retired the cooperative form; the exporter
 hashes it so the split programs replaced the cooperative ones under new names)
 and is built with ``vec=8, copy="tma2d"`` (eight channels, 16-byte vectors, per
@@ -124,7 +141,21 @@ from . import cake_build
 # ``launch.use_pdl``, ``arg_plan`` and ``logical``) are rewritten by the
 # exporter from the rendered program; every other field is host plan.
 MODULES: dict[str, dict[str, Any]] = {
-    "cake_causal_conv1d_train_f193c5247980992f4f81": {
+    # Route ``fwd`` (round 9): the forward's dynamic token-chunk program with the
+    # f32x2 pair math and the branch-free in-document stage, built with ``fast=True,
+    # sched="dynamic", chunk_stages=1, pair_math=True``.  The CTAs of a channel tile
+    # take chunks of ``n_sub x 8`` tokens from a device counter instead of equal
+    # contiguous shares, so the CTAs of the SMs that draw the most bandwidth take
+    # the tail; ``y`` is bitwise the static program's.  The counters are the
+    # ``work`` buffer (``workspace_rule``: int32, two words per channel tile: the
+    # next-chunk counter and the done-CTA counter), zero before the first launch;
+    # the last CTA of each tile resets them, so ``work`` is zero again after every
+    # launch and every CUDA Graph replay, and one buffer serves every later launch
+    # of one stream (two launches that may overlap need two buffers).
+    # ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows
+    # the kernel (the exporter's ``KERNEL_SMEM_PROGRAMS``): the first render writes the
+    # kernel's figure, the kernel symbol, the argument plan and the logical names it keeps.
+    "cake_causal_conv1d_train_f5497330bfd286211643": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -135,6 +166,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["buffer", "w"],
             ["buffer", "cu"],
             ["buffer", "y"],
+            ["buffer", "work"],
             ["parameter", "S"],
             ["parameter", "C"],
             ["parameter", "num_docs"],
@@ -149,13 +181,13 @@ MODULES: dict[str, dict[str, Any]] = {
         "ffi_entry": "run",
         # The grid is the co-resident CTA count, ``ctas_per_sm x SM count``:
         # CTA ``b`` owns channel tile ``b % n_ch_tiles`` and, with the other
-        # CTAs of that tile, an equal contiguous share of the token axis.  Any
-        # positive grid is correct; ``ctas_per_sm`` is the measured
-        # co-residency of the program: 4 CTAs per SM on B200 (sm_100a, 107
-        # registers) and GB300 (sm_103a, 109 registers), the register limit
-        # at 128 threads (ncu launch__occupancy_limit_registers); sm_107a is
-        # taken as the same launch bound.  ``geometry`` is the kernel's build
-        # geometry the host plan derives its scalars from.
+        # CTAs of that tile, claims the tile's token chunks in order from
+        # ``work`` (a CTA's chunks rise; its first chunk past ``S`` ends it).
+        # Every channel tile needs a CTA (the host refuses a ``C`` of more
+        # tiles than the grid).  ``ctas_per_sm`` 4 is the co-residency of the
+        # program (128 registers at 128 threads, no stack) on B200 (sm_100a),
+        # GB300 (sm_103a) and R200 (sm_107a).  ``geometry`` is the kernel's
+        # build geometry the host plan derives its scalars from.
         "grid_rule": {
             "cooperative": False,
             "ctas_per_sm": 4,
@@ -165,16 +197,16 @@ MODULES: dict[str, dict[str, Any]] = {
             },
             "kind": "co_resident",
         },
-        "kernel": "cake_causal_conv1d_train_f193c5247980992f4f81",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_f193c5247980992f4f81",
+        "kernel": "cake_causal_conv1d_train_f5497330bfd286211643",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_f5497330bfd286211643",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 33792,
+            "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_f193c5247980992f4f81",
+        "library": "cake_causal_conv1d_train_f5497330bfd286211643",
         "logical": {
             "C": "C",
             "S": "S",
@@ -185,11 +217,15 @@ MODULES: dict[str, dict[str, Any]] = {
             "num_docs": "num_docs",
             "search_steps": "search_steps",
             "w": "w",
+            "work": "work",
             "x": "x",
             "y": "y",
         },
         "role": "fwd",
-        "workspace_rule": None,
+        "workspace_rule": {
+            "kind": "tile_counters",
+            "words_per_tile": 2,
+        },
     },
     "cake_causal_conv1d_train_e08749684c395f2ab65e": {
         "arches": [
@@ -615,14 +651,15 @@ MODULES: dict[str, dict[str, Any]] = {
             "taps": 4,
         },
     },
-    # Route ``fwd_dt`` (hand-written fallback): the forward with ``dtype_flags`` (the
-    # ``flags`` scalar selects the tap load form: bit 0 set reads BF16 taps); built from the
-    # forward kernel's default keywords plus ``dtype_flags=True``.  ``ctas_per_sm`` 4 as the
-    # forward's (the register limit at 128 threads; the occupancy query confirms it).
+    # Route ``fwd_dt`` (round 9): the dynamic token-chunk forward with
+    # ``dtype_flags`` (the ``flags`` scalar selects the tap load form: bit 0 set
+    # reads BF16 taps), built with ``dtype_flags=True, fast=True,
+    # sched="dynamic", chunk_stages=1, pair_math=True``; ``work`` as the ``fwd``
+    # record's.
     # ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows
     # the kernel (the exporter's ``KERNEL_SMEM_PROGRAMS``): the first render writes the
     # kernel's figure, the kernel symbol, the argument plan and the logical names it keeps.
-    "cake_causal_conv1d_train_0f3982a5518f5a8696f6": {
+    "cake_causal_conv1d_train_9c1e7ee9f37e3102660e": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -633,6 +670,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["buffer", "w"],
             ["buffer", "cu"],
             ["buffer", "y"],
+            ["buffer", "work"],
             ["parameter", "S"],
             ["parameter", "C"],
             ["parameter", "num_docs"],
@@ -655,16 +693,16 @@ MODULES: dict[str, dict[str, Any]] = {
             },
             "kind": "co_resident",
         },
-        "kernel": "cake_causal_conv1d_train_0f3982a5518f5a8696f6",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_0f3982a5518f5a8696f6",
+        "kernel": "cake_causal_conv1d_train_9c1e7ee9f37e3102660e",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_9c1e7ee9f37e3102660e",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 33792,
+            "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_0f3982a5518f5a8696f6",
+        "library": "cake_causal_conv1d_train_9c1e7ee9f37e3102660e",
         "logical": {
             "C": "C",
             "S": "S",
@@ -676,19 +714,25 @@ MODULES: dict[str, dict[str, Any]] = {
             "num_docs": "num_docs",
             "search_steps": "search_steps",
             "w": "w",
+            "work": "work",
             "x": "x",
             "y": "y",
         },
         "role": "fwd",
-        "workspace_rule": None,
+        "workspace_rule": {
+            "kind": "tile_counters",
+            "words_per_tile": 2,
+        },
     },
-    # Route ``fwd_bias`` (hand-written fallback): the forward with a per-channel bias ``b``
-    # added after the four taps (FLA's order) and ``dtype_flags`` (bit 0: BF16 taps, bit 2:
-    # BF16 bias); built with ``bias=True, dtype_flags=True``.
+    # Route ``fwd_bias`` (round 9): the dynamic token-chunk forward with a
+    # per-channel bias ``b`` added after the four taps (FLA's order) and
+    # ``dtype_flags`` (bit 0: BF16 taps, bit 2: BF16 bias), built with ``bias=True,
+    # dtype_flags=True, fast=True, sched="dynamic", chunk_stages=1,
+    # pair_math=True``; ``work`` as the ``fwd`` record's.
     # ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows
     # the kernel (the exporter's ``KERNEL_SMEM_PROGRAMS``): the first render writes the
     # kernel's figure, the kernel symbol, the argument plan and the logical names it keeps.
-    "cake_causal_conv1d_train_62cb38eb8aa667d46bc1": {
+    "cake_causal_conv1d_train_08880ca12e4064bc8cdb": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -700,6 +744,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["buffer", "cu"],
             ["buffer", "y"],
             ["buffer", "b"],
+            ["buffer", "work"],
             ["parameter", "S"],
             ["parameter", "C"],
             ["parameter", "num_docs"],
@@ -722,16 +767,16 @@ MODULES: dict[str, dict[str, Any]] = {
             },
             "kind": "co_resident",
         },
-        "kernel": "cake_causal_conv1d_train_62cb38eb8aa667d46bc1",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_62cb38eb8aa667d46bc1",
+        "kernel": "cake_causal_conv1d_train_08880ca12e4064bc8cdb",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_08880ca12e4064bc8cdb",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 33792,
+            "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_62cb38eb8aa667d46bc1",
+        "library": "cake_causal_conv1d_train_08880ca12e4064bc8cdb",
         "logical": {
             "C": "C",
             "S": "S",
@@ -744,11 +789,15 @@ MODULES: dict[str, dict[str, Any]] = {
             "num_docs": "num_docs",
             "search_steps": "search_steps",
             "w": "w",
+            "work": "work",
             "x": "x",
             "y": "y",
         },
         "role": "fwd",
-        "workspace_rule": None,
+        "workspace_rule": {
+            "kind": "tile_counters",
+            "words_per_tile": 2,
+        },
     },
     # Route ``bwd_dt`` (hand-written fallback, sm_100a / sm_103a): the fallback backward body
     # ``vec=8, copy="tma2d"`` with ``dtype_flags=True`` (bit 0: BF16 taps; bit 1, the BF16
@@ -2047,13 +2096,13 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_train_170d89481a616ae977b3",
         ],
         "fwd": [
-            "cake_causal_conv1d_train_f193c5247980992f4f81",
+            "cake_causal_conv1d_train_f5497330bfd286211643",
         ],
         "fwd_bias": [
-            "cake_causal_conv1d_train_62cb38eb8aa667d46bc1",
+            "cake_causal_conv1d_train_08880ca12e4064bc8cdb",
         ],
         "fwd_dt": [
-            "cake_causal_conv1d_train_0f3982a5518f5a8696f6",
+            "cake_causal_conv1d_train_9c1e7ee9f37e3102660e",
         ],
     },
     "sm_103a": {
@@ -2079,13 +2128,13 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_train_170d89481a616ae977b3",
         ],
         "fwd": [
-            "cake_causal_conv1d_train_f193c5247980992f4f81",
+            "cake_causal_conv1d_train_f5497330bfd286211643",
         ],
         "fwd_bias": [
-            "cake_causal_conv1d_train_62cb38eb8aa667d46bc1",
+            "cake_causal_conv1d_train_08880ca12e4064bc8cdb",
         ],
         "fwd_dt": [
-            "cake_causal_conv1d_train_0f3982a5518f5a8696f6",
+            "cake_causal_conv1d_train_9c1e7ee9f37e3102660e",
         ],
     },
     "sm_107a": {
@@ -2112,13 +2161,13 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_train_170d89481a616ae977b3",
         ],
         "fwd": [
-            "cake_causal_conv1d_train_f193c5247980992f4f81",
+            "cake_causal_conv1d_train_f5497330bfd286211643",
         ],
         "fwd_bias": [
-            "cake_causal_conv1d_train_62cb38eb8aa667d46bc1",
+            "cake_causal_conv1d_train_08880ca12e4064bc8cdb",
         ],
         "fwd_dt": [
-            "cake_causal_conv1d_train_0f3982a5518f5a8696f6",
+            "cake_causal_conv1d_train_9c1e7ee9f37e3102660e",
         ],
     },
 }
@@ -2203,7 +2252,14 @@ LOGICAL_TENSORS = (
     "partial",
     "b",
     "db",
+    "work",
 )
+# The workspace-rule vocabulary (``record["workspace_rule"]["kind"]``): a
+# backward program's ``partial_rows`` (its FP32 partial rows, :func:`partial_bytes`)
+# and a forward program's ``tile_counters`` (its int32 ``work`` counters,
+# ``words_per_tile`` per channel tile, :func:`counter_words`); a reduce
+# program has none.
+WORKSPACE_KINDS = ("partial_rows", "tile_counters")
 # The scalars :func:`plan` produces, in kernel order; ``flags`` (the dtype bit
 # mask of the ``dtype_flags`` programs) and ``main_ctas`` (the CTA count of the
 # selected backward program's launch, ``grid_x``, from which the reduce program
@@ -2714,6 +2770,59 @@ def workspace_layout(
     }
 
 
+def counter_words(record: dict[str, Any], n_ch_tiles: int) -> int:
+    """Int32 words of a forward record's ``work`` counters for a launch of ``n_ch_tiles`` channel tiles.
+
+    A ``tile_counters`` rule holds ``words_per_tile`` words per channel tile
+    (the dynamic forward's next-chunk counter and done-CTA counter); a record
+    without a workspace rule takes no ``work`` (0 words).
+    """
+
+    rule = record["workspace_rule"]
+    if rule is None:
+        return 0
+    if rule["kind"] != "tile_counters":
+        raise ValueError(
+            f"module {record['kernel']}: workspace rule {rule['kind']!r} holds no forward counters"
+        )
+    if n_ch_tiles <= 0:
+        raise ValueError(f"n_ch_tiles must be positive, got {n_ch_tiles}")
+    return int(rule["words_per_tile"]) * int(n_ch_tiles)
+
+
+def forward_kinds(arch: str) -> tuple[str, ...]:
+    """The forward routes ``arch`` exports, in :data:`KINDS` order."""
+
+    return tuple(
+        kind
+        for kind in KINDS
+        if route_role(kind) == "fwd" and ROUTES.get(arch, {}).get(kind)
+    )
+
+
+def forward_workspace_words(arch: str, C: int) -> int:
+    """Int32 words of the forward workspace for ``C`` channels on ``arch``.
+
+    The largest :func:`counter_words` over every forward program of every
+    forward route of the architecture (each planned with its own geometry and
+    role), so one buffer serves every forward route; it depends on ``C`` only
+    (never on ``S`` or the device's SM count).  0 when no forward program of
+    the architecture takes ``work``.
+    """
+
+    words = 0
+    for kind in forward_kinds(arch):
+        for name in route_modules(arch, kind):
+            record = MODULES[name]
+            if record["workspace_rule"] is None:
+                continue
+            _, _, n_ch_tiles = channel_split(
+                C, geometry=record["grid_rule"]["geometry"], role=record["role"]
+            )
+            words = max(words, counter_words(record, n_ch_tiles))
+    return words
+
+
 @functools.cache
 def device_arch(device_index: int) -> str:
     """Exported architecture of one CUDA device (``RuntimeError`` when it is not an exported target)."""
@@ -2812,12 +2921,16 @@ __all__ = [
     "ROUTES",
     "SELECT_KINDS",
     "WIDTH",
+    "WORKSPACE_KINDS",
     "arch_for_capability",
     "backward_kinds",
     "backward_route",
     "channel_split",
+    "counter_words",
     "device_arch",
+    "forward_kinds",
     "forward_route",
+    "forward_workspace_words",
     "grid_mult",
     "grid_per_sm",
     "launch_grid",

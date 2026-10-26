@@ -51,7 +51,12 @@ program, then its ``reduce`` program with programmatic dependent launch -- and
 the suite holds the launch order, the registry's grid-rule kinds and
 FlashInfer issue #7038's recipe: a kernel resident on another stream does not
 stall the backward (``busy <= 2 x alone``) and leaves ``dweight`` bitwise
-unchanged.
+unchanged.  The forward takes its token chunks from int32 counters in a
+forward workspace that every launch leaves zero: the suite checks its size
+rule, one caller-owned buffer over repeated calls of every forward route,
+two streams with two buffers running at once, CUDA Graph capture and replay
+with and without a caller-owned buffer, and the package's per-(device,
+stream) buffer of the calls that pass none.
 
 This suite exercises the backend package alone: it names the package once,
 through ``tests.test_helpers.cake_package``, and imports nothing else from
@@ -86,6 +91,12 @@ cake_causal_conv1d_train_backward_workspace_bytes = (
     pkg.cake_causal_conv1d_train_backward_workspace_bytes
 )
 cake_causal_conv1d_train_forward = pkg.cake_causal_conv1d_train_forward
+cake_causal_conv1d_train_forward_workspace = (
+    pkg.cake_causal_conv1d_train_forward_workspace
+)
+cake_causal_conv1d_train_forward_workspace_bytes = (
+    pkg.cake_causal_conv1d_train_forward_workspace_bytes
+)
 is_cake_causal_conv1d_train_supported = pkg.is_cake_causal_conv1d_train_supported
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
@@ -1082,6 +1093,14 @@ def test_backward_launches_the_selected_program_then_its_reduce(monkeypatch) -> 
     launched.clear()
     cake_causal_conv1d_train_forward(x, w, cu)
     assert [name for name, _, _ in launched] == list(loader.route_modules(arch, "fwd"))
+    # The forward passes its token-chunk counters: int32, at least two words per channel tile of its plan.
+    forward = loader.MODULES[launched[0][0]]
+    work = launched[0][1]["work"]
+    _, _, fwd_tiles = loader.channel_split(
+        C, geometry=forward["grid_rule"]["geometry"], role="fwd"
+    )
+    assert work.dtype == torch.int32 and work.numel() >= 2 * fwd_tiles
+    assert loader.counter_words(forward, fwd_tiles) == 2 * fwd_tiles
 
 
 def test_backward_keeps_its_speed_beside_a_resident_side_kernel(
@@ -1547,6 +1566,280 @@ def test_workspace_bytes_and_layout() -> None:
         cake_causal_conv1d_train_backward_workspace_bytes(1, 130, device)
 
 
+# Forward workspace rows: whole-row and multi-sub-tile tiles, the forward's fallback tiles (1344, 1600), a
+# 2560-channel plan of five tiles and the S = 5 row below one stage.
+FORWARD_WORKSPACE_CASES = (
+    (1000, 512, "perf"),
+    (4097, 1280, (1000, 0, 3, 3094)),
+    (4097, 1344, (1000, 0, 3, 3094)),
+    (1000, 1600, "perf"),
+    (4097, 2560, (1000, 0, 3, 3094)),
+    (65, 256, (64, 1)),
+    (5, 1536, (2, 0, 3)),
+)
+# The backward route settings whose inputs select each forward route.
+FORWARD_ROUTE_SETTINGS = {"fwd": "bwd", "fwd_dt": "bwd_dt", "fwd_bias": "bwd_bias"}
+
+
+def _forward_tiles(C: int) -> int:
+    """The forward's channel tiles for ``C`` at the forward records' geometry."""
+
+    record = loader.MODULES[loader.route_modules(_arch(), "fwd")[0]]
+    return loader.channel_split(
+        C, geometry=record["grid_rule"]["geometry"], role="fwd"
+    )[2]
+
+
+def test_forward_workspace_bytes() -> None:
+    """Two int32 counters per channel tile of the forward's plan, the most over every forward route; independent
+    of ``S``; the allocated buffer is zero."""
+
+    device = _device()
+    arch = _arch()
+    assert loader.forward_kinds(arch) == ("fwd", "fwd_dt", "fwd_bias")
+    geometries = set()
+    for kind in loader.forward_kinds(arch):
+        for name in loader.route_modules(arch, kind):
+            record = loader.MODULES[name]
+            assert record["workspace_rule"] == {
+                "kind": "tile_counters",
+                "words_per_tile": 2,
+            }, name
+            geometries.add(tuple(sorted(record["grid_rule"]["geometry"].items())))
+    assert len(geometries) == 1
+    for C in (8, 128, 136, 1024, 1160, 1280, 1344, 1600, 2560, 3200, 8192):
+        tiles = _forward_tiles(C)
+        assert loader.forward_workspace_words(arch, C) == 2 * tiles, C
+        small = cake_causal_conv1d_train_forward_workspace_bytes(1, C, device)
+        large = cake_causal_conv1d_train_forward_workspace_bytes(262401, C, device)
+        assert small == large == 4 * 2 * tiles, C
+    workspace = cake_causal_conv1d_train_forward_workspace(65536, 2560, device)
+    assert workspace.dtype == torch.int32 and workspace.device == device
+    assert workspace.numel() == 2 * _forward_tiles(2560) and workspace.is_contiguous()
+    assert int(torch.count_nonzero(workspace)) == 0
+    with pytest.raises(ValueError):
+        cake_causal_conv1d_train_forward_workspace_bytes(-1, 512, device)
+    with pytest.raises(ValueError):
+        cake_causal_conv1d_train_forward_workspace_bytes(1, 130, device)
+
+
+def test_forward_reuses_one_workspace_over_calls_and_routes() -> None:
+    """One caller-owned buffer serves repeated calls of every forward route and channel count in turn: every launch
+    leaves the counters zero, and ``y`` is within the reference and bitwise the call without a workspace."""
+
+    device = _device()
+    workspace = cake_causal_conv1d_train_forward_workspace(
+        1,
+        max(
+            FORWARD_WORKSPACE_CASES,
+            key=lambda case: cake_causal_conv1d_train_forward_workspace_bytes(
+                1, case[1], device
+            ),
+        )[1],
+        device,
+    )
+    problems = []
+    for kind, settings in FORWARD_ROUTE_SETTINGS.items():
+        _require_route(settings)
+        for S, C, docs in FORWARD_WORKSPACE_CASES:
+            x, w, cu, _, b, _ = _route_inputs(S, C, docs, settings, key=13)
+            assert (
+                loader.forward_route(
+                    bias=b is not None, bf16_taps=w.dtype == torch.bfloat16
+                )
+                == kind
+            )
+            problems.append((kind, S, C, x, w, cu, b, reference_forward(x, w, cu, b)))
+    for repeat in range(3):
+        for kind, S, C, x, w, cu, b, expected in problems:
+            label = f"repeat {repeat} {kind} S={S} C={C}"
+            y = cake_causal_conv1d_train_forward(x, w, cu, bias=b, workspace=workspace)
+            torch.cuda.synchronize(device)
+            assert int(torch.count_nonzero(workspace)) == 0, label
+            _assert_within(y, expected, atol=Y_ATOL, rtol=Y_RTOL, label=f"y {label}")
+            assert torch.equal(y, cake_causal_conv1d_train_forward(x, w, cu, bias=b)), (
+                label
+            )
+
+
+def test_forward_on_two_streams_with_two_workspaces() -> None:
+    """Two streams, each with its own buffer (or the package's buffer of each stream), run the forward at once:
+    every ``y`` is bitwise the one-stream result and every buffer ends zero."""
+
+    device = _device()
+    S, C, docs = 131072, 1280, "perf"
+    x, w, cu, _ = _inputs(S, C, docs, key=17)
+    expected = cake_causal_conv1d_train_forward(x, w, cu)
+    torch.cuda.synchronize(device)
+    streams = [torch.cuda.Stream(device=device) for _ in range(2)]
+    assert streams[0].cuda_stream != streams[1].cuda_stream
+    workspaces = [
+        cake_causal_conv1d_train_forward_workspace(S, C, device) for _ in streams
+    ]
+    calls = 6
+    for owned in (True, False):
+        outs = [[torch.empty_like(x) for _ in range(calls)] for _ in streams]
+        for stream in streams:
+            stream.wait_stream(torch.cuda.current_stream(device))
+        for i in range(calls):
+            for s, stream in enumerate(streams):
+                with torch.cuda.stream(stream):
+                    cake_causal_conv1d_train_forward(
+                        x,
+                        w,
+                        cu,
+                        out=outs[s][i],
+                        workspace=workspaces[s] if owned else None,
+                    )
+        torch.cuda.synchronize(device)
+        for s in range(len(streams)):
+            for i in range(calls):
+                assert torch.equal(outs[s][i], expected), (owned, s, i)
+        held = (
+            workspaces
+            if owned
+            else [
+                pkg._FORWARD_WORKSPACES[(device.index, stream.cuda_stream)]
+                for stream in streams
+            ]
+        )
+        assert held[0].data_ptr() != held[1].data_ptr()
+        assert all(int(torch.count_nonzero(ws)) == 0 for ws in held), owned
+
+
+def test_forward_workspace_cache_per_device_and_stream() -> None:
+    """A call without a workspace uses the zeroed buffer the package keeps for its device and current stream:
+    reused by the stream's later calls, replaced by a larger zeroed one when a call needs more channel tiles (and
+    kept for the smaller ones after it), and never shared by two streams."""
+
+    device = _device()
+    cache = pkg._FORWARD_WORKSPACES
+    small = _inputs(1000, 512, "perf", key=19)[:3]
+    large = _inputs(4097, 2560, (1000, 0, 3, 3094), key=19)[:3]
+    stream, other = torch.cuda.Stream(device=device), torch.cuda.Stream(device=device)
+    key = (device.index, stream.cuda_stream)
+    other_key = (device.index, other.cuda_stream)
+    cache.pop(key, None)
+    cache.pop(other_key, None)
+    for tensor in (*small, *large):
+        tensor.record_stream(stream)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    other.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(stream):
+        y1 = cake_causal_conv1d_train_forward(*small)
+        first = cache[key]
+        assert first.dtype == torch.int32 and first.numel() == 2 * _forward_tiles(512)
+        y2 = cake_causal_conv1d_train_forward(*small)
+        assert cache[key] is first
+        y3 = cake_causal_conv1d_train_forward(*large)
+        grown = cache[key]
+        assert grown is not first and grown.numel() == 2 * _forward_tiles(2560)
+        y4 = cake_causal_conv1d_train_forward(*small)
+        assert cache[key] is grown
+    with torch.cuda.stream(other):
+        y5 = cake_causal_conv1d_train_forward(*small)
+    torch.cuda.synchronize(device)
+    assert cache[other_key].data_ptr() != cache[key].data_ptr()
+    assert int(torch.count_nonzero(cache[key])) == 0
+    assert int(torch.count_nonzero(cache[other_key])) == 0
+    assert torch.equal(y1, y2) and torch.equal(y1, y4) and torch.equal(y1, y5)
+    _assert_within(
+        y1, reference_forward(*small), atol=Y_ATOL, rtol=Y_RTOL, label="y C=512"
+    )
+    _assert_within(
+        y3, reference_forward(*large), atol=Y_ATOL, rtol=Y_RTOL, label="y C=2560"
+    )
+
+
+def test_forward_cuda_graph_with_and_without_workspace() -> None:
+    """A captured forward with a caller-owned buffer reuses it on every replay (left zero after each); one without
+    a buffer captures a zeroed buffer of its own and leaves the package's cached buffers alone.  Replays equal
+    eager, also when the two graphs replay at once on two streams."""
+
+    device = _device()
+    cache = pkg._FORWARD_WORKSPACES
+    for kind, settings in FORWARD_ROUTE_SETTINGS.items():
+        _require_route(settings)
+        S, C, docs = 4097, 1344, (1000, 0, 3, 3094)
+        x, w, cu, _, b, _ = _route_inputs(S, C, docs, settings, key=23)
+        eager = cake_causal_conv1d_train_forward(x, w, cu, bias=b)
+        workspace = cake_causal_conv1d_train_forward_workspace(S, C, device)
+        y_owned, y_own_buffer = torch.empty_like(x), torch.empty_like(x)
+        side = torch.cuda.Stream(device=device)
+        side.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(side):
+            cake_causal_conv1d_train_forward(
+                x, w, cu, bias=b, out=y_owned, workspace=workspace
+            )
+            cake_causal_conv1d_train_forward(x, w, cu, bias=b, out=y_own_buffer)
+        torch.cuda.current_stream(device).wait_stream(side)
+        torch.cuda.synchronize(device)
+        before = {key: held.data_ptr() for key, held in cache.items()}
+        owned, own_buffer = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+        with torch.cuda.graph(owned, stream=side):
+            cake_causal_conv1d_train_forward(
+                x, w, cu, bias=b, out=y_owned, workspace=workspace
+            )
+        with torch.cuda.graph(own_buffer, stream=side):
+            cake_causal_conv1d_train_forward(x, w, cu, bias=b, out=y_own_buffer)
+        assert {key: held.data_ptr() for key, held in cache.items()} == before, kind
+        for replay in range(GRAPH_REPLAYS):
+            y_owned.fill_(float("nan"))
+            y_own_buffer.fill_(float("nan"))
+            owned.replay()
+            own_buffer.replay()
+            torch.cuda.synchronize(device)
+            assert torch.equal(y_owned, eager) and torch.equal(y_own_buffer, eager), (
+                kind,
+                replay,
+            )
+            assert int(torch.count_nonzero(workspace)) == 0, (kind, replay)
+        streams = [torch.cuda.Stream(device=device) for _ in range(2)]
+        for stream in streams:
+            stream.wait_stream(torch.cuda.current_stream(device))
+        for _replay in range(GRAPH_REPLAYS):
+            with torch.cuda.stream(streams[0]):
+                owned.replay()
+            with torch.cuda.stream(streams[1]):
+                own_buffer.replay()
+        torch.cuda.synchronize(device)
+        assert torch.equal(y_owned, eager) and torch.equal(y_own_buffer, eager), kind
+        assert int(torch.count_nonzero(workspace)) == 0, kind
+
+
+def test_forward_workspace_validation() -> None:
+    S, C = 4097, 1280
+    x, w, cu, _ = _inputs(S, C, (1000, 0, 3, 3094))
+    words = cake_causal_conv1d_train_forward_workspace_bytes(S, C, _device()) // 4
+    with pytest.raises(ValueError, match="workspace holds"):
+        cake_causal_conv1d_train_forward(
+            x,
+            w,
+            cu,
+            workspace=torch.zeros(words - 1, dtype=torch.int32, device=_device()),
+        )
+    with pytest.raises(ValueError, match="torch.int32"):
+        cake_causal_conv1d_train_forward(
+            x,
+            w,
+            cu,
+            workspace=torch.zeros(4 * words, dtype=torch.uint8, device=_device()),
+        )
+    with pytest.raises(ValueError, match="1-D"):
+        cake_causal_conv1d_train_forward(
+            x,
+            w,
+            cu,
+            workspace=torch.zeros(1, words, dtype=torch.int32, device=_device()),
+        )
+    with pytest.raises(ValueError, match="must live on"):
+        cake_causal_conv1d_train_forward(
+            x, w, cu, workspace=torch.zeros(words, dtype=torch.int32)
+        )
+    with pytest.raises(TypeError):
+        cake_causal_conv1d_train_forward(x, w, cu, workspace=[0] * words)
+
+
 def test_argument_validation() -> None:
     S, C = 64, 256
     x, w, cu, dy = _inputs(S, C, None)
@@ -1780,7 +2073,17 @@ def test_registry_records_reference_the_build_manifest() -> None:
             assert record["workspace_rule"] is None, name
             assert reduce_core <= logical <= reduce_core | {"db", "flags"}, name
         else:
-            assert record["workspace_rule"] is None and not {"dw", "db"} & logical, name
+            # A forward program takes its token chunks from the ``work`` counters: two int32 words per channel
+            # tile (the next-chunk counter and the done-CTA counter).
+            assert record["workspace_rule"] == {
+                "kind": "tile_counters",
+                "words_per_tile": 2,
+            }, name
+            assert "work" in logical and not {"dw", "db", "partial"} & logical, name
+        assert (
+            record["workspace_rule"] is None
+            or record["workspace_rule"]["kind"] in loader.WORKSPACE_KINDS
+        ), name
         if "b" in logical:
             assert "flags" in logical, name
         # The selection vocabulary: forward records carry no rule; a backward rule is
