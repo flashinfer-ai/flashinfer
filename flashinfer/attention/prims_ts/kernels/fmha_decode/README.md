@@ -150,7 +150,9 @@ supported. Rows may have padding between them; each row must be contiguous.
 
 | Feature | Support |
 | --- | --- |
-| GPU | SM100a/B200 (qualified); SM103a/B300 (architecture-gated, not yet signoff-qualified) |
+| GPU: SM100a/B200 | Qualified |
+| GPU: SM103a/B300 | Architecture-gated, not yet signoff-qualified |
+| GPU: SM107a/Rubin | Qualified for FP8 E4M3 Q/K/V/output, D128/D256 and Q1/Q4/Q8 on CUDA 13.4 with native DSL 4.8; other combinations are not fully qualified |
 | Head dimension | 64, 128, 192, or 256 |
 | Fixed Q length | Any positive integer representable by the metadata and tensor extents |
 | Packed Q | Positive per-request lengths no greater than a positive static maximum |
@@ -253,11 +255,15 @@ tiles) as FMA polynomials to offload MUFU. SM103, with twice the MUFU ex2 rate,
 keeps every exponential on MUFU, and its unmasked max pass takes fragment maxima
 (or Sage scale-group maxima) from LDTM.STAT instead of a register reduction.
 
-SM107 uses native EX2. The generator accepts explicit resource limits
-`max_tmem_alloc_cols=576` and `smem_capacity_kib=327` on CUDA 13.4 with native
-DSL 4.8 support. Automatic plans retain the 512-column/227-KiB limits because
-expanded profiles can improve domain-local launches while slowing ordinary
-placement. Memory placement is not a configuration or dispatch input.
+SM107 uses native EX2. Pass `arch_config_args(compute_capability,
+expanded_resources=True)` as generator config arguments to select the larger
+limits from the architecture: 576 TMEM columns and 327 KiB SMEM on SM107,
+requiring CUDA 13.4 with native DSL 4.8 support. Explicit
+`max_tmem_alloc_cols` / `smem_capacity_kib` overrides remain tuning budgets,
+distinct from the 512-column non-exclusive TMEM allocation limit. Automatic
+plans retain the 512-column/227-KiB budgets because expanded profiles can
+improve domain-local launches while slowing ordinary placement. Memory
+placement is not a configuration or dispatch input.
 
 For homogeneous FP8 Q/K/V/output, opting into 327 KiB selects the following
 long-KV, nonsplit pipeline defaults. KV depth counts raw K/V slots in total;

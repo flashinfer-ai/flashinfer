@@ -86,7 +86,7 @@ from .fmha_decode_constants import (
     SPLIT_KV_MIN_TOKENS_PER_CTA,
     SWIZZLE_128B_ROW_BYTES,
     TMEM_COLUMNS_PER_ROW,
-    TMEM_MAX_ALLOCATION_COLUMNS,
+    TMEM_MAX_NON_EXCLUSIVE_COLUMNS,
     TMEM_ROW_STRIDE,
     TOTAL_SMEM_BUDGET_KIB,
     WARP_THREADS,
@@ -1573,7 +1573,7 @@ class FmhaDecodeConfig:
     uses_ldtm_stat: bool = False
     # Explicit SM107 resource limits; automatic plans retain SM100 budgets.
     # TMEM accepts 512/576 columns and SMEM accepts 227/327 KiB.
-    max_tmem_alloc_cols: int = 512
+    max_tmem_alloc_cols: int = TMEM_MAX_NON_EXCLUSIVE_COLUMNS
     smem_capacity_kib: int = SMEM_CAPACITY_KIB
     use_cluster_smem_reduction: bool = False
     use_separate_reduction_kernel: bool = False
@@ -2914,7 +2914,7 @@ class FmhaDecodeConfig:
             if self.max_seq_len_q > 1
             and not self.use_block_sparse
             and not self.use_sage_attention
-            else TMEM_MAX_ALLOCATION_COLUMNS
+            else TMEM_MAX_NON_EXCLUSIVE_COLUMNS
         )
         return (
             2 * self.tmem_s_cols
@@ -3512,12 +3512,15 @@ def _finalize_static_decode_config(
     """Fill dtype-dependent, profile-dependent, and SMEM-derived defaults."""
     cfg.validate_boolean_fields()
     cfg.validate_dtypes()
-    if cfg.max_tmem_alloc_cols not in (512, SM107_TMEM_ALLOCATION_COLUMNS):
+    if cfg.max_tmem_alloc_cols not in (
+        TMEM_MAX_NON_EXCLUSIVE_COLUMNS,
+        SM107_TMEM_ALLOCATION_COLUMNS,
+    ):
         raise ValueError("max_tmem_alloc_cols must be 512 or 576")
     if cfg.smem_capacity_kib not in (SMEM_CAPACITY_KIB, SM107_SMEM_CAPACITY_KIB):
         raise ValueError("smem_capacity_kib must be 227 or 327")
     if (
-        cfg.max_tmem_alloc_cols > TMEM_MAX_ALLOCATION_COLUMNS
+        cfg.max_tmem_alloc_cols > TMEM_MAX_NON_EXCLUSIVE_COLUMNS
         or cfg.smem_capacity_kib > SMEM_CAPACITY_KIB
     ) and not dsl_supports_exclusive_tmem():
         raise ValueError("Expanded SM107 resources require native DSL 4.8 support")
@@ -3622,7 +3625,7 @@ def _finalize_static_decode_config(
             or cfg.transformed_kv_stages == 0
         ):
             cfg.transformed_kv_stages = (
-                TMEM_MAX_ALLOCATION_COLUMNS
+                TMEM_MAX_NON_EXCLUSIVE_COLUMNS
                 - cfg.tmem_total_cols
                 + cfg.tmem_transformed_kv_stage_cols * cfg.transformed_kv_stages
                 # tmem_total_cols already includes the tmem of transform kv task. drop it
@@ -5291,7 +5294,7 @@ def _validate_profile_support(
         and cfg.tile_size_kv == 128
         and cfg.transform_kv_num_warps == 4
         and cfg.transformed_kv_stages > 0
-        and cfg.tmem_total_cols <= TMEM_MAX_ALLOCATION_COLUMNS
+        and cfg.tmem_total_cols <= TMEM_MAX_NON_EXCLUSIVE_COLUMNS
     ):
         raise ValueError(
             "store_transformed_kv_in_tmem requires FP8 Q, NVFP4 K/V, "
@@ -5530,11 +5533,11 @@ def validate_storage_page_size(
 
 
 def round_tmem_columns(
-    num_columns: int, max_columns: int = TMEM_MAX_ALLOCATION_COLUMNS
+    num_columns: int, max_columns: int = TMEM_MAX_NON_EXCLUSIVE_COLUMNS
 ) -> int:
     """Resolve a legal allocation size, rejecting overflow before compilation."""
     allocation = max(32, 1 << (num_columns - 1).bit_length())
-    if TMEM_MAX_ALLOCATION_COLUMNS < num_columns <= SM107_TMEM_ALLOCATION_COLUMNS:
+    if TMEM_MAX_NON_EXCLUSIVE_COLUMNS < num_columns <= SM107_TMEM_ALLOCATION_COLUMNS:
         allocation = SM107_TMEM_ALLOCATION_COLUMNS
     if allocation > max_columns:
         raise ValueError(
@@ -5543,7 +5546,9 @@ def round_tmem_columns(
     return allocation
 
 
-def arch_config_args(compute_capability: tuple[int, int]) -> dict[str, object]:
+def arch_config_args(
+    compute_capability: tuple[int, int], *, expanded_resources: bool = False
+) -> dict[str, object]:
     """Return the config fields whose value depends on the GPU architecture.
 
     SM100 runs three eighths of the streamed exponentials of KV128 tiles (a
@@ -5556,12 +5561,24 @@ def arch_config_args(compute_capability: tuple[int, int]) -> dict[str, object]:
     (LDTM.STAT) take them from the load, which replaces the max pass's
     register reduction; the context kernel shares that gate. SM107 also uses
     native EX2 because the emulation adds instructions on its tested FP8 paths.
+
+    ``expanded_resources`` selects the architecture's larger resource budget.
+    It is opt-in because its tuned profiles can slow ordinary placement; the
+    default retains the conservative allocation budgets on every architecture.
     """
     native_ex2 = tuple(compute_capability) in ((10, 3), (10, 7))
-    return {
+    args = {
         "ex2_emulated_pairs": 0 if native_ex2 else 6,
         "uses_ldtm_stat": ldtm_stat_supported(compute_capability),
     }
+    if expanded_resources:
+        if tuple(compute_capability) != (10, 7):
+            raise ValueError("Expanded decode resources require SM107")
+        args.update(
+            max_tmem_alloc_cols=SM107_TMEM_ALLOCATION_COLUMNS,
+            smem_capacity_kib=SM107_SMEM_CAPACITY_KIB,
+        )
+    return args
 
 
 def make_decode_config(

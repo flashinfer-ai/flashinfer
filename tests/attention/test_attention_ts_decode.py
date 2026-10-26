@@ -8430,11 +8430,12 @@ def test_attention_ts_decode_sm107_expanded_resources(
         seed=20261025,
     )
     config_args = {
+        **fmha_decode_config.arch_config_args(
+            torch.cuda.get_device_capability(), expanded_resources=True
+        ),
         "use_keeps_mma_ab": tile_size_q >= 64,
         "tile_size_q": tile_size_q,
         "tile_size_kv": tile_size_kv,
-        "max_tmem_alloc_cols": 576,
-        "smem_capacity_kib": 327,
     }
     if q_stages is not None:
         config_args["q_stages"] = q_stages
