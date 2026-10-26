@@ -20,7 +20,11 @@ import torch
 from flashinfer import SfLayout, mm_fp4, nvfp4_quantize
 from flashinfer.experimental.cake_nvfp4_per_token import cake_backend as cb
 from flashinfer.experimental.cake_nvfp4_per_token.cake_jit import KERNELS
-from tests.test_helpers.cake_nvfp4_per_token import required_kernel_keys
+from tests.test_helpers.cake_nvfp4_per_token import (
+    VALIDATED_GEMM_FAMILIES,
+    VALIDATED_OFF_MATRIX_FAMILY,
+    required_kernel_keys,
+)
 
 GLOBAL_SCALE_INV = 1.0 / (448.0 * 6.0)
 
@@ -34,7 +38,7 @@ def test_default_tactic_rules():
     # M <= 32: swapped orientation; narrow weights take cluster split-K.
     t = cb.default_tactic(1, 2112, 7168, 148)
     assert t["alpha_n"] and t["tile_n"] == 8 and t["split_k"] == 4
-    t = cb.default_tactic(32, 2112, 7168, 148)
+    t = cb.default_tactic(17, 2112, 7168, 148)
     assert t["alpha_n"] and t["tile_n"] == 8 and t["split_k"] == 2
     t = cb.default_tactic(32, 8192, 8192, 148)
     assert t["alpha_n"] and t["tile_n"] == 32 and "split_k" not in t
@@ -53,13 +57,15 @@ def test_default_tactic_rules():
     assert "split_k" not in cb.default_tactic(32, 18432, 7168, 148)
     # Three K slices when the whole cluster grid (weight tiles x token tiles) is co-resident:
     # 7168x1536 M = 17 needs 36 clusters of 3 (capacity 45 on 148 SMs, 46 on 152); the
-    # 48- and 51-cluster launches of M = 32 / N = 2112 keep two slices, as does a part
-    # without a measured capacity table.
+    # 48- and 51-cluster launches of M = 32 / N = 1536 and M = 17 / N = 2112 keep two
+    # 8-token slices outside the 16-token rows, as does a part without a measured
+    # capacity table.
     for sm_count in (148, 152):
         t = cb.default_tactic(17, 1536, 7168, sm_count)
         assert t["tile_n"] == 8 and t["split_k"] == 3
-        assert cb.default_tactic(32, 1536, 7168, sm_count)["split_k"] == 2
-        assert cb.default_tactic(17, 2112, 7168, sm_count)["split_k"] == 2
+    t = cb.default_tactic(32, 1536, 7168, 148, out_f16=True)
+    assert t["tile_n"] == 8 and t["split_k"] == 2
+    assert cb.default_tactic(17, 2112, 7168, 148)["split_k"] == 2
     assert cb.default_tactic(17, 1536, 7168, 132)["split_k"] == 2
     assert set(cb.CLUSTER_CAPACITY_BY_SM_COUNT) == {148, 152}
     # One 128-token tile over 128-wide weight tiles runs without the L2 promotion on both
@@ -158,6 +164,130 @@ def test_default_tactic_rules():
     assert t["two_cta"] and "raster_group" not in t and "sched" not in t
     t = cb.default_tactic(8192, 18432, 7168, 148)
     assert t["two_cta"] and t["sched"] == "clc" and "raster_group" not in t
+
+
+def test_n8_w64_rows_only_where_registered():
+    # Only sm_103a registers the 64-row weight-tile programs: sm_100a keeps 128-row weight
+    # tiles at two CTAs per SM, also with 152 SMs.
+    for sm_count in (148, 152):
+        for n, k in ((28672, 8192), (18432, 7168), (7168, 16384), (2112, 7168)):
+            for m in (1, 8, 17, 32):
+                for out_f16 in (False, True):
+                    plan = cb.gemm_plan(m, n, k, out_f16, "sm_100a", sm_count)
+                    assert "_w64" not in plan.kernel_key, plan.kernel_key
+    for m in (1, 8):
+        t = cb.default_tactic(m, 28672, 8192, 152, n8_wide_w_rows=False)
+        assert t["blocks_per_sm"] == 2 and "w_rows" not in t
+        for out_f16, out in ((False, "bf16"), (True, "f16")):
+            plan = cb.gemm_plan(m, 28672, 8192, out_f16, "sm_100a", 152)
+            assert plan.kernel_key == f"gemm:n8_{out}_aF_l2256b_o2", plan.kernel_key
+            assert plan.kernel_key in KERNELS["sm_100a"]
+
+
+def test_n8_w64_rows():
+    # The 8-token tile with more 128-row weight tiles than SMs on the 152-SM part:
+    # 64-row weight tiles at one CTA per SM (8192x28672: 448 tiles, about three waves).
+    for m in (1, 8):
+        t = cb.default_tactic(m, 28672, 8192, 152)
+        assert t["tile_n"] == 8 and t["w_rows"] == 64 and "blocks_per_sm" not in t
+        t = cb.default_tactic(m, 28672, 8192, 148)
+        assert t["blocks_per_sm"] == 2 and "w_rows" not in t
+    assert "w_rows" not in cb.default_tactic(8, 18432, 7168, 152)  # 144 tiles
+    assert "w_rows" not in cb.default_tactic(17, 28672, 8192, 152)
+    for out_f16, out in ((False, "bf16"), (True, "f16")):
+        plan = cb.gemm_plan(8, 28672, 8192, out_f16, "sm_103a", 152)
+        assert plan.kernel_key == f"gemm:n8_{out}_aF_l2256b_w64", plan.kernel_key
+        assert plan.w_tile == 64 and plan.w_tiles == 448 and plan.grid == 152
+    with pytest.raises(ValueError, match="one CTA per SM"):
+        cb.gemm_plan(
+            8,
+            28672,
+            8192,
+            False,
+            "sm_103a",
+            152,
+            tactic={**cb.default_tactic(8, 28672, 8192, 152), "blocks_per_sm": 2},
+        )
+
+
+def test_m64_ring_overlay_rows():
+    # The 64-wide 1-CTA m tile stages its output over the start of the mainloop ring on
+    # both parts: the single-token-tile rows over more than 40 64-wide weight tiles.
+    for arch, sm_count in (("sm_100a", 148), ("sm_103a", 152)):
+        for n, k in ((7168, 16384), (7168, 18432), (8192, 28672), (8192, 8192)):
+            t = cb.default_tactic(128, n, k, sm_count)
+            assert t["tile_n"] == 64 and "two_cta" not in t and t["ring_overlay"]
+            for out_f16, out in ((False, "bf16"), (True, "f16")):
+                plan = _registered(
+                    cb.gemm_plan(128, n, k, out_f16, arch, sm_count), arch
+                )
+                assert plan.kernel_key == f"gemm:m64_{out}_bF_l2256b_ro", (
+                    plan.kernel_key
+                )
+    # The 2-CTA 256x64 pair, the 128-wide tile and the swapped orientation keep their
+    # staging; the knob belongs to the 1-CTA m orientation.
+    for sm_count in (148, 152):
+        assert "ring_overlay" not in cb.default_tactic(128, 2112, 7168, sm_count)
+        assert "ring_overlay" not in cb.default_tactic(128, 18432, 7168, sm_count)
+        assert "ring_overlay" not in cb.default_tactic(8, 28672, 8192, sm_count)
+    with pytest.raises(ValueError, match="1-CTA m orientation"):
+        cb.gemm_plan(
+            8,
+            28672,
+            8192,
+            False,
+            "sm_103a",
+            152,
+            tactic={**cb.default_tactic(8, 28672, 8192, 152), "ring_overlay": True},
+        )
+
+
+def test_m128_ring_overlay_rows():
+    # One 128-token tile over more 128-wide weight tiles than SMs (8192x28672 M = 128 on
+    # 148 SMs: 224 tiles) takes the overlay program of the 128-wide 1-CTA m tile, which
+    # only sm_100a registers; one wave of 128-wide tiles keeps its staging.
+    for out_f16, out in ((False, "bf16"), (True, "f16")):
+        plan = _registered(
+            cb.gemm_plan(128, 28672, 8192, out_f16, "sm_100a", 148), "sm_100a"
+        )
+        assert plan.kernel_key == f"gemm:m128_{out}_bF_ro", plan.kernel_key
+        plan = cb.gemm_plan(128, 18432, 7168, out_f16, "sm_100a", 148)
+        assert plan.kernel_key == f"gemm:m128_{out}_bF", plan.kernel_key
+    t = cb.default_tactic(128, 28672, 8192, 148, m128_ring_overlay=True)
+    assert t["tile_n"] == 128 and "two_cta" not in t and t["ring_overlay"]
+    assert "ring_overlay" not in cb.default_tactic(128, 28672, 8192, 148)
+    t = cb.default_tactic(128, 18432, 7168, 148, m128_ring_overlay=True)
+    assert "ring_overlay" not in t
+
+
+def test_n16_split3_rows():
+    # The 16-token tile with three K slices on the measured rows of each SM count and
+    # output dtype: M = 17 stands for 17..24 and M = 32 for 25..32 where both dtypes
+    # agree, else only the measured token count.
+    def n16sk3(m, n, sm_count, out_f16, k=7168):
+        t = cb.default_tactic(m, n, k, sm_count, out_f16=out_f16)
+        assert t["alpha_n"] and t.get("split_k") in (2, 3), (m, n, sm_count, t)
+        return (t["tile_n"], t["split_k"]) == (16, 3)
+
+    tail = list(range(25, 33))
+    for out_f16 in (False, True):
+        assert all(n16sk3(m, 2112, 152, out_f16) for m in range(17, 33))
+        assert [m for m in range(17, 33) if n16sk3(m, 1536, 152, out_f16)] == tail
+    assert [m for m in range(17, 33) if n16sk3(m, 2112, 148, False)] == tail
+    assert [m for m in range(17, 33) if n16sk3(m, 2112, 148, True)] == [17, *tail]
+    assert [m for m in range(17, 33) if n16sk3(m, 1536, 148, False)] == [32]
+    assert not any(n16sk3(m, 1536, 148, True) for m in range(17, 33))
+    # Other parts and depths keep the 8-token tile.
+    for out_f16 in (False, True):
+        assert not any(n16sk3(m, 2112, 132, out_f16) for m in range(17, 33))
+        assert not any(n16sk3(m, 2112, 152, out_f16, k=4096) for m in range(17, 33))
+    # gemm_plan passes the output dtype to the rule.
+    for out_f16, out in ((False, "bf16"), (True, "f16")):
+        for arch in ("sm_100a", "sm_103a"):
+            plan = cb.gemm_plan(32, 2112, 7168, out_f16, arch, 152)
+            assert plan.kernel_key == f"gemm:n16_sk3_{out}_l2256b", plan.kernel_key
+    assert cb.gemm_plan(17, 2112, 7168, True, "sm_100a", 148).tactic["tile_n"] == 16
+    assert cb.gemm_plan(17, 2112, 7168, False, "sm_100a", 148).tactic["tile_n"] == 8
 
 
 def _registered(plan, arch):
@@ -319,6 +449,28 @@ def test_gemm_plan_geometry():
         )
 
 
+def test_sm103_k96_width_rule():
+    # On the 152-SM sm_103a part the 2-CTA width re-pick takes the K = 96 programs' wave
+    # cost when the re-picked plan is one of them: three multi-wave rows move from five
+    # waves of 192-wide pairs to four waves of the 256-wide grouped-raster pair.
+    for m, n, k in ((8192, 2112, 7168), (2048, 8192, 8192), (2048, 8192, 28672)):
+        for out_f16, out in ((False, "bf16"), (True, "f16")):
+            plan = _registered(
+                cb.gemm_plan(m, n, k, out_f16, "sm_103a", 152), "sm_103a"
+            )
+            assert plan.kernel_key == f"gemm:m256_2cta_{out}_aL_bL_l2256b_g8"
+            assert plan.kernel_key in cb.K96_KERNEL_KEYS
+            for arch, sm_count in (("sm_100a", 148), ("sm_100a", 152)):
+                base = cb.gemm_plan(m, n, k, out_f16, arch, sm_count)
+                assert base.tactic["tile_n"] == 192, (arch, sm_count, base.kernel_key)
+    # A row whose re-picked plan is not a K = 96 program keeps the K = 64 plan.
+    for m, n, k in ((2048, 1536, 7168), (8192, 8192, 8192), (512, 8192, 8192)):
+        assert (
+            cb.gemm_plan(m, n, k, False, "sm_103a", 152).kernel_key
+            == cb.gemm_plan(m, n, k, False, "sm_100a", 152).kernel_key
+        )
+
+
 def test_cake_is_registered_but_never_auto_selected():
     assert "cake" in mm_fp4.experimental_backends
     assert mm_fp4.is_backend_supported("cake", 100)
@@ -333,6 +485,87 @@ def test_required_gemm_keys_registered_when_programs_exist(arch):
     if arch in KERNELS:
         missing = sorted(set(required) - set(KERNELS[arch]))
         assert not missing, f"{arch} lacks {missing}"
+
+
+# Token counts at the edges of the dispatch rules: the swapped-orientation tiles, the
+# single-token-tile and 2-CTA limits, the validated rows and their neighbours.
+_EDGE_M = (1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 127, 128, 129, 130, 255, 256)
+_EDGE_M += (257, 511, 512, 513, 1000, 1024, 2047, 2048, 2049, 4096, 4097, 8191, 8192)
+_EDGE_M += (8193, 16384)
+
+
+@pytest.mark.parametrize("sm_count", (148, 152))
+@pytest.mark.parametrize("arch", cb.ARCHES)
+def test_plans_resolve_on_148_and_152_sms(arch, sm_count):
+    # Each architecture ships on a 148- and a 152-SM part (sm_100a: B200 / GB200,
+    # sm_103a: B300 / GB300) and registers the kernels of its measured part.  The
+    # validated matrix resolves on both parts; on the other part an edge row whose own
+    # tactic selects an unregistered kernel runs the measured part's kernel, and every
+    # other row keeps its own.
+    registered = KERNELS[arch]
+    missing = sorted(set(required_kernel_keys(arch, sm_count)) - set(registered))
+    assert not missing, f"{arch} with {sm_count} SMs lacks {missing}"
+    measured = cb.MEASURED_SM_COUNT[arch]
+    served = 0
+    for k, n in (*VALIDATED_GEMM_FAMILIES, VALIDATED_OFF_MATRIX_FAMILY):
+        for m in _EDGE_M:
+            for out_f16 in (False, True):
+                reference = cb.gemm_plan(m, n, k, out_f16, arch, measured)
+                if reference.kernel_key not in registered:
+                    continue  # outside the registered matrix on the measured part too
+                served += 1
+                plan = cb.gemm_plan(m, n, k, out_f16, arch, sm_count)
+                key = plan.kernel_key
+                assert key in registered, (m, n, k, out_f16, key)
+                assert plan.sm_count == sm_count
+                if sm_count == measured:
+                    continue
+                own = cb.default_tactic(
+                    m,
+                    n,
+                    k,
+                    sm_count,
+                    out_f16=out_f16,
+                    n8_wide_w_rows=arch == cb.N8_WIDE_W_ROWS_ARCH,
+                )
+                own_key = cb.gemm_plan(
+                    m, n, k, out_f16, arch, sm_count, tactic=own
+                ).kernel_key
+                if own_key in registered:
+                    assert key == own_key, (m, n, k, out_f16)
+                else:
+                    assert key == reference.kernel_key, (m, n, k, out_f16)
+    assert served
+
+
+def test_other_sm_count_runs_the_measured_kernel():
+    # GB200 (sm_100a, 152 SMs): two CTAs per SM on the 16 / 32-token tiles, the
+    # 128 x 192 one-CTA tile and the plain 192-wide 2-CTA pair are registered for
+    # sm_103a only.  B300 (sm_103a, 148 SMs): the stream-K tail programs are registered
+    # for sm_100a only.  These rows run the measured part's kernel with the grid of
+    # their own SM count.
+    rows = (
+        ("sm_100a", 152, 16, 28672, 8192, "gemm:n16_bf16_aF_l2256b", 152),
+        ("sm_100a", 152, 32, 28672, 8192, "gemm:n32_bf16_aF_l2256b", 152),
+        ("sm_100a", 152, 128, 28672, 8192, "gemm:m128_bf16_bF_ro", 152),
+        ("sm_100a", 152, 257, 7168, 16384, "gemm:m256_2cta_bf16_bF_l2256b", 112),
+        ("sm_103a", 148, 512, 28672, 8192, "gemm:m256_2cta_bf16_bF_l2256b", 148),
+        ("sm_103a", 148, 2048, 7168, 16384, "gemm:m256_2cta_bf16_aL_bL_l2256b_g8", 148),
+    )
+    for arch, sm_count, m, n, k, key, grid in rows:
+        own = cb.default_tactic(
+            m, n, k, sm_count, n8_wide_w_rows=arch == cb.N8_WIDE_W_ROWS_ARCH
+        )
+        own_key = cb.gemm_plan(m, n, k, False, arch, sm_count, tactic=own).kernel_key
+        assert own_key not in KERNELS[arch], own_key
+        plan = cb.gemm_plan(m, n, k, False, arch, sm_count)
+        measured = cb.gemm_plan(m, n, k, False, arch, cb.MEASURED_SM_COUNT[arch])
+        assert plan.kernel_key == measured.kernel_key == key, plan.kernel_key
+        assert plan.sm_count == sm_count and plan.grid == grid, plan.grid
+    # An explicit tactic is planned as given.
+    t = cb.default_tactic(32, 28672, 8192, 152)
+    plan = cb.gemm_plan(32, 28672, 8192, False, "sm_100a", 152, tactic=t)
+    assert plan.kernel_key == "gemm:n32_bf16_aF_l2256b_o2"
 
 
 # ---------------------------------------------------------------------------

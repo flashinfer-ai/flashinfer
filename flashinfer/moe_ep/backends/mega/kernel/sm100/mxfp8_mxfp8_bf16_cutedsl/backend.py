@@ -59,6 +59,15 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
     def __init__(self, config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig) -> None:
         """Validate pipeline options and initialize deferred tuning state."""
         super().__init__(config)
+        if (
+            config.activation != "swiglu"
+            or config.swiglu_alpha is not None
+            or not config.apply_routing_weights_before_fc2
+        ):
+            raise MoEEpConfigError(
+                "Activation controls and late routing weights require "
+                "kernel_name='sm100_mxfp8_mxfp8_bf16_cutedsl_next'."
+            )
         self._kernel_config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig = config
         if config.kernel_variant not in ("inference", "genphase"):
             raise MoEEpConfigError(

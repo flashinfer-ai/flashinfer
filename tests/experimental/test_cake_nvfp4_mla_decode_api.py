@@ -195,7 +195,9 @@ def test_public_api_returns_out_without_lse():
         pytest.skip(reason)
     kv_lens = [512, 300]
     inputs = make_inputs(kv_lens, 16, q_len=DSV4_Q_LEN, device="cuda")
-    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    num_sms = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
     workspace = torch.empty(
         nvfp4_mla_decode_workspace_size(kv_lens, 16, num_sms=num_sms, q_len=DSV4_Q_LEN),
         dtype=torch.uint8,

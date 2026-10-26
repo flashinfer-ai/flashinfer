@@ -288,6 +288,39 @@ def test_packed_serving_expected_m_one_with_multi_block_groups(nk, groups):
     )
 
 
+@pytest.mark.parametrize(
+    "groups,m,full,route",
+    [
+        (1, 1024, (0,), "seed_n512_k128__b1_bn32"),
+        (1, 2048, (0,), "seed_n512_k128__b1_mbn32"),
+        (4, 1024, (0, 3), "seed_n512_k128__b2_8_bn32"),
+        (4, 2048, (0, 3), "seed_n512_k128__b2_8_mbn32"),
+        (16, 1024, (2, 15), "seed_n512_k128__b9_bn128"),
+        (16, 2048, (2, 15), "seed_n512_k128__b9_mbn128"),
+        (40, 2048, (2, 39), "seed_n512_k128__b9_mbn192"),
+    ],
+)
+def test_n512_k128_groups_far_above_expected_m(groups, m, full, route):
+    """``expected_m`` is only a hint: groups that fill all M rows at ``expected_m=1``
+    on the N=512, K=128 routes still have every valid row written."""
+    device = torch.device("cuda")
+    masked = [g % 3 for g in range(groups)]
+    for g in full:
+        masked[g] = m
+    a, b, a_scale, b_scale, masked_m, _ = _make_inputs(
+        groups, m, 512, 128, seed=933, device=device, masked=masked
+    )
+    prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a, b, a_scale, b_scale, masked_m, 1
+    )
+    assert prepared.route == route
+    out = prepared.launch()
+    torch.cuda.synchronize()
+    _assert_valid_rows_close(
+        out, _reference(a, b, a_scale, b_scale, masked_m), masked_m
+    )
+
+
 def test_out_of_band_problems_raise():
     device = torch.device("cuda")
     a, b, a_scale, b_scale, masked_m, expected_m = _make_inputs(

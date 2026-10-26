@@ -71,6 +71,25 @@ change a bit: every CTA walks its own (segment, head) chain into its own indexed
 tile.  The earlier geometry ``"shipped"`` and the other :data:`WALK_GEOMETRIES`
 stay selectable through the test knob ``walk_geometry`` for the A/B record.
 
+Walk form (``WALK_FORM_DEFAULT = "auto"``): each K1 / K2 walk launch runs its
+program's full-width record (one CTA per segment and head) or its two-CTA
+record (two CTAs per segment and head over 64 value columns each, bitwise
+equal), chosen per launch by the registry's rule ``cake_kcp_jit.walk_form``
+from the launch's chains, head count and SM count: the two-CTA form when the
+launch list-schedules within its longest chain (one wave of co-resident
+half-width CTAs, which hide each other's per-step latency), the full-width
+form for the multi-wave launches (more work per issued instruction).  A split
+tape launch is never capped at one CTA per SM (the cap serves the full-width
+tape CTAs, which thrash when co-resident).  The test knob ``walk_form``
+(``"full"`` / ``"split"``) forces one form on every launch for the A/B record;
+the call's ``walk_form_log`` records ``(program, form, n_walk)`` per launch
+(``LAST_CALL[kind]["walk_forms"]`` keeps the copy).
+The tape programs' rule is ``split`` (their full-width records are test-only,
+under ``walk_form="full"``).  The rule's inputs are static per ``(ctx, H)``, so
+the form of each ``(program, walk list)`` is decided once per table set
+(``_Tables.walk_form``) and looked up on every later launch: the eager call
+carries no per-launch list scheduling.
+
 The bracket is host-side runtime state, so it is never issued inside a CUDA
 stream capture (``cudaDeviceSetCacheConfig`` would invalidate the capture,
 see below).  Under ``graph="replay"`` the captured call carries the tape
@@ -233,8 +252,8 @@ COLS_RULE_CHAINS = 24  # D1 threshold (DECISIONS.md D1: <= 24 concurrent chains 
 # one CTA per SM (the device cache-config preference bracketing the launch, see _FiPrograms; host side, no kernel change);
 # "tape_one_cta_per_sm" = the same cap for the tape kernels only (fwdh_tape / dhu_tape: the step-0 probe found co-resident
 # tape CTAs thrash while co-resident offset CTAs hide each other's latency); "lpt_*" = the LPT order plus that cap.  Order and
-# placement never touch a bit: every CTA walks its own (segment, head) chain (the kernels' map is walk_seg[b // H], head
-# b % H) into its own indexed tile.
+# placement never touch a bit: every CTA walks its own (segment, head) chain (the kernels' map is walk_seg[b // (nv H)], head
+# (b // nv) % H, value slice b % nv with nv the record's CTAs per head) into its own indexed tile.
 WALK_GEOMETRIES = (
     "shipped",
     "lpt_chains",
@@ -308,11 +327,20 @@ MERGE_FUSE_DEFAULT = "none"  # shipped: the separate launches; "carry" via _kcp_
 # (the A/B record).
 SAVED_CARRIES = (0, 1)
 SAVED_CARRY_DEFAULT = 1
+# Walk form of the K1 / K2 state walks: "auto" (shipped) = the registry's rule per launch (cake_kcp_jit.walk_form: the
+# offset programs take their two-CTA ``_vh64`` record when the launch list-schedules within its longest chain, else the
+# full-width record; the tape programs take their two-CTA record always, their full-width records being test-only);
+# "full" / "split" force one form on every launch, _kcp_test_knobs only (the A/B record).  The forms are bitwise equal:
+# the form never changes a bit.  A split tape launch is never capped at one CTA per SM (the cap serves the full-width
+# tape CTAs).
+WALK_FORMS = ("auto", "full", "split")
+WALK_FORM_DEFAULT = "auto"
 P2_KNOBS = {  # knob -> admitted values
     "schedule": SCHEDULES,
     "fused_walks": (0, 1),
     "cols_rule": COLS_RULES,
     "walk_geometry": WALK_GEOMETRIES,
+    "walk_form": WALK_FORMS,
     "graph": GRAPH_MODES,
     "graph_cap": GRAPH_CAPS,
     "host_trim": HOST_TRIMS,
@@ -538,6 +566,26 @@ _PROGRAM_OF = {
     "kcp_transfer_walk": "transfer_walk",
     "kcp_affine_merge": "affine_merge",
 }
+
+
+def _walk_form_of(call: Any, programs: Any, name: str, args: dict[str, Any]) -> str:
+    """The record form of walk launch ``name`` (``"full"`` / ``"split"``): the registry's rule
+    (``cake_kcp_jit.walk_form``) on the launch's chains (the chunk counts of its listed segments), the call's head
+    count and the device's SM count, under the call's ``walk_form`` knob -- decided once per ``(program, walk list)``
+    of the call's table set and looked up on every later launch (:meth:`_Tables.walk_form`); ``"full"`` with a
+    registry that has no form rule (one record per walk program)."""
+    jit = getattr(programs, "jit", None)
+    rule = getattr(jit, "walk_form", None)
+    if rule is None or name not in getattr(jit, "WALK_FORM_RULES", {}):
+        return "full"
+    return call.tb.walk_form(
+        name,
+        args["walk"],
+        int(call.H),
+        int(jit.sm_count(call.device.index)),
+        str(call.walk_form),
+        rule,
+    )
 
 
 class KcpPreconditionError(RuntimeError):
@@ -866,6 +914,11 @@ class KernelBackend(Backend):
             variant = {
                 "cols_per_cta": int(args["cols_per_cta"])
             }  # D1: an explicit record instead of the registry's choice
+        if (
+            prog in _WALK_K12
+        ):  # the record form of this walk launch (the registry's rule or the knob)
+            variant = {"walk_form": _walk_form_of(call, self.programs(), name, args)}
+            args["walk_form"] = variant["walk_form"]
         return prog, abi, int(grid), variant
 
     def run(self, name: str, args: dict[str, Any]) -> None:
@@ -916,6 +969,11 @@ class KernelBackend(Backend):
                 "precision_mode": call.precision_mode,
                 "transfer_walk": call.transfer_walk,
             }
+        elif (
+            prog in _WALK_K12
+        ):  # the record form of this walk launch (the registry's rule or the knob)
+            variant = {"walk_form": _walk_form_of(call, programs, name, args)}
+            args["walk_form"] = variant["walk_form"]
         programs.launch(
             prog,
             [],
@@ -1684,7 +1742,8 @@ class _FiPrograms:
     else ``run_module(record, values, grid=(x, 1, 1), device_index=)`` with ``values`` keyed by :data:`ABI_PARAMS`
     (record names ``kcp_<program>``; the merge record by ``ncols``: ``_c8`` / ``_c16``; K3 test variants by suffix).
     Under a ``walk_geometry`` in :data:`WALK_CAP_GEOMETRIES` (the shipped ``lpt_tape_one_cta_per_sm`` since this
-    revision) the programs of :data:`WALK_CAP_PROGRAMS` launch at one CTA per SM: the launch
+    revision) the programs of :data:`WALK_CAP_PROGRAMS` launch at one CTA per SM (their full-width
+    record; a ``walk_form="split"`` launch runs its two-CTA record uncapped): the launch
     is bracketed by the device cache-config preference (:func:`walk_device_cache_config`,
     ``WALK_CACHE_CONFIG_CAP`` before, ``WALK_CACHE_CONFIG_DEFAULT`` after); ``carveout_log`` keeps the first brackets'
     evidence per (program, device) and ``carveout_state`` the preference last set per device.  Inside a CUDA stream
@@ -1761,6 +1820,7 @@ class _FiPrograms:
         name: str | None = None,
         args: dict[str, Any] | None = None,
         cols_per_cta: int | None = None,
+        walk_form: str = "full",
     ) -> None:
         call = args.get("_call") if args is not None else None
         geometry = (
@@ -1768,9 +1828,9 @@ class _FiPrograms:
             if call is not None
             else WALK_GEOMETRY_DEFAULT
         )
-        if program in WALK_CAP_PROGRAMS.get(
-            geometry, ()
-        ):  # this launch at one CTA per SM (bracketed preference)
+        if (
+            program in WALK_CAP_PROGRAMS.get(geometry, ()) and walk_form != "split"
+        ):  # the full-width launch at one CTA per SM (bracketed preference); a split launch runs two CTAs per SM
             scratch = getattr(
                 call, "scratch", None
             )  # the call's record of its cache-config form
@@ -1791,6 +1851,7 @@ class _FiPrograms:
                         name=name,
                         args=args,
                         cols_per_cta=cols_per_cta,
+                        walk_form=walk_form,
                     )
                     self.cap_captured_node(
                         program, device_index, call, immediate=(form == "node_attr")
@@ -1808,6 +1869,7 @@ class _FiPrograms:
                     name=name,
                     args=args,
                     cols_per_cta=cols_per_cta,
+                    walk_form=walk_form,
                 )
                 return
             if (
@@ -1826,6 +1888,7 @@ class _FiPrograms:
                     name=name,
                     args=args,
                     cols_per_cta=cols_per_cta,
+                    walk_form=walk_form,
                 )
                 return
             if scratch is not None:
@@ -1842,6 +1905,7 @@ class _FiPrograms:
                     name=name,
                     args=args,
                     cols_per_cta=cols_per_cta,
+                    walk_form=walk_form,
                 )
             finally:
                 self.set_cache_config(program, device_index, WALK_CACHE_CONFIG_DEFAULT)
@@ -1856,6 +1920,7 @@ class _FiPrograms:
             name=name,
             args=args,
             cols_per_cta=cols_per_cta,
+            walk_form=walk_form,
         )
 
     def cap_captured_node(
@@ -1931,6 +1996,7 @@ class _FiPrograms:
         name: str | None = None,
         args: dict[str, Any] | None = None,
         cols_per_cta: int | None = None,
+        walk_form: str = "full",
     ) -> None:
         jit = self.jit
         if (
@@ -1958,6 +2024,18 @@ class _FiPrograms:
             jit.run_program(name, args, device_index=device_index)
             return
         record = f"kcp_{program}"
+        if (
+            program in _WALK_K12
+        ):  # the record of this launch's form: a fit program's two-CTA record is its ``_vh64``
+            # variant, a fixed-rule program's other form its test-only ``_<form>`` record
+            rule = getattr(jit, "WALK_FORM_RULES", {}).get(record, "fit")
+            if rule == "fit":
+                if walk_form == "split":
+                    record += "_vh64"
+            elif walk_form in ("full", "split") and walk_form != rule:
+                record += f"_{walk_form}"
+            if walk_form == "split":  # two CTAs per segment and head
+                grid = int(grid) * 2
         if program == "transfer_walk":
             if precision_mode:
                 record += {1: "_three_mma", 2: "_plain_tf32"}[int(precision_mode)]
@@ -2843,6 +2921,43 @@ class _Tables:
         cache[key] = (index, tiles, meta)
         return meta
 
+    def walk_form(
+        self,
+        name: str,
+        walk: Sequence[int],
+        H: int,
+        sm_count: int,
+        knob: str,
+        rule: Any,
+    ) -> str:
+        """The record form (``"full"`` / ``"split"``) of walk launch ``name`` over the segments ``walk``: the registry's
+        rule ``rule`` (``cake_kcp_jit.walk_form``) on the launch's chains (the chunk counts of its listed segments), the
+        head count ``H``, the device's SM count and the ``walk_form`` knob -- evaluated once per ``(name, walk list, H,
+        SM count, knob, rule)`` of this table set and looked up on every later launch.  The rule's inputs are static per
+        ``(ctx, H)`` (the walk lists and ``hp.seg_chunk_start`` are this set's, never mutated), so the lookup returns
+        what a per-launch evaluation would; the evaluation itself (the ``fit`` rule list-schedules the chains in
+        Python) leaves the launch path.  Keyed by value: a fresh equal list finds the same entry.  The first launch
+        per key of a context pays that one evaluation (milliseconds of Python for the ``fit`` rule on long chain
+        lists: the one-time cost of an eager first call, not a per-launch regression); every later launch pays a
+        dictionary lookup."""
+        key = (str(name), tuple(walk), int(H), int(sm_count), str(knob), rule)
+        cache = self.__dict__.setdefault("_walk_forms", {})
+        form = cache.get(key)
+        if form is None:
+            if len(cache) >= self.ID_CACHE_MAX:
+                cache.clear()
+            seg = self.hp.seg_chunk_start
+            form = cache[key] = str(
+                rule(
+                    name,
+                    [int(seg[s + 1]) - int(seg[s]) for s in walk],
+                    int(H),
+                    int(sm_count),
+                    knob=str(knob),
+                )
+            )
+        return form
+
     def pool_sizes(self, backward: bool) -> dict[str, int]:
         names = [
             "c1_send",
@@ -3186,6 +3301,7 @@ class KcpOptions:
     fused_walks: int = FUSED_WALKS_DEFAULT  # shipped 1: one tape launch per phase from the carry plane (+ the S_in / dS_out copies); 0 via _kcp_test_knobs
     cols_rule: str = "fixed"  # D1: "by_chains" = c8 up to COLS_RULE_CHAINS state chains, c16 beyond; _kcp_test_knobs only
     walk_geometry: str = WALK_GEOMETRY_DEFAULT  # walk geometry: shipped "lpt_tape_one_cta_per_sm"; "shipped" (the earlier geometry) and the other WALK_GEOMETRIES via _kcp_test_knobs only
+    walk_form: str = WALK_FORM_DEFAULT  # the record form of the K1 / K2 walk launches: "auto" (shipped) = the registry's rule per launch; "full" / "split" via _kcp_test_knobs only
     graph: str = GRAPH_DEFAULT  # graph replay: public keyword; "replay" captures a call once per validity key and replays it (eager on a key miss); also reachable through _kcp_test_knobs for the A/B record
     graph_cap: str = GRAPH_CAP_DEFAULT  # the cache-config form of a captured call ("node_attr" shipped | "none" the previous form of record | "capture_pref" rejected | "node_attr_post"); _kcp_test_knobs only
     host_trim: int = HOST_TRIM_DEFAULT  # shipped 1 = the trimmed host path of the eager call (same launches, bitwise); 0 = the previous path, _kcp_test_knobs only
@@ -3424,6 +3540,12 @@ class KcpCall:
             )
         # 1 = the trimmed host path (shipped), 0 = the previous path (same launches, bitwise)
         self.host_trim = int(opts.host_trim)
+        self.walk_form = str(
+            opts.walk_form
+        )  # "auto": the registry's rule per K1 / K2 launch; "full" / "split" forced
+        self.walk_form_log: list[
+            tuple[str, str, int]
+        ] = []  # (program, form, n_walk) per K1 / K2 walk launch
         self.merge_fuse = str(opts.merge_fuse)  # fused carry merges
         self.saved_carry = int(
             opts.saved_carry
@@ -3625,6 +3747,9 @@ def _record(kind: str, call: KcpCall) -> None:
         "fused_walks": call.tb.fused_walks,
         "cols_rule": call.cols_rule,  # the earlier knobs
         "walk_geometry": call.walk_geometry,  # walk-launch geometry
+        "walk_forms": list(
+            call.walk_form_log
+        ),  # (record, form, n_walk) per K1 / K2 walk launch: the registry's rule or the walk_form knob
         # the host path of this call (1 trimmed = shipped / 0 previous; same launches)
         "host_trim": call.host_trim,
         "merge_fuse": call.merge_fuse,  # the fused carry merges (test knob)

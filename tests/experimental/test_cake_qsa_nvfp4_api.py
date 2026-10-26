@@ -26,9 +26,11 @@ implementation, an unknown value is refused -- device runs of the route and of t
 default against the package, bit for bit, and
 the NVFP4 paged writer against the torch port the backend suite fills its caches with.
 It also holds the host's program rule on the CPU: which records a call launches for its
-form, architecture and grid classes, when a grid is wide (above one resident wave with
-at least 16 tiles per CTA) and when the sm_103a persistent walk serves it (a two-wave
-split-form grid whose longest walked CTA is shorter than the plain program's).
+form, architecture and grid classes, when a call is wide (on sm_80 above one resident
+wave with at least 16 tiles per CTA; on sm_120a at least 11 tiles per CTA whatever the
+grid) and when the sm_103a / sm_107a persistent walk serves it (a multi-wave
+split-form grid within the architecture's wave bound whose longest walked CTA is
+shorter than the plain program's).
 """
 
 import contextlib
@@ -280,11 +282,12 @@ def test_generated_sources_are_declared_as_package_data():
 
 def test_program_rule_selects_the_records_of_a_call():
     """The records are filtered by the device's architecture first: the ``mma.sync`` decode's
-    on sm_80 / sm_90a / sm_120a, the tcgen05 decode's on sm_100a / sm_103a / sm_107a.  On sm_80 a
-    wide (multi-wave, long-stream) split-form call launches the whole-tile decode, every
-    other call the K-first decode; the tcgen05 architectures launch the tcgen05 decode
-    whatever the grid, except that on sm_103a a walked split-form call (``walk`` = the
-    persistent walk's CTA count) launches the persistent walk;
+    on sm_80 / sm_90a / sm_120a, the tcgen05 decode's on sm_100a / sm_103a / sm_107a.  On sm_80
+    and sm_120a a wide split-form call launches the whole-tile decode (sm_80: a multi-wave,
+    long-stream grid; sm_120a: a long per-CTA stream), every other call the K-first decode
+    (sm_90a never selects the whole-tile record); the tcgen05 architectures launch the
+    tcgen05 decode whatever the grid, except that on sm_103a / sm_107a a walked split-form
+    call (``walk`` = the persistent walk's CTA count) launches the persistent walk;
     the merge follows above one split on every architecture; the fused form is the
     architecture's cooperative decode alone; an unknown form, architecture or split count is
     refused, as is a walk on an architecture whose decode cannot launch it (the plan)."""
@@ -301,13 +304,24 @@ def test_program_rule_selects_the_records_of_a_call():
         "decode_whole_tile",
     )
     assert select(form="split", splits=1, arch="sm_80", wide=False) == ("decode",)
+    assert select(form="split", splits=3, arch="sm_120a", wide=True) == (
+        "decode_whole_tile",
+        "merge",
+    )
+    assert select(form="split", splits=1, arch="sm_120a", wide=True) == (
+        "decode_whole_tile",
+    )
+    assert select(form="split", splits=5, arch="sm_120a", wide=False) == (
+        "decode",
+        "merge",
+    )
+    assert select(form="split", splits=1, arch="sm_120a", wide=False) == ("decode",)
     for wide in (False, True):
-        for arch in ("sm_90a", "sm_120a"):
-            assert select(form="split", splits=4, arch=arch, wide=wide) == (
-                "decode",
-                "merge",
-            )
-            assert select(form="split", splits=1, arch=arch, wide=wide) == ("decode",)
+        assert select(form="split", splits=4, arch="sm_90a", wide=wide) == (
+            "decode",
+            "merge",
+        )
+        assert select(form="split", splits=1, arch="sm_90a", wide=wide) == ("decode",)
         for arch in ("sm_80", "sm_90a", "sm_120a"):
             assert select(form="fused", splits=4, arch=arch, wide=wide) == (
                 "decode_coop",
@@ -323,22 +337,23 @@ def test_program_rule_selects_the_records_of_a_call():
             assert select(form="fused", splits=4, arch=arch, wide=wide) == (
                 "decode_tcgen05_coop",
             )
-    # The persistent walk: on sm_103a a walked split-form call launches the walk, then the
-    # merge above one partial slot; the fused form ignores the walk; sm_100a / sm_107a have
+    # The persistent walk: on sm_103a / sm_107a a walked split-form call launches the walk,
+    # then the merge above one partial slot; the fused form ignores the walk; sm_100a has
     # no record reading the walked grid class, so selection falls through to the plain
     # tcgen05 decode and the plan refuses the walk there (its split count would be the
     # walk's slots, not the plain cut).
-    assert select(form="split", splits=2, arch="sm_103a", wide=True, walk=152) == (
-        "decode_tcgen05_persistent",
-        "merge",
-    )
-    assert select(form="split", splits=1, arch="sm_103a", wide=False, walk=1) == (
-        "decode_tcgen05_persistent",
-    )
-    assert select(form="fused", splits=2, arch="sm_103a", wide=False, walk=152) == (
-        "decode_tcgen05_coop",
-    )
-    for arch in ("sm_100a", "sm_107a"):
+    for arch, ctas in (("sm_103a", 152), ("sm_107a", 212)):
+        assert select(form="split", splits=2, arch=arch, wide=True, walk=ctas) == (
+            "decode_tcgen05_persistent",
+            "merge",
+        )
+        assert select(form="split", splits=1, arch=arch, wide=False, walk=1) == (
+            "decode_tcgen05_persistent",
+        )
+        assert select(form="fused", splits=2, arch=arch, wide=False, walk=ctas) == (
+            "decode_tcgen05_coop",
+        )
+    for arch in ("sm_100a",):
         assert select(form="split", splits=2, arch=arch, wide=False, walk=148) == (
             "decode_tcgen05",
             "merge",
@@ -394,19 +409,35 @@ def test_two_wave_walk_rule_on_sm_103a():
     """``select_walk`` / ``num_splits`` at the owner's shape (2 KV heads, 33 tiles) on a
     GB300's 152 SMs and on 148: rows 128 (256 plain CTAs in two waves) take the persistent
     walk on one CTA per SM with 2 partial slots per (row, KV head); rows 1-64 (one wave) and
-    rows 256 / 512 (4 / 7 waves, past ``WALK_MAX_WAVES``) keep the plain cut, as does every
-    other architecture.  The walk arithmetic: ``walk_ctas`` never exceeds the slots,
-    ``walk_splits`` is the most segments any pair is cut into, ``walk_applies`` needs two
-    waves at most and a shorter longest CTA; the walk's launch grid is ``(walk, 1, 1)`` and
-    the merge's ignores the walk."""
+    rows 256 / 512 (4 / 7 waves, past ``WALK_MAX_WAVES["sm_103a"]``) keep the plain cut, as
+    does every architecture outside ``WALK_ARCHES``.  On an R200's 212 SMs (sm_107a, bound
+    three waves) rows 128 and 256 are walked, rows 1-64 and 512 keep the plain cut.  The walk
+    arithmetic: ``walk_ctas`` never exceeds the slots, ``walk_splits`` is the most segments
+    any pair is cut into, ``walk_applies`` needs the architecture's waves at most and a
+    shorter longest CTA; the walk's launch grid is ``(walk, 1, 1)`` and the merge's ignores
+    the walk."""
     tiles = cake_backend.num_tiles(2051)
     assert tiles == 33
-    assert cake_backend.WALK_ARCHES == ("sm_103a",)
-    assert cake_backend.WALK_MAX_WAVES == cake_jit.WALK_MAX_WAVES == 2
+    assert cake_backend.WALK_ARCHES == ("sm_103a", "sm_107a")
+    assert (
+        cake_backend.WALK_MAX_WAVES
+        == cake_jit.WALK_MAX_WAVES
+        == {"sm_103a": 2, "sm_107a": 3}
+    )
+    assert tuple(cake_jit.WALK_MAX_WAVES) == cake_backend.WALK_ARCHES
     assert (
         tuple(cake_jit.MODULES["decode_tcgen05_persistent"]["arches"])
         == cake_backend.WALK_ARCHES
     )
+    for rows in (128, 256):
+        assert cake_backend.select_walk(rows, 2, tiles, 212, "sm_107a") == 212, rows
+        assert cake_backend.plain_splits(rows, 2, 2051, 212, "sm_107a") == 1, rows
+        assert cake_backend.num_splits(rows, 2, 2051, 212, "sm_107a") == 2, rows
+    for rows in (1, 2, 4, 8, 16, 32, 64, 512):
+        assert cake_backend.select_walk(rows, 2, tiles, 212, "sm_107a") == 0, rows
+        assert cake_backend.num_splits(
+            rows, 2, 2051, 212, "sm_107a"
+        ) == cake_backend.plain_splits(rows, 2, 2051, 212, "sm_107a"), rows
     for sm_count in (148, 152):
         assert cake_backend.select_walk(128, 2, tiles, sm_count, "sm_103a") == sm_count
         assert cake_backend.plain_splits(128, 2, 2051, sm_count, "sm_103a") == 1
@@ -418,20 +449,26 @@ def test_two_wave_walk_rule_on_sm_103a():
             assert cake_backend.num_splits(
                 rows, 2, 2051, sm_count, "sm_103a"
             ) == cake_backend.plain_splits(rows, 2, 2051, sm_count, "sm_103a"), rows
-        for arch in ("sm_80", "sm_90a", "sm_100a", "sm_107a"):
+        for arch in ("sm_80", "sm_90a", "sm_100a", "sm_120a"):
             assert cake_backend.select_walk(128, 2, tiles, sm_count, arch) == 0, arch
             assert cake_backend.num_splits(
                 128, 2, 2051, sm_count, arch
             ) == cake_backend.plain_splits(128, 2, 2051, sm_count, arch), arch
     # The wave window: 256 pairs at one split on 152 SMs are two waves (the walk applies),
-    # rows 256 four (past the bound), rows 64 one (nothing to balance).
-    assert cake_jit.walk_applies(128, 2, tiles, 1, 152)
-    assert not cake_jit.walk_applies(256, 2, tiles, 1, 152)
-    assert not cake_jit.walk_applies(64, 2, tiles, 1, 152)
+    # rows 256 four (past sm_103a's bound), rows 64 one (nothing to balance); on 212 SMs rows
+    # 256 are three waves (within sm_107a's bound), rows 512 five (past it).
+    assert cake_jit.walk_applies(128, 2, tiles, 1, 152, "sm_103a")
+    assert not cake_jit.walk_applies(256, 2, tiles, 1, 152, "sm_103a")
+    assert not cake_jit.walk_applies(64, 2, tiles, 1, 152, "sm_103a")
+    assert cake_jit.walk_applies(256, 2, tiles, 1, 212, "sm_107a")
+    assert not cake_jit.walk_applies(512, 2, tiles, 1, 212, "sm_107a")
+    assert not cake_jit.walk_applies(64, 2, tiles, 1, 212, "sm_107a")
+    with pytest.raises(ValueError, match="wave bound"):
+        cake_jit.walk_applies(128, 2, tiles, 1, 148, "sm_100a")
     # The shortening condition: 3 pairs of 1 tile on 2 SMs (two waves) cannot be shortened
     # (the longest CTA walks 2 tiles either way); 3 pairs of 4 tiles can (6 < 8).
-    assert not cake_jit.walk_applies(3, 1, 1, 1, 2)
-    assert cake_jit.walk_applies(3, 1, 4, 1, 2)
+    assert not cake_jit.walk_applies(3, 1, 1, 1, 2, "sm_103a")
+    assert cake_jit.walk_applies(3, 1, 4, 1, 2, "sm_103a")
     assert (
         cake_jit.walk_ctas(152, 256, 33) == 152 and cake_jit.walk_ctas(152, 2, 4) == 8
     )
@@ -487,12 +524,21 @@ def test_wide_grid_is_multi_wave_with_long_streams():
     bound inclusive: 16 tiles per CTA (1024 selected tokens) above one wave is wide, 15 is
     not.  The wave is the architecture's: on sm_100a at 148 SMs (one CTA per SM) the rows
     128 single-split grid of 256 CTAs is wide too, which selects nothing there (the tcgen05
-    decode has one split-form record)."""
+    decode has one split-form record).  On sm_120a the bound is the stream alone
+    (``long_stream``): at 188 SMs (376 resident CTAs) rows 32 (3 splits, 11 tiles per CTA),
+    64 (2 splits, 17) and 128 (1 split, 33) are wide within one wave, rows 1-16 (at most 7
+    tiles per CTA) are not; the stream bound is inclusive at 11 tiles."""
     sm_count, arch = 108, "sm_80"
     tiles = cake_backend.num_tiles(2051)
     assert tiles == 33
     assert cake_jit.DECODE_LONG_STREAM_TILES == 16
     assert cake_backend.LONG_STREAM_TILES == cake_jit.DECODE_LONG_STREAM_TILES
+    assert cake_jit.DECODE_STREAM_TILES == 11
+    assert cake_backend.STREAM_TILES == cake_jit.DECODE_STREAM_TILES
+    assert cake_backend.WIDE_BOUNDS == {
+        "sm_80": "multi_wave_long",
+        "sm_120a": "long_stream",
+    }
     assert cake_backend.CTAS_PER_SM == {
         "sm_80": 2,
         "sm_90a": 2,
@@ -539,6 +585,30 @@ def test_wide_grid_is_multi_wave_with_long_streams():
     assert cake_jit.select_records(
         form="split", splits=1, arch="sm_100a", wide=True
     ) == ("decode_tcgen05",)
+    # sm_120a at 188 SMs: the stream alone decides; every owner grid is within one wave of 376.
+    splits_188 = {
+        rows: cake_backend.num_splits(rows, 2, 2051, 188, "sm_120a")
+        for rows in (1, 2, 4, 8, 16, 32, 64, 128)
+    }
+    assert [splits_188[rows] for rows in (16, 32, 64, 128)] == [5, 3, 2, 1]
+    for rows in (1, 2, 4, 8, 16):
+        splits = splits_188[rows]
+        assert -(-tiles // splits) < 11, rows
+        assert not wide(rows, 2, splits, tiles, "split", 188, "sm_120a"), rows
+    for rows in (32, 64, 128):
+        splits = splits_188[rows]
+        assert rows * 2 * splits <= 376, rows
+        assert wide(rows, 2, splits, tiles, "split", 188, "sm_120a"), rows
+        assert not wide(rows, 2, splits, tiles, "fused", 188, "sm_120a"), rows
+    assert wide(2048, 2, 1, tiles, "split", 188, "sm_120a")
+    # The stream bound is inclusive at 11 tiles per CTA and reads ceil(tiles / splits).
+    assert wide(1, 1, 1, 11, "split", 188, "sm_120a")
+    assert not wide(1, 1, 1, 10, "split", 188, "sm_120a")
+    assert wide(64, 2, 2, 21, "split", 188, "sm_120a")  # ceil(21 / 2) = 11
+    assert not wide(64, 2, 2, 20, "split", 188, "sm_120a")  # 10
+    assert cake_jit.select_records(
+        form="split", splits=3, arch="sm_120a", wide=True
+    ) == ("decode_whole_tile", "merge")
     for bad in (
         (0, 2, 1, tiles, "split", sm_count, arch),
         (1, 0, 1, tiles, "split", sm_count, arch),

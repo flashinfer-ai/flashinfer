@@ -127,12 +127,12 @@ QUANTIZE = cake_program.CakeProgram(
 )
 
 ATTENTION = cake_program.CakeProgram(
-    name="cake_minimax_h3_sm120_quant_varlen_attention_f61ce025db98a842ef62",
+    name="cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b",
     operator_dir="cake_minimax_h3_sm120_quant_varlen_attention",
-    kernel="kernel_cake_minimax_h3_sm120_quant_varlen_attention_f61ce025db98a842ef62",
+    kernel="kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b",
     sources=(
-        "cake_minimax_h3_sm120_quant_varlen_attention_f61ce025db98a842ef62_kernel.cu",
-        "cake_minimax_h3_sm120_quant_varlen_attention_f61ce025db98a842ef62_binding.cu",
+        "cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b_kernel.cu",
+        "cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b_binding.cu",
     ),
     targets=("sm_120a",),
     compile_options=(("sm_120a", ()),),

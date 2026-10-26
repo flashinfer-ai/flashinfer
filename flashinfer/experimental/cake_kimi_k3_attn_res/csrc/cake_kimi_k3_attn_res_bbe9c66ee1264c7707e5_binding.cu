@@ -37,6 +37,23 @@ void CheckCuda(cudaError_t status, const char* what) {
 
 void* DataPtr(const TensorView& t) { return static_cast<char*>(t.data_ptr()) + t.byte_offset(); }
 
+[[noreturn]] void NoInt64(int64_t a, const char* op, int64_t b) {
+  TVM_FFI_THROW(ValueError) << KERNEL_NAME << ": " << a << " " << op << " " << b
+                            << " has no int64 value in a host check";
+}
+
+int64_t CheckedAdd(int64_t a, int64_t b) {
+  int64_t sum;
+  if (__builtin_add_overflow(a, b, &sum)) NoInt64(a, "+", b);
+  return sum;
+}
+
+int64_t CheckedMul(int64_t a, int64_t b) {
+  int64_t product;
+  if (__builtin_mul_overflow(a, b, &product)) NoInt64(a, "*", b);
+  return product;
+}
+
 void Run(TensorView a_out, TensorView a_prefix, TensorView a_delta, TensorView a_blocks, TensorView a_norm_weight, TensorView a_qk_weight, TensorView a_output_norm_weight, int64_t a_blocks_m_stride, int64_t a_blocks_k_stride, double a_eps, double a_output_norm_eps, int64_t a_M, int64_t a_enable_pdl, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_out.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
@@ -76,6 +93,10 @@ void Run(TensorView a_out, TensorView a_prefix, TensorView a_delta, TensorView a
   check_same_device(a_qk_weight, a_out, "qk_weight", "out");
   check_contiguous(a_output_norm_weight, "output_norm_weight");
   check_same_device(a_output_norm_weight, a_out, "output_norm_weight", "out");
+  TVM_FFI_CHECK((a_blocks_k_stride >= 7168LL), ValueError)
+      << KERNEL_NAME << ": requires (blocks_k_stride >= 7168)";
+  TVM_FFI_CHECK((a_blocks_m_stride >= CheckedAdd(CheckedMul(2LL, a_blocks_k_stride), 7168LL)), ValueError)
+      << KERNEL_NAME << ": requires (blocks_m_stride >= ((2 * blocks_k_stride) + 7168))";
   TVM_FFI_CHECK(a_enable_pdl == 0LL || a_enable_pdl == 1LL, ValueError)
       << KERNEL_NAME << ": 'enable_pdl' = " << a_enable_pdl << " is not 0 or 1";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)

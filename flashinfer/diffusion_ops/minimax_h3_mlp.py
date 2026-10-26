@@ -62,7 +62,10 @@ _BLOCK_M = 128
 _CTA_GROUP = 2
 _FC2_BLOCK_N = 256  # output columns per CTA pair of the FC2 GEMM
 _FC2_N_TILES = MINIMAX_H3_HIDDEN // _FC2_BLOCK_N  # 21
-_NORM_ROWS_PER_CTA = 4  # the norm kernels run one warp per row
+_NORM_ROWS_PER_CTA = 4  # the BF16 and MXFP8 norm kernels run one warp per row
+# The NVFP4 norm kernel is persistent: one CTA per SM, each streaming a contiguous run of rows
+# with this many rows in flight; fewer CTAs when M does not give every one of them a row.
+_NVFP4_NORM_ROW_GROUPS = 8
 # FC1 output tiles per row-tile pair: 256x256 pair tiles (128 y columns each) or 256x448 pair
 # tiles (224 y columns each).  The MXFP8 FC1 GEMM is chosen by the weight scale layout: 128-row
 # tiles (prepare_minimax_h3_fc1_weight_mxfp8) run 256x256, 112-row sub-tiles
@@ -126,16 +129,23 @@ def _device_index(device: torch.device) -> int:
 
 
 def _launch_grids(
-    rows: int, device: torch.device, fc1_n_tiles: int, fc2_tail_split: bool
+    rows: int,
+    device: torch.device,
+    fc1_n_tiles: int,
+    fc2_tail_split: bool,
+    norm_row_groups: int = 0,
 ) -> Tuple[int, int, int, int, int, int]:
     """``(norm_grid, fc1_grid, fc2_grid, fc2_tail_base, fc2_split_count, fc2_clusters)``.
 
-    The norm kernel runs one warp per row.  Each GEMM launches one cluster (CTA pair) per output
-    tile pair; the hardware runs as many clusters as fit and running clusters claim the remaining
-    tiles in order through cluster launch control.  With the tail split, the FC2 launch adds one
-    cluster per tile of its final partial wave, which computes that tile's second K half."""
+    The norm kernel runs one warp per row; with ``norm_row_groups`` it is persistent instead and
+    launches ``min(SMs, ceil(M / norm_row_groups))`` CTAs.  Each GEMM launches one cluster (CTA
+    pair) per output tile pair; the hardware runs as many clusters as fit and running clusters
+    claim the remaining tiles in order through cluster launch control.  With the tail split, the
+    FC2 launch adds one cluster per tile of its final partial wave, which computes that tile's
+    second K half."""
     pairs = _m_tiles(rows) // _CTA_GROUP
-    clusters = _sm_count(_device_index(device)) // _CTA_GROUP
+    sm_count = _sm_count(_device_index(device))
+    clusters = sm_count // _CTA_GROUP
     fc2_tiles = pairs * _FC2_N_TILES
     tail = fc2_tiles % clusters
     split = 0
@@ -146,8 +156,14 @@ def _launch_grids(
         and fc2_tiles <= _FC2_TAIL_SPLIT_MAX_WAVES * clusters
     ):
         split = tail
+    if norm_row_groups:
+        norm_grid = max(
+            1, min(sm_count, (rows + norm_row_groups - 1) // norm_row_groups)
+        )
+    else:
+        norm_grid = (rows + _NORM_ROWS_PER_CTA - 1) // _NORM_ROWS_PER_CTA
     return (
-        (rows + _NORM_ROWS_PER_CTA - 1) // _NORM_ROWS_PER_CTA,
+        norm_grid,
         pairs * fc1_n_tiles * _CTA_GROUP,
         (fc2_tiles + split) * _CTA_GROUP,
         (fc2_tiles - tail) * _CTA_GROUP,
@@ -587,7 +603,9 @@ def _minimax_h3_mlp_nvfp4_impl(
         fc2_partial,
         fc2_flags,
         eps,
-        *_launch_grids(x.shape[0], x.device, _FC1_NVFP4_N_TILES, False),
+        *_launch_grids(
+            x.shape[0], x.device, _FC1_NVFP4_N_TILES, False, _NVFP4_NORM_ROW_GROUPS
+        ),
     )
 
 

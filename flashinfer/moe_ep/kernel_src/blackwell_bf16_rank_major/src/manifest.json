@@ -18,17 +18,21 @@
   },
   "kernel_symbols": [
     "kernel_rank_major_stage_inputs_v1",
-    "kernel_rank_major_input_arrive_v1",
-    "kernel_rank_major_dispatch_v2",
+    "kernel_rank_major_input_arrive_v2",
+    "kernel_rank_major_dispatch_v4",
     "kernel_rank_major_route_fused_v1",
     "kernel_rank_major_exact_fc1_swiglu_v1",
     "kernel_trtllm_moe_bmm_tile_n64_fc2_bf16",
-    "kernel_rank_major_exact_unpermute_v2",
+    "kernel_rank_major_exact_unpermute_v8",
     "kernel_rank_major_partial_arrive_v1",
-    "kernel_rank_major_combine_v3"
+    "kernel_rank_major_combine_v3",
+    "kernel_rank_major_ll_push_v4",
+    "kernel_rank_major_ll_recv_v2",
+    "kernel_rank_major_exact_unpermute_v6",
+    "kernel_rank_major_combine_v6"
   ],
   "schema_version": 1,
-  "source_sha256": "96283d84de09afaea949a580bce19ddfe60ba1428be4ed79a14324fd09ab4ca1",
+  "source_sha256": "cf3ee38bd13efac4ec0d415d7a2a9a3347b91b85f0f6070f236a6d24410b9b24",
   "stages": [
     {
       "bindings": [
@@ -77,7 +81,8 @@
         "pg_world",
         "pg_rank",
         "pg_flags",
-        "routed_peers"
+        "routed_peers",
+        "route_codes_peers"
       ],
       "block": [
         32,
@@ -104,7 +109,7 @@
           128
         ]
       ],
-      "symbol": "kernel_rank_major_input_arrive_v1",
+      "symbol": "kernel_rank_major_input_arrive_v2",
       "use_pdl": true
     },
     {
@@ -131,7 +136,8 @@
         "num_non_exiting_ctas",
         "total_padded_rows",
         "route_map",
-        "zero_sentinel"
+        "zero_sentinel",
+        "route_codes"
       ],
       "block": [
         256,
@@ -158,7 +164,7 @@
           128
         ]
       ],
-      "symbol": "kernel_rank_major_dispatch_v2",
+      "symbol": "kernel_rank_major_dispatch_v4",
       "use_pdl": true
     },
     {
@@ -318,7 +324,7 @@
           128
         ]
       ],
-      "symbol": "kernel_rank_major_exact_unpermute_v2",
+      "symbol": "kernel_rank_major_exact_unpermute_v8",
       "use_pdl": true
     },
     {
@@ -381,6 +387,177 @@
       "pdl_sync": true,
       "scalar_bindings": [],
       "symbol": "kernel_rank_major_combine_v3",
+      "use_pdl": true
+    },
+    {
+      "bindings": [
+        "hidden_in",
+        "ids_in",
+        "weights_in",
+        "topk_ids",
+        "ids_is_int64",
+        "active_tokens_per_rank",
+        "pg_world",
+        "pg_rank",
+        "ll_dispatch_peers",
+        "ll_control",
+        "ll_reuse_peers",
+        "ll_combine_peers"
+      ],
+      "block": [
+        288,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "dynamic_smem_bytes": 0,
+      "grid": [
+        32,
+        8,
+        8
+      ],
+      "name": "ll_push",
+      "pdl_launch": true,
+      "pdl_sync": false,
+      "scalar_bindings": [
+        [
+          "active_tokens_per_rank",
+          32
+        ]
+      ],
+      "symbol": "kernel_rank_major_ll_push_v4",
+      "use_pdl": false
+    },
+    {
+      "bindings": [
+        "recv_hidden",
+        "recv_local_ids",
+        "recv_weights",
+        "active_tokens_per_rank",
+        "pg_world",
+        "pg_rank",
+        "ll_dispatch",
+        "ll_control",
+        "expert_scatter_offsets",
+        "token_to_permuted",
+        "cta_to_expert",
+        "cta_to_mn_limit",
+        "expert_padded_row_offsets",
+        "num_non_exiting_ctas",
+        "total_padded_rows",
+        "route_map",
+        "zero_sentinel",
+        "row_splits"
+      ],
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "dynamic_smem_bytes": 0,
+      "grid": [
+        257,
+        1,
+        1
+      ],
+      "name": "ll_recv",
+      "pdl_launch": true,
+      "pdl_sync": true,
+      "scalar_bindings": [
+        [
+          "active_tokens_per_rank",
+          32
+        ],
+        [
+          "row_splits",
+          8
+        ]
+      ],
+      "symbol": "kernel_rank_major_ll_recv_v2",
+      "use_pdl": true
+    },
+    {
+      "bindings": [
+        "expert_output",
+        "topk_weights",
+        "token_to_permuted",
+        "ll_combine_peers",
+        "ll_control",
+        "hidden_size",
+        "active_tokens_per_rank",
+        "pg_rank"
+      ],
+      "block": [
+        128,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "dynamic_smem_bytes": 0,
+      "grid": [
+        256,
+        7,
+        1
+      ],
+      "name": "ll_unpermute",
+      "pdl_launch": true,
+      "pdl_sync": true,
+      "scalar_bindings": [
+        [
+          "hidden_size",
+          7168
+        ],
+        [
+          "active_tokens_per_rank",
+          32
+        ]
+      ],
+      "symbol": "kernel_rank_major_exact_unpermute_v6",
+      "use_pdl": true
+    },
+    {
+      "bindings": [
+        "output",
+        "pg_rank",
+        "ll_combine",
+        "ll_control",
+        "topk_ids",
+        "ll_reuse"
+      ],
+      "block": [
+        160,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "dynamic_smem_bytes": 0,
+      "grid": [
+        32,
+        7,
+        1
+      ],
+      "name": "ll_combine",
+      "pdl_launch": false,
+      "pdl_sync": true,
+      "scalar_bindings": [],
+      "symbol": "kernel_rank_major_combine_v6",
       "use_pdl": true
     }
   ]

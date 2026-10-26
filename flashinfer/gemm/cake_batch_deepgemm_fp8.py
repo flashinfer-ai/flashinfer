@@ -90,7 +90,7 @@ def serving_config(
     """
     if k == 7168:
         if expected_m <= 1:
-            return 5, 2, "evict_normal", 0, 8
+            return 6, 1, "evict_normal", 0, 2
         if expected_m <= 3:
             return 5, 2, "evict_normal", 16, 8
         if sm_count == 148:
@@ -127,7 +127,7 @@ def serving_plan(
     key = serving_program_key(
         n, k, groups, num_stages, num_epi_stages, a_cache_hint, n_l2_group
     )
-    program = SERVING_PROGRAMS.get(key)
+    program = SERVING_PROGRAMS.get(f"{arch}:{key}", SERVING_PROGRAMS.get(key))
     if program is None:
         raise NotImplementedError(
             f"no generated packed-scale serving program for N={n}, K={k}, B={groups}, "

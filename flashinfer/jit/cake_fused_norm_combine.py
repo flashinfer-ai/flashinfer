@@ -13,9 +13,10 @@
 # limitations under the License.
 """Generated programs of the eight-peer fused residual-add, two-track RMSNorm and BF16
 combine (hidden size 2560, sm_100a and sm_103a), one per dispatch band of the token
-count: the one-shot exchange with one CTA per token, the same exchange over eight CTAs
-per token, and the two-round owner reduce as a persistent streaming grid and as a
-persistent software-pipelined grid, both launched cooperatively. The host module
+count: the one-shot exchange with one CTA per token (with a one-token build), the same
+exchange over eight CTAs per token, and the two-round owner reduce as a persistent
+streaming grid and as a persistent software-pipelined grid at four and at three CTAs per
+SM, all three launched cooperatively. The host module
 ``flashinfer.comm.cake_fused_norm_combine`` owns the peer-mapped workspace, validates
 the tensors, selects the program and the grid and launches it.
 
@@ -28,13 +29,55 @@ from __future__ import annotations
 from . import cake_program
 from .core import JitSpec
 
-PARALLEL = cake_program.CakeProgram(
-    name="cake_fused_norm_combine_f0f0fd407a1de987d19e",
+PARALLEL_SINGLE = cake_program.CakeProgram(
+    name="cake_fused_norm_combine_7778a9a131a0653e5671",
     operator_dir="cake_fused_norm_combine",
-    kernel="kernel_cake_fused_norm_combine_f0f0fd407a1de987d19e",
+    kernel="kernel_cake_fused_norm_combine_7778a9a131a0653e5671",
     sources=(
-        "cake_fused_norm_combine_f0f0fd407a1de987d19e_kernel.cu",
-        "cake_fused_norm_combine_f0f0fd407a1de987d19e_binding.cu",
+        "cake_fused_norm_combine_7778a9a131a0653e5671_kernel.cu",
+        "cake_fused_norm_combine_7778a9a131a0653e5671_binding.cu",
+    ),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(("sm_100a", ("--fmad=true",)), ("sm_103a", ("--fmad=true",))),
+    args=(
+        "x",
+        "residual",
+        "weight",
+        "norm_out",
+        "residual_out",
+        "collective_out",
+        "workspace",
+        "rank",
+        "tokens",
+        "epsilon",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "x",
+        "residual",
+        "weight",
+        "norm_out",
+        "residual_out",
+        "collective_out",
+        "workspace",
+    ),
+    block=(320, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=10496,
+    use_pdl=True,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+PARALLEL = cake_program.CakeProgram(
+    name="cake_fused_norm_combine_f745596d3f90db224372",
+    operator_dir="cake_fused_norm_combine",
+    kernel="kernel_cake_fused_norm_combine_f745596d3f90db224372",
+    sources=(
+        "cake_fused_norm_combine_f745596d3f90db224372_kernel.cu",
+        "cake_fused_norm_combine_f745596d3f90db224372_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(("sm_100a", ("--fmad=true",)), ("sm_103a", ("--fmad=true",))),
@@ -71,12 +114,12 @@ PARALLEL = cake_program.CakeProgram(
 )
 
 PARALLEL_SPLIT = cake_program.CakeProgram(
-    name="cake_fused_norm_combine_45d4f681e01eef5ea0d0",
+    name="cake_fused_norm_combine_3def0164ca6263e62e56",
     operator_dir="cake_fused_norm_combine",
-    kernel="kernel_cake_fused_norm_combine_45d4f681e01eef5ea0d0",
+    kernel="kernel_cake_fused_norm_combine_3def0164ca6263e62e56",
     sources=(
-        "cake_fused_norm_combine_45d4f681e01eef5ea0d0_kernel.cu",
-        "cake_fused_norm_combine_45d4f681e01eef5ea0d0_binding.cu",
+        "cake_fused_norm_combine_3def0164ca6263e62e56_kernel.cu",
+        "cake_fused_norm_combine_3def0164ca6263e62e56_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(("sm_100a", ("--fmad=true",)), ("sm_103a", ("--fmad=true",))),
@@ -113,12 +156,12 @@ PARALLEL_SPLIT = cake_program.CakeProgram(
 )
 
 OWNER_STREAM = cake_program.CakeProgram(
-    name="cake_fused_norm_combine_068ee430f3a25ed6d13e",
+    name="cake_fused_norm_combine_426f8d7edfb8a57040ce",
     operator_dir="cake_fused_norm_combine",
-    kernel="kernel_cake_fused_norm_combine_068ee430f3a25ed6d13e",
+    kernel="kernel_cake_fused_norm_combine_426f8d7edfb8a57040ce",
     sources=(
-        "cake_fused_norm_combine_068ee430f3a25ed6d13e_kernel.cu",
-        "cake_fused_norm_combine_068ee430f3a25ed6d13e_binding.cu",
+        "cake_fused_norm_combine_426f8d7edfb8a57040ce_kernel.cu",
+        "cake_fused_norm_combine_426f8d7edfb8a57040ce_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(("sm_100a", ("--fmad=true",)), ("sm_103a", ("--fmad=true",))),
@@ -155,12 +198,54 @@ OWNER_STREAM = cake_program.CakeProgram(
 )
 
 OWNER_PIPELINED = cake_program.CakeProgram(
-    name="cake_fused_norm_combine_43fbcf87256eb482ea39",
+    name="cake_fused_norm_combine_3e5044114a64d435bf4e",
     operator_dir="cake_fused_norm_combine",
-    kernel="kernel_cake_fused_norm_combine_43fbcf87256eb482ea39",
+    kernel="kernel_cake_fused_norm_combine_3e5044114a64d435bf4e",
     sources=(
-        "cake_fused_norm_combine_43fbcf87256eb482ea39_kernel.cu",
-        "cake_fused_norm_combine_43fbcf87256eb482ea39_binding.cu",
+        "cake_fused_norm_combine_3e5044114a64d435bf4e_kernel.cu",
+        "cake_fused_norm_combine_3e5044114a64d435bf4e_binding.cu",
+    ),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(("sm_100a", ("--fmad=true",)), ("sm_103a", ("--fmad=true",))),
+    args=(
+        "x",
+        "residual",
+        "weight",
+        "norm_out",
+        "residual_out",
+        "collective_out",
+        "workspace",
+        "rank",
+        "tokens",
+        "epsilon",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "x",
+        "residual",
+        "weight",
+        "norm_out",
+        "residual_out",
+        "collective_out",
+        "workspace",
+    ),
+    block=(160, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=128,
+    use_pdl=True,
+    cooperative=True,
+    needs_device_linking=False,
+)
+
+OWNER_PIPELINED_EARLY = cake_program.CakeProgram(
+    name="cake_fused_norm_combine_8d72efaafce77c1ae5f9",
+    operator_dir="cake_fused_norm_combine",
+    kernel="kernel_cake_fused_norm_combine_8d72efaafce77c1ae5f9",
+    sources=(
+        "cake_fused_norm_combine_8d72efaafce77c1ae5f9_kernel.cu",
+        "cake_fused_norm_combine_8d72efaafce77c1ae5f9_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(("sm_100a", ("--fmad=true",)), ("sm_103a", ("--fmad=true",))),
@@ -197,10 +282,12 @@ OWNER_PIPELINED = cake_program.CakeProgram(
 )
 
 PROGRAMS: tuple[cake_program.CakeProgram, ...] = (
+    PARALLEL_SINGLE,
     PARALLEL,
     PARALLEL_SPLIT,
     OWNER_STREAM,
     OWNER_PIPELINED,
+    OWNER_PIPELINED_EARLY,
 )
 
 
@@ -210,10 +297,12 @@ def aot_specs(target: str) -> tuple[JitSpec, ...]:
 
 
 __all__ = [
+    "PARALLEL_SINGLE",
     "PARALLEL",
     "PARALLEL_SPLIT",
     "OWNER_STREAM",
     "OWNER_PIPELINED",
+    "OWNER_PIPELINED_EARLY",
     "PROGRAMS",
     "aot_specs",
 ]

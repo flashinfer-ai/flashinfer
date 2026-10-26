@@ -129,10 +129,11 @@ SEG_P_SMALL_BY_ARCH = {
 SEG_P_SMALL_MAX_NH = 4
 # The two-level segment carry (seg_carry_v8): the segments of each document's chain in groups of g, the groups'
 # products formed in parallel and chained, the CTAs handing over through CARRY_FLAG_WORDS_PER_CTA release-flag
-# words each under a fresh epoch.  Dispatched on CARRY_V8_ARCHES at most CARRY_V8_MAX_H heads, on the segmented rows
-# that are not the forward's overlap rows (those keep seg_carry_ov), where the host rule accepts: the shortest
-# critical path that fits one CTA per SM gains more than CARRY_S_HOPS hops over the chain (_carry_choice).
-CARRY_V8_ARCHES = ("sm_100a", "sm_107a")
+# words each under a fresh epoch.  Dispatched on every architecture (CARRY_V8_ARCHES) at most CARRY_V8_MAX_H heads,
+# on the segmented rows that are not the forward's overlap rows (those keep seg_carry_ov), where the host rule
+# accepts: the shortest critical path that fits one CTA per SM gains more than CARRY_S_HOPS hops over the chain
+# (_carry_choice).
+CARRY_V8_ARCHES = ARCHES
 CARRY_V8_MAX_H = 2
 CARRY_S_HOPS = 14
 CARRY_FLAG_WORDS_PER_CTA = 3
@@ -142,9 +143,13 @@ CARRY_FLAG_WORDS_PER_CTA = 3
 GATE_FUSED_ARCHES = ("sm_103a",)
 # The light saved set (version 4) carries the fold's qg on every row (the light backward's prep, bwd_prep_g8_noqg,
 # writes none) and the WY representation w / u on the paired serial WU_SAVED_H-head rows (the 32-column form) of
-# WU_SAVED_ARCHES: their prep is bwd_prep_g8_noqg_nokb and their light backward launches no wy program.
+# WU_SAVED_ARCHES and on the segmented WU_SAVED_H-head rows of WU_SEG_SAVED_ARCHES above WU_SEG_MIN_CHAINS (document,
+# head) chains (the rows above the fused saved-state pass 2's bound): their prep is bwd_prep_g8_noqg_nokb on both
+# light paths and their light backward launches no wy program.
 WU_SAVED_ARCHES = ("sm_100a",)
 WU_SAVED_H = 16
+WU_SEG_SAVED_ARCHES = ("sm_103a", "sm_107a")
+WU_SEG_MIN_CHAINS = 32
 # the table stage is optional too: on the forward and the replay of the segmented route up to 256 documents the
 # intra program writes the tables and no table record is selected; the gate epilogue launches on sm_107a alone
 OPTIONAL_STAGES = (
@@ -303,15 +308,13 @@ GRID_KINDS = (
     "carry_groups",
     "segments_heads",
 )
-# the records delivered for a subset of the architectures (every other record ships on all three): the gate
-# epilogue and its unfused GLM intra program on sm_100a / sm_107a, the fused one on sm_103a, the two-level carry on the
-# two families that take it, the no-kb prep on the architecture whose light set carries w / u
+# the records delivered for a subset of the architectures (every other record ships on all three, the two-level
+# carry and the no-kb prep among them): the gate epilogue and its unfused GLM intra program on sm_100a / sm_107a, the
+# fused one on sm_103a
 RECORD_ARCHES = {
     "glm_intra": ("sm_100a", "sm_107a"),
     "glm_intra_v14": ("sm_103a",),
     "gate_epilogue": ("sm_100a", "sm_107a"),
-    "seg_carry_v8": ("sm_100a", "sm_107a"),
-    "bwd_prep_g8_noqg_nokb": ("sm_100a",),
 }
 # The records of the segmented adjoint recurrence launch twice per stage (the carry between the passes); the
 # forward recurrence's passes are two stages (fwdh, fwdh_p3).
@@ -339,15 +342,18 @@ def _gate_fused(arch: str | None) -> bool:
 
 def _wu_saved(n: int, h: int, sm: int, arch: str | None) -> bool:
     """Whether the light set of the row carries ``w`` / ``u``: the serial route at ``WU_SAVED_H`` heads in the
-    32-column form on ``WU_SAVED_ARCHES`` (``arch=None``: the first exported architecture)."""
+    32-column form on ``WU_SAVED_ARCHES``, the segmented route at ``WU_SAVED_H`` heads above ``WU_SEG_MIN_CHAINS``
+    (document, head) chains on ``WU_SEG_SAVED_ARCHES`` (``arch=None``: the first exported architecture)."""
     arch = ARCHES[0] if arch is None else arch
     route = _expected_segments(n, h, sm, arch)[0]
-    return (
-        route == "serial"
-        and h == WU_SAVED_H
-        and n * h * RECUR_SLICES["v2"] <= sm * RECUR_CTAS_PER_SM
-        and arch in WU_SAVED_ARCHES
-    )
+    if h != WU_SAVED_H:
+        return False
+    if route == "serial":
+        return (
+            n * h * RECUR_SLICES["v2"] <= sm * RECUR_CTAS_PER_SM
+            and arch in WU_SAVED_ARCHES
+        )
+    return n * h > WU_SEG_MIN_CHAINS and arch in WU_SEG_SAVED_ARCHES
 
 
 def _carry_ctas(p: int, g: int) -> int:
@@ -569,7 +575,7 @@ def test_registry_records_are_well_formed() -> None:
             {"kind": "segments_heads_at_most", "max": OV1_MAX_SEGMENT_HEADS},
         ],
     }
-    # the backward paths and the forward's non-overlap rows: the two-level carry on sm_100a / sm_107a at most
+    # the backward paths and the forward's non-overlap rows: the two-level carry on every architecture at most
     # CARRY_V8_MAX_H heads where its host rule accepts, the chain carry everywhere else (the two rules partition)
     not_overlap = {
         "kind": "any_of",
@@ -590,10 +596,6 @@ def test_registry_records_are_well_formed() -> None:
             {
                 "kind": "any_of",
                 "rules": [
-                    {
-                        "kind": "arch_in",
-                        "arches": [a for a in ARCHES if a not in CARRY_V8_ARCHES],
-                    },
                     {"kind": "heads_above", "min": CARRY_V8_MAX_H},
                     {"kind": "carry_chain", "s_hops": CARRY_S_HOPS},
                 ],
@@ -608,7 +610,6 @@ def test_registry_records_are_well_formed() -> None:
             {
                 "kind": "all_of",
                 "rules": [
-                    {"kind": "arch_in", "arches": list(CARRY_V8_ARCHES)},
                     {"kind": "heads_at_most", "max": CARRY_V8_MAX_H},
                     {"kind": "carry_two_level", "s_hops": CARRY_S_HOPS},
                 ],
@@ -620,7 +621,9 @@ def test_registry_records_are_well_formed() -> None:
         "s_hops": CARRY_S_HOPS,
     }
     # the backward prep: the tape set's form (it writes qg), the replay's, and the light sets' no-qg forms (the
-    # version-4 set carries the forward's qg): the no-kb one on the rows whose set carries w / u, the other elsewhere
+    # version-4 set carries the forward's qg): the no-kb one, on both light paths, on the rows whose set carries w / u
+    # (the paired serial rows of WU_SAVED_ARCHES and the segmented rows of WU_SEG_SAVED_ARCHES above WU_SEG_MIN_CHAINS
+    # chains), the other elsewhere
     light = {"kind": "path_in", "paths": ["light"]}
     light_states = {"kind": "path_in", "paths": ["light_states"]}
     slots_fit = {
@@ -661,6 +664,42 @@ def test_registry_records_are_well_formed() -> None:
             },
         ],
     }
+    seg_wu_rows = {
+        "kind": "all_of",
+        "rules": [
+            seg_rule,
+            {
+                "kind": "all_of",
+                "rules": [
+                    {"kind": "heads_at_least", "min": WU_SAVED_H},
+                    {"kind": "heads_at_most", "max": WU_SAVED_H},
+                ],
+            },
+            {"kind": "chains_above", "min": WU_SEG_MIN_CHAINS},
+            {"kind": "arch_in", "arches": list(WU_SEG_SAVED_ARCHES)},
+        ],
+    }
+    not_seg_wu_rows = {
+        "kind": "any_of",
+        "rules": [
+            serial_rule,
+            {"kind": "heads_below", "max": WU_SAVED_H},
+            {"kind": "heads_above", "min": WU_SAVED_H},
+            {"kind": "chains_at_most", "max": WU_SEG_MIN_CHAINS},
+            {
+                "kind": "arch_in",
+                "arches": [a for a in ARCHES if a not in WU_SEG_SAVED_ARCHES],
+            },
+        ],
+    }
+    light_paths = {"kind": "path_in", "paths": ["light", "light_states"]}
+    # the serial rows' form is gated to the light path (the serial route never saves the states); its complement
+    # in the kb-writing form admits the states-saving set
+    wu_rows_light = {"kind": "all_of", "rules": [light, *wu_rows["rules"]]}
+    not_wu_rows_or_states = {
+        "kind": "any_of",
+        "rules": [light_states, *not_wu_rows["rules"]],
+    }
     assert cake_jit.MODULES["bwd_prep_g8"]["select_rule"] == {
         "kind": "path_in",
         "paths": ["tape"],
@@ -670,15 +709,19 @@ def test_registry_records_are_well_formed() -> None:
         "paths": ["replay"],
     }
     assert cake_jit.MODULES["bwd_prep_g8_noqg"]["select_rule"] == {
-        "kind": "any_of",
-        "rules": [light_states, {"kind": "all_of", "rules": [light, not_wu_rows]}],
+        "kind": "all_of",
+        "rules": [light_paths, not_wu_rows_or_states, not_seg_wu_rows],
     }
     assert cake_jit.MODULES["bwd_prep_g8_noqg_nokb"]["select_rule"] == {
         "kind": "all_of",
-        "rules": [light, wu_rows],
+        "rules": [
+            light_paths,
+            {"kind": "any_of", "rules": [wu_rows_light, seg_wu_rows]},
+        ],
     }
     # the backward's WY program: every tape set; the light sets but the fused 64-column recompute's rows and the
-    # rows whose set carries w / u; the saved-state sets above 32 chains (the fused pass 2 forms it below)
+    # rows whose set carries w / u; the saved-state sets above 32 chains (the fused pass 2 forms it below) but,
+    # again, the segmented rows whose set carries w / u
     assert cake_jit.MODULES["wy_bwd"]["select_rule"] == {
         "kind": "any_of",
         "rules": [
@@ -695,6 +738,7 @@ def test_registry_records_are_well_formed() -> None:
                         ],
                     },
                     not_wu_rows,
+                    not_seg_wu_rows,
                 ],
             },
             {
@@ -702,6 +746,7 @@ def test_registry_records_are_well_formed() -> None:
                 "rules": [
                     light_states,
                     {"kind": "chains_above", "min": FUSED_P3_MAX_CHAINS},
+                    not_seg_wu_rows,
                 ],
             },
         ],
@@ -820,7 +865,7 @@ def _expected_records(
         not seg and h >= FUSED_FWD_MIN_H and (arch != "sm_107a" or h <= FUSED_FWD_MIN_H)
     )
     fused_bwd = not seg and not v2 and h >= FUSED_BWD_MIN_H
-    # the rows whose light set carries w / u: no wy launch on their light path, a prep that writes no kb
+    # the rows whose light set carries w / u: no wy launch on their light paths, a prep that writes no kb
     wu = _wu_saved(n, h, sm, arch)
     # the fused gradient hosts dAqk on the serial rows from 16 heads and on every segmented row (whose adjoint
     # recurrence accumulates dv): no dav launch there
@@ -845,7 +890,7 @@ def _expected_records(
         and walk >= OV1_MIN_WAVES_BY_ARCH[arch] * sm
         and walk <= OV1_MAX_SEGMENT_HEADS
     )
-    # the two-level carry on the two families at most two heads where its host rule accepts (the forward's
+    # the two-level carry on every architecture at most two heads where its host rule accepts (the forward's
     # overlap rows keep the pair's carry); the chain carry everywhere else
     two_level = (
         seg
@@ -886,7 +931,7 @@ def _expected_records(
     elif path == "light":
         out["wy"] = None if (fused_bwd or wu) else "wy_bwd"
     elif path == "light_states":
-        out["wy"] = None if fused_p3 else "wy_bwd"
+        out["wy"] = None if (fused_p3 or wu) else "wy_bwd"
     elif replay:
         out["wy"] = None if fused_bwd else "wy_bwd_replay"
     else:
@@ -932,7 +977,7 @@ def _expected_records(
         out["bwd_prep"] = "bwd_prep_g8"
     elif replay:
         out["bwd_prep"] = "bwd_prep_g8_replay"
-    elif path == "light" and wu:
+    elif path in ("light", "light_states") and wu:
         out["bwd_prep"] = "bwd_prep_g8_noqg_nokb"
     elif path in ("light", "light_states"):
         out["bwd_prep"] = "bwd_prep_g8_noqg"
@@ -1263,10 +1308,12 @@ def test_flag_words_count_three_per_cta() -> None:
         assert cake_jit.flag_words(sm) <= D * D
 
 
-def test_the_two_level_carry_dispatches_on_two_families_at_most_two_heads() -> None:
-    # The two-level carry takes the backward paths and the forward's non-overlap rows on sm_100a / sm_107a at one
-    # or two heads where its rule accepts; never on sm_103a, never above two heads, never on the forward's
-    # overlap rows (seg_carry_ov); the chain carry where the rule rejects.
+def test_the_two_level_carry_dispatches_on_every_architecture_at_most_two_heads() -> (
+    None
+):
+    # The two-level carry takes the backward paths and the forward's non-overlap rows on every architecture at one
+    # or two heads where its rule accepts; never above two heads, never on the forward's overlap rows
+    # (seg_carry_ov); the chain carry where the rule rejects.
     sm = 148
     accepted = ((4, 2), (3, 2), (1, 1), (2, 2), (4, 1), (1, 2))
     for n, h in accepted:
@@ -1325,8 +1372,12 @@ def test_the_two_level_carry_dispatches_on_two_families_at_most_two_heads() -> N
     for path in ("light", "light_states", "tape", "replay"):
         assert p.records[path]["seg_carry"] == "seg_carry_v8"
         assert p.launches("seg_carry", path) == 1
+    # sm_103a: the same 64 segments per document, the same choice
     p = cake_backend.plan(4096, 4, 2, sm, "sm_103a")
-    assert p.gsize == 0 and p.records["light"]["seg_carry"] == "seg_carry"
+    assert p.gsize == 13 and p.grid("seg_carry", "light") == (128, 1, 1)
+    assert p.records["fwd"]["seg_carry"] == "seg_carry_ov"
+    for path in ("light", "light_states", "tape", "replay"):
+        assert p.records[path]["seg_carry"] == "seg_carry_v8"
     p = cake_backend.plan(4096, 1, 1, sm, "sm_107a")  # 38 segments: g = 5, 30 CTAs
     assert p.gsize == 5 and p.grid("seg_carry", "fwd") == (30, 1, 1)
     assert p.records["fwd"]["seg_carry"] == "seg_carry_v8"
@@ -1860,11 +1911,13 @@ def test_launch_counts_of_the_paths() -> None:
     # 148 SMs, per architecture.  One document at 16 heads: on sm_100a the 32-column serial form (no dav: the fused
     # gradient hosts dAqk; on the saving forward the token-row pair wy_fwd_rows + fwdh_o_v2_rows, the same count)
     # whose light set carries w / u (no wy launch on the light path), on sm_103a / sm_107a a segmented row of 16
-    # chains (nine segments per document).  Four documents at 64 heads: the 64-column form (the fused recompute: no
+    # chains (nine segments per document); four documents at 16 heads: on sm_100a the same paired serial form, on
+    # sm_103a / sm_107a a segmented row of 64 chains whose light set carries w / u (no wy launch on either light
+    # path: one launch fewer there).  Four documents at 64 heads: the 64-column form (the fused recompute: no
     # WY launch on the light and replay paths; on sm_107a the saving forward's token-row pair wy_fwd_rows +
     # fwdh_o_v1_rows instead of the fused forward).  Segmented rows: four documents at 2 heads (eight chains: the
     # dv-accumulating adjoint, the fused saved-state pass 2; the overlap pair on the forward, the two-level carry
-    # on the backward paths of sm_100a / sm_107a) and one document at 4 heads (four chains: the two-CTA adjoint);
+    # on the backward paths) and one document at 4 heads (four chains: the two-CTA adjoint);
     # no dav launch on either (the fused gradient hosts dAqk), no table launch on the forward and the replay (the
     # intra program writes the chunk tables and the block table itself).  The forward has no prep launch; the
     # backward of sm_103a has no gate epilogue launch (the fused GLM intra program); sm_100a / sm_107a launch it on
@@ -1878,9 +1931,20 @@ def test_launch_counts_of_the_paths() -> None:
         "tape": 7,
         "replay": 11,
     }
+    # four documents at 16 heads (64 chains) on sm_103a / sm_107a: the set carries w / u, no wy launch on the light
+    # paths (one launch fewer than the one-document row there); on sm_100a the paired serial row again
+    seg_16_wu = {
+        "fwd": 5,
+        "fwd_nosave": 5,
+        "light": 9,
+        "light_states": 7,
+        "tape": 7,
+        "replay": 11,
+    }
     seg_small = dict(seg_16)
     counts_by_arch = {
         (1, 16): {"sm_100a": serial_16, "sm_103a": seg_16, "sm_107a": seg_16},
+        (4, 16): {"sm_100a": serial_16, "sm_103a": seg_16_wu, "sm_107a": seg_16_wu},
         (4, 64): {
             "sm_100a": {"fwd": 3, "fwd_nosave": 3, "light": 5, "tape": 5, "replay": 7},
             "sm_103a": {"fwd": 3, "fwd_nosave": 3, "light": 5, "tape": 5, "replay": 7},
@@ -1934,10 +1998,8 @@ def test_launch_counts_of_the_paths() -> None:
             assert p.records[path]["fwd_intra"] == "fwd_intra_v14"
         for path in ("light", "light_states", "tape"):
             assert p.records[path]["table"] == "table_v3"
-        # the two-level carry replaces the chain carry launch for launch
-        assert p.records["light"]["seg_carry"] == (
-            "seg_carry_v8" if arch in CARRY_V8_ARCHES else "seg_carry"
-        )
+        # the two-level carry replaces the chain carry launch for launch, on every architecture
+        assert p.records["light"]["seg_carry"] == "seg_carry_v8"
         assert cake_backend.plan(4096, 1, 16, 148, arch).records["fwd"][
             "fwd_intra"
         ] == ("fwd_intra" if arch == "sm_100a" else "fwd_intra_v14")
@@ -2004,18 +2066,22 @@ def test_saved_set_version_4_fields_and_the_autograd_extras() -> None:
     assert cake_backend._saved_extra(tape_seg)[1] == ("h", "v_new", "seg_m")
 
 
-def test_the_light_set_saves_qg_everywhere_and_w_u_on_the_paired_16_head_rows() -> None:
+def test_the_light_set_saves_qg_everywhere_and_w_u_where_the_prep_writes_no_kb() -> (
+    None
+):
     # Plan.light_saves_qg / light_saves_wu read the light path's prep record: no-qg forms on every row (the set
-    # carries the forward's qg), the no-kb form (w / u in the set, no wy launch) on the serial 16-head rows of
-    # sm_100a whose 32-column form fits one wave; the byte query adds the tensors accordingly.
+    # carries the forward's qg), the no-kb form (w / u in the set, no wy launch on either light path) on the serial
+    # 16-head rows of sm_100a whose 32-column form fits one wave and on the segmented 16-head rows of sm_103a /
+    # sm_107a above 32 chains; the byte query adds the tensors accordingly.
     S = 4096
-    seen_wu = 0
+    seen_wu = seen_seg_wu = 0
     for arch, n, h, sm in itertools.product(
         ARCHES, (1, 2, 7, 300), (1, 2, 4, 8, 12, 16, 24, 32, 64), (132, 148, 212)
     ):
         p = cake_backend.plan(S, n, h, sm, arch)
         wu = _wu_saved(n, h, sm, arch)
         seen_wu += wu
+        seen_seg_wu += wu and p.recur == "seg"
         assert p.light_saves_qg is True
         assert p.light_saves_wu is wu, (arch, n, h, sm)
         prep = p.records["light"]["bwd_prep"]
@@ -2026,11 +2092,16 @@ def test_the_light_set_saves_qg_everywhere_and_w_u_on_the_paired_16_head_rows() 
             sm,
         )
         if "light_states" in p.records:
-            assert p.records["light_states"]["bwd_prep"] == "bwd_prep_g8_noqg"
+            assert p.records["light_states"]["bwd_prep"] == prep
         assert p.records["tape"]["bwd_prep"] == "bwd_prep_g8"
         assert p.records["replay"]["bwd_prep"] == "bwd_prep_g8_replay"
         if wu:
-            assert (p.recur, h, arch) == ("serial", WU_SAVED_H, "sm_100a")
+            assert h == WU_SAVED_H
+            if p.recur == "serial":
+                assert arch in WU_SAVED_ARCHES and n * h * 4 <= 4 * sm
+            else:
+                assert arch in WU_SEG_SAVED_ARCHES and n * h > WU_SEG_MIN_CHAINS
+                assert p.records["light_states"]["wy"] is None
             assert p.records["light"]["wy"] is None
             assert p.records["tape"]["wy"] == "wy_bwd"
             assert p.records["replay"]["wy"] == "wy_bwd_replay"
@@ -2047,11 +2118,32 @@ def test_the_light_set_saves_qg_everywhere_and_w_u_on_the_paired_16_head_rows() 
             h,
             sm,
         )
-    assert seen_wu > 0
+    assert seen_wu > seen_seg_wu > 0
     # 300 documents at 16 heads on sm_100a need 19200 slots, above 4 * 148: the 64-column form keeps the wy launch
     p = cake_backend.plan(S, 300, 16, 148, "sm_100a")
     assert p.light_saves_wu is False and p.records["light"]["wy"] == "wy_bwd"
     assert p.records["light"]["bwd_prep"] == "bwd_prep_g8_noqg"
+    for arch in WU_SEG_SAVED_ARCHES:
+        # two documents at 16 heads are 32 chains, not above: the fused saved-state pass 2 keeps forming the WY
+        # representation (its w^T adjoint behind it) and the light path keeps the wy launch
+        p = cake_backend.plan(S, 2, 16, 148, arch)
+        assert p.recur == "seg" and p.light_saves_wu is False
+        assert p.records["light"]["wy"] == "wy_bwd"
+        assert p.records["light"]["bwd_prep"] == "bwd_prep_g8_noqg"
+        assert p.records["light_states"]["wy"] is None
+        assert p.records["light_states"]["fwdh_p3"] == "fwdh_p3_wy"
+        assert p.records["light_states"]["dhu"].endswith("_wt")
+        # three documents are 48 chains: the set carries w / u, neither light path launches wy, pass 2 and the
+        # adjoint take their plain forms (no w^T tile: the saved w is read as it is)
+        p = cake_backend.plan(S, 3, 16, 148, arch)
+        assert p.recur == "seg" and p.light_saves_wu is True
+        for path in ("light", "light_states"):
+            assert p.records[path]["bwd_prep"] == "bwd_prep_g8_noqg_nokb"
+            assert p.records[path]["wy"] is None
+            assert p.records[path]["fwdh_p3"] == "fwdh_p3"
+            assert not p.records[path]["dhu"].endswith("_wt")
+        assert p.records["light"]["fwdh"] == "fwdh_v3"
+        assert p.records["light_states"]["fwdh"] is None
 
 
 def test_gate_fused_architectures_lay_the_arena_out_without_the_epilogue_buffers() -> (
@@ -2123,12 +2215,14 @@ def test_seg_state_rule_is_a_pure_function_of_the_scalars() -> None:
 
 def test_byte_queries_follow_the_arena_layout() -> None:
     GiB = 2**30
-    # two 16-head rows: the paired serial rows of sm_100a (their light set carries w / u), segmented elsewhere
+    # three 16-head rows: the paired serial rows of sm_100a (their light set carries w / u), segmented elsewhere,
+    # where the three-document row (48 chains) carries w / u too
     rows = SHAPES + [
         ((239718 // 3,) * 3, 4),
         ((261393 // 4,) * 4, 64),
         ((129,), 16),
         ((2000, 2000), 16),
+        ((2000, 2000, 2000), 16),
     ]
     for (lengths, heads), arch in itertools.product(rows, ARCHES):
         S, N = sum(lengths), len(lengths)
@@ -2194,7 +2288,8 @@ def test_byte_queries_follow_the_arena_layout() -> None:
         if p.recur == "seg":
             assert layout[-1][2] == p.NSEG + 2 * N + 1
         # light (version 4): the fold's qg BF16 [R, H, 128] on every row; the WY representation w / u (two more
-        # such tensors) on the paired serial 16-head rows of sm_100a; the segment-boundary states (three FP32
+        # such tensors) on the paired serial 16-head rows of sm_100a and on the segmented 16-head rows of sm_103a /
+        # sm_107a above 32 chains; the segment-boundary states (three FP32
         # state blocks) when the size rule holds: of these rows only the large segmented one (H = 4), not the
         # small packs or the serial H = 64
         states = (
@@ -2206,7 +2301,10 @@ def test_byte_queries_follow_the_arena_layout() -> None:
         assert (states > 0) == (S > 200_000 and heads == 4)
         qg = p.R * heads * D * 2
         wu = 2 * p.R * heads * D * 2 if _wu_saved(N, heads, 148, arch) else 0
-        assert (wu > 0) == (heads == 16 and arch in WU_SAVED_ARCHES), (lengths, arch)
+        wu_row = heads == 16 and (
+            arch in WU_SAVED_ARCHES or N * heads > WU_SEG_MIN_CHAINS
+        )
+        assert (wu > 0) == wu_row, (lengths, arch)
         assert p.light_saves_qg is True and p.light_saves_wu is (wu > 0)
         assert (
             cake_backend.saved_bytes(S, heads, N, **q)
@@ -2899,8 +2997,8 @@ def test_manifest_is_well_formed(manifest: dict) -> None:
     assert set(ARCHES) <= set(arch_flags)
     libraries = manifest["libraries"]
     names = [entry["name"] for entry in libraries]
-    # The 64 programs of cake_jit.MODULES, each built for the architectures its record delivers (59 on all three,
-    # the five of RECORD_ARCHES on their subsets: 185 libraries), plus the KCP programs of cake_kcp_jit.MODULES
+    # The 64 programs of cake_jit.MODULES, each built for the architectures its record delivers (61 on all three,
+    # the three of RECORD_ARCHES on their subsets: 188 libraries), plus the KCP programs of cake_kcp_jit.MODULES
     # on every architecture (its test-only TEST_MODULES live in build.test.json, never here).
     kcp_libraries = {record["library"] for record in cake_kcp_jit.MODULES.values()}
     train_libraries = {
@@ -2908,8 +3006,8 @@ def test_manifest_is_well_formed(manifest: dict) -> None:
         for record in cake_jit.MODULES.values()
         for arch in record["arches"]
     }
-    assert len(train_libraries) == 185
-    assert len(names) == len(set(names)) == 185 + len(kcp_libraries) * len(ARCHES)
+    assert len(train_libraries) == 188
+    assert len(names) == len(set(names)) == 188 + len(kcp_libraries) * len(ARCHES)
     for entry in libraries:
         assert entry["arch"] in ARCHES
         assert entry["entry"] == "run"
@@ -3333,7 +3431,7 @@ def test_workspace_reuse_and_byte_counts(device, manifest) -> None:
 
 
 def test_launch_sequences_follow_the_plan(device, manifest) -> None:
-    # Seven rows: the segmented route with six chains (the two-level carry on sm_100a / sm_107a), 16 heads (on
+    # Seven rows: the segmented route with six chains (the two-level carry), 16 heads (on
     # sm_100a the 32-column serial form whose light set carries w / u: no wy launch on the light path; segmented
     # on sm_103a / sm_107a), the 64-column serial form at 64 heads (the fused forward and the fused backward
     # recompute), the few-chain segmented rows (the two-CTA adjoint; the fused gradient hosts dAqk) and, on a
@@ -3496,11 +3594,20 @@ def test_the_light_saved_set_carries_qg_and_w_u_where_the_plan_says(
 ) -> None:
     """Version 4 on the device: every light set carries the fold's qg (BF16 [R, H, 128], a per-call tensor
     outside the arena); w / u exactly on the rows whose plan reads them from the set (the paired serial 16-head
-    rows of sm_100a: no wy launch there); the bytes are the query's; the backward refuses a set without qg, an
-    unpaired w / u and w / u on the wrong row, and gives the same gradients from the set without its tables."""
+    rows of sm_100a and the segmented 16-head rows of sm_103a / sm_107a above 32 chains: no wy launch there); the
+    bytes are the query's; the backward refuses a set without qg, an unpaired w / u and w / u on the wrong row, and
+    gives the same gradients from the set without its tables."""
     sm, arch = cake_jit.sm_count(device.index), cake_jit.device_arch(device.index)
     seen_wu = 0
-    cases = (((129,), 16), ((65,), 2), ((63, 1, 65), 64), ((129, 300), 16))
+    # the 16-head rows: one, two and three documents (16, 32 and 48 chains: on sm_103a / sm_107a the third alone
+    # carries w / u; on sm_100a all three are paired serial rows)
+    cases = (
+        ((129,), 16),
+        ((65,), 2),
+        ((63, 1, 65), 64),
+        ((129, 300), 16),
+        ((129, 300, 70), 16),
+    )
     for lengths, heads in cases:
         S, N = sum(lengths), len(lengths)
         inputs = make_inputs(lengths, heads, device)
@@ -3568,14 +3675,79 @@ def test_the_light_saved_set_carries_qg_and_w_u_where_the_plan_says(
         else:
             refused("w and u together", dataclasses.replace(saved, w=saved.qg))
             refused("carries w / u", dataclasses.replace(saved, w=saved.qg, u=saved.qg))
-    assert seen_wu == (2 if arch in WU_SAVED_ARCHES else 0)
+    assert seen_wu == (3 if arch in WU_SAVED_ARCHES else 1)
+
+
+def test_the_states_saving_set_of_a_segmented_16_head_row_feeds_the_plain_passes(
+    device, manifest
+) -> None:
+    """On the segmented 16-head rows whose light set carries ``w`` / ``u`` (above 32 (document, head) chains on
+    sm_103a / sm_107a) a pack at the size rule's threshold saves the segment-boundary states too: the backward
+    from that set launches the kb-free prep, no WY program, the plain pass 3 and the plain adjoint recurrence
+    (the saved representation feeds both), and its gradients equal those of the checkpoint replay, of the same
+    set stripped of its states and of the set on a tape-mode workspace bit for bit."""
+    sm, arch = cake_jit.sm_count(device.index), cake_jit.device_arch(device.index)
+    num_docs, heads = 3, 16
+    route, _, nseg = cake_jit.segment_plan(num_docs, heads, sm, arch)
+    if route != "seg" or not _wu_saved(num_docs, heads, sm, arch):
+        pytest.skip(f"{arch}: three documents at 16 heads are a {route} row")
+    S = (
+        cake_backend.SEG_SAVE_MIN_TOKENS_PER_SEG * nseg
+    )  # the shortest pack that saves the states
+    lengths = _split(S, num_docs)
+    inputs = make_inputs(lengths, heads, device)
+    q, k, v, g, beta, cu, dout = (
+        inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
+    )
+    launched: list[str] = []
+
+    def recording(name, values, *, grid, device_index):
+        launched.append(name)
+        cake_jit.run_module(name, values, grid=grid, device_index=device_index)
+
+    ws = KdaWorkspace.for_problem(S, num_docs, heads, device, launcher=recording)
+    p = ws.plan
+    assert p.recur == "seg" and nseg == p.NSEG and p.seg_save is True
+    assert p.light_path == "light_states"
+    assert p.light_saves_qg is True and p.light_saves_wu is True
+    records = p.records["light_states"]
+    assert records["bwd_prep"] == "bwd_prep_g8_noqg_nokb" and records["wy"] is None
+    assert records["fwdh_p3"] == "fwdh_p3" and not records["dhu"].endswith("_wt")
+    _, saved = cake_backend.chunk_kda_fwd(q, k, v, g, beta, cu, workspace=ws)
+    assert saved.hseg is not None and saved.seg_state is not None
+    assert saved.qg is not None and saved.w is not None and saved.u is not None
+    launched.clear()
+    grads = cake_backend.chunk_kda_bwd(
+        q, k, v, g, beta, cu, dout, saved=saved, workspace=ws
+    )
+    grads = [t.clone() for t in grads]
+    assert launched == _expected_launches(p, "light_states")
+    assert launched[0] == "bwd_prep_g8_noqg_nokb" and "wy_bwd" not in launched
+    assert "fwdh_p3" in launched and records["dhu"] in launched
+    replay = cake_backend.chunk_kda_bwd(
+        q, k, v, g, beta, cu, dout, saved=None, workspace=ws
+    )
+    stripped = dataclasses.replace(saved, hseg=None, seg_state=None)
+    launched.clear()
+    from_stripped = cake_backend.chunk_kda_bwd(
+        q, k, v, g, beta, cu, dout, saved=stripped, workspace=ws
+    )
+    assert launched == _expected_launches(p, "light")
+    assert launched[0] == "bwd_prep_g8_noqg_nokb" and "wy_bwd" not in launched
+    tape_ws = KdaWorkspace.for_problem(S, num_docs, heads, device, save_mode="tape")
+    from_tape_ws = cake_backend.chunk_kda_bwd(
+        q, k, v, g, beta, cu, dout, saved=saved, workspace=tape_ws
+    )
+    for other in (replay, from_stripped, from_tape_ws):
+        for mine, theirs in zip(grads, other, strict=True):
+            assert torch.equal(mine, theirs)
 
 
 def test_the_two_level_carry_binds_its_group_operands(device, manifest) -> None:
-    """Where a path dispatches the two-level carry (sm_100a / sm_107a, at most two heads, the rule's rows) its
+    """Where a path dispatches the two-level carry (every architecture, at most two heads, the rule's rows) its
     launch binds the carried states viewed as [NSEG * H, 128, 128] tiles, the plan's group size, the flag buffer
     (enough words for its grid) and a fresh epoch per launch, at the rule's grid; the chain carry binds none of
-    them.  On sm_103a no path dispatches it."""
+    them."""
     sm, arch = cake_jit.sm_count(device.index), cake_jit.device_arch(device.index)
     seen = 0
     for lengths, heads in (
@@ -4781,7 +4953,7 @@ def test_batch_plans_pin_the_whole_problems_records_and_segments() -> None:
                 p.check_doc_lengths(tuple(lengths[:-1]) + (lengths[-1] + 1,))
             with pytest.raises(ValueError, match="above batch_tokens"):
                 p.batches(cake_backend.KdaArena(batch_tokens=max(lengths) - 1), lengths)
-    # the six-chain row at 2 heads pins the two-level carry's group size on sm_100a / sm_107a
+    # the six-chain row at 2 heads pins the two-level carry's group size (on every architecture)
     assert pinned > 0
 
 
