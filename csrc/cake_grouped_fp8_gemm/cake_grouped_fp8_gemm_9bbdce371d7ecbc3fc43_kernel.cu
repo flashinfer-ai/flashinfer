@@ -234,7 +234,7 @@ __device__ __forceinline__ void tma_store_2d(
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_grouped_fp8_gemm_db83658d96c59a872d72(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap A32, const __grid_constant__ CUtensorMap A64, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C_tma, const __grid_constant__ CUtensorMap SFA_packed, const __grid_constant__ CUtensorMap SFB_packed, int* __restrict__ m_indices, unsigned int shape_m, unsigned int shape_n, unsigned int k_tiles, unsigned int sf_cols)
+kernel_cake_grouped_fp8_gemm_9bbdce371d7ecbc3fc43(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap A32, const __grid_constant__ CUtensorMap A64, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C_tma, const __grid_constant__ CUtensorMap SFA_packed, const __grid_constant__ CUtensorMap SFB_packed, int* __restrict__ m_indices, unsigned int shape_m, unsigned int shape_n, unsigned int k_tiles, unsigned int sf_cols)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -543,6 +543,7 @@ kernel_cake_grouped_fp8_gemm_db83658d96c59a872d72(const __grid_constant__ CUtens
             unsigned int total_pairs_1 = m_blocks_2 * (shape_n / 256);
             unsigned int _phase_epilogue_done = 1;
             unsigned int _phase_tma_full = 0;
+            unsigned int _phase_scale_ready = 0;
             #pragma unroll 1
             for (unsigned int pair_1 = worker_idx_1; pair_1 < total_pairs_1; pair_1 += num_workers_1) {
                 unsigned int grid_np_1 = shape_n / 256;
@@ -638,7 +639,7 @@ kernel_cake_grouped_fp8_gemm_db83658d96c59a872d72(const __grid_constant__ CUtens
                         for (unsigned int iter_k_1 = 0; iter_k_1 < k_tiles; iter_k_1++) {
                             if (cta_rank == 0) {
                                 mbarrier_wait(tma_full_addr + (tma_stage) * 8, _phase_tma_full);
-                                mbarrier_wait(scale_ready_addr + (tma_stage) * 8, _phase_tma_full);
+                                mbarrier_wait(scale_ready_addr + (tma_stage) * 8, _phase_scale_ready);
                                 asm volatile("tcgen05.fence::after_thread_sync;");
                                 int init_flag = ((iter_k_1 == 0) ? 1 : 0);
                                 if (elect_sync()) {
@@ -665,7 +666,7 @@ kernel_cake_grouped_fp8_gemm_db83658d96c59a872d72(const __grid_constant__ CUtens
                                 elect_commit_cg2_multicast(tma_free_addr + (tma_stage) * 8, (uint16_t)(3));
                             }
                             tma_stage += 1;
-                            if (tma_stage == 8) { tma_stage = 0; _phase_tma_full ^= 1; }
+                            if (tma_stage == 8) { tma_stage = 0; _phase_tma_full ^= 1; _phase_scale_ready ^= 1; }
                         }
                         if (cta_rank == 0) {
                             elect_commit_cg2_multicast(mainloop_done_addr + (epi_stage) * 8, (uint16_t)(3));
@@ -678,7 +679,7 @@ kernel_cake_grouped_fp8_gemm_db83658d96c59a872d72(const __grid_constant__ CUtens
             #pragma unroll
             for (int _tail_1 = 0; _tail_1 < 8; _tail_1++) {
                 tma_stage += 1;
-                if (tma_stage == 8) { tma_stage = 0; _phase_tma_full ^= 1; }
+                if (tma_stage == 8) { tma_stage = 0; _phase_tma_full ^= 1; _phase_scale_ready ^= 1; }
             }
         }
     }
