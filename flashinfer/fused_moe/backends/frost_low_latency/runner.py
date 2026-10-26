@@ -225,7 +225,12 @@ class FrostLowLatencyRunner(MoERunner):
         )
 
     def _cache_key_extras(self):
-        return super()._cache_key_extras() + (
+        extras = super()._cache_key_extras()
+        if self._fp4_weight_only and self.config.quant.weight is QuantFormat.NVFP4:
+            from .tc.nvfp4_config import compiler_cuda_major
+
+            extras += ("nvfp4-compiler-cuda", compiler_cuda_major())
+        return extras + (
             # Do not reuse winners selected with the deferred individual-call timer.
             "fp8-grouped-tc-w8-batch-v5"
             if self.config.quant.weight is QuantFormat.FP8PerTensor
@@ -235,7 +240,7 @@ class FrostLowLatencyRunner(MoERunner):
             else "mxint4-load-width-v1"
             if self.config.quant.weight is QuantFormat.MXINT4
             else (
-                "nvfp4-grouped-tc-fp16-pr-v5"
+                "nvfp4-grouped-tc-compiler-v6"
                 if self._fp4_weight_only
                 and self.config.quant.weight is QuantFormat.NVFP4
                 else "fp4-route-reuse-load-width-lut-fp16-v8"
@@ -303,32 +308,11 @@ class FrostLowLatencyRunner(MoERunner):
                     for a in (1, 2, 4)
                     for b in columns
                 ]
-            if (
-                self.config.quant.weight is QuantFormat.NVFP4
-                and self.config.quant.output is self.config.quant.activation
-                and inputs[0].shape == (8, 2048)
-                and self.config.experts.intermediate_size == 512
-                and self.config.routing.top_k == 10
-                and self.config.activation == SwiGLU()
-                and self.config.finalize.do_finalize
-            ):
-                # Reused routes amortize packed fragment conversion. Retain all
-                # FFMA choices for sparse overlap; untuned dispatch is unchanged.
-                if capability == (12, 0) and self.config.quant.activation in (
-                    QuantFormat.BF16,
-                    QuantFormat.FP16,
-                ):
-                    tactics += [
-                        ("warp_mma", 4, 2, 128),
-                        ("warp_mma", 8, 4, 128),
-                        ("warp_mma", 4, 2, 256),
-                        ("warp_mma", 8, 2, 256),
-                    ]
-                elif capability == (10, 3) and self.config.quant.activation in (
-                    QuantFormat.BF16,
-                    QuantFormat.FP16,
-                ):
-                    tactics += [("warp_mma", 4, 2, 256), ("warp_mma", 8, 2, 256)]
+            from .tc.nvfp4_config import grouped_nvfp4_tactics
+
+            # Reused routes amortize packed fragment conversion. Retain all
+            # FFMA choices for sparse overlap; untuned dispatch is unchanged.
+            tactics += grouped_nvfp4_tactics(self.config, capability, inputs[0].shape)
             return tactics
         if (
             self.config.quant.weight is QuantFormat.FP8PerTensor

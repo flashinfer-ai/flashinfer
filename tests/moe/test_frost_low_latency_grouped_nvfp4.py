@@ -94,9 +94,16 @@ def _case(packed, dtype=torch.bfloat16):
     inputs = runner.pack_inputs(
         MoEActivationPack(x, None, ids, scores, routing_input_mode=mode), pack
     )
+    from cutlass import CUDA_VERSION
+
+    expected_tactics = (
+        (TACTICS if CUDA_VERSION.major == 13 else TACTICS[:-1])
+        if torch.cuda.get_device_capability() == (12, 0)
+        else TACTICS[2:]
+    )
     assert [
         v for v in runner.get_valid_tactics(inputs, None) if v[0] == "warp_mma"
-    ] == (TACTICS if torch.cuda.get_device_capability() == (12, 0) else TACTICS[2:])
+    ] == expected_tactics
     assert (
         len([v for v in runner.get_valid_tactics(inputs, None) if v[0] == "ffma"]) == 64
     )
@@ -115,7 +122,7 @@ def _expected(runner, inputs, view, packed):
 def test_grouped_nvfp4_live_graph_and_fresh_storage(dtype, packed, tactic, monkeypatch):
     runner, inputs, view = _case(packed, dtype)
     if tactic not in runner.get_valid_tactics(inputs, None):
-        pytest.skip("Tactic is outside this architecture qualification")
+        pytest.skip("Tactic is outside this architecture/compiler qualification")
     _check(runner.forward(inputs, tactic), _expected(runner, inputs, view, packed))
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):

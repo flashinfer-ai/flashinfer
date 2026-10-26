@@ -7,6 +7,7 @@ from cutlass import cute
 
 from .runtime import combine_kernel
 from .warp import WarpGroupedProjection
+from .nvfp4_config import grouped_nvfp4_tactics
 
 
 @cute.jit
@@ -50,39 +51,17 @@ def execute(inputs, config, tactic):
     """Bind current tensors; compiled entries retain no runtime pointers."""
     import torch
     from cutlass.cute.runtime import from_dlpack
-    from ....api import QuantFormat, SwiGLU
     from .....utils import get_compute_capability
     from ..fma.activation_config import lower_activation
     from ..runtime import _COMPILED, _COMPILE_LOCK
 
     capability = get_compute_capability(inputs[0].device)
-    choices = (
-        (
-            ("warp_mma", 4, 2, 128),
-            ("warp_mma", 8, 4, 128),
-            ("warp_mma", 4, 2, 256),
-            ("warp_mma", 8, 2, 256),
-        )
-        if capability == (12, 0)
-        and config.quant.activation in (QuantFormat.BF16, QuantFormat.FP16)
-        else (("warp_mma", 4, 2, 256), ("warp_mma", 8, 2, 256))
-        if capability == (10, 3)
-        and config.quant.activation in (QuantFormat.BF16, QuantFormat.FP16)
-        else ()
-    )
-    if (
-        config.quant.weight is not QuantFormat.NVFP4
-        or config.quant.output is not config.quant.activation
-        or config.activation != SwiGLU()
-        or not config.finalize.do_finalize
-        or config.routing.top_k != 10
-        or config.experts.intermediate_size != 512
-        or len(inputs) != 13
-        or inputs[0].shape != (8, 2048)
-        or tactic not in choices
+    if len(inputs) != 13 or tactic not in grouped_nvfp4_tactics(
+        config, capability, inputs[0].shape
     ):
         raise ValueError(
-            "Grouped NVFP4 requires SM103/SM120 BF16/FP16 T8 H2048 I512 top-k10 SwiGLU"
+            "Grouped NVFP4 requires SM103/SM120 BF16/FP16 T8 H2048 I512 top-k10 "
+            "SwiGLU; SM120 G8/K256 requires the loaded CuTe DSL cu13 compiler"
         )
     tensors, narrow = inputs[:-1], inputs[-1]
     key = (

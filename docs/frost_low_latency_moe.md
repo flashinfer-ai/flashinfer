@@ -1894,12 +1894,20 @@ and final combine.
 
 ### Packed NVFP4 grouped decode on SM120 and B300
 
-Autotuning includes four grouped warp-MMA candidates for NVFP4 weights with
+Autotuning includes up to four grouped warp-MMA candidates for NVFP4 weights with
 matching BF16 or FP16 activation/output, default SwiGLU, finalized output, and
 T=8/H=2048/I=512/top-k=10 on SM120: group4/stages2/K128,
 group8/stages4/K128, and group4 or group8 with stages2/K256. All 64 FFMA
 choices and the untuned
-default remain available. B300/SM103 adds two-stage K256 groups of four and
+default remain available. SM120 group8/stages2/K256 additionally requires the
+loaded CuTe DSL **cu13 compiler component**. The cu12 component can generate
+invalid memory accesses for this candidate, including with DSL 4.8.1 and
+PyTorch built for CUDA 13. Enumeration and explicit execution share this
+guard; the other three SM120 candidates remain available on cu12. The loaded
+compiler also distinguishes persistent tuning keys. Install
+`nvidia-cutlass-dsl[cu13]>=4.8` with a compatible driver to use this candidate;
+`cutlass.CUDA_VERSION.major` reports the loaded compiler's CUDA major.
+B300/SM103 adds two-stage K256 groups of four and
 eight for the same shape with matching BF16 or FP16 input/output. K256 halves
 the number of producer/consumer stage transitions relative to K128; both
 projections still load packed weights and live block scales. Other architectures
