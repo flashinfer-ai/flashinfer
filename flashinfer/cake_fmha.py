@@ -2100,6 +2100,70 @@ def _decode_quant_program_values(
 _DECODE_PROGRAM_VALUES["decode_nvfp4"] = _decode_quant_program_values
 
 
+# ``cake_fmha_decode_fp8``: E4M3 K / V pages (one stacked or two pools).  The
+# key is ``(batch, num_q_heads, num_kv_heads, page_size, split plan,
+# enable_pdl)``: a one-split plan runs no reducer (``enable_pdl`` False in its
+# key); a program built for the fixed plan of eight splits of sixteen blocks
+# serves a call that asks for ``enable_pdl``, and the reducer of
+# ``cake_fmha_decode_fp8_pdl`` follows it with programmatic dependent launch.
+
+_DECODE_PROGRAM_HOST_PARAMS["decode_fp8"] = ("Qt", "K", "V", *_DECODE_QUANT_PARAMS)
+_DECODE_PROGRAM_HOST_PARAMS["decode_fp8_pdl"] = (
+    "partial_O",
+    "partial_max",
+    "partial_sum",
+    "O",
+    "bmm2_scale_ptr",
+    "num_split",
+    "bmm2_scalar",
+)
+_DECODE_PROGRAM_ROUTES["sm100a"].update(
+    {
+        ("decode_fp8", 256, 32, 4, 16, "split1", False): "B256_SM100A",
+        ("decode_fp8", 4, 32, 4, 32, "split8x16", True): "B4_S8X16_SM100A",
+        ("decode_fp8_pdl", 8): "REDUCE_S8",
+    }
+)
+_DECODE_PROGRAM_ROUTES["sm103a"].update(
+    {
+        ("decode_fp8", 256, 32, 4, 16, "split1", False): "B256_SM103A",
+        ("decode_fp8", 4, 32, 4, 32, "split8x16", True): "B4_S8X16_SM103A",
+        ("decode_fp8_pdl", 8): "REDUCE_S8",
+    }
+)
+_DECODE_PROGRAMS.update(
+    {
+        ("decode_fp8", "B256_SM100A"): (
+            "cake_fmha_decode_fp8_768aa719bcc0c8dc6de5",
+            "quant",
+        ),
+        ("decode_fp8", "B256_SM103A"): (
+            "cake_fmha_decode_fp8_2bf8c20db84aa7b45230",
+            "quant",
+        ),
+        ("decode_fp8", "B4_S8X16_SM100A"): (
+            "cake_fmha_decode_fp8_56920e5612bc123d66c9",
+            "quant",
+        ),
+        ("decode_fp8", "B4_S8X16_SM103A"): (
+            "cake_fmha_decode_fp8_4a15e1e5d592f3ec8833",
+            "quant",
+        ),
+        ("decode_fp8_pdl", "REDUCE_S8"): (
+            "cake_fmha_decode_fp8_pdl_8cb30ca58dc96a96e10c",
+            "reduce",
+        ),
+    }
+)
+_DECODE_PROGRAM_REDUCERS.update(
+    {
+        ("decode_fp8", "B4_S8X16_SM100A"): ("decode_fp8_pdl", "REDUCE_S8"),
+        ("decode_fp8", "B4_S8X16_SM103A"): ("decode_fp8_pdl", "REDUCE_S8"),
+    }
+)
+_DECODE_PROGRAM_VALUES["decode_fp8"] = _decode_quant_program_values
+
+
 # --- Small-M speculative decode programs (BF16, head dim 256) ----------------
 #
 # ``cake_fmha_decode_smallm``: the (query token, query head) pairs of one KV
@@ -3334,7 +3398,33 @@ def select_cake_fmha_decode_route(
         fixed = _decode_quant_fp8_fixed_split(
             batch_size, num_kv_heads, max_seq_len, _smallm_sm_count(device)
         )
-        return dataclass_replace(route("decode_quant_fp8"), num_split=8 if fixed else 0)
+        candidate = dataclass_replace(
+            route("decode_quant_fp8"), num_split=8 if fixed else 0
+        )
+        quant_program = _decode_quant_program_select(
+            device,
+            "decode_fp8",
+            query=query,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            workspace_buffer=workspace_buffer,
+            batch_size=batch_size,
+            num_kv_heads=num_kv_heads,
+            page_size=page_size,
+            max_seq_len=max_seq_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+            enable_pdl=enable_pdl is True,
+        )
+        if quant_program is not None:
+            return dataclass_replace(
+                candidate,
+                program=quant_program[0],
+                device_scales=quant_program[1],
+                num_split=quant_program[2],
+            )
+        return candidate
 
     if (
         dtypes

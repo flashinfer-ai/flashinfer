@@ -506,6 +506,14 @@ SHAPE_ROWS: dict[str, tuple] = {
         "decode_nvfp4", "nvfp4", 128, 1, 8192, 32, 4, 16,
         {"sm100a": "DEC_NVFP4_B128", "sm103a": "DEC_NVFP4_B128"},
     ),
+    "fp8_b256_s8192": (
+        "decode_fp8", "fp8", 256, 1, 8192, 32, 4, 16,
+        {"sm100a": "B256_SM100A", "sm103a": "B256_SM103A"},
+    ),
+    "fp8_b4_s16384": (
+        "decode_fp8", "fp8", 4, 1, 16384, 32, 4, 32,
+        {"sm100a": "B4_S8X16_SM100A", "sm103a": "B4_S8X16_SM103A"},
+    ),
     "bf16_b128_s4096": (
         "decode_bf16", "bf16", 128, 1, 4096, 32, 4, 16,
         {"sm100a": "DEC_B128", "sm103a": "DEC_B128"},
@@ -1846,3 +1854,221 @@ def test_cake_decode_bf16_program_is_sync_free_and_replays(
     _check_hit_is_sync_free_and_replays(case, lengths)
     identifier = SHAPE_ROWS[row][-1][target] + ("_DS" if device_scales else "")
     assert set(served_programs) == {("decode_bf16", identifier)}
+
+
+# --- FP8 boundaries (host-only) ----------------------------------------------
+
+# 127 blocks read the evened 128: the table must hold 512 32-token pages.
+_FP8_127_BLOCKS = {"kv_len": 16129, "width": 512}
+
+
+@pytest.mark.parametrize(
+    ("target", "row", "overrides", "program"),
+    [
+        # The fixed plan is eight splits of sixteen blocks: 127 or 128 blocks.
+        ("sm100a", "fp8_b4_s16384", _FP8_127_BLOCKS, "B4_S8X16_SM100A"),
+        ("sm103a", "fp8_b4_s16384", _FP8_127_BLOCKS, "B4_S8X16_SM103A"),
+        ("sm100a", "fp8_b4_s16384", {"kv_len": 16129}, None),
+        ("sm100a", "fp8_b4_s16384", {"kv_len": 16128}, None),
+        ("sm100a", "fp8_b4_s16384", {"kv_len": 16385, "width": 520}, None),
+        ("sm100a", "fp8_b4_s16384", {"kv_len": 16384, "width": 511}, None),
+        ("sm100a", "fp8_b4_s16384", {"batch": 3}, None),
+        ("sm100a", "fp8_b4_s16384", {"page_size": 16}, None),
+        # One split: any length whose table is wide enough.
+        ("sm100a", "fp8_b256_s8192", {"kv_len": 8000, "width": 512}, "B256_SM100A"),
+        ("sm100a", "fp8_b256_s8192", {"kv_len": 8000}, None),
+        ("sm103a", "fp8_b256_s8192", {"kv_len": 512}, "B256_SM103A"),
+        ("sm100a", "fp8_b256_s8192", {"batch": 255}, None),
+        ("sm100a", "fp8_b256_s8192", {"batch": 257}, None),
+        ("sm100a", "fp8_b256_s8192", {"page_size": 32}, None),
+    ],
+)
+def test_cake_fmha_decode_fp8_boundaries(
+    decode_target, target, row, overrides, program
+) -> None:
+    decode_target(target)
+    route = _select(_row_kwargs(row, **overrides))
+    if program is None:
+        assert route is None or route.program is None, overrides
+    else:
+        assert route.program == ("decode_fp8", program), overrides
+        assert route.num_split == (8 if row == "fp8_b4_s16384" else 1)
+
+
+def test_cake_fmha_decode_fp8_fixed_plan_needs_enable_pdl(decode_target) -> None:
+    """The fixed-plan programs hand their partials to a reducer launched with
+    programmatic dependent launch: a call without ``enable_pdl`` keeps the
+    JIT member (its reducer launches without the attribute)."""
+
+    decode_target("sm103a")
+    route = _select({**_row_kwargs("fp8_b4_s16384"), "enable_pdl": False})
+    assert route.component == "decode_quant_fp8" and route.program is None
+    assert route.num_split == 8
+
+
+def test_cake_fmha_decode_fp8_host_scales_without_output_scale_stay_balanced(
+    decode_target,
+) -> None:
+    """Host scales with no output scale keep the balanced FP8 route (16-token
+    pages); tensor scales take the program."""
+
+    decode_target("sm100a")
+    route = _select({**_row_kwargs("fp8_b256_s8192"), "o_scale": 1.0})
+    assert route.component == "decode_balanced_fp8" and route.program is None
+    route = _select(
+        {**_row_kwargs("fp8_b256_s8192", device_scales=True), "o_scale": 1.0}
+    )
+    assert route.program == ("decode_fp8", "B256_SM100A") and route.device_scales
+
+
+@pytest.mark.parametrize("mutation", ("mixed_scales", "strided_query", "small_sm"))
+def test_cake_fmha_decode_fp8_misses_keep_the_jit_route(decode_target, mutation):
+    # 120 SMs plan seven splits of twenty blocks (128 or more plan eight of
+    # sixteen, the program's plan).
+    decode_target("sm100a", sm_count=120 if mutation == "small_sm" else None)
+    kwargs = _row_kwargs("fp8_b4_s16384")
+    if mutation == "mixed_scales":
+        kwargs["bmm2_scale"] = torch.empty((1,), dtype=torch.float32, device="meta")
+    elif mutation == "strided_query":
+        query = kwargs["query"]
+        wide = torch.empty(
+            (query.shape[0], query.shape[1], 256), dtype=query.dtype, device="meta"
+        )
+        kwargs["query"] = wide[..., :128]
+    route = _select(kwargs)
+    assert route is None or route.program is None, mutation
+
+
+@pytest.mark.parametrize("device_scales", (False, True))
+def test_cake_decode_fp8_fixed_plan_values_pair_the_reducer(
+    monkeypatch, device_scales
+) -> None:
+    """The fixed-plan program and its reducer share the workspace partials
+    and the output; the reducer merges eight splits per (request, query
+    head) with the same bmm2 scale."""
+
+    kwargs, launches = _program_values(
+        monkeypatch, "fp8_b4_s16384", device_scales=device_scales
+    )
+    (main_name, main), (reduce_name, reduce) = launches
+    assert main_name == cake_api._DECODE_PROGRAMS[("decode_fp8", "B4_S8X16_SM100A")][0]
+    assert reduce_name == cake_api._DECODE_PROGRAMS[("decode_fp8_pdl", "REDUCE_S8")][0]
+    assert (main["num_splits"], main["blocks_per_split"]) == (8, 16)
+    assert (main["grid_x"], main["grid_y"], main["grid_z"]) == (128, 1, 1)
+    assert (reduce["grid_x"], reduce["grid_y"], reduce["grid_z"]) == (128, 1, 1)
+    assert reduce["num_split"] == 8
+    for name in ("partial_O", "partial_max", "partial_sum", "O"):
+        assert reduce[name] is main[name], name
+    assert main["K"].dtype == torch.uint8 and main["V"].dtype == torch.uint8
+    assert _same_storage(main["K"], kwargs["key_cache"])
+    assert _same_storage(main["V"], kwargs["value_cache"])
+    assert main["K"].stride() == kwargs["key_cache"].stride()
+    assert main["page_table"] is kwargs["block_tables"]
+    assert main["pt_batch_stride"] == 512
+    rows = 4 * 32 * 8
+    first = 0 if device_scales else 16
+    workspace = kwargs["workspace_buffer"].data_ptr()
+    assert main["partial_O"].data_ptr() == workspace + first
+    assert main["partial_max"].data_ptr() == workspace + first + rows * 512
+    assert main["partial_sum"].data_ptr() % 16 == 0
+    if device_scales:
+        assert _same_storage(reduce["bmm2_scale_ptr"], kwargs["bmm2_scale"])
+        assert main["bmm1_is_log2"] == 1
+    else:
+        assert reduce["bmm2_scale_ptr"] is None and main["bmm1_scale_ptr"] is None
+        assert reduce["bmm2_scalar"] == main["bmm2_scalar"] == 1.0 / 0.75
+
+
+# --- GPU: FP8 ----------------------------------------------------------------
+
+
+def _fp8_case(row, *, seed, device_scales=False, lengths=None):
+    """E4M3 queries over one stacked E4M3 cache, bmm2 folding an output scale
+    of 0.75 (the contract's form)."""
+
+    case = _bf16_case(row, seed=seed, lengths=lengths)
+    case.query = (case.query.float() * 0.5).to(torch.float8_e4m3fn)
+    case.kv_cache = (case.kv_cache.float() * 0.5).to(torch.float8_e4m3fn)
+    case.out = torch.empty_like(case.query)
+    case.bmm1, case.bmm2, case.o_scale = 128**-0.5, 1.0 / 0.75, 0.75
+    if device_scales:
+        case.bmm1 = torch.tensor([case.bmm1], dtype=torch.float32, device="cuda")
+        case.bmm2 = torch.tensor([case.bmm2], dtype=torch.float32, device="cuda")
+    return case
+
+
+@_GPU
+@pytest.mark.parametrize("device_scales", (False, True))
+@pytest.mark.parametrize("lengths", ("uniform", "ragged"))
+@pytest.mark.parametrize("row", ("fp8_b256_s8192", "fp8_b4_s16384"))
+def test_cake_decode_fp8_programs_match_reference_and_the_jit_route(
+    monkeypatch, served_programs, row, lengths, device_scales
+) -> None:
+    target = _require_full_device()
+    batch, kv_len = SHAPE_ROWS[row][2], SHAPE_ROWS[row][4]
+    ragged = None
+    if lengths == "ragged":
+        ragged = ([kv_len, 0, 1, 129, kv_len - 1, 2047, kv_len // 3, 17] * batch)[
+            :batch
+        ]
+    case = _fp8_case(row, seed=20261102, device_scales=device_scales, lengths=ragged)
+    got = _run_decode(case)
+    assert served_programs == [("decode_fp8", SHAPE_ROWS[row][-1][target])]
+    batches = sorted({0, 1, 2, 3, batch - 1})
+    reference = _bf16_reference(case, [b for b in batches if _case_length(case, b)])
+    for b, expected in reference.items():
+        torch.testing.assert_close(
+            got[b].float(), expected[0], atol=0.1, rtol=0.1, msg=f"request {b}"
+        )
+    for b in batches:
+        if not _case_length(case, b):
+            assert not got[b].float().any(), f"request {b} has no key"
+    _keep_the_jit_route(monkeypatch)
+    jit = _run_decode(case)
+    assert len(served_programs) == 1
+    assert torch.equal(_bits(got), _bits(jit))
+
+
+def _case_length(case, b):
+    return int(case.seq_lens[b])
+
+
+@_GPU
+@pytest.mark.parametrize("row", ("fp8_b256_s8192", "fp8_b4_s16384"))
+def test_cake_decode_fp8_program_is_sync_free_and_replays(served_programs, row):
+    target = _require_full_device()
+    case = _fp8_case(row, seed=20261103, device_scales=True)
+    batch, kv_len = SHAPE_ROWS[row][2], SHAPE_ROWS[row][4]
+    lengths = torch.randint(0, kv_len + 1, (batch,), dtype=torch.int32, device="cuda")
+    _check_hit_is_sync_free_and_replays(case, lengths)
+    assert set(served_programs) == {("decode_fp8", SHAPE_ROWS[row][-1][target])}
+
+
+@_GPU
+@pytest.mark.parametrize("row", ("bf16_b128_s4096", "fp8_b4_s16384"))
+def test_cake_decode_program_launches_on_the_current_torch_stream(
+    served_programs, row
+) -> None:
+    """Every launch of a program route (the FP8 fixed plan's decode and its
+    reducer too) is ordered on torch's current stream: queued behind a sleep
+    on a side stream, the output is still unwritten when the default stream
+    reads it, and is the direct launch's once the side stream drains."""
+
+    target = _require_full_device()
+    if row.startswith("fp8"):
+        case = _fp8_case(row, seed=20261104)
+    else:
+        case = _bf16_case(row, seed=20261104)
+    direct = _run_decode(case)
+    out = torch.zeros_like(direct)
+    torch.cuda.synchronize()
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side):
+        torch.cuda._sleep(200_000_000)
+        _run_decode(case, out=out)
+    early = out.clone()
+    torch.cuda.synchronize()
+    assert not _bits(early).any()
+    assert torch.equal(_bits(out), _bits(direct))
+    family = "decode_fp8" if row.startswith("fp8") else "decode_bf16"
+    assert set(served_programs) == {(family, SHAPE_ROWS[row][-1][target])}
