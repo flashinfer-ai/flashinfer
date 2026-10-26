@@ -7,6 +7,7 @@ from flashinfer.megamoe import select_fused_plan
 from flashinfer.megamoe.heuristics import SMEM_CAPACITY, _fused_smem_bytes
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("num_sms", [78, 132])
 @pytest.mark.parametrize(
     "experts,hidden,intermediate,topk",
@@ -29,6 +30,7 @@ def test_ep4_fused_plan_uses_legal_generic_pipeline(
         assert plan.num_stages == 3
 
 
+@pytest.mark.cpu_only
 def test_nvfp4_jit_cache_distinguishes_ep_width():
     plan = select_fused_plan(132, 8, 256, 6, 4096, 2048, 384, 1)
     args = (plan, 132, 384, 256, 6, 4096, 2048, 10.0, True)
@@ -38,12 +40,14 @@ def test_nvfp4_jit_cache_distinguishes_ep_width():
     assert "_r4_" in ep4 and "_r8_" in ep8
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("ep", [1, 2, 3, 16])
 def test_nvfp4_planner_rejects_unvalidated_ep_width(ep):
     with pytest.raises(ValueError, match="4 or 8 ranks"):
         select_fused_plan(132, ep, 256, 6, 4096, 2048, 384, 1)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "experts,hidden,intermediate,topk,push_max,rotated_from",
     [
@@ -65,6 +69,7 @@ def test_h200_ep8_counter_policy(
         ), tokens
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("num_sms", [78, 132])
 def test_counter_policy_limits(num_sms):
     # Unmeasured geometry (H7168 / E256 / K8, DeepSeek-V3): push up to M=32, no rotated pool.
@@ -89,6 +94,7 @@ def test_counter_policy_limits(num_sms):
         assert not plan.push_dispatch and not plan.no_clean_barrier, tokens
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("num_sms", [78, 132])
 @pytest.mark.parametrize(
     "hidden,intermediate,experts,topk",
@@ -120,6 +126,7 @@ def test_untuned_geometry_plans_are_legal(num_sms, hidden, intermediate, experts
         assert not plan.push_dispatch or (hidden % 1024 == 0 and tokens <= 32), tokens
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "hidden,intermediate", [(4096, 2560), (4352, 2048), (4096, 1000)]
 )
@@ -128,6 +135,7 @@ def test_unsupported_fused_shapes_raise(hidden, intermediate):
         select_fused_plan(132, 8, 256, 6, hidden, intermediate, 4096, 1)
 
 
+@pytest.mark.cpu_only
 def test_push_needs_one_publishing_sm_per_local_expert():
     # Local expert e is published by SM e, so push needs experts per rank <= SMs.
     plan = select_fused_plan(78, 8, 1024, 8, 4096, 1024, 4096, 1)

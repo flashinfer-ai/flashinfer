@@ -78,6 +78,7 @@ def _gemm1_ok(
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "n,mma,cluster,expect",
     [
@@ -100,6 +101,7 @@ def test_finalize_n_tiling(n, mma, cluster, expect):
     assert _finalize_ok(n, mma, cluster) is expect
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "n,mma,expect",
     [
@@ -115,6 +117,7 @@ def test_gemm1_n_tiling_guard(n, mma, expect):
     assert _gemm1_ok(n, mma, (1, 1)) is expect
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("op", [_gemm1_ok, _finalize_ok])
 def test_w4a8_dtype_contract(op):
     kwargs = dict(
@@ -147,6 +150,7 @@ def test_w4a8_dtype_contract(op):
     assert not op(256, (128, 128), (1, 1), **{**kwargs, "k": 64})
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "mma,n,expect",
     [
@@ -172,6 +176,7 @@ def test_w4a8_finalize_n_tiling(mma, n, expect):
     )
 
 
+@pytest.mark.cpu_only
 def test_every_rubin_cluster_covers_one_routing_tile():
     """Every enumerated Rubin tactic maps one cluster to one routing tile.
 
@@ -203,6 +208,7 @@ def test_every_rubin_cluster_covers_one_routing_tile():
             )
 
 
+@pytest.mark.cpu_only
 def test_rubin_gemm1_offers_two_cta_tile_256():
     """tile_size=256 offers the 2-CTA FC1 MMA with cluster (2, 1).
 
@@ -217,6 +223,7 @@ def test_rubin_gemm1_offers_two_cta_tile_256():
     assert all(t[1][0] == 128 for t in get_rubin_gemm1_valid_tactics(128))
 
 
+@pytest.mark.cpu_only
 def test_rubin_gemm2_offers_two_cta_tile_256():
     """tile_size=256 offers the 2-CTA finalize MMA with cluster (2, 1)."""
     from flashinfer.fused_moe.cute_dsl.tuner import get_rubin_gemm2_valid_tactics
@@ -227,6 +234,7 @@ def test_rubin_gemm2_offers_two_cta_tile_256():
     assert all(t[1][0] == 128 for t in get_rubin_gemm2_valid_tactics(128))
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("tile_size", [128, 256])
 def test_rubin_gemm2_offers_cluster_n_2(tile_size):
     """Every 1-CTA finalize MMA is offered with cluster (1, 1) and (1, 2)."""

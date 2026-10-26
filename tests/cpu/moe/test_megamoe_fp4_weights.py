@@ -9,6 +9,7 @@ from flashinfer.megamoe.weights import (
 )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("weight_format", ["nvfp4", "mxfp4"])
 def test_decoder_addresses_preserve_nibbles_and_scales(weight_format):
     group = 16 if weight_format == "nvfp4" else 32
@@ -62,6 +63,7 @@ def test_decoder_addresses_preserve_nibbles_and_scales(weight_format):
         assert torch.equal(sf.reshape(e, n, -1), scales)
 
 
+@pytest.mark.cpu_only
 def test_weight_transform_rejects_mismatched_scales():
     p1 = torch.zeros(1, 512, 256, dtype=torch.uint8)
     p2 = torch.zeros(1, 512, 128, dtype=torch.uint8)
