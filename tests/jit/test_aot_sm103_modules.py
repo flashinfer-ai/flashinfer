@@ -132,6 +132,15 @@ def test_combined_build_registers_both_variants(monkeypatch):
     assert registered >= SM103_SHARED_MODULES | SM100_ONLY_MODULES | SM103_ONLY_MODULES
 
 
+def test_sm107_only_build_registers_trtllm_gen_routing(monkeypatch):
+    # trtllm_gen_routing accepts SM107, so the sm107a provider must ship it.
+    registered = _registered_generators(
+        monkeypatch, {"sm107": True, "sm107a_exact": True}
+    )
+
+    assert "gen_trtllm_gen_routing_module" in registered
+
+
 @pytest.mark.parametrize(
     ("sm_capabilities", "expected_use_sm_100f"),
     [
