@@ -130,6 +130,10 @@ from .reduction import (  # noqa: F401
     decode_gen_separate_reduction_kernel,
     fmha_decode_separate_reduction_launch,
 )
+from .fmha_decode_dual_transform import (
+    create_mma_task_separate_transformed_kv,
+    create_single_kv_transform_task,
+)
 
 _PERSISTENT_SCHEDULE_TOKEN_STAGES = 2
 # Double-buffer CLC responses independently of the schedule-token throttle.
@@ -255,6 +259,8 @@ def _decode_min_blocks_per_mp(cfg: FmhaDecodeConfig, seq_len_kv: int) -> int:
     hand-off cost for a long enough mainloop; the established profiles below
     retain their existing unconditional launch bounds.
     """
+    if cfg.target_ctas_per_sm == 2:
+        return 2
     kv256_reallocation = (
         cfg.tile_size_kv == 256
         and _compute_total_kv_tiles(seq_len_kv, cfg.tile_size_kv)
@@ -267,6 +273,17 @@ def _decode_min_blocks_per_mp(cfg: FmhaDecodeConfig, seq_len_kv: int) -> int:
         or (cfg.tile_size_q == 16 and cfg.q_dtype_bytes == 1)
         or (cfg.use_keeps_mma_ab and cfg.tile_size_q == 128)
     )
+
+
+class DecodeTaskManager(TaskManager):
+    """Match TS register redistribution to the kernel's CTA launch bound."""
+
+    def __init__(self, *, num_ctas_per_sm: int = 1, **kwargs):
+        self.num_ctas_per_sm = num_ctas_per_sm
+        super().__init__(**kwargs)
+
+    def _default_task_registers(self) -> int:
+        return super()._default_task_registers() // (self.num_ctas_per_sm * 8) * 8
 
 
 def _compute_static_num_skipped_kv_tiles(cfg: FmhaDecodeConfig, seq_len_kv: int) -> int:
@@ -529,7 +546,7 @@ def _build_decode_gen_schedule(
     # (including Int8 K with E4M3 V) share one ring.
     use_shared_inst_kv_rings = (
         cfg.k_dtype_bytes != cfg.v_dtype_bytes and cfg.tile_size_kv != 256
-    )
+    ) or cfg.uses_parallel_kv_transform
     one_inst_tmem_stages = 2 if use_one_inst_qkv else 1
     # Keep complete head-dimension rounds in each balanced K/V ring. FP8's
     # smaller stage tiles can prefetch farther without increasing the budget.
@@ -588,10 +605,14 @@ def _build_decode_gen_schedule(
     )
     if use_shared_inst_kv_rings and not use_one_inst_qkv:
         # One K and one V stage per unit of depth.
-        shared_inst_kv_stages = max(
-            (MAX_KV_STAGE_SMEM_KIB * BYTES_PER_KIB)
-            // (cfg.smem_k_tile_bytes + cfg.smem_v_tile_bytes),
-            1,
+        shared_inst_kv_stages = (
+            max(cfg.kv_stages // 2, 1)
+            if cfg.uses_parallel_kv_transform
+            else max(
+                (MAX_KV_STAGE_SMEM_KIB * BYTES_PER_KIB)
+                // (cfg.smem_k_tile_bytes + cfg.smem_v_tile_bytes),
+                1,
+            )
         )
         split_k0_stages = shared_inst_kv_stages
         split_v0_stages = shared_inst_kv_stages
@@ -1191,16 +1212,26 @@ def _build_decode_gen_schedule(
             name="smemKv",
         )
     transformed_kv = None
+    transformed_v = None
     mma_smem_kv = smem_kv
     if cfg.use_transform_kv:
         if cfg.store_transformed_kv_in_tmem:
-            assert smem_kv is not None
+            source_k = smem_k0 if cfg.uses_parallel_kv_transform else smem_kv
+            assert source_k is not None
             transformed_kv = TmemTransformedKvResource(
                 pipeline_config=smem_transformed_kv_cfg,
                 cfg=cfg,
-                src_smem_kv=smem_kv,
+                src_smem_kv=source_k,
                 name="tmemTransformedKv",
             )
+            if cfg.uses_parallel_kv_transform:
+                assert smem_v0 is not None
+                transformed_v = TmemTransformedKvResource(
+                    pipeline_config=smem_transformed_kv_cfg,
+                    cfg=cfg,
+                    src_smem_kv=smem_v0,
+                    name="tmemTransformedV",
+                )
         else:
             transformed_kv = SmemTransformedKvResource(
                 pipeline_config=smem_transformed_kv_cfg,
@@ -1502,6 +1533,8 @@ def _build_decode_gen_schedule(
         smem_resources.append(smem_kv)
     if transformed_kv is not None:
         smem_resources.append(transformed_kv)
+    if transformed_v is not None:
+        smem_resources.append(transformed_v)
     smem_resources.append(smem_p0)
     if not use_one_inst_kv:
         smem_resources.append(smem_p1)
@@ -1571,6 +1604,7 @@ def _build_decode_gen_schedule(
         smem_page_offsets._init_placeholder_state()
         smem_allocator, clc_response_alloc = allocate_smem()
     launch_smem_bytes = smem_bytes(smem_allocator)
+    smem_capacity_bytes //= cfg.target_ctas_per_sm
     if launch_smem_bytes > smem_capacity_bytes:
         raise ValueError(
             "decode resources exceed the SM shared-memory capacity: "
@@ -1748,7 +1782,21 @@ def _build_decode_gen_schedule(
                 else None,
                 **task_runtime_kwargs,
             )
-    if use_one_inst_qkv:
+    if cfg.uses_parallel_kv_transform:
+        assert transformed_kv is not None and transformed_v is not None
+        mma_task = create_mma_task_separate_transformed_kv(
+            smem_q,
+            transformed_kv,
+            transformed_v,
+            tmem_s0,
+            smem_p0,
+            tmem_o,
+            cfg,
+            domain=mma_domain,
+            domain_bias=0,
+            **task_runtime_kwargs,
+        )
+    elif use_one_inst_qkv:
         mma_task = create_mma_task_one_inst_qkv(
             smem_q,
             smem_k0,
@@ -1799,7 +1847,27 @@ def _build_decode_gen_schedule(
             **task_runtime_kwargs,
         )
     transform_kv_task = None
-    if cfg.use_transform_kv:
+    transform_v_task = None
+    if cfg.uses_parallel_kv_transform:
+        transform_kv_task = create_single_kv_transform_task(
+            smem_k0,
+            transformed_kv,
+            cfg,
+            domain=load_domain,
+            is_v=False,
+            domain_bias=0,
+            **task_runtime_kwargs,
+        )
+        transform_v_task = create_single_kv_transform_task(
+            smem_v0,
+            transformed_v,
+            cfg,
+            domain=load_domain,
+            is_v=True,
+            domain_bias=0,
+            **task_runtime_kwargs,
+        )
+    elif cfg.use_transform_kv:
         transform_kv_task = create_transform_kv_task(
             smem_kv,
             smem_k0,
@@ -1909,6 +1977,8 @@ def _build_decode_gen_schedule(
     task_list.extend(load_tasks)
     if transform_kv_task is not None:
         task_list.append(transform_kv_task)
+    if transform_v_task is not None:
+        task_list.append(transform_v_task)
     if use_one_inst_qkv and not use_clc_dynamic:
         task_list.extend([correction_task, mma_task])
         task_list.append(softmax0_task)
@@ -1940,6 +2010,20 @@ def _build_decode_gen_schedule(
             tmem_softmax_local0: [tmem_s0],
             tmem_softmax_global0: [tmem_s0],
             tmem_o: [smem_p0, smem_v0],
+            tmem_corr0: [tmem_softmax_local0, tmem_o],
+        }
+    elif cfg.uses_parallel_kv_transform:
+        resource_dependency_graph = {
+            smem_q: [],
+            smem_k0: smem_k_deps,
+            smem_v0: smem_v_deps,
+            transformed_kv: [smem_k0],
+            transformed_v: [smem_v0],
+            tmem_s0: [transformed_kv, smem_q],
+            smem_p0: [tmem_s0],
+            tmem_softmax_local0: [tmem_s0],
+            tmem_softmax_global0: [tmem_s0],
+            tmem_o: [smem_p0, transformed_v],
             tmem_corr0: [tmem_softmax_local0, tmem_o],
         }
     elif cfg.use_transform_kv and use_per_inst_kv_resources:
@@ -2130,7 +2214,9 @@ def _build_decode_gen_schedule(
     ] = {}
     if transformed_kv is not None:
         dma_consumer_release_labels[(transformed_kv, tmem_s0)] = {"k_desc_0"}
-        dma_consumer_release_labels[(transformed_kv, tmem_o)] = {"v_desc_0"}
+        dma_consumer_release_labels[
+            (transformed_kv if transformed_v is None else transformed_v, tmem_o)
+        ] = {"v_desc_0"}
         if not use_one_inst_kv:
             dma_consumer_release_labels[(transformed_kv, tmem_s1)] = {"k_desc_1"}
             dma_consumer_release_labels[(transformed_kv, tmem_o)].add("v_desc_1")
@@ -2260,6 +2346,8 @@ def _build_decode_gen_schedule(
     if cfg.store_transformed_kv_in_tmem:
         assert transformed_kv is not None
         tmem_allocator.add_resource(transformed_kv)
+        if transformed_v is not None:
+            tmem_allocator.add_resource(transformed_v)
     tmem_allocator.compute_layout()
     if cfg.use_keeps_mma_ab and not use_one_inst_qkv and not cfg.uses_tmem_p:
         # Two-inst Keeps with SMEM P (currently Q64) must retain the historical
@@ -2434,7 +2522,8 @@ def build_decode_task_manager(
         num_heads_kv=Int32(num_heads_kv),
     )
 
-    tm = TaskManager(
+    tm = DecodeTaskManager(
+        num_ctas_per_sm=cfg.target_ctas_per_sm,
         tasks=task_list,
         resource_dependency_graph=resource_dependency_graph,
         dma_consumer_release_labels=dma_consumer_release_labels,
@@ -2759,7 +2848,8 @@ def _run_decode_gen_active(
         prims.tcgen05_relinquish_alloc_permit()
     init_warp += 1
 
-    task_manager = TaskManager(
+    task_manager = DecodeTaskManager(
+        num_ctas_per_sm=cfg.target_ctas_per_sm,
         tasks=task_list,
         resource_dependency_graph=dep_graph,
         dma_consumer_release_labels=dma_consumer_release_labels,

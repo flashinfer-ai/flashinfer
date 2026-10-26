@@ -72,7 +72,6 @@ from .helpers_output import (
     _p_stsm_smem_offset_bytes,
     _store_transposed_smem8b,
     _store_transposed_smem8b_x2,
-    _store_transposed_smem8b_x4,
 )
 from .helpers_softmax import (
     _compute_fp8_p_regs_and_local_sums,
@@ -1005,7 +1004,81 @@ class SmemPResource(DecodeGenResourceBase):
             and cfg.total_kv_tiles % cfg.num_insts_kv == 0
         )
         guards_fp8_rows = not (static_even_tiles and cfg.q_tiles_are_full)
-        if cutlass.const_expr(cfg.tile_size_q == 32 and cfg.use_fp8_pv):
+        if cutlass.const_expr(cfg.tile_size_q >= 48 and cfg.use_fp8_pv):
+            # Native stores cover Q32 bands plus a Q16 tail for Q48. Streamed
+            # profiles reload the scores while retaining the S pipeline credit.
+            for q_band in cutlass.range_constexpr((cfg.tile_size_q + 31) // 32):
+                band_rows = min(32, cfg.tile_size_q - q_band * 32)
+                repeats = band_rows // 8
+                if cutlass.const_expr(cfg.streams_swaps_q):
+                    score_base = self.tmem_s_ref._softmax_loop_score_tmem_addr(
+                        stage_info
+                    ) + Int32(q_band * 32)
+                    scores_lo = prims.tcgen05_ld(
+                        "16x256b", prims.make_tmem_ptr(score_base, Float32), num=repeats
+                    )
+                    scores_hi = prims.tcgen05_ld(
+                        "16x256b",
+                        prims.make_tmem_ptr(score_base + Int32(16 << 16), Float32),
+                        num=repeats,
+                    )
+                    cute.arch.fence_view_async_tmem_load()
+                else:
+                    scores_lo = cutlass.Vector.from_elements(
+                        tuple(s_arr[q_band * 16 + idx] for idx in range(repeats * 4)),
+                        Float32,
+                    )
+                    scores_hi = cutlass.Vector.from_elements(
+                        tuple(
+                            s_arr[cfg.tile_size_q // 2 + q_band * 16 + idx]
+                            for idx in range(repeats * 4)
+                        ),
+                        Float32,
+                    )
+                packed = cutlass.Array(
+                    Int32, repeats * 2, space=cutlass.AddressSpace.rmem
+                )
+                for offset in cutlass.range_constexpr(repeats):
+                    scale_base = (q_band * 4 + offset) * 2
+                    score_offset = offset * 4
+                    p_lo, p_hi, sum_lo, sum_hi = _compute_fp8_p_regs_and_local_sums(
+                        self.scale_softmax_log2,
+                        self._exponent_addend(
+                            new_max_arr[scale_base],
+                            route_is_proxy,
+                            guards_masked_rows=guards_fp8_rows,
+                        ),
+                        self._exponent_addend(
+                            new_max_arr[scale_base + 1],
+                            route_is_proxy,
+                            guards_masked_rows=guards_fp8_rows,
+                        ),
+                        scores_lo[score_offset],
+                        scores_lo[score_offset + 1],
+                        scores_lo[score_offset + 2],
+                        scores_lo[score_offset + 3],
+                        scores_hi[score_offset],
+                        scores_hi[score_offset + 1],
+                        scores_hi[score_offset + 2],
+                        scores_hi[score_offset + 3],
+                    )
+                    packed[offset] = p_lo
+                    packed[offset + repeats] = p_hi
+                    self.tmem_s_ref.store_p_local_sum(scale_base, sum_lo)
+                    self.tmem_s_ref.store_p_local_sum(scale_base + 1, sum_hi)
+                _store_transposed_smem8b(
+                    self._smem_base_p_i32.subview(q_band * 32 * cfg.tile_size_kv // 4),
+                    packed.data_ptr().load(count=repeats * 2, alignment=4),
+                    warp_grp_thread_idx,
+                    band_rows,
+                    cfg.tile_size_kv,
+                    repeats * 2,
+                )
+            cute.arch.fence_view_async_shared()
+            prims.barrier_cta_sync(4 + self.inst_id, thread_count=128)
+            return
+
+        if cutlass.const_expr(cfg.tile_size_q >= 32 and cfg.use_fp8_pv):
             # Tile-Q=32 FP8 fast path: compute E4M3 P registers in the
             # same order consumed by the STSM helper, while also capturing
             # one local denominator sum per softmax scale group.
@@ -1017,7 +1090,8 @@ class SmemPResource(DecodeGenResourceBase):
                 cfg.num_softmax_scale_groups,
                 space=cutlass.AddressSpace.rmem,
             )
-            for scale_pair_idx in cutlass.range_constexpr(4):
+            q_repeats = cfg.tile_size_q // 8
+            for scale_pair_idx in cutlass.range_constexpr(q_repeats):
                 scale_base = scale_pair_idx * 2
                 q32_s_base = scale_pair_idx * 4
                 p_lo, p_hi, sum_lo, sum_hi = _compute_fp8_p_regs_and_local_sums(
@@ -1036,13 +1110,13 @@ class SmemPResource(DecodeGenResourceBase):
                     s_arr[q32_s_base + 1],
                     s_arr[q32_s_base + 2],
                     s_arr[q32_s_base + 3],
-                    s_arr[q32_s_base + 16],
-                    s_arr[q32_s_base + 17],
-                    s_arr[q32_s_base + 18],
-                    s_arr[q32_s_base + 19],
+                    s_arr[q32_s_base + q_repeats * 4],
+                    s_arr[q32_s_base + q_repeats * 4 + 1],
+                    s_arr[q32_s_base + q_repeats * 4 + 2],
+                    s_arr[q32_s_base + q_repeats * 4 + 3],
                 )
                 packed_p[scale_pair_idx] = p_lo
-                packed_p[scale_pair_idx + 4] = p_hi
+                packed_p[scale_pair_idx + q_repeats] = p_hi
                 local_sum[scale_base] = sum_lo
                 local_sum[scale_base + 1] = sum_hi
             # Publish the local denominator contribution before committing P so
@@ -1051,26 +1125,13 @@ class SmemPResource(DecodeGenResourceBase):
                 self.tmem_s_ref.store_p_local_sum(scale_idx, local_sum[scale_idx])
             # Store the low and high K halves separately. The x4 helper writes
             # transposed E4M3 bytes into the SMEM layout expected by BMM2.
-            _store_transposed_smem8b_x4(
+            _store_transposed_smem8b(
                 self._smem_base_p_i32,
-                packed_p[0],
-                packed_p[1],
-                packed_p[2],
-                packed_p[3],
+                packed_p.data_ptr().load(count=cfg.num_packed_p_regs, alignment=4),
                 warp_grp_thread_idx,
                 cfg.tile_size_q,
                 cfg.tile_size_kv,
-            )
-            _store_transposed_smem8b_x4(
-                self._smem_base_p_i32,
-                packed_p[4],
-                packed_p[5],
-                packed_p[6],
-                packed_p[7],
-                warp_grp_thread_idx,
-                cfg.tile_size_q,
-                cfg.tile_size_kv,
-                1,
+                cfg.num_packed_p_regs,
             )
             # The P producer writes SMEM directly with STSM helpers. Fence
             # and synchronize the warpgroup before the TS pipeline commits
@@ -1135,7 +1196,7 @@ class SmemPResource(DecodeGenResourceBase):
             prims.barrier_cta_sync(4 + self.inst_id, thread_count=128)
             return
 
-        if cutlass.const_expr(cfg.tile_size_q in (16, 32)):
+        if cutlass.const_expr(cfg.tile_size_q >= 16):
             # Generic tile-Q 16/32 path: compute P scalars for each
             # softmax scale group, accumulate local sums, then pack/store
             # to the BMM2 SMEM layout.

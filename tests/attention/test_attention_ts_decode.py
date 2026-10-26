@@ -1029,6 +1029,8 @@ def _make_mixed_precision_decode_case(
     seed: int,
     splits_kv: int = 1,
     num_insts_kv: int = _FP8_NUM_KV_INSTANCES,
+    q_tokens_per_cta: int = 1,
+    mask_type: str = "dense",
 ) -> tuple[_DecodeCase, Optional[tuple[torch.Tensor, torch.Tensor]]]:
     """Build a nonzero mixed-Q/KV case and its independent reference."""
 
@@ -1134,9 +1136,10 @@ def _make_mixed_precision_decode_case(
             bmm2_scale=1.0,
             output_dtype=output_dtype,
             o_scale=1.0,
-            mask_type="dense",
+            mask_type=mask_type,
             splits_kv=splits_kv,
             num_insts_kv=num_insts_kv,
+            q_tokens_per_cta=q_tokens_per_cta,
         )
     else:
         reference = _decode_reference(
@@ -1150,7 +1153,7 @@ def _make_mixed_precision_decode_case(
             q_scale=1.0,
             k_scale=1.0,
             v_scale=1.0,
-            mask_type="dense",
+            mask_type=mask_type,
         )
     reference = reference.to(output_dtype).float()
     return (
@@ -1165,7 +1168,7 @@ def _make_mixed_precision_decode_case(
             paged_kv_last_page_len=last_page_len,
             reference_real=reference,
             output_dtype=output_dtype,
-            mask_type="dense",
+            mask_type=mask_type,
             bmm1_scale=bmm1_scale,
             bmm2_scale=1.0,
             q_scale=1.0,
@@ -9486,6 +9489,7 @@ def test_dense_encoded_eight_token_fragments(dtype):
         (128, _FP8, _FP8, 8, 128, 1, 5),
         (256, _FP8, torch.float16, 16, 64, 1, 5),
         (128, _FP8, _FP8, 64, 64, 3, 5),
+        (128, _FP8, torch.float16, 64, 64, 4, 8),
         (256, _FP8, torch.float16, 128, 128, 3, 5),
         (64, _FP8, _FP8, 4, 8, 4, 1),
         (256, _FP8, torch.float16, 128, 8, 4, 1),
@@ -9572,3 +9576,134 @@ def test_attention_ts_decode_window_ignores_evicted_pages(dtype):
         kv_lengths=(1024, 1059),
         poison_evicted_pages=True,
     )
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(
+    "head_dim,tile_size_q,seq_len_q,seq_len_kv,heads_q_per_kv,output_dtype,split_kv_mode,page_size",
+    (
+        (128, 48, 6, 65, 8, torch.float16, "disabled", 64),
+        (256, 48, 7, 769, 16, torch.bfloat16, "gmem_reduction", 32),
+        (128, 48, 7, 769, 8, torch.float16, "gmem_reduction_with_separate_kernel", 64),
+        (128, 64, 6, 769, 8, torch.float16, "gmem_reduction", 32),
+        (128, 64, 8, 8193, 8, torch.float16, "gmem_reduction_with_separate_kernel", 64),
+        (256, 64, 6, 65, 16, torch.bfloat16, "disabled", 64),
+        (128, 128, 12, 769, 8, torch.float16, "disabled", 64),
+        (
+            256,
+            128,
+            7,
+            8193,
+            16,
+            torch.bfloat16,
+            "gmem_reduction_with_separate_kernel",
+            32,
+        ),
+        (512, 64, 6, 769, 8, torch.float16, "gmem_reduction", 64),
+        (512, 128, 12, 769, 8, torch.float16, "disabled", 32),
+    ),
+)
+def test_attention_ts_decode_swaps_wide_q(
+    monkeypatch,
+    head_dim: int,
+    tile_size_q: int,
+    split_kv_mode: str,
+    heads_q_per_kv: int,
+    output_dtype: torch.dtype,
+    seq_len_kv: int,
+    seq_len_q: int,
+    page_size: int,
+) -> None:
+    """Wide transformed-KV tiles preserve every row through tail and split merge."""
+    from flashinfer.attention.prims_ts import decode as decode_module
+
+    def make_config():
+        return make_decode_config(
+            headdim=head_dim,
+            args={
+                "use_keeps_mma_ab": False,
+                "groups_tokens_heads_q": True,
+                "tile_size_q": tile_size_q,
+                "use_persistent_scheduler": False,
+            },
+            seq_len_q=seq_len_q,
+            seq_len_kv=seq_len_kv,
+            batch_size=2,
+            num_heads_q=heads_q_per_kv,
+            num_heads_kv=1,
+            q_dtype=Float8E4M3FN,
+            k_dtype=Float4E2M1FN,
+            v_dtype=Float4E2M1FN,
+            o_dtype=Float16 if output_dtype == torch.float16 else BFloat16,
+            qkv_layout="pagedKv",
+            num_tokens_per_page=page_size,
+            mask_type="causal",
+            split_kv_mode=split_kv_mode,
+            splits_kv=2 if split_kv_mode != "disabled" else -1,
+            max_splits_kv=2 if split_kv_mode != "disabled" else None,
+            auto_tuner=False,
+            split_kv=split_kv_mode != "disabled",
+        )
+
+    if head_dim == 512 and tile_size_q == 128:
+        with pytest.raises(ValueError, match="O stages cannot wrap TMEM rows"):
+            make_config()
+        return
+    cfg = make_config()
+    spec = decode_module._decode_launch_spec_from_config(
+        cfg,
+        batch_size=2,
+        num_qo_heads=heads_q_per_kv,
+        num_kv_heads=1,
+        head_dim=head_dim,
+        seq_len_q=seq_len_q,
+        max_active_clusters=fmha_decode_config.get_max_active_clusters_for_cluster_size(
+            1
+        ),
+    )
+    monkeypatch.setattr(
+        decode_module, "_resolve_decode_launch_spec", lambda *_args, **_kwargs: spec
+    )
+    case, scale_factors = _make_mixed_precision_decode_case(
+        batch_size=2,
+        seq_len_kv=seq_len_kv,
+        num_qo_heads=heads_q_per_kv,
+        num_kv_heads=1,
+        head_dim=head_dim,
+        seq_len_q=seq_len_q,
+        page_size=page_size,
+        q_dtype=_FP8,
+        kv_dtype=torch.uint8,
+        output_dtype=output_dtype,
+        device="cuda",
+        seed=6979,
+        splits_kv=cfg.splits_kv,
+        num_insts_kv=cfg.num_insts_kv,
+        q_tokens_per_cta=cfg.q_tokens_per_cta,
+        mask_type="causal",
+    )
+    wrapper = _plan_case(case, max_kv_len=seq_len_kv)
+    out = torch.empty_like(case.q, dtype=output_dtype)
+
+    def run():
+        return wrapper.run(
+            case.q,
+            case.paged_kv_cache,
+            None,
+            case.block_tables,
+            bmm1_scale=case.bmm1_scale,
+            bmm2_scale=case.bmm2_scale,
+            kv_scale_factors=scale_factors,
+            out=out,
+            validate=False,
+        )
+
+    run()
+    _assert_case_correct(out, case)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_case_correct(out, case)

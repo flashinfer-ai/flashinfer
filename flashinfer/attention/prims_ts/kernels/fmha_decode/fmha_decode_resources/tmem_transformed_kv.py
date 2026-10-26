@@ -46,7 +46,7 @@ from .helpers_common import (
     ResourceVars,
     _decode_gen_task_cache,
 )
-from .smem_resources import SmemKvResource
+from .smem_resources import SmemKvResource, SmemKvTileResource
 
 
 def _has_packed_e4m3_e2m1_mul() -> bool:
@@ -159,7 +159,7 @@ class TmemTransformedKvResource(DecodeGenResourceBase):
         ),
     )
     cfg: Constexpr[FmhaDecodeConfig] = None
-    src_smem_kv: Constexpr[SmemKvResource] = None
+    src_smem_kv: Constexpr[SmemKvResource | SmemKvTileResource] = None
     _alloc: Constexpr[TmemAllocation | None] = None
     kv_desc_slot: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     v_desc_0_slot: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -279,38 +279,61 @@ class TmemTransformedKvResource(DecodeGenResourceBase):
         swizzle_mask = (thread_row & Int32(7)) * Int32(16)
         stage_addr = self._destination_stage_addr(stage_info)
         for col_stage in cutlass.range_constexpr(8):
-            dst_regs = []
-            for row_block in cutlass.range_constexpr(2):
-                local_offset = Int32(
-                    row_block * 16 * cfg.head_dim_kv_stage + col_stage * 16
-                )
+            if cutlass.const_expr(cfg.target_ctas_per_sm == 2):
                 src_ptr = src_bytes.data_ptr() + (
                     thread_row * Int32(cfg.head_dim_kv_stage)
-                    + (local_offset ^ swizzle_mask)
+                    + (Int32(col_stage * 16) ^ swizzle_mask)
                 )
                 unpacked = prims.ldmatrix(
                     src_ptr,
-                    2,
+                    4,
                     prims.MMALayout.ROW,
                     shape=prims.LoadShape.M8N16,
                     src_format=prims.LoadSrcFormat.B4X16_P64,
                 )
-                sf_word_idx = col_stage // 4
-                sf_byte_idx = col_stage % 4
-                dst_regs.append(
-                    _mul_e2m1x4_e4m3x4_bx(
-                        unpacked[0],
-                        sf_rows[row_block * 2][sf_word_idx],
-                        sf_byte_idx,
+                dst_regs = []
+                for group in cutlass.range_constexpr(4):
+                    dst_regs.append(
+                        _mul_e2m1x4_e4m3x4_bx(
+                            unpacked[group],
+                            sf_rows[group][col_stage // 4],
+                            col_stage % 4,
+                        )
                     )
-                )
-                dst_regs.append(
-                    _mul_e2m1x4_e4m3x4_bx(
-                        unpacked[1],
-                        sf_rows[row_block * 2 + 1][sf_word_idx],
-                        sf_byte_idx,
+
+            else:
+                dst_regs = []
+                for row_block in cutlass.range_constexpr(2):
+                    local_offset = Int32(
+                        row_block * 16 * cfg.head_dim_kv_stage + col_stage * 16
                     )
-                )
+                    src_ptr = src_bytes.data_ptr() + (
+                        thread_row * Int32(cfg.head_dim_kv_stage)
+                        + (local_offset ^ swizzle_mask)
+                    )
+                    unpacked = prims.ldmatrix(
+                        src_ptr,
+                        2,
+                        prims.MMALayout.ROW,
+                        shape=prims.LoadShape.M8N16,
+                        src_format=prims.LoadSrcFormat.B4X16_P64,
+                    )
+                    sf_word_idx = col_stage // 4
+                    sf_byte_idx = col_stage % 4
+                    dst_regs.append(
+                        _mul_e2m1x4_e4m3x4_bx(
+                            unpacked[0],
+                            sf_rows[row_block * 2][sf_word_idx],
+                            sf_byte_idx,
+                        )
+                    )
+                    dst_regs.append(
+                        _mul_e2m1x4_e4m3x4_bx(
+                            unpacked[1],
+                            sf_rows[row_block * 2 + 1][sf_word_idx],
+                            sf_byte_idx,
+                        )
+                    )
 
             tmem_addr = stage_addr + Int32(col_stage * 4)
             prims.tcgen05_st(
@@ -362,25 +385,48 @@ class TmemTransformedKvResource(DecodeGenResourceBase):
             sf_packed0 = src_sf_words[sf_word_idx]
             sf_packed1 = src_sf_words[sf_word_idx + Int32(1)]
 
-            dst_regs = []
-            for col_block in cutlass.range_constexpr(2):
-                local_offset = Int32(
-                    token_stage * 16 * cfg.head_dim_kv_stage + col_block * 16
-                ) + warp_idx * Int32(32)
+            if cutlass.const_expr(cfg.target_ctas_per_sm == 2):
+                local_offset = (
+                    Int32(token_stage * 16 * cfg.head_dim_kv_stage)
+                    + warp_idx * Int32(32)
+                    + (lane_idx >> Int32(4)) * Int32(16)
+                )
+                row = lane_idx & Int32(15)
                 src_ptr = src_bytes.data_ptr() + (
-                    lane_idx * Int32(cfg.head_dim_kv_stage)
-                    + (local_offset ^ swizzle_mask)
+                    row * Int32(cfg.head_dim_kv_stage) + (local_offset ^ swizzle_mask)
                 )
                 unpacked = prims.ldmatrix(
                     src_ptr,
-                    2,
+                    4,
                     prims.MMALayout.COL,
                     shape=prims.LoadShape.M16N16,
                     src_format=prims.LoadSrcFormat.B4X16_P64,
                 )
-                packed_sf = sf_packed0 if col_block == 0 else sf_packed1
-                dst_regs.append(_mul_e2m1x4_e4m3x4(unpacked[0], packed_sf))
-                dst_regs.append(_mul_e2m1x4_e4m3x4(unpacked[1], packed_sf))
+                dst_regs = []
+                for group in cutlass.range_constexpr(4):
+                    packed_sf = sf_packed0 if group < 2 else sf_packed1
+                    dst_regs.append(_mul_e2m1x4_e4m3x4(unpacked[group], packed_sf))
+
+            else:
+                dst_regs = []
+                for col_block in cutlass.range_constexpr(2):
+                    local_offset = Int32(
+                        token_stage * 16 * cfg.head_dim_kv_stage + col_block * 16
+                    ) + warp_idx * Int32(32)
+                    src_ptr = src_bytes.data_ptr() + (
+                        lane_idx * Int32(cfg.head_dim_kv_stage)
+                        + (local_offset ^ swizzle_mask)
+                    )
+                    unpacked = prims.ldmatrix(
+                        src_ptr,
+                        2,
+                        prims.MMALayout.COL,
+                        shape=prims.LoadShape.M16N16,
+                        src_format=prims.LoadSrcFormat.B4X16_P64,
+                    )
+                    packed_sf = sf_packed0 if col_block == 0 else sf_packed1
+                    dst_regs.append(_mul_e2m1x4_e4m3x4(unpacked[0], packed_sf))
+                    dst_regs.append(_mul_e2m1x4_e4m3x4(unpacked[1], packed_sf))
 
             tmem_addr = stage_addr + Int32(token_stage * 4)
             prims.tcgen05_st(

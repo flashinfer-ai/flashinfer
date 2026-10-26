@@ -12,7 +12,51 @@ to the caller's split permission. Sliding-window plans remain nonsplit, but
 may use direct or CLC-persistent execution. There is no public scheduler or
 tuning knob and no fallback to another attention backend.
 
-Fixed multi-query paged plans compare legal Swaps Q8/Q16/Q32 and Keeps Q64/Q128 candidates across page sizes 4, 8, 16, 32, 64, and 128. Each candidate passes the shared profile validator; eligibility does not imply every dtype, MMA orientation, or reducer supports every combination. Sliding-window scoring uses the visible union, bounded by `window_size + Q - 1`, instead of the model context capacity. Partial final query groups remain candidates: the cost model uses the ceil-divided Q grid and complete per-CTA cost. Q1, packed variable-Q, and explicitly pinned choices retain their existing selection paths. Windowed split-KV remains disabled.
+Fixed multi-query paged plans compare legal Swaps Q8/Q16/Q32 and Keeps Q64/Q128 candidates, plus Swaps Q48/Q64/Q128 for transformed FP8-compute K/V, across page sizes 4, 8, 16, 32, 64, and 128. Each candidate passes the shared profile validator; eligibility does not imply every dtype, MMA orientation, or reducer supports every combination. Sliding-window scoring uses the visible union, bounded by `window_size + Q - 1`, instead of the model context capacity. Partial final query groups remain candidates: the cost model uses the ceil-divided Q grid and complete per-CTA cost. Q1, packed variable-Q, and explicitly pinned choices retain their existing selection paths. Windowed split-KV remains disabled.
+
+Wide Swaps supports fixed grouped paged queries with FP16/BF16 output,
+dense or causal masks, and direct or GMEM split reduction (fused or separate):
+
+| Q tile | Head dimensions | Compute / stored K/V |
+| --- | --- | --- |
+| 48 | 128, 256 | FP8 / NVFP4 |
+| 64 | 128, 256, 512 | Qualified transformed-K/V profiles |
+| 128 | 128, 256 | Qualified transformed-K/V profiles |
+
+Persistent scheduling, packed queries, sparse routes, windows, attention sinks,
+and cluster-SMEM reduction retain the narrow Swaps profiles. D512/Q128 is
+rejected before launch: its staged PV accumulators alone require all 512 TMEM
+columns, leaving no room for scores, statistics, or converted K/V. PV spans all
+TMEM rows, so another row band cannot hold the excess accumulators. D512 uses
+Q64; a wider tile requires a different accumulator or two-CTA MMA schedule.
+
+The wide pipeline uses one K/V instance. With FP8 compute, Q128 streams masked
+scores through TMEM in Q32 bands and retains the S credit until P has read them.
+P and O correction process bounded fragments, and final O staging reuses a D128
+SMEM band. D512/Q64 with FP8 Q and NVFP4 K/V at pages 32/64/128 uses independent
+four-warp K and V converters and TMEM FIFOs. Its twenty-warp CTA stages four raw
+tiles and two converted tiles per operand, issuing next QK before current PV.
+Other wide profiles share one conversion task.
+
+Q48 NVFP4 and compact FP8-compute D128/Q64 NVFP4 profiles target two resident
+CTAs per SM, with matching launch, shared-memory, TMEM, and register budgets.
+Q48 uses Q32+Q16 native score loads and padded statistics; compact correction
+drains Q16 fragments. D128/Q64 uses four raw and three converted stages.
+Explicit deeper FIFOs or larger Q/page-offset buffers retain one CTA. The
+compact D128/Q64 softmax skips max reductions only when a warp cannot increase
+the published maximum. Every warp still reaches the CTA barriers, and the
+first iteration initializes every maximum. Correction skips exponentials and
+O TMEM traffic when no row maximum changes. D256/D512 wide correction also
+skips identity rescaling.
+
+Automatic selection compares wide NVFP4 split fanouts across several waves,
+including when the base Q grid fills the SMs, to account for idle slots in a
+partial final wave. Homogeneous FP8 does the same for full grids and retains a
+one-wave budget for underfilled grids. Homogeneous FP8 D128 admits qualified
+Keeps profiles with FP16/BF16 output so a complete Q64 group can reuse K/V in
+one CTA. Transformed profiles account for conversion, streamed softmax, Q
+padding, split waves, and reduction cost. BF16-compute choices retain their
+established policy; explicit Q64/Q128 remain available for qualified profiles.
 
 D192 Keeps retains 128-wide SMEM stages while issuing PV N128+N64 into 192 logical O columns. Swaps keeps its padded PV computation and transposed output staging; output stores mask channels beyond D192. `smem_q_head_dim` expresses the 128-byte TMA fragment alignment: 192 elements for FP16/BF16, 256 for FP8. It does not widen the public Q tensor.
 
