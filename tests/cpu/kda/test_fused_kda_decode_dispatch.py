@@ -18,6 +18,7 @@ import torch
 from flashinfer.kda_kernels.fused_kda_decode_multitoken import _pick_tile
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
 @pytest.mark.parametrize("sm_count", [148, 160])
 @pytest.mark.parametrize("tokens", [5, 8])
@@ -39,6 +40,7 @@ def test_multitoken_dispatch_wave_boundary(
     assert _pick_tile(tokens, sequence_heads, sm_count, capability) == expected
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
 @pytest.mark.parametrize("sm_count", [148, 160])
 @pytest.mark.parametrize("tokens", [1, 2, 3, 4, 6, 7, 9])
@@ -59,6 +61,7 @@ def test_multitoken_dispatch_other_token_counts(
     assert _pick_tile(tokens, sequence_heads, sm_count, capability) == expected
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
 @pytest.mark.parametrize("sm_count", [148, 160])
 @pytest.mark.parametrize("tokens", [1, 5, 8])
@@ -82,6 +85,7 @@ def test_multitoken_dispatch_split_boundary(
     assert _pick_tile(tokens, sequence_heads, sm_count, capability) == expected
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
 @pytest.mark.parametrize("sm_count", [148, 160])
 @pytest.mark.parametrize("tokens", range(1, 10))
@@ -144,6 +148,7 @@ def test_multitoken_norm_order_dispatch(
     assert chosen == [expected]
 
 
+@pytest.mark.cpu_only
 def test_multitoken_norm_order_cache_key(monkeypatch):
     import importlib
 

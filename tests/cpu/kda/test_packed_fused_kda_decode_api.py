@@ -41,6 +41,7 @@ def _arguments(num_sequences=4, num_rows=4):
     }
 
 
+@pytest.mark.cpu_only
 def test_packed_fused_kda_decode_signature_and_public_name():
     packed = inspect.signature(kda_decode.packed_fused_kda_decode)
     legacy = inspect.signature(kda_decode.fused_kda_decode)
@@ -87,6 +88,7 @@ def _capture_metadata(monkeypatch, arguments):
     return captured
 
 
+@pytest.mark.cpu_only
 def test_packed_fused_kda_decode_t2_rejects_t1_state_indices(monkeypatch):
     arguments = _arguments(num_sequences=4, num_rows=4)
     arguments["state_indices"] = torch.ones((4, 2), dtype=torch.int32)
@@ -96,6 +98,7 @@ def test_packed_fused_kda_decode_t2_rejects_t1_state_indices(monkeypatch):
         kda_decode.packed_fused_kda_decode(**arguments)
 
 
+@pytest.mark.cpu_only
 def test_packed_fused_kda_decode_t2_forwards_none_lower_bound(monkeypatch):
     captured = {}
 
@@ -112,6 +115,7 @@ def test_packed_fused_kda_decode_t2_forwards_none_lower_bound(monkeypatch):
     assert captured["lower_bound"] is None
 
 
+@pytest.mark.cpu_only
 def test_packed_fused_kda_decode_t1_forwards_metadata_without_remap(monkeypatch):
     arguments = _arguments(num_sequences=3, num_rows=5)
     arguments["state_indices"] = torch.tensor([[11], [22], [33]], dtype=torch.int32)
@@ -126,6 +130,7 @@ def test_packed_fused_kda_decode_t1_forwards_metadata_without_remap(monkeypatch)
     assert captured["state_indices"].shape == (3,)
 
 
+@pytest.mark.cpu_only
 def test_packed_fused_kda_decode_t1_forwards_pre_resolved_rows(monkeypatch):
     arguments = _arguments(num_sequences=3, num_rows=5)
     arguments["state_indices"] = torch.tensor([[11], [22], [33]], dtype=torch.int32)
@@ -137,6 +142,7 @@ def test_packed_fused_kda_decode_t1_forwards_pre_resolved_rows(monkeypatch):
     assert "packed_state_indices" not in captured
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("field", "value", "error"),
     [
@@ -164,6 +170,7 @@ def test_packed_fused_kda_decode_t1_validates_remap_structure(
         kda_decode.packed_fused_kda_decode(**arguments)
 
 
+@pytest.mark.cpu_only
 def test_packed_fused_kda_decode_cache_getters_are_cached(monkeypatch):
     kernel_module = __import__(
         "flashinfer.kda_kernels.fused_kda_decode_multitoken", fromlist=["module"]
@@ -190,6 +197,7 @@ def test_packed_fused_kda_decode_cache_getters_are_cached(monkeypatch):
         kernel_module._get_compiled_kernel.cache_clear()
 
 
+@pytest.mark.cpu_only
 def test_packed_fused_kda_decode_metadata_is_required():
     arguments = _arguments()
     positional = [
