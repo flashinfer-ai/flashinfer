@@ -286,7 +286,7 @@ constexpr Schedule SelectSm103aSchedule(const Shape& shape) {
   }
 
   if (IsGeometry(shape, 4096, 1024, 512, 10) &&
-      (shape.num_tokens >= 6 && shape.num_tokens <= 25)) {
+      (shape.num_tokens >= 5 && shape.num_tokens <= 25)) {
     return {true,
             Geometry::kH4096I1024E512K10,
             RouteLayout::kGpuPacked,
@@ -874,6 +874,9 @@ static_assert(SelectSm103aSchedule({30, 2048, 512, 256, 256, 8}).fc2 ==
 static_assert(SelectSm103aSchedule({31, 2048, 512, 256, 256, 8}).fc2 ==
               Fc2Schedule::kRouteParallelK512Stage5DeviceWorkfeed);
 static_assert(SelectsSm103aFusedK512MmaU2({32, 2048, 512, 256, 256, 8}, 144));
+static_assert(SelectSm103aSchedule({4, 4096, 1024, 512, 512, 10}).route_layout ==
+              RouteLayout::kDirect);
+static_assert(SelectsSm103aFusedK512MmaU2({5, 4096, 1024, 512, 512, 10}, 144));
 static_assert(SelectsSm103aFusedK512MmaU2({6, 4096, 1024, 512, 512, 10}, 0));
 static_assert(SelectsSm103aFusedK512MmaU2({8, 4096, 1024, 512, 512, 10}, 0));
 static_assert(SelectsSm103aFusedK512MmaU2({9, 4096, 1024, 512, 512, 10}, 144));
@@ -969,7 +972,7 @@ constexpr int32_t Sm103aFusedK512MmaU2WorkfeedCtas(Geometry geometry, int32_t to
       return tokens >= 15 && tokens <= 32 ? 144 : -1;
     case Geometry::kH4096I1024E512K10:
       if (TokensIn(tokens, 6, 7, 8, 15)) return 0;
-      return tokens >= 9 && tokens <= 25 ? 144 : -1;
+      return tokens >= 5 && tokens <= 25 ? 144 : -1;
     case Geometry::kH2048I512E256K8:
       if (TokensIn(tokens, 20, 22, 24)) return 0;
       return TokensIn(tokens, 16, 17, 19, 21, 23, 25, 26, 27, 28, 29, 32) ? 144 : -1;
