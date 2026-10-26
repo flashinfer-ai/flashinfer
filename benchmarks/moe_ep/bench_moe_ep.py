@@ -419,7 +419,8 @@ def main() -> int:
             torch.cuda.synchronize()
             e2e_us_samples.append((perf_counter() - t0) * 1e6)
             tm = layer.last_timings_ms
-            disp_us.append(tm.get("dispatch", 0.0) * 1e3)
+            # The payload packing runs as its own "quantize" stage.
+            disp_us.append((tm.get("quantize", 0.0) + tm.get("dispatch", 0.0)) * 1e3)
             comp_us.append(tm.get("compute", 0.0) * 1e3)
             comb_us.append(tm.get("combine", 0.0) * 1e3)
 
