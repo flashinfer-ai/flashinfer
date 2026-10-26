@@ -180,7 +180,9 @@ jobs:
 
   build-flashinfer-cubin:
     needs: setup
-    runs-on: ubuntu-latest
+    # Ubuntu 26.04 mounts /tmp as a quota-limited tmpfs. The isolated PEP 517
+    # environment for torch and its CUDA dependencies exceeds that quota.
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -213,7 +215,14 @@ jobs:
 
       - name: Build flashinfer-cubin wheel
         id: build-cubin-wheel
+        env:
+          # Keep PEP 517's large isolated build environment off /tmp, which is
+          # a quota-limited tmpfs on Ubuntu 26.04 GitHub-hosted runners.
+          TMPDIR: ${{ runner.temp }}/flashinfer-cubin-build
         run: |
+          mkdir -p "${TMPDIR}"
+          df -hT "${TMPDIR}" /tmp
+          findmnt /tmp || true
           echo "Building flashinfer-cubin..."
           echo "Git commit: $(git rev-parse HEAD)"
           cd flashinfer-cubin
