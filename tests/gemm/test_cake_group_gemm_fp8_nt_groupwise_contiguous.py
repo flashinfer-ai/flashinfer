@@ -1140,20 +1140,26 @@ def test_block_scaled_swap_route_needs_groups_and_arch():
 def test_block_scaled_swap_rp32_rule():
     """The 32-row-block program takes 32- and 64-row alignments of at most 1536 rows.
 
-    sm_100a also needs ``ceil(m / 32) * n / 256`` tiles of at most ``sm_count``
-    and keeps the run32 program without ``sm_count``; sm_103a does not read it.
+    Its tiles also meet the architecture's bound: on sm_100a
+    ``ceil(m / 32) * n / 256`` 32 x 256 tiles of at most ``sm_count``, on
+    sm_103a three times ``ceil(m / 128) * n / 256`` 128 x 256 tiles of at most
+    ``sm_count``.  Without ``sm_count`` both keep the run32 program.
     """
     rule = functools.partial(bs_swap_route_for_shape, k=1024, num_groups=8)
-    # N 1024 on 148 SMs: 37 * 4 = 148 tiles fit, 38 * 4 = 152 do not.
+    # N 1024 on 148 SMs: 37 * 4 = 148 tiles of 32 rows fit sm_100a, 38 * 4 = 152
+    # do not; sm_103a takes 3 * 10 * 4 = 120 for both.
     for m, sm_100a in ((1184, BS_SWAP_RP32_ROUTE), (1216, BS_SWAP_RUN32_ROUTE)):
         assert rule(m, 1024, alignment=32, arch="sm_100a", sm_count=148) == sm_100a
         assert (
             rule(m, 1024, alignment=32, arch="sm_103a", sm_count=148)
             == BS_SWAP_RP32_ROUTE
         )
-    assert rule(1184, 1024, alignment=32, arch="sm_100a") == BS_SWAP_RUN32_ROUTE
-    assert rule(1184, 1024, alignment=32, arch="sm_103a") == BS_SWAP_RP32_ROUTE
+    # N 2048 on 148 SMs: 3 * 6 * 8 = 144 tiles of 128 rows fit sm_103a,
+    # 3 * 7 * 8 = 168 do not.
+    for m, sm_103a in ((768, BS_SWAP_RP32_ROUTE), (800, BS_SWAP_RUN32_ROUTE)):
+        assert rule(m, 2048, alignment=32, arch="sm_103a", sm_count=148) == sm_103a
     for arch in ("sm_100a", "sm_103a"):
+        assert rule(640, 1024, alignment=32, arch=arch) == BS_SWAP_RUN32_ROUTE
         # At most 1536 rows.
         assert (
             rule(1536, 256, alignment=32, arch=arch, sm_count=148) == BS_SWAP_RP32_ROUTE
@@ -1239,11 +1245,14 @@ def test_launch_plan_takes_the_swap_routes_with_the_architecture():
         # More than 1536 rows: 14 * 4 tiles of 128 x 256 rows.
         route, grid = multi_run(1792, 1024, sm_count=152, arch=arch)
         assert route == BS_SWAP_RUN32_ROUTE and grid == (2 * 14 * 4, 1, 1)
-    # launch_plan passes its sm_count: 80 tiles exceed 64 SMs on sm_100a only.
+    # launch_plan passes its sm_count: 80 tiles of 32 rows exceed 64 SMs on
+    # sm_100a; 3 * 20 tiles of 128 rows fit 64 SMs on sm_103a, not 56.
     route, grid = multi_run(640, 1024, sm_count=64, arch="sm_100a")
     assert route == BS_SWAP_RUN32_ROUTE and grid == (2 * 5 * 4, 1, 1)
     route, grid = multi_run(640, 1024, sm_count=64, arch="sm_103a")
     assert route == BS_SWAP_RP32_ROUTE and grid == (2 * 32, 1, 1)
+    route, grid = multi_run(640, 1024, sm_count=56, arch="sm_103a")
+    assert route == BS_SWAP_RUN32_ROUTE and grid == (2 * 5 * 4, 1, 1)
     route, _ = launch_plan(
         65408,
         512,
@@ -1259,8 +1268,8 @@ def test_launch_plan_takes_the_swap_routes_with_the_architecture():
 
 # (group_counts, N, K, alignment, route): compact layouts the swap-AB rule sends to
 # each swap route on both architectures with at least 80 SMs (multi-run of at
-# most 1536 rows and 32 x 256 tiles; longer multi-run; K > 512 below 100 rows
-# per group; K <= 256 at 2..20 rows per group).
+# most 1536 rows within the rp32 tile bound; longer multi-run; K > 512 below
+# 100 rows per group; K <= 256 at 2..20 rows per group).
 BLOCK_SCALED_SWAP_CASES = [
     pytest.param(
         [5, 33, 0, 0, 97, 32, 1, 129],
