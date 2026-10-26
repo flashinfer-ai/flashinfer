@@ -1040,8 +1040,7 @@ inline void validateFp8BlockScaleGemm1ActivationParams(
   if (activation_type == ActivationType::ClampedRelu2) {
     TVM_FFI_ICHECK(quantization_type == Fp8QuantizationType::MxFp8)
         << "TRTLLM ClampedRelu2 requires MXFP8.";
-    TVM_FFI_ICHECK(gemm1_clamp_limit.has_value())
-        << "ClampedRelu2 requires gemm1_clamp_limit.";
+    TVM_FFI_ICHECK(gemm1_clamp_limit.has_value()) << "ClampedRelu2 requires gemm1_clamp_limit.";
     TVM_FFI_ICHECK(!gemm1_alpha.has_value() && !gemm1_beta.has_value())
         << "ClampedRelu2 accepts gemm1_clamp_limit only.";
     return;
@@ -1618,10 +1617,11 @@ class FusedMoeLauncher {
   }
 
   void check_moe_common(bool allow_bias_with_none_type = false) const {
-    TVM_FFI_ICHECK(activation_type != ActivationType::ClampedRelu2 ||
-                   (((mDtypeAct == btg::Dtype::MxE4m3 && mDtypeWeights == btg::Dtype::MxE4m3) ||
-                     (mDtypeAct == btg::Dtype::Bfloat16 && mDtypeWeights == btg::Dtype::Bfloat16)) &&
-                    !args->mUseDeepSeekFp8))
+    TVM_FFI_ICHECK(
+        activation_type != ActivationType::ClampedRelu2 ||
+        (((mDtypeAct == btg::Dtype::MxE4m3 && mDtypeWeights == btg::Dtype::MxE4m3) ||
+          (mDtypeAct == btg::Dtype::Bfloat16 && mDtypeWeights == btg::Dtype::Bfloat16)) &&
+         !args->mUseDeepSeekFp8))
         << "TRTLLM ClampedRelu2 requires BF16 or MXFP8.";
     // Hidden states [num_tokens, hidden_size]
     TVM_FFI_ICHECK_EQ(hidden_states.ndim(), 2) << "hidden_states must be 2D.";

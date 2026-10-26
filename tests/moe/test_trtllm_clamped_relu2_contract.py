@@ -106,9 +106,11 @@ class ClampedRelu2ContractTest(unittest.TestCase):
             (1, self.scale, None, self.scale),
             (1, None, self.scale, self.scale),
         ):
-            with self.subTest(quant=quant, alpha=alpha, beta=beta, limit=limit):
-                with self.assertRaises(ValueError):
-                    self.validate(quant, Activation.ClampedRelu2, alpha, beta, limit)
+            with (
+                self.subTest(quant=quant, alpha=alpha, beta=beta, limit=limit),
+                self.assertRaises(ValueError),
+            ):
+                self.validate(quant, Activation.ClampedRelu2, alpha, beta, limit)
 
     def test_rejects_scale_metadata(self):
         for field, value in (
@@ -138,9 +140,11 @@ class ClampedRelu2ContractTest(unittest.TestCase):
             (self.scale, 3, "cuda:0"),
             (self.scale, 4, "cuda:1"),
         ):
-            with self.subTest(scale=scale, count=count, device=device):
-                with self.assertRaises(ValueError):
-                    self.validate_bf16(12, None, None, scale, count, device)
+            with (
+                self.subTest(scale=scale, count=count, device=device),
+                self.assertRaises(ValueError),
+            ):
+                self.validate_bf16(12, None, None, scale, count, device)
         for alpha, beta in ((self.scale, None), (None, self.scale)):
             with self.assertRaises(ValueError):
                 self.validate_bf16(12, alpha, beta, self.scale, 4, "cuda:0")
