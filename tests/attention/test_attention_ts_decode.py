@@ -631,6 +631,7 @@ def _fp8_decode_reference(
     num_insts_kv: int = _FP8_NUM_KV_INSTANCES,
     q_tokens_per_cta: int = 1,
     probability_scale: float = _FP8_PROBABILITY_SCALE,
+    tile_size_kv: int = _FP8_KV_TILE_SIZE,
 ) -> torch.Tensor:
     """Model the kernel's FP8-P operand and split/instance stream merge."""
 
@@ -727,10 +728,8 @@ def _fp8_decode_reference(
                 mask_type=mask_type,
                 window_left=window_left,
             )
-            first_token = group_begin // _FP8_KV_TILE_SIZE * _FP8_KV_TILE_SIZE
-            num_tiles = (
-                group_end - first_token + _FP8_KV_TILE_SIZE - 1
-            ) // _FP8_KV_TILE_SIZE
+            first_token = group_begin // tile_size_kv * tile_size_kv
+            num_tiles = (group_end - first_token + tile_size_kv - 1) // tile_size_kv
             scores = torch.einsum("hd,thd->ht", request_queries[query_idx], keys)
             tiles_per_group = splits_kv * num_insts_kv
             groups_per_split = (num_tiles + tiles_per_group - 1) // tiles_per_group
@@ -777,9 +776,9 @@ def _fp8_decode_reference(
 
             for stream_idx, tile_indices in enumerate(stream_tiles):
                 for tile_idx in tile_indices:
-                    tile_start = first_token + tile_idx * _FP8_KV_TILE_SIZE
+                    tile_start = first_token + tile_idx * tile_size_kv
                     tile_begin = max(tile_start, visible_begin)
-                    tile_end = min(tile_start + _FP8_KV_TILE_SIZE, visible_end)
+                    tile_end = min(tile_start + tile_size_kv, visible_end)
                     if tile_end <= tile_begin:
                         continue
                     tile_scores = scores[:, tile_begin:tile_end]
@@ -1605,6 +1604,7 @@ def _plan_case(
     qo_indptr: Optional[torch.Tensor] = None,
     max_seq_len_q: Optional[int] = None,
     dynamic_kv: bool = False,
+    split_kv: bool = True,
 ):
     wrapper = BatchDecodePagedTSWrapper(kv_layout="HND")
     seq_len_q = 1 if case.q.ndim == 3 else int(case.q.shape[1])
@@ -1630,6 +1630,7 @@ def _plan_case(
         mask_type=case.mask_type,
         window_left=case.window_left,
         seq_lens=None if dynamic_kv else seq_lens.cpu(),
+        split_kv=split_kv,
     )
     return wrapper
 
@@ -1707,6 +1708,7 @@ def _run_standalone(
     page_size: Optional[int] = None,
     storage_page_size: Optional[int] = None,
     validate: bool = True,
+    split_kv: bool = True,
 ):
     """Run the caller-workspace public entry point for wrapper parity."""
 
@@ -1732,6 +1734,7 @@ def _run_standalone(
             kv_layout="HND",
             storage_page_size=storage_page_size,
             device=case.q.device,
+            split_kv=split_kv,
         )
         workspace = torch.zeros(workspace_size, dtype=torch.int8, device=case.q.device)
     else:
@@ -1758,6 +1761,7 @@ def _run_standalone(
         kv_layout="HND",
         page_size=page_size,
         validate=validate,
+        split_kv=split_kv,
     )
     assert result is output
     return output
@@ -1805,6 +1809,7 @@ def _exercise_public_paths(
     exercise_all_paths: bool,
     qo_indptr: Optional[torch.Tensor] = None,
     max_seq_len_q: Optional[int] = None,
+    split_kv: bool = True,
 ):
     """Always check eager; reserve standalone/graph parity for anchor rows."""
 
@@ -1815,6 +1820,7 @@ def _exercise_public_paths(
             qo_indptr=qo_indptr,
             splits_kv=int(policy["splits_kv"]),
             num_insts_kv=int(policy["num_insts_kv"]),
+            tile_size_kv=int(policy["tile_size_kv"]),
             q_tokens_per_cta=(
                 int(policy["tile_size_q"])
                 // (case.q.shape[-2] // case.k_cache.shape[1])
@@ -1841,6 +1847,7 @@ def _exercise_public_paths(
         max_kv_len=max_kv_len,
         qo_indptr=qo_indptr,
         max_seq_len_q=max_seq_len_q,
+        split_kv=split_kv,
     )
     _assert_case_correct(standalone, case)
     torch.testing.assert_close(standalone, eager, rtol=0, atol=0)
@@ -1901,6 +1908,7 @@ def _with_reference(
     splits_kv: int = 1,
     num_insts_kv: int = _FP8_NUM_KV_INSTANCES,
     q_tokens_per_cta: int = 1,
+    tile_size_kv: int = _FP8_KV_TILE_SIZE,
 ):
     """Return a case whose oracle reflects its current mutable Q/K/V data."""
 
@@ -1923,6 +1931,7 @@ def _with_reference(
             splits_kv=splits_kv,
             num_insts_kv=num_insts_kv,
             q_tokens_per_cta=q_tokens_per_cta,
+            tile_size_kv=tile_size_kv,
         )
     else:
         reference = _decode_reference(
@@ -1970,6 +1979,7 @@ def _exercise_auto_case(
     max_seq_len_q: Optional[int] = None,
     exercise_all_paths: bool = False,
     dynamic_kv: bool = False,
+    split_kv: bool = True,
 ) -> dict[str, object]:
     """Plan automatically and validate one eager public-interface launch."""
 
@@ -1986,6 +1996,7 @@ def _exercise_auto_case(
         qo_indptr=qo_indptr,
         max_seq_len_q=max_seq_len_q,
         dynamic_kv=dynamic_kv,
+        split_kv=split_kv,
     )
     policy = dict(wrapper._policy)
     _assert_auto_policy(policy, {}, device=case.q.device)
@@ -1995,6 +2006,7 @@ def _exercise_auto_case(
         seq_lens,
         max_kv_len=max_kv_len,
         exercise_all_paths=exercise_all_paths,
+        split_kv=split_kv,
         qo_indptr=qo_indptr,
         max_seq_len_q=max_seq_len_q,
     )
@@ -2010,6 +2022,7 @@ def exercise_explicit_decode_profile(
     max_seq_len_q: Optional[int] = None,
     config_args: dict[str, object] | None = None,
     exercise_all_paths: bool = False,
+    split_kv: bool = True,
 ) -> dict[str, object]:
     """Check numerical output with an explicit generator profile."""
 
@@ -2047,6 +2060,7 @@ def exercise_explicit_decode_profile(
             qo_indptr=qo_indptr,
             max_seq_len_q=max_seq_len_q,
             exercise_all_paths=exercise_all_paths,
+            split_kv=split_kv,
         )
     finally:
         decode_module._resolve_decode_launch_spec.cache_clear()
@@ -8373,9 +8387,24 @@ def test_attention_ts_decode_16bit_paged_keeps_q128_automatic_scope(
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.parametrize(("tile_size_q", "tile_size_kv"), ((128, 128), (64, 256)))
+@pytest.mark.parametrize(
+    ("head_dim", "seq_len_q", "tile_size_q", "tile_size_kv"),
+    (
+        (128, 1, 16, 128),
+        (256, 1, 16, 128),
+        (128, 4, 64, 128),
+        (128, 8, 128, 128),
+        (256, 4, 64, 128),
+        (256, 8, 128, 128),
+        (128, 4, 64, 256),
+    ),
+)
 def test_attention_ts_decode_sm107_expanded_resources(
-    monkeypatch: pytest.MonkeyPatch, tile_size_q: int, tile_size_kv: int
+    monkeypatch: pytest.MonkeyPatch,
+    head_dim: int,
+    seq_len_q: int,
+    tile_size_q: int,
+    tile_size_kv: int,
 ):
     """Check exclusive TMEM and deeper FP8 rings across ragged KV tails."""
 
@@ -8388,8 +8417,8 @@ def test_attention_ts_decode_sm107_expanded_resources(
         kv_lens=(3073, 2637),
         num_qo_heads=64,
         num_kv_heads=4,
-        head_dim=128,
-        seq_len_q=tile_size_q // 16,
+        head_dim=head_dim,
+        seq_len_q=seq_len_q,
         page_size=32,
         qkv_dtype=_FP8,
         output_dtype=_FP8,
@@ -8402,12 +8431,14 @@ def test_attention_ts_decode_sm107_expanded_resources(
         monkeypatch,
         case,
         config_args={
+            "use_keeps_mma_ab": tile_size_q >= 64,
             "tile_size_q": tile_size_q,
             "tile_size_kv": tile_size_kv,
             "max_tmem_alloc_cols": 576,
             "smem_capacity_kib": 327,
         },
         exercise_all_paths=True,
+        split_kv=False,
     )
 
 

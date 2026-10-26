@@ -83,7 +83,6 @@ from .fmha_decode_constants import (
     SMEM_CAPACITY_KIB,
     SM107_SMEM_CAPACITY_KIB,
     SM107_TMEM_ALLOCATION_COLUMNS,
-    SM107_FP8_KV256_FIFO_STAGES,
     SPLIT_KV_MIN_TOKENS_PER_CTA,
     SWIZZLE_128B_ROW_BYTES,
     TMEM_COLUMNS_PER_ROW,
@@ -3472,6 +3471,40 @@ def _set_if_implicit(
         setattr(cfg, field_name, value)
 
 
+def sm107_fp8_pipeline_profile(cfg: FmhaDecodeConfig) -> tuple[int, int] | None:
+    """Return opt-in long-KV Q/KV depths for the physical decode layout.
+
+    These expanded-resource profiles target nonsplit throughput. Split-KV,
+    sparse and Sage retain their own defaults and resource lifetimes.
+    """
+    if not (
+        cfg.smem_capacity_kib == SM107_SMEM_CAPACITY_KIB
+        and not cfg.use_split_kv
+        and not cfg.use_block_sparse
+        and not cfg.use_q_token_kv_block_sparse_route
+        and not cfg.use_sage_attention
+        and cfg.q_dtype == cfg.k_dtype == cfg.v_dtype == cfg.out_dtype == Float8E4M3FN
+    ):
+        return None
+    if cfg.tile_size_kv == 256:
+        return (1, 8) if cfg.tile_size_q == 64 else None
+    if cfg.tile_size_kv != 128:
+        return None
+    if not cfg.use_keeps_mma_ab:
+        return (1, 18) if cfg.tile_size_q <= 32 else None
+    if cfg.num_insts_kv == 1 and cfg.num_head_dim_stages_kv > 1:
+        # Four complete two-stage head rounds in each K/V operand ring.
+        return (1, 16)
+    if cfg.num_insts_kv == 2:
+        if cfg.tile_size_q == 64:
+            return (1, 18 if cfg.uses_exclusive_tmem else 12)
+        if cfg.tile_size_q == 128:
+            # Full-score Q128 needs more Q overlap, rather than the deepest
+            # possible K/V ring. Streamed TMEM-P keeps the smaller ring.
+            return (2, 12 if cfg.uses_exclusive_tmem else 8)
+    return None
+
+
 def _finalize_static_decode_config(
     cfg: FmhaDecodeConfig,
     explicit_fields: set[str],
@@ -3511,26 +3544,13 @@ def _finalize_static_decode_config(
             # effective configuration is supported by the kernel.
             for field_name, value in _KV_TILE_256_PHYSICAL_DEFAULTS.items():
                 _set_if_implicit(cfg, field_name, value, explicit_fields)
-            # Rubin's larger opt-in SMEM budget can sustain eight FP8 slots.
-            # The same profile serves ordinary and domain-local allocations;
-            # placement never participates in kernel configuration.
+            # Start from the element-width defaults. Expanded-resource
+            # profiles are selected below after physical geometry is resolved.
             kv_stages = (
                 KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES
                 if cfg.k_dtype.width == 8 and cfg.v_dtype.width == 8
                 else KV_TILE_256_SHARED_FIFO_STAGES
             )
-            if (
-                cfg.smem_capacity_kib >= SM107_SMEM_CAPACITY_KIB
-                and not cfg.use_block_sparse
-                and cfg.headdim == 128
-                and cfg.tile_size_q == 64
-                and cfg.q_dtype
-                == cfg.k_dtype
-                == cfg.v_dtype
-                == cfg.out_dtype
-                == Float8E4M3FN
-            ):
-                kv_stages = SM107_FP8_KV256_FIFO_STAGES
             _set_if_implicit(
                 cfg,
                 "kv_stages",
@@ -3620,6 +3640,12 @@ def _finalize_static_decode_config(
         _set_if_implicit(
             cfg, "transformed_kv_stages", min(cfg.kv_stages, 4), explicit_fields
         )
+
+    profile = sm107_fp8_pipeline_profile(cfg)
+    if profile is not None:
+        q_stages, kv_stages = profile
+        _set_if_implicit(cfg, "q_stages", q_stages, explicit_fields)
+        _set_if_implicit(cfg, "kv_stages", kv_stages, explicit_fields)
 
     # Split-KV mode forbids persistent scheduling. Canonicalize here so
     # downstream consumers can gate on use_persistent_scheduler alone without

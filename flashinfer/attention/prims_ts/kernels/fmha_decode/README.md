@@ -253,18 +253,33 @@ tiles) as FMA polynomials to offload MUFU. SM103, with twice the MUFU ex2 rate,
 keeps every exponential on MUFU, and its unmasked max pass takes fragment maxima
 (or Sage scale-group maxima) from LDTM.STAT instead of a register reduction.
 
-SM107 uses native EX2. The generator also accepts explicit resource limits
-`max_tmem_alloc_cols=576` and `smem_capacity_kib=327` for Rubin profiles on
-CUDA 13.4 with native DSL 4.8 support. Automatic plans retain the conservative
-512-column/227-KiB limits: larger allocations can help domain-local launches
-while slowing ordinary placement.
+SM107 uses native EX2. The generator accepts explicit resource limits
+`max_tmem_alloc_cols=576` and `smem_capacity_kib=327` on CUDA 13.4 with native
+DSL 4.8 support. Automatic plans retain the 512-column/227-KiB limits because
+expanded profiles can improve domain-local launches while slowing ordinary
+placement. Memory placement is not a configuration or dispatch input.
 
-Exclusive TMEM separates multi-query score/statistics storage; its allocation
-and release use matching qualifiers. Sage and sparse fragment paths retain
-their required TMEM-P layout. The larger SMEM budget enables eight slots for a
-pure-FP8 Q64/KV256 profile while preserving explicit pipeline settings. Each
-resource/pipeline profile has its own compiled specialization; batch remains a
-runtime input.
+For homogeneous FP8 Q/K/V/output, opting into 327 KiB selects the following
+long-KV, nonsplit pipeline defaults. KV depth counts raw K/V slots in total;
+staged one-instance Keeps uses eight slots per operand for depth sixteen.
+Explicit Q/KV depths retain precedence.
+
+| Physical kernel layout | Q depth | KV depth |
+| --- | ---: | ---: |
+| Small-Q Swaps, KV128 | 1 | 18 |
+| Staged one-instance Keeps, KV128 | 1 | 16 |
+| Q64 Keeps, KV128, exclusive TMEM | 1 | 18 |
+| Q64 Keeps, KV128, ordinary TMEM | 1 | 12 |
+| Q128 Keeps, KV128, exclusive TMEM | 2 | 12 |
+| Q128 Keeps, KV128, streamed TMEM-P | 2 | 8 |
+| Q64 Keeps, KV256 | 1 | 8 |
+
+The full-score Q128 profile uses additional Q overlap instead of maximizing
+KV depth. Exclusive TMEM allocation and release use matching qualifiers;
+Sage, sparse and split-KV profiles retain their existing defaults and required
+TMEM-P layouts. The builder checks the complete SMEM allocation. Each chosen
+resource/pipeline configuration has its own compiled specialization; batch
+remains a runtime input.
 
 Eligible nonsplit work that exceeds one resident SM wave uses CLC-persistent
 scheduling. A scheduler warp discovers each schedule token once and broadcasts it to

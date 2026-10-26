@@ -37,7 +37,6 @@ SMEM_CAPACITY_KIB = 227
 # allocation sizes remain powers of two through 512 columns.
 SM107_SMEM_CAPACITY_KIB = 327
 SM107_TMEM_ALLOCATION_COLUMNS = 576
-SM107_FP8_KV256_FIFO_STAGES = 8
 
 # The M64N256 profile stages one 256-row K or V tile per shared-ring slot. A
 # 16-bit tile is 64 KiB, so three stages, the 16-KiB Q stage, the tail
