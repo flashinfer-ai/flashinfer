@@ -48,7 +48,11 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define TMEM_TMEM_STATS1_OFFSET 48
 #define TMEM_TMEM_O0_OFFSET 80
 #define TMEM_TMEM_O1_OFFSET 88
+#if __CUDA_ARCH__ == 1030
 #define NUM_KV_PIPE_STAGES 6
+#else
+#define NUM_KV_PIPE_STAGES 4
+#endif
 #define SMEM_SMEM_CORR0_OFF 1024
 #define SMEM_SMEM_CORR0_STAGE_BYTES 64
 #define SMEM_SMEM_CORR0_STRIDE 64
@@ -76,22 +80,42 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_SMEM_V_OFF 6144
 #define SMEM_SMEM_V_STAGE_BYTES 32768
 #define SMEM_SMEM_V_STRIDE 32768
+#if __CUDA_ARCH__ == 1030
 #define SMEM_SMEM_P0_OFF 202752
+#else
+#define SMEM_SMEM_P0_OFF 137216
+#endif
 #define SMEM_SMEM_P0_STAGE_BYTES 2048
 #define SMEM_SMEM_P0_STRIDE 2048
+#if __CUDA_ARCH__ == 1030
 #define SMEM_SMEM_P1_OFF 206848
+#else
+#define SMEM_SMEM_P1_OFF 141312
+#endif
 #define SMEM_SMEM_P1_STAGE_BYTES 2048
 #define SMEM_SMEM_P1_STRIDE 2048
+#if __CUDA_ARCH__ == 1030
 #define SMEM_SMEM_SK_FLAG_OFF 208896
+#else
+#define SMEM_SMEM_SK_FLAG_OFF 143360
+#endif
 #define SMEM_SMEM_SK_FLAG_STAGE_BYTES 16
 #define SMEM_SMEM_SK_FLAG_STRIDE 16
+#if __CUDA_ARCH__ == 1030
 #define SMEM_TOTAL 210944
+#else
+#define SMEM_TOTAL 145408
+#endif
 #define THREADS 512
 #define BLOCK_N 128
 #define HEAD_DIM 128
 #define TILE_Q 8
 #define PAGE_SIZE 16
+#if __CUDA_ARCH__ == 1030
 #define NUM_KV_STAGES 6
+#else
+#define NUM_KV_STAGES 4
+#endif
 #define BATCH_SIZE 128
 #define NUM_Q_HEADS 32
 #define NUM_KV_HEADS 4
@@ -309,6 +333,7 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
     #define q_full_addr (mbar_base + 0)
     #define q_empty_addr (mbar_base + 8)
     #define kv_full_addr (mbar_base + 16)
+#if __CUDA_ARCH__ == 1030
     #define kv_empty_addr (mbar_base + 64)
     #define s_full_0_addr (mbar_base + 112)
     #define s_full_1_addr (mbar_base + 120)
@@ -323,6 +348,22 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
     #define o_empty_0_addr (mbar_base + 200)
     #define o_empty_1_addr (mbar_base + 208)
     #define tmem_dealloc_addr (mbar_base + 216)
+#else
+    #define kv_empty_addr (mbar_base + 48)
+    #define s_full_0_addr (mbar_base + 80)
+    #define s_full_1_addr (mbar_base + 88)
+    #define p_full_0_addr (mbar_base + 96)
+    #define p_full_1_addr (mbar_base + 104)
+    #define corr_scale_addr (mbar_base + 112)
+    #define corr_empty_0_addr (mbar_base + 128)
+    #define corr_empty_1_addr (mbar_base + 136)
+    #define stats_empty_addr (mbar_base + 144)
+    #define o_ready_0_addr (mbar_base + 152)
+    #define o_ready_1_addr (mbar_base + 160)
+    #define o_empty_0_addr (mbar_base + 168)
+    #define o_empty_1_addr (mbar_base + 176)
+    #define tmem_dealloc_addr (mbar_base + 184)
+#endif
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -348,18 +389,32 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
     const int smem_kv_addr = smem + 6144;
     __nv_bfloat16* smem_v = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_v_addr = smem + 6144;
+#if __CUDA_ARCH__ == 1030
     __nv_bfloat16* smem_p0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 202752);
     const int smem_p0_addr = smem + 202752;
     __nv_bfloat16* smem_p1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 206848);
     const int smem_p1_addr = smem + 206848;
     unsigned int* smem_sk_flag = reinterpret_cast<unsigned int*>(smem_raw + 208896);
     const int smem_sk_flag_addr = smem + 208896;
+#else
+    __nv_bfloat16* smem_p0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 137216);
+    const int smem_p0_addr = smem + 137216;
+    __nv_bfloat16* smem_p1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 141312);
+    const int smem_p1_addr = smem + 141312;
+    unsigned int* smem_sk_flag = reinterpret_cast<unsigned int*>(smem_raw + 143360);
+    const int smem_sk_flag_addr = smem + 143360;
+#endif
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Qt))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&K))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&V))) : "memory");
 
+#if __CUDA_ARCH__ == 1030
     // Mbarrier init (17 pipeline groups, 0 ordered-sequence groups, 28 barriers)
     // Mbarriers at smem_raw[0..224)
+#else
+    // Mbarrier init (17 pipeline groups, 0 ordered-sequence groups, 24 barriers)
+    // Mbarriers at smem_raw[0..192)
+#endif
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -369,47 +424,113 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
             // q_empty: 1 barriers, init_count=1
             mbarrier_init(smem + 8, 1);
             // --- pipeline 'kv_pipe' ---
+#if __CUDA_ARCH__ == 1030
             // kv_full: 6 barriers, init_count=2
+#else
+            // kv_full: 4 barriers, init_count=2
+#endif
             mbarrier_init(smem + 16, 2);
             mbarrier_init(smem + 24, 2);
             mbarrier_init(smem + 32, 2);
             mbarrier_init(smem + 40, 2);
+#if __CUDA_ARCH__ == 1030
             mbarrier_init(smem + 48, 2);
             mbarrier_init(smem + 56, 2);
             // kv_empty: 6 barriers, init_count=1
+#else
+            // kv_empty: 4 barriers, init_count=1
+            mbarrier_init(smem + 48, 1);
+            mbarrier_init(smem + 56, 1);
+#endif
             mbarrier_init(smem + 64, 1);
             mbarrier_init(smem + 72, 1);
+#if __CUDA_ARCH__ == 1030
             mbarrier_init(smem + 80, 1);
             mbarrier_init(smem + 88, 1);
             mbarrier_init(smem + 96, 1);
             mbarrier_init(smem + 104, 1);
+#else
+#endif
             // s_full_0: 1 barriers, init_count=1
+#if __CUDA_ARCH__ == 1030
             mbarrier_init(smem + 112, 1);
+#else
+            mbarrier_init(smem + 80, 1);
+#endif
             // s_full_1: 1 barriers, init_count=1
+#if __CUDA_ARCH__ == 1030
             mbarrier_init(smem + 120, 1);
+#else
+            mbarrier_init(smem + 88, 1);
+#endif
             // p_full_0: 1 barriers, init_count=256
+#if __CUDA_ARCH__ == 1030
             mbarrier_init(smem + 128, 256);
+#else
+            mbarrier_init(smem + 96, 256);
+#endif
             // p_full_1: 1 barriers, init_count=256
+#if __CUDA_ARCH__ == 1030
             mbarrier_init(smem + 136, 256);
+#else
+            mbarrier_init(smem + 104, 256);
+#endif
             // corr_scale: 2 barriers, init_count=128
+#if __CUDA_ARCH__ == 1030
             mbarrier_init(smem + 144, 128);
             mbarrier_init(smem + 152, 128);
+#else
+            mbarrier_init(smem + 112, 128);
+            mbarrier_init(smem + 120, 128);
+#endif
             // corr_empty_0: 1 barriers, init_count=128
+#if __CUDA_ARCH__ == 1030
             mbarrier_init(smem + 160, 128);
+#else
+            mbarrier_init(smem + 128, 128);
+#endif
             // corr_empty_1: 1 barriers, init_count=128
+#if __CUDA_ARCH__ == 1030
             mbarrier_init(smem + 168, 128);
+#else
+            mbarrier_init(smem + 136, 128);
+#endif
             // stats_empty: 1 barriers, init_count=128
+#if __CUDA_ARCH__ == 1030
             mbarrier_init(smem + 176, 128);
+#else
+            mbarrier_init(smem + 144, 128);
+#endif
             // o_ready_0: 1 barriers, init_count=1
+#if __CUDA_ARCH__ == 1030
             mbarrier_init(smem + 184, 1);
+#else
+            mbarrier_init(smem + 152, 1);
+#endif
             // o_ready_1: 1 barriers, init_count=1
+#if __CUDA_ARCH__ == 1030
             mbarrier_init(smem + 192, 1);
+#else
+            mbarrier_init(smem + 160, 1);
+#endif
             // o_empty_0: 1 barriers, init_count=128
+#if __CUDA_ARCH__ == 1030
             mbarrier_init(smem + 200, 128);
+#else
+            mbarrier_init(smem + 168, 128);
+#endif
             // o_empty_1: 1 barriers, init_count=128
+#if __CUDA_ARCH__ == 1030
             mbarrier_init(smem + 208, 128);
+#else
+            mbarrier_init(smem + 176, 128);
+#endif
             // tmem_dealloc: 1 barriers, init_count=128
+#if __CUDA_ARCH__ == 1030
             mbarrier_init(smem + 216, 128);
+#else
+            mbarrier_init(smem + 184, 128);
+#endif
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -417,9 +538,17 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
     __syncwarp();
 
     // TMEM alloc (128 columns, 96 used)
+#if __CUDA_ARCH__ == 1030
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 224);
+#else
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 192);
+#endif
     if (warp == 0) {
+#if __CUDA_ARCH__ == 1030
         int _tmem_hold = smem + 224;
+#else
+        int _tmem_hold = smem + 192;
+#endif
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(128) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
@@ -1256,10 +1385,6 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                     split_2 = 1;
                 }
                 int kv_trip = 0;
-                int kv_pipe_kv_trip = 0;
-                int kv_pipe_kv_trip_2 = 2;
-                int kv_pipe_kv_trip_1 = 1;
-                int kv_pipe_kv_trip_3 = 3;
                 int first_pv0 = 1;
                 int first_pv1 = 1;
                 mbarrier_wait(q_full_addr, _phase_q_full_0);
@@ -1361,13 +1486,25 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                 elect_commit(kv_empty_addr + 8);
                 #pragma unroll 1
                 for (int pair_2 = 0; pair_2 < part_blocks_2 / 2 - 1; pair_2++) {
+#if __CUDA_ARCH__ == 1030
                     int s0_1 = kv_trip % 6;
                     int s1_1 = (kv_trip + 1) % 6;
                     int s0_next = (kv_trip + 2) % 6;
                     int s1_next = (kv_trip + 3) % 6;
+#else
+                    int s0_1 = kv_trip % 4;
+                    int s1_1 = (kv_trip + 1) % 4;
+                    int s0_next = (kv_trip + 2) % 4;
+                    int s1_next = (kv_trip + 3) % 4;
+#endif
                     mbarrier_wait(o_empty_0_addr, _phase_o_empty_0_0);
                     _phase_o_empty_0_0 ^= 1;
-                    mbarrier_wait(kv_full_addr + (kv_pipe_kv_trip) * 8, 1);
+#if __CUDA_ARCH__ == 1030
+                    int _stage_kv_full = (int)((unsigned int)kv_trip % 6);
+#else
+                    int _stage_kv_full = (int)((unsigned int)kv_trip % 4);
+#endif
+                    mbarrier_wait(kv_full_addr + (_stage_kv_full) * 8, 1);
                     mbarrier_wait(p_full_0_addr, _phase_p_full_0_0);
                     _phase_p_full_0_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
@@ -1415,8 +1552,14 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                             tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134382736, 1);
                         }
                     }
-                    elect_commit2(kv_empty_addr + (kv_pipe_kv_trip) * 8, o_ready_0_addr);
-                    mbarrier_wait(kv_full_addr + (kv_pipe_kv_trip_2) * 8, 0);
+#if __CUDA_ARCH__ == 1030
+                    elect_commit2(kv_empty_addr + ((int)((unsigned int)kv_trip % 6)) * 8, o_ready_0_addr);
+                    int _stage_kv_full_1 = (int)((unsigned int)(kv_trip + 2) % 6);
+#else
+                    elect_commit2(kv_empty_addr + ((int)((unsigned int)kv_trip % 4)) * 8, o_ready_0_addr);
+                    int _stage_kv_full_1 = (int)((unsigned int)(kv_trip + 2) % 4);
+#endif
+                    mbarrier_wait(kv_full_addr + (_stage_kv_full_1) * 8, 0);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     int _mma_a_lo_3 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (s0_next) * 2048);
                     int _mma_b_lo_2 = make_warp_uniform(((smem_qt_addr) >> 4) & 0x3FFF);
@@ -1466,7 +1609,12 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                     elect_commit(kv_empty_addr + (s0_next) * 8);
                     mbarrier_wait(o_empty_1_addr, _phase_o_empty_1_0);
                     _phase_o_empty_1_0 ^= 1;
-                    mbarrier_wait(kv_full_addr + (kv_pipe_kv_trip_1) * 8, 1);
+#if __CUDA_ARCH__ == 1030
+                    int _stage_kv_full_2 = (int)((unsigned int)(kv_trip + 1) % 6);
+#else
+                    int _stage_kv_full_2 = (int)((unsigned int)(kv_trip + 1) % 4);
+#endif
+                    mbarrier_wait(kv_full_addr + (_stage_kv_full_2) * 8, 1);
                     mbarrier_wait(p_full_1_addr, _phase_p_full_1_0);
                     _phase_p_full_1_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
@@ -1514,8 +1662,14 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                             tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134382736, 1);
                         }
                     }
-                    elect_commit2(kv_empty_addr + (kv_pipe_kv_trip_1) * 8, o_ready_1_addr);
-                    mbarrier_wait(kv_full_addr + (kv_pipe_kv_trip_3) * 8, 0);
+#if __CUDA_ARCH__ == 1030
+                    elect_commit2(kv_empty_addr + ((int)((unsigned int)(kv_trip + 1) % 6)) * 8, o_ready_1_addr);
+                    int _stage_kv_full_3 = (int)((unsigned int)(kv_trip + 3) % 6);
+#else
+                    elect_commit2(kv_empty_addr + ((int)((unsigned int)(kv_trip + 1) % 4)) * 8, o_ready_1_addr);
+                    int _stage_kv_full_3 = (int)((unsigned int)(kv_trip + 3) % 4);
+#endif
+                    mbarrier_wait(kv_full_addr + (_stage_kv_full_3) * 8, 0);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     int _mma_a_lo_5 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (s1_next) * 2048);
                     {
@@ -1565,29 +1719,23 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                     first_pv0 = 0;
                     first_pv1 = 0;
                     kv_trip += 2;
-                    kv_pipe_kv_trip += 1;
-                    if (kv_pipe_kv_trip == 6) { kv_pipe_kv_trip = 0; }
-                    kv_pipe_kv_trip += 1;
-                    if (kv_pipe_kv_trip == 6) { kv_pipe_kv_trip = 0; }
-                    kv_pipe_kv_trip_2 += 1;
-                    if (kv_pipe_kv_trip_2 == 6) { kv_pipe_kv_trip_2 = 0; }
-                    kv_pipe_kv_trip_2 += 1;
-                    if (kv_pipe_kv_trip_2 == 6) { kv_pipe_kv_trip_2 = 0; }
-                    kv_pipe_kv_trip_1 += 1;
-                    if (kv_pipe_kv_trip_1 == 6) { kv_pipe_kv_trip_1 = 0; }
-                    kv_pipe_kv_trip_1 += 1;
-                    if (kv_pipe_kv_trip_1 == 6) { kv_pipe_kv_trip_1 = 0; }
-                    kv_pipe_kv_trip_3 += 1;
-                    if (kv_pipe_kv_trip_3 == 6) { kv_pipe_kv_trip_3 = 0; }
-                    kv_pipe_kv_trip_3 += 1;
-                    if (kv_pipe_kv_trip_3 == 6) { kv_pipe_kv_trip_3 = 0; }
                 }
                 elect_commit(q_empty_addr);
+#if __CUDA_ARCH__ == 1030
                 int s0_last = kv_trip % 6;
                 int s1_last = (kv_trip + 1) % 6;
+#else
+                int s0_last = kv_trip % 4;
+                int s1_last = (kv_trip + 1) % 4;
+#endif
                 mbarrier_wait(o_empty_0_addr, _phase_o_empty_0_0);
                 _phase_o_empty_0_0 ^= 1;
-                mbarrier_wait(kv_full_addr + (kv_pipe_kv_trip) * 8, 1);
+#if __CUDA_ARCH__ == 1030
+                int _stage_kv_full_4 = (int)((unsigned int)kv_trip % 6);
+#else
+                int _stage_kv_full_4 = (int)((unsigned int)kv_trip % 4);
+#endif
+                mbarrier_wait(kv_full_addr + (_stage_kv_full_4) * 8, 1);
                 mbarrier_wait(p_full_0_addr, _phase_p_full_0_0);
                 _phase_p_full_0_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -1635,10 +1783,19 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                         tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_6, _mma_ss_b_desc_6, 134382736, 1);
                     }
                 }
-                elect_commit2(kv_empty_addr + (kv_pipe_kv_trip) * 8, o_ready_0_addr);
+#if __CUDA_ARCH__ == 1030
+                elect_commit2(kv_empty_addr + ((int)((unsigned int)kv_trip % 6)) * 8, o_ready_0_addr);
+#else
+                elect_commit2(kv_empty_addr + ((int)((unsigned int)kv_trip % 4)) * 8, o_ready_0_addr);
+#endif
                 mbarrier_wait(o_empty_1_addr, _phase_o_empty_1_0);
                 _phase_o_empty_1_0 ^= 1;
-                mbarrier_wait(kv_full_addr + (kv_pipe_kv_trip_1) * 8, 1);
+#if __CUDA_ARCH__ == 1030
+                int _stage_kv_full_5 = (int)((unsigned int)(kv_trip + 1) % 6);
+#else
+                int _stage_kv_full_5 = (int)((unsigned int)(kv_trip + 1) % 4);
+#endif
+                mbarrier_wait(kv_full_addr + (_stage_kv_full_5) * 8, 1);
                 mbarrier_wait(p_full_1_addr, _phase_p_full_1_0);
                 _phase_p_full_1_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -1686,7 +1843,11 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                         tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_7, _mma_ss_b_desc_7, 134382736, 1);
                     }
                 }
-                elect_commit2(kv_empty_addr + (kv_pipe_kv_trip_1) * 8, o_ready_1_addr);
+#if __CUDA_ARCH__ == 1030
+                elect_commit2(kv_empty_addr + ((int)((unsigned int)(kv_trip + 1) % 6)) * 8, o_ready_1_addr);
+#else
+                elect_commit2(kv_empty_addr + ((int)((unsigned int)(kv_trip + 1) % 4)) * 8, o_ready_1_addr);
+#endif
             }
             unsigned int _phase_tmem_dealloc_0 = 0;
             mbarrier_wait(tmem_dealloc_addr, _phase_tmem_dealloc_0);
@@ -1770,7 +1931,11 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                 if (elect_sync()) {
                     int pt_base_la = batch_idx_3 * max_pages_per_seq;
                     int kv_stage_la = 0;
+#if __CUDA_ARCH__ == 1030
                     int prefill_la = ((part_blocks_3 < 4) ? part_blocks_3 : 4);
+#else
+                    int prefill_la = ((part_blocks_3 < 2) ? part_blocks_3 : 2);
+#endif
                     unsigned int _phase_kv_empty = 1;
                     #pragma unroll 1
                     for (int ni_la = 0; ni_la < prefill_la; ni_la++) {
@@ -1805,16 +1970,33 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                             }
                         }
                         kv_stage_la += 1;
+#if __CUDA_ARCH__ == 1030
                         if (kv_stage_la == 6) { kv_stage_la = 0; _phase_kv_empty ^= 1; }
+#else
+                        if (kv_stage_la == 4) { kv_stage_la = 0; _phase_kv_empty ^= 1; }
+#endif
                     }
+#if __CUDA_ARCH__ == 1030
                     int main_ni_la = part_blocks_3 - 4;
+#else
+                    int main_ni_la = part_blocks_3 - 2;
+#endif
                     #pragma unroll 1
                     for (int ni_la_1 = 0; ni_la_1 < main_ni_la; ni_la_1++) {
+#if __CUDA_ARCH__ == 1030
                         int stage_la = ni_la_1 % 6;
+#else
+                        int stage_la = ni_la_1 % 4;
+#endif
                         int n_block_la_1 = split_start_block_la + part_blocks_3 - 1 - ni_la_1;
                         int vpg_base_la = n_block_la_1 * 8;
+#if __CUDA_ARCH__ == 1030
                         int next_ni_la = ni_la_1 + 4;
                         int k_stage_la = next_ni_la % 6;
+#else
+                        int next_ni_la = ni_la_1 + 2;
+                        int k_stage_la = next_ni_la % 4;
+#endif
                         int next_n_la = split_start_block_la + part_blocks_3 - 1 - next_ni_la;
                         int npg_base_la = next_n_la * 8;
                         int pg_v_la[4];
@@ -1837,9 +2019,17 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                             pg_nk_la[0 + 2] = _ivld_2.z;
                             pg_nk_la[0 + 3] = _ivld_2.w;
                         }
+#if __CUDA_ARCH__ == 1030
                         int _stage_kv_empty = (int)((unsigned int)ni_la_1 % 6);
+#else
+                        int _stage_kv_empty = (int)((unsigned int)ni_la_1 % 4);
+#endif
                         mbarrier_wait(kv_empty_addr + (_stage_kv_empty) * 8, 0);
+#if __CUDA_ARCH__ == 1030
                         mbarrier_arrive_expect_tx(kv_full_addr + ((int)((unsigned int)ni_la_1 % 6)) * 8, 16384);
+#else
+                        mbarrier_arrive_expect_tx(kv_full_addr + ((int)((unsigned int)ni_la_1 % 4)) * 8, 16384);
+#endif
                         int vdst_la = smem_kv_addr + (unsigned int)(stage_la * 32768);
                         #pragma unroll
                         for (int pg_half_la_1 = 0; pg_half_la_1 < 4; pg_half_la_1++) {
@@ -1852,13 +2042,25 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                                         "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                         " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
                                         :: "r"(vdst_la + vtoff_la), "l"((&V)), "r"(0), "r"(0), "r"(hg_la_1), "r"(kv_head_idx_3), "r"(vpg0_la),
+#if __CUDA_ARCH__ == 1030
                                            "r"(kv_full_addr + ((int)((unsigned int)ni_la_1 % 6)) * 8), "l"(0x12F0000000000000ULL) : "memory");
+#else
+                                           "r"(kv_full_addr + ((int)((unsigned int)ni_la_1 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
+#endif
                                 }
                             }
                         }
+#if __CUDA_ARCH__ == 1030
                         int _stage_kv_empty_1 = (int)((unsigned int)(ni_la_1 + 4) % 6);
+#else
+                        int _stage_kv_empty_1 = (int)((unsigned int)(ni_la_1 + 2) % 4);
+#endif
                         mbarrier_wait(kv_empty_addr + (_stage_kv_empty_1) * 8, 1);
+#if __CUDA_ARCH__ == 1030
                         mbarrier_arrive_expect_tx(kv_full_addr + ((int)((unsigned int)(ni_la_1 + 4) % 6)) * 8, 16384);
+#else
+                        mbarrier_arrive_expect_tx(kv_full_addr + ((int)((unsigned int)(ni_la_1 + 2) % 4)) * 8, 16384);
+#endif
                         int kdst_la = smem_kv_addr + (unsigned int)(k_stage_la * 32768);
                         #pragma unroll
                         for (int pg_half_la_2 = 0; pg_half_la_2 < 4; pg_half_la_2++) {
@@ -1871,14 +2073,22 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                                         "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                         " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
                                         :: "r"(kdst_la + ntoff_la), "l"((&K)), "r"(0), "r"(0), "r"(hg_la_2), "r"(kv_head_idx_3), "r"(npg0_la),
+#if __CUDA_ARCH__ == 1030
                                            "r"(kv_full_addr + ((int)((unsigned int)(ni_la_1 + 4) % 6)) * 8), "l"(0x12F0000000000000ULL) : "memory");
+#else
+                                           "r"(kv_full_addr + ((int)((unsigned int)(ni_la_1 + 2) % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
+#endif
                                 }
                             }
                         }
                     }
                     #pragma unroll 1
                     for (int tail_ni_la = main_ni_la; tail_ni_la < part_blocks_3; tail_ni_la++) {
+#if __CUDA_ARCH__ == 1030
                         int tstage_la = tail_ni_la % 6;
+#else
+                        int tstage_la = tail_ni_la % 4;
+#endif
                         int tn_block_la = split_start_block_la + part_blocks_3 - 1 - tail_ni_la;
                         int tvpg_base_la = tn_block_la * 8;
                         int tpg_v_la[4];
@@ -1891,9 +2101,17 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                             tpg_v_la[0 + 2] = _ivld_3.z;
                             tpg_v_la[0 + 3] = _ivld_3.w;
                         }
+#if __CUDA_ARCH__ == 1030
                         int _stage_kv_empty_2 = (int)((unsigned int)tail_ni_la % 6);
+#else
+                        int _stage_kv_empty_2 = (int)((unsigned int)tail_ni_la % 4);
+#endif
                         mbarrier_wait(kv_empty_addr + (_stage_kv_empty_2) * 8, 0);
+#if __CUDA_ARCH__ == 1030
                         mbarrier_arrive_expect_tx(kv_full_addr + ((int)((unsigned int)tail_ni_la % 6)) * 8, 16384);
+#else
+                        mbarrier_arrive_expect_tx(kv_full_addr + ((int)((unsigned int)tail_ni_la % 4)) * 8, 16384);
+#endif
                         int tvdst_la = smem_kv_addr + (unsigned int)(tstage_la * 32768);
                         #pragma unroll
                         for (int pg_half_la_3 = 0; pg_half_la_3 < 4; pg_half_la_3++) {
@@ -1906,7 +2124,11 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                                         "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                         " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
                                         :: "r"(tvdst_la + tvtoff_la), "l"((&V)), "r"(0), "r"(0), "r"(hg_la_3), "r"(kv_head_idx_3), "r"(tvpg0_la),
+#if __CUDA_ARCH__ == 1030
                                            "r"(kv_full_addr + ((int)((unsigned int)tail_ni_la % 6)) * 8), "l"(0x12F0000000000000ULL) : "memory");
+#else
+                                           "r"(kv_full_addr + ((int)((unsigned int)tail_ni_la % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
+#endif
                                 }
                             }
                         }
@@ -2002,7 +2224,11 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                     tma_3d_gmem2smem(smem_qt_addr, (&Qt), 0, off_qt, 0, q_full_addr);
                     int pt_base = batch_idx_4 * max_pages_per_seq;
                     int kv_stage = 0;
+#if __CUDA_ARCH__ == 1030
                     int prefill = ((part_blocks_4 < 4) ? part_blocks_4 : 4);
+#else
+                    int prefill = ((part_blocks_4 < 2) ? part_blocks_4 : 2);
+#endif
                     unsigned int _phase_kv_empty_1 = 1;
                     #pragma unroll 1
                     for (int ni = 0; ni < prefill; ni++) {
@@ -2038,16 +2264,33 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                             }
                         }
                         kv_stage += 1;
+#if __CUDA_ARCH__ == 1030
                         if (kv_stage == 6) { kv_stage = 0; _phase_kv_empty_1 ^= 1; }
+#else
+                        if (kv_stage == 4) { kv_stage = 0; _phase_kv_empty_1 ^= 1; }
+#endif
                     }
+#if __CUDA_ARCH__ == 1030
                     int main_ni = part_blocks_4 - 4;
+#else
+                    int main_ni = part_blocks_4 - 2;
+#endif
                     #pragma unroll 1
                     for (int ni_1 = 0; ni_1 < main_ni; ni_1++) {
+#if __CUDA_ARCH__ == 1030
                         int stage = ni_1 % 6;
+#else
+                        int stage = ni_1 % 4;
+#endif
                         int n_block_1 = split_start_block_1 + part_blocks_4 - 1 - ni_1;
                         int vpg_base = n_block_1 * 8;
+#if __CUDA_ARCH__ == 1030
                         int next_ni = ni_1 + 4;
                         int k_stage = next_ni % 6;
+#else
+                        int next_ni = ni_1 + 2;
+                        int k_stage = next_ni % 4;
+#endif
                         int next_n = split_start_block_1 + part_blocks_4 - 1 - next_ni;
                         int npg_base = next_n * 8;
                         int pg_v[4];
@@ -2070,9 +2313,17 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                             pg_nk[0 + 2] = _ivld_2.z;
                             pg_nk[0 + 3] = _ivld_2.w;
                         }
+#if __CUDA_ARCH__ == 1030
                         int _stage_kv_empty_3 = (int)((unsigned int)ni_1 % 6);
+#else
+                        int _stage_kv_empty_3 = (int)((unsigned int)ni_1 % 4);
+#endif
                         mbarrier_wait(kv_empty_addr + (_stage_kv_empty_3) * 8, 0);
+#if __CUDA_ARCH__ == 1030
                         mbarrier_arrive_expect_tx(kv_full_addr + ((int)((unsigned int)ni_1 % 6)) * 8, 16384);
+#else
+                        mbarrier_arrive_expect_tx(kv_full_addr + ((int)((unsigned int)ni_1 % 4)) * 8, 16384);
+#endif
                         int vdst = smem_kv_addr + (unsigned int)(stage * 32768);
                         #pragma unroll
                         for (int pg_half_1 = 0; pg_half_1 < 4; pg_half_1++) {
@@ -2086,13 +2337,25 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                                         "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                         " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
                                         :: "r"(vdst + vtoff), "l"((&V)), "r"(0), "r"(0), "r"(hg_1), "r"(kv_head_idx_4), "r"(vpg0),
+#if __CUDA_ARCH__ == 1030
                                            "r"(kv_full_addr + ((int)((unsigned int)ni_1 % 6)) * 8), "l"(0x12F0000000000000ULL) : "memory");
+#else
+                                           "r"(kv_full_addr + ((int)((unsigned int)ni_1 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
+#endif
                                 }
                             }
                         }
+#if __CUDA_ARCH__ == 1030
                         int _stage_kv_empty_4 = (int)((unsigned int)(ni_1 + 4) % 6);
+#else
+                        int _stage_kv_empty_4 = (int)((unsigned int)(ni_1 + 2) % 4);
+#endif
                         mbarrier_wait(kv_empty_addr + (_stage_kv_empty_4) * 8, 1);
+#if __CUDA_ARCH__ == 1030
                         mbarrier_arrive_expect_tx(kv_full_addr + ((int)((unsigned int)(ni_1 + 4) % 6)) * 8, 16384);
+#else
+                        mbarrier_arrive_expect_tx(kv_full_addr + ((int)((unsigned int)(ni_1 + 2) % 4)) * 8, 16384);
+#endif
                         int kdst = smem_kv_addr + (unsigned int)(k_stage * 32768);
                         #pragma unroll
                         for (int pg_half_2 = 0; pg_half_2 < 4; pg_half_2++) {
@@ -2106,14 +2369,22 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                                         "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                         " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
                                         :: "r"(kdst + ntoff), "l"((&K)), "r"(0), "r"(0), "r"(hg_2), "r"(kv_head_idx_4), "r"(npg0),
+#if __CUDA_ARCH__ == 1030
                                            "r"(kv_full_addr + ((int)((unsigned int)(ni_1 + 4) % 6)) * 8), "l"(0x12F0000000000000ULL) : "memory");
+#else
+                                           "r"(kv_full_addr + ((int)((unsigned int)(ni_1 + 2) % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
+#endif
                                 }
                             }
                         }
                     }
                     #pragma unroll 1
                     for (int tail_ni = main_ni; tail_ni < part_blocks_4; tail_ni++) {
+#if __CUDA_ARCH__ == 1030
                         int tstage = tail_ni % 6;
+#else
+                        int tstage = tail_ni % 4;
+#endif
                         int tn_block = split_start_block_1 + part_blocks_4 - 1 - tail_ni;
                         int tvpg_base = tn_block * 8;
                         int tpg_v[4];
@@ -2126,9 +2397,17 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                             tpg_v[0 + 2] = _ivld_3.z;
                             tpg_v[0 + 3] = _ivld_3.w;
                         }
+#if __CUDA_ARCH__ == 1030
                         int _stage_kv_empty_5 = (int)((unsigned int)tail_ni % 6);
+#else
+                        int _stage_kv_empty_5 = (int)((unsigned int)tail_ni % 4);
+#endif
                         mbarrier_wait(kv_empty_addr + (_stage_kv_empty_5) * 8, 0);
+#if __CUDA_ARCH__ == 1030
                         mbarrier_arrive_expect_tx(kv_full_addr + ((int)((unsigned int)tail_ni % 6)) * 8, 16384);
+#else
+                        mbarrier_arrive_expect_tx(kv_full_addr + ((int)((unsigned int)tail_ni % 4)) * 8, 16384);
+#endif
                         int tvdst = smem_kv_addr + (unsigned int)(tstage * 32768);
                         #pragma unroll
                         for (int pg_half_3 = 0; pg_half_3 < 4; pg_half_3++) {
@@ -2142,7 +2421,11 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                                         "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                         " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
                                         :: "r"(tvdst + tvtoff), "l"((&V)), "r"(0), "r"(0), "r"(hg_3), "r"(kv_head_idx_4), "r"(tvpg0),
+#if __CUDA_ARCH__ == 1030
                                            "r"(kv_full_addr + ((int)((unsigned int)tail_ni % 6)) * 8), "l"(0x12F0000000000000ULL) : "memory");
+#else
+                                           "r"(kv_full_addr + ((int)((unsigned int)tail_ni % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
+#endif
                                 }
                             }
                         }

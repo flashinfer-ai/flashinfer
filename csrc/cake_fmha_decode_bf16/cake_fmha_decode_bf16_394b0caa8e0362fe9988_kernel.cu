@@ -750,12 +750,12 @@ kernel_cake_fmha_decode_bf16_394b0caa8e0362fe9988(const __grid_constant__ CUtens
             unsigned int total_tiles_s = BATCH_SIZE * Q_LEN * NUM_KV_HEADS;
             unsigned int tile_idx_s = (blockIdx.z * Q_LEN + blockIdx.x) * NUM_KV_HEADS + blockIdx.y;
             int corr_signals = 0;
+            int pairs_seen = 0;
             unsigned int _phase_stats_empty_0 = 1;
             unsigned int _phase_s_full_1_0 = 0;
             unsigned int _phase_s_full_0_0 = 0;
             unsigned int _phase_corr_empty_1_0 = 1;
             unsigned int _phase_corr_empty_0_0 = 1;
-            unsigned int _phase_o_ready_1_0 = 1;
             unsigned int _phase_work_full = 0;
             #pragma unroll 1
             for (unsigned int _tile_iter_s = 0; _tile_iter_s < total_tiles_s; _tile_iter_s++) {
@@ -973,8 +973,8 @@ kernel_cake_fmha_decode_bf16_394b0caa8e0362fe9988(const __grid_constant__ CUtens
                     int seg_col_idx = mtx_col_idx ^ thr_row_idx;
                     int stsm_offset = slice_idx * 8 * 128 + thr_row_idx * 128 + seg_col_idx * 16;
                     const bool _selected_wait_cond_29 = is_wg1 != 0;
-                    mbarrier_wait((_selected_wait_cond_29 ? (o_ready_1_addr) : (o_ready_0_addr)), (_selected_wait_cond_29 ? (_phase_o_ready_1_0) : (_phase_o_ready_1_0)));
-                    _phase_o_ready_1_0 ^= 1;
+                    mbarrier_wait((_selected_wait_cond_29 ? (o_ready_1_addr) : (o_ready_0_addr)), (_selected_wait_cond_29 ? ((int)((unsigned int)pairs_seen % 2) ^ 1) : ((int)((unsigned int)pairs_seen % 2) ^ 1)));
+                    pairs_seen += 1;
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};\n"
                         :: "l"(__cvta_generic_to_shared(reinterpret_cast<uint8_t*>(my_p_base) + stsm_offset)), "r"(*reinterpret_cast<const uint32_t*>(&regs_p[0])), "r"(*reinterpret_cast<const uint32_t*>(&regs_p[1])), "r"(*reinterpret_cast<const uint32_t*>(&regs_p[2])), "r"(*reinterpret_cast<const uint32_t*>(&regs_p[3]))
@@ -1119,7 +1119,7 @@ kernel_cake_fmha_decode_bf16_394b0caa8e0362fe9988(const __grid_constant__ CUtens
             unsigned int _phase_corr_scale_0 = 0;
             unsigned int _phase_corr_scale_1 = 0;
             unsigned int _phase_o_ready_0_0 = 0;
-            unsigned int _phase_o_ready_1_0_1 = 0;
+            unsigned int _phase_o_ready_1_0 = 0;
             unsigned int _phase_work_full_1 = 0;
             #pragma unroll 1
             for (unsigned int _tile_iter_c = 0; _tile_iter_c < total_tiles_c; _tile_iter_c++) {
@@ -1237,8 +1237,8 @@ kernel_cake_fmha_decode_bf16_394b0caa8e0362fe9988(const __grid_constant__ CUtens
                     acc1_pair[1] = ((max_diff1_pair_f2.y != 0.0f) ? _exp2_4 : 1.0f);
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(corr_empty_1_addr);
-                    mbarrier_wait(o_ready_1_addr, _phase_o_ready_1_0_1);
-                    _phase_o_ready_1_0_1 ^= 1;
+                    mbarrier_wait(o_ready_1_addr, _phase_o_ready_1_0);
+                    _phase_o_ready_1_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     int rescale_pred_1 = ((acc1_pair[0] != 1.0f) ? 1 : 0);
                     rescale_pred_1 = rescale_pred_1 | ((acc1_pair[1] != 1.0f) ? 1 : 0);
@@ -1326,8 +1326,8 @@ kernel_cake_fmha_decode_bf16_394b0caa8e0362fe9988(const __grid_constant__ CUtens
                 mbarrier_arrive(corr_empty_1_addr);
                 mbarrier_wait(o_ready_0_addr, _phase_o_ready_0_0);
                 _phase_o_ready_0_0 ^= 1;
-                mbarrier_wait(o_ready_1_addr, _phase_o_ready_1_0_1);
-                _phase_o_ready_1_0_1 ^= 1;
+                mbarrier_wait(o_ready_1_addr, _phase_o_ready_1_0);
+                _phase_o_ready_1_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 float _tmem_load_2[8];
                 tmem_ld_x8(&_tmem_load_2[0], taddr + 80 + (unsigned int)corr_row);
@@ -1595,8 +1595,6 @@ kernel_cake_fmha_decode_bf16_394b0caa8e0362fe9988(const __grid_constant__ CUtens
                 elect_commit(s_full_1_addr);
                 elect_commit(kv_empty_addr + 8);
                 int kv_pos = 0;
-                int kv_full_kv_pos = 0;
-                int kv_full_kv_pos_1 = 1;
                 #pragma unroll 1
                 for (int pair_2 = 0; pair_2 < cta_n_blocks_2 / 2 - 1; pair_2++) {
                     int s0_1 = 2 * pair_2 % NUM_KV_STAGES;
@@ -1843,30 +1841,6 @@ kernel_cake_fmha_decode_bf16_394b0caa8e0362fe9988(const __grid_constant__ CUtens
                     first_pv0 = 0;
                     first_pv1 = 0;
                     kv_pos += 2;
-                    kv_full_kv_pos += 1;
-#if __CUDA_ARCH__ == 1030
-                    if (kv_full_kv_pos == 6) { kv_full_kv_pos = 0; }
-#else
-                    if (kv_full_kv_pos == 5) { kv_full_kv_pos = 0; }
-#endif
-                    kv_full_kv_pos += 1;
-#if __CUDA_ARCH__ == 1030
-                    if (kv_full_kv_pos == 6) { kv_full_kv_pos = 0; }
-#else
-                    if (kv_full_kv_pos == 5) { kv_full_kv_pos = 0; }
-#endif
-                    kv_full_kv_pos_1 += 1;
-#if __CUDA_ARCH__ == 1030
-                    if (kv_full_kv_pos_1 == 6) { kv_full_kv_pos_1 = 0; }
-#else
-                    if (kv_full_kv_pos_1 == 5) { kv_full_kv_pos_1 = 0; }
-#endif
-                    kv_full_kv_pos_1 += 1;
-#if __CUDA_ARCH__ == 1030
-                    if (kv_full_kv_pos_1 == 6) { kv_full_kv_pos_1 = 0; }
-#else
-                    if (kv_full_kv_pos_1 == 5) { kv_full_kv_pos_1 = 0; }
-#endif
                 }
                 elect_commit(q_empty_addr);
                 int last = cta_n_blocks_2 / 2 - 1;
@@ -1874,7 +1848,12 @@ kernel_cake_fmha_decode_bf16_394b0caa8e0362fe9988(const __grid_constant__ CUtens
                 int s1_last = (kv_pos + 1) % NUM_KV_STAGES;
                 mbarrier_wait(o_empty_0_addr, _phase_o_empty_0_0);
                 _phase_o_empty_0_0 ^= 1;
-                mbarrier_wait(kv_full_addr + (kv_full_kv_pos) * 8, 1);
+#if __CUDA_ARCH__ == 1030
+                int _stage_kv_full_4 = (int)((unsigned int)kv_pos % 6);
+#else
+                int _stage_kv_full_4 = (int)((unsigned int)kv_pos % 5);
+#endif
+                mbarrier_wait(kv_full_addr + (_stage_kv_full_4) * 8, 1);
                 mbarrier_wait(p_full_0_addr, _phase_p_full_0_0);
                 _phase_p_full_0_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -1922,10 +1901,19 @@ kernel_cake_fmha_decode_bf16_394b0caa8e0362fe9988(const __grid_constant__ CUtens
                         tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_6, _mma_ss_b_desc_6, 134382736, 1);
                     }
                 }
-                elect_commit2(kv_empty_addr + (kv_full_kv_pos) * 8, o_ready_0_addr);
+#if __CUDA_ARCH__ == 1030
+                elect_commit2(kv_empty_addr + ((int)((unsigned int)kv_pos % 6)) * 8, o_ready_0_addr);
+#else
+                elect_commit2(kv_empty_addr + ((int)((unsigned int)kv_pos % 5)) * 8, o_ready_0_addr);
+#endif
                 mbarrier_wait(o_empty_1_addr, _phase_o_empty_1_0);
                 _phase_o_empty_1_0 ^= 1;
-                mbarrier_wait(kv_full_addr + (kv_full_kv_pos_1) * 8, 1);
+#if __CUDA_ARCH__ == 1030
+                int _stage_kv_full_5 = (int)((unsigned int)(kv_pos + 1) % 6);
+#else
+                int _stage_kv_full_5 = (int)((unsigned int)(kv_pos + 1) % 5);
+#endif
+                mbarrier_wait(kv_full_addr + (_stage_kv_full_5) * 8, 1);
                 mbarrier_wait(p_full_1_addr, _phase_p_full_1_0);
                 _phase_p_full_1_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -1973,7 +1961,11 @@ kernel_cake_fmha_decode_bf16_394b0caa8e0362fe9988(const __grid_constant__ CUtens
                         tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_7, _mma_ss_b_desc_7, 134382736, 1);
                     }
                 }
-                elect_commit2(kv_empty_addr + (kv_full_kv_pos_1) * 8, o_ready_1_addr);
+#if __CUDA_ARCH__ == 1030
+                elect_commit2(kv_empty_addr + ((int)((unsigned int)(kv_pos + 1) % 6)) * 8, o_ready_1_addr);
+#else
+                elect_commit2(kv_empty_addr + ((int)((unsigned int)(kv_pos + 1) % 5)) * 8, o_ready_1_addr);
+#endif
                 mbarrier_wait(work_full_addr + (work_stage_m) * 8, _phase_work_full_2);
                 uint32_t _clc_valid_3 = 0;
                 asm volatile(

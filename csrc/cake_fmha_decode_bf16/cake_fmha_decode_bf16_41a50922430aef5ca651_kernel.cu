@@ -1253,10 +1253,6 @@ kernel_cake_fmha_decode_bf16_41a50922430aef5ca651(const __grid_constant__ CUtens
                 int visible_local_keys_2 = global_q_pos_2 + 1;
                 int win_start_2 = 0;
                 int kv_trip = 0;
-                int kv_pipe_kv_trip = 0;
-                int kv_pipe_kv_trip_2 = 2;
-                int kv_pipe_kv_trip_1 = 1;
-                int kv_pipe_kv_trip_3 = 3;
                 int first_pv0 = 1;
                 int first_pv1 = 1;
                 mbarrier_wait(q_full_addr + (q_stage_m) * 8, _phase_q_full);
@@ -1364,7 +1360,8 @@ kernel_cake_fmha_decode_bf16_41a50922430aef5ca651(const __grid_constant__ CUtens
                     int s1_next = (kv_trip + 3) % 4;
                     mbarrier_wait(o_empty_addr, _phase_o_empty_0);
                     _phase_o_empty_0 ^= 1;
-                    mbarrier_wait(kv_full_addr + (kv_pipe_kv_trip) * 8, 1);
+                    int _stage_kv_full = (int)((unsigned int)kv_trip % 4);
+                    mbarrier_wait(kv_full_addr + (_stage_kv_full) * 8, 1);
                     mbarrier_wait(p_full_0_addr, _phase_p_full_0_0);
                     _phase_p_full_0_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
@@ -1412,8 +1409,9 @@ kernel_cake_fmha_decode_bf16_41a50922430aef5ca651(const __grid_constant__ CUtens
                             tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134382736, 1);
                         }
                     }
-                    elect_commit2(kv_empty_addr + (kv_pipe_kv_trip) * 8, o_ready_addr);
-                    mbarrier_wait(kv_full_addr + (kv_pipe_kv_trip_2) * 8, 0);
+                    elect_commit2(kv_empty_addr + ((int)((unsigned int)kv_trip % 4)) * 8, o_ready_addr);
+                    int _stage_kv_full_1 = (int)((unsigned int)(kv_trip + 2) % 4);
+                    mbarrier_wait(kv_full_addr + (_stage_kv_full_1) * 8, 0);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     int _mma_a_lo_3 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (s0_next) * 2048);
                     int _mma_b_lo_3 = make_warp_uniform((((smem_qt_addr) >> 4) & 0x3FFF) + (q_stage_m) * 128);
@@ -1463,7 +1461,8 @@ kernel_cake_fmha_decode_bf16_41a50922430aef5ca651(const __grid_constant__ CUtens
                     elect_commit(kv_empty_addr + (s0_next) * 8);
                     mbarrier_wait(o_empty_addr + 8, _phase_o_empty_1);
                     _phase_o_empty_1 ^= 1;
-                    mbarrier_wait(kv_full_addr + (kv_pipe_kv_trip_1) * 8, 1);
+                    int _stage_kv_full_2 = (int)((unsigned int)(kv_trip + 1) % 4);
+                    mbarrier_wait(kv_full_addr + (_stage_kv_full_2) * 8, 1);
                     mbarrier_wait(p_full_1_addr, _phase_p_full_1_0);
                     _phase_p_full_1_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
@@ -1511,8 +1510,9 @@ kernel_cake_fmha_decode_bf16_41a50922430aef5ca651(const __grid_constant__ CUtens
                             tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134382736, 1);
                         }
                     }
-                    elect_commit2(kv_empty_addr + (kv_pipe_kv_trip_1) * 8, o_ready_addr + 8);
-                    mbarrier_wait(kv_full_addr + (kv_pipe_kv_trip_3) * 8, 0);
+                    elect_commit2(kv_empty_addr + ((int)((unsigned int)(kv_trip + 1) % 4)) * 8, o_ready_addr + 8);
+                    int _stage_kv_full_3 = (int)((unsigned int)(kv_trip + 3) % 4);
+                    mbarrier_wait(kv_full_addr + (_stage_kv_full_3) * 8, 0);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     int _mma_a_lo_5 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (s1_next) * 2048);
                     int _mma_b_lo_5 = make_warp_uniform((((smem_qt_addr) >> 4) & 0x3FFF) + (q_stage_m) * 128);
@@ -1563,22 +1563,6 @@ kernel_cake_fmha_decode_bf16_41a50922430aef5ca651(const __grid_constant__ CUtens
                     first_pv0 = 0;
                     first_pv1 = 0;
                     kv_trip += 2;
-                    kv_pipe_kv_trip += 1;
-                    if (kv_pipe_kv_trip == 4) { kv_pipe_kv_trip = 0; }
-                    kv_pipe_kv_trip += 1;
-                    if (kv_pipe_kv_trip == 4) { kv_pipe_kv_trip = 0; }
-                    kv_pipe_kv_trip_2 += 1;
-                    if (kv_pipe_kv_trip_2 == 4) { kv_pipe_kv_trip_2 = 0; }
-                    kv_pipe_kv_trip_2 += 1;
-                    if (kv_pipe_kv_trip_2 == 4) { kv_pipe_kv_trip_2 = 0; }
-                    kv_pipe_kv_trip_1 += 1;
-                    if (kv_pipe_kv_trip_1 == 4) { kv_pipe_kv_trip_1 = 0; }
-                    kv_pipe_kv_trip_1 += 1;
-                    if (kv_pipe_kv_trip_1 == 4) { kv_pipe_kv_trip_1 = 0; }
-                    kv_pipe_kv_trip_3 += 1;
-                    if (kv_pipe_kv_trip_3 == 4) { kv_pipe_kv_trip_3 = 0; }
-                    kv_pipe_kv_trip_3 += 1;
-                    if (kv_pipe_kv_trip_3 == 4) { kv_pipe_kv_trip_3 = 0; }
                 }
                 elect_commit(q_empty_addr + (q_stage_m) * 8);
                 q_stage_m += 1;
@@ -1587,7 +1571,8 @@ kernel_cake_fmha_decode_bf16_41a50922430aef5ca651(const __grid_constant__ CUtens
                 int s1_last = (kv_trip + 1) % 4;
                 mbarrier_wait(o_empty_addr, _phase_o_empty_0);
                 _phase_o_empty_0 ^= 1;
-                mbarrier_wait(kv_full_addr + (kv_pipe_kv_trip) * 8, 1);
+                int _stage_kv_full_4 = (int)((unsigned int)kv_trip % 4);
+                mbarrier_wait(kv_full_addr + (_stage_kv_full_4) * 8, 1);
                 mbarrier_wait(p_full_0_addr, _phase_p_full_0_0);
                 _phase_p_full_0_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -1635,10 +1620,11 @@ kernel_cake_fmha_decode_bf16_41a50922430aef5ca651(const __grid_constant__ CUtens
                         tcgen05_mma_f16(tmem_tmem_o0, _mma_ss_a_desc_6, _mma_ss_b_desc_6, 134382736, 1);
                     }
                 }
-                elect_commit2(kv_empty_addr + (kv_pipe_kv_trip) * 8, o_ready_addr);
+                elect_commit2(kv_empty_addr + ((int)((unsigned int)kv_trip % 4)) * 8, o_ready_addr);
                 mbarrier_wait(o_empty_addr + 8, _phase_o_empty_1);
                 _phase_o_empty_1 ^= 1;
-                mbarrier_wait(kv_full_addr + (kv_pipe_kv_trip_1) * 8, 1);
+                int _stage_kv_full_5 = (int)((unsigned int)(kv_trip + 1) % 4);
+                mbarrier_wait(kv_full_addr + (_stage_kv_full_5) * 8, 1);
                 mbarrier_wait(p_full_1_addr, _phase_p_full_1_0);
                 _phase_p_full_1_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -1686,7 +1672,7 @@ kernel_cake_fmha_decode_bf16_41a50922430aef5ca651(const __grid_constant__ CUtens
                         tcgen05_mma_f16(tmem_tmem_o1, _mma_ss_a_desc_7, _mma_ss_b_desc_7, 134382736, 1);
                     }
                 }
-                elect_commit2(kv_empty_addr + (kv_pipe_kv_trip_1) * 8, o_ready_addr + 8);
+                elect_commit2(kv_empty_addr + ((int)((unsigned int)(kv_trip + 1) % 4)) * 8, o_ready_addr + 8);
             }
             unsigned int _phase_tmem_dealloc_0 = 0;
             mbarrier_wait(tmem_dealloc_addr, _phase_tmem_dealloc_0);
