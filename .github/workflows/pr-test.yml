@@ -563,6 +563,7 @@ jobs:
             junit/**/*.telemetry.json
             junit/**/*.meta.json
             junit/**/*.memory.csv
+            junit/collection-*/*.log
             junit/jit-builds.jsonl
             junit/run-summary.json
           if-no-files-found: warn

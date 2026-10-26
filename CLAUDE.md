@@ -219,6 +219,11 @@ worker counts without GPU topology or measured memory capacity.
 Run the CPU-only coordinator suite with
 `pytest --confcutdir=tests/test_sharding tests/test_sharding/`.
 
+Collection stdout/stderr, including best-effort JIT prewarm warnings, is retained
+under `junit/collection-*/*.log` and uploaded with the public CI telemetry. Each
+collection gets a separate directory so concurrent collectors or later attempts
+preserve earlier diagnostics. Collection metadata remains temporary.
+
 Communication-test wrappers optionally emit cache-publication completion reports
 when `UNIT_TEST_RUN_STATUS_DIR` is set to a fresh directory unique to that wrapper
 and container/rank. `test_run_status.sh` records each pytest invocation, and
