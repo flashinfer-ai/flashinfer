@@ -18,8 +18,8 @@
 //
 // Kernel inventory:
 //   1. routingIndicesBlockKernel      — single-block fused kernel (≤4 tokens)
-//   1c. routingIndicesSmallBatchKernel / routingIndicesSmallBatchClusterKernel — one-launch
-//       kernels for 256 experts / top-8 and 1-64 tokens (one CTA, or a 2-CTA cluster, SM90+)
+//   1c. routingIndicesSmallBatchKernel / routingIndicesSmallBatchClusterKernel — single-launch
+//       kernels for 256 experts / top-8, ≤64 tokens (SM90+)
 //   2. routingIndicesClusterKernel    — single-cluster fused kernel (≤256 tokens, SM90+)
 //   3. routingIndicesHistogramScoresKernel — TopK + histogram from raw scores
 //   4. routingIndicesCoopKernel       — cooperative histogram + offsets (defined in
@@ -63,16 +63,14 @@ void launchHistogramKernel(Data const& data, int numBlocksHistogram, uint32_t nu
 void launchOffsetsKernel(Data const& data, int numBlocksOffsets, uint32_t numThreadsHist,
                          void* stream);
 
-// Small-batch routing (section 1c): 256 experts, top-8, 1-64 tokens, in one launch.
+// Small-batch kernels (section 1c): 256 experts, top-8, up to 64 tokens.
 static constexpr int SmallBatchKernelNumExperts = NumExperts256Experts;
 static constexpr int SmallBatchKernelTopK = NumTop8Experts;
 static constexpr int SmallBatchKernelMaxNumTokens = 64;
 static constexpr int SmallBatchKernelMaxThreads = 1024;
-// Up to this many tokens one CTA (routingIndicesSmallBatchKernel), above it a cluster of two
-// (routingIndicesSmallBatchClusterKernel), whose top-k is also cheaper. The faster kernel does not
-// pay off below 19 tokens: with the shared expert on a side stream (DeepSeek-style dual-stream
-// MoE), faster routing lets the routed FC1 GEMM take the SMs before the shared expert's kernels,
-// and a GB300 decode step (NVFP4 MoE, 256 experts, TP4) measured slower with it at 18 tokens.
+// Largest batch for the single-CTA kernel; larger batches use the 2-CTA cluster kernel. Small
+// batches keep the policy's own top-k: a faster one lets the routed FC1 GEMM take the SMs ahead
+// of a shared expert running on a side stream.
 static constexpr int SmallBatchKernelSingleCtaMaxNumTokens = 18;
 
 #if defined(FLASHINFER_ROUTING_CUSTOM_BLOCK_GROUP)
@@ -684,31 +682,18 @@ bool launchDynBlockKernel(Data const& data, uint32_t numThreadsHist, void* strea
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
-// 1c. Small-batch kernels — 256 experts / top-8, 1-64 tokens, one launch: DeepSeek-V3-style
-//     routing (SigmoidBias + ScaledSumNormalize, no expert groups) from logits, or precomputed
-//     top-k.
+// 1c. Small-batch kernels — 256 experts / top-8, up to 64 tokens, one launch. Input is logits
+//     with SigmoidBias + ScaledSumNormalize routing (DeepSeek-V3 style, no expert groups) or
+//     precomputed top-k. Outputs match the block and split kernels bit for bit; inside an expert,
+//     tokens are placed in ascending order.
 //
-//     They replace the static-block (<= 4 tokens) and dyn-block (5-16) kernels and, from 17
-//     tokens, the two-launch block-scores + post-TopK split path. The outputs are bit-identical:
-//       - Expert selection and weights use the policy's keys and arithmetic: makeCmpVal of
-//         sigmoid + bias (ties to the lower expert), an exact top-k, ScaledSumNormalize.
-//       - Inside an expert, tokens are placed in ascending token order, as the block kernels
-//         place them. (The split path's order depends on shared-memory atomics; the MoE GEMMs
-//         treat permuted rows independently, so no output changes.)
-//     The per-(token, expert) tables of the block kernels become one token bitset per expert:
-//       A. one warp per token: top-k (or the precomputed ids), weights, and the token's bit in
-//          each selected expert's token set;
-//       B. one thread per expert: token count = popc(token set), CTA count, block-wide exclusive
-//          scan, CTA maps, tile padding and sizes;
-//       C. one thread per (token, k): permuted row = the expert's first row + popc(token set &
-//          earlier tokens).
-//     routingIndicesSmallBatchKernel (up to SmallBatchKernelSingleCtaMaxNumTokens tokens) is one
-//     CTA that runs the policy's TopKExpertSelect::applyForLane per token.
-//     routingIndicesSmallBatchClusterKernel (above) is a cluster of two CTAs, each with half of
-//     the tokens and its own token sets (the other CTA's are read through distributed shared
-//     memory), and a cheaper top-k with the same keys: 8 contiguous experts per lane (vector
-//     loads), the bias staged before the PDL wait, a sort of the lane's keys, then 8 rounds of a
-//     warp max.
+//     Each expert keeps a bitset of the tokens routed to it:
+//       A. one warp per token: top-k, weights, and the token's bit in each selected expert's set;
+//       B. one thread per expert: token count (popc), CTA count, exclusive scan, CTA maps, padding;
+//       C. one thread per (token, k): permuted row = expert's first row + popc(earlier tokens).
+//     routingIndicesSmallBatchKernel: one CTA, using the policy's applyForLane top-k.
+//     routingIndicesSmallBatchClusterKernel: two CTAs with half of the tokens each, reading the
+//     other CTA's sets through DSMEM; its top-k gives each lane 8 contiguous experts.
 //
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -752,7 +737,7 @@ __global__ void __launch_bounds__(SmallBatchKernelMaxThreads, 1)
            (localExpIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
   };
 
-  // Shared-memory state only: overlaps the preceding kernel's tail under PDL.
+  // Before the PDL wait: shared memory only.
   if (threadIdxX < NumExperts) {
     smemTokenSet[threadIdxX] = 0u;
   }
@@ -764,7 +749,7 @@ __global__ void __launch_bounds__(SmallBatchKernelMaxThreads, 1)
   }
 #endif
 
-  // A. One warp per token (the CTA has at least one warp per token).
+  // A. One warp per token.
   if (warpIdx < numTokens) {
     int32_t const tokenIdx = warpIdx;
     int32_t const pairIdx = tokenIdx * TopK + laneIdx;
@@ -800,9 +785,7 @@ __global__ void __launch_bounds__(SmallBatchKernelMaxThreads, 1)
           }
         }
       }
-      // An expert listed twice for one token is routed once, from its lowest k; the other
-      // pairs map to -1 like invalid ids. (The previous kernels disagree on duplicates: the
-      // block kernels keep one pair, chosen by a race; the cluster kernel routes every copy.)
+      // An expert listed twice for a token is routed once, from its lowest k; other copies get -1.
       uint32_t const peers = __match_any_sync(0xffffffff, valid ? expertIdx : -1 - laneIdx);
       bool const routed = valid && (__ffs(peers) - 1 == laneIdx);
       if (laneIdx < TopK) {
@@ -815,8 +798,8 @@ __global__ void __launch_bounds__(SmallBatchKernelMaxThreads, 1)
   }
   __syncthreads();
 
-  // B. One thread per expert: token count, CTA count and block-wide exclusive scan of the CTA
-  // counts (warp scan, then the eight warp totals).
+  // B. One thread per expert: token count, CTA count, exclusive scan of the CTA counts (warp
+  // scan, then across warps).
   int32_t count = 0;
   int32_t numCta = 0;
   int32_t ctaInclusive = 0;
@@ -883,8 +866,7 @@ __global__ void __launch_bounds__(SmallBatchKernelMaxThreads, 1)
   }
   __syncthreads();
 
-  // C. One thread per (token, k) (the CTA has at least 256 threads): permuted row = the expert's
-  // first row + the number of earlier tokens routed to the same expert.
+  // C. One thread per (token, k): permuted row = expert's first row + its earlier tokens.
   if (int32_t const pairIdx = threadIdxX; pairIdx < numTokens * TopK) {
     int32_t const tokenIdx = pairIdx / TopK;
     int32_t const expertIdx = smemPairExpert[pairIdx];
@@ -905,10 +887,7 @@ __global__ void __launch_bounds__(SmallBatchKernelMaxThreads, 1)
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  // After the last global store, not right after the wait as the block kernels do: an early
-  // trigger lets the routed FC1 GEMM occupy SMs while routing runs. On GB300 that was 0.2-0.8 us
-  // faster per MoE call alone, but 4-6 us slower with the shared expert on a default-priority
-  // side stream.
+  // Trigger after the last global store, so the next GEMM does not take SMs while routing runs.
   if (params.mUsePdl) {
     cudaTriggerProgrammaticLaunchCompletion();
   }
@@ -923,9 +902,7 @@ __device__ __forceinline__ void smallBatchCompareSwapDesc(T& a, T& b) {
   b = lo;
 }
 
-// Descending sort of 8 keys: Batcher's odd-even merge network, 19 compare-exchanges (the generic
-// Sort<8> is a 24-comparator bitonic network). The keys are unique, so any correct sort gives
-// the order reduceTopK sees.
+// Descending sort of 8 unique keys: Batcher's odd-even merge network (19 compare-exchanges).
 template <typename T>
 __device__ __forceinline__ void smallBatchSort8Desc(T (&k)[8]) {
   smallBatchCompareSwapDesc(k[0], k[1]);
@@ -949,8 +926,7 @@ __device__ __forceinline__ void smallBatchSort8Desc(T (&k)[8]) {
   smallBatchCompareSwapDesc(k[5], k[6]);
 }
 
-// This lane's 8 contiguous logits of one token row, as float (the conversion the policies use).
-// VecLoad: the row is 16-byte aligned, so the 8 values are one or two 16-byte loads.
+// Loads 8 contiguous logits as float. VecLoad: 16-byte aligned, so one or two vector loads.
 template <typename InputT, bool VecLoad>
 __device__ __forceinline__ void smallBatchLoadLogits(InputT const* src, float (&x)[8]) {
   if constexpr (VecLoad && std::is_same_v<InputT, float>) {
@@ -996,7 +972,7 @@ __global__ void __launch_bounds__(SmallBatchKernelMaxThreads, 1)
   static_assert(TopK <= WarpSize && NumExperts <= SmallBatchKernelMaxThreads);
   static_assert(ExpertsPerLane == 8, "the per-lane sort network is written for 8 candidates");
 
-  // Selection bias (SigmoidBias), staged before the PDL wait.
+  // Selection bias, staged before the PDL wait.
   __shared__ __align__(16) float smemBias[Input == SmallBatchInput::Scores ? NumExperts : 1];
   // This CTA's tokens that selected each expert: bit j = the CTA's j-th token.
   __shared__ uint32_t smemTokenSet[NumExperts];
@@ -1009,8 +985,7 @@ __global__ void __launch_bounds__(SmallBatchKernelMaxThreads, 1)
   int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdxX / WarpSize, 0);
   int32_t const laneIdx = cutlass::arch::LaneId();
   int32_t const numTokens = params.mNumTokens;
-  // The first CTA takes the first ceil(T / 2) tokens, the second the rest: token order is
-  // CTA-major, so "earlier tokens" of an expert are the first CTA's set, then the lower bits.
+  // CTA 0 takes the first ceil(T / 2) tokens, CTA 1 the rest.
   int32_t const tokensPerCta = (numTokens + NumCtas - 1) / NumCtas;
   int32_t const ctaRank = static_cast<int32_t>(cg::this_cluster().block_rank());
   int32_t const firstToken = ctaRank * tokensPerCta;
@@ -1025,9 +1000,8 @@ __global__ void __launch_bounds__(SmallBatchKernelMaxThreads, 1)
            (localExpIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
   };
 
-  // Overlaps the preceding kernel's tail under PDL: clear the token sets and stage the bias, a
-  // model parameter that the preceding kernels do not write (the DeepSeek routing kernel also
-  // loads it before its wait).
+  // Before the PDL wait: clear the token sets and stage the bias (a weight, not written by the
+  // preceding kernels).
   if (threadIdxX < NumExperts) {
     if constexpr (Input == SmallBatchInput::Scores) {
       auto const& pre = params.mExpertSelectParams.mPreprocessParams;
@@ -1047,10 +1021,8 @@ __global__ void __launch_bounds__(SmallBatchKernelMaxThreads, 1)
     int32_t const pairIdx = tokenIdx * TopK + laneIdx;
     int32_t const localPair = warpIdx * TopK + laneIdx;
     if constexpr (Input == SmallBatchInput::Scores) {
-      // TopKExpertSelect<SigmoidBias, ScaledSumNormalize>::applyForLane with the experts of a
-      // lane contiguous: the same keys (makeCmpVal of sigmoid(logit) + bias, ties to the lower
-      // expert), the same exact top-8 by 64-bit warp max and the same postprocess, in fewer
-      // instructions per token.
+      // Same keys and result as TopKExpertSelect<SigmoidBias, ScaledSumNormalize>::applyForLane
+      // (sigmoid(logit) + bias, ties to the lower expert), with 8 contiguous experts per lane.
       using RedType = topk::TopKRedType<float>;
       using TypeCmp = typename RedType::TypeCmp;
       using PostProc = typename ExpertSelect::PostprocessPolicy;
@@ -1069,9 +1041,8 @@ __global__ void __launch_bounds__(SmallBatchKernelMaxThreads, 1)
         keys[i] = RedType::makeCmpVal(s + bias[i], firstExpert + i);
       }
       smallBatchSort8Desc(keys);
-      // Round kk: the warp's largest remaining key; the lane holding it pops its sorted head.
-      // Lane kk keeps the round's key. A lane holds 8 candidates, so its head is never the 0
-      // filler.
+      // Round kk: the warp max of the lanes' heads; the lane holding it pops its head, and lane kk
+      // keeps the key. With 8 candidates per lane, a head is never the 0 filler.
       TypeCmp laneKey = 0;
 #pragma unroll
       for (int kk = 0; kk < TopK; ++kk) {
@@ -1131,15 +1102,13 @@ __global__ void __launch_bounds__(SmallBatchKernelMaxThreads, 1)
       }
     }
   }
-  // Releases this CTA's token sets to the other CTA of the cluster.
+  // Publish this CTA's token sets to the other CTA.
   __cluster_barrier_arrive();
   __cluster_barrier_wait();
 
-  // B. One thread per expert, in both CTAs (each needs the CTA offsets of all experts): token
-  // count over both CTAs' sets, CTA count, block-wide exclusive scan of the CTA counts (warp
-  // scan, then the eight warp totals). Only the first CTA writes the CTA maps. Tile arithmetic
-  // by multiply / divide for every tile size: the same integers as the power-of-two shifts, and
-  // one code path keeps the kernel small.
+  // B. One thread per expert in both CTAs: token count over both CTAs' sets, CTA count, exclusive
+  // scan. Only CTA 0 writes the CTA maps. Multiply / divide by the tile size covers power-of-two
+  // tiles too, so one code path serves both.
   int32_t const tile = params.mTileTokensDim;
   int32_t count = 0;
   int32_t numCta = 0;
@@ -1165,8 +1134,7 @@ __global__ void __launch_bounds__(SmallBatchKernelMaxThreads, 1)
       smemWarpCtas[warpIdx] = ctaInclusive;
     }
   }
-  // The other CTA's token sets are not read after this point; the matching wait at exit keeps
-  // each CTA's shared memory alive until the other CTA's reads are done.
+  // Done reading the other CTA's sets; the wait at exit keeps ours alive until it is done too.
   __cluster_barrier_arrive();
   __syncthreads();
 
@@ -1188,8 +1156,7 @@ __global__ void __launch_bounds__(SmallBatchKernelMaxThreads, 1)
         int32_t const mappedLocalIdx =
             (threadIdxX - params.mLocalExpertsStartIdx) >> params.mLocalExpertsStrideLog2;
         int32_t const rowsEnd = firstRow + count;
-        // Kept rolled (as the loop below): a small kernel body stays resident in the instruction
-        // cache, which matters more here than the loop overhead.
+        // Kept rolled, as the loop below, to keep the kernel body small.
 #pragma unroll 1
         for (int cta = 0; cta < numCta; ++cta) {
           params.mPtrCtaIdxXyToBatchIdx[ctaOffset + cta] = mappedLocalIdx;
@@ -1214,8 +1181,8 @@ __global__ void __launch_bounds__(SmallBatchKernelMaxThreads, 1)
   }
   __syncthreads();
 
-  // C. One thread per (token, k) of this CTA (at least 32 threads per token, or 256): permuted
-  // row = the expert's first row for this CTA + the CTA's earlier tokens routed to the expert.
+  // C. One thread per (token, k) of this CTA: permuted row = expert's first row for this CTA +
+  // this CTA's earlier tokens of the expert.
   if (int32_t const localPair = threadIdxX; localPair < ctaTokens * TopK) {
     int32_t const localToken = localPair / TopK;
     int32_t const tokenIdx = firstToken + localToken;
@@ -2209,10 +2176,8 @@ void launchOffsetsKernel(Data const& data, int numBlocksOffsets, uint32_t numThr
 //
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// FLASHINFER_ROUTING_SMALL_BATCH_KERNEL=0 (or "off") routes the small-batch shapes through the
-// static-block / dyn-block / split kernels instead (for tests and A/B measurements). Read on every
-// eligible call, so a test can compare both paths in one process; CUDA-graph replays do not run
-// it.
+// FLASHINFER_ROUTING_SMALL_BATCH_KERNEL=0 (or "off") disables the small-batch kernels. Read on
+// every eligible call, so a test can compare both paths in one process.
 inline bool smallBatchKernelEnabled() {
   char const* raw = std::getenv("FLASHINFER_ROUTING_SMALL_BATCH_KERNEL");
   if (raw == nullptr) return true;
