@@ -39,6 +39,7 @@ class SparseMlaProfile:
     kv_pipeline_stages: int = 0
     kv_tile_size: int = 128
     page_pipeline_stages: int = 0
+    whole_kv_tile: bool = False
 
 
 def _base_fp8(rows, heads, capacity, sm_count):
@@ -447,10 +448,77 @@ def _size_buffers(profile, *, rows, heads, query_length, capacity, dtype, sm_cou
     return profile
 
 
-def select_sparse_mla_profile(*, rows, heads, query_length, capacity, dtype, sm_count):
+def select_sparse_mla_profile(
+    *,
+    rows,
+    heads,
+    query_length,
+    capacity,
+    dtype,
+    sm_count,
+    rope_dim=0,
+    kv_cache_format="native",
+):
     """Resolve one complete schedule from the validated public plan bounds."""
+    if (
+        kv_cache_format in ("nvfp4", "nvfp4.fp8rope", "fp8")
+        and dtype == "fp8"
+        and rope_dim in (0, 64)
+        and heads <= 32
+        and capacity >= 512
+        and rows * 2 >= sm_count
+    ):
+        # A resident query grid amortizes the separate raw gather and eight
+        # converters. Retain two complete tiles, independent of Q tile width.
+        # Above sixteen heads, WS M64 wins on GB300: its N256 PV consumes
+        # Dv512 in two passes, whereas the narrow Swap-AB path needs four.
+        keep = heads > 16
+        return SparseMlaProfile(
+            family="keep" if keep else "swap",
+            tile_size_q=64 if keep else 8 if heads <= 8 else 16,
+            gather_issue_warps=8,
+            reuse_kv=True,
+            whole_kv_tile=True,
+            single_kv_stream=not keep,
+            uniform_offset_cache=keep,
+            paired_correction=keep,
+            scheduler="clc",
+        )
     choose = _choose_fp8 if dtype == "fp8" else _choose_bf16
     profile = choose(rows, heads, query_length, capacity, sm_count)
+    if (
+        kv_cache_format != "native"
+        and dtype == "fp8"
+        and query_length <= 8
+        and capacity >= 2048
+        and rows >= 16
+        and rows * 2 < sm_count
+    ):
+        if heads == 64 or (
+            heads == 128 and kv_cache_format == "fp8" and rows * 4 < sm_count
+        ):
+            # Small packed grids still benefit from whole-record gathers and
+            # retained WS tiles. At low row counts, two M64 head tiles also
+            # beat group-2 mixed-pool startup despite repeating KV conversion.
+            # Power-of-two splits fill most of a resident wave without adding
+            # a short split for a source-boundary tile.
+            work = rows * ceil(heads / 64)
+            split_limit = min(capacity // 128, max(1, sm_count // work))
+            wave_splits = 1 << (split_limit.bit_length() - 1)
+            profile = SparseMlaProfile(
+                family="keep",
+                split_kv=wave_splits,
+                gather_issue_warps=8,
+                reuse_kv=True,
+                reuse_kv_stages=10,
+                whole_kv_tile=True,
+                uniform_offset_cache=True,
+                paired_correction=True,
+            )
+        elif profile.family == "2cta":
+            # Conversion makes longer per-cluster loops costly. Use the same
+            # resident-wave split sizing below, with two SMs per cluster.
+            profile = replace(profile, split_kv=0)
     profile = _size_buffers(
         profile,
         rows=rows,
@@ -460,6 +528,32 @@ def select_sparse_mla_profile(*, rows, heads, query_length, capacity, dtype, sm_
         dtype=dtype,
         sm_count=sm_count,
     )
+    if (
+        rope_dim
+        and dtype == "bf16"
+        and profile.family == "2cta"
+        and profile.kv_pipeline_stages
+    ):
+        # Each CTA's Q RoPE tail needs 64*rope_dim BF16 elements. A combined
+        # K/V stage holds 64*128, so trade whole prefetch stages for that storage.
+        profile = replace(
+            profile,
+            kv_pipeline_stages=max(
+                4, profile.kv_pipeline_stages - ceil(rope_dim / 128)
+            ),
+        )
+    if rope_dim and profile.reuse_kv:
+        if dtype == "bf16" and profile.family == "keep":
+            # A D576 M64 query plus a retained BK128 BF16 tile exceeds SMEM.
+            # BK64 retains one five-slice K tile plus one prefetched slice;
+            # its pipeline serializes PV before the next complete QK tile.
+            profile = replace(profile, kv_tile_size=64, reuse_kv_stages=6)
+        else:
+            retained_tiles = 2 if dtype == "fp8" else 1
+            profile = replace(
+                profile,
+                reuse_kv_stages=max(profile.reuse_kv_stages, retained_tiles * 5),
+            )
     tile = profile.tile_size_q or {"swap": 16, "keep": 64, "2cta": 128}[profile.family]
     work = rows * ceil(heads / tile)
     splits = profile.split_kv
@@ -486,6 +580,10 @@ def select_sparse_mla_profile(*, rows, heads, query_length, capacity, dtype, sm_
         )
     # Retaining K through PV requires a single owner of the V dimension.
     reuse = profile.reuse_kv and v_ctas == 1
+    if profile.family == "2cta" and kv_cache_format != "native":
+        # Convert each CTA's64 K rows once, then exchange the peer's V
+        # features through DSMEM. Buffering depends on the QK width.
+        profile = replace(profile, balanced_registers=True)
     return replace(
         profile,
         tile_size_q=tile,

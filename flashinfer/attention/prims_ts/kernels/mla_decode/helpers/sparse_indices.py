@@ -33,6 +33,7 @@ class SparseKVIndices:
     """Caller-owned index lists; optionally cache one query row's live lengths."""
 
     def __init__(self, values, capacity, assume_valid_prefix=False, has_extra=True):
+        """Carry caller-owned source metadata and an optional FP8-primary scale through JIT calls."""
         self.values = values
         (
             self.primary_indices,
@@ -42,6 +43,7 @@ class SparseKVIndices:
             self.query_row,
             self.primary_length,
             self.extra_length,
+            self.primary_tensor_scale,
         ) = values
         self.capacity = capacity
         self.assume_valid_prefix = assume_valid_prefix
@@ -65,6 +67,10 @@ class SparseKVIndices:
 
     @cute.jit
     def bind_query_row(self, query_row, primary_length=None, extra_length=None):
+        """Bind one query to live source lengths, optionally reusing register-cached lengths.
+
+        Round the primary span to 128 slots so a BK64/BK128 tile never mixes
+        pools. Padding is logical: caller index arrays and cache rows are not copied."""
         if cutlass.const_expr(self.is_bound):
             return self
         row = Int64(query_row)
@@ -86,11 +92,60 @@ class SparseKVIndices:
                 )
                 if cutlass.const_expr(self.has_extra)
                 else Int32(0),
+                self.primary_tensor_scale,
             ),
             self.capacity,
             self.assume_valid_prefix,
             self.has_extra,
         )
+
+    @cute.jit
+    def tensor_scale_is_extra(self, tile_start, query_row=None):
+        """Return whether a logical KV tile starts in the extra pool.
+
+        The primary list occupies ceil(primary_length/128)*128 logical slots.
+        Later slots select extra NVFP4 rows and therefore have tensor scale one.
+        Use the current graph-live length, not the planned list capacity."""
+        if cutlass.const_expr(not self.has_extra):
+            return cutlass.Boolean(False)
+        length = (
+            self.primary_length
+            if cutlass.const_expr(self.is_bound)
+            else Int32(self.primary_lengths[Int64(query_row)])
+        )
+        return tile_start >= (length + Int32(127)) // Int32(128) * Int32(128)
+
+    @cute.jit
+    def tensor_scale(self, tile_start, query_row=None):
+        """Return K/V's descale for this tile: primary FP8 scale or one for NVFP4.
+
+        NVFP4 block scales have already been applied in the loader. The FP8
+        primary bytes remain unchanged, so score/output arithmetic consumes
+        this scalar instead of rounding scaled K/V back into E4M3.
+        """
+        scale = cutlass.Float32(1)
+        if not self.tensor_scale_is_extra(tile_start, query_row):
+            scale = cutlass.Float32(self.primary_tensor_scale[0])
+        return scale
+
+    @cute.jit
+    def tensor_scale_ratio(self, current, previous, query_row=None):
+        """Convert accumulated O from the previous tile's V units to the current's.
+
+        PV uses raw FP8 primary values and already-decoded NVFP4 extra values.
+        Therefore O_new = alpha * (s_previous / s_current) * O_old + P @ V_raw,
+        where alpha is the ordinary online-softmax correction. Primary tiles
+        precede extra tiles, so the only transition multiplies O by the FP8
+        primary scale (the extra scale is one). Stay exactly one within a pool.
+        This factor changes O only; the softmax denominator and LSE use alpha.
+        """
+        ratio = cutlass.Float32(1)
+        if cutlass.const_expr(self.has_extra):
+            if self.tensor_scale_is_extra(
+                current, query_row
+            ) and not self.tensor_scale_is_extra(previous, query_row):
+                ratio = cutlass.Float32(self.primary_tensor_scale[0])
+        return ratio
 
     @cute.jit
     def select_source_tile(
@@ -279,6 +334,7 @@ def bind_sparse_kv_indices(
     query_row=None,
     assume_valid_prefix: cutlass.Constexpr[bool] = False,
     has_extra: cutlass.Constexpr[bool] = True,
+    primary_tensor_scale=None,
 ):
     """Bind index readers and scheduler lengths without copying metadata."""
     indices = SparseKVIndices(
@@ -290,6 +346,7 @@ def bind_sparse_kv_indices(
             None,
             None,
             None,
+            primary_tensor_scale,
         ),
         capacity,
         assume_valid_prefix,
@@ -306,3 +363,28 @@ def bind_sparse_kv_indices(
             (primary_lengths, extra_lengths, None, None), has_extra
         )
     return indices, lengths
+
+
+@cute.jit
+def cache_sparse_source_lengths(
+    page_offsets,
+    query_row,
+    lengths,
+    *,
+    include_primary_tiles: cutlass.Constexpr[bool] = False,
+):
+    """Snapshot graph-live source lengths once per scheduled query work tile.
+
+    Bound readers already carry scalar lengths. Unbound persistent readers
+    cache primary/extra lengths in registers; loaders can additionally retain
+    ceil(primary_length/128), the source boundary in full KV tiles.
+    """
+    if cutlass.const_expr(not page_offsets.is_bound):
+        lengths[0] = Int32(page_offsets.primary_lengths[query_row])
+        lengths[1] = (
+            Int32(page_offsets.extra_lengths[query_row])
+            if page_offsets.has_extra
+            else Int32(0)
+        )
+        if cutlass.const_expr(include_primary_tiles):
+            lengths[2] = (lengths[0] + Int32(127)) // Int32(128)

@@ -41,6 +41,7 @@ from ...helpers.layout import (
     SMEM_ROW_BYTES,
     decode_gen_task_cache,
     o_stage_tmem_col_offset,
+    smem_array,
     q_p_desc_k_block_wrap_bytes,
 )
 from ...helpers.math import (
@@ -370,6 +371,47 @@ class TmemOResource(MlaResource):
     ):
         """Issue PV MMA for keeps-MMA-AB with P sourced from TMEM."""
         cfg = self.cfg
+        if cutlass.const_expr(cfg.ws_pv):
+            assert (
+                cfg.async_nvfp4_kv_gather
+                and cfg.tile_size_q == 64
+                and cfg.tile_size_kv == 128
+            )
+            p_smem = smem_array(
+                stage_info.context, self.p_tmem_ref._ws_p_alloc, Int32, 4096
+            )
+            p_desc = cprims.Tcgen05SmemDesc.build(
+                p_smem.data_ptr(p_stage_idx * Int32(2048)),
+                leading_byte_offset=16,
+                stride_byte_offset=1024,
+                layout=qkv_smem_swizzle(cfg),
+            )
+            idesc = cprims.Tcgen05InstrDesc.build(
+                c_dtype=Float32,
+                a_dtype=qkv_dtype(cfg),
+                b_dtype=qkv_dtype(cfg),
+                a_major=0,
+                b_major=1,
+                n_dim=256,
+                m_dim=64,
+            )
+            if prims.elect_sync():
+                base_addr = self._pv_o_base_addr(
+                    stage_info, v_subtile_idx=v_subtile_idx
+                )
+                for _kb in cutlass.range_constexpr(4):
+                    prims.tcgen05_mma_ws(
+                        mma_kind_for_qkv(cfg),
+                        prims.make_tmem_ptr(base_addr, Float32),
+                        p_desc,
+                        v_desc,
+                        idesc,
+                        scale_d,
+                    )
+                    scale_d = Boolean(True)
+                    p_desc = p_desc + Int32(2)
+                    v_desc = v_desc + Int32(256)
+            return
         v_stage_idx = v_subtile_idx % cfg.v_head_dim_stages
         task_cache = decode_gen_task_cache(stage_info)
         p_addr = (
