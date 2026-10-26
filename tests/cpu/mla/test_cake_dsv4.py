@@ -29,6 +29,7 @@ def _canonical_query_tokens(batch_size: int, max_q_len: int, ragged: bool) -> in
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "dtype,num_heads,batch_size,max_q_len,ragged,sparse_topk,page_size,expected",
     [
@@ -1099,6 +1100,7 @@ def test_cake_dsv4_semantic_routes(
         assert _route(**kwargs) == expected
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "num_query_tokens,sparse_topk,page_size,expected",
     [
@@ -1138,6 +1140,7 @@ def test_bf16_h128_swa_and_topk4x_rows_use_the_persistent_prefill_body_from_64_t
         assert _route(**kwargs) == expected
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "num_query_tokens,page_size,sparse_topk,expected",
     [
@@ -1172,6 +1175,7 @@ def test_fp8_h128_rows_all_use_the_persistent_body(
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "num_query_tokens,page_size,sparse_topk,expected",
     [
@@ -1205,6 +1209,7 @@ def test_bf16_h64_compressed_rows_use_the_prefill_body_from_24_tokens(
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "num_heads,batch_size,page_size,expected",
     [
@@ -1246,12 +1251,14 @@ def test_fp8_prefill_keeps_batch_and_cache_layout_predicates(
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
 def test_unexported_variant_fails(arch):
     with pytest.raises(ValueError, match="no generated source contract"):
         get_cake_dsv4_spec("unexported_variant", arch=arch)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
 def test_registered_sources_exist_and_shared_sources_live_in_common(arch):
     """Every registered source is on disk; a source both architectures compile
@@ -1315,6 +1322,7 @@ _HOST_TMA_SOURCE_TENSORS = frozenset(
 )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", _ARCHES)
 def test_registered_arg_plans_use_known_names(arch):
     """Every generated argument is bindable by name."""
@@ -1341,6 +1349,7 @@ _PUBLIC_COMPILE_FLAGS = {
 }
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", _ARCHES)
 def test_registered_min_cuda_version_marks_the_nvfp4_programs(arch):
     """The NVFP4 programs spell the Blackwell QMUL4 as the PTX ISA 9.4 packed
@@ -1353,6 +1362,7 @@ def test_registered_min_cuda_version_marks_the_nvfp4_programs(arch):
             assert "min_cuda_version" not in spec, variant
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", _ARCHES)
 def test_registered_compile_flags_are_public(arch):
     """Exported programs must build with public nvcc/ptxas options only.
@@ -1382,6 +1392,7 @@ def test_registered_compile_flags_are_public(arch):
             assert pin not in flags, variant
 
 
+@pytest.mark.cpu_only
 def test_metadata_param_vocabulary_is_bindable():
     for name in KERNEL_METADATA_PARAMS:
         kind = "buffer" if name.endswith(("indices", "lens")) else "parameter"
@@ -1461,6 +1472,7 @@ def _install_fake_variants(monkeypatch, plans):
     return recorder
 
 
+@pytest.mark.cpu_only
 def test_launch_variant_binds_by_name_with_fake_arg_plan(monkeypatch):
     recorder = _install_fake_variants(monkeypatch, {"fake": _FAKE_PLAN})
     rows, compressed = 3, 132
@@ -1499,6 +1511,7 @@ def test_launch_variant_binds_by_name_with_fake_arg_plan(monkeypatch):
     assert all(isinstance(bound[n], int) for n in ("sparse_topk", "grid_x"))
 
 
+@pytest.mark.cpu_only
 def test_launch_variant_reports_unknown_and_unavailable_names(monkeypatch):
     plans = {
         "unknown": [
@@ -1612,6 +1625,7 @@ def _run_fake_dense_h64(monkeypatch, *, query_rows, metadata, workspace, out=Non
     return recorder, query, out, swa_cache, compressed_cache, sinks
 
 
+@pytest.mark.cpu_only
 def test_run_cake_dsv4_binds_uniform_metadata_and_prefix_views(monkeypatch):
     rows, compressed, query_rows = 4, 512, 6
     table, lens = _combined_metadata(rows, compressed)
@@ -1657,6 +1671,7 @@ def test_run_cake_dsv4_binds_uniform_metadata_and_prefix_views(monkeypatch):
     assert r["partial_O"] is m["partial_O"] and r["partial_lse"] is m["partial_lse"]
 
 
+@pytest.mark.cpu_only
 def test_run_cake_dsv4_separate_tables_and_offset(monkeypatch):
     rows, compressed = 3, 512
     table, lens = _combined_metadata(rows, compressed)
@@ -1691,6 +1706,7 @@ def test_run_cake_dsv4_separate_tables_and_offset(monkeypatch):
     assert torch.equal(m["sparse_topk_lens"], lens - 128)
 
 
+@pytest.mark.cpu_only
 def test_run_cake_dsv4_rejects_undersized_workspace_and_copies(monkeypatch):
     rows, compressed = 2, 512
     table, lens = _combined_metadata(rows, compressed)
@@ -1725,6 +1741,7 @@ def test_run_cake_dsv4_rejects_undersized_workspace_and_copies(monkeypatch):
         )
 
 
+@pytest.mark.cpu_only
 def test_workspace_formula_and_layout():
     tokens, heads, topk = 5, 128, 1152
     splits = max(-(-topk // 128), 5)
@@ -1786,6 +1803,7 @@ def test_workspace_formula_and_layout():
         cake_dsv4_workspace_layout(0, heads, 1)
 
 
+@pytest.mark.cpu_only
 def test_workspace_reset_zeroes_only_the_counter_region():
     total = cake._PARTIAL_OFFSET + 4096
     workspace = _aligned_u8(total)
@@ -1814,6 +1832,7 @@ def test_workspace_reset_zeroes_only_the_counter_region():
         cake_dsv4_workspace_reset(misaligned)
 
 
+@pytest.mark.cpu_only
 def test_counter_zeroing_is_part_of_the_launch_and_never_raises_in_capture(monkeypatch):
     """CAKE-939: counter zeroing is a launch-contract step, not a host priming step.
 
@@ -1859,6 +1878,7 @@ def test_counter_zeroing_is_part_of_the_launch_and_never_raises_in_capture(monke
     assert key not in cake._primed_workspaces
 
 
+@pytest.mark.cpu_only
 def test_metadata_resolution_combined_table():
     rows, compressed = 5, 132
     table, lens = _combined_metadata(rows, compressed)
@@ -1888,6 +1908,7 @@ def test_metadata_resolution_combined_table():
     assert folded.sparse_topk_lens.data_ptr() == lens.data_ptr()
 
 
+@pytest.mark.cpu_only
 def test_metadata_resolution_separate_tables():
     rows, compressed = 4, 256
     table, lens = _combined_metadata(rows, compressed)
@@ -1929,6 +1950,7 @@ def test_metadata_resolution_separate_tables():
     assert zero.compressed_indices is swa and zero.sparse_topk == 128
 
 
+@pytest.mark.cpu_only
 def test_metadata_resolution_padded_rows():
     rows, compressed = 3, 4
     table, lens = _combined_metadata(rows, compressed)
@@ -1944,6 +1966,7 @@ def test_metadata_resolution_padded_rows():
         resolve_cake_dsv4_sparse_metadata(table[:0], lens[:0], query_rows=2)
 
 
+@pytest.mark.cpu_only
 def test_metadata_resolution_errors():
     rows, compressed = 3, 8
     table, lens = _combined_metadata(rows, compressed)
@@ -2001,6 +2024,7 @@ def test_metadata_resolution_errors():
         )
 
 
+@pytest.mark.cpu_only
 def test_kernel_kwargs_hand_over_contiguous_index_spans():
     rows, compressed = 5, 132
     table, lens = _combined_metadata(rows, compressed)
@@ -2087,6 +2111,7 @@ def _run_fake_persistent_fp8_h128(monkeypatch, *, cum_seq_lens_q, max_q_len):
     return dict(zip((name for _, name in _PERSISTENT_PLAN), call, strict=True))
 
 
+@pytest.mark.cpu_only
 def test_persistent_route_synthesizes_dense_query_offsets(monkeypatch):
     # Dense [batch=3, q_len=2] query: every request is max_q_len long, so the
     # ragged-only producer receives cum_seq_lens_q = [0, 2, 4, 6] without a
@@ -2140,6 +2165,7 @@ class _RecordingLauncher:
         return self.variant(reducer, grid=(tokens, heads, 1), **overrides)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", _ARCHES)
 @pytest.mark.parametrize(
     "num_query_tokens,sparse_topk,expected_producer,expected_splits",
@@ -2203,6 +2229,7 @@ def test_bf16_h128_topk128x_launches_split4_or_row_first_owners(
     ]
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", _ARCHES)
 def test_bf16_h128_topk4x_launches_five_owners_and_the_split5_reducer(arch):
     tokens = 12
@@ -2252,6 +2279,7 @@ _SWEEP_QUERIES = (
 )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", _ARCHES)
 def test_every_route_result_has_a_registered_kernel(monkeypatch, arch):
     """``_route`` rejects a shape up front or dispatches only registered kernels."""
@@ -2295,6 +2323,7 @@ def test_every_route_result_has_a_registered_kernel(monkeypatch, arch):
     assert routed > 0 and rejected > 0
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("clusters", [74, 76])
 @pytest.mark.parametrize(
     "num_query_tokens,sparse_topk,expected",
@@ -2319,11 +2348,13 @@ def test_bf16_h128_prefill_snake_feed_predicate(
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("clusters", [74, 76])
 def test_bf16_h128_prefill_snake_feed_predicate_full_rounds(clusters):
     assert cake._bf16_h128_prefill_uses_snake_feed(8 * clusters, 640, clusters) is False
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", _ARCHES)
 @pytest.mark.parametrize(
     "num_query_tokens,sparse_topk,expected_program",
@@ -2362,6 +2393,7 @@ def test_bf16_h128_prefill_launches_the_snake_body_for_tail_majority_rows(
     ]
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "num_query_tokens,page_size,sparse_topk,expected",
     [
@@ -2425,6 +2457,7 @@ def test_fp8_h64_rows_follow_the_persistent_body_rule(
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("num_query_tokens", [128, 256, 512])
 @pytest.mark.parametrize(
     "sparse_topk,page_size,expected",
@@ -2461,6 +2494,7 @@ def test_fp8_h64_m64_program_is_selected_by_the_item_width(
     assert expected in cake._RAGGED_ONLY_ROUTES
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", _ARCHES)
 @pytest.mark.parametrize(
     "route",
@@ -2558,6 +2592,7 @@ def _run_fake_bf16_h32(
     return calls, table, lens, query, out
 
 
+@pytest.mark.cpu_only
 def test_query_layout_params_are_bindable_and_bound_for_dense_and_ragged_calls(
     monkeypatch,
 ):
@@ -2612,6 +2647,7 @@ def test_query_layout_params_are_bindable_and_bound_for_dense_and_ragged_calls(
         )
 
 
+@pytest.mark.cpu_only
 def test_run_cake_dsv4_tiles_rows_to_the_workspace(monkeypatch):
     """CAKE-939: a workspace below the single-launch carve tiles the metadata
     rows; every chunk sees row views, its own partials and counters, and the
@@ -2726,6 +2762,7 @@ def test_run_cake_dsv4_tiles_rows_to_the_workspace(monkeypatch):
         )
 
 
+@pytest.mark.cpu_only
 def test_workspace_requirement_is_exact_per_route():
     mib128 = 128 * 1024 * 1024
     # Routes without partial buffers need no workspace bytes.
@@ -2808,6 +2845,7 @@ def test_workspace_requirement_is_exact_per_route():
         )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", _ARCHES)
 def test_route_plan_matches_the_dispatcher(monkeypatch, arch):
     """The sizing table and the launches agree on splits, partial buffers and counters."""

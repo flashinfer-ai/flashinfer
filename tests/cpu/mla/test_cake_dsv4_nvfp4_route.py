@@ -25,17 +25,20 @@ from flashinfer.mla.cake_dsv4 import (
 _NVFP4_VARIANTS = cake._NVFP4_VARIANTS
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("backend", ["cake", "sparse"])
 def test_nvfp4_format_accepts_cake_and_sparse(backend):
     _check_dsv4_kv_cache_format_backend("nvfp4", backend)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("backend", ["trtllm-gen", "cute-dsl"])
 def test_nvfp4_format_rejects_other_backends(backend):
     with pytest.raises(ValueError, match="kv_cache_format='nvfp4'"):
         _check_dsv4_kv_cache_format_backend("nvfp4", backend)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("fmt", ["fp8_dsv41", "fp8_dsv41_fp4_ca"])
 def test_dsv41_formats_still_sparse_only(fmt):
     _check_dsv4_kv_cache_format_backend(fmt, "sparse")
@@ -43,6 +46,7 @@ def test_dsv41_formats_still_sparse_only(fmt):
         _check_dsv4_kv_cache_format_backend(fmt, "cake")
 
 
+@pytest.mark.cpu_only
 def test_fp8_format_accepts_every_backend():
     for backend in ("trtllm-gen", "cute-dsl", "sparse", "cake"):
         _check_dsv4_kv_cache_format_backend("fp8", backend)
@@ -222,6 +226,7 @@ def _instantiation(label):
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("key", sorted(_CAKE_PLAN_TABLE))
 def test_nvfp4_plan_matches_cake_plan(key):
     tokens, num_heads, topk, extra_topk, sm_count = key
@@ -270,6 +275,7 @@ def test_nvfp4_plan_matches_cake_plan(key):
         )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("sm_count", [148, 160])
 def test_nvfp4_plan_selects_an_instantiated_cell(sm_count):
     """Every templated-member plan names a cell its launcher instantiates."""
@@ -310,6 +316,7 @@ def test_nvfp4_plan_selects_an_instantiated_cell(sm_count):
                     assert cell in _TEMPLATED_INSTANTIATIONS, plan
 
 
+@pytest.mark.cpu_only
 def test_nvfp4_variant_names():
     assert cake._nvfp4_variant_name("persistent") == "nvfp4_decode_persistent"
     assert cake._nvfp4_variant_name("cluster") == "nvfp4_decode_cluster"
@@ -324,6 +331,7 @@ def test_nvfp4_variant_names():
         assert set(_NVFP4_VARIANTS) <= set(_ARCH_REGISTRATIONS[arch]["variants"])
 
 
+@pytest.mark.cpu_only
 def test_nvfp4_plan_head_tiles_and_caps():
     # Head tiles are 128 wide (64 on the tile64 member); one-tile rows form one head tile on every member.
     for heads in (8, 16, 32, 64, 128):
@@ -367,6 +375,7 @@ def test_nvfp4_plan_head_tiles_and_caps():
         )
 
 
+@pytest.mark.cpu_only
 def test_workspace_layout_lse_region_is_opt_in():
     base = cake_dsv4_workspace_layout(32, 128, 4)
     with_lse = cake_dsv4_workspace_layout(32, 128, 4, with_lse=True)
@@ -381,6 +390,7 @@ def test_workspace_layout_lse_region_is_opt_in():
     assert with_lse.lse[0] % 128 == 0
 
 
+@pytest.mark.cpu_only
 def test_workspace_bytes_nvfp4_bound():
     fp8_bytes = get_cake_dsv4_workspace_bytes(32, 128, 512, torch.bfloat16)
     assert fp8_bytes == cake_dsv4_workspace_layout(32, 128, 5).total_bytes
@@ -404,6 +414,7 @@ def test_workspace_bytes_nvfp4_bound():
         )
 
 
+@pytest.mark.cpu_only
 def test_nvfp4_argument_vocabulary():
     for name in (
         "q_rows",
@@ -455,6 +466,7 @@ def test_nvfp4_argument_vocabulary():
         )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
 @pytest.mark.parametrize("variant", _NVFP4_VARIANTS)
 def test_missing_nvfp4_variant_raises_not_implemented(monkeypatch, arch, variant):
@@ -466,6 +478,7 @@ def test_missing_nvfp4_variant_raises_not_implemented(monkeypatch, arch, variant
         _require_nvfp4_variant(variant, arch=arch)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
 def test_registered_variant_passes_the_guard(arch):
     registered = next(iter(_ARCH_REGISTRATIONS[arch]["variants"]))
