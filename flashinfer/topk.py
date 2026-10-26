@@ -37,6 +37,9 @@ from .utils import (
     register_fake_op,
 )
 
+# RadixRowState's global histograms and inter-CTA counters require 1 MiB.
+_ROW_STATES_NBYTES = 1024 * 1024
+
 
 class TopKTieBreak(IntEnum):
     """Top-k tie-break mode.
@@ -1029,14 +1032,9 @@ def top_k(
             return sorted_values, sorted_indices
         return output_values, indices
 
-    # Allocate row_states buffer for multi-CTA path
-    # 1MB is enough for any reasonable GPU (covers up to ~200 groups for deterministic
-    # mode and ~300 groups for non-deterministic mode)
-    row_states_buffer: Optional[torch.Tensor] = _get_cache_buf(
-        f"radix_topk_row_states_{input.device}",
-        1024 * 1024,  # 1MB
-        input.device,
-        zero_init=True,
+    # Per-call zeroing keeps concurrent streams disjoint; the kernel requires it.
+    row_states_buffer = torch.zeros(
+        _ROW_STATES_NBYTES, dtype=torch.uint8, device=input.device
     )
 
     # Allocate output_values for kernel to write directly
@@ -1295,12 +1293,9 @@ def top_k_page_table_transform(
     if clusters_eligible:
         return topk_clusters_page_table_transform(input, lengths, src_page_table, k)
 
-    # Allocate row_states buffer for multi-CTA path
-    row_states_buffer: Optional[torch.Tensor] = _get_cache_buf(
-        f"radix_topk_row_states_{device}",
-        1024 * 1024,  # 1MB
-        device,
-        zero_init=True,
+    # Per-call zeroing keeps concurrent streams disjoint; the kernel requires it.
+    row_states_buffer = torch.zeros(
+        _ROW_STATES_NBYTES, dtype=torch.uint8, device=device
     )
 
     if out is None:
@@ -1471,12 +1466,9 @@ def top_k_ragged_transform(
     if clusters_eligible:
         return topk_clusters_ragged_transform(input, lengths, offsets, k)
 
-    # Allocate row_states buffer for multi-CTA path
-    row_states_buffer: Optional[torch.Tensor] = _get_cache_buf(
-        f"radix_topk_row_states_{device}",
-        1024 * 1024,  # 1MB
-        device,
-        zero_init=True,
+    # Per-call zeroing keeps concurrent streams disjoint; the kernel requires it.
+    row_states_buffer = torch.zeros(
+        _ROW_STATES_NBYTES, dtype=torch.uint8, device=device
     )
 
     # Allocate output

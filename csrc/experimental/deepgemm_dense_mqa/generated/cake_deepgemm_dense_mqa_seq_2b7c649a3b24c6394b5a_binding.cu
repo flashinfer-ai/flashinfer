@@ -29,36 +29,16 @@
 #include <cstdint>
 #include <vector>
 
+#include "experimental/cake_host_common.cuh"
+
 extern "C" __global__ void kernel_cake_deepgemm_dense_mqa_2c9f274eb5a2741c7895(unsigned int* __restrict__ Starts, unsigned int* __restrict__ Ends, unsigned int* __restrict__ Metadata, unsigned int num_q_tokens, unsigned int num_kv_tokens);
 extern "C" __global__ void kernel_cake_deepgemm_dense_mqa_6146eed402e5946aabe4(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap Weights, const __grid_constant__ CUtensorMap SF_Q, const __grid_constant__ CUtensorMap SF_KV, float* __restrict__ Logits, int* __restrict__ cu_seq_len_k_start, int* __restrict__ cu_seq_len_k_end, int seq_len, int seq_len_kv, int stride_logits, int num_q_blocks, unsigned int* __restrict__ ScheduleMeta);
 
 
 namespace cake_host_shim_3ed4811f7aee3ae1 {
 
+using namespace cake_host_shim_common;
 using tvm::ffi::TensorView;
-
-// Opt the linked kernel into its dynamic shared memory once for every device
-// that accepts it. Function-local static initialization already serializes
-// the first call; no lock or per-device cache is needed.
-inline bool CakeSetMaxDynamicSmem(const void* symbol, int smem_bytes) {
-  cudaKernel_t kernel = nullptr;
-  TVM_FFI_CHECK_CUDA_ERROR(cudaGetKernel(&kernel, symbol));
-  int device_count = 0;
-  TVM_FFI_CHECK_CUDA_ERROR(cudaGetDeviceCount(&device_count));
-  int configured = 0;
-  for (int device = 0; device < device_count; ++device) {
-    if (cudaKernelSetAttributeForDevice(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes, device) ==
-        cudaSuccess) {
-      ++configured;
-    } else {
-      (void)cudaGetLastError();
-    }
-  }
-  TVM_FFI_CHECK(configured > 0, RuntimeError)
-      << "no CUDA device accepts " << smem_bytes << " B of dynamic shared memory";
-  return true;
-}
 
 namespace stage_metadata {
 

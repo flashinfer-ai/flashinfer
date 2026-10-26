@@ -1,6 +1,7 @@
 import inspect
 import math
 from types import SimpleNamespace
+from typing import Optional
 import random
 
 import pytest
@@ -1027,15 +1028,17 @@ def trtllm_mla_blackwell_reference(
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     softmax_scale: float,
+    page_size: int = 32,
+    sinks: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     kv_flat = kv_cache.reshape(-1, 576)
     outputs = []
     for batch_index in range(query.shape[0]):
         seq_len = int(seq_lens[batch_index].item())
-        pages = block_tables[batch_index, : (seq_len + 31) // 32]
+        pages = block_tables[batch_index, : (seq_len + page_size - 1) // page_size]
         indices = (
-            pages[:, None] * 32
-            + torch.arange(32, device=query.device, dtype=torch.int32)[None, :]
+            pages[:, None] * page_size
+            + torch.arange(page_size, device=query.device, dtype=torch.int32)[None, :]
         ).reshape(-1)[:seq_len]
         batch_outputs = []
         for query_index in range(query.shape[1]):
@@ -1051,7 +1054,12 @@ def trtllm_mla_blackwell_reference(
                 query[batch_index, query_index, :, 512:].float(),
                 kv[:, 512:].float(),
             )
-            probabilities = F.softmax(logits * softmax_scale, dim=-1)
+            logits = logits * softmax_scale
+            if sinks is not None:
+                # The sink is one extra logit per head that takes probability
+                # mass but contributes no value.
+                logits = torch.cat([logits, sinks.float()[:, None]], dim=-1)
+            probabilities = F.softmax(logits, dim=-1)[:, : kv.shape[0]]
             batch_outputs.append(
                 torch.einsum("hk,kd->hd", probabilities, kv[:, :512].float())
             )
@@ -2061,12 +2069,117 @@ def test_trtllm_mla_blackwell_page64_split_plan_is_size_based() -> None:
     assert plan_num_split(1, 128, 148) == 2
 
 
+_SMEM_FILL_SOURCE = r"""
+#include <torch/extension.h>
+
+__global__ void fill_shared_memory(int bytes) {
+  extern __shared__ unsigned char smem[];
+  for (int i = threadIdx.x; i < bytes; i += blockDim.x) smem[i] = 0x7F;
+  __syncthreads();
+}
+
+void fill_shared_memory_of_every_sm() {
+  int device = 0, sms = 0, bytes = 0;
+  cudaGetDevice(&device);
+  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+  cudaDeviceGetAttribute(&bytes, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+  cudaFuncSetAttribute(fill_shared_memory, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+  fill_shared_memory<<<4 * sms, 1024, bytes>>>(bytes);
+}
+"""
+
+
+@pytest.mark.parametrize("kv_lens", [(600, 2), (2, 600)])
+def test_trtllm_mla_blackwell_fp8_page64_empty_splits(kv_lens) -> None:
+    """A row with fewer KV tiles than splits has empty splits; they must not touch its output.
+
+    The split count is planned from the longest row, so the 2-key row's single tile leaves two of its three splits
+    empty. Every SM's shared memory is filled with 0x7F bytes (an FP8 E4M3 NaN) right before each of eight calls, so a
+    split that reads stale shared memory instead of skipping its PV turns the whole row non-finite. The 2-key row's two
+    keys are identical, so its output is that key's value row whichever of its keys the route attends.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("TRT-LLM MLA Blackwell requires CUDA")
+    if get_compute_capability(torch.device("cuda")) not in {(10, 0), (10, 3)}:
+        pytest.skip("TRT-LLM MLA Blackwell requires SM100a or SM103a")
+    from torch.utils.cpp_extension import load_inline
+
+    from flashinfer.mla.cake_trtllm_mla_blackwell import plan_num_split
+
+    smem_fill = load_inline(
+        name="test_trtllm_mla_blackwell_smem_fill",
+        cpp_sources=["void fill_shared_memory_of_every_sm();"],
+        cuda_sources=[_SMEM_FILL_SOURCE],
+        functions=["fill_shared_memory_of_every_sm"],
+        verbose=False,
+    )
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    page_size, max_seq_len = 64, max(kv_lens)
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    assert plan_num_split(len(kv_lens), max_seq_len, sms) == 3
+    pages = -(-max_seq_len // page_size)
+    query = (torch.randn(len(kv_lens), 1, 128, 576, device=device) * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    kv_cache = (
+        torch.randn(len(kv_lens) * pages, page_size, 576, device=device) * 0.5
+    ).to(torch.float8_e4m3fn)
+    block_tables = torch.arange(
+        len(kv_lens) * pages, dtype=torch.int32, device=device
+    ).reshape(len(kv_lens), pages)
+    short = kv_lens.index(2)
+    kv_cache[block_tables[short, 0], 1] = kv_cache[block_tables[short, 0], 0]
+
+    def decode():
+        return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=query,
+            kv_cache=kv_cache,
+            workspace_buffer=torch.empty(1, dtype=torch.uint8, device=device),
+            qk_nope_head_dim=128,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            block_tables=block_tables,
+            seq_lens=torch.tensor(kv_lens, dtype=torch.int32, device=device),
+            max_seq_len=max_seq_len,
+            bmm1_scale=1.0 / (192**0.5),
+            bmm2_scale=1.0,
+            backend="cake",
+        )
+
+    decode()  # builds the route and its plan before shared memory is filled
+    for _ in range(8):
+        smem_fill.fill_shared_memory_of_every_sm()
+        output = decode()
+        assert output.isfinite().all()
+    keys = kv_cache.float().reshape(-1, 576)
+    for batch, kv_len in enumerate(kv_lens):
+        tokens = (
+            block_tables[batch, :, None] * page_size
+            + torch.arange(page_size, device=device)[None, :]
+        ).reshape(-1)
+        visible = keys[tokens[:kv_len].long()]
+        probabilities = torch.softmax(
+            query[batch, 0].float() @ visible.T / (192**0.5), dim=-1
+        )
+        reference = (probabilities @ visible[:, :512]).to(torch.bfloat16)
+        torch.testing.assert_close(output[batch, 0], reference, rtol=0.1, atol=0.1)
+
+
 @pytest.mark.parametrize(
-    "batch_size,q_len_per_request",
-    [(1, 4), (1, 8), (4, 2), (4, 4), (4, 8), (4, 16)],
+    "batch_size,q_len_per_request,page_size,enable_sink",
+    [
+        (1, 4, 32, False),
+        (1, 8, 32, False),
+        (4, 2, 32, False),
+        (4, 4, 32, False),
+        (4, 8, 32, False),
+        (4, 16, 32, False),
+        (1, 1, 64, True),
+    ],
 )
 def test_trtllm_mla_blackwell_bf16_dispatch(
-    batch_size: int, q_len_per_request: int
+    batch_size: int, q_len_per_request: int, page_size: int, enable_sink: bool
 ) -> None:
     if not torch.cuda.is_available():
         pytest.skip("TRT-LLM MLA Blackwell requires CUDA")
@@ -2075,20 +2188,27 @@ def test_trtllm_mla_blackwell_bf16_dispatch(
 
     device = torch.device("cuda")
     torch.manual_seed(42)
-    page_size = 32
     max_seq_len = 1024
     pages_per_sequence = max_seq_len // page_size
+    # Inputs of magnitude 0.5 give a peaked softmax, so a score read from the
+    # wrong keys moves the output well past the tolerance; near-uniform
+    # probabilities from small inputs would hide it.
     query = (
-        torch.randn(batch_size, q_len_per_request, 128, 576, device=device) * 0.05
+        torch.randn(batch_size, q_len_per_request, 128, 576, device=device) * 0.5
     ).to(torch.bfloat16)
     kv_cache = (
         torch.randn(batch_size * pages_per_sequence, page_size, 576, device=device)
-        * 0.05
+        * 0.5
     ).to(torch.bfloat16)
     block_tables = torch.arange(
         batch_size * pages_per_sequence, dtype=torch.int32, device=device
     ).reshape(batch_size, pages_per_sequence)
     seq_lens = torch.full((batch_size,), max_seq_len, dtype=torch.int32, device=device)
+    sinks = (
+        torch.randn(128, dtype=torch.float32, device=device) * 2.0
+        if enable_sink
+        else None
+    )
     workspace = torch.empty(1, dtype=torch.uint8, device=device)
     bmm1_scale = 1.0 / (192**0.5)
 
@@ -2104,13 +2224,80 @@ def test_trtllm_mla_blackwell_bf16_dispatch(
         max_seq_len=max_seq_len,
         bmm1_scale=bmm1_scale,
         bmm2_scale=1.0,
+        sinks=[sinks] if enable_sink else None,
         backend="cake",
     )
     reference = trtllm_mla_blackwell_reference(
-        query, kv_cache, block_tables, seq_lens, bmm1_scale
+        query, kv_cache, block_tables, seq_lens, bmm1_scale, page_size, sinks
     )
     assert output.shape == (batch_size, q_len_per_request, 128, 512)
     torch.testing.assert_close(output, reference, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("q_len_per_request", [1, 2])
+def test_trtllm_mla_blackwell_fp8_page64_attends_the_last_key(
+    q_len_per_request: int,
+) -> None:
+    """Every query row of the FP8 page-64 route attends its causal keys, the last one included.
+
+    The last key of each request is aimed at head 0's query of the request's last row, so its logit dominates: a route
+    that drops it moves head 0's output by about the whole value range, far beyond the FP8 tolerance.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("TRT-LLM MLA Blackwell requires CUDA")
+    if get_compute_capability(torch.device("cuda")) not in {(10, 0), (10, 3)}:
+        pytest.skip("TRT-LLM MLA Blackwell requires SM100a or SM103a")
+
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    page_size, batch_size, max_seq_len = 64, 2, 1024
+    pages = max_seq_len // page_size
+    query = (
+        torch.randn(batch_size, q_len_per_request, 128, 576, device=device) * 0.5
+    ).to(torch.float8_e4m3fn)
+    kv_cache = (
+        torch.randn(batch_size * pages, page_size, 576, device=device) * 0.5
+    ).to(torch.float8_e4m3fn)
+    block_tables = torch.arange(
+        batch_size * pages, dtype=torch.int32, device=device
+    ).reshape(batch_size, pages)
+    kv_lens = [max_seq_len, 600]
+    for batch, kv_len in enumerate(kv_lens):
+        page, slot = divmod(kv_len - 1, page_size)
+        kv_cache[block_tables[batch, page], slot] = (
+            (query[batch, -1, 0].float() * 6).clamp(-400, 400).to(torch.float8_e4m3fn)
+        )
+    seq_lens = torch.tensor(kv_lens, dtype=torch.int32, device=device)
+    bmm1_scale = 1.0 / (192**0.5)
+
+    output = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+        query=query,
+        kv_cache=kv_cache,
+        workspace_buffer=torch.empty(1, dtype=torch.uint8, device=device),
+        qk_nope_head_dim=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=max_seq_len,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=1.0,
+        backend="cake",
+    )
+    keys = kv_cache.float().reshape(-1, 576)
+    for batch, kv_len in enumerate(kv_lens):
+        tokens = (
+            block_tables[batch, :, None] * page_size
+            + torch.arange(page_size, device=device)[None, :]
+        ).reshape(-1)
+        for row in range(q_len_per_request):
+            visible = keys[tokens[: kv_len - q_len_per_request + row + 1].long()]
+            q = query[batch, row].float()
+            probabilities = torch.softmax(q @ visible.T * bmm1_scale, dim=-1)
+            reference = (probabilities @ visible[:, :512]).to(torch.bfloat16)
+            torch.testing.assert_close(
+                output[batch, row], reference, rtol=0.1, atol=0.1
+            )
 
 
 @pytest.mark.parametrize(

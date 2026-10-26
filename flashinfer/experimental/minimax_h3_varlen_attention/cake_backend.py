@@ -79,6 +79,32 @@ Two program families share this package:
   one the plan needs with that program's parameter set
   (:func:`nvfp4_attention_stage`).
 
+The BF16 route also carries several programs per architecture (round 13 of
+the Cake kernel): three retraces of one Weave body with identical outputs --
+``attention`` (the static persistent schedule), ``attention_dyn`` (the dynamic
+whole-unit ticket scheduler: the first wave stays static, then the leader
+CTA's load warp draws the cluster's next unit from a per-plan ticket counter
+one unit ahead of its use; units are handed out in the LPT slot order, so
+only a unit's cluster changes) and, on ``BF16_SREAD_ARCHES`` (sm_100a) only,
+``attention_sread`` (the stage-0 cross-stage read wait issued before every P
+store, no per-block guard on the publish tail).
+:func:`build_bf16_segment_plan` decides from the plan numbers alone
+(``plan.dyn_sched``: at least ``BF16_DYN_SCHED_MIN_WAVES`` waves and
+``BF16_DYN_SCHED_MIN_CLUSTER_BLOCKS`` stage-weighted K/V blocks in every
+cluster's static share, then at least ``BF16_DYN_SCHED_MIN_UNITS_PER_CLUSTER``
+units per cluster or a static cluster imbalance above the cheapest unit;
+``plan.sread_unified`` is its complement) and
+:func:`prepare_minimax_h3_varlen_attention` binds that one program
+(``runner.attention_stage``, ``route_metadata["attention_variant"]``).  Every
+BF16 ``unit_table`` carries one more zero record after the ``num_clusters``
+prefetch padding: word 0 is the ticket counter, which the kernel resets at
+the end of every launch, so a cached plan needs no host memset.  The
+``attention_dyn`` program also uses word 6 of padding record ``c`` as
+cluster ``c``'s ticket mailbox and leaves the terminal ticket there, so
+the padding of a launched plan is launch state, not zeros.  Launches of
+one plan are stream-ordered (the plan cache keys the stream); never launch
+one cached plan concurrently from two streams.
+
 See ``README.md`` in this package and flashinfer-ai/flashinfer#4532.
 """
 
@@ -94,10 +120,13 @@ import torch
 import tvm_ffi
 
 from .cake_jit import (
+    BF16_SREAD_ARCHES,
+    FP8_TINY_SEGMENT_TOKENS,
     MODULES,
     STAGES,
     load_cake_minimax_h3_varlen_attention_module,
     route_available,
+    route_program,
     select_route,
 )
 
@@ -150,6 +179,25 @@ BF16_Q_SPLIT_MIN_GAIN = 0.005
 # next unit).
 UNIT_WORDS = 8
 COMBINE_WORDS = 4
+# Per-plan BF16 program dispatch (mirrors the Cake production planner's
+# ``dyn_sched_for_records`` / ``sread_unified_for_plan``, round 13): a plan
+# binds the dynamic whole-unit ticket scheduler (``attention_dyn``) when it
+# has at least ``BF16_DYN_SCHED_MIN_WAVES`` waves and every cluster's static
+# share is at least ``BF16_DYN_SCHED_MIN_CLUSTER_BLOCKS`` stage-weighted K/V
+# blocks (a two-stage unit counts its blocks twice) and then either the
+# fullest cluster runs at least ``BF16_DYN_SCHED_MIN_UNITS_PER_CLUSTER`` units
+# or the static LPT order is provably not makespan-optimal (its cluster
+# imbalance ``W_max - W_min`` exceeds the cheapest unit's weight).  The ticket
+# chain costs a fixed ~2.5 us at a cluster's first unit, so one-wave plans and
+# plans of many small units keep the static schedule.  Every other plan
+# records ``sread_unified`` and binds ``attention_sread`` on
+# ``BF16_SREAD_ARCHES`` (``cake_jit``).
+BF16_DYN_SCHED_MIN_WAVES = 2
+BF16_DYN_SCHED_MIN_CLUSTER_BLOCKS = 8192
+BF16_DYN_SCHED_MIN_UNITS_PER_CLUSTER = 64
+# Rows of one CTA's Q stage: a unit with at most this many valid rows from its
+# first row runs a single stage (the kernel's record decode, ``two_stages``).
+CTA_Q_ROWS = CLUSTER_Q_ROWS // 2
 PARTIAL_ROWS = CLUSTER_Q_ROWS  # FP16 rows per partial slot (one cluster's Q rows)
 MAX_KV_SPLITS = 8
 MAX_KV_BLOCKS = 1 << 16
@@ -195,11 +243,13 @@ QUANTIZE_STAGES = ("amax", "quantize")
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 
 QK_MMA_DTYPE = {
+    "fp8": "f8f6f4 e4m3 x e4m3, per-tensor q_descale * k_descale in the exponent",
     "bf16": "f16 bf16 x bf16",
     "nvfp4_fp4pv": "mxf4nvf4 e2m1 x e2m1, ue4m3 block-16 scales",
     "nvfp4_fp8pv": "mxf4nvf4 e2m1 x e2m1, ue4m3 block-16 scales",
 }
 PV_MMA_DTYPE = {
+    "fp8": "f8f6f4 e4m3 P (unit scale) x e4m3, per-tensor v_descale in the epilogue",
     "bf16": "f16 bf16 x bf16",
     "nvfp4_fp4pv": "mxf4nvf4 e2m1 x e2m1, ue4m3 block-16 scales (tile-max P scale)",
     "nvfp4_fp8pv": "f8f6f4 e4m3 x e4m3, per-tensor v_scale",
@@ -221,7 +271,26 @@ BF16_ATTENTION_KWARGS = (
     "softmax_scale_log2",
     "grid",
 )
-# K/V-split combine stage shared by all three program families.
+# The all-FP8 attention program: the BF16 program's bindings plus the three
+# per-tensor descales (one-element FP32 device tensors).
+FP8_ATTENTION_KWARGS = (
+    "Q",
+    "K",
+    "V",
+    "O",
+    "O_raw",
+    "unit_table",
+    "partial_O",
+    "partial_ML",
+    "q_descale",
+    "k_descale",
+    "v_descale",
+    "total_tiles",
+    "num_heads",
+    "softmax_scale_log2",
+    "grid",
+)
+# K/V-split combine stage shared by all program families.
 COMBINE_KWARGS = (
     "partial_O",
     "partial_ML",
@@ -358,7 +427,14 @@ class BF16SegmentPlan:
     two reserved words -- in slot order: unit ``u`` of the table runs on
     cluster ``u % num_clusters`` as its ``u // num_clusters``-th unit (see
     :func:`assign_unit_slots`), followed by ``num_clusters`` zero records (the
-    kernel's one-unit-ahead record prefetch).  ``total_tiles`` counts scheduled
+    kernel's one-unit-ahead record prefetch; the ``attention_dyn`` program uses
+    word 6 of padding record ``c`` as cluster ``c``'s ticket mailbox and leaves
+    the terminal ticket there) and one more zero record whose word 0 is the
+    dynamic scheduler's ticket counter (reset by the kernel at the end of
+    every launch).  ``dyn_sched`` / ``sread_unified`` record which
+    attention program the plan binds (``BF16_DYN_SCHED_MIN_WAVES`` and
+    below; ``sread_unified`` applies on ``BF16_SREAD_ARCHES`` only, see
+    :func:`bf16_attention_stage`).  ``total_tiles`` counts scheduled
     units (K/V ranges and Q-split halves included; ``num_q_split_units`` counts
     the halved units); ``combine_table`` holds ``COMBINE_WORDS`` int32
     per split (segment, head, cluster) unit and ``partial_O`` / ``partial_ML``
@@ -381,6 +457,8 @@ class BF16SegmentPlan:
     num_combine_units: int
     max_kv_splits: int
     num_q_split_units: int
+    dyn_sched: bool
+    sread_unified: bool
 
 
 @functools.cache
@@ -606,6 +684,64 @@ def bf16_choose_q_splits(
     return flags
 
 
+def bf16_unit_weights(table: Sequence[int]) -> list[int]:
+    """Per-slot stage-weighted K/V blocks of a unit table (a two-stage unit counts its blocks twice).
+
+    Mirrors the Cake planner's ``unit_weights``: ``two_stages`` is the kernel's record decode
+    (``q_half == 0`` and more than ``CTA_Q_ROWS`` valid rows from the unit's first row).
+    """
+    weights: list[int] = []
+    for slot in range(len(table) // UNIT_WORDS):
+        words = table[slot * UNIT_WORDS : (slot + 1) * UNIT_WORDS]
+        seg_len, c, kv_blocks, q_half = (
+            words[1],
+            words[2] & 0xFFFF,
+            words[3] & 0xFFFF,
+            words[5],
+        )
+        unit_row0 = c * CLUSTER_Q_ROWS + (q_half >> 1) * CTA_Q_ROWS
+        two_stages = q_half == 0 and seg_len - unit_row0 > CTA_Q_ROWS
+        weights.append(kv_blocks * (2 if two_stages else 1))
+    return weights
+
+
+def bf16_cluster_work(table: Sequence[int], num_clusters: int) -> list[int]:
+    """Per-cluster work of the static slot order (slot ``k * G + i`` is unit ``k`` of cluster ``i``)."""
+    G = max(1, int(num_clusters))
+    work = [0] * G
+    for slot, weight in enumerate(bf16_unit_weights(table)):
+        work[slot % G] += weight
+    return work
+
+
+def bf16_dyn_sched(table: Sequence[int], total_tiles: int, num_clusters: int) -> bool:
+    """Whether a plan binds the dynamic whole-unit ticket scheduler (mirrors ``dyn_sched_for_records``).
+
+    ``table`` holds the ``total_tiles`` scheduled unit records (no padding records).
+    """
+    total_tiles, num_clusters = int(total_tiles), int(num_clusters)
+    if num_clusters <= 0 or total_tiles < BF16_DYN_SCHED_MIN_WAVES * num_clusters:
+        return False
+    weights = bf16_unit_weights(table)
+    work = [0] * num_clusters
+    for slot, weight in enumerate(weights):
+        work[slot % num_clusters] += weight
+    if min(work) < BF16_DYN_SCHED_MIN_CLUSTER_BLOCKS:
+        return False
+    if -(-total_tiles // num_clusters) >= BF16_DYN_SCHED_MIN_UNITS_PER_CLUSTER:
+        return True
+    return max(work) - min(work) > min(weights)
+
+
+def bf16_attention_stage(plan: "BF16SegmentPlan", arch: str) -> str:
+    """The attention program ``plan`` binds on ``arch``: ``attention_dyn``, ``attention_sread`` or ``attention``."""
+    if plan.dyn_sched:
+        return "attention_dyn"
+    if plan.sread_unified and arch in BF16_SREAD_ARCHES:
+        return "attention_sread"
+    return "attention"
+
+
 def build_bf16_segment_plan(
     cu_seqlens: Union[torch.Tensor, Sequence[int]],
     device: torch.device,
@@ -724,6 +860,8 @@ def build_bf16_segment_plan(
             )
         )
     partial_O, partial_ML = _partial_workspace(partial_slots, device)
+    # Per-plan program dispatch from the scheduled records (see ``bf16_dyn_sched``).
+    dyn_sched = bf16_dyn_sched(table, total_tiles, num_clusters)
     return BF16SegmentPlan(
         cu_seqlens=bounds,
         num_heads=num_heads,
@@ -733,10 +871,14 @@ def build_bf16_segment_plan(
         num_clusters=num_clusters,
         seg_begin=_table(begins, device),
         seg_len=_table(lens, device),
-        # ``num_clusters`` zero records of padding: every kernel role prefetches
-        # the record of its next unit (``tile_idx + num_clusters``).
+        # ``num_clusters`` zero records of padding (every kernel role prefetches
+        # the record of its next unit, ``tile_idx + num_clusters``; the
+        # ``attention_dyn`` program keeps cluster ``c``'s ticket mailbox in word 6
+        # of padding record ``c``) and one more zero record whose word 0 is the
+        # dynamic scheduler's ticket counter (reset by the kernel at the end of
+        # every launch).
         unit_table=torch.tensor(
-            (table or [0] * UNIT_WORDS) + [0] * (UNIT_WORDS * num_clusters),
+            (table or [0] * UNIT_WORDS) + [0] * (UNIT_WORDS * (num_clusters + 1)),
             dtype=torch.int32,
             device=device,
         ),
@@ -749,6 +891,9 @@ def build_bf16_segment_plan(
         num_combine_units=len(combine) // COMBINE_WORDS,
         max_kv_splits=max(split_of, default=1),
         num_q_split_units=num_q_split_units,
+        dyn_sched=dyn_sched,
+        # Recorded arch-independently; the launcher applies ``BF16_SREAD_ARCHES``.
+        sread_unified=not dyn_sched,
     )
 
 
@@ -775,6 +920,9 @@ def cached_bf16_segment_plan(
     The key includes the current CUDA stream: launches of one plan are
     stream-ordered on their stream (a K/V-split plan's partial workspace is
     rewritten by every launch) and concurrent streams never share a plan.
+    The dynamic scheduler's ticket counter (word 0 of the plan's last
+    ``unit_table`` record) is rewritten by every launch as well and left at
+    zero by the kernel, so a cached plan needs no host reset.
     """
     index = _device_index(device)
     q_split = bool(BF16_Q_SPLIT_PLAN) if q_split is None else bool(q_split)
@@ -1229,6 +1377,19 @@ def _persistent_grid(
     return (2 * pairs, 1, 1)
 
 
+def minimax_h3_varlen_fp8_launch_grid(
+    num_sms: int, *, total_tiles: int
+) -> tuple[int, int, int]:
+    """Launch grid of the ``fp8`` attention programs on a device of ``num_sms`` SMs
+    for a plan of ``total_tiles`` units: ``2 * num_clusters`` CTAs (one 2-CTA
+    cluster per persistent slot) with ``num_clusters = min(max(1, num_sms // 2),
+    max(total_tiles, 1))`` -- the BF16 planner's cluster count
+    (:func:`bf16_grid_clusters` capped by the unit count).  The export parity lane
+    names this function as the route's grid rule."""
+    pairs = min(max(1, int(num_sms) // 2), max(int(total_tiles), 1))
+    return (2 * pairs, 1, 1)
+
+
 # Element multiple that keeps a BF16 stride 16-byte aligned (TMA global
 # strides and the BF16 kernel's 16-byte ragged-tail copies).
 THD_STRIDE_ALIGN = 16 // 2
@@ -1242,8 +1403,9 @@ def _check_thd(
     device: torch.device,
     *,
     contiguous: bool,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> None:
-    """Validate one ``[T, H, 128]`` BF16 operand.
+    """Validate one ``[T, H, 128]`` operand of ``dtype`` (BF16, or E4M3 for the ``fp8`` route).
 
     ``contiguous=False`` accepts any view with unit innermost stride, a head
     stride that is a 16-byte multiple of at least 128 elements, a token
@@ -1251,12 +1413,14 @@ def _check_thd(
     16-byte-aligned base: contiguous tensors, the column slices of a fused
     ``[T, 3 * H * 128]`` QKV projection (strides ``(3 * H * 128, 128, 1)``)
     and the slices of a ``[T, H, 3, 128]`` pack (strides ``(H * 384, 384,
-    1)``).  ``contiguous=True`` additionally requires a contiguous tensor.
+    1)``).  ``contiguous=True`` additionally requires a contiguous tensor.  The
+    16-byte stride rule is in bytes: 8 elements for BF16, 16 for E4M3.
     """
     if not tensor.is_cuda or tensor.device != device:
         raise ValueError(f"{name} must live on {device}")
-    if tensor.dtype != torch.bfloat16:
-        raise ValueError(f"{name} must be a bfloat16 tensor")
+    if tensor.dtype != dtype:
+        raise ValueError(f"{name} must be a {str(dtype).removeprefix('torch.')} tensor")
+    stride_align = 16 // tensor.element_size()
     if tuple(tensor.shape) != (total_tokens, num_heads, HEAD_DIM):
         raise ValueError(
             f"{name} must be [T, H, {HEAD_DIM}] = {(total_tokens, num_heads, HEAD_DIM)}, "
@@ -1267,12 +1431,12 @@ def _check_thd(
         raise ValueError(
             f"{name} must have a unit innermost stride, got stride(2)={elem_stride}"
         )
-    if head_stride < HEAD_DIM or head_stride % THD_STRIDE_ALIGN:
+    if head_stride < HEAD_DIM or head_stride % stride_align:
         raise ValueError(
             f"{name} head stride must be a 16-byte multiple of at least {HEAD_DIM} "
             f"elements, got {head_stride}"
         )
-    if row_stride < num_heads * head_stride or row_stride % THD_STRIDE_ALIGN:
+    if row_stride < num_heads * head_stride or row_stride % stride_align:
         raise ValueError(
             f"{name} token stride must be a 16-byte multiple of at least "
             f"H * head_stride = {num_heads * head_stride} elements, got {row_stride}"
@@ -1292,8 +1456,9 @@ def validate_minimax_h3_varlen_inputs(
     out: Optional[torch.Tensor],
     *,
     strided_qkv: bool,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[int, int, torch.device]:
-    """Shape / dtype / device validation shared by both families.
+    """Shape / dtype / device validation shared by the families (``dtype`` of ``query`` / ``key`` / ``value``).
 
     ``strided_qkv=True`` (the BF16 route) accepts strided ``[T, H, 128]``
     views for ``query`` / ``key`` / ``value`` (see ``_check_thd``; the three
@@ -1309,7 +1474,13 @@ def validate_minimax_h3_varlen_inputs(
     device = query.device
     for name, tensor in (("query", query), ("key", key), ("value", value)):
         _check_thd(
-            name, tensor, total_tokens, num_heads, device, contiguous=not strided_qkv
+            name,
+            tensor,
+            total_tokens,
+            num_heads,
+            device,
+            contiguous=not strided_qkv,
+            dtype=dtype,
         )
     if out is not None:
         _check_thd("out", out, total_tokens, num_heads, device, contiguous=True)
@@ -1336,6 +1507,7 @@ class MiniMaxH3VarlenAttentionRunner:
     arch: str
     plan: BF16SegmentPlan
     main_kwargs: dict
+    attention_stage: str
     out: torch.Tensor
     _entry: Optional[Callable[..., Any]]
     _arguments: tuple
@@ -1371,6 +1543,68 @@ class MiniMaxH3VarlenAttentionRunner:
             kv_split_units=self.plan.num_combine_units,
             max_kv_splits=self.plan.max_kv_splits,
             q_split_units=self.plan.num_q_split_units,
+            attention_variant=self.attention_stage,
+            dyn_sched=bool(self.plan.dyn_sched),
+            sread_unified=bool(self.plan.sread_unified)
+            and self.arch in BF16_SREAD_ARCHES,
+        )
+
+
+@dataclass(frozen=True)
+class MiniMaxH3VarlenFP8AttentionRunner:
+    """Launch the prepared all-FP8 packed-varlen attention (``variant="fp8"``).
+
+    Calling the runner or ``launch()`` writes the caller-owned ``out`` on the
+    current stream with no CUDA allocation and no host synchronization and
+    returns ``out``.  The segment plan and the descales are fixed at
+    preparation (the descale tensors are read by the kernel at every launch,
+    so their values may change freely); prepare a new runner when
+    ``cu_seqlens``, shapes or tensor bindings change.  CUDA Graph capture
+    belongs to the caller.
+    """
+
+    variant: str
+    arch: str
+    plan: BF16SegmentPlan
+    main_kwargs: dict
+    attention_stage: str
+    out: torch.Tensor
+    _entry: Optional[Callable[..., Any]]
+    _arguments: tuple
+    _combine_entry: Optional[Callable[..., Any]] = None
+    _combine_arguments: tuple = ()
+
+    def launch(self) -> torch.Tensor:
+        if self._entry is not None:  # zero tiles: nothing to launch
+            with tvm_ffi.use_torch_stream():
+                self._entry(*self._arguments)
+                if self._combine_entry is not None:  # K/V-split units to merge
+                    self._combine_entry(*self._combine_arguments)
+        return self.out
+
+    __call__ = launch
+
+    @property
+    def num_ctas(self) -> int:
+        return int(self.main_kwargs["grid"][0])
+
+    @property
+    def route_metadata(self) -> dict[str, Any]:
+        return dict(
+            variant=self.variant,
+            arch=self.arch,
+            qk_mma_dtype=QK_MMA_DTYPE[self.variant],
+            pv_mma_dtype=PV_MMA_DTYPE[self.variant],
+            segment_count=self.plan.num_segments,
+            cluster_tiles=self.plan.total_clusters,
+            unit_count=self.plan.total_tiles,
+            persistent_clusters=self.plan.num_clusters,
+            kv_split_units=self.plan.num_combine_units,
+            max_kv_splits=self.plan.max_kv_splits,
+            q_split_units=self.plan.num_q_split_units,
+            attention_variant=self.attention_stage,
+            dyn_sched=False,
+            sread_unified=False,
         )
 
 
@@ -1477,6 +1711,168 @@ def nvfp4_attention_stage(tiles: TileTables) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _descale_tensor(
+    name: str, value: Union[float, torch.Tensor], device: torch.device
+) -> torch.Tensor:
+    """One finite positive FP32 descale as a one-element CUDA tensor on ``device`` (a float is uploaded once, at
+    preparation; a tensor is passed through and read by the kernel at every launch)."""
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1 or value.dtype != torch.float32:
+            raise ValueError(
+                f"{name} must be a one-element float32 tensor, got {tuple(value.shape)} {value.dtype}"
+            )
+        if not value.is_cuda or value.device != device:
+            raise ValueError(f"{name} must live on {device}")
+        return value.reshape(1)
+    scale = float(value)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError(f"{name} must be a finite positive descale, got {value!r}")
+    return torch.tensor([scale], dtype=torch.float32, device=device)
+
+
+def fp8_attention_stage(bounds: Sequence[int]) -> str:
+    """The ``fp8`` route's attention program for a plan: ``attention_tiny`` (the ``tail_skip=32`` build) when every
+    segment has at most ``FP8_TINY_SEGMENT_TOKENS`` tokens -- every K/V block is then a tail block and the output is
+    bitwise the general program's -- else ``attention``."""
+    longest = max((b - a for a, b in zip(bounds, bounds[1:], strict=False)), default=0)
+    return "attention_tiny" if longest <= FP8_TINY_SEGMENT_TOKENS else "attention"
+
+
+def _bind_in_tree(
+    program: Any, target: str, kwargs: dict[str, Any]
+) -> tuple[Callable[..., Any], tuple]:
+    """Order ``kwargs`` by the generated program's argument order (``CakeProgram.args``: the binding's host
+    parameters followed by the grid triple) and resolve its entry for ``target``."""
+    grid = dict(zip(("grid_x", "grid_y", "grid_z"), kwargs["grid"], strict=True))
+    arguments = []
+    for name in program.args:
+        if name in grid:
+            arguments.append(grid[name])
+        elif name in kwargs:
+            arguments.append(kwargs[name])
+        else:
+            raise KeyError(
+                f"generated program {program.name!r} expects argument {name!r}; "
+                f"host binding provides {sorted(kwargs)}"
+            )
+    return program.entry(target), tuple(arguments)
+
+
+def prepare_minimax_h3_varlen_fp8_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_seqlens: Union[torch.Tensor, Sequence[int]],
+    *,
+    q_descale: Union[float, torch.Tensor],
+    k_descale: Union[float, torch.Tensor],
+    v_descale: Union[float, torch.Tensor],
+    softmax_scale: Optional[float] = None,
+    out: Optional[torch.Tensor] = None,
+    cu_seqlens_host: Optional[Sequence[int]] = None,
+    backend: str = "cake",
+) -> MiniMaxH3VarlenFP8AttentionRunner:
+    """Validate, plan and bind one all-FP8 packed-varlen attention problem.
+
+    ``query`` / ``key`` / ``value`` are E4M3 (``torch.float8_e4m3fn``) ``[T, H,
+    128]`` tensors or strided views of them (unit innermost stride, 16-byte
+    aligned head / token strides and base, as the BF16 route; the three may
+    differ in strides) with one per-tensor FP32 descale each: the kernel folds
+    ``q_descale * k_descale`` into the softmax exponent and ``v_descale`` into
+    the output scale, the probabilities are E4M3 at unit scale and ``out`` is
+    BF16.  The segment plan is the BF16 planner's (:func:`cached_bf16_segment_plan`,
+    shared cache); the attention program is the general one, or its tiny-plan
+    build when every segment has at most ``FP8_TINY_SEGMENT_TOKENS`` tokens
+    (:func:`fp8_attention_stage`), and K/V-split units are merged by the BF16
+    route's combine program.  Preparation allocates the optional ``out`` and
+    the descale tensors given as floats; the returned runner launches with no
+    allocation.
+    """
+    if backend != "cake":
+        raise ValueError("MiniMax-H3 varlen FP8 attention supports backend='cake'")
+    total_tokens, num_heads, device = validate_minimax_h3_varlen_inputs(
+        query, key, value, out, strided_qkv=True, dtype=torch.float8_e4m3fn
+    )
+    if isinstance(cu_seqlens, torch.Tensor) and (
+        not cu_seqlens.is_cuda or cu_seqlens.device != device
+    ):
+        raise ValueError("cu_seqlens must be an int32 CUDA tensor on the query device")
+    bounds = normalize_cu_seqlens(
+        cu_seqlens, total_tokens=total_tokens, cu_seqlens_host=cu_seqlens_host
+    )
+    arch = _arch_for(device)
+    route = select_route("fp8", arch)
+    if softmax_scale is None:
+        softmax_scale = HEAD_DIM**-0.5
+    if out is None:
+        out = torch.empty(
+            (total_tokens, num_heads, HEAD_DIM), dtype=torch.bfloat16, device=device
+        )
+    descales = (
+        _descale_tensor("q_descale", q_descale, device),
+        _descale_tensor("k_descale", k_descale, device),
+        _descale_tensor("v_descale", v_descale, device),
+    )
+    plan = cached_bf16_segment_plan(bounds, device, num_heads)
+    total_tiles = int(plan.total_tiles)
+    main_kwargs = dict(
+        Q=query,
+        K=key,
+        V=value,
+        O=out,
+        O_raw=out,
+        unit_table=plan.unit_table,
+        partial_O=plan.partial_O,
+        partial_ML=plan.partial_ML,
+        q_descale=descales[0],
+        k_descale=descales[1],
+        v_descale=descales[2],
+        total_tiles=total_tiles,
+        num_heads=num_heads,
+        softmax_scale_log2=float(softmax_scale) / math.log(2.0),
+        grid=minimax_h3_varlen_fp8_launch_grid(
+            _device_facts(_device_index(device))[0], total_tiles=total_tiles
+        ),
+    )
+    assert tuple(main_kwargs) == FP8_ATTENTION_KWARGS
+    assert main_kwargs["grid"][0] == 2 * int(plan.num_clusters)
+    attention_stage = fp8_attention_stage(bounds)
+    entry: Optional[Callable[..., Any]] = None
+    arguments: tuple = ()
+    combine_entry: Optional[Callable[..., Any]] = None
+    combine_arguments: tuple = ()
+    if total_tiles > 0:
+        program = route_program(route, attention_stage)
+        entry, arguments = _bind_in_tree(program, arch, main_kwargs)
+        if plan.num_combine_units > 0:
+            combine_entry, combine_arguments = _bind_stage(
+                route["modules"]["combine"],
+                arch,
+                combine_kwargs(
+                    plan.partial_O,
+                    plan.partial_ML,
+                    plan.combine_table,
+                    plan.seg_begin,
+                    plan.seg_len,
+                    out,
+                    num_heads,
+                    plan.num_combine_units,
+                ),
+            )
+    return MiniMaxH3VarlenFP8AttentionRunner(
+        "fp8",
+        arch,
+        plan,
+        main_kwargs,
+        attention_stage,
+        out,
+        entry,
+        arguments,
+        combine_entry,
+        combine_arguments,
+    )
+
+
 def prepare_minimax_h3_varlen_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -1537,12 +1933,18 @@ def prepare_minimax_h3_varlen_attention(
         grid=(2 * int(plan.num_clusters), 1, 1),
     )
     assert tuple(main_kwargs) == BF16_ATTENTION_KWARGS
+    attention_stage = bf16_attention_stage(plan, arch)
     entry: Optional[Callable[..., Any]] = None
     arguments: tuple = ()
     combine_entry: Optional[Callable[..., Any]] = None
     combine_arguments: tuple = ()
     if total_tiles > 0:
-        entry, arguments = _bind_stage(route["modules"]["attention"], arch, main_kwargs)
+        # Per-plan program dispatch: the plan's ``dyn_sched`` / ``sread_unified``
+        # flags and the arch filter select one of the route's BF16 attention
+        # programs (``bf16_attention_stage``).
+        entry, arguments = _bind_stage(
+            route["modules"][attention_stage], arch, main_kwargs
+        )
         if plan.num_combine_units > 0:
             combine_entry, combine_arguments = _bind_stage(
                 route["modules"]["combine"],
@@ -1563,6 +1965,7 @@ def prepare_minimax_h3_varlen_attention(
         arch,
         plan,
         main_kwargs,
+        attention_stage,
         out,
         entry,
         arguments,
@@ -1811,6 +2214,218 @@ def minimax_h3_varlen_attention(
         backend=backend,
     )
     return runner.launch()
+
+
+def minimax_h3_varlen_fp8_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_seqlens: Union[torch.Tensor, Sequence[int]],
+    *,
+    q_descale: Union[float, torch.Tensor],
+    k_descale: Union[float, torch.Tensor],
+    v_descale: Union[float, torch.Tensor],
+    softmax_scale: Optional[float] = None,
+    out: Optional[torch.Tensor] = None,
+    cu_seqlens_host: Optional[Sequence[int]] = None,
+    backend: str = "cake",
+) -> torch.Tensor:
+    """All-FP8 packed-varlen attention: :func:`prepare_minimax_h3_varlen_fp8_attention` then one launch."""
+    return prepare_minimax_h3_varlen_fp8_attention(
+        query,
+        key,
+        value,
+        cu_seqlens,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        softmax_scale=softmax_scale,
+        out=out,
+        cu_seqlens_host=cu_seqlens_host,
+        backend=backend,
+    ).launch()
+
+
+E4M3_MAX = 448.0
+_QUANT_CHUNK_ELEMENTS = (
+    1 << 28
+)  # FP32 staging chunk of the convenience quantizer (1 GiB)
+
+
+def quantize_minimax_h3_e4m3_per_tensor(
+    x: torch.Tensor,
+    *,
+    out: Optional[torch.Tensor] = None,
+    descale: Optional[torch.Tensor] = None,
+    staging: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-tensor E4M3 quantization of a BF16 ``[T, H, 128]`` tensor (or strided view) with torch ops.
+
+    ``descale = amax(|x|) / 448`` (one-element FP32 CUDA tensor, the value the FP8 route's ``*_descale`` arguments
+    take) and ``out = e4m3(clamp(x * 448 / amax))`` (contiguous ``torch.float8_e4m3fn``).  ``out`` / ``descale`` /
+    ``staging`` may be caller-owned so repeated quantization of one problem allocates nothing: ``staging`` is an FP32
+    buffer of at least ``min(numel, 2**28)`` elements.  No host synchronization: the amax stays on the device.
+    """
+    if x.dtype != torch.bfloat16 or x.dim() != 3 or x.shape[-1] != HEAD_DIM:
+        raise ValueError(
+            f"expected a BF16 [T, H, {HEAD_DIM}] tensor, got {tuple(x.shape)} {x.dtype}"
+        )
+    if out is None:
+        out = torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device)
+    elif (
+        out.shape != x.shape
+        or out.dtype != torch.float8_e4m3fn
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            "out must be a contiguous float8_e4m3fn tensor of the input's shape"
+        )
+    if descale is None:
+        descale = torch.empty(1, dtype=torch.float32, device=x.device)
+    amax = torch.linalg.vector_norm(x, ord=float("inf"), dtype=torch.float32)
+    amax = torch.clamp(amax, min=torch.finfo(torch.float32).tiny)
+    torch.div(amax, E4M3_MAX, out=descale.reshape(()))
+    scale = torch.reciprocal(descale.reshape(()))
+    rows = max(1, _QUANT_CHUNK_ELEMENTS // (x.shape[1] * HEAD_DIM))
+    T = x.shape[0]
+    n_stage = min(T, rows) * x.shape[1] * HEAD_DIM
+    if staging is None:
+        staging = torch.empty(n_stage, dtype=torch.float32, device=x.device)
+    elif staging.numel() < n_stage or staging.dtype != torch.float32:
+        raise ValueError(
+            f"staging must be an FP32 buffer of at least {n_stage} elements"
+        )
+    for start in range(0, T, rows):
+        stop = min(T, start + rows)
+        chunk = staging[: (stop - start) * x.shape[1] * HEAD_DIM].view(
+            stop - start, x.shape[1], HEAD_DIM
+        )
+        chunk.copy_(x[start:stop])
+        chunk.mul_(scale).clamp_(-E4M3_MAX, E4M3_MAX)
+        out[start:stop].copy_(chunk)
+    return out, descale
+
+
+class MiniMaxH3VarlenFP8AttentionBF16Runner:
+    """The BF16 convenience form of the all-FP8 route: quantize, then attend.
+
+    ``quantize()`` recomputes the three per-tensor descales and E4M3 operands from the bound BF16 tensors (torch
+    ops into preallocated buffers, no allocation), ``attention()`` launches the prepared FP8 runner on them, and
+    calling the runner does both.  The two halves are separable so quantization and attention can be timed apart.
+    """
+
+    def __init__(
+        self,
+        operands: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        e4m3: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        descales: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        staging: torch.Tensor,
+        attention: MiniMaxH3VarlenFP8AttentionRunner,
+    ) -> None:
+        self.operands = operands
+        self.e4m3 = e4m3
+        self.descales = descales
+        self._staging = staging
+        self.attention_runner = attention
+        self.out = attention.out
+
+    def quantize(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        for x, x8, d in zip(self.operands, self.e4m3, self.descales, strict=True):
+            quantize_minimax_h3_e4m3_per_tensor(
+                x, out=x8, descale=d, staging=self._staging
+            )
+        return self.e4m3
+
+    def attention(self) -> torch.Tensor:
+        return self.attention_runner.launch()
+
+    def launch(self) -> torch.Tensor:
+        self.quantize()
+        return self.attention_runner.launch()
+
+    __call__ = launch
+
+
+def prepare_minimax_h3_varlen_fp8_attention_bf16(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_seqlens: Union[torch.Tensor, Sequence[int]],
+    *,
+    softmax_scale: Optional[float] = None,
+    out: Optional[torch.Tensor] = None,
+    cu_seqlens_host: Optional[Sequence[int]] = None,
+    backend: str = "cake",
+) -> MiniMaxH3VarlenFP8AttentionBF16Runner:
+    """Bind BF16 ``query`` / ``key`` / ``value`` (contiguous or the BF16 route's strided views) to the all-FP8 route.
+
+    Allocates the three E4M3 operand buffers, the descale tensors and one FP32 staging chunk, quantizes once
+    (per-tensor ``amax / 448`` descales, :func:`quantize_minimax_h3_e4m3_per_tensor`) and prepares
+    :func:`prepare_minimax_h3_varlen_fp8_attention` on the E4M3 buffers with the descale tensors; the returned
+    runner re-quantizes and launches with no further allocation.  The quantization is torch work on the host
+    stream, not part of the kernel; time it apart from the attention launch.
+    """
+    validate_minimax_h3_varlen_inputs(
+        query, key, value, out, strided_qkv=True, dtype=torch.bfloat16
+    )
+    device = query.device
+    operands = (query, key, value)
+    e4m3 = tuple(
+        torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=device) for x in operands
+    )
+    descales = tuple(
+        torch.empty(1, dtype=torch.float32, device=device) for _ in operands
+    )
+    rows = max(1, _QUANT_CHUNK_ELEMENTS // (query.shape[1] * HEAD_DIM))
+    staging = torch.empty(
+        min(query.shape[0], rows) * query.shape[1] * HEAD_DIM,
+        dtype=torch.float32,
+        device=device,
+    )
+    for x, x8, d in zip(operands, e4m3, descales, strict=True):
+        quantize_minimax_h3_e4m3_per_tensor(x, out=x8, descale=d, staging=staging)
+    attention = prepare_minimax_h3_varlen_fp8_attention(
+        e4m3[0],
+        e4m3[1],
+        e4m3[2],
+        cu_seqlens,
+        q_descale=descales[0],
+        k_descale=descales[1],
+        v_descale=descales[2],
+        softmax_scale=softmax_scale,
+        out=out,
+        cu_seqlens_host=cu_seqlens_host,
+        backend=backend,
+    )
+    return MiniMaxH3VarlenFP8AttentionBF16Runner(
+        operands, e4m3, descales, staging, attention
+    )
+
+
+def minimax_h3_varlen_fp8_attention_bf16(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_seqlens: Union[torch.Tensor, Sequence[int]],
+    *,
+    softmax_scale: Optional[float] = None,
+    out: Optional[torch.Tensor] = None,
+    cu_seqlens_host: Optional[Sequence[int]] = None,
+    backend: str = "cake",
+) -> torch.Tensor:
+    """BF16 convenience entry: per-tensor E4M3 quantization of ``query`` / ``key`` / ``value`` (torch), then
+    :func:`minimax_h3_varlen_fp8_attention` with the three ``amax / 448`` descales.  Equivalent to quantizing with
+    :func:`quantize_minimax_h3_e4m3_per_tensor` and calling the FP8 entry on the results."""
+    return prepare_minimax_h3_varlen_fp8_attention_bf16(
+        query,
+        key,
+        value,
+        cu_seqlens,
+        softmax_scale=softmax_scale,
+        out=out,
+        cu_seqlens_host=cu_seqlens_host,
+        backend=backend,
+    ).attention()
 
 
 def minimax_h3_varlen_nvfp4_attention(

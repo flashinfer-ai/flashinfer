@@ -40,7 +40,6 @@ import tempfile
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
-_CACHE_VERSION = 1
 _MXFP4_DTYPE_PREFIX = "sm90_w_mxfp4_"
 _MXFP4_HARDWARE_KEY_FIELDS = ("compute_capability", "sm_count")
 _MXFP4_PROVENANCE_KEY_FIELD = "tuning_provenance_sha256"
@@ -133,6 +132,8 @@ def _is_valid_tuning_provenance_sha256(value: Any) -> bool:
 
 
 def _load_entries(path: str) -> List[Dict[str, Any]]:
+    from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
+
     try:
         with open(path) as f:
             data = json.load(f)
@@ -146,7 +147,7 @@ def _load_entries(path: str) -> List[Dict[str, Any]]:
             stacklevel=3,
         )
         return []
-    if not isinstance(data, dict) or data.get("version") != _CACHE_VERSION:
+    if not isinstance(data, dict) or data.get("version") != KNOB_CACHE_VERSION:
         warnings.warn(
             f"[moe_ep-knob-cache] {path!r} has unsupported version "
             f"{data.get('version') if isinstance(data, dict) else '?'}; ignoring.",
@@ -199,7 +200,7 @@ def _entry_matches_key(
     return routing_profile is None
 
 
-def lookup_knobs(
+def _matching_entries(
     *,
     dtype: str,
     fp8_scale_mode: str,
@@ -215,11 +216,11 @@ def lookup_knobs(
     compute_capability: Any = None,
     sm_count: Optional[int] = None,
     tuning_provenance_sha256: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
-    """Return the cached knob dict for this session key, or ``None`` on miss."""
+) -> List[Dict[str, Any]]:
+    """Filter by session, hardware, and routing identity before token bucketing."""
     path = _cache_path()
     if path is None:
-        return None
+        return []
     capability = resolved_sms = None
     if _is_mxfp4_dtype(dtype):
         if not _is_valid_tuning_provenance_sha256(tuning_provenance_sha256):
@@ -229,13 +230,13 @@ def lookup_knobs(
                 RuntimeWarning,
                 stacklevel=2,
             )
-            return None
+            return []
         capability, resolved_sms = _mxfp4_hardware_identity(
             compute_capability=compute_capability,
             sm_count=sm_count,
         )
         if capability is None or resolved_sms is None:
-            return None
+            return []
     key = dict(
         device=device if device is not None else _current_device_name(),
         dtype=dtype,
@@ -260,6 +261,52 @@ def lookup_knobs(
         and isinstance(e.get("knobs"), dict)
         and isinstance(e.get("max_tokens"), int)
     ]
+    return matches
+
+
+def live_token_buckets(**kwargs: Any) -> List[int]:
+    from flashinfer.moe_ep.core.tuning import live_buckets
+
+    return live_buckets(_matching_entries(**kwargs), kwargs["max_tokens"])
+
+
+def lookup_knobs(
+    *,
+    dtype: str,
+    fp8_scale_mode: str,
+    world_size: int,
+    hidden: int,
+    intermediate: int,
+    num_experts: int,
+    topk: int,
+    max_tokens: int,
+    live_tokens: Optional[int] = None,
+    device: Optional[str] = None,
+    gate_up_clamp: Optional[float] = None,
+    routing_profile: Optional[str] = None,
+    compute_capability: Any = None,
+    sm_count: Optional[int] = None,
+    tuning_provenance_sha256: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    from flashinfer.moe_ep.core.tuning import select_token_entries
+
+    matches = _matching_entries(
+        dtype=dtype,
+        fp8_scale_mode=fp8_scale_mode,
+        world_size=world_size,
+        hidden=hidden,
+        intermediate=intermediate,
+        num_experts=num_experts,
+        topk=topk,
+        max_tokens=max_tokens,
+        device=device,
+        gate_up_clamp=gate_up_clamp,
+        routing_profile=routing_profile,
+        compute_capability=compute_capability,
+        sm_count=sm_count,
+        tuning_provenance_sha256=tuning_provenance_sha256,
+    )
+    matches = select_token_entries(matches, max_tokens, live_tokens)
     if not matches:
         return None
     at_or_above = [e for e in matches if e["max_tokens"] >= max_tokens]
@@ -281,6 +328,7 @@ def record_knobs(
     num_experts: int,
     topk: int,
     max_tokens: int,
+    live_tokens: Optional[int] = None,
     device: Optional[str] = None,
     gate_up_clamp: Optional[float] = None,
     routing_profile: Optional[str] = None,
@@ -295,6 +343,10 @@ def record_knobs(
     Returns the cache path written, or ``None`` when the cache is disabled or
     the write failed (recording is best-effort).
     """
+    if live_tokens is None:
+        live_tokens = max_tokens
+    if type(live_tokens) is not int or not 0 <= live_tokens <= max_tokens:
+        raise ValueError("live_tokens must be between zero and max_tokens")
     path = _cache_path()
     if path is None:
         return None
@@ -330,6 +382,7 @@ def record_knobs(
         num_experts=num_experts,
         topk=topk,
         max_tokens=max_tokens,
+        live_tokens=live_tokens,
         gate_up_clamp=gate_up_clamp,
         knobs=_knobs_to_json(knobs),
         p50_us=p50_us,
@@ -362,14 +415,19 @@ def record_knobs(
                             routing_profile=routing_profile,
                         )
                         and e.get("max_tokens") == max_tokens
+                        and e.get("live_tokens", e["max_tokens"]) == live_tokens
                     )
                 ]
                 entries.append(entry)
                 fd, tmp = tempfile.mkstemp(dir=directory, prefix=".moe_ep_knob_cache.")
+                from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
+
                 try:
                     with os.fdopen(fd, "w") as f:
                         json.dump(
-                            {"version": _CACHE_VERSION, "entries": entries}, f, indent=1
+                            {"version": KNOB_CACHE_VERSION, "entries": entries},
+                            f,
+                            indent=1,
                         )
                         f.flush()
                         os.fsync(f.fileno())
@@ -400,6 +458,7 @@ def resolve_knobs(
     num_experts: int,
     topk: int,
     max_tokens: int,
+    live_tokens: Optional[int] = None,
     gate_up_clamp: Optional[float] = None,
 ) -> Tuple[Dict[str, Any], str]:
     """Pure-lookup knob resolution: cache hit, else built-in heuristic.
@@ -417,6 +476,7 @@ def resolve_knobs(
         num_experts=num_experts,
         topk=topk,
         max_tokens=max_tokens,
+        live_tokens=live_tokens,
         gate_up_clamp=gate_up_clamp,
     )
     if cached is not None:

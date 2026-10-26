@@ -51,8 +51,8 @@ Options::
     --m-list 1,2,4,...    Token counts to sweep (default: a log-ish ladder)
     --top-k 6,3           top_k values to cover (default: both)
     --protocols ll,bt,ht  Protocols to time (default: all three).  Also
-                          accepts bt0/bt1, which pin the BT route to a
-                          single preset so the preset split is measurable.
+                          accepts auto for the shipped cross-protocol route,
+                          and bt0/bt1 to pin one BT preset.
     --patterns ar,finalize
     --no-rms-norm         Compile the collective without its RMSNorm
                           (apply_rms_norm=False); LL and BT only
@@ -75,6 +75,7 @@ import torch.distributed as dist
 from flashinfer.comm import AllReduceFusionPattern, allreduce_fusion
 from flashinfer.comm.mnnvl_cutedsl import (
     BT_ONLY_CONFIG,
+    DEFAULT_CONFIG,
     HT_ONLY_CONFIG,
     LL_ONLY_CONFIG,
 )
@@ -111,6 +112,7 @@ RMS_EPS = 1e-6
 WEIGHT_BIAS = 1.0
 
 SHIPPED_CONFIGS = {
+    "auto": DEFAULT_CONFIG,
     "ll": LL_ONLY_CONFIG,
     "bt": BT_ONLY_CONFIG,
     "ht": HT_ONLY_CONFIG,
@@ -562,7 +564,7 @@ def main() -> int:
     _log(rank, "=" * 96)
     _log(
         rank,
-        "  MNNVL CuTe DSL fusion sweep (hidden=5120) -- "
+        f"  MNNVL CuTe DSL fusion sweep (hidden={HIDDEN_SIZE}) -- "
         f"{tp_size}x {torch.cuda.get_device_name(device)}",
     )
     _log(

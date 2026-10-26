@@ -17,13 +17,16 @@ limitations under the License.
 import functools
 from collections import OrderedDict
 import math
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
+import tvm_ffi
 
 from ..api_logging import flashinfer_api
 from ..jit.cake_minimax_h3_sm120_quant_varlen_attention import (
-    gen_minimax_h3_sm120_quant_varlen_attention_module,
+    ATTENTION,
+    KV_STATS,
+    QUANTIZE,
 )
 from ..utils import register_custom_op, register_fake_op
 
@@ -34,14 +37,19 @@ _BLOCK_M = 128
 _BLOCK_N = 128
 _MAX_HEADS = 1 << 15
 _MAX_SEGMENT_TILES = 1 << 16
+# The kernels index the [tokens padded to _BLOCK_N, heads, 128] operands, the [segments, heads, 128]
+# statistics and the [query tiles, heads, _PARTIAL_FLOATS] statistics partials with 32-bit offsets.
+_MAX_ELEMENTS = (1 << 31) - 1
 # Fixed per-unit overhead (Q TMA, pipeline fill, epilogue) in K/V-tile units for the LPT placement.
 _UNIT_OVERHEAD_TILES = 2
 _PARTIAL_FLOATS = 2 * MINIMAX_H3_HEAD_DIM
-
-
-@functools.cache
-def _get_module():
-    return gen_minimax_h3_sm120_quant_varlen_attention_module().build_and_load()
+# The attention kernel exponentiates in the log2 domain: the launch takes ``softmax_scale * log2(e)``,
+# log2(e) spelled as the double the scale is multiplied by before the binding rounds it to float.
+_LOG2E = 1.4426950408889634
+# Grid rule (``minimax_h3_sm120_quant_varlen_attention_launch_grids``): grid-stride statistics and
+# quantizer launches of at most 4 CTAs per SM, one persistent attention CTA per SM.
+_PREP_CTAS_PER_SM = 4
+_PROGRAMS = (KV_STATS, QUANTIZE, ATTENTION)
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -112,11 +120,29 @@ class MiniMaxH3VarlenPlan:
         num_ctas: int,
     ):
         self.bounds = bounds
+        self.key = (bounds, num_heads, device.index, int(num_ctas))
         self.num_heads = num_heads
         self.total_tokens = bounds[-1]
+        padded_tokens = max(1, _ceil_div(self.total_tokens, _BLOCK_N)) * _BLOCK_N
+        if padded_tokens * num_heads * MINIMAX_H3_HEAD_DIM > _MAX_ELEMENTS:
+            raise ValueError(
+                f"tokens (padded to {_BLOCK_N}) * heads * {MINIMAX_H3_HEAD_DIM} must fit the "
+                f"kernels' 32-bit offsets, got tokens={self.total_tokens}, heads={num_heads}"
+            )
         self.num_segments = len(bounds) - 1
         begins = [bounds[s] for s in range(self.num_segments)]
         lens = [bounds[s + 1] - bounds[s] for s in range(self.num_segments)]
+        num_tiles = sum(_ceil_div(length, _BLOCK_M) for length in lens)
+        if (
+            max(self.num_segments * MINIMAX_H3_HEAD_DIM, num_tiles * _PARTIAL_FLOATS)
+            * num_heads
+            > _MAX_ELEMENTS
+        ):
+            raise ValueError(
+                f"segments * heads * {MINIMAX_H3_HEAD_DIM} and query tiles * heads * "
+                f"{_PARTIAL_FLOATS} must fit the statistics kernels' 32-bit offsets, got "
+                f"segments={self.num_segments}, tiles={num_tiles}, heads={num_heads}"
+            )
         tile_table: List[int] = []
         seg_tile_begin: List[int] = [0]
         units: List[Tuple[int, int, int]] = []
@@ -166,6 +192,7 @@ _MAX_PLANS = 256
 _MAX_WORKSPACE_SETS = 8
 _PLANS: "OrderedDict[Tuple, MiniMaxH3VarlenPlan]" = OrderedDict()
 _WORKSPACES: "OrderedDict[Tuple[int, int], Dict[str, torch.Tensor]]" = OrderedDict()
+_STREAM_WORKSPACES: "OrderedDict[Tuple[int, int], _StreamWorkspace]" = OrderedDict()
 
 
 def _device_index(device: torch.device) -> int:
@@ -180,7 +207,12 @@ def _sm_count(index: int) -> int:
 def _plan(
     bounds: Tuple[int, ...], num_heads: int, device: torch.device
 ) -> MiniMaxH3VarlenPlan:
-    index = _device_index(device)
+    return _plan_at(bounds, num_heads, _device_index(device))
+
+
+def _plan_at(
+    bounds: Tuple[int, ...], num_heads: int, index: int
+) -> MiniMaxH3VarlenPlan:
     num_ctas = _sm_count(index)
     key = (bounds, num_heads, index, num_ctas)
     plan = _PLANS.get(key)
@@ -194,6 +226,120 @@ def _plan(
     else:
         _PLANS.move_to_end(key)
     return plan
+
+
+class _Launch:
+    """One plan's workspace slices and launch facts, built once per (device, stream) workspace: ``args``
+    are the custom op's arguments from ``cu_seqlens`` through ``attention_grid``, the tensors among them
+    already converted to tvm-ffi tensors, so a call hands the bindings no DLPack exchange but Q, K, V
+    and the output's."""
+
+    __slots__ = ("args",)
+    args: Tuple[Any, ...]
+
+    def __init__(
+        self, plan: MiniMaxH3VarlenPlan, workspace: "_StreamWorkspace", index: int
+    ):
+        tokens, heads, hd = plan.total_tokens, plan.num_heads, MINIMAX_H3_HEAD_DIM
+        # The bindings check the tensors handed in and the attention binding encodes its tensor maps
+        # from their shapes, so every buffer is sliced to the plan's exact size.  A plan with a unit has
+        # a query tile, so the statistics launch always has an item.
+        n_rows8 = tokens * heads * hd
+        n_vt8 = heads * hd * plan.padded_tokens
+        n_rows = tokens * heads
+        n_kblocks = heads * plan.num_kblocks
+        n_stats = plan.num_segments * heads * hd
+        n_partials = plan.num_tiles * heads * _PARTIAL_FLOATS
+        n_pairs = plan.num_segments * heads
+        buffer = workspace.buffer
+        q8 = buffer("q8", n_rows8, torch.uint8)[:n_rows8]
+        k8 = buffer("k8", n_rows8, torch.uint8)[:n_rows8]
+        vt8 = buffer("vt8", n_vt8, torch.uint8)[:n_vt8]
+        q_scale = buffer("q_scale", n_rows, torch.float32)[:n_rows]
+        k_scale = buffer("k_scale", n_kblocks, torch.float32)[:n_kblocks]
+        v_scale = buffer("v_scale", n_stats, torch.float32)[:n_stats]
+        mean_k = buffer("mean_k", n_stats, torch.float32)[:n_stats]
+        partials = buffer("partials", n_partials, torch.float32)[:n_partials]
+        counters = buffer("counters", n_pairs, torch.uint32, zero=True)[:n_pairs]
+        stats_grid, quantize_grid, attention_grid = (
+            minimax_h3_sm120_quant_varlen_attention_launch_grids(
+                _sm_count(index),
+                num_heads=heads,
+                num_tiles=plan.num_tiles,
+                num_kblocks=plan.num_kblocks,
+                num_units=plan.num_units,
+            )
+        )
+        tensors = (
+            plan.cu_seqlens,
+            plan.seg_begin,
+            plan.seg_len,
+            plan.seg_tile_begin,
+            plan.tile_table,
+            plan.unit_table,
+            q8.view(torch.uint32),
+            k8.view(torch.uint32),
+            vt8.view(torch.uint32),
+            q8.view(tokens, heads, hd),
+            k8.view(tokens, heads, hd),
+            vt8.view(heads, hd, plan.padded_tokens),
+            q_scale,
+            k_scale,
+            v_scale,
+            mean_k,
+            partials,
+            counters,
+        )
+        self.args = (
+            *(tvm_ffi.from_dlpack(t) for t in tensors),
+            plan.num_segments,
+            plan.num_tiles,
+            plan.num_units,
+            plan.num_kblocks,
+            plan.padded_tokens,
+            stats_grid,
+            quantize_grid,
+            attention_grid,
+        )
+
+
+class _StreamWorkspace:
+    """The grow-only buffers of one (device, stream) and the launches sliced from them, per plan.
+
+    The quantized operands, the scales and the statistics partials are rewritten every call, so the
+    buffers are shared between calls on the same stream; concurrent streams get their own set (no
+    cross-stream reuse races).  The arrival counters of the statistics launch start zeroed and the
+    kernel resets them after every complete call, so they too are per stream (interleaved arrivals
+    would misidentify the last tile of a (segment, head)).
+    """
+
+    __slots__ = ("device", "buffers", "launches")
+
+    def __init__(self, index: int):
+        self.device = torch.device("cuda", index)
+        self.buffers: Dict[str, torch.Tensor] = {}
+        self.launches: "OrderedDict[Tuple, _Launch]" = OrderedDict()
+
+    def buffer(
+        self, name: str, numel: int, dtype: torch.dtype, zero: bool = False
+    ) -> torch.Tensor:
+        buffer = self.buffers.get(name)
+        if buffer is None or buffer.numel() < numel:
+            make = torch.zeros if zero else torch.empty
+            buffer = make(max(numel, 16), dtype=dtype, device=self.device)
+            self.buffers[name] = buffer
+            # the cached launches slice the buffer this one replaces
+            self.launches.clear()
+        return buffer
+
+    def launch(self, plan: MiniMaxH3VarlenPlan, index: int) -> _Launch:
+        launch = self.launches.get(plan.key)
+        if launch is None:
+            launch = _Launch(plan, self, index)
+            while len(self.launches) >= _MAX_PLANS:
+                self.launches.popitem(last=False)
+            self.launches[plan.key] = launch
+        return launch
 
 
 def _workspace(index: int, name: str, numel: int, dtype: torch.dtype) -> torch.Tensor:
@@ -220,6 +366,34 @@ def _workspace(index: int, name: str, numel: int, dtype: torch.dtype) -> torch.T
     return buffer
 
 
+def _stream_workspace(index: int, stream: int) -> _StreamWorkspace:
+    key = (index, stream)
+    workspace = _STREAM_WORKSPACES.get(key)
+    if workspace is None:
+        while len(_STREAM_WORKSPACES) >= _MAX_WORKSPACE_SETS:
+            _STREAM_WORKSPACES.popitem(last=False)
+        workspace = _STREAM_WORKSPACES[key] = _StreamWorkspace(index)
+    elif next(reversed(_STREAM_WORKSPACES)) != key:
+        _STREAM_WORKSPACES.move_to_end(key)
+    return workspace
+
+
+_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
+
+def _current_stream(index: int) -> int:
+    """The raw handle of the current torch stream of device ``index`` (a CUDA-graph capture stream is
+    the current stream as well)."""
+    if _raw_stream is not None:
+        return _raw_stream(index)
+    return torch.cuda.current_stream(index).cuda_stream
+
+
+@functools.cache
+def _ffi_device(index: int):
+    return tvm_ffi.device(f"cuda:{index}")
+
+
 def workspace_bytes(tokens: int, num_heads: int, num_segments: int) -> int:
     """Bytes of the (device, stream) workspace set the operator needs for ``tokens`` packed rows."""
 
@@ -232,73 +406,170 @@ def workspace_bytes(tokens: int, num_heads: int, num_segments: int) -> int:
         + 2 * num_segments * num_heads * MINIMAX_H3_HEAD_DIM
     )
     partials = _ceil_div(tokens, _BLOCK_M) * num_heads * _PARTIAL_FLOATS
-    return q8 + k8 + vt8 + 4 * (scales + partials)
+    counters = num_segments * num_heads
+    return q8 + k8 + vt8 + 4 * (scales + partials + counters)
+
+
+def _softmax_scale_log2(softmax_scale: float) -> float:
+    """The log2-domain scale the attention launch takes: ``softmax_scale * log2(e)``."""
+    return float(softmax_scale) * _LOG2E
+
+
+@functools.cache
+def _fp8_target(index: int) -> str:
+    """The exact target (``"sm_120a"``) every program of the operator ships for device ``index``."""
+    capability = tuple(int(value) for value in torch.cuda.get_device_capability(index))
+    target = KV_STATS.target_for((capability[0], capability[1]))
+    if target is None or any(target not in program.targets for program in _PROGRAMS):
+        raise RuntimeError(
+            "minimax_h3_sm120_varlen_attention_fp8 requires exact compute capability 12.0 "
+            f"(SM120), got {capability[0]}.{capability[1]}"
+        )
+    return target
+
+
+def minimax_h3_sm120_quant_varlen_attention_launch_grids(
+    num_sms: int,
+    *,
+    num_heads: int,
+    num_tiles: Optional[int] = None,
+    num_kblocks: Optional[int] = None,
+    num_units: Optional[int] = None,
+) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """The ``(statistics, quantizer, attention)`` launch grids on a device of ``num_sms`` SMs:
+    ``max(1, min(n * num_heads, 4 * num_sms))`` grid-stride CTAs over the (query tile, head) and
+    (128-key block, head) items of the first two launches, and one persistent attention CTA per SM
+    up to the unit count, ``max(1, min(num_sms, max(num_units, 1)))`` (the plan's own grid, the CTA
+    count its unit table is laid out for).  A component whose fact is ``None`` is ``None``."""
+    sms, heads = int(num_sms), int(num_heads)
+    if sms <= 0 or heads <= 0:
+        raise ValueError(
+            f"num_sms and num_heads must be positive, got {num_sms}, {num_heads}"
+        )
+    cap = _PREP_CTAS_PER_SM * sms
+
+    def prep(items: Optional[int]) -> Optional[int]:
+        return None if items is None else max(1, min(int(items) * heads, cap))
+
+    attention = None if num_units is None else max(1, min(sms, max(int(num_units), 1)))
+    return prep(num_tiles), prep(num_kblocks), attention
 
 
 @register_custom_op(
     "flashinfer::minimax_h3_sm120_varlen_attention_fp8",
     mutates_args=(
         "out",
-        "q8",
-        "k8",
-        "vt8",
+        "q8_words",
+        "k8_words",
+        "vt8_words",
         "q_scale",
         "k_scale",
         "v_scale",
         "mean_k",
         "partials",
+        "counters",
     ),
 )
 def _minimax_h3_sm120_varlen_attention_fp8_impl(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    cu_seqlens: torch.Tensor,
     out: torch.Tensor,
-    seg_begin: torch.Tensor,
-    seg_len: torch.Tensor,
-    seg_tile_begin: torch.Tensor,
-    tile_table: torch.Tensor,
-    unit_table: torch.Tensor,
-    q8: torch.Tensor,
-    k8: torch.Tensor,
-    vt8: torch.Tensor,
-    q_scale: torch.Tensor,
-    k_scale: torch.Tensor,
-    v_scale: torch.Tensor,
-    mean_k: torch.Tensor,
-    partials: torch.Tensor,
+    cu_seqlens: Any,
+    seg_begin: Any,
+    seg_len: Any,
+    seg_tile_begin: Any,
+    tile_table: Any,
+    unit_table: Any,
+    q8_words: Any,
+    k8_words: Any,
+    vt8_words: Any,
+    q8_rows: Any,
+    k8_rows: Any,
+    vt8_rows: Any,
+    q_scale: Any,
+    k_scale: Any,
+    v_scale: Any,
+    mean_k: Any,
+    partials: Any,
+    counters: Any,
     num_segments: int,
     num_tiles: int,
     num_units: int,
+    num_kblocks: int,
+    padded_tokens: int,
+    stats_grid: int,
+    quantize_grid: int,
     attention_grid: int,
-    softmax_scale: float,
+    softmax_scale_log2: float,
+    stream: int,
+    target: str,
 ) -> None:
-    _get_module().minimax_h3_sm120_varlen_attention_fp8(
-        q,
-        k,
-        v,
-        cu_seqlens,
-        out,
-        seg_begin,
-        seg_len,
-        seg_tile_begin,
-        tile_table,
-        unit_table,
-        q8,
-        k8,
-        vt8,
-        q_scale,
-        k_scale,
-        v_scale,
-        mean_k,
-        partials,
-        num_segments,
-        num_tiles,
-        num_units,
-        attention_grid,
-        softmax_scale,
-    )
+    # Three launches on ``stream`` (the current torch stream): the K / V statistics (per-tile partials,
+    # the last tile of each (segment, head) folding them into its K means and V scales) -> E4M3 Q8 /
+    # centred K8 / transposed V8 -> attention.  The bindings take the host arguments in the kernels'
+    # signature order followed by the grid triple; the attention binding encodes its three tensor maps
+    # from the byte tensors handed in its descriptor positions (``*_rows``, views of ``*_words``).
+    tokens, heads = int(q.shape[0]), int(q.shape[1])
+    stats, quantize, attention = _entries(target)
+    with tvm_ffi.use_raw_stream(_ffi_device(q.device.index), stream):
+        stats(
+            k,
+            v,
+            tile_table,
+            seg_begin,
+            seg_len,
+            seg_tile_begin,
+            partials,
+            counters,
+            mean_k,
+            v_scale,
+            num_tiles,
+            heads,
+            stats_grid,
+            1,
+            1,
+        )
+        quantize(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            mean_k,
+            v_scale,
+            q8_words,
+            k8_words,
+            vt8_words,
+            q_scale,
+            k_scale,
+            tokens,
+            padded_tokens,
+            num_segments,
+            heads,
+            num_kblocks,
+            quantize_grid,
+            1,
+            1,
+        )
+        attention(
+            q8_rows,
+            k8_rows,
+            vt8_rows,
+            out,
+            q_scale,
+            k_scale,
+            v_scale,
+            seg_begin,
+            seg_len,
+            unit_table,
+            num_units,
+            heads,
+            num_kblocks,
+            softmax_scale_log2,
+            attention_grid,
+            1,
+            1,
+        )
 
 
 @register_fake_op("flashinfer::minimax_h3_sm120_varlen_attention_fp8")
@@ -306,28 +577,44 @@ def _minimax_h3_sm120_varlen_attention_fp8_fake(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    cu_seqlens: torch.Tensor,
     out: torch.Tensor,
-    seg_begin: torch.Tensor,
-    seg_len: torch.Tensor,
-    seg_tile_begin: torch.Tensor,
-    tile_table: torch.Tensor,
-    unit_table: torch.Tensor,
-    q8: torch.Tensor,
-    k8: torch.Tensor,
-    vt8: torch.Tensor,
-    q_scale: torch.Tensor,
-    k_scale: torch.Tensor,
-    v_scale: torch.Tensor,
-    mean_k: torch.Tensor,
-    partials: torch.Tensor,
+    cu_seqlens: Any,
+    seg_begin: Any,
+    seg_len: Any,
+    seg_tile_begin: Any,
+    tile_table: Any,
+    unit_table: Any,
+    q8_words: Any,
+    k8_words: Any,
+    vt8_words: Any,
+    q8_rows: Any,
+    k8_rows: Any,
+    vt8_rows: Any,
+    q_scale: Any,
+    k_scale: Any,
+    v_scale: Any,
+    mean_k: Any,
+    partials: Any,
+    counters: Any,
     num_segments: int,
     num_tiles: int,
     num_units: int,
+    num_kblocks: int,
+    padded_tokens: int,
+    stats_grid: int,
+    quantize_grid: int,
     attention_grid: int,
-    softmax_scale: float,
+    softmax_scale_log2: float,
+    stream: int,
+    target: str,
 ) -> None:
     pass
+
+
+@functools.cache
+def _entries(target: str) -> Tuple[Any, Any, Any]:
+    """The ``run`` entries of the statistics, quantizer and attention programs on ``target``."""
+    return KV_STATS.entry(target), QUANTIZE.entry(target), ATTENTION.entry(target)
 
 
 def _check_thd(name: str, tensor: torch.Tensor, tokens: int, heads: int) -> None:
@@ -361,11 +648,17 @@ def minimax_h3_sm120_varlen_attention_fp8(
     with FP8 E4M3 tensor-core operands and an FP32 softmax: Q is quantized per token, K per
     128-key block after subtracting its segment's per-channel mean (an exact softmax shift),
     the probabilities are stored as E4M3 with a 2^8 exponent bias and V per (segment, channel).
-    Both QK^T and PV run ``mma.sync.m16n8k32 kind::f8f6f4``; the output is rounded to BF16
-    once.  One runtime-variable kernel set serves any ``tokens`` and any segment lengths
-    (including empty segments and lengths below one tile); the quantized operands live in a
-    grow-only workspace per (device, stream) (``workspace_bytes``); the most recent 8 stream sets
-    and 256 segment plans are kept.
+    Both QK^T and PV run E4M3 ``mma.sync`` m16n8k32 MMAs in the block-scaled ``kind::mxf8f6f4`` form
+    with unit scales (bitwise the dense form; GB202 GeForce boards issue the dense FP32-accumulating
+    form at half rate); the output is rounded to BF16 once.
+    Three runtime-variable generated programs, launched in order on the current stream (the K / V
+    statistics with their per-segment fold, the quantizer, the attention), serve any ``tokens``
+    and any segment lengths (including empty segments and lengths below one tile); the grids are
+    ``minimax_h3_sm120_quant_varlen_attention_launch_grids``.  The quantized operands
+    live in a grow-only workspace per (device, stream) (``workspace_bytes``); the most recent 8
+    stream sets and 256 segment plans are kept.  The programs ship for ``sm_120a`` alone: a call
+    with a non-empty segment on a device of another compute capability than 12.0 raises
+    ``RuntimeError``.
 
     Parameters
     ----------
@@ -411,50 +704,21 @@ def minimax_h3_sm120_varlen_attention_fp8(
             raise ValueError("out must be on the same device as q")
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(MINIMAX_H3_HEAD_DIM)
-    plan = _plan(bounds, heads, q.device)
+    index = _device_index(q.device)
+    plan = _plan_at(bounds, heads, index)
     if plan.num_units == 0:
         return out  # every segment is empty: nothing to write
-    index = _device_index(q.device)
-    hd = MINIMAX_H3_HEAD_DIM
-    q8 = _workspace(index, "q8", tokens * heads * hd, torch.uint8)
-    k8 = _workspace(index, "k8", tokens * heads * hd, torch.uint8)
-    vt8 = _workspace(index, "vt8", heads * hd * plan.padded_tokens, torch.uint8)
-    q_scale = _workspace(index, "q_scale", tokens * heads, torch.float32)
-    k_scale = _workspace(index, "k_scale", heads * plan.num_kblocks, torch.float32)
-    v_scale = _workspace(
-        index, "v_scale", plan.num_segments * heads * hd, torch.float32
-    )
-    mean_k = _workspace(index, "mean_k", plan.num_segments * heads * hd, torch.float32)
-    partials = _workspace(
-        index,
-        "partials",
-        max(1, plan.num_tiles * heads * _PARTIAL_FLOATS),
-        torch.float32,
-    )
+    target = _fp8_target(index)
+    stream = _current_stream(index)
     _minimax_h3_sm120_varlen_attention_fp8_impl(
         q,
         k,
         v,
-        plan.cu_seqlens,
         out,
-        plan.seg_begin,
-        plan.seg_len,
-        plan.seg_tile_begin,
-        plan.tile_table,
-        plan.unit_table,
-        q8,
-        k8,
-        vt8,
-        q_scale,
-        k_scale,
-        v_scale,
-        mean_k,
-        partials,
-        plan.num_segments,
-        plan.num_tiles,
-        plan.num_units,
-        plan.grid,
-        float(softmax_scale),
+        *_stream_workspace(index, stream).launch(plan, index).args,
+        _softmax_scale_log2(softmax_scale),
+        stream,
+        target,
     )
     return out
 
@@ -464,6 +728,7 @@ __all__ = [
     "MINIMAX_H3_NUM_HEADS",
     "MiniMaxH3VarlenPlan",
     "assign_unit_slots",
+    "minimax_h3_sm120_quant_varlen_attention_launch_grids",
     "minimax_h3_sm120_varlen_attention_fp8",
     "normalize_cu_seqlens",
     "workspace_bytes",

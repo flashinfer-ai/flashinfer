@@ -296,10 +296,15 @@ def _refresh_input_dependent_config() -> None:
                 "NVFP4 TMEM overlap requires tile_n=256, tile_k=256, "
                 "and --epilogue-warps 8"
             )
-        if use_fused_qknorm_rope or use_tma_store:
+        if use_tma_store:
             raise ValueError(
-                "NVFP4 TMEM overlap is incompatible with fused QKNorm/RoPE "
-                "and TMA output stores"
+                "NVFP4 TMEM overlap is incompatible with TMA output stores"
+            )
+        # Fused QKNorm/RoPE keeps only subtile 0 in registers across the early
+        # release; SF384 (MMA-K=96) scales would also overwrite subtile 1.
+        if use_fused_qknorm_rope and nvfp4_mma_k != 64:
+            raise ValueError(
+                "NVFP4 TMEM overlap with fused QKNorm/RoPE requires MMA-K=64"
             )
     # The overlap path uses two physical accumulator windows in one 512-column
     # allocation. It deliberately keeps one logical UMMA pipeline stage so an
@@ -1276,6 +1281,12 @@ class TmemCResource(MemoryResource):
             self._epi_local_idx = self._epi_local_idx ^ cutlass.Int32(1)
         return result
 
+    @consumer_work(returns=t2r_rmem_prefix)
+    @cute.jit
+    def load_prefix_subtile(self, stage_info: StageInfo) -> cutlass.Float32:
+        """Subtile 0 into the prefix slot, kept across the QKNorm early release."""
+        return self._load_subtile_impl(stage_info, 0)
+
     @consumer_work(returns=(t2r_rmem_prefix, t2r_rmem))
     @cute.jit
     def load_overlap_prefix(self, stage_info: StageInfo):
@@ -2171,6 +2182,22 @@ class GmemDResource(MemoryResource):
         subtile_idx: cutlass.Constexpr[int],
     ) -> None:
         """First Q/K pass: reproduce the BF16 GEMM boundary and sum squares."""
+        self._accumulate_qknorm_impl(stage_info, t2r_rmem, subtile_idx)
+
+    @producer_work
+    @cute.jit
+    def accumulate_qknorm_prefix(
+        self, stage_info: StageInfo, *, t2r_rmem_prefix: cutlass.Float32
+    ) -> None:
+        self._accumulate_qknorm_impl(stage_info, t2r_rmem_prefix, 0)
+
+    @cute.jit
+    def _accumulate_qknorm_impl(
+        self,
+        stage_info: StageInfo,
+        t2r_rmem,
+        subtile_idx: cutlass.Constexpr[int],
+    ) -> None:
         coordc_m, coordc_n = self._cta_output_mn(stage_info)
         tx, _, _ = cute.arch.thread_idx()
         epilogue_group = tx // 128
@@ -3214,36 +3241,56 @@ def create_store_task(
                 gmem_d.preload_qknorm_rope()
             tmem_c.try_wait()
             tmem_c.wait()
-            if cutlass.const_expr(use_fused_qknorm_rope):
+            if cutlass.const_expr(use_fused_qknorm_rope and use_nvfp4_tmem_overlap):
+                # Sum squares over the whole head, keeping subtile 0 in
+                # registers. Next-tile scales overwrite only subtile 0's
+                # columns, so release before the store pass and store subtile 0
+                # from registers.
+                gmem_d.reset_qknorm_accumulator()
+                t2r_prefix = tmem_c.load_prefix_subtile()
+                gmem_d.accumulate_qknorm_prefix(t2r_rmem_prefix=t2r_prefix)
+                for subtile_idx in cutlass.range_constexpr(1, subtile_cnt):
+                    t2r_rmem = tmem_c.load_subtile(subtile_idx=subtile_idx)
+                    gmem_d.accumulate_qknorm(t2r_rmem=t2r_rmem, subtile_idx=subtile_idx)
+                gmem_d.finish_qknorm_accumulator()
+                tmem_c.release()
+                gmem_d.store_overlap_prefix(t2r_rmem_prefix=t2r_prefix)
+                for subtile_idx in cutlass.range_constexpr(1, subtile_cnt):
+                    t2r_rmem = tmem_c.load_overlap_subtile(subtile_idx=subtile_idx)
+                    gmem_d.store(t2r_rmem=t2r_rmem, subtile_idx=subtile_idx)
+            elif cutlass.const_expr(use_fused_qknorm_rope):
                 gmem_d.reset_qknorm_accumulator()
                 for subtile_idx in cutlass.range_constexpr(subtile_cnt):
                     t2r_rmem = tmem_c.load_subtile(subtile_idx=subtile_idx)
                     gmem_d.accumulate_qknorm(t2r_rmem=t2r_rmem, subtile_idx=subtile_idx)
                 gmem_d.finish_qknorm_accumulator()
-            if cutlass.const_expr(use_nvfp4_tmem_overlap):
-                # Retire the entire next-phase scale footprint before
-                # allowing scale copies to overwrite this window. SF384
-                # needs two subtiles per half, rather than SF256's one.
-                if cutlass.const_expr(overlap_prefix_subtiles == 2):
-                    t2r_prefix, t2r_rmem = tmem_c.load_overlap_prefix()
-                    tmem_c.release()
-                    gmem_d.store_overlap_prefix(t2r_rmem_prefix=t2r_prefix)
-                    gmem_d.store(t2r_rmem=t2r_rmem, subtile_idx=1)
+            if cutlass.const_expr(
+                not (use_fused_qknorm_rope and use_nvfp4_tmem_overlap)
+            ):
+                if cutlass.const_expr(use_nvfp4_tmem_overlap):
+                    # Retire the entire next-phase scale footprint before
+                    # allowing scale copies to overwrite this window. SF384
+                    # needs two subtiles per half, rather than SF256's one.
+                    if cutlass.const_expr(overlap_prefix_subtiles == 2):
+                        t2r_prefix, t2r_rmem = tmem_c.load_overlap_prefix()
+                        tmem_c.release()
+                        gmem_d.store_overlap_prefix(t2r_rmem_prefix=t2r_prefix)
+                        gmem_d.store(t2r_rmem=t2r_rmem, subtile_idx=1)
+                    else:
+                        t2r_rmem = tmem_c.load_subtile(subtile_idx=0)
+                        tmem_c.release()
+                        gmem_d.store(t2r_rmem=t2r_rmem, subtile_idx=0)
+                    for subtile_idx in cutlass.range_constexpr(
+                        overlap_prefix_subtiles, subtile_cnt
+                    ):
+                        t2r_rmem = tmem_c.load_overlap_subtile(subtile_idx=subtile_idx)
+                        gmem_d.store(t2r_rmem=t2r_rmem, subtile_idx=subtile_idx)
                 else:
-                    t2r_rmem = tmem_c.load_subtile(subtile_idx=0)
+                    for subtile_idx in cutlass.range_constexpr(subtile_cnt):
+                        t2r_rmem = tmem_c.load_subtile(subtile_idx=subtile_idx)
+                        gmem_d.store(t2r_rmem=t2r_rmem, subtile_idx=subtile_idx)
+                    # Release TMEM only after all output subtiles have been stored.
                     tmem_c.release()
-                    gmem_d.store(t2r_rmem=t2r_rmem, subtile_idx=0)
-                for subtile_idx in cutlass.range_constexpr(
-                    overlap_prefix_subtiles, subtile_cnt
-                ):
-                    t2r_rmem = tmem_c.load_overlap_subtile(subtile_idx=subtile_idx)
-                    gmem_d.store(t2r_rmem=t2r_rmem, subtile_idx=subtile_idx)
-            else:
-                for subtile_idx in cutlass.range_constexpr(subtile_cnt):
-                    t2r_rmem = tmem_c.load_subtile(subtile_idx=subtile_idx)
-                    gmem_d.store(t2r_rmem=t2r_rmem, subtile_idx=subtile_idx)
-                # Release TMEM only after all output subtiles have been stored.
-                tmem_c.release()
             wq.try_wait()
             wq.wait()
             wq.get_and_advance_work_tile()

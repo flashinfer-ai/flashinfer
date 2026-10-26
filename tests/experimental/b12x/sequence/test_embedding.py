@@ -2,6 +2,7 @@
 
 from contextlib import contextmanager
 
+import os
 import subprocess
 import sys
 import textwrap
@@ -141,6 +142,19 @@ def test_high_row_offset_is_widened_before_multiplication(id_dtype):
         graph.reset()
 
 
+def _is_compute_sanitizer_active() -> bool:
+    if any(name.startswith("NV_SANITIZER_INJECTION_") for name in os.environ):
+        return True
+    return any(
+        "sanitizer" in os.environ.get(name, "").lower()
+        for name in ("CUDA_INJECTION64_PATH", "NVTX_INJECTION64_PATH")
+    )
+
+
+@pytest.mark.skipif(
+    _is_compute_sanitizer_active(),
+    reason="the intentional device trap is reported as an error by compute-sanitizer",
+)
 @pytest.mark.parametrize("bad_id", [-1, 3, 2**32])
 def test_invalid_ids_raise_device_error_instead_of_zero_or_oob(bad_id):
     # trap poisons the CUDA context, so each invalid replay owns a subprocess.

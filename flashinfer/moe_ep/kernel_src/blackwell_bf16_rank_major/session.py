@@ -32,30 +32,52 @@ _LOCAL_EXPERTS = _NUM_EXPERTS // _WORLD_SIZE
 _TOP_K = 8
 _FIXED_EXPERT_ROWS = 32768
 _MAX_Y_GROUPS = 512
+_ROUTE_IN_DISPATCH_MAX_T = 128
+# Up to this many active rows the forward uses the LL (flag-in-data) path.
+_LL_MAX_T = 32
+_LL_CAPACITY_T = 32
+_LL_BANKS = 2
+_LL_HEADER_WORDS = 16
+_LL_ROW_WORDS = 3584
+_LL_SLOT_WORDS = _LL_HEADER_WORDS + _LL_ROW_WORDS
 _DESCRIPTOR_BYTES = 128
 _FC1_WEIGHT_BOX_DIM = (64, 128, 2, 1)
 _SOURCE_NAME = "flashinfer_blackwell_moe_ep_layer_sm100.cu"
 _STAGE_NAMES = (
-    "input_barrier",
+    "stage_inputs",
+    "input_arrive",
     "dispatch",
-    "route_reset",
-    "route_count",
-    "route_finalize",
-    "route_scatter",
+    "route_fused",
     "gemm1_swiglu",
     "gemm2",
     "local_unpermute",
-    "partial_barrier",
+    "partial_arrive",
     "combine",
+    "ll_push",
+    "ll_recv",
+    "ll_unpermute",
+    "ll_combine",
 )
 _STAGE_BINDINGS = {
-    "input_barrier": (
-        "expert_ids",
+    "stage_inputs": (
+        "hidden_in",
+        "ids_in",
+        "weights_in",
+        "hidden_states",
+        "topk_ids",
+        "topk_weights",
+        "ids_is_int64",
+        "hidden_copy",
+        "active_tokens_per_rank",
+    ),
+    "input_arrive": (
         "topk_ids",
         "active_tokens_per_rank",
         "pg_world",
         "pg_rank",
         "pg_flags",
+        "routed_peers",
+        "route_codes_peers",
     ),
     "dispatch": (
         "recv_hidden",
@@ -71,28 +93,29 @@ _STAGE_BINDINGS = {
         "topk_ids_peers",
         "topk_weights",
         "topk_weights_peers",
-    ),
-    "route_reset": ("expert_scatter_offsets", "zero_sentinel"),
-    "route_count": (
-        "recv_local_ids",
+        "routed",
         "expert_scatter_offsets",
         "token_to_permuted",
-        "active_tokens_per_rank",
-    ),
-    "route_finalize": (
-        "expert_scatter_offsets",
         "cta_to_expert",
         "cta_to_mn_limit",
         "expert_padded_row_offsets",
         "num_non_exiting_ctas",
         "total_padded_rows",
         "route_map",
+        "zero_sentinel",
+        "route_codes",
     ),
-    "route_scatter": (
+    "route_fused": (
         "recv_local_ids",
-        "expert_padded_row_offsets",
-        "route_map",
+        "expert_scatter_offsets",
         "token_to_permuted",
+        "cta_to_expert",
+        "cta_to_mn_limit",
+        "expert_padded_row_offsets",
+        "num_non_exiting_ctas",
+        "total_padded_rows",
+        "route_map",
+        "zero_sentinel",
         "active_tokens_per_rank",
     ),
     "gemm1_swiglu": (
@@ -122,7 +145,7 @@ _STAGE_BINDINGS = {
         "hidden_size",
         "active_tokens_per_rank",
     ),
-    "partial_barrier": ("pg_world", "pg_rank", "pg_flags"),
+    "partial_arrive": ("pg_world", "pg_rank", "pg_flags"),
     "combine": (
         "output",
         "pg_world",
@@ -130,61 +153,64 @@ _STAGE_BINDINGS = {
         "pg_flags",
         "local_partials",
         "local_partials_peers",
+        "topk_ids",
+    ),
+    "ll_push": (
+        "hidden_in",
+        "ids_in",
+        "weights_in",
+        "topk_ids",
+        "ids_is_int64",
+        "active_tokens_per_rank",
+        "pg_world",
+        "pg_rank",
+        "ll_dispatch_peers",
+        "ll_control",
+        "ll_reuse_peers",
+        "ll_combine_peers",
+    ),
+    "ll_recv": (
+        "recv_hidden",
+        "recv_local_ids",
+        "recv_weights",
+        "active_tokens_per_rank",
+        "pg_world",
+        "pg_rank",
+        "ll_dispatch",
+        "ll_control",
+        "expert_scatter_offsets",
+        "token_to_permuted",
+        "cta_to_expert",
+        "cta_to_mn_limit",
+        "expert_padded_row_offsets",
+        "num_non_exiting_ctas",
+        "total_padded_rows",
+        "route_map",
+        "zero_sentinel",
+        "row_splits",
+    ),
+    "ll_unpermute": (
+        "expert_output",
+        "topk_weights",
+        "token_to_permuted",
+        "ll_combine_peers",
+        "ll_control",
+        "hidden_size",
+        "active_tokens_per_rank",
+        "pg_rank",
+    ),
+    "ll_combine": (
+        "output",
+        "pg_rank",
+        "ll_combine",
+        "ll_control",
+        "topk_ids",
+        "ll_reuse",
     ),
 }
 _STAGE_LAUNCH_CONTRACTS = {
-    "input_barrier": (
-        (1, 1, 1),
-        (32, 1, 1),
-        (1, 1, 1),
-        0,
-        (("active_tokens_per_rank", 128),),
-        False,
-        False,
-        False,
-    ),
-    "dispatch": (
-        (1024, 1, 1),
-        (256, 1, 1),
-        (1, 1, 1),
-        15488,
-        (("active_tokens_per_rank", 128),),
-        False,
-        False,
-        False,
-    ),
-    "route_reset": (
-        (1, 1, 1),
-        (256, 1, 1),
-        (1, 1, 1),
-        0,
-        (),
-        False,
-        False,
-        False,
-    ),
-    "route_count": (
-        (32, 1, 1),
-        (256, 1, 1),
-        (1, 1, 1),
-        0,
-        (("active_tokens_per_rank", 128),),
-        False,
-        False,
-        False,
-    ),
-    "route_finalize": (
-        (1, 1, 1),
-        (32, 1, 1),
-        (1, 1, 1),
-        0,
-        (),
-        False,
-        False,
-        False,
-    ),
-    "route_scatter": (
-        (32, 1, 1),
+    "stage_inputs": (
+        (128, 1, 1),
         (256, 1, 1),
         (1, 1, 1),
         0,
@@ -192,6 +218,36 @@ _STAGE_LAUNCH_CONTRACTS = {
         False,
         True,
         False,
+    ),
+    "input_arrive": (
+        (1, 1, 1),
+        (32, 1, 1),
+        (1, 1, 1),
+        0,
+        (("active_tokens_per_rank", 128),),
+        True,
+        True,
+        True,
+    ),
+    "dispatch": (
+        (1025, 1, 1),
+        (256, 1, 1),
+        (1, 1, 1),
+        15488,
+        (("active_tokens_per_rank", 128),),
+        True,
+        True,
+        True,
+    ),
+    "route_fused": (
+        (1, 1, 1),
+        (1024, 1, 1),
+        (1, 1, 1),
+        0,
+        (("active_tokens_per_rank", 128),),
+        True,
+        True,
+        True,
     ),
     "gemm1_swiglu": (
         (32, 512, 1),
@@ -214,34 +270,56 @@ _STAGE_LAUNCH_CONTRACTS = {
         True,
     ),
     "local_unpermute": (
-        (1024, 1, 1),
+        (1024, 7, 1),
         (128, 1, 1),
         (1, 1, 1),
         128,
         (("hidden_size", 7168), ("active_tokens_per_rank", 128)),
         True,
-        False,
+        True,
         True,
     ),
-    "partial_barrier": (
+    "partial_arrive": ((1, 1, 1), (32, 1, 1), (1, 1, 1), 0, (), True, True, True),
+    "combine": ((128, 7, 1), (128, 1, 1), (1, 1, 1), 17408, (), True, False, True),
+    "ll_push": (
+        (32, 8, 8),
+        (288, 1, 1),
         (1, 1, 1),
-        (32, 1, 1),
+        0,
+        (("active_tokens_per_rank", 32),),
+        False,
+        True,
+        False,
+    ),
+    "ll_recv": (
+        (257, 1, 1),
+        (256, 1, 1),
+        (1, 1, 1),
+        0,
+        (("active_tokens_per_rank", 32), ("row_splits", 8)),
+        True,
+        True,
+        True,
+    ),
+    "ll_unpermute": (
+        (256, 7, 1),
+        (128, 1, 1),
+        (1, 1, 1),
+        0,
+        (("hidden_size", 7168), ("active_tokens_per_rank", 32)),
+        True,
+        True,
+        True,
+    ),
+    "ll_combine": (
+        (32, 7, 1),
+        (160, 1, 1),
         (1, 1, 1),
         0,
         (),
+        True,
         False,
-        False,
-        False,
-    ),
-    "combine": (
-        (128, 1, 1),
-        (256, 1, 1),
-        (1, 1, 1),
-        29696,
-        (),
-        False,
-        False,
-        False,
+        True,
     ),
 }
 
@@ -254,6 +332,15 @@ def _check_cuda(result: tuple[Any, ...], operation: str) -> tuple[Any, ...]:
     return result[1:]
 
 
+def _ll_row_splits(active_tokens_per_rank: int) -> int:
+    """Row splits of the LL push/receive, ``max(1, 8 // T)`` for T active rows.
+
+    The push and the receive launch ``8 * T * splits`` row CTAs: 64 for T in
+    {1, 2, 4, 8}, 48 for T = 3, and ``8 * T`` for every other T.
+    """
+    return max(1, 8 // active_tokens_per_rank)
+
+
 def _active_stage_grids(
     active_tokens_per_rank: int,
 ) -> dict[str, tuple[int, int, int]]:
@@ -262,26 +349,46 @@ def _active_stage_grids(
         raise ValueError(
             f"active tokens per rank must be in [1, 128], got {active_tokens_per_rank}"
         )
-    active_routes = _WORLD_SIZE * active_tokens_per_rank * _TOP_K
-    route_blocks = (active_routes + 255) // 256
     # One local expert group needs at most 64 routed rows.  With 32 local
     # experts, spreading the first row across every expert costs 32 groups;
     # each further group needs another 64 routes, so N + 31 bounds the active
-    # y-groups.  Keep the published capacity coordinate exactly at y=512.
-    gemm_y = (
-        _MAX_Y_GROUPS
-        if active_tokens_per_rank == _TOKENS_PER_RANK
-        else active_tokens_per_rank + _LOCAL_EXPERTS - 1
-    )
-    return {
-        "dispatch": (_WORLD_SIZE * active_tokens_per_rank, 1, 1),
-        "route_count": (route_blocks, 1, 1),
-        "route_scatter": (route_blocks, 1, 1),
+    # y-groups, which stays below the y=512 capacity for every active prefix.
+    gemm_y = min(_MAX_Y_GROUPS, active_tokens_per_rank + _LOCAL_EXPERTS - 1)
+    grids = {
+        "stage_inputs": (active_tokens_per_rank, 1, 1),
+        # one extra dispatch CTA computes the route from pushed route codes (no route kernel)
+        "dispatch": (
+            _WORLD_SIZE * active_tokens_per_rank
+            + (1 if active_tokens_per_rank <= _ROUTE_IN_DISPATCH_MAX_T else 0),
+            1,
+            1,
+        ),
         "gemm1_swiglu": (32, gemm_y, 1),
         "gemm2": (56, gemm_y, 1),
-        "local_unpermute": (_WORLD_SIZE * active_tokens_per_rank, 1, 1),
-        "combine": (active_tokens_per_rank, 1, 1),
+        "local_unpermute": (_WORLD_SIZE * active_tokens_per_rank, 7, 1),
+        "combine": (active_tokens_per_rank, 7, 1),
     }
+    if active_tokens_per_rank <= _LL_MAX_T:
+        grids.update(
+            {
+                "ll_push": (
+                    active_tokens_per_rank,
+                    _WORLD_SIZE,
+                    _ll_row_splits(active_tokens_per_rank),
+                ),
+                "ll_recv": (
+                    _WORLD_SIZE
+                    * active_tokens_per_rank
+                    * _ll_row_splits(active_tokens_per_rank)
+                    + 1,
+                    1,
+                    1,
+                ),
+                "ll_unpermute": (_WORLD_SIZE * active_tokens_per_rank, 7, 1),
+                "ll_combine": (active_tokens_per_rank, 7, 1),
+            }
+        )
+    return grids
 
 
 def _source_dir() -> Path:
@@ -576,6 +683,16 @@ class _KernelLibrary:
             drv.cuLibraryUnload(self._library)
             raise
 
+    def capture_id(self, stream: int) -> int | None:
+        """Id of the CUDA graph capture active on ``stream`` (unique in the process), or None."""
+        drv = self._drv
+        status, capture_id, *_ = _check_cuda(
+            drv.cuStreamGetCaptureInfo(drv.CUstream(stream)), "cuStreamGetCaptureInfo"
+        )
+        if status == drv.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_NONE:
+            return None
+        return int(capture_id)
+
     def launch(
         self,
         stage: dict[str, Any],
@@ -657,6 +774,35 @@ class BlackwellBf16RankMajorSession:
     Every rank in the process group must stage the same active row count for a
     launch.  The count may vary between launches from one through the fixed
     128-row capacity.
+
+    Up to 32 active rows per rank, ``stage_inputs`` already sends the rows to
+    the ranks that own their experts, so every rank must call ``stage_inputs``
+    and ``run`` symmetrically.  Before the first ``bind_weights``,
+    ``stage_inputs`` keeps a copy of the inputs instead and ``run`` sends them,
+    so every rank must also call ``bind_weights`` at the same point relative to
+    ``stage_inputs`` and ``run`` (the layer API binds in ``compute``).
+    Otherwise a repeated ``stage_inputs`` completes the pending forward on some
+    ranks and replaces it on others, and the ranks pair different forwards:
+    ``run`` hangs or returns rows computed from other inputs.
+
+    Peers wait for a staged forward whose rows were sent, or whose kernels
+    ``run`` began to launch when a launch failed.  The session completes such a
+    forward into internal scratch output when ``stage_inputs`` is called again,
+    and when ``run`` rejects its arguments (which also sends deferred rows), if
+    expert weights are bound and the forward was staged in the active CUDA graph
+    capture (or eagerly, outside any capture); a later ``run`` resumes it at the
+    failed launch.  Other staged inputs, including deferred rows not sent yet,
+    are replaced, also inside a capture.
+
+    A CUDA graph that captures ``stage_inputs`` must also capture the matching
+    ``run``, for every active row count: inputs staged in a capture that is no
+    longer active never ran and are dropped, so ``run`` reports that no inputs
+    are staged.  Inside a capture, ``stage_inputs`` and ``run`` raise for an
+    eagerly staged forward that peers wait for, and ``run`` also for other
+    eagerly staged inputs of up to 32 rows.  Kernels that ``run`` recorded into
+    a capture before one of its launches failed never run: calls inside that
+    capture raise, and afterwards an eagerly staged forward restarts at its
+    first kernel.  Do not replay such a graph.
     """
 
     def __init__(
@@ -744,11 +890,71 @@ class BlackwellBf16RankMajorSession:
             group_name=name,
         )
         self._flags.local.zero_()
-
-        self._expert_ids_i64 = torch.empty(
-            (_TOKENS_PER_RANK, _TOP_K), dtype=torch.int64, device=self._device
+        self._routed = _alloc_symmetric(
+            (_WORLD_SIZE * 4,),
+            torch.int32,
+            device=self._device,
+            group_name=name,
         )
-        self._recv_hidden = torch.empty(
+        self._routed.local.zero_()
+        # Route codes [source][token][8] (one byte per route), stored by each source's input_arrive.
+        self._route_codes = _alloc_symmetric(
+            (_WORLD_SIZE * _TOKENS_PER_RANK * 2,),
+            torch.int32,
+            device=self._device,
+            group_name=name,
+        )
+        self._route_codes.local.zero_()
+        # LL (flag-in-data) buffers of the small-T path: [bank][source][token][header + row] dispatch words and
+        # [bank][owner][token][row] combine words; zero words never match an epoch (epochs start at 1).
+        self._ll_dispatch = _alloc_symmetric(
+            (_LL_BANKS * _WORLD_SIZE * _LL_CAPACITY_T * _LL_SLOT_WORDS,),
+            torch.int64,
+            device=self._device,
+            group_name=name,
+        )
+        self._ll_dispatch.local.zero_()
+        # Buffer-reuse epochs released by every peer at the start of each LL forward.
+        self._ll_reuse = _alloc_symmetric(
+            (_WORLD_SIZE,),
+            torch.int32,
+            device=self._device,
+            group_name=name,
+        )
+        self._ll_reuse.local.zero_()
+        self._ll_combine = _alloc_symmetric(
+            (_LL_BANKS * _WORLD_SIZE * _LL_CAPACITY_T * _LL_ROW_WORDS,),
+            torch.int64,
+            device=self._device,
+            group_name=name,
+        )
+        self._ll_combine.local.zero_()
+        # [0]: epoch of the last LL forward (read by ll_push), [1]: epoch of the current LL forward.
+        self._ll_control = torch.zeros((2,), dtype=torch.int32, device=self._device)
+        # Output of a staged forward that the session completes itself (see _complete_staged_forward).
+        self._scratch_output = torch.empty(
+            (_TOKENS_PER_RANK, _HIDDEN_SIZE), dtype=torch.bfloat16, device=self._device
+        )
+        # Kernels of the staged forward's run() sequence that are already launched,
+        # and the CUDA graph capture they were launched in (None: eagerly).
+        self._launched_stages = 0
+        self._launch_capture_id: int | None = None
+        # Copy of the inputs of an LL stage staged before the first bind_weights; run() sends them.
+        self._ll_deferred_hidden = torch.empty(
+            (_LL_CAPACITY_T, _HIDDEN_SIZE), dtype=torch.bfloat16, device=self._device
+        )
+        self._ll_deferred_ids = torch.empty(
+            (_LL_CAPACITY_T, _TOP_K), dtype=torch.int64, device=self._device
+        )
+        self._ll_deferred_weights = torch.empty(
+            (_LL_CAPACITY_T, _TOP_K), dtype=torch.float32, device=self._device
+        )
+        # The staged LL inputs are that copy; run() sends it first.
+        self._ll_push_deferred = False
+        # CUDA graph capture that recorded the staged inputs (None: staged eagerly).
+        self._staged_capture_id: int | None = None
+
+        self._recv_hidden = torch.zeros(
             (_RANK_MAJOR_TOKENS, _HIDDEN_SIZE),
             dtype=torch.bfloat16,
             device=self._device,
@@ -789,6 +995,9 @@ class BlackwellBf16RankMajorSession:
         )
 
         self._manifest, source_path = _load_manifest()
+        self._stage_by_name = {
+            stage["name"]: stage for stage in self._manifest["stages"]
+        }
         cubin_path = _compile_cubin(source_path, self._manifest)
         torch.distributed.barrier(group=process_group)
         self._library = _KernelLibrary(
@@ -798,9 +1007,102 @@ class BlackwellBf16RankMajorSession:
         self._active_weight_key: tuple[int, int] | None = None
         self._descriptors: dict[str, int] = {}
 
+    def _ll_set_epoch_for_test(self, last_epoch: int) -> None:
+        """Test hook: make ``last_epoch`` the epoch of the last LL forward.
+
+        Call it on every rank of a quiescent session (no forward in flight);
+        it synchronizes the device and the process group before and after the
+        update.  The next LL forward uses ``last_epoch + 1`` (``0`` maps to
+        ``2``).  Every peer's buffer-reuse word is set to ``last_epoch``, the
+        state a completed forward with that epoch leaves behind.
+        """
+        if not 0 <= last_epoch < 2**32:
+            raise ValueError(f"LL epoch must be in [0, 2**32), got {last_epoch}")
+        value = last_epoch - 2**32 if last_epoch >= 2**31 else last_epoch
+        torch.cuda.synchronize(self._device)
+        torch.distributed.barrier(group=self._process_group)
+        self._ll_control.fill_(value)
+        self._ll_reuse.local.fill_(value)
+        torch.cuda.synchronize(self._device)
+        torch.distributed.barrier(group=self._process_group)
+
     def _require_open(self) -> None:
         if self._closed:
             raise RuntimeError("Blackwell BF16 rank-major session is closed")
+
+    def _stage_needs_completion(self) -> bool:
+        """Whether peers wait for the rest of the staged forward.
+
+        Its LL rows were sent, or ``run`` launched part of its kernels.
+        """
+        if not self._inputs_staged or self._active_tokens_per_rank is None:
+            return False
+        if self._launched_stages:
+            return True
+        return self._active_tokens_per_rank <= _LL_MAX_T and not self._ll_push_deferred
+
+    def _current_capture_id(self) -> int | None:
+        stream = torch.cuda.current_stream(self._device).cuda_stream
+        return self._library.capture_id(stream)
+
+    def _forget_work_of_ended_captures(self, capture_id: int | None) -> None:
+        """Forget work recorded in a CUDA graph capture that is no longer active.
+
+        Capture only records kernels.  Inputs staged in such a capture never
+        ran: drop them.  Kernels that run() recorded into such a capture never
+        ran either: an eagerly staged forward restarts at its first kernel.
+        """
+        if (
+            self._inputs_staged
+            and self._staged_capture_id is not None
+            and self._staged_capture_id != capture_id
+        ):
+            self._clear_stage()
+        elif (
+            self._launched_stages
+            and self._launch_capture_id is not None
+            and self._launch_capture_id != capture_id
+        ):
+            self._launched_stages = 0
+            self._launch_capture_id = None
+
+    def _launch_failed_in_capture(self, capture_id: int | None) -> bool:
+        """Whether a launch of the staged forward failed in the active capture."""
+        return (
+            self._launched_stages > 0
+            and capture_id is not None
+            and self._launch_capture_id == capture_id
+        )
+
+    def _clear_stage(self) -> None:
+        self._inputs_staged = False
+        self._active_tokens_per_rank = None
+        self._staged_capture_id = None
+        self._ll_push_deferred = False
+        self._launched_stages = 0
+        self._launch_capture_id = None
+
+    def _stage_blocker(self, capture_id: int | None) -> str | None:
+        """Why the staged forward cannot be completed now, or None."""
+        if self._active_weight_key is None:
+            return "expert weights are not bound"
+        if self._launch_failed_in_capture(capture_id):
+            return "one of its launches failed in this CUDA graph capture"
+        if self._staged_capture_id != capture_id:
+            return "it was staged outside the active CUDA graph capture"
+        return None
+
+    def _complete_staged_forward(self, capture_id: int | None) -> None:
+        """Launch the rest of the staged forward into the scratch output.
+
+        The kernels not launched yet (a deferred push first) run exactly as in
+        ``run``: they advance the epochs and release the buffers, and only the
+        output rows are discarded.  Every peer completes the same forward,
+        through ``run`` or here.
+        """
+        self._launch_staged(
+            self._scratch_output[: self._active_tokens_per_rank], capture_id
+        )
 
     def stage_inputs(
         self,
@@ -847,11 +1149,113 @@ class BlackwellBf16RankMajorSession:
                 )
             if tensor.device != self._device or not tensor.is_contiguous():
                 raise ValueError(f"{name} must be contiguous on {self._device}")
-        self._hidden_states.local[:active_tokens_per_rank].copy_(hidden_states)
-        self._expert_ids_i64[:active_tokens_per_rank].copy_(topk_ids)
-        self._topk_weights.local[:active_tokens_per_rank].copy_(topk_weights)
+        capture_id = self._current_capture_id()
+        self._forget_work_of_ended_captures(capture_id)
+        if self._stage_needs_completion():
+            # Complete the staged forward before staging again, so no epoch is
+            # sent twice.  Sent rows imply bound weights (see below).
+            blocker = self._stage_blocker(capture_id)
+            if blocker is not None:
+                raise RuntimeError(
+                    "Blackwell BF16 rank-major cannot complete the staged forward "
+                    f"that run() did not finish: {blocker}"
+                )
+            self._complete_staged_forward(capture_id)
+        # Nothing waits for other staged inputs: replace them.  If a launch
+        # below fails, no inputs are staged.
+        self._clear_stage()
+        if active_tokens_per_rank <= _LL_MAX_T and self._active_weight_key is None:
+            # Sent rows can only be received by a forward with bound weights,
+            # and the caller may bind them after this call or fail before it
+            # does.  Keep a copy of the inputs; run() sends it after its checks.
+            self._ll_deferred_hidden[:active_tokens_per_rank].copy_(hidden_states)
+            self._ll_deferred_ids[:active_tokens_per_rank].copy_(topk_ids)
+            self._ll_deferred_weights[:active_tokens_per_rank].copy_(topk_weights)
+            self._ll_push_deferred = True
+            self._active_tokens_per_rank = active_tokens_per_rank
+            self._inputs_staged = True
+            self._staged_capture_id = capture_id
+            return
+        # One staging kernel: hidden row copy, ids narrowed to int32, weights (the
+        # dependent input barrier waits on it through PDL).
+        hidden_copy = 1
+        if hidden_states.data_ptr() % 16:
+            self._hidden_states.local[:active_tokens_per_rank].copy_(hidden_states)
+            hidden_copy = 0
+        p = self._ptr
+        if active_tokens_per_rank <= _LL_MAX_T:
+            self._launch_ll_push(
+                hidden_states if hidden_copy else self._hidden_states.local,
+                topk_ids,
+                topk_weights,
+                active_tokens_per_rank,
+            )
+            self._active_tokens_per_rank = active_tokens_per_rank
+            self._inputs_staged = True
+            self._staged_capture_id = capture_id
+            return
+        self._library.launch(
+            self._stage_by_name["stage_inputs"],
+            (
+                p(hidden_states),
+                p(topk_ids),
+                p(topk_weights),
+                p(self._hidden_states.local),
+                p(self._topk_ids.local),
+                p(self._topk_weights.local),
+                1 if topk_ids.dtype is torch.int64 else 0,
+                hidden_copy,
+                active_tokens_per_rank,
+            ),
+            (*self._pointer_types(6), ctypes.c_int32, ctypes.c_int32, ctypes.c_int32),
+            torch.cuda.current_stream(self._device).cuda_stream,
+            grid=(active_tokens_per_rank, 1, 1),
+        )
         self._active_tokens_per_rank = active_tokens_per_rank
         self._inputs_staged = True
+        self._staged_capture_id = capture_id
+
+    def _launch_ll_push(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        active_tokens_per_rank: int,
+    ) -> None:
+        """Send one LL forward's ids, weights and routed rows (ll_push).
+
+        One push kernel writes every token's ids/weights (and routed rows)
+        into the owners' LL dispatch buffers; nothing waits on a peer here.
+        """
+        p = self._ptr
+        self._library.launch(
+            self._stage_by_name["ll_push"],
+            (
+                p(hidden_states),
+                p(topk_ids),
+                p(topk_weights),
+                p(self._topk_ids.local),
+                1 if topk_ids.dtype is torch.int64 else 0,
+                active_tokens_per_rank,
+                _WORLD_SIZE,
+                self._rank,
+                p(self._ll_dispatch.peers),
+                p(self._ll_control),
+                p(self._ll_reuse.peers),
+                p(self._ll_combine.peers),
+            ),
+            (
+                *self._pointer_types(4),
+                *(ctypes.c_int32,) * 4,
+                *self._pointer_types(4),
+            ),
+            torch.cuda.current_stream(self._device).cuda_stream,
+            grid=(
+                active_tokens_per_rank,
+                _WORLD_SIZE,
+                _ll_row_splits(active_tokens_per_rank),
+            ),
+        )
 
     def bind_weights(
         self, w13_block_major: torch.Tensor, w2_block_major: torch.Tensor
@@ -995,21 +1399,23 @@ class BlackwellBf16RankMajorSession:
             )
         active_tokens_per_rank = self._active_tokens_per_rank
         world_rank = (_WORLD_SIZE, self._rank)
-        if name == "input_barrier":
+        if name in ("input_barrier", "input_arrive"):
             return (
                 (
-                    p(self._expert_ids_i64),
                     p(self._topk_ids.local),
                     active_tokens_per_rank,
                     *world_rank,
                     p(self._flags.peers),
+                    p(self._routed.peers),
+                    p(self._route_codes.peers),
                 ),
                 (
                     ctypes.c_void_p,
+                    ctypes.c_int32,
+                    ctypes.c_int32,
+                    ctypes.c_int32,
                     ctypes.c_void_p,
-                    ctypes.c_int32,
-                    ctypes.c_int32,
-                    ctypes.c_int32,
+                    ctypes.c_void_p,
                     ctypes.c_void_p,
                 ),
             )
@@ -1027,6 +1433,17 @@ class BlackwellBf16RankMajorSession:
                 p(self._topk_ids.peers),
                 p(self._topk_weights.local),
                 p(self._topk_weights.peers),
+                p(self._routed.local),
+                p(self._expert_scatter_offsets),
+                p(self._token_to_permuted),
+                p(self._cta_to_expert),
+                p(self._cta_to_mn_limit),
+                p(self._expert_padded_row_offsets),
+                p(self._num_non_exiting_ctas),
+                p(self._total_padded_rows),
+                p(self._route_map),
+                p(self._gemm2_output[_FIXED_EXPERT_ROWS]),
+                p(self._route_codes.local),
             )
             return values, (
                 ctypes.c_void_p,
@@ -1042,39 +1459,84 @@ class BlackwellBf16RankMajorSession:
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.c_void_p,
+                ctypes.c_void_p,
+                *self._pointer_types(10),
             )
-        if name == "route_reset":
-            sentinel = self._gemm2_output[_FIXED_EXPERT_ROWS]
-            values = (p(self._expert_scatter_offsets), p(sentinel))
-            return values, self._pointer_types(2)
-        if name == "route_count":
+        if name == "ll_recv":
             values = (
+                p(self._recv_hidden),
                 p(self._recv_local_ids),
+                p(self._recv_weights),
+                active_tokens_per_rank,
+                *world_rank,
+                p(self._ll_dispatch.local),
+                p(self._ll_control),
                 p(self._expert_scatter_offsets),
                 p(self._token_to_permuted),
-                active_tokens_per_rank,
-            )
-            return values, (*self._pointer_types(3), ctypes.c_int32)
-        if name == "route_finalize":
-            values = (
-                p(self._expert_scatter_offsets),
                 p(self._cta_to_expert),
                 p(self._cta_to_mn_limit),
                 p(self._expert_padded_row_offsets),
                 p(self._num_non_exiting_ctas),
                 p(self._total_padded_rows),
                 p(self._route_map),
+                p(self._gemm2_output[_FIXED_EXPERT_ROWS]),
+                _ll_row_splits(active_tokens_per_rank),
             )
-            return values, self._pointer_types(7)
-        if name == "route_scatter":
+            return values, (
+                *self._pointer_types(3),
+                ctypes.c_int32,
+                ctypes.c_int32,
+                ctypes.c_int32,
+                *self._pointer_types(11),
+                ctypes.c_int32,
+            )
+        if name == "ll_unpermute":
+            values = (
+                p(self._gemm2_output),
+                p(self._recv_weights),
+                p(self._token_to_permuted),
+                p(self._ll_combine.peers),
+                p(self._ll_control),
+                _HIDDEN_SIZE,
+                active_tokens_per_rank,
+                self._rank,
+            )
+            return values, (
+                *self._pointer_types(5),
+                ctypes.c_int32,
+                ctypes.c_int32,
+                ctypes.c_int32,
+            )
+        if name == "ll_combine":
+            values = (
+                p(output),
+                self._rank,
+                p(self._ll_combine.local),
+                p(self._ll_control),
+                p(self._topk_ids.local),
+                p(self._ll_reuse.local),
+            )
+            return values, (
+                ctypes.c_void_p,
+                ctypes.c_int32,
+                *self._pointer_types(4),
+            )
+        if name == "route_fused":
+            sentinel = self._gemm2_output[_FIXED_EXPERT_ROWS]
             values = (
                 p(self._recv_local_ids),
-                p(self._expert_padded_row_offsets),
-                p(self._route_map),
+                p(self._expert_scatter_offsets),
                 p(self._token_to_permuted),
+                p(self._cta_to_expert),
+                p(self._cta_to_mn_limit),
+                p(self._expert_padded_row_offsets),
+                p(self._num_non_exiting_ctas),
+                p(self._total_padded_rows),
+                p(self._route_map),
+                p(sentinel),
                 active_tokens_per_rank,
             )
-            return values, (*self._pointer_types(4), ctypes.c_int32)
+            return values, (*self._pointer_types(10), ctypes.c_int32)
         if name == "gemm1_swiglu":
             values = (
                 self._descriptors["fc1_weights"],
@@ -1108,7 +1570,7 @@ class BlackwellBf16RankMajorSession:
                 active_tokens_per_rank,
             )
             return values, (*self._pointer_types(4), ctypes.c_int32, ctypes.c_int32)
-        if name == "partial_barrier":
+        if name in ("partial_barrier", "partial_arrive"):
             return (
                 (*world_rank, p(self._flags.peers)),
                 (ctypes.c_int32, ctypes.c_int32, ctypes.c_void_p),
@@ -1120,6 +1582,7 @@ class BlackwellBf16RankMajorSession:
                 p(self._flags.peers),
                 p(self._local_partials.local),
                 p(self._local_partials.peers),
+                p(self._topk_ids.local),
             )
             return values, (
                 ctypes.c_void_p,
@@ -1128,11 +1591,27 @@ class BlackwellBf16RankMajorSession:
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.c_void_p,
+                ctypes.c_void_p,
             )
         raise RuntimeError(f"unknown Blackwell BF16 rank-major stage {name!r}")
 
     def run(self, output: torch.Tensor) -> torch.Tensor:
         self._require_open()
+        capture_id = self._current_capture_id()
+        self._forget_work_of_ended_captures(capture_id)
+        try:
+            self._check_run(output, capture_id)
+        except Exception:
+            # Nothing of this call was launched.  Peers may wait for the staged
+            # forward, so complete it (a deferred push is sent first) before
+            # reporting the error.
+            must_complete = self._stage_needs_completion() or self._ll_push_deferred
+            if must_complete and self._stage_blocker(capture_id) is None:
+                self._complete_staged_forward(capture_id)
+            raise
+        return self._launch_staged(output, capture_id)
+
+    def _check_run(self, output: torch.Tensor, capture_id: int | None) -> None:
         if self._active_weight_key is None:
             raise RuntimeError("Blackwell BF16 rank-major expert weights are not bound")
         if not self._inputs_staged:
@@ -1141,7 +1620,18 @@ class BlackwellBf16RankMajorSession:
             raise RuntimeError(
                 "Blackwell BF16 rank-major active token count is not set"
             )
+        if self._launch_failed_in_capture(capture_id):
+            raise RuntimeError(
+                "Blackwell BF16 rank-major cannot resume the staged forward: one of "
+                "its launches failed in this CUDA graph capture"
+            )
         active_tokens_per_rank = self._active_tokens_per_rank
+        must_match = active_tokens_per_rank <= _LL_MAX_T or self._launched_stages > 0
+        if must_match and self._staged_capture_id != capture_id:
+            raise RuntimeError(
+                "Blackwell BF16 rank-major inputs were staged outside the active "
+                "CUDA graph capture"
+            )
         if (
             tuple(output.shape) != (active_tokens_per_rank, _HIDDEN_SIZE)
             or output.dtype is not torch.bfloat16
@@ -1152,23 +1642,65 @@ class BlackwellBf16RankMajorSession:
                 "output must be contiguous bfloat16 "
                 f"[{active_tokens_per_rank}, 7168] on the session device"
             )
+
+    def _launch_staged(
+        self, output: torch.Tensor, capture_id: int | None
+    ) -> torch.Tensor:
+        """Launch the rest of the staged forward (every check already passed)."""
+        active_tokens_per_rank = self._active_tokens_per_rank
+        if active_tokens_per_rank is None:
+            raise RuntimeError(
+                "Blackwell BF16 rank-major active token count is not set"
+            )
         active_grids = _active_stage_grids(active_tokens_per_rank)
         stream = torch.cuda.current_stream(self._device).cuda_stream
-        for stage in self._manifest["stages"]:
-            values, types = self._stage_arguments(stage["name"], output)
-            if len(values) != len(stage["bindings"]):
-                raise RuntimeError(
-                    f"stage {stage['name']} argument count differs from the manifest"
-                )
-            self._library.launch(
-                stage,
-                values,
-                types,
-                stream,
-                grid=active_grids.get(stage["name"]),
+        order: tuple[str, ...]
+        if active_tokens_per_rank <= _LL_MAX_T:
+            order = ("ll_recv", "gemm1_swiglu", "gemm2", "ll_unpermute", "ll_combine")
+            if self._ll_push_deferred:
+                order = ("ll_push", *order)
+        else:
+            order = (
+                "input_arrive",
+                "dispatch",
+                "route_fused",
+                "gemm1_swiglu",
+                "gemm2",
+                "local_unpermute",
+                "partial_arrive",
+                "combine",
             )
-        self._inputs_staged = False
-        self._active_tokens_per_rank = None
+        if not self._launched_stages:
+            self._launch_capture_id = capture_id
+        # Each launch is recorded at once.  After a failed launch the forward
+        # resumes at that kernel, so none of its kernels is launched twice.
+        for index in range(self._launched_stages, len(order)):
+            stage = self._stage_by_name[order[index]]
+            if stage["name"] == "ll_push":
+                self._launch_ll_push(
+                    self._ll_deferred_hidden,
+                    self._ll_deferred_ids,
+                    self._ll_deferred_weights,
+                    active_tokens_per_rank,
+                )
+            elif not (
+                stage["name"] == "route_fused"
+                and active_tokens_per_rank <= _ROUTE_IN_DISPATCH_MAX_T
+            ):
+                values, types = self._stage_arguments(stage["name"], output)
+                if len(values) != len(stage["bindings"]):
+                    raise RuntimeError(
+                        f"stage {stage['name']} argument count differs from the manifest"
+                    )
+                self._library.launch(
+                    stage,
+                    values,
+                    types,
+                    stream,
+                    grid=active_grids.get(stage["name"]),
+                )
+            self._launched_stages = index + 1
+        self._clear_stage()
         return output
 
     def destroy(self) -> None:

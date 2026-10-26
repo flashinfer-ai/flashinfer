@@ -25,12 +25,15 @@ import tempfile
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
-_CACHE_VERSION = 1
+from flashinfer.moe_ep._compat import deprecated_aliases
+
+# Bump when kernel or knob semantics invalidate previous tuning results.
+BACKEND_REVISION = "sm107-block-scaled-1667b47a-runtime-options-v1"
 _KEY_FIELDS = (
     "backend_revision",
     "kernel_variant",
     "allow_nondeterministic",
-    "apply_topk_at_fc1",
+    "apply_routing_weights_before_fc2",
     "device",
     "dtype",
     "world_size",
@@ -75,6 +78,8 @@ def _device_key(device: Optional[str]) -> str:
 
 
 def _load_entries(path: str) -> List[Dict[str, Any]]:
+    from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
+
     try:
         with open(path) as f:
             data = json.load(f)
@@ -87,7 +92,7 @@ def _load_entries(path: str) -> List[Dict[str, Any]]:
             stacklevel=3,
         )
         return []
-    if not isinstance(data, dict) or data.get("version") != _CACHE_VERSION:
+    if not isinstance(data, dict) or data.get("version") != KNOB_CACHE_VERSION:
         warnings.warn(
             f"[moe_ep-knob-cache] {path!r} has unsupported version "
             f"{data.get('version') if isinstance(data, dict) else '?'}; ignoring.",
@@ -110,8 +115,9 @@ def _knobs_from_json(knobs: Dict[str, Any]) -> Dict[str, Any]:
     return {k: tuple(v) if isinstance(v, list) else v for k, v in knobs.items()}
 
 
-def lookup_knobs(
+def _matching_entries(
     *,
+    entries: Optional[List[Dict[str, Any]]] = None,
     dtype: str,
     world_size: int,
     hidden: int,
@@ -123,21 +129,21 @@ def lookup_knobs(
     kernel_variant: str = "inference",
     device: Optional[str] = None,
     allow_nondeterministic: bool = False,
-    apply_topk_at_fc1: bool = True,
+    apply_routing_weights_before_fc2: bool = True,
     activation: str = "swiglu",
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
-) -> Optional[Dict[str, Any]]:
-    """Return the cached knob dict for this session key, or ``None`` on miss."""
-    path = _cache_path()
-    if path is None:
-        return None
+) -> List[Dict[str, Any]]:
+    """Return records with a compatible numerical and execution contract."""
+    if entries is None:
+        path = _cache_path()
+        entries = [] if path is None else _load_entries(path)
     key = dict(
-        backend_revision="sm107-block-scaled-1667b47a-runtime-options-v1",
+        backend_revision=BACKEND_REVISION,
         kernel_variant=kernel_variant,
         allow_nondeterministic=allow_nondeterministic,
-        apply_topk_at_fc1=apply_topk_at_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         activation=activation,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
@@ -153,7 +159,7 @@ def lookup_knobs(
     )
     matches = [
         e
-        for e in _load_entries(path)
+        for e in entries
         if all(e.get(f) == key[f] for f in _KEY_FIELDS)
         and isinstance(e.get("knobs"), dict)
         and isinstance(e.get("max_tokens"), int)
@@ -161,6 +167,59 @@ def lookup_knobs(
             allow_nondeterministic or not e["knobs"].get("reduce_topk_in_kernel", False)
         )
     ]
+    return matches
+
+
+@deprecated_aliases(apply_topk_at_fc1="apply_routing_weights_before_fc2")
+def live_token_buckets(**kwargs: Any) -> List[int]:
+    from flashinfer.moe_ep.core.tuning import live_buckets
+
+    return live_buckets(_matching_entries(**kwargs), kwargs["max_tokens"])
+
+
+def lookup_record(
+    *,
+    entries: Optional[List[Dict[str, Any]]] = None,
+    dtype: str,
+    world_size: int,
+    hidden: int,
+    intermediate: int,
+    num_experts: int,
+    topk: int,
+    max_tokens: int,
+    live_tokens: Optional[int] = None,
+    combine_dtype: str = "bf16",
+    kernel_variant: str = "inference",
+    device: Optional[str] = None,
+    allow_nondeterministic: bool = False,
+    apply_routing_weights_before_fc2: bool = True,
+    activation: str = "swiglu",
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
+    gate_up_clamp: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    from flashinfer.moe_ep.core.tuning import select_token_entries
+
+    matches = _matching_entries(
+        entries=entries,
+        dtype=dtype,
+        world_size=world_size,
+        hidden=hidden,
+        intermediate=intermediate,
+        num_experts=num_experts,
+        topk=topk,
+        max_tokens=max_tokens,
+        combine_dtype=combine_dtype,
+        kernel_variant=kernel_variant,
+        device=device,
+        allow_nondeterministic=allow_nondeterministic,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+        activation=activation,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        gate_up_clamp=gate_up_clamp,
+    )
+    matches = select_token_entries(matches, max_tokens, live_tokens)
     if not matches:
         return None
     at_or_above = [e for e in matches if e["max_tokens"] >= max_tokens]
@@ -168,10 +227,17 @@ def lookup_knobs(
         best = min(at_or_above, key=lambda e: e["max_tokens"])
     else:
         best = max(matches, key=lambda e: e["max_tokens"])
-    return _knobs_from_json(best["knobs"])
+    return best
 
 
-def record_knobs(
+@deprecated_aliases(apply_topk_at_fc1="apply_routing_weights_before_fc2")
+def lookup_knobs(**kwargs: Any) -> Optional[Dict[str, Any]]:
+    """Resolve knobs using the same record lookup as the shared autotuner."""
+    record = lookup_record(**kwargs)
+    return None if record is None else _knobs_from_json(record["knobs"])
+
+
+def make_record(
     knobs: Dict[str, Any],
     *,
     dtype: str,
@@ -181,35 +247,33 @@ def record_knobs(
     num_experts: int,
     topk: int,
     max_tokens: int,
+    live_tokens: Optional[int] = None,
     combine_dtype: str = "bf16",
     kernel_variant: str = "inference",
     device: Optional[str] = None,
     p50_us: Optional[float] = None,
     source: str = "autotune",
     allow_nondeterministic: bool = False,
-    apply_topk_at_fc1: bool = True,
+    apply_routing_weights_before_fc2: bool = True,
     activation: str = "swiglu",
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
-) -> Optional[str]:
-    """Upsert one tuned entry (exact key incl. ``max_tokens``); atomic write.
-
-    Best-effort: returns the cache path written, or ``None`` when the cache is
-    disabled or the write failed.
-    """
+) -> Dict[str, Any]:
+    """Build a tuning record shared by FlashInfer and the MegaMoE file."""
     if knobs.get("reduce_topk_in_kernel", False) and not allow_nondeterministic:
         raise ValueError(
             "recording in-kernel reduction requires allow_nondeterministic=True"
         )
-    path = _cache_path()
-    if path is None:
-        return None
+    if live_tokens is None:
+        live_tokens = max_tokens
+    if type(live_tokens) is not int or not 0 <= live_tokens <= max_tokens:
+        raise ValueError("live_tokens must be between zero and max_tokens")
     entry = dict(
-        backend_revision="sm107-block-scaled-1667b47a-runtime-options-v1",
+        backend_revision=BACKEND_REVISION,
         kernel_variant=kernel_variant,
         allow_nondeterministic=allow_nondeterministic,
-        apply_topk_at_fc1=apply_topk_at_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         activation=activation,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
@@ -223,11 +287,22 @@ def record_knobs(
         topk=topk,
         combine_dtype=combine_dtype,
         max_tokens=max_tokens,
+        live_tokens=live_tokens,
         knobs=_knobs_to_json(knobs),
         p50_us=p50_us,
         source=source,
         tuned_at=datetime.datetime.now().isoformat(timespec="seconds"),
     )
+    return entry
+
+
+def write_record(entry: Dict[str, Any]) -> Optional[str]:
+    """Write a selected record to the configured MegaMoE cache file."""
+    path = _cache_path()
+    if path is None:
+        return None
+    max_tokens = entry["max_tokens"]
+    live_tokens = entry.get("live_tokens", max_tokens)
     try:
         entries = _load_entries(path)
         entries = [
@@ -236,15 +311,20 @@ def record_knobs(
             if not (
                 all(e.get(f) == entry[f] for f in _KEY_FIELDS)
                 and e.get("max_tokens") == max_tokens
+                and e.get("live_tokens", e["max_tokens"]) == live_tokens
             )
         ]
         entries.append(entry)
         directory = os.path.dirname(path) or "."
         os.makedirs(directory, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=directory, prefix=".moe_ep_knob_cache.")
+        from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
+
         try:
             with os.fdopen(fd, "w") as f:
-                json.dump({"version": _CACHE_VERSION, "entries": entries}, f, indent=1)
+                json.dump(
+                    {"version": KNOB_CACHE_VERSION, "entries": entries}, f, indent=1
+                )
             os.replace(tmp, path)
         except BaseException:
             with contextlib.suppress(OSError):
@@ -258,6 +338,12 @@ def record_knobs(
         )
         return None
     return path
+
+
+@deprecated_aliases(apply_topk_at_fc1="apply_routing_weights_before_fc2")
+def record_knobs(knobs: Dict[str, Any], **kwargs: Any) -> Optional[str]:
+    """Record a winner in the MegaMoE file; return its path if written."""
+    return write_record(make_record(knobs, **kwargs))
 
 
 def default_knobs(
@@ -312,6 +398,7 @@ def default_knobs(
     return knobs
 
 
+@deprecated_aliases(apply_topk_at_fc1="apply_routing_weights_before_fc2")
 def resolve_knobs(
     *,
     dtype: str,
@@ -321,10 +408,11 @@ def resolve_knobs(
     num_experts: int,
     topk: int,
     max_tokens: int,
+    live_tokens: Optional[int] = None,
     combine_dtype: str = "bf16",
     kernel_variant: str = "inference",
     allow_nondeterministic: bool = False,
-    apply_topk_at_fc1: bool = True,
+    apply_routing_weights_before_fc2: bool = True,
     activation: str = "swiglu",
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
@@ -342,10 +430,11 @@ def resolve_knobs(
         num_experts=num_experts,
         topk=topk,
         max_tokens=max_tokens,
+        live_tokens=live_tokens,
         combine_dtype=combine_dtype,
         kernel_variant=kernel_variant,
         allow_nondeterministic=allow_nondeterministic,
-        apply_topk_at_fc1=apply_topk_at_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         activation=activation,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,

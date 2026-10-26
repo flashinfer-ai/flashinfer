@@ -14,14 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import dataclasses
 import math
+import re
+from pathlib import Path
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 from flashinfer.experimental.kimi_k3_vision_tower import cake_backend as cb
-from flashinfer.experimental.kimi_k3_vision_tower import cake_jit
+from flashinfer.experimental.kimi_k3_vision_tower import cake_build, cake_jit
 from flashinfer.experimental.kimi_k3_vision_tower.cake_backend import (
     FFN,
     GEMM_BLOCK_M,
@@ -163,11 +166,12 @@ def test_select_tile_config_buckets():
         "pos": ("xs_pf", "xs_pf", "s_e8_pf", "s_e8_pf"),
         "pos_sqxw": ("xs_pf", "xs_pf", "s_e8_pf", "s_e8_pf"),
         "norm_qkv_rope": ("xs_cs_pf", "s_cs", "l_e8_cs", "l_e8_cs"),
-        "residual_wo": ("xs_pf", "xs_pf", "s_e8_pf", "m_tma1"),
-        "residual_wo_sqxw": ("xs_pf", "xs_pf", "s_e8_pf", "m_tma1"),
+        "residual_wo": ("xs_pf", "xs_pf", "s_e8_pf", "l_e8_tma1x"),
+        "residual_wo_sqxw": ("xs_pf", "xs_pf", "s_e8_pf", "l_e8_tma1x"),
         "residual_fc1": ("xs_k4_pf", "xs_pf", "l_e8_pf", "m_p"),
         "residual_fc1_sqxw": ("xs_k4_pf", "xs_pf", "l_e8_pf", "m_p"),
-        "norm_gelu": ("xs", "s", "l_e8", "l_e8"),
+        # norm_gelu (K = 1024) takes the eight-warp pair tile m_e8 above NG_M_E8_MIN_M (768 rows).
+        "norm_gelu": ("xs", "m_e8", "l_e8", "l_e8"),
         # Round 4: the projector GEMMs take the stream-K twin ``l_sk`` inside the tile-census
         # window (gelu_erf at 10764: 688 pair tiles on 74 clusters, tail 22 = 30 %, saving 7 %).
         "gelu_erf": ("xs", "s", "l", "l_sk"),
@@ -187,16 +191,29 @@ def test_select_tile_config_buckets():
         "pos": [(1, "xs_pf"), (1025, "s_e8_pf")],
         "pos_sqxw": [(1, "xs_pf"), (1025, "s_e8_pf")],
         # Round 5: the eight-warp 256 x 128 pair tile inside (QKV_M_E8_MIN_M, M_E8_MAX_M] (norm_qkv_rope) /
-        # (NG_S_LIMIT, M_E8_MAX_M] (norm_gelu); Cake ``_m_e8_twin``.
+        # (NG_M_E8_MIN_M, M_E8_MAX_M] (norm_gelu); Cake ``_m_e8_twin``.  Inside (QKV_M_E8_MIN_M, L_E8_HALF_MAX_M] a
+        # 256 x 256 census whose tail fits one half-round keeps the 256-wide tile (2305 .. 2560 / 2816 on 148 SMs);
+        # norm_qkv_rope keeps 128 x 64 up to QKV_XS_LIMIT (512 rows).
         "norm_qkv_rope": [
             (1, "xs_cs_pf"),
-            (769, "s_cs"),
+            (513, "s_cs"),
             (1537, "l_e8_cs"),
-            (2305, "m_e8_cs"),
+            (2561, "m_e8_cs"),
             (4097, "l_e8_cs"),
         ],
-        "residual_wo": [(1, "xs_pf"), (1025, "s_e8_pf"), (6145, "m_tma1")],
-        "residual_wo_sqxw": [(1, "xs_pf"), (1025, "s_e8_pf"), (6145, "m_tma1")],
+        # The out-proj pair branch: m_tma1 up to 8191, the 256 x 256 tile from WO_PAIR_BANDS' 8192 on.
+        "residual_wo": [
+            (1, "xs_pf"),
+            (1025, "s_e8_pf"),
+            (6145, "m_tma1"),
+            (8192, "l_e8_tma1x"),
+        ],
+        "residual_wo_sqxw": [
+            (1, "xs_pf"),
+            (1025, "s_e8_pf"),
+            (6145, "m_tma1"),
+            (8192, "l_e8_tma1x"),
+        ],
         # Round 5 (Cake ``_fc1_sk_twin``): ``m_sk`` where the 256 x 256 census leaves 1..4 tiles in an extra round
         # (4609..4864 -> 76 pair tiles on 74 clusters), ``l_sk`` from 3.4 ideal rounds (15873) up to FC1_SK_L_MAX_M.
         "residual_fc1": [
@@ -219,12 +236,13 @@ def test_select_tile_config_buckets():
             (8193, "m_p"),
             (15873, "l_sk"),
         ],
+        # The (512, 768] 128 x 64 window is gelu_erf's (K = 4096) alone.
         "norm_gelu": [
             (1, "xs"),
             (257, "s"),
-            (513, "xs"),
-            (769, "s"),
-            (1657, "m_e8"),
+            (769, "m_e8"),
+            (2305, "l_e8"),
+            (2817, "m_e8"),
             (4097, "l_e8"),
         ],
         # Round 4 / 5: ``l`` <-> ``l_sk`` alternate per 128-row tile pair inside the pair-tile range wherever
@@ -298,7 +316,8 @@ def test_select_tile_config_buckets():
         assert not (cfg.sk and (cfg.tail or cfg.ksplit != 1 or cfg.cta_group != 2))
     # The stream-K twins exist for the pair tiles of the projector GEMMs (census window; above 16 rounds,
     # M > 17792 for gelu_erf, the window can no longer be met) and, round 5, of residual_fc1 (m_sk at the
-    # 4609..4864 census point, l_sk for 15873 <= M <= FC1_SK_L_MAX_M); no other form takes one.
+    # 4609..4864 census point, l_sk for 15873 <= M <= FC1_SK_L_MAX_M, its column-first twin l_sk_cf inside the
+    # arch's windows); no other form takes one.
     for variant in expect:
         if variant not in ("gelu_erf", "rmsnorm", "residual_fc1", "residual_fc1_sqxw"):
             assert not any(
@@ -314,13 +333,49 @@ def test_select_tile_config_buckets():
     assert [m for m, name in fc1 if name == "m_sk"] == [4609, 4737]
     l_sk = [m for m, name in fc1 if name == "l_sk"]
     assert (l_sk[0], l_sk[-1], len(l_sk)) == (15873, 105857, 704)
-    assert select_tile_config("residual_fc1_sqxw", cb.FC1_SK_L_MAX_M).name == "l_sk"
+    l_sk_cf = [
+        m for m, name in fc1 if name == "l_sk_cf"
+    ]  # no arch: the union of the arches' windows
+    assert (l_sk_cf[0], l_sk_cf[-1], len(l_sk_cf)) == (105985, 152961, 368)
+    assert cb.FC1_SK_L_MAX_M == 153088
+    assert select_tile_config("residual_fc1_sqxw", cb.FC1_SK_L_MAX_M).name == "l_sk_cf"
     assert base("residual_fc1_sqxw", cb.FC1_SK_L_MAX_M + 1).name == "m_p"
-    assert base("residual_fc1_sqxw", 153088).name == "m_p"
-    assert select_tile_config("residual_fc1_sqxw", 153088).name == "m_p"
-    # The census counts cover every routing window of the module (fc1 l_sk up to 105984, PDL windows) plus
-    # the rule boundaries and the PDL window edges on M.
-    assert cb.GEMM_CENSUS_LIMIT == 105984 + GEMM_BLOCK_M
+    # The column-first raster twin (same tile geometry) inside each arch's inclusive token windows, and the fc1
+    # forms' TMA-epilogue tile inside FC1_TMA_WINDOWS (both arches).
+    for name, twin in cb.COLS_FIRST_TWINS.items():
+        assert TILE_CONFIGS[twin] == dataclasses.replace(TILE_CONFIGS[name], name=twin)
+    assert cb.FC1_TMA_TILE == "l_e8_tma1x_h" and TILE_CONFIGS["l_e8_tma1x_h"].half
+    for arch, m, name in (
+        ("sm_100a", 10764, "l_e8_tma1x_h"),
+        ("sm_100a", 10765, "m_p"),
+        ("sm_100a", 11340, "l_e8_tma1x_h"),
+        ("sm_100a", 14100, "l_e8_tma1x_h"),
+        ("sm_100a", 14101, "m_p_h"),
+        ("sm_100a", 16508, "l_sk_cf"),
+        ("sm_100a", 16576, "l_sk"),
+        ("sm_100a", 19136, "l_sk_cf"),
+        ("sm_100a", 43056, "l_sk_cf"),
+        ("sm_100a", 105984, "l_sk_cf"),
+        ("sm_103a", 10764, "l_e8_tma1x_h"),
+        ("sm_103a", 11340, "l_e8_tma1x_h"),
+        ("sm_103a", 14100, "l_e8_tma1x_h"),
+        ("sm_103a", 16576, "l_sk_cf"),
+        ("sm_103a", 19140, "l_sk_cf"),
+        ("sm_103a", 43068, "l_sk_cf"),
+        ("sm_103a", 105984, "l_sk_cf"),
+        ("sm_103a", 105983, "l_sk"),
+        ("sm_100a", 153088, "l_sk_cf"),
+        ("sm_103a", 153088, "l_sk_cf"),
+    ):
+        for variant in cb.COLS_FIRST_VARIANTS:
+            assert select_tile_config(variant, m, arch=arch).name == name, (
+                variant,
+                arch,
+                m,
+            )
+    # The census counts cover every routing window of the module (fc1 l_sk up to 153088, PDL windows, the
+    # column-first twin windows) plus the rule boundaries and the window edges on M.
+    assert cb.GEMM_CENSUS_LIMIT == 153088 + GEMM_BLOCK_M
     counts = cb.gemm_census_counts("gelu_erf")
     assert counts[:3] == (1, 129, 143) and {
         143,
@@ -331,8 +386,14 @@ def test_select_tile_config_buckets():
         1196,
         1197,
     } <= set(counts)
-    assert {4096, 4097, 2304, 2305, 105984, 105985} <= set(
+    assert {4096, 4097, 2304, 2305, 768, 769, 3072, 3073, 153088, 153089} <= set(
         cb.gemm_census_counts("norm_gelu")
+    )
+    assert {10763, 10764, 10765, 11339, 11340, 11341, 14099, 14100, 14101} <= set(
+        cb.gemm_census_counts("residual_fc1_sqxw")
+    )
+    assert {16508, 16576, 19135, 19136, 19140, 19141, 43055, 43069} <= set(
+        cb.gemm_census_counts("residual_fc1_sqxw")
     )
     # The tail split-K twins are opt-in in Cake and never selected.
     for variant in expect:
@@ -353,21 +414,25 @@ def test_select_tile_config_buckets():
     )  # 72 > 70: a >= 97 %-full half round is a tie
     assert cb.half_tail_split(74 * 4, 74) == 0 and cb.half_tail_split(50, 74) == 0
     for variant, m, name in (
-        ("norm_gelu", 2552, "m_e8_h"),
+        # 2552: inside (QKV_M_E8_MIN_M, L_E8_HALF_MAX_M] the 256 x 256 census (160 tiles, tail 12) fits one
+        # half-round, so norm_gelu keeps l_e8 and takes its half twin.
+        ("norm_gelu", 2552, "l_e8_h"),
         ("residual_wo_sqxw", 2552, "s_e8_pf_h"),
-        ("residual_wo_sqxw", 19136, "m_tma1_h"),
-        ("residual_wo_sqxw", 8192, "m_tma1"),  # HALF_MIN_ROUNDS: 4 rounds
-        ("residual_wo_sqxw", 12288, "m_tma1_h"),  # 6 rounds
-        ("residual_wo_sqxw", 10764, "m_tma1"),
+        # The out-proj 256 x 256 tile: 4 column tiles per pair row on 74 clusters.
+        ("residual_wo_sqxw", 19136, "l_e8_tma1x_h"),  # 300 tiles, tail 4
+        ("residual_wo_sqxw", 8192, "l_e8_tma1x"),  # 128 tiles, tail 54: 108 > 70
+        ("residual_wo_sqxw", 12288, "l_e8_tma1x"),  # 192 tiles, tail 44: 88 > 70
+        ("residual_wo_sqxw", 10764, "l_e8_tma1x_h"),  # 172 tiles, tail 24
+        (
+            "residual_wo_sqxw",
+            7168,
+            "m_tma1",
+        ),  # m_tma1 runs below 8192, short of its 6 rounds
         ("residual_wo_sqxw", 4144, "s_e8_pf"),
         ("norm_qkv_rope", 4144, "l_e8_cs_h"),
         ("norm_qkv_rope", 1152, "s_cs_h"),
-        (
-            "norm_qkv_rope",
-            576,
-            "xs_cs_pf",
-        ),  # the xs tile never takes its twin
-        ("norm_gelu", 576, "xs"),
+        ("norm_qkv_rope", 576, "s_cs_h"),
+        ("norm_gelu", 576, "s_h"),
         ("norm_qkv_rope", 256, "xs_cs_pf"),
         ("rmsnorm", 4144, "l_h"),
         ("gelu_erf", 1196, "s_h"),
@@ -376,8 +441,9 @@ def test_select_tile_config_buckets():
             638,
             "xs",
         ),  # (gelu_erf, xs) never takes its twin
-        ("residual_wo_sqxw", 66564, "m_tma1"),  # 33 rounds > HALF_MAX_ROUNDS
-        ("residual_wo_sqxw", 43056, "m_tma1_h"),  # 20 rounds: twin kept
+        ("residual_wo_sqxw", 66564, "l_e8_tma1x_h"),  # 15 rounds, tail 8
+        ("residual_wo_sqxw", 43056, "l_e8_tma1x_h"),  # 10 rounds, tail 10
+        ("residual_wo_sqxw", 153088, "l_e8_tma1x"),  # 33 rounds > HALF_MAX_ROUNDS
         ("norm_gelu", 66564, "l_e8"),
         ("norm_gelu", 153088, "l_e8"),
         ("norm_gelu", 19140, "l_e8_h"),
@@ -413,13 +479,22 @@ def test_select_tile_config_buckets():
             getattr(b, f) for f in fields
         ), name
     assert not any(select_tile_config("pos_sqxw", m).half for m in range(1, 65537, 128))
+    # norm_gelu keeps its m_e8 tile whole (no half-N twin).
+    assert not any(
+        select_tile_config("norm_gelu", m).name == "m_e8_h" for m in range(1, 20001)
+    )
     # Final-head limits (Cake HALF_MAX_ROUNDS; the xs twins Cake excludes on every form are not in the catalogue).
     assert cb.HALF_MAX_ROUNDS == 24
     assert not any(name.startswith("xs") for name in cb.HALF_TWIN.values())
-    # m_tma1_h needs >= 6 persistent rounds (8192 = 4 rounds regressed the batch8_448 tower row on B200); 12288 keeps it.
+    # m_tma1_h needs >= 6 persistent rounds; the out-proj runs m_tma1 only below WO_PAIR_BANDS' 8192 (at most 4 rounds
+    # on 74 clusters), so its half twin is never launched there.
     assert cb.HALF_MIN_ROUNDS == {"m_tma1": 6}
-    assert select_tile_config("residual_wo_sqxw", 8192).name == "m_tma1"
-    assert select_tile_config("residual_wo_sqxw", 12288).name == "m_tma1_h"
+    assert cb.WO_PAIR_BANDS == ((8192, 2**30, "l_e8_tma1x"),)
+    assert not any(
+        select_tile_config("residual_wo_sqxw", m).half for m in range(6145, 8192)
+    )
+    assert select_tile_config("residual_wo_sqxw", 8191).name == "m_tma1"
+    assert select_tile_config("residual_wo_sqxw", 8192).name == "l_e8_tma1x"
     assert not any(
         select_tile_config(variant, m).name in ("xs_h", "xs_cs_pf_h")
         for variant in ("gelu_erf", "norm_gelu", "norm_qkv_rope")
@@ -427,7 +502,7 @@ def test_select_tile_config_buckets():
     )
     assert all(
         not select_tile_config(variant, m).half
-        for variant in ("residual_wo_sqxw", "norm_gelu", "norm_qkv_rope")
+        for variant in ("norm_gelu", "norm_qkv_rope")
         for m in (66564, 105984, 153088)
     )
     assert not any(
@@ -474,28 +549,33 @@ def test_gemm_launch_geometry():
     geo = gemm_launch_geometry("residual_fc1_sqxw", cfg, 4784, SM_COUNT)
     assert (geo.grid, geo.m_tiles, geo.cluster_tiles) == ((148, 1, 1), 38, 152)
     assert (geo.full_tiles, geo.tail_split) == (148, 22)
-    cfg = select_tile_config("residual_fc1_sqxw", 16576)
+    cfg = select_tile_config("residual_fc1_sqxw", 16576, arch="sm_100a")
     assert cfg.name == "l_sk"
     geo = gemm_launch_geometry("residual_fc1_sqxw", cfg, 16576, SM_COUNT)
     assert (geo.grid, geo.m_tiles, geo.cluster_tiles) == ((148, 1, 1), 130, 260)
     assert (geo.full_tiles, geo.tail_split) == (222, 33)
+    # sm_103a runs its column-first twin there: the same geometry.
+    cfg = select_tile_config("residual_fc1_sqxw", 16576, arch="sm_103a")
+    assert cfg.name == "l_sk_cf" and cfg.sk
+    assert gemm_launch_geometry("residual_fc1_sqxw", cfg, 16576, SM_COUNT) == geo
     # Round 6 half-N twins: the full rounds stay whole tiles; the ``half_tail_split`` tail runs as half items
-    # (norm_gelu at 2552: 20 pair rows / 2 x 32 column tiles = 320 tiles on 74 clusters, tail 24 -> 48 <= 70).
+    # (norm_gelu at 2552: 20 pair rows / 2 x 16 column tiles = 160 tiles on 74 clusters, tail 12 -> 24 <= 70).
     cfg = select_tile_config("norm_gelu", 2552)
-    assert cfg.name == "m_e8_h" and cfg.half
+    assert cfg.name == "l_e8_h" and cfg.half
     geo = gemm_launch_geometry("norm_gelu", cfg, 2552, SM_COUNT)
-    assert (geo.grid, geo.m_tiles, geo.cluster_tiles) == ((148, 1, 1), 20, 320)
-    assert (geo.full_tiles, geo.tail_split) == (296, 1)
-    # The out-proj TMA-epilogue twin at 19136 (150 pair rows / 2 x 8 column tiles = 600 tiles, tail 8).
+    assert (geo.grid, geo.m_tiles, geo.cluster_tiles) == ((148, 1, 1), 20, 160)
+    assert (geo.full_tiles, geo.tail_split) == (148, 1)
+    # The out-proj 256 x 256 TMA-epilogue tile's half twin at 19136 (150 pair rows / 2 x 4 column tiles = 300 tiles,
+    # tail 4).
     cfg = select_tile_config("residual_wo_sqxw", 19136)
-    assert cfg.name == "m_tma1_h"
+    assert cfg.name == "l_e8_tma1x_h"
     geo = gemm_launch_geometry("residual_wo_sqxw", cfg, 19136, SM_COUNT)
-    assert (geo.cluster_tiles, geo.full_tiles, geo.tail_split) == (600, 592, 1)
+    assert (geo.cluster_tiles, geo.full_tiles, geo.tail_split) == (300, 296, 1)
     # The base tile of a half twin keeps the whole-tile geometry.
     geo = gemm_launch_geometry(
-        "residual_wo_sqxw", TILE_CONFIGS["m_tma1"], 19136, SM_COUNT
+        "residual_wo_sqxw", TILE_CONFIGS["l_e8_tma1x"], 19136, SM_COUNT
     )
-    assert (geo.cluster_tiles, geo.full_tiles, geo.tail_split) == (600, 600, 1)
+    assert (geo.cluster_tiles, geo.full_tiles, geo.tail_split) == (300, 300, 1)
 
 
 def test_pdl_early_window_and_exclusions():
@@ -571,6 +651,69 @@ def test_export_rows_plan_onto_registered_programs(arch):
             name = cake_jit.kernel_module_name(arch, stage_key)
             assert arch in cake_jit.MODULES[name]["arches"], (label, stage_key)
             assert cake_jit.MODULES[name]["arg_plan"] in cake_jit.ARG_PLANS
+
+
+def test_registry_keys_and_programs_agree():
+    """Every logical kernel key of an architecture names a registered program built for
+    it (and ``kernel_module_name`` returns that program), every registered program is
+    reached by a key on each architecture it is built for, and a key an architecture lacks
+    is rejected the way the host plan expects."""
+    assert tuple(cake_jit.KERNELS) == cake_jit.ARCHES
+    reached = {name: set() for name in cake_jit.MODULES}
+    for arch, table in cake_jit.KERNELS.items():
+        assert list(table) == sorted(table)
+        for key, name in table.items():
+            record = cake_jit.MODULES[name]
+            assert arch in record["arches"], (arch, key, name)
+            assert record["arg_plan"] in cake_jit.ARG_PLANS, (arch, key, name)
+            assert cake_jit.kernel_module_name(arch, key) == name
+            reached[name].add(arch)
+    for name, record in cake_jit.MODULES.items():
+        assert reached[name] == set(record["arches"]), name
+    every_key = {key for table in cake_jit.KERNELS.values() for key in table}
+    for arch, table in cake_jit.KERNELS.items():
+        for key in sorted(every_key - set(table)):
+            assert not cake_jit.route_available(arch, (key,))
+            with pytest.raises(NotImplementedError):
+                cake_jit.kernel_module_name(arch, key)
+    with pytest.raises(NotImplementedError):
+        cake_jit.kernel_module_name("sm_90a", cake_jit.MERGE_KERNEL_KEY)
+
+
+def test_registry_records_reference_the_build_manifest():
+    """Every ``MODULES`` record names one ``build.json`` entry per architecture it is built
+    for (schema ``cake-build/1``): the entry's sources exist under ``csrc/`` with their
+    digests and a closure digest, ``--use_fast_math`` is an entry flag exactly for the GEMM
+    and attention programs and ptxas ``--opt-level=1`` exactly for the attention programs;
+    every entry is referenced (pure text; no module is built)."""
+    manifest = cake_build.manifest()
+    assert manifest["schema"] == "cake-build/1"
+    assert manifest["package"] == cake_jit.__name__.rsplit(".", 1)[0]
+    libraries = cake_build.libraries_by_name()
+    package = Path(cake_build.__file__).resolve().parent
+    referenced = set()
+    for name, record in cake_jit.MODULES.items():
+        assert record["library"] == name and record["kernel"] == f"kernel_{name}"
+        assert record["launch"]["use_pdl"] is True
+        assert record["launch"]["cooperative"] is False
+        for arch in record["arches"]:
+            library = cake_jit.library_name(name, arch)
+            referenced.add(library)
+            entry = libraries[library]
+            assert entry["arch"] == arch and entry["entry"] == "run"
+            assert entry["sources"] and set(entry["sha256"]) == set(entry["sources"])
+            for source in entry["sources"]:
+                assert source.startswith("csrc/") and (package / source).is_file(), (
+                    source
+                )
+            assert re.fullmatch(r"[0-9a-f]{64}", entry["closure_sha256"])
+            flags = entry["nvcc_flags"]
+            fast = record["arg_plan"] in ("gemm", "attention")
+            assert ("--use_fast_math" in flags) is fast, (name, arch)
+            assert ("--ptxas-options=--opt-level=1" in flags) is (
+                record["arg_plan"] == "attention"
+            ), (name, arch)
+    assert referenced == set(libraries)
 
 
 @pytest.mark.parametrize("label,grids", list(CONTRACT_GRIDS.items()))
@@ -925,12 +1068,13 @@ def test_plan_on_cpu_device_needs_sm_count():
     assert sk_plan.gemm_kernel_keys["norm_qkv_rope"] == "gemm:norm_qkv_rope:l_e8_cs_h"
     assert (
         sk_plan.gemm_kernel_keys["residual_wo_sqxw"]
-        == "gemm:residual_wo_sqxw:m_tma1:pdle"
+        == "gemm:residual_wo_sqxw:l_e8_tma1x_h:pdle"
     )
     assert sk_plan.gemm_kernel_keys["norm_gelu"] == "gemm:norm_gelu:l_e8_h:pdle"
+    # (the fc1 forms' TMA-epilogue tile at 10764, on both arches)
     assert (
         sk_plan.gemm_kernel_keys["residual_fc1_sqxw"]
-        == "gemm:residual_fc1_sqxw:m_p:pdle"
+        == "gemm:residual_fc1_sqxw:l_e8_tma1x_h:pdle"
     )
     assert plan.gemm_kernel_keys == {
         "pos_sqxw": "gemm:pos_sqxw:xs_pf",

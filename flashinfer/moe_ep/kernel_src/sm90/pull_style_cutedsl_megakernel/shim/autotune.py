@@ -414,6 +414,11 @@ def autotune_hopper_fp8_mega_moe(
     def _record(winner: Dict[str, Any], p50_s: float) -> None:
         # Persist for future pure-lookup engine starts; rank 0 writes (the
         # winner is identical on all ranks after the all_reduce).
+        from flashinfer.moe_ep.core.tuning import tuning_live_tokens
+
+        live_tokens = tuning_live_tokens(
+            num_tokens, cfg.num_tokens_per_rank, process_group
+        )
         if cfg.rank == 0:
             from .knob_cache import record_knobs
 
@@ -429,6 +434,7 @@ def autotune_hopper_fp8_mega_moe(
                 num_experts=cfg.num_total_experts,
                 topk=cfg.num_topk,
                 max_tokens=cfg.num_tokens_per_rank,
+                live_tokens=live_tokens,
                 gate_up_clamp=record_cfg.gate_up_clamp,
                 p50_us=p50_s * 1e6,
                 source="autotune",

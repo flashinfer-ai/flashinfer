@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <flashinfer/attention/sparse_mla_sm120/compute/nvfp4_quantization.cuh>
 #include <flashinfer/attention/sparse_mla_sm120/model/dsv41_layout.cuh>
+#include <type_traits>
 
 #include "../tvm_ffi_utils.h"
 
@@ -58,9 +59,18 @@ struct PagedCacheInfo {
   int num_pages;
   int page_size;
   size_t page_stride_bytes;
+  // Advance between a page's rows: the record for footer pages; the 16B-aligned
+  // row pitch for inline-scale records (the page pitch for one-row pages).
+  size_t row_pitch;
+  // Slot-mapping geometry: an append slot is page * rows_per_page + entry, and
+  // slots below num_rows are writable. Footer pages hold page_size slots;
+  // inline-scale records are rows of the whole cache, so a multi-row page
+  // spans page_stride / row_pitch rows (padding rows included).
+  size_t rows_per_page;
+  size_t num_rows;
 };
 
-PagedCacheInfo parse_dsv41_fp8_paged_layout(const TensorView& cache) {
+PagedCacheInfo parse_dsv41_fp8_paged_layout_pages(const TensorView& cache, bool inline_scale) {
   constexpr size_t BPT = Dsv41Fp8Layout::BYTES_PER_TOKEN;
   constexpr size_t VECTOR_ALIGNMENT = alignof(uint4);
   TVM_FFI_ICHECK_EQ(cache.dtype(), dl_uint8) << "DSV4_1 FP8 kv_cache must be uint8";
@@ -76,8 +86,10 @@ PagedCacheInfo parse_dsv41_fp8_paged_layout(const TensorView& cache) {
     TVM_FFI_ICHECK_EQ(cache.stride(1), 1) << "kv_cache byte dimension must be contiguous";
     TVM_FFI_ICHECK_GE(cache.stride(0), static_cast<int64_t>(page_bytes))
         << "kv_cache page stride is smaller than its logical payload";
+    const bool pitched_row = inline_scale && page_bytes == BPT;
     return {static_cast<int>(cache.size(0)), static_cast<int>(page_bytes / BPT),
-            static_cast<size_t>(cache.stride(0))};
+            static_cast<size_t>(cache.stride(0)),
+            pitched_row ? static_cast<size_t>(cache.stride(0)) : BPT};
   }
   TVM_FFI_ICHECK_EQ(static_cast<size_t>(cache.size(cache.ndim() - 1)), BPT)
       << "DSV4_1 FP8 cache last dimension must be " << BPT;
@@ -92,12 +104,38 @@ PagedCacheInfo parse_dsv41_fp8_paged_layout(const TensorView& cache) {
   }
   TVM_FFI_ICHECK_EQ(cache.stride(cache.ndim() - 1), 1)
       << "kv_cache byte dimension must be contiguous";
-  TVM_FFI_ICHECK_EQ(cache.stride(page_dim), static_cast<int64_t>(BPT))
-      << "DSV4_1 FP8 footer rows must stay packed";
-  TVM_FFI_ICHECK_GE(cache.stride(0), cache.size(page_dim) * static_cast<int64_t>(BPT))
+  // Inline-scale records may sit at any 16B-aligned row pitch; a one-row
+  // page's singleton row axis carries no layout, so its pitch is the page's.
+  const int64_t rows = cache.size(page_dim);
+  const int64_t pitch = inline_scale && rows == 1 ? cache.stride(0) : cache.stride(page_dim);
+  if (inline_scale) {
+    TVM_FFI_ICHECK(pitch >= static_cast<int64_t>(BPT) && pitch % VECTOR_ALIGNMENT == 0)
+        << "DSV4_1 FP8 inline-scale row pitch must be a 16-byte multiple of at least " << BPT
+        << " bytes; got " << pitch;
+  } else {
+    TVM_FFI_ICHECK_EQ(pitch, static_cast<int64_t>(BPT))
+        << "DSV4_1 FP8 footer rows must stay packed";
+  }
+  TVM_FFI_ICHECK_GE(cache.stride(0), rows * pitch)
       << "DSV4_1 FP8 page stride is smaller than its logical payload";
-  return {static_cast<int>(cache.size(0)), static_cast<int>(cache.size(page_dim)),
-          static_cast<size_t>(cache.stride(0))};
+  return {static_cast<int>(cache.size(0)), static_cast<int>(rows),
+          static_cast<size_t>(cache.stride(0)), static_cast<size_t>(pitch)};
+}
+
+PagedCacheInfo parse_dsv41_fp8_paged_layout(const TensorView& cache, bool inline_scale) {
+  PagedCacheInfo info = parse_dsv41_fp8_paged_layout_pages(cache, inline_scale);
+  info.rows_per_page = size_t(info.page_size);
+  if (inline_scale && info.page_size > 1) {
+    TVM_FFI_ICHECK_EQ(info.page_stride_bytes % info.row_pitch, 0)
+        << "DSV4_1 FP8 inline-scale records are rows of the whole cache; the page stride must be a "
+           "whole number of "
+        << info.row_pitch << "-byte rows";
+    info.rows_per_page = info.page_stride_bytes / info.row_pitch;
+  }
+  info.num_rows = info.num_pages == 0
+                      ? 0
+                      : size_t(info.num_pages - 1) * info.rows_per_page + size_t(info.page_size);
+  return info;
 }
 
 void check_latent(const TensorView& input, int64_t expected_tokens) {
@@ -190,41 +228,39 @@ __device__ __forceinline__ void quantize_token(const T* input, uint8_t* data_out
   quantize_dsv41_half_group(input + offset, data_output + offset, scale_output + group, half == 0);
 }
 
-__device__ __forceinline__ uint8_t* data_row(uint8_t* cache, size_t slot, int page_size,
-                                             size_t page_stride_bytes) {
-  const size_t page_idx = slot / page_size;
-  const size_t entry_idx = slot % page_size;
-  return cache + page_idx * page_stride_bytes + Dsv41Fp8Layout::data_offset(entry_idx);
+// Footer pages keep a page's data rows ahead of its scale rows; inline-scale
+// records keep each row's scales right after its data.
+template <bool Inline>
+__device__ __forceinline__ void token_rows(uint8_t* cache, const PagedCacheInfo& g, size_t page,
+                                           size_t entry, uint8_t*& data, uint8_t*& scales) {
+  uint8_t* base = cache + page * g.page_stride_bytes;
+  if constexpr (Inline) {
+    data = base + entry * g.row_pitch;
+    scales = data + Dsv41Fp8LayoutT<true>::DATA_BYTES;
+  } else {
+    data = base + Dsv41Fp8Layout::data_offset(entry);
+    scales = base + Dsv41Fp8Layout::scale_offset(static_cast<size_t>(g.page_size), entry);
+  }
 }
 
-__device__ __forceinline__ uint8_t* scale_row(uint8_t* cache, size_t slot, int page_size,
-                                              size_t page_stride_bytes) {
-  const size_t page_idx = slot / page_size;
-  const size_t entry_idx = slot % page_size;
-  return cache + page_idx * page_stride_bytes +
-         Dsv41Fp8Layout::scale_offset(static_cast<size_t>(page_size), entry_idx);
-}
-
-template <typename T>
-__global__ void QuantizePackKernel(const T* input, uint8_t* cache, int num_pages, int page_size,
-                                   size_t page_stride_bytes) {
+template <typename T, bool Inline>
+__global__ void QuantizePackKernel(const T* input, uint8_t* cache, PagedCacheInfo g) {
   const int page_idx = blockIdx.x;
   const int entry_idx = blockIdx.y;
-  if (page_idx >= num_pages || entry_idx >= page_size) return;
-  const size_t token_idx = static_cast<size_t>(page_idx) * page_size + entry_idx;
-  quantize_token(input + token_idx * Dsv41Fp8Layout::D_NOPE,
-                 data_row(cache, token_idx, page_size, page_stride_bytes),
-                 scale_row(cache, token_idx, page_size, page_stride_bytes));
+  if (page_idx >= g.num_pages || entry_idx >= g.page_size) return;
+  const size_t token_idx = static_cast<size_t>(page_idx) * g.page_size + entry_idx;
+  uint8_t *data, *scales;
+  token_rows<Inline>(cache, g, page_idx, entry_idx, data, scales);
+  quantize_token(input + token_idx * Dsv41Fp8Layout::D_NOPE, data, scales);
 }
 
-template <typename T, typename IdType>
+template <typename T, typename IdType, bool Inline>
 __global__ void QuantizeAppendKernel(const T* input, const IdType* slot_mapping, int num_tokens,
-                                     uint8_t* cache, int num_pages, int page_size,
-                                     size_t page_stride_bytes) {
+                                     uint8_t* cache, PagedCacheInfo g) {
   const int token_idx = blockIdx.x;
   if (token_idx >= num_tokens) return;
   const IdType slot = slot_mapping[token_idx];
-  if (slot < 0 || static_cast<size_t>(slot) >= static_cast<size_t>(num_pages) * page_size) return;
+  if (slot < 0 || static_cast<size_t>(slot) >= g.num_rows) return;
 
   // Duplicate slot mappings resolve deterministically: the lowest-index input
   // row wins, so a repeated slot cannot tear a cache record across blocks
@@ -236,20 +272,21 @@ __global__ void QuantizeAppendKernel(const T* input, const IdType* slot_mapping,
   }
   if (__any_sync(0xffffffffu, has_earlier_duplicate)) return;
 
-  quantize_token(input + static_cast<size_t>(token_idx) * Dsv41Fp8Layout::D_NOPE,
-                 data_row(cache, static_cast<size_t>(slot), page_size, page_stride_bytes),
-                 scale_row(cache, static_cast<size_t>(slot), page_size, page_stride_bytes));
+  uint8_t *data, *scales;
+  token_rows<Inline>(cache, g, static_cast<size_t>(slot) / g.rows_per_page,
+                     static_cast<size_t>(slot) % g.rows_per_page, data, scales);
+  quantize_token(input + static_cast<size_t>(token_idx) * Dsv41Fp8Layout::D_NOPE, data, scales);
 }
 
 }  // namespace
 
-void SparseMlaSm120Dsv41Fp8QuantizePack(TensorView latent_kv, TensorView cache) {
+void SparseMlaSm120Dsv41Fp8QuantizePack(TensorView latent_kv, TensorView cache, bool inline_scale) {
   CHECK_CUDA(latent_kv);
   CHECK_CUDA(cache);
   TVM_FFI_ICHECK_EQ(latent_kv.device().device_id, cache.device().device_id)
       << "latent_kv and cache must be on the same CUDA device";
 
-  const PagedCacheInfo shape = parse_dsv41_fp8_paged_layout(cache);
+  const PagedCacheInfo shape = parse_dsv41_fp8_paged_layout(cache, inline_scale);
   check_latent(latent_kv, static_cast<int64_t>(shape.num_pages) * shape.page_size);
   if (shape.num_pages == 0 || shape.page_size == 0) return;
   ffi::CUDADeviceGuard device_guard(latent_kv.device().device_id);
@@ -258,9 +295,13 @@ void SparseMlaSm120Dsv41Fp8QuantizePack(TensorView latent_kv, TensorView cache) 
   const dim3 block(kThreadsPerToken);
 
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(latent_kv.dtype(), c_type, [&] {
-    QuantizePackKernel<c_type><<<grid, block, 0, stream>>>(
-        static_cast<const c_type*>(latent_kv.data_ptr()), static_cast<uint8_t*>(cache.data_ptr()),
-        shape.num_pages, shape.page_size, shape.page_stride_bytes);
+    auto* input = static_cast<const c_type*>(latent_kv.data_ptr());
+    auto* out = static_cast<uint8_t*>(cache.data_ptr());
+    if (inline_scale) {
+      QuantizePackKernel<c_type, true><<<grid, block, 0, stream>>>(input, out, shape);
+    } else {
+      QuantizePackKernel<c_type, false><<<grid, block, 0, stream>>>(input, out, shape);
+    }
     return true;
   });
   const cudaError_t status = cudaGetLastError();
@@ -269,7 +310,7 @@ void SparseMlaSm120Dsv41Fp8QuantizePack(TensorView latent_kv, TensorView cache) 
 }
 
 void SparseMlaSm120Dsv41Fp8QuantizeAppend(TensorView latent_kv, TensorView slot_mapping,
-                                          TensorView cache) {
+                                          TensorView cache, bool inline_scale) {
   CHECK_CUDA(latent_kv);
   CHECK_CUDA(slot_mapping);
   CHECK_CUDA(cache);
@@ -282,7 +323,7 @@ void SparseMlaSm120Dsv41Fp8QuantizeAppend(TensorView latent_kv, TensorView slot_
       << "slot_mapping must have dtype int32 or int64";
   TVM_FFI_ICHECK(slot_mapping.IsContiguous()) << "slot_mapping must be contiguous";
 
-  const PagedCacheInfo shape = parse_dsv41_fp8_paged_layout(cache);
+  const PagedCacheInfo shape = parse_dsv41_fp8_paged_layout(cache, inline_scale);
   const int num_tokens = static_cast<int>(slot_mapping.size(0));
   check_latent(latent_kv, num_tokens);
   if (num_tokens == 0) return;
@@ -293,18 +334,17 @@ void SparseMlaSm120Dsv41Fp8QuantizeAppend(TensorView latent_kv, TensorView slot_
   const dim3 block(kThreadsPerToken);
 
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(latent_kv.dtype(), c_type, [&] {
+    auto launch = [&](auto id, auto inline_records) {
+      using IdType = decltype(id);
+      QuantizeAppendKernel<c_type, IdType, decltype(inline_records)::value>
+          <<<grid, block, 0, stream>>>(static_cast<const c_type*>(latent_kv.data_ptr()),
+                                       static_cast<const IdType*>(slot_mapping.data_ptr()),
+                                       num_tokens, static_cast<uint8_t*>(cache.data_ptr()), shape);
+    };
     if (slot_mapping.dtype() == dl_int32) {
-      QuantizeAppendKernel<c_type, int32_t>
-          <<<grid, block, 0, stream>>>(static_cast<const c_type*>(latent_kv.data_ptr()),
-                                       static_cast<const int32_t*>(slot_mapping.data_ptr()),
-                                       num_tokens, static_cast<uint8_t*>(cache.data_ptr()),
-                                       shape.num_pages, shape.page_size, shape.page_stride_bytes);
+      inline_scale ? launch(int32_t{}, std::true_type{}) : launch(int32_t{}, std::false_type{});
     } else {
-      QuantizeAppendKernel<c_type, int64_t>
-          <<<grid, block, 0, stream>>>(static_cast<const c_type*>(latent_kv.data_ptr()),
-                                       static_cast<const int64_t*>(slot_mapping.data_ptr()),
-                                       num_tokens, static_cast<uint8_t*>(cache.data_ptr()),
-                                       shape.num_pages, shape.page_size, shape.page_stride_bytes);
+      inline_scale ? launch(int64_t{}, std::true_type{}) : launch(int64_t{}, std::false_type{});
     }
     return true;
   });

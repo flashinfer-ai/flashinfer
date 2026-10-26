@@ -234,3 +234,9 @@ __device__ __forceinline__ void tmem_st_x32_f32(int tmem_addr, const float* src)
 // header did not define.
 #include "cake_device_helpers/cake_f32_mul_f64const_rn_reference_b66ea4f5da5a92dc.cuh"
 #include "cake_device_helpers/cake_f32_mul_f64const_rn_c45c9c808ac06b93.cuh"
+
+// Added after the shipped text (append-only delivery): device helpers the delivered kernels take that the
+// header did not define.
+struct CakeFastDivmod { int32_t divisor; uint32_t multiplier; uint32_t shift_right; };
+static_assert(sizeof(CakeFastDivmod) == 12, "CakeFastDivmod CUDA ABI must be 12 bytes");
+static_assert(alignof(CakeFastDivmod) == 4, "CakeFastDivmod CUDA ABI must be 4-byte aligned");

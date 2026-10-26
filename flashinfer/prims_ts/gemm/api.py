@@ -211,6 +211,9 @@ def _overlap_epilogue_supported(config: PrimsTsGemmConfig) -> bool:
         return config.output_format == "bf16"
     if config.epilogue == "swiglu":
         return config.output_format in ("bf16", "nvfp4_e2m1")
+    # QKNorm holds one retired subtile in registers; SF384 needs two.
+    if config.epilogue == "qkv_qknorm_rope":
+        return config.output_format == "bf16" and config.nvfp4_mma_k == 64
     return False
 
 
@@ -249,8 +252,8 @@ def _load_kernel(config: PrimsTsGemmConfig) -> ModuleType:
         module.use_tma_store = config.use_tma_store
         if config.tmem_overlap and not _overlap_epilogue_supported(config):
             raise ValueError(
-                "tmem_overlap supports NVFP4 BF16 linear and BF16/NVFP4 SwiGLU "
-                "epilogues only"
+                "tmem_overlap supports NVFP4 BF16 linear, BF16/NVFP4 SwiGLU and "
+                "MMA-K=64 BF16 QKV/QKNorm/RoPE epilogues only"
             )
         module.use_nvfp4_tmem_overlap = config.tmem_overlap
         module._tile_k_override = config.tile_k
@@ -953,10 +956,15 @@ def prepare_fp4_qkv_qknorm_rope(
     is_neox=False,
     mma_k: int = 64,
     tile_k: int = 256,
+    tmem_overlap: bool = False,
     qkv_scale=None,
     config=None,
 ) -> PreparedFp4Linear:
-    """Prepare a fixed packed-NVFP4 QKV+QKNorm+RoPE projection."""
+    """Prepare a fixed packed-NVFP4 QKV+QKNorm+RoPE projection.
+
+    ``tmem_overlap=True`` releases the accumulator after the QKNorm sum pass,
+    so the next tile's MMA overlaps the normalize/RoPE/store pass (MMA-K=64).
+    """
     if num_q_heads != num_kv_heads:
         raise ValueError("the copied QKV specialization requires equal Q/KV heads")
     if weight_packed.shape[0] != 3 * num_q_heads * head_dim:
@@ -974,6 +982,7 @@ def prepare_fp4_qkv_qknorm_rope(
         is_neox=is_neox,
         mma_k=mma_k,
         tile_k=tile_k,
+        tmem_overlap=tmem_overlap,
         config=config,
     )
 

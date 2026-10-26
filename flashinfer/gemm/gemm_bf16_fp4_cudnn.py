@@ -35,7 +35,7 @@ from .gemm_base import (
     _get_cudnn_workspace_size,
     _cudnn_graph_engine_knob_tactics,
     _finalize_cudnn_graph_for_tactic,
-    _tactic_for_graph_cache,
+    _get_cudnn_override_graph,
     _torch_data_type_to_cudnn_data_type,
     _is_cudnn_override_shape_available,
     _check_cudnn_override_shape_availability,
@@ -396,7 +396,9 @@ def _cudnn_bf16_fp4_runner(tuning_config):
             actual_m, k = int(a.shape[0]), int(a.shape[1])
             n = int(b.shape[0])
             cache_m = self._m_bucket_mapper(actual_m)
-            return build_cudnn_bf16_fp4_graph_override_shape(
+            return _get_cudnn_override_graph(
+                build_cudnn_bf16_fp4_graph_override_shape,
+                tactic,
                 batch=1,
                 n=n,
                 k=k,
@@ -407,7 +409,6 @@ def _cudnn_bf16_fp4_runner(tuning_config):
                 alpha_is_not_none=alpha is not None,
                 use_nvfp4=use_nvfp4,
                 cache_m=cache_m,
-                tactic=_tactic_for_graph_cache(tactic),
             )
 
         def get_valid_tactics(

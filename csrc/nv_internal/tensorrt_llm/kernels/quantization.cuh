@@ -721,6 +721,134 @@ cvt_fp16_to_fp4_expert(
 #endif
 }
 
+// MXFP8 quantization of an expert-major, masked batch, optionally fused with SiLU-and-mul.
+//
+// in:    [numExperts, numRows, numCols], or [numExperts, numRows, 2 * numCols] (gate then up)
+//        when USE_SILU_AND_MUL is set.
+// out:   [numExperts, numRows, numPaddedCols] e4m3; padded columns are zero.
+// SFout: per expert, [round_up(numRows, 128), numPaddedCols / 32] UE8M0 scales, 128x4 swizzled;
+//        padded columns get scale byte 0.
+// mask:  [numExperts]; only the first min(mask[e], numRows) rows of expert e are read and written.
+//
+// The valid rows of all experts form one list, so a skewed mask still spreads over the whole grid.
+// blockIdx.x and threadIdx.y stride over the list, threadIdx.x over the half scale blocks of a row.
+// Two lanes quantize a scale block and shuffle its maximum within the warp, so a warp holds one row
+// and every lane runs every column iteration. With at most 32 experts each warp keeps the experts'
+// first rows in registers; otherwise the block keeps them in numExperts + 1 int32 of dynamic
+// shared memory.
+template <class Type, bool USE_SILU_AND_MUL>
+__global__ void cvt_fp16_to_mxfp8_expert(int32_t numExperts, int32_t numRows, int32_t numCols,
+                                         int32_t numPaddedCols, Type const* in, int32_t const* mask,
+                                         uint8_t* out, uint32_t* SFout) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  static constexpr int SF_VEC_SIZE = 32;
+  // Half a scale block, read with one 32-byte load.
+  using HalfBlockT = PackedVec<Type, SF_VEC_SIZE / 2>;
+  static_assert(sizeof(HalfBlockT) == sizeof(PackedU32x8));
+  extern __shared__ int32_t expertFirstRow[];
+
+  int const numHalfBlocks = numCols / (SF_VEC_SIZE / 2);
+  int const numPaddedHalfBlocks = numPaddedCols / (SF_VEC_SIZE / 2);
+  int const numInHalfBlocks = USE_SILU_AND_MUL ? 2 * numHalfBlocks : numHalfBlocks;
+  auto const quantizeRow = [&](int expertIdx, int rowIdx) {
+    // Non-negative indices let the scale-offset math use shifts instead of signed division.
+    __builtin_assume(rowIdx >= 0);
+    int64_t const rowOffset = static_cast<int64_t>(expertIdx) * numRows + rowIdx;
+    HalfBlockT const* inRow = reinterpret_cast<HalfBlockT const*>(in) + rowOffset * numInHalfBlocks;
+    for (int colBase = 0; colBase < numPaddedHalfBlocks; colBase += blockDim.x) {
+      int const colIdx = colBase + threadIdx.x;
+      HalfBlockT vec;
+      if (colIdx < numHalfBlocks) {
+        loadPackedVec(vec, inRow + colIdx);
+        if constexpr (USE_SILU_AND_MUL) {
+          HalfBlockT upVec;
+          loadPackedVec(upVec, inRow + numHalfBlocks + colIdx);
+          silu_and_mul<Type, SF_VEC_SIZE / 2>(vec, upVec);
+        }
+      } else {
+        reinterpret_cast<PackedU32x8&>(vec) = PackedU32x8{};
+      }
+      uint8_t* sfOut = nullptr;
+      if (colIdx < numPaddedHalfBlocks) {
+        sfOut = cvt_quant_get_sf_out_offset<uint32_t, 2>(expertIdx, rowIdx, colIdx, numRows,
+                                                         numPaddedCols / SF_VEC_SIZE, SFout,
+                                                         QuantizationSFLayout::SWIZZLED_128x4);
+      }
+      uint4 const outVec = cvt_warp_fp16_to_mxfp8<Type, SF_VEC_SIZE, SF_VEC_SIZE / 2>(vec, sfOut);
+      if (colIdx < numPaddedHalfBlocks) {
+        reinterpret_cast<uint4*>(out)[rowOffset * numPaddedHalfBlocks + colIdx] = outVec;
+      }
+    }
+  };
+
+  cudaGridDependencySynchronize();
+
+  int const tid = threadIdx.y * blockDim.x + threadIdx.x;
+  int const laneIdx = tid % 32;
+  int const listBegin = blockIdx.x * blockDim.y + threadIdx.y;
+  int const listStride = gridDim.x * blockDim.y;
+  // Inclusive warp scan of value; every lane passes the same carry.
+  auto const warpScan = [&](int value, int carry) {
+#pragma unroll
+    for (int offset = 1; offset < 32; offset *= 2) {
+      int const prev = __shfl_up_sync(0xffffffffu, value, offset);
+      value += laneIdx >= offset ? prev : 0;
+    }
+    return value + carry;
+  };
+
+  if (numExperts <= 32) {
+    int const count = laneIdx < numExperts ? max(0, min(mask[laneIdx], numRows)) : 0;
+    int const lastRow = warpScan(count, 0);
+    int const firstRow = lastRow - count;
+    int const numValidRows = __shfl_sync(0xffffffffu, lastRow, 31);
+    for (int listIdx = listBegin; listIdx < numValidRows; listIdx += listStride) {
+      // The row's expert is the last one whose first row is at most listIdx.
+      int const expertIdx =
+          __popc(__ballot_sync(0xffffffffu, laneIdx < numExperts && firstRow <= listIdx)) - 1;
+      quantizeRow(expertIdx, listIdx - __shfl_sync(0xffffffffu, firstRow, expertIdx));
+    }
+  } else {
+    for (int e = tid; e < numExperts; e += blockDim.x * blockDim.y) {
+      expertFirstRow[e + 1] = max(0, min(mask[e], numRows));
+    }
+    __syncthreads();
+    if (tid < 32) {
+      int carry = 0;
+      for (int base = 0; base < numExperts; base += 32) {
+        int const e = base + laneIdx;
+        int const lastRow = warpScan(e < numExperts ? expertFirstRow[e + 1] : 0, carry);
+        if (e < numExperts) {
+          expertFirstRow[e + 1] = lastRow;
+        }
+        carry = __shfl_sync(0xffffffffu, lastRow, 31);
+      }
+      if (laneIdx == 0) {
+        expertFirstRow[0] = 0;
+      }
+    }
+    __syncthreads();
+    int const numValidRows = expertFirstRow[numExperts];
+    for (int listIdx = listBegin; listIdx < numValidRows; listIdx += listStride) {
+      // The row's expert is the last one whose first row is at most listIdx; the first rows are
+      // non-decreasing, so the warp counts them 32 at a time.
+      int expertIdx = -1;
+      for (int base = 0; base < numExperts; base += 32) {
+        int const e = base + laneIdx;
+        unsigned const atOrBefore =
+            __ballot_sync(0xffffffffu, e < numExperts && expertFirstRow[e] <= listIdx);
+        expertIdx += __popc(atOrBefore);
+        if (atOrBefore != 0xffffffffu) {
+          break;
+        }
+      }
+      quantizeRow(expertIdx, listIdx - expertFirstRow[expertIdx]);
+    }
+  }
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
 __global__ void block_scale_interleave_kernel(int numbatches, int numRows, int numCols,
                                               uint8_t const* SFIn, uint8_t* SFOutput);
 
