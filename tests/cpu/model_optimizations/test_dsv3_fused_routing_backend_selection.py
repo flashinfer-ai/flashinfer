@@ -26,6 +26,7 @@ def _supported(**overrides):
     return _is_cake_dsv3_fused_routing_supported(**params)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
 @pytest.mark.parametrize("score_dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("bias_dtype", [torch.float16, torch.bfloat16, torch.float32])
@@ -37,6 +38,7 @@ def test_cake_backend_accepts_contract_dtype_and_arch_union(
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -58,6 +60,7 @@ def test_cake_backend_rejects_calls_outside_contract(overrides):
     assert not _supported(**overrides)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("num_experts", [2, 128, 256, 384])
 def test_cake_backend_accepts_single_group_boundary(num_experts):
     assert _supported(
@@ -68,10 +71,12 @@ def test_cake_backend_accepts_single_group_boundary(num_experts):
     )
 
 
+@pytest.mark.cpu_only
 def test_cake_backend_rejects_single_group_above_boundary():
     assert not _supported(num_experts=385, n_group=1, topk_group=1)
 
 
+@pytest.mark.cpu_only
 def test_cake_backend_preserves_source_single_group_topk_constraint():
     assert not _supported(num_experts=256, n_group=1, topk_group=1, topk=8)
 
@@ -105,6 +110,7 @@ def _selected_backend(monkeypatch, backend=None):
     return selected
 
 
+@pytest.mark.cpu_only
 def test_fused_topk_deepseek_preserves_default_backend(monkeypatch):
     def fail_on_capability_query(*_args, **_kwargs):
         raise AssertionError("default backend must not query Cake capability")
@@ -113,10 +119,12 @@ def test_fused_topk_deepseek_preserves_default_backend(monkeypatch):
     assert _selected_backend(monkeypatch) == ["default"]
 
 
+@pytest.mark.cpu_only
 def test_fused_topk_deepseek_allows_explicit_cake_backend(monkeypatch):
     assert _selected_backend(monkeypatch, backend="cake") == ["cake"]
 
 
+@pytest.mark.cpu_only
 def test_fused_topk_deepseek_backend_capability_metadata():
     assert fused_routing.fused_topk_deepseek.is_backend_supported("default", 90)
     assert fused_routing.fused_topk_deepseek.is_backend_supported("default", 100)
@@ -126,6 +134,7 @@ def test_fused_topk_deepseek_backend_capability_metadata():
     assert fused_routing.fused_topk_deepseek.is_backend_supported("cake", 107)
 
 
+@pytest.mark.cpu_only
 def test_cake_backend_check_queries_device_capability_once(monkeypatch):
     calls = []
 
