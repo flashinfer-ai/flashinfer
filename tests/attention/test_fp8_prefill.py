@@ -18,17 +18,17 @@ import pytest
 import torch
 
 import flashinfer
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import get_compute_capability, log2e
 
 
 def head_dim_512_supported() -> bool:
-    # head_dim > 256 is only supported on SM100+.
-    return get_compute_capability(torch.device("cuda:0"))[0] >= 10
+    # FP8 FA2 head_dim > 256 uses the Ampere+ large-head path.
+    return get_compute_capability(torch.device("cuda:0"))[0] >= 8
 
 
 def skip_if_head_dim_unsupported(head_dim: int):
     if head_dim > 256 and not head_dim_512_supported():
-        pytest.skip("head_dim > 256 is only supported on SM100 or newer")
+        pytest.skip("FP8 FA2 head_dim > 256 is only supported on SM80 or newer")
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -148,7 +148,7 @@ def test_batch_prefill_with_ragged_kv_cache_fp8(
     # Validates the ragged FP8 KV dequant kernel path (BF16 repack for hd128/256,
     # in-loop dequant for the k64B hd64 case) against the equivalent 16-bit kernel
     # run on the *same* dequantized values -- so no dependence on k/v scale
-    # plumbing (the fa2 ragged wrapper does not apply k_scale/v_scale).
+    # plumbing (calibration scales are tested separately below).
     if qo_len > kv_len and causal:
         pytest.skip("qo_len > kv_len and causal is not supported")
     torch.manual_seed(42)
@@ -279,6 +279,217 @@ def test_batch_decode_with_prefill_with_paged_kv_cache(
     o_decode_fp8 = decode_wrapper.run(q, kv_data)
 
     torch.testing.assert_close(o_decode_fp8, o_fp8, atol=1e-2, rtol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# CTA_TILE_Q selection for FP8-KV head_dim=512 (gh #3843)
+#
+# FP8 h512 ragged/single prefill run on the non-VO-split SharedStorage; only
+# the 2-Q x 2-KV-warp layout keeps its cross-warp merge buffer within the
+# 101376B per-block limit of SM120/121-class GPUs at CTA_TILE_Q=32 (the 1x4
+# layout needs 132176B and cannot launch there, and clamping to CTA_TILE_Q=16
+# doubles the KV traversal).
+# ---------------------------------------------------------------------------
+
+_PLAN_INFO_CTA_TILE_Q_IDX = 3  # PrefillPlanInfo::ToVector layout (scheduler.cuh)
+
+
+# 128: full Q tiles; 53: partial tail tile of 21 rows (the second Q-warp of
+# the 2x2 layout gets a partial slice -- the failure mode of the old generic
+# 2x2 layout removed in gh #523); 40: partial tail tile of 8 rows (the second
+# Q-warp gets no rows).
+@pytest.mark.parametrize("qo_len", [128, 53, 40])
+def test_ragged_fp8_h512_long_q_keeps_cta32(qo_len):
+    head_dim = 512
+    skip_if_head_dim_unsupported(head_dim)
+    torch.manual_seed(42)
+    batch_size = 2
+    kv_len = 128
+    num_qo_heads = num_kv_heads = 4
+    q = torch.randn(
+        batch_size * qo_len, num_qo_heads, head_dim, dtype=torch.float16
+    ).to(0)
+    k = torch.randn(
+        batch_size * kv_len, num_kv_heads, head_dim, dtype=torch.float16
+    ).to(0)
+    v = torch.randn(
+        batch_size * kv_len, num_kv_heads, head_dim, dtype=torch.float16
+    ).to(0)
+    k_fp8 = k.to(torch.float8_e4m3fn)
+    v_fp8 = v.to(torch.float8_e4m3fn)
+    qo_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
+    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len
+
+    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
+    wrapper_ref = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace_buffer, "NHD", backend="fa2"
+    )
+    wrapper_ref.plan(
+        qo_indptr,
+        kv_indptr,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        q_data_type=torch.float16,
+        kv_data_type=torch.float16,
+    )
+    o_ref = wrapper_ref.run(q, k_fp8.to(torch.float16), v_fp8.to(torch.float16))
+
+    wrapper_f8 = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace_buffer, "NHD", backend="fa2"
+    )
+    wrapper_f8.plan(
+        qo_indptr,
+        kv_indptr,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        q_data_type=torch.float16,
+        kv_data_type=torch.float8_e4m3fn,
+    )
+    # Long q must keep CTA_TILE_Q=32: 16 would double the KV traversal, and a
+    # regression to the 1x4 layout at 32 fails to launch on 99KB-smem GPUs
+    # ("Required shared memory (132176 bytes) exceeds ...").
+    assert wrapper_f8._plan_info[_PLAN_INFO_CTA_TILE_Q_IDX] == 32
+    o_fp8 = wrapper_f8.run(q, k_fp8, v_fp8)
+    torch.testing.assert_close(o_fp8.to(torch.float16), o_ref, atol=1e-2, rtol=1e-2)
+
+
+def test_paged_fp8_h512_long_q_keeps_cta32():
+    head_dim = 512
+    skip_if_head_dim_unsupported(head_dim)
+    torch.manual_seed(42)
+    batch_size = 2
+    qo_len = kv_len = 128
+    page_size = 16
+    num_qo_heads = num_kv_heads = 4
+    q = torch.randn(
+        batch_size * qo_len, num_qo_heads, head_dim, dtype=torch.float16
+    ).to(0)
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    kv_data_fp8 = (
+        torch.randn(
+            total_num_pages, 2, page_size, num_kv_heads, head_dim, dtype=torch.float16
+        )
+        .to(0)
+        .to(torch.float8_e4m3fn)
+    )
+    qo_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
+    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * num_pages_per_seq
+    kv_indices = torch.arange(0, total_num_pages).to(0).int()
+    kv_last_page_len = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
+    ).to(0)
+
+    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, "NHD", backend="fa2"
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=torch.float16,
+        kv_data_type=torch.float8_e4m3fn,
+    )
+    assert wrapper._plan_info[_PLAN_INFO_CTA_TILE_Q_IDX] == 32
+    o = wrapper.run(q, kv_data_fp8)
+    assert torch.isfinite(o).all()
+
+
+def test_single_prefill_fp8_h512_long_q():
+    head_dim = 512
+    skip_if_head_dim_unsupported(head_dim)
+    torch.manual_seed(42)
+    qo_len = 100  # 3 full CTA_TILE_Q=32 tiles plus a 4-row partial tile
+    kv_len = 128
+    num_qo_heads = num_kv_heads = 4
+    q = torch.randn(qo_len, num_qo_heads, head_dim, dtype=torch.float16).to(0)
+    k_fp8 = (
+        torch.randn(kv_len, num_kv_heads, head_dim, dtype=torch.float16)
+        .to(0)
+        .to(torch.float8_e4m3fn)
+    )
+    v_fp8 = (
+        torch.randn(kv_len, num_kv_heads, head_dim, dtype=torch.float16)
+        .to(0)
+        .to(torch.float8_e4m3fn)
+    )
+    o_ref = flashinfer.single_prefill_with_kv_cache(
+        q, k_fp8.to(torch.float16), v_fp8.to(torch.float16)
+    )
+    o_fp8 = flashinfer.single_prefill_with_kv_cache(q, k_fp8, v_fp8)
+    torch.testing.assert_close(o_fp8.to(torch.float16), o_ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("kv_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "k_scale,v_scale",
+    [(None, None), (1.0, 1.0), (0.25, None), (None, 0.5), (0.25, 0.5)],
+)
+def test_ragged_fp8_calibration_scales(q_dtype, kv_dtype, causal, k_scale, v_scale):
+    # Regression for #4979: compare against the actual quantized values, so
+    # quantization error cannot hide missing K/V calibration.
+    torch.manual_seed(0)
+    batch, qo_len, kv_len, heads, kv_heads, dim = 2, 53, 97, 8, 2, 128
+    q = torch.randn(batch * qo_len, heads, dim, dtype=q_dtype, device="cuda")
+    k = torch.randn(batch * kv_len, kv_heads, dim, device="cuda").to(kv_dtype)
+    v = torch.randn(batch * kv_len, kv_heads, dim, device="cuda").to(kv_dtype)
+    qo_indptr = torch.arange(batch + 1, dtype=torch.int32, device="cuda") * qo_len
+    kv_indptr = torch.arange(batch + 1, dtype=torch.int32, device="cuda") * kv_len
+    workspace = torch.empty(32 << 20, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace, "NHD", backend="fa2"
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        heads,
+        kv_heads,
+        dim,
+        causal=causal,
+        q_data_type=q_dtype,
+        kv_data_type=kv_dtype,
+        logits_soft_cap=3.0,
+    )
+    out = torch.empty_like(q)
+    lse = torch.empty(q.shape[:2], dtype=torch.float32, device="cuda")
+    actual, actual_lse = wrapper.run(
+        q, k, v, k_scale=k_scale, v_scale=v_scale, out=out, lse=lse, return_lse=True
+    )
+    assert actual.data_ptr() == out.data_ptr()
+    assert actual_lse.data_ptr() == lse.data_ptr()
+
+    q_ref = q.float().reshape(batch, qo_len, heads, dim).transpose(1, 2)
+    k_ref = k.float().reshape(batch, kv_len, kv_heads, dim).transpose(1, 2)
+    v_ref = v.float().reshape(batch, kv_len, kv_heads, dim).transpose(1, 2)
+    k_ref = k_ref.repeat_interleave(heads // kv_heads, dim=1)
+    v_ref = v_ref.repeat_interleave(heads // kv_heads, dim=1)
+    logits = (q_ref @ k_ref.transpose(-1, -2)) * (
+        (1.0 if k_scale is None else k_scale) / dim**0.5
+    )
+    logits = 3.0 * torch.tanh(logits / 3.0)
+    if causal:
+        mask = torch.arange(kv_len, device="cuda")[None, :] > (
+            torch.arange(qo_len, device="cuda")[:, None] + kv_len - qo_len
+        )
+        logits.masked_fill_(mask, float("-inf"))
+    expected = (logits.softmax(-1) @ v_ref) * (1.0 if v_scale is None else v_scale)
+    expected = expected.transpose(1, 2).reshape_as(actual)
+    # FlashInfer returns base-2 LSE; torch.logsumexp uses natural logarithms.
+    expected_lse = logits.logsumexp(-1).transpose(1, 2).reshape_as(actual_lse) * log2e
+    assert torch.isfinite(actual).all()
+    assert torch.isfinite(actual_lse).all()
+    torch.testing.assert_close(actual.float(), expected, atol=3e-3, rtol=1e-2)
+    torch.testing.assert_close(actual_lse, expected_lse, atol=1e-3, rtol=1e-3)
 
 
 if __name__ == "__main__":

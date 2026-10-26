@@ -1,0 +1,4 @@
+[build-system]
+requires = ["setuptools>=77", "packaging>=24", "wheel", "tqdm", "torch", "ninja", "requests", "numpy", "nvidia-ml-py", "apache-tvm-ffi>=0.1,<0.2"]
+build-backend = "build_backend"
+backend-path = ["."]

@@ -56,13 +56,18 @@ struct GemmDescriptors {
   CuBlasLtMatrixLayout b_layout;  // mat1
   CuBlasLtMatrixLayout d_layout;  // out
 
-  GemmDescriptors(int m, int n, int k, cudaDataType_t d_type)
+  GemmDescriptors(int m, int n, int k, cudaDataType_t d_type, const __nv_bfloat16* bias = nullptr)
       : matmul_desc(CUBLAS_COMPUTE_32F, CUDA_R_32F),
         a_layout(CUDA_R_16BF, n, k, k, /*t=*/true),
         b_layout(CUDA_R_16BF, k, m, k),
         d_layout(d_type, n, m, n) {
     matmul_desc.setAttribute(CUBLASLT_MATMUL_DESC_TRANSA, CUBLAS_OP_T);
     matmul_desc.setAttribute(CUBLASLT_MATMUL_DESC_TRANSB, CUBLAS_OP_N);
+    if (bias != nullptr) {
+      matmul_desc.setAttribute(CUBLASLT_MATMUL_DESC_EPILOGUE, CUBLASLT_EPILOGUE_BIAS);
+      matmul_desc.setAttribute(CUBLASLT_MATMUL_DESC_BIAS_POINTER, bias);
+      matmul_desc.setAttribute(CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, CUDA_R_16BF);
+    }
   }
 };
 
@@ -76,10 +81,10 @@ struct GemmDescriptors {
  * \param max_algos Maximum number of algorithms to retrieve.
  * \return Number of algorithms written to algo_buf.
  */
-inline int get_algorithms(int m, int n, int k, cudaDataType_t d_type,
+inline int get_algorithms(int m, int n, int k, cudaDataType_t d_type, const __nv_bfloat16* bias,
                           size_t workspace_size_in_bytes, cublasLtHandle_t lt_handle,
                           void* algo_buf, int max_algos) {
-  GemmDescriptors desc(m, n, k, d_type);
+  GemmDescriptors desc(m, n, k, d_type, bias);
 
   CuBlasLtMatmulPreference preference;
   preference.setAttribute(CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, workspace_size_in_bytes);
@@ -107,10 +112,11 @@ inline int get_algorithms(int m, int n, int k, cudaDataType_t d_type,
  * \param algo_idx  Index into algo_buf selecting which algorithm to use.
  */
 inline cublasStatus_t run_with_algo(const __nv_bfloat16* mat1, const __nv_bfloat16* mat2, void* out,
-                                    int m, int n, int k, cudaDataType_t d_type, void* workspace,
+                                    const __nv_bfloat16* bias, int m, int n, int k,
+                                    cudaDataType_t d_type, void* workspace,
                                     size_t workspace_size_in_bytes, cublasLtHandle_t lt_handle,
                                     cudaStream_t stream, const void* algo_buf, int algo_idx) {
-  GemmDescriptors desc(m, n, k, d_type);
+  GemmDescriptors desc(m, n, k, d_type, bias);
 
   cublasLtMatmulAlgo_t algo;
   std::memcpy(&algo, static_cast<const uint8_t*>(algo_buf) + algo_idx * kAlgoBytes, kAlgoBytes);

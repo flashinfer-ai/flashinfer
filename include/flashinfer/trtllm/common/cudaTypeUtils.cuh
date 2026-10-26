@@ -592,7 +592,11 @@ __device__ inline half2 cuda_cast<half2, __nv_fp8x2_e4m3>(__nv_fp8x2_e4m3 val) {
 
 template <>
 __device__ inline __nv_fp8x2_e4m3 cuda_cast<__nv_fp8x2_e4m3, float2>(float2 val) {
-  return __nv_fp8x2_e4m3(bf1622float2(float22bf162(val)));
+  // Direct conversion: an intermediate bf16 step drops mantissa bits that a
+  // small quantization scale then amplifies past e4m3 bucket boundaries.
+  __nv_fp8x2_e4m3 out;
+  out.__x = __nv_cvt_float2_to_fp8x2(val, __NV_SATFINITE, __NV_E4M3);
+  return out;
 }
 
 template <>
@@ -639,6 +643,16 @@ __device__ inline int8_t cuda_cast<int8_t, __nv_fp8_e4m3>(__nv_fp8_e4m3 val) {
 template <>
 __device__ inline __nv_fp8_e4m3 cuda_cast<__nv_fp8_e4m3, int8_t>(int8_t val) {
   return cuda_cast<__nv_fp8_e4m3>(cuda_cast<__nv_bfloat16>(cuda_cast<float>(val)));
+}
+
+template <>
+__device__ inline __nv_fp8x2_e5m2 cuda_cast<__nv_fp8x2_e5m2, float2>(float2 val) {
+  return __nv_fp8x2_e5m2(val);
+}
+
+template <>
+__device__ inline __nv_fp8_e5m2 cuda_cast<__nv_fp8_e5m2, float>(float val) {
+  return __nv_fp8_e5m2(val);
 }
 
 #endif  // ENABLE_FP8

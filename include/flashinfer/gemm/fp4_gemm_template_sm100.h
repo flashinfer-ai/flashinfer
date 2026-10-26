@@ -36,6 +36,9 @@
 
 namespace flashinfer {
 namespace gemm {
+#if defined(FLASHINFER_SM103_GENERIC_STORE256_NAMESPACE)
+namespace sm103_generic_store256 {
+#endif
 using namespace cute;
 
 #ifdef ENABLE_BF16
@@ -55,7 +58,11 @@ template <>
 struct SMTypeAdapter<_1SM> {
   static int const Scale = 1;
   using AtomThrShape = cute::Shape<_1, _1, _1>;
+#if defined(FLASHINFER_SM103_GENERIC_NOSMEM_EPILOGUE)
+  using EpilogueSchedule = cutlass::epilogue::NoSmemWarpSpecialized1Sm;
+#else
   using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized1Sm;
+#endif
   using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized1SmNvf4Sm100;
 };
 
@@ -63,9 +70,24 @@ template <>
 struct SMTypeAdapter<_2SM> {
   static int const Scale = 2;
   using AtomThrShape = cute::Shape<_2, _1, _1>;
+#if defined(FLASHINFER_SM103_GENERIC_NOSMEM_EPILOGUE)
+  using EpilogueSchedule = cutlass::epilogue::NoSmemWarpSpecialized2Sm;
+#else
   using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized2Sm;
+#endif
   using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100;
 };
+
+#if defined(FLASHINFER_SM103_GENERIC_NOSMEM_EPILOGUE)
+inline constexpr int kGenericFp4OutputAlignmentBits = 256;
+#else
+inline constexpr int kGenericFp4OutputAlignmentBits = 128;
+#endif
+
+template <class ElementOutput, class ElementCompute, class ElementSource, class ElementScalar>
+using GenericFp4FusionOperation =
+    cutlass::epilogue::fusion::LinearCombination<ElementOutput, ElementCompute, ElementSource,
+                                                 ElementScalar>;
 
 template <typename>
 constexpr auto always_false = false;
@@ -118,6 +140,8 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
     using ElementC = void;                                                                                   \
     using LayoutC = cutlass::layout::RowMajor;                                                               \
     static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<OutElementType>::value;                     \
+    static constexpr int AlignmentD =                                                                        \
+        kGenericFp4OutputAlignmentBits / cutlass::sizeof_bits<OutElementType>::value;                        \
                                                                                                              \
     using SFType = cutlass::float_ue4m3_t;                                                                   \
     using ElementCompute = float;                                                                            \
@@ -130,12 +154,11 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
     using MainloopSchedule = SMTypeAdapter<XSM_>::MainloopSchedule;                                          \
     using MmaTileShape = cute::Shape<cute::Int<CTA_M_ * SMTypeAdapter<XSM_>::Scale>,                         \
                                      cute::Int<CTA_N_>, cute::Int<CTA_K_>>;                                  \
+    using FusionOperation = GenericFp4FusionOperation<OutElementType, float, void, float>;                   \
     using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<                    \
         Arch, OperatorClass, MmaTileShape, ClusterShape, EpilogueTileType, ElementAccumulator,               \
-        ElementCompute, ElementC, LayoutC, AlignmentC, OutElementType, LayoutC, AlignmentC,                  \
-        EpilogueSchedule,                                                                                    \
-        cutlass::epilogue::fusion::LinearCombination<OutElementType, float, void,                            \
-                                                     float>>::CollectiveOp;                                  \
+        ElementCompute, ElementC, LayoutC, AlignmentC, OutElementType, LayoutC, AlignmentD,                  \
+        EpilogueSchedule, FusionOperation>::CollectiveOp;                                                    \
                                                                                                              \
     using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<                        \
         Arch, cutlass::arch::OpClassBlockScaledTensorOp, cute::tuple<ElementA, SFType>, LayoutA,             \
@@ -284,6 +307,9 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
 
 #endif
 
+#if defined(FLASHINFER_SM103_GENERIC_STORE256_NAMESPACE)
+}  // namespace sm103_generic_store256
+#endif
 }  // namespace gemm
 }  // namespace flashinfer
 #endif  // FLASHINFER_FP4_GEMM_TEMPLATE_SM100_H_

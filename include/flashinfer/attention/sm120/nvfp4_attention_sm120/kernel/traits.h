@@ -59,7 +59,6 @@ struct SharedStorageQKVOwithSF : cute::aligned_struct<128, _0> {
         typename nvfp4_attention::OrderedSequenceBarrierVarGroupSize<EpiStages, 2>::SharedStorage
         barrier_o;
 
-    alignas(16) typename nvfp4_attention::OrderedSequenceBarrier<2, 2>::SharedStorage math_order;
     int tile_count_semaphore;
   };
 };
@@ -234,8 +233,6 @@ struct Flash_fwd_kernel_traits {
 
   using EpilogueBarrier =
       typename nvfp4_attention::OrderedSequenceBarrierVarGroupSize<EpiStages, 2>;
-
-  using MathOrderBarrier = nvfp4_attention::OrderedSequenceBarrier<2, 2>;
 };
 
 }  // namespace nvfp4_attention

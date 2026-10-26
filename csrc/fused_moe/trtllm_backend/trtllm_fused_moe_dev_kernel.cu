@@ -56,6 +56,44 @@ inline __device__ float silu(float x) { return x / (1.0f + expf(-x)); }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Gated SwiGLU with the optional OAI controls, matching the fused FC1 epilogue of the trtllm-gen
+// cubins:
+//   xGlu    = clamp(xGlu, max=limit)
+//   xLinear = clamp(xLinear, -limit, limit)
+//   out     = xGlu * sigmoid(alpha * xGlu) * (xLinear + beta)
+// With no parameters set this is exactly silu(xGlu) * xLinear, bit-for-bit, so the common path is
+// unchanged. The per-expert scalars are looked up per element rather than hoisted: they are the
+// same address for every thread of a tile and stay resident in L1, and this kernel is bandwidth
+// bound on the FC1 output anyway.
+template <typename KernelParams>
+inline __device__ float gatedSilu(KernelParams const& params, int32_t permutedIdx, float xLinear,
+                                  float xGlu) {
+  if (params.gatedActAlphaPtr == nullptr && params.gatedActBetaPtr == nullptr &&
+      params.gatedActClampLimitPtr == nullptr) {
+    return silu(xGlu) * xLinear;
+  }
+
+  // Permuted tokens are grouped per expert and padded to tileTokensDim, so the tile index is the
+  // FC1 GEMM's batch index. tileTokensDim is a runtime value (not always a power of two), hence
+  // the division; it is off the default path and negligible next to the global loads.
+  int32_t const localExpertIdx = params.ctaIdxXyToBatchIdx[permutedIdx / params.tileTokensDim];
+
+  if (params.gatedActClampLimitPtr != nullptr) {
+    float const limit = params.gatedActClampLimitPtr[localExpertIdx];
+    xGlu = fminf(xGlu, limit);
+    xLinear = fmaxf(fminf(xLinear, limit), -limit);
+  }
+  float const alpha =
+      params.gatedActAlphaPtr != nullptr ? params.gatedActAlphaPtr[localExpertIdx] : 1.0f;
+  float const beta =
+      params.gatedActBetaPtr != nullptr ? params.gatedActBetaPtr[localExpertIdx] : 0.0f;
+  // x * sigmoid(alpha * x), i.e. silu(x) generalized by alpha.
+  float const act = xGlu / (1.0f + expf(-alpha * xGlu));
+  return act * (xLinear + beta);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <typename KernelParams>
 __global__ void activationKernel(KernelParams params) {
   using Type = typename KernelParams::Type;
@@ -84,8 +122,7 @@ __global__ void activationKernel(KernelParams params) {
         float x1 = (float)params.inPtr[baseIdx];
         float x2 = (float)params.inPtr[baseIdx + params.innerDim / 2];
 
-        float act = silu(x2);
-        Type out = (Type)(act * x1);
+        Type out = (Type)gatedSilu(params, permutedIdx, x1, x2);
 
         int64_t const outIdx = (int64_t)permutedIdx * (params.innerDim / 2) + hiddenIdx;
         params.outPtr[outIdx] = out;
@@ -242,6 +279,10 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
           dataX2Arr[tokenInCtaIdx] = 0.0f;
           outArr[tokenInCtaIdx] = 0.0f;
           absOutArr[tokenInCtaIdx] = 0.0f;
+          // The loop below stops writing this at the tail of the token range, and the
+          // activation loop needs a defined value to decide whether a per-expert lookup
+          // is in range.
+          permutedIdxArr[tokenInCtaIdx] = -1;
         }
 #pragma unroll
         for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
@@ -278,8 +319,10 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
         for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
           float x1 = scale1Arr[tokenInCtaIdx] * dataX1Arr[tokenInCtaIdx];
           float x2 = scale2Arr[tokenInCtaIdx] * dataX2Arr[tokenInCtaIdx];
-          float act = silu(x2);
-          float out = act * x1;
+          // Padding lanes keep permutedIdx == -1 and contribute a zeroed x1/x2, so skip the
+          // per-expert lookup for them instead of indexing ctaIdxXyToBatchIdx out of range.
+          int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
+          float out = permutedIdx == -1 ? silu(x2) * x1 : gatedSilu(params, permutedIdx, x1, x2);
           outArr[tokenInCtaIdx] = out;
           absOutArr[tokenInCtaIdx] = fabsf(out);
         }
@@ -897,6 +940,110 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Small-batch finalize: each CTA reduces one hidden-dim slice of one token. The topK reduction is
+// split across blockDim.y thread groups so every thread issues at most
+// SMALL_BATCH_FINALIZE_MAX_LOADS independent 128-bit loads, and the partial sums are combined
+// through shared memory. This spreads a few tokens over many SMs instead of serializing topK
+// dependent loads per thread, which dominates finalize latency at decode batch sizes.
+constexpr int SMALL_BATCH_FINALIZE_THREADS = 256;
+constexpr int SMALL_BATCH_FINALIZE_MAX_LOADS = 4;
+// Cap on topK groups: keeps at least 16 threads per block across the hidden dimension.
+constexpr int SMALL_BATCH_FINALIZE_MAX_TOPK_GROUPS = 16;
+
+template <typename KernelParams>
+__global__ void __launch_bounds__(SMALL_BATCH_FINALIZE_THREADS)
+    finalizeKernelSmallBatch(KernelParams params) {
+  using Type = typename KernelParams::Type;
+  using TypeExpW = typename KernelParams::TypeExpW;
+  constexpr int ElemPerVec = 128 / cutlass::sizeof_bits<Type>::value;
+  using VecElem = cutlass::Array<Type, ElemPerVec>;
+  using ComputeElem = cutlass::Array<float, ElemPerVec>;
+
+  __shared__ float partialSmem[SMALL_BATCH_FINALIZE_THREADS][ElemPerVec];
+
+  int const kSplit = blockDim.y;
+  int64_t const tokenIdx = blockIdx.x;
+  int const vecIdx = blockIdx.y * blockDim.x + threadIdx.x;
+  int const numVecs = params.hiddenDim / ElemPerVec;
+  int64_t const numVecsPadded = params.hiddenDimPadded / ElemPerVec;
+  bool const active = vecIdx < numVecs;
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  // Let the next kernel launch while this one runs; it waits on this grid before reading the
+  // output.
+  if constexpr (KernelParams::UsePdl) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+#endif
+
+  // The permutation and the expert weights come from routing, which completed before the GEMMs
+  // this kernel depends on could start, so they are read before waiting on the primary kernel
+  // (as in finalizeKernelVecLoad). Only the GEMM output is read after the wait.
+  int permutedIdx[SMALL_BATCH_FINALIZE_MAX_LOADS];
+  float scale[SMALL_BATCH_FINALIZE_MAX_LOADS];
+#pragma unroll
+  for (int j = 0; j < SMALL_BATCH_FINALIZE_MAX_LOADS; ++j) {
+    int const k = threadIdx.y + j * kSplit;
+    permutedIdx[j] = -1;
+    scale[j] = 0.f;
+    if (active && k < params.topK) {
+      int64_t const expandedIdx = tokenIdx * params.topK + k;
+      permutedIdx[j] = params.expandedIdxToPermutedIdx[expandedIdx];
+      scale[j] = params.expertWeightsPtr != nullptr
+                     ? static_cast<float>(params.expertWeightsPtr[expandedIdx])
+                     : 1.f;
+    }
+  }
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  // wait on primary kernel when using PDL
+  if constexpr (KernelParams::UsePdl) {
+    cudaGridDependencySynchronize();
+  }
+#endif
+
+  ComputeElem acc;
+  acc.fill(0.f);
+  if (active) {
+    VecElem in[SMALL_BATCH_FINALIZE_MAX_LOADS];
+#pragma unroll
+    for (int j = 0; j < SMALL_BATCH_FINALIZE_MAX_LOADS; ++j) {
+      if (permutedIdx[j] != -1) {
+        float4 const v = vectorizedLoadPtx(reinterpret_cast<float4 const*>(params.inPtr) +
+                                           permutedIdx[j] * numVecsPadded + vecIdx);
+        in[j] = *reinterpret_cast<VecElem const*>(&v);
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < SMALL_BATCH_FINALIZE_MAX_LOADS; ++j) {
+      if (permutedIdx[j] != -1) {
+        acc = acc + scale[j] * arrayConvert<VecElem, ComputeElem>(in[j]);
+      }
+    }
+  }
+
+  int const tid = threadIdx.y * blockDim.x + threadIdx.x;
+  if (threadIdx.y > 0) {
+#pragma unroll
+    for (int e = 0; e < ElemPerVec; ++e) {
+      partialSmem[tid][e] = acc[e];
+    }
+  }
+  __syncthreads();
+  if (threadIdx.y == 0 && active) {
+    for (int g = 1; g < kSplit; ++g) {
+#pragma unroll
+      for (int e = 0; e < ElemPerVec; ++e) {
+        acc[e] += partialSmem[g * blockDim.x + threadIdx.x][e];
+      }
+    }
+    reinterpret_cast<VecElem*>(params.outPtr + tokenIdx * params.hiddenDim)[vecIdx] =
+        arrayConvert<ComputeElem, VecElem>(acc);
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <typename KernelParams>
 __global__ void finalizeDeepSeekKernel(KernelParams params) {
   using Type = typename KernelParams::Type;
@@ -975,7 +1122,27 @@ void run(Data const& data, void* stream) {
     // Capped at rather arbitrary 8192 to avoid gridDim exceeding 65535 specified by CUDA.
     int const numBlocksY = std::min(8192, data.numTokens);
 
-    if (numBlocksX * numBlocksY < 1184) {
+    int const elemPerVec = data.mDtypeElt == tg::Dtype::E4m3 ? 16 : 8;
+    bool const vecAligned =
+        data.hiddenDim % elemPerVec == 0 && data.hiddenDimPadded % elemPerVec == 0;
+    // With topK <= SMALL_BATCH_FINALIZE_MAX_LOADS there is a single topK group, and the
+    // shared-memory reduction costs more than the split saves.
+    bool const useSmallBatch =
+        numBlocksX * numBlocksY < 1184 && vecAligned &&
+        data.topK > SMALL_BATCH_FINALIZE_MAX_LOADS &&
+        data.topK <= SMALL_BATCH_FINALIZE_MAX_TOPK_GROUPS * SMALL_BATCH_FINALIZE_MAX_LOADS;
+    if (useSmallBatch) {
+      // Fewest topK groups that keep each thread at SMALL_BATCH_FINALIZE_MAX_LOADS loads or fewer.
+      int kSplit = 1;
+      while (kSplit * SMALL_BATCH_FINALIZE_MAX_LOADS < data.topK) {
+        kSplit *= 2;
+      }
+      int const vecsPerBlock = SMALL_BATCH_FINALIZE_THREADS / kSplit;
+      int const numVecs = data.hiddenDim / elemPerVec;
+      dim3 numBlocks(data.numTokens, (numVecs + vecsPerBlock - 1) / vecsPerBlock);
+      dim3 blockDim(vecsPerBlock, kSplit);
+      LAUNCH_TOPK_EXPW(data, finalizeKernelSmallBatch, numBlocks, blockDim, 0, stream);
+    } else if (numBlocksX * numBlocksY < 1184) {
       // The number 1184 comes from 148 * 8, where 148 is the number of SMs (Streaming
       // Multiprocessors) in the Blackwell architecture, and the value 8 means that each Streaming
       // Multiprocessor (SM) can hold up to 8 blocks for this kernel. This limitation is intended to

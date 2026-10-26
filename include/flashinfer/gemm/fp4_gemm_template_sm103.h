@@ -29,6 +29,7 @@
 #include "cutlass/gemm/gemm.h"
 #include "flashinfer/arch_condition.h"
 #include "flashinfer/cutlass_utils.cuh"
+#include "flashinfer/gemm/fp4_gemm_epilogue_sm103.h"
 
 #ifndef _WIN32
 #pragma GCC diagnostic pop
@@ -121,6 +122,7 @@ size_t genericFp4UltraGemmKernelLauncher(void* D, void const* A, void const* B,
     using ElementC = void;                                                                                   \
     using LayoutC = cutlass::layout::RowMajor;                                                               \
     static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<OutElementType>::value;                     \
+    static constexpr int AlignmentD = 256 / cutlass::sizeof_bits<OutElementType>::value;                     \
                                                                                                              \
     using SFType = cutlass::float_ue4m3_t;                                                                   \
     using ElementCompute = float;                                                                            \
@@ -133,12 +135,13 @@ size_t genericFp4UltraGemmKernelLauncher(void* D, void const* A, void const* B,
     using MainloopSchedule = SMTypeAdapter_sm103<XSM_>::MainloopSchedule;                                    \
     using MmaTileShape = cute::Shape<cute::Int<CTA_M_ * SMTypeAdapter_sm103<XSM_>::Scale>,                   \
                                      cute::Int<CTA_N_>, cute::Int<CTA_K_>>;                                  \
+    using FusionOperation =                                                                                  \
+        flashinfer::gemm::sm103_epilogue::LinearCombinationF32x2Operation<OutElementType, float,             \
+                                                                          void, float>;                      \
     using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<                    \
         Arch, OperatorClass, MmaTileShape, ClusterShape, EpilogueTileType, ElementAccumulator,               \
-        ElementCompute, ElementC, LayoutC, AlignmentC, OutElementType, LayoutC, AlignmentC,                  \
-        EpilogueSchedule,                                                                                    \
-        cutlass::epilogue::fusion::LinearCombination<OutElementType, float, void,                            \
-                                                     float>>::CollectiveOp;                                  \
+        ElementCompute, ElementC, LayoutC, AlignmentC, OutElementType, LayoutC, AlignmentD,                  \
+        EpilogueSchedule, FusionOperation>::CollectiveOp;                                                    \
                                                                                                              \
     using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<                        \
         Arch, cutlass::arch::OpClassBlockScaledTensorOp, cute::tuple<ElementA, SFType>, LayoutA,             \

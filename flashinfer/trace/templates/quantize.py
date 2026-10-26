@@ -28,9 +28,13 @@ def _bind_trace_init_dependencies(wrapper: Any, *dependencies: Any) -> Any:
     return wrapper
 
 
-# ── Reference helpers ────────────────────────────────────────────────────────
+def _bind_trace_reference_dependencies(wrapper: Any, *dependencies: Any) -> Any:
+    """Mark helpers to inline with a serialized reference."""
+    wrapper._trace_reference_dependencies = dependencies
+    return wrapper
 
-_E2M1_VALUES = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]  # FP4 e2m1fn magnitudes
+
+# ── Reference helpers ────────────────────────────────────────────────────────
 
 
 @torch.no_grad()
@@ -42,8 +46,17 @@ def _fp4_e2m1_quantize_block(
     Returns an int64 tensor with values in [0, 15] matching the nibble codes
     used by ``_unpack_fp4_e2m1`` in moe.py: low 3 bits = magnitude index,
     high bit = sign.
+
+    The e2m1fn magnitudes are inlined rather than read from a module-level
+    constant so this helper stays self-contained when serialized as a trace
+    reference dependency.
     """
-    values = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=block.device)
+    # FP4 e2m1fn magnitudes.
+    values = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        dtype=torch.float32,
+        device=block.device,
+    )
     sign_bit = (block < 0).to(torch.int64) << 3
     mag = block.abs()
     # Nearest-magnitude index among the 8 e2m1 values.
@@ -375,6 +388,134 @@ nvfp4_quantize_trace = TraceTemplate(
     tags=["status:verified", "quantization:nvfp4"],
     reference=_nvfp4_quantize_reference,
     init=_nvfp4_quantize_init,
+)
+
+
+# ── SiLU+mul + NVFP4 quantization (fused SwiGLU activation-quantize) ─────────
+
+
+@torch.no_grad()
+def _silu_and_mul_nvfp4_quantize_reference(
+    input: torch.Tensor,
+    global_scale: Optional[torch.Tensor] = None,
+    sf_vec_size: int = 16,
+    is_sf_swizzled_layout: bool = True,
+    is_sf_8x4_layout: bool = False,
+    enable_pdl: Optional[bool] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Reference SwiGLU followed by NVFP4 quantization with linear E4M3 scales."""
+    half = input.shape[-1] // 2
+    gate = input[..., :half].to(torch.float32)
+    up = input[..., half:].to(torch.float32)
+    activated = (gate * torch.sigmoid(gate) * up).to(input.dtype)
+    packed, scales = _fp4_quantize_reference(
+        activated,
+        global_scale=global_scale,
+        sf_vec_size=int(sf_vec_size),
+        sf_use_ue8m0=False,
+    )
+    # Return linear E4M3 scales as raw bytes to match the API dtype.
+    return packed, scales.view(torch.uint8)
+
+
+# Inline dependencies so the serialized reference is self-contained.
+_bind_trace_reference_dependencies(
+    _silu_and_mul_nvfp4_quantize_reference,
+    _fp4_e2m1_quantize_block,
+    _pack_fp4_pairs,
+    _quantize_fp4_block_scale,
+    _fp4_quantize_reference,
+)
+
+
+# Name traces by 2K because the input concatenates K-wide gate and up tensors,
+# matching silu_and_mul traces.
+_SILU_FP4_AXES: Dict[str, _AxisT] = {
+    "M": Var(description="Number of rows."),
+    "K_doubled": Const(
+        abbrev="k",
+        description="Gated input width (2 * output K; gate and up concatenated).",
+    ),
+    "K_packed": Var(
+        description="Packed output column dim (output_K // 2, two FP4 values per uint8)."
+    ),
+    "num_scale_elems": Var(
+        description="Total number of scale factor elements (layout-dependent)."
+    ),
+    "one": Var(description="Placeholder for shape [1] scalar tensors."),
+}
+
+
+def _silu_and_mul_nvfp4_quantize_init(
+    *,
+    M: int,
+    K_doubled: int = 16384,
+    K_packed: int = 0,
+    num_scale_elems: int = 0,
+    one: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build BF16 inputs and an amax-derived global scale for the fused trace."""
+    del K_packed, num_scale_elems, one  # derived from K_doubled
+    torch.manual_seed(seed)
+    inp = torch.randn(M, K_doubled, dtype=torch.bfloat16, device=device)
+    half = K_doubled // 2
+    gate = inp[..., :half].float()
+    up = inp[..., half:].float()
+    ref_y = (gate * torch.sigmoid(gate)) * up
+    amax = ref_y.abs().nan_to_num().max().clamp(min=1e-12)
+    return {
+        "input": inp,
+        "global_scale": (448.0 * 6.0 / amax).reshape(1).contiguous(),
+        "sf_vec_size": 16,
+    }
+
+
+silu_and_mul_nvfp4_quantize_trace = TraceTemplate(
+    op_type="quantization",
+    name_prefix="silu_and_mul_nvfp4_quantize",
+    description=(
+        "Fused SwiGLU (silu(gate) * up) with NVFP4 (sf_vec_size=16) "
+        "quantization. Input is [M, 2K] (gate and up concatenated); emits "
+        "packed FP4 [M, K/2] uint8 plus per-block e4m3 scales."
+    ),
+    axes=_SILU_FP4_AXES,
+    inputs={
+        "input": Tensor(
+            ["M", "K_doubled"],
+            param="input",
+            description="Gated input [M, 2K] (gate and up concatenated), fp16/bf16.",
+        ),
+        "global_scale": Tensor(
+            ["one"],
+            dtype="float32",
+            description="Per-tensor global scale, shape [1].",
+        ),
+        "sf_vec_size": Scalar(
+            "int32",
+            optional=True,
+            description="Scale-factor vector size (fixed at 16 for NVFP4).",
+        ),
+    },
+    outputs={
+        "x_q": Tensor(
+            ["M", "K_packed"],
+            dtype="uint8",
+            description="Packed FP4 output (two e2m1fn values per byte).",
+        ),
+        "sf": Tensor(
+            ["num_scale_elems"],
+            dtype="uint8",
+            description="Block scale factors packed as uint8 bytes (layout-dependent shape).",
+        ),
+    },
+    constraints=[
+        "K_packed == K_doubled // 4",
+    ],
+    tags=["status:verified", "fused", "quantization:nvfp4"],
+    reference=_silu_and_mul_nvfp4_quantize_reference,
+    init=_silu_and_mul_nvfp4_quantize_init,
 )
 
 
@@ -905,7 +1046,7 @@ mxfp8_grouped_quantize_trace = TraceTemplate(
     op_type="quantization",
     name_prefix="mxfp8_grouped_quantize",
     description=(
-        "Grouped MXFP8 quantization (cuTile, SM100+): [B, M, K] bf16/fp16 -> "
+        "Grouped MXFP8 quantization (SM100+): [B, M, K] bf16/fp16 -> "
         "fp8_e4m3fn activations + UE8M0 block scales, laid out for the masked "
         "grouped GEMM. K is padded up to a multiple of 128 for the kernel."
     ),
@@ -950,4 +1091,431 @@ mxfp8_grouped_quantize_trace = TraceTemplate(
     ],
     tags=["status:verified", "quantization:mxfp8"],
     init=_mxfp8_grouped_quantize_init,
+)
+
+
+# ── SiLU+mul + masked MXFP8 experts quantization (SM100+) ────────────────────
+
+
+@torch.no_grad()
+def _quantize_mxfp8_round_up_scale(
+    x: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """MXFP8-quantize ``[M, K]``; each UE8M0 block scale is ``amax / 448`` rounded up.
+
+    Scale bytes 0 and 254 get a zero output scale; 254 marks a block with an
+    infinity. Returns ``(x_q [M, K] fp8_e4m3fn, sf [M, K // 32] uint8)``.
+    """
+    m, k = x.shape
+    blocks = x.to(torch.float32).reshape(m, k // 32, 32)
+    is_nan = blocks.isnan()
+    block_scale = torch.where(is_nan, 0.0, blocks.abs()).amax(dim=-1) / 448.0
+    scale_bits = block_scale.contiguous().view(torch.int32)
+    exp = (scale_bits >> 23) & 0xFF
+    mantissa = scale_bits & 0x7FFFFF
+    exp = torch.where(exp == 0, 0, (exp + (mantissa != 0).to(exp.dtype)).clamp(max=254))
+    sf = torch.where(is_nan.all(dim=-1), 255, exp).to(torch.uint8)
+    inv_scale = torch.ldexp(torch.ones_like(block_scale), 127 - sf.to(torch.int32))
+    inv_scale.masked_fill_((sf == 0) | (sf == 254), 0)
+    scaled = blocks * inv_scale.unsqueeze(-1)
+    x_q = scaled.masked_fill(scaled.isnan(), float("nan")).to(torch.float8_e4m3fn)
+    return x_q.reshape(m, k), sf
+
+
+@torch.no_grad()
+def _silu_and_mul_mxfp8_experts_quantize_reference(
+    a: torch.Tensor, mask: torch.Tensor, **_unused
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Reference for silu_and_mul_mxfp8_experts_quantize in a plain layout.
+
+    Matches the kernel bit for bit on bf16 inputs, except that NaN and
+    infinities become NaN here and 448 in the kernel; on fp16 inputs a value
+    can also differ by one E4M3 step.
+
+    Returns ``x_q [B, M, K]`` (fp8_e4m3fn) and ``sf [B, M, K // 32]`` (UE8M0
+    bytes) for every row, without the K padding, scale swizzle or grouped GEMM
+    permutation; only the first ``min(mask[i], M)`` rows of expert ``i`` match
+    the kernel.
+    """
+    b, m, k_doubled = a.shape
+    k = k_doubled // 2
+    gate = a[..., :k].to(torch.float32)
+    up = a[..., k:].to(torch.float32)
+    y = (gate * torch.sigmoid(gate) * up).to(a.dtype)
+    x_q, sf = _quantize_mxfp8_round_up_scale(y.reshape(b * m, k))
+    return x_q.reshape(b, m, k), sf.reshape(b, m, k // 32)
+
+
+# Inline dependencies so the serialized reference is self-contained.
+_bind_trace_reference_dependencies(
+    _silu_and_mul_mxfp8_experts_quantize_reference,
+    _quantize_mxfp8_round_up_scale,
+)
+
+
+@torch.no_grad()
+def _silu_and_mul_mxfp8_experts_quantize_check(
+    reference_outputs, actual_outputs, *, mask=None, **_unused
+) -> bool:
+    """Compare the valid rows bit for bit in the reference's plain layout.
+
+    Undoes the grouped GEMM permutation, K padding and scale swizzle of the
+    actual outputs, then compares the first ``min(mask[i], M)`` rows of each
+    expert ``i``, or every row without ``mask``. Where the reference value is
+    NaN, the actual value must be +-448.
+    """
+    q_ref, sf_ref = reference_outputs
+    q, sf = actual_outputs
+    b, m, k = q_ref.shape
+    if q.dim() != 3 or q.shape[0] != m or q.shape[1] < k or q.shape[2] != b:
+        return False
+    if sf.dim() != 6 or sf.shape[5] != b:
+        return False
+    q = q.permute(2, 0, 1)[:, :, :k]
+    rm, rk = sf.shape[2], sf.shape[4]
+    sf = sf.permute(5, 2, 1, 0, 4, 3).reshape(b, rm * 128, rk * 4)[:, :m, : k // 32]
+    num_rows = torch.full((b,), m) if mask is None else mask.clamp(0, m)
+    valid = torch.arange(m, device=q.device) < num_rows.to(q.device).unsqueeze(1)
+    q, q_ref = q[valid].view(torch.uint8), q_ref[valid]
+    is_nan = q_ref.float().isnan()
+    q_ref = q_ref.view(torch.uint8)
+    return (
+        torch.equal(q[~is_nan], q_ref[~is_nan])
+        and bool(((q[is_nan] & 0x7F) == 0x7E).all())
+        and torch.equal(sf[valid], sf_ref[valid])
+    )
+
+
+def _silu_and_mul_mxfp8_experts_quantize_init(
+    *,
+    B,
+    M,
+    K_doubled=4096,
+    padded_K=0,
+    rm=0,
+    rk=0,
+    m32=32,
+    m4=4,
+    k4=4,
+    device="cuda",
+    seed=0,
+):
+    """Build inputs for ``flashinfer.silu_and_mul_mxfp8_experts_quantize``.
+
+    Every expert uses the full ``M`` valid rows (``mask = M``) so the trace
+    exercises the dense path with no uninitialized output rows; callers may
+    shrink ``mask`` afterwards.
+    """
+    del padded_K, rm, rk, m32, m4, k4  # output-only / derived axes
+    torch.manual_seed(seed)
+    a = torch.randn(B, M, K_doubled, dtype=torch.bfloat16, device=device)
+    mask = torch.full((B,), M, dtype=torch.int32, device=device)
+    return {"a": a, "mask": mask}
+
+
+silu_and_mul_mxfp8_experts_quantize_trace = TraceTemplate(
+    op_type="activation_quantize",
+    name_prefix="silu_and_mul_mxfp8_experts_quantize",
+    description=(
+        "Fused SiLU+mul + masked MXFP8 quantization between the two masked "
+        "grouped GEMMs of MoE experts (SM100+): [B, M, 2K] bf16/fp16 -> "
+        "fp8_e4m3fn activations + UE8M0 block scales, laid out for the masked "
+        "grouped GEMM. K is padded up to a multiple of 128."
+    ),
+    axes={
+        "B": Var(description="Number of experts."),
+        "M": Var(description="Row capacity per expert."),
+        "K_doubled": Const(
+            abbrev="k", description="2 * K, gate then up columns (K divisible by 32)."
+        ),
+        "padded_K": Var(description="K rounded up to a multiple of 128."),
+        "rm": Var(description="padded_M // 128 (row scale tiles)."),
+        "rk": Var(description="padded_K // 128 (column scale tiles)."),
+        "m32": Var(description="MXFP8 scale swizzle dim (32)."),
+        "m4": Var(description="MXFP8 scale swizzle dim (4)."),
+        "k4": Var(description="MXFP8 scale swizzle dim (4)."),
+    },
+    inputs={
+        "a": Tensor(
+            ["B", "M", "K_doubled"],
+            description="Gate values followed by up values, fp16/bf16.",
+        ),
+        "mask": Tensor(
+            ["B"],
+            dtype="int32",
+            description="Valid rows per expert (int32).",
+        ),
+    },
+    outputs={
+        "x_q": Tensor(
+            ["M", "padded_K", "B"],
+            dtype="float8_e4m3fn",
+            description="Quantized activations, permuted for the grouped GEMM.",
+        ),
+        "sf": Tensor(
+            ["m32", "m4", "rm", "k4", "rk", "B"],
+            dtype="uint8",
+            description="UE8M0 swizzled block scales (1 byte per 32-element block).",
+        ),
+    },
+    constraints=[
+        "padded_K == ((K_doubled // 2 + 127) // 128) * 128",
+        "rm == (M + 127) // 128",
+        "rk == padded_K // 128",
+        "m32 == 32",
+        "m4 == 4",
+        "k4 == 4",
+    ],
+    tags=["status:verified", "fused", "quantization:mxfp8", "moe"],
+    reference=_silu_and_mul_mxfp8_experts_quantize_reference,
+    check=_silu_and_mul_mxfp8_experts_quantize_check,
+    init=_silu_and_mul_mxfp8_experts_quantize_init,
+)
+
+
+class _Dsv41CacheFormat:
+    """Static facts of one DeepSeek-V4.1 paged cache ABI (shared by pack / append traces)."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        bytes_per_token: int,
+        tag: str,
+        cache_description: str,
+        pack_description: str,
+        append_description: str,
+    ) -> None:
+        self.name = name
+        self.bytes_per_token = bytes_per_token
+        self.tag = tag
+        self.cache_description = cache_description
+        self.pack_description = pack_description
+        self.append_description = append_description
+
+
+_DSV41_FP4_FORMAT = _Dsv41CacheFormat(
+    name="fp4",
+    bytes_per_token=288,
+    tag="quantization:fp4",
+    cache_description=(
+        "Opaque V41_FP4 uint8 cache: each physical page stores page_size * 256 "
+        "packed E2M1 data bytes followed by page_size * 32 E4M3 scale bytes. "
+        "The last dimension is not a contiguous per-token record. "
+        "Page-strided views are supported; bytes inside each page remain packed."
+    ),
+    pack_description=(
+        "Quantize complete DeepSeek-V4.1 latent-KV pages, including RoPE, "
+        "in groups of 16 to E2M1 with E4M3 scales. "
+        "Scale = clamp(amax / 6, 2**-9, 448) rounded to E4M3; "
+        "non-finite values poison their group (NaN scale, zero codes)."
+    ),
+    append_description=(
+        "Quantize DeepSeek-V4.1 latent KV by physical slot with the same "
+        "group-16 E2M1 / clamped E4M3 conversion as full-page pack. "
+        "Mutates cache in place and returns None; the trace output is "
+        "the updated cache. Unaddressed data and scale slots are preserved."
+    ),
+)
+
+_DSV41_FP8_FORMAT = _Dsv41CacheFormat(
+    name="fp8",
+    bytes_per_token=528,
+    tag="quantization:fp8",
+    cache_description=(
+        "Opaque DSV4_1 FP8 uint8 cache: each physical page stores page_size * 512 "
+        "E4M3 data bytes followed by page_size * 16 UE8M0 scale bytes. "
+        "The last dimension is not a contiguous per-token record. "
+        "Page-strided views are supported; bytes inside each page remain packed."
+    ),
+    pack_description=(
+        "Quantize complete DeepSeek-V4.1 latent-KV pages, including RoPE, "
+        "in groups of 32 to E4M3 with UE8M0 scales. "
+        "Scale = 2**ceil(log2(max(amax / 448, 1e-4))) with amax clamped at 1e-4; "
+        "values are divided by the scale and rounded to nearest-even E4M3 "
+        "saturating at 448. A NaN in a group gives a 0xFF scale and 0x7F codes; "
+        "an infinite group gives a 0xFF scale, 0x7F for the infinite values and "
+        "signed zero codes elsewhere (the torch reference trajectory)."
+    ),
+    append_description=(
+        "Quantize DeepSeek-V4.1 latent KV by physical slot with the same "
+        "group-32 E4M3 / UE8M0 conversion as full-page pack. "
+        "Mutates cache in place and returns None; the trace output is "
+        "the updated cache. Unaddressed data and scale slots are preserved."
+    ),
+)
+
+
+def _dsv41_paged_dims(layout, width):
+    if layout == "flat":
+        return ["num_pages", "page_bytes"]
+    if layout == "hnd":
+        return ["num_pages", "latent_heads", "page_size", width]
+    if layout == "nhd":
+        return ["num_pages", "page_size", "latent_heads", width]
+    return ["num_pages", "page_size", width]
+
+
+def _make_dsv41_pack_trace(fmt, input_layout, kv_layout):
+    return TraceTemplate(
+        op_type="quantization",
+        name_prefix=f"dsv41_{fmt.name}_quantize_pack_sparse_mla_cache_{input_layout}_{kv_layout.lower()}",
+        description=fmt.pack_description,
+        axes={
+            "num_pages": Var(),
+            "page_size": Const(abbrev="ps"),
+            "latent_dim": Const(value=512, abbrev=""),
+            "latent_heads": Const(value=1, abbrev=""),
+            "bytes_per_token": Const(value=fmt.bytes_per_token, abbrev=""),
+        },
+        inputs={
+            "latent_kv": Tensor(
+                _dsv41_paged_dims(input_layout, "latent_dim"),
+                description="Contiguous BF16/FP16 latent KV, including all 512 dimensions.",
+            ),
+            "kv_layout": Scalar(
+                "string",
+                optional=True,
+                description=f"Output layout; this definition uses {kv_layout}. API default: HND.",
+            ),
+        },
+        outputs={
+            "cache": Tensor(
+                _dsv41_paged_dims(kv_layout.lower(), "bytes_per_token"),
+                dtype="uint8",
+                description=fmt.cache_description,
+            ),
+        },
+        tags=[fmt.tag, "mla", f"kv_layout:{kv_layout}"],
+    )
+
+
+def _dsv41_pack_traces(fmt):
+    return {
+        (input_layout, kv_layout): _make_dsv41_pack_trace(fmt, input_layout, kv_layout)
+        for input_layout in ("3d", "hnd", "nhd")
+        for kv_layout in ("HND", "NHD")
+    }
+
+
+_DSV41_FP4_PACK_TRACES = _dsv41_pack_traces(_DSV41_FP4_FORMAT)
+_DSV41_FP8_PACK_TRACES = _dsv41_pack_traces(_DSV41_FP8_FORMAT)
+
+
+def _dsv41_paged_layout(tensor):
+    if tensor.ndim == 2:
+        return "flat"
+    if tensor.ndim == 4:
+        return "hnd" if tensor.shape[1] == 1 else "nhd"
+    return "3d"
+
+
+def dsv41_fp4_quantize_pack_sparse_mla_cache_trace(**kwargs):
+    return _DSV41_FP4_PACK_TRACES[
+        _dsv41_paged_layout(kwargs["latent_kv"]), kwargs.get("kv_layout", "HND")
+    ]
+
+
+dsv41_fp4_quantize_pack_sparse_mla_cache_trace.templates = list(  # type: ignore[attr-defined]
+    _DSV41_FP4_PACK_TRACES.values()
+)
+
+
+def dsv41_fp8_quantize_pack_sparse_mla_cache_trace(**kwargs):
+    return _DSV41_FP8_PACK_TRACES[
+        _dsv41_paged_layout(kwargs["latent_kv"]), kwargs.get("kv_layout", "HND")
+    ]
+
+
+dsv41_fp8_quantize_pack_sparse_mla_cache_trace.templates = list(  # type: ignore[attr-defined]
+    _DSV41_FP8_PACK_TRACES.values()
+)
+
+
+def _make_dsv41_append_trace(fmt, latent_rank, cache_layout):
+    latent_dims = [f"latent_dim_{i}" for i in range(latent_rank - 1)]
+    cache_dims = _dsv41_paged_dims(cache_layout, "bytes_per_token")
+    axes = {
+        "num_tokens": Var(description="Number of slot-mapping entries."),
+        **{dim: Var() for dim in latent_dims},
+        "latent_dim": Const(value=512, abbrev=""),
+        "num_pages": Var(),
+        "bytes_per_token": Const(value=fmt.bytes_per_token, abbrev=""),
+    }
+    if cache_layout == "flat":
+        axes["page_bytes"] = Const(
+            abbrev="pb", description=f"page_size * {fmt.bytes_per_token} bytes."
+        )
+    else:
+        axes["page_size"] = Const(abbrev="ps")
+    if cache_layout in ("hnd", "nhd"):
+        axes["latent_heads"] = Const(value=1, abbrev="")
+    return TraceTemplate(
+        op_type="quantization",
+        name_prefix=f"dsv41_{fmt.name}_quantize_append_sparse_mla_cache_{latent_rank}d_{cache_layout}",
+        description=fmt.append_description,
+        axes=axes,
+        inputs={
+            "latent_kv": Tensor(
+                [*latent_dims, "latent_dim"],
+                description="Contiguous BF16/FP16; flatten leading dimensions to one 512-value row per slot.",
+            ),
+            "slot_mapping": Tensor(
+                ["num_tokens"],
+                description=(
+                    "Contiguous int32/int64 physical slots: page_id * page_size + entry_id. "
+                    "Negative or out-of-range slots are ignored; the lowest-index "
+                    "input row wins duplicate valid slots."
+                ),
+            ),
+            "cache": Tensor(cache_dims, description=fmt.cache_description),
+        },
+        outputs={
+            "cache": Tensor(
+                cache_dims,
+                dtype_from="cache",
+                description="The input cache, updated in place.",
+            ),
+        },
+        constraints=[
+            f"{' * '.join(latent_dims)} == num_tokens",
+            *(["page_bytes % bytes_per_token == 0"] if cache_layout == "flat" else []),
+        ],
+        tags=[fmt.tag, "mla", "inplace"],
+    )
+
+
+def _dsv41_append_traces(fmt):
+    return {
+        (latent_rank, cache_layout): _make_dsv41_append_trace(
+            fmt, latent_rank, cache_layout
+        )
+        for latent_rank in (2, 3, 4)
+        for cache_layout in ("flat", "3d", "hnd", "nhd")
+    }
+
+
+_DSV41_FP4_APPEND_TRACES = _dsv41_append_traces(_DSV41_FP4_FORMAT)
+_DSV41_FP8_APPEND_TRACES = _dsv41_append_traces(_DSV41_FP8_FORMAT)
+
+
+def dsv41_fp4_quantize_append_sparse_mla_cache_trace(**kwargs):
+    return _DSV41_FP4_APPEND_TRACES[
+        kwargs["latent_kv"].ndim, _dsv41_paged_layout(kwargs["cache"])
+    ]
+
+
+dsv41_fp4_quantize_append_sparse_mla_cache_trace.templates = list(  # type: ignore[attr-defined]
+    _DSV41_FP4_APPEND_TRACES.values()
+)
+
+
+def dsv41_fp8_quantize_append_sparse_mla_cache_trace(**kwargs):
+    return _DSV41_FP8_APPEND_TRACES[
+        kwargs["latent_kv"].ndim, _dsv41_paged_layout(kwargs["cache"])
+    ]
+
+
+dsv41_fp8_quantize_append_sparse_mla_cache_trace.templates = list(  # type: ignore[attr-defined]
+    _DSV41_FP8_APPEND_TRACES.values()
 )

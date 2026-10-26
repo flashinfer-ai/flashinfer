@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """BF16 x FP4 (W4A16) dense GEMM public API.
 
-Backend implementation details live in respective submodules
-gemm_bf16_fp4_cudnn and gemm_bf16_fp4_cute_dsl.
+Backend implementation details live in respective submodules for cuDNN,
+CuTe DSL, and the source-built Blackwell kernels.
 """
 
 from typing import Literal, Optional, Tuple
@@ -11,8 +11,13 @@ from typing import Literal, Optional, Tuple
 import torch
 
 from ..api_logging import flashinfer_api
+from .kernels.native_bf16_fp4.support import check_native_bf16_fp4
 from ..trace.templates.gemm import mm_bf16_fp4_trace_dispatch
-from ..utils import backend_requirement, supported_compute_capability
+from ..utils import (
+    backend_requirement,
+    get_compute_capability,
+    supported_compute_capability,
+)
 
 from .gemm_base import (
     CUDNN_AVAILABLE,
@@ -26,6 +31,14 @@ if CUDNN_AVAILABLE:
 
 # Earliest cuDNN backend version supporting bf16 x fp4 GEMM
 _CUDNN_BF16_FP4_MIN_BACKEND_VERSION = 92301
+_Bf16Fp4Backend = Literal[
+    "cudnn",
+    "cute-dsl",
+    "cute-dsl-native",
+    "blackwell-native",
+    "blackwell-tiled",
+]
+_SourceBuiltBf16Fp4Backend = Literal["blackwell-native", "blackwell-tiled"]
 
 
 def _check_mm_bf16_fp4_problem_size(
@@ -34,7 +47,7 @@ def _check_mm_bf16_fp4_problem_size(
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     *,
-    backend: Literal["cudnn", "cute-dsl"],
+    backend: _Bf16Fp4Backend,
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
@@ -57,14 +70,14 @@ def _check_mm_bf16_fp4_problem_size(
     return True
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _cudnn_bf16_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     *,
-    backend: Literal["cudnn", "cute-dsl"],
+    backend: _Bf16Fp4Backend,
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
@@ -91,25 +104,59 @@ def _cudnn_bf16_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+def _cute_dsl_uses_sm100_layout(major: int, minor: int) -> bool:
+    """SM100-family cute-dsl keeps the canonical uint8 weight and a 6-D scale view."""
+    return (major, minor) in ((10, 0), (10, 3), (10, 7))
+
+
+@supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _cute_dsl_bf16_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     *,
-    backend: Literal["cudnn", "cute-dsl"],
+    backend: _Bf16Fp4Backend,
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     enable_pdl: bool = True,
 ):
-    if b.dtype != torch.int32:
+    major, minor = get_compute_capability(a.device)
+    cc = major * 10 + minor
+    expected_dtype = (
+        torch.uint8 if _cute_dsl_uses_sm100_layout(major, minor) else torch.int32
+    )
+    if b.dtype != expected_dtype:
         raise ValueError(
-            f"cute-dsl bf16 x fp4 expects the int32 tile-packed weight from "
-            f"prepare_bf16_fp4_weights(..., backend='cute-dsl'); got {b.dtype}."
+            f"cute-dsl bf16 x fp4 on SM{cc} expects the {expected_dtype} weight "
+            "returned by prepare_bf16_fp4_weights(..., backend='cute-dsl'); "
+            f"got {b.dtype}."
         )
     _check_cute_dsl_availability()
+    return True
+
+
+@supported_compute_capability([100, 103])
+def _blackwell_bf16_fp4_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    *,
+    backend: _SourceBuiltBf16Fp4Backend,
+    out_dtype: Optional[torch.dtype] = None,
+    out: Optional[torch.Tensor] = None,
+    block_size: int = 16,
+    enable_pdl: bool = True,
+):
+    """Source-built Blackwell backends: the checks the compute path runs itself."""
+    del enable_pdl
+    from .gemm_bf16_fp4_blackwell import _validate_blackwell_bf16_fp4
+
+    _validate_blackwell_bf16_fp4(
+        a, b, b_descale, alpha, out_dtype or a.dtype, out, block_size, backend
+    )
     return True
 
 
@@ -124,7 +171,7 @@ def prepare_bf16_fp4_weights(
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     *,
-    backend: Literal["cudnn", "cute-dsl"],
+    backend: _Bf16Fp4Backend,
     block_size: int = 16,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Prepare FP4 weights for the bf16 x fp4 GEMM, for a specific backend.
@@ -150,8 +197,10 @@ def prepare_bf16_fp4_weights(
         alpha: Optional ``(1,) float32`` global scalar.  Pass ``None``
             (default) for implicit ``alpha=1.0``.  Returned unchanged;
             forward the returned tuple to :func:`flashinfer.mm_bf16_fp4`.
-        backend: Identifier of a supported backend (``"cudnn"`` or
-            ``"cute-dsl"``).
+        backend: Identifier of a supported backend: ``"cudnn"``,
+            ``"cute-dsl"``, ``"blackwell-native"``, or
+            ``"blackwell-tiled"``. The ``"cute-dsl-native"``
+            backend returns the original canonical buffers without preparation.
         block_size: SF block size.  Always 16 for FP4.
 
     Returns:
@@ -185,6 +234,11 @@ def prepare_bf16_fp4_weights(
             raise ValueError(f"alpha must be shape (1,); got {tuple(alpha.shape)}")
         if alpha.dtype != torch.float32:
             raise TypeError(f"alpha must be float32; got {alpha.dtype}")
+    if backend == "cute-dsl-native":
+        from .kernels.native_bf16_fp4.support import check_weights
+
+        check_weights(b, b_descale, alpha, block_size)
+        return b, b_descale, alpha
     if backend == "cudnn":
         from .gemm_bf16_fp4_cudnn import _prepare_cudnn
 
@@ -193,13 +247,29 @@ def prepare_bf16_fp4_weights(
         from .gemm_bf16_fp4_cute_dsl import _prepare_cute_dsl
 
         return _prepare_cute_dsl(b, b_descale, alpha, block_size)
-    raise ValueError(f"Unknown backend {backend!r}.  Supported: 'cudnn', 'cute-dsl'.")
+    if backend in ("blackwell-native", "blackwell-tiled"):
+        from .gemm_bf16_fp4_blackwell import _prepare_blackwell_bf16_fp4
+
+        return _prepare_blackwell_bf16_fp4(
+            b,
+            b_descale,
+            alpha,
+            block_size,
+            backend,
+        )
+    raise ValueError(
+        f"Unknown backend {backend!r}.  Supported: 'cudnn', 'cute-dsl', "
+        "'cute-dsl-native', 'blackwell-native', 'blackwell-tiled'."
+    )
 
 
 @backend_requirement(
     {
         "cudnn": _cudnn_bf16_fp4_requirement,
         "cute-dsl": _cute_dsl_bf16_fp4_requirement,
+        "cute-dsl-native": check_native_bf16_fp4,
+        "blackwell-native": _blackwell_bf16_fp4_requirement,
+        "blackwell-tiled": _blackwell_bf16_fp4_requirement,
     },
     common_check=_check_mm_bf16_fp4_problem_size,
 )
@@ -210,7 +280,7 @@ def mm_bf16_fp4(
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     *,
-    backend: Literal["cudnn", "cute-dsl"],
+    backend: _Bf16Fp4Backend,
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
@@ -218,9 +288,10 @@ def mm_bf16_fp4(
 ) -> torch.Tensor:
     """BF16 x FP4 GEMM: ``out = (a @ dequant(b).T) * alpha``.
 
-    Intended to support **W4A16** workloads (4-bit weights, 16-bit activations)
-    nvfp4 weights must be prepared for ``backend`` by
-    :func:`prepare_bf16_fp4_weights`.  ``b``, ``b_descale``, and ``alpha``.
+    Supports **W4A16** workloads (4-bit weights, 16-bit activations).
+    Prepare weights for the selected backend with :func:`prepare_bf16_fp4_weights`.
+    The explicit ``cute-dsl-native`` backend needs no preparation: it accepts
+    canonical packed weights and 128x4-swizzled scales directly.
 
     Example:
         .. code-block:: python
@@ -244,6 +315,8 @@ def mm_bf16_fp4(
             whatever ``prepare_bf16_fp4_weights`` returned -- it may be
             ``None`` if the backend folded it into ``b_descale``.
         backend: Same identifier passed to ``prepare_bf16_fp4_weights``.
+            ``cute-dsl-native`` accepts canonical packed weights and 128x4
+            scales directly on SM120/121.
         out_dtype: Output dtype.  Defaults to ``a.dtype`` (``bfloat16``).
         out: Optional preallocated ``(M, N)`` output tensor.
         block_size: SF block size.  Always 16 for FP4.
@@ -253,6 +326,10 @@ def mm_bf16_fp4(
         ``(M, N)`` tensor of ``out_dtype``.
     """
     out_dtype = out_dtype or a.dtype
+    if backend == "cute-dsl-native":
+        from .kernels.native_bf16_fp4.runner import run
+
+        return run(a, b, b_descale, alpha, out_dtype, out, enable_pdl)
     if backend == "cudnn":
         from .gemm_bf16_fp4_cudnn import _compute_cudnn
 
@@ -263,15 +340,32 @@ def mm_bf16_fp4(
         return _compute_cute_dsl(
             a, b, b_descale, alpha, out_dtype, out, block_size, enable_pdl=enable_pdl
         )
-    raise ValueError(f"Unknown backend {backend!r}.  Supported: 'cudnn', 'cute-dsl'.")
+    if backend in ("blackwell-native", "blackwell-tiled"):
+        from .gemm_bf16_fp4_blackwell import _compute_blackwell_bf16_fp4
+
+        return _compute_blackwell_bf16_fp4(
+            a,
+            b,
+            b_descale,
+            alpha,
+            out_dtype,
+            out,
+            block_size,
+            enable_pdl,
+            backend,
+        )
+    raise ValueError(
+        f"Unknown backend {backend!r}.  Supported: 'cudnn', 'cute-dsl', "
+        "'cute-dsl-native', 'blackwell-native', 'blackwell-tiled'."
+    )
 
 
 # =============================================================================
 # Shared SF utility
 # =============================================================================
 #
-# Used by both backends' prepare paths (cuDNN and cute-dsl) to turn the
-# canonical 128x4-swizzled SF into a linear ``(N, K_sf)`` layout.
+# Used by backend preparation paths to turn the canonical 128x4-swizzled SF
+# into a linear ``(N, K_sf)`` layout.
 
 
 def _unswizzle_sf_128x4(sf_swizzled: torch.Tensor, n: int, k_sf: int) -> torch.Tensor:

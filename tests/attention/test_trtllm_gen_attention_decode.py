@@ -1,8 +1,17 @@
+import inspect
 import math
+import os
+import re
+import subprocess
+import sys
 from typing import Union
 
 import pytest
 import torch
+from tests.test_helpers.parametrize import (
+    pairwise_product_cases,
+    parametrize_product,
+)
 from tests.test_helpers.utils_fp4 import (
     cast_from_fp4,
     recover_swizzled_scales,
@@ -14,7 +23,14 @@ from tests.test_helpers.sink_attention_reference import sink_attention_unified
 from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
 
 import flashinfer
-from flashinfer.utils import FP4Tensor, ceil_div, round_up, get_compute_capability
+from flashinfer.utils import (
+    FP4Tensor,
+    ceil_div,
+    get_compute_capability,
+    get_device_sm_count,
+    get_trtllm_gen_multi_ctas_kv_counter_bytes,
+    round_up,
+)
 
 pytestmark = pytest.mark.long_running
 
@@ -28,12 +44,10 @@ DTYPE_MAP = {
 GPU_DEVICE = "cuda:0"
 
 global_workspace_buffer = None  # can.be empty initialized
-global_trtllm_gen_fmha_workspace_buffer = None  # must be zero initialized
+global_trtllm_gen_fmha_workspace_buffer = None
 workspace_size = 256 * 1024 * 1024
 
-# Counter slab at the head of the generation workspace: 8192 batches * 256 heads * 4 bytes/int32.
-TRTLLM_GEN_COUNTER_BYTES = 8192 * 256 * 4
-# Size of the guard region we zero past the softmax slab (or counter slab when LSE is off).
+# Size of the guard region we zero past the softmax slab.
 TRTLLM_GEN_WORKSPACE_CHECK_BYTES = 1 * 1024 * 1024
 
 
@@ -63,10 +77,8 @@ def trtllm_gen_workspace_softmax_end_bytes_context(
 def trtllm_gen_workspace_softmax_end_bytes_decode(
     num_qo_heads: int, batch_size: int, max_q_len: int
 ) -> int:
-    """End offset of the softmax slab in the generation-mode workspace layout [counter|softmax|scratch]."""
-    return TRTLLM_GEN_COUNTER_BYTES + _trtllm_gen_softmax_slab_bytes(
-        num_qo_heads, batch_size, max_q_len
-    )
+    """End offset of the softmax slab in the generation-mode workspace layout [softmax|scratch]."""
+    return _trtllm_gen_softmax_slab_bytes(num_qo_heads, batch_size, max_q_len)
 
 
 def _skip_if_not_blackwell() -> None:
@@ -370,7 +382,7 @@ def create_workspace_buffers(device: torch.device):
             workspace_size, dtype=torch.int8, device=device
         )
     if global_trtllm_gen_fmha_workspace_buffer is None:
-        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
+        global_trtllm_gen_fmha_workspace_buffer = torch.empty(
             workspace_size, dtype=torch.int8, device=device
         )
     return global_trtllm_gen_fmha_workspace_buffer, global_workspace_buffer
@@ -639,6 +651,8 @@ def _test_trtllm_batch_decode(
     uses_shared_paged_kv_idx: bool = True,
     return_lse: bool | None = None,
     provide_lse: bool = False,
+    use_bmm1_scale_log2: bool = False,
+    reuse_multi_ctas_kv_counter_buffer: bool = False,
 ) -> None:
     """
     Common function for testing trtllm-gen decode.
@@ -838,6 +852,27 @@ def _test_trtllm_batch_decode(
         bmm2_scale = bmm2_scale.item()
     elif not isinstance(bmm2_scale, torch.Tensor) and device_scale:
         bmm2_scale = torch.tensor(bmm2_scale, device=GPU_DEVICE, dtype=torch.float32)
+    bmm1_scale_log2 = None
+    if use_bmm1_scale_log2:
+        if backend != "trtllm-gen":
+            pytest.skip("bmm1_scale_log2 is only supported by trtllm-gen")
+        raw_bmm1_scale = (
+            float(bmm1_scale.item())
+            if isinstance(bmm1_scale, torch.Tensor)
+            else float(bmm1_scale)
+        )
+        bmm1_scale_workspace = torch.tensor(
+            [raw_bmm1_scale, raw_bmm1_scale * math.log2(math.e)],
+            device=GPU_DEVICE,
+            dtype=torch.float32,
+        )
+        bmm1_scale_log2 = bmm1_scale_workspace.narrow(0, 1, 1)
+        if isinstance(bmm1_scale, torch.Tensor):
+            # Poison the tensor bmm1_scale so precedence is output-observable: the
+            # result only matches the reference (computed from sm_scale above) if the
+            # log2 override takes priority over this tensor. Safe because bmm1_scale
+            # has no consumer after the API call under test.
+            bmm1_scale = bmm1_scale * 7.0
 
     # Optionally make query non-contiguous for testing stride support
     if non_contiguous_query:
@@ -887,6 +922,18 @@ def _test_trtllm_batch_decode(
         guard_end = min(softmax_end + TRTLLM_GEN_WORKSPACE_CHECK_BYTES, workspace_size)
         workspace_buffer[softmax_end:guard_end].zero_()
 
+    multi_ctas_kv_counter_buffer = None
+    if reuse_multi_ctas_kv_counter_buffer:
+        assert backend == "trtllm-gen"
+        counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+            batch_size,
+            num_qo_heads,
+            get_device_sm_count(torch.device(GPU_DEVICE)),
+        )
+        multi_ctas_kv_counter_buffer = torch.zeros(
+            counter_bytes, dtype=torch.uint8, device=GPU_DEVICE
+        )
+
     output_and_lse = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
         q_input,
         kv_cache_arg,
@@ -915,6 +962,8 @@ def _test_trtllm_batch_decode(
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
         lse=provided_lse,
         return_lse=effective_return_lse,
+        bmm1_scale_log2=bmm1_scale_log2,
+        multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
     )
     if expects_lse:
         if effective_return_lse:
@@ -947,11 +996,6 @@ def _test_trtllm_batch_decode(
         )
     else:
         output = output_and_lse
-
-    if backend == "trtllm-gen":
-        # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
-        # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
-        assert (workspace_buffer[: 8192 * 256 * 4] == 0).all().item()
 
     if o_dtype == "nvfp4":
         output, output_ref = unpack_compare_nvfp4(
@@ -994,6 +1038,49 @@ def _test_trtllm_batch_decode(
         atol=atol,
         max_mismatched_elements=max_mismatched_elements,
     )
+
+    if reuse_multi_ctas_kv_counter_buffer:
+        assert multi_ctas_kv_counter_buffer is not None
+        assert torch.count_nonzero(multi_ctas_kv_counter_buffer).item() == 0
+        reused_out = torch.empty_like(output)
+        reused_output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            q_input,
+            kv_cache_arg,
+            workspace_buffer,
+            page_table_kernel,
+            seq_lens.to(GPU_DEVICE),
+            torch.max(seq_lens).item(),
+            bmm1_scale,
+            bmm2_scale,
+            window_left,
+            out=reused_out,
+            out_dtype=out_dtype,
+            o_sf_scale=o_sf_scale,
+            o_sf_vec_size=o_sf_vec_size,
+            sinks=(sink if enable_sink else None),
+            kv_layout=kv_layout,
+            enable_pdl=enable_pdl,
+            backend=backend,
+            q_len_per_req=q_len_per_req,
+            o_scale=o_scale,
+            mask=mask,
+            max_q_len=max_q_len if max_q_len is not None else None,
+            cum_seq_lens_q=q_indptr if max_q_len is not None else None,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            kv_cache_sf=kv_cache_sf_kernel,
+            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+            bmm1_scale_log2=bmm1_scale_log2,
+            multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
+        )
+        assert reused_output.data_ptr() == reused_out.data_ptr()
+        assert torch.count_nonzero(multi_ctas_kv_counter_buffer).item() == 0
+        assert_close_with_mismatch_tolerance(
+            reused_output.float() * o_scale,
+            output.float() * o_scale,
+            rtol=rtol,
+            atol=atol,
+            max_mismatched_elements=max_mismatched_elements,
+        )
 
     # NVFP4 KV cache: use cosine similarity instead of element-wise comparison.
     # Cosine similarity is scale-invariant, which is important because the
@@ -1039,10 +1126,11 @@ def _test_trtllm_batch_decode(
             q_len_per_req=q_len_per_req,
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
-        # v_scale, o_scale in wrapper is emulated by multiplying output by v_scale instead of fused into kernel.
+        # v_scale is fused into the kernel; bmm1 scale is formed in a different order.
         if v_scale == o_scale == 1.0:
             assert (output_wrapper == output).all()
         else:
+            wrapper_rtol = 1.3e-1 if o_dtype == "fp8" else 1e-1
             # todo(Yingyi): fix precision issue with this test
             if not (
                 q_dtype == "fp8"
@@ -1057,70 +1145,105 @@ def _test_trtllm_batch_decode(
                 torch.testing.assert_close(
                     output.float(),
                     output_wrapper.float(),
-                    rtol=1e-1,
+                    rtol=wrapper_rtol,
                     atol=1e-1,
                 )
             else:
                 assert_close_with_mismatch_tolerance(
                     output.float(),
                     output_wrapper.float(),
-                    rtol=1e-1,
+                    rtol=wrapper_rtol,
                     atol=1e-1,
                     max_mismatched_elements=5,
                 )
-        # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
-        # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
-        assert (workspace_buffer[: 8192 * 256 * 4] == 0).all().item()
+        # A caller-provided out= buffer must hold the v-scaled result.
+        out_buf = torch.empty_like(output_wrapper)
+        output_wrapper_out = wrapper_trtllm_gen.run(
+            q_input,
+            kv_cache,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale / o_scale,
+            enable_pdl=enable_pdl,
+            sinks=(sink if enable_sink else None),
+            q_len_per_req=q_len_per_req,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            out=out_buf,
+        )
+        assert output_wrapper_out.data_ptr() == out_buf.data_ptr()
+        assert (out_buf.float() == output_wrapper.float()).all()
 
 
-@pytest.mark.parametrize("backend", ["trtllm-gen"])
-@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
-@pytest.mark.parametrize(
-    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
-    [
-        (4, 1, 16, 2, 1),
-        (4, 1, 32, 2, 5),
-        (4, 2, 64, 2, 5),
-        (4, 3, 32, 2, 5),
-        (4, 3, 64, 2, 1),
-        (4, 4, 64, 4, 1),
-        (4, 5, 64, 4, 8),
-        (128, 1, 64, 2, 5),
-        (128, 2, 32, 4, 1),
-        (128, 3, 16, 4, 8),
-        (128, 4, 16, 2, 5),
-        (128, 5, 16, 2, 5),
-        (256, 1, 64, 4, 8),
-        (256, 2, 16, 2, 8),
-        (256, 3, 64, 4, 5),
-        (256, 4, 32, 2, 8),
-        (256, 5, 32, 2, 1),
-    ],
-)
-@pytest.mark.parametrize("window_left", [-1, 127])
-@pytest.mark.parametrize(
-    "q_dtype,kv_dtype,o_dtype",
-    [
-        ("bf16", "bf16", "bf16"),
-        ("fp16", "fp16", "fp16"),
-        ("bf16", "fp8", "bf16"),
-        ("fp16", "fp8", "fp16"),
-        ("bf16", "fp8", "fp8"),
-        ("fp16", "fp8", "fp8"),
-        ("fp8", "fp8", "bf16"),
-        ("fp8", "fp8", "fp16"),
-        ("fp8", "fp8", "fp8"),
-        ("fp8", "fp8", "nvfp4"),
-        ("fp8", "nvfp4", "fp8"),
-    ],
-)
-@pytest.mark.parametrize("enable_pdl", [True, False, None])
-@pytest.mark.parametrize("enable_sink", [True, False])
-@pytest.mark.parametrize("max_in_kv_len", [110])
+@pytest.mark.parametrize("q_len_per_req", [1, 2])
+def test_trtllm_batch_decode_same_dtype_gqa_grouping(q_len_per_req: int):
+    _test_trtllm_batch_decode(
+        backend="trtllm-gen",
+        kv_layout="HND",
+        batch_size=4,
+        q_len_per_req=q_len_per_req,
+        page_size=32,
+        num_kv_heads=2,
+        head_grp_size=8,
+        window_left=-1,
+        q_dtype="bf16",
+        o_dtype="bf16",
+        kv_dtype="bf16",
+        enable_pdl=None,
+        enable_sink=False,
+        max_in_kv_len=110,
+        head_dim=128,
+    )
+
+
+# Cross both head dimensions with every sampled configuration; keep a normal
+# softmax case so mixed-dtype configurations survive the softmax-mode skip.
 @pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("non_contiguous_query", [False, True])
 @pytest.mark.parametrize("skips_softmax", [False, True])
-@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
+@parametrize_product(
+    {
+        "backend": ["trtllm-gen"],
+        "kv_layout": ["HND", "NHD"],
+        "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size": [
+            (4, 1, 16, 2, 1),
+            (4, 1, 32, 2, 5),
+            (4, 2, 64, 2, 5),
+            (4, 3, 32, 2, 5),
+            (4, 3, 64, 2, 1),
+            (4, 4, 64, 4, 1),
+            (4, 5, 64, 4, 8),
+            (128, 1, 64, 2, 5),
+            (128, 2, 32, 4, 1),
+            (128, 3, 16, 4, 8),
+            (128, 4, 16, 2, 5),
+            (128, 5, 16, 2, 5),
+            (256, 1, 64, 4, 8),
+            (256, 2, 16, 2, 8),
+            (256, 3, 64, 4, 5),
+            (256, 4, 32, 2, 8),
+            (256, 5, 32, 2, 1),
+        ],
+        "window_left": [-1, 127],
+        "q_dtype,kv_dtype,o_dtype": [
+            ("bf16", "bf16", "bf16"),
+            ("fp16", "fp16", "fp16"),
+            ("bf16", "fp8", "bf16"),
+            ("fp16", "fp8", "fp16"),
+            ("bf16", "fp8", "fp8"),
+            ("fp16", "fp8", "fp8"),
+            ("fp8", "fp8", "bf16"),
+            ("fp8", "fp8", "fp16"),
+            ("fp8", "fp8", "fp8"),
+            ("fp8", "fp8", "nvfp4"),
+            ("fp8", "nvfp4", "fp8"),
+        ],
+        "enable_pdl": [True, False, None],
+        "enable_sink": [True, False],
+        "max_in_kv_len": [110],
+        "non_contiguous_query": [False, True],
+        "uses_shared_paged_kv_idx": [True, False],
+    },
+    regular=pairwise_product_cases,
+)
 def test_trtllm_batch_decode(
     backend: str,
     kv_layout: str,
@@ -1169,6 +1292,30 @@ def test_trtllm_batch_decode(
     )
 
 
+@pytest.mark.parametrize(
+    "max_in_kv_len", [64, 256], ids=["window-does-not-bind", "window-binds"]
+)
+def test_trtllm_batch_decode_sliding_window_accuracy(max_in_kv_len: int) -> None:
+    """Check accuracy on both sides of the causal-window kernel-selection boundary."""
+    _test_trtllm_batch_decode(
+        backend="trtllm-gen",
+        kv_layout="HND",
+        batch_size=2,
+        q_len_per_req=1,
+        page_size=16,
+        num_kv_heads=2,
+        head_grp_size=1,
+        window_left=127,
+        q_dtype="bf16",
+        o_dtype="bf16",
+        kv_dtype="bf16",
+        enable_pdl=False,
+        enable_sink=False,
+        max_in_kv_len=max_in_kv_len,
+        head_dim=128,
+    )
+
+
 @pytest.mark.parametrize("return_lse", [False, True])
 @pytest.mark.parametrize("provide_lse", [False, True])
 def test_trtllm_batch_decode_lse_contract(return_lse, provide_lse):
@@ -1195,28 +1342,231 @@ def test_trtllm_batch_decode_lse_contract(return_lse, provide_lse):
     )
 
 
-@pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
-@pytest.mark.parametrize(
-    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
-    [
-        (1, 1, 16, 8, 8),
-        (1, 1, 32, 8, 8),
-    ],
-)
-@pytest.mark.parametrize("window_left", [-1])
+# device_scale=True exercises the precedence branch where a tensor ``bmm1_scale``
+# is also supplied and the log2 override must take priority. kv_dtype="fp8" covers
+# the motivating FP8 KV use case (#3500).
+@pytest.mark.parametrize("device_scale", [False, True])
 @pytest.mark.parametrize(
     "q_dtype,kv_dtype,o_dtype",
     [
-        ("fp8", "fp8", "fp8"),
+        ("bf16", "bf16", "bf16"),
+        ("bf16", "fp8", "bf16"),
     ],
 )
-@pytest.mark.parametrize("enable_pdl", [None])
-@pytest.mark.parametrize("enable_sink", [False])
-@pytest.mark.parametrize("max_in_kv_len", [4096, 8192])
-@pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("device_scale", [True, False])
-@pytest.mark.parametrize("skips_softmax", [False, True])
-@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
+def test_trtllm_batch_decode_bmm1_scale_log2(q_dtype, kv_dtype, o_dtype, device_scale):
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        2,
+        1,
+        16,
+        2,
+        2,
+        -1,
+        q_dtype,
+        o_dtype,
+        kv_dtype,
+        False,
+        False,
+        128,
+        128,
+        device_scale=device_scale,
+        uses_shared_paged_kv_idx=True,
+        use_bmm1_scale_log2=True,
+    )
+
+
+def test_bf16q_fp8kv_transform_mode_kwarg_exists():
+    signature = inspect.signature(flashinfer.decode.trtllm_batch_decode_with_kv_cache)
+    parameter = signature.parameters["bf16q_fp8kv_transform_mode"]
+    assert parameter.default is None
+    assert parameter.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        ("k_only", 1),
+        ("separate_kv", 2),
+    ],
+)
+def test_bf16q_fp8kv_transform_mode_mapping(mode, expected):
+    assert flashinfer.decode._get_bf16q_fp8kv_transform_mode(mode) == expected
+
+
+def test_bf16q_fp8kv_transform_mode_rejects_invalid_value():
+    with pytest.raises(ValueError, match="bf16q_fp8kv_transform_mode"):
+        flashinfer.decode._get_bf16q_fp8kv_transform_mode("split_kv")
+    with pytest.raises(ValueError, match="bf16q_fp8kv_transform_mode"):
+        flashinfer.decode._get_bf16q_fp8kv_transform_mode("full")
+
+
+def test_bf16q_fp8kv_transform_modes_run():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for this attention test")
+    if get_compute_capability(torch.device("cuda"))[0] != 10:
+        pytest.skip("This attention test requires SM100 or SM103 GPUs")
+
+    batch_size = 1
+    q_len = 1
+    num_kv_heads = 1
+    num_qo_heads = 8
+    head_dim = 64
+    page_size = 32
+    kv_len = 1024
+    num_pages = kv_len // page_size
+
+    torch.manual_seed(0)
+    query = (
+        torch.randn(
+            batch_size * q_len,
+            num_qo_heads,
+            head_dim,
+            device=GPU_DEVICE,
+            dtype=torch.bfloat16,
+        )
+        * 0.1
+    )
+    key_bf16 = (
+        torch.randn(
+            num_pages,
+            num_kv_heads,
+            page_size,
+            head_dim,
+            device=GPU_DEVICE,
+            dtype=torch.bfloat16,
+        )
+        * 0.1
+    )
+    value_bf16 = (
+        torch.randn(
+            num_pages,
+            num_kv_heads,
+            page_size,
+            head_dim,
+            device=GPU_DEVICE,
+            dtype=torch.bfloat16,
+        )
+        * 0.1
+    )
+    key_fp8, key_scale = to_float8(key_bf16)
+    value_fp8, value_scale = to_float8(value_bf16)
+    kv_cache = torch.stack([key_fp8, value_fp8], dim=1).contiguous()
+    block_tables = torch.arange(
+        num_pages, device=GPU_DEVICE, dtype=torch.int32
+    ).reshape(batch_size, num_pages)
+    seq_lens = torch.full((batch_size,), kv_len, device=GPU_DEVICE, dtype=torch.int32)
+    workspace = torch.empty(workspace_size, dtype=torch.int8, device=GPU_DEVICE)
+
+    outputs = {}
+    outputs["default"] = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+        query,
+        kv_cache,
+        workspace,
+        block_tables,
+        seq_lens,
+        kv_len,
+        bmm1_scale=float(key_scale.item()) / math.sqrt(head_dim),
+        bmm2_scale=float(value_scale.item()),
+        backend="trtllm-gen",
+        q_len_per_req=q_len,
+    )
+    torch.cuda.synchronize()
+    assert torch.isfinite(outputs["default"]).all()
+
+    workspace.zero_()
+    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, "HND", backend="trtllm-gen"
+    )
+    kv_indptr = torch.tensor([0, num_pages], device=GPU_DEVICE, dtype=torch.int32)
+    kv_indices = torch.arange(num_pages, device=GPU_DEVICE, dtype=torch.int32)
+    kv_last_page_len = torch.full(
+        (batch_size,), page_size, device=GPU_DEVICE, dtype=torch.int32
+    )
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=query.dtype,
+        kv_data_type=kv_cache.dtype,
+        o_data_type=torch.bfloat16,
+        q_len_per_req=q_len,
+    )
+    outputs["wrapper_default"] = wrapper.run(
+        query,
+        kv_cache,
+        q_len_per_req=q_len,
+        q_scale=1.0 / math.sqrt(head_dim),
+        k_scale=float(key_scale.item()),
+        v_scale=float(value_scale.item()),
+    )
+    torch.cuda.synchronize()
+    assert torch.isfinite(outputs["wrapper_default"]).all()
+
+    for mode in ("k_only", "separate_kv"):
+        workspace.zero_()
+        outputs[mode] = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            query,
+            kv_cache,
+            workspace,
+            block_tables,
+            seq_lens,
+            kv_len,
+            bmm1_scale=float(key_scale.item()) / math.sqrt(head_dim),
+            bmm2_scale=float(value_scale.item()),
+            backend="trtllm-gen",
+            q_len_per_req=q_len,
+            bf16q_fp8kv_transform_mode=mode,
+        )
+        torch.cuda.synchronize()
+        assert torch.isfinite(outputs[mode]).all()
+
+    torch.testing.assert_close(
+        outputs["default"].float(),
+        outputs["separate_kv"].float(),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        outputs["wrapper_default"].float(),
+        outputs["separate_kv"].float(),
+        rtol=5e-2,
+        atol=5e-2,
+    )
+    torch.testing.assert_close(
+        outputs["k_only"].float(),
+        outputs["separate_kv"].float(),
+        rtol=5e-2,
+        atol=5e-2,
+    )
+
+
+@parametrize_product(
+    {
+        "kv_layout": ["HND"],
+        "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size": [
+            (1, 1, 16, 8, 8),
+            (1, 1, 32, 8, 8),
+        ],
+        "window_left": [-1],
+        "q_dtype,kv_dtype,o_dtype": [("fp8", "fp8", "fp8")],
+        "enable_pdl": [None],
+        "enable_sink": [False],
+        "max_in_kv_len": [4096, 8192],
+        "head_dim": [128],
+        "device_scale": [True, False],
+        "skips_softmax": [False, True],
+        "uses_shared_paged_kv_idx": [True, False],
+    },
+    regular=pairwise_product_cases,
+)
 def test_trtllm_batch_decode_bs1(
     kv_layout: str,
     batch_size: int,
@@ -1259,39 +1609,63 @@ def test_trtllm_batch_decode_bs1(
     )
 
 
-@pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
-@pytest.mark.parametrize(
-    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
-    [
-        (4, 1, 16, 2, 1),
-        (4, 1, 32, 2, 5),
-        (4, 3, 64, 2, 1),
-        (4, 4, 64, 4, 1),
-        (128, 3, 16, 4, 8),
-        (128, 4, 16, 2, 5),
-        (256, 4, 32, 2, 8),
-        (256, 5, 32, 2, 1),
-    ],
-)
-@pytest.mark.parametrize("window_left", [-1])
-@pytest.mark.parametrize(
-    "q_dtype,kv_dtype,o_dtype",
-    [
-        ("bf16", "bf16", "bf16"),
-        ("fp16", "fp16", "fp16"),
-        ("fp8", "fp8", "fp16"),
-        ("fp8", "fp8", "fp8"),
-        ("fp8", "fp8", "nvfp4"),
-        ("fp8", "nvfp4", "fp8"),
-    ],
-)
-@pytest.mark.parametrize("enable_pdl", [None])
-@pytest.mark.parametrize("enable_sink", [False])
-@pytest.mark.parametrize("max_in_kv_len", [110])
-@pytest.mark.parametrize("head_dim", [256])
-@pytest.mark.parametrize("device_scale", [True, False])
+def test_trtllm_batch_decode_gpt_oss_counter_reuse():
+    _test_trtllm_batch_decode(
+        backend="trtllm-gen",
+        kv_layout="HND",
+        batch_size=1,
+        q_len_per_req=1,
+        page_size=16,
+        num_kv_heads=8,
+        head_grp_size=8,
+        window_left=-1,
+        q_dtype="fp8",
+        o_dtype="fp8",
+        kv_dtype="fp8",
+        enable_pdl=None,
+        enable_sink=False,
+        max_in_kv_len=8192,
+        head_dim=64,
+        device_scale=False,
+        skips_softmax=False,
+        uses_shared_paged_kv_idx=True,
+        reuse_multi_ctas_kv_counter_buffer=True,
+    )
+
+
+# Keep a normal-softmax case for every sampled mixed-dtype configuration.
 @pytest.mark.parametrize("skips_softmax", [False, True])
-@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
+@parametrize_product(
+    {
+        "kv_layout": ["HND"],
+        "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size": [
+            (4, 1, 16, 2, 1),
+            (4, 1, 32, 2, 5),
+            (4, 3, 64, 2, 1),
+            (4, 4, 64, 4, 1),
+            (128, 3, 16, 4, 8),
+            (128, 4, 16, 2, 5),
+            (256, 4, 32, 2, 8),
+            (256, 5, 32, 2, 1),
+        ],
+        "window_left": [-1],
+        "q_dtype,kv_dtype,o_dtype": [
+            ("bf16", "bf16", "bf16"),
+            ("fp16", "fp16", "fp16"),
+            ("fp8", "fp8", "fp16"),
+            ("fp8", "fp8", "fp8"),
+            ("fp8", "fp8", "nvfp4"),
+            ("fp8", "nvfp4", "fp8"),
+        ],
+        "enable_pdl": [None],
+        "enable_sink": [False],
+        "max_in_kv_len": [110],
+        "head_dim": [256],
+        "device_scale": [True, False],
+        "uses_shared_paged_kv_idx": [True, False],
+    },
+    regular=pairwise_product_cases,
+)
 def test_trtllm_batch_decode_head_dim_256(
     kv_layout: str,
     batch_size: int,
@@ -1334,34 +1708,33 @@ def test_trtllm_batch_decode_head_dim_256(
     )
 
 
-@pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
-@pytest.mark.parametrize(
-    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
-    [
-        (1, 1, 16, 2, 1),
-        (1, 1, 32, 2, 5),
-        (1, 3, 64, 2, 1),
-        (1, 4, 64, 4, 1),
-        (32, 4, 16, 2, 8),
-        (32, 8, 16, 2, 8),
-        (32, 16, 16, 2, 8),
-    ],
+@parametrize_product(
+    {
+        "kv_layout": ["HND"],
+        "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size": [
+            (1, 1, 16, 2, 1),
+            (1, 1, 32, 2, 5),
+            (1, 3, 64, 2, 1),
+            (1, 4, 64, 4, 1),
+            (32, 4, 16, 2, 8),
+            (32, 8, 16, 2, 8),
+            (32, 16, 16, 2, 8),
+        ],
+        "window_left": [-1],
+        "q_dtype,kv_dtype,o_dtype": [
+            ("bf16", "bf16", "bf16"),
+            ("fp8", "fp8", "fp8"),
+        ],
+        "enable_pdl": [None],
+        "enable_sink": [False],
+        "max_in_kv_len": [4096, 8192, 16384, 32768, 65536, 131072],
+        "head_dim": [128],
+        "device_scale": [True, False],
+        "skips_softmax": [False],
+        "uses_shared_paged_kv_idx": [True, False],
+    },
+    regular=pairwise_product_cases,
 )
-@pytest.mark.parametrize("window_left", [-1])
-@pytest.mark.parametrize(
-    "q_dtype,kv_dtype,o_dtype",
-    [
-        ("bf16", "bf16", "bf16"),
-        ("fp8", "fp8", "fp8"),
-    ],
-)
-@pytest.mark.parametrize("enable_pdl", [None])
-@pytest.mark.parametrize("enable_sink", [False])
-@pytest.mark.parametrize("max_in_kv_len", [4096, 8192, 16384, 32768, 65536, 131072])
-@pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("device_scale", [True, False])
-@pytest.mark.parametrize("skips_softmax", [False])
-@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
 def test_trtllm_batch_decode_long_sequence_length(
     kv_layout: str,
     batch_size: int,
@@ -1404,15 +1777,22 @@ def test_trtllm_batch_decode_long_sequence_length(
     )
 
 
-@pytest.mark.parametrize("page_size", [128, 256, 512, 1024])
-@pytest.mark.parametrize("q_len_per_req", [1, 2])
-@pytest.mark.parametrize("window_left", [-1, 127])
-@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
-def test_trtllm_batch_decode_dynamic_page_size_gqa(
+@parametrize_product(
+    {
+        "page_size": [128, 256, 512, 1024],
+        "q_len_per_req": [1, 2],
+        "window_left": [-1, 127],
+        "uses_shared_paged_kv_idx": [True, False],
+        "head_grp_size": [1, 5],
+    },
+    regular=pairwise_product_cases,
+)
+def test_trtllm_batch_decode_dynamic_page_size(
     page_size: int,
     q_len_per_req: int,
     window_left: int,
     uses_shared_paged_kv_idx: bool,
+    head_grp_size: int,
 ) -> None:
     _skip_if_not_blackwell()
     _test_trtllm_batch_decode(
@@ -1422,7 +1802,7 @@ def test_trtllm_batch_decode_dynamic_page_size_gqa(
         q_len_per_req=q_len_per_req,
         page_size=page_size,
         num_kv_heads=2,
-        head_grp_size=5,
+        head_grp_size=head_grp_size,
         window_left=window_left,
         q_dtype="bf16",
         o_dtype="bf16",
@@ -1435,35 +1815,34 @@ def test_trtllm_batch_decode_dynamic_page_size_gqa(
     )
 
 
-@pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
-@pytest.mark.parametrize(
-    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
-    [
-        (4, 1, 16, 2, 1),
-        (4, 1, 32, 2, 5),
-        (4, 3, 64, 4, 1),
-        (128, 3, 16, 4, 8),
-        (1, 6, 64, 2, 8),
-        (4, 8, 64, 2, 8),
-    ],
+@parametrize_product(
+    {
+        "kv_layout": ["HND"],
+        "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size": [
+            (4, 1, 16, 2, 1),
+            (4, 1, 32, 2, 5),
+            (4, 3, 64, 4, 1),
+            (128, 3, 16, 4, 8),
+            (1, 6, 64, 2, 8),
+            (4, 8, 64, 2, 8),
+        ],
+        "window_left": [-1],
+        "q_dtype,kv_dtype,o_dtype": [
+            ("bf16", "bf16", "bf16"),
+            ("fp16", "fp16", "fp16"),
+            ("fp8", "fp8", "fp8"),
+            ("fp8", "fp8", "bf16"),
+        ],
+        "enable_pdl": [None],
+        "enable_sink": [False],
+        "max_in_kv_len": [110, 4096, 8192],
+        "head_dim": [512],
+        "device_scale": [True, False],
+        "skips_softmax": [False, True],
+        "uses_shared_paged_kv_idx": [True, False],
+    },
+    regular=pairwise_product_cases,
 )
-@pytest.mark.parametrize("window_left", [-1])
-@pytest.mark.parametrize(
-    "q_dtype,kv_dtype,o_dtype",
-    [
-        ("bf16", "bf16", "bf16"),
-        ("fp16", "fp16", "fp16"),
-        ("fp8", "fp8", "fp8"),
-        ("fp8", "fp8", "bf16"),
-    ],
-)
-@pytest.mark.parametrize("enable_pdl", [None])
-@pytest.mark.parametrize("enable_sink", [False])
-@pytest.mark.parametrize("max_in_kv_len", [110, 4096, 8192])
-@pytest.mark.parametrize("head_dim", [512])
-@pytest.mark.parametrize("device_scale", [True, False])
-@pytest.mark.parametrize("skips_softmax", [False, True])
-@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
 def test_trtllm_batch_decode_head_dim_512(
     kv_layout: str,
     batch_size: int,
@@ -1505,6 +1884,130 @@ def test_trtllm_batch_decode_head_dim_512(
     )
 
 
+def test_trtllm_batch_decode_reduction_indexing():
+    """Regression coverage for packed-Q offsets and causal KV tile extent."""
+    compute_capability = get_compute_capability(torch.device(GPU_DEVICE))
+    if compute_capability[0] != 10:
+        pytest.skip("trtllm-gen backend requires SM100 or SM103 GPUs.")
+
+    q_len_per_req = 6
+    page_size = 16
+    num_qo_heads = 8
+    num_kv_heads = 1
+    head_dim = 512
+    dtype = torch.bfloat16
+
+    # The first case isolates the packed Q/O request offset. The second uses
+    # variable sequence lengths so the long request raises mMaxNumCtasKv while
+    # the short request crosses a 128-token KV-tile boundary. Zero Q/K and a
+    # tile-coded V make a missing reduction contribution deterministic.
+    cases = (
+        ("packed_qo_offset", [4096, 4096, 4096, 4096], False),
+        ("causal_kv_extent", [2052, 8192], True),
+    )
+
+    for case_name, seq_len_values, use_tile_coded_v in cases:
+        batch_size = len(seq_len_values)
+        max_seq_len = max(seq_len_values)
+        max_pages = (max_seq_len + page_size - 1) // page_size
+        seq_lens = torch.tensor(seq_len_values, dtype=torch.int32)
+        q_lens = torch.full((batch_size,), q_len_per_req, dtype=torch.int32)
+        page_table = torch.arange(
+            batch_size * max_pages, dtype=torch.int32, device=GPU_DEVICE
+        ).view(batch_size, max_pages)
+
+        if use_tile_coded_v:
+            query = torch.zeros(
+                batch_size * q_len_per_req,
+                num_qo_heads,
+                head_dim,
+                dtype=dtype,
+                device=GPU_DEVICE,
+            )
+            kv_cache = torch.zeros(
+                batch_size * max_pages,
+                2,
+                num_kv_heads,
+                page_size,
+                head_dim,
+                dtype=dtype,
+                device=GPU_DEVICE,
+            )
+            tile_values = (
+                torch.arange(max_pages * page_size, device=GPU_DEVICE)
+                .div(128, rounding_mode="floor")
+                .to(dtype)
+                .view(max_pages, page_size, 1)
+            )
+            for request_idx in range(batch_size):
+                page_start = request_idx * max_pages
+                kv_cache[page_start : page_start + max_pages, 1, 0] = tile_values
+        else:
+            torch.manual_seed(1234)
+            query_one = (
+                torch.randn(
+                    q_len_per_req,
+                    num_qo_heads,
+                    head_dim,
+                    dtype=dtype,
+                    device=GPU_DEVICE,
+                )
+                / 4
+            )
+            query = query_one.repeat(batch_size, 1, 1).contiguous()
+            kv_one = (
+                torch.randn(
+                    max_pages,
+                    2,
+                    num_kv_heads,
+                    page_size,
+                    head_dim,
+                    dtype=dtype,
+                    device=GPU_DEVICE,
+                )
+                / 4
+            )
+            kv_cache = kv_one.repeat(batch_size, 1, 1, 1, 1).contiguous()
+
+        output_ref = sdpa_paged_reference(
+            query,
+            kv_cache,
+            q_lens,
+            seq_lens,
+            page_table,
+            page_size,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            "HND",
+            -1,
+        )
+        workspace_buffer = torch.zeros(
+            256 * 1024 * 1024, dtype=torch.int8, device=GPU_DEVICE
+        )
+        output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            query=query,
+            kv_cache=kv_cache,
+            workspace_buffer=workspace_buffer,
+            block_tables=page_table,
+            seq_lens=seq_lens.to(GPU_DEVICE),
+            max_seq_len=max_seq_len,
+            bmm1_scale=head_dim**-0.5,
+            bmm2_scale=1.0,
+            window_left=-1,
+            kv_layout="HND",
+            backend="trtllm-gen",
+            q_len_per_req=q_len_per_req,
+        )
+
+        try:
+            torch.testing.assert_close(
+                output.float(), output_ref.float(), rtol=0.0, atol=1e-3
+            )
+        except AssertionError as error:
+            raise AssertionError(f"{case_name} failed: {error}") from error
+
+
 def make_query_non_contiguous(
     q: torch.Tensor, num_qo_heads: int, head_dim: int
 ) -> torch.Tensor:
@@ -1523,53 +2026,53 @@ def make_query_non_contiguous(
     return q_non_contiguous
 
 
-@pytest.mark.parametrize("backend", ["trtllm-gen"])
-@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
-@pytest.mark.parametrize(
-    "batch_size,max_q_len,page_size,num_kv_heads,head_grp_size,head_dim",
-    [
-        (4, 1, 16, 2, 1, 128),
-        (4, 1, 32, 2, 5, 128),
-        (4, 2, 64, 2, 5, 128),
-        (4, 3, 32, 2, 5, 128),
-        (4, 3, 64, 2, 1, 128),
-        (4, 4, 64, 4, 1, 128),
-        (4, 5, 64, 4, 8, 128),
-        # Iterate over head_dim 128, 256 for these configs to simplify
-        *[(bs, 4, 64, 4, 16, hd) for bs in [4, 8, 16, 32] for hd in [128, 256]],
-        (128, 1, 64, 2, 5, 128),
-        (128, 2, 32, 4, 1, 128),
-        (128, 3, 16, 4, 8, 128),
-        (128, 4, 16, 2, 5, 128),
-        (128, 5, 16, 2, 5, 128),
-        (256, 1, 64, 4, 8, 256),
-        (256, 2, 16, 2, 8, 256),
-        (256, 3, 64, 4, 5, 256),
-        (256, 4, 32, 2, 8, 256),
-        (256, 16, 32, 2, 8, 256),
-    ],
-)
-@pytest.mark.parametrize("window_left", [-1, 127])
-@pytest.mark.parametrize(
-    "q_dtype,kv_dtype,o_dtype",
-    [
-        ("bf16", "bf16", "bf16"),
-        ("fp16", "fp16", "fp16"),
-        ("bf16", "fp8", "bf16"),
-        ("fp16", "fp8", "fp16"),
-        ("bf16", "fp8", "fp8"),
-        ("fp16", "fp8", "fp8"),
-        ("fp8", "fp8", "bf16"),
-        ("fp8", "fp8", "fp16"),
-        ("fp8", "fp8", "fp8"),
-        ("fp8", "fp8", "nvfp4"),
-    ],
-)
-@pytest.mark.parametrize("enable_pdl", [True, False, None])
-@pytest.mark.parametrize("enable_sink", [True, False])
-@pytest.mark.parametrize("max_in_kv_len", [110])
+# Keep a normal-softmax case for every sampled mixed-dtype configuration.
 @pytest.mark.parametrize("skips_softmax", [False, True])
-@pytest.mark.parametrize("uses_shared_paged_kv_idx", [False, True])
+@parametrize_product(
+    {
+        "backend": ["trtllm-gen"],
+        "kv_layout": ["HND", "NHD"],
+        "batch_size,max_q_len,page_size,num_kv_heads,head_grp_size,head_dim": [
+            (4, 1, 16, 2, 1, 128),
+            (4, 1, 32, 2, 5, 128),
+            (4, 2, 64, 2, 5, 128),
+            (4, 3, 32, 2, 5, 128),
+            (4, 3, 64, 2, 1, 128),
+            (4, 4, 64, 4, 1, 128),
+            (4, 5, 64, 4, 8, 128),
+            # Iterate over head_dim 128, 256 for these configs to simplify
+            *[(bs, 4, 64, 4, 16, hd) for bs in [4, 8, 16, 32] for hd in [128, 256]],
+            (128, 1, 64, 2, 5, 128),
+            (128, 2, 32, 4, 1, 128),
+            (128, 3, 16, 4, 8, 128),
+            (128, 4, 16, 2, 5, 128),
+            (128, 5, 16, 2, 5, 128),
+            (256, 1, 64, 4, 8, 256),
+            (256, 2, 16, 2, 8, 256),
+            (256, 3, 64, 4, 5, 256),
+            (256, 4, 32, 2, 8, 256),
+            (256, 16, 32, 2, 8, 256),
+        ],
+        "window_left": [-1, 127],
+        "q_dtype,kv_dtype,o_dtype": [
+            ("bf16", "bf16", "bf16"),
+            ("fp16", "fp16", "fp16"),
+            ("bf16", "fp8", "bf16"),
+            ("fp16", "fp8", "fp16"),
+            ("bf16", "fp8", "fp8"),
+            ("fp16", "fp8", "fp8"),
+            ("fp8", "fp8", "bf16"),
+            ("fp8", "fp8", "fp16"),
+            ("fp8", "fp8", "fp8"),
+            ("fp8", "fp8", "nvfp4"),
+        ],
+        "enable_pdl": [True, False, None],
+        "enable_sink": [True, False],
+        "max_in_kv_len": [110],
+        "uses_shared_paged_kv_idx": [False, True],
+    },
+    regular=pairwise_product_cases,
+)
 def test_trtllm_batch_decode_spec(
     backend: str,
     kv_layout: str,
@@ -1609,3 +2112,359 @@ def test_trtllm_batch_decode_spec(
         skips_softmax=skips_softmax,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
+
+
+# Multi-wave KV split (opt-in): with FLASHINFER_TRTLLM_GEN_MULTI_WAVE_KV_SPLIT=1, when one wave
+# of CTAs gives at most 2 KV splits, trtllm-gen uses up to 4 waves (fmhaKernels.cuh). Unset keeps
+# the stock one-wave split. The 32/2-head cases have base CTAs = 2 x batch (one Q CTA per
+# request), so one-wave splits are SMs // (2 x batch).
+MULTI_WAVE_KV_SPLIT_ENV = "FLASHINFER_TRTLLM_GEN_MULTI_WAVE_KV_SPLIT"
+_MULTI_WAVE_SENTINEL = 0x5A
+
+
+def _multi_wave_sm_count() -> int:
+    compute_capability = get_compute_capability(torch.device(GPU_DEVICE))
+    if compute_capability[0] != 10:
+        pytest.skip("trtllm-gen backend requires SM100 or SM103 GPUs.")
+    return get_device_sm_count(torch.device(GPU_DEVICE))
+
+
+def _multi_wave_inputs(
+    batch_size: int,
+    q_len: int,
+    num_kv_heads: int,
+    head_grp_size: int,
+    head_dim: int,
+    q_dtype: str,
+    kv_dtype: str,
+    max_kv_len: int,
+    page_size: int = 16,
+):
+    """Deterministic paged-KV decode inputs with mixed KV lengths."""
+    torch.manual_seed(0)
+    num_qo_heads = num_kv_heads * head_grp_size
+    q_lens = torch.full((batch_size,), q_len, dtype=torch.int32)
+    seq_lens = torch.randint(
+        max(q_len, max_kv_len // 8), max_kv_len + 1, (batch_size,), dtype=torch.int32
+    )
+    seq_lens[-1] = max_kv_len
+    q, q_scale, ref_q = create_query_tensor(q_lens, num_qo_heads, head_dim, q_dtype)
+    kv_cache, k_scale, v_scale, ref_kv_cache, _ = create_kv_cache(
+        batch_size, seq_lens, page_size, num_kv_heads, head_dim, kv_dtype, "bf16"
+    )
+    page_table, _, _ = create_page_table(batch_size, seq_lens, page_size)
+    return dict(
+        q=q,
+        ref_q=ref_q,
+        kv_cache=kv_cache,
+        ref_kv_cache=ref_kv_cache,
+        page_table=page_table,
+        q_lens=q_lens,
+        seq_lens=seq_lens,
+        page_size=page_size,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        q_len=q_len,
+        bmm1_scale=float(q_scale * k_scale) * head_dim**-0.5,
+        bmm2_scale=float(v_scale),
+    )
+
+
+def _multi_wave_decode(
+    inp, workspace_buffer, window_left=-1, max_seq_len=None, return_lse=False
+):
+    return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+        query=inp["q"],
+        kv_cache=inp["kv_cache"],
+        workspace_buffer=workspace_buffer,
+        block_tables=inp["page_table"],
+        seq_lens=inp["seq_lens"].to(GPU_DEVICE),
+        max_seq_len=max_seq_len or int(inp["seq_lens"].max().item()),
+        bmm1_scale=inp["bmm1_scale"],
+        bmm2_scale=inp["bmm2_scale"],
+        window_left=window_left,
+        out_dtype=torch.bfloat16,
+        kv_layout="HND",
+        backend="trtllm-gen",
+        q_len_per_req=inp["q_len"],
+        return_lse=return_lse,
+    )
+
+
+def _assert_multi_wave_matches_fp32_reference(inp, output, q_dtype, window_left=-1):
+    # sdpa_paged_reference computes in fp32 from the dequantized Q/K/V.
+    output_ref = sdpa_paged_reference(
+        inp["ref_q"],
+        inp["ref_kv_cache"],
+        inp["q_lens"],
+        inp["seq_lens"],
+        inp["page_table"],
+        inp["page_size"],
+        inp["num_qo_heads"],
+        inp["num_kv_heads"],
+        inp["head_dim"],
+        "HND",
+        window_left,
+    )
+    rtol, atol = (4e-2, 7e-2) if q_dtype == "fp8" else (1e-2, 1e-2)
+    if inp["q_len"] > 1:
+        rtol, atol = rtol * 2, atol * 2
+    assert_close_with_mismatch_tolerance(
+        output.float(),
+        output_ref.float(),
+        rtol=rtol,
+        atol=atol,
+        max_mismatched_elements=int(5e-5 * output.numel()),
+    )
+
+
+def _sentinel_workspace(num_bytes: int, offset: int = 0):
+    """A workspace view at `offset` into a sentinel-filled buffer that has a guard tail."""
+    storage = torch.full(
+        (offset + num_bytes + TRTLLM_GEN_WORKSPACE_CHECK_BYTES,),
+        _MULTI_WAVE_SENTINEL,
+        dtype=torch.int8,
+        device=GPU_DEVICE,
+    )
+    return storage, storage[offset : offset + num_bytes]
+
+
+def _untouched(region: torch.Tensor) -> bool:
+    return bool((region == _MULTI_WAVE_SENTINEL).all().item())
+
+
+def _multi_wave_scratch_bytes(sm_count, total_ctas, step_q, head_dim_per_cta_v):
+    """Scratch bytes the launcher checks for a multi-wave split (fitsMultiCtasKvScratch).
+
+    The callers pass the cubin's stepQ and headDimPerCtaV, which Python cannot read. The
+    exact-capacity cases fail by design if a cubin has other values.
+    """
+    stats_bytes = max(sm_count, total_ctas) * step_q * 8
+    partial_o_bytes = total_ctas * step_q * head_dim_per_cta_v * 2
+    return stats_bytes + partial_o_bytes
+
+
+def _multi_wave_cases(m: int) -> dict:
+    """Decode cases for SM count m. expect: what the opt-in run does versus the default run.
+
+    engaged: more CTAs than SMs. unchanged: the same launch as default (bitwise).
+    cga_gmem: engaged, and the CGA candidate falls back to Gmem on occupancy.
+    """
+    cases = {}
+
+    def add(name, expect, batch_size, q_len=1, **kw):
+        cfg = dict(batch_size=batch_size, q_len=q_len, head_grp_size=16, head_dim=128)
+        cfg.update(q_dtype="fp8", kv_dtype="fp8", max_kv_len=8192, window_left=-1)
+        cfg.update(
+            page_size=16, workspace_bytes=None, misalign=0, lse=False, expect=expect
+        )
+        cfg.update(kw)
+        cases[name] = cfg
+
+    # fp32-reference shapes. KV is fp8 and out is bf16. Head 512 with 16/2 heads and q_len 6:
+    # keepsMmaAb Q64, headDimPerCtaV 256, separate reducer, base CTAs = 4 x batch.
+    for k0 in (1, 2):
+        for q_len in (1, 6):
+            for q_dtype in ("fp8", "bf16"):
+                batch_size = m // 4 + (1 if k0 == 1 else 0)
+                name = f"one_wave_{k0}-q{q_len}-{q_dtype}q"
+                add(name, "engaged", batch_size, q_len, q_dtype=q_dtype)
+    add("tuned_max_3", "engaged", m // 4 + 1, max_kv_len=768)
+    add("window_1023", "engaged", m // 4 + 1, window_left=1023)
+    head512 = dict(
+        q_len=6, head_grp_size=8, head_dim=512, max_kv_len=4096, page_size=64
+    )
+    add("head512-one_wave_1", "engaged", m // 8 + 1, **head512)
+    add("head512-base_2x_sms", "engaged", m // 2, **head512)
+    add("base_2x_sms", "engaged", m, max_kv_len=2048)
+    add("base_over_2x_sms", "unchanged", m + 1, max_kv_len=2048)  # 4 waves give 1 split
+    # One wave gives 4 splits; and short KV that binds tunedMax with tile-search probes.
+    add("parity", "unchanged", m // 8)
+    add("parity_tile_search", "unchanged", 4, q_len=4, max_kv_len=1024)
+    # Capacity: q_len 6, bf16, keepsMmaAb Q128 (stepQ 128, headDimPerCtaV 128). One wave gives
+    # 1 split, so stock writes no scratch. With LSE, the workspace starts 8 bytes past a 16-byte
+    # boundary and the launcher pads 8 bytes before the softmax stats.
+    batch_size = m // 4 + 1
+    need = _multi_wave_scratch_bytes(
+        m, (4 * m // (2 * batch_size)) * 2 * batch_size, 128, 128
+    )
+    for lse in (False, True):
+        misalign = 8 if lse else 0
+        lse_bytes = (
+            _trtllm_gen_softmax_slab_bytes(32, batch_size, 6)
+            + TRTLLM_GEN_WORKSPACE_CHECK_BYTES
+            if lse
+            else 0
+        )
+        for short in (False, True):
+            add(
+                f"capacity-{'lse_misaligned' if lse else 'no_lse'}-"
+                f"{'one_byte_short' if short else 'exact'}",
+                "unchanged" if short else "engaged",
+                batch_size,
+                6,
+                q_dtype="bf16",
+                kv_dtype="bf16",
+                workspace_bytes=misalign + lse_bytes + need - int(short),
+                misalign=misalign,
+                lse=lse,
+                scratch_start=misalign + lse_bytes,
+            )
+    # swapsMmaAb Q16 (stepQ 16): one wave gives 2 splits (CGA). The multi-wave grid exceeds CGA
+    # occupancy, so the candidate reselects GmemReduction.
+    batch_size = m // 4
+    need = _multi_wave_scratch_bytes(
+        m, (4 * m // (2 * batch_size)) * 2 * batch_size, 16, 128
+    )
+    add("cga_reselection_fits", "cga_gmem", batch_size, workspace_bytes=need)
+    add(
+        "cga_reselection_one_byte_short",
+        "unchanged",
+        batch_size,
+        workspace_bytes=need - 1,
+    )
+    return cases
+
+
+def _multi_wave_case_inputs(cfg: dict):
+    return _multi_wave_inputs(
+        cfg["batch_size"],
+        cfg["q_len"],
+        2,
+        cfg["head_grp_size"],
+        cfg["head_dim"],
+        cfg["q_dtype"],
+        cfg["kv_dtype"],
+        cfg["max_kv_len"],
+        page_size=cfg["page_size"],
+    )
+
+
+_MULTI_WAVE_FINAL_LAUNCH = re.compile(
+    r"final launch: kernelName = (\S+), multiCtasKvMode = (\d+), "
+    r"numCtasX = (\d+), numCtasY = (\d+), numCtasZ = (\d+)"
+)
+_MULTI_CTAS_KV_DISABLED, _GMEM_REDUCTION, _CGA_SMEM_REDUCTION = (
+    0,
+    1,
+    3,
+)  # MultiCtasKvMode
+
+
+def _multi_wave_worker(cases: dict, out_path: str) -> None:
+    """Subprocess body: one decode call per case, in order, so the log has one launch per case."""
+    results = {}
+    for case, cfg in cases.items():
+        inp = _multi_wave_case_inputs(cfg)
+        num_bytes = cfg["workspace_bytes"] or workspace_size
+        storage, workspace_buffer = _sentinel_workspace(num_bytes, cfg["misalign"])
+        assert workspace_buffer.data_ptr() % 16 == cfg["misalign"]
+        result = _multi_wave_decode(
+            inp, workspace_buffer, window_left=cfg["window_left"], return_lse=cfg["lse"]
+        )
+        output = result[0] if cfg["lse"] else result
+        torch.cuda.synchronize()
+        checks = {"tail": _untouched(storage[cfg["misalign"] + num_bytes :])}
+        if "scratch_start" in cfg:
+            start = cfg["scratch_start"]
+            checks["scratch"] = _untouched(workspace_buffer[start:])
+            guard = workspace_buffer[
+                max(0, start - TRTLLM_GEN_WORKSPACE_CHECK_BYTES) : start
+            ]
+            checks["lse_guard"] = not cfg["lse"] or _untouched(guard)
+        results[case] = (output.cpu(), checks)
+        del inp, storage, workspace_buffer, result
+    torch.save(results, out_path)
+
+
+def _run_multi_wave_worker(cases: dict, out_path: str, opt_in: bool) -> dict:
+    env = dict(os.environ, FLASHINFER_LOG_LEVEL="DEBUG")
+    env.pop(MULTI_WAVE_KV_SPLIT_ENV, None)
+    if opt_in:
+        env[MULTI_WAVE_KV_SPLIT_ENV] = "1"
+    repo_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    script = (
+        "from tests.attention.test_trtllm_gen_attention_decode import _multi_wave_worker\n"
+        f"_multi_wave_worker({cases!r}, {out_path!r})\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=3600,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    # One final-launch line per decode call; a capacity retry logs only its launched attempt.
+    launches = _MULTI_WAVE_FINAL_LAUNCH.findall(result.stdout)
+    assert len(launches) == len(cases), result.stdout[-2000:]
+    saved = torch.load(out_path)
+    return {
+        case: (*saved[case], name, int(mode), int(x) * int(y) * int(z))
+        for case, (name, mode, x, y, z) in zip(cases, launches, strict=True)
+    }
+
+
+@pytest.fixture(scope="module")
+def multi_wave_runs(tmp_path_factory):
+    # The env is read once per process: one subprocess per setting runs every case.
+    sm_count = _multi_wave_sm_count()
+    cases = _multi_wave_cases(sm_count)
+    out_dir = tmp_path_factory.mktemp("multi_wave")
+    runs = {
+        opt_in: _run_multi_wave_worker(cases, str(out_dir / f"{opt_in}.pt"), opt_in)
+        for opt_in in (False, True)
+    }
+    return sm_count, cases, runs
+
+
+@pytest.mark.parametrize("case", list(_multi_wave_cases(148)))
+def test_trtllm_batch_decode_multi_wave_kv_split(case: str, multi_wave_runs) -> None:
+    sm_count, cases, runs = multi_wave_runs
+    cfg = cases[case]
+    output, checks, name, mode, num_ctas = runs[True][case]
+    stock_output, stock_checks, stock_name, stock_mode, stock_num_ctas = runs[False][
+        case
+    ]
+    for run_checks in (checks, stock_checks):
+        assert run_checks["tail"], f"{case}: decode wrote past the workspace"
+        assert run_checks.get("lse_guard", True), (
+            f"{case}: decode wrote into the LSE guard"
+        )
+
+    # Unset: the stock one-wave split. Multi-CTA never launches more CTAs than SMs.
+    assert stock_mode == _MULTI_CTAS_KV_DISABLED or stock_num_ctas <= sm_count
+    if "scratch_start" in cfg:
+        assert stock_checks["scratch"], (
+            "default run wrote partials for a one-split shape"
+        )
+
+    # Opt-in.
+    if cfg["expect"] == "unchanged":
+        # The split is unchanged, or the multi-wave split did not fit: exactly the stock launch.
+        assert (name, mode, num_ctas) == (stock_name, stock_mode, stock_num_ctas)
+        assert torch.equal(output, stock_output)
+    else:
+        # More CTAs than SMs and than the stock launch, with multi-CTA KV on.
+        assert num_ctas > max(sm_count, stock_num_ctas), (num_ctas, stock_num_ctas)
+        assert mode != _MULTI_CTAS_KV_DISABLED
+        if "scratch_start" in cfg:
+            assert not checks["scratch"], (
+                "multi-wave split did not run at exact capacity"
+            )
+        if cfg["expect"] == "cga_gmem":
+            assert (stock_mode, mode) == (_CGA_SMEM_REDUCTION, _GMEM_REDUCTION), (
+                name,
+                mode,
+            )
+
+    # Both runs match an fp32 reference (sdpa_paged_reference on the dequantized Q/K/V).
+    inp = _multi_wave_case_inputs(cfg)
+    for out in (output, stock_output):
+        _assert_multi_wave_matches_fp32_reference(
+            inp, out.to(GPU_DEVICE), cfg["q_dtype"], cfg["window_left"]
+        )

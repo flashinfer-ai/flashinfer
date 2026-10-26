@@ -35,6 +35,7 @@ See Also
     (alias: ``nvfp4_block_scale_interleave``)
   - :func:`flashinfer.quantization.e2m1_and_ufp8sf_scale_to_float`
   - :func:`flashinfer.quantization.scaled_fp4_grouped_quantize`
+  - :func:`flashinfer.quantization.silu_and_mul_nvfp4_quantize`
   - :func:`flashinfer.quantization.shuffle_matrix_a`
   - :func:`flashinfer.quantization.shuffle_matrix_sf_a`
   - :func:`flashinfer.quantization.nvfp4_kv_quantize`

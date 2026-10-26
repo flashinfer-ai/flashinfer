@@ -30,6 +30,10 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
 
+from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+from .cute_dsl_cache_naming import make_kernel_name
+from .device_target import gdn_compile_options, gdn_device_target, target_arch
+
 # ============================================================================
 # Constants for PRETRANSPOSE version ([B*HV, V, K])
 # ============================================================================
@@ -70,6 +74,8 @@ def gdn_decode_kernel_small_batch_pretranspose(
     use_qk_l2norm: cutlass.Constexpr[bool],
     is_varlen: cutlass.Constexpr[bool],
     use_pool_indexing: cutlass.Constexpr[bool] = False,
+    num_stages: cutlass.Constexpr[int] = NUM_STAGES,
+    blocks_per_state: cutlass.Constexpr[int] = NUM_BLOCKS_PER_STATE,
 ):
     """Each block uses pipeline to load one batch and vectorized writeback"""
 
@@ -78,9 +84,9 @@ def gdn_decode_kernel_small_batch_pretranspose(
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
     block_idx, _, _ = cute.arch.block_idx()
-    batch_idx = block_idx // NUM_BLOCKS_PER_STATE
-    batch_inner = block_idx % NUM_BLOCKS_PER_STATE
-    num_v_tiles_per_block = num_v_tiles // NUM_BLOCKS_PER_STATE
+    batch_idx = block_idx // blocks_per_state
+    batch_inner = block_idx % blocks_per_state
+    num_v_tiles_per_block = num_v_tiles // blocks_per_state
     i_n = batch_idx // HV
     i_hv = batch_idx % HV
     i_h = i_hv // (HV // H)
@@ -176,9 +182,9 @@ def gdn_decode_kernel_small_batch_pretranspose(
         # Prefetch: All threads participate in cp.async load
         # ===================================================================
         start_v_tiles = batch_inner * num_v_tiles_per_block
-        prefetch_count = cutlass.min(NUM_STAGES - 1, num_v_tiles_per_block)
+        prefetch_count = cutlass.min(num_stages - 1, num_v_tiles_per_block)
         for v_tiles in range(start_v_tiles, start_v_tiles + prefetch_count):
-            stage = (v_tiles - start_v_tiles) % NUM_STAGES
+            stage = (v_tiles - start_v_tiles) % num_stages
 
             gSrc_tile = gSrc[(None, None, v_tiles)]
             sData_stage = sData[(None, None, stage)]
@@ -273,7 +279,7 @@ def gdn_decode_kernel_small_batch_pretranspose(
         # ===================================================================
         end_v_tiles = start_v_tiles + num_v_tiles_per_block
         for v_tiles in range(start_v_tiles, end_v_tiles):
-            stage = (v_tiles - start_v_tiles) % NUM_STAGES
+            stage = (v_tiles - start_v_tiles) % num_stages
 
             # Step 1: Wait for current stage to complete
             cute.arch.cp_async_wait_group(0)
@@ -282,7 +288,7 @@ def gdn_decode_kernel_small_batch_pretranspose(
             # Step 2: Issue async load for next tile (after compute)
             next_v_tiles = v_tiles + prefetch_count
             if next_v_tiles < end_v_tiles:
-                next_stage = (next_v_tiles - start_v_tiles) % NUM_STAGES
+                next_stage = (next_v_tiles - start_v_tiles) % num_stages
 
                 gSrc_next = gSrc[(None, None, next_v_tiles)]
                 sData_next = sData[(None, None, next_stage)]
@@ -696,6 +702,8 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
     use_qk_l2norm: cutlass.Constexpr[bool],
     is_varlen: cutlass.Constexpr[bool],
     use_pool_indexing: cutlass.Constexpr[bool] = False,
+    num_stages: cutlass.Constexpr[int] = NUM_STAGES,
+    blocks_per_state: cutlass.Constexpr[int] = NUM_BLOCKS_PER_STATE,
     stream: cuda.CUstream = None,
 ):
     """Launch original pipelined kernel for small batch pretranspose."""
@@ -737,13 +745,13 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
 
     # Create SMEM layout
     smem_layout_staged = cute.make_layout(
-        (TILE_V, TILE_K, NUM_STAGES), stride=(TILE_K, 1, TILE_V * TILE_K)
+        (TILE_V, TILE_K, num_stages), stride=(TILE_K, 1, TILE_V * TILE_K)
     )
 
     # sData: TILE_V * TILE_K * NUM_STAGES * 4 bytes (Float32)
     # sV: K * 4 bytes (Float32)
     # sOutput: V * 2 bytes (BFloat16)
-    smem_bytes = 4 * TILE_V * TILE_K * NUM_STAGES + 4 * k_dim + 2 * v_dim + 32
+    smem_bytes = 4 * TILE_V * TILE_K * num_stages + 4 * k_dim + 2 * v_dim + 32
 
     gdn_decode_kernel_small_batch_pretranspose(
         tiled_copy_load,
@@ -774,8 +782,10 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
         use_qk_l2norm,
         is_varlen,
         use_pool_indexing,
+        num_stages,
+        blocks_per_state,
     ).launch(
-        grid=(grid_batch * NUM_BLOCKS_PER_STATE, 1, 1),
+        grid=(grid_batch * blocks_per_state, 1, 1),
         block=[NUM_THREADS, 1, 1],
         smem=smem_bytes,
         stream=stream,
@@ -894,8 +904,26 @@ def run_gdn_decode_kernel_big_batch_pretranspose(
 # ============================================================================
 
 
-@functools.cache
-def _get_compiled_decode_kernel(
+_CUTE_DSL_MODULE = "gdn_decode_pretranspose"
+
+
+def _decode_launch_config(major: int, minor: int, B: int, HV: int) -> tuple:
+    """(num_stages, blocks_per_state) for the pipelined pretranspose kernel.
+
+    SM107 needs more bytes in flight per CTA once there are enough states to
+    fill the GPU; other archs keep the default.
+    """
+    if (major, minor) == (10, 7):
+        num_states = B * HV
+        if num_states >= 3072:
+            return 5, 4
+        if num_states >= 256:
+            return 3, 4
+    return NUM_STAGES, NUM_BLOCKS_PER_STATE
+
+
+def _pretranspose_kernel_name(
+    target_key: tuple,
     T: int,
     H: int,
     HV: int,
@@ -905,11 +933,56 @@ def _get_compiled_decode_kernel(
     scale: float,
     use_qk_l2norm: bool,
     use_pool_indexing: bool = False,
-    pool_size: int = 0,
-    stride0: int = 0,
     stride1: int = 0,
     stride2: int = 0,
     stride3: int = 0,
+    num_stages: int = NUM_STAGES,
+    blocks_per_state: int = NUM_BLOCKS_PER_STATE,
+) -> str:
+    """Specialization name within the gdn_decode_pretranspose module, encoding
+    every parameter that affects codegen."""
+    # Default config adds nothing, so existing artifact names are unchanged.
+    launch = (
+        ()
+        if (num_stages, blocks_per_state) == (NUM_STAGES, NUM_BLOCKS_PER_STATE)
+        else (f"s{num_stages}", f"b{blocks_per_state}")
+    )
+    return make_kernel_name(
+        "decode",
+        target_arch(target_key),
+        T,
+        H,
+        HV,
+        K,
+        V,
+        dtype,
+        scale,
+        use_qk_l2norm,
+        use_pool_indexing,
+        stride1,
+        stride2,
+        stride3,
+        *launch,
+    )
+
+
+@functools.cache
+def _get_compiled_decode_kernel(
+    target_key: tuple,
+    T: int,
+    H: int,
+    HV: int,
+    K: int,
+    V: int,
+    dtype: torch.dtype,
+    scale: float,
+    use_qk_l2norm: bool,
+    use_pool_indexing: bool = False,
+    stride1: int = 0,
+    stride2: int = 0,
+    stride3: int = 0,
+    num_stages: int = NUM_STAGES,
+    blocks_per_state: int = NUM_BLOCKS_PER_STATE,
 ):
     """Cache compiled kernel for given configuration (pretranspose version)."""
     # This will be populated on first call
@@ -956,11 +1029,19 @@ def run_pretranspose_decode(
     """
     # Compile kernel with TVM FFI (cached)
     if use_pool_indexing:
-        pool_size = int(h0_source.shape[0])
         stride0, stride1, stride2, stride3 = tuple(int(x) for x in h0_source.stride())
+        assert stride0 % 4 == 0, (
+            "initial_state stride(0) must be a multiple of 4 FP32 elements "
+            f"for 128-bit state copies, got stride(0)={stride0}"
+        )
     else:
-        pool_size = stride0 = stride1 = stride2 = stride3 = 0
+        stride1 = stride2 = stride3 = 0
+    target = gdn_device_target(q.device)
+    num_stages, blocks_per_state = _decode_launch_config(
+        target.major, target.minor, B, HV
+    )
     cache_key = (
+        target.compile_key,
         T,
         H,
         HV,
@@ -970,11 +1051,11 @@ def run_pretranspose_decode(
         scale,
         use_qk_l2norm,
         use_pool_indexing,
-        pool_size,
-        stride0,
         stride1,
         stride2,
         stride3,
+        num_stages,
+        blocks_per_state,
     )
     cache = _get_compiled_decode_kernel(*cache_key)
 
@@ -998,10 +1079,22 @@ def run_pretranspose_decode(
         h0_out_indices = h0_indices
 
     if "compiled" not in cache:
-        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
 
-        h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
-        if not use_pool_indexing:
+        if use_pool_indexing:
+            # Pool capacity and the distance between slots do not affect codegen.
+            # Keep the inner state layout static while accepting arbitrary pool
+            # sizes and padded slot strides through the same compiled callable.
+            sym_pool_size = cute.sym_int()
+            sym_pool_stride0 = cute.sym_int64(divisibility=4)
+            h0_source_tensor = cute.runtime.make_fake_tensor(
+                cute.Float32,
+                shape=(sym_pool_size, HV, V, K),
+                stride=(sym_pool_stride0, stride1, stride2, stride3),
+                assumed_align=16,
+            )
+        else:
+            h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
             h0_source_tensor = h0_source_tensor.mark_compact_shape_dynamic(
                 mode=0, stride_order=(0, 1, 2), divisibility=1
             )
@@ -1028,41 +1121,49 @@ def run_pretranspose_decode(
         run_func = run_gdn_decode_kernel_small_batch_pretranspose
 
         # Use TVM FFI to reduce runtime overhead
-        compiled = cute.compile(
-            run_func,
-            h0_source_tensor,
-            A_log_tensor,
-            a_tensor,
-            dt_bias_tensor,
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            b_tensor,
-            o_tensor,
-            h0_indices_tensor,
-            h0_out_indices_tensor,
-            cu_seqlens_tensor,
-            softplus_beta=1.0,
-            softplus_threshold=20.0,
-            scale=scale,
-            HV=HV,
-            T=T,
-            H=H,
-            K=K,
-            V=V,
-            use_initial_state=True,
-            use_qk_l2norm=use_qk_l2norm,
-            use_pool_indexing=use_pool_indexing,
-            is_varlen=False,
-            stream=stream,
-            options="--enable-tvm-ffi",
+        compiled = build_and_load_cute_dsl_kernel(
+            _CUTE_DSL_MODULE,
+            _pretranspose_kernel_name(*cache_key),
+            lambda: cute.compile[
+                gdn_compile_options(q.device, cute.EnableTVMFFI(True))
+            ](
+                run_func,
+                h0_source_tensor,
+                A_log_tensor,
+                a_tensor,
+                dt_bias_tensor,
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                b_tensor,
+                o_tensor,
+                h0_indices_tensor,
+                h0_out_indices_tensor,
+                cu_seqlens_tensor,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                scale=scale,
+                HV=HV,
+                T=T,
+                H=H,
+                K=K,
+                V=V,
+                use_initial_state=True,
+                use_qk_l2norm=use_qk_l2norm,
+                use_pool_indexing=use_pool_indexing,
+                is_varlen=False,
+                num_stages=num_stages,
+                blocks_per_state=blocks_per_state,
+                stream=stream,
+            ),
+            extra_key_files=(__file__,),
         )
         cache["compiled"] = compiled
     else:
         compiled = cache["compiled"]
 
     # Run kernel directly with PyTorch tensors (no from_dlpack needed)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
     cache["compiled"](
         h0_source,
         A_log,

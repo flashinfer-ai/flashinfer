@@ -65,16 +65,6 @@ size_t dispatchMXFP8xMXFP8GemmCTAShapeSm120(T* D, void const* A, void const* B,
                                                  SwapAB>(D, A, B, input_sf, weight_sf, m, n, k,
                                                          batch_count, gemmConfig, workspace,
                                                          workspaceBytes, stream, occupancy);
-    case CutlassTileConfigSM120::CtaShape256x128x128B:
-      return genericMxfp8GemmKernelLauncherSm120<T, cute::Int<256>, cute::Int<128>, cute::Int<128>,
-                                                 SwapAB>(D, A, B, input_sf, weight_sf, m, n, k,
-                                                         batch_count, gemmConfig, workspace,
-                                                         workspaceBytes, stream, occupancy);
-    case CutlassTileConfigSM120::CtaShape128x256x128B:
-      return genericMxfp8GemmKernelLauncherSm120<T, cute::Int<128>, cute::Int<256>, cute::Int<128>,
-                                                 SwapAB>(D, A, B, input_sf, weight_sf, m, n, k,
-                                                         batch_count, gemmConfig, workspace,
-                                                         workspaceBytes, stream, occupancy);
     case CutlassTileConfigSM120::Undefined:
       throw std::runtime_error(
           "[Error][MXFP8 SM120][dispatch_gemm_cta_shape] Gemm config undefined.");
@@ -117,15 +107,9 @@ class CutlassMxfp8GemmRunnerSm120 : public virtual CutlassMxfp8GemmRunnerInterfa
     if (workspace_hashmap.find(std::make_tuple(m, n, k, batch_count)) == workspace_hashmap.end()) {
       size_t workspace_size = 0;
       for (auto const& gemmConfig : getConfigs()) {
-        try {
-          size_t curr = dispatchToArch(nullptr, nullptr, nullptr, nullptr, nullptr, m, n, k,
-                                       batch_count, gemmConfig, nullptr, 0, nullptr, nullptr);
-          workspace_size = std::max(workspace_size, curr);
-        } catch (std::runtime_error&) {
-          // Some tile configs may fail for certain problem sizes (e.g. exceeding
-          // SMEM capacity).  Swallow the error and try the next config.
-          continue;
-        }
+        size_t curr = dispatchToArch(nullptr, nullptr, nullptr, nullptr, nullptr, m, n, k,
+                                     batch_count, gemmConfig, nullptr, 0, nullptr, nullptr);
+        workspace_size = std::max(workspace_size, curr);
       }
       workspace_hashmap[std::make_tuple(m, n, k, batch_count)] = workspace_size;
     }
@@ -135,9 +119,9 @@ class CutlassMxfp8GemmRunnerSm120 : public virtual CutlassMxfp8GemmRunnerInterfa
   std::vector<CutlassGemmConfig> getConfigs() const override {
     // SM120 MXFP8 tile configs.  No cluster shape variants (always 1x1x1).
     static const std::vector<CutlassTileConfigSM120> tiles = {
-        CutlassTileConfigSM120::CtaShape128x32x128B,  CutlassTileConfigSM120::CtaShape128x64x128B,
-        CutlassTileConfigSM120::CtaShape128x128x128B, CutlassTileConfigSM120::CtaShape256x128x128B,
-        CutlassTileConfigSM120::CtaShape128x256x128B,
+        CutlassTileConfigSM120::CtaShape128x32x128B,
+        CutlassTileConfigSM120::CtaShape128x64x128B,
+        CutlassTileConfigSM120::CtaShape128x128x128B,
     };
     std::vector<CutlassGemmConfig> configs;
     configs.reserve(tiles.size());

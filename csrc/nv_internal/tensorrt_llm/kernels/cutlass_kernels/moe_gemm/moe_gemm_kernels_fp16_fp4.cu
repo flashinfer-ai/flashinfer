@@ -18,6 +18,6 @@
 
 namespace tensorrt_llm::kernels::cutlass_kernels {
 #if defined(ENABLE_FP4)
-template class MoeGemmRunner<half, __nv_fp4_e2m1, half>;
+template class MoeGemmRunner<half, Fp4Type, half>;
 #endif
 }  // namespace tensorrt_llm::kernels::cutlass_kernels

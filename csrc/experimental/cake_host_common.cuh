@@ -1,0 +1,59 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// Shared tvm-ffi launch helpers of the Cake-generated kernel bindings under
+// csrc/experimental/.  Host code only: including this header adds no device
+// code to a translation unit.  Bindings include it through FlashInfer's csrc
+// include root as "experimental/cake_host_common.cuh".
+#pragma once
+#include <cuda.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+#include "tvm_ffi_utils.h"
+
+// Stringise the expansion of a macro argument (launch-error messages name the selected kernel symbol).
+#define CAKE_STRINGIZE_(x) #x
+#define CAKE_STRINGIZE(x) CAKE_STRINGIZE_(x)
+
+namespace cake_host_shim_common {
+
+// Opt the linked kernel into its dynamic shared memory once for every device
+// that accepts it. Function-local static initialization already serializes
+// the first call; no lock or per-device cache is needed.
+inline bool CakeSetMaxDynamicSmem(const void* symbol, int smem_bytes) {
+  cudaKernel_t kernel = nullptr;
+  TVM_FFI_CHECK_CUDA_ERROR(cudaGetKernel(&kernel, symbol));
+  int device_count = 0;
+  TVM_FFI_CHECK_CUDA_ERROR(cudaGetDeviceCount(&device_count));
+  int configured = 0;
+  for (int device = 0; device < device_count; ++device) {
+    if (cudaKernelSetAttributeForDevice(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes, device) ==
+        cudaSuccess) {
+      ++configured;
+    } else {
+      (void)cudaGetLastError();
+    }
+  }
+  TVM_FFI_CHECK(configured > 0, RuntimeError)
+      << "no CUDA device accepts " << smem_bytes << " B of dynamic shared memory";
+  return true;
+}
+
+}  // namespace cake_host_shim_common

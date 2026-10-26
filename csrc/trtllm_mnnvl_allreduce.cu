@@ -78,6 +78,7 @@ void trtllm_mnnvl_allreduce_fusion(
     TVM_FFI_ICHECK(quant_type_enum == QuantType::kNone ||
                    quant_type_enum == QuantType::kDynamicFP8 ||
                    quant_type_enum == QuantType::kPerTokenGroupFP8Packed ||
+                   quant_type_enum == QuantType::kMXFP8 ||
                    (output_scale.has_value() &&
                     encode_dlpack_dtype(output_scale.value().dtype()) == float32_code))
         << "output_scale must be provided for static MNNVL quantization fusion and must be float32";
@@ -177,6 +178,30 @@ void trtllm_mnnvl_allreduce_fusion(
             << ") but got (" << sf_out.value().stride(0) << ", " << sf_out.value().stride(1) << ")";
         TVM_FFI_ICHECK(encode_dlpack_dtype(sf_out.value().dtype()) == int32_code)
             << "scale_out for group FP8 must have dtype int32";
+        break;
+      }
+      case QuantType::kMXFP8: {
+        TVM_FFI_ICHECK(token_dim % 32 == 0)
+            << "MXFP8 MNNVL quantization fusion requires token_dim divisible by 32";
+        TVM_FFI_ICHECK(quant_out.value().size(0) == num_tokens &&
+                       quant_out.value().size(1) == token_dim)
+            << "quant_out shape mismatch for MXFP8: expected (" << num_tokens << ", " << token_dim
+            << ") but got (" << quant_out.value().size(0) << ", " << quant_out.value().size(1)
+            << ")";
+        TVM_FFI_ICHECK(encode_dlpack_dtype(quant_out.value().dtype()) == float8_e4m3fn_code)
+            << "quant_out for MXFP8 must have dtype float8_e4m3fn";
+        TVM_FFI_ICHECK(sf_out.has_value())
+            << "scale_out must be provided for MXFP8 MNNVL quantization fusion";
+        TVM_FFI_ICHECK(encode_dlpack_dtype(sf_out.value().dtype()) == uint8_code)
+            << "scale_out for MXFP8 must have dtype uint8";
+        int64_t const num_sf_cols = token_dim / 32;
+        int64_t const expected_sf =
+            sf_layout == QuantizationSFLayout::LINEAR
+                ? num_tokens * num_sf_cols
+                : (num_tokens + 127) / 128 * 128 * ((num_sf_cols + 3) / 4 * 4);
+        TVM_FFI_ICHECK(sf_out.value().numel() >= expected_sf)
+            << "scale_out is too small for MXFP8: expected at least " << expected_sf
+            << " elements but got " << sf_out.value().numel();
         break;
       }
       default:

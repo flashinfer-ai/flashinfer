@@ -23,7 +23,7 @@ from cutlass.pipeline import PipelineProducer, PipelineConsumer
 
 from ..config import AttentionConfig, AttentionFusion
 from ..tmem_layout import TmemLayout
-from ..fusion.mask import get_trip_count
+from ..fusion.mask import get_peel_sections, get_trip_count
 from ..scheduler.persistent import (
     FmhaStaticTileScheduler,
     FmhaStaticTileSchedulerParams,
@@ -53,8 +53,7 @@ class CorrectionRole:
         self.pv_mma_tiler = config.pv_mma_tiler
         self.pv_acc_dtype = config.pv_acc_dtype
         self.cta_tiler = config.cta_tiler
-        self.mask_type = config.mask_type
-        self.window_left = config.window_left
+        self.mask_spec = config.mask_spec
 
         # From TMEM layout
         self.tmem_vec0_offset = tmem.vec0_offset
@@ -64,6 +63,7 @@ class CorrectionRole:
         self.variant = fusion.variant
         self.has_logits_transform = fusion.variant.has_logits_transform
         self.has_output_transform = fusion.variant.has_output_transform
+        self.has_statistics_update = fusion.variant.has_statistics_update
 
         # Warp config
         self.correction_warp_ids = correction_warp_ids
@@ -92,6 +92,10 @@ class CorrectionRole:
         When processing attention in blocks, the softmax normalization factors may change
         as new blocks are processed. This method rescales previously computed partial
         output values to account for updated normalization factors.
+
+        Each TMEM tile gets its own register buffer, so the per-tile
+        load->mul->store chains have no cross-dependencies and the
+        compiler is free to overlap their TMEM round trips.
         """
         pv_tiled_mma_shape = (
             self.pv_mma_tiler[0],
@@ -280,6 +284,9 @@ class CorrectionRole:
         cum_seqlen_k: cute.Tensor | None,
         scale_softmax_log2: Float32,
         scale_output: Float32,
+        window_left: Int32,
+        window_right: Int32,
+        mLSE: cute.Tensor | None,
         s0_corr_consumer: PipelineConsumer,
         s1_corr_consumer: PipelineConsumer,
         mma_corr_consumer: PipelineConsumer,
@@ -350,26 +357,83 @@ class CorrectionRole:
                     )
                 )
 
+            # Base row of this sequence in the (total_q, h_q) LSE tensor.
+            lse_row_base = batch_coord * seqlen_q_global
+            if cutlass.const_expr(cum_seqlen_q is not None):
+                lse_row_base = cuseqlen_q
+
             if not continue_cond:
                 if cutlass.const_expr(cum_seqlen_k is not None):
                     cuseqlen_k = cum_seqlen_k[batch_coord]
                     seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
-                # Ignore first signal from softmax as no correction is required
-                vec0_handle = s0_corr_consumer.wait_and_advance()
-                vec0_handle.release()
-                vec1_handle = s1_corr_consumer.wait_and_advance()
-                seqlen_kv_loop_steps = (
-                    get_trip_count(
-                        self.mask_type,
-                        self.window_left,
+                # Head / main / tail split (see fusion/mask.py
+                # get_peel_sections and MmaRole.run): stage 0 runs
+                # head+main trips, stage 1 main+tail trips.  The shared
+                # mma_corr ring's commit order is [o0]*head, o0, (o1,o0)*
+                # (main-1), o1, [o1]*tail — consumption below must match it,
+                # which is also why O0's epilog runs before the tail loop
+                # (letting the O0 drain overlap stage 1's tail trips).
+                if cutlass.const_expr(not self.has_statistics_update):
+                    _, head_cnt, main_cnt, tail_cnt, _ = get_peel_sections(
+                        self.mask_spec,
                         curr_block_coord,
                         self.cta_tiler,
                         seqlen_k,
                         seqlen_q_,
+                        window_left,
+                        window_right,
                     )
-                    - 1
-                )
-                for _i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
+                else:
+                    head_cnt = Int32(0)
+                    tail_cnt = Int32(0)
+                    main_cnt = get_trip_count(
+                        self.mask_spec,
+                        curr_block_coord,
+                        self.cta_tiler,
+                        seqlen_k,
+                        seqlen_q_,
+                        window_left,
+                        window_right,
+                    )
+                # Ignore first vec0 from softmax as no correction is required
+                vec0_handle = s0_corr_consumer.wait_and_advance()
+                vec0_handle.release()
+                # HEAD: O0-only rescale trips (stage 1 has no traffic yet).
+                for _h in cutlass.range(0, head_cnt, 1, unroll=1):
+                    vec0_handle = s0_corr_consumer.wait_and_advance()
+                    tTMEM_LOAD_VECrS = cute.make_rmem_tensor(
+                        tTMEM_LOAD_VECcS.shape, self.qk_acc_dtype
+                    )
+                    cute.copy(tiled_tmem_load_vec, tTMEM_LOAD_VECtS0, tTMEM_LOAD_VECrS)
+                    scale_ = scale_softmax_log2 * (
+                        tTMEM_LOAD_VECrS[0] - tTMEM_LOAD_VECrS[1]
+                    )
+                    scale = cute.arch.exp2(scale_)
+                    rescale_ballot = cute.arch.vote_ballot_sync(
+                        tTMEM_LOAD_VECrS[0] != tTMEM_LOAD_VECrS[1]
+                    )
+                    o0_handle_consumer = mma_corr_consumer.wait_and_advance()
+                    if cutlass.const_expr(not self.has_logits_transform):
+                        if rescale_ballot != 0:
+                            self.rescale(pv_thr_mma, tOtO0, scale)
+                    vec0_handle.release()
+                    cute.arch.fence_view_async_tmem_store()
+                    o0_handle_consumer.release()
+                    # Drain the MMA's alternation-keeping empty o1 slot.
+                    o1_dummy_consumer = mma_corr_consumer.wait_and_advance()
+                    o1_dummy_consumer.release()
+                vec1_handle = s1_corr_consumer.wait_and_advance()
+                for _i in cutlass.range(0, main_cnt - 1, 1, unroll=1):
+                    # Iteration _i consumes the vec of the NEXT trip in each
+                    # stage's own stream (the first trips' vecs were handled
+                    # above).
+                    #
+                    # Rescale skip: a warp-wide ballot on old_max != new_max
+                    # skips the O TMEM roundtrip when the rescale factor is
+                    # exactly 1 for all 32 rows the warp covers (equal maxes
+                    # => exp2(0) == 1.0, so the skip is exact).  Per-warp
+                    # divergence is safe: the TMEM copies are warp-local
+                    # (each warp owns its 32-row slice of O).
                     # wait for vec0 (row_wise current max & previous max)
                     vec0_handle = s0_corr_consumer.wait_and_advance()
                     tTMEM_LOAD_VECrS = cute.make_rmem_tensor(
@@ -380,11 +444,15 @@ class CorrectionRole:
                         tTMEM_LOAD_VECrS[0] - tTMEM_LOAD_VECrS[1]
                     )
                     scale = cute.arch.exp2(scale_)
+                    rescale_ballot = cute.arch.vote_ballot_sync(
+                        tTMEM_LOAD_VECrS[0] != tTMEM_LOAD_VECrS[1]
+                    )
 
                     # wait for o0
                     o0_handle_consumer = mma_corr_consumer.wait_and_advance()
                     if cutlass.const_expr(not self.has_logits_transform):
-                        self.rescale(pv_thr_mma, tOtO0, scale)
+                        if rescale_ballot != 0:
+                            self.rescale(pv_thr_mma, tOtO0, scale)
                     # release vec1 & o0
                     vec1_handle.release()
                     cute.arch.fence_view_async_tmem_store()
@@ -397,10 +465,14 @@ class CorrectionRole:
                         tTMEM_LOAD_VECrS[0] - tTMEM_LOAD_VECrS[1]
                     )
                     scale = cute.arch.exp2(scale_)
+                    rescale_ballot = cute.arch.vote_ballot_sync(
+                        tTMEM_LOAD_VECrS[0] != tTMEM_LOAD_VECrS[1]
+                    )
 
                     o1_handle_consumer = mma_corr_consumer.wait_and_advance()
                     if cutlass.const_expr(not self.has_logits_transform):
-                        self.rescale(pv_thr_mma, tOtO1, scale)
+                        if rescale_ballot != 0:
+                            self.rescale(pv_thr_mma, tOtO1, scale)
                     vec0_handle.release()
                     cute.arch.fence_view_async_tmem_store()
                     o1_handle_consumer.release()
@@ -422,6 +494,18 @@ class CorrectionRole:
                 epilogue_scale = scale_output
                 d = tTMEM_LOAD_VECrS[0]  # row sum
                 m = tTMEM_LOAD_VECrS[1]  # row max
+                # Each correction thread owns one Q row of this 128-row
+                # stage (the vec partition's identity coordinate); a fully
+                # masked row has d = 0, m = -inf and stores -inf.
+                # LSE is emitted in log2 domain (flashinfer convention):
+                # (ln(row_sum) + sm_scale * row_max) * log2(e)
+                #   == log2(row_sum) + scale_softmax_log2 * row_max.
+                if cutlass.const_expr(mLSE is not None):
+                    lse_row = qo_idx_offset + tTMEM_LOAD_VECcS[0][0]
+                    if lse_row < seqlen_q_:
+                        mLSE[lse_row_base + lse_row, head_coord] = (
+                            cute.math.log2(d, fastmath=True) + scale_softmax_log2 * m
+                        )
                 self.epilog(
                     pv_thr_mma,
                     tOtO0,
@@ -436,8 +520,42 @@ class CorrectionRole:
                 o0_handle_consumer.release()
                 o0_final_handle.commit()
 
+                # TAIL: O1-only rescale trips (runs after — and overlapped
+                # with — the O0 epilog above; the shared o-ring's commit
+                # order requires exactly this placement).
+                for _t in cutlass.range(0, tail_cnt, 1, unroll=1):
+                    vec1_handle = s1_corr_consumer.wait_and_advance()
+                    tTMEM_LOAD_VECrS = cute.make_rmem_tensor(
+                        tTMEM_LOAD_VECcS.shape, self.qk_acc_dtype
+                    )
+                    cute.copy(tiled_tmem_load_vec, tTMEM_LOAD_VECtS1, tTMEM_LOAD_VECrS)
+                    scale_ = scale_softmax_log2 * (
+                        tTMEM_LOAD_VECrS[0] - tTMEM_LOAD_VECrS[1]
+                    )
+                    scale = cute.arch.exp2(scale_)
+                    rescale_ballot = cute.arch.vote_ballot_sync(
+                        tTMEM_LOAD_VECrS[0] != tTMEM_LOAD_VECrS[1]
+                    )
+                    o1_handle_consumer = mma_corr_consumer.wait_and_advance()
+                    if cutlass.const_expr(not self.has_logits_transform):
+                        if rescale_ballot != 0:
+                            self.rescale(pv_thr_mma, tOtO1, scale)
+                    vec1_handle.release()
+                    cute.arch.fence_view_async_tmem_store()
+                    o1_handle_consumer.release()
+                    # Drain the MMA's alternation-keeping empty o0 slot.
+                    o0_dummy_consumer = mma_corr_consumer.wait_and_advance()
+                    o0_dummy_consumer.release()
+
                 # wait for vec1 (row_wise global sum)
                 vec1_handle = s1_corr_consumer.wait_and_advance()
+                # Fresh rmem tensor: reusing the O0-final one would thread it
+                # through the TAIL loop above as a loop-carried memref (the
+                # tail body assigns the same name), which defeats mem2reg and
+                # demotes the vec values to a local-memory depot.
+                tTMEM_LOAD_VECrS = cute.make_rmem_tensor(
+                    tTMEM_LOAD_VECcS.shape, self.qk_acc_dtype
+                )
                 cute.copy(tiled_tmem_load_vec, tTMEM_LOAD_VECtS1, tTMEM_LOAD_VECrS)
                 cute.arch.fence_view_async_tmem_load()
                 vec1_handle.release()
@@ -448,6 +566,14 @@ class CorrectionRole:
                 epilogue_scale = scale_output
                 d = tTMEM_LOAD_VECrS[0]  # row sum
                 m = tTMEM_LOAD_VECrS[1]  # row max
+                if cutlass.const_expr(mLSE is not None):
+                    lse_row = (
+                        qo_idx_offset + self.qk_mma_tiler[0] + tTMEM_LOAD_VECcS[0][0]
+                    )
+                    if lse_row < seqlen_q_:
+                        mLSE[lse_row_base + lse_row, head_coord] = (
+                            cute.math.log2(d, fastmath=True) + scale_softmax_log2 * m
+                        )
                 self.epilog(
                     pv_thr_mma,
                     tOtO1,

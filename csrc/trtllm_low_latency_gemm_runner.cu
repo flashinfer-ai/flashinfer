@@ -19,6 +19,7 @@
 #include <tvm/ffi/error.h>
 #include <tvm_ffi_utils.h>
 
+#include <algorithm>
 #include <vector>
 
 #include "flashinfer/exception.h"
@@ -36,6 +37,29 @@ namespace flashinfer {
 
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
+
+namespace {
+
+bool isArchCompatible(int smVersion, gemm::trtllm::gen::CudaArch cubinArch) {
+  using CudaArch = gemm::trtllm::gen::CudaArch;
+  switch (cubinArch) {
+    case CudaArch::Sm100a:
+      return smVersion == 100;
+    case CudaArch::Sm100f:
+      // Low-latency heuristic kernels are named `_sm100f` and also run on sm107.
+      return smVersion == 100 || smVersion == 103 || smVersion == 107;
+    case CudaArch::Sm103a:
+      return smVersion == 103;
+#ifdef TLLM_RUBIN_FEATURES
+    case CudaArch::Sm107a:
+      return smVersion == 107;
+#endif
+    default:
+      return false;
+  }
+}
+
+}  // namespace
 
 struct TrtllmLowLatencyGemmRunnerOptions {
   gemm::trtllm::gen::Dtype eltType;
@@ -137,6 +161,7 @@ class TrtllmLowLatencyGemmRunner {
     auto const configs = gemm.getGemmConfigs();
 
     mPassingConfigIndices.clear();
+    int const sv = getSMVersion();
 
     for (size_t i = 0; i < gemm.getNumGemmConfigs(); ++i) {
       auto const configOptions = configs[i].mOptions;
@@ -146,6 +171,7 @@ class TrtllmLowLatencyGemmRunner {
           configOptions.mTransposeMmaOutput == true &&
           configOptions.mLayoutA == gemm::gemm::MatrixLayout::BlockMajorK &&
           configOptions.mUseShuffledMatrix) {
+        if (!isArchCompatible(sv, configs[i].mSm)) continue;
         mPassingConfigIndices.push_back(i);
       }
     }
@@ -155,11 +181,20 @@ class TrtllmLowLatencyGemmRunner {
         "No valid low latency TRTLLM-GEN GEMM kernel was found for the given data types.");
   }
 
+  void checkPassingConfigIndex(int64_t tactic) const {
+    auto it = std::find(mPassingConfigIndices.begin(), mPassingConfigIndices.end(), tactic);
+    TVM_FFI_ICHECK(it != mPassingConfigIndices.end())
+        << "Tactic " << tactic
+        << " is not in this runner's compatible config set (device architecture or GEMM options "
+           "mismatch)";
+  }
+
   void run(int64_t m, int64_t n, int64_t k, void const* a, void const* b, void* c, void* cScale,
            void* workspace, CUstream stream, int32_t device_index, int64_t tactic) {
     auto gemm = gemm::gemm::GemmInterface();
     auto const configs = gemm.getGemmConfigs();
     TVM_FFI_ICHECK(tactic >= 0 && tactic < gemm.getNumGemmConfigs()) << "Invalid tactic id in run";
+    checkPassingConfigIndex(tactic);
     auto const& config = configs[tactic];
 
     gemm::gemm::GemmData gemmData = createGemmData(m, n, k);

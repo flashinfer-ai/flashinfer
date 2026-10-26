@@ -1,0 +1,3912 @@
+# Copyright (c) 2025 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Tests for fp8_paged_mqa_logits and fp4_paged_mqa_logits.
+
+Reference implementations are adapted from TRT-LLM test scripts.
+"""
+
+import pytest
+import contextlib
+import os
+import shutil
+import subprocess
+import sys
+
+import torch
+
+from flashinfer.utils import is_sm100a_supported
+
+
+_SM107_UNSUPPORTED_KERNEL_TESTS = frozenset(
+    {
+        "test_block_table_width_contract",
+        "test_context_lens_must_be_rank_1",
+        "test_empty_batch_returns_without_launching",
+        "test_empty_batch_still_validates_out",
+        "test_fp4_head_dim_num_heads_validation",
+        "test_fp4_is_kv_sf_interleaved_guard",
+        "test_fp4_next_n4_rejected",
+        "test_fp4_out_and_schedule_meta_paths",
+        "test_fp4_paged_mqa_logits",
+        "test_fp4_paged_mqa_logits_sf_interleaved",
+        "test_fp4_sf_vec_size_contract",
+        "test_fp8_input_validation",
+        "test_fp8_out_and_schedule_meta_paths",
+        "test_fp8_paged_mqa_logits",
+        "test_fp8_paged_mqa_logits_fp16",
+        "test_fp8_paged_mqa_logits_head_dim64",
+        "test_fp8_paged_mqa_logits_next_n4",
+        "test_fp8_paged_mqa_logits_small_num_heads",
+        "test_max_context_len_bound",
+        "test_next_n_and_weights_contract",
+        "test_num_epi_subtiles_guard",
+        "test_oversized_out_returns_exact_rows",
+        "test_precompile_variants",
+        "test_relu_is_applied_per_head_before_weighting",
+        "test_schedule_meta_graph_replay_across_split_boundary",
+        "test_stale_schedule_meta_detected",
+    }
+)
+
+
+@pytest.fixture(autouse=True)
+def _skip_sm107_unsupported_kernel_tests(request):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        return
+    test_name = getattr(request.node, "originalname", request.node.name)
+    if test_name in _SM107_UNSUPPORTED_KERNEL_TESTS:
+        pytest.skip("paged MQA logits kernels support SM100 and SM103, not SM107")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers: FP8
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _ceil_to_ue8m0_fp(x: torch.Tensor) -> torch.Tensor:
+    return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
+
+
+def _make_fused_kv_fp8(
+    kv_fp8: torch.Tensor, kv_scales: torch.Tensor, block_size: int, head_dim: int
+) -> torch.Tensor:
+    """Pack KV + per-token FP32 scales into the fused layout.
+
+    Returns [num_blocks, block_size, 1, head_dim+4] uint8.
+    """
+    num_blocks = kv_fp8.shape[0]
+    per_token_size = head_dim + 4
+    block_bytes = block_size * per_token_size
+    scale_offset = block_size * head_dim
+
+    fused = torch.zeros(
+        num_blocks, block_bytes, dtype=torch.uint8, device=kv_fp8.device
+    )
+    for blk in range(num_blocks):
+        fused[blk, :scale_offset] = kv_fp8[blk].view(torch.uint8).reshape(-1)
+        fused[blk, scale_offset:] = (
+            kv_scales[blk].float().contiguous().view(torch.uint8).reshape(-1)
+        )
+    return fused.view(num_blocks, block_size, 1, per_token_size)
+
+
+def _ref_fp8_paged_mqa_logits(
+    q_fp8: torch.Tensor,
+    kv_fp8: torch.Tensor,
+    kv_scales: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_seq_len: int,
+    block_size: int,
+    out_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Pure-torch FP8 reference (adapted from TRT-LLM unit test)."""
+    B, next_n, H, D = q_fp8.shape
+    device = q_fp8.device
+    logits = torch.full(
+        (B * next_n, max_seq_len), float("-inf"), device=device, dtype=out_dtype
+    )
+    q_f32 = q_fp8.float()
+
+    for b in range(B):
+        ctx_len = int(seq_lens[b].item())
+        q_positions = torch.arange(ctx_len - next_n, ctx_len, device=device)
+        w = weights[b * next_n : (b + 1) * next_n, :].to(out_dtype)
+
+        for blk_idx in range((ctx_len + block_size - 1) // block_size):
+            phys_blk = int(block_tables[b, blk_idx].item())
+            k_f32 = kv_fp8[phys_blk].float()
+            scales = kv_scales[phys_blk].to(out_dtype)
+
+            k_positions = torch.arange(
+                blk_idx * block_size, (blk_idx + 1) * block_size, device=device
+            )
+            mask = (k_positions[None, :] < ctx_len) & (
+                k_positions[None, :] <= q_positions[:, None]
+            )
+            qk = torch.matmul(
+                q_f32[b].permute(1, 0, 2), k_f32.T
+            )  # [H, next_n, block_kv]
+            qk = torch.where(mask[None, :, :], qk, torch.zeros(1, device=device))
+            qk = torch.relu(qk).to(out_dtype)
+            weighted = (w.T[:, :, None] * qk).sum(dim=0)  # [next_n, block_kv]
+            weighted = weighted * scales[None, :]
+
+            start = blk_idx * block_size
+            end = min(start + block_size, max_seq_len)
+            if start >= max_seq_len:
+                break
+            ncol = end - start
+            logits[b * next_n : (b + 1) * next_n, start:end] = torch.where(
+                mask[:, :ncol],
+                weighted[:, :ncol],
+                torch.tensor(float("-inf"), device=device, dtype=out_dtype),
+            )
+    return logits
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers: FP4
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _ceil_to_ue8m0_int(x: torch.Tensor) -> torch.Tensor:
+    bits = x.abs().float().view(torch.int)
+    exp = ((bits >> 23) & 0xFF) + (bits & 0x7FFFFF).bool().int()
+    return (exp.clamp(1, 254) << 23).view(torch.float)
+
+
+def _pack_ue8m0_to_int(x: torch.Tensor) -> torch.Tensor:
+    assert x.dtype == torch.float and x.size(-1) % 4 == 0
+    return (x.view(torch.int) >> 23).to(torch.uint8).view(torch.int)
+
+
+def _unpack_ue8m0_from_int(packed: torch.Tensor) -> torch.Tensor:
+    return (packed.view(torch.uint8).to(torch.int) << 23).view(torch.float)
+
+
+def _quantize_to_fp4_e2m1(x: torch.Tensor) -> torch.Tensor:
+    ax = x.abs().clamp_max(6.0)
+    boundaries = torch.tensor(
+        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=x.device, dtype=ax.dtype
+    )
+    idx = torch.bucketize(ax, boundaries)
+    code = idx.to(torch.uint8)
+    sign = (x < 0) & (idx != 0)
+    return (code | (sign.to(torch.uint8) << 3)).view(torch.int8)
+
+
+def _dequantize_from_fp4_e2m1(x: torch.Tensor) -> torch.Tensor:
+    fp4_values = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=x.device, dtype=torch.float
+    )
+    sign, value_idx = (x & 0x08) != 0, (x & 0x07).to(torch.int)
+    value = fp4_values[value_idx]
+    return torch.where(sign & (value_idx != 0), -value, value)
+
+
+def _per_token_cast_to_fp4(x: torch.Tensor, gran_k: int = 32):
+    m, n = x.shape
+    padded_n = ((n + gran_k - 1) // gran_k) * gran_k
+    x_padded = torch.zeros((m, padded_n), dtype=x.dtype, device=x.device)
+    x_padded[:, :n] = x
+    x_view = x_padded.view(m, -1, gran_k)
+    x_amax = x_view.abs().float().amax(dim=2).clamp_min(1e-4)
+    sf = _ceil_to_ue8m0_int(x_amax / 6.0)
+    x_scaled = x_view * (1.0 / sf.unsqueeze(2))
+    codes = _quantize_to_fp4_e2m1(x_scaled).view(m, padded_n)
+    codes2 = codes.view(m, padded_n // 2, 2)
+    packed = (codes2[:, :, 0] & 0x0F) | ((codes2[:, :, 1] & 0x0F) << 4)
+    return packed[:, : n // 2].contiguous(), _pack_ue8m0_to_int(sf)
+
+
+def _cast_back_from_fp4(packed: torch.Tensor, sf: torch.Tensor, gran_k: int = 32):
+    m, n2 = packed.shape
+    n = n2 * 2
+    sf = _unpack_ue8m0_from_int(sf)
+    unpacked = torch.zeros((m, n), dtype=torch.int8, device=packed.device)
+    unpacked[:, ::2] = packed & 0x0F
+    unpacked[:, 1::2] = (packed >> 4) & 0x0F
+    x = _dequantize_from_fp4_e2m1(unpacked)
+    return x * sf[:, torch.arange(n, device=packed.device) // gran_k]
+
+
+def _kv_cache_cast_to_fp4(x: torch.Tensor, is_kv_sf_interleaved: bool = False):
+    num_blocks, block_size, num_heads, head_dim = x.shape
+    x_scaled, sf = _per_token_cast_to_fp4(x.view(-1, head_dim), gran_k=32)
+    x_back = _cast_back_from_fp4(x_scaled, sf, gran_k=32).view(
+        num_blocks, block_size, 1, head_dim
+    )
+    x_fp4 = torch.empty(
+        (num_blocks, block_size * (head_dim // 2 + 4)),
+        device=x.device,
+        dtype=torch.uint8,
+    )
+    x_fp4[:, : block_size * head_dim // 2] = x_scaled.view(
+        num_blocks, block_size * head_dim // 2
+    ).view(torch.uint8)
+    sf_per_block = sf.view(num_blocks, block_size)
+    if is_kv_sf_interleaved and block_size == 128:
+        sf_per_block = (
+            sf_per_block.reshape(num_blocks, 4, 32)
+            .transpose(-1, -2)
+            .contiguous()
+            .reshape(num_blocks, 128)
+        )
+    x_fp4[:, block_size * head_dim // 2 :] = sf_per_block.view(torch.uint8)
+    return (
+        x_fp4.view(num_blocks, block_size, num_heads, head_dim // 2 + 4),
+        x_back.to(x.dtype),
+    )
+
+
+def _ref_fp4_paged_mqa_logits(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_seq_len: int,
+) -> torch.Tensor:
+    """Pure-torch FP4 reference (adapted from TRT-LLM test)."""
+    batch_size, next_n, num_heads, dim = q.size()
+    _, block_size, _, _ = kv_cache.size()
+    logits = torch.full(
+        [batch_size * next_n, max_seq_len],
+        float("-inf"),
+        device=q.device,
+        dtype=torch.float32,
+    )
+    cl_list = seq_lens.tolist()
+    for i in range(batch_size):
+        ctx = int(cl_list[i])
+        q_offsets = torch.arange(ctx - next_n, ctx, device=q.device)
+        weight_slice = (
+            weights[i * next_n : (i + 1) * next_n, :].transpose(0, 1).contiguous()
+        )
+        n_blk = (ctx + block_size - 1) // block_size
+        block_idxs = block_tables[i, :n_blk]
+        kv_slice = kv_cache[block_idxs]
+        kx = kv_slice.permute(2, 3, 0, 1).reshape(kv_slice.size(2), dim, -1)
+        qx = q[i].transpose(0, 1)
+        s = torch.matmul(qx, kx).to(logits.dtype)
+        total_len = n_blk * block_size
+        k_offsets = torch.arange(0, total_len, device=q.device)
+        mask = (k_offsets[None, :] < ctx) & (k_offsets[None, :] <= q_offsets[:, None])
+        s = torch.where(mask[None, :, :], s, float("-inf"))
+        s = torch.relu(s) * weight_slice[..., None]
+        s = s.sum(dim=0)
+        w = min(total_len, max_seq_len)
+        logits[i * next_n : (i + 1) * next_n, :w] = torch.where(
+            k_offsets[None, :w] <= q_offsets[:, None], s[:, :w], float("-inf")
+        )
+    return logits
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Common: paged KV pool builder
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _make_paged_kv(batch_size, block_size, seq_lens, device):
+    n_blk_per_seq = (seq_lens + block_size - 1) // block_size
+    # Natural width -- ceil(max ctx / block_size), the table a serving stack
+    # keeps.  The kernels predicate every block-table read on the row's own
+    # block count, so no compute-tile padding is needed; a shorter row's
+    # trailing columns (zeros here) are never read.
+    total = int(n_blk_per_seq.sum().item())
+    num_total_blocks = total + batch_size * 2
+    max_blk = int(n_blk_per_seq.max().item())
+    block_tables = torch.zeros((batch_size, max_blk), dtype=torch.int32, device=device)
+    pool = torch.randperm(num_total_blocks, device=device, dtype=torch.int32)
+    off = 0
+    for i, nb in enumerate(n_blk_per_seq.tolist()):
+        block_tables[i, :nb] = pool[off : off + nb]
+        off += nb
+    return block_tables, num_total_blocks
+
+
+def _calc_cosine_diff(x: torch.Tensor, y: torch.Tensor) -> float:
+    x, y = x.double(), y.double()
+    denom = (x * x + y * y).sum()
+    if denom == 0:
+        return 0.0
+    return float(1 - 2 * (x * y).sum() / denom)
+
+
+def _valid_causal_mask(seq_lens, next_n, max_len, device):
+    """Boolean [B*next_n, max_len] mask of within-length, causally-valid positions."""
+    rows = seq_lens.shape[0] * next_n
+    positions = torch.arange(max_len, device=device).unsqueeze(0).expand(rows, -1)
+    offsets = torch.arange(rows, device=device)
+    limits = (seq_lens[offsets // next_n] - next_n + offsets % next_n).unsqueeze(1)
+    return positions <= limits
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GPU schedule kernel tests
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("batch_size", [1, 4, 32, 128])
+@pytest.mark.parametrize("avg_ctx", [256, 4096, 32768])
+def test_gpu_schedule_matches_cpu(batch_size, avg_ctx):
+    """GPU schedule kernel must be bit-exact vs CPU numpy reference."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip(
+            "GPU schedule kernel requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
+
+    from flashinfer.attn_scores.attn_scores import (
+        _cached_num_sms,
+        _compute_schedule_metadata,
+        compute_paged_mqa_logits_schedule,
+    )
+    from flashinfer.utils import get_device_index
+
+    device = "cuda"
+    lo = max(128, int(0.7 * avg_ctx))
+    hi = int(1.3 * avg_ctx) + 1
+    seq_lens = torch.randint(lo, hi, (batch_size,), dtype=torch.int32, device=device)
+
+    # Use the REAL device SM count so the CPU reference has the same [num_sms+1, 2]
+    # shape as the GPU kernel output (hardcoding 148 breaks on non-148-SM devices).
+    num_sms = _cached_num_sms(get_device_index(torch.device(device)))
+    ref_cpu = _compute_schedule_metadata(seq_lens.cpu(), num_sms).to(device)
+    gpu = compute_paged_mqa_logits_schedule(seq_lens, use_gpu_kernel=True)
+    torch.cuda.synchronize()
+    assert torch.equal(ref_cpu, gpu), (
+        f"GPU/CPU schedule mismatch: max diff {(ref_cpu - gpu).abs().max().item()}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FP8 tests
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("batch_size", [1, 4, 32])
+@pytest.mark.parametrize("next_n", [1, 2, 3])
+@pytest.mark.parametrize("avg_ctx", [256, 4096])
+@pytest.mark.parametrize("block_size", [64, 128])
+@pytest.mark.parametrize("output_dtype", [torch.float32])
+def test_fp8_paged_mqa_logits(batch_size, next_n, avg_ctx, block_size, output_dtype):
+    device = "cuda"
+    if not is_sm100a_supported(torch.device(device)):
+        pytest.skip(
+            "FP8 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
+
+    from flashinfer import fp8_paged_mqa_logits
+
+    torch.manual_seed(42)
+    num_heads, head_dim = 64, 128
+    max_seq_len = max(avg_ctx * 2, 2048)
+
+    lo = max(block_size, int(0.7 * avg_ctx))
+    hi = int(1.3 * avg_ctx) + 1
+    seq_lens = torch.randint(
+        lo, hi, (batch_size,), dtype=torch.int32, device=device
+    ).clamp(max=max_seq_len)
+    block_tables, num_total_blocks = _make_paged_kv(
+        batch_size, block_size, seq_lens, device
+    )
+
+    # FP8 inputs
+    q_f32 = torch.randn(batch_size, next_n, num_heads, head_dim, device=device)
+    q_fp8 = q_f32.to(torch.float8_e4m3fn)
+
+    kv_f32 = torch.randn(num_total_blocks, block_size, head_dim, device=device)
+    kv_amax = kv_f32.abs().float().amax(dim=-1, keepdim=True).clamp(1e-4)
+    kv_scale = _ceil_to_ue8m0_fp(kv_amax / 448.0).squeeze(-1)
+    kv_fp8 = (kv_f32 / kv_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+
+    weights = torch.randn(
+        batch_size * next_n, num_heads, device=device, dtype=torch.float32
+    )
+    kv_fused = _make_fused_kv_fp8(kv_fp8, kv_scale, block_size, head_dim)
+
+    ref = _ref_fp8_paged_mqa_logits(
+        q_fp8,
+        kv_fp8,
+        kv_scale,
+        weights,
+        seq_lens,
+        block_tables,
+        max_seq_len,
+        block_size,
+        out_dtype=output_dtype,
+    )
+
+    out = fp8_paged_mqa_logits(
+        q_fp8,
+        kv_fused,
+        weights,
+        block_tables,
+        seq_lens,
+        max_seq_len,
+        output_dtype=output_dtype,
+    )
+
+    # Mask out padding / beyond-length positions before comparing
+    positions = (
+        torch.arange(max_seq_len, device=device)
+        .unsqueeze(0)
+        .expand(batch_size * next_n, -1)
+    )
+    offsets = torch.arange(batch_size * next_n, device=device)
+    limits = (seq_lens[offsets // next_n] - next_n + offsets % next_n).unsqueeze(1)
+    neginf_mask = ~(positions <= limits)
+
+    out_m = out.float().masked_fill(neginf_mask, 0)
+    ref_m = ref.float().masked_fill(neginf_mask, 0)
+    # A non-finite kernel value where the reference is finite is a kernel
+    # failure (uninitialized read, bad predication), never an accumulation
+    # difference -- assert before masking so it cannot be hidden.  Exception:
+    # fp16 outputs saturate at |logit| > 65504 by contract (the fp16 epilogue
+    # trades range), so overflow-to-inf there is legitimate.
+    if out.dtype != torch.float16:
+        assert torch.isfinite(out_m[torch.isfinite(ref_m)]).all(), (
+            "kernel produced non-finite logits at positions the reference keeps finite"
+        )
+    finite = torch.isfinite(out_m) & torch.isfinite(ref_m)
+    out_clean = out_m.masked_fill(~finite, 0)
+    ref_clean = ref_m.masked_fill(~finite, 0)
+
+    atol, rtol = {
+        torch.float32: (5e-5, 1e-5),
+        torch.float16: (1e-3, 1e-3),
+    }[output_dtype]
+    valid = (~neginf_mask) & finite
+    if valid.any():
+        torch.testing.assert_close(
+            out_clean[valid], ref_clean[valid], atol=atol, rtol=rtol
+        )
+
+    diff = _calc_cosine_diff(out_clean, ref_clean)
+    assert diff < 0.02, f"cosine diff {diff:.3e} too large"
+
+
+@pytest.mark.parametrize("next_n", [1, 2])
+@pytest.mark.parametrize("block_size", [64, 128])
+def test_fp8_paged_mqa_logits_head_dim64(next_n, block_size):
+    """head_dim != 128 (the only value every other test uses).
+
+    The FP8 kernel is parametric over head_dim (unlike FP4, which asserts
+    head_dim == 128), but nothing else in the suite exercises that. head_dim=64
+    is the natural second point: a multiple of the MMA instruction K (32), a
+    native TMA swizzle width (64 B row), and half the SMEM of head_dim=128.
+    Catches any 128 accidentally hardcoded in the SMEM/TMA layout math.
+    """
+    device = "cuda"
+    if not is_sm100a_supported(torch.device(device)):
+        pytest.skip(
+            "FP8 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
+
+    from flashinfer import fp8_paged_mqa_logits
+
+    torch.manual_seed(42)
+    batch_size, avg_ctx, head_dim = 4, 1024, 64
+    output_dtype = torch.float32
+    max_seq_len = max(avg_ctx * 2, 2048)
+
+    lo = max(block_size, int(0.7 * avg_ctx))
+    hi = int(1.3 * avg_ctx) + 1
+    seq_lens = torch.randint(
+        lo, hi, (batch_size,), dtype=torch.int32, device=device
+    ).clamp(max=max_seq_len)
+    block_tables, num_total_blocks = _make_paged_kv(
+        batch_size, block_size, seq_lens, device
+    )
+
+    num_heads = 64
+    q_f32 = torch.randn(batch_size, next_n, num_heads, head_dim, device=device)
+    q_fp8 = q_f32.to(torch.float8_e4m3fn)
+
+    kv_f32 = torch.randn(num_total_blocks, block_size, head_dim, device=device)
+    kv_amax = kv_f32.abs().float().amax(dim=-1, keepdim=True).clamp(1e-4)
+    kv_scale = _ceil_to_ue8m0_fp(kv_amax / 448.0).squeeze(-1)
+    kv_fp8 = (kv_f32 / kv_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+
+    weights = torch.randn(
+        batch_size * next_n, num_heads, device=device, dtype=torch.float32
+    )
+    kv_fused = _make_fused_kv_fp8(kv_fp8, kv_scale, block_size, head_dim)
+
+    ref = _ref_fp8_paged_mqa_logits(
+        q_fp8,
+        kv_fp8,
+        kv_scale,
+        weights,
+        seq_lens,
+        block_tables,
+        max_seq_len,
+        block_size,
+        out_dtype=output_dtype,
+    )
+
+    out = fp8_paged_mqa_logits(
+        q_fp8,
+        kv_fused,
+        weights,
+        block_tables,
+        seq_lens,
+        max_seq_len,
+        output_dtype=output_dtype,
+    )
+
+    positions = (
+        torch.arange(max_seq_len, device=device)
+        .unsqueeze(0)
+        .expand(batch_size * next_n, -1)
+    )
+    offsets = torch.arange(batch_size * next_n, device=device)
+    limits = (seq_lens[offsets // next_n] - next_n + offsets % next_n).unsqueeze(1)
+    neginf_mask = ~(positions <= limits)
+
+    out_m = out.float().masked_fill(neginf_mask, 0)
+    ref_m = ref.float().masked_fill(neginf_mask, 0)
+    # A non-finite kernel value where the reference is finite is a kernel
+    # failure (uninitialized read, bad predication), never an accumulation
+    # difference -- assert before masking so it cannot be hidden.  Exception:
+    # fp16 outputs saturate at |logit| > 65504 by contract (the fp16 epilogue
+    # trades range), so overflow-to-inf there is legitimate.
+    if out.dtype != torch.float16:
+        assert torch.isfinite(out_m[torch.isfinite(ref_m)]).all(), (
+            "kernel produced non-finite logits at positions the reference keeps finite"
+        )
+    finite = torch.isfinite(out_m) & torch.isfinite(ref_m)
+    out_clean = out_m.masked_fill(~finite, 0)
+    ref_clean = ref_m.masked_fill(~finite, 0)
+
+    valid = (~neginf_mask) & finite
+    if valid.any():
+        torch.testing.assert_close(
+            out_clean[valid], ref_clean[valid], atol=5e-5, rtol=1e-5
+        )
+
+    diff = _calc_cosine_diff(out_clean, ref_clean)
+    assert diff < 0.02, f"cosine diff {diff:.3e} too large"
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("next_n", [1, 2])
+@pytest.mark.parametrize("avg_ctx", [256, 2048])
+def test_fp8_paged_mqa_logits_fp16(batch_size, next_n, avg_ctx):
+    """FP16 output path: use integer-valued data to keep precision losses small."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip(
+            "FP8 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
+
+    from flashinfer import fp8_paged_mqa_logits
+
+    torch.manual_seed(0)
+    device = "cuda"
+    num_heads, head_dim, block_size = 64, 128, 64
+    max_seq_len = max(avg_ctx * 2, 2048)
+    output_dtype = torch.float16
+
+    seq_lens = torch.full((batch_size,), avg_ctx, dtype=torch.int32, device=device)
+    block_tables, num_total_blocks = _make_paged_kv(
+        batch_size, block_size, seq_lens, device
+    )
+
+    # Integer-valued inputs to avoid fp16 accumulation drift
+    q_i = torch.randint(
+        -2, 3, (batch_size, next_n, num_heads, head_dim), device=device
+    ).float()
+    q_fp8 = q_i.to(torch.float8_e4m3fn)
+    kv_i = torch.randint(
+        -2, 3, (num_total_blocks, block_size, head_dim), device=device
+    ).float()
+    kv_amax = kv_i.abs().amax(dim=-1, keepdim=True).clamp(1e-4)
+    kv_scale = _ceil_to_ue8m0_fp(kv_amax / 448.0).squeeze(-1)
+    kv_fp8 = (kv_i / kv_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    weights = torch.randint(
+        -2, 3, (batch_size * next_n, num_heads), device=device
+    ).float()
+    kv_fused = _make_fused_kv_fp8(kv_fp8, kv_scale, block_size, head_dim)
+
+    ref = _ref_fp8_paged_mqa_logits(
+        q_fp8,
+        kv_fp8,
+        kv_scale,
+        weights,
+        seq_lens,
+        block_tables,
+        max_seq_len,
+        block_size,
+        out_dtype=output_dtype,
+    )
+    out = fp8_paged_mqa_logits(
+        q_fp8,
+        kv_fused,
+        weights,
+        block_tables,
+        seq_lens,
+        max_seq_len,
+        output_dtype=output_dtype,
+        epi_dtype=output_dtype,
+        acc_dtype=output_dtype,
+    )
+
+    positions = (
+        torch.arange(max_seq_len, device=device)
+        .unsqueeze(0)
+        .expand(batch_size * next_n, -1)
+    )
+    offsets = torch.arange(batch_size * next_n, device=device)
+    limits = (seq_lens[offsets // next_n] - next_n + offsets % next_n).unsqueeze(1)
+    neginf_mask = ~(positions <= limits)
+    out_m = out.float().masked_fill(neginf_mask, 0)
+    ref_m = ref.float().masked_fill(neginf_mask, 0)
+    # A non-finite kernel value where the reference is finite is a kernel
+    # failure (uninitialized read, bad predication), never an accumulation
+    # difference -- assert before masking so it cannot be hidden.  Exception:
+    # fp16 outputs saturate at |logit| > 65504 by contract (the fp16 epilogue
+    # trades range), so overflow-to-inf there is legitimate.
+    if out.dtype != torch.float16:
+        assert torch.isfinite(out_m[torch.isfinite(ref_m)]).all(), (
+            "kernel produced non-finite logits at positions the reference keeps finite"
+        )
+    finite = torch.isfinite(out_m) & torch.isfinite(ref_m)
+    out_clean = out_m.masked_fill(~finite, 0)
+    ref_clean = ref_m.masked_fill(~finite, 0)
+    valid = (~neginf_mask) & finite
+    if valid.any():
+        torch.testing.assert_close(
+            out_clean[valid], ref_clean[valid], atol=1e-3, rtol=1e-3
+        )
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("avg_ctx", [256, 2048])
+def test_fp8_paged_mqa_logits_next_n4(batch_size, avg_ctx):
+    """FP8 natively supports next_n=4 without atom-split."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip(
+            "FP8 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
+
+    from flashinfer import fp8_paged_mqa_logits
+
+    torch.manual_seed(5)
+    device = "cuda"
+    num_heads, head_dim, block_size, next_n = 64, 128, 64, 4
+    max_seq_len = max(avg_ctx * 2, 2048)
+
+    seq_lens = torch.full((batch_size,), avg_ctx, dtype=torch.int32, device=device)
+    block_tables, num_total_blocks = _make_paged_kv(
+        batch_size, block_size, seq_lens, device
+    )
+
+    q_fp8 = torch.randn(batch_size, next_n, num_heads, head_dim, device=device).to(
+        torch.float8_e4m3fn
+    )
+    kv_f32 = torch.randn(num_total_blocks, block_size, head_dim, device=device)
+    kv_amax = kv_f32.abs().amax(dim=-1, keepdim=True).clamp(1e-4)
+    kv_scale = _ceil_to_ue8m0_fp(kv_amax / 448.0).squeeze(-1)
+    kv_fp8 = (kv_f32 / kv_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    weights = torch.randn(
+        batch_size * next_n, num_heads, device=device, dtype=torch.float32
+    )
+    kv_fused = _make_fused_kv_fp8(kv_fp8, kv_scale, block_size, head_dim)
+
+    ref = _ref_fp8_paged_mqa_logits(
+        q_fp8,
+        kv_fp8,
+        kv_scale,
+        weights,
+        seq_lens,
+        block_tables,
+        max_seq_len,
+        block_size,
+        out_dtype=torch.float32,
+    )
+    out = fp8_paged_mqa_logits(
+        q_fp8,
+        kv_fused,
+        weights,
+        block_tables,
+        seq_lens,
+        max_seq_len,
+    )
+
+    positions = (
+        torch.arange(max_seq_len, device=device)
+        .unsqueeze(0)
+        .expand(batch_size * next_n, -1)
+    )
+    offsets = torch.arange(batch_size * next_n, device=device)
+    limits = (seq_lens[offsets // next_n] - next_n + offsets % next_n).unsqueeze(1)
+    neginf_mask = ~(positions <= limits)
+    out_m = out.float().masked_fill(neginf_mask, 0)
+    ref_m = ref.float().masked_fill(neginf_mask, 0)
+    # A non-finite kernel value where the reference is finite is a kernel
+    # failure (uninitialized read, bad predication), never an accumulation
+    # difference -- assert before masking so it cannot be hidden.  Exception:
+    # fp16 outputs saturate at |logit| > 65504 by contract (the fp16 epilogue
+    # trades range), so overflow-to-inf there is legitimate.
+    if out.dtype != torch.float16:
+        assert torch.isfinite(out_m[torch.isfinite(ref_m)]).all(), (
+            "kernel produced non-finite logits at positions the reference keeps finite"
+        )
+    finite = torch.isfinite(out_m) & torch.isfinite(ref_m)
+    out_clean = out_m.masked_fill(~finite, 0)
+    ref_clean = ref_m.masked_fill(~finite, 0)
+    valid = (~neginf_mask) & finite
+    if valid.any():
+        torch.testing.assert_close(
+            out_clean[valid], ref_clean[valid], atol=5e-5, rtol=1e-5
+        )
+    assert _calc_cosine_diff(out_clean, ref_clean) < 0.02
+
+
+# (num_heads, next_n): the epilogue weight cache holds NUM_W_IN_REG * next_n
+# elements. The per-slot cap stops binding once num_heads <= it, so these small
+# num_heads shapes are the ones whose footprint is limited by the register
+# budget instead. (32, 4) is the control -- it stays under the budget and keeps
+# the unclamped value.
+@pytest.mark.parametrize("num_heads,next_n", [(32, 6), (32, 8), (32, 4)])
+def test_fp8_paged_mqa_logits_small_num_heads(num_heads, next_n):
+    """num_heads below the per-slot weight-cache cap, where the budget binds."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip(
+            "FP8 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
+
+    from flashinfer import fp8_paged_mqa_logits
+
+    torch.manual_seed(5)
+    device = "cuda"
+    head_dim, block_size, batch_size, avg_ctx = 128, 64, 4, 2048
+    max_seq_len = max(avg_ctx * 2, 2048)
+
+    seq_lens = torch.full((batch_size,), avg_ctx, dtype=torch.int32, device=device)
+    block_tables, num_total_blocks = _make_paged_kv(
+        batch_size, block_size, seq_lens, device
+    )
+
+    q_fp8 = torch.randn(batch_size, next_n, num_heads, head_dim, device=device).to(
+        torch.float8_e4m3fn
+    )
+    kv_f32 = torch.randn(num_total_blocks, block_size, head_dim, device=device)
+    kv_amax = kv_f32.abs().amax(dim=-1, keepdim=True).clamp(1e-4)
+    kv_scale = _ceil_to_ue8m0_fp(kv_amax / 448.0).squeeze(-1)
+    kv_fp8 = (kv_f32 / kv_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    weights = torch.randn(
+        batch_size * next_n, num_heads, device=device, dtype=torch.float32
+    )
+    kv_fused = _make_fused_kv_fp8(kv_fp8, kv_scale, block_size, head_dim)
+
+    ref = _ref_fp8_paged_mqa_logits(
+        q_fp8,
+        kv_fp8,
+        kv_scale,
+        weights,
+        seq_lens,
+        block_tables,
+        max_seq_len,
+        block_size,
+        out_dtype=torch.float32,
+    )
+    out = fp8_paged_mqa_logits(
+        q_fp8,
+        kv_fused,
+        weights,
+        block_tables,
+        seq_lens,
+        max_seq_len,
+    )
+
+    positions = (
+        torch.arange(max_seq_len, device=device)
+        .unsqueeze(0)
+        .expand(batch_size * next_n, -1)
+    )
+    offsets = torch.arange(batch_size * next_n, device=device)
+    limits = (seq_lens[offsets // next_n] - next_n + offsets % next_n).unsqueeze(1)
+    neginf_mask = ~(positions <= limits)
+    out_m = out.float().masked_fill(neginf_mask, 0)
+    ref_m = ref.float().masked_fill(neginf_mask, 0)
+    # A non-finite kernel value where the reference is finite is a kernel
+    # failure (uninitialized read, bad predication), never an accumulation
+    # difference -- assert before masking so it cannot be hidden.  Exception:
+    # fp16 outputs saturate at |logit| > 65504 by contract (the fp16 epilogue
+    # trades range), so overflow-to-inf there is legitimate.
+    if out.dtype != torch.float16:
+        assert torch.isfinite(out_m[torch.isfinite(ref_m)]).all(), (
+            "kernel produced non-finite logits at positions the reference keeps finite"
+        )
+    finite = torch.isfinite(out_m) & torch.isfinite(ref_m)
+    out_clean = out_m.masked_fill(~finite, 0)
+    ref_clean = ref_m.masked_fill(~finite, 0)
+    valid = (~neginf_mask) & finite
+    assert valid.any(), "no valid positions to compare"
+    torch.testing.assert_close(out_clean[valid], ref_clean[valid], atol=5e-5, rtol=1e-5)
+    assert _calc_cosine_diff(out_clean, ref_clean) < 0.02
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FP4 tests
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("batch_size", [1, 4, 16])
+@pytest.mark.parametrize("next_n", [1, 2, 3])
+@pytest.mark.parametrize("avg_ctx", [256, 4096])
+@pytest.mark.parametrize("block_size", [32, 64, 128])
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32, torch.float16])
+def test_fp4_paged_mqa_logits(batch_size, next_n, avg_ctx, block_size, output_dtype):
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip(
+            "FP4 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
+
+    from flashinfer import fp4_paged_mqa_logits
+
+    torch.manual_seed(42)
+    device = "cuda"
+    num_heads, head_dim = 64, 128
+    max_seq_len = max(avg_ctx * 2, 2048)
+
+    lo = max(block_size, int(0.7 * avg_ctx))
+    hi = int(1.3 * avg_ctx) + 1
+    seq_lens = torch.randint(
+        lo, hi, (batch_size,), dtype=torch.int32, device=device
+    ).clamp(max=max_seq_len)
+    block_tables, num_total_blocks = _make_paged_kv(
+        batch_size, block_size, seq_lens, device
+    )
+
+    q_f32 = torch.randn(
+        batch_size, next_n, num_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    kv_cache = torch.randn(
+        num_total_blocks,
+        block_size,
+        1,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    weights = torch.randn(
+        batch_size * next_n, num_heads, device=device, dtype=torch.float32
+    )
+
+    q_packed, sf_q_packed = _per_token_cast_to_fp4(q_f32.view(-1, head_dim), gran_k=32)
+    q_fp4 = q_packed.view(torch.uint8).view(
+        batch_size, next_n, num_heads, head_dim // 2
+    )
+    q_sf = sf_q_packed.view(torch.int32).view(batch_size, next_n, num_heads)
+    q_sim = (
+        _cast_back_from_fp4(q_packed, sf_q_packed, gran_k=32)
+        .view(batch_size, next_n, num_heads, head_dim)
+        .to(torch.bfloat16)
+    )
+
+    kv_fused, kv_sim = _kv_cache_cast_to_fp4(kv_cache)
+
+    ref = _ref_fp4_paged_mqa_logits(
+        q_sim.float(), kv_sim.float(), weights, seq_lens, block_tables, max_seq_len
+    )
+
+    out = fp4_paged_mqa_logits(
+        q_fp4,
+        q_sf,
+        kv_fused,
+        weights,
+        block_tables,
+        seq_lens,
+        max_seq_len,
+        output_dtype=output_dtype,
+    )
+
+    positions = (
+        torch.arange(max_seq_len, device=device)
+        .unsqueeze(0)
+        .expand(batch_size * next_n, -1)
+    )
+    offsets = torch.arange(batch_size * next_n, device=device)
+    limits = (seq_lens[offsets // next_n] - next_n + offsets % next_n).unsqueeze(1)
+    neginf_mask = ~(positions <= limits)
+
+    out_m = out.float().masked_fill(neginf_mask, 0)
+    ref_m = ref.float().masked_fill(neginf_mask, 0)
+    # A non-finite kernel value where the reference is finite is a kernel
+    # failure (uninitialized read, bad predication), never an accumulation
+    # difference -- assert before masking so it cannot be hidden.  Exception:
+    # fp16 outputs saturate at |logit| > 65504 by contract (the fp16 epilogue
+    # trades range), so overflow-to-inf there is legitimate.
+    if out.dtype != torch.float16:
+        assert torch.isfinite(out_m[torch.isfinite(ref_m)]).all(), (
+            "kernel produced non-finite logits at positions the reference keeps finite"
+        )
+    finite = torch.isfinite(out_m) & torch.isfinite(ref_m)
+    out_clean = out_m.masked_fill(~finite, 0)
+    ref_clean = ref_m.masked_fill(~finite, 0)
+
+    tol = {
+        torch.float32: (5e-5, 1e-5),
+        torch.bfloat16: (1e-2, 1e-2),
+        torch.float16: (1e-3, 1e-3),
+    }
+    atol, rtol = tol[output_dtype]
+    valid = (~neginf_mask) & finite
+    if valid.any():
+        torch.testing.assert_close(
+            out_clean[valid], ref_clean[valid], atol=atol, rtol=rtol
+        )
+
+    diff = _calc_cosine_diff(out_clean, ref_clean)
+    assert diff < 0.02, f"cosine diff {diff:.3e} too large"
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("avg_ctx", [256, 4096])
+def test_fp4_paged_mqa_logits_next_n4(batch_size, avg_ctx):
+    """Numerical check of next_n=4 against the torch reference.
+
+    next_n=4 raw TMEM footprint is 544 columns.  Rubin (SM107+, 576) runs it as
+    one atom; Blackwell (512) decomposes it into two atoms of 2.  The
+    decomposition is a fixed internal rule keyed on the device, so running this
+    test on both architectures covers both executions: direct on Rubin, the
+    in-kernel split on Blackwell.  The staggered per-atom causal limits are the
+    easy thing to get wrong, so both a short sequence (one KV block) and a
+    multi-block one are covered.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip(
+            "FP4 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
+
+    from flashinfer import fp4_paged_mqa_logits
+
+    device = "cuda"
+    next_n = 4
+
+    torch.manual_seed(42)
+    num_heads, head_dim, block_size = 64, 128, 64
+    output_dtype = torch.float32
+    max_seq_len = max(avg_ctx * 2, 2048)
+
+    lo = max(block_size, int(0.7 * avg_ctx))
+    hi = int(1.3 * avg_ctx) + 1
+    seq_lens = torch.randint(
+        lo, hi, (batch_size,), dtype=torch.int32, device=device
+    ).clamp(max=max_seq_len)
+    block_tables, num_total_blocks = _make_paged_kv(
+        batch_size, block_size, seq_lens, device
+    )
+
+    q_f32 = torch.randn(
+        batch_size, next_n, num_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    kv_cache = torch.randn(
+        num_total_blocks, block_size, 1, head_dim, device=device, dtype=torch.bfloat16
+    )
+    weights = torch.randn(
+        batch_size * next_n, num_heads, device=device, dtype=torch.float32
+    )
+
+    q_packed, sf_q_packed = _per_token_cast_to_fp4(q_f32.view(-1, head_dim), gran_k=32)
+    q_fp4 = q_packed.view(torch.uint8).view(
+        batch_size, next_n, num_heads, head_dim // 2
+    )
+    q_sf = sf_q_packed.view(torch.int32).view(batch_size, next_n, num_heads)
+    q_sim = (
+        _cast_back_from_fp4(q_packed, sf_q_packed, gran_k=32)
+        .view(batch_size, next_n, num_heads, head_dim)
+        .to(torch.bfloat16)
+    )
+    kv_fused, kv_sim = _kv_cache_cast_to_fp4(kv_cache)
+
+    ref = _ref_fp4_paged_mqa_logits(
+        q_sim.float(), kv_sim.float(), weights, seq_lens, block_tables, max_seq_len
+    )
+    out = fp4_paged_mqa_logits(
+        q_fp4,
+        q_sf,
+        kv_fused,
+        weights,
+        block_tables,
+        seq_lens,
+        max_seq_len,
+        output_dtype=output_dtype,
+    )
+
+    positions = (
+        torch.arange(max_seq_len, device=device)
+        .unsqueeze(0)
+        .expand(batch_size * next_n, -1)
+    )
+    offsets = torch.arange(batch_size * next_n, device=device)
+    limits = (seq_lens[offsets // next_n] - next_n + offsets % next_n).unsqueeze(1)
+    neginf_mask = ~(positions <= limits)
+
+    out_m = out.float().masked_fill(neginf_mask, 0)
+    ref_m = ref.float().masked_fill(neginf_mask, 0)
+    # A non-finite kernel value where the reference is finite is a kernel
+    # failure (uninitialized read, bad predication), never an accumulation
+    # difference -- assert before masking so it cannot be hidden.  Exception:
+    # fp16 outputs saturate at |logit| > 65504 by contract (the fp16 epilogue
+    # trades range), so overflow-to-inf there is legitimate.
+    if out.dtype != torch.float16:
+        assert torch.isfinite(out_m[torch.isfinite(ref_m)]).all(), (
+            "kernel produced non-finite logits at positions the reference keeps finite"
+        )
+    finite = torch.isfinite(out_m) & torch.isfinite(ref_m)
+    valid = (~neginf_mask) & finite
+    assert valid.any(), "test shape produced no comparable positions"
+    torch.testing.assert_close(
+        out_m.masked_fill(~finite, 0)[valid],
+        ref_m.masked_fill(~finite, 0)[valid],
+        atol=5e-5,
+        rtol=1e-5,
+    )
+
+
+def test_fp4_next_n_limits():
+    """FP4 accepts next_n up to 4; 5 is still rejected.
+
+    next_n=4 needs 544 TMEM columns, over SM100's 512-column cap, so Rubin
+    (SM107+, 576 columns) runs it directly while Blackwell reaches it as two
+    atoms of 2.  The decomposition is now done *inside* the kernel, which is
+    what makes it acceptable: an earlier caller-side version duplicated the
+    block table and rebuilt the sequence lengths per call, and this test
+    previously asserted next_n=4 was refused outright for that reason.
+
+    The one hazard that remains is a caller-supplied schedule_meta: a split
+    makes the scheduler describe batch*num_atoms rows while the schedule's
+    shape is unchanged, so a schedule built from the native seq_lens would
+    pass every always-on check and still be wrong.  Such a schedule is only
+    accepted when built with this call's next_n and variant="fp4" (the helper
+    applies the same decomposition); a default-args schedule is caught by the
+    opt-in freshness check -- see test_fp4_next_n4_caller_schedule_via_helper.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip(
+            "FP4 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
+
+    from flashinfer import fp4_paged_mqa_logits
+
+    device = "cuda"
+    B, H, D, block_size, ctx = 2, 64, 128, 64, 256
+    seq_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
+    block_tables, ntb = _make_paged_kv(B, block_size, seq_lens, device)
+
+    for next_n, should_pass in ((3, True), (4, True), (5, False)):
+        q = torch.zeros(B, next_n, H, D // 2, dtype=torch.uint8, device=device)
+        q_sf = torch.zeros(B, next_n, H, dtype=torch.int32, device=device)
+        kv = torch.zeros(
+            ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device
+        )
+        w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+        args = (q, q_sf, kv, w, block_tables, seq_lens, ctx)
+        if should_pass:
+            fp4_paged_mqa_logits(*args, output_dtype=torch.bfloat16)
+        else:
+            with pytest.raises(ValueError, match=r"next_n in 1\.\.4"):
+                fp4_paged_mqa_logits(*args, output_dtype=torch.bfloat16)
+
+
+def test_fp4_next_n4_caller_schedule_via_helper(monkeypatch):
+    """A caller schedule built with matching helper arguments works everywhere.
+
+    For next_n=4 on SM100/SM103 the kernel internally restructures the problem
+    (the two-pass split), so the schedule differs from the native one;
+    compute_paged_mqa_logits_schedule applies the same internal policy when
+    given the call's next_n and variant.  Pins: (a) the helper output equals
+    the schedule the kernel computes internally, (b) the main call accepts it,
+    and (c) on a split device a schedule built with the DEFAULT helper
+    arguments describes the wrong problem and the opt-in freshness check
+    catches it -- the hang class commit 29ca0629 documented.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip(
+            "FP4 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
+
+    from flashinfer import compute_paged_mqa_logits_schedule, fp4_paged_mqa_logits
+    from flashinfer.attn_scores.attn_scores import (
+        _expand_seq_lens,
+        _fp4_atom_decomposition,
+        _fp4_max_atom_for_device,
+    )
+
+    device = "cuda"
+    B, H, D, block_size, ctx, next_n = 2, 64, 128, 64, 256, 4
+    seq_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
+    block_tables, ntb = _make_paged_kv(B, block_size, seq_lens, device)
+    q = torch.zeros(B, next_n, H, D // 2, dtype=torch.uint8, device=device)
+    q_sf = torch.zeros(B, next_n, H, dtype=torch.int32, device=device)
+    kv = torch.zeros(ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device)
+    w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+
+    # (a) The helper with matching arguments reproduces the internal schedule.
+    atom, num_atoms = _fp4_atom_decomposition(next_n, torch.device(device))
+    expected = compute_paged_mqa_logits_schedule(
+        _expand_seq_lens(seq_lens, num_atoms, atom), device=device
+    )
+    sched = compute_paged_mqa_logits_schedule(
+        seq_lens, device=device, next_n=next_n, variant="fp4"
+    )
+    assert torch.equal(sched, expected), (
+        "helper(next_n, variant) must equal the kernel's internal schedule"
+    )
+
+    # (b) The main call accepts it (on any architecture).
+    res = fp4_paged_mqa_logits(
+        q,
+        q_sf,
+        kv,
+        w,
+        block_tables,
+        seq_lens,
+        ctx,
+        output_dtype=torch.bfloat16,
+        schedule_meta=sched,
+    )
+    torch.cuda.synchronize()
+    assert res.shape == (B * next_n, ctx)
+
+    # (c) On a split device the native (default-args) schedule is a different
+    # tensor, and the opt-in freshness check refuses it before the kernel
+    # could hang on the mismatched end boundary.  The error's remediation
+    # recipe must itself be actionable: run it (parsed, not eval'd) into the
+    # rejected buffer and the very next call must be accepted.
+    if _fp4_max_atom_for_device(torch.device(device)) < next_n:
+        native = compute_paged_mqa_logits_schedule(seq_lens, device=device)
+        assert not torch.equal(native, sched), "test premise: split changes it"
+        monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
+        with pytest.raises(ValueError, match="Recompute it with") as excinfo:
+            fp4_paged_mqa_logits(
+                q,
+                q_sf,
+                kv,
+                w,
+                block_tables,
+                seq_lens,
+                ctx,
+                output_dtype=torch.bfloat16,
+                schedule_meta=native,
+            )
+        recipe_nn, recipe_variant = _parse_schedule_recipe(str(excinfo.value))
+        assert (recipe_nn, recipe_variant) == (next_n, "fp4"), str(excinfo.value)
+        compute_paged_mqa_logits_schedule(
+            seq_lens,
+            device=device,
+            next_n=recipe_nn,
+            variant=recipe_variant,
+            out=native,
+        )
+        assert torch.equal(native, sched), (
+            "the recipe must reproduce the accepted schedule"
+        )
+        fp4_paged_mqa_logits(
+            q,
+            q_sf,
+            kv,
+            w,
+            block_tables,
+            seq_lens,
+            ctx,
+            output_dtype=torch.bfloat16,
+            schedule_meta=native,
+        )
+        torch.cuda.synchronize()
+
+
+def _parse_schedule_recipe(message: str):
+    """Extract (next_n, variant) from the freshness error's recommended call.
+
+    Parsed with a regex rather than eval'd so no code from an error string is
+    ever executed by the test."""
+    import re
+
+    m = re.search(
+        r"compute_paged_mqa_logits_schedule\(seq_lens, next_n=(\d+), "
+        r"variant='(fp[48])', out=schedule_meta\)",
+        message,
+    )
+    assert m, f"no actionable recipe in the message: {message}"
+    return int(m.group(1)), m.group(2)
+
+
+@pytest.mark.parametrize("variant,next_n", [("fp8", 2), ("fp4", 4)])
+def test_stale_schedule_message_recipe_is_actionable(variant, next_n, monkeypatch):
+    """Following the freshness error's recipe verbatim must fix the mismatch.
+
+    Arch-independent stale trick (a schedule built for length 257 reused at
+    256) so the message is exercised on every SM100-class device, including
+    Rubin where the fp4 split is inactive; leg (c) of
+    test_fp4_next_n4_caller_schedule_via_helper covers the split-specific
+    default-args mismatch.  Against the pre-fix message ("...schedule(seq_lens,
+    out=schedule_meta)") the recipe parse fails: it named neither next_n nor
+    variant, and for the fp4 split it regenerated exactly the rejected schedule.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import (
+        compute_paged_mqa_logits_schedule,
+        fp4_paged_mqa_logits,
+        fp8_paged_mqa_logits,
+    )
+
+    device = "cuda"
+    B, H, D, block_size = 1, 64, 128, 64
+    seq_lens = torch.full((B,), 256, dtype=torch.int32, device=device)
+    stale_lens = torch.full((B,), 257, dtype=torch.int32, device=device)
+    max_ml = 512
+    block_tables, ntb = _make_paged_kv(B, block_size, stale_lens, device)
+    w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+    if variant == "fp8":
+        q = torch.zeros(B, next_n, H, D, device=device).to(torch.float8_e4m3fn)
+        kv = torch.zeros(ntb, block_size, 1, D + 4, dtype=torch.uint8, device=device)
+
+        def call(sched):
+            return fp8_paged_mqa_logits(
+                q, kv, w, block_tables, seq_lens, max_ml, schedule_meta=sched
+            )
+    else:
+        q = torch.zeros(B, next_n, H, D // 2, dtype=torch.uint8, device=device)
+        q_sf = torch.zeros(B, next_n, H, dtype=torch.int32, device=device)
+        kv = torch.zeros(
+            ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device
+        )
+
+        def call(sched):
+            return fp4_paged_mqa_logits(
+                q,
+                q_sf,
+                kv,
+                w,
+                block_tables,
+                seq_lens,
+                max_ml,
+                output_dtype=torch.bfloat16,
+                schedule_meta=sched,
+            )
+
+    stale = compute_paged_mqa_logits_schedule(
+        stale_lens, device=device, next_n=next_n, variant=variant
+    )
+    monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
+    with pytest.raises(ValueError, match="schedule_meta does not match seq_lens") as e:
+        call(stale)
+    msg = str(e.value)
+    assert f"next_n={next_n}" in msg and f"variant='{variant}'" in msg, msg
+    recipe_nn, recipe_variant = _parse_schedule_recipe(msg)
+    compute_paged_mqa_logits_schedule(
+        seq_lens, device=device, next_n=recipe_nn, variant=recipe_variant, out=stale
+    )
+    call(stale)  # the recipe made it fresh: accepted
+    torch.cuda.synchronize()
+
+
+def test_fp4_caller_schedule_does_not_expand_seq_lens(monkeypatch):
+    """With a caller schedule, the fp4 body must not materialise the per-atom
+    lengths: that is one dead elementwise kernel (and a [B*num_atoms] alloc)
+    per call -- and under CUDA-graph capture a dead node replayed on every
+    launch -- on the very path schedule_meta= exists to slim down.  The
+    expansion happens lazily inside the opt-in freshness check instead.
+    Asserted on call count, so it runs on every arch (identity or not)."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import (
+        compute_paged_mqa_logits_schedule,
+        fp4_paged_mqa_logits,
+        padded_seq_len,
+    )
+    from flashinfer.attn_scores import attn_scores as A
+
+    device = "cuda"
+    B, H, D, block_size, ctx, next_n = 2, 64, 128, 64, 256, 4
+    seq_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
+    block_tables, ntb = _make_paged_kv(B, block_size, seq_lens, device)
+    q = torch.zeros(B, next_n, H, D // 2, dtype=torch.uint8, device=device)
+    q_sf = torch.zeros(B, next_n, H, dtype=torch.int32, device=device)
+    kv = torch.zeros(ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device)
+    w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+    out = torch.empty(
+        (B * next_n, padded_seq_len(ctx)), dtype=torch.bfloat16, device=device
+    )
+    sched = compute_paged_mqa_logits_schedule(
+        seq_lens, device=device, next_n=next_n, variant="fp4"
+    )
+
+    def call():
+        return fp4_paged_mqa_logits(
+            q,
+            q_sf,
+            kv,
+            w,
+            block_tables,
+            seq_lens,
+            ctx,
+            output_dtype=torch.bfloat16,
+            schedule_meta=sched,
+            out=out,
+        )
+
+    call()
+    torch.cuda.synchronize()  # warm JIT before counting
+    ref = call().clone()
+    torch.cuda.synchronize()
+
+    calls = []
+    orig = A._expand_seq_lens
+
+    def spy(sl, n, a):
+        calls.append((n, a))
+        return orig(sl, n, a)
+
+    monkeypatch.setattr(A, "_expand_seq_lens", spy)
+    monkeypatch.delenv("FLASHINFER_VALIDATE_INPUTS", raising=False)
+
+    call()
+    torch.cuda.synchronize()
+    assert calls == [], f"eager caller-schedule path expanded seq_lens: {calls}"
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        call()
+    assert calls == [], f"expansion was captured into the graph: {calls}"
+    g.replay()
+    torch.cuda.synchronize()
+    valid = _valid_causal_mask(seq_lens, next_n, ctx, device)
+    assert torch.equal(out[:, :ctx][valid], ref[:, :ctx][valid])
+
+    # With validation on, the expansion happens exactly once -- inside the
+    # freshness check -- and the helper-built schedule is accepted.
+    monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
+    call()
+    torch.cuda.synchronize()
+    assert len(calls) == 1, calls
+
+
+@pytest.mark.parametrize("block_size", [64, 128])
+def test_fp4_paged_mqa_logits_sf_interleaved(block_size):
+    """is_kv_sf_interleaved=True path (requires block_size=128)."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip(
+            "FP4 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
+
+    from flashinfer import fp4_paged_mqa_logits
+
+    torch.manual_seed(3)
+    device = "cuda"
+    batch_size, next_n, num_heads, head_dim = 4, 2, 64, 128
+    avg_ctx = 1024
+    max_seq_len = avg_ctx * 2
+
+    seq_lens = torch.full((batch_size,), avg_ctx, dtype=torch.int32, device=device)
+    block_tables, num_total_blocks = _make_paged_kv(
+        batch_size, block_size, seq_lens, device
+    )
+    q_f32 = torch.randn(
+        batch_size, next_n, num_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    kv_cache = torch.randn(
+        num_total_blocks,
+        block_size,
+        1,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    weights = torch.randn(
+        batch_size * next_n, num_heads, device=device, dtype=torch.float32
+    )
+
+    q_packed, sf_q_packed = _per_token_cast_to_fp4(q_f32.view(-1, head_dim), gran_k=32)
+    q_fp4 = q_packed.view(torch.uint8).view(
+        batch_size, next_n, num_heads, head_dim // 2
+    )
+    q_sf = sf_q_packed.view(torch.int32).view(batch_size, next_n, num_heads)
+
+    # Pre-interleaved KV SF
+    kv_fused_interleaved, kv_sim = _kv_cache_cast_to_fp4(
+        kv_cache, is_kv_sf_interleaved=(block_size == 128)
+    )
+
+    out = fp4_paged_mqa_logits(
+        q_fp4,
+        q_sf,
+        kv_fused_interleaved,
+        weights,
+        block_tables,
+        seq_lens,
+        max_seq_len,
+        output_dtype=torch.bfloat16,
+        is_kv_sf_interleaved=(block_size == 128),
+    )
+
+    # Also run with the in-kernel rearrangement for cross-check
+    kv_fused_online, _ = _kv_cache_cast_to_fp4(kv_cache, is_kv_sf_interleaved=False)
+    out_online = fp4_paged_mqa_logits(
+        q_fp4,
+        q_sf,
+        kv_fused_online,
+        weights,
+        block_tables,
+        seq_lens,
+        max_seq_len,
+        output_dtype=torch.bfloat16,
+        is_kv_sf_interleaved=False,
+    )
+
+    # Mask to valid (within-length, finite) positions before comparing
+    positions = (
+        torch.arange(max_seq_len, device=device)
+        .unsqueeze(0)
+        .expand(batch_size * next_n, -1)
+    )
+    offsets = torch.arange(batch_size * next_n, device=device)
+    limits = (seq_lens[offsets // next_n] - next_n + offsets % next_n).unsqueeze(1)
+    neginf_mask = ~(positions <= limits)
+    out_m = out.float().masked_fill(neginf_mask, 0)
+    out_online_m = out_online.float().masked_fill(neginf_mask, 0)
+    finite = torch.isfinite(out_m) & torch.isfinite(out_online_m)
+    valid = (~neginf_mask) & finite
+    if valid.any():
+        torch.testing.assert_close(
+            out_m[valid], out_online_m[valid], atol=1e-2, rtol=1e-2
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# out= / schedule_meta= paths and input validation
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _make_fp8_case(
+    batch_size, next_n, ctx, block_size, device, seed=11, head_dim=128, num_heads=64
+):
+    torch.manual_seed(seed)
+    seq_lens = torch.full((batch_size,), ctx, dtype=torch.int32, device=device)
+    block_tables, num_total_blocks = _make_paged_kv(
+        batch_size, block_size, seq_lens, device
+    )
+    q_fp8 = torch.randn(batch_size, next_n, num_heads, head_dim, device=device).to(
+        torch.float8_e4m3fn
+    )
+    kv_f32 = torch.randn(num_total_blocks, block_size, head_dim, device=device)
+    kv_amax = kv_f32.abs().amax(dim=-1, keepdim=True).clamp(1e-4)
+    kv_scale = _ceil_to_ue8m0_fp(kv_amax / 448.0).squeeze(-1)
+    kv_fp8 = (kv_f32 / kv_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    weights = torch.randn(
+        batch_size * next_n, num_heads, device=device, dtype=torch.float32
+    )
+    kv_fused = _make_fused_kv_fp8(kv_fp8, kv_scale, block_size, head_dim)
+    return q_fp8, kv_fused, weights, seq_lens, block_tables
+
+
+# Shapes the UMMA N-mode rule (next_n*num_heads a multiple of 8 in [8, 256])
+# admits although num_heads is not a multiple of the epilogue unroll (4).  Only
+# possible when next_n itself is a multiple of 4.
+@pytest.mark.parametrize("next_n,num_heads", [(4, 10), (8, 9)])
+def test_fp8_num_heads_unroll_granularity_rejected(next_n, num_heads):
+    """num_heads not a multiple of 4 is rejected at the API boundary, in the
+    caller's vocabulary, before the compile layer is entered.
+
+    Previously the public supportedness checker accepted these shapes and the
+    kernel constructor rejected them -- after the output had been allocated
+    and the schedule kernel compiled -- with a message naming the internal
+    compile-layer parameter num_epi_subtiles, which the caller cannot set.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import fp8_paged_mqa_logits
+    from flashinfer.attn_scores import attn_scores as A
+
+    N = next_n * num_heads
+    assert N % 8 == 0 and 8 <= N <= 256 and num_heads % 4 != 0, "test premise"
+    ctx, block_size = 256, 64
+    q, kv, w, cl, bt = _make_fp8_case(
+        2, next_n, ctx, block_size, "cuda", num_heads=num_heads
+    )
+
+    misses = A._cached_compile_fp8_kernel.cache_info().misses
+    with pytest.raises(ValueError, match=r"num_heads must be a multiple of 4") as ei:
+        fp8_paged_mqa_logits(q, kv, w, bt, cl, ctx)
+    assert "num_epi_subtiles" not in str(ei.value), "internal parameter leaked"
+    assert A._cached_compile_fp8_kernel.cache_info().misses == misses, (
+        "the compile layer was entered before the shape was rejected"
+    )
+    # The public checker is the single source of supportedness: same verdict.
+    with pytest.raises(ValueError, match=r"num_heads must be a multiple of 4"):
+        A._check_fp8_paged_mqa_logits_supported(q, kv, w, bt, cl, ctx)
+    assert fp8_paged_mqa_logits.is_compute_capability_supported(100)
+
+
+@pytest.mark.parametrize("epi_dtype", [torch.float32, torch.float16])
+def test_fp8_epilogue_policy_is_bit_identical_and_keyed(epi_dtype, monkeypatch):
+    """The internal per-shape epilogue policy only changes speed.
+
+    At num_heads=32, next_n=6 the default weight-cache budget (160 registers,
+    24 weights per slot) spills -- Nsight Compute: ~12k local loads and ~8k
+    local stores per launch -- and the policy's 96-register budget (16 per
+    slot) removes every spill, 8-15% faster on B200 and 11-35% on Rubin; the
+    fp16 epilogue at this shape gains 5-13% from two epilogue subtiles.
+    Neither knob changes the head accumulation order, so the policy's kernel
+    and the default kernel must agree bit for bit, and they must be distinct
+    compile-cache entries so a policy change can never serve a stale artifact.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import fp8_paged_mqa_logits
+    from flashinfer.attn_scores import attn_scores as A
+
+    H, next_n, ctx, block_size = 32, 6, 2048, 64
+    policy = A._fp8_epilogue_policy(H, next_n, A._to_cutlass(epi_dtype))
+    assert policy != A._FP8_EPILOGUE_DEFAULT, "test premise: shape has a policy"
+    q, kv, w, cl, bt = _make_fp8_case(4, next_n, ctx, block_size, "cuda", num_heads=H)
+    kw = dict(epi_dtype=epi_dtype, output_dtype=torch.float32)
+
+    out_policy = fp8_paged_mqa_logits(q, kv, w, bt, cl, ctx, **kw).clone()
+    entries = A._cached_compile_fp8_kernel.cache_info().currsize
+    monkeypatch.setattr(A, "_fp8_epilogue_policy", lambda *a: A._FP8_EPILOGUE_DEFAULT)
+    out_default = fp8_paged_mqa_logits(q, kv, w, bt, cl, ctx, **kw)
+    assert A._cached_compile_fp8_kernel.cache_info().currsize == entries + 1, (
+        "the default and the policy kernel must be distinct cache entries"
+    )
+    torch.cuda.synchronize()
+    valid = _valid_causal_mask(cl, next_n, ctx, "cuda")
+    assert torch.isfinite(out_policy[valid]).all()
+    assert torch.equal(out_policy, out_default), "policy changed the numerics"
+
+
+def test_fp8_kernel_w_cache_regs_knob():
+    """The kernel's weight-cache register budget defaults to the module
+    constant, takes any positive override, and rejects the rest (host-only)."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer.attn_scores.kernels import FP8MQALogitsKernel
+    from flashinfer.attn_scores.kernels import fp8_paged_mqa_logits as K
+
+    def make(**kw):
+        return FP8MQALogitsKernel(
+            num_heads=32, next_n=6, phys_block_kv=64, arch="sm_100a", **kw
+        )
+
+    assert make().w_cache_regs == K._MAX_W_CACHE_REGS == 160
+    assert make(w_cache_regs=96).w_cache_regs == 96
+    with pytest.raises(ValueError, match="w_cache_regs"):
+        make(w_cache_regs=0)
+
+
+def test_fp8_out_and_schedule_meta_paths():
+    """out= (pre-allocated buffer) and schedule_meta= (pre-computed) must match the
+    default path bit-for-bit and the returned tensor must alias out."""
+    device = "cuda"
+    if not is_sm100a_supported(torch.device(device)):
+        pytest.skip(
+            "FP8 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
+
+    from flashinfer import (
+        padded_seq_len,
+        compute_paged_mqa_logits_schedule,
+        fp8_paged_mqa_logits,
+    )
+
+    B, next_n, ctx, block_size = 4, 2, 4096, 64
+    max_ml = ctx + 512
+    q, kv_fused, w, cl, bt = _make_fp8_case(B, next_n, ctx, block_size, device)
+
+    ref = fp8_paged_mqa_logits(q, kv_fused, w, bt, cl, max_ml)
+
+    # Pre-allocated out= sized via padded_seq_len, plus pre-computed schedule.
+    padded = padded_seq_len(max_ml)
+    out_buf = torch.empty((B * next_n, padded), device=device, dtype=torch.float32)
+    sched = compute_paged_mqa_logits_schedule(cl)
+    ret = fp8_paged_mqa_logits(
+        q, kv_fused, w, bt, cl, max_ml, schedule_meta=sched, out=out_buf
+    )
+
+    assert ret.data_ptr() == out_buf.data_ptr(), "returned tensor must alias out="
+    # Same kernel + same schedule → bit-identical in the causal-valid region.
+    # (Beyond-length padding is unwritten garbage and differs between buffers.)
+    valid = _valid_causal_mask(cl, next_n, max_ml, device)
+    torch.testing.assert_close(ret.float()[valid], ref.float()[valid], atol=0, rtol=0)
+
+
+def test_fp4_out_and_schedule_meta_paths():
+    device = "cuda"
+    if not is_sm100a_supported(torch.device(device)):
+        pytest.skip(
+            "FP4 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
+
+    from flashinfer import (
+        padded_seq_len,
+        compute_paged_mqa_logits_schedule,
+        fp4_paged_mqa_logits,
+    )
+
+    torch.manual_seed(13)
+    B, next_n, ctx, block_size = 4, 2, 4096, 64
+    num_heads, head_dim = 64, 128
+    max_ml = ctx + 512
+    seq_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
+    block_tables, num_total_blocks = _make_paged_kv(B, block_size, seq_lens, device)
+    q_bf = torch.randn(
+        B, next_n, num_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    kv_cache = torch.randn(
+        num_total_blocks, block_size, 1, head_dim, device=device, dtype=torch.bfloat16
+    )
+    weights = torch.randn(B * next_n, num_heads, device=device, dtype=torch.float32)
+    q_packed, sf_q_packed = _per_token_cast_to_fp4(q_bf.view(-1, head_dim), gran_k=32)
+    q_fp4 = q_packed.view(torch.uint8).view(B, next_n, num_heads, head_dim // 2)
+    q_sf = sf_q_packed.view(torch.int32).view(B, next_n, num_heads)
+    kv_fused, _ = _kv_cache_cast_to_fp4(kv_cache)
+
+    ref = fp4_paged_mqa_logits(
+        q_fp4,
+        q_sf,
+        kv_fused,
+        weights,
+        block_tables,
+        seq_lens,
+        max_ml,
+        output_dtype=torch.float32,
+    )
+    padded = padded_seq_len(max_ml)
+    out_buf = torch.empty((B * next_n, padded), device=device, dtype=torch.float32)
+    sched = compute_paged_mqa_logits_schedule(seq_lens)
+    ret = fp4_paged_mqa_logits(
+        q_fp4,
+        q_sf,
+        kv_fused,
+        weights,
+        block_tables,
+        seq_lens,
+        max_ml,
+        output_dtype=torch.float32,
+        schedule_meta=sched,
+        out=out_buf,
+    )
+    assert ret.data_ptr() == out_buf.data_ptr()
+    valid = _valid_causal_mask(seq_lens, next_n, max_ml, device)
+    torch.testing.assert_close(ret.float()[valid], ref.float()[valid], atol=0, rtol=0)
+
+
+def test_fp8_input_validation():
+    """Guard rails: bad out= size, unsupported dtype, and non-int32/CPU inputs must raise."""
+    device = "cuda"
+    if not is_sm100a_supported(torch.device(device)):
+        pytest.skip(
+            "FP8 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
+
+    from flashinfer import padded_seq_len, fp8_paged_mqa_logits
+
+    B, next_n, ctx, block_size = 2, 1, 1024, 64
+    max_ml = ctx + 300  # deliberately not a 256 multiple so padded_max_seq_len > max_ml
+    q, kv_fused, w, cl, bt = _make_fp8_case(B, next_n, ctx, block_size, device)
+
+    # Undersized out= (max_ml columns instead of padded) → ValueError (prevents OOB)
+    bad_out = torch.empty((B * next_n, max_ml), device=device, dtype=torch.float32)
+    assert padded_seq_len(max_ml) > max_ml
+    with pytest.raises(ValueError, match="padded_seq_len"):
+        fp8_paged_mqa_logits(q, kv_fused, w, bt, cl, max_ml, out=bad_out)
+
+    # Unsupported output dtype for FP8
+    with pytest.raises(ValueError, match="float32, float16"):
+        fp8_paged_mqa_logits(
+            q, kv_fused, w, bt, cl, max_ml, output_dtype=torch.bfloat16
+        )
+
+    # CPU seq_lens → ValueError (kernel needs int32 CUDA)
+    with pytest.raises(ValueError, match="seq_lens"):
+        fp8_paged_mqa_logits(q, kv_fused, w, bt, cl.cpu(), max_ml)
+
+    # int64 block_tables → ValueError
+    with pytest.raises(ValueError, match="block_tables"):
+        fp8_paged_mqa_logits(q, kv_fused, w, bt.to(torch.int64), cl, max_ml)
+
+    # head_dim not a multiple of the MMA instruction K (32) → ValueError.
+    # Without this guard the kernel's `head_dim // 32` integer division would
+    # silently truncate the QK contraction (100 -> 96) and return wrong logits.
+    q_bad, kv_bad, w_bad, cl_bad, bt_bad = _make_fp8_case(
+        B, next_n, ctx, block_size, device, head_dim=100
+    )
+    with pytest.raises(ValueError, match="multiple of 32"):
+        fp8_paged_mqa_logits(q_bad, kv_bad, w_bad, bt_bad, cl_bad, max_ml)
+
+    # head_dim large enough to exceed the per-CTA SMEM budget → ValueError.
+    # Measured on sm_100a: head_dim=256 needs 249856 B vs a 232448 B cap, and
+    # without this check the launch fails with a bare cudaErrorInvalidValue.
+    q_big, kv_big, w_big, cl_big, bt_big = _make_fp8_case(
+        B, next_n, ctx, block_size, device, head_dim=256
+    )
+    with pytest.raises(ValueError, match="shared memory"):
+        fp8_paged_mqa_logits(q_big, kv_big, w_big, bt_big, cl_big, max_ml)
+
+    # block_size that does not divide the 128-token compute tile into <=4
+    # sub-blocks. Measured: 16 trips "num_blocks_per_mma=8 exceeds max 4" and
+    # 48 trips "block_kv=128 must be divisible by block_size=48", both bare
+    # kernel assertions without this check.
+    for bad_pbk in (16, 48):
+        q2, kv2, w2, cl2, bt2 = _make_fp8_case(B, next_n, ctx, 64, device)
+        kv_reshaped = torch.zeros(
+            (kv2.shape[0], bad_pbk, 1, kv2.shape[-1]),
+            dtype=kv2.dtype,
+            device=kv2.device,
+        )
+        with pytest.raises(ValueError, match="block_size"):
+            fp8_paged_mqa_logits(q2, kv_reshaped, w2, bt2, cl2, max_ml)
+
+    # next_n * num_heads outside the UMMA N-mode range [8, 256].
+    # Measured: next_n=5 at num_heads=64 gives N=320 -> opaque DSL OpError.
+    q3, kv3, w3, cl3, bt3 = _make_fp8_case(B, 5, ctx, block_size, device)
+    with pytest.raises(ValueError, match="N-mode"):
+        fp8_paged_mqa_logits(q3, kv3, w3, bt3, cl3, max_ml)
+
+
+def test_fp4_head_dim_num_heads_validation():
+    """FP4 hardcodes head_dim=128 / num_heads=64; the wrapper must say so clearly."""
+    device = "cuda"
+    if not is_sm100a_supported(torch.device(device)):
+        pytest.skip(
+            "FP4 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
+
+    from flashinfer import fp4_paged_mqa_logits
+
+    B, next_n, num_heads, block_size, ctx = 2, 1, 64, 64, 512
+    max_ml = 2048
+    seq_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
+    block_tables, ntb = _make_paged_kv(B, block_size, seq_lens, device)
+
+    def _case(head_dim, n_heads):
+        half_d = head_dim // 2
+        q = torch.zeros(B, next_n, n_heads, half_d, dtype=torch.uint8, device=device)
+        q_sf = torch.zeros(B, next_n, n_heads, dtype=torch.int32, device=device)
+        kv = torch.zeros(
+            ntb, block_size, 1, half_d + 4, dtype=torch.uint8, device=device
+        )
+        w = torch.randn(B * next_n, n_heads, device=device, dtype=torch.float32)
+        return q, q_sf, kv, w
+
+    # Wrong head_dim (64 instead of 128)
+    q, q_sf, kv, w = _case(64, num_heads)
+    with pytest.raises(ValueError, match="requires head_dim == 128"):
+        fp4_paged_mqa_logits(q, q_sf, kv, w, block_tables, seq_lens, max_ml)
+
+    # Wrong num_heads (32 instead of 64)
+    q, q_sf, kv, w = _case(128, 32)
+    with pytest.raises(ValueError, match="requires num_heads == 64"):
+        fp4_paged_mqa_logits(q, q_sf, kv, w, block_tables, seq_lens, max_ml)
+
+    # next_n beyond what the kernel supports (1-4).
+    q5 = torch.zeros(B, 5, num_heads, 64, dtype=torch.uint8, device=device)
+    sf5 = torch.zeros(B, 5, num_heads, dtype=torch.int32, device=device)
+    kv5 = torch.zeros(ntb, block_size, 1, 68, dtype=torch.uint8, device=device)
+    w5 = torch.randn(B * 5, num_heads, device=device, dtype=torch.float32)
+    with pytest.raises(ValueError, match="next_n"):
+        fp4_paged_mqa_logits(q5, sf5, kv5, w5, block_tables, seq_lens, max_ml)
+
+    # block_size not a valid sub-tiling of the 128-token compute tile.
+    q6, sf6, kv6, w6 = _case(128, num_heads)
+    kv_bad = torch.zeros(ntb, 48, 1, 68, dtype=torch.uint8, device=device)
+    with pytest.raises(ValueError, match="block_size"):
+        fp4_paged_mqa_logits(q6, sf6, kv_bad, w6, block_tables, seq_lens, max_ml)
+
+
+def test_block_table_width_contract(monkeypatch):
+    """block_tables must be at least the natural width ceil(ctx / block_size).
+
+    ctx=257 at block_size=64 occupies 5 blocks while the kernel walks 3
+    128-token compute tiles spanning 6 table columns.  The kernel predicates
+    each column on the row's own block count, so the natural 5-column table
+    (what a serving stack emits) is accepted and runs, and only a table
+    narrower than 5 is rejected.  The bound needs the per-row seq_lens from
+    device memory, so the check is opt-in behind FLASHINFER_VALIDATE_INPUTS.
+    Regression for PR #4365 review r3824399380 and the block-table width
+    thread on PR #4737.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import (
+        fp4_paged_mqa_logits,
+        fp8_paged_mqa_logits,
+        min_block_table_width,
+    )
+    from flashinfer.attn_scores.attn_scores import _validate_paged_bounds
+
+    device = "cuda"
+    B, H, D, block_size = 2, 64, 128, 64
+    ctx = 257  # deliberately not a multiple of the 128-token compute tile
+    natural = -(-ctx // block_size)  # 5 -- what a serving stack allocates
+    tile_cols = -(-ctx // 128) * (128 // block_size)  # 6 -- what the tiles span
+    assert (natural, tile_cols) == (5, 6), "test premise: ctx exposes the gap"
+    assert min_block_table_width(ctx, block_size) == natural
+
+    seq_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
+    narrow = torch.zeros((B, natural - 1), dtype=torch.int32, device=device)
+    table = torch.zeros((B, natural), dtype=torch.int32, device=device)
+
+    # Default (unset): no sync, no check. Exercise the validator directly rather
+    # than launching -- a narrow table would genuinely read out of bounds.
+    monkeypatch.delenv("FLASHINFER_VALIDATE_INPUTS", raising=False)
+    assert (
+        _validate_paged_bounds(narrow, seq_lens, ctx, block_size, B * natural, "x")
+        is None
+    )
+
+    monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
+    ntb = B * natural
+    w = torch.zeros(B * 1, H, device=device, dtype=torch.float32)
+
+    q8 = torch.zeros(B, 1, H, D, device=device).to(torch.float8_e4m3fn)
+    kv8 = torch.zeros(ntb, block_size, 1, D + 4, dtype=torch.uint8, device=device)
+    with pytest.raises(
+        ValueError, match=r"block_tables has 4 columns.*occupies 5 blocks"
+    ):
+        fp8_paged_mqa_logits(q8, kv8, w, narrow, seq_lens, ctx)
+    fp8_paged_mqa_logits(q8, kv8, w, table, seq_lens, ctx)  # natural width runs
+
+    q4 = torch.zeros(B, 1, H, D // 2, dtype=torch.uint8, device=device)
+    sf4 = torch.zeros(B, 1, H, dtype=torch.int32, device=device)
+    kv4 = torch.zeros(ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device)
+    with pytest.raises(
+        ValueError, match=r"block_tables has 4 columns.*occupies 5 blocks"
+    ):
+        fp4_paged_mqa_logits(
+            q4, sf4, kv4, w, narrow, seq_lens, ctx, output_dtype=torch.bfloat16
+        )
+    fp4_paged_mqa_logits(
+        q4, sf4, kv4, w, table, seq_lens, ctx, output_dtype=torch.bfloat16
+    )
+
+    # Lives in the API body, so skip_check=True must not bypass it.
+    with pytest.raises(ValueError, match=r"block_tables has 4 columns"):
+        fp8_paged_mqa_logits(q8, kv8, w, narrow, seq_lens, ctx, skip_check=True)
+
+    # max_seq_len being much larger than ctx must NOT tighten the bound.
+    fp8_paged_mqa_logits(q8, kv8, w, table, seq_lens, ctx * 8)
+
+
+def _natural_width_serving_case(variant, device):
+    """SGLang-shaped inputs for the block-table width contract.
+
+    seq_lens = [129, 257, 385] at block_size=64 occupy [3, 5, 7] blocks, so the
+    conventional table -- ceil(max(seq_lens) / block_size) = 7 columns, what a
+    serving stack's metadata emits -- is [3, 7].  The kernel walks [2, 3, 4]
+    128-token compute tiles spanning [4, 6, 8] columns: every row's last tile
+    spans a column past the row's blocks, and the longest row is LAST so a
+    tile-granular reader would run one entry past the 84-byte allocation
+    (memcheck on the unpredicated kernel: "Invalid __global__ read of size 4
+    ... 1 bytes after the nearest allocation ... of size 84 bytes").  Shorter
+    rows' trailing entries are an out-of-pool sentinel, so any read of them
+    is caught by the debug validator (which checks exactly the entries the
+    kernel reads) or by memcheck.
+
+    Returns ``(call, ref, seq_lens, next_n, max_seq_len)``; ``call(**kw)``
+    runs the public API (float32 output) and ``ref`` is the torch reference.
+    """
+    from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits
+
+    torch.manual_seed(7)
+    H, D, block_size, next_n = 64, 128, 64, 2
+    seq_lens = torch.tensor([129, 257, 385], dtype=torch.int32, device=device)
+    B, max_seq_len = seq_lens.numel(), 385
+    lens = seq_lens.tolist()
+    n_blk = [-(-c // block_size) for c in lens]  # [3, 5, 7]
+    tile_cols = [-(-c // 128) * (128 // block_size) for c in lens]  # [4, 6, 8]
+    assert (n_blk, tile_cols) == ([3, 5, 7], [4, 6, 8]), "test premise"
+    width = max(n_blk)
+    num_blocks = sum(n_blk)
+    pool = torch.randperm(num_blocks, dtype=torch.int32, device=device)
+    SENTINEL = 2**30  # far outside the pool; never read by the kernel
+    block_tables = torch.full((B, width), SENTINEL, dtype=torch.int32, device=device)
+    off = 0
+    for r, nb in enumerate(n_blk):
+        block_tables[r, :nb] = pool[off : off + nb]
+        off += nb
+    weights = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+
+    if variant == "fp8":
+        q = torch.randn(B, next_n, H, D, device=device).to(torch.float8_e4m3fn)
+        kv_f32 = torch.randn(num_blocks, block_size, D, device=device)
+        scale = _ceil_to_ue8m0_fp(
+            kv_f32.abs().amax(-1, keepdim=True).clamp(1e-4) / 448.0
+        ).squeeze(-1)
+        kv_fp8 = (kv_f32 / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+        kv_fused = _make_fused_kv_fp8(kv_fp8, scale, block_size, D)
+        ref = _ref_fp8_paged_mqa_logits(
+            q, kv_fp8, scale, weights, seq_lens, block_tables, max_seq_len, block_size
+        )
+
+        def call(**kw):
+            return fp8_paged_mqa_logits(
+                q, kv_fused, weights, block_tables, seq_lens, max_seq_len, **kw
+            )
+
+    else:
+        q_bf = torch.randn(B, next_n, H, D, device=device, dtype=torch.bfloat16)
+        qp, sfp = _per_token_cast_to_fp4(q_bf.view(-1, D), gran_k=32)
+        q = qp.view(torch.uint8).view(B, next_n, H, D // 2)
+        q_sf = sfp.view(torch.int32).view(B, next_n, H)
+        q_sim = _cast_back_from_fp4(qp, sfp, gran_k=32).view(B, next_n, H, D)
+        kv_cache = torch.randn(
+            num_blocks, block_size, 1, D, device=device, dtype=torch.bfloat16
+        )
+        kv_fused, kv_sim = _kv_cache_cast_to_fp4(kv_cache)
+        ref = _ref_fp4_paged_mqa_logits(
+            q_sim.float(), kv_sim.float(), weights, seq_lens, block_tables, max_seq_len
+        )
+
+        def call(**kw):
+            return fp4_paged_mqa_logits(
+                q,
+                q_sf,
+                kv_fused,
+                weights,
+                block_tables,
+                seq_lens,
+                max_seq_len,
+                output_dtype=torch.float32,
+                **kw,
+            )
+
+    return call, ref, seq_lens, next_n, max_seq_len
+
+
+@pytest.mark.parametrize("variant", ["fp8", "fp4"])
+def test_natural_width_block_table_serving_layout(variant, monkeypatch):
+    """A block table of the conventional serving width ceil(seq_len / block_size)
+    with lengths that are not multiples of the compute tile is accepted and
+    computes correctly, eagerly with FLASHINFER_VALIDATE_INPUTS=1 and under
+    CUDA-graph replay.
+
+    SGLang's DSV4 metadata emits exactly this width (raw length 1028 ->
+    seq_len 257 at block size 64 -> 5 entries); the unpredicated kernel read a
+    sixth.  See _natural_width_serving_case for the shape.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import padded_seq_len
+
+    device = "cuda"
+    call, ref, seq_lens, next_n, max_seq_len = _natural_width_serving_case(
+        variant, device
+    )
+    valid = _valid_causal_mask(seq_lens, next_n, max_seq_len, device)
+
+    # Debug validation accepts the natural width and ignores the sentinel
+    # entries, because it checks exactly the entries the kernel reads.
+    monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
+    eager = call().clone()
+    torch.cuda.synchronize()
+    assert torch.isfinite(eager[valid]).all(), "non-finite logits in the valid region"
+    torch.testing.assert_close(eager[valid], ref[valid].float(), atol=5e-5, rtol=1e-5)
+    monkeypatch.delenv("FLASHINFER_VALIDATE_INPUTS")
+
+    # The same natural-width table captured in a CUDA graph (no validation is
+    # possible there, so the kernel's own predication is all that protects it).
+    out = torch.empty(
+        (seq_lens.numel() * next_n, padded_seq_len(max_seq_len)),
+        dtype=torch.float32,
+        device=device,
+    )
+    call(out=out)  # warm-up outside capture
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        res = call(out=out)
+    out.fill_(float("nan"))
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(res[valid], eager[valid])
+
+
+@pytest.mark.parametrize("variant", ["fp8", "fp4"])
+def test_natural_width_block_table_memcheck(variant):
+    """compute-sanitizer memcheck: the kernel reads nothing past a natural-width
+    block table.  Before the per-column predication it over-read 4 bytes past
+    the 84-byte allocation of the longest-last row in
+    _natural_width_serving_case (and the read landed on the next row's entry
+    for interior rows).
+
+    Opt-in -- FLASHINFER_MEMCHECK_TESTS=1 with compute-sanitizer available --
+    because it spawns the sanitizer, which not every CI image has, and a
+    regression does not fail cleanly: memcheck turns the over-read into a
+    launch failure whose teardown wedges until the timeout.  With the kernels
+    cached a passing run takes about ten seconds.  Every tensor is its own
+    cudaMalloc (PYTORCH_NO_CUDA_MEMORY_CACHING) so the over-read is visible at
+    the allocation boundary.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+    if os.environ.get("FLASHINFER_MEMCHECK_TESTS", "0") in ("0", ""):
+        pytest.skip(
+            "opt-in: set FLASHINFER_MEMCHECK_TESTS=1 (spawns compute-sanitizer)"
+        )
+    sanitizer = (
+        shutil.which("compute-sanitizer") or "/usr/local/cuda/bin/compute-sanitizer"
+    )
+    if not os.path.exists(sanitizer):
+        pytest.skip("compute-sanitizer not found")
+
+    import flashinfer
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(flashinfer.__file__)))
+    tests_dir = os.path.dirname(os.path.abspath(__file__))
+    code = (
+        f"import sys, torch; sys.path.insert(0, {tests_dir!r}); "
+        "from test_attn_scores import _natural_width_serving_case; "
+        f"call, *_ = _natural_width_serving_case({variant!r}, 'cuda'); "
+        "call(); torch.cuda.synchronize(); print('MEMCHECK_CASE_RAN')"
+    )
+    env = dict(os.environ)
+    env["PYTORCH_NO_CUDA_MEMORY_CACHING"] = "1"
+    env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.run(
+        [
+            sanitizer,
+            "--tool",
+            "memcheck",
+            "--print-limit",
+            "3",
+            sys.executable,
+            "-c",
+            code,
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    report = proc.stdout + proc.stderr
+    assert "MEMCHECK_CASE_RAN" in report, report[-3000:]
+    assert "ERROR SUMMARY: 0 errors" in report, report[-3000:]
+
+
+@pytest.mark.parametrize("variant", ["fp8", "fp4"])
+@pytest.mark.parametrize("next_n", [3, 4])
+def test_defined_output_region_fully_written_at_tile_boundary(variant, next_n):
+    """Every cell the API defines is written at seq_len=257, one past a compute
+    tile: row b*next_n + t through position seq_lens[b] - next_n + t.
+
+    The boundary is where the fp4 next_n=4 split on SM100/SM103 differs from
+    the direct path: a request's two leading rows run as an atom with context
+    255, cover two 128-token tiles instead of three, and never write column
+    256 -- which lies in their causal tail (unspecified by contract), not in
+    their defined region.  A NaN prefill of out= makes an unwritten defined
+    cell unmistakable, where torch.empty would hide it behind stale data.  The
+    benchmark's finiteness self-check relies on exactly this contract.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits, padded_seq_len
+
+    device = "cuda"
+    B, H, D, block_size, ctx = 2, 64, 128, 64, 257
+    torch.manual_seed(3)
+    if variant == "fp8":
+        q, kv, w, seq_lens, block_tables = _make_fp8_case(
+            B, next_n, ctx, block_size, device
+        )
+        dtype = torch.float32
+
+        def call(o):
+            return fp8_paged_mqa_logits(q, kv, w, block_tables, seq_lens, ctx, out=o)
+
+    else:
+        seq_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
+        block_tables, ntb = _make_paged_kv(B, block_size, seq_lens, device)
+        w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+        q_bf = torch.randn(B, next_n, H, D, device=device, dtype=torch.bfloat16)
+        qp, sfp = _per_token_cast_to_fp4(q_bf.view(-1, D), gran_k=32)
+        q = qp.view(torch.uint8).view(B, next_n, H, D // 2)
+        q_sf = sfp.view(torch.int32).view(B, next_n, H)
+        kv, _ = _kv_cache_cast_to_fp4(
+            torch.randn(ntb, block_size, 1, D, device=device, dtype=torch.bfloat16)
+        )
+        dtype = torch.bfloat16
+
+        def call(o):
+            return fp4_paged_mqa_logits(
+                q, q_sf, kv, w, block_tables, seq_lens, ctx, output_dtype=dtype, out=o
+            )
+
+    out = torch.full(
+        (B * next_n, padded_seq_len(ctx)), float("nan"), dtype=dtype, device=device
+    )
+    res = call(out)
+    torch.cuda.synchronize()
+    defined = _valid_causal_mask(seq_lens, next_n, ctx, device)
+    assert torch.isfinite(res.float()[defined]).all(), (
+        "an API-defined output cell was left unwritten or is non-finite"
+    )
+
+
+def test_max_seq_len_bound(monkeypatch):
+    """max_seq_len must be >= max(seq_lens), or the kernel writes OOB.
+
+    The output row is sized from max_seq_len while the schedule is derived
+    from seq_lens; seq_lens=[257] with max_seq_len=256 allocates 256
+    columns but schedules splits reaching 512, and the store is unconditional.
+    Checked under FLASHINFER_VALIDATE_INPUTS since the bound needs the per-row
+    lengths from device memory. Regression for PR #4365 review r3824481310.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits
+    from flashinfer.attn_scores.attn_scores import _validate_paged_bounds
+
+    device = "cuda"
+    B, H, D, block_size = 1, 64, 128, 64
+    ctx, max_ml = 257, 256  # the reviewer's example: schedule reaches 512
+
+    seq_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
+    width = -(-ctx // 128) * (128 // block_size)
+    block_tables = torch.zeros((B, width), dtype=torch.int32, device=device)
+    ntb = B * width
+    w = torch.zeros(B * 1, H, device=device, dtype=torch.float32)
+
+    # Default (unset): no sync, no check -- exercise the validator directly
+    # rather than launching, which would genuinely write out of bounds.
+    monkeypatch.delenv("FLASHINFER_VALIDATE_INPUTS", raising=False)
+    assert (
+        _validate_paged_bounds(block_tables, seq_lens, max_ml, block_size, ntb, "x")
+        is None
+    )
+
+    monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
+    q8 = torch.zeros(B, 1, H, D, device=device).to(torch.float8_e4m3fn)
+    kv8 = torch.zeros(ntb, block_size, 1, D + 4, dtype=torch.uint8, device=device)
+    with pytest.raises(ValueError, match=r"max_seq_len \(256\) must be at least"):
+        fp8_paged_mqa_logits(q8, kv8, w, block_tables, seq_lens, max_ml)
+
+    q4 = torch.zeros(B, 1, H, D // 2, dtype=torch.uint8, device=device)
+    sf4 = torch.zeros(B, 1, H, dtype=torch.int32, device=device)
+    kv4 = torch.zeros(ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device)
+    with pytest.raises(ValueError, match=r"max_seq_len \(256\) must be at least"):
+        fp4_paged_mqa_logits(
+            q4,
+            sf4,
+            kv4,
+            w,
+            block_tables,
+            seq_lens,
+            max_ml,
+            output_dtype=torch.bfloat16,
+        )
+
+    # skip_check=True must not bypass it (silent OOB write).
+    with pytest.raises(ValueError, match=r"max_seq_len \(256\) must be at least"):
+        fp8_paged_mqa_logits(
+            q8, kv8, w, block_tables, seq_lens, max_ml, skip_check=True
+        )
+
+    # Raising max_seq_len to the real length makes it legal again.
+    fp8_paged_mqa_logits(q8, kv8, w, block_tables, seq_lens, ctx)
+
+    # Ragged lengths: only the longest row matters.
+    ragged = torch.tensor([64, 257], dtype=torch.int32, device=device)
+    bt2 = torch.zeros((2, width), dtype=torch.int32, device=device)
+    q8b = torch.zeros(2, 1, H, D, device=device).to(torch.float8_e4m3fn)
+    wb = torch.zeros(2, H, device=device, dtype=torch.float32)
+    with pytest.raises(ValueError, match=r"max\(seq_lens\) \(257\)"):
+        fp8_paged_mqa_logits(q8b, kv8, wb, bt2, ragged, max_ml)
+
+
+@pytest.mark.parametrize("variant", ["fp8", "fp4"])
+def test_schedule_meta_graph_replay_across_split_boundary(variant):
+    """A captured graph must recompute schedule_meta when lengths cross 256.
+
+    The schedule is a function of the whole ceil(seq_lens/256) vector, so a
+    sequence moving 256 <-> 257 changes it while every shape stays identical.
+    Capture the recomputation into the same static buffer ahead of the kernel,
+    then replay in both directions and compare against a freshly scheduled
+    reference. Regression for PR #4365 review r3824580059.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import (
+        compute_paged_mqa_logits_schedule,
+        fp4_paged_mqa_logits,
+        fp8_paged_mqa_logits,
+        padded_seq_len,
+    )
+
+    device = "cuda"
+    torch.manual_seed(11)
+    B, next_n, H, D, block_size = 2, 1, 64, 128, 64
+    max_ml = 1024
+
+    # static buffers: addresses fixed for the lifetime of the graph
+    seq_lens = torch.full((B,), 256, dtype=torch.int32, device=device)
+    sched = compute_paged_mqa_logits_schedule(seq_lens, device=device)
+    block_tables, ntb = _make_paged_kv(
+        B,
+        block_size,
+        torch.full((B,), max_ml, dtype=torch.int32, device=device),
+        device,
+    )
+    out = torch.empty(
+        (B * next_n, padded_seq_len(max_ml)),
+        device=device,
+        dtype=torch.float32 if variant == "fp8" else torch.bfloat16,
+    )
+    w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+
+    if variant == "fp8":
+        q = torch.randn(B, next_n, H, D, device=device).to(torch.float8_e4m3fn)
+        kv_f32 = torch.randn(ntb, block_size, D, device=device)
+        scale = _ceil_to_ue8m0_fp(
+            kv_f32.abs().amax(-1, keepdim=True).clamp(1e-4) / 448.0
+        ).squeeze(-1)
+        kv = _make_fused_kv_fp8(
+            (kv_f32 / scale.unsqueeze(-1)).to(torch.float8_e4m3fn), scale, block_size, D
+        )
+
+        def launch():
+            compute_paged_mqa_logits_schedule(seq_lens, device=device, out=sched)
+            return fp8_paged_mqa_logits(
+                q,
+                kv,
+                w,
+                block_tables,
+                seq_lens,
+                max_ml,
+                schedule_meta=sched,
+                out=out,
+            )
+    else:
+        q_bf = torch.randn(B, next_n, H, D, device=device, dtype=torch.bfloat16)
+        qp, sfp = _per_token_cast_to_fp4(q_bf.view(-1, D), gran_k=32)
+        q = qp.view(torch.uint8).view(B, next_n, H, D // 2)
+        q_sf = sfp.view(torch.int32).view(B, next_n, H)
+        kv, _ = _kv_cache_cast_to_fp4(
+            torch.randn(ntb, block_size, 1, D, device=device, dtype=torch.bfloat16)
+        )
+
+        def launch():
+            compute_paged_mqa_logits_schedule(seq_lens, device=device, out=sched)
+            return fp4_paged_mqa_logits(
+                q,
+                q_sf,
+                kv,
+                w,
+                block_tables,
+                seq_lens,
+                max_ml,
+                output_dtype=torch.bfloat16,
+                schedule_meta=sched,
+                out=out,
+            )
+
+    # capture with the schedule recomputation INSIDE the graph
+    st = torch.cuda.Stream()
+    st.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(st):
+        for _ in range(3):
+            launch()
+    torch.cuda.current_stream().wait_stream(st)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        launch()
+    torch.cuda.synchronize()
+
+    # 256 -> 257 (grow across the boundary) and 257 -> 256 (shrink back)
+    for new_len in (257, 256, 257, 256):
+        seq_lens.fill_(new_len)
+        g.replay()
+        torch.cuda.synchronize()
+        replayed = out[:, :new_len].clone()
+
+        ref_sched = compute_paged_mqa_logits_schedule(seq_lens, device=device)
+        ref_out = torch.empty_like(out)
+        if variant == "fp8":
+            fp8_paged_mqa_logits(
+                q,
+                kv,
+                w,
+                block_tables,
+                seq_lens,
+                max_ml,
+                schedule_meta=ref_sched,
+                out=ref_out,
+            )
+        else:
+            fp4_paged_mqa_logits(
+                q,
+                q_sf,
+                kv,
+                w,
+                block_tables,
+                seq_lens,
+                max_ml,
+                output_dtype=torch.bfloat16,
+                schedule_meta=ref_sched,
+                out=ref_out,
+            )
+        torch.cuda.synchronize()
+        assert torch.equal(replayed, ref_out[:, :new_len]), (
+            f"{variant}: replay at ctx={new_len} disagrees with a fresh schedule"
+        )
+
+
+def test_stale_schedule_meta_detected(monkeypatch):
+    """A stale schedule_meta is reported instead of hanging the kernel.
+
+    Reusing a schedule built for a different ceil(seq_lens/256) vector makes
+    the persistent kernel's exact-equality termination unreachable. Under
+    FLASHINFER_VALIDATE_INPUTS the mismatch is caught before launch. Regression
+    for PR #4365 review r3824550881.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import compute_paged_mqa_logits_schedule, fp8_paged_mqa_logits
+
+    device = "cuda"
+    B, H, D, block_size, max_ml = 1, 64, 128, 64, 1024
+    width = -(-max_ml // 128) * (128 // block_size)
+    block_tables = torch.zeros((B, width), dtype=torch.int32, device=device)
+    ntb = B * width
+    q = torch.zeros(B, 1, H, D, device=device).to(torch.float8_e4m3fn)
+    kv = torch.zeros(ntb, block_size, 1, D + 4, dtype=torch.uint8, device=device)
+    w = torch.zeros(B, H, device=device, dtype=torch.float32)
+
+    cl_257 = torch.full((B,), 257, dtype=torch.int32, device=device)
+    cl_256 = torch.full((B,), 256, dtype=torch.int32, device=device)
+    stale = compute_paged_mqa_logits_schedule(cl_257, device=device)
+    assert not torch.equal(
+        stale, compute_paged_mqa_logits_schedule(cl_256, device=device)
+    ), "test premise: 256 and 257 must schedule differently"
+
+    monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
+    with pytest.raises(ValueError, match="schedule_meta does not match seq_lens"):
+        fp8_paged_mqa_logits(
+            q, kv, w, block_tables, cl_256, max_ml, schedule_meta=stale
+        )
+
+    # the matching schedule is accepted
+    fp8_paged_mqa_logits(
+        q,
+        kv,
+        w,
+        block_tables,
+        cl_256,
+        max_ml,
+        schedule_meta=compute_paged_mqa_logits_schedule(cl_256, device=device),
+    )
+
+
+@pytest.mark.parametrize("variant", ["fp8", "fp4"])
+def test_oversized_out_returns_exact_rows(variant):
+    """An oversized out= must return exactly batch_size*next_n rows.
+
+    A shared max-batch buffer is the CUDA-graph pattern: one address-stable
+    allocation reused across captures of different batch sizes. Returning all
+    capacity rows would hand a consumer that derives its batch from
+    scores.shape[0] both the wrong row count and stale values. Regression for
+    PR #4365 review r3824692495.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import (
+        fp4_paged_mqa_logits,
+        fp8_paged_mqa_logits,
+        padded_seq_len,
+    )
+
+    device = "cuda"
+    torch.manual_seed(5)
+    B, next_n, H, D, block_size, ctx = 2, 1, 64, 128, 64, 512
+    MAX_B = 8  # buffer sized for the largest capture
+    rows = B * next_n
+
+    seq_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
+    block_tables, ntb = _make_paged_kv(B, block_size, seq_lens, device)
+    w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+    padded = padded_seq_len(ctx)
+    dtype = torch.float32 if variant == "fp8" else torch.bfloat16
+    SENTINEL = -12345.0
+
+    if variant == "fp8":
+        q = torch.randn(B, next_n, H, D, device=device).to(torch.float8_e4m3fn)
+        kv_f32 = torch.randn(ntb, block_size, D, device=device)
+        scale = _ceil_to_ue8m0_fp(
+            kv_f32.abs().amax(-1, keepdim=True).clamp(1e-4) / 448.0
+        ).squeeze(-1)
+        kv = _make_fused_kv_fp8(
+            (kv_f32 / scale.unsqueeze(-1)).to(torch.float8_e4m3fn), scale, block_size, D
+        )
+        call = lambda o: fp8_paged_mqa_logits(  # noqa: E731
+            q, kv, w, block_tables, seq_lens, ctx, out=o
+        )
+    else:
+        q_bf = torch.randn(B, next_n, H, D, device=device, dtype=torch.bfloat16)
+        qp, sfp = _per_token_cast_to_fp4(q_bf.view(-1, D), gran_k=32)
+        q = qp.view(torch.uint8).view(B, next_n, H, D // 2)
+        q_sf = sfp.view(torch.int32).view(B, next_n, H)
+        kv, _ = _kv_cache_cast_to_fp4(
+            torch.randn(ntb, block_size, 1, D, device=device, dtype=torch.bfloat16)
+        )
+        call = lambda o: fp4_paged_mqa_logits(  # noqa: E731
+            q,
+            q_sf,
+            kv,
+            w,
+            block_tables,
+            seq_lens,
+            ctx,
+            output_dtype=torch.bfloat16,
+            out=o,
+        )
+
+    big = torch.full((MAX_B * next_n, padded), SENTINEL, device=device, dtype=dtype)
+    res = call(big)
+
+    assert res.shape == (rows, ctx), (
+        f"expected exactly {rows} rows, got {tuple(res.shape)}"
+    )
+    assert res.data_ptr() == big.data_ptr(), "must stay a view of the caller's buffer"
+
+    # rows past the real batch are left alone -- nothing stale is exposed
+    assert torch.all(big[rows:] == SENTINEL), "surplus rows must not be written"
+
+    # an exactly-sized buffer gives the same values
+    exact = torch.empty((rows, padded), device=device, dtype=dtype)
+    assert torch.equal(res, call(exact))
+
+
+@pytest.mark.parametrize("variant", ["fp8", "fp4"])
+@pytest.mark.parametrize("preallocated_out", [False, True])
+@pytest.mark.parametrize("next_n", [1, 4])
+def test_empty_batch_returns_without_launching(variant, preallocated_out, next_n):
+    """B == 0 returns an empty result without scheduling, compiling or launching.
+
+    The persistent kernel's grid is num_sms regardless of batch size, and each
+    CTA's prologue clamps with min(start_q, batch_size - 1) -- which is -1 for an
+    empty batch, an out-of-bounds read of an empty mContextLens (reproduced as a
+    CUDA illegal memory access before this guard existed).
+
+    Both "did not schedule" and "did not compile" are checked directly rather
+    than by patching:
+      * a well-formed but content-garbage schedule_meta is passed.  Its shape/
+        dtype/device pass the always-on buffer validation (which now runs even
+        at B == 0, like out=), but launching with those garbage boundaries
+        would hang the persistent kernel -- returning cleanly proves the
+        schedule/launch path was skipped.
+      * the compile entry points are functools-cached, so cache_info() moving
+        would mean the compile path was entered.
+
+    Regression for PR #4365 review r3824960307.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import (
+        fp4_paged_mqa_logits,
+        fp8_paged_mqa_logits,
+        padded_seq_len,
+    )
+    from flashinfer.attn_scores.attn_scores import (
+        _cached_compile_fp4_kernel,
+        _cached_compile_fp8_kernel,
+        _cached_num_sms,
+    )
+
+    device = "cuda"
+    H, D, block_size, ctx = 64, 128, 64, 256
+
+    seq_lens = torch.zeros((0,), dtype=torch.int32, device=device)
+    block_tables = torch.zeros((0, 4), dtype=torch.int32, device=device)
+    w = torch.zeros(0, H, device=device, dtype=torch.float32)
+    dtype = torch.float32 if variant == "fp8" else torch.bfloat16
+
+    # Well-formed shape/dtype/device (so it passes the always-on buffer
+    # validation) but garbage contents: launching with it would hang, so a
+    # clean return proves the schedule/launch path was skipped.
+    num_sms = _cached_num_sms(0)
+    bad_schedule = torch.full(
+        (num_sms + 1, 2), 123_456_789, dtype=torch.int32, device=device
+    )
+    schedule_arg = bad_schedule
+
+    out = None
+    if preallocated_out:
+        out = torch.empty((0, padded_seq_len(ctx)), device=device, dtype=dtype)
+
+    compile_fn = (
+        _cached_compile_fp8_kernel if variant == "fp8" else _cached_compile_fp4_kernel
+    )
+    before = compile_fn.cache_info()
+
+    if variant == "fp8":
+        q = torch.zeros(0, next_n, H, D, device=device).to(torch.float8_e4m3fn)
+        kv = torch.zeros(4, block_size, 1, D + 4, dtype=torch.uint8, device=device)
+        res = fp8_paged_mqa_logits(
+            q,
+            kv,
+            w,
+            block_tables,
+            seq_lens,
+            ctx,
+            schedule_meta=schedule_arg,
+            out=out,
+        )
+    else:
+        q = torch.zeros(0, next_n, H, D // 2, dtype=torch.uint8, device=device)
+        q_sf = torch.zeros(0, next_n, H, dtype=torch.int32, device=device)
+        kv = torch.zeros(4, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device)
+        res = fp4_paged_mqa_logits(
+            q,
+            q_sf,
+            kv,
+            w,
+            block_tables,
+            seq_lens,
+            ctx,
+            output_dtype=torch.bfloat16,
+            schedule_meta=schedule_arg,
+            out=out,
+        )
+    torch.cuda.synchronize()
+
+    assert res.shape == (0, ctx), f"expected (0, {ctx}), got {tuple(res.shape)}"
+    assert res.dtype == dtype
+    assert res.device.type == "cuda"
+    if preallocated_out:
+        assert res.data_ptr() == out.data_ptr(), "should be a view of out="
+
+    after = compile_fn.cache_info()
+    assert (after.hits, after.misses) == (before.hits, before.misses), (
+        "the compile path was entered for an empty batch"
+    )
+
+
+def test_empty_batch_still_validates_out():
+    """The empty-batch short-circuit sits after out= validation, not before.
+
+    A malformed out= must still be rejected when B == 0; otherwise the guard
+    would silently accept buffers it never checks.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import fp8_paged_mqa_logits, padded_seq_len
+
+    device = "cuda"
+    H, D, block_size, ctx = 64, 128, 64, 256
+    seq_lens = torch.zeros((0,), dtype=torch.int32, device=device)
+    block_tables = torch.zeros((0, 4), dtype=torch.int32, device=device)
+    w = torch.zeros(0, H, device=device, dtype=torch.float32)
+    q = torch.zeros(0, 1, H, D, device=device).to(torch.float8_e4m3fn)
+    kv = torch.zeros(4, block_size, 1, D + 4, dtype=torch.uint8, device=device)
+
+    wrong_dtype = torch.empty(
+        (0, padded_seq_len(ctx)), device=device, dtype=torch.float16
+    )
+    with pytest.raises(ValueError, match="out.dtype"):
+        fp8_paged_mqa_logits(q, kv, w, block_tables, seq_lens, ctx, out=wrong_dtype)
+
+    too_narrow = torch.empty((0, 8), device=device, dtype=torch.float32)
+    with pytest.raises(ValueError, match="out must be at least"):
+        fp8_paged_mqa_logits(q, kv, w, block_tables, seq_lens, ctx, out=too_narrow)
+
+    # A malformed caller-supplied schedule_meta is likewise validated at B == 0:
+    # a buffer that cannot be right at any batch size fails immediately.
+    bad_schedule = torch.zeros((3, 2), dtype=torch.int32, device=device)
+    with pytest.raises(ValueError, match="schedule_meta must have shape"):
+        fp8_paged_mqa_logits(
+            q, kv, w, block_tables, seq_lens, ctx, schedule_meta=bad_schedule
+        )
+
+
+def test_api_rejects_malformed_ranks_and_dtypes():
+    """Wrong-rank q / kv_fused and non-uint8 kv_fused get curated errors.
+
+    Before these guards a 3-D q died on the checker's tuple unpack ("not
+    enough values to unpack"), naming neither the argument nor the fix, and a
+    wrong-dtype kv_fused passed every curated check only to fail post-JIT at
+    the FFI boundary with a bare dtype error.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits
+
+    device = "cuda"
+    H, D, block_size, ctx = 64, 128, 64, 256
+    cl = torch.full((2,), ctx, dtype=torch.int32, device=device)
+    bt = torch.zeros((2, 4), dtype=torch.int32, device=device)
+    w = torch.zeros(2, H, device=device, dtype=torch.float32)
+    kv = torch.zeros(8, block_size, 1, D + 4, dtype=torch.uint8, device=device)
+
+    q3 = torch.zeros(2, H, D, device=device).to(torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match=r"q must be 4-D.*unsqueeze"):
+        fp8_paged_mqa_logits(q3, kv, w, bt, cl, ctx)
+
+    q4_fp4 = torch.zeros(2, H, D // 2, dtype=torch.uint8, device=device)
+    sf = torch.zeros(2, 1, H, dtype=torch.int32, device=device)
+    kv4 = torch.zeros(8, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device)
+    with pytest.raises(ValueError, match=r"q must be 4-D"):
+        fp4_paged_mqa_logits(q4_fp4, sf, kv4, w, bt, cl, ctx)
+
+    q = torch.zeros(2, 1, H, D, device=device).to(torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="kv_fused must be 4-D"):
+        fp8_paged_mqa_logits(q, kv.flatten(1), w, bt, cl, ctx)
+    with pytest.raises(ValueError, match="kv_fused must be uint8"):
+        fp8_paged_mqa_logits(
+            q,
+            torch.zeros(8, block_size, 1, D + 4, dtype=torch.float16, device=device),
+            w,
+            bt,
+            cl,
+            ctx,
+        )
+
+    # A column-strided table (inner stride != 1) is rejected with the fix, not
+    # a bare FFI error; row-strided views are accepted (see
+    # test_index_tensors_row_strided_views).
+    bt_noncontig = torch.zeros((4, 2), dtype=torch.int32, device=device).t()
+    with pytest.raises(ValueError, match="innermost stride must be 1"):
+        fp8_paged_mqa_logits(q, kv, w, bt_noncontig, cl, ctx)
+
+
+@pytest.mark.parametrize("variant", ["fp8", "fp4"])
+@pytest.mark.parametrize("offset", [0, 1])
+def test_index_tensors_row_strided_views(variant, offset):
+    """Row-strided block_tables and strided seq_lens views are accepted
+    zero-copy and give bit-identical logits to the compact tensors.
+
+    This is the serving shape SGLang produces for speculative verification: a
+    table with one row per draft token, de-expanded for this API with
+    block_tables[::next_n] (unit inner stride, row stride next_n*W) and
+    seq_lens[::next_n] (stride next_n).  The kernels read both only through
+    their layouts with scalar loads, so the API must not demand a copy the
+    kernel does not need.  offset=1 shifts the view's base by W*4 = 24 bytes
+    (not 16-byte aligned), pinning that no stronger alignment is assumed on
+    the index tensors.  Against the old code the call raised 'must be
+    contiguous' before any launch; if only the Python check were relaxed and
+    the compiled declaration stayed compact, request 1 would read request 0's
+    blocks and the bit-exact comparison would fail on its rows.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits
+    from flashinfer.attn_scores.attn_scores import min_block_table_width
+
+    device = "cuda"
+    torch.manual_seed(3)
+    B, next_n, H, D, block_size, ctx = 2, 2, 64, 128, 64, 300
+    seq_lens = torch.tensor([257, 300], dtype=torch.int32, device=device)
+    W = min_block_table_width(ctx, block_size)  # 6 -> W*4 = 24 B row shift
+    num_blocks = B * W
+    bt = torch.arange(num_blocks, dtype=torch.int32, device=device).view(B, W)
+    w = torch.rand(B * next_n, H, device=device)
+    if variant == "fp8":
+        kv_vals = torch.randn(num_blocks, block_size, D, device=device).to(
+            torch.float8_e4m3fn
+        )
+        kv_scales = torch.rand(num_blocks, block_size, device=device) + 0.5
+        kv = torch.cat(
+            [
+                kv_vals.view(torch.uint8).flatten(1),
+                kv_scales.view(torch.uint8).flatten(1),
+            ],
+            dim=1,
+        ).view(num_blocks, block_size, 1, D + 4)
+        q = torch.randn(B, next_n, H, D, device=device).to(torch.float8_e4m3fn)
+
+        def call(bt_arg, sl_arg):
+            return fp8_paged_mqa_logits(q, kv, w, bt_arg, sl_arg, ctx)
+    else:
+        kv_codes = torch.randint(
+            0,
+            256,
+            (num_blocks, block_size * (D // 2)),
+            dtype=torch.uint8,
+            device=device,
+        )
+        kv_sf = torch.full(
+            (num_blocks, block_size * 4), 0x7F, dtype=torch.uint8, device=device
+        )
+        kv = torch.cat([kv_codes, kv_sf], dim=1).view(
+            num_blocks, block_size, 1, D // 2 + 4
+        )
+        q = torch.randint(
+            0, 256, (B, next_n, H, D // 2), dtype=torch.uint8, device=device
+        )
+        q_sf = torch.full((B, next_n, H), 0x7F7F7F7F, dtype=torch.int32, device=device)
+
+        def call(bt_arg, sl_arg):
+            return fp4_paged_mqa_logits(
+                q, q_sf, kv, w, bt_arg, sl_arg, ctx, output_dtype=torch.bfloat16
+            )
+
+    ref = call(bt, seq_lens).clone()
+    torch.cuda.synchronize()
+
+    bt_view = bt.repeat_interleave(next_n, dim=0)[offset::next_n]  # (B, W), (2W, 1)
+    sl_view = seq_lens.repeat_interleave(next_n)[offset::next_n]  # (B,), stride 2
+    assert bt_view.stride() == (next_n * W, 1) and not bt_view.is_contiguous()
+    assert sl_view.stride() == (next_n,) and not sl_view.is_contiguous()
+    assert torch.equal(bt_view, bt) and torch.equal(sl_view, seq_lens)
+
+    got = call(bt_view, sl_view)
+    torch.cuda.synchronize()
+    valid = _valid_causal_mask(seq_lens, next_n, ctx, device)
+    assert torch.equal(got[:, :ctx][valid], ref[:, :ctx][valid]), (
+        "row-strided index views must be bit-identical to the compact tensors"
+    )
+    assert torch.isfinite(ref[:, :ctx][valid]).all()
+
+    # A column-strided table (inner stride != 1) is still rejected: that IS a
+    # kernel requirement (entries of a row are read as adjacent scalars).
+    bt_cols = torch.zeros((B, 2 * W), dtype=torch.int32, device=device)[:, ::2]
+    assert bt_cols.shape == (B, W) and bt_cols.stride(1) == 2
+    with pytest.raises(ValueError, match="innermost stride must be 1"):
+        call(bt_cols, seq_lens)
+
+
+def test_out_layout_rejected():
+    """A column-strided or row-overlapping out= view is rejected with the
+    allocation recipe.
+
+    All three passed device/dtype/shape validation.  The column-strided view
+    reached the FFI binding, which either errored bare or silently misplaced
+    stores.  The overlapping views -- an as_strided() pitch narrower than
+    padded_seq_len, or the zero row stride of an expand()ed row -- ran to
+    completion and returned silently wrong logits, later rows overwriting
+    earlier ones (every store stays inside the view's storage, so nothing
+    faults).
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import fp8_paged_mqa_logits, padded_seq_len
+
+    device = "cuda"
+    H, D, block_size, ctx = 64, 128, 64, 256
+    cl = torch.full((2,), ctx, dtype=torch.int32, device=device)
+    bt = torch.zeros((2, 4), dtype=torch.int32, device=device)
+    w = torch.zeros(2, H, device=device, dtype=torch.float32)
+    kv = torch.zeros(8, block_size, 1, D + 4, dtype=torch.uint8, device=device)
+    q = torch.zeros(2, 1, H, D, device=device).to(torch.float8_e4m3fn)
+    padded = padded_seq_len(ctx)
+
+    base = torch.empty((2, 2 * padded), device=device, dtype=torch.float32)
+    with pytest.raises(ValueError, match="innermost stride must be 1"):
+        fp8_paged_mqa_logits(q, kv, w, bt, cl, ctx, out=base[:, ::2])
+
+    # Pitched: row 1 starts halfway through row 0's padded span.
+    pitched = base.flatten().as_strided((2, padded), (padded // 2, 1))
+    assert pitched.shape == (2, padded) and pitched.stride() == (padded // 2, 1)
+    with pytest.raises(ValueError, match="rows overlap"):
+        fp8_paged_mqa_logits(q, kv, w, bt, cl, ctx, out=pitched)
+
+    # Zero row stride: both rows alias one row of storage.
+    expanded = torch.empty((1, padded), device=device, dtype=torch.float32).expand(
+        2, padded
+    )
+    assert expanded.stride(0) == 0
+    with pytest.raises(ValueError, match="rows overlap"):
+        fp8_paged_mqa_logits(q, kv, w, bt, cl, ctx, out=expanded)
+
+    # A row slice of a wider buffer has a LARGER row stride and stays accepted:
+    # the check must not tighten the contract beyond distinct rows.
+    wide_rows = base[:, :padded]
+    assert wide_rows.stride(0) == 2 * padded
+    exact = torch.empty((2, padded), device=device, dtype=torch.float32)
+    ref = fp8_paged_mqa_logits(q, kv, w, bt, cl, ctx, out=exact)
+    got = fp8_paged_mqa_logits(q, kv, w, bt, cl, ctx, out=wide_rows)
+    assert got.data_ptr() == wide_rows.data_ptr() and torch.equal(got, ref)
+
+    # A single row has nothing to collide with, whatever its stride(0) reads.
+    fp8_paged_mqa_logits(
+        q[:1], kv, w[:1], bt[:1], cl[:1], ctx, out=base.flatten()[:padded].view(1, -1)
+    )
+
+
+def test_inputs_foreign_device_rejected_paged():
+    """Tensor arguments on a different GPU than q are rejected by name.
+
+    is_cuda alone admits a tensor on another device; the kernel launched on
+    q's device would dereference peer pointers -- silently right or wrong
+    depending on peer access.  Needs two GPUs.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs a second CUDA device")
+
+    from flashinfer import fp8_paged_mqa_logits
+
+    device = "cuda:0"
+    H, D, block_size, ctx = 64, 128, 64, 256
+    cl_far = torch.full((2,), ctx, dtype=torch.int32, device="cuda:1")
+    bt = torch.zeros((2, 4), dtype=torch.int32, device=device)
+    w = torch.zeros(2, H, device=device, dtype=torch.float32)
+    kv = torch.zeros(8, block_size, 1, D + 4, dtype=torch.uint8, device=device)
+    q = torch.zeros(2, 1, H, D, device=device).to(torch.float8_e4m3fn)
+
+    with pytest.raises(ValueError, match=r"seq_lens is on cuda:1 but q is on"):
+        fp8_paged_mqa_logits(q, kv, w, bt, cl_far, ctx)
+
+
+# The schedule helper's three internal paths: the GPU schedule kernel, the fp4
+# atom-split expansion in front of it, and the CPU numpy fallback.
+_SCHEDULE_HELPER_PATHS = [
+    pytest.param({}, id="fp8-gpu"),
+    pytest.param({"next_n": 4, "variant": "fp4"}, id="fp4-split"),
+    pytest.param({"use_gpu_kernel": False}, id="cpu-fallback"),
+]
+
+
+@pytest.mark.parametrize("kwargs", _SCHEDULE_HELPER_PATHS)
+def test_schedule_helper_validates_inputs(kwargs):
+    """compute_paged_mqa_logits_schedule validates seq_lens and out= up front,
+    on every internal path.
+
+    The paths failed differently on a malformed seq_lens, two of them
+    silently: the GPU kernel path errored bare in the FFI binding on a [1, B]
+    tensor; the fp4 split path reshaped [1, B] through the atom expansion into
+    a wrong flat vector; and the CPU fallback read shape[0] == 1 and emitted a
+    one-row schedule (a hang or unwritten rows in the persistent kernel, not
+    a wrong number).  An int64 seq_lens died inside the DSL or was truncated
+    by numpy, and a malformed out= reached the compiled kernel or out.copy_
+    bare.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
+    from flashinfer import compute_paged_mqa_logits_schedule
+
+    dev = torch.device("cuda", torch.cuda.current_device())
+    cl64 = torch.full((2,), 256, dtype=torch.int64, device=dev)
+    with pytest.raises(ValueError, match="seq_lens must be int32"):
+        compute_paged_mqa_logits_schedule(cl64, **kwargs)
+
+    # [1, B] has the same numel as [B]; every path used to accept it.
+    cl_2d = torch.full((1, 2), 256, dtype=torch.int32, device=dev)
+    with pytest.raises(ValueError, match=r"seq_lens must be 1-D"):
+        compute_paged_mqa_logits_schedule(cl_2d, **kwargs)
+
+    cl = torch.full((2,), 256, dtype=torch.int32, device=dev)
+    bad_out = torch.zeros((3, 2), dtype=torch.int32, device=dev)
+    with pytest.raises(ValueError, match="schedule_meta must have shape"):
+        compute_paged_mqa_logits_schedule(cl, out=bad_out, **kwargs)
+
+    # Guard the new checks against over-strictness on the same path: the
+    # well-formed call succeeds, and a strided view of the same lengths gives
+    # the identical schedule (layout is not a constraint).
+    if is_sm100a_supported(dev) or kwargs.get("use_gpu_kernel", True) is False:
+        ref = compute_paged_mqa_logits_schedule(cl, **kwargs)
+        strided = cl.repeat_interleave(2)[::2]
+        assert strided.stride(0) == 2, "test premise: a genuinely strided view"
+        assert torch.equal(compute_paged_mqa_logits_schedule(strided, **kwargs), ref)
+
+
+def test_schedule_helper_rejects_foreign_device_seq_lens():
+    """seq_lens on another GPU than the target device is rejected by name on
+    every path instead of reaching the FFI binding (or being silently copied
+    across devices by the CPU fallback).  Needs two GPUs."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs a second CUDA device")
+
+    from flashinfer import compute_paged_mqa_logits_schedule
+
+    cl_far = torch.full((2,), 256, dtype=torch.int32, device="cuda:1")
+    for kwargs in ({}, {"next_n": 4, "variant": "fp4"}, {"use_gpu_kernel": False}):
+        with pytest.raises(ValueError, match=r"seq_lens is on cuda:1"):
+            compute_paged_mqa_logits_schedule(cl_far, device="cuda:0", **kwargs)
+
+
+def test_precompile_dsl_guards(monkeypatch):
+    """precompile warns (not silently no-ops) without a DSL, and fails with
+    the curated stale-toolchain message when the DSL cannot target the device.
+
+    Previously it returned silently with no DSL (a deployment build step
+    "succeeded" and serving JIT'd later), and went straight into cute.compile
+    -- deep KeyError -- on a DSL predating the device.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
+    from flashinfer.attn_scores import attn_scores as A
+
+    monkeypatch.setattr(A, "_CUTE_DSL_AVAILABLE", False)
+    with pytest.warns(RuntimeWarning, match="nothing was precompiled"):
+        A.precompile_paged_mqa_logits()
+
+    monkeypatch.setattr(A, "_CUTE_DSL_AVAILABLE", True)
+    monkeypatch.setattr(A, "_cached_dsl_targets_device", lambda i: False)
+    with pytest.raises(RuntimeError, match="cannot target"):
+        A.precompile_paged_mqa_logits()
+
+
+def test_validate_inputs_rejects_out_of_pool_block_index(monkeypatch):
+    """FLASHINFER_VALIDATE_INPUTS=1 catches stale/out-of-pool block indices.
+
+    The debug validator already pays the D2H sync for the width check; the
+    value check rides along.  A stale block index is the classic silent OOB
+    READ this validator exists to surface.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import fp8_paged_mqa_logits
+
+    monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
+    device = "cuda"
+    H, D, block_size, ctx = 64, 128, 64, 256
+    cl = torch.full((1,), ctx, dtype=torch.int32, device=device)
+    bt = torch.zeros((1, 4), dtype=torch.int32, device=device)
+    bt[0, 1] = 99  # only 8 blocks in the pool
+    w = torch.zeros(1, H, device=device, dtype=torch.float32)
+    kv = torch.zeros(8, block_size, 1, D + 4, dtype=torch.uint8, device=device)
+    q = torch.zeros(1, 1, H, D, device=device).to(torch.float8_e4m3fn)
+
+    with pytest.raises(ValueError, match=r"only 8 blocks"):
+        fp8_paged_mqa_logits(q, kv, w, bt, cl, ctx)
+
+
+def test_output_span_32bit_guard():
+    """Outputs spanning >= 2^31 elements are rejected before allocation.
+
+    The kernels carry output store offsets (row * stride + col) as 32-bit
+    integers; past 2^31 elements the offset wraps negative and stores land far
+    outside the buffer -- silent device-memory corruption. The guard fires
+    before the output is allocated, so this test never touches the ~8 GB the
+    rejected shape implies.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import fp8_paged_mqa_logits
+
+    device = "cuda"
+    H, D, block_size = 64, 128, 64
+    B, max_len = 8192, 262_145  # 8192 rows x 262_400 padded cols > 2^31
+    cl = torch.full((B,), 64, dtype=torch.int32, device=device)
+    cols = ((max_len + 127) // 128 * 128) // block_size
+    bt = torch.zeros((B, cols), dtype=torch.int32, device=device)
+    w = torch.zeros(B, H, device=device, dtype=torch.float32)
+    kv = torch.zeros(1, block_size, 1, D + 4, dtype=torch.uint8, device=device)
+    q = torch.zeros(B, 1, H, D, device=device).to(torch.float8_e4m3fn)
+
+    with pytest.raises(ValueError, match="32-bit"):
+        fp8_paged_mqa_logits(q, kv, w, bt, cl, max_len)
+
+    # The guard also accounts for a caller out= whose row stride exceeds the
+    # padded width (a view into a wider arena). A real tensor with a
+    # 2^31-spanning stride would itself need 8 GB, so the branch is pinned at
+    # the helper level with a small real tensor and a large row count.
+    from flashinfer.attn_scores.attn_scores import _validate_output_addressable
+
+    arena_row = torch.empty((2, 4096), device=device, dtype=torch.float32)
+    _validate_output_addressable(2, 256, arena_row, "fp8_paged_mqa_logits")  # fine
+    with pytest.raises(ValueError, match="32-bit"):
+        # rows * stride(0) = 2^19 * 4096 = 2^31: the stride, not the padded
+        # width, is what overflows.
+        _validate_output_addressable(2**19, 256, arena_row, "fp8_paged_mqa_logits")
+
+
+def test_fp4_split_graph_replay_across_split_boundary():
+    """CUDA-graph replay of fp4 next_n=4 with the INTERNAL schedule.
+
+    The only other graph test uses a caller schedule_meta, which the split
+    rejects, so the split's capture machinery (the expanded per-atom schedule
+    computed by a captured GPU kernel; the offsets cache that refuses capture
+    population) had no replay coverage. Replays cross a 256-token schedule
+    boundary in BOTH directions and must be bit-exact against eager -- this
+    module's failure mode for schedule mismatches is a hang, so the guard
+    matters. On SM100/SM103 this exercises the two-pass split; on Rubin the
+    same test covers the direct path.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import fp4_paged_mqa_logits, padded_seq_len
+
+    device = "cuda"
+    torch.manual_seed(7)
+    B, next_n, H, D, block_size = 2, 4, 64, 128, 64
+    max_len = 512
+
+    sizing = torch.full((B,), max_len, dtype=torch.int32, device=device)
+    bt, ntb = _make_paged_kv(B, block_size, sizing, device)
+    q_f32 = torch.randn(B, next_n, H, D, device=device, dtype=torch.bfloat16)
+    q_packed, q_sf_packed = _per_token_cast_to_fp4(q_f32.view(-1, D), gran_k=32)
+    q_fp4 = q_packed.view(torch.uint8).view(B, next_n, H, D // 2)
+    q_sf = q_sf_packed.view(torch.int32).view(B, next_n, H)
+    kv_cache = torch.randn(ntb, block_size, 1, D, device=device, dtype=torch.bfloat16)
+    kv_fused, _ = _kv_cache_cast_to_fp4(kv_cache)
+    w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+
+    seq_lens = torch.full((B,), 256, dtype=torch.int32, device=device)  # static
+    out = torch.empty(
+        (B * next_n, padded_seq_len(max_len)), device=device, dtype=torch.bfloat16
+    )
+
+    def call():
+        return fp4_paged_mqa_logits(
+            q_fp4, q_sf, kv_fused, w, bt, seq_lens, max_len, out=out
+        )
+
+    call()  # warm: kernel + schedule-bucket compiles
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        call()
+
+    # 256 -> 257 crosses the boundary upward, 300 -> 256 back down.  Compare
+    # bit-exact over the causal-valid region only: columns past each row's
+    # limit are documented UNSPECIFIED scratch and legitimately differ between
+    # the replayed buffer and a fresh eager allocation.
+    for length in (256, 257, 300, 256, 512):
+        seq_lens.fill_(length)
+        g.replay()
+        torch.cuda.synchronize()
+        replay_out = out[: B * next_n, :max_len].clone()
+        eager = fp4_paged_mqa_logits(q_fp4, q_sf, kv_fused, w, bt, seq_lens, max_len)
+        torch.cuda.synchronize()
+        valid = _valid_causal_mask(seq_lens, next_n, max_len, device)
+        assert torch.equal(
+            replay_out.masked_fill(~valid, 0), eager.masked_fill(~valid, 0)
+        ), f"replay != eager at seq_len={length}"
+
+
+def test_atom_offsets_cache_refuses_capture_population():
+    """A cache miss during CUDA-graph capture must NOT populate _ATOM_OFFSETS_CACHE.
+
+    A tensor allocated during capture comes from the graph's private memory
+    pool; caching it would leave a dangling entry after the graph is freed,
+    and later eager calls would read freed memory as per-atom lengths. The
+    manual dict deliberately skips population under capture (validated by hand
+    in commit 4c72476b); this pins it so a future functools.cache "cleanup"
+    cannot reintroduce the use-after-free. Split-only machinery, so it runs
+    where the atom split is active (SM100/SM103).
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import fp4_paged_mqa_logits, padded_seq_len
+    from flashinfer.attn_scores import attn_scores as A
+
+    if A._fp4_max_atom_for_device(torch.device("cuda")) >= 4:
+        pytest.skip("direct next_n=4 path (Rubin): the offsets cache is unused")
+
+    device = "cuda"
+    torch.manual_seed(11)
+    B, next_n, H, D, block_size = 2, 4, 64, 128, 64
+    max_len = 256
+    sizing = torch.full((B,), max_len, dtype=torch.int32, device=device)
+    bt, ntb = _make_paged_kv(B, block_size, sizing, device)
+    q_f32 = torch.randn(B, next_n, H, D, device=device, dtype=torch.bfloat16)
+    q_packed, q_sf_packed = _per_token_cast_to_fp4(q_f32.view(-1, D), gran_k=32)
+    q_fp4 = q_packed.view(torch.uint8).view(B, next_n, H, D // 2)
+    q_sf = q_sf_packed.view(torch.int32).view(B, next_n, H)
+    kv_cache = torch.randn(ntb, block_size, 1, D, device=device, dtype=torch.bfloat16)
+    kv_fused, _ = _kv_cache_cast_to_fp4(kv_cache)
+    w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+    seq_lens = torch.full((B,), max_len, dtype=torch.int32, device=device)
+    out = torch.empty(
+        (B * next_n, padded_seq_len(max_len)), device=device, dtype=torch.bfloat16
+    )
+
+    def call():
+        return fp4_paged_mqa_logits(
+            q_fp4, q_sf, kv_fused, w, bt, seq_lens, max_len, out=out
+        )
+
+    call()  # warm compiles (also populates the cache eagerly)
+    torch.cuda.synchronize()
+
+    A._ATOM_OFFSETS_CACHE.clear()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        call()  # cache miss under capture: compute, do NOT retain
+    assert len(A._ATOM_OFFSETS_CACHE) == 0, (
+        "a graph-pool tensor was cached during capture (dangles after graph free)"
+    )
+
+    g.replay()
+    torch.cuda.synchronize()
+    replay_out = out[: B * next_n, :max_len].clone()
+
+    del g
+    torch.cuda.empty_cache()
+
+    eager = fp4_paged_mqa_logits(q_fp4, q_sf, kv_fused, w, bt, seq_lens, max_len)
+    torch.cuda.synchronize()
+    assert torch.equal(replay_out, eager), "post-graph-free eager call corrupted"
+    assert len(A._ATOM_OFFSETS_CACHE) == 1, "eager call should populate the cache"
+
+
+def test_schedule_meta_device_must_match():
+    """A schedule_meta on another GPU must be rejected here, not by the FFI layer.
+
+    is_cuda only asserts "some CUDA device", so before this check a cuda:1
+    schedule passed to a cuda:0 call reached the generated TVM-FFI binding and
+    failed there with a much less actionable error. Regression for PR #4365
+    review r3824973386.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs two visible CUDA devices")
+
+    from flashinfer import compute_paged_mqa_logits_schedule, fp8_paged_mqa_logits
+    from flashinfer.attn_scores.attn_scores import _cached_num_sms
+
+    H, D, block_size, ctx = 64, 128, 64, 256
+    B = 2
+    dev0, dev1 = torch.device("cuda", 0), torch.device("cuda", 1)
+
+    seq_lens = torch.full((B,), ctx, dtype=torch.int32, device=dev0)
+    block_tables, ntb = _make_paged_kv(B, block_size, seq_lens, dev0)
+    q = torch.zeros(B, 1, H, D, device=dev0).to(torch.float8_e4m3fn)
+    kv = torch.zeros(ntb, block_size, 1, D + 4, dtype=torch.uint8, device=dev0)
+    w = torch.zeros(B, H, device=dev0, dtype=torch.float32)
+
+    # correctly shaped for device 0, but living on device 1
+    n0 = _cached_num_sms(0)
+    wrong_dev = torch.zeros((n0 + 1, 2), dtype=torch.int32, device=dev1)
+    with pytest.raises(ValueError, match=r"schedule_meta.device .* must match"):
+        fp8_paged_mqa_logits(
+            q, kv, w, block_tables, seq_lens, ctx, schedule_meta=wrong_dev
+        )
+
+    # the matching device is still accepted
+    right_dev = compute_paged_mqa_logits_schedule(seq_lens, device=dev0)
+    fp8_paged_mqa_logits(q, kv, w, block_tables, seq_lens, ctx, schedule_meta=right_dev)
+
+
+@pytest.mark.parametrize("variant", ["fp8", "fp4"])
+def test_seq_lens_must_be_rank_1(variant):
+    """A [B,1] seq_lens must be rejected here, not by the FFI binding.
+
+    [B] and [B,1] have the same shape[0], so the old shape-only check accepted
+    both and the rank-2 tensor failed later against the rank-1 compiled fake --
+    after JIT compilation, with a message that never mentions rank. [B,1] is a
+    real shape: SGLang's DeepGEMM path produces it.
+
+    Matches on the message text on purpose: the old path also raised ValueError,
+    so asserting the exception type alone would pass against unfixed code.
+    Regression for PR #4365 review r3825144972.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits
+
+    device = "cuda"
+    B, H, D, block_size, ctx = 2, 64, 128, 64, 256
+    good = torch.full((B,), ctx, dtype=torch.int32, device=device)
+    block_tables, ntb = _make_paged_kv(B, block_size, good, device)
+    w = torch.zeros(B, H, device=device, dtype=torch.float32)
+
+    if variant == "fp8":
+        q = torch.zeros(B, 1, H, D, device=device).to(torch.float8_e4m3fn)
+        kv = torch.zeros(ntb, block_size, 1, D + 4, dtype=torch.uint8, device=device)
+        call = lambda cl: fp8_paged_mqa_logits(  # noqa: E731
+            q, kv, w, block_tables, cl, ctx
+        )
+    else:
+        q = torch.zeros(B, 1, H, D // 2, dtype=torch.uint8, device=device)
+        q_sf = torch.zeros(B, 1, H, dtype=torch.int32, device=device)
+        kv = torch.zeros(
+            ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device
+        )
+        call = lambda cl: fp4_paged_mqa_logits(  # noqa: E731
+            q, q_sf, kv, w, block_tables, cl, ctx, output_dtype=torch.bfloat16
+        )
+
+    for bad in (
+        torch.full((B, 1), ctx, dtype=torch.int32, device=device),  # [B,1]
+        torch.full((B, 1, 1), ctx, dtype=torch.int32, device=device),  # [B,1,1]
+    ):
+        with pytest.raises(ValueError, match="seq_lens must be 1-D"):
+            call(bad)
+
+    # rank 1 still works
+    call(good)
+    torch.cuda.synchronize()
+
+
+def _to_cutlass_for_test(dtype):
+    from flashinfer.attn_scores.attn_scores import _to_cutlass
+
+    return _to_cutlass(dtype)
+
+
+def test_gpu_arch_resolves_from_requested_device():
+    """The compile arch must follow the requested device, not the current one.
+
+    CUTLASS's own probe queries ordinal 0 unconditionally and PyTorch's
+    no-argument get_device_capability() follows the process-wide current device,
+    so before this change num_sms came from the device= argument while the
+    codegen target and cache tag came from elsewhere. Regression for PR #4365
+    review r3824968121.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer.attn_scores.attn_scores import _cached_gpu_arch
+
+    for i in range(torch.cuda.device_count()):
+        p = torch.cuda.get_device_properties(i)
+        got = _cached_gpu_arch(i)
+        assert got.startswith(f"sm_{p.major}"), (
+            f"cuda:{i} is sm_{p.major}{p.minor} but arch resolved to {got}"
+        )
+
+    # ...and it must not drift with the process-wide current device.
+    if torch.cuda.device_count() > 1:
+        before = [_cached_gpu_arch(i) for i in range(torch.cuda.device_count())]
+        cur = torch.cuda.current_device()
+        try:
+            for i in range(torch.cuda.device_count()):
+                torch.cuda.set_device(i)
+                after = [_cached_gpu_arch(j) for j in range(torch.cuda.device_count())]
+                assert after == before, (
+                    f"arch resolution changed when current device was {i}: "
+                    f"{before} -> {after}"
+                )
+        finally:
+            torch.cuda.set_device(cur)
+
+
+def test_arch_backstop_rejects_target_it_cannot_run(monkeypatch):
+    """The arch backstop must still reject a target the current device can't run.
+
+    This is defence in depth, not the primary mechanism. The launch paths run
+    inside ``_on_device``, which makes the target current before compiling and
+    launching, so on those paths the arch matches by construction and this check
+    is unreachable. It stays because the failure it prevents is silent and
+    deferred: CuTe-DSL does not reject a --gpu-arch the current device cannot
+    execute -- it compiles, exports, reloads, and raises only on first
+    invocation (measured on sm_100a for sm_90a, sm_103a and sm_80), and
+    load_module performs no architecture check either. A future caller that
+    compiles for a device without entering it would hit exactly that.
+
+    The arch lookup is stubbed so this runs on a single-GPU host. Real
+    multi-GPU behaviour -- including that a non-current target now *works*
+    rather than raising -- is covered on a heterogeneous host. Regression for
+    PR #4365 review r3824968121.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
+    from flashinfer.attn_scores import attn_scores as A
+
+    cur = torch.cuda.current_device()
+    other = cur + 1  # need not exist: only the arch lookup is consulted
+
+    # Same device: must never raise, regardless of what the lookup returns.
+    monkeypatch.setattr(A, "_cached_gpu_arch", lambda i: "sm_100a")
+    assert A._arch_for_launch(cur, "fp8_paged_mqa_logits") == "sm_100a"
+
+    # Different device, same arch: allowed here (a same-arch device mismatch is
+    # a stream-placement concern, deliberately out of this check's scope).
+    assert A._arch_for_launch(other, "fp8_paged_mqa_logits") == "sm_100a"
+
+    # Different device, different arch: rejected, and the message must name
+    # both devices and both archs so the fix is obvious.
+    monkeypatch.setattr(
+        A, "_cached_gpu_arch", lambda i: "sm_100a" if i == other else "sm_90a"
+    )
+    with pytest.raises(ValueError) as e:
+        A._arch_for_launch(other, "fp8_paged_mqa_logits")
+    msg = str(e.value)
+    assert "fp8_paged_mqa_logits" in msg
+    assert "sm_100a" in msg and "sm_90a" in msg
+    assert f"cuda:{other}" in msg and f"cuda:{cur}" in msg
+    assert "torch.cuda.device" in msg, "the error should say how to fix it"
+
+
+def test_kernel_arch_gates_follow_passed_arch():
+    """Construction-time arch gates must follow the arch argument, never the
+    DSL's ambient (device-0 / CUTE_DSL_ARCH) probe.
+
+    The compile target is already threaded from the input tensor's device
+    (``_arch_for_launch`` -> ``--gpu-arch``), but the kernels also make
+    decisions at construction time -- the FP4 atom cap and the per-arch perf
+    levers -- and ``__init__`` runs before ``cute.compile`` installs the
+    target, where a DSL arch query silently reads the ambient arch. On a
+    heterogeneous node (e.g. cuda:0 Blackwell + cuda:1 Rubin) that crashed
+    valid next_n=4 calls with a bare AssertionError and baked the wrong
+    arch's levers into artifacts cached under the target's tag. Construction
+    is pure host code, so both targets are checked from whatever single GPU
+    runs this test.
+    """
+    pytest.importorskip("cutlass")
+
+    from flashinfer.attn_scores.kernels import FP4MQALogitsKernel, FP8MQALogitsKernel
+
+    # FP4 atom cap: a Blackwell target rejects atom=4 and gates its levers per
+    # Blackwell policy, regardless of which GPU (if any) is ambient. No DSL
+    # arch table is consulted, so this works on any installed DSL release.
+    with pytest.raises(AssertionError, match="requires Rubin"):
+        FP4MQALogitsKernel(next_n=4, num_next_n_atoms=1, arch="sm_100a")
+    k4s = FP4MQALogitsKernel(next_n=4, num_next_n_atoms=2, arch="sm_100a")
+    assert k4s.next_n_atom == 2
+    assert k4s.use_flat_logits_view is True  # Blackwell auto-gate: lever on
+    assert k4s.use_two_level_task_loop is True
+    # atom=3: both levers off everywhere (B200 register-pressure gate).
+    k43 = FP4MQALogitsKernel(next_n=3, num_next_n_atoms=1, arch="sm_100a")
+    assert k43.use_flat_logits_view is False
+    assert k43.use_two_level_task_loop is False
+
+    # Rubin target: atom=4 constructs directly and the levers flip to the
+    # Rubin policy. FP4 construction consults no DSL arch table; FP8 does
+    # (get_max_tmem_alloc_cols), so its Rubin half is gated on the installed
+    # DSL knowing the part.
+    k4 = FP4MQALogitsKernel(next_n=4, num_next_n_atoms=1, arch="sm_107a")
+    assert k4.next_n_atom == 4 and k4.N == 256
+    assert k4.use_flat_logits_view is False  # Rubin auto-gate: lever off
+
+    k8b = FP8MQALogitsKernel(next_n=4, arch="sm_100a")
+    assert k8b.use_flat_logits_view is True
+    assert k8b.use_two_level_task_loop is True
+    assert k8b.use_paired_pipeline_polls is True
+
+    from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
+
+    if is_cute_dsl_arch_supported(10, 7, native_only=True):
+        k8r = FP8MQALogitsKernel(next_n=4, arch="sm_107a")
+        assert k8r.use_flat_logits_view is False
+        assert k8r.use_two_level_task_loop is False
+        assert k8r.use_paired_pipeline_polls is False
+
+
+def test_on_device_enters_target_and_is_free_when_already_current():
+    """The launch paths must make the target device current before launching.
+
+    The kernels take the TVM-FFI environment stream, which resolves to the
+    current stream of the *current* device, so launching with tensors from
+    another device onto that stream is wrong regardless of architecture -- the
+    case raised in PR #4365 review r3824968121. ``_on_device`` fixes it by
+    entering the target, and must cost nothing when the target is already
+    current, which is every single-GPU call.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
+    import contextlib
+
+    from flashinfer.attn_scores.attn_scores import _on_device
+
+    cur = torch.cuda.current_device()
+
+    # Already current: must be a no-op context, not a device switch.
+    ctx = _on_device(cur)
+    assert isinstance(ctx, contextlib.nullcontext), (
+        "entering the already-current device should cost nothing; "
+        f"got {type(ctx).__name__}"
+    )
+    with ctx:
+        assert torch.cuda.current_device() == cur
+
+    # A different device: must actually switch, and restore afterwards.
+    if torch.cuda.device_count() > 1:
+        other = (cur + 1) % torch.cuda.device_count()
+        with _on_device(other):
+            assert torch.cuda.current_device() == other, (
+                "the target device was not made current for the launch"
+            )
+        assert torch.cuda.current_device() == cur, (
+            "the previous device was not restored"
+        )
+
+
+def test_arch_is_part_of_the_compile_cache_key():
+    """Two architectures must not share a compiled-kernel cache entry.
+
+    Without arch in the key, a kernel built for one device could be handed to
+    another with the same SM count. The annotation check also guards against
+    keying on cute.GPUArch, whose equality is identity-based (GPUArch(x) ==
+    GPUArch(x) is False) and would silently miss every lookup.
+    """
+    import inspect
+
+    from flashinfer.attn_scores.attn_scores import (
+        _cached_compile_fp4_kernel,
+        _cached_compile_fp8_kernel,
+    )
+    from flashinfer.attn_scores.kernels.schedule_kernel import _compile_schedule_kernel
+
+    for fn in (
+        _cached_compile_fp8_kernel,
+        _cached_compile_fp4_kernel,
+        _compile_schedule_kernel,
+    ):
+        inner = getattr(fn, "__wrapped__", fn)
+        sig = inspect.signature(inner)
+        assert "arch" in sig.parameters, (
+            f"{inner.__name__} cache key omits arch: {list(sig.parameters)}"
+        )
+        assert sig.parameters["arch"].annotation is str, (
+            f"{inner.__name__} must key on the arch string, not a cute.GPUArch"
+        )
+
+
+def test_precompile_targets_the_requested_device():
+    """precompile(device=...) builds entries keyed on that device's arch/SM count.
+
+    Verified by a cache *hit*: after precompiling, asking for the same config
+    with the target's (num_sms, arch) must not recompile. A different arch must
+    miss, which is what proves arch is really in the key.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import precompile_paged_mqa_logits
+    from flashinfer.attn_scores.attn_scores import (
+        _cached_compile_fp8_kernel,
+        _cached_gpu_arch,
+        _cached_num_sms,
+    )
+
+    # Pick the highest-numbered device that can actually run this kernel: on a
+    # heterogeneous box the last device may be another architecture entirely,
+    # and precompiling an sm100a kernel for it correctly raises.
+    capable = [
+        i
+        for i in range(torch.cuda.device_count())
+        if is_sm100a_supported(torch.device("cuda", i))
+    ]
+    assert capable, "no sm100a-capable device"
+    target = capable[-1]
+    arch = _cached_gpu_arch(target)
+    sms = _cached_num_sms(target)
+    f32 = _to_cutlass_for_test(torch.float32)
+
+    precompile_paged_mqa_logits(device=torch.device("cuda", target), variants=("fp8",))
+
+    hits = _cached_compile_fp8_kernel.cache_info().hits
+    _cached_compile_fp8_kernel(64, 64, 128, 1, sms, f32, f32, f32, 1, None, arch)
+    assert _cached_compile_fp8_kernel.cache_info().hits == hits + 1, (
+        f"precompile(device=cuda:{target}) produced no entry for "
+        f"(num_sms={sms}, arch={arch})"
+    )
+
+    # A different arch must be a distinct key, not a silent reuse.
+    misses = _cached_compile_fp8_kernel.cache_info().misses
+    # Compiling this kernel for sm_80 legitimately fails (no tcgen05); the cache
+    # miss is what we are asserting, not the compile result.
+    with contextlib.suppress(Exception):
+        other_arch = "sm_90a" if arch != "sm_90a" else "sm_80"
+        _cached_compile_fp8_kernel(
+            64, 64, 128, 1, sms, f32, f32, f32, 1, None, other_arch
+        )
+    assert _cached_compile_fp8_kernel.cache_info().misses > misses, (
+        "a different arch reused the cache entry -- arch is not in the key"
+    )
+
+
+def test_precompile_warms_fp4_float32_output():
+    """precompile must cover the output dtypes a deployment actually runs.
+
+    output_dtype is part of the compile cache key, so warming only the API
+    default (bfloat16) left a first-request JIT for any consumer binding logits
+    as C float. Asserted via cache hits, with an unwarmed dtype required to
+    miss -- otherwise the test would pass even if nothing were warmed.
+    Regression for PR #4365 review r3825087342.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import precompile_paged_mqa_logits
+    from flashinfer.attn_scores.attn_scores import (
+        _cached_compile_fp4_kernel,
+        _cached_gpu_arch,
+        _cached_num_sms,
+        _to_cutlass,
+    )
+
+    dev = torch.cuda.current_device()
+    arch = _cached_gpu_arch(dev)
+    sms = _cached_num_sms(dev)
+    f32 = _to_cutlass(torch.float32)
+
+    # The in-process cache is shared across the whole session, and other tests
+    # in this file compile fp4 with every supported output dtype. Without
+    # clearing it, "float16 must miss" below is decided by test ordering rather
+    # than by what precompile warmed. Clearing only drops the in-memory entries;
+    # the on-disk CuTe-DSL cache still serves them, so repopulation is a load.
+    _cached_compile_fp4_kernel.cache_clear()
+
+    precompile_paged_mqa_logits(variants=("fp4",))
+
+    # both the API default and float32 must now be hits
+    for out_dtype in (torch.bfloat16, torch.float32):
+        hits = _cached_compile_fp4_kernel.cache_info().hits
+        _cached_compile_fp4_kernel(
+            64, 64, 128, 1, sms, f32, _to_cutlass(out_dtype), 1, False, arch, 1
+        )
+        assert _cached_compile_fp4_kernel.cache_info().hits == hits + 1, (
+            f"precompile did not warm fp4 output_dtype={out_dtype}"
+        )
+
+    # a dtype outside the warmed set must miss, or the assertions above are vacuous
+    misses = _cached_compile_fp4_kernel.cache_info().misses
+    _cached_compile_fp4_kernel(
+        64, 64, 128, 1, sms, f32, _to_cutlass(torch.float16), 1, False, arch, 1
+    )
+    assert _cached_compile_fp4_kernel.cache_info().misses > misses, (
+        "float16 was not warmed but did not miss -- the cache key ignores "
+        "output_dtype, so the hit assertions above prove nothing"
+    )
+
+
+def test_precompile_warms_fp4_split_schedule_bucket():
+    """precompile(batch_sizes=[B]) must warm the schedule bucket fp4 next_n=4
+    actually requests: 2B rows on SM100/SM103 (two atoms), B rows on SM107.
+
+    batch_sizes is in caller units but the schedule kernel is keyed on the
+    scheduler row count, and only the launch path applied the atom
+    decomposition -- so before the fix every B > 16 missed on a split device
+    (bucket(B) warmed, bucket(2B) requested) and the first fp4 next_n=4 call,
+    or the first CUDA-graph capture, compiled inside the hot path.  Pins:
+    (a) the runtime bucket is an in-process hit, (b) the unsplit bucket stays
+    warm (fp8 and fp4 next_n<=3 request it), (c) an end-to-end fp4 next_n=4
+    call adds no miss, (d) an unwarmed bucket still misses so (a)-(c) are not
+    vacuous.  Fails against the unfixed code at (a) on SM100/SM103 and at the
+    import of the (then missing) shared derivation everywhere.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import fp4_paged_mqa_logits, precompile_paged_mqa_logits
+    from flashinfer.attn_scores.attn_scores import (
+        _SPLIT_KV,
+        _cached_gpu_arch,
+        _cached_num_sms,
+        _fp4_atom_decomposition,
+        _precompile_schedule_buckets,
+        _schedule_bucket,
+    )
+    from flashinfer.attn_scores.kernels.schedule_kernel import _compile_schedule_kernel
+
+    dev = torch.cuda.current_device()
+    device = torch.device("cuda", dev)
+    arch, sms = _cached_gpu_arch(dev), _cached_num_sms(dev)
+    B = 32
+    _, num_atoms = _fp4_atom_decomposition(4, device)
+    expected_bucket = _schedule_bucket(B * num_atoms)  # 64 on SM100/SM103, 32 on SM107
+
+    # The derivation itself, GPU-free: bucket(B) is always present; the split
+    # adds bucket(B*num_atoms); fp8 alone never expands.
+    assert _precompile_schedule_buckets([B], ("fp4",), device) == {32, expected_bucket}
+    assert _precompile_schedule_buckets([B], ("fp8",), device) == {32}
+    assert _precompile_schedule_buckets([1, 40], ("fp8", "fp4"), device) == (
+        {32, 64} if num_atoms == 1 else {32, 64, 96}
+    )
+
+    # In-process cache is session-wide; clear it so hits below are decided by
+    # what precompile warmed, not by test order (disk cache still serves).
+    _compile_schedule_kernel.cache_clear()
+    precompile_paged_mqa_logits(
+        device=device,
+        variants=("fp4",),
+        output_dtypes=(torch.bfloat16,),
+        batch_sizes=[B],
+    )
+    # (a) the bucket the runtime will request is warm
+    hits = _compile_schedule_kernel.cache_info().hits
+    _compile_schedule_kernel(expected_bucket, _SPLIT_KV, sms, arch)
+    assert _compile_schedule_kernel.cache_info().hits == hits + 1, (
+        f"precompile(batch_sizes=[{B}]) did not warm schedule bucket "
+        f"{expected_bucket} (fp4 next_n=4 schedules {B}*{num_atoms} rows here)"
+    )
+    # (b) the unsplit bucket is warm too
+    hits = _compile_schedule_kernel.cache_info().hits
+    _compile_schedule_kernel(32, _SPLIT_KV, sms, arch)
+    assert _compile_schedule_kernel.cache_info().hits == hits + 1
+
+    # (c) a real fp4 next_n=4 call at B=32 must not enter the compile path
+    ctx, block_size, H, D, next_n = 512, 64, 64, 128, 4
+    seq_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
+    block_tables, ntb = _make_paged_kv(B, block_size, seq_lens, device)
+    q = torch.zeros(B, next_n, H, D // 2, dtype=torch.uint8, device=device)
+    q_sf = torch.zeros(B, next_n, H, dtype=torch.int32, device=device)
+    kv = torch.zeros(ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device)
+    w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+    misses = _compile_schedule_kernel.cache_info().misses
+    fp4_paged_mqa_logits(
+        q, q_sf, kv, w, block_tables, seq_lens, ctx, output_dtype=torch.bfloat16
+    )
+    torch.cuda.synchronize()
+    assert _compile_schedule_kernel.cache_info().misses == misses, (
+        "fp4 next_n=4 at B=32 compiled a schedule bucket after precompile"
+    )
+    # (d) negative control: an unwarmed bucket misses
+    misses = _compile_schedule_kernel.cache_info().misses
+    _compile_schedule_kernel(expected_bucket + 128, _SPLIT_KV, sms, arch)
+    assert _compile_schedule_kernel.cache_info().misses == misses + 1
+
+
+def test_precompile_output_dtypes_is_honoured_and_validated():
+    """An explicit output_dtypes tuple builds only those, and is checked up front."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import precompile_paged_mqa_logits
+
+    # fp8 does not support bfloat16; reject before compiling anything
+    with pytest.raises(ValueError, match="does not support output dtype"):
+        precompile_paged_mqa_logits(variants=("fp8",), output_dtypes=(torch.bfloat16,))
+
+    # fp4 does support it, so the same tuple is fine there
+    precompile_paged_mqa_logits(variants=("fp4",), output_dtypes=(torch.bfloat16,))
+
+
+def test_relu_is_applied_per_head_before_weighting():
+    """The kernel computes Σ_h w·relu(dot), not relu(Σ_h w·dot).
+
+    The module and trace-template docstrings previously documented the latter.
+    The two disagree whenever head scores have mixed signs: with scores [1, -1]
+    and weights [1, 1] the kernel returns 1 while relu-of-the-sum returns 0.
+    They also disagree on range -- relu-of-the-sum cannot be negative, but the
+    kernel can be with negative weights. Regression for PR #4365 review
+    r3825128740; the references were always right, so only prose was wrong and
+    no existing test could have caught it.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import fp8_paged_mqa_logits
+
+    device = "cuda"
+    B, next_n, H, D, block_size, ctx = 1, 1, 64, 128, 64, 64
+    seq_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
+    block_tables, ntb = _make_paged_kv(B, block_size, seq_lens, device)
+
+    # head 0 sees +1, head 1 sees -1 against the same K column; all others zero
+    q = torch.zeros(B, next_n, H, D, device=device)
+    kv = torch.zeros(ntb, block_size, D, device=device)
+    kv[block_tables[0, 0].item(), 0, 0] = 1.0
+    q[0, 0, 0, 0] = 1.0
+    q[0, 0, 1, 0] = -1.0
+
+    scale = _ceil_to_ue8m0_fp(
+        kv.abs().amax(-1, keepdim=True).clamp(1e-4) / 448.0
+    ).squeeze(-1)
+    kv_fused = _make_fused_kv_fp8(
+        (kv / scale.unsqueeze(-1)).to(torch.float8_e4m3fn), scale, block_size, D
+    )
+    q8 = q.to(torch.float8_e4m3fn)
+
+    w = torch.zeros(B * next_n, H, device=device, dtype=torch.float32)
+    w[0, 0] = 1.0
+    w[0, 1] = 1.0
+    out = fp8_paged_mqa_logits(q8, kv_fused, w, block_tables, seq_lens, ctx)
+    torch.cuda.synchronize()
+    # Σ w·relu(dot) = 1·1 + 1·0 = 1 (times the KV scale, which is 1 here);
+    # relu(Σ w·dot) = relu(0) = 0.
+    assert out[0, 0].item() > 0.5, (
+        f"expected ~1 from per-head ReLU, got {out[0, 0].item()}; "
+        "relu-of-the-sum would give 0"
+    )
+
+    # negative weights: relu-of-the-sum could never be negative, the kernel can
+    w_neg = torch.zeros(B * next_n, H, device=device, dtype=torch.float32)
+    w_neg[0, 0] = -1.0
+    out_neg = fp8_paged_mqa_logits(q8, kv_fused, w_neg, block_tables, seq_lens, ctx)
+    torch.cuda.synchronize()
+    assert out_neg[0, 0].item() < -0.5, (
+        f"expected a negative logit with a negative weight, got {out_neg[0, 0].item()}"
+    )
+
+
+def test_precompile_variants():
+    """precompile_paged_mqa_logits(variants=...) builds only what was asked for."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import fp8_paged_mqa_logits, precompile_paged_mqa_logits
+    from flashinfer.attn_scores.attn_scores import (
+        _cached_compile_fp4_kernel,
+        _cached_compile_fp8_kernel,
+    )
+
+    with pytest.raises(ValueError, match="unknown variants"):
+        precompile_paged_mqa_logits(variants=("fp8", "int4"))
+
+    # fp8-only must not touch the fp4 cache, and vice versa.
+    fp4_before = _cached_compile_fp4_kernel.cache_info().misses
+    precompile_paged_mqa_logits(variants=("fp8",))
+    assert _cached_compile_fp4_kernel.cache_info().misses == fp4_before
+
+    fp8_before = _cached_compile_fp8_kernel.cache_info().misses
+    precompile_paged_mqa_logits(variants=("fp4",))
+    assert _cached_compile_fp8_kernel.cache_info().misses == fp8_before
+
+    # Every advertised fp8 config must now be a cache hit, not a fresh build.
+    precompile_paged_mqa_logits(variants=("fp8",))
+    misses = _cached_compile_fp8_kernel.cache_info().misses
+    device = "cuda"
+    for block_size in (64, 128):
+        for next_n in (1, 2, 3, 4):
+            ctx, max_ml = 512, 512
+            seq_lens = torch.full((2,), ctx, dtype=torch.int32, device=device)
+            block_tables, ntb = _make_paged_kv(2, block_size, seq_lens, device)
+            q = torch.zeros(2, next_n, 64, 128, device=device).to(torch.float8_e4m3fn)
+            kv = torch.zeros(ntb, block_size, 1, 132, dtype=torch.uint8, device=device)
+            w = torch.randn(2 * next_n, 64, device=device, dtype=torch.float32)
+            fp8_paged_mqa_logits(q, kv, w, block_tables, seq_lens, max_ml)
+    assert _cached_compile_fp8_kernel.cache_info().misses == misses, (
+        "a precompiled fp8 config still triggered a build; the precompile "
+        "config list has drifted from what the API actually compiles"
+    )
+
+
+def test_fp4_is_kv_sf_interleaved_guard():
+    """is_kv_sf_interleaved=True is only valid at block_size=128.
+
+    The kernel silently forces the flag back to False for other block sizes, so
+    a caller who pre-arranged SF for UTCCP would get it interleaved twice
+    -- wrong logits with no error. The API must reject the combination.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip(
+            "FP4 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
+    from flashinfer import fp4_paged_mqa_logits
+
+    device, B, next_n, H, D, ctx, max_ml = "cuda", 2, 1, 64, 128, 512, 512
+    seq_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
+
+    for block_size, should_raise in ((32, True), (64, True), (128, False)):
+        block_tables, ntb = _make_paged_kv(B, block_size, seq_lens, device)
+        q = torch.zeros(B, next_n, H, D // 2, dtype=torch.uint8, device=device)
+        q_sf = torch.zeros(B, next_n, H, dtype=torch.int32, device=device)
+        kv = torch.zeros(
+            ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device
+        )
+        w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+        if should_raise:
+            with pytest.raises(ValueError, match="is_kv_sf_interleaved"):
+                fp4_paged_mqa_logits(
+                    q,
+                    q_sf,
+                    kv,
+                    w,
+                    block_tables,
+                    seq_lens,
+                    max_ml,
+                    is_kv_sf_interleaved=True,
+                )
+        else:
+            fp4_paged_mqa_logits(
+                q,
+                q_sf,
+                kv,
+                w,
+                block_tables,
+                seq_lens,
+                max_ml,
+                is_kv_sf_interleaved=True,
+            )
+
+
+def test_next_n_and_weights_contract():
+    """weights shape/dtype are validated, and pin next_n without a next_n arg."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+    from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits
+
+    device, B, next_n, H, D, block_size, ctx, max_ml = (
+        "cuda",
+        2,
+        2,
+        64,
+        128,
+        64,
+        512,
+        512,
+    )
+    seq_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
+    block_tables, ntb = _make_paged_kv(B, block_size, seq_lens, device)
+    w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+    q8 = torch.zeros(B, next_n, H, D, device=device).to(torch.float8_e4m3fn)
+    kv8 = torch.zeros(ntb, block_size, 1, D + 4, dtype=torch.uint8, device=device)
+    q4 = torch.zeros(B, next_n, H, D // 2, dtype=torch.uint8, device=device)
+    sf4 = torch.zeros(B, next_n, H, dtype=torch.int32, device=device)
+    kv4 = torch.zeros(ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device)
+
+    # next_n is not an API parameter: it is q.shape[1] by definition, and a q
+    # that disagrees with the other tensors is caught by the weights and q_sf
+    # cross-checks without needing the caller to restate it.
+    q8_bad = torch.zeros(B, next_n + 1, H, D, device=device).to(torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="weights must be"):
+        fp8_paged_mqa_logits(q8_bad, kv8, w, block_tables, seq_lens, max_ml)
+    q4_bad = torch.zeros(B, next_n + 1, H, D // 2, dtype=torch.uint8, device=device)
+    # Either cross-check may fire first depending on ordering; both prove the
+    # inconsistency is caught without an explicit next_n argument.
+    with pytest.raises(ValueError, match="(weights|q_sf) must be"):
+        fp4_paged_mqa_logits(q4_bad, sf4, kv4, w, block_tables, seq_lens, max_ml)
+
+    # weights shape and dtype are now validated (previously unchecked).
+    bad_shape = torch.randn(B * next_n + 1, H, device=device, dtype=torch.float32)
+    bad_dtype = torch.randn(B * next_n, H, device=device, dtype=torch.bfloat16)
+    for bad_w, pat in (
+        (bad_shape, "weights must be"),
+        (bad_dtype, "weights must be float32"),
+    ):
+        with pytest.raises(ValueError, match=pat):
+            fp8_paged_mqa_logits(q8, kv8, bad_w, block_tables, seq_lens, max_ml)
+        with pytest.raises(ValueError, match=pat):
+            fp4_paged_mqa_logits(q4, sf4, kv4, bad_w, block_tables, seq_lens, max_ml)
+
+
+def test_fp4_sf_vec_size_contract():
+    """sf_vec_size drives both q_sf packing and the KV row's scale-factor bytes."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip(
+            "FP4 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
+    from flashinfer import fp4_paged_mqa_logits
+
+    device, B, next_n, H, D, block_size, ctx, max_ml = (
+        "cuda",
+        2,
+        1,
+        64,
+        128,
+        64,
+        512,
+        512,
+    )
+    seq_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
+    block_tables, ntb = _make_paged_kv(B, block_size, seq_lens, device)
+    w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+    q = torch.zeros(B, next_n, H, D // 2, dtype=torch.uint8, device=device)
+    q_sf = torch.zeros(B, next_n, H, dtype=torch.int32, device=device)
+    kv = torch.zeros(ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device)
+
+    fp4_paged_mqa_logits(q, q_sf, kv, w, block_tables, seq_lens, max_ml, sf_vec_size=32)
+    for bad in (16, 64):
+        with pytest.raises(ValueError, match="sf_vec_size must be 32"):
+            fp4_paged_mqa_logits(
+                q, q_sf, kv, w, block_tables, seq_lens, max_ml, sf_vec_size=bad
+            )
+
+    # The KV row's scale-factor bytes are derived from sf_vec_size, so a row
+    # sized for a different SF count is rejected with the arithmetic spelled out.
+    kv_bad = torch.zeros(
+        ntb, block_size, 1, D // 2 + 8, dtype=torch.uint8, device=device
+    )
+    with pytest.raises(ValueError, match="scale-factor bytes"):
+        fp4_paged_mqa_logits(q, q_sf, kv_bad, w, block_tables, seq_lens, max_ml)

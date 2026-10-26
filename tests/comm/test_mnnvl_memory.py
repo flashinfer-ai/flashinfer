@@ -20,7 +20,10 @@ import torch
 
 from flashinfer.comm.mapping import Mapping
 from flashinfer.comm.mnnvl import MnnvlMemory, MpiComm
-from flashinfer.comm.trtllm_alltoall import MnnvlMoe, MoEAlltoallInfo
+from flashinfer.moe_ep.backends.split.comm.nvlink_two_sided.kernels import (
+    alltoallv,
+    comm_workspace_size_per_rank,
+)
 
 from .conftest import mnnvl_available
 
@@ -29,7 +32,7 @@ pynvml.nvmlInit()
 
 @pytest.mark.skipif(
     not mnnvl_available(),
-    reason="Mnnvl memory is not supported on this platform or container lacks SYS_PTRACE capability",
+    reason="Mnnvl memory is not supported on this platform",
 )
 class TestMnnvlMemory:
     @pytest.fixture(autouse=True)
@@ -63,7 +66,7 @@ class TestMnnvlMemory:
 
     @pytest.mark.skipif(
         not mnnvl_available(),
-        reason="Mnnvl memory is not supported on this platform or container lacks SYS_PTRACE capability",
+        reason="Mnnvl memory is not supported on this platform",
     )
     def test_mnnvl_memory(self):
         # allocate un-aligned memory
@@ -121,7 +124,7 @@ class TestMnnvlMemory:
 
     @pytest.mark.skipif(
         not mnnvl_available(),
-        reason="Mnnvl memory is not supported on this platform or container lacks SYS_PTRACE capability",
+        reason="Mnnvl memory is not supported on this platform",
     )
     def test_moe_alltoall_multi_rank_single_gpu(self):
         torch.cuda.set_device(self.local_rank)
@@ -243,23 +246,26 @@ class TestMnnvlMemory:
             )
             recv_ids_all_ranks.append(local_recv_ids)
 
-        alltoall_info = MoEAlltoallInfo(
-            None,
-            send_cumsum_all_ranks[self.rank],
-            send_ids_all_ranks[self.rank],
-            recv_cumsum_all_ranks[self.rank],
-            recv_ids_all_ranks[self.rank],
-            None,
-            ref_output_tensors_all_ranks[self.rank].shape[0],
+        workspace_memory = MnnvlMemory(
+            self.mapping, comm_workspace_size_per_rank(self.world_size)
         )
-
-        alltoall_workspace = MnnvlMoe.get_moe_workspaces(self.mapping)
+        alltoall_workspace = workspace_memory.as_torch_strided_tensor(torch.uint64)
+        output = torch.empty(
+            ref_output_tensors_all_ranks[self.rank].shape[0],
+            vector_dim,
+            dtype=dtype,
+            device=torch.device("cuda"),
+        )
 
         self.comm.Barrier()
 
-        output = MnnvlMoe.mnnvl_moe_alltoallv(
+        alltoallv(
             input_tensors_all_ranks[self.rank],
-            alltoall_info,
+            send_cumsum_all_ranks[self.rank],
+            send_ids_all_ranks[self.rank],
+            output,
+            recv_cumsum_all_ranks[self.rank],
+            recv_ids_all_ranks[self.rank],
             alltoall_workspace,
             self.rank,
             self.world_size,

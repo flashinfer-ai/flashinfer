@@ -138,6 +138,44 @@ def _fused_add_rmsnorm_quant_check(
     )
 
 
+def _gated_residual_next_rmsnorm_check(
+    reference_outputs,
+    actual_outputs,
+    *,
+    residual_rtol=1e-5,
+    residual_atol=1e-5,
+    ffn_rtol=0.015625,
+    ffn_atol=0.03125,
+    max_mismatch_pct=0.0,
+    min_cos_sim=None,
+):
+    from flashinfer.trace import default_check
+
+    if isinstance(reference_outputs, dict):
+        ref_residual = reference_outputs["residual_out"]
+        ref_ffn = reference_outputs["ffn_input"]
+        actual_residual = actual_outputs["residual_out"]
+        actual_ffn = actual_outputs["ffn_input"]
+    else:
+        ref_residual, ref_ffn = reference_outputs
+        actual_residual, actual_ffn = actual_outputs
+    return default_check(
+        [ref_residual],
+        [actual_residual],
+        rtol=residual_rtol,
+        atol=residual_atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    ) and default_check(
+        [ref_ffn],
+        [actual_ffn],
+        rtol=ffn_rtol,
+        atol=ffn_atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    )
+
+
 @torch.no_grad()
 def _rmsnorm_reference(hidden_states, weight):
     """Root Mean Square Normalization. Epsilon is fixed at 1e-6."""
@@ -252,7 +290,255 @@ fused_add_rmsnorm_trace = TraceTemplate(
     init=_fused_add_rmsnorm_init,
 )
 
-# ── RMSNorm + FP8 Quantize ────────────────────────────────────────────────────
+# ── Fused gated normalization ────────────────────────────────────────────────────
+
+
+@torch.no_grad()
+def _gated_residual_rmsnorm_reference(
+    branch,
+    residual,
+    weight,
+    alpha,
+    beta,
+    eps=1e-6,
+    gain_center=0.0,
+):
+    values = branch.to(torch.float32)
+    if weight is not None:
+        values = values * (weight.to(torch.float32) + float(gain_center))
+    inv_rms = torch.rsqrt(values.square().mean(dim=-1, keepdim=True) + float(eps))
+    return alpha * residual + beta * (values * inv_rms)
+
+
+def _gated_residual_rmsnorm_init(
+    *,
+    num_rows: int,
+    hidden_size: int = 8192,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    torch.manual_seed(seed)
+    return {
+        "branch": torch.randn(
+            num_rows, hidden_size, dtype=torch.bfloat16, device=device
+        ),
+        "residual": torch.randn(
+            num_rows, hidden_size, dtype=torch.float32, device=device
+        ),
+        "weight": torch.randn(hidden_size, dtype=torch.bfloat16, device=device),
+        "alpha": torch.randn(hidden_size, dtype=torch.float32, device=device),
+        "beta": torch.randn(hidden_size, dtype=torch.float32, device=device),
+        "eps": 1e-6,
+        "gain_center": 0.0,
+    }
+
+
+gated_residual_rmsnorm_trace = TraceTemplate(
+    op_type="gated_residual_rmsnorm",
+    name_prefix="gated_residual_rmsnorm",
+    description="RMSNorm a branch and blend it into a gated FP32 residual stream.",
+    axes={"num_rows": Var(), "hidden_size": Const(abbrev="h")},
+    inputs={
+        "branch": Tensor(["num_rows", "hidden_size"]),
+        "residual": Tensor(["num_rows", "hidden_size"]),
+        "weight": Tensor(["hidden_size"], optional=True),
+        "alpha": Tensor(["hidden_size"]),
+        "beta": Tensor(["hidden_size"]),
+        "eps": Scalar("float32"),
+        "gain_center": Scalar("float32"),
+    },
+    outputs={
+        "output": Tensor(
+            ["num_rows", "hidden_size"], dtype_from="residual", param="out"
+        )
+    },
+    tags=["status:verified", "fused"],
+    reference=_gated_residual_rmsnorm_reference,
+    check=_norm_check,
+    init=_gated_residual_rmsnorm_init,
+)
+
+
+@torch.no_grad()
+def _gated_residual_next_rmsnorm_reference(
+    branch,
+    residual,
+    next_weight,
+    alpha,
+    beta,
+    post_eps=1e-6,
+    next_eps=1e-6,
+    next_gain_center=0.0,
+    post_weight=None,
+    post_gain_center=0.0,
+):
+    branch_fp32 = branch.to(torch.float32)
+    if post_weight is not None:
+        branch_fp32 *= post_weight.to(torch.float32) + float(post_gain_center)
+    branch_fp32 *= torch.rsqrt(
+        branch_fp32.square().mean(dim=-1, keepdim=True) + float(post_eps)
+    )
+    residual_out = alpha * residual + beta * branch_fp32
+    ffn_input = residual_out * torch.rsqrt(
+        residual_out.square().mean(dim=-1, keepdim=True) + float(next_eps)
+    )
+    ffn_input *= next_weight.to(torch.float32) + float(next_gain_center)
+    return residual_out, ffn_input.to(branch.dtype)
+
+
+def _gated_residual_next_rmsnorm_init(
+    *,
+    num_rows: int,
+    hidden_size: int = 8192,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    torch.manual_seed(seed)
+    return {
+        "branch": torch.randn(
+            num_rows, hidden_size, dtype=torch.bfloat16, device=device
+        ),
+        "residual": torch.randn(
+            num_rows, hidden_size, dtype=torch.float32, device=device
+        ),
+        "next_weight": torch.randn(hidden_size, dtype=torch.bfloat16, device=device),
+        "post_weight": torch.randn(hidden_size, dtype=torch.bfloat16, device=device),
+        "alpha": torch.randn(hidden_size, dtype=torch.float32, device=device),
+        "beta": torch.randn(hidden_size, dtype=torch.float32, device=device),
+        "post_eps": 1e-6,
+        "next_eps": 1e-6,
+        "next_gain_center": 0.0,
+        "post_gain_center": 1.0,
+    }
+
+
+gated_residual_next_rmsnorm_trace = TraceTemplate(
+    op_type="gated_residual_next_rmsnorm",
+    name_prefix="gated_residual_next_rmsnorm",
+    description="Blend a normalized branch and apply the next RMSNorm.",
+    axes={"num_rows": Var(), "hidden_size": Const(abbrev="h")},
+    inputs={
+        "branch": Tensor(["num_rows", "hidden_size"]),
+        "residual": Tensor(["num_rows", "hidden_size"]),
+        "next_weight": Tensor(["hidden_size"]),
+        "post_weight": Tensor(["hidden_size"], optional=True),
+        "alpha": Tensor(["hidden_size"]),
+        "beta": Tensor(["hidden_size"]),
+        "post_eps": Scalar("float32"),
+        "next_eps": Scalar("float32"),
+        "next_gain_center": Scalar("float32"),
+        "post_gain_center": Scalar("float32", optional=True),
+    },
+    outputs={
+        "residual_out": Tensor(["num_rows", "hidden_size"], dtype_from="residual"),
+        "ffn_input": Tensor(["num_rows", "hidden_size"], dtype_from="branch"),
+    },
+    tags=["status:verified", "fused"],
+    reference=_gated_residual_next_rmsnorm_reference,
+    check=_gated_residual_next_rmsnorm_check,
+    init=_gated_residual_next_rmsnorm_init,
+)
+
+
+def _gated_residual_next_rmsnorm_scalar_init(
+    *,
+    num_rows: int,
+    hidden_size: int = 8192,
+    alpha: float = 1.0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    inputs = _gated_residual_next_rmsnorm_init(
+        num_rows=num_rows, hidden_size=hidden_size, device=device, seed=seed
+    )
+    inputs["alpha"] = float(alpha)
+    return inputs
+
+
+_gated_residual_next_rmsnorm_scalar_init._trace_init_dependencies = (  # type: ignore[attr-defined]
+    _gated_residual_next_rmsnorm_init,
+)
+
+
+gated_residual_next_rmsnorm_scalar_trace = TraceTemplate(
+    op_type="gated_residual_next_rmsnorm",
+    name_prefix="gated_residual_next_rmsnorm_scalar_alpha",
+    description="Blend a normalized branch with a scalar stream gate and apply RMSNorm.",
+    axes=gated_residual_next_rmsnorm_trace.axes,
+    inputs={**gated_residual_next_rmsnorm_trace.inputs, "alpha": Scalar("float32")},
+    outputs=gated_residual_next_rmsnorm_trace.outputs,
+    tags=["status:verified", "fused"],
+    reference=_gated_residual_next_rmsnorm_reference,
+    check=_gated_residual_next_rmsnorm_check,
+    init=_gated_residual_next_rmsnorm_scalar_init,
+)
+
+
+def gated_residual_next_rmsnorm_trace_dispatch(**kwargs):
+    if isinstance(kwargs.get("alpha"), (int, float)):
+        return gated_residual_next_rmsnorm_scalar_trace
+    return gated_residual_next_rmsnorm_trace
+
+
+gated_residual_next_rmsnorm_trace_dispatch.templates = (  # type: ignore[attr-defined]
+    gated_residual_next_rmsnorm_trace,
+    gated_residual_next_rmsnorm_scalar_trace,
+)
+
+
+@torch.no_grad()
+def _rmsnorm_sigmoid_gate_reference(input, gate, eps=1e-5):
+    values = input.to(torch.float32)
+    inv_rms = torch.rsqrt(values.square().mean(dim=-1, keepdim=True) + float(eps))
+    return (values * inv_rms * torch.sigmoid(gate.to(torch.float32))).to(input.dtype)
+
+
+def _rmsnorm_sigmoid_gate_init(
+    *,
+    num_tokens: int,
+    num_heads: int = 32,
+    head_dim: int = 64,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    torch.manual_seed(seed)
+    shape = (num_tokens, num_heads, head_dim)
+    return {
+        "input": torch.randn(shape, dtype=torch.bfloat16, device=device),
+        "gate": torch.randn(shape, dtype=torch.bfloat16, device=device),
+        "eps": 1e-5,
+    }
+
+
+rmsnorm_sigmoid_gate_trace = TraceTemplate(
+    op_type="rmsnorm_sigmoid_gate",
+    name_prefix="rmsnorm_sigmoid_gate",
+    description="Per-head RMSNorm followed by an in-place sigmoid gate.",
+    axes={
+        "num_tokens": Var(),
+        "num_heads": Const(abbrev="nh"),
+        "head_dim": Const(abbrev="h"),
+    },
+    inputs={
+        "input": Tensor(["num_tokens", "num_heads", "head_dim"]),
+        "gate": Tensor(["num_tokens", "num_heads", "head_dim"]),
+        "eps": Scalar("float32"),
+    },
+    outputs={
+        "output": Tensor(
+            ["num_tokens", "num_heads", "head_dim"],
+            dtype_from="input",
+            param="input",
+        )
+    },
+    tags=["status:verified", "fused", "in-place"],
+    reference=_rmsnorm_sigmoid_gate_reference,
+    check=_norm_check,
+    init=_rmsnorm_sigmoid_gate_init,
+)
+
+
+# ── RMSNorm + FP8 Quantize ────────────────────────────────────────────
 
 
 @torch.no_grad()
@@ -586,6 +872,92 @@ layernorm_trace = TraceTemplate(
 )
 
 
+# ── LayerNorm + FP8 Quantize ──────────────────────────────────────────────────
+
+
+@torch.no_grad()
+def _layernorm_quant_reference(hidden_states, weight, bias, scale):
+    """LayerNorm followed by per-tensor FP8 (e4m3fn) quantization.
+
+    ``out = clamp(layernorm(input, gamma, beta) / scale, fp8_min, fp8_max).to(fp8_e4m3fn)``.
+    Epsilon is fixed at 1e-6.
+    """
+    EPS = 1e-6
+    x = hidden_states.to(torch.float32)
+    mean = x.mean(dim=-1, keepdim=True)
+    var = ((x - mean) ** 2).mean(dim=-1, keepdim=True)
+    y = (x - mean) / torch.sqrt(var + EPS)
+    y = y * weight.to(torch.float32) + bias.to(torch.float32)
+    s = (
+        scale.to(torch.float32).reshape(())
+        if isinstance(scale, torch.Tensor)
+        else float(scale)
+    )
+    y = y / s
+    fp8_max = 448.0  # float8_e4m3fn max finite value
+    y = y.clamp(-fp8_max, fp8_max)
+    return y.to(torch.float8_e4m3fn)
+
+
+def _layernorm_quant_init(
+    *,
+    batch_size: int,
+    hidden_size: int = 768,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.layernorm_quant``.
+
+    Default ``hidden_size=768`` matches GPT-2/BERT base. ``gemma`` (gamma) and
+    ``beta`` are float32 as required by the API.
+    """
+    torch.manual_seed(seed)
+    x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device=device)
+    out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    return {
+        "out": out,
+        "input": x,
+        "gemma": torch.randn(hidden_size, dtype=torch.float32, device=device),
+        "beta": torch.randn(hidden_size, dtype=torch.float32, device=device),
+        "scale": torch.tensor(1.0, dtype=torch.float32, device=device),
+    }
+
+
+layernorm_quant_trace = TraceTemplate(
+    op_type="layernorm",
+    name_prefix="layernorm_quant",
+    description="LayerNorm + FP8 quantization. out = quantize(layernorm(input, gemma, beta), scale).",
+    axes={
+        "batch_size": Var(),
+        "hidden_size": Const(abbrev="h"),
+    },
+    inputs={
+        "hidden_states": Tensor(["batch_size", "hidden_size"], param="input"),
+        "weight": Tensor(
+            ["hidden_size"], param="gemma", description="Scale (gamma) tensor, float32."
+        ),
+        "bias": Tensor(
+            ["hidden_size"], param="beta", description="Bias (beta) tensor, float32."
+        ),
+        "scale": Scalar(
+            "float32", description="Per-tensor quantization scale, shape (1,)."
+        ),
+    },
+    outputs={
+        "out": Tensor(
+            ["batch_size", "hidden_size"],
+            dtype_from="out",
+            dtype="float8_e4m3fn",
+            description="Quantized output (dtype matches pre-allocated out tensor).",
+        ),
+    },
+    tags=["status:verified", "quantization:fp8"],
+    reference=_layernorm_quant_reference,
+    check=_rmsnorm_quant_check,
+    init=_layernorm_quant_init,
+)
+
+
 # ── Fused RMSNorm + SiLU ──────────────────────────────────────────────────────
 
 
@@ -882,7 +1254,11 @@ add_rmsnorm_fp4quant_trace = TraceTemplate(
     name_prefix="add_rmsnorm_fp4quant",
     description=(
         "CuTe-DSL fused (residual + input) → RMSNorm → FP4 quantize. "
-        "Mutates the residual buffer in-place with the prenorm sum."
+        "Mutates the residual buffer in-place with the prenorm sum. "
+        "Note: the optional output variants of the runtime API "
+        "(``output_both_sf_layouts`` and ``y_out``) are not modeled by this "
+        "trace template — it captures the core FP4-quantize signature only; "
+        "dump/replay of those extra mutated buffers is unsupported."
     ),
     axes=_RMSNORM_FP4_AXES,
     inputs={
@@ -907,4 +1283,26 @@ add_rmsnorm_fp4quant_trace = TraceTemplate(
 )
 add_rmsnorm_fp4quant_trace.axes["scalar"] = Var(
     description="global_scale tensor length (typically 1).",
+)
+
+
+def add_rmsnorm_fp4quant_trace_dispatch(save_dir=None, name=None, **kwargs):
+    """Select the trace template for ``add_rmsnorm_fp4quant``.
+
+    The static template models only the core FP4-quantize signature. The
+    optional output variants — ``y_out`` (an extra normed bf16/fp16 store)
+    and ``output_both_sf_layouts`` (a second scale-factor buffer) — add
+    mutated outputs the template does not represent. Refuse to emit a trace
+    for those calls (return ``None``) instead of silently dumping an
+    incomplete definition that dump/replay tooling would mis-handle.
+    """
+    if kwargs.get("y_out") is not None or kwargs.get("output_both_sf_layouts"):
+        return None
+    return add_rmsnorm_fp4quant_trace
+
+
+# Published so ``@flashinfer_api`` can auto-register the underlying template
+# for trace discovery even though the decorator receives the dispatch fn.
+add_rmsnorm_fp4quant_trace_dispatch.templates = (  # type: ignore[attr-defined]
+    add_rmsnorm_fp4quant_trace,
 )

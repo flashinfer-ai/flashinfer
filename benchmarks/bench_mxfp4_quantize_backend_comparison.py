@@ -58,10 +58,11 @@ LAYOUTS_BY_NAME = {
 
 
 def _sf_layout_flags(sf_layout: SfLayout) -> Tuple[bool, bool]:
-    """Translate SfLayout enum to (is_sf_swizzled_layout, is_sf_8x4_layout)."""
-    is_swizzled = sf_layout != SfLayout.layout_linear
-    is_8x4 = sf_layout == SfLayout.layout_8x4
-    return is_swizzled, is_8x4
+    """Translate SfLayout into the flags used by fp4_quantize."""
+    return (
+        sf_layout != SfLayout.layout_linear,
+        sf_layout == SfLayout.layout_8x4,
+    )
 
 
 def get_cc():
@@ -79,46 +80,27 @@ def verify_mxfp4_correctness(
     """
     Verify that both backends produce correct outputs.
 
-    For 128x4 and linear layouts a dequant roundtrip is also checked. The
-    e2m1_and_ufp8sf_scale_to_float helper does not support 8x4, so for that
-    layout only the backend-vs-backend quant + scale match is verified.
+    A dequantization roundtrip is checked for every scale-factor layout.
 
     Returns:
         Tuple of (success, message, quant_match_pct, scale_match_pct)
         On failure, quant_match_pct and scale_match_pct are 0.0
     """
     from flashinfer.quantization.fp4_quantization import (
-        e2m1_and_ufp8sf_scale_to_float,
-        fp4_quantize,
+        mxfp4_dequantize,
+        mxfp4_quantize,
     )
-
-    is_sf_swizzled_layout, is_sf_8x4_layout = _sf_layout_flags(sf_layout)
 
     torch.manual_seed(42)
     x = torch.randn(m, k, device="cuda", dtype=dtype)
-    global_sf = ((448 * 6) / x.float().abs().nan_to_num().max()).cuda()
 
     try:
         # Test CUDA backend
-        quant_cuda, scale_cuda = fp4_quantize(
-            x,
-            global_sf,
-            sf_vec_size=32,
-            sf_use_ue8m0=True,
-            is_sf_swizzled_layout=is_sf_swizzled_layout,
-            is_sf_8x4_layout=is_sf_8x4_layout,
-            backend="cuda",
-        )
+        quant_cuda, scale_cuda = mxfp4_quantize(x, backend="cuda", sfLayout=sf_layout)
 
         # Test CuTe-DSL backend
-        quant_cute, scale_cute = fp4_quantize(
-            x,
-            global_sf,
-            sf_vec_size=32,
-            sf_use_ue8m0=True,
-            is_sf_swizzled_layout=is_sf_swizzled_layout,
-            is_sf_8x4_layout=is_sf_8x4_layout,
-            backend="cute-dsl",
+        quant_cute, scale_cute = mxfp4_quantize(
+            x, backend="cute-dsl", sfLayout=sf_layout
         )
 
         # Check shapes match
@@ -141,51 +123,30 @@ def verify_mxfp4_correctness(
         quant_match_pct = (quant_cuda == quant_cute).float().mean().item() * 100
         scale_match_pct = (scale_cuda == scale_cute).float().mean().item() * 100
 
-        # The dequant helper only supports 128x4 swizzled and linear layouts.
-        # Skip roundtrip for 8x4 and rely on the backend agreement check above.
-        if not is_sf_8x4_layout:
-            dq_cuda = e2m1_and_ufp8sf_scale_to_float(
-                quant_cuda.cpu().view(torch.uint8),
-                scale_cuda.cpu().view(torch.uint8).reshape(-1),
-                torch.tensor([1.0]),
-                32,
-                0,
-                is_sf_swizzled_layout,
+        dq_cuda = mxfp4_dequantize(quant_cuda, scale_cuda, sfLayout=sf_layout)
+        dq_cute = mxfp4_dequantize(quant_cute, scale_cute, sfLayout=sf_layout)
+
+        x_f32 = x.cpu().to(torch.float32).view(1, -1)
+        dq_cuda_f32 = dq_cuda.cpu().to(torch.float32).view(1, -1)
+        dq_cute_f32 = dq_cute.cpu().to(torch.float32).view(1, -1)
+
+        cos_sim_cuda = torch.nn.functional.cosine_similarity(x_f32, dq_cuda_f32).item()
+        cos_sim_cute = torch.nn.functional.cosine_similarity(x_f32, dq_cute_f32).item()
+
+        if cos_sim_cuda < 0.9:
+            return (
+                False,
+                f"CUDA roundtrip quality too low: cos_sim={cos_sim_cuda:.4f}",
+                quant_match_pct,
+                scale_match_pct,
             )
-            dq_cute = e2m1_and_ufp8sf_scale_to_float(
-                quant_cute.cpu().view(torch.uint8),
-                scale_cute.cpu().view(torch.uint8).reshape(-1),
-                torch.tensor([1.0]),
-                32,
-                0,
-                is_sf_swizzled_layout,
+        if cos_sim_cute < 0.9:
+            return (
+                False,
+                f"CuTe-DSL roundtrip quality too low: cos_sim={cos_sim_cute:.4f}",
+                quant_match_pct,
+                scale_match_pct,
             )
-
-            x_f32 = x.cpu().to(torch.float32).view(1, -1)
-            dq_cuda_f32 = dq_cuda.cpu().to(torch.float32).view(1, -1)
-            dq_cute_f32 = dq_cute.cpu().to(torch.float32).view(1, -1)
-
-            cos_sim_cuda = torch.nn.functional.cosine_similarity(
-                x_f32, dq_cuda_f32
-            ).item()
-            cos_sim_cute = torch.nn.functional.cosine_similarity(
-                x_f32, dq_cute_f32
-            ).item()
-
-            if cos_sim_cuda < 0.9:
-                return (
-                    False,
-                    f"CUDA roundtrip quality too low: cos_sim={cos_sim_cuda:.4f}",
-                    quant_match_pct,
-                    scale_match_pct,
-                )
-            if cos_sim_cute < 0.9:
-                return (
-                    False,
-                    f"CuTe-DSL roundtrip quality too low: cos_sim={cos_sim_cute:.4f}",
-                    quant_match_pct,
-                    scale_match_pct,
-                )
 
         return True, "OK", quant_match_pct, scale_match_pct
 
@@ -219,13 +180,12 @@ def bench_mxfp4_quantize(
 
     # Create input tensor
     x = torch.randn(m, k, device="cuda", dtype=dtype)
-    global_sf = ((448 * 6) / x.float().abs().nan_to_num().max()).cuda()
 
     # Warmup
     _ = fp4_quantize(
         x,
-        global_sf,
-        sf_vec_size=32,
+        global_scale=None,
+        sf_vec_size=SF_VEC_SIZE,
         sf_use_ue8m0=True,
         is_sf_swizzled_layout=is_sf_swizzled_layout,
         is_sf_8x4_layout=is_sf_8x4_layout,
@@ -236,8 +196,8 @@ def bench_mxfp4_quantize(
     def run_kernel():
         fp4_quantize(
             x,
-            global_sf,
-            sf_vec_size=32,
+            global_scale=None,
+            sf_vec_size=SF_VEC_SIZE,
             sf_use_ue8m0=True,
             is_sf_swizzled_layout=is_sf_swizzled_layout,
             is_sf_8x4_layout=is_sf_8x4_layout,

@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2011-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2011-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are not permit-
  * ted.
@@ -79,6 +79,11 @@ struct KernelParams {
   int64_t const* ptrCustomMaskOffsets;
   // The debug output matrix O
   float* ptrDebugO;
+  // DSv4 inverse-RoPE + FP8 quant fusion metadata and output scale tensor. The field order must
+  // stay in sync with the kernels or every later field is misread by the cubins.
+  float const* ptrDsv4InvRopeCosSinCache;
+  // DSv4 output scales. RopeQuant cubins interpret this as packed UE8M0 bytes in INT32 storage.
+  float* ptrDsv4OScale;
   // The first sparseMask offsets in the Kv sequence dimension.
   int32_t const* ptrFirstSparseMaskOffsetsKv;
   // The counter for the multiCtasKv mode.
@@ -124,12 +129,20 @@ struct KernelParams {
   // The variable sparseMla topK lengths with shape of [numTokensQ].
   int32_t const* ptrSparseMlaTopKLens;
 
-  // The attention window size for sliding window attention.
-  int32_t mAttentionWindowSize;
+  // Sliding-window reaches excluding the current token. -1 means unbounded.
+  // setKernelParams() zeroes this struct and then assigns all four fields explicitly; do not rely
+  // on default member initializers here.
+  int32_t mLeftSlidingWindow;
+  int32_t mRightSlidingWindow;
+  // Inclusive VariableWindow bounds, one pair per packed Q token.
+  int32_t const* ptrVariableWindowTokenStarts;
+  int32_t const* ptrVariableWindowTokenEnds;
   // The batch size
   int32_t mBatchSize;
   // The chunked attention size in log2.
   int32_t mChunkedAttentionSizeLog2;
+  // Padded token dimension for the DSv4 fused packed UE8M0 scale layout.
+  int64_t mDsv4ScaleBufM;
   // The factor to add to the maximum value to increase the probability
   //   of skip correction during next iterations.
   float mInflateMax;
@@ -195,7 +208,7 @@ struct KernelParams {
   template <class FmhaOptions>
   static auto makeTmaShapeStrideQ(FmhaOptions const& options, bool groupsHeadsQ,
                                   bool groupsTokensHeadsQ, int32_t tileSizeQ,
-                                  int32_t numEltsInClampedHeadDimQ) {
+                                  int32_t tileSizePerCtaQ, int32_t numEltsInClampedHeadDimQ) {
     //
     // The Q has shape of [numTokens * numHeadsQPerKv, numHeadsKv * 1, headDim]
     // when grouping headsQ, otherwise it would be [numTokens, numHeadsQPerKv * numHeadsKv,
@@ -265,8 +278,10 @@ struct KernelParams {
     // The tile shape for TMA.
     auto tileShapes = std::vector<uint32_t>{static_cast<uint32_t>(numEltsInClampedHeadDimQ), 1, 1,
                                             static_cast<uint32_t>(tileSizeQ)};
-    // The number of tokensQ per CTA.
-    int32_t numTokensPerCtaQ{tileSizeQ};
+    // The number of tokensQ per CTA (the CTA covers all Q tile instances).
+    int32_t numTokensPerCtaQ{tileSizePerCtaQ};
+    // The number of tokensQ loaded by one Q tile instance (the TMA box covers one instance).
+    int32_t numTokensPerTileQ{tileSizeQ};
     // Re-compute the number of tokensQ per CTA if groupsHeadsQ is enabled.
     if (groupsHeadsQ) {
       if (groupsTokensHeadsQ) {
@@ -275,13 +290,15 @@ struct KernelParams {
         // tensor to [numTokensQ, numGroupedHeads, numHeads, headDimQ] and we might want to revisit
         // this in the future.
         numTokensPerCtaQ = static_cast<int32_t>(numTokensPerCtaQ / numGroupedHeads);
+        numTokensPerTileQ = static_cast<int32_t>(numTokensPerTileQ / numGroupedHeads);
       } else {
-        numGroupedHeads = tileSizeQ;
+        numGroupedHeads = tileSizePerCtaQ;
         numTokensPerCtaQ = 1;
+        numTokensPerTileQ = 1;
       }
       tileShapes = std::vector<uint32_t>{static_cast<uint32_t>(numEltsInClampedHeadDimQ),
                                          static_cast<uint32_t>(numGroupedHeads), 1,
-                                         static_cast<uint32_t>(numTokensPerCtaQ)};
+                                         static_cast<uint32_t>(numTokensPerTileQ)};
     }
 
     return std::make_tuple(shape, stride, tileShapes, numTokensPerCtaQ);
@@ -382,8 +399,11 @@ struct KernelParams {
       strideBatch = options.vStrideBatch;
     }
 
-    // Ragged layout has no batch stride; reset negative overflow to 0 for TMA descriptor.
-    if (!isPagedKv(options.mQkvLayout) && !isContiguousKv(options.mQkvLayout) && strideBatch < 0) {
+    // The TRTLLM-GEN ragged prefill launcher uses SeparateQkv for packed non-paged
+    // K/V. makeShapeKv collapses non-paged/non-contiguous K/V to a singleton batch
+    // dimension, so the TMA descriptor must not inherit a synthetic numel-derived
+    // batch stride. Zero handles both negative and positive int32 wraparound.
+    if (isSeparateQkv(options.mQkvLayout)) {
       strideBatch = 0;
     }
 
@@ -646,10 +666,12 @@ struct KernelParams {
     return desc;
   }
 
-  // Setup the kernel parameters.
+  // Setup the kernel parameters. totalNumCtas is the launched CTA count when it can exceed the SM
+  // count (multi-wave KV split), else 0.
   template <class FmhaOptions_, class KernelMeta>
   static KernelParams setKernelParams(FmhaOptions_ const& options, KernelMeta const& kernelMeta,
-                                      int32_t maxNumCtasQ, int32_t maxNumCtasKv) {
+                                      int32_t maxNumCtasQ, int32_t maxNumCtasKv,
+                                      int32_t totalNumCtas) {
     // Create the return struct.
     KernelParams params;
     // Memset the kernel parameters to 0.
@@ -677,7 +699,7 @@ struct KernelParams {
     // Shape/stride for gmem tensor Q.
     auto [shapeQ, strideQ, tileShapeQ, numTokensPerCtaQ] =
         makeTmaShapeStrideQ(options, kernelMeta.mGroupsHeadsQ, kernelMeta.mGroupsTokensHeadsQ,
-                            kernelMeta.mTileSizeQ, numEltsInClampedHeadDimQ);
+                            kernelMeta.mTileSizeQ, kernelMeta.mStepQ, numEltsInClampedHeadDimQ);
     // Build tma descriptor for Q.
     params.tmaQ_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeQ, shapeQ, strideQ, tileShapeQ,
                                         const_cast<void*>(qPtr));
@@ -829,6 +851,8 @@ struct KernelParams {
     params.ptrO = options.oPtr;
     // The output scaling factor buffer.
     params.ptrSfO = options.oSfPtr;
+    params.ptrDsv4InvRopeCosSinCache = options.dsv4InvRopeCosSinCachePtr;
+    params.ptrDsv4OScale = options.dsv4OScalePtr;
 
     // TRT-LLM restrictions: the quantization scales must be on the device.
     params.ptrOutputScale = options.outputScalePtr;
@@ -836,12 +860,17 @@ struct KernelParams {
     // The sequence lengths for Kv.
     params.ptrSeqLensKv = options.seqLensKvPtr;
     params.ptrSparseMlaTopKLens = options.sparseMlaTopKLensPtr;
+    params.ptrVariableWindowTokenStarts = options.variableWindowTokenStartsPtr;
+    params.ptrVariableWindowTokenEnds = options.variableWindowTokenEndsPtr;
 
     // Attention sink
     params.ptrAttentionSinks = options.ptrAttentionSinks;
 
     // The partial buffers' pointers when the multiCtasKv mode is enabled.
-    int64_t partialStatsBufferSize = options.mMultiProcessorCount * kernelMeta.mStepQ;
+    // Size the partial stats for every launched CTA when there are more CTAs than SMs.
+    int64_t partialStatsBufferSize =
+        static_cast<int64_t>(std::max(options.mMultiProcessorCount, totalNumCtas)) *
+        kernelMeta.mStepQ;
     params.ptrMultiCtasKvCounter = options.multiCtasKvCounterPtr;
     params.ptrPartialStats = reinterpret_cast<float2*>(options.multiCtasKvScratchPtr);
     params.ptrPartialO = params.ptrPartialStats + partialStatsBufferSize;
@@ -853,10 +882,11 @@ struct KernelParams {
     params.ptrScaleSfO = options.oSfScalePtr;
     params.mScaleSfO = options.mScaleSfO;
 
-    params.mAttentionWindowSize = options.mAttentionWindowSize;
+    params.mLeftSlidingWindow = options.mLeftSlidingWindow;
+    params.mRightSlidingWindow = options.mRightSlidingWindow;
     if (isSlidingOrChunkedCausalMask(
             static_cast<TrtllmGenAttentionMaskType>(kernelMeta.mMaskType)) &&
-        options.mChunkedAttentionSize != INT_MAX) {
+        options.mChunkedAttentionSize > 0) {
       FLASHINFER_CHECK((options.mChunkedAttentionSize & (options.mChunkedAttentionSize - 1)) == 0,
                        "Chunked attention size must be a power of 2");
       params.mChunkedAttentionSizeLog2 = std::log2(options.mChunkedAttentionSize);
@@ -883,7 +913,6 @@ struct KernelParams {
     params.mSumOfSeqLensQ = options.mSumOfSeqLensQ;
     params.mSumOfSeqLensKv = options.mSumOfSeqLensKv;
     params.mBatchSize = options.mBatchSize;
-    params.mChunkedAttentionSizeLog2 = 0;
     params.mNumHeadsQ = options.mNumHeadsQ;
     params.mNumHeadsKv = options.mNumHeadsKv;
     params.mNumHeadsQPerKv = options.mNumHeadsQPerKv;
@@ -891,6 +920,7 @@ struct KernelParams {
     params.mNumHiddenEltsO = options.mNumHeadsQ * options.mHeadDimQk;
     params.mNumTokensPerCtaQ = numTokensPerCtaQ;
     params.mOutputScale = options.outputScale;
+    params.mDsv4ScaleBufM = options.mDsv4ScaleBufM;
     params.mScaleSoftmaxLog2 = options.scaleSoftmaxLog2;
     params.mSkipSoftmaxThresholdScaleFactor = options.mSkipSoftmaxThresholdScaleFactor;
     params.mStartTokenIdxSfO = options.mSfStartTokenIdx;
@@ -901,8 +931,8 @@ struct KernelParams {
     FLASHINFER_CHECK(!options.isSparseMla() || (options.mSparseMlaTopK % 4) == 0,
                      "SparseMlaTopK must be a multiple of 4");
     params.mSparseAttnTopK = options.mSparseMlaTopK;
-    // TODO: Integrate trtllm block-sparse attention kernels when needed.
-    params.mUseBlockSparseAttention = false;
+    // Whether to use block-sparse attention (per-KV-head page tables and sequence lengths).
+    params.mUseBlockSparseAttention = options.mUseBlockSparseAttention;
     // Whether the indices for K & V pages are shared as unified index (vLLM/FlashInfer).
     params.mUsesSharedPagedKvIdx = options.mUsesSharedPagedKvIdx;
     return params;

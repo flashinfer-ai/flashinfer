@@ -14,15 +14,14 @@ import torch
 from typing_extensions import deprecated
 
 from flashinfer.comm.mapping import Mapping
-from flashinfer.comm.mnnvl import TorchDistBackend
+from flashinfer.api_logging import flashinfer_api
 
 from ..jit import gen_trtllm_mnnvl_comm_module
-from ..utils import register_custom_op
+from ..utils import register_custom_op, round_up
 from ..fp4_quantization import _compute_swizzled_layout_sf_size
-from .mnnvl import CommBackend, MPIBackend
+from .mnnvl import CommBackend, McastGPUBuffer, MPIBackend, SymmDeviceMemory
 from .trtllm_ar import QuantizationSFLayout
 from .workspace_base import AllReduceFusionWorkspace
-from .torch_symmetric_memory import _alloc_symm_buffer_bytes
 
 
 def mpi_barrier():
@@ -59,6 +58,8 @@ def _supports_exact_group_quant_partition(
     hidden_dim: int, group_size: int, element_size: int
 ) -> bool:
     """Return whether MNNVL can assign whole quantization groups to each CTA."""
+    if hidden_dim <= 0 or group_size <= 0 or hidden_dim % group_size != 0:
+        return False
     elements_per_thread = _MNNVL_VECTOR_BYTES // element_size
     if hidden_dim % elements_per_thread != 0:
         return False
@@ -81,11 +82,16 @@ class MNNVLQuantType:
     FP8 = 1
     NVFP4 = 2
     DYNAMIC_FP8 = 3
-    PER_TOKEN_GROUP_FP8_PACKED = 4
+    # E4M3 data with one UE8M0 scale per 32 elements (SWIZZLED_128x4 or LINEAR scales),
+    # bit-exact with mxfp8_quantize(backend="cute-dsl") on the RMSNorm output.
+    MXFP8 = 4
+    PER_TOKEN_GROUP_FP8_PACKED = 5
 
 
 class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
     NUM_LAMPORT_BUFFERS = 3
+    TWOSHOT_NUM_STAGES = 2
+    PACKED_ALIGNMENT_BYTES = 16
 
     def __init__(
         self,
@@ -97,9 +103,9 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         comm_backend: Optional[CommBackend] = None,
     ):
         """
-        Initialize the MNNVL Allreduce Fusion Workspace. The workspace will be allocated and initialized based on the provided problem size. If max_num_tokens is larger than the one-shot threshold, the workspace will be created according to the max of required one-shot size at threshold, or the required two-shot size. Note that the workspace is not bind to the given problem size. It can be reused for different problem size without reinitialization given the allocated size is sufficient.
+        Initialize the MNNVL Allreduce Fusion Workspace. The workspace will be allocated and initialized based on the provided problem size. If the maximum problem size in bytes exceeds the one-shot threshold, the workspace will be created according to the max of required one-shot size at the threshold or the required two-shot size. Note that the workspace is not bound to the given problem size. It can be reused for different problem sizes without reinitialization given the allocated size is sufficient.
 
-        If the buffer_size_in_bytes is provided, the workspace will be created according to the provided size. The user is expected to use the utility function get_required_buffer_size_bytes to calculate the required size. The actual allocation size may be larger due to alignment requirements. This covers the advanced used case, for example, the user may want to enforce oneshot strategy and ignore the heuristics.
+        If the buffer_size_in_bytes is provided, the workspace will be created according to the provided size. The user is expected to use the utility function get_required_buffer_size_bytes to calculate the required size. The actual allocation size may be larger due to alignment requirements. This covers the advanced use case, for example, the user may want to enforce oneshot strategy and ignore the heuristics.
 
         Either max_num_tokens or buffer_size_in_bytes must be provided.
 
@@ -151,6 +157,9 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
                 f"[MNNVL Allreduce] Using provided buffer size override in bytes: {buffer_size_in_bytes} bytes."
             )
 
+        buffer_alignment = self.TWOSHOT_NUM_STAGES * self.PACKED_ALIGNMENT_BYTES
+        buffer_size_in_bytes = round_up(buffer_size_in_bytes, buffer_alignment)
+
         if comm_backend is None:
             comm_backend = MPIBackend()
         if buffer_size_in_bytes > (2**32 - 1):
@@ -172,29 +181,21 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         # support base_gpu_id != 0 scenarios where the actual CUDA device
         # index differs from the TP rank / local_rank.
         device = torch.device("cuda", torch.cuda.current_device())
-        if isinstance(comm_backend, TorchDistBackend):
-            group = (
-                comm_backend._group
-                if comm_backend._group is not None
-                else torch.distributed.group.WORLD
-            )
-            group_name = group.group_name
-        else:
-            group_name = torch.distributed.group.WORLD.group_name
-        self.ptrs, self.tensor, self.handle = _alloc_symm_buffer_bytes(
-            requested_workspace_size,
-            mapping.tp_size,
-            torch.float32,
-            device,
-            group_name,
+        self.handle = McastGPUBuffer(
+            buf_size=requested_workspace_size,
+            group_size=mapping.tp_size,
+            group_rank=mapping.tp_rank,
+            device=device,
+            comm_backend_for_handle_transfer=comm_backend,
         )
+        self.ptrs = self.handle.mcast_device_memory.get_buffer_ptrs_host()
 
-        # handle.buffer_size is the usable data size. torch symmetric memory
-        # allocator places signal_pad on top of it, not carved from within.
-        allocated_size = self.handle.buffer_size
-        # We want the buffer size to be aligned to 16B which is the granularity for buffer management.
+        allocated_size = self.handle.buf_size
         self.buffer_size_bytes = (
-            math.floor(allocated_size / self.NUM_LAMPORT_BUFFERS) // 16 * 16
+            allocated_size
+            // self.NUM_LAMPORT_BUFFERS
+            // buffer_alignment
+            * buffer_alignment
         )
         # This workspace size is used for checking the buffer. We need to set it to the actual size in use. The buffer free logic does not rely on this size.
         self.workspace_size_bytes = self.buffer_size_bytes * self.NUM_LAMPORT_BUFFERS
@@ -203,9 +204,7 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             f"[MNNVL Allreduce] Actual allocated size: {allocated_size} bytes, Actual buffer size per lamport buffer: {self.buffer_size_bytes} bytes, total workspace: {self.workspace_size_bytes} bytes."
         )
 
-        # lamport initialize tensor to negative zero.
-        self.tensor.fill_(-0.0)
-        # Wait until the initialization is done
+        self.handle.lamport_initialize(self.rank, torch.float32)
         torch.cuda.synchronize()
         comm_backend.barrier()
 
@@ -220,9 +219,16 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             device=torch.device("cuda", torch.cuda.current_device()),
         )
 
-        self.uc_ptrs_dev = self.handle.buffer_ptrs_dev
-        self.uc_ptr_local = self.handle.buffer_ptrs[self.rank]
-        self.mc_ptr = self.handle.multicast_ptr
+        self.uc_ptrs_dev = self.handle.get_buffer_ptrs_dev()
+        self.uc_ptr_local = self.handle.get_unicast_ptr(self.rank)
+        self.mc_ptr = self.handle.get_multicast_ptr()
+        if not self.mc_ptr:
+            self.destroy()
+            raise RuntimeError(
+                "[MNNVLAllReduceFusionWorkspace] Multicast pointer is null after rendezvous. "
+                "This requires NVLink multicast (SM90+ with NVLink, e.g. H100 SXM). "
+                "Use backend='trtllm' or backend='auto' on unsupported hardware."
+            )
 
     @functools.cache
     def is_buffer_size_sufficient(
@@ -277,6 +283,63 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
     def backend(self) -> str:
         return "mnnvl"
 
+    def _require_handles_attached(self) -> None:
+        memory = getattr(self.handle, "mcast_device_memory", None)
+        if isinstance(memory, SymmDeviceMemory) and not memory.mapped:
+            raise RuntimeError("MNNVL handles are not attached")
+
+    def _initialize_protocol(self) -> None:
+        self.handle.lamport_initialize(self.rank, torch.float32)
+        num_bytes_to_clear = [0] * 4
+        # The workspace may be created under inference mode and restored outside it.
+        with torch.inference_mode():
+            self.buffer_flags.copy_(
+                torch.tensor(
+                    [0, 2, self.buffer_size_bytes, 0, *num_bytes_to_clear, 0],
+                    dtype=torch.uint32,
+                    device=self.buffer_flags.device,
+                )
+            )
+        torch.cuda.synchronize()
+
+    @flashinfer_api
+    def checkpoint_prepare(self) -> None:
+        """Detach physical backing; repeated successful calls are no-ops."""
+        memory = getattr(self.handle, "mcast_device_memory", None)
+        if not isinstance(memory, SymmDeviceMemory):
+            raise NotImplementedError(
+                "Stable-VA checkpointing is unavailable for workspaces backed "
+                "by torch symmetric memory"
+            )
+        if not memory.mapped:
+            return
+        memory._unmap_and_release_handles()
+        # Do not return until every rank has released its workspace handles.
+        memory.comm_backend.barrier()
+
+    @flashinfer_api
+    def checkpoint_restore(self, comm_backend: CommBackend) -> None:
+        """Restore physical backing; repeated successful calls are no-ops.
+
+        Parameters
+        ----------
+        comm_backend : CommBackend
+            Communication backend used to recreate and exchange MNNVL memory
+            handles. It must have the same rank and world size as the original
+            allocation.
+        """
+        memory = getattr(self.handle, "mcast_device_memory", None)
+        if not isinstance(memory, SymmDeviceMemory):
+            raise NotImplementedError(
+                "Stable-VA checkpointing is unavailable for workspaces backed "
+                "by torch symmetric memory"
+            )
+        if memory.mapped:
+            return
+        memory._create_and_map_handles(comm_backend)
+        self._initialize_protocol()
+        comm_backend.barrier()
+
     def destroy(self) -> None:
         """Destroy workspace and free resources."""
         if getattr(self, "_destroyed", False):
@@ -286,7 +349,6 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         del self.uc_ptrs_dev
         del self.uc_ptr_local
         del self.mc_ptr
-        del self.tensor
         del self.handle
         del self.ptrs
         self._destroyed = True
@@ -461,6 +523,8 @@ def trtllm_mnnvl_allreduce(
             f"The output tensor must be 2D, got {len(output.shape)}D. The shape is {output.shape}."
         )
 
+    workspace._require_handles_attached()
+
     module = get_trtllm_mnnvl_comm_module()
 
     if strategy == MNNVLAllreduceFusionStrategy.AUTO:
@@ -561,6 +625,8 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
             f"The residual output tensor must be 2D, got {len(residual_out.shape)}D. The shape is {residual_out.shape}."
         )
 
+    workspace._require_handles_attached()
+
     module = get_trtllm_mnnvl_comm_module()
 
     if strategy == MNNVLAllreduceFusionStrategy.AUTO:
@@ -629,24 +695,28 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
             ``[num_tokens, hidden_dim]``.
         residual_out: Optional residual output tensor with shape
             ``[num_tokens, hidden_dim]``.
-        quant_out: Optional quantized output. For FP8, shape must be
+        quant_out: Optional quantized output. For FP8 and MXFP8, shape must be
             ``[num_tokens, hidden_dim]`` and dtype ``torch.float8_e4m3fn``. For
             NVFP4, shape must be ``[num_tokens, hidden_dim // 2]`` and dtype
             ``torch.uint8`` or ``torch.float4_e2m1fn_x2``.
         scale_out: Optional scale output. Dynamic FP8 uses ``[num_tokens, 1]``
-            float32. NVFP4 uses ``[num_tokens, hidden_dim // 16]`` for
+            float32. MXFP8 uses a contiguous 1-D uint8 tensor of UE8M0 scales
+            (one per 32 elements) sized as ``mxfp8_quantize`` returns it for the
+            layout; the scales of the swizzled layout's padding rows are not
+            written. NVFP4 uses ``[num_tokens, hidden_dim // 16]`` for
             ``LINEAR`` layout, or a 1-D tensor large enough for the padded
             ``SWIZZLED_128x4`` layout. Per-token-group FP8 uses packed UE8M0
             scales with shape ``[num_tokens, ceil(groups_per_row / 4)]``, dtype
             ``torch.int32``, and stride ``(1, ceil(num_tokens / 4) * 4)``.
             Static FP8 ignores this argument.
         output_scale: Scalar float or float32 tensor used as the quantization
-            output scale. Defaults to ``1.0``.
-        layout_code: NVFP4 scale layout. MNNVL supports ``SWIZZLED_128x4`` and
+            output scale. Defaults to ``1.0``. Not used by dynamic FP8, MXFP8,
+            or packed per-token-group FP8.
+        layout_code: NVFP4/MXFP8 scale layout. MNNVL supports ``SWIZZLED_128x4`` and
             ``LINEAR``; ``SWIZZLED_8x4`` is not supported.
-        quant_type: ``MNNVLQuantType.FP8``, ``MNNVLQuantType.NVFP4``, or
-            ``MNNVLQuantType.DYNAMIC_FP8``, or
-            ``MNNVLQuantType.PER_TOKEN_GROUP_FP8_PACKED``.
+        quant_type: ``MNNVLQuantType.FP8``, ``MNNVLQuantType.NVFP4``,
+            ``MNNVLQuantType.DYNAMIC_FP8``, ``MNNVLQuantType.MXFP8``,
+            or ``MNNVLQuantType.PER_TOKEN_GROUP_FP8_PACKED``.
         launch_with_pdl: Whether to launch with PDL.
         strategy: MNNVL execution strategy. ``AUTO`` uses internal heuristics.
         weight_bias: Bias added to gamma before scaling. ``0.0`` for standard
@@ -661,12 +731,40 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
         is ``None`` for static FP8; ``output`` is ``None`` unless requested.
     """
 
+    if quant_type == MNNVLQuantType.PER_TOKEN_GROUP_FP8_PACKED:
+        # The kernel uses packed vector loads/stores and interprets all RMSNorm
+        # buffers as the input dtype. Reject incompatible views before launch.
+        if input.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise ValueError(
+                "group FP8 input must have dtype float16, bfloat16, or float32."
+            )
+        if input.ndim != 2 or min(input.shape) <= 0:
+            raise ValueError("group FP8 input must be a non-empty 2D tensor.")
+        for tensor, name in (
+            (input, "input"),
+            (residual_in, "residual_in"),
+            (gamma, "gamma"),
+            (residual_out, "residual_out"),
+            (output, "output"),
+        ):
+            if tensor is not None:
+                if tensor.dtype != input.dtype:
+                    raise ValueError(
+                        f"{name} dtype must match input dtype for group FP8."
+                    )
+                if not tensor.is_contiguous():
+                    raise ValueError(f"{name} must be contiguous for group FP8.")
+                if tensor.data_ptr() % _MNNVL_VECTOR_BYTES != 0:
+                    raise ValueError(f"{name} must be 16-byte aligned for group FP8.")
+
     if epsilon is None:
         epsilon = torch.finfo(input.dtype).eps
-    if output_scale is None and quant_type not in (
+    dynamic_scale = quant_type in (
         MNNVLQuantType.DYNAMIC_FP8,
+        MNNVLQuantType.MXFP8,
         MNNVLQuantType.PER_TOKEN_GROUP_FP8_PACKED,
-    ):
+    )
+    if output_scale is None and not dynamic_scale:
         output_scale = 1.0
 
     if len(input.shape) != 2:
@@ -703,10 +801,7 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
             f"output shape must match input shape, got {output.shape} and {input.shape}."
         )
 
-    if quant_type in (
-        MNNVLQuantType.DYNAMIC_FP8,
-        MNNVLQuantType.PER_TOKEN_GROUP_FP8_PACKED,
-    ):
+    if dynamic_scale:
         output_scale_tensor = None
     elif isinstance(output_scale, torch.Tensor):
         if output_scale.numel() < 1:
@@ -812,10 +907,50 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
             )
         if not scale_out.is_contiguous():
             raise ValueError("scale_out must be contiguous for dynamic FP8.")
-    elif quant_type == MNNVLQuantType.PER_TOKEN_GROUP_FP8_PACKED:
-        if block_quant_group_size is None or block_quant_group_size <= 0:
+    elif quant_type == MNNVLQuantType.MXFP8:
+        if hidden_dim % 32 != 0:
             raise ValueError(
-                "block_quant_group_size must be provided and positive for group FP8."
+                f"MNNVL MXFP8 quantization requires hidden_dim divisible by 32, got {hidden_dim}."
+            )
+        if quant_out is None:
+            quant_out = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+        elif quant_out.shape != input.shape:
+            raise ValueError(
+                f"quant_out shape must be {tuple(input.shape)} for MXFP8, got {tuple(quant_out.shape)}."
+            )
+        if quant_out.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                f"quant_out dtype for MXFP8 must be float8_e4m3fn, got {quant_out.dtype}."
+            )
+        if not quant_out.is_contiguous():
+            raise ValueError("quant_out must be contiguous for MXFP8.")
+        expected_scale_out_numel = (
+            token_num * (hidden_dim // 32)
+            if layout_code == QuantizationSFLayout.LINEAR
+            else _compute_swizzled_layout_sf_size(token_num, hidden_dim // 32)
+        )
+        if scale_out is None:
+            scale_out = torch.empty(
+                expected_scale_out_numel, dtype=torch.uint8, device=input.device
+            )
+        elif scale_out.numel() < expected_scale_out_numel:
+            raise ValueError(
+                f"scale_out is too small for MXFP8: got {scale_out.numel()} elements, need at least {expected_scale_out_numel}."
+            )
+        if scale_out.dtype != torch.uint8:
+            raise ValueError(
+                f"scale_out dtype for MXFP8 must be uint8, got {scale_out.dtype}."
+            )
+        if not scale_out.is_contiguous():
+            raise ValueError("scale_out must be contiguous for MXFP8.")
+    elif quant_type == MNNVLQuantType.PER_TOKEN_GROUP_FP8_PACKED:
+        if (
+            not isinstance(block_quant_group_size, int)
+            or isinstance(block_quant_group_size, bool)
+            or block_quant_group_size <= 0
+        ):
+            raise ValueError(
+                "block_quant_group_size must be a positive integer for group FP8."
             )
         if hidden_dim % block_quant_group_size != 0:
             raise ValueError(
@@ -842,6 +977,8 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
             )
         if not quant_out.is_contiguous():
             raise ValueError("quant_out must be contiguous for group FP8.")
+        if quant_out.data_ptr() % (_MNNVL_VECTOR_BYTES // input.element_size()) != 0:
+            raise ValueError("quant_out must be vector-aligned for group FP8.")
 
         groups_per_row = hidden_dim // block_quant_group_size
         k_num_packed = (groups_per_row + 3) // 4
@@ -869,6 +1006,8 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
             )
     else:
         raise ValueError(f"Unsupported MNNVL quant_type: {quant_type}")
+
+    workspace._require_handles_attached()
 
     if strategy == MNNVLAllreduceFusionStrategy.AUTO:
         strategy = MNNVLAllreduceFusionStrategy.select_strategy(
@@ -944,7 +1083,7 @@ def get_allreduce_mnnvl_workspace(
 
     Returns:
         Tuple containing:
-        - MNNVLAllReduceFusionWorkspace: The workspace object backed by torch symmetric memory
+        - MNNVLAllReduceFusionWorkspace: The CUDA VMM-backed workspace object
         - torch.Tensor: Buffer flags tensor tracking state
         - int: Maximum number of elements that can fit in buffer
     """

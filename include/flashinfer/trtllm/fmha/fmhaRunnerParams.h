@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -35,7 +35,13 @@ enum class TrtllmGenAttentionMaskType {
   // Sliding window or chunked causal mask.
   SlidingOrChunkedCausal,
   // Custom mask.
-  Custom
+  Custom,
+  // Sliding window mask combined with a custom packed mask.
+  // FlashInfer does not produce this mode. Its value is retained to match
+  // tensorrt_llm::kernels::ContextAttentionMaskType and the CUBIN metadata encoding.
+  SlidingWindowCustom,
+  // Per-query-token inclusive K/V bounds.
+  VariableWindow
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -51,6 +57,7 @@ ATTENTION_MASK_TYPE_FUNCTION(Dense)
 ATTENTION_MASK_TYPE_FUNCTION(Causal)
 ATTENTION_MASK_TYPE_FUNCTION(SlidingOrChunkedCausal)
 ATTENTION_MASK_TYPE_FUNCTION(Custom)
+ATTENTION_MASK_TYPE_FUNCTION(VariableWindow)
 
 #undef ATTENTION_MASK_TYPE_FUNCTION
 
@@ -59,11 +66,9 @@ ATTENTION_MASK_TYPE_FUNCTION(Custom)
 enum class FmhaKernelType {
   // The context-phase kernels.
   Context = 0,
-  // Choose the best generation kernel based on the heuristic:
-  // use SwapsMmaAbForGeneration kernels when numHeadsQPerKv <= 16, otherwise
-  // KeepsMmaAbForGeneration.
+  // Choose the best generation kernel based on the heuristic.
   Generation = 1,
-  // Swap tensor A and tensor B of Mma, which only supports numHeadsQPerKv <= 16.
+  // Swap tensor A and tensor B of Mma. MLA cubins provide Q8, Q16, and Q32 head tiles.
   SwapsMmaAbForGeneration,
   // Keep tensor A and tensor B of Mma.
   KeepsMmaAbForGeneration,
@@ -153,6 +158,12 @@ enum class TrtllmGenSparseMlaType {
   DynamicTokenSparse = 2,
 };
 
+enum class Bf16QFp8KvTransformMode {
+  Full = 0,
+  KOnly,
+  SeparateKv,
+};
+
 inline bool isSparseMla(TrtllmGenSparseMlaType sparseMlaType) {
   return sparseMlaType != TrtllmGenSparseMlaType::None;
 }
@@ -216,6 +227,9 @@ struct TllmGenFmhaRunnerParams {
   int32_t const* firstSparseMaskOffsetsKvPtr;
   // Runtime sparse MLA top-k lengths, one value per query token.
   int32_t const* sparseMlaTopKLensPtr;
+  // Inclusive VariableWindow bounds, one pair per packed Q token.
+  int32_t const* variableWindowTokenStartsPtr;
+  int32_t const* variableWindowTokenEndsPtr;
   // The counter for the multiCtasKv mode.
   int32_t* multiCtasKvCounterPtr;
   // The sequence length buffer for K/V.
@@ -239,6 +253,8 @@ struct TllmGenFmhaRunnerParams {
   // The scratch space for each CtaKv when the multiCtasKv mode is enabled.
   // PartialO, partialMax and partialSum will be stored to the scratch space.
   void* multiCtasKvScratchPtr;
+  // The scratch space size in bytes. 0 (unknown) keeps the one-wave KV split rule.
+  size_t mMultiCtasKvScratchBytes;
   // The softmax stats buffer.
   // The softmax max/sum values will be stored to the buffer if it is not nullptr.
   float2* softmaxStatsPtr;
@@ -246,6 +262,9 @@ struct TllmGenFmhaRunnerParams {
   float* lsePtr;
   // Strides (in elements) for the LSE buffer laid out as [num_tokens, num_heads_q].
   int64_t lseStrideTokens;
+  // Multiplies the base-2 LSE; 1.0f keeps base 2. Set by launcher
+  // alongside lsePtr
+  float lseScale;
   int64_t lseStrideHeads;
 
   // SageAttention scaling factors (null when SageAttention is not used).
@@ -260,6 +279,9 @@ struct TllmGenFmhaRunnerParams {
   void* oPtr;
   // The output scaling factor buffer.
   void* oSfPtr;
+  // DSv4 fused inverse-RoPE + FP8 quantization inputs/outputs.
+  float const* dsv4InvRopeCosSinCachePtr;
+  float* dsv4OScalePtr;
 
   // The stride between different tokens for Q.
   int qStrideTokens;
@@ -303,10 +325,10 @@ struct TllmGenFmhaRunnerParams {
   int mMaxSeqLenQ;
   // The max kv sequence length.
   int mMaxSeqLenKv;
-  // The attention window size for sliding window attention (sliding-window-attention is enabled
-  // when seqLenKv > mAttentionWindowSize).
-  int mAttentionWindowSize;
-  // The chunked attention size (chunked-context is enabled when seqLenKv > mChunkedAttentionSize).
+  // Sliding-window reaches excluding the current token. -1 means unbounded.
+  int mLeftSlidingWindow;
+  int mRightSlidingWindow;
+  // The exact chunk size. Zero disables chunked attention.
   int mChunkedAttentionSize;
   // The sum of sequence lengths for Q and K/V. (Only used when mSupportsVarSeqLens = true)
   int mSumOfSeqLensQ;
@@ -334,15 +356,30 @@ struct TllmGenFmhaRunnerParams {
   bool mSkipsSoftmaxWhenPossible;
   // Skip softmax threshold scale factor.
   float mSkipSoftmaxThresholdScaleFactor;
+  // Whether to use the FP16 softmax accumulator (BF16 kernels only).
+  bool mUseFp16Softmax;
+  // Whether to use the sparse-compression kernel variants (FP8 Q kernels only).
+  bool mUsesSpcompress;
   // Sparse MLA type. DeepSeek V4 uses DynamicTokenSparse with per-query-token top-k lengths.
   TrtllmGenSparseMlaType mSparseMlaType;
   // The top k value for sparse MLA.
   int mSparseMlaTopK;
+  // Padded token dimension of the DSv4 packed UE8M0 output-scale tensor.
+  int64_t mDsv4ScaleBufM;
   // Whether DSv4 sparse MLA should read tile 0 from slidingWindowKvPoolPtr.
   bool mHasSlidingWindowKvPool;
+  // Whether the fixed DSv4 inverse-RoPE + FP8 quant epilogue is selected.
+  bool mFusesDsv4InvRopeFp8Quant;
+  // Transform mode for BF16 query + FP8 KV generation kernels.
+  Bf16QFp8KvTransformMode mBf16QFp8KvTransformMode;
   // Whether the indices for K & V pages are shared as unified index.
   // true -> vLLM/FlashInfer; false -> TRT-LLM.
   bool mUsesSharedPagedKvIdx;
+  // Whether to use block-sparse attention (per-KV-head page tables and sequence lengths).
+  // When enabled, seqLensKvPtr has shape [numHeadsKv, batchSize] and kvPageIdxPtr has shape
+  // [numHeadsKv, batchSize, maxNumPagesPerSeqKv] (shared paged-KV index layout), where the
+  // selected sparse pages are packed densely at the front of each row.
+  bool mUseBlockSparseAttention;
   // The cuda stream.
   cudaStream_t stream;
   // Whether to enable PDL (Programmatic Dependent Launch).
@@ -367,6 +404,12 @@ struct TllmGenFmhaRunnerParams {
       case 3:  // tensorrt_llm::kernels::ContextAttentionMaskType::CUSTOM_MASK
         mMaskType = TrtllmGenAttentionMaskType::Custom;
         break;
+      case 4:  // tensorrt_llm::kernels::ContextAttentionMaskType::SLIDING_WINDOW_CUSTOM
+        mMaskType = TrtllmGenAttentionMaskType::SlidingWindowCustom;
+        break;
+      case 5:  // tensorrt_llm::kernels::ContextAttentionMaskType::VARIABLE_WINDOW
+        mMaskType = TrtllmGenAttentionMaskType::VariableWindow;
+        break;
       default:
         FLASHINFER_ERROR("Invalid attention mask type");
     }
@@ -379,6 +422,9 @@ struct TllmGenFmhaRunnerParams {
                   "TllmGenFmhaRunnerParams must be a POD type (standard layout) for memset to be "
                   "safe.");
     memset(this, 0, sizeof(TllmGenFmhaRunnerParams));
+    // Zero is a one-token window. Restore the explicit unbounded sentinel after memset.
+    mLeftSlidingWindow = -1;
+    mRightSlidingWindow = -1;
   }
 };
 
@@ -407,6 +453,12 @@ struct TllmGenSelectKernelParams {
   bool mSelectNewKernel;
   // Do we enable skip softmax?
   bool mSkipsSoftmaxWhenPossible;
+  // Use FP16 softmax or not.
+  bool mUseFp16Softmax;
+  // Use spcompress or not.
+  bool mUsesSpcompress;
+  // Select the DSv4 inverse-RoPE + E4M3/UE8M0 fused cubin when its exact key exists.
+  bool mFusesDsv4InvRopeFp8Quant;
   // The tile scheduler.
   TileScheduler mTileScheduler;
   // The tile size for Q.
@@ -415,6 +467,10 @@ struct TllmGenSelectKernelParams {
   int mTileSizeKv;
   // Use 2 CTA MMA or not.
   bool mUses2CtaMma;
+  // Whether the selected generation kernel groups tokensQ and headsQ into one CTA.
+  bool mGroupsTokensHeadsQ;
+  // Transform mode for BF16 query + FP8 KV generation kernels.
+  Bf16QFp8KvTransformMode mBf16QFp8KvTransformMode;
 
   // The constructor.
   TllmGenSelectKernelParams(TllmGenFmhaRunnerParams params)
@@ -431,8 +487,13 @@ struct TllmGenSelectKernelParams {
         mReuseSmemKForV(false),
         mSelectNewKernel(false),
         mSkipsSoftmaxWhenPossible(params.mSkipsSoftmaxWhenPossible),
+        mUseFp16Softmax(params.mUseFp16Softmax),
+        mUsesSpcompress(params.mUsesSpcompress),
+        mFusesDsv4InvRopeFp8Quant(params.mFusesDsv4InvRopeFp8Quant),
         mTileScheduler(params.mTileScheduler),
         mTileSizeQ(128),
         mTileSizeKv(128),
-        mUses2CtaMma(false) {};
+        mUses2CtaMma(false),
+        mGroupsTokensHeadsQ(false),
+        mBf16QFp8KvTransformMode(params.mBf16QFp8KvTransformMode) {};
 };

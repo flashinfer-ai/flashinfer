@@ -1,0 +1,129 @@
+{
+  "name": "mono_moe_topk8_h2048_i512",
+  "description": "Single-kernel (monomoe) block-FP8 top-K MoE for the Qwen3.5-35B shape on Hopper (SM90a). Routing (softmax/sigmoid top-K + renormalize) is fused in-kernel from router_logits; weights are block-FP8 (128x128).",
+  "op_type": "moe",
+  "tags": [
+    "fi_api:flashinfer.fused_moe.monomoe.mono_moe",
+    "status:verified",
+    "quantization:float8_e4m3fn",
+    "arch:sm90a"
+  ],
+  "axes": {
+    "seq_len": {
+      "type": "var",
+      "description": "Sequence length (number of tokens, <= 8)."
+    },
+    "num_experts": {
+      "type": "const",
+      "value": 256,
+      "description": "Total number of experts."
+    },
+    "top_k": {
+      "type": "const",
+      "value": 8,
+      "description": "Number of experts to route to per token."
+    },
+    "hidden_size": {
+      "type": "const",
+      "value": 2048,
+      "description": "Hidden dimension size (K)."
+    },
+    "intermediate_size": {
+      "type": "const",
+      "value": 512,
+      "description": "MoE intermediate layer size (N)."
+    },
+    "gemm1_out_size": {
+      "type": "const",
+      "value": 1024,
+      "description": "Up-projection output rows (2 * intermediate_size, gate||up)."
+    },
+    "num_hidden_blocks": {
+      "type": "const",
+      "value": 16,
+      "description": "Quantized blocks along hidden_size (block_size=128)."
+    },
+    "num_intermediate_blocks": {
+      "type": "const",
+      "value": 4,
+      "description": "Quantized blocks along intermediate_size (block_size=128)."
+    },
+    "num_gemm1_out_blocks": {
+      "type": "const",
+      "value": 8,
+      "description": "Quantized blocks along gemm1_out_size (block_size=128)."
+    }
+  },
+  "inputs": {
+    "activations_in": {
+      "shape": [
+        "seq_len",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Input activations (bf16; quantized to FP8 in-kernel)."
+    },
+    "router_logits": {
+      "shape": [
+        "seq_len",
+        "num_experts"
+      ],
+      "dtype": "bfloat16",
+      "description": "Router logits for in-kernel expert selection."
+    },
+    "expert_weights_up": {
+      "shape": [
+        "num_experts",
+        "gemm1_out_size",
+        "hidden_size"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "Up/gate projection weights (FP8, [gate || up] rows)."
+    },
+    "expert_scales_up": {
+      "shape": [
+        "num_experts",
+        "num_gemm1_out_blocks",
+        "num_hidden_blocks"
+      ],
+      "dtype": "float32",
+      "description": "Block-wise (128x128) FP8 scales for up/gate weights."
+    },
+    "expert_weights_down": {
+      "shape": [
+        "num_experts",
+        "hidden_size",
+        "intermediate_size"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "Down projection weights (FP8, raw row-major)."
+    },
+    "expert_scales_down": {
+      "shape": [
+        "num_experts",
+        "num_hidden_blocks",
+        "num_intermediate_blocks"
+      ],
+      "dtype": "float32",
+      "description": "Block-wise (128x128) FP8 scales for down weights."
+    },
+    "top_k": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Number of experts to route to per token (1..8)."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "seq_len",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Final MoE output tensor (also the return value)."
+    }
+  },
+  "reference": "from __future__ import annotations\nimport math\nimport torch\nimport torch.nn.functional as F\n\n@torch.no_grad()\ndef _mono_moe_reference(\n    activations_in,\n    router_logits,\n    expert_weights_up,\n    expert_scales_up,\n    expert_weights_down,\n    expert_scales_down,\n    top_k,\n    scoring_func=\"softmax\",\n    renormalize=True,\n    **_unused,\n):\n    \"\"\"Reference for mono_moe: in-kernel softmax/sigmoid routing + block-FP8 SwiGLU.\n\n    Mirrors the monomoe math: score router_logits (softmax or sigmoid),\n    take top-k, optionally renormalize the selected weights to sum to 1,\n    then run the shared block-FP8 dequant + SwiGLU + GEMM helper.  The\n    up-projection weights use the [gate || up] half ordering (monomoe's\n    convention), which `_fp8_moe_run_experts` already assumes (X1=gate,\n    X2=up with silu on X2).\n    \"\"\"\n    E_global = router_logits.shape[1]\n    TOP_K = int(top_k)\n    logits = router_logits.to(torch.float32)\n    if scoring_func == \"sigmoid\":\n        scores = torch.sigmoid(logits)\n    else:\n        scores = torch.softmax(logits, dim=-1)\n    topk_vals, topk_idx = torch.topk(\n        scores, k=TOP_K, dim=1, largest=True, sorted=False\n    )\n    if renormalize:\n        weights = topk_vals / (topk_vals.sum(dim=1, keepdim=True) + 1e-20)\n    else:\n        weights = topk_vals\n    # hidden_states_scale: the helper expects [H/128, T] (block-wise act\n    # scale).  monomoe quantizes activations internally, so for the\n    # reference we treat the bf16 input as already-dequantized by passing a\n    # unit scale of the right shape and an fp8 round-trip of the input.\n    T, H = activations_in.shape\n    BLOCK = 128\n    hs_fp8, hs_scale_TxNb = fp8_block_quant_1d(\n        activations_in.to(torch.bfloat16), block=BLOCK\n    )\n    hs_scale = hs_scale_TxNb.transpose(0, 1).contiguous()  # [H/128, T]\n    return _fp8_moe_run_experts(\n        hs_fp8,\n        hs_scale,\n        expert_weights_up,\n        expert_scales_up,\n        expert_weights_down,\n        expert_scales_down,\n        weights,\n        topk_idx,\n        local_expert_offset=0,\n        E_global=E_global,\n    )\n",
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n",
+  "init": "from __future__ import annotations\nimport math\nimport torch\n\n# ----- shared init helpers -----\n# Copyright (c) 2025 by FlashInfer team.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#   http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Shared helpers used by ``TraceTemplate.init`` functions.\n\nThis module contains the small set of input-construction patterns that\nrecur across many templates (paged-KV cache index arrays, ragged indptr,\nRoPE pos_ids and cos/sin caches, sampling probs). Each helper is short and\ndocumented; init functions in ``templates/<category>.py`` call into here so\nthe per-template init bodies stay focused on shape/dtype, not boilerplate.\n\nThe full source of this module is **inlined into every dumped JSON's\n``\"init\"`` field** by ``flashinfer/trace/template.py:_render_init_source``,\nso downstream consumers don't need flashinfer installed to re-run the init\nsnippets.\n\"\"\"\n\n\nfrom typing import Optional, Tuple\n\nimport torch\n\n\ndef make_paged_kv_indices(\n    batch_size: int,\n    num_pages_per_seq: int,\n    page_size: int,\n    *,\n    device: str = \"cuda\",\n) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:\n    \"\"\"Return ``(kv_indptr, kv_indices, kv_last_page_len)`` for a uniform batch.\n\n    Every sequence is assigned exactly ``num_pages_per_seq`` pages, fully\n    populated (last-page length == page_size).\n\n    Invariants\n    ----------\n    - ``kv_indptr.shape == (batch_size + 1,)``, dtype int32, monotonic, [0]=0.\n    - ``kv_indices == arange(0, batch_size * num_pages_per_seq)``, int32.\n    - ``kv_last_page_len == full(batch_size, page_size)``, int32.\n    \"\"\"\n    total_pages = batch_size * num_pages_per_seq\n    kv_indptr = (\n        torch.arange(batch_size + 1, dtype=torch.int32, device=device)\n        * num_pages_per_seq\n    )\n    kv_indices = torch.arange(total_pages, dtype=torch.int32, device=device)\n    kv_last_page_len = torch.full(\n        (batch_size,), page_size, dtype=torch.int32, device=device\n    )\n    return kv_indptr, kv_indices, kv_last_page_len\n\n\ndef make_ragged_indptr(\n    seg_lens,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.int32,\n) -> torch.Tensor:\n    \"\"\"Return cumulative-sum ``indptr`` of length ``len(seg_lens)+1``.\n\n    ``seg_lens`` may be a list / tuple / 1-D tensor of segment lengths.\n    \"\"\"\n    if isinstance(seg_lens, torch.Tensor):\n        lens = seg_lens.to(device=device, dtype=dtype)\n    else:\n        lens = torch.tensor(list(seg_lens), dtype=dtype, device=device)\n    indptr = torch.zeros(lens.numel() + 1, dtype=dtype, device=device)\n    indptr[1:] = torch.cumsum(lens, dim=0).to(dtype)\n    return indptr\n\n\ndef make_uniform_qo_indptr(\n    batch_size: int,\n    qo_len: int,\n    *,\n    device: str = \"cuda\",\n) -> torch.Tensor:\n    \"\"\"Return ``[0, qo_len, 2*qo_len, ..., batch_size*qo_len]`` int32.\"\"\"\n    return torch.arange(batch_size + 1, dtype=torch.int32, device=device) * qo_len\n\n\ndef make_pos_ids(\n    nnz: int,\n    max_seq_len: Optional[int] = None,\n    *,\n    device: str = \"cuda\",\n) -> torch.Tensor:\n    \"\"\"Return ``[0, 1, ..., nnz-1] (% max_seq_len)`` as int32 on ``device``.\n\n    If ``max_seq_len`` is None, no wrapping is applied.\n    \"\"\"\n    pos = torch.arange(nnz, dtype=torch.int32, device=device)\n    if max_seq_len is not None:\n        pos = pos % max_seq_len\n    return pos\n\n\ndef make_rope_cos_sin_cache(\n    max_seq_len: int,\n    rope_dim: int,\n    *,\n    base: float = 1e4,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return concatenated ``[cos | sin]`` cache of shape ``[max_seq_len, rope_dim]``.\"\"\"\n    t = torch.arange(max_seq_len, dtype=torch.float32, device=device)\n    inv = 1.0 / (\n        base\n        ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim)\n    )\n    freqs = t.unsqueeze(-1) * inv.unsqueeze(0)\n    cache = torch.cat([torch.cos(freqs), torch.sin(freqs)], dim=-1)\n    return cache.to(dtype)\n\n\ndef make_probs(\n    batch_size: int,\n    vocab_size: int,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return a ``[batch_size, vocab_size]`` probability distribution.\n\n    Uses ``softmax(randn(...))`` so each row sums to 1.0. This mirrors the\n    pattern used throughout ``tests/utils/test_sampling.py``.\n    \"\"\"\n    return torch.softmax(\n        torch.randn(batch_size, vocab_size, dtype=torch.float32, device=device),\n        dim=-1,\n    ).to(dtype)\n\n\ndef make_logits(\n    batch_size: int,\n    vocab_size: int,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return ``randn(batch_size, vocab_size)`` logits.\"\"\"\n    return torch.randn(batch_size, vocab_size, dtype=dtype, device=device)\n\n\ndef fp8_safe_randn(\n    *shape: int,\n    scale: float = 0.1,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.bfloat16,\n) -> torch.Tensor:\n    \"\"\"``randn(*shape) * scale`` \u2014 keeps values in the FP8/FP4 representable range.\n\n    Tests for fp8/fp4 paths typically multiply ``randn`` by 0.1 to avoid\n    saturation when quantizing. Use this helper to mirror that convention.\n    \"\"\"\n    return (torch.randn(*shape, dtype=dtype, device=device) * scale).to(dtype)\n\n\ndef per_tensor_fp8_quantize(\n    x: torch.Tensor,\n    *,\n    fp8_dtype: torch.dtype = torch.float8_e4m3fn,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Per-tensor FP8 quantization, mirroring ``tests/utils_fp8.py:to_float8``.\n\n    Returns ``(x_fp8, inv_scale)`` where ``inv_scale`` is the dequant\n    multiplier (``float \u2248 fp8 * inv_scale``).\n    \"\"\"\n    finfo = torch.finfo(fp8_dtype)\n    amax = x.abs().amax().clamp(min=1e-12)\n    scale = finfo.max / amax\n    x_q = (x.float() * scale).clamp(min=finfo.min, max=finfo.max).to(fp8_dtype)\n    return x_q, scale.float().reciprocal()\n\n\ndef fp8_block_quant_1d(\n    x_bf16: torch.Tensor,\n    block: int = 128,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Quantize ``[T, H]`` activations into FP8 with per-``(token, block)``\n    column-block scales. Returns ``(x_fp8, scales)`` where\n    ``scales`` has shape ``[T, H // block]``.\n\n    Mirrors ``_fp8_block_quant_1d`` in\n    ``tests/moe/test_dpsk_fused_moe_fp8.py``.\n    \"\"\"\n    assert x_bf16.dim() == 2\n    T, H = x_bf16.shape\n    assert H % block == 0\n    nb = H // block\n    finfo = torch.finfo(torch.float8_e4m3fn)\n    max_fp8 = finfo.max\n    x_f32 = x_bf16.to(torch.float32)\n    x_fp8 = torch.empty((T, H), dtype=torch.float8_e4m3fn, device=x_bf16.device)\n    scales = torch.empty((T, nb), dtype=torch.float32, device=x_bf16.device)\n    for j in range(nb):\n        sl = slice(j * block, (j + 1) * block)\n        blk = x_f32[:, sl]\n        amax = torch.amax(torch.abs(blk), dim=1)\n        s = torch.where(amax > 0, amax / max_fp8, torch.ones_like(amax))\n        x_fp8[:, sl] = (blk / s.unsqueeze(1)).to(torch.float8_e4m3fn)\n        scales[:, j] = s\n    return x_fp8, scales\n\n\ndef fp8_block_quant_2d(\n    w_bf16: torch.Tensor,\n    block: int = 128,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Quantize weights ``[..., R, C]`` with 2-D ``block \u00d7 block`` scales.\n\n    Returns ``(w_fp8, scales)`` where ``scales`` has shape\n    ``[..., R // block, C // block]``. Mirrors ``_fp8_block_quant_2d`` in\n    ``tests/moe/test_dpsk_fused_moe_fp8.py``.\n    \"\"\"\n    assert w_bf16.dim() >= 2\n    *prefix, R, C = w_bf16.shape\n    assert R % block == 0 and C % block == 0\n    nb_r, nb_c = R // block, C // block\n    finfo = torch.finfo(torch.float8_e4m3fn)\n    max_fp8 = finfo.max\n    w_f32 = w_bf16.to(torch.float32).contiguous()\n    prefix_ndim = len(prefix)\n    reshaped = w_f32.reshape(*prefix, nb_r, block, nb_c, block)\n    permute_dims = tuple(range(prefix_ndim)) + (\n        prefix_ndim,\n        prefix_ndim + 2,\n        prefix_ndim + 1,\n        prefix_ndim + 3,\n    )\n    blocks = reshaped.permute(permute_dims).contiguous()\n    amax = torch.amax(torch.abs(blocks), dim=(-1, -2))\n    scales = torch.where(\n        amax > 0, amax / max_fp8, torch.ones_like(amax, dtype=torch.float32)\n    )\n    q_blocks = (blocks / scales.unsqueeze(-1).unsqueeze(-1)).to(torch.float8_e4m3fn)\n    inv_permute = [0] * (prefix_ndim + 4)\n    for i, p in enumerate(permute_dims):\n        inv_permute[p] = i\n    w_fp8 = q_blocks.permute(*inv_permute).reshape(*prefix, R, C).contiguous()\n    return w_fp8, scales\n\n\n__all__ = [\n    \"make_paged_kv_indices\",\n    \"make_ragged_indptr\",\n    \"make_uniform_qo_indptr\",\n    \"make_pos_ids\",\n    \"make_rope_cos_sin_cache\",\n    \"make_probs\",\n    \"make_logits\",\n    \"fp8_safe_randn\",\n    \"per_tensor_fp8_quantize\",\n    \"fp8_block_quant_1d\",\n    \"fp8_block_quant_2d\",\n]\n\n# ----- init -----\ndef _mono_moe_init(\n    *,\n    seq_len: int,\n    num_experts: int = 256,\n    top_k: int = 8,\n    hidden_size: int = 2048,\n    intermediate_size: int = 512,\n    gemm1_out_size: int = 0,  # derived: 2 * intermediate_size\n    num_hidden_blocks: int = 0,  # derived: hidden_size / 128\n    num_intermediate_blocks: int = 0,  # derived: intermediate_size / 128\n    num_gemm1_out_blocks: int = 0,  # derived: gemm1_out_size / 128\n    device: str = \"cuda\",\n    seed: int = 0,\n):\n    \"\"\"Build inputs for ``mono_moe`` (fixed Qwen3.5-35B block-FP8 shape).\n\n    The monomoe kernel is hard-specialized to E=256, N=512, K=2048, BS<=8,\n    so the defaults match that shape (``seq_len`` is the only Var, capped at\n    8 by the kernel).  Weights are block-FP8 (128\u00d7128) quantized via the\n    shared ``fp8_block_quant_2d`` helper; activations / router_logits are\n    bf16 (the kernel quantizes activations internally).\n    \"\"\"\n    del gemm1_out_size, num_hidden_blocks, num_intermediate_blocks\n    del num_gemm1_out_blocks\n    torch.manual_seed(seed)\n    BLOCK = 128\n    activations_in = torch.randn(\n        seq_len, hidden_size, dtype=torch.bfloat16, device=device\n    )\n    router_logits = torch.randn(\n        seq_len, num_experts, dtype=torch.bfloat16, device=device\n    )\n    w13_bf16 = 0.1 * torch.randn(\n        num_experts, 2 * intermediate_size, hidden_size, dtype=torch.bfloat16,\n        device=device,\n    )\n    w2_bf16 = 0.1 * torch.randn(\n        num_experts, hidden_size, intermediate_size, dtype=torch.bfloat16,\n        device=device,\n    )\n    w13, w13s = fp8_block_quant_2d(w13_bf16, block=BLOCK)\n    w2, w2s = fp8_block_quant_2d(w2_bf16, block=BLOCK)\n    return {\n        \"activations_in\": activations_in,\n        \"router_logits\": router_logits,\n        \"expert_weights_up\": w13,\n        \"expert_scales_up\": w13s,\n        \"expert_weights_down\": w2,\n        \"expert_scales_down\": w2s,\n        \"top_k\": int(top_k),\n        \"scoring_func\": \"softmax\",\n        \"renormalize\": True,\n    }\n"
+}

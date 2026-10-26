@@ -20,6 +20,7 @@ from flashinfer.gemm import (
 from flashinfer.cute_dsl.utils import (
     get_cutlass_dtype,
     get_num_sm,
+    is_cute_dsl_arch_supported,
     is_cute_dsl_available,
 )
 from flashinfer.utils import is_sm100a_supported, is_sm100f_supported
@@ -27,6 +28,13 @@ from flashinfer.utils import is_sm100a_supported, is_sm100f_supported
 
 @pytest.mark.skipif(
     not is_cute_dsl_available(), reason="Please `pip install nvidia-cutlass-dsl`"
+)
+@pytest.mark.skipif(
+    torch.cuda.is_available()
+    and not is_cute_dsl_arch_supported(
+        *torch.cuda.get_device_capability(0), native_only=True
+    ),
+    reason="installed CuTe DSL does not support this GPU architecture",
 )
 @pytest.mark.parametrize("lm", [(1, 1024), (2, 512), (4, 256)])
 @pytest.mark.parametrize("kn", [(7168, 4096), (2048, 7168)])
@@ -82,7 +90,7 @@ def test_blockscaled_gemm_python_interface(
     torch.manual_seed(42)
     device = torch.device("cuda:0")
     device_ver = torch.cuda.get_device_capability(device)
-    supported_device_vers = [(10, 0), (10, 3)]
+    supported_device_vers = [(10, 0), (10, 3), (10, 7)]
     if device_ver not in supported_device_vers:
         pytest.skip(
             f"Cute-dsl backend is only supported on {supported_device_vers}, skipping {device_ver}."
@@ -262,6 +270,71 @@ def test_blockscaled_gemm_python_interface(
 
 @pytest.mark.skipif(
     not is_cute_dsl_available(), reason="Please `pip install nvidia-cutlass-dsl`"
+)
+@pytest.mark.skipif(
+    torch.cuda.is_available()
+    and not is_cute_dsl_arch_supported(
+        *torch.cuda.get_device_capability(0), native_only=True
+    ),
+    reason="installed CuTe DSL does not support this GPU architecture",
+)
+def test_grouped_gemm_nt_masked_scheduler_empty_experts():
+    """Regression test for draining MaskedScheduler past empty experts."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    dev = torch.device("cuda:0")
+    if not (is_sm100a_supported(dev) or is_sm100f_supported(dev)):
+        pytest.skip("NVFP4 grouped GEMM requires SM100")
+
+    sf_vec = 16
+    m, n, k, num_experts = 128, 128, 256, 4
+    k_packed, num_m_tiles, num_k_sf = k // 2, m // 128, k // sf_vec
+    num_k_sf_tiles = num_k_sf // 4
+    sf_shape = (32, 4, num_m_tiles, 4, num_k_sf_tiles, num_experts)
+
+    a = torch.full((m, k_packed, num_experts), 0x11, dtype=torch.uint8, device=dev)
+    b = torch.full((n, k_packed, num_experts), 0x11, dtype=torch.uint8, device=dev)
+    sfa = torch.ones(sf_shape, dtype=torch.float8_e4m3fn, device=dev)
+    sfb = torch.ones(sf_shape, dtype=torch.float8_e4m3fn, device=dev)
+    sentinel = 13.0
+
+    def run(masked_m_values):
+        output = torch.full(
+            (num_experts, m, n), sentinel, dtype=torch.bfloat16, device=dev
+        ).permute(1, 2, 0)
+        masked_m = torch.tensor(masked_m_values, dtype=torch.int32, device=dev)
+        grouped_gemm_nt_masked(
+            (a, sfa),
+            (b, sfb),
+            output,
+            masked_m,
+            ab_dtype="float4_e2m1fn",
+            sf_dtype="float8_e4m3fn",
+            c_dtype="bfloat16",
+            sf_vec_size=sf_vec,
+        )
+        # Surface asynchronous illegal memory accesses in the test process.
+        torch.cuda.synchronize()
+        return output.permute(2, 0, 1).clone()
+
+    full = run([m] * num_experts)
+    trailing_empty = run([m, 0, 0, 0])
+    torch.testing.assert_close(trailing_empty[0], full[0], atol=0.0, rtol=0.0)
+    assert torch.all(trailing_empty[1:] == sentinel)
+
+    all_empty = run([0] * num_experts)
+    assert torch.all(all_empty == sentinel)
+
+
+@pytest.mark.skipif(
+    not is_cute_dsl_available(), reason="Please `pip install nvidia-cutlass-dsl`"
+)
+@pytest.mark.skipif(
+    torch.cuda.is_available()
+    and not is_cute_dsl_arch_supported(
+        *torch.cuda.get_device_capability(0), native_only=True
+    ),
+    reason="installed CuTe DSL does not support this GPU architecture",
 )
 def test_grouped_gemm_nt_masked_output_layout_contract():
     """Regression test for issue #3103.

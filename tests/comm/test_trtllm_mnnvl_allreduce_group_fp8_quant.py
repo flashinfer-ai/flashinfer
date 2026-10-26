@@ -144,7 +144,7 @@ def _assert_dequant_close(
     packed_scales: torch.Tensor,
     reference: torch.Tensor,
     group_size: int,
-    atol: float = 8e-1,
+    atol: float = 0.15,
 ) -> None:
     """Compare dequantized packed-group FP8 output to an RMSNorm reference."""
     token_num, hidden_dim = reference.shape
@@ -167,6 +167,7 @@ def _assert_dequant_close(
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("with_norm_out", [False, True])
 @pytest.mark.parametrize(
     "use_oneshot,token_num,hidden_dim,group_size,expected_error",
@@ -177,6 +178,12 @@ def _assert_dequant_close(
         (False, 129, 4224, 128, None),
         (True, 3, 768, 12, None),
         (False, 127, 4096, 512, None),
+        (True, 3, 24, 3, None),
+        (False, 3, 24, 3, None),
+        (True, 3, 8192, 1, None),
+        (False, 3, 8192, 1, None),
+        (True, 3, 16384, 128, None),
+        (False, 3, 16384, 128, None),
         (True, 1, 32808, 24, "no exact CTA partition"),
     ],
 )
@@ -187,8 +194,14 @@ def test_mnnvl_allreduce_group_fp8_quant(
     group_size: int,
     expected_error: str | None,
     with_norm_out: bool,
+    dtype: torch.dtype,
 ) -> None:
     """Validate MNNVL packed per-token-group FP8 fusion."""
+    # FP32 needs twice as many vector threads as FP16/BF16. The 33 groups
+    # cannot split evenly across a cluster, and one CTA would need 1056 threads.
+    if dtype == torch.float32 and hidden_dim == 4224:
+        expected_error = "no exact CTA partition"
+
     if torch.cuda.device_count() == 0:
         pytest.skip("requires CUDA")
 
@@ -202,7 +215,6 @@ def test_mnnvl_allreduce_group_fp8_quant(
     local_rank = rank % torch.cuda.device_count()
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    dtype = torch.bfloat16
     eps = 1e-6
 
     workspace = None
@@ -268,12 +280,12 @@ def test_mnnvl_allreduce_group_fp8_quant(
 
         ref_residual, ref_norm = _reference_norm(allreduce_in, residual, weight, eps)
         torch.testing.assert_close(
-            residual_out.float(), ref_residual.float(), atol=8e-1, rtol=1e-2
+            residual_out.float(), ref_residual.float(), atol=0.15, rtol=0.05
         )
 
         if norm_out is not None:
             torch.testing.assert_close(
-                norm_out.float(), ref_norm.float(), atol=8e-1, rtol=1e-2
+                norm_out.float(), ref_norm.float(), atol=0.15, rtol=0.05
             )
             ref_quant, ref_exponents, _ = _reference_group_quant(norm_out, group_size)
             fused_exponents = _unpack_scale_exponents(
@@ -290,7 +302,10 @@ def test_mnnvl_allreduce_group_fp8_quant(
 
 
 @pytest.mark.parametrize("use_oneshot", [True, False])
-def test_mnnvl_allreduce_group_fp8_cuda_graph_replay(use_oneshot: bool) -> None:
+@pytest.mark.parametrize("launch_with_pdl", [False, True])
+def test_mnnvl_allreduce_group_fp8_cuda_graph_replay(
+    use_oneshot: bool, launch_with_pdl: bool
+) -> None:
     """Validate MNNVL packed group FP8 CUDA Graph replay."""
     if torch.cuda.device_count() == 0:
         pytest.skip("requires CUDA")
@@ -340,6 +355,7 @@ def test_mnnvl_allreduce_group_fp8_cuda_graph_replay(use_oneshot: bool) -> None:
         def run_op() -> None:
             comm.allreduce_fusion(
                 input=static_input,
+                launch_with_pdl=launch_with_pdl,
                 workspace=workspace,
                 pattern=comm.AllReduceFusionPattern.kARResidualRMSNormPerTokenGroupFP8PackedQuant,
                 residual_in=residual,
@@ -380,10 +396,90 @@ def test_mnnvl_allreduce_group_fp8_cuda_graph_replay(use_oneshot: bool) -> None:
                 replay_input, residual, weight, eps
             )
             torch.testing.assert_close(
-                residual_out.float(), ref_residual.float(), atol=8e-1, rtol=1e-2
+                residual_out.float(), ref_residual.float(), atol=0.15, rtol=0.05
             )
             _assert_dequant_close(quant_out, scale_out, ref_norm, group_size)
     finally:
         if workspace is not None:
             workspace.destroy()
         dist.barrier()
+
+
+@pytest.mark.parametrize(
+    "name", ["input", "residual_in", "gamma", "residual_out", "output"]
+)
+@pytest.mark.parametrize("invalid_kind", ["dtype", "strides", "alignment"])
+def test_mnnvl_group_fp8_rejects_invalid_vector_buffers(name, invalid_kind):
+    """Reject buffers that packed loads/stores would misinterpret before launch."""
+    from flashinfer.comm.trtllm_mnnvl_ar import (
+        MNNVLQuantType,
+        trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant,
+    )
+
+    # CPU tensors suffice: validation must fail before consulting the workspace
+    # or loading the CUDA module.
+    args = {
+        "input": torch.empty((3, 128), dtype=torch.bfloat16),
+        "residual_in": torch.empty((3, 128), dtype=torch.bfloat16),
+        "gamma": torch.empty(128, dtype=torch.bfloat16),
+        "residual_out": torch.empty((3, 128), dtype=torch.bfloat16),
+        "output": torch.empty((3, 128), dtype=torch.bfloat16),
+    }
+    tensor = args[name]
+    if invalid_kind == "dtype":
+        # Changing input to float32 leaves the residual incompatible.
+        args[name] = tensor.float()
+        error = "dtype must match input dtype"
+    elif invalid_kind == "strides":
+        args[name] = torch.empty((*tensor.shape, 2), dtype=tensor.dtype)[..., 0]
+        error = "must be contiguous"
+    else:
+        args[name] = torch.empty(tensor.numel() + 1, dtype=tensor.dtype)[1:].view(
+            tensor.shape
+        )
+        error = "must be 16-byte aligned"
+    with pytest.raises(ValueError, match=error):
+        trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
+            **args,
+            workspace=None,
+            quant_type=MNNVLQuantType.PER_TOKEN_GROUP_FP8_PACKED,
+            block_quant_group_size=128,
+        )
+
+
+@pytest.mark.parametrize("group_size", [None, 0, -1, 12, 128.0, True])
+def test_mnnvl_group_fp8_rejects_invalid_group_size(group_size):
+    from flashinfer.comm.trtllm_mnnvl_ar import (
+        MNNVLQuantType,
+        trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant,
+    )
+
+    tensor = torch.empty((3, 128), dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="block_quant_group_size"):
+        trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
+            input=tensor,
+            residual_in=tensor,
+            gamma=tensor[0],
+            workspace=None,
+            quant_type=MNNVLQuantType.PER_TOKEN_GROUP_FP8_PACKED,
+            block_quant_group_size=group_size,
+        )
+
+
+@pytest.mark.parametrize("shape", [(0, 128), (3, 0)])
+def test_mnnvl_group_fp8_rejects_empty_input(shape):
+    from flashinfer.comm.trtllm_mnnvl_ar import (
+        MNNVLQuantType,
+        trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant,
+    )
+
+    tensor = torch.empty(shape, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="non-empty 2D"):
+        trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
+            input=tensor,
+            residual_in=tensor,
+            gamma=torch.empty(shape[1]),
+            workspace=None,
+            quant_type=MNNVLQuantType.PER_TOKEN_GROUP_FP8_PACKED,
+            block_quant_group_size=128,
+        )

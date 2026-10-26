@@ -36,7 +36,7 @@ from .trace.templates.rope import (
     rope_quantize_fp8_trace,
 )
 from .jit.rope import gen_rope_module
-from .utils import register_custom_op, register_fake_op
+from .utils import get_compute_capability, register_custom_op, register_fake_op
 
 
 @functools.cache
@@ -440,7 +440,7 @@ def apply_rope_inplace(
     rope_scale: float = 1,
     rope_theta: float = 1e4,
 ) -> None:
-    r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor) inplace.
+    r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor) in place.
     cos/sin values are computed on the fly inside the kernel.
 
     We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
@@ -463,8 +463,8 @@ def apply_rope_inplace(
     offsets : torch.Tensor
         The relative position offsets of each query in the batch, shape: ``(batch_size)``.
     rotary_dim : Optional[int]
-        The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
-        otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
+        The dimensions to which to apply RoPE. If ``None``, RoPE is applied to the entire head dimension,
+        otherwise it is applied to the first ``rotary_dim`` dimensions. Default: ``None``.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -527,7 +527,7 @@ def apply_rope_pos_ids_inplace(
     rope_scale: float = 1,
     rope_theta: float = 1e4,
 ) -> None:
-    r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor) inplace.
+    r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor) in place.
     cos/sin values are computed on the fly inside the kernel.
 
     We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
@@ -548,8 +548,8 @@ def apply_rope_pos_ids_inplace(
     pos_ids : torch.Tensor
         Position indices, shape: ``(nnz)``.
     rotary_dim : Optional[int]
-        The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
-        otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
+        The dimensions to which to apply RoPE. If ``None``, RoPE is applied to the entire head dimension,
+        otherwise it is applied to the first ``rotary_dim`` dimensions. Default: ``None``.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -590,8 +590,8 @@ def apply_llama31_rope_inplace(
     high_freq_factor: float = 4,
     old_context_len: int = 8192,
 ) -> None:
-    r"""Apply Llama 3.1 style rotary embedding to a batch of queries/keys (stored as
-    RaggedTensor) inplace. cos/sin values are computed on the fly inside the kernel.
+    r"""Apply Llama 3.1-style rotary embedding to a batch of queries/keys (stored as
+    RaggedTensor) in place. cos/sin values are computed on the fly inside the kernel.
 
     We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
     segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
@@ -613,8 +613,8 @@ def apply_llama31_rope_inplace(
     offsets : torch.Tensor
         The relative position offsets of each query in the batch, shape: ``(batch_size)``.
     rotary_dim : Optional[int]
-        The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
-        otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
+        The dimensions to which to apply RoPE. If ``None``, RoPE is applied to the entire head dimension,
+        otherwise it is applied to the first ``rotary_dim`` dimensions. Default: ``None``.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -698,8 +698,8 @@ def apply_llama31_rope_pos_ids_inplace(
     high_freq_factor: float = 4,
     old_context_len: int = 8192,
 ) -> None:
-    r"""Apply Llama 3.1 style rotary embedding to a batch of queries/keys (stored as
-    RaggedTensor) inplace. cos/sin values are computed on the fly inside the kernel.
+    r"""Apply Llama 3.1-style rotary embedding to a batch of queries/keys (stored as
+    RaggedTensor) in place. cos/sin values are computed on the fly inside the kernel.
 
     We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
     segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
@@ -958,7 +958,7 @@ def apply_llama31_rope(
     high_freq_factor: float = 4,
     old_context_len: int = 8192,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Apply Llama 3.1 style rotary embedding to a batch of queries/keys (stored as
+    r"""Apply Llama 3.1-style rotary embedding to a batch of queries/keys (stored as
     RaggedTensor). cos/sin values are computed on the fly inside the kernel.
 
     We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
@@ -1080,7 +1080,7 @@ def apply_llama31_rope_pos_ids(
     high_freq_factor: float = 4,
     old_context_len: int = 8192,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Apply Llama 3.1 style rotary embedding to a batch of queries/keys (stored as
+    r"""Apply Llama 3.1-style rotary embedding to a batch of queries/keys (stored as
     RaggedTensor). cos/sin values are computed on the fly inside the kernel.
 
     We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
@@ -1188,7 +1188,7 @@ def apply_rope_with_cos_sin_cache(
         Whether to use Neox style RoPE, default: ``True``.
 
         * If ``True``, the last dimension of the query/key tensor is not interleaved, i.e.,
-          we rorate the first half dimensions ``([..., :head_dim//2])`` and the second half
+          we rotate the first half dimensions ``([..., :head_dim//2])`` and the second half
           dimensions ``([..., head_dim//2:])``.
 
         * If ``False``, the last dimension of the query/key tensor is interleaved, i.e.,
@@ -1236,7 +1236,7 @@ def apply_rope_with_cos_sin_cache_inplace(
     r"""
     Apply rotary embedding to keys and queries with precomputed cos/sin values.
     This is designed to be compatible with the SGL/vLLM implementation.
-    The result is inplace applied to the input tensors.
+    The result is applied in place to the input tensors.
 
     Parameters
     ----------
@@ -1258,7 +1258,7 @@ def apply_rope_with_cos_sin_cache_inplace(
         Whether to use Neox style RoPE, default: ``True``.
 
         * If ``True``, the last dimension of the query/key tensor is not interleaved, i.e.,
-          we rorate the first half dimensions ``([..., :head_dim//2])`` and the second half
+          we rotate the first half dimensions ``([..., :head_dim//2])`` and the second half
           dimensions ``([..., head_dim//2:])``.
 
         * If ``False``, the last dimension of the query/key tensor is interleaved, i.e.,
@@ -1377,6 +1377,7 @@ def rope_quantize_fp8(
     q_nope_out: Optional[torch.Tensor] = None,
     k_nope_out: Optional[torch.Tensor] = None,
     enable_pdl: bool = False,
+    backend: str = "cuda",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""Apply RoPE (Rotary Positional Embeddings) and quantize to FP8 format.
 
@@ -1423,12 +1424,68 @@ def rope_quantize_fp8(
         Pre-allocated output tensor for quantized key (non-rotary). If ``None``, allocated automatically.
     enable_pdl : bool
         Whether to enable PDL (Programmatic Dependent Launch). Default: ``False``.
+    backend : str
+        Implementation backend. ``"cuda"`` (default) uses the fused CUDA kernel;
+        ``"cutile"`` uses the cuda.tile Python kernel and requires SM90 or newer.
 
     Returns
     -------
     Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
         Quantized tensors: (q_rope_out, k_rope_out, q_nope_out, k_nope_out).
     """
+    if backend not in ("cuda", "cutile"):
+        raise ValueError(
+            f"Unsupported backend for rope_quantize_fp8: {backend!r}; "
+            "expected 'cuda' or 'cutile'."
+        )
+    if backend == "cutile":
+        if is_neox:
+            # The cuTile kernel implements only the interleaved (GPT-J) rotary
+            # layout. is_neox defaults to True, so surface a clear error instead
+            # of the kernel's bare AssertionError (which -O would also strip).
+            raise NotImplementedError(
+                "backend='cutile' supports is_neox=False (interleaved/GPT-J "
+                "rotary) only; got is_neox=True."
+            )
+        if k_rope.ndim != 2:
+            # The kernel addresses the key as 2D [tokens, rope_dim] (single
+            # shared latent K head, the MLA use case). A 3D GQA/MHA key would
+            # fail deep in autotune with an opaque TileTypeError.
+            raise NotImplementedError(
+                "backend='cutile' rope_quantize_fp8 supports MLA-style 2D key "
+                f"tensors (single shared K head) only; got {k_rope.ndim}D key "
+                "(GQA/MHA multi-head K is not supported)."
+            )
+        if cos_sin_cache.dtype != torch.float32:
+            raise ValueError("cos_sin_cache should be float32")
+        capability = get_compute_capability(q_rope.device)
+        # cuda.tile (tileiras) has no FP8 lowering for sm_89 despite Ada hardware support.
+        if capability < (9, 0):
+            raise NotImplementedError(
+                "backend='cutile' rope_quantize_fp8 requires SM90 or newer "
+                f"for FP8 output; got SM{capability[0]}{capability[1]}."
+            )
+        from .quantization.kernels.cutile.rope_quantize_fp8_cutile import (
+            rope_quantize_fp8_cutile,
+        )
+
+        return rope_quantize_fp8_cutile(
+            q_rope,
+            k_rope,
+            q_nope,
+            k_nope,
+            cos_sin_cache,
+            pos_ids,
+            is_neox=is_neox,
+            quantize_dtype=quantize_dtype,
+            quant_scale_q=quant_scale_q,
+            quant_scale_kv=quant_scale_kv,
+            q_rope_out=q_rope_out,
+            k_rope_out=k_rope_out,
+            q_nope_out=q_nope_out,
+            k_nope_out=k_nope_out,
+        )
+
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")
 

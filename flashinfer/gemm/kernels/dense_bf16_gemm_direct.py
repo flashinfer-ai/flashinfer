@@ -1,0 +1,413 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+"""Register-prefetch BF16 GEMM for low-M, long-K decode shapes.
+
+The kernel keeps a complete output dot product inside one CTA and reuses each
+prefetched B value across several public-M rows.  It is intentionally a
+separate autotuner runner from the Blackwell tensor-core split-K kernel: the
+two algorithms have different useful shape regions and tactic spaces.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import functools
+
+import cuda.bindings.driver as _cuda
+import cutlass
+import cutlass.cute as cute
+import torch as _torch
+from cutlass import const_expr
+from cutlass.cute import experimental as cute_ext
+from cutlass.cute.runtime import from_dlpack
+
+_VECTOR_WIDTH = 8
+_SUPPORTED_BLOCK_SIZES = (32, 64, 96, 128, 192, 256, 384)
+_SUPPORTED_OUTPUTS_PER_BLOCK = (1, 2, 4)
+_MAX_M = 32
+# Base budget for unrolled B prefetch: 128 16-byte vectors/thread, not registers.
+_B_PREFETCH_VECTOR_BUDGET = 128
+_COMPILE_OPTIONS = "--ptxas-options -maxrregcount=64"
+
+
+@dataclasses.dataclass(frozen=True)
+class DirectTactic:
+    """One direct-kernel specialization."""
+
+    block_size: int
+    outputs_per_block: int
+    rows_per_block: int
+
+
+def _default_rows_per_block(m: int) -> int:
+    if m <= 8:
+        return m
+    return next(rows for rows in (8, 4, 2, 1) if m % rows == 0)
+
+
+def validate_tactic(tactic: DirectTactic, m: int, n: int, k: int) -> None:
+    """Reject a direct tactic that cannot serve ``(m, n, k)``."""
+    if tactic.block_size not in _SUPPORTED_BLOCK_SIZES:
+        raise ValueError(f"unsupported block_size={tactic.block_size}")
+    if tactic.outputs_per_block not in _SUPPORTED_OUTPUTS_PER_BLOCK:
+        raise ValueError(f"unsupported outputs_per_block={tactic.outputs_per_block}")
+    if not 1 <= m <= _MAX_M:
+        raise ValueError(f"direct GEMM requires 1 <= M <= {_MAX_M}, got {m}")
+    if not 1 <= tactic.rows_per_block <= m or m % tactic.rows_per_block:
+        raise ValueError(f"rows_per_block={tactic.rows_per_block} must divide M={m}")
+    if n <= 0 or n % tactic.outputs_per_block:
+        raise ValueError(
+            f"N={n} must be divisible by outputs_per_block={tactic.outputs_per_block}"
+        )
+    k_tile = tactic.block_size * _VECTOR_WIDTH
+    if k <= 0 or k % k_tile:
+        raise ValueError(f"K={k} must be divisible by {k_tile}")
+
+
+def default_tactic(m: int, n: int, k: int) -> DirectTactic:
+    """Choose the measured register-prefetch fallback tactic."""
+    blocks = [
+        block
+        for block in (256, 192, 128, 96, 64, 32)
+        if k % (block * _VECTOR_WIDTH) == 0
+    ]
+    if not blocks:
+        raise ValueError("direct GEMM requires a supported 16-byte K tiling")
+    # For M <= 4, keep at least two prefetched B vectors per thread: with one,
+    # a short-K CTA has too few loads in flight (cold-L2 B200/B300 sweep: up to
+    # 15% at M <= 2, K = 2048).  Larger M already issues a load per row.
+    block_size = blocks[0]
+    if m <= 4:
+        block_size = next(
+            (block for block in blocks if k // (block * _VECTOR_WIDTH) >= 2),
+            blocks[-1],
+        )
+    # Small weights (< 4 MiB): one output per CTA doubles the CTA count (up to
+    # 20% at M=8, N=128); larger weights already fill the SMs with two.
+    if n * k < 1 << 21:
+        outputs_per_block = 1
+    else:
+        outputs_per_block = next(outputs for outputs in (2, 1) if n % outputs == 0)
+    tactic = DirectTactic(
+        block_size,
+        outputs_per_block,
+        _default_rows_per_block(m),
+    )
+    validate_tactic(tactic, m, n, k)
+    return tactic
+
+
+def autotune_tactics(m: int, n: int, k: int) -> list[DirectTactic]:
+    """Bound whole-K prefetch expansion while retaining the default tactic."""
+    try:
+        default = default_tactic(m, n, k)
+    except ValueError:
+        return []
+    tactics = [default]
+    for block_size in _SUPPORTED_BLOCK_SIZES:
+        for outputs_per_block in _SUPPORTED_OUTPUTS_PER_BLOCK:
+            tactic = DirectTactic(
+                block_size,
+                outputs_per_block,
+                default.rows_per_block,
+            )
+            try:
+                validate_tactic(tactic, m, n, k)
+            except ValueError:
+                continue
+            if k // (block_size * _VECTOR_WIDTH) * outputs_per_block > max(
+                _B_PREFETCH_VECTOR_BUDGET,
+                k // (default.block_size * _VECTOR_WIDTH) * default.outputs_per_block,
+            ):
+                continue
+            tactics.append(tactic)
+    return list(dict.fromkeys(tactics))
+
+
+def is_direct_bf16_gemm_candidate_sm100(m: int, n: int) -> bool:
+    """Return whether direct is worth profiling for public ``(M, N)``.
+
+    Direct splits N one to four outputs per CTA, so it wins while M * N is too
+    small for the 16-wide warp / tensor-core tiles to fill the SMs; above
+    M = 8 each row group also re-reads B.  In a cold-L2 CUPTI sweep on B200
+    and B300 (M in {1, 2, 3, 4, 6, 8, 12, 16, 24, 32}, N = 128..8192,
+    K = 768..40960, every tactic of all three runners), direct never beat warp /
+    cluster Split-K by more than 1% outside this region.  M <= 3 is profiled
+    regardless of N because direct can still win by a few percent there.
+    """
+    return m <= 3 or m * n <= 4096
+
+
+def prefer_direct_bf16_gemm_sm100(m: int, n: int, k: int) -> bool:
+    """Return the no-autotune crossover heuristic (same rule on every GPU).
+
+    True implies ``default_tactic(m, n, k)`` succeeds.  The region contains the
+    previous K == 8192 bands and only shapes where the default direct tactic
+    was no slower than the previous no-autotune choice (the warp / cluster
+    Split-K default, or direct inside those bands) in cold-L2 CUPTI sweeps
+    with interleaved re-timing (within 2%).  Direct wins while M * N is too
+    small to fill the SMs with Split-K tiles; at M = 1 it also wins on long K.
+    M = 2 with larger N, M = 1 with K < 5120, and K = 40960 are left out
+    because the Split-K default can be faster there.
+    """
+    if not 1 <= m <= _MAX_M or n <= 0 or k <= 0:
+        return False
+    if k % (_SUPPORTED_BLOCK_SIZES[0] * _VECTOR_WIDTH):
+        return False
+    return m * n <= 2048 or (m == 1 and n <= 8192 and 5120 <= k <= 16384)
+
+
+class DirectDenseGemmKernel:
+    """K-specialized direct GEMM with whole-mainloop vector prefetch."""
+
+    def __init__(
+        self,
+        *,
+        element_type,
+        k_extent: int,
+        tactic: DirectTactic,
+        use_pdl: bool,
+    ) -> None:
+        validate_tactic(
+            tactic, tactic.rows_per_block, tactic.outputs_per_block, k_extent
+        )
+        self.element_type = element_type
+        self.rows_per_block = tactic.rows_per_block
+        self.block_size = tactic.block_size
+        self.outputs_per_block = tactic.outputs_per_block
+        self.vector_width = _VECTOR_WIDTH
+        self.use_pdl = use_pdl
+        self.num_warps = tactic.block_size // cute.arch.WARP_SIZE
+        self.num_k_tiles = k_extent // (tactic.block_size * _VECTOR_WIDTH)
+
+    @cute.jit
+    def __call__(
+        self,
+        gA: cute.Tensor,
+        gB: cute.Tensor,
+        gC: cute.Tensor,
+        stream: _cuda.CUstream,
+    ) -> None:
+        copy_a = cute.make_copy_atom(
+            cute.nvgpu.CopyG2ROp(),
+            self.element_type,
+            num_bits_per_copy=self.vector_width * self.element_type.width,
+            load_cache_mode=cute.nvgpu.LoadCacheMode.ALWAYS,
+        )
+        copy_b = cute.make_copy_atom(
+            cute.nvgpu.CopyG2ROp(),
+            self.element_type,
+            num_bits_per_copy=self.vector_width * self.element_type.width,
+            load_cache_mode=cute.nvgpu.LoadCacheMode.STREAMING,
+        )
+        self.kernel(gA, gB, gC, copy_a, copy_b).launch(
+            grid=[
+                cute.ceil_div(cute.size(gB, mode=[0]), self.outputs_per_block),
+                cute.size(gA, mode=[0]) // self.rows_per_block,
+                1,
+            ],
+            block=[self.block_size, 1, 1],
+            smem=self.rows_per_block * self.outputs_per_block * self.num_warps * 4,
+            stream=stream,
+            use_pdl=self.use_pdl,
+            min_blocks_per_mp=1,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        gA: cute.Tensor,
+        gB: cute.Tensor,
+        gC: cute.Tensor,
+        copy_a: cute.CopyAtom,
+        copy_b: cute.CopyAtom,
+    ) -> None:
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, block_m, _ = cute.arch.block_idx()
+        warp_idx = cute.arch.warp_idx()
+
+        num_rows: cutlass.Constexpr = self.rows_per_block
+        outputs_per_block: cutlass.Constexpr = self.outputs_per_block
+        vector_width: cutlass.Constexpr = self.vector_width
+        block_size: cutlass.Constexpr = self.block_size
+        num_warps: cutlass.Constexpr = self.num_warps
+        num_k_tiles: cutlass.Constexpr = self.num_k_tiles
+
+        acc = cute.make_rmem_tensor(
+            cute.make_layout(
+                (num_rows, outputs_per_block), stride=(outputs_per_block, 1)
+            ),
+            cutlass.Float32,
+        )
+        acc.fill(0.0)
+
+        if const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
+
+        n_base = block_idx * outputs_per_block
+        m_base = block_m * num_rows
+        gA_vec = cute.logical_divide(gA, (None, vector_width))
+        gB_vec = cute.logical_divide(gB, (None, vector_width))
+        tA_all = cute.logical_divide(gA_vec, (None, (None, block_size)))
+        tB_all = cute.logical_divide(gB_vec, (None, (None, block_size)))
+        tA = tA_all[None, (None, (tidx, None))]
+
+        b_regs = cute.make_rmem_tensor(
+            cute.make_layout(
+                (outputs_per_block, num_k_tiles, vector_width),
+                stride=(num_k_tiles * vector_width, vector_width, 1),
+            ),
+            self.element_type,
+        )
+        for ni in cutlass.range_constexpr(outputs_per_block):
+            tB = tB_all[n_base + ni, (None, (tidx, None))]
+            for k_tile in cutlass.range_constexpr(num_k_tiles):
+                cute.copy(copy_b, tB[None, k_tile], b_regs[ni, k_tile, None])
+
+        a_regs = cute.make_rmem_tensor(
+            cute.make_layout((num_k_tiles, vector_width), stride=(vector_width, 1)),
+            self.element_type,
+        )
+        for mi in cutlass.range_constexpr(num_rows):
+            for k_tile in cutlass.range_constexpr(num_k_tiles):
+                cute.copy(
+                    copy_a,
+                    tA[m_base + mi, None, k_tile],
+                    a_regs[k_tile, None],
+                )
+            for k_tile in cutlass.range_constexpr(num_k_tiles):
+                for vi in cutlass.range_constexpr(vector_width):
+                    a_value = a_regs[k_tile, vi].to(cutlass.Float32)
+                    for ni in cutlass.range_constexpr(outputs_per_block):
+                        acc[mi, ni] = acc[mi, ni] + a_value * b_regs[ni, k_tile, vi].to(
+                            cutlass.Float32
+                        )
+
+        for mi in cutlass.range_constexpr(num_rows):
+            for ni in cutlass.range_constexpr(outputs_per_block):
+                acc[mi, ni] = cute.arch.warp_reduction_sum(acc[mi, ni])
+
+        smem_layout = cute.make_layout(
+            (num_rows, outputs_per_block, num_warps),
+            stride=(outputs_per_block * num_warps, num_warps, 1),
+        )
+        smem = cutlass.utils.SmemAllocator()
+        partials = smem.allocate_tensor(cutlass.Float32, smem_layout, byte_alignment=16)
+        with cute.arch.elect_one():
+            for mi in cutlass.range_constexpr(num_rows):
+                for ni in cutlass.range_constexpr(outputs_per_block):
+                    partials[mi, ni, warp_idx] = acc[mi, ni]
+
+        cute.arch.sync_threads()
+        if tidx == 0:
+            for mi in cutlass.range_constexpr(num_rows):
+                for ni in cutlass.range_constexpr(outputs_per_block):
+                    total = cutlass.Float32(0.0)
+                    for warp in cutlass.range_constexpr(num_warps):
+                        total = total + partials[mi, ni, warp]
+                    gC[m_base + mi, n_base + ni] = total.to(self.element_type)
+
+        if const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_launch_dependents()
+
+
+def _from_dlpack(tensor: _torch.Tensor, *, dynamic_m: bool = False):
+    tensor = from_dlpack(tensor.detach(), assumed_align=32)
+    if dynamic_m:
+        # Keep K and the row stride static for vectorized G2R copies.
+        tensor = tensor.mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1), divisibility=1
+        )
+    return tensor
+
+
+def _make_compile_repr_tensors(dtype, rows_per_block: int, n: int, k: int):
+    return tuple(
+        _from_dlpack(
+            _torch.empty(shape, dtype=dtype, device="cuda"), dynamic_m=dynamic_m
+        )
+        for shape, dynamic_m in (
+            ((rows_per_block, k), True),
+            ((n, k), False),
+            ((rows_per_block, n), True),
+        )
+    )
+
+
+@functools.cache
+def _get_compiled_direct_kernel(
+    device_index: int,
+    dtype,
+    n: int,
+    k: int,
+    tactic: DirectTactic,
+    use_pdl: bool,
+):
+    if dtype != _torch.bfloat16:
+        raise ValueError(f"direct GEMM supports BF16; got {dtype}")
+
+    with _torch.cuda.device(device_index):
+        return cute_ext.compile(
+            DirectDenseGemmKernel(
+                element_type=cutlass.BFloat16,
+                k_extent=k,
+                tactic=tactic,
+                use_pdl=use_pdl,
+            ),
+            *_make_compile_repr_tensors(dtype, tactic.rows_per_block, n, k),
+            _cuda.CUstream(_torch.cuda.current_stream().cuda_stream),
+            options=_COMPILE_OPTIONS,
+        )
+
+
+def _validate_runtime_tensors(a, b, out, tactic: DirectTactic):
+    if any(not isinstance(tensor, _torch.Tensor) for tensor in (a, b, out)):
+        raise ValueError("a, b, and out must be torch tensors")
+    if a.ndim != 2 or b.ndim != 2 or out.ndim != 2:
+        raise ValueError("direct GEMM accepts only 2D tensors")
+    if a.device.type != "cuda" or b.device != a.device or out.device != a.device:
+        raise ValueError("a, b, and out must be on the same CUDA device")
+    if a.dtype != _torch.bfloat16 or b.dtype != a.dtype or out.dtype != a.dtype:
+        raise ValueError("a, b, and out must share BF16 dtype")
+    if not a.is_contiguous() or not b.T.is_contiguous() or not out.is_contiguous():
+        raise ValueError("direct GEMM requires row-major A/out and column-major B")
+    if any(tensor.data_ptr() % 32 for tensor in (a, b, out)):
+        raise ValueError("a, b, and out must be 32-byte aligned")
+
+    m, k = a.shape
+    if b.shape[0] != k:
+        raise ValueError(
+            f"incompatible shapes: a is {tuple(a.shape)}, b is {tuple(b.shape)}"
+        )
+    n = b.shape[1]
+    if out.shape != (m, n):
+        raise ValueError(f"out must have shape {(m, n)}, got {tuple(out.shape)}")
+    validate_tactic(tactic, m, n, k)
+    return m, n, k
+
+
+def run_direct_dense(a, b, out, pdl: bool, tactic: DirectTactic):
+    """Run direct ``A[M,K] @ B[K,N]`` with the ``mm_bf16`` layouts."""
+    _, n, k = _validate_runtime_tensors(a, b, out, tactic)
+    with _torch.cuda.device(a.device):
+        compiled = _get_compiled_direct_kernel(
+            a.get_device(), a.dtype, n, k, tactic, pdl
+        )
+        compiled(
+            _from_dlpack(a, dynamic_m=True),
+            _from_dlpack(b.T),
+            _from_dlpack(out, dynamic_m=True),
+            _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream),
+        )
+    return out
+
+
+__all__ = [
+    "DirectTactic",
+    "autotune_tactics",
+    "default_tactic",
+    "is_direct_bf16_gemm_candidate_sm100",
+    "prefer_direct_bf16_gemm_sm100",
+    "run_direct_dense",
+]

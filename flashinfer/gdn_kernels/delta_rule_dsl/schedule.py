@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Any
 
 import cutlass
 import cutlass.cute as cute
@@ -10,13 +11,20 @@ class WorkDesc:
     seq_idx: cutlass.Int32
     private_q_head_idx: cutlass.Int32
     private_v_head_idx: cutlass.Int32
-    tok_offset: cutlass.Int32
+    tok_offset: Any
 
     # shape
     seq_len: cutlass.Int32
 
     # update by mainloop
     tile_idx: cutlass.Int32
+
+    # V slice this block owns; nonzero only in the sm_80 kernel, which splits V.
+    v_slice_idx: cutlass.Int32 = 0
+
+    def v_row_offset(self, d_v: cutlass.Constexpr):
+        """First V row this block owns, in elements."""
+        return self.v_slice_idx * cutlass.Int32(d_v)
 
     def is_valid(self, num_seqs: cutlass.Int32):
         return self.seq_idx >= cutlass.Int32(0) and self.seq_idx < num_seqs
