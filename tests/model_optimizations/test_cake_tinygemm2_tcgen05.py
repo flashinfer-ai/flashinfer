@@ -1,6 +1,6 @@
 """Tests for tinygemm2_tcgen05 — the generated tcgen05 tinygemm2 programs.
 
-``flashinfer.jit.cake_tinygemm2_tcgen05`` holds three tiles, each with and
+``flashinfer.jit.cake_tinygemm2_tcgen05`` holds seven tiles, each with and
 without the bias and with and without programmatic dependent launch.  Their
 contract is the output of ``csrc/tinygemm2.cu`` bit for bit, so every parity
 test below uses ``torch.equal``, not a tolerance.
@@ -16,6 +16,8 @@ TILES = (
     "PACKED_NARROW",
     "PACKED_NARROW_U4",
     "PACKED_NARROW_FULL_STAGES",
+    "PACKED_M64_N16",
+    "PACKED_M64_N4",
     "PACKED",
     "ACCUMULATORS",
 )
@@ -26,8 +28,8 @@ PROGRAMS = tuple(
     for pdl in ("", "_PDL")
 )
 
-# Every program runs every shape: batches across the tiles' 2, 16 and 64 rows,
-# output features across their 8 and 32, and input features off the 64- and
+# Every program runs every shape: batches across the tiles' 2, 4, 16 and 64 rows,
+# output features across their 8, 16 and 32, and input features off the 64- and
 # 256-wide K steps of the four chains (zero-filled tails), with chains that
 # get no K chunk at all (K <= 768).
 PARITY_SHAPES = [
@@ -35,6 +37,7 @@ PARITY_SHAPES = [
     (1, 128, 720),
     (2, 16, 256),
     (3, 48, 4112),
+    (4, 2880, 2880),
     (5, 80, 1040),
     (7, 128, 4096),
     (8, 128, 7168),
