@@ -3199,10 +3199,6 @@ kernel_cake_blackwell_bf16_fp4_916900985e3576f137a2(const __grid_constant__ CUte
             asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
         }
     }
-
-    // Cleanup
-    asm volatile("barrier.cluster.arrive.release.aligned;");
-    asm volatile("barrier.cluster.wait.acquire.aligned;");
 }
 
 } // extern "C"

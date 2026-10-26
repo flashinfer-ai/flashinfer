@@ -16,16 +16,17 @@
 
 The Sage prepare writes one FP32 buffer per plan before attention, laid out
 as ``_SageScaleLayout`` describes; a context Q tile holds 128 tokens of one Q
-head. The helpers here turn work-tile coordinates into words of that buffer
-and move the words the kernel reads:
+head. A softmax lane reads its ``sfQ`` word once per work tile with
+``sage.index.load_sage_q_scale``, which the decode kernel shares. The helpers
+here turn work-tile coordinates into words of that buffer and move the other
+words the kernel reads:
 
-* ``load_sage_q_scale`` reads a softmax lane's ``sfQ`` word once per work
-  tile (``sage.index`` holds the word arithmetic both kernels share);
 * ``load_sage_k_tile`` reads one K tile's ``sfK`` atoms from the tile's
   address (``sage_k_section_address`` gives the sequence's first atom) for
   the softmax lanes; ``sage_k_transport`` says whether the plan's K block
-  size takes that path or the load warp's ring (``SmemSageKScalesResource``),
-  and ``sage_score_scaling`` how the softmax applies the words;
+  size takes that global-memory path or the load warp's shared-memory ring
+  (``SmemSageKScalesResource``), and ``sage_score_scaling`` how the softmax
+  applies the words;
   ``prefetch_sage_k_tile`` warms L1 with the next tile's atoms one tile ahead
   of direct loads;
 * ``load_sage_v_channels`` reads the sequence's ``sfV`` / ``v_mean`` words per
@@ -37,7 +38,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64
 
-from ...sage.index import sage_q_word, sage_section_word
+from ...sage.index import sage_section_word
 from ...sage.layout import _FLOAT4_WORDS, _SAGE_ATOM_TOKENS, _SageScaleLayout
 from ...sage.modes import SageKTransport, SageScoreScaling
 
@@ -50,8 +51,8 @@ SAGE_SCORE_BLOCK_COLS = 16
 _L1_LINE_BYTES = 128
 # Most ``sfK`` words of one K tile the softmax lanes load from global memory
 # and carry across the S wait as a task-local vector
-# (``SageKTransport.GLOBAL``); more words go through the load warp's ring.
-_GLOBAL_MAX_TILE_WORDS = 32
+# (``SageKTransport.GMEM``); more words go through the load warp's ring.
+_GMEM_MAX_TILE_WORDS = 32
 
 
 def validate_context_sage_layout(layout: _SageScaleLayout, kv_tile_n: int) -> None:
@@ -85,14 +86,14 @@ def sage_score_scaling(layout: _SageScaleLayout) -> SageScoreScaling:
 def sage_k_transport(layout: _SageScaleLayout) -> SageKTransport:
     """Return how the context softmax obtains a K tile's ``sfK`` words.
 
-    The lanes load a tile of at most ``_GLOBAL_MAX_TILE_WORDS`` words from
+    The lanes load a tile of at most ``_GMEM_MAX_TILE_WORDS`` words from
     global memory before the S wait; a tile with more words (one-token
     blocks) is too many to carry or to broadcast-load per lane, so the load
     warp stages it in the ``sfK`` ring (``SmemSageKScalesResource``).
     """
-    if sage_k_tile_words(layout) <= _GLOBAL_MAX_TILE_WORDS:
-        return SageKTransport.GLOBAL
-    return SageKTransport.RING
+    if sage_k_tile_words(layout) <= _GMEM_MAX_TILE_WORDS:
+        return SageKTransport.GMEM
+    return SageKTransport.SMEM
 
 
 def sage_k_tile_words(layout: _SageScaleLayout) -> int:
@@ -114,28 +115,6 @@ def sage_k_block_word(layout: _SageScaleLayout, block_idx: int) -> int:
     k_tokens = layout.k_tokens
     atom, token_in_atom = divmod(block_idx * SAGE_SCORE_BLOCK_COLS, _SAGE_ATOM_TOKENS)
     return atom * k_tokens.atom_words + token_in_atom // k_tokens.tokens_per_word
-
-
-@cute.jit
-def load_sage_q_scale(
-    layout: Constexpr[_SageScaleLayout],
-    scales: cute.Pointer,
-    *,
-    sequence_words: Int32,
-    q_tile_idx: Int32,
-    row_idx: Int32,
-) -> Float32:
-    """Return ``sfQ`` of row ``row_idx`` of Q tile ``q_tile_idx``.
-
-    ``sequence_words`` is the first word of the row's sequence
-    (``sage_sequence_words``); a tile holds 128 tokens of one Q head
-    (``_SageQSection.tile_index``). The word already holds the scale of the
-    row's token, the last token's for a row past the sequence's end.
-    """
-    word = sage_q_word(
-        layout, sequence_words=sequence_words, q_tile_idx=q_tile_idx, row_idx=row_idx
-    )
-    return Float32(scales[word])
 
 
 @cute.jit

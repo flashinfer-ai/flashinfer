@@ -1453,6 +1453,61 @@ def test_pdl_follows_the_plan():
     assert wide.items > wide.units and cake_backend.pdl_for(wide) is False
 
 
+def test_plan_shaves_one_wave_of_long_full_tiles():
+    """One wave of nearly as many full tiles as clusters over 1024 key tiles takes the shaved plan: every tile a
+    long range and a short one of ``MLA2_SHAVE_TILES`` tiles, the long ranges first, two partials per row behind a
+    ``merge_w1`` merge and no direct item; the same shapes over 64K keys and a second wave of tiles keep the
+    equal-length plans."""
+    units, pairs = cake_backend.units_pairs_for_sm_count(208)
+    shave = cake_backend.MLA2_SHAVE_TILES
+    tiles = 131072 // (2 * PAGE)
+    for heads, q_len, batch in ((96, 8, 16), (192, 1, 48), (448, 1, 24)):
+        kv_lens, q_lens = [131072] * batch, [q_len] * batch
+        n_tiles = batch * -(
+            -q_len * heads // ROWS_TILE
+        )  # 192, 448 and 768 rows: one, two and three full tiles
+        assert 0.8 * units <= n_tiles <= units
+        p = cake_backend.plan(
+            seq_lens_host=kv_lens,
+            num_heads=heads,
+            q_len=q_len,
+            units=units,
+            pairs=pairs,
+        )
+        _check_plan(p, kv_lens, q_lens, heads)
+        assert p.n_full == p.items == 2 * n_tiles and p.max_splits == 2
+        assert p.decode_record == "decode_full" and p.merge_record == "merge_w1"
+        rows = [tuple(p.item_table[6 * i : 6 * i + 6]) for i in range(p.items)]
+        assert [r[2:] for r in rows[:n_tiles]] == [(0, tiles - shave, 0, 2)] * n_tiles
+        assert [r[2:] for r in rows[n_tiles:]] == [
+            (tiles - shave, shave, 1, 2)
+        ] * n_tiles
+        assert [r[:2] for r in rows[:n_tiles]] == [r[:2] for r in rows[n_tiles:]]
+        # Two items per cluster: more items than resident clusters, so the launches are plain.
+        assert p.items > units and cake_backend.pdl_for(p) is False
+        q = cake_backend.plan(
+            seq_lens_host=[65536] * batch,
+            num_heads=heads,
+            q_len=q_len,
+            units=units,
+            pairs=pairs,
+        )
+        assert (
+            q.items == q.n_full == n_tiles
+            and q.max_splits == 1
+            and q.merge_record is None
+        )
+    # More full tiles than clusters (the 212-SM table): a second wave, no shaved range.
+    units, pairs = cake_backend.units_pairs_for_sm_count(212)
+    assert units < 48
+    p = cake_backend.plan(
+        seq_lens_host=[131072] * 16, num_heads=96, q_len=8, units=units, pairs=pairs
+    )
+    _check_plan(p, [131072] * 16, [8] * 16, 96)
+    rows = [tuple(p.item_table[6 * i : 6 * i + 6]) for i in range(p.items)]
+    assert not any(r[2:4] == (tiles - shave, shave) for r in rows)
+
+
 def test_plan_rejects_malformed_problems():
     with pytest.raises(ValueError, match="multiple of 16"):
         cake_backend.plan(seq_lens_host=[64], num_heads=8, q_len=1, units=46, pairs=14)

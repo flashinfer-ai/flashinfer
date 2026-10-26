@@ -56,18 +56,24 @@ cooperative launch above the device's co-residency is refused by the driver).
 Within it, compute capability 9.0 always takes the fused form, and 12.0 does
 except on a *wide* call (the program rule below: the whole-tile program ships
 in the split form alone, so a wide call takes the split form there).
-Compute capability 10.0 and 10.3 take it under the eager host rule alone: on a host of ``FUSED_HOSTS``
-(``aarch64``: the Grace host of a GB200 / GB300, whose eager path leaves a
-gap of several microseconds between the decode launch and the merge launch
-that costs more than the fused form's in-kernel merge tail), at ``rows <=
-FUSED_MAX_ROWS`` (4) and when the current stream is not capturing: a captured
-call is replayed without that gap, so it keeps the *split* form, whose GPU
-time is the shorter one.  Compute capability 10.7 keeps the split form on
+Compute capability 10.0 and 10.3 take it under the eager host rule alone: on a host of ``FUSED_HOSTS``,
+at ``rows <= FUSED_MAX_ROWS`` (4) and when the current stream is not
+capturing -- and ``FUSED_HOSTS`` lists no host.  The rule once named
+``aarch64`` (the Grace host of a GB200 / GB300) from an event-timed
+measurement that had the fused form's whole call 1.1-1.6x shorter at rows
+1-4; that measurement hid the fused form's longer pre-launch host path.
+Timed host-inclusively on a GB300 -- calls back to back, calls behind an L2
+flush in the stream, and lone synchronous calls -- the split form's whole
+call is the shorter one at rows 1-4 (1.07-1.14x, 1.21-1.40x and 1.08-1.14x)
+and the two forms tie above, while a captured call replays the split form
+either way.  So 10.0 and 10.3 take the *split* form on every host; the
+cooperative build and the rule stay for a host that measures otherwise.
+Compute capability 10.7 keeps the split form on
 every host: on an R200 system the split route's eager whole call is the
 shorter one at every row (measured at rows 1 to 16), so the rule does not
-apply there.  Everywhere else -- compute capability 8.x, an x86 host, rows
-above 4, a capturing stream, a call on a device other than the current one
-(its capture state is unreadable) -- the *split* form: the plain decode, then
+apply there.  Everywhere else -- compute capability 8.x, a capturing stream,
+a call on a device other than the current one (its capture state is
+unreadable) -- the *split* form: the plain decode, then
 the separate merge.  The package's graph tests compare an eager
 call with its captured replay bit for bit, so the two forms agree exactly.
 
@@ -176,9 +182,13 @@ FUSED_CTAS_PER_SM = cake_jit.DECODE_FUSED_CTAS_PER_SM
 # The eager host rule of the tcgen05 architectures (module docstring, "Form rule"): within the fused capacity, these
 # architectures take the fused form only on these host machines (``platform.machine()``), at this many rows or fewer,
 # and only outside a stream capture; compute capability 9.0 and 12.0 take it within their capacity on every host, and
-# sm_107a (not listed) keeps the split form on every host, the measured shorter one there.
+# sm_107a (not listed) keeps the split form on every host, the measured shorter one there.  No host machine is
+# listed: on the Grace host of a GB300 the split form's eager whole call is the shorter one at every row once the
+# host's enqueue time is counted (the rule once named ``aarch64`` from an event-timed measurement that hid the fused
+# form's longer pre-launch host path), so compute capability 10.0 and 10.3 keep the split form on every host; the
+# cooperative build and the rule stay for a host that measures otherwise.
 FUSED_HOST_RULE_ARCHES = ("sm_100a", "sm_103a")
-FUSED_HOSTS = ("aarch64",)
+FUSED_HOSTS: tuple[str, ...] = ()
 FUSED_MAX_ROWS = 4
 # Architectures whose cooperative build ships but whose eager call keeps the split form on every host.
 FUSED_SPLIT_ONLY_ARCHES = ("sm_107a",)
