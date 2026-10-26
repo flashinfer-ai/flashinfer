@@ -21,6 +21,7 @@ from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.tuner import (
 )
 
 
+@pytest.mark.cpu_only
 def test_bf16_knobs_only_expose_valid_fixed_geometry():
     knobs = default_knobs(256, dtype="bf16")
     assert knobs["mma_tiler_mnk"] == (256, 256, 64)
@@ -44,6 +45,7 @@ def test_bf16_knobs_only_expose_valid_fixed_geometry():
     ]
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("hidden", "intermediate", "top_k", "message"),
     ((33, 64, 1, "hidden"), (32, 65, 1, "intermediate"), (32, 64, 33, "topk")),
@@ -63,6 +65,7 @@ def test_bf16_frontend_rejects_unsupported_shapes(
         )
 
 
+@pytest.mark.cpu_only
 def test_bf16_factory_accepts_session_compatible_pinned_knobs(monkeypatch):
     import torch
 
@@ -93,6 +96,7 @@ def test_bf16_factory_accepts_session_compatible_pinned_knobs(monkeypatch):
         buf.destroy()
 
 
+@pytest.mark.cpu_only
 def test_bf16_factory_rejects_unpermitted_pinned_ikr(monkeypatch):
     import torch
 
@@ -114,6 +118,7 @@ def test_bf16_factory_rejects_unpermitted_pinned_ikr(monkeypatch):
         )
 
 
+@pytest.mark.cpu_only
 def test_bf16_factory_resolves_ikr_from_knobs_when_permitted(monkeypatch):
     """The permission is a ceiling: either knob value is now servable."""
     import torch
@@ -146,6 +151,7 @@ def test_bf16_factory_resolves_ikr_from_knobs_when_permitted(monkeypatch):
             buf.destroy()
 
 
+@pytest.mark.cpu_only
 def test_bf16_frontend_rejects_unpermitted_ikr_knobs():
     from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.bf16 import (
         MegaMoEBf16Frontend,
@@ -174,6 +180,7 @@ def test_bf16_frontend_rejects_unpermitted_ikr_knobs():
     assert permitted.config.in_kernel_fc2_reduce is True
 
 
+@pytest.mark.cpu_only
 def test_bf16_autotune_filters_unpermitted_ikr_candidates(monkeypatch):
     from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import autotune
     from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.bf16 import (
@@ -210,6 +217,7 @@ def test_bf16_autotune_filters_unpermitted_ikr_candidates(monkeypatch):
     assert "in_kernel_fc2_reduce=True is not permitted" in str(excinfo.value)
 
 
+@pytest.mark.cpu_only
 def test_bf16_autotune_sweeps_the_ikr_axis_when_permitted(monkeypatch):
     """A permitted session times both ikr modes; both must be runnable as-is."""
     from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import autotune
@@ -243,12 +251,14 @@ def test_bf16_autotune_sweeps_the_ikr_axis_when_permitted(monkeypatch):
     ]
 
 
+@pytest.mark.cpu_only
 def test_bf16_backend_defaults_to_scale_free_contract():
     config = Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig(intermediate_size=64, top_k=1)
     assert config.kernel_name == "sm100_bf16_bf16_bf16_cutedsl"
     assert config.knobs is None
 
 
+@pytest.mark.cpu_only
 def test_bf16_backend_accepts_collective_autotune():
     assert (
         Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig(

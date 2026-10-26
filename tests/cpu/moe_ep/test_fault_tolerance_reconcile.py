@@ -62,6 +62,7 @@ def _assert_all_agree(results, expected):
 
 
 class TestHappyPath:
+    @pytest.mark.cpu_only
     def test_all_alive(self):
         world = 4
         store = dist.HashStore()
@@ -69,6 +70,7 @@ class TestHappyPath:
         results = _run_ranks(store, world, masks)
         _assert_all_agree(results, [ACTIVE] * world)
 
+    @pytest.mark.cpu_only
     def test_single_rank_world(self):
         store = dist.HashStore()
         results = _run_ranks(store, 1, {0: [ACTIVE]})
@@ -76,6 +78,7 @@ class TestHappyPath:
 
 
 class TestDeadRanks:
+    @pytest.mark.cpu_only
     def test_rank_never_reports(self):
         """Rank 2 never calls reconcile; survivors must agree it is gone."""
         world = 4
@@ -89,6 +92,7 @@ class TestDeadRanks:
         expected = [ACTIVE, ACTIVE, MASKED, ACTIVE]
         _assert_all_agree(results, expected)
 
+    @pytest.mark.cpu_only
     def test_disagreeing_views_are_anded(self):
         """Rank 1 saw 3 time out; rank 2 did not. AND => 3 masked everywhere.
 
@@ -113,6 +117,7 @@ class TestDeadRanks:
             assert results[r] == expected, f"rank {r} got {results[r]}"
         assert isinstance(results[3], MoEEpRankEvictedError)
 
+    @pytest.mark.cpu_only
     def test_rank_never_masks_itself(self):
         """A caller-supplied mask that masks the local rank is corrected."""
         world = 2
@@ -122,6 +127,7 @@ class TestDeadRanks:
         # Rank 0 forces its own bit ACTIVE, so nothing is masked.
         _assert_all_agree(results, [ACTIVE, ACTIVE])
 
+    @pytest.mark.cpu_only
     def test_coordinator_is_the_dead_rank(self):
         """Rank 0 (lowest, the natural coordinator) is the one that died."""
         world = 4
@@ -133,6 +139,7 @@ class TestDeadRanks:
         # Takeover elects rank 1; every survivor must adopt the same vector.
         _assert_all_agree(results, [MASKED, ACTIVE, ACTIVE, ACTIVE])
 
+    @pytest.mark.cpu_only
     def test_two_dead_ranks(self):
         world = 5
         store = dist.HashStore()
@@ -144,6 +151,7 @@ class TestDeadRanks:
 
 
 class TestSplitBrain:
+    @pytest.mark.cpu_only
     def test_late_key_does_not_split_the_decision(self):
         """The regression test for the naive "everyone ANDs locally" design.
 
@@ -209,6 +217,7 @@ class TestSplitBrain:
         distinct = {tuple(v) for v in survivors.values()}  # type: ignore[arg-type]
         assert len(distinct) == 1, f"split brain: ranks disagreed: {results}"
 
+    @pytest.mark.cpu_only
     def test_decision_is_write_once(self):
         """A later reconcile at the same epoch adopts the published decision."""
         world = 3
@@ -240,6 +249,7 @@ class TestSplitBrain:
         )
         assert second == first
 
+    @pytest.mark.cpu_only
     def test_separate_epochs_are_independent(self):
         """The epoch namespaces the keys, so rounds do not leak into each other."""
         world = 2
@@ -270,6 +280,7 @@ class TestSplitBrain:
 
 
 class TestEviction:
+    @pytest.mark.cpu_only
     def test_rank_masked_by_peers_raises(self):
         """A rank the survivors gave up on must not silently keep serving."""
         from flashinfer.moe_ep.errors import MoEEpRankEvictedError
@@ -289,6 +300,7 @@ class TestEviction:
                 takeover_s=0.5,
             )
 
+    @pytest.mark.cpu_only
     def test_survivors_are_unaffected(self):
         """The same decision is adopted normally by a rank it keeps alive."""
         world = 3
@@ -307,6 +319,7 @@ class TestEviction:
 
 
 class TestValidation:
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize(
         "kwargs, match",
         [
@@ -321,6 +334,7 @@ class TestValidation:
                 dist.HashStore(), epoch=0, timeout_s=0.1, takeover_s=0.1, **kwargs
             )
 
+    @pytest.mark.cpu_only
     def test_peer_from_a_different_world_is_ignored(self):
         """A stale key of the wrong length must not corrupt the AND."""
         world = 3

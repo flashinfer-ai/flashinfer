@@ -12,7 +12,7 @@ import pytest
 
 _PACKAGE_NAME = "flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe"
 _PACKAGE_ROOT = (
-    Path(__file__).resolve().parents[2]
+    Path(__file__).resolve().parents[3]
     / "flashinfer"
     / "moe_ep"
     / "kernel_src"
@@ -87,6 +87,7 @@ class _FakeGemmRunner:
         self._log.append("fc1" if self._calls == 1 else "fc2")
 
 
+@pytest.mark.cpu_only
 def test_pipe_ep_size_validation_uses_guarded_handshake_with_a_comm() -> None:
     from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe import Sm90PushPipe
 
@@ -235,6 +236,7 @@ def _weight_bundle(*, num_experts: int = 1):
     )
 
 
+@pytest.mark.cpu_only
 def test_runner_rebinds_same_geometry_weights_without_reallocating_scratch():
     import torch
 
@@ -255,6 +257,7 @@ def test_runner_rebinds_same_geometry_weights_without_reallocating_scratch():
     assert (runner.a1, runner.a2, runner.y, runner._workspace, runner.runner) == scratch
 
 
+@pytest.mark.cpu_only
 def test_runner_weight_rebind_is_idle_only_and_transactional():
     import torch
 
@@ -279,6 +282,7 @@ def test_runner_weight_rebind_is_idle_only_and_transactional():
     assert runner.w13_fp8 is first.w13_fp8
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("rank", "prepare_phase"),
     (
@@ -321,6 +325,7 @@ def test_gemm_jit_collective_elects_one_leader_per_cache_and_tactic_identity(
     assert calls == [prepare_phase]
 
 
+@pytest.mark.cpu_only
 def test_gemm_jit_cache_identity_includes_tactic_inputs(monkeypatch, tmp_path):
     from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import (
         runner as module,
@@ -365,6 +370,7 @@ def test_gemm_jit_cache_identity_includes_tactic_inputs(monkeypatch, tmp_path):
     )
 
 
+@pytest.mark.cpu_only
 def test_gemm_jit_allows_warm_cache_without_nvcc(monkeypatch):
     from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import (
         runner as module,
@@ -389,6 +395,7 @@ def test_gemm_jit_allows_warm_cache_without_nvcc(monkeypatch):
     instance._require_gemm_jit_runtime()
 
 
+@pytest.mark.cpu_only
 def test_gemm_jit_rejects_cold_cache_without_nvcc(monkeypatch):
     from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import (
         runner as module,
@@ -416,6 +423,7 @@ def test_gemm_jit_rejects_cold_cache_without_nvcc(monkeypatch):
         instance._require_gemm_jit_runtime()
 
 
+@pytest.mark.cpu_only
 def test_fused_fc1_rejects_disabled_deepgemm(monkeypatch):
     from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import (
         runner as module,
@@ -432,6 +440,7 @@ def test_fused_fc1_rejects_disabled_deepgemm(monkeypatch):
         instance._require_gemm_jit_runtime()
 
 
+@pytest.mark.cpu_only
 def test_runner_preserves_protocol_and_compute_order():
     runner, pipe, log = _runner()
     output = object()
@@ -458,6 +467,7 @@ def test_runner_preserves_protocol_and_compute_order():
     assert runner.state == "idle"
 
 
+@pytest.mark.cpu_only
 def test_runner_rejects_compute_before_stage_and_double_stage():
     runner, _, _ = _runner()
     output = object()
@@ -470,6 +480,7 @@ def test_runner_rejects_compute_before_stage_and_double_stage():
     assert runner.state == "staged"
 
 
+@pytest.mark.cpu_only
 def test_runner_rejects_cross_stream_round_while_previous_event_is_incomplete():
     runner, _, log = _runner()
     runner._round_event = _FakeEvent(log, complete=False)
@@ -484,6 +495,7 @@ def test_runner_rejects_cross_stream_round_while_previous_event_is_incomplete():
     assert log == []
 
 
+@pytest.mark.cpu_only
 def test_runner_rejects_invalid_output_before_dispatch():
     runner, _, log = _runner()
     invalid_output = object()
@@ -501,6 +513,7 @@ def test_runner_rejects_invalid_output_before_dispatch():
     assert log == []
 
 
+@pytest.mark.cpu_only
 def test_runner_poisoned_when_compute_receives_invalid_output():
     runner, _, log = _runner()
     invalid_output = object()
@@ -523,6 +536,7 @@ def test_runner_poisoned_when_compute_receives_invalid_output():
     ]
 
 
+@pytest.mark.cpu_only
 def test_runner_poisoned_after_mid_round_failure():
     runner, pipe, log = _runner()
     output = object()
@@ -542,6 +556,7 @@ def test_runner_poisoned_after_mid_round_failure():
         runner.stage_inputs(object(), object(), object())
 
 
+@pytest.mark.cpu_only
 def test_runner_completes_on_staged_stream_before_joining_caller_stream():
     runner, _, log = _runner()
     output = object()
@@ -572,6 +587,7 @@ def test_runner_completes_on_staged_stream_before_joining_caller_stream():
     ]
 
 
+@pytest.mark.cpu_only
 def test_runner_destroy_is_idempotent():
     runner, _, log = _runner()
     runner._staged_stream = _FakeStream(17, log)
@@ -584,6 +600,7 @@ def test_runner_destroy_is_idempotent():
     assert log == ["destroy"]
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("round_open", [True, False])
 def test_pipe_abort_uses_control_stream_and_device_anchor(monkeypatch, round_open):
     from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import protocol
@@ -615,6 +632,7 @@ def test_pipe_abort_uses_control_stream_and_device_anchor(monkeypatch, round_ope
     ]
 
 
+@pytest.mark.cpu_only
 def test_pipe_abort_keeps_local_poison_when_cuda_is_sticky(monkeypatch):
     from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import protocol
 
@@ -639,6 +657,7 @@ def test_pipe_abort_keeps_local_poison_when_cuda_is_sticky(monkeypatch):
     assert log == [("publish_abort", ("layout", pipe._round))]
 
 
+@pytest.mark.cpu_only
 def test_abort_cuda_contract_is_wired_through_waits_and_traps():
     header = _package_text("src", "a2a", "sm90_push_a2a.cuh")
     ops = _package_text("src", "a2a", "sm90_push_a2a_ops.cu")

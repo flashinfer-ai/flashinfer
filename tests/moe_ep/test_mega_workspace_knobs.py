@@ -18,7 +18,7 @@ from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim.tuning import 
     sm100_genphase_candidates,
 )
 
-from .test_mega_workspace_api import _inputs
+from tests.cpu.moe_ep.test_mega_workspace_api import _inputs
 
 
 def _mxfp8_backend(*, capacity=129, hidden=384, **kwargs):

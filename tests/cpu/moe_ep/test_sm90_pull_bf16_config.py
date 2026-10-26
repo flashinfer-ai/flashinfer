@@ -33,6 +33,7 @@ def _config(**overrides) -> Sm90_Bf16_Bf16_Bf16_PullCutedsl_MegaMoeConfig:
 
 
 class TestSm90PullBf16Config:
+    @pytest.mark.cpu_only
     def test_defaults(self) -> None:
         cfg = _config()
         assert cfg.kernel_name == "sm90_bf16_bf16_bf16_pull_cutedsl"
@@ -64,9 +65,11 @@ class TestSm90PullBf16Config:
         # heuristic table (see kernel_src sm90 shim/tuner_bf16.py).
         assert cfg.knobs is None
 
+    @pytest.mark.cpu_only
     def test_is_mega_kernel_config(self) -> None:
         assert is_mega_kernel_config(_config())
 
+    @pytest.mark.cpu_only
     def test_registry_resolves_backend(self) -> None:
         backend = create_mega_kernel(_config())
         assert isinstance(backend, Sm90PullBf16MegaKernelBackend)
@@ -76,11 +79,13 @@ class TestSm90PullBf16Config:
             == "sm90_bf16_bf16_bf16_pull_cutedsl"
         )
 
+    @pytest.mark.cpu_only
     def test_registry_lists_kernel_in_unknown_error(self) -> None:
         bogus = dataclasses.replace(_config(), kernel_name="definitely_not_a_kernel")
         with pytest.raises(KeyError, match="sm90_bf16_bf16_bf16_pull_cutedsl"):
             create_mega_kernel(bogus)
 
+    @pytest.mark.cpu_only
     def test_public_reexports(self) -> None:
         import flashinfer.moe_ep as moe_ep
 
@@ -122,6 +127,7 @@ class TestSm90PullBf16ValidateInit:
             ),
         )
 
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize("intermediate_size", [64, 128, 192, 256, 3072])
     def test_intermediate_multiple_of_64_accepted(
         self, monkeypatch, intermediate_size
@@ -130,6 +136,7 @@ class TestSm90PullBf16ValidateInit:
             monkeypatch, intermediate_size=intermediate_size, hidden=256
         )
 
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize("intermediate_size", [32, 96, 200])
     def test_intermediate_not_multiple_of_64_rejected(
         self, monkeypatch, intermediate_size
@@ -141,10 +148,12 @@ class TestSm90PullBf16ValidateInit:
                 monkeypatch, intermediate_size=intermediate_size, hidden=256
             )
 
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize("hidden", [256, 512, 2048, 7168])
     def test_hidden_multiple_of_256_accepted(self, monkeypatch, hidden) -> None:
         self._validate_init(monkeypatch, intermediate_size=64, hidden=hidden)
 
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize("hidden", [64, 128, 192, 320, 2880])
     def test_hidden_needs_256(self, monkeypatch, hidden) -> None:
         # Multiples of 64 that are not multiples of 256 must still fail on the
@@ -156,6 +165,7 @@ class TestSm90PullBf16ValidateInit:
 
 
 class TestSm90PullBf16RuntimeRequirements:
+    @pytest.mark.cpu_only
     def test_requires_nvshmem_and_torch_dist(self, monkeypatch) -> None:
         monkeypatch.delenv("MEGA_NO_DIST", raising=False)
         from flashinfer.moe_ep.config import BootstrapConfig
@@ -171,6 +181,7 @@ class TestSm90PullBf16RuntimeRequirements:
         assert sm90_pull_bf16_runtime_requirements(bootstrap) == expected
         assert backend.runtime_requirements(bootstrap) == expected
 
+    @pytest.mark.cpu_only
     def test_mega_no_dist_needs_nothing(self, monkeypatch) -> None:
         monkeypatch.setenv("MEGA_NO_DIST", "1")
         from flashinfer.moe_ep.config import BootstrapConfig
@@ -181,6 +192,7 @@ class TestSm90PullBf16RuntimeRequirements:
 
 
 class TestSm90ArchGate:
+    @pytest.mark.cpu_only
     def test_validate_mega_arch_sm90_no_cuda_is_noop(self, monkeypatch) -> None:
         import torch
 
@@ -189,6 +201,7 @@ class TestSm90ArchGate:
         monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
         validate_mega_arch_sm90()  # must not raise on CPU-only hosts
 
+    @pytest.mark.cpu_only
     def test_validate_mega_arch_sm90_rejects_non_hopper(self, monkeypatch) -> None:
         import torch
 

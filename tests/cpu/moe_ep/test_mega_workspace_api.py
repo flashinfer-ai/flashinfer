@@ -107,6 +107,7 @@ def _create_workspace(layer, capacity: int, raw_workspace=None):
     return handle, raw_workspace, validate_init, prepare_workspace
 
 
+@pytest.mark.cpu_only
 def test_create_workspace_derives_only_capacity_from_layer_fleet_params():
     layer, _, _ = _make_layer()
     handle, raw_workspace, validate_init, prepare_workspace = _create_workspace(
@@ -134,6 +135,7 @@ def test_create_workspace_derives_only_capacity_from_layer_fleet_params():
     layer.destroy()
 
 
+@pytest.mark.cpu_only
 def test_live_profiles_preserve_capacity_and_handle_lifetime():
     layer, _, _ = _make_layer()
     layer._kernel.supports_live_token_tuning = True
@@ -158,6 +160,7 @@ def test_live_profiles_preserve_capacity_and_handle_lifetime():
     assert large.is_destroyed
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "config_name",
     [
@@ -229,6 +232,7 @@ def test_live_tactics_change_pool_key_for_all_cached_backends(monkeypatch, confi
     assert all(c.kwargs["max_tokens"] == 64 for c in cache.resolve_knobs.call_args_list)
 
 
+@pytest.mark.cpu_only
 def test_live_profile_pool_shares_only_equal_tactics(monkeypatch, tmp_path):
     import torch
     from flashinfer import moe_ep
@@ -275,6 +279,7 @@ def test_live_profile_pool_shares_only_equal_tactics(monkeypatch, tmp_path):
     assert keys[0] != keys[2]
 
 
+@pytest.mark.cpu_only
 def test_sm90_explicit_geometry_bypasses_live_cache(monkeypatch):
     from flashinfer import moe_ep
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
@@ -290,6 +295,7 @@ def test_sm90_explicit_geometry_bypasses_live_cache(monkeypatch):
     assert backend._workspace_knobs(fleet) is None
 
 
+@pytest.mark.cpu_only
 def test_duplicate_capacity_is_rejected_and_different_capacity_does_not_alias(
     monkeypatch,
 ):
@@ -359,6 +365,7 @@ def test_duplicate_capacity_is_rejected_and_different_capacity_does_not_alias(
     layer.destroy()
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("live_tokens", [None, 8])
 def test_default_profile_handle_adopts_the_lazy_default_workspace(live_tokens):
     layer, _, _ = _make_layer()
@@ -389,6 +396,7 @@ def test_default_profile_handle_adopts_the_lazy_default_workspace(live_tokens):
     layer.destroy()
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("initialize_default_first", [False, True])
 def test_full_capacity_handle_preserves_the_default_live_profile(
     initialize_default_first,
@@ -417,6 +425,7 @@ def test_full_capacity_handle_preserves_the_default_live_profile(
         layer.destroy()
 
 
+@pytest.mark.cpu_only
 def test_forward_uses_selected_workspace_and_capacity_profile():
     layer, transformed, _ = _make_layer()
     handle, raw_workspace, _, _ = _create_workspace(layer, 128)
@@ -455,6 +464,7 @@ def test_forward_uses_selected_workspace_and_capacity_profile():
     layer.destroy()
 
 
+@pytest.mark.cpu_only
 def test_unfinalized_output_requires_explicit_backend_opt_in():
     from flashinfer.moe_ep import MoEEpConfigError
 
@@ -469,6 +479,7 @@ def test_unfinalized_output_requires_explicit_backend_opt_in():
     layer.destroy()
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("apply_routing_weights_before_fc2", [False, True])
 @pytest.mark.parametrize("backend", ["nvfp4", "bf16", "w4a16"])
 def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
@@ -596,6 +607,7 @@ def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
     assert launch.call_count == 3
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "knobs",
     [
@@ -629,6 +641,7 @@ def test_nvfp4_knobs_reject_explicit_config_fields(monkeypatch, knobs):
     allocate.assert_not_called()
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "config_name",
     [
@@ -666,6 +679,7 @@ def test_finalized_and_unfinalized_workspaces_have_distinct_pool_keys(
         finalized.compute_unfinalized(None, ())
 
 
+@pytest.mark.cpu_only
 def test_w4a16_unfinalized_launch_failure_releases_staging_sources(monkeypatch):
     import torch
 
@@ -689,6 +703,7 @@ def test_w4a16_unfinalized_launch_failure_releases_staging_sources(monkeypatch):
     assert workspace._staging_inputs is None
 
 
+@pytest.mark.cpu_only
 def test_workspace_over_capacity_rejected_before_allocation_stage_or_compute():
     from flashinfer.moe_ep import MoEEpConfigError
 
@@ -711,6 +726,7 @@ def test_workspace_over_capacity_rejected_before_allocation_stage_or_compute():
     layer.destroy()
 
 
+@pytest.mark.cpu_only
 def test_forward_rejects_cross_layer_and_closed_workspace_before_staging():
     from flashinfer.moe_ep import MoEEpConfigError
 
@@ -744,6 +760,7 @@ def test_forward_rejects_cross_layer_and_closed_workspace_before_staging():
     other_layer.destroy()
 
 
+@pytest.mark.cpu_only
 def test_workspace_destroy_is_idempotent_and_layer_destroy_cleans_all_handles():
     layer, _, _ = _make_layer()
     first_raw = mock.MagicMock(name="first_raw")
@@ -780,6 +797,7 @@ def test_workspace_destroy_is_idempotent_and_layer_destroy_cleans_all_handles():
         assert destroy.call_count == 3
 
 
+@pytest.mark.cpu_only
 def test_layer_destroy_releases_profiles_in_reverse_creation_order():
     layer, _, _ = _make_layer()
     first_raw = mock.MagicMock(name="first_raw")
@@ -805,6 +823,7 @@ def test_layer_destroy_releases_profiles_in_reverse_creation_order():
     ]
 
 
+@pytest.mark.cpu_only
 def test_workspace_handle_is_not_a_context_manager():
     layer, _, _ = _make_layer()
     handle, _, _, _ = _create_workspace(layer, 128)
@@ -816,6 +835,7 @@ def test_workspace_handle_is_not_a_context_manager():
     layer.destroy()
 
 
+@pytest.mark.cpu_only
 def test_workspace_destroy_fails_loudly_if_owning_layer_is_gone():
     from flashinfer.moe_ep import MoEEpConfigError
 
@@ -831,6 +851,7 @@ def test_workspace_destroy_fails_loudly_if_owning_layer_is_gone():
     layer.destroy()
 
 
+@pytest.mark.cpu_only
 def test_layer_finalizer_does_not_run_collective_cleanup():
     layer, _, _ = _make_layer()
     workspace = mock.MagicMock(name="default_workspace")
@@ -847,6 +868,7 @@ def test_layer_finalizer_does_not_run_collective_cleanup():
     layer.destroy()
 
 
+@pytest.mark.cpu_only
 def test_forward_rejects_unregistered_workspace_handle():
     from flashinfer.moe_ep import MoEEpConfigError, MoEEpMegaWorkspace
 
@@ -870,6 +892,7 @@ def test_forward_rejects_unregistered_workspace_handle():
     layer.destroy()
 
 
+@pytest.mark.cpu_only
 def test_explicit_workspace_preserves_owned_output_by_default():
     layer, _, _ = _make_layer()
     handle, raw_workspace, _, _ = _create_workspace(layer, 128)
@@ -905,6 +928,7 @@ def test_explicit_workspace_preserves_owned_output_by_default():
     layer.destroy()
 
 
+@pytest.mark.cpu_only
 def test_creating_workspaces_does_not_repeat_weight_preprocessing():
     layer, transformed, preprocess_weights = _make_layer(preprocess_weights=True)
     assert layer._preprocessing_count == 1
@@ -932,6 +956,7 @@ def test_creating_workspaces_does_not_repeat_weight_preprocessing():
     layer.destroy()
 
 
+@pytest.mark.cpu_only
 def test_create_workspace_rejects_cuda_graph_capture_before_backend_calls():
     from flashinfer.moe_ep import MoEEpConfigError
 
@@ -950,6 +975,7 @@ def test_create_workspace_rejects_cuda_graph_capture_before_backend_calls():
     layer.destroy()
 
 
+@pytest.mark.cpu_only
 def test_workspace_and_layer_destruction_reject_cuda_graph_capture():
     from flashinfer.moe_ep import MoEEpConfigError
 
@@ -979,6 +1005,7 @@ def test_workspace_and_layer_destruction_reject_cuda_graph_capture():
     assert handle.is_destroyed
 
 
+@pytest.mark.cpu_only
 def test_create_workspace_rejects_mutable_auto_tuning_state():
     from flashinfer.moe_ep import MoEEpConfigError
 
@@ -996,6 +1023,7 @@ def test_create_workspace_rejects_mutable_auto_tuning_state():
     layer.destroy()
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("supports_live_profiles", [False, True])
 def test_auto_handles_and_default_replacement_retain_old_storage(
     supports_live_profiles,
@@ -1046,6 +1074,7 @@ def test_auto_handles_and_default_replacement_retain_old_storage(
         assert destroy.call_count == 3
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("dummy_warmup", [False, True])
 def test_default_replacement_keeps_implicit_workspace_until_layer_destroy(dummy_warmup):
     import torch
@@ -1084,6 +1113,7 @@ def test_default_replacement_keeps_implicit_workspace_until_layer_destroy(dummy_
         assert destroy.call_args_list == [mock.call(replacement), mock.call(original)]
 
 
+@pytest.mark.cpu_only
 def test_nvfp4_recompiled_workspace_releases_obsolete_launch_scratch(monkeypatch):
     """Recompiling one profile releases its old scratch and preserves its peers."""
     import weakref
