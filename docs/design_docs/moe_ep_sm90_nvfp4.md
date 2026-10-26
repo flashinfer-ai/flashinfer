@@ -120,6 +120,10 @@ LUT replication, mapping and compact pull-buffer choices. Cache provenance
 binds the layout and scheduling policy, while capacity/live-token bucketing
 is handled by the cache itself.
 
+The bounded NV pool combines the shape-compatible MX candidates with NV-specific
+choices. New MX candidates therefore also enter the NV pool and are checked by
+the NV compatibility filters and autotuner.
+
 An explicit `token_back_mode` with `knobs=None` is a manual execution request:
 it uses local defaults instead of inheriting a tuned profile. With a complete
 `knobs` dictionary, the explicit token-back mode overrides only that field and
