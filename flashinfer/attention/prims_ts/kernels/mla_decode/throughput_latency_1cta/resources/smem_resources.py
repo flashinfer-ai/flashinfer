@@ -1219,8 +1219,8 @@ class SmemKvResource(MlaResource):
 
         The words were loaded by ``SmemRawKvResource.load_v_slice_regs`` before
         the raw stage was released, so this slice's wait for a free V-ring stage
-        (PV of this tile) no longer holds the raw stage, and the loader can
-        refill it one tile earlier.
+        (freed by an earlier tile's PV) no longer holds the raw stage, and the
+        loader can refill it one tile earlier.
         """
         tile = local_kv_tile_idx(self.cfg, stage_info, inst, 0, section=section)
         self._dequant_stage(
@@ -1259,18 +1259,24 @@ class SmemKvResource(MlaResource):
 
         ``preload_only`` runs phase 1 only and returns the slice's raw and scale
         words as two register arrays; ``preloaded=(raw_arr, scale_arr)`` runs
-        phase 2 from such arrays (V slice 3 is converted after the raw stage was
-        released, see ``load_v_slice_regs``).
+        phase 2 from such arrays (the last V slice is converted after the raw
+        stage was released, see ``load_v_slice_regs``).
         """
         cfg = self.cfg
         qk_stage_idx = staged_kv_head_dim_call_idx(
             cfg, stage_info, inst_id, is_v, stage_idx=stage_idx, section=section
         )
+        if cutlass.const_expr(cfg.num_ctas_per_head_dim > 1):
+            # V head-dim split: this CTA owns latent slices
+            # [cta * stages, (cta + 1) * stages) of the resident K tile.
+            qk_stage_idx = Int32(qk_stage_idx) + cta_idx_head_dim_v_for_stage(
+                self.cta_idx_head_dim_v, stage_info
+            ) * Int32(cfg.v_head_dim_stages)
         slot = native_tile_idx % Int32(cfg.nvfp4_scale_slots)
         raw = self.raw_kv if raw_override is None else raw_override
         raw_base = raw.smem_byte_address(
             (native_tile_idx % Int32(cfg.kv_raw_stages)) * Int32(cfg.kv_raw_stage_bytes)
-            + Int32((qk_stage_idx // 2) * cfg.tile_size_kv * 128)
+            + (qk_stage_idx // 2) * Int32(cfg.tile_size_kv * 128)
         )
         scales_base = raw.smem_byte_address(raw.scale_slot_byte_offset(slot))
         dst_base = self._stage_base(stage_info).data_ptr(Int32(0)).toint(cutlass.Int32)
@@ -2179,9 +2185,10 @@ class SmemRawKvResource(SmemKvResource):
     ):
         """Load the last V slice's raw and scale words into registers.
 
-        Issued after the first three V slices were converted and before the raw
-        stage is released; ``SmemKvResource.dequant_v_native_regs`` converts
-        them once PV of this tile frees a V-ring stage.
+        Issued after the other V slices were converted (none under a 4-way V
+        head-dim split) and before the raw stage is released;
+        ``SmemKvResource.dequant_v_native_regs`` converts them once an earlier
+        tile's PV frees a V-ring stage.
         """
         tile = local_kv_tile_idx(self.cfg, stage_info, inst, 0, section=section)
         return self._dequant_stage(

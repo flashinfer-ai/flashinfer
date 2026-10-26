@@ -261,10 +261,8 @@ class MlaConfig:
         """Keeps-MMA-AB softmax with a 4-way row max, FFMA2 exp arguments, four
         packed sum accumulators and the running max / sum in registers (short
         dependency chains, no per-tile SMEM round trip or named barrier): the
-        native sparse path and the E4M3 token-sparse path."""
-        return self.native_sparse_pages or (
-            self.is_dynamic_token_sparse and not self.is_dynamic_token_sparse_nvfp4
-        )
+        native sparse path and both token-sparse paths."""
+        return self.native_sparse_pages or bool(self.is_dynamic_token_sparse)
 
     @property
     def one_insts_kv_swap(self) -> bool:
@@ -845,8 +843,9 @@ def keeps_mma_ab_config_kwargs(
         # W12-19; 20 warps = 640 threads.  Register budget at the 96-register launch
         # bound: 8 x 144 + 4 x 80 (MMA + loader group) + 8 x 56 = 1920. Raw ring: two
         # 128-key K tiles ([lat0 16 KB | lat1 16 KB | rope 8 KB] each) fed straight to
-        # the mxf4nvf4 BMM1; V ring: four E4M3 slices (one whole tile) so the dequant
-        # converts V(t) while PV(t - 1) runs.
+        # the mxf4nvf4 BMM1; V ring: four E4M3 slices (one whole tile, or two / four
+        # tiles under a V head-dim split) so the dequant converts V(t) while
+        # PV(t - 1) runs.
         raw_tile_bytes = 128 * 128 * 2 + 128 * 64
         kwargs.update(
             {

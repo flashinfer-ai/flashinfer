@@ -184,6 +184,9 @@ def compile_dsa_sparse_kernel(
     profile = _PROFILE
     if head_dim_split > 1 and split_kv == 1:
         raise NotImplementedError("token-sparse V head-dim split requires split-KV")
+    if nvfp4 and head_dim_split not in (1, 2, 4):
+        # Each NVFP4 V-split CTA owns whole 128-column latent slices.
+        raise NotImplementedError("NVFP4 V head-dim split must be 1, 2 or 4")
     if split_kv > 1:
         # Explicit profile: the generic split profile derives the V head-dim
         # split from the compile-time batch (1 here, one batch per token at

@@ -130,7 +130,8 @@ class ODoneResource(MlaResource):
         Identity lanes skip the exp2 and a whole warp of identity lanes skips
         the TMEM traffic (``_rescale_loop_o``); the ordering point before the
         P commit is kept either way.  Each 128-thread half of the softmax task
-        rescales the two V stages of its own TMEM panel.
+        rescales the V stages it owns (``_cs8_stage_owner``: the two of its TMEM
+        panel, or under a V head-dim split one / none).
         """
         self.corr_ref._rescale_loop_o(
             stage_info,

@@ -103,6 +103,17 @@ from .common import (
     MlaResource,
 )
 
+
+def _cs8_stage_owner(cfg, v_stage_idx: int) -> int:
+    """128-thread half of the NVFP4 column-split softmax that owns a V stage.
+
+    Four stages: each half owns the two stages of its TMEM panel.  Under a V
+    head-dim split (two stages or one) the stages share one panel and go to
+    half 0 / half 1 in turn.
+    """
+    return v_stage_idx * 2 // max(cfg.v_head_dim_stages, 2)
+
+
 # =====================================================================
 # TmemCorrResource — Correction and output store to GMEM
 # =====================================================================
@@ -1062,8 +1073,8 @@ class TmemCorrResource(MlaResource):
     def correct_tail_cs8(self, stage_info: StageInfo, *, new_max_arr, sum_arr):
         """Tail of the 8-warp column-split softmax task: the two column halves
         exchange their (max, sum) through the sum scratch, merge the
-        denominators, then each half normalizes and stores the two V stages
-        of its TMEM panel; half 0 stores LSE."""
+        denominators, then each half normalizes and stores the V stages it
+        owns (``_cs8_stage_owner``); half 0 stores LSE."""
         cfg = self.cfg
         task_cache = decode_gen_task_cache(stage_info)
         xt = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
@@ -1113,7 +1124,7 @@ class TmemCorrResource(MlaResource):
             .toint(Int32)
         )
         for v_stage_idx in cutlass.range_constexpr(cfg.v_head_dim_stages):
-            if half == Int32(v_stage_idx // 2):
+            if half == Int32(_cs8_stage_owner(cfg, v_stage_idx)):
                 base_addr0 = (
                     tmem_row_base
                     + self._o_base_col()
@@ -1153,10 +1164,10 @@ class TmemCorrResource(MlaResource):
                 cs8_half = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX] >> Int32(7)
             for v_stage_idx in cutlass.range_constexpr(cfg.v_head_dim_stages):
                 # Native FP4 QK column split: each 128-thread half of the
-                # softmax task rescales the two V stages of its panel.
+                # softmax task rescales the V stages it owns.
                 do_stage = cutlass.Boolean(True)
                 if cutlass.const_expr(cfg.is_dynamic_token_sparse_nvfp4):
-                    do_stage = cs8_half == Int32(v_stage_idx // 2)
+                    do_stage = cs8_half == Int32(_cs8_stage_owner(cfg, v_stage_idx))
                 if do_stage:
                     base_addr = (
                         tmem_row_base

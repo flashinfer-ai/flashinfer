@@ -99,6 +99,8 @@ _NVFP4_CASES = [
     Case("amax100", amax=100.0),
     Case("t16-ragged-neg50", total_q=16, ragged=True, neg=0.5),
     Case("h128", total_q=4, heads=128),
+    Case("h128-t1", total_q=1, heads=128),
+    Case("h128-t2", total_q=2, heads=128),
     Case("two-waves", total_q=300),
     Case("lens-zero", total_q=4, ragged=True, zero_len_token=True),
     Case("topk136", total_q=3, top_k=136),
@@ -608,8 +610,9 @@ def test_prims_ts_dsa_compiled_kernel_is_shared_across_token_counts(
     """The JIT key is (heads, top-k, skip-correction, cache format, dequant prefetch,
     split-KV count, V head-dim split); T is a runtime extent.
 
-    Token counts that select the same split (and, for NVFP4, the same side of
-    ``NVFP4_DEQUANT_PREFETCH_MAX_CTAS``) share one kernel.
+    Token counts that select the same split (and, for NVFP4, the same prefetch
+    choice: V split below 4 and at most ``NVFP4_DEQUANT_PREFETCH_MAX_CTAS``
+    CTAs) share one kernel.
     """
     device = torch.device("cuda")
     limit = dsa_module.NVFP4_DEQUANT_PREFETCH_MAX_CTAS
@@ -621,8 +624,8 @@ def test_prims_ts_dsa_compiled_kernel_is_shared_across_token_counts(
         if kernel == "fp8":
             variants.add(dsa_module._select_fp8_split(total_q, top_k, sm_count))
         else:
-            split = dsa_module._select_split_kv(total_q, top_k, sm_count)
-            variants.add((split, total_q * split <= limit))
+            split, hds = dsa_module._select_nvfp4_split(total_q, top_k, sm_count)
+            variants.add((split, hds, hds < 4 and total_q * split * hds <= limit))
     run = _run_fp8 if kernel == "fp8" else _run_nvfp4
     before = compile_dsa_sparse_kernel.cache_info()
     for total_q in totals:
@@ -652,6 +655,32 @@ def test_prims_ts_dsa_split_kv_policy() -> None:
     assert select(8, 512, 148) == 4  # four tiles at most
     assert select(3, 128, 148) == 1  # a single tile
     assert select(48, 2048, 148) == 2  # e.g. 24 tokens with 128 heads
+
+
+def test_prims_ts_dsa_nvfp4_split_policy() -> None:
+    """NVFP4: one tile per split CTA within one wave, then a V head-dim split
+    while the grid fills at most a quarter / half of the SMs.
+
+    Pins the tuned B200 (148 SM) policy; update it with the policy."""
+    select = dsa_module._select_nvfp4_split
+    ctas = (1, 2, 4, 5, 9, 16, 18, 19, 37, 38, 74, 75, 96)
+    assert [select(t, 2048, 148) for t in ctas] == [
+        (16, 4),
+        (16, 4),
+        (16, 2),
+        (16, 1),
+        (16, 1),
+        (8, 1),
+        (8, 1),
+        (4, 1),
+        (4, 1),
+        (2, 1),
+        (2, 1),
+        (1, 1),
+        (1, 1),
+    ]
+    assert select(1, 512, 148) == (4, 4)  # four tiles at most
+    assert select(3, 128, 148) == (1, 1)  # a single tile: no split, no V split
 
 
 def test_prims_ts_dsa_fp8_split_policy() -> None:
@@ -708,7 +737,15 @@ _SPLIT_CASES = [
         ("fp8", 16, 4),
         *(
             pytest.param("nvfp4", split, hds, marks=_REQUIRES_NVFP4_TOOLCHAIN)
-            for split, hds in ((1, 1), (2, 1), (16, 1))
+            for split, hds in (
+                (1, 1),
+                (2, 1),
+                (2, 2),
+                (4, 4),
+                (16, 1),
+                (16, 2),
+                (16, 4),
+            )
         ),
     ),
 )
@@ -720,7 +757,7 @@ def test_prims_ts_dsa_split_kv_matches_reference(
     case: Case,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Forced splits (incl. empty and one-tile splits, and E4M3 V head-dim splits)
+    """Forced splits (incl. empty and one-tile splits, and V head-dim splits)
     match the reference."""
     if kernel == "fp8":
         monkeypatch.setattr(
@@ -730,7 +767,9 @@ def test_prims_ts_dsa_split_kv_matches_reference(
         )
     else:
         monkeypatch.setattr(
-            dsa_module, "_select_split_kv", lambda num_ctas, top_k, sm_count: split
+            dsa_module,
+            "_select_nvfp4_split",
+            lambda num_ctas, top_k, sm_count: (split, head_dim_split),
         )
     device = torch.device("cuda")
     fx = build_fixture(case, device)
@@ -755,6 +794,12 @@ def test_prims_ts_dsa_nvfp4_dequant_prefetch_is_bit_identical(
 ) -> None:
     """The V-slice LDS prefetch only reorders loads: output and LSE match the default schedule bitwise."""
     device = torch.device("cuda")
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    _, head_dim_split = dsa_module._select_nvfp4_split(
+        case.total_q * (case.heads // 64), case.top_k, sm_count
+    )
+    if head_dim_split == 4:
+        pytest.skip("a one-slice (V split 4) CTA has no prefetch variant")
     fx = build_fixture(case, device)
     results = []
     for max_ctas in (0, 1 << 20):

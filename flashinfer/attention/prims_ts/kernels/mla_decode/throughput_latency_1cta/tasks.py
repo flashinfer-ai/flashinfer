@@ -2077,8 +2077,9 @@ def create_native_fp4_dequant_task(
     """Dequant warps for the native FP4 QK path (sole consumers of the raw K ring).
 
     Per K tile (Head: tile 0, loop n: tile n + 1): wait for the raw K tile,
-    convert the four V slices from the resident latent slices into the E4M3 V
-    ring, wait for the MMA's "BMM1 done" stage (``bmm1_done``, two stages
+    convert its V slices (four, or two / one under a V head-dim split) from the
+    resident latent slices into the E4M3 V ring, wait for the MMA's "BMM1
+    done" stage (``bmm1_done``, two stages
     indexed like the raw ring) and release the raw stage.  The MMA observes the
     raw ring directly; the token block scales (token-major rows landed by the
     loader, ``sf_landed``) are written to the TMEM SFB columns by this task
@@ -2106,6 +2107,9 @@ def create_native_fp4_dequant_task(
         # slice's convert / STS / fence / arrive (two slices live in registers; the
         # slices alternate between the handle name sets a and b).
         nslice = cfg.v_head_dim_stages
+        # Slice 0 carries the BMM1-done / SFB(t + 1) duties; a one-slice CTA
+        # takes ``one_tile_single_slice``.
+        assert nslice >= 2, "the dequant prefetch needs two or more V slices"
         load = {0: raw.load_v_slice_regs_a, 1: raw.load_v_slice_regs_b}
         conv = {0: kv.dequant_v_native_regs_a, 1: kv.dequant_v_native_regs_b}
         raw.wait()
@@ -2158,23 +2162,45 @@ def create_native_fp4_dequant_task(
             )
         kv.commit()
 
+    def one_tile_single_slice(raw, kv, done, section, inst, sfl, sfr):
+        # V head-dim split down to one 128-column slice: stage it in
+        # registers, then do the slice-0 duties (BMM1(t) completed -> SFB(t + 1))
+        # before releasing the raw stage, as the multi-slice order does.
+        raw.wait()
+        v3_raw, v3_scale = raw.load_v_slice_regs(section=section, inst=inst)
+        done.wait()
+        done.bmm1_completed()
+        _write_sfb(sfl, sfr, section, inst, 1)
+        done.release()
+        raw.release()
+        raw.issue_gathers_ahead(section=section, inst=inst)
+        kv.acquire()
+        kv.dequant_v_native_regs(
+            section=section, v3_raw=v3_raw, v3_scale=v3_scale, inst=inst
+        )
+        kv.commit()
+
     def one_tile(raw, kv, done, section, inst, sfl, sfr):
+        if cfg.v_head_dim_stages == 1:
+            return one_tile_single_slice(raw, kv, done, section, inst, sfl, sfr)
         if cfg.nvfp4_dequant_prefetch:
             return one_tile_prefetch(raw, kv, done, section, inst, sfl, sfr)
         raw.wait()
-        # Slices 0..2 into the V ring; the last slice is staged in registers
-        # so the raw stage is released (and the Gather4 of tile t + 2
-        # co-issued) before it waits for the V-ring stage that PV of this
-        # tile frees.
+        # All slices but the last into the V ring; the last is staged in
+        # registers so the raw stage is released (and the Gather4 of tile
+        # t + 2 co-issued) before it waits for a V-ring stage freed by an
+        # earlier tile's PV.
         for v in range(cfg.v_head_dim_stages - 1):
             kv.acquire()
             kv.dequant_v_native(stage_idx=v, section=section, inst=inst)
             kv.commit()
             if v == 0:
-                # BMM1(t) has completed by the time slice 0 is converted (its
-                # V-ring slot frees with PV(t - 1), issued after BMM1(t));
-                # write SFB(t + 1) now so BMM1(t + 1) never waits for it,
-                # instead of after the raw release.
+                # BMM1(t) has normally completed by the time slice 0 is
+                # converted (with four slices per tile its V-ring slot frees
+                # with PV(t - 1), issued after BMM1(t); under a V head-dim
+                # split the wait below may block briefly); write SFB(t + 1)
+                # now so BMM1(t + 1) never waits for it, instead of after the
+                # raw release.
                 done.wait()
                 done.bmm1_completed()
                 _write_sfb(sfl, sfr, section, inst, 1)
@@ -2442,8 +2468,8 @@ def create_native_fp4_cs8_softmax_task(
     named barrier through SMEM.  One copy of the softmax code per SMSP and a
     single S / P / PV-done pipeline each.  The 8 warps quantize Q (8 heads
     per warp, each head once); at the tail the halves exchange
-    (max, sum) through the correction scratch and each normalizes the two V
-    stages of its panel.
+    (max, sum) through the correction scratch and each normalizes the V
+    stages it owns (``_cs8_stage_owner``).
     """
     work_tile_skip_if = runtime_work_tile_skip_if(work_queue)
 
@@ -2473,8 +2499,8 @@ def create_native_fp4_cs8_softmax_task(
         tmem_p.store_p(regs_p=regs_p)
         if section != MlaStage.Head:
             o_done.wait()
-            # All four V stages are named; the column-half predicate inside
-            # keeps the two of this half's TMEM panel.
+            # Every V stage is named; the column-half predicate inside keeps
+            # the ones this half owns.
             o_done.rescale_o(old_max_arr=old_max_arr, new_max_arr=new_max_arr)
             o_done.release()
         tmem_p.commit()

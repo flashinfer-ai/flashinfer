@@ -69,14 +69,17 @@ _NVFP4_RESIDUAL_DIM = 64
 
 # The NVFP4 kernel issues the next V slice's LDS before converting the current one
 # (``nvfp4_dequant_prefetch``) when at most this many CTAs (query tokens x 64-head
-# groups) run.  Measured on B200 (K=2048, one CTA per SM): -5% at 1..32 CTAs, -2% at 64,
-# -1% at 96, neutral from 128 on, so the prefetch variant is only compiled and used
-# below the crossover.
+# groups x split CTAs x V split CTAs) run and a CTA converts at least two V slices
+# (V split 1 or 2).  Measured on B200 for unsplit 4-slice CTAs (K=2048, one CTA per
+# SM): -5% at 1..32 CTAs, -2% at 64, -1% at 96, neutral from 128 on, so the prefetch
+# variant is only compiled and used below the crossover.  With the small-batch
+# split policy it now applies to single-tile launches (top-k <= 128) and other
+# GPUs' small grids; the split CTAs of top-k 2048 on 148 SMs run without it.
 NVFP4_DEQUANT_PREFETCH_MAX_CTAS = 64
 
 # Split-KV: below this many CTAs (query tokens x 64-head groups) most SMs would idle,
 # so every token's top-k list is split into S contiguous tile ranges (one CTA each)
-# and a standalone reducer merges the partials.  NVFP4 (``_select_split_kv``) takes
+# and a standalone reducer merges the partials.  NVFP4 (``_select_nvfp4_split``) takes
 # the largest S that keeps the split grid within one wave and leaves each CTA at
 # least one 128-key tile: B200, K=2048, sc8, B1 35.6 -> 13.1 us (S=16), B16 36.2 ->
 # 15.9 (S=8), B32 36.2 -> 19.4 (S=4), B64 37.4 -> 27.6 (S=2); a split grid beyond
@@ -100,6 +103,35 @@ def _select_split_kv(num_ctas: int, sparse_mla_top_k: int, sm_count: int) -> int
         if num_ctas * split <= sm_count and tiles >= split * _SPLIT_KV_MIN_TILES:
             return split
     return 1
+
+
+def _v_head_dim_split(total_ctas: int, sm_count: int) -> int:
+    """V head-dim split of a split launch of ``total_ctas`` CTAs: 4 / 2 while the
+    grid fills at most a quarter / half of the SMs, else 1."""
+    if total_ctas * 4 <= sm_count:
+        return 4
+    if total_ctas * 2 <= sm_count:
+        return 2
+    return 1
+
+
+def _select_nvfp4_split(
+    num_ctas: int, sparse_mla_top_k: int, sm_count: int
+) -> tuple[int, int]:
+    """Return ``(split_kv, head_dim_split)`` for an NVFP4 launch of ``num_ctas`` CTAs.
+
+    One 128-key tile per split CTA (``_select_split_kv``), then, while the split
+    grid fills at most a quarter / half of the SMs, the 512 V columns over 4 / 2
+    CTAs that repeat QK / softmax but dequantize, multiply and store only their
+    slice.  Unlike E4M3 (two tiles per CTA, trtllm-gen's rule), the NVFP4 CTA's
+    fixed cost (on-chip Q quantization, first gather, dequant) favors more CTAs:
+    B200, top-k 2048, CUPTI: B1 13.7 -> 11.5 us (16 x 4), B2 13.9 -> 11.7,
+    B4 14.3 -> 12.7 (16 x 2); trtllm-gen FP8 KV 12.1 / 12.3 / 13.3.
+    """
+    split = _select_split_kv(num_ctas, sparse_mla_top_k, sm_count)
+    if split == 1:
+        return 1, 1
+    return split, _v_head_dim_split(num_ctas * split, sm_count)
 
 
 def _select_fp8_split(
@@ -129,12 +161,7 @@ def _select_fp8_split(
         split = 2
     if split == 1:
         return 1, 1
-    total = num_ctas * split
-    if total * 4 <= sm_count:
-        return split, 4
-    if total * 2 <= sm_count:
-        return split, 2
-    return split, 1
+    return split, _v_head_dim_split(num_ctas * split, sm_count)
 
 
 def _split_workspace(
@@ -575,7 +602,9 @@ def prims_ts_dsa_sparse_mla_nvfp4(
         )
     num_heads = query.shape[1]
     num_ctas = query.shape[0] * (num_heads // 64)
-    split_kv = _select_split_kv(num_ctas, sparse_mla_top_k, _sm_count(device_index))
+    split_kv, head_dim_split = _select_nvfp4_split(
+        num_ctas, sparse_mla_top_k, _sm_count(device_index)
+    )
     compiled = compile_dsa_sparse_kernel(
         device_index,
         num_heads=num_heads,
@@ -583,8 +612,11 @@ def prims_ts_dsa_sparse_mla_nvfp4(
         enable_skip_correction=skip_corr_threshold > 0.0,
         nvfp4=True,
         residual_dim=residual_dim,
-        dequant_prefetch=num_ctas * split_kv <= NVFP4_DEQUANT_PREFETCH_MAX_CTAS,
+        # A one-slice CTA (V split 4) has nothing to prefetch.
+        dequant_prefetch=head_dim_split < 4
+        and num_ctas * split_kv * head_dim_split <= NVFP4_DEQUANT_PREFETCH_MAX_CTAS,
         split_kv=split_kv,
+        head_dim_split=head_dim_split,
     )
     # s = m * 2**e with m in [1, 2): the exponent folds exactly into the E4M3
     # block scales of the V dequantization; m goes through the PV scale.  QK
