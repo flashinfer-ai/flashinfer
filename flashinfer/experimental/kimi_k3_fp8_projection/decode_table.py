@@ -1506,10 +1506,6 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         "144,6,1024": {
             "quant:u2": "quant:u2_xef_qel",
         },
-        "192,2,256": {
-            "quant:u1": "quant:u1_xef_qel",
-            "gemm_tstore_n192_k128": "gemm_tstore_n192_k128_bef",
-        },
         "192,2,2048": {
             "quant:u1": "quant:u1_xef_qel",
         },
