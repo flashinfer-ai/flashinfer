@@ -121,6 +121,7 @@ def _generic_symbols(body, rank):
     return set(_generic_symbol_sites(_rank_view(body, rank), rank))
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", cake_bgmv_moe.CAKE_BGMV_MOE_ARCHES)
 @pytest.mark.parametrize(
     ("hidden_size", "num_tokens", "expected"),
@@ -150,6 +151,7 @@ def test_selector_matches_measured_shape_portfolio(
     )
 
 
+@pytest.mark.cpu_only
 def test_specialized_schedule_ids_exclude_the_retired_t64_expand():
     # The 64-lane specialized expand (schedule 0) and the generic four-pair
     # decode shrink (form 1) were removed with the code that served them.
@@ -165,6 +167,7 @@ def test_specialized_schedule_ids_exclude_the_retired_t64_expand():
     assert cake_bgmv_moe.CAKE_BGMV_MOE_SHRINK_FORM_PREFILL_S3 == 2
 
 
+@pytest.mark.cpu_only
 def test_selector_rejects_unsupported_shapes():
     with pytest.raises(ValueError, match="hidden_size"):
         cake_bgmv_moe.select_cake_bgmv_moe_schedule(2048, 32)
@@ -174,6 +177,7 @@ def test_selector_rejects_unsupported_shapes():
         cake_bgmv_moe.select_cake_bgmv_moe_schedule(3072, 8, "sm120a")
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("capability", "expected"),
     [
@@ -191,6 +195,7 @@ def test_arch_for_capability(capability, expected):
     assert cake_bgmv_moe.cake_bgmv_moe_arch_for_capability(capability) == expected
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("arch", "cuda_arch", "gencode", "cc"),
     [
@@ -245,6 +250,7 @@ def test_jit_spec_binds_generated_source_per_arch(
     cake_bgmv_moe.gen_cake_bgmv_moe_module.cache_clear()
 
 
+@pytest.mark.cpu_only
 def test_arch_modules_do_not_share_a_uri():
     uris = {
         cake_bgmv_moe.get_cake_bgmv_moe_uri(hidden_size, dtype, arch)
@@ -259,6 +265,7 @@ def test_arch_modules_do_not_share_a_uri():
     )
 
 
+@pytest.mark.cpu_only
 def test_binding_preserves_graph_and_tensor_contracts():
     binding = (cake_bgmv_moe._get_csrc_dir() / "cake_bgmv_moe_binding.cuh").read_text()
     assert "TensorView route_index" in binding
@@ -294,6 +301,7 @@ def test_binding_preserves_graph_and_tensor_contracts():
         assert "expand_pair_owned" not in body
 
 
+@pytest.mark.cpu_only
 def test_specialized_bodies_fold_the_hidden_sizes():
     # One body per dtype serves both hidden sizes: the size enters only through
     # CAKE_BGMV_MOE_HIDDEN, and the kernel symbols are pasted from it.
@@ -314,6 +322,7 @@ def test_specialized_bodies_fold_the_hidden_sizes():
 # ---- generic-shape bundles -------------------------------------------------
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("hidden_size", "rank", "expected"),
     [
@@ -334,6 +343,7 @@ def test_variant_routing(hidden_size, rank, expected):
     assert cake_bgmv_moe.cake_bgmv_moe_variant(hidden_size, rank) == expected
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("hidden_size", "num_tokens", "expected"),
     [
@@ -372,6 +382,7 @@ def test_variant_routing_by_token_count(hidden_size, num_tokens, expected):
     assert cake_bgmv_moe.cake_bgmv_moe_variant(3072, 32) == "specialized"
 
 
+@pytest.mark.cpu_only
 def test_sm90a_never_selects_the_specialized_bodies():
     # Hopper has no specialized token window, so every token count takes the
     # generic bundle; the AOT list below therefore skips sm90a.
@@ -382,6 +393,7 @@ def test_sm90a_never_selects_the_specialized_bodies():
             assert variant(hidden_size, 32, num_tokens, "sm90a") == "generic"
 
 
+@pytest.mark.cpu_only
 def test_aot_prebuilds_the_bundles_only_for_windowed_arches(monkeypatch):
     from flashinfer import aot
 
@@ -446,6 +458,7 @@ def test_aot_prebuilds_the_bundles_only_for_windowed_arches(monkeypatch):
     ]
 
 
+@pytest.mark.cpu_only
 def test_pdl_mode_policy():
     pdl = cake_bgmv_moe.cake_bgmv_moe_pdl_mode
     # 16 tokens x 23 column CTAs = 368 CTAs: small on every part.
@@ -490,6 +503,7 @@ def test_pdl_mode_policy():
                 assert pdl(arch, num_tokens, hidden, sms) in modes[arch]
 
 
+@pytest.mark.cpu_only
 def test_generic_selector_rejects_unsupported_inputs():
     with pytest.raises(ValueError, match="multiple of 8"):
         cake_bgmv_moe.select_cake_bgmv_moe_generic_schedule(2052, 8)
@@ -501,6 +515,7 @@ def test_generic_selector_rejects_unsupported_inputs():
         cake_bgmv_moe.get_cake_bgmv_moe_generic_uri(12, "bfloat16")
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("arch", "cuda_arch", "gencode", "cc"),
     [
@@ -635,6 +650,7 @@ def test_generic_jit_spec_binds_generated_source_per_arch(
     cake_bgmv_moe.gen_cake_bgmv_moe_generic_module.cache_clear()
 
 
+@pytest.mark.cpu_only
 def test_generic_bodies_fold_the_ranks():
     # Ranks 16, 32 and 64 share one body per dtype; rank 8 keeps its own. The
     # rank enters the shared body only through CAKE_BGMV_MOE_RANK: no literal
@@ -691,6 +707,7 @@ def _target_gated_symbols(metadata, dtype, cc_major):
     return gated
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("cc_major", (9, 10))
 @pytest.mark.parametrize("rank", cake_bgmv_moe.CAKE_BGMV_MOE_GENERIC_RANKS)
 @pytest.mark.parametrize("dtype", cake_bgmv_moe.CAKE_BGMV_MOE_DTYPES)
@@ -716,6 +733,7 @@ def test_generic_bodies_gate_the_per_target_forms(dtype, rank, cc_major):
     assert (plain <= compiled) == (0 in cake_bgmv_moe.CAKE_BGMV_MOE_PDL_MODES[arch])
 
 
+@pytest.mark.cpu_only
 def test_generic_and_specialized_modules_do_not_share_a_uri():
     specialized = {
         cake_bgmv_moe.get_cake_bgmv_moe_uri(hidden_size, dtype, arch)
@@ -737,6 +755,7 @@ def test_generic_and_specialized_modules_do_not_share_a_uri():
     assert not (specialized & generic)
 
 
+@pytest.mark.cpu_only
 def test_generic_binding_preserves_graph_and_tensor_contracts():
     binding = (
         cake_bgmv_moe._get_csrc_dir() / "cake_bgmv_moe_generic_binding.cuh"
@@ -802,6 +821,7 @@ def test_generic_binding_preserves_graph_and_tensor_contracts():
     assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run" in binding
 
 
+@pytest.mark.cpu_only
 def test_route_index_workspace_sizing():
     assert cake_bgmv_moe.CAKE_BGMV_MOE_ROUTE_INDEX_MAX_ROUTES == 16
     assert cake_bgmv_moe.CAKE_BGMV_MOE_ROUTE_INDEX_HEADER_WORDS == 4
@@ -833,6 +853,7 @@ def test_route_index_workspace_sizing():
         assert "#define CAKE_BGMV_MOE_SMEM_EXPAND_DUAL " in body
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("num_pairs", "rank", "hidden_size", "expected"),
     [
@@ -865,6 +886,7 @@ def test_generic_shrink_launch_selection(num_pairs, rank, hidden_size, expected)
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "num_pairs,rank,hidden_size,arch,expected",
     [
@@ -899,6 +921,7 @@ def test_generic_shrink_launch_selection_blackwell_deep_ring(
     )
 
 
+@pytest.mark.cpu_only
 def test_generic_shrink_launch_selection_rejects_bad_inputs():
     with pytest.raises(ValueError):
         cake_bgmv_moe.select_cake_bgmv_moe_generic_shrink(0, 32, 3072)
@@ -906,6 +929,7 @@ def test_generic_shrink_launch_selection_rejects_bad_inputs():
         cake_bgmv_moe.select_cake_bgmv_moe_generic_shrink(8, 24, 3072)
 
 
+@pytest.mark.cpu_only
 def test_grouped_workspace_sizing_and_selector():
     assert cake_bgmv_moe.CAKE_BGMV_MOE_GROUP_TILE_TOKENS == 16
     assert cake_bgmv_moe.CAKE_BGMV_MOE_GROUP_BINS_MAX == 4096
@@ -1017,6 +1041,7 @@ def test_grouped_workspace_sizing_and_selector():
             assert (mixed_smem in body) == (tag == "bf16")
 
 
+@pytest.mark.cpu_only
 def test_order_remap_selector_and_workspace():
     assert cake_bgmv_moe.cake_bgmv_moe_order_workspace_words(3000) == 3000
     assert cake_bgmv_moe.CAKE_BGMV_MOE_ORDER_REMAP_MAX_PAIRS == 4096
@@ -1040,6 +1065,7 @@ def test_order_remap_selector_and_workspace():
     assert not select(2048, 1024, 64, 128, 7168, 64, "sm90a")  # 8192 bins
 
 
+@pytest.mark.cpu_only
 def test_sm107a_bodies_are_selected_for_the_measured_bf16_shapes_only():
     """The compute-capability-10.7 records exist for bf16 hidden 2688 / 3072 only."""
 

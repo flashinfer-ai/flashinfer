@@ -31,7 +31,7 @@ class _FakeEntryPoints(tuple):
 @pytest.fixture
 def jit_cache_shim_module():
     package_dir = (
-        Path(__file__).resolve().parents[2]
+        Path(__file__).resolve().parents[3]
         / "flashinfer-jit-cache"
         / "flashinfer_jit_cache"
     )
@@ -54,7 +54,7 @@ def jit_cache_shim_module():
 @pytest.fixture
 def provider_package_config_module():
     config_path = (
-        Path(__file__).resolve().parents[2]
+        Path(__file__).resolve().parents[3]
         / "flashinfer-jit-cache-provider"
         / "package_config.py"
     )
@@ -73,7 +73,7 @@ def provider_package_config_module():
 @pytest.fixture
 def provider_validation_module():
     validation_path = (
-        Path(__file__).resolve().parents[2]
+        Path(__file__).resolve().parents[3]
         / "scripts"
         / "jit_cache_provider_validation.py"
     )
@@ -97,6 +97,7 @@ def _create_aot_module(root: Path, module_name: str) -> Path:
     return module_path
 
 
+@pytest.mark.cpu_only
 def test_shim_discovers_and_normalizes_provider(
     monkeypatch, tmp_path, jit_cache_shim_module
 ):
@@ -123,6 +124,7 @@ def test_shim_discovers_and_normalizes_provider(
     assert providers[0].modules == frozenset({"attention_module"})
 
 
+@pytest.mark.cpu_only
 def test_shim_ignores_invalid_provider(monkeypatch, caplog, jit_cache_shim_module):
     manifest = {
         "schema_version": 1,
@@ -143,6 +145,7 @@ def test_shim_ignores_invalid_provider(monkeypatch, caplog, jit_cache_shim_modul
     assert "has no modules" in caplog.text
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("architecture", "expected_architecture", "expected_tag"),
     [
@@ -165,6 +168,7 @@ def test_provider_build_config_normalizes_architecture(
     )
 
 
+@pytest.mark.cpu_only
 def test_provider_build_config_uses_distinct_distribution_name(
     monkeypatch, provider_package_config_module
 ):
@@ -180,9 +184,10 @@ def test_provider_build_config_uses_distinct_distribution_name(
     assert config.version.endswith("+cu130")
 
 
+@pytest.mark.cpu_only
 def test_provider_backend_uses_configured_build_dependencies(monkeypatch, tmp_path):
     backend_path = (
-        Path(__file__).resolve().parents[2]
+        Path(__file__).resolve().parents[3]
         / "flashinfer-jit-cache-provider"
         / "build_backend.py"
     )
@@ -265,6 +270,7 @@ def test_provider_backend_uses_configured_build_dependencies(monkeypatch, tmp_pa
         sys.modules.pop(module_name, None)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "package_version",
     ("0.6.18", "0.6.18+cu130", "0.6.18+cu134"),
@@ -276,6 +282,7 @@ def test_jit_cache_version_requires_exact_public_version(monkeypatch, package_ve
     jit_env._check_jit_cache_version("flashinfer-jit-cache", package_version)
 
 
+@pytest.mark.cpu_only
 def test_jit_cache_version_rejects_unbounded_prefix(monkeypatch):
     monkeypatch.delenv("FLASHINFER_DISABLE_VERSION_CHECK", raising=False)
     monkeypatch.setattr(jit_env, "flashinfer_version", "0.6.1")
@@ -284,6 +291,7 @@ def test_jit_cache_version_rejects_unbounded_prefix(monkeypatch):
         jit_env._check_jit_cache_version("flashinfer-jit-cache", "0.6.10+cu130")
 
 
+@pytest.mark.cpu_only
 def test_jit_cache_provider_version_requires_exact_cuda_release(monkeypatch):
     monkeypatch.delenv("FLASHINFER_DISABLE_VERSION_CHECK", raising=False)
     monkeypatch.setattr(jit_env, "flashinfer_version", "0.6.18")
@@ -297,6 +305,7 @@ def test_jit_cache_provider_version_requires_exact_cuda_release(monkeypatch):
         )
 
 
+@pytest.mark.cpu_only
 def test_aot_provider_discovery_skips_incompatible_provider(
     monkeypatch, caplog, tmp_path
 ):
@@ -321,6 +330,7 @@ def test_aot_provider_discovery_skips_incompatible_provider(
     assert "Ignoring incompatible flashinfer jit-cache provider" in caplog.text
 
 
+@pytest.mark.cpu_only
 def test_aot_provider_discovery_ignores_mismatched_shim(monkeypatch, caplog):
     """A stale shim must not break the import that replaces it (#5886)."""
     monkeypatch.delenv("FLASHINFER_DISABLE_VERSION_CHECK", raising=False)
@@ -341,6 +351,7 @@ def test_aot_provider_discovery_ignores_mismatched_shim(monkeypatch, caplog):
     assert "flashinfer download-kernels" in caplog.text
 
 
+@pytest.mark.cpu_only
 def test_aot_provider_discovery_uses_mismatched_shim_when_check_disabled(
     monkeypatch, tmp_path
 ):
@@ -366,6 +377,7 @@ def test_aot_provider_discovery_uses_mismatched_shim_when_check_disabled(
     assert [provider.provider_id for provider in providers] == ["sm90a"]
 
 
+@pytest.mark.cpu_only
 def test_aot_provider_discovery_skips_different_cuda_release(
     monkeypatch, caplog, tmp_path
 ):
@@ -390,9 +402,10 @@ def test_aot_provider_discovery_skips_different_cuda_release(
     assert "does not match flashinfer-jit-cache version" in caplog.text
 
 
+@pytest.mark.cpu_only
 def test_jit_cache_build_setup_preserves_indexes_and_cleans_constraint(tmp_path):
     common_script = (
-        Path(__file__).resolve().parents[2] / "scripts" / "jit_cache_build_common.sh"
+        Path(__file__).resolve().parents[3] / "scripts" / "jit_cache_build_common.sh"
     )
     fake_python = tmp_path / "python"
     fake_python.write_text(
@@ -442,12 +455,13 @@ def _sccache_free_env():
     }
 
 
+@pytest.mark.cpu_only
 def test_sccache_setup_uses_server_side_compilation(tmp_path, monkeypatch):
     # Simulate running inside a wrapped GPU lane; the test must not touch it.
     lane_stats_dir = tmp_path / "lane-stats"
     monkeypatch.setenv("SCCACHE_STATS_DIR", str(lane_stats_dir))
     common_script = (
-        Path(__file__).resolve().parents[2] / "scripts" / "jit_cache_build_common.sh"
+        Path(__file__).resolve().parents[3] / "scripts" / "jit_cache_build_common.sh"
     )
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -546,7 +560,7 @@ def _write_test_sccache_fakes(
 
 def _run_with_test_sccache(tmp_path, child, env):
     wrapper = (
-        Path(__file__).resolve().parents[2] / "scripts" / "run_with_test_sccache.sh"
+        Path(__file__).resolve().parents[3] / "scripts" / "run_with_test_sccache.sh"
     )
     return subprocess.run(
         ["bash", str(wrapper), str(child), "--workers-per-gpu", "2"],
@@ -565,6 +579,7 @@ def _assert_ran_uncached(result):
     assert "args=--workers-per-gpu 2\n" in result.stdout
 
 
+@pytest.mark.cpu_only
 def test_gpu_lane_sccache_wrapper_enables_cache_and_keeps_exit_code(tmp_path):
     child, sccache_log, _, env = _write_test_sccache_fakes(tmp_path, "0.18.0")
 
@@ -586,6 +601,7 @@ def test_gpu_lane_sccache_wrapper_enables_cache_and_keeps_exit_code(tmp_path):
     assert (tmp_path / "stats" / "sccache-stats.txt").read_text() == "Cache hits 1\n"
 
 
+@pytest.mark.cpu_only
 def test_gpu_lane_sccache_wrapper_fails_open_when_download_fails(tmp_path):
     child, sccache_log, _, env = _write_test_sccache_fakes(tmp_path, "0.0.0")
 
@@ -595,6 +611,7 @@ def test_gpu_lane_sccache_wrapper_fails_open_when_download_fails(tmp_path):
     assert "--start-server" not in sccache_log.read_text().splitlines()
 
 
+@pytest.mark.cpu_only
 def test_gpu_lane_sccache_wrapper_rejects_checksum_mismatch(tmp_path):
     child, sccache_log, tar_log, env = _write_test_sccache_fakes(
         tmp_path, "0.0.0", serve_archive=True
@@ -608,6 +625,7 @@ def test_gpu_lane_sccache_wrapper_rejects_checksum_mismatch(tmp_path):
     assert "--start-server" not in sccache_log.read_text().splitlines()
 
 
+@pytest.mark.cpu_only
 def test_gpu_lane_sccache_wrapper_fails_open_without_nvcc(tmp_path):
     child, sccache_log, _, env = _write_test_sccache_fakes(tmp_path, "0.18.0")
     (tmp_path / "cuda" / "bin" / "nvcc").unlink()
@@ -618,6 +636,7 @@ def test_gpu_lane_sccache_wrapper_fails_open_without_nvcc(tmp_path):
     assert "--start-server" not in sccache_log.read_text().splitlines()
 
 
+@pytest.mark.cpu_only
 def test_gpu_lane_sccache_wrapper_fails_open_when_server_start_fails(tmp_path):
     child, sccache_log, _, env = _write_test_sccache_fakes(
         tmp_path, "0.18.0", start_server_fails=True
@@ -630,6 +649,7 @@ def test_gpu_lane_sccache_wrapper_fails_open_when_server_start_fails(tmp_path):
     assert not (tmp_path / "stats" / "sccache-stats.txt").exists()
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("binary_target", "device_architecture", "expected"),
     [
@@ -658,6 +678,7 @@ def test_cuda_binary_target_compatibility(
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("provider", "binary_target"),
     [
@@ -713,6 +734,7 @@ def test_native_provider_cuda_inspection_accepts_compatible_sass(
     assert ptx_modules == []
 
 
+@pytest.mark.cpu_only
 def test_native_provider_cuda_inspection_rejects_incompatible_sass(
     monkeypatch, tmp_path, provider_validation_module
 ):
@@ -755,6 +777,7 @@ def test_native_provider_cuda_inspection_rejects_incompatible_sass(
         )
 
 
+@pytest.mark.cpu_only
 def test_native_provider_cuda_inspection_rejects_ptx(
     monkeypatch, tmp_path, provider_validation_module
 ):
@@ -795,6 +818,7 @@ def test_native_provider_cuda_inspection_rejects_ptx(
         )
 
 
+@pytest.mark.cpu_only
 def test_get_aot_path_selects_provider_for_target_arch(monkeypatch, tmp_path):
     fallback_root = tmp_path / "package-aot"
     sm80_root = tmp_path / "sm80"
@@ -829,6 +853,7 @@ def test_get_aot_path_selects_provider_for_target_arch(monkeypatch, tmp_path):
     assert jit_env.get_aot_path("attention_module") == expected
 
 
+@pytest.mark.cpu_only
 def test_get_aot_path_uses_best_compatible_provider(monkeypatch, tmp_path):
     fallback_root = tmp_path / "package-aot"
     sm80_root = tmp_path / "sm80"
@@ -862,6 +887,7 @@ def test_get_aot_path_uses_best_compatible_provider(monkeypatch, tmp_path):
     assert jit_env.get_aot_path("attention_module") == expected
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("provider_architecture", "target_architecture", "compatible"),
     [
@@ -903,6 +929,7 @@ def test_get_aot_path_applies_cuda_provider_compatibility(
     )
 
 
+@pytest.mark.cpu_only
 def test_get_aot_path_allows_provider_for_subset_of_targets(monkeypatch, tmp_path):
     fallback_root = tmp_path / "package-aot"
     provider_root = tmp_path / "sm103a"
@@ -928,6 +955,7 @@ def test_get_aot_path_allows_provider_for_subset_of_targets(monkeypatch, tmp_pat
     )
 
 
+@pytest.mark.cpu_only
 def test_jit_spec_dispatches_heterogeneous_aot_modules(monkeypatch, tmp_path):
     sm103_path = tmp_path / "sm103a.so"
     sm120_path = tmp_path / "sm120f.so"
@@ -976,6 +1004,7 @@ def test_jit_spec_dispatches_heterogeneous_aot_modules(monkeypatch, tmp_path):
     assert module.run() == "jit"
 
 
+@pytest.mark.cpu_only
 def test_jit_spec_uses_partial_aot_provider_on_matching_device(monkeypatch, tmp_path):
     sm103_path = tmp_path / "sm103a.so"
     artifacts = (jit_env.AOTArtifact("sm103a", sm103_path, frozenset({"sm103a"})),)
@@ -1011,6 +1040,7 @@ def test_jit_spec_uses_partial_aot_provider_on_matching_device(monkeypatch, tmp_
     assert module.run() == "sm103a"
 
 
+@pytest.mark.cpu_only
 def test_get_aot_path_does_not_guess_when_target_is_unknown(monkeypatch, tmp_path):
     fallback_root = tmp_path / "package-aot"
     provider_root = tmp_path / "sm80"
@@ -1032,6 +1062,7 @@ def test_get_aot_path_does_not_guess_when_target_is_unknown(monkeypatch, tmp_pat
     )
 
 
+@pytest.mark.cpu_only
 def test_get_aot_path_prefers_bundled_package_module(monkeypatch, tmp_path):
     fallback_root = tmp_path / "package-aot"
     provider_root = tmp_path / "sm80"

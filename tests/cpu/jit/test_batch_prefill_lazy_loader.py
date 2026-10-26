@@ -93,6 +93,7 @@ def _clear_batch_prefill_module_cache():
     prefill.get_batch_prefill_module.cache_clear()
 
 
+@pytest.mark.cpu_only
 def test_fa2_selects_stride_variant_once(monkeypatch):
     calls = []
     primary_spec = _FakeSpec(_raw_module("primary", calls))
@@ -137,6 +138,7 @@ def test_fa2_selects_stride_variant_once(monkeypatch):
         module.prewarm_paged_kv_stride_variant("unknown")
 
 
+@pytest.mark.cpu_only
 def test_non_fa2_keeps_public_full_module_and_rejects_prewarm(monkeypatch):
     calls = []
     public_spec = _FakeSpec(_raw_module("public", calls))
@@ -175,6 +177,7 @@ class _PrewarmRecorder:
         self.variants.append(variant)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "wrapper_cls",
     [prefill.BatchPrefillWithPagedKVCacheWrapper, BatchDecodeWithPagedKVCacheWrapper],
@@ -205,6 +208,7 @@ def test_standard_wrappers_expose_post_plan_prewarm(wrapper_cls, monkeypatch):
         wrapper.prewarm_paged_kv_stride_variant()
 
 
+@pytest.mark.cpu_only
 def test_cascade_wrappers_delegate_prewarm():
     level_one = _PrewarmRecorder()
     level_two = _PrewarmRecorder()

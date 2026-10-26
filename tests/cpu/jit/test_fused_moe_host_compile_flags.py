@@ -19,6 +19,7 @@ import pytest
 from flashinfer.jit import fused_moe
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("machine", "is_gcc", "expected"),
     [

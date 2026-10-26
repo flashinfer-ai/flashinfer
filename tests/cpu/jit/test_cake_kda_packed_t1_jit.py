@@ -16,6 +16,7 @@ _SM100_CAPABILITIES = ((10, 0), (10, 3))
 _ALL_CAPABILITIES = tuple(cake_kda_packed_t1.CAKE_KDA_PACKED_T1_ALIGNED_BANDS)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("compute_capability", _SM100_CAPABILITIES)
 @pytest.mark.parametrize(
     ("batch", "expected"),
@@ -52,6 +53,7 @@ def test_aligned_selector_matches_qualified_batch_bands(
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("batch", "expected"),
     [
@@ -80,6 +82,7 @@ def test_aligned_selector_rebands_on_compute_capability_10_7(batch, expected):
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("compute_capability", _ALL_CAPABILITIES)
 def test_aligned_selector_bands_are_well_formed(compute_capability):
     bands = cake_kda_packed_t1.CAKE_KDA_PACKED_T1_ALIGNED_BANDS[compute_capability]
@@ -94,6 +97,7 @@ def test_aligned_selector_bands_are_well_formed(compute_capability):
         ].requires_aux_vec4
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("compute_capability", ((9, 0), (12, 0), (10, 8)))
 def test_selector_rejects_capabilities_without_qualified_bands(compute_capability):
     with pytest.raises(ValueError, match="no qualified selector bands"):
@@ -105,6 +109,7 @@ def test_selector_rejects_capabilities_without_qualified_bands(compute_capabilit
         )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("compute_capability", _ALL_CAPABILITIES)
 @pytest.mark.parametrize(
     ("batch", "expected"),
@@ -132,6 +137,7 @@ def test_scalar_aux_selector_fails_closed_outside_qualified_bands(
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("compute_capability", _ALL_CAPABILITIES)
 def test_unaligned_state_uses_legacy_route(compute_capability):
     for batch in (1, 38, 512):
@@ -153,6 +159,7 @@ def test_unaligned_state_uses_legacy_route(compute_capability):
         )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("target", "target_arch", "gencode", "target_kind"),
     [
@@ -222,6 +229,7 @@ def test_jit_specs_bind_frozen_source_and_physical_launch_metadata(
     cake_kda_packed_t1.gen_cake_kda_packed_t1_module.cache_clear()
 
 
+@pytest.mark.cpu_only
 def test_binding_preserves_stream_stride_index_and_alignment_contracts():
     binding = (
         cake_kda_packed_t1._get_csrc_dir() / "cake_kda_packed_t1_binding.cuh"

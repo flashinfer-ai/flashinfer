@@ -97,6 +97,7 @@ SVDQUANT_NAME_BASELINE = {
 }
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("getter", NVFP4_KERNEL_GETTERS)
 def test_nvfp4_kernel_name_signature_covers_codegen_params(getter):
     """Every kernel-getter parameter must be expressible in the cache key.
@@ -115,6 +116,7 @@ def test_nvfp4_kernel_name_signature_covers_codegen_params(getter):
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "param,alternate",
     [
@@ -153,6 +155,7 @@ def test_nvfp4_kernel_name_varies_with_every_argument(param, alternate):
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "param,alternate",
     [
@@ -173,6 +176,7 @@ def test_sm120_svdquant_kernel_name_varies_with_every_argument(param, alternate)
     assert _sm120_svdquant_kernel_name(**kwargs) != baseline_name
 
 
+@pytest.mark.cpu_only
 def test_sm120_svdquant_kernel_name_is_symbol_safe():
     name = _sm120_svdquant_kernel_name(
         **{**SVDQUANT_NAME_BASELINE, "mma_tiler_mn": (128, 64), "enable_iket": True}
@@ -180,6 +184,7 @@ def test_sm120_svdquant_kernel_name_is_symbol_safe():
     assert re.fullmatch(r"[A-Za-z0-9_]+", name), name
 
 
+@pytest.mark.cpu_only
 def test_sm120_svdquant_source_fingerprint_covers_layout_helpers():
     from flashinfer.cute_dsl import utils as cute_dsl_utils
     from flashinfer.gemm.kernels import dense_blockscaled_gemm_sm120_b12x
@@ -189,6 +194,7 @@ def test_sm120_svdquant_source_fingerprint_covers_layout_helpers():
     assert dense_blockscaled_gemm_sm120_b12x.__file__ in sources
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "runner_factory",
     [
@@ -203,6 +209,7 @@ def test_svdquant_autotune_cache_distinguishes_pdl(runner_factory):
     assert enabled.get_cache_key_extras([]) == (True,)
 
 
+@pytest.mark.cpu_only
 def test_sm100_svdquant_autotune_cache_distinguishes_pdl(monkeypatch):
     from flashinfer.gemm import gemm_svdquant
 
@@ -213,6 +220,7 @@ def test_sm100_svdquant_autotune_cache_distinguishes_pdl(monkeypatch):
     assert enabled.get_cache_key_extras([]) == (True,)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "config",
     [
@@ -286,6 +294,7 @@ NVFP4_LEGACY_KERNEL_NAMES = [
 ]
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "overrides,expected",
     NVFP4_LEGACY_KERNEL_NAMES,
@@ -301,6 +310,7 @@ def test_nvfp4_kernel_name_is_unchanged_from_pre_4over6_api(overrides, expected)
     assert _nvfp4_kernel_name(**{**NVFP4_NAME_BASELINE, **overrides}) == expected
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "config",
     [
@@ -331,6 +341,7 @@ def test_nvfp4_kernel_name_suffix_is_the_shared_cache_key(config):
         assert name == f"{base}_{nvfp4_4over6_cache_key(config)}"
 
 
+@pytest.mark.cpu_only
 def test_nvfp4_kernel_name_is_symbol_safe():
     """Names must already be valid symbol/filename components.
 
@@ -409,6 +420,7 @@ def _mm_fp4_name(**kwargs):
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("param", sorted(MM_FP4_NAME_BASELINE))
 def test_mm_fp4_kernel_name_varies_with_every_argument(param):
     """Changing any single codegen argument must change the kernel name, and
@@ -425,6 +437,7 @@ def test_mm_fp4_kernel_name_varies_with_every_argument(param):
         assert re.fullmatch(r"[0-9A-Za-z_]+", name), name
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("change", ["policy", "layout", "tactic"])
 def test_sm12x_disk_cache_tracks_codegen_changes(monkeypatch, tmp_path, change):
     """Policy selection may change without rebuilding an unchanged specialization."""
@@ -517,6 +530,7 @@ SM107_FP8_GROUPWISE_NAME_PERTURBED = {
 }
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("param", sorted(SM107_FP8_GROUPWISE_NAME_BASELINE))
 def test_sm107_fp8_groupwise_kernel_name_varies_with_every_argument(param):
     baseline_name = _sm107_fp8_groupwise_name(**SM107_FP8_GROUPWISE_NAME_BASELINE)

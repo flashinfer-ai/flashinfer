@@ -20,6 +20,7 @@ import pytest
 from packaging.version import Version
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("target_archs", "expected"),
     [
@@ -47,6 +48,7 @@ def test_detect_bgmv_moe_capability(monkeypatch, target_archs, expected):
     assert aot.detect_sm_capabilities()["bgmv_moe"] is expected
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("supported", [False, True])
 def test_aot_registers_bgmv_moe_only_for_supported_target(monkeypatch, supported):
     from flashinfer import aot

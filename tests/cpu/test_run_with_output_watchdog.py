@@ -1,3 +1,5 @@
+import pytest
+
 import os
 import signal
 import subprocess
@@ -6,7 +8,7 @@ import time
 from pathlib import Path
 
 
-WATCHDOG = Path(__file__).parents[1] / "scripts" / "run_with_output_watchdog.py"
+WATCHDOG = Path(__file__).parents[2] / "scripts" / "run_with_output_watchdog.py"
 
 
 def assert_process_stopped(pid: int, message: str) -> None:
@@ -48,6 +50,7 @@ def run_watchdog(
     )
 
 
+@pytest.mark.cpu_only
 def test_watchdog_preserves_output_and_exit_status() -> None:
     result = run_watchdog(
         sys.executable,
@@ -59,6 +62,7 @@ def test_watchdog_preserves_output_and_exit_status() -> None:
     assert result.stdout == "compiler output\n"
 
 
+@pytest.mark.cpu_only
 def test_watchdog_diagnoses_no_output(tmp_path: Path) -> None:
     diagnostics = tmp_path / "watchdog.txt"
     result = subprocess.run(
@@ -90,6 +94,7 @@ def test_watchdog_diagnoses_no_output(tmp_path: Path) -> None:
     assert "no_output_seconds=" in diagnostics.read_text()
 
 
+@pytest.mark.cpu_only
 def test_watchdog_kills_descendant_that_ignores_sigterm(tmp_path: Path) -> None:
     descendant_pid_file = tmp_path / "descendant.pid"
     command = """
@@ -124,6 +129,7 @@ time.sleep(30)
     assert result.returncode == 124
 
 
+@pytest.mark.cpu_only
 def test_watchdog_terminates_command_when_diagnostics_write_fails(
     tmp_path: Path,
 ) -> None:

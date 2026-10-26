@@ -28,7 +28,7 @@ from flashinfer.jit import core as jit_core
 from flashinfer.jit import cute_dsl_core
 from flashinfer.jit import _cute_dsl_source as source_analysis
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 @pytest.fixture
@@ -65,6 +65,7 @@ def fake_package(tmp_path, monkeypatch):
     source_analysis._import_closure.cache_clear()
 
 
+@pytest.mark.cpu_only
 def test_import_closure_follows_helpers_but_not_unkeyed_files(fake_package):
     closure = source_analysis._package_import_closure(
         fake_package / "kernels" / "kernel.py"
@@ -82,6 +83,7 @@ def test_import_closure_follows_helpers_but_not_unkeyed_files(fake_package):
     }
 
 
+@pytest.mark.cpu_only
 def test_strict_key_tracks_implicit_parent_initializers(fake_package, monkeypatch):
     monkeypatch.setenv("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY", "1")
     kernel = str(fake_package / "kernels/kernel.py")
@@ -93,6 +95,7 @@ def test_strict_key_tracks_implicit_parent_initializers(fake_package, monkeypatc
     assert cute_dsl_core._hash_source_files((kernel,)) != before
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "statement",
     [
@@ -117,6 +120,7 @@ def test_strict_key_tracks_resolvable_dynamic_imports(
     assert cute_dsl_core._hash_source_files((str(kernel),)) != before
 
 
+@pytest.mark.cpu_only
 def test_strict_key_tracks_package_export_shadowing_a_submodule(
     fake_package, monkeypatch
 ):
@@ -132,6 +136,7 @@ def test_strict_key_tracks_package_export_shadowing_a_submodule(
     assert cute_dsl_core._hash_source_files((str(kernel),)) != before
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "dependency", ["apache-tvm-ffi", "torch", "nvidia-cutlass-dsl-libs-cu13"]
 )
@@ -166,6 +171,7 @@ def test_compiler_fingerprint_tracks_resolved_dependencies(monkeypatch, dependen
         cute_dsl_core._get_cute_dsl_version.cache_clear()
 
 
+@pytest.mark.cpu_only
 def test_compiler_fingerprint_tracks_extension_abi(monkeypatch):
     import sysconfig
 
@@ -180,6 +186,7 @@ def test_compiler_fingerprint_tracks_extension_abi(monkeypatch):
         cute_dsl_core._get_cute_dsl_version.cache_clear()
 
 
+@pytest.mark.cpu_only
 def test_strict_key_tracks_imported_helpers(fake_package, monkeypatch):
     kernel = str(fake_package / "kernels" / "kernel.py")
     helper = fake_package / "helpers" / "math.py"
@@ -203,6 +210,7 @@ def test_strict_key_tracks_imported_helpers(fake_package, monkeypatch):
     assert cute_dsl_core._hash_source_files((kernel,)) == strict_after
 
 
+@pytest.mark.cpu_only
 def test_strict_key_leaves_files_outside_the_package_alone(
     fake_package, tmp_path, monkeypatch
 ):
@@ -212,6 +220,7 @@ def test_strict_key_leaves_files_outside_the_package_alone(
     assert source_analysis._expand_key_files((str(outside),)) == (str(outside),)
 
 
+@pytest.mark.cpu_only
 def test_strict_key_parse_failure_bypasses_disk_cache(fake_package, monkeypatch):
     monkeypatch.setenv("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY", "1")
     (fake_package / "helpers" / "math.py").write_text("def broken(:\n")
@@ -224,6 +233,7 @@ def test_strict_key_parse_failure_bypasses_disk_cache(fake_package, monkeypatch)
     assert result == "compiled in process"
 
 
+@pytest.mark.cpu_only
 def test_strict_closure_of_real_kernel_stays_small(monkeypatch):
     """Guards against the closure ballooning to the whole package again."""
     monkeypatch.setenv("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY", "1")
@@ -267,6 +277,7 @@ class _FakeSpec(jit_core.JitSpec):
         return "built"
 
 
+@pytest.mark.cpu_only
 def test_build_and_load_records_build_time(tmp_path, monkeypatch):
     log = tmp_path / "builds.jsonl"
     monkeypatch.setenv("FLASHINFER_JIT_BUILD_LOG", str(log))
@@ -282,6 +293,7 @@ def test_build_and_load_records_build_time(tmp_path, monkeypatch):
     assert records[0]["seconds"] >= 0
 
 
+@pytest.mark.cpu_only
 def test_build_log_is_off_by_default(tmp_path, monkeypatch):
     monkeypatch.delenv("FLASHINFER_JIT_BUILD_LOG", raising=False)
     monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
@@ -290,6 +302,7 @@ def test_build_log_is_off_by_default(tmp_path, monkeypatch):
     assert not list(tmp_path.glob("*.jsonl"))
 
 
+@pytest.mark.cpu_only
 def test_toolchain_labels():
     assert jit_core.JitSpecNvcc.toolchain == "nvcc"
     assert cute_dsl_core.JitSpecCuteDsl.toolchain == "cute_dsl"
@@ -304,6 +317,7 @@ def _load_summarizer():
     return module
 
 
+@pytest.mark.cpu_only
 def test_summary_totals_by_toolchain(tmp_path):
     log = tmp_path / "builds.jsonl"
     rows = [

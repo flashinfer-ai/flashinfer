@@ -10,7 +10,7 @@ import pytest
 
 @pytest.fixture
 def wheel_builder(monkeypatch):
-    path = Path(__file__).parents[1] / "scripts" / "build_jit_cache_wheel.py"
+    path = Path(__file__).parents[2] / "scripts" / "build_jit_cache_wheel.py"
     spec = importlib.util.spec_from_file_location("build_jit_cache_wheel", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -18,6 +18,7 @@ def wheel_builder(monkeypatch):
     return module
 
 
+@pytest.mark.cpu_only
 def test_dependency_install_recovers_from_disconnect(wheel_builder):
     failure = subprocess.CalledProcessError(
         1, ["python", "-m", "pip"], stderr=b"IncompleteRead(32768 bytes read)"
@@ -33,6 +34,7 @@ def test_dependency_install_recovers_from_disconnect(wheel_builder):
     wheel_builder.time.sleep.assert_called_once_with(10)
 
 
+@pytest.mark.cpu_only
 def test_dependency_install_stops_after_three_attempts(wheel_builder):
     failure = subprocess.CalledProcessError(
         1, ["python", "-m", "pip"], output="RemoteDisconnected"
@@ -51,6 +53,7 @@ def test_dependency_install_stops_after_three_attempts(wheel_builder):
     ]
 
 
+@pytest.mark.cpu_only
 def test_dependency_resolution_error_is_not_retried(wheel_builder):
     failure = subprocess.CalledProcessError(
         1, ["python", "-m", "pip"], stderr=b"No matching distribution found"
@@ -74,6 +77,7 @@ def _fake_python(tmp_path, body):
     return python, log
 
 
+@pytest.mark.cpu_only
 def test_current_interpreter_install_retries_interrupted_pip(wheel_builder, tmp_path):
     attempts = tmp_path / "attempts"
     python, log = _fake_python(
@@ -92,6 +96,7 @@ def test_current_interpreter_install_retries_interrupted_pip(wheel_builder, tmp_
     wheel_builder.time.sleep.assert_called_once_with(10)
 
 
+@pytest.mark.cpu_only
 def test_current_interpreter_install_skips_empty_requirements(wheel_builder, tmp_path):
     python, log = _fake_python(tmp_path, "exit 1")
     env = wheel_builder.CurrentInterpreterEnv()
@@ -102,6 +107,7 @@ def test_current_interpreter_install_skips_empty_requirements(wheel_builder, tmp
     assert not log.exists()
 
 
+@pytest.mark.cpu_only
 def test_build_wheel_runs_in_current_interpreter(wheel_builder, monkeypatch, tmp_path):
     """The build must not create a PEP 517 isolated env: its random path would
     leak into compile commands and defeat sccache across runs."""
@@ -149,6 +155,7 @@ def test_build_wheel_runs_in_current_interpreter(wheel_builder, monkeypatch, tmp
     ]
 
 
+@pytest.mark.cpu_only
 def test_pin_header_mtimes_only_touches_headers(wheel_builder, tmp_path):
     site = tmp_path / "site-packages"
     headers = [
@@ -192,6 +199,7 @@ def _gnu_cxx():
     return None
 
 
+@pytest.mark.cpu_only
 def test_pinned_mtimes_make_gcc_preprocessing_deterministic(wheel_builder, tmp_path):
     """Reproduce the torch-header cache misses with GCC's `#pragma once`.
 

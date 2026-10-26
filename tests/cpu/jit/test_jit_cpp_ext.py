@@ -15,12 +15,14 @@ from flashinfer.utils import (
 from tests.test_helpers import jit_utils
 
 
+@pytest.mark.cpu_only
 def test_nvcc_parallelism_flags_use_flashinfer_nvcc_threads(monkeypatch):
     monkeypatch.setenv("FLASHINFER_NVCC_THREADS", "4")
 
     assert cpp_ext.get_nvcc_parallelism_flags() == ["--threads=4"]
 
 
+@pytest.mark.cpu_only
 def test_nvcc_parallelism_flags_ignore_sccache_launcher(monkeypatch):
     monkeypatch.setenv("FLASHINFER_NVCC_THREADS", "4")
     monkeypatch.setenv("FLASHINFER_NVCC_LAUNCHER", "sccache")
@@ -28,6 +30,7 @@ def test_nvcc_parallelism_flags_ignore_sccache_launcher(monkeypatch):
     assert cpp_ext.get_nvcc_parallelism_flags() == ["--threads=4"]
 
 
+@pytest.mark.cpu_only
 def test_jit_uses_size_optimized_fatbin_compression(monkeypatch):
     monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
     monkeypatch.setattr(core, "get_nvcc_parallelism_flags", lambda: ["--threads=1"])
@@ -38,6 +41,7 @@ def test_jit_uses_size_optimized_fatbin_compression(monkeypatch):
     assert "--compress-mode=size" in spec.extra_cuda_cflags
 
 
+@pytest.mark.cpu_only
 def test_generate_ninja_uses_sccache_compatible_nvcc_depfile_flag(
     monkeypatch, tmp_path
 ):
@@ -58,6 +62,7 @@ def test_generate_ninja_uses_sccache_compatible_nvcc_depfile_flag(
     assert "--dependency-output" not in ninja
 
 
+@pytest.mark.cpu_only
 def test_generate_ninja_propagates_cuda_arch_flags_to_nvcc_link(monkeypatch, tmp_path):
     monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: "/usr/local/cuda")
     monkeypatch.setattr(cpp_ext.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
@@ -81,6 +86,7 @@ def test_generate_ninja_propagates_cuda_arch_flags_to_nvcc_link(monkeypatch, tmp
     assert "cuda_arch_flags = -DNDEBUG" not in ninja
 
 
+@pytest.mark.cpu_only
 def test_debug_jit_uses_sccache_compatible_nvcc_device_debug_flag(monkeypatch):
     monkeypatch.setenv("FLASHINFER_JIT_DEBUG", "1")
     monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
@@ -99,6 +105,7 @@ def test_debug_jit_uses_sccache_compatible_nvcc_device_debug_flag(monkeypatch):
     assert "-G" not in spec.extra_cuda_cflags
 
 
+@pytest.mark.cpu_only
 def test_release_jit_propagates_ndebug_to_host_cflags(monkeypatch):
     monkeypatch.delenv("FLASHINFER_JIT_DEBUG", raising=False)
     monkeypatch.delenv("FLASHINFER_JIT_VERBOSE", raising=False)
@@ -118,6 +125,7 @@ def test_release_jit_propagates_ndebug_to_host_cflags(monkeypatch):
     assert "-DNDEBUG" in spec.extra_cuda_cflags
 
 
+@pytest.mark.cpu_only
 def test_debug_jit_does_not_propagate_ndebug(monkeypatch):
     monkeypatch.setenv("FLASHINFER_JIT_DEBUG", "1")
     monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
@@ -136,6 +144,7 @@ def test_debug_jit_does_not_propagate_ndebug(monkeypatch):
     assert "-DNDEBUG" not in spec.extra_cuda_cflags
 
 
+@pytest.mark.cpu_only
 def test_run_ninja_uses_max_jobs(monkeypatch, tmp_path):
     commands = []
 
@@ -175,6 +184,7 @@ def jit_spec_nvcc(monkeypatch, tmp_path):
     )
 
 
+@pytest.mark.cpu_only
 def test_jit_spec_build_rewrites_ninja_before_build(monkeypatch, jit_spec_nvcc):
     writes = []
     monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
@@ -188,6 +198,7 @@ def test_jit_spec_build_rewrites_ninja_before_build(monkeypatch, jit_spec_nvcc):
     assert writes == [True]
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("cached", [False, True])
 def test_jit_spec_build_logs_only_for_cold_cache(monkeypatch, jit_spec_nvcc, cached):
     events = []
@@ -219,6 +230,7 @@ def test_jit_spec_build_logs_only_for_cold_cache(monkeypatch, jit_spec_nvcc, cac
     assert events == expected
 
 
+@pytest.mark.cpu_only
 def test_jit_spec_aot_cache_hit_does_not_log_jit_build(
     monkeypatch, tmp_path, jit_spec_nvcc
 ):
@@ -237,6 +249,7 @@ def test_jit_spec_aot_cache_hit_does_not_log_jit_build(
     assert logs == []
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("is_aot", [False, True])
 def test_jit_spec_post_load_adapter_applies_to_jit_and_aot_load_paths(
     monkeypatch, tmp_path, is_aot
@@ -259,6 +272,7 @@ def test_jit_spec_post_load_adapter_applies_to_jit_and_aot_load_paths(
     assert seen == [raw_module]
 
 
+@pytest.mark.cpu_only
 def test_customize_batch_prefill_nvfp4_large_head_uses_prefill_flags(
     monkeypatch, tmp_path
 ):
@@ -295,6 +309,7 @@ def test_customize_batch_prefill_nvfp4_large_head_uses_prefill_flags(
         attention_modules._fa2_head_dim_nvcc_flags(512, 512, torch.uint8)
 
 
+@pytest.mark.cpu_only
 def test_fa2_fp8_large_head_uses_sm80_flags(monkeypatch):
     monkeypatch.setattr(
         attention_modules.current_compilation_context, "TARGET_CUDA_ARCHS", {(8, 0)}
@@ -305,6 +320,7 @@ def test_fa2_fp8_large_head_uses_sm80_flags(monkeypatch):
     assert any("sm_80" in flag for flag in flags)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("head_dim_qk", "head_dim_vo", "supported"),
     [
@@ -321,6 +337,7 @@ def test_fa3_prefill_head_dim_supported(head_dim_qk, head_dim_vo, supported):
     assert is_fa3_prefill_head_dim_supported(head_dim_qk, head_dim_vo) is supported
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("head_dim_qk", "head_dim_vo", "expected_backend"),
     [
@@ -348,6 +365,7 @@ def test_determine_attention_backend_respects_fa3_prefill_head_dim(
     assert backend == expected_backend
 
 
+@pytest.mark.cpu_only
 def test_prefill_jit_helper_skips_fa3_unsupported_large_head(monkeypatch):
     calls = []
 
