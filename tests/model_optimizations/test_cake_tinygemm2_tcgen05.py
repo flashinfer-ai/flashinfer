@@ -179,8 +179,9 @@ SM100_FAMILY_ROUTES = [
     (13, 1024, 2048, True, None),
     (16, 2048, 2048, True, None),
 ]
-# The narrow tile without full stages on sm_100a: two corners of each window, and
-# the measured shapes just past a window's bound that keep the other kernels.
+# The narrow tile without full stages on sm_100a: two corners of each window, the
+# measured shapes just past a window's bound that keep the other kernels, and a
+# shape inside a window whose input is not a multiple of 64 (no narrow tile).
 SM100_NARROW_ROUTES = [
     (1, 32, 8192, True, "PACKED_NARROW"),
     (1, 32, 10240, True, "PACKED_NARROW"),
@@ -260,8 +261,9 @@ SM100_NARROW_ROUTES = [
     (8, 320, 9216, False, None),
     (8, 384, 14336, False, None),
 ]
-# The full-stage narrow tile on sm_103a: two corners of each window, and the
-# measured shapes just past a window's bound that keep the other kernels.
+# The full-stage narrow tile on sm_103a: two corners of each window, the measured
+# shapes just past a window's bound that keep the other kernels, and a shape inside
+# a window whose input is not a multiple of 64 (no narrow tile).
 SM103_NARROW_ROUTES = [
     (1, 32, 3584, True, "PACKED_NARROW_FULL_STAGES"),
     (1, 32, 8192, True, "PACKED_NARROW_FULL_STAGES"),
@@ -315,6 +317,7 @@ SM103_NARROW_ROUTES = [
     (3, 256, 5120, False, None),
     (3, 448, 7168, False, None),
     (4, 32, 3584, False, "PACKED_NARROW_FULL_STAGES"),
+    (4, 64, 3584, False, "PACKED_NARROW_FULL_STAGES"),
     (4, 64, 5120, False, "PACKED_NARROW_FULL_STAGES"),
     (4, 128, 4096, False, "PACKED_NARROW_FULL_STAGES"),
     (4, 160, 3072, False, None),
@@ -331,6 +334,7 @@ SM103_NARROW_ROUTES = [
     (8, 32, 4096, False, None),
     (8, 32, 5120, False, None),
     (8, 192, 4608, False, "PACKED_NARROW_FULL_STAGES"),
+    (8, 192, 5120, False, "PACKED_NARROW_FULL_STAGES"),
     (8, 256, 3584, False, "PACKED_NARROW_FULL_STAGES"),
     (8, 256, 4096, False, None),
     (8, 256, 20480, False, "PACKED_NARROW_FULL_STAGES"),
@@ -338,10 +342,10 @@ SM103_NARROW_ROUTES = [
     (8, 320, 9216, False, None),
     (8, 384, 14336, False, None),
 ]
-# sm_107a: the narrow tile up to 8 rows over the measured windows (inside points and
-# the nearest measured shapes the windows exclude), PACKED on 8 rows without a bias
-# and 9 to 16 with one from 3584 output features, and with a bias 28 to 32 rows
-# from 2048 output features.
+# sm_107a: the narrow tile up to 8 rows over the measured windows (inside points,
+# the nearest measured shapes the windows exclude and an input that is not a
+# multiple of 64), PACKED on 8 rows without a bias and 9 to 16 with one from 3584
+# output features, and with a bias 28 to 32 rows from 2048 output features.
 SM107_ROUTES = [
     (4, 384, 16384, True, "PACKED_NARROW_U4"),
     (3, 512, 16384, True, "PACKED_NARROW_U4"),
