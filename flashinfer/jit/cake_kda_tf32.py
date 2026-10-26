@@ -3982,6 +3982,13 @@ _RENDERED_WORK_BIN_ROUTES = {
 # keeps the ``_RENDERED_ROUTES`` program.
 _RENDERED_OWNER_HELPER_ROUTES = {"sm_100a": {}, "sm_103a": {}}
 
+# architecture -> shipped module -> the generated build of the affine apply
+# route's main module that also writes the block pair maps of the tail windows.
+# The runtime takes it instead of the ``_RENDERED_ROUTES`` program when it
+# launches the lean-map apply composite (no pair-map producer launch); every
+# other launch of the module keeps the routed program.
+_RENDERED_FOLD_ROUTES = {"sm_100a": {}, "sm_103a": {}}
+
 MODULES = {
     **{name: _module_record(name, *row) for name, row in _MODULE_ROWS.items()},
     **_RENDERED_MODULES,
@@ -5186,10 +5193,12 @@ def prepare_descriptors(prepared):
                     grid=owner._projection_grid, **owner._projection_args
                 )
             if getattr(owner, "_apply_route", False):
-                # Kernel round 2: pair-map producer, prefix chain and fused apply.
-                owner._pairmap_module.prepare(
-                    grid=owner._pairmap_grid, **owner._pairmap_bindings()
-                )
+                # Kernel round 2: pair-map producer, prefix chain and fused apply
+                # (no producer when the main body writes the pair maps).
+                if owner._pairmap_module is not None:
+                    owner._pairmap_module.prepare(
+                        grid=owner._pairmap_grid, **owner._pairmap_bindings()
+                    )
                 owner._prefix_module.prepare(
                     grid=owner._prefix_grid, **owner._prefix_bindings()
                 )

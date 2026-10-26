@@ -3585,6 +3585,34 @@ class FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerExportLaunch(
     _affine_operator_export = True
 
 
+class FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerExportFoldLaunch(
+    FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerExportLaunch
+):
+    """Main windows that also write the block pair maps of the tail windows.
+
+    The factory row is the operator-export main's; the body is that module's
+    pair-map fold build (``_pair_map_fold_factory``), whose ``tape_e`` /
+    ``norm_inv_out`` slots take the composite's pair / dpair buffers.  Raises
+    ``_PairMapFoldUnavailable``, before any module is built, when the module
+    has none.
+    """
+
+    @staticmethod
+    def _build_kda_module(factory, *args, **kwargs):
+        if getattr(factory, "func", None) is _factory and factory.args == (
+            "compiled_bf16_fused_m128",
+        ):
+            if (
+                _pair_map_fold_program(
+                    *factory.args, *args, **{**factory.keywords, **kwargs}
+                )
+                is None
+            ):
+                raise _PairMapFoldUnavailable
+            factory = partial(_pair_map_fold_factory, *factory.args, **factory.keywords)
+        return _build_kda_module(factory, *args, **kwargs)
+
+
 def _affine_lean_map_enabled() -> bool:
     """Kernel round 2: build the prefix maps with the pair-map producer + prefix chain instead of the map pass.
 
@@ -3596,6 +3624,77 @@ def _affine_lean_map_enabled() -> bool:
     import os
 
     return os.environ.get("CAKE_KDA_AFFINE_LEAN_MAP", "1") != "0"
+
+
+def _affine_pair_map_fold_enabled() -> bool:
+    """Kernel round 7: the lean-map apply composite's main body writes the block pair maps itself.
+
+    Default on where the loader names the main module's fold build
+    (``_RENDERED_FOLD_ROUTES``); ``CAKE_KDA_AFFINE_PAIR_FOLD=0`` keeps the
+    pair-map producer launch (the control for the paired comparison).
+    """
+    import os
+
+    return os.environ.get("CAKE_KDA_AFFINE_PAIR_FOLD", "1") != "0"
+
+
+def _pair_map_fold_routed(device) -> bool:
+    """The loader names a pair-map fold build for ``device``."""
+    import torch
+
+    arch = {(10, 0): "sm_100a", (10, 3): "sm_103a"}.get(
+        torch.cuda.get_device_capability(device)
+    )
+    return bool(_kda_registry._RENDERED_FOLD_ROUTES.get(arch))
+
+
+class _PairMapFoldUnavailable(Exception):
+    """The composite's main module has no pair-map fold build on this device."""
+
+
+def _pair_map_fold_program(
+    name, *args, route_heads=None, route_work_bins=False, owner_helper=False, **kwargs
+):
+    """The pair-map fold build of the factory row's main module, or ``None``.
+
+    ``None`` when the row has no module on this device, when the head-count
+    routes take the module elsewhere at ``route_heads``, when the call asks
+    for a work-binned or owner/helper build the loader names for the module
+    (a fold build has neither), or when the loader names no fold build of the
+    module (``_RENDERED_FOLD_ROUTES``).  The routing keywords are not part of
+    the row's key.
+    """
+    arch = detect_gpu_arch()
+    rows = _kda_registry.FACTORIES.get(arch, {}).get(name, {})
+    module = rows.get(_kda_registry._key(args, kwargs))
+    if module is None:
+        return None
+    heads = getattr(_kda_registry, "_RENDERED_HEAD_ROUTES", {})
+    if route_heads in heads.get(arch, {}).get(module, {}):
+        return None
+    if route_work_bins and module in _kda_registry._RENDERED_WORK_BIN_ROUTES.get(
+        arch, {}
+    ):
+        return None
+    if owner_helper and module in _kda_registry._RENDERED_OWNER_HELPER_ROUTES.get(
+        arch, {}
+    ):
+        return None
+    return _kda_registry._RENDERED_FOLD_ROUTES.get(arch, {}).get(module)
+
+
+def _pair_map_fold_factory(name, *args, **kwargs):
+    """The pair-map fold build of the factory row's main module.
+
+    ``_factory`` resolves the row to its shipped module and that module
+    through the routes; this takes the module's ``_RENDERED_FOLD_ROUTES``
+    build instead (same argument plan; the build also writes the block pair
+    maps of the tail windows through ``tape_e`` / ``norm_inv_out``).
+    """
+    program = _pair_map_fold_program(name, *args, **kwargs)
+    if program is None:
+        raise _PairMapFoldUnavailable
+    return _kda_registry.PreparedKernel(program, detect_gpu_arch())
 
 
 def _affine_apply_route_enabled() -> bool:
@@ -4145,12 +4244,24 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         )
         if not self._apply_route and not self._correction_merge:
             self._correction_out = torch.empty_like(out[:, first_part_tokens:])
+        # Kernel round 7: on the lean-map apply route the main body also writes
+        # the block pair maps of the tail windows (bitwise the pair-map
+        # producer's) when the loader names the main module's fold build; the
+        # composite then launches no pair-map producer.
+        self._pair_map_fold = bool(
+            self._apply_route
+            and _affine_lean_map_enabled()
+            and _affine_pair_map_fold_enabled()
+            and _pair_map_fold_routed(q.device)
+        )
         main_launch_cls = (
-            FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerExportLaunch
+            FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerExportFoldLaunch
+            if self._pair_map_fold
+            else FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerExportLaunch
             if self._apply_route
             else FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerLaunch
         )
-        self._main = main_launch_cls(
+        main_args = (
             q,
             k,
             v,
@@ -4164,6 +4275,8 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             self._main_initial,
             self._main_final,
             split_cu_seqlens,
+        )
+        main_kwargs = dict(
             backend=backend,
             compute_dtype=compute_dtype,
             _affine_active_beta_f32=active_beta_f32,
@@ -4176,6 +4289,17 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 )
             ),
         )
+        try:
+            self._main = main_launch_cls(*main_args, **main_kwargs)
+        except _PairMapFoldUnavailable:
+            # The main module has no fold build (the body without checkpoint
+            # rows, for one): the pair-map producer writes the maps.
+            self._pair_map_fold = False
+            self._main = (
+                FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerExportLaunch(
+                    *main_args, **main_kwargs
+                )
+            )
         self._main.args.update(
             state_indices_addr=self._part_state_indices.data_ptr(),
             state_slot_stride=initial_state.stride(0),
@@ -4334,23 +4458,36 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             self._dpair = torch.empty(
                 (snap_total, heads, HEAD_DIM), dtype=torch.float32, device=q.device
             )
-            pairmap_items = build_affine_apply_items(
-                tail_lengths=tail_lengths,
-                cu_chunk_offsets=cu_chunks,
-                snap_starts=self._map_snapshot_starts,
-                tail_offsets=tail_offsets[:-1],
-                num_heads=heads,
-                rows_enabled=False,
-                sm_count=_device_sm_count(q.device),
-                pairmap=True,
-            )
-            self._pairmap_items = torch.tensor(
-                pairmap_items, dtype=torch.int32, device=q.device
-            ).contiguous()
-            self._pairmap_grid = (len(pairmap_items), 1, 1)
-            self._pairmap_module = _build_kda_module(
-                partial(_factory, "compiled_flashkda_affine_apply_m128"), pairmap=True
-            )
+            if self._pair_map_fold:
+                # The fold build writes R_p and D_p of every 64-token block of
+                # the tail windows through the main body's (otherwise unused)
+                # training-tape slots, row (window snapshot start + block).
+                self._main.args.update(
+                    tape_e=self._pair.view(-1), norm_inv_out=self._dpair.view(-1)
+                )
+                self._main.__dict__.pop("_launch_records", None)
+                # No pair-map producer is built, prepared or launched.
+                self._pairmap_items = self._pairmap_grid = None
+                self._pairmap_module = None
+            else:
+                pairmap_items = build_affine_apply_items(
+                    tail_lengths=tail_lengths,
+                    cu_chunk_offsets=cu_chunks,
+                    snap_starts=self._map_snapshot_starts,
+                    tail_offsets=tail_offsets[:-1],
+                    num_heads=heads,
+                    rows_enabled=False,
+                    sm_count=_device_sm_count(q.device),
+                    pairmap=True,
+                )
+                self._pairmap_items = torch.tensor(
+                    pairmap_items, dtype=torch.int32, device=q.device
+                ).contiguous()
+                self._pairmap_grid = (len(pairmap_items), 1, 1)
+                self._pairmap_module = _build_kda_module(
+                    partial(_factory, "compiled_flashkda_affine_apply_m128"),
+                    pairmap=True,
+                )
             prefix_items = build_map_prefix_items(
                 tail_lengths=tail_lengths,
                 snap_starts=self._map_snapshot_starts,
@@ -4401,6 +4538,8 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             self.schedule += "_apply"
             if self._lean_map:
                 self.schedule += "_leanmap"
+            if self._pair_map_fold:
+                self.schedule += "_pairfold"
         if compute_dtype == "bf16":
             self._map.args["initial_state_f32"] = self._main_final
         # The hi/lo carry variant is keyed only on the apply route so the
@@ -4667,9 +4806,10 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 # chain addresses launch-owned buffers), so a plan-cache rebind
                 # re-uploads one descriptor set and the pair-map / prefix sets
                 # re-prepare only on the capture / full-stale path.
-                self._pairmap_module.prepare(
-                    grid=self._pairmap_grid, **self._pairmap_bindings()
-                )
+                if self._pairmap_module is not None:
+                    self._pairmap_module.prepare(
+                        grid=self._pairmap_grid, **self._pairmap_bindings()
+                    )
                 self._prefix_module.prepare(
                     grid=self._prefix_grid, **self._prefix_bindings()
                 )
@@ -4685,13 +4825,17 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             self._apply_module.prepare(grid=self._apply_grid, **self._apply_bindings())
             self._apply_descriptors_stale = False
         if self._apply_route and self._lean_map:
+            prefix = _prepared_kernel_record(
+                self._prefix_module, self._prefix_grid, self._prefix_bindings()
+            )
+            if self._pairmap_module is None:
+                # The main body wrote the pair maps: the prefix chain alone.
+                return [prefix]
             return [
                 _prepared_kernel_record(
                     self._pairmap_module, self._pairmap_grid, self._pairmap_bindings()
                 ),
-                _prepared_kernel_record(
-                    self._prefix_module, self._prefix_grid, self._prefix_bindings()
-                ),
+                prefix,
             ]
         return _settled_launch_records(self._map)
 

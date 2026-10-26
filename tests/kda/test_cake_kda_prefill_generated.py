@@ -43,7 +43,10 @@ from flashinfer import (
     kda_prefill_supports_fp32_checkpoints,
     prepare_bf16_kda_prefill,
 )
-from flashinfer.cake_kda_tf32_runtime import _MAP_FIRST_MODULES
+from flashinfer.cake_kda_tf32_runtime import (
+    _MAP_FIRST_MODULES,
+    _affine_pair_map_fold_enabled,
+)
 
 ROOT = Path(registry.__file__).resolve().parents[2]
 UNIT_DIR = "csrc/kda/prefill"
@@ -125,6 +128,14 @@ def test_routes_point_shipped_modules_at_generated_programs():
             assert program in registry._RENDERED_MODULES, (arch, program)
             assert arch in registry._RENDERED_MODULES[program]["arches"]
             routed.add(program)
+    assert set(registry._RENDERED_FOLD_ROUTES) == set(registry.ARCHES)
+    for arch, modules in registry._RENDERED_FOLD_ROUTES.items():
+        for module, program in modules.items():
+            # Every other launch of the module keeps its route.
+            assert module in registry._RENDERED_ROUTES[arch], (arch, module)
+            assert program in registry._RENDERED_MODULES, (arch, program)
+            assert arch in registry._RENDERED_MODULES[program]["arches"]
+            routed.add(program)
     assert routed == set(GENERATED)
 
 
@@ -165,6 +176,7 @@ def test_generated_plans_bind_from_the_shipped_plans():
             *registry._RENDERED_MERGE_ROUTES[arch].items(),
             *registry._RENDERED_WORK_BIN_ROUTES[arch].items(),
             *registry._RENDERED_OWNER_HELPER_ROUTES[arch].items(),
+            *registry._RENDERED_FOLD_ROUTES[arch].items(),
         ]
         for module, program in routes:
             shipped = {
@@ -501,6 +513,33 @@ def test_merging_correction_builds_reduce_into_the_composite():
             )
 
 
+FOLD_MODULES = ("cake_kda_bf16_15be1db8a50ee4d9fd16",)
+FOLD_BARRIER = re.compile(r"\bfold_p_ready_addr\b")
+
+
+@requires_programs
+def test_pair_map_fold_builds_take_the_main_bodys_plan():
+    """The affine apply route's main module has a pair-map fold build
+    (``_RENDERED_FOLD_ROUTES``): a generated program of its own, never the
+    module's routed program, with the routed program's argument plan (the
+    composite binds the pair maps to the plan's ``tape_e`` / ``norm_inv_out``)."""
+    assert set(registry._RENDERED_FOLD_ROUTES) == set(registry.ARCHES)
+    for arch, folding in registry._RENDERED_FOLD_ROUTES.items():
+        assert sorted(folding) == list(FOLD_MODULES), arch
+        for module, name in folding.items():
+            routed = registry._RENDERED_ROUTES[arch][module]
+            assert name in GENERATED and name != routed, (arch, module)
+            record = registry._RENDERED_MODULES[name]
+            assert arch in record["arches"]
+            assert record["arg_plan"] == registry._RENDERED_MODULES[routed]["arg_plan"]
+            plan = {slot for _, slot in record["arg_plan"]}
+            assert {"tape_e", "norm_inv_out"} <= plan, name
+            text = (ROOT / record["sources"][0]).read_text()
+            assert FOLD_BARRIER.search(text), name
+            text = (ROOT / registry._RENDERED_MODULES[routed]["sources"][0]).read_text()
+            assert not FOLD_BARRIER.search(text), routed
+
+
 # ---------------------------------------------------------------- GPU numerics
 
 LAYER_CASES = [
@@ -763,6 +802,7 @@ def unrouted(monkeypatch):
             "_RENDERED_MERGE_ROUTES",
             "_RENDERED_WORK_BIN_ROUTES",
             "_RENDERED_OWNER_HELPER_ROUTES",
+            "_RENDERED_FOLD_ROUTES",
         ):
             monkeypatch.setattr(registry, table, {arch: {} for arch in registry.ARCHES})
 
@@ -875,6 +915,51 @@ def test_merging_correction_is_bitwise_the_epilogue_composite(
     assert torch.equal(d["state"][untouched], d["initial_pool"][untouched])
 
 
+FOLD_ROWS = [
+    pytest.param([8192], 12, id="8192-h12"),
+    pytest.param([3000, 13384], 16, id="3000+13384-h16"),
+    pytest.param([8128, 64, 8128, 64], 12, id="8128+64x4-h12"),
+    pytest.param([100, 33, 200, 17, 65], 16, id="short-h16"),
+]
+
+
+@requires_blackwell
+@pytest.mark.parametrize("lengths,heads", FOLD_ROWS)
+def test_pair_map_fold_is_bitwise_the_pair_map_producer(lengths, heads, monkeypatch):
+    """An apply composite whose main body writes the block pair maps equals,
+    bit for bit, the composite that launches the pair-map producer (the loader
+    without fold builds): output, pool slots and checkpoint rows, every
+    element written over NaN, the other pool slots untouched."""
+    arch = registry.device_arch()
+    folding = registry._RENDERED_FOLD_ROUTES[arch]
+    d = _inputs(lengths, heads)
+    untouched = torch.ones(d["state"].shape[0], dtype=torch.bool, device="cuda")
+    untouched[d["state_indices"].long()] = False
+
+    folded = _Call(d, None)
+    folded_result = folded.run()
+    fold = bool(_modules(folded.prepared) & set(folding.values()))
+    assert fold == ("_pairfold" in str(folded.prepared.schedule))
+    if (
+        _affine_pair_map_fold_enabled()
+        and _checkpoint_dtype(None) == torch.float32
+        and "_apply_leanmap" in str(folded.prepared.schedule)
+    ):
+        assert fold, "the lean-map apply composite launched the pair-map producer"
+    assert torch.equal(d["state"][untouched], d["initial_pool"][untouched])
+    _assert_bitwise(folded.run(), folded_result, "folded repeat")
+
+    monkeypatch.setattr(
+        registry, "_RENDERED_FOLD_ROUTES", {name: {} for name in registry.ARCHES}
+    )
+    producer = _Call(d, None)
+    producer_result = producer.run()
+    assert not _modules(producer.prepared) & set(folding.values())
+    assert "_pairfold" not in str(producer.prepared.schedule)
+    _assert_bitwise(folded_result, producer_result, "folded vs pair-map producer")
+    assert torch.equal(d["state"][untouched], d["initial_pool"][untouched])
+
+
 GRAPH_ROWS = [
     pytest.param([17, 64, 65, 127, 128, 200, 255, 96] * 2, 12, None, id="mixed-h12"),
     pytest.param([64] * 16, 16, -5.0, id="bs16x64-h16-lb5"),
@@ -922,8 +1007,9 @@ def test_plan_cache_hit_matches_a_fresh_preparation(lengths, heads, lower_bound)
 def _host_encoded_parts(prepared):
     """(owner, module, grid, bindings) of every launch part whose module encodes
     its tensor maps on the host: the part launches, their prepare kernels and,
-    on the apply route, the pair-map, prefix and fused apply kernels (owner
-    ``None``: the composite re-prepares them itself)."""
+    on the apply route, the pair-map (none when the main body folds it),
+    prefix and fused apply kernels (owner ``None``: the composite re-prepares
+    them itself)."""
     parts = []
     seen = set()
 
@@ -957,6 +1043,8 @@ def _host_encoded_parts(prepared):
                 add(obj, attrs[module], attrs[grid], attrs[bindings])
         if attrs.get("_apply_route"):
             for part in ("pairmap", "prefix", "apply"):
+                if attrs[f"_{part}_module"] is None:
+                    continue
                 add(
                     None,
                     attrs[f"_{part}_module"],
