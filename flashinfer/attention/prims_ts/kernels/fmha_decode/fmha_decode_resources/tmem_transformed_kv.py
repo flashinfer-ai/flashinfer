@@ -36,6 +36,7 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
+from ...task_compat import consumer_work_stage
 from ......cute_dsl.availability import is_rubin_cute_dsl_available
 from ...placeholder_helpers import _placeholder_local_array
 from ..fmha_decode_config import FmhaDecodeConfig
@@ -496,7 +497,7 @@ class TmemTransformedKvResource(DecodeGenResourceBase):
         ``head_dim_stage_idx``; scale rows always cover the full head dim.
         """
         cfg = self.cfg
-        src_stage_idx = self.src_smem_kv.state_src.consumer_work_stage
+        src_stage_idx = consumer_work_stage(self.src_smem_kv)
         slice_offset = 0
         if cutlass.const_expr(cfg.use_whole_tile_nvfp4_raw_stage):
             slice_offset = head_dim_stage_idx * cfg.raw_nvfp4_slice_bytes
