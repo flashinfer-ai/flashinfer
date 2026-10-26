@@ -6174,6 +6174,10 @@ def _dsa_sparse_mla_axes() -> dict[str, Var | Const]:
         "v_dim": Const(abbrev="", value=512),
         "pool_rows": Var(description="Token rows in the flat KV pool."),
         "sparse_mla_top_k": Const(abbrev="k"),
+        "batch_size": Var(
+            description="Requests of the trtllm-gen parity placeholders."
+        ),
+        "batch_size_plus_1": Var(description="Length of cum_seq_lens_q."),
     }
 
 
@@ -6189,16 +6193,19 @@ def _dsa_sparse_mla_inputs() -> dict[str, Tensor | Scalar]:
             ),
         ),
         "seq_lens": Tensor(
-            ["total_q"],
+            ["batch_size"],
             dtype="int32",
             optional=True,
             description="Interface parity with trtllm-gen; not read by the kernel.",
         ),
         "cum_seq_lens_q": Tensor(
-            ["total_q"],
+            ["batch_size_plus_1"],
             dtype="int32",
             optional=True,
-            description="Interface parity with trtllm-gen; not read by the kernel.",
+            description=(
+                "Interface parity with trtllm-gen (prefix sums, batch_size + 1 "
+                "entries); not read by the kernel."
+            ),
         ),
         "sparse_mla_top_k_lens": Tensor(
             ["total_q"],

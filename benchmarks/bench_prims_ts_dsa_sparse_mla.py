@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib.metadata
 import os
 import statistics
 import sys
@@ -93,6 +94,27 @@ def roofline_us_per_token(heads: int, top_k: int, kv_row_bytes: int) -> float:
     return bytes_per_token / HBM_BYTES_PER_S * 1e6
 
 
+def _require_cupti() -> None:
+    """Prevent bench_gpu_time from silently falling back to CUDA events (warm L2)."""
+
+    try:
+        from cupti import cupti as _cupti  # noqa: F401
+
+        version = importlib.metadata.version("cupti-python")
+    except (ImportError, importlib.metadata.PackageNotFoundError) as error:
+        raise RuntimeError(
+            "CUPTI timing is mandatory; install cupti-python>=13.0.0"
+        ) from error
+    try:
+        major = int(version.split(".", maxsplit=1)[0])
+    except ValueError as error:
+        raise RuntimeError(f"invalid cupti-python version {version!r}") from error
+    if major < 13:
+        raise RuntimeError(
+            f"CUPTI timing requires cupti-python>=13.0.0, found {version}"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--kernel", choices=["fp8", "nvfp4"], default="nvfp4")
@@ -131,6 +153,7 @@ def main() -> None:
     )
     parser.add_argument("--tag", default="")
     args = parser.parse_args()
+    _require_cupti()
 
     device = torch.device("cuda")
     props = torch.cuda.get_device_properties(device)
@@ -288,6 +311,7 @@ def main() -> None:
                         statistics.median(
                             bench_gpu_time(
                                 ours,
+                                enable_cupti=True,
                                 use_cuda_graph=True,
                                 cold_l2_cache=True,
                                 repeat_iters=args.repeat,
@@ -299,6 +323,7 @@ def main() -> None:
                         statistics.median(
                             bench_gpu_time(
                                 ours,
+                                enable_cupti=True,
                                 use_cuda_graph=True,
                                 cold_l2_cache=False,
                                 repeat_iters=args.repeat,
@@ -314,6 +339,7 @@ def main() -> None:
                             statistics.median(
                                 bench_gpu_time(
                                     trtllm,
+                                    enable_cupti=True,
                                     use_cuda_graph=True,
                                     cold_l2_cache=True,
                                     repeat_iters=args.repeat,

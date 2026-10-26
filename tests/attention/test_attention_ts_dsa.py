@@ -30,12 +30,9 @@ import math
 
 import pytest
 import torch
+from packaging.version import Version
 
-pytest.importorskip(
-    "cutlass",
-    minversion="4.8.0",
-    reason="PrimTS DSA tests require nvidia-cutlass-dsl>=4.8.0 (PTX ISA 9.4 QMUL4)",
-)
+cutlass = pytest.importorskip("cutlass", minversion="4.7.0")
 
 from flashinfer.attention.prims_ts import (
     dsa as dsa_module,
@@ -47,6 +44,13 @@ from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.to
 )
 from tests.test_helpers import dsa_nvfp4_cache_reference as ref
 
+# Only the NVFP4 entry needs nvidia-cutlass-dsl>=4.8 (PTX ISA 9.4 QMUL4); the E4M3
+# entry, the argument checks and the pure-Python split policies run on 4.7 too.
+_REQUIRES_NVFP4_TOOLCHAIN = pytest.mark.skipif(
+    Version(cutlass.__version__) < Version("4.8"),
+    reason="prims_ts_dsa_sparse_mla_nvfp4 requires nvidia-cutlass-dsl>=4.8.0 (PTX ISA 9.4 QMUL4)",
+)
+_KERNELS = ["fp8", pytest.param("nvfp4", marks=_REQUIRES_NVFP4_TOOLCHAIN)]
 _REQUIRES_PRIMTS_GPU = pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
@@ -256,6 +260,7 @@ def _fp8_reference(fx: Fixture):
     )
 
 
+@_REQUIRES_NVFP4_TOOLCHAIN
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize("case", _NVFP4_CASES, ids=lambda c: c.name)
@@ -295,7 +300,7 @@ def test_prims_ts_dsa_fp8_matches_reference(case: Case) -> None:
 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
-@pytest.mark.parametrize("kernel", ["fp8", "nvfp4"])
+@pytest.mark.parametrize("kernel", _KERNELS)
 def test_prims_ts_dsa_fully_masked_token(kernel: str) -> None:
     """A token whose every slot is -1 yields zeros and an LSE of -inf; its neighbours are unaffected."""
     device = torch.device("cuda")
@@ -317,7 +322,7 @@ def test_prims_ts_dsa_fully_masked_token(kernel: str) -> None:
 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
-@pytest.mark.parametrize("kernel", ["fp8", "nvfp4"])
+@pytest.mark.parametrize("kernel", _KERNELS)
 def test_prims_ts_dsa_skip_correction(kernel: str) -> None:
     """The lazy rescale (threshold 8 = the E4M3 P headroom) stays inside the reference tolerance."""
     device = torch.device("cuda")
@@ -338,7 +343,7 @@ def test_prims_ts_dsa_skip_correction(kernel: str) -> None:
 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
-@pytest.mark.parametrize("kernel", ["fp8", "nvfp4"])
+@pytest.mark.parametrize("kernel", _KERNELS)
 def test_prims_ts_dsa_cuda_graph_replay(kernel: str) -> None:
     """Captured launches read the live buffers: new payloads and routes replay bitwise like eager."""
     device = torch.device("cuda")
@@ -382,7 +387,7 @@ def test_prims_ts_dsa_cuda_graph_replay(kernel: str) -> None:
 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
-@pytest.mark.parametrize("kernel", ["fp8", "nvfp4"])
+@pytest.mark.parametrize("kernel", _KERNELS)
 def test_prims_ts_dsa_validate_inputs(
     kernel: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -436,7 +441,14 @@ _COMMON_INVALID = [
     ("query-rank", lambda a, d: a.update(query=a["query"][:, 0])),
     ("query-heads", lambda a, d: a.update(query=a["query"][:, :48].contiguous())),
     ("query-head-dim", lambda a, d: a.update(query=a["query"][..., :512].contiguous())),
-    ("query-strided", lambda a, d: a.update(query=a["query"].transpose(0, 1))),
+    (
+        "query-strided",
+        lambda a, d: a.update(
+            query=torch.zeros((2, 64, 2 * _HEAD_DIM), dtype=_FP8, device=d)[
+                ..., :_HEAD_DIM
+            ]
+        ),
+    ),
     ("tables-dtype", lambda a, d: a.update(block_tables=a["block_tables"].long())),
     ("tables-shape", lambda a, d: a.update(block_tables=a["block_tables"][:, :32])),
     ("tables-rank", lambda a, d: a.update(block_tables=a["block_tables"][0])),
@@ -513,6 +525,40 @@ _NVFP4_INVALID = [
     ("dequant-scale-inf", lambda a, d: a.update(kv_global_dequant_scale=math.inf)),
 ]
 
+# The validation message each case must raise (re.search patterns).
+_INVALID_MATCH = {
+    "query-dtype": "query must be a CUDA E4M3 tensor",
+    "query-rank": "query must be a CUDA E4M3 tensor",
+    "query-heads": r"query must be \[T, 64\|128",
+    "query-head-dim": r"query must be \[T, 64\|128",
+    "query-strided": "query must be contiguous",
+    "tables-dtype": "block_tables must be contiguous INT32",
+    "tables-shape": "block_tables must be contiguous INT32",
+    "tables-rank": "block_tables must be contiguous INT32",
+    "topk-not-multiple-of-4": "sparse_mla_top_k must be a positive multiple of 4",
+    "topk-zero": "sparse_mla_top_k must be a positive multiple of 4",
+    "lens-shape": "sparse_mla_top_k_lens must be contiguous INT32",
+    "lens-dtype": "sparse_mla_top_k_lens must be contiguous INT32",
+    "seq-lens-dtype": "seq_lens must be a 1-D CUDA INT32",
+    "scale-nan": "bmm1_scale must be a finite number",
+    "scale-bool": "bmm2_scale must be a finite number",
+    "skip-corr-too-large": r"skip_corr_threshold must be in \[0, 8\]",
+    "skip-corr-negative": r"skip_corr_threshold must be in \[0, 8\]",
+    "out-dtype": "out must be contiguous BF16",
+    "out-shape": "out must be contiguous BF16",
+    "lse-shape": "lse must be contiguous FP32",
+    "cache-dtype": "kv_cache must be a contiguous CUDA E4M3 tensor",
+    "cache-row": "kv_cache must be a contiguous CUDA E4M3 tensor",
+    "cache-misaligned": "kv_cache must start at a 16-byte-aligned address",
+    "data-dtype": "kv_data_pool must be a contiguous CUDA uint8 tensor",
+    "data-row-bytes": "kv_data_pool must be a contiguous CUDA uint8 tensor",
+    "scale-row-bytes": "kv_scale_pool must be a contiguous CUDA E4M3/uint8 tensor",
+    "scale-rows-mismatch": "must have the same row count",
+    "residual-dim": "residual_dim=64",
+    "dequant-scale-zero": "kv_global_dequant_scale must be a positive finite number",
+    "dequant-scale-inf": "kv_global_dequant_scale must be a positive finite number",
+}
+
 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
@@ -531,13 +577,13 @@ def test_prims_ts_dsa_rejects_invalid_arguments(kernel: str, name: str, mutate) 
         if kernel == "nvfp4"
         else prims_ts_dsa_sparse_mla_fp8
     )
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=_INVALID_MATCH[name]):
         entry(**args)
 
 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
-@pytest.mark.parametrize("kernel", ["fp8", "nvfp4"])
+@pytest.mark.parametrize("kernel", _KERNELS)
 def test_prims_ts_dsa_zero_tokens(kernel: str) -> None:
     """A step without query tokens returns the empty output without a launch."""
     device = torch.device("cuda")
@@ -555,7 +601,10 @@ def test_prims_ts_dsa_zero_tokens(kernel: str) -> None:
 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
-def test_prims_ts_dsa_compiled_kernel_is_shared_across_token_counts() -> None:
+@pytest.mark.parametrize("kernel", _KERNELS)
+def test_prims_ts_dsa_compiled_kernel_is_shared_across_token_counts(
+    kernel: str,
+) -> None:
     """The JIT key is (heads, top-k, skip-correction, cache format, dequant prefetch,
     split-KV count, V head-dim split); T is a runtime extent.
 
@@ -569,18 +618,19 @@ def test_prims_ts_dsa_compiled_kernel_is_shared_across_token_counts() -> None:
     totals = (1, 7, limit, limit + 1, 150)
     variants = set()
     for total_q in totals:
-        variants.add(("fp8", *dsa_module._select_fp8_split(total_q, top_k, sm_count)))
-        split = dsa_module._select_split_kv(total_q, top_k, sm_count)
-        variants.add(("nvfp4", split, total_q * split <= limit))
+        if kernel == "fp8":
+            variants.add(dsa_module._select_fp8_split(total_q, top_k, sm_count))
+        else:
+            split = dsa_module._select_split_kv(total_q, top_k, sm_count)
+            variants.add((split, total_q * split <= limit))
+    run = _run_fp8 if kernel == "fp8" else _run_nvfp4
     before = compile_dsa_sparse_kernel.cache_info()
     for total_q in totals:
-        fx = build_fixture(Case("shared", total_q=total_q, top_k=top_k), device)
-        _run_nvfp4(fx)
-        _run_fp8(fx)
+        run(build_fixture(Case("shared", total_q=total_q, top_k=top_k), device))
     torch.cuda.synchronize()
     after = compile_dsa_sparse_kernel.cache_info()
     assert after.misses - before.misses <= len(variants)
-    assert after.hits - before.hits >= 2 * len(totals) - len(variants)
+    assert after.hits - before.hits >= len(totals) - len(variants)
 
 
 def test_prims_ts_dsa_split_kv_policy() -> None:
@@ -656,9 +706,10 @@ _SPLIT_CASES = [
         ("fp8", 2, 4),
         ("fp8", 4, 2),
         ("fp8", 16, 4),
-        ("nvfp4", 1, 1),
-        ("nvfp4", 2, 1),
-        ("nvfp4", 16, 1),
+        *(
+            pytest.param("nvfp4", split, hds, marks=_REQUIRES_NVFP4_TOOLCHAIN)
+            for split, hds in ((1, 1), (2, 1), (16, 1))
+        ),
     ),
 )
 @pytest.mark.parametrize("case", _SPLIT_CASES, ids=lambda c: c.name)
@@ -695,6 +746,7 @@ def test_prims_ts_dsa_split_kv_matches_reference(
     _check_against(out, lse, expected, expected_lse)
 
 
+@_REQUIRES_NVFP4_TOOLCHAIN
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize("case", _NVFP4_CASES, ids=lambda c: c.name)

@@ -35,6 +35,14 @@
       "type": "const",
       "value": 256
     },
+    "batch_size": {
+      "type": "var",
+      "description": "Requests of the trtllm-gen parity placeholders."
+    },
+    "batch_size_plus_1": {
+      "type": "var",
+      "description": "Length of cum_seq_lens_q."
+    },
     "data_row_bytes": {
       "type": "const",
       "value": 320
@@ -69,7 +77,7 @@
     },
     "seq_lens": {
       "shape": [
-        "total_q"
+        "batch_size"
       ],
       "dtype": "int32",
       "optional": true,
@@ -77,11 +85,11 @@
     },
     "cum_seq_lens_q": {
       "shape": [
-        "total_q"
+        "batch_size_plus_1"
       ],
       "dtype": "int32",
       "optional": true,
-      "description": "Interface parity with trtllm-gen; not read by the kernel."
+      "description": "Interface parity with trtllm-gen (prefix sums, batch_size + 1 entries); not read by the kernel."
     },
     "sparse_mla_top_k_lens": {
       "shape": [
