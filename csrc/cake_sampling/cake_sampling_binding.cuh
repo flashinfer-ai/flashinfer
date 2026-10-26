@@ -197,11 +197,14 @@ struct Stage23Variant {
 // (coarse_sample = 1: the first pass reads 1/8 of the row) taken only by launch_flags bit 4 -- a
 // runtime rate switch cost the k > 64 launches 1-2 % -- and a speculative-sample twin
 // (spec_sample = 1: the first register chunk doubles as the sample) taken only by launch_flags
-// bit 6.  The three twins are exclusive.  The slab tail (slab_tail = 1: a fused launch's selected
-// pairs are pushed into rank 0's shared memory and the two-warp tail reads them there) is a
-// second build of each sample twin taken only by launch_flags bit 7 -- the inactive slab code
-// moved the k > 64 chains of a single build by 1-14 %, and the slab form itself loses on Hopper's
-// single-row cluster-8 cells, so every sample twin keeps a plain form.  The pushed coarse sums
+// bit 6.  The coarse-sample twin is exclusive with the other two; the speculative-sample twin
+// combines with the whole-CTA tail (bits 3 + 6) on the variants that ship that build
+// (fused_block_tail = 1 and spec_sample = 1: the cluster-1 ept-32 stream).  The slab tail
+// (slab_tail = 1: a fused launch's selected pairs are pushed into rank 0's shared memory and the
+// two-warp tail reads them there) is a second build of each sample twin taken only by
+// launch_flags bit 7 -- the inactive slab code moved the k > 64 chains of a single build by
+// 1-14 %, and the slab form itself loses on Hopper's single-row cluster-8 cells, so every sample
+// twin keeps a plain form.  The pushed coarse sums
 // (coarse_push = 1: each CTA stores its coarse histogram sums into every CTA's shared memory so
 // the two-level select reads them locally) are a second build of the default build of the
 // streaming variants with the two-level select, taken only by launch_flags bit 8 on a two-launch
@@ -348,8 +351,9 @@ inline void CheckSlab(const TensorView& vals, const TensorView& idx, const Tenso
 //   sample, keeps the chunk for the filter pass and scales the lower-bucket margin and the
 //   sampled-mass cap to the realised rate; the exact passes and the fallbacks are unchanged, so
 //   every output is bit-identical.  The host sets it for streams on a cluster of at least 4 CTAs
-//   or rows of at least 16 register chunks per CTA (round 7, lever SP); exclusive with bits 3 and
-//   4; the kernel itself never sees the bit.
+//   or rows of at least 16 register chunks per CTA (round 7, lever SP); exclusive with bit 4; with
+//   bit 3 it selects the speculative-sample whole-CTA-tail build where the variant ships one
+//   (manifest fused_block_tail and spec_sample); the kernel itself never sees the bit.
 //   launch_flags bit 7 (slab tail): with bit 0 and bit 4 or 6, selects the slab-tail form of a
 //   streaming variant's coarse- or speculative-sample build (manifest slab_tail): the selected
 //   pairs are pushed into rank 0's shared-memory slab (distributed shared memory stores) and the

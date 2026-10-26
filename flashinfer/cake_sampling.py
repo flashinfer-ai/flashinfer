@@ -402,7 +402,8 @@ def _stage1_has_fused_block_tail(cluster: int, ept: int, stream: bool) -> bool:
 # cluster-8 streams at k = 1000 win on both (B200 0.89-0.94, GB300 0.89-0.97), so ``_fuse_block_tail`` takes the twin
 # only for a cluster-8 stream with top_k_max > _BLOCK_TAIL_MIN_K on a one-wave grid.  Round 8 adds H100: under graph
 # replay the twin runs 0.93-0.97 of the chain at V = 151936 and 0.96-0.99 at V = 262144 (B = 1-8, k = 800 / 1000, bitwise
-# identical; eager 0.93-0.98).  R200 keeps the chain (no graph-replay A/B recorded for it).
+# identical; eager 0.93-0.98).  R200 keeps the cluster-8 chain (no graph-replay A/B recorded for it).  This policy covers
+# the cluster-8 streams (``_fuse_block_tail``); the cluster-1 cells are listed per capability in ``_C1_BLOCK_TAIL_CELLS``.
 _BLOCK_TAIL_CAPABILITIES: frozenset[tuple[int, int]] = frozenset(
     {(9, 0), (10, 0), (10, 3)}
 )
@@ -419,7 +420,10 @@ _BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY: dict[tuple[int, int], Optional[int]] = {
 
 
 # Cluster-1 cells whose spec-sample stream takes the whole-CTA tail (launch_flags bits 3 + 6) per capability: one CTA
-# per row, so every row's tail runs beside the others in a one-wave grid.
+# per row, so every row's tail runs beside the others in a one-wave grid and the stage-2/3 launch, its ramp and its
+# prologue leave the chain.  At V = 262144, batch 128, k = 1000 the one launch runs about 0.95-0.97 of the two-launch
+# chain of the same stage-1 text on B200 and GB300 and 0.98-0.99 on R200, eager and under graph replay, with the same
+# sampled tokens.
 _C1_BLOCK_TAIL_CELLS: dict[tuple[int, int], frozenset[tuple[int, int]]] = {
     (10, 0): frozenset({(262144, 128)}),
     (10, 3): frozenset({(262144, 128)}),

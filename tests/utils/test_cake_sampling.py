@@ -3990,10 +3990,12 @@ def test_local_select_build_matches_leader_push_build():
 
 
 def test_int_tail_build_matches_block_tail_build():
-    """Round 10, lever L3-T: the (8, 16) stream, the only whole-CTA-tail build that compute capability 10.3 dispatches, ships
-    its integer-tested form (`_bt_tia`, launch_flags bit 11 with bit 3): the tail's f64 target product, cut tests and sample tests run as the stage-2/3 integer
-    emulation.  Slab, count, samples and renorm are bitwise identical to the f64 tail; the host sets bit 11 on compute
-    capability 10.3 only, and the module rejects it without bit 3 or on a register-resident variant."""
+    """Round 10, lever L3-T: the (8, 16) stream, the only cluster-8 whole-CTA-tail build that compute capability 10.3
+    dispatches, ships its integer-tested form (`_bt_tia`, launch_flags bit 11 with bit 3): the tail's f64 target product,
+    cut tests and sample tests run as the stage-2/3 integer emulation.  The cluster-1 ept-32 speculative-sample
+    whole-CTA-tail build (bits 3 + 6) ships one too (`_bt_sp_tia`).  Slab, count, samples and renorm are bitwise
+    identical to the f64 tail; the host sets bit 11 on compute capability 10.3 only, and the module rejects it without
+    bit 3 or on a register-resident variant."""
     _require_supported_device()
     import flashinfer.cake_sampling as cs
 
@@ -4005,7 +4007,6 @@ def test_int_tail_build_matches_block_tail_build():
     assert all(
         not (
             v["coarse_sample"]
-            or v["spec_sample"]
             or v["slab_tail"]
             or v["coarse_push"]
             or v["leader_push"]
@@ -4013,42 +4014,62 @@ def test_int_tail_build_matches_block_tail_build():
         )
         for v in itail
     )
-    assert all(v["symbol"].endswith("s_bt_tia") for v in itail)
+    # the speculative-sample int tail is the cluster-1 ept-32 stream's only
+    assert all(
+        not v["spec_sample"] or (v["cluster"], v["ept"]) == (1, 32) for v in itail
+    )
+    assert all(
+        v["symbol"].endswith("s_bt_sp_tia" if v["spec_sample"] else "s_bt_tia")
+        for v in itail
+    )
     assert all(
         not v["symbol"].endswith("_tia")
         for v in _stage1_builds(man)
         if not v["int_tail"]
     )
-    block_streams = sorted(
-        {
-            (v["cluster"], v["ept"])
-            for v in _stage1_builds(man)
-            if v["stream"] and v["fused_block_tail"] and not v["int_tail"]
-        }
-    )
-    # 10.3 (the only int-tail capability) caps the whole-CTA tail at 196608 entries, and up to there the ranking puts the
-    # ept-16 stream first, so the (8, 32) `_bt` build is never dispatched with bit 11 and ships no `_bt_tia` form
-    itail_streams = sorted({(v["cluster"], v["ept"]) for v in itail})
+
+    def streams(rows):
+        return sorted({(v["cluster"], v["ept"]) for v in rows})
+
+    block = [
+        v
+        for v in _stage1_builds(man)
+        if v["stream"] and v["fused_block_tail"] and not v["int_tail"]
+    ]
+    block_streams = streams(v for v in block if not v["spec_sample"])
+    spec_block_streams = streams(v for v in block if v["spec_sample"])
+    # 10.3 (the only int-tail capability) caps the cluster-8 whole-CTA tail at 196608 entries, and up to there the
+    # ranking puts the ept-16 stream first, so the (8, 32) `_bt` build is never dispatched with bit 11 and ships no
+    # `_bt_tia` form
+    itail_streams = streams(v for v in itail if not v["spec_sample"])
+    spec_itail_streams = streams(v for v in itail if v["spec_sample"])
     assert block_streams == [(8, 16), (8, 32)] and itail_streams == [(8, 16)]
-    for c, e in block_streams:
-        assert cs._stage1_has_int_tail(c, e, True) == ((c, e) in itail_streams)
+    assert spec_block_streams == spec_itail_streams == [(1, 32)]
+    for c, e in block_streams + spec_block_streams:
+        assert cs._stage1_has_int_tail(c, e, True) == (
+            (c, e) in itail_streams + spec_itail_streams
+        )
     for v in _stage1_builds(man):
         if not v["stream"]:
             assert not cs._stage1_has_int_tail(v["cluster"], v["ept"], False)
     # policy: whole-CTA-tail launches on compute capability 10.3 only
     assert frozenset({(10, 3)}) == cs._INT_TAIL_CAPABILITIES
     assert cs._int_tail_flag(8, 32, True, cs._FLAG_FUSE_BLOCK_TAIL, (10, 3)) == 0
-    for c, e in itail_streams:
+    # (cluster, ept, extra launch_flags of the build): the speculative-sample build also carries bit 6
+    tail_builds = [(c, e, 0) for c, e in itail_streams] + [
+        (c, e, cs._FLAG_SPEC_SAMPLE) for c, e in spec_itail_streams
+    ]
+    for c, e, x in tail_builds:
         assert (
-            cs._int_tail_flag(c, e, True, cs._FLAG_FUSE_BLOCK_TAIL, (10, 3))
+            cs._int_tail_flag(c, e, True, cs._FLAG_FUSE_BLOCK_TAIL | x, (10, 3))
             == cs._FLAG_INT_TAIL
         )
         assert (
-            cs._int_tail_flag(c, e, True, cs._FLAG_FUSE_BLOCK_TAIL, None)
+            cs._int_tail_flag(c, e, True, cs._FLAG_FUSE_BLOCK_TAIL | x, None)
             == cs._FLAG_INT_TAIL
         )
         for cap in ((9, 0), (10, 0), (10, 7), (12, 0)):
-            assert cs._int_tail_flag(c, e, True, cs._FLAG_FUSE_BLOCK_TAIL, cap) == 0
+            assert cs._int_tail_flag(c, e, True, cs._FLAG_FUSE_BLOCK_TAIL | x, cap) == 0
         assert cs._int_tail_flag(c, e, True, cs._FLAG_FUSE_TAIL, (10, 3)) == 0
         assert cs._int_tail_flag(c, e, True, cs._FLAG_EARLY_TRIGGER, (10, 3)) == 0
     assert cs._int_tail_flag(8, 16, False, cs._FLAG_FUSE_BLOCK_TAIL, (10, 3)) == 0
@@ -4059,6 +4080,7 @@ def test_int_tail_build_matches_block_tail_build():
         (151936, 8, 800),
         (262144, 1, 1000),
         (128256, 4, 200),
+        (262144, 128, 1000),
     ):
         try:
             plan = cs._launch_plan(dev, batch, vocab, k)
@@ -4091,10 +4113,10 @@ def test_int_tail_build_matches_block_tail_build():
         pn[1, [3, 5000]] = np.inf
         pn[-1, : vocab // 2] = 0.0
         probs.copy_(torch.tensor(pn, device="cuda"))
-        for c, e in itail_streams:
+        for c, e, x in tail_builds:
             for k, p in ((1000, 0.9), (200, 1e-6), (kcap, 1.0), (65, 0.5)):
                 a = _radix_topk_outputs(
-                    module, probs, k, c, e, cs._FLAG_FUSE_BLOCK_TAIL, p=p
+                    module, probs, k, c, e, cs._FLAG_FUSE_BLOCK_TAIL | x, p=p
                 )
                 b = _radix_topk_outputs(
                     module,
@@ -4102,7 +4124,7 @@ def test_int_tail_build_matches_block_tail_build():
                     k,
                     c,
                     e,
-                    cs._FLAG_FUSE_BLOCK_TAIL | cs._FLAG_INT_TAIL,
+                    cs._FLAG_FUSE_BLOCK_TAIL | x | cs._FLAG_INT_TAIL,
                     p=p,
                 )
                 _assert_fused_outputs_bitwise(a, b, (vocab, c, e, k, p))
