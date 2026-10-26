@@ -232,6 +232,9 @@ class _PreparedFP8MQASelectiveLogits:
     _launches: dict[tuple[Any, ...], Any] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
+    _metadata_modes: set[str] = field(
+        default_factory=set, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         _validate_math_mode(self.math_mode)
@@ -1046,6 +1049,9 @@ def _launch_metadata(
         compiled = _compile_for_device(device, metadata_kernel, *args, stream)
         _METADATA_COMPILED[key] = compiled
     if not _compile_only:
+        if active_rows is not None:
+            # Keep this sticky: a previously captured refresh may replay later.
+            prepared._metadata_modes.add("active_rows")
         compiled(*args, stream)
 
 
@@ -1453,6 +1459,10 @@ def _fp8_mqa_selective_logits(
     ``flashinfer_api`` wrapper.
     """
     _require_cute()
+    if _h64_candidate and "active_rows" in prepared._metadata_modes:
+        raise ValueError(
+            "the H64 candidate variant does not support active_rows metadata"
+        )
     if not _clear_counts and mode != _SelectiveLogitsMode.RADIX_HISTOGRAM:
         raise ValueError("only radix histograms support caller-owned count reset")
     if _candidate_counts_precleared and mode != _SelectiveLogitsMode.CANDIDATE:
@@ -1506,6 +1516,7 @@ def _fp8_mqa_selective_logits(
         radix_shift,
         cached_required_words,
         sample_page_indices is not None,
+        _h64_candidate,
         prepared.math_mode
         if isinstance(prepared, _PreparedFP8MQASelectiveLogits)
         else None,

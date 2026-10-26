@@ -6077,6 +6077,7 @@ def test_sample_candidate_overflow_and_exact_modes(math_mode):
         0,
         1,
         False,
+        False,
         prepared.math_mode,
         _shared_engine_source_token(),
     )
@@ -6118,6 +6119,7 @@ def test_sample_candidate_overflow_and_exact_modes(math_mode):
         capacity,
         0,
         1,
+        False,
         False,
         prepared.math_mode,
         _shared_engine_source_token(),
@@ -6852,6 +6854,7 @@ def test_cached_launch_rebinds_prepared_metadata_storage(metadata_name):
         130,
         0,
         1,
+        False,
         False,
         prepared.math_mode,
         sl._shared_engine_source_token(),
@@ -8305,6 +8308,62 @@ def test_segmented_packed_topk(segments, top_k, capacity):
                 rtol=0,
             )
             assert (selected[row, n:] == -1).all()
+
+
+@_requires_selective_sm100
+def test_h64_candidate_variant_rejects_active_rows_after_cached_launch():
+    """Dynamic metadata cannot reuse the H64 variant's static row schedule."""
+    from flashinfer.attn_scores.selective_logits import (
+        _fp8_mqa_selective_logits,
+        _prepare_fp8_mqa_selective_logits,
+        _refresh_fp8_mqa_selective_logits,
+        _SelectiveLogitsMode,
+    )
+
+    inputs = _request_inputs((8,), (4096,), heads=64)
+    q, _, _, weights, qo, kv = inputs
+    fused, table = _paged_inputs(inputs)
+    starts = torch.zeros(8, dtype=torch.int32, device=q.device)
+    ends = torch.full_like(starts, 4096)
+    prepared = _prepare_fp8_mqa_selective_logits(
+        q,
+        fused,
+        weights,
+        qo,
+        kv,
+        table,
+        row_starts=starts,
+        row_ends=ends,
+        num_heads=64,
+        query_tile=4,
+        num_umma_stages=1,
+        num_sms=2,
+    )
+    values = torch.empty((8, 8192), dtype=torch.int64, device=q.device)
+    counts = torch.empty((8, 5), dtype=torch.int32, device=q.device)
+    thresholds = torch.full((8,), float("-inf"), device=q.device)
+    kwargs = dict(
+        mode=_SelectiveLogitsMode.CANDIDATE,
+        capacity=8192,
+        values=values,
+        index_counts=counts,
+        policy_values=thresholds,
+        _h64_candidate=True,
+    )
+    _fp8_mqa_selective_logits(q, fused, weights, table, prepared, **kwargs)
+    torch.cuda.synchronize()
+    assert bool((counts[:, 1:].sum(1) == 4096).all())
+    active = torch.tensor([3], dtype=torch.int32, device=q.device)
+    _refresh_fp8_mqa_selective_logits(
+        prepared,
+        qo,
+        kv,
+        row_starts=starts,
+        row_ends=ends,
+        active_rows=active,
+    )
+    with pytest.raises(ValueError, match="does not support active_rows metadata"):
+        _fp8_mqa_selective_logits(q, fused, weights, table, prepared, **kwargs)
 
 
 @_requires_selective_sm100
