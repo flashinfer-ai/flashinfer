@@ -826,7 +826,16 @@ match what the code uses today; values are strings unless noted.
 | `FLASHINFER_JIT_CACHE_PROVIDER_ARCH` | required | `flashinfer-jit-cache-provider/package_config.py` | Select exactly one architecture, such as `9.0a` or `sm120f`, when building a binary provider wheel. |
 
 Release/nightly JIT-cache provider builds run sccache in server-side mode and
-wrap the complete wheel build with a no-output watchdog. After 90 minutes with
+wrap the complete wheel build with a no-output watchdog. They build in the
+container's torch-pinned interpreter rather than a PEP 517 isolated environment
+(`scripts/build_jit_cache_wheel.py`): an isolated environment's random path
+reaches every compile command through the tvm_ffi include directory and changes
+the sccache key of each translation unit that includes tvm_ffi on every run.
+Before compiling, the same script gives every installed header one fixed mtime:
+GCC's `#pragma once` skips a header whose size, contents and mtime match an
+already included file, and torch ships byte-identical `#pragma once` headers
+(the `ATen/ops/*_native.h` stubs), so otherwise the preprocessed output of each
+torch-including translation unit depends on pip's install timing. After 90 minutes with
 no build output, the watchdog captures system, process, compiler, and sccache
 state; terminates the wrapped build process group (TERM, then KILL after a
 two-minute grace period); and exits with status 124. Compiler discovery scans
