@@ -1269,7 +1269,7 @@ class UlyssesCommunicator:
         # gather is a CUDA completion fence on its own.
         try:
             with torch.cuda.device(self.device):
-                self._fa = init_ulysses_a2a(
+                self._fa = _init_ulysses_a2a_configured(
                     out_ptrs,
                     sig_ptrs,
                     self.rank,
@@ -2750,6 +2750,58 @@ def get_ulysses_a2a_module():
     )
 
 
+def _init_ulysses_a2a_configured(
+    out_ipc_ptrs: List[int],
+    signal_ipc_ptrs: List[int],
+    rank: int,
+    world_size: int,
+    full_nvlink: bool,
+    *,
+    signal_slots: int,
+    max_blocks: Optional[int],
+) -> int:
+    """Internal geometry-aware initializer used by the communicator."""
+    if world_size not in SUPPORTED_WORLD_SIZES:
+        raise ValueError(
+            f"ulysses a2a only supports world size in {SUPPORTED_WORLD_SIZES}, got {world_size}"
+        )
+    if not full_nvlink:
+        raise ValueError(
+            "full_nvlink=False is not supported: the fused kernel pushes over "
+            "all-pairs NVLink P2P and has no non-P2P path. Use "
+            "UlyssesCommunicator(backend='auto') for topology-aware NCCL "
+            "fallback instead."
+        )
+    if signal_slots not in (1, _ULYSSES_SIGNAL_SLOTS):
+        raise ValueError("signal_slots must be 1 or 4")
+    if signal_slots == 1 and max_blocks is not None:
+        raise ValueError("max_blocks requires signal_slots=4")
+    module = get_ulysses_a2a_module()
+    if signal_slots == 1:
+        fa = module.init_ulysses_a2a(
+            out_ipc_ptrs, signal_ipc_ptrs, rank, world_size, full_nvlink
+        )
+    else:
+        fa = module.init_ulysses_a2a_with_signal_slots(
+            out_ipc_ptrs,
+            signal_ipc_ptrs,
+            rank,
+            world_size,
+            full_nvlink,
+            signal_slots,
+            36 if max_blocks is None else max_blocks,
+        )
+    # The signal memset is asynchronous. Complete it before the caller's
+    # group-wide barrier, and release ownership if synchronization fails.
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        with contextlib.suppress(Exception):
+            module.dispose_ulysses_a2a(fa)
+        raise
+    return fa
+
+
 @flashinfer_api
 def init_ulysses_a2a(
     out_ipc_ptrs: List[int],
@@ -2757,9 +2809,6 @@ def init_ulysses_a2a(
     rank: int,
     world_size: int,
     full_nvlink: bool,
-    *,
-    signal_slots: int = 1,
-    max_blocks: Optional[int] = None,
 ) -> int:
     r"""Initialize the fused-transpose Ulysses NVLink-P2P all-to-all backend.
 
@@ -2796,17 +2845,6 @@ def init_ulysses_a2a(
     full_nvlink : bool
         ``True`` when every pair of ranks is connected via NVLink. The push
         kernel requires all-pairs P2P access; callers must gate on this.
-    signal_slots : int, default = 1
-        Number of vLLM-size signal slots allocated per rank. One preserves
-        the raw API's original 36-CTA path; four enables the faster portable
-        kernel and requires four times ``vllm_meta_size()`` bytes per rank.
-    max_blocks : Optional[int], default = None
-        Group-wide CTA cap for the four-slot path. All ranks must pass the
-        same value, no greater than their local occupancy capacity. The
-        default 36-CTA cap preserves the raw API's conservative behavior;
-        :class:`UlyssesCommunicator` exchanges capacities and uses their
-        minimum to enable a faster, rank-uniform launch.
-
     Returns
     -------
     int
@@ -2823,46 +2861,15 @@ def init_ulysses_a2a(
     before the first all-to-all call — the barrier alone is not a CUDA
     completion fence, and the device sync alone is not group-wide.
     """
-    if world_size not in SUPPORTED_WORLD_SIZES:
-        raise ValueError(
-            f"ulysses a2a only supports world size in {SUPPORTED_WORLD_SIZES}, got {world_size}"
-        )
-    if not full_nvlink:
-        raise ValueError(
-            "full_nvlink=False is not supported: the fused kernel pushes over "
-            "all-pairs NVLink P2P and has no non-P2P path. Use "
-            "UlyssesCommunicator(backend='auto') for topology-aware NCCL "
-            "fallback instead."
-        )
-    if signal_slots not in (1, _ULYSSES_SIGNAL_SLOTS):
-        raise ValueError("signal_slots must be 1 or 4")
-    if signal_slots == 1 and max_blocks is not None:
-        raise ValueError("max_blocks requires signal_slots=4")
-    module = get_ulysses_a2a_module()
-    if signal_slots == 1:
-        fa = module.init_ulysses_a2a(
-            out_ipc_ptrs, signal_ipc_ptrs, rank, world_size, full_nvlink
-        )
-    else:
-        fa = module.init_ulysses_a2a_with_signal_slots(
-            out_ipc_ptrs,
-            signal_ipc_ptrs,
-            rank,
-            world_size,
-            full_nvlink,
-            signal_slots,
-            36 if max_blocks is None else max_blocks,
-        )
-    # make the signal zeroing a real completion fence on this device
-    try:
-        torch.cuda.synchronize()
-    except Exception:
-        # the caller never receives fa on this path and could not dispose it:
-        # ownership stays here, so release the handle before re-raising
-        with contextlib.suppress(Exception):  # surface the sync error, not this
-            module.dispose_ulysses_a2a(fa)
-        raise
-    return fa
+    return _init_ulysses_a2a_configured(
+        out_ipc_ptrs,
+        signal_ipc_ptrs,
+        rank,
+        world_size,
+        full_nvlink,
+        signal_slots=1,
+        max_blocks=None,
+    )
 
 
 @flashinfer_api
