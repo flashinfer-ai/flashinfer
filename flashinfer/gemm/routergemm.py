@@ -928,7 +928,8 @@ def _use_tinygemm2_sm100(device: torch.device) -> bool:
 # on sm_100a; PACKED_NARROW_U4 unrolls its MMA loop by four, faster on sm_107a;
 # PACKED_NARROW_FULL_STAGES also issues a full stage's MMAs without a per-step K
 # test, faster on sm_103a.  PACKED_M64_N16 and PACKED_M64_N4 put sixteen output
-# features in each chain's block of an M=64 MMA, on 16 or 4 batch rows.
+# features in each chain's block of an M=64 MMA, on 16 or 4 batch rows (faster on
+# sm_107a).
 _TINYGEMM2_TCGEN05_TILES = {
     "PACKED_NARROW": (8, 2),
     "PACKED_NARROW_U4": (8, 2),
@@ -990,7 +991,9 @@ class _Tcgen05Window(NamedTuple):
 # one) PACKED serves while its grid fits one wave; past that ACCUMULATORS (64 rows
 # per CTA) does.  On sm_107a PACKED serves only 8 rows without a bias and 9 to 16
 # rows with one, from 3584 output features at inputs of 2112 to 6144, and with a
-# bias 28 to 32 rows start at 2048 output features.
+# bias 28 to 32 rows start at 2048 output features.  The M=64 tiles serve sm_107a
+# alone, at 2048 to 3072 output features: PACKED_M64_N4 4 rows, PACKED_M64_N16 9 to
+# 16 rows, ahead of PACKED and ACCUMULATORS where they measured faster.
 _LARGE_WEIGHT = 6_000_000
 _MANY_ROWS_NOBIAS = (
     _Tcgen05Window(
@@ -1088,6 +1091,15 @@ _SM107 = (
     _Tcgen05Window("PACKED_NARROW_U4", 1, 4, False, 64, 512, 6144, 20480),
     _Tcgen05Window("PACKED_NARROW_U4", 3, 8, False, 64, 128, 5120, 20480),
     _Tcgen05Window("PACKED_NARROW_U4", 1, 6, False, 64, 512, 7168, 20480),
+    _Tcgen05Window("PACKED_NARROW_U4", 4, 8, False, 64, 320, 4096, 8192),
+    _Tcgen05Window("PACKED_M64_N4", 4, 4, True, 2048, 3072, 2880, 8192),
+    _Tcgen05Window("PACKED_M64_N4", 4, 4, False, 2048, 3072, 2880, 10240),
+    _Tcgen05Window("PACKED_M64_N16", 16, 16, True, 2048, 3072, 2880, 10240),
+    _Tcgen05Window("PACKED_M64_N16", 11, 16, True, 2048, 3072, 6144, 10240),
+    _Tcgen05Window("PACKED_M64_N16", 9, 16, True, 2048, 3072, 8192, 10240),
+    _Tcgen05Window("PACKED_M64_N16", 16, 16, False, 2048, 3072, 2048, 10240),
+    _Tcgen05Window("PACKED_M64_N16", 11, 16, False, 2048, 3072, 6144, 10240),
+    _Tcgen05Window("PACKED_M64_N16", 9, 16, False, 2048, 3072, 8192, 10240),
     _Tcgen05Window("PACKED", 8, 8, False, 3584, 4096, 2112, 6144),
     _Tcgen05Window("PACKED", 9, 16, True, 3584, 4096, 2112, 6144),
     *_MANY_ROWS_NOBIAS,
