@@ -509,6 +509,7 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
             // corr_done: 2 barriers, init_count=128
             mbarrier_init(smem + 144, 128);
             mbarrier_init(smem + 152, 128);
+            // --- pipeline 'order_p01' ---
             // order_p01_0: 1 barriers, init_count=128
             mbarrier_init(smem + 160, 128);
             // order_p01_1: 1 barriers, init_count=128
@@ -578,7 +579,8 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
             int scale_off = make_warp_uniform(stage * (unsigned int)BLOCK_M);
             unsigned int total_tiles = NUM_M_BLOCKS * total_bh;
             unsigned int max_rounds = total_tiles + 1;
-            int order_p01_phase = ((stage == 0) ? 1 : 0);
+            int order_p01_start = ((stage == 0) ? -1 : 0);
+            int order_p01_seen = order_p01_start;
             unsigned int _phase_work_id_full_0 = 0;
             unsigned int _phase_s_full = 0;
             unsigned int _phase_corr_done = 0;
@@ -622,6 +624,8 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                         num_n_blocks = (max_n + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N;
                     }
                 }
+                unsigned int _max_0 = ((num_n_blocks) > (1) ? (num_n_blocks) : (1));
+                num_n_blocks = _max_0;
                 int causal_row;
                 unsigned int num_masked_iters;
                 {
@@ -668,374 +672,374 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                         : "r"(s_base + 96));
                     int tail_valid = seqlen_kv_bh - n_block * BLOCK_N;
                     if (tail_valid < BLOCK_N) {
-                        uint32_t _thresh_mask_0;
+                        uint32_t _thresh_mask_1;
                         {
-                            int _lim_1 = tail_valid;
-                            if (_lim_1 <= 0) { _thresh_mask_0 = 0u; }
-                            else if (_lim_1 >= 32) { _thresh_mask_0 = 0xFFFFFFFFu; }
+                            int _lim_2 = tail_valid;
+                            if (_lim_2 <= 0) { _thresh_mask_1 = 0u; }
+                            else if (_lim_2 >= 32) { _thresh_mask_1 = 0xFFFFFFFFu; }
                             else {
                                 asm volatile("{"
                                     ".reg .u32 t;\n\t"
                                     "shl.b32 t, 1, %1;\n\t"
                                     "add.u32 %0, t, -1;\n\t"
-                                    "}" : "=r"(_thresh_mask_0) : "r"(_lim_1));
+                                    "}" : "=r"(_thresh_mask_1) : "r"(_lim_2));
                             }
                         }
-                        if (!(_thresh_mask_0 & (1u << 0))) _tmem_load_0[0] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 1))) _tmem_load_0[1] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 2))) _tmem_load_0[2] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 3))) _tmem_load_0[3] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 4))) _tmem_load_0[4] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 5))) _tmem_load_0[5] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 6))) _tmem_load_0[6] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 7))) _tmem_load_0[7] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 8))) _tmem_load_0[8] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 9))) _tmem_load_0[9] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 10))) _tmem_load_0[10] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 11))) _tmem_load_0[11] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 12))) _tmem_load_0[12] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 13))) _tmem_load_0[13] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 14))) _tmem_load_0[14] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 15))) _tmem_load_0[15] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 16))) _tmem_load_0[16] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 17))) _tmem_load_0[17] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 18))) _tmem_load_0[18] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 19))) _tmem_load_0[19] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 20))) _tmem_load_0[20] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 21))) _tmem_load_0[21] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 22))) _tmem_load_0[22] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 23))) _tmem_load_0[23] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 24))) _tmem_load_0[24] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 25))) _tmem_load_0[25] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 26))) _tmem_load_0[26] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 27))) _tmem_load_0[27] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 28))) _tmem_load_0[28] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 29))) _tmem_load_0[29] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 30))) _tmem_load_0[30] = -CUDART_INF_F;
-                        if (!(_thresh_mask_0 & (1u << 31))) _tmem_load_0[31] = -CUDART_INF_F;
-                        uint32_t _thresh_mask_2;
+                        if (!(_thresh_mask_1 & (1u << 0))) _tmem_load_0[0] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 1))) _tmem_load_0[1] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 2))) _tmem_load_0[2] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 3))) _tmem_load_0[3] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 4))) _tmem_load_0[4] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 5))) _tmem_load_0[5] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 6))) _tmem_load_0[6] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 7))) _tmem_load_0[7] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 8))) _tmem_load_0[8] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 9))) _tmem_load_0[9] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 10))) _tmem_load_0[10] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 11))) _tmem_load_0[11] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 12))) _tmem_load_0[12] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 13))) _tmem_load_0[13] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 14))) _tmem_load_0[14] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 15))) _tmem_load_0[15] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 16))) _tmem_load_0[16] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 17))) _tmem_load_0[17] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 18))) _tmem_load_0[18] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 19))) _tmem_load_0[19] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 20))) _tmem_load_0[20] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 21))) _tmem_load_0[21] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 22))) _tmem_load_0[22] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 23))) _tmem_load_0[23] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 24))) _tmem_load_0[24] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 25))) _tmem_load_0[25] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 26))) _tmem_load_0[26] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 27))) _tmem_load_0[27] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 28))) _tmem_load_0[28] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 29))) _tmem_load_0[29] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 30))) _tmem_load_0[30] = -CUDART_INF_F;
+                        if (!(_thresh_mask_1 & (1u << 31))) _tmem_load_0[31] = -CUDART_INF_F;
+                        uint32_t _thresh_mask_3;
                         {
-                            int _lim_3 = tail_valid - 32;
-                            if (_lim_3 <= 0) { _thresh_mask_2 = 0u; }
-                            else if (_lim_3 >= 32) { _thresh_mask_2 = 0xFFFFFFFFu; }
+                            int _lim_4 = tail_valid - 32;
+                            if (_lim_4 <= 0) { _thresh_mask_3 = 0u; }
+                            else if (_lim_4 >= 32) { _thresh_mask_3 = 0xFFFFFFFFu; }
                             else {
                                 asm volatile("{"
                                     ".reg .u32 t;\n\t"
                                     "shl.b32 t, 1, %1;\n\t"
                                     "add.u32 %0, t, -1;\n\t"
-                                    "}" : "=r"(_thresh_mask_2) : "r"(_lim_3));
+                                    "}" : "=r"(_thresh_mask_3) : "r"(_lim_4));
                             }
                         }
-                        if (!(_thresh_mask_2 & (1u << 0))) _tmem_load_0[32] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 1))) _tmem_load_0[33] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 2))) _tmem_load_0[34] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 3))) _tmem_load_0[35] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 4))) _tmem_load_0[36] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 5))) _tmem_load_0[37] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 6))) _tmem_load_0[38] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 7))) _tmem_load_0[39] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 8))) _tmem_load_0[40] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 9))) _tmem_load_0[41] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 10))) _tmem_load_0[42] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 11))) _tmem_load_0[43] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 12))) _tmem_load_0[44] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 13))) _tmem_load_0[45] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 14))) _tmem_load_0[46] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 15))) _tmem_load_0[47] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 16))) _tmem_load_0[48] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 17))) _tmem_load_0[49] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 18))) _tmem_load_0[50] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 19))) _tmem_load_0[51] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 20))) _tmem_load_0[52] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 21))) _tmem_load_0[53] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 22))) _tmem_load_0[54] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 23))) _tmem_load_0[55] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 24))) _tmem_load_0[56] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 25))) _tmem_load_0[57] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 26))) _tmem_load_0[58] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 27))) _tmem_load_0[59] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 28))) _tmem_load_0[60] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 29))) _tmem_load_0[61] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 30))) _tmem_load_0[62] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 31))) _tmem_load_0[63] = -CUDART_INF_F;
-                        uint32_t _thresh_mask_4;
+                        if (!(_thresh_mask_3 & (1u << 0))) _tmem_load_0[32] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 1))) _tmem_load_0[33] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 2))) _tmem_load_0[34] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 3))) _tmem_load_0[35] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 4))) _tmem_load_0[36] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 5))) _tmem_load_0[37] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 6))) _tmem_load_0[38] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 7))) _tmem_load_0[39] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 8))) _tmem_load_0[40] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 9))) _tmem_load_0[41] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 10))) _tmem_load_0[42] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 11))) _tmem_load_0[43] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 12))) _tmem_load_0[44] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 13))) _tmem_load_0[45] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 14))) _tmem_load_0[46] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 15))) _tmem_load_0[47] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 16))) _tmem_load_0[48] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 17))) _tmem_load_0[49] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 18))) _tmem_load_0[50] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 19))) _tmem_load_0[51] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 20))) _tmem_load_0[52] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 21))) _tmem_load_0[53] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 22))) _tmem_load_0[54] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 23))) _tmem_load_0[55] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 24))) _tmem_load_0[56] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 25))) _tmem_load_0[57] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 26))) _tmem_load_0[58] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 27))) _tmem_load_0[59] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 28))) _tmem_load_0[60] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 29))) _tmem_load_0[61] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 30))) _tmem_load_0[62] = -CUDART_INF_F;
+                        if (!(_thresh_mask_3 & (1u << 31))) _tmem_load_0[63] = -CUDART_INF_F;
+                        uint32_t _thresh_mask_5;
                         {
-                            int _lim_5 = tail_valid - 64;
-                            if (_lim_5 <= 0) { _thresh_mask_4 = 0u; }
-                            else if (_lim_5 >= 32) { _thresh_mask_4 = 0xFFFFFFFFu; }
+                            int _lim_6 = tail_valid - 64;
+                            if (_lim_6 <= 0) { _thresh_mask_5 = 0u; }
+                            else if (_lim_6 >= 32) { _thresh_mask_5 = 0xFFFFFFFFu; }
                             else {
                                 asm volatile("{"
                                     ".reg .u32 t;\n\t"
                                     "shl.b32 t, 1, %1;\n\t"
                                     "add.u32 %0, t, -1;\n\t"
-                                    "}" : "=r"(_thresh_mask_4) : "r"(_lim_5));
+                                    "}" : "=r"(_thresh_mask_5) : "r"(_lim_6));
                             }
                         }
-                        if (!(_thresh_mask_4 & (1u << 0))) _tmem_load_0[64] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 1))) _tmem_load_0[65] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 2))) _tmem_load_0[66] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 3))) _tmem_load_0[67] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 4))) _tmem_load_0[68] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 5))) _tmem_load_0[69] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 6))) _tmem_load_0[70] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 7))) _tmem_load_0[71] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 8))) _tmem_load_0[72] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 9))) _tmem_load_0[73] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 10))) _tmem_load_0[74] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 11))) _tmem_load_0[75] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 12))) _tmem_load_0[76] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 13))) _tmem_load_0[77] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 14))) _tmem_load_0[78] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 15))) _tmem_load_0[79] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 16))) _tmem_load_0[80] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 17))) _tmem_load_0[81] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 18))) _tmem_load_0[82] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 19))) _tmem_load_0[83] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 20))) _tmem_load_0[84] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 21))) _tmem_load_0[85] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 22))) _tmem_load_0[86] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 23))) _tmem_load_0[87] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 24))) _tmem_load_0[88] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 25))) _tmem_load_0[89] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 26))) _tmem_load_0[90] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 27))) _tmem_load_0[91] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 28))) _tmem_load_0[92] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 29))) _tmem_load_0[93] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 30))) _tmem_load_0[94] = -CUDART_INF_F;
-                        if (!(_thresh_mask_4 & (1u << 31))) _tmem_load_0[95] = -CUDART_INF_F;
-                        uint32_t _thresh_mask_6;
+                        if (!(_thresh_mask_5 & (1u << 0))) _tmem_load_0[64] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 1))) _tmem_load_0[65] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 2))) _tmem_load_0[66] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 3))) _tmem_load_0[67] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 4))) _tmem_load_0[68] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 5))) _tmem_load_0[69] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 6))) _tmem_load_0[70] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 7))) _tmem_load_0[71] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 8))) _tmem_load_0[72] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 9))) _tmem_load_0[73] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 10))) _tmem_load_0[74] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 11))) _tmem_load_0[75] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 12))) _tmem_load_0[76] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 13))) _tmem_load_0[77] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 14))) _tmem_load_0[78] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 15))) _tmem_load_0[79] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 16))) _tmem_load_0[80] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 17))) _tmem_load_0[81] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 18))) _tmem_load_0[82] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 19))) _tmem_load_0[83] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 20))) _tmem_load_0[84] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 21))) _tmem_load_0[85] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 22))) _tmem_load_0[86] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 23))) _tmem_load_0[87] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 24))) _tmem_load_0[88] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 25))) _tmem_load_0[89] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 26))) _tmem_load_0[90] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 27))) _tmem_load_0[91] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 28))) _tmem_load_0[92] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 29))) _tmem_load_0[93] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 30))) _tmem_load_0[94] = -CUDART_INF_F;
+                        if (!(_thresh_mask_5 & (1u << 31))) _tmem_load_0[95] = -CUDART_INF_F;
+                        uint32_t _thresh_mask_7;
                         {
-                            int _lim_7 = tail_valid - 96;
-                            if (_lim_7 <= 0) { _thresh_mask_6 = 0u; }
-                            else if (_lim_7 >= 32) { _thresh_mask_6 = 0xFFFFFFFFu; }
+                            int _lim_8 = tail_valid - 96;
+                            if (_lim_8 <= 0) { _thresh_mask_7 = 0u; }
+                            else if (_lim_8 >= 32) { _thresh_mask_7 = 0xFFFFFFFFu; }
                             else {
                                 asm volatile("{"
                                     ".reg .u32 t;\n\t"
                                     "shl.b32 t, 1, %1;\n\t"
                                     "add.u32 %0, t, -1;\n\t"
-                                    "}" : "=r"(_thresh_mask_6) : "r"(_lim_7));
+                                    "}" : "=r"(_thresh_mask_7) : "r"(_lim_8));
                             }
                         }
-                        if (!(_thresh_mask_6 & (1u << 0))) _tmem_load_0[96] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 1))) _tmem_load_0[97] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 2))) _tmem_load_0[98] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 3))) _tmem_load_0[99] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 4))) _tmem_load_0[100] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 5))) _tmem_load_0[101] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 6))) _tmem_load_0[102] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 7))) _tmem_load_0[103] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 8))) _tmem_load_0[104] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 9))) _tmem_load_0[105] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 10))) _tmem_load_0[106] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 11))) _tmem_load_0[107] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 12))) _tmem_load_0[108] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 13))) _tmem_load_0[109] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 14))) _tmem_load_0[110] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 15))) _tmem_load_0[111] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 16))) _tmem_load_0[112] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 17))) _tmem_load_0[113] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 18))) _tmem_load_0[114] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 19))) _tmem_load_0[115] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 20))) _tmem_load_0[116] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 21))) _tmem_load_0[117] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 22))) _tmem_load_0[118] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 23))) _tmem_load_0[119] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 24))) _tmem_load_0[120] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 25))) _tmem_load_0[121] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 26))) _tmem_load_0[122] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 27))) _tmem_load_0[123] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 28))) _tmem_load_0[124] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 29))) _tmem_load_0[125] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 30))) _tmem_load_0[126] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 31))) _tmem_load_0[127] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 0))) _tmem_load_0[96] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 1))) _tmem_load_0[97] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 2))) _tmem_load_0[98] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 3))) _tmem_load_0[99] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 4))) _tmem_load_0[100] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 5))) _tmem_load_0[101] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 6))) _tmem_load_0[102] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 7))) _tmem_load_0[103] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 8))) _tmem_load_0[104] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 9))) _tmem_load_0[105] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 10))) _tmem_load_0[106] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 11))) _tmem_load_0[107] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 12))) _tmem_load_0[108] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 13))) _tmem_load_0[109] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 14))) _tmem_load_0[110] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 15))) _tmem_load_0[111] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 16))) _tmem_load_0[112] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 17))) _tmem_load_0[113] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 18))) _tmem_load_0[114] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 19))) _tmem_load_0[115] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 20))) _tmem_load_0[116] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 21))) _tmem_load_0[117] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 22))) _tmem_load_0[118] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 23))) _tmem_load_0[119] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 24))) _tmem_load_0[120] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 25))) _tmem_load_0[121] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 26))) _tmem_load_0[122] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 27))) _tmem_load_0[123] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 28))) _tmem_load_0[124] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 29))) _tmem_load_0[125] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 30))) _tmem_load_0[126] = -CUDART_INF_F;
+                        if (!(_thresh_mask_7 & (1u << 31))) _tmem_load_0[127] = -CUDART_INF_F;
                     }
                     int valid_count = causal_row - n_block * BLOCK_N + 1;
-                    uint32_t _thresh_mask_8;
+                    uint32_t _thresh_mask_9;
                     {
-                        int _lim_9 = valid_count;
-                        if (_lim_9 <= 0) { _thresh_mask_8 = 0u; }
-                        else if (_lim_9 >= 32) { _thresh_mask_8 = 0xFFFFFFFFu; }
+                        int _lim_10 = valid_count;
+                        if (_lim_10 <= 0) { _thresh_mask_9 = 0u; }
+                        else if (_lim_10 >= 32) { _thresh_mask_9 = 0xFFFFFFFFu; }
                         else {
                             asm volatile("{"
                                 ".reg .u32 t;\n\t"
                                 "shl.b32 t, 1, %1;\n\t"
                                 "add.u32 %0, t, -1;\n\t"
-                                "}" : "=r"(_thresh_mask_8) : "r"(_lim_9));
+                                "}" : "=r"(_thresh_mask_9) : "r"(_lim_10));
                         }
                     }
-                    if (!(_thresh_mask_8 & (1u << 0))) _tmem_load_0[0] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 1))) _tmem_load_0[1] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 2))) _tmem_load_0[2] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 3))) _tmem_load_0[3] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 4))) _tmem_load_0[4] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 5))) _tmem_load_0[5] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 6))) _tmem_load_0[6] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 7))) _tmem_load_0[7] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 8))) _tmem_load_0[8] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 9))) _tmem_load_0[9] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 10))) _tmem_load_0[10] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 11))) _tmem_load_0[11] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 12))) _tmem_load_0[12] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 13))) _tmem_load_0[13] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 14))) _tmem_load_0[14] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 15))) _tmem_load_0[15] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 16))) _tmem_load_0[16] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 17))) _tmem_load_0[17] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 18))) _tmem_load_0[18] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 19))) _tmem_load_0[19] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 20))) _tmem_load_0[20] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 21))) _tmem_load_0[21] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 22))) _tmem_load_0[22] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 23))) _tmem_load_0[23] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 24))) _tmem_load_0[24] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 25))) _tmem_load_0[25] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 26))) _tmem_load_0[26] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 27))) _tmem_load_0[27] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 28))) _tmem_load_0[28] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 29))) _tmem_load_0[29] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 30))) _tmem_load_0[30] = -CUDART_INF_F;
-                    if (!(_thresh_mask_8 & (1u << 31))) _tmem_load_0[31] = -CUDART_INF_F;
-                    uint32_t _thresh_mask_10;
+                    if (!(_thresh_mask_9 & (1u << 0))) _tmem_load_0[0] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 1))) _tmem_load_0[1] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 2))) _tmem_load_0[2] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 3))) _tmem_load_0[3] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 4))) _tmem_load_0[4] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 5))) _tmem_load_0[5] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 6))) _tmem_load_0[6] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 7))) _tmem_load_0[7] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 8))) _tmem_load_0[8] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 9))) _tmem_load_0[9] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 10))) _tmem_load_0[10] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 11))) _tmem_load_0[11] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 12))) _tmem_load_0[12] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 13))) _tmem_load_0[13] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 14))) _tmem_load_0[14] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 15))) _tmem_load_0[15] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 16))) _tmem_load_0[16] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 17))) _tmem_load_0[17] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 18))) _tmem_load_0[18] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 19))) _tmem_load_0[19] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 20))) _tmem_load_0[20] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 21))) _tmem_load_0[21] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 22))) _tmem_load_0[22] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 23))) _tmem_load_0[23] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 24))) _tmem_load_0[24] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 25))) _tmem_load_0[25] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 26))) _tmem_load_0[26] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 27))) _tmem_load_0[27] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 28))) _tmem_load_0[28] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 29))) _tmem_load_0[29] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 30))) _tmem_load_0[30] = -CUDART_INF_F;
+                    if (!(_thresh_mask_9 & (1u << 31))) _tmem_load_0[31] = -CUDART_INF_F;
+                    uint32_t _thresh_mask_11;
                     {
-                        int _lim_11 = valid_count - 32;
-                        if (_lim_11 <= 0) { _thresh_mask_10 = 0u; }
-                        else if (_lim_11 >= 32) { _thresh_mask_10 = 0xFFFFFFFFu; }
+                        int _lim_12 = valid_count - 32;
+                        if (_lim_12 <= 0) { _thresh_mask_11 = 0u; }
+                        else if (_lim_12 >= 32) { _thresh_mask_11 = 0xFFFFFFFFu; }
                         else {
                             asm volatile("{"
                                 ".reg .u32 t;\n\t"
                                 "shl.b32 t, 1, %1;\n\t"
                                 "add.u32 %0, t, -1;\n\t"
-                                "}" : "=r"(_thresh_mask_10) : "r"(_lim_11));
+                                "}" : "=r"(_thresh_mask_11) : "r"(_lim_12));
                         }
                     }
-                    if (!(_thresh_mask_10 & (1u << 0))) _tmem_load_0[32] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 1))) _tmem_load_0[33] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 2))) _tmem_load_0[34] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 3))) _tmem_load_0[35] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 4))) _tmem_load_0[36] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 5))) _tmem_load_0[37] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 6))) _tmem_load_0[38] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 7))) _tmem_load_0[39] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 8))) _tmem_load_0[40] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 9))) _tmem_load_0[41] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 10))) _tmem_load_0[42] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 11))) _tmem_load_0[43] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 12))) _tmem_load_0[44] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 13))) _tmem_load_0[45] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 14))) _tmem_load_0[46] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 15))) _tmem_load_0[47] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 16))) _tmem_load_0[48] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 17))) _tmem_load_0[49] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 18))) _tmem_load_0[50] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 19))) _tmem_load_0[51] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 20))) _tmem_load_0[52] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 21))) _tmem_load_0[53] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 22))) _tmem_load_0[54] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 23))) _tmem_load_0[55] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 24))) _tmem_load_0[56] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 25))) _tmem_load_0[57] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 26))) _tmem_load_0[58] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 27))) _tmem_load_0[59] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 28))) _tmem_load_0[60] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 29))) _tmem_load_0[61] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 30))) _tmem_load_0[62] = -CUDART_INF_F;
-                    if (!(_thresh_mask_10 & (1u << 31))) _tmem_load_0[63] = -CUDART_INF_F;
-                    uint32_t _thresh_mask_12;
+                    if (!(_thresh_mask_11 & (1u << 0))) _tmem_load_0[32] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 1))) _tmem_load_0[33] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 2))) _tmem_load_0[34] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 3))) _tmem_load_0[35] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 4))) _tmem_load_0[36] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 5))) _tmem_load_0[37] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 6))) _tmem_load_0[38] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 7))) _tmem_load_0[39] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 8))) _tmem_load_0[40] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 9))) _tmem_load_0[41] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 10))) _tmem_load_0[42] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 11))) _tmem_load_0[43] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 12))) _tmem_load_0[44] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 13))) _tmem_load_0[45] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 14))) _tmem_load_0[46] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 15))) _tmem_load_0[47] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 16))) _tmem_load_0[48] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 17))) _tmem_load_0[49] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 18))) _tmem_load_0[50] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 19))) _tmem_load_0[51] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 20))) _tmem_load_0[52] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 21))) _tmem_load_0[53] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 22))) _tmem_load_0[54] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 23))) _tmem_load_0[55] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 24))) _tmem_load_0[56] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 25))) _tmem_load_0[57] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 26))) _tmem_load_0[58] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 27))) _tmem_load_0[59] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 28))) _tmem_load_0[60] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 29))) _tmem_load_0[61] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 30))) _tmem_load_0[62] = -CUDART_INF_F;
+                    if (!(_thresh_mask_11 & (1u << 31))) _tmem_load_0[63] = -CUDART_INF_F;
+                    uint32_t _thresh_mask_13;
                     {
-                        int _lim_13 = valid_count - 64;
-                        if (_lim_13 <= 0) { _thresh_mask_12 = 0u; }
-                        else if (_lim_13 >= 32) { _thresh_mask_12 = 0xFFFFFFFFu; }
+                        int _lim_14 = valid_count - 64;
+                        if (_lim_14 <= 0) { _thresh_mask_13 = 0u; }
+                        else if (_lim_14 >= 32) { _thresh_mask_13 = 0xFFFFFFFFu; }
                         else {
                             asm volatile("{"
                                 ".reg .u32 t;\n\t"
                                 "shl.b32 t, 1, %1;\n\t"
                                 "add.u32 %0, t, -1;\n\t"
-                                "}" : "=r"(_thresh_mask_12) : "r"(_lim_13));
+                                "}" : "=r"(_thresh_mask_13) : "r"(_lim_14));
                         }
                     }
-                    if (!(_thresh_mask_12 & (1u << 0))) _tmem_load_0[64] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 1))) _tmem_load_0[65] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 2))) _tmem_load_0[66] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 3))) _tmem_load_0[67] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 4))) _tmem_load_0[68] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 5))) _tmem_load_0[69] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 6))) _tmem_load_0[70] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 7))) _tmem_load_0[71] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 8))) _tmem_load_0[72] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 9))) _tmem_load_0[73] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 10))) _tmem_load_0[74] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 11))) _tmem_load_0[75] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 12))) _tmem_load_0[76] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 13))) _tmem_load_0[77] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 14))) _tmem_load_0[78] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 15))) _tmem_load_0[79] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 16))) _tmem_load_0[80] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 17))) _tmem_load_0[81] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 18))) _tmem_load_0[82] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 19))) _tmem_load_0[83] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 20))) _tmem_load_0[84] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 21))) _tmem_load_0[85] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 22))) _tmem_load_0[86] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 23))) _tmem_load_0[87] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 24))) _tmem_load_0[88] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 25))) _tmem_load_0[89] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 26))) _tmem_load_0[90] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 27))) _tmem_load_0[91] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 28))) _tmem_load_0[92] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 29))) _tmem_load_0[93] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 30))) _tmem_load_0[94] = -CUDART_INF_F;
-                    if (!(_thresh_mask_12 & (1u << 31))) _tmem_load_0[95] = -CUDART_INF_F;
-                    uint32_t _thresh_mask_14;
+                    if (!(_thresh_mask_13 & (1u << 0))) _tmem_load_0[64] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 1))) _tmem_load_0[65] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 2))) _tmem_load_0[66] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 3))) _tmem_load_0[67] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 4))) _tmem_load_0[68] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 5))) _tmem_load_0[69] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 6))) _tmem_load_0[70] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 7))) _tmem_load_0[71] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 8))) _tmem_load_0[72] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 9))) _tmem_load_0[73] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 10))) _tmem_load_0[74] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 11))) _tmem_load_0[75] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 12))) _tmem_load_0[76] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 13))) _tmem_load_0[77] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 14))) _tmem_load_0[78] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 15))) _tmem_load_0[79] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 16))) _tmem_load_0[80] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 17))) _tmem_load_0[81] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 18))) _tmem_load_0[82] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 19))) _tmem_load_0[83] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 20))) _tmem_load_0[84] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 21))) _tmem_load_0[85] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 22))) _tmem_load_0[86] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 23))) _tmem_load_0[87] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 24))) _tmem_load_0[88] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 25))) _tmem_load_0[89] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 26))) _tmem_load_0[90] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 27))) _tmem_load_0[91] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 28))) _tmem_load_0[92] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 29))) _tmem_load_0[93] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 30))) _tmem_load_0[94] = -CUDART_INF_F;
+                    if (!(_thresh_mask_13 & (1u << 31))) _tmem_load_0[95] = -CUDART_INF_F;
+                    uint32_t _thresh_mask_15;
                     {
-                        int _lim_15 = valid_count - 96;
-                        if (_lim_15 <= 0) { _thresh_mask_14 = 0u; }
-                        else if (_lim_15 >= 32) { _thresh_mask_14 = 0xFFFFFFFFu; }
+                        int _lim_16 = valid_count - 96;
+                        if (_lim_16 <= 0) { _thresh_mask_15 = 0u; }
+                        else if (_lim_16 >= 32) { _thresh_mask_15 = 0xFFFFFFFFu; }
                         else {
                             asm volatile("{"
                                 ".reg .u32 t;\n\t"
                                 "shl.b32 t, 1, %1;\n\t"
                                 "add.u32 %0, t, -1;\n\t"
-                                "}" : "=r"(_thresh_mask_14) : "r"(_lim_15));
+                                "}" : "=r"(_thresh_mask_15) : "r"(_lim_16));
                         }
                     }
-                    if (!(_thresh_mask_14 & (1u << 0))) _tmem_load_0[96] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 1))) _tmem_load_0[97] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 2))) _tmem_load_0[98] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 3))) _tmem_load_0[99] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 4))) _tmem_load_0[100] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 5))) _tmem_load_0[101] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 6))) _tmem_load_0[102] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 7))) _tmem_load_0[103] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 8))) _tmem_load_0[104] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 9))) _tmem_load_0[105] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 10))) _tmem_load_0[106] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 11))) _tmem_load_0[107] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 12))) _tmem_load_0[108] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 13))) _tmem_load_0[109] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 14))) _tmem_load_0[110] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 15))) _tmem_load_0[111] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 16))) _tmem_load_0[112] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 17))) _tmem_load_0[113] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 18))) _tmem_load_0[114] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 19))) _tmem_load_0[115] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 20))) _tmem_load_0[116] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 21))) _tmem_load_0[117] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 22))) _tmem_load_0[118] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 23))) _tmem_load_0[119] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 24))) _tmem_load_0[120] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 25))) _tmem_load_0[121] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 26))) _tmem_load_0[122] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 27))) _tmem_load_0[123] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 28))) _tmem_load_0[124] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 29))) _tmem_load_0[125] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 30))) _tmem_load_0[126] = -CUDART_INF_F;
-                    if (!(_thresh_mask_14 & (1u << 31))) _tmem_load_0[127] = -CUDART_INF_F;
-                    float2 _reg_reduce_max2_16 = {-CAKE_INF, -CAKE_INF};
-                    row_max_x32_accum(&_tmem_load_0[0], _reg_reduce_max2_16);
-                    row_max_x32_accum(&_tmem_load_0[32], _reg_reduce_max2_16);
-                    row_max_x32_accum(&_tmem_load_0[64], _reg_reduce_max2_16);
-                    row_max_x32_accum(&_tmem_load_0[96], _reg_reduce_max2_16);
-                    float new_max = row_max_reduce(_reg_reduce_max2_16);
+                    if (!(_thresh_mask_15 & (1u << 0))) _tmem_load_0[96] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 1))) _tmem_load_0[97] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 2))) _tmem_load_0[98] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 3))) _tmem_load_0[99] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 4))) _tmem_load_0[100] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 5))) _tmem_load_0[101] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 6))) _tmem_load_0[102] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 7))) _tmem_load_0[103] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 8))) _tmem_load_0[104] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 9))) _tmem_load_0[105] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 10))) _tmem_load_0[106] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 11))) _tmem_load_0[107] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 12))) _tmem_load_0[108] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 13))) _tmem_load_0[109] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 14))) _tmem_load_0[110] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 15))) _tmem_load_0[111] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 16))) _tmem_load_0[112] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 17))) _tmem_load_0[113] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 18))) _tmem_load_0[114] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 19))) _tmem_load_0[115] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 20))) _tmem_load_0[116] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 21))) _tmem_load_0[117] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 22))) _tmem_load_0[118] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 23))) _tmem_load_0[119] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 24))) _tmem_load_0[120] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 25))) _tmem_load_0[121] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 26))) _tmem_load_0[122] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 27))) _tmem_load_0[123] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 28))) _tmem_load_0[124] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 29))) _tmem_load_0[125] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 30))) _tmem_load_0[126] = -CUDART_INF_F;
+                    if (!(_thresh_mask_15 & (1u << 31))) _tmem_load_0[127] = -CUDART_INF_F;
+                    float2 _reg_reduce_max2_17 = {-CAKE_INF, -CAKE_INF};
+                    row_max_x32_accum(&_tmem_load_0[0], _reg_reduce_max2_17);
+                    row_max_x32_accum(&_tmem_load_0[32], _reg_reduce_max2_17);
+                    row_max_x32_accum(&_tmem_load_0[64], _reg_reduce_max2_17);
+                    row_max_x32_accum(&_tmem_load_0[96], _reg_reduce_max2_17);
+                    float new_max = row_max_reduce(_reg_reduce_max2_17);
                     new_max = max_noftz(new_max, row_max_val);
                     float new_max_scaled = ((new_max == -CUDART_INF_F) ? 0.0f : new_max) * softmax_scale_log2;
                     float acc_scale;
@@ -1048,8 +1052,8 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                     } else {
                         selected_max = new_max;
                         if (row_max_val > -CUDART_INF_F) {
-                            float _exp2_17 = approx_exp2(_fma_0);
-                            acc_scale = _exp2_17;
+                            float _exp2_18 = approx_exp2(_fma_0);
+                            acc_scale = _exp2_18;
                         } else {
                             acc_scale = 1.0f;
                         }
@@ -1058,17 +1062,19 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                     sScale[warp % 4 * 32 + lane + scale_off] = acc_scale;
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(corr_sig_addr + (stage) * 8);
-                    const float2 _fma_b2_18 = {softmax_scale_log2, softmax_scale_log2};
-                    const float2 _fma_c2_19 = {-new_max_scaled, -new_max_scaled};
+                    const float2 _fma_b2_19 = {softmax_scale_log2, softmax_scale_log2};
+                    const float2 _fma_c2_20 = {-new_max_scaled, -new_max_scaled};
                     #pragma unroll
                     for (int _lf = 0; _lf < 64; _lf++)
-                        fma_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_0)[_lf], _fma_b2_18, _fma_c2_19);
+                        fma_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_0)[_lf], _fma_b2_19, _fma_c2_20);
                     int p_base = taddr + (unsigned int)tmem_p_off + (unsigned int)(warp % 4 * 32 << 16);
                     if (stage == 0) {
-                        mbarrier_wait_plain(order_p01_0_addr, order_p01_phase);
+                        int _parity_order_p01_0 = (int)((unsigned int)order_p01_seen % 2);
+                        mbarrier_wait_plain(order_p01_0_addr, _parity_order_p01_0);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                     } else {
-                        mbarrier_wait_plain(order_p01_1_addr, order_p01_phase);
+                        int _parity_order_p01_1 = (int)((unsigned int)order_p01_seen % 2);
+                        mbarrier_wait_plain(order_p01_1_addr, _parity_order_p01_1);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                     }
                     unsigned int _tmem_load_0_bf16[16];
@@ -1101,7 +1107,7 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                     } else {
                         mbarrier_arrive(order_p01_0_addr);
                     }
-                    order_p01_phase ^= 1;
+                    order_p01_seen += 1;
                     unsigned int _tmem_load_0_bf16_2[16];
                     #pragma unroll
                     for (int _lp = 0; _lp < 16; _lp++) {
@@ -1117,34 +1123,34 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                     mbarrier_arrive(p_full_2_addr + (stage) * 8);
                     mbarrier_wait(corr_done_addr + (stage) * 8, _phase_corr_done);
                     _phase_corr_done ^= 1;
-                    float2 _reg_reduce_sum2_21 = make_float2(0.0f, 0.0f);
-                    softmax_block_sum(&_tmem_load_0[(96) + 0], &_reg_reduce_sum2_21);
-                    float _reg_array_reduce_20 = _reg_reduce_sum2_21.x + _reg_reduce_sum2_21.y;
-                    float2 _reg_reduce_sum2_23 = make_float2(0.0f, 0.0f);
-                    softmax_block_sum(&_tmem_load_0[(64) + 0], &_reg_reduce_sum2_23);
-                    float _reg_array_reduce_22 = _reg_reduce_sum2_23.x + _reg_reduce_sum2_23.y;
-                    float2 _reg_reduce_sum2_25 = make_float2(0.0f, 0.0f);
-                    softmax_block_sum(&_tmem_load_0[(32) + 0], &_reg_reduce_sum2_25);
-                    float _reg_array_reduce_24 = _reg_reduce_sum2_25.x + _reg_reduce_sum2_25.y;
-                    float2 _reg_reduce_sum2_27 = make_float2(0.0f, 0.0f);
-                    _reg_reduce_sum2_27 = add_f32x2(_reg_reduce_sum2_27, make_float2(_tmem_load_0[0], _tmem_load_0[1]));
-                    _reg_reduce_sum2_27 = add_f32x2(_reg_reduce_sum2_27, make_float2(_tmem_load_0[2], _tmem_load_0[3]));
-                    _reg_reduce_sum2_27 = add_f32x2(_reg_reduce_sum2_27, make_float2(_tmem_load_0[4], _tmem_load_0[5]));
-                    _reg_reduce_sum2_27 = add_f32x2(_reg_reduce_sum2_27, make_float2(_tmem_load_0[6], _tmem_load_0[7]));
-                    _reg_reduce_sum2_27 = add_f32x2(_reg_reduce_sum2_27, make_float2(_tmem_load_0[8], _tmem_load_0[9]));
-                    _reg_reduce_sum2_27 = add_f32x2(_reg_reduce_sum2_27, make_float2(_tmem_load_0[10], _tmem_load_0[11]));
-                    _reg_reduce_sum2_27 = add_f32x2(_reg_reduce_sum2_27, make_float2(_tmem_load_0[12], _tmem_load_0[13]));
-                    _reg_reduce_sum2_27 = add_f32x2(_reg_reduce_sum2_27, make_float2(_tmem_load_0[14], _tmem_load_0[15]));
-                    _reg_reduce_sum2_27 = add_f32x2(_reg_reduce_sum2_27, make_float2(_tmem_load_0[16], _tmem_load_0[17]));
-                    _reg_reduce_sum2_27 = add_f32x2(_reg_reduce_sum2_27, make_float2(_tmem_load_0[18], _tmem_load_0[19]));
-                    _reg_reduce_sum2_27 = add_f32x2(_reg_reduce_sum2_27, make_float2(_tmem_load_0[20], _tmem_load_0[21]));
-                    _reg_reduce_sum2_27 = add_f32x2(_reg_reduce_sum2_27, make_float2(_tmem_load_0[22], _tmem_load_0[23]));
-                    _reg_reduce_sum2_27 = add_f32x2(_reg_reduce_sum2_27, make_float2(_tmem_load_0[24], _tmem_load_0[25]));
-                    _reg_reduce_sum2_27 = add_f32x2(_reg_reduce_sum2_27, make_float2(_tmem_load_0[26], _tmem_load_0[27]));
-                    _reg_reduce_sum2_27 = add_f32x2(_reg_reduce_sum2_27, make_float2(_tmem_load_0[28], _tmem_load_0[29]));
-                    _reg_reduce_sum2_27 = add_f32x2(_reg_reduce_sum2_27, make_float2(_tmem_load_0[30], _tmem_load_0[31]));
-                    float _reg_array_reduce_26 = _reg_reduce_sum2_27.x + _reg_reduce_sum2_27.y;
-                    row_sum_val = __fmaf_rn(row_sum_val, acc_scale, _reg_array_reduce_20 + _reg_array_reduce_22 + _reg_array_reduce_24 + _reg_array_reduce_26);
+                    float2 _reg_reduce_sum2_22 = make_float2(0.0f, 0.0f);
+                    softmax_block_sum(&_tmem_load_0[(96) + 0], &_reg_reduce_sum2_22);
+                    float _reg_array_reduce_21 = _reg_reduce_sum2_22.x + _reg_reduce_sum2_22.y;
+                    float2 _reg_reduce_sum2_24 = make_float2(0.0f, 0.0f);
+                    softmax_block_sum(&_tmem_load_0[(64) + 0], &_reg_reduce_sum2_24);
+                    float _reg_array_reduce_23 = _reg_reduce_sum2_24.x + _reg_reduce_sum2_24.y;
+                    float2 _reg_reduce_sum2_26 = make_float2(0.0f, 0.0f);
+                    softmax_block_sum(&_tmem_load_0[(32) + 0], &_reg_reduce_sum2_26);
+                    float _reg_array_reduce_25 = _reg_reduce_sum2_26.x + _reg_reduce_sum2_26.y;
+                    float2 _reg_reduce_sum2_28 = make_float2(0.0f, 0.0f);
+                    _reg_reduce_sum2_28 = add_f32x2(_reg_reduce_sum2_28, make_float2(_tmem_load_0[0], _tmem_load_0[1]));
+                    _reg_reduce_sum2_28 = add_f32x2(_reg_reduce_sum2_28, make_float2(_tmem_load_0[2], _tmem_load_0[3]));
+                    _reg_reduce_sum2_28 = add_f32x2(_reg_reduce_sum2_28, make_float2(_tmem_load_0[4], _tmem_load_0[5]));
+                    _reg_reduce_sum2_28 = add_f32x2(_reg_reduce_sum2_28, make_float2(_tmem_load_0[6], _tmem_load_0[7]));
+                    _reg_reduce_sum2_28 = add_f32x2(_reg_reduce_sum2_28, make_float2(_tmem_load_0[8], _tmem_load_0[9]));
+                    _reg_reduce_sum2_28 = add_f32x2(_reg_reduce_sum2_28, make_float2(_tmem_load_0[10], _tmem_load_0[11]));
+                    _reg_reduce_sum2_28 = add_f32x2(_reg_reduce_sum2_28, make_float2(_tmem_load_0[12], _tmem_load_0[13]));
+                    _reg_reduce_sum2_28 = add_f32x2(_reg_reduce_sum2_28, make_float2(_tmem_load_0[14], _tmem_load_0[15]));
+                    _reg_reduce_sum2_28 = add_f32x2(_reg_reduce_sum2_28, make_float2(_tmem_load_0[16], _tmem_load_0[17]));
+                    _reg_reduce_sum2_28 = add_f32x2(_reg_reduce_sum2_28, make_float2(_tmem_load_0[18], _tmem_load_0[19]));
+                    _reg_reduce_sum2_28 = add_f32x2(_reg_reduce_sum2_28, make_float2(_tmem_load_0[20], _tmem_load_0[21]));
+                    _reg_reduce_sum2_28 = add_f32x2(_reg_reduce_sum2_28, make_float2(_tmem_load_0[22], _tmem_load_0[23]));
+                    _reg_reduce_sum2_28 = add_f32x2(_reg_reduce_sum2_28, make_float2(_tmem_load_0[24], _tmem_load_0[25]));
+                    _reg_reduce_sum2_28 = add_f32x2(_reg_reduce_sum2_28, make_float2(_tmem_load_0[26], _tmem_load_0[27]));
+                    _reg_reduce_sum2_28 = add_f32x2(_reg_reduce_sum2_28, make_float2(_tmem_load_0[28], _tmem_load_0[29]));
+                    _reg_reduce_sum2_28 = add_f32x2(_reg_reduce_sum2_28, make_float2(_tmem_load_0[30], _tmem_load_0[31]));
+                    float _reg_array_reduce_27 = _reg_reduce_sum2_28.x + _reg_reduce_sum2_28.y;
+                    row_sum_val = __fmaf_rn(row_sum_val, acc_scale, _reg_array_reduce_21 + _reg_array_reduce_23 + _reg_array_reduce_25 + _reg_array_reduce_27);
                 }
                 #pragma unroll 1
                 for (unsigned int n_iter_1 = unmasked_loop_start; n_iter_1 < num_n_blocks; n_iter_1++) {
@@ -1209,343 +1215,343 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
 #endif
                     int tail_valid_1 = seqlen_kv_bh - n_block_1 * BLOCK_N;
                     if (tail_valid_1 < BLOCK_N) {
-                        uint32_t _thresh_mask_28;
+                        uint32_t _thresh_mask_29;
                         {
-                            int _lim_29 = tail_valid_1;
-                            if (_lim_29 <= 0) { _thresh_mask_28 = 0u; }
-                            else if (_lim_29 >= 32) { _thresh_mask_28 = 0xFFFFFFFFu; }
+                            int _lim_30 = tail_valid_1;
+                            if (_lim_30 <= 0) { _thresh_mask_29 = 0u; }
+                            else if (_lim_30 >= 32) { _thresh_mask_29 = 0xFFFFFFFFu; }
                             else {
                                 asm volatile("{"
                                     ".reg .u32 t;\n\t"
                                     "shl.b32 t, 1, %1;\n\t"
                                     "add.u32 %0, t, -1;\n\t"
-                                    "}" : "=r"(_thresh_mask_28) : "r"(_lim_29));
+                                    "}" : "=r"(_thresh_mask_29) : "r"(_lim_30));
                             }
                         }
 #if __CUDA_ARCH__ == 1030
-                        if (!(_thresh_mask_28 & (1u << 0))) sv[0] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 1))) sv[1] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 2))) sv[2] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 3))) sv[3] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 4))) sv[4] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 5))) sv[5] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 6))) sv[6] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 7))) sv[7] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 8))) sv[8] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 9))) sv[9] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 10))) sv[10] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 11))) sv[11] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 12))) sv[12] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 13))) sv[13] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 14))) sv[14] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 15))) sv[15] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 16))) sv[16] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 17))) sv[17] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 18))) sv[18] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 19))) sv[19] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 20))) sv[20] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 21))) sv[21] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 22))) sv[22] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 23))) sv[23] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 24))) sv[24] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 25))) sv[25] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 26))) sv[26] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 27))) sv[27] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 28))) sv[28] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 29))) sv[29] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 30))) sv[30] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 31))) sv[31] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 0))) sv[0] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 1))) sv[1] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 2))) sv[2] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 3))) sv[3] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 4))) sv[4] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 5))) sv[5] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 6))) sv[6] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 7))) sv[7] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 8))) sv[8] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 9))) sv[9] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 10))) sv[10] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 11))) sv[11] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 12))) sv[12] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 13))) sv[13] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 14))) sv[14] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 15))) sv[15] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 16))) sv[16] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 17))) sv[17] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 18))) sv[18] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 19))) sv[19] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 20))) sv[20] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 21))) sv[21] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 22))) sv[22] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 23))) sv[23] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 24))) sv[24] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 25))) sv[25] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 26))) sv[26] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 27))) sv[27] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 28))) sv[28] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 29))) sv[29] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 30))) sv[30] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 31))) sv[31] = -CUDART_INF_F;
 #else
-                        if (!(_thresh_mask_28 & (1u << 0))) _tmem_load_1[0] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 1))) _tmem_load_1[1] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 2))) _tmem_load_1[2] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 3))) _tmem_load_1[3] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 4))) _tmem_load_1[4] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 5))) _tmem_load_1[5] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 6))) _tmem_load_1[6] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 7))) _tmem_load_1[7] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 8))) _tmem_load_1[8] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 9))) _tmem_load_1[9] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 10))) _tmem_load_1[10] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 11))) _tmem_load_1[11] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 12))) _tmem_load_1[12] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 13))) _tmem_load_1[13] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 14))) _tmem_load_1[14] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 15))) _tmem_load_1[15] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 16))) _tmem_load_1[16] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 17))) _tmem_load_1[17] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 18))) _tmem_load_1[18] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 19))) _tmem_load_1[19] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 20))) _tmem_load_1[20] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 21))) _tmem_load_1[21] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 22))) _tmem_load_1[22] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 23))) _tmem_load_1[23] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 24))) _tmem_load_1[24] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 25))) _tmem_load_1[25] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 26))) _tmem_load_1[26] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 27))) _tmem_load_1[27] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 28))) _tmem_load_1[28] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 29))) _tmem_load_1[29] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 30))) _tmem_load_1[30] = -CUDART_INF_F;
-                        if (!(_thresh_mask_28 & (1u << 31))) _tmem_load_1[31] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 0))) _tmem_load_1[0] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 1))) _tmem_load_1[1] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 2))) _tmem_load_1[2] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 3))) _tmem_load_1[3] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 4))) _tmem_load_1[4] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 5))) _tmem_load_1[5] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 6))) _tmem_load_1[6] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 7))) _tmem_load_1[7] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 8))) _tmem_load_1[8] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 9))) _tmem_load_1[9] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 10))) _tmem_load_1[10] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 11))) _tmem_load_1[11] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 12))) _tmem_load_1[12] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 13))) _tmem_load_1[13] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 14))) _tmem_load_1[14] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 15))) _tmem_load_1[15] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 16))) _tmem_load_1[16] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 17))) _tmem_load_1[17] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 18))) _tmem_load_1[18] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 19))) _tmem_load_1[19] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 20))) _tmem_load_1[20] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 21))) _tmem_load_1[21] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 22))) _tmem_load_1[22] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 23))) _tmem_load_1[23] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 24))) _tmem_load_1[24] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 25))) _tmem_load_1[25] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 26))) _tmem_load_1[26] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 27))) _tmem_load_1[27] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 28))) _tmem_load_1[28] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 29))) _tmem_load_1[29] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 30))) _tmem_load_1[30] = -CUDART_INF_F;
+                        if (!(_thresh_mask_29 & (1u << 31))) _tmem_load_1[31] = -CUDART_INF_F;
 #endif
-                        uint32_t _thresh_mask_30;
+                        uint32_t _thresh_mask_31;
                         {
-                            int _lim_31 = tail_valid_1 - 32;
-                            if (_lim_31 <= 0) { _thresh_mask_30 = 0u; }
-                            else if (_lim_31 >= 32) { _thresh_mask_30 = 0xFFFFFFFFu; }
+                            int _lim_32 = tail_valid_1 - 32;
+                            if (_lim_32 <= 0) { _thresh_mask_31 = 0u; }
+                            else if (_lim_32 >= 32) { _thresh_mask_31 = 0xFFFFFFFFu; }
                             else {
                                 asm volatile("{"
                                     ".reg .u32 t;\n\t"
                                     "shl.b32 t, 1, %1;\n\t"
                                     "add.u32 %0, t, -1;\n\t"
-                                    "}" : "=r"(_thresh_mask_30) : "r"(_lim_31));
+                                    "}" : "=r"(_thresh_mask_31) : "r"(_lim_32));
                             }
                         }
 #if __CUDA_ARCH__ == 1030
-                        if (!(_thresh_mask_30 & (1u << 0))) sv[32] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 1))) sv[33] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 2))) sv[34] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 3))) sv[35] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 4))) sv[36] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 5))) sv[37] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 6))) sv[38] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 7))) sv[39] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 8))) sv[40] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 9))) sv[41] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 10))) sv[42] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 11))) sv[43] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 12))) sv[44] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 13))) sv[45] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 14))) sv[46] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 15))) sv[47] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 16))) sv[48] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 17))) sv[49] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 18))) sv[50] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 19))) sv[51] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 20))) sv[52] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 21))) sv[53] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 22))) sv[54] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 23))) sv[55] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 24))) sv[56] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 25))) sv[57] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 26))) sv[58] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 27))) sv[59] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 28))) sv[60] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 29))) sv[61] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 30))) sv[62] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 31))) sv[63] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 0))) sv[32] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 1))) sv[33] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 2))) sv[34] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 3))) sv[35] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 4))) sv[36] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 5))) sv[37] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 6))) sv[38] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 7))) sv[39] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 8))) sv[40] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 9))) sv[41] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 10))) sv[42] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 11))) sv[43] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 12))) sv[44] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 13))) sv[45] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 14))) sv[46] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 15))) sv[47] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 16))) sv[48] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 17))) sv[49] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 18))) sv[50] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 19))) sv[51] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 20))) sv[52] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 21))) sv[53] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 22))) sv[54] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 23))) sv[55] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 24))) sv[56] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 25))) sv[57] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 26))) sv[58] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 27))) sv[59] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 28))) sv[60] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 29))) sv[61] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 30))) sv[62] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 31))) sv[63] = -CUDART_INF_F;
 #else
-                        if (!(_thresh_mask_30 & (1u << 0))) _tmem_load_1[32] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 1))) _tmem_load_1[33] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 2))) _tmem_load_1[34] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 3))) _tmem_load_1[35] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 4))) _tmem_load_1[36] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 5))) _tmem_load_1[37] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 6))) _tmem_load_1[38] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 7))) _tmem_load_1[39] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 8))) _tmem_load_1[40] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 9))) _tmem_load_1[41] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 10))) _tmem_load_1[42] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 11))) _tmem_load_1[43] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 12))) _tmem_load_1[44] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 13))) _tmem_load_1[45] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 14))) _tmem_load_1[46] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 15))) _tmem_load_1[47] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 16))) _tmem_load_1[48] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 17))) _tmem_load_1[49] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 18))) _tmem_load_1[50] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 19))) _tmem_load_1[51] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 20))) _tmem_load_1[52] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 21))) _tmem_load_1[53] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 22))) _tmem_load_1[54] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 23))) _tmem_load_1[55] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 24))) _tmem_load_1[56] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 25))) _tmem_load_1[57] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 26))) _tmem_load_1[58] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 27))) _tmem_load_1[59] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 28))) _tmem_load_1[60] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 29))) _tmem_load_1[61] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 30))) _tmem_load_1[62] = -CUDART_INF_F;
-                        if (!(_thresh_mask_30 & (1u << 31))) _tmem_load_1[63] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 0))) _tmem_load_1[32] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 1))) _tmem_load_1[33] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 2))) _tmem_load_1[34] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 3))) _tmem_load_1[35] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 4))) _tmem_load_1[36] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 5))) _tmem_load_1[37] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 6))) _tmem_load_1[38] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 7))) _tmem_load_1[39] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 8))) _tmem_load_1[40] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 9))) _tmem_load_1[41] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 10))) _tmem_load_1[42] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 11))) _tmem_load_1[43] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 12))) _tmem_load_1[44] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 13))) _tmem_load_1[45] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 14))) _tmem_load_1[46] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 15))) _tmem_load_1[47] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 16))) _tmem_load_1[48] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 17))) _tmem_load_1[49] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 18))) _tmem_load_1[50] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 19))) _tmem_load_1[51] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 20))) _tmem_load_1[52] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 21))) _tmem_load_1[53] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 22))) _tmem_load_1[54] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 23))) _tmem_load_1[55] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 24))) _tmem_load_1[56] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 25))) _tmem_load_1[57] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 26))) _tmem_load_1[58] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 27))) _tmem_load_1[59] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 28))) _tmem_load_1[60] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 29))) _tmem_load_1[61] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 30))) _tmem_load_1[62] = -CUDART_INF_F;
+                        if (!(_thresh_mask_31 & (1u << 31))) _tmem_load_1[63] = -CUDART_INF_F;
 #endif
-                        uint32_t _thresh_mask_32;
+                        uint32_t _thresh_mask_33;
                         {
-                            int _lim_33 = tail_valid_1 - 64;
-                            if (_lim_33 <= 0) { _thresh_mask_32 = 0u; }
-                            else if (_lim_33 >= 32) { _thresh_mask_32 = 0xFFFFFFFFu; }
+                            int _lim_34 = tail_valid_1 - 64;
+                            if (_lim_34 <= 0) { _thresh_mask_33 = 0u; }
+                            else if (_lim_34 >= 32) { _thresh_mask_33 = 0xFFFFFFFFu; }
                             else {
                                 asm volatile("{"
                                     ".reg .u32 t;\n\t"
                                     "shl.b32 t, 1, %1;\n\t"
                                     "add.u32 %0, t, -1;\n\t"
-                                    "}" : "=r"(_thresh_mask_32) : "r"(_lim_33));
+                                    "}" : "=r"(_thresh_mask_33) : "r"(_lim_34));
                             }
                         }
 #if __CUDA_ARCH__ == 1030
-                        if (!(_thresh_mask_32 & (1u << 0))) sv[64] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 1))) sv[65] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 2))) sv[66] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 3))) sv[67] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 4))) sv[68] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 5))) sv[69] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 6))) sv[70] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 7))) sv[71] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 8))) sv[72] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 9))) sv[73] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 10))) sv[74] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 11))) sv[75] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 12))) sv[76] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 13))) sv[77] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 14))) sv[78] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 15))) sv[79] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 16))) sv[80] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 17))) sv[81] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 18))) sv[82] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 19))) sv[83] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 20))) sv[84] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 21))) sv[85] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 22))) sv[86] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 23))) sv[87] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 24))) sv[88] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 25))) sv[89] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 26))) sv[90] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 27))) sv[91] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 28))) sv[92] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 29))) sv[93] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 30))) sv[94] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 31))) sv[95] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 0))) sv[64] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 1))) sv[65] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 2))) sv[66] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 3))) sv[67] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 4))) sv[68] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 5))) sv[69] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 6))) sv[70] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 7))) sv[71] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 8))) sv[72] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 9))) sv[73] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 10))) sv[74] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 11))) sv[75] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 12))) sv[76] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 13))) sv[77] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 14))) sv[78] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 15))) sv[79] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 16))) sv[80] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 17))) sv[81] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 18))) sv[82] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 19))) sv[83] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 20))) sv[84] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 21))) sv[85] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 22))) sv[86] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 23))) sv[87] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 24))) sv[88] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 25))) sv[89] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 26))) sv[90] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 27))) sv[91] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 28))) sv[92] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 29))) sv[93] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 30))) sv[94] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 31))) sv[95] = -CUDART_INF_F;
 #else
-                        if (!(_thresh_mask_32 & (1u << 0))) _tmem_load_1[64] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 1))) _tmem_load_1[65] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 2))) _tmem_load_1[66] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 3))) _tmem_load_1[67] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 4))) _tmem_load_1[68] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 5))) _tmem_load_1[69] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 6))) _tmem_load_1[70] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 7))) _tmem_load_1[71] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 8))) _tmem_load_1[72] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 9))) _tmem_load_1[73] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 10))) _tmem_load_1[74] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 11))) _tmem_load_1[75] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 12))) _tmem_load_1[76] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 13))) _tmem_load_1[77] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 14))) _tmem_load_1[78] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 15))) _tmem_load_1[79] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 16))) _tmem_load_1[80] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 17))) _tmem_load_1[81] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 18))) _tmem_load_1[82] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 19))) _tmem_load_1[83] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 20))) _tmem_load_1[84] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 21))) _tmem_load_1[85] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 22))) _tmem_load_1[86] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 23))) _tmem_load_1[87] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 24))) _tmem_load_1[88] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 25))) _tmem_load_1[89] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 26))) _tmem_load_1[90] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 27))) _tmem_load_1[91] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 28))) _tmem_load_1[92] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 29))) _tmem_load_1[93] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 30))) _tmem_load_1[94] = -CUDART_INF_F;
-                        if (!(_thresh_mask_32 & (1u << 31))) _tmem_load_1[95] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 0))) _tmem_load_1[64] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 1))) _tmem_load_1[65] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 2))) _tmem_load_1[66] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 3))) _tmem_load_1[67] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 4))) _tmem_load_1[68] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 5))) _tmem_load_1[69] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 6))) _tmem_load_1[70] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 7))) _tmem_load_1[71] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 8))) _tmem_load_1[72] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 9))) _tmem_load_1[73] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 10))) _tmem_load_1[74] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 11))) _tmem_load_1[75] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 12))) _tmem_load_1[76] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 13))) _tmem_load_1[77] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 14))) _tmem_load_1[78] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 15))) _tmem_load_1[79] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 16))) _tmem_load_1[80] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 17))) _tmem_load_1[81] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 18))) _tmem_load_1[82] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 19))) _tmem_load_1[83] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 20))) _tmem_load_1[84] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 21))) _tmem_load_1[85] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 22))) _tmem_load_1[86] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 23))) _tmem_load_1[87] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 24))) _tmem_load_1[88] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 25))) _tmem_load_1[89] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 26))) _tmem_load_1[90] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 27))) _tmem_load_1[91] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 28))) _tmem_load_1[92] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 29))) _tmem_load_1[93] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 30))) _tmem_load_1[94] = -CUDART_INF_F;
+                        if (!(_thresh_mask_33 & (1u << 31))) _tmem_load_1[95] = -CUDART_INF_F;
 #endif
-                        uint32_t _thresh_mask_34;
+                        uint32_t _thresh_mask_35;
                         {
-                            int _lim_35 = tail_valid_1 - 96;
-                            if (_lim_35 <= 0) { _thresh_mask_34 = 0u; }
-                            else if (_lim_35 >= 32) { _thresh_mask_34 = 0xFFFFFFFFu; }
+                            int _lim_36 = tail_valid_1 - 96;
+                            if (_lim_36 <= 0) { _thresh_mask_35 = 0u; }
+                            else if (_lim_36 >= 32) { _thresh_mask_35 = 0xFFFFFFFFu; }
                             else {
                                 asm volatile("{"
                                     ".reg .u32 t;\n\t"
                                     "shl.b32 t, 1, %1;\n\t"
                                     "add.u32 %0, t, -1;\n\t"
-                                    "}" : "=r"(_thresh_mask_34) : "r"(_lim_35));
+                                    "}" : "=r"(_thresh_mask_35) : "r"(_lim_36));
                             }
                         }
 #if __CUDA_ARCH__ == 1030
-                        if (!(_thresh_mask_34 & (1u << 0))) sv[96] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 1))) sv[97] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 2))) sv[98] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 3))) sv[99] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 4))) sv[100] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 5))) sv[101] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 6))) sv[102] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 7))) sv[103] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 8))) sv[104] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 9))) sv[105] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 10))) sv[106] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 11))) sv[107] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 12))) sv[108] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 13))) sv[109] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 14))) sv[110] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 15))) sv[111] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 16))) sv[112] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 17))) sv[113] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 18))) sv[114] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 19))) sv[115] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 20))) sv[116] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 21))) sv[117] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 22))) sv[118] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 23))) sv[119] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 24))) sv[120] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 25))) sv[121] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 26))) sv[122] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 27))) sv[123] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 28))) sv[124] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 29))) sv[125] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 30))) sv[126] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 31))) sv[127] = -CUDART_INF_F;
-                        float2 _reg_reduce_max2_37 = {-CAKE_INF, -CAKE_INF};
-                        row_max_x32_accum(&sv[0], _reg_reduce_max2_37);
-                        row_max_x32_accum(&sv[32], _reg_reduce_max2_37);
-                        row_max_x32_accum(&sv[64], _reg_reduce_max2_37);
-                        row_max_x32_accum(&sv[96], _reg_reduce_max2_37);
-                        float _reg_array_reduce_36 = row_max_reduce(_reg_reduce_max2_37);
-                        tile_max = _reg_array_reduce_36;
+                        if (!(_thresh_mask_35 & (1u << 0))) sv[96] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 1))) sv[97] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 2))) sv[98] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 3))) sv[99] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 4))) sv[100] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 5))) sv[101] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 6))) sv[102] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 7))) sv[103] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 8))) sv[104] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 9))) sv[105] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 10))) sv[106] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 11))) sv[107] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 12))) sv[108] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 13))) sv[109] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 14))) sv[110] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 15))) sv[111] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 16))) sv[112] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 17))) sv[113] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 18))) sv[114] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 19))) sv[115] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 20))) sv[116] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 21))) sv[117] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 22))) sv[118] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 23))) sv[119] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 24))) sv[120] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 25))) sv[121] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 26))) sv[122] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 27))) sv[123] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 28))) sv[124] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 29))) sv[125] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 30))) sv[126] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 31))) sv[127] = -CUDART_INF_F;
+                        float2 _reg_reduce_max2_38 = {-CAKE_INF, -CAKE_INF};
+                        row_max_x32_accum(&sv[0], _reg_reduce_max2_38);
+                        row_max_x32_accum(&sv[32], _reg_reduce_max2_38);
+                        row_max_x32_accum(&sv[64], _reg_reduce_max2_38);
+                        row_max_x32_accum(&sv[96], _reg_reduce_max2_38);
+                        float _reg_array_reduce_37 = row_max_reduce(_reg_reduce_max2_38);
+                        tile_max = _reg_array_reduce_37;
 #else
-                        if (!(_thresh_mask_34 & (1u << 0))) _tmem_load_1[96] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 1))) _tmem_load_1[97] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 2))) _tmem_load_1[98] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 3))) _tmem_load_1[99] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 4))) _tmem_load_1[100] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 5))) _tmem_load_1[101] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 6))) _tmem_load_1[102] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 7))) _tmem_load_1[103] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 8))) _tmem_load_1[104] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 9))) _tmem_load_1[105] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 10))) _tmem_load_1[106] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 11))) _tmem_load_1[107] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 12))) _tmem_load_1[108] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 13))) _tmem_load_1[109] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 14))) _tmem_load_1[110] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 15))) _tmem_load_1[111] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 16))) _tmem_load_1[112] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 17))) _tmem_load_1[113] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 18))) _tmem_load_1[114] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 19))) _tmem_load_1[115] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 20))) _tmem_load_1[116] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 21))) _tmem_load_1[117] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 22))) _tmem_load_1[118] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 23))) _tmem_load_1[119] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 24))) _tmem_load_1[120] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 25))) _tmem_load_1[121] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 26))) _tmem_load_1[122] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 27))) _tmem_load_1[123] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 28))) _tmem_load_1[124] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 29))) _tmem_load_1[125] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 30))) _tmem_load_1[126] = -CUDART_INF_F;
-                        if (!(_thresh_mask_34 & (1u << 31))) _tmem_load_1[127] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 0))) _tmem_load_1[96] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 1))) _tmem_load_1[97] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 2))) _tmem_load_1[98] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 3))) _tmem_load_1[99] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 4))) _tmem_load_1[100] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 5))) _tmem_load_1[101] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 6))) _tmem_load_1[102] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 7))) _tmem_load_1[103] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 8))) _tmem_load_1[104] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 9))) _tmem_load_1[105] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 10))) _tmem_load_1[106] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 11))) _tmem_load_1[107] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 12))) _tmem_load_1[108] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 13))) _tmem_load_1[109] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 14))) _tmem_load_1[110] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 15))) _tmem_load_1[111] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 16))) _tmem_load_1[112] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 17))) _tmem_load_1[113] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 18))) _tmem_load_1[114] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 19))) _tmem_load_1[115] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 20))) _tmem_load_1[116] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 21))) _tmem_load_1[117] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 22))) _tmem_load_1[118] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 23))) _tmem_load_1[119] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 24))) _tmem_load_1[120] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 25))) _tmem_load_1[121] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 26))) _tmem_load_1[122] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 27))) _tmem_load_1[123] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 28))) _tmem_load_1[124] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 29))) _tmem_load_1[125] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 30))) _tmem_load_1[126] = -CUDART_INF_F;
+                        if (!(_thresh_mask_35 & (1u << 31))) _tmem_load_1[127] = -CUDART_INF_F;
 #endif
                     }
 #if __CUDA_ARCH__ == 1030
                     float new_max_1 = tile_max;
 #else
-                    float2 _reg_reduce_max2_36 = {-CAKE_INF, -CAKE_INF};
-                    row_max_x32_accum(&_tmem_load_1[0], _reg_reduce_max2_36);
-                    row_max_x32_accum(&_tmem_load_1[32], _reg_reduce_max2_36);
-                    row_max_x32_accum(&_tmem_load_1[64], _reg_reduce_max2_36);
-                    row_max_x32_accum(&_tmem_load_1[96], _reg_reduce_max2_36);
-                    float new_max_1 = row_max_reduce(_reg_reduce_max2_36);
+                    float2 _reg_reduce_max2_37 = {-CAKE_INF, -CAKE_INF};
+                    row_max_x32_accum(&_tmem_load_1[0], _reg_reduce_max2_37);
+                    row_max_x32_accum(&_tmem_load_1[32], _reg_reduce_max2_37);
+                    row_max_x32_accum(&_tmem_load_1[64], _reg_reduce_max2_37);
+                    row_max_x32_accum(&_tmem_load_1[96], _reg_reduce_max2_37);
+                    float new_max_1 = row_max_reduce(_reg_reduce_max2_37);
 #endif
                     new_max_1 = max_noftz(new_max_1, row_max_val);
                     float new_max_scaled_1 = ((new_max_1 == -CUDART_INF_F) ? 0.0f : new_max_1) * softmax_scale_log2;
@@ -1560,11 +1566,11 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                         selected_max_1 = new_max_1;
                         if (row_max_val > -CUDART_INF_F) {
 #if __CUDA_ARCH__ == 1030
+                            float _exp2_39 = approx_exp2(_fma_1);
+                            acc_scale_1 = _exp2_39;
+#else
                             float _exp2_38 = approx_exp2(_fma_1);
                             acc_scale_1 = _exp2_38;
-#else
-                            float _exp2_37 = approx_exp2(_fma_1);
-                            acc_scale_1 = _exp2_37;
 #endif
                         } else {
                             acc_scale_1 = 1.0f;
@@ -1575,26 +1581,28 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(corr_sig_addr + (stage) * 8);
 #if __CUDA_ARCH__ == 1030
+                    const float2 _fma_b2_40 = {softmax_scale_log2, softmax_scale_log2};
+                    const float2 _fma_c2_41 = {-new_max_scaled_1, -new_max_scaled_1};
+#else
                     const float2 _fma_b2_39 = {softmax_scale_log2, softmax_scale_log2};
                     const float2 _fma_c2_40 = {-new_max_scaled_1, -new_max_scaled_1};
-#else
-                    const float2 _fma_b2_38 = {softmax_scale_log2, softmax_scale_log2};
-                    const float2 _fma_c2_39 = {-new_max_scaled_1, -new_max_scaled_1};
 #endif
                     #pragma unroll
 #if __CUDA_ARCH__ == 1030
                     for (int _lf = 0; _lf < 64; _lf++)
-                        fma_f32x2_inplace(&reinterpret_cast<float2*>(sv)[_lf], _fma_b2_39, _fma_c2_40);
+                        fma_f32x2_inplace(&reinterpret_cast<float2*>(sv)[_lf], _fma_b2_40, _fma_c2_41);
 #else
                     for (int _lf = 0; _lf < 48; _lf++)
-                        fma_f32x2_inplace(&reinterpret_cast<float2*>((_tmem_load_1 + 0))[_lf], _fma_b2_38, _fma_c2_39);
+                        fma_f32x2_inplace(&reinterpret_cast<float2*>((_tmem_load_1 + 0))[_lf], _fma_b2_39, _fma_c2_40);
 #endif
                     int p_base_1 = taddr + (unsigned int)tmem_p_off + (unsigned int)(warp % 4 * 32 << 16);
                     if (stage == 0) {
-                        mbarrier_wait_plain(order_p01_0_addr, order_p01_phase);
+                        int _parity_order_p01_0_1 = (int)((unsigned int)order_p01_seen % 2);
+                        mbarrier_wait_plain(order_p01_0_addr, _parity_order_p01_0_1);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                     } else {
-                        mbarrier_wait_plain(order_p01_1_addr, order_p01_phase);
+                        int _parity_order_p01_1_1 = (int)((unsigned int)order_p01_seen % 2);
+                        mbarrier_wait_plain(order_p01_1_addr, _parity_order_p01_1_1);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                     }
                     {
@@ -1607,31 +1615,31 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
 #endif
                         }
 #if __CUDA_ARCH__ == 1030
-                        float2 _exp2_pair_41 = ex2_emulation_f32x2_value(make_float2(sv[24], sv[25]));
-                        sv[24] = _exp2_pair_41.x;
-                        sv[25] = _exp2_pair_41.y;
-                        float2 _exp2_pair_42 = ex2_emulation_f32x2_value(make_float2(sv[26], sv[27]));
-                        sv[26] = _exp2_pair_42.x;
-                        sv[27] = _exp2_pair_42.y;
-                        float2 _exp2_pair_43 = ex2_emulation_f32x2_value(make_float2(sv[28], sv[29]));
-                        sv[28] = _exp2_pair_43.x;
-                        sv[29] = _exp2_pair_43.y;
-                        float2 _exp2_pair_44 = ex2_emulation_f32x2_value(make_float2(sv[30], sv[31]));
-                        sv[30] = _exp2_pair_44.x;
-                        sv[31] = _exp2_pair_44.y;
+                        float2 _exp2_pair_42 = ex2_emulation_f32x2_value(make_float2(sv[24], sv[25]));
+                        sv[24] = _exp2_pair_42.x;
+                        sv[25] = _exp2_pair_42.y;
+                        float2 _exp2_pair_43 = ex2_emulation_f32x2_value(make_float2(sv[26], sv[27]));
+                        sv[26] = _exp2_pair_43.x;
+                        sv[27] = _exp2_pair_43.y;
+                        float2 _exp2_pair_44 = ex2_emulation_f32x2_value(make_float2(sv[28], sv[29]));
+                        sv[28] = _exp2_pair_44.x;
+                        sv[29] = _exp2_pair_44.y;
+                        float2 _exp2_pair_45 = ex2_emulation_f32x2_value(make_float2(sv[30], sv[31]));
+                        sv[30] = _exp2_pair_45.x;
+                        sv[31] = _exp2_pair_45.y;
 #else
-                        float2 _exp2_pair_40 = ex2_emulation_f32x2_value(make_float2(_tmem_load_1[24], _tmem_load_1[25]));
-                        _tmem_load_1[24] = _exp2_pair_40.x;
-                        _tmem_load_1[25] = _exp2_pair_40.y;
-                        float2 _exp2_pair_41 = ex2_emulation_f32x2_value(make_float2(_tmem_load_1[26], _tmem_load_1[27]));
-                        _tmem_load_1[26] = _exp2_pair_41.x;
-                        _tmem_load_1[27] = _exp2_pair_41.y;
-                        float2 _exp2_pair_42 = ex2_emulation_f32x2_value(make_float2(_tmem_load_1[28], _tmem_load_1[29]));
-                        _tmem_load_1[28] = _exp2_pair_42.x;
-                        _tmem_load_1[29] = _exp2_pair_42.y;
-                        float2 _exp2_pair_43 = ex2_emulation_f32x2_value(make_float2(_tmem_load_1[30], _tmem_load_1[31]));
-                        _tmem_load_1[30] = _exp2_pair_43.x;
-                        _tmem_load_1[31] = _exp2_pair_43.y;
+                        float2 _exp2_pair_41 = ex2_emulation_f32x2_value(make_float2(_tmem_load_1[24], _tmem_load_1[25]));
+                        _tmem_load_1[24] = _exp2_pair_41.x;
+                        _tmem_load_1[25] = _exp2_pair_41.y;
+                        float2 _exp2_pair_42 = ex2_emulation_f32x2_value(make_float2(_tmem_load_1[26], _tmem_load_1[27]));
+                        _tmem_load_1[26] = _exp2_pair_42.x;
+                        _tmem_load_1[27] = _exp2_pair_42.y;
+                        float2 _exp2_pair_43 = ex2_emulation_f32x2_value(make_float2(_tmem_load_1[28], _tmem_load_1[29]));
+                        _tmem_load_1[28] = _exp2_pair_43.x;
+                        _tmem_load_1[29] = _exp2_pair_43.y;
+                        float2 _exp2_pair_44 = ex2_emulation_f32x2_value(make_float2(_tmem_load_1[30], _tmem_load_1[31]));
+                        _tmem_load_1[30] = _exp2_pair_44.x;
+                        _tmem_load_1[31] = _exp2_pair_44.y;
 #endif
                     }
 #if __CUDA_ARCH__ == 1030
@@ -1667,31 +1675,31 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
 #endif
                         }
 #if __CUDA_ARCH__ == 1030
-                        float2 _exp2_pair_45 = ex2_emulation_f32x2_value(make_float2(sv[56], sv[57]));
-                        sv[56] = _exp2_pair_45.x;
-                        sv[57] = _exp2_pair_45.y;
-                        float2 _exp2_pair_46 = ex2_emulation_f32x2_value(make_float2(sv[58], sv[59]));
-                        sv[58] = _exp2_pair_46.x;
-                        sv[59] = _exp2_pair_46.y;
-                        float2 _exp2_pair_47 = ex2_emulation_f32x2_value(make_float2(sv[60], sv[61]));
-                        sv[60] = _exp2_pair_47.x;
-                        sv[61] = _exp2_pair_47.y;
-                        float2 _exp2_pair_48 = ex2_emulation_f32x2_value(make_float2(sv[62], sv[63]));
-                        sv[62] = _exp2_pair_48.x;
-                        sv[63] = _exp2_pair_48.y;
+                        float2 _exp2_pair_46 = ex2_emulation_f32x2_value(make_float2(sv[56], sv[57]));
+                        sv[56] = _exp2_pair_46.x;
+                        sv[57] = _exp2_pair_46.y;
+                        float2 _exp2_pair_47 = ex2_emulation_f32x2_value(make_float2(sv[58], sv[59]));
+                        sv[58] = _exp2_pair_47.x;
+                        sv[59] = _exp2_pair_47.y;
+                        float2 _exp2_pair_48 = ex2_emulation_f32x2_value(make_float2(sv[60], sv[61]));
+                        sv[60] = _exp2_pair_48.x;
+                        sv[61] = _exp2_pair_48.y;
+                        float2 _exp2_pair_49 = ex2_emulation_f32x2_value(make_float2(sv[62], sv[63]));
+                        sv[62] = _exp2_pair_49.x;
+                        sv[63] = _exp2_pair_49.y;
 #else
-                        float2 _exp2_pair_44 = ex2_emulation_f32x2_value(make_float2(_tmem_load_1[56], _tmem_load_1[57]));
-                        _tmem_load_1[56] = _exp2_pair_44.x;
-                        _tmem_load_1[57] = _exp2_pair_44.y;
-                        float2 _exp2_pair_45 = ex2_emulation_f32x2_value(make_float2(_tmem_load_1[58], _tmem_load_1[59]));
-                        _tmem_load_1[58] = _exp2_pair_45.x;
-                        _tmem_load_1[59] = _exp2_pair_45.y;
-                        float2 _exp2_pair_46 = ex2_emulation_f32x2_value(make_float2(_tmem_load_1[60], _tmem_load_1[61]));
-                        _tmem_load_1[60] = _exp2_pair_46.x;
-                        _tmem_load_1[61] = _exp2_pair_46.y;
-                        float2 _exp2_pair_47 = ex2_emulation_f32x2_value(make_float2(_tmem_load_1[62], _tmem_load_1[63]));
-                        _tmem_load_1[62] = _exp2_pair_47.x;
-                        _tmem_load_1[63] = _exp2_pair_47.y;
+                        float2 _exp2_pair_45 = ex2_emulation_f32x2_value(make_float2(_tmem_load_1[56], _tmem_load_1[57]));
+                        _tmem_load_1[56] = _exp2_pair_45.x;
+                        _tmem_load_1[57] = _exp2_pair_45.y;
+                        float2 _exp2_pair_46 = ex2_emulation_f32x2_value(make_float2(_tmem_load_1[58], _tmem_load_1[59]));
+                        _tmem_load_1[58] = _exp2_pair_46.x;
+                        _tmem_load_1[59] = _exp2_pair_46.y;
+                        float2 _exp2_pair_47 = ex2_emulation_f32x2_value(make_float2(_tmem_load_1[60], _tmem_load_1[61]));
+                        _tmem_load_1[60] = _exp2_pair_47.x;
+                        _tmem_load_1[61] = _exp2_pair_47.y;
+                        float2 _exp2_pair_48 = ex2_emulation_f32x2_value(make_float2(_tmem_load_1[62], _tmem_load_1[63]));
+                        _tmem_load_1[62] = _exp2_pair_48.x;
+                        _tmem_load_1[63] = _exp2_pair_48.y;
 #endif
                     }
 #if __CUDA_ARCH__ == 1030
@@ -1727,31 +1735,31 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
 #endif
                         }
 #if __CUDA_ARCH__ == 1030
-                        float2 _exp2_pair_49 = ex2_emulation_f32x2_value(make_float2(sv[88], sv[89]));
-                        sv[88] = _exp2_pair_49.x;
-                        sv[89] = _exp2_pair_49.y;
-                        float2 _exp2_pair_50 = ex2_emulation_f32x2_value(make_float2(sv[90], sv[91]));
-                        sv[90] = _exp2_pair_50.x;
-                        sv[91] = _exp2_pair_50.y;
-                        float2 _exp2_pair_51 = ex2_emulation_f32x2_value(make_float2(sv[92], sv[93]));
-                        sv[92] = _exp2_pair_51.x;
-                        sv[93] = _exp2_pair_51.y;
-                        float2 _exp2_pair_52 = ex2_emulation_f32x2_value(make_float2(sv[94], sv[95]));
-                        sv[94] = _exp2_pair_52.x;
-                        sv[95] = _exp2_pair_52.y;
+                        float2 _exp2_pair_50 = ex2_emulation_f32x2_value(make_float2(sv[88], sv[89]));
+                        sv[88] = _exp2_pair_50.x;
+                        sv[89] = _exp2_pair_50.y;
+                        float2 _exp2_pair_51 = ex2_emulation_f32x2_value(make_float2(sv[90], sv[91]));
+                        sv[90] = _exp2_pair_51.x;
+                        sv[91] = _exp2_pair_51.y;
+                        float2 _exp2_pair_52 = ex2_emulation_f32x2_value(make_float2(sv[92], sv[93]));
+                        sv[92] = _exp2_pair_52.x;
+                        sv[93] = _exp2_pair_52.y;
+                        float2 _exp2_pair_53 = ex2_emulation_f32x2_value(make_float2(sv[94], sv[95]));
+                        sv[94] = _exp2_pair_53.x;
+                        sv[95] = _exp2_pair_53.y;
 #else
-                        float2 _exp2_pair_48 = ex2_emulation_f32x2_value(make_float2(_tmem_load_1[88], _tmem_load_1[89]));
-                        _tmem_load_1[88] = _exp2_pair_48.x;
-                        _tmem_load_1[89] = _exp2_pair_48.y;
-                        float2 _exp2_pair_49 = ex2_emulation_f32x2_value(make_float2(_tmem_load_1[90], _tmem_load_1[91]));
-                        _tmem_load_1[90] = _exp2_pair_49.x;
-                        _tmem_load_1[91] = _exp2_pair_49.y;
-                        float2 _exp2_pair_50 = ex2_emulation_f32x2_value(make_float2(_tmem_load_1[92], _tmem_load_1[93]));
-                        _tmem_load_1[92] = _exp2_pair_50.x;
-                        _tmem_load_1[93] = _exp2_pair_50.y;
-                        float2 _exp2_pair_51 = ex2_emulation_f32x2_value(make_float2(_tmem_load_1[94], _tmem_load_1[95]));
-                        _tmem_load_1[94] = _exp2_pair_51.x;
-                        _tmem_load_1[95] = _exp2_pair_51.y;
+                        float2 _exp2_pair_49 = ex2_emulation_f32x2_value(make_float2(_tmem_load_1[88], _tmem_load_1[89]));
+                        _tmem_load_1[88] = _exp2_pair_49.x;
+                        _tmem_load_1[89] = _exp2_pair_49.y;
+                        float2 _exp2_pair_50 = ex2_emulation_f32x2_value(make_float2(_tmem_load_1[90], _tmem_load_1[91]));
+                        _tmem_load_1[90] = _exp2_pair_50.x;
+                        _tmem_load_1[91] = _exp2_pair_50.y;
+                        float2 _exp2_pair_51 = ex2_emulation_f32x2_value(make_float2(_tmem_load_1[92], _tmem_load_1[93]));
+                        _tmem_load_1[92] = _exp2_pair_51.x;
+                        _tmem_load_1[93] = _exp2_pair_51.y;
+                        float2 _exp2_pair_52 = ex2_emulation_f32x2_value(make_float2(_tmem_load_1[94], _tmem_load_1[95]));
+                        _tmem_load_1[94] = _exp2_pair_52.x;
+                        _tmem_load_1[95] = _exp2_pair_52.y;
 #endif
                     }
 #if __CUDA_ARCH__ == 1030
@@ -1782,56 +1790,56 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                     mbarrier_arrive(p_full_addr + (stage) * 8);
 #if __CUDA_ARCH__ == 1030
 #else
-                    const float2 _fma_b2_52 = {softmax_scale_log2, softmax_scale_log2};
-                    const float2 _fma_c2_53 = {-new_max_scaled_1, -new_max_scaled_1};
-                    float2 _fma_pair_54 = fma_f32x2(make_float2((_tmem_load_1 + 96)[0], (_tmem_load_1 + 96)[1]), _fma_b2_52, _fma_c2_53);
-                    (_tmem_load_1 + 96)[0] = _fma_pair_54.x;
-                    (_tmem_load_1 + 96)[1] = _fma_pair_54.y;
-                    float2 _fma_pair_55 = fma_f32x2(make_float2((_tmem_load_1 + 96)[2], (_tmem_load_1 + 96)[3]), _fma_b2_52, _fma_c2_53);
-                    (_tmem_load_1 + 96)[2] = _fma_pair_55.x;
-                    (_tmem_load_1 + 96)[3] = _fma_pair_55.y;
-                    float2 _fma_pair_56 = fma_f32x2(make_float2((_tmem_load_1 + 96)[4], (_tmem_load_1 + 96)[5]), _fma_b2_52, _fma_c2_53);
-                    (_tmem_load_1 + 96)[4] = _fma_pair_56.x;
-                    (_tmem_load_1 + 96)[5] = _fma_pair_56.y;
-                    float2 _fma_pair_57 = fma_f32x2(make_float2((_tmem_load_1 + 96)[6], (_tmem_load_1 + 96)[7]), _fma_b2_52, _fma_c2_53);
-                    (_tmem_load_1 + 96)[6] = _fma_pair_57.x;
-                    (_tmem_load_1 + 96)[7] = _fma_pair_57.y;
-                    float2 _fma_pair_58 = fma_f32x2(make_float2((_tmem_load_1 + 96)[8], (_tmem_load_1 + 96)[9]), _fma_b2_52, _fma_c2_53);
-                    (_tmem_load_1 + 96)[8] = _fma_pair_58.x;
-                    (_tmem_load_1 + 96)[9] = _fma_pair_58.y;
-                    float2 _fma_pair_59 = fma_f32x2(make_float2((_tmem_load_1 + 96)[10], (_tmem_load_1 + 96)[11]), _fma_b2_52, _fma_c2_53);
-                    (_tmem_load_1 + 96)[10] = _fma_pair_59.x;
-                    (_tmem_load_1 + 96)[11] = _fma_pair_59.y;
-                    float2 _fma_pair_60 = fma_f32x2(make_float2((_tmem_load_1 + 96)[12], (_tmem_load_1 + 96)[13]), _fma_b2_52, _fma_c2_53);
-                    (_tmem_load_1 + 96)[12] = _fma_pair_60.x;
-                    (_tmem_load_1 + 96)[13] = _fma_pair_60.y;
-                    float2 _fma_pair_61 = fma_f32x2(make_float2((_tmem_load_1 + 96)[14], (_tmem_load_1 + 96)[15]), _fma_b2_52, _fma_c2_53);
-                    (_tmem_load_1 + 96)[14] = _fma_pair_61.x;
-                    (_tmem_load_1 + 96)[15] = _fma_pair_61.y;
-                    float2 _fma_pair_62 = fma_f32x2(make_float2((_tmem_load_1 + 96)[16], (_tmem_load_1 + 96)[17]), _fma_b2_52, _fma_c2_53);
-                    (_tmem_load_1 + 96)[16] = _fma_pair_62.x;
-                    (_tmem_load_1 + 96)[17] = _fma_pair_62.y;
-                    float2 _fma_pair_63 = fma_f32x2(make_float2((_tmem_load_1 + 96)[18], (_tmem_load_1 + 96)[19]), _fma_b2_52, _fma_c2_53);
-                    (_tmem_load_1 + 96)[18] = _fma_pair_63.x;
-                    (_tmem_load_1 + 96)[19] = _fma_pair_63.y;
-                    float2 _fma_pair_64 = fma_f32x2(make_float2((_tmem_load_1 + 96)[20], (_tmem_load_1 + 96)[21]), _fma_b2_52, _fma_c2_53);
-                    (_tmem_load_1 + 96)[20] = _fma_pair_64.x;
-                    (_tmem_load_1 + 96)[21] = _fma_pair_64.y;
-                    float2 _fma_pair_65 = fma_f32x2(make_float2((_tmem_load_1 + 96)[22], (_tmem_load_1 + 96)[23]), _fma_b2_52, _fma_c2_53);
-                    (_tmem_load_1 + 96)[22] = _fma_pair_65.x;
-                    (_tmem_load_1 + 96)[23] = _fma_pair_65.y;
-                    float2 _fma_pair_66 = fma_f32x2(make_float2((_tmem_load_1 + 96)[24], (_tmem_load_1 + 96)[25]), _fma_b2_52, _fma_c2_53);
-                    (_tmem_load_1 + 96)[24] = _fma_pair_66.x;
-                    (_tmem_load_1 + 96)[25] = _fma_pair_66.y;
-                    float2 _fma_pair_67 = fma_f32x2(make_float2((_tmem_load_1 + 96)[26], (_tmem_load_1 + 96)[27]), _fma_b2_52, _fma_c2_53);
-                    (_tmem_load_1 + 96)[26] = _fma_pair_67.x;
-                    (_tmem_load_1 + 96)[27] = _fma_pair_67.y;
-                    float2 _fma_pair_68 = fma_f32x2(make_float2((_tmem_load_1 + 96)[28], (_tmem_load_1 + 96)[29]), _fma_b2_52, _fma_c2_53);
-                    (_tmem_load_1 + 96)[28] = _fma_pair_68.x;
-                    (_tmem_load_1 + 96)[29] = _fma_pair_68.y;
-                    float2 _fma_pair_69 = fma_f32x2(make_float2((_tmem_load_1 + 96)[30], (_tmem_load_1 + 96)[31]), _fma_b2_52, _fma_c2_53);
-                    (_tmem_load_1 + 96)[30] = _fma_pair_69.x;
-                    (_tmem_load_1 + 96)[31] = _fma_pair_69.y;
+                    const float2 _fma_b2_53 = {softmax_scale_log2, softmax_scale_log2};
+                    const float2 _fma_c2_54 = {-new_max_scaled_1, -new_max_scaled_1};
+                    float2 _fma_pair_55 = fma_f32x2(make_float2((_tmem_load_1 + 96)[0], (_tmem_load_1 + 96)[1]), _fma_b2_53, _fma_c2_54);
+                    (_tmem_load_1 + 96)[0] = _fma_pair_55.x;
+                    (_tmem_load_1 + 96)[1] = _fma_pair_55.y;
+                    float2 _fma_pair_56 = fma_f32x2(make_float2((_tmem_load_1 + 96)[2], (_tmem_load_1 + 96)[3]), _fma_b2_53, _fma_c2_54);
+                    (_tmem_load_1 + 96)[2] = _fma_pair_56.x;
+                    (_tmem_load_1 + 96)[3] = _fma_pair_56.y;
+                    float2 _fma_pair_57 = fma_f32x2(make_float2((_tmem_load_1 + 96)[4], (_tmem_load_1 + 96)[5]), _fma_b2_53, _fma_c2_54);
+                    (_tmem_load_1 + 96)[4] = _fma_pair_57.x;
+                    (_tmem_load_1 + 96)[5] = _fma_pair_57.y;
+                    float2 _fma_pair_58 = fma_f32x2(make_float2((_tmem_load_1 + 96)[6], (_tmem_load_1 + 96)[7]), _fma_b2_53, _fma_c2_54);
+                    (_tmem_load_1 + 96)[6] = _fma_pair_58.x;
+                    (_tmem_load_1 + 96)[7] = _fma_pair_58.y;
+                    float2 _fma_pair_59 = fma_f32x2(make_float2((_tmem_load_1 + 96)[8], (_tmem_load_1 + 96)[9]), _fma_b2_53, _fma_c2_54);
+                    (_tmem_load_1 + 96)[8] = _fma_pair_59.x;
+                    (_tmem_load_1 + 96)[9] = _fma_pair_59.y;
+                    float2 _fma_pair_60 = fma_f32x2(make_float2((_tmem_load_1 + 96)[10], (_tmem_load_1 + 96)[11]), _fma_b2_53, _fma_c2_54);
+                    (_tmem_load_1 + 96)[10] = _fma_pair_60.x;
+                    (_tmem_load_1 + 96)[11] = _fma_pair_60.y;
+                    float2 _fma_pair_61 = fma_f32x2(make_float2((_tmem_load_1 + 96)[12], (_tmem_load_1 + 96)[13]), _fma_b2_53, _fma_c2_54);
+                    (_tmem_load_1 + 96)[12] = _fma_pair_61.x;
+                    (_tmem_load_1 + 96)[13] = _fma_pair_61.y;
+                    float2 _fma_pair_62 = fma_f32x2(make_float2((_tmem_load_1 + 96)[14], (_tmem_load_1 + 96)[15]), _fma_b2_53, _fma_c2_54);
+                    (_tmem_load_1 + 96)[14] = _fma_pair_62.x;
+                    (_tmem_load_1 + 96)[15] = _fma_pair_62.y;
+                    float2 _fma_pair_63 = fma_f32x2(make_float2((_tmem_load_1 + 96)[16], (_tmem_load_1 + 96)[17]), _fma_b2_53, _fma_c2_54);
+                    (_tmem_load_1 + 96)[16] = _fma_pair_63.x;
+                    (_tmem_load_1 + 96)[17] = _fma_pair_63.y;
+                    float2 _fma_pair_64 = fma_f32x2(make_float2((_tmem_load_1 + 96)[18], (_tmem_load_1 + 96)[19]), _fma_b2_53, _fma_c2_54);
+                    (_tmem_load_1 + 96)[18] = _fma_pair_64.x;
+                    (_tmem_load_1 + 96)[19] = _fma_pair_64.y;
+                    float2 _fma_pair_65 = fma_f32x2(make_float2((_tmem_load_1 + 96)[20], (_tmem_load_1 + 96)[21]), _fma_b2_53, _fma_c2_54);
+                    (_tmem_load_1 + 96)[20] = _fma_pair_65.x;
+                    (_tmem_load_1 + 96)[21] = _fma_pair_65.y;
+                    float2 _fma_pair_66 = fma_f32x2(make_float2((_tmem_load_1 + 96)[22], (_tmem_load_1 + 96)[23]), _fma_b2_53, _fma_c2_54);
+                    (_tmem_load_1 + 96)[22] = _fma_pair_66.x;
+                    (_tmem_load_1 + 96)[23] = _fma_pair_66.y;
+                    float2 _fma_pair_67 = fma_f32x2(make_float2((_tmem_load_1 + 96)[24], (_tmem_load_1 + 96)[25]), _fma_b2_53, _fma_c2_54);
+                    (_tmem_load_1 + 96)[24] = _fma_pair_67.x;
+                    (_tmem_load_1 + 96)[25] = _fma_pair_67.y;
+                    float2 _fma_pair_68 = fma_f32x2(make_float2((_tmem_load_1 + 96)[26], (_tmem_load_1 + 96)[27]), _fma_b2_53, _fma_c2_54);
+                    (_tmem_load_1 + 96)[26] = _fma_pair_68.x;
+                    (_tmem_load_1 + 96)[27] = _fma_pair_68.y;
+                    float2 _fma_pair_69 = fma_f32x2(make_float2((_tmem_load_1 + 96)[28], (_tmem_load_1 + 96)[29]), _fma_b2_53, _fma_c2_54);
+                    (_tmem_load_1 + 96)[28] = _fma_pair_69.x;
+                    (_tmem_load_1 + 96)[29] = _fma_pair_69.y;
+                    float2 _fma_pair_70 = fma_f32x2(make_float2((_tmem_load_1 + 96)[30], (_tmem_load_1 + 96)[31]), _fma_b2_53, _fma_c2_54);
+                    (_tmem_load_1 + 96)[30] = _fma_pair_70.x;
+                    (_tmem_load_1 + 96)[31] = _fma_pair_70.y;
 #endif
                     #pragma unroll
                     for (int _le = 0; _le < 32; _le++) {
@@ -1846,7 +1854,7 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                     } else {
                         mbarrier_arrive(order_p01_0_addr);
                     }
-                    order_p01_phase ^= 1;
+                    order_p01_seen += 1;
 #if __CUDA_ARCH__ == 1030
                     unsigned int sv_bf16_2[16];
 #else
@@ -1876,141 +1884,141 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                     mbarrier_wait(corr_done_addr + (stage) * 8, _phase_corr_done);
                     _phase_corr_done ^= 1;
 #if __CUDA_ARCH__ == 1030
-                    float2 _reg_reduce_sum2_54 = make_float2(0.0f, 0.0f);
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[0], sv[1]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[2], sv[3]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[4], sv[5]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[6], sv[7]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[8], sv[9]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[10], sv[11]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[12], sv[13]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[14], sv[15]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[16], sv[17]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[18], sv[19]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[20], sv[21]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[22], sv[23]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[24], sv[25]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[26], sv[27]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[28], sv[29]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[30], sv[31]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[32], sv[33]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[34], sv[35]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[36], sv[37]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[38], sv[39]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[40], sv[41]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[42], sv[43]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[44], sv[45]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[46], sv[47]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[48], sv[49]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[50], sv[51]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[52], sv[53]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[54], sv[55]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[56], sv[57]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[58], sv[59]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[60], sv[61]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[62], sv[63]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[64], sv[65]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[66], sv[67]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[68], sv[69]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[70], sv[71]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[72], sv[73]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[74], sv[75]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[76], sv[77]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[78], sv[79]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[80], sv[81]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[82], sv[83]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[84], sv[85]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[86], sv[87]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[88], sv[89]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[90], sv[91]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[92], sv[93]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[94], sv[95]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[96], sv[97]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[98], sv[99]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[100], sv[101]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[102], sv[103]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[104], sv[105]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[106], sv[107]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[108], sv[109]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[110], sv[111]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[112], sv[113]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[114], sv[115]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[116], sv[117]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[118], sv[119]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[120], sv[121]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[122], sv[123]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[124], sv[125]));
-                    _reg_reduce_sum2_54 = add_f32x2_rn_noftz(_reg_reduce_sum2_54, make_float2(sv[126], sv[127]));
-                    float _reg_array_reduce_53 = _reg_reduce_sum2_54.x + _reg_reduce_sum2_54.y;
-                    row_sum_val = __fmaf_rn(row_sum_val, acc_scale_1, _reg_array_reduce_53);
+                    float2 _reg_reduce_sum2_55 = make_float2(0.0f, 0.0f);
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[0], sv[1]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[2], sv[3]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[4], sv[5]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[6], sv[7]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[8], sv[9]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[10], sv[11]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[12], sv[13]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[14], sv[15]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[16], sv[17]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[18], sv[19]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[20], sv[21]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[22], sv[23]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[24], sv[25]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[26], sv[27]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[28], sv[29]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[30], sv[31]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[32], sv[33]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[34], sv[35]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[36], sv[37]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[38], sv[39]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[40], sv[41]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[42], sv[43]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[44], sv[45]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[46], sv[47]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[48], sv[49]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[50], sv[51]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[52], sv[53]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[54], sv[55]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[56], sv[57]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[58], sv[59]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[60], sv[61]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[62], sv[63]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[64], sv[65]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[66], sv[67]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[68], sv[69]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[70], sv[71]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[72], sv[73]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[74], sv[75]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[76], sv[77]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[78], sv[79]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[80], sv[81]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[82], sv[83]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[84], sv[85]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[86], sv[87]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[88], sv[89]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[90], sv[91]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[92], sv[93]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[94], sv[95]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[96], sv[97]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[98], sv[99]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[100], sv[101]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[102], sv[103]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[104], sv[105]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[106], sv[107]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[108], sv[109]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[110], sv[111]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[112], sv[113]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[114], sv[115]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[116], sv[117]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[118], sv[119]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[120], sv[121]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[122], sv[123]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[124], sv[125]));
+                    _reg_reduce_sum2_55 = add_f32x2_rn_noftz(_reg_reduce_sum2_55, make_float2(sv[126], sv[127]));
+                    float _reg_array_reduce_54 = _reg_reduce_sum2_55.x + _reg_reduce_sum2_55.y;
+                    row_sum_val = __fmaf_rn(row_sum_val, acc_scale_1, _reg_array_reduce_54);
 #else
-                    float2 _reg_reduce_sum2_71 = make_float2(0.0f, 0.0f);
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[0], _tmem_load_1[1]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[2], _tmem_load_1[3]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[4], _tmem_load_1[5]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[6], _tmem_load_1[7]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[8], _tmem_load_1[9]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[10], _tmem_load_1[11]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[12], _tmem_load_1[13]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[14], _tmem_load_1[15]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[16], _tmem_load_1[17]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[18], _tmem_load_1[19]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[20], _tmem_load_1[21]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[22], _tmem_load_1[23]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[24], _tmem_load_1[25]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[26], _tmem_load_1[27]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[28], _tmem_load_1[29]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[30], _tmem_load_1[31]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[32], _tmem_load_1[33]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[34], _tmem_load_1[35]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[36], _tmem_load_1[37]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[38], _tmem_load_1[39]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[40], _tmem_load_1[41]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[42], _tmem_load_1[43]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[44], _tmem_load_1[45]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[46], _tmem_load_1[47]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[48], _tmem_load_1[49]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[50], _tmem_load_1[51]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[52], _tmem_load_1[53]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[54], _tmem_load_1[55]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[56], _tmem_load_1[57]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[58], _tmem_load_1[59]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[60], _tmem_load_1[61]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[62], _tmem_load_1[63]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[64], _tmem_load_1[65]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[66], _tmem_load_1[67]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[68], _tmem_load_1[69]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[70], _tmem_load_1[71]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[72], _tmem_load_1[73]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[74], _tmem_load_1[75]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[76], _tmem_load_1[77]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[78], _tmem_load_1[79]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[80], _tmem_load_1[81]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[82], _tmem_load_1[83]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[84], _tmem_load_1[85]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[86], _tmem_load_1[87]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[88], _tmem_load_1[89]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[90], _tmem_load_1[91]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[92], _tmem_load_1[93]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[94], _tmem_load_1[95]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[96], _tmem_load_1[97]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[98], _tmem_load_1[99]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[100], _tmem_load_1[101]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[102], _tmem_load_1[103]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[104], _tmem_load_1[105]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[106], _tmem_load_1[107]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[108], _tmem_load_1[109]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[110], _tmem_load_1[111]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[112], _tmem_load_1[113]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[114], _tmem_load_1[115]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[116], _tmem_load_1[117]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[118], _tmem_load_1[119]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[120], _tmem_load_1[121]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[122], _tmem_load_1[123]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[124], _tmem_load_1[125]));
-                    _reg_reduce_sum2_71 = add_f32x2_rn_noftz(_reg_reduce_sum2_71, make_float2(_tmem_load_1[126], _tmem_load_1[127]));
-                    float _reg_array_reduce_70 = _reg_reduce_sum2_71.x + _reg_reduce_sum2_71.y;
-                    row_sum_val = __fmaf_rn(row_sum_val, acc_scale_1, _reg_array_reduce_70);
+                    float2 _reg_reduce_sum2_72 = make_float2(0.0f, 0.0f);
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[0], _tmem_load_1[1]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[2], _tmem_load_1[3]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[4], _tmem_load_1[5]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[6], _tmem_load_1[7]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[8], _tmem_load_1[9]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[10], _tmem_load_1[11]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[12], _tmem_load_1[13]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[14], _tmem_load_1[15]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[16], _tmem_load_1[17]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[18], _tmem_load_1[19]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[20], _tmem_load_1[21]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[22], _tmem_load_1[23]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[24], _tmem_load_1[25]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[26], _tmem_load_1[27]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[28], _tmem_load_1[29]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[30], _tmem_load_1[31]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[32], _tmem_load_1[33]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[34], _tmem_load_1[35]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[36], _tmem_load_1[37]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[38], _tmem_load_1[39]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[40], _tmem_load_1[41]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[42], _tmem_load_1[43]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[44], _tmem_load_1[45]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[46], _tmem_load_1[47]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[48], _tmem_load_1[49]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[50], _tmem_load_1[51]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[52], _tmem_load_1[53]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[54], _tmem_load_1[55]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[56], _tmem_load_1[57]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[58], _tmem_load_1[59]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[60], _tmem_load_1[61]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[62], _tmem_load_1[63]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[64], _tmem_load_1[65]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[66], _tmem_load_1[67]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[68], _tmem_load_1[69]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[70], _tmem_load_1[71]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[72], _tmem_load_1[73]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[74], _tmem_load_1[75]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[76], _tmem_load_1[77]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[78], _tmem_load_1[79]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[80], _tmem_load_1[81]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[82], _tmem_load_1[83]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[84], _tmem_load_1[85]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[86], _tmem_load_1[87]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[88], _tmem_load_1[89]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[90], _tmem_load_1[91]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[92], _tmem_load_1[93]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[94], _tmem_load_1[95]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[96], _tmem_load_1[97]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[98], _tmem_load_1[99]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[100], _tmem_load_1[101]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[102], _tmem_load_1[103]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[104], _tmem_load_1[105]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[106], _tmem_load_1[107]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[108], _tmem_load_1[109]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[110], _tmem_load_1[111]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[112], _tmem_load_1[113]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[114], _tmem_load_1[115]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[116], _tmem_load_1[117]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[118], _tmem_load_1[119]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[120], _tmem_load_1[121]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[122], _tmem_load_1[123]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[124], _tmem_load_1[125]));
+                    _reg_reduce_sum2_72 = add_f32x2_rn_noftz(_reg_reduce_sum2_72, make_float2(_tmem_load_1[126], _tmem_load_1[127]));
+                    float _reg_array_reduce_71 = _reg_reduce_sum2_72.x + _reg_reduce_sum2_72.y;
+                    row_sum_val = __fmaf_rn(row_sum_val, acc_scale_1, _reg_array_reduce_71);
 #endif
                 }
                 sScale[warp % 4 * 32 + lane + scale_off + 2 * BLOCK_M] = row_sum_val;
@@ -2027,6 +2035,7 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
         { // correction_main
             unsigned int total_tiles_1 = NUM_M_BLOCKS * total_bh;
             unsigned int max_rounds_1 = total_tiles_1 + 1;
+            int corr_seq = 0;
             unsigned int _phase_work_id_full_0_1 = 0;
             unsigned int _phase_corr_sig_0 = 0;
             unsigned int _phase_corr_sig_1 = 0;
@@ -2072,6 +2081,8 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                         num_n_blocks_1 = (max_n_1 + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N;
                     }
                 }
+                unsigned int _max_0_1 = ((num_n_blocks_1) > (1) ? (num_n_blocks_1) : (1));
+                num_n_blocks_1 = _max_0_1;
                 int unit = bh_1 % (unsigned int)(NUM_Q_HEADS / PACK_G);
                 int q_head_base = unit * PACK_G;
                 int row_tok = (warp % 4 * 32 + lane) / PACK_G;
@@ -2092,8 +2103,8 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                     _phase_corr_sig_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     float scale = sScale[warp % 4 * 32 + lane];
-                    int _warp_vote_0 = __any_sync(0xFFFFFFFF, scale < 1.0f);
-                    if (_warp_vote_0 != 0) {
+                    int _warp_vote_1 = __any_sync(0xFFFFFFFF, scale < 1.0f);
+                    if (_warp_vote_1 != 0) {
                         #pragma unroll
                         for (int cr_col = 0; cr_col < HEAD_DIM / 16; cr_col++) {
                             int cr_addr = taddr + (unsigned int)256 + (unsigned int)(warp % 4 * 32 << 16) + (unsigned int)(cr_col * 16);
@@ -2104,14 +2115,14 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                             float _tmem_load_2[16];
                             tmem_ld_x16(&_tmem_load_2[0], cr_addr);
 #endif
-                            const float2 _scale2_1 = {scale, scale};
+                            const float2 _scale2_2 = {scale, scale};
                             #pragma unroll
                             for (int _ls = 0; _ls < 8; _ls++)
 #if __CUDA_ARCH__ == 1030
-                                mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_1)[_ls], _scale2_1);
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_1)[_ls], _scale2_2);
                             tmem_st_x16_f32(cr_addr, _tmem_load_1);
 #else
-                                mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_2)[_ls], _scale2_1);
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_2)[_ls], _scale2_2);
                             tmem_st_x16_f32(cr_addr, _tmem_load_2);
 #endif
                         }
@@ -2124,8 +2135,8 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                     _phase_corr_sig_1 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     float scale1 = sScale[warp % 4 * 32 + lane + BLOCK_M];
-                    int _warp_vote_2 = __any_sync(0xFFFFFFFF, scale1 < 1.0f);
-                    if (_warp_vote_2 != 0) {
+                    int _warp_vote_3 = __any_sync(0xFFFFFFFF, scale1 < 1.0f);
+                    if (_warp_vote_3 != 0) {
                         #pragma unroll
                         for (int cr_col_1 = 0; cr_col_1 < HEAD_DIM / 16; cr_col_1++) {
                             int cr_addr_1 = taddr + (unsigned int)384 + (unsigned int)(warp % 4 * 32 << 16) + (unsigned int)(cr_col_1 * 16);
@@ -2136,14 +2147,14 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                             float _tmem_load_3[16];
                             tmem_ld_x16(&_tmem_load_3[0], cr_addr_1);
 #endif
-                            const float2 _scale2_3 = {scale1, scale1};
+                            const float2 _scale2_4 = {scale1, scale1};
                             #pragma unroll
                             for (int _ls = 0; _ls < 8; _ls++)
 #if __CUDA_ARCH__ == 1030
-                                mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_2)[_ls], _scale2_3);
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_2)[_ls], _scale2_4);
                             tmem_st_x16_f32(cr_addr_1, _tmem_load_2);
 #else
-                                mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_3)[_ls], _scale2_3);
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_3)[_ls], _scale2_4);
                             tmem_st_x16_f32(cr_addr_1, _tmem_load_3);
 #endif
                         }
@@ -2152,6 +2163,7 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(p_full_addr + 8);
                     mbarrier_arrive(corr_done_addr);
+                    corr_seq += 1;
                 }
                 mbarrier_arrive(corr_done_addr + 8);
                 mbarrier_wait(corr_sig_addr, _phase_corr_sig_0);
@@ -2180,8 +2192,8 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                     float final_max = ((stage_1 == 0) ? final_max_0 : final_max_1);
                     float final_scale;
                     if (final_sum != 0.0f && final_sum == final_sum) {
-                        float _rcp_4 = approx_rcp(final_sum);
-                        final_scale = _rcp_4;
+                        float _rcp_5 = approx_rcp(final_sum);
+                        final_scale = _rcp_5;
                     } else {
                         final_scale = 0.0f;
                     }
@@ -2209,13 +2221,13 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                                 : "r"(ce_addr));
                             if (row_valid != 0) {
                                 long long o_elem = o_row * (long long)HEAD_DIM + (long long)(ce_col * 32);
-                                const float2 _scale2_5 = {final_scale, final_scale};
+                                const float2 _scale2_6 = {final_scale, final_scale};
                                 #pragma unroll
                                 for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_3)[_ls], _scale2_5);
+                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_3)[_ls], _scale2_6);
 #else
-                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_4)[_ls], _scale2_5);
+                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_4)[_ls], _scale2_6);
 #endif
                                 if (o_wide) {
                                     unsigned int _packed_0[16];
@@ -2519,9 +2531,11 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                             }
                         }
                     }
+                    asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(p_full_addr + (stage_1) * 8);
                 }
+                corr_seq += 2;
             }
         }
     }
@@ -2580,6 +2594,8 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                         num_n_blocks_2 = (max_n_2 + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N;
                     }
                 }
+                unsigned int _max_0_2 = ((num_n_blocks_2) > (1) ? (num_n_blocks_2) : (1));
+                num_n_blocks_2 = _max_0_2;
                 mbarrier_wait(q_full_addr, _phase_q_full_0);
                 _phase_q_full_0 ^= 1;
                 mbarrier_wait(q_full_addr + 8, _phase_q_full_1);
@@ -2589,90 +2605,90 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                 int _mma_a_lo_0 = make_warp_uniform(((smem_q0_addr) >> 4) & 0x3FFF);
                 int _mma_b_lo_0 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (mma_kv_stage) * 2048);
                 {
-                    uint64_t _mma_ss_a_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_0);
-                    uint64_t _mma_ss_b_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_0);
+                    uint64_t _mma_ss_a_desc_1 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_0);
+                    uint64_t _mma_ss_b_desc_1 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_0);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 136316048, 0);
+                        tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 136316048, 0);
                     }
-                    incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
-                    incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+                    incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 136316048, 1);
+                        tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 136316048, 1);
                     }
-                    incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
-                    incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+                    incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 136316048, 1);
+                        tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 136316048, 1);
                     }
-                    incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
-                    incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+                    incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 136316048, 1);
+                        tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 136316048, 1);
                     }
-                    incr_smem_desc_lo(_mma_ss_a_desc_0, 1018U);
-                    incr_smem_desc_lo(_mma_ss_b_desc_0, 1018U);
+                    incr_smem_desc_lo(_mma_ss_a_desc_1, 1018U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_1, 1018U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 136316048, 1);
+                        tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 136316048, 1);
                     }
-                    incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
-                    incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+                    incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 136316048, 1);
+                        tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 136316048, 1);
                     }
-                    incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
-                    incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+                    incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 136316048, 1);
+                        tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 136316048, 1);
                     }
-                    incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
-                    incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+                    incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 136316048, 1);
+                        tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 136316048, 1);
                     }
                 }
                 elect_commit(s_full_addr);
                 int _mma_a_lo_1 = make_warp_uniform(((smem_q1_addr) >> 4) & 0x3FFF);
                 int _mma_b_lo_1 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (mma_kv_stage) * 2048);
                 {
-                    uint64_t _mma_ss_a_desc_1 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_1);
-                    uint64_t _mma_ss_b_desc_1 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_1);
+                    uint64_t _mma_ss_a_desc_2 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_1);
+                    uint64_t _mma_ss_b_desc_2 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_1);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 136316048, 0);
+                        tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 136316048, 0);
                     }
-                    incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
-                    incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
+                    incr_smem_desc_lo(_mma_ss_a_desc_2, 2U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 136316048, 1);
+                        tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 136316048, 1);
                     }
-                    incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
-                    incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
+                    incr_smem_desc_lo(_mma_ss_a_desc_2, 2U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 136316048, 1);
+                        tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 136316048, 1);
                     }
-                    incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
-                    incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
+                    incr_smem_desc_lo(_mma_ss_a_desc_2, 2U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 136316048, 1);
+                        tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 136316048, 1);
                     }
-                    incr_smem_desc_lo(_mma_ss_a_desc_1, 1018U);
-                    incr_smem_desc_lo(_mma_ss_b_desc_1, 1018U);
+                    incr_smem_desc_lo(_mma_ss_a_desc_2, 1018U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_2, 1018U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 136316048, 1);
+                        tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 136316048, 1);
                     }
-                    incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
-                    incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
+                    incr_smem_desc_lo(_mma_ss_a_desc_2, 2U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 136316048, 1);
+                        tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 136316048, 1);
                     }
-                    incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
-                    incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
+                    incr_smem_desc_lo(_mma_ss_a_desc_2, 2U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 136316048, 1);
+                        tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 136316048, 1);
                     }
-                    incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
-                    incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
+                    incr_smem_desc_lo(_mma_ss_a_desc_2, 2U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 136316048, 1);
+                        tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 136316048, 1);
                     }
                 }
                 elect_commit(s_full_addr + 8);
@@ -2756,50 +2772,48 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                     mbarrier_wait(kv_full_addr + (mma_kv_stage) * 8, _phase_kv_full);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     unsigned int k_stage = mma_kv_stage;
-                    mma_kv_stage += 1;
-                    if (mma_kv_stage == 4) { mma_kv_stage = 0; _phase_kv_full ^= 1; }
                     int _mma_a_lo_2 = make_warp_uniform(((smem_q0_addr) >> 4) & 0x3FFF);
                     int _mma_b_lo_4 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (k_stage) * 2048);
                     {
-                        uint64_t _mma_ss_a_desc_2 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_2);
-                        uint64_t _mma_ss_b_desc_2 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_4);
+                        uint64_t _mma_ss_a_desc_3 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_2);
+                        uint64_t _mma_ss_b_desc_3 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_4);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 136316048, 0);
+                            tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 136316048, 0);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_2, 2U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_3, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 136316048, 1);
+                            tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 136316048, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_2, 2U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_3, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 136316048, 1);
+                            tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 136316048, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_2, 2U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_3, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 136316048, 1);
+                            tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 136316048, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_2, 1018U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_2, 1018U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_3, 1018U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_3, 1018U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 136316048, 1);
+                            tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 136316048, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_2, 2U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_3, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 136316048, 1);
+                            tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 136316048, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_2, 2U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_3, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 136316048, 1);
+                            tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 136316048, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_2, 2U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_3, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 136316048, 1);
+                            tcgen05_mma_f16(tmem_scores_0, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 136316048, 1);
                         }
                     }
                     elect_commit(s_full_addr);
@@ -2869,53 +2883,55 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_output_1), "r"(_mma_b_lo_6), "r"(tmem_softmax_1), "r"(1) : "memory");
-                    elect_commit(kv_empty_addr + (v_stage) * 8);
+                    elect_commit(kv_empty_addr + (((mma_kv_stage + 3 >= 4) ? mma_kv_stage + 3 - 4 : mma_kv_stage + 3)) * 8);
                     int _mma_a_lo_3 = make_warp_uniform(((smem_q1_addr) >> 4) & 0x3FFF);
                     int _mma_b_lo_7 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (k_stage) * 2048);
                     {
-                        uint64_t _mma_ss_a_desc_3 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_3);
-                        uint64_t _mma_ss_b_desc_3 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_7);
+                        uint64_t _mma_ss_a_desc_4 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_3);
+                        uint64_t _mma_ss_b_desc_4 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_7);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 136316048, 0);
+                            tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 136316048, 0);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_3, 2U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_4, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 136316048, 1);
+                            tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 136316048, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_3, 2U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_4, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 136316048, 1);
+                            tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 136316048, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_3, 2U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_4, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 136316048, 1);
+                            tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 136316048, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_3, 1018U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_3, 1018U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_4, 1018U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_4, 1018U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 136316048, 1);
+                            tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 136316048, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_3, 2U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_4, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 136316048, 1);
+                            tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 136316048, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_3, 2U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_4, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 136316048, 1);
+                            tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 136316048, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_3, 2U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_4, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 136316048, 1);
+                            tcgen05_mma_f16(tmem_scores_1, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 136316048, 1);
                         }
                     }
                     elect_commit(s_full_addr + 8);
                     elect_commit(kv_empty_addr + (k_stage) * 8);
+                    mma_kv_stage += 1;
+                    if (mma_kv_stage == 4) { mma_kv_stage = 0; _phase_kv_full ^= 1; }
                     first_pv = 0;
                 }
                 elect_commit(q_empty_addr);
@@ -3109,6 +3125,8 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                         num_n_blocks_3 = (max_n_3 + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N;
                     }
                 }
+                unsigned int _max_0_3 = ((num_n_blocks_3) > (1) ? (num_n_blocks_3) : (1));
+                num_n_blocks_3 = _max_0_3;
                 unsigned int b_idx = bh_3 / (unsigned int)(NUM_Q_HEADS / PACK_G);
                 int pt_base = b_idx * (unsigned int)page_row_stride;
                 int last_slot = (seqlen_kv_bh_3 - 1) / PAGE_SIZE;
@@ -3119,11 +3137,19 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                     mbarrier_wait(page_empty_addr + (po_stage) * 8, _phase_page_empty);
                     if (elect_sync()) {
                         int pg_idx = po_stage * 16;
-                        #pragma unroll
-                        for (int chunk = 0; chunk < BLOCK_N / KV_TOK_CHUNK; chunk++) {
-                            int slot = (((base_tok + chunk * KV_TOK_CHUNK) / PAGE_SIZE) < (last_slot) ? ((base_tok + chunk * KV_TOK_CHUNK) / PAGE_SIZE) : (last_slot));
-                            smem_pages[pg_idx + chunk] = page_table_k[pt_base + slot];
-                            smem_pages[pg_idx + 8 + chunk] = page_table_v[pt_base + slot];
+                        if (seqlen_kv_bh_3 == 0) {
+                            #pragma unroll
+                            for (int chunk = 0; chunk < BLOCK_N / KV_TOK_CHUNK; chunk++) {
+                                smem_pages[pg_idx + chunk] = 1073741824;
+                                smem_pages[pg_idx + 8 + chunk] = 1073741824;
+                            }
+                        } else {
+                            #pragma unroll
+                            for (int chunk_1 = 0; chunk_1 < BLOCK_N / KV_TOK_CHUNK; chunk_1++) {
+                                int slot = (((base_tok + chunk_1 * KV_TOK_CHUNK) / PAGE_SIZE) < (last_slot) ? ((base_tok + chunk_1 * KV_TOK_CHUNK) / PAGE_SIZE) : (last_slot));
+                                smem_pages[pg_idx + chunk_1] = page_table_k[pt_base + slot];
+                                smem_pages[pg_idx + 8 + chunk_1] = page_table_v[pt_base + slot];
+                            }
                         }
                         mbarrier_arrive(page_full_addr + (po_stage) * 8);
                     }
@@ -3212,6 +3238,8 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                         num_n_blocks_4 = (max_n_4 + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N;
                     }
                 }
+                unsigned int _max_0_4 = ((num_n_blocks_4) > (1) ? (num_n_blocks_4) : (1));
+                num_n_blocks_4 = _max_0_4;
                 int unit_1 = bh_4 % (unsigned int)(NUM_Q_HEADS / PACK_G);
                 int kv_head = unit_1 * PACK_G / HEADS_PER_GROUP;
                 int tok_q0 = (unsigned int)cu_seq_lens_q[bh_4 / (unsigned int)(NUM_Q_HEADS / PACK_G)] + m_block_4 * 2 * (unsigned int)TOK_PER_STAGE;
@@ -3238,11 +3266,11 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                     if (elect_sync()) {
                         mbarrier_arrive_expect_tx(kv_full_addr + (load_kv_stage) * 8, 32768);
                         #pragma unroll
-                        for (int chunk_1 = 0; chunk_1 < BLOCK_N / KV_TOK_CHUNK; chunk_1++) {
-                            int tok_off = (base_tok_1 + chunk_1 * KV_TOK_CHUNK) % PAGE_SIZE;
+                        for (int chunk_2 = 0; chunk_2 < BLOCK_N / KV_TOK_CHUNK; chunk_2++) {
+                            int tok_off = (base_tok_1 + chunk_2 * KV_TOK_CHUNK) % PAGE_SIZE;
                             const int chunk_bytes = KV_TOK_CHUNK * 64 * 2;
-                            tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + (unsigned int)(chunk_1 * chunk_bytes), (&K), 0, tok_off, 0, kv_head, smem_pages[pg_idx_1 + chunk_1], kv_full_addr + (load_kv_stage) * 8);
-                            tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + (unsigned int)(16384 + chunk_1 * chunk_bytes), (&K), 0, tok_off, 1, kv_head, smem_pages[pg_idx_1 + chunk_1], kv_full_addr + (load_kv_stage) * 8);
+                            tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + (unsigned int)(chunk_2 * chunk_bytes), (&K), 0, tok_off, 0, kv_head, smem_pages[pg_idx_1 + chunk_2], kv_full_addr + (load_kv_stage) * 8);
+                            tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + (unsigned int)(16384 + chunk_2 * chunk_bytes), (&K), 0, tok_off, 1, kv_head, smem_pages[pg_idx_1 + chunk_2], kv_full_addr + (load_kv_stage) * 8);
                         }
                     }
                     load_kv_stage += 1;
@@ -3251,11 +3279,11 @@ kernel_cake_fmha_context_bf16_eb5b942877557703876d(const __grid_constant__ CUten
                     if (elect_sync()) {
                         mbarrier_arrive_expect_tx(kv_full_addr + (load_kv_stage) * 8, 32768);
                         #pragma unroll
-                        for (int chunk_2 = 0; chunk_2 < BLOCK_N / KV_TOK_CHUNK; chunk_2++) {
-                            int tok_off_1 = (base_tok_1 + chunk_2 * KV_TOK_CHUNK) % PAGE_SIZE;
+                        for (int chunk_3 = 0; chunk_3 < BLOCK_N / KV_TOK_CHUNK; chunk_3++) {
+                            int tok_off_1 = (base_tok_1 + chunk_3 * KV_TOK_CHUNK) % PAGE_SIZE;
                             const int chunk_bytes_1 = KV_TOK_CHUNK * 64 * 2;
-                            tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + (unsigned int)(chunk_2 * chunk_bytes_1), (&V), 0, tok_off_1, 0, kv_head, smem_pages[pg_idx_1 + 8 + chunk_2], kv_full_addr + (load_kv_stage) * 8);
-                            tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + (unsigned int)(16384 + chunk_2 * chunk_bytes_1), (&V), 0, tok_off_1, 1, kv_head, smem_pages[pg_idx_1 + 8 + chunk_2], kv_full_addr + (load_kv_stage) * 8);
+                            tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + (unsigned int)(chunk_3 * chunk_bytes_1), (&V), 0, tok_off_1, 0, kv_head, smem_pages[pg_idx_1 + 8 + chunk_3], kv_full_addr + (load_kv_stage) * 8);
+                            tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 32768 + (unsigned int)(16384 + chunk_3 * chunk_bytes_1), (&V), 0, tok_off_1, 1, kv_head, smem_pages[pg_idx_1 + 8 + chunk_3], kv_full_addr + (load_kv_stage) * 8);
                         }
                     }
                     load_kv_stage += 1;
