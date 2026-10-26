@@ -1242,6 +1242,7 @@ def _is(name: str, *prefixes: str) -> bool:
     return loader.MODULES[name]["library"].startswith(prefixes)
 
 
+@pytest.mark.cpu_only
 def test_rules_table_is_the_harness_table_of_record() -> None:
     expected = _rows()
     assert len(expected) == 28 * len(BOARDS)
@@ -1260,6 +1261,7 @@ def test_rules_table_is_the_harness_table_of_record() -> None:
         assert loader.rules_row(want["T"], want["sm_count"], want["arch"]) == want
 
 
+@pytest.mark.cpu_only
 def test_host_plan_matches_the_table() -> None:
     for row in _rows():
         if row["T"] == 0:
@@ -1329,6 +1331,7 @@ def test_host_plan_matches_the_table() -> None:
         assert plan["chunks"] * plan["rows_per_cta"] >= row["T"]
 
 
+@pytest.mark.cpu_only
 def test_program_columns_follow_the_rules_of_record() -> None:
     for row in _rows():
         T, sm, arch = row["T"], row["sm_count"], row["arch"]
@@ -1388,6 +1391,7 @@ def test_program_columns_follow_the_rules_of_record() -> None:
         assert row["bwd_slab_program"] in SLAB_LIBRARY
 
 
+@pytest.mark.cpu_only
 def test_dispatch_of_record_at_the_boundaries() -> None:
     """The kernel-tests reference master's dispatch at every band boundary (:data:`DISPATCH_EXPECTED`: P_K and K units,
     the mapping-pass, coefficient-pass, token-owner, column-slab and reduction programs with the reduction's grid, the
@@ -1581,6 +1585,7 @@ def _literals() -> dict:
     return found
 
 
+@pytest.mark.cpu_only
 def test_registry_tables_are_literals() -> None:
     literals = _literals()
     for name in (
@@ -1622,6 +1627,7 @@ def test_registry_tables_are_literals() -> None:
     assert tuple(literals["ARCHES"]) == ARCHES
 
 
+@pytest.mark.cpu_only
 def test_records_are_consistent() -> None:
     modules = loader.MODULES
     assert len(modules) == len(RECORD_ARCHES) == N_RECORDS
@@ -1898,6 +1904,7 @@ def test_records_are_consistent() -> None:
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(("arch", "sm"), BOARDS)
 def test_every_call_selects_one_record_per_dispatched_kernel(
     arch: str, sm: int
@@ -1989,6 +1996,7 @@ def test_every_call_selects_one_record_per_dispatched_kernel(
         loader._selects({"kind": "other", "above": 0, "at_most": None}, 1, sm, arch)
 
 
+@pytest.mark.cpu_only
 def test_pdl_only_where_the_kernel_waits_for_the_preceding_grid() -> None:
     """``use_pdl`` is safe only for kernels that wait (``griddepcontrol.wait``) before reading a predecessor's
     output: the coefficient pass, the row streams, the token-owner pass, the column-slab pass (every role waits
@@ -2046,6 +2054,7 @@ def test_pdl_only_where_the_kernel_waits_for_the_preceding_grid() -> None:
     assert n_map >= len(MAP_LIBRARY)
 
 
+@pytest.mark.cpu_only
 def test_pdl_bands_of_record() -> None:
     """The per-call PDL attribute is off exactly inside the measured token-count bands of ``PDL_OFF_BANDS`` -- per
     architecture, edge (predecessor -> dependent) and call path -- and on in every other call; the records on an edge
@@ -2118,6 +2127,7 @@ def test_pdl_bands_of_record() -> None:
         loader.enable_pdl("cake_mhc_train_fwd_collapse", 1024, "sm_103a", "other")
 
 
+@pytest.mark.cpu_only
 def test_launch_facts_of_record() -> None:
     """The block and the dynamic shared memory every module launches with (:data:`LAUNCH_FACTS`: the kernel's
     shared-memory pool plus the 1024-byte control prefix (TMA mbarriers, TMEM hold) where the kernel declares one;
@@ -2198,6 +2208,7 @@ def test_launch_facts_of_record() -> None:
     assert 5 * 28672 + 1024 + 1024 <= 228 * 1024
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(("arch", "sm"), BOARDS)
 def test_launch_grids_follow_the_rules(
     monkeypatch: pytest.MonkeyPatch, arch: str, sm: int
@@ -2324,6 +2335,7 @@ def test_launch_grids_follow_the_rules(
         loader.launch_grid(modules[some_coef], 0, device_index=0)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(("arch", "sm"), BOARDS)
 def test_workspace_regions_and_envelope(arch: str, sm: int) -> None:
     names = {
@@ -2375,6 +2387,7 @@ def test_workspace_regions_and_envelope(arch: str, sm: int) -> None:
         loader.workspace_regions("other", 1, sm, arch)
 
 
+@pytest.mark.cpu_only
 def test_the_p_k_band_changes_the_forward_workspace_on_sm_103a_alone() -> None:
     """The P_K = 16 band (8192 < T <= 16384 on sm_103a) doubles the K-unit partials of the forward workspace; the
     backward workspace and the other architectures are unchanged."""
@@ -2392,6 +2405,7 @@ def test_the_p_k_band_changes_the_forward_workspace_on_sm_103a_alone() -> None:
             ) == loader.workspace_bytes("bwd", T, 148, "sm_100a")
 
 
+@pytest.mark.cpu_only
 def test_route_glue() -> None:
     assert loader.supported_hidden_sizes("sm_100a") == (4096,)
     assert loader.arch_for_capability((10, 0)) == "sm_100a"
