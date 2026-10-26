@@ -41,11 +41,13 @@ limitations under the License.
 #   (``torch.mm``, BF16 slice) above;
 # * the tail  owner reduce of the scattered ``shared_partial`` columns, add of
 #   the up-projection slice, one BF16 rounding, multicast all-gather into the
-#   caller-owned ``out``: ``k3_ess:grouped`` (one CTA per token and column
-#   half) for ``8 < M < K3_PERSIST_MIN_TOKENS`` (961); from there on the
-#   persistent token pipeline (``min(M, SM count)`` CTAs per column half, own
-#   scatter of ``shared_partial``) with ``cp.async.bulk`` reduce-scatter
-#   pushes, ``k3_persist_bulk:pinned``.
+#   caller-owned ``out``, by ``ROUTE_TABLE``: ``k3_ess:grouped`` (one CTA per
+#   token and column half) for ``8 < M < 320``; the persistent reduce mode
+#   ``k3_reduce:grouped`` (``min(M, SM count)`` CTAs per column half over the
+#   slots the ESS K1 filled) for ``320 <= M < K3_PERSIST_MIN_TOKENS`` (961);
+#   from there on the persistent token pipeline (``min(M, SM count)`` CTAs per
+#   column half, own scatter of ``shared_partial``) with ``cp.async.bulk``
+#   reduce-scatter pushes, ``k3_persist_bulk:pinned``.
 #
 # For ``M <= K23_MAX_TOKENS`` one program, ``k123:c<capacity>``, runs both
 # stages as two CTA roles of one grid ``(M + cols / K23_ROWS, 1, 1)``: the
@@ -122,7 +124,8 @@ K23_ROWS = 8
 #: The tail runs the persistent token pipeline (``k3_persist*:*``, grid ``(min(M, SM count), 2, 1)``: CTA ``b`` walks
 #: tokens ``b, b + P, ...`` scattering token ``t_k`` while reducing ``t_{k-1}`` and gathering ``t_{k-2}``) from this many
 #: tokens on; below it an early-shared-scatter K1 (``k1_*_ess``) scatters ``shared_partial`` and the one-CTA-per-token
-#: K3-ESS form (``k3_ess:grouped``, grid ``(M, 2, 1)``) reduces, adds and gathers.  In a paired A/B on GB200 and GB300
+#: K3-ESS form (``k3_ess:grouped``, grid ``(M, 2, 1)``) or, by ``ROUTE_TABLE``, the persistent tail's reduce mode
+#: (``k3_reduce:grouped``) reduces, adds and gathers.  In a paired A/B on GB200 and GB300
 #: NVL72 the ESS route is 1.6-7.2 us faster than the persistent one from 640 through 960 tokens and ties or loses from
 #: 1023 tokens on.
 K3_PERSIST_MIN_TOKENS = GROUPED_MAX_TOKENS + 1
@@ -131,6 +134,25 @@ K3_PERSIST_MIN_TOKENS = GROUPED_MAX_TOKENS + 1
 #: tail ``k3_persist:grouped`` and the plain grouped two-shot K1 ``k1_twoshot:grouped`` stay registered, but no token
 #: count selects them.
 BULK_MIN_TOKENS = K3_PERSIST_MIN_TOKENS
+#: Tail route for ``M > ONESHOT_MAX_TOKENS``: ``(first token count, form)`` rows in increasing first-count order; ``M``
+#: takes the last row whose first count is ``<= M``.  Forms:
+#:
+#: * ``"ess"``: ESS two-shot K1 -> cuBLAS -> K3-ESS (``k3_ess:grouped``, one CTA per token and column half);
+#: * ``"reduce"``: ESS two-shot K1 -> cuBLAS -> the persistent tail's reduce mode (``k3_reduce:grouped``, grid
+#:   ``(min(M, SM count), 2, 1)``: CTA ``b`` reduces token ``t_k`` of tokens ``b, b + P, ...`` over the slots the ESS K1
+#:   filled while it gathers the multicast row of ``t_{k-2}``);
+#: * ``"persist"``: plain two-shot K1 -> cuBLAS -> the persistent K3 with its own scatter and ``cp.async.bulk`` pushes
+#:   (``k3_persist_bulk:pinned``).
+#:
+#: Every form writes the same packets into the same slots and reduces them in the same order, so ``out`` is bitwise
+#: identical across forms.  The ESS K1 forms serve the grouped poll-schedule range only (``M <= GROUPED_MAX_TOKENS``).
+#: In a paired A/B on GB300 NVL72 the reduce form ties K3-ESS at 320 and 321 tokens and is 0.6-4.9 us faster from 383
+#: through 960 tokens.
+ROUTE_TABLE: tuple[tuple[int, str], ...] = (
+    (ONESHOT_MAX_TOKENS + 1, "ess"),
+    (320, "reduce"),
+    (K3_PERSIST_MIN_TOKENS, "persist"),
+)
 DEFAULT_MAX_TOKENS = 4096
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 
@@ -155,15 +177,28 @@ def poll_schedule_for(num_tokens: int) -> str:
     return "grouped" if num_tokens <= GROUPED_MAX_TOKENS else "pinned"
 
 
+def route_form_for(num_tokens: int) -> str:
+    """The ``ROUTE_TABLE`` form of ``num_tokens > ONESHOT_MAX_TOKENS``."""
+    if num_tokens <= ONESHOT_MAX_TOKENS:
+        raise ValueError(
+            f"num_tokens={num_tokens} <= {ONESHOT_MAX_TOKENS} runs the one-shot routes (no route-table row)"
+        )
+    form = ROUTE_TABLE[0][1]
+    for first, row_form in ROUTE_TABLE:
+        if first <= num_tokens:
+            form = row_form
+    return form
+
+
 def k1_kernel_key(num_tokens: int, rank: int) -> str:
     """The K1 kernel key: the one-launch program ``k123:c<capacity>`` (K1 and the fused K23 tail in one grid) for
-    ``num_tokens <= K23_MAX_TOKENS``, the early-shared-scatter (ESS) forms below ``K3_PERSIST_MIN_TOKENS``, plain
-    two-shot above."""
+    ``num_tokens <= K23_MAX_TOKENS``, the one-shot early-shared-scatter (ESS) form up to ``ONESHOT_MAX_TOKENS``, then
+    the two-shot ESS form for the ``"ess"`` / ``"reduce"`` routes and the plain two-shot form for ``"persist"``."""
     if num_tokens <= K23_MAX_TOKENS:
         return f"k123:c{k23_capacity_for(num_tokens)}"
     if num_tokens <= ONESHOT_MAX_TOKENS:
         return "k1_oneshot_ess"
-    if num_tokens < K3_PERSIST_MIN_TOKENS:
+    if route_form_for(num_tokens) in ("ess", "reduce"):
         return f"k1_twoshot_ess:{poll_schedule_for(num_tokens)}"
     return f"k1_twoshot:{poll_schedule_for(num_tokens)}"
 
@@ -185,13 +220,17 @@ def k23_capacity_for(num_tokens: int) -> int:
 
 def k3_form_for(num_tokens: int) -> str:
     """Tail form for ``num_tokens``: ``"k123"`` (the K23 role of the one-launch program, ``M <= K23_MAX_TOKENS``: no
-    tail launch of its own), ``"ess"`` (one CTA per token and column half after an ESS K1, ``M <
-    K3_PERSIST_MIN_TOKENS``), ``"persist"`` (persistent token pipeline, ``M < BULK_MIN_TOKENS``: an empty range while
-    the two thresholds are equal) or ``"persist_bulk"`` (persistent pipeline with ``cp.async.bulk`` pushes)."""
+    tail launch of its own), ``"ess"`` (one CTA per token and column half after an ESS K1: the one-shot rows and the
+    ``"ess"`` route), ``"reduce"`` (the persistent reduce mode after an ESS K1: the ``"reduce"`` route), ``"persist"``
+    (persistent token pipeline with its own scatter, ``M < BULK_MIN_TOKENS``: an empty range while the two thresholds
+    are equal) or ``"persist_bulk"`` (the same with ``cp.async.bulk`` pushes) for the ``"persist"`` route."""
     if num_tokens <= K23_MAX_TOKENS:
         return "k123"
-    if num_tokens < K3_PERSIST_MIN_TOKENS:
+    if num_tokens <= ONESHOT_MAX_TOKENS:
         return "ess"
+    form = route_form_for(num_tokens)
+    if form in ("ess", "reduce"):
+        return form
     if num_tokens < BULK_MIN_TOKENS:
         return "persist"
     return "persist_bulk"
@@ -435,7 +474,8 @@ class KimiK3Tp12TailRunner:
     ``launch()`` submits the one-launch program alone for
     ``M <= K23_MAX_TOKENS`` (``k3`` is None); above, K1 (the
     early-shared-scatter form below ``K3_PERSIST_MIN_TOKENS``), cuBLAS for
-    the up-projection slice (``cublas``) and the tail kernel -- K3-ESS below
+    the up-projection slice (``cublas``) and the tail kernel -- K3-ESS or the
+    persistent reduce mode (by ``ROUTE_TABLE``) below
     ``K3_PERSIST_MIN_TOKENS``, the persistent K3 with ``cp.async.bulk``
     pushes from there on -- in
     order on the current torch stream with no CUDA allocation and no host
@@ -634,8 +674,8 @@ def _k3_launch_kwargs(
             grid=grid,
         )
     else:
-        # persistent K3 (cp.async.bulk pushes; the unselected plain form takes the same arguments): scatters
-        # shared_partial itself
+        # persistent K3 (cp.async.bulk pushes; the unselected plain form and the reduce mode take the same
+        # arguments): scatters shared_partial itself, or (reduce mode) reads the slots the ESS K1 filled
         k3_kwargs = dict(
             shared=shared_partial,
             gemm_slice=gemm,
@@ -783,6 +823,7 @@ __all__ = [
     "ONESHOT_MAX_TOKENS",
     "PARTITION",
     "RMS_EPS",
+    "ROUTE_TABLE",
     "SUPPORTED_COMPUTE_CAPABILITIES",
     "THREADS",
     "WORLD_SIZE",
@@ -796,6 +837,7 @@ __all__ = [
     "k3_kernel_key",
     "poll_schedule_for",
     "prepare_kimi_k3_tp12_tail",
+    "route_form_for",
     "route_kernel_keys",
     "up_proj_form_for",
     "workspace_buffer_bytes",

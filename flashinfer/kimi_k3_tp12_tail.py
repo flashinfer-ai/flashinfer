@@ -21,8 +21,8 @@ import torch
 from .api_logging import flashinfer_experimental_api
 
 # Thin experimental entry points; the workspace, route selection (one-launch
-# program / one-shot / two-shot K1, K3-ESS / persistent tail, grouped / pinned
-# poll schedule), launch binding and JIT registration live in
+# program / one-shot / two-shot K1, K3-ESS / reduce / persistent tail, grouped /
+# pinned poll schedule), launch binding and JIT registration live in
 # flashinfer.experimental.kimi_k3_tp12_tail.
 
 _FEATURE = "Kimi-K3 TP12 fused LatentMoE tail"
@@ -114,9 +114,10 @@ def prepare_kimi_k3_tp12_tail(
     ``shared_partial`` columns fused with the add of the slice, one BF16
     rounding and the multicast all-gather of ``out`` (one CTA per eight output
     columns for ``M <= 8``, in the same grid as the all-reduce's one CTA per
-    token; one CTA per token below 961 tokens, a persistent token pipeline
-    above).  ``out`` is bitwise identical on every rank.  Every rank must
-    prepare and launch the same ``M``.
+    token; one CTA per token below 320 tokens, a persistent grid that reduces
+    and gathers from 320 to 960 tokens, a persistent token pipeline above).
+    ``out`` is bitwise identical on every rank.  Every rank must prepare and
+    launch the same ``M``.
 
     Parameters
     ----------
