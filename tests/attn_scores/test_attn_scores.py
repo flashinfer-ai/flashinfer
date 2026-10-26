@@ -9340,6 +9340,53 @@ def test_capacity_shared_layer_workspace(heads, ratio):
 
 
 @_requires_selective_sm100
+def test_capacity_first_compact_pool_precompiles_metadata(monkeypatch):
+    """A cold compact-repair pool never compiles metadata during capture."""
+    from flashinfer.attn_scores import selective_logits
+
+    # Preserve existing compiled owners while giving this plan a cold metadata
+    # cache, so the assertion does not depend on earlier tests' specializations.
+    monkeypatch.setattr(selective_logits, "_METADATA_COMPILED", {})
+    real_compile = selective_logits._compile_for_device
+    metadata_compiles = []
+
+    def compile_outside_capture(device, kernel, *args):
+        if type(kernel).__name__ in (
+            "SelectiveLogitsMetadataScheduleKernel",
+            "SelectiveLogitsExplicitMetadataScheduleKernel",
+        ):
+            assert not torch.cuda.is_current_stream_capturing()
+            metadata_compiles.append(type(kernel).__name__)
+        return real_compile(device, kernel, *args)
+
+    monkeypatch.setattr(
+        selective_logits, "_compile_for_device", compile_outside_capture
+    )
+    inputs = _request_inputs([2], [9001])
+    q, _, _, weights, qo, kv = inputs
+    fused, table = _paged_inputs(inputs)
+    wrapper = FP8PagedMQATopKWrapper(
+        strategy="selective",
+        max_context_length=9001,
+        max_chunk_size=2,
+        max_batch_size=1,
+        kv_layout=fused,
+    )
+    wrapper.prepare_pool(fused)
+    assert wrapper._capacity_plan._engine._compact_repair
+    assert metadata_compiles
+    assert any(key[-1] for key in selective_logits._METADATA_COMPILED)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.plan(qo, kv, table)
+        selected = wrapper.run(q, weights, fused)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert wrapper.error.item() == wrapper.repair_error.item() == 0
+    _check_selection(selected, _oracle_rows(inputs), 512)
+
+
+@_requires_selective_sm100
 @pytest.mark.parametrize("ratio", [1, 4])
 @pytest.mark.parametrize("physical_capacity", [6143, 6144, 6145])
 def test_capacity_sampling_physical_boundary(ratio, physical_capacity, monkeypatch):

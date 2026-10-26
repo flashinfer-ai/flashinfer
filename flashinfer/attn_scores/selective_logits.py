@@ -877,6 +877,7 @@ def _launch_metadata(
     row_starts: torch.Tensor | None = None,
     row_ends: torch.Tensor | None = None,
     active_rows: torch.Tensor | None = None,
+    _compile_only: bool = False,
 ) -> None:
     """Refresh caller-owned metadata with no allocation or host readback."""
     device = prepared.context_lens.device
@@ -933,7 +934,7 @@ def _launch_metadata(
     else:
         _require_aligned((cu_q, cu_kv))
 
-    if not prepared.capacity_bounds:
+    if not prepared.capacity_bounds and not _compile_only:
         _validate_device_metadata_values(
             cu_q,
             cu_kv,
@@ -999,6 +1000,10 @@ def _launch_metadata(
     )
     compiled = _METADATA_COMPILED.get(key)
     if compiled is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "metadata kernels must be compiled before CUDA graph capture"
+            )
         from .kernels.selective_logits_metadata import (
             SelectiveLogitsExplicitMetadataScheduleKernel,
             SelectiveLogitsMetadataScheduleKernel,
@@ -1023,7 +1028,8 @@ def _launch_metadata(
         )
         compiled = _compile_for_device(device, metadata_kernel, *args, stream)
         _METADATA_COMPILED[key] = compiled
-    compiled(*args, stream)
+    if not _compile_only:
+        compiled(*args, stream)
 
 
 def _launch_compact_metadata(
@@ -3132,7 +3138,7 @@ class _FP8PagedMQASelectiveTopKEngine:
         weights: torch.Tensor,
         block_table: torch.Tensor,
     ) -> None:
-        """Compile and bind every score phase needed by :meth:`run`."""
+        """Compile score phases and repair metadata before graph capture."""
         self._check_math_mode()
         assert self._prepared is not None
         assert self._repair_prepared is not None
@@ -3174,6 +3180,26 @@ class _FP8PagedMQASelectiveTopKEngine:
         assert self._candidate_counts is not None
         assert self._candidate_lengths is not None
         assert self._repair_flags is not None
+        if self._compact_repair:
+            assert self._physical_cu_kv is not None
+            assert self._repair_cu_q is not None
+            assert self._packed_repair_starts is not None
+            assert self._packed_repair_ends is not None
+            assert self._repair_active_count is not None
+            assert self._second_active_count is not None
+            for prepared, active_rows in (
+                (self._repair_prepared, self._repair_active_count),
+                (self._prepared, self._second_active_count),
+            ):
+                _launch_metadata(
+                    prepared,
+                    self._repair_cu_q,
+                    self._physical_cu_kv,
+                    row_starts=self._packed_repair_starts,
+                    row_ends=self._packed_repair_ends,
+                    active_rows=active_rows,
+                    _compile_only=True,
+                )
         _fp8_mqa_selective_logits(
             q,
             self._sample_fused,
