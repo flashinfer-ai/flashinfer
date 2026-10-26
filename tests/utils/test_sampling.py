@@ -290,8 +290,51 @@ def test_blackwell_cached_cluster_route_is_selected_and_correct(
         "shared_tiles": flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_SHARED_TILES,
     }
     assert route == routes[expected_route]
+    # Only sm_103a launches with PDL, and then through the kernel's _pdl twin.
+    kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    on_sm103 = torch.cuda.get_device_capability() == (10, 3)
+    assert kernel[2] == int(enable_pdl and on_sm103)
     assert probs.data_ptr() != logits.data_ptr()
     torch.testing.assert_close(probs, probs_ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size",
+    [
+        (32, 32000),  # B200: fewer resident 16-CTA clusters than rows
+        (34, 32000),  # B200 and GB300
+        (36, 64000),
+        (72, 24576),  # B200: fewer resident 8-CTA clusters than rows
+        (73, 24576),
+        (75, 24576),  # GB300: fewer resident 8-CTA clusters than rows
+    ],
+)
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_blackwell_cached_cluster_spread_keeps_rows_resident(
+    rows, vocab_size, enable_pdl
+):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    torch.manual_seed(7)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        logits, temperature=0.5, enable_pdl=enable_pdl
+    )
+    probs = flashinfer.sampling.softmax(logits, temperature=0.5, enable_pdl=enable_pdl)
+
+    _, max_tiles, pdl_twin, resident_clusters = kernel
+    on_sm103 = torch.cuda.get_device_capability() == (10, 3)
+    # Spreading a row over more CTAs stops before a cluster size whose
+    # resident clusters are fewer than the rows, so all rows run in one wave.
+    assert max_tiles == 4
+    assert rows <= resident_clusters
+    assert pdl_twin == int(enable_pdl and on_sm103)
+    torch.testing.assert_close(
+        probs, torch.softmax(logits / 0.5, dim=-1), atol=1e-3, rtol=1e-3
+    )
 
 
 @pytest.mark.parametrize(

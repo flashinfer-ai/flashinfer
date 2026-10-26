@@ -48,27 +48,49 @@ __global__ void kernel_flashinfer_blackwell_softmax_followup_warp(float* logits,
 // warp's (max, sum) pair goes to every CTA of the cluster through st.async
 // pushes counted on an mbarrier, and each CTA writes its normalized chunk.
 // Clusters of 16 CTAs need cudaFuncAttributeNonPortableClusterSizeAllowed.
-// The sm_103a PDL flag rides in bit 2 of parameter_kind, as for the other
-// adapted kernels.
+// Each cached-cluster kernel NAME has a twin NAME_pdl for PDL launches, which
+// waits on the prerequisite grid at entry and triggers its dependents at
+// exit; both take the plain 0/1/2 parameter_kind.
 __global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c1_t4(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c1_t4_pdl(
     float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
     int parameter_kind, float scalar_temperature);
 __global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c2_t4(
     float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
     int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c2_t4_pdl(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
 __global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c4_t4(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c4_t4_pdl(
     float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
     int parameter_kind, float scalar_temperature);
 __global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c8_t4(
     float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
     int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c8_t4_pdl(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
 __global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c8_t8(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c8_t8_pdl(
     float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
     int parameter_kind, float scalar_temperature);
 __global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c16_t4(
     float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
     int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c16_t4_pdl(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
 __global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c16_t8(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c16_t8_pdl(
     float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
     int parameter_kind, float scalar_temperature);
 
@@ -78,7 +100,13 @@ __global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c16_t8(
 __global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c8_t4_s4(
     float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
     int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c8_t4_s4_pdl(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
 __global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c16_t4_s4(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c16_t4_s4_pdl(
     float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
     int parameter_kind, float scalar_temperature);
 
@@ -89,7 +117,13 @@ __global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_c16_t4_s4(
 __global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c8_t8(
     float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
     int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c8_t8_pdl(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
 __global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c16_t8(
+    float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
+    int parameter_kind, float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c16_t8_pdl(
     float* x, float* parameter, float* output, int rows, int vocab_size, int chunk_elements,
     int parameter_kind, float scalar_temperature);
 
