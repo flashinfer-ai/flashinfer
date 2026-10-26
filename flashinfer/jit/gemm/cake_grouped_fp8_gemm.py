@@ -629,6 +629,7 @@ ROUTES: dict[str, Any] = {
     "bs_ue8m0_swap": "cake_grouped_fp8_gemm_1a2e91f2538e452d994a",
     "bs_ue8m0_swap_carry": "cake_grouped_fp8_gemm_d9a93c364e8ec95b96b2",
     "bs_ue8m0_swap_carry_s16": "cake_grouped_fp8_gemm_b171fdd83d9c3356bb5e",
+    "bs_ue8m0_swap_rp32": "cake_grouped_fp8_gemm_7bcd26069f3a219a87e7",
     "bs_ue8m0_swap_run32": "cake_grouped_fp8_gemm_9bbdce371d7ecbc3fc43",
     "bs_ue8m0_swap_s16": "cake_grouped_fp8_gemm_d06c687bb7a0129053ad",
     "deepk_c2_ab6_scale1_direct_store_m32": "cake_grouped_fp8_gemm_c8a9c3fa0b10ff00c03a",
@@ -660,6 +661,7 @@ ROUTE_GEOMETRY: dict[str, dict[str, int]] = {
     "bs_ue8m0_swap": {"tile_m": 128, "tile_n": 256, "cluster_ctas": 2},
     "bs_ue8m0_swap_carry": {"tile_m": 128, "tile_n": 256, "cluster_ctas": 2},
     "bs_ue8m0_swap_carry_s16": {"tile_m": 128, "tile_n": 256, "cluster_ctas": 2},
+    "bs_ue8m0_swap_rp32": {"tile_m": 32, "tile_n": 256, "cluster_ctas": 2},
     "bs_ue8m0_swap_run32": {"tile_m": 128, "tile_n": 256, "cluster_ctas": 2},
     "bs_ue8m0_swap_s16": {"tile_m": 128, "tile_n": 256, "cluster_ctas": 2},
     "deepk_c2_ab6_scale1_direct_store_m32": {

@@ -391,6 +391,7 @@ BS_SWAP_CARRY_ROUTE = "bs_ue8m0_swap_carry"
 BS_SWAP_RUN32_ROUTE = "bs_ue8m0_swap_run32"
 BS_SWAP_S16_ROUTE = "bs_ue8m0_swap_s16"
 BS_SWAP_CARRY_S16_ROUTE = "bs_ue8m0_swap_carry_s16"
+BS_SWAP_RP32_ROUTE = "bs_ue8m0_swap_rp32"
 BS_SWAP_ROUTES = frozenset(
     {
         BS_SWAP_ROUTE,
@@ -398,12 +399,19 @@ BS_SWAP_ROUTES = frozenset(
         BS_SWAP_CARRY_ROUTE,
         BS_SWAP_S16_ROUTE,
         BS_SWAP_CARRY_S16_ROUTE,
+        BS_SWAP_RP32_ROUTE,
     }
 )
 BS_SWAP_ARCHS = frozenset({"sm_100a", "sm_103a"})
 # sm_100a swaps a long-K problem of at least 100 rows per group when the
 # non-swapped BLOCK_N 128 grid has at most this many tiles (half of 148 SMs).
 BS_SWAP_SM100_MAX_TILES = 74
+# The 32-row-block swap-AB program (each 32-row M block holds one group's
+# rows) serves the 32- and 64-row-aligned layouts of at most 1536 rows on
+# these architectures, in place of BS_SWAP_RUN32_ROUTE.
+BS_SWAP_RP32_ARCHS = frozenset({"sm_103a"})
+BS_SWAP_RP32_MAX_ALIGNMENT = 64
+BS_SWAP_RP32_MAX_ROWS = 1536
 
 
 def bs_swap_route_for_shape(
@@ -424,7 +432,10 @@ def bs_swap_route_for_shape(
     - Keep the non-swapped routes when N is not a multiple of 256 (the swapped
       tile height) or the group count is unknown.
     - Swap every layout whose alignment is not a multiple of 128 (the 32-row
-      multi-run layouts) through ``BS_SWAP_RUN32_ROUTE``.
+      multi-run layouts) through ``BS_SWAP_RUN32_ROUTE``; on
+      ``BS_SWAP_RP32_ARCHS``, an alignment of at most
+      ``BS_SWAP_RP32_MAX_ALIGNMENT`` with ``m`` at most
+      ``BS_SWAP_RP32_MAX_ROWS`` takes ``BS_SWAP_RP32_ROUTE`` instead.
     - For K <= 512, swap at 2 <= rows <= 20, and at 1 <= rows < 2 when K <= 256.
     - For longer K, keep below 0.75 rows and swap below 100 rows.  From 100
       rows, sm_100a swaps for N >= 1024, or for K >= 2048 when the BLOCK_N
@@ -444,6 +455,12 @@ def bs_swap_route_for_shape(
         return None
     single_run = alignment % BS_BLOCK_M == 0
     if not single_run:
+        if (
+            arch in BS_SWAP_RP32_ARCHS
+            and alignment <= BS_SWAP_RP32_MAX_ALIGNMENT
+            and m <= BS_SWAP_RP32_MAX_ROWS
+        ):
+            return BS_SWAP_RP32_ROUTE
         return BS_SWAP_RUN32_ROUTE
     if not num_groups or num_groups <= 0:
         return None
