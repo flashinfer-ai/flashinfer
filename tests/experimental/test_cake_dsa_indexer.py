@@ -100,6 +100,7 @@ _COMMON = dict(
     cand_cap_floor_unsampled=8192,
     cand_cap_ceiling=None,
     cand_cap_ceiling_unsampled=None,
+    wide_first_rule=None,
     split_max=32,
     split_min_range_tiles=64,
     snake_default=False,
@@ -148,6 +149,7 @@ NARROW_PAIR_POLICY = DispatchPolicy.from_record(
         wide_rule=[6.0, 300.0],
         split_wave_rule=None,
         pair_rule=[128.0, 256.0, 512],
+        pair_units=["l6"],
         snake_rule=None,
         tile_unroll_rule=None,
         rank_rule=[524288, 262144],
@@ -163,6 +165,7 @@ SNAKE_UNROLL_POLICY = DispatchPolicy.from_record(
         wide_rule=[2.0, 250.0],
         split_wave_rule=[1000, 0.12],
         pair_rule=[0.0, 4096.0, 512],
+        pair_units=["l6", "narrow", "wide"],
         snake_rule=[
             ["narrow", "wide", "l6", "pair_narrow", "pair_wide", "pair_l6"],
             32.0,
@@ -327,6 +330,22 @@ def test_registry_records_are_well_formed():
         # the rank finalize programs are registered exactly where the architecture's rule admits a call
         assert bool(rank_keys) == (
             policy.rank_finalize and policy.rank_rule is not None
+        ), arch
+        # the CTA pair serves exactly the unit geometries whose pair program the architecture registers
+        assert policy.pair_units == sorted(
+            {
+                k.split(":")[1][len("pair_") :]
+                for k in scan_keys
+                if k.startswith("scan:pair_")
+            }
+        ), arch
+        # the wide-first precedence reaches the unrolled wide program in both fit forms
+        if policy.wide_first_rule is not None:
+            assert {"scan:wide:u2:s0:f0", "scan:wide:u2:s0:f1"} <= set(keys), arch
+        # a split needs grid // units >= 2 (rounds <= 0.5) and a wide unit needs rounds >= wide_rule[0], so without
+        # the two-way wave split the wide split program is unreachable where wide_rule[0] > 0.5 and need not ship
+        assert "scan:split_wide:u1:s0:f0" in keys or (
+            policy.split_wave_rule is None and policy.wide_rule[0] > 0.5
         ), arch
         for key in rank_keys:
             _role, threads, window, *form = key.split(":")
@@ -638,9 +657,28 @@ def test_policy_record_round_trip_and_validation():
         dict(sample_fit_kinds=["split"]),
         dict(sample_fit_kinds=["wide", "l6"]),
         dict(sample_fit_kinds=["l6", "l6"]),
+        # the wide-first precedence floor: [min mean unit tiles] or None
+        dict(wide_first_rule=512),
+        dict(wide_first_rule=[]),
+        dict(wide_first_rule=[512.0, 1]),
+        dict(wide_first_rule=[-1.0]),
+        dict(wide_first_rule=[True]),
+        # the units the CTA pair serves: an ascending list of unit geometries, not empty while pair_rule is set
+        dict(pair_units="l6"),
+        dict(pair_units=["pair_l6"]),
+        dict(pair_units=["split"]),
+        dict(pair_units=["wide", "l6"]),
+        dict(pair_units=["l6", "l6"]),
+        dict(pair_units=[]),
     ):
         with pytest.raises(ValueError):
             DispatchPolicy.from_record(dict(record, **bad))
+    first = DispatchPolicy.from_record(dict(record, wide_first_rule=[192.0]))
+    assert first.wide_first_rule == [192.0]
+    assert first.record()["wide_first_rule"] == [192.0]
+    assert DispatchPolicy.from_record(first.record()) == first
+    bare = DispatchPolicy.from_record(dict(record, pair_rule=None, pair_units=[]))
+    assert bare.pair_units == []  # no pair rule: an empty unit list is well-formed
 
 
 def test_policy_capacity_period_and_finalize():
@@ -1193,6 +1231,64 @@ def test_select_program_narrow_pair_policy():
         _select(p, 8192, 8192, far_sample=2)
 
 
+def test_wide_first_precedence_and_pair_units_guard():
+    """``wide_first_rule`` gives a wide-eligible call of at least its mean tiles the wide program before the
+    three-warpgroup rule; ``pair_units`` keeps the CTA pair on the units whose pair program the architecture
+    registers.  The fixture takes the sm_103a rule shape (``l6_rule`` to 1024 tiles, ``pair_rule`` 64..1024 tiles,
+    floor 512 tiles) on a 148-CTA grid; ``NARROW_PAIR_POLICY`` has no unroll rule, so its wide keys are ``u1``."""
+    first = DispatchPolicy.from_record(
+        dict(
+            NARROW_PAIR_POLICY.record(),
+            l6_rule=[1024.0, 512],
+            pair_rule=[64.0, 1024.0, 512],
+            wide_first_rule=[512.0],
+        )
+    )
+    # 128k causal document: 512.0 mean tiles, 16384 / 148 = 110.7 wide rounds -> wide first, no pair (the unit is
+    # not in pair_units); the long-unit multiplier 8 x 2048 = 16384 slots fit the 512-tile unit (offset 0) -> f1
+    c = _select(first, 131072, 131072)
+    assert c.scan_key == "scan:wide:u1:s0:f1" and c.block_q == 8 and not c.pair
+    assert c.grid_ctas == 148 and c.cand_cap == 16384
+    assert c.workspace_bytes == 148 * 8 * 16384 * 8
+    # 64k causal document: 256 < 512 keeps the three-warpgroup pair (multiplier 4 x 2048 = 8192 slots, fit)
+    assert _select(first, 65536, 65536).scan_key == "scan:pair_l6:u1:s0:f1"
+    # 4096 tail queries over 128k keys: 1008 tiles but 512 / 148 = 3.46 rounds < 6 -- ineligible for wide, so the
+    # precedence never demotes the call; the pair stays (the guard against any narrow demotion)
+    assert _select(first, 4096, 131072).scan_key == "scan:pair_l6:u1:s0:f0"
+    # the context-parallel tail of 496 tiles: the same ineligible pair (the 480-tile offset leaves no fitting unit)
+    assert _select(first, 4096, 65536).scan_key == "scan:pair_l6:u1:s0:f0"
+    # 8k causal document: 32 tiles, work 6.9 x 32 = 221 < 300 -> ineligible, below the pair floor: plain l6
+    assert _select(first, 8192, 8192).scan_key == "scan:l6:u1:s0:f1"
+    # top_k 256 at 64k: no three-warpgroup floor, the wide unit as before (the precedence adds no new wide call)
+    assert _select(first, 65536, 65536, K=256).kind == "wide"
+    # the guard: the same record with the wide unit admitted to the pair composes pair_wide on the wide-first call,
+    # a program sm_103a does not register -- the field, not the pair interval, keeps the dispatch on shipped programs
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    open_ = DispatchPolicy.from_record(dict(first.record(), pair_units=["l6", "wide"]))
+    assert _select(open_, 131072, 131072).scan_key == "scan:pair_wide:u1:s0:f1"
+    with pytest.raises(NotImplementedError, match="pair_wide"):
+        program_for("sm_103a", "scan:pair_wide:u1:s0:f1")
+    # a hostile record (no l6 rule, the pair interval open, the floor at zero) still selects sm_103a programs only
+    hostile = DispatchPolicy.from_record(
+        dict(
+            first.record(),
+            l6_rule=None,
+            pair_rule=[0.0, 4096.0, 512],
+            wide_first_rule=[0.0],
+        )
+    )
+    registered = cake_jit.PROGRAM_KEYS["sm_103a"]
+    for T, Tkv, S, ratio, top_k in _dense_geometries(hostile):
+        c = _select(hostile, T, Tkv, S=S, K=top_k, ratio=ratio)
+        assert c.kind not in ("pair_wide", "pair_narrow"), (T, Tkv, S, ratio, top_k)
+        assert c.scan_key in registered, (T, Tkv, S, ratio, top_k, c.scan_key)
+    hostile_open = DispatchPolicy.from_record(
+        dict(hostile.record(), pair_units=["l6", "wide"])
+    )
+    assert _select(hostile_open, 131072, 131072).kind == "pair_wide"
+
+
 def test_select_program_snake_unroll_policy():
     p = SNAKE_UNROLL_POLICY
     # one causal 8k document: pair three-warpgroup program in snake order (the unroll yields to the snake order)
@@ -1252,7 +1348,9 @@ def _dense_geometries(policy, *, steps_t=32, steps_m=28):
 def test_policy_selects_registered_programs_on_a_dense_geometry_grid():
     """Every program the frozen policy selects on a dense geometry grid is registered for the architecture: the host
     fails closed by name on an unregistered program, so a selectable but unregistered program is a production failure
-    (round 2 review: ``scan:narrow:u1:s1:f1`` on sm_107a at 6018 queries x 11754 keys was selectable but unregistered)."""
+    (round 2 review: ``scan:narrow:u1:s1:f1`` on sm_107a at 6018 queries x 11754 keys was selectable but unregistered).
+    Both sample modes: the unsampled plan family (``sample_tiles_max=0``, the ``*_unsampled`` capacity values) is
+    otherwise unseen by the grid."""
     if not cake_jit.PROGRAM_KEYS:
         pytest.skip("placeholder registry")
     for arch, keys in cake_jit.PROGRAM_KEYS.items():
@@ -1265,31 +1363,34 @@ def test_policy_selects_registered_programs_on_a_dense_geometry_grid():
                 ):  # lever RW: S equal segments and one long segment
                     bounds += sorted({-(-Tkv // S), Tkv})
                 for bound in bounds:
-                    choice = select_program(
-                        policy,
-                        num_queries=T,
-                        num_keys=Tkv,
-                        num_segments=S,
-                        ratio=ratio,
-                        top_k=top_k,
-                        grid=grid,
-                        max_seqlen_k=bound,
-                    )
-                    selected = [choice.scan_key, choice.finalize_key] + (
-                        [MERGE_KEY] if choice.n_split > 1 else []
-                    )
-                    for key in selected:
-                        assert key in keys, (
-                            arch,
-                            grid,
-                            T,
-                            Tkv,
-                            S,
-                            ratio,
-                            top_k,
-                            bound,
-                            key,
+                    for sample_tiles_max in (None, 0):
+                        choice = select_program(
+                            policy,
+                            num_queries=T,
+                            num_keys=Tkv,
+                            num_segments=S,
+                            ratio=ratio,
+                            top_k=top_k,
+                            grid=grid,
+                            sample_tiles_max=sample_tiles_max,
+                            max_seqlen_k=bound,
                         )
+                        selected = [choice.scan_key, choice.finalize_key] + (
+                            [MERGE_KEY] if choice.n_split > 1 else []
+                        )
+                        for key in selected:
+                            assert key in keys, (
+                                arch,
+                                grid,
+                                T,
+                                Tkv,
+                                S,
+                                ratio,
+                                top_k,
+                                bound,
+                                sample_tiles_max,
+                                key,
+                            )
 
 
 def test_sample_fit_kinds_name_exactly_the_registered_sampled_fit_programs():
@@ -1356,6 +1457,74 @@ def test_shipped_capacity_rules_by_architecture():
         == caps(p100, long, sample_tiles_max=0)
         == [8192, 16384, 32768]
     )
+
+
+def test_shipped_unit_rules_by_architecture():
+    """sm_103a (``wide_first_rule [512.0]``, ``pair_units ["l6"]``): a wide-eligible call of 512 or more mean tiles takes the
+    unrolled wide program before the three-warpgroup rule, in both sample modes; below the floor and on calls short of six
+    wide rounds the three-warpgroup pair stays, and the 32-tile document keeps plain l6.  sm_100a and sm_107a carry no floor
+    (``None``) and list every registered pair unit, so their plans are the previous package's by code path."""
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    p103, p100, p107 = (
+        policy_for("sm_103a"),
+        policy_for("sm_100a"),
+        policy_for("sm_107a"),
+    )
+    for grid in (152, 148):
+        for knobs in ({}, {"sample_tiles_max": 0}):
+            # 128k causal document: 512.0 mean tiles, 16384 / grid >= 107 rounds -> wide first; 8 x 2048 slots fit -> f1
+            assert (
+                _select(p103, 131072, 131072, grid=grid, **knobs).scan_key
+                == "scan:wide:u2:s0:f1"
+            ), (grid, knobs)
+            # 262k causal document: 1024.0 tiles -> wide first; above the 512-tile fit bound -> f0
+            assert (
+                _select(p103, 262144, 262144, grid=grid, **knobs).scan_key
+                == "scan:wide:u2:s0:f0"
+            ), (grid, knobs)
+            # 16k queries over two 135k-key segments: (270336 - 8192) / 2 / 128 = 1024.0 tiles, 13.5 rounds -> wide first
+            # at top_k 2048 (16384 slots) and 4096 (the 32768-slot ceiling)
+            for K in (2048, 4096):
+                assert (
+                    _select(p103, 16384, 270336, S=2, K=K, grid=grid, **knobs).scan_key
+                    == "scan:wide:u2:s0:f0"
+                ), (grid, knobs, K)
+            # 64k causal document: 256 tiles, below the floor -> the three-warpgroup pair as before
+            assert (
+                _select(p103, 65536, 65536, grid=grid, **knobs).scan_key
+                == "scan:pair_l6:u1:s0:f1"
+            ), (grid, knobs)
+            # context-parallel tail: 496 tiles but 512 / grid = 3.4 rounds < 6 -> ineligible, the pair stays (no fit:
+            # the 480-tile offset exceeds the 127 fitting tiles)
+            assert (
+                _select(p103, 4096, 65536, grid=grid, **knobs).scan_key
+                == "scan:pair_l6:u1:s0:f0"
+            ), (grid, knobs)
+            # 8k causal document: 32 tiles, 1024 / grid = 6.7 rounds but work 6.7 x 32 = 216 < 300 -> ineligible, below
+            # the 64-tile pair floor -> plain l6
+            assert (
+                _select(p103, 8192, 8192, grid=grid, **knobs).scan_key
+                == "scan:l6:u1:s0:f1"
+            ), (grid, knobs)
+            # sm_100a: the previous package's plans (l6 to 256 tiles, pair 128..256, no floor)
+            assert (
+                _select(p100, 65536, 65536, grid=grid, **knobs).scan_key
+                == "scan:pair_l6:u1:s0:f1"
+            ), (grid, knobs)
+            assert (
+                _select(p100, 16384, 270336, S=2, grid=grid, **knobs).scan_key
+                == "scan:wide:u2:s0:f0"
+            ), (grid, knobs)
+            assert (
+                _select(p100, 4096, 65536, grid=grid, **knobs).scan_key
+                == "scan:narrow:u1:s0:f0"
+            ), (grid, knobs)
+    # the identity guard of the untimed records: no floor, every registered pair unit listed
+    assert p100.wide_first_rule is None and p100.pair_units == ["l6"]
+    assert p107.wide_first_rule is None
+    assert p107.pair_units == ["l6", "narrow", "wide"]
+    assert p103.wide_first_rule == [512.0] and p103.pair_units == ["l6"]
 
 
 def test_program_keys_and_slugs():
@@ -2001,19 +2170,19 @@ def test_tile_boundary_neighbours(lq, lk, top_k):
 # Geometries that reach the host dispatch's program kinds (which kind a geometry takes depends on the
 # architecture's policy; every kind computes the same result).  The 64-query / 256k-key row splits its key ranges
 # on every registered architecture and so exercises the merge stage; the 16k causal document reaches the CTA-pair
-# program where the architecture's rule admits it.
+# program where the architecture's rule admits it; the 8k-query / 72k-key row reaches the wide-first precedence
+# where the architecture's record sets a floor.
 _DISPATCH_ROWS = [
     ([64], [262144], 2048),  # 16 narrow units over 2047 tiles: key-range split + merge
-    (
-        [16384],
-        [16384],
-        2048,
-    ),  # one causal document of 128 mean tiles: three-warpgroup / pair programs
-    (
-        [4096],
-        [65536],
-        2048,
-    ),  # context-parallel tail: narrow or wide unit by the architecture's rule
+    # one causal document of 64 mean tiles: three-warpgroup / pair programs (pair_l6 on sm_103a: at its 64-tile pair
+    # floor, below the wide-first floor)
+    ([16384], [16384], 2048),
+    # context-parallel tail of 496 tiles: narrow, the three-warpgroup pair (sm_103a: 3.4 wide rounds at 148-152 SMs,
+    # ineligible for the wide-first precedence) or the CTA-pair wide program by the architecture's rule
+    ([4096], [65536], 2048),
+    # one causal 8k query block over 72k keys, 544 mean tiles: wide-first on sm_103a, wide on sm_100a, CTA-pair wide on
+    # sm_107a
+    ([8192], [73728], 2048),
     ([4096], [4096], 256),  # small top_k: capacity floor, right-sized finalize
 ]
 

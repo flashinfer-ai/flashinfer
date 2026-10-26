@@ -379,9 +379,10 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
         asm volatile("setmaxnreg.dec.sync.aligned.u32 80;");
         { // epilogue_main
             // Rank-barrier operands, loaded by every lane of CTA 0 warp 0 before the publication barrier: the phase-0
-            // peer flag pointers and this rank's flag word of both phases.  Every lane holds them, so the lane that a
-            // later elect_sync() picks can use them (two elect.sync calls need not pick the same lane).  A phase's
-            // sense bit cannot flip before this rank's own add, which follows these loads across the CTA barriers.
+            // peer flag pointers and this rank's flag word of both phases.  The lane that a later elect_sync() picks
+            // holds them (elect.sync picks the same lane for the same member mask every time; every lane loads them
+            // anyway).  A phase's sense bit cannot flip before this rank's own add, which follows these loads across
+            // the CTA barriers.
             unsigned* barrier_peer_flags0[16];
             unsigned* barrier_local_flag0 = nullptr;
             unsigned barrier_old_sense0 = 0u;
@@ -489,8 +490,12 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                 }
             }
             // The publication stores and the first forward's arrival-word stores are ordered by this CTA barrier and
-            // the elected thread's gpu-scope release below, and CTA 0's system-scope fence before its rank-barrier adds
-            // (cumulative over what it acquired) orders them for the peers; no per-thread system-scope fence.
+            // the elected thread's gpu-scope release below.  CTA 0's elected thread acquires every CTA's release, then
+            // issues an alias proxy fence and a system-scope fence before its rank-barrier adds.  Routes and rows are
+            // stored through peer mappings and loaded through the owner's local address, and peers store route terms
+            // over the arrival words through their mappings.  Accesses to one location through different virtual
+            // addresses are ordered only with an alias proxy fence on the path between them; CTA 0's fence lies on
+            // every such path through the rank barrier.  No per-thread fence is needed.
             asm volatile("barrier.sync 12, 384;" ::: "memory");
             if (warp == 0) {
                 if (elect_sync()) {
@@ -528,6 +533,7 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                         unsigned* __peer_flags[16];
                         #pragma unroll
                         for (int __r = 0; __r < 16; ++__r) __peer_flags[__r] = barrier_peer_flags0[__r];
+                        asm volatile("fence.proxy.alias;" ::: "memory");
                         asm volatile("fence.acq_rel.sys;" ::: "memory");
                         #pragma unroll
                         for (int __r = 0; __r < 16; ++__r) {
@@ -543,7 +549,6 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                             asm volatile("red.relaxed.sys.global.add.u32 [%0], %1;"
                                 :: "l"(__peer_flag), "r"(__delta) : "memory");
                         }
-                        asm volatile("fence.proxy.alias;" ::: "memory");
                         while (true) {
                             unsigned __v;
                             asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_flag) : "memory");
@@ -1540,8 +1545,12 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                 }
             }
             // The publication stores and the first forward's arrival-word stores are ordered by this CTA barrier and
-            // the elected thread's gpu-scope release below, and CTA 0's system-scope fence before its rank-barrier adds
-            // (cumulative over what it acquired) orders them for the peers; no per-thread system-scope fence.
+            // the elected thread's gpu-scope release below.  CTA 0's elected thread acquires every CTA's release, then
+            // issues an alias proxy fence and a system-scope fence before its rank-barrier adds.  Routes and rows are
+            // stored through peer mappings and loaded through the owner's local address, and peers store route terms
+            // over the arrival words through their mappings.  Accesses to one location through different virtual
+            // addresses are ordered only with an alias proxy fence on the path between them; CTA 0's fence lies on
+            // every such path through the rank barrier.  No per-thread fence is needed.
             asm volatile("barrier.sync 12, 384;" ::: "memory");
             if (warp == 0) {
                 if (elect_sync()) {
@@ -1579,6 +1588,7 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                         unsigned* __peer_flags[16];
                         #pragma unroll
                         for (int __r = 0; __r < 16; ++__r) __peer_flags[__r] = mega_pg_flags[__r < __ws ? __r : 0] + __slot;
+                        asm volatile("fence.proxy.alias;" ::: "memory");
                         asm volatile("fence.acq_rel.sys;" ::: "memory");
                         #pragma unroll
                         for (int __r = 0; __r < 16; ++__r) {
@@ -1597,7 +1607,6 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                             asm volatile("red.relaxed.sys.global.add.u32 [%0], %1;"
                                 :: "l"(__peer_flag), "r"(__delta) : "memory");
                         }
-                        asm volatile("fence.proxy.alias;" ::: "memory");
                         while (true) {
                             unsigned __v;
                             asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_flag) : "memory");
@@ -1892,8 +1901,12 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                 }
             }
             // The publication stores and the first forward's arrival-word stores are ordered by this CTA barrier and
-            // the elected thread's gpu-scope release below, and CTA 0's system-scope fence before its rank-barrier adds
-            // (cumulative over what it acquired) orders them for the peers; no per-thread system-scope fence.
+            // the elected thread's gpu-scope release below.  CTA 0's elected thread acquires every CTA's release, then
+            // issues an alias proxy fence and a system-scope fence before its rank-barrier adds.  Routes and rows are
+            // stored through peer mappings and loaded through the owner's local address, and peers store route terms
+            // over the arrival words through their mappings.  Accesses to one location through different virtual
+            // addresses are ordered only with an alias proxy fence on the path between them; CTA 0's fence lies on
+            // every such path through the rank barrier.  No per-thread fence is needed.
             asm volatile("barrier.sync 12, 384;" ::: "memory");
             if (warp == 0) {
                 if (elect_sync()) {
@@ -1956,6 +1969,7 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                         unsigned* __peer_flags[16];
                         #pragma unroll
                         for (int __r = 0; __r < 16; ++__r) __peer_flags[__r] = mega_pg_flags[__r < __ws ? __r : 0] + __slot;
+                        asm volatile("fence.proxy.alias;" ::: "memory");
                         asm volatile("fence.acq_rel.sys;" ::: "memory");
                         #pragma unroll
                         for (int __r = 0; __r < 16; ++__r) {
@@ -1974,7 +1988,6 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                             asm volatile("red.relaxed.sys.global.add.u32 [%0], %1;"
                                 :: "l"(__peer_flag), "r"(__delta) : "memory");
                         }
-                        asm volatile("fence.proxy.alias;" ::: "memory");
                         while (true) {
                             unsigned __v;
                             asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_flag) : "memory");
@@ -2175,8 +2188,12 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                 }
             }
             // The publication stores and the first forward's arrival-word stores are ordered by this CTA barrier and
-            // the elected thread's gpu-scope release below, and CTA 0's system-scope fence before its rank-barrier adds
-            // (cumulative over what it acquired) orders them for the peers; no per-thread system-scope fence.
+            // the elected thread's gpu-scope release below.  CTA 0's elected thread acquires every CTA's release, then
+            // issues an alias proxy fence and a system-scope fence before its rank-barrier adds.  Routes and rows are
+            // stored through peer mappings and loaded through the owner's local address, and peers store route terms
+            // over the arrival words through their mappings.  Accesses to one location through different virtual
+            // addresses are ordered only with an alias proxy fence on the path between them; CTA 0's fence lies on
+            // every such path through the rank barrier.  No per-thread fence is needed.
             asm volatile("barrier.sync 12, 384;" ::: "memory");
             if (warp == 0) {
                 if (elect_sync()) {
@@ -2214,6 +2231,7 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                         unsigned* __peer_flags[16];
                         #pragma unroll
                         for (int __r = 0; __r < 16; ++__r) __peer_flags[__r] = mega_pg_flags[__r < __ws ? __r : 0] + __slot;
+                        asm volatile("fence.proxy.alias;" ::: "memory");
                         asm volatile("fence.acq_rel.sys;" ::: "memory");
                         #pragma unroll
                         for (int __r = 0; __r < 16; ++__r) {
@@ -2232,7 +2250,6 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                             asm volatile("red.relaxed.sys.global.add.u32 [%0], %1;"
                                 :: "l"(__peer_flag), "r"(__delta) : "memory");
                         }
-                        asm volatile("fence.proxy.alias;" ::: "memory");
                         while (true) {
                             unsigned __v;
                             asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_flag) : "memory");
@@ -2469,8 +2486,12 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                 }
             }
             // The publication stores and the first forward's arrival-word stores are ordered by this CTA barrier and
-            // the elected thread's gpu-scope release below, and CTA 0's system-scope fence before its rank-barrier adds
-            // (cumulative over what it acquired) orders them for the peers; no per-thread system-scope fence.
+            // the elected thread's gpu-scope release below.  CTA 0's elected thread acquires every CTA's release, then
+            // issues an alias proxy fence and a system-scope fence before its rank-barrier adds.  Routes and rows are
+            // stored through peer mappings and loaded through the owner's local address, and peers store route terms
+            // over the arrival words through their mappings.  Accesses to one location through different virtual
+            // addresses are ordered only with an alias proxy fence on the path between them; CTA 0's fence lies on
+            // every such path through the rank barrier.  No per-thread fence is needed.
             asm volatile("barrier.sync 12, 384;" ::: "memory");
             if (warp == 0) {
                 if (elect_sync()) {
@@ -2508,6 +2529,7 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                         unsigned* __peer_flags[16];
                         #pragma unroll
                         for (int __r = 0; __r < 16; ++__r) __peer_flags[__r] = mega_pg_flags[__r < __ws ? __r : 0] + __slot;
+                        asm volatile("fence.proxy.alias;" ::: "memory");
                         asm volatile("fence.acq_rel.sys;" ::: "memory");
                         #pragma unroll
                         for (int __r = 0; __r < 16; ++__r) {
@@ -2526,7 +2548,6 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                             asm volatile("red.relaxed.sys.global.add.u32 [%0], %1;"
                                 :: "l"(__peer_flag), "r"(__delta) : "memory");
                         }
-                        asm volatile("fence.proxy.alias;" ::: "memory");
                         while (true) {
                             unsigned __v;
                             asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_flag) : "memory");
@@ -2678,8 +2699,12 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                 }
             }
             // The publication stores and the first forward's arrival-word stores are ordered by this CTA barrier and
-            // the elected thread's gpu-scope release below, and CTA 0's system-scope fence before its rank-barrier adds
-            // (cumulative over what it acquired) orders them for the peers; no per-thread system-scope fence.
+            // the elected thread's gpu-scope release below.  CTA 0's elected thread acquires every CTA's release, then
+            // issues an alias proxy fence and a system-scope fence before its rank-barrier adds.  Routes and rows are
+            // stored through peer mappings and loaded through the owner's local address, and peers store route terms
+            // over the arrival words through their mappings.  Accesses to one location through different virtual
+            // addresses are ordered only with an alias proxy fence on the path between them; CTA 0's fence lies on
+            // every such path through the rank barrier.  No per-thread fence is needed.
             asm volatile("barrier.sync 12, 384;" ::: "memory");
             if (warp == 0) {
                 if (elect_sync()) {
@@ -2717,6 +2742,7 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                         unsigned* __peer_flags[16];
                         #pragma unroll
                         for (int __r = 0; __r < 16; ++__r) __peer_flags[__r] = mega_pg_flags[__r < __ws ? __r : 0] + __slot;
+                        asm volatile("fence.proxy.alias;" ::: "memory");
                         asm volatile("fence.acq_rel.sys;" ::: "memory");
                         #pragma unroll
                         for (int __r = 0; __r < 16; ++__r) {
@@ -2735,7 +2761,6 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                             asm volatile("red.relaxed.sys.global.add.u32 [%0], %1;"
                                 :: "l"(__peer_flag), "r"(__delta) : "memory");
                         }
-                        asm volatile("fence.proxy.alias;" ::: "memory");
                         while (true) {
                             unsigned __v;
                             asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_flag) : "memory");

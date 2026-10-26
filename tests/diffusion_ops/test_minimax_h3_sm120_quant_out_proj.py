@@ -35,6 +35,7 @@ from flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_out_proj import (
     MINIMAX_H3_GATE_ROWS,
     MINIMAX_H3_HIDDEN,
     MINIMAX_H3_SF_BLOCK,
+    _get_module,
     fp8_scale_from_amax,
     nvfp4_global_scale_from_amax,
 )
@@ -46,6 +47,9 @@ E4M3_MAX = 448.0
 ACT_AMAX = 4.0
 # Tail lengths around the 128-row tile, plus multi-tile shapes.
 ROWS = [1, 127, 128, 129, 257, 4097]
+# The host runs program 1 (warp-private epilogue staging) on devices with this many SMs and
+# program 0 elsewhere; the two programs produce identical bits.
+PROGRAM_1_SMS = 188
 
 
 def _supported() -> bool:
@@ -419,3 +423,76 @@ def test_out_proj_rejects_bad_inputs() -> None:
             inputs["gate_index"],
             inputs["residual"].float(),
         )
+
+
+def _routed_program() -> int:
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    return 1 if sms == PROGRAM_1_SMS else 0
+
+
+@requires_sm120
+def test_out_proj_routes_by_device() -> None:
+    module = _get_module()
+    assert module.minimax_h3_sm120_out_proj_program(0) == _routed_program()
+    try:
+        for program in (0, 1):
+            module.minimax_h3_sm120_out_proj_force_program(program)
+            assert module.minimax_h3_sm120_out_proj_program(0) == program
+    finally:
+        module.minimax_h3_sm120_out_proj_force_program(-1)
+    assert module.minimax_h3_sm120_out_proj_program(0) == _routed_program()
+
+
+@requires_sm120
+@pytest.mark.parametrize("variant", ["fp8", "nvfp4"])
+@pytest.mark.parametrize("rows", ROWS)
+def test_out_proj_programs_are_bitwise_identical(variant: str, rows: int) -> None:
+    """Both programs, forced on this device, write the same bits to every output."""
+
+    device = torch.device("cuda:0")
+    model = model_tensors(device)
+    inputs = make_inputs(
+        rows, seed=617000 + rows, device=device, guard_rows=(rows >= 129)
+    )
+    act_global_scale = nvfp4_global_scale_from_amax(ACT_AMAX).to(device)
+    module = _get_module()
+    results = []
+    try:
+        for program in (0, 1):
+            module.minimax_h3_sm120_out_proj_force_program(program)
+            workspaces = {
+                "out": torch.full(
+                    (rows, MINIMAX_H3_HIDDEN),
+                    float("nan"),
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+            }
+            if variant == "fp8":
+                workspaces["act_q"] = torch.zeros(
+                    (rows, MINIMAX_H3_ATTN_DIM),
+                    dtype=torch.float8_e4m3fn,
+                    device=device,
+                )
+                workspaces["act_scale"] = torch.zeros(
+                    (rows,), dtype=torch.float32, device=device
+                )
+            else:
+                workspaces["act_q"] = torch.zeros(
+                    (rows, MINIMAX_H3_ATTN_DIM // 2), dtype=torch.uint8, device=device
+                )
+                workspaces["act_sf"] = torch.zeros(
+                    (rows, MINIMAX_H3_ATTN_DIM // MINIMAX_H3_SF_BLOCK),
+                    dtype=torch.uint8,
+                    device=device,
+                )
+            run_operator(variant, inputs, model, act_global_scale, workspaces)
+            torch.cuda.synchronize()
+            results.append(workspaces)
+    finally:
+        module.minimax_h3_sm120_out_proj_force_program(-1)
+    for name, tensor in results[0].items():
+        assert torch.equal(
+            tensor.view(torch.uint8), results[1][name].view(torch.uint8)
+        ), f"{name} differs between the two programs"
+    assert not bool(torch.isnan(results[1]["out"].float()).any())

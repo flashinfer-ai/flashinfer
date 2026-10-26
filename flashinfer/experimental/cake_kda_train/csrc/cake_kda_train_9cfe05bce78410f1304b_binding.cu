@@ -62,6 +62,17 @@ int64_t NumelAbove(const TensorView& t, int trailing) {
   return product;
 }
 
+[[noreturn]] void NoInt64(int64_t a, const char* op, int64_t b) {
+  TVM_FFI_THROW(ValueError) << KERNEL_NAME << ": " << a << " " << op << " " << b
+                            << " has no int64 value in a host check";
+}
+
+int64_t CheckedMul(int64_t a, int64_t b) {
+  int64_t product;
+  if (__builtin_mul_overflow(a, b, &product)) NoInt64(a, "*", b);
+  return product;
+}
+
 cuuint64_t Extent(int64_t value, const char* descriptor) {
   TVM_FFI_CHECK(value > 0, ValueError)
       << KERNEL_NAME << ": an extent of descriptor '" << descriptor << "' resolves to " << value;
@@ -82,7 +93,7 @@ CUtensorMap EncodeTma_w_tma(const TensorView& t) {
   int64_t d2 = t.size(-2);
   int64_t outer2 = NumelAbove(t, 2);
   cuuint64_t global_dim[3] = {Extent(d1, "w_tma"), Extent(d2, "w_tma"), Extent(outer2, "w_tma")};
-  cuuint64_t global_strides[2] = {Stride((d1 * 2), "w_tma"), Stride(((d1 * d2) * 2), "w_tma")};
+  cuuint64_t global_strides[2] = {Stride(CheckedMul(d1, 2LL), "w_tma"), Stride(CheckedMul(CheckedMul(d1, d2), 2LL), "w_tma")};
   cuuint32_t box_dim[3] = {64u, 1u, 64u};
   cuuint32_t elem_strides[3] = {1u, 1u, 1u};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2], ValueError)
@@ -108,7 +119,7 @@ CUtensorMap EncodeTma_kg_tma(const TensorView& t) {
   int64_t d2 = t.size(-2);
   int64_t outer2 = NumelAbove(t, 2);
   cuuint64_t global_dim[3] = {Extent(d1, "kg_tma"), Extent(d2, "kg_tma"), Extent(outer2, "kg_tma")};
-  cuuint64_t global_strides[2] = {Stride((d1 * 2), "kg_tma"), Stride(((d1 * d2) * 2), "kg_tma")};
+  cuuint64_t global_strides[2] = {Stride(CheckedMul(d1, 2LL), "kg_tma"), Stride(CheckedMul(CheckedMul(d1, d2), 2LL), "kg_tma")};
   cuuint32_t box_dim[3] = {64u, 1u, 64u};
   cuuint32_t elem_strides[3] = {1u, 1u, 1u};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2], ValueError)
@@ -197,11 +208,11 @@ void Run(TensorView a_w_tma, TensorView a_kg_tma, TensorView a_u, TensorView a_g
   check_same_device(a_h_tape, a_w_tma, "h_tape", "w_tma");
   check_contiguous(a_v_new, "v_new");
   check_same_device(a_v_new, a_w_tma, "v_new", "w_tma");
-  TVM_FFI_CHECK((a_num_heads >= 1), ValueError)
+  TVM_FFI_CHECK((a_num_heads >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (num_heads >= 1)";
-  TVM_FFI_CHECK((a_num_seqs >= 0), ValueError)
+  TVM_FFI_CHECK((a_num_seqs >= 0LL), ValueError)
       << KERNEL_NAME << ": requires (num_seqs >= 0)";
-  TVM_FFI_CHECK((a_tile_stride >= 1), ValueError)
+  TVM_FFI_CHECK((a_tile_stride >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (tile_stride >= 1)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";

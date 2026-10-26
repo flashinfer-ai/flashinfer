@@ -593,6 +593,17 @@ the original allocation path unchanged. The NVLink backend uses ``out=`` but
 does not consume the workspace because its IPC staging allocation is owned by
 the communicator.
 
+**Registered NVLink outputs.** On the NVLink backend's Cake route (SM100 /
+SM103, ``nvlink_kernel == "cake"``), :meth:`UlyssesCommunicator.allocate_output`
+is collective, as on the PCIe backend: every rank allocates ``max_bytes`` bytes
+and maps every peer's allocation over CUDA IPC. A ``scatter_heads`` or
+``gather_heads`` whose ``out=`` is such an output writes each rank's blocks
+straight into the destination ranks' outputs, with no pass through the
+staging buffer. All ranks pass their output of the same registration;
+outputs stay registered until ``close``, which frees them. Caller-owned
+outputs keep the staged path, and the two may alternate on one communicator.
+Call ``allocate_output`` for every geometry before CUDA graph capture.
+
 **PCIe backend (experimental).** It additionally accepts the 1-, 2- and
 4-byte element types float16 / bfloat16 / float32, int8 / uint8 and
 float8_e4m3fn / float8_e5m2; its mlx5 routes — the eight-rank 4+4 NUMA

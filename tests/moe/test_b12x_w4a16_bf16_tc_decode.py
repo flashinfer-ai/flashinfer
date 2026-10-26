@@ -162,7 +162,7 @@ def test_bf16_tc8_matches_packed_routes_and_live_graph(
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured = call()
-        calls.append((call, graph, captured))
+        calls.append((call, graph, captured, work))
 
     def reference():
         result = torch.zeros_like(x, dtype=torch.float32)
@@ -200,11 +200,38 @@ def test_bf16_tc8_matches_packed_routes_and_live_graph(
         if mode == "negative":
             scores[::2, 0] = float("nan")
         expected = reference()
-        for _call, graph, output in calls:
+        for _call, graph, output, _work in calls:
             output.fill_(float("nan"))
             graph.replay()
             check(output, expected)
         check(calls[1][2], calls[0][2])
+
+        # The non-fused preplanned route is the explicit fixed-order combine
+        # alternative. Check identical inputs eagerly and under the retained
+        # graph; tolerance-based comparison alone cannot test repeatability.
+        fixed_call, fixed_graph, fixed_output, fixed_work = calls[0]
+        expected_bits = fixed_output.view(torch.int16).clone()
+        for execute in (fixed_call, fixed_graph.replay):
+            for _ in range(8):
+                fixed_output.fill_(float("nan"))
+                for name in (
+                    "intermediate_cache13",
+                    "intermediate_cache2",
+                    "fc1_c_tmp",
+                    "fc2_c_tmp",
+                ):
+                    getattr(fixed_work, name).view(torch.bfloat16).fill_(float("nan"))
+                for name in (
+                    "packed_route_indices",
+                    "block_expert_ids",
+                    "packed_route_count",
+                    "expert_offsets",
+                ):
+                    getattr(fixed_work, name).fill_(-1)
+                execute()
+                torch.testing.assert_close(
+                    fixed_output.view(torch.int16), expected_bits, atol=0, rtol=0
+                )
 
     # The direct launch must not silently fall back to route packing.
     def forbidden(*args, **kwargs):

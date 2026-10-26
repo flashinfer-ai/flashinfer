@@ -64,9 +64,9 @@ void Run(TensorView a_dg_part, TensorView a_gamma_dot, TensorView a_chunk_bos, T
   check_same_device(a_chunk_len, a_dg_part, "chunk_len", "dg_part");
   check_contiguous(a_dg_out, "dg_out");
   check_same_device(a_dg_out, a_dg_part, "dg_out", "dg_part");
-  TVM_FFI_CHECK((a_num_chunks >= 0), ValueError)
+  TVM_FFI_CHECK((a_num_chunks >= 0LL), ValueError)
       << KERNEL_NAME << ": requires (num_chunks >= 0)";
-  TVM_FFI_CHECK((a_num_heads >= 1), ValueError)
+  TVM_FFI_CHECK((a_num_heads >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (num_heads >= 1)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";

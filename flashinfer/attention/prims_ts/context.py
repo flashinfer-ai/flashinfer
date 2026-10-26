@@ -61,7 +61,6 @@ from flashinfer.api_logging import flashinfer_experimental_api
 from .sage.config import (
     SageAttentionConfig,
     SageAttentionParams,
-    sage_scale_shapes,
     validate_sage_params,
     validate_sage_recipe,
     _validate_int8_qk_device,
@@ -73,6 +72,7 @@ from .sage.layout import (
     _SageScaleLayout,
     _SageVSection,
 )
+from .sage.plan import SagePreparedScales, build_sage_prepared_scales
 
 
 if TYPE_CHECKING:
@@ -174,18 +174,6 @@ class _ContextPlanGeometry:
 
 
 @dataclass(frozen=True)
-class _ContextSageState:
-    """A contiguous context plan's prepared Sage scale buffer."""
-
-    layout: _SageScaleLayout
-    # Expected shape of every scale tensor a run supplies, by field name.
-    scale_shapes: dict[str, tuple[int, ...]]
-    # The buffer the Sage prepare writes before attention (``_SageScaleLayout``).
-    scales: torch.Tensor
-    prepare: Callable[..., None]
-
-
-@dataclass(frozen=True)
 class _ContextPlanState:
     """Atomically published state for one compiled contiguous context plan."""
 
@@ -201,7 +189,7 @@ class _ContextPlanState:
     vc_scale_shapes: Optional[dict[str, tuple[int, ...]]] = None
     # Output scale of VC runs: the per-channel V scale times the planned or passed scale.
     vc_output_scale: Optional[torch.Tensor] = None
-    sage: Optional[_ContextSageState] = None
+    sage: Optional[SagePreparedScales] = None
 
 
 @dataclass(frozen=True)
@@ -1823,67 +1811,11 @@ def _context_sage_layout(geometry: _ContextPlanGeometry) -> _SageScaleLayout:
     )
 
 
-@functools.cache
-def _get_compiled_sage_prepare(
-    device_index: int,
-    layout: _SageScaleLayout,
-    num_qo_heads: int,
-    num_kv_heads: int,
-) -> Callable[..., None]:
-    """Compile the launch that writes a context plan's prepared Sage scales.
-
-    The compiled callable takes ``(q_scale, k_scale, v_scale, v_mean, scales)``
-    torch tensors (``v_mean`` is ``None`` for a recipe without one) and runs on
-    the current stream. The batch size is a runtime extent, as for the
-    attention kernel, so plans of one layout share the compilation.
-    """
-
-    import cutlass
-    import cutlass.cute as cute
-    from cuda.bindings import driver as cuda_drv
-
-    from .sage.prepare import _PrepareSageScales
-
-    prepare = _PrepareSageScales(layout=layout, num_kv_heads=num_kv_heads)
-
-    @cute.jit
-    def prepare_adapter(
-        q_scale: cute.Tensor,
-        k_scale: cute.Tensor,
-        v_scale: cute.Tensor,
-        v_mean: cute.Tensor | None,
-        scales: cute.Tensor,
-        stream: cuda_drv.CUstream,
-    ) -> None:
-        prepare(q_scale, k_scale, None, v_scale, v_mean, scales, stream)
-
-    def fake_compact(shape):
-        return cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32,
-            shape,
-            stride_order=tuple(reversed(range(len(shape)))),
-            assumed_align=16,
-        )
-
-    v_rows_shape = (cute.sym_int(), num_kv_heads, layout.v_rows.headdim)
-    with torch.cuda.device(device_index):
-        return cute.compile(
-            prepare_adapter,
-            fake_compact((num_qo_heads, cute.sym_int())),
-            fake_compact((num_kv_heads, cute.sym_int())),
-            fake_compact(v_rows_shape),
-            fake_compact(v_rows_shape) if layout.v_rows.has_mean else None,
-            fake_compact((cute.sym_int(),)),
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options=_COMPILE_OPTIONS,
-        )
-
-
-def _build_context_sage_state(geometry: _ContextPlanGeometry) -> _ContextSageState:
+def _build_context_sage_state(geometry: _ContextPlanGeometry) -> SagePreparedScales:
     """Allocate a plan's prepared scale buffer and compile its prepare launch."""
 
-    layout = _context_sage_layout(geometry)
-    scale_shapes = sage_scale_shapes(
+    return build_sage_prepared_scales(
+        _context_sage_layout(geometry),
         geometry.sage,
         batch_size=geometry.batch_size,
         seq_len_q=geometry.max_seq_len_q,
@@ -1891,20 +1823,8 @@ def _build_context_sage_state(geometry: _ContextPlanGeometry) -> _ContextSageSta
         num_qo_heads=geometry.num_qo_heads,
         num_kv_heads=geometry.num_kv_heads,
         head_dim=geometry.head_dim,
-    )
-    scales = torch.empty(
-        layout.total_words(geometry.batch_size * geometry.num_kv_heads),
-        dtype=torch.float32,
         device=geometry.device,
-    )
-    prepare = _get_compiled_sage_prepare(
-        geometry.device_index, layout, geometry.num_qo_heads, geometry.num_kv_heads
-    )
-    return _ContextSageState(
-        layout=layout,
-        scale_shapes=scale_shapes,
-        scales=scales,
-        prepare=prepare,
+        device_index=geometry.device_index,
     )
 
 

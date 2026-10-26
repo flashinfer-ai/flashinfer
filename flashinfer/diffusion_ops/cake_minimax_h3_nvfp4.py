@@ -217,14 +217,24 @@ def _call_args(
     *,
     grid: tuple[int, int, int],
 ) -> tuple[Any, ...]:
-    """Positional ``run`` arguments of ``program``: its host parameters in binding order, then the grid."""
+    """Positional ``run`` arguments of ``program``: its host parameters in binding order, then the grid.
+
+    Each torch tensor is converted to a ``tvm_ffi.Tensor`` here, once, so a
+    launch passes the converted handles instead of converting every tensor
+    again.
+    """
     bound = {**values, **dict(zip(cake_program.GRID_ARGS, grid, strict=True))}
     missing = [name for name in program.args if name not in bound]
     if missing:
         raise RuntimeError(
             f"program {program.name} requires arguments {missing} the host did not bind"
         )
-    return tuple(bound[name] for name in program.args)
+    return tuple(
+        tvm_ffi.from_dlpack(bound[name])
+        if isinstance(bound[name], torch.Tensor)
+        else bound[name]
+        for name in program.args
+    )
 
 
 def repack_minimax_h3_qkv_weight_scales_for_fused_gemm(
@@ -253,9 +263,9 @@ def repack_minimax_h3_qkv_weight_scales_for_fused_gemm(
 class PreparedMiniMaxH3Nvfp4PreAttention:
     """Exact-shape prepared operation with caller-owned storage.
 
-    The generated stages take their TMA tensor maps by value, encoded once
-    at preparation; there is no descriptor workspace.  The
-    ``norm_descriptor_workspace`` / ``gemm_descriptor_workspace`` keyword
+    The generated stages take their TMA tensor maps by value, which each
+    launch encodes from the bound tensors; there is no descriptor workspace.
+    The ``norm_descriptor_workspace`` / ``gemm_descriptor_workspace`` keyword
     arguments of :func:`prepare_minimax_h3_nvfp4_pre_attention` are kept for
     API stability and must be ``None``.
     """
@@ -289,16 +299,20 @@ class PreparedMiniMaxH3Nvfp4PreAttention:
         self._derived = derived
         self.out_q = out_q
         self.out_sf = out_sf
+        self._device = out_q.device
+        self._ffi_device = tvm_ffi.device(str(out_q.device))
 
     def __call__(self) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        # The NVFP4 output scale tile pads rows to 128 per destination; the
-        # fused GEMM overwrites every live scale and this asynchronous clear
-        # makes the padding bytes deterministic. The activation scale tile is
-        # zero-padded inside the norm stage, so it needs no separate clear.
-        # The e4m3 output has no scale tile.
-        if self.out_sf is not None:
-            self.out_sf.zero_()
-        with tvm_ffi.use_torch_stream():
+        # The NVFP4 output scale tile pads rows to 128 per destination: the
+        # norm stage zeroes each destination's last 128-row tile and the fused
+        # GEMM then writes every live scale, so the padding bytes are
+        # deterministic without a separate clear. The norm stage zero-pads the
+        # activation scale tile as well. The e4m3 output has no scale tile.
+        # The converted arguments carry no stream, so both launches use the
+        # current torch stream of the tensors' device, which need not be the
+        # current device.
+        stream = torch.cuda.current_stream(self._device).cuda_stream
+        with tvm_ffi.use_raw_stream(self._ffi_device, stream):
             self._norm_run(*self._norm_args)
             self._gemm_run(*self._gemm_args)
         return self.out_q, self.out_sf
@@ -336,7 +350,8 @@ def prepare_minimax_h3_nvfp4_pre_attention(
     """Validate the caller-owned tensors once and bind both stage launches.
 
     ``out_format="nvfp4"`` takes ``out_global_scale`` (float32 ``[1]``) and
-    ``out_sf`` (uint8 ``[P, round_up(M * (56 / P) * 3, 128) * 8]``) and refuses
+    ``out_sf`` (uint8 ``[P, round_up(M * (56 / P) * 3, 128) * 8]``, 8-byte
+    aligned) and refuses
     ``qkv_scales``; ``out_format="e4m3"`` takes ``qkv_scales`` (float32 ``[3]``,
     the per-tensor scales of Q, K and V: ``out_q = e4m3(value / qkv_scales
     [kind])``, every entry positive and finite) and refuses ``out_global_scale``
@@ -485,6 +500,9 @@ def prepare_minimax_h3_nvfp4_pre_attention(
     if out_format == "nvfp4":
         assert out_global_scale is not None and out_sf is not None
         out_scale_arg = out_global_scale
+        # The norm stage zeroes each destination's padding rows in 8-byte words.
+        if out_sf.data_ptr() % 8 != 0:
+            raise ValueError("out_sf must be 8-byte aligned")
         out_sf_arg = out_sf
         out_q_bytes = out_q
         scale_stride = int(out_sf.shape[1])

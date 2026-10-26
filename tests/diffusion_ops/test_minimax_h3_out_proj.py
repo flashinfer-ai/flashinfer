@@ -589,6 +589,111 @@ def test_minimax_h3_out_proj_nvfp4_tail_split_bitwise(
         )
 
 
+# The BF16 and MXFP8 GEMMs have the same tail-split program, with their own host limits: the
+# NVFP4 cases plus 9648 rows = 798 tile pairs (a tail of half the co-resident pairs) and one
+# row (one pair of row tiles, so all 21 tile pairs are tail tiles).
+BF16_MXFP8_TAIL_SPLIT_CASES = [*TAIL_SPLIT_CASES, (9648, 4, 38), (1, 8, 21)]
+
+
+def check_tail_split_bitwise(run, rows: int, degree: int, tail: int, what: str) -> None:
+    """``run(full_units)`` returns the output of the host's schedule (None) or of a forced
+    one (-1: the whole-tile program; n >= 0: n whole-tile units, then half units)."""
+    num_tiles = _m_tiles(rows) // 2 * (MINIMAX_H3_HIDDEN // 256)
+    whole = run(-1)
+    for name, full_units in (
+        ("the host's schedule", None),
+        ("every tile as two half units", 0),
+        (f"a {tail}-tile tail", num_tiles - tail),
+    ):
+        assert torch.equal(run(full_units), whole), (
+            f"{what} P={degree} M={rows}: {name} differs from the whole-tile program"
+        )
+
+
+@requires_blackwell
+@pytest.mark.parametrize("rows,degree,tail", BF16_MXFP8_TAIL_SPLIT_CASES)
+def test_minimax_h3_out_proj_bf16_tail_split_bitwise(rows, degree, tail, model, device):
+    attn_out, idx, residual = make_inputs(
+        rows, degree, device, gate_rows=_gate_rows(model)
+    )
+
+    def run(full_units):
+        out = torch.empty(
+            (rows, MINIMAX_H3_HIDDEN), dtype=torch.bfloat16, device=device
+        )
+        if full_units is None:
+            minimax_h3_out_proj(
+                attn_out, model["o_weight"], model["gate"], idx, residual, out=out
+            )
+        else:
+            _module_for(device).minimax_h3_out_proj_schedule(
+                attn_out,
+                model["o_weight"],
+                model["gate"],
+                idx,
+                residual,
+                out,
+                full_units,
+            )
+        torch.cuda.synchronize()
+        return out
+
+    check_tail_split_bitwise(run, rows, degree, tail, "bf16")
+
+
+@requires_blackwell
+@pytest.mark.parametrize("rows,degree,tail", BF16_MXFP8_TAIL_SPLIT_CASES)
+def test_minimax_h3_out_proj_mxfp8_tail_split_bitwise(
+    rows, degree, tail, model, prepared_mxfp8, device
+):
+    attn_out, idx, residual = make_inputs(
+        rows, degree, device, gate_rows=_gate_rows(model)
+    )
+    w_q, w_tiles, _ = prepared_mxfp8
+
+    def run(full_units):
+        workspace_q = torch.empty(
+            (rows, MINIMAX_H3_ATTN_DIM), dtype=torch.float8_e4m3fn, device=device
+        )
+        workspace_sf = torch.zeros(
+            (mxfp8_activation_scale_workspace_bytes(rows),),
+            dtype=torch.uint8,
+            device=device,
+        )
+        out = torch.empty(
+            (rows, MINIMAX_H3_HIDDEN), dtype=torch.bfloat16, device=device
+        )
+        if full_units is None:
+            minimax_h3_out_proj_mxfp8(
+                attn_out,
+                w_q,
+                w_tiles,
+                model["gate"],
+                idx,
+                residual,
+                out=out,
+                workspace_q=workspace_q,
+                workspace_sf=workspace_sf,
+            )
+        else:
+            _module_for(device).minimax_h3_out_proj_mxfp8_schedule(
+                attn_out,
+                w_q,
+                w_tiles,
+                model["gate"],
+                idx,
+                residual,
+                out,
+                workspace_q,
+                workspace_sf,
+                full_units,
+            )
+        torch.cuda.synchronize()
+        return out
+
+    check_tail_split_bitwise(run, rows, degree, tail, "mxfp8")
+
+
 @requires_blackwell
 @pytest.mark.parametrize("gate_rows", [3, MINIMAX_H3_GATE_ROWS])
 def test_minimax_h3_out_proj_invalid_index_rows_pass_residual(gate_rows, model, device):
