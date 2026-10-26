@@ -339,11 +339,17 @@ def test_fused_kda_decode_glm_heads_and_ds_layout(num_heads, num_rows, state_dty
 
     results = {}
     for layout in ("SD", "DS"):
-        conv_state = (
-            _clone_strided(inputs["conv_state"])
-            if layout == "SD"
-            else inputs["conv_state"].contiguous()
-        )
+        if layout == "SD":
+            conv_state = _clone_strided(inputs["conv_state"])
+        else:
+            # Same paged slot stride as SD, not a compact 9 * H * 128.
+            conv_state = torch.empty_strided(
+                inputs["conv_state"].shape,
+                (inputs["conv_state"].stride(0), 3, 1),
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            conv_state.copy_(inputs["conv_state"])
         state = _clone_strided(inputs["state"])
         output = _fused_kda_decode(
             **{**inputs, "conv_state": conv_state, "state": state}
@@ -351,7 +357,8 @@ def test_fused_kda_decode_glm_heads_and_ds_layout(num_heads, num_rows, state_dty
         results[layout] = (output, conv_state, state)
 
     actual, actual_conv_state, actual_state = results["DS"]
-    assert actual_conv_state.stride()[1:] == (3, 1)
+    assert actual_conv_state.stride() == (inputs["conv_state"].stride(0), 3, 1)
+    assert actual_conv_state.stride(0) > 9 * num_heads * 128
     torch.testing.assert_close(actual, expected, rtol=3e-2, atol=2e-2)
     torch.testing.assert_close(actual_conv_state, reference_conv_state, rtol=0, atol=0)
     torch.testing.assert_close(actual_state, reference_state, rtol=3e-2, atol=2e-3)
@@ -445,19 +452,113 @@ def test_fused_kda_decode_requires_matching_cache_slots():
         _fused_kda_decode(**inputs)
 
 
+@pytest.mark.parametrize("misaligned", ["slot-stride", "pointer"])
 @pytest.mark.parametrize("ds", [False, True], ids=["SD", "DS"])
-def test_fused_kda_decode_rejects_misaligned_conv_slots(ds):
+def test_fused_kda_decode_rejects_misaligned_conv_slots(ds, misaligned):
     inputs = _make_inputs(num_heads=16, num_rows=2)
     conv_state = inputs["conv_state"]
-    slots, channels, history = conv_state.shape
-    slot_stride = conv_state.stride(0) + 2
-    strides = (slot_stride, 3, 1) if ds else (slot_stride, 1, channels)
-    inputs["conv_state"] = torch.empty_strided(
-        (slots, channels, history), strides, dtype=torch.bfloat16, device="cuda"
-    )
+    if misaligned == "pointer":
+        # Valid slot stride, base only 4-byte aligned.
+        inputs["conv_state"] = _conv_state_view(
+            conv_state, "DS" if ds else "SD", byte_offset=4
+        )
+        assert inputs["conv_state"].data_ptr() % 8 == 4
+    else:
+        slots, channels, history = conv_state.shape
+        slot_stride = conv_state.stride(0) + 2
+        strides = (slot_stride, 3, 1) if ds else (slot_stride, 1, channels)
+        inputs["conv_state"] = torch.empty_strided(
+            (slots, channels, history), strides, dtype=torch.bfloat16, device="cuda"
+        )
 
     with pytest.raises(ValueError, match="conv_state slots must start 8-byte aligned"):
         _fused_kda_decode(**inputs)
+
+
+def _conv_state_view(conv_state, layout, slot_padding=0, byte_offset=0):
+    """Copy ``conv_state`` into an SD or DS view whose slots are padded by
+    ``slot_padding`` elements and whose base is ``byte_offset`` bytes past a
+    fresh allocation."""
+    slots, channels, history = conv_state.shape
+    slot_stride = channels * history + slot_padding
+    strides = (slot_stride, 3, 1) if layout == "DS" else (slot_stride, 1, channels)
+    offset = byte_offset // conv_state.element_size()
+    storage = torch.zeros(
+        offset + slots * slot_stride, dtype=conv_state.dtype, device=conv_state.device
+    )
+    view = storage[offset:].as_strided((slots, channels, history), strides)
+    view.copy_(conv_state)
+    return view
+
+
+@pytest.mark.parametrize("layout", ["SD", "DS"])
+def test_fused_kda_decode_8_byte_aligned_conv_state(layout):
+    """A conv state whose base is 8- but not 16-byte aligned, with slots that
+    alternate between the two (both accepted by the launcher), matches a
+    compact, 16-byte aligned one."""
+    inputs = _make_inputs(num_heads=16, num_rows=8)
+    slot_padding, byte_offset = 4, 8
+    results = {}
+    for name, padding, offset in (
+        ("compact", 0, 0),
+        ("view", slot_padding, byte_offset),
+    ):
+        conv_state = _conv_state_view(inputs["conv_state"], layout, padding, offset)
+        state = _clone_strided(inputs["state"])
+        output = _fused_kda_decode(
+            **{**inputs, "conv_state": conv_state, "state": state}
+        )
+        results[name] = (output, conv_state, state)
+
+    view_conv_state = results["view"][1]
+    assert view_conv_state.data_ptr() % 16 == 8
+    assert view_conv_state.stride(0) == 9 * 16 * 128 + slot_padding
+    for view, compact in zip(results["view"], results["compact"], strict=True):
+        torch.testing.assert_close(view, compact, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("num_heads", [16, 64])
+def test_packed_fused_kda_decode_t1_ds_layout(num_heads):
+    """Packed T=1 rows with the DS conv-state layout match the direct T=1
+    call and the SD layout bit for bit."""
+    num_sequences = 4
+    inputs = _make_inputs(num_heads, num_sequences, state_dtype=torch.float32)
+    inputs["state_indices"] = inputs["state_indices"].reshape(num_sequences, 1)
+    inputs["query_start_loc"] = torch.arange(
+        num_sequences + 1, dtype=torch.int32, device="cuda"
+    )
+    inputs["num_accepted_tokens"] = torch.ones(
+        num_sequences, dtype=torch.int32, device="cuda"
+    )
+    direct_inputs = {
+        key: value
+        for key, value in inputs.items()
+        if key not in ("query_start_loc", "num_accepted_tokens")
+    }
+
+    results = {}
+    for layout in ("SD", "DS"):
+        for call in ("direct", "packed"):
+            conv_state = _conv_state_view(inputs["conv_state"], layout)
+            state = _clone_strided(inputs["state"])
+            if call == "direct":
+                output = _fused_kda_decode(
+                    **{
+                        **direct_inputs,
+                        "conv_state": conv_state,
+                        "state": state,
+                        "state_indices": inputs["state_indices"][:, 0],
+                    }
+                )
+            else:
+                output = _packed_fused_kda_decode(
+                    **{**inputs, "conv_state": conv_state, "state": state}
+                )
+            results[layout, call] = (output, conv_state, state)
+
+    for key in (("DS", "direct"), ("SD", "packed"), ("SD", "direct")):
+        for packed_ds, other in zip(results["DS", "packed"], results[key], strict=True):
+            torch.testing.assert_close(packed_ds, other, rtol=0, atol=0)
 
 
 def test_fused_kda_decode_compile_abi_orders_flags_and_metadata(monkeypatch):

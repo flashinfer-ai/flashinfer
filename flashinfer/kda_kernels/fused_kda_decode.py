@@ -631,11 +631,13 @@ def _make_compile_inputs(state_dtype, conv_dim_first=False):
         conv_stride = (cute.sym_int64(), 3, 1)
     else:
         conv_stride = (cute.sym_int64(), 1, qkv_size)
+    # Both layouts move conv state as bf16x4 vectors, so the launcher only
+    # requires 8-byte aligned slots; do not assume more here.
     conv_state = cute.runtime.make_fake_tensor(
         BF16,
         shape=(conv_slots, qkv_size, 3),
         stride=conv_stride,
-        assumed_align=16,
+        assumed_align=8,
     )
     raw_beta = cute.runtime.make_fake_tensor(
         BF16,
