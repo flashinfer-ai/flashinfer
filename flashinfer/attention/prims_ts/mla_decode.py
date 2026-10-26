@@ -138,13 +138,15 @@ class _MLADecodePlanState:
 
 
 @dataclass(frozen=True)
-class MLADecodeTuning:
-    """Compile-time tuning of one PrimTS MLA decode plan.
+class MLAAttentionTuning:
+    """Compile-time tuning of one PrimTS MLA attention plan.
 
-    ``softmax_rescale_threshold_log2`` is in binades. ``None`` keeps the entry
-    point's default: exact rescale for dense, and each schedule's existing
-    deferral for sparse. An explicit value, including ``0.0``, is compiled
-    into the kernel; see :meth:`BatchMLADecodePagedTSWrapper.plan`.
+    It applies to every query length the MLA wrappers serve, context
+    (multi-token Q) as well as generation. ``softmax_rescale_threshold_log2``
+    is in binades. ``None`` keeps the entry point's default: exact rescale for
+    dense, and each schedule's existing deferral for sparse. An explicit
+    value, including ``0.0``, is compiled into the kernel; see
+    :meth:`BatchMLADecodePagedTSWrapper.plan`.
     """
 
     softmax_rescale_threshold_log2: Optional[float] = None
@@ -153,8 +155,8 @@ class MLADecodeTuning:
 def _tuning_rescale_threshold(tuning: object) -> Optional[float]:
     if tuning is None:
         return None
-    if not isinstance(tuning, MLADecodeTuning):
-        raise TypeError("tuning must be an MLADecodeTuning or None")
+    if not isinstance(tuning, MLAAttentionTuning):
+        raise TypeError("tuning must be an MLAAttentionTuning or None")
     return tuning.softmax_rescale_threshold_log2
 
 
@@ -1540,7 +1542,7 @@ class BatchMLADecodePagedTSWrapper:
         mask_type: Literal["dense", "causal"] = "causal",
         workspace_buffer: Optional[torch.Tensor] = None,
         validate: bool = True,
-        tuning: Optional[MLADecodeTuning] = None,
+        tuning: Optional[MLAAttentionTuning] = None,
     ) -> None:
         """Compile one static MLA shape and bind its reusable workspace.
 
@@ -1586,7 +1588,7 @@ class BatchMLADecodePagedTSWrapper:
         validate : bool
             Validate static geometry and caller scratch. Defaults to ``True``.
             Disable only for previously validated inputs and warmed topology.
-        tuning : MLADecodeTuning, optional
+        tuning : MLAAttentionTuning, optional
             Compile-time tuning; ``None`` keeps every default.
             ``tuning.softmax_rescale_threshold_log2`` is the opt-in skip of
             the online-softmax O rescale (correction), in binades: 0 to 8 for
@@ -1841,7 +1843,7 @@ def batch_mla_decode_with_paged_kv_cache(
     out_dtype: torch.dtype = torch.bfloat16,
     workspace_buffer: Optional[torch.Tensor] = None,
     validate: bool = True,
-    tuning: Optional[MLADecodeTuning] = None,
+    tuning: Optional[MLAAttentionTuning] = None,
 ) -> torch.Tensor:
     """One-shot convenience wrapper for fixed or packed-query MLA decode.
 
@@ -1885,7 +1887,7 @@ def batch_mla_decode_with_paged_kv_cache(
         Validate tensors and metadata values (may synchronize), default True.
         False trusts the caller and requires workspace and explicit bounds;
         skips tensor and metadata validation. Invalid inputs have undefined behavior.
-    tuning : MLADecodeTuning, optional
+    tuning : MLAAttentionTuning, optional
         Compile-time tuning; see :meth:`BatchMLADecodePagedTSWrapper.plan`.
         ``None`` (default) keeps the exact rescale. A positive
         ``softmax_rescale_threshold_log2`` T quantizes FP8 P at
@@ -2433,7 +2435,7 @@ class BatchSparseMLADecodePagedTSWrapper:
         MXFP8; FP32 scales use unrounded amax/448. Both use an amax floor of
         1e-4. A block never crosses a head boundary.
 
-        ``tuning`` (an :class:`MLADecodeTuning`) has the meaning of
+        ``tuning`` (an :class:`MLAAttentionTuning`) has the meaning of
         :meth:`BatchMLADecodePagedTSWrapper.plan`; its
         ``softmax_rescale_threshold_log2`` takes 0 to 8 binades for E4M3 and
         0 to 32 for BF16. ``None`` (default) keeps each schedule's own

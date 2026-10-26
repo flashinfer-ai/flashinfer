@@ -43,7 +43,7 @@ from cutlass.experimental.task_scheduling.resources import (
 
 from flashinfer.attention.prims_ts import (
     BatchMLADecodePagedTSWrapper,
-    MLADecodeTuning,
+    MLAAttentionTuning,
     batch_mla_decode_with_paged_kv_cache,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.config import (
@@ -775,7 +775,7 @@ def _plan_case(
         kv_data_type=case.kv_cache.dtype,
         o_data_type=case.output_dtype,
         mask_type=case.mask_type,
-        tuning=MLADecodeTuning(
+        tuning=MLAAttentionTuning(
             softmax_rescale_threshold_log2=softmax_rescale_threshold_log2
         ),
     )
@@ -3133,7 +3133,7 @@ def test_attention_ts_mla_decode_softmax_rescale_threshold(
         bmm1_scale=case.bmm1_scale,
         bmm2_scale=case.bmm2_scale,
         mask_type=case.mask_type,
-        tuning=MLADecodeTuning(
+        tuning=MLAAttentionTuning(
             softmax_rescale_threshold_log2=softmax_rescale_threshold_log2
         ),
     )
