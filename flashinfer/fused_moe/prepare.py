@@ -2492,6 +2492,18 @@ def prepare_cutlass_humming_weights(
     }
 
 
+def _cute_dsl_gated_weight_group_size(device: torch.device) -> int:
+    """Keep each Blackwell epilogue warp's up/gate operands in its TMEM rows."""
+    arch = get_compute_capability(torch.device(device))
+    if arch in ((10, 0), (10, 3)):
+        return 16
+    if arch == (10, 7):
+        return 64
+    raise ValueError(
+        f"Split CuTe DSL MoE weight preparation does not support SM{arch[0]}{arch[1]}"
+    )
+
+
 def _interleave_linear_and_gate(
     x: torch.Tensor, group_size: int = 64, dim: int = -1
 ) -> torch.Tensor:
@@ -2521,6 +2533,9 @@ def prepare_cute_dsl_weights(
     """Build the CuteDSL ``cute_dsl`` weight view.
 
     Gemm1 weights get the linear/gate interleave only for gated activations;
+    Blackwell SM100/SM103 pairs 16 up rows with 16 gate rows so both operands
+    stay in one epilogue warp. Rubin SM107 retains its 64-row pairing.
+    Previously prepared Blackwell gated weights must be prepared again;
     non-gated ones (ReLU2) skip it and keep their ``[E, I, H]`` rows as-is.
     ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, MXFP8×MXFP8, or NVFP4×BF16
     (CuTe-DSL W4A16). Starts from the same canonical bf16 expert weights as
@@ -2597,7 +2612,9 @@ def prepare_cute_dsl_weights(
     activation = _normalize_activation(activation)
     gemm1_rows = _gemm1_rows(intermediate_size, activation)
     w1_interleaved = (
-        _interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
+        _interleave_linear_and_gate(
+            w1_bf16, group_size=_cute_dsl_gated_weight_group_size(device), dim=1
+        )
         if activation.is_gated
         else w1_bf16
     )

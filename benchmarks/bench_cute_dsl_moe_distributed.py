@@ -761,7 +761,10 @@ def _create_shared_ep_weights(rank, world_size, device):
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
     from flashinfer.fp4_quantization import block_scale_interleave, fp4_quantize
     from flashinfer.fused_moe import MoEWeightPack
-    from flashinfer.fused_moe.prepare import _interleave_linear_and_gate
+    from flashinfer.fused_moe.prepare import (
+        _cute_dsl_gated_weight_group_size,
+        _interleave_linear_and_gate,
+    )
     from flashinfer.moe_ep import PrequantizedMoEWeights
 
     num_local_experts = CFG.num_experts // world_size
@@ -807,14 +810,17 @@ def _create_shared_ep_weights(rank, world_size, device):
 
     # MegaMoE's canonical halves are [gate, up]. The split W4A16 epilogue
     # applies the gated activation to each interleaved pair (up, gate),
-    # so exchange the halves before its 64-row interleave. These are byte
+    # so exchange the halves before its architecture-specific interleave. These are byte
     # permutations only: neither path rounds or re-quantizes the weights.
     def up_gate(tensor):
         return torch.cat((tensor[:, intermediate:], tensor[:, :intermediate]), dim=1)
 
-    w13_split = _interleave_linear_and_gate(up_gate(w13_q), group_size=64, dim=1)
+    group_size = _cute_dsl_gated_weight_group_size(w13_q.device)
+    w13_split = _interleave_linear_and_gate(
+        up_gate(w13_q), group_size=group_size, dim=1
+    )
     w13_sf_split = _interleave_linear_and_gate(
-        up_gate(w13_sf.view(torch.uint8)), group_size=64, dim=1
+        up_gate(w13_sf.view(torch.uint8)), group_size=group_size, dim=1
     )
     split = MoEWeightPack()
     split.prepare_for(

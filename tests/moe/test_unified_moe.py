@@ -1427,11 +1427,10 @@ class TestMoERunnerSupport:
         assert CutlassBf16Runner.supported_activation_classes == cutlass
         assert CutlassW4A16Runner.supported_activation_classes == cutlass
         cute_dsl = (SwiGLU, GeGLUTanh, ReLU2, SiTU)
-        cute_dsl_mxfp8_act = (SwiGLU, GeGLUTanh, ReLU2)
         assert CuteDslRunner.supported_activation_classes_by_quant == {
             (QuantFormat.NVFP4, QuantFormat.NVFP4): cute_dsl,
-            (QuantFormat.MXFP4, QuantFormat.MXFP8): cute_dsl_mxfp8_act,
-            (QuantFormat.MXFP8, QuantFormat.MXFP8): cute_dsl_mxfp8_act,
+            (QuantFormat.MXFP4, QuantFormat.MXFP8): cute_dsl,
+            (QuantFormat.MXFP8, QuantFormat.MXFP8): cute_dsl,
             (QuantFormat.NVFP4, QuantFormat.BF16): cute_dsl,
         }
         assert TrtllmFp4RoutedRunner.supported_activation_classes_by_quant == {
@@ -1596,14 +1595,15 @@ class TestMoERunnerSupport:
             runner.config = self._nvfp4_swiglu(quant=quant)
             assert runner.check_support() is None
 
-    def test_cute_dsl_w4a8_requires_fused_finalize(self):
+    @pytest.mark.parametrize("weight_format", (QuantFormat.MXFP4, QuantFormat.MXFP8))
+    def test_cute_dsl_mxfp_situ_supports_unfused_finalize(self, weight_format):
         runner = CuteDslRunner.__new__(CuteDslRunner)
         runner.config = self._nvfp4_swiglu(
-            quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+            quant=QuantConfig(weight=weight_format, activation=QuantFormat.MXFP8),
+            activation=SiTU(),
             finalize=MoEFinalizeConfig(use_fused_finalize=False),
         )
-        with pytest.raises(NotImplementedError, match="requires fused finalize"):
-            runner.check_support()
+        assert runner.check_support() is None
 
     def test_cute_dsl_rejects_gated_rows_for_non_gated_activation(self):
         """A ReLU2 config paired with a default-prepared (SwiGLU) view.

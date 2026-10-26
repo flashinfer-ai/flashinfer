@@ -1280,18 +1280,8 @@ class Sm100W4A16GroupedGemmKernel:
         sS_tma = cute.make_tensor(sS_input.iterator, scale_tma_smem_layout)
         sA_transform_input = sA_input
         sS_transform_input = sS_input
-        if cutlass.const_expr(self.gated):
-            # Pair 16-row up/gate slices during decode so each epilogue warp
-            # owns both operands in its 32 TMEM lanes.
-            gated_row_layout = cute.make_layout(((16, 2), 4), stride=((1, 64), 16))
-            sA_transform_input = cute.composition(
-                sA_input,
-                ((gated_row_layout, None), None, None, None),
-            )
-            sS_transform_input = cute.composition(
-                sS_input,
-                ((gated_row_layout, None), None, None),
-            )
+        # Prepared gated weights already pair up16/gate16 rows, matching each
+        # epilogue warp's 32 TMEM lanes. Decode weights and scales in that order.
         sB_input = smem.allocate_tensor(
             element_type=self.b_dtype,
             layout=b_smem_layout.outer,

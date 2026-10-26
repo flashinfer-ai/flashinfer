@@ -120,11 +120,11 @@ def _run_kernel(x, w1, w2, topk_ids, topk_w, num_experts, tactic=None):
     )
 
 
-def _gemm1_n192_tactic(tile):
+def _channel_tile_tactic(channel_tile):
     return (
-        tile,
-        ((tile, 192), (tile // 128, 1), False),
-        ((tile, 128), (tile // 128, 1), False),
+        128,
+        ((channel_tile, 128), (2, 1), False),
+        ((128, 128), (1, 1), False),
     )
 
 
@@ -168,16 +168,22 @@ def test_mxfp8_relu2_moe(num_tokens, hidden, inter, num_experts, top_k):
     torch.testing.assert_close(out, ref_q, rtol=5e-2, atol=5e-2 * ref_q.abs().max())
 
 
-@pytest.mark.parametrize("tile", [128, 256])
-def test_mxfp8_relu2_gemm1_n192(tile):
-    """Non-gated GEMM1 may use N=192 tiles; check them against the MXFP8 reference."""
-    # intermediate = 14 x 192, not a multiple of 256
+@pytest.mark.parametrize("channel_tile", [256, 512])
+def test_mxfp8_relu2_partial_channel_tile(channel_tile):
+    """GEMM1 predicates the last channel-M tile of the 2688-wide intermediate."""
+    # The final tile is partial for both channel widths.
     num_tokens, hidden, inter, num_experts, top_k = 256, 1024, 2688, 64, 8
     x, w1, w2, topk_ids, topk_w = _make_case(
         num_tokens, hidden, inter, num_experts, top_k
     )
     out = _run_kernel(
-        x, w1, w2, topk_ids, topk_w, num_experts, tactic=_gemm1_n192_tactic(tile)
+        x,
+        w1,
+        w2,
+        topk_ids,
+        topk_w,
+        num_experts,
+        tactic=_channel_tile_tactic(channel_tile),
     ).float()
     ref_q = _reference(x, w1, w2, topk_ids, topk_w, quantized=True)
     cos_q = _cos(out, ref_q)
@@ -185,16 +191,9 @@ def test_mxfp8_relu2_gemm1_n192(tile):
     torch.testing.assert_close(out, ref_q, rtol=5e-2, atol=5e-2 * ref_q.abs().max())
 
 
-def test_mxfp8_relu2_gemm1_n192_rejects_partial_n_tile():
-    """GEMM1 has no partial-N-tile predicate, so N=192 needs inter % 192 == 0."""
-    x, w1, w2, topk_ids, topk_w = _make_case(33, 512, 512, 8, 2)
-    with pytest.raises(ValueError, match="Unsupported configuration"):
-        _run_kernel(x, w1, w2, topk_ids, topk_w, 8, tactic=_gemm1_n192_tactic(128))
-
-
-@pytest.mark.parametrize("tile", [128, 256])
-def test_w4a8_relu2_gemm1_n192_matches_default(tile):
-    """W4A8 (MXFP4 weights) with GEMM1 N=192 matches the default tactic."""
+@pytest.mark.parametrize("channel_tile", [256, 512])
+def test_w4a8_relu2_partial_channel_tile_matches_default(channel_tile):
+    """MXFP4 GEMM1 supports a partial channel-M tile with the same route-N layout."""
     from flashinfer import cute_dsl_fused_moe
     from flashinfer.fused_moe import CuteDslConfig, QuantConfig, QuantFormat, ReLU2
 
@@ -237,27 +236,37 @@ def test_w4a8_relu2_gemm1_n192_matches_default(tile):
         ).float()
 
     default = run(-1)
-    out = run(_gemm1_n192_tactic(tile))
+    out = run(_channel_tile_tactic(channel_tile))
     assert _cos(out, default) > 0.999
     torch.testing.assert_close(out, default, rtol=2e-2, atol=2e-2 * default.abs().max())
 
 
-def test_gemm1_n192_is_non_gated_only():
+def test_gemm1_partial_channel_tile_capability():
+    import cutlass
+
     from flashinfer.fused_moe.cute_dsl.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (  # noqa: E501
         BlockScaledContiguousGatherGroupedGemmKernel as Kernel,
     )
 
-    for tile in (128, 256):
-        cluster = (tile // 128, 1)
-        assert Kernel.is_valid_mma_tiler_and_cluster_shape(
-            (tile, 192), cluster, gated=False
+    for channels in (2688, 2 * 2688):
+        kwargs = dict(
+            a_dtype=cutlass.Float8E4M3FN,
+            b_dtype=cutlass.Float8E4M3FN,
+            sf_dtype=cutlass.Float8E8M0FNU,
+            sf_vec_size=32,
+            c_dtype=cutlass.Float8E4M3FN,
+            cluster_shape_mn=(2, 1),
+            m=128,
+            n=channels,
+            k=1024,
+            l=64,
+            a_major="k",
+            b_major="k",
+            c_major="n",
         )
-        assert not Kernel.is_valid_mma_tiler_and_cluster_shape(
-            (tile, 192), cluster, gated=True
-        )
-        assert Kernel.is_valid_mma_tiler_and_cluster_shape(
-            (tile, 128), cluster, gated=True
-        )
+        for channel_tile in (256, 512):
+            assert Kernel.can_implement(mma_tiler_mn=(channel_tile, 128), **kwargs)
+        assert not Kernel.can_implement(mma_tiler_mn=(256, 192), **kwargs)
 
 
 def test_mxfp8_mode_rejects_invalid_inputs():
@@ -288,7 +297,7 @@ def test_mxfp8_mode_rejects_invalid_inputs():
     x_q = x.to(torch.float8_e4m3fn)
     x_sf = torch.zeros(8, 256 // MXFP8_BLOCK, dtype=torch.uint8, device="cuda")
     # MXFP8 mode needs E4M3 weights, not BF16
-    with pytest.raises(TypeError, match="float8_e4m3fn weights"):
+    with pytest.raises(TypeError, match="float8_e4m3fn GEMM1 and GEMM2 weights"):
         cute_dsl_fused_moe(x=x_q, x_sf=x_sf, **{**kwargs, "w1_weight": w1})
 
 

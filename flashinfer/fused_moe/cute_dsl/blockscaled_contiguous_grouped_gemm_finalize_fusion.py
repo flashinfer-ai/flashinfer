@@ -29,7 +29,8 @@ grouped GEMM kernel with fused finalize operation designed for MoE GEMM2 layers:
 - Output C: finalized token rows or unfinalized expanded token/top-k rows
 
 Key features:
-- NVFP4 x NVFP4 or MXFP8 x MXFP4 grouped GEMM with FP8 scale factors
+- NVFP4 x NVFP4, MXFP8 x MXFP4, and MXFP8 x MXFP8 grouped GEMM
+- E4M3 block scales for NVFP4 and E8M0 block scales for MX formats
 - Optional fused finalize operation in epilogue:
   a) Map permuted rows to (token_idx, topk_idx) using permuted_idx_to_expanded_idx
   b) Apply router scale: scaled_output = gemm_output * token_final_scales[token_idx, topk_idx]
@@ -53,6 +54,7 @@ import torch
 from flashinfer.utils import get_compute_capability
 from flashinfer.cute_dsl.utils import (
     get_cutlass_dtype,
+    torch_to_cutlass_dtype,
     cutlass_to_torch_dtype,
     get_num_sm,
     get_max_active_clusters,
@@ -62,8 +64,257 @@ from flashinfer.cute_dsl.utils import (
 
 # Import the Blackwell (SM100) kernel implementation
 from .blackwell.blockscaled_contiguous_grouped_gemm_finalize_fusion import (
+    Sm100BlockScaledGroupedGemmKernel,
     Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
 )
+
+
+_CUDA_GRID_Y_MAX = 65_535
+
+_blockscaled_kernel_cache: Dict[Tuple, Any] = {}
+
+
+def _blockscaled_ptr(tensor, dtype, alignment=16):
+    if tensor is None:
+        return None
+    return make_ptr(
+        dtype, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=alignment
+    )
+
+
+def _run_blockscaled_gemm(
+    weight,
+    weight_sf,
+    activation,
+    activation_sf,
+    output,
+    output_sf,
+    alpha,
+    norm_const,
+    token_mapping,
+    expert_idx,
+    mn_limit,
+    num_tiles,
+    token_final_scales,
+    per_token_scale,
+    num_tokens,
+    top_k,
+    mma_tiler_mn,
+    cluster_shape_mn,
+    activation_type,
+    swiglu_alpha,
+    swiglu_beta,
+    swiglu_limit,
+    situ_beta,
+    situ_linear_beta,
+    use_fused_finalize,
+    enable_pdl,
+    activation_dtype,
+    weight_dtype,
+    sf_dtype,
+    sf_vec_size,
+    prepare_input,
+    scatter_output,
+    per_token_scale_is_routed,
+    k_steps,
+    num_stages,
+    overlap_epilogue,
+    overlap_activation_accumulators,
+    pdl_signal_at,
+    use_clc_scheduler,
+    num_tile_info_stages,
+    sm_count=None,
+    prefetch_weights_before_wait=False,
+    publish_routing_before_signal=False,
+    weight_scale_cache_policy: str = "normal",
+    activation_cache_policy: str = "normal",
+):
+    cache_policies = {
+        "normal": 0,
+        "evict_first": 0x12F0000000000000,
+        "evict_last": 0x14F0000000000000,
+    }
+    for policy in (weight_scale_cache_policy, activation_cache_policy):
+        if policy not in cache_policies:
+            raise ValueError(f"Unsupported block-scaled cache policy: {policy!r}")
+    weight_scale_cache_hint = cache_policies[weight_scale_cache_policy]
+    activation_cache_hint = cache_policies[activation_cache_policy]
+    if output.dtype == torch.uint8:
+        output_dtype = cutlass.Float4E2M1FN
+    else:
+        output_dtype = torch_to_cutlass_dtype(output.dtype)
+    if token_final_scales is None:
+        scale_dtype = cutlass.Float32
+    else:
+        scale_dtype = torch_to_cutlass_dtype(token_final_scales.dtype)
+    channels, reduction, experts = (
+        weight.shape[1],
+        weight.shape[2] * (2 if weight_dtype is cutlass.Float4E2M1FN else 1),
+        weight.shape[0],
+    )
+    routes = token_mapping.numel()
+    if not Sm100BlockScaledGroupedGemmKernel.can_implement(
+        m=channels,
+        n=routes,
+        k=reduction,
+        output_dtype=output_dtype,
+        activation_dtype=activation_dtype,
+        weight_dtype=weight_dtype,
+        sf_dtype=sf_dtype,
+        sf_vec_size=sf_vec_size,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        k_steps=k_steps,
+    ):
+        raise ValueError(
+            "Unsupported split block-scaled GEMM shape, output dtype, or K steps"
+        )
+    mma_m, route_tile = mma_tiler_mn
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if prepare_input:
+        from .blackwell.moe_prepare import allocate, prepare
+
+        routed, routed_sf = allocate(
+            activation, activation_sf, token_mapping.numel(), sf_vec_size
+        )
+        prepare(
+            activation,
+            activation_sf,
+            routed,
+            routed_sf,
+            token_mapping,
+            mn_limit,
+            num_tiles,
+            route_tile,
+            top_k,
+            sf_vec_size,
+            enable_pdl,
+        )
+        activation, activation_sf = routed, routed_sf
+    pointers = (
+        _blockscaled_ptr(weight, weight_dtype, 32),
+        _blockscaled_ptr(weight_sf, sf_dtype),
+        _blockscaled_ptr(activation, activation_dtype, 32),
+        _blockscaled_ptr(activation_sf, sf_dtype),
+        _blockscaled_ptr(output, output_dtype, 32),
+        _blockscaled_ptr(
+            output_sf,
+            cutlass.Uint8
+            if output_dtype is cutlass.Float8E4M3FN
+            and sf_dtype is cutlass.Float8E8M0FNU
+            and sf_vec_size == 32
+            else sf_dtype,
+        ),
+        _blockscaled_ptr(alpha, cutlass.Float32),
+        _blockscaled_ptr(norm_const, cutlass.Float32),
+        _blockscaled_ptr(token_mapping, cutlass.Int32),
+        _blockscaled_ptr(expert_idx, cutlass.Int32),
+        _blockscaled_ptr(mn_limit, cutlass.Int32),
+        _blockscaled_ptr(num_tiles, cutlass.Int32),
+        _blockscaled_ptr(token_final_scales, scale_dtype),
+        _blockscaled_ptr(per_token_scale, cutlass.Float32),
+    )
+    device_sms = get_num_sm(activation.device)
+    num_sms = device_sms if sm_count is None else sm_count
+    # A CLC grid can occupy the whole device, so honor an explicit SM budget
+    # with the bounded persistent launch. There is also no cancellation
+    # opportunity when the entire allocated work grid fits concurrently.
+    # The CLC grid's Y axis is the allocated route-tile capacity.
+    work_clusters = ((channels + mma_m - 1) // mma_m) * (routes // route_tile)
+    use_clc_scheduler = use_clc_scheduler and (
+        num_sms >= device_sms
+        and work_clusters > num_sms // cluster_shape_mn[0]
+        and routes // route_tile <= _CUDA_GRID_Y_MAX
+    )
+    key = (
+        activation.device.index,
+        mma_tiler_mn,
+        cluster_shape_mn,
+        output_dtype,
+        activation_dtype,
+        weight_dtype,
+        sf_dtype,
+        sf_vec_size,
+        output_sf is not None,
+        norm_const is not None,
+        scale_dtype,
+        channels,
+        reduction,
+        experts,
+        num_sms,
+        top_k,
+        prepare_input,
+        scatter_output,
+        per_token_scale_is_routed,
+        k_steps,
+        num_stages,
+        overlap_epilogue,
+        overlap_activation_accumulators,
+        pdl_signal_at,
+        use_clc_scheduler,
+        num_tile_info_stages,
+        prefetch_weights_before_wait,
+        publish_routing_before_signal,
+        weight_scale_cache_hint,
+        activation_cache_hint,
+        activation_type,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
+        situ_beta,
+        situ_linear_beta,
+        per_token_scale is not None,
+        use_fused_finalize,
+        enable_pdl,
+    )
+    tile_k = (
+        256
+        if activation_dtype is cutlass.Float4E2M1FN
+        and weight_dtype is cutlass.Float4E2M1FN
+        else 128
+    )
+    compiled = _blockscaled_kernel_cache.get(key)
+    args = (*pointers, channels, routes, reduction, experts, num_tokens)
+    if compiled is None:
+        kernel = Sm100BlockScaledGroupedGemmKernel(
+            mma_tiler_mnk=(mma_m, route_tile, tile_k),
+            activation_type=activation_type,
+            activation_dtype=activation_dtype,
+            weight_dtype=weight_dtype,
+            sf_dtype=sf_dtype,
+            sf_vec_size=sf_vec_size,
+            scatter_output=scatter_output,
+            per_token_scale_is_routed=per_token_scale_is_routed,
+            k_steps=k_steps,
+            num_stages=num_stages,
+            overlap_epilogue=overlap_epilogue,
+            overlap_activation_accumulators=overlap_activation_accumulators,
+            pdl_signal_at=pdl_signal_at,
+            use_clc_scheduler=use_clc_scheduler,
+            num_tile_info_stages=num_tile_info_stages,
+            prefetch_weights_before_wait=prefetch_weights_before_wait,
+            publish_routing_before_signal=publish_routing_before_signal,
+            weight_scale_cache_policy=weight_scale_cache_hint,
+            activation_cache_policy=activation_cache_hint,
+            generate_sfc=output_sf is not None,
+            output_dtype=output_dtype,
+            final_scale_dtype=scale_dtype,
+            top_k=top_k,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            use_per_token_scale=per_token_scale is not None,
+            use_fused_finalize=use_fused_finalize,
+            enable_pdl=enable_pdl,
+            max_active_clusters=num_sms,
+        )
+        compiled = cute.compile(kernel.wrapper, *args, stream=stream)
+        _blockscaled_kernel_cache[key] = compiled
+    # Channels, reduction, and experts already specialize the cache entry.
+    # Only routed capacity and token count remain runtime shape arguments.
+    compiled(*pointers, routes, num_tokens, stream=stream)
 
 
 @functools.cache
@@ -94,7 +345,7 @@ def create_finalize_fusion_tensors(
     mma_tiler_mn: Tuple[int, int],
     final_scale_dtype: torch.dtype = torch.float32,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Create tensors required for finalize fusion.
+    """Create tensors required for Blackwell finalize fusion.
 
     This function creates the mapping tensor and final scale tensor needed
     for the fused finalize operation in GEMM2.
@@ -102,9 +353,10 @@ def create_finalize_fusion_tensors(
     Args:
         seq_len: Number of output tokens (original sequence length)
         topk: Number of experts per token
-        permuted_m: Total permuted M dimension (sum of aligned group sizes)
-        group_m_list: List of actual (unaligned) M values per expert
-        mma_tiler_mn: MMA tile shape (M, N) for alignment
+        permuted_m: Total routed-token capacity (sum of aligned group sizes)
+        group_m_list: List of actual (unaligned) routed-token counts per expert
+        mma_tiler_mn: Physical Blackwell MMA tile shape (M, N). Routed-token
+            counts are aligned to N, which must be 16, 32, 64, 128, or 256.
         final_scale_dtype: Data type for token final scales. Default: torch.float32
 
     Returns:
@@ -118,17 +370,17 @@ def create_finalize_fusion_tensors(
     Example:
         >>> seq_len, topk, num_experts = 4096, 8, 8
         >>> group_m_list = [512, 480, 256, 320, 640, 512, 384, 704]  # Tokens per expert
-        >>> permuted_m = sum(align_to(m, 256) for m in group_m_list)  # Aligned total
+        >>> permuted_m = sum(align_to(m, 16) for m in group_m_list)  # Aligned total
         >>>
         >>> permuted_idx_to_expanded_idx, token_final_scales = create_finalize_fusion_tensors(
         ...     seq_len=seq_len,
         ...     topk=topk,
         ...     permuted_m=permuted_m,
         ...     group_m_list=group_m_list,
-        ...     mma_tiler_mn=(256, 128),
+        ...     mma_tiler_mn=(128, 16),
         ... )
     """
-    m_aligned = mma_tiler_mn[0]
+    route_tile = mma_tiler_mn[1]
 
     # Initialize mapping tensor with -1 (invalid)
     permuted_idx_to_expanded_idx = torch.empty(
@@ -171,7 +423,9 @@ def create_finalize_fusion_tensors(
             )
 
         # Move to next aligned group
-        m_aligned_per_group = ((m_per_group + m_aligned - 1) // m_aligned) * m_aligned
+        m_aligned_per_group = (
+            (m_per_group + route_tile - 1) // route_tile
+        ) * route_tile
         start_idx += m_aligned_per_group
 
     return permuted_idx_to_expanded_idx, token_final_scales
@@ -226,8 +480,8 @@ def _get_compiled_finalize_kernel(
 ):
     """Get or compile the grouped GEMM with finalize fusion kernel.
 
-    Supports both Blackwell (SM100, via mma_tiler_mn) and Rubin (SM107,
-    via mma_tiler + mma_inst_shape) architectures.
+    The Blackwell path uses the shared runtime-N launcher. This cache serves
+    Rubin (SM107) via mma_tiler + mma_inst_shape.
 
     This function caches compiled kernels by tactic and dtype parameters.
     Problem dimensions (m, n, k, num_experts) are runtime parameters.
@@ -239,6 +493,8 @@ def _get_compiled_finalize_kernel(
     global _finalize_kernel_cache
 
     is_rubin = mma_tiler is not None and mma_inst_shape is not None
+    if not is_rubin:
+        raise ValueError("Rubin compilation requires mma_tiler and mma_inst_shape")
 
     # Cache key includes tactic and pointer dtype parameters, NOT problem dimensions.
     cache_key = (
@@ -290,17 +546,6 @@ def _get_compiled_finalize_kernel(
                 use_fused_finalize=use_fused_finalize,
             )
             wrapper_fn = gemm_rubin.wrapper  # type: ignore[attr-defined]
-        else:
-            gemm_bw = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel(
-                sf_vec_size=sf_vec_size,
-                mma_tiler_mn=mma_tiler_mn,
-                cluster_shape_mn=cluster_shape_mn,
-                raster_along_m=raster_along_m,
-                enable_pdl=enable_pdl,
-                use_a_per_token_scale=use_a_per_token_scale,
-                use_fused_finalize=use_fused_finalize,
-            )
-            wrapper_fn = gemm_bw.wrapper
 
         # Compile with runtime parameters - they can vary across calls.
         # Order must match the wrapper signature, and the two wrappers have
@@ -407,8 +652,12 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         sf_dtype: Data type for scale factors. Default: "float8_e4m3fn"
         out_dtype: Data type for output matrix. Default: "bfloat16"
         sf_vec_size: Scale factor vector size. Use 16 for W4A4 or 32 for W4A8.
-        mma_tiler_mn: MMA tile shape (M, N). Default: (256, 128)
-        cluster_shape_mn: Cluster shape (ClusterM, ClusterN). Default: (2, 1)
+        mma_tiler_mn: Physical MMA tile shape (M, N). Blackwell uses channels on M
+            and routed tokens on N. Default: (256, 128).
+        cluster_shape_mn: Cluster shape (ClusterM, ClusterN). Blackwell uses
+            (1, 1) with M128 or (2, 1) with M256/M512. Resource admission
+            checks the selected channel and token widths.
+            Default: (2, 1).
         raster_along_m: If True, raster tiles along M dimension. Default: False
         sm_count: Number of SMs to use. Default: max available.
         domain_id: Locality-domain index (0 or 1), or -1 for ordinary output.
@@ -416,6 +665,13 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
              a caller-provided output with twice the shard's output width.
         use_fused_finalize: Use atomic fused finalize; otherwise write expanded
              rows for deterministic reduction. Default: True.
+        enable_pdl: Enable Programmatic Dependent Launch, including Blackwell
+             weight and scale prefetch before the dependency wait. Weights and
+             immutable routing metadata must be ready before early launch;
+             a preceding PDL producer must release-publish completed metadata
+             before its first signal in the same memory synchronization domain.
+             The built-in GEMM1 and per-token quantizer preserve this publication.
+             Default: True.
 
     Returns:
         out: Output tensor with dtype out_dtype. The shape is ``(seq_len, n)``
@@ -435,13 +691,13 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         >>> # Create tile mapping from routing decisions
         >>> group_m = torch.tensor([512, 480, 256, 320, 640, 512, 384, 704], device="cuda")
         >>> valid_m, aligned_m, tile_map, num_tiles, mn_limit = create_tile_mapping_finalize(
-        ...     group_m, mma_tiler_m=256
+        ...     group_m, mma_tiler_m=128
         ... )
         >>>
         >>> # Create finalize fusion tensors
         >>> permuted_idx, final_scales = create_finalize_fusion_tensors(
         ...     seq_len=seq_len, topk=topk, permuted_m=sum(aligned_m),
-        ...     group_m_list=group_m.tolist(), mma_tiler_mn=(256, 128)
+        ...     group_m_list=group_m.tolist(), mma_tiler_mn=(128, 128)
         ... )
         >>>
         >>> # Run grouped GEMM with finalize fusion
@@ -460,6 +716,68 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         ...     b_dtype="float4_e2m1fn",
         ... )  # out shape: (seq_len, hidden_dim)
     """
+    return _blockscaled_contiguous_grouped_gemm_finalize_fusion_impl(
+        a=a,
+        b=b,
+        a_scale=a_scale,
+        b_scale=b_scale,
+        alpha=alpha,
+        tile_idx_to_expert_idx=tile_idx_to_expert_idx,
+        num_non_exiting_tiles=num_non_exiting_tiles,
+        tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+        token_final_scales=token_final_scales,
+        out=out,
+        a_per_token_scale=a_per_token_scale,
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        sf_dtype=sf_dtype,
+        out_dtype=out_dtype,
+        sf_vec_size=sf_vec_size,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        raster_along_m=raster_along_m,
+        sm_count=sm_count,
+        domain_id=domain_id,
+        mma_tiler=mma_tiler,
+        mma_inst_shape=mma_inst_shape,
+        enable_pdl=enable_pdl,
+        use_fused_finalize=use_fused_finalize,
+    )
+
+
+def _blockscaled_contiguous_grouped_gemm_finalize_fusion_impl(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    tile_idx_to_expert_idx: torch.Tensor,
+    num_non_exiting_tiles: torch.Tensor,
+    tile_idx_to_mn_limit: torch.Tensor,
+    permuted_idx_to_expanded_idx: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    *,
+    a_per_token_scale: Optional[torch.Tensor] = None,
+    a_dtype: str,
+    b_dtype: str,
+    sf_dtype: str = "float8_e4m3fn",
+    out_dtype: str = "bfloat16",
+    sf_vec_size: int = 16,
+    mma_tiler_mn: Tuple[int, int] = (128, 128),
+    cluster_shape_mn: Tuple[int, int] = (1, 1),
+    raster_along_m: bool = False,
+    sm_count: Optional[int] = None,
+    domain_id: int = -1,
+    # Rubin-specific parameters (optional; when set, use SM107 kernel)
+    mma_tiler: Optional[Tuple[int, int, int]] = None,
+    mma_inst_shape: Optional[Tuple[int, int, int]] = None,
+    enable_pdl: bool = True,
+    use_fused_finalize: bool = True,
+    k_steps: Optional[int] = None,
+) -> torch.Tensor:
+    """Shared preparation and validation with an internal K-depth override."""
     # Validate inputs
     assert a.device.type == "cuda", "Input tensors must be on CUDA device"
     assert b.device.type == "cuda", "Input tensors must be on CUDA device"
@@ -499,6 +817,10 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     # Check compute capability
     major, minor = get_compute_capability(a.device)
     is_rubin = mma_tiler is not None and mma_inst_shape is not None
+    if k_steps is not None and (type(k_steps) is not int or k_steps not in (4, 8)):
+        raise ValueError("Blackwell k_steps must be None, 4, or 8")
+    if is_rubin and k_steps is not None:
+        raise ValueError("k_steps is supported only by the Blackwell kernels")
     if major != 10:
         raise ValueError(
             f"Blockscaled contiguous grouped GEMM with finalize fusion requires SM10x family. "
@@ -511,6 +833,12 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
             f"mma_tiler/mma_inst_shape select the Rubin (SM107) finalize "
             f"kernel, but the device is SM{major}{minor}."
         )
+    if not is_rubin and minor not in (0, 3):
+        raise ValueError(
+            f"The Blackwell runtime-N kernel requires SM100 or SM103, but "
+            f"the device is SM{major}{minor}. Select the Rubin kernel with "
+            "mma_tiler/mma_inst_shape on SM107."
+        )
 
     # Validate configuration
     a_dtype_cutlass = get_cutlass_dtype(a_dtype)
@@ -522,8 +850,10 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         token_scales_dtype = cutlass.Float32
     elif token_final_scales.dtype == torch.bfloat16:
         token_scales_dtype = cutlass.BFloat16
-    else:
+    elif token_final_scales.dtype == torch.float16:
         token_scales_dtype = cutlass.Float16
+    else:
+        raise TypeError(f"Unsupported routing weight dtype: {token_final_scales.dtype}")
 
     if is_rubin:
         can_impl = _sm107_finalize_kernel_cls().can_implement(
@@ -546,18 +876,18 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     else:
         can_impl = (
             Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.can_implement(
-                a_dtype_cutlass,
-                b_dtype_cutlass,
-                sf_dtype_cutlass,
-                sf_vec_size,
-                out_dtype_cutlass,
-                token_scales_dtype,
-                mma_tiler_mn,
-                cluster_shape_mn,
-                permuted_m,
-                n,
-                k,
-                num_experts,
+                m=permuted_m,
+                n=n,
+                k=k,
+                l=num_experts,
+                out_dtype=out_dtype_cutlass,
+                final_scale_dtype=token_scales_dtype,
+                a_dtype=a_dtype_cutlass,
+                b_dtype=b_dtype_cutlass,
+                sf_dtype=sf_dtype_cutlass,
+                sf_vec_size=sf_vec_size,
+                mma_tiler_mn=mma_tiler_mn,
+                cluster_shape_mn=cluster_shape_mn,
                 a_major="k",
                 b_major="k",
                 out_major="n",
@@ -614,6 +944,55 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
             raise ValueError(f"out must be on {a.device}, got {out.device}")
         if not out.is_contiguous():
             raise ValueError("out must be contiguous")
+
+    if not is_rubin:
+        _run_blockscaled_gemm(
+            weight=b,
+            weight_sf=b_scale,
+            activation=a,
+            activation_sf=a_scale,
+            output=out,
+            output_sf=None,
+            alpha=alpha,
+            norm_const=None,
+            token_mapping=permuted_idx_to_expanded_idx,
+            expert_idx=tile_idx_to_expert_idx,
+            mn_limit=tile_idx_to_mn_limit,
+            num_tiles=num_non_exiting_tiles,
+            token_final_scales=token_final_scales,
+            per_token_scale=a_per_token_scale,
+            num_tokens=seq_len,
+            top_k=topk,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            activation_type=None,
+            swiglu_alpha=1.0,
+            swiglu_beta=0.0,
+            swiglu_limit=0.0,
+            situ_beta=None,
+            situ_linear_beta=None,
+            use_fused_finalize=use_fused_finalize,
+            enable_pdl=enable_pdl,
+            activation_dtype=a_dtype_cutlass,
+            weight_dtype=b_dtype_cutlass,
+            sf_dtype=sf_dtype_cutlass,
+            sf_vec_size=sf_vec_size,
+            prepare_input=False,
+            scatter_output=True,
+            per_token_scale_is_routed=True,
+            k_steps=k_steps,
+            num_stages=None,
+            overlap_epilogue=True,
+            overlap_activation_accumulators=False,
+            pdl_signal_at="producer_exit",
+            prefetch_weights_before_wait=enable_pdl,
+            weight_scale_cache_policy="evict_first",
+            activation_cache_policy="evict_last",
+            use_clc_scheduler=False,
+            num_tile_info_stages=1,
+            sm_count=sm_count,
+        )
+        return out
 
     # Get SM count
     total_sm = get_num_sm(a.device)
@@ -852,9 +1231,9 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_mxfp8_mxfp4(
 
     ``a`` contains E4M3 values, while ``b`` contains two packed E2M1 values
     per byte. Both scale tensors use the MMA-compatible E8M0 block-32 layout.
-    The finalized scatter-reduced output is BF16. The problem N dimension must
-    be divisible by 128 and by ``mma_tiler_mn[1]`` because the current finalize
-    epilogue does not predicate a partial N tile.
+    The finalized scatter-reduced output is BF16. Physical MMA M covers output
+    channels, which must be divisible by 128; physical N covers routed tokens,
+    whose capacity must be padded to ``mma_tiler_mn[1]`` (16, 32, 64, 128, or 256).
     """
     warnings.warn(
         "blockscaled_contiguous_grouped_gemm_finalize_fusion_mxfp8_mxfp4 is "

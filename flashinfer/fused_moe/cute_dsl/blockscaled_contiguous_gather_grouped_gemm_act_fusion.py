@@ -20,28 +20,33 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Contiguous grouped GEMM kernel with gather and FC1 activation fusion for MoE
-workloads on Blackwell GPUs.
+Contiguous grouped GEMM API with logical token gather and fused FC1 activation
+for MoE workloads.
 
-This module provides a FlashInfer-style API wrapper around the TensorRT-LLM CuteDSL
-grouped GEMM kernel with fused gather and activation designed for MoE GEMM1 layers:
-- Input A: (seq_len, k) - original unpermuted tokens (no need for moe_permute!)
+This module provides a FlashInfer-style API for CuTe DSL MoE GEMM1 layers:
+- Input A: (seq_len, k) - original unpermuted tokens; no caller-side moe_permute
 - Input B: expert projection weights, interleaved for gated activations
 - Output C: activated outputs in permuted order
 
+On SM100/SM103, the wrapper prepares routed activation payloads and canonical
+scale factors in invocation-local storage before GEMM. The kernel loads the
+prepared payloads with regular TMA, placing weights on physical MMA M and routed
+tokens on runtime N. SM107 retains its in-kernel gather path. The public
+``a``/``b`` tensor order is unchanged.
+
 Key features:
-- NVFP4 x NVFP4 and MXFP8 x MXFP4 grouped GEMM paths
-- Fused gather operation using LDGSTS instructions with token_id_mapping
-- Eliminates the need for a separate moe_permute kernel
+- NVFP4 x NVFP4, MXFP8 x MXFP4, and MXFP8 x MXFP8 grouped GEMM paths
+- Original-token mapping through token_id_mapping
+- No caller-side permutation; Blackwell performs preparation inside the wrapper
 - Fused FC1 activation in the epilogue
-- Optional FP4 quantization of output with scale factor generation
+- Fused FP4 or MXFP8 output quantization with scale factor generation
 - Persistent tile scheduling with per-expert group mapping
 - Warp specialization for overlapped memory and compute
 - Support for SM100 (Blackwell) and SM107 (Rubin) architectures
 
-Comparison with non-gather activation fusion:
-- Non-Gather: Requires separate moe_permute kernel, then uses TMA for contiguous A load
-- Gather: Uses cp.async to gather A directly using token_id_mapping, no moe_permute needed
+The gather API accepts original unpermuted inputs. Blackwell prepares the routed
+inputs before regular-TMA GEMM; Rubin gathers inputs inside GEMM. Both retain
+FC1 activation fusion in the epilogue.
 """
 
 import functools
@@ -74,10 +79,10 @@ from .moe_utils import (
     validate_cute_dsl_moe_situ_config,
 )
 
-# Import the Blackwell (SM100) kernel implementation
 from .blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
     BlockScaledContiguousGatherGroupedGemmKernel,
 )
+from .blockscaled_contiguous_grouped_gemm_finalize_fusion import _run_blockscaled_gemm
 
 
 @functools.cache
@@ -109,22 +114,25 @@ def create_gather_gemm_tensors(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, List[int]]:
     """Create tensors required for gather grouped GEMM.
 
-    This function creates the mapping tensors needed for the fused gather operation
-    in GEMM1 with fused activation.
+    This function creates routing metadata for GEMM1 with fused activation.
+    Blackwell preparation and Rubin's in-kernel gather use the same mapping.
 
     Args:
         seq_len: Number of input tokens (original sequence length before routing)
         topk: Number of experts per token
-        group_m_list: List of actual (unaligned) M values per expert
-        mma_tiler_m: MMA tile M dimension for alignment (128 or 256)
+        group_m_list: List of actual (unaligned) routed-token counts per expert
+        mma_tiler_m: Routed-token tile capacity for alignment. For Blackwell,
+            pass physical MMA N (16, 32, 64, 128, or 256). The parameter name is
+            retained for callers of the Rubin path, which places tokens on M.
 
     Returns:
         Tuple of:
         - token_id_mapping: Maps permuted row to token_idx * topk + k_idx, shape (permuted_m,), int32
-          Used by cp.async to gather from the original unpermuted A tensor.
+          Identifies the original token for Blackwell routed-input preparation
+          or Rubin's in-kernel gather.
           Invalid rows are marked with -1.
         - tile_idx_to_expert_idx: Tile to expert mapping, shape (num_tiles,), int32
-        - tile_idx_to_mn_limit: M limit for each tile, shape (num_tiles,), int32
+        - tile_idx_to_mn_limit: Routed-token limit for each tile, shape (num_tiles,), int32
         - num_non_exiting_tiles: Number of valid tiles, shape (1,), int32
         - valid_m: Total valid M dimension (sum of aligned group sizes)
         - aligned_group_m_list: List of aligned M values per expert
@@ -137,7 +145,7 @@ def create_gather_gemm_tensors(
         ...     seq_len=seq_len,
         ...     topk=topk,
         ...     group_m_list=group_m_list,
-        ...     mma_tiler_m=256,
+        ...     mma_tiler_m=128,
         ... )
     """
     valid_m = 0
@@ -279,8 +287,8 @@ def _get_compiled_gather_kernel(
     This function caches compiled kernels by tactic and dtype parameters.
     Problem dimensions (m, n, k, num_experts) are runtime parameters.
 
-    Supports both Blackwell (SM100, via mma_tiler_mn) and Rubin (SM107,
-    via mma_tiler + mma_inst_shape) architectures.
+    The Blackwell path uses the shared runtime-N launcher. This cache serves
+    Rubin (SM107) via mma_tiler + mma_inst_shape.
     """
     global _gather_kernel_cache
     normalized_activation_type, expected_gated = normalize_cute_dsl_moe_activation_type(
@@ -296,6 +304,8 @@ def _get_compiled_gather_kernel(
     )
 
     is_rubin = mma_tiler is not None and mma_inst_shape is not None
+    if not is_rubin:
+        raise ValueError("Rubin compilation requires mma_tiler and mma_inst_shape")
 
     cache_key = (
         "sm107" if is_rubin else "sm100",
@@ -387,25 +397,6 @@ def _get_compiled_gather_kernel(
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
                 swiglu_limit=sm107_swiglu_limit,
-            )
-        else:
-            # Create kernel instance
-            gemm = BlockScaledContiguousGatherGroupedGemmKernel(
-                sf_vec_size=sf_vec_size,
-                mma_tiler_mn=mma_tiler_mn,
-                cluster_shape_mn=cluster_shape_mn,
-                vectorized_f32=vectorized_f32,
-                topk=topk,
-                raster_along_m=raster_along_m,
-                enable_pdl=enable_pdl,
-                activation_type=normalized_activation_type.value,
-                swiglu_alpha=swiglu_alpha,
-                swiglu_beta=swiglu_beta,
-                swiglu_limit=swiglu_limit,
-                situ_beta=situ_beta,
-                situ_linear_beta=situ_linear_beta,
-                gated=gated,
-                use_a_per_token_scale=use_a_per_token_scale,
             )
         wrapper_fn = gemm.wrapper
 
@@ -502,11 +493,13 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Blockscaled contiguous gather grouped GEMM with fused FC1 activation.
 
-    Performs grouped matrix multiplication with fused gather and activation.
+    Performs grouped matrix multiplication with logical token gather and fused
+    activation. On SM100/SM103, the wrapper prepares routed activation payloads
+    and canonical scales before regular-TMA GEMM. SM107 retains in-kernel gather.
 
-    This kernel is designed for Mixture of Experts (MoE) GEMM1 layers where:
-    - Input tokens are NOT pre-permuted (no need for moe_permute kernel!)
-    - The kernel gathers input tokens using token_id_mapping during cp.async load
+    This API is designed for Mixture of Experts (MoE) GEMM1 layers where:
+    - Input tokens are unpermuted; callers do not invoke moe_permute
+    - token_id_mapping identifies the source token for each routed row
     - Gated activations use interleaved gate and up projection weights
     - The configured activation is fused into the GEMM epilogue
     - Optional block-scaled quantization of output
@@ -522,10 +515,12 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         b_scale: Scale factors for B in MMA-compatible layout
         alpha: Per-expert scaling factors, shape (num_experts,), float32
         tile_idx_to_expert_idx: Mapping from tile index to expert index, shape (num_tiles,), int32
-        tile_idx_to_mn_limit: M limit for each tile for boundary checking, shape (num_tiles,), int32
+        tile_idx_to_mn_limit: Routed-token limit for each tile for boundary checking,
+            shape (num_tiles,), int32. This is physical MMA N for Blackwell.
         token_id_mapping: Mapping from permuted row to token_id, shape (permuted_m,), int32
             token_id = token_idx * topk + k_idx. Invalid rows have -1.
-            Used by cp.async to gather from A tensor.
+            Used by Blackwell preparation or Rubin's in-kernel gather to read
+            the original activation tensor.
         num_non_exiting_tiles: Number of valid tiles, shape (1,), int32
         out: Optional output tensor, shape (permuted_m, intermediate_size). Created if None.
              For FP4 output, shape is (permuted_m, intermediate_size//2) uint8.
@@ -551,12 +546,22 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             block-scaled format and generate out_scale. This is separate from
             c_dtype because float8_e4m3fn may also be used as a plain output
             dtype without MXFP8 scale generation.
-        mma_tiler_mn: MMA tile shape (M, N). Default: (256, 128)
-        cluster_shape_mn: Cluster shape (ClusterM, ClusterN). Default: (2, 1)
+        mma_tiler_mn: Channel/token tile shape (M, N). For Blackwell, M
+            covers weight channels and N covers routed tokens. M128/M256 use
+            N16/32/64/128/256; logical M512 uses the widths admitted by the
+            resource planner and shares one activation tile across two physical
+            M256 MMAs. Default: (256, 128).
+        cluster_shape_mn: Cluster shape (ClusterM, ClusterN). Blackwell uses
+            (1, 1) with M128 or (2, 1) with M256/M512. Default: (2, 1).
         vectorized_f32: Use vectorized f32x2 operations. Default: True
         raster_along_m: If True, raster tiles along M dimension. Default: False
         sm_count: Number of SMs to use. Default: max available.
-        enable_pdl: Enable Programmatic Dependent Launch. Default: True.
+        enable_pdl: Enable Programmatic Dependent Launch. Blackwell input
+            preparation publishes routing metadata before early GEMM startup,
+            allowing weights and their scales to load before the dependency wait.
+            Weights must be ready before early launch. The GEMM republishes
+            immutable routing metadata before signaling its dependent kernel
+            in the same memory synchronization domain. Default: True.
         activation_type: Activation type for the epilogue. Use
             ActivationType.Swiglu for gated SwiGLU/OAI/SiTU,
             ActivationType.GegluTanh for tanh-approximate GeGLU, and
@@ -579,24 +584,25 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         - out_scale: Output scale factors if quantize_output is True, else None
 
     Notes:
-        - Unlike the non-gather kernel, this kernel does NOT require moe_permute!
+        - Callers do not need a separate moe_permute call; Blackwell preparation
+          is internal to this wrapper.
         - The A tensor is the original unpermuted input
         - The output is in permuted order (can be fed directly to GEMM2)
         - Use create_gather_gemm_tensors() to create required mapping tensors
         - Supports SM100/SM103, plus W4A4 on SM107 with Rubin tactic parameters.
 
     Example:
-        >>> # Setup for MoE GEMM1 with 8 experts, no moe_permute needed!
+        >>> # Setup for MoE GEMM1 with 8 experts; no caller-side moe_permute.
         >>> num_experts, hidden_dim, intermediate_dim = 8, 4096, 14336
         >>> seq_len, topk = 4096, 8
         >>>
         >>> # Create gather mapping tensors
         >>> group_m = torch.tensor([512, 480, 256, 320, 640, 512, 384, 704], device="cuda")
         >>> token_map, tile_map, mn_limit, num_tiles, valid_m, aligned_m = create_gather_gemm_tensors(
-        ...     seq_len=seq_len, topk=topk, group_m_list=group_m.tolist(), mma_tiler_m=256
+        ...     seq_len=seq_len, topk=topk, group_m_list=group_m.tolist(), mma_tiler_m=128
         ... )
         >>>
-        >>> # Run gathered GEMM with SwiGLU fusion - NO moe_permute needed!
+        >>> # Run the gather API with fused SwiGLU; preparation is internal.
         >>> out, _ = blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         ...     a=original_input_fp4,            # (seq_len, hidden_dim//2) - UNPERMUTED!
         ...     b=expert_gate_up_weights_fp4,    # (num_experts, 2*intermediate_dim, hidden_dim//2)
@@ -615,6 +621,89 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         ...     topk=topk,
         ... )  # out shape: (valid_m, intermediate_dim)
     """
+    return _blockscaled_contiguous_gather_grouped_gemm_act_fusion_impl(
+        a=a,
+        b=b,
+        a_scale=a_scale,
+        b_scale=b_scale,
+        alpha=alpha,
+        tile_idx_to_expert_idx=tile_idx_to_expert_idx,
+        tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+        token_id_mapping=token_id_mapping,
+        num_non_exiting_tiles=num_non_exiting_tiles,
+        out=out,
+        out_scale=out_scale,
+        global_scale=global_scale,
+        a_per_token_scale=a_per_token_scale,
+        topk=topk,
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        sf_dtype=sf_dtype,
+        c_dtype=c_dtype,
+        sf_vec_size=sf_vec_size,
+        quantize_output=quantize_output,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        vectorized_f32=vectorized_f32,
+        raster_along_m=raster_along_m,
+        sm_count=sm_count,
+        domain_id=domain_id,
+        mma_tiler=mma_tiler,
+        mma_inst_shape=mma_inst_shape,
+        enable_pdl=enable_pdl,
+        activation_type=activation_type,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        gated=gated,
+    )
+
+
+def _blockscaled_contiguous_gather_grouped_gemm_act_fusion_impl(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    tile_idx_to_expert_idx: torch.Tensor,
+    tile_idx_to_mn_limit: torch.Tensor,
+    token_id_mapping: torch.Tensor,
+    num_non_exiting_tiles: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_scale: Optional[torch.Tensor] = None,
+    global_scale: Optional[torch.Tensor] = None,
+    *,
+    a_per_token_scale: Optional[torch.Tensor] = None,
+    topk: int = 8,
+    a_dtype: str = "float4_e2m1fn",
+    b_dtype: str = "float4_e2m1fn",
+    sf_dtype: str = "float8_e4m3fn",
+    c_dtype: str = "bfloat16",
+    sf_vec_size: int = 16,
+    quantize_output: bool = False,
+    mma_tiler_mn: Tuple[int, int] = (128, 128),
+    cluster_shape_mn: Tuple[int, int] = (1, 1),
+    vectorized_f32: bool = True,
+    raster_along_m: bool = False,
+    sm_count: Optional[int] = None,
+    domain_id: int = -1,
+    # Rubin-specific parameters (optional; when set, use SM107 kernel)
+    mma_tiler: Optional[Tuple[int, int, int]] = None,
+    mma_inst_shape: Optional[Tuple[int, int, int]] = None,
+    enable_pdl: bool = True,
+    activation_type: Union[int, ActivationType] = ActivationType.Swiglu.value,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
+    gated: bool = True,
+    k_steps: Optional[int] = None,
+    use_clc_scheduler: Optional[bool] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Shared preparation with internal reduction-depth and scheduler choices."""
     # Validate inputs
     assert a.device.type == "cuda", "Input tensors must be on CUDA device"
     assert b.device.type == "cuda", "Input tensors must be on CUDA device"
@@ -643,6 +732,18 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
 
     intermediate_size = n // (2 if gated else 1)
     permuted_m = token_id_mapping.shape[0]
+    is_rubin = mma_tiler is not None and mma_inst_shape is not None
+    if k_steps is not None and (type(k_steps) is not int or k_steps not in (4, 8)):
+        raise ValueError("Blackwell k_steps must be None, 4, or 8")
+    if is_rubin and k_steps is not None:
+        raise ValueError("k_steps is supported only by the Blackwell kernels")
+
+    if use_clc_scheduler is None:
+        use_clc_scheduler = not is_rubin
+    elif type(use_clc_scheduler) is not bool:
+        raise ValueError("use_clc_scheduler must be None or a boolean")
+    if is_rubin and use_clc_scheduler:
+        raise ValueError("CLC scheduling is supported only by the Blackwell kernels")
 
     use_a_per_token_scale = a_per_token_scale is not None
     if use_a_per_token_scale:
@@ -669,10 +770,20 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             raise ValueError(
                 f"Output scale generation is unsupported for c_dtype={c_dtype}"
             )
+        is_mxfp8_output = (
+            c_dtype == "float8_e4m3fn"
+            and sf_dtype == "float8_e8m0fnu"
+            and sf_vec_size == 32
+        )
         if c_dtype == "float4_e2m1fn" and global_scale is None:
             raise ValueError("global_scale is required when c_dtype is 'float4_e2m1fn'")
-        # The output scale-factor tensor is laid out in whole 128-row MMA atoms.
-        if permuted_m % 128 != 0:
+        if not is_rubin and not is_mxfp8_output and global_scale is None:
+            raise ValueError(
+                "global_scale is required for normalized block-scaled output"
+            )
+        # Blackwell pads SF storage independently of the routed-token tile.
+        # Rubin requires the routed rows themselves to fill 128-row atoms.
+        if is_rubin and permuted_m % 128 != 0:
             raise ValueError(
                 f"permuted_m={permuted_m} must be padded to a multiple of 128 "
                 "when generating output scale factors"
@@ -684,7 +795,6 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
 
     # Check compute capability
     major, minor = get_compute_capability(a.device)
-    is_rubin = mma_tiler is not None and mma_inst_shape is not None
     if major != 10:
         raise ValueError(
             f"Blockscaled contiguous gather grouped GEMM requires SM10x family. "
@@ -698,6 +808,12 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         raise ValueError(
             f"mma_tiler/mma_inst_shape select the Rubin (SM107) kernel, but "
             f"the device is SM{major}{minor}."
+        )
+    if not is_rubin and minor not in (0, 3):
+        raise ValueError(
+            f"The Blackwell runtime-N kernel requires SM100 or SM103, but "
+            f"the device is SM{major}{minor}. Select the Rubin kernel with "
+            "mma_tiler/mma_inst_shape on SM107."
         )
 
     localized_half_gemm = domain_id >= 0
@@ -775,21 +891,20 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         )
     else:
         can_impl = BlockScaledContiguousGatherGroupedGemmKernel.can_implement(
-            a_dtype_cutlass,
-            b_dtype_cutlass,
-            sf_dtype_cutlass,
-            sf_vec_size,
-            c_dtype_cutlass,
-            mma_tiler_mn,
-            cluster_shape_mn,
-            permuted_m,
-            n,
-            k,
-            num_experts,
+            m=permuted_m,
+            n=n,
+            k=k,
+            l=num_experts,
+            c_dtype=c_dtype_cutlass,
+            a_dtype=a_dtype_cutlass,
+            b_dtype=b_dtype_cutlass,
+            sf_dtype=sf_dtype_cutlass,
+            sf_vec_size=sf_vec_size,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
             a_major="k",
             b_major="k",
             c_major="n",
-            gated=gated,
         )
     if not can_impl:
         raise ValueError(
@@ -821,12 +936,63 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         # Scale factor layout for output
         scale_atom_n = sf_vec_size * 4
         scale_rest_n = (intermediate_size + scale_atom_n - 1) // scale_atom_n
+        scale_rest_m = (permuted_m + 127) // 128 if not is_rubin else permuted_m // 128
         # MMA-compatible scale factor shape
         out_scale = torch.empty(
-            (32, 4, permuted_m // 128, 4, scale_rest_n, 1),
+            (32, 4, scale_rest_m, 4, scale_rest_n, 1),
             dtype=torch.uint8,
             device=a.device,
         )
+
+    if not is_rubin:
+        _run_blockscaled_gemm(
+            weight=b,
+            weight_sf=b_scale,
+            activation=a,
+            activation_sf=a_scale,
+            output=out,
+            output_sf=out_scale if generate_sfc else None,
+            alpha=alpha,
+            norm_const=global_scale,
+            token_mapping=token_id_mapping,
+            expert_idx=tile_idx_to_expert_idx,
+            mn_limit=tile_idx_to_mn_limit,
+            num_tiles=num_non_exiting_tiles,
+            token_final_scales=None,
+            per_token_scale=a_per_token_scale,
+            num_tokens=seq_len,
+            top_k=topk,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            activation_type=normalized_activation_type.value,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            use_fused_finalize=False,
+            enable_pdl=enable_pdl,
+            activation_dtype=a_dtype_cutlass,
+            weight_dtype=b_dtype_cutlass,
+            sf_dtype=sf_dtype_cutlass,
+            sf_vec_size=sf_vec_size,
+            prepare_input=True,
+            scatter_output=False,
+            per_token_scale_is_routed=False,
+            k_steps=k_steps,
+            num_stages=None,
+            overlap_epilogue=True,
+            overlap_activation_accumulators=None,
+            pdl_signal_at="startup",
+            prefetch_weights_before_wait=enable_pdl,
+            publish_routing_before_signal=enable_pdl,
+            weight_scale_cache_policy="evict_first",
+            activation_cache_policy="evict_last",
+            use_clc_scheduler=use_clc_scheduler,
+            num_tile_info_stages=1,
+            sm_count=sm_count,
+        )
+        return out, out_scale if generate_sfc else None
 
     # Get SM count
     total_sm = get_num_sm(a.device)

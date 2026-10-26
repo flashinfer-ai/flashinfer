@@ -1031,6 +1031,12 @@ class NVFP4QuantizePerTokenKernel:
 
         if cutlass.const_expr(self.enable_pdl):
             cute.arch.griddepcontrol_wait()
+            # One CTA republishes completed ancestors before the grid's startup
+            # signal. The dependent wait still protects our quantized output.
+            if tidx < 32:
+                if bidx == 0:
+                    cute.arch.fence_acq_rel_gpu()
+                cute.arch.griddepcontrol_launch_dependents()
 
         smem = cutlass.utils.SmemAllocator()
         reduction_buffer = smem.allocate_tensor(
@@ -1054,8 +1060,6 @@ class NVFP4QuantizePerTokenKernel:
                     )
                     mScales[sf_offset] = Uint8(0)
                     sf_col_idx = sf_col_idx + threads
-            if cutlass.const_expr(self.enable_pdl):
-                cute.arch.griddepcontrol_launch_dependents()
         elif cutlass.const_expr(self.register_resident):
             self._quantize_row_register_resident(
                 mInput,
@@ -1168,9 +1172,6 @@ class NVFP4QuantizePerTokenKernel:
                     mScales[sf_offset] = Uint8(0)
                     sf_col_idx = sf_col_idx + threads
 
-            if cutlass.const_expr(self.enable_pdl):
-                cute.arch.griddepcontrol_launch_dependents()
-
     @cute.jit
     def _quantize_row_register_resident(
         self,
@@ -1240,11 +1241,6 @@ class NVFP4QuantizePerTokenKernel:
 
         warp_amax = warp_reduce(local_amax, fmax_f32)
         row_amax = block_reduce(warp_amax, fmax_f32, reduction_buffer, Float32(0.0))
-        # The row is fully in registers: let the dependent grid (the GEMM)
-        # start its prologue now; its griddepcontrol_wait still waits for this
-        # grid's stores to complete and flush.
-        if cutlass.const_expr(self.enable_pdl):
-            cute.arch.griddepcontrol_launch_dependents()
         global_scale_inv = Float32(mGlobalScaleInv[Int32(0)])
         global_encode_scale, per_token_scale = self._row_scales(
             row_amax, global_scale_inv

@@ -4975,9 +4975,8 @@ class CuteDslRunner(MoERunner):
         dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
     ] = {
         (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU, GeGLUTanh, ReLU2, SiTU),
-        # MXFP8 activations: _check_support() rejects SiTU.
-        (QuantFormat.MXFP4, QuantFormat.MXFP8): (SwiGLU, GeGLUTanh, ReLU2),
-        (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, GeGLUTanh, ReLU2),
+        (QuantFormat.MXFP4, QuantFormat.MXFP8): (SwiGLU, GeGLUTanh, ReLU2, SiTU),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, GeGLUTanh, ReLU2, SiTU),
         (QuantFormat.NVFP4, QuantFormat.BF16): (SwiGLU, GeGLUTanh, ReLU2, SiTU),
     }
     # The GEMM2 input is quantized by nvfp4_quantize_per_token_cute_dsl, which
@@ -5023,10 +5022,6 @@ class CuteDslRunner(MoERunner):
             if self.config.quant.pair == (QuantFormat.MXFP8, QuantFormat.MXFP8)
             else "W4A8"
         )
-        if mxfp8_act and isinstance(self.config.activation, SiTU):
-            raise NotImplementedError(f"CuTe-DSL {mode} does not support SiTU.")
-        if mxfp8_act and not self.config.finalize.use_fused_finalize:
-            raise NotImplementedError(f"CuTe-DSL {mode} requires fused finalize.")
         if mxfp8_act and hasattr(self, "device"):
             from ..utils import get_compute_capability
 

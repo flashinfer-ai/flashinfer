@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 """
-Numerical accuracy tests for CuteDSL Fused MoE NVFP4 on Blackwell and Rubin GPUs.
+Numerical accuracy tests for CuteDSL block-scaled MoE on Blackwell and Rubin GPUs.
 
 This test file covers both APIs:
 1. Functional API: `cute_dsl_fused_moe`
@@ -29,6 +29,7 @@ Tests include:
 """
 
 import gc
+import json
 import weakref
 
 import pytest
@@ -279,7 +280,8 @@ def test_geglu_tanh_activation_is_supported():
     assert gated
 
 
-def test_w4a4_and_w4a8_use_distinct_tuner_cache_keys():
+@pytest.mark.parametrize("other_mode", ["w4a8", "mxfp8"])
+def test_blockscaled_modes_use_distinct_tuner_cache_keys(other_mode):
     from flashinfer.fused_moe.cute_dsl.tuner import CuteDslFusedMoERunner
 
     kwargs = dict(
@@ -289,9 +291,13 @@ def test_w4a4_and_w4a8_use_distinct_tuner_cache_keys():
         num_local_experts=8,
     )
     w4a4 = CuteDslFusedMoERunner(**kwargs, quant_mode="w4a4")
-    w4a8 = CuteDslFusedMoERunner(**kwargs, quant_mode="w4a8")
-    assert hash(w4a4) != hash(w4a8)
-    assert w4a4.get_cache_key_extras([]) != w4a8.get_cache_key_extras([])
+    other = CuteDslFusedMoERunner(**kwargs, quant_mode=other_mode)
+    assert hash(w4a4) != hash(other)
+    assert w4a4.get_cache_key_extras([]) != other.get_cache_key_extras([])
+    if other_mode == "mxfp8":
+        w4a8 = CuteDslFusedMoERunner(**kwargs, quant_mode="w4a8")
+        assert hash(w4a8) != hash(other)
+        assert w4a8.get_cache_key_extras([]) != other.get_cache_key_extras([])
 
 
 @pytest.mark.parametrize(
@@ -312,7 +318,7 @@ def test_invalid_situ_config(activation_type, situ_beta, situ_linear_beta, error
         validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
 
 
-@pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
+@pytest.mark.parametrize("quant_mode", ["w4a4", "w4a8", "mxfp8", "w4a16"])
 def test_situ_changes_autotuner_cache_key(quant_mode: str):
     from flashinfer.fused_moe.cute_dsl.tuner import (
         CuteDslFusedMoERunner,
@@ -324,9 +330,10 @@ def test_situ_changes_autotuner_cache_key(quant_mode: str):
         "top_k": 2,
         "num_local_experts": 8,
     }
-    if quant_mode == "w4a4":
+    if quant_mode in ("w4a4", "w4a8", "mxfp8"):
         runner_cls = CuteDslFusedMoERunner
         kwargs["forward_impl"] = lambda *args, **kwargs: None
+        kwargs["quant_mode"] = quant_mode
     elif quant_mode == "w4a16":
         runner_cls = CuteDslFusedMoEW4A16Runner
     else:
@@ -342,10 +349,10 @@ def test_situ_changes_autotuner_cache_key(quant_mode: str):
 
 
 @cute_dsl_available
-@pytest.mark.parametrize("k", [128, 256, 384, 512])
+@pytest.mark.parametrize("k", [64, 128, 192, 256, 384, 512])
 @pytest.mark.parametrize("num_tokens", [1, 17])
-@pytest.mark.parametrize("tile_m", [128, 256])
-def test_gather_gemm_k_tail(k, num_tokens, tile_m):
+@pytest.mark.parametrize("tile_n", [16, 32, 64, 128, 256])
+def test_gather_gemm_k_tail(k, num_tokens, tile_n):
     if not torch.cuda.is_available() or get_compute_capability(
         torch.device("cuda")
     ) not in (
@@ -377,7 +384,8 @@ def test_gather_gemm_k_tail(k, num_tokens, tile_m):
     b_scale = torch.full(
         (32, 4, n // 128, 4, k // 64, 1), 0x38, dtype=torch.uint8, device=device
     )
-    mapping = torch.full((tile_m,), -1, dtype=torch.int32, device=device)
+    num_tiles = (num_tokens + tile_n - 1) // tile_n
+    mapping = torch.full((num_tiles * tile_n,), -1, dtype=torch.int32, device=device)
     mapping[:num_tokens] = torch.arange(num_tokens - 1, -1, -1, device=device)
 
     output, _ = blockscaled_contiguous_gather_grouped_gemm_act_fusion(
@@ -386,16 +394,18 @@ def test_gather_gemm_k_tail(k, num_tokens, tile_m):
         a_scale=a_scale,
         b_scale=b_scale,
         alpha=torch.full((1,), 1.0 / k, device=device),
-        tile_idx_to_expert_idx=torch.zeros(1, dtype=torch.int32, device=device),
-        tile_idx_to_mn_limit=torch.tensor(
-            [num_tokens], dtype=torch.int32, device=device
+        tile_idx_to_expert_idx=torch.zeros(num_tiles, dtype=torch.int32, device=device),
+        tile_idx_to_mn_limit=torch.full(
+            (num_tiles,), num_tokens, dtype=torch.int32, device=device
         ),
         token_id_mapping=mapping,
-        num_non_exiting_tiles=torch.ones(1, dtype=torch.int32, device=device),
+        num_non_exiting_tiles=torch.tensor(
+            [num_tiles], dtype=torch.int32, device=device
+        ),
         topk=1,
         c_dtype="bfloat16",
-        mma_tiler_mn=(tile_m, 128),
-        cluster_shape_mn=(tile_m // 128, 1),
+        mma_tiler_mn=(128, tile_n),
+        cluster_shape_mn=(1, 1),
         enable_pdl=False,
     )
     # Both projections are dot(ones, ones) / K = 1, hence SwiGLU = sigmoid(1).
@@ -424,13 +434,19 @@ def test_tuner_checks_gemm2_output_dtype(monkeypatch, output_dtype, arch):
 
         tactic = tuner.DEFAULT_RUBIN_MOE_TACTIC
         dtype_arg = "c_dtype"
-    else:
-        from flashinfer.fused_moe.cute_dsl.blackwell import (
-            Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel as kernel,
+        expected_dtypes = [torch_to_cutlass_dtype(output_dtype)]
+    elif arch == "blackwell":
+        import cutlass
+
+        from flashinfer.fused_moe.cute_dsl.blackwell.blockscaled_contiguous_grouped_gemm_finalize_fusion import (
+            Sm100BlockScaledGroupedGemmKernel as kernel,
         )
 
         tactic = tuner.DEFAULT_BLACKWELL_MOE_TACTIC
-        dtype_arg = "out_dtype"
+        dtype_arg = "output_dtype"
+        expected_dtypes = [cutlass.Float4E2M1FN, torch_to_cutlass_dtype(output_dtype)]
+    else:
+        raise ValueError(f"unsupported arch {arch!r}")
 
     can_implement = kernel.can_implement
     checked_dtypes = []
@@ -454,7 +470,7 @@ def test_tuner_checks_gemm2_output_dtype(monkeypatch, output_dtype, arch):
         output_dtype=output_dtype,
     )
     assert runner.get_valid_tactics(inputs, profile=None) == [tactic]
-    assert checked_dtypes == [torch_to_cutlass_dtype(output_dtype)]
+    assert checked_dtypes == expected_dtypes
 
 
 def test_localized_runner_uses_shard_shapes_and_separate_cache_key():
@@ -903,101 +919,139 @@ class TestTacticEnumeration:
     accuracy tests can fail to detect when a tile size is gated out of
     ALL_BLACKWELL_MOE_TACTICS as a workaround.
 
-    The MoE pipeline runs gemm1 (gather + SwiGLU) followed by gemm2
-    (finalize fusion) back-to-back on the same padded token sequence.
-    For the layouts to match, gemm1 and gemm2 must share the same
-    mma_tiler M dimension and the same cluster_shape M dimension.
+    Blackwell block-scaled GEMMs put output channels on M and routed tokens on N.
+    GEMM1 and GEMM2 must share the routed-token N capacity and use the
+    supported one- or two-CTA channel geometry independently; the intermediate
+    layout does not depend on the channel tile width.
     """
 
     def test_w4a8_retains_mixed_finalize_tactics(self):
+        """The mixed-input finalizer shares GEMM1's runtime-N routing tile."""
         from flashinfer.fused_moe.cute_dsl.tuner import (
+            ALL_BLACKWELL_MOE_TACTICS,
             canonicalize_w4a8_tactic,
             get_w4a8_moe_valid_tactics,
         )
 
         tactics = get_w4a8_moe_valid_tactics()
-        assert len(tactics) == 48
-        assert {gemm1[0][1] for _, gemm1, _ in tactics} == {128, 192, 256}
-        assert {gemm2[0][1] for _, _, gemm2 in tactics} == {64, 128, 192, 256}
-        assert canonicalize_w4a8_tactic(list(tactics[0])) == tactics[0]
+        assert tactics == ALL_BLACKWELL_MOE_TACTICS
+        for tactic in tactics:
+            assert canonicalize_w4a8_tactic(json.loads(json.dumps(tactic))) == tactic
+        legacy = tactics[0][:3]
+        for previous in (legacy, tactics[0][:4]):
+            assert (
+                canonicalize_w4a8_tactic(json.loads(json.dumps(previous))) == previous
+            )
+        for scheduler in (None, 0, 1, "true", (), (True,)):
+            with pytest.raises(ValueError, match="scheduler|bool|CLC"):
+                canonicalize_w4a8_tactic((*tactics[0][:4], scheduler))
+        for pair in (None, (), (4,), (4, 8, 4), (0, 8), (4, 16), (True, 8), (4.0, 8)):
+            with pytest.raises(ValueError, match="K-step|k_steps_pair"):
+                canonicalize_w4a8_tactic((*legacy, pair))
         with pytest.raises(ValueError, match="unsupported W4A8 MoE tactic"):
             canonicalize_w4a8_tactic(
                 (128, ((128, 128), (1, 1), False), ((128, 96), (1, 1), False))
             )
 
-    @pytest.mark.parametrize("tile_size", [128, 256])
+    @pytest.mark.parametrize("tile_size", [16, 32, 64, 128, 256])
     def test_gemm1_tactics_match_tile_size(self, tile_size):
-        """Every gemm1 tactic must have mma_tiler[0] == tile_size and
-        cluster_shape[0] == tile_size // 128 (1-CTA at tile=128, 2-CTA
-        at tile=256)."""
+        """GEMM1 puts routing on N and enumerates supported channel geometries."""
         from flashinfer.fused_moe.cute_dsl.tuner import (
             get_blackwell_gemm1_valid_tactics,
         )
 
         tactics = get_blackwell_gemm1_valid_tactics(tile_size)
-        assert len(tactics) > 0, f"no gemm1 tactics returned at tile_size={tile_size}"
-        expected_cluster_m = tile_size // 128
+        assert tactics, f"no gemm1 tactics returned at tile_size={tile_size}"
         for mma_tiler_mn, cluster_shape_mn, _ in tactics:
-            assert mma_tiler_mn[0] == tile_size, (
-                f"gemm1 mma_tiler[0]={mma_tiler_mn[0]} does not match "
+            assert mma_tiler_mn[1] == tile_size, (
+                f"gemm1 MMA shape {mma_tiler_mn} does not place routed tokens on N "
                 f"tile_size={tile_size}; tactic={(mma_tiler_mn, cluster_shape_mn)}"
             )
-            assert cluster_shape_mn[0] == expected_cluster_m, (
-                f"gemm1 cluster_shape[0]={cluster_shape_mn[0]} does not "
-                f"match tile_size//128={expected_cluster_m}; "
-                f"tactic={(mma_tiler_mn, cluster_shape_mn)}"
-            )
+            assert (mma_tiler_mn[0], cluster_shape_mn) in {
+                (128, (1, 1)),
+                (256, (2, 1)),
+                (512, (2, 1)),
+            }
 
-    @pytest.mark.parametrize("tile_size", [128, 256])
+    @pytest.mark.parametrize("tile_size", [16, 32, 64, 128, 256])
     def test_gemm2_tactics_match_tile_size(self, tile_size):
-        """Every gemm2 tactic must have mma_tiler[0] == tile_size and
-        cluster_shape[0] == tile_size // 128. The finalize kernel
-        consumes the upstream gemm1 output layout — a 1-CTA gemm2
-        tactic at tile_size=256 cannot consume a 2-CTA gemm1 output
-        and produces incorrect results (regression for #3067)."""
+        """GEMM2 consumes GEMM1's token layout with independent channel tiles."""
         from flashinfer.fused_moe.cute_dsl.tuner import (
             get_blackwell_gemm2_valid_tactics,
         )
 
         tactics = get_blackwell_gemm2_valid_tactics(tile_size)
-        assert len(tactics) > 0, f"no gemm2 tactics returned at tile_size={tile_size}"
-        expected_cluster_m = tile_size // 128
+        assert tactics, f"no gemm2 tactics returned at tile_size={tile_size}"
         for mma_tiler_mn, cluster_shape_mn, _ in tactics:
-            assert mma_tiler_mn[0] == tile_size, (
-                f"gemm2 mma_tiler[0]={mma_tiler_mn[0]} does not match "
+            assert mma_tiler_mn[1] == tile_size, (
+                f"gemm2 MMA shape {mma_tiler_mn} does not place routed tokens on N "
                 f"tile_size={tile_size}; tactic={(mma_tiler_mn, cluster_shape_mn)}"
             )
-            assert cluster_shape_mn[0] == expected_cluster_m, (
-                f"gemm2 cluster_shape[0]={cluster_shape_mn[0]} does not "
-                f"match tile_size//128={expected_cluster_m}; "
-                f"tactic={(mma_tiler_mn, cluster_shape_mn)}"
-            )
+            assert (mma_tiler_mn[0], cluster_shape_mn) in {
+                (128, (1, 1)),
+                (256, (2, 1)),
+                (512, (2, 1)),
+            }
 
     def test_all_moe_tactics_pair_gemm1_and_gemm2_consistently(self):
-        """Every (tile_size, gemm1_tactic, gemm2_tactic) tuple in
-        ALL_BLACKWELL_MOE_TACTICS must have gemm1 and gemm2 share both
-        mma_tiler[0] and cluster_shape[0] (the M dimensions). This
-        catches a class of bug where the product loop in
-        get_moe_valid_tactics accidentally pairs incompatible
-        gemm1/gemm2 tactics, even if each individual enumeration is
-        internally consistent."""
-        from flashinfer.fused_moe.cute_dsl.tuner import ALL_BLACKWELL_MOE_TACTICS
+        """Keep every supported routing capacity and pair compatible GEMMs."""
+        from flashinfer.fused_moe.cute_dsl.tuner import (
+            ALL_BLACKWELL_MOE_TACTICS,
+            DEFAULT_RUBIN_MOE_TACTIC,
+            _extract_tactic_params,
+        )
 
-        assert len(ALL_BLACKWELL_MOE_TACTICS) > 0
-        for tile_size, gemm1_tactic, gemm2_tactic in ALL_BLACKWELL_MOE_TACTICS:
-            gemm1_mma_m = gemm1_tactic[0][0]
-            gemm1_cluster_m = gemm1_tactic[1][0]
-            gemm2_mma_m = gemm2_tactic[0][0]
-            gemm2_cluster_m = gemm2_tactic[1][0]
-            assert gemm1_mma_m == gemm2_mma_m == tile_size, (
-                f"gemm1/gemm2 mma_m mismatch in ALL_BLACKWELL_MOE_TACTICS at "
-                f"tile_size={tile_size}: gemm1_mma_m={gemm1_mma_m}, "
-                f"gemm2_mma_m={gemm2_mma_m}"
-            )
-            assert gemm1_cluster_m == gemm2_cluster_m == tile_size // 128, (
-                f"gemm1/gemm2 cluster_m mismatch in ALL_BLACKWELL_MOE_TACTICS at "
-                f"tile_size={tile_size}: gemm1_cluster_m={gemm1_cluster_m}, "
-                f"gemm2_cluster_m={gemm2_cluster_m}"
+        assert ALL_BLACKWELL_MOE_TACTICS
+        assert len(ALL_BLACKWELL_MOE_TACTICS) == len(set(ALL_BLACKWELL_MOE_TACTICS))
+        assert {tactic[0] for tactic in ALL_BLACKWELL_MOE_TACTICS} == {
+            16,
+            32,
+            64,
+            128,
+            256,
+        }
+        assert {tactic[3] for tactic in ALL_BLACKWELL_MOE_TACTICS} == {
+            (4, 4),
+            (4, 8),
+            (8, 4),
+            (8, 8),
+        }
+        assert len(ALL_BLACKWELL_MOE_TACTICS) == 360
+        assert {tactic[4] for tactic in ALL_BLACKWELL_MOE_TACTICS} == {False, True}
+        for tactic in ALL_BLACKWELL_MOE_TACTICS:
+            assert len(tactic) == 5
+            tile_size, gemm1_tactic, gemm2_tactic, k_steps, scheduler = tactic
+            assert type(scheduler) is bool
+            assert gemm1_tactic[0][1] == gemm2_tactic[0][1] == tile_size
+            params = _extract_tactic_params(tactic)
+            assert (params["gemm1_k_steps"], params["gemm2_k_steps"]) == k_steps
+            assert params["gemm1_use_clc_scheduler"] is scheduler
+            assert (*tactic[:4], not scheduler) in ALL_BLACKWELL_MOE_TACTICS
+            legacy = _extract_tactic_params(tactic[:3])
+            previous = _extract_tactic_params(tactic[:4])
+            assert legacy["gemm1_use_clc_scheduler"] is True
+            assert previous["gemm1_use_clc_scheduler"] is True
+            assert legacy == {
+                **params,
+                "gemm1_k_steps": None,
+                "gemm2_k_steps": None,
+                "gemm1_use_clc_scheduler": True,
+            }
+            assert previous == {
+                **params,
+                "gemm1_use_clc_scheduler": True,
+            }
+        rubin = _extract_tactic_params(DEFAULT_RUBIN_MOE_TACTIC)
+        assert rubin["is_rubin"]
+        assert rubin["gemm1_use_clc_scheduler"] is False
+        assert rubin["gemm1_k_steps"] is rubin["gemm2_k_steps"] is None
+        with pytest.raises(ValueError, match="Blackwell-only"):
+            _extract_tactic_params((*DEFAULT_RUBIN_MOE_TACTIC, (4, 8)))
+        with pytest.raises(ValueError, match="Blackwell-only"):
+            _extract_tactic_params((*DEFAULT_RUBIN_MOE_TACTIC, (4, 8), True))
+        with pytest.raises(ValueError, match="same architecture format"):
+            _extract_tactic_params(
+                (128, ALL_BLACKWELL_MOE_TACTICS[0][1], DEFAULT_RUBIN_MOE_TACTIC[2])
             )
 
     def test_w4a16_tactic_enumeration_invariants(self):
@@ -2125,8 +2179,8 @@ class TestCuteDslFusedMoeFunctional:
     @pytest.mark.parametrize(
         "quant_mode,use_per_token_activation,use_fused_finalize,hidden_sizes",
         [
-            pytest.param("w4a4", False, True, (256, 384), id="w4a4-per-tensor"),
-            pytest.param("w4a4", True, True, (256, 384), id="w4a4-per-token"),
+            pytest.param("w4a4", False, False, (256, 384), id="w4a4-per-tensor"),
+            pytest.param("w4a4", True, False, (256, 384), id="w4a4-per-token"),
             pytest.param("w4a16", False, False, (256, 384, 256), id="w4a16-ordinary"),
         ],
     )
@@ -2140,15 +2194,15 @@ class TestCuteDslFusedMoeFunctional:
     ):
         from flashinfer.autotuner import AutoTuner
 
+        num_tokens = 128
         if quant_mode == "w4a4":
-            # hidden=256 leaves one padding CTA in the N=256, cluster_n=2
-            # configuration. hidden=384 also gives the second CTA a partial tile.
-            # Force the 256-row route so both cases execute the kernel path that
-            # previously had to be filtered out.
+            # 258 routes require a partial N128 tile. Hidden=384 also leaves
+            # one padding CTA in the final M256 channel tile.
+            num_tokens = 129
             tail_config = (
-                256,
+                128,
                 ((256, 128), (2, 1), False),
-                ((256, 256), (2, 2), False),
+                ((256, 128), (2, 1), False),
             )
         elif quant_mode == "w4a16":
             # The same cache sees a full cluster, a padding peer, then a full
@@ -2169,7 +2223,7 @@ class TestCuteDslFusedMoeFunctional:
         for hidden_size in hidden_sizes:
             self._run_numerical_accuracy(
                 activation_type=ActivationType.Relu2,
-                num_tokens=128,
+                num_tokens=num_tokens,
                 top_k=2,
                 hidden_size=hidden_size,
                 intermediate_size=512,
@@ -3995,7 +4049,7 @@ class TestMoeOutputMemsetInplaceContract:
             id="n128-bias-off",
         ),
         pytest.param(
-            (128, ((128, 128), (1, 1), False), ((128, 64), (1, 1), False)),
+            (64, ((128, 64), (1, 1), False), ((128, 64), (1, 1), False)),
             128,
             1.25,
             0.5,
@@ -4004,49 +4058,49 @@ class TestMoeOutputMemsetInplaceContract:
             id="n64-custom-bias",
         ),
         pytest.param(
-            (256, ((256, 128), (2, 1), False), ((256, 192), (2, 1), False)),
+            (32, ((128, 32), (1, 1), False), ((128, 32), (1, 1), False)),
             384,
             1.702,
             1.0,
             7.0,
             False,
-            id="n192-2cta-oai",
+            id="n32-h384-oai",
         ),
         pytest.param(
-            (256, ((256, 128), (2, 1), False), ((256, 128), (2, 1), False)),
+            (128, ((128, 128), (1, 1), False), ((128, 128), (1, 1), False)),
             256,
             1.702,
             1.0,
             7.0,
             False,
-            id="n128-2cta-oai",
+            id="n128-oai",
         ),
         pytest.param(
-            (128, ((128, 128), (1, 1), False), ((128, 192), (1, 1), False)),
+            (64, ((128, 64), (1, 1), False), ((128, 64), (1, 1), False)),
             384,
             1.0,
             0.0,
             torch.finfo(torch.float32).max,
             False,
-            id="n192-1cta",
+            id="n64-h384-bias-off",
         ),
         pytest.param(
-            (256, ((256, 128), (2, 1), False), ((256, 64), (2, 1), False)),
+            (32, ((128, 32), (1, 1), False), ((128, 32), (1, 1), False)),
             128,
             1.25,
             0.5,
             10.0,
             False,
-            id="n64-2cta-custom-bias",
+            id="n32-custom-bias",
         ),
         pytest.param(
-            (128, ((128, 128), (1, 1), False), ((128, 192), (1, 1), False)),
+            (16, ((128, 16), (1, 1), False), ((128, 16), (1, 1), False)),
             256,
             1.702,
             1.0,
             7.0,
             False,
-            id="n192-partial-oai",
+            id="n16-partial-oai",
         ),
     ],
 )
@@ -4940,11 +4994,11 @@ def test_localized_streams_are_joined_on_failure(
     monkeypatch.setattr(module, "moe_output_memset_inplace", memset)
     monkeypatch.setattr(
         module,
-        "blockscaled_contiguous_gather_grouped_gemm_act_fusion",
+        "_blockscaled_contiguous_gather_grouped_gemm_act_fusion_impl",
         lambda **kw: launch("fc1", **kw),
     )
     monkeypatch.setattr(
-        module, "blockscaled_contiguous_grouped_gemm_finalize_fusion", finalize
+        module, "_blockscaled_contiguous_grouped_gemm_finalize_fusion_impl", finalize
     )
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: main_stream)
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
@@ -5282,3 +5336,103 @@ def test_cute_dsl_pinned_recipe_matches_env(recipe):
         assert not torch.equal(env_on[leg], env_off[leg])
         assert torch.equal(pinned_under_env_off[leg], env_on[leg])
         assert torch.equal(none_under_env_on[leg], env_off[leg])
+
+
+@cute_dsl_available
+@mxfp8_required
+@pytest.mark.parametrize("quant_mode", ["w4a8", "mxfp8"])
+@pytest.mark.parametrize(
+    "situ_beta,situ_linear_beta",
+    [(None, None), (1.75, None), (0.8, 1.5)],
+    ids=["swiglu", "situ-gate", "situ-gate-and-up"],
+)
+@pytest.mark.parametrize(
+    "tactic",
+    [
+        (16, ((128, 16), (1, 1), False), ((128, 16), (1, 1), False)),
+        (128, ((256, 128), (2, 1), False), ((256, 128), (2, 1), False)),
+    ],
+    ids=["n16", "n128-two-cta"],
+)
+def test_mxfp_unfused_public_apis(quant_mode, tactic, situ_beta, situ_linear_beta):
+    from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe, mxfp8_quantize
+    from flashinfer.fused_moe import CuteDslConfig, QuantConfig, QuantFormat
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    tokens, hidden, intermediate, experts, top_k = 17, 256, 128, 2, 2
+    x_bf16 = torch.randn(tokens, hidden, dtype=torch.bfloat16, device=device) / 2
+    x, x_sf = mxfp8_quantize(
+        x_bf16, is_sf_swizzled_layout=False, alignment=128, backend="cuda"
+    )
+    x_sf = x_sf.view(torch.uint8).reshape(tokens, hidden // 32)
+    if quant_mode == "w4a8":
+        weight_format = QuantFormat.MXFP4
+    elif quant_mode == "mxfp8":
+        weight_format = QuantFormat.MXFP8
+    else:
+        raise ValueError(quant_mode)
+    weights = CuteDslConfig.prepare_weights(
+        torch.randn(
+            experts, 2 * intermediate, hidden, device=device, dtype=torch.bfloat16
+        )
+        / 4,
+        torch.randn(experts, hidden, intermediate, device=device, dtype=torch.bfloat16)
+        / 4,
+        quant=QuantConfig(weight_format, QuantFormat.MXFP8),
+        num_local_experts=experts,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+    )
+    inputs = dict(
+        x=x,
+        x_sf=x_sf,
+        token_selected_experts=torch.arange(experts, device=device, dtype=torch.int32)
+        .expand(tokens, top_k)
+        .contiguous(),
+        token_final_scales=torch.full(
+            (tokens, top_k), 1 / top_k, dtype=torch.float32, device=device
+        ),
+        fc2_input_scale=None,
+        **weights,
+    )
+    config = dict(
+        num_experts=experts,
+        top_k=top_k,
+        quant_mode=quant_mode,
+        use_fused_finalize=False,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+    )
+    expected = cute_dsl_fused_moe(**inputs, **config, tactic=tactic)
+    wrapper = CuteDslMoEWrapper(
+        **config,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        use_cuda_graph=True,
+        autotune_use_cuda_graph=True,
+    )
+    actual = wrapper.run(**inputs, tactic=tactic)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert wrapper._runner.use_cuda_graph
+
+    if situ_beta is not None:
+        from flashinfer.trace.templates.moe import _cute_dsl_fused_moe_reference
+
+        reference = _cute_dsl_fused_moe_reference(**inputs, **config)
+        swiglu_reference = _cute_dsl_fused_moe_reference(
+            **inputs, **dict(config, situ_beta=None, situ_linear_beta=None)
+        )
+        passed, percent_within, atol = check_accuracy(actual, reference)
+        assert passed, (
+            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+        situ_error = torch.mean(torch.abs(actual.float() - reference.float()))
+        swiglu_error = torch.mean(torch.abs(actual.float() - swiglu_reference.float()))
+        assert situ_error < swiglu_error
+
+    invalid = dict(inputs, w1_weight=inputs["w1_weight"].to(torch.bfloat16))
+    with pytest.raises(TypeError, match="GEMM1 and GEMM2 weights"):
+        wrapper.run(**invalid, tactic=tactic)
+    with pytest.raises(TypeError, match="GEMM1 and GEMM2 weights"):
+        cute_dsl_fused_moe(**invalid, **config, tactic=tactic)

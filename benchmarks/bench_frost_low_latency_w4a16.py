@@ -249,7 +249,12 @@ def _sm120_tc_native(x, w1, s1, a1, w2, s2, a2, ids, scores):
 
 
 def _cute_dsl_nvfp4_view(w1, s1, a1, w2, s2, a2):
-    from flashinfer.fused_moe.prepare import _interleave_linear_and_gate
+    from flashinfer.fused_moe.prepare import (
+        _cute_dsl_gated_weight_group_size,
+        _interleave_linear_and_gate,
+    )
+
+    group_size = _cute_dsl_gated_weight_group_size(w1.device)
 
     def mma_scales(sf):
         e, rows, cols = sf.shape
@@ -264,8 +269,8 @@ def _cute_dsl_nvfp4_view(w1, s1, a1, w2, s2, a2):
         return logical.view(torch.float8_e4m3fn)
 
     return dict(
-        w1_weight=_interleave_linear_and_gate(w1, 64, 1),
-        w1_weight_sf=mma_scales(_interleave_linear_and_gate(s1, 64, 1)),
+        w1_weight=_interleave_linear_and_gate(w1, group_size, 1),
+        w1_weight_sf=mma_scales(_interleave_linear_and_gate(s1, group_size, 1)),
         w1_alpha=a1,
         w2_weight=w2,
         w2_weight_sf=mma_scales(s2),

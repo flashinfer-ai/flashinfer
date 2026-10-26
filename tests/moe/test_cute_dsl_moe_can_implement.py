@@ -1,9 +1,7 @@
-"""Directed host-side checks for blockscaled MoE kernel contracts.
+"""Host checks for the shared blockscaled MoE operand contract.
 
-The finalize epilogue limits its bulk transfer to the remaining output columns,
-including for cluster-padding CTAs. The gemm1 SFC store is still unpredicated,
-so only gemm1 must reject configurations that leave a partial N tile. These are
-pure classmethod checks -- no GPU work.
+All SM100 types put channel tiles on M and routed tokens on N.
+These checks exercise the existing classmethod hooks without GPU work.
 """
 
 import pytest
@@ -81,19 +79,25 @@ def _gemm1_ok(
 @pytest.mark.parametrize(
     "n,mma,cluster,expect",
     [
-        # A padding CTA has no remaining columns and skips its row transfer.
-        (256, (128, 256), (1, 2), True),
-        # 2 exact tiles / cluster_n=2 -> exact cluster tiling: fine.
-        (512, (128, 256), (1, 2), True),
-        # A partial tile transfers only columns 256..383.
-        (384, (128, 256), (1, 2), True),
-        # The same tail handling applies without an N cluster.
-        (384, (128, 256), (1, 1), True),
-        # 3 exact 128-tiles, no cluster: fine.
-        (384, (128, 128), (1, 1), True),
-        (384, (128, 192), (1, 1), True),
-        (256, (128, 192), (1, 1), True),
-        (128, (128, 256), (1, 1), True),
+        # Output channels form complete M128 tiles; N is routed-token capacity.
+        (128, (128, 16), (1, 1), True),
+        (256, (128, 32), (1, 1), True),
+        (384, (128, 64), (1, 1), True),
+        (512, (128, 128), (1, 1), True),
+        (256, (128, 256), (1, 1), True),
+        # Previous channel-N192 tactics are not routed-token tactics.
+        (384, (128, 192), (1, 1), False),
+        # Two CTAs jointly issue M256 while retaining one M128 output per CTA.
+        (256, (256, 128), (2, 1), True),
+        (512, (256, 256), (2, 1), True),
+        (384, (256, 256), (2, 1), True),
+        (128, (256, 128), (2, 1), True),
+        (256, (256, 64), (2, 1), True),
+        (128, (128, 128), (1, 2), False),
+        (256, (128, 128), (2, 1), False),
+        (256, (256, 128), (1, 1), False),
+        # Both GEMMs can reuse B across two channel tiles.
+        (512, (512, 128), (2, 1), True),
     ],
 )
 def test_finalize_n_tiling(n, mma, cluster, expect):
@@ -101,18 +105,22 @@ def test_finalize_n_tiling(n, mma, cluster, expect):
 
 
 @pytest.mark.parametrize(
-    "n,mma,expect",
+    "n,mma,cluster,expect",
     [
-        # The scale-factor store requires exact tiling under mma_n=256.
-        (384, (128, 256), False),
-        # Exact tiling: fine.
-        (512, (128, 256), True),
-        (384, (128, 128), True),
+        # The gated epilogue produces 64 channels per physical M128 tile.
+        (384, (128, 16), (1, 1), True),
+        (512, (128, 64), (1, 1), True),
+        # Weight scale storage still requires complete 128-channel atoms.
+        (192, (128, 128), (1, 1), False),
+        # M512 reuses B across two M256 instructions in a two-CTA cluster.
+        (384, (512, 128), (2, 1), True),
+        (384, (512, 256), (2, 1), False),
+        (384, (512, 128), (1, 1), False),
+        (384, (512, 128), (4, 1), False),
     ],
 )
-def test_gemm1_n_tiling_guard(n, mma, expect):
-    # gemm1 requires cluster_n == 1 (enforced independently).
-    assert _gemm1_ok(n, mma, (1, 1)) is expect
+def test_gemm1_n_tiling_guard(n, mma, cluster, expect):
+    assert _gemm1_ok(n, mma, cluster) is expect
 
 
 @pytest.mark.parametrize("op", [_gemm1_ok, _finalize_ok])
@@ -151,9 +159,9 @@ def test_w4a8_dtype_contract(op):
     "mma,n,expect",
     [
         ((128, 64), 128, True),
-        ((128, 192), 384, True),
+        ((128, 32), 384, True),
         ((128, 64), 192, False),
-        ((128, 192), 256, True),
+        ((128, 192), 256, False),
     ],
 )
 def test_w4a8_finalize_n_tiling(mma, n, expect):
