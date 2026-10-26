@@ -1277,6 +1277,36 @@ __device__ __forceinline__ void copy_b_slice_async(quant::Type const* __restrict
 }
 
 /**
+ * @brief Prefetch x into L2 for the staged-B producer, two K64 tiles per row at a time.
+ *
+ * A K64 tile reads 128 contiguous bytes of each x row, which keeps DRAM below
+ * the bandwidth that longer row segments reach. Every kStagedBXPrefetchGroup
+ * tiles the quantize threads bulk-prefetch the next kStagedBXPrefetchGroup
+ * tiles of each row (256 bytes), kStagedBXPrefetchLead tiles ahead of the
+ * cp.async that reads them. Prefetching 128 bytes per row did not help; larger
+ * groups and a longer lead helped less or not at all.
+ */
+constexpr int kStagedBXPrefetchGroup = 2;
+constexpr int kStagedBXPrefetchLead = 2;
+
+/**
+ * @brief Bulk-prefetch x[row][k_begin, min(k_end, K)) into L2 for the tile's rows.
+ */
+template <int TileM>
+__device__ __forceinline__ void prefetch_x_rows_l2(quant::Type const* __restrict__ x, int row_base,
+                                                   int k_begin, int k_end, int first_row,
+                                                   int row_step, int M, int K) {
+  int const bytes = (min(k_end, K) - k_begin) * static_cast<int>(sizeof(quant::Type));
+  if (bytes <= 0) {
+    return;
+  }
+  for (int row = first_row; row >= 0 && row < TileM && row_base + row < M; row += row_step) {
+    quant::Type const* address = x + static_cast<std::int64_t>(row_base + row) * K + k_begin;
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" : : "l"(address), "r"(bytes));
+  }
+}
+
+/**
  * @brief Fuse quantization and LoRA-down with shared B slices and double-buffered X.
  * Down warps share K-major L2T slices across row partitions; larger row tiles
  * use one CTA per SM, while smaller tiles allow two.
@@ -1381,6 +1411,12 @@ __launch_bounds__(BlockThreads, 3 - staged_b_row_split(KernelTileM)) void nvfp4_
       copy_pre_quant_scale_tile_async_dyn<LongK, KernelTileK, Rank>(
           pre_quant_scale, scale_tiles[next_buffer], next_tile_k, thread);
       commit_x_tile_async();
+    }
+    if (tile_k % (kStagedBXPrefetchGroup * kTileK) == 0) {
+      int const prefetch_k = tile_k + kStagedBXPrefetchLead * kTileK;
+      prefetch_x_rows_l2<kKernelTileM>(x, row_base, prefetch_k,
+                                       prefetch_k + kStagedBXPrefetchGroup * kTileK,
+                                       thread - kDownWarps * 32, kKernelQuantThreads, M, K);
     }
     quant::Type const* x_tile = x_tiles[tile_buffer];
     quant::Type const* scale_tile = scale_tiles[tile_buffer];
