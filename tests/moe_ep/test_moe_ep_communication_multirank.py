@@ -293,6 +293,118 @@ def test_split_layer_cuda_graph_replays_new_inputs(backend):
         layer.destroy()
 
 
+def _fused_moe_split_config(comm, quant_pair, *, rank, world_size, num_experts):
+    from flashinfer.fused_moe.api import (
+        BackendOptions,
+        CuteDslConfig,
+        ExecutionConfig,
+        ExpertConfig,
+        MoEConfig,
+        QuantConfig,
+        QuantFormat,
+        RoutingConfig,
+        TrtllmFp4Config,
+    )
+    from flashinfer.moe_ep import FusedMoeKernelConfig, SplitConfig
+
+    weight, activation = (QuantFormat[name] for name in quant_pair)
+    local_num_experts = num_experts // world_size
+    candidate = TrtllmFp4Config() if weight is QuantFormat.NVFP4 else CuteDslConfig()
+    moe_config = MoEConfig(
+        routing=RoutingConfig(num_experts=num_experts, top_k=2),
+        quant=QuantConfig(weight=weight, activation=activation),
+        experts=ExpertConfig(
+            intermediate_size=512,
+            local_expert_offset=rank * local_num_experts,
+            local_num_experts=local_num_experts,
+        ),
+        backend=BackendOptions(candidates=(candidate,)),
+        execution=ExecutionConfig(tune_max_num_tokens=16 * world_size),
+    )
+    return SplitConfig(comm=comm, kernel=FusedMoeKernelConfig(moe_config=moe_config))
+
+
+@pytest.mark.gpu_2
+@pytest.mark.parametrize("quant_pair", [("NVFP4", "NVFP4"), ("MXFP4", "MXFP8")])
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_split_layer_quantizes_tokens_before_dispatch(backend, quant_pair):
+    """Quantized activations travel over the wire and match receiver-side
+    quantization.
+
+    NVFP4 and MXFP8 quantize each token row on its own, so a layer that
+    quantizes before dispatch must produce the output of one that dispatches
+    BF16 rows and quantizes them on the receiving rank.
+    """
+    import torch
+    import torch.distributed as dist
+
+    from flashinfer.fused_moe.api import QuantFormat
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        EpAlgorithm,
+        EpLayout,
+        FleetParams,
+        MoEEpLayer,
+        MoEEpTensors,
+        MoEWeightPack,
+    )
+
+    rank, world_size = _init_dist()
+    _backend_config(backend)
+    num_tokens, hidden, intermediate = 16, 1024, 512
+    num_experts = 4 * world_size
+    generator = torch.Generator().manual_seed(23 + rank)
+    x = torch.randn(num_tokens, hidden, generator=generator).to("cuda", torch.bfloat16)
+    topk_ids, topk_weights = _random_routing(num_tokens, num_experts, 2, generator)
+    t = MoEEpTensors(
+        hidden_states=x, topk_ids=topk_ids.long(), topk_weights=topk_weights
+    )
+    weight_generator = torch.Generator().manual_seed(1000 + rank)
+    w13 = torch.randn(4, 2 * intermediate, hidden, generator=weight_generator) * 0.05
+    w2 = torch.randn(4, hidden, intermediate, generator=weight_generator) * 0.05
+
+    def build_layer():
+        return MoEEpLayer(
+            BootstrapConfig(world_size=world_size, rank=rank),
+            FleetParams(
+                num_experts=num_experts,
+                max_tokens_per_rank=num_tokens,
+                token_hidden_size=hidden,
+                algorithm=EpAlgorithm.LOW_LATENCY,
+                layout=EpLayout.RANK_MAJOR,
+            ),
+            MoEWeightPack(
+                w13=w13.to("cuda", torch.bfloat16), w2=w2.to("cuda", torch.bfloat16)
+            ),
+            backend=_fused_moe_split_config(
+                _backend_config(backend),
+                quant_pair,
+                rank=rank,
+                world_size=world_size,
+                num_experts=num_experts,
+            ),
+        )
+
+    quantized = build_layer()
+    unquantized = build_layer()
+    # Dispatch BF16 rows, so the receiving rank quantizes them.
+    unquantized._kernel.dispatch_format = lambda: None
+    try:
+        out = quantized(t)
+        expected = unquantized(t)
+        assert (
+            quantized._communication.params.dispatch_format
+            is QuantFormat[quant_pair[1]]
+        )
+        assert unquantized._communication.params.dispatch_format is None
+        torch.testing.assert_close(out, expected, atol=0, rtol=0)
+    finally:
+        torch.cuda.synchronize()
+        dist.barrier()
+        quantized.destroy()
+        unquantized.destroy()
+
+
 @pytest.mark.gpu_2
 @pytest.mark.parametrize("backend", _BACKENDS)
 def test_split_layer_dispatches_runtime_max_tokens_per_rank(backend):

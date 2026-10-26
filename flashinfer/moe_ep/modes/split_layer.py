@@ -414,7 +414,7 @@ class MoEEpSplitLayer(nn.Module):
         # Opt-in per-stage profiling. When True, forward() records CUDA events
         # around dispatch / compute / combine and stores elapsed GPU time (ms)
         # in ``last_timings_ms`` after a device sync. Off by default (zero
-        # overhead on the hot path). Used by benchmarks/moe_ep/bench_moe_ep.py.
+        # overhead on the hot path). Used by benchmarks/moe_ep/bench_nccl_ep_reference.py.
         self.enable_timing = False
         self.last_timings_ms: dict[str, float] = {}
 
@@ -861,6 +861,7 @@ class MoEEpSplitLayer(nn.Module):
                     max_tokens_per_rank=fp.max_tokens_per_rank,
                     hidden_size=fp.token_hidden_size,
                     dtype=_TOKEN_DTYPE_BY_BYTES[fp.dtype_bytes],
+                    dispatch_format=self._kernel.dispatch_format(),
                 ),
                 _communication_backend(self._comm_backend, self._kernel),
             )
@@ -916,10 +917,16 @@ class MoEEpSplitLayer(nn.Module):
             else {"runtime_max_tokens_per_rank": t.runtime_max_tokens_per_rank}
         )
         with self._stage(timings, "dispatch"):
+            if comm.params.dispatch_format is None:
+                values = self._kernel.pack_dispatch_payload(t.hidden_states)
+                scales = None
+            else:
+                values, scales = self._kernel.quantize_for_dispatch(t.hidden_states)
             received = comm.dispatch(
-                self._kernel.pack_dispatch_payload(t.hidden_states),
+                values,
                 t.topk_ids,
                 t.topk_weights,
+                hidden_states_scale=scales,
                 **extra,
             )
         with self._stage(timings, "compute"):
@@ -948,4 +955,5 @@ class MoEEpSplitLayer(nn.Module):
                 is_local, ids - first_local, torch.full_like(ids, -1)
             ),
             recv_topk_weights=received.topk_weights,
+            expert_tensors_scale=received.hidden_states_scale,
         )
