@@ -396,12 +396,60 @@ inline TensorLayout DenseLayout(const void* data, std::initializer_list<int64_t>
   return layout;
 }
 
-struct DeviceState { bool ready; int32_t sm_count; };
+struct DeviceState { bool ready; int32_t sm_count; bool finalize_placement; };
 inline std::array<DeviceState, 64>& DeviceStates() {
   static std::array<DeviceState, 64> states{};
   return states;
 }
 inline std::mutex& DeviceMutex() { static std::mutex mutex; return mutex; }
+// Finalize placement. The finalize kernels use no shared memory, but a finalize CTA cannot share an SM with a
+// 512-thread FC2 CTA, which holds the whole register file. The block scheduler therefore packs a small finalize grid
+// onto the first SMs that FC2 frees, as many CTAs per SM as fit. Reserving P bytes of dynamic shared memory per
+// finalize CTA (the kernel does not touch them) admits at most c = floor(233472 / (P + 1024)) CTAs per SM (228 KiB
+// per SM, 1 KiB reserved per block), which spreads the grid over more SMs. A grid of G CTAs on S SMs takes the first
+// tier with G <= c * S:
+//   G <= 1 * S: P = 118784, 1 CTA per SM
+//   G <= 2 * S: P =  81920, 2 CTAs per SM
+//   G <= 3 * S: P =  65536, 3 CTAs per SM
+//   G <= 4 * S: P =  49152, 4 CTAs per SM
+// Larger grids get no reservation, because a cap would then add a wave. Only the launch configuration changes: the
+// kernels and their outputs are the same.
+struct FinalizePlacementTier { int64_t ctas_per_sm; size_t pad; };
+inline constexpr FinalizePlacementTier kFinalizePlacementTiers[] = {{1, 118784u}, {2, 81920u}, {3, 65536u}, {4, 49152u}};
+inline constexpr size_t kFinalizePlacementSmemPerSm = 233472u;
+inline constexpr size_t kFinalizePlacementReservedPerBlock = 1024u;
+inline constexpr size_t kFinalizePlacementMaxPad = 118784u;
+// Padded launches ask for the largest shared-memory carveout, so that the carveout does not hold an SM to fewer than
+// c padded CTAs.
+inline constexpr int kFinalizePlacementCarveout = 100;  // percent of the maximum shared memory; -1 = no preference
+inline constexpr int32_t kFinalizeKernels[] = {14, 15, 16, 20, 21, 22, 23, 24, 25};
+static_assert((118784u + 1024u) * 1u <= 233472u && (118784u + 1024u) * 2u > 233472u,
+              "finalize placement: pad 118784 admits exactly 1 CTA(s) per SM");
+static_assert((81920u + 1024u) * 2u <= 233472u && (81920u + 1024u) * 3u > 233472u,
+              "finalize placement: pad 81920 admits exactly 2 CTA(s) per SM");
+static_assert((65536u + 1024u) * 3u <= 233472u && (65536u + 1024u) * 4u > 233472u,
+              "finalize placement: pad 65536 admits exactly 3 CTA(s) per SM");
+static_assert((49152u + 1024u) * 4u <= 233472u && (49152u + 1024u) * 5u > 233472u,
+              "finalize placement: pad 49152 admits exactly 4 CTA(s) per SM");
+inline size_t FinalizePlacementPad(int64_t ctas, int32_t sm_count) {
+  for (const auto& tier : kFinalizePlacementTiers) {
+    if (ctas <= tier.ctas_per_sm * sm_count) return tier.pad;
+  }
+  return 0;
+}
+struct PlacedLaunch {
+  warp_decode::LaunchVisitor visitor;
+  void* context;
+  size_t dynamic_smem_bytes;
+  int carveout;
+};
+inline void VisitPlaced(const warp_decode::KernelLaunch& launch, void* opaque) {
+  const auto& placed = *static_cast<const PlacedLaunch*>(opaque);
+  warp_decode::KernelLaunch padded = launch;
+  padded.dynamic_smem_bytes = placed.dynamic_smem_bytes;
+  padded.preferred_shared_memory_carveout = placed.carveout;
+  placed.visitor(padded, placed.context);
+}
 
 inline bool EncodeTensorMap_1_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -5334,6 +5382,24 @@ inline warp_decode::ManifestStatus EnsureDeviceReady(int32_t device_id,
                                  static_cast<int>(requested));
     if (error != cudaSuccess) return detail::Runtime(error, "cudaFuncSetAttribute");
   }
+  // Finalize placement: let every finalize kernel take the largest reservation, but only on a device whose SMs have
+  // the sizes the tiers assume (228 KiB, 1 KiB reserved per block). On other devices the finalize launches keep
+  // their zero reservation.
+  int smem_per_sm = 0;
+  error = cudaDeviceGetAttribute(&smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device_id);
+  if (error != cudaSuccess) return detail::Runtime(error, "MaxSharedMemoryPerMultiprocessor");
+  int reserved_per_block = 0;
+  error = cudaDeviceGetAttribute(&reserved_per_block, cudaDevAttrReservedSharedMemoryPerBlock, device_id);
+  if (error != cudaSuccess) return detail::Runtime(error, "ReservedSharedMemoryPerBlock");
+  state.finalize_placement = static_cast<size_t>(smem_per_sm) == detail::kFinalizePlacementSmemPerSm
+      && static_cast<size_t>(reserved_per_block) == detail::kFinalizePlacementReservedPerBlock
+      && static_cast<size_t>(optin_max) >= detail::kFinalizePlacementMaxPad;
+  for (const int32_t kernel : detail::kFinalizeKernels) {
+    if (!state.finalize_placement) break;
+    error = cudaFuncSetAttribute(functions[kernel], cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(detail::kFinalizePlacementMaxPad));
+    if (error != cudaSuccess) return detail::Runtime(error, "cudaFuncSetAttribute(finalize placement)");
+  }
   state.ready = true;
   return warp_decode::ManifestStatus::Success();
 }
@@ -5354,9 +5420,13 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
   if (!detail::ResolveWorkspace(inv.shape, schedule, inv.workspace, &ws) || inv.workspace_bytes < ws.bytes) return;
   int device = -1;
   if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 64) return;
+  int32_t sm_count = 0;
+  bool finalize_placement = false;
   { std::lock_guard<std::mutex> lock(detail::DeviceMutex());
      const auto& state = detail::DeviceStates()[device];
      if (!state.ready) return;
+     sm_count = state.sm_count;
+     finalize_placement = state.finalize_placement;
      // A zero schedule limit represents the source's device-sized workfeed.
      if (schedule.route_layout == warp_decode::RouteLayout::kGpuPacked && ws.workfeed_ctas == 0)
        ws.workfeed_ctas = state.sm_count;
@@ -5659,9 +5729,26 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
   visit(fc2_kernel, fc2_kernel == 34 ? dim3(detail::Fc2LinearCtas(inv.shape, ws), 1, 1)
       : dim3(detail::Fc2GridM(inv.shape), detail::Fc2LaunchGridN(inv.shape, schedule, ws), 1));
   // The packed top-10 finalize (25) gives each thread four consecutive features.
-  visit(finalize_kernel, dim3(detail::CeilDiv(inv.shape.hidden_size,
-                                              finalize_kernel == 25 ? finalize_threads * 4 : finalize_threads),
-                              inv.shape.num_tokens, 1));
+  const dim3 finalize_grid = dim3(detail::CeilDiv(inv.shape.hidden_size,
+                                                  finalize_kernel == 25 ? finalize_threads * 4 : finalize_threads),
+                                  inv.shape.num_tokens, 1);
+  // Finalize placement: a grid of at most four CTAs per SM gets its tier's shared-memory reservation, which spreads
+  // it over the SMs (detail::FinalizePlacementPad). Larger grids launch as before.
+  const size_t finalize_pad = finalize_placement
+      ? detail::FinalizePlacementPad(static_cast<int64_t>(finalize_grid.x) * finalize_grid.y, sm_count) : 0;
+  detail::PlacedLaunch placed{visitor, context, finalize_pad, detail::kFinalizePlacementCarveout};
+  switch (finalize_pad > 0 ? finalize_kernel : -1) {
+    case 14: detail::VisitKernel_14(args14, finalize_grid, &detail::VisitPlaced, &placed); break;
+    case 15: detail::VisitKernel_15(args15, finalize_grid, &detail::VisitPlaced, &placed); break;
+    case 16: detail::VisitKernel_16(args16, finalize_grid, &detail::VisitPlaced, &placed); break;
+    case 20: detail::VisitKernel_20(args20, finalize_grid, &detail::VisitPlaced, &placed); break;
+    case 21: detail::VisitKernel_21(args21, finalize_grid, &detail::VisitPlaced, &placed); break;
+    case 22: detail::VisitKernel_22(args22, finalize_grid, &detail::VisitPlaced, &placed); break;
+    case 23: detail::VisitKernel_23(args23, finalize_grid, &detail::VisitPlaced, &placed); break;
+    case 24: detail::VisitKernel_24(args24, finalize_grid, &detail::VisitPlaced, &placed); break;
+    case 25: detail::VisitKernel_25(args25, finalize_grid, &detail::VisitPlaced, &placed); break;
+    default: visit(finalize_kernel, finalize_grid); break;
+  }
 }
 }  // namespace (DSO-local generated host implementation)
 }  // namespace flashinfer::warp_decode::generated
@@ -6021,12 +6108,60 @@ inline TensorLayout DenseLayout(const void* data, std::initializer_list<int64_t>
   return layout;
 }
 
-struct DeviceState { bool ready; int32_t sm_count; };
+struct DeviceState { bool ready; int32_t sm_count; bool finalize_placement; };
 inline std::array<DeviceState, 64>& DeviceStates() {
   static std::array<DeviceState, 64> states{};
   return states;
 }
 inline std::mutex& DeviceMutex() { static std::mutex mutex; return mutex; }
+// Finalize placement. The finalize kernels use no shared memory, but a finalize CTA cannot share an SM with a
+// 512-thread FC2 CTA, which holds the whole register file. The block scheduler therefore packs a small finalize grid
+// onto the first SMs that FC2 frees, as many CTAs per SM as fit. Reserving P bytes of dynamic shared memory per
+// finalize CTA (the kernel does not touch them) admits at most c = floor(233472 / (P + 1024)) CTAs per SM (228 KiB
+// per SM, 1 KiB reserved per block), which spreads the grid over more SMs. A grid of G CTAs on S SMs takes the first
+// tier with G <= c * S:
+//   G <= 1 * S: P = 118784, 1 CTA per SM
+//   G <= 2 * S: P =  81920, 2 CTAs per SM
+//   G <= 3 * S: P =  65536, 3 CTAs per SM
+//   G <= 4 * S: P =  49152, 4 CTAs per SM
+// Larger grids get no reservation, because a cap would then add a wave. Only the launch configuration changes: the
+// kernels and their outputs are the same.
+struct FinalizePlacementTier { int64_t ctas_per_sm; size_t pad; };
+inline constexpr FinalizePlacementTier kFinalizePlacementTiers[] = {{1, 118784u}, {2, 81920u}, {3, 65536u}, {4, 49152u}};
+inline constexpr size_t kFinalizePlacementSmemPerSm = 233472u;
+inline constexpr size_t kFinalizePlacementReservedPerBlock = 1024u;
+inline constexpr size_t kFinalizePlacementMaxPad = 118784u;
+// Padded launches ask for the largest shared-memory carveout, so that the carveout does not hold an SM to fewer than
+// c padded CTAs.
+inline constexpr int kFinalizePlacementCarveout = 100;  // percent of the maximum shared memory; -1 = no preference
+inline constexpr int32_t kFinalizeKernels[] = {19, 20, 21, 22, 24, 25, 26};
+static_assert((118784u + 1024u) * 1u <= 233472u && (118784u + 1024u) * 2u > 233472u,
+              "finalize placement: pad 118784 admits exactly 1 CTA(s) per SM");
+static_assert((81920u + 1024u) * 2u <= 233472u && (81920u + 1024u) * 3u > 233472u,
+              "finalize placement: pad 81920 admits exactly 2 CTA(s) per SM");
+static_assert((65536u + 1024u) * 3u <= 233472u && (65536u + 1024u) * 4u > 233472u,
+              "finalize placement: pad 65536 admits exactly 3 CTA(s) per SM");
+static_assert((49152u + 1024u) * 4u <= 233472u && (49152u + 1024u) * 5u > 233472u,
+              "finalize placement: pad 49152 admits exactly 4 CTA(s) per SM");
+inline size_t FinalizePlacementPad(int64_t ctas, int32_t sm_count) {
+  for (const auto& tier : kFinalizePlacementTiers) {
+    if (ctas <= tier.ctas_per_sm * sm_count) return tier.pad;
+  }
+  return 0;
+}
+struct PlacedLaunch {
+  warp_decode::LaunchVisitor visitor;
+  void* context;
+  size_t dynamic_smem_bytes;
+  int carveout;
+};
+inline void VisitPlaced(const warp_decode::KernelLaunch& launch, void* opaque) {
+  const auto& placed = *static_cast<const PlacedLaunch*>(opaque);
+  warp_decode::KernelLaunch padded = launch;
+  padded.dynamic_smem_bytes = placed.dynamic_smem_bytes;
+  padded.preferred_shared_memory_carveout = placed.carveout;
+  placed.visitor(padded, placed.context);
+}
 
 inline bool EncodeTensorMap_3_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -10996,6 +11131,24 @@ inline warp_decode::ManifestStatus EnsureDeviceReady(int32_t device_id,
                                  static_cast<int>(requested));
     if (error != cudaSuccess) return detail::Runtime(error, "cudaFuncSetAttribute");
   }
+  // Finalize placement: let every finalize kernel take the largest reservation, but only on a device whose SMs have
+  // the sizes the tiers assume (228 KiB, 1 KiB reserved per block). On other devices the finalize launches keep
+  // their zero reservation.
+  int smem_per_sm = 0;
+  error = cudaDeviceGetAttribute(&smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device_id);
+  if (error != cudaSuccess) return detail::Runtime(error, "MaxSharedMemoryPerMultiprocessor");
+  int reserved_per_block = 0;
+  error = cudaDeviceGetAttribute(&reserved_per_block, cudaDevAttrReservedSharedMemoryPerBlock, device_id);
+  if (error != cudaSuccess) return detail::Runtime(error, "ReservedSharedMemoryPerBlock");
+  state.finalize_placement = static_cast<size_t>(smem_per_sm) == detail::kFinalizePlacementSmemPerSm
+      && static_cast<size_t>(reserved_per_block) == detail::kFinalizePlacementReservedPerBlock
+      && static_cast<size_t>(optin_max) >= detail::kFinalizePlacementMaxPad;
+  for (const int32_t kernel : detail::kFinalizeKernels) {
+    if (!state.finalize_placement) break;
+    error = cudaFuncSetAttribute(functions[kernel], cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(detail::kFinalizePlacementMaxPad));
+    if (error != cudaSuccess) return detail::Runtime(error, "cudaFuncSetAttribute(finalize placement)");
+  }
   state.ready = true;
   return warp_decode::ManifestStatus::Success();
 }
@@ -11010,9 +11163,13 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
   if (!detail::ResolveWorkspace(inv.shape, schedule, inv.workspace, &ws) || inv.workspace_bytes < ws.bytes) return;
   int device = -1;
   if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 64) return;
+  int32_t sm_count = 0;
+  bool finalize_placement = false;
   { std::lock_guard<std::mutex> lock(detail::DeviceMutex());
      const auto& state = detail::DeviceStates()[device];
      if (!state.ready) return;
+     sm_count = state.sm_count;
+     finalize_placement = state.finalize_placement;
      // A zero schedule limit represents the source's device-sized workfeed.
      if (schedule.route_layout == warp_decode::RouteLayout::kGpuPacked && ws.workfeed_ctas == 0)
        ws.workfeed_ctas = state.sm_count;
@@ -11311,9 +11468,24 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
   visit(fc2_kernel, fc2_kernel == 34 ? dim3(detail::Fc2LinearCtas(inv.shape, ws), 1, 1)
       : dim3(detail::Fc2GridM(inv.shape), detail::Fc2LaunchGridN(inv.shape, schedule, ws), 1));
   // The packed top-10 finalize (26) gives each thread four consecutive features.
-  visit(finalize_kernel, dim3(detail::CeilDiv(inv.shape.hidden_size,
-                                              finalize_kernel == 26 ? finalize_threads * 4 : finalize_threads),
-                              inv.shape.num_tokens, 1));
+  const dim3 finalize_grid = dim3(detail::CeilDiv(inv.shape.hidden_size,
+                                                  finalize_kernel == 26 ? finalize_threads * 4 : finalize_threads),
+                                  inv.shape.num_tokens, 1);
+  // Finalize placement: a grid of at most four CTAs per SM gets its tier's shared-memory reservation, which spreads
+  // it over the SMs (detail::FinalizePlacementPad). Larger grids launch as before.
+  const size_t finalize_pad = finalize_placement
+      ? detail::FinalizePlacementPad(static_cast<int64_t>(finalize_grid.x) * finalize_grid.y, sm_count) : 0;
+  detail::PlacedLaunch placed{visitor, context, finalize_pad, detail::kFinalizePlacementCarveout};
+  switch (finalize_pad > 0 ? finalize_kernel : -1) {
+    case 19: detail::VisitKernel_19(args19, finalize_grid, &detail::VisitPlaced, &placed); break;
+    case 20: detail::VisitKernel_20(args20, finalize_grid, &detail::VisitPlaced, &placed); break;
+    case 21: detail::VisitKernel_21(args21, finalize_grid, &detail::VisitPlaced, &placed); break;
+    case 22: detail::VisitKernel_22(args22, finalize_grid, &detail::VisitPlaced, &placed); break;
+    case 24: detail::VisitKernel_24(args24, finalize_grid, &detail::VisitPlaced, &placed); break;
+    case 25: detail::VisitKernel_25(args25, finalize_grid, &detail::VisitPlaced, &placed); break;
+    case 26: detail::VisitKernel_26(args26, finalize_grid, &detail::VisitPlaced, &placed); break;
+    default: visit(finalize_kernel, finalize_grid); break;
+  }
 }
 }  // namespace (DSO-local generated host implementation)
 }  // namespace flashinfer::warp_decode::generated
