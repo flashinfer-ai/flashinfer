@@ -13,12 +13,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-JIT registration of the Cake-generated Blackwell MSA programs.  One device /
-binding source pair per physical schedule, compiled with the exact flag set of
-the device it runs on; the architecture is part of the JIT spec name so two
-architectures never share one cached library.  ``ARG_PLANS`` lists the host
-binding's argument order once per route family; each ``MODULES`` record names
-its plan.
+JIT registration of the Cake-generated Blackwell MSA programs.  One device
+source per physical schedule and one host binding per argument plan, each
+program selected by its record's compile flags and compiled with the exact
+flag set of the device it runs on; the architecture is part of the JIT spec
+name so two architectures never share one cached library.  ``ARG_PLANS`` lists
+the host binding's argument order once per route family; each ``MODULES``
+record names its plan.
 """
 
 import functools
@@ -49,42 +50,42 @@ _HEX20 = re.compile(r"^[0-9a-f]{20}$")
 # ``_expand_modules`` turns the rows into the ``MODULES`` records the dispatcher reads.
 # fmt: off
 _MODULE_ROWS: tuple[dict[str, Any], ...] = (
-    {"id": "0e41f3f76fefcd451bc1", "plan": "decode_m16"},
-    {"id": "1a404b555f04cdde1d2c", "plan": "prefill_union"},
-    {"id": "25c43f61f501a6d4c567", "plan": "prefill_union"},
-    {"id": "2a87e650f646a2de9df4", "plan": "decode_m16"},
-    {"id": "37190e3efb7c5f267e04", "plan": "long_bf16_reverse_reduce"},
-    {"id": "37f16ecc96a0bc9d5335", "plan": "long_bf16_reverse_main"},
-    {"id": "3cb239103137becab6db", "plan": "topk_select", "compile_flags": []},
-    {"id": "42c6eced172576d57c92", "plan": "prefill_union"},
-    {"id": "4c104ef3b4ee8c2fff55", "plan": "decode_m16"},
+    {"id": "0e41f3f76fefcd451bc1", "plan": "decode_m16", "binding": "cake_blackwell_msa_decode_m16", "defines": ["-DCAKE_BIND_SMEM=216704", "-DCAKE_BIND_PAGED=1", "-DCAKE_BIND_KV_FP8=0", "-DCAKE_BIND_Q_FP16=0"]},
+    {"id": "1a404b555f04cdde1d2c", "plan": "prefill_union", "binding": "cake_blackwell_msa_prefill_union", "defines": ["-DCAKE_BIND_SMEM=201728", "-DCAKE_BIND_PAGED=0", "-DCAKE_BIND_KV_FP8=0", "-DCAKE_BIND_Q_FP16=0", "-DCAKE_BIND_GQA=0"]},
+    {"id": "25c43f61f501a6d4c567", "plan": "prefill_union", "binding": "cake_blackwell_msa_prefill_union", "defines": ["-DCAKE_BIND_SMEM=212992", "-DCAKE_BIND_PAGED=1", "-DCAKE_BIND_KV_FP8=0", "-DCAKE_BIND_Q_FP16=0", "-DCAKE_BIND_GQA=16"]},
+    {"id": "2a87e650f646a2de9df4", "plan": "decode_m16", "binding": "cake_blackwell_msa_decode_m16", "defines": ["-DCAKE_BIND_SMEM=216704", "-DCAKE_BIND_PAGED=1", "-DCAKE_BIND_KV_FP8=0", "-DCAKE_BIND_Q_FP16=1"]},
+    {"id": "37190e3efb7c5f267e04", "plan": "long_bf16_reverse_reduce", "binding": "cake_blackwell_msa_long_bf16_reverse_reduce", "defines": ["-DCAKE_BIND_SMEM=40960"]},
+    {"id": "37f16ecc96a0bc9d5335", "plan": "long_bf16_reverse_main", "binding": "cake_blackwell_msa_long_bf16_reverse_main", "defines": ["-DCAKE_BIND_SMEM=148480", "-DCAKE_BIND_PAGED=1", "-DCAKE_BIND_GQA=16"]},
+    {"id": "3cb239103137becab6db", "plan": "topk_select", "compile_flags": [], "binding": "cake_blackwell_msa_topk_select", "defines": ["-DCAKE_BIND_SMEM=85632"]},
+    {"id": "42c6eced172576d57c92", "plan": "prefill_union", "binding": "cake_blackwell_msa_prefill_union", "defines": ["-DCAKE_BIND_SMEM=218112", "-DCAKE_BIND_PAGED=1", "-DCAKE_BIND_KV_FP8=1", "-DCAKE_BIND_Q_FP16=0", "-DCAKE_BIND_GQA=0"]},
+    {"id": "4c104ef3b4ee8c2fff55", "plan": "decode_m16", "binding": "cake_blackwell_msa_decode_m16", "defines": ["-DCAKE_BIND_SMEM=216704", "-DCAKE_BIND_PAGED=1", "-DCAKE_BIND_KV_FP8=0", "-DCAKE_BIND_Q_FP16=0"]},
     {"id": "4c5c6494c5ff2334ae2d", "plan": "decode_uniform_fp8"},
-    {"id": "5a7c4a2da9b6e9c14215", "plan": "long_bf16_reverse_reduce"},
-    {"id": "5c05cfb4c595d36a27f3", "plan": "long_bf16_reverse_main"},
-    {"id": "5ca8b7d363b9c6866923", "plan": "prefill_union"},
-    {"id": "616f5bbf2b76960e1e8c", "plan": "decode_m16"},
-    {"id": "64a3ba42bd5dc74b92f5", "plan": "prefill_union"},
-    {"id": "6ed84157fc9c633d8a00", "plan": "long_bf16_reverse_main"},
+    {"id": "5a7c4a2da9b6e9c14215", "plan": "long_bf16_reverse_reduce", "binding": "cake_blackwell_msa_long_bf16_reverse_reduce", "defines": ["-DCAKE_BIND_SMEM=40960"]},
+    {"id": "5c05cfb4c595d36a27f3", "plan": "long_bf16_reverse_main", "binding": "cake_blackwell_msa_long_bf16_reverse_main", "defines": ["-DCAKE_BIND_SMEM=148480", "-DCAKE_BIND_PAGED=0", "-DCAKE_BIND_GQA=16"]},
+    {"id": "5ca8b7d363b9c6866923", "plan": "prefill_union", "binding": "cake_blackwell_msa_prefill_union", "defines": ["-DCAKE_BIND_SMEM=205824", "-DCAKE_BIND_PAGED=0", "-DCAKE_BIND_KV_FP8=0", "-DCAKE_BIND_Q_FP16=0", "-DCAKE_BIND_GQA=8"]},
+    {"id": "616f5bbf2b76960e1e8c", "plan": "decode_m16", "binding": "cake_blackwell_msa_decode_m16", "defines": ["-DCAKE_BIND_SMEM=215680", "-DCAKE_BIND_PAGED=0", "-DCAKE_BIND_KV_FP8=1", "-DCAKE_BIND_Q_FP16=0"]},
+    {"id": "64a3ba42bd5dc74b92f5", "plan": "prefill_union", "binding": "cake_blackwell_msa_prefill_union", "defines": ["-DCAKE_BIND_SMEM=201728", "-DCAKE_BIND_PAGED=0", "-DCAKE_BIND_KV_FP8=0", "-DCAKE_BIND_Q_FP16=1", "-DCAKE_BIND_GQA=0"]},
+    {"id": "6ed84157fc9c633d8a00", "plan": "long_bf16_reverse_main", "binding": "cake_blackwell_msa_long_bf16_reverse_main", "defines": ["-DCAKE_BIND_SMEM=148480", "-DCAKE_BIND_PAGED=1", "-DCAKE_BIND_GQA=8"]},
     {"id": "7e5235eb5efbcabc3637", "plan": "decode_fp8_q1_flat_xform2"},
-    {"id": "82e6a9cf66fe33160b74", "plan": "prefill_union"},
+    {"id": "82e6a9cf66fe33160b74", "plan": "prefill_union", "binding": "cake_blackwell_msa_prefill_union", "defines": ["-DCAKE_BIND_SMEM=205824", "-DCAKE_BIND_PAGED=1", "-DCAKE_BIND_KV_FP8=0", "-DCAKE_BIND_Q_FP16=0", "-DCAKE_BIND_GQA=16"]},
     {"id": "89bcd02bb77ea339d039", "plan": "kmaj_p_reduce"},
     {"id": "9457a50f3f40d584c6c7", "plan": "topk_select_streaming", "compile_flags": []},
-    {"id": "96eda75a396e3001f22e", "plan": "prefill_union"},
-    {"id": "991dc4bce7a340d2008d", "plan": "decode_m16"},
-    {"id": "9c09f71e5846b7d0ce99", "plan": "prefill_union"},
-    {"id": "9d11f8cbc9df656a767b", "plan": "prefill_union"},
-    {"id": "b5e804da75b24237502b", "plan": "topk_select", "compile_flags": []},
-    {"id": "bae868b83abdfe541640", "plan": "kmaj_p_main"},
-    {"id": "c1141bb98fe0a1e6789a", "plan": "prefill_union"},
-    {"id": "cc6b5108eb89b35d1f64", "plan": "topk_select", "arches": ["sm_103a"], "compile_flags": []},
-    {"id": "cc9f8c16164bac3958eb", "plan": "decode_m16"},
-    {"id": "cd19e83ad952065bc779", "plan": "prefill_union"},
-    {"id": "d28ef1a700e18456846d", "plan": "prefill_union"},
-    {"id": "dce0ec63212385c16c81", "plan": "topk_select", "arches": ["sm_100a"], "compile_flags": []},
-    {"id": "e272f321506e704d7720", "plan": "kmaj_p_main"},
+    {"id": "96eda75a396e3001f22e", "plan": "prefill_union", "binding": "cake_blackwell_msa_prefill_union", "defines": ["-DCAKE_BIND_SMEM=218112", "-DCAKE_BIND_PAGED=0", "-DCAKE_BIND_KV_FP8=1", "-DCAKE_BIND_Q_FP16=0", "-DCAKE_BIND_GQA=0"]},
+    {"id": "991dc4bce7a340d2008d", "plan": "decode_m16", "binding": "cake_blackwell_msa_decode_m16", "defines": ["-DCAKE_BIND_SMEM=215680", "-DCAKE_BIND_PAGED=1", "-DCAKE_BIND_KV_FP8=1", "-DCAKE_BIND_Q_FP16=0"]},
+    {"id": "9c09f71e5846b7d0ce99", "plan": "prefill_union", "binding": "cake_blackwell_msa_prefill_union", "defines": ["-DCAKE_BIND_SMEM=201728", "-DCAKE_BIND_PAGED=1", "-DCAKE_BIND_KV_FP8=0", "-DCAKE_BIND_Q_FP16=1", "-DCAKE_BIND_GQA=0"]},
+    {"id": "9d11f8cbc9df656a767b", "plan": "prefill_union", "binding": "cake_blackwell_msa_prefill_union", "defines": ["-DCAKE_BIND_SMEM=201728", "-DCAKE_BIND_PAGED=1", "-DCAKE_BIND_KV_FP8=0", "-DCAKE_BIND_Q_FP16=0", "-DCAKE_BIND_GQA=0"]},
+    {"id": "b5e804da75b24237502b", "plan": "topk_select", "compile_flags": [], "binding": "cake_blackwell_msa_topk_select", "defines": ["-DCAKE_BIND_SMEM=75648"]},
+    {"id": "bae868b83abdfe541640", "plan": "kmaj_p_main", "binding": "cake_blackwell_msa_kmaj_p_main", "defines": ["-DCAKE_BIND_SMEM=197632", "-DCAKE_BIND_PAGED=1", "-DCAKE_BIND_GQA=8"]},
+    {"id": "c1141bb98fe0a1e6789a", "plan": "prefill_union", "binding": "cake_blackwell_msa_prefill_union", "defines": ["-DCAKE_BIND_SMEM=205824", "-DCAKE_BIND_PAGED=1", "-DCAKE_BIND_KV_FP8=0", "-DCAKE_BIND_Q_FP16=0", "-DCAKE_BIND_GQA=8"]},
+    {"id": "cc6b5108eb89b35d1f64", "plan": "topk_select", "arches": ["sm_103a"], "compile_flags": [], "binding": "cake_blackwell_msa_topk_select", "defines": ["-DCAKE_BIND_SMEM=75648"]},
+    {"id": "cc9f8c16164bac3958eb", "plan": "decode_m16", "binding": "cake_blackwell_msa_decode_m16", "defines": ["-DCAKE_BIND_SMEM=216704", "-DCAKE_BIND_PAGED=0", "-DCAKE_BIND_KV_FP8=0", "-DCAKE_BIND_Q_FP16=0"]},
+    {"id": "cd19e83ad952065bc779", "plan": "prefill_union", "binding": "cake_blackwell_msa_prefill_union", "defines": ["-DCAKE_BIND_SMEM=205824", "-DCAKE_BIND_PAGED=0", "-DCAKE_BIND_KV_FP8=0", "-DCAKE_BIND_Q_FP16=0", "-DCAKE_BIND_GQA=16"]},
+    {"id": "d28ef1a700e18456846d", "plan": "prefill_union", "binding": "cake_blackwell_msa_prefill_union", "defines": ["-DCAKE_BIND_SMEM=224256", "-DCAKE_BIND_PAGED=1", "-DCAKE_BIND_KV_FP8=0", "-DCAKE_BIND_Q_FP16=0", "-DCAKE_BIND_GQA=16"]},
+    {"id": "dce0ec63212385c16c81", "plan": "topk_select", "arches": ["sm_100a"], "compile_flags": [], "binding": "cake_blackwell_msa_topk_select", "defines": ["-DCAKE_BIND_SMEM=75520"]},
+    {"id": "e272f321506e704d7720", "plan": "kmaj_p_main", "binding": "cake_blackwell_msa_kmaj_p_main", "defines": ["-DCAKE_BIND_SMEM=197632", "-DCAKE_BIND_PAGED=0", "-DCAKE_BIND_GQA=16"]},
     {"id": "e635b4b314bb670500b5", "plan": "decode_fp8_q1_paged_xform2"},
-    {"id": "ec5682e5fca1b9f91612", "plan": "kmaj_p_main"},
-    {"id": "f15033e922adf9476885", "plan": "decode_m16"},
+    {"id": "ec5682e5fca1b9f91612", "plan": "kmaj_p_main", "binding": "cake_blackwell_msa_kmaj_p_main", "defines": ["-DCAKE_BIND_SMEM=197632", "-DCAKE_BIND_PAGED=1", "-DCAKE_BIND_GQA=16"]},
+    {"id": "f15033e922adf9476885", "plan": "decode_m16", "binding": "cake_blackwell_msa_decode_m16", "defines": ["-DCAKE_BIND_SMEM=216704", "-DCAKE_BIND_PAGED=0", "-DCAKE_BIND_KV_FP8=0", "-DCAKE_BIND_Q_FP16=1"]},
 )
 # fmt: on
 
