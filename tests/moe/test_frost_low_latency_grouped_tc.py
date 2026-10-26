@@ -49,6 +49,78 @@ def _require_grouped_tc():
         pytest.skip("Requires SM80, Hopper SM90 or SM120")
 
 
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("length", [1, 31, 32, 33, 65, 80, 129])
+@pytest.mark.parametrize("group", [2, 4, 8])
+def test_route_members_order_and_live_graph_inputs(dtype, length, group):
+    _require_grouped_tc()
+    import random
+
+    import cutlass
+    from cutlass import cute
+    from cutlass.cute.runtime import from_dlpack
+    from flashinfer.fused_moe.backends.frost_low_latency.tc.route_members import (
+        route_members,
+    )
+
+    @cute.kernel
+    def members_kernel(ids, output, group_size: cutlass.Constexpr):
+        leader, _, _ = cute.arch.block_idx()
+        tid, _, _ = cute.arch.thread_idx()
+        members = route_members(ids, leader, group_size)
+        for slot in cutlass.range_constexpr(group_size):
+            output[leader, tid, slot] = members[slot]
+
+    @cute.jit
+    def launch(ids, output, group_size: cutlass.Constexpr, stream):
+        members_kernel(ids, output, group_size).launch(
+            grid=(cute.size(ids), 1, 1), block=(128, 1, 1), stream=stream
+        )
+
+    ids = torch.zeros(length, device="cuda", dtype=dtype)
+    output = torch.empty((length, 128, group), device="cuda", dtype=torch.int32)
+    major, minor = torch.cuda.get_device_capability()
+    arch = f"sm_{major}{minor}" + ("" if major == 8 else "a")
+    compiled = cute.compile(
+        launch,
+        from_dlpack(ids),
+        from_dlpack(output),
+        group,
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options=f"--gpu-arch {arch} --enable-tvm-ffi",
+    )
+    compiled(ids, output)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        compiled(ids, output)
+
+    rng = random.Random(20261047)
+    choices = (-1, 0, 1, 7, 511, 512, 2**33 if dtype == torch.int64 else 2**30)
+    patterns = [
+        [0] * length,
+        list(range(length)),
+        [i % 7 - 2 for i in range(length)],
+        [rng.choice(choices) for _ in range(length)],
+    ]
+    for values in patterns:
+        ids.copy_(torch.tensor(values, dtype=dtype, device="cuda"))
+        expected = []
+        for leader, expert in enumerate(values):
+            rows = [i for i, value in enumerate(values) if value == expert]
+            rank = rows.index(leader)
+            picked = rows[rank : rank + group] if rank % group == 0 else []
+            expected.append(picked + [-1] * (group - len(picked)))
+        expected = torch.tensor(expected, device="cuda", dtype=torch.int32)
+        expected = expected[:, None, :].expand_as(output)
+        # Check every lane and warp, including empty groups and final chunks.
+        output.fill_(-99)
+        compiled(ids, output)
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        output.fill_(-99)
+        graph.replay()
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
 def _run_projection(
     activation, dtype, outdtype, t, k, g, stages, tile_k, narrow, finalize
 ):
