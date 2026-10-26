@@ -162,44 +162,52 @@ names the bound stages in launch order.
 ## Build targets and layout
 
 The programs are exact-architecture tcgen05 payloads built for the exact
-targets `sm_100a`, `sm_103a` and `sm_107a` (`build.json` `arch_flags`). Each
-of the five physical programs (`fwd`, `dgrad`, the weight-gradient main
-kernel with a 256- or 512-wide k tile, and the weight-gradient tail-reduce)
-has one kernel and one host-binding translation unit under
-`csrc/cake_moe_grouped_gemm/`, shared by the three architectures: the single
-architecture-dependent line is folded under `__CUDA_ARCH__`, the tail-reduce
-k tile is a compile-line specialization (`-DWGRAD_TILE=256|512`), and so is
-the fp32 weight-gradient output (`-DWGRAD_OUT=32`; `WGRAD_OUT=16`, the bf16
-output, is the default). The shared weight-gradient sources, their registry
-rows and their manifest entries are a hand fold of the exported files; a
-later export regenerates them. `cake_jit.PROGRAMS` lists each program once
-(its architecture-free `library` stem, FFI entry, argument plan and launch
-geometry); `cake_jit.ROUTES` maps each public route (operation, output dtype,
-k tile) to its stage programs and specializations. `build.json` (schema
-`cake-build/1`, written by the export) is the only record of what to compile:
-one entry per build `<library>[<specialization tag>]_<arch>` -- the tag is
-`_wgrad_tile256` / `_wgrad_tile512` for the specialized tail-reduce builds,
-`_wgrad_out32` for the fp32 weight-gradient builds (composed on the fp32
-tail-reduce: `_wgrad_out32_wgrad_tile256` / `_wgrad_out32_wgrad_tile512`),
-empty otherwise -- with its translation units, digests, nvcc flags (the
-`-D` defines included), per-architecture closure digest and `aot/<name>.so`
-path. `cake_jit.load_module(program, arch, specializations)` loads that entry
+targets `sm_100a`, `sm_103a` and `sm_107a` (`build.json` `arch_flags`).
+`cake_jit.PROGRAMS` lists nine libraries, one per kernel and build, each a
+kernel and a host-binding translation unit under `csrc/cake_moe_grouped_gemm/`
+shared by the architectures it is built for (an architecture-dependent line is
+folded under `__CUDA_ARCH__`):
+
+- `fwd` and `dgrad` in two builds each: the domain-scheduled build for
+  `sm_100a` and `sm_103a`, and the static-schedule build for `sm_107a`. A
+  route spells both as two `main` stages on disjoint architectures, and
+  `cake_jit.stage_binding(name, stage, arch)` returns the one built for the
+  architecture.
+- the wave-synchronized weight-gradient main kernel with a 256- or 512-wide
+  k tile, for `sm_100a` and `sm_103a` (the routes' `main_wave` stage).
+- the weight-gradient main kernel with a 256- or 512-wide k tile and the
+  weight-gradient tail-reduce, as the previous delivery shipped them.
+
+A specialization is a compile-line definition on its `build.json` entries:
+the tail-reduce k tile (`-DWGRAD_TILE=256|512`) and the fp32 weight-gradient
+output (`-DWGRAD_OUT=32` on the previous kernels, `-DCAKE_WGRAD_OUT=32` on the
+wave-synchronized ones; the bf16 output is the default). `cake_jit.ROUTES`
+maps each public route (operation, output dtype, k tile) to its stage programs
+and specializations. `build.json` (schema `cake-build/1`, written by the
+export) is the only record of what to compile: one entry per build
+`<library>[<specialization tag>]_<arch>` -- the tag is `_wgrad_tile256` /
+`_wgrad_tile512` for the specialized tail-reduce builds, `_wgrad_out32` for the
+fp32 weight-gradient builds (composed on the fp32 tail-reduce:
+`_wgrad_out32_wgrad_tile256` / `_wgrad_out32_wgrad_tile512`), empty otherwise
+-- with its translation units, digests, nvcc flags (the `-D` defines
+included), per-architecture closure digest and `aot/<name>.so` path.
+`cake_jit.load_module(program, arch, specializations)` loads that entry
 through the shared `cake_build.py` loader: the prebuilt library when `aot/`
 holds it, else FlashInfer's JIT build (the cache name carries the exact target
 and the closure digest; FlashInfer's build-target rules --
 `FLASHINFER_CUDA_ARCH_LIST` or the visible devices -- apply to that path
 only). The bindings include the package's `csrc/cake_ffi_checks.h`, no
-FlashInfer header. The 512-wide weight-gradient tile is registered for
-`sm_100a` and `sm_103a`.
-The five kernel translation units share one device header,
-`cake_moe_grouped_gemm_device.cuh`, carrying their common preamble (typedefs,
-tensor-map ABI, math constants and the tcgen05 helpers behind need-guards): a
-hand fold of the exported preambles that no `build.json` entry lists, so the
-build's dependency tracking, not a manifest digest, covers it.
-The four main-kernel bindings share their dynamic shared-memory opt-in and
-TMA descriptor encoders the same way, through the fragment headers
-`cake_moe_grouped_gemm_binding_*.h` included inside each host-shim namespace
-(hand folds of exported text that no `build.json` entry lists).
+FlashInfer header.
+
+The domain-scheduled, static-schedule and wave-synchronized translation units
+are self-contained. The previous weight-gradient and tail-reduce kernels share
+one device header, `cake_moe_grouped_gemm_device.cuh` (their common preamble:
+typedefs, tensor-map ABI, math constants and the tcgen05 helpers behind
+need-guards), and their bindings share the dynamic shared-memory opt-in and
+TMA descriptor encoders through the fragment headers
+`cake_moe_grouped_gemm_binding_*.h` included inside each host-shim namespace.
+These headers are hand folds of exported text that no `build.json` entry
+lists, so the build's dependency tracking, not a manifest digest, covers them.
 
 Measured on B200 (`sm_100a`), GB300 (`sm_103a`) and R200 (`sm_107a`); the
 performance summary is in the delivery pull requests.
