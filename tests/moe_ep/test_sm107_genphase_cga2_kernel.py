@@ -35,7 +35,7 @@ def test_genphase_n64_cga2(monkeypatch, capacity, early, schedule, work_id):
             epi_flag_batches=(1, 4),
             schedule_policy=schedule,
             work_id_mode=work_id,
-            apply_topk_at_fc1=early,
+            apply_routing_weights_before_fc2=early,
             reduce_topk_in_kernel=False,
         ),
     )

@@ -42,7 +42,6 @@ from typing import Any, Callable, Optional
 import torch
 import tvm_ffi
 
-from ...api_logging import warn_experimental_backend_once
 from .cake_jit import (
     HOST_PLAN_CONSTANTS,
     PROGRAMS,
@@ -69,12 +68,6 @@ _DTYPE_NAMES = {torch.bfloat16: "bfloat16", torch.float32: "float32"}
 
 def host_plan_constants() -> dict[str, Any]:
     """The production planner constants delivered with the generated programs."""
-    if not HOST_PLAN_CONSTANTS:
-        raise NotImplementedError(
-            "The generated ragged grouped GEMM programs are not registered in this "
-            "checkout yet (empty HOST_PLAN_CONSTANTS in "
-            "flashinfer.experimental.cake_moe_grouped_gemm.cake_jit)"
-        )
     return HOST_PLAN_CONSTANTS
 
 
@@ -107,7 +100,7 @@ def generated_program_available(
 ) -> bool:
     """True when this checkout registers the program of ``op`` for ``device``."""
     arch = arch_for(device)
-    if arch is None or not HOST_PLAN_CONSTANTS:
+    if arch is None:
         return False
     name = _DTYPE_NAMES.get(out_dtype) if out_dtype is not None else None
     return program_registered(op, arch, out_dtype=name)
@@ -187,8 +180,6 @@ def wgrad_tail_plan(
 def _cycles_per_step(cycles_per_step: dict, tile_k: int) -> int:
     if tile_k in cycles_per_step:
         return int(cycles_per_step[tile_k])
-    if str(tile_k) in cycles_per_step:
-        return int(cycles_per_step[str(tile_k)])
     raise KeyError(f"tail cost model has no cycles_per_step entry for tile_k={tile_k}")
 
 
@@ -329,13 +320,8 @@ def plan_wgrad(
 
 @dataclass(frozen=True)
 class _Launch:
-    stage: str
-    module: str
     entry: Callable[..., Any] = field(repr=False)
     arguments: tuple = field(repr=False)
-
-    def __call__(self) -> None:
-        self.entry(*self.arguments)
 
 
 @dataclass(frozen=True)
@@ -374,23 +360,6 @@ class GroupedGemmLaunch:
         return self.out
 
     __call__ = launch
-
-    @property
-    def stage_launchers(self) -> dict[str, Callable[[], None]]:
-        """One zero-argument launch per stage actually launched (for tests and timing)."""
-        result: dict[str, Callable[[], None]] = {}
-        for item in self.launches:
-
-            def run(item: _Launch = item) -> None:
-                with tvm_ffi.use_torch_stream():
-                    item.entry(*item.arguments)
-
-            result[item.stage] = run
-        return result
-
-    @property
-    def stage_modules(self) -> dict[str, str]:
-        return {item.stage: item.module for item in self.launches}
 
 
 def _span_view(t: torch.Tensor) -> torch.Tensor:
@@ -474,8 +443,6 @@ def _bind(name: str, stage: str, kwargs: dict[str, Any], arch: str) -> _Launch:
             )
     module = load_module(binding["program"], arch, binding["specializations"])
     return _Launch(
-        stage=stage,
-        module=binding["program"],
         entry=getattr(module, program["ffi_entry"]),
         arguments=tuple(arguments),
     )
@@ -774,9 +741,11 @@ def grouped_mm_bf16_cake(
     with ``a`` ``[cum_m, K]`` bf16, ``b`` ``[E, N, K]`` bf16 and ``m_indptr``
     ``[E + 1]`` int32 on the device (read by the kernel, never on the host).
     Only bfloat16 outputs are produced and there is no tactic index; rows of
-    ``a`` past ``m_indptr[-1]`` are left untouched in ``out``.
+    ``a`` past ``m_indptr[-1]`` are left untouched in ``out``.  The
+    experimental-backend warning is emitted by
+    ``flashinfer.grouped_mm.grouped_mm_bf16`` when the backend is named; this
+    function emits none.
     """
-    warn_experimental_backend_once("grouped_mm_bf16", "cake")
     if out is not None:
         out_dtype = out.dtype
     if out_dtype != torch.bfloat16:

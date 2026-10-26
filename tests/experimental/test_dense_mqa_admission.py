@@ -8,8 +8,9 @@ arch, a withheld tier is not (its record may exist for another arch).  The one-s
 (``policy.dense_ts``: 256 < K <= 2048, Q <= 1536, two or more query blocks) are the exception: a withheld
 ``:short`` / ``:ts`` call is served by the tier route of its query count, never by the stock kernel; so are the in-kernel
 KV-split ``:kvsplit`` routes (K > ``policy.dense_kvsplit.min_kv`` and fewer query blocks than the architecture's
-catalogued SM count ``policy.dense_kvsplit.sm_count[arch]``): a withheld ``:kvsplit`` call is served by the grid-stride
-``q1`` / tier route of its query count.  A call both the ``:ts`` gate and the KV-split gate accept (256 < K <= 2048,
+catalogued SM count ``policy.dense_kvsplit.sm_count[arch]``, or -- the whole-grid band, ``policy.dense_kvsplit.fullgrid[arch]``
+-- K > ``fullgrid_min_kv`` and ``sm_count <= blocks <= max_q_blocks``): a withheld ``:kvsplit`` call is served by the
+grid-stride ``q1`` / tier route of its query count.  A call both the ``:ts`` gate and the KV-split gate accept (256 < K <= 2048,
 fewer query blocks than SMs) is named by the KV-split plan.  These tests pin that contract
 against the shipped catalog itself and against a synthetic catalog whose architectures disagree.  The KV
 length rule is each route record's (``kv_min`` and the per-architecture ``kv_alignment``): the single-launch
@@ -37,11 +38,19 @@ H64_KVSPLIT_ROUTES = frozenset(
         ),
     }
 )
-# The grid-stride tier aliases the KV-split gate leaves without a domain at the catalogued SM counts (2..32 query blocks:
-# K > 256 is the plan, K <= 256 the one-split text): no record, neither admitted nor withheld
+# The grid-stride tier aliases the KV-split gate leaves without a domain at the catalogued SM counts: the 2..32-block
+# aliases (K > 256 is the plan, K <= 256 the one-split text) and -- under the whole-grid band, ``fullgrid`` on both
+# architectures above ``fullgrid_min_kv`` 2048 -- the ``le1024`` tier (at sm_count <= blocks <= max_q_blocks 512 the
+# ``:ts`` gate owns 256 < K <= 2048 and the qle2048 plan K > 2048): no record, neither admitted nor withheld
 # (``policy.dense_kvsplit.unreached_routes``).
 H64_UNREACHED_ROUTES = frozenset(
-    {"fp8:h64:partial:le8", "fp8:h64:full:le64", "fp8:h64:partial:le64"}
+    {
+        "fp8:h64:partial:le8",
+        "fp8:h64:full:le64",
+        "fp8:h64:partial:le64",
+        "fp8:h64:full:le1024",
+        "fp8:h64:partial:le1024",
+    }
 )
 # Every 64-head route the shipped route rule reaches: the admission lists name exactly these per architecture.
 H64_ROUTES = (
@@ -60,12 +69,14 @@ H64_ROUTES = (
 )
 # One to four (queries, keys) points per 64-head route.  K = 4137 is a legal 64-head KV length (any K >= 1)
 # that neither the one-split gate nor the tile-schedule-words gate accepts and the KV-split gate accepts for fewer
-# query blocks than the catalogued SM count (148 / 152: Q <= 294 on both); a ``:short`` route needs
-# K <= policy.dense_short.max_kv (256) and at least two query blocks (block_q = 2 for 64 heads); a ``:ts`` route
-# needs 256 < K <= policy.dense_ts.max_kv (2048), Q <= policy.dense_ts.max_queries (1536) and two or more blocks
-# the KV-split gate does not take (at least as many blocks as SMs: Q >= 303 on both; K = 257 at Q = 3 is the
-# KV-split plan's); the grid-stride ``q1`` / ``full:le8`` routes keep the one-block calls at K <= 256, the
-# ``le1024`` / ``any`` tiers the calls of at least as many blocks as SMs above K = 2048 (or above Q = 1536).
+# query blocks than the catalogued SM count (148 / 152: Q <= 294 on both) and -- the whole-grid band,
+# ``policy.dense_kvsplit.fullgrid[arch]`` on both -- above ``fullgrid_min_kv`` (2048) for sm_count <= blocks <=
+# ``max_q_blocks`` (512: Q <= 1024); a ``:short`` route needs K <= policy.dense_short.max_kv (256) and at least two
+# query blocks (block_q = 2 for 64 heads); a ``:ts`` route needs 256 < K <= policy.dense_ts.max_kv (2048),
+# Q <= policy.dense_ts.max_queries (1536) and two or more blocks the KV-split gate does not take (at least as many
+# blocks as SMs: Q >= 303 on both; K = 257 at Q = 3 is the KV-split plan's); the grid-stride ``q1`` / ``full:le8``
+# routes keep the one-block calls at K <= 256, the ``any`` tier the calls of more than ``max_q_blocks`` blocks
+# (Q > 1024) above K = 2048 (and the calls above Q = 1536 at 256 < K <= 2048); the ``le1024`` tier has no point left.
 SHAPES_BY_ROUTE = {
     "fp8:h64:q1": ((1, 1), (1, 256)),
     "fp8:h64:q1:kvsplit": ((1, 257), (1, 4137)),
@@ -78,10 +89,20 @@ SHAPES_BY_ROUTE = {
         # r15 pinned (3, 257) as ``fp8:h64:partial:ts``; the merged rule consults the KV-split gate first.
         (3, 257),  # merge-forward: overlap domain, provisional A (card Q-MF-1)
     ),
-    "fp8:h64:full:qle2048:kvsplit": ((128, 4137), (294, 4137)),
-    "fp8:h64:partial:qle2048:kvsplit": ((129, 4137), (293, 4137)),
-    "fp8:h64:full:le1024": ((1024, 4137), (304, 4137)),
-    "fp8:h64:partial:le1024": ((1023, 4137), (305, 4137)),
+    # (294 / 293, 4137): 147 blocks, below both SM counts; (304 / 305, 4137) and (1024 / 1023, 4137): 152 and 512
+    # blocks, the whole-grid band (``fullgrid``, K > ``fullgrid_min_kv``) -- the ``le1024`` tier's former points
+    "fp8:h64:full:qle2048:kvsplit": (
+        (128, 4137),
+        (294, 4137),
+        (304, 4137),
+        (1024, 4137),
+    ),
+    "fp8:h64:partial:qle2048:kvsplit": (
+        (129, 4137),
+        (293, 4137),
+        (305, 4137),
+        (1023, 4137),
+    ),
     "fp8:h64:full:any": ((4096, 4137), (16232, 4137)),
     "fp8:h64:partial:any": ((1025, 4137), (16231, 4137)),
     "fp8:h64:full:short": ((16, 16), (256, 256)),
@@ -97,7 +118,7 @@ SHAPES_BY_ROUTE = {
 # ``policy.dense_admission``); one tier is therefore admitted on some architectures only.
 ADMITTED_FIXTURE = {
     "sm_100a": (),
-    "sm_103a": ("fp8:h64:partial:any", "fp8:h64:full:le1024"),
+    "sm_103a": ("fp8:h64:partial:any", "fp8:h64:full:any"),
 }
 REASON_FIXTURE = {
     "sm_100a": "not converged: partial:any blocked by one row",
@@ -326,8 +347,9 @@ def test_plan_refuses_a_withheld_route_by_name(monkeypatch):
 def test_dense_kvsplit_gate_is_published_and_shape_only():
     """``policy.dense_kvsplit`` (the shipped catalog): the shape-only gate of the 64-head in-kernel KV-split routes --
     ``K > min_kv`` (the one-split routes' bound: the two gates partition K) and fewer query blocks than the
-    architecture's catalogued SM count ``sm_count[arch]`` (``<= max_sms``) -- its three plan bands, the ``"tier"``
-    fallback and the unreached tier aliases; the runtime applies it at the catalogued count (no device query), the
+    architecture's catalogued SM count ``sm_count[arch]`` (``<= max_sms``), or -- the whole-grid band
+    ``fullgrid[arch]`` -- ``K > fullgrid_min_kv`` and ``sm_count <= blocks <= max_q_blocks`` -- its three plan bands,
+    the ``"tier"`` fallback and the unreached tier aliases; the runtime applies it at the catalogued count (no device query), the
     32-head routes never take it, and the plan routes own the metadata buffer their text writes."""
     catalog = _runtime._catalog()
     gate = catalog["policy"].get("dense_kvsplit")
@@ -365,9 +387,13 @@ def test_dense_kvsplit_gate_is_published_and_shape_only():
         assert served == _served_route(
             "fp8:h64:full:qle2048:kvsplit", 2 * (sms - 1), admitted
         )
-        assert (
-            _runtime.served_route("fp8", 2 * sms - 1, 4137, 64, arch=arch)
-            == "fp8:h64:partial:le1024"
+        # at the SM count the whole-grid band (``fullgrid[arch]``, K > ``fullgrid_min_kv``) keeps the qle2048 plan;
+        # with the band off the grid-stride tier of the query count serves the call
+        fullgrid = gate["fullgrid"]
+        fg_on = fullgrid[arch] if isinstance(fullgrid, dict) else bool(fullgrid)
+        assert min_kv < int(gate["fullgrid_min_kv"]) < 4137
+        assert _runtime.served_route("fp8", 2 * sms - 1, 4137, 64, arch=arch) == (
+            "fp8:h64:partial:qle2048:kvsplit" if fg_on else "fp8:h64:partial:le1024"
         )
         assert _runtime.served_route("fp8", 37, min_kv, 64, arch=arch) == _served_route(
             "fp8:h64:partial:short", 37, admitted

@@ -140,10 +140,8 @@ def test_bf16_factory_resolves_ikr_from_knobs_when_permitted(monkeypatch):
         )
         try:
             assert buf._frontend.config.in_kernel_fc2_reduce is ikr
-            # Both destinations exist either way, so the knob can flip later.
-            assert buf.combine_output.shape == (8, 2, 128)
-            assert buf.reduced_output.shape == (8, 1, 128)
-            assert buf.kernel_combine_output.shape[1] == (1 if ikr else 2)
+            # The unified output remains stable when the knob flips.
+            assert buf.output_activation.shape == (8, 128)
         finally:
             buf.destroy()
 

@@ -21,15 +21,23 @@ limitations under the License.
 # ``dX = G @ W[e]`` (``grouped_gemm_dgrad``) and the weight gradient
 # ``dW[e] = G[e].T @ X[e]`` with bf16 or fp32 output (``grouped_gemm_wgrad``).
 #
-# The one-shot helpers below are the public opt-in (they warn once as an
-# experimental API).  The prepare-once / launch-many surface
-# (``prepare_grouped_gemm_*`` returning a ``GroupedGemmLaunch``) lives in
-# ``cake_backend`` and is re-exported lazily, as are the ``torch.autograd``
-# wrapper ``cake_grouped_mm`` / ``CakeGroupedMm`` of ``cake_autograd``; the
-# JIT registry filled by the generated-program export lives in ``cake_jit``.
-# All stay unimported until first use so importing this package is cheap.
-# The stable API ``flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")``
-# routes the forward projection to ``cake_backend.grouped_mm_bf16_cake``.
+# The public (experimental) entry points are the core functions
+# ``flashinfer.grouped_mm.grouped_gemm_fwd`` / ``grouped_gemm_dgrad`` /
+# ``grouped_gemm_wgrad`` / ``cake_grouped_mm`` and the stable API
+# ``flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")``: they carry
+# the experimental-API marking and the once-only warnings and hand off to the
+# plain functions of this package.  The package holds those plain functions
+# (the three one-shot helpers below, which prepare and launch in one call),
+# the ``torch.autograd`` wrapper ``cake_grouped_mm`` / ``CakeGroupedMm`` of
+# ``cake_autograd``, the host planning and the prepare-once / launch-many
+# surface (``prepare_grouped_gemm_*`` returning a ``GroupedGemmLaunch``) of
+# ``cake_backend`` together with the stable-API handoff
+# ``cake_backend.grouped_mm_bf16_cake``, and the JIT registration of the
+# generated sources in ``cake_jit``.  The submodules are re-exported lazily
+# and stay unimported until first use, so importing this package is cheap.
+# The package imports nothing from the rest of FlashInfer: only itself,
+# ``torch`` and ``tvm_ffi`` (the JIT fallback of ``cake_build`` imports
+# ``flashinfer`` inside ``try/except ImportError``).
 # ``offs`` may be given as ``[E]`` end offsets or as ``m_indptr`` ``[E + 1]``.
 
 from __future__ import annotations
@@ -37,8 +45,6 @@ from __future__ import annotations
 from typing import Any, Optional
 
 import torch
-
-from ...api_logging import flashinfer_experimental_api
 
 __all__ = [
     "CakeGroupedMm",
@@ -63,7 +69,6 @@ _BACKEND_EXPORTS = frozenset(
 _AUTOGRAD_EXPORTS = frozenset({"CakeGroupedMm", "cake_grouped_mm"})
 
 
-@flashinfer_experimental_api(feature="cake_moe_grouped_gemm.grouped_gemm_fwd")
 def grouped_gemm_fwd(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -101,7 +106,6 @@ def grouped_gemm_fwd(
     return prepare_grouped_gemm_fwd(x, w, offs, out=out).launch()
 
 
-@flashinfer_experimental_api(feature="cake_moe_grouped_gemm.grouped_gemm_dgrad")
 def grouped_gemm_dgrad(
     g: torch.Tensor,
     w: torch.Tensor,
@@ -120,7 +124,6 @@ def grouped_gemm_dgrad(
     return prepare_grouped_gemm_dgrad(g, w, offs, out=out).launch()
 
 
-@flashinfer_experimental_api(feature="cake_moe_grouped_gemm.grouped_gemm_wgrad")
 def grouped_gemm_wgrad(
     g: torch.Tensor,
     x: torch.Tensor,

@@ -638,8 +638,10 @@ def cake_chunk_gated_delta_product(
 
     The body of ``flashinfer.gdp_prefill.chunk_gated_delta_product(..., backend="cake")``; see that function for
     the full documentation of the arguments and semantics.  Every check here reads shapes, dtypes, strides and
-    Python scalars only.  One launch serves a call.  The launch follows the kernel's split rule of record
-    (``prefill_split_table``) over the host sequence lengths: when the rule cuts a long sequence into items, the
+    Python scalars only.  One Cake kernel launch per call; the split programs add a workspace clear and the item-table
+    upload.  With ``cu_seqlens_cpu`` given, no device-to-host synchronization is issued (the split rule reads the host
+    copy); without it the sequence offsets are copied to the host once.  The launch follows the kernel's split rule of
+    record (``prefill_split_table``) over the host sequence lengths: when the rule cuts a long sequence into items, the
     gate-saturation split program of the call's flags runs those items on ``min(SM count, items)`` persistent CTAs;
     when every sequence stays one item (every short batch), the exact program runs the single pass over the
     ``N x H`` (sequence, head) tiles on ``min(SM count, N x H)`` CTAs.  The two agree bitwise.  ``cu_seqlens_cpu``

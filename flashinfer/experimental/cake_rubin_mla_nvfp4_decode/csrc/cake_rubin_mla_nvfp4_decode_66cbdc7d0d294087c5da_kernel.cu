@@ -109,7 +109,7 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
   float* smem_w = reinterpret_cast<float*>(smem_raw + 0);
   const int smem_w_addr = smem + 0;
 
-  // === Task calls (dependency order) ===
+  // === Task calls (declaration order) ===
   asm volatile("griddepcontrol.wait;" ::: "memory");
   int part = warp % 4;
   int row = blockIdx.x * 2 + warp / 4;
@@ -1386,13 +1386,20 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
     for (int e_1 = 0; e_1 < 4; e_1++) {
       acc[e_1] = acc[e_1] * inv;
     }
-    {
-      uint2 _pk2;
-      __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
-      _pk[0] = __floats2bfloat162_rn(acc[0 + 0], acc[0 + 1]);
-      _pk[1] = __floats2bfloat162_rn(acc[0 + 2], acc[0 + 3]);
-      *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(O + (row * 512 + d0)))[0]) = _pk2;
+    unsigned int _packed_0[2];
+#pragma unroll
+    for (int _lp = 0; _lp < 1; _lp++) {
+      __nv_bfloat162 _bf2 =
+          __float22bfloat162_rn(make_float2(acc[_lp * 2 + 0], acc[_lp * 2 + 1 + 0]));
+      _packed_0[_lp] = *(uint32_t*)&_bf2;
     }
+#pragma unroll
+    for (int _lp = 0; _lp < 1; _lp++) {
+      __nv_bfloat162 _bf2 =
+          __float22bfloat162_rn(make_float2(acc[_lp * 2 + 2], acc[_lp * 2 + 1 + 2]));
+      _packed_0[_lp + 1] = *(uint32_t*)&_bf2;
+    }
+    reinterpret_cast<int2*>(O + (row * 512 + d0))[0] = reinterpret_cast<int2*>(_packed_0)[0];
     if (has_lse != 0) {
       if (part == 0) {
         if (lane_0 == 0) {
@@ -1400,7 +1407,7 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
           if (sum_w > 0.0f) {
             float _log2_67;
             asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_67) : "f"(sum_w));
-            lse_v = (m + _log2_67) * 0.6931471805599453f;
+            lse_v = (m + _log2_67) * 0.6931472f;
           }
           *(reinterpret_cast<float*>(lse + row) + (0)) = lse_v;
         }

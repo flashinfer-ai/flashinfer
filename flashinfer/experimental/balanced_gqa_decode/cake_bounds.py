@@ -21,8 +21,9 @@ buffer (one scheduler warp derives the chunk length and four length buckets,
 then decodes every ticket online).  Nothing here reads KV lengths: the host
 only needs these constants and bounds to carve the caller-owned workspace and
 to bound the kernel's ticket loop, so one prepared launch replays for any
-length distribution.  The exact host mirror of the planner used by the tests
-lives in ``tests/test_helpers/cake_balanced_gqa_plan.py``.
+length distribution.  The exact host mirror of the planner used by the tests,
+including the packed-row merge-ticket rule (``mtp_merge_slices_for`` /
+``mtp_merge_items``), lives in ``tests/test_helpers/cake_balanced_gqa_plan.py``.
 
 Two generated programs share the workspace: the row-tile kernel (one 8-head
 query row per item, any ``q_len_per_req``) and the packed-row MTP kernel
@@ -34,8 +35,6 @@ hold a 64 x 128 FP32 tile and 128 statistics words.
 """
 
 from __future__ import annotations
-
-from typing import Sequence
 
 BLOCK_N = 128
 PAIR_TOKENS = 2 * BLOCK_N
@@ -52,13 +51,6 @@ DEFAULT_PAIRS_MIN = 2
 MTP_MIN_Q_LEN = 3
 MTP_MAX_Q_LEN = 8
 MTP_GROUP = 8  # query heads per KV head
-# Merge tickets per split tile: T in {1, 2, q_len, 2 * q_len} row slices, the
-# smallest T with (2 * q_len / T) * n_chunks <= MTP_MERGE_ROWCHUNKS_PER_WARP
-# (rows folded per correction warp times chunks per row).
-MTP_MERGE_ROWCHUNKS_PER_WARP = 8
-# Two-chunk split tiles are folded in place by the last arriving chunk item
-# and take no merge tickets.
-MTP_INLINE_MERGE_CHUNKS = 2
 MTP_MAX_N_ROWS = 64
 MTP_PARTIAL_O_PER_SLOT = MTP_MAX_N_ROWS * 128  # FP32 O^T[64, 128] per split item
 MTP_STATS_PER_SLOT = 2 * MTP_MAX_N_ROWS  # max[64] then sum[64]
@@ -82,33 +74,6 @@ def mtp_n_rows(q_len_per_req: int) -> int:
 def mtp_merge_slices_per_tile(q_len_per_req: int) -> int:
     """Upper bound of merge tickets per split ``(request, kv head)`` tile."""
     return 2 * q_len_per_req
-
-
-def mtp_merge_slices_for(n_chunks: int, q_len_per_req: int) -> int:
-    """Merge tickets of a split tile with ``n_chunks`` partials.
-
-    Two-chunk tiles take none (folded in place by the last arriving chunk).
-    Otherwise ``T in (1, 2, q_len, 2 * q_len)``: the smallest keeping
-    ``(2 * q_len // T) * n_chunks <= MTP_MERGE_ROWCHUNKS_PER_WARP``.
-    """
-    if n_chunks <= MTP_INLINE_MERGE_CHUNKS:
-        return 0
-    for t in (1, 2, q_len_per_req, 2 * q_len_per_req):
-        if (2 * q_len_per_req // t) * n_chunks <= MTP_MERGE_ROWCHUNKS_PER_WARP:
-            return t
-    return 2 * q_len_per_req
-
-
-def mtp_merge_items(
-    seq_lens: Sequence[int], *, q_len_per_req: int, num_kv_heads: int, chunk_pairs: int
-) -> int:
-    """Merge tickets the device scheduler appends for chunk length ``chunk_pairs``."""
-    total = 0
-    for s in seq_lens:
-        n = -(-((int(s) + 255) // 256) // chunk_pairs)
-        if n > 1:
-            total += mtp_merge_slices_for(n, q_len_per_req)
-    return total * num_kv_heads
 
 
 def mtp_max_items_bound(

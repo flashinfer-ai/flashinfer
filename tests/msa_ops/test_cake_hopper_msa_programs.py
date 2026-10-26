@@ -16,17 +16,20 @@ limitations under the License.
 Registry-form consistency of the Cake Hopper (SM90) MSA programs, on the CPU.
 
 ``flashinfer.jit.cake_hopper_msa`` registers one program per physical
-schedule: ``MODULES`` carries each program's compile flags, FFI entry and
-argument order, ``ROUTES`` maps each logical route to the program that
-serves it.  These checks hold the registry to its two sources under
-``csrc/cake_hopper_msa/`` and to the host module that binds the argument
-order: each record's kernel and binding unit exist and name the same kernel
-symbol, the binding has the generated form (its namespace, the runtime
-header, the two exported functions), every argument plan ends in the grid
-triple and names only arguments the host binds, every tensor the binding
-checks for a dtype is checked for the dtype the host passes, each program
-serves exactly one route, and the JIT key is the content digest the loader
-documents.
+schedule: ``MODULES`` carries each program's two sources, compile flags, FFI
+entry and argument order, ``ROUTES`` maps each logical route to the program
+that serves it.  A binding source is shared by the programs of one role and a
+kernel source by the programs that differ only in a compile-time constant; the
+record's ``-D`` compile flags select the program (its kernel symbol, dynamic
+shared memory and block size for the binding).  These checks hold the registry
+to its sources under ``csrc/cake_hopper_msa/`` and to the host module that
+binds the argument order: each record's kernel and binding unit exist, the
+binding has the generated form (its namespace, the runtime header, the two
+exported functions) and names the kernel through the record's flags, the
+kernel defines that symbol, every argument plan ends in the grid triple and
+names only arguments the host binds, every tensor the binding checks for a
+dtype is checked for the dtype the host passes, each program serves exactly
+one route, and the JIT key is the content digest the loader documents.
 
 No CUDA device and no build: the units are read as text and the host module
 as source.  No program count, program name or digest is pinned here; the
@@ -66,7 +69,7 @@ _HOST_SITES = {
 # exactly; ``cake_ffi_checks.h``).  Transcribed by hand from the host (edit with any .view(torch.<dtype>) change at the launch sites; a drift fails at the first launch, not here): ``_admit_sparse_decode`` admits bf16 ``q``, an
 # fp8 e4m3 cache, int32 tables and a bf16 ``out``; ``hopper_msa_sparse_decode_attention`` passes
 # ``q.view(torch.uint32)`` and the ``uint8`` views of the two cache halves; ``_scratch`` allocates
-# uint32 / float32 / uint32 / uint32.  ``_admit_sparse_prefill`` admits the same dtypes and
+# uint32 / float32 / uint32.  ``_admit_sparse_prefill`` admits the same dtypes and
 # ``hopper_msa_sparse_attention`` passes ``Q=q`` beside ``Q32``, the cache halves as fp8 e4m3 views for
 # the v1 program and as uint8 views for v2 (``plan_sparse_prefill`` picks).  ``_admit_proxy_decode``
 # admits ``q`` and the index cache in one dtype (fp8 e4m3 or bf16, the route's first coordinate) and a
@@ -89,7 +92,6 @@ _HOST_DTYPES = {
         "part_o": _U32,
         "part_ml": _F32,
         "counters": _U32,
-        "done": _U32,
     },
     "prefill_v1": {
         "Q": _BF16,
@@ -145,6 +147,11 @@ _HOST_DTYPES = {
 _DTYPE_CHECK = re.compile(
     r'check_dtype\([^,]*, DLDataType\{(\w+), (\d+), (\d+)\}, "([^"]+)"\);'
 )
+# The three launch constants a shared binding takes from the record's compile flags, and the sites
+# that must spend them (the kernel symbol at its declaration and the launch, the dynamic shared
+# memory at the launch configuration, the block size at the launch configuration).
+_BINDING_FLAGS = ("CAKE_PROGRAM_KERNEL", "CAKE_BIND_SMEM", "CAKE_BIND_THREADS")
+_DEFINE = re.compile(r"^-D(CAKE_[A-Z0-9_]+)=(.+)$")
 
 
 def _dtype_key(route: str) -> str:
@@ -169,6 +176,26 @@ def _plan(name: str) -> list[tuple[str, str]]:
     return [
         (str(kind), str(argument)) for kind, argument in jm.MODULES[name]["arg_plan"]
     ]
+
+
+def _defines(name: str) -> dict[str, str]:
+    """The ``-D<macro>=<value>`` compile flags of a record, by macro (each defined once)."""
+
+    defines: dict[str, str] = {}
+    for flag in jm.MODULES[name]["compile_flags"]:
+        match = _DEFINE.match(flag)
+        if match:
+            macro, value = match.groups()
+            assert macro not in defines, f"{name}: {macro} defined twice"
+            defines[macro] = value
+    return defines
+
+
+def _knobs(name: str) -> tuple[tuple[str, str], ...]:
+    """The record's knob flags: its ``-D`` defines other than the three binding constants."""
+
+    defines = _defines(name)
+    return tuple(sorted(d for d in defines.items() if d[0] not in _BINDING_FLAGS))
 
 
 def _is_name(node: ast.AST, identifier: str) -> bool:
@@ -224,13 +251,16 @@ def _host_bound_names(function_names: tuple[str, ...]) -> set[str]:
 
 
 def test_every_program_serves_exactly_one_route():
-    """``ROUTES`` names each registered program once; no program is unrouted."""
+    """``ROUTES`` names each registered program once; no program is unrouted; every record's plan is one
+    of the named plans."""
 
     assert jm.MODULES
     assert sorted(jm.ROUTES.values()) == sorted(jm.MODULES)
-    assert tuple(jm.MODULES) == jm.HOPPER_MSA_VARIANTS
     for route, name in jm.ROUTES.items():
         assert jm.route_program(route) == name
+    plans = list(jm._ARG_PLANS.values())
+    for name in _PROGRAMS:
+        assert any(jm.MODULES[name]["arg_plan"] is plan for plan in plans), name
 
 
 def test_every_route_family_has_a_host_binding_site():
@@ -244,34 +274,91 @@ def test_every_route_family_has_a_host_binding_site():
 
 @pytest.mark.parametrize("name", _PROGRAMS)
 def test_units_match_the_record(name):
-    """Both units of the record exist; the binding declares the kernel the device unit defines, in
-    the generated binding form: its namespace, the runtime header and the two exported functions."""
+    """Both units the record names exist under the unit directory; the binding has the generated form (its
+    namespace, the runtime header, the two exported functions) and takes the kernel symbol, the dynamic
+    shared memory and the block size from the record's flags; the kernel unit defines that symbol, either
+    literally or through the same ``CAKE_PROGRAM_KERNEL`` flag."""
 
-    kernel_path = _CSRC / f"{name}_kernel.cu"
-    binding_path = _CSRC / f"{name}_binding.cu"
+    record = jm.MODULES[name]
+    kernel_path = _CSRC / record["kernel"]
+    binding_path = _CSRC / record["binding"]
     assert kernel_path.is_file(), kernel_path
     assert binding_path.is_file(), binding_path
+    assert kernel_path.parent == _CSRC and binding_path.parent == _CSRC
     kernel = kernel_path.read_text()
     binding = binding_path.read_text()
     symbol = f"kernel_{name}"
-    namespace = f"cake_binding_{symbol}"
-    entry = jm.MODULES[name]["ffi_entry"]
+    defines = _defines(name)
+    assert defines["CAKE_PROGRAM_KERNEL"] == symbol
+    assert (
+        defines["CAKE_BIND_SMEM"].isdigit() and defines["CAKE_BIND_THREADS"].isdigit()
+    )
+    for macro in _BINDING_FLAGS:
+        assert f"#ifndef {macro}\n#error" in binding, (
+            f"{record['binding']}: {macro} unguarded"
+        )
 
-    assert f'extern "C" __global__ void {symbol}(' in binding
-    assert re.search(rf"__global__[^;{{]*?\b{re.escape(symbol)}\s*\(", kernel), symbol
-    assert f"namespace {namespace} {{" in binding
-    assert f"}}  // namespace {namespace}" in binding
+    assert 'extern "C" __global__ void CAKE_PROGRAM_KERNEL(' in binding
+    assert re.search(
+        r"__global__[^;{]*?\b(CAKE_PROGRAM_KERNEL|" + re.escape(symbol) + r")\s*\(",
+        kernel,
+    )
+    assert "namespace CAKE_PROGRAM_SHIM {" in binding
+    assert "}  // namespace CAKE_PROGRAM_SHIM" in binding
+    assert (
+        "#define CAKE_PROGRAM_SHIM CAKE_CAT(cake_binding_, CAKE_PROGRAM_KERNEL)"
+        in binding
+    )
     assert '#include "cake_ffi_checks.h"' in binding
-    assert f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({entry}, {namespace}::Run);" in binding
+    assert "config.blockDim = dim3(CAKE_BIND_THREADS, 1, 1);" in binding
+    assert "config.dynamicSmemBytes = CAKE_BIND_SMEM;" in binding
+    assert "reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL)" in binding
+    assert not re.search(r"cake_hopper_msa_[0-9a-f]{20}", binding), (
+        "a shared binding names no program"
+    )
+    entry = record["ffi_entry"]
+    assert f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({entry}, CAKE_PROGRAM_SHIM::Run);" in binding
     assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(build_cuda_version, " in binding
 
 
-@pytest.mark.parametrize("name", _PROGRAMS)
-def test_plan_ends_in_the_grid_triple(name):
-    """The argument plan ends in the three grid scalars, names each argument once, places no grid
+def test_shared_bindings_serve_one_route_family_each():
+    """A binding source is shared only within a route family (its tensor-map geometry and argument plan
+    are the family's), and the programs sharing it differ in their flag values; a kernel source is shared
+    only within a family too, by programs whose knob flags differ, and a shared kernel takes its symbol
+    from the ``CAKE_PROGRAM_KERNEL`` flag."""
+
+    by_binding: dict[str, list[str]] = {}
+    for name in _PROGRAMS:
+        by_binding.setdefault(jm.MODULES[name]["binding"], []).append(name)
+    for binding, names in by_binding.items():
+        routes = [next(r for r, n in jm.ROUTES.items() if n == name) for name in names]
+        assert len({ch._route_family(route) for route in routes}) == 1, binding
+        plans = {id(jm.MODULES[name]["arg_plan"]) for name in names}
+        assert len(plans) == 1, f"{binding}: shared by programs of different plans"
+        flags = [tuple(sorted(_defines(name).items())) for name in names]
+        assert len(set(flags)) == len(flags), (
+            f"{binding}: two programs with the same flags"
+        )
+    by_kernel: dict[str, list[str]] = {}
+    for name in _PROGRAMS:
+        by_kernel.setdefault(jm.MODULES[name]["kernel"], []).append(name)
+    for kernel, names in by_kernel.items():
+        routes = [next(r for r, n in jm.ROUTES.items() if n == name) for name in names]
+        assert len({ch._route_family(route) for route in routes}) == 1, kernel
+        knobs = [_knobs(name) for name in names]
+        assert len(set(knobs)) == len(knobs), (
+            f"{kernel}: two programs with the same knobs"
+        )
+        if len(names) > 1:
+            assert "void CAKE_PROGRAM_KERNEL(" in (_CSRC / kernel).read_text(), kernel
+
+
+@pytest.mark.parametrize("plan_name", sorted(jm._ARG_PLANS))
+def test_plan_ends_in_the_grid_triple(plan_name):
+    """Each named argument plan ends in the three grid scalars, names each argument once, places no grid
     entry elsewhere and carries no ``trace`` argument."""
 
-    plan = _plan(name)
+    plan = [(str(kind), str(argument)) for kind, argument in jm._ARG_PLANS[plan_name]]
     assert plan[-3:] == _grid_triple()
     assert all(kind != "grid" for kind, _argument in plan[:-3])
     names = [argument for _kind, argument in plan]
@@ -301,7 +388,7 @@ def test_binding_checks_the_dtypes_the_host_passes(name):
 
     route = next(route for route, program in jm.ROUTES.items() if program == name)
     expected = _HOST_DTYPES[_dtype_key(route)]
-    binding = (_CSRC / f"{name}_binding.cu").read_text()
+    binding = (_CSRC / jm.MODULES[name]["binding"]).read_text()
     checks: dict[str, list[tuple[str, int, int]]] = {}
     for code, bits, lanes, argument in _DTYPE_CHECK.findall(binding):
         checks.setdefault(argument, []).append((code, int(bits), int(lanes)))
@@ -319,13 +406,13 @@ def test_binding_checks_the_dtypes_the_host_passes(name):
 @pytest.mark.parametrize("name", _PROGRAMS)
 def test_jit_key_is_the_content_digest(name):
     """The JIT / AOT key is the program name, the target and the first twenty hex digits of the
-    SHA-256 over the kernel unit, the binding unit and the compact JSON of its compile flags and
-    target, recomputed here from the file bytes."""
+    SHA-256 over the record's kernel unit, its binding unit and the compact JSON of its compile flags
+    and target, recomputed here from the file bytes."""
 
     record = jm.MODULES[name]
     digest = hashlib.sha256()
-    digest.update((_CSRC / f"{name}_kernel.cu").read_bytes())
-    digest.update((_CSRC / f"{name}_binding.cu").read_bytes())
+    digest.update((_CSRC / record["kernel"]).read_bytes())
+    digest.update((_CSRC / record["binding"]).read_bytes())
     identity = {"options": list(record["compile_flags"]), "target": jm._ARCHES[0]}
     digest.update(
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
