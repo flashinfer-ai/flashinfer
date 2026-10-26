@@ -50,16 +50,16 @@ PROFILES: Dict[str, Profile] = {
         intermediate_size=2880,
         weight_quant="mxfp4",
     ),
-    # FP8 block-scale MoE dispatches BF16 activations and quantizes after
-    # dispatch, so the communication payload is BF16.
+    # DeepSeek FP8: activations with one FP32 scale per 128 channels, weights
+    # with one per 128x128 block.
     "deepseek_v3": Profile(
         "deepseek_v3",
         hidden_size=7168,
         top_k=8,
         num_experts=256,
-        quant="bf16",
+        quant="fp8_block_scale",
         intermediate_size=2048,
-        weight_quant="bf16",
+        weight_quant="fp8_block_scale",
     ),
     "deepseek_v4_flash": Profile(
         "deepseek_v4_flash",

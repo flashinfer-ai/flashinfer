@@ -299,11 +299,12 @@ def dispatch_quant_format(
 ):
     """Activation format tokens can be quantized to before a rank-major dispatch.
 
-    NVFP4 with a unit global scale and MXFP8 quantize each token row on its
-    own, so quantizing before dispatch yields the same values the receiver
-    would compute. Per-token NVFP4 scaling and the packed ``mxfp8_dispatch``
-    row are excluded, as is any unquantized activation. Returns ``None`` when
-    the tokens must be dispatched unquantized.
+    NVFP4 with a unit global scale, MXFP8 and DeepSeek FP8 (1x128 blocks)
+    quantize each token row on its own, so quantizing before dispatch yields
+    the same values the receiver would compute. Per-token NVFP4 scaling and
+    the packed ``mxfp8_dispatch`` row are excluded, as is any unquantized
+    activation. Returns ``None`` when the tokens must be dispatched
+    unquantized.
     """
     from flashinfer.fused_moe.api import QuantFormat
 
@@ -312,6 +313,8 @@ def dispatch_quant_format(
         return QuantFormat.NVFP4
     if activation is QuantFormat.MXFP8 and not mxfp8_dispatch:
         return QuantFormat.MXFP8
+    if activation is QuantFormat.DeepSeekFp8:
+        return QuantFormat.DeepSeekFp8
     return None
 
 
@@ -322,8 +325,13 @@ def quantize_for_dispatch(
 
     Returns ``(values, scales)`` as uint8 rows, which every rank-major
     transport carries as raw bytes; :func:`build_activation_pack_rank_major`
-    restores the dtypes the runners expect.
+    restores the dtypes and scale layout the runners expect.
     """
+    from flashinfer.fused_moe.api import QuantFormat
+
+    if quant.pair[1] is QuantFormat.DeepSeekFp8:
+        q, scale = _deepseek_fp8_rows(x)
+        return q.view(torch.uint8), scale.view(torch.uint8)
     q, scale, _ = _quantize_activations(
         x,
         quant=quant,
@@ -389,11 +397,36 @@ def _view_dispatched_activations(
     weight, activation = quant.pair
     values = values.view(torch.uint8)
     scales = scales.view(torch.uint8)
+    if activation is QuantFormat.DeepSeekFp8:
+        # Runners take the 1x128 block scales transposed, as [hidden // 128, M].
+        values = values.reshape(-1, values.shape[-1])
+        scales = scales.reshape(values.shape[0], -1).view(torch.float32)
+        return values.view(torch.float8_e4m3fn), scales.t().contiguous()
     if activation is QuantFormat.MXFP8:
         values = values.view(torch.float8_e4m3fn)
         if weight is QuantFormat.MXFP4:
             scales = scales.view(torch.float8_e4m3fn)
     return values, scales
+
+
+def _check_deepseek_fp8_hidden(hidden: int) -> None:
+    if hidden % 128:
+        raise ValueError(
+            f"DeepSeek FP8 activations need hidden % 128 == 0, got {hidden}"
+        )
+
+
+def _deepseek_fp8_rows(flat: torch.Tensor) -> "tuple[torch.Tensor, torch.Tensor]":
+    """DeepSeek FP8 (1x128 block) quantization with row-major scales.
+
+    Returns float8_e4m3fn values ``[M, hidden]`` and float32 scales
+    ``[M, hidden // 128]``, so each token row carries its own scales.
+    """
+    from flashinfer.fused_moe.prepare import _deepseek_fp8_quantize_activations
+
+    _check_deepseek_fp8_hidden(flat.shape[1])
+    q, scale_t = _deepseek_fp8_quantize_activations(flat.contiguous())
+    return q, scale_t.t().contiguous()
 
 
 def _quantize_activations(
@@ -495,6 +528,13 @@ def _quantize_activations(
             # W4A8 packs carry UE8M0 bytes in float8 storage. CuTe reinterprets
             # them as uint8; TRT-LLM requires the float8 view.
             hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn)
+    elif activation is QuantFormat.DeepSeekFp8:
+        from flashinfer.fused_moe.prepare import _deepseek_fp8_quantize_activations
+
+        _check_deepseek_fp8_hidden(flat.shape[1])
+        hidden_states_q, hidden_states_scale = _deepseek_fp8_quantize_activations(
+            flat.contiguous()
+        )
     elif activation is QuantFormat.BF16:
         # BF16 and both W4A16 encodings consume the dispatched activations.
         hidden_states_q = flat

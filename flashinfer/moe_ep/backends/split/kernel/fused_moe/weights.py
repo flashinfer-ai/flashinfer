@@ -23,12 +23,23 @@ def materialize_fused_moe_weights(
     from ......fused_moe.api import (
         CuteDslConfig,
         MoEWeightPack as FusedMoEWeightPack,
+        PrimsTsConfig,
         QuantFormat,
         TrtllmBf16Config,
         TrtllmFp4Config,
     )
 
     quant = moe_config.quant
+    # FP8PerTensor needs calibrated global scales, which MoEWeightPack does
+    # not carry.
+    prims_ts_pairs = (
+        (QuantFormat.NVFP4, QuantFormat.NVFP4),
+        (QuantFormat.MXFP4, QuantFormat.MXFP8),
+        (QuantFormat.MXFP4, QuantFormat.BF16),
+        (QuantFormat.BF16, QuantFormat.BF16),
+        (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8),
+    )
     experts = moe_config.experts
     routing = moe_config.routing
     num_local = experts.local_num_experts or routing.num_experts
@@ -92,6 +103,22 @@ def materialize_fused_moe_weights(
                 device=weights.w13.device,
             )
             pack.prepare_for("cute_dsl", view)
+            continue
+
+        if quant.pair in prims_ts_pairs and isinstance(backend_cfg, PrimsTsConfig):
+            if "prims_ts" in pack.native_views:
+                continue
+            view = PrimsTsConfig.prepare_weights(
+                weights.w13,
+                weights.w2,
+                quant=quant,
+                num_local_experts=num_local,
+                hidden_size=hidden,
+                intermediate_size=intermediate,
+                activation=moe_config.activation,
+                device=weights.w13.device,
+            )
+            pack.prepare_for("prims_ts", view)
 
     if pack.native_views:
         return pack

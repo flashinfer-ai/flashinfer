@@ -101,7 +101,7 @@ QUANT_FORMATS = {
 }
 ACTIVATION_FORMATS = ("bf16", "fp8_block_scale", "mxfp8", "nvfp4")
 COMM_BACKENDS = ("nvlink_one_sided", "cake", "nvlink_two_sided")
-COMPUTE_BACKENDS = ("trtllm", "cutedsl")
+COMPUTE_BACKENDS = ("trtllm", "cutedsl", "prims_ts")
 # NVLinkOneSidedConfig.cft for each --cft choice.
 _CFT_MODES = {"auto": None, "on": True, "off": False}
 TIMING_SCOPES = ("dispatch_compute_combine", "forward")
@@ -134,6 +134,7 @@ def _compute_candidate(compute: str, weight_quant: str):
     """
     from flashinfer.fused_moe.api import (
         CuteDslConfig,
+        PrimsTsConfig,
         TrtllmBf16Config,
         TrtllmFp4Config,
         TrtllmFp8BlockConfig,
@@ -141,6 +142,8 @@ def _compute_candidate(compute: str, weight_quant: str):
 
     if compute == "cutedsl":
         return CuteDslConfig()
+    if compute == "prims_ts":
+        return PrimsTsConfig()
     if weight_quant == "bf16":
         return TrtllmBf16Config()
     if weight_quant in ("nvfp4", "mxfp4"):
@@ -535,7 +538,7 @@ def parse_args() -> argparse.Namespace:
         type=str.lower,
         default="trtllm",
         choices=COMPUTE_BACKENDS,
-        help="Expert computation: the TRT-LLM-Gen or the CuTe DSL fused MoE.",
+        help="Expert computation: the TRT-LLM-Gen, CuTe DSL or Prims-TS fused MoE.",
     )
     add_profile_args(parser)
     parser.add_argument(
