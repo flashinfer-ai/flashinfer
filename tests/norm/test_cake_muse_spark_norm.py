@@ -112,8 +112,18 @@ def _kwargs(inputs, has_post_weight: bool):
     return {"post_weight": torch.randn_like(inputs[2]) * 0.1, "post_gain_center": 1.0}
 
 
+def _admits(form, rows: int) -> bool:
+    """Whether a program of the form's route admits ``rows`` on this device: a route's windows may leave declared
+    gaps, where the facade's ``auto`` keeps the CuTe kernel and ``backend="cake"`` refuses the call."""
+    tensor_alpha, has_post_weight = form
+    return pkg.is_cake_gated_residual_next_rmsnorm_supported(
+        _device(), tensor_alpha=tensor_alpha, has_post_weight=has_post_weight, rows=rows
+    )
+
+
 def _edge_rows(route: str) -> list[int]:
-    """1, both sides of every window edge of the route on this device, and the two contract rows."""
+    """1, both sides of every window edge of the route on this device, and the two contract rows (admitted or
+    not: the tests check a declared gap refuses the Cake backend)."""
     rows = {1, 17, 2437}
     for name in loader.route_modules(_arch(), route):
         for _above, at_most in loader.MODULES[name]["select_rule"]["windows"][_arch()]:
@@ -139,15 +149,23 @@ def test_every_window_matches_the_reference(form):
 
     try:
         loader.run_module = spy
+        checked = 0
         for rows in _edge_rows(route):
             torch.manual_seed(1000 + rows)
             inputs = _inputs(rows, tensor_alpha=tensor_alpha)
             kwargs = _kwargs(inputs, has_post_weight)
+            if not _admits(form, rows):
+                # a declared gap of the route on this device: no program admits the row count
+                with pytest.raises(ValueError, match=f"admits {rows} rows"):
+                    _call(inputs, **kwargs)
+                continue
+            checked += 1
             assert supports_gated_residual_next_rmsnorm(
                 *inputs, post_weight=kwargs.get("post_weight"), backend="cake"
             )
             _assert_close(_call(inputs, **kwargs), _reference(inputs, **kwargs))
             assert launched[-1] == (loader.selected_module(_arch(), route, rows), rows)
+        assert checked, f"route {route} admits none of its edge rows on {_arch()}"
     finally:
         loader.run_module = original
 
@@ -227,7 +245,10 @@ def test_cuda_graph_replay_uses_changed_inputs(form):
     tensor_alpha, has_post_weight = form
     pkg._zero_post_weights.clear()
     pkg.warm_up(_device(), tensor_alpha=tensor_alpha, has_post_weight=has_post_weight)
-    inputs = _inputs(17, tensor_alpha=tensor_alpha)
+    route = pkg.gated_residual_next_rmsnorm_route(tensor_alpha, has_post_weight)
+    # 17 rows where the route admits them, else the first admitted edge row of the route on this device
+    rows = next(r for r in (17, *_edge_rows(route)) if _admits(form, r))
+    inputs = _inputs(rows, tensor_alpha=tensor_alpha)
     kwargs = _kwargs(inputs, has_post_weight)
     graph = torch.cuda.CUDAGraph()
     side = torch.cuda.Stream()
@@ -259,18 +280,70 @@ def test_warm_up_loads_every_route():
                 assert loader.cluster_capacity(name, _arch(), device.index) >= 1
 
 
+def _tokens_heads_launch_cluster(rule) -> tuple[int, int, int]:
+    """The launch cluster of a ``tokens_heads`` record: ``cluster`` CTAs over the head
+    blocks (the grid's first dimension) when the rule names one above one; otherwise the
+    token cluster along the token dimension, the first grid dimension in token-major
+    order and the second in head-major order."""
+    cluster, tcluster = int(rule["cluster"]), int(rule.get("tcluster", 1))
+    if cluster > 1:
+        return (cluster, 1, 1)
+    if rule.get("order") == "heads":
+        return (1, tcluster, 1)
+    return (tcluster, 1, 1)
+
+
+def _tokens_heads_grid(rule, tokens: int, heads: int) -> tuple[int, int, int]:
+    """The grid a ``tokens_heads`` rule prescribes: a CTA of ``tpc`` tokens covers
+    ``rows_per_cta / tpc`` heads each; otherwise a CTA covers ``rows_per_cta`` heads of
+    one token, the token count rounded up to the token cluster (or the interleave), the
+    head blocks first under a cluster over them or the head-major order."""
+    rows_per_cta, tpc = int(rule["rows_per_cta"]), int(rule.get("tpc", 1))
+    if tpc > 1:
+        return (-(-tokens // tpc), -(-heads // (rows_per_cta // tpc)), 1)
+    blocks = -(-heads // rows_per_cta)
+    tcluster, interleave = int(rule.get("tcluster", 1)), int(rule.get("interleave", 1))
+    if int(rule["cluster"]) > 1 or rule.get("order") == "heads":
+        return (blocks, -(-tokens // tcluster) * tcluster, 1)
+    step = max(tcluster, interleave)
+    return (-(-tokens // step) * step, blocks, 1)
+
+
 def test_launch_grid_follows_the_record_rule():
     device = _device()
     for name, record in loader.MODULES.items():
         if _arch() not in record["arches"]:
             continue
-        cluster = record["grid_rule"]["cluster"]
-        assert record["launch"]["cluster"][0] == cluster
+        rule = record["grid_rule"]
+        cluster = rule["cluster"]
+        if rule["kind"] == "tokens_heads":
+            launch_cluster = _tokens_heads_launch_cluster(rule)
+            assert tuple(record["launch"]["cluster"]) == launch_cluster, name
+        else:
+            assert record["launch"]["cluster"][0] == cluster
         for rows in (1, 7, 148, 4096):
+            if rule["kind"] == "tokens_heads":
+                # the two-dimensional grid of ``rows`` tokens and the given heads;
+                # a launch without a head count is refused
+                with pytest.raises(ValueError, match="must carry 'heads'"):
+                    loader.launch_grid(record, rows, device_index=device.index)
+                for heads in (1, 16, 32, 128):
+                    grid = loader.launch_grid(
+                        record,
+                        rows,
+                        device_index=device.index,
+                        values={"heads": heads},
+                    )
+                    expected = _tokens_heads_grid(rule, rows, heads)
+                    assert grid == expected, (name, rows, heads)
+                continue
             grid = loader.launch_grid(record, rows, device_index=device.index)
-            if record["grid_rule"]["kind"] == "rows":
-                assert grid == (rows * cluster, 1, 1)
+            if rule["kind"] == "rows":
+                # rows x the rule's CTAs per row (the cluster when the record names no row_ctas)
+                row_ctas = int(rule.get("row_ctas", cluster))
+                assert grid == (rows * row_ctas, 1, 1), name
             else:
+                assert rule["kind"] == "persistent_rows", name
                 capacity = loader.cluster_capacity(name, _arch(), device.index)
                 assert capacity >= 1
                 assert grid == (min(rows, capacity) * cluster, 1, 1)
