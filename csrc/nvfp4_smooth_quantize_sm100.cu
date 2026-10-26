@@ -233,12 +233,11 @@ void nvfp4_quantize_smooth_lora_down_geometry_sm120(TensorView x, TensorView pqs
 }
 
 // Runtime-M/K entry with an explicit producer geometry.
-void nvfp4_quantize_smooth_lora_down_dyn_sm120_impl(TensorView x, TensorView pqs,
-                                                    TensorView global_scale,
-                                                    TensorView l2t_smoothed, TensorView xq,
-                                                    TensorView sf, TensorView down, int family,
-                                                    int tiling0, int tiling1, int tiling2,
-                                                    int address_policy, bool signal_launch) {
+void nvfp4_quantize_smooth_lora_down_dyn_sm120_impl(
+    TensorView x, TensorView pqs, TensorView global_scale, TensorView l2t_smoothed, TensorView xq,
+    TensorView sf, TensorView down, int family, int tiling0, int tiling1, int tiling2,
+    int address_policy, bool signal_launch,
+    flashinfer::gemm::SvdquantQuantizeBarrierSm120 quantize_barrier = {}) {
   check_sm120_prefix_inputs(x, pqs, global_scale, l2t_smoothed, xq, sf, down);
   int const m = static_cast<int>(x.size(0));
   int const k = static_cast<int>(x.size(1));
@@ -248,7 +247,7 @@ void nvfp4_quantize_smooth_lora_down_dyn_sm120_impl(TensorView x, TensorView pqs
       flashinfer::gemm::nvfp4_smooth_quantize_lora_down_family_sm120<kSm120PrefixRank>(
           x.data_ptr(), pqs.data_ptr(), static_cast<float const*>(global_scale.data_ptr()),
           xq.data_ptr(), sf.data_ptr(), l2t_smoothed.data_ptr(), down.data_ptr(), m, k, family,
-          tiling0, tiling1, tiling2, address_policy, stream, signal_launch);
+          tiling0, tiling1, tiling2, address_policy, stream, signal_launch, quantize_barrier);
   TVM_FFI_ICHECK_EQ(status, cudaSuccess)
       << "nvfp4_quantize_smooth_lora_down_dyn_sm120 failed: " << cudaGetErrorString(status);
 }

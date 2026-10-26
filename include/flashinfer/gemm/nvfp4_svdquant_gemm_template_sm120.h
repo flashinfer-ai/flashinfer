@@ -454,7 +454,7 @@ struct RuntimeTacticSm120 {
   int swizzle;  // power of two; 1 = default
   // Not part of the encoded tactic: the fused linear route sets it when its
   // prefix launches the GEMM only after XQ/SF are complete (see the collective).
-  bool defer_lora_down_wait = false;
+  SvdquantQuantizeBarrierSm120 quantize_barrier{};
 };
 
 // 16 legacy kernel rows + 8 legacy Stream-K kernels x splits {2,4} + 8 legacy
@@ -781,7 +781,7 @@ void run_tactic_impl(RuntimeTacticSm120 const& rt, void* out, void const* A, voi
   args.mainloop.layout_SFB =
       narrow_sf_layout(Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(sf_shape));
   args.mainloop.lora_rank = lora_rank;
-  args.mainloop.defer_lora_down_wait = rt.defer_lora_down_wait;
+  args.mainloop.quantize_barrier = rt.quantize_barrier;
   bool const use_inline_down = inline_down_x != nullptr && inline_down_l2t != nullptr;
   if constexpr (!CompileInlineDown) {
     if (use_inline_down)

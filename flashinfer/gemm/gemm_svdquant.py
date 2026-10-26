@@ -1223,8 +1223,13 @@ def prepare_svdquant_l2t(l2t_smoothed: torch.Tensor) -> torch.Tensor:
     producers may read, once, and :func:`svdquant_linear` reuses it in all modes.
 
     Returns ``l2t_smoothed`` itself; pass that same tensor to
-    :func:`svdquant_linear`. Prepare again after modifying it in place. On
-    devices other than SM120 this is a no-op.
+    :func:`svdquant_linear` and keep it alive while captured graphs use it.
+    Prepare outside graph capture. After an in-place update that preserves the
+    tensor's storage and shape, prepare again before the next call or replay;
+    this refreshes the existing layout buffers so graphs need no recapture.
+    Order preparation and execution on the same CUDA stream, or synchronize
+    them explicitly. Replacing the tensor or its storage requires recapture.
+    On devices other than SM120 this is a no-op.
 
     Parameters
     ----------

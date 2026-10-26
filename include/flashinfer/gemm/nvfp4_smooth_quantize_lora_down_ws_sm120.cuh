@@ -10,10 +10,8 @@
 // Why a separate kernel. The large-M producers in
 // nvfp4_smooth_quantize_lora_down_sm120.cuh run every K tile as
 // "cp.async next tile -> compute this tile -> wait -> __syncthreads", with every
-// thread both a loader and a consumer. At 16384x3072x3072 rank 128 the staged-B
-// kernel took 168us; with B copies and the down MMAs removed (quantize only) it
-// still took 158us against an x-read floor of ~100us, so the per-tile barrier
-// structure itself leaves DRAM idle, and it couples the quantize and down warps.
+// thread both a loader and a consumer. Those barriers couple the quantize and
+// down warps and prevent either group from advancing independently.
 //
 // Here one producer warp streams x tiles (and the matching K-major L2T tile and
 // pre-quant-scale slice) into an N-stage shared-memory ring with 2-D TMA
@@ -24,18 +22,8 @@
 // split evenly across CTAs in 16-row units so there is no partial wave, and
 // each CTA walks its rows in chunks of TileM.
 //
-// Measured on RTX PRO 5000 (SM120, 110 SMs), 16384x3072x3072 cold L2:
-//   - per-row 1-D cp.async.bulk copies instead of TMA boxes: 459us (copy issue
-//     bound); TMA boxes: 150us.
-//   - quantize-only ablation (no B, no down warps) at the same K64 tiling:
-//     145us; with K256 stages 134us; standalone nvfp4_quantize_smooth 128us.
-//     The full kernel is ~5us over its own quantize-only ablation, and doubling
-//     the down warps recovers <2us, so it is the x/quantize stream at K64, not
-//     the LoRA-down MMAs, that bounds it. Wider K stages do not fit: a K64
-//     rank-128 B tile is 16 KB per stage, and row tiles under ~144 rows re-read
-//     L2T often enough to lose more than they gain (32x128: 158us).
-//   - reading B fragments straight from global/L2 (no B stage) to free shared
-//     memory for wider x stages: 152-275us, slower in every configuration.
+// A K64 rank-128 B tile uses 16 KB per stage. Wider K stages compete with
+// the x buffers for shared memory, while smaller row tiles increase L2T reads.
 //
 // Outputs are bit-identical to nvfp4_quantize_smooth for xq/sf (the same
 // quantizeSmoothed16 per 16-element block, SF zero-filled for rows in
@@ -535,7 +523,7 @@ inline cudaError_t launch_ws_kernel(void const* x, void const* pre_quant_scale,
     static_assert(Cfg::kSub < 30, "producer lanes");
     if (!ws_make_map(&b_map, l2t_kmajor, kRank, k, kRank)) return cudaErrorInvalidValue;
     auto* const kernel = nvfp4_smooth_quantize_lora_down_ws_sm120_kernel<Cfg>;
-    static cudaError_t const attribute_status =
+    cudaError_t const attribute_status =
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg::kSmemBytes);
     if (attribute_status != cudaSuccess) return attribute_status;
     kernel<<<grid, Cfg::kThreads, Cfg::kSmemBytes, stream>>>(

@@ -207,14 +207,15 @@ int nvfp4_svdquant_gemm_fallback_tactic(int m, int n, int k, int lora_rank) {
 
 // Fused residual NVFP4 GEMM + rank-32 LoRA-up: D @ L1ᵀ via the 2nd bf16 mma.sync in the custom
 // collective. 1/alpha folded into L1 so the epilogue yields alpha*residual + D@L1ᵀ + bias.
-// defer_lora_down_wait: see RuntimeTacticSm120; only the fused linear route sets it.
+// The fused linear route supplies a quantize-output barrier to overlap LoRA-down.
 void nvfp4_svdquant_gemm_run_sm120(void* out, void const* A, void const* B, void const* sfa,
                                    void const* sfb, float const* alpha, void const* D,
                                    void const* L1, void const* bias, int m, int n, int k,
                                    int lora_rank, char* ws, size_t wsBytes, cudaStream_t stream,
-                                   int tactic, bool enable_pdl, bool defer_lora_down_wait) {
+                                   int tactic, bool enable_pdl,
+                                   SvdquantQuantizeBarrierSm120 quantize_barrier) {
   auto rt = sd::decode_runtime_tactic(tactic);
-  rt.defer_lora_down_wait = defer_lora_down_wait;
+  rt.quantize_barrier = quantize_barrier;
   // The production entry never supplies the inline-down pointers, so every config
   // selected by kCompileInlineDownSm120 runs the variant that compiles the dead
   // path out. The selection is per config because compiling it out regresses the
@@ -236,7 +237,7 @@ void nvfp4_svdquant_gemm_run(void* out, void const* A, void const* B, void const
                              void const* bias, int m, int n, int k, int lora_rank, char* ws,
                              size_t wsBytes, cudaStream_t stream, int tactic, bool enable_pdl) {
   nvfp4_svdquant_gemm_run_sm120(out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, ws,
-                                wsBytes, stream, tactic, enable_pdl, false);
+                                wsBytes, stream, tactic, enable_pdl, {});
 }
 
 void nvfp4_svdquant_gemm_run_inline_down(void* out, void const* A, void const* B, void const* sfa,
@@ -527,12 +528,11 @@ void nvfp4_quantize_smooth_lora_down_geometry_sm120(TensorView x, TensorView pqs
                                                     int geometry_variant);
 // Producer entry that takes the geometry as numbers rather than as an index
 // into a ladder both languages have to agree on; see nvfp4_smooth_quantize_sm100.cu.
-void nvfp4_quantize_smooth_lora_down_dyn_sm120_impl(TensorView x, TensorView pqs,
-                                                    TensorView global_scale,
-                                                    TensorView l2t_smoothed, TensorView xq,
-                                                    TensorView sf, TensorView down, int family,
-                                                    int tiling0, int tiling1, int tiling2,
-                                                    int address_policy, bool signal_launch);
+void nvfp4_quantize_smooth_lora_down_dyn_sm120_impl(
+    TensorView x, TensorView pqs, TensorView global_scale, TensorView l2t_smoothed, TensorView xq,
+    TensorView sf, TensorView down, int family, int tiling0, int tiling1, int tiling2,
+    int address_policy, bool signal_launch,
+    flashinfer::gemm::SvdquantQuantizeBarrierSm120 quantize_barrier);
 
 void nvfp4_quantize_smooth_lora_down_overlap_sm120(TensorView x, TensorView pqs,
                                                    TensorView global_scale, TensorView l2t_smoothed,
@@ -576,12 +576,11 @@ void nvfp4_quantize_smooth_lora_down_cublaslt_sm120(TensorView x, TensorView pqs
 // D [m, 32] = x_hat @ L2ᵀ (bf16) and L1 [n, 32] = svdquant_lora_b / alpha (bf16; 1/alpha folded so
 // the epilogue out = alpha * acc yields the LoRA). One module serves one LoRA rank;
 // any other rank is rejected. out [m, n] bf16, allocated by the caller.
-void nvfp4_svdquant_gemm_impl(TensorView a, TensorView b, TensorView a_sf, TensorView b_sf,
-                              TensorView alpha, TensorView d, TensorView l1,
-                              Optional<TensorView> const& bias, TensorView out,
-                              TensorView workspace_buffer, int64_t tactic, bool enable_pdl,
-                              void const* inline_down_x, void const* inline_down_l2t,
-                              bool defer_lora_down_wait = false) {
+void nvfp4_svdquant_gemm_impl(
+    TensorView a, TensorView b, TensorView a_sf, TensorView b_sf, TensorView alpha, TensorView d,
+    TensorView l1, Optional<TensorView> const& bias, TensorView out, TensorView workspace_buffer,
+    int64_t tactic, bool enable_pdl, void const* inline_down_x, void const* inline_down_l2t,
+    flashinfer::gemm::SvdquantQuantizeBarrierSm120 quantize_barrier = {}) {
   CHECK_INPUT_AND_TYPE(a, FLOAT4_E2M1X2);
   CHECK_INPUT_AND_TYPE(b, FLOAT4_E2M1X2);
   CHECK_INPUT_AND_TYPE(a_sf, SF_DTYPE);
@@ -694,7 +693,7 @@ void nvfp4_svdquant_gemm_impl(TensorView a, TensorView b, TensorView a_sf, Tenso
         static_cast<float const*>(alpha.data_ptr()), d.data_ptr(), l1.data_ptr(), biasPtr,
         static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), static_cast<int>(loraRank),
         reinterpret_cast<char*>(workspace_buffer.data_ptr()), requiredWorkspaceBytes, stream,
-        tacticId, enable_pdl, defer_lora_down_wait);
+        tacticId, enable_pdl, quantize_barrier);
   }
 }
 
@@ -709,12 +708,11 @@ void nvfp4_svdquant_gemm(TensorView a, TensorView b, TensorView a_sf, TensorView
 #if defined(FLASHINFER_ENABLE_SVDQ_SM120_K1_K2_FUSION)
 // Both the L2T layout and the producer kernel are selected by the producer half
 // of the runtime tactic.
-void dispatch_svdquant_producer_sm120(TensorView x, TensorView pqs, TensorView global_scale,
-                                      TensorView l2t_smoothed, TensorView xq, TensorView a_sf,
-                                      TensorView down, TensorView workspace_buffer,
-                                      int producer_family = -1, int tiling0 = 0, int tiling1 = 0,
-                                      int tiling2 = 0, int address_policy = 0,
-                                      bool enable_pdl = false) {
+void dispatch_svdquant_producer_sm120(
+    TensorView x, TensorView pqs, TensorView global_scale, TensorView l2t_smoothed, TensorView xq,
+    TensorView a_sf, TensorView down, TensorView workspace_buffer, int producer_family = -1,
+    int tiling0 = 0, int tiling1 = 0, int tiling2 = 0, int address_policy = 0,
+    bool enable_pdl = false, flashinfer::gemm::SvdquantQuantizeBarrierSm120 quantize_barrier = {}) {
   if (producer_family == 3) {
     nvfp4_quantize_smooth_lora_down_cublaslt_sm120(x, pqs, global_scale, l2t_smoothed, xq, a_sf,
                                                    down, workspace_buffer);
@@ -724,7 +722,8 @@ void dispatch_svdquant_producer_sm120(TensorView x, TensorView pqs, TensorView g
     nvfp4_quantize_smooth_lora_down_dyn_sm120_impl(
         x, pqs, global_scale, l2t_smoothed, xq, a_sf, down, producer_family, tiling0, tiling1,
         tiling2, address_policy,
-        (producer_family == 4 || producer_family == 1 || producer_family == 6) && enable_pdl);
+        (producer_family == 4 || producer_family == 1 || producer_family == 6) && enable_pdl,
+        quantize_barrier);
     return;
   }
   nvfp4_quantize_smooth_lora_down_geometry_sm120(x, pqs, global_scale, l2t_smoothed, xq, a_sf, down,
@@ -778,10 +777,47 @@ void nvfp4_svdquant_linear_sm120(TensorView x, TensorView pqs, TensorView global
   // the L2T layout before this call, so layout and dispatch cannot disagree.
   namespace prefix_route = flashinfer::gemm::svdquant_sm120_prefix_route;
   int const k3_row = prefix_route::k3_row_of(tactic);
+  flashinfer::gemm::SvdquantQuantizeBarrierSm120 quantize_barrier{};
+  if (enable_pdl && address_policy == 1 && (producer_family == 1 || producer_family == 6) &&
+      x.ndim() == 2 && b.ndim() == 2 && down.ndim() == 2 && down.size(1) == 128 && x.size(0) > 0 &&
+      tiling0 > 0 && (producer_family != 6 || tiling2 > 0)) {
+    CHECK_INPUT_AND_TYPE(workspace_buffer, dl_uint8);
+    CHECK_DEVICE(workspace_buffer, x);
+    TVM_FFI_ICHECK(fits_nonnegative_int(x.size(0)) && fits_nonnegative_int(x.size(1)) &&
+                   fits_nonnegative_int(b.size(0)))
+        << "SM120 linear dimensions must fit in int32";
+    int const m = static_cast<int>(x.size(0));
+    int const n = static_cast<int>(b.size(0));
+    int const k = static_cast<int>(x.size(1));
+    int const row =
+        k3_row < 0 ? flashinfer::gemm::nvfp4_svdquant_gemm_fallback_tactic(m, n, k, 128) : k3_row;
+    if (row >= 0) {
+      auto const required = flashinfer::gemm::nvfp4_svdquant_gemm_workspace_size(m, n, k, row);
+      auto const bytes = static_cast<std::size_t>(workspace_buffer.numel());
+      // Use an aligned tail outside the GEMM workspace. Exact-sized callers
+      // retain the full-grid wait instead of requiring additional storage.
+      if (bytes >= required + 8 &&
+          reinterpret_cast<std::uintptr_t>(workspace_buffer.data_ptr()) % alignof(unsigned int) ==
+              0) {
+        auto const offset = (bytes - sizeof(unsigned int)) & ~(sizeof(unsigned int) - 1);
+        auto* counter = reinterpret_cast<unsigned int*>(
+            static_cast<char*>(workspace_buffer.data_ptr()) + offset);
+        std::int64_t const items = ((static_cast<std::int64_t>(m) + 127) / 128 * 128) * (k / 16);
+        std::int64_t const splits = producer_family == 6 ? tiling2 : 1;
+        std::int64_t const blocks =
+            ((items + tiling0 - 1) / tiling0 + splits - 1) / splits * splits;
+        TVM_FFI_ICHECK(blocks > 0 && blocks <= std::numeric_limits<int>::max())
+            << "SM120 quantize grid exceeds int32";
+        cudaError_t const status = cudaMemsetAsync(counter, 0, sizeof(*counter), stream);
+        TVM_FFI_ICHECK_EQ(status, cudaSuccess) << cudaGetErrorString(status);
+        quantize_barrier = {counter, static_cast<unsigned int>(blocks)};
+      }
+    }
+  }
   dispatch_svdquant_producer_sm120(
       x, pqs, global_scale, l2t_smoothed, xq, a_sf, down, workspace_buffer,
       static_cast<int>(producer_family), static_cast<int>(tiling0), static_cast<int>(tiling1),
-      static_cast<int>(tiling2), static_cast<int>(address_policy), enable_pdl);
+      static_cast<int>(tiling2), static_cast<int>(address_policy), enable_pdl, quantize_barrier);
   if (configure_case7_persisting_l2) {
     std::size_t const max_budget = static_cast<std::size_t>(max_persisting_l2_bytes);
     std::size_t const xq_budget = max_budget > sf_bytes ? max_budget - sf_bytes : 0;
@@ -790,13 +826,10 @@ void nvfp4_svdquant_linear_sm120(TensorView x, TensorView pqs, TensorView global
     TVM_FFI_ICHECK_EQ(status, cudaSuccess)
         << "failed to configure case-7 XQ persisting-L2 window: " << cudaGetErrorString(status);
   }
-  // Under address policy 1 the rank-128 small-M prefix signals PDL launch only
-  // once its quantize CTAs have exited (XQ/SF fenced), so the GEMM may start its
-  // FP4 mainloop at once and wait for the prefix grid only before LoRA-down.
-  bool const defer_lora_down_wait = (producer_family == 1 || producer_family == 6) &&
-                                    address_policy == 1 && down.size(1) == 128 && enable_pdl;
+  // The GEMM acquires quantize stores before its FP4 mainloop, then waits on
+  // the prefix grid before consuming LoRA-down.
   nvfp4_svdquant_gemm_impl(xq, b, a_sf, b_sf, alpha, down, l1, bias, out, workspace_buffer, k3_row,
-                           enable_pdl, nullptr, nullptr, defer_lora_down_wait);
+                           enable_pdl, nullptr, nullptr, quantize_barrier);
   if (configure_case7_persisting_l2) {
     cudaError_t const status = clear_xq_persisting_l2(stream);
     TVM_FFI_ICHECK_EQ(status, cudaSuccess)

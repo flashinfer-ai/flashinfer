@@ -83,8 +83,10 @@ class _CutlassAutoRunner(TunableRunner):
                 a.device, a.shape[0], b.shape[0], k, down.shape[1]
             ),
         )
-        workspace = cutlass._get_cache_buf(
-            "nvfp4_svdquant_gemm_workspace", size, a.device
+        workspace = (
+            cutlass._sm120_linear_workspace(size, a.device, down.shape[1])
+            if self.linear
+            else cutlass._get_cache_buf("nvfp4_svdquant_gemm_workspace", size, a.device)
         )
         if self.linear:
             # Native tactic queries read original operands and workspace only.

@@ -104,6 +104,7 @@
 // Hook-enabled epilogue copy + the subtile-hook helpers the kernel below threads
 // through the store loop.
 #include "flashinfer/gemm/nvfp4_svdquant_gemm_epilogue_sm120.h"
+#include "flashinfer/gemm/svdquant_quantize_barrier_sm120.cuh"
 
 namespace cutlass::gemm::collective {
 using namespace cute;
@@ -425,9 +426,8 @@ struct CollectiveMmaLoRaSm120 {
   static constexpr bool UseRow80SideSlot = UseDedicatedLoRaTma && Row80ProductionTraits_;
   // K256 stages hold 128-byte bf16 rows. Where a whole 64-column chunk is folded (rank 64
   // and up), mma_lora reads it with ldmatrix through the 128-byte swizzle the row80
-  // production path already uses. With unswizzled 32-bit LDS the rank-128 fold took
-  // ~6.5k cycles per tile at M=64 (5KP, 128x32x256), longer than its two stages' DRAM
-  // round trip. Row80 keeps its own layout and copies.
+  // production path already uses, avoiding bank conflicts in the LoRA loads.
+  // Row80 keeps its own layout and copies.
   static constexpr bool UseLoRaSmemLdsm128 = SVDQ_SM120_LORA_LDSM && !Row80ProductionTraits_ &&
                                              LoRaPath_ == Sm120LoRaPath::kByteExactMainloop &&
                                              LoRaStorageK == 64 && LoRaChunkK == 64;
@@ -438,8 +438,7 @@ struct CollectiveMmaLoRaSm120 {
       UseLoRaSmemLdsm128;
   // Multi-chunk ranks on K128 stages (rank 64 and up) fold LoRaChunks stage-wide
   // chunks in mma_lora. Their 64-byte rows are read with ldmatrix through a
-  // 64-byte swizzle; with narrow unswizzled LDS the tail showed 2.5x the shared
-  // bank conflicts and mio_throttle 0.35 -> 0.97 at rank 128. Single-chunk
+  // 64-byte swizzle to avoid bank conflicts in the tail. Single-chunk
   // (rank-32) builds keep their layout and copies.
   static constexpr bool UseLoRaSmemSwizzle64 = SVDQ_SM120_LORA_LDSM &&
                                                LoRaPath_ == Sm120LoRaPath::kByteExactMainloop &&
@@ -715,10 +714,9 @@ struct CollectiveMmaLoRaSm120 {
     int inline_down_m{0};
     int inline_down_k{0};
     bool inline_down_wait_on_n{false};
-    // Set by the fused linear route when its prefix launches this GEMM only after
-    // XQ/SF are complete: the producer then waits for the prefix grid just before
-    // loading LoRA-down instead of before its first A load.
-    bool defer_lora_down_wait{false};
+    // The fused linear route publishes XQ/SF through this barrier. The producer
+    // acquires it before loading A and waits for the prefix grid before LoRA-down.
+    flashinfer::gemm::SvdquantQuantizeBarrierSm120 quantize_barrier{};
   };
 
   // Device side kernel params
@@ -804,7 +802,7 @@ struct CollectiveMmaLoRaSm120 {
     int inline_down_m = 0;
     int inline_down_k = 0;
     bool inline_down_wait_on_n = false;
-    bool defer_lora_down_wait = false;
+    flashinfer::gemm::SvdquantQuantizeBarrierSm120 quantize_barrier{};
   };
 
   //
@@ -878,7 +876,7 @@ struct CollectiveMmaLoRaSm120 {
     params.inline_down_m = args.inline_down_m;
     params.inline_down_k = args.inline_down_k;
     params.inline_down_wait_on_n = args.inline_down_wait_on_n;
-    params.defer_lora_down_wait = args.defer_lora_down_wait;
+    params.quantize_barrier = args.quantize_barrier;
     if constexpr (UseLoRaPipeline) {
       auto tensor_d_dedicated = cute::recast<LoRaDedicatedTmaInternalElement>(tensor_d);
       auto tensor_l1_dedicated = cute::recast<LoRaDedicatedTmaInternalElement>(tensor_l1);
@@ -1323,7 +1321,7 @@ struct CollectiveMmaLoRaSm120 {
         if constexpr (CompileInlineDown) {
           wait_for_inline_lora_down(params, m_coord, n_coord);
         }
-        if (params.defer_lora_down_wait) {
+        if (params.quantize_barrier.counter != nullptr) {
           // LoRA-down is the one prefix output still in flight; see the producer.
           cutlass::arch::wait_on_dependent_grids();
         }
@@ -1456,7 +1454,7 @@ struct CollectiveMmaLoRaSm120 {
         if constexpr (CompileInlineDown) {
           wait_for_inline_lora_down(params, m_coord, n_coord);
         }
-        if (params.defer_lora_down_wait) {
+        if (params.quantize_barrier.counter != nullptr) {
           // LoRA-down is the one prefix output still in flight; see the producer.
           cutlass::arch::wait_on_dependent_grids();
         }
@@ -2506,10 +2504,11 @@ class GemmUniversalLoRaSm120 {
 
       // Mainloop Producer Warp
       else if (producer_warp_role == ProducerWarpRole::Mainloop) {
-        if (params.mainloop.defer_lora_down_wait) {
-          // The prefix fenced XQ/SF and let this grid launch only after its quantize
-          // CTAs exited, so the FP4 mainloop overlaps the LoRA-down still running;
-          // load() waits for the prefix grid before the LoRA-down TMA.
+        if (params.mainloop.quantize_barrier.counter != nullptr) {
+          // Acquire the quantize CTAs' stores before the generic-to-async proxy
+          // fence. Launch completion alone does not make XQ/SF visible. load()
+          // still waits for the prefix grid before reading LoRA-down through TMA.
+          params.mainloop.quantize_barrier.wait();
           asm volatile("fence.proxy.async.global;" ::: "memory");
         } else {
           cutlass::arch::wait_on_dependent_grids();

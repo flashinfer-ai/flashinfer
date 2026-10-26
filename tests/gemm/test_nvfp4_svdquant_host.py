@@ -1882,7 +1882,7 @@ def test_rank128_offers_small_m_after_existing_producers(m: int, k: int) -> None
         assert [policy for _, _, policy in family_variants] == [0] * len(early) + [
             1
         ] * len(deferred)
-    assert routes.sm120_linear_route_abi_version(m, k, 128) == 16
+    assert routes.sm120_linear_route_abi_version(m, k, 128) == 17
 
 
 # Workspace provisioning and cached tactic feasibility.
@@ -2875,7 +2875,12 @@ QUANT_HEADER: Final = (
 
 def _function(source: str, signature: str) -> str:
     start = source.index(signature)
-    opening = source.index("{", start)
+    position = start + len(signature)
+    parentheses = signature.count("(") - signature.count(")")
+    while parentheses:
+        parentheses += (source[position] == "(") - (source[position] == ")")
+        position += 1
+    opening = source.index("{", position - 1)
     depth = 1
     closing = opening + 1
     while depth:
@@ -3472,6 +3477,7 @@ int get_stream(Device) { return 0; }
 const char* cudaGetErrorString(int) { return "CUDA stub"; }
 int cudaGetLastError() { return cudaSuccess; }
 namespace flashinfer::gemm {
+struct SvdquantQuantizeBarrierSm120 {};
 template<class... Args> void nvfp4_smooth_quantize(Args...) { ++backend_calls; }
 template<int Rank, class... Args> int nvfp4_smooth_quantize_lora_down_sm120(Args...) {
   ++backend_calls;

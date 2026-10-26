@@ -25,16 +25,38 @@ from flashinfer.autotune_cache import MeasurementPolicy
 from flashinfer.autotuner import AutoTuner, _tactic_to_json
 
 
-Backend: TypeAlias = str
+Backend = Literal["cute-dsl", "cutlass-sm120", "auto"]
 Operation = Literal["gemm", "linear"]
 TuningL2 = Literal["operator", "warm", "cold"]
 JsonValue: TypeAlias = (
     str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
 )
-# SVDQ_BENCH_BACKENDS overrides the compared set (comma-separated); the first entry is the
-# accuracy reference and the speedup denominator.
-BACKENDS: Final[tuple[Backend, ...]] = tuple(
-    os.environ.get("SVDQ_BENCH_BACKENDS", "cute-dsl,cutlass-sm120,auto").split(",")
+
+
+class InvalidBackendsError(ValueError):
+    def __init__(self, value: str) -> None:
+        self.value = value
+        super().__init__(
+            "SVDQ_BENCH_BACKENDS must list cute-dsl, cutlass-sm120 or auto; "
+            f"got {value!r}"
+        )
+
+
+def parse_backends(value: str) -> tuple[Backend, ...]:
+    """Validate backend names while preserving reference order and removing duplicates."""
+    selected: list[Backend] = []
+    for token in value.split(","):
+        match token.strip():
+            case "cute-dsl" | "cutlass-sm120" | "auto" as backend:
+                selected.append(backend)
+            case _:
+                raise InvalidBackendsError(value)
+    return tuple(dict.fromkeys(selected))
+
+
+# The first backend supplies the accuracy reference and speedup denominator.
+BACKENDS: Final = parse_backends(
+    os.environ.get("SVDQ_BENCH_BACKENDS", "cute-dsl,cutlass-sm120,auto")
 )
 REDUCTION_ELEMENTS: Final = 1 << 20
 
@@ -267,7 +289,11 @@ def make_call(
                 case.pqs,
                 # Prepared once, as a model loader does; graph replay then
                 # reuses the derived layouts instead of re-laying them out.
-                prepare_svdquant_l2t(case.l2t),
+                (
+                    prepare_svdquant_l2t(case.l2t)
+                    if backend in ("cutlass-sm120", "auto")
+                    else case.l2t
+                ),
                 case.l1,
                 case.global_sf,
             )

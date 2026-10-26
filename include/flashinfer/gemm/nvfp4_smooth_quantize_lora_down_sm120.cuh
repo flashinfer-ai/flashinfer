@@ -15,6 +15,7 @@
 
 #include "flashinfer/gemm/nvfp4_smooth_quantize_lora_down_ws_sm120.cuh"
 #include "flashinfer/gemm/nvfp4_smooth_quantize_sm100.cuh"
+#include "flashinfer/gemm/svdquant_quantize_barrier_sm120.cuh"
 
 namespace flashinfer::gemm {
 
@@ -306,7 +307,8 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
     quant::Type const* __restrict__ x, quant::Type const* __restrict__ pre_quant_scale,
     float const* __restrict__ global_scale, std::uint64_t* __restrict__ xq,
     std::uint8_t* __restrict__ sf, quant::Type const* __restrict__ l2t_smoothed,
-    quant::Type* __restrict__ down, int M, int K) {
+    quant::Type* __restrict__ down, int M, int K,
+    SvdquantQuantizeBarrierSm120 quantize_barrier = {}) {
   constexpr int kRank = Rank;
   // Rank only sets how many DownTileCols-wide column tiles the down CTAs cover;
   // a CTA's fragments, shared accumulator and K split do not depend on it.
@@ -362,9 +364,8 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
     float const scale = global_scale[0];
     if constexpr (Rank > 64) {
       // One (row, scale column) item per thread over the whole padded SF tile,
-      // padding rows included (zero scales). Graph-replay ablation at M=64: the
-      // row-blocked loop's M / RowsPerQuantBlock CTAs took 4.1 us (K=3072) and
-      // 9.1 us (K=12288) alone; a flat split over enough CTAs, 2.9 and 4.0 us.
+      // padding rows included (zero scales). Splitting by item exposes more
+      // independent CTAs than splitting only by row for small M and large K.
       std::int64_t const items = static_cast<std::int64_t>(kPaddedM) * kSfCols;
       std::int64_t const item = static_cast<std::int64_t>(block) * BlockThreads + threadIdx.x;
       if (item < items) {
@@ -388,6 +389,7 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
       if constexpr (GateLaunchOnQuant) {
         // Exiting is this CTA's launch signal; see the top of the kernel.
         __threadfence();
+        quantize_barrier.arrive();
       }
       return;
     }
@@ -619,7 +621,8 @@ template <int BlockThreads, int DownTileCols, int RowsPerQuantBlock, bool Packed
 inline cudaError_t launch_small_m_dyn_kernel(void const* x, void const* pre_quant_scale,
                                              float const* global_scale, void* xq, void* sf,
                                              void const* l2t_smoothed, void* down, int m, int k,
-                                             cudaStream_t stream) {
+                                             cudaStream_t stream,
+                                             SvdquantQuantizeBarrierSm120 quantize_barrier = {}) {
   constexpr int kRank = Rank;
   constexpr int kDownWarps = BlockThreads / 32;
   constexpr int kNFragments = DownTileCols / kMmaN;
@@ -668,13 +671,14 @@ inline cudaError_t launch_small_m_dyn_kernel(void const* x, void const* pre_quan
                          static_cast<quant::Type const*>(pre_quant_scale), global_scale,
                          static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
                          static_cast<quant::Type const*>(l2t_smoothed),
-                         static_cast<quant::Type*>(down), m, k);
+                         static_cast<quant::Type*>(down), m, k, quantize_barrier);
     } else {
       // Keep the primary's ordinary stream dependency, including the preceding GEMM.
       kernel<<<grid_blocks, BlockThreads, 0, stream>>>(
           static_cast<quant::Type const*>(x), static_cast<quant::Type const*>(pre_quant_scale),
           global_scale, static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
-          static_cast<quant::Type const*>(l2t_smoothed), static_cast<quant::Type*>(down), m, k);
+          static_cast<quant::Type const*>(l2t_smoothed), static_cast<quant::Type*>(down), m, k,
+          quantize_barrier);
     }
     return cudaGetLastError();
   }
@@ -701,9 +705,8 @@ constexpr int large_m_down_warps(int rank) { return rank <= 64 ? rank / 8 : 8; }
 
 // Wide ranks read L2T from a K-major copy, l2[rank][K] stored in the [K, rank]
 // tensor. Row-major L2T makes each B-fragment pair two bf16 reads 2*Rank bytes
-// apart, so a warp's load touches 32 lines for 64 useful bytes; at rank 128 the
-// prefix lost ~50us of a ~160us run to those loads (16384x3072, removing them
-// left 106us). K-major turns each pair into one aligned 32-bit read and a warp
+// apart, so a warp's load touches 32 lines for 64 useful bytes.
+// K-major turns each pair into one aligned 32-bit read and a warp
 // load into eight 16-byte segments. Rank 32/64 keep the row-major layout.
 constexpr bool large_m_kmajor_l2(int rank) { return rank > 64; }
 
@@ -983,9 +986,7 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_large_m_dyn
       } else {
         // Wide rank: one A fragment per m16 block feeds kFrags adjacent n8 MMAs.
         // Every B fragment of the tile is issued before the first MMA so the
-        // global-load latency overlaps instead of serialising each k step
-        // (removing these loads entirely took the 16384x3072 rank-128 prefix
-        // from ~160us to ~106us; a layout change alone recovered nothing).
+        // global-load latency overlaps instead of serialising each k step.
         constexpr int kKSteps = kTileK / 16;
         std::uint32_t b0[kKSteps][kFrags];
         std::uint32_t b1[kKSteps][kFrags];
@@ -1189,9 +1190,7 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_large_m_dyn
 // The K128 wide-rank path above reads its B fragments with per-fragment global
 // loads at the start of every k tile, so those loads -- their latency and the
 // L2 traffic of every CTA re-reading the whole L2T -- sit on the down warps'
-// critical path once per tile. At 16384x3072 rank 128 (best geometry,
-// 384x80x128) the prefix took 170us; the same kernel with the B loads removed
-// took 142us, and with B loads that always hit one cached tile, 156us. Here each
+// critical path once per tile. Here each
 // down warp copies its own B slice of the next tile with cp.async while it runs
 // the current one, and reads the current one from shared memory. A K128 tile's
 // 32 KB B tile does not fit next to two x buffers at two CTAs per SM, which is
@@ -1351,8 +1350,7 @@ __launch_bounds__(BlockThreads, 3 - staged_b_row_split(KernelTileM)) void nvfp4_
       std::uint32_t b0[kKSteps][kFrags];
       std::uint32_t b1[kKSteps][kFrags];
       // ldmatrix replaces four 32-bit shared loads per fragment pair (B) and per
-      // m16 block (A): at 32640x4096x11008 those loads were 29% of the stall
-      // samples (MIO throttle) and the A loads 80 instructions per warp per tile.
+      // m16 block (A), reducing shared-memory instruction issue pressure.
       // Lane l addresses row l % 8 of matrix l / 8; the matrices are ordered as
       // the mma operands below, so the fragments are bit-identical.
       int const ld_row = lane % 8;
@@ -1545,7 +1543,7 @@ inline cudaError_t launch_large_m_dyn_kernel(void const* x, void const* pre_quan
       auto* const kernel = nvfp4_smooth_quantize_lora_down_large_m_staged_b_sm120_kernel<
           BlockThreads, LongK, kKernelTileM, TileK, Policy, Rank>;
       if constexpr (kStagedSharedBytes > 48 * 1024) {
-        static cudaError_t const attribute_status = cudaFuncSetAttribute(
+        cudaError_t const attribute_status = cudaFuncSetAttribute(
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kStagedSharedBytes);
         if (attribute_status != cudaSuccess) return attribute_status;
       }
@@ -1680,7 +1678,8 @@ template <int Rank = 32>
 inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
     void const* x, void const* pre_quant_scale, float const* global_scale, void* xq, void* sf,
     void const* l2t_smoothed, void* down, int m, int k, int family, int a, int b, int c,
-    int address_policy, cudaStream_t stream, bool signal_launch = false) {
+    int address_policy, cudaStream_t stream, bool signal_launch = false,
+    SvdquantQuantizeBarrierSm120 quantize_barrier = {}) {
   namespace large_m = smooth_quantize_lora_down_large_m_sm120_detail;
   namespace small_m = smooth_quantize_lora_down_small_m_sm120_detail;
   using large_m::DynAddress;
@@ -1702,7 +1701,8 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
   if (a == (BT) && b == (DTC) && c == (KS)) {                                              \
     if (signal_launch && address_policy == 1) {                                            \
       return small_m::launch_small_m_dyn_kernel<BT, DTC, 4, false, true, Rank, true, KS>(  \
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);     \
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream,      \
+          quantize_barrier);                                                               \
     }                                                                                      \
     if (signal_launch) {                                                                   \
       return small_m::launch_small_m_dyn_kernel<BT, DTC, 4, false, true, Rank, false, KS>( \
@@ -1761,7 +1761,8 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
     if constexpr (Rank == 128) {                                                           \
       if (signal_launch && address_policy == 1) {                                          \
         return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, false, true, Rank, true>( \
-            x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);   \
+            x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream,    \
+            quantize_barrier);                                                             \
       }                                                                                    \
       if (signal_launch) {                                                                 \
         return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, false, true, Rank>(       \

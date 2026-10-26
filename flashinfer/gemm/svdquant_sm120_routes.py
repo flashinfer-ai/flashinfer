@@ -26,8 +26,8 @@ SM120_TACTIC_ABI_VERSION: Final = 3
 SM120_LINEAR_ROUTE_ABI_VERSION: Final = 5
 SM120_PACKED_SMALL_M_ROUTE_ABI_VERSION: Final = 10
 SM120_RANK64_FUSED_ROUTE_ABI_VERSION: Final = 11
-# 16: the split-K small-M producer family joined the rank-128 candidates.
-SM120_RANK128_FUSED_ROUTE_ABI_VERSION: Final = 16
+# 17: rank-128 PDL routes include an explicit quantize-output handoff.
+SM120_RANK128_FUSED_ROUTE_ABI_VERSION: Final = 17
 
 # Historical route versions remain the fallback for shapes without the new
 # packed small-M family. Candidate admission below determines the v10 scope.

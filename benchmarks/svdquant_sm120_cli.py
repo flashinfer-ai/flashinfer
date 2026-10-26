@@ -72,7 +72,7 @@ def parse_options(
     )
     parser.add_argument("--output", type=Path, help="JSONL file; default: stdout")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--rank", type=int, choices=(32, 64, 96, 128), action="append")
+    parser.add_argument("--rank", type=int, choices=(32, 64, 128), action="append")
     parser.add_argument(
         "--untuned", action="store_true", help="measure defaults without autotuning"
     )

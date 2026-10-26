@@ -79,9 +79,9 @@ def get_nvfp4_svdquant_sm120_module(lora_rank: int = SVDQUANT_LORA_RANK_GRANULAR
 
     A rank a given tile cannot stage still compiles that tile at rank 32; the
     collective's ``can_implement`` then refuses it, so the autotuner simply sees
-    a smaller candidate plane rather than a build failure. Today only the K256
-    tiles (11 of 31 configs) stage rank 64, because the byte-exact path overlays
-    the rank tile on a residual stage worth TileK/4 bf16 columns.
+    smaller candidate set rather than a build failure. The byte-exact path
+    overlays LoRA chunks on residual stages and supports ranks 64 and 128
+    through multiple chunks when the whole rank does not fit one stage.
     """
     return gen_gemm_sm120_module_cutlass_nvfp4_svdquant(
         lora_rank=lora_rank
@@ -184,6 +184,19 @@ def _prepared_l2t_layout(
     return entry[2].get(layout)
 
 
+def _sm120_linear_workspace(size: int, device: torch.device, rank: int) -> torch.Tensor:
+    """Keep the quantize handoff private to each stream or captured graph."""
+    name = "nvfp4_svdquant_gemm_workspace"
+    if rank == 128:
+        size += 8  # Aligned completion counter beyond every GEMM tactic's scratch.
+        if device.type == "cuda":
+            if torch.cuda.is_current_stream_capturing():
+                # Graphs can share a capture stream and replay on different streams.
+                return torch.empty(size, dtype=torch.uint8, device=device)
+            name += f"_stream_{torch.cuda.current_stream(device).cuda_stream}"
+    return _get_cache_buf(name, size, device)
+
+
 def prepare_sm120_l2t(l2t_smoothed: torch.Tensor) -> None:
     """Build every L2T layout an SM120 fused producer may read for this matrix.
 
@@ -191,16 +204,27 @@ def prepare_sm120_l2t(l2t_smoothed: torch.Tensor) -> None:
     rank-32 packed layout (for K in the packed set) and the rank-128 K-major
     layout are both built when they can apply.
     """
+    if l2t_smoothed.is_cuda and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Prepare SVDQuant L2T before CUDA graph capture")
     rank = l2t_smoothed.shape[1]
     layouts: dict[str, torch.Tensor] = {}
     if rank == 32 and l2t_smoothed.shape[0] in _SM120_M537_PACKED_L2T_K:
         layouts["m537"] = _pack_sm120_m537_l2t(l2t_smoothed)
-    if rank > 64:
+    if rank == 128:
         layouts["kmajor"] = _pack_sm120_kmajor_l2t(l2t_smoothed)
     key = _prepared_l2t_key(l2t_smoothed)
     if not layouts:
         _SM120_PREPARED_L2T.pop(key, None)
         return
+
+    previous = _SM120_PREPARED_L2T.get(key)
+    if previous is not None and previous[0]() is l2t_smoothed:
+        # Captured graphs retain these addresses. Refresh the existing storage,
+        # including layouts originally allocated in inference mode.
+        with torch.inference_mode():
+            for name, packed in layouts.items():
+                previous[2][name].copy_(packed)
+        layouts = previous[2]
 
     def discard(dead_ref: weakref.ReferenceType, *, key: tuple = key) -> None:
         current = _SM120_PREPARED_L2T.get(key)
@@ -580,8 +604,7 @@ def _sm120_fused_linear_runner(
             family, tiling, address_policy = _sm120_decode_producer_variant(
                 m_rt, k_rt, producer_variant, rank
             )
-            # M537 and packed small-M producers share the packed L2T layout;
-            # the remaining producers read the original row-major matrix.
+            # Each producer family selects its packed, K-major or row-major layout.
             fused_l2t_smoothed = _sm120_fused_l2t(
                 l2t_smoothed, m_rt, k_rt, producer_variant, rank
             )
@@ -1064,9 +1087,7 @@ def svdquant_linear(
     workspace_bytes = max(
         DEFAULT_WORKSPACE_SIZE, _sm120_max_workspace_bytes(x.device, m, n, k, rank)
     )
-    workspace_buffer = _get_cache_buf(
-        "nvfp4_svdquant_gemm_workspace", workspace_bytes, x.device
-    )
+    workspace_buffer = _sm120_linear_workspace(workspace_bytes, x.device, rank)
     inputs = [
         x,
         weight_fp4,
