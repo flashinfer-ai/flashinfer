@@ -644,14 +644,21 @@ def k_up_for_tp(tp: int) -> int:
     return LATENT // tp
 
 
-def front_s_tiles(i_local: int) -> int:
-    if i_local % B_HALF_N:
-        raise ValueError(f"I_LOCAL must be a multiple of {B_HALF_N}, got {i_local}")
-    return i_local // B_HALF_N
+def front_s_tiles(i_local: int, block_n: int = BLOCK_N) -> int:
+    """Shared column tiles: ``block_n / 2`` output columns per pair tile (CTA0 the gate rows, CTA1 the up rows); the
+    224-wide tile's last one holds the remainder (the kernel stores no column past ``I_local``)."""
+    half = block_n // CTA_GROUP
+    if block_n == BLOCK_N and i_local % half:
+        raise ValueError(f"I_LOCAL must be a multiple of {half}, got {i_local}")
+    return (i_local + half - 1) // half
 
 
-def front_n_tiles(i_local: int) -> int:
-    return FRONT_R_TILES + FRONT_L_TILES + front_s_tiles(i_local)
+def front_n_tiles(i_local: int, block_n: int = BLOCK_N) -> int:
+    return (
+        (NUM_EXPERTS + block_n - 1) // block_n
+        + LATENT // block_n
+        + front_s_tiles(i_local, block_n)
+    )
 
 
 def m_tiles_for(M: int) -> int:
@@ -717,9 +724,38 @@ def front_evict_first(m_tiles: int) -> bool:
     return (m_tiles // CTA_GROUP) <= FRONT_EVICT_FIRST_MAX_PAIR_ROWS
 
 
-def front_kernel_key(i_local: int, evict_first: bool = False) -> str:
-    """``front:i<I_local>[e1]``: the ``e1`` suffix names the ``evict_first`` weight-policy instance."""
-    return f"front:i{int(i_local)}" + ("e1" if evict_first else "")
+# Round-4 lever T1F stage 2: on 152-SM parts the TP1 front rows of more than 128 and at most 512 tokens (one and two
+# pair rows, evict_first weights) run the 224-wide pair tile: 4 router + 16 latent + 55 shared tiles (the last one 96
+# columns wide) give 75 per pair row, which fill 75 of the 76 resident clusters where the 256-wide tile's 66 leave 10
+# idle (two whole waves at two pair rows).  Whole tiles only; the same K order and accumulation as the 256-wide tile,
+# so the outputs are bit-identical.
+FRONT_N224_I_LOCAL = SHARED_INTERMEDIATE
+FRONT_N224_MAX_T = 512
+FRONT_N224_SM_COUNT = 152
+FRONT_N224_BLOCK_N = 224
+
+
+def front_block_n(M: int, i_local: int, sm_count: int = SM_COUNT) -> int:
+    """Pair-tile width of the prefill front GEMM instance for ``M`` tokens of one rank on a ``sm_count``-SM device."""
+    if (
+        int(i_local) == FRONT_N224_I_LOCAL
+        and DECODE_MAX_T < int(M) <= FRONT_N224_MAX_T
+        and int(sm_count) == FRONT_N224_SM_COUNT
+    ):
+        return FRONT_N224_BLOCK_N
+    return FRONT_BLOCK_N
+
+
+def front_kernel_key(
+    i_local: int, evict_first: bool = False, block_n: int = FRONT_BLOCK_N
+) -> str:
+    """``front:i<I_local>[e1][n224]``: the ``e1`` suffix names the ``evict_first`` weight-policy instance, ``n224`` the
+    224-wide pair tile."""
+    return (
+        f"front:i{int(i_local)}"
+        + ("e1" if evict_first else "")
+        + ("" if block_n == FRONT_BLOCK_N else f"n{int(block_n)}")
+    )
 
 
 @_cached_plan
@@ -728,16 +764,23 @@ def prefill_front_plan(
 ) -> dict[str, Any]:
     """Host plan of the prefill front GEMM (one persistent launch) for ``M`` tokens of one rank."""
     m_tiles = m_tiles_for(M)
-    n_tiles = front_n_tiles(i_local)
+    block_n = front_block_n(M, i_local, sm_count)
+    n_tiles = front_n_tiles(i_local, block_n)
     cluster_tiles = (m_tiles // CTA_GROUP) * n_tiles
     sk = front_split_plan(cluster_tiles, sm_count)
+    evict_first = bool(front_evict_first(m_tiles))
+    if block_n != FRONT_BLOCK_N and (sk["sk_max_seg"] != 1 or not evict_first):
+        raise AssertionError(
+            f"the {block_n}-wide front instance runs whole evict_first tiles only (M={M}, plan {sk})"
+        )
     return dict(
         M=M,
         i_local=i_local,
         m_tiles=m_tiles,
         n_tiles=n_tiles,
+        block_n=block_n,
         cluster_tiles=cluster_tiles,
-        evict_first=bool(front_evict_first(m_tiles)),
+        evict_first=evict_first,
         grid=sk["num_items"] * CTA_GROUP,
         **sk,
     )
@@ -1059,7 +1102,13 @@ def route_kernel_keys(
             return (
                 decode_kernel_key(decode_front_plan(num_tokens, i_local, sm_count)),
             )
-        return (front_kernel_key(i_local, front_evict_first(m_tiles_for(num_tokens))),)
+        return (
+            front_kernel_key(
+                i_local,
+                front_evict_first(m_tiles_for(num_tokens)),
+                front_block_n(num_tokens, i_local, sm_count),
+            ),
+        )
     if stage == "tail":
         if num_tokens <= DECODE_MAX_T:
             return (
@@ -1800,7 +1849,7 @@ def _prepare_front(
             route = "decode"
         else:
             plan = prefill_front_plan(T, i_local, sm_count)
-            key = front_kernel_key(i_local, plan["evict_first"])
+            key = front_kernel_key(i_local, plan["evict_first"], plan["block_n"])
             counters, _ = _control_words(
                 index, _arrival_counter_words(plan), 0, lane=lane
             )

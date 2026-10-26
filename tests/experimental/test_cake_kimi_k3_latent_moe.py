@@ -492,7 +492,8 @@ def test_route_keys_are_registered_for_every_token_count(sm_count):
                     reached.add(KERNELS[key])
     # Every registered program is reachable on some qualified SM count (on 152 SMs the TP1 tail rows of
     # 129..512 tokens take the 192-wide instance, so the 256-wide ring-6 / ring-7 program serves 148 SMs
-    # only), serves every registered architecture once and carries a complete launch contract.
+    # only; the TP1 front rows there take the 224-wide instance), serves every registered architecture once
+    # and carries a complete launch contract.
     assert reached <= set(MODULES)
     assert set().union(
         *(_reached_programs(count) for count in QUALIFIED_SM_COUNTS)
@@ -547,9 +548,11 @@ def test_plans_follow_the_device_sm_count():
     assert prefill_front_plan(1024, i_local_for_tp(1), 152)["sk_tiles"] == 36
     for tp in SUPPORTED_TP:
         for tokens in (256, 512, 300, 1024, 2048, 4096, 8192, 16384):
-            assert route_kernel_keys("front", tp, tokens, 148) == route_kernel_keys(
-                "front", tp, tokens, 152
-            )
+            same_front = route_kernel_keys(
+                "front", tp, tokens, 148
+            ) == route_kernel_keys("front", tp, tokens, 152)
+            # The TP1 front rows of 129..512 tokens take the 224-wide tile on 152 SMs.
+            assert same_front == (tp != 1 or not DECODE_MAX_T < tokens <= 512)
             same_tail = route_kernel_keys("tail", tp, tokens, 148) == route_kernel_keys(
                 "tail", tp, tokens, 152
             )
@@ -614,6 +617,29 @@ def test_tail_n192_rule_on_152_sms():
         assert "n192" not in "".join(route_kernel_keys("tail", 1, tokens, 152))
     for tokens in (129, 256, 512):
         assert prefill_tail_plan(tokens, 8, 152)["block_n"] != 192
+
+
+def test_front_n224_rule_on_152_sms():
+    """152-SM parts (GB200 / GB300) run the TP1 front rows of 129..512 tokens on the 224-wide pair tile: 75 column
+    tiles per pair row (4 router + 16 latent + 55 shared, the last one 96 columns wide), whole evict_first tiles in
+    one wave at one pair row and two at two; 148-SM parts and the TP8 rows keep the 256-wide tile."""
+    for tokens, pair_rows in ((129, 1), (256, 1), (300, 2), (511, 2), (512, 2)):
+        plan = prefill_front_plan(tokens, i_local_for_tp(1), 152)
+        assert (plan["block_n"], plan["n_tiles"], plan["evict_first"]) == (
+            224,
+            75,
+            True,
+        )
+        assert plan["cluster_tiles"] == 75 * pair_rows
+        assert plan["num_items"] == plan["full_items"] == plan["cluster_tiles"]
+        assert plan["sk_max_seg"] == 1 and plan["grid"] == 2 * 75 * pair_rows
+        assert route_kernel_keys("front", 1, tokens, 152) == ("front:i6144e1n224",)
+        assert prefill_front_plan(tokens, i_local_for_tp(1), 148)["block_n"] == 256
+        assert route_kernel_keys("front", 1, tokens, 148) == ("front:i6144e1",)
+    for tokens in (128, 513, 1024):
+        assert "n224" not in "".join(route_kernel_keys("front", 1, tokens, 152))
+    for tokens in (129, 256, 512):
+        assert prefill_front_plan(tokens, i_local_for_tp(8), 152)["block_n"] == 256
 
 
 def test_generated_program_available_follows_partials_and_sm_count(monkeypatch):
