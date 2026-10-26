@@ -199,7 +199,10 @@ def _route(
     unless the single-CTA route shortens the launch's critical path, counted
     from ``tile_starts`` and ``sm_count`` (:func:`_max_load`).  ``sm_count``
     also lets K=384 problems of at most ``K384_KG1_MAX_TILES`` 128x128 tiles
-    run the K-loop route instead of the static-K route.  K=512 problems of at
+    run the K-loop route instead of the static-K route, and K=128 problems of
+    at most ``sm_count`` 128x128 tiles (one wave) run the K-loop K-group 1
+    route, whose accumulator starts from -0.0 at K=128 so that its output
+    has the bits of the static-K route's.  K=512 problems of at
     least ``K512_C2_MIN_TILES`` 128x128 tiles keep the K-multiple-of-512 route
     except at N=256 or M=4096.
     """
@@ -219,6 +222,11 @@ def _route(
         }:
             return _CG2_ALIGNED_ROUTE[(n, k)]
     if k == 128:
+        if (
+            sm_count is not None
+            and math.ceil(m / 128) * math.ceil(n / 128) <= sm_count
+        ):
+            return DEEPK_C2_KG1_ROUTE
         return K128_ROUTE
     if k == 384:
         if (
