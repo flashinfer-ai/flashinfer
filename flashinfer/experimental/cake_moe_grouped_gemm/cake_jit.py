@@ -36,37 +36,16 @@ from . import cake_build
 # FlashInfer's JIT.
 #
 # ``ROUTES``: one record per public route -- ``fwd``, ``dgrad`` and
-# ``wgrad_{bf16,f32}_k{256,512}`` -- naming its architectures, host plan and
+# ``wgrad_{bf16,f32}_k{256,512}`` -- naming its architectures and
 # ordered stages.  Each stage binds a program and the compile-line
 # specializations the loader defines for it (the weight-gradient tail-reduce
 # program takes the k width of the partials it sums, ``WGRAD_TILE``, from the
-# route's tile instead of carrying one source per tile).
+# route's tile instead of carrying one source per tile; the three
+# weight-gradient programs take their output element width, ``WGRAD_OUT`` =
+# 16 for bf16 or 32 for fp32, from the route's output dtype instead of
+# carrying one source per output dtype).
 PROGRAMS: dict[str, dict[str, Any]] = {
-    "cake_moe_grouped_gemm_05498a17b6c266797a62": {
-        "kernel": "kernel_cake_moe_grouped_gemm_05498a17b6c266797a62",
-        "library": "cake_moe_grouped_gemm_05498a17b6c266797a62",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "partials"],
-            ["buffer", "C"],
-            ["buffer", "offs"],
-            ["parameter", "num_groups"],
-            ["parameter", "N"],
-            ["parameter", "K"],
-            ["parameter", "ldc"],
-            ["parameter", "stride_e"],
-            ["parameter", "num_clusters"],
-            ["parameter", "tail_splits"],
-            ["parameter", "raster_rows"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
-        "arches": ["sm_100a", "sm_103a", "sm_107a"],
-    },
     "cake_moe_grouped_gemm_1edcad995dcc790600cb": {
-        "kernel": "kernel_cake_moe_grouped_gemm_1edcad995dcc790600cb",
         "library": "cake_moe_grouped_gemm_1edcad995dcc790600cb",
         "ffi_entry": "run",
         "arg_plan": [
@@ -87,7 +66,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_moe_grouped_gemm_276cec1f1d2c8ba1e4cb": {
-        "kernel": "kernel_cake_moe_grouped_gemm_276cec1f1d2c8ba1e4cb",
         "library": "cake_moe_grouped_gemm_276cec1f1d2c8ba1e4cb",
         "ffi_entry": "run",
         "arg_plan": [
@@ -108,7 +86,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_moe_grouped_gemm_611af0ca12365b0e7c3b": {
-        "kernel": "kernel_cake_moe_grouped_gemm_611af0ca12365b0e7c3b",
         "library": "cake_moe_grouped_gemm_611af0ca12365b0e7c3b",
         "ffi_entry": "run",
         "arg_plan": [
@@ -133,34 +110,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "launch": {"block": [192, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_moe_grouped_gemm_7ac85aef90878e42ea02": {
-        "kernel": "kernel_cake_moe_grouped_gemm_7ac85aef90878e42ea02",
-        "library": "cake_moe_grouped_gemm_7ac85aef90878e42ea02",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "A"],
-            ["tma_buffer", "B"],
-            ["buffer", "C"],
-            ["buffer", "offs"],
-            ["buffer", "tensormap_workspace"],
-            ["buffer", "partials"],
-            ["parameter", "tail_splits"],
-            ["parameter", "raster_rows"],
-            ["parameter", "num_groups"],
-            ["parameter", "sum_m"],
-            ["parameter", "N"],
-            ["parameter", "K"],
-            ["parameter", "ldc"],
-            ["parameter", "stride_e"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "launch": {"block": [192, 1, 1], "cluster": [2, 1, 1]},
-        "arches": ["sm_100a", "sm_103a", "sm_107a"],
-    },
     "cake_moe_grouped_gemm_bc774d802e4f0b3ac27c": {
-        "kernel": "kernel_cake_moe_grouped_gemm_bc774d802e4f0b3ac27c",
         "library": "cake_moe_grouped_gemm_bc774d802e4f0b3ac27c",
         "ffi_entry": "run",
         "arg_plan": [
@@ -182,34 +132,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
-    "cake_moe_grouped_gemm_d77aff0f30a2661aecc8": {
-        "kernel": "kernel_cake_moe_grouped_gemm_d77aff0f30a2661aecc8",
-        "library": "cake_moe_grouped_gemm_d77aff0f30a2661aecc8",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "A"],
-            ["tma_buffer", "B"],
-            ["buffer", "C"],
-            ["buffer", "offs"],
-            ["buffer", "tensormap_workspace"],
-            ["buffer", "partials"],
-            ["parameter", "tail_splits"],
-            ["parameter", "raster_rows"],
-            ["parameter", "num_groups"],
-            ["parameter", "sum_m"],
-            ["parameter", "N"],
-            ["parameter", "K"],
-            ["parameter", "ldc"],
-            ["parameter", "stride_e"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "launch": {"block": [192, 1, 1], "cluster": [2, 1, 1]},
-        "arches": ["sm_100a", "sm_103a"],
-    },
     "cake_moe_grouped_gemm_ed9a74f36ba13a52183d": {
-        "kernel": "kernel_cake_moe_grouped_gemm_ed9a74f36ba13a52183d",
         "library": "cake_moe_grouped_gemm_ed9a74f36ba13a52183d",
         "ffi_entry": "run",
         "arg_plan": [
@@ -238,15 +161,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
 ROUTES: dict[str, dict[str, Any]] = {
     "cake_moe_grouped_gemm_dgrad": {
         "op": "dgrad",
-        "out_dtype": "bfloat16",
-        "tile_k": None,
-        "public_helper": "grouped_gemm_dgrad",
-        "host_plan": {
-            "alignment": "K % 256 == 0 and N % 64 == 0",
-            "cols": "K",
-            "grid": "persistent_grid(sm_count, max_cluster_tiles_upper_bound(sum_m, num_groups, cols))",
-            "launches": 1,
-        },
         "stages": [
             {
                 "name": "main",
@@ -258,15 +172,6 @@ ROUTES: dict[str, dict[str, Any]] = {
     },
     "cake_moe_grouped_gemm_fwd": {
         "op": "fwd",
-        "out_dtype": "bfloat16",
-        "tile_k": None,
-        "public_helper": "grouped_gemm_fwd",
-        "host_plan": {
-            "alignment": "N % 256 == 0 and K % 64 == 0",
-            "cols": "N",
-            "grid": "persistent_grid(sm_count, max_cluster_tiles_upper_bound(sum_m, num_groups, cols))",
-            "launches": 1,
-        },
         "stages": [
             {
                 "name": "main",
@@ -278,21 +183,6 @@ ROUTES: dict[str, dict[str, Any]] = {
     },
     "cake_moe_grouped_gemm_wgrad_bf16_k256": {
         "op": "wgrad",
-        "out_dtype": "bfloat16",
-        "tile_k": 256,
-        "public_helper": "grouped_gemm_wgrad",
-        "host_plan": {
-            "alignment": "N % 256 == 0 and K % 256 == 0",
-            "clusters": "grid_x // 2",
-            "grid": "persistent_grid(sm_count, num_groups * (N // 256) * (K // tile_k))",
-            "launches": "1 + (tail_splits > 1)",
-            "num_tail": "(num_groups * (N // 256) * (K // tile_k)) % clusters",
-            "partials_bytes": "4 * 256 * tile_k * max(num_tail * tail_splits if tail_splits > 1 else 0, 1)",
-            "raster_rows": "wgrad_raster_rows(N // 256, K // tile_k, clusters, tile_k)",
-            "tail_reduce_grid": "wgrad_reduce_grid(num_tail, tile_k) when tail_splits > 1, else no tail_reduce launch",
-            "tail_splits": "wgrad_tail_plan(num_tail, clusters, sum_m, num_groups, tile_k) if num_tail else 1",
-            "tensormap_workspace_bytes": "grid_x * tmap_slots_per_cta * tmap_slot_bytes (uint8, 128-byte aligned)",
-        },
         "stages": [
             {
                 "name": "main",
@@ -309,21 +199,6 @@ ROUTES: dict[str, dict[str, Any]] = {
     },
     "cake_moe_grouped_gemm_wgrad_bf16_k512": {
         "op": "wgrad",
-        "out_dtype": "bfloat16",
-        "tile_k": 512,
-        "public_helper": "grouped_gemm_wgrad",
-        "host_plan": {
-            "alignment": "N % 256 == 0 and K % 512 == 0",
-            "clusters": "grid_x // 2",
-            "grid": "persistent_grid(sm_count, num_groups * (N // 256) * (K // tile_k))",
-            "launches": "1 + (tail_splits > 1)",
-            "num_tail": "(num_groups * (N // 256) * (K // tile_k)) % clusters",
-            "partials_bytes": "4 * 256 * tile_k * max(num_tail * tail_splits if tail_splits > 1 else 0, 1)",
-            "raster_rows": "wgrad_raster_rows(N // 256, K // tile_k, clusters, tile_k)",
-            "tail_reduce_grid": "wgrad_reduce_grid(num_tail, tile_k) when tail_splits > 1, else no tail_reduce launch",
-            "tail_splits": "wgrad_tail_plan(num_tail, clusters, sum_m, num_groups, tile_k) if num_tail else 1",
-            "tensormap_workspace_bytes": "grid_x * tmap_slots_per_cta * tmap_slot_bytes (uint8, 128-byte aligned)",
-        },
         "stages": [
             {
                 "name": "main",
@@ -340,69 +215,38 @@ ROUTES: dict[str, dict[str, Any]] = {
     },
     "cake_moe_grouped_gemm_wgrad_f32_k256": {
         "op": "wgrad",
-        "out_dtype": "float32",
-        "tile_k": 256,
-        "public_helper": "grouped_gemm_wgrad",
-        "host_plan": {
-            "alignment": "N % 256 == 0 and K % 256 == 0",
-            "clusters": "grid_x // 2",
-            "grid": "persistent_grid(sm_count, num_groups * (N // 256) * (K // tile_k))",
-            "launches": "1 + (tail_splits > 1)",
-            "num_tail": "(num_groups * (N // 256) * (K // tile_k)) % clusters",
-            "partials_bytes": "4 * 256 * tile_k * max(num_tail * tail_splits if tail_splits > 1 else 0, 1)",
-            "raster_rows": "wgrad_raster_rows(N // 256, K // tile_k, clusters, tile_k)",
-            "tail_reduce_grid": "wgrad_reduce_grid(num_tail, tile_k) when tail_splits > 1, else no tail_reduce launch",
-            "tail_splits": "wgrad_tail_plan(num_tail, clusters, sum_m, num_groups, tile_k) if num_tail else 1",
-            "tensormap_workspace_bytes": "grid_x * tmap_slots_per_cta * tmap_slot_bytes (uint8, 128-byte aligned)",
-        },
         "stages": [
             {
                 "name": "main",
-                "program": "cake_moe_grouped_gemm_7ac85aef90878e42ea02",
-                "specializations": {},
+                "program": "cake_moe_grouped_gemm_ed9a74f36ba13a52183d",
+                "specializations": {"WGRAD_OUT": 32},
             },
             {
                 "name": "tail_reduce",
-                "program": "cake_moe_grouped_gemm_05498a17b6c266797a62",
-                "specializations": {"WGRAD_TILE": 256},
+                "program": "cake_moe_grouped_gemm_bc774d802e4f0b3ac27c",
+                "specializations": {"WGRAD_OUT": 32, "WGRAD_TILE": 256},
             },
         ],
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_moe_grouped_gemm_wgrad_f32_k512": {
         "op": "wgrad",
-        "out_dtype": "float32",
-        "tile_k": 512,
-        "public_helper": "grouped_gemm_wgrad",
-        "host_plan": {
-            "alignment": "N % 256 == 0 and K % 512 == 0",
-            "clusters": "grid_x // 2",
-            "grid": "persistent_grid(sm_count, num_groups * (N // 256) * (K // tile_k))",
-            "launches": "1 + (tail_splits > 1)",
-            "num_tail": "(num_groups * (N // 256) * (K // tile_k)) % clusters",
-            "partials_bytes": "4 * 256 * tile_k * max(num_tail * tail_splits if tail_splits > 1 else 0, 1)",
-            "raster_rows": "wgrad_raster_rows(N // 256, K // tile_k, clusters, tile_k)",
-            "tail_reduce_grid": "wgrad_reduce_grid(num_tail, tile_k) when tail_splits > 1, else no tail_reduce launch",
-            "tail_splits": "wgrad_tail_plan(num_tail, clusters, sum_m, num_groups, tile_k) if num_tail else 1",
-            "tensormap_workspace_bytes": "grid_x * tmap_slots_per_cta * tmap_slot_bytes (uint8, 128-byte aligned)",
-        },
         "stages": [
             {
                 "name": "main",
-                "program": "cake_moe_grouped_gemm_d77aff0f30a2661aecc8",
-                "specializations": {},
+                "program": "cake_moe_grouped_gemm_611af0ca12365b0e7c3b",
+                "specializations": {"WGRAD_OUT": 32},
             },
             {
                 "name": "tail_reduce",
-                "program": "cake_moe_grouped_gemm_05498a17b6c266797a62",
-                "specializations": {"WGRAD_TILE": 512},
+                "program": "cake_moe_grouped_gemm_bc774d802e4f0b3ac27c",
+                "specializations": {"WGRAD_OUT": 32, "WGRAD_TILE": 512},
             },
         ],
         "arches": ["sm_100a", "sm_103a"],
     },
 }
 HOST_PLAN_CONSTANTS: dict[str, Any] = {
-    "block_m": 128,
     "block_n": 256,
     "block_k": 64,
     "cta_group": 2,
@@ -444,12 +288,6 @@ def record_name(
             )
         base += f"_{'f32' if out_dtype == 'float32' else 'bf16'}_k{tile_k}"
     return base
-
-
-def registered_arches() -> tuple[str, ...]:
-    """Architectures with at least one registered route, in ``ARCHES`` order."""
-    present = {arch for route in ROUTES.values() for arch in route["arches"]}
-    return tuple(arch for arch in ARCHES if arch in present)
 
 
 def program_registered(
@@ -552,9 +390,3 @@ def load_module(
     library under ``aot/`` when the package ships it, else FlashInfer's JIT build of its ``build.json``
     entry."""
     return _load_module(program, arch, _specialization_items(specializations or {}))
-
-
-def specs_for_arch(arch: str):
-    """JIT specs of every ``build.json`` entry of ``arch`` without a prebuilt library (the
-    ``flashinfer.jit.build_jit_specs`` warm-up)."""
-    return cake_build.jit_specs(arch)

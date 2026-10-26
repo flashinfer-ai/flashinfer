@@ -85,8 +85,13 @@ def _manifest() -> dict:
     return cake_sparse_mla_sm120_dsv4_nvfp4_manifest()
 
 
+@functools.cache
 def cake_sparse_mla_sm120_dsv4_nvfp4_format_info() -> dict:
-    """Static facts of the Cake SM120 NVFP4 route (mirrors ``dsv4_nvfp4_format_info``)."""
+    """Static facts of the Cake SM120 NVFP4 route (mirrors ``dsv4_nvfp4_format_info``).
+
+    Built once per process from the cached manifest (the planners and the entries
+    read it several times per call); the returned dict is shared, do not mutate it.
+    """
 
     manifest = _manifest()
     return {
@@ -1159,8 +1164,10 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_prefill(
     ``out_lse``), but one CTA runs every chunk of a token: the candidate list
     is limited to 16 chunks (``topk + extra_topk <= 1024`` slots) and the
     head count needs a prefill instance (16 .. 128, multiples of 16).  Writes
-    ``output`` and ``out_lse`` in place and returns the resolved plan
-    ``{"head_tiles", "num_ctas"}`` (one CTA per (token, head block) item);
+    ``output`` and ``out_lse`` in place and returns the resolved plan:
+    ``head_tiles``, ``num_ctas`` (one CTA per (token, head block) item),
+    ``num_stages`` (cp.async ring depth), ``q_evict_first`` and
+    ``grid_head_blocks_first`` (the launch hints of the ``plan_prefill_*`` planners);
     ``head_tiles`` (see :func:`cake_sparse_mla_sm120_dsv4_nvfp4_prefill_head_tiles`)
     overrides :func:`cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill`.
 
@@ -1201,7 +1208,8 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_prefill(
     Returns
     -------
     dict[str, int]
-        The resolved plan ``{"head_tiles", "num_ctas"}``.
+        The resolved plan: ``head_tiles``, ``num_ctas``, ``num_stages``,
+        ``q_evict_first`` and ``grid_head_blocks_first`` (the last two ``bool``).
     """
 
     p = _prepare_inputs(

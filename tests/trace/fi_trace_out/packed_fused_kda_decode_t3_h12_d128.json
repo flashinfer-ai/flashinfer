@@ -1,204 +1,205 @@
 {
-  "name": "packed_fused_kda_decode_t3_h12_d128",
-  "description": "Packed ragged T>=1 Kimi width-four causal convolution, recurrent KDA, and gated RMSNorm with one recurrent checkpoint per token.",
-  "op_type": "kda",
-  "tags": [
-    "fi_api:flashinfer.kda_decode.packed_fused_kda_decode",
-    "stage:decode",
-    "status:experimental"
-  ],
-  "axes": {
-    "num_sequences": {
-      "type": "var",
-      "description": "Number of independent sequences."
+    "name": "packed_fused_kda_decode_t3_h12_d128",
+    "description": "Packed ragged T>=1 Kimi width-four causal convolution, recurrent KDA, and gated RMSNorm with one recurrent checkpoint per token.",
+    "op_type": "kda",
+    "tags": [
+        "fi_api:flashinfer.kda_decode.packed_fused_kda_decode",
+        "stage:decode",
+        "status:experimental"
+    ],
+    "axes": {
+        "num_sequences": {
+            "type": "var",
+            "description": "Number of independent sequences."
+        },
+        "num_tokens": {
+            "type": "const",
+            "value": 3,
+            "description": "Maximum tokens per sequence."
+        },
+        "num_rows": {
+            "type": "var",
+            "description": "Total packed tokens."
+        },
+        "num_sequence_offsets": {
+            "type": "var",
+            "description": "Number of packed sequence boundaries."
+        },
+        "num_heads": {
+            "type": "const",
+            "value": 12,
+            "description": "Number of KDA heads."
+        },
+        "head_dim": {
+            "type": "const",
+            "value": 128,
+            "description": "KDA head dimension."
+        },
+        "singleton": {
+            "type": "const",
+            "value": 1,
+            "description": "Leading singleton dimension."
+        },
+        "projection_groups": {
+            "type": "const",
+            "value": 3,
+            "description": "Packed QKV projection groups."
+        },
+        "hidden_size": {
+            "type": "const",
+            "value": 1536,
+            "description": "Channels in one projection."
+        },
+        "qkv_width": {
+            "type": "const",
+            "value": 4608,
+            "description": "Packed QKV width."
+        },
+        "conv_width": {
+            "type": "const",
+            "value": 4,
+            "description": "Depthwise convolution width."
+        },
+        "conv_history": {
+            "type": "const",
+            "value": 5,
+            "description": "Cached convolution history."
+        },
+        "num_slots": {
+            "type": "var",
+            "description": "Number of cache slots."
+        }
     },
-    "num_tokens": {
-      "type": "const",
-      "value": 3,
-      "description": "Maximum tokens per sequence."
+    "constraints": [
+        "num_rows <= num_sequences * num_tokens",
+        "num_sequence_offsets == num_sequences + 1",
+        "num_tokens >= 1",
+        "qkv_width == 3 * num_heads * head_dim",
+        "hidden_size == num_heads * head_dim",
+        "singleton == 1",
+        "projection_groups == 3",
+        "head_dim == 128",
+        "num_heads in (12, 24, 32, 48, 96)",
+        "conv_width == 4",
+        "conv_history == num_tokens + 2"
+    ],
+    "inputs": {
+        "x": {
+            "shape": [
+                "num_rows",
+                "qkv_width"
+            ],
+            "dtype": "bfloat16"
+        },
+        "weight": {
+            "shape": [
+                "projection_groups",
+                "conv_width",
+                "hidden_size"
+            ],
+            "dtype": "float32"
+        },
+        "conv_state": {
+            "shape": [
+                "num_slots",
+                "qkv_width",
+                "conv_history"
+            ],
+            "dtype": "bfloat16"
+        },
+        "raw_gate": {
+            "shape": [
+                "singleton",
+                "num_rows",
+                "num_heads",
+                "head_dim"
+            ],
+            "dtype": "bfloat16"
+        },
+        "raw_beta": {
+            "shape": [
+                "singleton",
+                "num_rows",
+                "num_heads"
+            ],
+            "dtype": "bfloat16"
+        },
+        "A_log": {
+            "shape": [
+                "num_heads"
+            ],
+            "dtype": "float32"
+        },
+        "dt_bias": {
+            "shape": [
+                "hidden_size"
+            ],
+            "dtype": "float32"
+        },
+        "state_indices": {
+            "shape": [
+                "num_sequences",
+                "num_tokens"
+            ],
+            "dtype": "int32"
+        },
+        "query_start_loc": {
+            "shape": [
+                "num_sequence_offsets"
+            ],
+            "dtype": "int32"
+        },
+        "num_accepted_tokens": {
+            "shape": [
+                "num_sequences"
+            ],
+            "dtype": "int32"
+        },
+        "state": {
+            "shape": [
+                "num_slots",
+                "num_heads",
+                "head_dim",
+                "head_dim"
+            ],
+            "dtype": "float32"
+        },
+        "output_gate": {
+            "shape": [
+                "num_rows",
+                "num_heads",
+                "head_dim"
+            ],
+            "dtype": "bfloat16"
+        },
+        "norm_weight": {
+            "shape": [
+                "head_dim"
+            ],
+            "dtype": "float32"
+        },
+        "lower_bound": {
+            "shape": null,
+            "dtype": "float32",
+            "optional": true
+        },
+        "norm_eps": {
+            "shape": null,
+            "dtype": "float32",
+            "optional": true
+        }
     },
-    "num_rows": {
-      "type": "var",
-      "description": "Total packed tokens."
+    "outputs": {
+        "output": {
+            "shape": [
+                "singleton",
+                "num_rows",
+                "num_heads",
+                "head_dim"
+            ],
+            "dtype": "bfloat16"
+        }
     },
-    "num_sequence_offsets": {
-      "type": "var",
-      "description": "Number of packed sequence boundaries."
-    },
-    "num_heads": {
-      "type": "const",
-      "value": 12,
-      "description": "Number of KDA heads."
-    },
-    "head_dim": {
-      "type": "const",
-      "value": 128,
-      "description": "KDA head dimension."
-    },
-    "singleton": {
-      "type": "const",
-      "value": 1,
-      "description": "Leading singleton dimension."
-    },
-    "projection_groups": {
-      "type": "const",
-      "value": 3,
-      "description": "Packed QKV projection groups."
-    },
-    "hidden_size": {
-      "type": "const",
-      "value": 1536,
-      "description": "Channels in one projection."
-    },
-    "qkv_width": {
-      "type": "const",
-      "value": 4608,
-      "description": "Packed QKV width."
-    },
-    "conv_width": {
-      "type": "const",
-      "value": 4,
-      "description": "Depthwise convolution width."
-    },
-    "conv_history": {
-      "type": "const",
-      "value": 5,
-      "description": "Cached convolution history."
-    },
-    "num_slots": {
-      "type": "var",
-      "description": "Number of cache slots."
-    }
-  },
-  "constraints": [
-    "num_rows <= num_sequences * num_tokens",
-    "num_sequence_offsets == num_sequences + 1",
-    "num_tokens >= 1",
-    "qkv_width == 3 * num_heads * head_dim",
-    "hidden_size == num_heads * head_dim",
-    "singleton == 1",
-    "projection_groups == 3",
-    "head_dim == 128",
-    "num_heads in (12, 24, 32, 48, 96)",
-    "conv_width == 4",
-    "conv_history == num_tokens + 2"
-  ],
-  "inputs": {
-    "x": {
-      "shape": [
-        "num_rows",
-        "qkv_width"
-      ],
-      "dtype": "bfloat16"
-    },
-    "weight": {
-      "shape": [
-        "projection_groups",
-        "conv_width",
-        "hidden_size"
-      ],
-      "dtype": "float32"
-    },
-    "conv_state": {
-      "shape": [
-        "num_slots",
-        "qkv_width",
-        "conv_history"
-      ],
-      "dtype": "bfloat16"
-    },
-    "raw_gate": {
-      "shape": [
-        "singleton",
-        "num_rows",
-        "num_heads",
-        "head_dim"
-      ],
-      "dtype": "bfloat16"
-    },
-    "raw_beta": {
-      "shape": [
-        "singleton",
-        "num_rows",
-        "num_heads"
-      ],
-      "dtype": "bfloat16"
-    },
-    "A_log": {
-      "shape": [
-        "num_heads"
-      ],
-      "dtype": "float32"
-    },
-    "dt_bias": {
-      "shape": [
-        "hidden_size"
-      ],
-      "dtype": "float32"
-    },
-    "state_indices": {
-      "shape": [
-        "num_sequences",
-        "num_tokens"
-      ],
-      "dtype": "int32"
-    },
-    "query_start_loc": {
-      "shape": [
-        "num_sequence_offsets"
-      ],
-      "dtype": "int32"
-    },
-    "num_accepted_tokens": {
-      "shape": [
-        "num_sequences"
-      ],
-      "dtype": "int32"
-    },
-    "state": {
-      "shape": [
-        "num_slots",
-        "num_heads",
-        "head_dim",
-        "head_dim"
-      ],
-      "dtype": "float32"
-    },
-    "output_gate": {
-      "shape": [
-        "num_rows",
-        "num_heads",
-        "head_dim"
-      ],
-      "dtype": "bfloat16"
-    },
-    "norm_weight": {
-      "shape": [
-        "head_dim"
-      ],
-      "dtype": "float32"
-    },
-    "lower_bound": {
-      "shape": null,
-      "dtype": "float32",
-      "optional": true
-    },
-    "norm_eps": {
-      "shape": null,
-      "dtype": "float32",
-      "optional": true
-    }
-  },
-  "outputs": {
-    "output": {
-      "shape": [
-        "singleton",
-        "num_rows",
-        "num_heads",
-        "head_dim"
-      ],
-      "dtype": "bfloat16"
-    }
-  },
-  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+    "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n",
+    "reference": "from __future__ import annotations\nimport math\nimport torch\nimport torch.nn.functional as F\n\n@torch.no_grad()\ndef _packed_fused_kda_decode_reference(\n    x, weight, conv_state, raw_gate, raw_beta,\n    A_log, dt_bias, state_indices, query_start_loc,\n    num_accepted_tokens, state, output_gate, norm_weight,\n    lower_bound=-5.0, norm_eps=1e-5,\n):\n    \"\"\"FP32 token-serial reference for packed fused KDA decode.\n\n    Mirrors tests/kda/test_fused_kda_decode.py::_packed_reference with the\n    full trace-definition signature.  Processes each sequence token-by-token\n    with depthwise conv1d update, QK-L2-norm, gated delta-rule recurrence,\n    RMSNorm, and output-gate multiplication.\n    \"\"\"\n    num_rows = x.shape[0]\n    num_heads = A_log.numel()\n    hidden_size = num_heads * 128\n    device = x.device\n    num_sequences, max_tokens = state_indices.shape\n\n    taps = weight.permute(0, 2, 1).reshape(3 * hidden_size, 4).float()\n    decay_a = A_log.exp().view(num_heads, 1)\n    q_offsets = query_start_loc.cpu().tolist()\n    accepted = num_accepted_tokens.cpu().tolist()\n\n    output = torch.zeros(\n        (1, num_rows, num_heads, 128), dtype=torch.bfloat16, device=device\n    )\n\n    for seq in range(num_sequences):\n        begin, end = q_offsets[seq : seq + 2]\n        seq_len = end - begin\n        if seq_len <= 0:\n            continue\n        conv_slot = int(state_indices[seq, 0])\n        if conv_slot <= 0:\n            continue\n        acc = accepted[seq] - 1\n        state_slot = int(state_indices[seq, acc])\n        history = conv_state[conv_slot, :, acc : acc + 3].float()\n        current_state = state[state_slot].float().clone()\n        conv_state[conv_slot, :, 0] = history[:, 1].to(torch.bfloat16)\n        conv_state[conv_slot, :, 1] = history[:, 2].to(torch.bfloat16)\n\n        for token in range(seq_len):\n            row = begin + token\n            current_x = x[row].float()\n            window = torch.cat((history, current_x.unsqueeze(-1)), dim=-1)\n            history = window[:, 1:]\n            conv_state[conv_slot, :, token + 2] = current_x.to(torch.bfloat16)\n\n            mixed = F.silu((window * taps).sum(-1)).to(torch.bfloat16)\n            query, key, value = mixed.float().view(3, num_heads, 128).unbind(0)\n            query *= torch.rsqrt(query.square().sum(-1, keepdim=True) + 1e-6)\n            query *= 128**-0.5\n            key *= torch.rsqrt(key.square().sum(-1, keepdim=True) + 1e-6)\n            rg = raw_gate[0, row].float() + dt_bias.view(num_heads, 128)\n            lb = lower_bound if lower_bound is not None else -5.0\n            decay = torch.exp(lb * torch.sigmoid(decay_a * rg))\n            current_state *= decay.unsqueeze(-2)\n            state_key = torch.einsum(\"hvk,hk->hv\", current_state, key)\n            delta = value - state_key\n            beta = raw_beta[0, row].float().sigmoid()\n            current_state += (delta * beta.unsqueeze(-1)).unsqueeze(-1) * key.unsqueeze(-2)\n            destination = int(state_indices[seq, token])\n            if destination > 0:\n                state[destination].copy_(current_state)\n            recurrent = torch.einsum(\"hvk,hk->hv\", current_state, query)\n            output[0, row] = recurrent.to(torch.bfloat16)\n\n    output_float = output.float()\n    inverse_rms = torch.rsqrt(\n        output_float.square().mean(-1, keepdim=True) + (norm_eps or 1e-5)\n    )\n    return {\n        \"output\": (\n            output_float\n            * inverse_rms\n            * norm_weight\n            * output_gate.float().sigmoid().unsqueeze(0)\n        ).to(torch.bfloat16)\n    }\n"
 }

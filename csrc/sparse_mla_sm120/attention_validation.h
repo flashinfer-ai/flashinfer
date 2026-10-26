@@ -33,7 +33,10 @@ inline PagedKVLayout parse_paged_kv_layout(const TensorView& kv, int bpt, bool i
     TVM_FFI_ICHECK_GT(kv.size(1), 0) << name << " page capacity must be positive";
     TVM_FFI_ICHECK_GE(page_stride, kv.size(1))
         << name << " block stride is smaller than packed block width";
-    return {static_cast<int>(kv.size(1) / bpt), static_cast<size_t>(page_stride), bpt};
+    // A one-row inline-scale page is one record at the page pitch.
+    const bool pitched_row = inline_scale && kv.size(1) == bpt;
+    return {static_cast<int>(kv.size(1) / bpt), static_cast<size_t>(page_stride),
+            pitched_row ? static_cast<int>(page_stride) : bpt};
   }
   int axis = 1;
   if (kv.ndim() == 4) {
@@ -41,7 +44,10 @@ inline PagedKVLayout parse_paged_kv_layout(const TensorView& kv, int bpt, bool i
         << name << " requires singleton KV-head axis";
     axis = kv.size(1) == 1 ? 2 : 1;
   }
-  const int64_t rows = kv.size(axis), width = kv.size(-1), advance = kv.stride(axis);
+  const int64_t rows = kv.size(axis), width = kv.size(-1);
+  // A one-row inline-scale page is one record at the page pitch; the stride of
+  // its singleton row axis carries no layout.
+  const int64_t advance = inline_scale && rows == 1 ? page_stride : kv.stride(axis);
   TVM_FFI_ICHECK_GT(rows, 0) << name << " page capacity must be positive";
   TVM_FFI_ICHECK_GE(width, bpt) << name << " row width is smaller than bytes_per_token";
   TVM_FFI_ICHECK_GE(advance, width) << name << " token-axis stride is smaller than row width";
@@ -151,7 +157,7 @@ ffi::Array<int64_t> inspect_attention_metadata(
     ffi::Optional<TensorView> extra_lengths, ffi::Optional<TensorView> lse,
     ffi::Optional<TensorView> mid, ffi::Optional<TensorView> mlse, int64_t model, bool extra_fp4,
     int64_t value_dim) {
-  TVM_FFI_ICHECK(model >= 0 && model <= int(ModelType::DSV4_1)) << "unknown cache format";
+  TVM_FFI_ICHECK(model >= 0 && model <= int(ModelType::DSV4_1_INLINE)) << "unknown cache format";
   const auto format = cache_format_info(static_cast<ModelType>(model));
   CHECK_INPUT_AND_TYPE(q, dl_bfloat16);
   CHECK_DIM(3, q);
@@ -199,7 +205,7 @@ ffi::Array<int64_t> inspect_attention_metadata(
         << "scratch layout mismatch";
     check_attention_alignment(value, 16, "scratch");
   }
-  auto parse = [&](TensorView value, bool compressed) {
+  auto parse = [&](TensorView value, bool extra, bool compressed) {
     check_attention_device(q, value, "kv_cache");
     const int bpt = IsDsv4Nvfp4  ? Dsv4Nvfp4Layout::BYTES_PER_TOKEN
                     : compressed ? Dsv41Fp4Layout::BYTES_PER_TOKEN
@@ -207,13 +213,14 @@ ffi::Array<int64_t> inspect_attention_metadata(
     if constexpr (IsDsv4Nvfp4) {
       TVM_FFI_ICHECK(value.ndim() == 2 || value.size(-1) == bpt) << "NVFP4 cache width mismatch";
     }
-    return parse_paged_kv_layout(value, bpt, !IsDsv4Nvfp4 && format.inline_scale, "kv_cache");
+    return parse_paged_kv_layout(value, bpt, !IsDsv4Nvfp4 && format.inline_scale,
+                                 extra ? "extra_kv_cache" : "kv_cache");
   };
-  const auto layout = parse(cache, false);
+  const auto layout = parse(cache, false, false);
   PagedKVLayout ex{};
   if (extra.has_value()) {
     index_check(extra_indices.value());
-    ex = parse(extra.value(), extra_fp4);
+    ex = parse(extra.value(), true, extra_fp4);
   }
   if constexpr (IsDsv4Nvfp4)
     TVM_FFI_ICHECK(lse_stride == size_t(h)) << "NVFP4 LSE must be contiguous";
@@ -223,7 +230,8 @@ ffi::Array<int64_t> inspect_attention_metadata(
        ex.page_block_size, layout.stride_kv_block, ex.stride_kv_block, layout.stride_kv_row,
        size_t(indices.stride(0)),
        extra_indices.has_value() ? size_t(extra_indices.value().stride(0)) : 0, lse_stride,
-       lengths.has_value(), extra_lengths.has_value(), sink.has_value(), extra_fp4, 0});
+       lengths.has_value(), extra_lengths.has_value(), sink.has_value(), extra_fp4, 0,
+       extra.has_value() ? size_t(ex.stride_kv_row) : 0});
 }
 
 }  // namespace flashinfer::sparse_mla_sm120

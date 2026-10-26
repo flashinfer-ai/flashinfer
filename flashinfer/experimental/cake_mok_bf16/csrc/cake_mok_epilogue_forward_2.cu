@@ -133,6 +133,10 @@ __device__ __forceinline__ __nv_bfloat162 __as_bf16x2(unsigned int v) {
     return __nv_bfloat162(raw);
 }
 
+__device__ __forceinline__ float2 cake_bf16x2_to_f32x2(__nv_bfloat162 v) {
+    return __bfloat1622float2(v);
+}
+
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
@@ -184,7 +188,7 @@ kernel_cake_mok_epilogue_forward_2(__nv_bfloat16* __restrict__ shared, __nv_bflo
 
     __syncthreads();
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int col_blocks = (hidden + 1024 - 1) / 1024;
     int units = tokens * col_blocks;
     int count = 0;
@@ -197,8 +201,7 @@ kernel_cake_mok_epilogue_forward_2(__nv_bfloat16* __restrict__ shared, __nv_bflo
         int stage = first % 6;
         int token = (bid + first * ctas) / col_blocks;
         int col = (bid + first * ctas) % col_blocks * 1024;
-        int _min_1 = ((1024) < (hidden - col) ? (1024) : (hidden - col));
-        int cols = _min_1;
+        int cols = ((1024) < (hidden - col) ? (1024) : (hidden - col));
         if (tid == 0) {
             mbarrier_arrive_expect_tx(inputs_addr + (stage) * 8, (unsigned int)(3 * cols * 2));
         }
@@ -214,15 +217,14 @@ kernel_cake_mok_epilogue_forward_2(__nv_bfloat16* __restrict__ shared, __nv_bflo
         int unit = bid + j * ctas;
         int token_1 = unit / col_blocks;
         int col_1 = unit % col_blocks * 1024;
-        int _min_2 = ((1024) < (hidden - col_1) ? (1024) : (hidden - col_1));
-        int cols_1 = _min_2;
+        int cols_1 = ((1024) < (hidden - col_1) ? (1024) : (hidden - col_1));
         mbarrier_wait(inputs_addr + (stage_1) * 8, j / 6 & 1);
         if (cols_1 > tid * 4) {
             int base = stage_1 * 3 * 512 + tid * 2;
             float accumulator[4];
             #pragma unroll
             for (int pair = 0; pair < 2; pair++) {
-                float2 _cvt_f32_0 = __bfloat1622float2(__as_bf16x2(words[base + pair]));
+                float2 _cvt_f32_0 = cake_bf16x2_to_f32x2(__as_bf16x2(words[base + pair]));
                 accumulator[pair * 2] = _cvt_f32_0.x;
                 accumulator[pair * 2 + 1] = _cvt_f32_0.y;
             }
@@ -232,7 +234,7 @@ kernel_cake_mok_epilogue_forward_2(__nv_bfloat16* __restrict__ shared, __nv_bflo
                 weight = scores[token_1 * 2 + k];
                 #pragma unroll
                 for (int pair_1 = 0; pair_1 < 2; pair_1++) {
-                    float2 _cvt_f32_1 = __bfloat1622float2(__as_bf16x2(words[base + (1 + k) * 512 + pair_1]));
+                    float2 _cvt_f32_1 = cake_bf16x2_to_f32x2(__as_bf16x2(words[base + (1 + k) * 512 + pair_1]));
                     float term_x = _cvt_f32_1.x * weight;
                     float term_y = _cvt_f32_1.y * weight;
                     accumulator[pair_1 * 2] = accumulator[pair_1 * 2] + term_x;
@@ -242,8 +244,7 @@ kernel_cake_mok_epilogue_forward_2(__nv_bfloat16* __restrict__ shared, __nv_bflo
             long long out = ((long long)token_1 * (long long)hidden + (long long)col_1) / 2 + (long long)(tid * 2);
             #pragma unroll
             for (int pair_2 = 0; pair_2 < 2; pair_2++) {
-                __nv_bfloat162 _bf16x2_0 = __float22bfloat162_rn(make_float2(accumulator[pair_2 * 2], accumulator[pair_2 * 2 + 1]));
-                output[out + (long long)pair_2] = __as_u32(_bf16x2_0);
+                output[out + (long long)pair_2] = __as_u32(__float22bfloat162_rn(make_float2(accumulator[pair_2 * 2], accumulator[pair_2 * 2 + 1])));
             }
         }
         __syncthreads();
@@ -251,8 +252,7 @@ kernel_cake_mok_epilogue_forward_2(__nv_bfloat16* __restrict__ shared, __nv_bflo
             int stage_0 = (j + 6) % 6;
             int token_1_1 = (bid + (j + 6) * ctas) / col_blocks;
             int col_2 = (bid + (j + 6) * ctas) % col_blocks * 1024;
-            int _min_3 = ((1024) < (hidden - col_2) ? (1024) : (hidden - col_2));
-            int cols_3 = _min_3;
+            int cols_3 = ((1024) < (hidden - col_2) ? (1024) : (hidden - col_2));
             if (tid == 0) {
                 mbarrier_arrive_expect_tx(inputs_addr + (stage_0) * 8, (unsigned int)(3 * cols_3 * 2));
             }

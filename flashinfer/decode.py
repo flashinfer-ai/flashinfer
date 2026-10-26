@@ -19,7 +19,7 @@ import math
 import os
 import warnings
 from types import SimpleNamespace
-from typing import Any, List, Literal, Optional, Tuple, Union, overload
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
@@ -233,7 +233,7 @@ def sm110_gqa_decode(
         allocated tensor.
     """
 
-    from .experimental.sm110_gqa_decode import decode
+    from .experimental.sm110_gqa_decode.backend import sm110_gqa_decode as decode
 
     return decode(
         q,
@@ -259,11 +259,16 @@ def prepare_sm110_gqa_decode(
         ``O`` must not alias any input storage. Optional ``q_scale`` defaults
         to 1.0 and must be finite and positive.
     num_splits : Optional[int]
-        ``None`` selects the prepared shape specialization. Above capacity 64,
-        ``1`` selects the original long kernel. B=1 with capacity 1024 or 4096
-        also supports its fixed split count of ``10``. Above capacity 64,
-        other split choices are rejected. Capacities up to 64 always use the
-        original short kernel; accepted explicit counts are 1, 2, 4, 8, 10, 16.
+        ``None`` (or ``1``) selects the size-based route with one split: one
+        request over a 64-key cache uses the short kernel and over 65..128 keys
+        the long kernel; one request over 129..256 keys or two requests over at
+        most 512 keys use the one-split 64-token-tile build of the split-KV
+        kernel, one or two requests over longer caches its four-slot-ring
+        64-token-tile build, and three or more requests its one-split
+        32-token-tile build. An explicit count in ``{2, 4, 8, 10, 16}``
+        launches the run-time-split program of the shape's tile (64-token tiles
+        for one or two requests over at most 4095 keys, 32-token tiles
+        otherwise) with that many splits; any other value is rejected.
 
     Returns
     -------
@@ -274,15 +279,16 @@ def prepare_sm110_gqa_decode(
     Notes
     -----
     This opt-in interface separates allocation and JIT compilation from
-    sustained decode. Default specializations cover B=4/capacity=256 and
-    B=1/capacity=1024 or 4096; other shapes use the original kernels.
+    sustained decode. The route is a pure function of the batch, the cache
+    capacity and ``num_splits``; a split route owns FP32 partial buffers and
+    self-resetting completion counters in the prepared state.
     Every sequence length must remain in ``[1, capacity]`` at every launch.
     GPU length values may change between launches; preparation does not read
     them back to the host. The caller is responsible for this precondition.
     Prepare and warm up before CUDA Graph capture. Retain the prepared state
     until all asynchronous work completes and captured Graphs are retired.
     """
-    from .experimental.sm110_gqa_decode import prepare_for_launch
+    from .experimental.sm110_gqa_decode.backend import prepare_for_launch
 
     return prepare_for_launch(inputs, num_splits=num_splits)
 
@@ -387,7 +393,7 @@ def launch_sm110_gqa_decode_prepared(prepared: dict[str, Any]) -> torch.Tensor:
     including event-ordered stream handoffs. No allocations or host reads of
     sequence lengths occur in this launch path.
     """
-    from .experimental.sm110_gqa_decode import launch_prepared
+    from .experimental.sm110_gqa_decode.backend import launch_prepared
 
     return launch_prepared(prepared)
 
@@ -1269,6 +1275,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         paged_kv_last_page_len_buffer: Optional[torch.Tensor] = None,
         backend: str = "auto",
         jit_args: Optional[List[Any]] = None,
+        jit_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         r"""Constructor of :class:`BatchDecodeWithPagedKVCacheWrapper`.
 
@@ -1358,6 +1365,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
             otherwise, the wrapper will use default attention implementation.
+
+        jit_kwargs : Optional[Dict[str, Any]]
+            The keyword arguments to create the JIT module, defaults to None.
         """
         if backend == "prims-ts":
             raise NotImplementedError(
@@ -1381,13 +1391,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._jit_module = get_batch_prefill_jit_module(
                     jit_args[0],
                     gen_customize_batch_prefill_module(
-                        backend, *jit_args
+                        backend, *jit_args, **(jit_kwargs or {})
                     ).build_and_load(),
                 )
             else:
                 self._jit_module = get_batch_decode_jit_module(
                     jit_args[0],
-                    gen_customize_batch_decode_module(*jit_args).build_and_load(),
+                    gen_customize_batch_decode_module(
+                        *jit_args, **(jit_kwargs or {})
+                    ).build_and_load(),
                 )
             # jit_args[7] is additional_tensor_names from gen_customize_batch_decode/prefill_module
             self._jit_additional_tensor_names = list(jit_args[7])
@@ -1463,7 +1475,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 )
         self._backend = backend
         # backend="auto" is re-resolved at every plan(); the tensor-core path
-        # rewrites self._backend to its pick, so remember what was asked for.
+        # rewrites self._backend to its pick, so remember what was asked for. The
+        # token-head-scale check in plan() keys off this value so a prior
+        # auto-resolved plan does not leak into a later token-head plan.
         self._requested_backend = backend
         self._cudnn_auto = False
         self._cudnn_auto_frozen: Optional[bool] = None
@@ -1984,6 +1998,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
             Whether the mask is causal within each request block. Defaults to ``None``,
             which derives it from ``q_len_per_req > 1``. Values that differ from
             that default are not supported by this wrapper.
+        use_token_head_sf : bool
+            Whether the FP8 KV cache uses the per-(token, head) scale layout: a separate
+            ``float32`` scale tensor (passed via ``kv_cache_sf`` in :meth:`run`) dequantizes
+            the KV cache inside the kernel. When enabled, the KV cache is FP8 (``e4m3``/
+            ``e5m2``) with standard layout (last dim ``head_dim``), ``q`` must be ``fp16``
+            (or ``bf16`` on SM80+), and the ``fa2`` tensor-core backend is forced.
+            Defaults to ``False``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -2059,6 +2080,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         disable_split_kv: bool = False,
         q_len_per_req: int = 1,
         is_causal: Optional[bool] = None,
+        use_token_head_sf: bool = False,
     ) -> None:
         """Shared plan() implementation for the paged-decode wrapper across backends."""
         _check_workspace_buffer_alignment(
@@ -2089,6 +2111,56 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if o_data_type is None:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
+
+        if use_token_head_sf:
+            if kv_data_type not in (torch.float8_e4m3fn, torch.float8_e5m2):
+                raise ValueError(
+                    f"use_token_head_sf requires fp8 KV dtype, got {kv_data_type}"
+                )
+            if q_data_type not in (torch.float16, torch.bfloat16):
+                raise ValueError(
+                    f"use_token_head_sf requires fp16/bf16 Q dtype, got {q_data_type}"
+                )
+            if get_compute_capability(self.device)[0] < 8:
+                if q_data_type != torch.float16:
+                    raise ValueError(
+                        "use_token_head_sf on SM75 only supports fp16 Q dtype"
+                    )
+            # Decode requires head_dim_qk == head_dim_vo, so K and V share one head_dim;
+            # any 16-multiple is supported.
+            if head_dim % 16 != 0:
+                raise ValueError(
+                    f"use_token_head_sf requires head_dim to be a multiple of 16, got {head_dim}"
+                )
+            # Key off the originally requested backend, not self._backend (which a prior
+            # "auto" plan may have resolved to a non-fa2 backend).
+            if self._requested_backend == "auto":
+                self._backend = "fa2"
+            elif self._requested_backend != "fa2":
+                raise ValueError(
+                    f"use_token_head_sf requires backend='fa2', got {self._requested_backend!r}"
+                )
+            # The custom-JIT-module path (jit_args) is built without the token-head-scale
+            # flag (the decode wrapper takes no jit_kwargs), so its run() would pass None
+            # for the required K/V scale tensors. Reject it rather than silently misroute.
+            if self._jit_module is not None:
+                raise ValueError(
+                    "use_token_head_sf is not supported with a custom JIT module "
+                    "(jit_args); use the standard fa2 tensor-core path instead"
+                )
+            # The CUDA-core decode path has no token-head-scale support; route to the
+            # tensor-core (fa2 prefill) path, which reuses the prefill kernel and reads
+            # the scale from the separate tensor.
+            self._use_tensor_cores = True
+            # __init__ only allocates the CUDA-graph qo_indptr buffer when use_tensor_cores was
+            # set at construction; forcing tensor-core here requires it, so allocate lazily.
+            if self._use_cuda_graph and not hasattr(self, "_qo_indptr_buf"):
+                self._qo_indptr_buf = torch.arange(
+                    self._fixed_batch_size + 1,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+        self._use_token_head_sf = use_token_head_sf
 
         # backend="auto" may resolve to cudnn; decided per plan() so that the
         # q_len_per_req / buffer checks below already know the path.
@@ -2453,6 +2525,26 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         "q_len_per_req > 1 is currently only supported on the "
                         "fa2 tensor-core backend."
                     )
+                if (
+                    self._backend == "fa2"
+                    and q_data_type == torch.float8_e4m3fn
+                    and not (
+                        get_compute_capability(self.device) == (12, 0)
+                        and kv_data_type == torch.float8_e4m3fn
+                        and o_data_type == torch.bfloat16
+                        and head_dim == 256
+                        and pos_encoding_mode == "NONE"
+                        and logits_soft_cap == 0
+                        and q_len_per_req == 1
+                        and num_qo_heads // num_kv_heads in (1, 2, 4, 8)
+                    )
+                ):
+                    raise NotImplementedError(
+                        "The fa2 tensor-core decode takes an e4m3 query only on SM120, "
+                        "for single-token requests with an e4m3 KV cache, bfloat16 "
+                        "output, head_dim 256, no RoPE or soft cap, and 1, 2, 4 or 8 "
+                        "query heads per KV head."
+                    )
                 self._cached_module = get_batch_prefill_module(
                     self._backend,
                     q_data_type,
@@ -2465,6 +2557,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     window_left != -1,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
                     False,  # use_fp16_qk_reduction
+                    use_token_head_sf,
                 )
 
             args = [
@@ -2862,6 +2955,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
             Both tensors have dtype ``torch.float8_e4m3fn``.
 
             Currently, NVFP4 KV supports `fa2` and `trtllm-gen` backend.
+
+            With ``use_token_head_sf=True`` (plan time), ``kv_cache_sf`` must be a
+            ``(k_sf, v_sf)`` tuple of ``float32`` tensors mirroring the KV layout
+            minus ``head_dim``: ``[num_pages, page_size, num_kv_heads]`` if
+            :attr:`kv_layout` is ``NHD``, and ``[num_pages, num_kv_heads, page_size]``
+            if ``HND``. The tensors may be non-contiguous views (e.g. sliced out of
+            an inline slot layout).
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -2875,19 +2975,68 @@ class BatchDecodeWithPagedKVCacheWrapper:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
 
+        if getattr(self, "_use_token_head_sf", False):
+            # FP8 token-head scale uses the standard KV layout (last dim == head_dim);
+            # the scale is a separate float32 tensor passed via kv_cache_sf.
+            # Decode requires head_dim_qk == head_dim_vo, so both share q's head dim.
+            expected_head_dim = q.shape[-1]
+            if k_cache.shape[-1] != expected_head_dim:
+                raise ValueError(
+                    f"use_token_head_sf requires K cache last dim = head_dim "
+                    f"({expected_head_dim}), got {k_cache.shape[-1]}"
+                )
+            if v_cache.shape[-1] != expected_head_dim:
+                raise ValueError(
+                    f"use_token_head_sf requires V cache last dim = head_dim "
+                    f"({expected_head_dim}), got {v_cache.shape[-1]}"
+                )
+
         if k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8:
             if kv_cache_sf is None:
                 raise ValueError("kv_cache_sf must be provided for NVFP4 KV cache.")
-        key_block_scales, value_block_scales = (
-            _unpack_paged_kv_cache(kv_cache_sf, self._kv_layout)
-            if kv_cache_sf is not None
-            else (None, None)
-        )
+        if getattr(self, "_use_token_head_sf", False):
+            # FP8 per-(token, head) scale: kv_cache_sf is a (k_sf, v_sf) tuple of
+            # float32 tensors mirroring the KV layout minus head_dim (3-D paged).
+            # Pass through as-is — the 4-D/5-D expansion in _unpack_paged_kv_cache
+            # is NVFP4-specific and would misinterpret the page_size dim.
+            if not isinstance(kv_cache_sf, (tuple, list)) or len(kv_cache_sf) != 2:
+                raise ValueError(
+                    "use_token_head_sf requires kv_cache_sf to be a "
+                    "(k_sf, v_sf) tuple of float32 tensors"
+                )
+            key_block_scales, value_block_scales = kv_cache_sf
+        else:
+            key_block_scales, value_block_scales = (
+                _unpack_paged_kv_cache(kv_cache_sf, self._kv_layout)
+                if kv_cache_sf is not None
+                else (None, None)
+            )
 
         if self._kv_layout == "NHD":
             page_size = k_cache.shape[1]
         else:
             page_size = k_cache.shape[2]
+        if getattr(self, "_use_token_head_sf", False):
+            # Scale tensors mirror the KV layout minus head_dim; they may be
+            # non-contiguous views (e.g. sliced out of an inline slot), so only
+            # the logical shape and dtype are checked.
+            num_pages = k_cache.shape[0]
+            if self._kv_layout == "NHD":
+                expected_sf_shape = (num_pages, page_size, self._num_kv_heads)
+            else:
+                expected_sf_shape = (num_pages, self._num_kv_heads, page_size)
+            for name, sf in (("k_sf", key_block_scales), ("v_sf", value_block_scales)):
+                if sf is None:
+                    raise ValueError(
+                        "use_token_head_sf requires both k_sf and v_sf in kv_cache_sf"
+                    )
+                if sf.dtype != torch.float32:
+                    raise ValueError(f"{name} must be float32, got {sf.dtype}")
+                if tuple(sf.shape) != expected_sf_shape:
+                    raise ValueError(
+                        f"{name} must have shape {expected_sf_shape} for "
+                        f"kv_layout={self._kv_layout!r}, got {tuple(sf.shape)}"
+                    )
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
@@ -3246,6 +3395,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                             "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
                                 q.shape[1], q.device
                             ),
+                            "maybe_k_cache_sf": key_block_scales,
+                            "maybe_v_cache_sf": value_block_scales,
                         },
                         args,
                     )
@@ -4518,7 +4669,9 @@ def trtllm_batch_decode_with_kv_cache(
 
         if backend == "cake":
             from .cake_fmha import (
+                CakeFmhaAlignedDecodeModule,
                 _resolve_cake_fmha_decode_module,
+                _run_cake_fmha_aligned_decode,
                 select_cake_fmha_decode_route,
             )
 
@@ -4559,6 +4712,23 @@ def trtllm_batch_decode_with_kv_cache(
             cake_module, optimized_loaded = _resolve_cake_fmha_decode_module(
                 query.device, cake_route
             )
+            if isinstance(cake_module, CakeFmhaAlignedDecodeModule):
+                # Aligned hd128 q1 decode: a generated in-tree program whose
+                # binding takes the kernel's host parameters positionally plus
+                # the grid.  The route admits only BF16 / FP16 output in the
+                # query dtype without LSE, so ``out`` is the whole result; it
+                # needs no workspace or counter buffer and ignores enable_pdl.
+                _run_cake_fmha_aligned_decode(
+                    cake_module,
+                    query=query,
+                    key_cache=k_cache,
+                    value_cache=v_cache,
+                    out=out,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                    bmm1_scale=bmm1_scale,
+                )
+                return out
             if not optimized_loaded:
                 # compat_v1 takes host scalar scales; only the optimized
                 # scale-pointer specialization preserves the device binding.
@@ -4984,6 +5154,18 @@ def fast_decode_plan(
                 "q_len_per_req > 1 is currently only supported on the fa2 "
                 "tensor-core backend."
             )
+    if (
+        getattr(self, "_backend", None) == "fa2"
+        and getattr(self, "_cached_q_data_type", None) == torch.float8_e4m3fn
+        and (
+            q_len_per_req != 1
+            or num_qo_heads not in [num_kv_heads * g for g in (1, 2, 4, 8)]
+        )
+    ):
+        raise NotImplementedError(
+            "The fa2 tensor-core decode takes an e4m3 query only for single-token "
+            "requests with 1, 2, 4 or 8 query heads per KV head."
+        )
     if self.is_cuda_graph_enabled:
         frozen_q_len = getattr(self, "_q_len_per_req", None)
         if frozen_q_len is not None and frozen_q_len != q_len_per_req:

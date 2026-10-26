@@ -88,9 +88,10 @@ answers on the host (without `batch`: whether any variant of the geometry
 ships); there is no fallback for an unsupported configuration. The scheduler
 program is shared by every route (route `sm120:metadata`).
 
-The launch grid of the logits program **is** the CTA budget: the programs take
-no compile-line definitions, so one delivered text per program serves every SM
-count and every `sm_count` override.
+The launch grid of the logits program **is** the CTA budget: no compile-line
+definition carries an SM count, so one delivered text serves every SM count and
+every `sm_count` override. The only compile-line definitions are the page size
+and `next_n` of the texts that several routes share (see "Layout").
 
 ## Operands
 
@@ -244,10 +245,23 @@ Every row was measured with `max_context_hint` set to the batch's maximum contex
 ## Layout
 
 Generated CUDA and bindings live in
-`csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated` (one device source
-per program, one binding for the scheduler, one prepared-sequence binding per
-route). The runtime and the program/route catalog are in this directory; the
-public API is `flashinfer/sm120_paged_mqa_logits.py`.
+`csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated`: one device source
+and one prepared-sequence binding per `(heads, Q-atom variant)` text, plus the
+scheduler's kernel and binding. The 32-head texts take the page size as
+`-DPAGE_KV=64|128` (the block-table index, the row offset inside a page and the
+FP32 scale-tail column follow from it; the sequence binding sizes the KV tensor
+map from the same value); the two-token texts (`a2`) take `-DNEXT_N=2..6` and
+the 64-head three-token text (`a3`) `-DNEXT_N=3|5|6` (Q-atom index arithmetic
+and the short-last-atom guards). Each route's sequence record in the catalog
+names the shared sources and carries its definitions in `compile_flags`; every
+`#if` branch is the per-route text that was delivered for that value, so each
+definition set preprocesses to the kernel it replaced. Each definition set also
+keeps the kernel symbol and host-shim namespace of the unit it replaced (the
+`CAKE_PROGRAM_KERNEL` / `CAKE_PROGRAM_SHIM` ladder at the top of the text), so
+every JIT module exports its own symbols although the modules share one
+process. The runtime and the
+program/route catalog are in this directory; the public API is
+`flashinfer/sm120_paged_mqa_logits.py`.
 
 ```bash
 pytest tests/experimental/test_sm120_paged_mqa_logits.py -q
@@ -281,13 +295,11 @@ selects from the second table (16384), and `selection_long["h<H>:n<N>"]`, the
 same shape as `selection`, used when the hint is at least that bound and
 differing from `selection` in batch class 1 only), `max_batch` (the scheduler's shared-memory request
 ceiling), `logits_stride_alignment` (`[128, 256]`), `clean_logits` (`"raw"`),
-`metadata_program`, `metadata_route`, `threads` and per-program `programs`
-records keyed `h<H>:p<P>:n<N>:a<A>` (`atom_variant`, `atom_tokens`,
-`next_n_atom`, `num_atoms`, `last_atom_tokens`, `num_q_stages`, `hoist_b`,
-tile size, group count, KV stages, shared-memory bytes). A program record
-carries `kind` (`"module"` or `"sequence"`), `role`, `sources`, `standalone`,
-`compile_flags`, `ffi_entry`, `arg_plan` and the per-architecture
-`closure_sha256`. Every route record has `stages` (`[[stage, program], ...]`),
-`sequence` (the prepared-sequence binding, `null` for the metadata route),
-`kernel_launches`, `num_heads`, `page_kv`, `next_n`, `next_n_atom`,
-`atom_variant` and `clean_logits`.
+`metadata_route` and `threads`. `programs` holds the standalone scheduler module
+and one prepared-sequence record per logits route; a record carries `kind`
+(`"module"` or `"sequence"`), `role`, `sources` (a sequence lists the scheduler
+kernel, its logits kernel and the binding of its text), `standalone`, `compile_flags`,
+`ffi_entry` and `arg_plan`. A logits route record has `sequence` (the
+prepared-sequence binding), `kernel_launches` (2), `num_heads`, `page_kv`,
+`next_n`, `next_n_atom`, `atom_variant` and `clean_logits`; the metadata route
+has `stages` (`[["metadata", program]]`) and `sequence: null`.

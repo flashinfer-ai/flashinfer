@@ -25,7 +25,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
-kernel_cake_dsv4_nvfp4_a9c628c1d0493dc9608a(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, __nv_bfloat16* __restrict__ O, float* __restrict__ lse_out, int num_heads, int num_splits, int heads_per_cta, float lse_scale)
+kernel_cake_dsv4_nvfp4_77005d9553279f14c044(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, __nv_bfloat16* __restrict__ O, float* __restrict__ lse_out, int num_heads, int num_splits, int heads_per_cta, float lse_scale)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -38,6 +38,7 @@ kernel_cake_dsv4_nvfp4_a9c628c1d0493dc9608a(__nv_bfloat16* __restrict__ partial_
     const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
+    asm volatile("griddepcontrol.wait;" ::: "memory");
     int query_idx = blockIdx.x;
     int head_idx = blockIdx.y * heads_per_cta + warp;
     if (warp < heads_per_cta && head_idx < num_heads) {

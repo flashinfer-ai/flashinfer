@@ -267,7 +267,9 @@ def sm90_fp8_lora_program(
     ``waves_min`` cluster-tile waves over the launch's clusters -- ``(sm_count - sm_count % cluster_m) / cluster_m``
     clusters, ``ceil(M / block_m)`` m-tiles paired per cluster, ``ceil(N / block_n)`` n-tiles -- the gated program
     (TMA L2 policies: A evict_last, W evict_first; raster group ``gated_group_m``) wins; everywhere else the default
-    program.  The selected record's ``group_m`` is the raster group the host passes.
+    program.  The selected record's ``group_m`` is the raster group the host passes, and its ``tiles_per_cluster``
+    the launch grid rule (:func:`launch_grid`): the gated program launches ``cluster_m * ceil(tiles / 4)`` CTAs so the
+    hardware dispatches clusters in tile order and the raster group's two m-pairs read each W n-tile together.
     """
     constants = record["dispatch"]
     default_name, gated_name = (
@@ -614,8 +616,26 @@ def launch_grid(record: dict, m: int, n: int, sm_count: int) -> tuple[int, int, 
         return (2 * min(sm_count // 2, num_tiles), 1, 1)
     if rule == "sm90_persistent":
         cluster_m = int(record["cluster_m"])
+        tiles_per_cluster = record.get("tiles_per_cluster")
+        if tiles_per_cluster:
+            # Dispatched grid: ``tiles_per_cluster`` cluster tiles per launched cluster, so the hardware starts clusters in
+            # tile order as earlier ones finish and the running wave stays a contiguous window of the raster; the persistent
+            # grid's static round robin drifts the clusters apart over hundreds of tiles and the W n-tile the raster
+            # group's m-pairs share is no longer L2-hot for the second pair (CAKE-2550 step 3).
+            num_tiles = sm90_cluster_tiles(record, m, n)
+            return (cluster_m * _ceil_div(num_tiles, int(tiles_per_cluster)), 1, 1)
         return (sm_count - sm_count % cluster_m, 1, 1)
     raise RuntimeError(f"unsupported generated grid rule {rule!r}")
+
+
+def sm90_cluster_tiles(record: dict, m: int, n: int) -> int:
+    """The SM90 kernel's cluster-tile count: ``pairs x n_tiles`` m-pair tiles (two 128-row tiles, one W tile) plus
+    ``tail x n_pairs`` single-m-tile tiles (one 128-row tile, two W tiles)."""
+    cluster_m = int(record["cluster_m"])
+    m_tiles = _ceil_div(m, int(record["block_m"]))
+    n_tiles = _ceil_div(n, int(record["block_n"]))
+    pairs, tail = divmod(m_tiles, cluster_m)
+    return pairs * n_tiles + tail * _ceil_div(n_tiles, cluster_m)
 
 
 def select_cake_quant_lora_template(

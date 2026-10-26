@@ -24,7 +24,7 @@ from ...jit import env as jit_env
 from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 
 # Generated programs of the MiniMax-M3 ICP decode indexer chain, one record per
-# delivered source pair.  A record lists the architectures its source compiles
+# delivered program.  A record lists the architectures its source compiles
 # for (``arches``); the loader compiles it with the exact flag set of the device
 # it runs on, so two architectures never share one cached library.  ``role`` is
 # ``scorer`` (the fused FP8 index scorer with the in-epilogue top-16 of one
@@ -35,450 +35,129 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # keyed by ``world_size`` / ``warps`` / ``entries_per_thread``).  ``ARG_PLANS``
 # lists the host binding's argument order once per role.  ``POLICY`` carries
 # the host-side planning constants the backend mirrors (merge warp policy,
-# pad encodings, production switches).  All three literals are written by the
-# generated-program export; do not edit by hand.
-PROGRAMS: dict[str, dict[str, Any]] = {
-    "cake_msa_icp_indexer_0526764aadf29021f835": {
-        "arches": ["sm_100a", "sm_103a"],
-        "role": "scorer",
-        "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_0526764aadf29021f835_kernel.cu",
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_0526764aadf29021f835_binding.cu",
-        ],
-        "compile_flags": [],
-        "use_pdl": True,
-        "query_len": 8,
-        "rows_per_rank": 32,
-        "page_size": 128,
-        "bpt": 2,
-        "slots": 4,
-        "stages": 6,
-        "ctas_per_sm": 2,
-        "pdl_trigger": "epi",
-    },
-    "cake_msa_icp_indexer_133176f530b7352070c3": {
-        "arches": ["sm_100a", "sm_103a"],
-        "role": "merge",
-        "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_133176f530b7352070c3_kernel.cu",
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_133176f530b7352070c3_binding.cu",
-        ],
-        "compile_flags": [],
-        "use_pdl": True,
-        "world_size": 2,
-        "warps": 2,
-        "entries_per_thread": 8,
-        "late_wait": True,
-        "small_fast": True,
-        "reg_tail": True,
-    },
-    "cake_msa_icp_indexer_177f6799f01a652ddd21": {
-        "arches": ["sm_100a", "sm_103a"],
-        "role": "merge",
-        "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_177f6799f01a652ddd21_kernel.cu",
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_177f6799f01a652ddd21_binding.cu",
-        ],
-        "compile_flags": [],
-        "use_pdl": True,
-        "world_size": 2,
-        "warps": 4,
-        "entries_per_thread": 8,
-        "late_wait": True,
-        "small_fast": True,
-        "reg_tail": True,
-    },
-    "cake_msa_icp_indexer_17f1f4efee096a75db68": {
-        "arches": ["sm_100a", "sm_103a"],
-        "role": "merge",
-        "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_17f1f4efee096a75db68_kernel.cu",
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_17f1f4efee096a75db68_binding.cu",
-        ],
-        "compile_flags": [],
-        "use_pdl": True,
-        "world_size": 2,
-        "warps": 1,
-        "entries_per_thread": 6,
-        "late_wait": True,
-        "small_fast": True,
-        "reg_tail": True,
-    },
-    "cake_msa_icp_indexer_1e761920da002ac94538": {
-        "arches": ["sm_100a", "sm_103a"],
-        "role": "merge",
-        "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_1e761920da002ac94538_kernel.cu",
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_1e761920da002ac94538_binding.cu",
-        ],
-        "compile_flags": [],
-        "use_pdl": True,
-        "world_size": 2,
-        "warps": 4,
-        "entries_per_thread": 6,
-        "late_wait": True,
-        "small_fast": True,
-        "reg_tail": True,
-    },
-    "cake_msa_icp_indexer_1efb99d6a16097468ed4": {
-        "arches": ["sm_100a", "sm_103a"],
-        "role": "scorer",
-        "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_1efb99d6a16097468ed4_kernel.cu",
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_1efb99d6a16097468ed4_binding.cu",
-        ],
-        "compile_flags": [],
-        "use_pdl": True,
-        "query_len": 2,
-        "rows_per_rank": 32,
-        "page_size": 128,
-        "bpt": 2,
-        "slots": 4,
-        "stages": 6,
-        "ctas_per_sm": 2,
-        "pdl_trigger": "epi",
-    },
-    "cake_msa_icp_indexer_2ec5a89c6565dfcd7514": {
-        "arches": ["sm_100a", "sm_103a"],
-        "role": "merge",
-        "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_2ec5a89c6565dfcd7514_kernel.cu",
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_2ec5a89c6565dfcd7514_binding.cu",
-        ],
-        "compile_flags": [],
-        "use_pdl": True,
-        "world_size": 2,
-        "warps": 8,
-        "entries_per_thread": 6,
-        "late_wait": True,
-        "small_fast": True,
-        "reg_tail": True,
-    },
-    "cake_msa_icp_indexer_39d4ed41c00ea86fdd77": {
-        "arches": ["sm_100a", "sm_103a"],
-        "role": "merge",
-        "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_39d4ed41c00ea86fdd77_kernel.cu",
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_39d4ed41c00ea86fdd77_binding.cu",
-        ],
-        "compile_flags": [],
-        "use_pdl": True,
-        "world_size": 4,
-        "warps": 2,
-        "entries_per_thread": 4,
-        "late_wait": True,
-        "small_fast": True,
-        "reg_tail": False,
-    },
-    "cake_msa_icp_indexer_4a17d4a2448067c8f248": {
-        "arches": ["sm_100a", "sm_103a"],
-        "role": "merge",
-        "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_4a17d4a2448067c8f248_kernel.cu",
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_4a17d4a2448067c8f248_binding.cu",
-        ],
-        "compile_flags": [],
-        "use_pdl": True,
-        "world_size": 4,
-        "warps": 8,
-        "entries_per_thread": 10,
-        "late_wait": True,
-        "small_fast": True,
-        "reg_tail": False,
-    },
-    "cake_msa_icp_indexer_4f32c350f45f5f393a0b": {
-        "arches": ["sm_100a", "sm_103a"],
-        "role": "merge",
-        "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_4f32c350f45f5f393a0b_kernel.cu",
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_4f32c350f45f5f393a0b_binding.cu",
-        ],
-        "compile_flags": [],
-        "use_pdl": True,
-        "world_size": 2,
-        "warps": 1,
-        "entries_per_thread": 8,
-        "late_wait": True,
-        "small_fast": True,
-        "reg_tail": True,
-    },
-    "cake_msa_icp_indexer_56918d06c4ae67812752": {
-        "arches": ["sm_100a", "sm_103a"],
-        "role": "scorer",
-        "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_56918d06c4ae67812752_kernel.cu",
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_56918d06c4ae67812752_binding.cu",
-        ],
-        "compile_flags": [],
-        "use_pdl": True,
-        "query_len": 3,
-        "rows_per_rank": 32,
-        "page_size": 128,
-        "bpt": 2,
-        "slots": 4,
-        "stages": 6,
-        "ctas_per_sm": 2,
-        "pdl_trigger": "epi",
-    },
-    "cake_msa_icp_indexer_5aaad7f513fe5e4e7fce": {
-        "arches": ["sm_100a", "sm_103a"],
-        "role": "merge",
-        "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_5aaad7f513fe5e4e7fce_kernel.cu",
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_5aaad7f513fe5e4e7fce_binding.cu",
-        ],
-        "compile_flags": [],
-        "use_pdl": True,
-        "world_size": 2,
-        "warps": 8,
-        "entries_per_thread": 10,
-        "late_wait": True,
-        "small_fast": True,
-        "reg_tail": True,
-    },
-    "cake_msa_icp_indexer_6c9de96daa7d9ac678d6": {
-        "arches": ["sm_100a", "sm_103a"],
-        "role": "merge",
-        "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_6c9de96daa7d9ac678d6_kernel.cu",
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_6c9de96daa7d9ac678d6_binding.cu",
-        ],
-        "compile_flags": [],
-        "use_pdl": True,
-        "world_size": 2,
-        "warps": 1,
-        "entries_per_thread": 2,
-        "late_wait": True,
-        "small_fast": True,
-        "reg_tail": True,
-    },
-    "cake_msa_icp_indexer_71ba5a628ebea112847c": {
-        "arches": ["sm_100a", "sm_103a"],
-        "role": "scorer",
-        "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_71ba5a628ebea112847c_kernel.cu",
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_71ba5a628ebea112847c_binding.cu",
-        ],
-        "compile_flags": [],
-        "use_pdl": True,
-        "query_len": 2,
-        "rows_per_rank": 64,
-        "page_size": 128,
-        "bpt": 1,
-        "slots": 4,
-        "stages": 6,
-        "ctas_per_sm": 2,
-        "pdl_trigger": "epi",
-    },
-    "cake_msa_icp_indexer_7a747c58ca2af7bb6786": {
-        "arches": ["sm_100a", "sm_103a"],
-        "role": "merge",
-        "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_7a747c58ca2af7bb6786_kernel.cu",
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_7a747c58ca2af7bb6786_binding.cu",
-        ],
-        "compile_flags": [],
-        "use_pdl": True,
-        "world_size": 2,
-        "warps": 1,
-        "entries_per_thread": 4,
-        "late_wait": True,
-        "small_fast": True,
-        "reg_tail": True,
-    },
-    "cake_msa_icp_indexer_7e593093c70057f71290": {
-        "arches": ["sm_100a", "sm_103a"],
-        "role": "scorer",
-        "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_7e593093c70057f71290_kernel.cu",
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_7e593093c70057f71290_binding.cu",
-        ],
-        "compile_flags": [],
-        "use_pdl": True,
-        "query_len": 4,
-        "rows_per_rank": 32,
-        "page_size": 128,
-        "bpt": 2,
-        "slots": 4,
-        "stages": 6,
-        "ctas_per_sm": 2,
-        "pdl_trigger": "epi",
-    },
-    "cake_msa_icp_indexer_9c8c1dc86f1b2c21e293": {
-        "arches": ["sm_100a", "sm_103a"],
-        "role": "merge",
-        "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_9c8c1dc86f1b2c21e293_kernel.cu",
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_9c8c1dc86f1b2c21e293_binding.cu",
-        ],
-        "compile_flags": [],
-        "use_pdl": True,
-        "world_size": 2,
-        "warps": 2,
-        "entries_per_thread": 6,
-        "late_wait": True,
-        "small_fast": True,
-        "reg_tail": True,
-    },
-    "cake_msa_icp_indexer_a1d2b2946134a90f832e": {
-        "arches": ["sm_100a", "sm_103a"],
-        "role": "scorer",
-        "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_a1d2b2946134a90f832e_kernel.cu",
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_a1d2b2946134a90f832e_binding.cu",
-        ],
-        "compile_flags": [],
-        "use_pdl": True,
-        "query_len": 1,
-        "rows_per_rank": 128,
-        "page_size": 256,
-        "bpt": 1,
-        "slots": 4,
-        "stages": 6,
-        "ctas_per_sm": 1,
-        "pdl_trigger": "epi",
-    },
-    "cake_msa_icp_indexer_a25ac9f6d1806c937555": {
-        "arches": ["sm_100a", "sm_103a"],
-        "role": "scorer",
-        "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_a25ac9f6d1806c937555_kernel.cu",
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_a25ac9f6d1806c937555_binding.cu",
-        ],
-        "compile_flags": [],
-        "use_pdl": True,
-        "query_len": 4,
-        "rows_per_rank": 64,
-        "page_size": 128,
-        "bpt": 1,
-        "slots": 4,
-        "stages": 6,
-        "ctas_per_sm": 2,
-        "pdl_trigger": "epi",
-    },
-    "cake_msa_icp_indexer_a8101e4dbbf1639b3bbd": {
-        "arches": ["sm_100a", "sm_103a"],
-        "role": "scorer",
-        "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_a8101e4dbbf1639b3bbd_kernel.cu",
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_a8101e4dbbf1639b3bbd_binding.cu",
-        ],
-        "compile_flags": [],
-        "use_pdl": True,
-        "query_len": 1,
-        "rows_per_rank": 32,
-        "page_size": 128,
-        "bpt": 2,
-        "slots": 4,
-        "stages": 6,
-        "ctas_per_sm": 2,
-        "pdl_trigger": "epi",
-    },
-    "cake_msa_icp_indexer_ac84ae929e6b0b76f4a4": {
-        "arches": ["sm_100a", "sm_103a"],
-        "role": "scorer",
-        "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_ac84ae929e6b0b76f4a4_kernel.cu",
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_ac84ae929e6b0b76f4a4_binding.cu",
-        ],
-        "compile_flags": [],
-        "use_pdl": True,
-        "query_len": 4,
-        "rows_per_rank": 128,
-        "page_size": 256,
-        "bpt": 1,
-        "slots": 4,
-        "stages": 6,
-        "ctas_per_sm": 1,
-        "pdl_trigger": "epi",
-    },
-    "cake_msa_icp_indexer_cd167b915dd26c85797e": {
-        "arches": ["sm_100a", "sm_103a"],
-        "role": "merge",
-        "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_cd167b915dd26c85797e_kernel.cu",
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_cd167b915dd26c85797e_binding.cu",
-        ],
-        "compile_flags": [],
-        "use_pdl": True,
-        "world_size": 4,
-        "warps": 2,
-        "entries_per_thread": 2,
-        "late_wait": True,
-        "small_fast": True,
-        "reg_tail": False,
-    },
-    "cake_msa_icp_indexer_cd26681ee2375382ee29": {
-        "arches": ["sm_100a", "sm_103a"],
-        "role": "scorer",
-        "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_cd26681ee2375382ee29_kernel.cu",
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_cd26681ee2375382ee29_binding.cu",
-        ],
-        "compile_flags": [],
-        "use_pdl": True,
-        "query_len": 1,
-        "rows_per_rank": 64,
-        "page_size": 128,
-        "bpt": 1,
-        "slots": 4,
-        "stages": 6,
-        "ctas_per_sm": 2,
-        "pdl_trigger": "epi",
-    },
-    "cake_msa_icp_indexer_d1e79de3128a4be7527e": {
-        "arches": ["sm_100a", "sm_103a"],
-        "role": "scorer",
-        "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_d1e79de3128a4be7527e_kernel.cu",
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_d1e79de3128a4be7527e_binding.cu",
-        ],
-        "compile_flags": [],
-        "use_pdl": True,
-        "query_len": 3,
-        "rows_per_rank": 64,
-        "page_size": 128,
-        "bpt": 1,
-        "slots": 4,
-        "stages": 6,
-        "ctas_per_sm": 2,
-        "pdl_trigger": "epi",
-    },
-    "cake_msa_icp_indexer_dc24f0e9db942be02542": {
-        "arches": ["sm_100a", "sm_103a"],
-        "role": "scorer",
-        "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_dc24f0e9db942be02542_kernel.cu",
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_dc24f0e9db942be02542_binding.cu",
-        ],
-        "compile_flags": [],
-        "use_pdl": True,
-        "query_len": 8,
-        "rows_per_rank": 64,
-        "page_size": 128,
-        "bpt": 1,
-        "slots": 4,
-        "stages": 6,
-        "ctas_per_sm": 2,
-        "pdl_trigger": "epi",
-    },
-    "cake_msa_icp_indexer_f76a34922ef374f481e6": {
-        "arches": ["sm_100a", "sm_103a"],
-        "role": "merge",
-        "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_f76a34922ef374f481e6_kernel.cu",
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_f76a34922ef374f481e6_binding.cu",
-        ],
-        "compile_flags": [],
-        "use_pdl": True,
-        "world_size": 2,
-        "warps": 8,
-        "entries_per_thread": 8,
-        "late_wait": True,
-        "small_fast": True,
-        "reg_tail": True,
-    },
+# pad encodings, production switches).  ``PROGRAMS`` is expanded from one table
+# row per record (the record hash, its host-shim namespace and its key) plus
+# the per-family constants; ``sources`` and ``compile_flags`` follow from the
+# role and the key: the scorer records of one ``rows_per_rank`` family share
+# one kernel text (the family's ``query_len`` 1 export), every record builds
+# its role's host binding, and the flags select the record's kernel symbol,
+# host-shim namespace and launch constants.  The tables, ``ARG_PLANS`` and
+# ``POLICY`` are written by the generated-program export; do not edit by hand.
+# The shared sources and the tabular form are a hand fold of the exported
+# literals pending their regeneration by the export.
+
+# Scorer rows: (record hash, host-shim namespace suffix, query_len,
+# rows_per_rank).
+_SCORER_ROWS: tuple[tuple[str, str, int, int], ...] = (
+    ("0526764aadf29021f835", "46b468ca2078abe4", 8, 32),
+    ("1efb99d6a16097468ed4", "61a3d4f8952519f6", 2, 32),
+    ("56918d06c4ae67812752", "deb8d69a66fbf462", 3, 32),
+    ("71ba5a628ebea112847c", "72403d0537dcc693", 2, 64),
+    ("7e593093c70057f71290", "5f794fce523fb1cc", 4, 32),
+    ("a1d2b2946134a90f832e", "2b60f8cc4e7f722f", 1, 128),
+    ("a25ac9f6d1806c937555", "a2cc60e7cc2ed3a6", 4, 64),
+    ("a8101e4dbbf1639b3bbd", "cd1c9ab33b97201e", 1, 32),
+    ("ac84ae929e6b0b76f4a4", "befc48ed7922eb6a", 4, 128),
+    ("cd26681ee2375382ee29", "ecad07f07917fb3b", 1, 64),
+    ("d1e79de3128a4be7527e", "f1fda020885d0261", 3, 64),
+    ("dc24f0e9db942be02542", "d748cc06c6edb174", 8, 64),
+)
+# rows_per_rank -> (shared kernel text: the family's query_len 1 export,
+# page_size, bpt, ctas_per_sm, dynamic shared memory bytes of the launch).
+_SCORER_FAMILIES: dict[int, tuple[str, int, int, int, int]] = {
+    32: ("a8101e4dbbf1639b3bbd", 128, 2, 2, 66560),
+    64: ("cd26681ee2375382ee29", 128, 1, 2, 66560),
+    128: ("a1d2b2946134a90f832e", 256, 1, 1, 115712),
 }
+# Merge rows: (record hash, host-shim namespace suffix, world_size, warps,
+# entries_per_thread); each merge record builds its own kernel text.
+_MERGE_ROWS: tuple[tuple[str, str, int, int, int], ...] = (
+    ("133176f530b7352070c3", "2d7cf17183503496", 2, 2, 8),
+    ("177f6799f01a652ddd21", "58e050de77950599", 2, 4, 8),
+    ("17f1f4efee096a75db68", "83a03baeada0253c", 2, 1, 6),
+    ("1e761920da002ac94538", "7d7d86ce82514c6a", 2, 4, 6),
+    ("2ec5a89c6565dfcd7514", "94d730f261c73513", 2, 8, 6),
+    ("39d4ed41c00ea86fdd77", "5c72164dfad5d8d4", 4, 2, 4),
+    ("4a17d4a2448067c8f248", "ea1d2723a86d61cf", 4, 8, 10),
+    ("4f32c350f45f5f393a0b", "653f3a7eafcaaf38", 2, 1, 8),
+    ("5aaad7f513fe5e4e7fce", "bee55e82844155f1", 2, 8, 10),
+    ("6c9de96daa7d9ac678d6", "dcc1237482a5bc01", 2, 1, 2),
+    ("7a747c58ca2af7bb6786", "5fe18fd647da4532", 2, 1, 4),
+    ("9c8c1dc86f1b2c21e293", "67f0b3173822d417", 2, 2, 6),
+    ("cd167b915dd26c85797e", "921aa87847d33a7f", 4, 2, 2),
+    ("f76a34922ef374f481e6", "d1cf9c1e048be3f7", 2, 8, 8),
+)
+# warps -> dynamic shared memory bytes of the merge launch (block threads are
+# ``32 * warps``).
+_MERGE_SMEM: dict[int, int] = {1: 768, 2: 1280, 4: 2304, 8: 4352}
+# The host binding every record of a role builds.
+_SCORER_BINDING = "a8101e4dbbf1639b3bbd"
+_MERGE_BINDING = "6c9de96daa7d9ac678d6"
+
+
+def _source(digest: str, kind: str) -> str:
+    return f"cake_msa_icp_indexer/cake_msa_icp_indexer_{digest}_{kind}.cu"
+
+
+def _scorer_record(
+    digest: str, shim: str, query_len: int, rows_per_rank: int
+) -> tuple[str, dict[str, Any]]:
+    kernel, page_size, bpt, ctas_per_sm, smem = _SCORER_FAMILIES[rows_per_rank]
+    name = f"cake_msa_icp_indexer_{digest}"
+    record: dict[str, Any] = {
+        "arches": ["sm_100a", "sm_103a"],
+        "role": "scorer",
+        "sources": [_source(kernel, "kernel"), _source(_SCORER_BINDING, "binding")],
+        "compile_flags": [
+            f"-DBLOCK_Q={4 * query_len}",
+            f"-DCAKE_PROGRAM_KERNEL=kernel_{name}",
+            f"-DCAKE_PROGRAM_SHIM=cake_host_shim_{shim}",
+            f"-DCAKE_BIND_KBOX_ROWS={rows_per_rank}",
+            f"-DCAKE_BIND_SMEM={smem}",
+        ],
+        "query_len": query_len,
+        "rows_per_rank": rows_per_rank,
+        "page_size": page_size,
+        "bpt": bpt,
+        "slots": 4,
+        "stages": 6,
+        "ctas_per_sm": ctas_per_sm,
+        "pdl_trigger": "epi",
+    }
+    return name, record
+
+
+def _merge_record(
+    digest: str, shim: str, world_size: int, warps: int, entries_per_thread: int
+) -> tuple[str, dict[str, Any]]:
+    name = f"cake_msa_icp_indexer_{digest}"
+    record: dict[str, Any] = {
+        "arches": ["sm_100a", "sm_103a"],
+        "role": "merge",
+        "sources": [_source(digest, "kernel"), _source(_MERGE_BINDING, "binding")],
+        "compile_flags": [
+            f"-DCAKE_PROGRAM_KERNEL=kernel_{name}",
+            f"-DCAKE_PROGRAM_SHIM=cake_host_shim_{shim}",
+            f"-DCAKE_BIND_THREADS={32 * warps}",
+            f"-DCAKE_BIND_SMEM={_MERGE_SMEM[warps]}",
+            f"-DCAKE_BIND_WORLD={world_size}",
+        ],
+        "world_size": world_size,
+        "warps": warps,
+        "entries_per_thread": entries_per_thread,
+        "late_wait": True,
+        "small_fast": True,
+    }
+    return name, record
+
+
+PROGRAMS: dict[str, dict[str, Any]] = dict(
+    sorted(
+        [_scorer_record(*row) for row in _SCORER_ROWS]
+        + [_merge_record(*row) for row in _MERGE_ROWS],
+        key=lambda item: item[0],
+    )
+)
 ARG_PLANS: dict[str, list[list[str]]] = {
     "scorer": [
         ["tma_buffer", "Q"],
@@ -541,7 +220,6 @@ ARG_PLANS: dict[str, list[list[str]]] = {
 POLICY: dict[str, Any] = {
     "topk": 16,
     "num_heads": 4,
-    "head_dim": 128,
     "pad_key": 8388607,
     "pad_id": 2147483647,
     "merge_w_policy": [[256, 1], [512, 2], [1024, 4]],
@@ -552,16 +230,7 @@ POLICY: dict[str, Any] = {
         "late_wait": True,
         "scorer_pdl_trigger": "epi",
         "small_fast": True,
-        "reg_tail": True,
     },
-    "status": {
-        "nan_candidate": 1,
-        "layout_overflow": 2,
-        "no_progress": 4,
-        "timeout": 8,
-        "contract": 16,
-    },
-    "phases": {"push_poll": 0, "push_only": 1, "poll_only": 2},
 }
 
 SOURCE_PACKAGE = "cake_msa_icp_indexer"
