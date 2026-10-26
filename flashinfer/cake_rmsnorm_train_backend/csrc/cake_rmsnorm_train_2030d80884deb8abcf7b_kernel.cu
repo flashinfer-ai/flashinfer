@@ -50,20 +50,20 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_RED_FOLD_OFF 0
-#define SMEM_RED_FOLD_STAGE_BYTES 6144
-#define SMEM_RED_FOLD_STRIDE 6144
-#define SMEM_GRP_FOLD_OFF 6144
+#define SMEM_RED_FOLD_STAGE_BYTES 16384
+#define SMEM_RED_FOLD_STRIDE 16384
+#define SMEM_GRP_FOLD_OFF 16384
 #define SMEM_GRP_FOLD_STAGE_BYTES 1024
 #define SMEM_GRP_FOLD_STRIDE 1024
-#define SMEM_TOTAL 7168
-#define THREADS 384
+#define SMEM_TOTAL 17408
+#define THREADS 1024
 
 #include <math_constants.h>
 
 extern "C" {
 
-__global__ __launch_bounds__(384) void
-kernel_cake_rmsnorm_train_434c635cf8da8dc5adb0(float* __restrict__ partial, float* __restrict__ dw, int n_chunks)
+__global__ __launch_bounds__(1024) void
+kernel_cake_rmsnorm_train_2030d80884deb8abcf7b(float* __restrict__ partial, float* __restrict__ dw, int n_chunks)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -81,8 +81,8 @@ kernel_cake_rmsnorm_train_434c635cf8da8dc5adb0(float* __restrict__ partial, floa
     // Kernel setup ops
     float* red_fold = reinterpret_cast<float*>(smem_raw + 0);
     const int red_fold_addr = smem + 0;
-    float* grp_fold = reinterpret_cast<float*>(smem_raw + 6144);
-    const int grp_fold_addr = smem + 6144;
+    float* grp_fold = reinterpret_cast<float*>(smem_raw + 16384);
+    const int grp_fold_addr = smem + 16384;
 
     // === Task calls (declaration order) ===
     asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -98,14 +98,14 @@ kernel_cake_rmsnorm_train_434c635cf8da8dc5adb0(float* __restrict__ partial, floa
         a[e] = 0.0f;
         c[e] = 0.0f;
     }
-    int n_trips = (n_chunks + 47) / 48;
+    int n_trips = (n_chunks + 127) / 128;
     #pragma unroll 4
     for (int k = 0; k < n_trips; k++) {
-        int cc = rsub + k * 48;
+        int cc = rsub + k * 128;
         if (cc < n_chunks) {
             float _vec_load_0[4];
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(partial + (unsigned long long)cc * 6144 + (unsigned long long)col);
+                float4 _v4 = *reinterpret_cast<const float4*>(partial + (unsigned long long)cc * 4096 + (unsigned long long)col);
                 _vec_load_0[0 + 0] = _v4.x;
                 _vec_load_0[0 + 1] = _v4.y;
                 _vec_load_0[0 + 2] = _v4.z;
@@ -136,10 +136,10 @@ kernel_cake_rmsnorm_train_434c635cf8da8dc5adb0(float* __restrict__ partial, floa
             oc[e_3] = 0.0f;
         }
         #pragma unroll
-        for (int k_1 = 0; k_1 < 6; k_1++) {
+        for (int k_1 = 0; k_1 < 16; k_1++) {
             #pragma unroll
             for (int e_4 = 0; e_4 < 4; e_4++) {
-                float d = red_fold[(gi * 6 + k_1) * 32 + lane_1 * 4 + e_4];
+                float d = red_fold[(gi * 16 + k_1) * 32 + lane_1 * 4 + e_4];
                 float y_1 = __fmaf_rn(d, 1.0f, -oc[e_4]);
                 float t_1 = o[e_4] + y_1;
                 oc[e_4] = t_1 - o[e_4] - y_1;
