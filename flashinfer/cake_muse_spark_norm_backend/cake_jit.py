@@ -10200,10 +10200,18 @@ def tokens_heads_grid(
     """The grid of a ``tokens_heads`` rule for ``tokens`` tokens of ``heads`` heads (the kernel's own
     arithmetic): ``(ceil(heads / rows_per_cta), tokens rounded up to tcluster, 1)`` for a cluster over the head
     blocks or the head-major order, else ``(tokens rounded up to max(tcluster, interleave), ceil(heads /
-    rows_per_cta), 1)``."""
+    rows_per_cta), 1)``; for a multi-token program (the rule's ``tpc`` above one: a CTA holding ``tpc`` whole
+    tokens) ``(ceil(tokens / tpc), ceil(heads / (rows_per_cta / tpc)), 1)``."""
     if tokens <= 0 or heads <= 0:
         raise ValueError(
             f"Cake norm tokens_heads launches need positive counts, got tokens={tokens}, heads={heads}"
+        )
+    tpc = int(rule.get("tpc", 1))
+    if tpc > 1:
+        return (
+            -(-int(tokens) // tpc),
+            -(-int(heads) // (int(rule["rows_per_cta"]) // tpc)),
+            1,
         )
     blocks = -(-int(heads) // int(rule["rows_per_cta"]))
     tcluster, interleave = int(rule.get("tcluster", 1)), int(rule.get("interleave", 1))
