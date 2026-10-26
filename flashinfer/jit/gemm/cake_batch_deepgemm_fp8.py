@@ -1290,9 +1290,12 @@ _BAND_MAX_B: dict[tuple[int, int], int] = {(128, 512): 8}
 
 # Stage kinds and their launch shapes (``_stage_plan``):
 #   masked_bn  one BLOCK_N GEMM of the masked family; (program, kind, BLOCK_N,
-#              K tile of the k_tiles argument)
+#              K tile of the k_tiles argument[, "grid_m"]): persistent, its grid
+#              sized from expected_m, or from M with "grid_m"
 #   n128_k512  / n512_k128  the whole-geometry GEMMs of the small shapes; an
-#              n512_k128 stage may name its BLOCK_N (default 128)
+#              n512_k128 stage may name its BLOCK_N (default 128) and its M tiles:
+#              "grid_m" ceil(M / 128), "grid_max" max(ceil(expected_m / 128) + 1,
+#              ceil(M / 128)); either covers every M tile a masked_m <= M reaches
 #   cta1       one CTA per 128-row M tile (the expected_m == 24 profile)
 #   large_nk   two CTAs per 256-row M tile (the large geometries)
 #   pack_m224 + gemm_m224   scale pack into the packed-scale workspace, then
@@ -1353,12 +1356,13 @@ def _band(
 def _bcta(
     route: str,
     nk: tuple[int, int],
-    b: tuple[int, int],
+    b: tuple[int | None, int | None],
     cta: tuple[int | None, int | None],
     stage: tuple[Any, ...],
+    m: tuple[int | None, int | None] = (None, None),
 ) -> _Route:
-    """(N, K) by B and by CTA = B * ceil(expected_m / 128), on both architectures."""
-    where = {"nk": nk, "b": b, "cta": cta}
+    """(N, K) by B, by CTA = B * ceil(expected_m / 128) and by M, on both architectures."""
+    where = {"nk": nk, "b": b, "cta": cta, "m": m}
     return _Route(_BOTH, route, route.split("__")[0], "bcta", where, (stage,), None)
 
 
@@ -1454,17 +1458,37 @@ _ROUTES: tuple[_Route, ...] = (
             (128, 128, 7168, 2048)), None,
            (("cake_batch_deepgemm_fp8_d74da5f79ee356250373", "masked_bn", 128, 128),),
            parent="seed_swap_bm"),
-    # The N=512, K=128 geometry up to B = 8, by B and CTA = B * ceil(expected_m / 128).
+    # The N=512, K=128 geometry, by B, CTA = B * ceil(expected_m / 128) and M. A
+    # one-shot n512_k128 grid covers every (group, M tile, N tile) a masked_m <= M
+    # reaches, and M > 1024 takes the persistent masked_bn programs; expected_m only
+    # selects the route.
     _bcta("seed_n512_k128__b1_bn32", (512, 128), (1, 1), (None, 7),
-          ("cake_batch_deepgemm_fp8_c580972984193a63c3c2", "n512_k128", 32)),
+          ("cake_batch_deepgemm_fp8_c580972984193a63c3c2", "n512_k128", 32, "grid_max"),
+          m=(None, 1024)),
+    _bcta("seed_n512_k128__b1_mbn32", (512, 128), (1, 1), (None, 7),
+          ("cake_batch_deepgemm_fp8_929a5561abc99caa7f4f", "masked_bn", 32, 128, "grid_m"),
+          m=(1025, None)),
     _bcta("seed_n512_k128__b1_bn192", (512, 128), (1, 1), (8, None),
           ("cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9", "masked_bn", 192, 128)),
     _bcta("seed_n512_k128__b2_8_bn32", (512, 128), (2, 8), (None, 8),
-          ("cake_batch_deepgemm_fp8_8d6890e370790c5f11f1", "n512_k128", 32)),
+          ("cake_batch_deepgemm_fp8_8d6890e370790c5f11f1", "n512_k128", 32, "grid_max"),
+          m=(None, 1024)),
+    _bcta("seed_n512_k128__b2_8_mbn32", (512, 128), (2, 8), (None, 8),
+          ("cake_batch_deepgemm_fp8_929a5561abc99caa7f4f", "masked_bn", 32, 128, "grid_m"),
+          m=(1025, None)),
     _bcta("seed_n512_k128__b2_8_bn128", (512, 128), (2, 8), (9, 32),
           ("cake_batch_deepgemm_fp8_c1541da977c9a379e49b", "masked_bn", 128, 128)),
     _bcta("seed_n512_k128__b2_8_bn192", (512, 128), (2, 8), (33, None),
           ("cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9", "masked_bn", 192, 128)),
+    _bcta("seed_n512_k128__b9_bn128", (512, 128), (9, None), (None, None),
+          ("cake_batch_deepgemm_fp8_c9415f6c743e6bb72fc7", "n512_k128", 128, "grid_m"),
+          m=(None, 1024)),
+    _bcta("seed_n512_k128__b9_mbn128", (512, 128), (9, None), (None, 32),
+          ("cake_batch_deepgemm_fp8_c1541da977c9a379e49b", "masked_bn", 128, 128, "grid_m"),
+          m=(1025, None)),
+    _bcta("seed_n512_k128__b9_mbn192", (512, 128), (9, None), (33, None),
+          ("cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9", "masked_bn", 192, 128, "grid_m"),
+          m=(1025, None)),
     # Exact (B, M, N, K, expected_m) points of the masked BLOCK_N family.
     _point("sm_100a", "seed_masked_bn__b1_m128_n4096_k7168_em102",
            ((1, 128, 4096, 7168),), 102,
@@ -1607,11 +1631,9 @@ _ROUTES: tuple[_Route, ...] = (
           ("cake_batch_deepgemm_fp8_c1541da977c9a379e49b", "masked_bn", 128, 128),
           {"sm_100a": ((75, None),),
            "sm_103a": ((77, None),)}),
-    # The remaining N=128, K=512 shapes (B > 8) and the N=512, K=128 geometry.
+    # The remaining N=128, K=512 shapes (B > 8).
     _nk("seed_n128_k512", (128, 512),
         ("cake_batch_deepgemm_fp8_ba92e96364e30012640e", "n128_k512")),
-    _nk("seed_n512_k128", (512, 128),
-        ("cake_batch_deepgemm_fp8_c9415f6c743e6bb72fc7", "n512_k128")),
     # Exact-shape swap-AB routes (scale-pack kernel + GEMM, packed-scale workspace).
     _point("sm_100a", "seed_swap_m32_fp32_sm100_b32",
            ((32, 4096, 6144, 7168),), 24,
@@ -1688,7 +1710,11 @@ def _matches(
         cta = B * ((expected_m + 127) // 128)
         return all(
             (lo is None or lo <= value) and (hi is None or value <= hi)
-            for value, (lo, hi) in ((B, where["b"]), (cta, where["cta"]))
+            for value, (lo, hi) in (
+                (B, where["b"]),
+                (cta, where["cta"]),
+                (M, where.get("m", (None, None))),
+            )
         )
     if row.form == "nk":
         return where["nk"] == (N, K)
@@ -1713,14 +1739,23 @@ def _stage_plan(
     if kind == "masked_bn":
         block_n, k_tile = stage[2], stage[3]
         n_tiles = (N + block_n - 1) // block_n
-        grid = (min(B * ((expected_m + 127) // 128 + 1) * n_tiles, sm_count), 1, 1)
+        if len(stage) > 4 and stage[4] == "grid_m":
+            m_tiles = (M + 127) // 128
+        else:
+            m_tiles = (expected_m + 127) // 128 + 1
+        grid = (min(B * m_tiles * n_tiles, sm_count), 1, 1)
         args = (*_MASKED_TENSORS, B, M, N, n_tiles, K // k_tile, K // 128)
     elif kind == "n128_k512":
         grid = (min(B * ((M + 255) // 256), sm_count // 2) * 2, 1, 1)
         args = ("a", "b", "a_scale", "b_scale", "masked_m", "out", B, M)
     elif kind == "n512_k128":
         block_n = stage[2] if len(stage) > 2 else 128
-        grid = (B * ((expected_m + 127) // 128 + 1) * (N // block_n), 1, 1)
+        m_blocks = (expected_m + 127) // 128 + 1
+        if len(stage) > 3 and stage[3] == "grid_m":
+            m_blocks = (M + 127) // 128
+        elif len(stage) > 3 and stage[3] == "grid_max":
+            m_blocks = max(m_blocks, (M + 127) // 128)
+        grid = (B * m_blocks * (N // block_n), 1, 1)
         args = ("a", "b", "out", "a_scale", "b_scale", "masked_m", B, M, N // block_n)
     elif kind == "cta1":
         m_tiles = (expected_m + 127) // 128 + 1
