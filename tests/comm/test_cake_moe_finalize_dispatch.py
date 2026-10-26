@@ -1,5 +1,7 @@
 """CPU-only tests for the Cake MoE finalize backend selector."""
 
+import re
+
 import pytest
 import torch
 
@@ -141,3 +143,51 @@ def test_unified_selector_is_not_forwarded_to_other_patterns(
     assert result is output
     assert len(calls) == 1
     assert "backend" not in calls[0]
+
+
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+def test_small_token_max_reaches_the_binding(
+    monkeypatch: pytest.MonkeyPatch, world_size: int
+) -> None:
+    calls: list[tuple[object, ...]] = []
+    arches: list[str] = []
+
+    class _Module:
+        def cake_moe_finalize_allreduce_fusion(self, *args: object) -> None:
+            calls.append(args)
+
+    def _get_module(arch: str) -> _Module:
+        arches.append(arch)
+        return _Module()
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(cake_moe_finalize_comm, "target_arch", lambda index: "sm_103a")
+    monkeypatch.setattr(
+        cake_moe_finalize_comm, "get_cake_moe_finalize_module", _get_module
+    )
+    arguments = _arguments()
+    arguments["world_size"] = world_size
+
+    cake_moe_finalize_comm.run_cake_moe_finalize(**arguments, weight_bias=None)
+
+    assert arches == ["sm_103a"]
+    assert len(calls) == 1
+    # Positional binding arguments: world_rank, world_size, small_token_max.
+    assert calls[0][11:14] == (0, world_size, cake_moe_finalize_comm.SMALL_TOKEN_MAX)
+
+
+def test_module_records_match_the_binding() -> None:
+    source_dir = cake_moe_finalize_comm._source_dir()
+    binding = (
+        source_dir / f"{cake_moe_finalize_comm.SOURCE_PACKAGE}_binding.cu"
+    ).read_text()
+    declared = set(
+        re.findall(r"^CAKE_MOE_FINALIZE_KERNEL\([^,]+, (\w+)\)$", binding, re.M)
+    )
+    assert cake_moe_finalize_comm.MODULES
+    for name, record in cake_moe_finalize_comm.MODULES.items():
+        assert record["kernel"] == f"kernel_{name}"
+        assert record["kernel"] in declared
+        assert set(record["arches"]) <= {"sm_100a", "sm_103a"}
+        for source in record["sources"]:
+            assert (source_dir / source).is_file(), source

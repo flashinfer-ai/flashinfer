@@ -62,6 +62,17 @@ int64_t NumelAbove(const TensorView& t, int trailing) {
   return product;
 }
 
+[[noreturn]] void NoInt64(int64_t a, const char* op, int64_t b) {
+  TVM_FFI_THROW(ValueError) << KERNEL_NAME << ": " << a << " " << op << " " << b
+                            << " has no int64 value in a host check";
+}
+
+int64_t CheckedMul(int64_t a, int64_t b) {
+  int64_t product;
+  if (__builtin_mul_overflow(a, b, &product)) NoInt64(a, "*", b);
+  return product;
+}
+
 cuuint64_t Extent(int64_t value, const char* descriptor) {
   TVM_FFI_CHECK(value > 0, ValueError)
       << KERNEL_NAME << ": an extent of descriptor '" << descriptor << "' resolves to " << value;
@@ -82,7 +93,7 @@ CUtensorMap EncodeTma_do_tma(const TensorView& t) {
   int64_t d2 = t.size(-2);
   int64_t outer2 = NumelAbove(t, 2);
   cuuint64_t global_dim[3] = {Extent(d1, "do_tma"), Extent(d2, "do_tma"), Extent(outer2, "do_tma")};
-  cuuint64_t global_strides[2] = {Stride((d1 * 2), "do_tma"), Stride(((d1 * d2) * 2), "do_tma")};
+  cuuint64_t global_strides[2] = {Stride(CheckedMul(d1, 2LL), "do_tma"), Stride(CheckedMul(CheckedMul(d1, d2), 2LL), "do_tma")};
   cuuint32_t box_dim[3] = {64u, 1u, 128u};
   cuuint32_t elem_strides[3] = {1u, 1u, 1u};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2], ValueError)
@@ -108,7 +119,7 @@ CUtensorMap EncodeTma_vnew_tma(const TensorView& t) {
   int64_t d2 = t.size(-2);
   int64_t outer2 = NumelAbove(t, 2);
   cuuint64_t global_dim[3] = {Extent(d1, "vnew_tma"), Extent(d2, "vnew_tma"), Extent(outer2, "vnew_tma")};
-  cuuint64_t global_strides[2] = {Stride((d1 * 2), "vnew_tma"), Stride(((d1 * d2) * 2), "vnew_tma")};
+  cuuint64_t global_strides[2] = {Stride(CheckedMul(d1, 2LL), "vnew_tma"), Stride(CheckedMul(CheckedMul(d1, d2), 2LL), "vnew_tma")};
   cuuint32_t box_dim[3] = {64u, 1u, 128u};
   cuuint32_t elem_strides[3] = {1u, 1u, 1u};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2], ValueError)
@@ -134,7 +145,7 @@ CUtensorMap EncodeTma_aqk_tma(const TensorView& t) {
   int64_t d2 = t.size(-2);
   int64_t outer2 = NumelAbove(t, 2);
   cuuint64_t global_dim[3] = {Extent(d1, "aqk_tma"), Extent(d2, "aqk_tma"), Extent(outer2, "aqk_tma")};
-  cuuint64_t global_strides[2] = {Stride((d1 * 2), "aqk_tma"), Stride(((d1 * d2) * 2), "aqk_tma")};
+  cuuint64_t global_strides[2] = {Stride(CheckedMul(d1, 2LL), "aqk_tma"), Stride(CheckedMul(CheckedMul(d1, d2), 2LL), "aqk_tma")};
   cuuint32_t box_dim[3] = {64u, 1u, 64u};
   cuuint32_t elem_strides[3] = {1u, 1u, 1u};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2], ValueError)
@@ -177,7 +188,7 @@ void Run(TensorView a_do_tma, TensorView a_vnew_tma, TensorView a_aqk_tma, Tenso
   check_same_device(a_dAqk, a_do_tma, "dAqk", "do_tma");
   check_contiguous(a_dv1, "dv1");
   check_same_device(a_dv1, a_do_tma, "dv1", "do_tma");
-  TVM_FFI_CHECK((a_num_heads >= 1), ValueError)
+  TVM_FFI_CHECK((a_num_heads >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (num_heads >= 1)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";

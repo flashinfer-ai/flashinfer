@@ -198,8 +198,8 @@ def test_blackwell_scalar_one_pdl_b64_v32000_takes_cached_cluster_route():
         (1, 256000, None, False, 5),
         (48, 256000, None, False, 6),
         (100, 128000, 0.5, True, 6),
-        (256, 256000, None, False, 7),
-        (512, 128000, 0.5, True, 7),
+        (512, 256000, None, False, 7),
+        (1024, 128000, 0.5, True, 7),
     ],
 )
 def test_blackwell_softmax_all_negative_infinity_matches_public_semantics(
@@ -246,12 +246,14 @@ def test_blackwell_route_observer_falls_back_off_blackwell():
         (8, 4096, "scalar", False, "row"),
         (64, 32000, "scalar", True, "row"),
         (8, 256000, "none", False, "row"),  # 8-tile rows in one wave
-        (16, 256000, "none", False, "shared_tiles"),  # under the persistent threshold
+        (16, 256000, "none", False, "shared_tiles"),  # under 4/5 of persistent trips
         (40, 151936, "scalar", False, "shared_tiles"),  # 5-tile chunks
         (48, 256000, "per_row", True, "persistent"),  # persistent 16-CTA clusters
         (100, 128000, "none", False, "persistent"),  # persistent 8-CTA clusters
+        (64, 128000, "none", False, "persistent"),  # 4/5 of the persistent trips
+        (200, 256000, "per_row", True, "persistent"),  # < 8 rows per shared cluster
         (96, 100008, "none", False, "persistent"),  # a partial last tile in every row
-        (1024, 128000, "none", False, "shared_tiles"),  # 4+ rows per cluster
+        (1024, 128000, "none", False, "shared_tiles"),  # 7+ rows per C8 shared cluster
         (1024, 256000, "per_row", True, "shared_tiles"),
         (989, 128256, "per_row", True, "shared_tiles"),  # rows not a multiple of 8
         (600, 100008, "scalar", False, "shared_tiles"),  # the last tile unreached
@@ -288,8 +290,88 @@ def test_blackwell_cached_cluster_route_is_selected_and_correct(
         "shared_tiles": flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_SHARED_TILES,
     }
     assert route == routes[expected_route]
+    # Only sm_103a launches with PDL: the row-caching and shared-tile kernels
+    # through their _pdl twins, the persistent kernels through a flag.
+    kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    on_sm103 = torch.cuda.get_device_capability() == (10, 3)
+    pdl_twin = enable_pdl and on_sm103 and expected_route != "persistent"
+    assert kernel[2] == int(pdl_twin)
     assert probs.data_ptr() != logits.data_ptr()
     torch.testing.assert_close(probs, probs_ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size",
+    [
+        (31, 32000),  # B200: as many rows as resident 16-CTA clusters
+        (32, 32000),  # B200: fewer resident 16-CTA clusters than rows
+        (33, 32000),  # GB300: as many rows as resident 16-CTA clusters
+        (34, 32000),  # B200 and GB300
+        (36, 64000),
+        (71, 24576),  # B200: as many rows as resident 8-CTA clusters
+        (72, 24576),  # B200: fewer resident 8-CTA clusters than rows
+        (73, 24576),
+        (74, 24576),  # GB300: as many rows as resident 8-CTA clusters
+        (75, 24576),  # GB300: fewer resident 8-CTA clusters than rows
+    ],
+)
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_blackwell_cached_cluster_spread_keeps_rows_resident(
+    rows, vocab_size, enable_pdl
+):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    torch.manual_seed(7)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        logits, temperature=0.5, enable_pdl=enable_pdl
+    )
+    probs = flashinfer.sampling.softmax(logits, temperature=0.5, enable_pdl=enable_pdl)
+
+    _, max_tiles, pdl_twin, resident_clusters, next_resident_clusters = kernel
+    on_sm103 = torch.cuda.get_device_capability() == (10, 3)
+    # Spreading a row over more CTAs stops before a cluster size whose
+    # resident clusters are fewer than the rows, so all rows run in one wave,
+    # and not earlier: twice the CTAs would leave rows for a second wave.
+    assert max_tiles == 4
+    assert rows <= resident_clusters
+    assert rows > next_resident_clusters
+    assert pdl_twin == int(enable_pdl and on_sm103)
+    torch.testing.assert_close(
+        probs, torch.softmax(logits / 0.5, dim=-1), atol=1e-3, rtol=1e-3
+    )
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size,cluster_ctas",
+    [
+        (36, 80000, 16),  # 5-tile 8-CTA chunks
+        (36, 128000, 16),  # 8-tile 8-CTA chunks
+        (73, 32000, 8),  # 4-tile 4-CTA chunks; B200: past the resident 8-CTA clusters
+    ],
+)
+def test_blackwell_cached_cluster_spread_of_wide_chunks_ignores_residency(
+    rows, vocab_size, cluster_ctas
+):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    torch.manual_seed(7)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        logits, temperature=0.5
+    )
+    probs = flashinfer.sampling.softmax(logits, temperature=0.5)
+
+    # Rows whose chunks are wider than the capped spreads allow keep spreading
+    # even when some clusters then run in a second wave, as measured faster.
+    assert kernel[:2] == (cluster_ctas, 4)
+    torch.testing.assert_close(
+        probs, torch.softmax(logits / 0.5, dim=-1), atol=1e-3, rtol=1e-3
+    )
 
 
 @pytest.mark.parametrize(

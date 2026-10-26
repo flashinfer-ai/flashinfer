@@ -62,12 +62,21 @@ int64_t NumelAbove(const TensorView& t, int trailing) {
   return product;
 }
 
-int64_t NonZero(int64_t divisor) {
-  TVM_FFI_CHECK(divisor != 0, ValueError) << KERNEL_NAME << ": a descriptor formula divides by zero";
-  return divisor;
+[[noreturn]] void NoInt64(int64_t a, const char* op, int64_t b) {
+  TVM_FFI_THROW(ValueError) << KERNEL_NAME << ": " << a << " " << op << " " << b
+                            << " has no int64 value in a host check";
 }
 
-int64_t CDiv(int64_t a, int64_t b) { return a / NonZero(b); }
+int64_t CheckedMul(int64_t a, int64_t b) {
+  int64_t product;
+  if (__builtin_mul_overflow(a, b, &product)) NoInt64(a, "*", b);
+  return product;
+}
+
+int64_t CDiv(int64_t a, int64_t b) {
+  if (b == 0 || (a == INT64_MIN && b == -1)) NoInt64(a, "/", b);
+  return a / b;
+}
 
 cuuint64_t Extent(int64_t value, const char* descriptor) {
   TVM_FFI_CHECK(value > 0, ValueError)
@@ -145,7 +154,7 @@ CUtensorMap EncodeTma_aqk_tma(const TensorView& t) {
   int64_t d2 = t.size(-2);
   int64_t outer2 = NumelAbove(t, 2);
   cuuint64_t global_dim[3] = {Extent(d1, "aqk_tma"), Extent(d2, "aqk_tma"), Extent(outer2, "aqk_tma")};
-  cuuint64_t global_strides[2] = {Stride((d1 * 2), "aqk_tma"), Stride(((d1 * d2) * 2), "aqk_tma")};
+  cuuint64_t global_strides[2] = {Stride(CheckedMul(d1, 2LL), "aqk_tma"), Stride(CheckedMul(CheckedMul(d1, d2), 2LL), "aqk_tma")};
   cuuint32_t box_dim[3] = {64u, 1u, 64u};
   cuuint32_t elem_strides[3] = {1u, 1u, 1u};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2], ValueError)
@@ -171,7 +180,7 @@ CUtensorMap EncodeTma_vn_tma(const TensorView& t) {
   int64_t d2 = t.size(-2);
   int64_t outer2 = NumelAbove(t, 2);
   cuuint64_t global_dim[3] = {Extent(d1, "vn_tma"), Extent(d2, "vn_tma"), Extent(outer2, "vn_tma")};
-  cuuint64_t global_strides[2] = {Stride((d1 * 2), "vn_tma"), Stride(((d1 * d2) * 2), "vn_tma")};
+  cuuint64_t global_strides[2] = {Stride(CheckedMul(d1, 2LL), "vn_tma"), Stride(CheckedMul(CheckedMul(d1, d2), 2LL), "vn_tma")};
   cuuint32_t box_dim[3] = {64u, 1u, 64u};
   cuuint32_t elem_strides[3] = {1u, 1u, 1u};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2], ValueError)
@@ -238,13 +247,13 @@ void Run(TensorView a_q_tma, TensorView a_h_tma, TensorView a_aqk_tma, TensorVie
   check_same_device(a_seq_chunk_start, a_q_tma, "seq_chunk_start", "q_tma");
   check_contiguous(a_ticket, "ticket");
   check_same_device(a_ticket, a_q_tma, "ticket", "q_tma");
-  TVM_FFI_CHECK((a_num_seqs >= 0), ValueError)
+  TVM_FFI_CHECK((a_num_seqs >= 0LL), ValueError)
       << KERNEL_NAME << ": requires (num_seqs >= 0)";
-  TVM_FFI_CHECK((a_num_heads >= 1), ValueError)
+  TVM_FFI_CHECK((a_num_heads >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (num_heads >= 1)";
-  TVM_FFI_CHECK((a_num_qk_heads >= 1), ValueError)
+  TVM_FFI_CHECK((a_num_qk_heads >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (num_qk_heads >= 1)";
-  TVM_FFI_CHECK((a_num_heads == (CDiv(a_num_heads, a_num_qk_heads) * a_num_qk_heads)), ValueError)
+  TVM_FFI_CHECK((a_num_heads == CheckedMul(CDiv(a_num_heads, a_num_qk_heads), a_num_qk_heads)), ValueError)
       << KERNEL_NAME << ": requires (num_heads == (CDiv(num_heads, num_qk_heads) * num_qk_heads))";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";

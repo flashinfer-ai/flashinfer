@@ -63,6 +63,9 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_TOTAL 211456
 #define THREADS 288
 #define LAUNCH_MIN_BLOCKS 1
+#ifndef CAKE_FP4_ALLREDUCE_KERNEL
+#define CAKE_FP4_ALLREDUCE_KERNEL cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_sfu_csp_sop
+#endif
 
 #include <math_constants.h>
 
@@ -162,7 +165,7 @@ __device__ __forceinline__ float mul_f32_rn_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(288, LAUNCH_MIN_BLOCKS) void
-cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_sfu_csp_sop(uint8_t* __restrict__ xq, float* __restrict__ gs, __nv_bfloat16* __restrict__ res_in, __nv_bfloat16* __restrict__ w, uint8_t* __restrict__ outq, uint8_t* __restrict__ out_sf, float* __restrict__ gs_out, __nv_bfloat16* __restrict__ res_out, uint8_t* __restrict__ os_wire, uint8_t* __restrict__ os_rs, long long* __restrict__ peer_ptrs, unsigned int* __restrict__ ctrl, int rank, int rows, int cap, float eps, float wbias)
+CAKE_FP4_ALLREDUCE_KERNEL(uint8_t* __restrict__ xq, float* __restrict__ gs, __nv_bfloat16* __restrict__ res_in, __nv_bfloat16* __restrict__ w, uint8_t* __restrict__ outq, uint8_t* __restrict__ out_sf, float* __restrict__ gs_out, __nv_bfloat16* __restrict__ res_out, uint8_t* __restrict__ os_wire, uint8_t* __restrict__ os_rs, long long* __restrict__ peer_ptrs, unsigned int* __restrict__ ctrl, int rank, int rows, int cap, float eps, float wbias)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -299,6 +302,11 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_nvfp4_sfu_csp_sop(uint8_t* __restrict__ xq,
                 if (n > k) {
                     long long row64 = (long long)(r0 + warp_1 + 8 * k);
                     int ob_off = xb_off + k % 3 * 3472;
+#ifdef CAKE_FP4_ALLREDUCE_PREFETCH
+                    asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(reinterpret_cast<uint8_t*>(res_in) + (row64 * 12288 + (long long)(128 * lane_2)))));
+                    asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(reinterpret_cast<uint8_t*>(res_in) + (row64 * 12288 + (long long)(128 * (lane_2 + 32))))));
+                    asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(reinterpret_cast<uint8_t*>(res_in) + (row64 * 12288 + (long long)(128 * (lane_2 + 64))))));
+#endif
                     float rs = 1.0f;
                     mbarrier_wait(xb_full_addr + (warp_1) * 8, k & 1);
                     rs = gs_me;

@@ -3546,10 +3546,11 @@ def test_fake_backend_transfer_matches_lane_p(fake) -> None:
     )
 
 
+@pytest.mark.parametrize("walk_form", ["auto", "full"])
 @pytest.mark.parametrize(
     "graph_cap", ["none", "capture_pref", "node_attr", "node_attr_post"]
 )
-def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
+def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap, walk_form) -> None:
     """The graph-replay option, KDA module, one rank (``world == 1``: no collective): under the public keyword
     ``graph="replay"`` the first call of a validity key runs eagerly, the second is captured and replayed once, later
     calls replay the graph; ``out`` and the five gradients are bitwise the eager (``graph="off"``) results on every call.
@@ -3561,14 +3562,29 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
     record the arm (with the set / reset evidence of the capture-wide preference under ``"capture_pref"``).  The kernel-node
     forms ``"node_attr"`` / ``"node_attr_post"`` capture and replay bitwise too: no
     launch is skipped (``capture_skips`` unchanged), every captured tape launch gets the carveout attribute (``node_attrs``
-    grows by the tape launches of the captured calls, recorded as ``cache_config_nodes``)."""
+    grows by the tape launches of the captured calls, recorded as ``cache_config_nodes``).  The cap applies to the
+    full-width launches of the capped programs only (a two-CTA launch runs uncapped), so the expectations follow the
+    forms the calls launched (``LAST_CALL[kind]["walk_forms"]``): under ``walk_form="auto"`` the registry's rule
+    decides per launch, under ``"full"`` every launch is full-width and the bracket / skip / node-attribute paths are
+    exercised."""
     monkeypatch.setenv(cake_kcp.TEST_KNOBS_ENV, "1")
-    knobs = {"_kcp_test_knobs": {"graph_cap": graph_cap}}
+    knobs = {"_kcp_test_knobs": {"graph_cap": graph_cap, "walk_form": walk_form}}
     backend = cake_kcp.get_backend()
     programs = backend.programs() if hasattr(backend, "programs") else None
-    capped = isinstance(programs, cake_kcp._FiPrograms) and bool(
-        cake_kcp.WALK_CAP_PROGRAMS.get(cake_kcp.WALK_GEOMETRY_DEFAULT)
-    )
+    cap_programs = cake_kcp.WALK_CAP_PROGRAMS.get(cake_kcp.WALK_GEOMETRY_DEFAULT, ())
+    capped = isinstance(programs, cake_kcp._FiPrograms) and bool(cap_programs)
+
+    def n_capped(rec) -> int:
+        """The call's launches under the cap: full-width launches of the capped programs (``walk_forms``)."""
+        return sum(
+            1
+            for name, form, _ in rec["walk_forms"]
+            if cake_kcp._PROGRAM_OF[name] in cap_programs and form == "full"
+        )
+
+    def eager_cc(rec) -> str:
+        return "bracket" if capped and n_capped(rec) else "none"
+
     dt = backend.dtypes
     H = 2
     cu = torch.tensor([0, 300, 1024, 1500], dtype=torch.int64)
@@ -3611,7 +3627,7 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
         )
 
     cake_kcp.graph_cache_clear()
-    ref, ev0, recs0 = run(graph="off")
+    ref, ev0, recs0 = run(graph="off", **knobs)
     ref = tuple(
         x.clone() for x in ref
     )  # copies taken before any other call: the comparison stays explicit
@@ -3619,15 +3635,18 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
         "the eager reference is not finite: the operands violate the delta rule's contract"
     )
     assert ev0 == ("eager", "eager") and recs0[0]["graph"] == "off"
-    eager_cc = "bracket" if capped else "none"
     assert (recs0[0]["cache_config"], recs0[1]["cache_config"]) == (
-        eager_cc,
-        eager_cc,
+        eager_cc(recs0[0]),
+        eager_cc(recs0[1]),
     ), recs0
+    if (
+        capped and walk_form == "full"
+    ):  # every tape launch full-width: the eager bracket on both calls
+        assert n_capped(recs0[0]) >= 1 and n_capped(recs0[1]) >= 1, recs0
     fallback0 = cake_kcp.GRAPH_STATS["fallback"]
     skips0 = programs.capture_skips if capped else None
     nodes0 = programs.node_attrs if capped else None
-    events, ccs, brackets, nodes, tapes = [], [], [], [], []
+    events, ccs, brackets, nodes, caps, inv = [], [], [], [], [], []
     try:
         for _ in range(4):
             res, ev, recs = run(graph="replay", **knobs)
@@ -3637,17 +3656,13 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
                 (recs[0]["cache_config_bracket"], recs[1]["cache_config_bracket"])
             )
             nodes.append(
-                (recs[0].get("cache_config_nodes"), recs[1].get("cache_config_nodes"))
-            )
-            tapes.append(
-                tuple(
-                    sum(
-                        r["sequence"].count(p)
-                        for p in ("kcp_fwdh_tape", "kcp_dhu_tape")
-                    )
-                    for r in recs
+                (
+                    recs[0].get("cache_config_nodes") or 0,
+                    recs[1].get("cache_config_nodes") or 0,
                 )
             )
+            caps.append((n_capped(recs[0]), n_capped(recs[1])))
+            inv.append(recs)
             assert all(torch.equal(a, b) for a, b in zip(res, ref, strict=True)), events
         assert [e[0] for e in events] == ["eager", "capture", "replay", "replay"], (
             events
@@ -3656,7 +3671,7 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
         assert cake_kcp.GRAPH_STATS["fallback"] == fallback0
         assert cake_kcp.LAST_CALL["fwd"]["graph"] == "replay"
         cap_cc = graph_cap if capped else "none"
-        assert [c[0] for c in ccs] == [eager_cc, cap_cc, cap_cc, cap_cc], ccs
+        assert [c[0] for c in ccs] == [eager_cc(inv[0][0]), cap_cc, cap_cc, cap_cc], ccs
         # the backward's validity key hashes the workspace pools and the saved tensors: whether the second
         # replay-mode call repeats the first call's key (capture at the second call, like the forward) or sees a
         # key the first calls changed (capture at the third) depends on which pools those calls create -- both
@@ -3668,38 +3683,47 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
         assert bwd_events == ["eager"] * cap_b + ["capture"] + ["replay"] * (
             3 - cap_b
         ), events
-        assert [c[1] for c in ccs] == [eager_cc] * cap_b + [cap_cc] * (4 - cap_b), ccs
+        assert [c[1] for c in ccs] == [eager_cc(inv[i][1]) for i in range(cap_b)] + [
+            cap_cc
+        ] * (4 - cap_b), ccs
+        n_cap_captured = (
+            caps[1][0] + caps[cap_b][1]
+        )  # the capped (full-width tape) launches inside the two captures
+        if capped and walk_form == "full":
+            assert n_cap_captured >= 2, (
+                caps
+            )  # both captures hold full-width tape launches
         if capped and graph_cap in cake_kcp.GRAPH_NODE_CAPS:
-            # kernel-node cap forms: nothing launched bare; every captured tape launch carries the node attribute
+            # kernel-node cap forms: nothing launched bare; every captured capped launch carries the node attribute
             assert programs.capture_skips == skips0, (programs.capture_skips, skips0)
-            assert programs.node_attrs == nodes0 + tapes[1][0] + tapes[cap_b][1], (
+            assert programs.node_attrs == nodes0 + n_cap_captured, (
                 programs.node_attrs,
                 nodes0,
-                tapes,
+                caps,
             )
-            assert (
-                nodes[1][0] == tapes[1][0] >= 1
-                and nodes[cap_b][1] == tapes[cap_b][1] >= 1
-            ), (
+            assert nodes[1][0] == caps[1][0] and nodes[cap_b][1] == caps[cap_b][1], (
                 nodes,
-                tapes,
+                caps,
             )
-            assert [n[0] for n in nodes[1:]] == [tapes[1][0]] * 3, (
+            assert [n[0] for n in nodes[1:]] == [caps[1][0]] * 3, (
                 nodes
             )  # the replays carry the capture's record
             assert brackets[1][0] is None and brackets[cap_b][1] is None, brackets
-            evidence = programs.node_attr_log
-            assert evidence and all(
-                e["rc"] == 0
-                and e["node_type"] == 0
-                and e["readback"] == cake_kcp.GRAPH_NODE_CARVEOUT
-                for log in evidence.values()
-                for e in log
-            ), evidence
+            if n_cap_captured:
+                evidence = programs.node_attr_log
+                assert evidence and all(
+                    e["rc"] == 0
+                    and e["node_type"] == 0
+                    and e["readback"] == cake_kcp.GRAPH_NODE_CARVEOUT
+                    for log in evidence.values()
+                    for e in log
+                ), evidence
         elif capped:
-            assert (
-                programs.capture_skips > skips0
-            )  # the capped programs launched bare inside the captures
+            assert programs.capture_skips == skips0 + n_cap_captured, (
+                programs.capture_skips,
+                skips0,
+                caps,
+            )  # each capped launch inside a capture launches bare and counts one skip
             if graph_cap == "capture_pref":
                 for b in (
                     brackets[1][0],
@@ -3722,17 +3746,19 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
         assert n_entries >= 2 and cake_kcp.graph_cache_clear() == 0
     finally:
         cake_kcp.graph_cache_clear()
-    res, ev, _ = run(graph="off")
+    res, ev, _ = run(graph="off", **knobs)
     assert ev == ("eager", "eager") and all(
         torch.equal(a, b) for a, b in zip(res, ref, strict=True)
     )
     _evidence(
-        f"gpu_graph_replay_{graph_cap}",
+        f"gpu_graph_replay_{graph_cap}_{walk_form}",
         {
             "module": "cake_kcp",
             "T": T,
             "H": H,
             "graph_cap": graph_cap,
+            "walk_form": walk_form,
+            "walk_forms_eager": [list(map(list, r["walk_forms"])) for r in recs0],
             "capped_geometry": capped,
             "events": events,
             "cache_config": ccs,
@@ -3742,7 +3768,7 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
             else None,
             "node_attrs_delta": (programs.node_attrs - nodes0) if capped else None,
             "cache_config_nodes": nodes,
-            "tape_launches": tapes,
+            "capped_launches": caps,
             "node_attr_log": {
                 f"{k[0]}:{k[1]}": v for k, v in programs.node_attr_log.items()
             }
@@ -4098,6 +4124,82 @@ def test_host_trim_kernel_backend_run_skips_the_discarded_abi() -> None:
     c3 = call(1, geometry="shipped")
     backend.run("kcp_fwdh_tape", {"walk": [0, 1], "h0": None, "out": None, "_call": c3})
     assert calls == [("run_program", "kcp_fwdh_tape", None, None)]
+
+
+def test_walk_form_of_decides_once_per_table_set() -> None:
+    """``_walk_form_of`` (the record form of a K1 / K2 walk launch) evaluates the registry's rule once per
+    ``(program, walk list, H, SM count, knob)`` of the call's table set and looks the form up on every later launch:
+    the forms of a per-launch evaluation (the rule's inputs are static per ``(ctx, H)``), a fresh equal list finding
+    the same entry, the knob's forced forms passing through; a provider without a form rule gives ``"full"``."""
+    part = kp.kcp_partition((0, 64 * 200, 64 * 350), 4, layout="contiguous")
+    ctx = kp.build_kcp_context(part, None, 0, "cpu", 4, sm_count=148)
+    tb = cake_kcp._Tables(ctx, 64)
+    evaluated: list[tuple] = []
+
+    def rule(program, chains, num_heads, sm_count, *, knob="auto"):
+        evaluated.append((program, tuple(chains), num_heads, sm_count, knob))
+        return cake_kcp_jit.walk_form(program, chains, num_heads, sm_count, knob=knob)
+
+    programs = types.SimpleNamespace(
+        jit=types.SimpleNamespace(
+            walk_form=rule,
+            WALK_FORM_RULES=cake_kcp_jit.WALK_FORM_RULES,
+            sm_count=lambda index: 148,
+        )
+    )
+    seg = [int(x) for x in tb.hp.seg_chunk_start]
+    lists = {
+        "offset": tb.walk_offset,
+        "in": tb.walk_in,
+        "live": tb.walk_live,
+        "end": tb.walk_end,
+        "first": list(tb.walk_offset[:1]),  # a list unlike the others: its own entry
+    }
+
+    def call(knob: str):
+        return types.SimpleNamespace(
+            tb=tb, H=64, device=torch.device("cpu"), walk_form=knob
+        )
+
+    forms: dict[
+        tuple, str
+    ] = {}  # (knob, program, walk tuple) -> form: one rule evaluation each
+    for knob in ("auto", "full", "split"):
+        for name in cake_kcp_jit.WALK_FORM_RULES:
+            for tag, lst in lists.items():
+                if not lst:
+                    continue
+                want = cake_kcp_jit.walk_form(
+                    name, [seg[s + 1] - seg[s] for s in lst], 64, 148, knob=knob
+                )
+                forms[(knob, name, tuple(lst))] = want
+                for _ in range(3):  # the first launch evaluates, the others look up
+                    got = cake_kcp._walk_form_of(
+                        call(knob), programs, name, {"walk": lst}
+                    )
+                    assert got == want, (knob, name, tag, got, want)
+                fresh = {
+                    "walk": [int(s) for s in lst]
+                }  # a fresh equal list: the same entry
+                assert cake_kcp._walk_form_of(call(knob), programs, name, fresh) == want
+    # every distinct (knob, program, walk list) evaluated exactly once (equal lists share the entry)
+    assert len(forms) >= 3 * len(cake_kcp_jit.WALK_FORM_RULES) * 2, len(forms)
+    assert sorted(evaluated) == sorted(
+        (name, tuple(seg[s + 1] - seg[s] for s in walk), 64, 148, knob)
+        for (knob, name, walk) in forms
+    ), (len(evaluated), len(forms))
+    assert all(form == knob for (knob, _, _), form in forms.items() if knob != "auto")
+    assert {
+        forms[("auto", name, tuple(tb.walk_offset))]
+        for name in cake_kcp_jit.WALK_FORM_RULES
+    } >= {"split"}  # the tape programs' rule
+    bare = types.SimpleNamespace(jit=types.SimpleNamespace())
+    assert (
+        cake_kcp._walk_form_of(
+            types.SimpleNamespace(), bare, "kcp_fwdh_offset", {"walk": tb.walk_offset}
+        )
+        == "full"
+    )
 
 
 class _FakeGraphRt:

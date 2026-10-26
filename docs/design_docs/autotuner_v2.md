@@ -51,15 +51,22 @@ unusable entries as work to rebuild).
 v2 is a standalone context manager, deliberately disjoint from `autotune()`:
 
 ```python
-with flashinfer.autotune_v2(measurement_policy=MeasurementPolicy(execution_mode="cuda_graph")):
+graph_policy = MeasurementPolicy(execution_mode="cuda_graph")
+with flashinfer.autotune_v2(measurement_policy=graph_policy):
     model(dummy_inputs)      # warmup: tune misses, publish each winner atomically
 model(inputs)                # serving: reuses entries, no context needed
 
-# fresh process, same environment
-with flashinfer.autotune_v2(mode="replay"):
+# fresh process, same environment and measurement policy
+graph_policy = MeasurementPolicy(execution_mode="cuda_graph")
+with flashinfer.autotune_v2(mode="replay", measurement_policy=graph_policy):
     pass                     # hydrate only
 model(inputs)
 ```
+
+The measurement policy is part of the managed-cache identity. Reusing the same
+cache root without passing the original policy selects a different store; it
+does not hydrate the graph-tuned winners. Bare serving after the context exits
+uses the attached store under the default process scope.
 
 | `mode` | `persistent_cache` | meaning |
 |---|---|---|
