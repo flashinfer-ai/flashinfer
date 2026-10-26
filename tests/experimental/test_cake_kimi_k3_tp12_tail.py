@@ -207,11 +207,38 @@ def test_generated_module_inventory():
             "grid",
         }
         assert record["launch"]["use_pdl"] is True
+        # the one-launch program's CTAs wait for CTAs of the same grid: it launches cooperatively, the others do not
+        assert record["launch"]["cooperative"] is key.startswith("k123:"), key
         assert tuple(record["launch"]["block"]) == (cb.THREADS, 1, 1)
     for arch in cake_jit.ARCHES:
         assert cake_jit.route_available(arch, tuple(required))
         for key in required:
             assert cake_jit.kernel_module_name(arch, key) == cake_jit.KERNELS[key]
+
+
+class _FakeCommBackend:
+    """A host-only stand-in for the comm backend's ``allgather``: every rank reports ``counts``."""
+
+    def __init__(self, counts):
+        self.counts = tuple(counts)
+        self.sent = []
+
+    def allgather(self, data):
+        self.sent.append(data)
+        return self.counts
+
+
+def test_sm_count_is_the_group_minimum():
+    # the persistent tails map token t to CTA t mod P on every rank: P is the group's smallest SM count
+    backend = _FakeCommBackend([152] * 11 + [148])
+    assert cb.group_sm_count(backend, 152) == 148
+    assert backend.sent == [152]
+    assert cb.group_sm_count(_FakeCommBackend([152] * 12), 152) == 152
+    assert cb.group_sm_count(_FakeCommBackend([148] * 12), 148) == 148
+    with pytest.raises(ValueError):
+        cb.group_sm_count(_FakeCommBackend([152] * 12), 0)
+    with pytest.raises(ValueError):
+        cb.group_sm_count(_FakeCommBackend([152] * 11 + [0]), 152)
 
 
 class _LaunchKwargsWorkspace:
@@ -390,8 +417,28 @@ def _rank_invariant(out: torch.Tensor, world: int) -> bool:
     return all(torch.equal(outs[0], t) for t in outs[1:])
 
 
+@pytest.fixture(scope="module")
+def twelve_rank_group():
+    """The process group of the twelve-rank tests, initialised once for the module.
+
+    A process group initialised again after ``destroy_process_group`` in the same torchrun process can read the
+    previous group's rendezvous keys from the launcher's store, so the tests share one group.
+    """
+    import torch.distributed as dist
+
+    owns_group = not dist.is_initialized()
+    if owns_group:
+        dist.init_process_group("nccl")
+    rank, world = dist.get_rank(), dist.get_world_size()
+    local = int(os.environ.get("LOCAL_RANK", rank % max(1, torch.cuda.device_count())))
+    torch.cuda.set_device(local)
+    yield rank, world, torch.device("cuda", local)
+    if owns_group:
+        dist.destroy_process_group()
+
+
 @pytest.mark.skipif(bool(_twelve_rank_platform()), reason=_twelve_rank_platform() or "")
-def test_tail_matches_reference_on_twelve_ranks():
+def test_tail_matches_reference_on_twelve_ranks(twelve_rank_group):
     import torch.distributed as dist
 
     from flashinfer.kimi_k3_tp12_tail import (
@@ -399,14 +446,8 @@ def test_tail_matches_reference_on_twelve_ranks():
         prepare_kimi_k3_tp12_tail,
     )
 
-    owns_group = not dist.is_initialized()
-    if owns_group:
-        dist.init_process_group("nccl")
-    rank, world = dist.get_rank(), dist.get_world_size()
+    rank, world, device = twelve_rank_group
     assert world == cb.WORLD_SIZE
-    local = int(os.environ.get("LOCAL_RANK", rank % max(1, torch.cuda.device_count())))
-    torch.cuda.set_device(local)
-    device = torch.device("cuda", local)
     if not cb.generated_program_available(device):
         pytest.skip("no generated program registered for this architecture")
     workspace = create_kimi_k3_tp12_tail_workspace(rank=rank, max_tokens=GPU_MAX_TOKENS)
@@ -474,5 +515,62 @@ def test_tail_matches_reference_on_twelve_ranks():
     finally:
         torch.cuda.synchronize()
         workspace.destroy()
-        if owns_group:
-            dist.destroy_process_group()
+
+
+# One-launch rows of both programs and one row of every tail route.
+STREAM_ROWS = (1, 4, 8, 64, 320, 961)
+STREAM_CALLS = 24
+
+
+@pytest.mark.skipif(bool(_twelve_rank_platform()), reason=_twelve_rank_platform() or "")
+def test_alternating_streams_are_ordered_on_twelve_ranks(twelve_rank_group):
+    """Calls that alternate between two streams with no caller synchronisation run one at a time (the workspace
+    orders a launch from another stream after the previous one): every call is bitwise the single-stream result."""
+    import torch.distributed as dist
+
+    from flashinfer.kimi_k3_tp12_tail import (
+        create_kimi_k3_tp12_tail_workspace,
+        prepare_kimi_k3_tp12_tail,
+    )
+
+    rank, world, device = twelve_rank_group
+    assert world == cb.WORLD_SIZE
+    if not cb.generated_program_available(device):
+        pytest.skip("no generated program registered for this architecture")
+    workspace = create_kimi_k3_tp12_tail_workspace(rank=rank, max_tokens=GPU_MAX_TOKENS)
+    streams = (torch.cuda.Stream(), torch.cuda.Stream())
+    try:
+        for M in STREAM_ROWS:
+            inp = make_inputs(M, rank, device)
+            # one runner (and output) per stream over the one workspace: each stream touches only its own output
+            outs = (inp["out"], torch.empty_like(inp["out"]))
+            runners = [
+                prepare_kimi_k3_tp12_tail(
+                    inp["routed"],
+                    inp["shared"],
+                    inp["norm_w"],
+                    inp["up_w"],
+                    out,
+                    workspace=workspace,
+                )
+                for out in outs
+            ]
+            runners[0]()
+            torch.cuda.synchronize()
+            first = outs[0].clone()
+            copies = torch.empty(
+                (STREAM_CALLS, *first.shape), dtype=first.dtype, device=device
+            )
+            for i in range(STREAM_CALLS):
+                with torch.cuda.stream(streams[i % 2]):
+                    outs[i % 2].fill_(float("nan"))
+                    runners[i % 2]()
+                    copies[i].copy_(outs[i % 2])
+            torch.cuda.synchronize()
+            for i in range(STREAM_CALLS):
+                assert torch.equal(copies[i], first), f"M={M}: call {i} differs"
+            assert _rank_invariant(first, world), f"M={M}: output differs between ranks"
+        dist.barrier()
+    finally:
+        torch.cuda.synchronize()
+        workspace.destroy()
