@@ -35,6 +35,7 @@ def test_partial_route_map_padding_keeps_trt_absolute_limits():
     cfg = SimpleNamespace(
         use_early_exit=0,
         is_persistent=False,
+        token_metadata_stride=1,
     )
 
     _, mn_limit, route_map = _launch_metadata_lists(
@@ -69,6 +70,7 @@ def test_early_exit_route_map_padding_is_not_semantic_metadata():
     cfg = SimpleNamespace(
         use_early_exit=1,
         is_persistent=True,
+        token_metadata_stride=1,
     )
 
     _, _, route_map = _launch_metadata_lists(
@@ -154,7 +156,7 @@ def test_persistent_multistage_workid_disables_c_scratch_ab_alias():
     assert not cfg.aliases_c_scratch_with_ab
 
 
-def test_single_stage_workid_allows_c_scratch_ab_alias():
+def test_single_stage_workid_keeps_c_scratch_disjoint_from_ab():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         TileScheduler,
         make_config,
@@ -165,4 +167,4 @@ def test_single_stage_workid_allows_c_scratch_ab_alias():
         num_stages_workid=1,
     )
 
-    assert cfg.aliases_c_scratch_with_ab
+    assert not cfg.aliases_c_scratch_with_ab

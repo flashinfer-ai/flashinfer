@@ -59,19 +59,16 @@ remain SM120/SM121-only, and outside those routes the 10.0/10.3/10.7 backend
 requires separate contiguous K and V tensors and does not make implicit
 copies. The decode ``out=`` parameter is implemented by that 10.0/10.3/10.7 route
 alone; every other route raises ``NotImplementedError`` when it is passed.
-The compute capability 10.0/10.3/10.7 backend uses TopK16 as its generic contract
-and additionally retains four shape-exact routes: paged BF16 decode at
-B64/Q8/KV65536/TopK32, 512-thread paged BF16 decode at
-B2/Q1/KV257/TopK4, flat
-BF16-query/FP8-KV prefill at B3/Q1024/KV8192/TopK8, and paged BF16 prefill at
-B3/Q4096/KV8192/TopK4. Neighboring non-TopK16 shapes fail closed instead of
-entering a generic kernel. The decode path uses direct persistent M16
-ownership for both Q1 and multi-token decode; it does not route BF16 decode
-through prefill or split-K.
-Frozen BF16-query/FP8-KV Q1 serving shapes use exact or transformed direct
-kernels, while paged uniform FP8 Q/K/V supports Q1 through Q32 and returns
-BF16 output. Long batch-one BF16 causal prefill uses a selected-block reverse
-producer and deterministic reduction once the query reaches 8192 tokens.
+The compute capability 10.0/10.3/10.7 backend uses TopK16 as its generic contract;
+non-TopK16 shapes fail closed instead of entering a generic kernel. The decode
+path uses direct persistent M16 ownership for both Q1 and multi-token decode;
+it does not route BF16 decode through prefill or split-K. With
+``force_fused=True``, two frozen BF16-query/FP8-KV single-query serving shapes
+use transformed direct kernels, and paged uniform FP8 Q/K/V supports Q1
+through Q32 and returns BF16 output. Long BF16 causal prefill uses a
+selected-block reverse producer and deterministic reduction when every
+request of the call has at least 8192 queries (and, on flat K/V, at least
+8192 keys).
 The NVFP4 paged-KV prefill route on compute capability 10.0/10.3/10.7 requires
 CUDA 13.0 or newer; on an older toolkit it declines with the reason, which
 ``msa_prefill_nvfp4_specialized_stats()`` also reports as
@@ -103,20 +100,8 @@ CUDA graph capture of sparse prefill or decode on compute capability
 10.0/10.3/10.7 requires a caller-owned
 :class:`flashinfer.msa_ops.MSASparseAttentionWorkspace`. Warm the workspace
 eagerly with the exact tensors, options, and capture stream before capture.
-The exact decode overrides are eager-only. The exact TopK8 reverse-prefill
-route is also eager-only because its reducer uses a host-owned monotonic launch
-generation. The exact paged TopK4 route normally captures its producer and
-reducer into an internal two-node CUDA graph; while an outer CUDA graph is
-being captured it emits the two kernel nodes directly.
-
-Normal callers should leave the Blackwell schedule environment variables
-unset. For advanced diagnostics and benchmarking,
-``FLASHINFER_MSA_PREFILL_SCHEDULE=m64`` forces the eligible M64 prefill
-schedule. ``FLASHINFER_MSA_FP8_Q1_SCHEDULE`` can select
-``batch_attention``, ``q1_exact``, ``q1_flat_xform2``,
-``q1_paged_xform2``, or ``paged_uniform_fp8`` for an eligible FP8 Q1 route.
-Unsupported values, or a schedule incompatible with the input layout and
-dtypes, raise :class:`ValueError`.
+The two FP8-KV single-query decode specializations are eager-only; under
+capture the same inputs take the generic decode route.
 
 .. currentmodule:: flashinfer.msa_ops
 

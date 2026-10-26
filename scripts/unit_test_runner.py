@@ -299,11 +299,17 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
             "SAMPLE_OFFSET (defaults: SAMPLE_RATE=5, SAMPLE_OFFSET=0)"
         ),
     )
-    parser.add_argument(
+    worker_options = parser.add_mutually_exclusive_group()
+    worker_options.add_argument(
         "--workers",
         type=_positive,
-        default=os.environ.get("UNIT_TEST_WORKERS", max(1, len(visible_devices()))),
-        help="local workers, at most visible GPU count (UNIT_TEST_WORKERS)",
+        default=os.environ.get("UNIT_TEST_WORKERS"),
+        help="total local workers, assigned to visible GPUs round-robin (UNIT_TEST_WORKERS)",
+    )
+    worker_options.add_argument(
+        "--workers-per-gpu",
+        type=_positive,
+        help="workers per visible GPU; defaults to one",
     )
     parser.add_argument(
         "--unit-timeout-seconds",
@@ -391,6 +397,12 @@ def _shell_settings(argv: list[str]) -> int:
     return 0
 
 
+def _worker_count(args: argparse.Namespace) -> int:
+    if args.workers_per_gpu is not None:
+        return args.workers_per_gpu * max(1, len(visible_devices()))
+    return args.workers if args.workers is not None else max(1, len(visible_devices()))
+
+
 def _load_frozen_plan(junit_dir: Path) -> Plan:
     manifest = load_manifest(junit_dir)
     if manifest is None:
@@ -417,6 +429,7 @@ def _execute_command(args: argparse.Namespace, operation_started_at: float) -> i
             "UNIT_TEST_TIMEOUT_GRACE_SECONDS or --timeout-grace-seconds"
         )
 
+    args.workers = _worker_count(args)
     _report_collection_jit_parallelism(args.workers)
     pytest_command_prefix = _pytest_command_prefix()
     planning = PlanningOptions(

@@ -17,12 +17,16 @@ Synthetic NVFP4 paged-KV MSA decode problems in the canonical page layout.
 
 Builds one planar page pool exactly as ``docs/design_docs/nvfp4_msa_paged_kv_layout.md``
 describes it (K data, linear K scales, V data, swizzled V scales per page), a
-permuted page table, right-aligned decode tokens and a head-major top-k
-selection, and returns the strided views every SM100/SM103 MSA reader
-consumes.  Shared by the experimental Cake decode tests and its benchmark.
+page table (shuffled, identity or shared-prefix order), right-aligned decode
+tokens and a head-major top-k selection -- independent per token, or with a
+controlled fraction of history pages shared by the tokens of a request -- and
+returns the strided views every SM100/SM103 MSA reader consumes.  Shared by
+the experimental Cake decode tests and its benchmark.
 """
 
 from __future__ import annotations
+
+from typing import Optional
 
 import torch
 
@@ -34,6 +38,7 @@ DATA_DIM = HEAD_DIM // 2
 SCALE_DIM = HEAD_DIM // SCALE_VEC
 K_GLOBAL_SCALE = 0.75
 V_GLOBAL_SCALE = 0.85
+PAGE_TABLE_ORDERS = ("shuffled", "identity", "shared_prefix")
 
 
 def page_layout(num_kv_heads: int) -> dict:
@@ -123,6 +128,103 @@ def swizzle_v_scale(linear: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     return out.reshape_as(linear)
 
 
+def _page_table(
+    blocks: torch.Tensor, order: str, generator: torch.Generator
+) -> tuple[torch.Tensor, int]:
+    """``(page_table, num_physical_pages)`` for ``blocks`` pages per request.
+
+    ``shuffled``: every request owns its pages, drawn from one permutation of
+    the pool (the default).  ``identity``: every request owns its pages in
+    pool order.  ``shared_prefix``: the first ``max_pages // 4`` logical pages
+    of every request alias the same physical pages (an L2-reuse pattern); the
+    remaining pages are private and follow in pool order.
+    """
+    batch = int(blocks.numel())
+    counts = [int(n) for n in blocks.tolist()]
+    max_pages = max(counts)
+    page_table = torch.full((batch, max_pages), -1, dtype=torch.int32)
+    if order == "shared_prefix":
+        shared = max_pages // 4
+        cursor = shared
+        for request, count in enumerate(counts):
+            own = min(shared, count)
+            page_table[request, :own] = torch.arange(own, dtype=torch.int32)
+            private = count - own
+            page_table[request, own:count] = torch.arange(
+                cursor, cursor + private, dtype=torch.int32
+            )
+            cursor += private
+        return page_table, cursor
+    num_pages = sum(counts)
+    if order == "shuffled":
+        physical = torch.randperm(num_pages, generator=generator).to(torch.int32)
+    elif order == "identity":
+        physical = torch.arange(num_pages, dtype=torch.int32)
+    else:
+        raise ValueError(
+            f"page_table_order must be one of {PAGE_TABLE_ORDERS}, got {order!r}"
+        )
+    cursor = 0
+    for request, count in enumerate(counts):
+        page_table[request, :count] = physical[cursor : cursor + count]
+        cursor += count
+    return page_table, num_pages
+
+
+def overlap_selection(
+    generator: torch.Generator, own_pages: list[int], overlap: float, topk: int = TOPK
+) -> list[list[int]]:
+    """Per-token ascending selections of one (request, KV head) with shared history pages.
+
+    ``own_pages[i]`` is token ``i``'s own page (always selected).  History
+    pages are drawn from ``[0, own_pages[0])``, the prefix visible to every
+    token of the request.  ``overlap`` is the fraction of the ``topk - 1``
+    history slots the tokens share: the shared pages are drawn once, the
+    remaining slots come from disjoint parts of the shuffled history while
+    pages last (``overlap = 0`` gives disjoint rows whenever the context is
+    long enough), then from the siblings' own pages ``[own_pages[0],
+    own_pages[i])``.  A token with fewer than ``topk`` visible pages selects
+    every visible page.  Rows keep per-token ascending order; the caller pads
+    with ``-1``.
+    """
+    history_n = int(own_pages[0])
+    slots = [min(topk, int(own) + 1) - 1 for own in own_pages]
+    shared_n = min(history_n, int(round(float(overlap) * (topk - 1))))
+    history = (
+        torch.randperm(history_n, generator=generator).tolist() if history_n else []
+    )
+    shared = history[:shared_n]
+    pool = history[shared_n:]
+    cursor = 0
+    rows: list[list[int]] = []
+    for i, own in enumerate(own_pages):
+        chosen = set(shared[: min(shared_n, slots[i])])
+        chosen.add(int(own))
+        need = slots[i] - (len(chosen) - 1)
+        scanned = 0
+        while need > 0 and pool and scanned < len(pool):
+            if cursor >= len(pool):
+                pool = [
+                    pool[j]
+                    for j in torch.randperm(len(pool), generator=generator).tolist()
+                ]
+                cursor = 0
+            candidate = pool[cursor]
+            cursor += 1
+            scanned += 1
+            if candidate not in chosen:
+                chosen.add(candidate)
+                need -= 1
+        for page in range(int(own_pages[0]), int(own)):
+            if need <= 0:
+                break
+            if page not in chosen:
+                chosen.add(page)
+                need -= 1
+        rows.append(sorted(chosen))
+    return rows
+
+
 def build_decode_inputs(
     seq_lens,
     *,
@@ -135,30 +237,36 @@ def build_decode_inputs(
     v_global_scale: float = V_GLOBAL_SCALE,
     topk: int = TOPK,
     pages_per_chunk: int = 512,
+    q_overlap_fraction: Optional[float] = None,
+    page_table_order: str = "shuffled",
 ) -> dict:
     """One decode step of ``len(seq_lens)`` requests against a fresh page pool.
 
     Token ``i`` of a request sits at position ``seq_len - seqlen_q + i``; its
     selection holds ``min(topk, own_page + 1)`` distinct pages at or before its
     own page (always including the own page, so the causal edge is exercised),
-    ascending and ``-1`` padded, one independent selection per KV head.
+    ascending and ``-1`` padded, one independent selection per KV head.  With
+    ``q_overlap_fraction`` set, the tokens of a request share that fraction of
+    their history slots (:func:`overlap_selection`); ``page_table_order``
+    selects the page-table pattern (:func:`_page_table`).  The defaults
+    reproduce the independent draw and the shuffled table bit for bit.
     """
     device = torch.device(device)
     seq_lens = torch.as_tensor(list(seq_lens), dtype=torch.int32)
     batch = int(seq_lens.numel())
     if batch == 0 or int(seq_lens.min()) < seqlen_q:
         raise ValueError("every request needs at least seqlen_q KV tokens")
+    if page_table_order not in PAGE_TABLE_ORDERS:
+        raise ValueError(
+            f"page_table_order must be one of {PAGE_TABLE_ORDERS}, got {page_table_order!r}"
+        )
+    if q_overlap_fraction is not None and not 0.0 <= float(q_overlap_fraction) <= 1.0:
+        raise ValueError("q_overlap_fraction must be in [0, 1]")
     num_q_heads = num_kv_heads * group_size
     blocks = (seq_lens.long() + PAGE_SIZE - 1) // PAGE_SIZE
     max_pages = int(blocks.max())
-    num_pages = int(blocks.sum())
     cpu = torch.Generator().manual_seed(seed)
-    permutation = torch.randperm(num_pages, generator=cpu).to(torch.int32)
-    page_table = torch.full((batch, max_pages), -1, dtype=torch.int32)
-    cursor = 0
-    for request, count in enumerate(blocks.tolist()):
-        page_table[request, :count] = permutation[cursor : cursor + count]
-        cursor += count
+    page_table, num_pages = _page_table(blocks, page_table_order, cpu)
 
     layout = page_layout(num_kv_heads)
     pool = torch.zeros(
@@ -196,16 +304,29 @@ def build_decode_inputs(
     own_page = positions // PAGE_SIZE
     q2k = torch.full((num_kv_heads, total_q, topk), -1, dtype=torch.int32)
     select = torch.Generator().manual_seed(seed + 99)
-    for row in range(total_q):
-        own = int(own_page[row])
-        count = min(topk, own + 1)
-        for head in range(num_kv_heads):
-            if count > 1:
-                history = torch.randperm(own, generator=select)[: count - 1]
-                chosen = torch.cat([history, torch.tensor([own])])
-            else:
-                chosen = torch.tensor([own])
-            q2k[head, row, :count] = torch.sort(chosen).values.to(torch.int32)
+    if q_overlap_fraction is None:
+        for row in range(total_q):
+            own = int(own_page[row])
+            count = min(topk, own + 1)
+            for head in range(num_kv_heads):
+                if count > 1:
+                    history = torch.randperm(own, generator=select)[: count - 1]
+                    chosen = torch.cat([history, torch.tensor([own])])
+                else:
+                    chosen = torch.tensor([own])
+                q2k[head, row, :count] = torch.sort(chosen).values.to(torch.int32)
+    else:
+        for request in range(batch):
+            rows = range(request * seqlen_q, (request + 1) * seqlen_q)
+            own_pages = [int(own_page[row]) for row in rows]
+            for head in range(num_kv_heads):
+                selections = overlap_selection(
+                    select, own_pages, float(q_overlap_fraction), topk
+                )
+                for row, chosen in zip(rows, selections, strict=True):
+                    q2k[head, row, : len(chosen)] = torch.tensor(
+                        chosen, dtype=torch.int32
+                    )
 
     return dict(
         q=q,
@@ -223,6 +344,8 @@ def build_decode_inputs(
         num_pages=num_pages,
         max_pages=max_pages,
         pool=pool,
+        q_overlap_fraction=q_overlap_fraction,
+        page_table_order=page_table_order,
     )
 
 

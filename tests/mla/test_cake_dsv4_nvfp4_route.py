@@ -6,6 +6,8 @@ extension and the explicit ``NotImplementedError`` raised while the generated
 NVFP4 sources are not exported. No GPU is needed.
 """
 
+import re
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -48,9 +50,12 @@ def test_fp8_format_accepts_every_backend():
         _check_dsv4_kv_cache_format_backend("int4", "cake")
 
 
-# (num_query_tokens, num_heads, sparse_topk, extra_topk, sm_count) -> (variant, num_splits, tiles_per_split, grid, merge_heads_per_cta)
+# (num_query_tokens, num_heads, sparse_topk, extra_topk, sm_count) -> (instantiation, num_splits, tiles_per_split, grid, merge_heads_per_cta)
 # generated from the Cake production plans of the 76 contract rows of the DSv4 NVFP4 shape ledger at the exportable SM counts;
-# the H64 one-tile rows at 2 or 4 CTAs per work item run the H64 tile member (same grid and split count as the tile member)
+# the H64 one-tile rows at 2 or 4 CTAs per work item run the H64 tile member (same grid and split count as the tile member).
+# The instantiation label ``nvfp4_decode_<member>[_n<tile_n>][_oc<o_chunks>]`` names the kernel instantiation the plan
+# selects (the per-knob program it was exported as); ``_instantiation`` maps it onto the registered member variant and
+# the (tile_n, o_chunks) launch arguments the host passes.
 _CAKE_PLAN_TABLE = {
     (1, 16, 128, 0, 148): ("nvfp4_decode_swap_n16_oc4", 1, 1, 4, 1),
     (1, 16, 128, 0, 152): ("nvfp4_decode_swap_n16_oc4", 1, 1, 4, 1),
@@ -182,11 +187,45 @@ _CAKE_PLAN_TABLE = {
     (128, 128, 512, 512, 152): ("nvfp4_decode_persistent", 1, 8, 128, 16),
 }
 
+_INSTANTIATION_LABEL = re.compile(
+    r"nvfp4_decode_(?P<member>[a-z0-9_]+?)(?:_n(?P<tile_n>\d+))?(?:_oc(?P<o_chunks>\d+))?"
+)
+_TEMPLATED_MEMBERS = ("pv", "swap", "tile", "tile_h64")
+# The explicit instantiations of the templated members' kernel units, i.e. the rows of
+# their launchers' instance tables: (variant, tile_n, o_chunks).
+_TEMPLATED_INSTANTIATIONS = {
+    ("nvfp4_decode_swap", 16, 1),
+    ("nvfp4_decode_swap", 16, 2),
+    ("nvfp4_decode_swap", 16, 4),
+    ("nvfp4_decode_swap", 32, 1),
+    ("nvfp4_decode_swap", 32, 2),
+    ("nvfp4_decode_swap", 32, 4),
+    ("nvfp4_decode_tile", None, 1),
+    ("nvfp4_decode_tile", None, 2),
+    ("nvfp4_decode_tile", None, 4),
+    ("nvfp4_decode_tile_h64", None, 2),
+    ("nvfp4_decode_tile_h64", None, 4),
+    ("nvfp4_decode_pv", 16, 1),
+    ("nvfp4_decode_pv", 32, 1),
+}
+
+
+def _instantiation(label):
+    """(registered variant, tile_n, o_chunks) of a plan-table instantiation label."""
+    match = _INSTANTIATION_LABEL.fullmatch(label)
+    assert match is not None, label
+    member, tile_n, o_chunks = match.group("member", "tile_n", "o_chunks")
+    return (
+        cake._nvfp4_variant_name(member),
+        int(tile_n) if tile_n is not None else None,
+        int(o_chunks) if o_chunks is not None else 1,
+    )
+
 
 @pytest.mark.parametrize("key", sorted(_CAKE_PLAN_TABLE))
 def test_nvfp4_plan_matches_cake_plan(key):
     tokens, num_heads, topk, extra_topk, sm_count = key
-    variant, expected_splits, expected_tiles_per_split, expected_grid, expected_hpc = (
+    label, expected_splits, expected_tiles_per_split, expected_grid, expected_hpc = (
         _CAKE_PLAN_TABLE[key]
     )
     plan = _nvfp4_plan(
@@ -201,18 +240,22 @@ def test_nvfp4_plan_matches_cake_plan(key):
     assert plan.total_tiles == plan.num_main_tiles + plan.num_extra_tiles
     assert (
         plan.variant,
+        plan.tile_n,
+        plan.o_chunks,
         plan.num_splits,
         plan.tiles_per_split,
         plan.grid,
         plan.merge_heads_per_cta,
     ) == (
-        variant,
+        *_instantiation(label),
         expected_splits,
         expected_tiles_per_split,
         expected_grid,
         expected_hpc,
     )
     assert plan.variant in cake._NVFP4_DECODE_VARIANTS
+    if plan.member in _TEMPLATED_MEMBERS:
+        assert (plan.variant, plan.tile_n, plan.o_chunks) in _TEMPLATED_INSTANTIATIONS
     # Every split owns tiles_per_split tiles and the splits cover all tiles.
     assert plan.tiles_per_split * (plan.num_splits - 1) < plan.total_tiles
     assert plan.tiles_per_split * plan.num_splits >= plan.total_tiles
@@ -227,25 +270,58 @@ def test_nvfp4_plan_matches_cake_plan(key):
         )
 
 
+@pytest.mark.parametrize("sm_count", [148, 160])
+def test_nvfp4_plan_selects_an_instantiated_cell(sm_count):
+    """Every templated-member plan names a cell its launcher instantiates."""
+    tokens_sweep = (
+        1,
+        2,
+        3,
+        4,
+        5,
+        7,
+        8,
+        9,
+        12,
+        16,
+        24,
+        32,
+        48,
+        64,
+        96,
+        128,
+        256,
+        1024,
+        4096,
+    )
+    for heads in cake._NVFP4_HEAD_COUNTS:
+        for total_tiles in range(1, cake._NVFP4_MAX_SPLITS + 1):
+            for tokens in tokens_sweep:
+                plan = _nvfp4_plan(
+                    num_query_tokens=tokens,
+                    num_heads=heads,
+                    sparse_topk=128 * total_tiles,
+                    extra_topk=0,
+                    sm_count=sm_count,
+                )
+                assert plan.variant in cake._NVFP4_DECODE_VARIANTS
+                if plan.member in _TEMPLATED_MEMBERS:
+                    cell = (plan.variant, plan.tile_n, plan.o_chunks)
+                    assert cell in _TEMPLATED_INSTANTIATIONS, plan
+
+
 def test_nvfp4_variant_names():
     assert cake._nvfp4_variant_name("persistent") == "nvfp4_decode_persistent"
-    assert (
-        cake._nvfp4_variant_name("swap", tile_n=16, o_chunks=4)
-        == "nvfp4_decode_swap_n16_oc4"
-    )
-    assert cake._nvfp4_variant_name("tile", o_chunks=2) == "nvfp4_decode_tile_oc2"
-    assert (
-        cake._nvfp4_variant_name("tile_h64", o_chunks=4) == "nvfp4_decode_tile_h64_oc4"
-    )
-    assert (
-        cake._nvfp4_variant_name("t64", tile_n=64, o_chunks=1)
-        == "nvfp4_decode_t64_n64_oc1"
-    )
-    with pytest.raises(ValueError, match="variant knob"):
-        cake._nvfp4_variant_name("pv", o_chunks=1)
+    assert cake._nvfp4_variant_name("cluster") == "nvfp4_decode_cluster"
+    assert cake._nvfp4_variant_name("t64") == "nvfp4_decode_t64_n64_oc1"
+    # One program per templated member; tile_n / o_chunks are launch arguments.
+    for member in _TEMPLATED_MEMBERS:
+        assert cake._nvfp4_variant_name(member) == f"nvfp4_decode_{member}"
     with pytest.raises(ValueError, match="unknown NVFP4 family member"):
         cake._nvfp4_variant_name("merge")
-    assert len(set(_NVFP4_VARIANTS)) == len(_NVFP4_VARIANTS) == 17
+    assert len(set(_NVFP4_VARIANTS)) == len(_NVFP4_VARIANTS) == 8
+    for arch in ("sm_100a", "sm_103a"):
+        assert set(_NVFP4_VARIANTS) <= set(_ARCH_REGISTRATIONS[arch]["variants"])
 
 
 def test_nvfp4_plan_head_tiles_and_caps():
@@ -357,6 +433,8 @@ def test_nvfp4_argument_vocabulary():
     for name in (
         "tiles_per_split",
         "total_tiles",
+        "tile_n",
+        "o_chunks",
         "main_page_stride",
         "lse_partial_scale",
         "lse_scale",
@@ -364,30 +442,16 @@ def test_nvfp4_argument_vocabulary():
         assert cake.is_bindable_arg("parameter", name)
     values = {"lse_scale": 0.5, "total_tiles": 3}
     assert (
-        cake._bind_argument(
-            values, "parameter", "lse_scale", variant="v", grid={}, descriptor_slab=None
-        )
+        cake._bind_argument(values, "parameter", "lse_scale", variant="v", grid={})
         == 0.5
     )
     assert (
-        cake._bind_argument(
-            values,
-            "parameter",
-            "total_tiles",
-            variant="v",
-            grid={},
-            descriptor_slab=None,
-        )
+        cake._bind_argument(values, "parameter", "total_tiles", variant="v", grid={})
         == 3
     )
     with pytest.raises(TypeError, match="must be an int"):
         cake._bind_argument(
-            {"total_tiles": 2.0},
-            "parameter",
-            "total_tiles",
-            variant="v",
-            grid={},
-            descriptor_slab=None,
+            {"total_tiles": 2.0}, "parameter", "total_tiles", variant="v", grid={}
         )
 
 

@@ -164,9 +164,10 @@ class TopkReduce:
     # topk loop (small enough to not bloat registers; a CTA-broadcast read).
     _prefetch_limit: ClassVar[int] = 16
 
-    def __init__(self, hidden: int, num_topk: int, combine_format: CombineFormat) -> None:
+    def __init__(self, hidden: int, num_topk: int, combine_format: CombineFormat, num_experts: Optional[int] = None) -> None:
         self.hidden = int(hidden)
         self.num_topk = int(num_topk)
+        self.num_experts = None if num_experts is None else int(num_experts)
         self.combine_format = combine_format
         self.hidden_per_thread = self._hidden_per_thread[combine_format.name]
         # hidden must tile cleanly both into worker slices and into scale blocks.
@@ -192,7 +193,11 @@ class TopkReduce:
         reduced_output: cute.Tensor,  # (token, hidden)
         topk_score: Optional[cute.Tensor],  # (token, topk)
         stream: cuda.CUstream,
+        topk_indices: Optional[cute.Tensor] = None,
     ):
+        if cutlass.const_expr(topk_indices is not None):
+            if cutlass.const_expr(self.num_experts is None or self.combine_format.is_quantized):
+                raise ValueError("Masked combine requires BF16 storage and a static expert count.")
         threads = self._threads
         total_workers = reduced_output.shape[0] * self.hidden_tiles
         grid = [(total_workers + threads - 1) // threads, 1, 1]
@@ -212,7 +217,7 @@ class TopkReduce:
             )
 
         if cutlass.const_expr(not self.combine_format.is_quantized):
-            self._reduce_bf16(combine_quant, topk_score, reduced_output).launch(grid=grid, block=block, stream=stream)
+            self._reduce_bf16(combine_quant, topk_score, reduced_output, topk_indices).launch(grid=grid, block=block, stream=stream)
             return
 
         # The mega kernel hands sf in already as the depth-2 broadcast layout; a
@@ -247,7 +252,7 @@ class TopkReduce:
     # -- kernels --------------------------------------------------------------
 
     @cute.kernel
-    def _reduce_bf16(self, combine_output: cute.Tensor, topk_score: Optional[cute.Tensor], reduced_output: cute.Tensor):
+    def _reduce_bf16(self, combine_output: cute.Tensor, topk_score: Optional[cute.Tensor], reduced_output: cute.Tensor, topk_indices: Optional[cute.Tensor] = None):
         threads = self._threads
         hidden_per_thread = self.hidden_per_thread
         hidden_tiles = self.hidden_tiles
@@ -283,11 +288,26 @@ class TopkReduce:
 
             for k in cutlass.range_constexpr(0, num_topk, 1):
                 term = cute.make_rmem_tensor((hidden_per_thread,), cutlass.BFloat16)
-                cute.copy(
-                    load_atom, mark_alignment(terms[k, None], hidden_per_thread * cutlass.BFloat16.width // 8), term
-                )
+                # Invalid routes never write a combine slot. Suppress the
+                # stale load here instead of clearing the entire plane before
+                # the main kernel, which pollutes decode's working set.
+                if cutlass.const_expr(topk_indices is not None):
+                    expert = topk_indices[token_idx, Int32(k)]
+                    valid_route = (expert >= 0) & (expert < self.num_experts)
+                    term.fill(0)
+                    if valid_route:
+                        cute.copy(
+                            load_atom, mark_alignment(terms[k, None], hidden_per_thread * cutlass.BFloat16.width // 8), term
+                        )
+                else:
+                    cute.copy(
+                        load_atom, mark_alignment(terms[k, None], hidden_per_thread * cutlass.BFloat16.width // 8), term
+                    )
                 if cutlass.const_expr(topk_score is not None and not prefetch):
                     score_reg[k] = topk_score[token_idx, Int32(k)]
+                if cutlass.const_expr(topk_indices is not None):
+                    if not valid_route:
+                        score_reg[k] = score_dtype(0)
                 score_pair = (Float32(score_reg[k]), Float32(score_reg[k]))
 
                 for i in cutlass.range_constexpr(0, hidden_per_thread, 2):

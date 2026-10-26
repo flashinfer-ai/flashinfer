@@ -19,7 +19,16 @@ Hopper Humming MXFP4 fused (the scale ABI is selected automatically)::
         --max-tokens 8 32 64 128 256 512 1024 2048
 
 ``--intermediate`` is the width after activation. Use ``MEGA_NO_DIST=1`` for
-single-rank tuning. Atomic reduction candidates require
+single-rank tuning.
+
+``--dtype sm120_mxfp4_mxfp8`` tunes the transport table of the SM120 Cake MegaMoE
+backend (``transport_table="tuned"``) on the launched topology::
+
+    torchrun --nproc_per_node=8 -m flashinfer.moe_ep.tune --dtype sm120_mxfp4_mxfp8 \\
+        --hidden 4096 --intermediate 2048 --num-experts 256 --topk 6 \\
+        --max-tokens 512 2048 8192 [--shared-expert]
+
+Atomic reduction candidates require
 ``--allow-nondeterministic`` and an engine configuration that enables IKR.
 """
 
@@ -38,6 +47,7 @@ from .sm90_routing import (
 
 
 def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    """Parse offline workload, pipeline and sweep options without starting CUDA."""
     parser = argparse.ArgumentParser(
         prog="python -m flashinfer.moe_ep.tune",
         description="Offline cutedsl mega-MoE knob tuner (writes the knob cache).",
@@ -49,6 +59,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "mxfp8_e4m3",
             "mxfp8_e5m2",
             "mxfp4_mxfp8",
+            "sm120_mxfp4_mxfp8",
             "sm90_fp8_e4m3",
             "sm90_fp8_e5m2",
             "sm90_bf16",
@@ -83,6 +94,11 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="backend family; auto selects sm107 on Rubin, sm100 otherwise; "
         "sm90_fp8_* / sm90_mxfp4 / sm90_bf16 dtypes select sm90",
     )
+    parser.add_argument(
+        "--shared-expert",
+        action="store_true",
+        help="sm120_mxfp4_mxfp8: tune the in-kernel FP8 shared-expert variant",
+    )
     parser.add_argument("--hidden", type=int, required=True)
     parser.add_argument(
         "--intermediate",
@@ -111,7 +127,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--kernel-variant",
         choices=("inference", "genphase"),
         default="inference",
-        help="SM107 kernel composition; GenPhase requires at most 1024 tokens/rank",
+        help="SM107 or SM100 MXFP8 kernel composition; GenPhase capacity <= 1024",
     )
     parser.add_argument(
         "--gate-up-clamp",
@@ -165,6 +181,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "after EP communication completes (SM100 NVFP4)",
     )
     parser.add_argument(
+        "--apply-routing-weights-before-fc2",
         "--apply-topk-in-fc1",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -292,12 +309,28 @@ def _resolve_arch(arch: str) -> str:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    """Validate CLI options and run the architecture-specific offline tuner.
+
+    Invalid argument combinations return 2 before importing a backend tuner;
+    valid requests return the selected tuner's exit code.
+    """
     args = _parse_args(argv)
     error = _argument_error(args)
     if error is not None:
         print(error, file=sys.stderr)
         return 2
 
+    if args.dtype == "sm120_mxfp4_mxfp8":
+        if args.arch != "auto":
+            print("sm120_mxfp4_mxfp8 requires --arch auto", file=sys.stderr)
+            return 2
+        tuner = importlib.import_module(
+            ".backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake.cake_tuner", __package__
+        )
+        return tuner.run_tuning(args)
+    if args.shared_expert:
+        print("--shared-expert requires --dtype sm120_mxfp4_mxfp8", file=sys.stderr)
+        return 2
     if args.dtype == "sm90_mxfp4":
         if args.arch not in ("auto", "sm90"):
             print("sm90_mxfp4 requires --arch auto or sm90", file=sys.stderr)
@@ -333,7 +366,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             backend = "mxfp8_mxfp8_bf16_cutedsl"
 
-    if not args.do_finalize or not args.apply_topk_in_fc1:
+    if not args.do_finalize or not args.apply_routing_weights_before_fc2:
         if family != "sm100" or args.dtype != "nvfp4":
             print(
                 "caller finalization and routing-weight placement require SM100 NVFP4",
@@ -357,8 +390,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("GenPhase requires --combine-dtype bf16", file=sys.stderr)
         return 2
 
-    if args.kernel_variant != "inference" and family != "sm107":
-        print("--kernel-variant genphase requires --arch sm107", file=sys.stderr)
+    if (
+        args.kernel_variant == "genphase"
+        and family != "sm107"
+        and not (
+            family == "sm100"
+            and args.dtype == "mxfp8_e4m3"
+            and not args.allow_nondeterministic
+        )
+    ):
+        print(
+            "GenPhase requires SM107 or SM100 MXFP8 E4M3 with deterministic reduction",
+            file=sys.stderr,
+        )
         return 2
 
     activation_requested = (

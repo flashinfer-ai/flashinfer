@@ -55,6 +55,7 @@ from ....schedulers.fc12_mapping import BlockPhase
 from . import dynamic_mainloop
 from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
 from .tma_gather import sm107_tma_gather4_load
+from .....helpers.ptx_helpers import barrier_sync_unaligned
 
 
 class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
@@ -129,6 +130,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         self._validate_desc_inputs(problem_desc, impl_desc)
+        self.cluster_shape_mn = tuple(impl_desc.get("cluster_shape_mn", (4, 1)))
 
         self.quant_kind = QuantKind(problem_desc["quant_kind"])
         self.a_dtype = self.quant_kind.weight_dtype
@@ -142,6 +144,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
         self.mma_instruction_mnk = impl_desc["mma_instruction_mnk"]
         self.mma_tiler_mnk = impl_desc["mma_tiler_mnk"]
         self.use_2cta_instrs = impl_desc["use_2cta_instrs"]
+        self.num_gather_b_warps = 2 if self.mma_tiler_mnk[1] == 64 and self.cluster_shape_mn == (4, 1) else 4
         self.tmem_plan = impl_desc["tmem_plan"]
         self.mainloop_smem_budget_bytes = impl_desc["mainloop_smem_budget_bytes"]
         self.num_accumulator_consumer_warps_per_cta = impl_desc["num_accumulator_consumer_warps_per_cta"]
@@ -213,6 +216,16 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
         # Only the 256-wide token tile is specialized: at 128 the shared plan
         # already reaches 93% of DRAM peak, so it stays byte-for-byte as it was.
         self.uses_asymmetric_ab_stages = self.cta_tile_n == self.asymmetric_token_tile
+        # Decode MMA reads only a 16-row-aligned valid token window. Keep the
+        # allocated layout, but omit padding-row B transfers in the qualified
+        # N64 geometry and register their exact completion bytes per stage.
+        self.dynamic_gather = (
+            self.quant_kind in (QuantKind.mxfp8_e4m3, QuantKind.mxfp4_mxfp8)
+            and self.mma_tiler_mnk == (256, 64, 128)
+            and self.cluster_shape_mn == (4, 1)
+            and self.use_2cta_instrs
+            and not self.uses_asymmetric_ab_stages
+        )
         self._select_ab_stage_plan()
         self.num_tma_load_bytes = self.ab_stage_tma_bytes * self.mma_cta_count
         if self.num_tma_load_bytes != (
@@ -280,11 +293,9 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
                 f"{gather_row_bytes}."
             )
 
-        # The AB pipeline registers one static transaction expectation that serves
-        # both phases, so FC1's gather has to move exactly as many B bytes as FC2's
-        # tiled TMA. The two sides of this are computed independently -- the left
-        # from the tile geometry here, the right by `make_smem_layouts` -- so the
-        # comparison catches a drift between them rather than restating one of them.
+        # Full-tile Gather4 capacity must match FC2's tiled TMA layout. Compare
+        # independently derived geometry and SMEM byte counts before allowing
+        # FC1 to subtract omitted padding bytes from its stage expectation.
         self.gather_b_stage_bytes = self.cta_tile_n * self.mma_tile_k * int(self.b_dtype.width) // 8
         if self.gather_b_stage_bytes != self.b_stage_tma_bytes:
             raise ValueError(
@@ -317,11 +328,19 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
             )
         if self.mma_instruction_mnk[:2] != self.mma_tiler_mnk[:2]:
             raise NotImplementedError("Rubin Genphase MegaMoE does not implement M/N instruction repetition.")
-        # Tile N 64 is excluded: it forces the halved SFB tile index and the SFB
-        # TMEM shift, two special paths whose interaction with a dynamic
-        # instruction N is not worth carrying for a token extent this small.
-        if self.mma_tiler_mnk[1] not in (128, 256):
-            raise ValueError("Rubin Genphase MegaMoE supports tile N in (128, 256).")
+        # The additional decode geometry is deliberately bounded to the
+        # MXFP8 and mixed-FP4 paths with two-CTA MMA and two or four gather warps.
+        if self.cluster_shape_mn != (4, 1) or self.mma_tiler_mnk[1] == 64:
+            if not (
+                self.cluster_shape_mn in ((2, 1), (4, 1))
+                and self.mma_tiler_mnk == (256, 64, 128)
+                and self.use_2cta_instrs
+                and (self.quant_kind == QuantKind.mxfp8_e4m3
+                     or (self.quant_kind == QuantKind.mxfp4_mxfp8 and self.cluster_shape_mn == (4, 1)))
+            ):
+                raise ValueError("GenPhase N64 requires MXFP8 E4M3 (or mixed FP4 at CGA4), tile (256, 64, 128), and cluster (2, 1) or (4, 1).")
+        if self.mma_tiler_mnk[1] not in (64, 128, 256):
+            raise ValueError("Rubin Genphase MegaMoE supports tile N in (64, 128, 256).")
         if self.mma_tiler_mnk[2] % self.instruction_k != 0:
             raise ValueError("mma_tiler K must be divisible by instruction K.")
         if self.mainloop_smem_budget_bytes <= 0:
@@ -1029,18 +1048,32 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
                 partitioned_smem_sfb = cute.filter_zeros(partitioned_smem_sfb)
                 partitioned_global_sfb = cute.filter_zeros(partitioned_global_sfb)
 
-                global_sfb_slice = partitioned_global_sfb[(None, work_tile.tile_n_idx, None, 0)]
+                sfb_tile_n_index = work_tile.tile_n_idx
+                if cutlass.const_expr(self.cta_tile_n == 64):
+                    sfb_tile_n_index = work_tile.tile_n_idx // Int32(2)
+                global_sfb_slice = partitioned_global_sfb[(None, sfb_tile_n_index, None, 0)]
 
+                fc1_expected_tx = Int32(self.ab_pipeline_tx_count_per_producer)
+                if cutlass.const_expr(self.dynamic_gather):
+                    # Weight/SFA and SFB transfers are unchanged. TMA-B alone
+                    # subtracts FC1 B bytes omitted by all Gather4 issuers. The
+                    # two producer arrivals still register the exact combined
+                    # transaction count for this two-CTA MMA group.
+                    omitted_rows = Int32(self.cta_tile_n) - round_up(work_tile.valid_tokens_in_cta_tile, 16)
+                    fc1_expected_tx = fc1_expected_tx - omitted_rows * Int32(self.mma_tile_k * int(self.b_dtype.width) // 8)
                 empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
                 for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
-                    ab_pipeline.producer_acquire(ab_pipeline_state, empty_status)
+                    if cutlass.const_expr(self.dynamic_gather):
+                        ab_pipeline.producer_acquire(ab_pipeline_state, empty_status, expected_tx=fc1_expected_tx)
+                    else:
+                        ab_pipeline.producer_acquire(ab_pipeline_state, empty_status)
                     tma_barrier = ab_pipeline.producer_get_barrier(ab_pipeline_state)
                     stage_index = ab_pipeline_state.index
                     # TMA-B has waited for this AB stage to become empty and
                     # contributed one of the two static producer transaction
                     # expectations. Rendezvous with the Gather-B warps before any
                     # of them issues Gather4 against this barrier.
-                    self.fc1_gather_sync_barrier.arrive_and_wait()
+                    barrier_sync_unaligned(self.fc1_gather_sync_barrier_id, 32 * (1 + self.num_gather_b_warps))
                     ab_pipeline_state.advance()
                     if k_tile_idx + 1 < k_tile_count:
                         empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
@@ -1104,7 +1137,10 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
                 partitioned_global_sfb = cute.filter_zeros(partitioned_global_sfb)
 
                 global_b_slice = partitioned_global_b[(None, work_tile.tile_n_idx, None, 0)]
-                global_sfb_slice = partitioned_global_sfb[(None, work_tile.tile_n_idx, None, 0)]
+                sfb_tile_n_index = work_tile.tile_n_idx
+                if cutlass.const_expr(self.cta_tile_n == 64):
+                    sfb_tile_n_index = work_tile.tile_n_idx // Int32(2)
+                global_sfb_slice = partitioned_global_sfb[(None, sfb_tile_n_index, None, 0)]
 
                 empty_status = ab_pipeline.producer_try_acquire(ab_pipeline_state)
                 for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
@@ -1200,9 +1236,9 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
 
                 for k_tile_idx in cutlass.range(self.fc1_k_tile_count, unroll=1):
                     # TMA-B has already acquired this stage and contributed its
-                    # static transaction expectation. The named barrier orders that
+                    # stage-specific transaction expectation. The named barrier orders that
                     # arrive-and-expect-tx before Gather4.
-                    self.fc1_gather_sync_barrier.arrive_and_wait()
+                    barrier_sync_unaligned(self.fc1_gather_sync_barrier_id, 32 * (1 + self.num_gather_b_warps))
                     tma_barrier = ab_pipeline.producer_get_barrier(ab_pipeline_state)
                     stage_index = ab_pipeline_state.index
                     col_k = k_tile_idx * Int32(self.mma_tile_k)
@@ -1210,27 +1246,32 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
 
                     for local_run in cutlass.range_constexpr(self.gather_b_runs_per_unit):
                         run_index = Int32(local_run * self.gather_issuing_units) + issuing_unit
-                        run_base_elements = stage_base_elements + run_index * Int32(
-                            self.gather_index_load_rows * self.mma_tile_k
-                        )
-                        for group_in_run in cutlass.range_constexpr(self.gather_b_groups_per_run):
-                            destination_offset = run_base_elements + Int32(
-                                group_in_run * self.gather4_width * self.mma_tile_k
+                        issue_rows = True
+                        if cutlass.const_expr(self.dynamic_gather):
+                            rows_per_cta = round_up(work_tile.valid_tokens_in_cta_tile, 16) // Int32(self.mma_cta_count)
+                            issue_rows = run_index * Int32(self.gather_index_load_rows) < rows_per_cta
+                        if issue_rows:
+                            run_base_elements = stage_base_elements + run_index * Int32(
+                                self.gather_index_load_rows * self.mma_tile_k
                             )
-                            row_start = local_run * self.gather_index_load_rows + group_in_run * self.gather4_width
-                            with cute.arch.elect_one():
-                                sm107_tma_gather4_load(
-                                    fc1_tma_b_atom,
-                                    self.b_smem_tensor.iterator + destination_offset,
-                                    tma_barrier,
-                                    col_k,
-                                    row_ids[row_start],
-                                    row_ids[row_start + 1],
-                                    row_ids[row_start + 2],
-                                    row_ids[row_start + 3],
-                                    use_cta_group_2=self.use_2cta_instrs,
-                                    mcast_mask=gather_b_multicast_mask,
+                            for group_in_run in cutlass.range_constexpr(self.gather_b_groups_per_run):
+                                destination_offset = run_base_elements + Int32(
+                                    group_in_run * self.gather4_width * self.mma_tile_k
                                 )
+                                row_start = local_run * self.gather_index_load_rows + group_in_run * self.gather4_width
+                                with cute.arch.elect_one():
+                                    sm107_tma_gather4_load(
+                                        fc1_tma_b_atom,
+                                        self.b_smem_tensor.iterator + destination_offset,
+                                        tma_barrier,
+                                        col_k,
+                                        row_ids[row_start],
+                                        row_ids[row_start + 1],
+                                        row_ids[row_start + 2],
+                                        row_ids[row_start + 3],
+                                        use_cta_group_2=self.use_2cta_instrs,
+                                        mcast_mask=gather_b_multicast_mask,
+                                    )
                     ab_pipeline_state.advance()
                 iket.range_pop()
             else:
@@ -1260,7 +1301,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
         fragment_a = tiled_mma.make_fragment_A(self.a_smem_tensor)
         fragment_b = tiled_mma.make_fragment_B(self.b_smem_tensor)
 
-        tmem_allocator.wait_for_alloc()
+        barrier_sync_unaligned(self.tmem_allocation_barrier_id, 32 * (1 + self.num_accumulator_consumer_warps_per_cta))
         accumulator_pointer = tmem_allocator.retrieve_ptr(self.acc_dtype)
         accumulator_layout = cute.make_layout(self.accumulator_shape, stride=self.accumulator_stride)
         accumulator_base = cute.make_tensor(accumulator_pointer, accumulator_layout)
@@ -1308,6 +1349,14 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
             if self.is_leader_cta:
                 accumulator = accumulator_base[(None, None, accumulator_stage_index)]
                 accumulator = cute.tiled_divide(accumulator, accumulator.shape)
+                mma_tmem_sfb = tmem_sfb
+                if cutlass.const_expr(self.cta_tile_n == 64):
+                    sfb_shift = (work_tile.tile_n_idx % Int32(2)) * Int32(2)
+                    shifted_sfb_pointer = cute.recast_ptr(
+                        accumulator_pointer + self.num_accumulator_tmem_cols + self.num_sfa_tmem_cols + sfb_shift,
+                        dtype=self.sf_dtype,
+                    )
+                    mma_tmem_sfb = cute.make_tensor(shifted_sfb_pointer, sfb_layout)
                 # At tile N 256 a dynamic extent of 128 or less makes the SFB TMEM
                 # window compact, so its two K halves come from a different pair of
                 # SMEM rest coordinates than the full-width case.
@@ -1353,7 +1402,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
                             a_window_frag=a_stage_frag,
                             b_window_frag=b_stage_frag,
                             sfa_window_tensor=tmem_sfa,
-                            sfb_window_tensor=tmem_sfb,
+                            sfb_window_tensor=mma_tmem_sfb,
                             valid_tokens_in_tile=work_tile.valid_tokens_in_cta_tile,
                             mma_instruction_mnk=self.mma_instruction_mnk,
                             window_instruction_offset=0,
@@ -1387,7 +1436,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
                             a_window_frag=a_stage_frag,
                             b_window_frag=b_stage_frag,
                             sfa_window_tensor=tmem_sfa,
-                            sfb_window_tensor=tmem_sfb,
+                            sfb_window_tensor=mma_tmem_sfb,
                             valid_tokens_in_tile=work_tile.valid_tokens_in_cta_tile,
                             mma_instruction_mnk=self.mma_instruction_mnk,
                             window_instruction_offset=0,
@@ -1435,7 +1484,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
         fragment_a = tiled_mma.make_fragment_A(self.a_smem_tensor)
         fragment_b = tiled_mma.make_fragment_B(self.b_smem_tensor)
 
-        tmem_allocator.wait_for_alloc()
+        barrier_sync_unaligned(self.tmem_allocation_barrier_id, 32 * (1 + self.num_accumulator_consumer_warps_per_cta))
         accumulator_pointer = tmem_allocator.retrieve_ptr(self.acc_dtype)
         accumulator_layout = cute.make_layout(self.accumulator_shape, stride=self.accumulator_stride)
         accumulator_base = cute.make_tensor(accumulator_pointer, accumulator_layout)
@@ -1483,6 +1532,14 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
             if self.is_leader_cta:
                 accumulator = accumulator_base[(None, None, accumulator_stage_index)]
                 accumulator = cute.tiled_divide(accumulator, accumulator.shape)
+                mma_tmem_sfb = tmem_sfb
+                if cutlass.const_expr(self.cta_tile_n == 64):
+                    sfb_shift = (work_tile.tile_n_idx % Int32(2)) * Int32(2)
+                    shifted_sfb_pointer = cute.recast_ptr(
+                        accumulator_pointer + self.num_accumulator_tmem_cols + self.num_sfa_tmem_cols + sfb_shift,
+                        dtype=self.sf_dtype,
+                    )
+                    mma_tmem_sfb = cute.make_tensor(shifted_sfb_pointer, sfb_layout)
                 # At tile N 256 a dynamic extent of 128 or less makes the SFB TMEM
                 # window compact, so its two K halves come from a different pair of
                 # SMEM rest coordinates than the full-width case. Tested inside the
@@ -1539,7 +1596,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
                         a_window_frag=a_stage_frag,
                         b_window_frag=b_stage_frag,
                         sfa_window_tensor=tmem_sfa,
-                        sfb_window_tensor=tmem_sfb,
+                        sfb_window_tensor=mma_tmem_sfb,
                         valid_tokens_in_tile=work_tile.valid_tokens_in_cta_tile,
                         mma_instruction_mnk=self.mma_instruction_mnk,
                         window_instruction_offset=0,

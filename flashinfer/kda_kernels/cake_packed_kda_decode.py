@@ -23,6 +23,7 @@ import torch
 from ..jit.cpp_ext import is_cuda_version_at_least
 from ..jit.cake_kda_packed_t1 import (
     CakeKDAPackedT1Target,
+    CakeKDAPackedT1Variant,
     get_cake_kda_packed_t1_module,
     select_cake_kda_packed_t1_variant,
 )
@@ -40,8 +41,26 @@ _MIXED_WIDTH = 3 * _HEADS * _HEAD_DIM
 # SM100-family cubin on compute capability 10.7 (same kernel source; the output and
 # state pool are bitwise identical). Every other variant keeps the family target.
 _SM107_NATIVE_VARIANTS: frozenset[str] = frozenset(
-    {"cpasync_tile64_register_pipeline_early_publish"}
+    {
+        "cpasync_tile64_register_pipeline_early_publish",
+        "cpasync_tile64_register_pipeline_early_publish_bulk1",
+    }
 )
+
+# Variants that store the two output rows a thread group owns as one 32-bit
+# BF16x2 word.  They need a 4-byte-aligned output base; otherwise the band's
+# scalar-publish body of the same schedule runs (same output bits).
+_PAIR_PUBLISH_FALLBACK: dict[CakeKDAPackedT1Variant, CakeKDAPackedT1Variant] = {
+    "cpasync_tile128_register_pipeline_pair_publish": (
+        "cpasync_tile128_register_pipeline"
+    ),
+}
+
+
+def _output_pair_store_aligned(output_view: torch.Tensor) -> bool:
+    """Whether the contiguous output view can take 32-bit BF16x2 pair stores."""
+
+    return int(output_view.data_ptr()) % 4 == 0
 
 
 def _target_for_device(device: torch.device) -> CakeKDAPackedT1Target:
@@ -177,6 +196,10 @@ def run_packed_kda_decode(
         state_aligned=state_aligned,
         aux_vec4_aligned=aux_vec4_aligned,
     )
+    if optimized_variant in _PAIR_PUBLISH_FALLBACK and not _output_pair_store_aligned(
+        output_view
+    ):
+        optimized_variant = _PAIR_PUBLISH_FALLBACK[optimized_variant]
     if optimized_variant is None:
         legacy_variant = _legacy_variant_for_batch(batch)
         module = get_flash_kda_packed_t1_module(legacy_variant, target)

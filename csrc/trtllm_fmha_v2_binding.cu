@@ -49,6 +49,10 @@ extern void run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_b
     const bert::Fused_multihead_attention_params_v2& params,
     const bert::Fused_multihead_attention_launch_params& launch_params, cudaStream_t stream);
 
+extern void run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_256x256_output_bf16_sm120_nl_tiled(
+    const bert::Fused_multihead_attention_params_v2& params,
+    const bert::Fused_multihead_attention_launch_params& launch_params, cudaStream_t stream);
+
 extern void run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_fp16_sm120_nl_tiled(
     const bert::Fused_multihead_attention_params_v2& params,
     const bert::Fused_multihead_attention_launch_params& launch_params, cudaStream_t stream);
@@ -292,11 +296,11 @@ static inline void determine_launch_params(
  * @brief TVM FFI binding for SM120 TRTLLM FMHA V2 separate-Q/K/V attention
  *
  * This function calls a specific TRTLLM kernel variant with:
- * - Standard 64x64 and 128x128 input type: E4M3
+ * - Standard 64x64, 128x128 and MLA 256x256 input type: E4M3
  * - Backward-compatible 192x128 input type: E4M3 or BF16
  * - Accumulator type: FP32
  * - Layout: Separate Q, K, V tensors
- * - Standard Q/K/V dimensions: 64x64 or 128x128
+ * - Standard Q/K/V dimensions: 64x64, 128x128, or 256x256
  * - Backward-compatible Q/K/V dimensions: 192x128
  * - Output type: BF16 for standard paths; BF16 or FP16 for the 192x128 path
  * - Target architecture: SM120/SM121 (Blackwell)
@@ -435,6 +439,10 @@ void TRTLLMFMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
   } else if (head_dim == 192 && head_dim_v == 128 && data_type == DATA_TYPE_E4M3 &&
              output_dtype == DATA_TYPE_BF16) {
     run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_bf16_sm120_nl_tiled(
+        params, launch_params, stream);
+  } else if (head_dim == 256 && head_dim_v == 256 && data_type == DATA_TYPE_E4M3 &&
+             output_dtype == DATA_TYPE_BF16) {
+    run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_256x256_output_bf16_sm120_nl_tiled(
         params, launch_params, stream);
   } else if (head_dim == 192 && head_dim_v == 128 && data_type == DATA_TYPE_E4M3 &&
              output_dtype == DATA_TYPE_FP16) {

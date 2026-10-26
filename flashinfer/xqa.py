@@ -212,6 +212,7 @@ def xqa(
     v_sf_cache: Optional[torch.Tensor] = None,
 ) -> None:
     r"""Apply attention with paged KV cache using XQA kernel.
+
     Parameters
     ----------
     q : torch.Tensor
@@ -556,6 +557,7 @@ def xqa_mla(
     enable_pdl: Optional[bool] = None,
 ) -> None:
     r"""Apply attention with paged KV cache using XQA MLA (Multi-Head Latent Attention) kernel.
+
     Parameters
     ----------
     q : torch.Tensor

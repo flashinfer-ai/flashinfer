@@ -271,9 +271,9 @@ paths and concrete backend class names are not stable APIs.
 `_batch_mla/_wrapper.py` owns:
 
 - The public `BatchMLAPagedAttentionWrapper`, `plan()`, and `run()` signatures.
-- Interpretation of `backend="auto"`, `"fa2"`, `"fa3"`, `"cutlass"`,
+- Interpretation of `backend="auto"`, `"autotune"`, `"fa2"`, `"fa3"`, `"cutlass"`,
   `"cutile"`, `"trtllm-gen"`, `"xqa"`, `"cute-dsl"`,
-  `"cute-dsl-monolithic"`, and `"cute-dsl-modular"`.
+  `"cute-dsl-monolithic"`, `"cute-dsl-modular"`, and `"cute-dsl-rubin-mtp"`.
 - Canonical and deprecated argument normalization.
 - User-facing compatibility warnings.
 - Construction of the backend-neutral `_MLAPlanArguments` request.
@@ -304,7 +304,7 @@ It does not own generated-module planning or backend kernel launch assembly.
 lookup. Every accepted explicit selector maps to one backend-like planning
 class. Concrete selectors map directly to their backend class; the
 compatibility-only `cute-dsl` alias maps to a thin wrapper-local planner that
-lowers to the monolithic or modular backend.
+lowers to the monolithic, modular, or Rubin MTP backend.
 Backend-specific JIT modules and compiled kernels are acquired during
 `plan()`, after compatibility validation, and retained for `run()`. This is the
 same lifecycle used by the CUTLASS backend: Python class registration is eager,
@@ -333,7 +333,7 @@ use the same planning, workspace, staging, and run contracts. The
 concrete `fa2_backend.py` and `fa3_backend.py` modules own the named backend
 classes and generated-module specialization. CUTLASS and cuTile have separate
 implementations because their metadata, layout, hardware, and output contracts
-differ. TRTLLM-GEN, XQA, and the two CuTe DSL implementations likewise remain
+differ. TRTLLM-GEN, XQA, and the three CuTe DSL implementations likewise remain
 separate vertical slices so each backend's hardware gates, dense metadata,
 graph behavior, and launch contract remain inspectable without changing the
 generated-FA hot path.
@@ -359,6 +359,7 @@ flashinfer/mla/
         |-- _fa_common.py
         |-- cute_dsl_modular_backend.py
         |-- cute_dsl_monolithic_backend.py
+        |-- cute_dsl_rubin_mtp_backend.py
         |-- fa2_backend.py
         |-- fa3_backend.py
         |-- cutlass_backend.py
@@ -383,10 +384,13 @@ name the mechanism they share rather than introducing a general backend layer.
 Construction validates the requested backend; selection and preparation happen
 in `plan()`. An explicit request evaluates only that backend. For `backend="auto"`,
 [`_auto_policy.py`](../../flashinfer/mla/_batch_mla/_auto_policy.py) applies a
-request-based preference policy on exact SM100 and SM103. Exact SM107 has its
-own `_ordered_sm107_backends` entry point, which delegates to the SM100 rules.
-These rules perform well in the measured SM107 cases; further investigation may
-identify useful SM107-specific ordering. SM80, supported SM90, and supported
+request-based preference policy on exact SM100 and SM103. Exact SM107 starts
+from that order and prefers Rubin MTP over monolithic CuTe for bounded FP8
+regions: larger batches with short KV in graph mode, and uniform long-context
+workloads in eager mode. `_ordered_sm107_backends` defines the precise shape,
+layout, scale, initial-length, and page-table capacity bounds. These are
+plan-time performance heuristics; later live-length changes retain the selected
+backend and may change which backend would be fastest. SM80, supported SM90, and supported
 SM12x use their architecture policies; other devices use the default order.
 Every order includes all concrete backends exactly once, with support checks
 determining eligibility. The same module also owns the separate `autotune`
@@ -407,8 +411,9 @@ control to the caller. Experimental auto candidates require
 `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`; explicit selection is an opt-in.
 Architecture preferences retain fallback to the remaining concrete candidates.
 
-`backend="cute-dsl"` tries monolithic CuTe followed by modular CuTe using the
-same preparation and fallback rules. Both currently reject `use_sinks=True`.
+`backend="cute-dsl"` tries monolithic, modular, then Rubin MTP CuTe using the
+same preparation and fallback rules. All three currently reject `use_sinks=True`.
+This compatibility alias does not apply the SM107 `auto` preference heuristic.
 
 ## Planning contract
 
@@ -541,6 +546,7 @@ device, and backend-specific option checks.
 | XQA | Dense | Packed | None | None | First plan/capture only |
 | CuTe DSL monolithic | Dense | Packed | None, base 2, or base e | None | First plan/capture only |
 | CuTe DSL modular | Dense | Packed | None | None | Rejected before planning |
+| CuTe DSL Rubin MTP | Dense | Packed | None, base 2, or base e | None | First plan/capture only |
 
 ### FA2 and FA3
 
@@ -635,29 +641,47 @@ shape are not part of this backend.
 
 The concrete CuTe DSL backends support explicit and automatic selection;
 `backend="cute-dsl"` retains its family-alias policy across eager replans.
-Both require SM100, SM103 or SM107, dense device metadata, packed (or adjacent split)
-query and KV storage, FP16/BF16 output, matching FP16/BF16/FP8 E4M3 inputs,
-and scalar BMM scales. Monolithic supports causal multi-query attention,
+Monolithic and modular require SM100, SM103 or SM107, dense device metadata,
+packed (or adjacent split) query and KV storage, matching FP16/BF16/FP8 E4M3
+inputs, and scalar BMM scales. Both support FP16/BF16 output; monolithic also
+supports FP8 E4M3 output. Monolithic supports causal multi-query attention,
 compact ragged queries, base-e LSE and first-plan graph capture, but no sinks.
 Modular supports uniform noncausal queries (up to the native four-query limit),
 but rejects sinks, causal multi-query attention, ragged queries, LSE and
 graph planning. For one query, causal and noncausal masks are equivalent.
 DCP, sparse, HCA and DSV4 remain outside this wrapper.
 
-On SM107, an installed CuTe DSL that lacks a native SM107 target must support
+Rubin MTP is wrapper-only and requires exact SM107, FP8 E4M3 query/KV/output,
+128 heads, latent/RoPE widths 512/64, page size 64/128, and uniform causal Q=2
+or Q=4. It supports no LSE, base-2 LSE, or base-e LSE; its scale mode is
+`default` or `bmm-scalar`, with a positive, finite effective FP32 log2 softmax
+scale and a finite FP32 BMM2 scale. It rejects sinks, PDL, profiler,
+skip-softmax, and per-tensor output scaling. Its kernel reads live device
+KV lengths in eager and graph execution, including zero or shorter-than-Q
+lengths; query lengths remain fixed. Each length must fit its page-table row,
+and live page IDs must address the supplied KV pool. Plan with
+`output_dtype=torch.float8_e4m3fn` to declare its FP8 output contract.
+The functional API does not select Rubin MTP.
+
+For monolithic and modular on SM107, an installed CuTe DSL that lacks a native
+SM107 target must support
 the family target and start with `CUTE_DSL_ARCH=sm_100f` set **before importing
 Cutlass/CuTe DSL**. Setting it after import cannot retarget the captured DSL.
 The wrapper checks the existing target availability guard and does not mutate
 global compiler settings. An unavailable target produces a typed plan rejection
 so selectors can try their next eligible backend; explicit selection reports
-the rejection. Modular graph planning remains unsupported.
+the rejection. Rubin MTP additionally requires a native SM107 target and CuTe
+DSL mixed-CGA pipeline/compiler features; the family-target fallback does not
+satisfy that requirement. Missing features produce a typed rejection before
+compilation. Unexpected compiler failures propagate. Modular graph planning
+remains unsupported.
 
 For matching FP8 E4M3 query/KV inputs on SM100, SM103 and SM107, the default
 scale contract remains `default`; mixed-precision KV-only FP8 continues to use
 `kv-per-tensor`. Explicit scale contracts are preserved. Architecture eligibility
 does not determine automatic preference order. SM100 and SM103 share their
-ranking rules, and the SM107 policy currently delegates to those same rules.
-The SM107 entry point leaves room for future architecture-specific ordering.
+ranking rules; the bounded SM107 MTP preferences are defined in
+[`_auto_policy.py`](../../flashinfer/mla/_batch_mla/_auto_policy.py).
 
 Callers do not declare sequence variability to the planned wrapper.
 TRTLLM-GEN derives compact query variability from `cum_seq_lens_q`; CuTe derives
@@ -665,7 +689,9 @@ KV-length variability from `seq_lens`. The same inference works for canonical
 CSR input because normalization maps `qo_indptr` to `cum_seq_lens_q` and
 `kv_len_arr` to `seq_lens`. A CuTe fixed-pointer CUDA Graph plan conservatively
 uses the variable-sequence specialization so later in-place device length
-updates stay within the compiled contract.
+updates stay within the compiled contract. These live metadata rules apply to
+explicit backends and heuristic `auto`; `backend="autotune"` instead owns a
+metadata snapshot, as described below.
 
 ## Plan state and CUDA Graph safety
 
@@ -893,12 +919,16 @@ Mutable caller, runner and plan buffers are never cached globally.
 ## Planned workload autotuning
 
 `BatchMLAPagedAttentionWrapper(..., backend="autotune")` uses the policy in
-`_batch_mla/_auto_policy.py`. TRTLLM-GEN, monolithic and modular CuTe DSL, XQA, CUTLASS, FA2/FA3,
-and experimental cuTile are registered when eligible,
-using their existing tactic `-1`; CuTe retains its heuristic split-K/reducer
-configuration. The policy compares backend/tactic candidates through
+`_batch_mla/_auto_policy.py`. TRTLLM-GEN, monolithic, modular and Rubin MTP CuTe
+DSL, XQA, CUTLASS, FA2/FA3, and experimental cuTile are registered when eligible.
+Monolithic and Rubin MTP offer native tactic `-1` plus static split budgets
+1, 2, 4, 8, 16, and 32, filtered by page-table capacity, workspace and indexing
+limits. Positive budgets remain static as live lengths change; empty partitions
+are handled by the kernels. Modular and the other backends retain tactic `-1`.
+The policy compares backend/tactic candidates through
 `AutoTuner`; adding candidates does not require the TRT backend to know about
-other implementations. `backend="auto"` remains the existing planning heuristic.
+other implementations. `backend="auto"` selects through the planning heuristic
+without benchmarking split budgets.
 
 ```python
 wrapper = BatchMLAPagedAttentionWrapper(workspace, backend="autotune")
@@ -963,10 +993,11 @@ the captured tensors alive and update their device values in place.
 
 ## Shared monolithic CuTe execution
 
-Both concrete CuTe backends implement `TunableRunner` for functional and planned
-execution. Core resolves the CuTe family before constructing `from_functional`;
+Monolithic and modular CuTe implement `TunableRunner` for functional and planned
+execution. Rubin MTP participates only in planned wrapper execution. Core
+resolves the monolithic/modular CuTe family before constructing `from_functional`;
 it does not benchmark both CuTe implementations for one functional call. Uniform
-functional calls keep batch-bucket tuning, while compact ragged calls execute
+functional calls keep batch-bucket tuning with native tactic `-1`, while compact ragged calls execute
 the backend directly. DCP, PDL and the direct public CuTe callable retain their
 functional contracts without becoming wrapper requirements or new wrapper APIs.
 
@@ -989,7 +1020,10 @@ padding must not modify that snapshot. Modular CuTe participates only in support
 non-graph plans: it rejects LSE, compact ragged queries, sinks and causal multi-Q.
 Its functional adapter preserves the existing modular callable and workspace
 sizing, while planned execution retains its existing prepared kernel binding.
-No low-level CuTe implementation is changed by the backend integration.
+The monolithic low-level interface accepts an optional static split budget;
+its default retains the native heuristic. Its scratch LSE pointer arithmetic
+uses widened element offsets so larger split workspaces do not overflow byte
+offsets. The Rubin MTP implementation has its own prepared kernel interface.
 
 
 ### Additional planned autotune backends
@@ -1020,6 +1054,6 @@ XQA functional and planned entrypoints share the backend's native launch. The
 functional runner uses the actual workload, preserving native scale conventions
 and scalar/tensor support. Its single tactic runs directly outside a tuning
 context, avoiding generic cache selection on ordinary functional calls.
-Planned XQA keeps scalar-only BMM scales. Existing
-`auto` routing remains unchanged; cross-backend expansion applies to the
-wrapper's explicit `backend="autotune"` policy.
+Planned XQA keeps scalar-only BMM scales. These additional autotune candidates
+do not change the heuristic `auto` ordering; the separate SM107 MTP preference
+is described above.

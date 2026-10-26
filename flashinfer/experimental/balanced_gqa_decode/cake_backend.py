@@ -73,49 +73,15 @@ QUEUE_COUNTERS = 4  # ticket, done CTAs (both reset in-kernel), L, total items
 WORKSPACE_ALIGN = 256
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 
-# Exact keyword set of the generated program's ``run`` entry (bound by the
-# export's argument plan); ``grid`` is expanded to ``grid_x/y/z``.
-MTP_MAIN_KWARGS = (
-    "Q",
-    "K",
-    "V",
-    "O_ptr",
-    "page_table",
-    "seq_lens_kv",
-    "partial_o",
-    "partial_stats",
-    "tile_counters",
-    "queue_counters",
-    "max_pages_per_seq",
-    "softmax_scale_log2",
-    "num_q_heads",
-    "num_kv_heads",
-    "batch_size",
-    "q_len",
-    "max_items",
-    "grid",
-)
-MAIN_KWARGS = (
-    "Qt",
-    "K",
-    "V",
-    "O_ptr",
-    "page_table",
-    "seq_lens_kv",
-    "partial_o",
-    "partial_stats",
-    "tile_counters",
-    "queue_counters",
-    "max_pages_per_seq",
-    "softmax_scale",
-    "num_q_heads",
-    "num_kv_heads",
-    "group_ratio",
-    "batch_size",
-    "q_len",
-    "max_items",
-    "grid",
-)
+
+def _plan_kwargs(kind: str) -> tuple[str, ...]:
+    """Exact keyword set of program ``kind``'s ``run`` entry, read from the
+    export's argument plan; the ``grid_x/y/z`` slots collapse to one ``grid``
+    keyword, which ``bind_decode_payload`` expands again."""
+    plan = PROGRAMS[KINDS[kind]]["arg_plan"]
+    return tuple(
+        dict.fromkeys("grid" if slot == "grid" else name for slot, name in plan)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -261,26 +227,12 @@ class BalancedGQADecodeRunner:
     def num_ctas(self) -> int:
         return int(self.main_kwargs["grid"][0])
 
-    def device_plan(self) -> tuple[int, int]:
-        """``(chunk_pairs, num_items)`` published by the last launch (syncs)."""
-        counters = self.main_kwargs["queue_counters"].tolist()
-        return int(counters[2]), int(counters[3])
-
 
 def program_kind(q_len_per_req: int) -> str:
     """``"row"`` or the packed MTP instance (``"mtp32"`` / ``"mtp64"``) for ``q_len_per_req``."""
     if uses_packed_mtp(q_len_per_req):
         return f"mtp{mtp_n_rows(q_len_per_req)}"
     return "row"
-
-
-def generated_program_available(device: torch.device, q_len_per_req: int = 1) -> bool:
-    """True when this checkout registers the program serving ``q_len_per_req`` on ``device``."""
-    arch = _device_arch(_device_index(device))
-    program = KINDS.get(program_kind(q_len_per_req))
-    return (
-        arch is not None and program is not None and arch in PROGRAMS[program]["arches"]
-    )
 
 
 def bind_decode_payload(
@@ -300,7 +252,7 @@ def bind_decode_payload(
         for slot, name in record["arg_plan"]
     )
     module = load_cake_balanced_gqa_decode_module(module_name, arch)
-    entry = getattr(module, record["ffi_entry"])
+    entry = module.run
     return BalancedGQADecodeRunner(
         module_name, main_kwargs, out, entry, arguments, block_tables_padded
     )
@@ -540,7 +492,7 @@ def prepare_balanced_batch_decode_with_kv_cache(
             max_items=mtp_max_items_bound(batch, q_len_per_req, num_kv_heads, num_ctas),
             grid=(num_ctas, 1, 1),
         )
-        assert tuple(main_kwargs) == MTP_MAIN_KWARGS
+        assert tuple(main_kwargs) == _plan_kwargs(kind)
     else:
         main_kwargs = dict(
             Qt=query.view(total_q * num_q_heads, HEAD_DIM),
@@ -563,7 +515,7 @@ def prepare_balanced_batch_decode_with_kv_cache(
             max_items=max_items_bound(batch, q_len_per_req, num_kv_heads, num_ctas),
             grid=(num_ctas, 1, 1),
         )
-        assert tuple(main_kwargs) == MAIN_KWARGS
+        assert tuple(main_kwargs) == _plan_kwargs(kind)
     return bind_decode_payload(
         arch, main_kwargs, out, block_tables_padded=needs_padding, kind=kind
     )

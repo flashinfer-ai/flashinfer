@@ -101,11 +101,11 @@ def silu_and_mul(
         Input tensor, shape (..., 2 * hidden_size).
 
     out: Optional[torch.Tensor]
-        The output tensor, if specified, the kernel will update this tensor inplace.
+        The output tensor, if specified, the kernel will update this tensor in place.
 
-    enable_pdl: bool
+    enable_pdl: Optional[bool]
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
 
     Returns
     -------
@@ -145,11 +145,11 @@ def gelu_tanh_and_mul(
         Input tensor, shape (..., 2 * hidden_size).
 
     out: Optional[torch.Tensor]
-        The output tensor, if specified, the kernel will update this tensor inplace.
+        The output tensor, if specified, the kernel will update this tensor in place.
 
-    enable_pdl: bool
+    enable_pdl: Optional[bool]
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
 
     Returns
     -------
@@ -185,11 +185,11 @@ def gelu_and_mul(
         Input tensor, shape (..., 2 * hidden_size).
 
     out: Optional[torch.Tensor]
-        The output tensor, if specified, the kernel will update this tensor inplace.
+        The output tensor, if specified, the kernel will update this tensor in place.
 
-    enable_pdl: bool
+    enable_pdl: Optional[bool]
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
 
     Returns
     -------

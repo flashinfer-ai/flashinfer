@@ -247,7 +247,7 @@ would conceal.
 
 Relevant CUDA compatibility references:
 
-- [CUDA C Programming Guide: Binary Compatibility](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#binary-compatibility)
+- [CUDA Programming Guide: Binary Compatibility](https://docs.nvidia.com/cuda/cuda-programming-guide/01-introduction/cuda-platform.html#binary-compatibility)
 - [Blackwell Compatibility Guide](https://docs.nvidia.com/cuda/blackwell-compatibility-guide/index.html)
 
 ## Provider Builds

@@ -5,7 +5,7 @@
 
 The local W4A16 helpers load packed weights and block scales, then decode
 BF16 tiles directly into the TMEM operand pipeline. Both GEMMs use
-dynamic routed-token widths with M128/M256, N64/N128 and K256 allocation.
+dynamic routed-token widths with M128/M256, N32/N64/N128 and K256 allocation.
 Static and atomic schedulers fuse BF16 dispatch, both GEMMs, and combine.
 """
 
@@ -81,8 +81,10 @@ class _MegaMixedInput(Sm100W4A16GroupedGemmKernel):
         use_clc_scheduler,
     ):
         assert mma_tiler_mnk in (
+            (128, 32, 256),
             (128, 64, 256),
             (128, 128, 256),
+            (256, 32, 256),
             (256, 64, 256),
             (256, 128, 256),
         )
@@ -93,7 +95,7 @@ class _MegaMixedInput(Sm100W4A16GroupedGemmKernel):
         cols_per_a = cute.round_up(cta_tile_shape_mnk[2] // 2, 4)
         assert cols_per_acc == mma_tiler_mnk[1] and cols_per_a == 128
         # Reuse the local W4A16 TMEM-capacity rule: after two accumulator
-        # stages, N64 fits three decoded K256 tiles; N128 still fits two.
+        # stages, N32/N64 fit three decoded K256 tiles; N128 still fits two.
         max_tmem_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
         transform_stages = (max_tmem_cols - 2 * cols_per_acc) // cols_per_a
         assert transform_stages in (2, 3)
@@ -146,7 +148,7 @@ class Sm100W4A16MegaMoEKernel:
         acc_dtype=cutlass.Float32,
         in_kernel_fc2_reduce=False,
         token_back_mode="epi_warps",
-        apply_topk_in_fc1=False,
+        apply_routing_weights_before_fc2=False,
         gate_up_clamp=None,
         epi_flag_batch=(1, 1),
         flag_batch=1,
@@ -162,7 +164,7 @@ class Sm100W4A16MegaMoEKernel:
             raise ValueError("W4A16 requires forward 2Dx3D scheduler records.")
         if load_balance_mode not in ("static", "atomic_counter"):
             raise ValueError("Unsupported W4A16 load_balance_mode.")
-        self.apply_topk_in_fc1 = apply_topk_in_fc1
+        self.apply_routing_weights_before_fc2 = apply_routing_weights_before_fc2
         if token_back_mode not in ("epi_warps", "reuse_dispatch_warps"):
             raise ValueError(
                 "W4A16 supports epi_warps or reuse_dispatch_warps token return."
@@ -172,13 +174,15 @@ class Sm100W4A16MegaMoEKernel:
         if self.in_kernel_fc2_reduce and not by_dispatch:
             raise ValueError("W4A16 in-kernel FC2 reduction requires dispatch return.")
         if mma_tiler_mnk not in (
+            (128, 32, 256),
             (128, 64, 256),
             (128, 128, 256),
+            (256, 32, 256),
             (256, 64, 256),
             (256, 128, 256),
         ):
             raise ValueError(
-                "W4A16 MegaMoE requires mma_tiler_mnk=M128/M256, N64/N128, K256."
+                "W4A16 MegaMoE requires M128/N32,N64,N128 or M256/N32,N64,N128, K256."
             )
         if cluster_shape_mnk != (2, 1, 1) and not (
             cluster_shape_mnk == (1, 1, 1) and mma_tiler_mnk == (128, 64, 256)
@@ -316,7 +320,11 @@ class Sm100W4A16MegaMoEKernel:
             f"_swiglua{self.swiglu_alpha}_swiglub{self.swiglu_beta}"
             f"_situb{self.situ_beta}_situlinb{self.situ_linear_beta}"
             + ("_ikr" if self.in_kernel_fc2_reduce else "")
-            + ("_topk_fc1" if self.apply_topk_in_fc1 else "")
+            + (
+                "_routing_weights_before_fc2"
+                if self.apply_routing_weights_before_fc2
+                else ""
+            )
         )
 
     def _make_mixed(self, fragment_size, output_tensor, raw_stages, activation_stages):
@@ -767,7 +775,7 @@ class Sm100W4A16MegaMoEKernel:
             cluster_shape_mn=self.cluster_shape_mn,
             token_back_by_dispatch=self.token_back_by_dispatch,
             in_kernel_fc2_reduce=self.in_kernel_fc2_reduce,
-            apply_topk_in_fc1=self.apply_topk_in_fc1,
+            apply_routing_weights_before_fc2=(self.apply_routing_weights_before_fc2),
             epi_flag_batch=self.epi_flag_batch,
             static_expert_shape=self.static_expert_shape,
             gate_up_clamp=self.gate_up_clamp,
@@ -1051,7 +1059,7 @@ class Sm100W4A16MegaMoEKernel:
         if worker_idx < num_workers:
             token_idx, hidden_tile_idx = self.topk_reduce._prepare_bf16_worker(
                 None
-                if cutlass.const_expr(self.apply_topk_in_fc1)
+                if cutlass.const_expr(self.apply_routing_weights_before_fc2)
                 else token_comm_args.input_topk_weights_buffer,
                 score_reg,
                 worker_idx,
@@ -1513,7 +1521,7 @@ class Sm100W4A16MegaMoEKernel:
             not self.in_kernel_fc2_reduce and reduced_output is not None
         ):
             score_reg = None
-            if cutlass.const_expr(not self.apply_topk_in_fc1):
+            if cutlass.const_expr(not self.apply_routing_weights_before_fc2):
                 score_reg = cute.make_rmem_tensor(
                     (self.num_topk,), token_comm_args.input_topk_weights_buffer.dtype
                 )
@@ -1672,7 +1680,7 @@ class Sm100W4A16MegaMoEKernel:
                     self.topk_reduce._reduce_bf16_worker(
                         combine,
                         None
-                        if cutlass.const_expr(self.apply_topk_in_fc1)
+                        if cutlass.const_expr(self.apply_routing_weights_before_fc2)
                         else token_comm_args.input_topk_weights_buffer,
                         reduced_output,
                         token_idx,
@@ -1685,7 +1693,9 @@ class Sm100W4A16MegaMoEKernel:
                         token_idx, hidden_tile_idx = (
                             self.topk_reduce._prepare_bf16_worker(
                                 None
-                                if cutlass.const_expr(self.apply_topk_in_fc1)
+                                if cutlass.const_expr(
+                                    self.apply_routing_weights_before_fc2
+                                )
                                 else token_comm_args.input_topk_weights_buffer,
                                 score_reg,
                                 worker_idx,
