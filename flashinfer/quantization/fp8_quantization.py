@@ -19,6 +19,8 @@ from ..jit.cake_grouped_mxfp8_quantize import (
     F16 as _CAKE_GROUPED_MXFP8_F16,
     TILED_BF16 as _CAKE_GROUPED_MXFP8_TILED_BF16,
     TILED_F16 as _CAKE_GROUPED_MXFP8_TILED_F16,
+    TILED_WIDE_BF16 as _CAKE_GROUPED_MXFP8_TILED_WIDE_BF16,
+    TILED_WIDE_F16 as _CAKE_GROUPED_MXFP8_TILED_WIDE_F16,
 )
 from ..jit.cake_program import CakeProgram
 from ..jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
@@ -474,7 +476,7 @@ def get_mxfp8_grouped_quantization_module():
     )
 
 
-# Generated Cake programs of the grouped MXFP8 quantizer: three kernels per
+# Generated Cake programs of the grouped MXFP8 quantizer: four kernels per
 # input dtype, all writing the same bytes.  Every program reads two-byte
 # elements through one bfloat16 pointer (the float16 programs widen with their
 # own conversion), so the host selects the program by dtype and shape and
@@ -503,12 +505,20 @@ _CAKE_GROUPED_MXFP8_TILED_PROGRAMS: Dict[torch.dtype, CakeProgram] = {
     torch.bfloat16: _CAKE_GROUPED_MXFP8_TILED_BF16,
     torch.float16: _CAKE_GROUPED_MXFP8_TILED_F16,
 }
+# The wide tiled kernel is the tiled kernel with 224-thread CTAs: a row of 224
+# blocks (K = 7168) is one CTA instead of two, so the grid has half the CTAs.
+_CAKE_GROUPED_MXFP8_TILED_WIDE_PROGRAMS: Dict[torch.dtype, CakeProgram] = {
+    torch.bfloat16: _CAKE_GROUPED_MXFP8_TILED_WIDE_BF16,
+    torch.float16: _CAKE_GROUPED_MXFP8_TILED_WIDE_F16,
+}
 # Problems of at most this many input bytes take the bulk kernel.
 _CAKE_BULK_MAX_INPUT_BYTES = 4 << 20
-# Problems of at least this many rows (B * M) take the tiled kernel, at
-# _CAKE_TILED_ROWS rows per thread.
+# Problems of at least this many rows (B * M) take a tiled kernel, at
+# _CAKE_TILED_ROWS rows per thread: the wide one when K is _CAKE_TILED_WIDE_K
+# (one CTA a row), else the 128-thread one.
 _CAKE_TILED_MIN_ROWS = 16384
 _CAKE_TILED_ROWS = 2
+_CAKE_TILED_WIDE_K = 7168
 _CAKE_QUANT_BLOCK = 32
 # One block row per M and one grid slice per B: CUDA caps grid.y and grid.z at 65535.
 _CAKE_MAX_GRID_YZ = 65535
@@ -570,10 +580,11 @@ def cake_grouped_mxfp8_quantize_program(
         _CAKE_GROUPED_MXFP8_PROGRAMS,
         _CAKE_GROUPED_MXFP8_BULK_PROGRAMS,
         _CAKE_GROUPED_MXFP8_TILED_PROGRAMS,
+        _CAKE_GROUPED_MXFP8_TILED_WIDE_PROGRAMS,
     )
     if dtype not in _CAKE_GROUPED_MXFP8_PROGRAMS:
         raise TypeError(f"unsupported Cake grouped MXFP8 input dtype: {dtype}")
-    row2d, bulk, tiled = (table[dtype] for table in programs)
+    row2d, bulk, tiled, tiled_wide = (table[dtype] for table in programs)
     if k < _CAKE_QUANT_BLOCK:
         return row2d
     if padded_k is not None and padded_k != _round_up(k, _CAKE_SCALE_TILE):
@@ -581,7 +592,7 @@ def cake_grouped_mxfp8_quantize_program(
     if b * m * k * dtype.itemsize <= _CAKE_BULK_MAX_INPUT_BYTES:
         return bulk
     if b * m >= _CAKE_TILED_MIN_ROWS:
-        return tiled
+        return tiled_wide if k == _CAKE_TILED_WIDE_K else tiled
     return row2d
 
 
