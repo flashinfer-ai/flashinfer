@@ -890,7 +890,7 @@ class _CorrectionMergeUnavailable(Exception):
 
 
 def _correction_merge_factory(
-    name, *args, route_heads=None, route_work_bins=False, **kwargs
+    name, *args, route_heads=None, route_work_bins=False, owner_helper=False, **kwargs
 ):
     """The merging build of the factory row's correction module.
 
@@ -898,9 +898,9 @@ def _correction_merge_factory(
     through the routes; this takes the module's ``_RENDERED_MERGE_ROUTES``
     build instead (same argument plan, the merge on top).  The routing
     keywords are not part of the row's key, and a merging build has no
-    work bins.
+    work bins and no owner/helper build.
     """
-    del route_heads, route_work_bins
+    del route_heads, route_work_bins, owner_helper
     arch = detect_gpu_arch()
     rows = _kda_registry.FACTORIES.get(arch, {}).get(name, {})
     module = rows.get(_kda_registry._key(args, kwargs))
@@ -1062,6 +1062,29 @@ def _bt16_chunks_per_prep_cta(
     if num_heads * total_chunks >= BT16_GENERAL_HIGH_WORK_MIN_CHUNK_HEADS:
         return BT16_GENERAL_HIGH_WORK_CHUNKS_PER_PREP_CTA
     return 6 if compute_dtype == "bf16" else BT16_GENERAL_LOW_WORK_CHUNKS_PER_PREP_CTA
+
+
+# The owner/helper split of the unbounded direct N32 body: helper CTAs prepare a
+# task's chunks (gate scan, normalization, pairwise products, block inverse) and
+# hand each prepared stage to the task's owner CTA through a global ring, so the
+# owner runs the recurrence alone. Every owner and helper CTA is resident at once
+# (one CTA per SM, launched cooperatively): a task takes min(2, SMs / tasks - 1)
+# helpers, and a sequence shorter than OWNER_HELPER_MIN_TOKENS keeps the one-CTA
+# body. Each helper has OWNER_HELPER_SLOTS_PER_HELPER ring slots of 32 KiB per task.
+OWNER_HELPER_MAX_HELPERS = 2
+OWNER_HELPER_MIN_TOKENS = 1024
+OWNER_HELPER_SLOTS_PER_HELPER = 5
+OWNER_HELPER_SLOT_ELEMENTS = 16384
+
+
+def _owner_helper_count(
+    *, gpu_arch: str, sm_count: int, total_tasks: int, max_seq_len: int
+) -> int:
+    """Helper CTAs per task of the owner/helper split, or 0 for the one-CTA body."""
+    if gpu_arch not in ("sm_100a", "sm_103a") or max_seq_len < OWNER_HELPER_MIN_TOKENS:
+        return 0
+    helpers = min(OWNER_HELPER_MAX_HELPERS, sm_count // max(total_tasks, 1) - 1)
+    return helpers if helpers >= 1 else 0
 
 
 def _should_use_small_bh_owner_helper(
@@ -2769,6 +2792,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 f"FlashKDA route {route!r} with {compute_dtype} compute resolves to "
                 f"the {unexported_route} kernel family, which is not exported"
             )
+        owner_helpers = 0
         if use_bt16_prepare_chain:
             self.prepare_module = self._build_body(
                 partial(_factory, "compiled_tf32_bt16_prepare"),
@@ -2804,11 +2828,29 @@ class FlashKDABlackwellBF16FusedLaunch:
                 raise ValueError(
                     "checkpoint accumulation requires FP32 checkpoint rows"
                 )
+            # The owner/helper program is asked for on the unbounded N32 body of
+            # an unforced plan; the factory keeps the one-CTA program for a
+            # module without one.
+            owner_helpers = (
+                _owner_helper_count(
+                    gpu_arch=gpu_arch,
+                    sm_count=sm_count,
+                    total_tasks=total_tasks,
+                    max_seq_len=max_seq_len,
+                )
+                if unbounded_softplus
+                and compute_dtype == "bf16"
+                and backend == "cuda_cpp"
+                and not use_direct_m128_n16
+                and not (self._force_direct_m128 or self._force_direct_m128_n32)
+                else 0
+            )
             self.module = self._build_body(
                 partial(
                     _factory,
                     "compiled_bf16_fused_m128",
                     route_work_bins=route_work_bins,
+                    **({"owner_helper": True} if owner_helpers else {}),
                 ),
                 BF16_N16_M128_CHUNK if use_direct_m128_n16 else BF16_M128_CHUNK,
                 serving_native_abi=serving_native_abi,
@@ -3092,6 +3134,12 @@ class FlashKDABlackwellBF16FusedLaunch:
                     "work bins replace the one-CTA-per-task direct grid only"
                 )
             self.grid = (num_work_bins, 1, 1)
+        self.owner_helpers = (
+            owner_helpers if getattr(self.module, "owner_helper", False) else 0
+        )
+        if self.owner_helpers:
+            self.grid = (total_tasks * (1 + self.owner_helpers), 1, 1)
+            self.schedule += f"_owner{self.owner_helpers}helper"
         self.prepare_grid = (bt16_prepare_total_ctas, 1, 1)
         qkv_carriers = self._qkv_carrier_names.get(id(self.module), ())
         self.args = {
@@ -3209,6 +3257,24 @@ class FlashKDABlackwellBF16FusedLaunch:
             self.args.update(
                 initial_state_f32=initial_state_f32_pointer,
                 final_state_f32=final_state_f32_pointer,
+            )
+        if self.owner_helpers:
+            # The packet ring (chunk_state) and its two word arrays: the ready
+            # words (zero_workspace) and the consumed words
+            # (state_checkpoint_needed). The program leaves every word zero when
+            # it exits, so one zeroed allocation serves every launch of the plan.
+            slots = total_tasks * OWNER_HELPER_SLOTS_PER_HELPER * self.owner_helpers
+            owner_helper_words = torch.zeros(
+                2 * slots, dtype=torch.uint32, device=q.device
+            )
+            self.args.update(
+                chunk_state=torch.empty(
+                    slots * OWNER_HELPER_SLOT_ELEMENTS,
+                    dtype=torch.bfloat16,
+                    device=q.device,
+                ),
+                zero_workspace=owner_helper_words[:slots],
+                state_checkpoint_needed=owner_helper_words[slots:],
             )
         self.prepare_args: dict[str, Any] = {}
         if use_bt16_prepare_chain:

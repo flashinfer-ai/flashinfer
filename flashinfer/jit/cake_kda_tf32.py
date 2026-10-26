@@ -9,7 +9,9 @@ into the generated-source directory when its JIT spec is created; a generated
 program (``_RENDERED_MODULES``) ships its own binding, and ``_RENDERED_ROUTES``
 points the factory rows of the modules it replaces at it (``_RENDERED_HEAD_ROUTES``
 per head count where a program's build depends on it, ``_RENDERED_WORK_BIN_ROUTES``
-for launches that ask for a program built with work bins).
+for launches that ask for a program built with work bins,
+``_RENDERED_OWNER_HELPER_ROUTES`` for the owner/helper build a call selects when the
+device holds its grid).
 """
 
 from functools import cache
@@ -3973,6 +3975,13 @@ _RENDERED_WORK_BIN_ROUTES = {
     },
 }
 
+# architecture -> shipped module -> the generated owner/helper program of its body:
+# helper CTAs prepare a task's chunks and hand them to the task's owner CTA, so the
+# program runs cooperatively with ``tasks * (1 + helpers)`` CTAs. ``_factory``
+# returns it when the call asks for it (``owner_helper=True``); every other call
+# keeps the ``_RENDERED_ROUTES`` program.
+_RENDERED_OWNER_HELPER_ROUTES = {"sm_100a": {}, "sm_103a": {}}
+
 MODULES = {
     **{name: _module_record(name, *row) for name, row in _MODULE_ROWS.items()},
     **_RENDERED_MODULES,
@@ -5038,6 +5047,10 @@ class PreparedKernel:
     #: CTAs per (sequence, head) of a program routed by head count
     #: (``_RENDERED_HEAD_ROUTES``); ``None`` for every other module.
     ctas_per_head = None
+    #: Whether the program is an owner/helper build
+    #: (``_RENDERED_OWNER_HELPER_ROUTES``): its grid is ``tasks * (1 + helpers)``
+    #: CTAs, all resident at once, and it takes a zeroed packet ring.
+    owner_helper = False
 
     #: The program runs bins of (sequence, head) tasks: its ``seq_order``
     #: argument is a bin table and its grid is one CTA per bin.
@@ -5192,14 +5205,18 @@ def prepare_descriptors(prepared):
             owner._descriptors_stale = False
 
 
-def _factory(name, *args, route_heads=None, route_work_bins=False, **kwargs):
+def _factory(
+    name, *args, route_heads=None, route_work_bins=False, owner_helper=False, **kwargs
+):
     """The prepared module of one factory row, through the routes.
 
     ``route_heads`` is the head count of the call: a module the head-count
     routes name at that count resolves to that program, whose launch grid is
     ``ctas_per_head`` CTAs per (sequence, head). ``route_work_bins`` asks for
     the module's program built with work bins, where the work-bin routes name
-    one (its record sets ``work_bins``).
+    one (its record sets ``work_bins``). ``owner_helper`` asks for the
+    owner/helper program of the module; a module without one keeps its route
+    (the returned kernel's ``owner_helper`` says which the call got).
     """
     arch = device_arch()
     variants = FACTORIES.get(arch, {}).get(name, {})
@@ -5209,6 +5226,12 @@ def _factory(name, *args, route_heads=None, route_work_bins=False, **kwargs):
             f"Unexported KDA schedule specialization: {(arch, name, *key)}"
         )
     module = variants[key]
+    if owner_helper:
+        program = _RENDERED_OWNER_HELPER_ROUTES.get(arch, {}).get(module)
+        if program is not None:
+            kernel = PreparedKernel(program, arch)
+            kernel.owner_helper = True
+            return kernel
     by_heads = _RENDERED_HEAD_ROUTES.get(arch, {}).get(module, {})
     if route_heads in by_heads:
         program, ctas_per_head = by_heads[route_heads]
