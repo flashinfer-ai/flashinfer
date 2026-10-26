@@ -98,7 +98,7 @@ __device__ __forceinline__ float2 fma_f32x2_rn_ftz(float2 a, float2 b, float2 c)
 extern "C" {
 
 __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
-kernel_cake_selective_state_update_ef3807c7af19110c1126(__nv_bfloat16* __restrict__ state, __nv_bfloat16* __restrict__ x, float* __restrict__ dt, float* __restrict__ A, __nv_bfloat16* __restrict__ B, __nv_bfloat16* __restrict__ C, float* __restrict__ D, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ output, long long* __restrict__ state_batch_indices, int batch_size, int nheads, int dim, int dstate, int ngroups, int token_steps, unsigned long long state_stride_slot, int dt_softplus, long long pad_slot_id)
+kernel_cake_selective_state_update_a70e8dc68aabd722a74b(__nv_bfloat16* __restrict__ state, __nv_bfloat16* __restrict__ x, float* __restrict__ dt, float* __restrict__ A, __nv_bfloat16* __restrict__ B, __nv_bfloat16* __restrict__ C, float* __restrict__ D, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ output, long long* __restrict__ state_batch_indices, int batch_size, int nheads, int dim, int dstate, int ngroups, int token_steps, unsigned long long state_stride_slot, int dt_softplus, long long pad_slot_id)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
