@@ -14,15 +14,15 @@
  * limitations under the License.
  */
 
-// This unit serves two programs: cake_grouped_mxfp8_quantize_8576babbd894e4b6d820 (CAKE_PROGRAM_VARIANT 0, the default) and
-// cake_grouped_mxfp8_quantize_d121f7006a04383f7954 (CAKE_PROGRAM_VARIANT 1).  CAKE_PROGRAM_KERNEL names the kernel it defines.  A build
+// This unit serves two programs: cake_grouped_mxfp8_quantize_3167620f1b40056f0af4 (CAKE_PROGRAM_VARIANT 0, the default) and
+// cake_grouped_mxfp8_quantize_54f46d4ff24768c763c2 (CAKE_PROGRAM_VARIANT 1).  CAKE_PROGRAM_KERNEL names the kernel it defines.  A build
 // selects the second program with the compile definitions
-// -DCAKE_PROGRAM_VARIANT=1 -DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_d121f7006a04383f7954.
+// -DCAKE_PROGRAM_VARIANT=1 -DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_54f46d4ff24768c763c2.
 #ifndef CAKE_PROGRAM_VARIANT
 #define CAKE_PROGRAM_VARIANT 0
 #endif
 #ifndef CAKE_PROGRAM_KERNEL
-#define CAKE_PROGRAM_KERNEL kernel_cake_grouped_mxfp8_quantize_8576babbd894e4b6d820
+#define CAKE_PROGRAM_KERNEL kernel_cake_grouped_mxfp8_quantize_3167620f1b40056f0af4
 #endif
 
 typedef signed char        int8_t;
@@ -63,7 +63,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
-#define THREADS 128
+#define THREADS 224
 
 #include <math_constants.h>
 
@@ -108,7 +108,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 
 extern "C" {
 
-__global__ __launch_bounds__(128) void
+__global__ __launch_bounds__(224) void
 CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8_t* __restrict__ quantized, uint8_t* __restrict__ scales, int M, int K, int PADDED_K, int PM_TILES, int PK_TILES, CakeFastDivmod BLOCKS_PER_ROW, unsigned long long TOTAL_TASKS, unsigned int ROWS, unsigned int SUBROWS)
 {
     const int tid = threadIdx.x;
@@ -124,7 +124,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
     // === Task calls (declaration order) ===
     unsigned int group = blockIdx.z;
     unsigned int tid_0 = (unsigned int)tid;
-    unsigned int flat = (unsigned int)blockIdx.x * 128 + tid_0;
+    unsigned int flat = (unsigned int)blockIdx.x * 224 + tid_0;
     uint32_t _fast_div_q_0 = (BLOCKS_PER_ROW.divisor != 1) ? (__umulhi((uint32_t)(flat), BLOCKS_PER_ROW.multiplier) >> BLOCKS_PER_ROW.shift_right) : (uint32_t)(flat);
     uint32_t _fast_div_r_0 = (uint32_t)(flat) - _fast_div_q_0 * (uint32_t)(BLOCKS_PER_ROW.divisor);
     if (_fast_div_q_0 < SUBROWS) {
@@ -430,23 +430,21 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                     _reg_reduce_max2_1.x = max_noftz(_reg_reduce_max2_1.x, max_noftz(magnitudes[28], magnitudes[29]));
                     _reg_reduce_max2_1.y = max_noftz(_reg_reduce_max2_1.y, max_noftz(magnitudes[30], magnitudes[31]));
                     float absmax = row_max_reduce(_reg_reduce_max2_1);
-                    float scale = absmax / 448.0f;
-                    unsigned int scale_bits = __as_u32(scale);
-                    unsigned int exponent = scale_bits >> 23 & 255;
-                    unsigned int mantissa = scale_bits & 8388607;
-                    unsigned int has_mantissa = ((mantissa != 0) ? 1 : 0);
-                    unsigned int normal = ((exponent != 0) ? 1 : 0);
-                    unsigned int large_subnormal = ((mantissa > 4194304) ? 1 : 0);
-                    unsigned int scale_byte = ((exponent + (has_mantissa & (normal | large_subnormal))) < (254) ? (exponent + (has_mantissa & (normal | large_subnormal))) : (254));
+                    unsigned int magnitude = __as_u32(absmax) & 2147483647;
+                    int shifted = (int)(magnitude - 65011713) >> 23;
+                    int _max_2 = ((shifted) > (0) ? (shifted) : (0));
+                    unsigned int finite_byte = (unsigned int)_max_2;
+                    unsigned int saturated_byte = 254;
+                    unsigned int scale_byte = ((magnitude > 2139095039) ? saturated_byte : finite_byte);
                     unsigned int inverse_nonzero_bits = 254 - scale_byte << 23;
                     unsigned int zero_bits = 0;
                     unsigned int inverse_bits = ((scale_byte == 0) ? zero_bits : inverse_nonzero_bits);
                     float inverse = 0.0f;
                     inverse = reinterpret_cast<float*>(&inverse_bits)[0];
-                    const float2 _scale2_2 = {inverse, inverse};
+                    const float2 _scale2_3 = {inverse, inverse};
                     #pragma unroll
                     for (int _ls = 0; _ls < 16; _ls++)
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(values)[_ls], _scale2_2);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(values)[_ls], _scale2_3);
                     unsigned long long task = global_row * (unsigned long long)((uint32_t)(BLOCKS_PER_ROW.divisor)) + (unsigned long long)_fast_div_r_0;
                     unsigned long long q_offset = task * 32;
                     unsigned int _packed_0[8];
@@ -555,10 +553,10 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                         _packed_0[7] = _packed;
                     }
                     {
-                        const unsigned* _raw_stv8_3 = reinterpret_cast<const unsigned*>(_packed_0);
+                        const unsigned* _raw_stv8_4 = reinterpret_cast<const unsigned*>(_packed_0);
                         asm volatile(
                             "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                            :: "l"((void*)(quantized + q_offset)), "r"(_raw_stv8_3[0]), "r"(_raw_stv8_3[1]), "r"(_raw_stv8_3[2]), "r"(_raw_stv8_3[3]), "r"(_raw_stv8_3[4]), "r"(_raw_stv8_3[5]), "r"(_raw_stv8_3[6]), "r"(_raw_stv8_3[7]) : "memory");
+                            :: "l"((void*)(quantized + q_offset)), "r"(_raw_stv8_4[0]), "r"(_raw_stv8_4[1]), "r"(_raw_stv8_4[2]), "r"(_raw_stv8_4[3]), "r"(_raw_stv8_4[4]), "r"(_raw_stv8_4[5]), "r"(_raw_stv8_4[6]), "r"(_raw_stv8_4[7]) : "memory");
                     }
                     unsigned int m_tile = row / 128;
                     unsigned int row_in_tile = row - m_tile * 128;

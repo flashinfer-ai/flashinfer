@@ -14,15 +14,15 @@
  * limitations under the License.
  */
 
-// This unit serves two programs: cake_grouped_mxfp8_quantize_dd34a67556795b5a9623 (CAKE_PROGRAM_VARIANT 0, the default) and
-// cake_grouped_mxfp8_quantize_fbcc0484317e99db440e (CAKE_PROGRAM_VARIANT 1).  CAKE_PROGRAM_KERNEL names the kernel it defines.  A build
+// This unit serves two programs: cake_grouped_mxfp8_quantize_17f0a8f073d6b2b82f6e (CAKE_PROGRAM_VARIANT 0, the default) and
+// cake_grouped_mxfp8_quantize_b04f03c1a974efa820a8 (CAKE_PROGRAM_VARIANT 1).  CAKE_PROGRAM_KERNEL names the kernel it defines.  A build
 // selects the second program with the compile definitions
-// -DCAKE_PROGRAM_VARIANT=1 -DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_fbcc0484317e99db440e.
+// -DCAKE_PROGRAM_VARIANT=1 -DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_b04f03c1a974efa820a8.
 #ifndef CAKE_PROGRAM_VARIANT
 #define CAKE_PROGRAM_VARIANT 0
 #endif
 #ifndef CAKE_PROGRAM_KERNEL
-#define CAKE_PROGRAM_KERNEL kernel_cake_grouped_mxfp8_quantize_dd34a67556795b5a9623
+#define CAKE_PROGRAM_KERNEL kernel_cake_grouped_mxfp8_quantize_17f0a8f073d6b2b82f6e
 #endif
 
 typedef signed char        int8_t;
@@ -63,7 +63,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
-#define THREADS 224
+#define THREADS 128
 
 #include <math_constants.h>
 
@@ -108,7 +108,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 
 extern "C" {
 
-__global__ __launch_bounds__(224) void
+__global__ __launch_bounds__(128) void
 CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8_t* __restrict__ quantized, uint8_t* __restrict__ scales, int M, int K, int PADDED_K, int PM_TILES, int PK_TILES, CakeFastDivmod BLOCKS_PER_ROW, unsigned long long TOTAL_TASKS, unsigned int ROWS, unsigned int SUBROWS)
 {
     const int tid = threadIdx.x;
@@ -124,7 +124,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
     // === Task calls (declaration order) ===
     unsigned int group = blockIdx.z;
     unsigned int tid_0 = (unsigned int)tid;
-    unsigned int flat = (unsigned int)blockIdx.x * 224 + tid_0;
+    unsigned int flat = (unsigned int)blockIdx.x * 128 + tid_0;
     uint32_t _fast_div_q_0 = (BLOCKS_PER_ROW.divisor != 1) ? (__umulhi((uint32_t)(flat), BLOCKS_PER_ROW.multiplier) >> BLOCKS_PER_ROW.shift_right) : (uint32_t)(flat);
     uint32_t _fast_div_r_0 = (uint32_t)(flat) - _fast_div_q_0 * (uint32_t)(BLOCKS_PER_ROW.divisor);
     if (_fast_div_q_0 < SUBROWS) {
