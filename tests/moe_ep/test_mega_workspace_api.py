@@ -996,11 +996,19 @@ def test_create_workspace_rejects_mutable_auto_tuning_state():
     layer.destroy()
 
 
-def test_auto_handles_and_default_replacement_retain_old_storage():
+@pytest.mark.parametrize("supports_live_profiles", [False, True])
+def test_auto_handles_and_default_replacement_retain_old_storage(
+    supports_live_profiles,
+):
+    from flashinfer.moe_ep import MoEEpConfigError
+
     layer, transformed, _ = _make_layer()
     layer._megakernel_config = SimpleNamespace(knobs="auto")
     layer._kernel.supports_auto_workspaces = True
-    layer._kernel.supports_live_token_tuning = True
+    layer._kernel.supports_live_token_tuning = supports_live_profiles
+    if not supports_live_profiles:
+        with pytest.raises(MoEEpConfigError, match="live-token tuning"):
+            layer.create_workspace(64, live_tokens=8, knobs={})
     first_raw = object()
     with (
         mock.patch.object(layer._kernel, "validate_init"),

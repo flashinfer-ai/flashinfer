@@ -119,9 +119,12 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
                 "use knobs for the inference pipeline."
             )
         self.supports_unfinalized_output = config.finalize_mode is FinalizeMode.NONE
-        # knobs="auto": tune at the first compute() (weights + staged inputs
-        # exist there), then keep the winner for the session.
-        self._autotune_pending = config.knobs == "auto"
+        # Legacy inference tunes at the first compute(). GenPhase uses the
+        # workspace's v2 selection state.
+        self.supports_auto_workspaces = config.kernel_variant == "genphase"
+        self._autotune_pending = (
+            config.knobs == "auto" and not self.supports_auto_workspaces
+        )
         if self._autotune_pending:
             import warnings
 
@@ -134,6 +137,20 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
                 UserWarning,
                 stacklevel=3,
             )
+
+    def coordinate_workspace_replacement(self, workspace):
+        if not self.supports_auto_workspaces:
+            return False
+        from ..automatic import coordinate_workspace_replacement
+
+        return coordinate_workspace_replacement(self, workspace)
+
+    def get_tuned_knobs(self, workspace=None):
+        if not self.supports_auto_workspaces:
+            return super().get_tuned_knobs(workspace)
+        from ..automatic import get_tuned_knobs
+
+        return get_tuned_knobs(workspace)
 
     @classmethod
     def kernel_name(cls) -> str:
@@ -180,9 +197,8 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
     def _genphase_config(self, fleet_params: FleetParams):
         """Memoize cache or heuristic selection for one workload and device.
 
-        Auto tuning bypasses the disk cache here and retunes its default
-        workspace during warmup. Public auto layers cannot create additional
-        capacity profiles through ``create_workspace()``.
+        Automatic workspaces start from the capacity heuristic. Their v2
+        selection uses the actual staged batch size during warmup or forward.
         """
         from ......kernel_src.sm100.next_cutedsl_megamoe import resolve_genphase_knobs
 
@@ -198,14 +214,16 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
                 if props is not None
                 else None
             )
-            key = (base, repr(constraints), fleet_params.tuning_live_tokens, hardware)
+            automatic = self._kernel_config.knobs == "auto"
+            live_tokens = None if automatic else fleet_params.tuning_live_tokens
+            key = (base, repr(constraints), live_tokens, hardware)
             if key not in self._genphase_configs:
                 knobs, _ = resolve_genphase_knobs(
                     base,
                     sm_count=sms,
-                    live_tokens=fleet_params.tuning_live_tokens,
+                    live_tokens=live_tokens,
                     constraints=constraints,
-                    use_cache=gpu and self._kernel_config.knobs != "auto",
+                    use_cache=gpu and not automatic,
                 )
                 self._genphase_configs[key] = dataclasses.replace(base, **knobs)
             return self._genphase_configs[key]
@@ -401,11 +419,11 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         return workspace
 
     def validate_capture_ready(self, workspace, transformed_weights):
-        """Reject GenPhase capture until collective auto warmup has completed."""
-        if self._kernel_config.kernel_variant == "genphase" and self._autotune_pending:
-            raise MoEEpConfigError(
-                "GenPhase knobs='auto' requires collective warmup before CUDA graph capture"
-            )
+        if (
+            self._kernel_config.kernel_variant == "genphase"
+            and workspace._compiled is None
+        ):
+            raise MoEEpConfigError("Warm up GenPhase before CUDA graph capture")
 
     def validate_forward(
         self,
@@ -508,23 +526,11 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             num_tokens = (
                 output.shape[0] if output is not None else workspace.staged_tokens()
             )
-            if self._autotune_pending:
-                from ......kernel_src.sm100.next_cutedsl_megamoe import (
-                    autotune_sm100_genphase_mega_moe,
-                )
+            from ..automatic import prepare_auto_configuration
 
-                winner = autotune_sm100_genphase_mega_moe(
-                    output,
-                    transformed_weights[0],
-                    transformed_weights[1],
-                    workspace,
-                    num_tokens=num_tokens,
-                    constraints=self._genphase_constraints(),
-                    process_group=self._ep_comm_group,
-                )
-                workspace.retune(winner)
-                self._autotune_winner = winner
-                self._autotune_pending = False
+            prepare_auto_configuration(
+                self, workspace, transformed_weights, output, num_tokens
+            )
             view = sm100_genphase_mega_moe(
                 output,
                 transformed_weights[0],
