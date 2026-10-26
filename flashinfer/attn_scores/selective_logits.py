@@ -182,6 +182,19 @@ if _CUTE_DSL_AVAILABLE:
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
 
+    # Load DSL definitions before a caller owns plan or graph storage. Supported
+    # DSL decorators can retain their importing frames until cyclic collection;
+    # a first import inside a plan would keep that plan's CUDA owners alive.
+    # Kernel compilation remains lazy.
+    for _definition_module in (
+        ".kernels.schedule_kernel",
+        ".kernels._fp8_mqa_selective",
+        ".kernels.selective_logits_metadata",
+        "..topk_varlen.kernels.gvr2_topk_decode",
+    ):
+        importlib.import_module(_definition_module, __package__)
+    del _definition_module
+
 
 @dataclass(frozen=True)
 class _PreparedFP8MQASelectiveLogits:

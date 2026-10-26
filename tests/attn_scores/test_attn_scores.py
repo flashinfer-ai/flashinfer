@@ -9265,17 +9265,25 @@ def test_capacity_shared_layer_workspace(heads, ratio):
     assert torch.equal(table, table_b)
     exemplar = pool_a.clone()
     exemplar_ref = weakref.ref(exemplar)
-    wrapper = FP8PagedMQATopKWrapper(
-        strategy="selective",
-        num_heads=heads,
-        compression_ratio=ratio,
-        max_context_length=9001 * ratio,
-        max_chunk_size=2,
-        max_batch_size=2,
-        kv_layout=exemplar,
-    )
-    del exemplar
-    assert exemplar_ref() is None
+    # Layout inspection must not rely on collection of import/decorator frames
+    # to release the exemplar, even on the first construction in a process.
+    gc_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        wrapper = FP8PagedMQATopKWrapper(
+            strategy="selective",
+            num_heads=heads,
+            compression_ratio=ratio,
+            max_context_length=9001 * ratio,
+            max_chunk_size=2,
+            max_batch_size=2,
+            kv_layout=exemplar,
+        )
+        del exemplar
+        assert exemplar_ref() is None
+    finally:
+        if gc_enabled:
+            gc.enable()
     wrapper.prepare_pool(pool_a)
     engine = wrapper._capacity_plan._engine
     workspace = engine._candidate_values
