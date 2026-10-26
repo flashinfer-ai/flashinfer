@@ -73,12 +73,49 @@ kernel_cake_mega_moe_w4a16_0655fab0ea64d52e2c7f(__nv_bfloat16* route_terms, int*
     // === Task calls (declaration order) ===
     asm volatile("griddepcontrol.wait;" ::: "memory");
     int slice_index = blockIdx.x;
-    int token = blockIdx.y;
+    int first_token = blockIdx.y;
+    int token_stride = gridDim.y;
     int32_t _sysv_u32_0;
     asm volatile("ld.volatile.global.s32 %0, [%1];" : "=r"(_sysv_u32_0) : "l"(tokens_per_rank) : "memory");
     int live_tokens = _sysv_u32_0;
-    if (token < live_tokens) {
+    if (first_token < live_tokens) {
         int column = slice_index * 1024 + tid * 8;
+        unsigned long long row = (unsigned long long)hidden;
+        int ids[8];
+        float scores[8];
+        unsigned long long first_route = (unsigned long long)first_token * 8;
+        {
+            const int4* _ivptr_0 = reinterpret_cast<const int4*>(topk_ids + first_route + 0);
+            int4 _ivld_0;
+            _ivld_0 = *_ivptr_0;
+            ids[0 + 0] = _ivld_0.x;
+            ids[0 + 1] = _ivld_0.y;
+            ids[0 + 2] = _ivld_0.z;
+            ids[0 + 3] = _ivld_0.w;
+        }
+        {
+            const int4* _ivptr_1 = reinterpret_cast<const int4*>(topk_ids + (first_route + 4) + 0);
+            int4 _ivld_1;
+            _ivld_1 = *_ivptr_1;
+            ids[4 + 0] = _ivld_1.x;
+            ids[4 + 1] = _ivld_1.y;
+            ids[4 + 2] = _ivld_1.z;
+            ids[4 + 3] = _ivld_1.w;
+        }
+        {
+            float4 _v4 = *reinterpret_cast<const float4*>(topk_weights + first_route + 0);
+            scores[0 + 0] = _v4.x;
+            scores[0 + 1] = _v4.y;
+            scores[0 + 2] = _v4.z;
+            scores[0 + 3] = _v4.w;
+        }
+        {
+            float4 _v4 = *reinterpret_cast<const float4*>(topk_weights + (first_route + 4) + 0);
+            scores[4 + 0] = _v4.x;
+            scores[4 + 1] = _v4.y;
+            scores[4 + 2] = _v4.z;
+            scores[4 + 3] = _v4.w;
+        }
         unsigned int* counter_words = reinterpret_cast<unsigned int*>(completion);
         if (tid == 0) {
             uint32_t _sysv_u32_1;
@@ -94,101 +131,125 @@ kernel_cake_mega_moe_w4a16_0655fab0ea64d52e2c7f(__nv_bfloat16* route_terms, int*
             asm volatile("fence.acquire.sys;" ::: "memory");
         }
         asm volatile("barrier.sync 15, 128;" ::: "memory");
-        unsigned long long row = (unsigned long long)hidden;
-        unsigned long long route_offset = (unsigned long long)token * 8;
-        int ids[8];
-        {
-            const int4* _ivptr_0 = reinterpret_cast<const int4*>(topk_ids + route_offset + 0);
-            int4 _ivld_0;
-            _ivld_0 = *_ivptr_0;
-            ids[0 + 0] = _ivld_0.x;
-            ids[0 + 1] = _ivld_0.y;
-            ids[0 + 2] = _ivld_0.z;
-            ids[0 + 3] = _ivld_0.w;
-        }
-        {
-            const int4* _ivptr_1 = reinterpret_cast<const int4*>(topk_ids + (route_offset + 4) + 0);
-            int4 _ivld_1;
-            _ivld_1 = *_ivptr_1;
-            ids[4 + 0] = _ivld_1.x;
-            ids[4 + 1] = _ivld_1.y;
-            ids[4 + 2] = _ivld_1.z;
-            ids[4 + 3] = _ivld_1.w;
-        }
-        float scores[8];
-        {
-            float4 _v4 = *reinterpret_cast<const float4*>(topk_weights + route_offset + 0);
-            scores[0 + 0] = _v4.x;
-            scores[0 + 1] = _v4.y;
-            scores[0 + 2] = _v4.z;
-            scores[0 + 3] = _v4.w;
-        }
-        {
-            float4 _v4 = *reinterpret_cast<const float4*>(topk_weights + (route_offset + 4) + 0);
-            scores[4 + 0] = _v4.x;
-            scores[4 + 1] = _v4.y;
-            scores[4 + 2] = _v4.z;
-            scores[4 + 3] = _v4.w;
-        }
-        unsigned long long route_base = route_offset * row + (unsigned long long)column;
+        unsigned int terms[32];
+        float values[8];
         float accum[8];
-        accum[0] = 0.0f;
-        accum[1] = 0.0f;
-        accum[2] = 0.0f;
-        accum[3] = 0.0f;
-        accum[4] = 0.0f;
-        accum[5] = 0.0f;
-        accum[6] = 0.0f;
-        accum[7] = 0.0f;
-        #pragma unroll
-        for (int route_slot = 0; route_slot < 8; route_slot++) {
-            int expert = ids[route_slot];
-            if (expert >= 0) {
-                float _vec_load_0[8];
+        for (int token = first_token; token < live_tokens; token += token_stride) {
+            unsigned long long route_offset = (unsigned long long)token * 8;
+            unsigned long long route_base = route_offset * row + (unsigned long long)column;
+            #pragma unroll
+            for (int route_slot = 0; route_slot < 8; route_slot++) {
                 {
-                    const uint4* _vptr_4 = reinterpret_cast<const uint4*>(route_terms + (route_base + row * (unsigned long long)route_slot) + 0);
-                    uint4 _vld_4[1];
+                    uint32_t _uv4_4_0;
+                    uint32_t _uv4_4_1;
+                    uint32_t _uv4_4_2;
+                    uint32_t _uv4_4_3;
+                    asm volatile("ld.global.v4.b32 {%0, %1, %2, %3}, [%4];"
+                        : "=r"(_uv4_4_0), "=r"(_uv4_4_1), "=r"(_uv4_4_2), "=r"(_uv4_4_3) : "l"((const void*)(route_terms + (route_base + row * (unsigned long long)route_slot) + (0))) : "memory");
+                    terms[route_slot * 4 + 0] = _uv4_4_0;
+                    terms[route_slot * 4 + 1] = _uv4_4_1;
+                    terms[route_slot * 4 + 2] = _uv4_4_2;
+                    terms[route_slot * 4 + 3] = _uv4_4_3;
+                }
+            }
+            accum[0] = 0.0f;
+            accum[1] = 0.0f;
+            accum[2] = 0.0f;
+            accum[3] = 0.0f;
+            accum[4] = 0.0f;
+            accum[5] = 0.0f;
+            accum[6] = 0.0f;
+            accum[7] = 0.0f;
+            #pragma unroll
+            for (int route_slot_1 = 0; route_slot_1 < 8; route_slot_1++) {
+                int expert = ids[route_slot_1];
+                if (expert >= 0) {
                     #pragma unroll
-                    for (int _blk = 0; _blk < 1; _blk++) {
-                        asm volatile("ld.global.v4.b32 {%0, %1, %2, %3}, [%4];"
-                            : "=r"(_vld_4[_blk].x), "=r"(_vld_4[_blk].y), "=r"(_vld_4[_blk].z), "=r"(_vld_4[_blk].w) : "l"((const void*)(_vptr_4 + _blk)) : "memory");
-                        uint32_t* _vpairs_4 = reinterpret_cast<uint32_t*>(&_vld_4[_blk]);
-                        #pragma unroll
-                        for (int _pair = 0; _pair < 4; _pair++) {
-                            (&_vec_load_0[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_4[_pair]) << 16);
-                            (&_vec_load_0[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_4[_pair]) & 0xffff0000u);
-                        }
+                    for (int _pair = 0; _pair < 1; _pair++) {
+                        (&values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((terms + route_slot_1 * 4)[_pair]) << 16);
+                        (&values[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((terms + route_slot_1 * 4)[_pair]) & 0xffff0000u);
+                    }
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 1; _pair++) {
+                        (&values[2 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((terms + route_slot_1 * 4)[1 + _pair]) << 16);
+                        (&values[2 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((terms + route_slot_1 * 4)[1 + _pair]) & 0xffff0000u);
+                    }
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 1; _pair++) {
+                        (&values[4 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((terms + route_slot_1 * 4)[2 + _pair]) << 16);
+                        (&values[4 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((terms + route_slot_1 * 4)[2 + _pair]) & 0xffff0000u);
+                    }
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 1; _pair++) {
+                        (&values[6 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((terms + route_slot_1 * 4)[3 + _pair]) << 16);
+                        (&values[6 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((terms + route_slot_1 * 4)[3 + _pair]) & 0xffff0000u);
+                    }
+                    float score = scores[route_slot_1];
+                    #pragma unroll
+                    for (int element = 0; element < 8; element++) {
+                        accum[element] = __fmaf_rn(values[element], score, accum[element]);
                     }
                 }
-                float score = scores[route_slot];
-                #pragma unroll
-                for (int element = 0; element < 8; element++) {
-                    accum[element] = __fmaf_rn(_vec_load_0[element], score, accum[element]);
+            }
+            unsigned int _packed_0[4];
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(accum[_lp*2 + 0], accum[_lp*2+1 + 0]));
+                _packed_0[_lp] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(accum[_lp*2 + 2], accum[_lp*2+1 + 2]));
+                _packed_0[_lp + 1] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(accum[_lp*2 + 4], accum[_lp*2+1 + 4]));
+                _packed_0[_lp + 2] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(accum[_lp*2 + 6], accum[_lp*2+1 + 6]));
+                _packed_0[_lp + 3] = *(uint32_t*)&_bf2;
+            }
+            reinterpret_cast<int4*>(output + ((unsigned long long)token * row + (unsigned long long)column))[0] = reinterpret_cast<int4*>(_packed_0)[0];
+            int next_token = token + token_stride;
+            if (next_token < live_tokens) {
+                unsigned long long next_route = (unsigned long long)next_token * 8;
+                {
+                    const int4* _ivptr_5 = reinterpret_cast<const int4*>(topk_ids + next_route + 0);
+                    int4 _ivld_5;
+                    _ivld_5 = *_ivptr_5;
+                    ids[0 + 0] = _ivld_5.x;
+                    ids[0 + 1] = _ivld_5.y;
+                    ids[0 + 2] = _ivld_5.z;
+                    ids[0 + 3] = _ivld_5.w;
+                }
+                {
+                    const int4* _ivptr_6 = reinterpret_cast<const int4*>(topk_ids + (next_route + 4) + 0);
+                    int4 _ivld_6;
+                    _ivld_6 = *_ivptr_6;
+                    ids[4 + 0] = _ivld_6.x;
+                    ids[4 + 1] = _ivld_6.y;
+                    ids[4 + 2] = _ivld_6.z;
+                    ids[4 + 3] = _ivld_6.w;
+                }
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(topk_weights + next_route + 0);
+                    scores[0 + 0] = _v4.x;
+                    scores[0 + 1] = _v4.y;
+                    scores[0 + 2] = _v4.z;
+                    scores[0 + 3] = _v4.w;
+                }
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(topk_weights + (next_route + 4) + 0);
+                    scores[4 + 0] = _v4.x;
+                    scores[4 + 1] = _v4.y;
+                    scores[4 + 2] = _v4.z;
+                    scores[4 + 3] = _v4.w;
                 }
             }
         }
-        unsigned int _packed_0[4];
-        #pragma unroll
-        for (int _lp = 0; _lp < 1; _lp++) {
-            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(accum[_lp*2 + 0], accum[_lp*2+1 + 0]));
-            _packed_0[_lp] = *(uint32_t*)&_bf2;
-        }
-        #pragma unroll
-        for (int _lp = 0; _lp < 1; _lp++) {
-            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(accum[_lp*2 + 2], accum[_lp*2+1 + 2]));
-            _packed_0[_lp + 1] = *(uint32_t*)&_bf2;
-        }
-        #pragma unroll
-        for (int _lp = 0; _lp < 1; _lp++) {
-            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(accum[_lp*2 + 4], accum[_lp*2+1 + 4]));
-            _packed_0[_lp + 2] = *(uint32_t*)&_bf2;
-        }
-        #pragma unroll
-        for (int _lp = 0; _lp < 1; _lp++) {
-            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(accum[_lp*2 + 6], accum[_lp*2+1 + 6]));
-            _packed_0[_lp + 3] = *(uint32_t*)&_bf2;
-        }
-        reinterpret_cast<int4*>(output + ((unsigned long long)token * row + (unsigned long long)column))[0] = reinterpret_cast<int4*>(_packed_0)[0];
     }
 }
 
