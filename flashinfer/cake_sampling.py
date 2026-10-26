@@ -1649,6 +1649,7 @@ _STAGE1_PICKS_BY_DEVICE: dict[
         (128256, 16, False): (4, 16, True),
         (128256, 32, False): (4, 16, True),
         (128256, 64, False): (2, 16, True),
+        (128256, 128, False): (1, 16, True),
         (151936, 1, False): (8, 16, True),
         (151936, 2, False): (8, 16, True),
         (151936, 4, False): (8, 16, True),
