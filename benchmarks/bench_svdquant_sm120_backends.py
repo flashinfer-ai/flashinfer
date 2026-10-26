@@ -132,6 +132,11 @@ def run_operation(
     env: Environment,
     stream: TextIO,
 ) -> None:
+    """Tune and compare one workload, then write its accuracy and timing record.
+
+    The first configured backend supplies the accuracy reference. Trials rotate
+    backend order; all tuning and output checks finish before timed sampling.
+    """
     calls = {
         backend: make_call(case, operation, backend, options.enable_pdl)
         for backend in BACKENDS

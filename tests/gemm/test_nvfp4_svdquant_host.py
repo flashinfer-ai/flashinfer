@@ -305,6 +305,7 @@ def test_auto_linear_measures_both_native_prefixes(auto_backend_case):
 )
 @pytest.mark.parametrize("operation", ["gemm", "linear"])
 def test_auto_skips_native_build_for_unsupported_rank(auto_backend_case, operation):
+    """Auto dispatch must exclude unsupported native ranks without loading a module."""
     from flashinfer import autotune
 
     _, call, _, builds, _ = auto_backend_case
@@ -317,6 +318,7 @@ def test_auto_skips_native_build_for_unsupported_rank(auto_backend_case, operati
 def test_explicit_cutlass_rejects_unsupported_rank_before_build(
     auto_backend_case, rank
 ):
+    """Explicit CUTLASS must reject unsupported ranks before JIT compilation."""
     _, _, _, builds, _ = auto_backend_case
     m, n, k = 64, 128, 3072
     with pytest.raises(ValueError, match="Problem size is not supported"):
@@ -1465,6 +1467,7 @@ def test_linear_runners_load_the_requested_rank(
 
 @pytest.mark.parametrize("rank", [0, 48, 96, 160])
 def test_linear_rejects_unsupported_ranks_before_loading_kernels(rank: int) -> None:
+    """The linear API must reject unsupported ranks before native module lookup."""
     with pytest.raises(ValueError, match="rank"):
         svdquant_linear(
             torch.empty((1, 32), dtype=torch.bfloat16),
@@ -1844,6 +1847,7 @@ def test_rank64_fusion_invalidates_unfused_route_cache() -> None:
 
 @pytest.mark.parametrize("m,k", [(64, 3072), (537, 7168), (4096, 12288)])
 def test_rank128_offers_small_m_after_existing_producers(m: int, k: int) -> None:
+    """New rank-128 producer families must preserve existing variant indices."""
     variants = routes.sm120_producer_variants(m, k, 128)
     families = [family for family, _, _ in variants]
     small = families.index(routes.SM120_FAMILY_SMALL_M)
@@ -2874,6 +2878,7 @@ QUANT_HEADER: Final = (
 
 
 def _function(source: str, signature: str) -> str:
+    """Extract a C++ body for host tests, skipping braces in default arguments."""
     start = source.index(signature)
     position = start + len(signature)
     parentheses = signature.count("(") - signature.count(")")
@@ -3221,6 +3226,7 @@ def _run_ubsan(tmp_path: Path, source: str) -> None:
 
 @pytest.mark.parametrize("rank", (32, 64, 128))
 def test_dynamic_prefix_offsets_cross_int32_boundary(tmp_path: Path, rank: int) -> None:
+    """UBSan must accept production offsets exceeding signed 32-bit range."""
     # Compile the production expressions so UBSan checks C++ promotion rules,
     # without allocating multi-gigabyte CUDA tensors to reach the boundary.
     source = PRODUCER_HEADER.read_text()
@@ -3376,6 +3382,7 @@ int main() { check<false>(); check<true>(); }
 def alignment_binary(
     request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory
 ) -> Path:
+    """Compile prefix guards with stubbed launches and UBSan for each rank."""
     compiler = shutil.which("g++") or shutil.which("clang++")
     if compiler is None:
         pytest.skip("requires a C++ compiler with UBSan")

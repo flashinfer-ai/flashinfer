@@ -35,6 +35,7 @@ JsonValue: TypeAlias = (
 
 class InvalidBackendsError(ValueError):
     def __init__(self, value: str) -> None:
+        """Retain the rejected environment value and identify supported backends."""
         self.value = value
         super().__init__(
             "SVDQ_BENCH_BACKENDS must list cute-dsl, cutlass-sm120 or auto; "
@@ -259,6 +260,11 @@ def build_case(
 def make_call(
     case: Case, operation: Operation, backend: Backend, enable_pdl: bool
 ) -> Call:
+    """Bind a workload for repeated execution outside setup and preparation costs.
+
+    GEMM reuses its output allocation. Linear calls prepare L2T only for backends
+    that can select CUTLASS producers, leaving CuTe-only setup independent of JIT.
+    """
     operands: tuple[torch.Tensor, ...]
     match operation:
         case "gemm":

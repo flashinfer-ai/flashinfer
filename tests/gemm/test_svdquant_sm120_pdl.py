@@ -9,6 +9,7 @@ from flashinfer.gemm import svdquant_sm120_routes as routes
 
 @pytest.mark.parametrize("capture", [False, True])
 def test_quantize_handoff_workspace_is_isolated(capture: bool) -> None:
+    """Independent streams or captures must not overwrite each other's counter."""
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
@@ -39,6 +40,7 @@ def test_quantize_handoff_workspace_is_isolated(capture: bool) -> None:
 def test_deferred_prefix_matches_serialized_replays(
     m: int, k: int, extra_workspace: int
 ) -> None:
+    """Replayed PDL output must match serialization after inputs and scratch change."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("requires SM120")
     # Given: changing inputs and each deferred small-M producer configuration.
@@ -73,6 +75,7 @@ def test_deferred_prefix_matches_serialized_replays(
             continue
 
         def run(enable_pdl: bool) -> None:
+            """Run a fixed producer/GEMM pair with only dependency policy varying."""
             module.nvfp4_svdquant_linear_sm120(
                 x,
                 pqs,

@@ -511,12 +511,12 @@ struct CollectiveMmaLoRaSm120 {
   using SmemLayoutDConsume = SmemLayoutDPayload;
   using SmemLayoutL1Consume = SmemLayoutL1Payload;
 
-  // The storage-width fallback's tail MMAs over the TMA zero-filled columns
-  // compute acc = acc + 0 on every lane, which canonicalizes an exactly -0.0
-  // accumulator lane to +0.0. The payload view skips those MMAs, so the same
-  // additive identity is applied explicitly to keep the output bit pattern
-  // identical to the fallback's on every valid input. K128 stages have no
-  // skipped columns and need nothing.
+  /// The storage-width fallback's tail MMAs over the TMA zero-filled columns
+  /// compute acc = acc + 0 on every lane, which canonicalizes an exactly -0.0
+  /// accumulator lane to +0.0. The payload view skips those MMAs, so the same
+  /// additive identity is applied explicitly to keep the output bit pattern
+  /// identical to the fallback's on every valid input. K128 stages have no
+  /// skipped columns and need nothing.
   template <class FrgTensorAcc>
   CUTLASS_DEVICE static void canonicalize_lora_tail_zeros(FrgTensorAcc&& accum) {
     if constexpr (LoRaStorageK != LoRaChunkK) {
@@ -809,6 +809,7 @@ struct CollectiveMmaLoRaSm120 {
   // Methods
   //
 
+  /// Build mainloop layouts and TMA descriptors, carrying the optional prefix barrier.
   template <class ProblemShape>
   static constexpr Params to_underlying_arguments(ProblemShape const& problem_shape,
                                                   Arguments const& args, void* workspace) {
@@ -1668,9 +1669,9 @@ struct CollectiveMmaLoRaSm120 {
     });
   }
 
-  /// Consume the LoRA stage: rank-32 bf16 D@L1^T added into the SAME accumulator fragment.
-  /// Called by the kernel AFTER TileScheduler::fixup (accumulator fully reduced) and before
-  /// the epilogue, only by the epilogue-owning work unit; consumes exactly one stage.
+  /// Consume all BF16 LoRA rank chunks into the residual accumulator fragment.
+  /// Called after TileScheduler::fixup and before the epilogue, only by the
+  /// epilogue-owning work unit; consumes one stage per rank chunk.
   template <class FrgTensorC>
   CUTLASS_DEVICE void mma_lora(MainloopPipeline pipeline, PipelineState smem_pipe_read,
                                FrgTensorC& accum, int thread_idx, TensorStorage& shared_tensors) {
@@ -2226,6 +2227,8 @@ class GemmUniversalLoRaSm120 {
 
   static dim3 get_block_shape() { return dim3(MaxThreadsPerBlock, 1, 1); }
 
+  /// Execute persistent residual GEMM work and add LoRA after split-K reduction.
+  /// Only the epilogue-owning work unit consumes the LoRA stages and writes output.
   CUTLASS_DEVICE
   void operator()(Params const& params, char* smem_buf) {
     using namespace cute;

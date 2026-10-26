@@ -11,6 +11,7 @@ from flashinfer.gemm import svdquant_sm120_cutlass as backend
 
 @pytest.fixture(autouse=True)
 def clear_layout_caches():
+    """Isolate prepared and opportunistic layout caches between regression cases."""
     backend._SM120_PREPARED_L2T.clear()
     backend._SM120_KMAJOR_L2T_CACHE.clear()
     backend._SM120_M537_PACKED_L2T_CACHE.clear()
@@ -23,6 +24,7 @@ def clear_layout_caches():
 @pytest.mark.parametrize("rank", [32, 128])
 @pytest.mark.parametrize("inference", [False, True])
 def test_reprepare_updates_existing_layout(rank: int, inference: bool) -> None:
+    """A retained packed layout must observe re-preparation of the same source."""
     # Given: a consumer retains the layout prepared for an existing weight.
     with torch.inference_mode() if inference else nullcontext():
         source = torch.zeros((3072, rank), dtype=torch.bfloat16)
@@ -46,6 +48,7 @@ def test_reprepare_updates_existing_layout(rank: int, inference: bool) -> None:
 @pytest.mark.parametrize("rank", [32, 128])
 @pytest.mark.parametrize("inference", [False, True])
 def test_prepared_graph_observes_reprepare(rank: int, inference: bool) -> None:
+    """An existing graph must read updated weights without recapturing addresses."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("requires SM120")
     # Given: the graph reads a prepared layout, with the source kept alive.
@@ -73,6 +76,7 @@ def test_prepared_graph_observes_reprepare(rank: int, inference: bool) -> None:
 
 @pytest.mark.parametrize("rank", [32, 128])
 def test_preparing_inside_capture_is_rejected(rank: int) -> None:
+    """Reject capture-time preparation without preventing remaining graph work."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("requires SM120")
     source = torch.zeros((3072, rank), device="cuda", dtype=torch.bfloat16)
@@ -90,6 +94,7 @@ def test_preparing_inside_capture_is_rejected(rank: int) -> None:
 def test_dynamic_shared_memory_opt_in_on_each_device(
     family: int, tiling: tuple[int, int, int]
 ) -> None:
+    """One loaded module must opt in and compute correctly on each SM120 device."""
     devices = [
         index
         for index in range(torch.cuda.device_count())

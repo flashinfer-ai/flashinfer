@@ -19,6 +19,8 @@ struct SvdquantQuantizeBarrierSm120 {
   unsigned int* counter = nullptr;
   unsigned int blocks = 0;
 
+  /// Publish this CTA's completed quantize stores with a device-scope release.
+  /// All CTA threads must call together; a null counter disables the barrier.
   __device__ void arrive() const {
     if (counter != nullptr) {
       __syncthreads();
@@ -29,6 +31,8 @@ struct SvdquantQuantizeBarrierSm120 {
     }
   }
 
+  /// Acquire all quantize CTA releases through a non-null, per-launch counter.
+  /// The caller must fence the async proxy before issuing dependent TMA loads.
   __device__ void wait() const {
     cuda::atomic_ref<unsigned int, cuda::thread_scope_device> ready(*counter);
     while (ready.load(cuda::memory_order_acquire) != blocks) {

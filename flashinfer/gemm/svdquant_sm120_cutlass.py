@@ -164,6 +164,7 @@ _SM120_PREPARED_L2T: dict[
 
 
 def _prepared_l2t_key(l2t_smoothed: torch.Tensor) -> tuple:
+    """Key prepared layouts by the source's device, address, shape, strides and dtype."""
     return (
         l2t_smoothed.device,
         l2t_smoothed.data_ptr(),
@@ -176,6 +177,7 @@ def _prepared_l2t_key(l2t_smoothed: torch.Tensor) -> tuple:
 def _prepared_l2t_layout(
     l2t_smoothed: torch.Tensor, layout: str
 ) -> Optional[torch.Tensor]:
+    """Look up a prepared layout if source identity and its available version match."""
     entry = _SM120_PREPARED_L2T.get(_prepared_l2t_key(l2t_smoothed))
     if entry is None or entry[0]() is not l2t_smoothed:
         return None
@@ -227,6 +229,7 @@ def prepare_sm120_l2t(l2t_smoothed: torch.Tensor) -> None:
         layouts = previous[2]
 
     def discard(dead_ref: weakref.ReferenceType, *, key: tuple = key) -> None:
+        """Release this source's layouts without removing a replacement cache entry."""
         current = _SM120_PREPARED_L2T.get(key)
         if current is not None and current[0] is dead_ref:
             _SM120_PREPARED_L2T.pop(key, None)
@@ -269,6 +272,7 @@ def _cached_l2t_pack(
     packed = pack(l2t_smoothed)
 
     def discard(dead_ref: weakref.ReferenceType, *, key: int = source_id) -> None:
+        """Evict a dead source only if its weak reference still owns the cache slot."""
         current = cache.get(key)
         if current is not None and current[0] is dead_ref:
             cache.pop(key, None)
@@ -557,6 +561,7 @@ def _sm120_run_unfused_linear_prefix(
 def _sm120_fused_linear_runner(
     enable_pdl: bool, device: torch.device, rank: int = 32
 ) -> _SvdquantRunner:
+    """Build a rank-specialized runner for jointly selected prefix and GEMM tactics."""
     module = get_nvfp4_svdquant_sm120_module(rank)
 
     class Sm120FusedLinearRunner(_SvdquantRunner):
@@ -580,6 +585,7 @@ def _sm120_fused_linear_runner(
             do_preparation: bool = False,
             **kwargs,
         ):
+            """Launch the selected producer/layout and GEMM using caller-owned scratch."""
             (
                 x,
                 weight_fp4,

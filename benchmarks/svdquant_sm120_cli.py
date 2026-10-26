@@ -57,6 +57,11 @@ def parse_shape(text: str) -> ShapeCase:
 def parse_options(
     argv: Sequence[str] | None = None, *, description: str | None = None
 ) -> Options:
+    """Parse benchmark workloads and reject incompatible timing or rank options.
+
+    Repeated shapes, operations and ranks are deduplicated in input order.
+    Invalid durations, counts or eager/cold-L2 combinations exit through argparse.
+    """
     parser = argparse.ArgumentParser(
         description=description, formatter_class=argparse.RawDescriptionHelpFormatter
     )

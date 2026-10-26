@@ -2171,12 +2171,14 @@ def test_sm120_m537_l2t_pack_handles_inference_tensor_mutation(k: int) -> None:
 
 
 def _clear_prepared_l2t() -> None:
+    """Remove explicit preparation and opportunistic packs between cache tests."""
     svdquant_sm120_cutlass._SM120_PREPARED_L2T.clear()
     svdquant_sm120_cutlass._SM120_KMAJOR_L2T_CACHE.clear()
     svdquant_sm120_cutlass._SM120_M537_PACKED_L2T_CACHE.clear()
 
 
 def test_sm120_prepared_kmajor_l2t_serves_inference_tensors() -> None:
+    """Only prepared inference weights may reuse a cached K-major layout."""
     _clear_prepared_l2t()
     try:
         with torch.inference_mode():
@@ -2195,6 +2197,7 @@ def test_sm120_prepared_kmajor_l2t_serves_inference_tensors() -> None:
 
 
 def test_sm120_prepared_l2t_invalidates_on_mutation_and_release() -> None:
+    """Version changes bypass prepared layouts; source destruction releases them."""
     _clear_prepared_l2t()
     try:
         source = torch.zeros((5120, 32), dtype=torch.int32)
@@ -2218,6 +2221,7 @@ def test_sm120_prepared_l2t_invalidates_on_mutation_and_release() -> None:
 
 
 def test_sm120_prepare_l2t_skips_layouts_no_producer_reads() -> None:
+    """Preparation must not retain unused layout copies for rank-64 producers."""
     _clear_prepared_l2t()
     try:
         source = torch.zeros((3072, 64))
@@ -4974,10 +4978,12 @@ def test_linear_rank_autotune_and_graph_replay(
     enable_pdl: bool,
     backend_name: str,
 ) -> None:
+    """Public backends must stay accurate through tuning and graph weight updates."""
     _check_linear_graph_replay(rank, shape, use_bias, enable_pdl, backend_name)
 
 
 def _small_m_variants(m: int, k: int, rank: int) -> list[int]:
+    """Select ordinary and split-K small-M variants for prefix replay tests."""
     return [
         variant
         for variant, (family, _, _) in enumerate(
@@ -5005,6 +5011,7 @@ def _small_m_variants(m: int, k: int, rank: int) -> list[int]:
 def test_fused_prefix_observes_graph_weight_updates(
     rank: int, m: int, k: int, variant: int
 ) -> None:
+    """Every selected prefix must refresh quantization and LoRA columns on replay."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("requires SM120")
 
@@ -5029,6 +5036,7 @@ def test_fused_prefix_observes_graph_weight_updates(
     l2t_read = backend._pack_sm120_kmajor_l2t(l2t) if kmajor else l2t
 
     def prefix() -> None:
+        """Launch the fixed producer with the layout required by its route."""
         module.nvfp4_quantize_smooth_lora_down_dyn_sm120(
             x,
             pqs,
@@ -5043,6 +5051,7 @@ def test_fused_prefix_observes_graph_weight_updates(
         )
 
     def check() -> None:
+        """Check packed outputs exactly and down columns against an FP32 reference."""
         module.nvfp4_quantize_smooth(
             x, pqs, global_scale, expected_xq, expected_sf, False
         )
