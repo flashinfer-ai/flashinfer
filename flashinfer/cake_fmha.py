@@ -1828,6 +1828,274 @@ def _run_cake_fmha_decode_program(
             entry(*[values[name] for name in program.args])
 
 
+@functools.cache
+def _decode_program_toolkit_at_least(version: str) -> bool:
+    """Whether the CUDA toolkit that builds the programs is ``version`` or newer
+    (asked once per process)."""
+
+    from .jit.cpp_ext import is_cuda_version_at_least
+
+    return is_cuda_version_at_least(version)
+
+
+# --- Quantized decode programs (E4M3 query and output) ----------------------
+#
+# ``cake_fmha_decode_nvfp4``: NVFP4 K / V pages.  A program serves both scale
+# forms: host scales travel as kernel scalars (null scale pointers), device
+# scales as FP32 pointers (bmm1 in log2 units).  The key is ``(batch,
+# num_q_heads, num_kv_heads, page_size, split plan)``.
+
+_DECODE_QUANT_PARAMS = (
+    "O",
+    "page_table",
+    "seq_lens_kv",
+    "bmm1_scale_ptr",
+    "bmm2_scale_ptr",
+    "partial_O",
+    "partial_max",
+    "partial_sum",
+    "pt_batch_stride",
+    "pt_v_offset",
+    "bmm1_is_log2",
+    "num_splits",
+    "blocks_per_split",
+    "bmm1_scalar",
+    "bmm2_scalar",
+)
+_DECODE_PROGRAM_HOST_PARAMS["decode_nvfp4"] = (
+    "Qt",
+    "Kp",
+    "Vp",
+    "Ksf",
+    "Vsf",
+    *_DECODE_QUANT_PARAMS,
+)
+_DECODE_PROGRAM_ROUTES["sm100a"].update(
+    {
+        ("decode_nvfp4", 128, 32, 4, 16, "split1"): "DEC_NVFP4_B128",
+    }
+)
+_DECODE_PROGRAM_ROUTES["sm103a"].update(
+    {
+        ("decode_nvfp4", 128, 32, 4, 16, "split1"): "DEC_NVFP4_B128",
+    }
+)
+_DECODE_PROGRAMS.update(
+    {
+        ("decode_nvfp4", "DEC_NVFP4_B128"): (
+            "cake_fmha_decode_nvfp4_bcfe92828a999ce45ff4",
+            "quant128",
+        ),
+    }
+)
+
+
+def _decode_quant_program_workspace_bytes(
+    *, host_scales: bool, batch_size: int, num_q_heads: int, num_splits: int
+) -> int:
+    """The workspace of a quantized decode program: the host scalar slots
+    (reserved; the scalars travel as kernel arguments), then the FP32 split
+    partials ``O`` / max / sum, 16-byte aligned (the binding's layout without
+    the padded query and page table, which a hit never needs)."""
+
+    rows = batch_size * num_q_heads * num_splits
+    scalar_slots = 16 if host_scales else 0  # two 4-byte slots, aligned to 16
+    return scalar_slots + rows * 128 * 4 + 2 * rows * 4
+
+
+def _decode_quant_program_select(
+    device: torch.device,
+    family: str,
+    *,
+    query: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    batch_size: int,
+    num_kv_heads: int,
+    page_size: int,
+    max_seq_len: int,
+    bmm1_scale: float | torch.Tensor,
+    bmm2_scale: float | torch.Tensor,
+    uses_shared_paged_kv_idx: bool,
+    enable_pdl: bool | None = None,
+) -> tuple[tuple[str, str], bool, int] | None:
+    """``(program, device_scales, num_splits)`` of a quantized decode launch
+    the family's programs serve, or ``None``.
+
+    A hit takes a contiguous query of eight query heads per KV head, a
+    contiguous int32 shared page table at least as wide as the kernel reads
+    (the evened 128-token block count of ``max_seq_len``, at least two, in
+    pages), int32 lengths, one scale form and a 16-byte aligned workspace
+    holding the split partials.  The plan comes from host scalars only.
+    ``enable_pdl`` is part of the key of a family whose multi-split programs
+    hand their partials to a reducer launched with programmatic dependent
+    launch (``None`` for a family without such a key).
+    """
+
+    num_q_heads = int(query.shape[1])
+    if not (
+        uses_shared_paged_kv_idx
+        and block_tables.ndim == 2
+        and block_tables.dtype == torch.int32
+        and seq_lens.dtype == torch.int32
+        and query.is_contiguous()
+        and num_q_heads == 8 * num_kv_heads
+        and page_size in (16, 32)
+    ):
+        return None
+    form = _decode_program_scale_form(bmm1_scale, bmm2_scale, query)
+    if form is None:
+        return None
+    blocks = (max_seq_len + 127) // 128
+    even = max(2, blocks + blocks % 2)
+    if int(block_tables.shape[-1]) < even * (128 // page_size):
+        return None
+    sm_count = _smallm_sm_count(device)
+    plan = _decode_program_quant_plan(batch_size, num_kv_heads, max_seq_len, sm_count)
+    required = _decode_quant_program_workspace_bytes(
+        host_scales=form == "host",
+        batch_size=batch_size,
+        num_q_heads=num_q_heads,
+        num_splits=plan[0],
+    )
+    if (
+        not workspace_buffer.is_contiguous()
+        or workspace_buffer.data_ptr() % 16
+        or workspace_buffer.numel() * workspace_buffer.element_size() < required
+    ):
+        return None
+    key: tuple[Any, ...] = (
+        batch_size,
+        num_q_heads,
+        num_kv_heads,
+        page_size,
+        _decode_program_plan_label(plan),
+    )
+    if enable_pdl is not None:
+        key += (plan[0] > 1 and enable_pdl is True,)
+    program = _decode_program_lookup(device, family, key)
+    if program is None:
+        return None
+    return program, form == "device", plan[0]
+
+
+def _decode_quant_program_values(
+    module: CakeFmhaDecodeProgramModule,
+    *,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    out: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    bmm1_scale: float | torch.Tensor,
+    bmm2_scale: float | torch.Tensor,
+    key_block_scales: torch.Tensor | None,
+    value_block_scales: torch.Tensor | None,
+    sm_count: int,
+    **unused: Any,
+) -> list[tuple[Any, Any, dict[str, Any]]]:
+    """The launches of a quantized decode program: the decode program, then
+    its split-KV reducer if it has one.  The kernels read the page table in
+    place (row stride its width) and the per-request lengths on the device;
+    the split partials live in the workspace."""
+
+    route = module.route
+    num_splits, blocks_per_split = _decode_program_quant_plan(
+        route.batch_size, route.num_kv_heads, max_seq_len, sm_count
+    )
+    if num_splits != route.num_split:
+        raise RuntimeError(
+            f"Cake FMHA decode program {module.identifier} was selected for "
+            f"{route.num_split} splits; the launch plans {num_splits}"
+        )
+    device_scales = route.device_scales
+    rows = route.batch_size * route.num_q_heads * num_splits
+    # FP32 partial O (128 per row), then the row maxima, then the row sums.
+    partials = _decode_program_workspace(
+        _decode_program_bytes(workspace_buffer),
+        0 if device_scales else 16,
+        rows * 130 * 4,
+        torch.float32,
+    )
+    partial_o = partials[: rows * 128]
+    partial_max = partials[rows * 128 : rows * 129]
+    partial_sum = partials[rows * 129 :]
+    if device_scales:
+        if not isinstance(bmm1_scale, torch.Tensor) or not isinstance(
+            bmm2_scale, torch.Tensor
+        ):
+            raise RuntimeError(
+                f"Cake FMHA decode program {module.identifier} was selected for "
+                "device scales; the launch passes host scales"
+            )
+        bmm1_ptr, bmm2_ptr = bmm1_scale.reshape(1), bmm2_scale.reshape(1)
+        bmm1_scalar = bmm2_scalar = 1.0
+    else:
+        bmm1_ptr = bmm2_ptr = None
+        bmm1_scalar, bmm2_scalar = float(bmm1_scale), float(bmm2_scale)
+    out_bytes = out.view(torch.uint8)
+    values: dict[str, Any] = {
+        "Qt": query.view(torch.uint8).view(-1, 128),
+        "O": out_bytes,
+        "page_table": block_tables,
+        "seq_lens_kv": seq_lens,
+        "bmm1_scale_ptr": bmm1_ptr,
+        "bmm2_scale_ptr": bmm2_ptr,
+        "partial_O": partial_o,
+        "partial_max": partial_max,
+        "partial_sum": partial_sum,
+        "pt_batch_stride": int(block_tables.shape[-1]),
+        "pt_v_offset": 0,
+        "bmm1_is_log2": 1 if device_scales else 0,
+        "num_splits": num_splits,
+        "blocks_per_split": blocks_per_split,
+        "bmm1_scalar": bmm1_scalar,
+        "bmm2_scalar": bmm2_scalar,
+    }
+    if module.family == "decode_nvfp4":
+        values["Kp"] = key_cache
+        values["Vp"] = value_cache
+        values["Ksf"] = key_block_scales.view(torch.uint8)
+        values["Vsf"] = value_block_scales.view(torch.uint8)
+    else:
+        values["K"] = key_cache.view(torch.uint8)
+        values["V"] = value_cache.view(torch.uint8)
+    grid = _decode_program_grid(
+        module,
+        module.program,
+        module.launch,
+        sm_count=sm_count,
+        num_splits=num_splits,
+    )
+    values.update(grid)
+    launches = [(module.program, module.entry, values)]
+    if module.reducer is not None:
+        _, _, launch, program, entry = module.reducer
+        reduce_values: dict[str, Any] = {
+            "partial_O": partial_o,
+            "partial_max": partial_max,
+            "partial_sum": partial_sum,
+            "O": out_bytes,
+            "bmm2_scale_ptr": bmm2_ptr,
+            "num_split": num_splits,
+            "bmm2_scalar": bmm2_scalar,
+        }
+        reduce_values.update(
+            _decode_program_grid(
+                module, program, launch, sm_count=sm_count, num_splits=num_splits
+            )
+        )
+        launches.append((program, entry, reduce_values))
+    return launches
+
+
+_DECODE_PROGRAM_VALUES["decode_nvfp4"] = _decode_quant_program_values
+
+
 def select_cake_fmha_decode_route(
     device: torch.device,
     *,
@@ -2491,7 +2759,34 @@ def select_cake_fmha_decode_route(
             bmm2_scale=bmm2_scale,
         )
     ):
-        return route("decode_quant_nvfp4")
+        candidate = route("decode_quant_nvfp4")
+        quant_program = None
+        if _decode_program_toolkit_at_least("13.4"):
+            # The generated program converts the E2M1 codes with the CUDA 13.4
+            # toolchain's native conversion; older toolkits keep the JIT member.
+            quant_program = _decode_quant_program_select(
+                device,
+                "decode_nvfp4",
+                query=query,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                workspace_buffer=workspace_buffer,
+                batch_size=batch_size,
+                num_kv_heads=num_kv_heads,
+                page_size=page_size,
+                max_seq_len=max_seq_len,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+            )
+        if quant_program is not None:
+            return dataclass_replace(
+                candidate,
+                program=quant_program[0],
+                device_scales=quant_program[1],
+                num_split=quant_program[2],
+            )
+        return candidate
     return None
 
 

@@ -493,3 +493,594 @@ def test_cake_decode_batch_without_query_tokens_returns_before_any_launch(
     assert result is out and out.shape[0] == 0
     assert lse.shape == (0, 32)
     assert not counter.any()
+
+
+# --- Shape rows through route selection (host-only) ---------------------------
+
+# The shape rows: name -> (family, kind, batch, q_len, kv_len, num_q_heads,
+# num_kv_heads, page_size, the program per target).  ``kind`` names the
+# dtypes and head dim of the launch (see ``_decode_kwargs``).
+SHAPE_ROWS: dict[str, tuple] = {
+    "nvfp4_b128_s8192": (
+        "decode_nvfp4", "nvfp4", 128, 1, 8192, 32, 4, 16,
+        {"sm100a": "DEC_NVFP4_B128", "sm103a": "DEC_NVFP4_B128"},
+    ),
+}  # fmt: skip
+
+_SM_COUNT = {"sm100a": 148, "sm103a": 152}
+_QUANT_KINDS = ("fp8", "nvfp4")
+_HOST_BMM1 = 128**-0.5
+
+
+def _decode_kwargs(
+    kind,
+    batch,
+    q_len,
+    kv_len,
+    num_q_heads,
+    num_kv_heads,
+    page_size,
+    *,
+    device="meta",
+    device_scales=False,
+    width=None,
+    max_seq_len=None,
+    workspace_bytes=1 << 28,
+):
+    """``select_cake_fmha_decode_route`` inputs of one launch: empty tensors
+    of its shapes (the selector reads shapes, strides, dtypes and pointer
+    alignment only).  K / V are the two halves of one stacked cache (the
+    contract's form) except NVFP4's separate code and scale pools."""
+
+    head_dim = 256 if kind == "smallm" else 128
+    pages = -(-kv_len // page_size)
+    width = pages if width is None else width
+    total_pages = batch * max(width, 1)
+    q_dtype = torch.bfloat16 if kind in ("bf16", "smallm") else torch.float8_e4m3fn
+    query = torch.empty(
+        (batch * q_len, num_q_heads, head_dim), dtype=q_dtype, device=device
+    )
+    key_scales = value_scales = None
+    if kind == "nvfp4":
+        shape = (total_pages, num_kv_heads, page_size, 64)
+        key = torch.empty(shape, dtype=torch.uint8, device=device)
+        value = torch.empty(shape, dtype=torch.uint8, device=device)
+        scale_shape = (total_pages, num_kv_heads, page_size, 8)
+        key_scales = torch.empty(scale_shape, dtype=torch.float8_e4m3fn, device=device)
+        value_scales = torch.empty_like(key_scales)
+    else:
+        stacked = torch.empty(
+            (total_pages, 2, num_kv_heads, page_size, head_dim),
+            dtype=q_dtype,
+            device=device,
+        )
+        key, value = stacked[:, 0], stacked[:, 1]
+    bmm2 = 1.0 / 0.75 if kind in _QUANT_KINDS else 1.0
+
+    def scale(host):
+        if not device_scales:
+            return host
+        return torch.empty((1,), dtype=torch.float32, device=device)
+
+    return dict(
+        query=query,
+        key_cache=key,
+        value_cache=value,
+        out=torch.empty_like(query),
+        workspace_buffer=torch.zeros(workspace_bytes, dtype=torch.uint8, device=device),
+        block_tables=torch.zeros((batch, width), dtype=torch.int32, device=device),
+        seq_lens=torch.full((batch,), kv_len, dtype=torch.int32, device=device),
+        batch_size=batch,
+        q_len=q_len,
+        max_seq_len=kv_len if max_seq_len is None else max_seq_len,
+        window_left=-1,
+        bmm1_scale=scale(_HOST_BMM1),
+        bmm2_scale=scale(bmm2),
+        o_scale=0.75 if kind in _QUANT_KINDS else 1.0,
+        sinks=None,
+        kv_layout="HND",
+        uses_shared_paged_kv_idx=True,
+        cum_seq_lens_q=None,
+        key_block_scales=key_scales,
+        value_block_scales=value_scales,
+        skip_softmax_threshold_scale_factor=None,
+        enable_block_sparse_attention=False,
+        lse=None,
+        multi_ctas_kv_counter_buffer=None,
+        enable_pdl=True,
+    )
+
+
+def _row_kwargs(row, **overrides):
+    _, kind, batch, q_len, kv_len, hq, hkv, page, _ = SHAPE_ROWS[row]
+    shape = dict(
+        batch=batch,
+        q_len=q_len,
+        kv_len=kv_len,
+        num_q_heads=hq,
+        num_kv_heads=hkv,
+        page_size=page,
+    )
+    for name in tuple(overrides):
+        if name in shape:
+            shape[name] = overrides.pop(name)
+    return _decode_kwargs(kind, *shape.values(), **overrides)
+
+
+@pytest.fixture
+def decode_target(monkeypatch):
+    """Pin the selection's target and SM count (meta tensors have neither);
+    returns a setter."""
+
+    def pin(target, sm_count=None):
+        monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+        count = _SM_COUNT[target] if sm_count is None else sm_count
+        monkeypatch.setattr(cake_api, "_smallm_sm_count", lambda device: count)
+        monkeypatch.setattr(
+            cake_api, "_decode_program_toolkit_at_least", lambda version: True
+        )
+
+    return pin
+
+
+def _select(kwargs):
+    return cake_api.select_cake_fmha_decode_route(torch.device("meta"), **kwargs)
+
+
+@pytest.mark.parametrize("device_scales", (False, True))
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+@pytest.mark.parametrize("row", sorted(SHAPE_ROWS))
+def test_cake_fmha_decode_route_serves_shape_rows_as_pinned(
+    decode_target, row, target, device_scales
+) -> None:
+    decode_target(target)
+    family = SHAPE_ROWS[row][0]
+    route = _select(_row_kwargs(row, device_scales=device_scales))
+    assert route is not None
+    assert route.program == (family, SHAPE_ROWS[row][-1][target])
+    assert route.device_scales is device_scales
+    assert cake_api.cake_fmha_route_is_optimized(route)
+
+
+# --- NVFP4 boundaries (host-only) --------------------------------------------
+
+
+def test_cake_fmha_decode_nvfp4_toolkit_gate_keeps_the_jit_member(
+    decode_target, monkeypatch
+) -> None:
+    decode_target("sm100a")
+    monkeypatch.setattr(
+        cake_api, "_decode_program_toolkit_at_least", lambda version: False
+    )
+    route = _select(_row_kwargs("nvfp4_b128_s8192"))
+    assert route is not None and route.component == "decode_quant_nvfp4"
+    assert route.program is None
+
+
+@pytest.mark.parametrize(
+    ("overrides", "hit"),
+    [
+        # An odd 128-token block count reads the evened width: the caller's
+        # table must hold it (a tight table misses).
+        ({"kv_len": 8000, "width": 512}, True),
+        ({"kv_len": 8000}, False),
+        ({"kv_len": 8064, "width": 512}, True),
+        ({"kv_len": 1, "width": 16}, True),
+        ({"kv_len": 1}, False),
+        # One token more reads one block pair more.
+        ({"kv_len": 8192, "max_seq_len": 8193}, False),
+        ({"kv_len": 8193, "width": 528}, True),
+        ({"kv_len": 8192, "width": 511}, False),
+        ({"kv_len": 8192, "width": 600}, True),
+        ({"batch": 127}, False),
+        ({"batch": 129}, False),
+        ({"page_size": 32}, False),
+    ],
+)
+def test_cake_fmha_decode_nvfp4_boundaries(decode_target, overrides, hit) -> None:
+    decode_target("sm103a")
+    route = _select(_row_kwargs("nvfp4_b128_s8192", **overrides))
+    if hit:
+        assert route.program == ("decode_nvfp4", "DEC_NVFP4_B128"), overrides
+    else:
+        assert route is None or route.program is None, overrides
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "mixed_scales",
+        "cpu_scale",
+        "strided_query",
+        "separate_tables",
+        "int64_lengths",
+        "small_workspace",
+    ),
+)
+def test_cake_fmha_decode_nvfp4_misses_keep_the_jit_route(
+    decode_target, mutation
+) -> None:
+    decode_target("sm100a")
+    kwargs = _row_kwargs("nvfp4_b128_s8192")
+    if mutation == "mixed_scales":
+        kwargs["bmm1_scale"] = torch.empty((1,), dtype=torch.float32, device="meta")
+    elif mutation == "cpu_scale":
+        kwargs["bmm1_scale"] = torch.ones((1,), dtype=torch.float32)
+        kwargs["bmm2_scale"] = torch.ones((1,), dtype=torch.float32)
+    elif mutation == "strided_query":
+        query = kwargs["query"]
+        wide = torch.empty(
+            (query.shape[0], query.shape[1], 256), dtype=query.dtype, device="meta"
+        )
+        kwargs["query"] = wide[..., :128]
+    elif mutation == "separate_tables":
+        kwargs["uses_shared_paged_kv_idx"] = False
+        kwargs["block_tables"] = torch.zeros(
+            (128, 2, 512), dtype=torch.int32, device="meta"
+        )
+    elif mutation == "int64_lengths":
+        kwargs["seq_lens"] = kwargs["seq_lens"].to(torch.int64)
+    else:
+        small = torch.empty(1024, dtype=torch.uint8, device="meta")
+        kwargs["workspace_buffer"] = small
+    route = _select(kwargs)
+    assert route is None or route.program is None, mutation
+
+
+# --- The values a quantized program receives (host-only) ---------------------
+
+
+def _program_values(monkeypatch, row, *, device_scales, sm_count=148, **overrides):
+    """The launches a stand-in program of ``row``'s route receives on CPU
+    tensors: ``[(name, values)]`` in stream order, under the no-sync spy."""
+
+    from flashinfer.jit.cake_program import GRID_ARGS
+
+    target = "sm100a" if sm_count == 148 else "sm103a"
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    monkeypatch.setattr(cake_api, "_smallm_sm_count", lambda device: sm_count)
+    monkeypatch.setattr(
+        cake_api, "_decode_program_toolkit_at_least", lambda version: True
+    )
+    kwargs = _row_kwargs(
+        row,
+        device="cpu",
+        device_scales=device_scales,
+        workspace_bytes=1 << 26,
+        **overrides,
+    )
+    route = cake_api.select_cake_fmha_decode_route(torch.device("cpu"), **kwargs)
+    family, identifier = route.program
+    calls = []
+
+    def record(key):
+        name, launch = cake_api._DECODE_PROGRAMS[key]
+        args = (*cake_api._DECODE_PROGRAM_HOST_PARAMS[key[0]], *GRID_ARGS)
+        cluster = tuple(getattr(_loader(key[0]), key[1]).cluster)
+        program = SimpleNamespace(name=name, args=args, cluster=cluster)
+        return launch, program, lambda *values: calls.append((name, args, values))
+
+    launch, program, entry = record((family, identifier))
+    reducer = None
+    reducer_key = cake_api._DECODE_PROGRAM_REDUCERS.get((family, identifier))
+    if reducer_key is not None:
+        reducer = (*reducer_key, *record(reducer_key))
+    module = cake_api.CakeFmhaDecodeProgramModule(
+        route=route,
+        family=family,
+        identifier=identifier,
+        launch=launch,
+        program=program,
+        target=_TARGET_ARCH[target],
+        entry=entry,
+        reducer=reducer,
+    )
+    monkeypatch.setattr(
+        cake_api, "_torch_stream_context", lambda device: contextlib.nullcontext()
+    )
+    with no_host_sync():
+        cake_api._run_cake_fmha_decode_program(
+            module,
+            query=kwargs["query"],
+            key_cache=kwargs["key_cache"],
+            value_cache=kwargs["value_cache"],
+            out=kwargs["out"],
+            workspace_buffer=kwargs["workspace_buffer"],
+            counter_buffer=kwargs["multi_ctas_kv_counter_buffer"],
+            block_tables=kwargs["block_tables"],
+            seq_lens=kwargs["seq_lens"],
+            max_seq_len=kwargs["max_seq_len"],
+            bmm1_scale=kwargs["bmm1_scale"],
+            bmm2_scale=kwargs["bmm2_scale"],
+            sinks=kwargs["sinks"],
+            lse=kwargs["lse"],
+            key_block_scales=kwargs["key_block_scales"],
+            value_block_scales=kwargs["value_block_scales"],
+            sm_count=sm_count,
+        )
+    launches = [
+        (name, dict(zip(args, values, strict=True))) for name, args, values in calls
+    ]
+    return kwargs, launches
+
+
+def _same_storage(view, tensor):
+    return view.data_ptr() == tensor.data_ptr()
+
+
+@pytest.mark.parametrize("device_scales", (False, True))
+def test_cake_decode_nvfp4_program_values_view_the_callers_tensors(
+    monkeypatch, device_scales
+) -> None:
+    """One launch over views of the caller's tensors (no copy, no padding):
+    the table in place with its width as the row stride, the partials in the
+    workspace after the reserved scalar slots, null scale pointers with host
+    scalars or the caller's FP32 scalars."""
+
+    kwargs, launches = _program_values(
+        monkeypatch, "nvfp4_b128_s8192", device_scales=device_scales
+    )
+    ((name, values),) = launches
+    assert name == cake_api._DECODE_PROGRAMS[("decode_nvfp4", "DEC_NVFP4_B128")][0]
+    assert values["Qt"].dtype == torch.uint8 and values["Qt"].shape == (128 * 32, 128)
+    assert _same_storage(values["Qt"], kwargs["query"])
+    assert values["Kp"] is kwargs["key_cache"] and values["Vp"] is kwargs["value_cache"]
+    assert values["Ksf"].dtype == torch.uint8
+    assert _same_storage(values["Ksf"], kwargs["key_block_scales"])
+    assert _same_storage(values["Vsf"], kwargs["value_block_scales"])
+    assert values["O"].dtype == torch.uint8
+    assert _same_storage(values["O"], kwargs["out"])
+    assert values["page_table"] is kwargs["block_tables"]
+    assert values["seq_lens_kv"] is kwargs["seq_lens"]
+    assert (values["pt_batch_stride"], values["pt_v_offset"]) == (512, 0)
+    assert (values["num_splits"], values["blocks_per_split"]) == (1, 64)
+    rows = 128 * 32
+    workspace = kwargs["workspace_buffer"].data_ptr()
+    first = 0 if device_scales else 16
+    assert values["partial_O"].data_ptr() == workspace + first
+    assert values["partial_O"].numel() == rows * 128
+    assert values["partial_max"].data_ptr() == workspace + first + rows * 512
+    assert values["partial_sum"].data_ptr() == workspace + first + rows * 516
+    if device_scales:
+        assert _same_storage(values["bmm1_scale_ptr"], kwargs["bmm1_scale"])
+        assert _same_storage(values["bmm2_scale_ptr"], kwargs["bmm2_scale"])
+        assert values["bmm1_is_log2"] == 1
+    else:
+        assert values["bmm1_scale_ptr"] is None and values["bmm2_scale_ptr"] is None
+        assert values["bmm1_is_log2"] == 0
+        assert values["bmm1_scalar"] == _HOST_BMM1
+        assert values["bmm2_scalar"] == 1.0 / 0.75
+    assert (values["grid_x"], values["grid_y"], values["grid_z"]) == (128, 1, 1)
+
+
+# --- GPU: shared helpers -----------------------------------------------------
+
+
+@pytest.fixture
+def served_programs(monkeypatch):
+    """The generated programs the decode dispatch runs, in call order (the
+    resolve, not the loader: a route loaded once skips the loader)."""
+
+    served = []
+    resolve = cake_api._resolve_cake_fmha_decode_module
+
+    def spy(device, route):
+        module, loaded = resolve(device, route)
+        if isinstance(module, cake_api.CakeFmhaDecodeProgramModule):
+            served.append(route.program)
+        return module, loaded
+
+    monkeypatch.setattr(cake_api, "_resolve_cake_fmha_decode_module", spy)
+    return served
+
+
+def _keep_the_jit_route(monkeypatch):
+    """Route every launch outside the program tables (the JIT members)."""
+
+    for target in tuple(cake_api._DECODE_PROGRAM_ROUTES):
+        monkeypatch.setitem(cake_api._DECODE_PROGRAM_ROUTES, target, {})
+
+
+def _bits(tensor):
+    dtype = torch.uint8 if tensor.element_size() == 1 else torch.int16
+    return tensor.view(dtype)
+
+
+def _run_decode(case, *, seq_lens=None, out=None, max_seq_len=None):
+    return decode_api.trtllm_batch_decode_with_kv_cache(
+        case.query,
+        case.kv_cache,
+        case.workspace,
+        case.block_tables,
+        case.seq_lens if seq_lens is None else seq_lens,
+        case.max_seq_len if max_seq_len is None else max_seq_len,
+        bmm1_scale=case.bmm1,
+        bmm2_scale=case.bmm2,
+        out=torch.empty_like(case.out) if out is None else out,
+        kv_layout="HND",
+        backend="cake",
+        kv_cache_sf=case.kv_cache_sf,
+        o_scale=case.o_scale,
+        q_len_per_req=case.q_len,
+        sinks=case.sinks,
+        enable_pdl=True,
+        multi_ctas_kv_counter_buffer=case.counter,
+    )
+
+
+def _check_hit_is_sync_free_and_replays(case, lengths):
+    """The hit reads nothing back (the spy), and a CUDA graph captured at the
+    case's lengths replays new lengths bitwise to a direct launch."""
+
+    _run_decode(case)
+    torch.cuda.synchronize()
+    with no_host_sync():
+        _run_decode(case)
+    seq_lens = case.seq_lens.clone()
+    out = torch.empty_like(case.out)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _run_decode(case, seq_lens=seq_lens, out=out)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run_decode(case, seq_lens=seq_lens, out=out)
+    seq_lens.copy_(lengths)
+    graph.replay()
+    direct = _run_decode(case, seq_lens=lengths)
+    torch.cuda.synchronize()
+    assert torch.equal(_bits(out), _bits(direct))
+
+
+# --- GPU: NVFP4 --------------------------------------------------------------
+
+_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _nvfp4_case(batch, kv_len, *, seed, lengths=None, device_scales=False):
+    """FP8 queries over NVFP4 K / V pages (random codes, block scales from
+    {0.5, 1, 2}, V's in FlashInfer's swizzled order), shuffled pages."""
+
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(seed)
+    hq, hkv, page = 32, 4, 16
+    width = -(-kv_len // page)
+    total = batch * width
+
+    def randint(high, *shape):
+        return torch.randint(
+            0, high, shape, generator=generator, device=device, dtype=torch.int64
+        )
+
+    scale_values = torch.tensor((0.5, 1.0, 2.0), device=device)
+    pools = []
+    for _ in range(2):
+        codes = randint(256, total, hkv, page, 64).to(torch.uint8)
+        scales = scale_values[randint(3, total, hkv, page, 8)]
+        pools.append((codes, scales.to(torch.float8_e4m3fn)))
+    query = (
+        torch.randn((batch, hq, 128), generator=generator, device=device) * 2.0
+    ).to(torch.float8_e4m3fn)
+    order = torch.randperm(total, generator=generator, device=device)
+    block_tables = order.view(batch, width).to(torch.int32).contiguous()
+    if lengths is None:
+        lengths = [kv_len] * batch
+    seq_lens = torch.tensor(lengths, dtype=torch.int32, device=device)
+    bmm1, bmm2 = 128**-0.5, 1.0 / 0.75
+    if device_scales:
+        bmm1 = torch.tensor([bmm1], dtype=torch.float32, device=device)
+        bmm2 = torch.tensor([bmm2], dtype=torch.float32, device=device)
+    return SimpleNamespace(
+        query=query,
+        kv_cache=(pools[0][0], pools[1][0]),
+        kv_cache_sf=(pools[0][1], pools[1][1]),
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=kv_len,
+        bmm1=bmm1,
+        bmm2=bmm2,
+        o_scale=0.75,
+        q_len=1,
+        sinks=None,
+        out=torch.empty_like(query),
+        workspace=torch.zeros(1 << 28, dtype=torch.uint8, device=device),
+        counter=torch.zeros(1 << 16, dtype=torch.uint8, device=device),
+    )
+
+
+def _nvfp4_dequantize(codes, scales, *, swizzled):
+    """``[..., 16, 64]`` packed codes and ``[..., 16, 8]`` scales of whole
+    pages to ``[..., 16, 128]`` FP32 values."""
+
+    if swizzled:
+        token = torch.arange(16, device=codes.device)[:, None]
+        group = torch.arange(8, device=codes.device)[None, :]
+        rows = (token & ~3) | (group >> 1)
+        cols = ((group & 1) << 2) | (token & 3)
+        scales = scales[..., rows, cols]
+    table = torch.tensor(_E2M1, device=codes.device)
+    low, high = (codes & 7).long(), ((codes >> 4) & 7).long()
+    sign_low, sign_high = (codes & 8) != 0, (codes & 128) != 0
+    values = torch.stack(
+        (
+            torch.where(sign_low, -table[low], table[low]),
+            torch.where(sign_high, -table[high], table[high]),
+        ),
+        dim=-1,
+    ).flatten(-2)
+    return values * scales.float().repeat_interleave(16, dim=-1)
+
+
+def _nvfp4_reference(case, batches):
+    """FP32 ``softmax(bmm1 Q K^T) V bmm2`` of the given requests."""
+
+    bmm1, bmm2 = (
+        scale.item() if isinstance(scale, torch.Tensor) else float(scale)
+        for scale in (case.bmm1, case.bmm2)
+    )
+    outputs = {}
+    for b in batches:
+        length = int(case.seq_lens[b])
+        if length == 0:
+            outputs[b] = torch.zeros((32, 128), device=case.query.device)
+            continue
+        pages = case.block_tables[b, : -(-length // 16)].long()
+        k = _nvfp4_dequantize(
+            case.kv_cache[0][pages], case.kv_cache_sf[0][pages], swizzled=False
+        )
+        v = _nvfp4_dequantize(
+            case.kv_cache[1][pages], case.kv_cache_sf[1][pages], swizzled=True
+        )
+        k = k.transpose(0, 1).reshape(4, -1, 128)[:, :length]
+        v = v.transpose(0, 1).reshape(4, -1, 128)[:, :length]
+        q = case.query[b].float().view(4, 8, 128)
+        p = torch.softmax(q @ k.transpose(1, 2) * bmm1, dim=-1)
+        outputs[b] = (p @ v).reshape(32, 128) * bmm2
+    return outputs
+
+
+@_GPU
+@pytest.mark.parametrize("device_scales", (False, True))
+@pytest.mark.parametrize("lengths", ("uniform", "ragged"))
+def test_cake_decode_nvfp4_program_matches_reference_and_the_jit_route(
+    monkeypatch, served_programs, device_scales, lengths
+) -> None:
+    from flashinfer.jit.cpp_ext import is_cuda_version_at_least
+
+    if not is_cuda_version_at_least("13.4"):
+        pytest.skip("the NVFP4 decode program needs the CUDA 13.4 toolkit")
+    ragged = [8192, 0, 1, 129, 4097, 8191, 255, 8000] * 16
+    case = _nvfp4_case(
+        128,
+        8192,
+        seed=20261026,
+        lengths=None if lengths == "uniform" else ragged,
+        device_scales=device_scales,
+    )
+    got = _run_decode(case)
+    assert served_programs == [("decode_nvfp4", "DEC_NVFP4_B128")]
+    batches = (0, 1, 2, 3, 5, 77, 127)
+    reference = _nvfp4_reference(case, batches)
+    for b in batches:
+        torch.testing.assert_close(
+            got[b].float(), reference[b], atol=1.0, rtol=0.1, msg=f"request {b}"
+        )
+    _keep_the_jit_route(monkeypatch)
+    jit = _run_decode(case)
+    assert len(served_programs) == 1
+    assert torch.equal(_bits(got), _bits(jit))
+
+
+@_GPU
+def test_cake_decode_nvfp4_program_is_sync_free_and_replays(served_programs) -> None:
+    from flashinfer.jit.cpp_ext import is_cuda_version_at_least
+
+    if not is_cuda_version_at_least("13.4"):
+        pytest.skip("the NVFP4 decode program needs the CUDA 13.4 toolkit")
+    case = _nvfp4_case(128, 8192, seed=20261027, device_scales=True)
+    lengths = torch.randint(
+        0, 8193, (128,), dtype=torch.int32, device=case.seq_lens.device
+    )
+    _check_hit_is_sync_free_and_replays(case, lengths)
+    assert set(served_programs) == {("decode_nvfp4", "DEC_NVFP4_B128")}
