@@ -8,6 +8,7 @@ decode entrypoint and does not change ordinary-call behavior.
 from __future__ import annotations
 
 import copy
+import functools
 import warnings
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -422,39 +423,6 @@ _CONTEXT_HOST_PARAMS: dict[str, tuple[str, ...]] = {
         "bmm1_is_log2",
     ),
 }
-
-
-def _context_route_program(
-    target: str,
-    component: str,
-    *,
-    scale_form: str,
-    num_q_heads: int,
-    num_kv_heads: int,
-    pack_g: int,
-    num_m_blocks: int,
-    page_size: int,
-    exact_profile: str | None,
-    is_causal: bool,
-    return_lse: bool,
-    enable_sink: bool,
-) -> str | None:
-    """The generated program serving a context route on ``target``, or
-    ``None`` when the route keeps its component's JIT module."""
-
-    if not is_causal or return_lse or enable_sink:
-        return None
-    key = (
-        component,
-        scale_form,
-        num_q_heads,
-        num_kv_heads,
-        pack_g,
-        num_m_blocks,
-        page_size,
-        exact_profile,
-    )
-    return _CONTEXT_PROGRAM_ROUTES.get(target, {}).get(key)
 
 
 def _context_program_facts(program_name: str) -> tuple[str, int, bool]:
@@ -1270,9 +1238,16 @@ def _manifest_authenticated_route_accounting() -> tuple[int, int]:
 def _cake_fmha_target(device: torch.device) -> CakeFmhaTarget:
     """Resolve the exact Blackwell cubin target without cross-arch fallback."""
 
+    return _cake_fmha_target_of(get_compute_capability(device))
+
+
+@functools.lru_cache(maxsize=None)
+def _cake_fmha_target_of(capability: tuple[int, int]) -> CakeFmhaTarget:
+    """The target of a compute capability (the CUDA version is fixed per
+    process, so the result is cached; a refusal raises every time)."""
+
     from .jit.cpp_ext import is_cuda_version_at_least
 
-    capability = get_compute_capability(device)
     if capability == (10, 0):
         if not is_cuda_version_at_least("12.8"):
             raise RuntimeError("Cake FMHA on B200 requires CUDA 12.8 or newer")
@@ -2224,10 +2199,13 @@ def _context_tile_mma_work(q_len: int, kv_len: int, tokens_per_tile: int) -> int
     return total
 
 
+@functools.lru_cache(maxsize=1024)
 def _context_pack_g(
     max_q_len: int, max_kv_len: int, num_q_heads: int, num_kv_heads: int
 ) -> int:
-    """Choose the canonical packed-GQA axis from host-visible maxima."""
+    """Choose the canonical packed-GQA axis from host-visible maxima (a pure
+    function of its integers, cached: the tile-work sums walk every query
+    block, which is tens of microseconds at long query lengths)."""
 
     group = num_q_heads // num_kv_heads
     if group <= 1 or group > 128:
@@ -2637,20 +2615,24 @@ def select_cake_fmha_context_route(
     device_scales = component in ("context_fp8", "context_nvfp4") and (
         isinstance(bmm1_scale, torch.Tensor) and isinstance(bmm2_scale, torch.Tensor)
     )
-    program = _context_route_program(
-        target,
-        component,
-        scale_form="device" if device_scales else "host",
-        num_q_heads=num_q_heads,
-        num_kv_heads=num_kv_heads,
-        pack_g=pack_g,
-        num_m_blocks=num_m_blocks,
-        page_size=page_size,
-        exact_profile=exact_profile,
-        is_causal=is_causal,
-        return_lse=lse is not None,
-        enable_sink=sinks is not None,
-    )
+    # The generated program serving the route on ``target`` (its key is the
+    # route's component, scale form, head counts, pack, m-blocks, page size
+    # and exact class), or ``None`` to keep the component's JIT module; the
+    # programs are causal and write no LSE and take no sink.
+    program = None
+    if is_causal and lse is None and sinks is None:
+        program = _CONTEXT_PROGRAM_ROUTES.get(target, {}).get(
+            (
+                component,
+                "device" if device_scales else "host",
+                num_q_heads,
+                num_kv_heads,
+                pack_g,
+                num_m_blocks,
+                page_size,
+                exact_profile,
+            )
+        )
     return CakeFmhaContextRoute(
         target=target,
         component=component,
@@ -2682,6 +2664,7 @@ class CakeFmhaContextProgramModule:
         self.entry = program.entry(target)
         self.units_per_batch = route.num_q_heads // route.pack_g
         self.quantized = route.component != "context_bf16"
+        _, self.num_m_blocks, self.one_tile = _context_program_facts(program.name)
 
     def cake_paged_attention_context(
         self,
@@ -2729,7 +2712,7 @@ class CakeFmhaContextProgramModule:
         pointers; a host-scalar program takes them as scalars and never reads
         the pointers.  The LSE, sink and Q-length pointers are unread (the
         programs write no LSE, take no sink and derive the query lengths from
-        ``cum_seq_lens_q``): they point into the workspace.
+        ``cum_seq_lens_q``): they point at a small per-device buffer.
         """
 
         route = self.route
@@ -2740,44 +2723,38 @@ class CakeFmhaContextProgramModule:
                 "Cake FMHA context launch does not match its selected route"
             )
         total_bh = int(batch_size) * self.units_per_batch
-        grid = cake_fmha_context_launch_grid(self.program, total_bh, sm_count)
-        unread = workspace_buffer.view(-1).view(torch.uint8)[:16]
+        tiles = self.num_m_blocks * total_bh
+        num_ctas = tiles if self.one_tile else min(int(sm_count), tiles)
+        device = query.device
+        unread_f32, unread_i32 = _unread_pointers(device)
         # The kernel reads page ``p`` of request ``b`` at ``page_table[b x
         # page_row_stride + p]``: pass 1-D views over the caller's own table
         # storage (no copy) that span every row, and its true row stride.
-        tables = block_tables.view(torch.int32)
-        if tables.stride(-1) != 1:
+        tables = (
+            block_tables
+            if block_tables.dtype == torch.int32
+            else block_tables.view(torch.int32)
+        )
+        strides = tables.stride()
+        if strides[-1] != 1:
             raise RuntimeError(
                 "Cake FMHA context page tables need a unit stride along the pages"
             )
-        row_stride = int(tables.stride(0))
-        span = (int(tables.shape[0]) - 1) * row_stride + int(tables.shape[-1])
-        page_table_k = tables.as_strided((span,), (1,), tables.storage_offset())
+        shape = tables.shape
+        row_stride = strides[0]
+        span = (shape[0] - 1) * row_stride + shape[-1]
+        offset = tables.storage_offset()
+        page_table_k = tables.as_strided((span,), (1,), offset)
         page_table_v = (
             page_table_k
             if uses_shared_paged_kv_idx
-            else tables.as_strided(
-                (span,), (1,), tables.storage_offset() + int(tables.stride(1))
-            )
+            else tables.as_strided((span,), (1,), offset + strides[1])
         )
-        values: dict[str, Any] = {
-            "Q": query.view(torch.uint8) if self.quantized else query,
-            "O_ptr": out.view(torch.uint8) if self.quantized else out,
-            "LSE_ptr": unread.view(torch.float32),
-            "sinks": unread.view(torch.float32),
-            "page_table_k": page_table_k,
-            "page_table_v": page_table_v,
-            "seq_lens_q": unread.view(torch.int32),
-            "seq_lens_kv": seq_lens,
-            "cu_seq_lens_q": cum_seq_lens_q,
-            "total_bh": total_bh,
-            "page_row_stride": row_stride,
-            "num_ctas": grid[0],
-            "dynamic_counter": multi_ctas_kv_counter_buffer.view(-1).view(torch.uint32),
-            "grid_x": grid[0],
-            "grid_y": grid[1],
-            "grid_z": grid[2],
-        }
+        counter = multi_ctas_kv_counter_buffer
+        if counter.dim() != 1:
+            counter = counter.view(-1)
+        if counter.dtype != torch.uint32:
+            counter = counter.view(torch.uint32)
         if route.device_scales:
             # bmm1 arrives in log2 units (trtllm_batch_context_with_kv_cache
             # multiplies a device bmm1 scale by log2e).
@@ -2787,30 +2764,163 @@ class CakeFmhaContextProgramModule:
                 raise RuntimeError(
                     "a device-scale Cake FMHA context program takes tensor scales"
                 )
-            values["softmax_scale_log2"] = 1.0
-            values["output_scale"] = 1.0
-            values["bmm1_scale_ptr"] = bmm1_scale.reshape(1)
-            values["bmm2_scale_ptr"] = bmm2_scale.reshape(1)
-            values["bmm1_is_log2"] = 1
+            softmax_scale_log2, output_scale, bmm1_is_log2 = 1.0, 1.0, 1
+            bmm1_ptr = bmm1_scale if bmm1_scale.dim() == 1 else bmm1_scale.reshape(1)
+            bmm2_ptr = bmm2_scale if bmm2_scale.dim() == 1 else bmm2_scale.reshape(1)
         else:
-            values["softmax_scale_log2"] = float(bmm1_scale) * log2e
-            values["output_scale"] = float(bmm2_scale)
-            values["bmm1_scale_ptr"] = unread.view(torch.float32)
-            values["bmm2_scale_ptr"] = unread.view(torch.float32)
-            values["bmm1_is_log2"] = 0
-        if route.component == "context_nvfp4":
-            values["Kp"] = key_cache
-            values["Vp"] = value_cache
-            values["Ksf"] = key_block_scales.view(torch.uint8)
-            values["Vsf"] = value_block_scales.view(torch.uint8)
-        else:
-            values["K"] = key_cache.view(torch.uint8) if self.quantized else key_cache
-            values["V"] = (
-                value_cache.view(torch.uint8) if self.quantized else value_cache
+            softmax_scale_log2 = float(bmm1_scale) * log2e
+            output_scale, bmm1_is_log2 = float(bmm2_scale), 0
+            bmm1_ptr = bmm2_ptr = unread_f32
+        # The arguments in the binding's order: ``_CONTEXT_HOST_PARAMS`` of the
+        # component (LSE_ptr, sinks and seq_lens_q unread), then the grid; the
+        # order is checked against the record at load.
+        if not self.quantized:
+            arguments: tuple[Any, ...] = (
+                query,
+                key_cache,
+                value_cache,
+                out,
+                unread_f32,
+                unread_f32,
+                page_table_k,
+                page_table_v,
+                unread_i32,
+                seq_lens,
+                cum_seq_lens_q,
+                softmax_scale_log2,
+                total_bh,
+                row_stride,
+                num_ctas,
+                counter,
+                num_ctas,
+                1,
+                1,
             )
-        arguments = [values[name] for name in self.program.args]
-        with torch.cuda.device(query.device), tvm_ffi.use_torch_stream():
+        elif route.component == "context_nvfp4":
+            arguments = (
+                query.view(torch.uint8),
+                key_cache,
+                value_cache,
+                key_block_scales.view(torch.uint8),
+                value_block_scales.view(torch.uint8),
+                out.view(torch.uint8),
+                unread_f32,
+                unread_f32,
+                page_table_k,
+                page_table_v,
+                unread_i32,
+                seq_lens,
+                cum_seq_lens_q,
+                softmax_scale_log2,
+                output_scale,
+                total_bh,
+                row_stride,
+                num_ctas,
+                counter,
+                bmm1_ptr,
+                bmm2_ptr,
+                bmm1_is_log2,
+                num_ctas,
+                1,
+                1,
+            )
+        else:
+            arguments = (
+                query.view(torch.uint8),
+                key_cache.view(torch.uint8),
+                value_cache.view(torch.uint8),
+                out.view(torch.uint8),
+                unread_f32,
+                unread_f32,
+                page_table_k,
+                page_table_v,
+                unread_i32,
+                seq_lens,
+                cum_seq_lens_q,
+                softmax_scale_log2,
+                output_scale,
+                total_bh,
+                row_stride,
+                num_ctas,
+                counter,
+                bmm1_ptr,
+                bmm2_ptr,
+                bmm1_is_log2,
+                num_ctas,
+                1,
+                1,
+            )
+        if _ffi_call_takes_the_torch_stream():
             self.entry(*arguments)
+        else:
+            with _torch_stream_context(device):
+                self.entry(*arguments)
+
+
+@functools.cache
+def _ffi_call_takes_the_torch_stream() -> bool:
+    """Whether a tvm-ffi call runs on torch's current stream by itself.
+
+    With the DLPack exchange API on torch tensors (``__dlpack_c_exchange_api__``,
+    native or installed by ``import tvm_ffi``), the call sets the FFI stream of
+    its first CUDA tensor argument's device to torch's current stream there for
+    the call's duration, as for FlashInfer's JIT modules; otherwise the launch
+    sets it itself (:func:`_torch_stream_context`).
+    """
+
+    return getattr(torch.Tensor, "__dlpack_c_exchange_api__", None) is not None
+
+
+_FFI_DEVICES: dict[int, Any] = {}
+_UNREAD_POINTERS: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _unread_pointers(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """A 16-byte buffer on ``device`` as float32 and int32, for the binding
+    arguments a context program never reads (allocated once per device)."""
+
+    pointers = _UNREAD_POINTERS.get(device)
+    if pointers is None:
+        buffer = torch.empty(4, dtype=torch.float32, device=device)
+        pointers = _UNREAD_POINTERS[device] = (buffer, buffer.view(torch.int32))
+    return pointers
+
+
+def _torch_stream_context(device: torch.device):
+    """The FFI stream context on the current torch stream of ``device``.
+
+    The binding selects its device from its tensor arguments and launches on
+    the FFI stream of that device; this sets that stream to torch's current
+    one (a CUDA graph's capture stream during capture).  The raw stream handle
+    and a cached FFI device cost a fraction of ``torch.cuda.device`` plus
+    ``tvm_ffi.use_torch_stream()``, which builds a ``torch.cuda.Stream`` and
+    parses a device string on every call.
+    """
+
+    raw_stream_of = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    if raw_stream_of is None:
+        return _DeviceTorchStream(index)
+    ffi_device = _FFI_DEVICES.get(index)
+    if ffi_device is None:
+        ffi_device = _FFI_DEVICES[index] = tvm_ffi.device(f"cuda:{index}")
+    return tvm_ffi.use_raw_stream(ffi_device, raw_stream_of(index))
+
+
+class _DeviceTorchStream:
+    """``torch.cuda.device(index)`` and ``tvm_ffi.use_torch_stream()``."""
+
+    def __init__(self, index: int):
+        self.device = torch.cuda.device(index)
+        self.stream = tvm_ffi.use_torch_stream()
+
+    def __enter__(self) -> None:
+        self.device.__enter__()
+        self.stream.__enter__()
+
+    def __exit__(self, *args: Any) -> None:
+        self.stream.__exit__(*args)
+        self.device.__exit__(*args)
 
 
 _CONTEXT_PROGRAM_MODULES: dict[tuple[str, str, str], CakeFmhaContextProgramModule] = {}

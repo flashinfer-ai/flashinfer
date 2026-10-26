@@ -364,9 +364,8 @@ def _launch_values(monkeypatch, block_tables, *, shared, batch=3):
         program=identifier,
     )
     module = cake_api.CakeFmhaContextProgramModule(route, record, "sm_100a")
-    monkeypatch.setattr(torch.cuda, "device", lambda device: contextlib.nullcontext())
     monkeypatch.setattr(
-        cake_api, "tvm_ffi", SimpleNamespace(use_torch_stream=contextlib.nullcontext)
+        cake_api, "_torch_stream_context", lambda device: contextlib.nullcontext()
     )
     query = torch.zeros((batch * 64, 32, 128), dtype=torch.bfloat16)
     key = torch.zeros((8, 4, 16, 128), dtype=torch.bfloat16)
@@ -435,6 +434,39 @@ def test_cake_context_program_page_tables_view_the_callers_storage(
         for p in range(pages):
             assert table_k[b * row_stride + p] == view_k[b, p]
             assert table_v[b * row_stride + p] == view_v[b, p]
+
+
+def test_cake_context_program_arguments_follow_the_binding_order(monkeypatch) -> None:
+    """Each binding argument receives its value: the lengths and offsets the
+    caller passed, the work units, the grid, the ticket as uint32 and the
+    unread pointers on one small buffer."""
+
+    batch = 3
+    tables = torch.arange(batch * 4, dtype=torch.int32).view(batch, 4)
+    values = _launch_values(monkeypatch, tables, shared=True, batch=batch)
+    _, num_m_blocks, one_tile = cake_api._CONTEXT_PROGRAMS[("context_bf16", "B128")]
+    units = 32 // 8
+    tiles = num_m_blocks * batch * units
+    assert values["total_bh"] == batch * units
+    assert values["num_ctas"] == values["grid_x"]
+    assert values["grid_x"] == (tiles if one_tile else min(148, tiles))
+    assert (values["grid_y"], values["grid_z"]) == (1, 1)
+    assert torch.equal(
+        values["seq_lens_kv"], torch.full((batch,), 64, dtype=torch.int32)
+    )
+    assert torch.equal(
+        values["cu_seq_lens_q"],
+        torch.arange(0, 64 * (batch + 1), 64, dtype=torch.int32),
+    )
+    assert values["dynamic_counter"].dtype == torch.uint32
+    assert values["softmax_scale_log2"] == pytest.approx(0.125 * cake_api.log2e)
+    assert values["LSE_ptr"].dtype == values["sinks"].dtype == torch.float32
+    assert values["seq_lens_q"].dtype == torch.int32
+    assert values["LSE_ptr"].data_ptr() == values["seq_lens_q"].data_ptr()
+    assert (
+        values["Q"].shape == (batch * 64, 32, 128)
+        and values["O_ptr"].dtype == torch.bfloat16
+    )
 
 
 def test_cake_context_program_refuses_a_strided_page_column(monkeypatch) -> None:
@@ -914,6 +946,61 @@ def test_cake_context_program_launch_invariances_are_bitwise(
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(_bits(graph_out), _bits(direct))
+    assert not case.counter.any()
+
+
+@_GPU
+@pytest.mark.parametrize("explicit_stream", (False, True))
+@pytest.mark.parametrize(
+    ("row", "batch", "max_q"),
+    [("bf16_b128_q64_k2048", 3, 64), ("fp8_b256_q32_k1024", 3, 32)],
+)
+def test_cake_context_program_launches_on_the_current_torch_stream(
+    monkeypatch, served_programs, row, batch, max_q, explicit_stream
+) -> None:
+    """The program launches on torch's current stream: queued behind a sleep
+    on a side stream, its output is still unwritten when the default stream
+    reads it, and is the direct launch's once the side stream drains.  Both
+    ways the launch gets the stream: from the tvm-ffi call's torch tensor
+    arguments, and from the launch's own stream context."""
+
+    if explicit_stream:
+        monkeypatch.setattr(cake_api, "_ffi_call_takes_the_torch_stream", lambda: False)
+    elif not cake_api._ffi_call_takes_the_torch_stream():
+        pytest.skip("torch tensors carry no DLPack exchange API here")
+    case = _context_case(row, batch, max_q)
+    program = case.programs[cake_api._cake_fmha_target(torch.device("cuda"))]
+    direct = _run_context(case)
+    bmm1, bmm2 = _SCALES.get(case.component, _QUANT_SCALES)
+    out = torch.zeros_like(direct)
+    torch.cuda.synchronize()
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side):
+        torch.cuda._sleep(200_000_000)
+        prefill.trtllm_batch_context_with_kv_cache(
+            case.query,
+            (case.key, case.value),
+            case.workspace,
+            case.block_tables,
+            case.seq_lens,
+            case.max_q,
+            case.max_kv,
+            bmm1,
+            bmm2,
+            case.batch,
+            case.cum_q,
+            case.cum_kv,
+            out=out,
+            kv_layout="HND",
+            uses_shared_paged_kv_idx=case.shared,
+            multi_ctas_kv_counter_buffer=case.counter,
+            backend="cake",
+        )
+    early = out.clone()
+    torch.cuda.synchronize()
+    assert served_programs == [program] * 2
+    assert not early.view(torch.uint8).any()
+    assert torch.equal(_bits(out), _bits(direct))
     assert not case.counter.any()
 
 
