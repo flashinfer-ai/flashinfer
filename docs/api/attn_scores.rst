@@ -41,6 +41,12 @@ SM100/SM103 run it as two internal KV passes; build any caller
 arguments. Paging arguments, the output contract, and
 ``out=``/``schedule_meta`` semantics are identical across the pair.
 
+FP8 selects 64-bit store offsets when the physical output span, including row
+padding, reaches ``2**31`` elements. Logical dimensions still fit int32. This
+specialization has small-output and lowering coverage; outputs at that scale
+have not been validated. FP4 continues to reject spans of ``2**31`` elements
+or larger.
+
 .. note::
 
   Within each row's scheduled extent the kernels write unconditionally and
@@ -153,9 +159,9 @@ ordinary calls without grouped metadata retain trace support.
 FP8 MQA TopK
 ------------
 
-The selective strategy supports SM100 and SM103 GPUs and requires CuTe DSL
-and CUDA 12.4 or newer. Construction rejects other compute capabilities before
-allocating its workspace.
+The selective strategy requires CuTe DSL and supports SM100 with CUDA 12.8 or
+newer, and SM103 with CUDA 12.9 or newer. Construction rejects other compute
+capabilities before allocating its workspace.
 
 The TopK wrapper has an explicit, lifetime-fixed ``strategy`` with distinct
 planning contracts. Selective reserves capacities at construction, updates

@@ -4028,7 +4028,12 @@ class FP8PagedMQATopKWrapper:
         physical extent. Construction allocates the step workspace outside
         CUDA graph capture without compiling kernels. The first ``prepare_pool``
         or eager ``run`` compiles metadata kernels and allocates/compiles the
-        shared scoring chain. Construction requires CUDA. Capacities and layout are immutable:
+        shared scoring chain when physical capacity is nonempty. Unsupported
+        scoring specializations are rejected when that chain is first built;
+        an empty physical capacity returns -1 results without building it.
+        Construction validates capacities, layout and device, but does not
+        validate the scoring kernel specialization. Construction requires CUDA.
+        Capacities and layout are immutable:
         construct another wrapper to change them. Full takes none of these.
 
         In a serving engine, construct the selective wrapper after allocating
@@ -4061,8 +4066,10 @@ class FP8PagedMQATopKWrapper:
             None.
 
         Raises:
-            ValueError: A strategy, specialization, capacity, layout or device
-                is unsupported. Selective requires SM100 or SM103.
+            ValueError: A strategy, argument value, capacity, layout or device
+                is unsupported. Selective requires SM100 or SM103. Unsupported
+                scoring kernel specializations are rejected when the first
+                ``prepare_pool`` or eager ``run`` builds a nonempty chain.
             RuntimeError: Construction occurs during CUDA graph capture.
         """
         math_mode = _validate_math_mode(math_mode)
@@ -4479,8 +4486,7 @@ class FP8PagedMQATopKWrapper:
         or replanning. Replacing a tensor object, even with a view sharing the
         same storage, or changing storage/layout raises ValueError. Recapture
         enclosing graphs after replanning; they keep the previous bindings.
-        If outer capture fails, discard that graph before retrying; only the
-        wrapper-owned repair body capture is cleaned up by run(). A failed
+        If outer capture fails, discard that graph before retrying. A failed
         plan rebuild remains invalid until a successful plan.
         Enclosing capture must use a stream on the input tensors' device.
         """
@@ -4548,6 +4554,9 @@ class FP8PagedMQATopKWrapper:
             *args: Strategy-specific tensors, also accepted by keyword.
                 Selective takes CUDA int32 ``qo_indptr[B + 1]``, original-token
                 ``kv_indptr[B + 1]`` and ``block_table[B, pages_per_request]``.
+                Selective requires at least
+                ``ceil((max_context_length // compression_ratio) / page_size)``
+                columns in ``block_table``.
                 Full takes FP8 ``q[R, H, D]``, uint8 ``kv_fused``, FP32
                 ``weights[R, H]``, CUDA int32 ``qo_indptr[B + 1]``, ``kv_indptr[B + 1]``
                 and ``block_table[B, pages_per_request]``.
