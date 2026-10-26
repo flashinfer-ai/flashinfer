@@ -273,9 +273,8 @@ def test_cudnn_prefill_token_indptr(
 def test_cudnn_prefill_token_indptr_omit_actual_seq_lens(monkeypatch, direct):
     """actual_seq_lens_q/kv are optional with token-unit indptrs.
 
-    The direct path never reads them, and the conversion path derives them
-    from the indptrs, so omitting them must be bitwise-identical to passing
-    them within either path.
+    Explicit lengths and cumulative lengths can select different legal plans.
+    Check both against the same reference without requiring identical rounding.
     """
     if not cudnn_prefill.CUDNN_AVAILABLE:
         pytest.skip("cudnn-frontend python package not available")
@@ -335,6 +334,7 @@ def test_cudnn_prefill_token_indptr_omit_actual_seq_lens(monkeypatch, direct):
         max_sequence_kv=s_kv,
         causal=True,
         return_lse=True,
+        lse_base="ln",
         batch_offsets_q=qo_indptr,
         batch_offsets_k=kv_indptr,
         batch_offsets_units="tokens",
@@ -352,8 +352,27 @@ def test_cudnn_prefill_token_indptr_omit_actual_seq_lens(monkeypatch, direct):
         q, k_cache, v_cache, **common
     )
 
-    assert torch.equal(out_without, out_with)
-    assert torch.equal(lse_without, lse_with)
+    q_starts, kv_starts = qo_indptr.cpu().tolist(), kv_indptr.cpu().tolist()
+    for qs, qe, ks, ke in zip(
+        q_starts[:-1], q_starts[1:], kv_starts[:-1], kv_starts[1:], strict=True
+    ):
+        qb = q[qs:qe].double().transpose(0, 1)
+        kb = k_cache[ks:ke].double().transpose(0, 1)
+        vb = v_cache[ks:ke].double().transpose(0, 1)
+        kb = kb.repeat_interleave(num_qo_heads // num_kv_heads, 0)
+        vb = vb.repeat_interleave(num_qo_heads // num_kv_heads, 0)
+        scores = qb @ kb.transpose(1, 2) * head_dim**-0.5
+        nq, nk = qe - qs, ke - ks
+        rows = torch.arange(nq, device=device)
+        cols = torch.arange(nk, device=device)
+        scores.masked_fill_(cols[None, :] > rows[:, None] + nk - nq, -torch.inf)
+        expected = (scores.softmax(-1) @ vb).transpose(0, 1)
+        stats = scores.logsumexp(-1).transpose(0, 1)
+        for out, lse in ((out_with, lse_with), (out_without, lse_without)):
+            torch.testing.assert_close(
+                out[qs:qe].double(), expected, atol=0.01, rtol=0.01
+            )
+            torch.testing.assert_close(lse[qs:qe].double(), stats, atol=4e-4, rtol=0)
 
 
 @pytest.mark.parametrize("num_kv_heads", [1, 2, 8])
