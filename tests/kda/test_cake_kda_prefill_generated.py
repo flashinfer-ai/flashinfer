@@ -10,7 +10,8 @@ https://www.apache.org/licenses/LICENSE-2.0
 own device unit and host binding under ``csrc/kda/prefill/``) and
 ``_RENDERED_ROUTES`` points the shipped modules of each architecture at them;
 ``_RENDERED_WORK_BIN_ROUTES`` names the programs built with work bins that
-launches asking for work bins take instead.
+launches asking for work bins take instead, and ``_RENDERED_OWNER_HELPER_ROUTES``
+the owner/helper program a call takes when the device holds its grid.
 
 The CPU checks hold both tables to the units, to the shipped argument plans and
 to the factory lookup. The GPU checks run the prepared BF16 prefill on the
@@ -116,6 +117,14 @@ def test_routes_point_shipped_modules_at_generated_programs():
             assert program in registry._RENDERED_MODULES, (arch, program)
             assert arch in registry._RENDERED_MODULES[program]["arches"]
             routed.add(program)
+    assert set(registry._RENDERED_OWNER_HELPER_ROUTES) == set(registry.ARCHES)
+    for arch, modules in registry._RENDERED_OWNER_HELPER_ROUTES.items():
+        for module, program in modules.items():
+            # A call the owner/helper launch does not fit takes the module's route.
+            assert module in registry._RENDERED_ROUTES[arch], (arch, module)
+            assert program in registry._RENDERED_MODULES, (arch, program)
+            assert arch in registry._RENDERED_MODULES[program]["arches"]
+            routed.add(program)
     assert routed == set(GENERATED)
 
 
@@ -155,6 +164,7 @@ def test_generated_plans_bind_from_the_shipped_plans():
             *registry._RENDERED_ROUTES[arch].items(),
             *registry._RENDERED_MERGE_ROUTES[arch].items(),
             *registry._RENDERED_WORK_BIN_ROUTES[arch].items(),
+            *registry._RENDERED_OWNER_HELPER_ROUTES[arch].items(),
         ]
         for module, program in routes:
             shipped = {
@@ -232,6 +242,32 @@ def test_factory_resolves_through_the_routes(monkeypatch, arch):
             assert name == routes.get(module, module)
             seen.add(module)
     assert set(routes) <= seen
+
+
+@requires_programs
+@pytest.mark.parametrize("arch", sorted(registry.ARCHES))
+def test_factory_resolves_the_owner_helper_routes(monkeypatch, arch):
+    monkeypatch.setattr(registry, "device_arch", lambda device=None: arch)
+    monkeypatch.setattr(
+        registry,
+        "PreparedKernel",
+        lambda name, target: SimpleNamespace(name=name, arch=target),
+    )
+    by_module = registry._RENDERED_OWNER_HELPER_ROUTES[arch]
+    routes = registry._RENDERED_ROUTES[arch]
+    seen = set()
+    for family, variants in registry.FACTORIES[arch].items():
+        for (args, kwargs), module in variants.items():
+            kernel = registry._factory(family, *args, owner_helper=True, **dict(kwargs))
+            if module in by_module:
+                seen.add(module)
+                assert (kernel.name, kernel.arch) == (by_module[module], arch)
+                assert kernel.owner_helper is True
+            else:
+                # A module without an owner/helper program keeps its route.
+                assert kernel.name == routes.get(module, module)
+                assert getattr(kernel, "owner_helper", False) is False
+    assert seen == set(by_module)
 
 
 @requires_programs
@@ -726,6 +762,7 @@ def unrouted(monkeypatch):
             "_RENDERED_HEAD_ROUTES",
             "_RENDERED_MERGE_ROUTES",
             "_RENDERED_WORK_BIN_ROUTES",
+            "_RENDERED_OWNER_HELPER_ROUTES",
         ):
             monkeypatch.setattr(registry, table, {arch: {} for arch in registry.ARCHES})
 
