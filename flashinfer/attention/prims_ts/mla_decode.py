@@ -138,6 +138,27 @@ class _MLADecodePlanState:
 
 
 @dataclass(frozen=True)
+class MLADecodeTuning:
+    """Compile-time tuning of one PrimTS MLA decode plan.
+
+    ``softmax_rescale_threshold_log2`` is in binades. ``None`` keeps the entry
+    point's default: exact rescale for dense, and each schedule's existing
+    deferral for sparse. An explicit value, including ``0.0``, is compiled
+    into the kernel; see :meth:`BatchMLADecodePagedTSWrapper.plan`.
+    """
+
+    softmax_rescale_threshold_log2: Optional[float] = None
+
+
+def _tuning_rescale_threshold(tuning: object) -> Optional[float]:
+    if tuning is None:
+        return None
+    if not isinstance(tuning, MLADecodeTuning):
+        raise TypeError("tuning must be an MLADecodeTuning or None")
+    return tuning.softmax_rescale_threshold_log2
+
+
+@dataclass(frozen=True)
 class _MLARuntime:
     query: torch.Tensor
     normalized_cache: torch.Tensor
@@ -1519,7 +1540,7 @@ class BatchMLADecodePagedTSWrapper:
         mask_type: Literal["dense", "causal"] = "causal",
         workspace_buffer: Optional[torch.Tensor] = None,
         validate: bool = True,
-        softmax_rescale_threshold_log2: float = 0.0,
+        tuning: Optional[MLADecodeTuning] = None,
     ) -> None:
         """Compile one static MLA shape and bind its reusable workspace.
 
@@ -1565,12 +1586,14 @@ class BatchMLADecodePagedTSWrapper:
         validate : bool
             Validate static geometry and caller scratch. Defaults to ``True``.
             Disable only for previously validated inputs and warmed topology.
-        softmax_rescale_threshold_log2 : float
-            Opt-in skip of the online-softmax O rescale (correction), in
-            binades: 0 to 8 for FP8 QKV, 0 to 32 for BF16 QKV. The name and
-            the FP8 P scale follow the Prims-TS FMHA decode option of the same
-            name; the bounds follow the trtllm-gen FMHA ``skipCorrThreshold``.
-            ``0.0`` (default) rescales on every new row maximum. A positive
+        tuning : MLADecodeTuning, optional
+            Compile-time tuning; ``None`` keeps every default.
+            ``tuning.softmax_rescale_threshold_log2`` is the opt-in skip of
+            the online-softmax O rescale (correction), in binades: 0 to 8 for
+            FP8 QKV, 0 to 32 for BF16 QKV. The name and the FP8 P scale
+            follow the Prims-TS FMHA decode option of the same name; the
+            bounds follow the trtllm-gen FMHA ``skipCorrThreshold``.
+            ``None`` or ``0.0`` rescales on every new row maximum. A positive
             value T keeps a row's softmax anchor while a K tile raises the row
             maximum by at most T binades, which skips that tile's rescale of
             the accumulated output. Probabilities then reach ``2**T``, so FP8
@@ -1611,8 +1634,9 @@ class BatchMLADecodePagedTSWrapper:
         # Range-check the threshold even when validate is False: it selects a
         # compiled kernel, and past the per-dtype bound FP8 P (scaled by
         # 448 * 2**-T) would lose most of the row to E4M3 subnormals.
+        threshold = _tuning_rescale_threshold(tuning)
         softmax_rescale_threshold_log2 = _check_softmax_rescale_threshold_log2_range(
-            softmax_rescale_threshold_log2, q_dtype=q_data_type
+            0.0 if threshold is None else threshold, q_dtype=q_data_type
         )
 
         device, device_index = _resolve_cuda_device(device)
@@ -1817,7 +1841,7 @@ def batch_mla_decode_with_paged_kv_cache(
     out_dtype: torch.dtype = torch.bfloat16,
     workspace_buffer: Optional[torch.Tensor] = None,
     validate: bool = True,
-    softmax_rescale_threshold_log2: float = 0.0,
+    tuning: Optional[MLADecodeTuning] = None,
 ) -> torch.Tensor:
     """One-shot convenience wrapper for fixed or packed-query MLA decode.
 
@@ -1861,12 +1885,12 @@ def batch_mla_decode_with_paged_kv_cache(
         Validate tensors and metadata values (may synchronize), default True.
         False trusts the caller and requires workspace and explicit bounds;
         skips tensor and metadata validation. Invalid inputs have undefined behavior.
-    softmax_rescale_threshold_log2 : float
-        Opt-in skip of the online-softmax O rescale in binades; see
-        :meth:`BatchMLADecodePagedTSWrapper.plan`. ``0.0`` (default) keeps the
-        exact rescale. A positive value T quantizes FP8 P at ``448 * 2**-T``
-        instead of 448, which costs E4M3 precision for probabilities far below
-        the anchor.
+    tuning : MLADecodeTuning, optional
+        Compile-time tuning; see :meth:`BatchMLADecodePagedTSWrapper.plan`.
+        ``None`` (default) keeps the exact rescale. A positive
+        ``softmax_rescale_threshold_log2`` T quantizes FP8 P at
+        ``448 * 2**-T`` instead of 448, which costs E4M3 precision for
+        probabilities far below the anchor.
 
     Returns
     -------
@@ -1990,7 +2014,7 @@ def batch_mla_decode_with_paged_kv_cache(
         mask_type=mask_type,
         workspace_buffer=workspace_buffer,
         validate=validate,
-        softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+        tuning=tuning,
     )
     return wrapper.run(
         query,
@@ -2180,7 +2204,7 @@ def _resolve_sparse_mla_plan(
     output_quant_block_size=None,
     out_scale_format="ue8m0",
     num_output_groups=None,
-    softmax_rescale_threshold_log2=None,
+    tuning=None,
 ):
     """Resolve sparse geometry and scratch sizing without allocation/compilation."""
     import cutlass
@@ -2224,6 +2248,7 @@ def _resolve_sparse_mla_plan(
         raise ValueError("native BF16 or E4M3 is required")
     if kv_layout not in ("NHD", "HND"):
         raise ValueError("kv_layout must be NHD or HND")
+    softmax_rescale_threshold_log2 = _tuning_rescale_threshold(tuning)
     if softmax_rescale_threshold_log2 is not None:
         softmax_rescale_threshold_log2 = _check_softmax_rescale_threshold_log2_range(
             softmax_rescale_threshold_log2, q_dtype=q_data_type
@@ -2394,7 +2419,7 @@ class BatchSparseMLADecodePagedTSWrapper:
         output_quant_block_size=None,
         out_scale_format="ue8m0",
         num_output_groups=None,
-        softmax_rescale_threshold_log2=None,
+        tuning=None,
     ):
         """Plan D512 attention over one primary and an optional extra pool.
 
@@ -2408,9 +2433,10 @@ class BatchSparseMLADecodePagedTSWrapper:
         MXFP8; FP32 scales use unrounded amax/448. Both use an amax floor of
         1e-4. A block never crosses a head boundary.
 
-        ``softmax_rescale_threshold_log2`` has the meaning, unit and bounds of
-        :meth:`BatchMLADecodePagedTSWrapper.plan` (0 to 8 binades for E4M3,
-        0 to 32 for BF16). ``None`` (default) keeps each schedule's own
+        ``tuning`` (an :class:`MLADecodeTuning`) has the meaning of
+        :meth:`BatchMLADecodePagedTSWrapper.plan`; its
+        ``softmax_rescale_threshold_log2`` takes 0 to 8 binades for E4M3 and
+        0 to 32 for BF16. ``None`` (default) keeps each schedule's own
         behavior: some BF16 schedules keep the row anchor while a K tile
         raises it by at most 6 binades, and all others rescale on every new
         maximum. An explicit value applies to every schedule; ``0.0``
@@ -2436,7 +2462,7 @@ class BatchSparseMLADecodePagedTSWrapper:
                 output_quant_block_size=output_quant_block_size,
                 out_scale_format=out_scale_format,
                 num_output_groups=num_output_groups,
-                softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+                tuning=tuning,
             )
         )
         kernel = spec.kernel
@@ -2914,15 +2940,15 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
     token_positions=None,
     cos_sin_cache=None,
     out_scale=None,
-    softmax_rescale_threshold_log2=None,
+    tuning=None,
 ):
     """Eager plan-and-run helper using separate source indices and lengths.
 
     Use a planned wrapper for CUDA Graph replay. Index conversion and scale
     composition remain external. softmax_scale includes attention/Q/K descales;
     output_scale includes the V descale and optional output multiplier.
-    Source contracts, output quantization arguments, ``softmax_rescale_threshold_log2``
-    and return layouts follow
+    Source contracts, output quantization arguments, ``tuning`` and return
+    layouts follow
     :class:`BatchSparseMLADecodePagedTSWrapper`.
     """
     if torch.cuda.is_current_stream_capturing():
@@ -2956,7 +2982,7 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
         output_quant_block_size=output_quant_block_size,
         out_scale_format=out_scale_format,
         num_output_groups=num_output_groups,
-        softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+        tuning=tuning,
     )
     return wrapper.run(
         query,

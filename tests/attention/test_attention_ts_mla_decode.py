@@ -43,6 +43,7 @@ from cutlass.experimental.task_scheduling.resources import (
 
 from flashinfer.attention.prims_ts import (
     BatchMLADecodePagedTSWrapper,
+    MLADecodeTuning,
     batch_mla_decode_with_paged_kv_cache,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.config import (
@@ -774,7 +775,9 @@ def _plan_case(
         kv_data_type=case.kv_cache.dtype,
         o_data_type=case.output_dtype,
         mask_type=case.mask_type,
-        softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+        tuning=MLADecodeTuning(
+            softmax_rescale_threshold_log2=softmax_rescale_threshold_log2
+        ),
     )
     return wrapper
 
@@ -1250,7 +1253,7 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         "mask_type",
         "workspace_buffer",
         "validate",
-        "softmax_rescale_threshold_log2",
+        "tuning",
     )
     for name in (
         "device",
@@ -3130,7 +3133,9 @@ def test_attention_ts_mla_decode_softmax_rescale_threshold(
         bmm1_scale=case.bmm1_scale,
         bmm2_scale=case.bmm2_scale,
         mask_type=case.mask_type,
-        softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+        tuning=MLADecodeTuning(
+            softmax_rescale_threshold_log2=softmax_rescale_threshold_log2
+        ),
     )
     torch.testing.assert_close(one_shot, output, rtol=0, atol=0)
 

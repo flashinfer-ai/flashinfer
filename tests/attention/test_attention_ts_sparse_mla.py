@@ -15,6 +15,7 @@ triton = pytest.importorskip("triton")
 import triton.language as tl
 from flashinfer.attention.prims_ts import (
     BatchSparseMLADecodePagedTSWrapper,
+    MLADecodeTuning,
     batch_sparse_mla_decode_with_paged_kv_cache,
     get_prims_ts_sparse_mla_decode_workspace_size,
 )
@@ -1180,7 +1181,11 @@ def test_softmax_rescale_threshold_log2(dtype, rows, heads, capacity, threshold)
     for value in (None, 0.0, threshold):
         wrapper = BatchSparseMLADecodePagedTSWrapper()
         wrapper.plan(
-            q.device, rows, heads, **args, softmax_rescale_threshold_log2=value
+            q.device,
+            rows,
+            heads,
+            **args,
+            tuning=MLADecodeTuning(softmax_rescale_threshold_log2=value),
         )
         meta = prepare_sparse_mla_indices(wrapper, q, kv, indices)
         results[value] = wrapper.run(
@@ -1194,7 +1199,7 @@ def test_softmax_rescale_threshold_log2(dtype, rows, heads, capacity, threshold)
         sinks=sinks,
         softmax_scale=softmax_scale,
         return_lse=True,
-        softmax_rescale_threshold_log2=threshold,
+        tuning=MLADecodeTuning(softmax_rescale_threshold_log2=threshold),
     )
     assert torch.equal(out, eager) and torch.equal(lse, eager_lse)
     ref, ref_lse, bound = _reference(
@@ -1232,5 +1237,5 @@ def test_softmax_rescale_threshold_log2_rejected(dtype, threshold):
             16,
             max_topk=128,
             q_data_type=dtype,
-            softmax_rescale_threshold_log2=threshold,
+            tuning=MLADecodeTuning(softmax_rescale_threshold_log2=threshold),
         )

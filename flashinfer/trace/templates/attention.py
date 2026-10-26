@@ -1685,7 +1685,6 @@ def _make_prims_ts_decode_mla_one_shot_trace(*, rank4_cache: bool, packed_query:
             "bmm2_scale": Scalar("float32", optional=True),
             "mask_type": Scalar("string", optional=True),
             "out_dtype": Scalar("dtype", optional=True),
-            "softmax_rescale_threshold_log2": Scalar("float32", optional=True),
         },
         outputs={"output": Tensor(output_dims, dtype="bfloat16", param="out")},
         constraints=[

@@ -536,7 +536,8 @@ def parse_attention_args(line, parser):
         help=(
             "BatchMLAPagedAttentionWrapper routine with the prims-ts backend only "
             "(ignored by other routines): passed to BatchMLADecodePagedTSWrapper."
-            "plan(softmax_rescale_threshold_log2=...). A positive value skips the "
+            "plan(tuning=MLADecodeTuning(softmax_rescale_threshold_log2=...)). "
+            "A positive value skips the "
             "O rescale while a K tile raises a row maximum by at most this many "
             "binades (bound: 8 for FP8, 32 for BF16); FP8 P is then quantized at "
             "448 * 2**-T instead of 448. 0 (default) keeps the exact rescale."
@@ -3676,7 +3677,9 @@ def testBatchMLAPagedAttentionWrapper(args):
             o_data_type=torch.bfloat16,
             mask_type="causal",
             workspace_buffer=workspace_buffer,
-            softmax_rescale_threshold_log2=mla_softmax_rescale_threshold_log2,
+            tuning=prims_ts.MLADecodeTuning(
+                softmax_rescale_threshold_log2=mla_softmax_rescale_threshold_log2
+            ),
         )
 
     direct_out = None
