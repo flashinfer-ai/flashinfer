@@ -6124,10 +6124,19 @@ inline std::mutex& DeviceMutex() { static std::mutex mutex; return mutex; }
 //   G <= 2 * S: P =  81920, 2 CTAs per SM
 //   G <= 3 * S: P =  65536, 3 CTAs per SM
 //   G <= 4 * S: P =  49152, 4 CTAs per SM
-// Larger grids get no reservation, because a cap would then add a wave. Only the launch configuration changes: the
-// kernels and their outputs are the same.
+//   G <= 5 * S: P =  40960, 5 CTAs per SM
+//   G <= 6 * S: P =  34816, 6 CTAs per SM
+//   G <= 7 * S: P =  30720, 7 CTAs per SM
+//   G <= 8 * S: P =  26624, 8 CTAs per SM
+//   G <= 9 * S: P =  23552, 9 CTAs per SM
+//   G <= 10 * S: P = 21504, 10 CTAs per SM
+//   G <= 11 * S: P = 19456, 11 CTAs per SM
+// The SiTU geometry takes only the first four tiers (ForEachLaunch). Larger grids get no reservation, because a cap
+// would then add a wave. Only the launch configuration changes: the kernels and their outputs are the same.
 struct FinalizePlacementTier { int64_t ctas_per_sm; size_t pad; };
-inline constexpr FinalizePlacementTier kFinalizePlacementTiers[] = {{1, 118784u}, {2, 81920u}, {3, 65536u}, {4, 49152u}};
+inline constexpr FinalizePlacementTier kFinalizePlacementTiers[] = {{1, 118784u}, {2, 81920u}, {3, 65536u}, {4, 49152u},
+                                                                    {5, 40960u}, {6, 34816u}, {7, 30720u}, {8, 26624u},
+                                                                    {9, 23552u}, {10, 21504u}, {11, 19456u}};
 inline constexpr size_t kFinalizePlacementSmemPerSm = 233472u;
 inline constexpr size_t kFinalizePlacementReservedPerBlock = 1024u;
 inline constexpr size_t kFinalizePlacementMaxPad = 118784u;
@@ -6143,6 +6152,20 @@ static_assert((65536u + 1024u) * 3u <= 233472u && (65536u + 1024u) * 4u > 233472
               "finalize placement: pad 65536 admits exactly 3 CTA(s) per SM");
 static_assert((49152u + 1024u) * 4u <= 233472u && (49152u + 1024u) * 5u > 233472u,
               "finalize placement: pad 49152 admits exactly 4 CTA(s) per SM");
+static_assert((40960u + 1024u) * 5u <= 233472u && (40960u + 1024u) * 6u > 233472u,
+              "finalize placement: pad 40960 admits exactly 5 CTA(s) per SM");
+static_assert((34816u + 1024u) * 6u <= 233472u && (34816u + 1024u) * 7u > 233472u,
+              "finalize placement: pad 34816 admits exactly 6 CTA(s) per SM");
+static_assert((30720u + 1024u) * 7u <= 233472u && (30720u + 1024u) * 8u > 233472u,
+              "finalize placement: pad 30720 admits exactly 7 CTA(s) per SM");
+static_assert((26624u + 1024u) * 8u <= 233472u && (26624u + 1024u) * 9u > 233472u,
+              "finalize placement: pad 26624 admits exactly 8 CTA(s) per SM");
+static_assert((23552u + 1024u) * 9u <= 233472u && (23552u + 1024u) * 10u > 233472u,
+              "finalize placement: pad 23552 admits exactly 9 CTA(s) per SM");
+static_assert((21504u + 1024u) * 10u <= 233472u && (21504u + 1024u) * 11u > 233472u,
+              "finalize placement: pad 21504 admits exactly 10 CTA(s) per SM");
+static_assert((19456u + 1024u) * 11u <= 233472u && (19456u + 1024u) * 12u > 233472u,
+              "finalize placement: pad 19456 admits exactly 11 CTA(s) per SM");
 inline size_t FinalizePlacementPad(int64_t ctas, int32_t sm_count) {
   for (const auto& tier : kFinalizePlacementTiers) {
     if (ctas <= tier.ctas_per_sm * sm_count) return tier.pad;
@@ -11471,10 +11494,13 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
   const dim3 finalize_grid = dim3(detail::CeilDiv(inv.shape.hidden_size,
                                                   finalize_kernel == 26 ? finalize_threads * 4 : finalize_threads),
                                   inv.shape.num_tokens, 1);
-  // Finalize placement: a grid of at most four CTAs per SM gets its tier's shared-memory reservation, which spreads
-  // it over the SMs (detail::FinalizePlacementPad). Larger grids launch as before.
-  const size_t finalize_pad = finalize_placement
-      ? detail::FinalizePlacementPad(static_cast<int64_t>(finalize_grid.x) * finalize_grid.y, sm_count) : 0;
+  // Finalize placement: a grid of at most eleven CTAs per SM gets its tier's shared-memory reservation, which spreads
+  // it over the SMs (detail::FinalizePlacementPad). A SiTU grid gets a reservation only up to four CTAs per SM, the
+  // tiers it was measured with. Larger grids launch as before.
+  const int64_t finalize_ctas = static_cast<int64_t>(finalize_grid.x) * finalize_grid.y;
+  const size_t finalize_pad = !finalize_placement ? 0
+      : (situ && finalize_ctas > 4 * static_cast<int64_t>(sm_count)) ? 0
+      : detail::FinalizePlacementPad(finalize_ctas, sm_count);
   detail::PlacedLaunch placed{visitor, context, finalize_pad, detail::kFinalizePlacementCarveout};
   switch (finalize_pad > 0 ? finalize_kernel : -1) {
     case 19: detail::VisitKernel_19(args19, finalize_grid, &detail::VisitPlaced, &placed); break;
