@@ -466,7 +466,6 @@ DECODE_TABLE: dict[str, dict[str, Any]] = {
     },
     "96,1,16384": {"route": "gemm", "gemm_stages": 2, "gemm_ts_slots": 4},
     "96,28,256": {"route": "gemm", "gemm_bn": 192, "gemm_pf": 2, "gemm_bk": 128},
-    "96,28,512": {"route": "gemm", "gemm_bn": 384},
     "96,28,1024": {"route": "gemm", "gemm_skf": 1, "gemm_bk": 128},
     "96,28,4096": {"route": "gemm", "gemm_skf": 1},
     "144,6,8": {
@@ -782,7 +781,7 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "pf": 1,
             "tstore": True,
         },
-        "56,6,512": {"route": "gemm", "gemm_bk": 128, "gemm_gs": 1},
+        "56,6,512": {"route": "gemm", "gemm_bn": 224, "gemm_bk": 128, "gemm_gs": 1},
         "56,6,1024": {"route": "gemm", "gemm_pf": 2, "gemm_bk": 128},
         "56,6,2048": {"route": "gemm", "gemm_bk": 128, "gemm_gs": 1},
         "56,6,4096": {"route": "gemm", "gemm_bk": 128},
@@ -805,7 +804,7 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "tstore": True,
             "quant_units": 4,
         },
-        "56,48,512": {"route": "gemm", "gemm_pf": 2},
+        "56,48,512": {"route": "gemm", "gemm_bn": 224, "gemm_pf": 2},
         "56,48,1024": {
             "route": "gemm",
             "gemm_bn": 192,
@@ -864,6 +863,7 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "persist": True,
             "tstore": True,
         },
+        "96,28,512": {"route": "gemm", "gemm_bn": 352},
         "96,28,2048": {"route": "gemm", "gemm_skf": 1},
         "96,28,16384": {"route": "gemm"},
         "144,6,1": {
@@ -1219,6 +1219,7 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "pf": 1,
             "tstore": True,
         },
+        "96,28,512": {"route": "gemm", "gemm_bn": 384},
         "96,28,2048": {"route": "gemm", "gemm_skf": 1, "gemm_bk": 128},
         "96,28,16384": {"route": "gemm", "gemm_bn": 384},
         "144,6,1": {

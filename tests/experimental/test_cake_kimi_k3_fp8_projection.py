@@ -501,6 +501,78 @@ def test_n384_cell_rules_and_g64_stems():
     assert cb.gemm_n384_cell_conflicts({"gemm_bn": 352, "gemm_pf": 2}) == ["gemm_pf"]
 
 
+def test_gemm_block_n_is_a_launch_parameter(monkeypatch):
+    """Round 12 (FTP-N / FTP-W): ``gemm_bn`` is a parameter of the GEMM launch, not of a row.  The sm_100a cells
+    56,48,512 (tp1:o_proj:512, ``gemm_pf`` 2), 56,6,512 (tp8:o_proj:512, ``gemm_bk`` 128 + ``gemm_gs`` 1) and 96,28,512
+    (tp1:q_proj:512) launch the 224-, 224- and 352-wide programs of their forms; the plan takes ``n_tiles = ceil(n_valid /
+    bn)``, the ``bn``-wide B scale tiles viewed ``(-1, weight_scale_sf_rows(bn), 128)`` and the grid of the form (one CTA pair
+    per tile; the grid-stride form's ``P' = min(T, sm_count // 2)`` pairs, also its ``sk_pairs``), and the staged-register and
+    register-epilogue views of the cells keep the 256-wide programs (both widths ship the TMA-store epilogue only).  The
+    registry is stubbed, so the host rules are checked whether or not this checkout registers the programs."""
+    monkeypatch.setattr(cb, "route_available", lambda arch, keys: True)
+    monkeypatch.setattr(cb, "kernel_program", lambda arch, key: (key, ()))
+    assert cb.gemm_bn_suffix(256) == "" and cb.gemm_bn_suffix(224) == "_n224"
+    widths = (192, 224, 256, 352, 384)
+    assert [cb.gemm_bn_wide(b) for b in widths] == [False, False, False, True, True]
+    assert [cb.gemm_bn_rstaged(b) for b in widths] == [True, False, True, False, True]
+    assert cb.weight_scale_sf_rows(224) == 8 and cb.weight_scale_sf_rows(352) == 12
+    arch, M = "sm_100a", 512
+    torch.manual_seed(2106)
+    for tp, module, bn, key, gs in (
+        ("tp1", "o_proj", 224, "gemm_tstore_n224_pf2", False),
+        ("tp8", "o_proj", 224, "gemm_tstore_n224_k128_gs", True),
+        ("tp1", "q_proj", 352, "gemm_tstore_n352_k128", False),
+    ):
+        n_valid, K = PROJECTION_FAMILIES[tp][module]
+        n_pad, num_k_iters = n_padded(n_valid), -(-K // 256)
+        sf = torch.randint(100, 140, (n_pad // BLOCK, K // BLOCK), dtype=torch.uint8)
+        prepared = cb.PreparedProjectionWeight(
+            n_valid=n_valid,
+            K=K,
+            n_pad=n_pad,
+            n_tiles=n_pad // 256,
+            n_tiles128=-(-n_valid // BLOCK),
+            num_k_iters=num_k_iters,
+            sf_k_sets=k_sets(K),
+            k_blocks_pad=2 * num_k_iters,
+            weight_tiles=torch.zeros(1, dtype=torch.uint8),
+            scale_tiles=cb.weight_scale_tiles(sf, K),
+            weight_scale_ue8m0=torch.zeros(1),
+            sf_bytes=sf,
+        )
+        assert (
+            decode_config(M, prepared.n_tiles128, num_k_iters, arch, SM_COUNT) is None
+        )
+        plan = cb.route_plan(prepared, M, arch, SM_COUNT, None)
+        n_tiles, m_tiles = -(-n_valid // bn), cb._m_tiles(M)
+        pairs = min(m_tiles // 2 * n_tiles, SM_COUNT // 2)
+        grid = 2 * pairs if gs else 2 * (m_tiles // 2) * n_tiles
+        assert plan.route == "gemm" and plan.kernels[-1] == key, plan.kernels
+        assert plan.gemm_bn == bn and plan.gemm_n_tiles == n_tiles
+        assert plan.gemm_gs == gs and plan.gemm_gs_pairs == (pairs if gs else 0)
+        assert plan.grids[-1] == grid
+        ((_, args),) = [
+            stage
+            for stage in cb._stage_kwargs(plan, prepared, None, M, n_valid, 0)
+            if "SFB" in stage[1]
+        ]
+        assert args["n_tiles"] == n_tiles and args["grid"] == (grid, 1, 1)
+        assert args["sk_pairs"] == (pairs if gs else 0)
+        assert tuple(args["SFB"].shape[1:]) == (cb.weight_scale_sf_rows(bn), 128)
+        assert torch.equal(args["SFB"].reshape(-1), cb.weight_scale_tiles_bn(sf, K, bn))
+        for tma_store, reg_staged in ((False, True), (False, False)):
+            other = cb.route_plan(
+                prepared,
+                M,
+                arch,
+                SM_COUNT,
+                None,
+                gemm_tma_store=tma_store,
+                gemm_reg_staged=reg_staged,
+            )
+            assert other.gemm_bn == 256 and other.gemm_n_tiles == prepared.n_tiles
+            assert f"_n{bn}" not in other.kernels[-1], other.kernels
+
 
 def test_sk_bindings_carry_no_split_scalars(monkeypatch):
     """Round 11 (CAKE-985 T6, ``_gs``): the stream-K hand-off bindings of a GEMM launch are the two workspace tensors only;
@@ -1060,7 +1132,8 @@ def test_decode_config_round6_continuation_rules(arch):
     # round 7 adds measured 192-wide cells on the 512 / 1024 / 2048 buckets; the round-6 kv_a cells stay
     assert {"5,28,16384", "5,28,4096"} <= set(narrow)
     assert all(
-        e["route"] == "gemm" and e["gemm_bn"] in (192, 384) for e in narrow.values()
+        e["route"] == "gemm" and e["gemm_bn"] in (192, 224, 352, 384)
+        for e in narrow.values()
     )
     # Round 10 (CAKE-985 S3, the 128 x 384 pair tile, ``gemm_bn`` 384): the exact ``gemm_bn`` cell sets of the table.
     # 96,28,512 (tp1 q_proj, N = 12288) adopted the 384-wide TMA-store form on both GPUs after R8-3 confirms on the
@@ -1076,6 +1149,15 @@ def test_decode_config_round6_continuation_rules(arch):
     # (``gemm_n384_cell_conflicts``: the instance implies ``gemm_bk`` 128, the plain CLC schedule, no weight prefetch).
     n192 = {k for k, e in narrow.items() if e["gemm_bn"] == 192}
     n384 = {k for k, e in narrow.items() if e["gemm_bn"] == 384}
+    # Round 12 (FTP-N / FTP-W): the sm_100a o_proj M 512 cells 56,48,512 (tp1, ``gemm_pf`` 2) and 56,6,512 (tp8,
+    # ``gemm_bk`` 128 + ``gemm_gs`` 1) take the 224-wide tile (32 tiles of 224 = 7168 columns, no padded column; B200 tart-level
+    # paired 1.0903 / 1.0291, 8/8 rounds, bit-identical) and the sm_100a 96,28,512 cell (tp1 q_proj, N = 12288) the 352-wide
+    # tile (35 tiles, the last one 320 columns wide instead of the 384-wide tile's 96 padded columns; 1.0273 8/8, bit-identical);
+    # both TMA-store only, sm_103a keeps its cells.
+    n224 = {k for k, e in narrow.items() if e["gemm_bn"] == 224}
+    n352 = {k for k, e in narrow.items() if e["gemm_bn"] == 352}
+    assert n224 == {"sm_100a": {"56,48,512", "56,6,512"}, "sm_103a": set()}[arch]
+    assert n352 == {"sm_100a": {"96,28,512"}, "sm_103a": set()}[arch]
     n192_common = {
         "12,1,16384",  # round 11 C25 (CAKE-985 T7, FIN tip 8): gemm_bn 192 on both GPUs after the C24 staging-slot fix
         "12,1,2048",
@@ -1147,7 +1229,7 @@ def test_decode_config_round6_continuation_rules(arch):
     assert (
         n384
         == {
-            "sm_100a": {"96,28,512", "384,28,16384", "386,28,16384"},
+            "sm_100a": {"384,28,16384", "386,28,16384"},
             "sm_103a": {"96,28,512", "96,28,16384", "56,48,16384"},
         }[arch]
     )
@@ -1159,9 +1241,12 @@ def test_decode_config_round6_continuation_rules(arch):
             for k in ("gemm_pf", "gemm_sk", "gemm_skf", "gemm_sks", "gemm_skp")
         )
         assert cb.gemm_n384_cell_conflicts(cell) == []
-    assert cb.gemm_block_n(512, 96, 28, arch, 12288, 12288) == 384
     assert (
-        cb.gemm_block_n(384, 96, 28, arch, 12288, 12288) == 384
+        cb.gemm_block_n(512, 96, 28, arch, 12288, 12288)
+        == {"sm_100a": 352, "sm_103a": 384}[arch]
+    )
+    assert cb.gemm_block_n(384, 96, 28, arch, 12288, 12288) == cb.gemm_block_n(
+        512, 96, 28, arch, 12288, 12288
     )  # the 512 bucket (M 257-512) is one cell
     assert (
         cb.gemm_block_n(1024, 48, 28, arch, 6144, 6144)
@@ -1198,6 +1283,12 @@ def test_decode_config_round6_continuation_rules(arch):
         "sm_103a": {"56,48,512", "56,6,512", "56,48,1024"},
     }[arch]
     n384_in_proj = {"sm_100a": {"386,28,16384"}, "sm_103a": {"56,48,16384"}}[arch]
+    n224_o_proj = {"sm_100a": {"56,48,512", "56,6,512"}, "sm_103a": set()}[arch]
+    assert {
+        k
+        for k, e in decode_table(arch).items()
+        if k.startswith(("56,6,", "56,48,", "386,28,")) and e.get("gemm_bn") == 224
+    } == n224_o_proj
     assert {
         k
         for k, e in decode_table(arch).items()
@@ -1216,6 +1307,7 @@ def test_decode_config_round6_continuation_rules(arch):
         }
         - n192_o_proj
         - n384_in_proj
+        - n224_o_proj
     )
     for bucket, n_tiles128, num_k_iters in (
         (512, 56, 6),
@@ -1226,7 +1318,13 @@ def test_decode_config_round6_continuation_rules(arch):
     ):
         key = f"{n_tiles128},{num_k_iters},{bucket}"
         assert cb.gemm_block_n(bucket, n_tiles128, num_k_iters, arch, 7168, 7168) == (
-            192 if key in n192_o_proj else 384 if key in n384_in_proj else 256
+            192
+            if key in n192_o_proj
+            else 384
+            if key in n384_in_proj
+            else 224
+            if key in n224_o_proj
+            else 256
         )
     # round 10 S6 / S5 v2 (CAKE-985): the GEMM-cell adoptions of the FIN confirms, all bit-exact (Tier A).  sm_103a (GB300
     # 964581 node alone): 192,2,2048 (tp1:kv_b:2048, gemm_bk 128; R8-3 confirm step 856eec52: quiet 1.0164, shared 1.0229 /
@@ -1323,7 +1421,8 @@ def test_decode_config_round6_continuation_rules(arch):
     # C19: the sm_100a 192,2,512 cell (tp1:kv_b:512) joined on the 256-wide form and left its round-7 ``gemm_pf`` 2 behind (the
     # ``_gs`` form has no prefetch composition; B200 node alone, T6 U3d screen step 5f247cc4 on tree 6f3dbb1f, S5 v2 step 4c54d65e
     # on tree 66fec20d: 1.01987 / 1.01762 / 1.01762, aa 1.0 x3, bit-exact, Tier A; gemm_tstore_pf2 -> gemm_tstore_k128_gs).
-    # ``gemm_tstore_pf2`` stays in both plans: sm_100a 144,6,512 / 144,6,1024 / 56,48,512 and the sm_103a pf-2 256-wide cells.
+    # ``gemm_tstore_pf2`` stays in both plans: sm_100a 144,6,512 / 144,6,1024 (56,48,512 until round 12 moved it to the
+    # 224-wide tile) and the sm_103a pf-2 256-wide cells.  Round 12: sm_100a 56,6,512 launches the 224-wide ``_gs`` form.
     gs_rows = {k for k, e in decode_table(arch).items() if e.get("gemm_gs")}
     assert (
         gs_rows
@@ -1464,6 +1563,20 @@ def test_decode_config_round6_continuation_rules(arch):
     # the 384-wide programs the adopted cells launch: always the ``_k128`` TMA-store form on these 16-byte-aligned
     # column edges; the staged-register form only where the cell's bucket carries 8-byte-stride correctness rows
     assert "gemm_tstore_n384_k128" in required
+    # round 12: the 224- and 352-wide programs of the sm_100a cells, TMA store only (``gemm_bn_rstaged``)
+    assert {
+        k for k in required if k.startswith(("gemm_tstore_n224", "gemm_tstore_n352"))
+    } == {
+        "sm_100a": {
+            "gemm_tstore_n224_pf2",
+            "gemm_tstore_n224_k128_gs",
+            "gemm_tstore_n352_k128",
+        },
+        "sm_103a": set(),
+    }[arch]
+    assert not any(
+        k.startswith(("gemm_rstaged_n224", "gemm_rstaged_n352")) for k in required
+    )
     assert ("gemm_rstaged_n384_k128" in required) == any(
         cb.gemm_k128_cell_epilogues(*(int(v) for v in key.split(",")))[1]
         for key in n384
