@@ -109,6 +109,11 @@ output_column_dict = {
         "ppf",
         "pph",
         "ppw",
+        # normquant 2026-10: activation / mHC / gated-residual norm modes
+        "act_type",
+        "mhc_mode",
+        "num_splits",
+        "norm_variant",
     ],
     "quantization": [
         "alignment",
@@ -116,6 +121,19 @@ output_column_dict = {
         "sf_layout",
         "do_shuffle",
         "sf_vec_size",
+        # normquant 2026-10: quantization mode knobs
+        "per_token_activation",
+        "nvfp4_4over6",
+        "use_4over6",
+        "nvfp4_4over6_err_mode",
+        "nvfp4_4over6_err_use_fast_math",
+        "nvfp4_4over6_e4m3_max",
+        "disable_quant_fast_math",
+        "masked_m",
+        "column_major_scales",
+        "scale_tma_aligned",
+        "scale_ue8m0",
+        "bitorder",
     ],
     "sampling": [
         "vocab_size",
@@ -127,6 +145,13 @@ output_column_dict = {
         "filter_apply_order",
         "max_len",
         "num_rows",
+        # normquant 2026-10: sampling / top-k modes
+        "param_mode",
+        "deterministic",
+        "input_distribution",
+        "sorted",
+        "tie_break",
+        "dsa_graph_safe",
     ],
     # top_k_varlen selects top-K KV positions per request; its row width is a
     # max sequence length, not a vocab size (see routines/topk_varlen.py).
@@ -142,6 +167,9 @@ output_column_dict = {
         "rope_scale",
         "interleave",
         "kv_layout",
+        # normquant 2026-10
+        "inplace",
+        "mla_kv",
     ],
     "mamba": [
         "nheads",
@@ -282,12 +310,32 @@ benchmark_apis = {
         "fused_rmsnorm_silu",
         "fused_dit_layernorm",
         "fused_qk_rmsnorm_rope",
+        # normquant 2026-10
+        "fused_add_rmsnorm_fp8_block_quant",
+        "layernorm",
+        "act_and_mul",
+        "mhc",
+        "gated_residual_rmsnorm",
+        "gated_residual_next_rmsnorm",
+        "rmsnorm_sigmoid_gate",
     ],
     "quantization": [
         "mxfp8_quantize",
         "mxfp4_quantize",
         "nvfp4_quantize",
         "nvfp4_batched_quantize",
+        # normquant 2026-10
+        "scaled_fp4_grouped_quantize",
+        "mxfp8_grouped_quantize",
+        "per_token_group_quant_8bit",
+        "silu_and_mul_nvfp4_quantize",
+        "silu_and_mul_scaled_nvfp4_experts_quantize",
+        "silu_and_mul_mxfp8_experts_quantize",
+        "nvfp4_kv_quantize",
+        "nvfp4_kv_dequantize",
+        "nvfp4_kv_dequantize_paged",
+        "packbits",
+        "segment_packbits",
     ],
     "sampling": [
         "softmax",
@@ -381,6 +429,51 @@ def is_close_stats(input, other, rtol=1e-5, atol=1e-8):
         num_elements,  # total number of elements in tensor
         num_different_elements / num_elements * 100.0,
     )
+
+
+def fp8_code_distance(actual, expected):
+    """Per-element distance in representable steps between two 8-bit tensors.
+
+    A fixed rtol cannot express one fp8 ULP (12.5% relative for e4m3), so fp8
+    outputs are compared in code space: sign-magnitude bytes mapped to an
+    ordered integer line. int8 tensors are compared directly.
+    """
+    if actual.dtype == torch.int8:
+        return (actual.to(torch.int16) - expected.to(torch.int16)).abs()
+
+    def ordered(x):
+        u = x.view(torch.uint8).to(torch.int16)
+        mag = u & 0x7F
+        return torch.where(u >= 0x80, -mag, mag)
+
+    return (ordered(actual) - ordered(expected)).abs()
+
+
+def blank_unused_mode_columns(args, res, defaults=None, owners=None):
+    """Keep pre-existing CSV rows (and the dashboard problem keys built from them) unchanged
+    when a routine family gains new mode flags.
+
+    flashinfer_benchmark.py backfills every empty output column from ``args``, so a new flag
+    would otherwise write its default into rows that never used it. ``defaults`` maps a
+    column to the string values that mean "mode not used" (written as ""); ``owners`` maps a
+    column to the routines that use it (blank for every other routine). Rows that set a
+    non-default value keep it; ``args`` is blanked afterwards so the backfill writes "".
+    Call this after the routine has run (it overwrites ``args`` attributes).
+    """
+    defaults = defaults or {}
+    owners = owners or {}
+    for col in set(defaults) | set(owners):
+        for r in res:
+            v = r.get(col, "")
+            if v == "":
+                v = getattr(args, col, "")
+            unused = col in owners and args.routine not in owners[col]
+            if unused or str(v) in defaults.get(col, ()):
+                v = ""
+            r[col] = v
+        if hasattr(args, col):
+            setattr(args, col, "")
+    return res
 
 
 def to_float8(x, dtype=torch.float8_e4m3fn):
@@ -838,6 +931,123 @@ routine_cc_to_supported_backends = {
     },
     # fused_qk_rmsnorm_rope: CC check done programmatically via
     # fused_qk_rmsnorm_rope.is_compute_capability_supported() in the benchmark.
+    # normquant 2026-10. fused_rmsnorm_silu / fused_dit_layernorm: SM80+ (norm/__init__.py
+    # fused_rmsnorm_silu, _dit_ln_check_common_inputs); fp8 output SM89+, nvfp4/mxfp8 output
+    # SM100+, enforced by the library at call time.
+    "fused_rmsnorm_silu": {
+        "7.5": [],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    "fused_dit_layernorm": {
+        "7.5": [],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    # fused_add_rmsnorm_fp8_block_quant / act_and_mul: generic CUDA JIT, no SM guard.
+    "fused_add_rmsnorm_fp8_block_quant": {
+        "7.5": ["cuda"],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    "act_and_mul": {
+        "7.5": ["cuda"],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    # layernorm: same CuTe-DSL / CUDA-fallback dispatch as rmsnorm.
+    "layernorm": {
+        "7.5": ["cute-dsl"],
+        "8.0": ["cute-dsl"],
+        "8.6": ["cute-dsl"],
+        "8.9": ["cute-dsl"],
+        "9.0": ["cute-dsl"],
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
+        "12.0": ["cute-dsl"],
+        "12.1": ["cute-dsl"],
+    },
+    # mhc: generic CUDA JIT (jit/mhc.py), no SM guard; bf16-only API.
+    "mhc": {
+        "7.5": [],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    # gated residual norms (Muse-Spark-style hidden 8192 / head dim 64): CuTe-DSL kernel
+    # gated on _GATED_RESIDUAL_COMPUTE_CAPABILITIES = (10,0),(10,3),(10,7) (norm/__init__.py:196);
+    # the library's cake route is out of scope, the routine forces backend='cute'.
+    "gated_residual_rmsnorm": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
+        "12.0": [],
+        "12.1": [],
+    },
+    "gated_residual_next_rmsnorm": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
+        "12.0": [],
+        "12.1": [],
+    },
+    "rmsnorm_sigmoid_gate": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
+        "12.0": [],
+        "12.1": [],
+    },
     # QUANTIZATION
     "mxfp8_quantize": {
         "7.5": [],
@@ -859,7 +1069,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cuda", "cute-dsl"],
         "10.3": ["cuda", "cute-dsl"],
-        "10.7": ["cuda"],
+        "10.7": ["cuda", "cute-dsl"],
         "12.0": ["cuda", "cute-dsl"],
         "12.1": ["cuda", "cute-dsl"],
     },
@@ -881,6 +1091,147 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    # normquant 2026-10. CUDA fp4/mxfp8 quantize kernels compile their body only for
+    # __CUDA_ARCH__ >= 1000, so no rows below 10.0.
+    "scaled_fp4_grouped_quantize": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    # mxfp8_grouped_quantize: major >= 10 (fp8_quantization.py mxfp8_grouped_quantize);
+    # cutile needs a tileiras that targets the device: the CTK 13.4 perf image's tileiras
+    # rejects sm_107 ("Cannot find option named 'sm_107'"), so no 10.7 cutile rows (here,
+    # per_token_group_quant_8bit and rope_quantize_fp8). cake out of scope.
+    "mxfp8_grouped_quantize": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cuda", "cutile"],
+        "10.3": ["cuda", "cutile"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda", "cutile"],
+        "12.1": ["cuda", "cutile"],
+    },
+    # per_token_group_quant_8bit: cutile only, no static SM guard; rows only where observed.
+    "per_token_group_quant_8bit": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cutile"],
+        "10.3": ["cutile"],
+        "10.7": [],
+        "12.0": [],
+        "12.1": [],
+    },
+    # silu_and_mul_nvfp4_quantize: major >= 10 + CuTe-DSL (fp4_quantization.py:1017).
+    "silu_and_mul_nvfp4_quantize": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
+        "12.0": ["cute-dsl"],
+        "12.1": ["cute-dsl"],
+    },
+    "silu_and_mul_scaled_nvfp4_experts_quantize": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    # silu_and_mul_mxfp8_experts_quantize: major >= 10 (fp8_quantization.py).
+    "silu_and_mul_mxfp8_experts_quantize": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    "nvfp4_kv_quantize": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    "nvfp4_kv_dequantize": {
+        "7.5": [],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    "nvfp4_kv_dequantize_paged": {
+        "7.5": [],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    "packbits": {
+        "7.5": ["cuda"],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    "segment_packbits": {
+        "7.5": ["cuda"],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "10.7": ["cuda"],
@@ -1032,41 +1383,44 @@ routine_cc_to_supported_backends = {
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
+    # normquant 2026-10. top_k family: "cuda" = library auto-dispatch; "radix" / "clusters" /
+    # "cub" are forced through FLASHINFER_TOPK_ALGO. clusters: topk.py can_use_clusters_topk
+    # (cc major 10); cub: can_use_cub_topk (limits enforced per call by the routine).
     "top_k": {
-        "7.5": ["cuda"],
-        "8.0": ["cuda"],
-        "8.6": ["cuda"],
-        "8.9": ["cuda"],
-        "9.0": ["cuda"],
-        "10.0": ["cuda"],
-        "10.3": ["cuda"],
-        "10.7": ["cuda"],
-        "12.0": ["cuda"],
-        "12.1": ["cuda"],
+        "7.5": ["cuda", "radix", "cub"],
+        "8.0": ["cuda", "radix", "cub"],
+        "8.6": ["cuda", "radix", "cub"],
+        "8.9": ["cuda", "radix", "cub"],
+        "9.0": ["cuda", "radix", "cub"],
+        "10.0": ["cuda", "radix", "clusters", "cub"],
+        "10.3": ["cuda", "radix", "clusters", "cub"],
+        "10.7": ["cuda", "radix", "clusters", "cub"],
+        "12.0": ["cuda", "radix", "cub"],
+        "12.1": ["cuda", "radix", "cub"],
     },
     "top_k_page_table_transform": {
-        "7.5": ["cuda"],
-        "8.0": ["cuda"],
-        "8.6": ["cuda"],
-        "8.9": ["cuda"],
-        "9.0": ["cuda"],
-        "10.0": ["cuda"],
-        "10.3": ["cuda"],
-        "10.7": ["cuda"],
-        "12.0": ["cuda"],
-        "12.1": ["cuda"],
+        "7.5": ["cuda", "radix", "cub"],
+        "8.0": ["cuda", "radix", "cub"],
+        "8.6": ["cuda", "radix", "cub"],
+        "8.9": ["cuda", "radix", "cub"],
+        "9.0": ["cuda", "radix", "cub"],
+        "10.0": ["cuda", "radix", "clusters", "cub"],
+        "10.3": ["cuda", "radix", "clusters", "cub"],
+        "10.7": ["cuda", "radix", "clusters", "cub"],
+        "12.0": ["cuda", "radix", "cub"],
+        "12.1": ["cuda", "radix", "cub"],
     },
     "top_k_ragged_transform": {
-        "7.5": ["cuda"],
-        "8.0": ["cuda"],
-        "8.6": ["cuda"],
-        "8.9": ["cuda"],
-        "9.0": ["cuda"],
-        "10.0": ["cuda"],
-        "10.3": ["cuda"],
-        "10.7": ["cuda"],
-        "12.0": ["cuda"],
-        "12.1": ["cuda"],
+        "7.5": ["cuda", "radix", "cub"],
+        "8.0": ["cuda", "radix", "cub"],
+        "8.6": ["cuda", "radix", "cub"],
+        "8.9": ["cuda", "radix", "cub"],
+        "9.0": ["cuda", "radix", "cub"],
+        "10.0": ["cuda", "radix", "clusters", "cub"],
+        "10.3": ["cuda", "radix", "clusters", "cub"],
+        "10.7": ["cuda", "radix", "clusters", "cub"],
+        "12.0": ["cuda", "radix", "cub"],
+        "12.1": ["cuda", "radix", "cub"],
     },
     # Note: top_k_varlen uses its @backend_requirement support checks
     # (top_k_varlen.is_backend_supported) to filter backends, so it is not listed here.
@@ -1143,17 +1497,19 @@ routine_cc_to_supported_backends = {
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
+    # normquant 2026-10. cutile: rope.py rope_quantize_fp8 requires SM90+ (FP8 lowering),
+    # interleaved rotary and a 2-D (MLA) key; no other static guard.
     "rope_quantize_fp8": {
         "7.5": [],
         "8.0": [],
         "8.6": [],
         "8.9": ["cuda"],
-        "9.0": ["cuda"],
-        "10.0": ["cuda"],
-        "10.3": ["cuda"],
+        "9.0": ["cuda", "cutile"],
+        "10.0": ["cuda", "cutile"],
+        "10.3": ["cuda", "cutile"],
         "10.7": ["cuda"],
-        "12.0": ["cuda"],
-        "12.1": ["cuda"],
+        "12.0": ["cuda", "cutile"],
+        "12.1": ["cuda", "cutile"],
     },
     "rope_quantize_fp8_append_paged_kv_cache": {
         "7.5": [],

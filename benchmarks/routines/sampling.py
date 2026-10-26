@@ -14,15 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import contextlib
+import os
 from collections import defaultdict
 
 import numpy as np
 import torch
 
 import flashinfer
+import flashinfer.topk
 from flashinfer.testing.utils import bench_gpu_time
 
 from .flashinfer_benchmark_utils import (
+    blank_unused_mode_columns,
     dtype_str_to_torch_dtype,
     get_device,
     is_close_stats,
@@ -31,8 +35,130 @@ from .flashinfer_benchmark_utils import (
     warn_if_pdl_unsupported,
 )
 
+# Top-k backends forced through the library's documented FLASHINFER_TOPK_ALGO knob
+# (flashinfer/topk.py). "cuda" leaves the environment alone, i.e. the library's
+# auto-dispatch, which also depends on whether a CUDA graph is being captured.
+_TOPK_ALGO_BY_BACKEND = {
+    "cuda": None,
+    "radix": "default",
+    "clusters": "clusters",
+    "cub": "cub",
+}
+_TIE_BREAK_BY_NAME = {
+    "none": flashinfer.topk.TopKTieBreak.NONE,
+    "small": flashinfer.topk.TopKTieBreak.SMALL,
+    "large": flashinfer.topk.TopKTieBreak.LARGE,
+}
+
+
+def _float_or_none(value):
+    return None if value.lower() == "none" else float(value)
+
+
+def _sampling_param(args, value, batch_size, device, dtype):
+    """Scalar parameter, or a constant-filled per-request [batch_size] tensor.
+
+    The tensor form is what serving frameworks pass; it takes different library
+    dispatch paths than the scalar form (e.g. it disables the top_k_first fast path).
+    """
+    if args.param_mode == "tensor":
+        return torch.full((batch_size,), value, dtype=dtype, device=device)
+    return value
+
+
+def _deterministic_kwargs(args, name="deterministic"):
+    """Forward --deterministic only when given, so each API keeps its own default."""
+    if args.deterministic is None:
+        return {}
+    return {name: args.deterministic == "true"}
+
+
+def _make_probs(args, batch_size, vocab_size, device, dtype=None):
+    """Random probabilities: near-uniform (default) or softmax of normal logits."""
+    if args.input_distribution == "normal":
+        logits = torch.randn(batch_size, vocab_size, device=device)
+        probs = torch.softmax(logits, dim=-1)
+        return probs if dtype is None else probs.to(dtype)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, dtype=dtype, device=device)
+    return pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+
+@contextlib.contextmanager
+def _topk_algo(backend):
+    """Force a top-k backend for the duration of one backend's refcheck + timing."""
+    algo = _TOPK_ALGO_BY_BACKEND[backend]
+    if algo is None:
+        yield
+        return
+    previous = os.environ.get("FLASHINFER_TOPK_ALGO")
+    os.environ["FLASHINFER_TOPK_ALGO"] = algo
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("FLASHINFER_TOPK_ALGO", None)
+        else:
+            os.environ["FLASHINFER_TOPK_ALGO"] = previous
+
+
+def _filter_topk_backends(backends, args, scores, k, clusters_extra_ok=True):
+    """Drop forced top-k backends the library would silently not serve.
+
+    Without this, FLASHINFER_TOPK_ALGO=clusters/cub falls back to radix when the call
+    is ineligible and the row would be mislabeled. Uses the library's own predicates.
+    """
+    deterministic = args.deterministic == "true"
+    tie_break = _TIE_BREAK_BY_NAME[args.tie_break]
+    sorted_output = getattr(args, "sorted", False) and args.routine == "top_k"
+    kept = []
+    for backend in backends:
+        reason = None
+        if backend == "clusters" and not (
+            clusters_extra_ok
+            and flashinfer.topk.can_use_clusters_topk(
+                "clusters", scores.device, deterministic, tie_break, args.dsa_graph_safe
+            )
+        ):
+            reason = "clusters needs cc major 10, non-deterministic, no tie-break, not dsa_graph_safe"
+        elif backend == "cub" and not flashinfer.topk.can_use_cub_topk(
+            "cub", scores, tie_break, deterministic, sorted_output
+        ):
+            reason = "cub declines this dtype/width/sorted/deterministic/tie-break/arch"
+        elif backend == "radix" and args.dsa_graph_safe:
+            with torch.cuda.device(scores.device):
+                if not (k <= 2048 and flashinfer.topk.can_implement_filtered_topk()):
+                    reason = (
+                        "dsa_graph_safe radix needs k <= 2048 and FilteredTopK smem"
+                    )
+        if reason is None:
+            kept.append(backend)
+        else:
+            print(f"[WARNING] {backend} for routine {args.routine} skipped: {reason}.")
+    return kept
+
 
 def run_sampling_test(args):
+    """Run one sampling testlist line; see _dispatch_sampling_test for the routine table."""
+    res = _dispatch_sampling_test(args)
+    # Mode flags added in 2026-10 stay blank on rows that do not use them, so
+    # pre-existing lines keep their CSV columns (and dashboard keys).
+    return blank_unused_mode_columns(
+        args,
+        res,
+        defaults={
+            "param_mode": {"scalar"},
+            "deterministic": {"None"},
+            "input_distribution": {"uniform"},
+            "sorted": {"False"},
+            "tie_break": {"none"},
+            "dsa_graph_safe": {"False"},
+            "page_size": {"1"},
+        },
+        owners={"page_size": ("top_k_page_table_transform",)},
+    )
+
+
+def _dispatch_sampling_test(args):
     """
     Run a sampling test.
 
@@ -141,10 +267,10 @@ def parse_sampling_args(line, parser):
     )
     parser.add_argument(
         "--temperature",
-        type=float,
+        type=_float_or_none,
         required=False,
         default=1.0,
-        help="Temperature for softmax.",
+        help="Temperature for softmax, or 'none' (no temperature; a distinct Blackwell softmax route).",
     )
     parser.add_argument(
         "--filter_apply_order",
@@ -176,13 +302,67 @@ def parse_sampling_args(line, parser):
         help="Number of rows for top_k_page_table_transform and top_k_ragged_transform. Defaults to batch_size.",
     )
     parser.add_argument(
+        "--page_size",
+        type=int,
+        required=False,
+        default=1,
+        help="Score positions per page-table entry for top_k_page_table_transform (power of two). Default: 1.",
+    )
+    parser.add_argument(
+        "--param_mode",
+        type=str,
+        required=False,
+        default="scalar",
+        choices=["scalar", "tensor"],
+        help="Pass top_k/top_p/min_p/temperature as scalars (default) or as per-request [batch_size] tensors.",
+    )
+    parser.add_argument(
+        "--deterministic",
+        type=str,
+        required=False,
+        default=None,
+        choices=["true", "false"],
+        help="Force the API's deterministic / is_deterministic flag. Default: the API's own default.",
+    )
+    parser.add_argument(
+        "--input_distribution",
+        type=str,
+        required=False,
+        default="uniform",
+        choices=["uniform", "normal"],
+        help="Probability inputs: normalized uniform noise (default) or softmax of normal logits.",
+    )
+    parser.add_argument(
+        "--sorted",
+        action="store_true",
+        default=False,
+        help="top_k only: request sorted output.",
+    )
+    parser.add_argument(
+        "--tie_break",
+        type=str,
+        required=False,
+        default="none",
+        choices=list(_TIE_BREAK_BY_NAME),
+        help="Top-k routines: tie-break mode at the selection boundary. Default: none.",
+    )
+    parser.add_argument(
+        "--dsa_graph_safe",
+        action="store_true",
+        default=False,
+        help="Top-k routines: require the CUDA-graph-safe execution path.",
+    )
+    parser.add_argument(
         "--backends",
         type=str,
         required=False,
         nargs="+",
         default=["cuda"],
-        choices=["cuda"],
-        help="Kernel backends to test. Default: cuda.",
+        choices=["cuda", "radix", "clusters", "cub"],
+        help=(
+            "Kernel backends to test. Default: cuda. 'radix'/'clusters'/'cub' (top-k routines) "
+            "force a top-k backend via FLASHINFER_TOPK_ALGO, 'cuda' is the library's auto-dispatch."
+        ),
     )
 
     args = parser.parse_args(line)
@@ -190,6 +370,13 @@ def parse_sampling_args(line, parser):
     # Default num_rows to batch_size if not specified
     if args.num_rows is None:
         args.num_rows = args.batch_size
+    if (
+        args.routine == "top_k_page_table_transform"
+        and args.num_rows % args.batch_size != 0
+    ):
+        parser.error(
+            "--num_rows must be a multiple of --batch_size (rows are mapped to requests via row_to_batch)"
+        )
 
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
@@ -239,6 +426,11 @@ def testSoftmax(args):
 
     ## Prepare input tensors
     logits = torch.randn(batch_size, vocab_size, dtype=input_dtype, device=device)
+    temperature_arg = (
+        None
+        if temperature is None
+        else _sampling_param(args, temperature, batch_size, device, torch.float32)
+    )
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {logits.shape = }")
@@ -247,7 +439,7 @@ def testSoftmax(args):
     def run_backend(backend, logits):
         if backend == "cuda":
             return flashinfer.sampling.softmax(
-                logits, temperature=temperature, enable_pdl=args.enable_pdl
+                logits, temperature=temperature_arg, enable_pdl=args.enable_pdl
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -269,7 +461,8 @@ def testSoftmax(args):
 
     # Reference check: compare against PyTorch softmax
     if run_refcheck and outputs:
-        reference_output = torch.softmax(logits.float() / temperature, dim=-1)
+        ref_temperature = 1.0 if temperature is None else temperature
+        reference_output = torch.softmax(logits.float() / ref_temperature, dim=-1)
         for backend, output in outputs.items():
             num_diff, num_total, pct_diff = is_close_stats(
                 reference_output, output.float(), rtol=1e-3, atol=1e-5
@@ -358,8 +551,7 @@ def testSamplingFromProbs(args):
         return res
 
     ## Prepare input tensors (probs are always float32)
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device=device)
-    probs = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    probs = _make_probs(args, batch_size, vocab_size, device)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {probs.shape = }")
@@ -368,7 +560,7 @@ def testSamplingFromProbs(args):
     def run_backend(backend, probs):
         if backend == "cuda":
             return flashinfer.sampling.sampling_from_probs(
-                probs, seed=seed, offset=offset
+                probs, seed=seed, offset=offset, **_deterministic_kwargs(args)
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -469,7 +661,7 @@ def testSamplingFromLogits(args):
     def run_backend(backend, logits):
         if backend == "cuda":
             return flashinfer.sampling.sampling_from_logits(
-                logits, seed=seed, offset=offset
+                logits, seed=seed, offset=offset, **_deterministic_kwargs(args)
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -560,8 +752,8 @@ def testTopKSamplingFromProbs(args):
         return res
 
     ## Prepare input tensors
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device=device)
-    probs = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    probs = _make_probs(args, batch_size, vocab_size, device)
+    top_k_arg = _sampling_param(args, top_k, batch_size, device, torch.int32)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {probs.shape = }")
@@ -571,7 +763,11 @@ def testTopKSamplingFromProbs(args):
     def run_backend(backend, probs):
         if backend == "cuda":
             return flashinfer.sampling.top_k_sampling_from_probs(
-                probs, top_k, seed=seed, offset=offset
+                probs,
+                top_k_arg,
+                seed=seed,
+                offset=offset,
+                **_deterministic_kwargs(args),
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -663,8 +859,8 @@ def testTopPSamplingFromProbs(args):
         return res
 
     ## Prepare input tensors
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device=device)
-    probs = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    probs = _make_probs(args, batch_size, vocab_size, device)
+    top_p_arg = _sampling_param(args, top_p, batch_size, device, torch.float32)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {probs.shape = }")
@@ -674,7 +870,11 @@ def testTopPSamplingFromProbs(args):
     def run_backend(backend, probs):
         if backend == "cuda":
             return flashinfer.sampling.top_p_sampling_from_probs(
-                probs, top_p, seed=seed, offset=offset
+                probs,
+                top_p_arg,
+                seed=seed,
+                offset=offset,
+                **_deterministic_kwargs(args),
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -768,8 +968,9 @@ def testTopKTopPSamplingFromProbs(args):
         return res
 
     ## Prepare input tensors
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device=device)
-    probs = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    probs = _make_probs(args, batch_size, vocab_size, device)
+    top_k_arg = _sampling_param(args, top_k, batch_size, device, torch.int32)
+    top_p_arg = _sampling_param(args, top_p, batch_size, device, torch.float32)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {probs.shape = }")
@@ -782,11 +983,12 @@ def testTopKTopPSamplingFromProbs(args):
         if backend == "cuda":
             return flashinfer.sampling.top_k_top_p_sampling_from_probs(
                 probs,
-                top_k,
-                top_p,
+                top_k_arg,
+                top_p_arg,
                 filter_apply_order=filter_apply_order,
                 seed=seed,
                 offset=offset,
+                **_deterministic_kwargs(args),
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -885,6 +1087,8 @@ def testTopKTopPSamplingFromLogits(args):
 
     ## Prepare input tensors
     logits = torch.randn(batch_size, vocab_size, dtype=input_dtype, device=device)
+    top_k_arg = _sampling_param(args, top_k, batch_size, device, torch.int32)
+    top_p_arg = _sampling_param(args, top_p, batch_size, device, torch.float32)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {logits.shape = }")
@@ -897,11 +1101,12 @@ def testTopKTopPSamplingFromLogits(args):
         if backend == "cuda":
             return flashinfer.sampling.top_k_top_p_sampling_from_logits(
                 logits,
-                top_k,
-                top_p,
+                top_k_arg,
+                top_p_arg,
                 filter_apply_order=filter_apply_order,
                 seed=seed,
                 offset=offset,
+                **_deterministic_kwargs(args),
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -995,8 +1200,8 @@ def testMinPSamplingFromProbs(args):
         return res
 
     ## Prepare input tensors
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device=device)
-    probs = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    probs = _make_probs(args, batch_size, vocab_size, device)
+    min_p_arg = _sampling_param(args, min_p, batch_size, device, torch.float32)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {probs.shape = }")
@@ -1006,7 +1211,11 @@ def testMinPSamplingFromProbs(args):
     def run_backend(backend, probs):
         if backend == "cuda":
             return flashinfer.sampling.min_p_sampling_from_probs(
-                probs, min_p, seed=seed, offset=offset
+                probs,
+                min_p_arg,
+                seed=seed,
+                offset=offset,
+                **_deterministic_kwargs(args),
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -1098,8 +1307,8 @@ def testTopKRenormProbs(args):
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
 
     ## Prepare input tensors
-    pre_norm_prob = torch.rand(batch_size, vocab_size, dtype=input_dtype, device=device)
-    probs = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    probs = _make_probs(args, batch_size, vocab_size, device, dtype=input_dtype)
+    top_k_arg = _sampling_param(args, top_k, batch_size, device, torch.int32)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {probs.shape = }")
@@ -1108,7 +1317,9 @@ def testTopKRenormProbs(args):
 
     def run_backend(backend, probs):
         if backend == "cuda":
-            return flashinfer.sampling.top_k_renorm_probs(probs, top_k)
+            return flashinfer.sampling.top_k_renorm_probs(
+                probs, top_k_arg, **_deterministic_kwargs(args, "is_deterministic")
+            )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
@@ -1230,8 +1441,8 @@ def testTopPRenormProbs(args):
         return res
 
     ## Prepare input tensors (top_p_renorm_probs uses float32)
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device=device)
-    probs = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    probs = _make_probs(args, batch_size, vocab_size, device)
+    top_p_arg = _sampling_param(args, top_p, batch_size, device, torch.float32)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {probs.shape = }")
@@ -1240,7 +1451,9 @@ def testTopPRenormProbs(args):
 
     def run_backend(backend, probs):
         if backend == "cuda":
-            return flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+            return flashinfer.sampling.top_p_renorm_probs(
+                probs, top_p_arg, **_deterministic_kwargs(args, "is_deterministic")
+            )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
@@ -1371,6 +1584,7 @@ def testTopKMaskLogits(args):
 
     ## Prepare input tensors
     logits = torch.randn(batch_size, vocab_size, dtype=input_dtype, device=device)
+    top_k_arg = _sampling_param(args, top_k, batch_size, device, torch.int32)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {logits.shape = }")
@@ -1379,7 +1593,7 @@ def testTopKMaskLogits(args):
 
     def run_backend(backend, logits):
         if backend == "cuda":
-            return flashinfer.sampling.top_k_mask_logits(logits, top_k)
+            return flashinfer.sampling.top_k_mask_logits(logits, top_k_arg)
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
@@ -1544,7 +1758,12 @@ def testChainSpeculativeSampling(args):
     def run_backend(backend, draft_probs, draft_token_ids, target_probs):
         if backend == "cuda":
             return flashinfer.sampling.chain_speculative_sampling(
-                draft_probs, draft_token_ids, target_probs, seed=seed, offset=offset
+                draft_probs,
+                draft_token_ids,
+                target_probs,
+                seed=seed,
+                offset=offset,
+                **_deterministic_kwargs(args),
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -1643,14 +1862,26 @@ def testTopK(args):
     ## Prepare input tensors
     input_tensor = torch.randn(batch_size, vocab_size, dtype=input_dtype, device=device)
 
+    backends = _filter_topk_backends(backends, args, input_tensor, top_k)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
     if args.verbose >= 2:
         print(f"[VVERBOSE] {input_tensor.shape = }")
         print(f"[VVERBOSE] {input_tensor.dtype = }")
         print(f"[VVERBOSE] {top_k = }")
 
     def run_backend(backend, input_tensor):
-        if backend == "cuda":
-            return flashinfer.top_k(input_tensor, top_k)
+        if backend in _TOPK_ALGO_BY_BACKEND:
+            return flashinfer.top_k(
+                input_tensor,
+                top_k,
+                sorted=args.sorted,
+                tie_break=_TIE_BREAK_BY_NAME[args.tie_break],
+                dsa_graph_safe=args.dsa_graph_safe,
+                **_deterministic_kwargs(args),
+            )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
@@ -1658,21 +1889,22 @@ def testTopK(args):
     backend_times = {backend: [] for backend in backends}
     outputs = {}
     for cur_backend in backends:
-        if run_refcheck:
-            outputs[cur_backend] = run_backend(cur_backend, input_tensor)
-            # top_k returns (values, indices) tuple - detach both
-            outputs[cur_backend] = (
-                outputs[cur_backend][0].detach(),
-                outputs[cur_backend][1].detach(),
+        with _topk_algo(cur_backend):
+            if run_refcheck:
+                outputs[cur_backend] = run_backend(cur_backend, input_tensor)
+                # top_k returns (values, indices) tuple - detach both
+                outputs[cur_backend] = (
+                    outputs[cur_backend][0].detach(),
+                    outputs[cur_backend][1].detach(),
+                )
+            backend_times[cur_backend] = bench_gpu_time(
+                fn=run_backend,
+                dry_run_iters=args.dry_run_iters,
+                repeat_iters=args.num_iters,
+                enable_cupti=args.use_cupti,
+                use_cuda_graph=is_cuda_graph_compatible,
+                input_args=(cur_backend, input_tensor),
             )
-        backend_times[cur_backend] = bench_gpu_time(
-            fn=run_backend,
-            dry_run_iters=args.dry_run_iters,
-            repeat_iters=args.num_iters,
-            enable_cupti=args.use_cupti,
-            use_cuda_graph=is_cuda_graph_compatible,
-            input_args=(cur_backend, input_tensor),
-        )
 
     # Reference check: compare against PyTorch torch.topk
     # Note: FlashInfer top_k returns UNSORTED results by default, so we compare
@@ -1788,16 +2020,39 @@ def testTopKPageTableTransform(args):
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
 
     ## Prepare input tensors
+    page_size = args.page_size
     # Input scores: (num_rows, max_len)
     input_scores = torch.randn(num_rows, max_len, dtype=input_dtype, device=device)
 
-    # Source page table: (batch_size, max_len)
+    # Source page table: (batch_size, ceil(max_len / page_size)); each entry covers
+    # page_size consecutive score positions.
+    page_table_width = (max_len + page_size - 1) // page_size
     src_page_table = torch.randint(
-        0, 1000, (batch_size, max_len), dtype=torch.int32, device=device
+        0, 1000, (batch_size, page_table_width), dtype=torch.int32, device=device
+    )
+
+    # Rows beyond one per request (e.g. MTP / prefill query rows) map to their request.
+    rows_per_request = num_rows // batch_size
+    row_to_batch = (
+        None
+        if rows_per_request == 1
+        else torch.arange(num_rows, dtype=torch.int32, device=device)
+        // rows_per_request
     )
 
     # Lengths: (num_rows,)
     lengths = torch.full((num_rows,), max_len, dtype=torch.int32, device=device)
+
+    backends = _filter_topk_backends(
+        backends,
+        args,
+        input_scores,
+        top_k,
+        clusters_extra_ok=row_to_batch is None and page_size == 1,
+    )
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {input_scores.shape = }")
@@ -1807,9 +2062,17 @@ def testTopKPageTableTransform(args):
         print(f"[VVERBOSE] {top_k = }")
 
     def run_backend(backend, input_scores, src_page_table, lengths):
-        if backend == "cuda":
+        if backend in _TOPK_ALGO_BY_BACKEND:
             return flashinfer.top_k_page_table_transform(
-                input_scores, src_page_table, lengths, top_k
+                input_scores,
+                src_page_table,
+                lengths,
+                top_k,
+                row_to_batch=row_to_batch,
+                tie_break=_TIE_BREAK_BY_NAME[args.tie_break],
+                dsa_graph_safe=args.dsa_graph_safe,
+                page_size=page_size,
+                **_deterministic_kwargs(args),
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -1818,28 +2081,36 @@ def testTopKPageTableTransform(args):
     backend_times = {backend: [] for backend in backends}
     outputs = {}
     for cur_backend in backends:
-        if run_refcheck:
-            outputs[cur_backend] = run_backend(
-                cur_backend, input_scores, src_page_table, lengths
-            ).detach()
-        backend_times[cur_backend] = bench_gpu_time(
-            fn=run_backend,
-            dry_run_iters=args.dry_run_iters,
-            repeat_iters=args.num_iters,
-            enable_cupti=args.use_cupti,
-            use_cuda_graph=is_cuda_graph_compatible,
-            input_args=(cur_backend, input_scores, src_page_table, lengths),
-        )
+        with _topk_algo(cur_backend):
+            if run_refcheck:
+                outputs[cur_backend] = run_backend(
+                    cur_backend, input_scores, src_page_table, lengths
+                ).detach()
+            backend_times[cur_backend] = bench_gpu_time(
+                fn=run_backend,
+                dry_run_iters=args.dry_run_iters,
+                repeat_iters=args.num_iters,
+                enable_cupti=args.use_cupti,
+                use_cuda_graph=is_cuda_graph_compatible,
+                input_args=(cur_backend, input_scores, src_page_table, lengths),
+            )
 
     # Reference check: PyTorch implementation of top-k + page table transform
-    # For each row i: output[i, j] = src_page_table[i, topk_indices[i, j]]
+    # For each row i: output[i, j] = page[idx // page_size] * page_size + idx % page_size,
+    # with page = src_page_table[row_to_batch[i]] (1:1 when row_to_batch is None).
     # Note: FlashInfer uses unsorted top-k internally, so we compare sorted sets per row
     if run_refcheck and outputs:
         # Get top-k indices
         _, topk_indices = torch.topk(input_scores.float(), k=top_k, dim=-1)
-        # Gather from page table - row index maps to batch index (1:1 when row_to_batch is None)
-        reference_output = torch.gather(
-            src_page_table[:num_rows], dim=-1, index=topk_indices.int()
+        row_page_table = (
+            src_page_table[:num_rows]
+            if row_to_batch is None
+            else src_page_table[row_to_batch.long()]
+        )
+        reference_output = (
+            torch.gather(row_page_table, dim=-1, index=topk_indices // page_size)
+            * page_size
+            + (topk_indices % page_size).int()
         )
 
         for backend, output in outputs.items():
@@ -1871,7 +2142,7 @@ def testTopKPageTableTransform(args):
             # Write: output_page_table
             problem_bytes = (
                 num_rows * max_len * input_dtype.itemsize  # input_scores read
-                + batch_size * max_len * 4  # src_page_table read (int32)
+                + batch_size * page_table_width * 4  # src_page_table read (int32)
                 + num_rows * top_k * 4  # output_page_table write (int32)
             )
             tflops = 0  # Memory-bound operation
@@ -1949,6 +2220,11 @@ def testTopKRaggedTransform(args):
     # Lengths: (num_rows,)
     lengths = torch.full((num_rows,), max_len, dtype=torch.int32, device=device)
 
+    backends = _filter_topk_backends(backends, args, input_scores, top_k)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
     if args.verbose >= 2:
         print(f"[VVERBOSE] {input_scores.shape = }")
         print(f"[VVERBOSE] {input_scores.dtype = }")
@@ -1957,9 +2233,15 @@ def testTopKRaggedTransform(args):
         print(f"[VVERBOSE] {top_k = }")
 
     def run_backend(backend, input_scores, offsets, lengths):
-        if backend == "cuda":
+        if backend in _TOPK_ALGO_BY_BACKEND:
             return flashinfer.top_k_ragged_transform(
-                input_scores, offsets, lengths, top_k
+                input_scores,
+                offsets,
+                lengths,
+                top_k,
+                tie_break=_TIE_BREAK_BY_NAME[args.tie_break],
+                dsa_graph_safe=args.dsa_graph_safe,
+                **_deterministic_kwargs(args),
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -1968,18 +2250,19 @@ def testTopKRaggedTransform(args):
     backend_times = {backend: [] for backend in backends}
     outputs = {}
     for cur_backend in backends:
-        if run_refcheck:
-            outputs[cur_backend] = run_backend(
-                cur_backend, input_scores, offsets, lengths
-            ).detach()
-        backend_times[cur_backend] = bench_gpu_time(
-            fn=run_backend,
-            dry_run_iters=args.dry_run_iters,
-            repeat_iters=args.num_iters,
-            enable_cupti=args.use_cupti,
-            use_cuda_graph=is_cuda_graph_compatible,
-            input_args=(cur_backend, input_scores, offsets, lengths),
-        )
+        with _topk_algo(cur_backend):
+            if run_refcheck:
+                outputs[cur_backend] = run_backend(
+                    cur_backend, input_scores, offsets, lengths
+                ).detach()
+            backend_times[cur_backend] = bench_gpu_time(
+                fn=run_backend,
+                dry_run_iters=args.dry_run_iters,
+                repeat_iters=args.num_iters,
+                enable_cupti=args.use_cupti,
+                use_cuda_graph=is_cuda_graph_compatible,
+                input_args=(cur_backend, input_scores, offsets, lengths),
+            )
 
     # Reference check: PyTorch implementation of top-k + ragged index transform
     # For each row i: output_indices[i, j] = topk_indices[i, j] + offsets[i]
