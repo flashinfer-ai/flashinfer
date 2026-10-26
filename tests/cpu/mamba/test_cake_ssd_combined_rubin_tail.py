@@ -2,6 +2,8 @@
 pair program and the per-capability chunk-parallel workspace cap
 (CAKE-2549 round 9, Round A; measured on R200, Hecate lease 799171)."""
 
+import pytest
+
 import importlib
 import math
 
@@ -10,6 +12,7 @@ def _module():
     return importlib.import_module("flashinfer.mamba.cake_ssd_combined")
 
 
+@pytest.mark.cpu_only
 def test_source_tail_full_grid_rule_is_rubin_only():
     """One admission rule, keyed on (10, 7); Blackwell capabilities have none."""
 
@@ -29,6 +32,7 @@ def test_source_tail_full_grid_rule_is_rubin_only():
     assert module._TAIL_MIN_CHUNKS == 16
 
 
+@pytest.mark.cpu_only
 def test_source_tail_route_default_arguments_keep_the_blackwell_rule():
     """With the default arguments ``tail_selected`` is the round-7 body on
     every device, and a full persistent grid never takes the pair program."""
@@ -129,6 +133,7 @@ R200_SCREEN_ROWS = (
 )
 
 
+@pytest.mark.cpu_only
 def test_source_tail_full_grid_rule_reproduces_the_r200_screens():
     module = _module()
     rule = module.tail_full_grid_rule((10, 7))
@@ -145,6 +150,7 @@ def test_source_tail_full_grid_rule_reproduces_the_r200_screens():
         ), label
 
 
+@pytest.mark.cpu_only
 def test_source_tail_full_grid_rule_geometry():
     """The (items x chunks x form) grid measured on R200 (persistent /
     pair-program time): wins are admitted, losses and equal makespans are
@@ -201,6 +207,7 @@ def test_source_tail_full_grid_rule_geometry():
     assert not route(4096, 32, False) and not route(4096, 32, True)
 
 
+@pytest.mark.cpu_only
 def test_source_tail_full_grid_rule_stays_disjoint_from_the_fused_window():
     """No shape is both ``fused_selected`` and admitted to the pair program on
     212 SMs: the admitted calls exceed one item per SM, so batched calls of
@@ -236,6 +243,7 @@ def test_source_tail_full_grid_rule_stays_disjoint_from_the_fused_window():
                     )
 
 
+@pytest.mark.cpu_only
 def test_source_chunk_parallel_workspace_cap_rubin():
     """The chunk-parallel workspace cap is 512 MiB on (10, 7) and 256 MiB
     elsewhere (the 1 x 1024-chunk and 4 x 256-chunk 8-head calls, 384 MiB,
