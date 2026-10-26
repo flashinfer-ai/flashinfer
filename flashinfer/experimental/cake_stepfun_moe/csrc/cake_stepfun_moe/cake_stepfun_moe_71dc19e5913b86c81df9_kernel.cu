@@ -204,7 +204,7 @@ kernel_cake_stepfun_moe_71dc19e5913b86c81df9(__nv_bfloat16* __restrict__ input, 
                     values[2 * w3_1 + 1] = mul_f32_rn_ftz(__uint_as_float(word_1 & 4294901760u), output_scale);
                 }
                 asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(packed[1]) : "f"(values[0]), "f"(values[1]), "f"(values[2]), "f"(values[3]), "f"(values[4]), "f"(values[5]), "f"(values[6]), "f"(values[7]));
-                asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(out_fp4 + ((unsigned long long)vec_offset2 * 8) + (0)), "r"(packed[(0) + 0]), "r"(packed[(0) + 1]) : "memory");
+                reinterpret_cast<int2*>(out_fp4 + ((unsigned long long)vec_offset2 * 8))[0] = reinterpret_cast<int2*>(packed)[0];
                 long long row64 = (long long)row_idx;
                 long long vec64 = (long long)vec_idx2;
                 long long num_k_tiles = ((long long)num_vecs_per_row + 3) / 4;
@@ -214,11 +214,9 @@ kernel_cake_stepfun_moe_71dc19e5913b86c81df9(__nv_bfloat16* __restrict__ input, 
                 long long outer_m = row64 % 32;
                 long long m_tile = row64 / 128;
                 long long sf_offset = m_tile * (num_k_tiles * 512) + k_tile * 512 + outer_m * 16 + inner_m * 4 + inner_k;
-                {
-                    unsigned short _sf_pair;
-                    asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_sf_pair) : "f"(sf_value));
-                    *(reinterpret_cast<unsigned char*>(out_sf + sf_offset) + (0)) = (unsigned char)(_sf_pair & 0x7F);
-                }
+                uint16_t _cvt_satfinite_e4m3x2_f32_24;
+                asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_f32_24) : "f"(0.0f), "f"(sf_value));
+                *reinterpret_cast<unsigned char*>(out_sf + sf_offset) = (unsigned char)((unsigned int)(unsigned char)(_cvt_satfinite_e4m3x2_f32_24 & 127));
             }
             asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
         }

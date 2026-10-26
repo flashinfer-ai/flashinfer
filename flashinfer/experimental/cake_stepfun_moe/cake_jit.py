@@ -49,9 +49,17 @@ from . import cake_build
 #   capacity and the cooperative flag of each kind; ``_ROUTING_PRE`` links a
 #   cooperative row to the histogram pre-program launched first (``pre`` on
 #   the cooperative row, ``leads`` on the pre-program);
-# * ``_FC1`` / ``_FC2``: family, tile and K block (FC2 also the block-scale
-#   layout of its activation operand); ``_FAMILY_FACTS`` and ``_GEMM_DTYPES``
-#   give family index, per-token flag, weight layout and operand dtypes;
+# * ``_FC1`` / ``_FC2``: family, tile, K block (FC2 also the block-scale
+#   layout of its activation operand) and grid rule: ``tiles``, one CTA
+#   (cluster) per output tile, grid ``(grid_m, max_ctas, split_k)``;
+#   ``resident``, one resident CTA (cluster of ``c``) per SM (``c`` SMs)
+#   taking the tiles in turn, grid
+#   ``(c * min(SMs // c, grid_m // c * max_ctas), 1, 1)``, its
+#   ``work_counter`` (where the kernel takes one) a persistent ``int32[2]``
+#   zeroed once, which the kernel leaves zeroed: one per program, per FC1 /
+#   FC2 and per concurrent stream, never reset per launch; ``_FAMILY_FACTS``
+#   and ``_GEMM_DTYPES`` give family index, per-token flag, weight layout and
+#   operand dtypes;
 # * ``_REQUANT``: variant and block-scale layout; ``_FINALIZE``: variant,
 #   kernel variant, expert-weights dtype and top-k capacity;
 # * ``_STAGE_CONSTANTS``: the ``unit`` fields constant within a stage.
@@ -143,25 +151,7 @@ ARG_PLANS: tuple[list[list[str]], ...] = (
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
-    # 2: fc2 bf16 tiles 8, 16, 32 (3 programs)
-    [
-        ["tma_buffer", "A"],
-        ["buffer", "B"],
-        ["tma_buffer", "C"],
-        ["buffer", "tile_expert"],
-        ["buffer", "tile_mn_limit"],
-        ["buffer", "num_non_exiting_ctas"],
-        ["parameter", "M_out"],
-        ["parameter", "K"],
-        ["parameter", "grid_m"],
-        ["parameter", "grid_n"],
-        ["parameter", "K_tiles"],
-        ["launch", "enable_pdl"],
-        ["grid", "grid_x"],
-        ["grid", "grid_y"],
-        ["grid", "grid_z"],
-    ],
-    # 3: fc2 fp8 tiles 8, 16, 32, 64, 128, 256 (6 programs)
+    # 2: fc2 fp8 tile 64 (1 program)
     [
         ["tma_buffer", "A"],
         ["tma_buffer", "B"],
@@ -180,7 +170,7 @@ ARG_PLANS: tuple[list[list[str]], ...] = (
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
-    # 4: fc1 nvfp4_bf16tok tiles 8, 16, 32 (3 programs)
+    # 3: fc1 nvfp4_bf16tok tiles 8, 16, 32 (3 programs)
     [
         ["tma_buffer", "A"],
         ["buffer", "B"],
@@ -208,7 +198,7 @@ ARG_PLANS: tuple[list[list[str]], ...] = (
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
-    # 5: fc2 nvfp4_bf16tok tiles 8, 16, 32, 64, 256 (5 programs)
+    # 4: fc2 nvfp4_bf16tok tiles 32, 256 (2 programs)
     [
         ["tma_buffer", "A"],
         ["tma_buffer", "B"],
@@ -230,7 +220,7 @@ ARG_PLANS: tuple[list[list[str]], ...] = (
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
-    # 6: fc2 mxfp8 tiles 8, 16, 32, 64, 128, 256 (6 programs)
+    # 5: fc2 mxfp8 tiles 64, 128, 256 (3 programs)
     [
         ["tma_buffer", "A"],
         ["tma_buffer", "B"],
@@ -250,7 +240,7 @@ ARG_PLANS: tuple[list[list[str]], ...] = (
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
-    # 7: fc1 nvfp4 tiles 8, 16, 32 (3 programs)
+    # 6: fc1 nvfp4 tiles 8, 16, 32 (3 programs)
     [
         ["tma_buffer", "A"],
         ["buffer", "B"],
@@ -278,7 +268,7 @@ ARG_PLANS: tuple[list[list[str]], ...] = (
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
-    # 8: fc2 nvfp4 tiles 8, 16, 32, 64, 256 (5 programs)
+    # 7: fc2 nvfp4 tiles 16, 32, 256 (3 programs)
     [
         ["tma_buffer", "A"],
         ["tma_buffer", "B"],
@@ -299,27 +289,7 @@ ARG_PLANS: tuple[list[list[str]], ...] = (
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
-    # 9: fc1 bf16 tiles 8, 16, 32 (3 programs)
-    [
-        ["tma_buffer", "A"],
-        ["buffer", "B"],
-        ["tma_buffer", "C"],
-        ["buffer", "route_map"],
-        ["buffer", "tile_expert"],
-        ["buffer", "tile_mn_limit"],
-        ["buffer", "num_non_exiting_ctas"],
-        ["parameter", "M_out"],
-        ["parameter", "K"],
-        ["parameter", "grid_m"],
-        ["parameter", "grid_n"],
-        ["parameter", "K_tiles"],
-        ["buffer", "clamp_limit"],
-        ["launch", "enable_pdl"],
-        ["grid", "grid_x"],
-        ["grid", "grid_y"],
-        ["grid", "grid_z"],
-    ],
-    # 10: fc1 fp8 tiles 8, 16, 32, 64, 128, 256 (6 programs)
+    # 8: fc1 fp8 tiles 8, 16, 32, 64, 128, 256 (6 programs)
     [
         ["tma_buffer", "A"],
         ["tma_buffer", "B"],
@@ -343,7 +313,7 @@ ARG_PLANS: tuple[list[list[str]], ...] = (
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
-    # 11: finalize scalar_bf16, scalar_f32, vector_bf16, vector_f32 (4 programs)
+    # 9: finalize scalar_bf16, scalar_f32, vector_bf16, vector_f32 (4 programs)
     [
         ["buffer", "in_ptr"],
         ["buffer", "expert_weights"],
@@ -358,7 +328,7 @@ ARG_PLANS: tuple[list[list[str]], ...] = (
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
-    # 12: requant r128c4, r8c4 (2 programs)
+    # 10: requant r128c4, r8c4 (2 programs)
     [
         ["buffer", "input"],
         ["buffer", "expanded_idx_to_permuted_idx"],
@@ -373,7 +343,7 @@ ARG_PLANS: tuple[list[list[str]], ...] = (
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
-    # 13: fc1 nvfp4 tile 64 (1 program)
+    # 11: fc1 nvfp4 tile 64 (1 program)
     [
         ["tma_buffer", "A"],
         ["tma_buffer", "B"],
@@ -400,7 +370,7 @@ ARG_PLANS: tuple[list[list[str]], ...] = (
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
-    # 14: fc1 mxfp8 tiles 8, 16, 64, 256 (4 programs)
+    # 12: fc1 mxfp8 tiles 8, 16, 64, 256 (4 programs)
     [
         ["tma_buffer", "A"],
         ["tma_buffer", "B"],
@@ -423,25 +393,7 @@ ARG_PLANS: tuple[list[list[str]], ...] = (
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
-    # 15: fc2 bf16 tiles 64, 128, 256 (3 programs)
-    [
-        ["tma_buffer", "A"],
-        ["tma_buffer", "B"],
-        ["tma_buffer", "C"],
-        ["buffer", "tile_expert"],
-        ["buffer", "tile_mn_limit"],
-        ["buffer", "num_non_exiting_ctas"],
-        ["parameter", "M_out"],
-        ["parameter", "K"],
-        ["parameter", "grid_m"],
-        ["parameter", "grid_n"],
-        ["parameter", "K_tiles"],
-        ["launch", "enable_pdl"],
-        ["grid", "grid_x"],
-        ["grid", "grid_y"],
-        ["grid", "grid_z"],
-    ],
-    # 16: fc1 nvfp4_bf16tok tile 64 (1 program)
+    # 13: fc1 nvfp4_bf16tok tile 64 (1 program)
     [
         ["tma_buffer", "A"],
         ["tma_buffer", "B"],
@@ -468,7 +420,7 @@ ARG_PLANS: tuple[list[list[str]], ...] = (
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
-    # 17: fc1 bf16 tiles 64, 128, 256 (3 programs)
+    # 14: fc1 bf16 tiles 64, 128, 256 (3 programs)
     [
         ["tma_buffer", "A"],
         ["tma_buffer", "B"],
@@ -488,7 +440,7 @@ ARG_PLANS: tuple[list[list[str]], ...] = (
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
-    # 18: fc1 nvfp4_bf16tok tile 256 (1 program)
+    # 15: fc1 nvfp4_bf16tok tile 256 (1 program)
     [
         ["tma_buffer", "A"],
         ["tma_buffer", "B"],
@@ -515,7 +467,7 @@ ARG_PLANS: tuple[list[list[str]], ...] = (
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
-    # 19: fc1 nvfp4 tile 256 (1 program)
+    # 16: fc1 nvfp4 tile 256 (1 program)
     [
         ["tma_buffer", "A"],
         ["tma_buffer", "B"],
@@ -542,7 +494,7 @@ ARG_PLANS: tuple[list[list[str]], ...] = (
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
-    # 20: fc1 mxfp8 tile 128 (1 program)
+    # 17: fc1 mxfp8 tile 128 (1 program)
     [
         ["tma_buffer", "A"],
         ["buffer", "B"],
@@ -559,6 +511,155 @@ ARG_PLANS: tuple[list[list[str]], ...] = (
         ["parameter", "K"],
         ["parameter", "grid_m"],
         ["parameter", "grid_n"],
+        ["parameter", "K_tiles"],
+        ["launch", "enable_pdl"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    # 18: fc2 bf16 tiles 8, 16, 32 (3 programs)
+    [
+        ["tma_buffer", "A"],
+        ["buffer", "B"],
+        ["tma_buffer", "C"],
+        ["buffer", "tile_expert"],
+        ["buffer", "tile_mn_limit"],
+        ["buffer", "num_tiles"],
+        ["buffer", "work_counter"],
+        ["parameter", "K"],
+        ["parameter", "grid_m"],
+        ["parameter", "max_tiles"],
+        ["parameter", "K_tiles"],
+        ["launch", "enable_pdl"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    # 19: fc2 nvfp4_bf16tok tiles 8, 16, 64 (3 programs)
+    [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
+        ["tma_buffer", "SFA"],
+        ["tma_buffer", "SFB"],
+        ["tma_buffer", "C"],
+        ["buffer", "tile_expert"],
+        ["buffer", "tile_mn_limit"],
+        ["buffer", "num_non_exiting_ctas"],
+        ["buffer", "work_counter"],
+        ["buffer", "scale_c"],
+        ["parameter", "grid_m"],
+        ["parameter", "grid_n"],
+        ["parameter", "K_tiles"],
+        ["buffer", "token_sf"],
+        ["launch", "enable_pdl"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    # 20: fc2 mxfp8 tiles 8, 16, 32 (3 programs)
+    [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
+        ["tma_buffer", "SFA"],
+        ["tma_buffer", "SFB"],
+        ["tma_buffer", "C"],
+        ["buffer", "tile_expert"],
+        ["buffer", "tile_mn_limit"],
+        ["buffer", "num_tiles"],
+        ["buffer", "work_counter"],
+        ["parameter", "grid_m"],
+        ["parameter", "max_tiles"],
+        ["parameter", "K_tiles"],
+        ["launch", "enable_pdl"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    # 21: fc2 nvfp4 tiles 8, 64 (2 programs)
+    [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
+        ["tma_buffer", "SFA"],
+        ["tma_buffer", "SFB"],
+        ["tma_buffer", "C"],
+        ["buffer", "tile_expert"],
+        ["buffer", "tile_mn_limit"],
+        ["buffer", "num_non_exiting_ctas"],
+        ["buffer", "work_counter"],
+        ["buffer", "scale_c"],
+        ["parameter", "grid_m"],
+        ["parameter", "grid_n"],
+        ["parameter", "K_tiles"],
+        ["launch", "enable_pdl"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    # 22: fc1 bf16 tiles 8, 16, 32 (3 programs)
+    [
+        ["tma_buffer", "A"],
+        ["buffer", "B"],
+        ["tma_buffer", "C"],
+        ["buffer", "route_map"],
+        ["buffer", "tile_expert"],
+        ["buffer", "tile_mn_limit"],
+        ["buffer", "num_tiles"],
+        ["buffer", "work_counter"],
+        ["parameter", "K"],
+        ["parameter", "grid_m"],
+        ["parameter", "max_tiles"],
+        ["parameter", "K_tiles"],
+        ["buffer", "clamp_limit"],
+        ["launch", "enable_pdl"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    # 23: fc2 fp8 tiles 8, 16, 32 (3 programs)
+    [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
+        ["tma_buffer", "C"],
+        ["buffer", "tile_expert"],
+        ["buffer", "tile_mn_limit"],
+        ["buffer", "num_tiles"],
+        ["buffer", "work_counter"],
+        ["buffer", "scale_c"],
+        ["parameter", "grid_m"],
+        ["parameter", "max_tiles"],
+        ["parameter", "K_tiles"],
+        ["launch", "enable_pdl"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    # 24: fc2 fp8 tiles 128, 256 (2 programs)
+    [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
+        ["tma_buffer", "C"],
+        ["buffer", "tile_expert"],
+        ["buffer", "tile_mn_limit"],
+        ["buffer", "num_tiles"],
+        ["buffer", "scale_c"],
+        ["parameter", "grid_m"],
+        ["parameter", "max_tiles"],
+        ["parameter", "K_tiles"],
+        ["launch", "enable_pdl"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    # 25: fc2 bf16 tiles 64, 128, 256 (3 programs)
+    [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
+        ["tma_buffer", "C"],
+        ["buffer", "tile_expert"],
+        ["buffer", "tile_mn_limit"],
+        ["buffer", "num_tiles"],
+        ["parameter", "grid_m"],
+        ["parameter", "max_tiles"],
         ["parameter", "K_tiles"],
         ["launch", "enable_pdl"],
         ["grid", "grid_x"],
@@ -607,16 +708,7 @@ _ARG_DTYPES: tuple[dict[str, str], ...] = (
         "cta_idx_xy_to_mn_limit": "int32",
         "num_non_exiting_ctas": "int32",
     },
-    # 3: fc2 bf16 tiles 8, 16, 32, 64, 128, 256 (6 programs)
-    {
-        "A": "bfloat16",
-        "B": "bfloat16",
-        "C": "bfloat16",
-        "tile_expert": "int32",
-        "tile_mn_limit": "int32",
-        "num_non_exiting_ctas": "int32",
-    },
-    # 4: fc2 fp8 tiles 8, 16, 32, 64, 128, 256 (6 programs)
+    # 3: fc2 fp8 tile 64 (1 program)
     {
         "A": "uint8",
         "B": "uint8",
@@ -626,7 +718,7 @@ _ARG_DTYPES: tuple[dict[str, str], ...] = (
         "num_non_exiting_ctas": "int32",
         "scale_c": "float32",
     },
-    # 5: fc1 nvfp4_bf16tok tiles 8, 16, 32 (3 programs)
+    # 4: fc1 nvfp4_bf16tok tiles 8, 16, 32 (3 programs)
     {
         "A": "uint8",
         "B": "uint8",
@@ -645,7 +737,7 @@ _ARG_DTYPES: tuple[dict[str, str], ...] = (
         "act_alpha": "float32",
         "act_beta": "float32",
     },
-    # 6: fc2 nvfp4_bf16tok tiles 8, 16, 32, 64, 256 (5 programs)
+    # 5: fc2 nvfp4_bf16tok tiles 32, 256 (2 programs)
     {
         "A": "uint8",
         "B": "uint8",
@@ -658,7 +750,7 @@ _ARG_DTYPES: tuple[dict[str, str], ...] = (
         "scale_c": "float32",
         "token_sf": "float32",
     },
-    # 7: fc2 mxfp8 tiles 8, 16, 32, 64, 128, 256 (6 programs)
+    # 6: fc2 mxfp8 tiles 64, 128, 256 (3 programs)
     {
         "A": "uint8",
         "B": "uint8",
@@ -669,7 +761,7 @@ _ARG_DTYPES: tuple[dict[str, str], ...] = (
         "tile_mn_limit": "int32",
         "num_non_exiting_ctas": "int32",
     },
-    # 8: fc1 nvfp4 tiles 8, 16, 32 (3 programs)
+    # 7: fc1 nvfp4 tiles 8, 16, 32 (3 programs)
     {
         "A": "uint8",
         "B": "uint8",
@@ -688,7 +780,7 @@ _ARG_DTYPES: tuple[dict[str, str], ...] = (
         "act_alpha": "float32",
         "act_beta": "float32",
     },
-    # 9: fc2 nvfp4 tiles 8, 16, 32, 64, 256 (5 programs)
+    # 8: fc2 nvfp4 tiles 16, 32, 256 (3 programs)
     {
         "A": "uint8",
         "B": "uint8",
@@ -700,7 +792,7 @@ _ARG_DTYPES: tuple[dict[str, str], ...] = (
         "num_non_exiting_ctas": "int32",
         "scale_c": "float32",
     },
-    # 10: fc1 bf16 tiles 8, 16, 32, 64, 128, 256 (6 programs)
+    # 9: fc1 bf16 tiles 64, 128, 256 (3 programs)
     {
         "A": "bfloat16",
         "B": "bfloat16",
@@ -711,7 +803,7 @@ _ARG_DTYPES: tuple[dict[str, str], ...] = (
         "num_non_exiting_ctas": "int32",
         "clamp_limit": "float32",
     },
-    # 11: fc1 fp8 tiles 8, 16, 32, 64, 128, 256 (6 programs)
+    # 10: fc1 fp8 tiles 8, 16, 32, 64, 128, 256 (6 programs)
     {
         "A": "uint8",
         "B": "uint8",
@@ -726,14 +818,14 @@ _ARG_DTYPES: tuple[dict[str, str], ...] = (
         "act_alpha": "float32",
         "act_beta": "float32",
     },
-    # 12: finalize scalar_f32, vector_f32 (2 programs)
+    # 11: finalize scalar_f32, vector_f32 (2 programs)
     {
         "in_ptr": "bfloat16",
         "expert_weights": "float32",
         "out_ptr": "bfloat16",
         "expanded_idx_to_permuted_idx": "int32",
     },
-    # 13: requant r128c4, r8c4 (2 programs)
+    # 12: requant r128c4, r8c4 (2 programs)
     {
         "input": "bfloat16",
         "expanded_idx_to_permuted_idx": "int32",
@@ -741,14 +833,14 @@ _ARG_DTYPES: tuple[dict[str, str], ...] = (
         "out_sf": "uint8",
         "per_token_scale": "float32",
     },
-    # 14: finalize scalar_bf16, vector_bf16 (2 programs)
+    # 13: finalize scalar_bf16, vector_bf16 (2 programs)
     {
         "in_ptr": "bfloat16",
         "expert_weights": "bfloat16",
         "out_ptr": "bfloat16",
         "expanded_idx_to_permuted_idx": "int32",
     },
-    # 15: fc1 nvfp4 tile 64 (1 program)
+    # 14: fc1 nvfp4 tile 64 (1 program)
     {
         "A": "uint8",
         "B": "uint8",
@@ -766,7 +858,7 @@ _ARG_DTYPES: tuple[dict[str, str], ...] = (
         "act_alpha": "float32",
         "act_beta": "float32",
     },
-    # 16: fc1 mxfp8 tiles 8, 16, 64, 128, 256 (5 programs)
+    # 15: fc1 mxfp8 tiles 8, 16, 64, 128, 256 (5 programs)
     {
         "A": "uint8",
         "B": "uint8",
@@ -780,7 +872,7 @@ _ARG_DTYPES: tuple[dict[str, str], ...] = (
         "num_non_exiting_ctas": "int32",
         "clamp_limit": "float32",
     },
-    # 17: fc1 nvfp4_bf16tok tile 64 (1 program)
+    # 16: fc1 nvfp4_bf16tok tile 64 (1 program)
     {
         "A": "uint8",
         "B": "uint8",
@@ -798,7 +890,7 @@ _ARG_DTYPES: tuple[dict[str, str], ...] = (
         "act_alpha": "float32",
         "act_beta": "float32",
     },
-    # 18: fc1 nvfp4_bf16tok tile 256 (1 program)
+    # 17: fc1 nvfp4_bf16tok tile 256 (1 program)
     {
         "A": "uint8",
         "B": "uint8",
@@ -816,7 +908,7 @@ _ARG_DTYPES: tuple[dict[str, str], ...] = (
         "act_alpha": "float32",
         "act_beta": "float32",
     },
-    # 19: fc1 nvfp4 tile 256 (1 program)
+    # 18: fc1 nvfp4 tile 256 (1 program)
     {
         "A": "uint8",
         "B": "uint8",
@@ -833,6 +925,97 @@ _ARG_DTYPES: tuple[dict[str, str], ...] = (
         "clamp_limit": "float32",
         "act_alpha": "float32",
         "act_beta": "float32",
+    },
+    # 19: fc2 bf16 tiles 8, 16, 32 (3 programs)
+    {
+        "A": "bfloat16",
+        "B": "bfloat16",
+        "C": "bfloat16",
+        "tile_expert": "int32",
+        "tile_mn_limit": "int32",
+        "num_tiles": "int32",
+        "work_counter": "int32",
+    },
+    # 20: fc2 nvfp4_bf16tok tiles 8, 16, 64 (3 programs)
+    {
+        "A": "uint8",
+        "B": "uint8",
+        "SFA": "uint8",
+        "SFB": "uint8",
+        "C": "bfloat16",
+        "tile_expert": "int32",
+        "tile_mn_limit": "int32",
+        "num_non_exiting_ctas": "int32",
+        "work_counter": "int32",
+        "scale_c": "float32",
+        "token_sf": "float32",
+    },
+    # 21: fc2 mxfp8 tiles 8, 16, 32 (3 programs)
+    {
+        "A": "uint8",
+        "B": "uint8",
+        "SFA": "uint8",
+        "SFB": "uint8",
+        "C": "bfloat16",
+        "tile_expert": "int32",
+        "tile_mn_limit": "int32",
+        "num_tiles": "int32",
+        "work_counter": "int32",
+    },
+    # 22: fc2 nvfp4 tiles 8, 64 (2 programs)
+    {
+        "A": "uint8",
+        "B": "uint8",
+        "SFA": "uint8",
+        "SFB": "uint8",
+        "C": "bfloat16",
+        "tile_expert": "int32",
+        "tile_mn_limit": "int32",
+        "num_non_exiting_ctas": "int32",
+        "work_counter": "int32",
+        "scale_c": "float32",
+    },
+    # 23: fc1 bf16 tiles 8, 16, 32 (3 programs)
+    {
+        "A": "bfloat16",
+        "B": "bfloat16",
+        "C": "bfloat16",
+        "route_map": "int32",
+        "tile_expert": "int32",
+        "tile_mn_limit": "int32",
+        "num_tiles": "int32",
+        "work_counter": "int32",
+        "clamp_limit": "float32",
+    },
+    # 24: fc2 fp8 tiles 8, 16, 32 (3 programs)
+    {
+        "A": "uint8",
+        "B": "uint8",
+        "C": "bfloat16",
+        "tile_expert": "int32",
+        "tile_mn_limit": "int32",
+        "num_tiles": "int32",
+        "work_counter": "int32",
+        "scale_c": "float32",
+    },
+    # 25: fc2 fp8 tiles 128, 256 (2 programs)
+    {
+        "A": "uint8",
+        "B": "uint8",
+        "C": "bfloat16",
+        "tile_expert": "int32",
+        "tile_mn_limit": "int32",
+        "num_tiles": "int32",
+        "scale_c": "float32",
+    },
+    # 26: fc2 bf16 tiles 64, 128, 256 (3 programs)
+    {
+        "A": "bfloat16",
+        "B": "bfloat16",
+        "C": "bfloat16",
+        "tile_expert": "int32",
+        "tile_mn_limit": "int32",
+        "num_tiles": "int32",
     },
 )
 # Minimum source rank per tensor-map operand.
@@ -857,114 +1040,114 @@ _PROGRAMS: dict[str, tuple[str, int, int, int, list[int], list[int], int]] = {
     "009bbe5472ef75ce05ae": ("routing", 0, 0, 0, [320, 1, 1], [1, 1, 1], 4096),
     "00f76a907f7053a93044": ("routing", 0, 1, 0, [256, 1, 1], [8, 1, 1], 1664),
     "020c9d274df0964a372c": ("routing", 1, 2, 0, [288, 1, 1], [1, 1, 1], 3712),
-    "024867aa963132f48ac0": ("fc2", 5, 6, 9, [384, 1, 1], [2, 1, 1], 221312),
+    "024867aa963132f48ac0": ("fc2", 4, 5, 9, [384, 1, 1], [2, 1, 1], 221312),
     "089365bf21f908c6212f": ("routing", 0, 1, 0, [352, 1, 1], [1, 1, 1], 4480),
-    "0d02520bcc278529cf27": ("fc2", 2, 3, 1, [384, 1, 1], [1, 1, 1], 226432),
+    "0d02520bcc278529cf27": ("fc2", 18, 19, 1, [384, 1, 1], [1, 1, 1], 226432),
     "149b84ba72a501e9f419": ("routing", 0, 0, 0, [128, 1, 1], [1, 1, 1], 1152),
-    "151b3e849cd52a227427": ("fc2", 3, 4, 2, [256, 1, 1], [2, 1, 1], 181376),
+    "151b3e849cd52a227427": ("fc2", 2, 3, 2, [256, 1, 1], [2, 1, 1], 181376),
     "153ef8a2626c47b36ad2": ("routing", 0, 1, 0, [416, 1, 1], [1, 1, 1], 5248),
-    "1f6526215da971bcc9c6": ("fc1", 4, 5, 3, [512, 1, 1], [1, 1, 1], 188544),
-    "207264b4f5afb1793f23": ("fc2", 5, 6, 4, [512, 1, 1], [1, 1, 1], 199040),
+    "1f6526215da971bcc9c6": ("fc1", 3, 4, 3, [512, 1, 1], [1, 1, 1], 188544),
+    "207264b4f5afb1793f23": ("fc2", 19, 20, 4, [512, 1, 1], [1, 1, 1], 199040),
     "26a28a148a1411bd53b5": ("routing", 0, 0, 0, [384, 1, 1], [1, 1, 1], 4864),
-    "26edf45a86b9afe56815": ("fc2", 6, 7, 4, [512, 1, 1], [1, 1, 1], 119296),
+    "26edf45a86b9afe56815": ("fc2", 20, 21, 4, [512, 1, 1], [1, 1, 1], 119296),
     "27eba75722ade3773779": ("routing", 1, 2, 0, [320, 1, 1], [1, 1, 1], 4096),
-    "28619698637f40d1fa2d": ("fc1", 7, 8, 5, [512, 1, 1], [1, 1, 1], 199040),
-    "2b4c507bf99c30c92543": ("fc2", 8, 9, 4, [512, 1, 1], [1, 1, 1], 183424),
+    "28619698637f40d1fa2d": ("fc1", 6, 7, 5, [512, 1, 1], [1, 1, 1], 199040),
+    "2b4c507bf99c30c92543": ("fc2", 21, 22, 4, [512, 1, 1], [1, 1, 1], 183424),
     "3243c1101f8f83d67462": ("routing", 0, 1, 0, [224, 1, 1], [1, 1, 1], 2944),
-    "364dc5e6c49377c27b79": ("fc1", 9, 10, 1, [384, 1, 1], [1, 1, 1], 210048),
+    "364dc5e6c49377c27b79": ("fc1", 22, 23, 1, [384, 1, 1], [1, 1, 1], 210048),
     "36c6bd00714e0bbf252c": ("routing", 0, 0, 0, [256, 1, 1], [8, 1, 1], 1408),
     "38bad85beb6a61c84bca": ("routing", 1, 2, 0, [192, 1, 1], [1, 1, 1], 2560),
-    "3a5388a6a052318613bd": ("fc2", 8, 9, 4, [512, 1, 1], [2, 1, 1], 219264),
-    "3c3e3d7bf81779f17064": ("fc2", 5, 6, 4, [512, 1, 1], [1, 1, 1], 212608),
-    "3cec6179da3b3834f473": ("fc1", 9, 10, 1, [384, 1, 1], [1, 1, 1], 224384),
+    "3a5388a6a052318613bd": ("fc2", 7, 8, 4, [512, 1, 1], [2, 1, 1], 219264),
+    "3c3e3d7bf81779f17064": ("fc2", 19, 20, 4, [512, 1, 1], [1, 1, 1], 212608),
+    "3cec6179da3b3834f473": ("fc1", 22, 23, 1, [384, 1, 1], [1, 1, 1], 224384),
     "3fea9f2972306530e112": ("routing", 0, 1, 0, [192, 1, 1], [1, 1, 1], 2560),
-    "3ffef72b1c7ffd7f5ef8": ("fc2", 3, 4, 2, [256, 1, 1], [1, 1, 1], 212096),
-    "4120432c808d60d09d02": ("fc1", 10, 11, 2, [256, 1, 1], [1, 1, 1], 105984),
+    "3ffef72b1c7ffd7f5ef8": ("fc2", 23, 24, 2, [256, 1, 1], [1, 1, 1], 212096),
+    "4120432c808d60d09d02": ("fc1", 8, 10, 2, [256, 1, 1], [1, 1, 1], 105984),
     "44ad161d50ffbc995694": ("routing", 0, 0, 0, [512, 1, 1], [8, 1, 1], 1664),
     "468943c4d21a141a598c": ("routing", 1, 2, 0, [160, 1, 1], [1, 1, 1], 2176),
-    "473b3ed97ca34adb1911": ("fc2", 3, 4, 2, [256, 1, 1], [1, 1, 1], 214144),
-    "486e203b0db053728da1": ("fc1", 10, 11, 2, [512, 1, 1], [2, 1, 1], 201856),
+    "473b3ed97ca34adb1911": ("fc2", 23, 24, 2, [256, 1, 1], [1, 1, 1], 214144),
+    "486e203b0db053728da1": ("fc1", 8, 10, 2, [512, 1, 1], [2, 1, 1], 201856),
     "490aa8adecdb6209bb9c": ("routing", 1, 2, 0, [480, 1, 1], [1, 1, 1], 6016),
-    "4d39cc1bd1356a2b3566": ("fc2", 3, 4, 2, [256, 1, 1], [2, 1, 1], 181376),
+    "4d39cc1bd1356a2b3566": ("fc2", 24, 25, 2, [256, 1, 1], [2, 1, 1], 181248),
     "5144f41bbd707c277a10": ("routing", 0, 0, 0, [128, 1, 1], [1, 1, 1], 0),
     "52e00418e5fbb3658e6c": ("routing", 0, 1, 0, [512, 1, 1], [1, 1, 1], 6400),
-    "53458328057cfece24fd": ("finalize", 11, 12, 0, [256, 1, 1], [1, 1, 1], 0),
+    "53458328057cfece24fd": ("finalize", 9, 11, 0, [256, 1, 1], [1, 1, 1], 0),
     "53c9390446e5e2e0e7f2": ("routing", 0, 1, 0, [256, 1, 1], [1, 1, 1], 3328),
     "55b3a954ca28f7cd2a01": ("routing", 1, 2, 0, [416, 1, 1], [1, 1, 1], 5248),
     "58872b8ecc4b72fcfae2": ("routing", 0, 0, 0, [512, 1, 1], [1, 1, 1], 6400),
     "59b4ebbee6bc72a686d9": ("routing", 1, 2, 0, [128, 1, 1], [1, 1, 1], 1152),
-    "5b2a4076d9456a216cb0": ("fc1", 7, 8, 5, [512, 1, 1], [1, 1, 1], 188544),
-    "5c8a855e55a71f4e5a4f": ("fc1", 10, 11, 2, [256, 1, 1], [1, 1, 1], 223232),
+    "5b2a4076d9456a216cb0": ("fc1", 6, 7, 5, [512, 1, 1], [1, 1, 1], 188544),
+    "5c8a855e55a71f4e5a4f": ("fc1", 8, 10, 2, [256, 1, 1], [1, 1, 1], 223232),
     "5d32381c3df3025f8b36": ("routing", 0, 0, 0, [192, 1, 1], [1, 1, 1], 2560),
     "6144d7ba1dd5eb933e02": ("routing", 0, 1, 0, [160, 1, 1], [1, 1, 1], 2176),
     "617db619833b05d03f14": ("routing", 0, 0, 0, [480, 1, 1], [1, 1, 1], 6016),
     "641673f58a6362969174": ("routing", 1, 2, 0, [512, 1, 1], [8, 1, 1], 1664),
     "650f390c7908e735b6b8": ("routing", 0, 0, 0, [160, 1, 1], [1, 1, 1], 2176),
-    "667764a3fa267f85926f": ("fc2", 3, 4, 2, [256, 1, 1], [2, 1, 1], 205952),
-    "71dc19e5913b86c81df9": ("requant", 12, 13, 0, [128, 1, 1], [1, 1, 1], 0),
-    "73af683d678f64679a42": ("finalize", 11, 14, 0, [256, 1, 1], [1, 1, 1], 0),
-    "7517857ff7d76e0dc9b8": ("finalize", 11, 12, 0, [256, 1, 1], [1, 1, 1], 0),
-    "75f123649cc57072713c": ("fc2", 8, 9, 4, [512, 1, 1], [2, 1, 1], 202368),
+    "667764a3fa267f85926f": ("fc2", 24, 25, 2, [256, 1, 1], [2, 1, 1], 205824),
+    "71dc19e5913b86c81df9": ("requant", 10, 12, 0, [128, 1, 1], [1, 1, 1], 0),
+    "73af683d678f64679a42": ("finalize", 9, 13, 0, [256, 1, 1], [1, 1, 1], 0),
+    "7517857ff7d76e0dc9b8": ("finalize", 9, 11, 0, [256, 1, 1], [1, 1, 1], 0),
+    "75f123649cc57072713c": ("fc2", 7, 8, 4, [512, 1, 1], [2, 1, 1], 202368),
     "7a2cba94a1fa6381e410": ("routing", 0, 0, 0, [1024, 1, 1], [8, 1, 1], 2176),
     "7b7412cdbf97e305bb0a": ("routing", 1, 2, 0, [1024, 1, 1], [8, 1, 1], 2176),
-    "7cb3690815e48b750087": ("fc1", 13, 15, 6, [896, 1, 1], [2, 1, 1], 193152),
+    "7cb3690815e48b750087": ("fc1", 11, 14, 6, [896, 1, 1], [2, 1, 1], 193152),
     "801f356a080c3fc264f2": ("routing", 0, 1, 0, [512, 1, 1], [8, 1, 1], 2176),
-    "83be80000a2c395b0180": ("fc1", 10, 11, 2, [512, 1, 1], [2, 1, 1], 210048),
+    "83be80000a2c395b0180": ("fc1", 8, 10, 2, [512, 1, 1], [2, 1, 1], 210048),
     "85e03fcd251dde9ebf18": ("routing", 0, 0, 0, [128, 1, 1], [1, 1, 1], 1152),
-    "893d9279ac4a4a3d1904": ("fc2", 5, 6, 4, [512, 1, 1], [2, 1, 1], 177280),
+    "893d9279ac4a4a3d1904": ("fc2", 4, 5, 4, [512, 1, 1], [2, 1, 1], 177280),
     "8d8873b942ad2696dd37": ("routing", 0, 1, 0, [320, 1, 1], [1, 1, 1], 4096),
-    "8e32f55e2c8cc674a74a": ("fc1", 7, 8, 5, [512, 1, 1], [1, 1, 1], 210560),
+    "8e32f55e2c8cc674a74a": ("fc1", 6, 7, 5, [512, 1, 1], [1, 1, 1], 210560),
     "8f16181b96ffd8a94362": ("routing", 0, 1, 0, [448, 1, 1], [1, 1, 1], 5632),
     "91d8e602f2d067496ea3": ("routing", 0, 0, 0, [448, 1, 1], [1, 1, 1], 5632),
     "94829f81f49d9cd83238": ("routing", 1, 2, 0, [384, 1, 1], [1, 1, 1], 4864),
-    "94969f032e90041ddaab": ("fc2", 6, 7, 4, [512, 1, 1], [1, 1, 1], 136064),
-    "98389094462077483771": ("fc1", 14, 16, 7, [512, 1, 1], [2, 1, 1], 176256),
+    "94969f032e90041ddaab": ("fc2", 20, 21, 4, [512, 1, 1], [1, 1, 1], 136064),
+    "98389094462077483771": ("fc1", 12, 15, 7, [512, 1, 1], [2, 1, 1], 176256),
     "98534e8bfabc615ff7d5": ("routing", 0, 1, 0, [480, 1, 1], [1, 1, 1], 6016),
     "9a305f39c4182bc865be": ("routing", 0, 1, 0, [128, 1, 1], [1, 1, 1], 1152),
-    "a4a11b14b7fc96229730": ("fc2", 15, 3, 8, [256, 1, 1], [2, 1, 1], 214144),
-    "a5b8153548cab6dd4a26": ("fc1", 10, 11, 2, [512, 1, 1], [2, 1, 1], 226432),
+    "a4a11b14b7fc96229730": ("fc2", 25, 26, 8, [256, 1, 1], [2, 1, 1], 214016),
+    "a5b8153548cab6dd4a26": ("fc1", 8, 10, 2, [512, 1, 1], [2, 1, 1], 226432),
     "ae217b5e6c838affbdf0": ("routing", 0, 1, 0, [128, 1, 1], [1, 1, 1], 1152),
-    "ae6ca81a0800a8c71538": ("fc2", 6, 7, 9, [384, 1, 1], [2, 1, 1], 197248),
-    "ae7dcfbf2d3e0cc4a20b": ("fc2", 6, 7, 9, [384, 1, 1], [2, 1, 1], 189056),
+    "ae6ca81a0800a8c71538": ("fc2", 5, 6, 9, [384, 1, 1], [2, 1, 1], 197248),
+    "ae7dcfbf2d3e0cc4a20b": ("fc2", 5, 6, 9, [384, 1, 1], [2, 1, 1], 189056),
     "ae9bbf9c9644097f8828": ("routing", 1, 2, 0, [448, 1, 1], [1, 1, 1], 5632),
-    "af32c4e6a3c0d0e036bf": ("fc2", 5, 6, 4, [512, 1, 1], [1, 1, 1], 183424),
-    "b398b040e1b8ef869e3c": ("fc1", 20, 16, 5, [384, 1, 1], [2, 1, 1], 209024),
-    "b8722b9a6936e6a4c924": ("fc1", 16, 17, 10, [896, 1, 1], [2, 1, 1], 193152),
+    "af32c4e6a3c0d0e036bf": ("fc2", 19, 20, 4, [512, 1, 1], [1, 1, 1], 183424),
+    "b398b040e1b8ef869e3c": ("fc1", 17, 15, 5, [384, 1, 1], [2, 1, 1], 209024),
+    "b8722b9a6936e6a4c924": ("fc1", 13, 16, 10, [896, 1, 1], [2, 1, 1], 193152),
     "bf81684716f8abab06d1": ("routing", 1, 2, 0, [512, 1, 1], [1, 1, 1], 6400),
-    "c1118bec4cfea74fa04e": ("fc2", 15, 3, 8, [256, 1, 1], [2, 1, 1], 222336),
-    "c16c727913eac39c7f25": ("fc1", 14, 16, 7, [640, 1, 1], [4, 1, 1], 224384),
+    "c1118bec4cfea74fa04e": ("fc2", 25, 26, 8, [256, 1, 1], [2, 1, 1], 222208),
+    "c16c727913eac39c7f25": ("fc1", 12, 15, 7, [640, 1, 1], [4, 1, 1], 224384),
     "c1a1ea765b3fb9132f49": ("routing", 1, 2, 0, [224, 1, 1], [1, 1, 1], 2944),
-    "c3d9de1e9d6270fc651c": ("fc1", 17, 10, 8, [384, 1, 1], [2, 1, 1], 201856),
-    "c3df92890bea6316d938": ("fc2", 8, 9, 4, [512, 1, 1], [1, 1, 1], 199040),
+    "c3d9de1e9d6270fc651c": ("fc1", 14, 9, 8, [384, 1, 1], [2, 1, 1], 201856),
+    "c3df92890bea6316d938": ("fc2", 21, 22, 4, [512, 1, 1], [1, 1, 1], 199040),
     "c476df668d159348bc57": ("routing", 0, 0, 0, [416, 1, 1], [1, 1, 1], 5248),
-    "c515b08780ee51d11666": ("fc2", 2, 3, 1, [384, 1, 1], [1, 1, 1], 214144),
-    "c96f943c65b2c8eaa9ab": ("fc1", 14, 16, 7, [512, 1, 1], [1, 1, 1], 217600),
-    "cad86e812c35e9572739": ("fc1", 17, 10, 8, [384, 1, 1], [2, 1, 1], 210048),
+    "c515b08780ee51d11666": ("fc2", 18, 19, 1, [384, 1, 1], [1, 1, 1], 214144),
+    "c96f943c65b2c8eaa9ab": ("fc1", 12, 15, 7, [512, 1, 1], [1, 1, 1], 217600),
+    "cad86e812c35e9572739": ("fc1", 14, 9, 8, [384, 1, 1], [2, 1, 1], 210048),
     "cbdd540435fadd0d63f6": ("routing", 1, 2, 0, [256, 1, 1], [8, 1, 1], 1408),
-    "ce56d77c382736e1c912": ("fc1", 4, 5, 3, [512, 1, 1], [1, 1, 1], 210560),
-    "ce5e4aee5124c2a50192": ("fc2", 6, 7, 4, [512, 1, 1], [1, 1, 1], 147072),
+    "ce56d77c382736e1c912": ("fc1", 3, 4, 3, [512, 1, 1], [1, 1, 1], 210560),
+    "ce5e4aee5124c2a50192": ("fc2", 20, 21, 4, [512, 1, 1], [1, 1, 1], 147072),
     "cecd60278603dcc4678d": ("routing", 0, 1, 0, [1024, 1, 1], [8, 1, 1], 3200),
-    "d2bfac69e4b5b7c5f961": ("fc1", 17, 10, 8, [384, 1, 1], [2, 1, 1], 226432),
+    "d2bfac69e4b5b7c5f961": ("fc1", 14, 9, 8, [384, 1, 1], [2, 1, 1], 226432),
     "d2ed453ef29437abcbfe": ("routing", 0, 0, 0, [224, 1, 1], [1, 1, 1], 2944),
-    "d53109285a57b12da009": ("fc2", 15, 3, 8, [256, 1, 1], [2, 1, 1], 214144),
+    "d53109285a57b12da009": ("fc2", 25, 26, 8, [256, 1, 1], [2, 1, 1], 214016),
     "d5c6f1eaf5f0c70097c8": ("routing", 0, 0, 0, [352, 1, 1], [1, 1, 1], 4480),
     "d8ed340b82ed5d180872": ("routing", 0, 0, 0, [256, 1, 1], [1, 1, 1], 3328),
-    "da3cce1da37ee8392722": ("requant", 12, 13, 0, [128, 1, 1], [1, 1, 1], 0),
+    "da3cce1da37ee8392722": ("requant", 10, 12, 0, [128, 1, 1], [1, 1, 1], 0),
     "da98c89d4739d782b98c": ("routing", 0, 1, 0, [384, 1, 1], [1, 1, 1], 4864),
-    "dc6b51f2c1bbc6ed7dfa": ("fc2", 2, 3, 1, [384, 1, 1], [1, 1, 1], 212096),
+    "dc6b51f2c1bbc6ed7dfa": ("fc2", 18, 19, 1, [384, 1, 1], [1, 1, 1], 212096),
     "dfa112cd632ae74e7c6e": ("routing", 1, 2, 0, [352, 1, 1], [1, 1, 1], 4480),
-    "e07259ed5242a5ed08f5": ("fc1", 4, 5, 3, [512, 1, 1], [1, 1, 1], 199040),
-    "e2293bcb1ccd0fb0fa95": ("fc1", 14, 16, 7, [640, 1, 1], [1, 1, 1], 193280),
-    "e236d0a22b1241463649": ("fc1", 10, 11, 2, [256, 1, 1], [1, 1, 1], 207872),
-    "e2c03be2acbc48deccaf": ("fc1", 9, 10, 1, [384, 1, 1], [1, 1, 1], 211072),
-    "ef40785c53887398a669": ("finalize", 11, 14, 0, [256, 1, 1], [1, 1, 1], 0),
-    "f10c6f853ce09601ded6": ("fc1", 18, 18, 11, [640, 1, 1], [2, 1, 1], 170112),
-    "f44269ae056bce32e72d": ("fc2", 6, 7, 4, [512, 1, 1], [2, 1, 1], 187520),
-    "f496b224df3869be9686": ("fc2", 8, 9, 9, [384, 1, 1], [2, 1, 1], 220288),
-    "f4d6d750fa13240db475": ("fc2", 3, 4, 2, [256, 1, 1], [1, 1, 1], 226432),
+    "e07259ed5242a5ed08f5": ("fc1", 3, 4, 3, [512, 1, 1], [1, 1, 1], 199040),
+    "e2293bcb1ccd0fb0fa95": ("fc1", 12, 15, 7, [640, 1, 1], [1, 1, 1], 193280),
+    "e236d0a22b1241463649": ("fc1", 8, 10, 2, [256, 1, 1], [1, 1, 1], 207872),
+    "e2c03be2acbc48deccaf": ("fc1", 22, 23, 1, [384, 1, 1], [1, 1, 1], 211072),
+    "ef40785c53887398a669": ("finalize", 9, 13, 0, [256, 1, 1], [1, 1, 1], 0),
+    "f10c6f853ce09601ded6": ("fc1", 15, 17, 11, [640, 1, 1], [2, 1, 1], 170112),
+    "f44269ae056bce32e72d": ("fc2", 5, 6, 4, [512, 1, 1], [2, 1, 1], 187520),
+    "f496b224df3869be9686": ("fc2", 7, 8, 9, [384, 1, 1], [2, 1, 1], 220288),
+    "f4d6d750fa13240db475": ("fc2", 23, 24, 2, [256, 1, 1], [1, 1, 1], 226432),
     "f705b4bad90742efa82b": ("routing", 0, 1, 0, [288, 1, 1], [1, 1, 1], 3712),
     "f7ef47dbe2fd5582df03": ("routing", 0, 0, 0, [288, 1, 1], [1, 1, 1], 3712),
-    "f8b951ca28630f6cded8": ("fc1", 19, 19, 7, [640, 1, 1], [2, 1, 1], 170112),
+    "f8b951ca28630f6cded8": ("fc1", 16, 18, 7, [640, 1, 1], [2, 1, 1], 170112),
     "fa9bc43250643aafa1d8": ("routing", 1, 2, 0, [256, 1, 1], [1, 1, 1], 3328),
     "fdd94436356faa9ae3e0": ("routing", 0, 1, 0, [128, 1, 1], [1, 1, 1], 0),
 }
@@ -1077,66 +1260,66 @@ _GEMM_DTYPES: dict[str, dict[str, list[str]]] = {
         "mxfp8": ["MxE4m3", "MxE4m3", "Bfloat16"],
     },
 }
-# digest -> (family, tile_n, block_k)
-_FC1: dict[str, tuple[str, int, int]] = {
-    "1f6526215da971bcc9c6": ("nvfp4_bf16tok", 32, 512),
-    "28619698637f40d1fa2d": ("nvfp4", 8, 512),
-    "364dc5e6c49377c27b79": ("bf16", 32, 128),
-    "3cec6179da3b3834f473": ("bf16", 16, 128),
-    "4120432c808d60d09d02": ("fp8", 8, 256),
-    "486e203b0db053728da1": ("fp8", 256, 128),
-    "5b2a4076d9456a216cb0": ("nvfp4", 32, 512),
-    "5c8a855e55a71f4e5a4f": ("fp8", 16, 256),
-    "7cb3690815e48b750087": ("nvfp4", 64, 512),
-    "83be80000a2c395b0180": ("fp8", 64, 256),
-    "8e32f55e2c8cc674a74a": ("nvfp4", 16, 512),
-    "98389094462077483771": ("mxfp8", 64, 256),
-    "a5b8153548cab6dd4a26": ("fp8", 128, 128),
-    "b398b040e1b8ef869e3c": ("mxfp8", 128, 256),
-    "b8722b9a6936e6a4c924": ("nvfp4_bf16tok", 64, 512),
-    "c16c727913eac39c7f25": ("mxfp8", 256, 256),
-    "c3d9de1e9d6270fc651c": ("bf16", 256, 64),
-    "c96f943c65b2c8eaa9ab": ("mxfp8", 8, 512),
-    "cad86e812c35e9572739": ("bf16", 64, 128),
-    "ce56d77c382736e1c912": ("nvfp4_bf16tok", 16, 512),
-    "d2bfac69e4b5b7c5f961": ("bf16", 128, 64),
-    "e07259ed5242a5ed08f5": ("nvfp4_bf16tok", 8, 512),
-    "e2293bcb1ccd0fb0fa95": ("mxfp8", 16, 256),
-    "e236d0a22b1241463649": ("fp8", 32, 256),
-    "e2c03be2acbc48deccaf": ("bf16", 8, 128),
-    "f10c6f853ce09601ded6": ("nvfp4_bf16tok", 256, 256),
-    "f8b951ca28630f6cded8": ("nvfp4", 256, 256),
+# digest -> (family, tile_n, block_k, grid_rule)
+_FC1: dict[str, tuple[str, int, int, str]] = {
+    "1f6526215da971bcc9c6": ("nvfp4_bf16tok", 32, 512, "tiles"),
+    "28619698637f40d1fa2d": ("nvfp4", 8, 512, "tiles"),
+    "364dc5e6c49377c27b79": ("bf16", 32, 128, "resident"),
+    "3cec6179da3b3834f473": ("bf16", 16, 128, "resident"),
+    "4120432c808d60d09d02": ("fp8", 8, 256, "tiles"),
+    "486e203b0db053728da1": ("fp8", 256, 128, "tiles"),
+    "5b2a4076d9456a216cb0": ("nvfp4", 32, 512, "tiles"),
+    "5c8a855e55a71f4e5a4f": ("fp8", 16, 256, "tiles"),
+    "7cb3690815e48b750087": ("nvfp4", 64, 512, "tiles"),
+    "83be80000a2c395b0180": ("fp8", 64, 256, "tiles"),
+    "8e32f55e2c8cc674a74a": ("nvfp4", 16, 512, "tiles"),
+    "98389094462077483771": ("mxfp8", 64, 256, "tiles"),
+    "a5b8153548cab6dd4a26": ("fp8", 128, 128, "tiles"),
+    "b398b040e1b8ef869e3c": ("mxfp8", 128, 256, "tiles"),
+    "b8722b9a6936e6a4c924": ("nvfp4_bf16tok", 64, 512, "tiles"),
+    "c16c727913eac39c7f25": ("mxfp8", 256, 256, "tiles"),
+    "c3d9de1e9d6270fc651c": ("bf16", 256, 64, "tiles"),
+    "c96f943c65b2c8eaa9ab": ("mxfp8", 8, 512, "tiles"),
+    "cad86e812c35e9572739": ("bf16", 64, 128, "tiles"),
+    "ce56d77c382736e1c912": ("nvfp4_bf16tok", 16, 512, "tiles"),
+    "d2bfac69e4b5b7c5f961": ("bf16", 128, 64, "tiles"),
+    "e07259ed5242a5ed08f5": ("nvfp4_bf16tok", 8, 512, "tiles"),
+    "e2293bcb1ccd0fb0fa95": ("mxfp8", 16, 256, "tiles"),
+    "e236d0a22b1241463649": ("fp8", 32, 256, "tiles"),
+    "e2c03be2acbc48deccaf": ("bf16", 8, 128, "resident"),
+    "f10c6f853ce09601ded6": ("nvfp4_bf16tok", 256, 256, "tiles"),
+    "f8b951ca28630f6cded8": ("nvfp4", 256, 256, "tiles"),
 }
-# digest -> (family, tile_n, block_k, sf_layout_a)
-_FC2: dict[str, tuple[str, int, int, str]] = {
-    "024867aa963132f48ac0": ("nvfp4_bf16tok", 256, 256, "r128c4"),
-    "0d02520bcc278529cf27": ("bf16", 16, 128, "none"),
-    "151b3e849cd52a227427": ("fp8", 64, 128, "none"),
-    "207264b4f5afb1793f23": ("nvfp4_bf16tok", 8, 512, "r8c4"),
-    "26edf45a86b9afe56815": ("mxfp8", 16, 256, "r8c4"),
-    "2b4c507bf99c30c92543": ("nvfp4", 64, 512, "r8c4"),
-    "3a5388a6a052318613bd": ("nvfp4", 32, 512, "r8c4"),
-    "3c3e3d7bf81779f17064": ("nvfp4_bf16tok", 16, 512, "r8c4"),
-    "3ffef72b1c7ffd7f5ef8": ("fp8", 8, 256, "none"),
-    "473b3ed97ca34adb1911": ("fp8", 32, 256, "none"),
-    "4d39cc1bd1356a2b3566": ("fp8", 128, 128, "none"),
-    "667764a3fa267f85926f": ("fp8", 256, 128, "none"),
-    "75f123649cc57072713c": ("nvfp4", 16, 512, "r8c4"),
-    "893d9279ac4a4a3d1904": ("nvfp4_bf16tok", 32, 512, "r8c4"),
-    "94969f032e90041ddaab": ("mxfp8", 32, 256, "r8c4"),
-    "a4a11b14b7fc96229730": ("bf16", 128, 64, "none"),
-    "ae6ca81a0800a8c71538": ("mxfp8", 128, 128, "r128c4"),
-    "ae7dcfbf2d3e0cc4a20b": ("mxfp8", 256, 128, "r128c4"),
-    "af32c4e6a3c0d0e036bf": ("nvfp4_bf16tok", 64, 512, "r8c4"),
-    "c1118bec4cfea74fa04e": ("bf16", 64, 128, "none"),
-    "c3df92890bea6316d938": ("nvfp4", 8, 512, "r8c4"),
-    "c515b08780ee51d11666": ("bf16", 32, 128, "none"),
-    "ce5e4aee5124c2a50192": ("mxfp8", 8, 256, "r8c4"),
-    "d53109285a57b12da009": ("bf16", 256, 64, "none"),
-    "dc6b51f2c1bbc6ed7dfa": ("bf16", 8, 128, "none"),
-    "f44269ae056bce32e72d": ("mxfp8", 64, 256, "r8c4"),
-    "f496b224df3869be9686": ("nvfp4", 256, 256, "r128c4"),
-    "f4d6d750fa13240db475": ("fp8", 16, 256, "none"),
+# digest -> (family, tile_n, block_k, sf_layout_a, grid_rule)
+_FC2: dict[str, tuple[str, int, int, str, str]] = {
+    "024867aa963132f48ac0": ("nvfp4_bf16tok", 256, 256, "r128c4", "tiles"),
+    "0d02520bcc278529cf27": ("bf16", 16, 128, "none", "resident"),
+    "151b3e849cd52a227427": ("fp8", 64, 128, "none", "tiles"),
+    "207264b4f5afb1793f23": ("nvfp4_bf16tok", 8, 512, "r8c4", "resident"),
+    "26edf45a86b9afe56815": ("mxfp8", 16, 256, "r8c4", "resident"),
+    "2b4c507bf99c30c92543": ("nvfp4", 64, 512, "r8c4", "resident"),
+    "3a5388a6a052318613bd": ("nvfp4", 32, 512, "r8c4", "tiles"),
+    "3c3e3d7bf81779f17064": ("nvfp4_bf16tok", 16, 512, "r8c4", "resident"),
+    "3ffef72b1c7ffd7f5ef8": ("fp8", 8, 256, "none", "resident"),
+    "473b3ed97ca34adb1911": ("fp8", 32, 256, "none", "resident"),
+    "4d39cc1bd1356a2b3566": ("fp8", 128, 128, "none", "resident"),
+    "667764a3fa267f85926f": ("fp8", 256, 128, "none", "resident"),
+    "75f123649cc57072713c": ("nvfp4", 16, 512, "r8c4", "tiles"),
+    "893d9279ac4a4a3d1904": ("nvfp4_bf16tok", 32, 512, "r8c4", "tiles"),
+    "94969f032e90041ddaab": ("mxfp8", 32, 256, "r8c4", "resident"),
+    "a4a11b14b7fc96229730": ("bf16", 128, 64, "none", "resident"),
+    "ae6ca81a0800a8c71538": ("mxfp8", 128, 128, "r128c4", "tiles"),
+    "ae7dcfbf2d3e0cc4a20b": ("mxfp8", 256, 128, "r128c4", "tiles"),
+    "af32c4e6a3c0d0e036bf": ("nvfp4_bf16tok", 64, 512, "r8c4", "resident"),
+    "c1118bec4cfea74fa04e": ("bf16", 64, 128, "none", "resident"),
+    "c3df92890bea6316d938": ("nvfp4", 8, 512, "r8c4", "resident"),
+    "c515b08780ee51d11666": ("bf16", 32, 128, "none", "resident"),
+    "ce5e4aee5124c2a50192": ("mxfp8", 8, 256, "r8c4", "resident"),
+    "d53109285a57b12da009": ("bf16", 256, 64, "none", "resident"),
+    "dc6b51f2c1bbc6ed7dfa": ("bf16", 8, 128, "none", "resident"),
+    "f44269ae056bce32e72d": ("mxfp8", 64, 256, "r8c4", "tiles"),
+    "f496b224df3869be9686": ("nvfp4", 256, 256, "r128c4", "tiles"),
+    "f4d6d750fa13240db475": ("fp8", 16, 256, "none", "resident"),
 }
 # digest -> (variant, sf_layout)
 _REQUANT: dict[str, tuple[str, str]] = {
@@ -1223,12 +1406,13 @@ def _unit(digest: str) -> dict[str, Any]:
             variant=variant,
         )
     elif stage == "fc1":
-        family, tile_n, block_k = _FC1[digest]
+        family, tile_n, block_k, grid_rule = _FC1[digest]
         unit.update(_gemm_fields(stage, family, tile_n, block_k))
+        unit["grid_rule"] = grid_rule
     elif stage == "fc2":
-        family, tile_n, block_k, sf_layout_a = _FC2[digest]
+        family, tile_n, block_k, sf_layout_a, grid_rule = _FC2[digest]
         unit.update(_gemm_fields(stage, family, tile_n, block_k))
-        unit["sf_layout_a"] = sf_layout_a
+        unit.update(grid_rule=grid_rule, sf_layout_a=sf_layout_a)
     elif stage == "requant":
         variant, sf_layout = _REQUANT[digest]
         unit.update(sf_layout=sf_layout, unit_key=[stage, variant], variant=variant)

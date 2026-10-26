@@ -241,7 +241,7 @@ kernel_cake_stepfun_moe_7517857ff7d76e0dc9b8(const __nv_bfloat16* in_ptr, const 
                 asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_15) : "f"(scale[7]), "f"(value[7]), "f"(data));
                 data = _fma_15;
             }
-            *(reinterpret_cast<__nv_bfloat16*>(out_ptr + (token_idx * hidden_dim + hidden_idx)) + (0)) = __float2bfloat16_rn(data);
+            *(reinterpret_cast<__nv_bfloat16*>(out_ptr + (token_idx * hidden_dim + hidden_idx)) + (0)) = (__nv_bfloat16)data;
         }
     }
 }

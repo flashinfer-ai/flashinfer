@@ -61,6 +61,17 @@ int64_t NumelAbove(const TensorView& t, int trailing) {
   return product;
 }
 
+[[noreturn]] void NoInt64(int64_t a, const char* op, int64_t b) {
+  TVM_FFI_THROW(ValueError) << KERNEL_NAME << ": " << a << " " << op << " " << b
+                            << " has no int64 value in a host check";
+}
+
+int64_t CheckedSub(int64_t a, int64_t b) {
+  int64_t difference;
+  if (__builtin_sub_overflow(a, b, &difference)) NoInt64(a, "-", b);
+  return difference;
+}
+
 cuuint64_t Extent(int64_t value, const char* descriptor) {
   TVM_FFI_CHECK(value > 0, ValueError)
       << KERNEL_NAME << ": an extent of descriptor '" << descriptor << "' resolves to " << value;
@@ -137,8 +148,8 @@ CUtensorMap EncodeTma_C(const TensorView& t) {
   CheckUnitInnerStride(t, "C");
   int64_t d1 = t.size(-1);
   int64_t s2 = t.stride(-2) * 2;
-  cuuint64_t global_dim[4] = {Extent(d1, "C"), Extent(128, "C"), Extent(2147483648LL, "C"), Extent(2147483648LL, "C")};
-  cuuint64_t global_strides[3] = {Stride(s2, "C"), Stride((68719476736LL - s2), "C"), Stride(s2, "C")};
+  cuuint64_t global_dim[4] = {Extent(d1, "C"), Extent(128LL, "C"), Extent(2147483648LL, "C"), Extent(2147483648LL, "C")};
+  cuuint64_t global_strides[3] = {Stride(s2, "C"), Stride(CheckedSub(68719476736LL, s2), "C"), Stride(s2, "C")};
   cuuint32_t box_dim[4] = {64u, 32u, 1u, 1u};
   cuuint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2] && box_dim[3] <= global_dim[3], ValueError)
