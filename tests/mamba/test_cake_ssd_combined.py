@@ -4794,32 +4794,37 @@ def test_source_program_table_names_shipped_sources():
     assert set(module._CHUNKPAR3_MODULES) == {
         name for name in module._PROGRAMS if name.startswith("chunkpar3_")
     }
-    # The sm_107a (Rubin) module table: the programs whose Rubin render was
-    # regenerated with its own geometry -- the fused and one-launch varlen
-    # scans, the look-back chunk-parallel program and the two-kernel varlen
-    # ring program -- each entry the fold module's stem under its own
-    # identity (the export's content hash).  Every other program builds its
-    # fold module on sm_107a too: the retained start ``exact_*`` programs,
-    # the SM100-only ``exactmeta_*`` programs and the programs whose Rubin
-    # render differed from the fold only by the descriptor mask (an
-    # ``__CUDA_ARCH__`` branch of the fold source).  The ``exactone_*`` entry
-    # of a suffix is a source of its own (the one-launch render beside the
-    # SM100-form render), as on SM103.
+    # The sm_107a (Rubin) module table: every program whose Rubin render was
+    # regenerated with its own geometry -- the fused, one-launch and
+    # two-kernel exact scans (with their ``_noring`` and ``_tail`` variants),
+    # the look-back and the three-phase chunk-parallel programs -- each entry
+    # the fold module's stem under its own identity (the export's content
+    # hash).  Only the retained start ``exact_*`` programs and the SM100-only
+    # ``exactmeta_*`` programs build their fold module on sm_107a.  The
+    # ``exactone_*`` entry of a suffix is a source of its own (the one-launch
+    # render beside the SM100-form render), as on SM103.
     assert set(module._SM107_MODULES) == {
         f"{family}_{state}_{mode}{variant}"
         for family, mode, variants in (
+            ("exactfused", "batched", ("", "_noring")),
             ("exactfused", "varlen", ("", "_noring")),
             ("exactone", "varlen", ("", "_noring")),
-            ("exactpre", "varlen", ("",)),
+            ("exactpre", "batched", ("", "_tail")),
+            ("exactpre", "varlen", ("", "_tail")),
             ("chunkpar", "batched", ("",)),
             ("chunkpar", "varlen", ("",)),
+            ("chunkpar3", "batched", ("",)),
+            ("chunkpar3", "varlen", ("",)),
         )
         for variant in variants
         for state in ("bf16", "f16", "f32")
-        if (variant, state) != ("_noring", "f32")
+        if (variant, state, mode) != ("_noring", "f32", "varlen")
     }
-    assert len(module._SM107_MODULES) == 19
+    assert len(module._SM107_MODULES) == 40
     assert set(module._SM107_MODULES) <= set(module._PROGRAMS)
+    assert set(module._PROGRAMS) - set(module._SM107_MODULES) == {
+        name for name in module._PROGRAMS if name.startswith(("exact_", "exactmeta_"))
+    }
     for name, own in module._SM107_MODULES.items():
         if name.startswith("exactone_"):
             twin = module._SM107_MODULES[name.replace("exactone_", "exactfused_", 1)]
