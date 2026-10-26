@@ -1123,7 +1123,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o110_small(__half* __restrict__ allr
     int access_1 = first_access;
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     int rms_parity = 0;
-    int rms_phase = 0;
+    unsigned int _phase_rms_bar = 0;
     #pragma unroll 1
     for (int token_1 = token_begin; token_1 < token_end; token_1 += token_stride) {
         int elem_early = access_1 * 8;
@@ -1394,51 +1394,50 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o110_small(__half* __restrict__ allr
             float block_sum = reduce_smem[0] + reduce_smem[4] + (reduce_smem[2] + reduce_smem[6]) + (reduce_smem[1] + reduce_smem[5] + reduce_smem[3]);
             mbarrier_arrive_expect_tx(rms_bar_addr + (rms_parity) * 8, 16);
             int slot_addr = rms_slots_addr + (unsigned int)(rms_parity * 16) + (unsigned int)(cta_rank * 4);
-            unsigned int bar_addr = rms_bar_addr + (unsigned int)(rms_parity * 8);
             uint32_t _cluster_mapa_21;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
                 : "=r"(_cluster_mapa_21) : "r"(slot_addr), "r"(0));
-            uint32_t _cluster_mapa_22;
-            asm volatile(
+            uint32_t _mbar_peer_22;
+            asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_22) : "r"(bar_addr), "r"(0));
+                : "=r"(_mbar_peer_22) : "r"(rms_bar_addr + (rms_parity) * 8), "r"(0));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_21), "f"(block_sum), "r"(_cluster_mapa_22) : "memory");
+                :: "r"(_cluster_mapa_21), "f"(block_sum), "r"(_mbar_peer_22) : "memory");
             uint32_t _cluster_mapa_23;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
                 : "=r"(_cluster_mapa_23) : "r"(slot_addr), "r"(1));
-            uint32_t _cluster_mapa_24;
-            asm volatile(
+            uint32_t _mbar_peer_24;
+            asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_24) : "r"(bar_addr), "r"(1));
+                : "=r"(_mbar_peer_24) : "r"(rms_bar_addr + (rms_parity) * 8), "r"(1));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_23), "f"(block_sum), "r"(_cluster_mapa_24) : "memory");
+                :: "r"(_cluster_mapa_23), "f"(block_sum), "r"(_mbar_peer_24) : "memory");
             uint32_t _cluster_mapa_25;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
                 : "=r"(_cluster_mapa_25) : "r"(slot_addr), "r"(2));
-            uint32_t _cluster_mapa_26;
-            asm volatile(
+            uint32_t _mbar_peer_26;
+            asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_26) : "r"(bar_addr), "r"(2));
+                : "=r"(_mbar_peer_26) : "r"(rms_bar_addr + (rms_parity) * 8), "r"(2));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_25), "f"(block_sum), "r"(_cluster_mapa_26) : "memory");
+                :: "r"(_cluster_mapa_25), "f"(block_sum), "r"(_mbar_peer_26) : "memory");
             uint32_t _cluster_mapa_27;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
                 : "=r"(_cluster_mapa_27) : "r"(slot_addr), "r"(3));
-            uint32_t _cluster_mapa_28;
-            asm volatile(
+            uint32_t _mbar_peer_28;
+            asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_28) : "r"(bar_addr), "r"(3));
+                : "=r"(_mbar_peer_28) : "r"(rms_bar_addr + (rms_parity) * 8), "r"(3));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_27), "f"(block_sum), "r"(_cluster_mapa_28) : "memory");
+                :: "r"(_cluster_mapa_27), "f"(block_sum), "r"(_mbar_peer_28) : "memory");
             asm volatile("fence.release.sync_restrict::shared::cta.cluster;" ::: "memory");
             asm volatile(
                 "{\n\t"
@@ -1462,7 +1461,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o110_small(__half* __restrict__ allr
                 "}"
                 :: "r"(rms_bar_addr + (rms_parity) * 8), "r"(cta_rank ^ 3) : "memory");
         }
-        mbarrier_wait_cluster_hint(rms_bar_addr + (rms_parity) * 8, rms_phase, 10000000);
+        mbarrier_wait_cluster_hint(rms_bar_addr + (rms_parity) * 8, _phase_rms_bar, 10000000);
         float cluster_sum = 0.0f;
         cluster_sum = cluster_sum + rms_slots[rms_parity * 4];
         cluster_sum = cluster_sum + rms_slots[rms_parity * 4 + 1];
@@ -1482,8 +1481,8 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o110_small(__half* __restrict__ allr
         }
         reinterpret_cast<int4*>(norm_out + elem)[0] = reinterpret_cast<int4*>(norm_value_f16)[0];
         access_1 += access_stride;
-        rms_phase = rms_phase ^ rms_parity;
-        rms_parity = 1 - rms_parity;
+        rms_parity += 1;
+        if (rms_parity == 2) { rms_parity = 0; _phase_rms_bar ^= 1; }
     }
     if (bid == 0) {
         if (tid == 0) {
