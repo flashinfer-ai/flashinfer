@@ -135,6 +135,33 @@ def unswizzle_sf(
     return sf_unswizzle_sliced.contiguous()
 
 
+@pytest.mark.parametrize("shape", [(17, 5), (128, 4), (2, 129, 7)])
+@torch.inference_mode()
+def test_block_scale_interleave_out_graph(shape):
+    device = torch.device("cuda")
+    if not _is_fp4_supported(device):
+        pytest.skip("requires FP4 block-scale interleave support")
+    source = torch.randint(0, 256, shape, dtype=torch.uint8, device=device)
+    reference = block_scale_interleave(source)
+    output = torch.empty_like(reference)
+    assert block_scale_interleave(source, out=output) is output
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        block_scale_interleave(source, out=output)
+    for _ in range(3):
+        source.random_(0, 256)
+        output.fill_(0)
+        graph.replay()
+        expected = block_scale_interleave(source)
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    with pytest.raises(ValueError, match="contiguous flat tensor"):
+        block_scale_interleave(source, out=output[:-1])
+    with pytest.raises(ValueError, match="contiguous flat tensor"):
+        block_scale_interleave(source, out=output.view(1, -1))
+    with pytest.raises(ValueError, match="contiguous flat tensor"):
+        block_scale_interleave(source, out=output.to(torch.bfloat16))
+
+
 @pytest.mark.parametrize("backend", FP4_BACKENDS)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", SHAPES)

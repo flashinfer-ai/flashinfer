@@ -32,7 +32,11 @@ host selects per token count (`cake_backend.select_tile_config`, the Cake
 cluster for small `T`, the single-CTA 128x128 eight-warp tile `s_e8_pf` for
 the residual GEMMs while the pair grid underfills the machine (out-proj to
 6144 rows, FC1 to 2304), 256x256 / 256x128 2-CTA pair tiles above (the
-out-proj pair tile is the TMA-epilogue twin `m_tma1`); the residual / pos
+out-proj pair tile is the TMA-epilogue twin `m_tma1` up to 8191 rows and the
+256x256 eight-warp TMA-epilogue tile `l_e8_tma1x` from 8192 rows,
+`cake_backend.WO_PAIR_BANDS`; the FC1 forms take that tile with its half-N
+tail, `l_e8_tma1x_h`, at the token counts of `cake_backend.FC1_TMA_WINDOWS`);
+the residual / pos
 forms run their packed bf16x2-epilogue twins `*_p` / `*_pf` with the
 pre-mainloop residual prefetch, the QKV GEMM its packed-RoPE-table twins
 `*_cs`; the half-N tail twins `*_h` (`cake_backend.HALF_TWIN`,
@@ -53,11 +57,12 @@ lists every logical kernel the plan rule can select per architecture (the
 GEMM tile / PDL census, the attention-form census over single segments up to
 70016 tokens and the exported rows, the merge kernels).  The export registers
 the programs its rows launch: the 22 rows of the evaluation contract (the
-acceptance denominator) plus six export-only *coverage* rows
+acceptance denominator) plus eleven export-only *coverage* rows
 (`COVERAGE_ROW_GRIDS`; validated bitwise against the source tower, not part
 of the acceptance geomean) that reach the keys no contract row exercises
-(half-N twins at token counts outside the rows, the plain two-tile form on
-SM100, the plain / split one-tile forms on SM103) -- so every reachable key is
+(for example half-N twins at token counts outside the rows, the out-proj
+`m_tma1` tile below 8192 rows, the plain two-tile form on SM100, the plain /
+split one-tile forms on SM103) -- so every reachable key is
 registered and `UNCOVERED_KERNEL_KEYS` is empty.  The check stays: a
 `grid_thws` batch whose plan resolves to an unregistered key raises
 `NotImplementedError` naming the missing keys -- it is never served by another
@@ -65,9 +70,9 @@ binary.
 
 Programmatic dependent launch: the registered programs follow the Cake
 production PDL default (`KIMI_K3_VISION_TOWER_PDL`, on since the round-2
-route), so every binding launches its kernel with the
-programmatic-stream-serialization attribute (owned by the generated binding,
-not by this host code): the kernel
+route), so the shared launcher launches every kernel with the
+programmatic-stream-serialization attribute (owned by the generated launcher
+source, not by this host code): the kernel
 runs its mbarrier / TMEM prologue while the previous launch drains, waits on
 `griddepcontrol.wait` before touching a route buffer and signals
 `launch_dependents` before its epilogue. The host launch sequence is the same
@@ -133,13 +138,25 @@ allocation in `launch()`. Benchmark against the HF torch chain with the
 FlashInfer ragged BF16 attention route:
 `benchmarks/bench_cake_kimi_k3_vision_tower.py`.
 
-The generated sources under `csrc/cake_kimi_k3_vision_tower/` and the
-`MODULES` / `ARG_PLANS` / `KERNELS` registries in `cake_jit.py` are written by
-the Cake generated-program export; do not edit them by hand. One source pair
-is one program, built for every architecture it lists (`MODULES[name]["arches"]`)
-with FlashInfer's exact `sm100a` / `sm103a` flag set of the device it runs on;
-the attention kernels are separate programs per architecture (SM103 drains the
-scores with `tcgen05.ld.red`), and the plain one-tile / two-tile-split attention
-forms exist on SM103 only because the plan rule selects them there alone. On a
-device without a registered program the entry points raise
-`NotImplementedError`.
+The sources under `csrc/` are Cake exporter output (`.clang-format` disables
+formatting there so they stay byte-faithful to the export): one kernel source
+per program under `csrc/cake_kimi_k3_vision_tower/` (`*_kernel.cu`), the
+TVM-FFI launch bindings (`*_binding.cu`, 23 sources shared by the 81
+programs), the shared device header
+`cake_kimi_k3_vision_tower_device_common.cuh`, the device helper headers under
+`csrc/cake_device_helpers/` and `csrc/cake_ffi_checks.h`. `build.json` lists
+one library per program and architecture (its sources with their SHA-256,
+nvcc flags and the architecture's gencode); `cake_build.py` serves a library
+from `aot/` when a builder has compiled it from the manifest and otherwise
+builds it through FlashInfer's JIT from the same sources and flags.
+`cake_jit.py` registers the programs: one `_PROGRAMS` row per program
+(architectures, argument plan, launch values), the `ARG_PLANS`, and the
+`KERNELS` table both architectures share plus the per-architecture entries (4
+SM103-only keys), expanded into `MODULES` / `KERNELS` at import.
+A program built for both architectures whose SM100 and SM103 text differ is
+one source with compile-time architecture arms (`#if __CUDA_ARCH__ == 1000`:
+SM100 text first). The KV-split ring3 attention form is one program per
+architecture (its SM103 build merges the K/V parts in the kernel), and the
+plain one-tile / two-tile-split attention forms exist on SM103 only because
+the plan rule selects them there alone. On a device without a registered
+program the entry points raise `NotImplementedError`.

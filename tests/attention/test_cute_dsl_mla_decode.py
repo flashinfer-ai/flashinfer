@@ -1168,8 +1168,15 @@ def test_mla_split_kv_cap():
         48,
         48,
     ]
-    assert _get_split_kv_and_workspace_size(1, 8, 12, 512, 212)[0] == 48
-    assert _get_split_kv_and_workspace_size(2, 1, 128, 512, 212)[0] == 48
+    # Above the static cap the reducer grows to the covering power of two, up to 128.
+    assert [_get_reducer_max_splits(s) for s in (53, 104, 128)] == [64, 128, 128]
+    # One or two work units may split past 48 so every 2-CTA cluster stays busy.
+    assert _get_split_kv_and_workspace_size(1, 8, 12, 512, 212)[0] == 106
+    assert _get_split_kv_and_workspace_size(1, 8, 12, 512, 148)[0] == 74
+    assert _get_split_kv_and_workspace_size(1, 8, 12, 512, 1024)[0] == 128
+    assert _get_split_kv_and_workspace_size(2, 1, 128, 512, 212)[0] == 53
+    # Three or more work units keep the static cap.
+    assert _get_split_kv_and_workspace_size(3, 1, 128, 512, 288)[0] == 48
     assert _get_split_kv_and_workspace_size(4, 1, 128, 512, 212)[0] == 26
     # A known short max_seq_len still trims empty splits.
     assert (

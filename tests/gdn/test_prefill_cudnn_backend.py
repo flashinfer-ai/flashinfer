@@ -773,6 +773,10 @@ def test_cudnn_backend_rejects_context_parallel():
 @pytest.mark.parametrize("raw_gate", [False, True])
 @pytest.mark.parametrize("beta_dtype", [torch.float32, torch.bfloat16])
 def test_gdn_raw_and_log_gates_match_recurrence(backend, raw_gate, beta_dtype):
+    cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+    if backend == "flashinfer" and cuda_major < 13:
+        pytest.skip("Native Blackwell GDN prefill requires CUDA 13+")
+
     inputs = _make_inputs([65, 127], 4, 4, 8, seed=29, initial_state=True)
     raw = torch.randn(192, 8, device="cuda", dtype=torch.bfloat16)
     a_log = torch.linspace(-1, 1, 8, device="cuda")

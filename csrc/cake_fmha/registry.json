@@ -489,8 +489,8 @@
             "RETURN_LSE": 0
           },
           "sources": {
-            "sm_100a": "cuda/context_bf16/sm_100a/enable_sink0_is_causal0_return_lse0.cu",
-            "sm_103a": "cuda/context_bf16/sm_103a/enable_sink0_is_causal0_return_lse0.cu"
+            "sm_100a": "cuda/context_bf16/default.cu",
+            "sm_103a": "cuda/context_bf16/default.cu"
           }
         },
         {
@@ -500,8 +500,8 @@
             "RETURN_LSE": 0
           },
           "sources": {
-            "sm_100a": "cuda/context_bf16/sm_100a/enable_sink1_is_causal0_return_lse0.cu",
-            "sm_103a": "cuda/context_bf16/sm_103a/enable_sink1_is_causal0_return_lse0.cu"
+            "sm_100a": "cuda/context_bf16/default.cu",
+            "sm_103a": "cuda/context_bf16/default.cu"
           }
         },
         {
@@ -511,8 +511,8 @@
             "RETURN_LSE": 1
           },
           "sources": {
-            "sm_100a": "cuda/context_bf16/sm_100a/enable_sink0_is_causal0_return_lse1.cu",
-            "sm_103a": "cuda/context_bf16/sm_103a/enable_sink0_is_causal0_return_lse1.cu"
+            "sm_100a": "cuda/context_bf16/default.cu",
+            "sm_103a": "cuda/context_bf16/default.cu"
           }
         },
         {
@@ -522,8 +522,8 @@
             "RETURN_LSE": 0
           },
           "sources": {
-            "sm_100a": "cuda/context_bf16/sm_100a/enable_sink0_is_causal1_return_lse0.cu",
-            "sm_103a": "cuda/context_bf16/sm_103a/enable_sink0_is_causal1_return_lse0.cu"
+            "sm_100a": "cuda/context_bf16/default.cu",
+            "sm_103a": "cuda/context_bf16/default.cu"
           }
         },
         {
@@ -533,8 +533,8 @@
             "RETURN_LSE": 0
           },
           "sources": {
-            "sm_100a": "cuda/context_bf16/sm_100a/enable_sink1_is_causal1_return_lse0.cu",
-            "sm_103a": "cuda/context_bf16/sm_103a/enable_sink1_is_causal1_return_lse0.cu"
+            "sm_100a": "cuda/context_bf16/default.cu",
+            "sm_103a": "cuda/context_bf16/default.cu"
           }
         },
         {
@@ -544,8 +544,8 @@
             "RETURN_LSE": 1
           },
           "sources": {
-            "sm_100a": "cuda/context_bf16/sm_100a/enable_sink0_is_causal1_return_lse1.cu",
-            "sm_103a": "cuda/context_bf16/sm_103a/enable_sink0_is_causal1_return_lse1.cu"
+            "sm_100a": "cuda/context_bf16/default.cu",
+            "sm_103a": "cuda/context_bf16/default.cu"
           }
         },
         {
@@ -847,8 +847,8 @@
             "RETURN_LSE": 0
           },
           "sources": {
-            "sm_100a": "cuda/context_fp8/enable_sink0_is_causal0_return_lse0.cu",
-            "sm_103a": "cuda/context_fp8/enable_sink0_is_causal0_return_lse0.cu"
+            "sm_100a": "cuda/context_fp8/default.cu",
+            "sm_103a": "cuda/context_fp8/default.cu"
           }
         },
         {
@@ -858,8 +858,8 @@
             "RETURN_LSE": 0
           },
           "sources": {
-            "sm_100a": "cuda/context_fp8/enable_sink1_is_causal0_return_lse0.cu",
-            "sm_103a": "cuda/context_fp8/enable_sink1_is_causal0_return_lse0.cu"
+            "sm_100a": "cuda/context_fp8/default.cu",
+            "sm_103a": "cuda/context_fp8/default.cu"
           }
         },
         {
@@ -869,8 +869,8 @@
             "RETURN_LSE": 1
           },
           "sources": {
-            "sm_100a": "cuda/context_fp8/enable_sink0_is_causal0_return_lse1.cu",
-            "sm_103a": "cuda/context_fp8/enable_sink0_is_causal0_return_lse1.cu"
+            "sm_100a": "cuda/context_fp8/default.cu",
+            "sm_103a": "cuda/context_fp8/default.cu"
           }
         },
         {
@@ -880,8 +880,8 @@
             "RETURN_LSE": 0
           },
           "sources": {
-            "sm_100a": "cuda/context_fp8/enable_sink0_is_causal1_return_lse0.cu",
-            "sm_103a": "cuda/context_fp8/enable_sink0_is_causal1_return_lse0.cu"
+            "sm_100a": "cuda/context_fp8/default.cu",
+            "sm_103a": "cuda/context_fp8/default.cu"
           }
         },
         {
@@ -891,8 +891,8 @@
             "RETURN_LSE": 0
           },
           "sources": {
-            "sm_100a": "cuda/context_fp8/enable_sink1_is_causal1_return_lse0.cu",
-            "sm_103a": "cuda/context_fp8/enable_sink1_is_causal1_return_lse0.cu"
+            "sm_100a": "cuda/context_fp8/default.cu",
+            "sm_103a": "cuda/context_fp8/default.cu"
           }
         },
         {
@@ -902,8 +902,8 @@
             "RETURN_LSE": 1
           },
           "sources": {
-            "sm_100a": "cuda/context_fp8/enable_sink0_is_causal1_return_lse1.cu",
-            "sm_103a": "cuda/context_fp8/enable_sink0_is_causal1_return_lse1.cu"
+            "sm_100a": "cuda/context_fp8/default.cu",
+            "sm_103a": "cuda/context_fp8/default.cu"
           }
         }
       ],
@@ -1232,18 +1232,18 @@
       "launch_binding": "cake_fmha_launch_decode_balanced_bf16",
       "parameters": [
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "Qt"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -1328,8 +1328,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16/default.cu"
+            "sm_100a": "cuda/decode_balanced_16bit/default.cu",
+            "sm_103a": "cuda/decode_balanced_16bit/default.cu"
           }
         }
       ],
@@ -1341,18 +1341,18 @@
       "launch_binding": "cake_fmha_launch_decode_balanced_bf16_hd256_p16",
       "parameters": [
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "Qt"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -1437,8 +1437,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16_hd256_p16/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16_hd256_p16/default.cu"
+            "sm_100a": "cuda/decode_balanced_hd256/default.cu",
+            "sm_103a": "cuda/decode_balanced_hd256/default.cu"
           }
         }
       ],
@@ -1450,18 +1450,18 @@
       "launch_binding": "cake_fmha_launch_decode_balanced_bf16_hd256_p32",
       "parameters": [
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "Qt"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -1546,8 +1546,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16_hd256_p32/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16_hd256_p32/default.cu"
+            "sm_100a": "cuda/decode_balanced_hd256/default.cu",
+            "sm_103a": "cuda/decode_balanced_hd256/default.cu"
           }
         }
       ],
@@ -1559,18 +1559,18 @@
       "launch_binding": "cake_fmha_launch_decode_balanced_bf16_hd256_p64",
       "parameters": [
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "Qt"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -1655,8 +1655,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16_hd256_p64/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16_hd256_p64/default.cu"
+            "sm_100a": "cuda/decode_balanced_hd256/default.cu",
+            "sm_103a": "cuda/decode_balanced_hd256/default.cu"
           }
         }
       ],
@@ -1664,22 +1664,22 @@
     },
     "decode_balanced_bf16_hd64": {
       "binding_source": "bindings/cake_fmha_decode_balanced_bf16_hd64_binding.cu",
-      "dynamic_shared_memory_bytes": 117760,
+      "dynamic_shared_memory_bytes": 159616,
       "launch_binding": "cake_fmha_launch_decode_balanced_bf16_hd64",
       "parameters": [
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "Qt"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -1764,8 +1764,117 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16_hd64/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16_hd64/default.cu"
+            "sm_100a": "cuda/decode_balanced_hd64/default.cu",
+            "sm_103a": "cuda/decode_balanced_hd64/default.cu"
+          }
+        }
+      ],
+      "threads": 512
+    },
+    "decode_balanced_bf16_hd64_g16": {
+      "binding_source": "bindings/cake_fmha_decode_balanced_bf16_hd64_g16_binding.cu",
+      "dynamic_shared_memory_bytes": 159616,
+      "launch_binding": "cake_fmha_launch_decode_balanced_bf16_hd64_g16",
+      "parameters": [
+        {
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
+          "name": "Qt"
+        },
+        {
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
+          "name": "K"
+        },
+        {
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
+          "name": "V"
+        },
+        {
+          "ctype": "__nv_bfloat16*",
+          "kind": "pointer",
+          "name": "O_ptr"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "page_table"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "seq_lens_kv"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_o"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_stats"
+        },
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "tile_counters"
+        },
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "queue_counters"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "max_pages_per_seq"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "softmax_scale_log2"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_q_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_kv_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "group_ratio"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "batch_size"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "q_len"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "max_items"
+        }
+      ],
+      "parametric_axes": [],
+      "public_symbol": "kernel_cake_fmha_decode_balanced_bf16_hd64_g16",
+      "source_family": [
+        {
+          "selector": {},
+          "sources": {
+            "sm_100a": "cuda/decode_balanced_hd64/default.cu",
+            "sm_103a": "cuda/decode_balanced_hd64/default.cu"
           }
         }
       ],
@@ -1777,18 +1886,18 @@
       "launch_binding": "cake_fmha_launch_decode_balanced_bf16_mtp_n32",
       "parameters": [
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "Q"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -1868,8 +1977,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16_mtp_n32/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16_mtp_n32/default.cu"
+            "sm_100a": "cuda/decode_balanced_mtp/default.cu",
+            "sm_103a": "cuda/decode_balanced_mtp/default.cu"
           }
         }
       ],
@@ -1881,18 +1990,18 @@
       "launch_binding": "cake_fmha_launch_decode_balanced_bf16_mtp_n64",
       "parameters": [
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "Q"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -1972,8 +2081,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16_mtp_n64/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16_mtp_n64/default.cu"
+            "sm_100a": "cuda/decode_balanced_mtp/default.cu",
+            "sm_103a": "cuda/decode_balanced_mtp/default.cu"
           }
         }
       ],
@@ -1990,13 +2099,13 @@
           "name": "Qt"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -2086,8 +2195,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16q/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16q/default.cu"
+            "sm_100a": "cuda/decode_balanced_q16bit/default.cu",
+            "sm_103a": "cuda/decode_balanced_q16bit/default.cu"
           }
         }
       ],
@@ -2099,18 +2208,18 @@
       "launch_binding": "cake_fmha_launch_decode_balanced_fp16",
       "parameters": [
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "Qt"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -2195,8 +2304,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_fp16/default.cu",
-            "sm_103a": "cuda/decode_balanced_fp16/default.cu"
+            "sm_100a": "cuda/decode_balanced_16bit/default.cu",
+            "sm_103a": "cuda/decode_balanced_16bit/default.cu"
           }
         }
       ],
@@ -2208,18 +2317,18 @@
       "launch_binding": "cake_fmha_launch_decode_balanced_fp16_mtp_n32",
       "parameters": [
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "Q"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -2299,8 +2408,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_fp16_mtp_n32/default.cu",
-            "sm_103a": "cuda/decode_balanced_fp16_mtp_n32/default.cu"
+            "sm_100a": "cuda/decode_balanced_mtp/default.cu",
+            "sm_103a": "cuda/decode_balanced_mtp/default.cu"
           }
         }
       ],
@@ -2312,18 +2421,18 @@
       "launch_binding": "cake_fmha_launch_decode_balanced_fp16_mtp_n64",
       "parameters": [
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "Q"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -2403,8 +2512,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_fp16_mtp_n64/default.cu",
-            "sm_103a": "cuda/decode_balanced_fp16_mtp_n64/default.cu"
+            "sm_100a": "cuda/decode_balanced_mtp/default.cu",
+            "sm_103a": "cuda/decode_balanced_mtp/default.cu"
           }
         }
       ],
@@ -2421,13 +2530,13 @@
           "name": "Qt"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -2517,8 +2626,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_fp16q/default.cu",
-            "sm_103a": "cuda/decode_balanced_fp16q/default.cu"
+            "sm_100a": "cuda/decode_balanced_q16bit/default.cu",
+            "sm_103a": "cuda/decode_balanced_q16bit/default.cu"
           }
         }
       ],
@@ -2530,18 +2639,18 @@
       "launch_binding": "cake_fmha_launch_decode_balanced_fp8",
       "parameters": [
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "Qt"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -2772,8 +2881,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16/has_sink0_has_window0_retain_kv_l20_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_bf16/has_sink0_has_window0_retain_kv_l20_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_bf16/default.cu",
+            "sm_103a": "cuda/decode_native_bf16/default.cu"
           }
         },
         {
@@ -2784,8 +2893,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16/has_sink0_has_window0_retain_kv_l21_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_bf16/has_sink0_has_window0_retain_kv_l21_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_bf16/default.cu",
+            "sm_103a": "cuda/decode_native_bf16/default.cu"
           }
         },
         {
@@ -2796,8 +2905,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16/has_sink0_has_window0_retain_kv_l20_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_bf16/has_sink0_has_window0_retain_kv_l20_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_bf16/default.cu",
+            "sm_103a": "cuda/decode_native_bf16/default.cu"
           }
         },
         {
@@ -2808,8 +2917,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16/has_sink0_has_window0_retain_kv_l21_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_bf16/has_sink0_has_window0_retain_kv_l21_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_bf16/default.cu",
+            "sm_103a": "cuda/decode_native_bf16/default.cu"
           }
         },
         {
@@ -2820,8 +2929,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16/has_sink0_has_window1_retain_kv_l20_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_bf16/has_sink0_has_window1_retain_kv_l20_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_bf16/default.cu",
+            "sm_103a": "cuda/decode_native_bf16/default.cu"
           }
         },
         {
@@ -2832,8 +2941,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16/has_sink0_has_window1_retain_kv_l21_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_bf16/has_sink0_has_window1_retain_kv_l21_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_bf16/default.cu",
+            "sm_103a": "cuda/decode_native_bf16/default.cu"
           }
         },
         {
@@ -2844,8 +2953,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16/has_sink1_has_window0_retain_kv_l21_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_bf16/has_sink1_has_window0_retain_kv_l21_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_bf16/default.cu",
+            "sm_103a": "cuda/decode_native_bf16/default.cu"
           }
         },
         {
@@ -2856,8 +2965,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16/has_sink1_has_window0_retain_kv_l20_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_bf16/has_sink1_has_window0_retain_kv_l20_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_bf16/default.cu",
+            "sm_103a": "cuda/decode_native_bf16/default.cu"
           }
         },
         {
@@ -2868,8 +2977,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16/has_sink1_has_window0_retain_kv_l21_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_bf16/has_sink1_has_window0_retain_kv_l21_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_bf16/default.cu",
+            "sm_103a": "cuda/decode_native_bf16/default.cu"
           }
         },
         {
@@ -2880,8 +2989,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16/has_sink1_has_window1_retain_kv_l20_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_bf16/has_sink1_has_window1_retain_kv_l20_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_bf16/default.cu",
+            "sm_103a": "cuda/decode_native_bf16/default.cu"
           }
         },
         {
@@ -2892,8 +3001,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16/has_sink1_has_window1_retain_kv_l21_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_bf16/has_sink1_has_window1_retain_kv_l21_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_bf16/default.cu",
+            "sm_103a": "cuda/decode_native_bf16/default.cu"
           }
         },
         {
@@ -3058,11 +3167,11 @@
           "launch_override": {
             "by_arch": {
               "sm_100a": {
-                "binding_source": "bindings/cake_fmha_decode_native_bf16_sink_peer_clc_sm_100a_binding.cu",
+                "binding_source": "bindings/cake_fmha_decode_native_bf16_sink_peer_clc_binding.cu",
                 "dynamic_shared_memory_bytes": 178176
               },
               "sm_103a": {
-                "binding_source": "bindings/cake_fmha_decode_native_bf16_sink_peer_clc_sm_103a_binding.cu",
+                "binding_source": "bindings/cake_fmha_decode_native_bf16_sink_peer_clc_binding.cu",
                 "dynamic_shared_memory_bytes": 210944
               }
             },
@@ -3300,8 +3409,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n32_p16/default.cu",
-            "sm_103a": "cuda/decode_native_bf16_hd256_smallm_n32_p16/default.cu"
+            "sm_100a": "cuda/decode_native_bf16_hd256_smallm/default.cu",
+            "sm_103a": "cuda/decode_native_bf16_hd256_smallm/default.cu"
           }
         }
       ],
@@ -3426,8 +3535,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n32_p32/default.cu",
-            "sm_103a": "cuda/decode_native_bf16_hd256_smallm_n32_p32/default.cu"
+            "sm_100a": "cuda/decode_native_bf16_hd256_smallm/default.cu",
+            "sm_103a": "cuda/decode_native_bf16_hd256_smallm/default.cu"
           }
         }
       ],
@@ -3552,8 +3661,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n32_p64/default.cu",
-            "sm_103a": "cuda/decode_native_bf16_hd256_smallm_n32_p64/default.cu"
+            "sm_100a": "cuda/decode_native_bf16_hd256_smallm/default.cu",
+            "sm_103a": "cuda/decode_native_bf16_hd256_smallm/default.cu"
           }
         }
       ],
@@ -3678,8 +3787,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n64_p16/default.cu",
-            "sm_103a": "cuda/decode_native_bf16_hd256_smallm_n64_p16/default.cu"
+            "sm_100a": "cuda/decode_native_bf16_hd256_smallm/default.cu",
+            "sm_103a": "cuda/decode_native_bf16_hd256_smallm/default.cu"
           }
         }
       ],
@@ -3804,8 +3913,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n64_p32/default.cu",
-            "sm_103a": "cuda/decode_native_bf16_hd256_smallm_n64_p32/default.cu"
+            "sm_100a": "cuda/decode_native_bf16_hd256_smallm/default.cu",
+            "sm_103a": "cuda/decode_native_bf16_hd256_smallm/default.cu"
           }
         }
       ],
@@ -3930,8 +4039,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n64_p64/default.cu",
-            "sm_103a": "cuda/decode_native_bf16_hd256_smallm_n64_p64/default.cu"
+            "sm_100a": "cuda/decode_native_bf16_hd256_smallm/default.cu",
+            "sm_103a": "cuda/decode_native_bf16_hd256_smallm/default.cu"
           }
         }
       ],
@@ -4065,8 +4174,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l20_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l20_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_fp16_hd512/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_hd512/default.cu"
           }
         },
         {
@@ -4076,8 +4185,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l21_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l21_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_fp16_hd512/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_hd512/default.cu"
           }
         },
         {
@@ -4087,8 +4196,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l20_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l20_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_fp16_hd512/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_hd512/default.cu"
           }
         },
         {
@@ -4098,8 +4207,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l21_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l21_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_fp16_hd512/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_hd512/default.cu"
           }
         },
         {
@@ -4109,8 +4218,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l20_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l20_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_fp16_hd512/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_hd512/default.cu"
           }
         },
         {
@@ -4120,8 +4229,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l21_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l21_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_fp16_hd512/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_hd512/default.cu"
           }
         },
         {
@@ -4131,8 +4240,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l20_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l20_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_fp16_hd512/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_hd512/default.cu"
           }
         },
         {
@@ -4142,8 +4251,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l21_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l21_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_fp16_hd512/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_hd512/default.cu"
           }
         }
       ],
@@ -4283,8 +4392,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l20_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l20_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4295,8 +4404,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l21_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l21_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4307,8 +4416,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l20_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l20_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4319,8 +4428,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l21_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l21_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4331,8 +4440,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l20_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l20_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4343,8 +4452,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l21_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l21_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4355,8 +4464,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l20_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l20_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4367,8 +4476,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l21_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l21_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4379,8 +4488,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l20_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l20_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4391,8 +4500,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l21_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l21_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4403,8 +4512,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l20_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l20_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4415,8 +4524,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l21_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l21_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4427,8 +4536,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l20_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l20_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4439,8 +4548,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l21_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l21_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4451,8 +4560,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l20_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l20_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4463,8 +4572,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l21_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l21_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         }
       ],
@@ -4592,8 +4701,8 @@
             "PAGE_SIZE": 16
           },
           "sources": {
-            "sm_100a": "cuda/decode_quant_bf16q/page_size16.cu",
-            "sm_103a": "cuda/decode_quant_bf16q/page_size16.cu"
+            "sm_100a": "cuda/decode_quant_bf16q/default.cu",
+            "sm_103a": "cuda/decode_quant_bf16q/default.cu"
           }
         },
         {
@@ -4601,8 +4710,8 @@
             "PAGE_SIZE": 32
           },
           "sources": {
-            "sm_100a": "cuda/decode_quant_bf16q/page_size32.cu",
-            "sm_103a": "cuda/decode_quant_bf16q/page_size32.cu"
+            "sm_100a": "cuda/decode_quant_bf16q/default.cu",
+            "sm_103a": "cuda/decode_quant_bf16q/default.cu"
           }
         }
       ],
@@ -4731,8 +4840,8 @@
             "PAGE_SIZE": 16
           },
           "sources": {
-            "sm_100a": "cuda/decode_quant_fp8/sm_100a/full_blocks1_page_size16.cu",
-            "sm_103a": "cuda/decode_quant_fp8/sm_103a/full_blocks1_page_size16.cu"
+            "sm_100a": "cuda/decode_quant_fp8/default.cu",
+            "sm_103a": "cuda/decode_quant_fp8/default.cu"
           }
         },
         {
@@ -4741,8 +4850,8 @@
             "PAGE_SIZE": 32
           },
           "sources": {
-            "sm_100a": "cuda/decode_quant_fp8/sm_100a/full_blocks1_page_size32.cu",
-            "sm_103a": "cuda/decode_quant_fp8/sm_103a/full_blocks1_page_size32.cu"
+            "sm_100a": "cuda/decode_quant_fp8/default.cu",
+            "sm_103a": "cuda/decode_quant_fp8/default.cu"
           }
         }
       ],
@@ -4929,8 +5038,8 @@
             "PAGE_SIZE": 16
           },
           "sources": {
-            "sm_100a": "cuda/decode_quant_nvfp4/page_size16.cu",
-            "sm_103a": "cuda/decode_quant_nvfp4/page_size16.cu"
+            "sm_100a": "cuda/decode_quant_nvfp4/default.cu",
+            "sm_103a": "cuda/decode_quant_nvfp4/default.cu"
           }
         },
         {
@@ -4938,8 +5047,8 @@
             "PAGE_SIZE": 32
           },
           "sources": {
-            "sm_100a": "cuda/decode_quant_nvfp4/page_size32.cu",
-            "sm_103a": "cuda/decode_quant_nvfp4/page_size32.cu"
+            "sm_100a": "cuda/decode_quant_nvfp4/default.cu",
+            "sm_103a": "cuda/decode_quant_nvfp4/default.cu"
           }
         }
       ],
@@ -5300,7 +5409,11 @@
       "components": [
         {
           "component": "decode_balanced_bf16_hd64",
-          "condition": "always"
+          "condition": "num_qo_heads // num_kv_heads <= 8"
+        },
+        {
+          "component": "decode_balanced_bf16_hd64_g16",
+          "condition": "9 <= num_qo_heads // num_kv_heads <= 16"
         }
       ],
       "standalone_ready": true,

@@ -16,20 +16,46 @@
 
 // Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
 #include "cake_dsa_indexer_topk_device_common.cuh"
+// The common preamble's fallback helper this module's helper library does not provide; the shared
+// header carries another member's library definition of the name (kept translation-unit-local).
+__device__ __forceinline__ int make_warp_uniform(int x) {
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
+}
+
 #include <cub/block/block_radix_sort.cuh>
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_SCRATCH_OFF 0
+#ifndef SMEM_SCRATCH_STAGE_BYTES
 #define SMEM_SCRATCH_STAGE_BYTES 4096
+#endif
+#ifndef SMEM_SCRATCH_STRIDE
 #define SMEM_SCRATCH_STRIDE 4096
+#endif
+#ifndef SMEM_TOTAL
 #define SMEM_TOTAL 4096
+#endif
+#ifndef THREADS
 #define THREADS 32
+#endif
+
+// Shared by every build.json entry that names this translation unit in its sources: the entry's -D
+// defines select the thread count and scratch constants (SMEM_SCRATCH_STAGE_BYTES /
+// SMEM_SCRATCH_STRIDE / SMEM_TOTAL / THREADS; the guarded defaults above are this file's own
+// values) and the kernel symbol (-DCAKE_PROGRAM_KERNEL=<its own symbol>; every library of the
+// family exports a distinct kernel); without them the defaults name this file's own program.
+#ifndef CAKE_PROGRAM_KERNEL
+#define CAKE_PROGRAM_KERNEL kernel_cake_dsa_indexer_topk_e1e316281190b2a3203b
+#endif
 
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_cake_dsa_indexer_topk_e1e316281190b2a3203b(int* __restrict__ Indices, float* __restrict__ Scores, int top_k, int key_bits)
+CAKE_PROGRAM_KERNEL(int* __restrict__ Indices, float* __restrict__ Scores, int top_k, int key_bits)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);

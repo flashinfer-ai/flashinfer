@@ -58,11 +58,20 @@ def pytest_configure(config: pytest.Config) -> None:
     )
     config.addinivalue_line(
         "markers",
-        "solo: run every node from this source without overlapping another local unit",
+        "node_exclusive: run this whole file alone across the allocation, after "
+        "parallel work, with all GPUs visible; use only for allocation-wide "
+        "requirements such as multi-GPU execution or host-memory OOM risk",
     )
     config.addinivalue_line(
         "markers",
-        "long_running: dispatch every unit from this source before normal work",
+        "long_running: prioritize runnable units from this source over normal work",
+    )
+    config.addinivalue_line(
+        "markers", "gpu_exclusive: run this source alone on its assigned GPU"
+    )
+    config.addinivalue_line(
+        "markers",
+        "host_memory_heavy: serialize this source with other host-heavy sources",
     )
     session_start = time.time()
     state = {
@@ -89,15 +98,25 @@ def _marker_name(item: pytest.Item) -> str | None:
 def pytest_collection_modifyitems(
     config: pytest.Config, items: list[pytest.Item]
 ) -> None:
-    solo_sources = {
+    node_exclusive_sources = {
         Path(str(item.path)).resolve()
         for item in items
-        if item.get_closest_marker("solo") is not None
+        if item.get_closest_marker("node_exclusive") is not None
     }
     long_running_sources = {
         Path(str(item.path)).resolve()
         for item in items
         if item.get_closest_marker("long_running") is not None
+    }
+    gpu_exclusive_sources = {
+        Path(str(item.path)).resolve()
+        for item in items
+        if item.get_closest_marker("gpu_exclusive") is not None
+    }
+    host_memory_heavy_sources = {
+        Path(str(item.path)).resolve()
+        for item in items
+        if item.get_closest_marker("host_memory_heavy") is not None
     }
     collected = []
     for order, item in enumerate(items):
@@ -114,8 +133,10 @@ def pytest_collection_modifyitems(
                 base_function=node.base_function,
                 order=node.order,
                 shard_group=node.shard_group,
-                solo=item_path in solo_sources,
+                node_exclusive=item_path in node_exclusive_sources,
                 long_running=item_path in long_running_sources,
+                gpu_exclusive=item_path in gpu_exclusive_sources,
+                host_memory_heavy=item_path in host_memory_heavy_sources,
             )
         )
     collection_path = config.getoption("--flashinfer-collection-json")

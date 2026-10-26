@@ -11,6 +11,7 @@ from typing import Callable, Literal, Optional, Tuple
 
 import torch
 
+from flashinfer.moe_ep._compat import deprecated_aliases
 from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
     _CompiledMega,
     _compute_peer_offsets,
@@ -22,6 +23,10 @@ from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
 )
 
 
+@deprecated_aliases(
+    apply_topk_in_fc1="apply_routing_weights_before_fc2",
+    defer_topk_reduce="use_custom_finalize",
+)
 @dataclasses.dataclass(frozen=True)
 class MegaMoEBf16Nvfp4Config:
     """Compile-time and launch-time W4A16 MegaMoE configuration."""
@@ -48,15 +53,23 @@ class MegaMoEBf16Nvfp4Config:
         "epi_warps", "standalone_warps", "reuse_dispatch_warps"
     ] = "epi_warps"
     gate_up_clamp: Optional[float] = None
-    apply_topk_in_fc1: bool = False
+    apply_routing_weights_before_fc2: bool = False
     enable_iket: bool = False
     swiglu_alpha: Optional[float] = None
     swiglu_beta: Optional[float] = None
     activation: Literal["swiglu", "situ"] = "swiglu"
     situ_beta: Optional[float] = None
     situ_linear_beta: Optional[float] = None
+    use_custom_finalize: bool = False
 
     def __post_init__(self) -> None:
+        if self.use_custom_finalize and (
+            self.enable_in_kernel_fc2_reduce or self.in_kernel_fc2_reduce
+        ):
+            raise ValueError(
+                "use_custom_finalize requires enable_in_kernel_fc2_reduce=False "
+                "and in_kernel_fc2_reduce=False."
+            )
         if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
             raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
         if self.activation not in ("swiglu", "situ"):
@@ -110,13 +123,15 @@ class MegaMoEBf16Nvfp4Config:
         if self.intermediate % 64:
             raise ValueError("intermediate must be divisible by 64.")
         if self.mma_tiler_mnk not in (
+            (128, 32, 256),
             (128, 64, 256),
             (128, 128, 256),
+            (256, 32, 256),
             (256, 64, 256),
             (256, 128, 256),
         ):
             raise ValueError(
-                "W4A16 MegaMoE requires mma_tiler_mnk=M128/M256, N64/N128, K256."
+                "W4A16 MegaMoE requires M128/N32,N64,N128 or M256/N32,N64,N128, K256."
             )
         if self.cluster_shape_mnk != (2, 1, 1) and not (
             self.cluster_shape_mnk == (1, 1, 1) and self.mma_tiler_mnk == (128, 64, 256)
@@ -196,19 +211,23 @@ class MegaMoEBf16Nvfp4Frontend:
                 f"unsupported BF16/NVFP4 MegaMoE knobs {knobs}: "
                 f"{tuner.describe_invalid_knobs(self.config, knobs, tuner.is_valid_bf16_nvfp4_for_config)}."
             )
+        tuner.reject_explicit_knobs(knobs)
         # Numerical behavior belongs to the session, not the tuner.
         new_config = with_knobs(
             self.config,
             {
                 **knobs,
                 "gate_up_clamp": self.config.gate_up_clamp,
-                "apply_topk_in_fc1": self.config.apply_topk_in_fc1,
+                "apply_routing_weights_before_fc2": (
+                    self.config.apply_routing_weights_before_fc2
+                ),
                 "enable_in_kernel_fc2_reduce": self.config.enable_in_kernel_fc2_reduce,
                 "swiglu_alpha": self.config.swiglu_alpha,
                 "swiglu_beta": self.config.swiglu_beta,
                 "activation": self.config.activation,
                 "situ_beta": self.config.situ_beta,
                 "situ_linear_beta": self.config.situ_linear_beta,
+                "use_custom_finalize": self.config.use_custom_finalize,
             },
         )
         if new_config != self._config:
@@ -243,6 +262,7 @@ class MegaMoEBf16Nvfp4Frontend:
         if self._mega is None:
             ensure_not_capturing("cute.compile + symmetric-heap allocation")
             import cutlass
+
             from .megamoe_kernel import Sm100W4A16MegaMoEKernel
 
             c = self.config
@@ -275,7 +295,7 @@ class MegaMoEBf16Nvfp4Frontend:
                 epi_flag_batch=c.epi_flag_batch,
                 flag_batch=c.flag_batch,
                 gate_up_clamp=c.gate_up_clamp,
-                apply_topk_in_fc1=c.apply_topk_in_fc1,
+                apply_routing_weights_before_fc2=(c.apply_routing_weights_before_fc2),
                 swiglu_alpha=c.swiglu_alpha,
                 swiglu_beta=c.swiglu_beta,
                 situ_beta=c.situ_beta,
@@ -404,6 +424,7 @@ class MegaMoEBf16Nvfp4Frontend:
         self, inputs: MegaMoEBf16Nvfp4Inputs, mega: _CompiledMega
     ) -> dict:
         import cuda.bindings.driver as cuda
+
         from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import SymBufferHost
 
         c = self.config
@@ -624,7 +645,10 @@ class MegaMoEBf16Nvfp4Frontend:
                 "combine_output must be CUDA BF16 with the expected shape."
             )
         output = inputs.reduced_output
-        if c.in_kernel_fc2_reduce:
+        if c.use_custom_finalize:
+            if output is not None:
+                raise ValueError("use_custom_finalize does not use reduced_output.")
+        elif c.in_kernel_fc2_reduce:
             if output is not None:
                 raise ValueError("in_kernel_fc2_reduce does not use reduced_output.")
         elif (
@@ -645,12 +669,13 @@ class MegaMoEBf16Nvfp4Frontend:
         # have no local rows to reduce and must not launch a zero-block grid.
         if output.shape[0] == 0:
             return
-        import cutlass.cute as cute
         import cuda.bindings.driver as cuda
+        import cutlass.cute as cute
+
         from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
-            get_cutedsl_target_arch,
-            TopkReduce,
             CombineFormat,
+            TopkReduce,
+            get_cutedsl_target_arch,
         )
 
         def compact(tensor):
@@ -662,7 +687,7 @@ class MegaMoEBf16Nvfp4Frontend:
             compact(combined),
             None,
             compact(output),
-            None if self.config.apply_topk_in_fc1 else compact(scores),
+            (None if self.config.apply_routing_weights_before_fc2 else compact(scores)),
             cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         )
         if self._reduce is None:
@@ -700,6 +725,8 @@ class MegaMoEBf16Nvfp4SymmBuffer:
     )
     fc1_norm_const: Optional[torch.Tensor] = None
     _use_fc1_norm_const: bool = False
+    _unfinalized_route_map: torch.Tensor | None = None
+    _unfinalized_weights: torch.Tensor | None = None
 
     @property
     def kernel_combine_output(self) -> torch.Tensor:
@@ -712,6 +739,8 @@ class MegaMoEBf16Nvfp4SymmBuffer:
     def destroy(self) -> None:
         if not self._destroyed:
             self._staging_inputs = None
+            self._unfinalized_route_map = None
+            self._unfinalized_weights = None
             self._frontend.release()
             for root in self._sym_roots:
                 free_sym_tensor(root)
@@ -722,6 +751,10 @@ class MegaMoEBf16Nvfp4SymmBuffer:
 TransformedWeights = Tuple[torch.Tensor, torch.Tensor]
 
 
+@deprecated_aliases(
+    apply_topk_in_fc1="apply_routing_weights_before_fc2",
+    defer_topk_reduce="use_custom_finalize",
+)
 def get_symm_buffer_for_bf16_nvfp4_mega_moe(
     num_total_experts: int,
     num_max_tokens: int,
@@ -734,7 +767,7 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
     enable_in_kernel_fc2_reduce: bool = False,
-    apply_topk_in_fc1: bool = False,
+    apply_routing_weights_before_fc2: bool = False,
     fc1_alpha: torch.Tensor | int | float | None = None,
     fc2_alpha: torch.Tensor | int | float | None = None,
     token_back_mode: Optional[
@@ -747,6 +780,7 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
     activation: Literal["swiglu", "situ"] = "swiglu",
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
+    use_custom_finalize: bool = False,
 ) -> MegaMoEBf16Nvfp4SymmBuffer:
     """Allocate stable per-expert scales and BF16 transport buffers.
 
@@ -757,6 +791,8 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
     Later omission retains the last staged normalization. A captured graph
     retains its normalization mode; enabling it requires warmup and recapture.
     A normalized graph observes in-place updates to its captured source tensor.
+    ``use_custom_finalize=True`` exposes BF16 per-route rows for caller finalization
+    and requires in-kernel FC2 reduction to be disabled.
     """
     clamp = resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
@@ -783,6 +819,7 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
         activation=activation,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        use_custom_finalize=use_custom_finalize,
     )
 
     # Match the existing Mega cache contract: None is a pure capacity-keyed
@@ -798,22 +835,25 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
             max_tokens=num_max_tokens,
             combine_dtype="bf16",
             enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
-            apply_topk_in_fc1=apply_topk_in_fc1,
+            apply_routing_weights_before_fc2=(apply_routing_weights_before_fc2),
+            use_custom_finalize=use_custom_finalize,
         )
     else:
         resolved_knobs = {}
+    tuner.reject_explicit_knobs(knobs)
     optional_config = {
         **resolved_knobs,
         **({"token_back_mode": token_back_mode} if token_back_mode is not None else {}),
         **(knobs or {}),
         "gate_up_clamp": clamp,
         "enable_in_kernel_fc2_reduce": enable_in_kernel_fc2_reduce,
-        "apply_topk_in_fc1": apply_topk_in_fc1,
+        "apply_routing_weights_before_fc2": apply_routing_weights_before_fc2,
         "swiglu_alpha": swiglu_alpha,
         "swiglu_beta": swiglu_beta,
         "activation": activation,
         "situ_beta": situ_beta,
         "situ_linear_beta": situ_linear_beta,
+        "use_custom_finalize": use_custom_finalize,
     }
     if not tuner.is_valid_bf16_nvfp4_for_config(cfg, optional_config):
         raise ValueError(
@@ -861,7 +901,7 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
 
 
 def bf16_nvfp4_mega_moe(
-    y: torch.Tensor,
+    y: Optional[torch.Tensor],
     transformed_l1: TransformedWeights,
     transformed_l2: TransformedWeights,
     symm_buffer: MegaMoEBf16Nvfp4SymmBuffer,
@@ -872,14 +912,25 @@ def bf16_nvfp4_mega_moe(
     sync: bool = False,
     swiglu_alpha: Optional[float] = None,
     swiglu_beta: Optional[float] = None,
-) -> None:
+) -> Optional[torch.Tensor]:
+    """Run W4A16 MegaMoE, returning per-route rows in deferred mode.
+
+    Deferred workspaces require ``y=None``; otherwise ``y`` receives the
+    finalized output. Returned partials borrow the symmetric workspace.
+    """
     if symm_buffer._destroyed:
         raise RuntimeError("symm_buffer.destroy() was already called.")
     n = symm_buffer.num_max_tokens if num_tokens is None else num_tokens
-    if y.shape != (n, symm_buffer.hidden) or y.dtype != torch.bfloat16:
-        raise ValueError(f"y must be bfloat16 with shape ({n}, {symm_buffer.hidden}).")
-    if not y.is_cuda or not y.is_contiguous():
-        raise ValueError("y must be a contiguous CUDA tensor.")
+    if symm_buffer._frontend.config.use_custom_finalize:
+        if y is not None:
+            raise ValueError("use_custom_finalize=True requires y=None.")
+    else:
+        if y is None or y.shape != (n, symm_buffer.hidden) or y.dtype != torch.bfloat16:
+            raise ValueError(
+                f"y must be bfloat16 with shape ({n}, {symm_buffer.hidden})."
+            )
+        if not y.is_cuda or not y.is_contiguous():
+            raise ValueError("y must be a contiguous CUDA tensor.")
     clamp = resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
     )
@@ -906,9 +957,11 @@ def bf16_nvfp4_mega_moe(
         num_tokens=n,
     )
     if symm_buffer._frontend.config.in_kernel_fc2_reduce:
+        assert y is not None
         y.copy_(result[:, 0])
     if sync:
         torch.cuda.synchronize()
+    return result if symm_buffer._frontend.config.use_custom_finalize else None
 
 
 def bf16_nvfp4_mega_launch_thunk(
@@ -917,7 +970,10 @@ def bf16_nvfp4_mega_launch_thunk(
     symm_buffer: MegaMoEBf16Nvfp4SymmBuffer,
 ) -> Callable[[], None]:
     reduced_output = None
-    if not symm_buffer._frontend.config.in_kernel_fc2_reduce:
+    if not (
+        symm_buffer._frontend.config.in_kernel_fc2_reduce
+        or symm_buffer._frontend.config.use_custom_finalize
+    ):
         ensure_not_capturing("launch thunk output allocation")
         # Keep this raw-core thunk compute-only while sharing the Tensor signature.
         reduced_output = torch.empty(

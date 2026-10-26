@@ -31,9 +31,12 @@ from typing import Any, Literal, Optional, Tuple
 
 import torch
 
+from flashinfer.moe_ep._compat import deprecated_aliases
+
 from . import comm
 from .dependencies import require_sm107_dsl
 from .kernel_helpers import Mxfp8BlockSize, Nvfp4BlockSize, swizzled_flat_sf_size
+from .tuning_state import AutoTuningState
 
 Sm107QuantKind = Literal["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"]
 Sm107TokenBackMode = Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"]
@@ -51,6 +54,8 @@ _KIND_TABLE: dict = {
 }
 
 TransformedBlockScaledWeights = Tuple[torch.Tensor, torch.Tensor]
+
+_SCALAR_NAMES = ("fc1_alpha", "fc2_alpha", "fc1_norm_const")
 
 
 def _require_sm107() -> None:
@@ -115,6 +120,7 @@ def _max_active_clusters(cluster_size: int) -> int:
     return cached
 
 
+@deprecated_aliases(apply_topk_at_fc1="apply_routing_weights_before_fc2")
 @dataclasses.dataclass(frozen=True)
 class Sm107BlockScaledMoeConfig:
     """Validated construction parameters for Rubin inference and GenPhase."""
@@ -145,7 +151,7 @@ class Sm107BlockScaledMoeConfig:
     gate_up_clamp: Optional[float] = None
     reduce_topk_in_kernel: bool = False
     token_back_mode: Sm107TokenBackMode = "epi_warps"
-    apply_topk_at_fc1: bool = True
+    apply_routing_weights_before_fc2: bool = True
     max_sm_count: Optional[int] = None
     activation: Literal["swiglu", "situ"] = "swiglu"
     situ_beta: Optional[float] = None
@@ -199,7 +205,11 @@ class Sm107BlockScaledMoeConfig:
                 raise ValueError(f"{name} must be a positive Python integer.")
         if type(self.rank) is not int or not (0 <= self.rank < self.world_size):
             raise ValueError(f"invalid rank/world_size {self.rank}/{self.world_size}.")
-        for name in ("fc2_use_bulk", "reduce_topk_in_kernel", "apply_topk_at_fc1"):
+        for name in (
+            "fc2_use_bulk",
+            "reduce_topk_in_kernel",
+            "apply_routing_weights_before_fc2",
+        ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a Python bool.")
         if self.num_total_experts > 16384:
@@ -355,24 +365,48 @@ class Sm107BlockScaledMoeConfig:
                 f"fc2_tma_stages must be in [1, {tiler[1] // 64}] for tiler N "
                 f"{tiler[1]}."
             )
-        if self.reduce_topk_in_kernel and not self.apply_topk_at_fc1:
+        if self.reduce_topk_in_kernel and not self.apply_routing_weights_before_fc2:
             raise ValueError(
-                "reduce_topk_in_kernel requires apply_topk_at_fc1=True (the "
-                "in-kernel reduce red-adds already-weighted terms)."
+                "reduce_topk_in_kernel requires "
+                "apply_routing_weights_before_fc2=True (the in-kernel reduce "
+                "red-adds already-weighted terms)."
             )
 
         if self.kernel_variant == "genphase":
             if self.padded_tokens_per_rank > 1024:
                 raise ValueError("GenPhase supports at most 1024 tokens per rank.")
+            n64_decode = (
+                self.cluster_shape_mn in ((2, 1), (4, 1))
+                and tiler == (256, 64, 128)
+                and (
+                    self.quant_kind == "mxfp8_e4m3"
+                    or (
+                        self.quant_kind == "mxfp4_mxfp8"
+                        and self.cluster_shape_mn == (4, 1)
+                    )
+                )
+            )
             if (
-                self.cluster_shape_mn != (4, 1)
-                or self.fallback_cluster_shape_mn is not None
-            ):
-                raise ValueError("GenPhase requires uniform cluster_shape_mn=(4, 1).")
+                self.cluster_shape_mn != (4, 1) and not n64_decode
+            ) or self.fallback_cluster_shape_mn is not None:
+                raise ValueError(
+                    "GenPhase requires uniform cluster (4, 1), or an admitted N64 decode geometry at (2, 1) or (4, 1)."
+                )
             if not self.fc2_use_bulk:
                 raise ValueError("GenPhase requires fc2_use_bulk=True.")
-            if tiler[1] not in (128, 256):
-                raise ValueError("GenPhase requires tile N 128 or 256.")
+            if tiler[1] not in (128, 256) and not n64_decode:
+                raise ValueError(
+                    "GenPhase requires tile N 128 or 256, or an admitted N64 decode geometry."
+                )
+            if n64_decode and self.world_size > 1 and mode == "phase_interleave":
+                # EP1 phase-interleave coverage does not establish multirank
+                # liveness: an EP2 dense/replay case stalls with this geometry.
+                # Reject before allocation or compilation; autotune applies
+                # this same config validation through is_valid_sm107.
+                raise ValueError(
+                    "GenPhase N64 with world_size > 1 requires grouped scheduling; "
+                    "multirank phase_interleave is not qualified."
+                )
             if tiler[2] != 2 * instruction_k:
                 raise ValueError(
                     f"GenPhase {self.quant_kind} requires tile K {2 * instruction_k} "
@@ -466,8 +500,9 @@ class Sm107BlockScaledSymmBuffer:
             (tokens, cfg.num_topk), -1, dtype=torch.int32, device="cuda"
         )
         # Stable local-expert pointers allow per-call scaling updates in graphs.
-        # Defaults and overrides are copied on every backend staging call.
-        for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
+        # Per-call tensors are bound as launch arguments (bind_scalars); other
+        # values and defaults are copied in by the backend staging call.
+        for name in _SCALAR_NAMES:
             setattr(
                 self,
                 name,
@@ -480,6 +515,17 @@ class Sm107BlockScaledSymmBuffer:
         if self.topk_idx.data_ptr() % 16 != 0:
             raise RuntimeError("routing index tensor must be 16-byte aligned.")
 
+        self._allocate_execution_state()
+        self._staged_tokens: Optional[int] = None
+        self._destroyed = False
+        self._tuning_state = AutoTuningState()
+        self._routing_checks: dict[tuple, Any] = {}
+        # Missing scalar bindings use the workspace's own tensors.
+        self._bound_scalars: dict = {}
+
+    def _allocate_execution_state(self) -> None:
+        cfg, kernel = self.config, self.kernel
+        tokens = cfg.padded_tokens_per_rank
         # In-kernel reduce: the combine peer-writes (red.add) each topk term
         # straight into the output, so it must live on the SYMMETRIC heap and
         # start zeroed; the separate-reduce path only sees local stores.
@@ -540,14 +586,11 @@ class Sm107BlockScaledSymmBuffer:
         self._launch_weights: Optional[
             Tuple[TransformedBlockScaledWeights, TransformedBlockScaledWeights]
         ] = None
-        self._staged_tokens: Optional[int] = None
-        self._destroyed = False
 
     @staticmethod
     def _build_kernel(cfg: Sm107BlockScaledMoeConfig):
         import cutlass
         from cutlass.cute.nvgpu import OperandMajorMode
-
         from sources import RubinInferenceGenphaseMegaMoE, RubinInferenceMegaMoE
         from sources.api import ImplDesc, ProblemDesc
         from sources.quant_def import CombineFormat
@@ -614,7 +657,7 @@ class Sm107BlockScaledSymmBuffer:
                 "topk": cfg.num_topk,
                 "topk_index_dtype": cutlass.Int32,
                 "max_tokens_per_rank": cfg.padded_tokens_per_rank,
-                "apply_topk_at_fc1": cfg.apply_topk_at_fc1,
+                "apply_topk_at_fc1": cfg.apply_routing_weights_before_fc2,
             }
         )
         impl_fields = {
@@ -655,6 +698,24 @@ class Sm107BlockScaledSymmBuffer:
     def staged_tokens(self) -> Optional[int]:
         return self._staged_tokens
 
+    def bind_scalars(self, values: dict) -> None:
+        """Bind per-call NVFP4 scalar tensors (``fc1_alpha`` / ``fc2_alpha`` /
+        ``fc1_norm_const``: contiguous fp32 ``[experts_per_rank]`` CUDA tensors) as
+        the launch arguments, instead of copying them into the workspace tensors
+        every call. ``None`` (or a missing name) selects the workspace tensor.
+        The tensors must stay alive while launches (or captured graphs) use them."""
+        bound = {}
+        for name in _SCALAR_NAMES:
+            value = values.get(name)
+            if value is not None:
+                bound[name] = value
+        self._bound_scalars = bound
+
+    def _scalar_tensor(self, name: str):
+        bound = getattr(self, "_bound_scalars", None) or {}
+        value = bound.get(name)
+        return value if value is not None else getattr(self, name)
+
     def _peer_mapper(self):
         from sources.communication.nvlink_domain.symmetric_buffer import (
             SymmetricBufferHost,
@@ -688,18 +749,18 @@ class Sm107BlockScaledSymmBuffer:
             "peer_rank_ptr_mapper_host": self._peer_mapper(),
             "stream": _cu_stream(stream),
             **{
-                name: _to_cute(getattr(self, name), assumed_align=4)
-                for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const")
+                name: _to_cute(self._scalar_tensor(name), assumed_align=4)
+                for name in _SCALAR_NAMES
                 if self.config.quant_kind == "nvfp4"
             },
         }
 
-    def launch(
+    def prepare(
         self,
         transformed_l1: TransformedBlockScaledWeights,
         transformed_l2: TransformedBlockScaledWeights,
     ) -> None:
-        """Compile on first use, then launch the fused mega kernel."""
+        """Compile and bind the selected kernel without launching it."""
         import cutlass.cute as cute
 
         if self._destroyed:
@@ -716,6 +777,13 @@ class Sm107BlockScaledSymmBuffer:
             transformed_l1[1].data_ptr(),
             transformed_l2[0].data_ptr(),
             transformed_l2[1].data_ptr(),
+            # Bound per-call scalars: a new tensor re-binds the launch arguments
+            # (host-only, no recompile).
+            *(
+                self._scalar_tensor(name).data_ptr()
+                for name in _SCALAR_NAMES
+                if self.config.quant_kind == "nvfp4"
+            ),
             torch.cuda.current_stream().cuda_stream,
         )
         if self._compiled is None or self._launch_key != key:
@@ -730,10 +798,20 @@ class Sm107BlockScaledSymmBuffer:
             self._launch_kwargs = kwargs
             # Keep pointers alive until the cached bindings are replaced.
             self._launch_weights = (transformed_l1, transformed_l2)
+
+    def launch(
+        self,
+        transformed_l1: TransformedBlockScaledWeights,
+        transformed_l2: TransformedBlockScaledWeights,
+    ) -> None:
+        """Compile on first use, then launch the fused mega kernel."""
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            self._tuning_state.graph_captured = True
+        self.prepare(transformed_l1, transformed_l2)
         if self.config.reduce_topk_in_kernel:
             # red.add accumulation base: zero the output every launch.
             self.output_activation.zero_()
-        else:
+        elif not getattr(self.kernel, "masks_invalid_combine_slots", False):
             # Invalid routes do not write a combine slot. Clear those slots on
             # every launch so a masked route cannot reuse an earlier result.
             invalid = (self.topk_idx < 0) | (
@@ -748,31 +826,70 @@ class Sm107BlockScaledSymmBuffer:
                 )
         self._compiled(**self._launch_kwargs)
 
+    def _release_execution_state(self) -> None:
+        self._compiled = None
+        self._launch_kwargs = None
+        self._launch_weights = None
+        self._launch_key = None
+        self._pre_reduced_activation = None
+        self._pre_reduced_activation_sf = None
+        comm.free_sym_tensor(getattr(self, "shared_workspace", None))
+        if self.config.reduce_topk_in_kernel:
+            comm.free_sym_tensor(self.output_activation)
+        self.output_activation = None
+        self.shared_workspace = None
+        self.local_workspace = None
+
+    def install_tuned_knobs(
+        self,
+        knobs: dict[str, Any],
+        transformed_l1: TransformedBlockScaledWeights,
+        transformed_l2: TransformedBlockScaledWeights,
+    ) -> None:
+        """Replace output and scratch before capture, retaining staged inputs."""
+        import dataclasses
+
+        comm.ensure_not_capturing("SM107 tuning winner installation")
+        if self._destroyed or self._tuning_state.graph_captured:
+            raise RuntimeError("cannot tune a destroyed or captured SM107 workspace")
+        config = dataclasses.replace(self.config, **knobs)
+        if config != self.config:
+            kernel = self._build_kernel(config)
+            sf_cols = int(
+                kernel.token_comm.plain_activation_sf_row_elements
+                if config.kernel_variant == "genphase"
+                else kernel.token_comm.activation_sf_hidden_padded
+            )
+            if sf_cols != self.sf_cols:
+                raise ValueError("tuning cannot change the staged scale layout")
+            torch.cuda.synchronize()
+            self._release_execution_state()
+            self.config, self.kernel = config, kernel
+            self._allocate_execution_state()
+        self.prepare(transformed_l1, transformed_l2)
+
     def destroy(self) -> None:
         if self._destroyed:
             return
         comm.ensure_not_capturing("SM107 mega workspace free")
-        # nvshmem free is collective and does not wait for in-flight work;
-        # drain this rank's device before releasing symmetric memory that a
-        # still-running launch (ours or a peer's dispatch pull) may touch.
+        # Symmetric free is collective and does not wait for in-flight kernels.
         torch.cuda.synchronize()
-        self._compiled = None
-        self._launch_kwargs = None
-        self._launch_weights = None
-        self._pre_reduced_activation = None
-        self._pre_reduced_activation_sf = None
-        for name in ("x", "x_sf", "topk_weights", "shared_workspace"):
+        self._release_execution_state()
+        self._routing_checks.clear()
+        self._bound_scalars = {}
+        for name in ("x", "x_sf", "topk_weights"):
             comm.free_sym_tensor(getattr(self, name, None))
             setattr(self, name, None)
-        if self.config.reduce_topk_in_kernel:
-            comm.free_sym_tensor(self.output_activation)
-        self.output_activation = None
-        self.local_workspace = None
+        if self.config.quant_kind == "nvfp4":
+            from ....sm100.cutedsl_megamoe.shim.quant_stage import forget_staged_tokens
+
+            forget_staged_tokens(self.topk_idx)
         self.topk_idx = None
         self.fc1_alpha = self.fc2_alpha = self.fc1_norm_const = None
         self._destroyed = True
 
 
+@deprecated_aliases(apply_topk_at_fc1="apply_routing_weights_before_fc2")
 def get_symm_buffer_for_sm107_block_scaled_mega_moe(
     num_total_experts: int,
     num_max_tokens: int,
@@ -799,7 +916,7 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
     gate_up_clamp: Optional[float] = None,
     reduce_topk_in_kernel: bool = False,
     token_back_mode: Sm107TokenBackMode = "epi_warps",
-    apply_topk_at_fc1: bool = True,
+    apply_routing_weights_before_fc2: bool = True,
     max_sm_count: Optional[int] = None,
     activation: Literal["swiglu", "situ"] = "swiglu",
     situ_beta: Optional[float] = None,
@@ -836,7 +953,7 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
         gate_up_clamp=gate_up_clamp,
         reduce_topk_in_kernel=reduce_topk_in_kernel,
         token_back_mode=token_back_mode,
-        apply_topk_at_fc1=apply_topk_at_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         max_sm_count=max_sm_count,
         activation=activation,
         situ_beta=situ_beta,

@@ -2518,12 +2518,12 @@ def prepare_cute_dsl_weights(
     device: Optional[torch.device] = None,
     nvfp4_4over6: Optional[NVFP44Over6Config] = None,
 ) -> Dict[str, torch.Tensor]:
-    """Build the CuteDSL FP4 ``cute_dsl`` weight view.
+    """Build the CuteDSL ``cute_dsl`` weight view.
 
     Gemm1 weights get the linear/gate interleave only for gated activations;
     non-gated ones (ReLU2) skip it and keep their ``[E, I, H]`` rows as-is.
-    ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, or NVFP4×BF16 (CuTe-DSL W4A16).
-    Starts from the same canonical bf16 expert weights as
+    ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, MXFP8×MXFP8, or NVFP4×BF16
+    (CuTe-DSL W4A16). Starts from the same canonical bf16 expert weights as
     :func:`prepare_trtllm_fp4_weights`, so a single weight set can feed both
     backends and a shared reference.
 
@@ -2551,15 +2551,17 @@ def prepare_cute_dsl_weights(
     """
     from ..cute_dsl.utils import convert_sf_to_mma_layout
     from ..fp4_quantization import fp4_quantize
+    from ..quantization.fp8_quantization import mxfp8_quantize
     from .api import QuantFormat
 
     allowed = {
         (QuantFormat.NVFP4, QuantFormat.NVFP4),
         (QuantFormat.MXFP4, QuantFormat.MXFP8),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8),
         (QuantFormat.NVFP4, QuantFormat.BF16),
     }
     if quant.pair not in allowed:
-        raise ValueError(f"CuTe-DSL FP4 weight preparation does not support {quant!r}")
+        raise ValueError(f"CuTe-DSL weight preparation does not support {quant!r}")
 
     if device is None:
         device = w1_bf16.device
@@ -2569,11 +2571,27 @@ def prepare_cute_dsl_weights(
     w2_bf16 = w2_bf16.to(device)
 
     is_mxfp4 = quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
-    if is_mxfp4 and (hidden_size % 128 or intermediate_size % 128):
+    is_mxfp8 = quant.pair == (QuantFormat.MXFP8, QuantFormat.MXFP8)
+    if (is_mxfp4 or is_mxfp8) and (hidden_size % 128 or intermediate_size % 128):
         raise ValueError(
-            "CuTe-DSL MXFP4 requires hidden and intermediate sizes divisible by 128"
+            f"CuTe-DSL {quant.weight.name} requires hidden and intermediate sizes "
+            "divisible by 128"
         )
-    sf_vec_size = 32 if is_mxfp4 else 16
+    sf_vec_size = 32 if is_mxfp4 or is_mxfp8 else 16
+    # FP4 packs two elements per byte; MXFP8 weights are one E4M3 byte each.
+    elems_per_byte = 1 if is_mxfp8 else 2
+
+    def quantize(flat: torch.Tensor):
+        if is_mxfp8:
+            return mxfp8_quantize(flat, is_sf_swizzled_layout=True)
+        return fp4_quantize(
+            flat,
+            global_scale=gs,
+            sf_vec_size=sf_vec_size,
+            sf_use_ue8m0=is_mxfp4,
+            is_sf_swizzled_layout=True,
+        )
+
     gs = torch.tensor([1.0], device=device, dtype=torch.float32)
 
     activation = _normalize_activation(activation)
@@ -2584,14 +2602,10 @@ def prepare_cute_dsl_weights(
         else w1_bf16
     )
     w1_flat = w1_interleaved.view(num_local_experts * gemm1_rows, hidden_size)
-    w1_q_flat, w1_sf_flat = fp4_quantize(
-        w1_flat,
-        global_scale=gs,
-        sf_vec_size=sf_vec_size,
-        sf_use_ue8m0=is_mxfp4,
-        is_sf_swizzled_layout=True,
+    w1_q_flat, w1_sf_flat = quantize(w1_flat)
+    w1_weight = w1_q_flat.view(
+        num_local_experts, gemm1_rows, hidden_size // elems_per_byte
     )
-    w1_weight = w1_q_flat.view(num_local_experts, gemm1_rows, hidden_size // 2)
     w1_weight_sf = convert_sf_to_mma_layout(
         w1_sf_flat,
         m=gemm1_rows,
@@ -2601,14 +2615,10 @@ def prepare_cute_dsl_weights(
     )
 
     w2_flat = w2_bf16.view(num_local_experts * hidden_size, intermediate_size)
-    w2_q_flat, w2_sf_flat = fp4_quantize(
-        w2_flat,
-        global_scale=gs,
-        sf_vec_size=sf_vec_size,
-        sf_use_ue8m0=is_mxfp4,
-        is_sf_swizzled_layout=True,
+    w2_q_flat, w2_sf_flat = quantize(w2_flat)
+    w2_weight = w2_q_flat.view(
+        num_local_experts, hidden_size, intermediate_size // elems_per_byte
     )
-    w2_weight = w2_q_flat.view(num_local_experts, hidden_size, intermediate_size // 2)
     w2_weight_sf = convert_sf_to_mma_layout(
         w2_sf_flat,
         m=hidden_size,
@@ -2626,7 +2636,7 @@ def prepare_cute_dsl_weights(
         "w2_weight_sf": w2_weight_sf,
         "w2_alpha": ones,
     }
-    if not is_mxfp4:
+    if not (is_mxfp4 or is_mxfp8):
         # A pinned recipe fixes the GEMM2-input scale to 1 / (6 * e4m3_max).
         # w2_bf16 is passed for its device only.
         nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
@@ -2834,9 +2844,8 @@ def _checked_cudnn_grouped_gemm_weights(
     alignment: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Validate canonical BF16 expert weights (``w1 [E, 2*I | I, H]`` in
-    ``[up, gate]`` order, ``w2 [E, H, I]``) and return them on ``device``,
-    gated fc1 rows reordered to ``[gate, up]``. ``w2`` aliases the input when it
-    is already contiguous there.
+    ``[up, gate]`` order, ``w2 [E, H, I]``) and return them on ``device``; each
+    aliases its input when it is already contiguous there.
     """
     if w1_bf16.ndim != 3 or w2_bf16.ndim != 3:
         raise ValueError(
@@ -2854,13 +2863,6 @@ def _checked_cudnn_grouped_gemm_weights(
         alignment=alignment if alignment > 1 else None,
         device=device,
     )
-    if _normalize_activation(activation).is_gated:
-        # [up, gate] -> [gate, up] as two strided copies; a torch.cat of the
-        # halves runs several times slower.
-        reordered = torch.empty(w1.shape, dtype=w1.dtype, device=device)
-        reordered[:, :intermediate_size].copy_(w1[:, intermediate_size:])
-        reordered[:, intermediate_size:].copy_(w1[:, :intermediate_size])
-        w1 = reordered
     return w1, w2
 
 
@@ -2877,11 +2879,11 @@ def prepare_cudnn_grouped_gemm_bf16_weights(
     """Build the weight view consumed by ``CudnnGroupedGemmBf16Runner``.
 
     Returns ``{"fc1_expert_weights", "fc2_expert_weights"}``: the two
-    ``grouped_mm_bf16`` operands, contiguous BF16 on ``device``
-    (``fc2_expert_weights`` aliases ``w2_bf16`` when it already is). GEMM1 computes
+    ``grouped_mm_bf16`` operands, contiguous BF16 on ``device`` (each aliases its
+    input when it already is). GEMM1 computes
     ``permuted_tokens @ fc1_expert_weights[e].T`` and GEMM2 computes
-    ``intermediate @ fc2_expert_weights[e].T``.
-    For gated activations the ``fc1_expert_weights`` rows are in ``[gate, up]`` order.
+    ``intermediate @ fc2_expert_weights[e].T``. Gated ``fc1_expert_weights`` rows
+    keep the canonical ``[up, gate]`` order.
     """
     w1, w2 = _checked_cudnn_grouped_gemm_weights(
         w1_bf16,
@@ -2915,8 +2917,8 @@ def prepare_cudnn_grouped_gemm_fp8_per_tensor_weights(
     ``fc1_dequant_scale = fc1_dequant / hidden_states_scale_global``,
     ``fc2_act_quant_scale = intermediate_scale_global`` and
     ``fc2_dequant_scale = fc2_dequant / intermediate_scale_global``. The
-    unfolded values stay in the view as calibration metadata.
-    For gated activations the ``fc1_expert_weights`` rows are in ``[gate, up]`` order.
+    unfolded values stay in the view as calibration metadata. Gated
+    ``fc1_expert_weights`` rows keep the canonical ``[up, gate]`` order.
     """
     w1, w2 = _checked_cudnn_grouped_gemm_weights(
         w1_bf16,
@@ -3029,8 +3031,8 @@ def prepare_cudnn_grouped_gemm_mxfp8_weights(
     / ``fc2_expert_weights`` (E4M3, same shapes as the BF16 view) and
     ``fc1_weight_scale`` / ``fc2_weight_scale`` (``uint8 [E_local, n, k // 32]``
     swizzled 128x4 block scales). ``hidden_size`` and ``intermediate_size``
-    must be multiples of 128.
-    For gated activations the ``fc1_expert_weights`` rows are in ``[gate, up]`` order.
+    must be multiples of 128. Gated ``fc1_expert_weights`` rows keep the
+    canonical ``[up, gate]`` order.
     """
     w1, w2 = _checked_cudnn_grouped_gemm_weights(
         w1_bf16,
@@ -3176,8 +3178,8 @@ def prepare_cudnn_grouped_gemm_nvfp4_weights(
     (``float8_e4m3fn [E_local, n, k // 16]`` swizzled 128x4 block scales) and
     ``fc1_dequant`` / ``fc2_dequant`` (``float32 [E_local]``, the inverse global
     scale the runner applies per output row). ``hidden_size`` and
-    ``intermediate_size`` must be multiples of 128.
-    For gated activations the ``fc1_expert_weights`` rows are in ``[gate, up]`` order.
+    ``intermediate_size`` must be multiples of 128. Gated ``fc1_expert_weights``
+    rows keep the canonical ``[up, gate]`` order.
     """
     w1, w2 = _checked_cudnn_grouped_gemm_weights(
         w1_bf16,

@@ -16,11 +16,11 @@
 namespace flashinfer::sparse_mla_sm120::execution {
 
 inline AttentionMetadata unpack_metadata(const ffi::Array<int64_t>& d, size_t i = 0) {
-  TVM_FFI_ICHECK_EQ(d.size() - i, 18) << "attention metadata ABI mismatch";
+  TVM_FFI_ICHECK_EQ(d.size() - i, 19) << "attention metadata ABI mismatch";
   for (size_t j = i; j < d.size(); ++j) {
     TVM_FFI_ICHECK_GE(d[j], 0) << "negative attention metadata";
     const auto field = j - i;
-    if (field != 7 && field != 8 && field != 10 && field != 11 && field != 12)
+    if (field != 7 && field != 8 && field != 10 && field != 11 && field != 12 && field != 18)
       TVM_FFI_ICHECK_LE(d[j], INT_MAX) << "attention metadata integer range";
     if (field >= 13 && field <= 16) TVM_FFI_ICHECK_LE(d[j], 1);
   }
@@ -28,7 +28,7 @@ inline AttentionMetadata unpack_metadata(const ffi::Array<int64_t>& d, size_t i 
           int(d[i + 4]),     int(d[i + 5]),   int(d[i + 6]),     size_t(d[i + 7]),
           size_t(d[i + 8]),  int(d[i + 9]),   size_t(d[i + 10]), size_t(d[i + 11]),
           size_t(d[i + 12]), bool(d[i + 13]), bool(d[i + 14]),   bool(d[i + 15]),
-          bool(d[i + 16]),   int(d[i + 17])};
+          bool(d[i + 16]),   int(d[i + 17]),  size_t(d[i + 18])};
 }
 
 inline ffi::Array<int64_t> pack_metadata(const AttentionMetadata& m) {
@@ -49,7 +49,8 @@ inline ffi::Array<int64_t> pack_metadata(const AttentionMetadata& m) {
           m.has_extra_lengths,
           m.has_sink,
           m.extra_fp4,
-          m.variant};
+          m.variant,
+          int64_t(m.extra_row_stride_bytes)};
 }
 
 class AttentionPlanObj : public ffi::ModuleObj {
