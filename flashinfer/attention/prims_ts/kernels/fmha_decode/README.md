@@ -255,18 +255,16 @@ tiles) as FMA polynomials to offload MUFU. SM103, with twice the MUFU ex2 rate,
 keeps every exponential on MUFU, and its unmasked max pass takes fragment maxima
 (or Sage scale-group maxima) from LDTM.STAT instead of a register reduction.
 
-SM107 uses native EX2. Pass `arch_config_args(compute_capability,
-expanded_resources=True)` as generator config arguments to select the larger
-limits from the architecture: 576 TMEM columns and 327 KiB SMEM on SM107,
-requiring CUDA 13.4 with native DSL 4.8 support. Explicit
-`max_tmem_alloc_cols` / `smem_capacity_kib` overrides remain tuning budgets,
-distinct from the 512-column non-exclusive TMEM allocation limit. Automatic
-plans retain the 512-column/227-KiB budgets because expanded profiles can
-improve domain-local launches while slowing ordinary placement. Memory
-placement is not a configuration or dispatch input.
+SM107 uses native EX2 and automatically selects its 576-column TMEM and
+327-KiB SMEM budgets through `arch_config_args(compute_capability)`, requiring
+CUDA 13.4 with native DSL 4.8 support. Explicit `max_tmem_alloc_cols` /
+`smem_capacity_kib` overrides remain tuning budgets, distinct from the
+512-column non-exclusive TMEM allocation limit. Lower 512-column/227-KiB
+budgets remain available for tuning ordinary placement, where larger profiles
+can be slower. Memory placement is not a configuration or dispatch input.
 
-For homogeneous FP8 Q/K/V/output, opting into 327 KiB selects the following
-long-KV, nonsplit pipeline defaults. KV depth counts raw K/V slots in total;
+For homogeneous FP8 Q/K/V/output, SM107 selects the following long-KV,
+nonsplit pipeline defaults. KV depth counts raw K/V slots in total;
 staged one-instance Keeps uses eight slots per operand for depth sixteen.
 These paired defaults apply when both depths are unspecified. Setting either
 Q or KV depth retains the existing manual-profile inference for the other.

@@ -1571,7 +1571,7 @@ class FmhaDecodeConfig:
     # Reduce streamed score-fragment maxima inside the TMEM load
     # (tcgen05.ld.red); ``arch_config_args`` supplies it.
     uses_ldtm_stat: bool = False
-    # Explicit SM107 resource limits; automatic plans retain SM100 budgets.
+    # Architecture resource budgets; raw configs retain SM100 defaults.
     # TMEM accepts 512/576 columns and SMEM accepts 227/327 KiB.
     max_tmem_alloc_cols: int = TMEM_MAX_NON_EXCLUSIVE_COLUMNS
     smem_capacity_kib: int = SMEM_CAPACITY_KIB
@@ -3472,7 +3472,7 @@ def _set_if_implicit(
 
 
 def sm107_fp8_pipeline_profile(cfg: FmhaDecodeConfig) -> tuple[int, int] | None:
-    """Return opt-in long-KV Q/KV depths for the physical decode layout.
+    """Return SM107 long-KV Q/KV depths for the physical decode layout.
 
     These expanded-resource profiles target nonsplit throughput. Split-KV,
     sparse and Sage retain their own defaults and resource lifetimes.
@@ -5546,9 +5546,7 @@ def round_tmem_columns(
     return allocation
 
 
-def arch_config_args(
-    compute_capability: tuple[int, int], *, expanded_resources: bool = False
-) -> dict[str, object]:
+def arch_config_args(compute_capability: tuple[int, int]) -> dict[str, object]:
     """Return the config fields whose value depends on the GPU architecture.
 
     SM100 runs three eighths of the streamed exponentials of KV128 tiles (a
@@ -5562,18 +5560,15 @@ def arch_config_args(
     register reduction; the context kernel shares that gate. SM107 also uses
     native EX2 because the emulation adds instructions on its tested FP8 paths.
 
-    ``expanded_resources`` selects the architecture's larger resource budget.
-    It is opt-in because its tuned profiles can slow ordinary placement; the
-    default retains the conservative allocation budgets on every architecture.
+    SM107 always uses its larger resource budgets. Callers can still supply
+    explicit lower budgets or manual pipeline depths for workload tuning.
     """
     native_ex2 = tuple(compute_capability) in ((10, 3), (10, 7))
     args = {
         "ex2_emulated_pairs": 0 if native_ex2 else 6,
         "uses_ldtm_stat": ldtm_stat_supported(compute_capability),
     }
-    if expanded_resources:
-        if tuple(compute_capability) != (10, 7):
-            raise ValueError("Expanded decode resources require SM107")
+    if tuple(compute_capability) == (10, 7):
         args.update(
             max_tmem_alloc_cols=SM107_TMEM_ALLOCATION_COLUMNS,
             smem_capacity_kib=SM107_SMEM_CAPACITY_KIB,

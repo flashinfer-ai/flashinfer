@@ -4023,6 +4023,8 @@ def test_attention_ts_decode_arch_config_args_follow_softmax_hardware() -> None:
     assert arch_args((10, 7)) == {
         "ex2_emulated_pairs": 0,
         "uses_ldtm_stat": tcgen05_compat.ldtm_stat_supported((10, 7)),
+        "max_tmem_alloc_cols": 576,
+        "smem_capacity_kib": 327,
     }
     cfg = _make_contiguous_kv256_config(persistent=False)
     assert cfg.ex2_emulated_pairs == 6 and not cfg.uses_ldtm_stat
@@ -8430,9 +8432,7 @@ def test_attention_ts_decode_sm107_expanded_resources(
         seed=20261025,
     )
     config_args = {
-        **fmha_decode_config.arch_config_args(
-            torch.cuda.get_device_capability(), expanded_resources=True
-        ),
+        **fmha_decode_config.arch_config_args(torch.cuda.get_device_capability()),
         "use_keeps_mma_ab": tile_size_q >= 64,
         "tile_size_q": tile_size_q,
         "tile_size_kv": tile_size_kv,
