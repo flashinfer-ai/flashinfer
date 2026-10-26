@@ -618,7 +618,10 @@ kernel_cake_kda_train_3808ea4d567b82ea21a4(const __grid_constant__ CUtensorMap k
                     for (int panel_1 = 0; panel_1 < 2; panel_1++) {
                         tma_3d_gmem2smem(qg_panel_addr + (unsigned int)(panel_1 * 8192), (&qg_tma), panel_1 * 64, head_1, trow_1, rest_full_addr);
                         tma_3d_gmem2smem(w_panel_addr + (unsigned int)(panel_1 * 8192), (&w_tma), panel_1 * 64, head_1, trow_1, rest_full_addr);
-                        tma_3d_gmem2smem(do_panel_addr + (unsigned int)(panel_1 * 8192), (&do_tma), panel_1 * 64, head_1, trow_1, rest_full_addr);
+                    }
+                    #pragma unroll
+                    for (int panel_2 = 0; panel_2 < 2; panel_2++) {
+                        tma_3d_gmem2smem(do_panel_addr + (unsigned int)(panel_2 * 8192), (&do_tma), panel_2 * 64, head_1, trow_1, rest_full_addr);
                     }
                     _phase_rest_empty ^= 1;
                 }
