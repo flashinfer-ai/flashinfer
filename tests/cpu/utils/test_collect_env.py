@@ -30,6 +30,7 @@ def report():
     return collect_env_info()
 
 
+@pytest.mark.cpu_only
 def test_sections_present(report):
     for section in (
         "FlashInfer",
@@ -45,18 +46,21 @@ def test_sections_present(report):
         assert isinstance(report[section], dict)
 
 
+@pytest.mark.cpu_only
 def test_report_has_flashinfer_version(report):
     import flashinfer
 
     assert report["FlashInfer"]["flashinfer"] == flashinfer.__version__
 
 
+@pytest.mark.cpu_only
 def test_format_report(report):
     text = format_report(report)
     assert "FlashInfer environment report" in text
     assert "==== Relevant Packages ====" in text
 
 
+@pytest.mark.cpu_only
 def test_json_serializable(report):
     json.dumps(report)
 
@@ -66,6 +70,7 @@ def _kernel_package_info(monkeypatch, dists):
     return collect_env._get_kernel_package_info()
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("pkg", "version", "matches"),
     [
@@ -81,6 +86,7 @@ def test_kernel_package_version_rule(pkg, version, matches):
     assert collect_env._kernel_package_matches(pkg, version, "0.7.0") is matches
 
 
+@pytest.mark.cpu_only
 def test_matching_kernel_packages_not_flagged(monkeypatch):
     info = _kernel_package_info(
         monkeypatch,
@@ -100,6 +106,7 @@ def test_matching_kernel_packages_not_flagged(monkeypatch):
     }
 
 
+@pytest.mark.cpu_only
 def test_stale_kernel_packages_flagged(monkeypatch):
     info = _kernel_package_info(
         monkeypatch,
@@ -120,6 +127,7 @@ def test_stale_kernel_packages_flagged(monkeypatch):
     }
 
 
+@pytest.mark.cpu_only
 def test_jit_cache_providers_must_match_shim(monkeypatch):
     info = _kernel_package_info(
         monkeypatch,
@@ -137,6 +145,7 @@ def test_jit_cache_providers_must_match_shim(monkeypatch):
     )
 
 
+@pytest.mark.cpu_only
 def test_jit_cache_providers_without_shim(monkeypatch):
     info = _kernel_package_info(
         monkeypatch,
@@ -149,6 +158,7 @@ def test_jit_cache_providers_without_shim(monkeypatch):
     )
 
 
+@pytest.mark.cpu_only
 def test_kernel_packages_reported_when_import_fails(monkeypatch):
     # A stale kernel wheel can make `import flashinfer` fail; the report must
     # still show the versions that explain it.
