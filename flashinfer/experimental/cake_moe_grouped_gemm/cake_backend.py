@@ -30,12 +30,29 @@ from host-known scalars (tensor shapes, the SM count, the architecture) so a
 prepared launch is CUDA-graph capturable and stays valid for any ``offs``
 written later.  The host planner below reproduces the production launchers'
 decisions exactly from ``HOST_PLAN_CONSTANTS``.
+
+Stream workspaces.  The forward and data-gradient programs take a scheduler
+workspace (``sched``: ``sched_words`` u32 words whose first three rest at
+``sched_rest``) and the split of their clusters over the two claim queues
+(``c0 = clusters // 2``, ``c1 = clusters - c0``); the weight-gradient wave
+programs take two wave counters (``wave_sync``, resting at zero) and their wave
+mode.  Every launch leaves a workspace at its rest state (the kernels re-arm it
+at the end), so one buffer serves every launch of one CUDA stream: the buffers
+are kept per (device, stream), allocated and set to their rest state by the
+first launch on a stream and reused by every later one, never shared by two
+streams (launches on one stream are ordered, so a buffer is never live in two
+launches at once).  A launch captured into a CUDA graph, or issued for a
+device other than the current one, takes buffers of its own at their rest
+state, set at the launch (a capture records that set with the launch and
+allocates the buffers from the graph's pool).  The static sm_107a forward and
+data-gradient programs take ``sched``, ``c0`` and ``c1`` and ignore them.
 """
 
 from __future__ import annotations
 
 import functools
 import math
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -45,11 +62,11 @@ import tvm_ffi
 from .cake_jit import (
     HOST_PLAN_CONSTANTS,
     PROGRAMS,
-    ROUTES,
     load_module,
     program_registered,
     select_module,
     stage_binding,
+    stage_served,
 )
 
 SUPPORTED_COMPUTE_CAPABILITIES = {
@@ -239,8 +256,18 @@ def plan_fwd_dgrad(
         cluster_m=int(c["cluster_m"]),
         block_n=int(c["block_n"]),
     )
-    grid_x = persistent_grid(sm_count, tiles, cta_group=int(c["cta_group"]))
-    return dict(grid=[grid_x, 1, 1], launches=1, tile_k=None)
+    cta_group = int(c["cta_group"])
+    grid_x = persistent_grid(sm_count, tiles, cta_group=cta_group)
+    clusters = grid_x // cta_group
+    c0 = clusters // 2
+    return dict(
+        grid=[grid_x, 1, 1],
+        clusters=clusters,
+        c0=c0,
+        c1=clusters - c0,
+        launches=1,
+        tile_k=None,
+    )
 
 
 def plan_wgrad(
@@ -318,10 +345,94 @@ def plan_wgrad(
 # ---------------------------------------------------------------------------
 
 
+# The CUDA state queries of the per-launch path, bound to their C entries
+# (``torch.cuda.current_stream`` constructs a ``Stream`` object per call), with
+# the ``torch.cuda`` forms on a torch build without them.
+try:
+    _current_raw_stream = torch._C._cuda_getCurrentRawStream
+except AttributeError:  # pragma: no cover - older torch
+
+    def _current_raw_stream(device_index: int) -> int:
+        return torch.cuda.current_stream(device_index).cuda_stream
+
+
+try:
+    _current_stream_capturing = torch._C._cuda_isCurrentStreamCapturing
+except AttributeError:  # pragma: no cover - older torch
+    _current_stream_capturing = torch.cuda.is_current_stream_capturing
+try:
+    _current_device = torch._C._cuda_getDevice
+except AttributeError:  # pragma: no cover - older torch
+    _current_device = torch.cuda.current_device
+
+# The workspace kinds a program's argument plan may name, by argument name.
+STREAM_WORKSPACES = ("sched", "wave_sync")
+# Stream workspaces (module docstring): one buffer per (kind, device index,
+# CUDA stream handle), created on the first launch on that stream.
+_stream_workspaces: dict[tuple[str, int, int], torch.Tensor] = {}
+_STREAM_WORKSPACES_LOCK = threading.Lock()
+
+
+def _rest_workspace(kind: str, device: torch.device) -> torch.Tensor:
+    """A new ``kind`` workspace on ``device`` at its rest state (u32 words, contiguous), set on the current stream."""
+    c = host_plan_constants()
+    if kind == "sched":
+        words = torch.zeros(int(c["sched_words"]), dtype=torch.int32, device=device)
+        for index, value in enumerate(c["sched_rest"]):
+            if value:
+                # Two's-complement spelling of the u32 rest word in the int32 view.
+                words[index] = (
+                    int(value) - (1 << 32) if value >= 1 << 31 else int(value)
+                )
+        return words.view(torch.uint32)
+    if kind == "wave_sync":
+        return torch.zeros(
+            int(c["wave_sync_words"]), dtype=torch.int32, device=device
+        ).view(torch.uint32)
+    raise KeyError(
+        f"unknown stream workspace {kind!r}; expected one of {STREAM_WORKSPACES}"
+    )
+
+
+def _launch_workspace(
+    kind: str, device: torch.device, device_index: int
+) -> torch.Tensor:
+    """The ``kind`` workspace of a launch on the current stream of ``device`` (module docstring)."""
+    if device_index != _current_device() or _current_stream_capturing():
+        # A capture records no buffer the host keeps; the capture state is readable for the
+        # current device's stream only, so a launch for another device takes this path too.
+        return _rest_workspace(kind, device)
+    key = (kind, device_index, _current_raw_stream(device_index))
+    buffer = _stream_workspaces.get(key)
+    if buffer is None:
+        with _STREAM_WORKSPACES_LOCK:
+            buffer = _stream_workspaces.get(key)
+            if buffer is None:
+                buffer = _stream_workspaces[key] = _rest_workspace(kind, device)
+    return buffer
+
+
+def stream_workspace(
+    kind: str, device: torch.device, stream: Optional[torch.cuda.Stream] = None
+) -> Optional[torch.Tensor]:
+    """The ``kind`` (``"sched"`` / ``"wave_sync"``) workspace kept for ``stream`` (the current stream of
+    ``device`` by default), or ``None`` before a launch on that stream needed one."""
+    if kind not in STREAM_WORKSPACES:
+        raise KeyError(
+            f"unknown stream workspace {kind!r}; expected one of {STREAM_WORKSPACES}"
+        )
+    index = _device_index(device)
+    handle = _current_raw_stream(index) if stream is None else int(stream.cuda_stream)
+    return _stream_workspaces.get((kind, index, handle))
+
+
 @dataclass(frozen=True)
 class _Launch:
     entry: Callable[..., Any] = field(repr=False)
     arguments: tuple = field(repr=False)
+    # (argument position, workspace kind) of the stream workspaces the program
+    # takes; their placeholders in ``arguments`` are filled per launch.
+    workspace_slots: tuple[tuple[int, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -336,8 +447,10 @@ class GroupedGemmLaunch:
     launch (or a CUDA Graph capturing it) stays valid when the caller writes
     new group boundaries into ``offs`` or new values into the operands.
     Prepare a new launch when a shape, dtype or tensor binding changes.
-    ``plan`` records the host decisions (grid, k tile, tail split, raster,
-    launch count); ``stages`` is the stage set of the bound route.
+    ``plan`` records the host decisions (grid, queue split, k tile, tail
+    split, raster, wave mode, launch count); ``stages`` names the bound stages
+    of the route in launch order.  The scheduler and wave workspaces are the
+    current stream's (module docstring), resolved at every launch.
     """
 
     op: str
@@ -350,13 +463,21 @@ class GroupedGemmLaunch:
     # Caller-owned buffers of this launch (weight gradient): the per-CTA
     # descriptor slots and the fp32 tail partials.  Kept alive with the launch.
     workspaces: tuple[torch.Tensor, ...] = field(default=(), repr=False)
+    device_index: int = -1
 
     def launch(self) -> torch.Tensor:
         if self.zero_fill:
             self.out.zero_()
         with tvm_ffi.use_torch_stream():
             for item in self.launches:
-                item.entry(*item.arguments)
+                arguments = item.arguments
+                if item.workspace_slots:
+                    arguments = list(arguments)
+                    for position, kind in item.workspace_slots:
+                        arguments[position] = _launch_workspace(
+                            kind, self.out.device, self.device_index
+                        )
+                item.entry(*arguments)
         return self.out
 
     __call__ = launch
@@ -425,15 +546,20 @@ def _aligned_bytes(nbytes: int, device: torch.device, what: str) -> torch.Tensor
 
 
 def _bind(name: str, stage: str, kwargs: dict[str, Any], arch: str) -> _Launch:
-    """Order ``kwargs`` by the generated argument plan of ``stage`` of route ``name`` and load its entry
-    for ``arch`` (the binding encodes the operands' TMA descriptors by value at every launch)."""
-    binding = stage_binding(name, stage)
+    """Order ``kwargs`` by the generated argument plan of ``stage`` of route ``name`` on ``arch`` and load
+    its entry (the binding encodes the operands' TMA descriptors by value at every launch).  A buffer the
+    plan names after a stream workspace kind is left to ``GroupedGemmLaunch.launch``."""
+    binding = stage_binding(name, stage, arch)
     program = PROGRAMS[binding["program"]]
     grid = dict(zip(("grid_x", "grid_y", "grid_z"), kwargs["grid"], strict=True))
-    arguments = []
+    arguments: list[Any] = []
+    slots: list[tuple[int, str]] = []
     for kind, arg in program["arg_plan"]:
         if kind == "grid":
             arguments.append(int(grid[arg]))
+        elif kind == "buffer" and arg in STREAM_WORKSPACES:
+            slots.append((len(arguments), arg))
+            arguments.append(None)
         elif arg in kwargs:
             arguments.append(kwargs[arg])
         else:
@@ -445,6 +571,7 @@ def _bind(name: str, stage: str, kwargs: dict[str, Any], arch: str) -> _Launch:
     return _Launch(
         entry=getattr(module, program["ffi_entry"]),
         arguments=tuple(arguments),
+        workspace_slots=tuple(slots),
     )
 
 
@@ -453,6 +580,7 @@ def _finish(
     name: str,
     plan: dict[str, Any],
     out: torch.Tensor,
+    stages: tuple[str, ...],
     launches: list[_Launch],
     workspaces: list,
     *,
@@ -461,12 +589,13 @@ def _finish(
     return GroupedGemmLaunch(
         op=op,
         record_name=name,
-        stages=tuple(stage["name"] for stage in ROUTES[name]["stages"]),
+        stages=stages,
         plan=plan,
         out=out,
         launches=tuple(launches),
         zero_fill=zero_fill,
         workspaces=tuple(workspaces),
+        device_index=_device_index(out.device),
     )
 
 
@@ -543,7 +672,7 @@ def _prepare_row_op(
         constants=c,
     )
     if sum_m == 0:
-        return _finish(op, name, plan, out, [], [])
+        return _finish(op, name, plan, out, (), [], [])
     kwargs = dict(
         A=a,
         B=w,
@@ -554,9 +683,13 @@ def _prepare_row_op(
         N=n,
         K=k,
         ldc=int(out.stride(0)),
+        c0=plan["c0"],
+        c1=plan["c1"],
         grid=plan["grid"],
     )
-    return _finish(op, name, plan, out, [_bind(name, "main", kwargs, arch)], [])
+    return _finish(
+        op, name, plan, out, ("main",), [_bind(name, "main", kwargs, arch)], []
+    )
 
 
 def prepare_grouped_gemm_fwd(
@@ -655,10 +788,13 @@ def prepare_grouped_gemm_wgrad(
     name = select_module(
         "wgrad", arch, out_dtype=_DTYPE_NAMES[out_dtype], tile_k=tile_k
     )
-    stages = {stage["name"]: stage for stage in ROUTES[name]["stages"]}
     reduce_threads = (
-        int(PROGRAMS[stages["tail_reduce"]["program"]]["launch"]["block"][0])
-        if "tail_reduce" in stages
+        int(
+            PROGRAMS[stage_binding(name, "tail_reduce", arch)["program"]]["launch"][
+                "block"
+            ][0]
+        )
+        if stage_served(name, "tail_reduce", arch)
         else 0
     )
     plan = plan_wgrad(
@@ -671,8 +807,11 @@ def prepare_grouped_gemm_wgrad(
         reduce_threads=reduce_threads,
         constants=c,
     )
+    wave = k >= int(c["wave_sync_min_k"]) and stage_served(name, "main_wave", arch)
+    main_stage = "main_wave" if wave else "main"
+    plan["wave_mode"] = int(c["wave_sync_mode"]) if wave else 0
     if sum_m == 0:
-        return _finish("wgrad", name, plan, out, [], [], zero_fill=True)
+        return _finish("wgrad", name, plan, out, (), [], [], zero_fill=True)
     grid_x, clusters, splits = plan["grid"][0], plan["clusters"], plan["tail_splits"]
     slots = _aligned_bytes(
         grid_x * int(c["tmap_slots_per_cta"]) * int(c["tmap_slot_bytes"]),
@@ -700,9 +839,11 @@ def prepare_grouped_gemm_wgrad(
         K=k,
         ldc=int(out.stride(1)),
         stride_e=int(out.stride(0)),
+        wave_mode=plan["wave_mode"],
         grid=plan["grid"],
     )
-    launches = [_bind(name, "main", main_kwargs, arch)]
+    stages = [main_stage]
+    launches = [_bind(name, main_stage, main_kwargs, arch)]
     if splits > 1:
         reduce_kwargs = dict(
             partials=partials,
@@ -718,8 +859,9 @@ def prepare_grouped_gemm_wgrad(
             raster_rows=plan["raster_rows"],
             grid=plan["tail_reduce_grid"],
         )
+        stages.append("tail_reduce")
         launches.append(_bind(name, "tail_reduce", reduce_kwargs, arch))
-    return _finish("wgrad", name, plan, out, launches, workspaces)
+    return _finish("wgrad", name, plan, out, tuple(stages), launches, workspaces)
 
 
 # ---------------------------------------------------------------------------

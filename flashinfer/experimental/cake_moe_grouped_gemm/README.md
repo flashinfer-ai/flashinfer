@@ -110,6 +110,14 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
 - Grid: one 2-CTA cluster per SM pair, capped by the tile count
   (`persistent_grid`); for `fwd` / `dgrad` the tile count bound lets every
   group add one partial 256-row tile (`max_cluster_tiles_upper_bound`).
+- `fwd` / `dgrad` tile order on `sm_100a` / `sm_103a`: the column tiles of
+  every 256-row block are split between two claim queues, one per locality
+  domain of the device, in proportion to the clusters that claim each queue
+  first (`c0 = clusters // 2`, `c1 = clusters - c0`, `clusters = grid_x // 2`);
+  a cluster finds its domain on the device and claims from the other queue
+  when its own is empty, so every tile is computed exactly once whatever the
+  split. The `sm_107a` programs stride the tiles over the clusters in the same
+  row-block-major order and ignore the queues.
 - Weight-gradient k tile (`select_wgrad_tile`): 512 when `K % 512 == 0`, the
   architecture is listed for it and the average rows per group reach the
   delivered threshold; 256 otherwise. The two tiles are separate registered
@@ -122,6 +130,11 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
   (`wgrad_reduce_grid` CTAs) sums the chunks, otherwise only the main kernel
   runs. The tile raster inside a group follows the per-wave operand footprint
   (`wgrad_raster_rows`).
+- Weight-gradient wave sync: when `K` reaches `wave_sync_min_k` (the
+  gate-up-shaped rows) and the route has a `main_wave` stage on the
+  architecture (`sm_100a`, `sm_103a`), the main kernel is the wave-synchronized
+  build, launched with `wave_mode = wave_sync_mode`; otherwise the plain build
+  (`wave_mode = 0`). Both builds give the same output bits for a given route.
 - Workspaces (allocated at preparation, retained by the launch object): the
   per-CTA TMA descriptor slots of the weight gradient (a ring of nine
   descriptor pairs per CTA: a group switch edits the next pair and warms the
@@ -129,9 +142,22 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
   tail partials. The operand
   descriptors are launch arguments; there is no descriptor workspace and no
   descriptor upload kernel.
+- Stream workspaces (kept per device and CUDA stream, reused by every launch
+  on that stream): the `fwd` / `dgrad` scheduler words (`sched`,
+  `sched_words` u32 words whose first three rest at `sched_rest`) and the
+  wave-sync counters (`wave_sync`, `wave_sync_words` u32 words resting at
+  zero). The first launch on a stream allocates a buffer at its rest state;
+  every kernel leaves it at its rest state, so launches on one stream share it
+  and launches on two streams never do. A launch under CUDA graph capture, or
+  for a device that is not the current one, takes buffers of its own, set to
+  their rest state at the launch. `stream_workspace(kind, device, stream=None)`
+  returns the buffer kept for a stream, or `None` before a launch on it needed
+  one.
 
 `GroupedGemmLaunch.plan` exposes `grid`, `tile_k`, `tail_splits`,
-`raster_rows` and `launches` for inspection and tests.
+`raster_rows`, `launches` and, for `fwd` / `dgrad`, `clusters`, `c0` and `c1`,
+for `wgrad` `wave_mode`, for inspection and tests; `GroupedGemmLaunch.stages`
+names the bound stages in launch order.
 
 ## Build targets and layout
 

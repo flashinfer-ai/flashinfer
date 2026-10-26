@@ -36,6 +36,8 @@ prepare_grouped_gemm_dgrad = cb.prepare_grouped_gemm_dgrad
 prepare_grouped_gemm_fwd = cb.prepare_grouped_gemm_fwd
 prepare_grouped_gemm_wgrad = cb.prepare_grouped_gemm_wgrad
 HOST_PLAN_CONSTANTS = cake_jit.HOST_PLAN_CONSTANTS
+PROGRAMS = cake_jit.PROGRAMS
+ROUTES = cake_jit.ROUTES
 
 ATOL = RTOL = 1e-2  # bf16 outputs
 FP32_REL_L2 = 1e-4  # fp32 weight gradient vs the fp64 reference
@@ -139,6 +141,10 @@ def test_plan_invariants(sm_count, sizes):
             and cta_group <= grid_x <= (sm_count // cta_group) * cta_group
         )
         assert plan["launches"] == 1 and plan["tile_k"] is None
+        # The two claim queues: c0 = clusters // 2, c1 = the rest.
+        assert plan["clusters"] == grid_x // cta_group
+        assert plan["c0"] == plan["clusters"] // 2
+        assert plan["c0"] + plan["c1"] == plan["clusters"] and plan["c1"] >= 1
     for arch in ("sm_100a", "sm_103a", "sm_107a"):
         for n, k in ((4096, 6144), (6144, 2048), (256, 256)):
             tile_k = cb.select_wgrad_tile(k, arch, sum_m, e, c)
@@ -168,6 +174,50 @@ def test_plan_invariants(sm_count, sizes):
                 assert plan["tail_reduce_grid"][0] > 0
             if plan["num_tail"] == 0:
                 assert plan["tail_splits"] == 1
+
+
+def test_stage_bindings_are_unique_per_architecture():
+    """A route may spell two stages of one name; they serve disjoint architectures,
+    and ``stage_binding`` returns the one built for the asked architecture."""
+    for name, route in ROUTES.items():
+        for arch in route["arches"]:
+            served = {}
+            for stage in route["stages"]:
+                if arch in PROGRAMS[stage["program"]]["arches"]:
+                    assert stage["name"] not in served, (name, arch, stage["name"])
+                    served[stage["name"]] = stage
+            assert "main" in served or "main_wave" in served, (name, arch)
+            for stage_name, stage in served.items():
+                assert cake_jit.stage_binding(name, stage_name, arch) is stage
+                assert cake_jit.stage_served(name, stage_name, arch)
+            assert not cake_jit.stage_served(name, "no_such_stage", arch)
+            with pytest.raises(KeyError):
+                cake_jit.stage_binding(name, "no_such_stage", arch)
+
+
+def test_workspace_arguments_of_the_argument_plans():
+    """``sched`` is followed by the queue split ``c0``, ``c1``; ``wave_sync`` by
+    ``wave_mode``; the ``main_wave`` stages bind programs taking ``wave_sync``."""
+    for program in PROGRAMS.values():
+        plan = [tuple(item) for item in program["arg_plan"]]
+        for buffer, parameters in (
+            ("sched", [("parameter", "c0"), ("parameter", "c1")]),
+            ("wave_sync", [("parameter", "wave_mode")]),
+        ):
+            if ("buffer", buffer) in plan:
+                at = plan.index(("buffer", buffer))
+                assert plan[at + 1 : at + 1 + len(parameters)] == parameters
+    for route in ROUTES.values():
+        for stage in route["stages"]:
+            plan = [tuple(item) for item in PROGRAMS[stage["program"]]["arg_plan"]]
+            if stage["name"] == "main_wave":
+                assert ("buffer", "wave_sync") in plan
+            if route["op"] != "wgrad":
+                assert ("buffer", "wave_sync") not in plan
+    rest = HOST_PLAN_CONSTANTS["sched_rest"]
+    assert len(rest) == 3 and all(0 <= int(v) < 2**32 for v in rest)
+    assert int(HOST_PLAN_CONSTANTS["sched_words"]) >= len(rest)
+    assert int(HOST_PLAN_CONSTANTS["wave_sync_words"]) >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +335,177 @@ def test_prepared_launch_reuses_buffers_without_allocation():
     after = torch.cuda.memory_stats(device)
     assert after["allocation.all.allocated"] == before["allocation.all.allocated"]
     _assert_bf16_close(out, _reference("fwd", x, w, RAGGED_E6))
+
+
+def _u32_words(tensor):
+    """The words of a u32 workspace as Python ints."""
+    return [v & 0xFFFFFFFF for v in tensor.view(torch.int32).tolist()]
+
+
+def _workspace_kinds(launch):
+    return {kind for item in launch.launches for _, kind in item.workspace_slots}
+
+
+def _prepare_row_op(op, sizes, n, k, device, out=None):
+    x, w, g, offs = _inputs(sizes, n, k, device)
+    if op == "fwd":
+        return prepare_grouped_gemm_fwd(x, w, offs, out=out), _reference(
+            "fwd", x, w, sizes
+        )
+    return prepare_grouped_gemm_dgrad(g, w, offs, out=out), _reference(
+        "dgrad", g, w, sizes
+    )
+
+
+@pytest.mark.parametrize("op", ["fwd", "dgrad"])
+def test_scheduler_workspace_rests_after_every_launch(op):
+    """The kernels re-arm ``sched`` at the end of every launch: repeated launches of
+    one prepared call on one stream each compute every tile (the output is refilled
+    with NaN before each), and the stream's workspace is at its rest words."""
+    device = _require_program(op)
+    launch, ref = _prepare_row_op(op, RAGGED_E6, 1024, 512, device)
+    if "sched" not in _workspace_kinds(launch):
+        pytest.skip(
+            f"the {op} program bound on this device takes no scheduler workspace"
+        )
+    c = HOST_PLAN_CONSTANTS
+    for _ in range(4):
+        launch.out.fill_(float("nan"))
+        _assert_bf16_close(launch.launch(), ref)
+    torch.cuda.synchronize()
+    sched = cb.stream_workspace("sched", device)
+    assert sched is not None and sched.dtype == torch.uint32
+    assert sched.numel() == int(c["sched_words"]) and sched.is_contiguous()
+    assert _u32_words(sched[:3]) == [int(v) for v in c["sched_rest"]]
+
+
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+def test_wgrad_wave_sync_route_and_rest_state(out_dtype, monkeypatch):
+    """From ``wave_sync_min_k`` on, an architecture whose route has a ``main_wave``
+    stage launches the wave build with ``wave_mode = wave_sync_mode``; it leaves its
+    counters at zero and gives the plain build's output bits."""
+    device = _require_program("wgrad", out_dtype)
+    c = HOST_PLAN_CONSTANTS
+    arch = SUPPORTED_COMPUTE_CAPABILITIES[torch.cuda.get_device_capability(device)]
+    n, k = 256, int(c["wave_sync_min_k"])
+    x, _w, g, offs = _inputs(RAGGED_E4, n, k, device, seed=7)
+    launch = prepare_grouped_gemm_wgrad(g, x, offs, out_dtype=out_dtype)
+    wave = cake_jit.stage_served(launch.record_name, "main_wave", arch)
+    assert launch.stages[0] == ("main_wave" if wave else "main")
+    assert launch.plan["wave_mode"] == (int(c["wave_sync_mode"]) if wave else 0)
+    assert ("wave_sync" in _workspace_kinds(launch)) == wave
+    ref = _reference("wgrad", g, x, RAGGED_E4)
+    for _ in range(3):
+        launch.out.fill_(float("nan"))
+        out = launch.launch()
+        if out_dtype == torch.bfloat16:
+            _assert_bf16_close(out, ref)
+        else:
+            assert ((out - ref).norm() / ref.norm()).item() <= FP32_REL_L2
+    torch.cuda.synchronize()
+    if wave:
+        counters = cb.stream_workspace("wave_sync", device)
+        assert counters is not None and counters.dtype == torch.uint32
+        assert counters.numel() == int(c["wave_sync_words"])
+        assert _u32_words(counters) == [0] * int(c["wave_sync_words"])
+    # Below the threshold (or with the wave build switched off) the plain build runs.
+    short = prepare_grouped_gemm_wgrad(
+        g, x[:, : k // 2].contiguous(), offs, out_dtype=out_dtype
+    )
+    assert short.stages[0] == "main" and short.plan["wave_mode"] == 0
+    monkeypatch.setitem(HOST_PLAN_CONSTANTS, "wave_sync_min_k", 1 << 30)
+    plain = prepare_grouped_gemm_wgrad(g, x, offs, out_dtype=out_dtype)
+    assert plain.stages[0] == "main" and plain.plan["wave_mode"] == 0
+    assert plain.plan["tile_k"] == launch.plan["tile_k"]
+    torch.cuda.synchronize()
+    assert torch.equal(plain.launch(), out)
+
+
+def test_two_streams_take_separate_workspaces():
+    """Launches on two streams in flight together never share a workspace; each
+    stream keeps its own buffer at rest, and both results are exact."""
+    device = _require_program("fwd")
+    first, ref = _prepare_row_op("fwd", RAGGED_E6, 1024, 512, device)
+    if "sched" not in _workspace_kinds(first):
+        pytest.skip("the fwd program bound on this device takes no scheduler workspace")
+    second, ref2 = _prepare_row_op("dgrad", RAGGED_E4, 256, 512, device)
+    streams = [torch.cuda.Stream(device), torch.cuda.Stream(device)]
+    main = torch.cuda.current_stream(device)
+    for stream in streams:
+        stream.wait_stream(main)
+    for _ in range(8):
+        for stream, launch in zip(streams, (first, second), strict=True):
+            with torch.cuda.stream(stream):
+                launch.launch()
+    for stream in streams:
+        main.wait_stream(stream)
+    torch.cuda.synchronize()
+    _assert_bf16_close(first.out, ref)
+    _assert_bf16_close(second.out, ref2)
+    buffers = [cb.stream_workspace("sched", device, stream) for stream in streams]
+    assert all(buffer is not None for buffer in buffers)
+    assert buffers[0].data_ptr() != buffers[1].data_ptr()
+    rest = [int(v) for v in HOST_PLAN_CONSTANTS["sched_rest"]]
+    for buffer in buffers:
+        assert _u32_words(buffer[:3]) == rest
+    current = cb.stream_workspace("sched", device)
+    assert current is None or current.data_ptr() not in {
+        buffer.data_ptr() for buffer in buffers
+    }
+
+
+@pytest.mark.parametrize("op", ["fwd", "wgrad"])
+def test_cuda_graph_replay(op):
+    """A captured launch takes workspaces of its own, set to their rest state in the
+    graph; every replay computes every tile."""
+    if op == "fwd":
+        device = _require_program("fwd")
+        launch, ref = _prepare_row_op("fwd", RAGGED_E6, 1024, 512, device)
+    else:
+        device = _require_program("wgrad", torch.bfloat16)
+        k = int(HOST_PLAN_CONSTANTS["wave_sync_min_k"])
+        x, _w, g, offs = _inputs(RAGGED_E4, 256, k, device, seed=8)
+        launch = prepare_grouped_gemm_wgrad(g, x, offs)
+        ref = _reference("wgrad", g, x, RAGGED_E4)
+    side = torch.cuda.Stream(device)
+    side.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(side):
+        launch.launch()
+    torch.cuda.current_stream(device).wait_stream(side)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch.launch()
+    for _ in range(3):
+        launch.out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_bf16_close(launch.out, ref)
+
+
+@pytest.mark.parametrize("op", ["dgrad", "wgrad"])
+def test_prepared_launches_allocate_nothing_after_the_first(op):
+    """After the first launch on a stream (which creates the stream workspaces), a
+    prepared launch allocates no device memory: dgrad, and the weight gradient on
+    its wave build where the device has one."""
+    if op == "dgrad":
+        device = _require_program("dgrad")
+        launch, ref = _prepare_row_op("dgrad", RAGGED_E6, 1024, 512, device)
+    else:
+        device = _require_program("wgrad", torch.bfloat16)
+        k = int(HOST_PLAN_CONSTANTS["wave_sync_min_k"])
+        x, _w, g, offs = _inputs(RAGGED_E4, 256, k, device, seed=9)
+        launch = prepare_grouped_gemm_wgrad(g, x, offs)
+        ref = _reference("wgrad", g, x, RAGGED_E4)
+    launch.launch()
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_stats(device)
+    for _ in range(3):
+        launch.launch()
+    torch.cuda.synchronize()
+    after = torch.cuda.memory_stats(device)
+    assert after["allocation.all.allocated"] == before["allocation.all.allocated"]
+    _assert_bf16_close(launch.out, ref)
 
 
 def test_prepared_launch_follows_new_offsets():

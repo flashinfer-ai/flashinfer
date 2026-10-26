@@ -21,8 +21,9 @@ from typing import Any, Optional
 
 from . import cake_build
 
-# Registry of the generated ragged grouped GEMM programs (filled verbatim by the
-# Cake generated-program export; do not edit the literals by hand).
+# Registry of the generated ragged grouped GEMM programs.  ``PROGRAMS`` and
+# ``ROUTES`` are written by the Cake generated-program export; the host plan
+# constants and the functions below are this package's.
 #
 # ``PROGRAMS``: one record per physical program -- one kernel source plus its
 # host binding, shared by every architecture in ``arches`` (genuine
@@ -40,10 +41,17 @@ from . import cake_build
 # ordered stages.  Each stage binds a program and the compile-line
 # specializations the loader defines for it (the weight-gradient tail-reduce
 # program takes the k width of the partials it sums, ``WGRAD_TILE``, from the
-# route's tile instead of carrying one source per tile; the three
-# weight-gradient programs take their output element width, ``WGRAD_OUT`` =
-# 16 for bf16 or 32 for fp32, from the route's output dtype instead of
-# carrying one source per output dtype).
+# route's tile instead of carrying one source per tile; the weight-gradient
+# programs take their output element width, ``WGRAD_OUT`` = 16 for bf16 or 32
+# for fp32, from the route's output dtype instead of carrying one source per
+# output dtype).  A stage serves the architectures its program is built for
+# among the route's: a route may name two stages of one name whose programs
+# serve disjoint architectures (the forward and data-gradient ``main`` stages:
+# the domain-scheduled program on sm_100a / sm_103a, the static program on
+# sm_107a), so a stage is looked up per architecture (``stage_binding``).  The
+# weight-gradient ``main_wave`` stage is the main program with wave
+# synchronisation, which the host selects by ``HOST_PLAN_CONSTANTS``
+# (``wave_sync_min_k``) where the route serves it.
 PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_moe_grouped_gemm_1edcad995dcc790600cb": {
         "library": "cake_moe_grouped_gemm_1edcad995dcc790600cb",
@@ -255,7 +263,12 @@ HOST_PLAN_CONSTANTS: dict[str, Any] = {
     "tmap_slot_bytes": 128,
     "tmap_slots_per_cta": 18,
     "k512_archs": ["sm_100a", "sm_103a"],
-    "k512_min_rows_per_group": 20480,
+    "k512_min_rows_per_group": 8192,
+    "wave_sync_min_k": 4096,
+    "wave_sync_mode": 2,
+    "wave_sync_words": 2,
+    "sched_words": 4224,
+    "sched_rest": [0, 2147483648, 0],
     "wgrad_tail_split": 1,
     "tail_plan": {
         "max_splits": 16,
@@ -343,14 +356,20 @@ def select_module(
     return name
 
 
-def stage_binding(name: str, stage: str) -> dict[str, Any]:
-    """The ``{"name", "program", "specializations"}`` record of ``stage`` of route ``name``."""
+def stage_binding(name: str, stage: str, arch: str) -> dict[str, Any]:
+    """The ``{"name", "program", "specializations"}`` record of ``stage`` of route ``name`` on ``arch``."""
     route = ROUTES[name]
     for item in route["stages"]:
-        if item["name"] == stage:
+        if item["name"] == stage and arch in PROGRAMS[item["program"]]["arches"]:
             return item
-    raise KeyError(
-        f"route {name!r} has stages {[s['name'] for s in route['stages']]}, not {stage!r}"
+    raise KeyError(f"route {name!r} has no {stage!r} stage on {arch}")
+
+
+def stage_served(name: str, stage: str, arch: str) -> bool:
+    """True when route ``name`` has a ``stage`` stage whose program is built for ``arch``."""
+    return any(
+        item["name"] == stage and arch in PROGRAMS[item["program"]]["arches"]
+        for item in ROUTES[name]["stages"]
     )
 
 
