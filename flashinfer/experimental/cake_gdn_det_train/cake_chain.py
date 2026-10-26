@@ -686,13 +686,28 @@ def split_cta_limit(sm_count: int, residency: int) -> int:
     )
 
 
-def _best_split(chunks, per_segment, sm_count, residency, step_factor):
+@cache
+def _prescan_capacity(kind: str, config: tuple[int, int]) -> int:
+    """Chunks one pre-scan CTA of ``kind`` at ``config`` covers (the registry's ``scan.max_segment_chunks``): the
+    longest segment the split route can run."""
+    vb, ks = config
+    for found in cake_jit.MODULES.values():
+        if found["stage"] == f"{kind}_pre_r{vb}k{ks}":
+            return int(found["scan"]["max_segment_chunks"])
+    return 0
+
+
+def _best_split(chunks, per_segment, sm_count, residency, step_factor, max_segment_len):
+    """The cheapest split ``(segment_len, cost)``; a candidate longer than ``max_segment_len`` chunks (the pre-scan
+    capacity) is not admissible, so the search keeps the best of the rest (``(0, inf)`` when none is left)."""
     longest = max(chunks)
     limit = split_cta_limit(sm_count, residency)
     best_len, best_cost = 0, math.inf
     for segments in range(2, longest // MIN_SEGMENT_CHUNKS + 1):
         seg_len = -(-longest // segments)
         if seg_len < MIN_SEGMENT_CHUNKS or seg_len >= longest:
+            continue
+        if seg_len > max_segment_len:
             continue
         splits = tuple(max(1, -(-n // seg_len)) for n in chunks)
         if sum(splits) * per_segment > limit:
@@ -781,7 +796,12 @@ def choose_scan_plan(kind, total_tokens, num_seqs, num_v_heads, device_index, se
         if _prescan_fits(kind, config, device_index, sset) is None:
             options.append(
                 _best_split(
-                    chunks, per_segment, sm_count, residency, SCAN_STEP_FACTOR[config]
+                    chunks,
+                    per_segment,
+                    sm_count,
+                    residency,
+                    SCAN_STEP_FACTOR[config],
+                    _prescan_capacity(kind, tuple(config)),
                 )
             )
         for seg_len, cost in options:

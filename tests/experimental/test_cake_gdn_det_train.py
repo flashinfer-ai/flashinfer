@@ -446,6 +446,60 @@ def test_initial_and_final_state(device) -> None:
     _assert_close_to_reference(got, ref, OUTPUT_NAMES + ("final_state", "dh0"))
 
 
+# --------------------------------------------------------------------------- long layouts and the pre-scan capacity
+
+# Layouts whose device-route bound layout (one sequence of ``T // 64 + N - (N - 1)`` chunks) prices a split longer
+# than one pre-scan CTA covers unless the search rejects it.  The two routes plan different layouts, so their outputs
+# are compared with tolerance; each one carries the error of its own plan (twice the FP64 gate's max-abs bound).
+LONG_LAYOUTS = (
+    ("16x4096-h8", (4096,) * 16, (8, 16)),
+    ("15-real-h8", (2756, 4479, 4053, 4052, 5896, 4229, 5238, 3013, 4429, 4175, 3743, 4029, 5404, 3129, 5875), (8, 16)),
+    ("1x16384-h16", (16384,), (16, 32)),
+)  # fmt: skip
+
+
+@pytest.mark.parametrize("layout", LONG_LAYOUTS, ids=[c[0] for c in LONG_LAYOUTS])
+def test_split_plans_fit_the_prescan_capacity(layout, device) -> None:
+    _id, seq_lens, heads = layout
+    index = device.index
+    for lens in (
+        seq_lens,
+        None,
+    ):  # host route: real lengths; device route: the bound layout
+        fwd, bwd = cake_chain.scan_plans(
+            sum(seq_lens), len(seq_lens), heads[1], index, lens
+        )
+        for kind, plan in (("fwd_h", fwd), ("dhu", bwd)):
+            if plan.segment_len:
+                capacity = cake_chain._prescan_capacity(kind, tuple(plan.config))
+                assert 0 < plan.segment_len <= capacity, (
+                    kind,
+                    plan,
+                    capacity,
+                    lens is None,
+                )
+
+
+@pytest.mark.parametrize("layout", LONG_LAYOUTS, ids=[c[0] for c in LONG_LAYOUTS])
+def test_long_device_route_runs_and_is_deterministic(layout, device) -> None:
+    _id, seq_lens, heads = layout
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=13)
+    first = _run(inputs, seq_lens, route="device")
+    _assert_bitwise(first, _run(inputs, seq_lens, route="device"), OUTPUT_NAMES)
+    host = _run(inputs, seq_lens, route="host")
+    report = {name: _metrics(first[name], host[name]) for name in OUTPUT_NAMES}
+    bad = [
+        name
+        for name, m in report.items()
+        if not (
+            m["finite"]
+            and m["rel_rms"] <= REL_RMS_MAX
+            and m["max_abs"] <= 2 * MAX_ABS_REL * m["max_ref"]
+        )
+    ]
+    assert not bad, f"device vs host route outside the cross-plan gate: {bad}; {report}"
+
+
 # --------------------------------------------------------------------------- bitwise contracts
 
 
