@@ -43,8 +43,3 @@ def launch_selective_sample_ladder(module, *args):
     # Prepared phase calls append a CuTe stream argument. The FFI launch uses
     # the caller's current stream, like the other native FlashInfer operations.
     module.run(*args[:-1])
-
-
-def launch_refined_selective_sample_ladder(module, *args):
-    """Keep coarse chooser/repair metadata and refine the effective threshold."""
-    module.run_refined(*args[:-1])

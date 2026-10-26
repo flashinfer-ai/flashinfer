@@ -86,6 +86,7 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
+from .._fp8_mqa_constants import _EPI_UNROLL
 from .._math_policy import _MathMode, _validate_math_mode
 
 # CuTe DSL CUDA 13 validates rounding modes as string literals. The string
@@ -125,14 +126,6 @@ def relu_f32(a: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
             ip=ip,
         )
     )
-
-
-# Epilogue FMA unroll. NUM_W_IN_REG is the split point between the register
-# and SMEM weight paths, both unrolled this wide, so it must stay a multiple
-# of it -- otherwise the two paths stop tiling the subtile and the epilogue
-# reads past it. Mirrors _EPI_SUBTILE_UNROLL in attn_scores.py, which applies
-# the same granularity to num_heads // num_epi_subtiles.
-_EPI_UNROLL = 4
 
 
 @dsl_user_op

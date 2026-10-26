@@ -324,6 +324,7 @@ def _shared_engine_source_token() -> str:
         "_fp8_mqa_selective.py",
         "../_math_policy.py",
         "../_selective_contract.py",
+        "../_fp8_mqa_constants.py",
     ):
         contents = (kernel_dir / name).read_bytes()
         digest.update(name.encode("ascii"))

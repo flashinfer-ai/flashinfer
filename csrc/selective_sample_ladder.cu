@@ -17,7 +17,6 @@
 
 #include "tvm_ffi_utils.h"
 
-template <bool Refine>
 void selective_sample_ladder(TensorView samples, TensorView valid, TensorView ranks,
                              TensorView ends, TensorView thresholds, TensorView selected_bins,
                              TensorView ladder, TensorView populations, int64_t top_k,
@@ -53,17 +52,14 @@ void selective_sample_ladder(TensorView samples, TensorView valid, TensorView ra
   TVM_FFI_ICHECK(rows <= INT32_MAX);
   if (rows == 0) return;
   ffi::CUDADeviceGuard guard(samples.device().device_id);
-  flashinfer::attention::SelectiveSampleLadder<Refine>
-      <<<rows, 128, 0, get_stream(samples.device())>>>(
-          static_cast<const float*>(samples.data_ptr()), samples.stride(0),
-          static_cast<const int32_t*>(valid.data_ptr()),
-          static_cast<const int32_t*>(ranks.data_ptr()),
-          static_cast<const int32_t*>(ends.data_ptr()), static_cast<float*>(thresholds.data_ptr()),
-          static_cast<int32_t*>(selected_bins.data_ptr()), static_cast<float*>(ladder.data_ptr()),
-          static_cast<int32_t*>(populations.data_ptr()), top_k, capacity, count_segments);
+  flashinfer::attention::SelectiveSampleLadder<<<rows, 128, 0, get_stream(samples.device())>>>(
+      static_cast<const float*>(samples.data_ptr()), samples.stride(0),
+      static_cast<const int32_t*>(valid.data_ptr()), static_cast<const int32_t*>(ranks.data_ptr()),
+      static_cast<const int32_t*>(ends.data_ptr()), static_cast<float*>(thresholds.data_ptr()),
+      static_cast<int32_t*>(selected_bins.data_ptr()), static_cast<float*>(ladder.data_ptr()),
+      static_cast<int32_t*>(populations.data_ptr()), top_k, capacity, count_segments);
   auto status = cudaGetLastError();
   TVM_FFI_ICHECK_EQ(status, cudaSuccess) << cudaGetErrorString(status);
 }
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, selective_sample_ladder<false>);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_refined, selective_sample_ladder<true>);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, selective_sample_ladder);

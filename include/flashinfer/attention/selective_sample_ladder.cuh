@@ -42,12 +42,12 @@ __device__ __forceinline__ float SampleLadderBinFloor(int bin) {
 
 // The histogram and all three crossings share one CTA. The sampled populations
 // remain estimates: exact selection and repair must still verify the result.
-template <bool Refine = false>
-__global__ void SelectiveSampleLadder(const float* samples, int64_t sample_stride,
-                                      const int32_t* valid, const int32_t* ranks,
-                                      const int32_t* ends, float* thresholds,
-                                      int32_t* selected_bins, float* ladder, int32_t* populations,
-                                      int top_k, int capacity, int count_segments) {
+static __global__ void SelectiveSampleLadder(const float* samples, int64_t sample_stride,
+                                             const int32_t* valid, const int32_t* ranks,
+                                             const int32_t* ends, float* thresholds,
+                                             int32_t* selected_bins, float* ladder,
+                                             int32_t* populations, int top_k, int capacity,
+                                             int count_segments) {
   constexpr int kThreads = 128;
   constexpr int kBins = 2048;
   constexpr int kItems = kBins / kThreads;
@@ -55,9 +55,6 @@ __global__ void SelectiveSampleLadder(const float* samples, int64_t sample_strid
   __shared__ typename Scan::TempStorage scan_storage;
   __shared__ int histogram[kBins];
   __shared__ int chosen_bins[3];
-  __shared__ int preceding[3];
-  __shared__ int selected_rung, residual_rank, nonfinite;
-  __shared__ uint32_t selected_key;
   const int tid = threadIdx.x, row = blockIdx.x, count = valid[row];
   for (int bin = tid; bin < kBins; bin += kThreads) histogram[bin] = 0;
   __syncthreads();
@@ -77,7 +74,6 @@ __global__ void SelectiveSampleLadder(const float* samples, int64_t sample_strid
       if (prefix[i] < target && prefix[i] + counts[i] >= target) {
         const int bin = tid * kItems + i;
         chosen_bins[rung] = bin;
-        if constexpr (Refine) preceding[rung] = prefix[i];
         ladder[row * 3 + rung] = SampleLadderBinFloor(bin);
         populations[row * 3 + rung] = prefix[i] + counts[i];
       }
@@ -106,62 +102,6 @@ __global__ void SelectiveSampleLadder(const float* samples, int64_t sample_strid
     const bool eligible = count > 0 && ends[row] >= top_k;
     thresholds[row] = eligible ? ladder[row * 3 + chosen] : -CUDART_INF_F;
     selected_bins[row] = eligible ? chosen_bins[chosen] : kBins - 1;
-    if constexpr (Refine) {
-      selected_rung = chosen;
-      nonfinite = 0;
-      selected_key = 0;
-      if (eligible) {
-        residual_rank = max(1, min(count, ranks[row]) / (4 >> chosen)) - preceding[chosen];
-      }
-    }
-  }
-  if constexpr (Refine) {
-    __syncthreads();
-    if (count == 0 || ends[row] < top_k) return;
-    // Rows with nonfinite samples keep the coarse threshold. Invalid padded
-    // slots are outside count and never participate in refinement.
-    for (int item = tid; item < count; item += kThreads) {
-      if (!isfinite(samples[row * sample_stride + item])) atomicOr(&nonfinite, 1);
-    }
-    __syncthreads();
-    if (nonfinite) return;
-    const int bin = chosen_bins[selected_rung];
-    uint32_t mask = 0;
-    // Exact descending FP32 radix selection within the already chosen half bin.
-    // Coarse populations, rung choice and selected_bins remain repair metadata.
-    for (int shift = 24; shift >= 0; shift -= 8) {
-      for (int bucket = tid; bucket < 256; bucket += kThreads) histogram[bucket] = 0;
-      __syncthreads();
-      for (int item = tid; item < count; item += kThreads) {
-        const float value = samples[row * sample_stride + item];
-        const uint32_t bits = __float_as_uint(value);
-        const uint32_t key = (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
-        if (SampleLadderBin(value) == bin && (key & mask) == selected_key) {
-          atomicAdd(histogram + ((key >> shift) & 255u), 1);
-        }
-      }
-      __syncthreads();
-      if (tid == 0) {
-        int before = 0;
-        for (int bucket = 255; bucket >= 0; --bucket) {
-          const int hits = histogram[bucket];
-          if (before + hits >= residual_rank) {
-            residual_rank -= before;
-            selected_key |= uint32_t(bucket) << shift;
-            break;
-          }
-          before += hits;
-        }
-      }
-      __syncthreads();
-      mask |= 255u << shift;
-    }
-    if (tid == 0) {
-      const uint32_t bits =
-          (selected_key & 0x80000000u) ? (selected_key ^ 0x80000000u) : ~selected_key;
-      // Consumers compare >=, retaining every tie at the selected value.
-      thresholds[row] = __uint_as_float(bits);
-    }
   }
 }
 

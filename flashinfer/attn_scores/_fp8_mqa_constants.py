@@ -18,6 +18,8 @@
 _FP8_MMA_INST_K = 32
 # Register and shared-memory weight paths consume this many heads at a time.
 # UMMA's next_n * num_heads alignment alone does not imply this constraint.
+# NUM_W_IN_REG and num_heads // num_epi_subtiles must be multiples of this
+# width so both weight paths tile the epilogue without out-of-bounds reads.
 _EPI_UNROLL = 4
 _COMPUTE_BLOCK_KV = 128
 # Maximum TMA sub-copies per compute tile.

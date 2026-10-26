@@ -969,12 +969,13 @@ if _CUTE_DSL_AVAILABLE:
 @functools.cache
 def _cached_fp8_source_files() -> Tuple[str, ...]:
     from .kernels import fp8_paged_mqa_logits as _m
-    from . import _math_policy
+    from . import _fp8_mqa_constants, _math_policy
 
     return (
         __file__,
         _m.__file__,
         _math_policy.__file__,
+        _fp8_mqa_constants.__file__,
     )
 
 

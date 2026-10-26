@@ -2305,55 +2305,24 @@ class FP8MQASelectiveLogitsKernel(_FP8MQAEngineMixin):
         else:
             selected = valid & (score >= i32_bits_to_fp32(policy_word))
 
-            segment_begin = cutlass.Int32(0)
-            segment_end = cutlass.Int32(self.capacity)
-            slot = cutlass.Int32(0)
-            if cutlass.const_expr(
-                self.num_count_segments > 0
-                and (
-                    self.mode == _SelectiveLogitsMode.CANDIDATE
-                    or self.mode == _SelectiveLogitsMode.REPAIR
+            # Segmented candidates publish through the cooperative store path.
+            selected_mask = cute.arch.vote_ballot_sync(selected)
+            warp_count = cutlass.Int32(cute.arch.popc(selected_mask))
+            lane = cute.arch.lane_idx()
+            lane_mask = (cutlass.Uint32(1) << cutlass.Uint32(lane)) - cutlass.Uint32(1)
+            lane_rank = cutlass.Int32(cute.arch.popc(selected_mask & lane_mask))
+            warp_base = cutlass.Int32(0)
+            if lane == cutlass.Int32(0) and warp_count != cutlass.Int32(0):
+                warp_base = cute.arch.atomic_add(
+                    cute.domain_offset((out_row, 0), mIndexCounts).iterator,
+                    warp_count,
+                    sem="relaxed",
+                    scope="gpu",
                 )
-            ):
-                # Match the segmented producer's fixed store-warp
-                # segments: a 384-token split is striped across 12 warps in
-                # consecutive 32-token lanes.  The retained set at overflow is
-                # part of the packed consumer ABI, so contiguous KV ranges are
-                # not interchangeable here.
-                segment = (store_kv_pos // self.count_segment_span) % cutlass.Int32(
-                    self.num_count_segments
-                )
-                segment_begin = segment * self.capacity // self.num_count_segments
-                segment_end = (segment + 1) * self.capacity // self.num_count_segments
-                if selected:
-                    slot = segment_begin + cute.arch.atomic_add(
-                        cute.domain_offset(
-                            (out_row, segment + 1), mIndexCounts
-                        ).iterator,
-                        cutlass.Int32(1),
-                        sem="relaxed",
-                        scope="gpu",
-                    )
-            else:
-                selected_mask = cute.arch.vote_ballot_sync(selected)
-                warp_count = cutlass.Int32(cute.arch.popc(selected_mask))
-                lane = cute.arch.lane_idx()
-                lane_mask = (
-                    cutlass.Uint32(1) << cutlass.Uint32(lane)
-                ) - cutlass.Uint32(1)
-                lane_rank = cutlass.Int32(cute.arch.popc(selected_mask & lane_mask))
-                warp_base = cutlass.Int32(0)
-                if lane == cutlass.Int32(0) and warp_count != cutlass.Int32(0):
-                    warp_base = cute.arch.atomic_add(
-                        cute.domain_offset((out_row, 0), mIndexCounts).iterator,
-                        warp_count,
-                        sem="relaxed",
-                        scope="gpu",
-                    )
-                warp_base = cute.arch.shuffle_sync(warp_base, cutlass.Int32(0))
-                slot = warp_base + lane_rank
+            warp_base = cute.arch.shuffle_sync(warp_base, cutlass.Int32(0))
+            slot = warp_base + lane_rank
             if selected:
-                if slot < segment_end:
+                if slot < self.capacity:
                     # The packed consumer uses request-local logical indices.
                     logical_index = store_kv_pos
                     if cutlass.const_expr(
