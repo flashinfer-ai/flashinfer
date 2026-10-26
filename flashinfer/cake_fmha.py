@@ -2412,6 +2412,278 @@ def _decode_smallm_launch_args(
 _DECODE_PROGRAM_VALUES["decode_smallm"] = _decode_smallm_program_values
 
 
+# --- BF16 decode programs (head dim 128, one query token) --------------------
+#
+# ``cake_fmha_decode_bf16``: 16-token HND pages, eight query heads per KV
+# head, a stacked or strided cache.  A host-scale program takes the base-2
+# softmax scale as a kernel scalar (bmm2 1); a device-scale twin reads the
+# log2-domain bmm1 and the bmm2 FP32 scalars in the kernel.  The key is
+# ``(scale form, batch, q_len, num_q_heads, num_kv_heads, page_size, sink,
+# retain_kv_l2)``.  The families are tried in order, so a family of
+# per-target programs can take a key ahead of this one.
+_DECODE_BF16_FAMILIES = ("decode_bf16",)
+
+_DECODE_PROGRAM_HOST_PARAMS["decode_bf16"] = (
+    "Qt",
+    "K",
+    "V",
+    "O_ptr",
+    "LSE_ptr",
+    "page_table",
+    "causal_seqlens_kv_global",
+    "scale_log2_ptr",
+    "bmm2_ptr",
+    "sinks_ptr",
+    "max_pages_per_seq",
+    "max_local_seq_len",
+    "softmax_scale_log2",
+    "window_left",
+    "num_q_heads",
+    "num_kv_heads",
+    "batch_size",
+)
+_DECODE_PROGRAM_ROUTES["sm100a"].update(
+    {
+        ("decode_bf16", "host", 128, 1, 32, 4, 16, False, False): "DEC_B128",
+        ("decode_bf16", "device", 128, 1, 32, 4, 16, False, False): "DEC_B128_DS",
+        ("decode_bf16", "host", 4, 1, 32, 4, 16, False, True): "DEC_B4C4",
+        ("decode_bf16", "device", 4, 1, 32, 4, 16, False, True): "DEC_B4C4_DS",
+        ("decode_bf16", "host", 256, 1, 32, 4, 16, True, False): "DEC_SINK",
+        ("decode_bf16", "device", 256, 1, 32, 4, 16, True, False): "DEC_SINK_DS",
+    }
+)
+_DECODE_PROGRAM_ROUTES["sm103a"].update(
+    {
+        ("decode_bf16", "host", 128, 1, 32, 4, 16, False, False): "DEC_B128",
+        ("decode_bf16", "device", 128, 1, 32, 4, 16, False, False): "DEC_B128_DS",
+        ("decode_bf16", "host", 4, 1, 32, 4, 16, False, True): "DEC_B4C4",
+        ("decode_bf16", "device", 4, 1, 32, 4, 16, False, True): "DEC_B4C4_DS",
+        ("decode_bf16", "host", 256, 1, 32, 4, 16, True, False): "DEC_SINK",
+        ("decode_bf16", "device", 256, 1, 32, 4, 16, True, False): "DEC_SINK_DS",
+    }
+)
+_DECODE_PROGRAMS.update(
+    {
+        ("decode_bf16", "DEC_B128"): (
+            "cake_fmha_decode_bf16_265a74c9c9384d1e9e07",
+            "persistent",
+        ),
+        ("decode_bf16", "DEC_B128_DS"): (
+            "cake_fmha_decode_bf16_69ec51fc7b583178a053",
+            "persistent",
+        ),
+        ("decode_bf16", "DEC_B4C4"): (
+            "cake_fmha_decode_bf16_da0b91411447542f0766",
+            "cluster",
+        ),
+        ("decode_bf16", "DEC_B4C4_DS"): (
+            "cake_fmha_decode_bf16_41a50922430aef5ca651",
+            "cluster",
+        ),
+        ("decode_bf16", "DEC_SINK"): (
+            "cake_fmha_decode_bf16_eb613495c94cae21226f",
+            "bhq",
+        ),
+        ("decode_bf16", "DEC_SINK_DS"): (
+            "cake_fmha_decode_bf16_394b0caa8e0362fe9988",
+            "bhq",
+        ),
+    }
+)
+
+
+def _decode_exact_sink_member_cannot_finish(
+    route: CakeFmhaDecodeRoute, max_seq_len: int, block_tables: torch.Tensor
+) -> bool:
+    """Whether ``route`` runs the exact B256 sink member on a launch it cannot
+    finish.  That member serves the route's shape without LSE outside the
+    retained-KV form; its page producer always publishes the page groups of
+    32 KV blocks and reads 256 page-table entries per row, so it finishes
+    only when ``max_seq_len`` evens to 30 or 32 blocks (3585..4096) and the
+    table holds 256 pages per row.  Every other member keeps its launches."""
+
+    shape = (route.batch_size, route.q_len, route.num_q_heads, route.num_kv_heads)
+    return (
+        route.has_sink
+        and shape == (256, 1, 32, 4)
+        and not route.return_lse
+        and not route.retain_kv_l2
+        and not route.use_scale_ptr
+        and not route.has_window
+        and not (3585 <= max_seq_len <= 4096 and int(block_tables.shape[-1]) >= 256)
+    )
+
+
+def _decode_bf16_program_select(
+    device: torch.device,
+    *,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    batch_size: int,
+    q_len: int,
+    max_seq_len: int,
+    window_left: int,
+    bmm1_scale: float | torch.Tensor,
+    bmm2_scale: float | torch.Tensor,
+    o_scale: float | None,
+    sinks: torch.Tensor | None,
+    lse: torch.Tensor | None,
+    kv_layout: str,
+    uses_shared_paged_kv_idx: bool,
+    no_block_scales: bool,
+) -> tuple[tuple[str, str], bool] | None:
+    """``(program, device_scales)`` of a BF16 decode launch the generated
+    programs serve, or ``None``.
+
+    A hit takes a contiguous query, 16-token HND pages of head dim 128, a
+    contiguous int32 shared page table at least as wide as the kernels read
+    (eight pages per evened 128-token block, at least four blocks), int32
+    lengths (the kernels derive each request's causal prefix from them), no
+    LSE, window, block scales or output scale, one scale form (host: bmm2 1)
+    and a workspace holding the kernels' LSE scratch.
+    """
+
+    num_q_heads = int(query.shape[1])
+    num_kv_heads = int(key_cache.shape[1])
+    if not (
+        query.is_contiguous()
+        and query.shape[2] == 128
+        and key_cache.shape[2:] == (16, 128)
+        and kv_layout == "HND"
+        and uses_shared_paged_kv_idx
+        and block_tables.ndim == 2
+        and block_tables.dtype == torch.int32
+        and seq_lens.dtype == torch.int32
+        and lse is None
+        and window_left < 0
+        and no_block_scales
+        and (o_scale is None or float(o_scale) == 1.0)
+        and _tma_paged_kv_strides_supported(key_cache)
+        and _tma_paged_kv_strides_supported(value_cache)
+    ):
+        return None
+    form = _decode_program_scale_form(bmm1_scale, bmm2_scale, query)
+    if form is None or (form == "host" and float(bmm2_scale) != 1.0):
+        return None
+    blocks = (max_seq_len + 127) // 128
+    even = max(4, blocks + blocks % 2)
+    if int(block_tables.shape[-1]) < 8 * even:
+        return None
+    if not _decode_native_workspace_supported(
+        workspace_buffer,
+        query,
+        block_tables,
+        batch_size=batch_size,
+        max_seq_len=max_seq_len,
+        pages_per_block=8,
+        page_table_rows=1,
+        lse=None,
+    ):
+        return None
+    key = (
+        form,
+        batch_size,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        16,
+        sinks is not None,
+        max(1, blocks) <= 9,
+    )
+    for family in _DECODE_BF16_FAMILIES:
+        program = _decode_program_lookup(device, family, key)
+        if program is not None:
+            # A cluster program gives each tile its own cluster and arms its
+            # reduction barrier once: a device with fewer SMs than tiles (a
+            # partition) would hand a cluster a second tile and hang.
+            if (
+                _DECODE_PROGRAMS[program][1] == "cluster"
+                and _smallm_sm_count(device) < batch_size * q_len * num_kv_heads
+            ):
+                return None
+            return program, form == "device"
+    return None
+
+
+def _decode_bf16_program_values(
+    module: CakeFmhaDecodeProgramModule,
+    *,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    out: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    bmm1_scale: float | torch.Tensor,
+    bmm2_scale: float | torch.Tensor,
+    sinks: torch.Tensor | None,
+    sm_count: int,
+    **unused: Any,
+) -> list[tuple[Any, Any, dict[str, Any]]]:
+    """The one launch of a BF16 decode program.  The kernels read the page
+    table in place (row stride its width), each request's length (its causal
+    prefix is the length less the query length) and write the per-row LSE
+    to scratch in the workspace (the JIT route's offset).  A pointer the
+    program does not read (a host-scale program's scales, an absent sink)
+    points at the lengths, as the JIT route's do."""
+
+    route = module.route
+    rows = int(query.shape[0]) * int(query.shape[1])
+    lse_offset = (route.batch_size * 4 + 15) // 16 * 16
+    unread = seq_lens.view(torch.float32)
+    if module.route.device_scales:
+        if not isinstance(bmm1_scale, torch.Tensor) or not isinstance(
+            bmm2_scale, torch.Tensor
+        ):
+            raise RuntimeError(
+                f"Cake FMHA decode program {module.identifier} was selected for "
+                "device scales; the launch passes host scales"
+            )
+        scale_ptr, bmm2_ptr = bmm1_scale.reshape(1), bmm2_scale.reshape(1)
+        softmax_scale_log2 = 0.0
+    else:
+        scale_ptr = bmm2_ptr = unread
+        softmax_scale_log2 = float(bmm1_scale) * log2e
+    values: dict[str, Any] = {
+        "Qt": query,
+        "K": key_cache,
+        "V": value_cache,
+        "O_ptr": out,
+        "LSE_ptr": _decode_program_workspace(
+            _decode_program_bytes(workspace_buffer),
+            lse_offset,
+            rows * 4,
+            torch.float32,
+        ),
+        "page_table": block_tables,
+        "causal_seqlens_kv_global": seq_lens,
+        "scale_log2_ptr": scale_ptr,
+        "bmm2_ptr": bmm2_ptr,
+        "sinks_ptr": unread if sinks is None else sinks,
+        "max_pages_per_seq": int(block_tables.shape[-1]),
+        "max_local_seq_len": max_seq_len,
+        "softmax_scale_log2": softmax_scale_log2,
+        "window_left": -1,
+        "num_q_heads": route.num_q_heads,
+        "num_kv_heads": route.num_kv_heads,
+        "batch_size": route.batch_size,
+    }
+    grid = _decode_program_grid(
+        module, module.program, module.launch, sm_count=sm_count
+    )
+    values.update(grid)
+    return [(module.program, module.entry, values)]
+
+
+_DECODE_PROGRAM_VALUES["decode_bf16"] = _decode_bf16_program_values
+
+
 def select_cake_fmha_decode_route(
     device: torch.device,
     *,
@@ -2445,6 +2717,11 @@ def select_cake_fmha_decode_route(
 
     ``enable_pdl`` is the caller's launch mode; a generated program whose split-KV
     reducer waits on the decode grid serves only a call that asks for it.
+
+    A launch with ``lse`` takes the program route of the same launch without
+    it, with ``return_lse`` set, when its JIT member is the route the module
+    selects for the LSE launch: the route then runs that JIT member (the BF16
+    programs write no caller LSE).
     """
 
     if q_len is None or q_len <= 0 or batch_size <= 0 or max_seq_len <= 0:
@@ -2789,6 +3066,50 @@ def select_cake_fmha_decode_route(
             # Long-context / ragged decode: the on-device balanced scheduler
             # splits long requests into chunks and merges them on device.
             return route("decode_balanced_bf16", selected_page_size=16)
+        # Generated BF16 programs (host or device scales, sinks), ahead of the
+        # native JIT members; a launch they do not serve keeps those.  An LSE
+        # launch is selected as the same launch without it and decided at the
+        # native member below.
+        bf16_program = _decode_bf16_program_select(
+            device,
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            workspace_buffer=workspace_buffer,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            batch_size=batch_size,
+            q_len=q_len,
+            max_seq_len=max_seq_len,
+            window_left=window_left,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            o_scale=o_scale,
+            sinks=sinks,
+            lse=None,
+            kv_layout=kv_layout,
+            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+            no_block_scales=no_block_scales,
+        )
+        program_route = None
+        if bf16_program is not None:
+            program_route = CakeFmhaDecodeRoute(
+                target=_cake_fmha_target(device),
+                batch_size=batch_size,
+                q_len=q_len,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                has_sink=sinks is not None,
+                has_window=False,
+                use_scale_ptr=bf16_program[1],
+                retain_kv_l2=local_blocks <= 9,
+                component="decode_native_bf16",
+                page_size=16,
+                program=bf16_program[0],
+                device_scales=bf16_program[1],
+            )
+            if lse is None:
+                return program_route
         if (
             query.is_contiguous()
             and query.shape[2] == 128
@@ -2812,7 +3133,21 @@ def select_cake_fmha_decode_route(
             and float(bmm2_scale) == 1.0
             and (o_scale is None or float(o_scale) == 1.0)
         ):
-            return route("decode_native_bf16", selected_page_size=16)
+            native = route("decode_native_bf16", selected_page_size=16)
+            if native is not None and _decode_exact_sink_member_cannot_finish(
+                native, max_seq_len, block_tables
+            ):
+                # A launch the exact sink member cannot finish takes the
+                # compat route (a program it fits took its program above).
+                return None
+            # The LSE launch keeps the program route of the launch without it
+            # when that route's JIT member is this one; the route runs the
+            # member (see _decode_route_runs_program).
+            if program_route is not None and native == dataclass_replace(
+                program_route, program=None, device_scales=False, return_lse=True
+            ):
+                return dataclass_replace(program_route, return_lse=True)
+            return native
         return None
 
     if dtypes == (torch.float16,) * 4:

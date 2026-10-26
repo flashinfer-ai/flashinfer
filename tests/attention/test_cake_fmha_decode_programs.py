@@ -11,6 +11,7 @@ program family adds its shape rows, boundaries and GPU cases.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import importlib
 import operator
 import sys
@@ -505,6 +506,18 @@ SHAPE_ROWS: dict[str, tuple] = {
         "decode_nvfp4", "nvfp4", 128, 1, 8192, 32, 4, 16,
         {"sm100a": "DEC_NVFP4_B128", "sm103a": "DEC_NVFP4_B128"},
     ),
+    "bf16_b128_s4096": (
+        "decode_bf16", "bf16", 128, 1, 4096, 32, 4, 16,
+        {"sm100a": "DEC_B128", "sm103a": "DEC_B128"},
+    ),
+    "bf16_b4_s1024": (
+        "decode_bf16", "bf16", 4, 1, 1024, 32, 4, 16,
+        {"sm100a": "DEC_B4C4", "sm103a": "DEC_B4C4"},
+    ),
+    "bf16_b256_s4096_sink": (
+        "decode_bf16", "bf16_sink", 256, 1, 4096, 32, 4, 16,
+        {"sm100a": "DEC_SINK", "sm103a": "DEC_SINK"},
+    ),
     "smallm_kv60008_q8_p64": (
         "decode_smallm", "smallm", 1, 8, 60008, 8, 1, 64,
         {"sm100a": "N64_P64_Q8_S148", "sm103a": "N64_P64_Q8_S152"},
@@ -572,7 +585,8 @@ def _decode_kwargs(
     pages = -(-kv_len // page_size)
     width = pages if width is None else width
     total_pages = batch * max(width, 1)
-    q_dtype = torch.bfloat16 if kind in ("bf16", "smallm") else torch.float8_e4m3fn
+    bf16 = kind in ("bf16", "bf16_sink", "smallm")
+    q_dtype = torch.bfloat16 if bf16 else torch.float8_e4m3fn
     query = torch.empty(
         (batch * q_len, num_q_heads, head_dim), dtype=q_dtype, device=device
     )
@@ -613,7 +627,11 @@ def _decode_kwargs(
         bmm1_scale=scale(_HOST_BMM1),
         bmm2_scale=scale(bmm2),
         o_scale=0.75 if kind in _QUANT_KINDS else 1.0,
-        sinks=None,
+        sinks=(
+            torch.empty((num_q_heads,), dtype=torch.float32, device=device)
+            if kind == "bf16_sink"
+            else None
+        ),
         kv_layout="HND",
         uses_shared_paged_kv_idx=True,
         cum_seq_lens_q=None,
@@ -666,7 +684,11 @@ def _select(kwargs):
 # The program a launch with device scales takes, per host-scalar program
 # (a family whose programs read both forms takes the same program; a family
 # without device scales takes none).
-_DEVICE_SCALE_PROGRAM: dict[tuple[str, str], str | None] = {}
+_DEVICE_SCALE_PROGRAM: dict[tuple[str, str], str | None] = {
+    ("decode_bf16", "DEC_B128"): "DEC_B128_DS",
+    ("decode_bf16", "DEC_B4C4"): "DEC_B4C4_DS",
+    ("decode_bf16", "DEC_SINK"): "DEC_SINK_DS",
+}
 
 
 def _device_scale_program(family, identifier):
@@ -990,23 +1012,24 @@ def _check_hit_is_sync_free_and_replays(case, lengths):
     """The hit reads nothing back (the spy), and a CUDA graph captured at the
     case's lengths replays new lengths bitwise to a direct launch."""
 
-    _run_decode(case)
+    run = getattr(case, "run", _run_decode)
+    run(case)
     torch.cuda.synchronize()
     with no_host_sync():
-        _run_decode(case)
+        run(case)
     seq_lens = case.seq_lens.clone()
     out = torch.empty_like(case.out)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        _run_decode(case, seq_lens=seq_lens, out=out)
+        run(case, seq_lens=seq_lens, out=out)
     torch.cuda.current_stream().wait_stream(stream)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        _run_decode(case, seq_lens=seq_lens, out=out)
+        run(case, seq_lens=seq_lens, out=out)
     seq_lens.copy_(lengths)
     graph.replay()
-    direct = _run_decode(case, seq_lens=lengths)
+    direct = run(case, seq_lens=lengths)
     torch.cuda.synchronize()
     assert torch.equal(_bits(out), _bits(direct))
 
@@ -1517,3 +1540,309 @@ def test_cake_decode_smallm_program_without_a_counter_buffer(served_programs) ->
     for _ in range(3):
         assert torch.equal(_bits(_run_decode(without)), _bits(expected))
     assert not with_buffer.counter.any()
+
+
+# --- BF16 boundaries (host-only) ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("row", "overrides", "program"),
+    [
+        # Nine 128-token blocks keep the KV in L2 (the cluster program's key);
+        # the table must hold ten evened blocks of eight pages.
+        ("bf16_b4_s1024", {"kv_len": 1152, "width": 80}, "DEC_B4C4"),
+        ("bf16_b4_s1024", {"kv_len": 1153, "width": 80}, None),
+        ("bf16_b4_s1024", {"kv_len": 1024, "max_seq_len": 1152}, None),
+        ("bf16_b4_s1024", {"kv_len": 1, "width": 32}, "DEC_B4C4"),
+        ("bf16_b4_s1024", {"kv_len": 1}, None),
+        ("bf16_b128_s4096", {"kv_len": 4000, "width": 256}, "DEC_B128"),
+        ("bf16_b128_s4096", {"kv_len": 4000}, None),
+        ("bf16_b128_s4096", {"width": 255}, None),
+        ("bf16_b128_s4096", {"batch": 127}, None),
+        ("bf16_b128_s4096", {"batch": 129}, None),
+        ("bf16_b256_s4096_sink", {"batch": 255}, None),
+        ("bf16_b4_s1024", {"num_q_heads": 16, "num_kv_heads": 2}, None),
+    ],
+)
+def test_cake_fmha_decode_bf16_boundaries(decode_target, row, overrides, program):
+    decode_target("sm100a")
+    route = _select(_row_kwargs(row, **overrides))
+    if program is None:
+        assert route is None or route.program is None, overrides
+    else:
+        assert route.program == ("decode_bf16", program), overrides
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+@pytest.mark.parametrize(
+    ("kv_len", "max_seq_len", "width", "lse", "kept"),
+    [
+        (4096, 4096, 256, False, True),
+        (3585, 3585, 256, False, True),
+        (1300, 4096, 256, False, True),
+        (3584, 3584, 256, False, False),
+        (4100, 4100, 272, False, False),
+        (1300, 1300, 144, False, False),
+        (1300, 4096, 144, False, False),
+        (1300, 1300, 82, False, False),
+        # The retained-KV member (max_seq_len up to 9 blocks) keeps its
+        # launches, with or without LSE; an LSE launch never runs the exact
+        # member (no member writes LSE at its other flags).
+        (1152, 1152, 144, False, True),
+        (1152, 1152, 72, False, True),
+        (1152, 1152, 144, True, True),
+        (1300, 1300, 144, True, False),
+    ],
+)
+def test_cake_fmha_decode_exact_sink_member_finishes_or_takes_compat(
+    decode_target, monkeypatch, target, kv_len, max_seq_len, width, lse, kept
+) -> None:
+    """The exact B256 sink member finishes only for 3585 <= max_seq_len <=
+    4096 with 256 pages per row: the launches outside that window that would
+    run it take the compat route, and every other launch keeps its member."""
+
+    decode_target(target)
+    _keep_the_jit_route(monkeypatch)
+    kwargs = _row_kwargs(
+        "bf16_b256_s4096_sink", kv_len=kv_len, max_seq_len=max_seq_len, width=width
+    )
+    if lse:
+        kwargs["lse"] = torch.empty((256, 32), dtype=torch.float32, device="meta")
+    route = _select(kwargs)
+    if kept:
+        assert route is not None and route.component == "decode_native_bf16", route
+        assert route.has_sink and route.program is None and route.return_lse == lse
+        assert route.retain_kv_l2 == (max_seq_len <= 9 * 128)
+    else:
+        assert route is None, route
+
+
+@pytest.mark.parametrize("device_scales", (False, True))
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+def test_cake_fmha_decode_bf16_cluster_program_needs_a_cluster_per_tile(
+    decode_target, target, device_scales
+) -> None:
+    """The cluster program gives each of its 16 tiles (4 requests x 4 KV heads)
+    its own cluster and arms its reduction barrier once.  A device with fewer
+    SMs (a partition) keeps the module's route; that JIT member refuses the
+    launch instead of hanging."""
+
+    kwargs = _row_kwargs("bf16_b4_s1024", device_scales=device_scales)
+    identifier = SHAPE_ROWS["bf16_b4_s1024"][-1][target]
+    if device_scales:
+        identifier = _device_scale_program("decode_bf16", identifier)
+    decode_target(target, sm_count=16)
+    assert _select(kwargs).program == ("decode_bf16", identifier)
+    decode_target(target, sm_count=15)
+    route = _select(kwargs)
+    assert route is None or route.program is None, route
+    if not device_scales:
+        assert route.component == "decode_native_bf16", route
+        assert not cake_api._decode_route_runs_program(route)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "lse",
+        "window",
+        "bmm2",
+        "o_scale",
+        "mixed_scales",
+        "cpu_scales",
+        "uint32_lengths",
+        "contiguous_pools",
+    ),
+)
+@pytest.mark.parametrize("row", ("bf16_b128_s4096", "bf16_b4_s1024"))
+def test_cake_fmha_decode_bf16_misses_keep_the_other_routes(
+    decode_target, row, mutation
+) -> None:
+    """Outside the programs' contract a launch keeps the module's routes: a
+    window, a host bmm2 other than 1, an output scale, mixed or CPU scales,
+    unsigned lengths and separate contiguous K / V pools (the aligned
+    programs' form).  An LSE launch runs the JIT member of its route."""
+
+    decode_target("sm100a")
+    kwargs = _row_kwargs(row)
+    query = kwargs["query"]
+    if mutation == "lse":
+        kwargs["lse"] = torch.empty(
+            (query.shape[0], query.shape[1]), dtype=torch.float32, device="meta"
+        )
+    elif mutation == "window":
+        kwargs["window_left"] = 128
+    elif mutation == "bmm2":
+        kwargs["bmm2_scale"] = 0.5
+    elif mutation == "o_scale":
+        kwargs["o_scale"] = 0.75
+    elif mutation == "mixed_scales":
+        kwargs["bmm1_scale"] = torch.empty((1,), dtype=torch.float32, device="meta")
+    elif mutation == "cpu_scales":
+        kwargs["bmm1_scale"] = torch.ones((1,), dtype=torch.float32)
+        kwargs["bmm2_scale"] = torch.ones((1,), dtype=torch.float32)
+    elif mutation == "uint32_lengths":
+        kwargs["seq_lens"] = kwargs["seq_lens"].to(torch.uint32)
+    else:
+        key = kwargs["key_cache"]
+        kwargs["key_cache"] = torch.empty(key.shape, dtype=key.dtype, device="meta")
+        kwargs["value_cache"] = torch.empty_like(kwargs["key_cache"])
+    route = _select(kwargs)
+    if mutation == "lse":
+        # An LSE launch takes the route of the same launch without it and runs
+        # the JIT member, which writes the LSE (the programs write none).
+        plain = _select(_row_kwargs(row))
+        assert route == dataclasses.replace(plain, return_lse=True), route
+        assert not cake_api._decode_route_runs_program(route)
+        jit = dataclasses.replace(route, program=None, device_scales=False)
+        assert cake_api._route_components(route) == cake_api._route_components(jit)
+        assert cake_api.cake_fmha_route_is_optimized(route)
+    else:
+        assert route is None or route.program is None, (row, mutation, route)
+
+
+@pytest.mark.parametrize("device_scales", (False, True))
+@pytest.mark.parametrize(
+    ("row", "grid"),
+    [
+        ("bf16_b128_s4096", (148, 1, 1)),
+        ("bf16_b4_s1024", (64, 1, 1)),
+        ("bf16_b256_s4096_sink", (1, 4, 256)),
+    ],
+)
+def test_cake_decode_bf16_program_values(monkeypatch, row, grid, device_scales) -> None:
+    """The kernels read the caller's tensors in place, the lengths raw, the
+    LSE scratch at the JIT route's offset; unread pointers point at the
+    lengths."""
+
+    kwargs, launches = _program_values(monkeypatch, row, device_scales=device_scales)
+    ((_, values),) = launches
+    batch = kwargs["batch_size"]
+    assert values["Qt"] is kwargs["query"] and values["O_ptr"] is kwargs["out"]
+    assert values["K"] is kwargs["key_cache"] and values["V"] is kwargs["value_cache"]
+    assert values["page_table"] is kwargs["block_tables"]
+    assert values["causal_seqlens_kv_global"] is kwargs["seq_lens"]
+    assert values["max_pages_per_seq"] == kwargs["block_tables"].shape[1]
+    assert values["max_local_seq_len"] == kwargs["max_seq_len"]
+    workspace = kwargs["workspace_buffer"].data_ptr()
+    assert values["LSE_ptr"].data_ptr() == workspace + (batch * 4 + 15) // 16 * 16
+    assert values["LSE_ptr"].numel() == batch * 32
+    lengths = kwargs["seq_lens"].data_ptr()
+    if device_scales:
+        assert _same_storage(values["scale_log2_ptr"], kwargs["bmm1_scale"])
+        assert _same_storage(values["bmm2_ptr"], kwargs["bmm2_scale"])
+    else:
+        assert values["scale_log2_ptr"].data_ptr() == lengths
+        assert values["bmm2_ptr"].data_ptr() == lengths
+        assert values["softmax_scale_log2"] == _HOST_BMM1 * 1.4426950408889634
+    if kwargs["sinks"] is None:
+        assert values["sinks_ptr"].data_ptr() == lengths
+    else:
+        assert values["sinks_ptr"] is kwargs["sinks"]
+    assert values["window_left"] == -1
+    assert (values["num_q_heads"], values["num_kv_heads"]) == (32, 4)
+    assert values["batch_size"] == batch
+    assert (values["grid_x"], values["grid_y"], values["grid_z"]) == grid
+
+
+# --- GPU: BF16 ---------------------------------------------------------------
+
+_BF16_GPU_ROWS = ("bf16_b128_s4096", "bf16_b4_s1024", "bf16_b256_s4096_sink")
+# The programs whose host-scale form is the module's JIT member bit for bit
+# (the four-CTA cluster program splits a tile's KV four ways instead of two).
+_BF16_JIT_BITWISE = ("DEC_B128", "DEC_SINK")
+
+
+def _bf16_gpu_case(row, *, seed, device_scales=False, lengths=None):
+    case = _bf16_case(row, seed=seed, lengths=lengths)
+    if SHAPE_ROWS[row][1] == "bf16_sink":
+        generator = torch.Generator(device="cuda").manual_seed(seed + 1)
+        case.sinks = (
+            torch.rand((32,), generator=generator, device="cuda", dtype=torch.float32)
+            * 5.0
+        )
+    if device_scales:
+        # The log2-domain bmm1 the host route computes, so both forms agree.
+        log2_bmm1 = torch.tensor(
+            [case.bmm1 * 1.4426950408889634], dtype=torch.float32, device="cuda"
+        )
+        case.bmm1 = log2_bmm1 / 1.4426950408889634
+        case.bmm1_log2 = log2_bmm1
+        case.bmm2 = torch.ones((1,), dtype=torch.float32, device="cuda")
+    return case
+
+
+def _run_bf16(case, **kwargs):
+    log2 = getattr(case, "bmm1_log2", None)
+    if log2 is None:
+        return _run_decode(case, **kwargs)
+    seq_lens, out = kwargs.get("seq_lens"), kwargs.get("out")
+    return decode_api.trtllm_batch_decode_with_kv_cache(
+        case.query,
+        case.kv_cache,
+        case.workspace,
+        case.block_tables,
+        case.seq_lens if seq_lens is None else seq_lens,
+        case.max_seq_len,
+        bmm1_scale=case.bmm1,
+        bmm2_scale=case.bmm2,
+        bmm1_scale_log2=log2,
+        out=torch.empty_like(case.out) if out is None else out,
+        kv_layout="HND",
+        backend="cake",
+        sinks=case.sinks,
+        enable_pdl=True,
+        multi_ctas_kv_counter_buffer=case.counter,
+    )
+
+
+@_GPU
+@pytest.mark.parametrize("lengths", ("uniform", "ragged"))
+@pytest.mark.parametrize("row", _BF16_GPU_ROWS)
+def test_cake_decode_bf16_programs_match_reference_and_the_jit_route(
+    monkeypatch, served_programs, row, lengths
+) -> None:
+    target = _require_full_device()
+    batch, kv_len = SHAPE_ROWS[row][2], SHAPE_ROWS[row][4]
+    ragged = None
+    if lengths == "ragged":
+        ragged = [kv_len, 1, 2, 129, kv_len - 1, 255, kv_len // 2, 17]
+        ragged = (ragged * batch)[:batch]
+    case = _bf16_gpu_case(row, seed=20261031, lengths=ragged)
+    got = _run_bf16(case)
+    identifier = SHAPE_ROWS[row][-1][target]
+    assert served_programs == [("decode_bf16", identifier)]
+    batches = sorted({0, 1, 2, 3, batch - 1})
+    reference = _bf16_reference(case, batches)
+    for b in batches:
+        torch.testing.assert_close(
+            got[b].float(), reference[b][0], atol=1e-2, rtol=1e-2, msg=f"request {b}"
+        )
+    # The device-scale twin, with the same base-2 scale: the same bits.
+    device_case = _bf16_gpu_case(row, seed=20261031, lengths=ragged, device_scales=True)
+    device_out = _run_bf16(device_case)
+    assert served_programs[-1] == ("decode_bf16", f"{identifier}_DS")
+    assert torch.equal(_bits(device_out), _bits(got))
+    _keep_the_jit_route(monkeypatch)
+    jit = _run_bf16(case)
+    assert len(served_programs) == 2
+    if identifier in _BF16_JIT_BITWISE:
+        assert torch.equal(_bits(got), _bits(jit))
+    else:
+        torch.testing.assert_close(got.float(), jit.float(), atol=1e-2, rtol=1e-2)
+
+
+@_GPU
+@pytest.mark.parametrize("device_scales", (False, True))
+@pytest.mark.parametrize("row", _BF16_GPU_ROWS)
+def test_cake_decode_bf16_program_is_sync_free_and_replays(
+    served_programs, row, device_scales
+) -> None:
+    target = _require_full_device()
+    case = _bf16_gpu_case(row, seed=20261101, device_scales=device_scales)
+    batch, kv_len = SHAPE_ROWS[row][2], SHAPE_ROWS[row][4]
+    lengths = torch.randint(1, kv_len + 1, (batch,), dtype=torch.int32, device="cuda")
+    case.run = _run_bf16
+    _check_hit_is_sync_free_and_replays(case, lengths)
+    identifier = SHAPE_ROWS[row][-1][target] + ("_DS" if device_scales else "")
+    assert set(served_programs) == {("decode_bf16", identifier)}
