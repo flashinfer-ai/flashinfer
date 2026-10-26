@@ -40,6 +40,15 @@ handling; the flag is part of each compile key. This is the measured CuTe auto
 rework, not the previous pipeline32 implementation. The separate local-fusion
 prototype is not included.
 
+Launch-grid dimensions (token/chunk slots, segments, sequences and normalization
+rows) are runtime arguments, so new sequence lengths reuse compiled kernels
+within the same static configuration and kernel path. Head shapes, dtypes,
+state layout/options, V tile and the V128 full-chunk specialization still select
+separate compiled variants. A fused-only warmup does not compile the CP
+Warmup/PrepareH/CorrectH kernels. Sequence-layout plans remain separate from the
+compiled-kernel cache; the 64-layout limit and graph warmup requirement above
+still apply.
+
 ## Validation and measurement
 
 ```bash

@@ -24,12 +24,12 @@ class Warmup(KeyedCompileMixin):
             threshold,
             g_dtype,
         )
-        self.manual_cache_key("heads", "parts", "index_dtype", "threshold", "g_dtype")
+        self.manual_cache_key("heads", "index_dtype", "threshold", "g_dtype")
 
     @cute.jit
-    def __call__(self, g, segments, counts, fallback, stream):
+    def __call__(self, g, segments, counts, fallback, parts: int, stream):
         self.kernel(g, segments, counts, fallback).launch(
-            grid=(self.parts, 1, 1),
+            grid=(parts, 1, 1),
             block=(((self.heads + 31) // 32) * 32, 1, 1),
             stream=stream,
         )
@@ -71,11 +71,11 @@ class PrepareH(KeyedCompileMixin):
             self.b_dtype,
         ) = dtype, hk, heads, parts, index_dtype, g_dtype, b_dtype
         self.manual_cache_key(
-            "dtype", "hk", "heads", "parts", "index_dtype", "g_dtype", "b_dtype"
+            "dtype", "hk", "heads", "index_dtype", "g_dtype", "b_dtype"
         )
 
     @cute.jit
-    def __call__(self, k, v, a, g, b, segments, counts, ht, mt, stream):
+    def __call__(self, k, v, a, g, b, segments, counts, ht, mt, parts: int, stream):
         dtype = self.dtype
 
         @cute.struct
@@ -97,7 +97,7 @@ class PrepareH(KeyedCompileMixin):
         # toolchain, omitting this prevents CTA register-pool allocation and
         # spills the recurrent state despite the setmaxregister calls below.
         self.kernel(k, v, a, g, b, segments, counts, ht, mt).launch(
-            grid=(self.parts, self.heads, 1),
+            grid=(parts, self.heads, 1),
             block=(512, 1, 1),
             min_blocks_per_mp=1,
             stream=stream,
@@ -363,7 +363,6 @@ class CorrectH(KeyedCompileMixin):
         self.manual_cache_key(
             "dtype",
             "heads",
-            "sequences",
             "index_dtype",
             "initial_dtype",
             "has_initial",
@@ -371,7 +370,7 @@ class CorrectH(KeyedCompileMixin):
         )
 
     @cute.jit
-    def __call__(self, ht, mt, fb, ranges, initial, result, stream):
+    def __call__(self, ht, mt, fb, ranges, initial, result, sequences: int, stream):
         dtype = self.dtype
 
         @cute.struct
@@ -381,7 +380,7 @@ class CorrectH(KeyedCompileMixin):
 
         self.storage = Storage
         self.kernel(ht, mt, fb, ranges, initial, result).launch(
-            grid=(4, self.heads, self.sequences), block=(128, 1, 1), stream=stream
+            grid=(4, self.heads, sequences), block=(128, 1, 1), stream=stream
         )
 
     @cute.kernel
@@ -448,12 +447,12 @@ def boundary_states(
     mt = torch.empty_like(ht)
     launch(
         Warmup(heads, parts, segments.dtype, threshold, g.dtype),
-        (g, segments, counts, fallback),
+        (g, segments, counts, fallback, parts),
         k.device,
     )
     launch(
         PrepareH(dtype, k.shape[1], heads, parts, segments.dtype, g.dtype, b.dtype),
-        (k, v, a, g, b, segments, counts, ht, mt),
+        (k, v, a, g, b, segments, counts, ht, mt, parts),
         k.device,
     )
     has_initial = initial is not None
@@ -470,7 +469,7 @@ def boundary_states(
             has_initial,
             state_v_first,
         ),
-        (ht, mt, fallback, ranges, initial, result),
+        (ht, mt, fallback, ranges, initial, result, ranges.shape[0]),
         k.device,
     )
     return result, counts, fallback, ht, mt

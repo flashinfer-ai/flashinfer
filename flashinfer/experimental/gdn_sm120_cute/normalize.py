@@ -9,18 +9,16 @@ from .preprocess import launch
 class Normalize128(KeyedCompileMixin):
     def __init__(self, dtype, rows):
         self.dtype, self.rows = dtype, rows
-        self.manual_cache_key("dtype", "rows")
+        self.manual_cache_key("dtype")
 
     @cute.jit
-    def __call__(self, x, y, stream):
+    def __call__(self, x, y, rows: int, stream):
         @cute.struct
         class Storage:
             partial: cute.struct.MemRange[cutlass.Float32, 4]
 
         self.storage = Storage
-        self.kernel(x, y).launch(
-            grid=(self.rows, 1, 1), block=(128, 1, 1), stream=stream
-        )
+        self.kernel(x, y).launch(grid=(rows, 1, 1), block=(128, 1, 1), stream=stream)
 
     @cute.kernel
     def kernel(self, x, y):
@@ -49,5 +47,5 @@ class Normalize128(KeyedCompileMixin):
 def normalize(x):
     y = torch.empty_like(x)
     dtype = {torch.bfloat16: cutlass.BFloat16, torch.float16: cutlass.Float16}[x.dtype]
-    launch(Normalize128(dtype, x.numel() // 128), (x, y), x.device)
+    launch(Normalize128(dtype, x.numel() // 128), (x, y, x.numel() // 128), x.device)
     return y

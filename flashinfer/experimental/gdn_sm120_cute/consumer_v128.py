@@ -45,7 +45,6 @@ class FusedForward128(KeyedCompileMixin):
             "dtype",
             "hk",
             "heads",
-            "segments",
             "index_dtype",
             "initial_dtype",
             "has_initial",
@@ -59,7 +58,20 @@ class FusedForward128(KeyedCompileMixin):
 
     @cute.jit
     def __call__(
-        self, q, k, v, a, g, b, segments, initial, output, final, scale, stream
+        self,
+        q,
+        k,
+        v,
+        a,
+        g,
+        b,
+        segments,
+        initial,
+        output,
+        final,
+        scale,
+        nseg: int,
+        stream,
     ):
         dtype = self.dtype
 
@@ -79,7 +91,7 @@ class FusedForward128(KeyedCompileMixin):
 
         self.storage = Storage
         self.kernel(q, k, v, a, g, b, segments, initial, output, final, scale).launch(
-            grid=(1, self.heads, self.segments),
+            grid=(1, self.heads, nseg),
             block=(512, 1, 1),
             min_blocks_per_mp=1,
             stream=stream,
@@ -430,6 +442,7 @@ def fused_forward(
     )
     args = tuple(map(wrap, (q, k, v, a, g, b, segments, initial, output, final))) + (
         cutlass.Float32(scale if scale is not None else 128 ** (-0.5)),
+        segments.shape[0],
         driver.CUstream(torch.cuda.current_stream(k.device).cuda_stream),
     )
     fn = cached_compile(kernel, *args, compile_options=(cute.GPUArch("sm_120a"),))

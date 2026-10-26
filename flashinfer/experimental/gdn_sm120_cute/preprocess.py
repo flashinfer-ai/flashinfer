@@ -21,7 +21,7 @@ def wrap(a):
 def launch(kernel, args, device):
     import cuda.bindings.driver as driver
 
-    args = tuple(map(wrap, args)) + (
+    args = tuple(wrap(a) if isinstance(a, torch.Tensor) else a for a in args) + (
         driver.CUstream(torch.cuda.current_stream(device).cuda_stream),
     )
     fn = cached_compile(kernel, *args, compile_options=(cute.GPUArch("sm_120a"),))
@@ -36,12 +36,12 @@ class Prefix32(KeyedCompileMixin):
             index_dtype,
             g_dtype,
         )
-        self.manual_cache_key("heads", "slots", "index_dtype", "g_dtype")
+        self.manual_cache_key("heads", "index_dtype", "g_dtype")
 
     @cute.jit
-    def __call__(self, g, indices, prefix, stream):
+    def __call__(self, g, indices, prefix, slots: int, stream):
         self.kernel(g, indices, prefix).launch(
-            grid=(self.slots, self.heads, 1), block=(32, 1, 1), stream=stream
+            grid=(slots, self.heads, 1), block=(32, 1, 1), stream=stream
         )
 
     @cute.kernel
@@ -72,10 +72,10 @@ class Inverse32(KeyedCompileMixin):
             index_dtype,
             b_dtype,
         )
-        self.manual_cache_key("dtype", "hk", "heads", "slots", "index_dtype", "b_dtype")
+        self.manual_cache_key("dtype", "hk", "heads", "index_dtype", "b_dtype")
 
     @cute.jit
-    def __call__(self, k, b, indices, a, stream):
+    def __call__(self, k, b, indices, a, slots: int, stream):
         dtype = self.dtype
 
         @cute.struct
@@ -87,7 +87,7 @@ class Inverse32(KeyedCompileMixin):
 
         self.storage = Storage
         self.kernel(k, b, indices, a).launch(
-            grid=(self.slots, self.heads, 1), block=(128, 1, 1), stream=stream
+            grid=(slots, self.heads, 1), block=(128, 1, 1), stream=stream
         )
 
     @cute.kernel
@@ -184,11 +184,13 @@ def precompute(k, b, g, indices):
     prefix = torch.empty_like(g)
     dtype = {torch.bfloat16: cutlass.BFloat16, torch.float16: cutlass.Float16}[k.dtype]
     launch(
-        Prefix32(heads, slots, indices.dtype, g.dtype), (g, indices, prefix), k.device
+        Prefix32(heads, slots, indices.dtype, g.dtype),
+        (g, indices, prefix, slots),
+        k.device,
     )
     launch(
         Inverse32(dtype, hk, heads, slots, indices.dtype, b.dtype),
-        (k, b, indices, a),
+        (k, b, indices, a, slots),
         k.device,
     )
     return a, prefix
