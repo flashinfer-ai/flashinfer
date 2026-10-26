@@ -29,15 +29,30 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
 - Attention:
     - `BatchDecodeWithPagedKVCacheWrapper` - Decode attention with paged KV cache.
         - Also supports computationally similar `cudnn_batch_decode_with_kv_cache` and `trtllm_batch_decode_with_kv_cache`.
+        - `trtllm-native` calls `trtllm_batch_decode_with_kv_cache(backend="auto")` (trtllm-gen on SM10x, XQA elsewhere; the CSV `resolved_backend` names which); `xqa` forces XQA. `cute-dsl` is the wrapper backend of that name.
         - Speculative decode is supported by setting `--s_qo > 1` (subject to backend limitations noted below).
     - `BatchPrefillWithPagedKVCacheWrapper` - Prefill attention with paged KV cache.
-        - Also supports computationally similar `cudnn_batch_prefill_with_kv_cache` and  `trtllm_batch_context_with_kv_cache`.
+        - Also supports computationally similar `cudnn_batch_prefill_with_kv_cache` and  `trtllm_batch_context_with_kv_cache` (causal and non-causal). `cute-dsl` is the wrapper's CuTe DSL backend. `batch-attention` runs `flashinfer.BatchAttention` (holistic persistent prefill/decode kernel) on the same paged batch; its fixed workspace can reject large batches, in which case it is skipped.
     - `BatchPrefillWithRaggedKVCacheWrapper` - Prefill attention with ragged KV cache.
-        - Also supports computationally similar `cudnn_batch_prefill_with_kv_cache` (cudnn-native) and  `trtllm_ragged_attention_deepseek`.
+        - Also supports computationally similar `cudnn_batch_prefill_with_kv_cache` (cudnn-native) and  `trtllm_ragged_attention_deepseek` (`trtllm-native`, and `cute-dsl` with `backend="cute-dsl"`). `auto` is the wrapper's auto selection (the CSV `resolved_backend` names the pick); `cutile` needs equal q/kv lengths.
+    - The three dense routines accept `--window_left`, `--logits_soft_cap` and `--sinks`; backends that cannot serve a requested mode are skipped rather than run without it.
+    - `append_paged_kv_cache` - KV-cache write path: `append_paged_kv_cache`, `append_paged_mla_kv_cache` (`--kv_cache_kind mla`) and their NVFP4 quantize-append variants (`--kv_dtype nvfp4`, optional `--slot_mapping`). `--s_qo` is the per-request append length and `--s_kv` the cache length after the append; reports bandwidth only.
+    - `single_decode_with_kv_cache` / `single_prefill_with_kv_cache` - one request over a contiguous (non-paged) KV tensor. Decode backends `fa2` (CUDA cores) and `fa2_tc` (tensor cores); prefill backends `fa2`, `fa3` (SM90) and `auto`.
+    - `merge_states` - cascade attention-state merge: `merge_state` for `--num_states 2`, `merge_states` for more. `--batch_size` is the token count; reports bandwidth only.
     - `BatchMLAPagedAttentionWrapper` - MLA attention proposed in DeepSeek series of models.
-        - Also supports computationally similar `trtllm_batch_decode_with_kv_cache_mla` (trtllm-native) and CuTe DSL MLA decode kernel (cute-dsl, SM100+).
-    - `trtllm_batch_decode_sparse_mla_dsv4` - DeepSeek-V4 sparse MLA using the public TRTLLM-GEN API on SM100/SM103. Supports varlen prefill-style query lengths, causal SWA and compressed-cache sparse tables, FP8/BF16 inputs, sampled FP32 reference checking, and hot-path Q-tile selector benchmarks.
-    - All four wrapper attention routines above accept `--backends prims-ts` on SM100/SM103. The standalone `trtllm_batch_decode_sparse_mla_dsv4` routine supports only `trtllm-gen`.
+        - Wrapper backends: `fa2`, `fa3`, `cutlass`, `cutile` (SM100/SM103/SM12x, BF16, `s_qo=1`) and `trtllm-gen` (the wrapper's own trtllm-gen backend, SM100/SM103 only).
+        - Direct `trtllm_batch_decode_with_kv_cache_mla` backends: `trtllm-native` (backend="trtllm-gen"), `cute-dsl` and `auto` (pairs with `--autotune`). `prims-ts` runs the task-scheduled MLA decode.
+        - `--sparse_mla_top_k K` benchmarks token-sparse (DSA / DeepSeek-V3.2 / GLM-5) decode on `trtllm-native`/`auto`: every query row attends `K` causally visible tokens (seeded random selection); throughput counts the selected tokens and `--refcheck` checks sampled rows against an FP32 gather oracle. With `--s_qo > 1` the KV bytes are counted per query row, so sparse MTP `tb_per_sec` is not comparable with dense MTP rows.
+        - `--use_fp16_softmax` selects the SM107-only FP16-softmax trtllm-gen cubins for `trtllm-native`.
+    - `trtllm_batch_decode_sparse_mla_dsv4` - DeepSeek-V4 sparse MLA (public API) on SM100/SM103 with backend `trtllm-gen` and, for `--dsv4_layer hca`, `cute-dsl` (CuTe DSL HCA kernel, FP8). Supports varlen prefill-style query lengths, causal SWA and compressed-cache sparse tables (`--dsv4_layer csa`, default) or the heavily-compressed layer (`hca`: ratio-128 pool, every row attended), FP8/BF16 inputs and sampled FP32 reference checking of every backend. SM107 is rejected by the library for every backend.
+    - `concat_mla_k` - MLA prefill key assembly `k = [k_nope | k_rope]` (fixed 128 heads, nope 128, rope 64; `num_tokens = batch_size * s_kv`, `--kv_dtype` bf16/fp16/fp8). Backend `cuda` (`backend="default"`). Reports bandwidth; `--refcheck` is a bit-exact `torch.cat` comparison.
+    - `concat_mla_kv_quant_fp8` - fused MLA context K/V pack + FP8 cast (`flashinfer.mla_kv_pack`): bf16 `[k_nope | v]` and shared `k_pe` to fp8 `key`/`value` (`--num_kv_heads` local heads, `num_tokens = batch_size * s_kv`). Backends `specialized` (SM100+) and `auto` (the CSV `resolved_backend` names the kernel that served it); a backend that would take the torch fallback is skipped. `--refcheck` is bit-exact.
+    - All four wrapper attention routines above accept `--backends prims-ts` on SM100/SM103/SM107.
+- Sparse attention / DSA indexer:
+    - `MSAProxyScore`, `MSASparseAttention`, `MSASparseDecode`, `MSAPipeline`, `MSATopKSelect` - MiniMax Sparse Attention ops (`flashinfer.msa_ops`, backend `cudsl` = the public call; `MSASparseDecode` also `trtllm-gen` = `trtllm_batch_decode_with_kv_cache(enable_block_sparse_attention=True)`).
+    - `paged_mqa_logits` - DSA lightning-indexer logits over a paged KV cache (`fp8_paged_mqa_logits` / `fp4_paged_mqa_logits`, `cute-dsl`).
+    - `BlockSparseAttentionWrapper`, `VariableBlockSparseAttentionWrapper` - block-sparse (VSA) attention, backends `fa2`, `fa3`, `cutile`, `vsa_sm100_blk64`, `vsa_sm120_blk64`.
+    - `top_k_varlen` - DSA indexer top-K KV selection (`radix`, `gvr`, `gvr_2`, `radix_cutlass`, `radix_filter`, `auto`); `--topk_mode prefill` (windowed `row_starts` mode) and `--page_size` (fused page-table output) are served by `gvr_2`/`auto`.
 - GEMM:
     - `gemm_fp8_nt_groupwise` - GEMM with FP8 data types using groupwise scaling.
     - `group_gemm_fp8_nt_groupwise` - Group GEMM with FP8 data types using groupwise scaling.
@@ -286,7 +301,17 @@ The output CSV will contain detailed metrics including:
 | `--compressed_topk`      | DSV4 sparse MLA only: maximum compressed-cache rows selected per query. Default: 1920.                    |
 | `--compressed_kv_len`    | DSV4 sparse MLA only: compressed-cache rows per request. Default: `ceil(s_kv / 4)`.                       |
 | `--compressed_page_size` | DSV4 sparse MLA only: compressed-cache page size. Default: 64.                                             |
-| `--kv_layout`            | DSV4 sparse MLA only: `HND` (default) or `NHD` for both KV-cache pools.                                    |
+| `--kv_layout`            | DSV4 sparse MLA and `append_paged_kv_cache` only: `HND` (default) or `NHD` for the KV-cache pools.          |
+| `--dsv4_layer`           | DSV4 sparse MLA only: `csa` (default; ratio-4 pool, `--compressed_topk` rows) or `hca` (ratio-128 pool, every row attended; enables `cute-dsl`). |
+| `--sparse_mla_top_k`     | `BatchMLAPagedAttentionWrapper` only: token-sparse MLA decode attending K selected tokens per query row (`trtllm-native`/`auto`). Default 0 (dense). |
+| `--window_left`          | Dense decode/prefill routines: left sliding-window size (`-1`, the default, disables it). Backends without window support are skipped. `tflops` and `tb_per_sec` count only the in-window keys. |
+| `--logits_soft_cap`      | Dense decode/prefill routines: logits soft-cap (`0`, the default, disables it). Served by fa2/fa3/auto (and cute-dsl paged prefill). |
+| `--sinks`                | Dense decode/prefill routines: learned per-head attention-sink logit (GPT-OSS style). fa2/fa3/auto paged prefill run it through `BatchAttentionWithAttentionSinkWrapper`. |
+| `--use_fp16_softmax`, `--uses_spcompress` | Paged/ragged prefill (and MLA `trtllm-native`), trtllm-gen backends only: SM107-only FP16-softmax / Spcomp cubins. Other devices skip the backend. |
+| `--skip_softmax_threshold_scale_factor` | Dense decode/prefill, trtllm-gen/trtllm-native (and cute-dsl decode) only. |
+| `--kv_cache_kind`        | `append_paged_kv_cache` only: `mha` (default) or `mla` (ckv/kpe rows). `--kv_dtype nvfp4` selects the NVFP4 quantize-append variant. |
+| `--slot_mapping`         | `append_paged_kv_cache --kv_cache_kind mha --kv_dtype nvfp4` only: the slot-mapping variant. |
+| `--num_states`           | `merge_states` only: attention states merged per token (default 2, which calls `merge_state`). |
 
 ### GEMM Flags
 | Flag                     | Description                                                                                                 |

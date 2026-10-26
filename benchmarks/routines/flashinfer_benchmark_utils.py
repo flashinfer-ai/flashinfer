@@ -34,12 +34,24 @@ output_column_dict = {
         "timing_metric",
         "row_activity_mode",
         "calls_per_sample",
+        "window_left",
+        "logits_soft_cap",
+        "sinks",
+        "use_fp16_softmax",
+        "uses_spcompress",
+        "use_token_head_sf",
+        "skip_softmax_threshold_scale_factor",
+        "kv_cache_kind",
+        "slot_mapping",
+        "num_states",
     ],
     "dsv4_sparse_mla": [
         "swa_topk",
         "compressed_topk",
         "compressed_kv_len",
         "compressed_page_size",
+        "dsv4_layer",
+        "sparse_mla_top_k",
     ],
     "gemm": [
         "n",
@@ -132,6 +144,12 @@ output_column_dict = {
     # max sequence length, not a vocab size (see routines/topk_varlen.py).
     "topk_varlen": [
         "max_seq_len",
+        "compress_ratio",
+        "seq_len_distribution",
+        "load_balance",
+        "return_values",
+        "topk_mode",
+        "chunk_len",
     ],
     "rope": [
         "seq_len",
@@ -180,6 +198,13 @@ output_column_dict = {
         "max_k_tiles",
         "total_q",
         "total_kv",
+        # paged_mqa_logits (DSA indexer); next_n is shared with top_k_varlen
+        "mqa_dtype",
+        "next_n",
+        # Block-sparse wrappers: block shape and fraction of blocks attended
+        "block_r",
+        "block_c",
+        "block_density",
     ],
     "general": [
         "batch_size",
@@ -232,6 +257,12 @@ benchmark_apis = {
         "BatchPrefillWithRaggedKVCacheWrapper",
         "BatchMLAPagedAttentionWrapper",
         "trtllm_batch_decode_sparse_mla_dsv4",
+        "concat_mla_k",
+        "concat_mla_kv_quant_fp8",
+        "append_paged_kv_cache",
+        "single_decode_with_kv_cache",
+        "single_prefill_with_kv_cache",
+        "merge_states",
     ],
     "gemm": [
         "gemm_fp8_nt_groupwise",
@@ -337,6 +368,10 @@ benchmark_apis = {
         "MSASparseAttention",
         "MSASparseDecode",
         "MSAPipeline",
+        "MSATopKSelect",
+        "paged_mqa_logits",
+        "BlockSparseAttentionWrapper",
+        "VariableBlockSparseAttentionWrapper",
     ],
 }
 
@@ -419,13 +454,23 @@ def dtype_str_to_torch_dtype(dtype_str):
 routine_cc_to_supported_backends = {
     # ATTENTION
     "BatchDecodeWithPagedKVCacheWrapper": {
-        # NOTE: trtllm-native calls trtllm_batch_decode_with_kv_cache
+        # NOTE: trtllm-native calls trtllm_batch_decode_with_kv_cache(backend="auto"),
+        #       which resolves to trtllm-gen on SM10x and to xqa elsewhere
+        # NOTE: xqa calls trtllm_batch_decode_with_kv_cache(backend="xqa")
         # NOTE: cudnn-native calls cudnn_batch_decode_with_kv_cache
         "7.5": ["fa2", "auto"],
         "8.0": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native"],
         "8.6": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native"],
         "8.9": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native"],
-        "9.0": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native", "trtllm-native"],
+        "9.0": [
+            "fa2",
+            "fa2_tc",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-native",
+            "xqa",
+        ],
         "10.0": [
             "fa2",
             "fa2_tc",
@@ -435,6 +480,8 @@ routine_cc_to_supported_backends = {
             "trtllm-gen",
             "trtllm-native",
             "prims-ts",
+            "cute-dsl",
+            "xqa",
         ],
         "10.3": [
             "fa2",
@@ -445,6 +492,8 @@ routine_cc_to_supported_backends = {
             "trtllm-gen",
             "trtllm-native",
             "prims-ts",
+            "cute-dsl",
+            "xqa",
         ],
         "10.7": [
             "fa2",
@@ -454,14 +503,103 @@ routine_cc_to_supported_backends = {
             "cudnn-native",
             "trtllm-gen",
             "trtllm-native",
+            "cute-dsl",
+            "xqa",
+            "prims-ts",
         ],
-        "12.0": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native", "trtllm-native"],
-        "12.1": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native", "trtllm-native"],
+        "12.0": [
+            "fa2",
+            "fa2_tc",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-native",
+            "xqa",
+        ],
+        "12.1": [
+            "fa2",
+            "fa2_tc",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-native",
+            "xqa",
+        ],
     },
     "BatchPrefillWithPagedKVCacheWrapper": {
         # NOTE: trtllm-native calls trtllm_batch_context_with_kv_cache
         # NOTE: trtllm-fmha-v2 calls trtllm_fmha_v2_prefill
         # NOTE: cudnn-native calls cudnn_batch_prefill_with_kv_cache
+        # NOTE: batch-attention runs flashinfer.BatchAttention on the same batch
+        "7.5": [],
+        "8.0": ["fa2", "auto", "cudnn", "cudnn-native", "batch-attention"],
+        "8.6": ["fa2", "auto", "cudnn", "cudnn-native", "batch-attention"],
+        "8.9": ["fa2", "auto", "cudnn", "cudnn-native", "batch-attention"],
+        "9.0": [
+            "fa2",
+            "fa3",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-fmha-v2",
+            "batch-attention",
+        ],
+        "10.0": [
+            "fa2",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-gen",
+            "trtllm-native",
+            "prims-ts",
+            "cute-dsl",
+            "batch-attention",
+        ],
+        "10.3": [
+            "fa2",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-gen",
+            "trtllm-native",
+            "prims-ts",
+            "cute-dsl",
+            "batch-attention",
+        ],
+        "10.7": [
+            "fa2",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-gen",
+            "trtllm-native",
+            "prims-ts",
+            "cute-dsl",
+            "batch-attention",
+        ],
+        "12.0": [
+            "fa2",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-fmha-v2",
+            "cute-dsl-prims",
+            "batch-attention",
+        ],
+        "12.1": [
+            "fa2",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-fmha-v2",
+            "batch-attention",
+        ],
+    },
+    "BatchPrefillWithRaggedKVCacheWrapper": {
+        # NOTE: trtllm-native calls trtllm_ragged_attention_deepseek
+        # NOTE: trtllm-fmha-v2 calls trtllm_fmha_v2_prefill
+        # NOTE: cudnn-native calls cudnn_batch_prefill_with_kv_cache
+        # NOTE: auto resolves inside the wrapper (Blackwell upgrades to cudnn/cutlass)
         "7.5": [],
         "8.0": ["fa2", "auto", "cudnn", "cudnn-native"],
         "8.6": ["fa2", "auto", "cudnn", "cudnn-native"],
@@ -472,59 +610,26 @@ routine_cc_to_supported_backends = {
             "auto",
             "cudnn",
             "cudnn-native",
-            "trtllm-gen",
+            "cutlass",
+            "cute-dsl",
             "trtllm-native",
             "prims-ts",
+            "cutile",
         ],
         "10.3": [
             "fa2",
             "auto",
             "cudnn",
             "cudnn-native",
-            "trtllm-gen",
-            "trtllm-native",
-            "prims-ts",
-        ],
-        "10.7": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-gen", "trtllm-native"],
-        "12.0": [
-            "fa2",
-            "auto",
-            "cudnn",
-            "cudnn-native",
-            "trtllm-fmha-v2",
-            "cute-dsl-prims",
-        ],
-        "12.1": ["fa2", "auto", "cudnn", "cudnn-native"],
-    },
-    "BatchPrefillWithRaggedKVCacheWrapper": {
-        # NOTE: trtllm-native calls trtllm_ragged_attention_deepseek
-        # NOTE: trtllm-fmha-v2 calls trtllm_fmha_v2_prefill
-        # NOTE: cudnn-native calls cudnn_batch_prefill_with_kv_cache
-        "7.5": [],
-        "8.0": ["fa2", "cudnn", "cudnn-native"],
-        "8.6": ["fa2", "cudnn", "cudnn-native"],
-        "8.9": ["fa2", "cudnn", "cudnn-native"],
-        "9.0": ["fa2", "fa3", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
-        "10.0": [
-            "fa2",
-            "cudnn",
-            "cudnn-native",
             "cutlass",
             "cute-dsl",
             "trtllm-native",
             "prims-ts",
-        ],
-        "10.3": [
-            "fa2",
-            "cudnn",
-            "cudnn-native",
-            "cutlass",
-            "cute-dsl",
-            "trtllm-native",
-            "prims-ts",
+            "cutile",
         ],
         "10.7": [
             "fa2",
+            "auto",
             "cudnn",
             "cudnn-native",
             "cutlass",
@@ -534,40 +639,223 @@ routine_cc_to_supported_backends = {
         ],
         "12.0": [
             "fa2",
+            "auto",
             "cudnn",
             "cudnn-native",
             "trtllm-fmha-v2",
             "cute-dsl-prims",
         ],
-        "12.1": ["fa2", "cudnn", "cudnn-native"],
+        "12.1": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
     },
     "BatchMLAPagedAttentionWrapper": {
         # NOTE: trtllm-native calls trtllm_batch_decode_with_kv_cache_mla(backend="trtllm-gen")
         # NOTE: cute-dsl calls trtllm_batch_decode_with_kv_cache_mla(backend="cute-dsl")
         # NOTE: auto calls trtllm_batch_decode_with_kv_cache_mla(backend="auto")
         #       and is the only backend that benefits from --autotune
+        # NOTE: cutile / trtllm-gen / cute-dsl-rubin-mtp run
+        #       BatchMLAPagedAttentionWrapper(backend=...). trtllm-gen admits
+        #       10.0/10.3/10.7 (_batch_mla/_backends/trtllm_gen_backend.py), cutile
+        #       10.0/10.3/10.7/12.x (cutile_backend.py), cute-dsl-rubin-mtp 10.7 only
+        #       (cute_dsl_rubin_mtp_backend.py: fp8 in/out, 128 heads, page 64/128).
         "7.5": [],
         "8.0": ["fa2"],
         "8.6": ["fa2"],
         "8.9": ["fa2"],
         "9.0": ["fa2", "fa3"],
-        "10.0": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto", "prims-ts"],
-        "10.3": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto", "prims-ts"],
-        "10.7": ["fa2", "cutlass", "trtllm-native"],
-        "12.0": ["fa2"],
-        "12.1": ["fa2"],
+        "10.0": [
+            "fa2",
+            "cutlass",
+            "trtllm-native",
+            "cute-dsl",
+            "auto",
+            "prims-ts",
+            "cutile",
+            "trtllm-gen",
+        ],
+        "10.3": [
+            "fa2",
+            "cutlass",
+            "trtllm-native",
+            "cute-dsl",
+            "auto",
+            "prims-ts",
+            "cutile",
+            "trtllm-gen",
+        ],
+        "10.7": [
+            "fa2",
+            "cutlass",
+            "trtllm-native",
+            "cute-dsl",
+            "auto",
+            "prims-ts",
+            "trtllm-gen",
+            "cute-dsl-rubin-mtp",
+        ],
+        "12.0": ["fa2", "cutile"],
+        "12.1": ["fa2", "cutile"],
     },
     "trtllm_batch_decode_sparse_mla_dsv4": {
+        # NOTE: cute-dsl is the CuTe DSL HCA kernel (--dsv4_layer hca only).
+        # _resolve_dsv4_sparse_mla_backend (mla/_core.py): trtllm-gen admits
+        # 10.0/10.3/10.7, cute-dsl 10.0/10.3 only.
         "7.5": [],
         "8.0": [],
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["trtllm-gen"],
-        "10.3": ["trtllm-gen"],
-        "10.7": [],
+        "10.0": ["trtllm-gen", "cute-dsl"],
+        "10.3": ["trtllm-gen", "cute-dsl"],
+        "10.7": ["trtllm-gen"],
         "12.0": [],
         "12.1": [],
+    },
+    "concat_mla_k": {
+        # NOTE: cuda = concat_mla_k(backend="default"), a generic JIT copy kernel.
+        "7.5": ["cuda"],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    "concat_mla_kv_quant_fp8": {
+        # NOTE: specialized = the CUDA fused pack kernel; auto = the library's
+        #       per-head-count pick (mla_kv_pack.py _backend_order). Device guard:
+        #       mla_kv_pack.py _device_supported (cc >= allowlist min_cc = 10.0).
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["specialized", "auto"],
+        "10.3": ["specialized", "auto"],
+        "10.7": ["specialized", "auto"],
+        "12.0": ["specialized", "auto"],
+        "12.1": ["specialized", "auto"],
+    },
+    "append_paged_kv_cache": {
+        # NOTE: cuda = flashinfer.page.append_paged_kv_cache and its MLA / NVFP4
+        #       variants (generic JIT, no arch guard; jit/page.py)
+        "7.5": ["cuda"],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    "single_decode_with_kv_cache": {
+        # NOTE: fa2_tc = use_tensor_cores=True (prefill kernel); fa2 JIT is built
+        #       for every supported arch (utils.determine_attention_backend)
+        "7.5": ["fa2"],
+        "8.0": ["fa2", "fa2_tc"],
+        "8.6": ["fa2", "fa2_tc"],
+        "8.9": ["fa2", "fa2_tc"],
+        "9.0": ["fa2", "fa2_tc"],
+        "10.0": ["fa2", "fa2_tc"],
+        "10.3": ["fa2", "fa2_tc"],
+        "10.7": ["fa2", "fa2_tc"],
+        "12.0": ["fa2", "fa2_tc"],
+        "12.1": ["fa2", "fa2_tc"],
+    },
+    "single_prefill_with_kv_cache": {
+        # NOTE: fa3 needs is_sm90a_supported (utils.py)
+        "7.5": [],
+        "8.0": ["fa2", "auto"],
+        "8.6": ["fa2", "auto"],
+        "8.9": ["fa2", "auto"],
+        "9.0": ["fa2", "fa3", "auto"],
+        "10.0": ["fa2", "auto"],
+        "10.3": ["fa2", "auto"],
+        "10.7": ["fa2", "auto"],
+        "12.0": ["fa2", "auto"],
+        "12.1": ["fa2", "auto"],
+    },
+    "merge_states": {
+        # NOTE: cuda = flashinfer.cascade.merge_state / merge_states (generic JIT,
+        #       no arch guard). The triton variants are Hopper-only (triton/cascade.py).
+        "7.5": ["cuda"],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    "MSAProxyScore": {
+        # msa_ops/proxy_score.py:370,776 -- SM120/SM121 only
+        "12.0": ["cudsl"],
+        "12.1": ["cudsl"],
+    },
+    "MSASparseAttention": {
+        "10.0": ["cudsl"],
+        "10.3": ["cudsl"],
+        "10.7": ["cudsl"],
+        "12.0": ["cudsl"],
+        "12.1": ["cudsl"],
+    },
+    "MSASparseDecode": {
+        # trtllm-gen: decode.py enable_block_sparse_attention (trtllm-gen cubins)
+        "10.0": ["cudsl", "trtllm-gen"],
+        "10.3": ["cudsl", "trtllm-gen"],
+        "10.7": ["cudsl", "trtllm-gen"],
+        "12.0": ["cudsl"],
+        "12.1": ["cudsl"],
+    },
+    "MSAPipeline": {
+        # proxy stage is SM120/SM121 only
+        "12.0": ["cudsl"],
+        "12.1": ["cudsl"],
+    },
+    "MSATopKSelect": {
+        # msa_ops/sparse_topk_select.py:181,195; 10.7 raises (_blackwell_sm100.py:140)
+        "10.0": ["cudsl"],
+        "10.3": ["cudsl"],
+        "12.0": ["cudsl"],
+        "12.1": ["cudsl"],
+    },
+    "paged_mqa_logits": {
+        # attn_scores/attn_scores.py:759 _PAGED_MQA_CCS = [100, 103, 107]
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
+    },
+    "BlockSparseAttentionWrapper": {
+        # fa3: SM90 (utils.py determine_attention_backend); vsa_sm100_*:
+        # 10.0/10.3/10.7 (sparse.py vsa_sm100_* plan checks); vsa_sm120_blk64:
+        # cc major 12 (sparse.py:1071). Non-CI rows are guard-backed only.
+        # vsa_sm100_blk128 is guard-admitted on 10.0/10.3 but needs `quack-kernels`.
+        "8.0": ["fa2"],
+        "8.6": ["fa2"],
+        "8.9": ["fa2"],
+        "9.0": ["fa2", "fa3"],
+        "10.0": ["fa2", "cutile", "vsa_sm100_blk64"],
+        "10.3": ["fa2", "cutile", "vsa_sm100_blk64"],
+        "10.7": ["fa2", "vsa_sm100_blk64"],
+        "12.0": ["fa2", "vsa_sm120_blk64"],
+        "12.1": ["fa2", "vsa_sm120_blk64"],
+    },
+    "VariableBlockSparseAttentionWrapper": {
+        "8.0": ["fa2"],
+        "8.6": ["fa2"],
+        "8.9": ["fa2"],
+        "9.0": ["fa2", "fa3"],
+        "10.0": ["fa2"],
+        "10.3": ["fa2"],
+        "10.7": ["fa2"],
+        "12.0": ["fa2"],
+        "12.1": ["fa2"],
     },
     # GEMM
     "gemm_fp8_nt_groupwise": {
