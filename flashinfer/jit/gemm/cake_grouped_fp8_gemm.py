@@ -269,7 +269,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "ffi_entry": "run",
         "tma_abi": "grid_constant",
         "arg_plan": "plan3",
-        "arches": ["sm_103a"],
+        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_grouped_fp8_gemm_7ee216a957327349cf41": {
         "kernel": "kernel_cake_grouped_fp8_gemm_7ee216a957327349cf41",
@@ -544,6 +544,10 @@ MODULES: dict[str, dict[str, str]] = {
     "cake_grouped_fp8_gemm_6da15715d9ab967a1cc3_sm_103a": {
         "arch": "sm_103a",
         "program": "cake_grouped_fp8_gemm_6da15715d9ab967a1cc3",
+    },
+    "cake_grouped_fp8_gemm_7bcd26069f3a219a87e7_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_grouped_fp8_gemm_7bcd26069f3a219a87e7",
     },
     "cake_grouped_fp8_gemm_7bcd26069f3a219a87e7_sm_103a": {
         "arch": "sm_103a",
