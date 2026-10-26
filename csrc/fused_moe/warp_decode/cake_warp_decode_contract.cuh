@@ -548,6 +548,15 @@ constexpr Schedule SelectSm100aSchedule(const Shape& shape) {
             0};
   }
 
+  // H6144 I3072 T4: the fused route-pack FC1 with the parameterized-SwiGLU epilogue (the
+  // generated manifest selects that program for this geometry only) and the K512 MMA-U2
+  // device-workfeed FC2, as on sm_103a.
+  if (IsGeometry(shape, 6144, 3072, 128, 4) && shape.num_tokens == 4) {
+    return {true, Geometry::kH6144I3072E128K4, RouteLayout::kGpuPacked,
+            RoutePacker::kFusedFc1, Fc1Schedule::kPersistentDeviceWorkfeed,
+            Fc2Schedule::kRouteParallelK512MmaU2DeviceWorkfeed, 128, 4, 144};
+  }
+
   if (IsGeometry(shape, 6144, 3072, 128, 4) &&
       (shape.num_tokens >= 4 && shape.num_tokens <= 32)) {
     return {true, Geometry::kH6144I3072E128K4, RouteLayout::kGpuPacked,
@@ -683,7 +692,8 @@ constexpr Schedule SelectSm100aSchedule(const Shape& shape) {
   }
 
   if (IsGeometry(shape, 2048, 1536, 60, 4)) {
-    if (shape.num_tokens >= 15) {
+    // T14 joins the packed general route of T15..T32.
+    if (shape.num_tokens >= 14) {
       return {true,
               Geometry::kH2048I1536E60K4,
               RouteLayout::kGpuPacked,
@@ -849,6 +859,16 @@ constexpr bool SelectsSm103aFusedK512MmaU2(const Shape& shape, int32_t workfeed_
          s.fc2 == Fc2Schedule::kRouteParallelK512MmaU2DeviceWorkfeed && s.finalize_threads == 128 &&
          s.finalize_unroll == 4 && s.workfeed_ctas == workfeed_ctas;
 }
+// The sm_100a fused route-pack FC1 + K512 MMA-U2 device-workfeed FC2 rows that
+// Sm100aFusedK512MmaU2WorkfeedCtas lists (the H2048 I768 fused rows keep their own checks).
+constexpr bool SelectsSm100aFusedK512MmaU2(const Shape& shape, int32_t workfeed_ctas) {
+  const Schedule s = SelectSm100aSchedule(shape);
+  return s.supported && s.route_layout == RouteLayout::kGpuPacked &&
+         s.route_packer == RoutePacker::kFusedFc1 &&
+         s.fc1 == Fc1Schedule::kPersistentDeviceWorkfeed &&
+         s.fc2 == Fc2Schedule::kRouteParallelK512MmaU2DeviceWorkfeed && s.finalize_threads == 128 &&
+         s.finalize_unroll == 4 && s.workfeed_ctas == workfeed_ctas;
+}
 static_assert(SelectSm103aSchedule({5, 4096, 1536, 128, 128, 8}).route_layout ==
               RouteLayout::kDirect);
 static_assert(SelectsSm103aFusedK512MmaU2({6, 4096, 1536, 128, 128, 8}, 0));
@@ -891,7 +911,14 @@ static_assert(SelectsSm103aFusedK512MmaU2({16, 6144, 3072, 128, 128, 4}, 144));
 static_assert(SelectsSm103aFusedK512MmaU2({32, 6144, 3072, 128, 128, 4}, 144));
 static_assert(SelectSm100aSchedule({1, 6144, 3072, 128, 128, 4}).route_layout ==
               RouteLayout::kDirect);
-static_assert(SelectSm100aSchedule({4, 6144, 3072, 128, 128, 4}).route_packer ==
+static_assert(SelectsSm100aFusedK512MmaU2({4, 6144, 3072, 128, 128, 4}, 144));
+static_assert(SelectSm100aSchedule({5, 6144, 3072, 128, 128, 4}).route_packer ==
+              RoutePacker::kGeneral);
+static_assert(SelectSm100aSchedule({8, 6144, 3072, 128, 128, 4}).route_packer ==
+              RoutePacker::kGeneral);
+static_assert(SelectSm100aSchedule({9, 6144, 3072, 128, 128, 4}).route_packer ==
+              RoutePacker::kGeneral);
+static_assert(SelectSm100aSchedule({10, 6144, 3072, 128, 128, 4}).route_packer ==
               RoutePacker::kGeneral);
 static_assert(SelectSm100aSchedule({32, 6144, 3072, 128, 128, 4}).route_packer ==
               RoutePacker::kGeneral);
@@ -932,8 +959,13 @@ static_assert(Gemm1WeightRows(E512Shape(1), SelectSm103aSchedule(E512Shape(1))) 
 static_assert(SelectSm100aSchedule(E512Shape(23)).route_layout == RouteLayout::kDirect);
 static_assert(SelectSm100aSchedule(E60Shape(1)).fc1 == Fc1Schedule::kPersistent);
 static_assert(SelectSm100aSchedule(E60Shape(2)).fc1 == Fc1Schedule::kPersistent);
+static_assert(SelectSm100aSchedule(E60Shape(10)).route_layout == RouteLayout::kDirect);
 static_assert(SelectSm100aSchedule(E60Shape(11)).route_layout == RouteLayout::kDirect);
-static_assert(SelectSm100aSchedule(E60Shape(14)).route_layout == RouteLayout::kDirect);
+static_assert(SelectSm100aSchedule(E60Shape(13)).route_layout == RouteLayout::kDirect);
+static_assert(SelectSm100aSchedule(E60Shape(14)).route_layout == RouteLayout::kGpuPacked);
+static_assert(SelectSm100aSchedule(E60Shape(14)).route_packer == RoutePacker::kGeneral);
+static_assert(SelectSm100aSchedule(E60Shape(14)).workfeed_ctas == 144);
+static_assert(SelectSm100aSchedule(E60Shape(14)).fc2 == Fc2Schedule::kRouteParallelK512DeviceWorkfeed);
 static_assert(SelectSm100aSchedule(E60Shape(15)).route_layout == RouteLayout::kGpuPacked);
 static_assert(SelectSm100aSchedule(E60Shape(15)).route_packer == RoutePacker::kGeneral);
 static_assert(SelectSm100aSchedule(E60Shape(15)).fc1 == Fc1Schedule::kPersistentDeviceWorkfeed);
@@ -986,6 +1018,18 @@ constexpr int32_t Sm103aFusedK512MmaU2WorkfeedCtas(Geometry geometry, int32_t to
   }
 }
 
+// The workfeed CTAs of the sm_100a rows that run the fused route-pack FC1 and the K512 MMA-U2
+// device-workfeed FC2 and are walked by CheckPublicBoundaries (0: the device's SM count); -1 for
+// every other row. The H2048 I768 fused rows keep their own branches there.
+constexpr int32_t Sm100aFusedK512MmaU2WorkfeedCtas(Geometry geometry, int32_t tokens) {
+  switch (geometry) {
+    case Geometry::kH6144I3072E128K4:
+      return tokens == 4 ? 144 : -1;
+    default:
+      return -1;
+  }
+}
+
 // Every sm_103a E60 row from T12 selects the E60 geometry and runs the fused route-pack K512
 // MMA-U2 schedule with the workfeed listed above.
 constexpr bool Sm103aE60FusedK512MmaU2Rows() {
@@ -1002,9 +1046,9 @@ static_assert(Sm103aE60FusedK512MmaU2Rows());
 // The fused route-pack FC1 programs carry the plain SwiGLU epilogue, except two sm_103a programs
 // with the parameterized-SwiGLU epilogue (they differ only in the weight cache hint) that the
 // generated manifest selects for the H6144 I3072 geometry only. So no row of the SiLU, SiTU or
-// clamped SwiGLU (H4096 I2048) geometries selects RoutePacker::kFusedFc1 on either target, no
-// H6144 I3072 row selects it on sm_100a, and an H6144 I3072 row selects it on sm_103a exactly
-// where Sm103aFusedK512MmaU2WorkfeedCtas lists it.
+// clamped SwiGLU (H4096 I2048) geometries selects RoutePacker::kFusedFc1 on either target, and an
+// H6144 I3072 row selects it exactly where Sm100aFusedK512MmaU2WorkfeedCtas (sm_100a) and
+// Sm103aFusedK512MmaU2WorkfeedCtas (sm_103a) list it.
 constexpr bool FusedFc1RowsMatchTheirEpilogue() {
   const Shape plain_only[] = {E192SiluShape(0), Shape{0, 4096, 2048, 256, 256, 6},
                               Shape{0, 3584, 3072, 896, 896, 16}};
@@ -1020,7 +1064,8 @@ constexpr bool FusedFc1RowsMatchTheirEpilogue() {
   for (int32_t t = 0; t <= 33; ++t) {
     const Shape shape{t, 6144, 3072, 128, 128, 4};
     const bool fused = SelectSm103aSchedule(shape).route_packer == RoutePacker::kFusedFc1;
-    if (SelectSm100aSchedule(shape).route_packer == RoutePacker::kFusedFc1 ||
+    const bool fused100 = SelectSm100aSchedule(shape).route_packer == RoutePacker::kFusedFc1;
+    if (fused100 != (Sm100aFusedK512MmaU2WorkfeedCtas(Geometry::kH6144I3072E128K4, t) >= 0) ||
         fused != (Sm103aFusedK512MmaU2WorkfeedCtas(Geometry::kH6144I3072E128K4, t) >= 0)) {
       return false;
     }
@@ -1040,7 +1085,8 @@ constexpr bool CheckPublicBoundaries(Shape shape, Geometry geometry,
       const RoutePacker packed_packer =
           PackedRoutePacker(target == 0 ? Target::kSm100a : Target::kSm103a, shape);
       const int32_t fused_k512_workfeed =
-          target == 1 ? Sm103aFusedK512MmaU2WorkfeedCtas(geometry, tokens) : -1;
+          target == 1 ? Sm103aFusedK512MmaU2WorkfeedCtas(geometry, tokens)
+                      : Sm100aFusedK512MmaU2WorkfeedCtas(geometry, tokens);
       if (tokens == 0 || tokens == 33) {
         if (schedule.supported) return false;
       } else if (fused_k512_workfeed >= 0) {
