@@ -287,7 +287,7 @@ class _MixedSwapABFc1Epilogue(_ImmutableAfterInit):
         * rows 16..31 -- its matching up block.
 
         The two 32-token column halves are handled sequentially.  SwiGLU is
-        elementwise and therefore runs in the raw TMEM load distribution; the
+        elementwise and therefore runs in the raw LDTM distribution; the
         resulting 16x32 fragment is then transposed to one token x 16 features
         per lane before the BF16 store.
         """
@@ -388,7 +388,7 @@ class _MixedSwapABFc1Epilogue(_ImmutableAfterInit):
             folded = cute.make_rmem_tensor(
                 (Fc1GateUpInterleave,), cutlass.Float32,
             )
-            # The raw TMEM load distribution does not give one token to one lane:
+            # The raw LDTM distribution does not give one token to one lane:
             # its 16 values span several token rows.  SwiGLU is elementwise
             # and may run before the transpose, but the token-specific top-k
             # weight must wait until the transpose output, where lane_idx is

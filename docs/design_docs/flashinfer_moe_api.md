@@ -833,7 +833,7 @@ order. MXFP8 and NVFP4 additionally use 128x4 weight-scale layouts. BF16 and
 MXFP8 traces retain `use_shuffled_weight` to select the row order. Serialized
 references restore these layouts using PyTorch.
 
-`PowLU` (CUTLASS only) rides the generic slots with changed meaning:
+For CUTLASS, per-expert `PowLU` overrides use the generic slots with changed meaning:
 `gemm1_alpha` carries the exponent `m` (not a sigmoid slope) and
 `gemm1_clamp_limit` the post-activation clamp on the gate plus the symmetric
 clamp on the linear branch; `gemm1_beta` has no PowLU meaning and per-expert
@@ -922,10 +922,21 @@ python scripts/generate_moe_activation_matrix.py --write
 | `cutlass_nvfp4` | `CutlassNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutlass_w4a16` | `CutlassW4A16Config` | `MXFP4×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutlass_w4a8` | `CutlassW4A8Config` | `INT4×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
-| `frost_low_latency` | `FrostLowLatencyConfig` | `BF16×BF16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
-| `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP4×MXFP8` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
-| `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP8×MXFP8` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
-| `frost_low_latency` | `FrostLowLatencyConfig` | `NVFP4×NVFP4` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `BF16×BF16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `FP16×FP16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `FP8PerTensor×BF16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `FP8PerTensor×FP16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP4×BF16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP4×FP16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP4×MXFP8` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP8×MXFP8` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `MXINT4×BF16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `MXINT4×FP16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `NVFP4×BF16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `NVFP4×FP16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `NVFP4×NVFP4` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
 | `prims_ts` | `PrimsTsConfig` | `BF16×BF16` | `SwiGLU`, `ReLU2` |
 | `prims_ts` | `PrimsTsConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
 | `prims_ts` | `PrimsTsConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `ReLU2` |
@@ -1218,3 +1229,15 @@ crosses the Python API.
 | [ ] | Keep FP8, MXFP4, and additional backend families out of this PR. | Track as follow-up runners after the NVFP4 path is solid. |
 | [ ] | Keep general routing unification out of this PR. | This MVP assumes pre-routed inputs through `MoEActivationPack`. |
 | [ ] | Keep broader public API ergonomics separate from MVP correctness. | Backend discovery, pipe-operator sugar, repro replay, and a full eager functional API can evolve after the MVP contract is stable. |
+
+
+### Frost grouped DeepSeek block-FP8 candidates
+
+The existing `DeepSeekFp8` preparation and activation packs also serve the SM90
+and SM120 grouped Tensor Core paths. The bounded candidate region is finalized
+H2048/I512/top-k10, default SwiGLU T4/T8 and default ReLU2/SiLU T8. BF16 entry
+and prequantized E4M3 entry retain the same dynamic block-scale contract.
+All sixteen FMA choices remain available; other shapes and custom parameters
+retain FMA. No new public configuration or cross-backend auto-dispatch rule is
+introduced. See [the Frost guide](../frost_low_latency_moe.md#grouped-deepseek-block-fp8-on-sm90-and-sm120)
+for numerical boundaries and a full routed-expert GPU-time reproducer.

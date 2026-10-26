@@ -86,7 +86,7 @@ PLANS = {
     "kcp_transfer_walk_three_mma": TRANSFER_PLAN,
     "kcp_transfer_walk_plain_tf32": TRANSFER_PLAN,
     "kcp_transfer_walk_bf16x3": TRANSFER_PLAN,
-    "kcp_transfer_walk_bf16x3_hw64": TRANSFER_PLAN,
+    "kcp_transfer_walk_tf32_hilo": TRANSFER_PLAN,
 }
 # The identity rule: ``cake_kda_train_<20 hex of sha256("<tart module>\\n<sorted JSON of the build keywords>")>``.
 _W = "sm100_sm103_sm107"
@@ -108,8 +108,8 @@ IDENTITIES = {
         {"program": "tape"},
     ),
     "kcp_transfer_walk": (
-        f"tart.kda_chunk_kcp_transfer_walk.{_W}.kda_chunk_kcp_transfer_walk_v1",
-        {"precision_mode": 0},
+        f"tart.kda_chunk_kcp_transfer_walk.{_W}.kda_chunk_kcp_transfer_walk_bf16x3_v1",
+        {"vh": 64},
     ),
     "kcp_affine_merge_c8": (
         f"tart.kda_chunk_kcp_affine_merge.{_W}.kda_chunk_kcp_affine_merge_fp32_v1",
@@ -133,9 +133,9 @@ IDENTITIES = {
         f"tart.kda_chunk_kcp_transfer_walk.{_W}.kda_chunk_kcp_transfer_walk_bf16x3_v1",
         {"vh": 128},
     ),
-    "kcp_transfer_walk_bf16x3_hw64": (
-        f"tart.kda_chunk_kcp_transfer_walk.{_W}.kda_chunk_kcp_transfer_walk_bf16x3_v1",
-        {"vh": 64},
+    "kcp_transfer_walk_tf32_hilo": (
+        f"tart.kda_chunk_kcp_transfer_walk.{_W}.kda_chunk_kcp_transfer_walk_v1",
+        {"precision_mode": 0},
     ),
 }
 
@@ -150,7 +150,7 @@ def test_the_tables_are_disjoint_and_complete() -> None:
         "kcp_transfer_walk_three_mma",
         "kcp_transfer_walk_plain_tf32",
         "kcp_transfer_walk_bf16x3",
-        "kcp_transfer_walk_bf16x3_hw64",
+        "kcp_transfer_walk_tf32_hilo",
     }
     assert kcp_jit.ARCHES == ARCHES == tuple(cake_jit.ARCHES)
     assert kcp_jit.PROGRAMS == (
@@ -164,7 +164,7 @@ def test_the_tables_are_disjoint_and_complete() -> None:
         "kcp_dav",
     )
     assert kcp_jit.PRECISION_MODES == (0, 1, 2)
-    assert kcp_jit.TRANSFER_WALKS == ("tf32_hilo", "bf16x3", "bf16x3_hw64")
+    assert kcp_jit.TRANSFER_WALKS == ("bf16x3_hw64", "tf32_hilo", "bf16x3")
 
 
 @pytest.mark.parametrize("name", sorted(PLANS))
@@ -227,9 +227,14 @@ def test_selection_and_grids() -> None:
         1,
         1,
     )
+    assert kcp_jit.launch_grid("kcp_transfer_walk", n_walk=3, num_heads=4) == (
+        24,
+        1,
+        1,
+    )
     assert kcp_jit.launch_grid(
-        "kcp_transfer_walk_bf16x3_hw64", n_walk=3, num_heads=4
-    ) == (24, 1, 1)
+        "kcp_transfer_walk_tf32_hilo", n_walk=3, num_heads=4
+    ) == (12, 1, 1)
     assert kcp_jit.launch_grid("kcp_affine_merge_c16", n_chains=5, ncols=256) == (
         80,
         1,
@@ -256,17 +261,29 @@ def test_selection_and_grids() -> None:
 
 def test_test_record_selection_by_knobs() -> None:
     assert kcp_jit.test_record() is None
-    assert kcp_jit.test_record(0, "tf32_hilo") is None
+    assert kcp_jit.test_record(0, "bf16x3_hw64") is None
+    assert kcp_jit.test_record(0, "tf32_hilo")[0] == "kcp_transfer_walk_tf32_hilo"
     assert kcp_jit.test_record(1)[0] == "kcp_transfer_walk_three_mma"
+    assert kcp_jit.test_record(1, "tf32_hilo")[0] == "kcp_transfer_walk_three_mma"
     assert kcp_jit.test_record(2)[0] == "kcp_transfer_walk_plain_tf32"
     assert kcp_jit.test_record(0, "bf16x3")[0] == "kcp_transfer_walk_bf16x3"
-    assert kcp_jit.test_record(0, "bf16x3_hw64")[0] == "kcp_transfer_walk_bf16x3_hw64"
     with pytest.raises(ValueError, match="name two test-only programs"):
         kcp_jit.test_record(1, "bf16x3")
     with pytest.raises(ValueError):
         kcp_jit.test_record(3)
     with pytest.raises(ValueError):
         kcp_jit.test_record(0, "fp32")
+
+
+def test_the_shipped_transfer_walk_is_the_half_width_bf16x3_program() -> None:
+    record = kcp_jit.MODULES["kcp_transfer_walk"]
+    assert record["grid_rule"] == {"ctas_per_head": 2, "kind": "kcp_segments_heads"}
+    assert record["library"] == "cake_kda_train_9a3f306bacf8c8a1547d"
+    previous = kcp_jit.TEST_MODULES["kcp_transfer_walk_tf32_hilo"]
+    assert previous["grid_rule"] == {"kind": "kcp_segments_heads"}
+    assert previous["library"] == "cake_kda_train_1ac972f0cb7cc7b13cf7"
+    assert previous["test_knobs"] == {"transfer_walk": "tf32_hilo"}
+    assert kcp_jit.TRANSFER_WALKS[0] == "bf16x3_hw64"
 
 
 def test_shipped_manifest_lists_the_kcp_programs_and_no_test_only_one() -> None:

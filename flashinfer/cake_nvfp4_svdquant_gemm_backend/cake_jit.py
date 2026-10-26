@@ -112,6 +112,7 @@ GRID_RULES = (
     "cluster_n2",
     "pair_persistent",
     "pair_tailsplit",
+    "splitk_cluster",
 )
 SCALE_ELEMS = ("uint8", "uint16", "uint32")
 
@@ -192,7 +193,9 @@ PARAMETER_LOGICAL: dict[str, str] = {
 # runtime parameter), ``scale_elems`` the element type of the scale-factor
 # views, ``grid_rule`` one of :data:`GRID_RULES`, ``variant`` one of
 # :data:`VARIANTS`, ``pdl`` whether the program's launch carries programmatic
-# dependent launch (must agree with ``launch.use_pdl``).
+# dependent launch (must agree with ``launch.use_pdl``), ``split_k`` (the
+# ``splitk_cluster`` programs only) the cluster size the K dimension is
+# split over.
 MODULES: dict[str, dict[str, Any]] = {
     # tactic 0, 128x128x128, 11-stage ring, exact BF16 epilogue; the fallback
     # of every problem no other row claims.
@@ -1748,10 +1751,87 @@ MODULES: dict[str, dict[str, Any]] = {
             "variant": "bias",
         },
     },
-    # The tactic14_m64_bias program built with {"bias": True, "epi": "fused64", "epi_alias": True, "prologue": "overlap", "stages": 16}
-    # (round-3 final of the exact-dispatch rows below; the plan of ``e6789ee4eaed1dff09ae``).
-    "cake_nvfp4_svdquant_gemm_44ec820136bf5bcde86e": {
-        "arches": ["sm_100a", "sm_103a"],
+    # Form A with the TMA L2 promotion of the weight descriptors (``l2_promotion
+    # = "l2_256b"``: B and SFB are promoted to 256-byte L2 lines; the kernel
+    # text is otherwise form A's), built with the bias epilogue: the sm_103a
+    # build of the (129, 3072, 3072, {32, 64}, True) rows.  Ships for sm_103a
+    # only (sm_100a keeps form A on those rows).
+    "cake_nvfp4_svdquant_gemm_99bdf6e03d704178faf9": {
+        "arches": ["sm_103a"],
+        # derived; rewritten by the exporter
+        "arg_plan": [
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["buffer", "D"],
+            ["buffer", "L1"],
+            ["buffer", "alpha"],
+            ["buffer", "bias"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K_tiles"],
+            ["parameter", "rank_tiles"],
+            ["parameter", "grid_n"],
+            ["parameter", "has_bias"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "bias": True,
+            "epi": "fused64",
+            "l2_promotion": "l2_256b",
+            "prologue": "overlap",
+        },
+        "ffi_entry": "run",
+        "kernel": "cake_nvfp4_svdquant_gemm_99bdf6e03d704178faf9",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_99bdf6e03d704178faf9",  # derived; rewritten by the exporter
+        "launch": {  # derived; rewritten by the exporter
+            "block": (256, 1, 1),
+            "cluster": (1, 2, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 210048,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_svdquant_gemm_99bdf6e03d704178faf9",
+        # derived; rewritten by the exporter
+        "logical": {
+            "A": "a",
+            "B": "b",
+            "D": "d",
+            "K_tiles": "K_tiles",
+            "L1": "l1",
+            "M": "M",
+            "N": "N",
+            "SFA": "a_sf",
+            "SFB": "b_sf",
+            "alpha": "alpha",
+            "bias": "bias",
+            "grid_n": "grid_n",
+            "has_bias": "has_bias",
+            "out": "out",
+            "rank_tiles": "rank_tiles",
+        },
+        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_tactic14_m64_bias",
+        "plan": {
+            "block_m": 64,
+            "block_n": 64,
+            "block_k": 128,
+            "grid_rule": "cluster_n2",
+            "pdl": False,
+            "rank_storage": None,
+            "scale_elems": "uint16",
+            "variant": "bias",
+        },
+    },
+    # The 16-stage aliased ring of form A ({"stages": 16, "epi_alias": True})
+    # with the TMA L2 promotion of the weight descriptors, built with the bias
+    # epilogue: the sm_103a build of the (129, 3072, 3072, {96, 128}, True)
+    # rows.  Ships for sm_103a only.
+    "cake_nvfp4_svdquant_gemm_01405277c4bbc4031fbd": {
+        "arches": ["sm_103a"],
         # derived; rewritten by the exporter
         "arg_plan": [
             ["buffer", "A"],
@@ -1777,12 +1857,13 @@ MODULES: dict[str, dict[str, Any]] = {
             "bias": True,
             "epi": "fused64",
             "epi_alias": True,
+            "l2_promotion": "l2_256b",
             "prologue": "overlap",
             "stages": 16,
         },
         "ffi_entry": "run",
-        "kernel": "cake_nvfp4_svdquant_gemm_44ec820136bf5bcde86e",
-        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_44ec820136bf5bcde86e",  # derived; rewritten by the exporter
+        "kernel": "cake_nvfp4_svdquant_gemm_01405277c4bbc4031fbd",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_01405277c4bbc4031fbd",  # derived; rewritten by the exporter
         "launch": {  # derived; rewritten by the exporter
             "block": (256, 1, 1),
             "cluster": (1, 2, 1),
@@ -1790,7 +1871,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 230528,
             "use_pdl": False,
         },
-        "library": "cake_nvfp4_svdquant_gemm_44ec820136bf5bcde86e",
+        "library": "cake_nvfp4_svdquant_gemm_01405277c4bbc4031fbd",
         # derived; rewritten by the exporter
         "logical": {
             "A": "a",
@@ -1889,10 +1970,84 @@ MODULES: dict[str, dict[str, Any]] = {
             "variant": "nobias",
         },
     },
-    # The tactic14_m64_bias program built with {"bias": False, "epi": "fused64", "epi_alias": True, "prologue": "overlap", "stages": 16}
-    # (round-3 final of the exact-dispatch rows below; the plan of ``8dc2b79ff158918dd5c8``).
-    "cake_nvfp4_svdquant_gemm_fed389c9e9cb9293bd29": {
-        "arches": ["sm_100a", "sm_103a"],
+    # Form A with the TMA L2 promotion of the weight descriptors, built without
+    # the bias epilogue: the sm_103a build of the (129, 3072, 3072, 32, False)
+    # row.  Ships for sm_103a only.
+    "cake_nvfp4_svdquant_gemm_8319e1548886614ab273": {
+        "arches": ["sm_103a"],
+        # derived; rewritten by the exporter
+        "arg_plan": [
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["buffer", "D"],
+            ["buffer", "L1"],
+            ["buffer", "alpha"],
+            ["buffer", "bias"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K_tiles"],
+            ["parameter", "rank_tiles"],
+            ["parameter", "grid_n"],
+            ["parameter", "has_bias"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "bias": False,
+            "epi": "fused64",
+            "l2_promotion": "l2_256b",
+            "prologue": "overlap",
+        },
+        "ffi_entry": "run",
+        "kernel": "cake_nvfp4_svdquant_gemm_8319e1548886614ab273",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_8319e1548886614ab273",  # derived; rewritten by the exporter
+        "launch": {  # derived; rewritten by the exporter
+            "block": (256, 1, 1),
+            "cluster": (1, 2, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 210048,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_svdquant_gemm_8319e1548886614ab273",
+        # derived; rewritten by the exporter
+        "logical": {
+            "A": "a",
+            "B": "b",
+            "D": "d",
+            "K_tiles": "K_tiles",
+            "L1": "l1",
+            "M": "M",
+            "N": "N",
+            "SFA": "a_sf",
+            "SFB": "b_sf",
+            "alpha": "alpha",
+            "bias": "bias",
+            "grid_n": "grid_n",
+            "has_bias": "has_bias",
+            "out": "out",
+            "rank_tiles": "rank_tiles",
+        },
+        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_tactic14_m64_bias",
+        "plan": {
+            "block_m": 64,
+            "block_n": 64,
+            "block_k": 128,
+            "grid_rule": "cluster_n2",
+            "pdl": False,
+            "rank_storage": None,
+            "scale_elems": "uint16",
+            "variant": "nobias",
+        },
+    },
+    # The 16-stage aliased ring of form A with the TMA L2 promotion of the
+    # weight descriptors, built without the bias epilogue: the sm_103a build of
+    # the (129, 3072, 3072, 128, False) row.  Ships for sm_103a only.
+    "cake_nvfp4_svdquant_gemm_23bfc212699bbb4e6214": {
+        "arches": ["sm_103a"],
         # derived; rewritten by the exporter
         "arg_plan": [
             ["buffer", "A"],
@@ -1918,12 +2073,13 @@ MODULES: dict[str, dict[str, Any]] = {
             "bias": False,
             "epi": "fused64",
             "epi_alias": True,
+            "l2_promotion": "l2_256b",
             "prologue": "overlap",
             "stages": 16,
         },
         "ffi_entry": "run",
-        "kernel": "cake_nvfp4_svdquant_gemm_fed389c9e9cb9293bd29",
-        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_fed389c9e9cb9293bd29",  # derived; rewritten by the exporter
+        "kernel": "cake_nvfp4_svdquant_gemm_23bfc212699bbb4e6214",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_23bfc212699bbb4e6214",  # derived; rewritten by the exporter
         "launch": {  # derived; rewritten by the exporter
             "block": (256, 1, 1),
             "cluster": (1, 2, 1),
@@ -1931,7 +2087,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 230528,
             "use_pdl": False,
         },
-        "library": "cake_nvfp4_svdquant_gemm_fed389c9e9cb9293bd29",
+        "library": "cake_nvfp4_svdquant_gemm_23bfc212699bbb4e6214",
         # derived; rewritten by the exporter
         "logical": {
             "A": "a",
@@ -2175,6 +2331,149 @@ MODULES: dict[str, dict[str, Any]] = {
             "pdl": False,
             "rank_storage": None,
             "scale_elems": "uint16",
+            "variant": "nobias",
+        },
+    },
+    # The swap-AB split-K program of the M 129 / N 3072 / K 12288 rows: the
+    # weights are the MMA A operand (128 rows, the TMEM lanes), the 136-row
+    # activation box the B operand (rows >= M zero-filled by TMA), and the
+    # ``split_k`` CTAs of one cluster each walk ``K / split_k`` and
+    # reduce-scatter their FP32 partials through distributed shared memory, so
+    # every output element is written by exactly one CTA.  Grid
+    # ``(split_k * N / 128, 1, 1)``, cluster ``(split_k, 1, 1)``
+    # (``splitk_cluster``); 32-bit scale-factor views of both operands; one
+    # build per bias form and cluster size.  Reached by the exact rows per
+    # architecture at the head of ``ROUTE_TABLE`` (``K_tiles = K / 128`` is a
+    # multiple of ``split_k`` on those rows, as the kernel requires).
+    "cake_nvfp4_svdquant_gemm_8958df827006875b2512": {
+        "arches": ["sm_100a", "sm_103a"],
+        # derived; rewritten by the exporter
+        "arg_plan": [
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["buffer", "D"],
+            ["buffer", "L1"],
+            ["buffer", "alpha"],
+            ["buffer", "bias"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K_tiles"],
+            ["parameter", "rank_tiles"],
+            ["parameter", "grid_n"],
+            ["parameter", "has_bias"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {"bias": True, "split_k": 4},
+        "ffi_entry": "run",
+        "kernel": "cake_nvfp4_svdquant_gemm_8958df827006875b2512",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_8958df827006875b2512",  # derived; rewritten by the exporter
+        "launch": {  # derived; rewritten by the exporter
+            "block": (256, 1, 1),
+            "cluster": (4, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 216064,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_svdquant_gemm_8958df827006875b2512",
+        # derived; rewritten by the exporter
+        "logical": {
+            "A": "a",
+            "B": "b",
+            "D": "d",
+            "K_tiles": "K_tiles",
+            "L1": "l1",
+            "M": "M",
+            "N": "N",
+            "SFA": "a_sf",
+            "SFB": "b_sf",
+            "alpha": "alpha",
+            "bias": "bias",
+            "grid_n": "grid_n",
+            "has_bias": "has_bias",
+            "out": "out",
+            "rank_tiles": "rank_tiles",
+        },
+        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_swapab_splitk",
+        "plan": {
+            "block_m": 136,
+            "block_n": 128,
+            "block_k": 128,
+            "grid_rule": "splitk_cluster",
+            "pdl": False,
+            "rank_storage": None,
+            "scale_elems": "uint32",
+            "split_k": 4,
+            "variant": "bias",
+        },
+    },
+    "cake_nvfp4_svdquant_gemm_0a3a28f6f508e7d75146": {
+        "arches": ["sm_100a", "sm_103a"],
+        # derived; rewritten by the exporter
+        "arg_plan": [
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["buffer", "D"],
+            ["buffer", "L1"],
+            ["buffer", "alpha"],
+            ["buffer", "bias"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K_tiles"],
+            ["parameter", "rank_tiles"],
+            ["parameter", "grid_n"],
+            ["parameter", "has_bias"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {"bias": False, "split_k": 4},
+        "ffi_entry": "run",
+        "kernel": "cake_nvfp4_svdquant_gemm_0a3a28f6f508e7d75146",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_0a3a28f6f508e7d75146",  # derived; rewritten by the exporter
+        "launch": {  # derived; rewritten by the exporter
+            "block": (256, 1, 1),
+            "cluster": (4, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 216064,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_svdquant_gemm_0a3a28f6f508e7d75146",
+        # derived; rewritten by the exporter
+        "logical": {
+            "A": "a",
+            "B": "b",
+            "D": "d",
+            "K_tiles": "K_tiles",
+            "L1": "l1",
+            "M": "M",
+            "N": "N",
+            "SFA": "a_sf",
+            "SFB": "b_sf",
+            "alpha": "alpha",
+            "bias": "bias",
+            "grid_n": "grid_n",
+            "has_bias": "has_bias",
+            "out": "out",
+            "rank_tiles": "rank_tiles",
+        },
+        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_swapab_splitk",
+        "plan": {
+            "block_m": 136,
+            "block_n": 128,
+            "block_k": 128,
+            "grid_rule": "splitk_cluster",
+            "pdl": False,
+            "rank_storage": None,
+            "scale_elems": "uint32",
+            "split_k": 4,
             "variant": "nobias",
         },
     },
@@ -2793,14 +3092,17 @@ MODULES: dict[str, dict[str, Any]] = {
 # launch, the 64-row tactic-14 builds of the M 129 rows per K class); the
 # tail rows reproduce the previous dispatcher for every other problem.
 ROUTE_TABLE: tuple[dict[str, Any], ...] = (
-    # Exact-dispatch rows of the convergence finals, first so that each names the
+    # Exact-dispatch rows: the sm_103a rows of the M 129 / N 3072 / K 3072
+    # problems (the L2-promoted 64-row builds), the split-K rows and the
+    # convergence finals' rows, so that each names the
     # program of exactly one (M, N, K, rank, bias), per architecture where the two
     # architectures measured different winners (``arches``; absent = both):
-    #   (129, 3072, 3072, 96, True) on sm_103a -> 44ec820136bf5bcde86e
+    #   (129, 3072, 3072, {32, 64}, True) on sm_103a -> 99bdf6e03d704178faf9 (L2-promoted form A)
+    #   (129, 3072, 3072, 32, False) on sm_103a -> 8319e1548886614ab273 (L2-promoted form A)
+    #   (129, 3072, 3072, {96, 128}, True) on sm_103a -> 01405277c4bbc4031fbd (L2-promoted 16-stage ring)
+    #   (129, 3072, 3072, 128, False) on sm_103a -> 23bfc212699bbb4e6214 (L2-promoted 16-stage ring)
     #   (129, 3072, 3072, 128, False) on sm_100a -> 8c21118cf9b080867cf1
-    #   (129, 3072, 3072, 128, False) on sm_103a -> fed389c9e9cb9293bd29
     #   (129, 3072, 3072, 128, True) on sm_100a -> 2270204930b79b8caef7
-    #   (129, 3072, 3072, 128, True) on sm_103a -> 44ec820136bf5bcde86e
     #   (4096, 3072, 3072, 32, True) on sm_100a -> 1d78f2bd5722fb02b75a
     #   (4096, 3072, 3072, 32, True) on sm_103a -> b4be925d9e1e6959b702 (held: the shipped cake_r1 build)
     #   (4096, 12288, 3072, 32, True) on sm_100a -> 2ca0cf40f7bbfca9df92
@@ -2814,6 +3116,8 @@ ROUTE_TABLE: tuple[dict[str, Any], ...] = (
     #   (16384, 3072, 3072, 32, True) on sm_100a -> c80322ffcfa97a956474
     #   (16384, 3072, 3072, 32, True) on sm_103a -> fdcf777b3acd972f8841
     #   (16384, 12288, 3072, 32, True) on sm_100a -> b4be925d9e1e6959b702 (held: the shipped cake_r1 build)
+    #   (129, 3072, 12288, {32, 128}, True) on both -> 8958df827006875b2512 (split-K, S = 4)
+    #   (129, 3072, 12288, {32, 128}, False) on both -> 0a3a28f6f508e7d75146 (split-K, S = 4)
     {
         "arches": ("sm_103a",),
         "m_min": 129,
@@ -2822,9 +3126,67 @@ ROUTE_TABLE: tuple[dict[str, Any], ...] = (
         "n_max": 3072,
         "k_min": 3072,
         "k_max": 3072,
-        "ranks": (96,),
+        "ranks": (32, 64),
         "bias": True,
-        "record": "cake_nvfp4_svdquant_gemm_44ec820136bf5bcde86e",
+        "record": "cake_nvfp4_svdquant_gemm_99bdf6e03d704178faf9",
+    },
+    {
+        "arches": ("sm_103a",),
+        "m_min": 129,
+        "m_max": 129,
+        "n_min": 3072,
+        "n_max": 3072,
+        "k_min": 3072,
+        "k_max": 3072,
+        "ranks": (32,),
+        "bias": False,
+        "record": "cake_nvfp4_svdquant_gemm_8319e1548886614ab273",
+    },
+    {
+        "arches": ("sm_103a",),
+        "m_min": 129,
+        "m_max": 129,
+        "n_min": 3072,
+        "n_max": 3072,
+        "k_min": 3072,
+        "k_max": 3072,
+        "ranks": (96, 128),
+        "bias": True,
+        "record": "cake_nvfp4_svdquant_gemm_01405277c4bbc4031fbd",
+    },
+    {
+        "arches": ("sm_103a",),
+        "m_min": 129,
+        "m_max": 129,
+        "n_min": 3072,
+        "n_max": 3072,
+        "k_min": 3072,
+        "k_max": 3072,
+        "ranks": (128,),
+        "bias": False,
+        "record": "cake_nvfp4_svdquant_gemm_23bfc212699bbb4e6214",
+    },
+    {
+        "m_min": 129,
+        "m_max": 129,
+        "n_min": 3072,
+        "n_max": 3072,
+        "k_min": 12288,
+        "k_max": 12288,
+        "ranks": (32, 128),
+        "bias": True,
+        "record": "cake_nvfp4_svdquant_gemm_8958df827006875b2512",
+    },
+    {
+        "m_min": 129,
+        "m_max": 129,
+        "n_min": 3072,
+        "n_max": 3072,
+        "k_min": 12288,
+        "k_max": 12288,
+        "ranks": (32, 128),
+        "bias": False,
+        "record": "cake_nvfp4_svdquant_gemm_0a3a28f6f508e7d75146",
     },
     {
         "arches": ("sm_100a",),
@@ -2839,18 +3201,6 @@ ROUTE_TABLE: tuple[dict[str, Any], ...] = (
         "record": "cake_nvfp4_svdquant_gemm_8c21118cf9b080867cf1",
     },
     {
-        "arches": ("sm_103a",),
-        "m_min": 129,
-        "m_max": 129,
-        "n_min": 3072,
-        "n_max": 3072,
-        "k_min": 3072,
-        "k_max": 3072,
-        "ranks": (128,),
-        "bias": False,
-        "record": "cake_nvfp4_svdquant_gemm_fed389c9e9cb9293bd29",
-    },
-    {
         "arches": ("sm_100a",),
         "m_min": 129,
         "m_max": 129,
@@ -2861,18 +3211,6 @@ ROUTE_TABLE: tuple[dict[str, Any], ...] = (
         "ranks": (128,),
         "bias": True,
         "record": "cake_nvfp4_svdquant_gemm_2270204930b79b8caef7",
-    },
-    {
-        "arches": ("sm_103a",),
-        "m_min": 129,
-        "m_max": 129,
-        "n_min": 3072,
-        "n_max": 3072,
-        "k_min": 3072,
-        "k_max": 3072,
-        "ranks": (128,),
-        "bias": True,
-        "record": "cake_nvfp4_svdquant_gemm_44ec820136bf5bcde86e",
     },
     {
         "arches": ("sm_100a",),
@@ -3124,7 +3462,8 @@ ROUTE_TABLE: tuple[dict[str, Any], ...] = (
     # The M 129 / N 3072 rows: the 64-row tactic 14 program, 144 CTAs in one
     # wave, in the form of the K class -- form B for K >= 12288 with K % 256 == 0,
     # form A for every other K (a multiple of 128); the biased build for biased
-    # problems, the bias-free build otherwise.
+    # problems, the bias-free build otherwise (the sm_103a K 3072 rows at the
+    # head take the L2-promoted builds instead).
     {
         "m_min": 129,
         "m_max": 129,
@@ -3398,8 +3737,11 @@ def launch_grid(
     ``N`` is a multiple of 128); ``pair_persistent`` ``(2 * tok_tiles * w_tiles, 1, 1)`` with
     ``tok_tiles = ceil(M / block_m)`` and ``w_tiles = ceil(N / block_n)``, two
     CTAs per scheduled tile; ``pair_tailsplit`` ``(2 * num_units, 1, 1)`` with
-    the ``num_units`` of :func:`tailsplit_units` (``sm_count`` required).
-    ``K`` takes no part in any rule today (no rule splits K).
+    the ``num_units`` of :func:`tailsplit_units` (``sm_count`` required);
+    ``splitk_cluster`` ``(split_k * grid_n, 1, 1)``: one cluster of the plan's
+    ``split_k`` CTAs per 128-column weight tile, every CTA of a cluster walking
+    ``K / split_k`` (the route rows pin ``K``, so ``K`` enters no grid
+    arithmetic).
     """
     plan = record["plan"]
     rule = plan["grid_rule"]
@@ -3421,6 +3763,8 @@ def launch_grid(
             )
         _, num_units, _, _ = tailsplit_units(m=m, n=n, sm_count=sm_count)
         return (2 * num_units, 1, 1)
+    if rule == "splitk_cluster":
+        return (int(plan["split_k"]) * grid_n, 1, 1)
     raise ValueError(f"unknown Cake NVFP4 SVDQuant grid rule: {rule!r}")
 
 

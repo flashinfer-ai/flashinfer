@@ -2423,6 +2423,46 @@ def test_attention_ts_mla_decode_page_size_dtype_product(
 
 
 @pytest.mark.parametrize(
+    ("batch_size", "page_size", "max_seq_len"),
+    (
+        (2, 16, 32769),
+        (128, 16, 2049),
+        (128, 128, 4225),
+    ),
+    ids=("split-page16", "page16", "page128"),
+)
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_fp8_2cta_page_window(
+    batch_size: int, page_size: int, max_seq_len: int
+):
+    """FP8 2CTA K/V loaders read page IDs through a prefetched 32-entry window.
+
+    One window covers ``32 / pages_per_tile`` K tiles. Every case gives the
+    longest request's work tiles more K tiles than one window, so the loaders
+    swap in the prefetched window. The two-request case is long enough to
+    split KV, so windows start at each split's first K tile. Page 128 covers
+    the two CTAs sharing one page.
+    """
+
+    case = _make_mla_case(
+        batch_size=batch_size,
+        num_qo_heads=128,
+        max_seq_len=max_seq_len,
+        qkv_dtype=_FP8,
+        page_size=page_size,
+        device="cuda",
+        seed=37000 + page_size + batch_size,
+    )
+    wrapper = _plan_case(case)
+    policy = _policy_dict(wrapper)
+    assert policy["kernel"] == "throughput_2cta"
+    k_tiles = -(-max_seq_len // 128)
+    tiles_per_work_tile = -(-k_tiles // int(policy["split_kv"]))
+    assert tiles_per_work_tile > 32 // (128 // page_size), policy
+    _assert_case_correct(_run_case(wrapper, case), case, policy)
+
+
+@pytest.mark.parametrize(
     "page_size", (16, 32, 64, 128), ids=lambda value: f"page{value}"
 )
 @pytest.mark.parametrize(

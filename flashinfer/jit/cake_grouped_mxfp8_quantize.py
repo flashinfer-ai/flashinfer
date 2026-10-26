@@ -11,9 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Generated programs of the Blackwell grouped MXFP8 quantization kernel: one program per
-input dtype (bfloat16, float16), each shipped for sm_100a and sm_103a. The host module
-``flashinfer.quantization.fp8_quantization`` computes the grid and launches them.
+"""Generated programs of the Blackwell grouped MXFP8 quantization kernels: the row-2D
+kernel (BF16, F16), its bulk-copy form (BULK_BF16, BULK_F16), its row-tiled form
+(TILED_BF16, TILED_F16) and the row-tiled form with 224-thread CTAs (TILED_WIDE_BF16,
+TILED_WIDE_F16), each shipped for sm_100a and sm_103a. The host module
+``flashinfer.quantization.fp8_quantization`` selects the program from the problem's
+shape, computes the grid and launches it.
 
 Generated file: every value below is derived from the exported sources and checked
 against them; do not edit.
@@ -113,7 +116,291 @@ F16 = cake_program.CakeProgram(
     needs_device_linking=False,
 )
 
-PROGRAMS: tuple[cake_program.CakeProgram, ...] = (BF16, F16)
+BULK_BF16 = cake_program.CakeProgram(
+    name="cake_grouped_mxfp8_quantize_bc015d46cbd7b0ccd67b",
+    operator_dir="cake_grouped_mxfp8_quantize",
+    kernel="kernel_cake_grouped_mxfp8_quantize_bc015d46cbd7b0ccd67b",
+    sources=(
+        "cake_grouped_mxfp8_quantize_bc015d46cbd7b0ccd67b_kernel.cu",
+        "cake_grouped_mxfp8_quantize_bc015d46cbd7b0ccd67b_binding.cu",
+    ),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(("sm_100a", ("--fmad=true",)), ("sm_103a", ("--fmad=true",))),
+    args=(
+        "x",
+        "mask",
+        "quantized",
+        "scales",
+        "M",
+        "K",
+        "PADDED_K",
+        "PM_TILES",
+        "PK_TILES",
+        "BLOCKS_PER_ROW",
+        "TOTAL_TASKS",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=("x", "mask", "quantized", "scales"),
+    block=(128, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=8320,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+BULK_F16 = cake_program.CakeProgram(
+    name="cake_grouped_mxfp8_quantize_977b5e967e2415146d6d",
+    operator_dir="cake_grouped_mxfp8_quantize",
+    kernel="kernel_cake_grouped_mxfp8_quantize_977b5e967e2415146d6d",
+    sources=(
+        "cake_grouped_mxfp8_quantize_bc015d46cbd7b0ccd67b_kernel.cu",
+        "cake_grouped_mxfp8_quantize_bc015d46cbd7b0ccd67b_binding.cu",
+    ),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        (
+            "sm_100a",
+            (
+                "--fmad=true",
+                "-DCAKE_PROGRAM_VARIANT=1",
+                "-DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_977b5e967e2415146d6d",
+                "-DCAKE_PROGRAM_SHIM=cake_binding_kernel_cake_grouped_mxfp8_quantize_977b5e967e2415146d6d",
+            ),
+        ),
+        (
+            "sm_103a",
+            (
+                "--fmad=true",
+                "-DCAKE_PROGRAM_VARIANT=1",
+                "-DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_977b5e967e2415146d6d",
+                "-DCAKE_PROGRAM_SHIM=cake_binding_kernel_cake_grouped_mxfp8_quantize_977b5e967e2415146d6d",
+            ),
+        ),
+    ),
+    args=(
+        "x",
+        "mask",
+        "quantized",
+        "scales",
+        "M",
+        "K",
+        "PADDED_K",
+        "PM_TILES",
+        "PK_TILES",
+        "BLOCKS_PER_ROW",
+        "TOTAL_TASKS",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=("x", "mask", "quantized", "scales"),
+    block=(128, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=8320,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+TILED_BF16 = cake_program.CakeProgram(
+    name="cake_grouped_mxfp8_quantize_8576babbd894e4b6d820",
+    operator_dir="cake_grouped_mxfp8_quantize",
+    kernel="kernel_cake_grouped_mxfp8_quantize_8576babbd894e4b6d820",
+    sources=(
+        "cake_grouped_mxfp8_quantize_8576babbd894e4b6d820_kernel.cu",
+        "cake_grouped_mxfp8_quantize_8576babbd894e4b6d820_binding.cu",
+    ),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(("sm_100a", ("--fmad=true",)), ("sm_103a", ("--fmad=true",))),
+    args=(
+        "x",
+        "mask",
+        "quantized",
+        "scales",
+        "M",
+        "K",
+        "PADDED_K",
+        "PM_TILES",
+        "PK_TILES",
+        "BLOCKS_PER_ROW",
+        "TOTAL_TASKS",
+        "ROWS",
+        "SUBROWS",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=("x", "mask", "quantized", "scales"),
+    block=(128, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=0,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+TILED_F16 = cake_program.CakeProgram(
+    name="cake_grouped_mxfp8_quantize_d121f7006a04383f7954",
+    operator_dir="cake_grouped_mxfp8_quantize",
+    kernel="kernel_cake_grouped_mxfp8_quantize_d121f7006a04383f7954",
+    sources=(
+        "cake_grouped_mxfp8_quantize_8576babbd894e4b6d820_kernel.cu",
+        "cake_grouped_mxfp8_quantize_8576babbd894e4b6d820_binding.cu",
+    ),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        (
+            "sm_100a",
+            (
+                "--fmad=true",
+                "-DCAKE_PROGRAM_VARIANT=1",
+                "-DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_d121f7006a04383f7954",
+                "-DCAKE_PROGRAM_SHIM=cake_binding_kernel_cake_grouped_mxfp8_quantize_d121f7006a04383f7954",
+            ),
+        ),
+        (
+            "sm_103a",
+            (
+                "--fmad=true",
+                "-DCAKE_PROGRAM_VARIANT=1",
+                "-DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_d121f7006a04383f7954",
+                "-DCAKE_PROGRAM_SHIM=cake_binding_kernel_cake_grouped_mxfp8_quantize_d121f7006a04383f7954",
+            ),
+        ),
+    ),
+    args=(
+        "x",
+        "mask",
+        "quantized",
+        "scales",
+        "M",
+        "K",
+        "PADDED_K",
+        "PM_TILES",
+        "PK_TILES",
+        "BLOCKS_PER_ROW",
+        "TOTAL_TASKS",
+        "ROWS",
+        "SUBROWS",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=("x", "mask", "quantized", "scales"),
+    block=(128, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=0,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+TILED_WIDE_BF16 = cake_program.CakeProgram(
+    name="cake_grouped_mxfp8_quantize_dd34a67556795b5a9623",
+    operator_dir="cake_grouped_mxfp8_quantize",
+    kernel="kernel_cake_grouped_mxfp8_quantize_dd34a67556795b5a9623",
+    sources=(
+        "cake_grouped_mxfp8_quantize_dd34a67556795b5a9623_kernel.cu",
+        "cake_grouped_mxfp8_quantize_dd34a67556795b5a9623_binding.cu",
+    ),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(("sm_100a", ("--fmad=true",)), ("sm_103a", ("--fmad=true",))),
+    args=(
+        "x",
+        "mask",
+        "quantized",
+        "scales",
+        "M",
+        "K",
+        "PADDED_K",
+        "PM_TILES",
+        "PK_TILES",
+        "BLOCKS_PER_ROW",
+        "TOTAL_TASKS",
+        "ROWS",
+        "SUBROWS",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=("x", "mask", "quantized", "scales"),
+    block=(224, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=0,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+TILED_WIDE_F16 = cake_program.CakeProgram(
+    name="cake_grouped_mxfp8_quantize_fbcc0484317e99db440e",
+    operator_dir="cake_grouped_mxfp8_quantize",
+    kernel="kernel_cake_grouped_mxfp8_quantize_fbcc0484317e99db440e",
+    sources=(
+        "cake_grouped_mxfp8_quantize_dd34a67556795b5a9623_kernel.cu",
+        "cake_grouped_mxfp8_quantize_dd34a67556795b5a9623_binding.cu",
+    ),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        (
+            "sm_100a",
+            (
+                "--fmad=true",
+                "-DCAKE_PROGRAM_VARIANT=1",
+                "-DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_fbcc0484317e99db440e",
+                "-DCAKE_PROGRAM_SHIM=cake_binding_kernel_cake_grouped_mxfp8_quantize_fbcc0484317e99db440e",
+            ),
+        ),
+        (
+            "sm_103a",
+            (
+                "--fmad=true",
+                "-DCAKE_PROGRAM_VARIANT=1",
+                "-DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_fbcc0484317e99db440e",
+                "-DCAKE_PROGRAM_SHIM=cake_binding_kernel_cake_grouped_mxfp8_quantize_fbcc0484317e99db440e",
+            ),
+        ),
+    ),
+    args=(
+        "x",
+        "mask",
+        "quantized",
+        "scales",
+        "M",
+        "K",
+        "PADDED_K",
+        "PM_TILES",
+        "PK_TILES",
+        "BLOCKS_PER_ROW",
+        "TOTAL_TASKS",
+        "ROWS",
+        "SUBROWS",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=("x", "mask", "quantized", "scales"),
+    block=(224, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=0,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+PROGRAMS: tuple[cake_program.CakeProgram, ...] = (
+    BF16,
+    F16,
+    BULK_BF16,
+    BULK_F16,
+    TILED_BF16,
+    TILED_F16,
+    TILED_WIDE_BF16,
+    TILED_WIDE_F16,
+)
 
 
 def aot_specs(target: str) -> tuple[JitSpec, ...]:
@@ -121,4 +408,15 @@ def aot_specs(target: str) -> tuple[JitSpec, ...]:
     return cake_program.aot_specs(PROGRAMS, target)
 
 
-__all__ = ["BF16", "F16", "PROGRAMS", "aot_specs"]
+__all__ = [
+    "BF16",
+    "F16",
+    "BULK_BF16",
+    "BULK_F16",
+    "TILED_BF16",
+    "TILED_F16",
+    "TILED_WIDE_BF16",
+    "TILED_WIDE_F16",
+    "PROGRAMS",
+    "aot_specs",
+]

@@ -42,7 +42,8 @@ The programs are the eight launches of the KCP composition
 * ``kcp_dhu_offset`` / ``kcp_dhu_tape`` -- the adjoint recurrence likewise
   (reverse walk; the tape program writes the ``dh`` / ``dv2`` tapes);
 * ``kcp_transfer_walk`` -- the FP32-class transfer ``M_f`` (``^T``) of a
-  segment (TF32 hi/lo on the tensor cores) or, with ``init_mode = 1``, its
+  segment (BF16x3 on the tensor cores: two CTAs per segment and head, each
+  over one 64-column half of the state) or, with ``init_mode = 1``, its
   FP32-class offset;
 * ``kcp_affine_merge`` -- the exact FP32 affine chains over tile pools
   (``grid_rule`` ``kcp_chains``: ``n_chains * (ncols / cols_per_cta)`` CTAs);
@@ -74,15 +75,16 @@ base-pointer views, the operand and tape tensors from the call's local stage
 values -- onto :func:`run_module`.
 
 Test-only record set (``build.test.json``, loaded only under the environment
-variable ``CAKE_KCP_TEST_KNOBS=1``): the transfer walk built with the static
-knob ``precision_mode`` 1 (the explicit three-MMA TF32x3 form of the bitwise
-unit test) and 2 (plain TF32, a cross-check that is not a gate), and the
-BF16x3 candidate of the transfer walk (``transfer_walk`` knob ``bf16x3``: six
-BF16 MMAs per step; ``bf16x3_hw64``: its 64-column half-width form, two CTAs
-per segment and head) for its evaluation on the end-to-end path; their
+variable ``CAKE_KCP_TEST_KNOBS=1``): the TF32 hi/lo transfer walk
+(``transfer_walk`` knob ``tf32_hilo``: the previous shipped program, one CTA
+per segment and head) with its static ``precision_mode`` forms 1 (the
+explicit three-MMA TF32x3 form of the bitwise unit test) and 2 (plain TF32, a
+cross-check that is not a gate), and the full-width BF16x3 walk
+(``transfer_walk`` knob ``bf16x3``: one CTA per segment and head over all 128
+value columns) for the A/B record of the shipped half-width program; their
 records are ``TEST_MODULES`` and their libraries never enter ``build.json``,
-so the shipped route carries the TF32 hi/lo program only.  The public API
-cannot select them: :mod:`.cake_kcp` takes ``precision_mode`` and
+so the shipped route carries the BF16x3 half-width program only.  The public
+API cannot select them: :mod:`.cake_kcp` takes ``precision_mode`` and
 ``transfer_walk`` from the validated ``_kcp_test_knobs`` option alone.
 
 The derived leaves of a record (``kernel_symbol``, ``launch``, ``arg_plan``,
@@ -125,12 +127,14 @@ PROGRAMS = (
 WALK_PROGRAMS = PROGRAMS[:5]
 # Elements of one FP32 state tile [128, 128].
 TILE = 128 * 128
-# The static ``precision_mode`` knob of the transfer walk: 0 the shipped TF32
-# hi/lo program, 1 / 2 the test-only programs of ``build.test.json``.
+# The static ``precision_mode`` knob of the TF32 hi/lo transfer walk: 0 the
+# program the ``transfer_walk`` knob selects, 1 / 2 the test-only TF32
+# programs of ``build.test.json``.
 PRECISION_MODES = (0, 1, 2)
-# The ``transfer_walk`` knob: ``tf32_hilo`` the shipped program, ``bf16x3`` /
-# ``bf16x3_hw64`` the test-only BF16x3 candidate programs of ``build.test.json``.
-TRANSFER_WALKS = ("tf32_hilo", "bf16x3", "bf16x3_hw64")
+# The ``transfer_walk`` knob: ``bf16x3_hw64`` the shipped program (BF16x3, two
+# CTAs per segment and head), ``tf32_hilo`` / ``bf16x3`` the test-only programs
+# of ``build.test.json`` (the TF32 hi/lo walk and the full-width BF16x3 form).
+TRANSFER_WALKS = ("bf16x3_hw64", "tf32_hilo", "bf16x3")
 TEST_KNOBS_ENV = "CAKE_KCP_TEST_KNOBS"
 TEST_MANIFEST = "build.test.json"
 
@@ -502,16 +506,17 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "grid_rule": {"kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_kda_train_1ac972f0cb7cc7b13cf7",
+        # Two CTAs per (segment, head): each walks one 64-column half of the state.
+        "grid_rule": {"ctas_per_head": 2, "kind": "kcp_segments_heads"},
+        "kernel_symbol": "kernel_cake_kda_train_9a3f306bacf8c8a1547d",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 198656,
+            "dynamic_smem_bytes": 107520,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_1ac972f0cb7cc7b13cf7",
+        "library": "cake_kda_train_9a3f306bacf8c8a1547d",
         "logical": {
             "gk": "gk",
             "init_mode": "init_mode",
@@ -728,14 +733,16 @@ MODULES: dict[str, dict[str, Any]] = {
     },
 }
 
-# The test-only record set: the transfer walk built with the static knob
+# The test-only record set: the TF32 hi/lo transfer walk
+# ``kda_chunk_kcp_transfer_walk_v1`` (``_tf32_hilo``: the previous shipped
+# program, one CTA per segment and head) with its static knob
 # ``precision_mode`` 1 (``_three_mma``: the explicit three-MMA TF32x3 form,
-# bitwise equal to the shipped program) and 2 (``_plain_tf32``: the lo
-# products skipped; an optional cross-check, never a gate), and the BF16x3
-# candidate ``kda_chunk_kcp_transfer_walk_bf16x3_v1`` at ``vh`` 128 (one CTA
-# per segment and head) and 64 (``_hw64``: two CTAs per segment and head,
-# ``grid_rule.ctas_per_head`` 2).  Same kernel signature, argument plan and
-# logical map as ``kcp_transfer_walk``; the libraries live in
+# bitwise equal to the hi/lo program) and 2 (``_plain_tf32``: the lo products
+# skipped; an optional cross-check, never a gate), and the BF16x3 walk
+# ``kda_chunk_kcp_transfer_walk_bf16x3_v1`` at ``vh`` 128 (``_bf16x3``: one
+# CTA per segment and head; the shipped ``kcp_transfer_walk`` is its ``vh`` 64
+# form, ``grid_rule.ctas_per_head`` 2).  Same kernel signature, argument plan
+# and logical map as ``kcp_transfer_walk``; the libraries live in
 # ``build.test.json`` only (:func:`load_test`), never in ``build.json``, and
 # :func:`run_program` reaches a record only through the call's test knobs
 # (``test_knobs``: the knob values that select it).
@@ -911,7 +918,7 @@ TEST_MODULES: dict[str, dict[str, Any]] = {
         "test_knobs": {"transfer_walk": "bf16x3"},
         "variant": "bf16x3",
     },
-    "kcp_transfer_walk_bf16x3_hw64": {
+    "kcp_transfer_walk_tf32_hilo": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "w_tma"],
@@ -935,17 +942,16 @@ TEST_MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        # Two CTAs per (segment, head): each walks one 64-column half of the state.
-        "grid_rule": {"ctas_per_head": 2, "kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_kda_train_9a3f306bacf8c8a1547d",
+        "grid_rule": {"kind": "kcp_segments_heads"},
+        "kernel_symbol": "kernel_cake_kda_train_1ac972f0cb7cc7b13cf7",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 107520,
+            "dynamic_smem_bytes": 198656,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_9a3f306bacf8c8a1547d",
+        "library": "cake_kda_train_1ac972f0cb7cc7b13cf7",
         "logical": {
             "gk": "gk",
             "init_mode": "init_mode",
@@ -966,8 +972,8 @@ TEST_MODULES: dict[str, dict[str, Any]] = {
         },
         "program": "kcp_transfer_walk",
         "select_rule": {"kind": "always"},
-        "test_knobs": {"transfer_walk": "bf16x3_hw64"},
-        "variant": "bf16x3_hw64",
+        "test_knobs": {"transfer_walk": "tf32_hilo"},
+        "variant": "tf32_hilo",
     },
 }
 
@@ -1208,12 +1214,13 @@ def test_knobs_enabled() -> bool:
 
 
 def test_record(
-    precision_mode: int = 0, transfer_walk: str = "tf32_hilo"
+    precision_mode: int = 0, transfer_walk: str = "bf16x3_hw64"
 ) -> tuple[str, dict[str, Any]] | None:
     """``(record name, record)`` of the test-only transfer walk the knobs select, ``None`` for the shipped program
-    (``precision_mode`` 0 and ``transfer_walk`` ``"tf32_hilo"``).  ``precision_mode`` 1 / 2 are the static TF32
-    programs; ``transfer_walk`` ``"bf16x3"`` / ``"bf16x3_hw64"`` the BF16x3 candidate; both knobs at once are refused
-    (one test-only program per launch)."""
+    (``precision_mode`` 0 and ``transfer_walk`` ``"bf16x3_hw64"``).  ``transfer_walk`` ``"tf32_hilo"`` is the TF32
+    hi/lo walk and ``"bf16x3"`` the full-width BF16x3 form; ``precision_mode`` 1 / 2 are the static programs of the
+    TF32 hi/lo walk (``transfer_walk`` left at its default or ``"tf32_hilo"``); a BF16x3 walk beside a non-zero
+    ``precision_mode`` is refused (one test-only program per launch)."""
     mode, walk = int(precision_mode), str(transfer_walk)
     if mode not in PRECISION_MODES:
         raise ValueError(
@@ -1225,7 +1232,7 @@ def test_record(
         )
     if mode == 0 and walk == TRANSFER_WALKS[0]:
         return None
-    if mode != 0 and walk != TRANSFER_WALKS[0]:
+    if mode != 0 and walk not in (TRANSFER_WALKS[0], "tf32_hilo"):
         raise ValueError(
             f"precision_mode {mode} and transfer_walk {walk!r} name two test-only programs; set one knob"
         )
