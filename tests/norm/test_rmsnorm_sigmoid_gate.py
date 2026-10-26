@@ -166,6 +166,12 @@ def test_rmsnorm_sigmoid_gate_matches_strided_reference(
 @pytest.mark.parametrize("tokens", [8, 64])
 def test_rmsnorm_sigmoid_gate_cuda_graph_uses_changed_inputs(tokens: int, backend: str):
     _skip_unless_supported(backend)
+    if backend == "cake" and not _cake_admits(tokens):
+        # a declared gap of the package's PDL route: the explicit "cake" call is refused there (checked above), so
+        # there is no Cake launch to capture; "auto" replays the CuTe DSL kernel under PDL
+        pytest.skip(
+            f"the Cake PDL route declares a gap at {tokens} tokens of {NUM_HEADS} heads on this device"
+        )
 
     static_x, static_gate, projection = _inputs(tokens, seed=1001)
     rmsnorm_sigmoid_gate(static_x, static_gate, 1e-5, backend=backend)
