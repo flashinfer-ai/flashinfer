@@ -38,7 +38,9 @@ limitations under the License.
 # activation reads and hand-off stores; ``_k128`` an unfused decode program's
 # 256-K TMA stages loaded as two 128-K halves, ``_sko<N>`` a 16-token cluster
 # split-K decode program's partial-sum exchange bounded to the first N rows, in
-# cells of at most N rows), measured faster on that
+# cells of at most N rows; ``_cv100`` the quantization launch with a preferred
+# shared-memory carveout of 100 percent, which the decode launch starting beside
+# it under PDL uses), measured faster on that
 # architecture's rows of the cell; ``route_twins(arch)`` reads it.  Generated
 # from the Cake measurement sweeps recorded in the source repository; do not
 # edit by hand.
@@ -1326,6 +1328,9 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         },
         "12,28,4096": {
             "quant:u4": "quant:u4_xef_qel",
+        },
+        "17,28,64": {
+            "quant:u1": "quant:u1_cv100",
         },
         "17,28,256": {
             "quant:u1": "quant:u1_xef_qel",

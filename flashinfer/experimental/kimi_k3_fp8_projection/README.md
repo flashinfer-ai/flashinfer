@@ -66,7 +66,9 @@ evict-first), `_xef_qel` (quantization: activation loads evict-first, E4M3 /
 scale stores evict-last) -- or with a schedule change -- `_k128` (unfused
 decode: each 256-K TMA stage loaded as two 128-K halves), `_sko<N>` (16-token
 cluster split-K decode: the partial-sum exchange bounded to the first N rows,
-taken only by cells of at most N rows) -- built for the architectures it was
+taken only by cells of at most N rows), `_cv100` (quantization: a preferred
+shared-memory carveout of 100 percent, set as a launch attribute, for the
+decode launch that starts beside it) -- built for the architectures it was
 measured faster on; the output bits are the plain program's.
 
 | Tensor | Shape | dtype |
