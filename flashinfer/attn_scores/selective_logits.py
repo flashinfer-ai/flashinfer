@@ -672,10 +672,12 @@ def _validate_prepared(
     return metadata
 
 
+def _device_ordinal(device: torch.device) -> int:
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
 def _current_stream(device: torch.device):
-    device_index = device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
+    device_index = _device_ordinal(device)
     raw_stream = (
         _raw_stream(device_index)
         if _raw_stream is not None
@@ -991,6 +993,7 @@ def _launch_metadata(
     capability = torch.cuda.get_device_capability(device)
     key = (
         *capability,
+        _device_ordinal(device),
         prepared.num_sms,
         prepared.query_tile,
         prepared.kv_chunk_size,
@@ -1072,6 +1075,7 @@ def _launch_compact_metadata(
     capability = torch.cuda.get_device_capability(prepared.context_lens.device)
     key = (
         *capability,
+        _device_ordinal(prepared.context_lens.device),
         prepared.num_sms,
         prepared.kv_chunk_size,
         prepared.split_kv,
@@ -1871,6 +1875,7 @@ def _fp8_mqa_selective_logits(
         )
     key: Tuple[Any, ...] = (
         capability[0] * 10 + capability[1],
+        _device_ordinal(q.device),
         prepared.num_sms,
         mode,
         capacity,

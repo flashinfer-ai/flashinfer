@@ -4230,6 +4230,16 @@ def test_selective_constructor_device_support(monkeypatch, capability):
         )
 
 
+@pytest.mark.parametrize(
+    "device, expected", [("cuda:0", 0), ("cuda:1", 1), ("cuda", 2)]
+)
+def test_selective_compile_device_ordinal(monkeypatch, device, expected):
+    from flashinfer.attn_scores.selective_logits import _device_ordinal
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 2)
+    assert _device_ordinal(torch.device(device)) == expected
+
+
 def test_topk_plan_explicit_signature_and_strategy_binding(monkeypatch):
     """Strategy-specific logging uses true names for both planning contracts."""
     import inspect
@@ -9340,8 +9350,10 @@ def test_capacity_shared_layer_workspace(heads, ratio):
 
 
 @_requires_selective_sm100
-def test_capacity_first_compact_pool_precompiles_metadata(monkeypatch):
+def test_capacity_first_compact_pool_precompiles_metadata(monkeypatch, record_property):
     """A cold compact-repair pool never compiles metadata during capture."""
+    import time
+
     from flashinfer.attn_scores import selective_logits
 
     # Preserve existing compiled owners while giving this plan a cold metadata
@@ -9372,7 +9384,9 @@ def test_capacity_first_compact_pool_precompiles_metadata(monkeypatch):
         max_batch_size=1,
         kv_layout=fused,
     )
+    started = time.perf_counter()
     wrapper.prepare_pool(fused)
+    record_property("first_prepare_pool_seconds", time.perf_counter() - started)
     assert wrapper._capacity_plan._engine._compact_repair
     assert metadata_compiles
     assert any(key[-1] for key in selective_logits._METADATA_COMPILED)
