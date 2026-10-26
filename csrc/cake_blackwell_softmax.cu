@@ -769,7 +769,8 @@ SoftmaxRoute query_softmax_route(TensorView logits, Optional<TensorView> maybe_t
 
 // The cached-cluster kernel these logits would launch, for tests: {cluster
 // CTAs, max tiles, 1 if its symbol is a _pdl twin, its resident clusters on
-// this device}; empty for the other routes.
+// this device, the resident clusters of the 4-tile kernel twice its size (0
+// past 16 CTAs)}; empty for the other routes.
 Array<int64_t> query_cached_kernel(TensorView logits, Optional<TensorView> maybe_temperature_arr,
                                    double temperature_val, bool enable_pdl,
                                    bool temperature_is_none) {
@@ -782,6 +783,7 @@ Array<int64_t> query_cached_kernel(TensorView logits, Optional<TensorView> maybe
   ffi::CUDADeviceGuard device_guard(logits.device().device_id);
   const char* name = nullptr;
   int resident = 0;
+  int next_resident = 0;
   cudaError_t status = cudaFuncGetName(&name, launch.kernel);
   if (status == cudaSuccess) {
     status = query_resident_clusters(nullptr, launch.kernel, launch.variant.cluster_ctas,
@@ -791,8 +793,16 @@ Array<int64_t> query_cached_kernel(TensorView logits, Optional<TensorView> maybe
       << "Blackwell Softmax kernel query failed with error code " << cudaGetErrorString(status);
   const size_t length = std::strlen(name);
   const bool pdl_twin = length > 4 && std::strcmp(name + length - 4, "_pdl") == 0;
+  const int next_ctas = launch.variant.cluster_ctas * 2;
+  if (next_ctas <= kCachedMaxClusterSize) {
+    status =
+        query_resident_clusters(nullptr, cached_cluster_kernel({next_ctas, 4}, pdl_twin), next_ctas,
+                                cached_dynamic_smem_bytes(next_ctas), &next_resident);
+  }
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "Blackwell Softmax kernel query failed with error code " << cudaGetErrorString(status);
   return Array<int64_t>(std::vector<int64_t>{launch.variant.cluster_ctas, launch.variant.max_tiles,
-                                             pdl_twin ? 1 : 0, resident});
+                                             pdl_twin ? 1 : 0, resident, next_resident});
 }
 
 void blackwell_softmax_impl(TensorView workspace_buffer, TensorView logits, TensorView output,

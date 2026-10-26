@@ -325,12 +325,14 @@ def test_blackwell_cached_cluster_spread_keeps_rows_resident(
     )
     probs = flashinfer.sampling.softmax(logits, temperature=0.5, enable_pdl=enable_pdl)
 
-    _, max_tiles, pdl_twin, resident_clusters = kernel
+    _, max_tiles, pdl_twin, resident_clusters, next_resident_clusters = kernel
     on_sm103 = torch.cuda.get_device_capability() == (10, 3)
     # Spreading a row over more CTAs stops before a cluster size whose
-    # resident clusters are fewer than the rows, so all rows run in one wave.
+    # resident clusters are fewer than the rows, so all rows run in one wave,
+    # and not earlier: twice the CTAs would leave rows for a second wave.
     assert max_tiles == 4
     assert rows <= resident_clusters
+    assert rows > next_resident_clusters
     assert pdl_twin == int(enable_pdl and on_sm103)
     torch.testing.assert_close(
         probs, torch.softmax(logits / 0.5, dim=-1), atol=1e-3, rtol=1e-3

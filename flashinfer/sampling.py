@@ -165,7 +165,8 @@ def _blackwell_softmax_cached_kernel_for_testing(
 ) -> Tuple[int, ...]:
     """Return the cached-cluster kernel the C++ dispatcher would launch, without
     launching it: (cluster CTAs, max tiles, 1 if it is a PDL twin, its resident
-    clusters on this device), or () for the other routes."""
+    clusters on this device, the resident clusters of the 4-tile kernel twice its
+    size or 0 past 16 CTAs), or () for the other routes."""
     if not logits.is_cuda:
         raise ValueError(f"logits must be a CUDA tensor, got device={logits.device}")
     device_index = logits.device.index
