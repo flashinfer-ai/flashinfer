@@ -14,7 +14,6 @@
 
 """Captured task schedules for the throughput-latency 1CTA MLA TS path."""
 
-import functools
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32
@@ -1868,25 +1867,14 @@ def create_single_kv_pipe_mma_task(
     work_tile_skip_if = runtime_work_tile_skip_if(work_queue)
     swap = cfg.one_insts_kv_swap
     pv_mma = staged_pv_mma if swap else staged_pv_mma_tmem_p
-    qk_only_stages = (
-        cfg.qk_head_dim_stages - cfg.v_head_dim_stages if cfg.sparse_reuse_kv else 0
-    )
-    if qk_only_stages:
-        # Reused 576-dim K tiles: PV also releases the RoPE stage of its tile.
-        assert not swap, "reused RoPE stages are released by the Keep-AB PV"
-        pv_mma = functools.partial(staged_pv_mma_tmem_p, qk_only_stages=qk_only_stages)
     pv_loop = "pv_mma_loop_0" if swap else "pv_mma_loop_tmem_p"
     pv_tail = "pv_mma_tail_0" if swap else "pv_mma_tail_tmem_p"
     v_desc = "v_desc_reused_0" if swap else "v_desc_reused"
     if not cfg.sparse_reuse_kv:
         v_desc = "v_desc_0"
-    # Token-sparse E4M3 also issues PV(t) before QK(t + 1): one resident
-    # 576-dim K tile (5 stages) leaves a whole tile of the 10-stage ring for
-    # the next gather, which the HBM-bound full-wave decode needs (QK-first
-    # holds two tiles and stalls the loader: +3.6 % at 148 tokens vs -18 %).
     pv_before_qk = (
         cfg.sparse_reuse_kv
-        and (not cfg.is_fp8_qkv() or cfg.is_dynamic_token_sparse)
+        and not cfg.is_fp8_qkv()
         and (swap or cfg.tile_size_kv == 128)
     )
 

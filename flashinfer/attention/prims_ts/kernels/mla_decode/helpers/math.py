@@ -50,21 +50,6 @@ def ceil_div(a, b):
     return (a + b - 1) // b
 
 
-def max_skip_corr_threshold(qkv_dtype: str) -> float:
-    """Return the largest legal ``skip_corr_threshold`` (log2 units) per P dtype.
-
-    ``"e4m3"`` caps at 8: the P scale is 1.75 and ``1.75 * 2**8 == 448`` is the
-    E4M3 maximum.  ``"bf16"`` caps at 64 (``2**6``): P is unscaled, so this is
-    an engineering cap well inside the FP32 exponent range.
-    """
-
-    if qkv_dtype == "e4m3":
-        return 8.0
-    if qkv_dtype == "bf16":
-        return 64.0
-    raise ValueError(f"unsupported qkv_dtype={qkv_dtype!r}")
-
-
 def qkv_dtype(cfg):
     """Return the shared Q/K/V element dtype for MLA decode examples."""
     if cfg.is_fp8_qkv():

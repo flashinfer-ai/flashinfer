@@ -47,6 +47,7 @@ import os
 from typing import Optional
 
 import torch
+from packaging.version import Version
 
 from flashinfer.api_logging import flashinfer_experimental_api
 from flashinfer.trace.templates.attention import (
@@ -75,11 +76,11 @@ NVFP4_DEQUANT_PREFETCH_MAX_CTAS = 64
 
 # Split-KV: below this many CTAs (query tokens x 64-head groups) most SMs would idle,
 # so every token's top-k list is split into S contiguous tile ranges (one CTA each)
-# and a standalone reducer merges the partials.  S is the largest choice that keeps
-# the split grid within one wave and leaves each CTA at least one 128-key tile.
-# Measured on B200 (K=2048, sc8, NVFP4 / FP8): B1 35.6 -> 13.1 / 52.0 -> 11.4 us
-# (S=16), B16 36.2 -> 15.9 / 52.1 -> 14.9 (S=8), B32 36.2 -> 19.4 (S=4), B64 37.4 ->
-# 27.6 / 52.8 -> 33.1 (S=2); a split grid beyond one wave is slower than S=1.
+# and a standalone reducer merges the partials.  NVFP4 (``_select_split_kv``) takes
+# the largest S that keeps the split grid within one wave and leaves each CTA at
+# least one 128-key tile: B200, K=2048, sc8, B1 35.6 -> 13.1 us (S=16), B16 36.2 ->
+# 15.9 (S=8), B32 36.2 -> 19.4 (S=4), B64 37.4 -> 27.6 (S=2); a split grid beyond
+# one wave is slower than S=1.  E4M3 follows trtllm-gen (``_select_fp8_split``).
 SPLIT_KV_MIN_CTAS = 96
 SPLIT_KV_CHOICES = (16, 8, 4, 2)
 _SPLIT_KV_MIN_TILES = 1
@@ -227,7 +228,7 @@ def _validate_common_inputs(
             f"{name} must be a finite number",
         )
     # E4M3 P: 1.75 * 2**8 == 448 is the largest row-max shift the frozen
-    # maximum may lag behind (see ``max_skip_corr_threshold``).
+    # maximum may lag behind.
     _require(
         0.0 <= float(skip_corr_threshold) <= 8.0,
         "skip_corr_threshold must be in [0, 8] (log2 units)",
@@ -286,8 +287,7 @@ def _require_nvfp4_toolchain() -> None:
     """Raise once if cutlass-dsl cannot emit the NVFP4 dequantization (QMUL4, PTX ISA 9.4)."""
     import cutlass
 
-    version = tuple(int(part) for part in cutlass.__version__.split(".")[:2])
-    if version < (4, 8):
+    if Version(cutlass.__version__) < Version("4.8"):
         raise NotImplementedError(
             "prims_ts_dsa_sparse_mla_nvfp4 requires nvidia-cutlass-dsl>=4.8 "
             f"(PTX ISA 9.4 QMUL4, CUDA 13.4); found {cutlass.__version__}"

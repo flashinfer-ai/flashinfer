@@ -118,10 +118,14 @@ not read the placeholders.  Both entries return BF16 `[T, H, 512]` (optional
 caller-owned `out` and base-2 `lse`), accept `skip_corr_threshold` in `[0, 8]`,
 and run one CTA per query token and 64 heads (128 heads run as two row tiles
 of the same token).  Below 96 such CTAs the entries split every token's top-k
-list into S in {16, 8, 4, 2} contiguous 128-key tile ranges (the largest S
-that keeps the grid within one wave of SMs and at least one tile per CTA);
-the CTAs write BF16 partial O / LSE to a per-call workspace and a reducer
-kernel merges them, so S > 1 is not bitwise equal to S = 1.  Both need
+list into S in {16, 8, 4, 2} contiguous 128-key tile ranges, the largest S
+that keeps the grid within one wave of SMs and leaves each CTA at least one
+tile (NVFP4) or two tiles (FP8, trtllm-gen's MLA generation rule).  While a
+split FP8 grid still fills at most a half or a quarter of the SMs, it also
+splits the 512 V columns over 2 or 4 CTAs that repeat QK / softmax (B200,
+top-k 2048: one token runs 8 x 4 CTAs).  The CTAs write BF16 partial O / LSE
+to a per-call workspace and a reducer kernel merges them, so a split launch
+is not bitwise equal to the unsplit one.  Both need
 SM100 / SM103; the NVFP4 entry additionally needs
 CUDA 13.4+ / `nvidia-cutlass-dsl` 4.8+ (PTX ISA 9.4 packed E2M1 x E4M3
 multiply).  The kernel trusts the routing values: `block_tables` entries must

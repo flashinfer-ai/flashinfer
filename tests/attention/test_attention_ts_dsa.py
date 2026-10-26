@@ -555,9 +555,9 @@ def test_prims_ts_dsa_zero_tokens(kernel: str) -> None:
 @pytest.mark.arch_blackwell
 def test_prims_ts_dsa_compiled_kernel_is_shared_across_token_counts() -> None:
     """The JIT key is (heads, top-k, skip-correction, cache format, dequant prefetch,
-    split-KV count); T is a runtime extent.
+    split-KV count, V head-dim split); T is a runtime extent.
 
-    Token counts that select the same split count (and, for NVFP4, the same side of
+    Token counts that select the same split (and, for NVFP4, the same side of
     ``NVFP4_DEQUANT_PREFETCH_MAX_CTAS``) share one kernel.
     """
     device = torch.device("cuda")
@@ -567,8 +567,8 @@ def test_prims_ts_dsa_compiled_kernel_is_shared_across_token_counts() -> None:
     totals = (1, 7, limit, limit + 1, 150)
     variants = set()
     for total_q in totals:
+        variants.add(("fp8", *dsa_module._select_fp8_split(total_q, top_k, sm_count)))
         split = dsa_module._select_split_kv(total_q, top_k, sm_count)
-        variants.add(("fp8", split))
         variants.add(("nvfp4", split, total_q * split <= limit))
     before = compile_dsa_sparse_kernel.cache_info()
     for total_q in totals:
@@ -602,6 +602,31 @@ def test_prims_ts_dsa_split_kv_policy() -> None:
     assert select(48, 2048, 148) == 2  # e.g. 24 tokens with 128 heads
 
 
+def test_prims_ts_dsa_fp8_split_policy() -> None:
+    """E4M3 follows trtllm-gen: at least two tiles per split CTA within one wave,
+    then a V head-dim split while the grid fills at most a quarter / half of the SMs."""
+    select = dsa_module._select_fp8_split
+    ctas = (1, 4, 5, 8, 9, 16, 18, 19, 37, 38, 74, 75, 96)
+    assert [select(t, 2048, 148) for t in ctas] == [
+        (8, 4),
+        (8, 4),
+        (8, 2),
+        (8, 2),
+        (8, 2),
+        (8, 1),
+        (8, 1),
+        (4, 1),
+        (4, 1),
+        (2, 1),
+        (2, 1),
+        (1, 1),
+        (1, 1),
+    ]
+    assert select(1, 512, 148) == (2, 4)  # two tile pairs
+    assert select(1, 256, 148) == (1, 1)  # one tile pair: no split, no V split
+    assert select(48, 2048, 148) == (2, 1)  # e.g. 24 tokens with 128 heads
+
+
 _SPLIT_CASES = [
     Case("ragged-neg30", total_q=6, ragged=True, neg=0.3),
     Case("lens-zero", total_q=4, ragged=True, zero_len_token=True),
@@ -611,16 +636,39 @@ _SPLIT_CASES = [
 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
-@pytest.mark.parametrize("kernel", ("fp8", "nvfp4"))
-@pytest.mark.parametrize("split", (1, 2, 16))
+@pytest.mark.parametrize(
+    ("kernel", "split", "head_dim_split"),
+    (
+        ("fp8", 1, 1),
+        ("fp8", 2, 1),
+        ("fp8", 2, 4),
+        ("fp8", 4, 2),
+        ("fp8", 16, 4),
+        ("nvfp4", 1, 1),
+        ("nvfp4", 2, 1),
+        ("nvfp4", 16, 1),
+    ),
+)
 @pytest.mark.parametrize("case", _SPLIT_CASES, ids=lambda c: c.name)
 def test_prims_ts_dsa_split_kv_matches_reference(
-    kernel: str, split: int, case: Case, monkeypatch: pytest.MonkeyPatch
+    kernel: str,
+    split: int,
+    head_dim_split: int,
+    case: Case,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Forced split counts (incl. empty and one-tile splits) match the reference."""
-    monkeypatch.setattr(
-        dsa_module, "_select_split_kv", lambda num_ctas, top_k, sm_count: split
-    )
+    """Forced splits (incl. empty and one-tile splits, and E4M3 V head-dim splits)
+    match the reference."""
+    if kernel == "fp8":
+        monkeypatch.setattr(
+            dsa_module,
+            "_select_fp8_split",
+            lambda num_ctas, top_k, sm_count: (split, head_dim_split),
+        )
+    else:
+        monkeypatch.setattr(
+            dsa_module, "_select_split_kv", lambda num_ctas, top_k, sm_count: split
+        )
     device = torch.device("cuda")
     fx = build_fixture(case, device)
     lse = torch.empty((case.total_q, case.heads), dtype=torch.float32, device=device)

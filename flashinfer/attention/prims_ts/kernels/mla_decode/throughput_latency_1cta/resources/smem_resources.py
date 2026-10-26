@@ -98,8 +98,8 @@ from .common import (
 )
 
 # Token-sparse per-key validity ring: ``SPARSE_MASK_SLOTS`` tiles x four
-# 32-bit words. Word ``j`` bit ``l`` is token ``4 * l + j`` of the 128-token
-# tile (lane ``l`` of the index-producer warp stages tokens ``4l .. 4l + 3``).
+# 32-bit words. Word ``w`` bit ``l`` is token ``32 * w + l`` of the 128-token
+# tile (a warp ballot over tokens ``32w .. 32w + 31``).
 SPARSE_MASK_SLOTS = 16
 SPARSE_MASK_WORDS = 4
 
