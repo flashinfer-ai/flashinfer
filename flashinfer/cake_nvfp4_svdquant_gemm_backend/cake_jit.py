@@ -1525,8 +1525,8 @@ MODULES: dict[str, dict[str, Any]] = {
     # Form A with the TMA L2 promotion of the weight descriptors (``l2_promotion
     # = "l2_256b"``: B and SFB are promoted to 256-byte L2 lines; the kernel
     # text is otherwise form A's), built with the bias epilogue: the sm_103a
-    # build of the (129, 3072, 3072, 32, True) row.  Ships for sm_103a only
-    # (sm_100a keeps form A on that row).
+    # build of the (129, 3072, 3072, {32, 64}, True) rows.  Ships for sm_103a
+    # only (sm_100a keeps form A on those rows).
     "cake_nvfp4_svdquant_gemm_99bdf6e03d704178faf9": {
         "arches": ["sm_103a"],
         # derived; rewritten by the exporter
@@ -1599,8 +1599,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     # The 16-stage aliased ring of form A ({"stages": 16, "epi_alias": True})
     # with the TMA L2 promotion of the weight descriptors, built with the bias
-    # epilogue: the sm_103a build of the (129, 3072, 3072, {64, 96, 128},
-    # True) rows.  Ships for sm_103a only.
+    # epilogue: the sm_103a build of the (129, 3072, 3072, {96, 128}, True)
+    # rows.  Ships for sm_103a only.
     "cake_nvfp4_svdquant_gemm_01405277c4bbc4031fbd": {
         "arches": ["sm_103a"],
         # derived; rewritten by the exporter
@@ -3807,12 +3807,12 @@ ROUTE_TABLE: tuple[dict[str, Any], ...] = (
     # two-CTA programs, so that each names the
     # program of exactly one (M, N, K, rank, bias), per architecture where the two
     # architectures measured different winners (``arches``; absent = both):
-    #   (129, 3072, 3072, 32, True) on sm_103a -> 99bdf6e03d704178faf9 (L2-promoted form A)
+    #   (129, 3072, 3072, {32, 64}, True) on sm_103a -> 99bdf6e03d704178faf9 (L2-promoted form A)
     #   (129, 3072, 3072, 32, False) on sm_103a -> 8319e1548886614ab273 (L2-promoted form A)
     #   (129, 3072, 3072, 32, True) on sm_100a -> 05bda082a73c0c1a68b0
     #   (129, 3072, 3072, 32, False) on sm_100a -> 5852ad0db045e502e10a
-    #   (129, 3072, 3072, {64, 96, 128}, True) on sm_103a -> 01405277c4bbc4031fbd (L2-promoted 16-stage ring)
     #   (129, 3072, 3072, 64, True) on sm_100a -> 05bda082a73c0c1a68b0
+    #   (129, 3072, 3072, {96, 128}, True) on sm_103a -> 01405277c4bbc4031fbd (L2-promoted 16-stage ring)
     #   (129, 3072, 3072, 96, True) on sm_100a -> 2270204930b79b8caef7
     #   (129, 3072, 3072, 128, False) on sm_103a -> 23bfc212699bbb4e6214 (L2-promoted 16-stage ring)
     #   (129, 3072, 3072, 128, False) on sm_100a -> 5852ad0db045e502e10a
@@ -3864,7 +3864,7 @@ ROUTE_TABLE: tuple[dict[str, Any], ...] = (
         "n_max": 3072,
         "k_min": 3072,
         "k_max": 3072,
-        "ranks": (32,),
+        "ranks": (32, 64),
         "bias": True,
         "record": "cake_nvfp4_svdquant_gemm_99bdf6e03d704178faf9",
     },
@@ -3888,7 +3888,7 @@ ROUTE_TABLE: tuple[dict[str, Any], ...] = (
         "n_max": 3072,
         "k_min": 3072,
         "k_max": 3072,
-        "ranks": (64, 96, 128),
+        "ranks": (96, 128),
         "bias": True,
         "record": "cake_nvfp4_svdquant_gemm_01405277c4bbc4031fbd",
     },
