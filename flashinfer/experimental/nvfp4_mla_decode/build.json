@@ -157,6 +157,86 @@
         "csrc/cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_4cd8124d834b7ab3a055_kernel.cu",
         "csrc/cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_4cd8124d834b7ab3a055_binding.cu"
       ]
+    },
+    {
+      "arch": "sm_100a",
+      "closure_sha256": "c7018173f0afb258e086de00810a876d96dce5609157397aff6998c0c20d323a",
+      "entry": "run",
+      "gencode": "-gencode=arch=compute_100a,code=sm_100a",
+      "min_cuda": "12.8",
+      "name": "cake_nvfp4_mla_decode_7d6b9ae94df533a027ea_sm_100a",
+      "nvcc_flags": [
+        "--use_fast_math"
+      ],
+      "nvcc_flags_if": [],
+      "path": "aot/cake_nvfp4_mla_decode_7d6b9ae94df533a027ea_sm_100a.so",
+      "sha256": {
+        "csrc/cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_7d6b9ae94df533a027ea_binding.cu": "0296669f0135343304950bc1f6161920050a95354243a543d160b845f56eda22",
+        "csrc/cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_7d6b9ae94df533a027ea_kernel.cu": "d4606422e801e81f39cb9ebba708584105b4b3d19761053d63ca7df33a822ea6"
+      },
+      "sources": [
+        "csrc/cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_7d6b9ae94df533a027ea_kernel.cu",
+        "csrc/cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_7d6b9ae94df533a027ea_binding.cu"
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "closure_sha256": "ef61d312922dfc6117df234004201a65e61cf74379b3e29764d0d623e894bcb4",
+      "entry": "run",
+      "gencode": "-gencode=arch=compute_103a,code=sm_103a",
+      "min_cuda": "12.9",
+      "name": "cake_nvfp4_mla_decode_7d6b9ae94df533a027ea_sm_103a",
+      "nvcc_flags": [
+        "--use_fast_math"
+      ],
+      "nvcc_flags_if": [],
+      "path": "aot/cake_nvfp4_mla_decode_7d6b9ae94df533a027ea_sm_103a.so",
+      "sha256": {
+        "csrc/cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_7d6b9ae94df533a027ea_binding.cu": "0296669f0135343304950bc1f6161920050a95354243a543d160b845f56eda22",
+        "csrc/cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_7d6b9ae94df533a027ea_kernel.cu": "d4606422e801e81f39cb9ebba708584105b4b3d19761053d63ca7df33a822ea6"
+      },
+      "sources": [
+        "csrc/cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_7d6b9ae94df533a027ea_kernel.cu",
+        "csrc/cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_7d6b9ae94df533a027ea_binding.cu"
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "closure_sha256": "3ca3db830d1c1da5b556f0ebdbf1278dcc83a43b1a71f34de224f3a109afa3e1",
+      "entry": "run",
+      "gencode": "-gencode=arch=compute_100a,code=sm_100a",
+      "min_cuda": "12.8",
+      "name": "cake_nvfp4_mla_decode_d3e21f744c0427fef73d_sm_100a",
+      "nvcc_flags": [],
+      "nvcc_flags_if": [],
+      "path": "aot/cake_nvfp4_mla_decode_d3e21f744c0427fef73d_sm_100a.so",
+      "sha256": {
+        "csrc/cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_d3e21f744c0427fef73d_binding.cu": "52dd9d1402fb4f5299c9453441ae05af7893054653d2ea5f16ae3df9bdceab30",
+        "csrc/cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_d3e21f744c0427fef73d_kernel.cu": "d560ced17538557970b42e0a41e655b84778585b4d3884a6631f98f1f39d569c"
+      },
+      "sources": [
+        "csrc/cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_d3e21f744c0427fef73d_kernel.cu",
+        "csrc/cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_d3e21f744c0427fef73d_binding.cu"
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "closure_sha256": "33d4b85745e0c4f9240fb652766b21a6d528a2a0fc1aaacf24859f4f6c5ff57b",
+      "entry": "run",
+      "gencode": "-gencode=arch=compute_103a,code=sm_103a",
+      "min_cuda": "12.9",
+      "name": "cake_nvfp4_mla_decode_d3e21f744c0427fef73d_sm_103a",
+      "nvcc_flags": [],
+      "nvcc_flags_if": [],
+      "path": "aot/cake_nvfp4_mla_decode_d3e21f744c0427fef73d_sm_103a.so",
+      "sha256": {
+        "csrc/cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_d3e21f744c0427fef73d_binding.cu": "52dd9d1402fb4f5299c9453441ae05af7893054653d2ea5f16ae3df9bdceab30",
+        "csrc/cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_d3e21f744c0427fef73d_kernel.cu": "d560ced17538557970b42e0a41e655b84778585b4d3884a6631f98f1f39d569c"
+      },
+      "sources": [
+        "csrc/cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_d3e21f744c0427fef73d_kernel.cu",
+        "csrc/cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_d3e21f744c0427fef73d_binding.cu"
+      ]
     }
   ],
   "package": "flashinfer.experimental.nvfp4_mla_decode",
