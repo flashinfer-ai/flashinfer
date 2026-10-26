@@ -30,8 +30,9 @@ def bench(fn, reps=300, warmup=50):
         t0 = time.perf_counter()
         for _ in range(reps):
             fn()
-        torch.cuda.synchronize()
+        # Stop the clock before draining: GPU completion is not host cost.
         best = min(best, (time.perf_counter() - t0) / reps * 1e6)
+        torch.cuda.synchronize()
     return best
 
 
@@ -78,7 +79,7 @@ def main():
             lambda x=backend: flashinfer.mm_bf16(a, b, out=out, backend=x),
         )
 
-    if props.major == 10:
+    if props.major in (10, 12):
         w = b.t().contiguous()
         ga = (448 * 6) / a.float().abs().max()
         gw = (448 * 6) / w.float().abs().max()
@@ -106,7 +107,13 @@ def main():
     base = None
     if args.compare:
         with open(args.compare) as f:
-            base = json.load(f)["results"]
+            saved = json.load(f)
+        if saved.get("shape") != [m, n, k] or saved.get("gpu") != props.name:
+            raise SystemExit(
+                f"--compare baseline was measured on {saved.get('gpu')} shape "
+                f"{saved.get('shape')}; this run is {props.name} shape {[m, n, k]}"
+            )
+        base = saved["results"]
     width = max(len(x) for x in results)
     print(
         f"\n{'':<{width}}  {'us/call':>9s}"

@@ -18,6 +18,7 @@ import functools
 from collections import Counter, OrderedDict
 import logging
 import os
+import threading
 import warnings
 import weakref
 from dataclasses import astuple, replace
@@ -2200,6 +2201,9 @@ def get_mm_bf16_cublaslt_module():
 
             def __init__(self):
                 self._algo_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
+                # The memoized runner is shared across threads; a lookup must not
+                # race an eviction.  Enumeration itself stays outside the lock.
+                self._algo_cache_lock = threading.Lock()
 
             def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
                 # Semantic key: synthesis-invariant.  M/N/K already live in the
@@ -2262,10 +2266,11 @@ def get_mm_bf16_cublaslt_module():
                 a, b, bias, _, out, workspace_buffer = inputs
                 compute_dt = self._compute_dtype(out.dtype)
                 key = self._algo_cache_key(inputs)
-                cached = self._algo_cache.get(key)
-                if cached is not None:
-                    self._algo_cache.move_to_end(key)
-                    return cached
+                with self._algo_cache_lock:
+                    cached = self._algo_cache.get(key)
+                    if cached is not None:
+                        self._algo_cache.move_to_end(key)
+                        return cached
                 algo_buf = torch.empty(
                     _CUBLASLT_MAX_ALGOS * _CUBLASLT_ALGO_BYTES,
                     dtype=torch.uint8,
@@ -2288,12 +2293,13 @@ def get_mm_bf16_cublaslt_module():
                     algo_buf,
                 )
                 result = (algo_buf, count)
-                self._algo_cache[key] = result
-                # Bounded: the runner is process-lived now, and a serving process
-                # walks many exact M values.  The outer factory lru_cache bounds
-                # the number of runners, not this.
-                if len(self._algo_cache) > self._ALGO_CACHE_MAX:
-                    self._algo_cache.popitem(last=False)
+                with self._algo_cache_lock:
+                    self._algo_cache[key] = result
+                    # Bounded: the runner is process-lived now, and a serving
+                    # process walks many exact M values.  The outer factory
+                    # lru_cache bounds the number of runners, not this.
+                    if len(self._algo_cache) > self._ALGO_CACHE_MAX:
+                        self._algo_cache.popitem(last=False)
                 return result
 
             def get_valid_tactics(
