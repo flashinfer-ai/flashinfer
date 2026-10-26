@@ -31,6 +31,8 @@ _TILES = {1: (128, 8), 8: (64, 8), 17: (128, 32), 32: (64, 32)}
 
 
 def _require_splitk():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available.")
     if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("The cluster split-K kernel requires SM100/SM103/SM107.")
     from flashinfer.cute_dsl.utils import is_cute_dsl_available
