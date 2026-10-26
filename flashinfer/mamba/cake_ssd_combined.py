@@ -775,18 +775,17 @@ def _arch_program(name: str, arch: str) -> _Program:
 
     program = _PROGRAMS[name]
     module = _main_module(name, arch)
-    rebound: dict[str, _Kernel] = {}
-    if module != program.main.module:
-        rebound["main"] = _scan(module)
+    main = program.main if module == program.main.module else _scan(module)
+    preprocess = program.preprocess
     if arch == _SM107_ARCH and program.preprocess is _SEGMENT_PREPROCESS:
-        rebound["preprocess"] = (
+        preprocess = (
             _SM107_SEGMENT_PREPROCESS_TRIGGER
             if _main_pdl(name, arch) and program.family in _PDL_TRIGGER_FAMILIES
             else _SM107_SEGMENT_PREPROCESS
         )
-    if not rebound:
+    if main is program.main and preprocess is program.preprocess:
         return program
-    return replace(program, **rebound)
+    return replace(program, main=main, preprocess=preprocess)
 
 
 # The sm_107a two-kernel programs whose main kernel waits on the preprocess
