@@ -6122,7 +6122,7 @@ def trtllm_fp8_block_scale_moe(
     activation_type : int
         Activation type (default ``3`` — Swiglu).  ``3`` Swiglu; ``4`` Geglu;
         ``6`` Relu2; ``7`` SwigluStep (MxFp8 only); ``9`` Identity; ``12`` ClampedRelu2
-        (MXFP8 only; requires ``gemm1_clamp_limit`` and a matching TRTLLM-gen artifact).
+        (MXFP8 only; requires ``gemm1_clamp_limit`` and a matching kernel artifact).
     norm_topk_prob : bool
         Whether to normalize the top-k probabilities (default ``True``).
     routing_replay_out : Optional[torch.Tensor]
@@ -6156,7 +6156,7 @@ def trtllm_fp8_block_scale_moe(
         ``s`` for each local expert (including fused shared experts, if any).
         FC1 applies ``(s * tanh(relu(x) / s)) ** 2`` before MXFP8 quantization.
         ``gemm1_alpha`` and ``gemm1_beta`` must be absent. This requires a
-        TRTLLM-gen artifact containing the ClampedRelu2 kernels; older
+        kernel artifact containing the ClampedRelu2 kernels; older
         artifacts reject this activation. Scale values are a caller contract
         and are not read back to the host during CUDA graph capture.
 
@@ -6424,7 +6424,7 @@ def trtllm_fp8_block_scale_routed_moe(
     activation_type : int
         Activation type (default ``3`` — Swiglu).  ``3`` Swiglu; ``4`` Geglu;
         ``6`` Relu2; ``7`` SwigluStep; ``9`` Identity; ``12`` ClampedRelu2
-        (MXFP8 only; requires ``gemm1_clamp_limit`` and a matching TRTLLM-gen artifact).
+        (MXFP8 only; requires ``gemm1_clamp_limit`` and a matching kernel artifact).
     gemm1_alpha : Optional[torch.Tensor]
         Optional ``[local_num_experts]`` float32 per-expert SwiGLU OA alpha
         parameter.  Supported for ``Fp8QuantizationType.MxFp8`` and
@@ -6447,7 +6447,7 @@ def trtllm_fp8_block_scale_routed_moe(
         ``s`` for each local expert (including fused shared experts, if any).
         FC1 applies ``(s * tanh(relu(x) / s)) ** 2`` before MXFP8 quantization.
         ``gemm1_alpha`` and ``gemm1_beta`` must be absent. This requires a
-        TRTLLM-gen artifact containing the ClampedRelu2 kernels; older
+        kernel artifact containing the ClampedRelu2 kernels; older
         artifacts reject this activation. Scale values are a caller contract
         and are not read back to the host during CUDA graph capture.
 

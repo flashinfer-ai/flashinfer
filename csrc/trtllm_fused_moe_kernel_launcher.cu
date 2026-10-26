@@ -1005,7 +1005,7 @@ inline ActivationType validateAndCastActivationType(int64_t act_type) {
     return ActivationType::ClampedRelu2;
 #else
     TVM_FFI_ICHECK(false)
-        << "TRTLLM ClampedRelu2 requires a published TRTLLM-gen artifact with "
+        << "TRTLLM ClampedRelu2 requires a kernel artifact with "
            "ClampedRelu2 headers and MXFP8 kernels; the installed artifact lacks support.";
 #endif
   }
