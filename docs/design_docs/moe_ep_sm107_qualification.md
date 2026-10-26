@@ -78,7 +78,14 @@ FP32 and zero masked scores. Activation and scale bytes are copied unchanged.
 Eligible BF16 inputs use fused quantization and staging for NVFP4 or MXFP8;
 unsupported layouts and score dtypes retain the Torch path. Set
 `FLASHINFER_MEGA_FUSED_STAGE=0` to use Torch staging. Routing validation remains
-separate and runs before either staging path.
+separate and runs before either staging path by default.
+
+Set `FLASHINFER_SM107_MEGA_CHECK_ROUTES=0` to skip routing value checks when
+the caller guarantees valid routing. This skips ID-range, duplicate-ID and
+finite-score checks; it does not sanitize non-finite scores on active routes.
+Metadata checks, staging and masked-score zeroing remain active. Set the
+variable before warmup and graph capture; existing graphs must be recaptured
+to change their validation behavior.
 
 Routing value checks use device assertions so they remain active on graph
 replay without a host synchronization. Invalid routing can invalidate the
