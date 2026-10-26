@@ -32,7 +32,8 @@ generated Cake program::
       layer_attention     packed-varlen noncausal BF16 attention per grid_thw segment  [T, 12, 128]
                           (``attention:<layout>[:wide][:split]``; a split plan writes the tail-round units'
                           K/V parts as FP32 partials and runs ``layer_attention_merge`` -- the exact
-                          fixed-order merge -- right after it)
+                          fixed-order merge -- right after it on SM100; the SM103 split builds merge the
+                          parts in the kernel)
       layer_out_proj      gemm residual_wo_sqxw: x += bf16(a @ Wo^T); xw = bf16(x * norm1), stats (in place)
       layer_norm_fc0_gelu gemm norm_gelu:      f  = bf16(gelu_tanh(bf16((xw @ Wfc0^T) * rstd(x)))) [T, 4096]
       layer_fc1           gemm residual_fc1_sqxw: x += bf16(f @ Wfc1^T); xw = bf16(x * norm0[l+1]), stats
@@ -222,9 +223,10 @@ MAX_KV_PARTS = 8  # Cake ``kimi_k3_vision_attention.MAX_KV_PARTS`` (= ``kimi_k3_
 #   the separate merge launch.
 IN_KERNEL_MERGE_ARCHES = ("sm_103a",)
 # * forced tail splits: (arch, non-empty segment lengths) -> the part count the automatic plan of that exact batch
-#   takes instead of the automatic split decision, on its automatic layout (unless a part of it could not run as its
-#   cluster's last item on the device's grid, where the automatic plan stays).  The one entry is the 4096 x 4096 image
-#   on sm_103a, where the four-way tail split measured faster than the unsplit plan the block model prefers.
+#   takes instead of the automatic split decision, on its automatic layout (unless it cuts no unit on the device's grid
+#   or a part of it could not run as its cluster's last item there, where the automatic plan stays).  The one entry is
+#   the 4096 x 4096 image on sm_103a, where the four-way tail split measured faster than the unsplit plan the block
+#   model prefers.
 FORCED_KV_SPLIT: dict[tuple[str, tuple[int, ...]], int] = {("sm_103a", (66564,)): 4}
 
 
@@ -1081,10 +1083,10 @@ def build_attention_plan(
             grid_policy=grid_policy,
             arch=arch,
         )
-        if int(probe["split_units"]) > 0 and not probe["merge_ok"]:
-            forced = (
-                None  # the parts cannot all run last on this grid: the automatic plan
-            )
+        if int(probe["split_units"]) == 0 or not probe["merge_ok"]:
+            # The split cuts no unit on this grid (the partial-output build would run idle), or its parts cannot all
+            # run last there: the automatic plan.
+            forced = None
     if forced is not None:
         # A measured batch: the automatic layout with its tail units split ``forced`` ways (``FORCED_KV_SPLIT``).
         selection = select_tiles_per_cta(lens, num_heads, grid_clusters, arch)
@@ -2608,6 +2610,8 @@ class KimiK3VisionTowerRunner:
     @property
     def route_metadata(self) -> dict[str, Any]:
         plan = self.plan
+        # The merge launch follows a split plan's attention, except where the split builds merge in the kernel.
+        merge = plan.attention.num_merge_units > 0 and not in_kernel_merge(plan.arch)
         return dict(
             arch=plan.arch,
             layers=plan.num_layers,
@@ -2621,7 +2625,7 @@ class KimiK3VisionTowerRunner:
             kv_split_used=plan.attention.kv_split_used,
             split_units=plan.attention.split_units,
             attention_kernel_key=plan.attention.kernel_key,
-            attention_merge=plan.attention.num_merge_units > 0,
+            attention_merge=merge,
             attention_merge_units=plan.attention.num_merge_units,
             attention_items=plan.attention.total_tiles,
             attention_units=plan.attention.total_units,

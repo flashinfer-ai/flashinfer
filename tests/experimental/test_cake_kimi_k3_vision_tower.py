@@ -929,6 +929,42 @@ def test_attention_plan_layout_rule():
         cake_jit.parse_attention_kernel_key("attention:ring3:split:wide")
 
 
+def test_forced_kv_split_never_launches_the_split_build_idle(monkeypatch):
+    """The forced four-way tail split of the 4096 x 4096 image on sm_103a (``FORCED_KV_SPLIT``) cuts 18 tail units
+    on 74 clusters; on a grid whose rounds its 1572 two-tile units fill exactly (12 or 131 clusters) it cuts none,
+    and the plan is the automatic one: whole units, no idle partial-output build."""
+    cu = cu_seqlens_of(CONTRACT_GRIDS["img_max_4096sq"])
+    cpu = torch.device("cpu")
+    forced = build_attention_plan(
+        cu, cpu, HEADS, grid_clusters=GRID_CLUSTERS, arch="sm_103a"
+    )
+    assert (
+        forced.kernel_key,
+        forced.kv_split,
+        forced.split_units,
+        forced.num_merge_units,
+    ) == ("attention:tiles2:split", 4, 18, 18)
+    idle = {
+        clusters: build_attention_plan(
+            cu, cpu, HEADS, grid_clusters=clusters, arch="sm_103a"
+        )
+        for clusters in (12, 131)
+    }
+    monkeypatch.setattr(cb, "FORCED_KV_SPLIT", {})
+    for clusters, plan in idle.items():
+        auto = build_attention_plan(
+            cu, cpu, HEADS, grid_clusters=clusters, arch="sm_103a"
+        )
+        assert plan.total_units % clusters == 0
+        assert (plan.kernel_key, plan.kv_split, plan.num_merge_units) == (
+            "attention:tiles2",
+            None,
+            0,
+        )
+        assert auto.kernel_key == plan.kernel_key and auto.kv_split is None
+        assert torch.equal(auto.unit_table, plan.unit_table)
+
+
 def test_attention_plan_drops_empty_segments():
     plan = build_attention_plan(
         [0, 0, 640, 640, 1200], torch.device("cpu"), HEADS, grid_clusters=5
@@ -1489,7 +1525,10 @@ def test_prepared_runner_graph_replay_and_no_allocation():
     runner = prepare_kimi_k3_vision_tower(
         pixels, grids, prepared, out, plan=plan, pos_rows=pos_rows
     )
-    merge = int(plan.attention.num_merge_units > 0)
+    # The merge launch follows a split plan's attention, except where the split builds merge in the kernel.
+    merge = int(
+        plan.attention.num_merge_units > 0 and not cb.in_kernel_merge(plan.arch)
+    )
     assert runner.plan is plan and runner.launch_count == 1 + 2 * (5 + merge) + 4
     expected_stages = set(cb.STAGE_NAMES) - (
         set() if merge else {"layer_attention_merge"}
