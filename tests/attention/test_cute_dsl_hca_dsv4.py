@@ -195,6 +195,9 @@ def test_dsv4_backend_resolution_is_explicit(monkeypatch):
         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "auto")
         == "trtllm-gen"
     )
+    sm100_default = mla_core._resolve_dsv4_sparse_mla_backend(
+        torch.device("cpu"), "auto"
+    )
     assert (
         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "cute-dsl")
         == "cute-dsl"
@@ -205,14 +208,63 @@ def test_dsv4_backend_resolution_is_explicit(monkeypatch):
         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "auto")
         == "sparse"
     )
-    with pytest.raises(ValueError, match="requires SM100/SM103"):
+    with pytest.raises(ValueError, match="requires SM100/SM103, got SM120"):
         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "cute-dsl")
 
     monkeypatch.setattr(mla_core, "get_compute_capability", lambda _device: (10, 1))
     with pytest.raises(ValueError, match="supports SM100/SM103"):
         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "auto")
-    with pytest.raises(ValueError, match="requires SM100/SM103"):
+    with pytest.raises(ValueError, match="requires SM100/SM103, got SM101"):
         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "cute-dsl")
+
+    monkeypatch.setattr(mla_core, "get_compute_capability", lambda _device: (10, 7))
+    sm107_default = mla_core._resolve_dsv4_sparse_mla_backend(
+        torch.device("cpu"), "auto"
+    )
+    assert sm107_default == sm100_default
+    assert (
+        mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), sm100_default)
+        == sm100_default
+    )
+    with pytest.raises(ValueError, match="requires SM100/SM103, got SM107"):
+        mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "cute-dsl")
+    with pytest.raises(
+        ValueError, match="requires SM100/SM103 or SM120/SM121, got SM107"
+    ):
+        mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "cake")
+
+    for cc in ((10, 0), (10, 3), (12, 0), (12, 1)):
+        monkeypatch.setattr(mla_core, "get_compute_capability", lambda _device: cc)
+        assert (
+            mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "cake")
+            == "cake"
+        )
+
+
+@pytest.mark.parametrize(
+    ("backend", "compute_capability"),
+    (("cute-dsl", (10, 0)), ("sparse", (12, 0))),
+)
+@pytest.mark.parametrize(
+    "remap_arg",
+    ("remapped_sparse_indices_buffer", "sparse_indices_are_storage_offsets"),
+)
+def test_non_trtllm_dsv4_backends_reject_index_remapping_args(
+    monkeypatch, backend, compute_capability, remap_arg
+):
+    args = _cpu_hca_inputs()
+    args["backend"] = backend
+    args[remap_arg] = (
+        torch.empty((1, 128), dtype=torch.int32)
+        if remap_arg == "remapped_sparse_indices_buffer"
+        else False
+    )
+    monkeypatch.setattr(
+        mla_core, "get_compute_capability", lambda _device: compute_capability
+    )
+
+    with pytest.raises(ValueError, match=f"backend='{backend}' does not accept"):
+        trtllm_batch_decode_sparse_mla_dsv4(**args)
 
 
 def test_dsv4_backend_neutral_alias_is_backward_compatible():

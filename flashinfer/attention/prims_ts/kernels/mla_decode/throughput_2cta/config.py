@@ -14,24 +14,16 @@
 
 """Configuration for the throughput 2CTA MLA decode TS kernel.
 
-The throughput 2CTA policy uses a 2CTA M128 schedule. BF16 is the public
-throughput path; dtype traits are explicit so FP8 bring-up can share the same
-configuration structure once its 2CTA V/PV layout is complete.
+The throughput 2CTA policy uses a 2CTA M128 schedule. BF16 and FP8 inputs share
+the same explicit configuration structure and output-reduction contract.
 """
 
 from dataclasses import dataclass
 from typing import Tuple
 
-from ..helpers.constants import SUPPORTED_MLA_PAGE_SIZES
+from ..helpers.constants import MAX_MLA_SPLITS_KV, SUPPORTED_MLA_PAGE_SIZES
 from ..helpers.mask import MaskType, normalize_mask_type
 
-
-# Softmax converts natural-scale scores to exp2 with log2(e).
-LOG2_E = 1.4426950408889634074
-
-# Split-KV reduction allocates one LSE slot per possible split.  Match the
-# standalone reducer's qualified workspace and launch capacity.
-MAX_SPLITS = 128
 
 # The separate reducer follows the public MLA output contract: partial O is
 # stored as BF16 while LSE and the final accumulation remain FP32.  One
@@ -54,6 +46,10 @@ V_SMEM_K_BLOCK_TOKENS = 32
 # Each transpose-TMA issue stages one 64-element slice of the latent dimension.
 V_TMA_LATENT_ELEMENTS = 64
 
+# Two N slices of the final M128xD512 FP8 output, split across two CTAs.
+OUTPUT_TMA_STAGES = 2
+OUTPUT_TMA_STAGE_BYTES = 64 * 256
+
 
 def ceil_div(a: int, b: int) -> int:
     """Return ``ceil(a / b)`` for positive integer divisors."""
@@ -66,7 +62,7 @@ def ceil_div(a: int, b: int) -> int:
 def compute_split_kv(
     *,
     batch_size: int,
-    seq_len_q: int,
+    num_q_tiles: int,
     seq_len_kv: int,
     mma_qk_tiler_mn: Tuple[int, int] = (128, 128),
     max_active_blocks: int,
@@ -80,8 +76,8 @@ def compute_split_kv(
 
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
-    if seq_len_q <= 0:
-        raise ValueError(f"seq_len_q must be positive, got {seq_len_q}")
+    if num_q_tiles <= 0:
+        raise ValueError(f"num_q_tiles must be positive, got {num_q_tiles}")
     if seq_len_kv <= 0:
         raise ValueError(f"seq_len_kv must be positive, got {seq_len_kv}")
     if max_active_blocks <= 0:
@@ -92,30 +88,32 @@ def compute_split_kv(
         )
 
     max_splits = ceil_div(seq_len_kv, mma_qk_tiler_mn[1])
-    blocks_per_batch = max(1, max_active_blocks // batch_size // (seq_len_q * 2))
+    blocks_per_batch = max(1, max_active_blocks // batch_size // (num_q_tiles * 2))
     split_heur = min(max_splits, blocks_per_batch)
     k_waves = ceil_div(max_splits, split_heur)
     split_wave_aware = ceil_div(max_splits, k_waves)
-    # The 2CTA reduction workspace supports more split slots, but the automatic
-    # scheduler caps launch-time splits at 32 to avoid excessive reduction work.
-    return min(split_wave_aware, 32)
+    return min(split_wave_aware, MAX_MLA_SPLITS_KV)
 
 
 def compute_workspace_size(
     *,
-    num_heads: int,
-    seq_len_q: int,
+    tile_size_q: int,
+    num_q_tiles: int,
     latent_dim: int,
     batch_size: int,
     split_kv: int,
     partial_o_dtype,
     lse_dtype,
 ) -> int:
-    """Return mixed-dtype MLA split-KV workspace size in bytes."""
+    """Return the physical flat-tile split-KV workspace size in bytes."""
 
     if split_kv == 1:
         return 0
-    partial_rows = batch_size * num_heads * seq_len_q * split_kv
+    if tile_size_q <= 0:
+        raise ValueError(f"tile_size_q must be positive, got {tile_size_q}")
+    if num_q_tiles <= 0:
+        raise ValueError(f"num_q_tiles must be positive, got {num_q_tiles}")
+    partial_rows = batch_size * tile_size_q * num_q_tiles * split_kv
     return partial_rows * (
         latent_dim * partial_o_dtype.width // 8 + lse_dtype.width // 8
     )
@@ -162,8 +160,12 @@ class MlaDecodeConfig:
     iterations_qk_stages: int = 5
     iterations_pv_stages: int = 4
 
+    # Final quantized output can use a staged TMA store on padding warp 10.
+    use_tma_output: bool = False
+
     # Pipeline stage counts for the captured schedule resources.  The combined
     # K/V stage count keeps enough delayed-V stages live for K-before-V overlap.
+    sparse_offset_stages: int = 4
     load_q_stage: int = 1
     load_k_stage: int = 3
     load_v_stage: int = 2
@@ -182,6 +184,9 @@ class MlaDecodeConfig:
     correction_warp_ids: Tuple[int, ...] = (4, 5, 6, 7)
     mma_warp_id: int = 8
     load_tma_warp_id: int = 9
+    load_k_warp_id: int = 9
+    load_v_warp_id: int = 10
+    load_num_warps: int = 1
     pv_mma_warp_id: int = 11
     empty_warp_ids: Tuple[int, ...] = (11,)
     second_compute_warp_ids: Tuple[int, ...] = ()
@@ -261,6 +266,7 @@ class MlaDecodeConfig:
     # Use block_split_kvs[batch] as a per-batch cap before runtime K contracts
     # the useful split prefix. Grid and workspace geometry retain the maximum.
     is_var_split_kv: bool = False
+    cache_uniform_sparse_pages: bool = False
     # Causal is bottom-right aligned for speculative decode. Dense still masks
     # the ordinary per-batch KV tail at ``cache_seqs[batch]``.
     mask_type: str = MaskType.CAUSAL.value
@@ -337,6 +343,11 @@ def make_mla_decode_config(
     is_var_seq: bool = False,
     is_var_split_kv: bool = False,
     mask_type: MaskType | str = MaskType.CAUSAL,
+    sparse_gather_warps: int = 1,
+    sparse_kv_stages: int = 0,
+    cache_uniform_sparse_pages: bool = False,
+    balance_sparse_registers: bool = False,
+    fuse_output_quant: bool = False,
 ) -> MlaDecodeConfig:
     """Create and populate a MlaDecodeConfig from problem parameters."""
     cfg = MlaDecodeConfig()
@@ -376,7 +387,9 @@ def make_mla_decode_config(
     if rope_dim < 0:
         raise ValueError(f"rope_dim must be non-negative, got {rope_dim}")
     _require_positive("page_size", page_size)
-    if page_size not in SUPPORTED_MLA_PAGE_SIZES:
+    if page_size not in SUPPORTED_MLA_PAGE_SIZES and not (
+        page_size == 1 and rope_dim == 0
+    ):
         raise ValueError(
             f"page_size must be one of {SUPPORTED_MLA_PAGE_SIZES}, got {page_size}"
         )
@@ -406,6 +419,81 @@ def make_mla_decode_config(
         cfg.other_reg_num = 32
         cfg.mma_o_stage = 2
         cfg.epilogue_sync_bar_id = 4
+        if page_size == 1:
+            # Independent QK/PV streams retain two whole K/V tiles each. A
+            # third V tile costs 32 KiB per CTA without improving overlap in
+            # the qualified sparse schedule. Keep four metadata slots so
+            # index prefetch can run ahead of both streams.
+            cfg.load_k_stage = 2
+            cfg.load_v_stage = 2
+            cfg.use_fp8_dual_softmax_schedule = False
+            cfg.second_compute_warp_ids = ()
+            cfg.num_softmax_groups = 1
+            cfg.load_k_warp_id = 12
+            cfg.load_v_warp_id = 16
+            cfg.load_num_warps = 4
+            cfg.threads_per_cta = cfg.threads_per_warp * 20
+            cfg.other_reg_num = 48
+
+    if sparse_gather_warps != 1:
+        if sparse_gather_warps not in (4, 8) or qkv_dtype != "bf16" or page_size != 1:
+            raise ValueError("multi-warp combined loading requires BF16 sparse 2CTA")
+        cfg.load_num_warps = sparse_gather_warps
+        cfg.load_tma_warp_id = 12
+        cfg.load_k_warp_id = 12
+        cfg.threads_per_cta = 384 + 32 * sparse_gather_warps
+        cfg.softmax_reg_num = 128 if sparse_gather_warps == 8 else 192
+        cfg.correction_reg_num = 160 if sparse_gather_warps == 8 else 192
+        cfg.other_reg_num = 64
+
+    if sparse_kv_stages:
+        if qkv_dtype != "bf16" or page_size != 1 or sparse_gather_warps not in (4, 8):
+            raise ValueError("pipeline tuning requires multi-warp BF16 sparse 2CTA")
+        if sparse_kv_stages < 4:
+            raise ValueError("combined KV pipeline requires at least four stages")
+        cfg.load_kv_stage = sparse_kv_stages
+
+    if cache_uniform_sparse_pages:
+        if qkv_dtype != "bf16" or page_size != 1 or sparse_gather_warps not in (4, 8):
+            raise ValueError("uniform K cache requires multi-warp BF16 sparse loading")
+        cfg.cache_uniform_sparse_pages = True
+        cfg.softmax_reg_num = 128
+        cfg.correction_reg_num = 160 if sparse_gather_warps == 8 else 192
+        cfg.other_reg_num = 64 if sparse_gather_warps == 8 else 96
+
+    if balance_sparse_registers:
+        if page_size != 1 or qkv_dtype != "e4m3":
+            raise ValueError("balanced registers require sparse FP8")
+        # Sparse FP8 keeps 64 registers for the gather issuers. Split the
+        # remaining budget equally: 128 softmax registers spilled live loop
+        # state on every KV tile, while correction fits in 144 registers.
+        # 4*144 + 4*144 + 12*64 = 1920 warp-registers, the same CTA total
+        # as the previous 128/160/64 allocation (61440 registers).
+        cfg.softmax_reg_num = 144
+        cfg.correction_reg_num = 144
+        cfg.other_reg_num = 64
+
+    if fuse_output_quant and cfg.is_fp8_qkv() and cfg.threads_per_cta == 640:
+        # Quantization keeps an output block and rotary coefficients live.
+        # The gather tasks fit in 48 registers; use their surplus for the
+        # correction task while preserving the CTA's 61,440-register budget.
+        cfg.softmax_reg_num = 160
+        cfg.correction_reg_num = 176
+        cfg.other_reg_num = 48
+
+    # SETMAXNREG redistributes the CTA's initial allocation, rounded down
+    # to eight registers/thread; the remainder of the SM file is not credit.
+    initial_regs = 65536 // (cfg.threads_per_cta * 8) * 8
+    smx_warps = cfg.num_softmax_groups * cfg.num_compute_warps
+    cor_warps = cfg.num_compute_warps
+    other_warps = cfg.threads_per_cta // 32 - smx_warps - cor_warps
+    claimed = (
+        smx_warps * cfg.softmax_reg_num
+        + cor_warps * cfg.correction_reg_num
+        + other_warps * cfg.other_reg_num
+    ) * 32
+    if claimed > initial_regs * cfg.threads_per_cta:
+        raise ValueError("2CTA task registers exceed the CTA's initial allocation")
 
     # Derived MMA tilers. FP8 latent QK uses K=128 while the separate RoPE MMA
     # keeps K=64.

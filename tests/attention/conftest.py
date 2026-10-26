@@ -168,15 +168,19 @@ def _fmha_v2_specs(items):
     # test item (~2.4k items would grind for many minutes).
     fmha_keys = set()  # (layout, dtype, o_dtype-or-None)
     sink_keys = set()  # (dtype, use_swa, head_dim)
-    need_sm120_module = False
+    test_names = {it.name.split("[")[0] for it in items}
+    need_sm120_module = sm12x and any(
+        name.startswith("test_fmha_v2_prefill_deepseek")
+        or name.startswith("test_fmha_v2_prefill_sm120")
+        for name in test_names
+    )
     for it in items:
         cs = getattr(it, "callspec", None)
         if cs is None:
             continue
         p = cs.params
         fn = it.name.split("[")[0]
-        if fn == "test_fmha_v2_prefill_deepseek":
-            need_sm120_module = sm12x
+        if fn.startswith("test_fmha_v2_prefill_deepseek"):
             continue
         if fn == "test_trtllm_fmha_v2_prefill_sm120_large_head_dim" and not sm12x:
             continue  # test skips on non-SM12x
@@ -228,15 +232,7 @@ def _fmha_v2_specs(items):
 
 
 def _batch_prefill_specs(items):
-    """JitSpecs for test_batch_prefill_kernels.py.
-
-    The file's module-scoped warmup_jit fixture covers the main fp16/fp8-kv
-    grids for head_dim 128/256; this collector adds the gap modules measured
-    as serial first-use compiles (head_dim 64/512, ALIBI, soft-cap, NVFP4
-    uint8-kv, bf16 references, cta-tile probes) and also includes the
-    fixture's grid so everything gets staged into the AOT dir (making the
-    fixture itself a fast no-op via skip_prebuilt).
-    """
+    """Prebuild selected prefill cases and their reference kernels."""
     from flashinfer.prefill import gen_batch_prefill_module, gen_single_prefill_module
     from flashinfer.utils import get_compute_capability, is_sm90a_supported
 
@@ -319,6 +315,8 @@ def _batch_prefill_specs(items):
     nvfp4_fns = {
         "test_batch_prefill_with_paged_kv_cache_nvfp4",
         "test_batch_prefill_with_paged_kv_cache_nvfp4_strided_scale_views",
+        "test_batch_prefill_with_paged_kv_cache_nvfp4_head_dim_256",
+        "test_batch_prefill_with_ragged_kv_cache_nvfp4_head_dim_256",
         "test_batch_prefill_with_ragged_kv_cache_nvfp4",
         "test_batch_prefill_with_paged_kv_cache_nvfp4_large_head",
         "test_batch_prefill_with_paged_kv_cache_nvfp4_large_head_bf16",
@@ -327,18 +325,26 @@ def _batch_prefill_specs(items):
         "test_batch_prefill_with_ragged_kv_cache_nvfp4_large_head",
         "test_batch_prefill_with_ragged_kv_cache_nvfp4_rope_large_head",
     }
-    if fns & nvfp4_fns:
-        # NVFP4 KV is uint8 (fp4x2_e2m1) and always fa2; references run on the
-        # dequantized dtype (bf16 references are not in the fixture grid).
-        for q in (H, B):
-            bp("fa2", q, U8, q, I, 128, 128, 0, False, False, False)
-            sp("fa2", q, q, q, 128, 128, 0, False, False, False)
-            if sm90:
-                sp("fa3", q, q, q, 128, 128, 0, False, False, False)
-            if hd512_ok:
-                for p in (0, 1):
-                    bp("fa2", q, U8, q, I, 512, 512, p, False, False, False)
-                    sp("fa2", q, q, q, 512, 512, p, False, False, False)
+    # Keep expensive large-head builds on the shard that runs those cases.
+    nvfp4_keys = set()
+    for item in items:
+        fn = item.name.split("[")[0]
+        if fn not in nvfp4_fns:
+            continue
+        params = getattr(getattr(item, "callspec", None), "params", {})
+        q = params.get("q_dtype", B if fn.endswith("_bf16") else H)
+        hd = params.get(
+            "head_dim",
+            512 if "large_head" in fn else 256 if "head_dim_256" in fn else 128,
+        )
+        p = 1 if "rope_large_head" in fn else 0
+        if hd <= 256 or hd512_ok:
+            nvfp4_keys.add((q, hd, p))
+    for q, hd, p in sorted(nvfp4_keys, key=str):
+        bp("fa2", q, U8, q, I, hd, hd, p, False, False, False)
+        sp("fa2", q, q, q, hd, hd, p, False, False, False)
+        if sm90 and hd <= 256:
+            sp("fa3", q, q, q, hd, hd, p, False, False, False)
 
     if (
         "test_batch_prefill_with_paged_kv_cache_nvfp4_asymmetric" in fns

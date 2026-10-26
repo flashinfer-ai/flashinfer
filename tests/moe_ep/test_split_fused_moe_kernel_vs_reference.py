@@ -79,23 +79,34 @@ def _make_problem():
 def _build_moe_config(variant_str):
     from flashinfer.fused_moe.api import (
         BackendOptions,
+        CuteDslConfig,
         ExecutionConfig,
         ExpertConfig,
         MoEConfig,
         QuantConfig,
-        QuantVariant,
+        QuantFormat,
         RoutingConfig,
         TrtllmBf16Config,
         TrtllmFp4Config,
     )
 
     variant, backend = {
-        "bf16": (QuantVariant.BF16, TrtllmBf16Config()),
-        "nvfp4": (QuantVariant.NVFP4, TrtllmFp4Config()),
+        "bf16": (
+            QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
+            TrtllmBf16Config(),
+        ),
+        "nvfp4": (
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+            TrtllmFp4Config(),
+        ),
+        "w4a8": (
+            QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+            CuteDslConfig(),
+        ),
     }[variant_str]
     return MoEConfig(
         routing=RoutingConfig(num_experts=NUM_EXPERTS, top_k=TOP_K),
-        quant=QuantConfig(variant=variant),
+        quant=variant,
         experts=ExpertConfig(
             intermediate_size=INTERMEDIATE,
             local_expert_offset=0,
@@ -211,6 +222,82 @@ def test_split_bf16_kernel_matches_torch_reference():
 
 
 @pytest.mark.arch_blackwell
+@pytest.mark.parametrize("offset", [0, 12])
+@pytest.mark.parametrize("num_tokens", [8, 512])
+def test_split_bf16_masked_routes_cuda_graph(offset, num_tokens):
+    """Remote routes stay excluded when graph inputs change or become empty."""
+    _require_backend(TrtllmBf16Config)
+
+    from dataclasses import replace
+
+    import torch
+
+    from flashinfer.fused_moe.layer import MoELayer
+    from flashinfer.moe_ep import MoEWeightPack
+    from flashinfer.moe_ep.backends.split.kernel.fused_moe.bridge import (
+        build_activation_pack_rank_major,
+    )
+    from flashinfer.moe_ep.backends.split.kernel.fused_moe.weights import (
+        materialize_fused_moe_weights,
+    )
+
+    x, w13, w2, _, weights = _make_problem()
+    repeats = (num_tokens + NUM_TOKENS - 1) // NUM_TOKENS
+    x = x.repeat(repeats, 1)[:num_tokens]
+    weights = weights.repeat(repeats, 1)[:num_tokens]
+    cfg = _build_moe_config("bf16")
+    cfg = replace(
+        cfg,
+        experts=replace(cfg.experts, local_expert_offset=offset, local_num_experts=4),
+        execution=replace(cfg.execution, tune_max_num_tokens=num_tokens),
+    )
+    wp = materialize_fused_moe_weights(
+        MoEWeightPack(w13=w13[offset : offset + 4], w2=w2[offset : offset + 4]), cfg
+    )
+    layer = MoELayer(cfg)
+    routes = torch.arange(num_tokens * TOP_K, device="cuda").reshape(-1, TOP_K)
+    initial = torch.where(routes % 3 == 0, -1, routes % 4)
+    initial[0] = -1
+    idx = initial.clone()
+
+    def forward():
+        pack = build_activation_pack_rank_major(
+            x.reshape(1, num_tokens, HIDDEN),
+            idx,
+            weights,
+            num_local_experts=4,
+            local_expert_offset=offset,
+            num_experts=NUM_EXPERTS,
+            quant=cfg.quant,
+        )
+        return layer(pack, wp)
+
+    def check(output):
+        reference = _dense_moe_reference(
+            x.float(),
+            w13.float(),
+            w2.float(),
+            idx.clamp_min(0) + offset,
+            torch.where(idx >= 0, weights, 0.0),
+            act_roundtrip=lambda a: a.to(torch.bfloat16).float(),
+        )
+        torch.testing.assert_close(output.float(), reference, rtol=3e-2, atol=3e-2)
+        assert torch.count_nonzero(output[(idx < 0).all(dim=1)]).item() == 0
+
+    for _ in range(3):
+        output = forward()
+    check(output)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = forward()
+    for new_idx in (initial, torch.full_like(idx, -1), (routes + 1) % 4):
+        idx.copy_(new_idx)
+        graph.replay()
+        check(output)
+
+
+@pytest.mark.arch_blackwell
 def test_split_nvfp4_kernel_matches_torch_reference():
     """``trtllm_fp4_routed`` (all experts local) matches the dequant torch oracle."""
     _require_backend(TrtllmFp4Config)
@@ -278,6 +365,73 @@ def test_split_nvfp4_kernel_matches_torch_reference():
     assert rel_l2.item() < 0.05
 
 
+@pytest.mark.parametrize("compute_backend", ["cute", "trtllm"])
+def test_split_w4a8_kernel_matches_direct_runner(compute_backend):
+    import torch
+
+    import flashinfer.fused_moe as fm
+    import flashinfer.moe_ep as ep
+
+    config_cls = fm.CuteDslConfig if compute_backend == "cute" else fm.TrtllmFp4Config
+    _require_backend(config_cls)
+    if compute_backend == "cute" and torch.cuda.get_device_capability() == (10, 7):
+        pytest.skip("CuTe-DSL W4A8 is not supported on SM107")
+    from flashinfer.cute_dsl import is_cute_dsl_available
+
+    if compute_backend == "cute" and not is_cute_dsl_available():
+        pytest.skip("CuTeDSL is not available")
+
+    from dataclasses import replace
+
+    from flashinfer.moe_ep.backends.split.kernel.fused_moe.backend import (
+        FusedMoeSplitKernelBackend,
+    )
+    from flashinfer.quantization.fp8_quantization import mxfp8_quantize
+
+    x, w13, w2, _, _ = _make_problem()
+    cfg = replace(
+        _build_moe_config("w4a8"),
+        backend=fm.BackendOptions(candidates=(config_cls(),)),
+    )
+    fleet = ep.FleetParams(
+        num_experts=NUM_EXPERTS,
+        max_tokens_per_rank=NUM_TOKENS // NUM_EXPERTS,
+        token_hidden_size=HIDDEN,
+    )
+    backend = FusedMoeSplitKernelBackend(ep.FusedMoeKernelConfig(moe_config=cfg))
+    assert backend._transformed_weights is None
+    assert backend.pack_dispatch_payload(x) is x
+    backend.validate_init(ep.BootstrapConfig(world_size=1, rank=0), fleet)
+    weights = backend.preprocess_weights(ep.MoEWeightPack(w13=w13, w2=w2), fleet)
+    assert backend._transformed_weights is weights
+
+    expert = x.view(NUM_EXPERTS, -1, HIDDEN)
+    actual = backend.compute(
+        ep.SplitKernelContext(
+            expert_tensors=expert,
+            num_tokens=NUM_TOKENS,
+            fleet_params=fleet,
+        )
+    ).reshape(NUM_TOKENS, HIDDEN)
+    expected_backend = "cute_dsl" if compute_backend == "cute" else "trtllm_fp4_routed"
+    assert backend._compute.winner_backend == expected_backend
+
+    x_q, x_sf = mxfp8_quantize(x.contiguous(), is_sf_swizzled_layout=False)
+    ids = torch.arange(NUM_EXPERTS, device="cuda", dtype=torch.int32)
+    ids = ids.repeat_interleave(expert.shape[1]).reshape(-1, 1)
+    act = fm.MoEActivationPack(
+        hidden_states_q=x_q,
+        hidden_states_scale=x_sf.view(torch.float8_e4m3fn).reshape(
+            NUM_TOKENS, HIDDEN // 32
+        ),
+        topk_ids=ids,
+        topk_weights=torch.ones(NUM_TOKENS, 1, device="cuda"),
+    )
+    ref_cfg = replace(cfg, routing=replace(cfg.routing, top_k=1))
+    expected = fm.MoELayer(ref_cfg)(act, weights)
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+
 @pytest.mark.parametrize(
     ("arch", "expected"),
     [
@@ -305,7 +459,7 @@ def test_trtllm_routed_moe_supported_architectures(config_cls, arch, expected):
         (90, False),
         (100, True),
         (103, True),
-        (107, False),
+        (107, True),
         (110, False),
         (120, False),
         (121, False),

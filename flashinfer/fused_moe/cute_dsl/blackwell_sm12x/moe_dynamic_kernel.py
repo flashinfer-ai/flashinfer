@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Any, Tuple
 
 from ._moe_dynamic.generic import (
     _TASK_SLICE_CHUNK,
@@ -78,6 +78,7 @@ class MoEDynamicKernel:
         hidden_size: int | None = None,
         intermediate_size: int | None = None,
         num_topk: int | None = None,
+        source_down_scales: bool = False,
     ):
         # The shared-input producer reserves 32 route slots per token in both
         # implementations. Fall back to the per-route producer above that.
@@ -97,6 +98,19 @@ class MoEDynamicKernel:
         implementation = (
             MoEGatedDynamicKernel if use_gated_optimized else _GenericMoEDynamicKernel
         )
+        if source_down_scales and not use_gated_optimized:
+            raise ValueError("source down scales require the optimized gated kernel")
+        implementation_kwargs: dict[str, Any] = {}
+        if (
+            use_gated_optimized
+            and not share_input_across_experts
+            and isinstance(num_topk, int)
+            and not isinstance(num_topk, bool)
+            and 1 <= num_topk <= _GATED_OPTIMIZED_MAX_TOPK
+        ):
+            implementation_kwargs["known_topk"] = num_topk
+        if use_gated_optimized:
+            implementation_kwargs["source_down_scales"] = bool(source_down_scales)
         return implementation(
             sf_vec_size=sf_vec_size,
             mma_tiler_mn=mma_tiler_mn,
@@ -107,6 +121,7 @@ class MoEDynamicKernel:
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             share_input_across_experts=share_input_across_experts,
+            **implementation_kwargs,
         )
 
 

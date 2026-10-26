@@ -24,20 +24,25 @@ import torch
 
 from ...api_logging import flashinfer_api
 from ...autotuner import AutoTuner
-from ...jit.cute_sm120_mxfp8_groupwise import gen_gemm_sm120_module_cute_mxfp8
+from ...jit.cute_sm12x_gemm import gen_gemm_sm120_module_cute
 from ...utils import supported_compute_capability
 from .._sm120_moe_autotune import SM120_MOE_TUNING_CONFIG, Sm120MoeTunableRunner
 
 
-_MXFP8_MOE_TACTIC_SCHEMA_VERSION = 2
-_MXFP8_MOE_TACTICS = (
+_MXFP8_MOE_TACTIC_SCHEMA_VERSION = 3
+_MXFP8_MOE_COMMON_TACTICS = (
     (_MXFP8_MOE_TACTIC_SCHEMA_VERSION, 32, 128),
     (_MXFP8_MOE_TACTIC_SCHEMA_VERSION, 64, 64),
     (_MXFP8_MOE_TACTIC_SCHEMA_VERSION, 64, 128),
-    (_MXFP8_MOE_TACTIC_SCHEMA_VERSION, 128, 64),
     (_MXFP8_MOE_TACTIC_SCHEMA_VERSION, 128, 8),
 )
-_MXFP8_MOE_TACTICS_GRANK128 = _MXFP8_MOE_TACTICS + (
+_MXFP8_MOE_PLAIN_TACTICS = _MXFP8_MOE_COMMON_TACTICS + (
+    (_MXFP8_MOE_TACTIC_SCHEMA_VERSION, 128, 128),
+)
+_MXFP8_MOE_GATED_TACTICS = _MXFP8_MOE_COMMON_TACTICS + (
+    (_MXFP8_MOE_TACTIC_SCHEMA_VERSION, 128, 64),
+)
+_MXFP8_MOE_GATED_TACTICS_GRANK128 = _MXFP8_MOE_GATED_TACTICS + (
     (_MXFP8_MOE_TACTIC_SCHEMA_VERSION, 128, 128),
 )
 
@@ -45,7 +50,7 @@ _MXFP8_MOE_TACTICS_GRANK128 = _MXFP8_MOE_TACTICS + (
 @functools.cache
 def get_gemm_sm120_module_cute_mxfp8():
     """MXFP8 grouped MM module accessor for SM120 cute backend."""
-    return gen_gemm_sm120_module_cute_mxfp8().build_and_load()
+    return gen_gemm_sm120_module_cute().build_and_load()
 
 
 def _check_m_indptr(m_indptr: torch.Tensor, num_experts: int) -> None:
@@ -114,11 +119,14 @@ class _CuteSm120Mxfp8MoeRunner(Sm120MoeTunableRunner):
         scale_granularity_mnk: Tuple[int, int, int],
         scale_major_mode: str,
     ) -> None:
-        tactics = (
-            _MXFP8_MOE_TACTICS_GRANK128
-            if scale_granularity_mnk[2] == 128
-            else _MXFP8_MOE_TACTICS
-        )
+        if is_gated:
+            tactics = (
+                _MXFP8_MOE_GATED_TACTICS_GRANK128
+                if scale_granularity_mnk[2] == 128
+                else _MXFP8_MOE_GATED_TACTICS
+            )
+        else:
+            tactics = _MXFP8_MOE_PLAIN_TACTICS
         super().__init__(
             out,
             is_gated,

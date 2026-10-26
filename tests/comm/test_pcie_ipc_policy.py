@@ -36,11 +36,15 @@ group.
 import importlib.util
 import inspect
 import pathlib
+from typing import Callable, List
 
 import pytest
 
 from flashinfer.comm import pcie_ipc_tuning as tuning
+from flashinfer.comm.pcie_ipc_collectives._topology import PcieIpcTopologyEvidence
 from flashinfer.comm.pcie_ipc_policy import (
+    CE_MAX_PIECES,
+    CE_THREADS,
     MAX_BLOCKS,
     IpcLaunchConfig,
     IpcVariant,
@@ -49,6 +53,7 @@ from flashinfer.comm.pcie_ipc_policy import (
     _seed,
     get_pcie_ipc_launch_config,
 )
+from flashinfer.comm.pcie_ipc_topology import decide_ring_slow_hops
 
 # The launcher accepts 2-byte dtypes only (bfloat16, float16), so this is the
 # only element size a caller can reach.
@@ -261,6 +266,120 @@ def test_a_small_max_blocks_is_never_exceeded(max_blocks: int) -> None:
         assert admitted, f"ws={world_size} max_blocks={max_blocks} checks nothing"
 
 
+# The variants whose `blocks` is a ring depth rather than a grid size.
+_CE_VARIANTS = (
+    IpcVariant.COPY_ENGINE_RING,
+    IpcVariant.COPY_ENGINE_ISLAND,
+    IpcVariant.COPY_ENGINE_RING_MEMOP,
+    IpcVariant.COPY_ENGINE_RING_PIPED,
+)
+
+
+def _ce_variants(world_size):
+    # The island schedule is a 4+4 decomposition; see _is_launchable.
+    return [
+        v
+        for v in _CE_VARIANTS
+        if v is not IpcVariant.COPY_ENGINE_ISLAND or world_size == 8
+    ]
+
+
+@pytest.mark.parametrize("max_blocks", (1, 2, 3))
+def test_a_small_max_blocks_bounds_the_copy_engine_depth_too(max_blocks: int) -> None:
+    """Copy-engine depths past ``max_blocks`` are neither admitted nor offered.
+
+    The launcher checks ``blocks <= max_blocks`` for every variant, and the seed
+    never picks a copy-engine variant, so the test above cannot see this.
+    """
+    for world_size in (4, 8):
+        for variant in _ce_variants(world_size):
+            for depth in range(max_blocks + 1, CE_MAX_PIECES + 1):
+                config = IpcLaunchConfig(depth, CE_THREADS, variant)
+                assert not _is_launchable(world_size, config, max_blocks), config
+
+        offered = 0
+        for numel in (None, *_NUMELS):
+            for memop_supported in (False, True):
+                tactics = tuning.candidate_tactics(
+                    world_size,
+                    max_blocks,
+                    numel=numel,
+                    elem_size=_ELEM_SIZE,
+                    memop_supported=memop_supported,
+                )
+                for tactic in tactics:
+                    config = tuning.tactic_to_config(tactic)
+                    if config.variant in _CE_VARIANTS:
+                        offered += 1
+                        assert config.blocks <= max_blocks, (world_size, numel, config)
+        # Not vacuous: depth 1 fits every budget.
+        assert offered, f"ws={world_size} max_blocks={max_blocks} checks nothing"
+
+
+@pytest.mark.parametrize("max_blocks", (1, 2, 3, CE_MAX_PIECES, MAX_BLOCKS))
+def test_a_copy_engine_depth_within_max_blocks_is_still_offered(
+    max_blocks: int,
+) -> None:
+    """The budget removes only the depths the launcher refuses."""
+    bound = min(CE_MAX_PIECES, max_blocks)
+    ring = {b for b in tuning.TUNE_BLOCKS if b <= bound}
+    for world_size in (4, 8):
+        for variant in _ce_variants(world_size):
+            # Memop runs at depth 1 only; deeper falls back to the plain ring.
+            if variant is IpcVariant.COPY_ENGINE_RING_MEMOP:
+                continue
+            for depth in range(1, bound + 1):
+                config = IpcLaunchConfig(depth, CE_THREADS, variant)
+                assert _is_launchable(world_size, config, max_blocks), config
+
+        expected = {
+            IpcVariant.COPY_ENGINE_RING: ring,
+            # A candidate-list rule, whatever the budget.
+            IpcVariant.COPY_ENGINE_RING_MEMOP: {1},
+            # Its own depth grid, which includes 3.
+            IpcVariant.COPY_ENGINE_RING_PIPED: set(range(1, bound + 1)),
+        }
+        if world_size == 8:
+            expected[IpcVariant.COPY_ENGINE_ISLAND] = ring
+        tactics = tuning.candidate_tactics(world_size, max_blocks, memop_supported=True)
+        for variant, depths in expected.items():
+            offered = {b for v, b, _ in tactics if v == int(variant)}
+            assert offered == depths, (world_size, variant.name, offered)
+
+
+@pytest.mark.parametrize("world_size", (4, 8))
+def test_the_pipelined_ring_needs_room_for_its_pieces_not_even_shares(
+    world_size: int,
+) -> None:
+    """Its chunks follow the fabric, so an even share need not divide by the depth.
+
+    What it needs is whole shards of packs, like every ring, and at least one
+    pack for every piece of its smallest chunk -- which the floor of four packs
+    per piece per rank guarantees for any weighting it derives.
+    """
+    pack = 8  # 16-byte packs of 2-byte elements
+
+    def ring(depth: int) -> IpcLaunchConfig:
+        return IpcLaunchConfig(depth, CE_THREADS, IpcVariant.COPY_ENGINE_RING)
+
+    def piped(depth: int) -> IpcLaunchConfig:
+        return IpcLaunchConfig(depth, CE_THREADS, IpcVariant.COPY_ENGINE_RING_PIPED)
+
+    # 37 packs per rank: no depth past one divides it.
+    numel = world_size * pack * 37
+    for depth in range(1, CE_MAX_PIECES + 1):
+        assert _is_launchable(world_size, piped(depth), MAX_BLOCKS, numel), depth
+    assert not _is_launchable(world_size, ring(2), MAX_BLOCKS, numel)
+    # Not whole shards.
+    assert not _is_launchable(world_size, piped(1), MAX_BLOCKS, numel + pack)
+    # Below the floor.
+    floor = 4 * CE_MAX_PIECES * world_size * pack
+    assert _is_launchable(world_size, piped(4), MAX_BLOCKS, floor)
+    assert not _is_launchable(
+        world_size, piped(1), MAX_BLOCKS, floor - world_size * pack
+    )
+
+
 def test_every_dispatchable_variant_is_reachable_from_the_tuner() -> None:
     """A variant the dispatch can launch but nothing can select is invisible.
 
@@ -271,14 +390,31 @@ def test_every_dispatchable_variant_is_reachable_from_the_tuner() -> None:
     round. The seed deliberately reaches only some of them, so the tuner's
     candidate list is where this has to hold.
     """
+    # World size 2 admits two variants and no more: the launcher's check is a
+    # whitelist of variant numbers, so naming a launcher of your own does not
+    # exempt a variant from it. A ring listed here hits that hard check on the
+    # first candidate of a two-rank tune -- on every rank at once, since the
+    # rule is shape-independent; a shape-dependent one would throw on one rank
+    # while the others spun.
     expected = {
         2: {IpcVariant.UNSTAGED, IpcVariant.STAGED},
-        4: {IpcVariant.UNSTAGED, IpcVariant.STAGED, IpcVariant.STAGED_RING},
+        4: {
+            IpcVariant.UNSTAGED,
+            IpcVariant.STAGED,
+            IpcVariant.STAGED_RING,
+            IpcVariant.COPY_ENGINE_RING,
+        },
         8: {
             IpcVariant.UNSTAGED,
             IpcVariant.STAGED,
             IpcVariant.STAGED_RING,
             IpcVariant.FLAT_STAGED,
+            IpcVariant.COPY_ENGINE_RING,
+            # World size 8 only -- it is a 4+4 decomposition. Reachable here
+            # because this asks with no profile, i.e. which configurations can
+            # exist; get_valid_tactics passes one and drops it on a fabric the
+            # grouping does not describe.
+            IpcVariant.COPY_ENGINE_ISLAND,
         },
     }
     seen = {
@@ -520,3 +656,70 @@ def test_group_correctness_uses_a_min_reduction() -> None:
     assert all(op is real_dist.ReduceOp.MIN for op in calls), (
         f"correctness must reduce with MIN (logical AND), got {calls}"
     )
+
+
+# Which ring hops cross the CPU interconnect, from the gathered NVML probe. The
+# answer shapes the pipelined ring's chunks, so it is part of the policy: every
+# rank must derive the same mask from the same gathered evidence.
+
+# NVML_TOPOLOGY_* values, restated rather than imported so the test needs no NVML.
+_HOSTBRIDGE = 30
+_NODE = 40
+_SYSTEM = 50
+
+
+def _evidence(
+    world_size: int, socket_of: Callable[[int], int]
+) -> List[PcieIpcTopologyEvidence]:
+    uuids = [f"GPU-{rank:02d}" for rank in range(world_size)]
+    return [
+        PcieIpcTopologyEvidence(
+            rank=rank,
+            device_uuid=uuids[rank],
+            peer_ancestors={
+                uuids[peer]: _SYSTEM if socket_of(peer) != socket_of(rank) else _NODE
+                for peer in range(world_size)
+                if peer != rank
+            },
+            hostbridge_level=_HOSTBRIDGE,
+            system_level=_SYSTEM,
+        )
+        for rank in range(world_size)
+    ]
+
+
+def test_two_sockets_mark_the_two_crossings() -> None:
+    # Ranks 0-3 on one socket and 4-7 on the other: the ring crosses at 3 -> 4
+    # and at 7 -> 0.
+    assert decide_ring_slow_hops(_evidence(8, lambda r: r // 4)) == (1 << 3) | (1 << 7)
+
+
+def test_one_socket_has_no_slow_hop() -> None:
+    assert decide_ring_slow_hops(_evidence(4, lambda r: 0)) == 0
+
+
+def test_alternating_sockets_mark_every_hop() -> None:
+    assert decide_ring_slow_hops(_evidence(4, lambda r: r % 2)) == 0b1111
+
+
+def test_the_mask_follows_rank_order_not_list_order() -> None:
+    evidence = _evidence(8, lambda r: r // 4)
+    assert decide_ring_slow_hops(list(reversed(evidence))) == (1 << 3) | (1 << 7)
+
+
+def test_unknown_evidence_counts_as_fast() -> None:
+    """A wrong mask costs speed only, so anything unproven is a fast hop."""
+    evidence = _evidence(8, lambda r: r // 4)
+    evidence[3].probe_error = "NVMLError: not supported"
+    del evidence[7].peer_ancestors["GPU-00"]
+    assert decide_ring_slow_hops(evidence) == 0
+
+    evidence = _evidence(8, lambda r: r // 4)
+    evidence[3].system_level = None
+    assert decide_ring_slow_hops(evidence) == 1 << 7
+
+
+def test_an_incomplete_group_gets_an_even_split() -> None:
+    # A rank missing from the gathered evidence leaves the ring order unknown.
+    evidence = [e for e in _evidence(8, lambda r: r // 4) if e.rank != 3]
+    assert decide_ring_slow_hops(evidence) == 0

@@ -15,11 +15,27 @@ limitations under the License.
 """
 
 import functools
+from typing import Literal
 
 import torch
+import tvm_ffi
 
 from .api_logging import flashinfer_api
 from .trace.templates.attention import concat_mla_k_trace
+
+ConcatMLABackend = Literal["default", "cake"]
+_NUM_HEADS = 128
+_NOPE_DIM = 128
+_ROPE_DIM = 64
+_OUTPUT_DIM = _NOPE_DIM + _ROPE_DIM
+_VECTOR_BYTES = 16
+_MAX_SAFE_TOKENS = (2**31 - 1) // 8
+_OUTPUT_STRIDES = {(24576, 192, 1), (32768, 256, 1)}
+_INPUT_STRIDE_PROFILES = {
+    ((16384, 128, 1), (64, 64, 1)),
+    ((32768, 256, 1), (64, 64, 1)),
+    ((32768, 256, 1), (192, 192, 1)),
+}
 
 
 @functools.cache
@@ -29,11 +45,218 @@ def get_concat_mla_module():
     return gen_concat_mla_module().build_and_load()
 
 
+def _require_cake_tensor(value: torch.Tensor, *, name: str) -> torch.Tensor:
+    if not isinstance(value, torch.Tensor) or not value.is_cuda:
+        raise ValueError(f"{name} must be a CUDA tensor")
+    if value.ndim != 3 or value.stride(2) != 1:
+        raise ValueError(f"{name} must be rank 3 with last-dimension stride 1")
+    return value
+
+
+def _require_cake_vector_alignment(
+    value: torch.Tensor, *, name: str, element_bytes: int
+) -> None:
+    if value.data_ptr() % _VECTOR_BYTES:
+        raise ValueError(f"{name} data pointer must be 16-byte aligned")
+    if any(value.stride(axis) * element_bytes % _VECTOR_BYTES for axis in (0, 1)):
+        raise ValueError(f"{name} row and head strides must be 16-byte aligned")
+
+
+def _validate_cake_concat_mla_k(
+    k: torch.Tensor, k_nope: torch.Tensor, k_rope: torch.Tensor
+) -> tuple[int, int]:
+    k = _require_cake_tensor(k, name="k")
+    k_nope = _require_cake_tensor(k_nope, name="k_nope")
+    k_rope = _require_cake_tensor(k_rope, name="k_rope")
+    supported_dtypes = {
+        torch.bfloat16,
+        torch.float16,
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    }
+    if k.dtype not in supported_dtypes:
+        raise ValueError(f"unsupported Cake concat_mla_k dtype {k.dtype}")
+    if k_nope.dtype != k.dtype or k_rope.dtype != k.dtype:
+        raise ValueError("k, k_nope, and k_rope must have the same dtype")
+    if k_nope.device != k.device or k_rope.device != k.device:
+        raise ValueError("k, k_nope, and k_rope must be on the same device")
+    cake_concat_mla_k_target(k.device)
+
+    tokens = int(k.shape[0])
+    if tuple(k.shape) != (tokens, _NUM_HEADS, _OUTPUT_DIM):
+        raise ValueError("k must have shape [tokens, 128, 192]")
+    if tuple(k_nope.shape) != (tokens, _NUM_HEADS, _NOPE_DIM):
+        raise ValueError("k_nope must have shape [tokens, 128, 128]")
+    if tuple(k_rope.shape) != (tokens, 1, _ROPE_DIM):
+        raise ValueError("k_rope must have shape [tokens, 1, 64]")
+    if tokens < 0 or tokens > _MAX_SAFE_TOKENS:
+        raise ValueError(
+            f"Cake concat_mla_k token count must be in [0, {_MAX_SAFE_TOKENS}]"
+        )
+
+    k_stride = tuple(int(stride) for stride in k.stride())
+    k_nope_stride = tuple(int(stride) for stride in k_nope.stride())
+    k_rope_stride = tuple(int(stride) for stride in k_rope.stride())
+    if k_stride not in _OUTPUT_STRIDES:
+        raise ValueError(
+            "k stride must be exactly contiguous [24576,192,1] or "
+            "padded [32768,256,1] for backend='cake'"
+        )
+    if (k_nope_stride, k_rope_stride) not in _INPUT_STRIDE_PROFILES:
+        raise ValueError(
+            "k_nope/k_rope strides must match a proven contiguous, "
+            "nope_strided, or both_strided profile for backend='cake'"
+        )
+
+    element_bytes = int(k.element_size())
+    for name, value in (("k", k), ("k_nope", k_nope), ("k_rope", k_rope)):
+        _require_cake_vector_alignment(
+            value,
+            name=name,
+            element_bytes=element_bytes,
+        )
+    if tokens:
+        storage_pointers = {
+            int(k.untyped_storage().data_ptr()),
+            int(k_nope.untyped_storage().data_ptr()),
+            int(k_rope.untyped_storage().data_ptr()),
+        }
+        if len(storage_pointers) != 3:
+            raise ValueError("k, k_nope, and k_rope storage must not overlap")
+    return tokens, element_bytes
+
+
+# The Cake backend: two generated programs (``flashinfer.jit.cake_concat_mla_k``): ``ONE_CTA`` (one CTA per token
+# window) for the exact targets sm_100a, sm_103a and sm_107a, and ``SPLIT`` (``gridDim.y`` CTAs share one token
+# window) for sm_107a.  The host owns the launch plan: one CTA copies two 1-byte tokens or one 2-byte token
+# (``_CAKE_TOKENS_PER_CTA``); on sm_107a a window is split over the largest admissible CTA count
+# (``_CAKE_SPLIT_CHOICES``) that keeps ``grid_x * split <= _CAKE_SPLIT_MAX_CTAS``, a single window over
+# ``_CAKE_ONE_WINDOW_SPLIT`` CTAs; every other target launches one CTA per window.
+_CAKE_TARGETS = ("sm_100a", "sm_103a", "sm_107a")
+_CAKE_SPLIT_TARGET = "sm_107a"
+_CAKE_TOKENS_PER_CTA = {1: 2, 2: 1}
+_CAKE_SPLIT_CHOICES = (1, 2, 3, 6)
+_CAKE_SPLIT_MAX_CTAS = 424
+_CAKE_ONE_WINDOW_SPLIT = 2
+
+
+def cake_concat_mla_k_target(device) -> str:
+    """The exact target of the generated programs on ``device``: ``"sm_100a"``, ``"sm_103a"`` or ``"sm_107a"``
+    (the sm_107a build needs CUDA 13.0); any other device is an error."""
+    from .jit.cake_concat_mla_k import ONE_CTA
+    from .jit.cpp_ext import is_cuda_version_at_least
+
+    major, minor = torch.cuda.get_device_capability(device)
+    capability = (int(major), int(minor))
+    target = ONE_CTA.target_for(capability)
+    if target is None:
+        raise RuntimeError(
+            "the Cake concat_mla_k backend requires compute capability 10.0 "
+            "(sm_100a), 10.3 (sm_103a) or 10.7 (sm_107a), got "
+            f"{capability[0]}.{capability[1]}"
+        )
+    if target == _CAKE_SPLIT_TARGET and not is_cuda_version_at_least("13.0"):
+        raise RuntimeError(
+            "the Cake concat_mla_k backend on compute capability 10.7 requires "
+            "CUDA 13.0 or newer for the sm_107a target"
+        )
+    return target
+
+
+def cake_concat_mla_k_tokens_per_cta(element_bytes: int) -> int:
+    """The token window one CTA copies: two 1-byte tokens or one 2-byte token."""
+    try:
+        return _CAKE_TOKENS_PER_CTA[int(element_bytes)]
+    except KeyError:
+        raise ValueError(
+            f"the Cake concat_mla_k programs have no launch rule for {element_bytes}-byte elements"
+        ) from None
+
+
+def cake_concat_mla_k_split_ctas(tokens: int, element_bytes: int, target: str) -> int:
+    """``gridDim.y`` of one launch: 1 on every target but sm_107a and for no tokens; on sm_107a a single token
+    window takes two CTAs, otherwise the largest choice of ``(1, 2, 3, 6)`` with ``grid_x * choice <= 424``."""
+    if target not in _CAKE_TARGETS:
+        raise ValueError(f"unsupported Cake concat_mla_k target: {target!r}")
+    if target != _CAKE_SPLIT_TARGET or int(tokens) <= 0:
+        return 1
+    window = cake_concat_mla_k_tokens_per_cta(element_bytes)
+    grid_x = (int(tokens) + window - 1) // window
+    if grid_x == 1:
+        return _CAKE_ONE_WINDOW_SPLIT
+    best = 1
+    for choice in _CAKE_SPLIT_CHOICES:
+        if grid_x * choice <= _CAKE_SPLIT_MAX_CTAS:
+            best = choice
+    return best
+
+
+def cake_concat_mla_k_grid(
+    tokens: int, element_bytes: int, target: str
+) -> tuple[int, int, int]:
+    """The launch grid for ``tokens > 0``: ``(ceil(tokens / window), split_ctas, 1)``."""
+    window = cake_concat_mla_k_tokens_per_cta(element_bytes)
+    grid_x = (int(tokens) + window - 1) // window
+    return grid_x, cake_concat_mla_k_split_ctas(tokens, element_bytes, target), 1
+
+
+def _cake_program(target: str, split_ctas: int):
+    """``SPLIT`` when the host splits a window on sm_107a, else ``ONE_CTA``."""
+    from .jit.cake_concat_mla_k import ONE_CTA, SPLIT
+
+    return SPLIT if target == _CAKE_SPLIT_TARGET and int(split_ctas) > 1 else ONE_CTA
+
+
+def _concat_mla_k_cake(
+    k: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    *,
+    backend: Literal["cake"],
+) -> None:
+    tokens, element_bytes = _validate_cake_concat_mla_k(k, k_nope, k_rope)
+    if not tokens:
+        return None
+    target = cake_concat_mla_k_target(k.device)
+    grid_x, grid_y, grid_z = cake_concat_mla_k_grid(tokens, element_bytes, target)
+    program = _cake_program(target, grid_y)
+    # The generated binding's arguments by name (``CakeProgram.args`` orders them): the three byte views, the
+    # element width, the five byte strides, the token count and the grid.  The kernel addresses the tensors
+    # through the byte strides alone; the binding checks their device and dtype and the strides' 16-byte
+    # multiples, the validation above the ranks, shapes, stride profiles, alignment and overlap.
+    values = {
+        "k": k.view(torch.uint8),
+        "k_nope": k_nope.view(torch.uint8),
+        "k_rope": k_rope.view(torch.uint8),
+        "element_bytes": element_bytes,
+        "k_stride_0_bytes": int(k.stride(0)) * element_bytes,
+        "k_stride_1_bytes": int(k.stride(1)) * element_bytes,
+        "k_nope_stride_0_bytes": int(k_nope.stride(0)) * element_bytes,
+        "k_nope_stride_1_bytes": int(k_nope.stride(1)) * element_bytes,
+        "k_rope_stride_0_bytes": int(k_rope.stride(0)) * element_bytes,
+        "tokens": tokens,
+        "grid_x": grid_x,
+        "grid_y": grid_y,
+        "grid_z": grid_z,
+    }
+    if set(program.args) != set(values):
+        raise RuntimeError(
+            f"the generated {program.name} binding takes {list(program.args)}; the host spells {sorted(values)}"
+        )
+    entry = program.entry(target)
+    arguments = [values[name] for name in program.args]
+    with torch.cuda.device(k.device), tvm_ffi.use_torch_stream():
+        entry(*arguments)
+    return None
+
+
 @flashinfer_api(trace=concat_mla_k_trace)
 def concat_mla_k(
     k: torch.Tensor,
     k_nope: torch.Tensor,
     k_rope: torch.Tensor,
+    *,
+    backend: ConcatMLABackend = "default",
 ) -> None:
     r"""Concatenate k_nope and k_rope tensors for MLA attention.
 
@@ -62,6 +285,10 @@ def concat_mla_k(
     k_rope : torch.Tensor
         The rope part of k (shared), shape: ``[num_tokens, 1, rope_dim]``.
         This is broadcast to all heads.
+    backend : {"default", "cake"}, optional
+        Backend implementation. The generated ``"cake"`` backend is available
+        on the exact sm_100a, sm_103a and sm_107a targets for the documented
+        fixed shape and layouts.
 
     Example
     -------
@@ -84,4 +311,9 @@ def concat_mla_k(
     - ``nope_dim = 128``
     - ``rope_dim = 64``
     """
+    if backend == "cake":
+        return _concat_mla_k_cake(k, k_nope, k_rope, backend="cake")
+    if backend != "default":
+        raise ValueError(f"unsupported concat_mla_k backend: {backend!r}")
     get_concat_mla_module().concat_mla_k(k, k_nope, k_rope)
+    return None

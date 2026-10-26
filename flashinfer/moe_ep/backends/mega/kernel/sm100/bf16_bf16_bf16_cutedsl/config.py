@@ -3,24 +3,35 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+
+from flashinfer.moe_ep._compat import legacy_finalize
+from flashinfer.moe_ep.config import FinalizeMode, validate_finalize_mode
+
+from ..common.bf16_config import Sm100_Bf16_Cutedsl_MegaMoeConfigBase
 
 
+@legacy_finalize
 @dataclass
-class Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig:
+class Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig(Sm100_Bf16_Cutedsl_MegaMoeConfigBase):
     """Parameters for the SM100 BF16 CuTeDSL MegaMoE kernel."""
 
-    intermediate_size: int
-    top_k: int
     kernel_name: str = "sm100_bf16_bf16_bf16_cutedsl"
-    gate_up_clamp: float | None = None
-    activation_clamp: float | None = None
-    fast_math: bool = True
-    in_kernel_fc2_reduce: bool = False
-    token_back_mode: Literal[
-        "epi_warps", "standalone_warps", "reuse_dispatch_warps"
-    ] = "epi_warps"
-    load_balance_mode: Literal["static", "atomic_counter"] = "static"
-    # "auto" runs the collective tuner over the current single supported
-    # geometry, preserving the autotune contract as more geometries arrive.
-    knobs: dict | str | None = None
+    # NONE makes MoEEpMegaLayer.forward return per-route outputs.
+    finalize_mode: FinalizeMode = FinalizeMode.AUTO
+    # False multiplies the completed FP32 FC2 output by the routing weight instead.
+    apply_routing_weights_before_fc2: bool = True
+
+    def __post_init__(self) -> None:
+        validate_finalize_mode(
+            self.finalize_mode,
+            (FinalizeMode.AUTO, FinalizeMode.DEFAULT, FinalizeMode.NONE),
+        )
+        if self.finalize_mode is FinalizeMode.NONE:
+            if self.enable_in_kernel_fc2_reduce:
+                raise ValueError(
+                    "finalize_mode=NONE requires enable_in_kernel_fc2_reduce=False."
+                )
+            if self.knobs == "auto":
+                raise ValueError(
+                    "finalize_mode=NONE requires fixed/offline-tuned knobs."
+                )

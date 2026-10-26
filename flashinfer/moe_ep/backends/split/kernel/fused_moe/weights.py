@@ -70,26 +70,35 @@ def materialize_fused_moe_weights(
     weights: MoEWeightPack,
     moe_config: "MoEConfig",
 ) -> "FusedMoEWeightPack":
-    """Convert canonical :class:`MoEWeightPack` into a fused_moe weight pack."""
+    """Prepare each configured EP compute backend's native weight view.
+
+    MoELayer compares the eligible candidates at execution time, so every
+    candidate needs its view even when it is not first in the search order.
+    Repeated configurations of the same backend share one weight view.
+    """
     from ......fused_moe.api import (
         CuteDslConfig,
         MoEWeightPack as FusedMoEWeightPack,
-        QuantVariant,
+        QuantFormat,
         TrtllmBf16Config,
         TrtllmFp4Config,
     )
 
-    variant = moe_config.quant.variant
+    quant = moe_config.quant
     experts = moe_config.experts
     routing = moe_config.routing
     num_local = experts.local_num_experts or routing.num_experts
     hidden = weights.w13.shape[-1]
-    intermediate = weights.w13.shape[-2] // 2
+    intermediate = experts.intermediate_size
 
     pack = FusedMoEWeightPack()
 
     for backend_cfg in moe_config.backend:
-        if variant == QuantVariant.BF16 and isinstance(backend_cfg, TrtllmBf16Config):
+        if quant.pair == (QuantFormat.BF16, QuantFormat.BF16) and isinstance(
+            backend_cfg, TrtllmBf16Config
+        ):
+            if "trtllm_bf16_routed" in pack.native_views:
+                continue
             g1, g2 = _block_major_k_weights(weights.w13, weights.w2)
             pack.prepare_for(
                 "trtllm_bf16_routed",
@@ -98,35 +107,50 @@ def materialize_fused_moe_weights(
                     "gemm2_weights": g2,
                 },
             )
-            return pack
+            continue
 
-        if variant == QuantVariant.NVFP4 and isinstance(backend_cfg, TrtllmFp4Config):
+        if quant.pair in (
+            (QuantFormat.NVFP4, QuantFormat.NVFP4),
+            (QuantFormat.MXFP4, QuantFormat.MXFP8),
+        ) and isinstance(backend_cfg, TrtllmFp4Config):
+            if "trtllm_fp4_routed" in pack.native_views:
+                continue
             view = TrtllmFp4Config.prepare_weights(
                 weights.w13,
                 weights.w2,
+                quant=quant,
                 num_local_experts=num_local,
                 hidden_size=hidden,
                 intermediate_size=intermediate,
+                activation=moe_config.activation,
                 device=weights.w13.device,
             )
             pack.prepare_for("trtllm_fp4_routed", view)
-            return pack
+            continue
 
-        if variant in (QuantVariant.NVFP4, QuantVariant.W4A16) and isinstance(
-            backend_cfg, CuteDslConfig
-        ):
+        if quant.pair in (
+            (QuantFormat.NVFP4, QuantFormat.NVFP4),
+            (QuantFormat.MXFP4, QuantFormat.MXFP8),
+            (QuantFormat.NVFP4, QuantFormat.BF16),
+        ) and isinstance(backend_cfg, CuteDslConfig):
+            if "cute_dsl" in pack.native_views:
+                continue
             view = CuteDslConfig.prepare_weights(
                 weights.w13,
                 weights.w2,
+                quant=quant,
                 num_local_experts=num_local,
                 hidden_size=hidden,
                 intermediate_size=intermediate,
+                activation=moe_config.activation,
                 device=weights.w13.device,
             )
-            pack.prepare_for("cute_dsl_nvfp4", view)
-            return pack
+            pack.prepare_for("cute_dsl", view)
+
+    if pack.native_views:
+        return pack
 
     raise ValueError(
-        f"No fused_moe backend in MoEConfig matches quant variant {variant!r}. "
+        f"No fused_moe backend in MoEConfig matches quant {quant!r}. "
         f"Configured backends: {[type(c).__name__ for c in moe_config.backend]}"
     )

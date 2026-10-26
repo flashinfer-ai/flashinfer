@@ -51,7 +51,7 @@ def test_cudnn_prefill(
     q_indptr = torch.cat(
         [
             torch.tensor([0], device=device),
-            torch.cumsum(actual_seq_lens_q.view(-1), dim=0) * head_dim * num_qo_heads,
+            torch.cumsum(actual_seq_lens_q.view(-1), dim=0),
         ]
     ).int()
 
@@ -149,7 +149,19 @@ def test_cudnn_prefill(
         block_tables=block_tables,
     )
 
-    output = wrapper_cudnn.run(q, (k_cache, v_cache))
+    cache_nhd = (k_cache.transpose(1, 2), v_cache.transpose(1, 2))
+    result = wrapper_cudnn.run(q, cache_nhd, return_lse=return_lse)
+    output, stats = result if return_lse else (result, None)
+    if is_cuda_graph_compatible:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            wrapper_cudnn.run(
+                q, cache_nhd, out=output, lse=stats, return_lse=return_lse
+            )
+        output.fill_(torch.nan)
+        if stats is not None:
+            stats.fill_(torch.nan)
+        graph.replay()
 
     qo_indptr = torch.cat(
         [
@@ -180,8 +192,11 @@ def test_cudnn_prefill(
         q_data_type=torch.bfloat16,
     )
 
-    output_ref = wrapper.run(q, kv_cache)
+    result_ref = wrapper.run(q, kv_cache, return_lse=return_lse)
+    output_ref, stats_ref = result_ref if return_lse else (result_ref, None)
     torch.testing.assert_close(output, output_ref, atol=3e-3, rtol=1e-2)
+    if return_lse:
+        torch.testing.assert_close(stats, stats_ref, atol=3e-3, rtol=1e-2)
 
 
 @pytest.mark.parametrize("batch_size", [1, 4])
@@ -248,7 +263,7 @@ def test_cudnn_prefill_fp8(
     q_indptr = torch.cat(
         [
             torch.tensor([0], device=device),
-            torch.cumsum(actual_seq_lens_q.view(-1), dim=0) * head_dim * num_qo_heads,
+            torch.cumsum(actual_seq_lens_q.view(-1), dim=0),
         ]
     ).int()
 
@@ -357,7 +372,7 @@ def test_cudnn_prefill_fp8(
 
     output = wrapper_cudnn.run(
         q_fp8,
-        (k_cache_fp8, v_cache_fp8),
+        (k_cache_fp8.transpose(1, 2), v_cache_fp8.transpose(1, 2)),
         q_scale=q_scale,
         k_scale=k_scale_tensor,
         v_scale=v_scale_tensor,

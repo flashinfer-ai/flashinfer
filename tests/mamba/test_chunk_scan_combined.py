@@ -151,12 +151,12 @@ def _is_blackwell_ssd_supported():
     if not is_sm100a_supported(torch.device("cuda")):
         return False
     _, minor = get_compute_capability(torch.device("cuda"))
-    return minor <= 3  # SM100 (minor=0) and SM103 (minor=3) only
+    return minor in (0, 3, 7)  # SM100, SM103 and SM107 (Rubin)
 
 
 pytestmark = pytest.mark.skipif(
     not _is_blackwell_ssd_supported(),
-    reason="Blackwell GPU (SM100/SM103) required for CuTe DSL Mamba2 SSD kernel",
+    reason="SM100/SM103/SM107 GPU required for CuTe DSL Mamba2 SSD kernel",
 )
 
 

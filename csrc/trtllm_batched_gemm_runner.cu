@@ -181,10 +181,9 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
           std::strstr(config.mFunctionName, "E2m1xFp32") != nullptr) {
         continue;
       }
-      if (mOptions.usePerChannelScaling) {
-        if (options.mTransposeMmaOutput && !options.mUsePerTokenSfA) continue;
-        if (!options.mTransposeMmaOutput && !options.mUsePerTokenSfB) continue;
-      }
+      bool const usesPerChannelScaling =
+          options.mTransposeMmaOutput ? options.mUsePerTokenSfA : options.mUsePerTokenSfB;
+      if (usesPerChannelScaling != mOptions.usePerChannelScaling) continue;
       if (options.mFusedAct) {
         if (options.mActType != static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType)) {
           continue;
@@ -217,6 +216,22 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
     arch_msg << "The trtllm-gen batched GEMM cubin manifest contains no kernels runnable on sm"
              << sm_version << "; this backend currently ships cubins for sm100, sm103 and sm107.";
     FLASHINFER_CHECK(anyArchCompatible, arch_msg.str());
+    if (mOptions.fusedAct && mOptions.actType == ActType::SwiGluStep) {
+      bool anyStepCompatible = false;
+      for (size_t i = 0; i < bmm.getNumBatchedGemmConfigs(); ++i) {
+        auto const& config = configs[i];
+        if (config.mOptions.mFusedAct &&
+            static_cast<int>(config.mOptions.mActType) == static_cast<int>(ActType::SwiGluStep) &&
+            isArchCompatible(sm_version, config.mSm)) {
+          anyStepCompatible = true;
+          break;
+        }
+      }
+      FLASHINFER_CHECK(
+          anyStepCompatible,
+          "SwiGLUStep requires trtllm-gen batched-GEMM cubins with the StepFun epilogue "
+          "(export 7.0.5.0.4.0 or later); the current artifact contains no StepFun kernels.");
+    }
   }
 
   std::ostringstream error_msg;
@@ -237,6 +252,13 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
             << ", mPerTokenSfDtype: " << tg::dtypeToString(mOptions.perTokenSfDtype)
             << ", mUsePerChannelScaling: " << mOptions.usePerChannelScaling;
   FLASHINFER_CHECK(!mPassingConfigIndices.empty(), error_msg.str());
+}
+
+batchedGemm::trtllm::gen::SfLayout TrtllmGenBatchedGemmRunner::getSfLayoutB(
+    int32_t configIndex) const {
+  checkPassingConfigIndex(mPassingConfigIndices, configIndex);
+  auto const configs = BatchedGemmInterface().getBatchedGemmConfigs();
+  return configs[configIndex].mOptions.mSfLayoutB;
 }
 
 size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(
@@ -280,7 +302,7 @@ void TrtllmGenBatchedGemmRunner::run(
     int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx,
     int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
     int32_t const* permutedIdxToBiasRowIdx, void* workspace, CUstream stream, int device,
-    int32_t configIndex, bool enable_pdl) {
+    int32_t configIndex, bool enable_pdl, int32_t validM, int32_t validN, int32_t validK) {
   auto bmm = BatchedGemmInterface();
 
   BatchedGemmData gemmData{};
@@ -371,6 +393,23 @@ void TrtllmGenBatchedGemmRunner::run(
 
   int32_t multiProcessorCount;
   cudaDeviceGetAttribute(&multiProcessorCount, cudaDevAttrMultiProcessorCount, device);
+
+  // Resolve valid dimensions in the caller's logical m/n/k space, then remap M/N into the
+  // internal coordinate space used above when transposeMmaOutput swaps m and n.
+  int32_t const logicalValidM = (validM >= 0) ? validM : m;
+  int32_t const logicalValidN = (validN >= 0) ? validN : n;
+  int32_t const logicalValidK = (validK >= 0) ? validK : k;
+
+  FLASHINFER_CHECK(logicalValidM >= 0 && logicalValidM <= m, "validM (", logicalValidM,
+                   ") must be in [0, m=", m, "]");
+  FLASHINFER_CHECK(logicalValidN >= 0 && logicalValidN <= n, "validN (", logicalValidN,
+                   ") must be in [0, n=", n, "]");
+  FLASHINFER_CHECK(logicalValidK >= 0 && logicalValidK <= k, "validK (", logicalValidK,
+                   ") must be in [0, k=", k, "]");
+
+  gemmData.mProblemDimensions.mValidM = mOptions.transposeMmaOutput ? logicalValidN : logicalValidM;
+  gemmData.mProblemDimensions.mValidN = mOptions.transposeMmaOutput ? logicalValidM : logicalValidN;
+  gemmData.mProblemDimensions.mValidK = logicalValidK;
 
   // FIXME once we start using all-reduce in the epilogue of the bmm this can be moved elsewhere
   bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
@@ -502,19 +541,48 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
       return optionsA.mTileN > optionsB.mTileN;
     }
 
-    // Tier 2+: When previous comparators are the same, and when the number of estimated CTAs is on
-    // the larger side, prefer persistent tile scheduler.
-    if (optionsA.mTileScheduler != optionsB.mTileScheduler) {
-      auto options = bmm.getOptionsFromConfigAndData(configs[idx0], gemmData);
-      auto numCtas = bmm.getNumCtas(options, gemmData.mProblemDimensions.mMaxNumCtasInTokenDim);
-      if (numCtas > multiProcessorCount) {
-        return optionsA.mTileScheduler == batchedGemm::gemm::TileScheduler::Persistent;
-      } else {
-        return optionsB.mTileScheduler == batchedGemm::gemm::TileScheduler::Persistent;
-      }
+    // Tier 2+: When previous comparators are the same, prefer fewer split-K slices. Split-K adds a
+    // cross-CTA reduction and is left to the autotuner; on B200/B300 the splitK2/splitK3 tie-mates
+    // of an unsplit kernel measured 1.3-1.9x slower for the routed MoE GEMMs (#6838).
+    if (optionsA.mNumSlicesForSplitK != optionsB.mNumSlicesForSplitK) {
+      return optionsA.mNumSlicesForSplitK < optionsB.mNumSlicesForSplitK;
     }
 
-    return false;
+    // Tier 2+: When previous comparators are the same, and when the number of estimated CTAs is on
+    // the larger side, prefer persistent tile scheduler. The estimate drops split-K and clusters so
+    // it only depends on the tile shape, which both configs share here; otherwise cmp(a, b) and
+    // cmp(b, a) could disagree and the sort would not be a strict weak ordering.
+    bool const persistentA =
+        optionsA.mTileScheduler == batchedGemm::gemm::TileScheduler::Persistent;
+    bool const persistentB =
+        optionsB.mTileScheduler == batchedGemm::gemm::TileScheduler::Persistent;
+    if (persistentA != persistentB) {
+      auto options = bmm.getOptionsFromConfigAndData(configs[idx0], gemmData);
+      options.mNumSlicesForSplitK = 1;
+      options.mClusterDimX = 1;
+      options.mClusterDimY = 1;
+      options.mClusterDimZ = 1;
+      auto numCtas = bmm.getNumCtas(options, gemmData.mProblemDimensions.mMaxNumCtasInTokenDim);
+      return numCtas > multiProcessorCount ? persistentA : persistentB;
+    }
+
+    // The tiers below only order configs the tiers above leave tied. The untuned default is the
+    // first sorted entry, so every tie must be broken by the kernel itself, never by its position
+    // in the cubin manifest: a reorder of the manifest must not change the default (#6838).
+
+    // Tier 3: prefer deeper A/B pipelines. Without it the name tie-break below would pick the
+    // shallowest (_s3_) tie-mate, measured up to 1.2x slower on the DeepSeek-V4 FC1 GEMM.
+    if (optionsA.mNumStagesA != optionsB.mNumStagesA) {
+      return optionsA.mNumStagesA > optionsB.mNumStagesA;
+    }
+    if (optionsA.mNumStagesB != optionsB.mNumStagesB) {
+      return optionsA.mNumStagesB > optionsB.mNumStagesB;
+    }
+
+    // Final tier: the kernel name is unique, so the order is total.
+    char const* nameA = configs[idx0].mFunctionName;
+    char const* nameB = configs[idx1].mFunctionName;
+    return std::strcmp(nameA != nullptr ? nameA : "", nameB != nullptr ? nameB : "") < 0;
   };
 
   // Sort configs by options.

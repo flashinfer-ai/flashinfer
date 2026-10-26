@@ -79,12 +79,11 @@ struct KernelParams {
   int64_t const* ptrCustomMaskOffsets;
   // The debug output matrix O
   float* ptrDebugO;
-  // DSv4 inverse-RoPE + FP8 quant fusion metadata and output scale tensor, only for epilogue
-  // fusion. Unused by FlashInfer but part of the kernel-side KernelParams ABI; the field order
-  // must stay in sync with the kernels or every later field is misread by the cubins.
+  // DSv4 inverse-RoPE + FP8 quant fusion metadata and output scale tensor. The field order must
+  // stay in sync with the kernels or every later field is misread by the cubins.
   float const* ptrDsv4InvRopeCosSinCache;
-  // Dsv4 output block-scaled tensor, only for epilogue fusion
-  float* ptrDsv4OScaleFp32;
+  // DSv4 output scales. RopeQuant cubins interpret this as packed UE8M0 bytes in INT32 storage.
+  float* ptrDsv4OScale;
   // The first sparseMask offsets in the Kv sequence dimension.
   int32_t const* ptrFirstSparseMaskOffsetsKv;
   // The counter for the multiCtasKv mode.
@@ -130,14 +129,19 @@ struct KernelParams {
   // The variable sparseMla topK lengths with shape of [numTokensQ].
   int32_t const* ptrSparseMlaTopKLens;
 
-  // The attention window size for sliding window attention.
-  int32_t mAttentionWindowSize;
+  // Sliding-window reaches excluding the current token. -1 means unbounded.
+  // setKernelParams() zeroes this struct and then assigns all four fields explicitly; do not rely
+  // on default member initializers here.
+  int32_t mLeftSlidingWindow;
+  int32_t mRightSlidingWindow;
+  // Inclusive VariableWindow bounds, one pair per packed Q token.
+  int32_t const* ptrVariableWindowTokenStarts;
+  int32_t const* ptrVariableWindowTokenEnds;
   // The batch size
   int32_t mBatchSize;
   // The chunked attention size in log2.
   int32_t mChunkedAttentionSizeLog2;
-  // Padded token dimension for the DSv4 fused FP32 scale layout. Unused by FlashInfer; kept for
-  // the KernelParams ABI (see the DSv4 pointer fields above).
+  // Padded token dimension for the DSv4 fused packed UE8M0 scale layout.
   int64_t mDsv4ScaleBufM;
   // The factor to add to the maximum value to increase the probability
   //   of skip correction during next iterations.
@@ -662,10 +666,12 @@ struct KernelParams {
     return desc;
   }
 
-  // Setup the kernel parameters.
+  // Setup the kernel parameters. totalNumCtas is the launched CTA count when it can exceed the SM
+  // count (multi-wave KV split), else 0.
   template <class FmhaOptions_, class KernelMeta>
   static KernelParams setKernelParams(FmhaOptions_ const& options, KernelMeta const& kernelMeta,
-                                      int32_t maxNumCtasQ, int32_t maxNumCtasKv) {
+                                      int32_t maxNumCtasQ, int32_t maxNumCtasKv,
+                                      int32_t totalNumCtas) {
     // Create the return struct.
     KernelParams params;
     // Memset the kernel parameters to 0.
@@ -845,6 +851,8 @@ struct KernelParams {
     params.ptrO = options.oPtr;
     // The output scaling factor buffer.
     params.ptrSfO = options.oSfPtr;
+    params.ptrDsv4InvRopeCosSinCache = options.dsv4InvRopeCosSinCachePtr;
+    params.ptrDsv4OScale = options.dsv4OScalePtr;
 
     // TRT-LLM restrictions: the quantization scales must be on the device.
     params.ptrOutputScale = options.outputScalePtr;
@@ -852,12 +860,17 @@ struct KernelParams {
     // The sequence lengths for Kv.
     params.ptrSeqLensKv = options.seqLensKvPtr;
     params.ptrSparseMlaTopKLens = options.sparseMlaTopKLensPtr;
+    params.ptrVariableWindowTokenStarts = options.variableWindowTokenStartsPtr;
+    params.ptrVariableWindowTokenEnds = options.variableWindowTokenEndsPtr;
 
     // Attention sink
     params.ptrAttentionSinks = options.ptrAttentionSinks;
 
     // The partial buffers' pointers when the multiCtasKv mode is enabled.
-    int64_t partialStatsBufferSize = options.mMultiProcessorCount * kernelMeta.mStepQ;
+    // Size the partial stats for every launched CTA when there are more CTAs than SMs.
+    int64_t partialStatsBufferSize =
+        static_cast<int64_t>(std::max(options.mMultiProcessorCount, totalNumCtas)) *
+        kernelMeta.mStepQ;
     params.ptrMultiCtasKvCounter = options.multiCtasKvCounterPtr;
     params.ptrPartialStats = reinterpret_cast<float2*>(options.multiCtasKvScratchPtr);
     params.ptrPartialO = params.ptrPartialStats + partialStatsBufferSize;
@@ -869,10 +882,11 @@ struct KernelParams {
     params.ptrScaleSfO = options.oSfScalePtr;
     params.mScaleSfO = options.mScaleSfO;
 
-    params.mAttentionWindowSize = options.mAttentionWindowSize;
+    params.mLeftSlidingWindow = options.mLeftSlidingWindow;
+    params.mRightSlidingWindow = options.mRightSlidingWindow;
     if (isSlidingOrChunkedCausalMask(
             static_cast<TrtllmGenAttentionMaskType>(kernelMeta.mMaskType)) &&
-        options.mChunkedAttentionSize != INT_MAX) {
+        options.mChunkedAttentionSize > 0) {
       FLASHINFER_CHECK((options.mChunkedAttentionSize & (options.mChunkedAttentionSize - 1)) == 0,
                        "Chunked attention size must be a power of 2");
       params.mChunkedAttentionSizeLog2 = std::log2(options.mChunkedAttentionSize);
@@ -899,7 +913,6 @@ struct KernelParams {
     params.mSumOfSeqLensQ = options.mSumOfSeqLensQ;
     params.mSumOfSeqLensKv = options.mSumOfSeqLensKv;
     params.mBatchSize = options.mBatchSize;
-    params.mChunkedAttentionSizeLog2 = 0;
     params.mNumHeadsQ = options.mNumHeadsQ;
     params.mNumHeadsKv = options.mNumHeadsKv;
     params.mNumHeadsQPerKv = options.mNumHeadsQPerKv;
@@ -907,6 +920,7 @@ struct KernelParams {
     params.mNumHiddenEltsO = options.mNumHeadsQ * options.mHeadDimQk;
     params.mNumTokensPerCtaQ = numTokensPerCtaQ;
     params.mOutputScale = options.outputScale;
+    params.mDsv4ScaleBufM = options.mDsv4ScaleBufM;
     params.mScaleSoftmaxLog2 = options.scaleSoftmaxLog2;
     params.mSkipSoftmaxThresholdScaleFactor = options.mSkipSoftmaxThresholdScaleFactor;
     params.mStartTokenIdxSfO = options.mSfStartTokenIdx;

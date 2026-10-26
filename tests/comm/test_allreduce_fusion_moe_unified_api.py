@@ -21,9 +21,11 @@ import torch.distributed as dist
 
 from flashinfer.comm import (
     AllReduceFusionPattern,
+    MNNVLAllReduceFusionWorkspace,
     TRTLLMAllReduceFusionWorkspace,
     allreduce_fusion,
 )
+from flashinfer.comm.workspace_base import AllReduceFusionWorkspace
 
 MAX_TOKEN_NUM = 2048
 HIDDEN_SIZE = 7168
@@ -76,6 +78,23 @@ def multi_process_parallel(
 # ============================================================================
 
 
+def test_cake_finalize_rejects_non_trtllm_workspace() -> None:
+    workspace = object.__new__(MNNVLAllReduceFusionWorkspace)
+    AllReduceFusionWorkspace.__init__(workspace, world_size=2, rank=0)
+    workspace._destroyed = True
+
+    with pytest.raises(
+        ValueError,
+        match=("moe_finalize_backend='cake' requires a TRTLLMAllReduceFusionWorkspace"),
+    ):
+        allreduce_fusion(
+            input=torch.empty((1, HIDDEN_SIZE), dtype=torch.float16),
+            workspace=workspace,
+            pattern=AllReduceFusionPattern.kMoEFinalizeARResidualRMSNorm,
+            moe_finalize_backend="cake",
+        )
+
+
 def _run_moe_finalize_unified_worker(
     world_size,
     rank,
@@ -87,6 +106,7 @@ def _run_moe_finalize_unified_worker(
     expanded_idx_to_permuted_idx,
     residual,
     weight_bias=0.0,
+    moe_finalize_backend="trtllm",
 ):
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
@@ -142,6 +162,7 @@ def _run_moe_finalize_unified_worker(
                     expert_scale_factor=scale_d,
                     shared_expert_output=shared_d,
                     weight_bias=weight_bias,
+                    moe_finalize_backend=moe_finalize_backend,
                 )
                 torch.cuda.synchronize()
 
@@ -200,6 +221,7 @@ def _run_moe_finalize_unified_worker(
                         expert_scale_factor=scale_d,
                         shared_expert_output=shared_d,
                         weight_bias=weight_bias,
+                        moe_finalize_backend=moe_finalize_backend,
                     )
             torch.cuda.current_stream().wait_stream(s)
 
@@ -220,6 +242,7 @@ def _run_moe_finalize_unified_worker(
                         expert_scale_factor=scale_d,
                         shared_expert_output=shared_d,
                         weight_bias=weight_bias,
+                        moe_finalize_backend=moe_finalize_backend,
                     )
             g.replay()
             torch.cuda.synchronize()
@@ -243,7 +266,8 @@ def _run_moe_finalize_unified_worker(
             shared_str = "with_shared" if has_shared_expert else "no_shared"
             print(
                 f"MOE Finalize unified API: tp{world_size}-{dtype}-"
-                f"seq{seq_len}-topk{top_k}-{shared_str} PASSED"
+                f"seq{seq_len}-topk{top_k}-{shared_str}-"
+                f"{moe_finalize_backend} PASSED"
             )
 
     finally:
@@ -300,6 +324,42 @@ def test_moe_finalize_allreduce_unified_api(
             expanded_idx_to_permuted_idx,
             residual,
             weight_bias,
+        ),
+    )
+
+
+def test_moe_finalize_allreduce_unified_api_cake() -> None:
+    """Exercise the Cake selector through the real unified GPU API."""
+    world_size = 2
+    dtype = torch.float16
+    if world_size > torch.cuda.device_count():
+        pytest.skip(f"world_size {world_size} > available GPUs")
+
+    np.random.seed(42)
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+    seq_len = 16
+    top_k = 8
+    shared_expert_output = torch.randn((seq_len, HIDDEN_SIZE), dtype=dtype)
+    fc2_output = torch.randn((seq_len * top_k, HIDDEN_SIZE), dtype=dtype)
+    scale = torch.randn((seq_len, top_k), dtype=dtype)
+    expanded_idx_to_permuted_idx = torch.randint(
+        0, seq_len * top_k, (seq_len, top_k), dtype=torch.int32
+    )
+    residual = torch.randn((seq_len, HIDDEN_SIZE), dtype=dtype)
+
+    multi_process_parallel(
+        world_size,
+        dtype,
+        _run_moe_finalize_unified_worker,
+        target_args=(
+            shared_expert_output,
+            fc2_output,
+            scale,
+            expanded_idx_to_permuted_idx,
+            residual,
+            0.0,
+            "cake",
         ),
     )
 

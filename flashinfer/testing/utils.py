@@ -472,7 +472,7 @@ def attention_flops(
         head_dim_qk (int): Head dimension of the query and key.
         head_dim_vo (int): Head dimension of the value.
         num_qo_heads (int): Number of query heads.
-        causal (bool): Whether to use causal masking. FLOPs is halved for causal masking.
+        causal (bool): Whether to use causal masking. FLOPs are halved for causal masking.
 
     Returns:
         total_flops (int): Total FLOPs for the layer.
@@ -664,11 +664,12 @@ def attention_tb_per_sec(
     num_kv_heads,
     time,
     q_dtype=torch.bfloat16,
-    kv_dtype=torch.bfloat16,
+    k_dtype=torch.bfloat16,
+    v_dtype=torch.bfloat16,
     o_dtype=torch.bfloat16,
 ):
     """
-    Calculate TB per second perf achieved for a given attention layer. Assumes all sequence lengths are the same within the batch.
+    Calculate the TB-per-second performance achieved for a given attention layer. Assumes all sequence lengths are the same within the batch.
 
     Args:
         batch_size (int): Batch size.
@@ -680,15 +681,16 @@ def attention_tb_per_sec(
         num_kv_heads (int): Number of key and value heads.
         time (float): Execution time in milliseconds.
         q_dtype (torch.dtype): Data type of the query.
-        kv_dtype (torch.dtype): Data type of the key and value.
+        k_dtype (torch.dtype): Data type of the key.
+        v_dtype (torch.dtype): Data type of the value.
         o_dtype (torch.dtype): Data type of the output.
 
     Returns:
         tb_per_sec (float): TB per second for the layer.
     """
     q_bytes = batch_size * qo_seqlen * num_qo_heads * head_dim_qk * q_dtype.itemsize
-    k_bytes = batch_size * kv_seqlen * num_kv_heads * head_dim_qk * kv_dtype.itemsize
-    v_bytes = batch_size * kv_seqlen * num_kv_heads * head_dim_vo * kv_dtype.itemsize
+    k_bytes = batch_size * kv_seqlen * num_kv_heads * head_dim_qk * k_dtype.itemsize
+    v_bytes = batch_size * kv_seqlen * num_kv_heads * head_dim_vo * v_dtype.itemsize
     o_bytes = batch_size * qo_seqlen * num_qo_heads * head_dim_vo * o_dtype.itemsize
     total_bytes = q_bytes + k_bytes + v_bytes + o_bytes
 
@@ -706,11 +708,12 @@ def attention_tb_per_sec_with_actual_seq_lens(
     num_kv_heads,
     time,
     q_dtype=torch.bfloat16,
-    kv_dtype=torch.bfloat16,
+    k_dtype=torch.bfloat16,
+    v_dtype=torch.bfloat16,
     o_dtype=torch.bfloat16,
 ):
     """
-    Calculate TB per second perf achieved for a given attention layer with actual sequence lengths.
+    Calculate the TB-per-second performance achieved for a given attention layer with actual sequence lengths.
     Does not assume all sequence lengths are the same within the batch.
 
     Args:
@@ -722,7 +725,8 @@ def attention_tb_per_sec_with_actual_seq_lens(
         num_kv_heads (int): Number of key and value heads.
         time (float): Execution time in milliseconds.
         q_dtype (torch.dtype): Data type of the query.
-        kv_dtype (torch.dtype): Data type of the key and value.
+        k_dtype (torch.dtype): Data type of the key.
+        v_dtype (torch.dtype): Data type of the value.
         o_dtype (torch.dtype): Data type of the output.
 
     Returns:
@@ -732,10 +736,10 @@ def attention_tb_per_sec_with_actual_seq_lens(
         torch.sum(actual_seq_lens_q) * num_qo_heads * head_dim_qk * q_dtype.itemsize
     )
     k_bytes = (
-        torch.sum(actual_seq_lens_kv) * num_kv_heads * head_dim_qk * kv_dtype.itemsize
+        torch.sum(actual_seq_lens_kv) * num_kv_heads * head_dim_qk * k_dtype.itemsize
     )
     v_bytes = (
-        torch.sum(actual_seq_lens_kv) * num_kv_heads * head_dim_vo * kv_dtype.itemsize
+        torch.sum(actual_seq_lens_kv) * num_kv_heads * head_dim_vo * v_dtype.itemsize
     )
     o_bytes = (
         torch.sum(actual_seq_lens_q) * num_qo_heads * head_dim_vo * o_dtype.itemsize
@@ -838,7 +842,7 @@ def bench_gpu_time_with_cuda_event(
         launch overhead. For microbenchmarking where launch latency matters,
         consider using ``bench_gpu_time_with_cudagraph`` instead.
 
-    .. deprecated::
+    .. deprecated:: 0.6.0
         The ``l2_flush``, ``l2_flush_size_mb``, and ``l2_flush_device`` parameters
         are deprecated. Use ``cold_l2_cache`` instead.
     """
@@ -1009,7 +1013,7 @@ def bench_gpu_time_with_cupti(
         If CUPTI is not available, a warning is issued and the function
         automatically falls back to CUDA event or CUDA graph timing.
 
-    .. deprecated::
+    .. deprecated:: 0.6.0
         The ``l2_flush``, ``l2_flush_size_mb``, and ``l2_flush_device`` parameters
         are deprecated. Use ``cold_l2_cache`` instead.
     """
@@ -1404,7 +1408,7 @@ def bench_gpu_time_with_cudagraph(
     See Also:
         - ``calculate_rotation_count``: Computes required buffer copies for cold-L2.
 
-    .. deprecated::
+    .. deprecated:: 0.6.0
         The ``l2_flush``, ``l2_flush_size_mb``, and ``l2_flush_device`` parameters
         are deprecated. Use ``cold_l2_cache`` instead.
     """
@@ -1639,7 +1643,7 @@ def bench_gpu_time(
         - ``bench_gpu_time_with_cudagraph``: Direct CUDA graph timing.
         - ``bench_gpu_time_with_cupti``: Direct CUPTI timing.
 
-    .. deprecated::
+    .. deprecated:: 0.6.0
         The ``l2_flush``, ``l2_flush_size_mb``, and ``l2_flush_device``
         parameters are deprecated. Use ``cold_l2_cache`` instead.
     """

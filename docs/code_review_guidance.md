@@ -60,11 +60,14 @@ unsafe shape/alignment assumptions.
 ## Experimental APIs
 
 FlashInfer does not gate PRs by size. Some PRs may instead be submitted on **experimental**
-terms — a separate lifecycle, workflow management, and quality bar — declared via a tracked
-issue. Review such PRs against the experimental quality bar, not the durable-code bar.
+terms — a separate lifecycle, workflow management, and quality bar. An experimental PR is
+declared by the **Experimental Track** checkbox in the PR template (with a linked tracking
+issue) and the `experimental` label; the code itself is marked by placement under
+`flashinfer/experimental/` and/or `@flashinfer_experimental_api`. Review such PRs against the
+experimental quality bar, not the durable-code bar.
 
-<!-- TODO(@bkryu): declaration workflow (tracked issue), review quality bar for experimental
-code, and graduation / removal criteria. -->
+<!-- TODO(@bkryu): review quality bar for experimental code, and graduation / removal
+criteria (see flashinfer/experimental/README.md). -->
 
 ## Checklist
 

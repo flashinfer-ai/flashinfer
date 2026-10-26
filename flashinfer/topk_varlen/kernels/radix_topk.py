@@ -1163,6 +1163,11 @@ class SinglePassMultiCTARadixTopKKernel:
             # next_n adjustment is in token units, so it must happen before
             # dividing by compress_ratio; when compress_ratio=1 this is a no-op.
             length = (seq_len - next_n + (row_idx % next_n) + 1) // compress_ratio
+            # A padded / evicted request (seq_len < next_n - nn) gives a negative
+            # numerator: the row has no valid columns, not a negative length
+            # (which would place the identity epilogue's writes before the row).
+            if length < cutlass.Int32(0):
+                length = cutlass.Int32(0)
 
             # My chunk boundaries
             chunk_start = cta_in_group * chunk_size

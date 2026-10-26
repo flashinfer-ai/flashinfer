@@ -62,15 +62,46 @@ def main():
     )
 
     results = {"torch.mm": bench(lambda: torch.mm(a, b, out=out), args.reps)}
-    for backend in ("auto", "cudnn", "cublaslt", "cutlass", "tgv", "tinygemm"):
+
+    def add(name, fn):
+        # A backend can pass its first call and still fail later (warmup, re-plan);
+        # skip it rather than abort the whole table.
         try:
-            flashinfer.mm_bf16(a, b, out=out, backend=backend)
+            fn()
+            results[name] = bench(fn, args.reps)
         except Exception as exc:
-            print(f"  skip {backend}: {str(exc)[:60]}")
-            continue
-        results[f"mm_bf16({backend})"] = bench(
-            lambda x=backend: flashinfer.mm_bf16(a, b, out=out, backend=x), args.reps
+            print(f"  skip {name}: {str(exc)[:60]}")
+
+    for backend in ("auto", "cudnn", "cublaslt", "cutlass", "tgv", "tinygemm"):
+        add(
+            f"mm_bf16({backend})",
+            lambda x=backend: flashinfer.mm_bf16(a, b, out=out, backend=x),
         )
+
+    if props.major == 10:
+        w = b.t().contiguous()
+        ga = (448 * 6) / a.float().abs().max()
+        gw = (448 * 6) / w.float().abs().max()
+        layout = flashinfer.SfLayout.layout_128x4
+        a4, a_sf = flashinfer.nvfp4_quantize(a, ga, sfLayout=layout, do_shuffle=False)
+        w4, w_sf = flashinfer.nvfp4_quantize(w, gw, sfLayout=layout, do_shuffle=False)
+        alpha = (1.0 / (ga * gw)).reshape(1).float()
+        for backend in ("auto", "cudnn", "cutlass", "cute-dsl"):
+            add(
+                f"mm_fp4({backend})",
+                lambda x=backend: flashinfer.mm_fp4(
+                    a4,
+                    w4.T,
+                    a_sf,
+                    w_sf.T,
+                    alpha,
+                    torch.bfloat16,
+                    out=out,
+                    block_size=16,
+                    use_8x4_sf_layout=False,
+                    backend=x,
+                ),
+            )
 
     base = None
     if args.compare:

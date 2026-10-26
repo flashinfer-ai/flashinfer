@@ -24,9 +24,11 @@ from ..utils import _get_cache_buf, get_native_fp4_dtype
 
 from .gemm_base import (
     CUDNN_AVAILABLE,
+    CudnnCaptureUnsafeError,
     DEFAULT_WORKSPACE_SIZE,
     _effective_cache_m,
     UIDs,
+    _gemm_workspace_at_least,
     _check_cudnn_fp4_availability,
     _get_cudnn_handle,
     _get_cudnn_override_shape_workspace_size,
@@ -34,7 +36,7 @@ from .gemm_base import (
     _get_cudnn_workspace_size,
     _cudnn_graph_engine_knob_tactics,
     _finalize_cudnn_graph_for_tactic,
-    _tactic_for_graph_cache,
+    _get_cudnn_override_graph,
     _torch_data_type_to_cudnn_data_type,
     _is_cudnn_override_shape_available,
     _check_cudnn_override_shape_availability,
@@ -268,8 +270,7 @@ def execute_cudnn_bf16_fp4_graph(
     plan_index = _get_cudnn_plan_index_for_tactic(graph, tactic)
 
     workspace_size = _get_cudnn_workspace_size(graph, plan_index)
-    if workspace_buffer.numel() < workspace_size:
-        workspace_buffer.resize_(workspace_size)
+    workspace_buffer = _gemm_workspace_at_least(workspace_buffer, workspace_size)
 
     stream = torch.cuda.current_stream(a.device)
     handle = _get_cudnn_handle(a.device, stream)
@@ -331,8 +332,7 @@ def execute_cudnn_bf16_fp4_graph_override_shape(
         override_shapes,
         override_strides,
     )
-    if workspace_buffer.numel() < workspace_size:
-        workspace_buffer.resize_(workspace_size)
+    workspace_buffer = _gemm_workspace_at_least(workspace_buffer, workspace_size)
 
     if plan_index < 0:
         graph.execute(
@@ -399,7 +399,9 @@ def _cudnn_bf16_fp4_runner(tuning_config):
             actual_m, k = int(a.shape[0]), int(a.shape[1])
             n = int(b.shape[0])
             cache_m = _effective_cache_m(self._tuning_config, actual_m)
-            return build_cudnn_bf16_fp4_graph_override_shape(
+            return _get_cudnn_override_graph(
+                build_cudnn_bf16_fp4_graph_override_shape,
+                tactic,
                 batch=1,
                 n=n,
                 k=k,
@@ -410,7 +412,6 @@ def _cudnn_bf16_fp4_runner(tuning_config):
                 alpha_is_not_none=alpha is not None,
                 use_nvfp4=use_nvfp4,
                 cache_m=cache_m,
-                tactic=_tactic_for_graph_cache(tactic),
             )
 
         def get_valid_tactics(
@@ -507,6 +508,8 @@ def _cudnn_bf16_fp4_runner(tuning_config):
                         workspace_buffer,
                         tactic=tactic,
                     )
+            except CudnnCaptureUnsafeError:
+                raise
             except Exception as exc:
                 warnings.warn(
                     "cuDNN bf16-fp4 GEMM tactic failed; falling back to default "

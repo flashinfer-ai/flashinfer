@@ -23,7 +23,9 @@ limitations under the License.
 import pytest
 
 from tests.moe.trtllm_gen_fused_moe_utils import (
+    ActivationType,
     FP8BlockScaleMoe,
+    FP8PerChannelMoe,
     FP8PerTensorMoe,
     QuantMode,
     RENORMALIZE_ACTIVATION_TYPES,
@@ -34,6 +36,8 @@ from tests.moe.trtllm_gen_fused_moe_utils import (
     RENORMALIZE_ROUTING_LOGITS_DTYPES,
     RENORMALIZE_WEIGHT_PROCESSING,
     RENORMALIZE_ZERO_HIDDEN_STATES,
+    RoutingMethodType,
+    WeightLayout,
     run_moe_test,
 )
 
@@ -91,4 +95,59 @@ def test_renormalize_routing(
         cache_permute_indices,
         routing_logits_dtype,
         zero_hidden_states=zero_hidden_states,
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [8, 768, 3072])
+@pytest.mark.parametrize("hidden_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [384, 512, 768, 1024])
+@pytest.mark.parametrize(
+    "routing_config",
+    [
+        pytest.param(
+            {
+                "num_experts": 128,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.Renormalize,
+                "compatible_moe_impls": [FP8PerChannelMoe],
+                "compatible_intermediate_size": [384, 512, 768, 1024],
+                "enable_autotune": True,
+            },
+            id="Renorm_128e",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "activation_type",
+    [
+        pytest.param(ActivationType.Swiglu, id="Swiglu"),
+        pytest.param(ActivationType.Relu2, id="Relu2"),
+    ],
+)
+def test_fp8_per_channel_renormalize(
+    num_tokens,
+    hidden_size,
+    intermediate_size,
+    routing_config,
+    activation_type,
+    cache_permute_indices,
+):
+    run_moe_test(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        FP8PerChannelMoe(),
+        routing_config,
+        {
+            "use_shuffled_weight": True,
+            "layout": WeightLayout.MajorK,
+            "compatible_moe_impls": [FP8PerChannelMoe],
+        },
+        activation_type,
+        cache_permute_indices,
     )

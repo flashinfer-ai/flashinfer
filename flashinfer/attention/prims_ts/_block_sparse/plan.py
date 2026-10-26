@@ -18,18 +18,28 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import functools
 import _thread
-from typing import Concatenate, ParamSpec, Protocol, TypeVar, cast
+from typing import Concatenate, Literal, ParamSpec, Protocol, TypeVar, cast
 
 import torch
 
 from flashinfer.utils import ceil_div
 
-from .common import _SIGNED_INT32_MAX
+from ..sage.config import (
+    SageAttentionConfig,
+    sage_scale_shapes,
+    _validate_int8_qk_device,
+)
+from .common import (
+    _SIGNED_INT32_MAX,
+    _block_sparse_proxy_summary_geometry,
+    _num_sparse_pattern_heads,
+)
 from .compiler import _get_compiled_block_sparse
 from .config import (
     _BlockSparseStaticProfile,
     _resolve_block_sparse_launch_spec,
 )
+from ..sage.layout import _SageScaleLayout
 from .prepared import _BlockSparseRouteLayout
 
 _P = ParamSpec("_P")
@@ -59,120 +69,25 @@ def _serialize_plan(
 
 
 @dataclass(frozen=True)
-class _PagedKVPlanMetadata:
-    """Plan-owned metadata required only by paged K/V storage."""
-
-    page_size: int
-    paged_kv_indptr: torch.Tensor
-    seq_lens_kv: torch.Tensor
-    num_page_indices: int
-    use_variable_seqlens_kv: bool
-
-
-def _snapshot_paged_kv_plan_metadata(
-    paged_kv_indptr: torch.Tensor,
-    seq_lens_kv: torch.Tensor | None,
-    *,
-    static: _BlockSparseStaticProfile,
-    device: torch.device,
-    plan_stream: torch.cuda.Stream,
-) -> _PagedKVPlanMetadata:
-    """Validate and copy stable paged inputs into one final plan object."""
-
-    assert static.page_size is not None
-    if seq_lens_kv is not None:
-        if not isinstance(seq_lens_kv, torch.Tensor):
-            raise TypeError("seq_lens_kv must be a torch.Tensor")
-        if seq_lens_kv.dtype != torch.int32:
-            raise TypeError("seq_lens_kv must have dtype torch.int32")
-        if seq_lens_kv.ndim != 1:
-            raise ValueError("seq_lens_kv must be one-dimensional")
-        if seq_lens_kv.device != device:
-            raise ValueError(
-                f"seq_lens_kv must be on planned device {device}, "
-                f"got {seq_lens_kv.device}"
-            )
-        if tuple(seq_lens_kv.shape) != (static.batch_size,):
-            raise ValueError(f"seq_lens_kv must have shape ({static.batch_size},)")
-        if not seq_lens_kv.is_contiguous():
-            raise ValueError("seq_lens_kv must be contiguous")
-        if seq_lens_kv.data_ptr() % 4 != 0:
-            raise ValueError("seq_lens_kv data pointer must be 4-byte aligned")
-
-    with torch.cuda.device(device), torch.cuda.stream(plan_stream):
-        indptr_values = tuple(int(value) for value in paged_kv_indptr.tolist())
-        if indptr_values[0] != 0:
-            raise ValueError("paged_kv_indptr must start at zero")
-        for begin, end in zip(indptr_values[:-1], indptr_values[1:], strict=True):
-            if end < begin:
-                raise ValueError("paged_kv_indptr must be monotonic non-decreasing")
-
-        if seq_lens_kv is None:
-            seq_lens_kv_values = (static.seq_len_kv,) * static.batch_size
-        else:
-            seq_lens_kv_values = tuple(int(value) for value in seq_lens_kv.tolist())
-
-        lower_bound = static.seq_len_q if static.mask_type == "causal" else 1
-        for request_idx, (live_kv, begin, end) in enumerate(
-            zip(
-                seq_lens_kv_values,
-                indptr_values[:-1],
-                indptr_values[1:],
-                strict=True,
-            )
-        ):
-            if not lower_bound <= live_kv <= static.seq_len_kv:
-                raise ValueError(
-                    "seq_lens_kv values must be in "
-                    f"[{lower_bound}, {static.seq_len_kv}]"
-                )
-            required_pages = ceil_div(live_kv, static.page_size)
-            available_pages = end - begin
-            if available_pages < required_pages:
-                qualifier = " for live seq_lens_kv" if seq_lens_kv is not None else ""
-                raise ValueError(
-                    "each paged_kv_indptr request must contain at least "
-                    f"{required_pages} pages{qualifier}; request {request_idx} "
-                    f"contains {available_pages}"
-                )
-
-        use_variable_seqlens_kv = any(
-            live_kv != static.seq_len_kv for live_kv in seq_lens_kv_values
-        )
-        return _PagedKVPlanMetadata(
-            page_size=static.page_size,
-            paged_kv_indptr=torch.tensor(
-                indptr_values,
-                dtype=torch.int32,
-                device=device,
-            ),
-            seq_lens_kv=torch.tensor(
-                seq_lens_kv_values,
-                dtype=torch.int32,
-                device=device,
-            ),
-            num_page_indices=indptr_values[-1],
-            use_variable_seqlens_kv=use_variable_seqlens_kv,
-        )
-
-
-@dataclass(frozen=True)
 class _BlockSparsePlanState:
     """One complete launch state published by a block-sparse wrapper.
 
-    Every state executes one ``prepare -> prepared-route attention`` adapter,
-    including a pattern whose rows select every KV block. Caller BSR and token
-    mask tensors belong to individual runs and are never retained here.
+    Every block-sparse state executes one ``prepare -> prepared-route
+    attention`` adapter, including a pattern whose rows select every KV block;
+    a dense state skips route preparation. A Sage state of either kind
+    prepares its scales first. Caller BSR and token mask tensors belong to
+    individual runs and are never retained here.
 
     Runtime geometry, dtypes, the compiled launch, and the readiness event are
     published together. ``run()`` therefore sees either the complete old state
     or the complete new one, never a mix. Plan-owned row offsets describe
     uniform capacity slices. Mutable route scratch, the optional unmasked-ABI
-    dummy mask, and the event are also state-owned.
-    Policy is immutable after publication; the cached compiled adapter is
-    shared read-only.
+    dummy mask, a Sage state's mutable prepared scales, and the event are also
+    state-owned. Policy is immutable after publication; the cached compiled
+    adapter is shared read-only.
 
-    One revision owns one mutable route workspace. Ordered runs on one
+    One revision owns one mutable route workspace and, for a Sage state, one
+    mutable prepared-scale buffer that every run rewrites. Ordered runs on one
     stream, or externally synchronized cross-stream runs, are valid. Unordered
     concurrent runs of the same revision are unsupported because their prepare
     launches would race. Different wrappers and published revisions own
@@ -183,6 +98,9 @@ class _BlockSparsePlanState:
     cannot prevent in-place modification or replace graph ownership.
     """
 
+    use_block_sparse: bool
+    sparse_format: Literal["bsr", "bitmask"]
+    use_proxy_routes: bool
     device: torch.device
     batch_size: int
     seq_len_q: int
@@ -191,20 +109,31 @@ class _BlockSparsePlanState:
     num_kv_heads: int
     head_dim: int
     q_block_size: int
+    kv_block_size: int
     q_dtype: torch.dtype
     kv_dtype: torch.dtype
+    v_dtype: torch.dtype
     output_dtype: torch.dtype
     use_kv_valid_bits: bool
+    page_size: int | None
+    sage: SageAttentionConfig | None
+    # Expected shape of every Sage scale tensor, by field name.
+    sage_scale_shapes: dict[str, tuple[int, ...]] | None
 
-    # Only an unmasked specialization needs a shape-correct ABI placeholder.
+    # Only an unmasked specialization needs a shape-correct ABI placeholder;
+    # dense plans own neither it nor route storage.
     dummy_kv_valid_bits: torch.Tensor | None
 
     # Immutable row capacities and mutable per-run route payload.
-    row_route_offsets: torch.Tensor
-    route_workspace: torch.Tensor
+    row_route_offsets: torch.Tensor | None
+    route_workspace: torch.Tensor | None
+    # Mutable per-run prepared scales of a Sage plan, in the layout the plan
+    # compiled.
+    sage_scales: torch.Tensor | None
+    sage_scales_layout: _SageScaleLayout | None
     # Semantic row bound; unlike route capacity, this distinguishes
     # multiple semantic blocks packed into one prepared route.
-    max_blocks_per_row: int
+    max_blocks_per_row: int | None
 
     policy: tuple[tuple[str, object], ...]
     compiled: Callable[..., object]
@@ -212,7 +141,7 @@ class _BlockSparsePlanState:
     # All plan-stream work happens-before run after waiting on this event.
     ready_event: torch.cuda.Event
     ready_stream_handle: int
-    paged_kv: _PagedKVPlanMetadata | None
+    share_pattern_across_kv_heads: bool = False
 
 
 def _allocate_dummy_kv_valid_bits(
@@ -271,37 +200,72 @@ def _record_block_sparse_plan_ready_event(
     return event
 
 
+def _block_sparse_route_capacity(
+    static: _BlockSparseStaticProfile, *, use_proxy_routes: bool
+) -> tuple[int, int]:
+    """Return ``(prepared rows, route capacity per row)`` of one plan.
+
+    A dense plan has none; a proxy plan adds its summary routes to every row.
+    """
+
+    if not static.use_block_sparse:
+        return 0, 0
+    assert static.max_blocks_per_row is not None
+    num_rows = (
+        static.batch_size
+        * _num_sparse_pattern_heads(
+            static.num_kv_heads, static.share_pattern_across_kv_heads
+        )
+        * ceil_div(static.seq_len_q, static.q_block_size)
+    )
+    if num_rows > _SIGNED_INT32_MAX:
+        raise OverflowError("row_count must fit in signed int32")
+    max_row_route_capacity = ceil_div(
+        static.max_blocks_per_row * static.kv_block_size,
+        static.kv_route_size,
+    )
+    if use_proxy_routes:
+        num_summaries, _ = _block_sparse_proxy_summary_geometry(
+            static.seq_len_kv,
+            static.kv_block_size,
+        )
+        max_row_route_capacity += ceil_div(num_summaries, static.kv_route_size)
+    return num_rows, max_row_route_capacity
+
+
 def _build_block_sparse_plan_state(
     static: _BlockSparseStaticProfile,
     *,
     device: torch.device,
     device_index: int,
     plan_stream: torch.cuda.Stream,
-    paged_kv: _PagedKVPlanMetadata | None,
+    sparse_format: Literal["bsr", "bitmask"] = "bsr",
+    use_proxy_routes: bool = False,
 ) -> _BlockSparsePlanState:
-    """Build and close one complete state after storage validation."""
+    """Build one format- and route-specialized plan atomically."""
 
-    assert static.max_blocks_per_row is not None
-    assert (static.page_size is None) == (paged_kv is None)
-    if paged_kv is not None:
-        assert static.page_size == paged_kv.page_size
-    max_row_route_capacity = ceil_div(
-        static.max_blocks_per_row * static.kv_block_size,
-        static.kv_route_size,
+    if static.page_size is not None:
+        assert sparse_format == "bsr" and not use_proxy_routes
+    _validate_int8_qk_device(static.q_dtype, device_index)
+    num_rows, max_row_route_capacity = _block_sparse_route_capacity(
+        static, use_proxy_routes=use_proxy_routes
     )
-    num_rows = (
-        static.batch_size
-        * static.num_kv_heads
-        * ceil_div(static.seq_len_q, static.q_block_size)
-    )
-    route_layout = _BlockSparseRouteLayout.create(
-        kv_route_size=static.kv_route_size,
-        kv_block_size=static.kv_block_size,
-        page_size=static.page_size,
-        has_token_bits=static.use_kv_valid_bits,
-        route_metadata_capacity=num_rows * max_row_route_capacity,
-        num_rows=num_rows,
-    )
+    scale_shapes = None
+    if static.sage is not None:
+        scale_shapes = sage_scale_shapes(
+            static.sage,
+            batch_size=static.batch_size,
+            seq_len_q=static.seq_len_q,
+            seq_len_kv=static.seq_len_kv,
+            num_qo_heads=static.num_qo_heads,
+            num_kv_heads=static.num_kv_heads,
+            head_dim=static.head_dim,
+            summary_seq_len=(
+                ceil_div(static.seq_len_kv, static.kv_block_size)
+                if use_proxy_routes
+                else None
+            ),
+        )
     with torch.cuda.device(device_index), torch.cuda.stream(plan_stream):
         spec = _resolve_block_sparse_launch_spec(
             device_index=device_index,
@@ -310,6 +274,7 @@ def _build_block_sparse_plan_state(
             seq_len_kv=static.seq_len_kv,
             num_qo_heads=static.num_qo_heads,
             num_kv_heads=static.num_kv_heads,
+            share_pattern_across_kv_heads=static.share_pattern_across_kv_heads,
             head_dim=static.head_dim,
             q_block_size=static.q_block_size,
             kv_block_size=static.kv_block_size,
@@ -319,32 +284,55 @@ def _build_block_sparse_plan_state(
             mask_type=static.mask_type,
             use_kv_valid_bits=static.use_kv_valid_bits,
             max_row_route_capacity=max_row_route_capacity,
-            use_variable_seqlens_kv=(
-                False if paged_kv is None else paged_kv.use_variable_seqlens_kv
-            ),
+            sparse_format=sparse_format,
+            use_proxy_routes=use_proxy_routes,
+            use_block_sparse=static.use_block_sparse,
+            out_dtype_key=static.out_dtype_key,
+            v_dtype_key=static.v_dtype_key,
+            sage=static.sage,
+            softmax_rescale_threshold_log2=static.softmax_rescale_threshold_log2,
         )
         policy = (
             *spec.policy,
             ("max_blocks_per_row", static.max_blocks_per_row),
         )
         compiled = _get_compiled_block_sparse(spec.compile_key)
-        dummy_kv_valid_bits = (
-            None
-            if static.use_kv_valid_bits
-            else _allocate_dummy_kv_valid_bits(
-                batch_size=static.batch_size,
-                seq_len_kv=static.seq_len_kv,
+        dummy_kv_valid_bits = None
+        row_route_offsets = None
+        route_workspace = None
+        sage_scales = None
+        if spec.sage_scales is not None:
+            sage_scales = torch.empty(
+                spec.sage_scales.total_words(static.batch_size * static.num_kv_heads),
+                dtype=torch.float32,
                 device=device,
             )
-        )
-        row_route_offsets, route_workspace = _allocate_route_storage(
-            device=device,
-            route_layout=route_layout,
-            uniform_row_route_capacity=max_row_route_capacity,
-        )
+        if static.use_block_sparse:
+            route_layout = _BlockSparseRouteLayout.create(
+                kv_route_size=static.kv_route_size,
+                kv_block_size=static.kv_block_size,
+                page_size=static.page_size,
+                has_token_bits=spec.prepares_score_words,
+                route_metadata_capacity=num_rows * max_row_route_capacity,
+                num_rows=num_rows,
+            )
+            if not static.use_kv_valid_bits:
+                dummy_kv_valid_bits = _allocate_dummy_kv_valid_bits(
+                    batch_size=static.batch_size,
+                    seq_len_kv=static.seq_len_kv,
+                    device=device,
+                )
+            row_route_offsets, route_workspace = _allocate_route_storage(
+                device=device,
+                route_layout=route_layout,
+                uniform_row_route_capacity=max_row_route_capacity,
+            )
         ready_event = _record_block_sparse_plan_ready_event(plan_stream)
 
     return _BlockSparsePlanState(
+        use_block_sparse=static.use_block_sparse,
+        sparse_format=sparse_format,
+        use_proxy_routes=use_proxy_routes,
         device=device,
         batch_size=static.batch_size,
         seq_len_q=static.seq_len_q,
@@ -353,19 +341,26 @@ def _build_block_sparse_plan_state(
         num_kv_heads=static.num_kv_heads,
         head_dim=static.head_dim,
         q_block_size=static.q_block_size,
+        kv_block_size=static.kv_block_size,
         q_dtype=static.q_dtype,
         kv_dtype=static.kv_dtype,
+        v_dtype=static.v_dtype,
         output_dtype=static.output_dtype,
         use_kv_valid_bits=static.use_kv_valid_bits,
+        page_size=static.page_size,
+        sage=static.sage,
+        sage_scale_shapes=scale_shapes,
         dummy_kv_valid_bits=dummy_kv_valid_bits,
         row_route_offsets=row_route_offsets,
         route_workspace=route_workspace,
+        sage_scales=sage_scales,
+        sage_scales_layout=spec.sage_scales,
         max_blocks_per_row=static.max_blocks_per_row,
         policy=policy,
         compiled=compiled,
         ready_event=ready_event,
         ready_stream_handle=plan_stream.cuda_stream,
-        paged_kv=paged_kv,
+        share_pattern_across_kv_heads=static.share_pattern_across_kv_heads,
     )
 
 
@@ -382,21 +377,20 @@ def _wait_and_record_block_sparse_plan(
 
     if state.dummy_kv_valid_bits is not None:
         state.dummy_kv_valid_bits.record_stream(stream)
-    state.row_route_offsets.record_stream(stream)
-    state.route_workspace.record_stream(stream)
-    if state.paged_kv is not None:
-        state.paged_kv.paged_kv_indptr.record_stream(stream)
-        state.paged_kv.seq_lens_kv.record_stream(stream)
+    if state.row_route_offsets is not None:
+        state.row_route_offsets.record_stream(stream)
+    if state.route_workspace is not None:
+        state.route_workspace.record_stream(stream)
+    if state.sage_scales is not None:
+        state.sage_scales.record_stream(stream)
 
 
 __all__ = [
     "_BlockSparsePlanState",
-    "_PagedKVPlanMetadata",
     "_allocate_dummy_kv_valid_bits",
     "_allocate_route_storage",
     "_build_block_sparse_plan_state",
     "_record_block_sparse_plan_ready_event",
     "_serialize_plan",
-    "_snapshot_paged_kv_plan_metadata",
     "_wait_and_record_block_sparse_plan",
 ]

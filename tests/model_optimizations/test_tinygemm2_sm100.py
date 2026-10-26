@@ -1,9 +1,9 @@
-"""Tests for tinygemm2_sm100 — the generated SM100/SM103 tinygemm2 variants.
+"""Tests for tinygemm2_sm100 — the generated SM100/SM103 tinygemm2 kernel.
 
-The four frozen variants in ``csrc/tinygemm2_sm100/tinygemm2_sm100.cu`` are
-generated Loom schedules exactly porting ``csrc/tinygemm2.cu``; the contract
-is bit-identical outputs. Every parity test below therefore uses
-``torch.equal``, not a tolerance.
+``csrc/tinygemm2_sm100.cu`` holds one kernel template instantiated for the
+pipeline ring depths 4/8/16 and PDL off/on; it is a generated port of
+``csrc/tinygemm2.cu`` whose contract is bit-identical outputs. Every parity
+test below therefore uses ``torch.equal``, not a tolerance.
 """
 
 import pytest
@@ -44,6 +44,22 @@ def _make_case(batch_size, output_features, input_features, seed=0):
     return input, weight, bias
 
 
+# Ring-depth selection rule of the binding (SelectStages in
+# csrc/tinygemm2_sm100.cu), restated here so the tier tests can prove that
+# their shapes reach every instantiation on the device they run on:
+#   stage4  if K <= 1024 (one loader iteration) or total_ctas > 2 * num_sms;
+#   stage16 if K >= 4608 and total_ctas <= num_sms;
+#   stage8  otherwise,
+# with total_ctas = ceil(M / 16) * ceil(batch / 8).
+def _expected_stages(batch_size, output_features, input_features, num_sms):
+    total_ctas = ((output_features + 15) // 16) * ((batch_size + 7) // 8)
+    if input_features <= 1024 or total_ctas > 2 * num_sms:
+        return 4
+    if input_features >= 4608 and total_ctas <= num_sms:
+        return 16
+    return 8
+
+
 # Shape axes: batch sweeps across the TILE_N=8 boundary (1..7 exercises the
 # out-of-bounds TMA box on the batch axis), K sweeps the ring-depth selection
 # tiers (K <= 1024 selects the shallow ring; single-wave K >= 4608 selects the
@@ -62,13 +78,24 @@ PARITY_SHAPES = [
     (1, 128, 14336),
 ]
 
+# One shape per selection arm. The CTA counts (8, 64, 2048) sit far from the
+# SM-count thresholds of every SM100-family part, so the tier each shape
+# reaches does not depend on the device; test_tinygemm2_sm100_tiers asserts
+# that with the device's actual SM count.
+TIER_SHAPES = [
+    (1, 128, 720),  # stage4: K fits one loader iteration
+    (64, 4096, 3072),  # stage4: 2048 CTAs, multi-wave grid
+    (8, 1024, 2048),  # stage8: 64 CTAs, K between the arms
+    (8, 128, 7168),  # stage16: 8 CTAs, long K
+]
+
 
 @pytest.mark.parametrize("batch_size,output_features,input_features", PARITY_SHAPES)
 @pytest.mark.parametrize("use_pdl", [False, True])
 def test_tinygemm2_sm100_bitwise_parity(
     batch_size, output_features, input_features, use_pdl
 ):
-    """The generated variants must be bit-identical to csrc/tinygemm2.cu."""
+    """The generated kernel must be bit-identical to csrc/tinygemm2.cu."""
     _skip_if_not_sm100_family()
     from flashinfer.gemm.routergemm import (
         get_tinygemm2_module,
@@ -100,49 +127,44 @@ def test_tinygemm2_sm100_bitwise_parity(
     torch.testing.assert_close(out_gen.float(), ref.float(), atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize(
-    "variant_op,smem_note",
-    [
-        ("stage8_op", "deep ring"),
-        ("stage8_pdl_op", "deep ring + PDL"),
-        ("stage4_op", "shallow ring"),
-        ("stage4_pdl_op", "shallow ring + PDL"),
-        ("stage16_op", "deepest ring"),
-        ("stage16_pdl_op", "deepest ring + PDL"),
-    ],
-)
-def test_tinygemm2_sm100_each_variant(variant_op, smem_note):
-    """Drive each frozen variant directly, bypassing the stage selection."""
+@pytest.mark.parametrize("use_pdl", [False, True])
+def test_tinygemm2_sm100_tiers(use_pdl):
+    """Every ring depth is reached through the public op by a shape of
+    TIER_SHAPES on this device, and each produces the F.linear result."""
     _skip_if_not_sm100_family()
-    from flashinfer.jit import gen_tinygemm2_sm100_module
+    from flashinfer.gemm.routergemm import get_tinygemm2_sm100_module
 
-    module = gen_tinygemm2_sm100_module().build_and_load()
-    op = getattr(module, variant_op)
+    num_sms = torch.cuda.get_device_properties(
+        torch.device("cuda")
+    ).multi_processor_count
+    tiers = {_expected_stages(*shape, num_sms) for shape in TIER_SHAPES}
+    assert tiers == {4, 8, 16}, (
+        f"TIER_SHAPES reach ring depths {sorted(tiers)} on a {num_sms}-SM device"
+    )
 
-    for batch_size, output_features, input_features in [
-        (1, 128, 720),
-        (8, 1024, 2048),
-        (8, 128, 7168),
-    ]:
+    for batch_size, output_features, input_features in TIER_SHAPES:
         input, weight, bias = _make_case(batch_size, output_features, input_features)
         out = torch.zeros(
             batch_size, output_features, device="cuda", dtype=torch.bfloat16
         )
-        op(input, weight, bias, out)
+        get_tinygemm2_sm100_module().tinygemm2_sm100_op(
+            input, weight, bias, out, use_pdl
+        )
         torch.cuda.synchronize()
         ref = F.linear(input.float(), weight.float(), bias.float()).bfloat16()
+        stages = _expected_stages(batch_size, output_features, input_features, num_sms)
         torch.testing.assert_close(
             out.float(),
             ref.float(),
             atol=1e-2,
             rtol=1e-2,
-            msg=lambda m: f"{variant_op} ({smem_note}) failed: {m}",
+            msg=lambda m: f"stage{stages} pdl={use_pdl} failed: {m}",
         )
 
 
 @pytest.mark.parametrize("num_launches", [2, 8])
 def test_tinygemm2_sm100_pdl_back_to_back(num_launches):
-    """PDL variants fired back-to-back must match their eager outputs."""
+    """PDL launches fired back-to-back must match their eager outputs."""
     _skip_if_not_sm100_family()
     from flashinfer.gemm.routergemm import get_tinygemm2_sm100_module
 
@@ -175,7 +197,7 @@ def test_tinygemm2_sm100_pdl_back_to_back(num_launches):
 
 def test_tinygemm2_sm100_dispatch_and_escape_hatch(monkeypatch):
     """tinygemm_bf16 must route to the generated backend on SM100/SM103 and
-    honor FLASHINFER_DISABLE_TINYGEMM2_SM100."""
+    honor FLASHINFER_DISABLE_TINYGEMM2_SM100, including a toggle at runtime."""
     _skip_if_not_sm100_family()
     import flashinfer.gemm.routergemm as routergemm
     from flashinfer.gemm import tinygemm_bf16
@@ -183,6 +205,7 @@ def test_tinygemm2_sm100_dispatch_and_escape_hatch(monkeypatch):
     input, weight, bias = _make_case(4, 128, 720)
     ref = F.linear(input.float(), weight.float(), bias.float()).bfloat16()
 
+    monkeypatch.delenv("FLASHINFER_DISABLE_TINYGEMM2_SM100", raising=False)
     assert routergemm._use_tinygemm2_sm100(input.device)
     out = torch.zeros(4, 128, device="cuda", dtype=torch.bfloat16)
     tinygemm_bf16(input, weight, out, bias=bias)
@@ -195,3 +218,6 @@ def test_tinygemm2_sm100_dispatch_and_escape_hatch(monkeypatch):
     tinygemm_bf16(input, weight, out_disabled, bias=bias)
     torch.cuda.synchronize()
     assert torch.equal(out_disabled, out)
+
+    monkeypatch.setenv("FLASHINFER_DISABLE_TINYGEMM2_SM100", "0")
+    assert routergemm._use_tinygemm2_sm100(input.device)

@@ -32,16 +32,105 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 if TYPE_CHECKING:
-    from flashinfer.fused_moe.api import MoEActivationPack, QuantVariant
+    from flashinfer.fused_moe.api import MoEActivationPack, QuantConfig
+
+
+_NCCL_EP_LL_BF16_WIDTHS = (2048, 2560, 4096, 5120, 6144, 7168, 8192)
+
+
+def packed_mxfp8_dispatch_width(hidden: int) -> int:
+    """Return the smallest supported BF16 row that holds MXFP8 data + scales."""
+    if hidden % 64:
+        raise ValueError(f"mxfp8_dispatch requires hidden % 64 == 0, got {hidden}")
+    need = (hidden + hidden // 32) // 2
+    for width in _NCCL_EP_LL_BF16_WIDTHS:
+        if width >= need:
+            return width
+    raise ValueError(f"packed MXFP8 row for hidden={hidden} is too large")
+
+
+def pack_mxfp8_dispatch_payload(x: torch.Tensor) -> torch.Tensor:
+    """Pack per-token MXFP8 values and linear scale bytes into BF16 rows."""
+    if x.dim() != 2 or x.dtype != torch.bfloat16:
+        raise ValueError(
+            "mxfp8_dispatch expects 2D BF16 [num_tokens, hidden] tokens, "
+            f"got {x.dtype} shape {tuple(x.shape)}"
+        )
+    from flashinfer.quantization.fp8_quantization import mxfp8_quantize
+
+    m, hidden = x.shape
+    send_width = packed_mxfp8_dispatch_width(hidden)
+    q, sf = mxfp8_quantize(x.contiguous(), is_sf_swizzled_layout=False)
+    packed = torch.zeros(m, 2 * send_width, dtype=torch.uint8, device=x.device)
+    packed[:, :hidden] = q.view(torch.uint8)
+    packed[:, hidden : hidden + hidden // 32] = sf.view(torch.uint8).reshape(
+        m, hidden // 32
+    )
+    return packed.view(torch.bfloat16)
+
+
+def _mask_padding_rows_nonlocal(
+    selected_experts: torch.Tensor,
+    final_scales: torch.Tensor,
+    recv_count: torch.Tensor,
+    *,
+    num_local_experts: int,
+    cap: int,
+    local_expert_offset: int,
+    num_experts: Optional[int],
+):
+    """Mask padded rows by marking them as belonging to an expert this rank does not own.
+
+    Only the first recv_count[e] rows of each expert's block hold real tokens, the rest is padding. The
+    routing kernel behind moe_sort only counts an expert into its histogram when that expert is local, so pointing a padding row at
+    a remote expert drops it from the tile count, from ``permutedIdxSize``, and from
+    every stage bounded by them - the permute/gather, both GEMMs, the activation and
+    the finalize.
+
+    Returns the inputs unchanged when there is no remote expert to point at.
+    """
+    if num_experts is None or num_local_experts >= num_experts:
+        return selected_experts, final_scales
+
+    expected = (num_local_experts,)
+    if tuple(recv_count.shape) != expected:
+        raise ValueError(
+            f"recv_count must have shape {list(expected)}, got {list(recv_count.shape)}"
+        )
+
+    device = selected_experts.device
+    m = selected_experts.shape[0]
+    remote_id = (
+        local_expert_offset + num_local_experts
+    ) % num_experts  # First expert past this ranks block
+
+    if m != num_local_experts * cap:
+        raise ValueError(
+            f"EXPERT_MAJOR pack must be num_local_experts * cap rows "
+            f"({num_local_experts} * {cap} = {num_local_experts * cap}), got {m}"
+        )
+
+    # Mask padding rows by marking them as remote; efficient as broadcast compare.
+    recv_count = recv_count.to(device)
+    col = torch.arange(cap, device=device, dtype=recv_count.dtype)
+    is_real = (col.unsqueeze(0) < recv_count.unsqueeze(1)).reshape(m, 1)
+
+    selected_experts = torch.where(is_real, selected_experts, remote_id)
+    final_scales = torch.where(is_real, final_scales, 0.0)
+    return selected_experts, final_scales
 
 
 def build_activation_pack(
     expert_tensors: torch.Tensor,
     *,
     local_expert_offset: int = 0,
-    quant_variant: "QuantVariant",
+    quant: "QuantConfig",
     per_token_activation: bool = False,
     global_scale: Optional[torch.Tensor] = None,
+    mxfp8_dispatch: bool = False,
+    hidden_size: Optional[int] = None,
+    recv_count: Optional[torch.Tensor] = None,
+    num_experts: Optional[int] = None,
 ) -> "MoEActivationPack":
     """Translate the 3D expert-major dispatch output into a token-major pack.
 
@@ -53,9 +142,10 @@ def build_activation_pack(
         Global id of this rank's first local expert.  Synthesized expert ids are
         ``(row // cap) + local_expert_offset``; the compute runner subtracts the same
         offset, so the two must agree (they share one :class:`MoEConfig`).
-    quant_variant : QuantVariant
-        Activation and weight quantization contract. NVFP4 quantizes the
-        dispatched BF16 activations; BF16 and W4A16 carry them unchanged.
+    quant : QuantConfig
+        Weight / activation / output formats. NVFP4 activations quantize the
+        dispatched BF16 rows; BF16 activations (including both W4A16 encodings)
+        pass them through.
     per_token_activation : bool
         Use per-token NVFP4 activation scaling when quantizing the input.
     global_scale : torch.Tensor, optional
@@ -79,13 +169,26 @@ def build_activation_pack(
     )
     final_scales = torch.ones(m, 1, dtype=torch.float32, device=device)
 
+    if recv_count is not None:
+        selected_experts, final_scales = _mask_padding_rows_nonlocal(
+            selected_experts,
+            final_scales,
+            recv_count,
+            num_local_experts=num_local_experts,
+            cap=cap,
+            local_expert_offset=local_expert_offset,
+            num_experts=num_experts,
+        )
+
     return _quantize_and_pack(
         flat,
         selected_experts,
         final_scales,
-        quant_variant=quant_variant,
+        quant=quant,
         per_token_activation=per_token_activation,
         global_scale=global_scale,
+        mxfp8_dispatch=mxfp8_dispatch,
+        hidden_size=hidden_size,
     )
 
 
@@ -96,9 +199,12 @@ def build_activation_pack_rank_major(
     *,
     num_local_experts: int,
     local_expert_offset: int = 0,
-    quant_variant: "QuantVariant",
+    num_experts: Optional[int] = None,
+    quant: "QuantConfig",
     per_token_activation: bool = False,
     global_scale: Optional[torch.Tensor] = None,
+    mxfp8_dispatch: bool = False,
+    hidden_size: Optional[int] = None,
 ) -> "MoEActivationPack":
     """Translate the 3D RANK_MAJOR dispatch output into a token-major pack.
 
@@ -111,13 +217,10 @@ def build_activation_pack_rank_major(
     in its top-k, weighted and summed (the "pre-reduce across local experts" the
     layout contract calls for).
 
-    This is the **faithful** path: we drive the unified runner at the model's real
-    ``top_k`` with ``do_finalize=True`` (which does the per-token weighted sum), and
-    mask the non-local picks to weight 0 (pointing them at a valid local expert so
-    indexing stays in range).  ``combine`` then just sums across ranks — the real
-    weights are applied here, not on receive.  (The runner still evaluates all
-    ``top_k`` slots per token, so the masked picks cost compute they don't
-    contribute; an exact local-only gather is a future optimization.)
+    The runner applies the real ``top_k`` weights and sums local contributions;
+    ``combine`` sums across ranks. Masked picks use a valid remote expert ID
+    when ``num_experts`` provides a remote shard, so the runner excludes them
+    from expert compute. Otherwise they use a local ID with zero weight.
 
     Parameters
     ----------
@@ -133,7 +236,10 @@ def build_activation_pack_rank_major(
         Number of experts this rank owns (carried for API symmetry / validation).
     local_expert_offset : int
         Global id of this rank's first local expert (see EXPERT_MAJOR builder).
-    quant_variant, per_token_activation, global_scale :
+    num_experts : int, optional
+        Global expert count. Enables exclusion of masked picks from local compute
+        when this rank owns fewer than all experts.
+    quant, per_token_activation, global_scale :
         Same semantics as :func:`build_activation_pack`.
     """
     if recv_tensors.dim() != 3:
@@ -158,19 +264,15 @@ def build_activation_pack_rank_major(
             f"{tuple(idx.shape)} / {tuple(weights.shape)}."
         )
 
-    # The RANK_MAJOR dispatch returns LOCAL expert indices (0-based within this
-    # rank's experts) for each token's picks, with -1 marking a pick routed to a
-    # NON-local expert (handled by another rank). Convert local->global
-    # (idx + local_expert_offset) for the runner, which expects global ids and
-    # filters by local_expert_offset. Only [0, num_local_experts) is local; -1 and
-    # any out-of-range id are masked to a valid local id with weight 0, so the
-    # weighted finalize sum drops them; combine then sums each token's per-rank
-    # partial reductions across ranks.
+    # Zero weight alone does not skip GEMMs; a remote ID excludes the route.
+    masked_expert = local_expert_offset
+    if num_experts is not None and num_local_experts < num_experts:
+        masked_expert = (local_expert_offset + num_local_experts) % num_experts
     is_local = (idx >= 0) & (idx < num_local_experts)
     selected_experts = torch.where(
         is_local,
         idx + local_expert_offset,
-        torch.full_like(idx, local_expert_offset),
+        torch.full_like(idx, masked_expert),
     ).to(torch.int32)
     final_scales = torch.where(is_local, weights, torch.zeros_like(weights))
 
@@ -178,9 +280,11 @@ def build_activation_pack_rank_major(
         flat,
         selected_experts,
         final_scales,
-        quant_variant=quant_variant,
+        quant=quant,
         per_token_activation=per_token_activation,
         global_scale=global_scale,
+        mxfp8_dispatch=mxfp8_dispatch,
+        hidden_size=hidden_size,
     )
 
 
@@ -189,22 +293,26 @@ def _quantize_and_pack(
     selected_experts: torch.Tensor,
     final_scales: torch.Tensor,
     *,
-    quant_variant: "QuantVariant",
+    quant: "QuantConfig",
     per_token_activation: bool,
     global_scale: Optional[torch.Tensor],
+    mxfp8_dispatch: bool,
+    hidden_size: Optional[int],
 ) -> "MoEActivationPack":
     """Prepare ``flat`` for the configured activation path and assemble the pack.
 
     Shared by the EXPERT_MAJOR and RANK_MAJOR builders, which differ only in how
     ``selected_experts`` / ``final_scales`` are synthesized.
     """
-    from flashinfer.fused_moe.api import MoEActivationPack, QuantVariant
+    from flashinfer.fused_moe.api import MoEActivationPack, QuantFormat
 
+    pair = quant.pair
+    activation = pair[1]
     device = flat.device
     per_token_scale = None
-    if per_token_activation and quant_variant is not QuantVariant.NVFP4:
-        raise ValueError("per-token activation scaling requires QuantVariant.NVFP4")
-    if quant_variant is QuantVariant.NVFP4:
+    if per_token_activation and activation is not QuantFormat.NVFP4:
+        raise ValueError("per-token activation scaling requires NVFP4 activations")
+    if activation is QuantFormat.NVFP4:
         from flashinfer.quantization.fp4_quantization import (
             fp4_quantize,
             nvfp4_quantize,
@@ -223,15 +331,15 @@ def _quantize_and_pack(
         # the kernel index the scale tensor out of bounds → illegal memory access.
         if per_token_activation:
             from flashinfer.quantization.nvfp4_quantization_utils import (
-                current_nvfp4_4over6_config,
                 make_nvfp4_global_scale,
+                resolve_nvfp4_4over6,
             )
             from flashinfer.tllm_enums import SfLayout
 
             global_scale = make_nvfp4_global_scale(
                 flat,
                 per_token_activation=True,
-                nvfp4_4over6_config=current_nvfp4_4over6_config(),
+                nvfp4_4over6_config=resolve_nvfp4_4over6(),
             )
             hidden_states_q, hidden_states_scale, per_token_scale = nvfp4_quantize(
                 flat,
@@ -251,12 +359,45 @@ def _quantize_and_pack(
         # Runners expect a 2D [M, H//16] scale; fp4_quantize may return a trailing dim.
         if hidden_states_scale.dim() > 2:
             hidden_states_scale = hidden_states_scale.squeeze(-1)
-    elif quant_variant in (QuantVariant.BF16, QuantVariant.W4A16):
-        # BF16 and W4A16 runners consume the dispatched activations directly.
+    elif activation is QuantFormat.MXFP8:
+        from flashinfer.quantization.fp8_quantization import mxfp8_quantize
+
+        if mxfp8_dispatch:
+            if hidden_size is None:
+                raise ValueError("mxfp8_dispatch requires the logical hidden size")
+            send_width = packed_mxfp8_dispatch_width(hidden_size)
+            if flat.dtype != torch.bfloat16 or flat.shape[1] != send_width:
+                raise ValueError(
+                    f"packed MXFP8 input must be BF16 width {send_width}, got "
+                    f"{flat.dtype} width {flat.shape[1]}"
+                )
+            packed = flat.contiguous().view(torch.uint8)
+            hidden_states_q = (
+                packed[:, :hidden_size].contiguous().view(torch.float8_e4m3fn)
+            )
+            hidden_states_scale = packed[
+                :, hidden_size : hidden_size + hidden_size // 32
+            ].contiguous()
+        else:
+            hidden_states_q, hidden_states_scale = mxfp8_quantize(
+                flat.contiguous(), is_sf_swizzled_layout=False
+            )
+            hidden_states_scale = hidden_states_scale.view(torch.uint8).reshape(
+                flat.shape[0], flat.shape[1] // 32
+            )
+        if pair[0] is QuantFormat.MXFP4:
+            # W4A8 packs carry UE8M0 bytes in float8 storage. CuTe reinterprets
+            # them as uint8; TRT-LLM requires the float8 view.
+            hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn)
+    elif activation is QuantFormat.BF16:
+        # BF16 and both W4A16 encodings consume the dispatched activations.
         hidden_states_q = flat
         hidden_states_scale = None
     else:
-        raise ValueError(f"fused_moe split bridge does not support {quant_variant!r}")
+        raise ValueError(
+            f"fused_moe split bridge does not support weight={pair[0].name}, "
+            f"activation={pair[1].name}"
+        )
 
     return MoEActivationPack(
         hidden_states_q=hidden_states_q,
