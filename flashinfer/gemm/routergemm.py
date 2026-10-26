@@ -938,6 +938,7 @@ _TINYGEMM2_TCGEN05_TILES = {
     "PACKED": (32, 16),
     "ACCUMULATORS": (32, 64),
 }
+_NARROW_TILES = ("PACKED_NARROW", "PACKED_NARROW_U4", "PACKED_NARROW_FULL_STAGES")
 
 
 class _Tcgen05Window(NamedTuple):
@@ -969,6 +970,7 @@ class _Tcgen05Window(NamedTuple):
             and within(in_features, self.min_input_features, self.max_input_features)
             and within(out_features * in_features, self.min_weight_elements, None)
             and (not self.one_wave or packed_ctas <= sms)
+            and (self.tile not in _NARROW_TILES or in_features % 64 == 0)
         )
 
 
@@ -979,15 +981,16 @@ class _Tcgen05Window(NamedTuple):
 # kernel.  The bounds are the measured ranges.  Small weights stay on that kernel:
 # the tensor-memory allocation adds a fixed half microsecond to a launch that
 # takes four.  The narrow tiles serve up to 8 rows and up to 512 output features
-# over long inputs; their windows differ per architecture.  PACKED serves eight rows
-# or fewer only without a bias and from 2880 output features (90 CTAs).  With a
-# bias, tinygemm2_sm100 stays faster up to 27 rows except for PACKED on 9 to 16 rows
-# from 2880 output features and an input of 2112, and up to 32 rows below 1536
-# output features.  From 9 rows without a bias (28 with one) PACKED serves while its
-# grid fits one wave; past that ACCUMULATORS (64 rows per CTA) does.  On sm_107a
-# PACKED serves only 8 rows without a bias and 9 to 16 rows with one, from 3584
-# output features at inputs of 2112 to 6144, and with a bias 28 to 32 rows start at
-# 2048 output features.
+# over long inputs; their windows differ per architecture, and they serve only
+# inputs that are a multiple of 64 (128-byte rows): off that, some measured slower.
+# PACKED serves eight rows or fewer only without a bias and from 2880 output
+# features (90 CTAs).  With a bias, tinygemm2_sm100 stays faster up to 27 rows
+# except for PACKED on 9 to 16 rows from 2880 output features and an input of 2112,
+# and up to 32 rows below 1536 output features.  From 9 rows without a bias (28 with
+# one) PACKED serves while its grid fits one wave; past that ACCUMULATORS (64 rows
+# per CTA) does.  On sm_107a PACKED serves only 8 rows without a bias and 9 to 16
+# rows with one, from 3584 output features at inputs of 2112 to 6144, and with a
+# bias 28 to 32 rows start at 2048 output features.
 _LARGE_WEIGHT = 6_000_000
 _MANY_ROWS_NOBIAS = (
     _Tcgen05Window(

@@ -137,6 +137,7 @@ def test_tinygemm2_tcgen05_bitwise_parity(
 SM100_FAMILY_ROUTES = [
     # PACKED up to eight rows: no bias, 2880 to 4096 output features, K at most 6144
     (1, 2880, 2112, False, "PACKED"),
+    (1, 2880, 2120, False, "PACKED"),
     (4, 2880, 2880, False, "PACKED"),
     (8, 4096, 4096, False, "PACKED"),
     (8, 2864, 4096, False, None),
@@ -188,6 +189,7 @@ SM100_NARROW_ROUTES = [
     (1, 512, 9216, True, None),
     (2, 32, 7168, True, None),
     (2, 128, 4096, True, None),
+    (2, 128, 12296, True, None),
     (2, 256, 3584, True, "PACKED_NARROW"),
     (3, 32, 3584, True, "PACKED_NARROW"),
     (3, 32, 7168, True, "PACKED_NARROW"),
@@ -286,6 +288,7 @@ SM103_NARROW_ROUTES = [
     (4, 448, 7168, True, None),
     (4, 512, 20480, True, "PACKED_NARROW_FULL_STAGES"),
     (6, 320, 2048, True, None),
+    (6, 288, 3400, True, None),
     (6, 320, 4096, True, "PACKED_NARROW_FULL_STAGES"),
     (6, 384, 3584, True, "PACKED_NARROW_FULL_STAGES"),
     (6, 384, 20480, True, "PACKED_NARROW_FULL_STAGES"),
@@ -347,6 +350,7 @@ SM107_ROUTES = [
     (7, 320, 16384, True, "PACKED_NARROW_U4"),
     (3, 512, 4096, True, "PACKED_NARROW_U4"),
     (3, 512, 16384, False, "PACKED_NARROW_U4"),
+    (3, 512, 16392, False, None),
     (4, 384, 16384, False, "PACKED_NARROW_U4"),
     (5, 384, 16384, False, "PACKED_NARROW_U4"),
     (2, 512, 16384, False, "PACKED_NARROW_U4"),
