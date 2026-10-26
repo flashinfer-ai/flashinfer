@@ -23,11 +23,18 @@ device translation unit plus a tvm-ffi binding, compiled once per
 architecture.  The records are keyed by name and each names the stage it fills
 (``stage``, one of ``STAGES``: ``decode``, the persistent decode, one cluster
 of CTAs per work unit; ``reduce``, the split-KV combine, launched only when the
-plan has more than one split).  The decode stage has two records: ``decode``
-and ``decode_qk_ahead``, an SM100 decode (the QK MMAs issued two tiles ahead of
-PV) that the host's ``select_decode_record`` picks for long balanced plans; the
-two programs' outputs are bitwise identical.  A renamed program still changes
-no host code.  A record carries the host plan only: the
+plan has more than one split).  Each stage may have further records, which
+the host picks once per plan; the programs of one stage give bitwise
+identical outputs.  The decode stage's are ``decode_qk_ahead``, an SM100
+decode (the QK MMAs issued two tiles ahead of PV) that
+``select_decode_record`` picks for long balanced plans, and
+``decode_short``, a decode that reads its unit range in the kernel setup and
+frees its tensor memory once the last epilogue has read it, which
+``select_decode_record`` picks for plans of short units; the combine's is
+``reduce_general``, a combine that reads the first pair of splits of a row
+from its top loads, which ``select_reduce_record`` picks for plans of more
+than two splits per row.  A renamed program still changes no host code.  A
+record carries the host plan only: the
 program's ``library`` stem (its ``build.json`` entries are
 ``<library>_<arch>``), the architectures it is delivered for, the source
 ``module`` and ``build`` keywords it was rendered from, its launch record, the
@@ -60,8 +67,9 @@ The program name ``cake_nvfp4_mla_decode_<20 hex>`` is the first twenty hex
 digits of the SHA-256 of the compact JSON ``{"build": <build keywords, sorted,
 every default spelled>, "module": <dotted source module>}`` of the kernel the
 program was rendered from; a changed keyword is a new program.  The exception
-is a keyword at its implicit default (``qk_ahead`` at ``False``): the name
-omits it, so programs named before the keyword existed keep their names.
+is a keyword at its implicit default (``qk_ahead``, ``short_rows`` and
+``general_splits`` at ``False``): the name omits it, so programs named before
+the keyword existed keep their names.
 """
 
 from __future__ import annotations
@@ -263,6 +271,93 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "decode",
         "tile_kv": 128,
     },
+    "decode_short": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["tma_buffer", "Q"],
+            ["tma_buffer", "QS"],
+            ["tma_buffer", "KV"],
+            ["tma_buffer", "KVS"],
+            ["tma_buffer", "OT"],
+            ["tma_buffer", "PO"],
+            ["buffer", "O"],
+            ["buffer", "LSE"],
+            ["buffer", "partial_o"],
+            ["buffer", "partial_lse"],
+            ["buffer", "work_table"],
+            ["buffer", "unit_first"],
+            ["buffer", "page_table"],
+            ["buffer", "seq_lens"],
+            ["buffer", "q_indptr"],
+            ["buffer", "sinks"],
+            ["parameter", "rows_total"],
+            ["parameter", "num_heads"],
+            ["parameter", "q_len"],
+            ["parameter", "max_pages"],
+            ["parameter", "max_splits"],
+            ["parameter", "scale_log2"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "lazy_rescale": True,
+            "num_p_stages": 2,
+            "num_raw_stages": 3,
+            "num_v_stages": 2,
+            "short_rows": True,
+        },
+        "ffi_entry": "run",
+        "flag_direct_out": 2,
+        "flag_seed_sink": 1,
+        "grid_rule": {
+            "ctas": 2,
+            "kind": "units_by_cluster",
+        },
+        "item_fields": 8,
+        "kernel": "cake_nvfp4_mla_decode_7d6b9ae94df533a027ea",
+        "kernel_symbol": "kernel_cake_nvfp4_mla_decode_7d6b9ae94df533a027ea",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (2, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 222208,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_mla_decode_7d6b9ae94df533a027ea",
+        "logical": {
+            "KV": "KV",
+            "KVS": "KVS",
+            "LSE": "LSE",
+            "O": "O",
+            "OT": "OT",
+            "PO": "PO",
+            "Q": "Q",
+            "QS": "QS",
+            "max_pages": "max_pages",
+            "max_splits": "max_splits",
+            "num_heads": "num_heads",
+            "page_table": "page_table",
+            "partial_lse": "partial_lse",
+            "partial_o": "partial_o",
+            "q_indptr": "q_indptr",
+            "q_len": "q_len",
+            "rows_total": "rows_total",
+            "scale_log2": "scale_log2",
+            "seq_lens": "seq_lens",
+            "sinks": "sinks",
+            "unit_first": "unit_first",
+            "work_table": "work_table",
+        },
+        "module": "tart.mla_decode_dsv4_dense_nvfp4.sm100_sm103.dsv4_nvfp4_fmha_decode",
+        "page_size": 64,
+        "rows_per_tile": 128,
+        "stage": "decode",
+        "tile_kv": 128,
+    },
     "reduce": {
         "arches": [
             "sm_100a",
@@ -311,6 +406,54 @@ MODULES: dict[str, dict[str, Any]] = {
         "module": "tart.attention_split_kv_merge_bf16_rowsplits_with_lse.sm100_sm103.dsv4_nvfp4_fmha_decode_reduce",
         "stage": "reduce",
     },
+    "reduce_general": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "o"],
+            ["buffer", "lse"],
+            ["buffer", "partial_o"],
+            ["buffer", "partial_lse"],
+            ["buffer", "row_splits"],
+            ["parameter", "total_q"],
+            ["parameter", "num_heads"],
+            ["parameter", "max_splits"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {"general_splits": True},
+        "ffi_entry": "run",
+        "grid_rule": {
+            "heads_per_cta": 16,
+            "kind": "rows_by_heads",
+        },
+        "kernel": "cake_nvfp4_mla_decode_d3e21f744c0427fef73d",
+        "kernel_symbol": "kernel_cake_nvfp4_mla_decode_d3e21f744c0427fef73d",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_mla_decode_d3e21f744c0427fef73d",
+        "logical": {
+            "lse": "lse",
+            "max_splits": "max_splits",
+            "num_heads": "num_heads",
+            "o": "o",
+            "partial_lse": "partial_lse",
+            "partial_o": "partial_o",
+            "row_splits": "row_splits",
+            "total_q": "total_q",
+        },
+        "max_splits": 64,
+        "module": "tart.attention_split_kv_merge_bf16_rowsplits_with_lse.sm100_sm103.dsv4_nvfp4_fmha_decode_reduce",
+        "stage": "reduce",
+    },
 }
 
 
@@ -340,8 +483,8 @@ def device_arch(device_index: int) -> str:
 
 def program_available(arch: str) -> bool:
     """True when the record named after every stage is delivered for ``arch``
-    (``decode_qk_ahead`` is an optional second decode the host selects only
-    where it is delivered)."""
+    (a stage's further records are optional programs the host selects only
+    where they are delivered)."""
     return all(
         stage in MODULES and arch in MODULES[stage]["arches"] for stage in STAGES
     )
