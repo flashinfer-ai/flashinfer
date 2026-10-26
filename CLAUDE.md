@@ -290,6 +290,15 @@ Replay an old capture only with lengths inside its declared bounds and compatibl
 buffers. Keep numerical and lifetime tests independent of heuristic winners and
 timing thresholds.
 
+Valid attention lengths and physical ragged offsets are separate operands:
+`seq_lens_q` can be shorter than its query slot. Infer lengths from adjacent
+offsets only when lengths were omitted. Test explicit/default length transitions
+against a compacted reference while replaying the original graph; switching
+mask representations must not strand a captured pointer. Keep token-offset
+units independent of whether the mask uses lengths or cumulative lengths, and
+include that distinction in graph descriptors and override shapes. Provider
+controls need an isolated real graph cache and an actual selected-engine check.
+
 FA2 captures also bind CPU-generated scheduling metadata, including output and
 merge prefixes. Updating only Q/KV indptr tensors after switching to cuDNN leaves
 that schedule stale when requests exchange query rows. In graph mode, keep FA2
