@@ -30,6 +30,9 @@
 #   FP8_ACCUM_MODE=2xacc bash ... --scale-mode per-tensor
 #   FP8_NON_SWAP_M=64 FP8_NON_SWAP_N=128 bash .../run_functional_tests.sh M1
 #   FP8_SWAP_AB_M=256 FP8_SWAP_AB_N=32 bash .../run_functional_tests.sh --swapab M1
+#   FP8_TAIL_SPLIT=1 appends --tail_split_pairs (needs a 2-CTA token cluster:
+#   FP8_CLUSTER_SHAPE=1,2,1 with --swapab or 2,1,1 without), e.g.
+#   FP8_TAIL_SPLIT=1 FP8_CLUSTER_SHAPE=1,2,1 bash .../run_functional_tests.sh --swapab
 #
 # Selective execution (positional args; substring match against test names,
 # OR-combined across multiple selectors):
@@ -195,6 +198,29 @@ case "$FP8_CLUSTER_SHAPE" in
         ;;
 esac
 
+# FP8_TAIL_SPLIT=1: the whole run shares one geometry, so reject an
+# incompatible cluster shape up front.
+FP8_TAIL_SPLIT="${FP8_TAIL_SPLIT:-0}"
+declare -a TAIL_SPLIT_ARGS=()
+case "$FP8_TAIL_SPLIT" in
+    1)
+        if { [ "$SWAP_AB" -eq 1 ] && [ "$FP8_CLUSTER_SHAPE" = "1,2,1" ]; } \
+            || { [ "$SWAP_AB" -eq 0 ] && [ "$FP8_CLUSTER_SHAPE" = "2,1,1" ]; }; then
+            TAIL_SPLIT_ARGS=(--tail_split_pairs)
+        else
+            echo "ERROR: FP8_TAIL_SPLIT=1 requires FP8_CLUSTER_SHAPE=1,2,1 with --swapab or FP8_CLUSTER_SHAPE=2,1,1 without it (got swap_ab=$SWAP_AB, cluster $FP8_CLUSTER_SHAPE)" >&2
+            exit 2
+        fi
+        ;;
+    0)
+        ;;
+    *)
+        echo "ERROR: FP8_TAIL_SPLIT must be 0 or 1" >&2
+        exit 2
+        ;;
+esac
+export FP8_TAIL_SPLIT
+
 # Returns 0 (true) if the test name matches any selector, OR if the selector
 # list is empty (default = run all).
 test_matches_selectors() {
@@ -353,6 +379,9 @@ for index in "${!ACTIVE_NAMES[@]}"; do
         if [ "$PINGPONG" -eq 1 ]; then
             case_tile_args=(--pingpong "${case_tile_args[@]}")
         fi
+        if [ "${#TAIL_SPLIT_ARGS[@]}" -gt 0 ]; then
+            case_tile_args+=("${TAIL_SPLIT_ARGS[@]}")
+        fi
 
         if ! test_matches_selectors "$full_name"; then
             SKIP_COUNT=$((SKIP_COUNT + 1))
@@ -362,7 +391,7 @@ for index in "${!ACTIVE_NAMES[@]}"; do
         echo
         echo "==========================================================================="
         echo "[TEST] $full_name"
-        echo "[MODE] scale=$SCALE_MODE accum=$accum_mode swap_ab=$case_swap_ab pingpong=$PINGPONG tile=${tile_m},${tile_n},128"
+        echo "[MODE] scale=$SCALE_MODE accum=$accum_mode swap_ab=$case_swap_ab pingpong=$PINGPONG tile=${tile_m},${tile_n},128 tail_split=$FP8_TAIL_SPLIT"
         echo "[CMD]  $PYTHON $RUNNER $args --fp8_scale_mode $SCALE_MODE --fp8_accum_mode $accum_mode ${case_tile_args[*]}"
         echo "==========================================================================="
 

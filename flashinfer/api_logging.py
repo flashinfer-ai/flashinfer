@@ -32,6 +32,27 @@ import importlib
 import torch
 
 
+def _warn_from_external_caller(message: str, category: type[Warning]) -> None:
+    """Emit a warning at the first caller outside the FlashInfer package.
+
+    Callers own warning messages, categories and any deduplication. Walking the
+    frames keeps attribution independent of internal decorators and helpers.
+    """
+    frame = inspect.currentframe()
+    stacklevel = 1
+    package = __package__
+    try:
+        while frame is not None:
+            module = frame.f_globals.get("__name__", "")
+            if module != package and not module.startswith(package + "."):
+                break
+            stacklevel += 1
+            frame = frame.f_back
+    finally:
+        del frame
+    warnings.warn(message, category, stacklevel=stacklevel)
+
+
 # Helper function to substitute %i with process ID in file paths
 def _substitute_process_id(path: str) -> str:
     """

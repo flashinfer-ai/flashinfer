@@ -280,7 +280,7 @@ class SmemSfBResource(MemoryResource):
             self.cfg.num_bytes_sfb_per_stage * stage_info.stage_idx
         )
         if prims.elect_sync():
-            if cutlass.const_expr(self.cfg.use_tile256_tmem_overlap):
+            if cutlass.const_expr(self.cfg.uses_rank4_sfb_tma):
                 outer_tile = coord_sfb_mn * Int32((self.cfg.tile_n + 127) // 128)
                 self._tma_load(
                     stage_base,
@@ -294,14 +294,6 @@ class SmemSfBResource(MemoryResource):
                     stage_base,
                     self.tma_sfb_desc,
                     (Int32(0), sfk_block, outer_tile),
-                    stage_info.barrier,
-                )
-            elif cutlass.const_expr(self.cfg.is_mx_mma):
-                outer_tile = coord_sfb_mn * Int32((self.cfg.tile_n + 127) // 128)
-                self._tma_load(
-                    stage_base,
-                    self.tma_sfb_desc,
-                    (Int32(0), Int32(0), sfk_block, outer_tile),
                     stage_info.barrier,
                 )
             else:
@@ -509,8 +501,10 @@ class SmemSfGatherResource(MemoryResource):
         return local_limit
 
     @cute.jit
-    def _load_routed_row_or_zero(self, route_idx, row_in_tile, tile_limit):
-        routed_row = Int32(0)
+    def _load_routed_row_or_oob(self, route_idx, row_in_tile, tile_limit):
+        # An out-of-bounds coordinate requests TMA zero-fill for padding.
+        # Reusing token 0 creates concentrated reads that can slow down FC1.
+        routed_row = Int32(-1)
         if row_in_tile < tile_limit:
             routed_row = self.route_map.load(idx=route_idx, vector_size=1)[0]
         return cute.arch.make_warp_uniform(routed_row)
@@ -542,7 +536,10 @@ class SmemSfGatherResource(MemoryResource):
         tile_limit = Int32(tile_rows)
         if cutlass.const_expr(self.mn_limit is not None):
             tile_limit = self._local_tile_limit(
-                self.mn_limit.load(idx=token_tile, vector_size=1)[0],
+                self.mn_limit.load(
+                    idx=token_tile // Int32(self.cfg.token_metadata_stride),
+                    vector_size=1,
+                )[0],
                 token_tile,
                 tile_rows,
             )
@@ -557,16 +554,16 @@ class SmemSfGatherResource(MemoryResource):
             if is_valid_gather:
                 base_row = coord_mn + gi * Int32(4)
                 row_base = gi * Int32(4)
-                self.routed_rows[wi * 4] = self._load_routed_row_or_zero(
+                self.routed_rows[wi * 4] = self._load_routed_row_or_oob(
                     base_row, row_base, tile_limit
                 )
-                self.routed_rows[wi * 4 + 1] = self._load_routed_row_or_zero(
+                self.routed_rows[wi * 4 + 1] = self._load_routed_row_or_oob(
                     base_row + Int32(1), row_base + Int32(1), tile_limit
                 )
-                self.routed_rows[wi * 4 + 2] = self._load_routed_row_or_zero(
+                self.routed_rows[wi * 4 + 2] = self._load_routed_row_or_oob(
                     base_row + Int32(2), row_base + Int32(2), tile_limit
                 )
-                self.routed_rows[wi * 4 + 3] = self._load_routed_row_or_zero(
+                self.routed_rows[wi * 4 + 3] = self._load_routed_row_or_oob(
                     base_row + Int32(3), row_base + Int32(3), tile_limit
                 )
 
@@ -983,7 +980,10 @@ class SmemSfLdgstsResource(MemoryResource):
         else:
             tile_limit_idx = coord_mn
         self.tile_limit = self._local_tile_limit(
-            self.mn_limit.load(idx=tile_limit_idx, vector_size=1)[0],
+            self.mn_limit.load(
+                idx=tile_limit_idx // Int32(self.cfg.token_metadata_stride),
+                vector_size=1,
+            )[0],
             tile_limit_idx,
             tile_rows,
         )

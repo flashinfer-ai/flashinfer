@@ -697,7 +697,6 @@ def test_optional_dependency_comm_apis_skip_instead_of_xfailing():
         comm.vllm_dispose,
         comm.vllm_register_buffer,
         comm.vllm_register_graph_buffers,
-        comm.MoeAlltoAll.dispatch,
     ],
     ids=lambda api: api.__qualname__,
 )

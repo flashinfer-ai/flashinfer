@@ -63,7 +63,7 @@ def _admission_worker(world_size: int, rank: int, port: int, scenario: str) -> N
                 # access its absent capability field.
                 all(entry["memop_supported"] for entry in entries)
         elif scenario == "argument_mismatch":
-            with pytest.raises(ValueError, match="identical arguments"):
+            with pytest.raises(ValueError, match="identical collective arguments"):
                 workspace._joint_check(
                     {"error": None, "max_numel": 8 * (rank + 1)},
                     "validating arguments",

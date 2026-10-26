@@ -42,7 +42,7 @@ HAS_PRIMS_TS_RUNTIME = ensure_cutlass_dsl_experimental()
 # The reach is transitive, not direct: ``batched_gemm_config`` does an unguarded
 # module-level ``from cutlass.experimental import primitives``, so every module
 # importing it inherits the requirement. That is all ten ``test_batched_gemm_*``
-# modules plus the three MoE modules below. Follow the chain all the way down --
+# modules plus the MoE modules below. Follow the chain all the way down --
 # ``test_moe_compile_cache`` is three hops from anything named after a GEMM
 # (``batched_gemm_run`` -> ``batched_gemm_quant`` -> ``batched_gemm_config``),
 # and stopping at the first hop is what left it off this list originally.
@@ -55,6 +55,7 @@ HAS_PRIMS_TS_RUNTIME = ensure_cutlass_dsl_experimental()
 if not HAS_PRIMS_TS_RUNTIME:
     collect_ignore_glob = ["test_batched_gemm_*.py"]
     collect_ignore = [
+        "test_moe_bf16_prefill_tiles.py",
         "test_moe_bf16_support.py",
         "test_moe_compile_cache.py",
         "test_moe_nvfp4_support.py",
@@ -92,7 +93,9 @@ def pytest_collection_modifyitems(config, items):
 @pytest.fixture(autouse=True)
 def _scope_exhaustive_schedule_checker(monkeypatch, request):
     test_path = Path(str(request.node.path))
-    if test_path.name.startswith("test_batched_gemm_"):
+    # Dense GEMM (test_gemm_*) and batched GEMM compile TaskManager with
+    # validation and the exhaustive checker. Other Prims-TS tests leave both off.
+    if test_path.name.startswith(("test_batched_gemm_", "test_gemm_")):
         monkeypatch.setenv("FLASHINFER_PRIMS_TS_DEBUG_CHECKS", "1")
     else:
         monkeypatch.setenv("FLASHINFER_PRIMS_TS_DEBUG_CHECKS", "0")

@@ -17,7 +17,7 @@ def _require_cuda():
 @pytest.mark.arch_blackwell
 def test_bf16_megamoe_public_reference_is_lazy():
     """Keep the CPU import boundary free of the CuTeDSL reference dependency."""
-    import flashinfer.moe_ep.kernel_src.cutedsl_megamoe as megamoe
+    import flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe as megamoe
 
     assert callable(megamoe.get_symm_buffer_for_bf16_mega_moe)
     assert callable(megamoe.bf16_mega_moe)
@@ -39,7 +39,7 @@ def test_bf16_kernel_matches_mega_reference(monkeypatch):
     from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_bf16_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         bf16_mega_moe,
         compute_megamoe_reference_bf16,
         get_symm_buffer_for_bf16_mega_moe,
@@ -102,7 +102,7 @@ def test_bf16_kernel_matches_mega_reference(monkeypatch):
             fc1_weight=transformed_l1[0].unsqueeze(0),
             fc2_weight=transformed_l2[0].unsqueeze(0),
             ref_compute_graph="deepgemm",
-            apply_topk_in_fc1=True,
+            apply_routing_weights_before_fc2=True,
         )
         y_ref = combine_ref[0].to(torch.float32).sum(dim=1)
         y_kernel = torch.empty(num_tokens, hidden, dtype=torch.bfloat16, device="cuda")

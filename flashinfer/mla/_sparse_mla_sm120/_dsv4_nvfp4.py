@@ -35,8 +35,15 @@ from ...utils import (
 
 from ._execution import (
     dsv4_nvfp4_format_info,
+    get_sparse_mla_dsv4_nvfp4_cache_ops_module,
     get_sparse_mla_dsv4_nvfp4_module,
 )
+
+# DSv4 NVFP4 cache ABI constants (static_asserted in
+# include/flashinfer/attention/sparse_mla_sm120/kernels/dsv4_nvfp4/resources.cuh); the cache helpers
+# use them directly so that SM100 / SM103 never build the SM120 attention module.
+_DSV4_LATENT_DIM = 512
+_DSV4_NVFP4_BYTES_PER_TOKEN = 384
 
 
 @functools.cache
@@ -68,6 +75,7 @@ def get_sparse_mla_nvfp4_sm120_module():
         extra_topk_length: torch.Tensor | None,
         use_prefill: bool,
         chunks_per_block_override: int,
+        lse_scale: float = 1.0,
     ) -> None:
         if not use_prefill:
             if mid_out is None or mid_lse is None:
@@ -92,6 +100,7 @@ def get_sparse_mla_nvfp4_sm120_module():
                 extra_topk_length,
                 chunks_per_block_override,
                 False,
+                lse_scale,
             )
         else:
             module.sparse_mla_sm120_nvfp4_prefill(
@@ -106,6 +115,7 @@ def get_sparse_mla_nvfp4_sm120_module():
                 extra_kv_cache,
                 extra_indices,
                 extra_topk_length,
+                lse_scale,
             )
 
     @register_fake_op("flashinfer::sparse_mla_nvfp4_sm120_paged_attention")
@@ -139,6 +149,7 @@ def _sparse_mla_nvfp4_sm120_paged_attention(
     mid_lse: torch.Tensor | None = None,
     use_prefill: bool,
     chunks_per_block_override: int = 0,
+    lse_scale: float = 1.0,
 ) -> None:
     """Run the allocation-free NVFP4 sparse-MLA custom op."""
     get_sparse_mla_nvfp4_sm120_module().paged_attention(
@@ -157,6 +168,7 @@ def _sparse_mla_nvfp4_sm120_paged_attention(
         extra_topk_length,
         use_prefill,
         chunks_per_block_override,
+        lse_scale,
     )
 
 
@@ -171,13 +183,13 @@ def _check_latent_kv(latent_kv: torch.Tensor, *, expected_rows: int | None) -> i
         raise ValueError(
             f"latent_kv must be 2D, 3D, or 4D, got shape={tuple(latent_kv.shape)}"
         )
-    if latent_kv.shape[-1] != dsv4_nvfp4_format_info()["query_dim"]:
+    if latent_kv.shape[-1] != _DSV4_LATENT_DIM:
         raise ValueError(
-            f"latent_kv last dimension must be {dsv4_nvfp4_format_info()['query_dim']}, got {latent_kv.shape[-1]}"
+            f"latent_kv last dimension must be {_DSV4_LATENT_DIM}, got {latent_kv.shape[-1]}"
         )
     if not latent_kv.is_contiguous():
         raise ValueError("latent_kv must be contiguous")
-    rows = latent_kv.numel() // dsv4_nvfp4_format_info()["query_dim"]
+    rows = latent_kv.numel() // _DSV4_LATENT_DIM
     if expected_rows is not None and rows != expected_rows:
         raise ValueError(
             f"latent_kv contains {rows} rows, expected {expected_rows} rows"
@@ -190,10 +202,7 @@ def _cache_shape(cache: torch.Tensor) -> tuple[int, int, str]:
         raise ValueError(f"cache must be a CUDA tensor, got {cache.device}")
     if cache.dtype != torch.uint8:
         raise ValueError(f"cache must have dtype torch.uint8, got {cache.dtype}")
-    if (
-        cache.ndim not in (3, 4)
-        or cache.shape[-1] != dsv4_nvfp4_format_info()["bytes_per_token"]
-    ):
+    if cache.ndim not in (3, 4) or cache.shape[-1] != _DSV4_NVFP4_BYTES_PER_TOKEN:
         raise ValueError(
             "cache must be [num_pages, page_size, 384], HND "
             "[num_pages, 1, page_size, 384], or NHD "
@@ -210,15 +219,12 @@ def _cache_shape(cache: torch.Tensor) -> tuple[int, int, str]:
             "cache must have a singleton latent-head dimension at axis 1 or 2"
         )
     page_dim = 1 if cache.ndim == 3 or layout == "NHD" else 2
-    if (
-        cache.stride(-1) != 1
-        or cache.stride(page_dim) != dsv4_nvfp4_format_info()["bytes_per_token"]
-    ):
+    if cache.stride(-1) != 1 or cache.stride(page_dim) != _DSV4_NVFP4_BYTES_PER_TOKEN:
         raise ValueError(
             "cache entries must be contiguous inside each page with strides "
-            f"(..., {dsv4_nvfp4_format_info()['bytes_per_token']}, 1), got {cache.stride()}"
+            f"(..., {_DSV4_NVFP4_BYTES_PER_TOKEN}, 1), got {cache.stride()}"
         )
-    if cache.stride(0) < page_size * dsv4_nvfp4_format_info()["bytes_per_token"]:
+    if cache.stride(0) < page_size * _DSV4_NVFP4_BYTES_PER_TOKEN:
         raise ValueError(
             "cache page stride must cover the logical page payload, got "
             f"stride(0)={cache.stride(0)} for page_size={page_size}"
@@ -226,7 +232,7 @@ def _cache_shape(cache: torch.Tensor) -> tuple[int, int, str]:
     return int(num_pages), int(page_size), layout
 
 
-@supported_compute_capability([120, 121])
+@supported_compute_capability([100, 103, 120, 121])
 @flashinfer_api
 def nvfp4_quantize_pack_sparse_mla_cache(
     latent_kv: torch.Tensor,
@@ -234,6 +240,9 @@ def nvfp4_quantize_pack_sparse_mla_cache(
     kv_layout: str = "HND",
 ) -> torch.Tensor:
     r"""Quantize complete DeepSeek-V4 latent-KV pages to the NVFP4 cache ABI.
+
+    Runs on SM100 / SM103 (consumed by ``backend="cake"``) and SM120 / SM121
+    (``backend="sparse"``); the packed bytes are identical on every architecture.
 
     Parameters
     ----------
@@ -278,20 +287,20 @@ def nvfp4_quantize_pack_sparse_mla_cache(
 
     _check_latent_kv(latent_kv, expected_rows=int(num_pages) * int(page_size))
     cache_shape = (
-        (num_pages, 1, page_size, dsv4_nvfp4_format_info()["bytes_per_token"])
+        (num_pages, 1, page_size, _DSV4_NVFP4_BYTES_PER_TOKEN)
         if kv_layout == "HND"
-        else (num_pages, page_size, 1, dsv4_nvfp4_format_info()["bytes_per_token"])
+        else (num_pages, page_size, 1, _DSV4_NVFP4_BYTES_PER_TOKEN)
     )
     cache = torch.empty(cache_shape, dtype=torch.uint8, device=latent_kv.device)
     if int(num_pages) == 0 or int(page_size) == 0:
         return cache
-    get_sparse_mla_dsv4_nvfp4_module().sparse_mla_sm120_nvfp4_quantize_pack(
+    get_sparse_mla_dsv4_nvfp4_cache_ops_module().sparse_mla_sm120_nvfp4_quantize_pack(
         latent_kv, cache
     )
     return cache
 
 
-@supported_compute_capability([120, 121])
+@supported_compute_capability([100, 103, 120, 121])
 @flashinfer_api
 def nvfp4_quantize_append_sparse_mla_cache(
     latent_kv: torch.Tensor,
@@ -336,7 +345,7 @@ def nvfp4_quantize_append_sparse_mla_cache(
     if num_pages * page_size == 0 and slot_mapping.numel() != 0:
         raise ValueError("cannot append to an empty cache")
 
-    get_sparse_mla_dsv4_nvfp4_module().sparse_mla_sm120_nvfp4_quantize_append(
+    get_sparse_mla_dsv4_nvfp4_cache_ops_module().sparse_mla_sm120_nvfp4_quantize_append(
         latent_kv, slot_mapping, cache
     )
 
@@ -389,10 +398,13 @@ def _nvfp4_sparse_mla_decode(
     extra_topk_length: torch.Tensor | None = None,
     chunks_per_block_override: int = 0,
     stage1_only: bool = False,
+    lse_scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return final output and LSE from DeepSeek-V4 NVFP4 sparse-MLA decode.
 
-    Empty-KV output/LSE and sink semantics follow :meth:`SparseMLASm120Wrapper.run`.
+    ``lse_scale`` multiplies final base-2 LSE only; split-K scratch stays
+    base-2. Empty-KV output/LSE and sink semantics follow
+    :meth:`SparseMLASm120Wrapper.run`.
     """
     if stage1_only:
         raise ValueError(
@@ -444,6 +456,7 @@ def _nvfp4_sparse_mla_decode(
         extra_topk_length,
         chunks_per_block_override,
         stage1_only,
+        lse_scale,
     )
     return output, out_lse
 
@@ -460,10 +473,13 @@ def _nvfp4_sparse_mla_prefill(
     extra_kv_cache: torch.Tensor | None = None,
     extra_indices: torch.Tensor | None = None,
     extra_topk_length: torch.Tensor | None = None,
+    lse_scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the single-launch streaming DeepSeek-V4 NVFP4 prefill kernel.
 
-    Empty-KV output/LSE and sink semantics follow :meth:`SparseMLASm120Wrapper.run`.
+    ``lse_scale`` multiplies final base-2 LSE only; split-K scratch stays
+    base-2. Empty-KV output/LSE and sink semantics follow
+    :meth:`SparseMLASm120Wrapper.run`.
     """
     if q.ndim != 3 or q.shape[-1] != dsv4_nvfp4_format_info()["query_dim"]:
         raise ValueError(
@@ -492,6 +508,7 @@ def _nvfp4_sparse_mla_prefill(
         extra_kv_cache,
         extra_indices,
         extra_topk_length,
+        lse_scale,
     )
     return output, out_lse
 

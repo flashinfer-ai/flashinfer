@@ -23,10 +23,12 @@ def _skip_if_not_sm100():
 
 
 def _skip_if_not_sm100_or_103():
-    """Gate for kernels that run only on Blackwell proper (SM100/SM103)."""
+    """Gate for kernels that run on the SM100 family (SM100/SM103/SM107)."""
     major, minor = _cc()
-    if (major, minor) not in ((10, 0), (10, 3)):
-        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    if (major, minor) not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip(
+            "These tests are only guaranteed to work on SM100, SM103 and SM107 GPUs."
+        )
 
 
 def _check(template, reference_outputs, actual_outputs, **thresholds) -> None:
@@ -50,6 +52,18 @@ def _init_filtered(template, **kwargs):
     sig = inspect.signature(template.init)
     accepted = set(sig.parameters)
     return template.init(**{k: v for k, v in kwargs.items() if k in accepted})
+
+
+def _unswizzle_mxfp8_scales_128x4(sf: torch.Tensor, row: int, col: int) -> torch.Tensor:
+    """Invert the 128x4 swizzle to a plain ``[row, col // 32]`` scale grid."""
+    scale_vec_size = 32
+    factor = scale_vec_size * 4
+    num_m_tiles = (row + 128 - 1) // 128
+    num_k_tiles = (col + factor - 1) // factor
+    sf_reshaped = sf.reshape(num_m_tiles, num_k_tiles, 32, 4, 4)
+    sf_unswizzled = sf_reshaped.transpose(1, 3)
+    sf_unswizzled = sf_unswizzled.reshape(num_m_tiles * 32 * 4, num_k_tiles * 4)
+    return sf_unswizzled[:row, : (col // scale_vec_size)].contiguous()
 
 
 def _assert_finite(*tensors: torch.Tensor) -> None:

@@ -1,15 +1,18 @@
 import abc
 import dataclasses
 import functools
+import json
 import logging
 import os
 import threading
+import time
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import (
     Any,
     Callable,
+    ClassVar,
     Dict,
     Hashable,
     List,
@@ -103,6 +106,36 @@ class FlashInferJITLogger(logging.Logger):
 
 
 logger = FlashInferJITLogger("flashinfer.jit")
+
+
+def _record_jit_build(toolchain: str, name: str, seconds: float) -> None:
+    """Append one build's wall time to ``FLASHINFER_JIT_BUILD_LOG`` as JSONL.
+
+    Lets CI attribute compile time to each toolchain. A single ``O_APPEND``
+    write of one short line keeps concurrent test processes from
+    interleaving records. Builds that find everything up to date (ninja
+    no-ops) are recorded too; their near-zero times show up as such.
+    """
+    log_path = os.environ.get("FLASHINFER_JIT_BUILD_LOG")
+    if not log_path:
+        return
+    line = json.dumps(
+        {
+            "toolchain": toolchain,
+            "name": name,
+            "seconds": round(seconds, 3),
+            "pid": os.getpid(),
+            "time": round(time.time(), 3),
+        }
+    )
+    try:
+        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, (line + "\n").encode())
+        finally:
+            os.close(fd)
+    except OSError as e:
+        logger.warning_once("Cannot write JIT build log %s: %s", log_path, str(e))
 
 
 def refresh_current_compilation_context() -> CompilationContext:
@@ -282,6 +315,8 @@ class JitSpec(abc.ABC):
     """
 
     name: str
+    # Label for build timing records (FLASHINFER_JIT_BUILD_LOG).
+    toolchain: ClassVar[str] = "unknown"
 
     @property
     @abc.abstractmethod
@@ -354,8 +389,13 @@ class JitSpec(abc.ABC):
                     spec=self,
                 )
 
-            self.build()
+            self._timed_build()
             return self.load()
+
+    def _timed_build(self) -> None:
+        started = time.perf_counter()
+        self.build()
+        _record_jit_build(self.toolchain, self.name, time.perf_counter() - started)
 
 
 class _HeterogeneousAOTModule:
@@ -434,9 +474,16 @@ class _HeterogeneousAOTModule:
     def __getitem__(self, key: Any) -> Any:
         return self._get_dispatched_attribute(lambda module: module[key])
 
+    def _resolve_for_current_device(self) -> Any:
+        """Resolve an AOT copy or build the fallback before a captured call."""
+        return self._select_attribute(
+            lambda module: module, self._loaded_modules, (), {}
+        )
+
 
 @dataclasses.dataclass
 class JitSpecNvcc(JitSpec):
+    toolchain: ClassVar[str] = "nvcc"
     name: str
     sources: List[Path]
     extra_cflags: Optional[List[str]]
@@ -447,6 +494,7 @@ class JitSpecNvcc(JitSpec):
     needs_device_linking: bool = False
     post_load_adapter: Optional[Callable[[Any], Any]] = None
     embedded_cubin_factory: Optional[Callable[[Path], Mapping[str, Path]]] = None
+    extra_cuda_cflags_by_source: Optional[Mapping[Path, List[str]]] = None
 
     @property
     def ninja_path(self) -> Path:
@@ -518,6 +566,7 @@ class JitSpecNvcc(JitSpec):
             extra_include_dirs=self.extra_include_dirs,
             needs_device_linking=self.needs_device_linking,
             embedded_cubins=embedded_cubins,
+            extra_cuda_cflags_by_source=self.extra_cuda_cflags_by_source,
         )
         write_if_different(ninja_path, content)
 
@@ -563,7 +612,7 @@ class JitSpecNvcc(JitSpec):
 
     def _build_and_load_jit_fallback(self) -> Any:
         with FileLock(self.lock_path, thread_local=False):
-            self.build()
+            self._timed_build()
             return self.load()
 
     def build(self, verbose: Optional[bool] = None, need_lock: bool = False) -> None:
@@ -638,6 +687,12 @@ class JitSpecNvcc(JitSpec):
         ]
         cflags_expanded = expand_flags(cflags, common_cflags_expanded)
         cuda_cflags_expanded = expand_flags(cuda_cflags, common_cflags_expanded)
+        cuda_cflags_by_source = {
+            Path(source).resolve(): expand_flags(
+                build_cuda_cflags(common_cflags, flags), common_cflags_expanded
+            )
+            for source, flags in (self.extra_cuda_cflags_by_source or {}).items()
+        }
 
         # Get compilers
         cxx = os.environ.get("CXX", "c++")
@@ -653,7 +708,9 @@ class JitSpecNvcc(JitSpec):
 
             if is_cuda:
                 compiler = nvcc
-                flags = cuda_cflags_expanded
+                flags = cuda_cflags_by_source.get(
+                    source.resolve(), cuda_cflags_expanded
+                )
                 object_suffix = ".cuda.o"
             else:
                 compiler = cxx
@@ -690,7 +747,16 @@ def gen_jit_spec(
     post_load_adapter: Optional[Callable[[Any], Any]] = None,
     embedded_cubin_factory: Optional[Callable[[Path], Mapping[str, Path]]] = None,
     use_fast_math: bool = True,
+    extra_cuda_cflags_by_source: Optional[Mapping[Union[str, Path], List[str]]] = None,
 ) -> JitSpec:
+    """Create a CUDA build specification.
+
+    For named CUDA sources, ``extra_cuda_cflags_by_source`` replaces the shared
+    ``extra_cuda_cflags`` and opts out of the default ``-use_fast_math``. Other
+    build defaults still apply; request fast math explicitly when required.
+    Sources absent from the mapping retain the shared flags and defaults,
+    including the module-wide ``use_fast_math`` setting.
+    """
     check_cuda_arch()
     # Use FLASHINFER_JIT_DEBUG if set, otherwise use FLASHINFER_JIT_VERBOSE (for backward compatibility)
     debug_env = os.environ.get("FLASHINFER_JIT_DEBUG")
@@ -744,6 +810,26 @@ def gen_jit_spec(
 
     if extra_cflags is not None:
         cflags += extra_cflags
+    cuda_cflags_by_source = None
+    if extra_cuda_cflags_by_source is not None:
+        cuda_sources = {
+            Path(source).resolve() for source in sources if Path(source).suffix == ".cu"
+        }
+        cuda_cflags_by_source = {}
+        for raw_source, source_flags in extra_cuda_cflags_by_source.items():
+            source = Path(raw_source).resolve()
+            if source not in cuda_sources:
+                raise ValueError(
+                    f"CUDA flags refer to a source outside this JIT spec: {source}"
+                )
+            source_defaults = [
+                flag
+                for flag in cuda_cflags
+                if flag != "-use_fast_math" and not flag.startswith("-std=")
+            ]
+            if not any(flag.startswith("-std=") for flag in source_flags):
+                source_defaults.insert(0, "-std=c++17")
+            cuda_cflags_by_source[source] = source_defaults + list(source_flags)
     if extra_cuda_cflags is not None:
         cuda_cflags += extra_cuda_cflags
 
@@ -761,6 +847,7 @@ def gen_jit_spec(
         needs_device_linking=needs_device_linking,
         post_load_adapter=post_load_adapter,
         embedded_cubin_factory=embedded_cubin_factory,
+        extra_cuda_cflags_by_source=cuda_cflags_by_source,
     )
 
     # Register the spec in the global registry
@@ -797,10 +884,27 @@ def build_jit_specs(
     if not lines:
         return
 
+    num_modules = len(lines)
     lines = ["ninja_required_version = 1.3"] + lines + [""]
 
     tmpdir = get_tmpdir()
     with FileLock(tmpdir / "flashinfer_jit.lock", thread_local=False):
         ninja_path = tmpdir / "flashinfer_jit.ninja"
         write_if_different(ninja_path, "\n".join(lines))
-        run_ninja(jit_env.FLASHINFER_JIT_DIR, ninja_path, verbose)
+        prebuild_max_jobs = os.environ.get("FLASHINFER_JIT_PREBUILD_MAX_JOBS")
+        started = time.perf_counter()
+        run_ninja(
+            jit_env.FLASHINFER_JIT_DIR,
+            ninja_path,
+            verbose,
+            max_jobs=(
+                int(prebuild_max_jobs)
+                if prebuild_max_jobs is not None and prebuild_max_jobs.isdigit()
+                else None
+            ),
+        )
+        _record_jit_build(
+            JitSpecNvcc.toolchain,
+            f"prebuild[{num_modules} modules]",
+            time.perf_counter() - started,
+        )

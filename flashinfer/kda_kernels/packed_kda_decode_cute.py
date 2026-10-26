@@ -2495,10 +2495,10 @@ def _check_cuda_tensor(name, tensor, dtype):
 
 def _check_b200(device: torch.device) -> None:
     capability = get_compute_capability(device)
-    if capability != (10, 0):
+    if capability not in ((10, 0), (10, 3), (10, 7)):
         raise RuntimeError(
-            "experimental CuTe packed KDA requires exact compute capability "
-            f"10.0 (B200), got {capability[0]}.{capability[1]}"
+            "experimental CuTe packed KDA requires compute capability "
+            f"10.0, 10.3 or 10.7 (SM100 family), got {capability[0]}.{capability[1]}"
         )
     if not is_cuda_version_at_least("12.8"):
         raise RuntimeError(

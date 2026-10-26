@@ -7,6 +7,73 @@ import pytest
 pytest.importorskip("torch")
 
 
+@pytest.mark.parametrize("quant_pair", [("NVFP4", "NVFP4"), ("MXFP4", "MXFP8")])
+@pytest.mark.parametrize(
+    "candidates",
+    [
+        ("cute", "trt"),
+        ("trt", "cute"),
+        ("cute",),
+        ("trt",),
+        ("cute", "trt", "cute", "trt"),
+        ("bf16", "cute", "trt"),
+    ],
+)
+def test_materializes_all_matching_candidates(monkeypatch, candidates, quant_pair):
+    import dataclasses
+    from unittest.mock import Mock
+
+    import torch
+
+    from flashinfer.fused_moe.api import (
+        BackendOptions,
+        CuteDslConfig,
+        QuantConfig,
+        QuantFormat,
+        TrtllmBf16Config,
+        TrtllmFp4Config,
+    )
+    from flashinfer.moe_ep import MoEWeightPack
+    from flashinfer.moe_ep.backends.split.kernel.fused_moe.weights import (
+        materialize_fused_moe_weights,
+    )
+
+    configs = {
+        "cute": CuteDslConfig(),
+        "trt": TrtllmFp4Config(),
+        "bf16": TrtllmBf16Config(),
+    }
+    preparers = {}
+    for name in ("cute", "trt"):
+        preparers[name] = Mock(return_value={"weight": torch.tensor([len(preparers)])})
+        monkeypatch.setattr(type(configs[name]), "prepare_weights", preparers[name])
+    cfg = dataclasses.replace(
+        _nvfp4_moe_config(
+            num_experts=8, local_num_experts=2, offset=2, intermediate=128
+        ),
+        quant=QuantConfig(
+            weight=QuantFormat[quant_pair[0]], activation=QuantFormat[quant_pair[1]]
+        ),
+        backend=BackendOptions(candidates=tuple(configs[name] for name in candidates)),
+    )
+    weights = MoEWeightPack(
+        w13=torch.empty(2, 256, 256, dtype=torch.bfloat16),
+        w2=torch.empty(2, 256, 128, dtype=torch.bfloat16),
+    )
+    pack = materialize_fused_moe_weights(weights, cfg)
+    keys = {"cute": "cute_dsl", "trt": "trtllm_fp4_routed"}
+    assert set(pack.native_views) == {keys[name] for name in candidates if name in keys}
+    for name, preparer in preparers.items():
+        assert preparer.call_count == int(name in candidates)
+        if name in candidates:
+            assert pack.get_view(keys[name]) is preparer.return_value
+            assert preparer.call_args.args[0] is weights.w13
+            assert preparer.call_args.args[1] is weights.w2
+            assert preparer.call_args.kwargs["num_local_experts"] == 2
+            assert preparer.call_args.kwargs["activation"] == cfg.activation
+            assert preparer.call_args.kwargs["quant"] is cfg.quant
+
+
 def _bf16_moe_config(*, num_experts, local_num_experts, offset, intermediate, top_k=4):
     from flashinfer.fused_moe.api import (
         BackendOptions,
@@ -123,13 +190,18 @@ class TestMaterializeFusedMoeWeights:
     @pytest.mark.skipif(
         not __import__("torch").cuda.is_available()
         or __import__("torch").cuda.get_device_capability()[0] < 10,
-        reason="NVFP4 weight prep needs SM100+",
+        reason="FP4 weight prep needs SM100+",
     )
-    def test_nvfp4_trtllm_matches_manual_prepare(self):
+    @pytest.mark.parametrize("quant_pair", [("NVFP4", "NVFP4"), ("MXFP4", "MXFP8")])
+    def test_fp4_trtllm_matches_manual_prepare(self, quant_pair):
+        from dataclasses import replace
+
         import torch
 
         from flashinfer.fused_moe.api import (
             MoEWeightPack as FusedMoEWeightPack,
+            QuantConfig,
+            QuantFormat,
             TrtllmFp4Config,
         )
         from flashinfer.moe_ep import MoEWeightPack
@@ -155,6 +227,12 @@ class TestMaterializeFusedMoeWeights:
             offset=0,
             intermediate=intermediate,
         )
+        cfg = replace(
+            cfg,
+            quant=QuantConfig(
+                weight=QuantFormat[quant_pair[0]], activation=QuantFormat[quant_pair[1]]
+            ),
+        )
 
         got = materialize_fused_moe_weights(MoEWeightPack(w13=w13, w2=w2), cfg)
         manual = FusedMoEWeightPack()
@@ -163,6 +241,7 @@ class TestMaterializeFusedMoeWeights:
             TrtllmFp4Config.prepare_weights(
                 w13,
                 w2,
+                quant=cfg.quant,
                 num_local_experts=local_n,
                 hidden_size=hidden,
                 intermediate_size=intermediate,

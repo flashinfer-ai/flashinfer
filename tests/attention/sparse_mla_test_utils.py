@@ -38,7 +38,7 @@ def ordinary_format_facts(monkeypatch):
             bytes_per_token=width,
             fp4_bytes_per_token=288,
         )
-        for model, width in enumerate((656, 584, 656, 528, 1160, 528))
+        for model, width in enumerate((656, 584, 656, 528, 1160, 528, 528))
     }
     monkeypatch.setattr(_calibration, "format_info", facts.__getitem__)
     return facts

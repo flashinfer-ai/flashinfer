@@ -1,0 +1,4 @@
+# Digest-bound generated sources (Cake export of the experimental NVFP4 sparse MLA decode): build.json attests
+# these bytes; formatting them would break the digests that bind them to the manifest.
+DisableFormat: true
+SortIncludes: Never

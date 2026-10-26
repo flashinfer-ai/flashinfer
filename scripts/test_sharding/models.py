@@ -4,7 +4,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-SCHEMA_VERSION = 4
+# 5 names node-wide isolation and adds independent GPU and host-heavy markers.
+# Older schemas remain readable for reports, but cannot be resumed.
+SCHEMA_VERSION = 5
 ALGORITHM_VERSION = "lpt-ms-v4"
 DEFAULT_CHECKPOINT_SECONDS = 1_000_000
 DEFAULT_TARGET_UNIT_SECONDS = 1_000_000
@@ -30,8 +32,14 @@ class CollectedNode:
     base_function: str
     order: int
     shard_group: str | None = None
-    solo: bool = False
+    # Run the whole source alone after parallel work, with all GPUs visible.
+    node_exclusive: bool = False
     long_running: bool = False
+    # Exclude other work on the assigned GPU; other GPUs may keep running.
+    gpu_exclusive: bool = False
+    # Prioritize this source and serialize its units with other host-heavy work;
+    # lighter work may overlap. This does not enforce a memory limit.
+    host_memory_heavy: bool = False
 
     @classmethod
     def from_nodeid(
@@ -40,8 +48,10 @@ class CollectedNode:
         order: int,
         shard_group: str | None = None,
         *,
-        solo: bool = False,
+        node_exclusive: bool = False,
         long_running: bool = False,
+        gpu_exclusive: bool = False,
+        host_memory_heavy: bool = False,
     ) -> "CollectedNode":
         return cls(
             nodeid=nodeid,
@@ -49,8 +59,10 @@ class CollectedNode:
             base_function=base_function_for_nodeid(nodeid),
             order=order,
             shard_group=shard_group,
-            solo=solo,
+            node_exclusive=node_exclusive,
             long_running=long_running,
+            gpu_exclusive=gpu_exclusive,
+            host_memory_heavy=host_memory_heavy,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -60,8 +72,10 @@ class CollectedNode:
             "base_function": self.base_function,
             "order": self.order,
             "shard_group": self.shard_group,
-            "solo": self.solo,
+            "node_exclusive": self.node_exclusive,
             "long_running": self.long_running,
+            "gpu_exclusive": self.gpu_exclusive,
+            "host_memory_heavy": self.host_memory_heavy,
         }
 
 
@@ -188,8 +202,8 @@ class Plan:
             for index, node in enumerate(self.nodes)
             if node.shard_group is not None
         }
-        solo_sources = sorted(
-            {node.source_file for node in self.nodes if node.solo},
+        node_exclusive_sources = sorted(
+            {node.source_file for node in self.nodes if node.node_exclusive},
             key=lambda value: value.encode("utf-8"),
         )
         long_running_sources = sorted(
@@ -206,8 +220,14 @@ class Plan:
                 for path, indexes in sorted(source_file_groups.items())
             ],
             "shard_groups": shard_groups,
-            "solo_sources": solo_sources,
+            "node_exclusive_sources": node_exclusive_sources,
             "long_running_sources": long_running_sources,
+            "gpu_exclusive_sources": sorted(
+                {node.source_file for node in self.nodes if node.gpu_exclusive}
+            ),
+            "host_memory_heavy_sources": sorted(
+                {node.source_file for node in self.nodes if node.host_memory_heavy}
+            ),
             "units": [
                 {
                     "id": unit.id,
@@ -241,6 +261,9 @@ class Plan:
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "Plan":
+        # Preserve allocation-wide isolation when reading older plans for reports.
+        schema = int(value.get("schema_version", 1))
+        isolation_key = "node_exclusive" if schema >= 5 else "solo"
         option_value = value["options"]
         options = PlanningOptions(
             checkpoint_seconds=int(option_value["checkpoint_seconds"]),
@@ -265,8 +288,10 @@ class Plan:
                         base_function=node["base_function"],
                         order=int(node["order"]),
                         shard_group=node.get("shard_group"),
-                        solo=bool(node.get("solo", False)),
+                        node_exclusive=bool(node.get(isolation_key, False)),
                         long_running=bool(node.get("long_running", False)),
+                        gpu_exclusive=bool(node.get("gpu_exclusive", False)),
+                        host_memory_heavy=bool(node.get("host_memory_heavy", False)),
                     )
                     for node in value["nodes"]
                 ),
@@ -290,23 +315,31 @@ class Plan:
             for group in value.get("source_files", [])
             for index in group["node_indexes"]
         }
-        solo_sources = {str(source) for source in value.get("solo_sources", [])}
+        node_exclusive_sources = {
+            str(source) for source in value.get(f"{isolation_key}_sources", [])
+        }
         long_running_sources = {
             str(source) for source in value.get("long_running_sources", [])
         }
-        nodes = tuple(
-            CollectedNode(
-                nodeid,
-                source_files.get(index, source_file_for_nodeid(nodeid)),
-                base_function_for_nodeid(nodeid),
-                index,
-                shard_groups.get(index),
-                source_files.get(index, source_file_for_nodeid(nodeid)) in solo_sources,
-                source_files.get(index, source_file_for_nodeid(nodeid))
-                in long_running_sources,
+        gpu_exclusive_sources = set(value.get("gpu_exclusive_sources", []))
+        host_memory_heavy_sources = set(value.get("host_memory_heavy_sources", []))
+        nodes_list = []
+        for index, nodeid in enumerate(nodeids):
+            source_file = source_files.get(index, source_file_for_nodeid(nodeid))
+            nodes_list.append(
+                CollectedNode(
+                    nodeid=nodeid,
+                    source_file=source_file,
+                    base_function=base_function_for_nodeid(nodeid),
+                    order=index,
+                    shard_group=shard_groups.get(index),
+                    node_exclusive=source_file in node_exclusive_sources,
+                    long_running=source_file in long_running_sources,
+                    gpu_exclusive=source_file in gpu_exclusive_sources,
+                    host_memory_heavy=source_file in host_memory_heavy_sources,
+                )
             )
-            for index, nodeid in enumerate(nodeids)
-        )
+        nodes = tuple(nodes_list)
         units = tuple(
             Unit(
                 id=unit["id"],

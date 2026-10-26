@@ -247,6 +247,32 @@ def stg_128b_bf16x8(
 
 
 @cute.jit
+def stg_128b_bf16x8_at(dst_addr, o0, o1, o2, o3) -> None:
+    """One 16-byte store of eight BF16 values (four u32 words, low half
+    first) to the global byte address ``dst_addr`` (must be 16-byte aligned).
+
+    Raw-address variant of ``stg_128b_bf16x8`` for destinations that are
+    resolved per token row (peer-mapped MegaMoE rows)."""
+    o_u32 = cute.make_rmem_tensor(4, cutlass.Uint32)
+    o_u32[0] = o0
+    o_u32[1] = o1
+    o_u32[2] = o2
+    o_u32[3] = o3
+    o_bf16 = cute.recast_tensor(o_u32, cutlass.BFloat16)
+    dst_ptr = cute.make_ptr(
+        cutlass.BFloat16, dst_addr, cute.AddressSpace.gmem, assumed_align=16,
+    )
+    cute.copy(
+        cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16,
+            num_bits_per_copy=128,
+        ),
+        o_bf16,
+        cute.make_tensor(dst_ptr, cute.make_layout(8)),
+    )
+
+
+@cute.jit
 def tma_store_fc1_output(
     sC,
     stage_idx,

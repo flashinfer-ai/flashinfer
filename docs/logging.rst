@@ -157,7 +157,7 @@ For faster, pickle-free serialization, you can enable safetensors format:
      - ``.pt``
      - ``.safetensors``
    * - Dependency
-     - `torch``
+     - ``torch``
      - Requires ``pip install safetensors``
 
 **Replay is format-agnostic**: The replay command automatically detects the format based on file extension.

@@ -12,17 +12,20 @@ namespace flashinfer::sparse_mla_sm120::nvfp4 {
 
 template <int PageSize, bool Dual>
 __device__ void page_location(int index, bool extra, int page_size, int& page, int& local) {
-  if constexpr (Dual) {
-    if (extra && page_size == 2) {
-      page = index >> 1;
-      local = index & 1;
-    } else {
-      page = index >> 6;
-      local = index & 63;
-    }
+  // PageSize==0 is the runtime-page variant (mirrors the fp8 prefill idiom); a
+  // nonzero PageSize keeps the compile-time divisor on the canonical path.
+  // Extra-candidate chunks always resolve through the runtime extra page size.
+  const int ps = max(1, (Dual && extra) || PageSize == 0 ? page_size : PageSize);
+  // Whitelisted page sizes are powers of two, so the common case stays a
+  // shift/mask (folding to the old >>6/&63 when ps==64); arbitrary positive
+  // sizes fall back to plain division.
+  if ((ps & (ps - 1)) == 0) {
+    const int shift = 31 - __clz(ps);
+    page = index >> shift;
+    local = index & (ps - 1);
   } else {
-    page = index / PageSize;
-    local = index - page * PageSize;
+    page = index / ps;
+    local = index - page * ps;
   }
 }
 

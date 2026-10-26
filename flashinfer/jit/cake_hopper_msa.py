@@ -1,0 +1,318 @@
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+JIT registration of the Cake-generated Hopper (compute capability 9.0) MSA
+programs.  One device / binding source pair per physical schedule, compiled
+with FlashInfer's exact ``sm_90a`` flag set (``_ARCHES``); ``ROUTES`` maps a
+logical route (``<route key>:<stage>``) to the program that serves it and
+``MODULES`` carries each program's neutral compile flags, FFI entry and
+argument order.  A record names its two sources under ``csrc/cake_hopper_msa/``
+(``kernel`` and ``binding``; a binding is shared by the programs of one role and
+a kernel by the programs that differ only in a compile-time constant, selected
+through the record's ``-D`` compile flags); its JIT key is the name, the target
+and the first twenty hex digits of the SHA-256 over the two sources and its
+compile flags (``get_hopper_msa_uri``).
+"""
+
+import functools
+import hashlib
+import json
+from pathlib import Path
+from typing import Any
+
+from . import env as jit_env
+from .core import JitSpec, gen_jit_spec, sm90a_nvcc_flags
+
+_ARCHES = ("sm_90a",)
+_TARGET = "sm90a"
+
+# fmt: off
+# The seven distinct argument plans of the 89 programs, named once (a record references its plan).
+_ARG_PLANS: dict[str, list[list[str]]] = {
+    "decode_v5": [["buffer", "Q32"], ["buffer", "K"], ["buffer", "V"], ["buffer", "O"], ["buffer", "q2k_indices"], ["buffer", "page_table"], ["buffer", "seqused_k"], ["buffer", "part_o"], ["buffer", "part_ml"], ["buffer", "counters"], ["parameter", "total_q"], ["parameter", "seqlen_q"], ["parameter", "num_q_heads"], ["parameter", "num_kv_heads"], ["parameter", "max_pages"], ["parameter", "num_chunks"], ["parameter", "softmax_scale_log2"], ["parameter", "zero_u32"], ["grid", "grid_x"], ["grid", "grid_y"], ["grid", "grid_z"]],
+    "decode_v5_persist": [["buffer", "Q32"], ["buffer", "K"], ["buffer", "V"], ["buffer", "O"], ["buffer", "q2k_indices"], ["buffer", "page_table"], ["buffer", "seqused_k"], ["parameter", "total_q"], ["parameter", "seqlen_q"], ["parameter", "num_q_heads"], ["parameter", "num_kv_heads"], ["parameter", "max_pages"], ["parameter", "num_chunks"], ["parameter", "num_items"], ["parameter", "softmax_scale_log2"], ["parameter", "zero_u32"], ["grid", "grid_x"], ["grid", "grid_y"], ["grid", "grid_z"]],
+    "prefill_v1": [["buffer", "Q"], ["buffer", "K"], ["buffer", "V"], ["buffer", "O"], ["buffer", "q2k_indices"], ["buffer", "cu_seqlens_q"], ["buffer", "page_table"], ["buffer", "seqused_k"], ["buffer", "q_offset"], ["parameter", "total_q"], ["parameter", "batch"], ["parameter", "num_q_heads"], ["parameter", "num_kv_heads"], ["parameter", "max_pages"], ["parameter", "use_q_offset"], ["parameter", "softmax_scale_log2"], ["parameter", "zero_u32"], ["grid", "grid_x"], ["grid", "grid_y"], ["grid", "grid_z"]],
+    "prefill_v2": [["buffer", "Q32"], ["buffer", "K"], ["buffer", "V"], ["buffer", "O"], ["buffer", "q2k_indices"], ["buffer", "cu_seqlens_q"], ["buffer", "page_table"], ["buffer", "seqused_k"], ["buffer", "q_offset"], ["parameter", "total_q"], ["parameter", "batch"], ["parameter", "num_q_heads"], ["parameter", "num_kv_heads"], ["parameter", "max_pages"], ["parameter", "use_q_offset"], ["parameter", "softmax_scale_log2"], ["grid", "grid_x"], ["grid", "grid_y"], ["grid", "grid_z"]],
+    "proxy_decode": [["buffer", "Q"], ["buffer", "K"], ["buffer", "out"], ["buffer", "page_table"], ["buffer", "seqused_k"], ["buffer", "q_offset"], ["parameter", "has_qoff"], ["parameter", "pt_stride"], ["parameter", "max_k_tiles"], ["parameter", "total_q"], ["parameter", "batch_fast"], ["parameter", "evict_first"], ["grid", "grid_x"], ["grid", "grid_y"], ["grid", "grid_z"]],
+    "proxy_prefill": [["buffer", "Q"], ["buffer", "K"], ["buffer", "out"], ["buffer", "cu_seqlens_q"], ["buffer", "page_table"], ["buffer", "seqused_k"], ["buffer", "q_offset"], ["parameter", "has_qoff"], ["parameter", "pt_stride"], ["parameter", "max_k_tiles"], ["parameter", "total_q"], ["parameter", "num_heads"], ["parameter", "nsplit"], ["grid", "grid_x"], ["grid", "grid_y"], ["grid", "grid_z"]],
+    "topk_select": [["buffer", "S"], ["buffer", "nvp"], ["buffer", "out"], ["parameter", "tiles"], ["parameter", "total_q"], ["parameter", "num_heads"], ["parameter", "num_chunks"], ["parameter", "fb"], ["parameter", "fe"], ["grid", "grid_x"], ["grid", "grid_y"], ["grid", "grid_z"]],
+}
+MODULES: dict[str, dict[str, Any]] = {
+    "cake_hopper_msa_025cfebce8c49b67ec28": {"kernel": "cake_hopper_msa_025cfebce8c49b67ec28_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_025cfebce8c49b67ec28", "-DCAKE_BIND_SMEM=19712", "-DCAKE_BIND_THREADS=256"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_02949879f73b80e4a89d": {"kernel": "cake_hopper_msa_e9f9ae0d08ebbf603198_kernel.cu", "binding": "cake_hopper_msa_e9f9ae0d08ebbf603198_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_02949879f73b80e4a89d", "-DCAKE_BIND_SMEM=18560", "-DCAKE_BIND_THREADS=128", "-DCAKE_HQ=2", "-DCAKE_SQ=3", "-DCAKE_HQ_SQ=6"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_decode"]},
+    "cake_hopper_msa_10913214edb8c25d60e6": {"kernel": "cake_hopper_msa_26311d226b72e91edb96_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_10913214edb8c25d60e6", "-DCAKE_BIND_SMEM=35200", "-DCAKE_BIND_THREADS=512", "-DCAKE_INDEX_BITS=11", "-DCAKE_INDEX_LOW_MASK=2047", "-DCAKE_INDEX_HIGH_MASK=4294965248u", "-DCAKE_INDEX_SCORE_MASK=2139092992"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_10a5ce76abdf61206e96": {"kernel": "cake_hopper_msa_5fdc63d045d78d90a65b_kernel.cu", "binding": "cake_hopper_msa_5fdc63d045d78d90a65b_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_10a5ce76abdf61206e96", "-DCAKE_BIND_SMEM=19712", "-DCAKE_BIND_THREADS=128", "-DCAKE_HQ=4", "-DCAKE_SQ=4", "-DCAKE_HQ_SQ=16"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_decode"]},
+    "cake_hopper_msa_112f343295150aa53f1b": {"kernel": "cake_hopper_msa_6a18dd4a679b2805be09_kernel.cu", "binding": "cake_hopper_msa_6a18dd4a679b2805be09_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_112f343295150aa53f1b", "-DCAKE_BIND_SMEM=35968", "-DCAKE_BIND_THREADS=128", "-DCAKE_HQ=1", "-DCAKE_SQ=2", "-DCAKE_HQ_SQ=2"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_decode"]},
+    "cake_hopper_msa_1533648d99b5503e11d3": {"kernel": "cake_hopper_msa_6c4ab03fa64cb21663ed_kernel.cu", "binding": "cake_hopper_msa_1533648d99b5503e11d3_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_1533648d99b5503e11d3", "-DCAKE_BIND_SMEM=94336", "-DCAKE_BIND_THREADS=128", "-DCAKE_GROUP=4"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["prefill_v1"]},
+    "cake_hopper_msa_17cd0cc3a08e4f2a8aab": {"kernel": "cake_hopper_msa_2841be2dbf5dd0850755_kernel.cu", "binding": "cake_hopper_msa_200ffb0330dbc8893eeb_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_17cd0cc3a08e4f2a8aab", "-DCAKE_BIND_SMEM=81408", "-DCAKE_BIND_THREADS=128", "-DCAKE_L2_EVICT_FIRST=0"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["decode_v5"]},
+    "cake_hopper_msa_200ffb0330dbc8893eeb": {"kernel": "cake_hopper_msa_200ffb0330dbc8893eeb_kernel.cu", "binding": "cake_hopper_msa_200ffb0330dbc8893eeb_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_200ffb0330dbc8893eeb", "-DCAKE_BIND_SMEM=81408", "-DCAKE_BIND_THREADS=128", "-DCAKE_L2_EVICT_FIRST=1"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["decode_v5"]},
+    "cake_hopper_msa_20ef3836378e7e27b4cc": {"kernel": "cake_hopper_msa_20ef3836378e7e27b4cc_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_20ef3836378e7e27b4cc", "-DCAKE_BIND_SMEM=11264", "-DCAKE_BIND_THREADS=128"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_2336edef056031b8d505": {"kernel": "cake_hopper_msa_e9f9ae0d08ebbf603198_kernel.cu", "binding": "cake_hopper_msa_e9f9ae0d08ebbf603198_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_2336edef056031b8d505", "-DCAKE_BIND_SMEM=18560", "-DCAKE_BIND_THREADS=128", "-DCAKE_HQ=2", "-DCAKE_SQ=1", "-DCAKE_HQ_SQ=2"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_decode"]},
+    "cake_hopper_msa_26311d226b72e91edb96": {"kernel": "cake_hopper_msa_26311d226b72e91edb96_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_26311d226b72e91edb96", "-DCAKE_BIND_SMEM=35200", "-DCAKE_BIND_THREADS=512", "-DCAKE_INDEX_BITS=10", "-DCAKE_INDEX_LOW_MASK=1023", "-DCAKE_INDEX_HIGH_MASK=4294966272u", "-DCAKE_INDEX_SCORE_MASK=2139094016"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_276e272a54b4efd20df6": {"kernel": "cake_hopper_msa_276e272a54b4efd20df6_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_276e272a54b4efd20df6", "-DCAKE_BIND_SMEM=9856", "-DCAKE_BIND_THREADS=128"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_2841be2dbf5dd0850755": {"kernel": "cake_hopper_msa_2841be2dbf5dd0850755_kernel.cu", "binding": "cake_hopper_msa_200ffb0330dbc8893eeb_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_2841be2dbf5dd0850755", "-DCAKE_BIND_SMEM=81408", "-DCAKE_BIND_THREADS=128", "-DCAKE_L2_EVICT_FIRST=1"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["decode_v5"]},
+    "cake_hopper_msa_28d169fe4dab7b3b30ce": {"kernel": "cake_hopper_msa_28d169fe4dab7b3b30ce_kernel.cu", "binding": "cake_hopper_msa_28d169fe4dab7b3b30ce_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_28d169fe4dab7b3b30ce", "-DCAKE_BIND_SMEM=38144", "-DCAKE_BIND_THREADS=128", "-DCAKE_HQ=4", "-DCAKE_SQ=3", "-DCAKE_HQ_SQ=12"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_decode"]},
+    "cake_hopper_msa_32dffc6bff721ed84d72": {"kernel": "cake_hopper_msa_32dffc6bff721ed84d72_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_32dffc6bff721ed84d72", "-DCAKE_BIND_SMEM=640", "-DCAKE_BIND_THREADS=32"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_33db3e98efe0657eaf8c": {"kernel": "cake_hopper_msa_6a18dd4a679b2805be09_kernel.cu", "binding": "cake_hopper_msa_6a18dd4a679b2805be09_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_33db3e98efe0657eaf8c", "-DCAKE_BIND_SMEM=35968", "-DCAKE_BIND_THREADS=128", "-DCAKE_HQ=4", "-DCAKE_SQ=2", "-DCAKE_HQ_SQ=8"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_decode"]},
+    "cake_hopper_msa_38ae2dcd5875ff4f4492": {"kernel": "cake_hopper_msa_aa3467cf0eac90f51afb_kernel.cu", "binding": "cake_hopper_msa_aa3467cf0eac90f51afb_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_38ae2dcd5875ff4f4492", "-DCAKE_BIND_SMEM=82944", "-DCAKE_BIND_THREADS=288", "-DCAKE_FOLD=0"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_prefill"]},
+    "cake_hopper_msa_3ac2f034fe9238ad3b82": {"kernel": "cake_hopper_msa_5d570a1e487133c6dca6_kernel.cu", "binding": "cake_hopper_msa_200ffb0330dbc8893eeb_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_3ac2f034fe9238ad3b82", "-DCAKE_BIND_SMEM=87808", "-DCAKE_BIND_THREADS=128", "-DCAKE_L2_EVICT_FIRST=0"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["decode_v5"]},
+    "cake_hopper_msa_434683e642fc2353d459": {"kernel": "cake_hopper_msa_434683e642fc2353d459_kernel.cu", "binding": "cake_hopper_msa_200ffb0330dbc8893eeb_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_434683e642fc2353d459", "-DCAKE_BIND_SMEM=81408", "-DCAKE_BIND_THREADS=128", "-DCAKE_L2_EVICT_FIRST=1"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["decode_v5"]},
+    "cake_hopper_msa_43e957550739d30313fb": {"kernel": "cake_hopper_msa_43e957550739d30313fb_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_43e957550739d30313fb", "-DCAKE_BIND_SMEM=20096", "-DCAKE_BIND_THREADS=256"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_47452510f979fcf77372": {"kernel": "cake_hopper_msa_e9f9ae0d08ebbf603198_kernel.cu", "binding": "cake_hopper_msa_e9f9ae0d08ebbf603198_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_47452510f979fcf77372", "-DCAKE_BIND_SMEM=18560", "-DCAKE_BIND_THREADS=128", "-DCAKE_HQ=2", "-DCAKE_SQ=2", "-DCAKE_HQ_SQ=4"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_decode"]},
+    "cake_hopper_msa_4c19e05879003d7441c6": {"kernel": "cake_hopper_msa_e9f9ae0d08ebbf603198_kernel.cu", "binding": "cake_hopper_msa_e9f9ae0d08ebbf603198_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_4c19e05879003d7441c6", "-DCAKE_BIND_SMEM=18560", "-DCAKE_BIND_THREADS=128", "-DCAKE_HQ=4", "-DCAKE_SQ=1", "-DCAKE_HQ_SQ=4"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_decode"]},
+    "cake_hopper_msa_4c525bd96e3b3a405ca9": {"kernel": "cake_hopper_msa_e9f9ae0d08ebbf603198_kernel.cu", "binding": "cake_hopper_msa_e9f9ae0d08ebbf603198_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_4c525bd96e3b3a405ca9", "-DCAKE_BIND_SMEM=18560", "-DCAKE_BIND_THREADS=128", "-DCAKE_HQ=4", "-DCAKE_SQ=2", "-DCAKE_HQ_SQ=8"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_decode"]},
+    "cake_hopper_msa_56dcad5539ad9283e4c4": {"kernel": "cake_hopper_msa_56dcad5539ad9283e4c4_kernel.cu", "binding": "cake_hopper_msa_200ffb0330dbc8893eeb_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_56dcad5539ad9283e4c4", "-DCAKE_BIND_SMEM=55040", "-DCAKE_BIND_THREADS=128"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["decode_v5"]},
+    "cake_hopper_msa_5a3b3a1697633a0e8b04": {"kernel": "cake_hopper_msa_98d948252b6f068d1c81_kernel.cu", "binding": "cake_hopper_msa_200ffb0330dbc8893eeb_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_5a3b3a1697633a0e8b04", "-DCAKE_BIND_SMEM=81408", "-DCAKE_BIND_THREADS=128", "-DCAKE_L2_EVICT_FIRST=0"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["decode_v5"]},
+    "cake_hopper_msa_5adf7239b83aa93c4897": {"kernel": "cake_hopper_msa_5adf7239b83aa93c4897_kernel.cu", "binding": "cake_hopper_msa_200ffb0330dbc8893eeb_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_5adf7239b83aa93c4897", "-DCAKE_BIND_SMEM=120576", "-DCAKE_BIND_THREADS=128"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["decode_v5"]},
+    "cake_hopper_msa_5b4a0b9e9f07928582f0": {"kernel": "cake_hopper_msa_e9f9ae0d08ebbf603198_kernel.cu", "binding": "cake_hopper_msa_e9f9ae0d08ebbf603198_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_5b4a0b9e9f07928582f0", "-DCAKE_BIND_SMEM=18560", "-DCAKE_BIND_THREADS=128", "-DCAKE_HQ=2", "-DCAKE_SQ=4", "-DCAKE_HQ_SQ=8"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_decode"]},
+    "cake_hopper_msa_5d570a1e487133c6dca6": {"kernel": "cake_hopper_msa_5d570a1e487133c6dca6_kernel.cu", "binding": "cake_hopper_msa_200ffb0330dbc8893eeb_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_5d570a1e487133c6dca6", "-DCAKE_BIND_SMEM=87808", "-DCAKE_BIND_THREADS=128", "-DCAKE_L2_EVICT_FIRST=1"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["decode_v5"]},
+    "cake_hopper_msa_5ed0c641bcea3a524077": {"kernel": "cake_hopper_msa_28d169fe4dab7b3b30ce_kernel.cu", "binding": "cake_hopper_msa_28d169fe4dab7b3b30ce_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_5ed0c641bcea3a524077", "-DCAKE_BIND_SMEM=38144", "-DCAKE_BIND_THREADS=128", "-DCAKE_HQ=4", "-DCAKE_SQ=4", "-DCAKE_HQ_SQ=16"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_decode"]},
+    "cake_hopper_msa_5fdc63d045d78d90a65b": {"kernel": "cake_hopper_msa_5fdc63d045d78d90a65b_kernel.cu", "binding": "cake_hopper_msa_5fdc63d045d78d90a65b_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_5fdc63d045d78d90a65b", "-DCAKE_BIND_SMEM=19712", "-DCAKE_BIND_THREADS=128", "-DCAKE_HQ=4", "-DCAKE_SQ=3", "-DCAKE_HQ_SQ=12"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_decode"]},
+    "cake_hopper_msa_6400f9b940af49476321": {"kernel": "cake_hopper_msa_6400f9b940af49476321_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_6400f9b940af49476321", "-DCAKE_BIND_SMEM=1280", "-DCAKE_BIND_THREADS=32"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_68735943ee82c916aba4": {"kernel": "cake_hopper_msa_68735943ee82c916aba4_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_68735943ee82c916aba4", "-DCAKE_BIND_SMEM=4480", "-DCAKE_BIND_THREADS=128"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_68ed6c2ee8c7e4e9b9e7": {"kernel": "cake_hopper_msa_434683e642fc2353d459_kernel.cu", "binding": "cake_hopper_msa_200ffb0330dbc8893eeb_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_68ed6c2ee8c7e4e9b9e7", "-DCAKE_BIND_SMEM=81408", "-DCAKE_BIND_THREADS=128", "-DCAKE_L2_EVICT_FIRST=0"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["decode_v5"]},
+    "cake_hopper_msa_6a18dd4a679b2805be09": {"kernel": "cake_hopper_msa_6a18dd4a679b2805be09_kernel.cu", "binding": "cake_hopper_msa_6a18dd4a679b2805be09_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_6a18dd4a679b2805be09", "-DCAKE_BIND_SMEM=35968", "-DCAKE_BIND_THREADS=128", "-DCAKE_HQ=1", "-DCAKE_SQ=1", "-DCAKE_HQ_SQ=1"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_decode"]},
+    "cake_hopper_msa_6bc022e40283794cee7f": {"kernel": "cake_hopper_msa_6bc022e40283794cee7f_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_6bc022e40283794cee7f", "-DCAKE_BIND_SMEM=37376", "-DCAKE_BIND_THREADS=512"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_6c4ab03fa64cb21663ed": {"kernel": "cake_hopper_msa_6c4ab03fa64cb21663ed_kernel.cu", "binding": "cake_hopper_msa_6c4ab03fa64cb21663ed_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_6c4ab03fa64cb21663ed", "-DCAKE_BIND_SMEM=93184", "-DCAKE_BIND_THREADS=128", "-DCAKE_GROUP=16"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["prefill_v1"]},
+    "cake_hopper_msa_6f654886d6934fcaf89a": {"kernel": "cake_hopper_msa_6f654886d6934fcaf89a_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_6f654886d6934fcaf89a", "-DCAKE_BIND_SMEM=2432", "-DCAKE_BIND_THREADS=32", "-DCAKE_INDEX_BITS=1", "-DCAKE_INDEX_LOW_MASK=1", "-DCAKE_INDEX_HIGH_MASK=4294967294u", "-DCAKE_INDEX_SCORE_MASK=2139095038"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_72b2aa6d03c5f8f9ad54": {"kernel": "cake_hopper_msa_6a18dd4a679b2805be09_kernel.cu", "binding": "cake_hopper_msa_6a18dd4a679b2805be09_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_72b2aa6d03c5f8f9ad54", "-DCAKE_BIND_SMEM=35968", "-DCAKE_BIND_THREADS=128", "-DCAKE_HQ=4", "-DCAKE_SQ=1", "-DCAKE_HQ_SQ=4"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_decode"]},
+    "cake_hopper_msa_74205ef0b2ce7da8e6d8": {"kernel": "cake_hopper_msa_74205ef0b2ce7da8e6d8_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_74205ef0b2ce7da8e6d8", "-DCAKE_BIND_SMEM=11264", "-DCAKE_BIND_THREADS=128"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_79943b91410024d2d669": {"kernel": "cake_hopper_msa_6a18dd4a679b2805be09_kernel.cu", "binding": "cake_hopper_msa_6a18dd4a679b2805be09_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_79943b91410024d2d669", "-DCAKE_BIND_SMEM=35968", "-DCAKE_BIND_THREADS=128", "-DCAKE_HQ=1", "-DCAKE_SQ=4", "-DCAKE_HQ_SQ=4"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_decode"]},
+    "cake_hopper_msa_7b36cd26ef2fda8ca238": {"kernel": "cake_hopper_msa_db6c9d3115914fecfacf_kernel.cu", "binding": "cake_hopper_msa_200ffb0330dbc8893eeb_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_7b36cd26ef2fda8ca238", "-DCAKE_BIND_SMEM=87808", "-DCAKE_BIND_THREADS=128", "-DCAKE_L2_EVICT_FIRST=0"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["decode_v5"]},
+    "cake_hopper_msa_7b41c417f2155cba303c": {"kernel": "cake_hopper_msa_7b41c417f2155cba303c_kernel.cu", "binding": "cake_hopper_msa_7b41c417f2155cba303c_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_7b41c417f2155cba303c", "-DCAKE_BIND_SMEM=48640", "-DCAKE_BIND_THREADS=128"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["decode_v5"]},
+    "cake_hopper_msa_7bbffa90057de145b905": {"kernel": "cake_hopper_msa_7bbffa90057de145b905_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_7bbffa90057de145b905", "-DCAKE_BIND_SMEM=9856", "-DCAKE_BIND_THREADS=128"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_7bf42068b30a7198903c": {"kernel": "cake_hopper_msa_e9f9ae0d08ebbf603198_kernel.cu", "binding": "cake_hopper_msa_e9f9ae0d08ebbf603198_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_7bf42068b30a7198903c", "-DCAKE_BIND_SMEM=18560", "-DCAKE_BIND_THREADS=128", "-DCAKE_HQ=1", "-DCAKE_SQ=4", "-DCAKE_HQ_SQ=4"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_decode"]},
+    "cake_hopper_msa_859fe30a3573f05eae1c": {"kernel": "cake_hopper_msa_9a5ac33b7664412dcc01_kernel.cu", "binding": "cake_hopper_msa_9836e2dce49c4f15dfce_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_859fe30a3573f05eae1c", "-DCAKE_BIND_SMEM=145024", "-DCAKE_BIND_THREADS=384", "-DCAKE_GROUP=8"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["prefill_v2"]},
+    "cake_hopper_msa_8b6a95d561090f227dab": {"kernel": "cake_hopper_msa_8b6a95d561090f227dab_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_8b6a95d561090f227dab", "-DCAKE_BIND_SMEM=20096", "-DCAKE_BIND_THREADS=256"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_93a9c57f2a8dddc0caab": {"kernel": "cake_hopper_msa_6c4ab03fa64cb21663ed_kernel.cu", "binding": "cake_hopper_msa_93a9c57f2a8dddc0caab_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_93a9c57f2a8dddc0caab", "-DCAKE_BIND_SMEM=93568", "-DCAKE_BIND_THREADS=128", "-DCAKE_GROUP=8"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["prefill_v1"]},
+    "cake_hopper_msa_9836e2dce49c4f15dfce": {"kernel": "cake_hopper_msa_9836e2dce49c4f15dfce_kernel.cu", "binding": "cake_hopper_msa_9836e2dce49c4f15dfce_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_9836e2dce49c4f15dfce", "-DCAKE_BIND_SMEM=149120", "-DCAKE_BIND_THREADS=384"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["prefill_v2"]},
+    "cake_hopper_msa_98d948252b6f068d1c81": {"kernel": "cake_hopper_msa_98d948252b6f068d1c81_kernel.cu", "binding": "cake_hopper_msa_200ffb0330dbc8893eeb_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_98d948252b6f068d1c81", "-DCAKE_BIND_SMEM=81408", "-DCAKE_BIND_THREADS=128", "-DCAKE_L2_EVICT_FIRST=1"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["decode_v5"]},
+    "cake_hopper_msa_9a5ac33b7664412dcc01": {"kernel": "cake_hopper_msa_9a5ac33b7664412dcc01_kernel.cu", "binding": "cake_hopper_msa_9836e2dce49c4f15dfce_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_9a5ac33b7664412dcc01", "-DCAKE_BIND_SMEM=142976", "-DCAKE_BIND_THREADS=384", "-DCAKE_GROUP=16"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["prefill_v2"]},
+    "cake_hopper_msa_9e8f576d0962c01e6d38": {"kernel": "cake_hopper_msa_9e8f576d0962c01e6d38_kernel.cu", "binding": "cake_hopper_msa_9e8f576d0962c01e6d38_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_9e8f576d0962c01e6d38", "-DCAKE_BIND_SMEM=124672", "-DCAKE_BIND_THREADS=128"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["decode_v5_persist"]},
+    "cake_hopper_msa_9f2b923fef8d64829d34": {"kernel": "cake_hopper_msa_200ffb0330dbc8893eeb_kernel.cu", "binding": "cake_hopper_msa_200ffb0330dbc8893eeb_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_9f2b923fef8d64829d34", "-DCAKE_BIND_SMEM=81408", "-DCAKE_BIND_THREADS=128", "-DCAKE_L2_EVICT_FIRST=0"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["decode_v5"]},
+    "cake_hopper_msa_a1ae7ef9e264d4f504dd": {"kernel": "cake_hopper_msa_a1ae7ef9e264d4f504dd_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_a1ae7ef9e264d4f504dd", "-DCAKE_BIND_SMEM=2560", "-DCAKE_BIND_THREADS=32"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_a68e884144b35797092c": {"kernel": "cake_hopper_msa_b8a663af850de1edb0d9_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_a68e884144b35797092c", "-DCAKE_BIND_SMEM=18560", "-DCAKE_BIND_THREADS=256", "-DCAKE_INDEX_BITS=3", "-DCAKE_INDEX_LOW_MASK=7", "-DCAKE_INDEX_HIGH_MASK=4294967288u", "-DCAKE_INDEX_SCORE_MASK=2139095032"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_aa3467cf0eac90f51afb": {"kernel": "cake_hopper_msa_aa3467cf0eac90f51afb_kernel.cu", "binding": "cake_hopper_msa_aa3467cf0eac90f51afb_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_aa3467cf0eac90f51afb", "-DCAKE_BIND_SMEM=82944", "-DCAKE_BIND_THREADS=288", "-DCAKE_FOLD=1"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_prefill"]},
+    "cake_hopper_msa_aaeebb555d02603f6d7d": {"kernel": "cake_hopper_msa_e44b187248ccb2036429_kernel.cu", "binding": "cake_hopper_msa_200ffb0330dbc8893eeb_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_aaeebb555d02603f6d7d", "-DCAKE_BIND_SMEM=87808", "-DCAKE_BIND_THREADS=128", "-DCAKE_L2_EVICT_FIRST=0"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["decode_v5"]},
+    "cake_hopper_msa_ac2766e9d4ba2584d7ae": {"kernel": "cake_hopper_msa_ac2766e9d4ba2584d7ae_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_ac2766e9d4ba2584d7ae", "-DCAKE_BIND_SMEM=35456", "-DCAKE_BIND_THREADS=512", "-DCAKE_INDEX_BITS=6", "-DCAKE_INDEX_LOW_MASK=63", "-DCAKE_INDEX_HIGH_MASK=4294967232u", "-DCAKE_INDEX_SCORE_MASK=2139094976"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_b2f3a1305ff2fa815c81": {"kernel": "cake_hopper_msa_ac2766e9d4ba2584d7ae_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_b2f3a1305ff2fa815c81", "-DCAKE_BIND_SMEM=35456", "-DCAKE_BIND_THREADS=512", "-DCAKE_INDEX_BITS=7", "-DCAKE_INDEX_LOW_MASK=127", "-DCAKE_INDEX_HIGH_MASK=4294967168u", "-DCAKE_INDEX_SCORE_MASK=2139094912"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_b6a2a20bc02e391d3b45": {"kernel": "cake_hopper_msa_6f654886d6934fcaf89a_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_b6a2a20bc02e391d3b45", "-DCAKE_BIND_SMEM=2432", "-DCAKE_BIND_THREADS=32", "-DCAKE_INDEX_BITS=3", "-DCAKE_INDEX_LOW_MASK=7", "-DCAKE_INDEX_HIGH_MASK=4294967288u", "-DCAKE_INDEX_SCORE_MASK=2139095032"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_b8a663af850de1edb0d9": {"kernel": "cake_hopper_msa_b8a663af850de1edb0d9_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_b8a663af850de1edb0d9", "-DCAKE_BIND_SMEM=18560", "-DCAKE_BIND_THREADS=256", "-DCAKE_INDEX_BITS=1", "-DCAKE_INDEX_LOW_MASK=1", "-DCAKE_INDEX_HIGH_MASK=4294967294u", "-DCAKE_INDEX_SCORE_MASK=2139095038"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_ba99bfe0afd9ce76cad5": {"kernel": "cake_hopper_msa_e9f9ae0d08ebbf603198_kernel.cu", "binding": "cake_hopper_msa_e9f9ae0d08ebbf603198_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_ba99bfe0afd9ce76cad5", "-DCAKE_BIND_SMEM=18560", "-DCAKE_BIND_THREADS=128", "-DCAKE_HQ=1", "-DCAKE_SQ=3", "-DCAKE_HQ_SQ=3"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_decode"]},
+    "cake_hopper_msa_bb22f86b3d99286ad074": {"kernel": "cake_hopper_msa_bb22f86b3d99286ad074_kernel.cu", "binding": "cake_hopper_msa_bb22f86b3d99286ad074_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_bb22f86b3d99286ad074", "-DCAKE_BIND_SMEM=99328", "-DCAKE_BIND_THREADS=544"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_prefill"]},
+    "cake_hopper_msa_bc95c6fe0ba17ca60452": {"kernel": "cake_hopper_msa_6a18dd4a679b2805be09_kernel.cu", "binding": "cake_hopper_msa_6a18dd4a679b2805be09_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_bc95c6fe0ba17ca60452", "-DCAKE_BIND_SMEM=35968", "-DCAKE_BIND_THREADS=128", "-DCAKE_HQ=2", "-DCAKE_SQ=3", "-DCAKE_HQ_SQ=6"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_decode"]},
+    "cake_hopper_msa_bcdd1a5a7ff34d9bd896": {"kernel": "cake_hopper_msa_6a18dd4a679b2805be09_kernel.cu", "binding": "cake_hopper_msa_6a18dd4a679b2805be09_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_bcdd1a5a7ff34d9bd896", "-DCAKE_BIND_SMEM=35968", "-DCAKE_BIND_THREADS=128", "-DCAKE_HQ=1", "-DCAKE_SQ=3", "-DCAKE_HQ_SQ=3"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_decode"]},
+    "cake_hopper_msa_bee3f87e8352e3c15b6d": {"kernel": "cake_hopper_msa_bee3f87e8352e3c15b6d_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_bee3f87e8352e3c15b6d", "-DCAKE_BIND_SMEM=384", "-DCAKE_BIND_THREADS=64"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_c068424133e9f294259e": {"kernel": "cake_hopper_msa_d569914059e33efb7b5d_kernel.cu", "binding": "cake_hopper_msa_200ffb0330dbc8893eeb_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_c068424133e9f294259e", "-DCAKE_BIND_SMEM=81408", "-DCAKE_BIND_THREADS=128", "-DCAKE_L2_EVICT_FIRST=0"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["decode_v5"]},
+    "cake_hopper_msa_c331c4b69479b4b27ddd": {"kernel": "cake_hopper_msa_c331c4b69479b4b27ddd_kernel.cu", "binding": "cake_hopper_msa_c331c4b69479b4b27ddd_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_c331c4b69479b4b27ddd", "-DCAKE_BIND_SMEM=91136", "-DCAKE_BIND_THREADS=416"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_prefill"]},
+    "cake_hopper_msa_c3b2a4f1fd24297a9d2b": {"kernel": "cake_hopper_msa_c3b2a4f1fd24297a9d2b_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_c3b2a4f1fd24297a9d2b", "-DCAKE_BIND_SMEM=384", "-DCAKE_BIND_THREADS=32"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_d0a467f526d3867ac5e1": {"kernel": "cake_hopper_msa_6a18dd4a679b2805be09_kernel.cu", "binding": "cake_hopper_msa_6a18dd4a679b2805be09_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_d0a467f526d3867ac5e1", "-DCAKE_BIND_SMEM=35968", "-DCAKE_BIND_THREADS=128", "-DCAKE_HQ=2", "-DCAKE_SQ=4", "-DCAKE_HQ_SQ=8"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_decode"]},
+    "cake_hopper_msa_d11a076134fd62b4b353": {"kernel": "cake_hopper_msa_d11a076134fd62b4b353_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_d11a076134fd62b4b353", "-DCAKE_BIND_SMEM=640", "-DCAKE_BIND_THREADS=32"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_d569914059e33efb7b5d": {"kernel": "cake_hopper_msa_d569914059e33efb7b5d_kernel.cu", "binding": "cake_hopper_msa_200ffb0330dbc8893eeb_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_d569914059e33efb7b5d", "-DCAKE_BIND_SMEM=81408", "-DCAKE_BIND_THREADS=128", "-DCAKE_L2_EVICT_FIRST=1"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["decode_v5"]},
+    "cake_hopper_msa_d5f749fb65a2dcacfe45": {"kernel": "cake_hopper_msa_d5f749fb65a2dcacfe45_kernel.cu", "binding": "cake_hopper_msa_200ffb0330dbc8893eeb_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_d5f749fb65a2dcacfe45", "-DCAKE_BIND_SMEM=87808", "-DCAKE_BIND_THREADS=128", "-DCAKE_L2_EVICT_FIRST=1"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["decode_v5"]},
+    "cake_hopper_msa_db50816bd273fd52da82": {"kernel": "cake_hopper_msa_db50816bd273fd52da82_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_db50816bd273fd52da82", "-DCAKE_BIND_SMEM=2560", "-DCAKE_BIND_THREADS=32"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_db6c9d3115914fecfacf": {"kernel": "cake_hopper_msa_db6c9d3115914fecfacf_kernel.cu", "binding": "cake_hopper_msa_200ffb0330dbc8893eeb_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_db6c9d3115914fecfacf", "-DCAKE_BIND_SMEM=87808", "-DCAKE_BIND_THREADS=128", "-DCAKE_L2_EVICT_FIRST=1"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["decode_v5"]},
+    "cake_hopper_msa_dbd355b7b172f79b91c1": {"kernel": "cake_hopper_msa_dbd355b7b172f79b91c1_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_dbd355b7b172f79b91c1", "-DCAKE_BIND_SMEM=256", "-DCAKE_BIND_THREADS=64"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_de0f3642c1c821652669": {"kernel": "cake_hopper_msa_de0f3642c1c821652669_kernel.cu", "binding": "cake_hopper_msa_bb22f86b3d99286ad074_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_de0f3642c1c821652669", "-DCAKE_BIND_SMEM=99328", "-DCAKE_BIND_THREADS=544"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_prefill"]},
+    "cake_hopper_msa_e3290a79330977e2e676": {"kernel": "cake_hopper_msa_e3290a79330977e2e676_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_e3290a79330977e2e676", "-DCAKE_BIND_SMEM=18688", "-DCAKE_BIND_THREADS=256"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_e3f7ae829be0044f3725": {"kernel": "cake_hopper_msa_e3f7ae829be0044f3725_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_e3f7ae829be0044f3725", "-DCAKE_BIND_SMEM=18688", "-DCAKE_BIND_THREADS=256"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_e44b187248ccb2036429": {"kernel": "cake_hopper_msa_e44b187248ccb2036429_kernel.cu", "binding": "cake_hopper_msa_200ffb0330dbc8893eeb_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_e44b187248ccb2036429", "-DCAKE_BIND_SMEM=87808", "-DCAKE_BIND_THREADS=128", "-DCAKE_L2_EVICT_FIRST=1"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["decode_v5"]},
+    "cake_hopper_msa_e7ceaf13bd710abb0e4e": {"kernel": "cake_hopper_msa_6a18dd4a679b2805be09_kernel.cu", "binding": "cake_hopper_msa_6a18dd4a679b2805be09_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_e7ceaf13bd710abb0e4e", "-DCAKE_BIND_SMEM=35968", "-DCAKE_BIND_THREADS=128", "-DCAKE_HQ=2", "-DCAKE_SQ=1", "-DCAKE_HQ_SQ=2"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_decode"]},
+    "cake_hopper_msa_e7de79c713bd81585160": {"kernel": "cake_hopper_msa_6a18dd4a679b2805be09_kernel.cu", "binding": "cake_hopper_msa_6a18dd4a679b2805be09_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_e7de79c713bd81585160", "-DCAKE_BIND_SMEM=35968", "-DCAKE_BIND_THREADS=128", "-DCAKE_HQ=2", "-DCAKE_SQ=2", "-DCAKE_HQ_SQ=4"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_decode"]},
+    "cake_hopper_msa_e81547a295d9d917baea": {"kernel": "cake_hopper_msa_e9f9ae0d08ebbf603198_kernel.cu", "binding": "cake_hopper_msa_e9f9ae0d08ebbf603198_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_e81547a295d9d917baea", "-DCAKE_BIND_SMEM=18560", "-DCAKE_BIND_THREADS=128", "-DCAKE_HQ=1", "-DCAKE_SQ=2", "-DCAKE_HQ_SQ=2"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_decode"]},
+    "cake_hopper_msa_e9b601567cc3a6dd8033": {"kernel": "cake_hopper_msa_e9b601567cc3a6dd8033_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_e9b601567cc3a6dd8033", "-DCAKE_BIND_SMEM=512", "-DCAKE_BIND_THREADS=64"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_e9f9ae0d08ebbf603198": {"kernel": "cake_hopper_msa_e9f9ae0d08ebbf603198_kernel.cu", "binding": "cake_hopper_msa_e9f9ae0d08ebbf603198_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_e9f9ae0d08ebbf603198", "-DCAKE_BIND_SMEM=18560", "-DCAKE_BIND_THREADS=128", "-DCAKE_HQ=1", "-DCAKE_SQ=1", "-DCAKE_HQ_SQ=1"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["proxy_decode"]},
+    "cake_hopper_msa_eadeab9fa70f479ad877": {"kernel": "cake_hopper_msa_eadeab9fa70f479ad877_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_eadeab9fa70f479ad877", "-DCAKE_BIND_SMEM=37376", "-DCAKE_BIND_THREADS=512"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_ec73383b420033711c12": {"kernel": "cake_hopper_msa_d5f749fb65a2dcacfe45_kernel.cu", "binding": "cake_hopper_msa_200ffb0330dbc8893eeb_binding.cu", "compile_flags": ["--use_fast_math", "-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_ec73383b420033711c12", "-DCAKE_BIND_SMEM=87808", "-DCAKE_BIND_THREADS=128", "-DCAKE_L2_EVICT_FIRST=0"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["decode_v5"]},
+    "cake_hopper_msa_f6b7c28db5340c5e38bf": {"kernel": "cake_hopper_msa_ac2766e9d4ba2584d7ae_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_f6b7c28db5340c5e38bf", "-DCAKE_BIND_SMEM=35456", "-DCAKE_BIND_THREADS=512", "-DCAKE_INDEX_BITS=8", "-DCAKE_INDEX_LOW_MASK=255", "-DCAKE_INDEX_HIGH_MASK=4294967040u", "-DCAKE_INDEX_SCORE_MASK=2139094784"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_f7cca058bf8c73b01aee": {"kernel": "cake_hopper_msa_f7cca058bf8c73b01aee_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_f7cca058bf8c73b01aee", "-DCAKE_BIND_SMEM=19712", "-DCAKE_BIND_THREADS=256"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+    "cake_hopper_msa_fc14209ebc6cac7e0653": {"kernel": "cake_hopper_msa_fc14209ebc6cac7e0653_kernel.cu", "binding": "cake_hopper_msa_025cfebce8c49b67ec28_binding.cu", "compile_flags": ["-DCAKE_PROGRAM_KERNEL=kernel_cake_hopper_msa_fc14209ebc6cac7e0653", "-DCAKE_BIND_SMEM=256", "-DCAKE_BIND_THREADS=32"], "ffi_entry": "run", "arg_plan": _ARG_PLANS["topk_select"]},
+}
+# fmt: on
+
+# fmt: off
+ROUTES: dict[str, str] = {
+    "decode_v5:nc16:s1:st2:evict_first:half:vseq:lean-qk-v-vlate:main": "cake_hopper_msa_56dcad5539ad9283e4c4",
+    "decode_v5:nc16:s1:st2:evict_first:main": "cake_hopper_msa_e44b187248ccb2036429",
+    "decode_v5:nc16:s1:st2:none:main": "cake_hopper_msa_aaeebb555d02603f6d7d",
+    "decode_v5:nc16:s1:st3:none:persist:main": "cake_hopper_msa_9e8f576d0962c01e6d38",
+    "decode_v5:nc16:s2:st2:evict_first:main": "cake_hopper_msa_d5f749fb65a2dcacfe45",
+    "decode_v5:nc16:s2:st2:none:main": "cake_hopper_msa_ec73383b420033711c12",
+    "decode_v5:nc16:s2:st3:none:main": "cake_hopper_msa_5adf7239b83aa93c4897",
+    "decode_v5:nc16:s4:st2:evict_first:main": "cake_hopper_msa_5d570a1e487133c6dca6",
+    "decode_v5:nc16:s4:st2:none:main": "cake_hopper_msa_3ac2f034fe9238ad3b82",
+    "decode_v5:nc16:s8:st2:evict_first:main": "cake_hopper_msa_db6c9d3115914fecfacf",
+    "decode_v5:nc16:s8:st2:none:main": "cake_hopper_msa_7b36cd26ef2fda8ca238",
+    "decode_v5:nc8:s16:st2:evict_first:main": "cake_hopper_msa_200ffb0330dbc8893eeb",
+    "decode_v5:nc8:s16:st2:none:main": "cake_hopper_msa_9f2b923fef8d64829d34",
+    "decode_v5:nc8:s1:st2:evict_first:half:vseq:main": "cake_hopper_msa_7b41c417f2155cba303c",
+    "decode_v5:nc8:s1:st2:evict_first:main": "cake_hopper_msa_d569914059e33efb7b5d",
+    "decode_v5:nc8:s1:st2:none:main": "cake_hopper_msa_c068424133e9f294259e",
+    "decode_v5:nc8:s2:st2:evict_first:main": "cake_hopper_msa_434683e642fc2353d459",
+    "decode_v5:nc8:s2:st2:none:main": "cake_hopper_msa_68ed6c2ee8c7e4e9b9e7",
+    "decode_v5:nc8:s4:st2:evict_first:main": "cake_hopper_msa_98d948252b6f068d1c81",
+    "decode_v5:nc8:s4:st2:none:main": "cake_hopper_msa_5a3b3a1697633a0e8b04",
+    "decode_v5:nc8:s8:st4:evict_first:half:main": "cake_hopper_msa_2841be2dbf5dd0850755",
+    "decode_v5:nc8:s8:st4:none:half:main": "cake_hopper_msa_17cd0cc3a08e4f2a8aab",
+    "prefill_v1:g16:nr32:st2:none:ksplit:main": "cake_hopper_msa_6c4ab03fa64cb21663ed",
+    "prefill_v1:g4:nr32:st2:none:ksplit:main": "cake_hopper_msa_1533648d99b5503e11d3",
+    "prefill_v1:g8:nr32:st2:none:ksplit:main": "cake_hopper_msa_93a9c57f2a8dddc0caab",
+    "prefill_v2:g16:nc2:st4:fb2:none:qrs:pp:pvwait:role:amma:main": "cake_hopper_msa_9a5ac33b7664412dcc01",
+    "prefill_v2:g4:nc2:st4:fb2:none:qrs:pp:pvwait:role:amma:main": "cake_hopper_msa_9836e2dce49c4f15dfce",
+    "prefill_v2:g8:nc2:st4:fb2:none:qrs:pp:pvwait:role:amma:main": "cake_hopper_msa_859fe30a3573f05eae1c",
+    "proxy_decode:bf16:hq1:sq1:main": "cake_hopper_msa_6a18dd4a679b2805be09",
+    "proxy_decode:bf16:hq1:sq2:main": "cake_hopper_msa_112f343295150aa53f1b",
+    "proxy_decode:bf16:hq1:sq3:main": "cake_hopper_msa_bcdd1a5a7ff34d9bd896",
+    "proxy_decode:bf16:hq1:sq4:main": "cake_hopper_msa_79943b91410024d2d669",
+    "proxy_decode:bf16:hq2:sq1:main": "cake_hopper_msa_e7ceaf13bd710abb0e4e",
+    "proxy_decode:bf16:hq2:sq2:main": "cake_hopper_msa_e7de79c713bd81585160",
+    "proxy_decode:bf16:hq2:sq3:main": "cake_hopper_msa_bc95c6fe0ba17ca60452",
+    "proxy_decode:bf16:hq2:sq4:main": "cake_hopper_msa_d0a467f526d3867ac5e1",
+    "proxy_decode:bf16:hq4:sq1:main": "cake_hopper_msa_72b2aa6d03c5f8f9ad54",
+    "proxy_decode:bf16:hq4:sq2:main": "cake_hopper_msa_33db3e98efe0657eaf8c",
+    "proxy_decode:bf16:hq4:sq3:main": "cake_hopper_msa_28d169fe4dab7b3b30ce",
+    "proxy_decode:bf16:hq4:sq4:main": "cake_hopper_msa_5ed0c641bcea3a524077",
+    "proxy_decode:fp8:hq1:sq1:main": "cake_hopper_msa_e9f9ae0d08ebbf603198",
+    "proxy_decode:fp8:hq1:sq2:main": "cake_hopper_msa_e81547a295d9d917baea",
+    "proxy_decode:fp8:hq1:sq3:main": "cake_hopper_msa_ba99bfe0afd9ce76cad5",
+    "proxy_decode:fp8:hq1:sq4:main": "cake_hopper_msa_7bf42068b30a7198903c",
+    "proxy_decode:fp8:hq2:sq1:main": "cake_hopper_msa_2336edef056031b8d505",
+    "proxy_decode:fp8:hq2:sq2:main": "cake_hopper_msa_47452510f979fcf77372",
+    "proxy_decode:fp8:hq2:sq3:main": "cake_hopper_msa_02949879f73b80e4a89d",
+    "proxy_decode:fp8:hq2:sq4:main": "cake_hopper_msa_5b4a0b9e9f07928582f0",
+    "proxy_decode:fp8:hq4:sq1:main": "cake_hopper_msa_4c19e05879003d7441c6",
+    "proxy_decode:fp8:hq4:sq2:main": "cake_hopper_msa_4c525bd96e3b3a405ca9",
+    "proxy_decode:fp8:hq4:sq3:main": "cake_hopper_msa_5fdc63d045d78d90a65b",
+    "proxy_decode:fp8:hq4:sq4:main": "cake_hopper_msa_10a5ce76abdf61206e96",
+    "proxy_prefill:fp8:st4:sb:f16db:main": "cake_hopper_msa_de0f3642c1c821652669",
+    "proxy_prefill:fp8:st4:sb:f16t4:main": "cake_hopper_msa_38ae2dcd5875ff4f4492",
+    "proxy_prefill:fp8:st4:sb:f16t4F:main": "cake_hopper_msa_aa3467cf0eac90f51afb",
+    "proxy_prefill:fp8:st4:sb:f16w3L:main": "cake_hopper_msa_c331c4b69479b4b27ddd",
+    "proxy_prefill:fp8:st4:sb:wg4st:main": "cake_hopper_msa_bb22f86b3d99286ad074",
+    "topk_select:c128:w4:l6:masked:nvp:lat:main": "cake_hopper_msa_ac2766e9d4ba2584d7ae",
+    "topk_select:c128:w4:l7:masked:nvp:lat:main": "cake_hopper_msa_b2f3a1305ff2fa815c81",
+    "topk_select:c128:w4:l8:masked:nvp:lat:main": "cake_hopper_msa_f6b7c28db5340c5e38bf",
+    "topk_select:c16:w16:l9:masked:nvp:lat:t32:main": "cake_hopper_msa_e3290a79330977e2e676",
+    "topk_select:c16:w16:l9:plain:t32:main": "cake_hopper_msa_e3f7ae829be0044f3725",
+    "topk_select:c16:w2:l5:masked:nvp:lat:main": "cake_hopper_msa_6400f9b940af49476321",
+    "topk_select:c16:w8:l10:masked:nvp:lat:main": "cake_hopper_msa_68735943ee82c916aba4",
+    "topk_select:c1:w128:l11:masked:nvp:main": "cake_hopper_msa_7bbffa90057de145b905",
+    "topk_select:c1:w128:l11:plain:main": "cake_hopper_msa_276e272a54b4efd20df6",
+    "topk_select:c1:w32:l9:masked:nvp:main": "cake_hopper_msa_db50816bd273fd52da82",
+    "topk_select:c1:w32:l9:plain:main": "cake_hopper_msa_a1ae7ef9e264d4f504dd",
+    "topk_select:c1:w64:l10:masked:nvp:main": "cake_hopper_msa_dbd355b7b172f79b91c1",
+    "topk_select:c256:w1:l1:masked:nvp:lat:main": "cake_hopper_msa_b8a663af850de1edb0d9",
+    "topk_select:c256:w1:l3:masked:nvp:lat:main": "cake_hopper_msa_a68e884144b35797092c",
+    "topk_select:c2:w128:l11:masked:nvp:lat:main": "cake_hopper_msa_f7cca058bf8c73b01aee",
+    "topk_select:c2:w128:l11:plain:main": "cake_hopper_msa_025cfebce8c49b67ec28",
+    "topk_select:c2:w16:l8:masked:nvp:lat:main": "cake_hopper_msa_fc14209ebc6cac7e0653",
+    "topk_select:c2:w32:l9:masked:nvp:lat:main": "cake_hopper_msa_e9b601567cc3a6dd8033",
+    "topk_select:c2:w32:l9:plain:main": "cake_hopper_msa_bee3f87e8352e3c15b6d",
+    "topk_select:c32:w16:l11:masked:nvp:lat:main": "cake_hopper_msa_eadeab9fa70f479ad877",
+    "topk_select:c32:w16:l11:plain:main": "cake_hopper_msa_6bc022e40283794cee7f",
+    "topk_select:c32:w1:l1:masked:nvp:lat:main": "cake_hopper_msa_6f654886d6934fcaf89a",
+    "topk_select:c32:w1:l3:masked:nvp:lat:main": "cake_hopper_msa_b6a2a20bc02e391d3b45",
+    "topk_select:c32:w4:l6:masked:nvp:lat:main": "cake_hopper_msa_74205ef0b2ce7da8e6d8",
+    "topk_select:c32:w4:l6:plain:main": "cake_hopper_msa_20ef3836378e7e27b4cc",
+    "topk_select:c4:w8:l7:masked:nvp:lat:main": "cake_hopper_msa_c3b2a4f1fd24297a9d2b",
+    "topk_select:c64:w8:l10:masked:nvp:lat:main": "cake_hopper_msa_26311d226b72e91edb96",
+    "topk_select:c64:w8:l11:masked:nvp:lat:main": "cake_hopper_msa_10913214edb8c25d60e6",
+    "topk_select:c8:w32:l9:masked:nvp:lat:main": "cake_hopper_msa_8b6a95d561090f227dab",
+    "topk_select:c8:w32:l9:plain:main": "cake_hopper_msa_43e957550739d30313fb",
+    "topk_select:c8:w4:l6:masked:nvp:lat:main": "cake_hopper_msa_32dffc6bff721ed84d72",
+    "topk_select:c8:w4:l6:plain:main": "cake_hopper_msa_d11a076134fd62b4b353",
+}
+# fmt: on
+
+
+def _csrc_dir() -> Path:
+    for root in (
+        jit_env.FLASHINFER_CSRC_DIR,
+        Path(__file__).resolve().parents[2] / "csrc",
+    ):
+        if (root / "cake_hopper_msa").exists():
+            return root
+    raise FileNotFoundError(
+        "Hopper MSA CUDA sources were not found under csrc/cake_hopper_msa"
+    )
+
+
+def route_program(key: str) -> str:
+    """Program name of one logical route (``<route key>:<stage>``)."""
+    try:
+        return ROUTES[key]
+    except KeyError:
+        raise KeyError(f"no Hopper MSA program for route {key!r}") from None
+
+
+@functools.cache
+def _content_digest(name: str) -> str:
+    """First twenty hex digits of the SHA-256 over the program's two sources and
+    the compact JSON of its compile flags and target, computed once per process
+    at first use."""
+    csrc = _csrc_dir() / "cake_hopper_msa"
+    record = MODULES[name]
+    digest = hashlib.sha256()
+    digest.update((csrc / record["kernel"]).read_bytes())
+    digest.update((csrc / record["binding"]).read_bytes())
+    identity = {"options": list(record["compile_flags"]), "target": _ARCHES[0]}
+    digest.update(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    return digest.hexdigest()[:20]
+
+
+def get_hopper_msa_uri(name: str) -> str:
+    """JIT / AOT key of one program: its name, the target and its content digest."""
+    if name not in MODULES:
+        raise ValueError(f"unsupported Hopper MSA program: {name}")
+    return f"{name}_{_TARGET}_{_content_digest(name)}"
+
+
+@functools.cache
+def gen_hopper_msa_module(name: str) -> JitSpec:
+    uri = get_hopper_msa_uri(name)
+    record = MODULES[name]
+    csrc = _csrc_dir()
+    return gen_jit_spec(
+        name=uri,
+        sources=[
+            csrc / "cake_hopper_msa" / record["kernel"],
+            csrc / "cake_hopper_msa" / record["binding"],
+        ],
+        extra_cuda_cflags=[*sm90a_nvcc_flags, *record["compile_flags"]],
+        extra_include_paths=[csrc / "cake_hopper_msa"],
+    )
+
+
+@functools.cache
+def load_hopper_msa_module(name: str):
+    return gen_hopper_msa_module(name).build_and_load()
+
+
+def get_hopper_msa_module(name: str):
+    """The loaded module of one program."""
+    return load_hopper_msa_module(name)
+
+
+__all__ = [
+    "MODULES",
+    "ROUTES",
+    "gen_hopper_msa_module",
+    "get_hopper_msa_module",
+    "get_hopper_msa_uri",
+    "load_hopper_msa_module",
+    "route_program",
+]
