@@ -42,7 +42,13 @@ pre-mainloop residual prefetch, the QKV GEMM its packed-RoPE-table twins
 `*_cs`; the half-N tail twins `*_h` (`cake_backend.HALF_TWIN`,
 `half_tail_split`) run the tiles past the last full persistent round as
 half-width items whenever they fit one half-round with margin, bitwise
-identical per output element to the base tile); the attention unit layout
+identical per output element to the base tile; on the architectures of
+`cake_backend.WEIGHT_PF_LEAD_ARCHES` the PDL_EARLY QKV, FC0 and FC1 forms up
+to 256 rows run the `*_wpl` twin of their tile, which prefetches the weight
+boxes past the first ring fill into L2 before the grid-dependency wait, and on
+those of `cake_backend.A_BOX_ARCHES` the merger GEMMs up to 64 merged rows run
+the `xs_ab` / `s_ab` twin, which loads a 64-row A box: same launch, same stored
+rows); the attention unit layout
 and the automatic tail split are chosen per `grid_thws` batch from the
 split-aware LPT makespans of both layouts
 (`cake_backend.select_layout_and_split`: the `units mod G` cheapest units of
@@ -57,7 +63,7 @@ lists every logical kernel the plan rule can select per architecture (the
 GEMM tile / PDL census, the attention-form census over single segments up to
 70016 tokens and the exported rows, the merge kernels).  The export registers
 the programs its rows launch: the 22 rows of the evaluation contract (the
-acceptance denominator) plus eleven export-only *coverage* rows
+acceptance denominator) plus twelve export-only *coverage* rows
 (`COVERAGE_ROW_GRIDS`; validated bitwise against the source tower, not part
 of the acceptance geomean) that reach the keys no contract row exercises
 (for example half-N twins at token counts outside the rows, the out-proj

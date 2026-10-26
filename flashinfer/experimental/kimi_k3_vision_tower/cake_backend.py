@@ -1685,21 +1685,80 @@ def _fc1_tma_tile(name: str, variant: str, M: int) -> str:
     return name
 
 
+# Pre-wait L2 weight prefetch twins (Cake ``kimi_k3_vision_gemm`` ``*_wpl``): the PDL_EARLY forms of norm_qkv_rope,
+# norm_gelu and the two fc1 forms at M <= TINY_M_LIMIT launch the twin of their tile on the arches of
+# ``WEIGHT_PF_LEAD_ARCHES``.  The twin is the base tile's program plus L2 prefetches, issued before the grid-dependency
+# wait, of the weight boxes its first item loads after the ring fill: same TileConfig, launch and stored rows.
+WEIGHT_PF_LEAD_ARCHES = frozenset({"sm_100a", "sm_103a"})
+WEIGHT_PF_LEAD_VARIANTS = (
+    "norm_qkv_rope",
+    "norm_gelu",
+    "residual_fc1",
+    "residual_fc1_sqxw",
+)
+WEIGHT_PF_LEAD_TWINS = {
+    "xs": "xs_wpl",
+    "xs_cs_pf": "xs_cs_pf_wpl",
+    "xs_k4_pf": "xs_k4_pf_wpl",
+}
+# 64-row A-box twins (Cake ``*_ab``) of the merger GEMMs' production tiles at M <= A_BOX_MAX_M outside the PDL_EARLY
+# window, on the arches of ``A_BOX_ARCHES``.  The twin loads a 64-row A box instead of 128 rows half of which are TMA
+# zero fill; the A rows it never writes feed only output rows >= M, which are not stored.  Its launcher refuses
+# M > A_BOX_MAX_M.  Same TileConfig and launch geometry as the base tile.
+A_BOX_ARCHES = frozenset({"sm_100a", "sm_103a"})
+A_BOX_TWINS = {("gelu_erf", "xs"): "xs_ab", ("rmsnorm", "s"): "s_ab"}
+A_BOX_MAX_M = 64
+for _base, _twin in WEIGHT_PF_LEAD_TWINS.items():
+    TILE_CONFIGS[_twin] = dataclasses.replace(TILE_CONFIGS[_base], name=_twin)
+for (_variant, _base), _twin in A_BOX_TWINS.items():
+    TILE_CONFIGS[_twin] = dataclasses.replace(TILE_CONFIGS[_base], name=_twin)
+
+
+def _weight_pf_lead_twin(name: str, variant: str, M: int, arch: Optional[str]) -> str:
+    """``name``'s pre-wait weight prefetch twin (``WEIGHT_PF_LEAD_TWINS``) where ``arch`` takes it and the launch is a
+    PDL_EARLY form of ``WEIGHT_PF_LEAD_VARIANTS`` at M <= TINY_M_LIMIT; ``name`` otherwise (and with no arch)."""
+    if (
+        arch in WEIGHT_PF_LEAD_ARCHES
+        and variant in WEIGHT_PF_LEAD_VARIANTS
+        and name in WEIGHT_PF_LEAD_TWINS
+        and int(M) <= TINY_M_LIMIT
+        and pdl_early_on(variant, M)
+    ):
+        return WEIGHT_PF_LEAD_TWINS[name]
+    return name
+
+
+def _a_box_twin(name: str, variant: str, M: int, arch: Optional[str]) -> str:
+    """``name``'s 64-row A-box twin (``A_BOX_TWINS``) where ``arch`` takes it, M <= A_BOX_MAX_M and the launch is
+    outside the PDL_EARLY window; ``name`` otherwise (and with no arch)."""
+    if (
+        arch in A_BOX_ARCHES
+        and (variant, name) in A_BOX_TWINS
+        and int(M) <= A_BOX_MAX_M
+        and not pdl_early_on(variant, M)
+    ):
+        return A_BOX_TWINS[variant, name]
+    return name
+
+
 def select_tile_config(
     variant: str, M: int, sm_count: int = DEFAULT_SM_COUNT, arch: Optional[str] = None
 ) -> TileConfig:
     """Production tile config for ``(variant, M)``; mirrors ``kimi_k3_vision_gemm.select_tile_config``: the
     round-3 .. round-6 routing (:func:`_select_tile_config_base`), the half-N tail twin of the non-pos forms where the
     census tail fits one half-round (:func:`_half_twin`) and, as the outermost steps, the column-first raster twin of
-    the fc1 stream-K pair tile inside the windows of ``arch`` (:func:`_cols_first_twin`) and the fc1 forms'
-    TMA-epilogue tile inside ``FC1_TMA_WINDOWS`` (:func:`_fc1_tma_tile`)."""
+    the fc1 stream-K pair tile inside the windows of ``arch`` (:func:`_cols_first_twin`), the fc1 forms'
+    TMA-epilogue tile inside ``FC1_TMA_WINDOWS`` (:func:`_fc1_tma_tile`) and the small-M twins of ``arch``
+    (:func:`_weight_pf_lead_twin`, :func:`_a_box_twin`)."""
     cfg = _select_tile_config_base(variant, M, sm_count, arch)
     n_total, _k_total, pos_split = GEMM_VARIANTS[variant]
     if pos_split:
         return cfg  # gemm_pos streams row pairs: no half-N tail
     name = _half_twin(cfg.name, n_total, M, sm_count, variant)
     name = _cols_first_twin(name, variant, M, arch)
-    return TILE_CONFIGS[_fc1_tma_tile(name, variant, M)]
+    name = _fc1_tma_tile(name, variant, M)
+    name = _weight_pf_lead_twin(name, variant, M, arch)
+    return TILE_CONFIGS[_a_box_twin(name, variant, M, arch)]
 
 
 def _select_tile_config_base(
@@ -1955,6 +2014,7 @@ def gemm_census_counts(variant: str) -> tuple[int, ...]:
         QKV_M_E8_MIN_M,
         L_E8_HALF_MAX_M,
         FC1_SK_L_MAX_M,
+        A_BOX_MAX_M,
     ):
         counts.update((bound, bound + 1))
     for lo, hi in PDL_EARLY_WINDOW.get(variant, PDL_EARLY_DEFAULT_WINDOW):
@@ -2005,7 +2065,8 @@ CONTRACT_ROW_GRIDS: dict[str, tuple[tuple[int, int, int], ...]] = {
 # Export-only coverage rows of the Cake export (``COVERAGE_GRIDS``, tag ``coverage``): the minimal grid_thws set reaching
 # every kernel key the 22 contract rows do not (half-N twins at token counts no row has, the plain two-tile form on
 # SM100, the plain / split one-tile forms on SM103, the QKV eight-warp tile's early form, the fc1 pair tile outside the
-# column-first windows on SM103 and above the stream-K window).  Exported and validated bitwise; not part of the acceptance geomean.
+# column-first windows on SM103 and above the stream-K window, the merger RMSNorm one-tile form above the A-box twins'
+# 64 rows).  Exported and validated bitwise; not part of the acceptance geomean.
 COVERAGE_ROW_GRIDS: dict[str, tuple[tuple[int, int, int], ...]] = {
     "cov_batch11_224": ((1, 16, 16),) * 11,
     "cov_img_476x476": ((1, 34, 34),),
@@ -2018,6 +2079,7 @@ COVERAGE_ROW_GRIDS: dict[str, tuple[tuple[int, int, int], ...]] = {
     "cov_img_2296x700": ((1, 50, 164),),
     "cov_video_720p_32f_28x28": ((4, 52, 92),) * 8 + ((1, 2, 2),),
     "cov_img_1568x896": ((1, 64, 112),),
+    "cov_img_280x224": ((1, 16, 20),),
 }
 
 

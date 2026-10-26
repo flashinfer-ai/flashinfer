@@ -377,7 +377,7 @@ def test_select_tile_config_buckets():
     # column-first twin windows) plus the rule boundaries and the window edges on M.
     assert cb.GEMM_CENSUS_LIMIT == 153088 + GEMM_BLOCK_M
     counts = cb.gemm_census_counts("gelu_erf")
-    assert counts[:3] == (1, 129, 143) and {
+    assert counts[:5] == (1, 64, 65, 129, 143) and {
         143,
         144,
         638,
@@ -613,6 +613,43 @@ def test_pdl_early_window_and_exclusions():
         cb.gemm_stage_key("residual_fc1_sqxw", 4784, sm_count=160)
         == "gemm:residual_fc1_sqxw:l_e8_pf:pdle"
     )
+
+
+@pytest.mark.parametrize("arch", sorted(SUPPORTED_COMPUTE_CAPABILITIES.values()))
+def test_small_m_twins_route_per_arch(arch):
+    # The pre-wait weight prefetch twins (``*_wpl``: the PDL_EARLY QKV / FC0 / FC1 forms up to TINY_M_LIMIT rows)
+    # and the 64-row A-box twins (``*_ab``: the merger GEMMs up to A_BOX_MAX_M rows, outside the PDL_EARLY window)
+    # replace their base tile only on the arches of their scope; the twin keeps the base TileConfig.
+    wpl, ab = arch in cb.WEIGHT_PF_LEAD_ARCHES, arch in cb.A_BOX_ARCHES
+    for variant, base, twin in (
+        ("norm_qkv_rope", "xs_cs_pf", "xs_cs_pf_wpl"),
+        ("norm_gelu", "xs", "xs_wpl"),
+        ("residual_fc1", "xs_k4_pf", "xs_k4_pf_wpl"),
+        ("residual_fc1_sqxw", "xs_k4_pf", "xs_k4_pf_wpl"),
+    ):
+        for m in (1, 256):
+            assert cb.gemm_stage_key(variant, m, arch=arch) == (
+                f"gemm:{variant}:{twin if wpl else base}:pdle"
+            )
+        assert cb.gemm_stage_key(variant, 1) == f"gemm:{variant}:{base}:pdle"
+    assert cb.gemm_stage_key("norm_qkv_rope", 257, arch=arch) == (
+        "gemm:norm_qkv_rope:xs_cs_pf:pdle"
+    )
+    assert cb.gemm_stage_key("residual_wo_sqxw", 256, arch=arch) == (
+        "gemm:residual_wo_sqxw:xs_pf:pdle"
+    )
+    for variant, base, twin in (("gelu_erf", "xs", "xs_ab"), ("rmsnorm", "s", "s_ab")):
+        for m in (1, 64):
+            assert cb.gemm_stage_key(variant, m, arch=arch) == (
+                f"gemm:{variant}:{twin if ab else base}"
+            )
+        assert cb.gemm_stage_key(variant, 65, arch=arch) == f"gemm:{variant}:{base}"
+        assert cb.gemm_stage_key(variant, 64) == f"gemm:{variant}:{base}"
+    for base, twin in (
+        *cb.WEIGHT_PF_LEAD_TWINS.items(),
+        *((name, t) for (_v, name), t in cb.A_BOX_TWINS.items()),
+    ):
+        assert dataclasses.replace(TILE_CONFIGS[twin], name=base) == TILE_CONFIGS[base]
 
 
 @pytest.mark.parametrize("arch", sorted(SUPPORTED_COMPUTE_CAPABILITIES.values()))

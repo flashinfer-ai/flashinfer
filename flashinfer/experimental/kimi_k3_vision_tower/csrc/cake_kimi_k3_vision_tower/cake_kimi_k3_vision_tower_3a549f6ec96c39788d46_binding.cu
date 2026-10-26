@@ -27,10 +27,10 @@
 #define CAKE_STRINGIZE(x) CAKE_STRINGIZE_(x)
 
 #ifndef CAKE_PROGRAM_KERNEL
-#define CAKE_PROGRAM_KERNEL kernel_cake_kimi_k3_vision_tower_366dd4e66e59b62c4255
+#define CAKE_PROGRAM_KERNEL kernel_cake_kimi_k3_vision_tower_3a549f6ec96c39788d46
 #endif
 #ifndef CAKE_PROGRAM_SHIM
-#define CAKE_PROGRAM_SHIM cake_binding_kernel_cake_kimi_k3_vision_tower_366dd4e66e59b62c4255
+#define CAKE_PROGRAM_SHIM cake_binding_kernel_cake_kimi_k3_vision_tower_3a549f6ec96c39788d46
 #endif
 #ifndef CAKE_BINDING_THREADS
 #define CAKE_BINDING_THREADS 192
