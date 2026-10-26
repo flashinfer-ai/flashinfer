@@ -8744,6 +8744,18 @@ def trtllm_batch_context_with_kv_cache(
         lse_stride_tokens = 0
         lse_stride_heads = 0
 
+    if backend == "cake" and (query.size(0) == 0 or max_q_len == 0 or batch_size == 0):
+        # No request has a query token: there is nothing to attend or write,
+        # so return before choosing a route or launching a kernel.
+        empty_out = (
+            out
+            if out_dtype != "nvfp4"
+            else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
+        )
+        if return_lse:
+            return empty_out, lse
+        return empty_out
+
     if backend == "cake":
         from .cake_fmha import (
             get_cake_fmha_context_module,

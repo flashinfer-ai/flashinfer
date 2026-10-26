@@ -915,3 +915,50 @@ def test_cake_context_program_launch_invariances_are_bitwise(
     torch.cuda.synchronize()
     assert torch.equal(_bits(graph_out), _bits(direct))
     assert not case.counter.any()
+
+
+@_GPU
+@pytest.mark.parametrize("kv_len", (0, 300))
+@pytest.mark.parametrize(
+    "row", ("bf16_b128_q64_k2048", "fp8_b256_q32_k1024", "nvfp4_b4_q511_k2047")
+)
+def test_cake_context_batch_without_query_tokens_returns_before_any_launch(
+    monkeypatch, row, kv_len
+) -> None:
+    """A batch whose requests have no query token (KV empty or not) returns its
+    empty output and LSE without choosing a route or launching a kernel."""
+
+    case = _context_case(row, 3, 1)
+    device = case.query.device
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("a batch without query tokens chose a route")
+
+    monkeypatch.setattr(cake_api, "select_cake_fmha_context_route", refuse)
+    monkeypatch.setattr(cake_api, "get_cake_fmha_context_module", refuse)
+    query = case.query[:0]
+    seq_lens = torch.full((case.batch,), kv_len, dtype=torch.int32, device=device)
+    out = torch.empty_like(query)
+    result, lse = prefill.trtllm_batch_context_with_kv_cache(
+        query,
+        (case.key, case.value),
+        case.workspace,
+        case.block_tables,
+        seq_lens,
+        0,
+        kv_len,
+        *_SCALES.get(case.component, _QUANT_SCALES),
+        case.batch,
+        torch.zeros(case.batch + 1, dtype=torch.int32, device=device),
+        torch.arange(case.batch + 1, dtype=torch.int32, device=device) * kv_len,
+        out=out,
+        kv_layout="HND",
+        kv_cache_sf=case.kv_cache_sf,
+        uses_shared_paged_kv_idx=case.shared,
+        multi_ctas_kv_counter_buffer=case.counter,
+        return_lse=True,
+        backend="cake",
+    )
+    assert result is out and out.shape[0] == 0
+    assert lse.shape == (0, case.query.shape[1])
+    assert not case.counter.any()
