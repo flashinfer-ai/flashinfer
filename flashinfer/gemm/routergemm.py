@@ -1042,7 +1042,7 @@ _SM100 = (
     _Tcgen05Window("PACKED_NARROW", 1, 4, True, 32, 320, 8192, 20480),
     _Tcgen05Window("PACKED_NARROW", 1, 6, True, 32, 384, 11264, 20480),
     _Tcgen05Window("PACKED_NARROW", 2, 6, True, 256, 320, 3584, 4096),
-    _Tcgen05Window("PACKED_NARROW", 7, 8, True, 32, 128, 7168, 8192),
+    _Tcgen05Window("PACKED_NARROW", 6, 9, True, 32, 192, 6144, 9216),
     _Tcgen05Window("PACKED_NARROW", 1, 4, False, 32, 512, 8192, 20480),
     _Tcgen05Window("PACKED_NARROW", 2, 8, False, 32, 256, 6144, 20480),
     _Tcgen05Window("PACKED_NARROW", 1, 6, False, 32, 384, 8192, 20480),
