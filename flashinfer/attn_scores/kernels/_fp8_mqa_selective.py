@@ -257,6 +257,14 @@ class FP8MQASelectiveLogitsKernel(_FP8MQAEngineMixin):
     _store_policy_f32 = staticmethod(i32_bits_to_fp32)
     _engine_relu_f32 = staticmethod(relu_f32)
 
+    @cute.jit
+    def _release_kv_after_scale_use(self, kv_pipeline, kv_cons_state):
+        """Defensively order late scale reads before selective KV-stage reuse."""
+        cute.arch.fence_view_async_shared()
+        kv_pipeline.consumer_release(kv_cons_state)
+        kv_cons_state.advance()
+        return kv_cons_state
+
     def _initialize_geometry(
         self,
         block_kv: int = 128,

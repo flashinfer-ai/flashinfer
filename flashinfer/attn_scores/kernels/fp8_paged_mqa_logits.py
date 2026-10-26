@@ -392,13 +392,9 @@ class _FP8MQAEngineMixin(_FP8MQALayoutMixin):
 
     @cute.jit
     def _release_kv_after_scale_use(self, kv_pipeline, kv_cons_state):
-        """End a KV generation at the consumer's explicit final scale-use site.
-
-        Ordinary calls at its existing early epilogue boundary; SAMPLE calls
-        only after every flattened subtile has consumed the scale. Reduction
-        and ingress adapters must not call this or advance states themselves.
-        """
-        cute.arch.fence_view_async_shared()
+        """Release the KV generation at its consumer's final scale-use site."""
+        # Ordinary scale loads precede this arrival in program order; the
+        # producer waits for the arrival before reusing the shared stage.
         kv_pipeline.consumer_release(kv_cons_state)
         kv_cons_state.advance()
         return kv_cons_state
