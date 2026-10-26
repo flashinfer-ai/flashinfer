@@ -207,9 +207,9 @@ class WarpGroupedProjection:
         if cutlass.const_expr(self.a_dtype.width != 16 and self.a_dtype.width != 8):
             raise TypeError("a_dtype should be float16 or float8")
         # Packed scale stages always need the cooperative producer.
-        # Small typed decode keeps the serial producer. At T >= 8, and for
-        # native FP8, cooperative gather overlaps the asynchronous weight copy.
-        # This decision uses static geometry, never the current route contents.
+        # E4M3 weights, including W8A16, use cooperative gather at every T.
+        # Dense 16-bit weights use it at T >= 8 to overlap the weight copy;
+        # smaller dense decode retains the serial producer.
         self.cooperative_gather = (
             self.packed_nvfp4
             or self.a_dtype == cutlass.Float8E4M3FN
