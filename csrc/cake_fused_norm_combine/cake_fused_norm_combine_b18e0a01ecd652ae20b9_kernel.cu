@@ -52,7 +52,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_SCRATCH_OFF 0
 #define SMEM_SCRATCH_STAGE_BYTES 128
 #define SMEM_SCRATCH_STRIDE 128
-#define SMEM_TOTAL 128
+#define SMEM_HANDOFF_OFF 128
+#define SMEM_HANDOFF_STAGE_BYTES 8
+#define SMEM_HANDOFF_STRIDE 8
+#define SMEM_TOTAL 256
 #define THREADS 320
 
 #include <math_constants.h>
@@ -60,7 +63,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(320) void
-kernel_cake_fused_norm_combine_426f8d7edfb8a57040ce(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ residual, __nv_bfloat16* __restrict__ weight, __nv_bfloat16* __restrict__ norm_out, __nv_bfloat16* __restrict__ residual_out, __nv_bfloat16* __restrict__ collective_out, unsigned long long* __restrict__ workspace, int rank, int tokens, float epsilon)
+kernel_cake_fused_norm_combine_b18e0a01ecd652ae20b9(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ residual, __nv_bfloat16* __restrict__ weight, __nv_bfloat16* __restrict__ norm_out, __nv_bfloat16* __restrict__ residual_out, __nv_bfloat16* __restrict__ collective_out, unsigned long long* __restrict__ workspace, int rank, int tokens, float epsilon)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -83,6 +86,8 @@ kernel_cake_fused_norm_combine_426f8d7edfb8a57040ce(__nv_bfloat16* __restrict__ 
     // Kernel setup ops
     float* scratch = reinterpret_cast<float*>(smem_raw + 0);
     const int scratch_addr = smem + 0;
+    unsigned long long* handoff = reinterpret_cast<unsigned long long*>(smem_raw + 128);
+    const int handoff_addr = smem + 128;
 
     // ---- Role: producers ----
     if (warp <= 4) {
@@ -92,12 +97,6 @@ kernel_cake_fused_norm_combine_426f8d7edfb8a57040ce(__nv_bfloat16* __restrict__ 
                 asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(x + row)));
                 asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(residual + row)));
                 asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(weight + (tid * 64))));
-            }
-            if (tid == 0) {
-                asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(workspace + 16)));
-                uint64_t _sysv_u32_0;
-                asm volatile("ld.volatile.global.u64 %0, [%1];" : "=l"(_sysv_u32_0) : "l"(workspace + 24) : "memory");
-                asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(reinterpret_cast<int*>(_sysv_u32_0))));
             }
             asm volatile("griddepcontrol.wait;" ::: "memory");
             int lane_1 = tid;
@@ -133,22 +132,8 @@ kernel_cake_fused_norm_combine_426f8d7edfb8a57040ce(__nv_bfloat16* __restrict__ 
                     : "=r"(next_r1[0 + 0]), "=r"(next_r1[0 + 1]), "=r"(next_r1[0 + 2]), "=r"(next_r1[0 + 3]), "=r"(next_r1[0 + 4]), "=r"(next_r1[0 + 5]), "=r"(next_r1[0 + 6]), "=r"(next_r1[0 + 7]) : "l"((const void*)((const char*)(residual + (base + 2560) + 0) + 0)) : "memory");
             }
             unsigned long long owner_address = workspace[16 + bid % 8];
-            unsigned long long control_address = workspace[24];
-            int* control_0 = reinterpret_cast<int*>(control_address);
-            int control_current_word = control_0[2];
-            int control_bytes_per_buffer_word = control_0[3];
-            int control_clear_word = control_0[4];
-            int control_current = control_current_word % 3;
-            int control_dirty = (control_current_word + 2) % 3;
-            __nv_bfloat16* local_payload = reinterpret_cast<__nv_bfloat16*>(workspace[16 + rank]);
-            long long data_base = (long long)control_current * (long long)control_bytes_per_buffer_word / 2;
-            long long clear_base = (long long)control_dirty * (long long)control_bytes_per_buffer_word / 2;
-            int total_vectors = tokens * 160;
-            asm volatile("barrier.sync 1, 320;" ::: "memory");
-            if (tid == 0) {
-                asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(control_0)) + (0))), "r"(static_cast<unsigned int>(1)) : "memory");
-            }
             int slots = (tokens + 7) / 8;
+            long long handed_base = 0;
             #pragma unroll 1
             for (int token = bid; token < tokens; token += num_bids) {
                 long long base_0 = (long long)token * 5120 + (long long)(lane_1 * 16);
@@ -385,8 +370,12 @@ kernel_cake_fused_norm_combine_426f8d7edfb8a57040ce(__nv_bfloat16* __restrict__ 
                 uint32_t _bf16x2_add_23;
                 asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_23) : "r"(mean_bf16[7]), "r"(positive_zero));
                 contribution_words[7] = _bf16x2_add_23;
+                if (token == bid) {
+                    asm volatile("barrier.sync 1, 320;" ::: "memory");
+                    handed_base = (long long)handoff[0];
+                }
                 __nv_bfloat16* owner_payload = reinterpret_cast<__nv_bfloat16*>(owner_address);
-                long long offset = data_base + ((long long)(rank * slots + token / 8) * 160 + (long long)lane_1) * 16;
+                long long offset = handed_base + ((long long)(rank * slots + token / 8) * 160 + (long long)lane_1) * 16;
                 asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(owner_payload + offset), "r"((contribution_words)[0]), "r"((contribution_words)[1]), "r"((contribution_words)[2]), "r"((contribution_words)[3]), "r"((contribution_words)[4]), "r"((contribution_words)[5]), "r"((contribution_words)[6]), "r"((contribution_words)[7]) : "memory");
                 owner_address = workspace[16 + following % 8];
             }
@@ -396,19 +385,32 @@ kernel_cake_fused_norm_combine_426f8d7edfb8a57040ce(__nv_bfloat16* __restrict__ 
     // ---- Role: consumers ----
     if (warp >= 5 && warp <= 9) {
         { // consumers_main
+            if (tid == 160) {
+                asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(workspace + 16)));
+                uint64_t _sysv_u32_0;
+                asm volatile("ld.volatile.global.u64 %0, [%1];" : "=l"(_sysv_u32_0) : "l"(workspace + 24) : "memory");
+                asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(reinterpret_cast<int*>(_sysv_u32_0))));
+            }
             asm volatile("griddepcontrol.wait;" ::: "memory");
-            unsigned long long control_address_1 = workspace[24];
-            int* control_0_1 = reinterpret_cast<int*>(control_address_1);
-            int control_current_word_1 = control_0_1[2];
-            int control_bytes_per_buffer_word_1 = control_0_1[3];
-            int control_clear_word_1 = control_0_1[4];
-            int control_current_1 = control_current_word_1 % 3;
-            int control_dirty_1 = (control_current_word_1 + 2) % 3;
-            __nv_bfloat16* local_payload_1 = reinterpret_cast<__nv_bfloat16*>(workspace[16 + rank]);
-            long long data_base_1 = (long long)control_current_1 * (long long)control_bytes_per_buffer_word_1 / 2;
-            long long clear_base_1 = (long long)control_dirty_1 * (long long)control_bytes_per_buffer_word_1 / 2;
-            int total_vectors_1 = tokens * 160;
-            asm volatile("barrier.sync 1, 320;" ::: "memory");
+            unsigned long long control_address = workspace[24];
+            int* control_0 = reinterpret_cast<int*>(control_address);
+            int control_current_word = control_0[2];
+            int control_bytes_per_buffer_word = control_0[3];
+            int control_clear_word = control_0[4];
+            int control_current = control_current_word % 3;
+            int control_dirty = (control_current_word + 2) % 3;
+            __nv_bfloat16* local_payload = reinterpret_cast<__nv_bfloat16*>(workspace[16 + rank]);
+            long long data_base = (long long)control_current * (long long)control_bytes_per_buffer_word / 2;
+            long long clear_base = (long long)control_dirty * (long long)control_bytes_per_buffer_word / 2;
+            int total_vectors = tokens * 160;
+            if (tid == 160) {
+                handoff[0] = (unsigned long long)data_base;
+            }
+            asm volatile("barrier.arrive 1, 320;" ::: "memory");
+            asm volatile("barrier.sync 3, 160;" ::: "memory");
+            if (tid == 160) {
+                asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(control_0)) + (0))), "r"(static_cast<unsigned int>(1)) : "memory");
+            }
             int slots_1 = (tokens + 7) / 8;
             int lane_1_1 = tid - 160;
             unsigned int sentinel[8];
@@ -418,64 +420,161 @@ kernel_cake_fused_norm_combine_426f8d7edfb8a57040ce(__nv_bfloat16* __restrict__ 
             }
             int clear_start = bid * 160 + lane_1_1;
             #pragma unroll 1
-            for (int clear_index = clear_start; clear_index < control_clear_word_1 / 32; clear_index += num_bids * 160) {
-                asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(local_payload_1 + (clear_base_1 + (long long)clear_index * 16)), "r"((sentinel)[0]), "r"((sentinel)[1]), "r"((sentinel)[2]), "r"((sentinel)[3]), "r"((sentinel)[4]), "r"((sentinel)[5]), "r"((sentinel)[6]), "r"((sentinel)[7]) : "memory");
+            for (int clear_index = clear_start; clear_index < control_clear_word / 32; clear_index += num_bids * 160) {
+                asm volatile("st.volatile.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(local_payload + (clear_base + (long long)clear_index * 16)), "r"((sentinel)[0]), "r"((sentinel)[1]), "r"((sentinel)[2]), "r"((sentinel)[3]), "r"((sentinel)[4]), "r"((sentinel)[5]), "r"((sentinel)[6]), "r"((sentinel)[7]) : "memory");
             }
             #pragma unroll 1
             for (int token_1 = bid; token_1 < tokens; token_1 += num_bids) {
                 if (token_1 % 8 == rank) {
                     int slot = token_1 / 8;
-                    long long offset_1 = data_base_1 + ((long long)slot * 160 + (long long)lane_1_1) * 16;
-                    long long offset_0 = data_base_1 + ((long long)(slots_1 + slot) * 160 + (long long)lane_1_1) * 16;
-                    long long offset_1_1 = data_base_1 + ((long long)(2 * slots_1 + slot) * 160 + (long long)lane_1_1) * 16;
-                    long long offset_2 = data_base_1 + ((long long)(3 * slots_1 + slot) * 160 + (long long)lane_1_1) * 16;
-                    long long offset_3 = data_base_1 + ((long long)(4 * slots_1 + slot) * 160 + (long long)lane_1_1) * 16;
-                    long long offset_4 = data_base_1 + ((long long)(5 * slots_1 + slot) * 160 + (long long)lane_1_1) * 16;
-                    long long offset_5 = data_base_1 + ((long long)(6 * slots_1 + slot) * 160 + (long long)lane_1_1) * 16;
-                    long long offset_6 = data_base_1 + ((long long)(7 * slots_1 + slot) * 160 + (long long)lane_1_1) * 16;
+                    long long offset_1 = data_base + ((long long)slot * 160 + (long long)lane_1_1) * 16;
+                    long long offset_0 = data_base + ((long long)(slots_1 + slot) * 160 + (long long)lane_1_1) * 16;
+                    long long offset_1_1 = data_base + ((long long)(2 * slots_1 + slot) * 160 + (long long)lane_1_1) * 16;
+                    long long offset_2 = data_base + ((long long)(3 * slots_1 + slot) * 160 + (long long)lane_1_1) * 16;
+                    long long offset_3 = data_base + ((long long)(4 * slots_1 + slot) * 160 + (long long)lane_1_1) * 16;
+                    long long offset_4 = data_base + ((long long)(5 * slots_1 + slot) * 160 + (long long)lane_1_1) * 16;
+                    long long offset_5 = data_base + ((long long)(6 * slots_1 + slot) * 160 + (long long)lane_1_1) * 16;
+                    long long offset_6 = data_base + ((long long)(7 * slots_1 + slot) * 160 + (long long)lane_1_1) * 16;
                     uint32_t _sysv_poll256_group_0[64];
+                    uint32_t _sysv_min_0;
                     do {
-                        asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[0]), "=r"(_sysv_poll256_group_0[1]), "=r"(_sysv_poll256_group_0[2]), "=r"(_sysv_poll256_group_0[3]), "=r"(_sysv_poll256_group_0[4]), "=r"(_sysv_poll256_group_0[5]), "=r"(_sysv_poll256_group_0[6]), "=r"(_sysv_poll256_group_0[7]) : "l"(local_payload_1 + offset_1) : "memory");
-                        asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[8]), "=r"(_sysv_poll256_group_0[9]), "=r"(_sysv_poll256_group_0[10]), "=r"(_sysv_poll256_group_0[11]), "=r"(_sysv_poll256_group_0[12]), "=r"(_sysv_poll256_group_0[13]), "=r"(_sysv_poll256_group_0[14]), "=r"(_sysv_poll256_group_0[15]) : "l"(local_payload_1 + offset_0) : "memory");
-                        asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[16]), "=r"(_sysv_poll256_group_0[17]), "=r"(_sysv_poll256_group_0[18]), "=r"(_sysv_poll256_group_0[19]), "=r"(_sysv_poll256_group_0[20]), "=r"(_sysv_poll256_group_0[21]), "=r"(_sysv_poll256_group_0[22]), "=r"(_sysv_poll256_group_0[23]) : "l"(local_payload_1 + offset_1_1) : "memory");
-                        asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[24]), "=r"(_sysv_poll256_group_0[25]), "=r"(_sysv_poll256_group_0[26]), "=r"(_sysv_poll256_group_0[27]), "=r"(_sysv_poll256_group_0[28]), "=r"(_sysv_poll256_group_0[29]), "=r"(_sysv_poll256_group_0[30]), "=r"(_sysv_poll256_group_0[31]) : "l"(local_payload_1 + offset_2) : "memory");
-                        asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[32]), "=r"(_sysv_poll256_group_0[33]), "=r"(_sysv_poll256_group_0[34]), "=r"(_sysv_poll256_group_0[35]), "=r"(_sysv_poll256_group_0[36]), "=r"(_sysv_poll256_group_0[37]), "=r"(_sysv_poll256_group_0[38]), "=r"(_sysv_poll256_group_0[39]) : "l"(local_payload_1 + offset_3) : "memory");
-                        asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[40]), "=r"(_sysv_poll256_group_0[41]), "=r"(_sysv_poll256_group_0[42]), "=r"(_sysv_poll256_group_0[43]), "=r"(_sysv_poll256_group_0[44]), "=r"(_sysv_poll256_group_0[45]), "=r"(_sysv_poll256_group_0[46]), "=r"(_sysv_poll256_group_0[47]) : "l"(local_payload_1 + offset_4) : "memory");
-                        asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[48]), "=r"(_sysv_poll256_group_0[49]), "=r"(_sysv_poll256_group_0[50]), "=r"(_sysv_poll256_group_0[51]), "=r"(_sysv_poll256_group_0[52]), "=r"(_sysv_poll256_group_0[53]), "=r"(_sysv_poll256_group_0[54]), "=r"(_sysv_poll256_group_0[55]) : "l"(local_payload_1 + offset_5) : "memory");
-                        asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[56]), "=r"(_sysv_poll256_group_0[57]), "=r"(_sysv_poll256_group_0[58]), "=r"(_sysv_poll256_group_0[59]), "=r"(_sysv_poll256_group_0[60]), "=r"(_sysv_poll256_group_0[61]), "=r"(_sysv_poll256_group_0[62]), "=r"(_sysv_poll256_group_0[63]) : "l"(local_payload_1 + offset_6) : "memory");
+                        asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[0]), "=r"(_sysv_poll256_group_0[1]), "=r"(_sysv_poll256_group_0[2]), "=r"(_sysv_poll256_group_0[3]), "=r"(_sysv_poll256_group_0[4]), "=r"(_sysv_poll256_group_0[5]), "=r"(_sysv_poll256_group_0[6]), "=r"(_sysv_poll256_group_0[7]) : "l"(local_payload + offset_1) : "memory");
+                        asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[8]), "=r"(_sysv_poll256_group_0[9]), "=r"(_sysv_poll256_group_0[10]), "=r"(_sysv_poll256_group_0[11]), "=r"(_sysv_poll256_group_0[12]), "=r"(_sysv_poll256_group_0[13]), "=r"(_sysv_poll256_group_0[14]), "=r"(_sysv_poll256_group_0[15]) : "l"(local_payload + offset_0) : "memory");
+                        asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[16]), "=r"(_sysv_poll256_group_0[17]), "=r"(_sysv_poll256_group_0[18]), "=r"(_sysv_poll256_group_0[19]), "=r"(_sysv_poll256_group_0[20]), "=r"(_sysv_poll256_group_0[21]), "=r"(_sysv_poll256_group_0[22]), "=r"(_sysv_poll256_group_0[23]) : "l"(local_payload + offset_1_1) : "memory");
+                        asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[24]), "=r"(_sysv_poll256_group_0[25]), "=r"(_sysv_poll256_group_0[26]), "=r"(_sysv_poll256_group_0[27]), "=r"(_sysv_poll256_group_0[28]), "=r"(_sysv_poll256_group_0[29]), "=r"(_sysv_poll256_group_0[30]), "=r"(_sysv_poll256_group_0[31]) : "l"(local_payload + offset_2) : "memory");
+                        asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[32]), "=r"(_sysv_poll256_group_0[33]), "=r"(_sysv_poll256_group_0[34]), "=r"(_sysv_poll256_group_0[35]), "=r"(_sysv_poll256_group_0[36]), "=r"(_sysv_poll256_group_0[37]), "=r"(_sysv_poll256_group_0[38]), "=r"(_sysv_poll256_group_0[39]) : "l"(local_payload + offset_3) : "memory");
+                        asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[40]), "=r"(_sysv_poll256_group_0[41]), "=r"(_sysv_poll256_group_0[42]), "=r"(_sysv_poll256_group_0[43]), "=r"(_sysv_poll256_group_0[44]), "=r"(_sysv_poll256_group_0[45]), "=r"(_sysv_poll256_group_0[46]), "=r"(_sysv_poll256_group_0[47]) : "l"(local_payload + offset_4) : "memory");
+                        asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[48]), "=r"(_sysv_poll256_group_0[49]), "=r"(_sysv_poll256_group_0[50]), "=r"(_sysv_poll256_group_0[51]), "=r"(_sysv_poll256_group_0[52]), "=r"(_sysv_poll256_group_0[53]), "=r"(_sysv_poll256_group_0[54]), "=r"(_sysv_poll256_group_0[55]) : "l"(local_payload + offset_5) : "memory");
+                        asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_0[56]), "=r"(_sysv_poll256_group_0[57]), "=r"(_sysv_poll256_group_0[58]), "=r"(_sysv_poll256_group_0[59]), "=r"(_sysv_poll256_group_0[60]), "=r"(_sysv_poll256_group_0[61]), "=r"(_sysv_poll256_group_0[62]), "=r"(_sysv_poll256_group_0[63]) : "l"(local_payload + offset_6) : "memory");
+                        uint32_t _sysv_min_1_0;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_0) : "r"(_sysv_poll256_group_0[0]), "r"(_sysv_poll256_group_0[1]));
+                        uint32_t _sysv_min_1_1;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_1) : "r"(_sysv_poll256_group_0[2]), "r"(_sysv_poll256_group_0[3]));
+                        uint32_t _sysv_min_1_2;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_2) : "r"(_sysv_min_1_0), "r"(_sysv_min_1_1));
+                        uint32_t _sysv_min_1_3;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_3) : "r"(_sysv_poll256_group_0[4]), "r"(_sysv_poll256_group_0[5]));
+                        uint32_t _sysv_min_1_4;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_4) : "r"(_sysv_poll256_group_0[6]), "r"(_sysv_poll256_group_0[7]));
+                        uint32_t _sysv_min_1_5;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_5) : "r"(_sysv_min_1_3), "r"(_sysv_min_1_4));
+                        uint32_t _sysv_min_1_6;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_6) : "r"(_sysv_min_1_2), "r"(_sysv_min_1_5));
+                        uint32_t _sysv_min_1_7;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_7) : "r"(_sysv_poll256_group_0[8]), "r"(_sysv_poll256_group_0[9]));
+                        uint32_t _sysv_min_1_8;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_8) : "r"(_sysv_poll256_group_0[10]), "r"(_sysv_poll256_group_0[11]));
+                        uint32_t _sysv_min_1_9;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_9) : "r"(_sysv_min_1_7), "r"(_sysv_min_1_8));
+                        uint32_t _sysv_min_1_10;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_10) : "r"(_sysv_poll256_group_0[12]), "r"(_sysv_poll256_group_0[13]));
+                        uint32_t _sysv_min_1_11;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_11) : "r"(_sysv_poll256_group_0[14]), "r"(_sysv_poll256_group_0[15]));
+                        uint32_t _sysv_min_1_12;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_12) : "r"(_sysv_min_1_10), "r"(_sysv_min_1_11));
+                        uint32_t _sysv_min_1_13;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_13) : "r"(_sysv_min_1_9), "r"(_sysv_min_1_12));
+                        uint32_t _sysv_min_1_14;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_14) : "r"(_sysv_min_1_6), "r"(_sysv_min_1_13));
+                        uint32_t _sysv_min_1_15;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_15) : "r"(_sysv_poll256_group_0[16]), "r"(_sysv_poll256_group_0[17]));
+                        uint32_t _sysv_min_1_16;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_16) : "r"(_sysv_poll256_group_0[18]), "r"(_sysv_poll256_group_0[19]));
+                        uint32_t _sysv_min_1_17;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_17) : "r"(_sysv_min_1_15), "r"(_sysv_min_1_16));
+                        uint32_t _sysv_min_1_18;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_18) : "r"(_sysv_poll256_group_0[20]), "r"(_sysv_poll256_group_0[21]));
+                        uint32_t _sysv_min_1_19;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_19) : "r"(_sysv_poll256_group_0[22]), "r"(_sysv_poll256_group_0[23]));
+                        uint32_t _sysv_min_1_20;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_20) : "r"(_sysv_min_1_18), "r"(_sysv_min_1_19));
+                        uint32_t _sysv_min_1_21;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_21) : "r"(_sysv_min_1_17), "r"(_sysv_min_1_20));
+                        uint32_t _sysv_min_1_22;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_22) : "r"(_sysv_poll256_group_0[24]), "r"(_sysv_poll256_group_0[25]));
+                        uint32_t _sysv_min_1_23;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_23) : "r"(_sysv_poll256_group_0[26]), "r"(_sysv_poll256_group_0[27]));
+                        uint32_t _sysv_min_1_24;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_24) : "r"(_sysv_min_1_22), "r"(_sysv_min_1_23));
+                        uint32_t _sysv_min_1_25;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_25) : "r"(_sysv_poll256_group_0[28]), "r"(_sysv_poll256_group_0[29]));
+                        uint32_t _sysv_min_1_26;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_26) : "r"(_sysv_poll256_group_0[30]), "r"(_sysv_poll256_group_0[31]));
+                        uint32_t _sysv_min_1_27;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_27) : "r"(_sysv_min_1_25), "r"(_sysv_min_1_26));
+                        uint32_t _sysv_min_1_28;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_28) : "r"(_sysv_min_1_24), "r"(_sysv_min_1_27));
+                        uint32_t _sysv_min_1_29;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_29) : "r"(_sysv_min_1_21), "r"(_sysv_min_1_28));
+                        uint32_t _sysv_min_1_30;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_30) : "r"(_sysv_min_1_14), "r"(_sysv_min_1_29));
+                        uint32_t _sysv_min_1_31;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_31) : "r"(_sysv_poll256_group_0[32]), "r"(_sysv_poll256_group_0[33]));
+                        uint32_t _sysv_min_1_32;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_32) : "r"(_sysv_poll256_group_0[34]), "r"(_sysv_poll256_group_0[35]));
+                        uint32_t _sysv_min_1_33;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_33) : "r"(_sysv_min_1_31), "r"(_sysv_min_1_32));
+                        uint32_t _sysv_min_1_34;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_34) : "r"(_sysv_poll256_group_0[36]), "r"(_sysv_poll256_group_0[37]));
+                        uint32_t _sysv_min_1_35;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_35) : "r"(_sysv_poll256_group_0[38]), "r"(_sysv_poll256_group_0[39]));
+                        uint32_t _sysv_min_1_36;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_36) : "r"(_sysv_min_1_34), "r"(_sysv_min_1_35));
+                        uint32_t _sysv_min_1_37;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_37) : "r"(_sysv_min_1_33), "r"(_sysv_min_1_36));
+                        uint32_t _sysv_min_1_38;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_38) : "r"(_sysv_poll256_group_0[40]), "r"(_sysv_poll256_group_0[41]));
+                        uint32_t _sysv_min_1_39;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_39) : "r"(_sysv_poll256_group_0[42]), "r"(_sysv_poll256_group_0[43]));
+                        uint32_t _sysv_min_1_40;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_40) : "r"(_sysv_min_1_38), "r"(_sysv_min_1_39));
+                        uint32_t _sysv_min_1_41;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_41) : "r"(_sysv_poll256_group_0[44]), "r"(_sysv_poll256_group_0[45]));
+                        uint32_t _sysv_min_1_42;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_42) : "r"(_sysv_poll256_group_0[46]), "r"(_sysv_poll256_group_0[47]));
+                        uint32_t _sysv_min_1_43;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_43) : "r"(_sysv_min_1_41), "r"(_sysv_min_1_42));
+                        uint32_t _sysv_min_1_44;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_44) : "r"(_sysv_min_1_40), "r"(_sysv_min_1_43));
+                        uint32_t _sysv_min_1_45;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_45) : "r"(_sysv_min_1_37), "r"(_sysv_min_1_44));
+                        uint32_t _sysv_min_1_46;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_46) : "r"(_sysv_poll256_group_0[48]), "r"(_sysv_poll256_group_0[49]));
+                        uint32_t _sysv_min_1_47;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_47) : "r"(_sysv_poll256_group_0[50]), "r"(_sysv_poll256_group_0[51]));
+                        uint32_t _sysv_min_1_48;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_48) : "r"(_sysv_min_1_46), "r"(_sysv_min_1_47));
+                        uint32_t _sysv_min_1_49;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_49) : "r"(_sysv_poll256_group_0[52]), "r"(_sysv_poll256_group_0[53]));
+                        uint32_t _sysv_min_1_50;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_50) : "r"(_sysv_poll256_group_0[54]), "r"(_sysv_poll256_group_0[55]));
+                        uint32_t _sysv_min_1_51;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_51) : "r"(_sysv_min_1_49), "r"(_sysv_min_1_50));
+                        uint32_t _sysv_min_1_52;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_52) : "r"(_sysv_min_1_48), "r"(_sysv_min_1_51));
+                        uint32_t _sysv_min_1_53;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_53) : "r"(_sysv_poll256_group_0[56]), "r"(_sysv_poll256_group_0[57]));
+                        uint32_t _sysv_min_1_54;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_54) : "r"(_sysv_poll256_group_0[58]), "r"(_sysv_poll256_group_0[59]));
+                        uint32_t _sysv_min_1_55;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_55) : "r"(_sysv_min_1_53), "r"(_sysv_min_1_54));
+                        uint32_t _sysv_min_1_56;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_56) : "r"(_sysv_poll256_group_0[60]), "r"(_sysv_poll256_group_0[61]));
+                        uint32_t _sysv_min_1_57;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_57) : "r"(_sysv_poll256_group_0[62]), "r"(_sysv_poll256_group_0[63]));
+                        uint32_t _sysv_min_1_58;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_58) : "r"(_sysv_min_1_56), "r"(_sysv_min_1_57));
+                        uint32_t _sysv_min_1_59;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_59) : "r"(_sysv_min_1_55), "r"(_sysv_min_1_58));
+                        uint32_t _sysv_min_1_60;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_60) : "r"(_sysv_min_1_52), "r"(_sysv_min_1_59));
+                        uint32_t _sysv_min_1_61;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_61) : "r"(_sysv_min_1_45), "r"(_sysv_min_1_60));
+                        uint32_t _sysv_min_1_62;
+                        asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_1_62) : "r"(_sysv_min_1_30), "r"(_sysv_min_1_61));
+                        _sysv_min_0 = _sysv_min_1_62;
                     } while (
-                        (((_sysv_poll256_group_0[0] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[0] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[1] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[1] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[2] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[2] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[3] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[3] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[4] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[4] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[5] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[5] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[6] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[6] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[7] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[7] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[8] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[8] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[9] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[9] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[10] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[10] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[11] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[11] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[12] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[12] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[13] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[13] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[14] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[14] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[15] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[15] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[16] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[16] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[17] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[17] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[18] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[18] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[19] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[19] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[20] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[20] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[21] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[21] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[22] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[22] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[23] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[23] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[24] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[24] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[25] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[25] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[26] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[26] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[27] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[27] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[28] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[28] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[29] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[29] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[30] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[30] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[31] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[31] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[32] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[32] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[33] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[33] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[34] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[34] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[35] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[35] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[36] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[36] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[37] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[37] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[38] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[38] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[39] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[39] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[40] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[40] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[41] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[41] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[42] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[42] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[43] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[43] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[44] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[44] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[45] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[45] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[46] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[46] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[47] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[47] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[48] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[48] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[49] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[49] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[50] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[50] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[51] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[51] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[52] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[52] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[53] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[53] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[54] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[54] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[55] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[55] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[56] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[56] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[57] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[57] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[58] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[58] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[59] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[59] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[60] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[60] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[61] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[61] >> 16) & 0xffffu) == 0x8000u) ||
-                        (((_sysv_poll256_group_0[62] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[62] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[63] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_0[63] >> 16) & 0xffffu) == 0x8000u)
+                        ((_sysv_min_0 & 0xffffu) == 0x8000u) || ((_sysv_min_0 >> 16) == 0x8000u)
                     );
                     unsigned int result_words[8];
                     uint32_t _bf16x2_add_24;
@@ -646,7 +745,7 @@ kernel_cake_fused_norm_combine_426f8d7edfb8a57040ce(__nv_bfloat16* __restrict__ 
                     uint32_t _bf16x2_add_79;
                     asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_79) : "r"(result_words[7]), "r"(_sysv_poll256_group_0[63]));
                     result_words[7] = _bf16x2_add_79;
-                    long long offset_7 = data_base_1 + ((long long)(8 * slots_1 + token_1) * 160 + (long long)lane_1_1) * 16;
+                    long long offset_7 = data_base + ((long long)(8 * slots_1 + token_1) * 160 + (long long)lane_1_1) * 16;
                     #pragma unroll
                     for (int peer = 0; peer < 8; peer++) {
                         __nv_bfloat16* peer_payload = reinterpret_cast<__nv_bfloat16*>(workspace[16 + peer]);
@@ -656,15 +755,28 @@ kernel_cake_fused_norm_combine_426f8d7edfb8a57040ce(__nv_bfloat16* __restrict__ 
             }
             #pragma unroll 1
             for (int token_2 = bid; token_2 < tokens; token_2 += num_bids) {
-                long long offset_8 = data_base_1 + ((long long)(8 * slots_1 + token_2) * 160 + (long long)lane_1_1) * 16;
+                long long offset_8 = data_base + ((long long)(8 * slots_1 + token_2) * 160 + (long long)lane_1_1) * 16;
                 uint32_t _sysv_poll256_group_1[8];
+                uint32_t _sysv_min_2;
                 do {
-                    asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_1[0]), "=r"(_sysv_poll256_group_1[1]), "=r"(_sysv_poll256_group_1[2]), "=r"(_sysv_poll256_group_1[3]), "=r"(_sysv_poll256_group_1[4]), "=r"(_sysv_poll256_group_1[5]), "=r"(_sysv_poll256_group_1[6]), "=r"(_sysv_poll256_group_1[7]) : "l"(local_payload_1 + offset_8) : "memory");
+                    asm volatile("ld.volatile.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_sysv_poll256_group_1[0]), "=r"(_sysv_poll256_group_1[1]), "=r"(_sysv_poll256_group_1[2]), "=r"(_sysv_poll256_group_1[3]), "=r"(_sysv_poll256_group_1[4]), "=r"(_sysv_poll256_group_1[5]), "=r"(_sysv_poll256_group_1[6]), "=r"(_sysv_poll256_group_1[7]) : "l"(local_payload + offset_8) : "memory");
+                    uint32_t _sysv_min_3_0;
+                    asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_3_0) : "r"(_sysv_poll256_group_1[0]), "r"(_sysv_poll256_group_1[1]));
+                    uint32_t _sysv_min_3_1;
+                    asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_3_1) : "r"(_sysv_poll256_group_1[2]), "r"(_sysv_poll256_group_1[3]));
+                    uint32_t _sysv_min_3_2;
+                    asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_3_2) : "r"(_sysv_min_3_0), "r"(_sysv_min_3_1));
+                    uint32_t _sysv_min_3_3;
+                    asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_3_3) : "r"(_sysv_poll256_group_1[4]), "r"(_sysv_poll256_group_1[5]));
+                    uint32_t _sysv_min_3_4;
+                    asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_3_4) : "r"(_sysv_poll256_group_1[6]), "r"(_sysv_poll256_group_1[7]));
+                    uint32_t _sysv_min_3_5;
+                    asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_3_5) : "r"(_sysv_min_3_3), "r"(_sysv_min_3_4));
+                    uint32_t _sysv_min_3_6;
+                    asm("min.s16x2 %0, %1, %2;" : "=r"(_sysv_min_3_6) : "r"(_sysv_min_3_2), "r"(_sysv_min_3_5));
+                    _sysv_min_2 = _sysv_min_3_6;
                 } while (
-                    (((_sysv_poll256_group_1[0] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_1[0] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_1[1] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_1[1] >> 16) & 0xffffu) == 0x8000u) ||
-                    (((_sysv_poll256_group_1[2] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_1[2] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_1[3] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_1[3] >> 16) & 0xffffu) == 0x8000u) ||
-                    (((_sysv_poll256_group_1[4] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_1[4] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_1[5] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_1[5] >> 16) & 0xffffu) == 0x8000u) ||
-                    (((_sysv_poll256_group_1[6] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_1[6] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_1[7] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll256_group_1[7] >> 16) & 0xffffu) == 0x8000u)
+                    ((_sysv_min_2 & 0xffffu) == 0x8000u) || ((_sysv_min_2 >> 16) == 0x8000u)
                 );
                 unsigned int final_words[8];
                 final_words[0] = _sysv_poll256_group_1[0];
@@ -681,12 +793,12 @@ kernel_cake_fused_norm_combine_426f8d7edfb8a57040ce(__nv_bfloat16* __restrict__ 
                 if (lane_1_1 == 0) {
                     int clear_bytes = (8 * slots_1 + tokens) * 5120;
                     {
-                        volatile int* _sysv_wait_p_0 = reinterpret_cast<volatile int*>(reinterpret_cast<unsigned int*>(control_0_1)) + (0);
-                        while (*_sysv_wait_p_0 != static_cast<int>(num_bids)) {}
+                        volatile int* _sysv_wait_p_4 = reinterpret_cast<volatile int*>(reinterpret_cast<unsigned int*>(control_0)) + (0);
+                        while (*_sysv_wait_p_4 != static_cast<int>(num_bids)) {}
                     }
-                    control_0_1[2] = (control_current_word_1 + 1) % 3;
-                    control_0_1[4] = clear_bytes;
-                    reinterpret_cast<unsigned int*>(control_0_1)[0] = 0;
+                    control_0[2] = (control_current_word + 1) % 3;
+                    control_0[4] = clear_bytes;
+                    reinterpret_cast<unsigned int*>(control_0)[0] = 0;
                 }
             }
             asm volatile("griddepcontrol.launch_dependents;" ::: "memory");

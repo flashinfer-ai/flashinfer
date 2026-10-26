@@ -63,7 +63,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(320) void
-kernel_cake_fused_norm_combine_7778a9a131a0653e5671(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ residual, __nv_bfloat16* __restrict__ weight, __nv_bfloat16* __restrict__ norm_out, __nv_bfloat16* __restrict__ residual_out, __nv_bfloat16* __restrict__ collective_out, unsigned long long* __restrict__ workspace, int rank, int tokens, float epsilon)
+kernel_cake_fused_norm_combine_5d69eac5f72e62976f4e(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ residual, __nv_bfloat16* __restrict__ weight, __nv_bfloat16* __restrict__ norm_out, __nv_bfloat16* __restrict__ residual_out, __nv_bfloat16* __restrict__ collective_out, unsigned long long* __restrict__ workspace, int rank, int tokens, float epsilon)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -102,6 +102,8 @@ kernel_cake_fused_norm_combine_7778a9a131a0653e5671(__nv_bfloat16* __restrict__ 
         asm volatile("ld.volatile.global.u64 %0, [%1];" : "=l"(_sysv_u32_0) : "l"(workspace + 24) : "memory");
         asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(reinterpret_cast<int*>(_sysv_u32_0))));
     }
+    unsigned long long control_slot = workspace[24];
+    unsigned long long local_root = workspace[16 + rank];
     asm volatile("griddepcontrol.wait;" ::: "memory");
     int track = tid / 160;
     int local_tid = tid % 160;
@@ -140,22 +142,16 @@ kernel_cake_fused_norm_combine_7778a9a131a0653e5671(__nv_bfloat16* __restrict__ 
         (&_vec_load_0[0 + 14])[0] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[7]) << 16);
         (&_vec_load_0[0 + 14])[1] = __uint_as_float(static_cast<uint32_t>(_v8_2_0[7]) & 0xffff0000u);
     }
-    unsigned long long control_address = workspace[24];
+    unsigned long long control_address = control_slot;
     int* control_0 = reinterpret_cast<int*>(control_address);
     int control_current_word = control_0[2];
     int control_bytes_per_buffer_word = control_0[3];
     int control_clear_word = control_0[4];
     int control_current = control_current_word % 3;
     int control_dirty = (control_current_word + 2) % 3;
-    __nv_bfloat16* local_payload = reinterpret_cast<__nv_bfloat16*>(workspace[16 + rank]);
-    long long data_base = (long long)control_current * (long long)control_bytes_per_buffer_word / 2;
-    long long clear_base = (long long)control_dirty * (long long)control_bytes_per_buffer_word / 2;
+    __nv_bfloat16* local_payload = reinterpret_cast<__nv_bfloat16*>(local_root);
     int total_vectors = tokens * 160;
     int vector_index = bid * 160 + tid;
-    __syncthreads();
-    if (tid == 0) {
-        asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(control_0)) + (0))), "r"(static_cast<unsigned int>(1)) : "memory");
-    }
     int local_warp = local_tid / 32;
     int scratch_row = track * 32;
     unsigned int propagated_words[8];
@@ -203,6 +199,9 @@ kernel_cake_fused_norm_combine_7778a9a131a0653e5671(__nv_bfloat16* __restrict__ 
         scratch[scratch_row + local_warp] = _warp_reduce_0;
     }
     __syncthreads();
+    if (tid == 288) {
+        asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(control_0)) + (0))), "r"(static_cast<unsigned int>(1)) : "memory");
+    }
     if (local_warp == 0) {
         float partial = ((lane < 5) ? scratch[scratch_row + lane] : 0.0f);
         float _warp_reduce_1 = partial;
@@ -255,6 +254,8 @@ kernel_cake_fused_norm_combine_7778a9a131a0653e5671(__nv_bfloat16* __restrict__ 
             mean[element_4] = __fmaf_rn(other_track, 0.5f, mean[element_4]);
         }
     }
+    long long data_base = (long long)control_current * (long long)control_bytes_per_buffer_word / 2;
+    long long clear_base = (long long)control_dirty * (long long)control_bytes_per_buffer_word / 2;
     if (tid < 160) {
         unsigned int mean_bf16[8];
         #pragma unroll
