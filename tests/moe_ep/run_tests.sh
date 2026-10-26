@@ -152,6 +152,7 @@ run_unit() {
     --ignore=tests/moe_ep/test_sm107_combine_kernel.py \
     --ignore=tests/moe_ep/test_sm90_pull_fp8_tuner.py \
     --ignore=tests/moe_ep/test_sm90_pull_bf16_tuner.py \
+    --ignore=tests/moe_ep/test_sm120_w4a8_cutedsl_host.py \
     --ignore=tests/moe_ep/test_split_fused_moe_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_moe_ep_compute_correctness.py \
     --ignore=tests/moe_ep/test_moe_ep_compute_correctness_nvfp4.py \
@@ -169,6 +170,11 @@ run_unit() {
   # notes; observed since 2026-07-22).
   pytest_no_finalize -v "${MOE_EP_PYTEST_FLAGS[@]}" \
     "tests/moe_ep/test_workspace_pool.py::test_two_nvfp4_layers_share_one_symm_buffer" \
+    || return 1
+  # The SM120 split shim prepends raw packages named src/common that overlap
+  # the SM100 drop. Keep its host contracts covered in a separate process.
+  pytest_no_finalize -v "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_sm120_w4a8_cutedsl_host.py \
     || return 1
   # The SM90 pull tuner tests import the sm90 pull_style_cutedsl_megakernel
   # tree, which shares top-level module names (common, src, moe_nvfp4_swapab)
@@ -334,6 +340,12 @@ run_mega() {
     tests/moe_ep/test_moe_ep_bf16_mxfp8_cutedsl_mega_multirank.py \
     tests/moe_ep/test_mega_native_topk_reduce_multirank.py -v \
     -m "gpu_4 and arch_blackwell" || rc=1
+
+  "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_mega_cuda_graph_multirank.py -v \
+    -k "tail_reset_multirank_graph or sparse_dispatch_graph or sparse_to_dense_graph or blackwell_genphase_graph" \
+    -m "gpu_2 and arch_blackwell" || rc=1
 
   MEGA_NO_DIST=1 "${TORCHRUN}" --nproc_per_node=1 -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \

@@ -348,24 +348,9 @@ def _bind(
     """Order ``values`` by the role's generated argument plan and load the program."""
     grid_values = dict(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
     arguments = []
-    first_tensor = next(
-        (v for v in values.values() if isinstance(v, torch.Tensor)), None
-    )
     for kind, name in ARG_PLANS[role]:
         if kind == "grid":
             arguments.append(int(grid_values[name]))
-        elif kind == "device":
-            if first_tensor is None:
-                raise ValueError(
-                    f"the {role} program needs a device index but binds no tensor"
-                )
-            arguments.append(int(first_tensor.device.index))
-        elif kind == "launch":
-            if name != "enable_pdl":
-                raise ValueError(
-                    f"the {role} program's argument plan names an unknown launch flag {name!r}"
-                )
-            arguments.append(1)
         elif name in values:
             arguments.append(values[name])
         else:

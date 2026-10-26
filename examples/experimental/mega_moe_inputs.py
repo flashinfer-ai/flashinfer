@@ -126,12 +126,15 @@ def model_reference(inputs, x_scales):
     """BF16 L1, clamped SwiGLU, FP32 activation quantization, BF16 L2 of the
     routed experts (only the selected ones are dequantized; all 384 at once
     would need tens of GiB), summed in FP32 and rounded to BF16 once, like the
-    kernel."""
+    kernel. A negative expert id routes its slot to no expert (a masked token):
+    the slot adds nothing, whatever its weight."""
     precision = inputs["routed_weight_dtype"]
     x = unpack(inputs["x_fp8_packed"], x_scales, "fp8")
     width = inputs["intermediate"]
     output = torch.zeros_like(x)
     for index in inputs["topk_idx"].unique().tolist():
+        if index < 0:
+            continue
         first = unpack(
             inputs[f"w1_{precision}"][index], inputs["w1_sf"][index], precision
         )

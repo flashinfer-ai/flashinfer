@@ -220,6 +220,95 @@ def test_v3_long_token_routes(num_tokens):
         check_v3_workspace(plan)
 
 
+@pytest.mark.parametrize(
+    ("precision", "num_tokens"),
+    [
+        ("fp4", 1),
+        ("fp4", 16),
+        ("fp8", 16),
+        ("fp4", 128),
+        ("fp4", 512),
+        ("fp4", 1024),
+        ("fp4", 4096),
+    ],
+)
+def test_pipeline_negative_topk_idx_routes_to_no_expert(precision, num_tokens):
+    """A topk_idx of -1 routes its slot to no expert, on every pipeline route.
+
+    Every fourth token is masked the way a routing gate writes it (all slots -1,
+    weight 0); another quarter of the tokens drop one slot whose weight stays
+    nonzero, which must not count. Such a slot contributes exactly what the same
+    route at weight 0 contributes, nothing: the output equals, bit for bit, a
+    plan whose slots keep their experts at weight 0, and it is close to the
+    PyTorch reference that skips -1. Masked rows are zero. This holds on the
+    first launch, a replay and a captured graph; each launch marks a -1 slot's
+    token_to_permuted entry -1 (the entries start at a real row), and the
+    workspace stays clean."""
+    require_model_memory()
+    inputs, xs = fixtures.model_inputs(
+        precision,
+        num_tokens=num_tokens,
+        l2_scale_shift=5 if num_tokens >= 1024 else 0,
+    )
+    token = torch.arange(num_tokens, device="cuda")
+    masked = token % 4 == 1
+    dropped = token % 4 == 0
+    inputs["topk_weights"][masked] = 0.0
+    weight_zero = dict(inputs, topk_weights=inputs["topk_weights"].clone())
+    weight_zero["topk_weights"][dropped, 3] = 0.0
+    zero_plan = _v3_runtime.prepare_pipeline(weight_zero)
+    zero_plan.run()
+    torch.cuda.synchronize()
+    unrouted = zero_plan.outputs.clone()
+    del zero_plan
+    inputs["topk_idx"] = inputs["topk_idx"].clone()
+    inputs["topk_idx"][masked] = -1
+    inputs["topk_idx"][dropped, 3] = -1
+    plan = _v3_runtime.prepare_pipeline(inputs)
+    expected = model_reference(inputs, xs).float()
+    permuted = plan.stages[0].bindings["token_to_permuted"]
+    unrouted_slots = (inputs["topk_idx"] < 0).reshape(-1)
+    for launch in range(3):
+        plan.outputs.fill_(float("nan"))
+        # Row 0 is a real row: a -1 slot must not be read from a stale entry.
+        permuted.fill_(0)
+        if launch < 2:
+            plan.run()
+        else:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                plan.run()
+            plan.outputs.fill_(float("nan"))
+            graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(plan.outputs, unrouted, atol=0, rtol=0)
+        assert plan.outputs[masked].count_nonzero().item() == 0
+        assert (permuted[unrouted_slots] == -1).all().item()
+        actual = plan.outputs.float()
+        difference = 1 - 2 * (actual * expected).sum() / (
+            actual.square().sum() + expected.square().sum()
+        )
+        assert difference.item() < 1e-3
+        check_v3_workspace(plan, scratch_cleared=num_tokens == 1)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 16])
+def test_pipeline_fully_masked_batch_is_zero(num_tokens):
+    """A batch whose every slot is -1 routes no token: it binds to the route's
+    grid, every launch writes zeros and the workspace stays clean."""
+    require_model_memory()
+    inputs, _ = fixtures.model_inputs("fp4", num_tokens=num_tokens)
+    inputs["topk_idx"][:] = -1
+    inputs["topk_weights"][:] = 0.0
+    plan = _v3_runtime.prepare_pipeline(inputs)
+    for _ in range(2):
+        plan.outputs.fill_(float("nan"))
+        plan.run()
+        torch.cuda.synchronize()
+        assert plan.outputs.count_nonzero().item() == 0
+        check_v3_workspace(plan, scratch_cleared=num_tokens == 1)
+
+
 def test_grouped_l2_update_scales_and_graph_replay():
     plan, a, b, sa, sb, words_a, words_b = fixtures.make_grouped_l2()
     for changed in (None, "activation", "weight"):

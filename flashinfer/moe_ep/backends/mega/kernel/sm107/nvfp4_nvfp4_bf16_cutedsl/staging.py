@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 
@@ -39,6 +41,40 @@ def stage_mega_moe_inputs(
         return 0
     if topk_weights.shape != topk_ids.shape:
         raise ValueError("topk_weights and topk_ids must have the same shape.")
+
+    if (
+        os.environ.get("FLASHINFER_MEGA_FUSED_STAGE", "1") != "0"
+        and hidden_states.is_contiguous()
+        and hidden_states.data_ptr() % 16 == 0
+        and hidden % 64 == 0
+        and x_sf.shape[1] == hidden // 16
+        and topk_ids.is_contiguous()
+        and topk_weights.is_contiguous()
+        and topk_ids.data_ptr() % 16 == 0
+        and topk_weights.data_ptr() % 16 == 0
+        and topk_weights.dtype in (torch.float16, torch.bfloat16, torch.float32)
+    ):
+        from ......kernel_src.sm100.cutedsl_megamoe import (
+            fused_quant_stage,
+            note_staged_tokens,
+        )
+
+        # Other layers can stage prequantized inputs into this pooled workspace.
+        # Their live counts do not update the shared stager's tail memo.
+        note_staged_tokens(topk_idx_out, capacity)
+        fused_quant_stage(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            x_nvfp4,
+            x_sf,
+            topk_idx_out,
+            topk_weights_out,
+            quant_type="nvfp4",
+            norm_const=input_norm_const,
+            scale_multiplier=input_norm_const / 6.0,
+        )
+        return num_tokens
 
     q, sf = quantize_nvfp4_block16(
         hidden_states.to(torch.float32), norm_const=input_norm_const

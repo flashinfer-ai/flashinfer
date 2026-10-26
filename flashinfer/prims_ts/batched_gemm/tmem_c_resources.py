@@ -123,7 +123,7 @@ class TmemCResource(MemoryResource):
     def __post_init__(self):
         if self._alloc_c is None:
             if self.cfg.use_tile256_tmem_overlap and self.cfg.num_epilogue_warps == 4:
-                cols_per_stage = 2 * self.cfg.tile_n - self.cfg.epi_tile_n
+                cols_per_stage = 2 * self.cfg.tile_n - self.cfg.tmem_overlap_chunk_cols
             else:
                 cols_per_stage = self.cfg.tmem_c_cols_per_stage
             total_cols = cols_per_stage * self.cfg.num_stages_tmem_acc
@@ -279,7 +279,7 @@ class TmemCResource(MemoryResource):
 
     def _tmem_c_cols_per_stage(self) -> int:
         if self.cfg.use_tile256_tmem_overlap and self.cfg.num_epilogue_warps == 4:
-            return 2 * self.cfg.tile_n - self.cfg.epi_tile_n
+            return 2 * self.cfg.tile_n - self.cfg.tmem_overlap_chunk_cols
         return self.cfg.tmem_c_cols_per_stage
 
     @cute.jit
@@ -399,7 +399,7 @@ class TmemCResource(MemoryResource):
             self.cfg.use_tile256_tmem_overlap and self.cfg.num_epilogue_warps == 4
         ):
             stage_col_offset += self._mma_local_idx * Int32(
-                self.cfg.tile_n - self.cfg.epi_tile_n
+                self.cfg.tile_n - self.cfg.tmem_overlap_chunk_cols
             )
         acc_tmem_ptr = prims.make_tmem_ptr(
             self.tmem_raw_addr + self._alloc_c.offset + stage_col_offset,
@@ -732,7 +732,7 @@ class TmemCResource(MemoryResource):
                 stage_info, subtile_idx + Int32(1)
             )
             if cutlass.const_expr(
-                subtile_idx == self.cfg.tile_n // self.cfg.epi_tile_n - 2
+                subtile_idx == self.cfg.tile_n // self.cfg.tmem_overlap_chunk_cols - 2
             ):
                 self._epi_local_idx = self._epi_local_idx ^ Int32(1)
             return t2r_rmem, t2r_rmem_1, t2r_output_call_idx
@@ -826,7 +826,24 @@ class TmemCResource(MemoryResource):
             # 32x32b: 1 reg per column
             epi_t2r_repx = self.cfg.epi_tile_n // 4
             row_offset = warp_in_group * 32
-            col_offset = logical_call_idx * epi_t2r_repx
+            call_idx_for_tmem = Int32(logical_call_idx)
+            call_idx_for_output = Int32(logical_call_idx)
+            if cutlass.const_expr(self.cfg.use_tile256_tmem_overlap):
+                num_chunks = self.cfg.tile_n // epi_t2r_repx
+                offset_idx = logical_call_idx + Int32(num_chunks - 1)
+                wrapped_idx = nonnegative_mod(offset_idx, num_chunks)
+                first_window = self._epi_local_idx == Int32(0)
+                call_idx_for_tmem = prims.inline_ptx_hl(
+                    "selp.s32 {$w0}, {$r0}, {$r1}, {$r2};",
+                    write_only_types=[Int32],
+                    read_only_args=[wrapped_idx, offset_idx, first_window],
+                )
+                call_idx_for_output = prims.inline_ptx_hl(
+                    "selp.s32 {$w0}, {$r0}, {$r1}, {$r2};",
+                    write_only_types=[Int32],
+                    read_only_args=[wrapped_idx, Int32(logical_call_idx), first_window],
+                )
+            col_offset = call_idx_for_tmem * epi_t2r_repx
             col_id = base_col + self._alloc_c.offset + stage_col_offset + col_offset
             current_addr = ((base_row + row_offset) << 16) | col_id
 
@@ -835,4 +852,8 @@ class TmemCResource(MemoryResource):
             c_rmem = prims.tcgen05_ld(shape, tmem, num=max(1, epi_t2r_repx))
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
             cute.arch.fence_view_async_tmem_load()
-            return (c_rmem, cutlass.vector.full([1], 0.0, cutlass.Float32), Int32(0))
+            return (
+                c_rmem,
+                cutlass.vector.full([1], 0.0, cutlass.Float32),
+                call_idx_for_output,
+            )

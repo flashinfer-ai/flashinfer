@@ -55,17 +55,17 @@ Enable Cake CP explicitly with
 CP routing. With ``backend="cake_gdn"``, ``use_cp=False`` or ``"auto"``
 continues to select the non-CP Cake backend.
 
-The Cake GDN CP backend covers the complete legal SM100a/SM103a public context-
-parallel input domain.  It preserves ``T precompute -> MN precompute -> state
-fixup -> CP prefill`` and supports the public dtype, head-mapping, optional
-gate/scale, int32/int64 cu-seqlens and state indices, mixed or all-empty
-varlen batches, Q/K L2 normalization, checkpoints, output, and arbitrary
-positive non-overlapping packed/indexed/in-place state strides.
-The runtime manifest records only the source inventory and loading metadata.
+The Cake GDN CP backend covers the complete legal public context-parallel input
+domain on SM100a/SM103a/SM107a.  It preserves ``T precompute -> MN
+precompute -> state fixup -> CP prefill`` and supports the public dtype,
+head-mapping, optional gate/scale, int32/int64 cu-seqlens and state indices,
+mixed or all-empty varlen batches, Q/K L2 normalization, checkpoints, output,
+and arbitrary positive non-overlapping packed/indexed/in-place state strides.
 
-On SM100a/SM103a, the ``gdn_cp`` route uses checked-in CUDA sources and is
-supported with CUDA 12.8, CUDA 12.9, and CUDA 13 for FP16/BF16 inputs plus
-FP32/FP16/BF16 state and FP32 checkpoints. Other SM100 context-parallel DSL
+On SM100a/SM103a/SM107a, the ``gdn_cp`` route uses checked-in CUDA sources for
+FP16/BF16 inputs plus FP32/FP16/BF16 state and FP32 checkpoints. SM100a/SM103a
+are supported with CUDA 12.8, CUDA 12.9, and CUDA 13; SM107a needs a toolkit
+whose ``nvcc`` can emit ``compute_107a``. Other SM100 context-parallel DSL
 routes, including FP8 state or checkpoints, require CUDA 13 and
 ``nvidia-cutlass-dsl[cu13]>=4.4.2``.
 

@@ -30,12 +30,19 @@
 #define SMEM_SMEM_K_STRIDE 8192
 #define SMEM_TOTAL 66560
 #define THREADS 192
-#define BLOCK_Q 4
+// Shared by every scorer of this rows_per_rank family: the program record's
+// compile_flags fix BLOCK_Q (4 * query_len) and the kernel symbol.
+#ifndef BLOCK_Q
+#error "BLOCK_Q must be defined (-DBLOCK_Q=<4 * query_len>) by the program record's compile_flags"
+#endif
+#ifndef CAKE_PROGRAM_KERNEL
+#error "CAKE_PROGRAM_KERNEL must be defined (-DCAKE_PROGRAM_KERNEL=<kernel symbol>) by the program record's compile_flags"
+#endif
 
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_cake_msa_icp_indexer_a8101e4dbbf1639b3bbd(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, int* __restrict__ block_table, float* __restrict__ score, uint8_t* __restrict__ valid, int* __restrict__ seq_lens, int* __restrict__ query_start_loc, long long* __restrict__ positions, uint8_t* __restrict__ active_rows, int total_tokens, int token_begin, int token_count, int request_begin, int score_stride, int block_table_stride, int split_count, int rank, int* __restrict__ forced_column, int* __restrict__ pool, int pool_stride, int* __restrict__ row_meta, int* __restrict__ status, int* __restrict__ gen_ctr, int x_region_stride, int x_par_stride)
+CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, int* __restrict__ block_table, float* __restrict__ score, uint8_t* __restrict__ valid, int* __restrict__ seq_lens, int* __restrict__ query_start_loc, long long* __restrict__ positions, uint8_t* __restrict__ active_rows, int total_tokens, int token_begin, int token_count, int request_begin, int score_stride, int block_table_stride, int split_count, int rank, int* __restrict__ forced_column, int* __restrict__ pool, int pool_stride, int* __restrict__ row_meta, int* __restrict__ status, int* __restrict__ gen_ctr, int x_region_stride, int x_par_stride)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);

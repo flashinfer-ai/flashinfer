@@ -49,6 +49,40 @@ from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 from ._init_helpers import make_paged_kv_indices
 
 
+mla_swa_decode_trace = TraceTemplate(
+    op_type="mla_swa",
+    name_prefix="mla_swa_decode",
+    description="BF16 Page64 causal latent MLA sliding-window decode on SM90.",
+    axes={
+        "batch_size": Var(),
+        "q_len_per_req": Const(abbrev="sq"),
+        "num_heads": Const(abbrev="h"),
+        "head_dim_qk": Const(abbrev="d"),
+        "head_dim_v": Const(abbrev="dv", value=1024),
+        "num_pages": Var(),
+        "page_size": Const(abbrev="ps"),
+        "table_width": Var(),
+        "workspace_bytes": Var(),
+    },
+    inputs={
+        "query": Tensor(["batch_size", "q_len_per_req", "num_heads", "head_dim_qk"]),
+        "kv_cache": Tensor(["num_pages", "page_size", "head_dim_qk"]),
+        "workspace_buffer": Tensor(["workspace_bytes"]),
+        "block_tables": Tensor(["batch_size", "table_width"]),
+        "seq_lens": Tensor(["batch_size"]),
+        "window_left": Scalar("int32"),
+        "sm_scale": Scalar("float32"),
+        "backend": Scalar("string", optional=True),
+    },
+    outputs={
+        "output": Tensor(
+            ["batch_size", "q_len_per_req", "num_heads", "head_dim_v"],
+            dtype_from="query",
+        )
+    },
+)
+
+
 def _attention_check(
     reference_outputs,
     actual_outputs,
@@ -1075,31 +1109,35 @@ def _fmha_trace_variant(kwargs, *, query_param: str, cache_param: str, plan_stat
         output_dtype = requested_out_dtype
     elif isinstance(getattr(plan_state, "output_dtype", None), torch.dtype):
         # Reusable wrappers retain the planned output dtype.  In particular,
-        # an FP8-input plan may allocate FP16 output even though run() has no
+        # an FP8-input plan may allocate FP16/BF16 output even though run() has no
         # out_dtype argument and the caller omits an explicit out buffer.
         output_dtype = plan_state.output_dtype
     elif isinstance(query, torch.Tensor):
         output_dtype = query.dtype
     else:
         output_dtype = None
-    fp16_output = (
-        isinstance(query, torch.Tensor)
+    output_dtype = (
+        str(output_dtype).removeprefix("torch.")
+        if isinstance(query, torch.Tensor)
         and query.dtype == torch.float8_e4m3fn
-        and output_dtype == torch.float16
+        and output_dtype in (torch.float16, torch.bfloat16)
+        else None
     )
-    return isinstance(kwargs.get(cache_param), torch.Tensor), fp16_output, q_mode
+    return isinstance(kwargs.get(cache_param), torch.Tensor), output_dtype, q_mode
 
 
 # fi_trace retains builders by template identity, so repeated traces must reuse
 # their templates, including each supported encoded fragment size.
 @lru_cache(maxsize=None)
 def _make_attention_ts_decode_trace(
-    *, combined: bool, fp16_output: bool, q_mode: str, encoded_page_size: int = 0
+    *, combined: bool, output_dtype: str | None, q_mode: str, encoded_page_size: int = 0
 ):
     cache_form = "combined" if combined else "tuple"
     storage_axis = "storage_page_size" if encoded_page_size else "page_size"
     page_suffix = f"_encoded_page{encoded_page_size}" if encoded_page_size else ""
-    output_suffix = "_fp16_output" if fp16_output else ""
+    output_suffix = {None: "", "float16": "_fp16_output", "bfloat16": "_bf16_output"}[
+        output_dtype
+    ]
     q_axes, q_shape, output_shape, q_suffix = _fmha_q_schema(q_mode)
     axes: dict[str, Var | Const] = {
         **q_axes,
@@ -1210,8 +1248,8 @@ def _make_attention_ts_decode_trace(
         outputs={
             "output": Tensor(
                 output_shape,
-                dtype="float16" if fp16_output else None,
-                dtype_from=None if fp16_output else "q",
+                dtype=output_dtype,
+                dtype_from=None if output_dtype else "q",
                 param="out",
             )
         },
@@ -1223,14 +1261,19 @@ def _make_attention_ts_decode_trace(
 # Representative native/encoded layouts suffice for discovery. Other supported
 # fragment sizes are built lazily by the cached factories during dispatch.
 _ATTENTION_TS_DECODE_TRACES = {
-    (combined, fp16_output, q_mode, encoded_page_size): _make_attention_ts_decode_trace(
+    (
+        combined,
+        output_dtype,
+        q_mode,
+        encoded_page_size,
+    ): _make_attention_ts_decode_trace(
         combined=combined,
-        fp16_output=fp16_output,
+        output_dtype=output_dtype,
         q_mode=q_mode,
         encoded_page_size=encoded_page_size,
     )
     for combined in (False, True)
-    for fp16_output in (False, True)
+    for output_dtype in (None, "float16", "bfloat16")
     for q_mode in (_Q_FIXED_ONE, _Q_FIXED_MULTI, _Q_PACKED)
     for encoded_page_size in (0, 4)
 }
@@ -1239,12 +1282,12 @@ _ATTENTION_TS_DECODE_TRACES = {
 def attention_ts_decode_trace_dispatch(**kwargs):
     """Select one-shot FMHA storage, cache, and output-dtype schema."""
 
-    combined, fp16_output, q_mode = _fmha_trace_variant(
+    combined, output_dtype, q_mode = _fmha_trace_variant(
         kwargs, query_param="q", cache_param="paged_kv_cache"
     )
     return _make_attention_ts_decode_trace(
         combined=combined,
-        fp16_output=fp16_output,
+        output_dtype=output_dtype,
         q_mode=q_mode,
         encoded_page_size=_fmha_encoded_page_size(kwargs, cache_param="paged_kv_cache"),
     )
@@ -1258,7 +1301,7 @@ attention_ts_decode_trace_dispatch.templates = list(  # type: ignore[attr-define
 def _make_prims_ts_decode_wrapper_trace(
     *,
     combined: bool,
-    fp16_output: bool,
+    output_dtype: str | None,
     q_mode: str,
     mask_type: str,
     window_left: int,
@@ -1275,7 +1318,9 @@ def _make_prims_ts_decode_wrapper_trace(
     cache_form = "combined" if combined else "tuple"
     storage_axis = "storage_page_size" if encoded_page_size else "page_size"
     page_suffix = f"_encoded_page{encoded_page_size}" if encoded_page_size else ""
-    output_suffix = "_fp16_output" if fp16_output else ""
+    output_suffix = {None: "", "float16": "_fp16_output", "bfloat16": "_bf16_output"}[
+        output_dtype
+    ]
     q_axes, q_shape, output_shape, q_suffix = _fmha_q_schema(q_mode)
     axes: dict[str, Var | Const] = {
         **q_axes,
@@ -1438,8 +1483,8 @@ def _make_prims_ts_decode_wrapper_trace(
         outputs={
             "output": Tensor(
                 output_shape,
-                dtype="float16" if fp16_output else None,
-                dtype_from=None if fp16_output else "q",
+                dtype=output_dtype,
+                dtype_from=None if output_dtype else "q",
                 param="out",
             )
         },
@@ -1461,13 +1506,13 @@ def _make_prims_ts_decode_wrapper_trace(
 _PRIMS_TS_DECODE_WRAPPER_TRACE_EXAMPLES = {
     (
         combined,
-        fp16_output,
+        output_dtype,
         q_mode,
         plan_owns_seq_lens,
         encoded_page_size,
     ): _make_prims_ts_decode_wrapper_trace(
         combined=combined,
-        fp16_output=fp16_output,
+        output_dtype=output_dtype,
         q_mode=q_mode,
         mask_type="dense",
         window_left=-1,
@@ -1479,7 +1524,7 @@ _PRIMS_TS_DECODE_WRAPPER_TRACE_EXAMPLES = {
         encoded_page_size=encoded_page_size,
     )
     for combined in (False, True)
-    for fp16_output in (False, True)
+    for output_dtype in (None, "float16", "bfloat16")
     for q_mode in (_Q_FIXED_ONE, _Q_FIXED_MULTI, _Q_PACKED)
     for encoded_page_size in (0, 4)
     for plan_owns_seq_lens in (False, True)
@@ -1492,7 +1537,7 @@ _PRIMS_TS_DECODE_WRAPPER_TRACE_EXAMPLES = {
 def _get_prims_ts_decode_wrapper_trace(
     *,
     combined: bool,
-    fp16_output: bool,
+    output_dtype: str | None,
     q_mode: str,
     mask_type: str,
     window_left: int,
@@ -1508,7 +1553,7 @@ def _get_prims_ts_decode_wrapper_trace(
 
     return _make_prims_ts_decode_wrapper_trace(
         combined=combined,
-        fp16_output=fp16_output,
+        output_dtype=output_dtype,
         q_mode=q_mode,
         mask_type=mask_type,
         window_left=window_left,
@@ -1570,7 +1615,7 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
         wrapper_name="BatchDecodePagedTSWrapper",
         names=required_metadata,
     )
-    combined, fp16_output, q_mode = _fmha_trace_variant(
+    combined, output_dtype, q_mode = _fmha_trace_variant(
         kwargs,
         query_param="q",
         cache_param="paged_kv_cache",
@@ -1593,7 +1638,7 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
     )
     return _get_prims_ts_decode_wrapper_trace(
         combined=combined,
-        fp16_output=fp16_output,
+        output_dtype=output_dtype,
         q_mode=q_mode,
         mask_type=str(state.mask_type),
         window_left=int(state.window_left),
@@ -1728,9 +1773,35 @@ def _make_prims_ts_decode_mla_wrapper_trace(
     max_kv_len: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    softmax_rescale_threshold_log2: float = 0.0,
 ):
     cache_suffix = "_rank4" if rank4_cache else ""
     q_suffix = "_packed_q" if packed_query else ""
+    # A nonzero plan-time rescale threshold selects a different kernel; name it
+    # so its traces never alias the exact-rescale plan. Zero keeps old names.
+    threshold_suffix = ""
+    threshold_tags: list[str] = []
+    threshold_note = ""
+    if softmax_rescale_threshold_log2 > 0.0:
+        # The plan rounds the threshold to float32: use the shortest text that
+        # round-trips in float32, so distinct compiled values never share a name.
+        threshold_value = torch.tensor(
+            float(softmax_rescale_threshold_log2), dtype=torch.float32
+        ).item()
+        threshold_text = next(
+            text
+            for text in (f"{threshold_value:.{digits}g}" for digits in range(1, 10))
+            if torch.tensor(float(text), dtype=torch.float32).item() == threshold_value
+        )
+        threshold_suffix = "_rescale_thr" + threshold_text.replace(".", "p").replace(
+            "-", "m"
+        ).replace("+", "")
+        threshold_tags = [f"softmax_rescale_threshold_log2:{threshold_text}"]
+        threshold_note = (
+            " The plan sets softmax_rescale_threshold_log2="
+            f"{threshold_text}, so O rescales are skipped while a K tile raises "
+            "a row maximum by at most that many binades."
+        )
     axes: dict[str, Var | Const] = {
         "batch_size": Var(description="Exact number of planned MLA requests."),
         "max_seq_len_q": Const(
@@ -1786,11 +1857,13 @@ def _make_prims_ts_decode_mla_wrapper_trace(
         op_type="mla_paged",
         name_prefix=(
             f"prims_ts_decode_mla_wrapper{cache_suffix}{q_suffix}_{mask_type}"
+            f"{threshold_suffix}"
         ),
         description=(
             "Reusable PrimTS MLA decode wrapper. The plan fixes masks, static "
             "bounds, and exact batch size. Every run supplies page tables and "
             "sequence lengths; packed-Q runs also supply Q offsets."
+            f"{threshold_note}"
         ),
         axes=axes,
         inputs={
@@ -1846,6 +1919,7 @@ def _make_prims_ts_decode_mla_wrapper_trace(
             "status:experimental",
             "mla",
             f"mask:{mask_type}",
+            *threshold_tags,
         ],
     )
 
@@ -1879,6 +1953,7 @@ def _get_prims_ts_decode_mla_wrapper_trace(
     max_kv_len: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    softmax_rescale_threshold_log2: float = 0.0,
 ) -> TraceTemplate:
     """Return one stable trace template for a frozen MLA plan identity."""
 
@@ -1890,6 +1965,7 @@ def _get_prims_ts_decode_mla_wrapper_trace(
         max_kv_len=max_kv_len,
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
+        softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
     )
 
 
@@ -1926,6 +2002,10 @@ def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
         max_kv_len=int(state.max_kv_len),
         kv_lora_rank=int(state.kv_lora_rank),
         qk_rope_head_dim=int(state.qk_rope_head_dim),
+        # Plan-state stand-ins in the trace tests predate the threshold field.
+        softmax_rescale_threshold_log2=float(
+            getattr(state, "softmax_rescale_threshold_log2", 0.0)
+        ),
     )
 
 
@@ -3334,6 +3414,12 @@ def _trtllm_paged_attention_reference(
     bmm1_scale = float(kwargs.get("bmm1_scale", 1.0 / math.sqrt(head_dim)) or 1.0)
     bmm2_scale = float(kwargs.get("bmm2_scale", 1.0) or 1.0)
     cum_seq_lens_q = kwargs.get("cum_seq_lens_q")
+    window_left_arg = kwargs.get("window_left")
+    window_right_arg = kwargs.get("window_right")
+    window_left = -1 if window_left_arg is None else int(window_left_arg)
+    window_right = -1 if window_right_arg is None else int(window_right_arg)
+    variable_window_token_starts = kwargs.get("variable_window_token_starts")
+    variable_window_token_ends = kwargs.get("variable_window_token_ends")
     batch_size = block_tables.shape[0]
     output = torch.zeros_like(query, dtype=torch.float32)
     for b in range(batch_size):
@@ -3364,13 +3450,30 @@ def _trtllm_paged_attention_reference(
                 torch.matmul(q_b[:, h], k_flat[:, kv_h].to(torch.float32).T)
                 * bmm1_scale
             )
-            if causal:
-                qi = q_end - q_start
-                delta = kv_len - qi
-                mask = torch.full_like(logits, float("-inf"))
-                for i in range(qi):
-                    mask[i, : i + 1 + max(0, delta)] = 0.0
-                logits = logits + mask
+            qi = q_end - q_start
+            q_positions = torch.arange(qi, device=query.device) + max(0, kv_len - qi)
+            k_positions = torch.arange(kv_len, device=query.device)
+            if variable_window_token_starts is not None:
+                visible = (
+                    k_positions[None, :]
+                    >= variable_window_token_starts[q_start:q_end, None]
+                ) & (
+                    k_positions[None, :]
+                    <= variable_window_token_ends[q_start:q_end, None]
+                )
+            else:
+                visible = torch.ones_like(logits, dtype=torch.bool)
+                if causal:
+                    visible &= k_positions[None, :] <= q_positions[:, None]
+                if window_left >= 0:
+                    visible &= k_positions[None, :] >= (
+                        q_positions[:, None] - window_left
+                    )
+                if window_right >= 0 and not causal:
+                    visible &= k_positions[None, :] <= (
+                        q_positions[:, None] + window_right
+                    )
+            logits = logits.masked_fill(~visible, -float("inf"))
             attn = torch.softmax(logits, dim=-1)
             output[q_start:q_end, h] = (
                 torch.matmul(attn, v_flat[:, kv_h].to(torch.float32)) * bmm2_scale
@@ -3410,15 +3513,18 @@ def _trtllm_batch_context_reference(
     cum_seq_lens_kv,
     **kwargs,
 ):
+    reference_kwargs = dict(kwargs)
+    causal = bool(reference_kwargs.pop("causal", True))
     return _trtllm_paged_attention_reference(
         query,
         kv_cache,
         block_tables,
         seq_lens,
-        causal=True,
+        causal=causal,
         bmm1_scale=bmm1_scale,
         bmm2_scale=bmm2_scale,
         cum_seq_lens_q=cum_seq_lens_q,
+        **reference_kwargs,
     )
 
 
@@ -3996,6 +4102,27 @@ trtllm_batch_context_trace = TraceTemplate(
             ["batch_size_plus_1_kv"],
             dtype="int32",
             description="Cumulative KV sequence lengths, shape batch_size + 1.",
+        ),
+        "window_left": Scalar(
+            "int32", optional=True, description="Left sliding-window reach."
+        ),
+        "causal": Scalar(
+            "bool", optional=True, description="Whether to apply causal masking."
+        ),
+        "window_right": Scalar(
+            "int32", optional=True, description="Right sliding-window reach."
+        ),
+        "variable_window_token_starts": Tensor(
+            ["num_tokens"],
+            dtype="int32",
+            optional=True,
+            description="Inclusive K/V start for each packed query token.",
+        ),
+        "variable_window_token_ends": Tensor(
+            ["num_tokens"],
+            dtype="int32",
+            optional=True,
+            description="Inclusive K/V end for each packed query token.",
         ),
     },
     outputs={

@@ -156,7 +156,12 @@ two outputs per warp at T=1 and four at T=2..4. Other shapes retain their
 existing Tensor Core candidates. The `bf16/fma*.py` sources use
 the shared persistent JIT cache, external PTXAS and graph resource retention.
 
-All four FMA dtype paths share `fma_activations.py`. FC1 specializes the activation
+The FMA device bodies now live under `../frost_low_latency/fma/`; the local
+`fma*.py` device modules are compatibility imports. These legacy host adapters
+retain their geometry admission, launch ABI, persistent cache, and numerical
+contract. Their source hashes cover the shared implementation.
+
+All four legacy FMA dtype paths share `../frost_low_latency/fma/activations.py`. FC1 specializes the activation
 at compile time; non-gated variants omit gate weight/scale loads and the second
 dot product. FC1 compilation and tactic identities include the activation, while
 FC2's compiled source is shared across activations. The supported contracts are
