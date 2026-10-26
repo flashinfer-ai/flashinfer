@@ -49,9 +49,9 @@
     }
   },
   "generator": {
-    "cake_revision": "023e846fac93ec018c2fb10dac881f8347970420",
+    "cake_revision": "468629dab325498210268f46264193f7e3b6f4a8",
     "cuda": "13.4.92",
-    "rendered_at": "2026-10-20T03:29:21Z"
+    "rendered_at": "2026-10-26T04:26:23Z"
   },
   "libraries": [
     {
@@ -644,7 +644,7 @@
     },
     {
       "arch": "sm_90a",
-      "closure_sha256": "131a7f3a0c00c85d95b441cf42fa27387479f6b5ed0b312a630b3fc30e889575",
+      "closure_sha256": "4c498aaffdf4e7f50cd6d1486b7be5da905329e906aa9b991eaf526d0cd10188",
       "entry": "run",
       "gencode": "-gencode=arch=compute_90a,code=sm_90a",
       "min_cuda": "12.8",
@@ -656,7 +656,7 @@
       "path": "aot/cake_vsa_sm90_61a0584024c4257a2dad_sm_90a.so",
       "sha256": {
         "csrc/cake_vsa_sm90_61a0584024c4257a2dad_binding.cu": "e1af5d931dd3be425799e9b61069eaf73494aaac6ca83609838002ff5c8a9be6",
-        "csrc/cake_vsa_sm90_61a0584024c4257a2dad_kernel.cu": "747128e338cadf67b0c6a2affc7d40ce835441bcfff798c90f8bb43e1aefb51a"
+        "csrc/cake_vsa_sm90_61a0584024c4257a2dad_kernel.cu": "1b080907fd5f015dc67e4dcf3a45752e58d613cbbf1a309c39885277cfbb9004"
       },
       "sources": [
         "csrc/cake_vsa_sm90_61a0584024c4257a2dad_kernel.cu",
@@ -1379,7 +1379,7 @@
     },
     {
       "arch": "sm_90a",
-      "closure_sha256": "0a939370cc8abc8f0fae4aabe1b0433aaa2e67cd1cda7d0318dcb9cf0dff3773",
+      "closure_sha256": "e21e57b18934fc664682a7140f6153585910480ae0ad23e7ab2c2723a0fd8ea4",
       "entry": "run",
       "gencode": "-gencode=arch=compute_90a,code=sm_90a",
       "min_cuda": "12.8",
@@ -1391,7 +1391,7 @@
       "path": "aot/cake_vsa_sm90_c4be0774255356629c4e_sm_90a.so",
       "sha256": {
         "csrc/cake_vsa_sm90_c4be0774255356629c4e_binding.cu": "9460eba0fea0fcb088b6e207264da028575810211eed55c8abdd1f6b40e61525",
-        "csrc/cake_vsa_sm90_c4be0774255356629c4e_kernel.cu": "21b11713a0ced5d9b164b220de4e6545422585e274025a7b4d1ba91ec1ab479e"
+        "csrc/cake_vsa_sm90_c4be0774255356629c4e_kernel.cu": "6e78f798d768f821341d412ad43ae4c3f632ee8e7a089c320a5d6eb4578b25f9"
       },
       "sources": [
         "csrc/cake_vsa_sm90_c4be0774255356629c4e_kernel.cu",

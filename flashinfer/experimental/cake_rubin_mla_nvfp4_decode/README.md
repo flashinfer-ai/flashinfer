@@ -134,9 +134,17 @@ hold are handed out by cluster launch control. The host plan cuts every
 (request, 256-row tile) into key ranges -- the pair of split counts (full
 tiles, half tiles whose rows past the first 128 are padding) with the least
 modelled makespan over the device's clusters and pairs -- and emits the work
-items (full-tile items first). A plan without half tiles launches the
+items (full-tile items first). One wave of nearly as many full tiles as
+clusters over 1024 key tiles or more also prices a shaved plan -- every tile
+a long range and a short one of 48 tiles, the long ranges emitted first and
+the short ones left to the clusters the wave does not fill and the pairs as
+they free -- and takes it when the model puts it under the equal-length plan
+by more than the slack. A plan without half tiles launches the
 `decode_full` build (the same kernel without the double-item test at each
-item's end); otherwise `decode`. An item holding all of its rows' keys writes
+item's end); otherwise `decode`. The one plan whose scalars (rows, full-tile
+items, items, splits) lie in the `decode_full_pairpipe` record's box launches
+that build instead: the full kernel with the pair body's converter pipeline.
+An item holding all of its rows' keys writes
 `out` / `lse` directly; split items write normalised BF16 partials and
 log2-domain partial LSEs into the workspace.
 
@@ -174,7 +182,7 @@ The selection and grid rules are data in `cake_jit.MODULES` (`select_rule`,
   `launch.use_pdl` is `"runtime"`).
 * `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
   package (byte-identical copies) and this package's build manifest (schema
-  `cake-build/1`): one entry per `<library>_sm_107a` (6 programs) with its
+  `cake-build/1`): one entry per `<library>_sm_107a` (8 programs) with its
   two translation units, digests, nvcc flags, closure digest and
   `aot/<name>.so` path. `cake_build.load_library(name)` loads the prebuilt
   library when `aot/` holds it and otherwise JIT-builds the entry through

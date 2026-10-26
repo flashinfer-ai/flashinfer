@@ -73,7 +73,7 @@ SHA-256 of the compact JSON ``{"build": <build keywords, sorted>, "module":
 record's ``build`` spells those keywords: ``variant`` (the body's geometry:
 ``l8r4`` = eight lanes per state row, four rows per lane; ``l8r4p`` and
 ``l8r4w5`` = that geometry with the producer preload, for one wave of four
-CTAs per SM, for one wave of five and for the many-wave rows (``B x HV > 64 x SM
+CTAs per SM and for the many-wave rows (``B x HV > 64 x SM
 count``); ``l8r2``;
 ``l4r2``; ``l4r4`` for the runtime programs; ``splitv8_tile8`` = eight CTAs of
 eight rows
@@ -1534,21 +1534,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": [
-            {
-                "above": 160,
-                "at_most": None,
-                "ctas_per_sm_above": 4,
-                "ctas_per_sm_at_most": 5,
-                "kind": "state_heads_between",
-            },
-            {
-                "above": 160,
-                "at_most": None,
-                "ctas_per_sm_above": 64,
-                "kind": "state_heads_between",
-            },
-        ],
+        "select_rule": {
+            "above": 160,
+            "at_most": None,
+            "ctas_per_sm_above": 64,
+            "kind": "state_heads_between",
+        },
     },
     "cake_gdp_585a5ea4cbdd07f1b2a8": {
         "arches": [
@@ -3682,7 +3673,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "sm_103a",
                 ],
                 "at_most": None,
-                "ctas_per_sm_above": 5,
+                "ctas_per_sm_above": 4,
                 "ctas_per_sm_at_most": 64,
                 "kind": "state_heads_between",
             },

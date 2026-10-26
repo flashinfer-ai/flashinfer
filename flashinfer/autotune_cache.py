@@ -32,7 +32,7 @@ Design rules (kept deliberately minimal for the first version):
 
 The cache root defaults to ``FLASHINFER_CACHE_DIR/autotune`` and can be
 overridden with the ``FLASHINFER_AUTOTUNE_CACHE_DIR`` environment variable
-or ``autotune_v2(root=...)`` (always a directory, never a schema-bearing
+or ``autotune_v2(cache_root=...)`` (always a directory, never a schema-bearing
 filename: the location is placement only, so no choice of root can mix
 incompatible entries).
 """

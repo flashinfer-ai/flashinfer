@@ -2,7 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """vLLM device kernels in a standalone low-token BF16 research harness.
 
-This preserves native typed preactivation and pre-cast router weighting.
+Unchanged pinned vLLM GEMM device functions, with either naive route assignment
+or expert grouping using FI GPU sorting and a padding adapter. All adapters are
+included in timed calls. Preserves typed preactivation and pre-cast weighting.
+The grouped policy is a standalone comparison, not stock vLLM integration.
 Activation and sum are harness Triton kernels, not vLLM CUDA implementations.
 Supports SwiGLU and a standalone ReLU2 wrapper. No vLLM framework performance or bitwise Frost equivalence is asserted.
 """
@@ -77,8 +80,35 @@ def combine(
     tl.store(out + idx, acc, idx < T * H)
 
 
+@triton.jit
+def pad_sorted_indices(
+    permuted,
+    limits,
+    active_tiles,
+    sorted_ids,
+    R: tl.constexpr,
+    M: tl.constexpr,
+    B: tl.constexpr,
+):
+    idx = tl.program_id(0) * B + tl.arange(0, B)
+    tile = idx // M
+    active = tile < tl.load(active_tiles)
+    limit = tl.load(limits + tile, (idx < R * M) & active, other=0)
+    valid = (idx < R * M) & active & (idx < limit)
+    # FI only initializes valid entries. The upstream GEMM masks indices >=R,
+    # so never expose negative padding or stale entries outside each tile limit.
+    route = tl.load(permuted + idx, valid, other=R)
+    tl.store(
+        sorted_ids + idx,
+        tl.where(valid & (route >= 0) & (route < R), route, R),
+        idx < R * M,
+    )
+
+
 class VllmTritonComparator:
-    def __init__(self, x, w1, w2, ids, scores, source, gated=True):
+    def __init__(self, x, w1, w2, ids, scores, source, gated=True, route_policy="both"):
+        if route_policy not in ("both", "naive", "grouped"):
+            raise ValueError("route_policy must be both, naive or grouped")
         self.gated = gated
         # Triton inspects source files while compiling; keep this file alive with the
         # comparator rather than exec-ing a source string with no inspectable file.
@@ -99,7 +129,9 @@ class VllmTritonComparator:
         self.i = w2.shape[-1]
         self.r = self.t * self.k
         if self.r * 4 > w1.shape[0]:
-            raise ValueError("Only the upstream naive route policy is reproduced")
+            raise ValueError(
+                "The comparator is limited to low-token workloads with routes * 4 <= experts"
+            )
         if x.dtype not in (torch.bfloat16, torch.float16) or any(
             tensor.dtype != x.dtype for tensor in (w1, w2)
         ):
@@ -111,8 +143,24 @@ class VllmTritonComparator:
         self.raw = torch.empty((self.r, self.h), device=x.device, dtype=x.dtype)
         self.out = torch.empty_like(x)
         self.padded = torch.empty(1, device=x.device, dtype=torch.int32)
+        from flashinfer.fused_moe.cute_dsl.moe_utils import (
+            allocate_moe_sort_buffers,
+            moe_sort,
+        )
+
+        self._sort = moe_sort
+        self.sort_buffers = allocate_moe_sort_buffers(
+            self.t, w1.shape[0], self.k, tile_tokens_dim=16, device=x.device
+        )
+        self.sorted_ids = torch.empty(self.r * 16, device=x.device, dtype=torch.int32)
+        self._grouped = False
         self.tactics = [
-            (16, n, k, stage)
+            (16, n, k, stage, grouped)
+            for grouped in (
+                {"both": (False, True), "naive": (False,), "grouped": (True,)}[
+                    route_policy
+                ]
+            )
             for n in (32, 64, 128)
             for k in (32, 64, 128)
             for stage in (2, 3, 4)
@@ -122,7 +170,7 @@ class VllmTritonComparator:
         return self.tactics
 
     def gemm(self, a, b, c, tactic, mul, topk):
-        m, n, k, stage = tactic
+        m, n, k, stage = tactic[:4]
         em = self.r * m
         self._gemm[(self.r * triton.cdiv(b.shape[1], n),)](
             a,
@@ -132,9 +180,13 @@ class VllmTritonComparator:
             None,
             None,
             self.scores,
-            None,
-            self.ids,
-            self.padded,
+            self.sorted_ids if self._grouped else None,
+            self.sort_buffers["out_tile_idx_to_expert_idx"]
+            if self._grouped
+            else self.ids,
+            self.sort_buffers["out_total_num_padded_tokens"]
+            if self._grouped
+            else self.padded,
             b.shape[1],
             b.shape[2],
             em,
@@ -155,7 +207,7 @@ class VllmTritonComparator:
             0,
             0,
             0,
-            naive_block_assignment=True,
+            naive_block_assignment=not self._grouped,
             BLOCK_SIZE_M=m,
             BLOCK_SIZE_N=n,
             BLOCK_SIZE_K=k,
@@ -176,8 +228,32 @@ class VllmTritonComparator:
         )
 
     def forward(self, tactic):
-        # The upstream low-token path fills this scalar per call; include it in graphs.
-        self.padded.fill_(self.r * tactic[0])
+        # Include route preparation in every call, including graph replay.
+        tactic = (*tactic, False) if len(tactic) == 4 else tuple(tactic)
+        if tactic not in self.tactics:
+            raise ValueError("Tactic is outside the configured comparator search")
+        self._grouped = bool(tactic[4])
+        if self._grouped:
+            self._sort(
+                self.ids,
+                self.scores,
+                self.w1.shape[0],
+                self.k,
+                tile_tokens_dim=16,
+                enable_pdl=False,
+                **self.sort_buffers,
+            )
+            pad_sorted_indices[(triton.cdiv(self.r * 16, 256),)](
+                self.sort_buffers["out_permuted_idx_to_expanded_idx"],
+                self.sort_buffers["out_tile_idx_to_mn_limit"],
+                self.sort_buffers["out_num_non_exiting_tiles"],
+                self.sorted_ids,
+                self.r,
+                16,
+                256,
+            )
+        else:
+            self.padded.fill_(self.r * tactic[0])
         self.gemm(self.x, self.w1, self.pre, tactic, False, self.k)
         activation[(triton.cdiv(self.r * self.i, 256),)](
             self.pre, self.mid, self.i, self.r, 256, self.gated

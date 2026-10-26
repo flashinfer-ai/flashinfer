@@ -42,7 +42,10 @@ import cutlass.utils.hopper_helpers as sm90_utils
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from .route_members import route_members
+from .block_scale import promote_block_scaled
 from ..fma.activations import apply_activation
+from ..quantization import _mul
+from .....cute_dsl.fp4_common import cvt_f32_to_e4m3
 
 
 class HopperGroupedProjection:
@@ -56,6 +59,7 @@ class HopperGroupedProjection:
         activation="swiglu",
         gated=True,
         parameters=None,
+        block_scaled=False,
     ):
         if (
             group_size not in (2, 4, 8)
@@ -71,6 +75,7 @@ class HopperGroupedProjection:
         self.input_route_divisor = top_k if fc1 else 1
         self.activation = activation
         self.parameters = parameters
+        self.block_scaled = block_scaled
         self.rows_per_tile = 32 if self.split_gate else 64
         self.acc_dtype = cutlass.Float32
         self.cluster_shape_mn = (1, 1)
@@ -132,6 +137,8 @@ class HopperGroupedProjection:
         ids: cute.Tensor,
         output: cute.Tensor,
         stream: cuda.CUstream,
+        dequant=None,
+        mid_quant=None,
     ):
         a = cute.make_tensor(
             weights.iterator,
@@ -170,8 +177,16 @@ class HopperGroupedProjection:
             raise TypeError(
                 f"Type width mismatch: {self.a_dtype.width} != {self.b_dtype.width}"
             )
-        if cutlass.const_expr(self.a_dtype not in (cutlass.BFloat16, cutlass.Float16)):
-            raise TypeError("Grouped Hopper projection requires BF16 or FP16")
+        if cutlass.const_expr(
+            self.a_dtype
+            not in (cutlass.BFloat16, cutlass.Float16, cutlass.Float8E4M3FN)
+        ):
+            raise TypeError("Grouped Hopper projection requires BF16, FP16 or E4M3")
+        if cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN):
+            if cutlass.const_expr(dequant is None or mid_quant is None):
+                raise TypeError(
+                    "Grouped E4M3 projection requires live calibration scales"
+                )
         self._setup_attributes()
         if cutlass.const_expr(self.split_gate):
             weight_layout = cute.composition(
@@ -210,6 +225,8 @@ class HopperGroupedProjection:
             b,
             output,
             route_ids,
+            dequant,
+            mid_quant,
             tma_atom_a,
             tma_tensor_a,
             self.tiled_mma,
@@ -231,6 +248,8 @@ class HopperGroupedProjection:
         raw_b: cute.Tensor,
         output: cute.Tensor,
         route_ids: cute.Tensor,
+        dequant,
+        mid_quant,
         tma_atom_a: cute.CopyAtom,
         mA_mkl: cute.Tensor,
         tiled_mma: cute.TiledMma,
@@ -370,7 +389,13 @@ class HopperGroupedProjection:
                 tCrA = tiled_mma.make_fragment_A(tCsA)
                 tCrB = tiled_mma.make_fragment_B(tCsB)
                 acc_shape = tCgC.shape
+                coordinates = tiled_mma.get_slice(tidx).partition_C(
+                    cute.make_identity_tensor((64, 8))
+                )
                 accumulators = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
+                if cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN):
+                    total = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
+                    total.fill(0)
                 pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
                 k_tile_cnt = cute.size(gA_mkl, mode=[2])
                 prefetch_k_tile_cnt = cutlass.max(
@@ -448,6 +473,8 @@ class HopperGroupedProjection:
                     mainloop_pipeline.consumer_wait(
                         mainloop_consumer_read_state, peek_ab_full_status
                     )
+                    if cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN):
+                        tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
                     cute.nvgpu.warpgroup.fence()
                     for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
                         k_block_coord = (
@@ -466,7 +493,45 @@ class HopperGroupedProjection:
                             accumulators,
                         )
                         tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
-                    cute.nvgpu.warpgroup.commit_group()
+                        if cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN):
+                            # Native FP8 WGMMA K=32. Promote at most two instructions
+                            # at a time independently of the TMA staging tile width.
+                            if (
+                                k_block_idx + 1
+                            ) % 2 == 0 or k_block_idx + 1 == num_k_blocks:
+                                cute.nvgpu.warpgroup.commit_group()
+                                cute.nvgpu.warpgroup.wait_group(0)
+                                if cutlass.const_expr(self.block_scaled):
+                                    promote_block_scaled(
+                                        accumulators,
+                                        total,
+                                        coordinates,
+                                        dequant,
+                                        mid_quant,
+                                        members,
+                                        expert,
+                                        cute.size(output, mode=[1]),
+                                        pid_m,
+                                        _k_tile,
+                                        self.rows_per_tile,
+                                        self.tile_k,
+                                        self.group_size,
+                                        self.split_gate,
+                                        self.input_route_divisor,
+                                    )
+                                else:
+                                    for element in cutlass.range_constexpr(
+                                        cute.size(accumulators)
+                                    ):
+                                        total[element] = (
+                                            total[element] + accumulators[element]
+                                        )
+                                tiled_mma.set(
+                                    cute.nvgpu.warpgroup.Field.ACCUMULATE, False
+                                )
+                                cute.nvgpu.warpgroup.fence()
+                    if cutlass.const_expr(self.a_dtype != cutlass.Float8E4M3FN):
+                        cute.nvgpu.warpgroup.commit_group()
                     mainloop_consumer_read_state.advance()
                     peek_ab_full_status = cutlass.Boolean(1)
                     if mainloop_consumer_read_state.count < k_tile_cnt:
@@ -477,6 +542,8 @@ class HopperGroupedProjection:
                     mainloop_pipeline.consumer_wait(
                         mainloop_consumer_read_state, peek_ab_full_status
                     )
+                    if cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN):
+                        tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
                     cute.nvgpu.warpgroup.fence()
                     for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
                         k_block_coord = (
@@ -494,7 +561,46 @@ class HopperGroupedProjection:
                             tCrB_1phase,
                             accumulators,
                         )
-                    cute.nvgpu.warpgroup.commit_group()
+                        if cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN):
+                            tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
+                            # Native FP8 WGMMA K=32. Promote at most two instructions
+                            # at a time independently of the TMA staging tile width.
+                            if (
+                                k_block_idx + 1
+                            ) % 2 == 0 or k_block_idx + 1 == num_k_blocks:
+                                cute.nvgpu.warpgroup.commit_group()
+                                cute.nvgpu.warpgroup.wait_group(0)
+                                if cutlass.const_expr(self.block_scaled):
+                                    promote_block_scaled(
+                                        accumulators,
+                                        total,
+                                        coordinates,
+                                        dequant,
+                                        mid_quant,
+                                        members,
+                                        expert,
+                                        cute.size(output, mode=[1]),
+                                        pid_m,
+                                        _k_tile,
+                                        self.rows_per_tile,
+                                        self.tile_k,
+                                        self.group_size,
+                                        self.split_gate,
+                                        self.input_route_divisor,
+                                    )
+                                else:
+                                    for element in cutlass.range_constexpr(
+                                        cute.size(accumulators)
+                                    ):
+                                        total[element] = (
+                                            total[element] + accumulators[element]
+                                        )
+                                tiled_mma.set(
+                                    cute.nvgpu.warpgroup.Field.ACCUMULATE, False
+                                )
+                                cute.nvgpu.warpgroup.fence()
+                    if cutlass.const_expr(self.a_dtype != cutlass.Float8E4M3FN):
+                        cute.nvgpu.warpgroup.commit_group()
                     cute.nvgpu.warpgroup.wait_group(k_pipe_mmas)
                     # WGMMA completion must precede producer reuse of this stage.
                     mainloop_pipeline.consumer_release(mainloop_consumer_release_state)
@@ -564,35 +670,63 @@ class HopperGroupedProjection:
                 # Reuse weight shared storage only after all WGMMA consumers finish.
                 thread_c = tiled_mma.get_slice(tidx).partition_C(sC[None, None, 0])
                 for element in cutlass.range_constexpr(cute.size(accumulators)):
-                    thread_c[element] = accumulators[element]
+                    if cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN):
+                        thread_c[element] = total[element]
+                    else:
+                        thread_c[element] = accumulators[element]
                 cute.arch.sync_threads()
                 lane = cute.arch.lane_idx()
                 for member in cutlass.range_constexpr(self.group_size):
                     if cutlass.const_expr(self.split_gate):
                         if warp_idx == member % 4 and members[member] >= 0:
-                            up = sC[lane, member, 0]
-                            gate = sC[lane + 32, member, 0]
-                            output[members[member], pid_m * 32 + lane] = (
-                                apply_activation(
-                                    up, gate, self.activation, False, self.parameters
-                                ).to(output.element_type)
+                            value = self.epilogue(
+                                sC[lane, member, 0],
+                                sC[lane + 32, member, 0],
+                                dequant,
+                                mid_quant,
+                                expert,
+                            )
+                            output[members[member], pid_m * 32 + lane] = value.to(
+                                output.element_type
                             )
                     else:
                         if warp_idx // 2 == member % 2 and members[member] >= 0:
                             row = (warp_idx % 2) * 32 + lane
-                            value = sC[row, member, 0]
-                            if cutlass.const_expr(self.fc1):
-                                value = apply_activation(
-                                    value,
-                                    cutlass.Float32(0),
-                                    self.activation,
-                                    False,
-                                    self.parameters,
-                                )
+                            value = self.epilogue(
+                                sC[row, member, 0],
+                                cutlass.Float32(0),
+                                dequant,
+                                mid_quant,
+                                expert,
+                            )
                             output[members[member], pid_m * 64 + row] = value.to(
                                 output.element_type
                             )
         return
+
+    @cute.jit
+    def epilogue(self, value, gate, dequant, mid_quant, expert):
+        if cutlass.const_expr(
+            self.a_dtype == cutlass.Float8E4M3FN and not self.block_scaled
+        ):
+            value = _mul(value, dequant[expert])
+            if cutlass.const_expr(self.fc1):
+                gate = _mul(gate, dequant[expert])
+                value = value.to(cutlass.BFloat16).to(cutlass.Float32)
+                gate = gate.to(cutlass.BFloat16).to(cutlass.Float32)
+        if cutlass.const_expr(self.fc1):
+            value = apply_activation(
+                value, gate, self.activation, False, self.parameters
+            )
+            if cutlass.const_expr(
+                self.a_dtype == cutlass.Float8E4M3FN and not self.block_scaled
+            ):
+                value = (
+                    cvt_f32_to_e4m3(_mul(value, mid_quant[0]))
+                    .to(cutlass.Uint8)
+                    .bitcast(cutlass.Float8E4M3FN)
+                )
+        return value
 
     @staticmethod
     def _make_smem_layouts(

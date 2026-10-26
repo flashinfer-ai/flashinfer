@@ -219,6 +219,11 @@ worker counts without GPU topology or measured memory capacity.
 Run the CPU-only coordinator suite with
 `pytest --confcutdir=tests/test_sharding tests/test_sharding/`.
 
+Collection stdout/stderr, including best-effort JIT prewarm warnings, is retained
+under `junit/collection-*/*.log` and uploaded with the public CI telemetry. Each
+collection gets a separate directory so concurrent collectors or later attempts
+preserve earlier diagnostics. Collection metadata remains temporary.
+
 Communication-test wrappers optionally emit cache-publication completion reports
 when `UNIT_TEST_RUN_STATUS_DIR` is set to a fresh directory unique to that wrapper
 and container/rank. `test_run_status.sh` records each pytest invocation, and
@@ -267,6 +272,51 @@ def test_hopper_attention():
 | FP8 GEMM | SM89+ | `get_compute_capability()[0] >= 9` |
 
 **Note:** `tests/conftest.py` auto-skips tests that trigger OOM, but tests should be written to avoid OOM by using appropriate problem sizes.
+
+### Attention plan and CUDA Graph lifetime
+
+When `auto` changes providers, an older captured call can still hold the previous
+provider's metadata pointers. Keep wrapper-owned tables and length buffers alive
+and refresh them in `plan()` whenever replay can still use them; `run()` must not
+rebuild or repack metadata. Validate transitions with changed page IDs as well as
+changed lengths, including replacing an owned table with a caller-supplied table
+of a different width. Shortening a KV prefix without changing page IDs can accidentally
+pass while the captured table is stale. A reserved page table can be wider than
+one graph's declared KV range: declare only that range while preserving the
+storage row stride and pointer. Include a backend-only provider control in
+capacity-lifetime tests, since FROST can accept an oversized descriptor that the
+backend rejects. Table capacity must cover initialized
+indices and rounded graph bounds; also test a fallback beyond cuDNN admission.
+An explicit KV maximum may be looser than the caller table's capacity. Intersect
+these two upper bounds when declaring the graph, using the same effective bound
+for the attention attribute and table slice; actual device lengths still mask
+the live tokens, without a host readback.
+Replay an old capture only with lengths inside its declared bounds and compatible
+buffers. Keep numerical and lifetime tests independent of heuristic winners and
+timing thresholds.
+
+FA2 captures also bind CPU-generated scheduling metadata, including output and
+merge prefixes. Updating only Q/KV indptr tensors after switching to cuDNN leaves
+that schedule stale when requests exchange query rows. In graph mode, keep FA2
+once it has been planned; eager auto selection can still change providers. Test
+FA2-first as well as cuDNN-first with changed Q partitions and page IDs.
+
+Auto dispatch must preserve run-time calibration scales for half-precision as
+well as FP8 inputs. Test non-unit Q/K scales with nontrivial logits, V scales
+against O and unchanged LSE, and GPU scalar changes before replay. A plan-time
+predicate cannot exclude arguments supplied only to `run()`.
+
+Refining auto admission must also preserve the explicit-bound, device-length
+no-readback path. Declining cuDNN can itself cause FA2 to stage KV metadata back
+to the host. Use per-request work only when its lengths are already on CPU;
+otherwise retain the existing bound-based policy. Check with a busy GPU stream
+and synchronization debugging, not just a predicate-level test.
+
+Full-prefill admission requires each request's Q length to equal its KV length;
+equal batch maxima do not establish that contract. Prove it using existing CPU
+metadata, and decline the full-prefill extension when independent query-length
+overrides or device-only KV lengths prevent that proof. Preserve the existing
+prefix policy without adding a device readback just for dispatch.
 
 ## Benchmarking
 
@@ -797,6 +847,7 @@ CI `docker run --rm` boundary provides final cleanup for those processes.
 | `FLASHINFER_DSL_FMHA_LOCAL_DIR` | unset | `flashinfer/attention/cute_dsl/fmha.py` | Path to a local checkout of the CuTe-DSL FMHA kernel sources. The loader checks here before downloading. |
 | `FLASHINFER_LOGGING_LEVEL` | `INFO` | `flashinfer/artifacts.py`, `flashinfer/jit/core.py` | Python logging level for the artifacts/cubin loader and the JIT compiler (`DEBUG`/`INFO`/`WARNING`/`ERROR`). Distinct from `FLASHINFER_LOGLEVEL`. |
 | `FLASHINFER_DISABLE_TINYGEMM2_SM100` | `0` | `flashinfer/gemm/routergemm.py` | Set to `1` to disable the generated SM100/SM103 `tinygemm2` backend and force the dispatcher to fall back to the legacy implementation. Useful as an escape hatch when debugging backend-selection or kernel issues on Blackwell systems. |
+| `FLASHINFER_DISABLE_CAKE_BF16_BMM_SWAP_AB` | `0` | `flashinfer/gemm/gemm_base.py` | Set to `1` to keep `bmm_bf16(..., backend="cake")` on its mma.sync dispatcher for every shape, instead of the generated SM100/SM103 tcgen05 swap-AB programs that serve the decode shapes of its route table. Useful as an escape hatch when debugging backend-selection or kernel issues on Blackwell systems. |
 
 ##### API Dump / Logging Extensions
 
@@ -871,7 +922,7 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_B12X_FORCE_MOE_W4A16` | unset | `flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py` | `1` forces the SM12x MoE dispatcher onto the W4A16 path with BF16 activations. Internal/experimental — used to reproduce W4A16-specific issues. |
 | `FLASHINFER_B12X_STATIC_COMPACT_CUTOVER_PAIRS` | shape/device-dependent | `flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py` | Override the routed-pair threshold between static and dynamic MoE for device/workload tuning. Set before first use; the decision is cached. A nonnegative integer, with `0` disabling the static band. Legacy aliases, in decreasing precedence: `B12X_STATIC_COMPACT_CUTOVER_PAIRS`, `B12X_DYNAMIC_STATIC_CUTOVER_PAIRS`, `B12X_LEVEL10_STATIC_CUTOVER_PAIRS`. |
 | `FLASHINFER_TACTICS_BLOCKLIST` | unset | `flashinfer/autotuner/autotuner.py` | Path to a JSON tactics-blocklist file generated by `flashinfer tactics-blocklist generate` (or `python -m flashinfer tactics-blocklist generate`). When set, the autotuner loads the file at startup and skips any kernel tactics listed as invalid for the current GPU/driver environment, preventing hang or crash on known-bad tactics. |
-| `FLASHINFER_CUDNN_PREFILL_SHAPE_OVERRIDE` | `1` | `flashinfer/cudnn/prefill.py` (ragged token-indptr path) | `0` makes the cuDNN ragged prefill graph declare the exact `(batch, max_seq_len)` per call instead of building one override-enabled graph per length class (declared max_len 128 or 65536+, batch 4096+) and passing the real shapes at execute time via cuDNN's shape override. With matching FE 1.31+ Python/native support, BF16 SM100 MLA prefixes (D192/V128, equal 4–64 heads, B1–4, Q64–1024, KV2K–32K at least 4x Q) use bounded power-of-two batch/Q/KV classes and a packed-Q capacity instead; this preserves reuse within each class while exposing useful plan-time occupancy and workspace bounds. Crossing a class builds one cached plan. Override exists because cuDNN finalizes one execution plan per declared shape (55-70 ms, ~1 s with a kernel compile) and serving changes the shape every step; needs cuDNN 9.22+ and cudnn-frontend 1.29+, otherwise the exact declaration is used. Disable only to bisect a suspected override regression. |
+| `FLASHINFER_CUDNN_PREFILL_SHAPE_OVERRIDE` | `1` | `flashinfer/cudnn/prefill.py` (ragged token-indptr path) | `0` makes the cuDNN ragged prefill graph declare the exact `(batch, max_seq_len)` per call instead of building one override-enabled graph per length class (declared max_len 128 or 65536+, batch 4096+) and passing the real shapes at execute time via cuDNN's shape override. With matching FE 1.31+ Python/native support, SM100/SM107 packed prefixes (BF16 D192/V128 with equal heads, or FP16/BF16 D128/V128 with integral GQA1/2/4/8/16; 4–64 query heads, B1–4, Q2–1024, KV2K–32K at least 4x Q) use bounded power-of-two batch/Q/KV classes and a packed-Q capacity instead; this preserves reuse within each class while exposing useful plan-time occupancy and workspace bounds. Q2–128 share the Q128 class; Q=1 retains the separate decode class. Crossing a class builds one cached plan. Override exists because cuDNN finalizes one execution plan per declared shape (55-70 ms, ~1 s with a kernel compile) and serving changes the shape every step; needs cuDNN 9.22+ and cudnn-frontend 1.29+, otherwise the exact declaration is used. Disable only to bisect a suspected override regression. |
 | `FLASHINFER_ALLOW_CUDNN_PLAN_BUILD_IN_CAPTURE` | `0` | `flashinfer/gemm/gemm_base.py` (read once at import) | `1` downgrades the refusal to build a cuDNN execution plan during CUDA graph capture from a `CudnnPlanBuildInCaptureError` to a warning. Set it only if you have verified your cuDNN version tolerates plan build under capture; the supported alternative is to run each shape once eagerly outside the capture region, which populates the per-shape plan cache the captured call then reuses. |
 | `FLASHINFER_DECODE_AUTO_CUDNN` | unset | `flashinfer/decode.py` (`_auto_decode_prefers_cudnn`) | `BatchDecodeWithPagedKVCacheWrapper(backend="auto")`: unset applies the measured rule (SM100/SM103 with cudnn-frontend 1.30+, fp16/bf16 head_dim 128, GQA group dividing 128, `2 <= q_len_per_req <= 4` with `q_len_per_req * group` in [32, 128] rows per CTA and `batch_size * num_kv_heads >= 64` CTAs, no RoPE / soft-cap / window resolve to `cudnn`, whose default SM100 engine runs those multi-token rows on its FROST decode tile at 0.35-0.95x fa2; single-token decode stays on fa2 except head_dim-256 GQA models with group 4 / 8 / 16 and `batch_size * num_kv_heads` in [96, 256], where the d256 decode tile measures at 0.5-0.95x fa2, from 64 under `use_cuda_graph=True` with a caller-owned table on cudnn-frontend 1.31+, which the wrapper tells the graph is replayed (`is_cuda_graph_replay_expected`) so the tile splits KV; multi-token rows without tensor cores, which have no fa2 kernel, take cudnn whenever its decode path can run them); `0` never resolves to cudnn; `1` applies the rule on an older frontend too (benchmarking; the backend engine is ~8x slower there). Under CUDA graphs `auto` takes cudnn only with a caller-owned `block_tables` (the auto-built table cannot grow once captured) or for multi-token rows without tensor cores, and the resolution is frozen after the first plan. A caller-owned table narrower than 2048 tokens keeps fa2 on cudnn-frontend 1.30 (its placement ranks the backend's prefill-class engine first below that; 1.31+ lifts the limit). `auto` takes cudnn only where the frontend's FROST engines can run (its own CuTe-DSL check: `nvidia-cutlass-dsl` >= 4.7.0, above the 4.6.2 the dependency metadata admits; the `1` override and the no-fa2 route are not gated), and callers passing `fixed_split_size` / `disable_split_kv` (fa2's batch-invariance controls) keep fa2 wherever fa2 can serve the rows. `wrapper.resolved_backend` reports the choice. |
 | `FLASHINFER_CAKE_SSD_CHUNK_PARALLEL` | `auto` | `flashinfer/mamba/cake_ssd_combined.py` (`SSDCombined(backend="cake")`, read on every call) | Chooses between the two exact Mamba2 SSD prefill program families of the Cake backend: `auto` applies the calibrated rule (`chunk_parallel_selected`: the chunk-parallel family only when the call has fewer `(sequence, head)` work items than SMs, its per-tile S/H workspace fits in 256 MiB and its predicted main-kernel time beats the exact scan's by the selection margin), `always` forces the chunk-parallel family, `never` forces the exact scan. Both families run the same exact-scan arithmetic. Any other value raises `ValueError`. |

@@ -46,6 +46,20 @@ def _resolve_gate_up_clamp(
     return config.activation_clamp
 
 
+def _cake_reducer_supported(k, fleet_params: FleetParams) -> bool:
+    from flashinfer.jit.cake_megamoe_topk_reduce import supports_device
+
+    return (
+        fleet_params.max_tokens_per_rank in (256, 4096)
+        and fleet_params.token_hidden_size == 4096
+        and k.top_k == 6
+        and not k.enable_in_kernel_fc2_reduce
+        and k.combine_dtype == "bf16"
+        and k.apply_routing_weights_before_fc2
+        and supports_device()
+    )
+
+
 @register_mega_kernel(
     "sm100_nvfp4_nvfp4_bf16_cutedsl", deprecated_aliases=("nvfp4_cutedsl",)
 )
@@ -217,23 +231,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         return self._finalize_mode(fleet_params) is FinalizeMode.CAKE
 
     def _cake_reducer_supported(self, fleet_params: FleetParams) -> bool:
-        """Whether this exact workspace can use the frozen Cake reducer.
-
-        The reducer is published for the datacenter-Blackwell targets that
-        also run this CuTeDSL megakernel (sm_100a on B200, sm_103a on B300).
-        """
-        from flashinfer.jit.cake_megamoe_topk_reduce import supports_device
-
-        k = self._kernel_config
-        return (
-            supports_device()
-            and fleet_params.max_tokens_per_rank in (256, 4096)
-            and fleet_params.token_hidden_size == 4096
-            and k.top_k == 6
-            and not k.enable_in_kernel_fc2_reduce
-            and k.combine_dtype == "bf16"
-            and k.apply_routing_weights_before_fc2
-        )
+        return _cake_reducer_supported(self._kernel_config, fleet_params)
 
     def validate_forward(
         self,

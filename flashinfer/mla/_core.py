@@ -4661,8 +4661,9 @@ def nvfp4_sparse_mla_decode(
         ``[num_tokens, 16, 512]`` ``torch.bfloat16`` output; allocated when omitted.
     num_ctas_per_token : Optional[int]
         Thread-block cluster size per query token: 3 to 8 with ``backend="cuda"``, 1 to 6 or 8 with
-        ``backend="cake"`` (7 is rejected). By default, the largest size whose ``num_tokens`` clusters all fit
-        on the device in one wave.
+        ``backend="cake"`` (7 is rejected). By default, among the sizes whose ``num_tokens`` clusters all fit
+        on the device in one wave, ``backend="cuda"`` takes the largest and ``backend="cake"`` the one with
+        the least work per CTA.
     backend : str
         ``"cuda"`` (default), the hand-written kernel, or ``"cake"``, the generated program of the same
         operator (``flashinfer/experimental/nvfp4_sparse_mla_decode/cake_backend.py``).

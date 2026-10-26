@@ -60,7 +60,9 @@ constexpr int kScratchRegionCount = 2;
 // no epoch and no arrival counter -- its scratch reuse is guarded by an
 // end-of-call neighbour handshake rather than by a double buffer -- so a
 // ScratchRegion enumerator for it would be state that exists only to be
-// miscalled.
+// miscalled. The pipelined ring's slots and flags are a third region, with no
+// handshake at all; ce_ring_all_reduce_piped carries the argument for reusing
+// them.
 //
 // Flags are strided a full sector apart because a peer writes them over PCIe;
 // two sharing a sector turn a store into a read-modify-write on the root
@@ -103,9 +105,10 @@ enum class Variant : int {
   kCopyEngineRing = 4,
   kCopyEngineIsland = 5,     // 4+4 decomposition; world_size 8 and rootcplx only
   kCopyEngineRingMemop = 6,  // SM120 single-piece ring with CE publication
+  kCopyEngineRingPiped = 7,  // SM120 pipelined, topology-weighted ring with CE publication
 };
 
-constexpr int kVariantCount = 7;
+constexpr int kVariantCount = 8;
 
 // Which staging area a kernel uses. The kernels come in two protocol families
 // and a region may hold only one of them.
@@ -2239,7 +2242,7 @@ cudaError_t all_reduce(const T* input, T* output, int64_t numel, const PeerViews
   // world_size == 2 branch below selects on `variant == kStaged` and would
   // otherwise silently run the TP2 SM kernel for any variant it does not know.
   if (variant == Variant::kCopyEngineRing || variant == Variant::kCopyEngineIsland ||
-      variant == Variant::kCopyEngineRingMemop) {
+      variant == Variant::kCopyEngineRingMemop || variant == Variant::kCopyEngineRingPiped) {
     return cudaErrorInvalidValue;
   }
 

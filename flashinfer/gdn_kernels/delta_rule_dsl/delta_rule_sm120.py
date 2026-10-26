@@ -1661,7 +1661,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
                 16,
             ]
 
-        self.shared_storage = SharedStorage
+        self.shared_storage: type = SharedStorage
 
         self.kernel(
             g_alpha,

@@ -794,18 +794,6 @@ kernel_cake_vsa_sm90_61a0584024c4257a2dad(const __grid_constant__ CUtensorMap Q,
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         mbarrier_arrive(v_full_addr + (p % 3) * 8);
                         mbarrier_arrive(v_land_empty_addr + (p % 3) * 8);
-                        int ipk = i + 1;
-                        if (ipk < n_seq_k) {
-                            int swp = __shfl_sync(0xFFFFFFFF, meta_smem[mb_k + 8 + ipk], 0);
-                            int pblk_a = swp << 16 >> 16;
-                            int pblk_b = swp >> 16;
-                            if (elect_sync()) {
-                                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&K))), "r"((int)(0)), "r"((int)(kv_base + pblk_a * 64)) : "memory");
-                                if (pblk_b >= 0) {
-                                    asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&K))), "r"((int)(0)), "r"((int)(kv_base + pblk_b * 64)) : "memory");
-                                }
-                            }
-                        }
                     }
                     gk += n_seq_k;
                     __syncwarp();
@@ -1417,18 +1405,6 @@ kernel_cake_vsa_sm90_61a0584024c4257a2dad(const __grid_constant__ CUtensorMap Q,
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         mbarrier_arrive(v_full_addr + (pv % 3) * 8);
                         mbarrier_arrive(v_land_empty_addr + (pv % 3) * 8);
-                        int ipv = i_1 + 1;
-                        if (ipv < n_seq_v) {
-                            int svp = __shfl_sync(0xFFFFFFFF, meta_smem[mb_v + 8 + ipv], 0);
-                            int pvblk_a = svp << 16 >> 16;
-                            int pvblk_b = svp >> 16;
-                            if (elect_sync()) {
-                                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&V))), "r"((int)(0)), "r"((int)(kv_base_v + pvblk_a * 64)) : "memory");
-                                if (pvblk_b >= 0) {
-                                    asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&V))), "r"((int)(0)), "r"((int)(kv_base_v + pvblk_b * 64)) : "memory");
-                                }
-                            }
-                        }
                     }
                     gv += n_seq_v;
                     __syncwarp();

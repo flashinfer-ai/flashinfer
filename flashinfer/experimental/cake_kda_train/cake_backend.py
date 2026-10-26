@@ -64,8 +64,10 @@ writes the gate gradients itself).  The bracketed launches depend on the path
 and the row: from a version-2 (tape) saved set there is no recurrence
 recompute; from a version-4 set carrying the segment-boundary states the
 segmented recompute is pass 2 alone; the rows whose version-4 set carries the
-WY representation (the paired serial 16-head rows of ``sm_100a``) launch no WY
-program; the serial recompute of the 64-column form from 64 heads forms the WY
+WY representation (the paired serial 16-head rows of ``sm_100a``, the
+segmented 16-head rows of ``sm_103a`` / ``sm_107a`` above 32 (document, head)
+chains) launch no WY program; the serial recompute of the 64-column form from
+64 heads forms the WY
 representation itself (no WY launch) and leaves the transposed ``w`` tile the
 matching adjoint recurrence reads; the saved-state pass 2 of the segmented
 rows with at most 32 (document, head) chains does the same; the serial adjoint
@@ -85,9 +87,9 @@ and as the segmented three passes otherwise (:func:`cake_jit.segment_plan`):
 pass 1 walks every segment of every document in parallel (the forward's from
 zero and from the identity: the segment offset and transfer; the backward's
 reverse walk from zero), ``seg_carry`` chains the segments' states within
-each document (TF32 on the tensor cores; on ``sm_100a`` / ``sm_107a`` with at
-most two heads, where its host rule accepts, the two-level carry
-``seg_carry_v8`` forms the groups of segments in parallel), pass 2 walks again
+each document (TF32 on the tensor cores; with at most two heads, where its
+host rule accepts, the two-level carry ``seg_carry_v8`` forms the groups of
+segments in parallel), pass 2 walks again
 from the carried states and writes the tapes.
 
 Memory.  A :class:`KdaWorkspace` is one arena holding only the internal
@@ -101,8 +103,10 @@ kept between calls.  :func:`workspace_bytes`, :func:`saved_bytes`,
 ``save_mode="light"`` (the default; saved set version 4) saves ``Aqk`` /
 ``Akk`` on the token rows (256 B per token-head), the tables, the fold's ``qg``
 (256 B per internal token-head: the light backward's prep writes none), on the
-paired serial 16-head rows of ``sm_100a`` the WY representation ``w`` / ``u``
-(512 B more; that backward launches no WY program) and, on the
+rows whose light backward reads it from the set (the paired serial 16-head
+rows of ``sm_100a``, the segmented 16-head rows of ``sm_103a`` / ``sm_107a``
+above 32 (document, head) chains) the WY representation ``w`` / ``u`` (512 B
+more; that backward launches no WY program) and, on the
 segmented route when ``S >= 384 * NSEG`` (:func:`seg_states_saved`: the three
 FP32 state blocks are then no larger than the ``Aqk`` / ``Akk`` set), the
 forward's segment-boundary states ``hseg`` and ``seg_state``, so the
@@ -138,8 +142,9 @@ MAX_DOCS = 65536  # the layout table finds a chunk's document with a 16-step sea
 SCALE = D**-0.5  # the default softmax-free scale of the GLM contract
 # saved set version 4 (light): {Aqk, Akk, tables, qg} + the segment-boundary states {hseg, seg_state} on the
 # segmented route when the size rule holds + the WY representation {w, u} on the rows whose light backward reads
-# it from the set (the paired serial 16-head rows of sm_100a: no wy launch there); versions 1 and 3 (the light sets
-# without qg) are no longer produced or accepted
+# it from the set (the paired serial 16-head rows of sm_100a, the segmented 16-head rows of sm_103a / sm_107a above
+# 32 (document, head) chains: no wy launch there); versions 1 and 3 (the light sets without qg) are no longer
+# produced or accepted
 SAVED_VERSION = 4
 SAVED_VERSION_TAPE = (
     2  # saved set version 2: + the forward's h tape and v_new (+ the segment transfers)
@@ -466,8 +471,9 @@ class Plan:
     @property
     def light_saves_wu(self) -> bool:
         """Whether the light forward saves the WY representation ``w`` / ``u`` (version 4): the light backward's
-        prep record writes no ``kb`` (``bwd_prep_g8_noqg_nokb``, the paired serial 16-head rows of ``sm_100a``) and
-        the path launches no ``wy`` program; the saved tensors feed the recurrence recompute and the adjoint."""
+        prep record writes no ``kb`` (``bwd_prep_g8_noqg_nokb``: the paired serial 16-head rows of ``sm_100a`` and
+        the segmented 16-head rows of ``sm_103a`` / ``sm_107a`` above 32 (document, head) chains) and neither light
+        path launches a ``wy`` program; the saved tensors feed the recurrence recompute and the adjoint."""
         return "kb" not in self._light_prep_logical()
 
     def _light_prep_logical(self) -> set[str]:
@@ -1498,8 +1504,9 @@ def saved_bytes(
     the forward's segment-boundary states ``hseg`` FP32 ``[NSEG, H, 128, 128]`` and ``seg_state`` FP32 ``[2, NSEG,
     H, 128, 128]`` (three state blocks of ``NSEG * H * 64 KiB``; the segment count needs ``num_docs`` and
     ``sm_count`` / ``arch``, :func:`_arch_sms`) and, on the rows whose light backward reads the WY representation
-    from the set (the paired serial 16-head rows of ``sm_100a``; ``arch=None`` takes the first exported
-    architecture's records), ``w`` / ``u`` BF16 ``[R, H, 128]``.  ``save_mode="tape"`` adds the internal-layout
+    from the set (the paired serial 16-head rows of ``sm_100a`` and the segmented 16-head rows of ``sm_103a`` /
+    ``sm_107a`` above 32 (document, head) chains; ``arch=None`` takes the first exported architecture's records),
+    ``w`` / ``u`` BF16 ``[R, H, 128]``.  ``save_mode="tape"`` adds the internal-layout
     ``h`` BF16 ``[NC_pad, H, 128, 128]``, ``v_new`` BF16 ``[R, H, 128]`` and, on the segmented route, the forward's
     segment states FP32 ``[2, NSEG, H, 128, 128]`` whose transfer half is the saved ``seg_m`` (``num_docs``
     required) instead."""
@@ -1811,8 +1818,9 @@ class KdaChunkSaved:
     ``[2, NSEG, H, 128, 128]`` (``[0]`` the segment offsets, ``[1]`` the transfers the backward's reverse carry
     reads): the backward's recurrence recompute is then pass 2 alone (both ``None`` on the serial route and for
     shorter packs, which the backward recomputes), and on the rows whose light backward reads the WY
-    representation from the set (:attr:`Plan.light_saves_wu`: the paired serial 16-head rows of ``sm_100a``) the
-    forward's ``w`` / ``u`` BF16 ``[R, H, 128]`` (``None`` elsewhere: the backward's ``wy`` program recomputes
+    representation from the set (:attr:`Plan.light_saves_wu`: the paired serial 16-head rows of ``sm_100a`` and
+    the segmented 16-head rows of ``sm_103a`` / ``sm_107a`` above 32 (document, head) chains) the forward's ``w``
+    / ``u`` BF16 ``[R, H, 128]`` (``None`` elsewhere: the backward's ``wy`` program recomputes
     them).  Version 2 (``save_mode="tape"``) adds the forward's ``h`` tape BF16 ``[NC_pad, H, 128, 128]``,
     ``v_new`` BF16 ``[R, H, 128]`` (internal layout, pad rows zero) and, on the segmented route, ``seg_m`` FP32
     ``[NSEG, H, 128, 128]`` (``None`` on the serial route) instead, and no ``qg`` / ``w`` / ``u`` (its prep writes
