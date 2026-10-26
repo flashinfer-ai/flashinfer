@@ -106,6 +106,7 @@ def _reset_trace_apply(monkeypatch: pytest.MonkeyPatch):
 # ===========================================================================
 
 
+@pytest.mark.cpu_only
 def test_schema_roundtrip():
     defn = Definition.from_dict(_defn("rmsnorm_h7168", 7168))
     assert defn.fi_api() == FI_API
@@ -120,6 +121,7 @@ def test_schema_roundtrip():
     assert Solution.from_dict(sol.to_dict()) == sol
 
 
+@pytest.mark.cpu_only
 def test_definition_name_from_template():
     # Name-routing relies on this: the live template recomputes the definition
     # name from const axes (var axes are excluded).
@@ -130,6 +132,7 @@ def test_definition_name_from_template():
     )
 
 
+@pytest.mark.cpu_only
 def test_axis_extraction_parity_with_live_template():
     reg = _registry_by_fi_api()
     assert FI_API in reg
@@ -155,6 +158,7 @@ def test_axis_extraction_parity_with_live_template():
     assert dt == _dt("float32")
 
 
+@pytest.mark.cpu_only
 def test_stateful_plan_run_namespace_and_candidate_kwargs():
     from flashinfer.trace_apply.plan_capture import adapter_for, stash_plan_kwargs
 
@@ -203,6 +207,7 @@ def test_stateful_plan_run_namespace_and_candidate_kwargs():
     assert ck["sm_scale"] == 0.125
 
 
+@pytest.mark.cpu_only
 def test_mla_stateful_adapter_recovers_moved_wrapper_plan_state():
     from flashinfer.trace_apply.plan_capture import adapter_for
 
@@ -234,6 +239,7 @@ def test_mla_stateful_adapter_recovers_moved_wrapper_plan_state():
     assert candidate_kwargs["sm_scale"] == 0.125
 
 
+@pytest.mark.cpu_only
 def test_mla_trace_apply_accepts_historical_and_moved_wrapper_keys():
     from flashinfer.trace_apply.plan_capture import adapter_for
 
@@ -248,6 +254,7 @@ def test_mla_trace_apply_accepts_historical_and_moved_wrapper_keys():
     assert adapter_for(moved) is not None
 
 
+@pytest.mark.cpu_only
 def test_output_adapt_value_returning_returns_value():
     tmpl = _live_template(FI_API)
     x = torch.randn(4, 8)
@@ -269,6 +276,7 @@ def test_output_adapt_value_returning_returns_value():
     assert torch.allclose(out, x + 1.0)
 
 
+@pytest.mark.cpu_only
 def test_derive_output_dests_auto_binds_out_and_lse():
     # The trace declares no output param for value-returning APIs; the out=/lse=
     # buffers are auto-derived from the live API signature at enable time.
@@ -295,6 +303,7 @@ def test_derive_output_dests_auto_binds_out_and_lse():
     }
 
 
+@pytest.mark.cpu_only
 def test_output_adapt_honors_caller_out_buffer():
     # With dests={"output": "out"} (as auto-derived), a value-returning solution +
     # a caller-provided out= buffer → result copied into the buffer and returned.
@@ -318,6 +327,7 @@ def test_output_adapt_honors_caller_out_buffer():
     assert torch.allclose(buf, x + 1.0)
 
 
+@pytest.mark.cpu_only
 def test_output_adapt_inplace_writeback():
     FA = "flashinfer.norm.fused_add_rmsnorm"
     tmpl = _live_template(FA)
@@ -348,6 +358,7 @@ def test_output_adapt_inplace_writeback():
     assert torch.allclose(res, new_res)
 
 
+@pytest.mark.cpu_only
 def test_output_adapt_dps_solution():
     tmpl = _live_template(FI_API)
     x = torch.randn(4, 8)
@@ -367,6 +378,7 @@ def test_output_adapt_dps_solution():
     assert torch.allclose(out, x * 2.0)
 
 
+@pytest.mark.cpu_only
 def test_output_arity_passthrough():
     DEC = "flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper.run"
     tmpl = _live_template(DEC)
@@ -394,6 +406,7 @@ def test_output_arity_passthrough():
     assert isinstance(r, tuple) and r[0] is o and r[1] is lse
 
 
+@pytest.mark.cpu_only
 def test_python_solution_loader(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     sol = Solution.from_dict(
@@ -416,6 +429,7 @@ def test_python_solution_loader(tmp_path, monkeypatch):
     assert torch.allclose(out, torch.tensor([2.0, 3.0]))
 
 
+@pytest.mark.cpu_only
 def test_loader_rejects_path_traversal(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     for bad in ("../evil.py", "/etc/evil.py", "a/../../evil.py"):
@@ -438,6 +452,7 @@ def test_loader_rejects_path_traversal(tmp_path, monkeypatch):
             )
 
 
+@pytest.mark.cpu_only
 def test_solution_hash_is_source_order_independent():
     base = {
         "name": "s",
@@ -470,6 +485,7 @@ def test_solution_hash_is_source_order_independent():
     assert a.hash() == b.hash()
 
 
+@pytest.mark.cpu_only
 def test_plan_stash_weakref_cleanup():
     import gc
     import weakref
@@ -493,6 +509,7 @@ def test_plan_stash_weakref_cleanup():
 # ===========================================================================
 
 
+@pytest.mark.cpu_only
 def test_enable_apply_dispatches_to_callable():
     calls = []
 
@@ -517,6 +534,7 @@ def test_enable_apply_dispatches_to_callable():
     assert calls  # the solution actually executed
 
 
+@pytest.mark.cpu_only
 def test_enable_apply_real_kernel_numeric():
     """A genuine torch RMSNorm callable; assert the substituted output matches."""
     ta.enable_apply({"rmsnorm_h16": _torch_rmsnorm})
@@ -528,6 +546,7 @@ def test_enable_apply_real_kernel_numeric():
     assert ta.stats().get(FI_API, {}).get("hit", 0) >= 1
 
 
+@pytest.mark.cpu_only
 def test_enable_apply_honors_out_kwarg():
     # End-to-end: a caller passing out= gets the substituted result written into
     # the buffer (auto-derived out= binding), matching the real kernel.
@@ -541,6 +560,7 @@ def test_enable_apply_honors_out_kwarg():
     assert torch.allclose(buf, _ref_rmsnorm(x, w), rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.cpu_only
 def test_enable_apply_solution_object(tmp_path, monkeypatch):
     """A first-class Solution (loaded via the loader), not a raw callable."""
     monkeypatch.setenv("HOME", str(tmp_path / "home"))  # hermetic loader cache
@@ -573,6 +593,7 @@ def test_enable_apply_solution_object(tmp_path, monkeypatch):
     assert ta.stats().get(FI_API, {}).get("hit", 0) >= 1
 
 
+@pytest.mark.cpu_only
 def test_fallback_on_miss_calls_original(monkeypatch):
     """A shape with no registered name must fall through to the original API."""
 
@@ -599,6 +620,7 @@ def test_fallback_on_miss_calls_original(monkeypatch):
     assert st.get("hit", 0) >= 1 and st.get("fallback_no_candidate", 0) >= 1
 
 
+@pytest.mark.cpu_only
 def test_strict_mode_matched_solution_error_raises():
     """A matched solution that raises must propagate (not silently fall back)."""
 
@@ -611,6 +633,7 @@ def test_strict_mode_matched_solution_error_raises():
     assert ta.stats().get(FI_API, {}).get("error", 0) >= 1
 
 
+@pytest.mark.cpu_only
 def test_enable_overrides_previous_then_disable_reverts():
     def s1(hidden_states, weight):
         return torch.full_like(hidden_states, SENTINEL)
@@ -632,6 +655,7 @@ def test_enable_overrides_previous_then_disable_reverts():
     assert getattr(flashinfer.norm.rmsnorm, "_trace_apply", False) is False
 
 
+@pytest.mark.cpu_only
 def test_solutions_positional_and_keyword_equivalent():
     def sol(hidden_states, weight):
         return torch.full_like(hidden_states, SENTINEL)
@@ -644,11 +668,13 @@ def test_solutions_positional_and_keyword_equivalent():
     assert torch.allclose(out, torch.full_like(out, SENTINEL))
 
 
+@pytest.mark.cpu_only
 def test_enable_apply_empty_is_noop():
     assert ta.enable_apply({}) == 0
     assert not ta.is_enabled()
 
 
+@pytest.mark.cpu_only
 def test_multi_template_apply_uses_only_selected_metadata(monkeypatch):
     """A runtime-selected template owns extraction, plan state, and outputs."""
 
@@ -833,6 +859,7 @@ def _moe_definition_name(fi_api, call_kwargs):
     return template.definition_name(axes)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "fi_api, make_kwargs",
     [(MOE_FP8_API, _fp8_moe_kwargs), (MOE_FP4_API, _fp4_moe_kwargs)],
