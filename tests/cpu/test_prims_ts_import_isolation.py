@@ -22,7 +22,7 @@ import sys
 import pytest
 
 
-_REPO_ROOT = Path(__file__).parents[1]
+_REPO_ROOT = Path(__file__).parents[2]
 
 
 def _run_isolated(code: str) -> None:
@@ -33,6 +33,7 @@ def _run_isolated(code: str) -> None:
     subprocess.run([sys.executable, "-c", code], check=True, env=env)
 
 
+@pytest.mark.cpu_only
 def test_flashinfer_import_and_availability_probe_do_not_import_task_scheduling():
     _run_isolated(
         """
@@ -65,6 +66,7 @@ assert "cutlass.experimental.task_scheduling.resources" not in sys.modules
     )
 
 
+@pytest.mark.cpu_only
 def test_prims_ts_bootstrap_scopes_work_tile_info_customization():
     from flashinfer.prims_ts import is_prims_ts_available
 
@@ -163,6 +165,7 @@ sys.meta_path.insert(0, _Stub())
 """
 
 
+@pytest.mark.cpu_only
 def test_prims_ts_directory_still_collects_without_cutlass_experimental(tmp_path):
     """``tests/prims_ts`` must COLLECT cleanly on a DSL that lacks 4.7.
 

@@ -74,6 +74,7 @@ def _first_buildable_pair(mapper, tile_n, **kwargs):
     pytest.fail(f"no buildable tactic found for tile_N={tile_n}")
 
 
+@pytest.mark.cpu_only
 def test_mxfp8_mxfp8_mapper_supports_tile256():
     pair = map_trtllm_mxfp8_mxfp8_moe_tactic(
         [256, 0],
@@ -92,6 +93,7 @@ def test_mxfp8_mxfp8_mapper_supports_tile256():
     assert not fc2.has_epilogue_quant
 
 
+@pytest.mark.cpu_only
 def test_mxfp8_mxfp8_mapper_supports_geglu_tile8():
     pair = _first_buildable_pair(
         map_trtllm_mxfp8_mxfp8_moe_tactic,
@@ -108,6 +110,7 @@ def test_mxfp8_mxfp8_mapper_supports_geglu_tile8():
     assert pair.fc1.cfg.build().uses_mxfp8_output_quant
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("tile_n", [8, 16, 32, 64, 128])
 def test_deepseek_fp8_mapper_supports_trtllm_tile_ladder(tile_n):
     pair = _first_buildable_pair(
@@ -130,6 +133,7 @@ def test_deepseek_fp8_mapper_supports_trtllm_tile_ladder(tile_n):
     assert fc2.num_stages_c_smem == 1
 
 
+@pytest.mark.cpu_only
 def test_fp8_per_tensor_mapper_supports_no_per_token_sfb_tile8():
     pair = _first_buildable_pair(
         map_trtllm_fp8_per_tensor_moe_tactic,
@@ -152,6 +156,7 @@ def test_fp8_per_tensor_mapper_supports_no_per_token_sfb_tile8():
     assert fc2.use_per_token_sf_b == 0
 
 
+@pytest.mark.cpu_only
 def test_fp8_per_tensor_mapper_uses_sfa_and_fc1_sfb_tile8():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
 
@@ -180,6 +185,7 @@ def test_fp8_per_tensor_mapper_uses_sfa_and_fc1_sfb_tile8():
     assert fc2.per_token_sf_dtype == int(DType.FP32)
 
 
+@pytest.mark.cpu_only
 def test_fp8_per_tensor_mapper_supports_fc1_per_channel_only_tile8():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
 
@@ -204,6 +210,7 @@ def test_fp8_per_tensor_mapper_supports_fc1_per_channel_only_tile8():
     assert fc2.use_per_token_sf_b == 0
 
 
+@pytest.mark.cpu_only
 def test_fp8_per_tensor_mapper_supports_fc2_per_channel_only_tile8():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
 
@@ -228,6 +235,7 @@ def test_fp8_per_tensor_mapper_supports_fc2_per_channel_only_tile8():
     assert fc2.per_token_sf_dtype == int(DType.FP32)
 
 
+@pytest.mark.cpu_only
 def test_fp8_per_tensor_mapper_supports_fc1_sfb_without_sfa_tile8():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
 
@@ -252,6 +260,7 @@ def test_fp8_per_tensor_mapper_supports_fc1_sfb_without_sfa_tile8():
     assert fc2.use_per_token_sf_b == 0
 
 
+@pytest.mark.cpu_only
 def test_fp8_per_tensor_mapper_accepts_bf16_per_token_sf_dtype():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
 
@@ -270,6 +279,7 @@ def test_fp8_per_tensor_mapper_accepts_bf16_per_token_sf_dtype():
     assert pair.fc1.cfg.build().per_token_sf_dtype == int(DType.BF16)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("num_tokens", "expected_tile_n"),
     [
@@ -291,11 +301,13 @@ def test_deepseek_fp8_mapper_default_matches_trtllm_fallback(
     assert pair.tile_n == expected_tile_n
 
 
+@pytest.mark.cpu_only
 def test_deepseek_fp8_mapper_rejects_trtllm_unsupported_tile256():
     with pytest.raises(ValueError, match="DeepSeek FP8 tile_N=256"):
         map_trtllm_deepseek_fp8_moe_tactic([256, 0])
 
 
+@pytest.mark.cpu_only
 def test_mxfp8_block_support_accepts_swiglu_oa_params(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
     monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
@@ -317,6 +329,7 @@ def test_mxfp8_block_support_accepts_swiglu_oa_params(monkeypatch):
     assert reason == ""
 
 
+@pytest.mark.cpu_only
 def test_mxfp8_block_support_accepts_bias(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
     monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
@@ -337,6 +350,7 @@ def test_mxfp8_block_support_accepts_bias(monkeypatch):
     assert reason == ""
 
 
+@pytest.mark.cpu_only
 def test_deepseek_fp8_support_rejects_oa_params(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
     monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
@@ -358,6 +372,7 @@ def test_deepseek_fp8_support_rejects_oa_params(monkeypatch):
     assert "DeepSeek FP8 Prims-TS OA params" in reason
 
 
+@pytest.mark.cpu_only
 def test_deepseek_fp8_support_rejects_bias(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
     monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
@@ -381,6 +396,7 @@ def test_deepseek_fp8_support_rejects_bias(monkeypatch):
     assert "DeepSeek FP8 Prims-TS bias" in reason
 
 
+@pytest.mark.cpu_only
 def test_fp8_block_routing_resolver_accepts_unpacked_precomputed():
     hidden_states = torch.empty((4, 128), dtype=torch.bfloat16)
     topk_ids = torch.empty((4, 2), dtype=torch.int32)
@@ -399,6 +415,7 @@ def test_fp8_block_routing_resolver_accepts_unpacked_precomputed():
     assert resolved_weights is topk_weights
 
 
+@pytest.mark.cpu_only
 def test_fp8_block_routing_resolver_rejects_unpacked_fp32_weights():
     hidden_states = torch.empty((4, 128), dtype=torch.bfloat16)
     topk_ids = torch.empty((4, 2), dtype=torch.int32)

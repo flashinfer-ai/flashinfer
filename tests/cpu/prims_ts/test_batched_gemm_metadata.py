@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 
 
+@pytest.mark.cpu_only
 def test_partial_route_map_padding_keeps_trt_absolute_limits():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
         _launch_metadata_lists,
@@ -54,6 +55,7 @@ def test_partial_route_map_padding_keeps_trt_absolute_limits():
     assert set(padded_routes) == {0}
 
 
+@pytest.mark.cpu_only
 def test_early_exit_route_map_padding_is_not_semantic_metadata():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
         _launch_metadata_lists,
@@ -85,6 +87,7 @@ def test_early_exit_route_map_padding_is_not_semantic_metadata():
     assert set(extra_routes) == {0}
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("num_tokens", "requested_extent", "expected_extent"),
     (
@@ -118,6 +121,7 @@ def test_early_exit_launch_extent_covers_active_token_tiles(
     assert extent == expected_extent
 
 
+@pytest.mark.cpu_only
 def test_disabled_early_exit_keeps_requested_launch_extent():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
         _make_token_layout,
@@ -142,6 +146,7 @@ def test_disabled_early_exit_keeps_requested_launch_extent():
     assert extent == 3
 
 
+@pytest.mark.cpu_only
 def test_persistent_multistage_workid_disables_c_scratch_ab_alias():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         TileScheduler,
@@ -156,6 +161,7 @@ def test_persistent_multistage_workid_disables_c_scratch_ab_alias():
     assert not cfg.aliases_c_scratch_with_ab
 
 
+@pytest.mark.cpu_only
 def test_single_stage_workid_keeps_c_scratch_disjoint_from_ab():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         TileScheduler,

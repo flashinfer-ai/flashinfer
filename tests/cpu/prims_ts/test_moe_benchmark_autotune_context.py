@@ -14,12 +14,14 @@
 
 """Regressions for the PrimsTS/TRT-LLM Gen qualification driver."""
 
+import pytest
+
 import ast
 from pathlib import Path
 
 
 _BENCHMARK = (
-    Path(__file__).parents[2] / "benchmarks" / "bench_trtllm_gen_fused_moe_autotuner.py"
+    Path(__file__).parents[3] / "benchmarks" / "bench_trtllm_gen_fused_moe_autotuner.py"
 )
 
 
@@ -31,6 +33,7 @@ def _function(tree: ast.Module, name: str) -> ast.FunctionDef:
     )
 
 
+@pytest.mark.cpu_only
 def test_autotune_lookup_preserves_profile_replay_override():
     tree = ast.parse(_BENCHMARK.read_text())
     run_benchmark = _function(tree, "_run_benchmark")
@@ -52,6 +55,7 @@ def test_autotune_lookup_preserves_profile_replay_override():
     assert overrides >= {"tuning_buckets", "cuda_graph_profile_replays"}
 
 
+@pytest.mark.cpu_only
 def test_bf16_benchmark_forwards_profile_replays_and_uses_situ_gating():
     tree = ast.parse(_BENCHMARK.read_text())
     benchmark = _function(tree, "bench_trtllm_gen_fused_moe_autotuner_bf16")
@@ -78,6 +82,7 @@ def test_bf16_benchmark_forwards_profile_replays_and_uses_situ_gating():
     assert ast.unparse(is_gated.value) == "ActivationType(activation_type).is_gated"
 
 
+@pytest.mark.cpu_only
 def test_fp4_benchmark_cli_clamp_takes_precedence_over_model_default():
     tree = ast.parse(_BENCHMARK.read_text())
     benchmark = _function(tree, "bench_trtllm_gen_fused_moe_autotuner_fp4")
