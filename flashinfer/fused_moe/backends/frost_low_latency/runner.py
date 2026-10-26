@@ -235,7 +235,10 @@ class FrostLowLatencyRunner(MoERunner):
             else "mxint4-load-width-v1"
             if self.config.quant.weight is QuantFormat.MXINT4
             else (
-                "fp4-route-reuse-load-width-lut-fp16-v8"
+                "nvfp4-grouped-tc-pr-v4"
+                if self._fp4_weight_only
+                and self.config.quant.weight is QuantFormat.NVFP4
+                else "fp4-route-reuse-load-width-lut-fp16-v8"
                 if self._fp4_weight_only
                 else (
                     "w8a16-grouped-tc-pr-v17"
@@ -300,6 +303,32 @@ class FrostLowLatencyRunner(MoERunner):
                     for a in (1, 2, 4)
                     for b in columns
                 ]
+            if (
+                self.config.quant.weight is QuantFormat.NVFP4
+                and self.config.quant.output is self.config.quant.activation
+                and inputs[0].shape == (8, 2048)
+                and self.config.experts.intermediate_size == 512
+                and self.config.routing.top_k == 10
+                and self.config.activation == SwiGLU()
+                and self.config.finalize.do_finalize
+            ):
+                # Reused routes amortize packed fragment conversion. Retain all
+                # FFMA choices for sparse overlap; untuned dispatch is unchanged.
+                if (
+                    capability == (12, 0)
+                    and self.config.quant.activation is QuantFormat.BF16
+                ):
+                    tactics += [
+                        ("warp_mma", 4, 2, 128),
+                        ("warp_mma", 8, 4, 128),
+                        ("warp_mma", 4, 2, 256),
+                        ("warp_mma", 8, 2, 256),
+                    ]
+                elif capability == (10, 3) and self.config.quant.activation in (
+                    QuantFormat.BF16,
+                    QuantFormat.FP16,
+                ):
+                    tactics += [("warp_mma", 4, 2, 256), ("warp_mma", 8, 2, 256)]
             return tactics
         if (
             self.config.quant.weight is QuantFormat.FP8PerTensor

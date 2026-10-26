@@ -1876,3 +1876,45 @@ Use `benchmarks/bench_frost_low_latency_w8a16.py --baseline frost_fma
 For BF16, use `--dtype bf16` and compare with `--baseline cutile_w8a16` as well as
 `--baseline frost_fma`. The interval includes both projections, activation
 and final combine.
+
+### Packed NVFP4 grouped decode on SM120 and B300
+
+Autotuning includes four grouped warp-MMA candidates for NVFP4 weights with
+BF16 activation/output, default SwiGLU, finalized output, and
+T=8/H=2048/I=512/top-k=10 on SM120: group4/stages2/K128,
+group8/stages4/K128, and group4 or group8 with stages2/K256. All 64 FFMA
+choices and the untuned
+default remain available. B300/SM103 adds two-stage K256 groups of four and
+eight for the same shape with matching BF16 or FP16 input/output. K256 halves
+the number of producer/consumer stage transitions relative to K128; both
+projections still load packed weights and live block scales. Other architectures
+and dtypes keep their existing choices. A cached winner does not automatically
+adapt to changing expert reuse.
+
+The shared grouped projection keeps weights packed through TMA/shared memory
+and stages live E4M3 block scales with the activation producer. Exact
+E2M1-times-E4M3 products become BF16 or FP16 MMA fragments. Expert scales remain
+after the dot product; FC1 preactivation and expert outputs round to the
+activation dtype. Packed routing scores still round to BF16 for both types.
+Routing, activation, workspace, combine and executable-cache infrastructure are shared with the existing paths. This addition does not
+admit MXFP4 or MXINT4 Tensor Core candidates.
+
+`benchmarks/bench_frost_low_latency_w4a16.py` includes both FFMA and these
+grouped choices in the advertised Frost candidate search.
+
+On SM120, compare with the packed cuTile path:
+
+```bash
+python benchmarks/bench_frost_low_latency_w4a16.py \
+  --weight-format nvfp4 --native-backend cutile --tokens 8 \
+  --expert-reuse shared --cache-mode warm --output nvfp4-sm120-warm.json
+```
+
+On SM103, use `--native-backend expanded-bf16` for matching BF16 or
+`--activation-dtype fp16 --native-backend expanded-fp16` for matching FP16.
+These CUTLASS controls use exact offline expansion, require four times the
+packed weight storage, and exclude expansion from timing. The search compares
+stage-ranked native pairs and the default; it is not the full native Cartesian
+search. Repeat with `--cache-mode cold` and representative routing. Here
+`--expert-reuse half` alternates two disjoint top-k groups, so T8 has four tokens
+per active expert; `disjoint` gives each token separate experts.
