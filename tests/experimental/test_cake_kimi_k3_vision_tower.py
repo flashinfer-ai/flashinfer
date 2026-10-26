@@ -68,6 +68,8 @@ ATOL = RTOL = 1e-2
 # Persistent-grid capacity of B200 / B300 in 2-CTA clusters (148 SMs).
 GRID_CLUSTERS = 74
 SM_COUNT = 148
+# Encoder layers of the evaluation contract's rows.
+CONTRACT_LAYERS = 27
 
 # grid_thws batches: single images, a ragged multi-segment batch and a t = 3 video group.
 SMALL_GRIDS = [
@@ -653,6 +655,82 @@ def test_small_m_twins_route_per_arch(arch):
 
 
 @pytest.mark.parametrize("arch", sorted(SUPPORTED_COMPUTE_CAPABILITIES.values()))
+def test_ready_counter_key_contract(arch):
+    """The ready counters gate batch8_448 (8192 tokens) on sm_103a at 148 SMs on all three edges: its plan lists the
+    five twin keys after its GEMM keys, the twins are required and registered there (on no other arch), the counter
+    words are the plan's last zeroed u32 workspace, and every encoder launch takes its twin and wait target; a plan
+    of one layer, another token count or another arch keeps the base launches and allocates no counter words."""
+    on = arch in cb.READY_COUNTER_ARCHES
+    plan = build_kimi_k3_vision_plan(
+        CONTRACT_GRIDS["batch8_448"],
+        "cpu",
+        num_layers=CONTRACT_LAYERS,
+        sm_count=SM_COUNT,
+        arch=arch,
+    )
+    assert plan.total_tokens == 8192
+    assert plan.ready_counters == (("E1", "E2", "E3") if on else ())
+    for edge in cb.READY_COUNTER_EDGES:
+        early = cb.ready_counter_early_clusters(edge, 8192, SM_COUNT, plan.gemm_configs)
+        assert early > 0, edge
+    twins = list(cb.READY_COUNTER_KEYS)
+    gemm = list(dict.fromkeys(plan.gemm_kernel_keys.values()))
+    keys = list(cb.plan_kernel_keys(plan))
+    assert keys[: len(gemm)] == gemm
+    if on:
+        assert keys[len(gemm) : len(gemm) + len(twins)] == twins
+    else:
+        assert not set(twins) & set(keys)
+    assert (set(twins) <= set(cb.REQUIRED_KERNEL_KEYS[arch])) is on
+    assert (set(twins) <= set(cb.REGISTERED_KERNEL_KEYS[arch])) is on
+    if cake_jit.route_available(arch):
+        assert cake_jit.route_available(arch, tuple(twins)) is on
+    for variant, (base, twin) in cb.READY_COUNTER_TILES.items():
+        assert plan.gemm_kernel_keys[variant] == f"gemm:{variant}:{base}:pdle"
+        assert cb.READY_COUNTER_KEYS[list(cb.READY_COUNTER_TILES).index(variant)] == (
+            f"gemm:{variant}:{twin}:pdle"
+        )
+    if on:
+        assert list(plan.workspace)[-1] == "ready_counters"
+        words = plan.workspace["ready_counters"]
+        assert words.shape == (cb.READY_COUNTER_SLOTS * cb.READY_COUNTER_STRIDE,)
+        assert words.dtype == torch.uint32
+        assert int(words.view(torch.int32).count_nonzero()) == 0
+    else:
+        assert "ready_counters" not in plan.workspace
+    for layer in range(CONTRACT_LAYERS - 1):
+        expected = {
+            "norm_qkv_rope": None if layer == 0 else ("l_e8_cs_rcw", 4 * layer),
+            "residual_wo_sqxw": ("l_e8_tma1x_rcp", 0),
+            "norm_gelu": ("l_e8_rcwp", 4 * (layer + 1)),
+            "residual_fc1_sqxw": ("l_e8_pf_rcwp", 16 * (layer + 1)),
+        }
+        for variant, want in expected.items():
+            if want is not None and on:
+                want = (f"gemm:{variant}:{want[0]}:pdle", want[1])
+            else:
+                want = None
+            got = cb.ready_counter_launch(plan, variant, layer)
+            assert got == want, (variant, layer)
+    last = cb.ready_counter_launch(plan, "residual_fc1", CONTRACT_LAYERS - 1)
+    assert last == (("gemm:residual_fc1:l_e8_pf_rcc:pdle", 0) if on else None)
+    if on:
+        with pytest.raises(RuntimeError, match="below the last layer"):
+            cb.ready_counter_launch(plan, "residual_fc1_sqxw", CONTRACT_LAYERS - 1)
+    assert cb.ready_counter_launch(plan, "pos_sqxw", 0) is None
+    for grids, layers in (
+        (CONTRACT_GRIDS["batch8_448"], 1),
+        ([(1, 32, 32)] * 7, CONTRACT_LAYERS),
+        (CONTRACT_GRIDS["img_1920x1080"], CONTRACT_LAYERS),
+    ):
+        other = build_kimi_k3_vision_plan(
+            grids, "cpu", num_layers=layers, sm_count=SM_COUNT, arch=arch
+        )
+        assert other.ready_counters == () and "ready_counters" not in other.workspace
+        assert not set(twins) & set(cb.plan_kernel_keys(other))
+
+
+@pytest.mark.parametrize("arch", sorted(SUPPORTED_COMPUTE_CAPABILITIES.values()))
 def test_export_rows_plan_onto_registered_programs(arch):
     """Every grid batch of the export's rows (the contract rows and the coverage rows) plans on the
     CPU, with the census device's SM count, onto kernels this checkout registers for ``arch``, and the
@@ -661,7 +739,7 @@ def test_export_rows_plan_onto_registered_programs(arch):
         pytest.skip(f"no generated Kimi-K3 vision tower program registered for {arch}")
     for label, grids in {**cb.CONTRACT_ROW_GRIDS, **cb.COVERAGE_ROW_GRIDS}.items():
         plan = build_kimi_k3_vision_plan(
-            grids, "cpu", num_layers=1, sm_count=SM_COUNT, arch=arch
+            grids, "cpu", num_layers=CONTRACT_LAYERS, sm_count=SM_COUNT, arch=arch
         )
         keys = cb.plan_kernel_keys(plan)
         missing = [k for k in keys if not cake_jit.route_available(arch, (k,))]
@@ -1604,6 +1682,79 @@ def test_prepared_runner_graph_replay_and_no_allocation():
     assert metadata["attention_kernel_key"] == plan.attention.kernel_key
     assert metadata["attention_merge"] is bool(merge)
     assert metadata["attention_kernel_key"] in cb.REGISTERED_KERNEL_KEYS[plan.arch]
+
+
+def test_ready_counters_match_the_base_launches():
+    """batch8_448 on a GPU whose plan the ready counters gate (sm_103a): the counter-gated forward equals the plan's
+    base launches bitwise, after a first forward, after five back-to-back forwards without a host synchronization and
+    through CUDA-graph replay (also with new pixel values); the counters are zero again after every forward."""
+    arch = _require_program()
+    grids = CONTRACT_GRIDS["batch8_448"]
+    layers = 3
+    device, weights, pixels, cos, sin, pos_rows, out = _inputs(grids, layers, seed=9)
+    prepared = prepare_kimi_k3_vision_weights(weights)
+    plan = build_kimi_k3_vision_plan(grids, device, num_layers=layers)
+    if not plan.ready_counters:
+        pytest.skip(
+            f"no ready-counter plan for this batch on {arch} ({plan.sm_count} SMs)"
+        )
+    runner = prepare_kimi_k3_vision_tower(
+        pixels, grids, prepared, out, plan=plan, pos_rows=pos_rows
+    )
+    torch.cuda.synchronize()
+    metadata = runner.route_metadata
+    assert metadata["ready_counter_edges"] == ["E1", "E2", "E3"]
+    assert set(metadata["ready_counter_keys"].values()) == set(cb.READY_COUNTER_KEYS)
+    # every layer's out-proj, fc0 and fc1 but the first layer's QKV: 4 per layer, less one
+    assert metadata["ready_counter_launches"] == 4 * layers - 1
+    assert runner.launch_count == len(runner.stage_launches)
+    reference = torch.full_like(out, float("nan"))
+    base = dataclasses.replace(
+        runner,
+        out=reference,
+        launches=cb._launch_sequence(
+            plan, prepared, pixels, pos_rows, reference, ready_counters=False
+        ),
+        stage_launches=(),
+    )
+    words = plan.workspace["ready_counters"]
+
+    def cleared() -> bool:
+        return int(words.view(torch.int32).count_nonzero()) == 0
+
+    base.launch()
+    torch.cuda.synchronize()
+    expected = reference.clone()
+    assert torch.isfinite(expected.float()).all()
+    runner.launch()
+    torch.cuda.synchronize()
+    assert torch.equal(out, expected) and cleared()
+    out.fill_(float("nan"))
+    for _ in range(5):
+        runner.launch()
+    torch.cuda.synchronize()
+    assert torch.equal(out, expected) and cleared()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        runner.launch()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    for _ in range(3):
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, expected) and cleared()
+    pixels.mul_(-1.0)
+    base.launch()
+    torch.cuda.synchronize()
+    flipped = reference.clone()
+    assert not torch.equal(flipped, expected)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, flipped) and cleared()
 
 
 def test_one_shot_api():

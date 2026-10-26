@@ -48,7 +48,14 @@ to 256 rows run the `*_wpl` twin of their tile, which prefetches the weight
 boxes past the first ring fill into L2 before the grid-dependency wait, and on
 those of `cake_backend.A_BOX_ARCHES` the merger GEMMs up to 64 merged rows run
 the `xs_ab` / `s_ab` twin, which loads a 64-row A box: same launch, same stored
-rows); the attention unit layout
+rows; on `cake_backend.READY_COUNTER_ARCHES` (SM103) a batch inside
+`cake_backend.READY_COUNTER_WINDOWS` (8192 tokens) whose schedule model lets a
+consumer start early (`cake_backend.ready_counter_edges`) runs the encoder's
+GEMM -> GEMM edges (FC1 -> next QKV, out-proj -> FC0, FC0 -> FC1) on the
+ready-counter twins `*_rc*`, which replace the grid-dependency wait of the A
+loads by per 128-row block counters, so a consumer's first items start while
+its producer finishes its last ones: same launch, same stored rows); the
+attention unit layout
 and the automatic tail split are chosen per `grid_thws` batch from the
 split-aware LPT makespans of both layouts
 (`cake_backend.select_layout_and_split`: the `units mod G` cheapest units of
