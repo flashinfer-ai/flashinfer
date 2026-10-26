@@ -793,11 +793,27 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t1024_sm103a(int* __restrict_
                     unsigned int sf_k_offset = task_1[1] * (task_1[7] / 128) + (unsigned int)k_1;
                     if (elect_sync()) {
                         if (task_1[0] == 1) {
-                            tma_2d_gmem2smem_cta2(smem_b_addr + b_stage * 16384, (&B1), k_1 * 128, task_1[1] * task_1[6] + n_offset, ((full_addr + (b_stage) * 8) & 0xFEFFFFFF));
-                            tma_2d_gmem2smem_cta2(smem_sfb_addr + b_stage * 512, (&SFB1), n_offset, sf_k_offset, ((full_addr + (b_stage) * 8) & 0xFEFFFFFF));
+                            asm volatile(
+                                "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
+                                " [%0], [%1, {%2, %3}], [%4], %5;"
+                                :: "r"(smem_b_addr + b_stage * 16384), "l"((&B1)), "r"(k_1 * 128), "r"(task_1[1] * task_1[6] + n_offset),
+                                   "r"(((full_addr + (b_stage) * 8) & 0xFEFFFFFF)), "l"(0x12F0000000000000ULL) : "memory");
+                            asm volatile(
+                                "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
+                                " [%0], [%1, {%2, %3}], [%4], %5;"
+                                :: "r"(smem_sfb_addr + b_stage * 512), "l"((&SFB1)), "r"(n_offset), "r"(sf_k_offset),
+                                   "r"(((full_addr + (b_stage) * 8) & 0xFEFFFFFF)), "l"(0x12F0000000000000ULL) : "memory");
                         } else {
-                            tma_2d_gmem2smem_cta2(smem_b_addr + b_stage * 16384, (&B2), k_1 * 128, task_1[1] * task_1[6] + n_offset, ((full_addr + (b_stage) * 8) & 0xFEFFFFFF));
-                            tma_2d_gmem2smem_cta2(smem_sfb_addr + b_stage * 512, (&SFB2), n_offset, sf_k_offset, ((full_addr + (b_stage) * 8) & 0xFEFFFFFF));
+                            asm volatile(
+                                "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
+                                " [%0], [%1, {%2, %3}], [%4], %5;"
+                                :: "r"(smem_b_addr + b_stage * 16384), "l"((&B2)), "r"(k_1 * 128), "r"(task_1[1] * task_1[6] + n_offset),
+                                   "r"(((full_addr + (b_stage) * 8) & 0xFEFFFFFF)), "l"(0x12F0000000000000ULL) : "memory");
+                            asm volatile(
+                                "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
+                                " [%0], [%1, {%2, %3}], [%4], %5;"
+                                :: "r"(smem_sfb_addr + b_stage * 512), "l"((&SFB2)), "r"(n_offset), "r"(sf_k_offset),
+                                   "r"(((full_addr + (b_stage) * 8) & 0xFEFFFFFF)), "l"(0x12F0000000000000ULL) : "memory");
                         }
                         if (cta_rank == 0) {
                             mbarrier_arrive_expect_tx(full_addr + (b_stage) * 8, 17408);

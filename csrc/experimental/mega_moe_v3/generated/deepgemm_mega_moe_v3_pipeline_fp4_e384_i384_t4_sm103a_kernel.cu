@@ -796,6 +796,9 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
             asm volatile("barrier.sync 12, 512;" ::: "memory");
             unsigned int task[8];
             unsigned int a_stage = 0;
+            unsigned int group_block = 4294967295;
+            unsigned int group_token_offset = 0;
+            unsigned int group_ready = 0;
             unsigned int _phase_empty = 1;
             #pragma unroll 1
             for (int task_iteration = 0; task_iteration < 8879; task_iteration++) {
@@ -811,10 +814,26 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                 if (task[0] == 0) {
                     break;
                 }
-                unsigned int public_m = (unsigned int)expert_row_offsets[task[1]] + task[2] * 16;
-                unsigned int aligned_m = (task[5] + 15) / 16 * 16;
-                unsigned int token_offset = public_m + (unsigned int)cta_rank * (aligned_m / 2);
+                unsigned int group_hit = 0;
+                if (task[0] == 2) {
+                    if (task[4] == group_block) {
+                        group_hit = 1;
+                    }
+                }
+                unsigned int token_offset = group_token_offset;
                 unsigned long long pending = 63;
+                if (group_hit == 0) {
+                    unsigned int public_m = (unsigned int)expert_row_offsets[task[1]] + task[2] * 16;
+                    unsigned int aligned_m = (task[5] + 15) / 16 * 16;
+                    token_offset = public_m + (unsigned int)cta_rank * (aligned_m / 2);
+                } else if (group_ready != 0) {
+                    pending = (unsigned long long)0;
+                }
+                group_block = 4294967295;
+                if (task[0] == 2) {
+                    group_block = task[4];
+                }
+                group_token_offset = token_offset;
                 if (task[0] == 1) {
                     {
                     unsigned int _acquire_observed;
@@ -856,6 +875,10 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                     __syncwarp();
                     a_stage += 1;
                     if (a_stage == 11) { a_stage = 0; _phase_empty ^= 1; }
+                }
+                group_ready = 0;
+                if (pending == 0) {
+                    group_ready = 1;
                 }
             }
         }
@@ -1289,9 +1312,9 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                             unsigned int _shfl_sync_18 = __shfl_sync(0xFFFFFFFF, claimed_0_1, 0);
                             claimed = _shfl_sync_18;
                         }
-                        if (claimed < state[0] * 20) {
+                        if (claimed < state[0] * 10) {
                             if (state[1] != 4294967295u) {
-                                state[1] = 1;
+                                state[1] = 2;
                             } else {
                                 if (lane == 0) {
                                     unsigned int _atomic_fetch_add_19 = atomicAdd(PrivateCounters + 1, 1);
@@ -1303,6 +1326,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                             clusters = 20;
                             shape_n = 5120;
                             shape_k = 384;
+                            claimed = claimed * 2;
                         }
                     }
                     task_3[0] = 0;
@@ -1564,10 +1588,39 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                     }
                     __syncwarp();
                     schedule_iteration += 1;
+                    if (task_3[0] == 2) {
+                        for (int _tile = 1; _tile < 2; _tile++) {
+                            unsigned int _stage_task_empty_1 = schedule_iteration % 4;
+                            unsigned int _parity_task_empty_1 = schedule_iteration / 4 % 2 ^ 1;
+                            mbarrier_wait(task_empty_addr + (_stage_task_empty_1) * 8, _parity_task_empty_1);
+                            task_3[3] = task_3[3] + 1;
+                            if (lane < 2) {
+                                uint32_t destination_1;
+                                asm volatile(
+                                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                                    : "=r"(destination_1) : "r"(task_infos_addr + schedule_iteration % 4 * 32), "r"(lane));
+                                uint32_t barrier_1;
+                                asm volatile(
+                                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                                    : "=r"(barrier_1) : "r"(task_full_addr + (unsigned int)(schedule_iteration % 4 * 8)), "r"(lane));
+                                asm volatile(
+                                    "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
+                                    :: "r"(barrier_1), "r"((uint32_t)(32)) : "memory");
+                                asm volatile(
+                                    "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                                    :: "r"(destination_1), "r"(task_3[0]), "r"(task_3[1]), "r"(task_3[2]), "r"(task_3[3]), "r"(barrier_1) : "memory");
+                                asm volatile(
+                                    "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                                    :: "r"(destination_1 + 16), "r"(task_3[4]), "r"(task_3[5]), "r"(task_3[6]), "r"(task_3[7]), "r"(barrier_1) : "memory");
+                            }
+                            __syncwarp();
+                            schedule_iteration += 1;
+                        }
+                    }
                 }
-                unsigned int _stage_task_empty_1 = schedule_iteration % 4;
-                unsigned int _parity_task_empty_1 = schedule_iteration / 4 % 2 ^ 1;
-                mbarrier_wait(task_empty_addr + (_stage_task_empty_1) * 8, _parity_task_empty_1);
+                unsigned int _stage_task_empty_2 = schedule_iteration % 4;
+                unsigned int _parity_task_empty_2 = schedule_iteration / 4 % 2 ^ 1;
+                mbarrier_wait(task_empty_addr + (_stage_task_empty_2) * 8, _parity_task_empty_2);
                 task_3[0] = 0;
                 task_3[1] = 0;
                 task_3[2] = 0;
@@ -1577,23 +1630,23 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                 task_3[6] = 0;
                 task_3[7] = 0;
                 if (lane < 2) {
-                    uint32_t destination_1;
+                    uint32_t destination_2;
                     asm volatile(
                         "mapa.shared::cluster.u32 %0, %1, %2;"
-                        : "=r"(destination_1) : "r"(task_infos_addr + schedule_iteration % 4 * 32), "r"(lane));
-                    uint32_t barrier_1;
+                        : "=r"(destination_2) : "r"(task_infos_addr + schedule_iteration % 4 * 32), "r"(lane));
+                    uint32_t barrier_2;
                     asm volatile(
                         "mapa.shared::cluster.u32 %0, %1, %2;"
-                        : "=r"(barrier_1) : "r"(task_full_addr + (unsigned int)(schedule_iteration % 4 * 8)), "r"(lane));
+                        : "=r"(barrier_2) : "r"(task_full_addr + (unsigned int)(schedule_iteration % 4 * 8)), "r"(lane));
                     asm volatile(
                         "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
-                        :: "r"(barrier_1), "r"((uint32_t)(32)) : "memory");
+                        :: "r"(barrier_2), "r"((uint32_t)(32)) : "memory");
                     asm volatile(
                         "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                        :: "r"(destination_1), "r"(task_3[0]), "r"(task_3[1]), "r"(task_3[2]), "r"(task_3[3]), "r"(barrier_1) : "memory");
+                        :: "r"(destination_2), "r"(task_3[0]), "r"(task_3[1]), "r"(task_3[2]), "r"(task_3[3]), "r"(barrier_2) : "memory");
                     asm volatile(
                         "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                        :: "r"(destination_1 + 16), "r"(task_3[4]), "r"(task_3[5]), "r"(task_3[6]), "r"(task_3[7]), "r"(barrier_1) : "memory");
+                        :: "r"(destination_2 + 16), "r"(task_3[4]), "r"(task_3[5]), "r"(task_3[6]), "r"(task_3[7]), "r"(barrier_2) : "memory");
                 }
                 __syncwarp();
             }

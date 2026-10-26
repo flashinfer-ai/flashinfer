@@ -1337,7 +1337,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t16_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a_binding.cu"
    ],
-   "closure_sha256": "617fad8e5a23f1df8a29980b3abea0e59c3a5e012f2df46dd169569bd9f8b39f",
+   "closure_sha256": "59594480a40008d1c2fa07a605b592ee60e34386a0df83f17de43cb1eb86b7ad",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t16_sm103a",
@@ -1582,7 +1582,10 @@
      "grid_z"
     ]
    ],
-   "tma_workspace_bytes": 0
+   "tma_workspace_bytes": 0,
+   "definitions": [
+    "NUM_CTAS"
+   ]
   },
   "deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t32_sm103a": {
    "arches": [
@@ -1592,7 +1595,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t32_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a_binding.cu"
    ],
-   "closure_sha256": "e4faa671cb130f747d2fc5651feb4fe0b8bcd76145f7adc81dae9fa7b3af8e94",
+   "closure_sha256": "0c4f9b6b6609d316f8b5e49a41c747d17639327ce8101a5580534622ca3e5085",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t32_sm103a",
@@ -2363,7 +2366,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a_binding.cu"
    ],
-   "closure_sha256": "186efa97785e8dc5fc3afbfadb8c9a9ec0455cd1464f27f9eaa6a671963bff5a",
+   "closure_sha256": "b8e514d12f368b56357e15e88f64df5da21f4486851da999c6437af03969bb1c",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a",
@@ -3137,7 +3140,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a_binding.cu"
    ],
-   "closure_sha256": "451c097c950ed95d11db045ab7ed52d283b370e6f49d7c195a0272223fcaf7fc",
+   "closure_sha256": "5f800d3514478651a777c7e950a4d95521954240d5312576eedfa93075cfdcf5",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a",
@@ -3395,7 +3398,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a_binding.cu"
    ],
-   "closure_sha256": "20e1414e586ac2c17dce143ce1d5f2e7cde3488d05d99db6b7f3a72660aa58bb",
+   "closure_sha256": "a8541d229bb74132de837fabdc0702216b5656f012c5b0afbb07eebc04d83bc7",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -3638,7 +3641,10 @@
      "grid_z"
     ]
    ],
-   "tma_workspace_bytes": 0
+   "tma_workspace_bytes": 0,
+   "definitions": [
+    "NUM_CTAS"
+   ]
   },
   "deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t32_sm103a": {
    "arches": [
@@ -3648,7 +3654,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t32_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a_binding.cu"
    ],
-   "closure_sha256": "0471f6dd5f462b2400750851a1984f4fc141d5e640b17a3c89c90c4b03a3b423",
+   "closure_sha256": "14959af04d15d7a1e1e01cf2b80018bb26b33c5a68d06d935f890562142eaba2",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t32_sm103a",
@@ -4417,7 +4423,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a_binding.cu"
    ],
-   "closure_sha256": "ab34069bba81d838bb696c1c4790d7baa67722e02b2eaa024bcbd12f02265a78",
+   "closure_sha256": "a49043cd7654adcf138209174ba4f7f354527a4b2cb185475c7c2ac6fd303edb",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -5187,7 +5193,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t16_sm103a_binding.cu"
    ],
-   "closure_sha256": "8b8266936590c7827cb8aff4d3db7dba46659994b0774691bfda70f5b1cd8a9a",
+   "closure_sha256": "befdec860ba39c27895d7e7da0ad571010b75979225d4d32fd4332d11a2a53b1",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4_sm103a",
@@ -5445,7 +5451,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t16_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t16_sm103a_binding.cu"
    ],
-   "closure_sha256": "b4cc65169f81a6984337d3f52c095777ac397bec8e1ef91159d708f9958b515e",
+   "closure_sha256": "40b867bf9ac296ff09a8b520f0486445a90e2e9ad9337d8ea3c402bf954f6a9d",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t16_sm103a",
@@ -5690,7 +5696,10 @@
      "grid_z"
     ]
    ],
-   "tma_workspace_bytes": 0
+   "tma_workspace_bytes": 0,
+   "definitions": [
+    "NUM_CTAS"
+   ]
   },
   "deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t32_sm103a": {
    "arches": [
@@ -5700,7 +5709,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t32_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t16_sm103a_binding.cu"
    ],
-   "closure_sha256": "dcb7972651159476aa52221bd89df9487b9588f0350764be115127418d888765",
+   "closure_sha256": "a4e611d0ef07ffe49b0e9162794bb496e42a3556d8c97bd0edba9664a9e151f6",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t32_sm103a",
@@ -6471,7 +6480,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t1024_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1024_sm103a_binding.cu"
    ],
-   "closure_sha256": "2762cf173f31b30ab04f5d97a6b67faad5305640732f60e429f350be2e84742d",
+   "closure_sha256": "27d0d63c97e388a88df882429f8ffd27df9f948f2ec517e2fcb82b76d53fa1e6",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t1024_sm103a",
@@ -7245,7 +7254,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t4_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t16_sm103a_binding.cu"
    ],
-   "closure_sha256": "8dad007fa80e29a755a2bf09f7dc966f00ee350bbb1258dd54c8ca27bfe20bb1",
+   "closure_sha256": "498c04cb1e619867b5899717dcc01f862a353a5be100683b4a075ee4acf224ff",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t4_sm103a",
@@ -7503,7 +7512,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t16_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t16_sm103a_binding.cu"
    ],
-   "closure_sha256": "c4ac5a973a68ce6614450e859956163964d64c628972e6b9cab9c68cff5e0fb7",
+   "closure_sha256": "0573e499b4104531666174d1da4bd161af2048065e1163becaf92e18abf926f0",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -7746,7 +7755,10 @@
      "grid_z"
     ]
    ],
-   "tma_workspace_bytes": 0
+   "tma_workspace_bytes": 0,
+   "definitions": [
+    "NUM_CTAS"
+   ]
   },
   "deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t32_sm103a": {
    "arches": [
@@ -7756,7 +7768,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t32_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t16_sm103a_binding.cu"
    ],
-   "closure_sha256": "9a0a9bc79bdd83474cae6fb2c619028264a5bf1847f8da3c47e251ddd7db3c04",
+   "closure_sha256": "d9f10d8b119f8f2bc8fc290071cda830a889d079637a3c481d3e72460a0c8cff",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t32_sm103a",
@@ -8525,7 +8537,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1024_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1024_sm103a_binding.cu"
    ],
-   "closure_sha256": "66f2f8590be92cb74d3f907748dc22d4f7e87c7df3e49c0535b89ee410cc7477",
+   "closure_sha256": "a50eb07ab04087dfb6ccc337d6aceb2b32a92b73057d097ff6ffd9c63b3e31aa",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -10010,7 +10022,7 @@
      "self_cleaning": true,
      "block_m": 16,
      "readiness": "block",
-     "slot_list": true,
+     "slot_list": false,
      "local_expert_filter": true,
      "w1_expert_map": true,
      "kernel_intermediate": 640,
@@ -10047,7 +10059,7 @@
      "self_cleaning": true,
      "block_m": 16,
      "readiness": "block",
-     "slot_list": true,
+     "slot_list": false,
      "local_expert_filter": true,
      "w1_expert_map": true,
      "kernel_intermediate": 640,
@@ -10306,7 +10318,7 @@
      "self_cleaning": true,
      "block_m": 16,
      "readiness": "block",
-     "slot_list": true,
+     "slot_list": false,
      "local_expert_filter": true,
      "w1_expert_map": true,
      "kernel_intermediate": 384,
@@ -10343,7 +10355,7 @@
      "self_cleaning": true,
      "block_m": 16,
      "readiness": "block",
-     "slot_list": true,
+     "slot_list": false,
      "local_expert_filter": true,
      "w1_expert_map": true,
      "kernel_intermediate": 384,
@@ -10565,7 +10577,7 @@
      "self_cleaning": true,
      "block_m": 16,
      "readiness": "block",
-     "slot_list": true,
+     "slot_list": false,
      "local_expert_filter": true,
      "w1_expert_map": false,
      "kernel_intermediate": 2304,
@@ -10602,7 +10614,7 @@
      "self_cleaning": true,
      "block_m": 16,
      "readiness": "block",
-     "slot_list": true,
+     "slot_list": false,
      "local_expert_filter": true,
      "w1_expert_map": false,
      "kernel_intermediate": 2304,
@@ -10639,7 +10651,7 @@
      "self_cleaning": true,
      "block_m": 16,
      "readiness": "block",
-     "slot_list": true,
+     "slot_list": false,
      "local_expert_filter": true,
      "w1_expert_map": false,
      "kernel_intermediate": 2304,
@@ -10861,7 +10873,7 @@
      "self_cleaning": true,
      "block_m": 16,
      "readiness": "block",
-     "slot_list": true,
+     "slot_list": false,
      "local_expert_filter": true,
      "w1_expert_map": false,
      "kernel_intermediate": 2304,
@@ -10898,7 +10910,7 @@
      "self_cleaning": true,
      "block_m": 16,
      "readiness": "block",
-     "slot_list": true,
+     "slot_list": false,
      "local_expert_filter": true,
      "w1_expert_map": false,
      "kernel_intermediate": 2304,
@@ -10935,7 +10947,7 @@
      "self_cleaning": true,
      "block_m": 16,
      "readiness": "block",
-     "slot_list": true,
+     "slot_list": false,
      "local_expert_filter": true,
      "w1_expert_map": false,
      "kernel_intermediate": 2304,
