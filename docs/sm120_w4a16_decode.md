@@ -74,10 +74,11 @@ those cross-CTA additions.
 Callers that need a fixed-order combine can use the existing preplanned
 route: build `compile_w4a16_fused_moe` with `direct_topk_routes=False` and
 `tc_decode_fused_sum=False`, then pass that plan as `fused_launch` to
-`run_w4a16_moe`. This writes FP32 expert partials and uses the separate top-k
-sum instead of the fused BF16 atomic epilogue. The runtime honors the
-non-fused plan even when the shape qualifies for fused TC decode. Retain the
-plan and provide its correctly sized workspaces before CUDA Graph capture.
+`run_w4a16_moe`. This writes BF16 expert outputs and uses the separate top-k
+sum with FP32 accumulation instead of the fused BF16 atomic epilogue. The
+runtime honors the non-fused plan even when the shape qualifies for fused
+TC decode. Retain the plan and provide its correctly sized workspaces before
+CUDA Graph capture.
 
 This is a low-level plan choice, not a new unified-MoE determinism flag. It
 can add route-packing and reduction work. It also has different rounding
