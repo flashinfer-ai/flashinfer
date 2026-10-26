@@ -56,7 +56,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `unified_moe` - Unified MoE API comparison between the CUTLASS, cuTile, b12x and cuDNN grouped-GEMM backends. It supports BF16, NVFP4 and MXFP4 W4A4/W4A16, per-tensor FP8 and MXFP8 W8A8/W8A16, and MXFP4 W4A8 with gated SwiGLU, SwiGLU-Step, GeGLU, GeGLU-Tanh, and SiTU or non-gated GELU, ReLU, SiLU, ReLU2, and Identity; filters unsupported backends at runtime; and can autotune each backend independently.
 - MOE Communication: no routine yet; standalone scripts cover it. `benchmarks/moe_ep/core/comm/bench_moe_ep_comm.py` times dispatch + combine of the `flashinfer.moe_ep` communication backends (launched with `torchrun`), and `benchmarks/moe_ep/bench_moe_ep.py` times dispatch + MoE + combine.
 - AllReduce Communication:
-    - `allreduce_fusion` - AllReduce fusion benchmark for multi-GPU inference. Requires `mpirun` for multi-GPU execution. Supports TRTLLM and TRTLLM MNNVL backends with multiple fusion patterns (plain allreduce, allreduce + residual + RMSNorm).
+    - `allreduce_fusion` - AllReduce fusion benchmark for multi-GPU inference. Requires `mpirun` for multi-GPU execution. Backends (`--ar_backend`, one or more): `auto`, `trtllm`, `mnnvl`, `mnnvl-cutedsl` (MNNVL CuTe DSL, bf16, SM10x), and the unfused `vllm` (`vllm_all_reduce`) and `quantized_fp8` (`quantized_all_reduce`). Patterns: every `AllReduceFusionPattern` (plain, + residual + RMSNorm, static / dynamic / per-token-group FP8, NVFP4, MXFP8, MoE reduction / finalize); unsupported backend x pattern pairs are skipped.
 - Norm:
     - `rmsnorm` - Root Mean Square Layer Normalization.
     - `fused_add_rmsnorm` - Fused residual add + RMSNorm.
@@ -97,13 +97,24 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `rope_quantize_fp8` - RoPE with FP8 quantization (SM8.9+).
     - `rope_quantize_fp8_append_paged_kv_cache` - RoPE with FP8 quantization and paged KV cache append (SM8.9+).
 - Mamba (Selective State Space Models):
-    - `selective_state_update` - Selective state update for Mamba layers (generation phase). Supports both single-token prediction (STP) and multi-token prediction (MTP) via `--cache_steps`. Backends: `flashinfer` (CUDA, architecture-specific kernels for base/SM90/SM100+) and `triton` (reference).
+    - `selective_state_update` - Selective state update for Mamba layers (generation phase). STP and MTP (`--cache_steps`), varlen, int16 block-scaled state, spec-decode intermediate states / dst checkpoints, Philox stochastic rounding, `--algorithm`. Backends: `flashinfer` (CUDA, base/SM90/SM100+ modules) and `triton` (reference).
+    - `ssd_combined` - Mamba2 SSD chunked prefill (`flashinfer.mamba.SSDCombined`). Backends: `cute-dsl` (tcgen05 CuTe-DSL, cc major 10/11 incl. SM107) and `triton` (reference).
+    - `checkpointing_ssu` - ReplaySSM checkpointing MTP decode. Backends: `flashinfer` (autotuned), `flashinfer-monolith`, `flashinfer-two-kernel`, `triton`.
+    - `replayssm_materialize` - ReplaySSM prefix materialization (`flashinfer`; timed eagerly).
 - GDN (Gated Delta Net linear attention, SM90+):
     - `gated_delta_rule_decode` - Single-token (T=1) gated delta rule decode. `--state_layout` selects between `gated_delta_rule_decode_pretranspose` ([B, HV, V, K] state, default) and `gated_delta_rule_decode` ([B, HV, K, V] state). `--state_dtype bfloat16` selects the BF16 state kernels (head_size=128, pretranspose only). Backends: `flashinfer` (the public API with its default `backend="auto"`: whatever FlashInfer dispatches to on this GPU), `cute` (`backend="flashinfer"`: the generic CuTe-DSL kernels), `cake_gdn` (`backend="cake_gdn"`: the Cake GDN kernels; SM100/SM103/SM107, bf16 inputs), `triton` (reference), `rubin` (`backend="rubin"`: the Rubin-tuned T=1 bf16-state kernel; SM107 only) and `rubin_ugpu` (`rubin` with uGPU localization: a `ugpu_state_pool`, each die updates the half of every state in its own memory).
-    - `gated_delta_rule_mtp` - Multi-token (T>=2) gated delta rule for speculative-decoding verification, with a state pool + indices. `--state_dtype float32` uses `gated_delta_rule_mtp`; `--state_dtype bfloat16` uses the BF16 MTP kernel via `gated_delta_rule_decode_pretranspose`. Backends: `flashinfer`, `triton`.
-    - `chunk_gated_delta_rule` - Chunked GDN prefill over varlen sequences (uniform per-sequence length `--s_qo`). Backends: `flashinfer` (SM90 C++ / SM100 CuTe-DSL) and `fla` (flash-linear-attention Triton baseline, perf-only).
-- KDA (SM120a):
-    - `recurrent_kda_prefill` - Ordinary multi-token recurrent KDA prefill with fixed or packed inputs. Backends: `flashinfer` (automatic variant policy), `flashinfer-decomp`, `flashinfer-fused`, and optional external `cutekda` / `flash-kda` baselines.
+    - `gated_delta_rule_mtp` - Multi-token (T>=2) gated delta rule for speculative-decoding verification, with a state pool + indices. Backends: `flashinfer`, `cute-dsl`, `cute-dsl-wy` (output-only WY BF16-state kernel), `triton`. `--cache_replayssm` also persists the ReplaySSM raw window (SM10x).
+    - `gated_delta_rule_replayssm_commit` - Fold the accepted prefix of a ReplaySSM verify into every layer's checkpoint (SM10x). Backends: `flashinfer` (auto), `simt`, `tcgen05`.
+    - `chunk_gated_delta_rule` - Chunked GDN prefill over varlen sequences. Backends: `flashinfer` (library auto), `cute-dsl`, `cute-dsl-cp` (context-parallel), `cudnn`, `fla` (flash-linear-attention Triton baseline, perf-only).
+    - `chunk_gated_delta_rule2` / `chunk_gated_delta_product` - cuDNN GDN-2 and gated delta product prefill (`cudnn`).
+    - `gated_delta_rule_mtp_ucache` / `gated_delta_rule_mtp_ucache_flush` - ReplaySSM u-cache verify / verify+flush kernels (`cute-dsl`).
+    - `gdn_fused_decode_step` - fused GEMV + conv1d + GDN decode step (`flashinfer`, `specialized`; SM120 registry).
+- KDA (Kimi Delta Attention):
+    - `recurrent_kda_prefill` - Multi-token recurrent KDA prefill with fixed, packed or ragged inputs. Backends: `flashinfer` (library auto), `cute-dsl`, `cute-dsl-persistent`, `ptx` (SM103), `small-bh`, `cudnn`, the pinned SM120 variants `flashinfer-decomp` / `flashinfer-fused`, and optional external `cutekda` / `flash-kda` baselines.
+    - `recurrent_kda_decode` - T=1 and speculative (1+S) decode (`flashinfer`, `cute-dsl`).
+    - `recurrent_kda_output_only` - frozen-state verify (`disable_state_update=True`; `cute-dsl`).
+    - `fused_kda_decode` / `packed_fused_kda_decode` - fused conv + KDA + gated RMSNorm decode and its packed MTP form (`cute-dsl`).
+- Apart from the `cake_gdn` GDN decode row, the Cake backends of these families (`backend="cake"`, Cake-only KDA/SSD exports) are not benchmarked by this harness.
 
 ## Quick Start
 ### Single Test Run
@@ -358,8 +369,11 @@ The `allreduce_fusion` routine benchmarks AllReduce fusion operations for multi-
 | `--num_tokens`           | Number of tokens (rows) in the input tensor. Default: 64                                                   |
 | `--hidden_size`          | Hidden dimension size. Default: 4096                                                                       |
 | `--input_dtype`          | Data type for input tensors: `bfloat16` (default) or `float16`                                             |
-| `--ar_backend`           | AllReduce backend: `auto` (default), `trtllm`, or `mnnvl`. `auto` uses heuristic                          |
-| `--pattern`              | Fusion pattern: `allreduce` (default) or `ar_residual_rmsnorm` (AllReduce + Residual + RMSNorm)            |
+| `--ar_backend`           | One or more of `auto` (default), `trtllm`, `mnnvl`, `mnnvl-cutedsl`, `vllm`, `quantized_fp8`              |
+| `--pattern`              | Fusion pattern, e.g. `allreduce` (default), `ar_residual_rmsnorm`, `ar_residual_rmsnorm_{fp8,out_fp8,fp4,out_fp4,dynamic_fp8,out_dynamic_fp8,group_fp8,out_group_fp8,mxfp8,out_mxfp8}`, `moe_reduction`, `moe_finalize`, `moe_finalize_fp8` |
+| `--layout_code`          | Scale layout for the NVFP4 / MXFP8 patterns: `swizzled_128x4` (default), `swizzled_8x4`, `linear`          |
+| `--block_quant_group_size` / `--weight_bias` / `--fp32_acc` | Group size of the group-FP8 patterns; RMSNorm weight bias (1.0 = Gemma); FP32 accumulation (trtllm) |
+| `--top_k` / `--shared_expert` | MoE patterns' experts per token (default 8; also selects the mnnvl-cutedsl profile) and shared-expert add |
 | `--validate`             | Run correctness validation before benchmarking                                                             |
 
 **Launch Examples:**
@@ -465,14 +479,17 @@ mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
 | `--nheads`               | Number of SSM heads                                                                                        |
 | `--dim`                  | Head dimension (headdim)                                                                                   |
 | `--dstate`               | SSM state size                                                                                             |
-| `--ngroups`              | Number of groups for B and C matrices. `nheads` must be divisible by `ngroups`, and `nheads/ngroups` must be 1, 8, or 16. Default: 8 |
+| `--ngroups`              | Number of groups for B and C matrices. `nheads` must be divisible by `ngroups`. Default: 8 |
 | `--cache_steps`          | Number of steps/tokens for multi-token prediction (MTP). 0 = single-token prediction (STP). Default: 0    |
 | `--input_dtype`          | Data type for input tensors (x, B, C, z): `bfloat16` (default). Only `bfloat16` is supported.             |
 | `--state_dtype`          | Data type for the SSM state cache: `bfloat16` (default), `float16`, or `float32`                           |
 | `--weight_dtype`         | Data type for weight tensors (dt, D, dt_bias): `float32` (default) or `bfloat16`                           |
 | `--has_z`                | Include z tensor for gating (`z * sigmoid(z)` applied to output)                                           |
 | `--dt_softplus`          | Apply softplus to dt before use                                                                            |
-| `--backends`             | Backends to test: `flashinfer` (default), `triton` (reference). Refcheck compares against Triton reference |
+| `--varlen` / `--algorithm` / `--intermediate_states` / `--disable_state_update` / `--dst_checkpoint_step` / `--philox_rounds` | `selective_state_update` spec-decode and quantization modes (see `routines/mamba.py`) |
+| `--seqlen` / `--chunk_size` / `--initial_states` / `--no_d` / `--d_has_hdim` | `ssd_combined` knobs                                                               |
+| `--max_window` / `--prev_tokens` / `--d_split` / `--num_layers` / `--replay_prefix_len` / `--active_requests` | `checkpointing_ssu` / `replayssm_materialize` knobs                  |
+| `--backends`             | Per routine, see the routine list above. Refcheck compares against the Triton / torch reference              |
 
 ### GDN Flags
 Applies to `gated_delta_rule_decode`, `gated_delta_rule_mtp`, and `chunk_gated_delta_rule` (SM90+).
@@ -493,7 +510,10 @@ Applies to `gated_delta_rule_decode`, `gated_delta_rule_mtp`, and `chunk_gated_d
 | `--update_state`              | MTP only: write the final state back (`disable_state_update=False`). BF16 state always updates in-place    |
 | `--cache_intermediate_states` | MTP with `float32` state only: cache per-token intermediate states                                         |
 | `--no_qk_l2norm`              | Decode/MTP: disable in-kernel Q/K L2 normalization                                                         |
-| `--backends`                  | Decode/MTP: `flashinfer` (default, `backend="auto"`), `triton`; decode also `cute` (generic CuTe-DSL kernels), `cake_gdn` (SM100/SM103/SM107, bf16 inputs) and, with `--state_dtype bfloat16`, `rubin` and `rubin_ugpu` (SM107). Prefill: `flashinfer` (default), `fla` (requires `pip install flash-linear-attention`; perf-only, excluded from refcheck) |
+| `--pool_mode indexed` / `--strided_qkv` / `--output_only` / `--use_ssm_state_indices` / `--cache_replayssm` | Decode/MTP pool and spec-decode modes (see `routines/gdn.py`)              |
+| `--initial_state` / `--seqlen_dist` / `--use_state_indices` / `--checkpoint_every_n_tokens` / `--qk_l2norm_in_kernel` | Prefill workload modes                                                   |
+| `--num_layers`                | `gated_delta_rule_replayssm_commit`: layers folded by one call. Default: 1                                 |
+| `--backends`                  | Decode/MTP: `flashinfer` (default, `backend="auto"`), `triton`; decode also `cute` (generic CuTe-DSL kernels), `cake_gdn` (SM100/SM103/SM107, bf16 inputs) and, with `--state_dtype bfloat16`, `rubin` and `rubin_ugpu` (SM107); MTP also `cute-dsl`, `cute-dsl-wy`. Prefill: `flashinfer` (default), `cute-dsl`, `cute-dsl-cp`, `cudnn`, `fla` (requires `pip install flash-linear-attention`; perf-only, excluded from refcheck) |
 
 Notes:
 - Refcheck compares against the torch reference in `tests/gdn/reference_delta_rule.py`.
@@ -573,11 +593,20 @@ Legend:
 | **mla_rope_quantize_fp8** |  |  |  | cuda | cuda | cuda | cuda | cuda |
 | **rope_quantize_fp8** |  |  |  | cuda | cuda | cuda | cuda | cuda |
 | **rope_quantize_fp8_append_paged_kv_cache** |  |  |  | cuda | cuda | cuda | cuda | cuda |
-| **selective_state_update** | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton |
+| **selective_state_update** | triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton |
+| **ssd_combined** |  |  |  |  |  | cute-dsl, triton | cute-dsl, triton |  |
+| **checkpointing_ssu** |  | flashinfer(-monolith, -two-kernel), triton | flashinfer(-monolith, -two-kernel), triton | flashinfer(-monolith, -two-kernel), triton | flashinfer(-monolith, -two-kernel), triton | flashinfer(-monolith, -two-kernel), triton | flashinfer(-monolith, -two-kernel), triton | flashinfer(-monolith, -two-kernel), triton |
+| **replayssm_materialize** |  | flashinfer | flashinfer | flashinfer | flashinfer | flashinfer | flashinfer | flashinfer |
 | **gated_delta_rule_decode** |  |  |  |  | flashinfer, cute, triton | flashinfer, cute, cake_gdn, triton | flashinfer, cute, cake_gdn, triton | triton |
-| **gated_delta_rule_mtp** |  |  |  |  | flashinfer, triton | flashinfer, triton | flashinfer, triton | triton |
-| **chunk_gated_delta_rule** |  |  |  |  | flashinfer, fla | flashinfer, fla | flashinfer, fla |  |
-| **recurrent_kda_prefill** |  |  |  |  |  |  |  | flashinfer, flashinfer-decomp, flashinfer-fused, cutekda, flash-kda |
+| **gated_delta_rule_mtp** |  |  |  |  | flashinfer, triton | flashinfer, cute-dsl, cute-dsl-wy, triton | flashinfer, cute-dsl, cute-dsl-wy, triton | triton |
+| **gated_delta_rule_replayssm_commit** |  |  |  |  |  | flashinfer, simt, tcgen05 | flashinfer, simt, tcgen05 |  |
+| **chunk_gated_delta_rule** |  | flashinfer, cute-dsl, cute-dsl-cp | flashinfer, cute-dsl, cute-dsl-cp | flashinfer, cute-dsl, cute-dsl-cp | flashinfer, cute-dsl, cute-dsl-cp, fla | flashinfer, cute-dsl, cute-dsl-cp, cudnn, fla | flashinfer, cute-dsl, cute-dsl-cp, cudnn, fla | flashinfer, cute-dsl, cute-dsl-cp |
+| **chunk_gated_delta_rule2** / **chunk_gated_delta_product** |  |  |  |  |  | cudnn | cudnn |  |
+| **gated_delta_rule_mtp_ucache(_flush)** |  |  |  |  |  | cute-dsl | cute-dsl |  |
+| **gdn_fused_decode_step** |  |  |  |  |  |  |  | flashinfer, specialized |
+| **recurrent_kda_prefill** |  |  |  |  |  | flashinfer, cute-dsl, cute-dsl-persistent, small-bh, cudnn | flashinfer, cute-dsl, cute-dsl-persistent, ptx, small-bh, cudnn | flashinfer, flashinfer-decomp, flashinfer-fused, cutekda, flash-kda |
+| **recurrent_kda_decode** |  |  |  |  |  | flashinfer, cute-dsl | flashinfer, cute-dsl |  |
+| **recurrent_kda_output_only** / **fused_kda_decode** / **packed_fused_kda_decode** |  |  |  |  |  | cute-dsl | cute-dsl |  |
 
 Backend Legend:
 - fa2: FlashAttention2
