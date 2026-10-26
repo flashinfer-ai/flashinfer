@@ -112,6 +112,40 @@ def test_ragged_prefill_plan_noncontiguous_indptr(metadata_device, backend):
     _assert_same(*outs)
 
 
+@pytest.mark.parametrize("metadata_device", ["cuda", "cpu"])
+def test_cudnn_ragged_plan_noncontiguous_optional_offsets(metadata_device):
+    """Independent O/V offset operands honor their values, not storage gaps."""
+    pytest.importorskip("cudnn")
+    torch.manual_seed(0)
+    qo_indptr, kv_indptr = _indptr(QO_LENS), _indptr(KV_LENS)
+    q = torch.randn(
+        int(qo_indptr[-1]), NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    k = torch.randn(
+        int(kv_indptr[-1]), NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    v = torch.randn_like(k)
+    results = []
+    for make in (lambda t: t, _strided):
+        wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            _workspace(), "NHD", backend="cudnn"
+        )
+        wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            NUM_QO_HEADS,
+            NUM_KV_HEADS,
+            HEAD_DIM,
+            causal=True,
+            q_data_type=DTYPE,
+            o_indptr=make(qo_indptr.to(metadata_device)),
+            v_indptr=make(kv_indptr.to(metadata_device)),
+        )
+        results.append(wrapper.run(q, k, v, return_lse=True))
+    for ref, out in zip(*results, strict=True):
+        _assert_same(ref, out)
+
+
 @pytest.mark.parametrize("pass_seq_lens", [False, True])
 @pytest.mark.parametrize("metadata_device", ["cuda", "cpu"])
 @pytest.mark.parametrize("backend", ["fa2", "fa3"])
