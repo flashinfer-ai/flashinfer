@@ -82,6 +82,12 @@ def require_trtllm_gen_moe():
         pytest.skip("trtllm-gen fused MoE requires SM100 / SM103")
 
 
+def small_batch_kernels_dispatched() -> bool:
+    """The small-batch kernels run on SM10x only; other architectures keep the previous kernels
+    with the switch on, so there the comparisons run the same kernels twice."""
+    return get_compute_capability(torch.device("cuda"))[0] == 10
+
+
 @contextlib.contextmanager
 def small_batch_kernel(enabled: bool):
     saved = os.environ.get(SWITCH)
@@ -443,6 +449,8 @@ def test_routing_precomputed_invalid_and_duplicate_ids(fmt):
     """Out-of-range ids are not routed; an expert listed twice for a token is routed once,
     from its lowest k. (The previous kernels disagree on duplicates: the block kernels keep one
     pair, chosen by a race; the cluster kernel routes every copy.)"""
+    if not small_batch_kernels_dispatched():
+        pytest.skip("the small-batch routing kernels run on SM10x only")
     for T in [1, 6, 16, 18, 19, 24, 32, 33, 48, 64]:
         ids, weights = make_topk(T, stable_seed("bad", fmt, T))
         ids[0, 1] = -1
@@ -492,7 +500,8 @@ def _routing_kernels(fn):
 @pytest.mark.parametrize("T", [1, 6, 16, 18, 19, 32, 64, 65])
 def test_switch_selects_kernels(T):
     """Guards the premise of the comparisons: the switch really changes the kernels, and the
-    small-batch kernels serve exactly the calls in their token windows, in a single launch."""
+    small-batch kernels serve exactly the calls in their token windows, in a single launch
+    (SM10x; elsewhere the switch leaves the kernels unchanged)."""
     logits, bias = make_logits("glm", T, 1)
 
     def call():
@@ -508,7 +517,9 @@ def test_switch_selects_kernels(T):
     if not new and not old:
         pytest.skip("torch profiler recorded no kernels")
     small = [k for k in new if "SmallBatch" in k]
-    if T <= MAX_TOKENS:
+    if not small_batch_kernels_dispatched():
+        assert new == old, (new, old)
+    elif T <= MAX_TOKENS:
         assert len(new) == 1 and len(small) == 1, new
         cluster = "SmallBatchClusterKernel" in small[0]
         assert cluster == (T > SINGLE_CTA_MAX_TOKENS), new
