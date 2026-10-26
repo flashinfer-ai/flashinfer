@@ -25,11 +25,11 @@ def expected_block_m(num_tokens):
 
 def expected_source_form(num_experts, num_tokens):
     """``(readiness, slot_list)`` of a TP/EP row's generated program: per-block
-    readiness with the per-expert slot list on every row but the one-token
-    rows and the two 384-expert four-token rows, whose programs fold the
-    dispatch metadata into every CTA instead (block readiness, no slot
-    list)."""
-    if num_tokens == 1 or (num_experts == 384 and num_tokens == 4):
+    readiness with the per-expert slot list on the 128-token and larger rows;
+    the rows of up to 32 tokens fold the dispatch metadata into every CTA
+    instead (block readiness, no slot list), whichever their expert count."""
+    del num_experts  # every rank shape takes the same rule
+    if num_tokens <= 32:
         return "block", False
     return "block", True
 
