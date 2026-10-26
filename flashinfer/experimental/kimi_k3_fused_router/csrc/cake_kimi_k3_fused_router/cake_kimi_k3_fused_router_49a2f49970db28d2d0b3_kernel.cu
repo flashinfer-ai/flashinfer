@@ -159,7 +159,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(224, LAUNCH_MIN_BLOCKS) void
-kernel_cake_kimi_k3_fused_router_d8a7364f3da88f50e666(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
+kernel_cake_kimi_k3_fused_router_49a2f49970db28d2d0b3(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -176,6 +176,9 @@ kernel_cake_kimi_k3_fused_router_d8a7364f3da88f50e666(float* __restrict__ logits
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    const unsigned int clusters_x = gridDim.x / 1;
+    const unsigned int cluster_id = ((blockIdx.z * gridDim.y + blockIdx.y) * clusters_x) + blockIdx.x / 1;
+    const unsigned int num_clusters = clusters_x * gridDim.y * gridDim.z;
 
     const int cta_rank = 0;
 
@@ -902,23 +905,35 @@ kernel_cake_kimi_k3_fused_router_d8a7364f3da88f50e666(float* __restrict__ logits
                     }
                 }
             }
+            unsigned int hit_mask = 0;
             #pragma unroll
-            for (int store_slot = 0; store_slot < GATHER_LOADS; store_slot++) {
-                #pragma unroll
-                for (int store_lane = 0; store_lane < 4; store_lane++) {
-                    int store_id = gathered[store_slot * 4 + store_lane];
-                    if (store_id >= 0) {
-                        atomicAdd(&plan_counts[store_id], 1);
-                        int own_slot = store_id - own_expert_base;
-                        if (own_slot >= 0 && own_slot < NUM_WARPS) {
-                            int store_pair = gather_base + (store_slot * THREADS + tid) * 4 + store_lane;
-                            int store_token = store_pair >> 4;
-                            int store_route = store_pair & 15;
-                            atomicAdd(&own_bitmap[own_slot * BITMAP_STRIDE + (store_token >> 5)], (unsigned int)1 << (unsigned int)(store_token & 31));
-                            atomicAdd(&own_routes[own_slot * ROUTE_STRIDE + (store_token >> 3)], (unsigned int)store_route << (unsigned int)((store_token & 7) * 4));
+            for (int count_slot = 0; count_slot < GATHER_LOADS; count_slot++) {
+                int count_pair = gather_base + (count_slot * THREADS + tid) * 4;
+                if (count_pair < total_pairs) {
+                    #pragma unroll
+                    for (int count_lane = 0; count_lane < 4; count_lane++) {
+                        int count_id = gathered[count_slot * 4 + count_lane];
+                        atomicAdd(&plan_counts[count_id], 1);
+                        int count_own = count_id - own_expert_base;
+                        if (count_own >= 0 && count_own < NUM_WARPS) {
+                            hit_mask |= (unsigned int)1 << (unsigned int)(count_slot * 4 + count_lane);
                         }
                     }
                 }
+            }
+            int hit_count = (int)(unsigned int)__popc(hit_mask);
+            #pragma unroll 1
+            for (int hit = 0; hit < hit_count; hit++) {
+                int _find_first_set_6 = __ffs(hit_mask);
+                int hit_bit = _find_first_set_6 - 1;
+                int hit_pair = gather_base + ((hit_bit >> 2) * THREADS + tid) * 4 + (hit_bit & 3);
+                int hit_id = topk_ids[hit_pair];
+                int hit_slot = hit_id - own_expert_base;
+                int hit_token = hit_pair >> 4;
+                int hit_route = hit_pair & 15;
+                atomicAdd(&own_bitmap[hit_slot * BITMAP_STRIDE + (hit_token >> 5)], (unsigned int)1 << (unsigned int)(hit_token & 31));
+                atomicAdd(&own_routes[hit_slot * ROUTE_STRIDE + (hit_token >> 3)], (unsigned int)hit_route << (unsigned int)((hit_token & 7) * 4));
+                hit_mask = hit_mask & hit_mask - (unsigned int)1;
             }
         }
         __syncthreads();
@@ -1001,46 +1016,52 @@ kernel_cake_kimi_k3_fused_router_d8a7364f3da88f50e666(float* __restrict__ logits
         if (own_count > 0) {
             #pragma unroll
             for (int word_pass = 0; word_pass < WORD_PASSES; word_pass++) {
-                int pass_word = word_pass * 32 + lane;
-                unsigned int pass_bits = 0;
-                if (pass_word < bitmap_words) {
-                    pass_bits = own_bitmap[own_bitmap_base + pass_word];
+                if (bitmap_words > word_pass * 32) {
+                    int pass_word = word_pass * 32 + lane;
+                    unsigned int pass_bits = 0;
+                    unsigned int pass_routes[4];
+                    if (pass_word < bitmap_words) {
+                        pass_bits = own_bitmap[own_bitmap_base + pass_word];
+                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                            : "=r"(*reinterpret_cast<uint32_t*>(&pass_routes[0])), "=r"(*reinterpret_cast<uint32_t*>(&pass_routes[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pass_routes[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pass_routes[(0) + 3]))
+                            : "r"(own_routes_addr + (unsigned int)((own_route_base + pass_word * 4) * 4)));
+                    }
+                    int pass_count = (int)(unsigned int)__popc(pass_bits);
+                    int pass_inclusive = pass_count;
+                    int pass_peer = __shfl_up_sync(0xFFFFFFFF, pass_inclusive, 1, 32);
+                    if (lane >= 1) {
+                        pass_inclusive += pass_peer;
+                    }
+                    int pass_peer_0 = __shfl_up_sync(0xFFFFFFFF, pass_inclusive, 2, 32);
+                    if (lane >= 2) {
+                        pass_inclusive += pass_peer_0;
+                    }
+                    int pass_peer_1 = __shfl_up_sync(0xFFFFFFFF, pass_inclusive, 4, 32);
+                    if (lane >= 4) {
+                        pass_inclusive += pass_peer_1;
+                    }
+                    int pass_peer_2 = __shfl_up_sync(0xFFFFFFFF, pass_inclusive, 8, 32);
+                    if (lane >= 8) {
+                        pass_inclusive += pass_peer_2;
+                    }
+                    int pass_peer_3 = __shfl_up_sync(0xFFFFFFFF, pass_inclusive, 16, 32);
+                    if (lane >= 16) {
+                        pass_inclusive += pass_peer_3;
+                    }
+                    int lane_rank = own_base + emitted + pass_inclusive - pass_count;
+                    #pragma unroll 1
+                    for (int emit_bit = 0; emit_bit < pass_count; emit_bit++) {
+                        int _find_first_set_7 = __ffs(pass_bits);
+                        int emit_offset = _find_first_set_7 - 1;
+                        int emit_token = (pass_word << 5) + emit_offset;
+                        unsigned int route_word = (((emit_offset & 16) != 0) ? (((emit_offset & 8) != 0) ? pass_routes[3] : pass_routes[2]) : (((emit_offset & 8) != 0) ? pass_routes[1] : pass_routes[0]));
+                        unsigned int emit_route = route_word >> (unsigned int)((emit_token & 7) * 4) & (unsigned int)15;
+                        sorted_token_ids[lane_rank + emit_bit] = emit_token * TOP_K + (int)emit_route;
+                        pass_bits = pass_bits & pass_bits - (unsigned int)1;
+                    }
+                    int _shfl_sync_8 = __shfl_sync(0xFFFFFFFF, pass_inclusive, 31);
+                    emitted += _shfl_sync_8;
                 }
-                int pass_count = (int)(unsigned int)__popc(pass_bits);
-                int pass_inclusive = pass_count;
-                int pass_peer = __shfl_up_sync(0xFFFFFFFF, pass_inclusive, 1, 32);
-                if (lane >= 1) {
-                    pass_inclusive += pass_peer;
-                }
-                int pass_peer_0 = __shfl_up_sync(0xFFFFFFFF, pass_inclusive, 2, 32);
-                if (lane >= 2) {
-                    pass_inclusive += pass_peer_0;
-                }
-                int pass_peer_1 = __shfl_up_sync(0xFFFFFFFF, pass_inclusive, 4, 32);
-                if (lane >= 4) {
-                    pass_inclusive += pass_peer_1;
-                }
-                int pass_peer_2 = __shfl_up_sync(0xFFFFFFFF, pass_inclusive, 8, 32);
-                if (lane >= 8) {
-                    pass_inclusive += pass_peer_2;
-                }
-                int pass_peer_3 = __shfl_up_sync(0xFFFFFFFF, pass_inclusive, 16, 32);
-                if (lane >= 16) {
-                    pass_inclusive += pass_peer_3;
-                }
-                int lane_rank = own_base + emitted + pass_inclusive - pass_count;
-                #pragma unroll 1
-                for (int emit_bit = 0; emit_bit < pass_count; emit_bit++) {
-                    int _find_first_set_6 = __ffs(pass_bits);
-                    int emit_offset = _find_first_set_6 - 1;
-                    int emit_token = (pass_word << 5) + emit_offset;
-                    unsigned int route_word = own_routes[own_route_base + (emit_token >> 3)];
-                    unsigned int emit_route = route_word >> (unsigned int)((emit_token & 7) * 4) & (unsigned int)15;
-                    sorted_token_ids[lane_rank + emit_bit] = emit_token * TOP_K + (int)emit_route;
-                    pass_bits = pass_bits & pass_bits - (unsigned int)1;
-                }
-                int _shfl_sync_7 = __shfl_sync(0xFFFFFFFF, pass_inclusive, 31);
-                emitted += _shfl_sync_7;
             }
         }
         #pragma unroll 1
