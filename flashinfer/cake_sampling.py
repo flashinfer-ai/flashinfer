@@ -1633,7 +1633,9 @@ def _choose_stage1_resolved(
 # where a variant ran at most 0.97 of the served pick in both modes at every top-k of its class: GB300 V = 128256
 # B = 1 / 4 the (8, 16) stream 0.963-0.964, B = 64 the (2, 16) stream 0.968, V = 262144 B = 64 top-k 1000 the (2, 16)
 # stream 0.949 / 0.954; B200 V = 32768 B = 32 the (4, 16) stream 0.877-0.925, V = 128256 B = 2 top-k 1000 the (8, 16)
-# stream 0.963 / 0.954, V = 262144 B = 64 top-k 1000 the (2, 16) stream 0.927 / 0.928.  Key (vocab bin, batch bin,
+# stream 0.963 / 0.954, V = 262144 B = 64 top-k 1000 the (2, 16) stream 0.927 / 0.928 -- or at most 0.98 there and
+# again on a second node: GB300 V = 128256 B = 2 / 8 the (8, 16) stream 0.976, B200 V = 128256 B = 4 top-k 1000 the
+# (8, 16) stream 0.971 / 0.970 on the first node.  Key (vocab bin, batch bin,
 # top-k class): the vocab bin is the measured vocab V, serving (max(3 V / 4, previous V), V]; the batch bin is the
 # measured batch B, serving (B / 2, B]; the top-k class is True for a larger top-k, False for a top-k up to
 # _STAGE1_LARGE_K, or _STAGE1_PICK_L1 for a top-k up to the capability's CTA-local-select cap
@@ -1699,6 +1701,7 @@ _STAGE1_PICKS_BY_DEVICE: dict[
         (262144, 32, False): (4, 16, True),
         (262144, 64, False): (2, 16, True),
         (128256, 2, True): (8, 16, True),
+        (128256, 4, True): (8, 16, True),
         (128256, 64, True): (2, 16, True),
         (128256, 128, True): (1, 16, True),
         (151936, 128, True): (1, 16, True),
@@ -1716,7 +1719,9 @@ _STAGE1_PICKS_BY_DEVICE: dict[
         (32768, 16, False): (4, 16, True),
         (32768, 32, False): (4, 16, True),
         (128256, 1, False): (8, 16, True),
+        (128256, 2, False): (8, 16, True),
         (128256, 4, False): (8, 16, True),
+        (128256, 8, False): (8, 16, True),
         (128256, 16, False): (4, 16, True),
         (128256, 32, False): (4, 16, True),
         (128256, 64, False): (2, 16, True),
