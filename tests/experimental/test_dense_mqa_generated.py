@@ -953,7 +953,13 @@ def test_dense_route_table_is_catalog_driven():
             _runtime.route_name("fp8", 129, 4100, 64)
             == "fp8:h64:partial:qle2048:kvsplit"
         )
-        assert _runtime.route_name("fp8", 1024, 5124, 64) == "fp8:h64:full:le1024"
+        # the whole-grid band of the qle2048 plan (policy.dense_kvsplit.fullgrid[arch], fullgrid_min_kv): above
+        # fullgrid_min_kv a 64-head chunk with sm_count <= blocks <= max_q_blocks keeps the in-kernel KV-split route
+        fg = catalog["policy"]["dense_kvsplit"]["fullgrid"]
+        fg_all = all(fg.values()) if isinstance(fg, dict) else bool(fg)
+        assert _runtime.route_name("fp8", 1024, 5124, 64) == (
+            "fp8:h64:full:qle2048:kvsplit" if fg_all else "fp8:h64:full:le1024"
+        )
         assert _runtime.route_name("fp8", 37, 37, 64) == "fp8:h64:partial:short"
         assert _runtime.route_name("fp8", 16, 16, 64) == "fp8:h64:full:short"
         assert _runtime.route_name("fp8", 2, 2, 64) == "fp8:h64:full:le8"
@@ -987,9 +993,11 @@ def test_dense_route_table_is_catalog_driven():
             )
             == "fp8:h64:partial:any"
         )
-        assert (
-            _runtime.route_name("fp8", 1024, int(ts["max_kv"]) + 1, 64)
-            == "fp8:h64:full:le1024"
+        assert int(catalog["policy"]["dense_kvsplit"]["fullgrid_min_kv"]) == int(
+            ts["max_kv"]
+        )
+        assert _runtime.route_name("fp8", 1024, int(ts["max_kv"]) + 1, 64) == (
+            "fp8:h64:full:qle2048:kvsplit" if fg_all else "fp8:h64:full:le1024"
         )
         # a one-block call above the short bound is the KV-split plan's (never ``:ts``: dense_ts.min_q_blocks)
         assert not _runtime.h64_ts_shape(2, 300, 64)
@@ -1000,8 +1008,12 @@ def test_dense_route_table_is_catalog_driven():
             admitted_ts = "fp8:h64:full:ts" in set(
                 _runtime.h64_admission(arch)["admitted_routes"]
             )
+            # a withheld :ts route falls back to the shipped tier of the query count (le1024 where catalogued, else the
+            # next shipped tier -- the whole-grid KV-split band leaves le1024 without a domain)
             assert _runtime.served_route("fp8", 1024, 1024, 64, arch=arch) == (
-                "fp8:h64:full:ts" if admitted_ts else "fp8:h64:full:le1024"
+                "fp8:h64:full:ts"
+                if admitted_ts
+                else _runtime._h64_grid_stride_route("fp8", 1024, 64, "full", arch)
             )
             assert _runtime.dense_route_available(64, 1024, 1024, arch=arch)
         # W-dense contract: single-stage programs, no metadata stage, no query bound; the ``:kvsplit`` plans own
@@ -1385,13 +1397,19 @@ def test_h64_admission_matches_the_catalog_table():
         else set()
     )
     unreached = set(gate["unreached_routes"]) if gate is not None else set()
-    # r4 leaves exactly the 2..32-block grid-stride aliases without a domain; the le1024 / any tiers keep theirs above
-    # dense_ts.max_kv (r15: the ``:ts`` fallback tier of Q <= 1536 is ``le1024``) and must never be reported unreached
+    # r4 leaves exactly the 2..32-block grid-stride aliases without a domain; the whole-grid KV-split band
+    # (dense_kvsplit.fullgrid) takes the le1024 tier's K > fullgrid_min_kv domain and the :ts gate its
+    # 256 < K <= dense_ts.max_kv domain, so the le1024 tier routes are unreached where the band is on (a fallback that
+    # names them resolves to the next shipped tier, _h64_grid_stride_route); the any tiers keep their domain
+    fg = gate["fullgrid"] if gate is not None else False
+    fg_any = any(fg.values()) if isinstance(fg, dict) else bool(fg)
     assert unreached <= {
         "fp8:h64:partial:le8",
         "fp8:h64:full:le64",
         "fp8:h64:partial:le64",
+        *(("fp8:h64:full:le1024", "fp8:h64:partial:le1024") if fg_any else ()),
     }, unreached
+    assert not {"fp8:h64:full:any", "fp8:h64:partial:any", "fp8:h64:q1"} & unreached
     tiers = (
         {
             "fp8:h64:q1",
@@ -1477,6 +1495,41 @@ def test_h64_admission_matches_the_catalog_table():
                 is None
             )
             assert _runtime.h64_kvsplit_plan(37, max_kv, 64, arch=arch) is None
+            # the whole-grid KV-split band (policy.dense_kvsplit.fullgrid[arch], fullgrid_min_kv): above fullgrid_min_kv
+            # a 64-head chunk with sm_count <= blocks <= max_q_blocks keeps the in-kernel KV-split route (the qle2048
+            # plan); at or below it, and above max_q_blocks, the grid-stride / :ts route
+            fullgrid = gate["fullgrid"]
+            fg_on = fullgrid[arch] if isinstance(fullgrid, dict) else bool(fullgrid)
+            fg_kv = int(gate["fullgrid_min_kv"])
+            assert fg_kv > int(gate["min_kv"])
+            assert _runtime.h64_kvsplit_plan(2 * sms - 1, fg_kv, 64, arch=arch) is None
+            assert (
+                _runtime.h64_kvsplit_plan(2 * sms - 1, fg_kv + 1, 64, arch=arch)
+                == "qle2048"
+            ) is fg_on
+            assert (
+                _runtime.h64_kvsplit_plan(1024, fg_kv + 1, 64, arch=arch) == "qle2048"
+            ) is fg_on  # 512 blocks: the last admitted count
+            assert _runtime.h64_kvsplit_plan(1026, fg_kv + 1, 64, arch=arch) is None
+            assert (
+                _runtime.h64_kvsplit_plan(2 * (sms - 1), fg_kv + 1, 64, arch=arch)
+                == "qle2048"
+            )  # below sm_count: the r4 band, unchanged
+            if fg_on:
+                # the band is resolved per architecture (``served_route``, the arch-aware
+                # resolver; ``route_name`` takes no arch): the qle2048 plan at 512 blocks,
+                # the grid-stride ``any`` tier above max_q_blocks
+                assert (
+                    _runtime.served_route("fp8", 1024, 5124, 64, arch=arch)
+                    == "fp8:h64:full:qle2048:kvsplit"
+                )
+                assert (
+                    _runtime.served_route("fp8", 1023, 5123, 64, arch=arch)
+                    == "fp8:h64:partial:qle2048:kvsplit"
+                )
+                assert not _runtime.served_route(
+                    "fp8", 1026, 5126, 64, arch=arch
+                ).endswith(":kvsplit")
             for queries in (1, 2, 3, 37, 64, 65, 128, 2 * (sms - 1), 2 * sms - 1, 1024):
                 plan = _runtime.h64_kvsplit_plan(queries, max_kv + 1, 64, arch=arch)
                 served = _runtime.served_route(

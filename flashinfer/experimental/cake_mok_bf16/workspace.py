@@ -54,6 +54,14 @@ class MoKSchedule:
     peer_token_idx: torch.Tensor  # (schedule_capacity,) int32
     num_tokens: torch.Tensor  # (1,) int32
     tokens_per_expert: torch.Tensor  # (num_local_experts,) int32
+    # Expert layout the fused launches decode their tasks from, derived once per
+    # schedule by ``build_schedule`` from ``tokens_per_expert`` and ``peer_rank``:
+    # ``[counts | row offsets | real rows | expert of each 256-row block]``,
+    # (3 * num_local_experts + schedule_capacity // 256,) int32. ``None`` on a
+    # schedule built without it; every launcher then derives the layout itself.
+    # A copy made with ``dataclasses.replace`` that changes ``peer_rank``,
+    # ``tokens_per_expert`` or the capacity must pass ``layout=None``.
+    layout: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)

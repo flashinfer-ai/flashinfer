@@ -125,8 +125,13 @@ def _reference(case, scale=0.125, output_scale=0.75):
         )
         mask = torch.arange(len(kv), device="cuda")[None, :] > query_positions[:, None]
         scores.masked_fill_(mask[:, None, :], -float("inf"))
+        probabilities = scores.softmax(-1)
+        # Bottom-right causality can leave a query row with no visible keys.
+        probabilities = torch.where(
+            query_positions[:, None, None] >= 0, probabilities, 0.0
+        )
         outputs.append(
-            torch.einsum("qhk,kd->qhd", scores.softmax(-1), kv[:, :512]) * output_scale
+            torch.einsum("qhk,kd->qhd", probabilities, kv[:, :512]) * output_scale
         )
         lses.append(scores.logsumexp(-1) / math.log(2))
     return torch.cat(outputs), torch.cat(lses)
@@ -381,7 +386,8 @@ def test_invalid_warm_layout_preserves_selection(case, tuner, monkeypatch):
     out = torch.empty(
         (*inputs["out"].shape[:-1], 1024), device="cuda", dtype=inputs["out"].dtype
     )[..., ::2]
-    with pytest.raises(ValueError, match="out must be contiguous"):
+    # Planned CuTe tactics reject unsupported layouts before the launch.
+    with pytest.raises(ValueError, match="Unsupported cute-dsl-monolithic tactic"):
         wrapper.run(**dict(inputs, out=out, bmm1_scale=0.25))
     assert wrapper._planned_backend._selection is selection
     changed = dict(inputs, bmm1_scale=0.0625, bmm2_scale=0.5)
@@ -495,7 +501,7 @@ def test_unavailable_cute_dependency_leaves_trt_candidate(
         availability.is_cute_dsl_arch_supported.cache_clear()
 
 
-def test_insufficient_cute_workspace_leaves_trt_candidate(case):
+def test_zero_workspace_keeps_monolithic_one_split_candidate(case):
     from flashinfer.cute_dsl.attention.monolithic import mla_decode
 
     # Two K tiles force nonzero split-reduction storage for this small query
@@ -510,8 +516,14 @@ def test_insufficient_cute_workspace_leaves_trt_candidate(case):
     )
     _plan(wrapper, case)
     assert [type(candidate) for candidate in wrapper._planned_backend._candidates] == [
-        backend._BatchMLAPagedAttentionTrtllmGenBackend
+        backend._BatchMLAPagedAttentionTrtllmGenBackend,
+        _BatchMLAPagedAttentionCuteDslMonolithicBackend,
     ]
+    candidate = wrapper._planned_backend._candidates[1]
+    inputs = _inputs(case)
+    assert candidate.get_valid_tactics(
+        [inputs["query"], inputs["kv_cache"], inputs["out"], None, None], None
+    ) == [-1, 1]
 
 
 @pytest.mark.parametrize("implementation", ["monolithic", "modular"])
@@ -909,3 +921,1002 @@ def test_candidate_rejection_preserves_supported_execution(tuner, monkeypatch, c
         cache = kv[tables[i].long()].reshape(-1, 576)[:length].float()
         expected = (query[i].float() @ cache.T * scale).softmax(-1) @ cache[:, :512]
         torch.testing.assert_close(out[i].float(), expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.fixture
+def mtp_adapter(monkeypatch):
+    """Exercise adapter contracts with a deterministic prepared launch."""
+    from types import SimpleNamespace
+
+    from flashinfer.mla._batch_mla._backends.cute_dsl_rubin_mtp_backend import (
+        _BatchMLAPagedAttentionCuteDslRubinMtpBackend as Backend,
+    )
+
+    compiled, launches = [], []
+
+    def workspace_size(B, Q, H, D, _sms, max_seq_len, num_kv_splits=None):
+        splits = 4 if num_kv_splits is None else num_kv_splits
+        return splits, 0 if splits == 1 else B * Q * H * splits * (D + 1) * 4
+
+    def prepare(**options):
+        compiled.append(options)
+
+        def launch(*args):
+            launches.append(args)
+            args[5].zero_()
+            args[6].fill_(args[-1])
+
+        return launch
+
+    implementation = SimpleNamespace(
+        _check_can_implement=lambda **kwargs: None,
+        _check_tensor_indexing=lambda tensor, name: None,
+        _check_kv_tensor_indexing=lambda tensor, name: None,
+        _get_split_kv_and_workspace_size=workspace_size,
+        prepare_cute_dsl_mla_decode=prepare,
+        get_num_sm=lambda device: 16,
+        _as_cute_dsl_workspace_i8=lambda workspace: workspace.view(torch.int8),
+        Float32=float,
+        Int32=int,
+    )
+    monkeypatch.setattr(
+        Backend, "_implementation", staticmethod(lambda: implementation)
+    )
+    runner = Backend(torch.empty(16 * 1024 * 1024, dtype=torch.uint8))
+    tables = torch.arange(16, dtype=torch.int32).reshape(2, 8)
+    lengths = torch.tensor([256, 256], dtype=torch.int32)
+    options = dict(
+        cum_seq_lens_q=torch.tensor([0, 2, 4], dtype=torch.int32),
+        block_tables=tables,
+        seq_lens=lengths,
+        max_q_len=2,
+        num_heads=128,
+        head_dim_ckv=512,
+        head_dim_kpe=64,
+        page_size=64,
+        sm_scale=0.125,
+        q_data_type=torch.float8_e4m3fn,
+        output_dtype=torch.float8_e4m3fn,
+        use_cuda_graph=False,
+        use_sinks=False,
+        causal=True,
+    )
+    runner._plan(**options)
+    runner._lse_scale = math.log(2)
+    runner.configure_tuning(
+        cache_key=("test",),
+        run_options=dict(
+            return_lse=True,
+            return_lse_base_on_e=True,
+            o_scale=None,
+            ckv_scale=None,
+            kpe_scale=None,
+            skip_softmax_threshold_scale_factor=None,
+            bmm1_scale=0.125,
+            bmm2_scale=0.75,
+        ),
+    )
+    inputs = [
+        torch.empty((4, 128, 576), dtype=torch.float8_e4m3fn),
+        torch.empty((16, 64, 576), dtype=torch.float8_e4m3fn),
+        torch.empty((4, 128, 512), dtype=torch.float8_e4m3fn),
+        torch.empty((4, 128), dtype=torch.float32),
+        None,
+    ]
+    return SimpleNamespace(
+        runner=runner,
+        inputs=inputs,
+        compiled=compiled,
+        launches=launches,
+        tables=tables,
+        lengths=lengths,
+        options=options,
+    )
+
+
+def test_mtp_split_tactics_are_capacity_bound_and_preserve_live_metadata(mtp_adapter):
+    case = mtp_adapter
+    runner = case.runner
+    assert runner._compile_options["resolved_is_var_seq"] is True
+    assert runner.get_valid_tactics(case.inputs, None) == [-1, 1, 2, 4]
+    assert not runner.validate_tactic(case.inputs, 8)
+    assert not runner.validate_tactic(case.inputs, True)
+    runner.precompile_tactics(case.inputs, [-1, 1, 2, 4], None)
+    assert len(case.compiled) == 4
+    for tactic in (-1, 1, 2, 4):
+        out, lse = runner(case.inputs, tactic=tactic)
+        assert out is case.inputs[2] and lse is case.inputs[3]
+        torch.testing.assert_close(lse, torch.full_like(lse, math.log(2)))
+        args = case.launches[-1]
+        assert args[4] is case.tables and args[9] is case.lengths
+        assert args[-3:] == (0.125, 0.75, math.log(2))
+    key = runner.get_cache_key_extras(case.inputs)
+    case.lengths.copy_(torch.tensor([1, 511], dtype=torch.int32))
+    case.tables.copy_(case.tables.flip(1))
+    runner(case.inputs, tactic=4)
+    assert len(case.compiled) == 4
+    assert runner.get_cache_key_extras(case.inputs) == key
+    assert runner.validate_tactic(case.inputs, 4)
+    with pytest.raises(ValueError, match="Unsupported.*tactic"):
+        runner(case.inputs, tactic=8)
+
+
+def test_mtp_unprepared_tactic_rejects_capture_and_warm_tactic_reuses(
+    mtp_adapter, monkeypatch
+):
+    case = mtp_adapter
+    case.runner.precompile_tactics(case.inputs, [2], None)
+    case.runner.device = torch.device("cuda")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    case.runner(case.inputs, tactic=2)
+    assert len(case.compiled) == 2
+    with pytest.raises(RuntimeError, match="before CUDA graph capture"):
+        case.runner(case.inputs, tactic=4)
+    assert len(case.compiled) == 2
+
+
+def test_mtp_default_falls_back_to_one_split_for_zero_workspace(mtp_adapter):
+    case = mtp_adapter
+    case.runner._float_workspace_buffer = torch.empty(0, dtype=torch.uint8)
+    case.runner._plan(**case.options)
+    assert case.runner.get_valid_tactics(case.inputs, None) == [-1, 1]
+    assert case.runner._execution_state.split_kv == 1
+    assert case.runner._execution_state.workspace_bytes is None
+
+
+@pytest.mark.parametrize("change", ["ragged", "noncausal", "q1"])
+def test_mtp_query_contract_is_independent_of_live_kv_support(mtp_adapter, change):
+    from flashinfer.mla._batch_mla._backends._capabilities import (
+        _BackendPlanUnsupportedError,
+    )
+
+    options = dict(mtp_adapter.options)
+    if change == "ragged":
+        options["cum_seq_lens_q"] = torch.tensor([0, 1, 4], dtype=torch.int32)
+        options["max_q_len"] = 3
+    elif change == "noncausal":
+        options["causal"] = False
+    else:
+        options["cum_seq_lens_q"] = torch.tensor([0, 1, 2], dtype=torch.int32)
+        options["max_q_len"] = 1
+    with pytest.raises(_BackendPlanUnsupportedError):
+        mtp_adapter.runner._plan(**options)
+
+
+@pytest.mark.parametrize(
+    "name", ["cute-dsl-rubin-mtp", "cute-dsl-monolithic", "autotune"]
+)
+def test_rubin_mtp_planned_fp8_output_and_snapshot(case, tuner, monkeypatch, name):
+    from flashinfer.mla._batch_mla._backends.cute_dsl_rubin_mtp_backend import (
+        _BatchMLAPagedAttentionCuteDslRubinMtpBackend as Mtp,
+    )
+
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("requires SM107")
+    case.update(
+        query=(torch.randn(4, 128, 576, device="cuda") * 0.3).to(torch.float8_e4m3fn),
+        kv=(torch.randn(16, 64, 576, device="cuda") * 0.3).to(torch.float8_e4m3fn),
+        tables=torch.arange(16, device="cuda", dtype=torch.int32).reshape(2, 8),
+        lengths=[257, 511],
+        offsets=[0, 2, 4],
+    )
+    if name == "autotune":
+        monkeypatch.setattr(
+            policy._BatchMLAPagedAttentionAutotuneBackend,
+            "_candidate_types",
+            (_BatchMLAPagedAttentionCuteDslMonolithicBackend, Mtp),
+        )
+        _prefer_backend(tuner, monkeypatch, "cute-dsl-rubin-mtp")
+    wrapper = BatchMLAPagedAttentionWrapper(
+        torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device="cuda"), backend=name
+    )
+    _plan(
+        wrapper,
+        case,
+        lse=True,
+        page_size=64,
+        q_data_type=torch.float8_e4m3fn,
+        kv_data_type=torch.float8_e4m3fn,
+        output_dtype=torch.float8_e4m3fn,
+    )
+    inputs = _inputs(case, lse=True)
+    inputs["out"] = torch.empty((4, 128, 512), device="cuda", dtype=torch.float8_e4m3fn)
+    expected, expected_lse = _reference(case)
+    with flashinfer.autotune(name == "autotune"):
+        out, lse = wrapper.run(**inputs)
+    assert out is inputs["out"] and lse is inputs["lse"]
+    torch.testing.assert_close(out.float(), expected, rtol=0.12, atol=0.03)
+    torch.testing.assert_close(lse, expected_lse, rtol=0.02, atol=0.02)
+    if name == "autotune":
+        selection = wrapper._planned_backend._selection
+        assert selection[0]._backend == "cute-dsl-rubin-mtp"
+        case["tables"].copy_(case["tables"].flip(0))
+        monkeypatch.setattr(tuner, "choose_one", _forbidden)
+        out, lse = wrapper.run(**inputs)
+        assert wrapper._planned_backend._selection is selection
+        torch.testing.assert_close(out.float(), expected, rtol=0.12, atol=0.03)
+        torch.testing.assert_close(lse, expected_lse, rtol=0.02, atol=0.02)
+
+
+@pytest.mark.parametrize("scale", [0.0, -0.125, 1e-50, 1e40, 3e38])
+def test_mtp_rejects_unsafe_runtime_softmax_scale(mtp_adapter, scale):
+    case = mtp_adapter
+    options = dict(case.runner._planned_run_options, bmm1_scale=scale)
+    case.runner.configure_tuning(cache_key=("bad-scale",), run_options=options)
+    assert case.runner.get_valid_tactics(case.inputs, None) == []
+    with pytest.raises(ValueError, match="positive softmax scale"):
+        case.runner._run(
+            query=case.inputs[0],
+            kv_cache=case.inputs[1],
+            out=case.inputs[2],
+            lse=case.inputs[3],
+            return_lse=True,
+            bmm1_scale=scale,
+            bmm2_scale=0.75,
+        )
+    assert not case.launches
+
+
+@pytest.mark.parametrize("scale", [1e40, -1e40])
+def test_mtp_rejects_unsafe_runtime_output_scale(mtp_adapter, scale):
+    case = mtp_adapter
+    options = dict(case.runner._planned_run_options, bmm2_scale=scale)
+    case.runner.configure_tuning(cache_key=("bad-output-scale",), run_options=options)
+    assert case.runner.get_valid_tactics(case.inputs, None) == []
+    with pytest.raises(ValueError, match="finite FP32 output scale"):
+        case.runner._run(
+            query=case.inputs[0],
+            kv_cache=case.inputs[1],
+            out=case.inputs[2],
+            lse=case.inputs[3],
+            return_lse=True,
+            bmm1_scale=0.125,
+            bmm2_scale=scale,
+        )
+    assert not case.launches
+
+
+@pytest.mark.parametrize("scale", [1e-50, 1e40, 3e38])
+def test_mtp_rejects_unsafe_plan_softmax_scale(case, scale):
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("requires SM107")
+    case["offsets"] = [0, 2, 4]
+    wrapper = BatchMLAPagedAttentionWrapper(
+        torch.empty(128 << 20, dtype=torch.uint8, device="cuda"),
+        backend="cute-dsl-rubin-mtp",
+    )
+    with pytest.raises(ValueError, match="positive softmax scale"):
+        _plan(
+            wrapper,
+            case,
+            page_size=64,
+            sm_scale=scale,
+            q_data_type=torch.float8_e4m3fn,
+            kv_data_type=torch.float8_e4m3fn,
+            output_dtype=torch.float8_e4m3fn,
+        )
+    assert wrapper._planned_backend is None
+
+
+def test_mtp_family_only_compiler_target_is_typed_refusal(case, monkeypatch):
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("requires SM107")
+    from flashinfer.cute_dsl import availability
+    from flashinfer.mla._batch_mla._backends._capabilities import (
+        _BackendPlanUnsupportedError,
+    )
+
+    monkeypatch.setattr(availability, "cute_dsl_compile_arch", lambda *_: "sm_100f")
+    case["offsets"] = [0, 2, 4]
+    wrapper = BatchMLAPagedAttentionWrapper(
+        torch.empty(128 << 20, dtype=torch.uint8, device="cuda"),
+        backend="cute-dsl-rubin-mtp",
+    )
+    with pytest.raises(_BackendPlanUnsupportedError, match="native SM107"):
+        _plan(
+            wrapper,
+            case,
+            page_size=64,
+            q_data_type=torch.float8_e4m3fn,
+            kv_data_type=torch.float8_e4m3fn,
+            output_dtype=torch.float8_e4m3fn,
+        )
+    assert wrapper._planned_backend is None
+
+
+@pytest.mark.parametrize("q_len,page_size", [(2, 64), (4, 128)])
+def test_mtp_low_level_default_output_dtype(case, q_len, page_size):
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("requires SM107")
+    from flashinfer.cute_dsl.attention.rubin_mtp.mla_decode import cute_dsl_mla_decode
+
+    case.update(
+        query=torch.randn(2 * q_len, 128, 576, device="cuda").to(torch.float8_e4m3fn),
+        kv=torch.randn(6, page_size, 576, device="cuda").to(torch.float8_e4m3fn),
+        tables=torch.tensor([[2, 0, 1], [5, 3, 4]], dtype=torch.int32, device="cuda"),
+        lengths=[129, 97],
+        offsets=[0, q_len, 2 * q_len],
+    )
+    out, lse = cute_dsl_mla_decode(
+        query=case["query"].reshape(2, q_len, 128, 576),
+        kv_cache=case["kv"],
+        workspace_buffer=torch.empty(128 << 20, dtype=torch.uint8, device="cuda"),
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        block_tables=case["tables"],
+        seq_lens=torch.tensor(case["lengths"], dtype=torch.int32, device="cuda"),
+        max_seq_len=129,
+        softmax_scale=1 / 24,
+        return_lse=True,
+    )
+    expected, expected_lse = _reference(case, scale=1 / 24, output_scale=1.0)
+    assert out.dtype == torch.float8_e4m3fn
+    assert out.shape == (2, q_len, 128, 512)
+    torch.testing.assert_close(
+        out.flatten(0, 1).float(), expected, atol=0.03, rtol=0.12
+    )
+    torch.testing.assert_close(
+        lse.reshape(2 * q_len, 128), expected_lse * math.log(2), atol=0.02, rtol=0.002
+    )
+
+
+@pytest.mark.parametrize(
+    "softmax_scale,output_scale,message",
+    [
+        (1e-50, 1.0, "positive softmax scale"),
+        (1e40, 1.0, "positive softmax scale"),
+        (3e38, 1.0, "positive softmax scale"),
+        (1 / 24, 1e40, "finite FP32 output scale"),
+        (1 / 24, -1e40, "finite FP32 output scale"),
+    ],
+)
+def test_mtp_low_level_rejects_unsafe_scales_before_launch(
+    softmax_scale, output_scale, message
+):
+    from flashinfer.cute_dsl.attention.rubin_mtp.mla_decode import cute_dsl_mla_decode
+
+    with pytest.raises(ValueError, match=message):
+        cute_dsl_mla_decode(
+            query=None,
+            kv_cache=None,
+            workspace_buffer=None,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            block_tables=None,
+            seq_lens=None,
+            max_seq_len=128,
+            softmax_scale=softmax_scale,
+            output_scale=output_scale,
+        )
+
+
+@pytest.mark.parametrize("output_scale", [0.0, -0.5, 3e38])
+@pytest.mark.parametrize("softmax_scale", [1e-8, 1 / 24, 2e38])
+def test_mtp_scale_validation_preserves_representable_scales(
+    softmax_scale, output_scale
+):
+    from flashinfer.cute_dsl._mla_validation import _validate_mtp_scales
+
+    _validate_mtp_scales(softmax_scale, output_scale)
+
+
+def test_mtp_compiler_failure_propagates_without_support_fallback(
+    mtp_adapter, monkeypatch
+):
+    failure = ValueError("injected MTP compiler failure")
+
+    def broken_compile(**kwargs):
+        raise failure
+
+    monkeypatch.setattr(
+        mtp_adapter.runner._implementation(),
+        "prepare_cute_dsl_mla_decode",
+        broken_compile,
+    )
+    with pytest.raises(ValueError) as caught:
+        mtp_adapter.runner._plan(**mtp_adapter.options)
+    assert caught.value is failure
+
+
+def test_mtp_missing_compiler_features_are_typed_refusals(mtp_adapter, monkeypatch):
+    from flashinfer.mla._batch_mla._backends._capabilities import (
+        _BackendPlanUnsupportedError,
+    )
+
+    def unavailable(**kwargs):
+        raise ImportError("missing Rubin mixed-CGA compiler features")
+
+    monkeypatch.setattr(
+        mtp_adapter.runner._implementation(), "_check_can_implement", unavailable
+    )
+    with pytest.raises(_BackendPlanUnsupportedError, match="mixed-CGA"):
+        mtp_adapter.runner._plan(**mtp_adapter.options)
+
+
+def test_mtp_filters_unsafe_split_budgets_without_clamping(mtp_adapter, monkeypatch):
+    case = mtp_adapter
+    implementation = case.runner._implementation()
+    workspace_size = implementation._get_split_kv_and_workspace_size
+
+    def bounded_workspace(*args, num_kv_splits=None, **kwargs):
+        if num_kv_splits in (None, 4):
+            raise ValueError("split scratch exceeds signed 32-bit indexing")
+        return workspace_size(*args, num_kv_splits=num_kv_splits, **kwargs)
+
+    monkeypatch.setattr(
+        implementation, "_get_split_kv_and_workspace_size", bounded_workspace
+    )
+    case.runner._plan(**case.options)
+    assert case.runner._execution_state.split_kv == 1
+    assert case.runner.get_valid_tactics(case.inputs, None) == [-1, 1, 2]
+    assert not case.runner.validate_tactic(case.inputs, 4)
+    compiled_before = len(case.compiled)
+    with pytest.raises(ValueError, match="Unsupported.*tactic"):
+        case.runner.precompile_tactics(case.inputs, [4], None)
+    with pytest.raises(ValueError, match="Unsupported.*tactic"):
+        case.runner(case.inputs, tactic=4)
+    assert len(case.compiled) == compiled_before
+    assert not case.launches
+
+
+def test_mtp_unsafe_shape_refuses_before_compile(mtp_adapter, monkeypatch):
+    from flashinfer.mla._batch_mla._backends._capabilities import (
+        _BackendPlanUnsupportedError,
+    )
+
+    case = mtp_adapter
+
+    def unsafe_shape(*args, **kwargs):
+        raise ValueError("query span exceeds signed 32-bit indexing")
+
+    monkeypatch.setattr(
+        case.runner._implementation(), "_get_split_kv_and_workspace_size", unsafe_shape
+    )
+    compiled_before = len(case.compiled)
+    assert case.runner.get_valid_tactics(case.inputs, None) == []
+    with pytest.raises(_BackendPlanUnsupportedError, match="query span"):
+        case.runner._plan(**case.options)
+    assert len(case.compiled) == compiled_before
+
+
+@pytest.mark.parametrize(
+    "name", ["query", "kv_cache", "out", "lse", "block_tables", "seq_lens"]
+)
+def test_mtp_unsafe_tensor_span_excludes_tuning_candidate(
+    mtp_adapter, monkeypatch, name
+):
+    case = mtp_adapter
+
+    def check_indexing(tensor, tensor_name):
+        if tensor_name == name:
+            raise ValueError(f"{name} span exceeds signed 32-bit indexing")
+
+    monkeypatch.setattr(
+        case.runner._implementation(),
+        "_check_kv_tensor_indexing" if name == "kv_cache" else "_check_tensor_indexing",
+        check_indexing,
+    )
+    assert case.runner.get_valid_tactics(case.inputs, None) == []
+    assert not case.runner.validate_tactic(case.inputs, 1)
+    assert not case.launches
+
+
+def test_mtp_unsafe_plan_metadata_refuses_before_compile(mtp_adapter, monkeypatch):
+    from flashinfer.mla._batch_mla._backends._capabilities import (
+        _BackendPlanUnsupportedError,
+    )
+
+    case = mtp_adapter
+
+    def check_indexing(tensor, name):
+        if name == "block_tables":
+            raise ValueError("page table span exceeds signed 32-bit indexing")
+
+    monkeypatch.setattr(
+        case.runner._implementation(), "_check_tensor_indexing", check_indexing
+    )
+    compiled_before = len(case.compiled)
+    with pytest.raises(_BackendPlanUnsupportedError, match="page table span"):
+        case.runner._plan(**case.options)
+    assert len(case.compiled) == compiled_before
+
+
+@pytest.mark.parametrize("q_len,page_size", [(2, 64), (4, 128)])
+def test_mtp_large_kv_pool_high_pages_eager_and_graph(
+    case, monkeypatch, q_len, page_size
+):
+    """A small request can address the final pages of a shared pool above 4 GiB."""
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("requires SM107")
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    pool_bytes = 9 << 29  # 4.5 GiB of FP8, without initializing unused pages.
+    if torch.cuda.mem_get_info()[0] < pool_bytes + (512 << 20):
+        pytest.skip("requires 5 GiB of free GPU memory")
+    page_bytes = page_size * 576
+    pool_pages = pool_bytes // page_bytes
+    pages = 1024 // page_size
+    scale = 1 / 24
+    case.update(
+        query=(torch.randn(q_len, 128, 576, device="cuda") * 0.5).to(
+            torch.float8_e4m3fn
+        ),
+        kv=(torch.randn(pages, page_size, 576, device="cuda") * 0.5).to(
+            torch.float8_e4m3fn
+        ),
+        tables=torch.randperm(pages, device="cuda", dtype=torch.int32).view(1, pages),
+        lengths=[1024],
+        offsets=[0, q_len],
+    )
+    # Compute the oracle from the small pool before remapping physical pages.
+    expected, expected_lse = _reference(case, scale)
+    pool = torch.empty(
+        (pool_pages, page_size, 576), dtype=torch.float8_e4m3fn, device="cuda"
+    )
+    first_page = pool_pages - pages
+    assert first_page * page_bytes > 1 << 32
+    raw = pool.view(torch.uint8).reshape(-1)
+    for page in range(first_page, pool_pages):
+        # A truncated 31/32-bit address must read poison, not plausible low data.
+        for bits in (31, 32):
+            alias = (page * page_bytes) % (1 << bits)
+            raw[alias : alias + page_bytes].fill_(0x7F)  # E4M3 NaN
+    pool[first_page:].copy_(case["kv"])
+    case["kv"] = pool
+    case["tables"] = case["tables"] + first_page
+    wrapper = BatchMLAPagedAttentionWrapper(
+        torch.empty(128 << 20, dtype=torch.uint8, device="cuda"),
+        backend="cute-dsl-rubin-mtp",
+        use_cuda_graph=True,
+    )
+    _plan(
+        wrapper,
+        case,
+        lse=True,
+        page_size=page_size,
+        sm_scale=scale,
+        q_data_type=torch.float8_e4m3fn,
+        kv_data_type=torch.float8_e4m3fn,
+        output_dtype=torch.float8_e4m3fn,
+    )
+    inputs = _inputs(case, lse=True, scale=scale)
+    inputs["out"] = torch.empty(
+        (q_len, 128, 512), dtype=torch.float8_e4m3fn, device="cuda"
+    )
+
+    def check(result):
+        out, lse = result
+        assert out is inputs["out"] and lse is inputs["lse"]
+        assert torch.isfinite(out.float()).all() and torch.isfinite(lse).all()
+        torch.testing.assert_close(out.float(), expected, rtol=0.12, atol=0.03)
+        torch.testing.assert_close(lse, expected_lse, rtol=0.002, atol=0.02)
+
+    # Exercise the public runtime before checking private tuning eligibility.
+    check(wrapper.run(**inputs))
+    runner = wrapper._planned_backend
+    tuning_inputs = [inputs[k] for k in ("query", "kv_cache", "out", "lse")] + [None]
+    runner.configure_tuning(
+        cache_key=("high-kv-pages",),
+        run_options=dict(
+            return_lse=True,
+            return_lse_base_on_e=False,
+            o_scale=None,
+            ckv_scale=None,
+            kpe_scale=None,
+            skip_softmax_threshold_scale_factor=None,
+            bmm1_scale=scale,
+            bmm2_scale=inputs["bmm2_scale"],
+        ),
+    )
+    assert -1 in runner.get_valid_tactics(tuning_inputs, None)
+    assert runner.validate_tactic(tuning_inputs, -1)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        wrapper.run(**inputs)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = wrapper.run(**inputs)
+    inputs["out"].view(torch.uint8).fill_(0x7F)
+    inputs["lse"].fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    check(captured)
+
+
+@pytest.mark.parametrize(
+    "branch,q_len,page_size,scale,capacity",
+    [
+        (None, q_len, page_size, scale, 4096)
+        for q_len in (2, 4)
+        for page_size in (64, 128)
+        for scale in (1 / 24, 1e-8, 0.125)
+    ]
+    + [
+        (branch, q_len, page_size, 1e-8, 4096)
+        for branch in ("preferred", "fallback")
+        for q_len, page_size in ((2, 64), (4, 128))
+    ]
+    + [(None, q_len, 64, 1 / 24, 64) for q_len in (2, 4)],
+)
+def test_planned_fp8_split_tactics_and_graph_replay(
+    case, monkeypatch, branch, q_len, page_size, scale, capacity
+):
+    """Every admitted MTP tactic must handle live tails and fully masked rows.
+
+    Forced branches retain the empty-partition progress regression even if the
+    hardware scheduler otherwise always chooses the preferred cluster size.
+    """
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("requires SM107")
+    from flashinfer.cute_dsl.attention.rubin_mtp import kernel, mla_decode
+
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    if branch is not None:
+        cls = kernel.RubinMultiHeadLatentAttentionForwardFP8TwoPlusTwo
+        original = cls.__init__
+
+        def initialize(self, *args, **kwargs):
+            kwargs["force_branch"] = branch
+            original(self, *args, **kwargs)
+
+        mla_decode._get_compiled_mla_kernel.cache_clear()
+        monkeypatch.setattr(cls, "__init__", initialize)
+
+    try:
+        pages = capacity // page_size
+        case.update(
+            query=(torch.randn(2 * q_len, 128, 576, device="cuda") * 0.3).to(
+                torch.float8_e4m3fn
+            ),
+            kv=(torch.randn(2 * pages, page_size, 576, device="cuda") * 0.3).to(
+                torch.float8_e4m3fn
+            ),
+            tables=torch.randperm(2 * pages, device="cuda", dtype=torch.int32).view(
+                2, pages
+            ),
+            lengths=[min(2048, capacity)] * 2,
+            offsets=[0, q_len, 2 * q_len],
+        )
+        lengths = torch.tensor(case["lengths"], dtype=torch.int32, device="cuda")
+        metadata = MLAPlanMetadata.dense(
+            torch.tensor(case["offsets"], dtype=torch.int32, device="cuda"),
+            case["tables"],
+            lengths,
+            max_q_len=q_len,
+        )
+        wrapper = BatchMLAPagedAttentionWrapper(
+            torch.empty(128 << 20, dtype=torch.uint8, device="cuda"),
+            backend="cute-dsl-rubin-mtp",
+            use_cuda_graph=capacity > 64,
+        )
+        _plan(
+            wrapper,
+            case,
+            metadata=metadata,
+            lse=True,
+            page_size=page_size,
+            sm_scale=scale,
+            q_data_type=torch.float8_e4m3fn,
+            kv_data_type=torch.float8_e4m3fn,
+            output_dtype=torch.float8_e4m3fn,
+        )
+        inputs = _inputs(case, lse=True, scale=scale)
+        inputs["out"] = torch.empty(
+            (2 * q_len, 128, 512), dtype=torch.float8_e4m3fn, device="cuda"
+        )
+        runner = wrapper._planned_backend
+        assert runner._backend == "cute-dsl-rubin-mtp"
+        assert runner._execution_state.seq_lens.data_ptr() == lengths.data_ptr()
+        tuning_inputs = [inputs[k] for k in ("query", "kv_cache", "out", "lse")] + [
+            None
+        ]
+        runner.configure_tuning(
+            cache_key=("fp8-sweep",),
+            run_options=dict(
+                return_lse=True,
+                return_lse_base_on_e=False,
+                o_scale=None,
+                ckv_scale=None,
+                kpe_scale=None,
+                skip_softmax_threshold_scale_factor=None,
+                bmm1_scale=scale,
+                bmm2_scale=inputs["bmm2_scale"],
+            ),
+        )
+        tactics = runner.get_valid_tactics(tuning_inputs, None)
+        assert tactics == ([-1, 1] if capacity == 64 else [-1, 1, 2, 4, 8, 16, 32])
+        runner.precompile_tactics(tuning_inputs, tactics, None)
+        addresses = tuple(
+            t.data_ptr() for t in (lengths, case["tables"], *tuning_inputs[2:4])
+        )
+        # Cover the public wrapper call as well as each prepared tuning tactic.
+        result = wrapper.run(**inputs)
+        assert result[0] is inputs["out"] and result[1] is inputs["lse"]
+        expected, expected_lse = _reference(case, scale)
+        torch.testing.assert_close(result[0].float(), expected, rtol=0.12, atol=0.03)
+        torch.testing.assert_close(result[1], expected_lse, rtol=0.002, atol=0.02)
+        for tactic in tactics:
+            graph = None
+            if capacity > 64:
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    runner(tuning_inputs, tactic=tactic)
+                torch.cuda.current_stream().wait_stream(stream)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = runner(tuning_inputs, tactic=tactic)
+            for live in (
+                [min(2048, capacity)] * 2,
+                [q_len, 129],
+                [1, 3],
+                [0, 129],
+                [0, 0],
+                [63, 64],
+                [128, 128],
+                [4, 1024],
+                [513, 1024],
+                [2048, 255],
+            ):
+                if max(live) > capacity:
+                    continue
+                case["lengths"] = live
+                lengths.copy_(torch.tensor(live, dtype=torch.int32, device="cuda"))
+                # A one-page table is padded by plan(); that derived table
+                # is intentionally independent of the caller's original.
+                if capacity > 64:
+                    case["tables"].copy_(case["tables"].flip(-1))
+                expected, expected_lse = _reference(case, scale)
+                inputs["out"].fill_(float("nan"))
+                inputs["lse"].fill_(float("nan"))
+                if graph is None:
+                    captured = runner(tuning_inputs, tactic=tactic)
+                else:
+                    graph.replay()
+                torch.cuda.synchronize()
+                actual, lse = captured
+                assert actual is inputs["out"] and lse is inputs["lse"]
+                assert torch.isfinite(actual.float()).all()
+                torch.testing.assert_close(
+                    actual.float(), expected, rtol=0.12, atol=0.03
+                )
+                relative_rms = (
+                    actual.float() - expected
+                ).square().mean().sqrt() / expected.square().mean().sqrt().clamp_min(
+                    1e-6
+                )
+                assert relative_rms.item() <= 0.12
+                empty = torch.isneginf(expected_lse)
+                assert torch.equal(torch.isneginf(lse), empty)
+                assert (actual.float()[empty] == 0).all()
+                torch.testing.assert_close(
+                    lse[~empty], expected_lse[~empty], rtol=0.002, atol=0.02
+                )
+                if (~empty).any():
+                    lse_error = (
+                        (lse[~empty] - expected_lse[~empty]).square().mean().sqrt()
+                    )
+                    lse_magnitude = (
+                        expected_lse[~empty].square().mean().sqrt().clamp_min(1e-6)
+                    )
+                    assert (lse_error / lse_magnitude).item() <= 0.003
+                assert addresses == tuple(
+                    t.data_ptr() for t in (lengths, case["tables"], *tuning_inputs[2:4])
+                )
+                assert runner.validate_tactic(tuning_inputs, tactic)
+    finally:
+        if branch is not None:
+            mla_decode._get_compiled_mla_kernel.cache_clear()
+
+
+@pytest.mark.parametrize("implementation_name", ["monolithic", "rubin_mtp"])
+def test_cute_split_workspace_signed_index_boundary(implementation_name):
+    """Check real sizing arithmetic; adapter-refusal tests mock that boundary."""
+    import importlib
+
+    pytest.importorskip("cutlass")
+    implementation = importlib.import_module(
+        f"flashinfer.cute_dsl.attention.{implementation_name}.mla_decode"
+    )
+    kwargs = dict(
+        q_len=4,
+        H=128,
+        kv_lora_rank=512,
+        max_active_blocks=148,
+        max_seq_len=4096,
+        num_kv_splits=16,
+    )
+    # Includes LSE partials: B=511 is 8192 FP32 elements below 2^31.
+    assert implementation._get_split_kv_and_workspace_size(B=511, **kwargs) == (
+        16,
+        8_589_901_824,
+    )
+    with pytest.raises(ValueError, match="signed 32-bit indexing"):
+        implementation._get_split_kv_and_workspace_size(B=512, **kwargs)
+    kwargs["num_kv_splits"] = 1
+    assert implementation._get_split_kv_and_workspace_size(B=512, **kwargs) == (1, 0)
+
+
+def test_mtp_query_capacity_and_strided_index_boundaries():
+    pytest.importorskip("cutlass")
+    from flashinfer.cute_dsl.attention.rubin_mtp import mla_decode
+
+    with pytest.raises(ValueError, match="query.*signed 32-bit indexing"):
+        mla_decode._get_split_kv_and_workspace_size(
+            8192, 4, 128, 512, 148, 4096, num_kv_splits=1
+        )
+    query = torch.empty((8192, 4, 128, 576), dtype=torch.float8_e4m3fn, device="meta")
+    with pytest.raises(ValueError, match="query.*signed 32-bit indexing"):
+        mla_decode._check_tensor_indexing(query, "query")
+    safe = torch.empty_strided((2,), ((1 << 31) - 2,), device="meta")
+    unsafe = torch.empty_strided((2,), ((1 << 31) - 1,), device="meta")
+    mla_decode._check_tensor_indexing(safe, "query")
+    with pytest.raises(ValueError, match="query.*signed 32-bit indexing"):
+        mla_decode._check_tensor_indexing(unsafe, "query")
+
+
+@pytest.mark.parametrize("pool_pages", [32768, 65536])
+def test_mtp_kv_indexing_allows_large_pool_span(pool_pages):
+    pytest.importorskip("cutlass")
+    from flashinfer.cute_dsl.attention.rubin_mtp import mla_decode
+
+    pool = torch.empty((pool_pages, 128, 576), dtype=torch.float8_e4m3fn, device="meta")
+    assert pool.numel() > 1 << 31
+    mla_decode._check_kv_tensor_indexing(pool, "kv_cache")
+    mla_decode._check_kv_tensor_indexing(pool[..., :512], "kv_latent")
+    mla_decode._check_kv_tensor_indexing(pool[..., 512:], "kv_rope")
+    # Query/output/workspace indexing keeps its original span limit.
+    with pytest.raises(ValueError, match="query.*signed 32-bit indexing"):
+        mla_decode._check_tensor_indexing(pool, "query")
+
+
+@pytest.mark.parametrize(
+    "shape,strides",
+    [(((1 << 31) - 1, 1), (1, 1)), ((2, 1), ((1 << 31) - 1, 1))],
+)
+def test_mtp_kv_indexing_accepts_individual_signed_index_limit(shape, strides):
+    pytest.importorskip("cutlass")
+    from flashinfer.cute_dsl.attention.rubin_mtp import mla_decode
+
+    tensor = torch.empty_strided(
+        shape, strides, dtype=torch.float8_e4m3fn, device="meta"
+    )
+    mla_decode._check_kv_tensor_indexing(tensor, "kv_cache")
+
+
+@pytest.mark.parametrize(
+    "shape,strides",
+    [((1 << 31, 1), (1, 1)), ((2, 1), (1 << 31, 1)), ((0, 1), (1 << 31, 1))],
+)
+def test_mtp_kv_indexing_rejects_unrepresentable_dimensions_or_strides(shape, strides):
+    pytest.importorskip("cutlass")
+    from flashinfer.cute_dsl.attention.rubin_mtp import mla_decode
+
+    tensor = torch.empty_strided(
+        shape, strides, dtype=torch.float8_e4m3fn, device="meta"
+    )
+    with pytest.raises(ValueError, match="kv_cache.*signed 32-bit indexing"):
+        mla_decode._check_kv_tensor_indexing(tensor, "kv_cache")
+
+
+@pytest.mark.parametrize(
+    "graph,batch,q_len,page_size,kv_len,lse_mode",
+    [
+        (True, 64, 4, 64, 129, "none"),
+        (True, 128, 2, 128, 1024, "basee"),
+        (True, 64, 4, 128, 2048, "base2"),
+        (False, 64, 4, 64, 8192, "none"),
+        (False, 32, 4, 128, 32768, "base2"),
+        (False, 64, 2, 128, 32768, "basee"),
+    ],
+)
+def test_auto_rubin_mtp_planned_regions(
+    case, monkeypatch, graph, batch, q_len, page_size, kv_len, lse_mode
+):
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("requires SM107")
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    pages = (kv_len + 127) // 128 * (128 // page_size)
+    scale = 1 / 24
+    case.update(
+        query=(torch.randn(batch * q_len, 128, 576, device="cuda") * 0.3).to(
+            torch.float8_e4m3fn
+        ),
+        kv=(
+            torch.randn(
+                batch * pages, page_size, 576, device="cuda", dtype=torch.bfloat16
+            )
+            * 0.3
+        ).to(torch.float8_e4m3fn),
+        tables=torch.randperm(batch * pages, device="cuda", dtype=torch.int32).view(
+            batch, pages
+        ),
+        lengths=[kv_len] * batch,
+        offsets=list(range(0, (batch + 1) * q_len, q_len)),
+    )
+    lengths = torch.tensor(case["lengths"], dtype=torch.int32, device="cuda")
+    metadata = MLAPlanMetadata.dense(
+        torch.tensor(case["offsets"], dtype=torch.int32, device="cuda"),
+        case["tables"],
+        lengths,
+        max_q_len=q_len,
+    )
+    wrapper = BatchMLAPagedAttentionWrapper(
+        torch.empty(128 << 20, dtype=torch.uint8, device="cuda"),
+        backend="auto",
+        use_cuda_graph=graph,
+    )
+    _plan(
+        wrapper,
+        case,
+        metadata=metadata,
+        page_size=page_size,
+        sm_scale=scale,
+        q_data_type=torch.float8_e4m3fn,
+        kv_data_type=torch.float8_e4m3fn,
+        output_dtype=torch.float8_e4m3fn,
+        scale_mode="default",
+        lse_mode=lse_mode,
+    )
+    assert wrapper._planned_backend_name == "cute-dsl-rubin-mtp"
+    state = wrapper._planned_backend._execution_state
+    assert state.split_kv == 1
+    out = torch.empty(
+        (batch * q_len, 128, 512), dtype=torch.float8_e4m3fn, device="cuda"
+    )
+    lse = (
+        torch.empty((batch * q_len, 128), device="cuda") if lse_mode != "none" else None
+    )
+
+    def run():
+        result = wrapper.run(
+            query=case["query"],
+            kv_cache=case["kv"],
+            out=out,
+            lse=lse,
+            return_lse=lse is not None,
+            return_lse_base_on_e=lse_mode == "basee",
+        )
+        assert (result[0] if lse is not None else result) is out
+        if lse is not None:
+            assert result[1] is lse
+
+    def check():
+        expected, expected_lse = _reference(case, scale, output_scale=1.0)
+        torch.testing.assert_close(out.float(), expected, rtol=0.12, atol=0.03)
+        # Small FP8 outputs can have >12% error from output rounding alone.
+        # Budget that unavoidable floor from the independent FP32 oracle.
+        rounding_rms = (
+            (expected.to(out.dtype).float() - expected).square().mean().sqrt()
+        )
+        error_rms = (out.float() - expected).square().mean().sqrt()
+        budget = rounding_rms + 0.12 * expected.square().mean().sqrt()
+        assert error_rms.item() <= budget.item(), (error_rms.item(), budget.item())
+        if lse is not None:
+            if lse_mode == "basee":
+                expected_lse *= math.log(2)
+            torch.testing.assert_close(lse, expected_lse, rtol=0.002, atol=0.02)
+
+    run()
+    check()
+    if graph:
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run()
+        torch.cuda.current_stream().wait_stream(stream)
+        captured = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(captured):
+            run()
+        # The initial preference need not remain optimal after live lengths
+        # change, but the retained graph must continue to compute correctly.
+        case["lengths"] = [q_len if i % 2 else kv_len for i in range(batch)]
+        lengths.copy_(torch.tensor(case["lengths"], dtype=torch.int32, device="cuda"))
+        out.view(torch.uint8).fill_(0x7F)
+        if lse is not None:
+            lse.fill_(float("nan"))
+        captured.replay()
+        torch.cuda.synchronize()
+        assert wrapper._planned_backend._execution_state is state
+        check()

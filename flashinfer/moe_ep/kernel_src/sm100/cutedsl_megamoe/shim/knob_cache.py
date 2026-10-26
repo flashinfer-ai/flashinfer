@@ -19,10 +19,11 @@ File location: ``FLASHINFER_MOE_EP_KNOB_CACHE`` (a path, or ``0``/``off`` to
 disable the cache entirely), default
 ``~/.cache/flashinfer/moe_ep_knob_cache.json``.  Format::
 
-    {"version": 1,
+    {"version": 2,
      "entries": [{"device": "NVIDIA GB200", "dtype": "nvfp4",
                   "world_size": 4, "hidden": 7168, "intermediate": 2048,
                   "num_experts": 256, "topk": 8, "combine_dtype": "bf16",
+                  "apply_routing_weights_before_fc2": true,
                   "max_tokens": 2048, "knobs": {...},
                   "p50_us": 585.0, "source": "autotune",
                   "tuned_at": "2026-07-16T12:00:00"}, ...]}
@@ -47,7 +48,8 @@ import tempfile
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
-_CACHE_VERSION = 1
+from flashinfer.moe_ep._compat import deprecated_aliases
+
 _KEY_FIELDS = (
     "device",
     "dtype",
@@ -88,6 +90,8 @@ def _current_device_name() -> str:
 
 
 def _load_entries(path: str) -> List[Dict[str, Any]]:
+    from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
+
     try:
         with open(path) as f:
             data = json.load(f)
@@ -101,7 +105,7 @@ def _load_entries(path: str) -> List[Dict[str, Any]]:
             stacklevel=3,
         )
         return []
-    if not isinstance(data, dict) or data.get("version") != _CACHE_VERSION:
+    if not isinstance(data, dict) or data.get("version") != KNOB_CACHE_VERSION:
         warnings.warn(
             f"[moe_ep-knob-cache] {path!r} has unsupported version "
             f"{data.get('version') if isinstance(data, dict) else '?'}; ignoring.",
@@ -132,6 +136,10 @@ def _entry_needs_ikr(entry: Dict[str, Any]) -> bool:
     return bool(isinstance(knobs, dict) and knobs.get("in_kernel_fc2_reduce"))
 
 
+@deprecated_aliases(
+    apply_topk_in_fc1="apply_routing_weights_before_fc2",
+    defer_topk_reduce="use_custom_finalize",
+)
 def _matching_entries(
     *,
     dtype: str,
@@ -143,8 +151,8 @@ def _matching_entries(
     max_tokens: int,
     combine_dtype: str = "bf16",
     enable_in_kernel_fc2_reduce: bool = False,
-    apply_topk_in_fc1: bool = False,
-    defer_topk_reduce: bool = False,
+    apply_routing_weights_before_fc2: bool = False,
+    use_custom_finalize: bool = False,
     device: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Return the cached knob dict for this session key, or ``None`` on miss.
@@ -168,8 +176,9 @@ def _matching_entries(
         e
         for e in _load_entries(path)
         if all(e.get(f) == key[f] for f in _KEY_FIELDS)
-        and e.get("apply_topk_in_fc1") == apply_topk_in_fc1
-        and e.get("defer_topk_reduce", False) == defer_topk_reduce
+        and e.get("apply_routing_weights_before_fc2")
+        == apply_routing_weights_before_fc2
+        and e.get("use_custom_finalize", False) == use_custom_finalize
         and e.get("profile") in (None, "live_tokens")
         and isinstance(e.get("knobs"), dict)
         and isinstance(e.get("max_tokens"), int)
@@ -178,12 +187,20 @@ def _matching_entries(
     return matches
 
 
+@deprecated_aliases(
+    apply_topk_in_fc1="apply_routing_weights_before_fc2",
+    defer_topk_reduce="use_custom_finalize",
+)
 def live_token_buckets(**kwargs: Any) -> List[int]:
     from flashinfer.moe_ep.core.tuning import live_buckets
 
     return live_buckets(_matching_entries(**kwargs), kwargs["max_tokens"])
 
 
+@deprecated_aliases(
+    apply_topk_in_fc1="apply_routing_weights_before_fc2",
+    defer_topk_reduce="use_custom_finalize",
+)
 def lookup_knobs(
     *,
     dtype: str,
@@ -196,8 +213,8 @@ def lookup_knobs(
     live_tokens: Optional[int] = None,
     combine_dtype: str = "bf16",
     enable_in_kernel_fc2_reduce: bool = False,
-    apply_topk_in_fc1: bool = False,
-    defer_topk_reduce: bool = False,
+    apply_routing_weights_before_fc2: bool = False,
+    use_custom_finalize: bool = False,
     device: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     from flashinfer.moe_ep.core.tuning import select_token_entries
@@ -212,8 +229,8 @@ def lookup_knobs(
         max_tokens=max_tokens,
         combine_dtype=combine_dtype,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
-        apply_topk_in_fc1=apply_topk_in_fc1,
-        defer_topk_reduce=defer_topk_reduce,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+        use_custom_finalize=use_custom_finalize,
         device=device,
     )
     matches = select_token_entries(matches, max_tokens, live_tokens)
@@ -234,6 +251,10 @@ def lookup_knobs(
     return _knobs_from_json(best["knobs"])
 
 
+@deprecated_aliases(
+    apply_topk_in_fc1="apply_routing_weights_before_fc2",
+    defer_topk_reduce="use_custom_finalize",
+)
 def record_knobs(
     knobs: Dict[str, Any],
     *,
@@ -246,8 +267,8 @@ def record_knobs(
     max_tokens: int,
     live_tokens: Optional[int] = None,
     combine_dtype: str = "bf16",
-    apply_topk_in_fc1: bool = False,
-    defer_topk_reduce: bool = False,
+    apply_routing_weights_before_fc2: bool = False,
+    use_custom_finalize: bool = False,
     device: Optional[str] = None,
     p50_us: Optional[float] = None,
     source: str = "autotune",
@@ -284,8 +305,8 @@ def record_knobs(
         combine_dtype=combine_dtype,
         max_tokens=max_tokens,
         live_tokens=live_tokens,
-        apply_topk_in_fc1=apply_topk_in_fc1,
-        defer_topk_reduce=defer_topk_reduce,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+        use_custom_finalize=use_custom_finalize,
         knobs=_knobs_to_json(knobs),
         p50_us=p50_us,
         source=source,
@@ -300,8 +321,9 @@ def record_knobs(
                 all(e.get(f) == entry[f] for f in _KEY_FIELDS)
                 and e.get("max_tokens") == max_tokens
                 and e.get("live_tokens", e["max_tokens"]) == live_tokens
-                and e.get("apply_topk_in_fc1") == apply_topk_in_fc1
-                and e.get("defer_topk_reduce", False) == defer_topk_reduce
+                and e.get("apply_routing_weights_before_fc2")
+                == apply_routing_weights_before_fc2
+                and e.get("use_custom_finalize", False) == use_custom_finalize
                 and e.get("profile") in (None, "live_tokens")
                 and _entry_needs_ikr(e) == _entry_needs_ikr(entry)
             )
@@ -311,9 +333,13 @@ def record_knobs(
         fd, tmp = tempfile.mkstemp(
             dir=os.path.dirname(path), prefix=".moe_ep_knob_cache."
         )
+        from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
+
         try:
             with os.fdopen(fd, "w") as f:
-                json.dump({"version": _CACHE_VERSION, "entries": entries}, f, indent=1)
+                json.dump(
+                    {"version": KNOB_CACHE_VERSION, "entries": entries}, f, indent=1
+                )
             os.replace(tmp, path)
         except BaseException:
             with contextlib.suppress(OSError):
@@ -329,6 +355,10 @@ def record_knobs(
     return path
 
 
+@deprecated_aliases(
+    apply_topk_in_fc1="apply_routing_weights_before_fc2",
+    defer_topk_reduce="use_custom_finalize",
+)
 def resolve_knobs(
     *,
     dtype: str,
@@ -341,8 +371,8 @@ def resolve_knobs(
     live_tokens: Optional[int] = None,
     combine_dtype: str = "bf16",
     enable_in_kernel_fc2_reduce: bool = False,
-    apply_topk_in_fc1: bool = False,
-    defer_topk_reduce: bool = False,
+    apply_routing_weights_before_fc2: bool = False,
+    use_custom_finalize: bool = False,
 ) -> Tuple[Dict[str, Any], str]:
     """Pure-lookup knob resolution: cache hit, else built-in heuristic.
 
@@ -369,8 +399,8 @@ def resolve_knobs(
         live_tokens=live_tokens,
         combine_dtype=combine_dtype,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
-        apply_topk_in_fc1=apply_topk_in_fc1,
-        defer_topk_reduce=defer_topk_reduce,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+        use_custom_finalize=use_custom_finalize,
     )
     if cached is not None:
         return cached, "cache"

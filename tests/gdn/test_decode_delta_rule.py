@@ -62,6 +62,14 @@ try:
 except ImportError:
     GDN_DECODE_BF16_STATE_AVAILABLE = False
 
+# Rubin-tuned (SM107) T=1 BF16 state kernel
+try:
+    from flashinfer.gdn_kernels.gdn_decode_bf16_state_rubin import (
+        gated_delta_rule_t1_rubin as gdn_decode_bf16_state_t1_rubin,
+    )
+except (ImportError, RuntimeError):
+    gdn_decode_bf16_state_t1_rubin = None
+
 
 def _skip_if_not_sm90_or_later():
     """Skip test if not Hopper (SM90+) or Blackwell (SM100+) architecture."""
@@ -2020,15 +2028,22 @@ def _test_gdn_decode_bf16_state_t1_kernel(
     alpha: bool,
     beta: bool,
     seed: int | None = None,
+    kernel: str = "generic",
 ):
     """Test BF16 state kernel for T=1.
 
     Both kernel and reference use bf16 h state so the comparison is apples-to-apples.
+    ``kernel="rubin"`` runs the Rubin-tuned T=1 kernel (SM107) instead of the generic one.
     """
     _skip_if_not_sm90_or_later()
 
     if not GDN_DECODE_BF16_STATE_AVAILABLE:
         pytest.skip("BF16 state kernel not available")
+    if kernel == "rubin" and gdn_decode_bf16_state_t1_rubin is None:
+        pytest.skip("Rubin BF16 state kernel not available")
+    kernel_fn = (
+        gdn_decode_bf16_state_t1_rubin if kernel == "rubin" else gdn_decode_bf16_state
+    )
 
     random.seed(seed)
     torch.random.manual_seed(seed)
@@ -2072,7 +2087,7 @@ def _test_gdn_decode_bf16_state_t1_kernel(
     # non-pool semantics.
     our_state = input_state_kernel.clone()
     indices = torch.arange(batch_size, dtype=torch.int32, device=device)
-    our_o = gdn_decode_bf16_state(
+    our_o = kernel_fn(
         A_log=A_log,
         a=a,
         dt_bias=dt_bias,
@@ -2146,7 +2161,11 @@ def _test_gdn_decode_bf16_state_t1_kernel(
 # One B per _get_bf16_mtp_config bucket, at both HV=32 and HV=64.
 @pytest.mark.parametrize("batch_size", [1, 4, 8, 16, 32])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
+@pytest.mark.parametrize(
+    "kernel", ["generic", pytest.param("rubin", marks=pytest.mark.arch_rubin)]
+)
 def test_gdn_decode_bf16_state_t1_kernel(
+    kernel: str,
     dtype: str,
     num_q_heads: int,
     num_k_heads: int,
@@ -2170,7 +2189,43 @@ def test_gdn_decode_bf16_state_t1_kernel(
         alpha,
         beta,
         seed,
+        kernel,
     )
+
+
+def test_pretranspose_backend_rubin_rejected_off_sm107():
+    """backend="rubin" and the Rubin kernel itself are gated to compute capability 10.7."""
+    _skip_if_not_sm90_or_later()
+    if gdn_decode_bf16_state_t1_rubin is None:
+        pytest.skip("Rubin BF16 state kernel not available")
+    if get_compute_capability(torch.device("cuda")) == (10, 7):
+        pytest.skip("runs on GPUs other than SM107")
+    B, H, HV, K = 8, 16, 64, 128
+    device = torch.device("cuda")
+    q = torch.randn(B, 1, H, K, dtype=torch.bfloat16, device=device)
+    k = torch.randn(B, 1, H, K, dtype=torch.bfloat16, device=device)
+    v = torch.randn(B, 1, HV, K, dtype=torch.bfloat16, device=device)
+    a = torch.randn(B, 1, HV, dtype=torch.bfloat16, device=device)
+    b = torch.randn(B, 1, HV, dtype=torch.bfloat16, device=device)
+    A_log = torch.randn(HV, dtype=torch.float32, device=device)
+    dt_bias = torch.randn(HV, dtype=torch.float32, device=device)
+    state = torch.randn(B, HV, K, K, dtype=torch.bfloat16, device=device)
+    with pytest.raises(ValueError, match="10.7"):
+        gated_delta_rule_decode_pretranspose(
+            q, k, v, state, A_log, a, dt_bias, b, backend="rubin"
+        )
+    with pytest.raises(ValueError, match="10.7"):
+        gdn_decode_bf16_state_t1_rubin(
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=state,
+            initial_state_indices=torch.arange(B, dtype=torch.int32, device=device),
+        )
 
 
 # ============================================================================
@@ -4435,6 +4490,71 @@ def _packed_qkv_params(batch_size, seq_len, num_v_heads, device):
     A_log = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
     dt_bias = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
     return a, b, A_log, dt_bias
+
+
+def test_decode_pretranspose_accepts_scalar_aligned_views():
+    """Gate/parameter views with only element-size alignment must be accepted.
+
+    Regression test: the scalar-loaded operands (a, b, A_log, dt_bias) were
+    wrapped with from_dlpack(assumed_align=16), rejecting contiguous views
+    whose base pointer is not 16-byte aligned, e.g. the second half of a
+    packed [B, 2*HV] gate buffer when HV % 8 != 0.
+    """
+    _skip_if_not_sm90_or_later()
+    torch.manual_seed(0)
+    B, H, HV, D = 2, 2, 4, 128
+    dev = torch.device("cuda")
+    scale = 1.0 / math.sqrt(D)
+
+    q = torch.randn(B, 1, H, D, dtype=torch.bfloat16, device=dev)
+    k = torch.randn_like(q)
+    v = torch.randn(B, 1, HV, D, dtype=torch.bfloat16, device=dev)
+    pool = torch.randn(B + 1, HV, D, D, dtype=torch.float32, device=dev)
+    indices = torch.arange(1, B + 1, dtype=torch.int32, device=dev)
+    # Offset by one element: contiguous but only element-size aligned.
+    A_log = torch.randn(HV + 1, dtype=torch.float32, device=dev)[1:]
+    dt_bias = torch.randn(HV + 1, dtype=torch.float32, device=dev)[1:]
+    # Packed [B, 2*HV] gate buffer: the second half starts at HV * 2 = 8
+    # bytes into the allocation when HV % 8 != 0.
+    gates = torch.randn(B, 2 * HV, dtype=torch.bfloat16, device=dev)
+    b, a = gates.chunk(2, dim=-1)
+    assert A_log.data_ptr() % 16 == 4 and a.data_ptr() % 16 == 8
+
+    kw = dict(
+        q=q,
+        k=k,
+        v=v,
+        state=None,
+        scale=scale,
+        use_qk_l2norm=True,
+        initial_state_indices=indices,
+        backend="flashinfer",
+    )
+    out_view = torch.empty(B, 1, HV, D, dtype=torch.bfloat16, device=dev)
+    pool_view = pool.clone()
+    gated_delta_rule_decode_pretranspose(
+        A_log=A_log,
+        a=a.unsqueeze(1),
+        dt_bias=dt_bias,
+        b=b.unsqueeze(1),
+        output=out_view,
+        initial_state=pool_view,
+        **kw,
+    )
+    out_clone = torch.empty_like(out_view)
+    pool_clone = pool.clone()
+    gated_delta_rule_decode_pretranspose(
+        A_log=A_log.clone(),
+        a=a.contiguous().unsqueeze(1),
+        dt_bias=dt_bias.clone(),
+        b=b.contiguous().unsqueeze(1),
+        output=out_clone,
+        initial_state=pool_clone,
+        **kw,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out_view, out_clone, atol=0, rtol=0)
+    torch.testing.assert_close(pool_view, pool_clone, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("state_dtype", ["bfloat16", "float32"])

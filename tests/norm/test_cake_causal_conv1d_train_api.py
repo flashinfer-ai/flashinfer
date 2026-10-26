@@ -18,17 +18,20 @@ causal convolution + SiLU training kernels (SM100 / SM103 / SM107): the
 ``flashinfer.cake_causal_conv1d_train`` facade and its re-export from the
 ``flashinfer`` top-level package.  The facade's three entry points are
 pass-throughs to ``flashinfer.cake_causal_conv1d_train_backend``; this module
-checks that identity (same objects at the top level, same bits as the backend)
-and leaves the numerical contract to ``test_cake_causal_conv1d_train.py``,
-which imports only the backend package.
+checks that identity (same objects at the top level, the backend's exact
+signatures, same bits as the backend) and leaves the numerical contract to
+``test_cake_causal_conv1d_train.py``, which imports only the backend package.
 """
 
 from __future__ import annotations
+
+import inspect
 
 import pytest
 import torch
 
 import flashinfer
+import flashinfer.cake_causal_conv1d_train
 import flashinfer.cake_causal_conv1d_train_backend as backend
 from flashinfer.cake_causal_conv1d_train import (
     CakeCausalConv1dFunction,
@@ -86,6 +89,29 @@ def test_function_signature_is_exported() -> None:
         is cake_causal_conv1d_train_backward_workspace_bytes
     )
     assert flashinfer.CakeCausalConv1dFunction is CakeCausalConv1dFunction
+
+
+def test_facade_signatures_mirror_the_backend() -> None:
+    """Every keyword of the backend's entry points (``bias``, ``silu_grad_preactivation``, ``dbias``, ...) is
+    spelled identically on the ``@flashinfer_api`` facade, which public-API tooling reads."""
+
+    for name in (
+        "cake_causal_conv1d_train_forward",
+        "cake_causal_conv1d_train_backward",
+        "cake_causal_conv1d",
+    ):
+        facade = inspect.signature(getattr(flashinfer.cake_causal_conv1d_train, name))
+        backend_signature = inspect.signature(getattr(backend, name))
+        assert facade == backend_signature, (name, facade, backend_signature)
+    backward = inspect.signature(cake_causal_conv1d_train_backward).parameters
+    assert backward["bias"].default is None
+    assert backward["silu_grad_preactivation"].default == "bf16"
+    assert backward["dbias"].default is None
+    assert backward["bias"].kind is inspect.Parameter.KEYWORD_ONLY
+    autograd = inspect.signature(cake_causal_conv1d).parameters
+    assert autograd["bias"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    assert autograd["silu_grad_preactivation"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert backend.SILU_GRAD_PREACTIVATIONS == ("bf16", "fp32")
 
 
 def test_facade_entry_points_match_the_backend() -> None:

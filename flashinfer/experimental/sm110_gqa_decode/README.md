@@ -42,12 +42,18 @@ The package is a self-contained Cake package (FlashInfer issue #6553):
 | `cake_build.py` | The loader shared by every Cake package: a prebuilt `aot/<library>.so` when a builder compiled it, else FlashInfer's JIT from the manifest's sources and flags (`use_fast_math=False`; the entry's own `--use_fast_math` is in `nvcc_flags`). |
 | `csrc/cake_ffi_checks.h` | The tvm-ffi checks the bindings use; no FlashInfer header is included. |
 | `csrc/cake_sm110_gqa_decode_<digest>_{kernel,binding}.cu` | One device translation unit and one tvm-ffi binding (`run`, `build_cuda_version`) per program. |
+| `csrc/cake_sm110_gqa_decode_device_abi.cuh` | The device ABI block every kernel translation unit includes first: fixed-width typedefs, the `CakeTensorMap64` / `CUtensorMap` size and alignment asserts, the CUDA headers, `make_warp_uniform` and `CAKE_INF`. |
+| `csrc/cake_sm110_gqa_decode_device_helpers.cuh` | The device helper library the kernel translation units share; every kernel translation unit includes the whole library, and the helpers a unit does not call emit no code. |
+| `csrc/cake_sm110_gqa_decode_binding_helpers_tma.h` | The host helpers the six TMA bindings share (CUDA and driver error checks, tensor-view accessors, TMA extent and stride conversion), included once per binding inside its namespace after `KERNEL_NAME`. |
 | `backend.py` | Argument validation, routing, the workspace and the launches of both public APIs. |
 
-Every generated file is written by the Cake exporter; `cake_jit.py` is read as
-a literal by `scripts/check_cake_build_manifests.py`, which checks the manifest
-against the registry and the sources. Edit the exporter, not the generated
-files.
+Every generated file is written by the Cake exporter; the package tests check
+`build.json` against the registry in `cake_jit.py` and against the sources.
+Edit the exporter, not the generated files.
+
+The three `csrc/cake_sm110_gqa_decode_*` headers (`.cuh` and `.h`) are a hand
+fold of blocks the generated files shared, pending regeneration from the
+exporter.
 
 ## Routes
 
@@ -111,8 +117,7 @@ prepared object and tensors alive until all work and captured Graphs finish.
 Order tensor updates before launch, and allocate separate prepared instances
 for concurrently executing streams or Graphs because workspace is mutable.
 The prepared state records `route` (the registry record), `num_splits` (the
-run-time split count), `grid`, `workspace`, `launch_names` and
-`workspace_bytes`.
+run-time split count), `grid`, `workspace` and `workspace_bytes`.
 
 This API is experimental because its tensor layout and fixed head geometry are
 serving-workload specific. Graduation requires broader workload validation,
@@ -122,12 +127,15 @@ decode APIs.
 ## Validation
 
 ```bash
-python scripts/check_cake_build_manifests.py --in-tree sm110_gqa_decode
 python -m pytest tests/experimental/test_cake_sm110_gqa_decode.py -q
 python -m pytest tests/experimental/test_sm110_gqa_decode.py tests/experimental/test_sm110_gqa_decode_prepared.py -q
 python examples/experimental/sm110_gqa_decode_prepared.py --graph
 python benchmarks/bench_sm110_gqa_decode.py
 ```
+
+The package is not registered with `scripts/check_cake_build_manifests.py`
+yet; `cake_build` applies the same digest rule at JIT load: the SHA-256 of
+each source listed in `build.json` must equal the manifest's value.
 
 `tests/experimental/test_cake_sm110_gqa_decode.py` is the backend suite: it
 imports the package alone (its `PACKAGE` constant names the import path),

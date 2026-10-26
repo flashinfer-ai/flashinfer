@@ -777,16 +777,18 @@ def test_decode_context_parallel_ranks_merge_on_host(
 
 def test_split_merge_up_to_and_past_32_splits():
     device = _device_or_skip()
-    # A 1-token H96 request (a half tile) at KV64K: the planner's own split count, then 20 double ranges = 40
-    # partial slots per row (the merge's second load batch), and a 3072-row problem on the one-warp merge.
+    # A 1-token H96 request (a half tile, 96 rows: the eight-warp merge) at KV64K: the planner's own split count,
+    # then 20 double ranges = 40 partial slots per row (the 64-slot round's upper half), a 3072-row problem at two
+    # partials (the one-warp merge above 2048 rows) and a 1536-row one at three (two warps: that grid is one wave
+    # up to 1664 rows).
     case = _make_case([65536], 1, 96, seed=625030, device=device, return_lse=True)
     out, lse, runner = _run(case, dense=True)
-    assert runner.plan.max_splits > 1 and runner.plan.merge_record == "merge_w4"
+    assert runner.plan.max_splits > 1 and runner.plan.merge_record == "merge_w8"
     ref, ref_lse = _reference(case)
     _check_out(out, ref)
     _check_lse(lse, ref_lse)
     out, lse, runner = _run(case, dense=True, split=(1, 20))
-    assert runner.plan.max_splits == 40 and runner.plan.merge_record == "merge_w4"
+    assert runner.plan.max_splits == 40 and runner.plan.merge_record == "merge_w8"
     _check_out(out, ref)
     _check_lse(lse, ref_lse)
     wide = _make_case(
@@ -1075,11 +1077,12 @@ def test_every_record_resolves_on_the_running_architecture():
     for name, record in cake_jit.MODULES.items():
         assert arch in record["arches"]
         assert cake_jit.library_name(name, arch) in libraries
-        # The exporter filled the derived leaves: the argument plan names every kernel parameter in order and
-        # the three grid arguments; the launch record is a real one.
+        # The exporter filled the derived leaves: the argument plan names every kernel parameter in order, the
+        # per-call PDL switch of a decode or merge record right before the grid (none for the quantizer) and the
+        # three grid arguments; the launch record is a real one.
         assert record["kernel_symbol"]
         plan = record["arg_plan"]
-        assert [key for kind, key in plan if kind != "grid"] == list(
+        assert [key for kind, key in plan if kind not in ("grid", "launch")] == list(
             parameters[record["stage"]]
         )
         assert [key for kind, key in plan if kind == "grid"] == [
@@ -1088,9 +1091,15 @@ def test_every_record_resolves_on_the_running_architecture():
             "grid_z",
         ]
         launch = record["launch"]
+        launches = [i for i, (kind, _) in enumerate(plan) if kind == "launch"]
+        if launch["use_pdl"] == "runtime":
+            assert launches == [len(plan) - 4]
+            assert plan[len(plan) - 4][1] == cake_jit.LAUNCH_ARGUMENT
+        else:
+            assert launches == [] and launch["use_pdl"] is False
         assert len(launch["block"]) == 3 and launch["block"][0] > 0
         assert len(launch["cluster"]) == 3 and all(c >= 1 for c in launch["cluster"])
-        assert launch["dynamic_smem_bytes"] >= 0 and isinstance(launch["use_pdl"], bool)
+        assert launch["dynamic_smem_bytes"] >= 0
     # The decode launches clusters (a required cluster of two, a preferred one of four); the others are plain CTAs.
     assert cake_jit.MODULES["decode"]["launch"]["cluster"][0] > 1
     assert cake_jit.MODULES["decode_full"]["launch"]["cluster"][0] > 1
@@ -1112,7 +1121,7 @@ def test_registry_records_follow_the_plan_vocabulary():
         "merge": cake_jit.MERGE_PARAMETERS,
         "quantize": cake_jit.QUANTIZE_PARAMETERS,
     }
-    select_kinds = {"always", "all_full", "rows_above", "rows_between", "rows_at_most"}
+    select_kinds = {"always", "all_full", "plan_within", "rows_splits_within"}
     grid_kinds = {"ctas_per_item", "rows_per_cta"}
     assert cake_jit.ARCHES == ("sm_107a",) and cake_jit.ARCH_BY_CAPABILITY == {
         (10, 7): "sm_107a"
@@ -1130,12 +1139,25 @@ def test_registry_records_follow_the_plan_vocabulary():
         params = parameters[record["stage"]]
         assert set(record["logical"]) == set(params), name
         assert all(k == v for k, v in record["logical"].items()), name
+        # The decode and the merge take the per-call PDL switch; the quantizer launches plain.
+        assert record["launch"]["use_pdl"] == (
+            "runtime" if record["stage"] in ("decode", "merge") else False
+        ), name
         for key in params:
             assert key in cake_jit.LOGICAL_TENSORS or key in cake_jit.LOGICAL_SCALARS, (
                 key
             )
-    assert cake_jit.records_of_stage("decode") == ("decode", "decode_full")
-    assert cake_jit.records_of_stage("merge") == ("merge_w1", "merge_w2", "merge_w4")
+    assert cake_jit.records_of_stage("decode") == (
+        "decode",
+        "decode_full",
+        "decode_full_pairpipe",
+    )
+    assert cake_jit.records_of_stage("merge") == (
+        "merge_w1",
+        "merge_w2",
+        "merge_w4",
+        "merge_w8",
+    )
     assert cake_jit.records_of_stage("quantize") == ("quantize",)
     assert len({r["library"] for r in cake_jit.MODULES.values()}) == len(
         cake_jit.MODULES
@@ -1149,19 +1171,47 @@ def test_select_rules_and_grids():
     )
     assert cake_jit.select_record("decode", rows=384, n_full=1, items=3) == "decode"
     assert cake_jit.select_record("decode", rows=96, n_full=0, items=4) == "decode"
-    rows = (96, 768, 1024, 1025, 2048, 2049, 24576)
-    want = (
-        "merge_w4",
-        "merge_w4",
-        "merge_w4",
-        "merge_w2",
-        "merge_w2",
-        "merge_w1",
-        "merge_w1",
+    # The pair-body converter pipeline program takes the one plan box of its rule (64 requests of
+    # 8 query tokens over 96 heads, 64K keys: 618 full-tile items, 4 splits); its neighbours keep
+    # the all_full / half-tile selection.
+    assert (
+        cake_jit.select_record("decode", rows=49152, n_full=618, items=618, splits=4)
+        == "decode_full_pairpipe"
     )
-    for r, w in zip(rows, want, strict=True):
-        assert cake_jit.select_record("merge", rows=r, n_full=0, items=1) == w
-        assert cake_jit.merge_warps_per_row(r) == int(w[-1])
+    assert (
+        cake_jit.select_record("decode", rows=49152, n_full=618, items=618, splits=2)
+        == "decode_full"
+    )
+    assert (
+        cake_jit.select_record("decode", rows=49152, n_full=617, items=618, splits=4)
+        == "decode"
+    )
+    cases = (
+        (96, 24, "merge_w8"),
+        (192, 52, "merge_w8"),
+        (384, 24, "merge_w8"),
+        (385, 24, "merge_w4"),
+        (448, 25, "merge_w4"),
+        (768, 12, "merge_w2"),
+        (768, 16, "merge_w2"),
+        (768, 20, "merge_w4"),
+        (768, 33, "merge_w8"),
+        (1536, 8, "merge_w2"),
+        (1664, 8, "merge_w2"),
+        (1665, 8, "merge_w1"),
+        (1792, 6, "merge_w1"),
+        (1792, 12, "merge_w2"),
+        (2048, 33, "merge_w8"),
+        (2049, 33, "merge_w1"),
+        (3072, 10, "merge_w1"),
+        (24576, 4, "merge_w1"),
+    )
+    for r, splits, w in cases:
+        assert (
+            cake_jit.select_record("merge", rows=r, n_full=0, items=1, splits=splits)
+            == w
+        )
+        assert cake_jit.merge_warps_per_row(r, splits) == int(w[-1])
         rows_per_cta = 8 // int(w[-1])
         assert cake_jit.launch_grid(w, items=1, rows=r) == (-(-r // rows_per_cta), 1, 1)
     assert cake_jit.select_record("quantize", rows=1, n_full=0, items=0) == "quantize"
@@ -1172,7 +1222,7 @@ def test_select_rules_and_grids():
     with pytest.raises(ValueError):
         cake_jit.launch_grid("decode", items=0, rows=96)
     with pytest.raises(ValueError):
-        cake_jit.select_record("merge", rows=0, n_full=0, items=1)
+        cake_jit.select_record("merge", rows=0, n_full=0, items=1, splits=2)
     with pytest.raises(ValueError):
         cake_jit.records_of_stage("reduce")
 
@@ -1242,7 +1292,10 @@ def _check_plan(p, kv_lens, q_lens, heads):
     if p.max_splits == 1:
         assert p.merge_record is None and p.grid_merge is None
     else:
-        assert p.merge_record == f"merge_w{cake_jit.merge_warps_per_row(rows_total)}"
+        assert (
+            p.merge_record
+            == f"merge_w{cake_jit.merge_warps_per_row(rows_total, p.max_splits)}"
+        )
         assert p.grid_merge == cake_jit.launch_grid(
             p.merge_record, items=p.items, rows=rows_total
         )
@@ -1364,7 +1417,7 @@ def test_plan_invariants(sm_count):
         pairs=pairs,
         split=(1, 20),
     )
-    assert forced.max_splits == 40 and forced.merge_record == "merge_w4"
+    assert forced.max_splits == 40 and forced.merge_record == "merge_w8"
     _check_plan(forced, [65536], [1], 96)
     with pytest.raises(ValueError, match="at most 64"):
         cake_backend.plan(
@@ -1375,6 +1428,84 @@ def test_plan_invariants(sm_count):
             pairs=pairs,
             split=(1, 40),
         )
+
+
+def test_pdl_follows_the_plan():
+    """The decode and the merge launch with programmatic dependent launch when the plan has a split merge and its
+    decode is one wave of clusters (``items <= units``); the switch is a pure function of the plan."""
+    import dataclasses
+
+    units, pairs = cake_backend.units_pairs_for_sm_count(208)
+    p = cake_backend.plan(
+        seq_lens_host=[65536], num_heads=96, q_len=1, units=units, pairs=pairs
+    )
+    assert cake_backend.pdl_for(p) is (p.max_splits > 1 and p.items <= p.units)
+    one_wave = dataclasses.replace(p, max_splits=2, items=units)
+    assert cake_backend.pdl_for(one_wave) is True
+    # A second wave of clusters: the early-launched merge would take its SMs.
+    assert cake_backend.pdl_for(dataclasses.replace(one_wave, items=units + 1)) is False
+    # No merge: nothing behind the decode to overlap.
+    assert cake_backend.pdl_for(dataclasses.replace(one_wave, max_splits=1)) is False
+    # The owner's largest row (Q8, B64) has more items than clusters on every board: plain launches.
+    wide = cake_backend.plan(
+        seq_lens_host=[65536] * 64, num_heads=96, q_len=8, units=units, pairs=pairs
+    )
+    assert wide.items > wide.units and cake_backend.pdl_for(wide) is False
+
+
+def test_plan_shaves_one_wave_of_long_full_tiles():
+    """One wave of nearly as many full tiles as clusters over 1024 key tiles takes the shaved plan: every tile a
+    long range and a short one of ``MLA2_SHAVE_TILES`` tiles, the long ranges first, two partials per row behind a
+    ``merge_w1`` merge and no direct item; the same shapes over 64K keys and a second wave of tiles keep the
+    equal-length plans."""
+    units, pairs = cake_backend.units_pairs_for_sm_count(208)
+    shave = cake_backend.MLA2_SHAVE_TILES
+    tiles = 131072 // (2 * PAGE)
+    for heads, q_len, batch in ((96, 8, 16), (192, 1, 48), (448, 1, 24)):
+        kv_lens, q_lens = [131072] * batch, [q_len] * batch
+        n_tiles = batch * -(
+            -q_len * heads // ROWS_TILE
+        )  # 192, 448 and 768 rows: one, two and three full tiles
+        assert 0.8 * units <= n_tiles <= units
+        p = cake_backend.plan(
+            seq_lens_host=kv_lens,
+            num_heads=heads,
+            q_len=q_len,
+            units=units,
+            pairs=pairs,
+        )
+        _check_plan(p, kv_lens, q_lens, heads)
+        assert p.n_full == p.items == 2 * n_tiles and p.max_splits == 2
+        assert p.decode_record == "decode_full" and p.merge_record == "merge_w1"
+        rows = [tuple(p.item_table[6 * i : 6 * i + 6]) for i in range(p.items)]
+        assert [r[2:] for r in rows[:n_tiles]] == [(0, tiles - shave, 0, 2)] * n_tiles
+        assert [r[2:] for r in rows[n_tiles:]] == [
+            (tiles - shave, shave, 1, 2)
+        ] * n_tiles
+        assert [r[:2] for r in rows[:n_tiles]] == [r[:2] for r in rows[n_tiles:]]
+        # Two items per cluster: more items than resident clusters, so the launches are plain.
+        assert p.items > units and cake_backend.pdl_for(p) is False
+        q = cake_backend.plan(
+            seq_lens_host=[65536] * batch,
+            num_heads=heads,
+            q_len=q_len,
+            units=units,
+            pairs=pairs,
+        )
+        assert (
+            q.items == q.n_full == n_tiles
+            and q.max_splits == 1
+            and q.merge_record is None
+        )
+    # More full tiles than clusters (the 212-SM table): a second wave, no shaved range.
+    units, pairs = cake_backend.units_pairs_for_sm_count(212)
+    assert units < 48
+    p = cake_backend.plan(
+        seq_lens_host=[131072] * 16, num_heads=96, q_len=8, units=units, pairs=pairs
+    )
+    _check_plan(p, [131072] * 16, [8] * 16, 96)
+    rows = [tuple(p.item_table[6 * i : 6 * i + 6]) for i in range(p.items)]
+    assert not any(r[2:4] == (tiles - shave, shave) for r in rows)
 
 
 def test_plan_rejects_malformed_problems():

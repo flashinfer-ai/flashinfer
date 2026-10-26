@@ -79,7 +79,7 @@ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
 
   const int cta_rank = 0;
 
-  // === Task calls (dependency order) ===
+  // === Task calls (declaration order) ===
   int row = blockIdx.x * 4 + warp;
   if (row < rows) {
     int lane_0 = lane;
@@ -222,6 +222,7 @@ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
       *(reinterpret_cast<float*>(q_scale + row) + (0)) = qs;
     }
   }
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 }
 
 }  // extern "C"

@@ -23,6 +23,13 @@ bound and the judgement of a result against the reference.  Shared by
 
 Nothing here knows how the kernels partition queries or keys.
 
+Input generators.  ``make_random_inputs`` draws iid Gaussian ``q`` / ``k``
+(optionally ``peaked``); ``make_sink_inputs`` draws the attention-sink +
+local-band statistics of flashinfer-ai/flashinfer#7042 (key 0 boosted along a
+shared direction, log-spaced sinusoid position features shared by every query
+and its nearby keys, positive ``w``), the distribution on which the sampled
+first threshold of the generated program is stress-tested.
+
 Scoring.  For every visible (query, key) pair the FP64 score is treated as
 exact and an independent FP32 scorer that follows the generated program's
 documented reduction model is evaluated beside it.  With
@@ -341,6 +348,97 @@ def make_random_inputs(
         softmax_scale=DEFAULT_SCALE if softmax_scale is None else softmax_scale,
         q_causal_offsets=q_causal_offsets,
         ratio=ratio,
+        label=label,
+    )
+
+
+SINK_NUM_FREQUENCIES = 32
+SINK_SEED = 7
+
+
+def make_sink_inputs(
+    seg_q_len,
+    seg_k_len,
+    *,
+    top_k: int = DEFAULT_TOP_K,
+    seed: int = SINK_SEED,
+    device="cuda",
+    q_causal_offsets=None,
+    noise: float = 0.5,
+    local: float = 4.0,
+    sink: float = 2.0,
+    key0_boost: float = 8.0,
+    n_freq: int = SINK_NUM_FREQUENCIES,
+    label: str = "",
+) -> IndexerInputs:
+    """Attention-sink + local-band inputs (flashinfer-ai/flashinfer#7042, the GLM-5.2 layer-6 indexer statistics).
+
+    The issue's generator, byte for byte, generalised to several segments: position features ``z(pos)`` are 32
+    random-phase ``(cos, sin)`` pairs at the log-spaced frequencies ``2**-3 .. 2**-17`` over ``sqrt(32)``,
+    zero-padded to 128; a unit direction ``s`` is shared by every query (``+ sink * s``) and boosted on key 0 of
+    every segment (``+ key0_boost * s``); ``q = noise * N + local * z(q_pos) + sink * s``,
+    ``k = noise * N + local * z(k_pos)``, ``w = |N| * H**-0.5`` (positive weights, unlike
+    :func:`make_random_inputs`).  Query ``u`` of segment ``s`` sits at document position ``offset_s + u``
+    (``offset_s = Lk - Lq`` by default, the context-parallel tail rule), key ``j`` at position ``j``, so the
+    nearest keys of every query form a log-decaying band and key 0 is an attention sink.  ``ratio`` is 1.
+
+    The draws follow one seeded generator in a fixed order (``phi``, ``s``, ``q`` noise, ``k`` noise, ``w``), so two
+    calls with the same arguments on the same device give the same bits; CUDA Gaussian draws of large tensors
+    depend on the device's SM count, so bitwise identity of the inputs holds within one GPU model only.
+    """
+    device = torch.device(device)
+    seg_q_len = [int(x) for x in seg_q_len]
+    seg_k_len = [int(x) for x in seg_k_len]
+    if len(seg_q_len) != len(seg_k_len):
+        raise ValueError("query and key segment lists must have the same length")
+    offsets = effective_offsets(seg_q_len, seg_k_len, q_causal_offsets, 1)
+    q_pos = torch.cat(
+        [
+            torch.arange(off, off + lq, dtype=torch.int64)
+            for off, lq in zip(offsets, seg_q_len, strict=True)
+        ]
+    ).to(device)
+    k_pos = torch.cat([torch.arange(0, lk, dtype=torch.int64) for lk in seg_k_len]).to(
+        device
+    )
+    T = int(q_pos.numel())
+    gen = torch.Generator(device=device).manual_seed(int(seed))
+    omega = torch.logspace(
+        -3, -17, n_freq, base=2.0, device=device, dtype=torch.float64
+    )
+    phi = (
+        torch.rand(n_freq, generator=gen, device=device, dtype=torch.float64)
+        * 2
+        * torch.pi
+    )
+
+    def z(pos):
+        ang = pos.double()[:, None] * omega + phi
+        feat = torch.cat((ang.cos(), ang.sin()), 1).float() / n_freq**0.5
+        return torch.nn.functional.pad(feat, (0, HEAD_DIM - 2 * n_freq))
+
+    s = torch.randn(HEAD_DIM, generator=gen, device=device)
+    s = s / s.norm()
+    q = (
+        noise * torch.randn(T, NUM_HEADS, HEAD_DIM, generator=gen, device=device)
+        + local * z(q_pos)[:, None, :]
+        + sink * s
+    )
+    k = noise * torch.randn(
+        k_pos.numel(), HEAD_DIM, generator=gen, device=device
+    ) + local * z(k_pos)
+    k = k + (k_pos == 0).float()[:, None] * key0_boost * s
+    w = torch.randn(T, NUM_HEADS, generator=gen, device=device).abs() * NUM_HEADS**-0.5
+    return build_inputs(
+        q.bfloat16(),
+        k.bfloat16(),
+        w,
+        seg_q_len,
+        seg_k_len,
+        top_k=top_k,
+        softmax_scale=DEFAULT_SCALE,
+        q_causal_offsets=q_causal_offsets,
+        ratio=1,
         label=label,
     )
 
@@ -1521,6 +1619,8 @@ __all__ = [
     "PAD_ID",
     "PAD_SCORE",
     "SEQUENTIAL_PAIR_LIMIT",
+    "SINK_NUM_FREQUENCIES",
+    "SINK_SEED",
     "TRAINER_KEY_ROW_STRIDE",
     "ZERO_SIGN_POLICIES",
     "IndexerInputs",
@@ -1544,6 +1644,7 @@ __all__ = [
     "make_nonfinite_inputs",
     "make_packed_inputs",
     "make_random_inputs",
+    "make_sink_inputs",
     "mixed_weights",
     "negative_weights",
     "pair_bound",

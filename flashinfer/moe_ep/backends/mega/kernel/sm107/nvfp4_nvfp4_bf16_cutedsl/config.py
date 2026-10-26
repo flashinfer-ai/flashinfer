@@ -5,10 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Optional, Tuple
 
+from flashinfer.moe_ep._compat import deprecated_aliases
+
 if TYPE_CHECKING:
     import torch
 
 
+@deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
 @dataclass
 class Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     """Configure Rubin inference with NVFP4 activations and weights.
@@ -30,7 +33,7 @@ class Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     token_back_mode: Literal[
         "epi_warps", "standalone_warps", "reuse_dispatch_warps"
     ] = "epi_warps"
-    apply_topk_in_fc1: bool = True
+    apply_routing_weights_before_fc2: bool = True
     schedule_policy: Tuple[str, Optional[int]] = ("grouped", None)
     work_id_mode: Literal["grid_stride", "atomic_counter"] = "grid_stride"
     fc2_use_bulk: bool = False
@@ -43,8 +46,8 @@ class Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     # (e.g. preferred (4, 1) + fallback (2, 1)). None -> uniform launch.
     fallback_cluster_shape_mn: Optional[Tuple[int, int]] = None
     # None preserves the fields above; a dict overrides KNOB_KEYS.
-    # "cache" uses an offline winner or the heuristic fallback. Online "auto"
-    # is unsupported because the kernel fixes its knobs at construction.
+    # "cache" uses an offline winner or heuristic; "auto" also permits a
+    # search during an enabled FlashInfer autotune warmup, before capture.
     knobs: dict | str | None = None
     max_sm_count: Optional[int] = None
     activation: Literal["swiglu", "situ"] = "swiglu"
