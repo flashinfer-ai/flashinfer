@@ -179,17 +179,21 @@ def launch_fp8(
         )
 
 
-_TACTICS = tuple(
-    (kind, group, stages, tile_k)
-    for kind in ("wgmma", "ampere_mma")
-    for group in (2, 4, 8)
-    for stages in (2, 4, 8)
-    for tile_k in (64, 128)
-) + tuple(
-    ("warp_mma", group, stages, tile_k)
-    for group in (2, 4, 8)
-    for tile_k in (64, 128)
-    for stages in ((2, 4) if tile_k == 128 else (2, 4, 8))
+_TACTICS = (
+    tuple(
+        (kind, group, stages, tile_k)
+        for kind in ("wgmma", "ampere_mma")
+        for group in (2, 4, 8)
+        for stages in (2, 4, 8)
+        for tile_k in (64, 128)
+    )
+    + tuple(
+        ("warp_mma", group, stages, tile_k)
+        for group in (2, 4, 8)
+        for tile_k in (64, 128)
+        for stages in ((2, 4) if tile_k == 128 else (2, 4, 8))
+    )
+    + (("warp_mma", 4, 2, 256), ("warp_mma", 8, 2, 256))
 )
 
 
@@ -239,11 +243,26 @@ def execute(inputs, config, tactic):
         raise ValueError("Grouped TC decode requires T<=8, top-k<=32 and aligned H/I")
     group_size, stages, tile_k = tactic[1:]
     finalize = config.finalize.do_finalize
+    if tile_k == 256:
+        from ....api import GeGLU
+
+        if not (
+            architecture == 90
+            and weight_only
+            and x.dtype == torch.bfloat16
+            and output.dtype == torch.bfloat16
+            and x.shape == (group_size, 2048)
+            and mid.shape[1] == 512
+            and ids.shape[1] == 10
+            and config.activation == GeGLU()
+            and finalize
+        ):
+            raise ValueError("K256 W8A16 requires SM90 BF16 GeGLU T4/T8 H2048/I512/K10")
     tensors = (x, w1, ids, mid, w2, routes, scores, output)
     if scaled:
         tensors += tuple(inputs[9:])
     key = (
-        "grouped-tc-ffi-w8a16-gather-v12",
+        "grouped-tc-ffi-w8a16-hopper-k256-v13",
         architecture,
         tuple((v.dtype, tuple(v.shape), tuple(v.stride()), v.device) for v in tensors),
         config.activation,

@@ -106,10 +106,13 @@ def _candidate_setup(packed, tokens, dtype, group, stages, activation, **shape):
         if tokens != 8 or not admitted_activation:
             pytest.skip("Outside SM90 W8A16 T8 activation admission")
         choices = runner.get_valid_tactics(inputs, None)
-        assert [t for t in choices if t[0] != "ffma"] == [
+        expected = [
             ("warp_mma", g, 2, 128)
             for g in ((4, 8) if dtype is torch.float16 else (8,))
         ]
+        if dtype is torch.bfloat16 and activation == GeGLU():
+            expected.insert(0, ("warp_mma", 8, 2, 256))
+        assert [t for t in choices if t[0] != "ffma"] == expected
         assert len([t for t in choices if t[0] == "ffma"]) == 16
         return runner, inputs, view, ("warp_mma", group, stages, 128)
     if tokens == 8 and group == 4:
@@ -314,7 +317,7 @@ def test_grouped_w8a16_bounded_admission():
             dict(dtype=torch.float16, tokens=t, activation=GeGLU()) for t in (1, 2, 4)
         )
         cases.extend(
-            dict(dtype=torch.bfloat16, tokens=t, activation=GeGLU()) for t in (1, 2, 4)
+            dict(dtype=torch.bfloat16, tokens=t, activation=GeGLU()) for t in (1, 2)
         )
         cases.extend(
             [
@@ -343,6 +346,7 @@ def test_grouped_w8a16_bounded_admission():
     for case in cases:
         runner, inputs, _ = _setup(**case)
         assert all(t[0] == "ffma" for t in runner.get_valid_tactics(inputs, None))
+
     for dtype in (torch.bfloat16, torch.float16):
         runner, inputs, _ = _setup(dtype=dtype)
         other = QuantFormat.FP16 if dtype is torch.bfloat16 else QuantFormat.BF16
@@ -356,3 +360,43 @@ def test_grouped_w8a16_bounded_admission():
             runner.config, finalize=replace(runner.config.finalize, do_finalize=False)
         )
         assert all(t[0] == "ffma" for t in runner.get_valid_tactics(inputs, None))
+
+
+@pytest.mark.parametrize("tokens", [4, 8])
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("fresh_storage", [False, True])
+def test_grouped_w8a16_hopper_k256_contract(tokens, packed, fresh_storage):
+    runner, inputs, view = _setup(packed, tokens=tokens, activation=GeGLU())
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("K256 W8A16 requires SM90")
+    tactic = ("warp_mma", tokens, 2, 256)
+    choices = runner.get_valid_tactics(inputs, None)
+    expected = [tactic] + ([("warp_mma", 8, 2, 128)] if tokens == 8 else [])
+    assert [t for t in choices if t[0] != "ffma"] == expected
+    assert len([t for t in choices if t[0] == "ffma"]) == 16
+    if fresh_storage:
+        _check_fresh_storage(runner, inputs, packed, tactic)
+    else:
+        _check_live_graph(runner, inputs, view, packed, tactic)
+
+
+def test_grouped_w8a16_hopper_k256_rejects_unqualified_calls():
+    from flashinfer.fused_moe.backends.frost_low_latency.tc.runtime import execute
+
+    for change in (
+        dict(dtype=torch.float16),
+        dict(activation=SwiGLU()),
+        dict(tokens=2),
+        dict(hidden=4096),
+        dict(intermediate=1024),
+        dict(topk=8),
+    ):
+        args = dict(tokens=4, activation=GeGLU())
+        args.update(change)
+        runner, inputs, _ = _setup(**args)
+        assert all(
+            t[0] == "ffma" or t[-1] != 256
+            for t in runner.get_valid_tactics(inputs, None)
+        )
+        with pytest.raises(ValueError, match="K256 W8A16 requires"):
+            execute(inputs, runner.config, ("warp_mma", 4, 2, 256))

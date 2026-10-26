@@ -241,7 +241,7 @@ class FrostLowLatencyRunner(MoERunner):
                 else "fp4-route-reuse-load-width-lut-fp16-v8"
                 if self._fp4_weight_only
                 else (
-                    "w8a16-grouped-tc-cumulative-v21"
+                    "w8a16-grouped-tc-hopper-k256-v22"
                     if self.config.quant.weight is QuantFormat.FP8PerTensor
                     and self.config.quant.activation
                     in (QuantFormat.BF16, QuantFormat.FP16)
@@ -335,7 +335,14 @@ class FrostLowLatencyRunner(MoERunner):
             and self.config.quant.activation in (QuantFormat.BF16, QuantFormat.FP16)
             and self.config.quant.output is self.config.quant.activation
             and capability == (9, 0)
-            and inputs[0].shape == (8, 2048)
+            and (
+                inputs[0].shape == (8, 2048)
+                or (
+                    inputs[0].shape == (4, 2048)
+                    and self.config.quant.activation is QuantFormat.BF16
+                    and self.config.activation == GeGLU()
+                )
+            )
             and self.config.experts.intermediate_size == 512
             and self.config.routing.top_k == 10
             and (
@@ -349,7 +356,18 @@ class FrostLowLatencyRunner(MoERunner):
         ):
             # Reused experts amortize typed fragment conversion. Keep FMA for
             # sparse overlap, and both group sizes for warm/cold variation.
-            return [("ffma", a, b) for a in (1, 2, 4, 8) for b in (1, 2, 4, 8)] + [
+            tactics = [("ffma", a, b) for a in (1, 2, 4, 8) for b in (1, 2, 4, 8)]
+            if (
+                self.config.quant.activation is QuantFormat.BF16
+                and self.config.activation == GeGLU()
+            ):
+                # Wider K tiles amortize producer synchronization for reused
+                # experts. Keep the existing T8 K128 choice for tuning.
+                tokens = inputs[0].shape[0]
+                tactics.append(("warp_mma", tokens, 2, 256))
+                if tokens == 4:
+                    return tactics
+            return tactics + [
                 ("warp_mma", group, 2, 128)
                 for group in (
                     (4, 8) if self.config.quant.activation is QuantFormat.FP16 else (8,)

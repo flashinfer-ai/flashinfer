@@ -1817,10 +1817,16 @@ fragments and
 live per-expert scales. Native FP8 activation execution retains its WGMMA
 projection. The untuned default is unchanged.
 
+BF16 GeGLU at the same H2048/I512/K10 geometry additionally offers
+group4/stages2/K256 at T4 and group8/stages2/K256 at T8. Wider K tiles
+amortize producer synchronization when tokens reuse experts. The existing T8
+K128 candidate and all sixteen FMA choices remain available. This extension
+does not admit K256 for FP16, other activations or other architectures.
+
 Shared expert routes can amortize fragment conversion; partial or disjoint
 routes still favor FMA. Cold BF16 execution can favor native cuTile. Tune with
 representative routes and cache conditions.
-Other activations, T1/T2/T4, other shapes, mixed output types and
+Other activations, T1/T2, T4 outside BF16 GeGLU, other shapes, mixed output types and
 raw expert outputs keep their previous candidate sets.
 
 Use `benchmarks/bench_frost_low_latency_w8a16.py --baseline frost_fma

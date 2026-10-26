@@ -178,8 +178,17 @@ class WarpGroupedProjection:
         self.b_layout = utils.LayoutEnum.from_tensor(b)
         self.c_layout = utils.LayoutEnum.COL_MAJOR
         self.packed_nvfp4 = block_scales is not None
-        if cutlass.const_expr(self.tile_k == 256 and not self.packed_nvfp4):
-            raise ValueError("K256 is qualified only for packed NVFP4 projections")
+        if cutlass.const_expr(
+            self.tile_k == 256
+            and not (
+                self.packed_nvfp4
+                or (
+                    self.a_dtype == cutlass.Float8E4M3FN
+                    and self.b_dtype == cutlass.BFloat16
+                )
+            )
+        ):
+            raise ValueError("K256 requires packed NVFP4 or qualified BF16 W8A16")
         self.weight_k = self.tile_k // 2 if self.packed_nvfp4 else self.tile_k
         if cutlass.const_expr(self.packed_nvfp4):
             if cutlass.const_expr(
