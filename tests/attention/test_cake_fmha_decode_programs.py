@@ -505,6 +505,42 @@ SHAPE_ROWS: dict[str, tuple] = {
         "decode_nvfp4", "nvfp4", 128, 1, 8192, 32, 4, 16,
         {"sm100a": "DEC_NVFP4_B128", "sm103a": "DEC_NVFP4_B128"},
     ),
+    "smallm_kv60008_q8_p64": (
+        "decode_smallm", "smallm", 1, 8, 60008, 8, 1, 64,
+        {"sm100a": "N64_P64_Q8_S148", "sm103a": "N64_P64_Q8_S152"},
+    ),
+    "smallm_kv60007_q7_p64": (
+        "decode_smallm", "smallm", 1, 7, 60007, 8, 1, 64,
+        {"sm100a": "N64_P64_Q7_S148", "sm103a": "N64_P64_Q7_S152"},
+    ),
+    "smallm_kv60008_q8_p16": (
+        "decode_smallm", "smallm", 1, 8, 60008, 8, 1, 16,
+        {"sm100a": "N64_P16_Q8_S148", "sm103a": "N64_P16_Q8_S152"},
+    ),
+    "smallm_kv60004_q4_p64": (
+        "decode_smallm", "smallm", 1, 4, 60004, 8, 1, 64,
+        {"sm100a": "N32_P64_Q4_S148", "sm103a": "N32_P64_Q4_S152"},
+    ),
+    "smallm_kv60003_q3_p64": (
+        "decode_smallm", "smallm", 1, 3, 60003, 8, 1, 64,
+        {"sm100a": "N32_P64_Q3_S148", "sm103a": "N32_P64_Q3_S152"},
+    ),
+    "smallm_tp1_kv60004_q4_p64": (
+        "decode_smallm", "smallm", 1, 4, 60004, 16, 2, 64,
+        {"sm100a": "N32_P64_Q4_S74", "sm103a": "N32_P64_Q4_S76"},
+    ),
+    "smallm_kv8200_q8_p64": (
+        "decode_smallm", "smallm", 1, 8, 8200, 8, 1, 64,
+        {"sm100a": "N64_P64_Q8_S65", "sm103a": "N64_P64_Q8_S65"},
+    ),
+    "smallm_kv8199_q7_p64": (
+        "decode_smallm", "smallm", 1, 7, 8199, 8, 1, 64,
+        {"sm100a": "N64_P64_Q7_S65", "sm103a": "N64_P64_Q7_S65"},
+    ),
+    "smallm_kv1032_q8_p64": (
+        "decode_smallm", "smallm", 1, 8, 1032, 8, 1, 64,
+        {"sm100a": "N64_P64_Q8_C9", "sm103a": "N64_P64_Q8_C9"},
+    ),
 }  # fmt: skip
 
 _SM_COUNT = {"sm100a": 148, "sm103a": 152}
@@ -627,6 +663,18 @@ def _select(kwargs):
     return cake_api.select_cake_fmha_decode_route(torch.device("meta"), **kwargs)
 
 
+# The program a launch with device scales takes, per host-scalar program
+# (a family whose programs read both forms takes the same program; a family
+# without device scales takes none).
+_DEVICE_SCALE_PROGRAM: dict[tuple[str, str], str | None] = {}
+
+
+def _device_scale_program(family, identifier):
+    if family in ("decode_nvfp4", "decode_fp8"):
+        return identifier
+    return _DEVICE_SCALE_PROGRAM.get((family, identifier))
+
+
 @pytest.mark.parametrize("device_scales", (False, True))
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))
 @pytest.mark.parametrize("row", sorted(SHAPE_ROWS))
@@ -635,9 +683,15 @@ def test_cake_fmha_decode_route_serves_shape_rows_as_pinned(
 ) -> None:
     decode_target(target)
     family = SHAPE_ROWS[row][0]
+    identifier = SHAPE_ROWS[row][-1][target]
     route = _select(_row_kwargs(row, device_scales=device_scales))
+    if device_scales:
+        identifier = _device_scale_program(family, identifier)
+        if identifier is None:
+            assert route is None or route.program is None
+            return
     assert route is not None
-    assert route.program == (family, SHAPE_ROWS[row][-1][target])
+    assert route.program == (family, identifier)
     assert route.device_scales is device_scales
     assert cake_api.cake_fmha_route_is_optimized(route)
 
@@ -730,9 +784,20 @@ def test_cake_fmha_decode_nvfp4_misses_keep_the_jit_route(
 # --- The values a quantized program receives (host-only) ---------------------
 
 
-def _program_values(monkeypatch, row, *, device_scales, sm_count=148, **overrides):
+def _program_values(
+    monkeypatch,
+    row,
+    *,
+    device_scales,
+    sm_count=148,
+    counter_buffer=None,
+    rerun=False,
+    **overrides,
+):
     """The launches a stand-in program of ``row``'s route receives on CPU
-    tensors: ``[(name, values)]`` in stream order, under the no-sync spy."""
+    tensors: ``[(name, values)]`` in stream order, under the no-sync spy.
+    With ``rerun``, also a function that launches the same module again with
+    some launch arguments replaced and returns those launches."""
 
     from flashinfer.jit.cake_program import GRID_ARGS
 
@@ -749,6 +814,9 @@ def _program_values(monkeypatch, row, *, device_scales, sm_count=148, **override
         workspace_bytes=1 << 26,
         **overrides,
     )
+    kwargs["multi_ctas_kv_counter_buffer"] = counter_buffer
+    # Poison the workspace: whatever a launch needs zeroed, it zeroes.
+    kwargs["workspace_buffer"].fill_(0xA5)
     route = cake_api.select_cake_fmha_decode_route(torch.device("cpu"), **kwargs)
     family, identifier = route.program
     calls = []
@@ -778,29 +846,38 @@ def _program_values(monkeypatch, row, *, device_scales, sm_count=148, **override
     monkeypatch.setattr(
         cake_api, "_torch_stream_context", lambda device: contextlib.nullcontext()
     )
-    with no_host_sync():
-        cake_api._run_cake_fmha_decode_program(
-            module,
-            query=kwargs["query"],
-            key_cache=kwargs["key_cache"],
-            value_cache=kwargs["value_cache"],
-            out=kwargs["out"],
-            workspace_buffer=kwargs["workspace_buffer"],
-            counter_buffer=kwargs["multi_ctas_kv_counter_buffer"],
-            block_tables=kwargs["block_tables"],
-            seq_lens=kwargs["seq_lens"],
-            max_seq_len=kwargs["max_seq_len"],
-            bmm1_scale=kwargs["bmm1_scale"],
-            bmm2_scale=kwargs["bmm2_scale"],
-            sinks=kwargs["sinks"],
-            lse=kwargs["lse"],
-            key_block_scales=kwargs["key_block_scales"],
-            value_block_scales=kwargs["value_block_scales"],
-            sm_count=sm_count,
-        )
-    launches = [
-        (name, dict(zip(args, values, strict=True))) for name, args, values in calls
-    ]
+    launch_kwargs = dict(
+        query=kwargs["query"],
+        key_cache=kwargs["key_cache"],
+        value_cache=kwargs["value_cache"],
+        out=kwargs["out"],
+        workspace_buffer=kwargs["workspace_buffer"],
+        counter_buffer=kwargs["multi_ctas_kv_counter_buffer"],
+        block_tables=kwargs["block_tables"],
+        seq_lens=kwargs["seq_lens"],
+        max_seq_len=kwargs["max_seq_len"],
+        bmm1_scale=kwargs["bmm1_scale"],
+        bmm2_scale=kwargs["bmm2_scale"],
+        sinks=kwargs["sinks"],
+        lse=kwargs["lse"],
+        key_block_scales=kwargs["key_block_scales"],
+        value_block_scales=kwargs["value_block_scales"],
+        sm_count=sm_count,
+    )
+
+    def launch(**replaced):
+        calls.clear()
+        with no_host_sync():
+            cake_api._run_cake_fmha_decode_program(
+                module, **{**launch_kwargs, **replaced}
+            )
+        return [
+            (name, dict(zip(args, values, strict=True))) for name, args, values in calls
+        ]
+
+    launches = launch()
+    if rerun:
+        return kwargs, launches, launch
     return kwargs, launches
 
 
@@ -886,7 +963,7 @@ def _bits(tensor):
     return tensor.view(dtype)
 
 
-def _run_decode(case, *, seq_lens=None, out=None, max_seq_len=None):
+def _run_decode(case, *, seq_lens=None, out=None, max_seq_len=None, lse=None):
     return decode_api.trtllm_batch_decode_with_kv_cache(
         case.query,
         case.kv_cache,
@@ -905,6 +982,7 @@ def _run_decode(case, *, seq_lens=None, out=None, max_seq_len=None):
         sinks=case.sinks,
         enable_pdl=True,
         multi_ctas_kv_counter_buffer=case.counter,
+        lse=lse,
     )
 
 
@@ -1084,3 +1162,358 @@ def test_cake_decode_nvfp4_program_is_sync_free_and_replays(served_programs) -> 
     )
     _check_hit_is_sync_free_and_replays(case, lengths)
     assert set(served_programs) == {("decode_nvfp4", "DEC_NVFP4_B128")}
+
+
+# --- Small-M boundaries (host-only) -------------------------------------------
+
+_TWO_KV_HEADS = {"num_q_heads": 16, "num_kv_heads": 2}
+
+
+@pytest.mark.parametrize(
+    ("target", "row", "overrides", "program"),
+    [
+        # The cluster program takes one tile of exactly nine 128-token blocks.
+        ("sm100a", "smallm_kv1032_q8_p64", {"kv_len": 1025}, "N64_P64_Q8_C9"),
+        ("sm103a", "smallm_kv1032_q8_p64", {"kv_len": 1152}, "N64_P64_Q8_C9"),
+        ("sm100a", "smallm_kv1032_q8_p64", {"kv_len": 1024}, None),
+        ("sm100a", "smallm_kv1032_q8_p64", {"kv_len": 1153}, None),
+        ("sm100a", "smallm_kv1032_q8_p64", {"batch": 2}, None),
+        ("sm103a", "smallm_kv1032_q8_p64", _TWO_KV_HEADS, None),
+        ("sm100a", "smallm_kv1032_q8_p64", {"q_len": 7}, None),
+        ("sm100a", "smallm_kv1032_q8_p64", {"page_size": 16}, None),
+        # Sixty-five blocks split 65 ways; 64 and 66 have no program.
+        ("sm100a", "smallm_kv8200_q8_p64", {"kv_len": 8320}, "N64_P64_Q8_S65"),
+        ("sm103a", "smallm_kv8200_q8_p64", {"kv_len": 8193}, "N64_P64_Q8_S65"),
+        ("sm100a", "smallm_kv8200_q8_p64", {"kv_len": 8192}, None),
+        ("sm100a", "smallm_kv8200_q8_p64", {"kv_len": 8321}, None),
+        # Two tiles of 64 rows split 74 ways: no program.
+        ("sm100a", "smallm_kv60008_q8_p64", {"batch": 2}, None),
+        ("sm100a", "smallm_kv60008_q8_p64", _TWO_KV_HEADS, None),
+    ],
+)
+def test_cake_fmha_decode_smallm_boundaries(
+    decode_target, target, row, overrides, program
+) -> None:
+    decode_target(target)
+    route = _select(_row_kwargs(row, **overrides))
+    if program is None:
+        assert route is None or route.program is None, overrides
+    else:
+        assert route.program == ("decode_smallm", program), overrides
+
+
+def test_cake_fmha_decode_smallm_split_count_follows_the_device(
+    decode_target,
+) -> None:
+    """A device with another SM count plans another split: an SM103 part with
+    148 SMs has no 148-way program; 152 SMs on SM100 neither."""
+
+    decode_target("sm103a", sm_count=148)
+    assert _select(_row_kwargs("smallm_kv60008_q8_p64")).program is None
+    decode_target("sm100a", sm_count=152)
+    assert _select(_row_kwargs("smallm_kv60008_q8_p64")).program is None
+
+
+@pytest.mark.parametrize("mutation", ("uint32_tables", "lse", "device_scales"))
+def test_cake_fmha_decode_smallm_scale_table_and_lse_forms(
+    decode_target, mutation
+) -> None:
+    decode_target("sm100a")
+    kwargs = _row_kwargs("smallm_kv8200_q8_p64")
+    if mutation == "uint32_tables":
+        kwargs["block_tables"] = kwargs["block_tables"].to(torch.uint32)
+        route = _select(kwargs)
+        assert route is None or route.program is None
+    elif mutation == "lse":
+        query = kwargs["query"]
+        kwargs["lse"] = torch.empty(
+            (query.shape[0], query.shape[1]), dtype=torch.float32, device="meta"
+        )
+        assert _select(kwargs).program == ("decode_smallm", "N64_P64_Q8_S65")
+    else:
+        kwargs = _row_kwargs("smallm_kv8200_q8_p64", device_scales=True)
+        route = _select(kwargs)
+        assert route is None or route.program is None
+
+
+@pytest.mark.parametrize("counters", ("caller", "workspace"))
+@pytest.mark.parametrize("row", ("smallm_kv8200_q8_p64", "smallm_kv1032_q8_p64"))
+def test_cake_decode_smallm_program_values(monkeypatch, row, counters) -> None:
+    """The JIT route's workspace layout; the merge tickets in the caller's
+    counter buffer, or zeroed in the workspace when it passes none."""
+
+    caller = torch.full((64,), 7, dtype=torch.uint8) if counters == "caller" else None
+    kwargs, launches = _program_values(
+        monkeypatch, row, device_scales=False, counter_buffer=caller
+    )
+    ((_, values),) = launches
+    num_split = 9 if row == "smallm_kv1032_q8_p64" else 65
+    slots, n_rows = num_split, 64
+    workspace = kwargs["workspace_buffer"]
+    base = workspace.data_ptr()
+    assert values["Q"] is kwargs["query"] and values["O_ptr"] is kwargs["out"]
+    assert values["K"] is kwargs["key_cache"] and values["V"] is kwargs["value_cache"]
+    assert values["partial_O_ptr"].data_ptr() == base
+    assert values["partial_O_ptr"].dtype == torch.bfloat16
+    lse_slots = (slots * n_rows * 512 + 255) // 256 * 256
+    assert values["partial_LSE_ptr"].data_ptr() == base + lse_slots
+    tickets = (lse_slots + slots * n_rows * 4 + 255) // 256 * 256
+    if counters == "caller":
+        assert values["counters"].data_ptr() == caller.data_ptr()
+        assert values["counters"].numel() == 2
+    else:
+        assert values["counters"].data_ptr() == base + tickets
+        assert not values["counters"].any()
+    assert values["LSE_ptr"].data_ptr() == base + (tickets + 8 + 255) // 256 * 256
+    assert values["page_table"] is kwargs["block_tables"]
+    assert values["max_pages_per_seq"] == kwargs["block_tables"].shape[1]
+    assert values["softmax_scale_log2"] == _HOST_BMM1 * 1.4426950408889634
+    assert (values["num_q_heads"], values["num_kv_heads"]) == (8, 1)
+    assert (values["grid_x"], values["grid_y"], values["grid_z"]) == (num_split, 1, 1)
+
+
+@pytest.mark.parametrize("counters", ("caller", "workspace"))
+def test_cake_decode_smallm_program_values_follow_the_buffers(
+    monkeypatch, counters
+) -> None:
+    """A launch on the module's last workspace and counter buffer reuses their
+    argument views; the caller's other tensors pass as given, the workspace
+    tickets are zeroed at every launch, and another workspace takes its own
+    views."""
+
+    caller = torch.zeros((64,), dtype=torch.uint8) if counters == "caller" else None
+    kwargs, launches, launch = _program_values(
+        monkeypatch,
+        "smallm_kv8200_q8_p64",
+        device_scales=False,
+        counter_buffer=caller,
+        rerun=True,
+    )
+    ((_, first),) = launch()
+    workspace = kwargs["workspace_buffer"]
+    workspace.fill_(0xA5)
+    query, out = torch.empty_like(kwargs["query"]), torch.empty_like(kwargs["out"])
+    ((_, second),) = launch(query=query, out=out)
+    for name in ("partial_O_ptr", "partial_LSE_ptr", "counters", "LSE_ptr"):
+        assert second[name] is first[name], name
+    assert second["Q"] is query and second["O_ptr"] is out
+    if counters == "workspace":
+        assert not second["counters"].any()
+    lse = torch.empty((query.shape[0], query.shape[1]), dtype=torch.float32)
+    ((_, with_lse),) = launch(lse=lse)
+    assert with_lse["LSE_ptr"] is lse
+    for name in ("partial_O_ptr", "partial_LSE_ptr", "counters"):
+        assert with_lse[name].data_ptr() == first[name].data_ptr(), name
+    ((_, third),) = launch()
+    assert third["partial_O_ptr"] is first["partial_O_ptr"]
+    assert launches[0][1]["partial_O_ptr"].data_ptr() == workspace.data_ptr()
+    other = torch.full_like(workspace, 0xA5)
+    ((_, fourth),) = launch(workspace_buffer=other)
+    assert fourth["partial_O_ptr"].data_ptr() == other.data_ptr()
+    assert fourth["partial_LSE_ptr"].data_ptr() != first["partial_LSE_ptr"].data_ptr()
+    if caller is not None:
+        assert fourth["counters"].data_ptr() == caller.data_ptr()
+    else:
+        assert fourth["counters"].data_ptr() != first["counters"].data_ptr()
+
+
+@pytest.mark.parametrize(
+    ("batch", "max_seq_len", "cluster"),
+    [
+        (1, 1024, False),
+        (1, 1025, True),
+        (1, 1152, True),
+        (1, 1153, False),
+        (2, 1100, False),
+    ],
+)
+def test_cake_decode_smallm_cluster_program_precondition(
+    monkeypatch, batch, max_seq_len, cluster
+) -> None:
+    """The nine-CTA cluster program serves one tile (one request, one KV
+    head) whose KV is more than eight and at most nine 128-token blocks; its
+    launch refuses any other."""
+
+    kwargs, launches, launch = _program_values(
+        monkeypatch,
+        "smallm_kv1032_q8_p64",
+        device_scales=False,
+        rerun=True,
+    )
+    ((_, values),) = launches
+    assert values["grid_x"] == 9
+    for bound in (9 * 128 + 1, 2 * 9 * 128):
+        with pytest.raises(RuntimeError, match="merges one tile"):
+            launch(max_seq_len=bound)
+    selected = _select(
+        _row_kwargs(
+            "smallm_kv1032_q8_p64",
+            batch=batch,
+            kv_len=min(max_seq_len, 1032),
+            max_seq_len=max_seq_len,
+            width=-(-max_seq_len // 64),
+        )
+    )
+    program = None if selected is None else selected.program
+    assert (program == ("decode_smallm", "N64_P64_Q8_C9")) == cluster, selected
+
+
+# --- GPU: BF16 inputs and reference ------------------------------------------
+
+
+def _bf16_case(row, *, seed, lengths=None, counter=True):
+    """BF16 queries over one stacked BF16 cache (the contract's form: K and V
+    are the two halves of each page), shuffled pages."""
+
+    _, kind, batch, q_len, kv_len, hq, hkv, page, _ = SHAPE_ROWS[row]
+    head_dim = 256 if kind == "smallm" else 128
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(seed)
+    width = -(-kv_len // page)
+    total = batch * width
+    cache = torch.randn(
+        (total, 2, hkv, page, head_dim), generator=generator, device=device
+    ).to(torch.bfloat16)
+    query = torch.randn(
+        (batch * q_len, hq, head_dim), generator=generator, device=device
+    ).to(torch.bfloat16)
+    order = torch.randperm(total, generator=generator, device=device)
+    if lengths is None:
+        lengths = [kv_len] * batch
+    return SimpleNamespace(
+        query=query,
+        kv_cache=cache,
+        kv_cache_sf=None,
+        block_tables=order.view(batch, width).to(torch.int32).contiguous(),
+        seq_lens=torch.tensor(lengths, dtype=torch.int32, device=device),
+        max_seq_len=kv_len,
+        bmm1=head_dim**-0.5,
+        bmm2=1.0,
+        o_scale=1.0,
+        q_len=q_len,
+        sinks=None,
+        out=torch.empty_like(query),
+        workspace=torch.zeros(1 << 28, dtype=torch.uint8, device=device),
+        counter=(
+            torch.zeros(1 << 16, dtype=torch.uint8, device=device) if counter else None
+        ),
+    )
+
+
+def _bf16_reference(case, batches):
+    """FP32 speculative decode of the given requests: query token ``i`` of a
+    request of length ``L`` sees keys ``0 .. L - q_len + i``; a sink adds its
+    logit to every row's softmax."""
+
+    cache, q_len = case.kv_cache, case.q_len
+    page = cache.shape[3]
+    num_q_heads, num_kv_heads = case.query.shape[1], cache.shape[2]
+    group = num_q_heads // num_kv_heads
+    bmm1, bmm2 = (
+        scale.item() if isinstance(scale, torch.Tensor) else float(scale)
+        for scale in (case.bmm1, case.bmm2)
+    )
+    outputs = {}
+    for b in batches:
+        length = int(case.seq_lens[b])
+        pages = case.block_tables[b, : -(-length // page)].long()
+
+        def side(index):
+            values = cache[pages, index].float().transpose(0, 1)
+            values = values.reshape(num_kv_heads, -1, values.shape[-1])[:, :length]
+            return values.repeat_interleave(group, dim=0)
+
+        k, v = side(0), side(1)
+        q = case.query[b * q_len : (b + 1) * q_len].float()
+        logits = torch.einsum("qhd,hld->hql", q, k) * bmm1
+        rows = torch.arange(q_len, device=q.device)[:, None] + length - q_len
+        visible = torch.arange(length, device=q.device)[None, :] <= rows
+        logits = logits.masked_fill(~visible[None], float("-inf"))
+        if case.sinks is not None:
+            sink = case.sinks.float()[:, None, None].expand(-1, q_len, 1)
+            logits = torch.cat((logits, sink), dim=-1)
+        p = torch.softmax(logits, dim=-1)[..., :length]
+        outputs[b] = torch.einsum("hql,hld->qhd", p, v) * bmm2
+    return outputs
+
+
+def _require_full_device():
+    """The shape rows' split counts assume the device's full SM count."""
+
+    target = cake_api._cake_fmha_target(torch.device("cuda"))
+    count = torch.cuda.get_device_properties(0).multi_processor_count
+    if count != _SM_COUNT[target]:
+        pytest.skip(f"{target} with {count} SMs plans other split counts")
+    return target
+
+
+# --- GPU: small-M ------------------------------------------------------------
+
+_SMALLM_GPU_ROWS = (
+    "smallm_kv1032_q8_p64",
+    "smallm_kv8200_q8_p64",
+    "smallm_kv8199_q7_p64",
+    "smallm_kv60008_q8_p16",
+    "smallm_tp1_kv60004_q4_p64",
+    "smallm_kv60003_q3_p64",
+)
+
+
+@_GPU
+@pytest.mark.parametrize("row", _SMALLM_GPU_ROWS)
+def test_cake_decode_smallm_programs_match_reference_and_the_jit_route(
+    monkeypatch, served_programs, row
+) -> None:
+    """Each program against the FP32 reference at the BF16 tolerance and
+    against the module's JIT route (the merge order of the partials may
+    differ: compared at the same tolerance), output and LSE."""
+
+    target = _require_full_device()
+    case = _bf16_case(row, seed=20261028)
+    rows, heads = case.query.shape[:2]
+    lse = torch.empty((rows, heads), dtype=torch.float32, device="cuda")
+    got = _run_decode(case, lse=lse)
+    assert served_programs == [("decode_smallm", SHAPE_ROWS[row][-1][target])]
+    batch = SHAPE_ROWS[row][2]
+    reference = _bf16_reference(case, range(batch))
+    for b in range(batch):
+        q_len = case.q_len
+        torch.testing.assert_close(
+            got[b * q_len : (b + 1) * q_len].float(),
+            reference[b],
+            atol=1e-2,
+            rtol=1e-2,
+        )
+    _keep_the_jit_route(monkeypatch)
+    jit_lse = torch.empty_like(lse)
+    jit = _run_decode(case, lse=jit_lse)
+    assert len(served_programs) == 1
+    torch.testing.assert_close(got.float(), jit.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(lse, jit_lse, atol=1e-3, rtol=1e-3)
+
+
+@_GPU
+@pytest.mark.parametrize("row", ("smallm_kv1032_q8_p64", "smallm_kv8200_q8_p64"))
+def test_cake_decode_smallm_program_is_sync_free_and_replays(
+    served_programs, row
+) -> None:
+    target = _require_full_device()
+    case = _bf16_case(row, seed=20261029)
+    lengths = torch.tensor([case.max_seq_len - 37], dtype=torch.int32, device="cuda")
+    _check_hit_is_sync_free_and_replays(case, lengths)
+    assert set(served_programs) == {("decode_smallm", SHAPE_ROWS[row][-1][target])}
+
+
+@_GPU
+def test_cake_decode_smallm_program_without_a_counter_buffer(served_programs) -> None:
+    """Without the caller's counter buffer the tickets live in the workspace,
+    zeroed on the stream first: the same bits, launch after launch."""
+
+    _require_full_device()
+    with_buffer = _bf16_case("smallm_kv8200_q8_p64", seed=20261030)
+    without = _bf16_case("smallm_kv8200_q8_p64", seed=20261030, counter=False)
+    without.workspace.fill_(0xA5)
+    expected = _run_decode(with_buffer)
+    for _ in range(3):
+        assert torch.equal(_bits(_run_decode(without)), _bits(expected))
+    assert not with_buffer.counter.any()

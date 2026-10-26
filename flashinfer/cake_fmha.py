@@ -10,7 +10,7 @@ from __future__ import annotations
 import copy
 import functools
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dataclasses import replace as dataclass_replace
 from typing import Any, Literal
 
@@ -1610,6 +1610,10 @@ class CakeFmhaDecodeProgramModule:
     target: str
     entry: Any
     reducer: tuple[str, str, str, Any, Any] | None = None
+    # The family's launch arguments derived from the caller's workspace (see
+    # _decode_smallm_program_values): built at the first launch on a
+    # workspace, kept until a launch on another one; not part of the module.
+    launch_args: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
 
 def _decode_program_constant(family: str, identifier: str, target: str):
@@ -2096,6 +2100,318 @@ def _decode_quant_program_values(
 _DECODE_PROGRAM_VALUES["decode_nvfp4"] = _decode_quant_program_values
 
 
+# --- Small-M speculative decode programs (BF16, head dim 256) ----------------
+#
+# ``cake_fmha_decode_smallm``: the (query token, query head) pairs of one KV
+# head packed into a 32- or 64-row tile, the KV split over one resident wave
+# of CTAs whose split count is a build constant.  The key is ``(n_rows,
+# page_size, q_len, group, num_split, cluster)``: the module's split rule
+# (``_smallm_num_split``), except that one tile whose KV is exactly nine
+# 128-token blocks takes the nine-CTA cluster program.
+
+_DECODE_PROGRAM_HOST_PARAMS["decode_smallm"] = (
+    "Q",
+    "K",
+    "V",
+    "partial_O_ptr",
+    "partial_LSE_ptr",
+    "O_ptr",
+    "LSE_ptr",
+    "counters",
+    "page_table",
+    "seq_lens",
+    "max_pages_per_seq",
+    "softmax_scale_log2",
+    "num_q_heads",
+    "num_kv_heads",
+)
+_DECODE_PROGRAM_ROUTES["sm100a"].update(
+    {
+        ("decode_smallm", 64, 64, 8, 8, 148, 0): "N64_P64_Q8_S148",
+        ("decode_smallm", 64, 64, 7, 8, 148, 0): "N64_P64_Q7_S148",
+        ("decode_smallm", 64, 16, 8, 8, 148, 0): "N64_P16_Q8_S148",
+        ("decode_smallm", 32, 64, 4, 8, 148, 0): "N32_P64_Q4_S148",
+        ("decode_smallm", 32, 64, 3, 8, 148, 0): "N32_P64_Q3_S148",
+        ("decode_smallm", 32, 64, 4, 8, 74, 0): "N32_P64_Q4_S74",
+        ("decode_smallm", 64, 64, 8, 8, 65, 0): "N64_P64_Q8_S65",
+        ("decode_smallm", 64, 64, 7, 8, 65, 0): "N64_P64_Q7_S65",
+        ("decode_smallm", 64, 64, 8, 8, 9, 9): "N64_P64_Q8_C9",
+    }
+)
+_DECODE_PROGRAM_ROUTES["sm103a"].update(
+    {
+        ("decode_smallm", 64, 64, 8, 8, 152, 0): "N64_P64_Q8_S152",
+        ("decode_smallm", 64, 64, 7, 8, 152, 0): "N64_P64_Q7_S152",
+        ("decode_smallm", 64, 16, 8, 8, 152, 0): "N64_P16_Q8_S152",
+        ("decode_smallm", 32, 64, 4, 8, 152, 0): "N32_P64_Q4_S152",
+        ("decode_smallm", 32, 64, 3, 8, 152, 0): "N32_P64_Q3_S152",
+        ("decode_smallm", 32, 64, 4, 8, 76, 0): "N32_P64_Q4_S76",
+        ("decode_smallm", 64, 64, 8, 8, 65, 0): "N64_P64_Q8_S65",
+        ("decode_smallm", 64, 64, 7, 8, 65, 0): "N64_P64_Q7_S65",
+        ("decode_smallm", 64, 64, 8, 8, 9, 9): "N64_P64_Q8_C9",
+    }
+)
+_DECODE_PROGRAMS.update(
+    {
+        ("decode_smallm", "N64_P64_Q8_S148"): (
+            "cake_fmha_decode_smallm_21ea26612a009f241410",
+            "split",
+        ),
+        ("decode_smallm", "N64_P64_Q7_S148"): (
+            "cake_fmha_decode_smallm_87d9cf4f8515047dcbaa",
+            "split",
+        ),
+        ("decode_smallm", "N64_P16_Q8_S148"): (
+            "cake_fmha_decode_smallm_a99e225068e33cf99451",
+            "split",
+        ),
+        ("decode_smallm", "N32_P64_Q4_S148"): (
+            "cake_fmha_decode_smallm_87d5d62578d02874cada",
+            "split",
+        ),
+        ("decode_smallm", "N32_P64_Q3_S148"): (
+            "cake_fmha_decode_smallm_0327fa5913427e139db7",
+            "split",
+        ),
+        ("decode_smallm", "N32_P64_Q4_S74"): (
+            "cake_fmha_decode_smallm_d9854bf8ac213ba04ea9",
+            "split",
+        ),
+        ("decode_smallm", "N64_P64_Q8_S152"): (
+            "cake_fmha_decode_smallm_60474a8cc8bc55e56484",
+            "split",
+        ),
+        ("decode_smallm", "N64_P64_Q7_S152"): (
+            "cake_fmha_decode_smallm_5ea2416d7e4599b34e4b",
+            "split",
+        ),
+        ("decode_smallm", "N64_P16_Q8_S152"): (
+            "cake_fmha_decode_smallm_4286f312b61072e4b222",
+            "split",
+        ),
+        ("decode_smallm", "N32_P64_Q4_S152"): (
+            "cake_fmha_decode_smallm_ba23b5c11e506e04ac2a",
+            "split",
+        ),
+        ("decode_smallm", "N32_P64_Q3_S152"): (
+            "cake_fmha_decode_smallm_3cbe2ae98d241be2267e",
+            "split",
+        ),
+        ("decode_smallm", "N32_P64_Q4_S76"): (
+            "cake_fmha_decode_smallm_2e16f0e25463fa51d7d6",
+            "split",
+        ),
+        ("decode_smallm", "N64_P64_Q8_S65"): (
+            "cake_fmha_decode_smallm_ab6579d6278a8d29b0a3",
+            "split",
+        ),
+        ("decode_smallm", "N64_P64_Q7_S65"): (
+            "cake_fmha_decode_smallm_cdeb96c96f466fa3f07d",
+            "split",
+        ),
+        ("decode_smallm", "N64_P64_Q8_C9"): (
+            "cake_fmha_decode_smallm_f8167380e9cf9cf665b5",
+            "split",
+        ),
+    }
+)
+
+
+def _decode_smallm_program_select(
+    device: torch.device,
+    *,
+    n_rows: int,
+    page_size: int,
+    q_len: int,
+    group: int,
+    tiles: int,
+    max_seq_len: int,
+    num_split: int,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+) -> tuple[tuple[str, str], int] | None:
+    """``(program, num_split)`` of a small-M launch the generated programs
+    serve, or ``None``: the module's split rule, except one 64-row tile of
+    eight query tokens over 64-token pages whose KV is exactly nine 128-token
+    blocks, which the nine-CTA cluster program merges in distributed shared
+    memory."""
+
+    if block_tables.dtype != torch.int32 or seq_lens.dtype != torch.int32:
+        return None
+    cluster = 0
+    # The cluster program's precondition: one tile (one request, one KV head)
+    # whose KV fits its nine 128-token blocks.
+    if (n_rows, page_size, q_len, group, tiles) == (64, 64, 8, 8, 1) and (
+        8 * 128 < max_seq_len <= 9 * 128
+    ):
+        num_split = cluster = 9
+    key = (n_rows, page_size, q_len, group, num_split, cluster)
+    program = _decode_program_lookup(device, "decode_smallm", key)
+    return None if program is None else (program, num_split)
+
+
+def _decode_smallm_program_values(
+    module: CakeFmhaDecodeProgramModule,
+    *,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    out: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    counter_buffer: torch.Tensor | None,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    bmm1_scale: float,
+    lse: torch.Tensor | None,
+    sm_count: int,
+    **unused: Any,
+) -> list[tuple[Any, Any, dict[str, Any]]]:
+    """The one launch of a small-M program: the workspace layout of the
+    module's JIT route (BF16 partial ``O`` and FP32 partial LSE slots, two
+    merge tickets per tile, the LSE when the caller passes none).  The tickets
+    live in the caller's zeroed counter buffer when it is large enough (the
+    kernel's last CTA of a tile resets them), else in the workspace, zeroed
+    on the stream first.
+
+    Those workspace arguments and the grid depend only on the buffers'
+    addresses and sizes, so the module keeps them from its last launch of
+    each LSE form (on a CUDA device as FFI tensors, converted once) and a
+    launch on the same buffers reads their addresses only; the caller's other
+    tensors pass as given.  A cluster program merges one tile whose KV fits its splits'
+    128-token blocks and refuses any other launch."""
+
+    route = module.route
+    if module.program.cluster[0] > 1 and (
+        route.batch_size * route.num_kv_heads != 1
+        or max_seq_len > route.num_split * 128
+    ):
+        raise RuntimeError(
+            f"Cake FMHA decode program {module.identifier} merges one tile of at "
+            f"most {route.num_split * 128} KV tokens; the launch has "
+            f"{route.batch_size * route.num_kv_heads} tiles and max_seq_len "
+            f"{max_seq_len}"
+        )
+    counter_key = None
+    if counter_buffer is not None:
+        counter_key = (
+            counter_buffer.data_ptr(),
+            counter_buffer.numel() * counter_buffer.element_size(),
+            counter_buffer.is_contiguous(),
+        )
+    key = (
+        workspace_buffer.data_ptr(),
+        workspace_buffer.numel() * workspace_buffer.element_size(),
+        counter_key,
+        sm_count,
+    )
+    slot = "smallm" if lse is None else "smallm_lse"
+    cached = module.launch_args.get(slot)
+    if cached is None or cached[0] != key:
+        cached = (
+            key,
+            _decode_smallm_launch_args(
+                module,
+                query=query,
+                workspace_buffer=workspace_buffer,
+                counter_buffer=counter_buffer,
+                own_lse=lse is None,
+                sm_count=sm_count,
+            ),
+        )
+        module.launch_args[slot] = cached
+    args, zero = cached[1]
+    if zero is not None:
+        zero.zero_()
+    values: dict[str, Any] = {
+        "Q": query,
+        "K": key_cache,
+        "V": value_cache,
+        "O_ptr": out,
+        "page_table": block_tables,
+        "seq_lens": seq_lens,
+        "max_pages_per_seq": int(block_tables.shape[-1]),
+        "softmax_scale_log2": float(bmm1_scale) * log2e,
+        "num_q_heads": route.num_q_heads,
+        "num_kv_heads": route.num_kv_heads,
+        **args,
+    }
+    if lse is not None:
+        values["LSE_ptr"] = lse
+    return [(module.program, module.entry, values)]
+
+
+def _decode_smallm_launch_args(
+    module: CakeFmhaDecodeProgramModule,
+    *,
+    query: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    counter_buffer: torch.Tensor | None,
+    own_lse: bool,
+    sm_count: int,
+) -> tuple[dict[str, Any], torch.Tensor | None]:
+    """The workspace arguments and the grid of a small-M launch, and the
+    workspace tickets to zero before each launch (``None`` when the tickets
+    live in the caller's counter buffer)."""
+
+    route = module.route
+    num_split = route.num_split
+    n_rows = _smallm_tile_rows_for(route.q_len, route.num_q_heads // route.num_kv_heads)
+    tiles = route.batch_size * route.num_kv_heads
+    slots = tiles * num_split
+
+    def align(value: int) -> int:
+        return (value + 255) // 256 * 256
+
+    partial_lse_offset = align(slots * n_rows * 256 * 2)
+    counters_offset = align(partial_lse_offset + slots * n_rows * 4)
+    lse_offset = align(counters_offset + tiles * 2 * 4)
+    flat = _decode_program_bytes(workspace_buffer)
+    args: dict[str, Any] = {
+        "partial_O_ptr": _decode_program_workspace(
+            flat, 0, slots * n_rows * 256 * 2, torch.bfloat16
+        ),
+        "partial_LSE_ptr": _decode_program_workspace(
+            flat, partial_lse_offset, slots * n_rows * 4, torch.float32
+        ),
+    }
+    counter_bytes = tiles * 2 * 4
+    zero = None
+    if (
+        counter_buffer is not None
+        and counter_buffer.device == query.device
+        and counter_buffer.is_contiguous()
+        and counter_buffer.numel() * counter_buffer.element_size() >= counter_bytes
+        and counter_buffer.data_ptr() % 4 == 0
+    ):
+        counter_flat = counter_buffer.view(-1).view(torch.uint8)
+        args["counters"] = counter_flat[:counter_bytes].view(torch.uint32)
+    else:
+        args["counters"] = zero = _decode_program_workspace(
+            flat, counters_offset, counter_bytes, torch.uint32
+        )
+    if own_lse:
+        rows = int(query.shape[0]) * int(query.shape[1])
+        args["LSE_ptr"] = _decode_program_workspace(
+            flat, lse_offset, rows * 4, torch.float32
+        )
+    if query.device.type == "cuda":
+        args = {name: tvm_ffi.from_dlpack(view) for name, view in args.items()}
+    args.update(
+        _decode_program_grid(
+            module,
+            module.program,
+            module.launch,
+            sm_count=sm_count,
+            num_splits=num_split,
+        )
+    )
+    return args, zero
+
+
+_DECODE_PROGRAM_VALUES["decode_smallm"] = _decode_smallm_program_values
+
+
 def select_cake_fmha_decode_route(
     device: torch.device,
     *,
@@ -2367,6 +2683,19 @@ def select_cake_fmha_decode_route(
             and float(bmm2_scale) == 1.0
             and (o_scale is None or float(o_scale) == 1.0)
         ):
+            smallm_program = _decode_smallm_program_select(
+                device,
+                n_rows=smallm_rows,
+                page_size=page_size,
+                q_len=q_len,
+                group=group,
+                tiles=smallm_tiles,
+                max_seq_len=max_seq_len,
+                num_split=smallm_num_split,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+            )
+            smallm_key, smallm_split = smallm_program or (None, smallm_num_split)
             candidate = CakeFmhaDecodeRoute(
                 target=_cake_fmha_target(device),
                 batch_size=batch_size,
@@ -2379,8 +2708,11 @@ def select_cake_fmha_decode_route(
                 retain_kv_l2=local_blocks <= 9,
                 component="decode_native_bf16_hd256_smallm",
                 page_size=page_size,
-                num_split=smallm_num_split,
+                num_split=smallm_split,
+                program=smallm_key,
             )
+            if smallm_key is not None:
+                return candidate
             return candidate if cake_fmha_route_is_optimized(candidate) else None
         if (
             query.is_contiguous()
