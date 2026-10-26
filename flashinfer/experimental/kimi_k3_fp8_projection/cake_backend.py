@@ -103,7 +103,7 @@ from .cake_jit import (
     quant_kernel_key,
     route_available,
 )
-from .decode_table import ARCHES, decode_table
+from .decode_table import ARCHES, decode_table, route_twins
 
 # ---------------------------------------------------------------------------
 # Fixed geometry of the generated programs
@@ -1464,7 +1464,7 @@ def gemm_gs_launch_pairs(
 
 
 def _gs_eligible(stem: str) -> bool:
-    """Whether a program stem has a static grid-stride form (round 11, CAKE-985 T6): the plain ``_k128`` / ``_n192_k128`` (or
+    """Whether a program stem has a static grid-stride form (round 11): the plain ``_k128`` / ``_n192_k128`` (or
     their ``_g64`` raster twins) TMA-store stems; never the 384-wide, staged-register or register-epilogue programs."""
     return (
         stem.startswith(GEMM_TSTORE_KERNEL_KEY)
@@ -2669,7 +2669,31 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
             tso_key = cfg.kernel_key_for(True)
             if tso_key not in keys and not cs_form:
                 keys.append(tso_key)
+    # the twin programs the architecture's cells take in place of the selected ones (``route_twins``)
+    for twins in route_twins(arch).values():
+        for twin in twins.values():
+            if twin not in keys:
+                keys.append(twin)
     return tuple(keys)
+
+
+def route_twin_keys(
+    kernels: tuple[str, ...] | list[str],
+    M: int,
+    n_tiles128: int,
+    num_k_iters: int,
+    arch: str,
+) -> tuple[str, ...]:
+    """The launched keys of a route: each selected key replaced by the twin its cell names on ``arch``
+    (``decode_table.route_twins``) when the twin's program is built for ``arch``, else kept."""
+    bucket = next((b for b in DECODE_TABLE_BUCKETS if b >= M), None)
+    if bucket is None:
+        return tuple(kernels)
+    twins = route_twins(arch).get(f"{int(n_tiles128)},{int(num_k_iters)},{bucket}", {})
+    return tuple(
+        twins[key] if key in twins and route_available(arch, (twins[key],)) else key
+        for key in kernels
+    )
 
 
 def _bucket_rows(bucket: int) -> tuple[int, ...]:
@@ -3436,6 +3460,9 @@ def route_plan(
             )  # the TMA-store program is not registered for this arch: register epilogue
         kernels.append(key)
         grids.append(cfg.grid)
+    kernels = list(
+        route_twin_keys(kernels, M, prepared.n_tiles128, prepared.num_k_iters, arch)
+    )
     return ProjectionPlan(
         arch=arch,
         sm_count=int(sm_count),

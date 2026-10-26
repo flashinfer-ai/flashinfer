@@ -60,10 +60,14 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # instantiation (``-DNAME=value``):
 #
 # * ``quant:u<units>``                 the per-token 1x128 E4M3 / UE8M0
-#   quantization launch; one program, ``units`` K blocks per half warp is the
-#   ``QUANT_UNITS`` define (the ``cake_backend.quant_units`` rule: 1 for
+#   quantization launch; ``units`` K blocks per half warp, passed to every
+#   ``quant:`` program as the ``QUANT_UNITS`` define (a generated program
+#   folds its own width in; the hand-folded unit reads the define; the
+#   ``cake_backend.quant_units`` rule: 1 for
 #   M <= 256, 2 / 4 for the large-M rows; or the width a measured table cell
-#   pins with ``quant_units``);
+#   pins with ``quant_units``); a ``quant:u<units>_xef_qel`` twin (the L2
+#   eviction-priority hints of ``decode_table.ROUTE_TWINS``) takes the same
+#   ``QUANT_UNITS``;
 # * ``gemm`` / ``gemm_rstaged`` / ``gemm_tstore``   the persistent 2-CTA
 #   block-scaled tcgen05 GEMM (256 output columns per CTA pair, M > 256) with
 #   the register, staged-register or TMA-store epilogue; the instance tokens
@@ -3280,7 +3284,7 @@ KERNELS: dict[str, dict[str, Any]] = {
     key: {
         "module": f"cake_kimi_k3_fp8_projection_{digest}",
         "defines": (
-            {"QUANT_UNITS": int(key.removeprefix("quant:u"))}
+            {"QUANT_UNITS": int(key.removeprefix("quant:u").split("_")[0])}
             if key.startswith("quant:u")
             else {}
         ),

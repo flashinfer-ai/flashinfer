@@ -28,9 +28,17 @@ limitations under the License.
 # narrow quantization units of the fused variant, optional ``acc_bufs`` TMEM
 # accumulator sets and ``epi_groups`` epilogue warp groups of the instance) or
 # "gemm" (quantization launch + persistent 2-CTA GEMM); a two-launch cell may
-# pin the width of its quantization launch (``quant_units``).  Generated from
-# the Cake measurement sweeps recorded in the source repository; do not edit
-# by hand.
+# pin the width of its quantization launch (``quant_units``).
+# ``ROUTE_TWINS`` holds, per architecture and cell, the twin programs a cell's
+# launches take instead of the program the table selects: ``{selected kernel
+# key: twin kernel key}``, the twin an instance of the same program with build
+# time changes that keep every output bit (the L2 eviction-priority hints
+# ``_wef`` / ``_xef`` of a decode program's weight / token stream, ``_bef`` of a
+# GEMM program's weight stream, ``_xef_qel`` of the quantization launch's
+# activation reads and hand-off stores), measured faster on that
+# architecture's rows of the cell; ``route_twins(arch)`` reads it.  Generated
+# from the Cake measurement sweeps recorded in the source repository; do not
+# edit by hand.
 
 from __future__ import annotations
 
@@ -1243,6 +1251,500 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
 }
 
 
+ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
+    "sm_100a": {
+        "1,28,512": {
+            "quant:u2": "quant:u2_xef_qel",
+        },
+        "1,28,2048": {
+            "decode:t64_p2_fused_w16_r2_xh_q8_cs4_xp": "decode:t64_p2_fused_w16_r2_xh_q8_cs4_xp_xef",
+        },
+        "1,28,4096": {
+            "decode:t32_p3_fused_r5_q4_tso": "decode:t32_p3_fused_r5_q4_tso_xef",
+        },
+        "1,28,16384": {
+            "decode:t64_p2_fused_w16_r3_xh_qe_q4_pf4_px1_tso_pi2": "decode:t64_p2_fused_w16_r3_xh_qe_q4_pf4_px1_tso_pi2_xef",
+            "decode:t64_p2_fused_w16_r3_xh_qe_q4_pf4_px1_pi2": "decode:t64_p2_fused_w16_r3_xh_qe_q4_pf4_px1_pi2_xef",
+        },
+        "5,28,64": {
+            "quant:u1": "quant:u1_xef_qel",
+        },
+        "5,28,256": {
+            "quant:u1": "quant:u1_xef_qel",
+        },
+        "5,28,512": {
+            "quant:u2": "quant:u2_xef_qel",
+        },
+        "5,28,1024": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "5,28,2048": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "5,28,4096": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "12,1,4096": {
+            "quant:u1": "quant:u1_xef_qel",
+        },
+        "12,28,256": {
+            "quant:u1": "quant:u1_xef_qel",
+        },
+        "12,28,512": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "12,28,1024": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "12,28,2048": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "12,28,4096": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "17,28,256": {
+            "quant:u1": "quant:u1_xef_qel",
+        },
+        "17,28,512": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "17,28,1024": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "17,28,2048": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "17,28,4096": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "18,6,256": {
+            "quant:u1": "quant:u1_xef_qel",
+        },
+        "18,6,512": {
+            "quant:u1": "quant:u1_xef_qel",
+        },
+        "18,6,1024": {
+            "quant:u2": "quant:u2_xef_qel",
+        },
+        "18,6,4096": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "24,2,1024": {
+            "quant:u1": "quant:u1_xef_qel",
+        },
+        "24,2,2048": {
+            "quant:u1": "quant:u1_xef_qel",
+        },
+        "24,2,4096": {
+            "quant:u2": "quant:u2_xef_qel",
+        },
+        "48,28,1": {
+            "decode:t16_p4_fused_cs2": "decode:t16_p4_fused_cs2_wef",
+        },
+        "48,28,8": {
+            "decode:t16_p4_fused_cs2": "decode:t16_p4_fused_cs2_wef",
+        },
+        "48,28,256": {
+            "quant:u1": "quant:u1_xef_qel",
+            "decode:t128_p3_mc2_pf3_tso": "decode:t128_p3_mc2_pf3_tso_wef",
+        },
+        "48,28,512": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "48,28,1024": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "48,28,2048": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "48,28,4096": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "50,28,1": {
+            "decode:t16_p4_fused_cs2": "decode:t16_p4_fused_cs2_wef",
+        },
+        "50,28,8": {
+            "decode:t16_p4_fused_cs2": "decode:t16_p4_fused_cs2_wef",
+        },
+        "50,28,64": {
+            "quant:u1": "quant:u1_xef_qel",
+        },
+        "50,28,256": {
+            "quant:u1": "quant:u1_xef_qel",
+            "decode:t128_p3_mc2_pf3": "decode:t128_p3_mc2_pf3_wef",
+        },
+        "50,28,512": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "50,28,1024": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "50,28,2048": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "50,28,4096": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "56,6,256": {
+            "quant:u1": "quant:u1_xef_qel",
+        },
+        "56,6,512": {
+            "quant:u1": "quant:u1_xef_qel",
+        },
+        "56,6,1024": {
+            "quant:u2": "quant:u2_xef_qel",
+        },
+        "56,6,4096": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "56,48,1": {
+            "decode:t16_p4_fused_cs2": "decode:t16_p4_fused_cs2_wef",
+        },
+        "56,48,8": {
+            "decode:t16_p4_fused_cs2": "decode:t16_p4_fused_cs2_wef",
+        },
+        "56,48,64": {
+            "quant:u1": "quant:u1_xef_qel",
+            "decode:t64_p4_cs2a": "decode:t64_p4_cs2a_wef",
+        },
+        "56,48,256": {
+            "quant:u4": "quant:u4_xef_qel",
+            "decode:t128_p3_mc2_pf3_tso": "decode:t128_p3_mc2_pf3_tso_wef",
+        },
+        "56,48,512": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "56,48,1024": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "56,48,2048": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "56,48,4096": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "96,28,1": {
+            "decode:t16_p4_fused": "decode:t16_p4_fused_wef",
+        },
+        "96,28,8": {
+            "decode:t16_p4_fused": "decode:t16_p4_fused_wef",
+        },
+        "96,28,64": {
+            "quant:u1": "quant:u1_xef_qel",
+            "decode:t64_p4_tso": "decode:t64_p4_tso_wef",
+        },
+        "96,28,256": {
+            "quant:u1": "quant:u1_xef_qel",
+            "gemm_tstore_n192_k128_pf2": "gemm_tstore_n192_k128_pf2_bef",
+        },
+        "96,28,512": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "96,28,1024": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "96,28,2048": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "144,6,1": {
+            "decode:t16_p3_fused": "decode:t16_p3_fused_wef",
+        },
+        "144,6,8": {
+            "decode:t16_p4_fused": "decode:t16_p4_fused_wef",
+        },
+        "144,6,64": {
+            "quant:u1": "quant:u1_xef_qel",
+            "decode:t64_p4_tso": "decode:t64_p4_tso_wef",
+        },
+        "144,6,256": {
+            "quant:u1": "quant:u1_xef_qel",
+            "gemm_tstore_k128": "gemm_tstore_k128_bef",
+        },
+        "144,6,512": {
+            "quant:u1": "quant:u1_xef_qel",
+        },
+        "144,6,1024": {
+            "quant:u2": "quant:u2_xef_qel",
+        },
+        "192,2,256": {
+            "quant:u1": "quant:u1_xef_qel",
+            "gemm_tstore_n192_k128": "gemm_tstore_n192_k128_bef",
+        },
+        "192,2,2048": {
+            "quant:u1": "quant:u1_xef_qel",
+        },
+        "384,28,1": {
+            "decode:t16_p4_fused": "decode:t16_p4_fused_wef",
+        },
+        "384,28,8": {
+            "decode:t16_p4_fused_pf1": "decode:t16_p4_fused_pf1_wef",
+        },
+        "384,28,64": {
+            "quant:u1": "quant:u1_xef_qel",
+            "decode:t64_p4_tso": "decode:t64_p4_tso_wef",
+        },
+        "384,28,256": {
+            "quant:u1": "quant:u1_xef_qel",
+            "gemm_tstore_skf_pf1": "gemm_tstore_skf_pf1_bef",
+        },
+        "386,28,1": {
+            "decode:t16_p4_fused": "decode:t16_p4_fused_wef",
+        },
+        "386,28,8": {
+            "decode:t16_p4_fused_pf1": "decode:t16_p4_fused_pf1_wef",
+        },
+        "386,28,64": {
+            "quant:u1": "quant:u1_xef_qel",
+            "decode:t64_p4": "decode:t64_p4_wef",
+        },
+        "386,28,256": {
+            "quant:u1": "quant:u1_xef_qel",
+            "gemm_tstore_skf_pf1": "gemm_tstore_skf_pf1_bef",
+        },
+    },
+    "sm_103a": {
+        "1,28,512": {
+            "quant:u2": "quant:u2_xef_qel",
+        },
+        "1,28,2048": {
+            "decode:t64_p2_fused_w16_r2_xh_q8_cs4_xp": "decode:t64_p2_fused_w16_r2_xh_q8_cs4_xp_xef",
+        },
+        "1,28,4096": {
+            "decode:t32_p3_fused_r5_q4_tso": "decode:t32_p3_fused_r5_q4_tso_xef",
+        },
+        "1,28,16384": {
+            "decode:t64_p2_fused_w16_r3_xh_qe_q4_pf4_px1_pi2": "decode:t64_p2_fused_w16_r3_xh_qe_q4_pf4_px1_pi2_xef",
+        },
+        "5,28,64": {
+            "quant:u1": "quant:u1_xef_qel",
+        },
+        "5,28,256": {
+            "quant:u1": "quant:u1_xef_qel",
+        },
+        "5,28,512": {
+            "quant:u2": "quant:u2_xef_qel",
+        },
+        "5,28,1024": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "5,28,2048": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "5,28,4096": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "12,1,4096": {
+            "quant:u1": "quant:u1_xef_qel",
+        },
+        "12,28,256": {
+            "quant:u1": "quant:u1_xef_qel",
+        },
+        "12,28,512": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "12,28,1024": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "12,28,2048": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "12,28,4096": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "17,28,64": {
+            "quant:u1": "quant:u1_xef_qel",
+            "decode:t64_p4": "decode:t64_p4_wef",
+        },
+        "17,28,256": {
+            "quant:u1": "quant:u1_xef_qel",
+        },
+        "17,28,512": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "17,28,1024": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "17,28,2048": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "17,28,4096": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "18,6,256": {
+            "quant:u1": "quant:u1_xef_qel",
+        },
+        "18,6,512": {
+            "quant:u2": "quant:u2_xef_qel",
+        },
+        "18,6,1024": {
+            "quant:u2": "quant:u2_xef_qel",
+        },
+        "18,6,2048": {
+            "quant:u2": "quant:u2_xef_qel",
+        },
+        "18,6,4096": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "24,2,512": {
+            "quant:u2": "quant:u2_xef_qel",
+        },
+        "24,2,1024": {
+            "quant:u1": "quant:u1_xef_qel",
+        },
+        "24,2,2048": {
+            "quant:u1": "quant:u1_xef_qel",
+        },
+        "24,2,4096": {
+            "quant:u2": "quant:u2_xef_qel",
+        },
+        "48,28,1": {
+            "decode:t16_p4_fused_cs2": "decode:t16_p4_fused_cs2_wef",
+        },
+        "48,28,8": {
+            "decode:t16_p4_fused_cs2": "decode:t16_p4_fused_cs2_wef",
+        },
+        "48,28,256": {
+            "quant:u1": "quant:u1_xef_qel",
+            "decode:t128_p3_mc2_pf3_tso": "decode:t128_p3_mc2_pf3_tso_wef",
+        },
+        "48,28,512": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "48,28,1024": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "48,28,2048": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "48,28,4096": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "50,28,1": {
+            "decode:t16_p4_fused_cs2": "decode:t16_p4_fused_cs2_wef",
+        },
+        "50,28,8": {
+            "decode:t16_p4_fused_cs2": "decode:t16_p4_fused_cs2_wef",
+        },
+        "50,28,256": {
+            "quant:u1": "quant:u1_xef_qel",
+            "decode:t128_p3_mc2_pf3": "decode:t128_p3_mc2_pf3_wef",
+        },
+        "50,28,512": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "50,28,1024": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "50,28,2048": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "50,28,4096": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "56,6,512": {
+            "quant:u1": "quant:u1_xef_qel",
+        },
+        "56,6,1024": {
+            "quant:u2": "quant:u2_xef_qel",
+        },
+        "56,6,4096": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "56,48,1": {
+            "decode:t16_p4_fused_cs2": "decode:t16_p4_fused_cs2_wef",
+        },
+        "56,48,8": {
+            "decode:t16_p4_fused_cs2": "decode:t16_p4_fused_cs2_wef",
+        },
+        "56,48,64": {
+            "quant:u1": "quant:u1_xef_qel",
+            "decode:t64_p4_a2_cs2a": "decode:t64_p4_a2_cs2a_wef",
+        },
+        "56,48,256": {
+            "quant:u2": "quant:u2_xef_qel",
+            "decode:t128_p3_mc2_pf3_tso": "decode:t128_p3_mc2_pf3_tso_wef",
+        },
+        "56,48,512": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "56,48,1024": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "56,48,2048": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "56,48,4096": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "96,28,1": {
+            "decode:t16_p4_fused_dpf": "decode:t16_p4_fused_dpf_wef",
+        },
+        "96,28,8": {
+            "decode:t16_p4_fused_dpf": "decode:t16_p4_fused_dpf_wef",
+        },
+        "96,28,64": {
+            "quant:u1": "quant:u1_xef_qel",
+            "decode:t64_p4_pf1_tso": "decode:t64_p4_pf1_tso_wef",
+        },
+        "96,28,256": {
+            "quant:u1": "quant:u1_xef_qel",
+            "gemm_tstore_n192_k128_pf2": "gemm_tstore_n192_k128_pf2_bef",
+        },
+        "96,28,1024": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "96,28,2048": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "96,28,4096": {
+            "quant:u4": "quant:u4_xef_qel",
+        },
+        "144,6,1": {
+            "decode:t16_p4_fused": "decode:t16_p4_fused_wef",
+        },
+        "144,6,8": {
+            "decode:t16_p4_fused": "decode:t16_p4_fused_wef",
+        },
+        "144,6,64": {
+            "quant:u1": "quant:u1_xef_qel",
+            "decode:t64_p4_tso": "decode:t64_p4_tso_wef",
+        },
+        "144,6,256": {
+            "quant:u1": "quant:u1_xef_qel",
+            "gemm_tstore_k128": "gemm_tstore_k128_bef",
+        },
+        "384,28,1": {
+            "decode:t16_p4_fused": "decode:t16_p4_fused_wef",
+        },
+        "384,28,8": {
+            "decode:t16_p4_fused_pf1": "decode:t16_p4_fused_pf1_wef",
+        },
+        "384,28,64": {
+            "quant:u1": "quant:u1_xef_qel",
+            "decode:t64_p4_tso": "decode:t64_p4_tso_wef",
+        },
+        "384,28,256": {
+            "quant:u1": "quant:u1_xef_qel",
+            "gemm_tstore_skf_pf1": "gemm_tstore_skf_pf1_bef",
+        },
+        "386,28,1": {
+            "decode:t16_p4_fused": "decode:t16_p4_fused_wef",
+        },
+        "386,28,8": {
+            "decode:t16_p4_fused_pf1": "decode:t16_p4_fused_pf1_wef",
+        },
+        "386,28,64": {
+            "quant:u1": "quant:u1_xef_qel",
+            "decode:t64_p4": "decode:t64_p4_wef",
+        },
+        "386,28,256": {
+            "quant:u1": "quant:u1_xef_qel",
+            "gemm_tstore_skf_pf1": "gemm_tstore_skf_pf1_bef",
+        },
+    },
+}
+
+
 @functools.cache
 def decode_table(arch: str) -> dict[str, dict[str, Any]]:
     """The measured table of ``arch``: the shared cells with the overrides of that architecture."""
@@ -1252,3 +1754,9 @@ def decode_table(arch: str) -> dict[str, dict[str, Any]]:
             f"no measured dispatch table for {arch!r} (tabulated: {ARCHES})"
         )
     return {**DECODE_TABLE, **overrides}
+
+
+def route_twins(arch: str) -> dict[str, dict[str, str]]:
+    """The twin programs of ``arch``: ``{cell: {selected kernel key: twin kernel key}}`` (none for an untabulated
+    architecture)."""
+    return ROUTE_TWINS.get(arch, {})

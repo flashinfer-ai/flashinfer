@@ -51,6 +51,7 @@ from flashinfer.experimental.kimi_k3_fp8_projection.decode_table import (
     DECODE_TABLE,
     DECODE_TABLE_OVERRIDES,
     decode_table,
+    route_twins,
 )
 from flashinfer.gemm import (
     allocate_kimi_k3_fp8_projection_workspace,
@@ -1012,15 +1013,19 @@ def test_decode_config_round6_continuation_rules(arch):
         }
         <= required
     )
+    # A route twin (``route_twins``: the L2-hint instance a cell launches in place of its key) stands for that key: the
+    # register twin of a TMA-store key is the selected key's, which the host keeps when the output is not aligned.
+    selected = {
+        twin: key for pairs in route_twins(arch).values() for key, twin in pairs.items()
+    }
+    plain = {selected.get(k, k) for k in required}
     assert not {
-        k
-        for k in required
-        if k.endswith("_tso") and k.removesuffix("_tso") not in required
+        k for k in plain if k.endswith("_tso") and k.removesuffix("_tso") not in plain
     }
     # ... including the TMA-store forms a lever token follows (``_tso_dpf``, ``_tso_pi<N>``): the register twin is the
     # key without its ``_tso`` token (the grammar-exact rule of the export's ``decode_register_twin``).
     assert not {
-        k for k in required if "_tso" in k and k.replace("_tso", "", 1) not in required
+        k for k in plain if "_tso" in k and k.replace("_tso", "", 1) not in plain
     }
     assert "decode:t16_p4_fused_cs14" not in required
     # Round 8 (pass 14): both programs of the sm_103a dpf cell are in its plan; sm_100a ships the plain pair of that cell
@@ -1807,18 +1812,48 @@ def test_required_kernel_keys_are_registered_when_programs_exist(arch):
             if key.startswith("quant:"):
                 quant_programs.add(name)
                 assert dict(defines) == {
-                    "QUANT_UNITS": int(key.removeprefix("quant:u"))
+                    "QUANT_UNITS": int(key.removeprefix("quant:u").split("_")[0])
                 }
             else:
                 assert defines == ()
-        # The three quantization widths are one program, specialized on the compile line.
-        assert len(quant_programs) == 1
+        # The quantization launch is one program per width and L2-hint form (the generated instances fold the
+        # width into the program), or, carried, one program specialized on the compile line.
+        quant_keys = [key for key in required if key.startswith("quant:")]
+        assert len(quant_programs) in (1, len(quant_keys))
         # The registry is the union of the per-architecture key maps (round 7): every architecture's required keys
         # are registered and no registered key is unused by every architecture.
         assert set(required) <= set(KERNELS)
         assert set(KERNELS) == set().union(
             *(required_kernel_keys(a, SM_COUNT) for a in ARCHES)
         )
+
+
+_ROUTE_TWIN_HINTS = ("_wef", "_xef", "_bef", "_xef_qel")
+
+
+@pytest.mark.parametrize("arch", ARCHES)
+def test_route_twins_are_registered_hint_instances(arch):
+    # ``decode_table.ROUTE_TWINS``: a cell's launch takes the L2-hint twin of the key the table selects -- the same
+    # key with one hint suffix (decode ``_wef`` / ``_xef``, GEMM ``_bef``, quantization ``_xef_qel``) -- on the
+    # architecture the twin was measured on; the twin is a required key, its program is registered for that
+    # architecture once generated, and a quantization twin compiles at its plain key's width.
+    required = set(required_kernel_keys(arch, SM_COUNT))
+    twins = route_twins(arch)
+    assert twins, f"{arch} routes no twin"
+    for cell, pairs in twins.items():
+        assert len(cell.split(",")) == 3, cell
+        for key, twin in pairs.items():
+            assert (
+                twin.startswith(key + "_") and twin[len(key) :] in _ROUTE_TWIN_HINTS
+            ), (cell, key, twin)
+            assert twin in required, (cell, twin)
+            if MODULES:
+                assert route_available(arch, (twin,)), (arch, twin)
+                if key.startswith("quant:"):
+                    assert dict(kernel_program(arch, twin)[1]) == dict(
+                        kernel_program(arch, key)[1]
+                    )
+    assert route_twins("sm_90a") == {}
 
 
 _PROGRAM_KERNEL_FLAG = "-DCAKE_PROGRAM_KERNEL="
@@ -1989,6 +2024,17 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
     )
     plan = runner.plan
     assert plan.route in ("decode", "gemm")
+    # The launched keys are the selected ones with the cell's route twins in place (``route_twin_keys``); the rest of the
+    # test checks the selected keys.
+    twin_of = {
+        twin: key
+        for pairs in route_twins(plan.arch).values()
+        for key, twin in pairs.items()
+    }
+    selected = [twin_of.get(k, k) for k in plan.kernels]
+    assert tuple(plan.kernels) == cb.route_twin_keys(
+        selected, M, _prepared.n_tiles128, _prepared.num_k_iters, plan.arch
+    )
     if plan.route == "gemm":
         aligned = cb.gemm_tma_store_eligible(
             _out.data_ptr(), _out.stride(0), _prepared.n_valid
@@ -2009,11 +2055,11 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
                 M, _prepared.n_tiles128, _prepared.num_k_iters, plan.arch
             )
             cs_stem = expected_kernel + "_n192_k128" + plan.gemm_cs.program_suffix
-            assert plan.kernels[-1] in (cb._pdlb_stem(cs_stem), cs_stem)
-            assert plan.gemm_pdlb == plan.kernels[-1].endswith("_pdlb")
+            assert selected[-1] in (cb._pdlb_stem(cs_stem), cs_stem)
+            assert plan.gemm_pdlb == selected[-1].endswith("_pdlb")
             assert (plan.gemm_bn, plan.gemm_bk) == (192, 128)
             assert plan.gemm_n_tiles == -(-_prepared.n_valid // 192)
-            assert runner.launch_count == 2 and plan.kernels[0].startswith("quant:u")
+            assert runner.launch_count == 2 and selected[0].startswith("quant:u")
             return
         # Round 6 (lever L5): the tabulated ``gemm_bn`` rows launch the 192-wide instance of the same epilogue over
         # ceil(n_valid / 192) N tiles; lever GP adds the prefetch distance of the tabulated aligned rows.
@@ -2175,7 +2221,7 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
             pdlb_key = cb.gemm_kernel_key(cb._pdlb_stem(full_stem), gpf)
             if cb.route_available(plan.arch, (pdlb_key,)):
                 expected_key = pdlb_key
-        assert plan.kernels[-1] == expected_key
+        assert selected[-1] == expected_key
         launched = expected_key.split("_pf")[0]
         assert plan.gemm_pdlb == launched.endswith("_pdlb")
         assert plan.gemm_static == launched.endswith("_st")
@@ -2218,13 +2264,13 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
             and cb.route_available(plan.arch, (tso_key,))
         )
         assert plan.decode_tma_store == expected_tma_store
-        assert plan.kernels[-1] == plan.decode.kernel_key_for(plan.decode_tma_store)
+        assert selected[-1] == plan.decode.kernel_key_for(plan.decode_tma_store)
         if stride_pad:
-            assert not plan.decode_tma_store and not plan.kernels[-1].endswith("_tso")
+            assert not plan.decode_tma_store and not selected[-1].endswith("_tso")
     if plan.route == "decode" and plan.decode.fused:
         assert runner.launch_count == 1
     else:
-        assert runner.launch_count == 2 and plan.kernels[0].startswith("quant:u")
+        assert runner.launch_count == 2 and selected[0].startswith("quant:u")
 
 
 def _workspace_sf_numel(runner) -> int:
