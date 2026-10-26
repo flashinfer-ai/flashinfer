@@ -686,6 +686,23 @@ def _paged_kv_split_bounds(
     return bounds
 
 
+def _kv_split_scratch(
+    total_q: int, heads: int, head_dim: int, o_dtype: torch.dtype, num_chunks: int
+) -> tuple:
+    """Shape, dtype and byte offset of the split's partial O, partial LSE and merged LSE in the float
+    workspace, and the bytes they span."""
+    rows = num_chunks * total_q
+    layout, offset = [], 0
+    for shape, dtype in (
+        ((rows, heads, head_dim), o_dtype),
+        ((rows, heads), torch.float32),
+        ((total_q, heads), torch.float32),
+    ):
+        layout.append((shape, dtype, offset))
+        offset += ceil_div(math.prod(shape) * dtype.itemsize, 256) * 256
+    return layout, offset
+
+
 def _gqa_pack_size(num_qo_heads: int, num_kv_heads: int, q_tile: int) -> int:
     """Largest power of two dividing both the GQA group and ``q_tile``."""
     group = num_qo_heads // num_kv_heads
@@ -915,6 +932,42 @@ class SM120PrimsBatchPrefillBackend:
             use_cuda_graph=use_cuda_graph,
         )
 
+    def paged_workspace_size(
+        self,
+        *,
+        qo_indptr_host: torch.Tensor,
+        seqlens_kv_host: torch.Tensor,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        o_dtype: torch.dtype,
+        page_size: int,
+        causal: bool,
+        fixed_split_size: int,
+        disable_split_kv: bool,
+        use_cuda_graph: bool,
+    ) -> int:
+        """Float workspace bytes the paged plan's K/V split needs; 0 when it does not split."""
+        if disable_split_kv or use_cuda_graph or head_dim < 64:
+            return 0
+        bounds = _paged_kv_split_bounds(
+            (qo_indptr_host[1:] - qo_indptr_host[:-1]).tolist(),
+            seqlens_kv_host.tolist(),
+            num_qo_heads,
+            causal,
+            128,
+            torch.cuda.get_device_properties(self.device).multi_processor_count,
+            fixed_split_size * page_size if fixed_split_size > 0 else 0,
+            1 << 30,
+            _gqa_pack_size(num_qo_heads, num_kv_heads, 128),
+        )
+        if bounds is None:
+            return 0
+        total_q = int(qo_indptr_host[-1].item())
+        return _kv_split_scratch(
+            total_q, num_qo_heads, head_dim, o_dtype, len(bounds[0]) - 1
+        )[1]
+
     def _plan_kv_split(
         self,
         *,
@@ -946,7 +999,17 @@ class SM120PrimsBatchPrefillBackend:
         heads, dim = self._num_qo_heads, self._head_dim
         # Per chunk: one partial O row and one LSE row per Q token; plus the merged LSE.
         chunk_bytes = total_q * heads * (dim * self._o_dtype.itemsize + 4)
-        free_bytes = float_workspace_buffer.nbytes - total_q * heads * 4 - 3 * 256
+        max_chunks = max(
+            (float_workspace_buffer.nbytes - total_q * heads * 4)
+            // max(chunk_bytes, 1),
+            1,
+        )
+        while (
+            max_chunks > 1
+            and _kv_split_scratch(total_q, heads, dim, self._o_dtype, max_chunks)[1]
+            > float_workspace_buffer.nbytes
+        ):
+            max_chunks -= 1
         bounds = _paged_kv_split_bounds(
             q_lens,
             kv_lens,
@@ -955,7 +1018,7 @@ class SM120PrimsBatchPrefillBackend:
             tile,
             torch.cuda.get_device_properties(self.device).multi_processor_count,
             fixed_split_size * self._page_size if fixed_split_size > 0 else 0,
-            max(free_bytes // max(chunk_bytes, 1), 1),
+            max_chunks,
             self._gqa_pack_size,
         )
         if bounds is None:
@@ -975,18 +1038,14 @@ class SM120PrimsBatchPrefillBackend:
             "kv_tile_ranges", tuple(ranges.shape), torch.int32
         )
         kv_tile_ranges.copy_(ranges, non_blocking=True)
-        rows = num_chunks * total_q
         workspace = float_workspace_buffer.reshape(-1).view(torch.uint8)
-        scratch = []
-        offset = 0
-        for shape, dtype in (
-            ((rows, heads, dim), self._o_dtype),
-            ((rows, heads), torch.float32),
-            ((total_q, heads), torch.float32),
-        ):
-            nbytes = math.prod(shape) * dtype.itemsize
-            scratch.append(workspace[offset : offset + nbytes].view(dtype).view(shape))
-            offset += ceil_div(nbytes, 256) * 256
+        layout, _ = _kv_split_scratch(total_q, heads, dim, self._o_dtype, num_chunks)
+        scratch = [
+            workspace[offset : offset + math.prod(shape) * dtype.itemsize]
+            .view(dtype)
+            .view(shape)
+            for shape, dtype, offset in layout
+        ]
         self._kv_split = SimpleNamespace(
             num_chunks=num_chunks,
             total_q=total_q,

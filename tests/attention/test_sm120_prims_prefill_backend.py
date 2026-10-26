@@ -482,6 +482,51 @@ def test_paged_kv_split_bounds():
         _paged_kv_split_bounds([64], [2112], 16, True, 128, 188, 128, 4, 8)
 
 
+def test_paged_workspace_size_fits_the_split():
+    hq, hkv, d, page_size, q_lens, kv_lens = 16, 2, 128, 16, [8, 64], [3000, 2112]
+    pages = [ceil_div(kv, page_size) for kv in kv_lens]
+    args = (
+        torch.tensor([0, *q_lens], device="cuda").cumsum(0, dtype=torch.int32),
+        torch.tensor([0, *pages], device="cuda").cumsum(0, dtype=torch.int32),
+        torch.arange(sum(pages), dtype=torch.int32, device="cuda"),
+        torch.tensor(
+            [kv - (p - 1) * page_size for kv, p in zip(kv_lens, pages, strict=True)],
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        hq,
+        hkv,
+        d,
+        page_size,
+    )
+    kwargs = dict(
+        causal=True,
+        q_data_type=torch.float8_e4m3fn,
+        kv_data_type=torch.float8_e4m3fn,
+        o_data_type=torch.bfloat16,
+    )
+    chunks = []
+    for size in (64 << 20, None):
+        workspace = torch.empty(size or 1, dtype=torch.uint8, device="cuda")
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            workspace, "HND", backend="cute-dsl-prims"
+        )
+        if size is None:
+            float_bytes, int_bytes = wrapper.workspace_size(*args, **kwargs)
+            assert float_bytes > 0 and int_bytes == 0
+            assert wrapper.workspace_size(*args, **kwargs, disable_split_kv=True) == (
+                0,
+                0,
+            )
+            wrapper.reset_workspace_buffer(
+                torch.empty(float_bytes, dtype=torch.uint8, device="cuda"),
+                torch.empty(1, dtype=torch.uint8, device="cuda"),
+            )
+        wrapper.plan(*args, **kwargs)
+        chunks.append(wrapper._prims_backend._kv_split.num_chunks)
+    assert chunks[0] == chunks[1] > 1
+
+
 def test_paged_fixed_split_is_batch_invariant():
     hq, hkv, d, page_size = 16, 2, 128, 16
     pages = [ceil_div(2112, page_size), ceil_div(9000, page_size)]

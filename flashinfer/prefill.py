@@ -3353,7 +3353,30 @@ class BatchPrefillWithPagedKVCacheWrapper:
         >>> wrapper.plan(...)
         """
         if self._backend == "cute-dsl-prims":
-            return (0, 0)
+            qo_indptr_host = qo_indptr.to("cpu")
+            if seq_lens is None:
+                kv_lens_arr_host = get_seq_lens(
+                    paged_kv_indptr.to("cpu"),
+                    paged_kv_last_page_len.to("cpu"),
+                    page_size,
+                )
+            else:
+                kv_lens_arr_host = seq_lens.cpu().flatten().to(torch.int32)
+            assert self._prims_backend is not None
+            float_bytes = self._prims_backend.paged_workspace_size(
+                qo_indptr_host=qo_indptr_host,
+                seqlens_kv_host=kv_lens_arr_host,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim_qk,
+                o_dtype=canonicalize_torch_dtype(o_data_type or q_data_type),
+                page_size=page_size,
+                causal=causal,
+                fixed_split_size=fixed_split_size or -1,
+                disable_split_kv=disable_split_kv,
+                use_cuda_graph=self._use_cuda_graph,
+            )
+            return (float_bytes, 0)
 
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
