@@ -46,16 +46,21 @@ outputs and workspace), ``cake_nosample`` (the same runner with
 ``sample_tiles_max=0``: the sampled first threshold off, same programs, same
 bits), ``cake_far`` (the same runner with ``far_sample=1``: the sampled first
 threshold ranks the far sample tiles only, same programs, same bits),
-``cake_wide`` / ``cake_l6`` / ``cake_pair_l6`` / ``cake_wide_c1`` and their
-``_nosample`` twins (forced dispatch: the local package under the device's
-registry record with a rule replaced -- ``cake_wide`` drops ``l6_rule`` and
-``pair_rule`` (the single-CTA wide program; ``pair_rule`` alone would name the
-unregistered ``pair_wide``), ``cake_l6`` drops ``pair_rule``, ``cake_pair_l6`` widens both to
-``[1024.0, 512]`` / ``[128.0, 1024.0, 512]``, ``cake_wide_c1`` drops
-both and takes the wide program from one round, ``wide_rule
-[1.0, 0.0]``, ``cake_narrow`` drops both and never qualifies for wide (the
-narrow program; only where ``narrow`` is registered for the row's fit); the recorded ``plan`` and workspace bytes are the forced
-policy's, see ``forced_policy``), ``cake_main`` / ``cake_main_nosample`` (a
+``cake_wide`` / ``cake_l6`` / ``cake_pair_l6`` / ``cake_wide_c1`` /
+``cake_narrow`` and their ``_nosample`` twins (forced
+dispatch: the local package under the device's registry record with a rule
+replaced -- ``cake_wide`` drops ``l6_rule`` and ``pair_rule`` (the
+single-CTA wide program on every architecture: the record's ``pair_units``
+gate keeps ``pair_for`` off the wide unit on ``sm_100a`` / ``sm_103a``, and
+the drop keeps the arm off the registered ``pair_wide`` on ``sm_107a`` too),
+``cake_l6`` drops ``pair_rule`` and the wide-first rule (``wide_first_rule``
+None), ``cake_pair_l6`` widens both unit rules to ``[1024.0, 512]`` /
+``[128.0, 1024.0, 512]`` with no wide-first rule, ``cake_wide_c1`` drops
+both and takes the wide program from one round, ``wide_rule [1.0, 0.0]``,
+``cake_narrow`` drops both and never qualifies for wide (the narrow program;
+only where ``narrow`` is registered for the row's fit); the recorded
+``plan`` and workspace bytes are the forced policy's, see
+``forced_policy``), ``cake_main`` / ``cake_main_nosample`` (a
 second copy of the package loaded from ``--main-package DIR``, e.g. the
 ``flashinfer/experimental/cake_dsa_indexer``
 directory of a FlashInfer main checkout, in the same process: the package is
@@ -763,11 +768,18 @@ class MaterializedArm(Arm):
 NOSAMPLE = {"sample_tiles_max": 0}
 FAR = {"far_sample": 1}
 # forced dispatch records: registry fields replaced through ``forced_policy`` (these arms run the local package only).
-# A record that drops ``l6_rule`` drops ``pair_rule`` too: ``pair_for`` ignores the kind, and ``pair_wide`` is registered on
-# sm_107a only (``program_for`` fails closed by name).
+# ``pair_for`` is gated by the record's ``pair_units`` (the units whose pair program the architecture registers), so a
+# record that drops ``l6_rule`` cannot compose the unregistered ``pair_wide`` on sm_100a / sm_103a; ``WIDE`` keeps dropping
+# ``pair_rule`` so the arm is the single-CTA wide program on sm_107a (which registers ``pair_wide``) as well.  The plain-l6
+# and reverse pair arms pin ``wide_first_rule`` to None: without the pin they would inherit an architecture's wide-first
+# precedence and run the wide program on every eligible row at or above its floor.
 WIDE = {"l6_rule": None, "pair_rule": None}
-L6 = {"pair_rule": None}
-PAIR_L6 = {"l6_rule": [1024.0, 512], "pair_rule": [128.0, 1024.0, 512]}
+L6 = {"pair_rule": None, "wide_first_rule": None}
+PAIR_L6 = {
+    "l6_rule": [1024.0, 512],
+    "pair_rule": [128.0, 1024.0, 512],
+    "wide_first_rule": None,
+}
 WIDE_C1 = {"l6_rule": None, "pair_rule": None, "wide_rule": [1.0, 0.0]}
 # forced narrow: no l6, no pair, and a wide rule no call can meet (the single-warpgroup narrow program on every row)
 NARROW = {"l6_rule": None, "pair_rule": None, "wide_rule": [1e18, 1e18]}
@@ -789,10 +801,12 @@ def _cake(name, backend=None, knobs=None, policy=None):
 # name -> factory(inputs) -> Arm.  ``cake_aa`` / ``cake_far_aa`` / ``cake_main_aa`` prepare the same arm a second time (the
 # in-process A/A band); the ``_nosample`` arms run the same programs with the sampled first threshold off, ``cake_far`` with
 # the far-sample first threshold (``far_sample=1``; the main package has no such knob, so the arm has no main twin).  The
-# forced-dispatch arms (``cake_wide`` / ``cake_l6`` / ``cake_pair_l6`` / ``cake_wide_c1`` and their ``_nosample`` twins) run
-# the local package under a replaced dispatch rule -- ``cake_wide`` without the three-warpgroup and CTA-pair rules (the
-# single-CTA wide program), ``cake_l6`` without the CTA-pair rule, ``cake_pair_l6`` with both widened to 1024 mean unit tiles, ``cake_wide_c1`` the wide program from one
-# round -- so the same bits are expected against ``cake`` / ``cake_nosample`` while the programs (``plan``) differ.
+# forced-dispatch arms (``cake_wide`` / ``cake_l6`` / ``cake_pair_l6`` / ``cake_wide_c1`` / ``cake_narrow`` and their
+# ``_nosample`` twins) run the local package under a replaced dispatch rule -- ``cake_wide`` without the three-warpgroup
+# and CTA-pair rules (the single-CTA wide program), ``cake_l6`` without the CTA-pair and wide-first rules,
+# ``cake_pair_l6`` with both unit rules widened to 1024 mean unit tiles and no wide-first rule, ``cake_wide_c1`` the wide
+# program from one round, ``cake_narrow`` the narrow program -- so the same bits are expected against ``cake`` /
+# ``cake_nosample`` while the programs (``plan``) differ.
 ARMS = {
     "cake": _cake("cake"),
     "cake_nosample": _cake("cake_nosample", knobs=NOSAMPLE),
@@ -815,7 +829,9 @@ ARMS = {
         "cake_wide_c1_nosample", knobs=NOSAMPLE, policy=WIDE_C1
     ),
     "cake_narrow": _cake("cake_narrow", policy=NARROW),
-    "cake_narrow_nosample": _cake("cake_narrow_nosample", knobs=NOSAMPLE, policy=NARROW),
+    "cake_narrow_nosample": _cake(
+        "cake_narrow_nosample", knobs=NOSAMPLE, policy=NARROW
+    ),
     ChunkedPipelineArm.name: ChunkedPipelineArm,
     MaterializedArm.name: MaterializedArm,
 }
