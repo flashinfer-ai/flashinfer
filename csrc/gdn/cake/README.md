@@ -73,6 +73,15 @@ with per-variant SASS equivalence checks against the generated originals.
 embeds it into the rendered host shim, and resolves requests to exactly one
 listed variant; requests outside the listed routes fail closed.
 
+Two more body-sharing `-D` knobs join `CAKE_GDN_KERNEL_SYMBOL` and `LAUNCH_MIN_BLOCKS`:
+`CAKE_GDN_METADATA_I64` (default 0 in-file) selects, inside the eight shared prefill bodies, the int32-or-int64 reads of
+`cu_seqlens` / `state_indices` / `checkpoint_cu_starts` and the `int metadata_i64_mask` kernel parameter (after `total_tiles`)
+(`CAKE_GDN_METADATA_I64_PARAM`); the SM107a `metadata_i64` records pass `-DCAKE_GDN_METADATA_I64=1` and their own
+kernel symbol and compile the same body as their SM100a/SM103a base record.  `CAKE_GDN_FP8_X2` (default `e4m3x2`)
+names the FP8 pair type inside the `cvt` instructions of the FP8-state bodies; the e5m2 records pass
+`-DCAKE_GDN_FP8_X2=e5m2x2`.  Expanding a shared body with a record's defines reproduces the former per-record file
+token for token (the e5m2 arm up to the names of a few local variables), under the per-variant SASS equivalence checks against the generated originals.
+
 ## Contracts
 
 Indexed prefill requires every state slot to be in `[0, pool_size)`.

@@ -2447,6 +2447,19 @@
         "sm_100a",
         "sm_103a"
       ],
+      "defines": {
+        "CAKE_GDN_FP8_X2": "e5m2x2",
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_97add81e1039502fa13c",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "-1",
+        "IS_GQA": "1",
+        "NUM_O_HEADS_LOG2": "-1",
+        "SINGLE_CHUNK_NO_STATE": "0",
+        "STORE_FINAL_STATE": "1",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "1",
+        "USE_STATE_INDICES": "0"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_97add81e1039502fa13c",
@@ -2468,7 +2481,7 @@
             "sm_100a",
             "sm_103a"
           ],
-          "path": "cuda/cake_gdn_prefill_dvsplit_initial_e5m2state_33ae9c957bbb.cu"
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_e4m3state_f7dcb3340ddf.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_e5m2state",
@@ -2490,6 +2503,19 @@
         "sm_100a",
         "sm_103a"
       ],
+      "defines": {
+        "CAKE_GDN_FP8_X2": "e5m2x2",
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_97add81e1039502fa13c",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "0",
+        "IS_GQA": "1",
+        "NUM_O_HEADS_LOG2": "0",
+        "SINGLE_CHUNK_NO_STATE": "0",
+        "STORE_FINAL_STATE": "1",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "1",
+        "USE_STATE_INDICES": "0"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_97add81e1039502fa13c",
@@ -2515,7 +2541,7 @@
             "sm_100a",
             "sm_103a"
           ],
-          "path": "cuda/cake_gdn_prefill_dvsplit_initial_e5m2state_33ae9c957bbb.cu"
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_e4m3state_f7dcb3340ddf.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_e5m2state",
@@ -2537,6 +2563,19 @@
         "sm_100a",
         "sm_103a"
       ],
+      "defines": {
+        "CAKE_GDN_FP8_X2": "e5m2x2",
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_97add81e1039502fa13c",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "1",
+        "IS_GQA": "0",
+        "NUM_O_HEADS_LOG2": "5",
+        "SINGLE_CHUNK_NO_STATE": "0",
+        "STORE_FINAL_STATE": "1",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "1",
+        "USE_STATE_INDICES": "0"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_97add81e1039502fa13c",
@@ -2562,7 +2601,7 @@
             "sm_100a",
             "sm_103a"
           ],
-          "path": "cuda/cake_gdn_prefill_dvsplit_initial_e5m2state_33ae9c957bbb.cu"
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_e4m3state_f7dcb3340ddf.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_e5m2state",
@@ -12062,6 +12101,19 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_FP8_X2": "e5m2x2",
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_d67b5888dbcd509ae4aa",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "-1",
+        "IS_GQA": "1",
+        "NUM_O_HEADS_LOG2": "-1",
+        "SINGLE_CHUNK_NO_STATE": "0",
+        "STORE_FINAL_STATE": "1",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "1",
+        "USE_STATE_INDICES": "0"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_d67b5888dbcd509ae4aa",
@@ -12083,7 +12135,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_d67b5888dbcd509ae4aa_0bcc66055bd7.cu"
+          "path": "cuda/cake_gdn_19766579e3e931205229_adfec3c187aa.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_e5m2state_sm107a_st8s_pack",
@@ -12104,6 +12156,19 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_FP8_X2": "e5m2x2",
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_d67b5888dbcd509ae4aa",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "0",
+        "IS_GQA": "1",
+        "NUM_O_HEADS_LOG2": "0",
+        "SINGLE_CHUNK_NO_STATE": "0",
+        "STORE_FINAL_STATE": "1",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "1",
+        "USE_STATE_INDICES": "0"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_d67b5888dbcd509ae4aa",
@@ -12129,7 +12194,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_d67b5888dbcd509ae4aa_0bcc66055bd7.cu"
+          "path": "cuda/cake_gdn_19766579e3e931205229_adfec3c187aa.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_e5m2state_sm107a_st8s_pack",
@@ -12150,6 +12215,19 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_FP8_X2": "e5m2x2",
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_d67b5888dbcd509ae4aa",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "1",
+        "IS_GQA": "0",
+        "NUM_O_HEADS_LOG2": "5",
+        "SINGLE_CHUNK_NO_STATE": "0",
+        "STORE_FINAL_STATE": "1",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "1",
+        "USE_STATE_INDICES": "0"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_d67b5888dbcd509ae4aa",
@@ -12175,7 +12253,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_d67b5888dbcd509ae4aa_0bcc66055bd7.cu"
+          "path": "cuda/cake_gdn_19766579e3e931205229_adfec3c187aa.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_e5m2state_sm107a_st8s_pack",
@@ -13553,6 +13631,19 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_81f6078141927139f711",
+        "CAKE_GDN_METADATA_I64": "1",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "1",
+        "IS_GQA": "0",
+        "NUM_O_HEADS_LOG2": "3",
+        "SINGLE_CHUNK_NO_STATE": "1",
+        "STORE_FINAL_STATE": "0",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "0",
+        "USE_STATE_INDICES": "0"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_81f6078141927139f711",
@@ -13575,7 +13666,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_81f6078141927139f711_642f060f04cb.cu"
+          "path": "cuda/cake_gdn_prefill_dvsplit_single_chunk_aeafc8d7c738.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_single_chunk_sm107a_i64meta",
@@ -13995,6 +14086,19 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_fb63be2ac831313de494",
+        "CAKE_GDN_METADATA_I64": "1",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "2",
+        "IS_GQA": "0",
+        "NUM_O_HEADS_LOG2": "6",
+        "SINGLE_CHUNK_NO_STATE": "0",
+        "STORE_FINAL_STATE": "1",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "0",
+        "USE_STATE_INDICES": "0"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_fb63be2ac831313de494",
@@ -14020,7 +14124,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_fb63be2ac831313de494_0ef2a0a2c022.cu"
+          "path": "cuda/cake_gdn_prefill_f16io_8b89a285a74a.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_f16io_sm107a_i64meta",
@@ -14041,6 +14145,19 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_af2317b5bf278d4938d9",
+        "CAKE_GDN_METADATA_I64": "1",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "2",
+        "IS_GQA": "0",
+        "NUM_O_HEADS_LOG2": "6",
+        "SINGLE_CHUNK_NO_STATE": "0",
+        "STORE_FINAL_STATE": "0",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "0",
+        "USE_STATE_INDICES": "0"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_af2317b5bf278d4938d9",
@@ -14063,7 +14180,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_af2317b5bf278d4938d9_531b9251a7f0.cu"
+          "path": "cuda/cake_gdn_prefill_f16io_9529d21f4f2f.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_f16io_sm107a_i64meta",
@@ -14084,6 +14201,19 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_fb63be2ac831313de494",
+        "CAKE_GDN_METADATA_I64": "1",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "1",
+        "IS_GQA": "0",
+        "NUM_O_HEADS_LOG2": "5",
+        "SINGLE_CHUNK_NO_STATE": "0",
+        "STORE_FINAL_STATE": "1",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "0",
+        "USE_STATE_INDICES": "0"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_fb63be2ac831313de494",
@@ -14109,7 +14239,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_fb63be2ac831313de494_0ef2a0a2c022.cu"
+          "path": "cuda/cake_gdn_prefill_f16io_8b89a285a74a.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_f16io_sm107a_i64meta",
@@ -14360,6 +14490,19 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_e79b2c2b9b9843fcd44a",
+        "CAKE_GDN_METADATA_I64": "1",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "1",
+        "IS_GQA": "0",
+        "NUM_O_HEADS_LOG2": "3",
+        "SINGLE_CHUNK_NO_STATE": "0",
+        "STORE_FINAL_STATE": "1",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "1",
+        "USE_STATE_INDICES": "0"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_e79b2c2b9b9843fcd44a",
@@ -14385,7 +14528,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_e79b2c2b9b9843fcd44a_21562b3bd6cc.cu"
+          "path": "cuda/cake_gdn_5ddc80f0469f08b3e82e_061a148a4800.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_initial_bf16state_sm107a_i64meta",
@@ -14406,6 +14549,19 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_e79b2c2b9b9843fcd44a",
+        "CAKE_GDN_METADATA_I64": "1",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "1",
+        "IS_GQA": "0",
+        "NUM_O_HEADS_LOG2": "5",
+        "SINGLE_CHUNK_NO_STATE": "0",
+        "STORE_FINAL_STATE": "1",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "1",
+        "USE_STATE_INDICES": "0"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_e79b2c2b9b9843fcd44a",
@@ -14431,7 +14587,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_e79b2c2b9b9843fcd44a_21562b3bd6cc.cu"
+          "path": "cuda/cake_gdn_5ddc80f0469f08b3e82e_061a148a4800.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_initial_bf16state_sm107a_i64meta",
@@ -14452,6 +14608,19 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_e79b2c2b9b9843fcd44a",
+        "CAKE_GDN_METADATA_I64": "1",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "2",
+        "IS_GQA": "0",
+        "NUM_O_HEADS_LOG2": "5",
+        "SINGLE_CHUNK_NO_STATE": "0",
+        "STORE_FINAL_STATE": "1",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "1",
+        "USE_STATE_INDICES": "0"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_e79b2c2b9b9843fcd44a",
@@ -14477,7 +14646,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_e79b2c2b9b9843fcd44a_21562b3bd6cc.cu"
+          "path": "cuda/cake_gdn_5ddc80f0469f08b3e82e_061a148a4800.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_initial_bf16state_sm107a_i64meta",
@@ -14498,6 +14667,19 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_dc42f96f83a18276d510",
+        "CAKE_GDN_METADATA_I64": "1",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "0",
+        "IS_GQA": "1",
+        "NUM_O_HEADS_LOG2": "5",
+        "SINGLE_CHUNK_NO_STATE": "0",
+        "STORE_FINAL_STATE": "1",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "1",
+        "USE_STATE_INDICES": "1"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_dc42f96f83a18276d510",
@@ -14519,7 +14701,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_dc42f96f83a18276d510_82911e39ebeb.cu"
+          "path": "cuda/cake_gdn_prefill_initial_bf16state_indexed_7403a890b8b9.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_initial_bf16state_sm107a_i64meta",
@@ -14540,6 +14722,19 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_e79b2c2b9b9843fcd44a",
+        "CAKE_GDN_METADATA_I64": "1",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "2",
+        "IS_GQA": "0",
+        "NUM_O_HEADS_LOG2": "4",
+        "SINGLE_CHUNK_NO_STATE": "0",
+        "STORE_FINAL_STATE": "1",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "1",
+        "USE_STATE_INDICES": "0"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_e79b2c2b9b9843fcd44a",
@@ -14565,7 +14760,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_e79b2c2b9b9843fcd44a_21562b3bd6cc.cu"
+          "path": "cuda/cake_gdn_5ddc80f0469f08b3e82e_061a148a4800.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_initial_bf16state_sm107a_i64meta",
@@ -14586,6 +14781,19 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_e79b2c2b9b9843fcd44a",
+        "CAKE_GDN_METADATA_I64": "1",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "1",
+        "IS_GQA": "0",
+        "NUM_O_HEADS_LOG2": "4",
+        "SINGLE_CHUNK_NO_STATE": "0",
+        "STORE_FINAL_STATE": "1",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "1",
+        "USE_STATE_INDICES": "0"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_e79b2c2b9b9843fcd44a",
@@ -14611,7 +14819,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_e79b2c2b9b9843fcd44a_21562b3bd6cc.cu"
+          "path": "cuda/cake_gdn_5ddc80f0469f08b3e82e_061a148a4800.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_initial_bf16state_sm107a_i64meta",
@@ -14632,6 +14840,19 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_e79b2c2b9b9843fcd44a",
+        "CAKE_GDN_METADATA_I64": "1",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "2",
+        "IS_GQA": "0",
+        "NUM_O_HEADS_LOG2": "3",
+        "SINGLE_CHUNK_NO_STATE": "0",
+        "STORE_FINAL_STATE": "1",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "1",
+        "USE_STATE_INDICES": "0"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_e79b2c2b9b9843fcd44a",
@@ -14657,7 +14878,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_e79b2c2b9b9843fcd44a_21562b3bd6cc.cu"
+          "path": "cuda/cake_gdn_5ddc80f0469f08b3e82e_061a148a4800.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_initial_bf16state_sm107a_i64meta",
@@ -14678,6 +14899,19 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
+        "CAKE_GDN_METADATA_I64": "1",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "2",
+        "IS_GQA": "0",
+        "NUM_O_HEADS_LOG2": "5",
+        "SINGLE_CHUNK_NO_STATE": "0",
+        "STORE_FINAL_STATE": "1",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "1",
+        "USE_STATE_INDICES": "0"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
@@ -14703,7 +14937,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_120e913d5466.cu"
+          "path": "cuda/cake_gdn_prefill_initial_f16io_85046d4a9c55.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_initial_f16io_sm107a_i64meta",
@@ -14724,6 +14958,19 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
+        "CAKE_GDN_METADATA_I64": "1",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "1",
+        "IS_GQA": "0",
+        "NUM_O_HEADS_LOG2": "5",
+        "SINGLE_CHUNK_NO_STATE": "0",
+        "STORE_FINAL_STATE": "1",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "1",
+        "USE_STATE_INDICES": "0"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
@@ -14749,7 +14996,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_120e913d5466.cu"
+          "path": "cuda/cake_gdn_prefill_initial_f16io_85046d4a9c55.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_initial_f16io_sm107a_i64meta",
@@ -14770,6 +15017,19 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
+        "CAKE_GDN_METADATA_I64": "1",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "2",
+        "IS_GQA": "0",
+        "NUM_O_HEADS_LOG2": "4",
+        "SINGLE_CHUNK_NO_STATE": "0",
+        "STORE_FINAL_STATE": "1",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "1",
+        "USE_STATE_INDICES": "0"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
@@ -14795,7 +15055,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_120e913d5466.cu"
+          "path": "cuda/cake_gdn_prefill_initial_f16io_85046d4a9c55.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_initial_f16io_sm107a_i64meta",
@@ -14816,6 +15076,19 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
+        "CAKE_GDN_METADATA_I64": "1",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "-1",
+        "IS_GQA": "0",
+        "NUM_O_HEADS_LOG2": "-1",
+        "SINGLE_CHUNK_NO_STATE": "0",
+        "STORE_FINAL_STATE": "1",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "1",
+        "USE_STATE_INDICES": "0"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
@@ -14834,7 +15107,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_120e913d5466.cu"
+          "path": "cuda/cake_gdn_prefill_initial_f16io_85046d4a9c55.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_initial_f16io_sm107a_i64meta",
@@ -14855,6 +15128,19 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
+        "CAKE_GDN_METADATA_I64": "1",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "2",
+        "IS_GQA": "0",
+        "NUM_O_HEADS_LOG2": "3",
+        "SINGLE_CHUNK_NO_STATE": "0",
+        "STORE_FINAL_STATE": "1",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "1",
+        "USE_STATE_INDICES": "0"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
@@ -14880,7 +15166,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_120e913d5466.cu"
+          "path": "cuda/cake_gdn_prefill_initial_f16io_85046d4a9c55.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_initial_f16io_sm107a_i64meta",
@@ -14901,6 +15187,19 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
+        "CAKE_GDN_METADATA_I64": "1",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "0",
+        "IS_GQA": "1",
+        "NUM_O_HEADS_LOG2": "4",
+        "SINGLE_CHUNK_NO_STATE": "0",
+        "STORE_FINAL_STATE": "1",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "1",
+        "USE_STATE_INDICES": "0"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
@@ -14926,7 +15225,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_120e913d5466.cu"
+          "path": "cuda/cake_gdn_prefill_initial_f16io_85046d4a9c55.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_initial_f16io_sm107a_i64meta",
@@ -14947,6 +15246,19 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
+        "CAKE_GDN_METADATA_I64": "1",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "2",
+        "IS_GQA": "0",
+        "NUM_O_HEADS_LOG2": "6",
+        "SINGLE_CHUNK_NO_STATE": "0",
+        "STORE_FINAL_STATE": "1",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "1",
+        "USE_STATE_INDICES": "0"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
@@ -14972,7 +15284,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_120e913d5466.cu"
+          "path": "cuda/cake_gdn_prefill_initial_f16io_85046d4a9c55.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_initial_f16io_sm107a_i64meta",
@@ -14993,6 +15305,19 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
+        "CAKE_GDN_METADATA_I64": "1",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "0",
+        "IS_GQA": "1",
+        "NUM_O_HEADS_LOG2": "5",
+        "SINGLE_CHUNK_NO_STATE": "0",
+        "STORE_FINAL_STATE": "1",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "1",
+        "USE_STATE_INDICES": "0"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_2b64b167aeacd18e9b2b",
@@ -15018,7 +15343,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_2b64b167aeacd18e9b2b_120e913d5466.cu"
+          "path": "cuda/cake_gdn_prefill_initial_f16io_85046d4a9c55.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_initial_f16io_sm107a_i64meta",
@@ -15545,6 +15870,19 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_fc9cf7c2efad0b3e2b5c",
+        "CAKE_GDN_METADATA_I64": "1",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "2",
+        "IS_GQA": "0",
+        "NUM_O_HEADS_LOG2": "6",
+        "SINGLE_CHUNK_NO_STATE": "0",
+        "STORE_FINAL_STATE": "1",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "0",
+        "USE_STATE_INDICES": "0"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_fc9cf7c2efad0b3e2b5c",
@@ -15570,7 +15908,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_fc9cf7c2efad0b3e2b5c_9159caed76d4.cu"
+          "path": "cuda/cake_gdn_prefill_ce14e99a4019.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_sm107a_i64meta",
@@ -15591,6 +15929,19 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_fc9cf7c2efad0b3e2b5c",
+        "CAKE_GDN_METADATA_I64": "1",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "1",
+        "IS_GQA": "0",
+        "NUM_O_HEADS_LOG2": "5",
+        "SINGLE_CHUNK_NO_STATE": "0",
+        "STORE_FINAL_STATE": "1",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "0",
+        "USE_STATE_INDICES": "0"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_fc9cf7c2efad0b3e2b5c",
@@ -15616,7 +15967,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_fc9cf7c2efad0b3e2b5c_9159caed76d4.cu"
+          "path": "cuda/cake_gdn_prefill_ce14e99a4019.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_sm107a_i64meta",
@@ -15637,6 +15988,19 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_0e079833a6566367c2e5",
+        "CAKE_GDN_METADATA_I64": "1",
+        "ENABLE_CHECKPOINTS": "0",
+        "HEAD_GROUP_LOG2": "2",
+        "IS_GQA": "0",
+        "NUM_O_HEADS_LOG2": "6",
+        "SINGLE_CHUNK_NO_STATE": "0",
+        "STORE_FINAL_STATE": "0",
+        "UNIT_GATES": "0",
+        "USE_INITIAL_STATE": "0",
+        "USE_STATE_INDICES": "0"
+      },
       "domain": "prefill",
       "host_binding": {
         "cuda_symbol": "kernel_cake_gdn_0e079833a6566367c2e5",
@@ -15659,7 +16023,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_0e079833a6566367c2e5_15be5b78a377.cu"
+          "path": "cuda/cake_gdn_prefill_3854c6922d55.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_sm107a_i64meta",
