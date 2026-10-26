@@ -263,7 +263,8 @@ def test_m128_ring_overlay_rows():
 def test_chain_entry_prefetch_rows():
     # The quantize + GEMM chain runs the entry L2 prefetch program (``_ep4``) of the GEMM
     # plan exactly on the cells of CHAIN_EP_RULES (program family and token count per
-    # architecture); the GEMM alone never does, and the prefetch keeps the plan's grid.
+    # architecture); the default-tactic plan never does (the GEMM alone takes it only on
+    # the GEMM_ALONE_EP_RULES cells), and the prefetch keeps the plan's grid.
     for arch, cells in cb.CHAIN_EP_RULES.items():
         sm_count = cb.MEASURED_SM_COUNT[arch]
         served = set()
@@ -305,6 +306,49 @@ def test_chain_entry_prefetch_rows():
             148,
             tactic={**cb.default_tactic(512, 8192, 8192, 148), "ep_stages": 4},
         )
+
+
+def test_gemm_alone_entry_prefetch_rows():
+    # The GEMM alone runs the entry L2 prefetch program exactly on the cells of
+    # GEMM_ALONE_EP_RULES, each inside a CHAIN_EP_RULES cell, with the plan's grid.
+    for arch, cells in cb.GEMM_ALONE_EP_RULES.items():
+        for family, (lo, hi) in cells.items():
+            chain = cb.CHAIN_EP_RULES[arch][family]
+            assert chain[0] <= lo <= hi <= chain[1], (arch, family)
+        sm_count = cb.MEASURED_SM_COUNT[arch]
+        served = set()
+        for k, n in VALIDATED_GEMM_FAMILIES:
+            for m in _EDGE_M:
+                for out_f16 in (False, True):
+                    plan = cb.gemm_plan(m, n, k, out_f16, arch, sm_count)
+                    if plan.kernel_key not in KERNELS[arch]:
+                        continue
+                    family = "_".join(
+                        p
+                        for p in plan.kernel_key.removeprefix("gemm:").split("_")
+                        if p not in ("bf16", "f16")
+                    )
+                    cell = cells.get(family)
+                    inside = cell is not None and cell[0] <= m <= cell[1]
+                    tactic = cb.gemm_alone_tactic(plan)
+                    assert (tactic is not None) == inside, (arch, m, n, k, out_f16)
+                    if tactic is None:
+                        continue
+                    assert tactic == cb.chain_gemm_tactic(plan)
+                    alone = _registered(
+                        cb.gemm_plan(m, n, k, out_f16, arch, sm_count, tactic=tactic),
+                        arch,
+                    )
+                    assert alone.kernel_key == plan.kernel_key + "_ep4"
+                    assert (alone.grid, alone.num_tiles) == (plan.grid, plan.num_tiles)
+                    served.add(family)
+        assert served == set(cells), (arch, sorted(set(cells) - served))
+    for arch in cb.MEASURED_SM_COUNT:
+        if arch not in cb.GEMM_ALONE_EP_RULES:
+            plan = cb.gemm_plan(
+                128, 8192, 8192, False, arch, cb.MEASURED_SM_COUNT[arch]
+            )
+            assert cb.gemm_alone_tactic(plan) is None
 
 
 def test_n16_split3_rows():
@@ -842,6 +886,54 @@ def test_chain_entry_prefetch_matches_gemm_alone(m, n, k, out_dtype):
     assert torch.equal(out, alone)
     ref = _dequantize(ws.fp4, ws.sf) @ _dequantize(w_fp4, w_sf).T
     _assert_matches(out, ref * ws.scale[:, None])
+
+
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("n,k", [(8192, 8192), (7168, 16384)])
+def test_gemm_alone_entry_prefetch_matches_plain_program(n, k, out_dtype):
+    # On a GEMM_ALONE_EP_RULES cell mm_fp4 and the prepared GEMM run the entry L2 prefetch
+    # program, bitwise equal to the plain program of the same plan.
+    device = _require_program()
+    m = 128
+    _, _, a_fp4, a_sf, alpha, w_fp4, w_sf, _, _ = _operands(
+        m, n, k, torch.bfloat16, device, seed=400 + n
+    )
+    plan = cb.gemm_plan(
+        m,
+        n,
+        k,
+        out_dtype == torch.float16,
+        cb._device_arch(device),
+        cb._sm_count(device),
+    )
+    if cb.gemm_alone_tactic(plan) is None:
+        pytest.skip(f"{plan.kernel_key} has no GEMM-alone prefetch cell on this part")
+    a_u8, w_u8 = a_fp4.view(torch.uint8), w_fp4.view(torch.uint8)
+    out = torch.full((m, n), float("nan"), dtype=out_dtype, device=device)
+    runner = cb.prepare_mm_fp4_per_token(a_u8, a_sf, w_u8, w_sf, alpha, out)
+    assert runner.plan.kernel_key == plan.kernel_key + "_ep4"
+    runner()
+    plain = torch.full_like(out, float("nan"))
+    cb.prepare_mm_fp4_per_token(
+        a_u8, a_sf, w_u8, w_sf, alpha, plain, tactic=plan.tactic
+    )()
+    public = mm_fp4(
+        a_fp4,
+        w_fp4.T,
+        a_sf,
+        w_sf.T,
+        alpha,
+        out_dtype,
+        None,
+        block_size=16,
+        use_8x4_sf_layout=False,
+        backend="cake",
+        use_nvfp4=True,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out, plain) and torch.equal(public, plain)
+    ref = (_dequantize(a_fp4, a_sf) @ _dequantize(w_fp4, w_sf).T) * alpha[:, None]
+    _assert_matches(out, ref)
 
 
 @pytest.mark.parametrize("m", [9, 12, 16])
