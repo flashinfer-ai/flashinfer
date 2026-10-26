@@ -1048,35 +1048,36 @@ def test_prefill_scales_capture_replay(paged, scale_type, dtype):
 
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
-@pytest.mark.parametrize("tensor_scales", [False, True])
-def test_paged_auto_preserves_runtime_scales(tensor_scales):
+@pytest.mark.parametrize(
+    "q_lengths,kv_lengths",
+    [([128], [8192]), ([1024, 1536], [1024, 1536]), ([128, 1536], [1024, 1536])],
+    ids=["prefix", "full", "mixed_equal_maxima"],
+)
+def test_paged_auto_preserves_runtime_scales(q_lengths, kv_lengths):
     if (
         torch.cuda.get_device_capability() != (10, 0)
         or not prefill._cudnn_supports_paged_auto()
     ):
         pytest.skip("requires the qualified SM100 paged-auto runtime")
     torch.manual_seed(19)
-    q = torch.randn(128, 16, 128, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(512, 16, 4, 128, device=q.device, dtype=q.dtype)
+    counts = [length // 16 for length in kv_lengths]
+    q = torch.randn(sum(q_lengths), 16, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(sum(counts), 16, 4, 128, device=q.device, dtype=q.dtype)
     v = torch.randn_like(k)
-    qo = torch.tensor([0, 128], dtype=torch.int32)
-    ip = torch.tensor([0, 512], dtype=torch.int32)
-    ix = torch.randperm(512, device=q.device, dtype=torch.int32)
-    last = torch.tensor([16], dtype=torch.int32)
+    qo = torch.tensor([0, *q_lengths], dtype=torch.int32).cumsum(0).int()
+    ip = torch.tensor([0, *counts], dtype=torch.int32).cumsum(0).int()
+    ix = torch.randperm(sum(counts), device=q.device, dtype=torch.int32)
+    last = torch.full((len(q_lengths),), 16, dtype=torch.int32)
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         torch.empty(128 << 20, device=q.device, dtype=torch.uint8),
         "HND",
         backend="auto",
     )
     wrapper.plan(qo, ip, ix, last, 16, 4, 128, 16, causal=True, q_data_type=q.dtype)
-    # Check public semantics without pinning a heuristic winner.
+    # Float scales work across auto providers. The explicit cuDNN capture/replay
+    # test above covers device scales; FA2 requires a host softmax scale.
     for values in ((0.5, 1.0, 1.0), (1.0, 0.25, 1.0), (1.0, 1.0, 0.75)):
         scales = dict(zip(("q_scale", "k_scale", "v_scale"), values, strict=True))
-        if tensor_scales:
-            scales = {
-                name: torch.full((), value, device=q.device)
-                for name, value in scales.items()
-            }
         out, lse = wrapper.run(
             q,
             (k.transpose(1, 2), v.transpose(1, 2)),

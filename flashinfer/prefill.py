@@ -2520,8 +2520,13 @@ def _blackwell_paged_auto_cudnn(
     total_q,
     qo_indptr_host,
     kv_lens,
+    seq_lens_q=None,
 ):
-    """Measured D128 prefix domain; feature compatibility is checked by plan."""
+    """Measured D128 domains; feature compatibility is checked by plan."""
+    prefix = 64 <= max_q <= 1024 and 2048 <= max_kv <= 32768 and max_kv >= 4 * max_q
+    full = 1024 <= max_q <= 8192 and max_q == max_kv and seq_lens_q is None
+    if not (prefix or full):
+        return False
     if not (
         layout == "HND"
         and q_dtype == kv_dtype == o_dtype == torch.bfloat16
@@ -2532,9 +2537,6 @@ def _blackwell_paged_auto_cudnn(
         and hq % hk == 0
         and hq // hk in (1, 2, 4, 8, 16)
         and page_size == 16
-        and 64 <= max_q <= 1024
-        and 2048 <= max_kv <= 32768
-        and max_kv >= 4 * max_q
         # Cheap upper-bound rejection before querying optional runtime support.
         and total_q * hq * max_kv >= 8 * 1024 * 1024
         and get_compute_capability(device) == (10, 0)
@@ -2545,13 +2547,27 @@ def _blackwell_paged_auto_cudnn(
     # For device-only lengths, preserve the existing upper-bound policy:
     # declining to FA2 would itself stage KV metadata back to the host.
     if kv_lens is None or kv_lens.device.type != "cpu":
-        return True
+        return prefix
     q_bounds = qo_indptr_host.tolist()
+    lengths = kv_lens.flatten().tolist()
+    if full:
+        # Maxima alone cannot distinguish full from mixed-prefix batches.
+        # Reuse CPU metadata; never stage lengths back just for dispatch.
+        q_lengths = [
+            end - start for start, end in zip(q_bounds, q_bounds[1:], strict=False)
+        ]
+        if not (
+            len(q_lengths) == len(lengths) == batch
+            and max(q_lengths) >= 1024
+            and all(
+                q_len == kv_len and q_len > 0
+                for q_len, kv_len in zip(q_lengths, lengths, strict=True)
+            )
+        ):
+            return False
     work = hq * sum(
         (end - start) * length
-        for start, end, length in zip(
-            q_bounds, q_bounds[1:], kv_lens.flatten().tolist(), strict=False
-        )
+        for start, end, length in zip(q_bounds, q_bounds[1:], lengths, strict=False)
     )
     return work >= 8 * 1024 * 1024
 
@@ -3839,6 +3855,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     total_num_rows,
                     qo_indptr_host,
                     kv_lens_arr_host if kv_lens_arr_host is not None else seq_lens,
+                    seq_lens_q,
                 )
             ):
                 self._backend = "cudnn"
