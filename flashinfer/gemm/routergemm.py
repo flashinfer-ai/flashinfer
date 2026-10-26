@@ -922,16 +922,19 @@ def _use_tinygemm2_sm100(device: torch.device) -> bool:
 # with the reference's output bits.  They keep the reference's four K chains, the
 # K16 order within a chain and its +0 start, and sum the chains and the bias in the
 # reference's order, so a routed call returns exactly what the reference returns.
-# Five tiles, each with and without the bias and with and without programmatic
+# Seven tiles, each with and without the bias and with and without programmatic
 # dependent launch, as (output features, batch rows) per CTA.  The three narrow
 # tiles differ only in their loops: PACKED_NARROW unrolls them by two rounds, faster
 # on sm_100a; PACKED_NARROW_U4 unrolls its MMA loop by four, faster on sm_107a;
 # PACKED_NARROW_FULL_STAGES also issues a full stage's MMAs without a per-step K
-# test, faster on sm_103a.
+# test, faster on sm_103a.  PACKED_M64_N16 and PACKED_M64_N4 put sixteen output
+# features in each chain's block of an M=64 MMA, on 16 or 4 batch rows.
 _TINYGEMM2_TCGEN05_TILES = {
     "PACKED_NARROW": (8, 2),
     "PACKED_NARROW_U4": (8, 2),
     "PACKED_NARROW_FULL_STAGES": (8, 2),
+    "PACKED_M64_N16": (16, 16),
+    "PACKED_M64_N4": (16, 4),
     "PACKED": (32, 16),
     "ACCUMULATORS": (32, 64),
 }
