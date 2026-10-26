@@ -298,6 +298,10 @@ mask representations must not strand a captured pointer. Keep token-offset
 units independent of whether the mask uses lengths or cumulative lengths, and
 include that distinction in graph descriptors and override shapes. Provider
 controls need an isolated real graph cache and an actual selected-engine check.
+For graph-mode ragged wrappers, stage both mask lengths into owned storage from
+the first cuDNN plan, even when both are inferred. Replan with fresh caller
+tensors and alternate Q-only, KV-only, both and omitted lengths while replaying
+the same capture; checking only the latest eager run misses stale bindings.
 
 FA2 captures also bind CPU-generated scheduling metadata, including output and
 merge prefixes. Updating only Q/KV indptr tensors after switching to cuDNN leaves
