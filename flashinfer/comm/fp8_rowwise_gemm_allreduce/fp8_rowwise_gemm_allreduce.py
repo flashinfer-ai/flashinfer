@@ -59,7 +59,8 @@ def fp8_rowwise_gemm_allreduce(
     ----------
     a : torch.Tensor
         This rank's contiguous FP8 (e4m3) activation shard of shape
-        ``[M, K_l]``.
+        ``[M, K_l]``. ``a``, ``a_scale``, ``w``, and ``w_scale`` must be CUDA
+        tensors on one shared device.
     a_scale : torch.Tensor
         Contiguous FP32 row scales of shape ``[M]``.
     w : torch.Tensor
@@ -124,6 +125,8 @@ def prepare_fp8_rowwise_gemm_allreduce(
     ----------
     a : torch.Tensor
         Sample contiguous FP8 (e4m3) activation shard of shape ``[M, K_l]``.
+        ``a``, ``a_scale``, ``w``, and ``w_scale`` must be CUDA tensors on one
+        shared device.
     a_scale : torch.Tensor
         Sample contiguous FP32 row scales of shape ``[M]``.
     w : torch.Tensor
@@ -135,8 +138,9 @@ def prepare_fp8_rowwise_gemm_allreduce(
     backend : str, optional
         ``"auto"`` and ``"cake"`` both select the Cake backend.
     max_rows : int, optional
-        Maximum row count accepted by the returned launcher. Defaults to the
-        sample input's row count and must match on every rank.
+        Maximum row count accepted by the returned launcher. Must be at least
+        the sample input's row count. Defaults to the sample input's row count
+        and must match on every rank.
 
     Returns
     -------

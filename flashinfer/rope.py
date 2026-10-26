@@ -453,11 +453,10 @@ def apply_rope_inplace(
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)`, where ``nnz`` is the last
-        element of ``indptr``.
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where
+        ``nnz`` is the number of query/key rows.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     indptr : torch.Tensor
         Indptr tensor, shape: ``(batch_size + 1)``.
     offsets : torch.Tensor
@@ -537,11 +536,10 @@ def apply_rope_pos_ids_inplace(
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)`, where ``nnz`` is the last
-        element of ``indptr``.
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where
+        ``nnz`` is the number of query/key rows.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     pos_ids : torch.Tensor
         Position indices, shape: ``(nnz)``.
     rotary_dim : Optional[int]
@@ -600,11 +598,10 @@ def apply_llama31_rope_inplace(
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where
+        ``nnz`` is the number of query/key rows.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     indptr : torch.Tensor
         Indptr tensor, shape: ``(batch_size + 1)``.
     offsets : torch.Tensor
@@ -705,11 +702,10 @@ def apply_llama31_rope_pos_ids_inplace(
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where
+        ``nnz`` is the number of query/key rows.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     pos_ids : torch.Tensor
         Position indices, shape: ``(nnz)``.
     rotary_dim : Optional[int]
@@ -782,11 +778,10 @@ def apply_rope(
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)`, where ``nnz`` is the last
-        element of ``indptr``.
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where
+        ``nnz`` is the number of query/key rows.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     indptr : torch.Tensor
         Indptr tensor, shape: ``(batch_size + 1)``.
     offsets : torch.Tensor
@@ -889,13 +884,12 @@ def apply_rope_pos_ids(
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)`, where ``nnz`` is the last
-        element of ``indptr``.
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where
+        ``nnz`` is the number of query/key rows.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     pos_ids : torch.Tensor
-        Position indices, shape: ``(batch_size + 1)``.
+        Position indices, shape: ``(nnz)``.
     rotary_dim : Optional[int]
         The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
         otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
@@ -962,11 +956,10 @@ def apply_llama31_rope(
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where
+        ``nnz`` is the number of query/key rows.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     indptr : torch.Tensor
         Indptr tensor, shape: ``(batch_size + 1)``.
     offsets : torch.Tensor
@@ -1081,11 +1074,10 @@ def apply_llama31_rope_pos_ids(
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where
+        ``nnz`` is the number of query/key rows.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     pos_ids : torch.Tensor
         Position indices, shape: ``(nnz)``.
     rotary_dim : Optional[int]
