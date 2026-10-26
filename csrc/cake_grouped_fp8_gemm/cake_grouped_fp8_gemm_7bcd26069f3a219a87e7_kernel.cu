@@ -234,7 +234,7 @@ __device__ __forceinline__ void tma_store_2d(
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_grouped_fp8_gemm_1a2e91f2538e452d994a(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap A32, const __grid_constant__ CUtensorMap A64, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C_tma, const __grid_constant__ CUtensorMap SFA_packed, const __grid_constant__ CUtensorMap SFB_packed, int* __restrict__ m_indices, unsigned int shape_m, unsigned int shape_n, unsigned int k_tiles, unsigned int sf_cols)
+kernel_cake_grouped_fp8_gemm_7bcd26069f3a219a87e7(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap A32, const __grid_constant__ CUtensorMap A64, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C_tma, const __grid_constant__ CUtensorMap SFA_packed, const __grid_constant__ CUtensorMap SFB_packed, int* __restrict__ m_indices, unsigned int shape_m, unsigned int shape_n, unsigned int k_tiles, unsigned int sf_cols)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -256,6 +256,7 @@ kernel_cake_grouped_fp8_gemm_1a2e91f2538e452d994a(const __grid_constant__ CUtens
     #define scale_ready_addr (mbar_base + 192)
     #define mainloop_done_addr (mbar_base + 256)
     #define epilogue_done_addr (mbar_base + 272)
+    #define tmem_dealloc_bar_addr (mbar_base + 288)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -285,8 +286,8 @@ kernel_cake_grouped_fp8_gemm_1a2e91f2538e452d994a(const __grid_constant__ CUtens
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&SFB_packed))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&C_tma))) : "memory");
 
-    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 36 barriers)
-    // Mbarriers at smem_raw[0..288)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 37 barriers)
+    // Mbarriers at smem_raw[0..296)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -335,18 +336,19 @@ kernel_cake_grouped_fp8_gemm_1a2e91f2538e452d994a(const __grid_constant__ CUtens
             // epilogue_done: 2 barriers, init_count=8
             mbarrier_init(smem + 272, 8);
             mbarrier_init(smem + 280, 8);
+            // tmem_dealloc_bar: 1 barriers, init_count=32
+            mbarrier_init(smem + 288, 32);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
 
-    __syncwarp();
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
     // TMEM alloc (512 columns, 264 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 288);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 296);
     if (warp == 2) {
-        int _tmem_hold = smem + 288;
+        int _tmem_hold = smem + 296;
         asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
@@ -368,13 +370,13 @@ kernel_cake_grouped_fp8_gemm_1a2e91f2538e452d994a(const __grid_constant__ CUtens
             unsigned int load_stage = 0;
             unsigned int num_workers = (unsigned int)num_clusters;
             unsigned int worker_idx = (unsigned int)cluster_id;
-            unsigned int m_blocks = (shape_m + 128 - 1) / 128;
+            unsigned int m_blocks = (shape_m + 32 - 1) / 32;
             unsigned int total_pairs = m_blocks * (shape_n / 256);
             unsigned int _phase_tma_free = 1;
             #pragma unroll 1
             for (unsigned int pair = worker_idx; pair < total_pairs; pair += num_workers) {
                 unsigned int grid_np = shape_n / 256;
-                unsigned int m_blocks_0 = (shape_m + 128 - 1) / 128;
+                unsigned int m_blocks_0 = (shape_m + 32 - 1) / 32;
                 unsigned int pairs_per_l2 = m_blocks_0 * 8;
                 unsigned int n_l2_limit = (unsigned int)8;
                 unsigned int l2_group = pair / pairs_per_l2;
@@ -384,32 +386,14 @@ kernel_cake_grouped_fp8_gemm_1a2e91f2538e452d994a(const __grid_constant__ CUtens
                 unsigned int n_in_l2 = ((remaining_np > n_l2_limit) ? n_l2_limit : remaining_np);
                 unsigned int m_block = in_l2 / n_in_l2;
                 unsigned int n_pair = first_np + in_l2 % n_in_l2;
-                unsigned int off_m = m_block * 128;
+                unsigned int off_m = m_block * 32;
                 unsigned int off_n = (n_pair * 2 + (unsigned int)cta_rank) * 128;
                 unsigned int last_row = shape_m - 1;
                 int e0 = m_indices[off_m];
-                unsigned int srow = off_m + 32;
-                unsigned int srow_safe = ((srow < shape_m) ? srow : last_row);
-                int es = m_indices[srow_safe];
-                if (srow >= shape_m) {
-                    es = -1;
-                }
-                unsigned int srow_1 = off_m + 64;
-                unsigned int srow_safe_2 = ((srow_1 < shape_m) ? srow_1 : last_row);
-                int es_3 = m_indices[srow_safe_2];
-                if (srow_1 >= shape_m) {
-                    es_3 = -1;
-                }
-                unsigned int srow_4 = off_m + 96;
-                unsigned int srow_safe_5 = ((srow_4 < shape_m) ? srow_4 : last_row);
-                int es_6 = m_indices[srow_safe_5];
-                if (srow_4 >= shape_m) {
-                    es_6 = -1;
-                }
                 unsigned int next_pair = pair + num_workers;
                 if (next_pair < total_pairs) {
                     unsigned int grid_np_0 = shape_n / 256;
-                    unsigned int m_blocks_1 = (shape_m + 128 - 1) / 128;
+                    unsigned int m_blocks_1 = (shape_m + 32 - 1) / 32;
                     unsigned int pairs_per_l2_2 = m_blocks_1 * 8;
                     unsigned int n_l2_limit_3 = (unsigned int)8;
                     unsigned int l2_group_4 = next_pair / pairs_per_l2_2;
@@ -419,27 +403,15 @@ kernel_cake_grouped_fp8_gemm_1a2e91f2538e452d994a(const __grid_constant__ CUtens
                     unsigned int n_in_l2_8 = ((remaining_np_7 > n_l2_limit_3) ? n_l2_limit_3 : remaining_np_7);
                     unsigned int m_block_9 = in_l2_6 / n_in_l2_8;
                     unsigned int n_pair_10 = first_np_5 + in_l2_6 % n_in_l2_8;
-                    unsigned int off_m_11 = m_block_9 * 128;
+                    unsigned int off_m_11 = m_block_9 * 32;
                     unsigned int off_n_12 = (n_pair_10 * 2 + (unsigned int)cta_rank) * 128;
                     if (off_m_11 < shape_m) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(m_indices + off_m_11))); }
-                    if (off_m_11 + 32 < shape_m) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(m_indices + (off_m_11 + 32)))); }
-                    if (off_m_11 + 64 < shape_m) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(m_indices + (off_m_11 + 64)))); }
-                    if (off_m_11 + 96 < shape_m) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(m_indices + (off_m_11 + 96)))); }
                 }
                 unsigned int nsub = (unsigned int)0;
                 unsigned int runs = (unsigned int)0;
                 if (e0 >= 0) {
                     nsub = 1;
                     runs = 1;
-                    if (es >= 0) {
-                        nsub = nsub + 1;
-                    }
-                    if (es_3 >= 0) {
-                        nsub = nsub + 1;
-                    }
-                    if (es_6 >= 0) {
-                        nsub = nsub + 1;
-                    }
                 }
                 unsigned int half = nsub * 16;
                 unsigned int tok_row0 = off_m + (unsigned int)0 + (unsigned int)cta_rank * half;
@@ -504,15 +476,14 @@ kernel_cake_grouped_fp8_gemm_1a2e91f2538e452d994a(const __grid_constant__ CUtens
             unsigned int epi_stage = 0;
             unsigned int num_workers_1 = (unsigned int)num_clusters;
             unsigned int worker_idx_1 = (unsigned int)cluster_id;
-            unsigned int m_blocks_2 = (shape_m + 128 - 1) / 128;
+            unsigned int m_blocks_2 = (shape_m + 32 - 1) / 32;
             unsigned int total_pairs_1 = m_blocks_2 * (shape_n / 256);
             unsigned int _phase_epilogue_done = 1;
             unsigned int _phase_tma_full = 0;
-            unsigned int _phase_scale_ready = 0;
             #pragma unroll 1
             for (unsigned int pair_1 = worker_idx_1; pair_1 < total_pairs_1; pair_1 += num_workers_1) {
                 unsigned int grid_np_1 = shape_n / 256;
-                unsigned int m_blocks_0_1 = (shape_m + 128 - 1) / 128;
+                unsigned int m_blocks_0_1 = (shape_m + 32 - 1) / 32;
                 unsigned int pairs_per_l2_1 = m_blocks_0_1 * 8;
                 unsigned int n_l2_limit_1 = (unsigned int)8;
                 unsigned int l2_group_1 = pair_1 / pairs_per_l2_1;
@@ -522,42 +493,15 @@ kernel_cake_grouped_fp8_gemm_1a2e91f2538e452d994a(const __grid_constant__ CUtens
                 unsigned int n_in_l2_1 = ((remaining_np_1 > n_l2_limit_1) ? n_l2_limit_1 : remaining_np_1);
                 unsigned int m_block_1 = in_l2_1 / n_in_l2_1;
                 unsigned int n_pair_1 = first_np_1 + in_l2_1 % n_in_l2_1;
-                unsigned int off_m_1 = m_block_1 * 128;
+                unsigned int off_m_1 = m_block_1 * 32;
                 unsigned int off_n_1 = (n_pair_1 * 2 + (unsigned int)cta_rank) * 128;
                 unsigned int last_row_1 = shape_m - 1;
                 int e0_1 = m_indices[off_m_1];
-                unsigned int srow_2 = off_m_1 + 32;
-                unsigned int srow_safe_1 = ((srow_2 < shape_m) ? srow_2 : last_row_1);
-                int es_1 = m_indices[srow_safe_1];
-                if (srow_2 >= shape_m) {
-                    es_1 = -1;
-                }
-                unsigned int srow_1_1 = off_m_1 + 64;
-                unsigned int srow_safe_2_1 = ((srow_1_1 < shape_m) ? srow_1_1 : last_row_1);
-                int es_3_1 = m_indices[srow_safe_2_1];
-                if (srow_1_1 >= shape_m) {
-                    es_3_1 = -1;
-                }
-                unsigned int srow_4_1 = off_m_1 + 96;
-                unsigned int srow_safe_5_1 = ((srow_4_1 < shape_m) ? srow_4_1 : last_row_1);
-                int es_6_1 = m_indices[srow_safe_5_1];
-                if (srow_4_1 >= shape_m) {
-                    es_6_1 = -1;
-                }
                 unsigned int nsub_1 = (unsigned int)0;
                 unsigned int runs_1 = (unsigned int)0;
                 if (e0_1 >= 0) {
                     nsub_1 = 1;
                     runs_1 = 1;
-                    if (es_1 >= 0) {
-                        nsub_1 = nsub_1 + 1;
-                    }
-                    if (es_3_1 >= 0) {
-                        nsub_1 = nsub_1 + 1;
-                    }
-                    if (es_6_1 >= 0) {
-                        nsub_1 = nsub_1 + 1;
-                    }
                 }
                 #pragma unroll 1
                 for (unsigned int _run_1 = 0; _run_1 < runs_1; _run_1++) {
@@ -570,7 +514,7 @@ kernel_cake_grouped_fp8_gemm_1a2e91f2538e452d994a(const __grid_constant__ CUtens
                     for (unsigned int iter_k_1 = 0; iter_k_1 < k_tiles; iter_k_1++) {
                         if (cta_rank == 0) {
                             mbarrier_wait(tma_full_addr + (tma_stage) * 8, _phase_tma_full);
-                            mbarrier_wait(scale_ready_addr + (tma_stage) * 8, _phase_scale_ready);
+                            mbarrier_wait(scale_ready_addr + (tma_stage) * 8, _phase_tma_full);
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             int init_flag = ((iter_k_1 == 0) ? 1 : 0);
                             if (elect_sync()) {
@@ -597,7 +541,7 @@ kernel_cake_grouped_fp8_gemm_1a2e91f2538e452d994a(const __grid_constant__ CUtens
                             elect_commit_cg2_multicast(tma_free_addr + (tma_stage) * 8, (uint16_t)(3));
                         }
                         tma_stage += 1;
-                        if (tma_stage == 8) { tma_stage = 0; _phase_tma_full ^= 1; _phase_scale_ready ^= 1; }
+                        if (tma_stage == 8) { tma_stage = 0; _phase_tma_full ^= 1; }
                     }
                     if (cta_rank == 0) {
                         elect_commit_cg2_multicast(mainloop_done_addr + (epi_stage) * 8, (uint16_t)(3));
@@ -609,8 +553,40 @@ kernel_cake_grouped_fp8_gemm_1a2e91f2538e452d994a(const __grid_constant__ CUtens
             #pragma unroll
             for (int _tail_1 = 0; _tail_1 < 8; _tail_1++) {
                 tma_stage += 1;
-                if (tma_stage == 8) { tma_stage = 0; _phase_tma_full ^= 1; _phase_scale_ready ^= 1; }
+                if (tma_stage == 8) { tma_stage = 0; _phase_tma_full ^= 1; }
             }
+            #pragma unroll
+            for (int _drain = 0; _drain < 2; _drain++) {
+                if (cta_rank == 0) {
+                    mbarrier_wait(epilogue_done_addr + (epi_stage) * 8, _phase_epilogue_done);
+                }
+                epi_stage += 1;
+                if (epi_stage == 2) { epi_stage = 0; _phase_epilogue_done ^= 1; }
+            }
+            int dealloc_peer_rank = cta_rank ^ 1;
+            if (cta_rank != 0) {
+                asm volatile("tcgen05.fence::before_thread_sync;");
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b32 remAddr32;\n\t"
+                    "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
+                    "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
+                    "}"
+                    :: "r"(tmem_dealloc_bar_addr), "r"(dealloc_peer_rank) : "memory");
+            }
+            mbarrier_wait(tmem_dealloc_bar_addr, 0);
+            if (cta_rank == 0) {
+                asm volatile("tcgen05.fence::before_thread_sync;");
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b32 remAddr32;\n\t"
+                    "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
+                    "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
+                    "}"
+                    :: "r"(tmem_dealloc_bar_addr), "r"(dealloc_peer_rank) : "memory");
+            }
+            asm volatile("tcgen05.fence::after_thread_sync;");
+            asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(512));
         }
     }
     // ---- Role: transpose ----
@@ -619,13 +595,13 @@ kernel_cake_grouped_fp8_gemm_1a2e91f2538e452d994a(const __grid_constant__ CUtens
             unsigned int transpose_stage = 0;
             unsigned int num_workers_2 = (unsigned int)num_clusters;
             unsigned int worker_idx_2 = (unsigned int)cluster_id;
-            unsigned int m_blocks_3 = (shape_m + 128 - 1) / 128;
+            unsigned int m_blocks_3 = (shape_m + 32 - 1) / 32;
             unsigned int total_pairs_2 = m_blocks_3 * (shape_n / 256);
             unsigned int _phase_sf_full = 0;
             #pragma unroll 1
             for (unsigned int pair_2 = worker_idx_2; pair_2 < total_pairs_2; pair_2 += num_workers_2) {
                 unsigned int grid_np_2 = shape_n / 256;
-                unsigned int m_blocks_0_2 = (shape_m + 128 - 1) / 128;
+                unsigned int m_blocks_0_2 = (shape_m + 32 - 1) / 32;
                 unsigned int pairs_per_l2_3 = m_blocks_0_2 * 8;
                 unsigned int n_l2_limit_2 = (unsigned int)8;
                 unsigned int l2_group_2 = pair_2 / pairs_per_l2_3;
@@ -635,42 +611,15 @@ kernel_cake_grouped_fp8_gemm_1a2e91f2538e452d994a(const __grid_constant__ CUtens
                 unsigned int n_in_l2_2 = ((remaining_np_2 > n_l2_limit_2) ? n_l2_limit_2 : remaining_np_2);
                 unsigned int m_block_2 = in_l2_2 / n_in_l2_2;
                 unsigned int n_pair_2 = first_np_2 + in_l2_2 % n_in_l2_2;
-                unsigned int off_m_2 = m_block_2 * 128;
+                unsigned int off_m_2 = m_block_2 * 32;
                 unsigned int off_n_2 = (n_pair_2 * 2 + (unsigned int)cta_rank) * 128;
                 unsigned int last_row_2 = shape_m - 1;
                 int e0_2 = m_indices[off_m_2];
-                unsigned int srow_3 = off_m_2 + 32;
-                unsigned int srow_safe_3 = ((srow_3 < shape_m) ? srow_3 : last_row_2);
-                int es_2 = m_indices[srow_safe_3];
-                if (srow_3 >= shape_m) {
-                    es_2 = -1;
-                }
-                unsigned int srow_1_2 = off_m_2 + 64;
-                unsigned int srow_safe_2_2 = ((srow_1_2 < shape_m) ? srow_1_2 : last_row_2);
-                int es_3_2 = m_indices[srow_safe_2_2];
-                if (srow_1_2 >= shape_m) {
-                    es_3_2 = -1;
-                }
-                unsigned int srow_4_2 = off_m_2 + 96;
-                unsigned int srow_safe_5_2 = ((srow_4_2 < shape_m) ? srow_4_2 : last_row_2);
-                int es_6_2 = m_indices[srow_safe_5_2];
-                if (srow_4_2 >= shape_m) {
-                    es_6_2 = -1;
-                }
                 unsigned int nsub_2 = (unsigned int)0;
                 unsigned int runs_2 = (unsigned int)0;
                 if (e0_2 >= 0) {
                     nsub_2 = 1;
                     runs_2 = 1;
-                    if (es_2 >= 0) {
-                        nsub_2 = nsub_2 + 1;
-                    }
-                    if (es_3_2 >= 0) {
-                        nsub_2 = nsub_2 + 1;
-                    }
-                    if (es_6_2 >= 0) {
-                        nsub_2 = nsub_2 + 1;
-                    }
                 }
                 #pragma unroll 1
                 for (unsigned int _run_2 = 0; _run_2 < runs_2; _run_2++) {
@@ -724,13 +673,13 @@ kernel_cake_grouped_fp8_gemm_1a2e91f2538e452d994a(const __grid_constant__ CUtens
             const int epi_warp = warp % 4;
             unsigned int num_workers_3 = (unsigned int)num_clusters;
             unsigned int worker_idx_3 = (unsigned int)cluster_id;
-            unsigned int m_blocks_4 = (shape_m + 128 - 1) / 128;
+            unsigned int m_blocks_4 = (shape_m + 32 - 1) / 32;
             unsigned int total_pairs_3 = m_blocks_4 * (shape_n / 256);
             unsigned int _phase_mainloop_done = 0;
             #pragma unroll 1
             for (unsigned int pair_3 = worker_idx_3; pair_3 < total_pairs_3; pair_3 += num_workers_3) {
                 unsigned int grid_np_3 = shape_n / 256;
-                unsigned int m_blocks_0_3 = (shape_m + 128 - 1) / 128;
+                unsigned int m_blocks_0_3 = (shape_m + 32 - 1) / 32;
                 unsigned int pairs_per_l2_4 = m_blocks_0_3 * 8;
                 unsigned int n_l2_limit_4 = (unsigned int)8;
                 unsigned int l2_group_3 = pair_3 / pairs_per_l2_4;
@@ -740,42 +689,15 @@ kernel_cake_grouped_fp8_gemm_1a2e91f2538e452d994a(const __grid_constant__ CUtens
                 unsigned int n_in_l2_3 = ((remaining_np_3 > n_l2_limit_4) ? n_l2_limit_4 : remaining_np_3);
                 unsigned int m_block_3 = in_l2_3 / n_in_l2_3;
                 unsigned int n_pair_3 = first_np_3 + in_l2_3 % n_in_l2_3;
-                unsigned int off_m_3 = m_block_3 * 128;
+                unsigned int off_m_3 = m_block_3 * 32;
                 unsigned int off_n_3 = (n_pair_3 * 2 + (unsigned int)cta_rank) * 128;
                 unsigned int last_row_3 = shape_m - 1;
                 int e0_3 = m_indices[off_m_3];
-                unsigned int srow_5 = off_m_3 + 32;
-                unsigned int srow_safe_4 = ((srow_5 < shape_m) ? srow_5 : last_row_3);
-                int es_4 = m_indices[srow_safe_4];
-                if (srow_5 >= shape_m) {
-                    es_4 = -1;
-                }
-                unsigned int srow_1_3 = off_m_3 + 64;
-                unsigned int srow_safe_2_3 = ((srow_1_3 < shape_m) ? srow_1_3 : last_row_3);
-                int es_3_3 = m_indices[srow_safe_2_3];
-                if (srow_1_3 >= shape_m) {
-                    es_3_3 = -1;
-                }
-                unsigned int srow_4_3 = off_m_3 + 96;
-                unsigned int srow_safe_5_3 = ((srow_4_3 < shape_m) ? srow_4_3 : last_row_3);
-                int es_6_3 = m_indices[srow_safe_5_3];
-                if (srow_4_3 >= shape_m) {
-                    es_6_3 = -1;
-                }
                 unsigned int nsub_3 = (unsigned int)0;
                 unsigned int runs_3 = (unsigned int)0;
                 if (e0_3 >= 0) {
                     nsub_3 = 1;
                     runs_3 = 1;
-                    if (es_4 >= 0) {
-                        nsub_3 = nsub_3 + 1;
-                    }
-                    if (es_3_3 >= 0) {
-                        nsub_3 = nsub_3 + 1;
-                    }
-                    if (es_6_3 >= 0) {
-                        nsub_3 = nsub_3 + 1;
-                    }
                 }
                 #pragma unroll 1
                 for (unsigned int _run_3 = 0; _run_3 < runs_3; _run_3++) {
@@ -854,13 +776,6 @@ kernel_cake_grouped_fp8_gemm_1a2e91f2538e452d994a(const __grid_constant__ CUtens
     }
 
     // Cleanup
-    asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
-    asm volatile("barrier.cluster.arrive.release.aligned;");
-    asm volatile("barrier.cluster.wait.acquire.aligned;");
-
-    if (warp == 2) {
-        asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(512));
-    }
 }
 
 } // extern "C"

@@ -234,7 +234,7 @@ __device__ __forceinline__ void tma_store_2d(
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_grouped_fp8_gemm_b171fdd83d9c3356bb5e(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap A32, const __grid_constant__ CUtensorMap A64, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C_tma, const __grid_constant__ CUtensorMap SFA_packed, const __grid_constant__ CUtensorMap SFB_packed, int* __restrict__ m_indices, unsigned int shape_m, unsigned int shape_n, unsigned int k_tiles, unsigned int sf_cols)
+kernel_cake_grouped_fp8_gemm_7ee216a957327349cf41(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap A32, const __grid_constant__ CUtensorMap A64, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C_tma, const __grid_constant__ CUtensorMap SFA_packed, const __grid_constant__ CUtensorMap SFB_packed, int* __restrict__ m_indices, unsigned int shape_m, unsigned int shape_n, unsigned int k_tiles, unsigned int sf_cols)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -370,20 +370,16 @@ kernel_cake_grouped_fp8_gemm_b171fdd83d9c3356bb5e(const __grid_constant__ CUtens
             unsigned int worker_idx = (unsigned int)cluster_id;
             unsigned int m_blocks = (shape_m + 128 - 1) / 128;
             unsigned int total_pairs = m_blocks * (shape_n / 256);
-            unsigned int cur_m = (unsigned int)0;
-            unsigned int cur_n = (unsigned int)0;
-            int w0 = -1;
-            int w1 = -1;
-            int w2 = -1;
-            int w3 = -1;
-            if (worker_idx < total_pairs) {
+            unsigned int _phase_tma_free = 1;
+            #pragma unroll 1
+            for (unsigned int pair = worker_idx; pair < total_pairs; pair += num_workers) {
                 unsigned int grid_np = shape_n / 256;
                 unsigned int m_blocks_0 = (shape_m + 128 - 1) / 128;
                 unsigned int pairs_per_l2 = m_blocks_0 * 8;
                 unsigned int n_l2_limit = (unsigned int)8;
-                unsigned int l2_group = worker_idx / pairs_per_l2;
+                unsigned int l2_group = pair / pairs_per_l2;
                 unsigned int first_np = l2_group * 8;
-                unsigned int in_l2 = worker_idx % pairs_per_l2;
+                unsigned int in_l2 = pair % pairs_per_l2;
                 unsigned int remaining_np = grid_np - first_np;
                 unsigned int n_in_l2 = ((remaining_np > n_l2_limit) ? n_l2_limit : remaining_np);
                 unsigned int m_block = in_l2 / n_in_l2;
@@ -391,65 +387,34 @@ kernel_cake_grouped_fp8_gemm_b171fdd83d9c3356bb5e(const __grid_constant__ CUtens
                 unsigned int off_m = m_block * 128;
                 unsigned int off_n = (n_pair * 2 + (unsigned int)cta_rank) * 128;
                 unsigned int last_row = shape_m - 1;
-                unsigned int srow = off_m;
+                int e0 = m_indices[off_m];
+                unsigned int srow = off_m + 32;
                 unsigned int srow_safe = ((srow < shape_m) ? srow : last_row);
-                int word = m_indices[srow_safe];
-                unsigned int srow_1 = off_m + 32;
+                int es = m_indices[srow_safe];
+                if (srow >= shape_m) {
+                    es = -1;
+                }
+                unsigned int srow_1 = off_m + 64;
                 unsigned int srow_safe_2 = ((srow_1 < shape_m) ? srow_1 : last_row);
-                int word_3 = m_indices[srow_safe_2];
-                unsigned int srow_4 = off_m + 64;
+                int es_3 = m_indices[srow_safe_2];
+                if (srow_1 >= shape_m) {
+                    es_3 = -1;
+                }
+                unsigned int srow_4 = off_m + 96;
                 unsigned int srow_safe_5 = ((srow_4 < shape_m) ? srow_4 : last_row);
-                int word_6 = m_indices[srow_safe_5];
-                unsigned int srow_7 = off_m + 96;
-                unsigned int srow_safe_8 = ((srow_7 < shape_m) ? srow_7 : last_row);
-                int word_9 = m_indices[srow_safe_8];
-                cur_m = off_m;
-                cur_n = off_n;
-                w0 = word;
-                w1 = word_3;
-                w2 = word_6;
-                w3 = word_9;
-            }
-            unsigned int _phase_tma_free = 1;
-            #pragma unroll 1
-            for (unsigned int pair = worker_idx; pair < total_pairs; pair += num_workers) {
+                int es_6 = m_indices[srow_safe_5];
+                if (srow_4 >= shape_m) {
+                    es_6 = -1;
+                }
                 unsigned int next_pair = pair + num_workers;
-                unsigned int next_safe = ((next_pair < total_pairs) ? next_pair : pair);
-                unsigned int grid_np_1 = shape_n / 256;
-                unsigned int m_blocks_0_1 = (shape_m + 128 - 1) / 128;
-                unsigned int pairs_per_l2_1 = m_blocks_0_1 * 8;
-                unsigned int n_l2_limit_1 = (unsigned int)8;
-                unsigned int l2_group_1 = next_safe / pairs_per_l2_1;
-                unsigned int first_np_1 = l2_group_1 * 8;
-                unsigned int in_l2_1 = next_safe % pairs_per_l2_1;
-                unsigned int remaining_np_1 = grid_np_1 - first_np_1;
-                unsigned int n_in_l2_1 = ((remaining_np_1 > n_l2_limit_1) ? n_l2_limit_1 : remaining_np_1);
-                unsigned int m_block_1 = in_l2_1 / n_in_l2_1;
-                unsigned int n_pair_1 = first_np_1 + in_l2_1 % n_in_l2_1;
-                unsigned int off_m_1 = m_block_1 * 128;
-                unsigned int off_n_1 = (n_pair_1 * 2 + (unsigned int)cta_rank) * 128;
-                unsigned int last_row_1 = shape_m - 1;
-                unsigned int srow_2 = off_m_1;
-                unsigned int srow_safe_1 = ((srow_2 < shape_m) ? srow_2 : last_row_1);
-                int word_1 = m_indices[srow_safe_1];
-                unsigned int srow_1_1 = off_m_1 + 32;
-                unsigned int srow_safe_2_1 = ((srow_1_1 < shape_m) ? srow_1_1 : last_row_1);
-                int word_3_1 = m_indices[srow_safe_2_1];
-                unsigned int srow_4_1 = off_m_1 + 64;
-                unsigned int srow_safe_5_1 = ((srow_4_1 < shape_m) ? srow_4_1 : last_row_1);
-                int word_6_1 = m_indices[srow_safe_5_1];
-                unsigned int srow_7_1 = off_m_1 + 96;
-                unsigned int srow_safe_8_1 = ((srow_7_1 < shape_m) ? srow_7_1 : last_row_1);
-                int word_9_1 = m_indices[srow_safe_8_1];
-                unsigned int warm_pair = next_pair + num_workers;
-                if (warm_pair < total_pairs) {
+                if (next_pair < total_pairs) {
                     unsigned int grid_np_0 = shape_n / 256;
                     unsigned int m_blocks_1 = (shape_m + 128 - 1) / 128;
                     unsigned int pairs_per_l2_2 = m_blocks_1 * 8;
                     unsigned int n_l2_limit_3 = (unsigned int)8;
-                    unsigned int l2_group_4 = warm_pair / pairs_per_l2_2;
+                    unsigned int l2_group_4 = next_pair / pairs_per_l2_2;
                     unsigned int first_np_5 = l2_group_4 * 8;
-                    unsigned int in_l2_6 = warm_pair % pairs_per_l2_2;
+                    unsigned int in_l2_6 = next_pair % pairs_per_l2_2;
                     unsigned int remaining_np_7 = grid_np_0 - first_np_5;
                     unsigned int n_in_l2_8 = ((remaining_np_7 > n_l2_limit_3) ? n_l2_limit_3 : remaining_np_7);
                     unsigned int m_block_9 = in_l2_6 / n_in_l2_8;
@@ -461,43 +426,25 @@ kernel_cake_grouped_fp8_gemm_b171fdd83d9c3356bb5e(const __grid_constant__ CUtens
                     if (off_m_11 + 64 < shape_m) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(m_indices + (off_m_11 + 64)))); }
                     if (off_m_11 + 96 < shape_m) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(m_indices + (off_m_11 + 96)))); }
                 }
-                unsigned int off_m_10 = cur_m;
-                unsigned int off_n_11 = cur_n;
-                int es = w0;
-                if (off_m_10 >= shape_m) {
-                    es = -1;
-                }
-                int es_12 = w1;
-                if (off_m_10 + 32 >= shape_m) {
-                    es_12 = -1;
-                }
-                int es_13 = w2;
-                if (off_m_10 + 64 >= shape_m) {
-                    es_13 = -1;
-                }
-                int es_14 = w3;
-                if (off_m_10 + 96 >= shape_m) {
-                    es_14 = -1;
-                }
                 unsigned int nsub = (unsigned int)0;
                 unsigned int runs = (unsigned int)0;
-                if (es >= 0) {
+                if (e0 >= 0) {
                     nsub = 1;
                     runs = 1;
-                    if (es_12 >= 0) {
+                    if (es >= 0) {
                         nsub = nsub + 1;
                     }
-                    if (es_13 >= 0) {
+                    if (es_3 >= 0) {
                         nsub = nsub + 1;
                     }
-                    if (es_14 >= 0) {
+                    if (es_6 >= 0) {
                         nsub = nsub + 1;
                     }
                 }
                 unsigned int half = nsub * 16;
-                unsigned int tok_row0 = off_m_10 + (unsigned int)0 + (unsigned int)cta_rank * half;
-                unsigned int sf_row0 = off_m_10 + (unsigned int)0;
-                unsigned int sfb_outer0 = (unsigned int)es * sf_cols;
+                unsigned int tok_row0 = off_m + (unsigned int)0 + (unsigned int)cta_rank * half;
+                unsigned int sf_row0 = off_m + (unsigned int)0;
+                unsigned int sfb_outer0 = (unsigned int)e0 * sf_cols;
                 #pragma unroll 1
                 for (unsigned int _run = 0; _run < runs; _run++) {
                     #pragma unroll 1
@@ -507,11 +454,11 @@ kernel_cake_grouped_fp8_gemm_b171fdd83d9c3356bb5e(const __grid_constant__ CUtens
                             unsigned int sf_bytes = (unsigned int)0;
                             if (iter_k % 4 == 0) {
                                 tma_2d_gmem2smem(smem_sfa_addr + load_stage * 25600, (&SFA_packed), sf_row0, iter_k / 4, sf_full_addr + (load_stage) * 8);
-                                tma_2d_gmem2smem(smem_sfb_addr + load_stage * 25600, (&SFB_packed), off_n_11, sfb_outer0 + iter_k / 4, sf_full_addr + (load_stage) * 8);
+                                tma_2d_gmem2smem(smem_sfb_addr + load_stage * 25600, (&SFB_packed), off_n, sfb_outer0 + iter_k / 4, sf_full_addr + (load_stage) * 8);
                                 sf_bytes = 1024;
                             }
                             mbarrier_arrive_expect_tx(sf_full_addr + (load_stage) * 8, sf_bytes);
-                            tma_4d_gmem2smem_cta2(smem_b_addr + load_stage * 25600, (&B), 0, off_n_11, iter_k, (unsigned int)es, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                            tma_4d_gmem2smem_cta2(smem_b_addr + load_stage * 25600, (&B), 0, off_n, iter_k, (unsigned int)e0, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
                             if (nsub == 4) {
                                 tma_3d_gmem2smem_cta2(smem_a_addr + load_stage * 25600, (&A64), 0, tok_row0, iter_k, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
                                 asm volatile(
@@ -541,12 +488,6 @@ kernel_cake_grouped_fp8_gemm_b171fdd83d9c3356bb5e(const __grid_constant__ CUtens
                         if (load_stage == 8) { load_stage = 0; _phase_tma_free ^= 1; }
                     }
                 }
-                cur_m = off_m_1;
-                cur_n = off_n_1;
-                w0 = word_1;
-                w1 = word_3_1;
-                w2 = word_6_1;
-                w3 = word_9_1;
             }
             #pragma unroll
             for (int _tail = 0; _tail < 8; _tail++) {
@@ -565,109 +506,55 @@ kernel_cake_grouped_fp8_gemm_b171fdd83d9c3356bb5e(const __grid_constant__ CUtens
             unsigned int worker_idx_1 = (unsigned int)cluster_id;
             unsigned int m_blocks_2 = (shape_m + 128 - 1) / 128;
             unsigned int total_pairs_1 = m_blocks_2 * (shape_n / 256);
-            unsigned int cur_m_1 = (unsigned int)0;
-            unsigned int cur_n_1 = (unsigned int)0;
-            int w0_1 = -1;
-            int w1_1 = -1;
-            int w2_1 = -1;
-            int w3_1 = -1;
-            if (worker_idx_1 < total_pairs_1) {
-                unsigned int grid_np_2 = shape_n / 256;
-                unsigned int m_blocks_0_2 = (shape_m + 128 - 1) / 128;
-                unsigned int pairs_per_l2_3 = m_blocks_0_2 * 8;
-                unsigned int n_l2_limit_2 = (unsigned int)8;
-                unsigned int l2_group_2 = worker_idx_1 / pairs_per_l2_3;
-                unsigned int first_np_2 = l2_group_2 * 8;
-                unsigned int in_l2_2 = worker_idx_1 % pairs_per_l2_3;
-                unsigned int remaining_np_2 = grid_np_2 - first_np_2;
-                unsigned int n_in_l2_2 = ((remaining_np_2 > n_l2_limit_2) ? n_l2_limit_2 : remaining_np_2);
-                unsigned int m_block_2 = in_l2_2 / n_in_l2_2;
-                unsigned int n_pair_2 = first_np_2 + in_l2_2 % n_in_l2_2;
-                unsigned int off_m_2 = m_block_2 * 128;
-                unsigned int off_n_2 = (n_pair_2 * 2 + (unsigned int)cta_rank) * 128;
-                unsigned int last_row_2 = shape_m - 1;
-                unsigned int srow_3 = off_m_2;
-                unsigned int srow_safe_3 = ((srow_3 < shape_m) ? srow_3 : last_row_2);
-                int word_2 = m_indices[srow_safe_3];
-                unsigned int srow_1_2 = off_m_2 + 32;
-                unsigned int srow_safe_2_2 = ((srow_1_2 < shape_m) ? srow_1_2 : last_row_2);
-                int word_3_2 = m_indices[srow_safe_2_2];
-                unsigned int srow_4_2 = off_m_2 + 64;
-                unsigned int srow_safe_5_2 = ((srow_4_2 < shape_m) ? srow_4_2 : last_row_2);
-                int word_6_2 = m_indices[srow_safe_5_2];
-                unsigned int srow_7_2 = off_m_2 + 96;
-                unsigned int srow_safe_8_2 = ((srow_7_2 < shape_m) ? srow_7_2 : last_row_2);
-                int word_9_2 = m_indices[srow_safe_8_2];
-                cur_m_1 = off_m_2;
-                cur_n_1 = off_n_2;
-                w0_1 = word_2;
-                w1_1 = word_3_2;
-                w2_1 = word_6_2;
-                w3_1 = word_9_2;
-            }
             unsigned int _phase_epilogue_done = 1;
             unsigned int _phase_tma_full = 0;
-            unsigned int _phase_scale_ready = 0;
             #pragma unroll 1
             for (unsigned int pair_1 = worker_idx_1; pair_1 < total_pairs_1; pair_1 += num_workers_1) {
-                unsigned int next_pair_1 = pair_1 + num_workers_1;
-                unsigned int next_safe_1 = ((next_pair_1 < total_pairs_1) ? next_pair_1 : pair_1);
-                unsigned int grid_np_3 = shape_n / 256;
-                unsigned int m_blocks_0_3 = (shape_m + 128 - 1) / 128;
-                unsigned int pairs_per_l2_4 = m_blocks_0_3 * 8;
-                unsigned int n_l2_limit_4 = (unsigned int)8;
-                unsigned int l2_group_3 = next_safe_1 / pairs_per_l2_4;
-                unsigned int first_np_3 = l2_group_3 * 8;
-                unsigned int in_l2_3 = next_safe_1 % pairs_per_l2_4;
-                unsigned int remaining_np_3 = grid_np_3 - first_np_3;
-                unsigned int n_in_l2_3 = ((remaining_np_3 > n_l2_limit_4) ? n_l2_limit_4 : remaining_np_3);
-                unsigned int m_block_3 = in_l2_3 / n_in_l2_3;
-                unsigned int n_pair_3 = first_np_3 + in_l2_3 % n_in_l2_3;
-                unsigned int off_m_3 = m_block_3 * 128;
-                unsigned int off_n_3 = (n_pair_3 * 2 + (unsigned int)cta_rank) * 128;
-                unsigned int last_row_3 = shape_m - 1;
-                unsigned int srow_5 = off_m_3;
-                unsigned int srow_safe_4 = ((srow_5 < shape_m) ? srow_5 : last_row_3);
-                int word_4 = m_indices[srow_safe_4];
-                unsigned int srow_1_3 = off_m_3 + 32;
-                unsigned int srow_safe_2_3 = ((srow_1_3 < shape_m) ? srow_1_3 : last_row_3);
-                int word_3_3 = m_indices[srow_safe_2_3];
-                unsigned int srow_4_3 = off_m_3 + 64;
-                unsigned int srow_safe_5_3 = ((srow_4_3 < shape_m) ? srow_4_3 : last_row_3);
-                int word_6_3 = m_indices[srow_safe_5_3];
-                unsigned int srow_7_3 = off_m_3 + 96;
-                unsigned int srow_safe_8_3 = ((srow_7_3 < shape_m) ? srow_7_3 : last_row_3);
-                int word_9_3 = m_indices[srow_safe_8_3];
-                unsigned int off_m_10_1 = cur_m_1;
-                unsigned int off_n_11_1 = cur_n_1;
-                int es_1 = w0_1;
-                if (off_m_10_1 >= shape_m) {
+                unsigned int grid_np_1 = shape_n / 256;
+                unsigned int m_blocks_0_1 = (shape_m + 128 - 1) / 128;
+                unsigned int pairs_per_l2_1 = m_blocks_0_1 * 8;
+                unsigned int n_l2_limit_1 = (unsigned int)8;
+                unsigned int l2_group_1 = pair_1 / pairs_per_l2_1;
+                unsigned int first_np_1 = l2_group_1 * 8;
+                unsigned int in_l2_1 = pair_1 % pairs_per_l2_1;
+                unsigned int remaining_np_1 = grid_np_1 - first_np_1;
+                unsigned int n_in_l2_1 = ((remaining_np_1 > n_l2_limit_1) ? n_l2_limit_1 : remaining_np_1);
+                unsigned int m_block_1 = in_l2_1 / n_in_l2_1;
+                unsigned int n_pair_1 = first_np_1 + in_l2_1 % n_in_l2_1;
+                unsigned int off_m_1 = m_block_1 * 128;
+                unsigned int off_n_1 = (n_pair_1 * 2 + (unsigned int)cta_rank) * 128;
+                unsigned int last_row_1 = shape_m - 1;
+                int e0_1 = m_indices[off_m_1];
+                unsigned int srow_2 = off_m_1 + 32;
+                unsigned int srow_safe_1 = ((srow_2 < shape_m) ? srow_2 : last_row_1);
+                int es_1 = m_indices[srow_safe_1];
+                if (srow_2 >= shape_m) {
                     es_1 = -1;
                 }
-                int es_12_1 = w1_1;
-                if (off_m_10_1 + 32 >= shape_m) {
-                    es_12_1 = -1;
+                unsigned int srow_1_1 = off_m_1 + 64;
+                unsigned int srow_safe_2_1 = ((srow_1_1 < shape_m) ? srow_1_1 : last_row_1);
+                int es_3_1 = m_indices[srow_safe_2_1];
+                if (srow_1_1 >= shape_m) {
+                    es_3_1 = -1;
                 }
-                int es_13_1 = w2_1;
-                if (off_m_10_1 + 64 >= shape_m) {
-                    es_13_1 = -1;
-                }
-                int es_14_1 = w3_1;
-                if (off_m_10_1 + 96 >= shape_m) {
-                    es_14_1 = -1;
+                unsigned int srow_4_1 = off_m_1 + 96;
+                unsigned int srow_safe_5_1 = ((srow_4_1 < shape_m) ? srow_4_1 : last_row_1);
+                int es_6_1 = m_indices[srow_safe_5_1];
+                if (srow_4_1 >= shape_m) {
+                    es_6_1 = -1;
                 }
                 unsigned int nsub_1 = (unsigned int)0;
                 unsigned int runs_1 = (unsigned int)0;
-                if (es_1 >= 0) {
+                if (e0_1 >= 0) {
                     nsub_1 = 1;
                     runs_1 = 1;
-                    if (es_12_1 >= 0) {
+                    if (es_1 >= 0) {
                         nsub_1 = nsub_1 + 1;
                     }
-                    if (es_13_1 >= 0) {
+                    if (es_3_1 >= 0) {
                         nsub_1 = nsub_1 + 1;
                     }
-                    if (es_14_1 >= 0) {
+                    if (es_6_1 >= 0) {
                         nsub_1 = nsub_1 + 1;
                     }
                 }
@@ -682,7 +569,7 @@ kernel_cake_grouped_fp8_gemm_b171fdd83d9c3356bb5e(const __grid_constant__ CUtens
                     for (unsigned int iter_k_1 = 0; iter_k_1 < k_tiles; iter_k_1++) {
                         if (cta_rank == 0) {
                             mbarrier_wait(tma_full_addr + (tma_stage) * 8, _phase_tma_full);
-                            mbarrier_wait(scale_ready_addr + (tma_stage) * 8, _phase_scale_ready);
+                            mbarrier_wait(scale_ready_addr + (tma_stage) * 8, _phase_tma_full);
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             int init_flag = ((iter_k_1 == 0) ? 1 : 0);
                             if (elect_sync()) {
@@ -709,7 +596,7 @@ kernel_cake_grouped_fp8_gemm_b171fdd83d9c3356bb5e(const __grid_constant__ CUtens
                             elect_commit_cg2_multicast(tma_free_addr + (tma_stage) * 8, (uint16_t)(3));
                         }
                         tma_stage += 1;
-                        if (tma_stage == 8) { tma_stage = 0; _phase_tma_full ^= 1; _phase_scale_ready ^= 1; }
+                        if (tma_stage == 8) { tma_stage = 0; _phase_tma_full ^= 1; }
                     }
                     if (cta_rank == 0) {
                         elect_commit_cg2_multicast(mainloop_done_addr + (epi_stage) * 8, (uint16_t)(3));
@@ -717,17 +604,11 @@ kernel_cake_grouped_fp8_gemm_b171fdd83d9c3356bb5e(const __grid_constant__ CUtens
                     epi_stage += 1;
                     if (epi_stage == 2) { epi_stage = 0; _phase_epilogue_done ^= 1; }
                 }
-                cur_m_1 = off_m_3;
-                cur_n_1 = off_n_3;
-                w0_1 = word_4;
-                w1_1 = word_3_3;
-                w2_1 = word_6_3;
-                w3_1 = word_9_3;
             }
             #pragma unroll
             for (int _tail_1 = 0; _tail_1 < 8; _tail_1++) {
                 tma_stage += 1;
-                if (tma_stage == 8) { tma_stage = 0; _phase_tma_full ^= 1; _phase_scale_ready ^= 1; }
+                if (tma_stage == 8) { tma_stage = 0; _phase_tma_full ^= 1; }
             }
         }
     }
@@ -739,107 +620,54 @@ kernel_cake_grouped_fp8_gemm_b171fdd83d9c3356bb5e(const __grid_constant__ CUtens
             unsigned int worker_idx_2 = (unsigned int)cluster_id;
             unsigned int m_blocks_3 = (shape_m + 128 - 1) / 128;
             unsigned int total_pairs_2 = m_blocks_3 * (shape_n / 256);
-            unsigned int cur_m_2 = (unsigned int)0;
-            unsigned int cur_n_2 = (unsigned int)0;
-            int w0_2 = -1;
-            int w1_2 = -1;
-            int w2_2 = -1;
-            int w3_2 = -1;
-            if (worker_idx_2 < total_pairs_2) {
-                unsigned int grid_np_4 = shape_n / 256;
-                unsigned int m_blocks_0_4 = (shape_m + 128 - 1) / 128;
-                unsigned int pairs_per_l2_5 = m_blocks_0_4 * 8;
-                unsigned int n_l2_limit_5 = (unsigned int)8;
-                unsigned int l2_group_5 = worker_idx_2 / pairs_per_l2_5;
-                unsigned int first_np_4 = l2_group_5 * 8;
-                unsigned int in_l2_4 = worker_idx_2 % pairs_per_l2_5;
-                unsigned int remaining_np_4 = grid_np_4 - first_np_4;
-                unsigned int n_in_l2_4 = ((remaining_np_4 > n_l2_limit_5) ? n_l2_limit_5 : remaining_np_4);
-                unsigned int m_block_4 = in_l2_4 / n_in_l2_4;
-                unsigned int n_pair_4 = first_np_4 + in_l2_4 % n_in_l2_4;
-                unsigned int off_m_4 = m_block_4 * 128;
-                unsigned int off_n_4 = (n_pair_4 * 2 + (unsigned int)cta_rank) * 128;
-                unsigned int last_row_4 = shape_m - 1;
-                unsigned int srow_6 = off_m_4;
-                unsigned int srow_safe_6 = ((srow_6 < shape_m) ? srow_6 : last_row_4);
-                int word_5 = m_indices[srow_safe_6];
-                unsigned int srow_1_4 = off_m_4 + 32;
-                unsigned int srow_safe_2_4 = ((srow_1_4 < shape_m) ? srow_1_4 : last_row_4);
-                int word_3_4 = m_indices[srow_safe_2_4];
-                unsigned int srow_4_4 = off_m_4 + 64;
-                unsigned int srow_safe_5_4 = ((srow_4_4 < shape_m) ? srow_4_4 : last_row_4);
-                int word_6_4 = m_indices[srow_safe_5_4];
-                unsigned int srow_7_4 = off_m_4 + 96;
-                unsigned int srow_safe_8_4 = ((srow_7_4 < shape_m) ? srow_7_4 : last_row_4);
-                int word_9_4 = m_indices[srow_safe_8_4];
-                cur_m_2 = off_m_4;
-                cur_n_2 = off_n_4;
-                w0_2 = word_5;
-                w1_2 = word_3_4;
-                w2_2 = word_6_4;
-                w3_2 = word_9_4;
-            }
             unsigned int _phase_sf_full = 0;
             #pragma unroll 1
             for (unsigned int pair_2 = worker_idx_2; pair_2 < total_pairs_2; pair_2 += num_workers_2) {
-                unsigned int next_pair_2 = pair_2 + num_workers_2;
-                unsigned int next_safe_2 = ((next_pair_2 < total_pairs_2) ? next_pair_2 : pair_2);
-                unsigned int grid_np_5 = shape_n / 256;
-                unsigned int m_blocks_0_5 = (shape_m + 128 - 1) / 128;
-                unsigned int pairs_per_l2_6 = m_blocks_0_5 * 8;
-                unsigned int n_l2_limit_6 = (unsigned int)8;
-                unsigned int l2_group_6 = next_safe_2 / pairs_per_l2_6;
-                unsigned int first_np_6 = l2_group_6 * 8;
-                unsigned int in_l2_5 = next_safe_2 % pairs_per_l2_6;
-                unsigned int remaining_np_5 = grid_np_5 - first_np_6;
-                unsigned int n_in_l2_5 = ((remaining_np_5 > n_l2_limit_6) ? n_l2_limit_6 : remaining_np_5);
-                unsigned int m_block_5 = in_l2_5 / n_in_l2_5;
-                unsigned int n_pair_5 = first_np_6 + in_l2_5 % n_in_l2_5;
-                unsigned int off_m_5 = m_block_5 * 128;
-                unsigned int off_n_5 = (n_pair_5 * 2 + (unsigned int)cta_rank) * 128;
-                unsigned int last_row_5 = shape_m - 1;
-                unsigned int srow_8 = off_m_5;
-                unsigned int srow_safe_7 = ((srow_8 < shape_m) ? srow_8 : last_row_5);
-                int word_7 = m_indices[srow_safe_7];
-                unsigned int srow_1_5 = off_m_5 + 32;
-                unsigned int srow_safe_2_5 = ((srow_1_5 < shape_m) ? srow_1_5 : last_row_5);
-                int word_3_5 = m_indices[srow_safe_2_5];
-                unsigned int srow_4_5 = off_m_5 + 64;
-                unsigned int srow_safe_5_5 = ((srow_4_5 < shape_m) ? srow_4_5 : last_row_5);
-                int word_6_5 = m_indices[srow_safe_5_5];
-                unsigned int srow_7_5 = off_m_5 + 96;
-                unsigned int srow_safe_8_5 = ((srow_7_5 < shape_m) ? srow_7_5 : last_row_5);
-                int word_9_5 = m_indices[srow_safe_8_5];
-                unsigned int off_m_10_2 = cur_m_2;
-                unsigned int off_n_11_2 = cur_n_2;
-                int es_2 = w0_2;
-                if (off_m_10_2 >= shape_m) {
+                unsigned int grid_np_2 = shape_n / 256;
+                unsigned int m_blocks_0_2 = (shape_m + 128 - 1) / 128;
+                unsigned int pairs_per_l2_3 = m_blocks_0_2 * 8;
+                unsigned int n_l2_limit_2 = (unsigned int)8;
+                unsigned int l2_group_2 = pair_2 / pairs_per_l2_3;
+                unsigned int first_np_2 = l2_group_2 * 8;
+                unsigned int in_l2_2 = pair_2 % pairs_per_l2_3;
+                unsigned int remaining_np_2 = grid_np_2 - first_np_2;
+                unsigned int n_in_l2_2 = ((remaining_np_2 > n_l2_limit_2) ? n_l2_limit_2 : remaining_np_2);
+                unsigned int m_block_2 = in_l2_2 / n_in_l2_2;
+                unsigned int n_pair_2 = first_np_2 + in_l2_2 % n_in_l2_2;
+                unsigned int off_m_2 = m_block_2 * 128;
+                unsigned int off_n_2 = (n_pair_2 * 2 + (unsigned int)cta_rank) * 128;
+                unsigned int last_row_2 = shape_m - 1;
+                int e0_2 = m_indices[off_m_2];
+                unsigned int srow_3 = off_m_2 + 32;
+                unsigned int srow_safe_3 = ((srow_3 < shape_m) ? srow_3 : last_row_2);
+                int es_2 = m_indices[srow_safe_3];
+                if (srow_3 >= shape_m) {
                     es_2 = -1;
                 }
-                int es_12_2 = w1_2;
-                if (off_m_10_2 + 32 >= shape_m) {
-                    es_12_2 = -1;
+                unsigned int srow_1_2 = off_m_2 + 64;
+                unsigned int srow_safe_2_2 = ((srow_1_2 < shape_m) ? srow_1_2 : last_row_2);
+                int es_3_2 = m_indices[srow_safe_2_2];
+                if (srow_1_2 >= shape_m) {
+                    es_3_2 = -1;
                 }
-                int es_13_2 = w2_2;
-                if (off_m_10_2 + 64 >= shape_m) {
-                    es_13_2 = -1;
-                }
-                int es_14_2 = w3_2;
-                if (off_m_10_2 + 96 >= shape_m) {
-                    es_14_2 = -1;
+                unsigned int srow_4_2 = off_m_2 + 96;
+                unsigned int srow_safe_5_2 = ((srow_4_2 < shape_m) ? srow_4_2 : last_row_2);
+                int es_6_2 = m_indices[srow_safe_5_2];
+                if (srow_4_2 >= shape_m) {
+                    es_6_2 = -1;
                 }
                 unsigned int nsub_2 = (unsigned int)0;
                 unsigned int runs_2 = (unsigned int)0;
-                if (es_2 >= 0) {
+                if (e0_2 >= 0) {
                     nsub_2 = 1;
                     runs_2 = 1;
-                    if (es_12_2 >= 0) {
+                    if (es_2 >= 0) {
                         nsub_2 = nsub_2 + 1;
                     }
-                    if (es_13_2 >= 0) {
+                    if (es_3_2 >= 0) {
                         nsub_2 = nsub_2 + 1;
                     }
-                    if (es_14_2 >= 0) {
+                    if (es_6_2 >= 0) {
                         nsub_2 = nsub_2 + 1;
                     }
                 }
@@ -879,12 +707,6 @@ kernel_cake_grouped_fp8_gemm_b171fdd83d9c3356bb5e(const __grid_constant__ CUtens
                         if (transpose_stage == 8) { transpose_stage = 0; _phase_sf_full ^= 1; }
                     }
                 }
-                cur_m_2 = off_m_5;
-                cur_n_2 = off_n_5;
-                w0_2 = word_7;
-                w1_2 = word_3_5;
-                w2_2 = word_6_5;
-                w3_2 = word_9_5;
             }
             #pragma unroll
             for (int _tail_2 = 0; _tail_2 < 8; _tail_2++) {
@@ -903,126 +725,62 @@ kernel_cake_grouped_fp8_gemm_b171fdd83d9c3356bb5e(const __grid_constant__ CUtens
             unsigned int worker_idx_3 = (unsigned int)cluster_id;
             unsigned int m_blocks_4 = (shape_m + 128 - 1) / 128;
             unsigned int total_pairs_3 = m_blocks_4 * (shape_n / 256);
-            unsigned int cur_m_3 = (unsigned int)0;
-            unsigned int cur_n_3 = (unsigned int)0;
-            int w0_3 = -1;
-            int w1_3 = -1;
-            int w2_3 = -1;
-            int w3_3 = -1;
-            if (worker_idx_3 < total_pairs_3) {
-                unsigned int grid_np_6 = shape_n / 256;
-                unsigned int m_blocks_0_6 = (shape_m + 128 - 1) / 128;
-                unsigned int pairs_per_l2_7 = m_blocks_0_6 * 8;
-                unsigned int n_l2_limit_7 = (unsigned int)8;
-                unsigned int l2_group_7 = worker_idx_3 / pairs_per_l2_7;
-                unsigned int first_np_7 = l2_group_7 * 8;
-                unsigned int in_l2_7 = worker_idx_3 % pairs_per_l2_7;
-                unsigned int remaining_np_6 = grid_np_6 - first_np_7;
-                unsigned int n_in_l2_6 = ((remaining_np_6 > n_l2_limit_7) ? n_l2_limit_7 : remaining_np_6);
-                unsigned int m_block_6 = in_l2_7 / n_in_l2_6;
-                unsigned int n_pair_6 = first_np_7 + in_l2_7 % n_in_l2_6;
-                unsigned int off_m_6 = m_block_6 * 128;
-                unsigned int off_n_6 = (n_pair_6 * 2 + (unsigned int)cta_rank) * 128;
-                unsigned int last_row_6 = shape_m - 1;
-                unsigned int srow_9 = off_m_6;
-                unsigned int srow_safe_9 = ((srow_9 < shape_m) ? srow_9 : last_row_6);
-                int word_8 = m_indices[srow_safe_9];
-                unsigned int srow_1_6 = off_m_6 + 32;
-                unsigned int srow_safe_2_6 = ((srow_1_6 < shape_m) ? srow_1_6 : last_row_6);
-                int word_3_6 = m_indices[srow_safe_2_6];
-                unsigned int srow_4_6 = off_m_6 + 64;
-                unsigned int srow_safe_5_6 = ((srow_4_6 < shape_m) ? srow_4_6 : last_row_6);
-                int word_6_6 = m_indices[srow_safe_5_6];
-                unsigned int srow_7_6 = off_m_6 + 96;
-                unsigned int srow_safe_8_6 = ((srow_7_6 < shape_m) ? srow_7_6 : last_row_6);
-                int word_9_6 = m_indices[srow_safe_8_6];
-                cur_m_3 = off_m_6;
-                cur_n_3 = off_n_6;
-                w0_3 = word_8;
-                w1_3 = word_3_6;
-                w2_3 = word_6_6;
-                w3_3 = word_9_6;
-            }
             unsigned int _phase_mainloop_done = 0;
             #pragma unroll 1
             for (unsigned int pair_3 = worker_idx_3; pair_3 < total_pairs_3; pair_3 += num_workers_3) {
-                unsigned int next_pair_3 = pair_3 + num_workers_3;
-                unsigned int next_safe_3 = ((next_pair_3 < total_pairs_3) ? next_pair_3 : pair_3);
-                unsigned int grid_np_7 = shape_n / 256;
-                unsigned int m_blocks_0_7 = (shape_m + 128 - 1) / 128;
-                unsigned int pairs_per_l2_8 = m_blocks_0_7 * 8;
-                unsigned int n_l2_limit_8 = (unsigned int)8;
-                unsigned int l2_group_8 = next_safe_3 / pairs_per_l2_8;
-                unsigned int first_np_8 = l2_group_8 * 8;
-                unsigned int in_l2_8 = next_safe_3 % pairs_per_l2_8;
-                unsigned int remaining_np_8 = grid_np_7 - first_np_8;
-                unsigned int n_in_l2_7 = ((remaining_np_8 > n_l2_limit_8) ? n_l2_limit_8 : remaining_np_8);
-                unsigned int m_block_7 = in_l2_8 / n_in_l2_7;
-                unsigned int n_pair_7 = first_np_8 + in_l2_8 % n_in_l2_7;
-                unsigned int off_m_7 = m_block_7 * 128;
-                unsigned int off_n_7 = (n_pair_7 * 2 + (unsigned int)cta_rank) * 128;
-                unsigned int last_row_7 = shape_m - 1;
-                unsigned int srow_10 = off_m_7;
-                unsigned int srow_safe_10 = ((srow_10 < shape_m) ? srow_10 : last_row_7);
-                int word_10 = m_indices[srow_safe_10];
-                unsigned int srow_1_7 = off_m_7 + 32;
-                unsigned int srow_safe_2_7 = ((srow_1_7 < shape_m) ? srow_1_7 : last_row_7);
-                int word_3_7 = m_indices[srow_safe_2_7];
-                unsigned int srow_4_7 = off_m_7 + 64;
-                unsigned int srow_safe_5_7 = ((srow_4_7 < shape_m) ? srow_4_7 : last_row_7);
-                int word_6_7 = m_indices[srow_safe_5_7];
-                unsigned int srow_7_7 = off_m_7 + 96;
-                unsigned int srow_safe_8_7 = ((srow_7_7 < shape_m) ? srow_7_7 : last_row_7);
-                int word_9_7 = m_indices[srow_safe_8_7];
-                unsigned int off_m_10_3 = cur_m_3;
-                unsigned int off_n_11_3 = cur_n_3;
-                int es_3 = w0_3;
-                if (off_m_10_3 >= shape_m) {
-                    es_3 = -1;
+                unsigned int grid_np_3 = shape_n / 256;
+                unsigned int m_blocks_0_3 = (shape_m + 128 - 1) / 128;
+                unsigned int pairs_per_l2_4 = m_blocks_0_3 * 8;
+                unsigned int n_l2_limit_4 = (unsigned int)8;
+                unsigned int l2_group_3 = pair_3 / pairs_per_l2_4;
+                unsigned int first_np_3 = l2_group_3 * 8;
+                unsigned int in_l2_3 = pair_3 % pairs_per_l2_4;
+                unsigned int remaining_np_3 = grid_np_3 - first_np_3;
+                unsigned int n_in_l2_3 = ((remaining_np_3 > n_l2_limit_4) ? n_l2_limit_4 : remaining_np_3);
+                unsigned int m_block_3 = in_l2_3 / n_in_l2_3;
+                unsigned int n_pair_3 = first_np_3 + in_l2_3 % n_in_l2_3;
+                unsigned int off_m_3 = m_block_3 * 128;
+                unsigned int off_n_3 = (n_pair_3 * 2 + (unsigned int)cta_rank) * 128;
+                unsigned int last_row_3 = shape_m - 1;
+                int e0_3 = m_indices[off_m_3];
+                unsigned int srow_5 = off_m_3 + 32;
+                unsigned int srow_safe_4 = ((srow_5 < shape_m) ? srow_5 : last_row_3);
+                int es_4 = m_indices[srow_safe_4];
+                if (srow_5 >= shape_m) {
+                    es_4 = -1;
                 }
-                int es_12_3 = w1_3;
-                if (off_m_10_3 + 32 >= shape_m) {
-                    es_12_3 = -1;
+                unsigned int srow_1_3 = off_m_3 + 64;
+                unsigned int srow_safe_2_3 = ((srow_1_3 < shape_m) ? srow_1_3 : last_row_3);
+                int es_3_3 = m_indices[srow_safe_2_3];
+                if (srow_1_3 >= shape_m) {
+                    es_3_3 = -1;
                 }
-                int es_13_3 = w2_3;
-                if (off_m_10_3 + 64 >= shape_m) {
-                    es_13_3 = -1;
-                }
-                int es_14_3 = w3_3;
-                if (off_m_10_3 + 96 >= shape_m) {
-                    es_14_3 = -1;
+                unsigned int srow_4_3 = off_m_3 + 96;
+                unsigned int srow_safe_5_3 = ((srow_4_3 < shape_m) ? srow_4_3 : last_row_3);
+                int es_6_3 = m_indices[srow_safe_5_3];
+                if (srow_4_3 >= shape_m) {
+                    es_6_3 = -1;
                 }
                 unsigned int nsub_3 = (unsigned int)0;
                 unsigned int runs_3 = (unsigned int)0;
-                if (es_3 >= 0) {
+                if (e0_3 >= 0) {
                     nsub_3 = 1;
                     runs_3 = 1;
-                    if (es_12_3 >= 0) {
+                    if (es_4 >= 0) {
                         nsub_3 = nsub_3 + 1;
                     }
-                    if (es_13_3 >= 0) {
+                    if (es_3_3 >= 0) {
                         nsub_3 = nsub_3 + 1;
                     }
-                    if (es_14_3 >= 0) {
+                    if (es_6_3 >= 0) {
                         nsub_3 = nsub_3 + 1;
                     }
-                }
-                unsigned int last_row_15 = shape_m - 1;
-                unsigned int half_row = off_m_10_3 + (unsigned int)0 + nsub_3 * 32 - 16;
-                unsigned int half_safe = ((half_row < shape_m) ? half_row : last_row_15);
-                int half_entry = m_indices[half_safe];
-                if (half_row >= shape_m) {
-                    half_entry = -1;
                 }
                 #pragma unroll 1
                 for (unsigned int _run_3 = 0; _run_3 < runs_3; _run_3++) {
                     mbarrier_wait(mainloop_done_addr + (epi_stage_1) * 8, _phase_mainloop_done);
                     unsigned int num_strips = nsub_3 * 2;
-                    unsigned int drop_strip = num_strips;
-                    if (half_entry < 0) {
-                        drop_strip = num_strips - 1;
-                    }
-                    unsigned int row_base = off_m_10_3 + (unsigned int)0;
+                    unsigned int row_base = off_m_3 + (unsigned int)0;
                     int tmem_base = taddr + (unsigned int)((int)epi_stage_1 * 128) + (unsigned int)(epi_warp * 32 << 16);
                     #pragma unroll 1
                     for (unsigned int strip = 0; strip < num_strips; strip++) {
@@ -1066,14 +824,10 @@ kernel_cake_grouped_fp8_gemm_b171fdd83d9c3356bb5e(const __grid_constant__ CUtens
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         asm volatile("tcgen05.fence::before_thread_sync;");
                         asm volatile("barrier.sync 15, 128;" ::: "memory");
-                        unsigned int store_row = row_base + (unsigned int)col_strip;
-                        if (strip == drop_strip) {
-                            store_row = shape_m;
-                        }
                         if (warp == 4) {
                             if (elect_sync()) {
-                                tma_store_2d((&C_tma), off_n_11_3, store_row, stage_base);
-                                tma_store_2d((&C_tma), off_n_11_3 + 64, store_row, stage_base + 2048);
+                                tma_store_2d((&C_tma), off_n_3, row_base + (unsigned int)col_strip, stage_base);
+                                tma_store_2d((&C_tma), off_n_3 + 64, row_base + (unsigned int)col_strip, stage_base + 2048);
                                 asm volatile("cp.async.bulk.commit_group;");
                             }
                         }
@@ -1091,12 +845,6 @@ kernel_cake_grouped_fp8_gemm_b171fdd83d9c3356bb5e(const __grid_constant__ CUtens
                     epi_stage_1 += 1;
                     if (epi_stage_1 == 2) { epi_stage_1 = 0; _phase_mainloop_done ^= 1; }
                 }
-                cur_m_3 = off_m_7;
-                cur_n_3 = off_n_7;
-                w0_3 = word_10;
-                w1_3 = word_3_7;
-                w2_3 = word_6_7;
-                w3_3 = word_9_7;
             }
             if (epi_warp == 0) {
                 asm volatile("cp.async.bulk.wait_group.read 0;");
