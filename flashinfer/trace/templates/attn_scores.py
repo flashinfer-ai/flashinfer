@@ -946,12 +946,15 @@ def _capacity_topk_rows(
     ):
         return []
     if compression_ratio == 4:
-        return _compressed_topk_row_scores(
+        rows = _compressed_topk_row_scores(
             q, kv_fused, weights, qo_indptr, kv_indptr, block_table, math_mode, 4
         )
-    return _selective_topk_row_scores(
-        q, kv_fused, weights, qo_indptr, kv_indptr, block_table, math_mode
-    )
+    else:
+        rows = _selective_topk_row_scores(
+            q, kv_fused, weights, qo_indptr, kv_indptr, block_table, math_mode
+        )
+    # The full strategy shares the raw score helpers but keeps its own policy.
+    return [torch.where(torch.isnan(row), float("-inf"), row) for row in rows]
 
 
 def _capacity_topk_reference(
@@ -1221,7 +1224,7 @@ class _CapacityTopKTraceTemplate(TraceTemplate):
 fp8_paged_mqa_selective_topk_trace = _CapacityTopKTraceTemplate(
     op_type="paged_mqa_topk",
     name_prefix="fp8_paged_mqa_selective_topk",
-    description="Capacity-planned exact selective FP8 TopK with device step prefixes and -1 inactive suffixes.",
+    description="Capacity-planned exact selective FP8 TopK with device step prefixes, NaN scores ranked as -inf and -1 inactive suffixes.",
     axes={
         **fp8_paged_mqa_topk_trace.axes,
         "max_chunk_size": Var(description="Planned total Q-row capacity."),
@@ -1297,7 +1300,7 @@ fp8_paged_mqa_selective_topk_trace = _CapacityTopKTraceTemplate(
 fp8_paged_mqa_compressed_topk_trace = _CapacityTopKTraceTemplate(
     op_type="paged_mqa_topk",
     name_prefix="fp8_paged_mqa_compressed_topk",
-    description="Capacity-planned selective FP8 TopK over compressed KV and original-token step prefixes.",
+    description="Capacity-planned selective FP8 TopK over compressed KV and original-token step prefixes, with NaN scores ranked as -inf.",
     axes={
         **fp8_paged_mqa_selective_topk_trace.axes,
         "compression_ratio": Const(

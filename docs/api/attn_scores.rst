@@ -182,6 +182,11 @@ ReLU with the full scale. Fast is an explicit opt-in to those tradeoffs. FP16
 epilogue arithmetic is unchanged in either mode; FP16 output alone does not
 select FP16 arithmetic. TopK is exact for the selected scoring recipe, not
 a promise of bitwise equality between recipes.
+Selective treats a final NaN score as negative infinity consistently in
+sampling, candidate publication and exact repair. NaNs tie with genuine
+negative infinity, so valid indices from that tie can fill TopK when fewer
+than K higher scores exist. Short-row padding remains -1. The ordinary
+scorer and the full strategy keep their existing NaN behavior.
 The FP8 logits trace reference models FP32 epilogue and accumulation with
 FP32 or FP16 final output storage. It rejects other traced epilogue or
 accumulator precisions; the public scorer still supports its documented
@@ -328,7 +333,7 @@ device-side step validation.
 
 Both strategies use ``run(q, weights, kv_fused, ...)``. Full additionally
 requires ``block_table=...``; its host-reading planning signature remains
-``plan(q, kv_fused, weights, cu_q, cu_kv, block_table, ...)``. Use named payload
+``plan(q, kv_fused, weights, qo_indptr, kv_indptr, block_table, ...)``. Use named payload
 arguments when switching between the full plan and run calls.
 
 Capacities and the pool layout are fixed for the wrapper's lifetime; construct

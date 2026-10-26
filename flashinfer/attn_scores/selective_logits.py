@@ -89,6 +89,9 @@ def _candidate_target(top_k: int) -> int:
     Publication capacity is selected separately for each ownership layout.
     Targets above K1024 remain capped at 4096; bank overflow and underfill use
     exact repair. Sample ranks remain clipped to each row's valid samples.
+    The target/K margin decreases to 2 at K2048. Population and bank margins
+    are throughput heuristics; bounded publication and exact repair establish
+    correctness independently of the sample's population estimate.
     """
     return min(_MAX_TARGET_CANDIDATES, max(512, 4 * top_k))
 
@@ -4048,9 +4051,12 @@ class FP8PagedMQATopKWrapper:
     full scale across full scoring, sampling and every repair phase.
     ``"relu_fast"`` opts into packed FP32 x+abs(x) with one half-scale compensation.
     Fast doubled intermediates can overflow, tiny half-scales can underflow,
-    and -inf becomes NaN instead of zero. Both propagate NaN without a
-    payload guarantee; their local ReLUs map signed zero to +0, but whole
-    results need not be bit-identical. The selected recipe is immutable for
+    and -inf becomes NaN instead of zero. Both local ReLUs propagate NaN
+    without a payload guarantee and map signed zero to +0. Selective ranks
+    final NaN scores as -inf in every phase; NaNs tie with genuine -inf and
+    may supply valid indices when fewer than K higher scores exist. Full
+    keeps the public scorer's NaN behavior. Whole results need not be
+    bit-identical. The selected recipe is immutable for
     this wrapper's lifetime, including replan and graph capture. Construct
     another wrapper to change it. TopK is exact for the selected score recipe.
     """

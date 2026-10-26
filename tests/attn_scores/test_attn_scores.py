@@ -5972,6 +5972,99 @@ def test_unified_wrapper_exact_repair_negative_threshold(q_lengths, ties):
             _check_selection(corrupted, expected, 512)
 
 
+def _nan_score_inputs(q_lengths, kv_lengths, heads=8):
+    inputs = _request_inputs(q_lengths, kv_lengths, heads=heads)
+    q, kv, scale, weights, cu_q, cu_kv = inputs
+    q.copy_(torch.ones(q.shape, device=q.device).to(q.dtype))
+    kv.copy_(torch.ones(kv.shape, device=kv.device).to(kv.dtype))
+    scale.fill_(float("nan"))
+    weights.fill_(-1.0)
+    weights[0].fill_(1.0)
+    for start in cu_kv[:-1].tolist():
+        scale[start : start + 257] = torch.linspace(1.0, 2.0, 257, device=q.device)
+        scale[start] = float("inf")
+    for end in cu_q[1:].tolist():
+        weights[end - 1].fill_(float("nan"))
+    return inputs
+
+
+def _nan_as_negative_infinity_rows(inputs):
+    # Preserve genuine +/-inf; nan_to_num's defaults would also clamp them.
+    return [
+        torch.where(torch.isnan(scores), float("-inf"), scores)
+        for scores in _oracle_rows(inputs)
+    ]
+
+
+@_requires_selective_sm100
+@pytest.mark.parametrize("math_mode", ["relu_fast", "relu_strict"])
+@pytest.mark.parametrize("q_lengths", [[3], [3, 3]], ids=["compact", "standard"])
+def test_unified_wrapper_nan_scores_rank_as_negative_infinity(q_lengths, math_mode):
+    """Sampling, publication and exact repair agree on mixed/all-NaN rows."""
+    inputs = _nan_score_inputs(q_lengths, [9001] * len(q_lengths))
+    q, _, _, weights, cu_q, cu_kv = inputs
+    fused, table = _paged_inputs(inputs)
+    wrapper = FP8PagedMQATopKWrapper(
+        strategy="selective",
+        math_mode=math_mode,
+        max_context_length=9001,
+        max_chunk_size=q.shape[0],
+        max_batch_size=len(q_lengths),
+        kv_layout=fused,
+    )
+    wrapper.prepare_pool(fused)
+    engine = wrapper._capacity_plan._engine
+    assert engine._compact_repair == (len(q_lengths) == 1)
+    assert engine._sample_prepared is not None
+    expected = _nan_as_negative_infinity_rows(inputs)
+    assert torch.isposinf(expected[0]).any()
+    assert torch.isneginf(expected[-1]).all()
+
+    def check(selected):
+        torch.cuda.synchronize()
+        assert wrapper.error.item() == wrapper.repair_error.item() == 0
+        # Fewer than K finite keys force -inf ties into both bounded arenas.
+        assert engine._second_repair_flags.count_nonzero().item() == q.shape[0]
+        assert not torch.isnan(engine._sample_scores).any()
+        _check_selection(selected, expected, 512)
+
+    wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
+    check(wrapper.run(q, weights, fused))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
+        captured = wrapper.run(q, weights, fused)
+    graph.replay()
+    check(captured)
+
+
+@_requires_selective_sm100
+@pytest.mark.parametrize("math_mode", ["relu_fast", "relu_strict"])
+def test_h64_candidate_nan_scores_rank_as_negative_infinity(math_mode):
+    """The row-per-warpgroup publisher shares the generic NaN ordering."""
+    inputs = _nan_score_inputs([5], [16384], heads=64)
+    q, _, _, weights, cu_q, cu_kv = inputs
+    fused, table = _paged_inputs(inputs)
+    wrapper = SelectiveEngineCase(math_mode=math_mode)
+    wrapper.plan(q, fused, weights, cu_q, cu_kv, table, num_heads=64, num_sms=2)
+    assert wrapper._candidate_schedule.h64_candidate
+    expected = _nan_as_negative_infinity_rows(inputs)
+
+    def check(selected):
+        torch.cuda.synchronize()
+        assert wrapper._exact_error.item() == 0
+        assert wrapper._second_repair_flags.count_nonzero().item() == q.shape[0]
+        assert not torch.isnan(wrapper._sample_scores).any()
+        _check_selection(selected, expected, 512)
+
+    check(wrapper.run(q, fused, weights, table))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = wrapper.run(q, fused, weights, table)
+    graph.replay()
+    check(captured)
+
+
 @_requires_selective_sm100
 @pytest.mark.parametrize("math_mode", ["relu_fast", "relu_strict"])
 def test_sample_candidate_overflow_and_exact_modes(math_mode):

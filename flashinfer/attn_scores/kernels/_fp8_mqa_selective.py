@@ -216,6 +216,24 @@ def relu_f32(a: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
     )
 
 
+@dsl_user_op
+def selective_score_f32(a: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
+    """Rank NaN as -inf while preserving every non-NaN score, including infinities."""
+    # PTX max without .NaN selects the numeric operand if the other is NaN.
+    # Apply this before sampling/publication as well as EXACT/RADIX keying so
+    # every phase uses the same total order. Omitting .ftz preserves subnormals.
+    return cutlass.Float32(
+        llvm.inline_asm(
+            cutlass.Float32.mlir_type,
+            [cutlass.Float32(a).ir_value(loc=loc, ip=ip)],
+            "max.f32 $0, $1, 0fFF800000;",
+            "=f,f",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 @cute.jit
 def make_warp_uniform_i64(value) -> cutlass.Int64:
     """Materialize one warp-uniform 64-bit value as two uniform halves."""
@@ -1148,7 +1166,9 @@ class FP8MQASelectiveLogitsKernel(_FP8MQAEngineMixin):
                     # The common lifecycle owns stage acquire/commit/release;
                     # this pure sink writes only the final scaled score.
                     sStoreScores[(t, m_coord, store_stage, store_group)] = (
-                        cutlass.Float32(result_t) * cutlass.Float32(scale_val)
+                        selective_score_f32(
+                            cutlass.Float32(result_t) * cutlass.Float32(scale_val)
+                        )
                     )
                 else:
                     self._store_result_packed_causal_meta(
@@ -2251,7 +2271,9 @@ class FP8MQASelectiveLogitsKernel(_FP8MQAEngineMixin):
                 & (store_kv_pos >= row_start)
                 & (store_kv_pos < row_end)
             )
-        score = cutlass.Float32(result) * cutlass.Float32(scale_val)
+        score = selective_score_f32(
+            cutlass.Float32(result) * cutlass.Float32(scale_val)
+        )
 
         policy_word = cutlass.Int32(0)
         if cutlass.const_expr(self.mode != _SelectiveLogitsMode.SAMPLE):
@@ -2619,7 +2641,9 @@ class FP8MQASelectiveH64CandidateKernel(FP8MQASelectiveLogitsKernel):
                 )
         s0x, s0y, s1x, s1y = sums
         sum_x, sum_y = cute.arch.add_packed_f32x2((s0x, s0y), (s1x, s1y))
-        score = cutlass.Float32(sum_x + sum_y) * cutlass.Float32(scale)
+        score = selective_score_f32(
+            cutlass.Float32(sum_x + sum_y) * cutlass.Float32(scale)
+        )
         hit = (kv_pos >= row_start) & (kv_pos < row_end) & (score >= threshold)
         mask = cute.arch.vote_ballot_sync(hit)
         if mask != 0:
