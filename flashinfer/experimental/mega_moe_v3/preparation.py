@@ -41,7 +41,8 @@ def _mega_dispatch_reference(
     row offsets, tile list, and total M. Row assignment within an expert is
     runtime-nondeterministic (atomic claim order), so pool/metadata are checked
     via token_to_permuted, not by fixed row — this returns only the
-    order-independent quantities."""
+    order-independent quantities. A negative id routes its slot to no expert
+    (a masked token) and takes no row."""
     import torch
 
     T, TK = topk_idx.shape
@@ -49,7 +50,9 @@ def _mega_dispatch_reference(
     ids = topk_idx.cpu()
     for t in range(T):
         for k in range(TK):
-            counts[int(ids[t, k].item())] += 1
+            expert = int(ids[t, k].item())
+            if expert >= 0:
+                counts[expert] += 1
     pad = ((counts + align_m - 1) // align_m) * align_m
     offsets = torch.zeros(num_experts, dtype=torch.int64)
     running = 0
@@ -128,8 +131,6 @@ def build_tile_lists(per_expert_M, num_experts: int):
 
 def prepare_pipeline_bindings(inputs, num_sms):
     """Pack ``inputs`` for the persistent grid of a ``num_sms``-SM catalogued route."""
-    pr432_optimizations = True
-    capture_l1 = False
     import torch
 
     E, TK, T, H, I = (
@@ -145,18 +146,15 @@ def prepare_pipeline_bindings(inputs, num_sms):
         )
     if T < 1 or H % BLOCK_K or I % BLOCK_K:
         raise ValueError("MegaMoE requires positive T and H/I divisible by 256")
-    source_schedule = (
-        bool(pr432_optimizations)
-        and (not capture_l1)
-        and ((E, TK, H, I) == (384, 6, 5120, 2304))
-    )
     source_block_m = _source_block_m(T, E, TK)
     source_blocks = E + (T * TK + source_block_m - 1) // source_block_m
     N1, K1, N2, K2 = (2 * I, H, H, I)
     grid_n1, K1_tiles = (N1 // BLOCK_N, K1 // BLOCK_K)
     grid_n2, K2_tiles = (N2 // BLOCK_N, K2 // BLOCK_K)
     ref = _mega_dispatch_reference(inputs["topk_idx"], E)
-    M_total = ref["M_total"]
+    # A batch whose every slot is -1 routes no row; its pools keep one aligned
+    # block so that their tensor maps stay valid.
+    M_total = max(ref["M_total"], ALIGN_M)
     total_m_tiles = ref["total_m_tiles"]
     topk_idx_i32 = inputs["topk_idx"].contiguous().view(torch.int32)
     topk_weights_flat = inputs["topk_weights"].contiguous().view(-1)
@@ -181,55 +179,31 @@ def prepare_pipeline_bindings(inputs, num_sms):
     meta_token = torch.full((M_total,), -1, dtype=torch.int32, device="cuda")
     meta_slot = torch.full((M_total,), -1, dtype=torch.int32, device="cuda")
     num_sms = int(num_sms)
-    num_tiles = max(total_m_tiles * grid_n1, total_m_tiles * grid_n2)
-    persistent_grid = max(CTA_GROUP, min(num_sms - num_sms % CTA_GROUP, num_tiles))
-    if persistent_grid % CTA_GROUP != 0:
-        persistent_grid += CTA_GROUP - persistent_grid % CTA_GROUP
+    # The source schedule runs one CTA per SM (NUM_CTAS) however few tiles
+    # the routes fill, e.g. when -1 slots leave fewer routed tokens.
+    persistent_grid = num_sms
     grid = (persistent_grid, 1, 1)
     residual_readiness = (
-        source_schedule
-        and persistent_grid in (148, 152)
-        and (
-            (
-                float("inf")
-                if inputs.get("activation_clamp") is None
-                else float(inputs["activation_clamp"])
-            )
-            == 10.0
-        )
-        and (
-            weight_fmt == "fp4"
-            and T in (16, 128, 512, 1024, 4096)
-            or (weight_fmt == "fp8" and T == 16)
-        )
+        weight_fmt == "fp4"
+        and T in (16, 128, 512, 1024, 4096)
+        or (weight_fmt == "fp8" and T == 16)
     )
     arrival_words = total_m_tiles * K2_tiles
-    if source_schedule:
-        arrival_words = max(
-            arrival_words,
-            2 + (3 if T == 1 or residual_readiness else 2) * source_blocks,
-        )
-    reset_storage = (
-        torch.zeros(2 * E + 4 + arrival_words, dtype=torch.uint32, device="cuda")
-        if source_schedule and (T == 1 or residual_readiness)
-        else None
+    arrival_words = max(
+        arrival_words,
+        2 + (3 if T == 1 or residual_readiness else 2) * source_blocks,
     )
-    expert_counts = (
-        reset_storage[:E].view(torch.int32)
-        if reset_storage is not None
-        else torch.zeros(E, dtype=torch.int32, device="cuda")
+    reset_storage = torch.zeros(
+        2 * E + 4 + arrival_words, dtype=torch.uint32, device="cuda"
     )
+    expert_counts = reset_storage[:E].view(torch.int32)
     expert_row_offsets = torch.zeros(E, dtype=torch.int32, device="cuda")
-    if source_schedule and residual_readiness:
+    if residual_readiness:
         # Round-7 slot-list dispatch: per-expert slot list [E, T] (native
         # src_token_topk_idx), fully rewritten by every launch, never reset.
         expert_scatter_offsets = torch.empty(E * T, dtype=torch.int32, device="cuda")
     else:
-        expert_scatter_offsets = (
-            reset_storage[E : 2 * E].view(torch.int32)
-            if reset_storage is not None
-            else torch.zeros(E, dtype=torch.int32, device="cuda")
-        )
+        expert_scatter_offsets = reset_storage[E : 2 * E].view(torch.int32)
     tile_expert = torch.full((total_m_tiles,), -1, dtype=torch.int32, device="cuda")
     tile_m_local = torch.full((total_m_tiles,), -1, dtype=torch.int32, device="cuda")
     total_m_tiles_out = torch.zeros(1, dtype=torch.int32, device="cuda")
@@ -237,23 +211,11 @@ def prepare_pipeline_bindings(inputs, num_sms):
     SF_I = torch.zeros(M_total, I // GRAN_OUT, dtype=torch.uint8, device="cuda")
     expert_output = torch.zeros(M_total, H, dtype=torch.bfloat16, device="cuda")
     y = torch.zeros(T, H, dtype=torch.bfloat16, device="cuda")
-    l1_bf16 = (
-        torch.full((M_total, N1), float("nan"), dtype=torch.bfloat16, device="cuda")
-        if capture_l1
-        else expert_output
-    )
-    if reset_storage is not None:
-        histogram_done = reset_storage[2 * E : 2 * E + 1]
-        prefix_done = reset_storage[2 * E + 1 : 2 * E + 2]
-        dispatch_done = reset_storage[2 * E + 2 : 2 * E + 3]
-        l2_done = reset_storage[2 * E + 3 : 2 * E + 4]
-        l1_arrival = reset_storage[2 * E + 4 :]
-    else:
-        histogram_done = torch.zeros(1, dtype=torch.uint32, device="cuda")
-        prefix_done = torch.zeros(1, dtype=torch.uint32, device="cuda")
-        dispatch_done = torch.zeros(1, dtype=torch.uint32, device="cuda")
-        l1_arrival = torch.zeros(arrival_words, dtype=torch.uint32, device="cuda")
-        l2_done = torch.zeros(1, dtype=torch.uint32, device="cuda")
+    histogram_done = reset_storage[2 * E : 2 * E + 1]
+    prefix_done = reset_storage[2 * E + 1 : 2 * E + 2]
+    dispatch_done = reset_storage[2 * E + 2 : 2 * E + 3]
+    l2_done = reset_storage[2 * E + 3 : 2 * E + 4]
+    l1_arrival = reset_storage[2 * E + 4 :]
     launch_kwargs = dict(
         grid=grid,
         topk_idx_i32=topk_idx_i32,
@@ -277,7 +239,7 @@ def prepare_pipeline_bindings(inputs, num_sms):
         SFB1=SFB1,
         I_fp8_w=I_fp8,
         SF_I_w=SF_I,
-        l1_bf16_capture=l1_bf16,
+        l1_bf16_capture=expert_output,
         A2=I_fp8,
         SFA2=SF_I.view(torch.uint32),
         B2=B2,
@@ -306,39 +268,32 @@ def prepare_pipeline_bindings(inputs, num_sms):
         if inputs.get("activation_clamp") is None
         else float(inputs["activation_clamp"]),
     )
-    if source_schedule:
-        for name in ("SFB1", "SFB2"):
-            original = launch_kwargs[name]
-            groups, rows, words_k = original.shape
-            packed = original.reshape(groups, rows // 128, 4, 32, words_k).transpose(
-                2, 3
-            )
-            launch_kwargs[name] = (
-                packed.reshape(groups, rows, words_k)
-                .permute(0, 2, 1)
-                .contiguous()
-                .reshape(-1, rows)
-            )
-        for name in ("B1", "B2"):
-            original = launch_kwargs[name]
-            launch_kwargs[name] = original.reshape(-1, original.shape[-1])
-        source_rows = source_blocks * 128
-        source_sf1 = torch.zeros(
-            (H // 128, source_rows), dtype=torch.uint32, device="cuda"
+    for name in ("SFB1", "SFB2"):
+        original = launch_kwargs[name]
+        groups, rows, words_k = original.shape
+        packed = original.reshape(groups, rows // 128, 4, 32, words_k).transpose(2, 3)
+        launch_kwargs[name] = (
+            packed.reshape(groups, rows, words_k)
+            .permute(0, 2, 1)
+            .contiguous()
+            .reshape(-1, rows)
         )
-        source_sf2 = torch.zeros(
-            (I // 128, source_rows), dtype=torch.uint32, device="cuda"
-        )
-        launch_kwargs.update(
-            PrivateCounters=l1_arrival[:2],
-            PrivateMasks=l1_arrival[2 : 2 + 2 * source_blocks].view(torch.uint64),
-            PublicExpertOutput=expert_output.view(torch.uint32),
-            PrivateSFBlockOffsets=torch.empty((E,), dtype=torch.uint32, device="cuda"),
-            PrivateSF1=source_sf1,
-            PrivateSF2=source_sf2,
-            PrivateSF1Words=source_sf1.reshape(-1),
-            PrivateSF2Bytes=source_sf2.view(torch.uint8).reshape(-1),
-        )
+    for name in ("B1", "B2"):
+        original = launch_kwargs[name]
+        launch_kwargs[name] = original.reshape(-1, original.shape[-1])
+    source_rows = source_blocks * 128
+    source_sf1 = torch.zeros((H // 128, source_rows), dtype=torch.uint32, device="cuda")
+    source_sf2 = torch.zeros((I // 128, source_rows), dtype=torch.uint32, device="cuda")
+    launch_kwargs.update(
+        PrivateCounters=l1_arrival[:2],
+        PrivateMasks=l1_arrival[2 : 2 + 2 * source_blocks].view(torch.uint64),
+        PublicExpertOutput=expert_output.view(torch.uint32),
+        PrivateSFBlockOffsets=torch.empty((E,), dtype=torch.uint32, device="cuda"),
+        PrivateSF1=source_sf1,
+        PrivateSF2=source_sf2,
+        PrivateSF1Words=source_sf1.reshape(-1),
+        PrivateSF2Bytes=source_sf2.view(torch.uint8).reshape(-1),
+    )
     reset_buffers = (
         expert_counts,
         expert_scatter_offsets,
@@ -354,7 +309,7 @@ def prepare_pipeline_bindings(inputs, num_sms):
         reset_buffers=reset_buffers,
         output=y,
         expert_output=expert_output,
-        source_schedule=source_schedule,
+        source_schedule=True,
         grid=grid,
         M_total=M_total,
         total_m_tiles=total_m_tiles,

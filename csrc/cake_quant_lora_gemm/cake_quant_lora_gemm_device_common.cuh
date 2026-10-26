@@ -67,7 +67,7 @@ union MmaSmemDesc {
 #include "cake_device_helpers/cake_tma_2d_gmem2smem_cta2_5672cfb9c8e38a51.cuh"
 #include "cake_device_helpers/cake_tma_store_2d_d8ce2704cc6b8732.cuh"
 #include "cake_device_helpers/cake_tmem_st_x32_f32_8db5b92d2c24a1f0.cuh"
-#include "cake_device_helpers/cake_mbarrier_wait_relaxed_hint_6c7a98f6a495754c.cuh"
+#include "cake_device_helpers/cake_mbarrier_wait_plain_hint_eabc759051cd90a7.cuh"
 #include "cake_device_helpers/cake_mbarrier_wait_cluster_hint_bdb29a0e36dedbee.cuh"
 #include "cake_device_helpers/cake_mbarrier_arrive_expect_tx_54ce59d489f69526.cuh"
 #include "cake_device_helpers/cake_make_warp_uniform_26e432f3ff129648.cuh"

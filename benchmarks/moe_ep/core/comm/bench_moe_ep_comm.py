@@ -51,6 +51,7 @@ FP4_E2M1_MAX = 6.0
 DISPATCH_FORMATS = {
     "bf16": None,
     "fp8": "FP8PerTensor",
+    "fp8_block_scale": "DeepSeekFp8",
     "mxfp8": "MXFP8",
     "nvfp4": "NVFP4",
 }
@@ -153,6 +154,17 @@ def quantize_fp8_per_tensor(x: torch.Tensor) -> Tuple[torch.Tensor, None]:
     return (x.float() * (FP8_E4M3_MAX / amax)).to(torch.float8_e4m3fn), None
 
 
+def quantize_fp8_block_scale(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """DeepSeek FP8: E4M3 values with one FP32 scale per 128 elements."""
+    num_tokens, hidden = x.shape
+    if hidden % 128:
+        raise ValueError(f"fp8_block_scale needs hidden_size % 128 == 0, got {hidden}")
+    blocks = x.float().view(num_tokens, hidden // 128, 128)
+    scales = blocks.abs().amax(-1, keepdim=True).clamp(min=1e-12) / FP8_E4M3_MAX
+    values = (blocks / scales).to(torch.float8_e4m3fn)
+    return values.view(num_tokens, hidden), scales.squeeze(-1)
+
+
 def quantize_mxfp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """MXFP8: E4M3 values with one UE8M0 scale per 32 elements."""
     num_tokens, hidden = x.shape
@@ -208,6 +220,8 @@ def quantize_input(
         return x, None
     if quant == "fp8":
         return quantize_fp8_per_tensor(x)
+    if quant == "fp8_block_scale":
+        return quantize_fp8_block_scale(x)
     if quant == "mxfp8":
         return quantize_mxfp8(x)
     if quant == "nvfp4":

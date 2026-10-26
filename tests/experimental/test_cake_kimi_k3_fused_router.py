@@ -467,6 +467,34 @@ def test_launch_grid_rules(compute_capability, sm_count):
         launch_grid("A", 1, **kw)
 
 
+@pytest.mark.parametrize(
+    "compute_capability,sm_count,admits_m",
+    [
+        ((10, 0), 42, False),
+        ((10, 0), 43, True),
+        ((10, 3), 31, False),
+        ((10, 3), 32, True),
+    ],
+)
+def test_launch_grid_small_devices(compute_capability, sm_count, admits_m):
+    cap = persistent_grid_cap(compute_capability, sm_count)
+    kw = dict(compute_capability=compute_capability, sm_count=sm_count)
+    # Arm M: CTA b < OWNER_CTAS alone publishes experts 7b to 7b + 6, so a
+    # device whose persistent grid cap is below OWNER_CTAS cannot run it.
+    assert (cap >= OWNER_CTAS) == admits_m
+    if admits_m:
+        assert launch_grid("M", 256, **kw) == min(256, cap)
+    else:
+        with pytest.raises(RuntimeError, match="co-resident owner CTAs"):
+            launch_grid("M", 256, **kw)
+    # Arms L / LP and GW stride their owners over the experts, so any grid
+    # publishes the whole plan.
+    for arm in ARM_L_FAMILY:
+        assert launch_grid(arm, 128, **kw) == min(ARM_L_MIN_GRID, cap)
+    gw_ctas = ARM_GW_CTAS_PER_SM[compute_capability] * sm_count
+    assert launch_grid("GW", 4096, **kw) == min(4096, gw_ctas)
+
+
 def test_registry_keys_are_dispatch_arms():
     for arch, table in cake_jit.ROUTES.items():
         assert arch in SHAPE_ROUTES

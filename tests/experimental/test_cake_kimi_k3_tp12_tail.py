@@ -38,10 +38,10 @@ from flashinfer.experimental.kimi_k3_tp12_tail import cake_jit
 
 ATOL = RTOL = 1e-2
 SEED = 620
-# Fused K23 rows (M <= 8: the four-token module at 1 / 4, the eight-token module at 6 / 8), K3-ESS rows with the
-# one-shot / two-shot ESS K1, the plain persistent K3 at 256 and one cp.async.bulk pinned row (M > 256).
-GPU_ROWS = (1, 4, 6, 8, 16, 32, 128, 256, 300)
-GPU_MAX_TOKENS = 512
+# One-launch rows (M <= 8: the four-token program at 1 / 4, the eight-token program at 6 / 8), K3-ESS rows with the
+# one-shot / two-shot ESS K1 up to the last ESS row 960, and the first cp.async.bulk persistent rows 961 / 962.
+GPU_ROWS = (1, 4, 6, 8, 16, 32, 128, 256, 300, 960, 961, 962)
+GPU_MAX_TOKENS = 1024
 
 
 def test_partition_covers_hidden_in_128_column_blocks():
@@ -55,55 +55,68 @@ def test_partition_covers_hidden_in_128_column_blocks():
 
 
 def test_route_selection_by_token_count():
-    # fused K23 regime: ESS one-shot K1 + fused slice GEMM / tail, module by the rank's column width and by the
-    # accumulator capacity ladder (the four-token module for M <= 4, the eight-token module for 5 <= M <= 8)
+    # one-launch regime: the ESS one-shot K1 and the fused slice GEMM / tail as two CTA roles of one grid, program by
+    # the accumulator capacity ladder (the four-token program for M <= 4, the eight-token program for 5 <= M <= 8)
     assert cb.K23_MAX_TOKENS == 8 and cb.K23_ROWS == 8 and cb.K23_LADDER == (4, 8)
     for M in (1, 2, 3, 4, 5, 6, 7, 8):
         capacity = 4 if M <= 4 else 8
         assert cb.k23_capacity_for(M) == capacity
         for rank in range(cb.WORLD_SIZE):
             # one program per capacity on every rank: the rank is a launch argument, the column width a grid size
-            assert cb.route_kernel_keys(M, rank) == (
-                "k1_oneshot_ess",
-                f"k23:c{capacity}",
-            )
+            assert cb.route_kernel_keys(M, rank) == (f"k123:c{capacity}",)
+            assert cb.k1_kernel_key(M, rank) == f"k123:c{capacity}"
+        assert cb.k3_form_for(M) == "k123"
+        # no tail launch of its own
+        with pytest.raises(ValueError):
+            cb.k3_kernel_key(M, 0)
+        with pytest.raises(ValueError):
+            cb.k3_grid(M, 152, 0)
     assert cb.up_proj_form_for(8) == "k23" and cb.up_proj_form_for(9) == "cublas"
-    assert cb.k3_kernel_key(4, 0) == "k23:c4"
-    assert cb.k3_kernel_key(5, 0) == "k23:c8"
-    assert cb.k3_kernel_key(8, 11) == "k23:c8"
     with pytest.raises(ValueError):
         cb.k23_capacity_for(9)
+    # the token CTAs, then one K23 CTA per K23_ROWS output columns of the rank (80 for 640, 64 for 512)
+    assert cb.k123_grid(1, 0) == (81, 1, 1)
+    assert cb.k123_grid(4, 11) == (68, 1, 1)
+    assert cb.k123_grid(8, 0) == (88, 1, 1)
+    with pytest.raises(ValueError):
+        cb.k123_grid(9, 0)
     # cuBLAS + K3-ESS regime: the ESS K1 scattered the shared partial, one CTA per token and column half
     for M in (9, 12, 16):
         for rank in range(cb.WORLD_SIZE):
             assert cb.route_kernel_keys(M, rank) == ("k1_oneshot_ess", "k3_ess:grouped")
-    for M in (17, 32, 128, 255):
+    for M in (17, 32, 128, 255, 256, 257, 512, 960):
         assert cb.route_kernel_keys(M, 3) == (
             "k1_twoshot_ess:grouped",
             "k3_ess:grouped",
         )
-    # persistent K3 pipeline from K3_PERSIST_MIN_TOKENS on: plain at 256 (grouped), cp.async.bulk pushes above (pinned)
-    assert cb.K3_PERSIST_MIN_TOKENS == 256 and cb.BULK_MIN_TOKENS == 257
-    assert cb.route_kernel_keys(256, 3) == ("k1_twoshot:grouped", "k3_persist:grouped")
-    for M in (257, 512, 4096):
+    # persistent K3 pipeline with cp.async.bulk pushes (pinned) from K3_PERSIST_MIN_TOKENS on
+    assert cb.GROUPED_MAX_TOKENS == 960
+    assert cb.K3_PERSIST_MIN_TOKENS == cb.BULK_MIN_TOKENS == 961
+    for M in (961, 962, 1024, 2048, 4096):
         assert cb.route_kernel_keys(M, 3) == (
             "k1_twoshot:pinned",
             "k3_persist_bulk:pinned",
         )
-    for M in (1, 4, 5, 255, 256, 257, 4096):
+    for M in (1, 4, 5, 8):
+        assert len(cb.route_kernel_keys(M, 0)) == 1
+    for M in (9, 255, 256, 257, 960, 961, 4096):
         assert len(cb.route_kernel_keys(M, 0)) == 2
-    assert cb.k3_form_for(8) == "k23" and cb.k3_form_for(9) == "ess"
-    assert cb.k3_form_for(255) == "ess" and cb.k3_form_for(256) == "persist"
-    assert cb.k3_form_for(257) == "persist_bulk"
-    # K23: one CTA per K23_ROWS output columns of the rank (80 for 640, 64 for 512)
-    assert cb.k3_grid(1, 152, 0) == (80, 1, 1)
-    assert cb.k3_grid(4, 148, 11) == (64, 1, 1)
-    assert cb.k3_grid(8, 152, 0) == (80, 1, 1)
+    assert cb.k3_form_for(8) == "k123" and cb.k3_form_for(9) == "ess"
+    assert cb.k3_form_for(256) == "ess" and cb.k3_form_for(960) == "ess"
+    assert cb.k3_form_for(961) == "persist_bulk"
+    # the plain grouped two-shot K1 and the plain persistent K3 stay registered, but no token count selects them
+    selected = {key for M in range(1, 4097) for key in cb.route_kernel_keys(M, 0)}
+    assert selected == set(cake_jit.required_kernel_keys()) - {
+        "k1_twoshot:grouped",
+        "k3_persist:grouped",
+    }
     # K3-ESS: one CTA per token and column half; persistent forms: min(M, SM count)
     assert cb.k3_grid(9, 152, 0) == (9, 2, 1)
     assert cb.k3_grid(100, 152, 3) == (100, 2, 1)
     assert cb.k3_grid(255, 152, 3) == (255, 2, 1)
-    assert cb.k3_grid(256, 152, 3) == (152, 2, 1)
+    assert cb.k3_grid(256, 152, 3) == (256, 2, 1)
+    assert cb.k3_grid(960, 148, 3) == (960, 2, 1)
+    assert cb.k3_grid(961, 152, 3) == (152, 2, 1)
     assert cb.k3_grid(4096, 148, 3) == (148, 2, 1)
     with pytest.raises(ValueError):
         cb.k3_grid(4096, 0, 3)
@@ -113,8 +126,8 @@ def test_route_selection_by_token_count():
         "k1_twoshot_ess:grouped",
         "k1_twoshot:grouped",
         "k1_twoshot:pinned",
-        "k23:c4",
-        "k23:c8",
+        "k123:c4",
+        "k123:c8",
         "k3_ess:grouped",
         "k3_persist:grouped",
         "k3_persist_bulk:pinned",
@@ -204,42 +217,59 @@ def test_launch_kwargs_cover_every_generated_argument_plan():
             "no generated Kimi-K3 TP12 tail program is registered in this checkout"
         )
     workspace = _LaunchKwargsWorkspace()
+    cases = [
+        (M, rank, cb.route_kernel_keys(M, rank))
+        for M in (1, 4, 5, 8, 9, 16, 17, 32, 128, 255, 256, 300, 960, 961, 1024)
+        for rank in (0, 5, 11)
+    ]
+    # registered programs no token count selects: the plain grouped two-shot K1 and the plain persistent K3
+    cases += [
+        (300, rank, ("k1_twoshot:grouped", "k3_persist:grouped")) for rank in (0, 5, 11)
+    ]
     seen: set[str] = set()
-    for M in (1, 4, 5, 8, 9, 16, 17, 32, 128, 255, 256, 300, 1024):
-        for rank in (0, 5, 11):
-            k1_key, k3_key = cb.route_kernel_keys(M, rank)
-            name, k1_kwargs = cb._k1_launch_kwargs(
-                k1_key,
-                M=M,
-                rank=rank,
-                workspace=workspace,
-                routed_partial=None,
-                shared_partial=None,
-                y=None,
-                norm_weight=None,
+    for M, rank, keys in cases:
+        k1_key = keys[0]
+        name, k1_kwargs = cb._k1_launch_kwargs(
+            k1_key,
+            M=M,
+            rank=rank,
+            workspace=workspace,
+            routed_partial=None,
+            shared_partial=None,
+            y=None,
+            norm_weight=None,
+            up_weight_slice=None,
+            out=None,
+        )
+        assert name == ("k1_oneshot" if M <= cb.ONESHOT_MAX_TOKENS else "k1_twoshot")
+        launches = [(k1_key, k1_kwargs)]
+        if M <= cb.K23_MAX_TOKENS:
+            # the one-launch program: the token CTAs, then the rank's K23 CTAs
+            assert len(keys) == 1
+            assert k1_kwargs["grid"] == (
+                M + workspace.my_cols // cb.K23_ROWS,
+                1,
+                1,
             )
-            assert name == (
-                "k1_oneshot" if M <= cb.ONESHOT_MAX_TOKENS else "k1_twoshot"
-            )
-            grid = cb.k3_grid(M, workspace.sm_count, rank)
+        else:
+            (k3_key,) = keys[1:]
             k3_kwargs = cb._k3_launch_kwargs(
                 k3_key,
                 M=M,
                 rank=rank,
                 workspace=workspace,
-                grid=grid,
+                grid=cb.k3_grid(M, workspace.sm_count, rank),
                 shared_partial=None,
-                y=None,
                 gemm=None,
-                up_weight_slice=None,
                 out=None,
             )
-            for key, kwargs in ((k1_key, k1_kwargs), (k3_key, k3_kwargs)):
-                record = cake_jit.MODULES[cake_jit.KERNELS[key]]
-                expected = {name for kind, name in record["arg_plan"] if kind != "grid"}
-                assert expected <= set(kwargs), (key, sorted(expected - set(kwargs)))
-                assert len(kwargs["grid"]) == 3, key
-                seen.add(key)
+            launches.append((k3_key, k3_kwargs))
+        for key, kwargs in launches:
+            record = cake_jit.MODULES[cake_jit.KERNELS[key]]
+            expected = {name for kind, name in record["arg_plan"] if kind != "grid"}
+            assert expected <= set(kwargs), (key, sorted(expected - set(kwargs)))
+            assert len(kwargs["grid"]) == 3, key
+            seen.add(key)
     assert seen == set(cake_jit.required_kernel_keys())
 
 
@@ -364,9 +394,16 @@ def test_tail_matches_reference_on_twelve_ranks():
                 workspace=workspace,
             )
             assert runner.kernel_keys == cb.route_kernel_keys(M, rank)
-            assert runner.k3.kwargs["grid"] == cb.k3_grid(M, workspace.sm_count, rank)
             assert runner.cublas == (M > cb.K23_MAX_TOKENS)
-            assert runner.launch_count == (2 if M <= cb.K23_MAX_TOKENS else 3)
+            if M <= cb.K23_MAX_TOKENS:
+                # one launch: the one-launch program, no tail launch
+                assert runner.k3 is None and runner.launch_count == 1
+                assert runner.k1.kwargs["grid"] == cb.k123_grid(M, rank)
+            else:
+                assert runner.launch_count == 3
+                assert runner.k3.kwargs["grid"] == cb.k3_grid(
+                    M, workspace.sm_count, rank
+                )
             inp["out"].fill_(float("nan"))
             runner()
             torch.cuda.synchronize()

@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer import autotune, mm_bf16
+from flashinfer.autotuner import AutoTuner
 from flashinfer.gemm.gemm_base import CUDNN_AVAILABLE
 from flashinfer.gemm import is_cuda_tile_available
 from flashinfer.utils import get_compute_capability, is_sm100a_supported
@@ -142,6 +143,25 @@ def test_mm_bf16(
             input.float(), mat2.float(), bias.float() if bias is not None else None
         ).to(res_dtype)
         torch.testing.assert_close(out, fp32_reference, rtol=2e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize("backend", ["auto", "cudnn"])
+@pytest.mark.parametrize("padded", [False, True])
+def test_mm_bf16_autotune_weight_layouts(monkeypatch, backend, padded):
+    """Autotuning stages dense and padded weights in the cold-chain arena."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("The cold-chain BF16 tuning config is used on SM100-family.")
+    if backend == "cudnn" and not CUDNN_AVAILABLE:
+        pytest.skip("cuDNN is not available on this system.")
+
+    monkeypatch.setattr(AutoTuner, "_instance", AutoTuner())
+    torch.manual_seed(0)
+    a = torch.randn(16, 512, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(256, 640 if padded else 512, device="cuda", dtype=torch.bfloat16)
+    b = w[:, :512].T
+    with autotune(True, tuning_buckets=[16]):
+        out = mm_bf16(a, b, backend=backend)
+    torch.testing.assert_close(out, a @ b, rtol=2e-2, atol=5e-2)
 
 
 def test_mm_bf16_cutile_rejects_bias_and_pdl():

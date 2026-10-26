@@ -11,6 +11,8 @@
 
 #ifdef FLASHINFER_CAKE_BACKEND
 #include "cake_deepseek_fused_routing/cake_deepseek_fused_routing_kernels.cu"
+#include "cake_deepseek_fused_routing/cake_deepseek_fused_routing_kernels_sm107a_mt.cu"
+#include "cake_deepseek_fused_routing/cake_deepseek_fused_routing_kernels_sm107a_single.cu"
 #include "cake_deepseek_fused_routing_launch.cuh"
 #endif
 

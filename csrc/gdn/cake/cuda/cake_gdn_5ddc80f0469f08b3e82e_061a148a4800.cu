@@ -16,6 +16,14 @@
 // Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
 #include "cake_gdn_device_common.cuh"
 
+// Shared-memory descriptor address mask of this body: the 15-bit form on
+// SM107a, the 14-bit form on SM100a/SM103a (device compilation only).
+#if __CUDA_ARCH__ == 1070
+#define CAKE_GDN_SMEM_DESC_MASK 0x7FFF
+#else
+#define CAKE_GDN_SMEM_DESC_MASK 0x3FFF
+#endif  // __CUDA_ARCH__
+
 #define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 512
 #define TMEM_TMEM_STATE_OFFSET 0
@@ -2386,8 +2394,8 @@ kernel_cake_gdn_5ddc80f0469f08b3e82e(const __grid_constant__ CUtensorMap Q, cons
                     k_cg0_stage += 1;
                     if (k_cg0_stage == 4) { k_cg0_stage = 0; k_cg0_phase ^= 1; }
                     mbarrier_wait(cg0_shared_acc_empty_addr, 1);
-                    int _mma_a_lo_0 = make_warp_uniform((((smem_k_addr) >> 4) & 0x3FFF) + (k0_stage) * 1024);
-                    int _mma_b_lo_0 = make_warp_uniform((((smem_k_addr) >> 4) & 0x3FFF) + (k0_stage) * 1024);
+                    int _mma_a_lo_0 = make_warp_uniform((((smem_k_addr) >> 4) & CAKE_GDN_SMEM_DESC_MASK) + (k0_stage) * 1024);
+                    int _mma_b_lo_0 = make_warp_uniform((((smem_k_addr) >> 4) & CAKE_GDN_SMEM_DESC_MASK) + (k0_stage) * 1024);
                     {
                         uint64_t _mma_ss_a_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_0);
                         uint64_t _mma_ss_b_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_0);
@@ -2436,8 +2444,8 @@ kernel_cake_gdn_5ddc80f0469f08b3e82e(const __grid_constant__ CUtensorMap Q, cons
                     k_cg0_stage += 1;
                     if (k_cg0_stage == 4) { k_cg0_stage = 0; k_cg0_phase ^= 1; }
                     mbarrier_wait(cg0_shared_acc_empty_addr + 8, 1);
-                    int _mma_a_lo_1 = make_warp_uniform((((smem_k_addr) >> 4) & 0x3FFF) + (k1_stage) * 1024);
-                    int _mma_b_lo_1 = make_warp_uniform((((smem_k_addr) >> 4) & 0x3FFF) + (k1_stage) * 1024);
+                    int _mma_a_lo_1 = make_warp_uniform((((smem_k_addr) >> 4) & CAKE_GDN_SMEM_DESC_MASK) + (k1_stage) * 1024);
+                    int _mma_b_lo_1 = make_warp_uniform((((smem_k_addr) >> 4) & CAKE_GDN_SMEM_DESC_MASK) + (k1_stage) * 1024);
                     {
                         uint64_t _mma_ss_a_desc_1 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_1);
                         uint64_t _mma_ss_b_desc_1 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_1);
@@ -2486,8 +2494,8 @@ kernel_cake_gdn_5ddc80f0469f08b3e82e(const __grid_constant__ CUtensorMap Q, cons
                     q_cg0_stage += 1;
                     if (q_cg0_stage == 2) { q_cg0_stage = 0; q_cg0_phase ^= 1; }
                     mbarrier_wait(cg0_shared_acc_empty_addr, 0);
-                    int _mma_a_lo_2 = make_warp_uniform((((smem_q_addr) >> 4) & 0x3FFF) + (q0_stage) * 1024);
-                    int _mma_b_lo_2 = make_warp_uniform((((smem_k_addr) >> 4) & 0x3FFF) + (k0_stage) * 1024);
+                    int _mma_a_lo_2 = make_warp_uniform((((smem_q_addr) >> 4) & CAKE_GDN_SMEM_DESC_MASK) + (q0_stage) * 1024);
+                    int _mma_b_lo_2 = make_warp_uniform((((smem_k_addr) >> 4) & CAKE_GDN_SMEM_DESC_MASK) + (k0_stage) * 1024);
                     {
                         uint64_t _mma_ss_a_desc_2 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_2);
                         uint64_t _mma_ss_b_desc_2 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_2);
@@ -2536,8 +2544,8 @@ kernel_cake_gdn_5ddc80f0469f08b3e82e(const __grid_constant__ CUtensorMap Q, cons
                     q_cg0_stage += 1;
                     if (q_cg0_stage == 2) { q_cg0_stage = 0; q_cg0_phase ^= 1; }
                     mbarrier_wait(cg0_shared_acc_empty_addr + 8, 0);
-                    int _mma_a_lo_3 = make_warp_uniform((((smem_q_addr) >> 4) & 0x3FFF) + (q1_stage) * 1024);
-                    int _mma_b_lo_3 = make_warp_uniform((((smem_k_addr) >> 4) & 0x3FFF) + (k1_stage) * 1024);
+                    int _mma_a_lo_3 = make_warp_uniform((((smem_q_addr) >> 4) & CAKE_GDN_SMEM_DESC_MASK) + (q1_stage) * 1024);
+                    int _mma_b_lo_3 = make_warp_uniform((((smem_k_addr) >> 4) & CAKE_GDN_SMEM_DESC_MASK) + (k1_stage) * 1024);
                     {
                         uint64_t _mma_ss_a_desc_3 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_3);
                         uint64_t _mma_ss_b_desc_3 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_3);
@@ -2761,7 +2769,7 @@ kernel_cake_gdn_5ddc80f0469f08b3e82e(const __grid_constant__ CUtensorMap Q, cons
                             _phase_state_inp_ready_0 ^= 1;
                             mbarrier_wait(cg1_shared_acc_empty_addr, _phase_cg1_shared_acc_empty_0);
                             _phase_cg1_shared_acc_empty_0 ^= 1;
-                            int _mma_b_lo_4 = make_warp_uniform((((smem_k_addr) >> 4) & 0x3FFF) + (k_stage_1) * 1024);
+                            int _mma_b_lo_4 = make_warp_uniform((((smem_k_addr) >> 4) & CAKE_GDN_SMEM_DESC_MASK) + (k_stage_1) * 1024);
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2809,7 +2817,7 @@ kernel_cake_gdn_5ddc80f0469f08b3e82e(const __grid_constant__ CUtensorMap Q, cons
                     :: "r"(tmem_tmem_cg1_shared_acc), "r"(_mma_b_lo_4), "r"(tmem_tmem_state_inp), "r"(0));
                             elect_commit(cg1_shared_acc_full_addr);
                             mbarrier_wait(q_state_acc_empty_addr + (q_state_acc_mma_stage) * 8, q_state_acc_mma_phase);
-                            int _mma_b_lo_5 = make_warp_uniform((((smem_q_addr) >> 4) & 0x3FFF) + (q_stage_1) * 1024);
+                            int _mma_b_lo_5 = make_warp_uniform((((smem_q_addr) >> 4) & CAKE_GDN_SMEM_DESC_MASK) + (q_stage_1) * 1024);
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2869,7 +2877,7 @@ kernel_cake_gdn_5ddc80f0469f08b3e82e(const __grid_constant__ CUtensorMap Q, cons
                         mbarrier_wait(cg1_shared_acc_empty_addr, _phase_cg1_shared_acc_empty_0);
                         _phase_cg1_shared_acc_empty_0 ^= 1;
                         {
-                            int _mma_b_lo_6 = make_warp_uniform((((smem_ainv_addr) >> 4) & 0x3FFF) + (ainv_stage_mma) * 512);
+                            int _mma_b_lo_6 = make_warp_uniform((((smem_ainv_addr) >> 4) & CAKE_GDN_SMEM_DESC_MASK) + (ainv_stage_mma) * 512);
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2909,7 +2917,7 @@ kernel_cake_gdn_5ddc80f0469f08b3e82e(const __grid_constant__ CUtensorMap Q, cons
                         _phase_nv_ready_0 ^= 1;
                         mbarrier_wait(q_state_acc_empty_addr + (q_state_acc_mma_stage) * 8, q_state_acc_mma_phase);
                         {
-                            int _mma_b_lo_8 = make_warp_uniform((((smem_qk_addr) >> 4) & 0x3FFF) + (qk_stage_mma) * 512);
+                            int _mma_b_lo_8 = make_warp_uniform((((smem_qk_addr) >> 4) & CAKE_GDN_SMEM_DESC_MASK) + (qk_stage_mma) * 512);
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2952,7 +2960,7 @@ kernel_cake_gdn_5ddc80f0469f08b3e82e(const __grid_constant__ CUtensorMap Q, cons
                             mbarrier_wait(decay_v_ready_addr, _phase_decay_v_ready_0);
                             _phase_decay_v_ready_0 ^= 1;
                             {
-                                int _mma_b_lo_10 = make_warp_uniform(((((smem_k_trans_mma_addr) >> 4) & 0x3FFF) | 0x2000000) + (k_stage_1) * 1024);
+                                int _mma_b_lo_10 = make_warp_uniform(((((smem_k_trans_mma_addr) >> 4) & CAKE_GDN_SMEM_DESC_MASK) | 0x2000000) + (k_stage_1) * 1024);
                                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -3010,7 +3018,7 @@ kernel_cake_gdn_5ddc80f0469f08b3e82e(const __grid_constant__ CUtensorMap Q, cons
                         _phase_state_inp_ready_0 ^= 1;
                         mbarrier_wait(cg1_shared_acc_empty_addr, _phase_cg1_shared_acc_empty_0);
                         _phase_cg1_shared_acc_empty_0 ^= 1;
-                        int _mma_b_lo_20 = make_warp_uniform((((smem_k_addr) >> 4) & 0x3FFF) + (k_stage_1) * 1024);
+                        int _mma_b_lo_20 = make_warp_uniform((((smem_k_addr) >> 4) & CAKE_GDN_SMEM_DESC_MASK) + (k_stage_1) * 1024);
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -3058,7 +3066,7 @@ kernel_cake_gdn_5ddc80f0469f08b3e82e(const __grid_constant__ CUtensorMap Q, cons
                     :: "r"(tmem_tmem_cg1_shared_acc), "r"(_mma_b_lo_20), "r"(tmem_tmem_state_inp), "r"(0));
                         elect_commit(cg1_shared_acc_full_addr);
                         mbarrier_wait(q_state_acc_empty_addr + (q_state_acc_mma_stage) * 8, q_state_acc_mma_phase);
-                        int _mma_b_lo_21 = make_warp_uniform((((smem_q_addr) >> 4) & 0x3FFF) + (q_stage_1) * 1024);
+                        int _mma_b_lo_21 = make_warp_uniform((((smem_q_addr) >> 4) & CAKE_GDN_SMEM_DESC_MASK) + (q_stage_1) * 1024);
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -3118,7 +3126,7 @@ kernel_cake_gdn_5ddc80f0469f08b3e82e(const __grid_constant__ CUtensorMap Q, cons
                     mbarrier_wait(cg1_shared_acc_empty_addr, _phase_cg1_shared_acc_empty_0);
                     _phase_cg1_shared_acc_empty_0 ^= 1;
                     {
-                        int _mma_b_lo_22 = make_warp_uniform((((smem_ainv_addr) >> 4) & 0x3FFF) + (ainv_stage_mma) * 512);
+                        int _mma_b_lo_22 = make_warp_uniform((((smem_ainv_addr) >> 4) & CAKE_GDN_SMEM_DESC_MASK) + (ainv_stage_mma) * 512);
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -3158,7 +3166,7 @@ kernel_cake_gdn_5ddc80f0469f08b3e82e(const __grid_constant__ CUtensorMap Q, cons
                     _phase_nv_ready_0 ^= 1;
                     mbarrier_wait(q_state_acc_empty_addr + (q_state_acc_mma_stage) * 8, q_state_acc_mma_phase);
                     {
-                        int _mma_b_lo_24 = make_warp_uniform((((smem_qk_addr) >> 4) & 0x3FFF) + (qk_stage_mma) * 512);
+                        int _mma_b_lo_24 = make_warp_uniform((((smem_qk_addr) >> 4) & CAKE_GDN_SMEM_DESC_MASK) + (qk_stage_mma) * 512);
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -3201,7 +3209,7 @@ kernel_cake_gdn_5ddc80f0469f08b3e82e(const __grid_constant__ CUtensorMap Q, cons
                         mbarrier_wait(decay_v_ready_addr, _phase_decay_v_ready_0);
                         _phase_decay_v_ready_0 ^= 1;
                         {
-                            int _mma_b_lo_26 = make_warp_uniform(((((smem_k_trans_mma_addr) >> 4) & 0x3FFF) | 0x2000000) + (k_stage_1) * 1024);
+                            int _mma_b_lo_26 = make_warp_uniform(((((smem_k_trans_mma_addr) >> 4) & CAKE_GDN_SMEM_DESC_MASK) | 0x2000000) + (k_stage_1) * 1024);
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"

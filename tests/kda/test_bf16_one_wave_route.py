@@ -16,7 +16,7 @@ import pytest
 import torch
 
 from flashinfer import prepare_bf16_kda_prefill
-from flashinfer.cake_kda_tf32_runtime import select_bf16_schedule_route
+from flashinfer.kda_prefill import select_bf16_schedule_route
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -120,13 +120,16 @@ def test_multi_wave_grid_keeps_direct_tile():
     assert schedule.startswith("fused_")
 
 
-def test_select_bf16_schedule_route_rejects_unknown_gpu_arch():
-    """The metadata adapter takes ``gpu_arch`` directly (no device probe); an
-    unmapped architecture string fails with a clear error instead of a KeyError."""
+def test_select_bf16_schedule_route_is_the_shared_planner_adapter():
+    """The prepared runtime shares the planner's metadata adapter, which takes
+    the compute capability directly (no device probe).  The packed H12 grid of
+    1025 + 33 tokens (24 tasks, one M64 chain wave on 148 SMs) takes the BT16
+    prepare-chain M64 split on both supported architectures."""
     kwargs = dict(
         sm_count=148, fixed_layout=False, sequence_lengths=(1025, 33), num_heads=12
     )
-    for gpu_arch in ("sm_100a", "sm_103a"):
-        assert isinstance(select_bf16_schedule_route(gpu_arch=gpu_arch, **kwargs), str)
-    with pytest.raises(ValueError, match="gpu_arch must be one of"):
-        select_bf16_schedule_route(gpu_arch="sm_90a", **kwargs)
+    for compute_capability in ((10, 0), (10, 3)):
+        assert (
+            select_bf16_schedule_route(compute_capability=compute_capability, **kwargs)
+            == "bt16_prepare_chain_m64"
+        )

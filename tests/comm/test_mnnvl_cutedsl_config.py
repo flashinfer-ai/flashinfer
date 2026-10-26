@@ -24,6 +24,7 @@ from flashinfer.comm.mnnvl_cutedsl import (
     DEFAULT_CONFIG,
     HT_ONLY_CONFIG,
     LL_ONLY_CONFIG,
+    NO_NORM_CONFIG,
 )
 from flashinfer.comm.mnnvl_cutedsl.config import (
     KernelTarget,
@@ -49,16 +50,34 @@ from flashinfer.comm.mnnvl_cutedsl.kernel_bt import (
     BT_FINALIZE_GB300_TP4_H7168_K16_PRESET_1,
     BT_FINALIZE_GB300_TP8_H7168_K16_PRESET_0,
     BT_FINALIZE_GB300_TP8_H7168_K16_PRESET_1,
+    BT_ALL_REDUCE_GB300_TP4_H8192_FUSED,
+    BT_ALL_REDUCE_GB300_TP4_H8192_PRESET_0,
+    BT_FINALIZE_GB300_TP4_H8192_K10,
+    BT_ALL_REDUCE_RUBIN_TP4_H8192_FUSED,
+    BT_ALL_REDUCE_RUBIN_TP4_H8192_PRESET_0,
+    BT_FINALIZE_RUBIN_TP4_H8192_K10,
 )
 from flashinfer.comm.mnnvl_cutedsl.kernel_ht import (
     HT_ALL_REDUCE_GB300_TP4_H7168,
     HT_FINALIZE_GB300_TP4_H7168_K16,
+    HT_FINALIZE_GB300_TP4_H8192_K10,
+    HT_FINALIZE_RUBIN_TP4_H8192_K10,
 )
 from flashinfer.comm.mnnvl_cutedsl.kernel_ll import (
     LL_ALL_REDUCE_GB300_TP4_H7168,
     LL_ALL_REDUCE_GB300_TP8_H7168,
     LL_FINALIZE_GB300_TP4_H7168_K16,
     LL_FINALIZE_GB300_TP8_H7168_K16,
+    LL_ALL_REDUCE_GB300_TP4_H8192,
+    LL_ALL_REDUCE_GB300_TP4_H8192_BULK,
+    LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_25_TO_64,
+    LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_65_TO_192,
+    LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_193_TO_320,
+    LL_FINALIZE_GB300_TP4_H8192_K10,
+    LL_ALL_REDUCE_RUBIN_TP4_H8192,
+    LL_ALL_REDUCE_RUBIN_TP4_H8192_BULK,
+    LL_ALL_REDUCE_RUBIN_TP4_H8192_TWO_SHOT,
+    LL_FINALIZE_RUBIN_TP4_H8192_K10,
 )
 
 
@@ -330,6 +349,219 @@ def test_kimi_k3_default_protocol_and_preset_boundaries():
                 assert target.preset is expected_preset
 
 
+_LL = ProtocolKind.LL
+_BT = ProtocolKind.BT
+_HT = ProtocolKind.HT
+_RUBIN = (10, 7)
+_GB300 = (10, 3)
+_TP4_H8192_ROUTES = {
+    (_RUBIN, True): (
+        (
+            (32, _LL, LL_FINALIZE_RUBIN_TP4_H8192_K10),
+            (33, _BT, BT_FINALIZE_RUBIN_TP4_H8192_K10),
+            (2048, _BT, BT_FINALIZE_RUBIN_TP4_H8192_K10),
+            (2049, _HT, HT_FINALIZE_RUBIN_TP4_H8192_K10),
+        ),
+        (
+            (16, _LL, LL_ALL_REDUCE_RUBIN_TP4_H8192),
+            (17, _LL, LL_ALL_REDUCE_RUBIN_TP4_H8192_BULK),
+            (48, _LL, LL_ALL_REDUCE_RUBIN_TP4_H8192_BULK),
+            (49, _BT, BT_ALL_REDUCE_RUBIN_TP4_H8192_PRESET_0),
+            (256, _BT, BT_ALL_REDUCE_RUBIN_TP4_H8192_PRESET_0),
+            (257, _BT, BT_ALL_REDUCE_RUBIN_TP4_H8192_FUSED),
+            (16384, _BT, BT_ALL_REDUCE_RUBIN_TP4_H8192_FUSED),
+        ),
+    ),
+    (_RUBIN, False): (
+        (
+            (48, _LL, LL_FINALIZE_RUBIN_TP4_H8192_K10),
+            (49, _BT, BT_FINALIZE_RUBIN_TP4_H8192_K10),
+            (16384, _BT, BT_FINALIZE_RUBIN_TP4_H8192_K10),
+        ),
+        (
+            (16, _LL, LL_ALL_REDUCE_RUBIN_TP4_H8192),
+            (17, _LL, LL_ALL_REDUCE_RUBIN_TP4_H8192_BULK),
+            (64, _LL, LL_ALL_REDUCE_RUBIN_TP4_H8192_BULK),
+            (65, _BT, BT_ALL_REDUCE_RUBIN_TP4_H8192_PRESET_0),
+            (128, _BT, BT_ALL_REDUCE_RUBIN_TP4_H8192_PRESET_0),
+            (129, _LL, LL_ALL_REDUCE_RUBIN_TP4_H8192_TWO_SHOT),
+            (384, _LL, LL_ALL_REDUCE_RUBIN_TP4_H8192_TWO_SHOT),
+            (385, _BT, BT_ALL_REDUCE_RUBIN_TP4_H8192_FUSED),
+            (16384, _BT, BT_ALL_REDUCE_RUBIN_TP4_H8192_FUSED),
+        ),
+    ),
+    (_GB300, True): (
+        (
+            (24, _LL, LL_FINALIZE_GB300_TP4_H8192_K10),
+            (25, _BT, BT_FINALIZE_GB300_TP4_H8192_K10),
+            (768, _BT, BT_FINALIZE_GB300_TP4_H8192_K10),
+            (769, _HT, HT_FINALIZE_GB300_TP4_H8192_K10),
+            (16384, _HT, HT_FINALIZE_GB300_TP4_H8192_K10),
+        ),
+        (
+            (16, _LL, LL_ALL_REDUCE_GB300_TP4_H8192),
+            (17, _BT, BT_ALL_REDUCE_GB300_TP4_H8192_PRESET_0),
+            (384, _BT, BT_ALL_REDUCE_GB300_TP4_H8192_PRESET_0),
+            (385, _BT, BT_ALL_REDUCE_GB300_TP4_H8192_FUSED),
+            (16384, _BT, BT_ALL_REDUCE_GB300_TP4_H8192_FUSED),
+        ),
+    ),
+    (_GB300, False): (
+        (
+            (32, _LL, LL_FINALIZE_GB300_TP4_H8192_K10),
+            (33, _BT, BT_FINALIZE_GB300_TP4_H8192_K10),
+            (16384, _BT, BT_FINALIZE_GB300_TP4_H8192_K10),
+        ),
+        (
+            (8, _LL, LL_ALL_REDUCE_GB300_TP4_H8192),
+            (9, _LL, LL_ALL_REDUCE_GB300_TP4_H8192_BULK),
+            (24, _LL, LL_ALL_REDUCE_GB300_TP4_H8192_BULK),
+            (25, _LL, LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_25_TO_64),
+            (64, _LL, LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_25_TO_64),
+            (65, _LL, LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_65_TO_192),
+            (192, _LL, LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_65_TO_192),
+            (193, _LL, LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_193_TO_320),
+            (320, _LL, LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_193_TO_320),
+            (321, _BT, BT_ALL_REDUCE_GB300_TP4_H8192_FUSED),
+            (16384, _BT, BT_ALL_REDUCE_GB300_TP4_H8192_FUSED),
+        ),
+    ),
+}
+
+
+def _tp4_h8192(config, compute_capability):
+    return config.resolve(
+        tp_size=4,
+        hidden_size=8192,
+        top_k=10,
+        dtype=torch.bfloat16,
+        capacity_m=16384,
+        compute_capability=compute_capability,
+    )
+
+
+@pytest.mark.parametrize(
+    "compute_capability,norm",
+    tuple(_TP4_H8192_ROUTES),
+    ids=("rubin-norm", "rubin-no-norm", "gb300-norm", "gb300-no-norm"),
+)
+def test_tp4_h8192_protocol_and_preset_boundaries(compute_capability, norm):
+    config = DEFAULT_CONFIG if norm else NO_NORM_CONFIG
+    profile = _tp4_h8192(config, compute_capability)
+    assert profile.compute_capability == compute_capability
+    finalize, all_reduce = _TP4_H8192_ROUTES[(compute_capability, norm)]
+    for route, expected in (
+        (profile.finalize_routes, finalize),
+        (profile.all_reduce_routes, all_reduce),
+    ):
+        for m, protocol, preset in expected:
+            target = route.select(m)
+            assert target.protocol is protocol
+            assert target.preset is preset
+
+
+@pytest.mark.parametrize("compute_capability", (_RUBIN, _GB300))
+def test_tp4_h8192_norm_routes_avoid_two_shot(compute_capability):
+    """The norm-on routes also serve dynamic FP8, which two-shot rejects."""
+    profile = _tp4_h8192(DEFAULT_CONFIG, compute_capability)
+    for target in profile.all_reduce_routes.targets:
+        assert not getattr(target.preset, "two_shot", False)
+
+
+@pytest.mark.parametrize("compute_capability", (_RUBIN, _GB300))
+def test_tp4_h8192_no_norm_routes_avoid_ht(compute_capability):
+    """HT cannot compile the norm out, so norm-free routes never reach it."""
+    profile = _tp4_h8192(NO_NORM_CONFIG, compute_capability)
+    assert ProtocolKind.HT not in profile.referenced_protocols
+
+
+@pytest.mark.parametrize("compute_capability", (None, (10, 0), (12, 0)))
+def test_tp4_h8192_has_no_profile_for_other_architectures(compute_capability):
+    for config in (DEFAULT_CONFIG, NO_NORM_CONFIG):
+        with pytest.raises(ValueError, match="No MNNVL CuTe DSL profile"):
+            _tp4_h8192(config, compute_capability)
+
+
+def _single_route_profile(preset: str, compute_capability=None) -> StaticProfile:
+    route = MRangeDispatch(
+        upper_bounds=(None,), targets=(_target(ProtocolKind.LL, preset),)
+    )
+    return StaticProfile(
+        tp_size=4,
+        hidden_size=4096,
+        top_k=8,
+        dtype=torch.bfloat16,
+        finalize_routes=route,
+        all_reduce_routes=route,
+        compute_capability=compute_capability,
+    )
+
+
+def _resolved_preset(config: MNNVLCuteDSLConfig, compute_capability) -> str:
+    profile = config.resolve(
+        tp_size=4,
+        hidden_size=4096,
+        top_k=8,
+        dtype=torch.bfloat16,
+        capacity_m=64,
+        compute_capability=compute_capability,
+    )
+    return profile.all_reduce_routes.select(1).preset
+
+
+@pytest.mark.parametrize("agnostic_first", (True, False))
+def test_resolve_prefers_architecture_specific_profile(agnostic_first):
+    agnostic = _single_route_profile("any")
+    rubin = _single_route_profile("rubin", _RUBIN)
+    gb300 = _single_route_profile("gb300", _GB300)
+    profiles = (agnostic, rubin, gb300) if agnostic_first else (rubin, gb300, agnostic)
+    config = MNNVLCuteDSLConfig(profiles=profiles)
+    assert _resolved_preset(config, _RUBIN) == "rubin"
+    assert _resolved_preset(config, _GB300) == "gb300"
+    assert _resolved_preset(config, (10, 0)) == "any"
+    assert _resolved_preset(config, None) == "any"
+
+
+def test_architecture_specific_profile_needs_a_matching_device():
+    config = MNNVLCuteDSLConfig(profiles=(_single_route_profile("rubin", _RUBIN),))
+    assert _resolved_preset(config, _RUBIN) == "rubin"
+    for compute_capability in (None, _GB300):
+        with pytest.raises(ValueError, match="No MNNVL CuTe DSL profile"):
+            _resolved_preset(config, compute_capability)
+        assert (
+            config.find(
+                tp_size=4,
+                hidden_size=4096,
+                top_k=8,
+                dtype=torch.bfloat16,
+                compute_capability=compute_capability,
+            )
+            is None
+        )
+
+
+def test_config_rejects_duplicate_profile_per_architecture():
+    MNNVLCuteDSLConfig(
+        profiles=(_single_route_profile("a"), _single_route_profile("b", _RUBIN))
+    )
+    with pytest.raises(ValueError, match="unique static shapes"):
+        MNNVLCuteDSLConfig(
+            profiles=(
+                _single_route_profile("a", _RUBIN),
+                _single_route_profile("b", _RUBIN),
+            )
+        )
+    with pytest.raises(ValueError, match="unique static shapes"):
+        MNNVLCuteDSLConfig(
+            profiles=(_single_route_profile("a"), _single_route_profile("b"))
+        )
+
+
+def test_static_profile_rejects_malformed_compute_capability():
+    with pytest.raises(ValueError, match="compute_capability"):
+        _single_route_profile("a", (10,))  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize(
     "config,expected_protocol,tp_sizes",
     [
@@ -375,3 +607,45 @@ def test_only_configs_select_one_protocol(
 
     for routes in (profile.finalize_routes, profile.all_reduce_routes):
         assert all(target.protocol is expected_protocol for target in routes.targets)
+
+
+@pytest.mark.parametrize(
+    "compute_capability,capacity_m,expected",
+    (
+        (_RUBIN, 16384, {LL_ALL_REDUCE_RUBIN_TP4_H8192_TWO_SHOT: 384}),
+        (_RUBIN, 200, {LL_ALL_REDUCE_RUBIN_TP4_H8192_TWO_SHOT: 200}),
+        (_RUBIN, 100, {}),
+        (
+            _GB300,
+            16384,
+            {
+                LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_25_TO_64: 64,
+                LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_65_TO_192: 192,
+                LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_193_TO_320: 320,
+            },
+        ),
+        (
+            _GB300,
+            100,
+            {
+                LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_25_TO_64: 64,
+                LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_65_TO_192: 100,
+            },
+        ),
+    ),
+    ids=("rubin", "rubin-capped", "rubin-unreached", "gb300", "gb300-capped"),
+)
+def test_two_shot_capacities_follow_routes(compute_capability, capacity_m, expected):
+    """Each LL two-shot preset is sized to the largest token count routed to it."""
+    from flashinfer.comm.mnnvl_cutedsl_ar import _preset_capacities
+
+    profile = _tp4_h8192(NO_NORM_CONFIG, compute_capability)
+    capacities = _preset_capacities(
+        profile.all_reduce_routes, ProtocolKind.LL, capacity_m
+    )
+    two_shot = {
+        preset: capacity
+        for preset, capacity in capacities.items()
+        if getattr(preset, "two_shot", False)
+    }
+    assert two_shot == expected

@@ -1005,18 +1005,27 @@
             "_comment": "Bf16xBf16_FC1_HighThroughput",
             "_template": "BatchedGemmBf16Bf16HighThroughput",
             "route_act": "tma",
-            "fused_act,act,eltwise_act_type": [
-                [true, "swiglu", "none"],
-                [false, "swiglu", "relu2"],
-                [false, "none", "none"]
-            ],
             "dtype_c": "bf16",
-            "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,epilogue_regs,mma_regs,load_regs,load_sf_regs,copy_sf_regs,padding_regs,workid_regs,gather_regs": [
-                [64, 64, 64, 128, 5, 5, 5, 5, 5, 5, 168, 96, 96, 96, 96, 96, 96, 96],
-                [128, 128, 128, 64, 6, 6, 6, 6, 6, 6, 168, 96, 96, 96, 96, 96, 96, 96]
-            ],
-            "tile_scheduler,num_stages_tmem_acc": [
-                ["persistent", 2]
+            "epilogue_regs": 168,
+            "mma_regs": 96,
+            "load_regs": 96,
+            "load_sf_regs": 96,
+            "copy_sf_regs": 96,
+            "padding_regs": 96,
+            "workid_regs": 96,
+            "gather_regs": 96,
+            "tile_scheduler": "persistent",
+            "use_unroll_loop_2x_for_mma": false,
+            "fused_act,act,eltwise_act_type,mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,num_stages_tmem_acc,transpose_mma_output,use_max_tmem_overlap": [
+                [true, "swiglu", "none", 64, 64, 64, 128, 5, 5, 5, 5, 5, 5, 2, true, false],
+                [true, "swiglu", "none", 128, 128, 128, 64, 6, 6, 6, 6, 6, 6, 2, true, false],
+                [false, "swiglu", "relu2", 64, 64, 64, 128, 5, 5, 5, 5, 5, 5, 2, true, false],
+                [false, "swiglu", "relu2", 128, 128, 128, 64, 6, 6, 6, 6, 6, 6, 2, true, false],
+                [false, "none", "none", 64, 64, 64, 128, 5, 5, 5, 5, 5, 5, 2, true, false],
+                [false, "none", "none", 128, 128, 128, 64, 6, 6, 6, 6, 6, 6, 2, true, false],
+                [true, "swiglu", "none", 192, 192, 64, 64, 6, 6, 4, 4, 4, 4, 2, true, false],
+                [true, "swiglu", "none", 256, 256, 128, 64, 4, 4, 4, 4, 4, 4, 1, false, true],
+                [true, "swiglu", "none", 128, 128, 128, 64, 4, 4, 4, 4, 4, 4, 2, false, false]
             ]
         },
         {
@@ -1046,12 +1055,22 @@
             "route_act": false,
             "fused_act": false,
             "dtype_c": "bf16",
-            "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,epilogue_regs,mma_regs,load_regs,load_sf_regs,copy_sf_regs,padding_regs,workid_regs,gather_regs": [
-                [64, 64, 64, 128, 4, 4, 4, 4, 4, 4, 168, 96, 96, 96, 96, 96, 96, 96],
-                [128, 128, 64, 64, 8, 8, 8, 8, 8, 8, 168, 96, 96, 96, 96, 96, 96, 96]
-            ],
-            "tile_scheduler,num_stages_tmem_acc": [
-                ["persistent", 2]
+            "epilogue_regs": 168,
+            "mma_regs": 96,
+            "load_regs": 96,
+            "load_sf_regs": 96,
+            "copy_sf_regs": 96,
+            "padding_regs": 96,
+            "workid_regs": 96,
+            "gather_regs": 96,
+            "tile_scheduler": "persistent",
+            "use_unroll_loop_2x_for_mma": false,
+            "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,num_stages_tmem_acc,transpose_mma_output,use_max_tmem_overlap,act": [
+                [64, 64, 64, 128, 4, 4, 4, 4, 4, 4, 2, true, false, "swiglu"],
+                [128, 128, 64, 64, 8, 8, 8, 8, 8, 8, 2, true, false, "swiglu"],
+                [192, 192, 64, 64, 6, 6, 4, 4, 4, 4, 2, true, false, "none"],
+                [256, 256, 128, 64, 4, 4, 4, 4, 4, 4, 1, false, true, "none"],
+                [128, 128, 128, 64, 4, 4, 4, 4, 4, 4, 2, false, false, "none"]
             ]
         },
         {

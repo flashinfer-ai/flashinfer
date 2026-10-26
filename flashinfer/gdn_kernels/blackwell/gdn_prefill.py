@@ -26,6 +26,7 @@ State layout: ``[N, H, V, K]``.
 """
 
 import functools
+import os
 from typing import Optional
 
 import torch
@@ -39,6 +40,7 @@ from flashinfer.cute_dsl.utils import get_num_sm
 
 from ..device_target import gdn_compile_options, gdn_device_target, target_arch
 from .gated_delta_net_chunked import GatedDeltaNetChunkedKernel
+from .gated_delta_net_chunked_sm107 import RubinGatedDeltaNetChunkedKernel
 from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from ..cute_dsl_cache_naming import make_kernel_name
 
@@ -55,16 +57,36 @@ _CUTE_DSL_MODULE = "gdn_blackwell_prefill"
 
 def _kernel_source_files() -> tuple:
     """Source files whose content invalidates the on-disk kernel cache."""
-    from . import gated_delta_net_chunked, gated_delta_net_tile_scheduler
+    from . import (
+        gated_delta_net_chunked,
+        gated_delta_net_chunked_sm107,
+        gated_delta_net_tile_scheduler,
+    )
 
     return (
         __file__,
         gated_delta_net_chunked.__file__,
+        gated_delta_net_chunked_sm107.__file__,
         gated_delta_net_tile_scheduler.__file__,
     )
 
 
+def _prefill_kernel_variant(major: int, minor: int) -> str:
+    """``"sm107"`` on Rubin unless FLASHINFER_GDN_SM107_PREFILL_KERNEL=sm100."""
+    if (major, minor) == (10, 7):
+        forced = os.environ.get("FLASHINFER_GDN_SM107_PREFILL_KERNEL", "sm107")
+        return "sm100" if forced == "sm100" else "sm107"
+    return "sm100"
+
+
+_PREFILL_KERNEL_CLASSES = {
+    "sm100": GatedDeltaNetChunkedKernel,
+    "sm107": RubinGatedDeltaNetChunkedKernel,
+}
+
+
 def _prefill_kernel_name(
+    kernel_variant: str,
     target_key: tuple,
     num_sm: int,
     io_dtype_str: str,
@@ -88,7 +110,8 @@ def _prefill_kernel_name(
     which the compile below bakes in as ``max_active_clusters``.
     """
     return make_kernel_name(
-        target_arch(target_key),
+        target_arch(target_key)
+        + ("" if kernel_variant == "sm100" else f"_{kernel_variant}"),
         num_sm,
         io_dtype_str,
         state_dtype_str,
@@ -109,6 +132,7 @@ def _prefill_kernel_name(
 
 @functools.cache
 def _get_compiled_cache(
+    kernel_variant: str,
     target_key: tuple,
     num_sm: int,
     io_dtype_str: str,
@@ -264,7 +288,10 @@ def chunk_gated_delta_rule_sm100(
     # num_sm is baked in as max_active_clusters, so it belongs to the key.
     target = gdn_device_target(q.device)
     num_sm = get_num_sm(q.device)
+    kernel_variant = _prefill_kernel_variant(target.major, target.minor)
+    kernel_cls = _PREFILL_KERNEL_CLASSES[kernel_variant]
     cache_key = (
+        kernel_variant,
         target.compile_key,
         num_sm,
         str(q.dtype),
@@ -296,7 +323,7 @@ def chunk_gated_delta_rule_sm100(
         # --- First call: compile the kernel ---
         max_active_clusters = num_sm
 
-        gdn = GatedDeltaNetChunkedKernel(
+        gdn = kernel_cls(
             io_dtype=io_dtype,
             # The kernel requires the triangular-inverse dtype to match io_dtype
             # (asserted in its __init__); pass io_dtype so bf16 uses the same

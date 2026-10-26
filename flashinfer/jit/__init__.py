@@ -78,14 +78,16 @@ from .core import sm120f_nvcc_flags as sm120f_nvcc_flags
 from .core import sm121a_nvcc_flags as sm121a_nvcc_flags
 from .core import current_compilation_context as current_compilation_context
 from .cubin_loader import setup_cubin_loader
-from .comm import gen_comm_alltoall_module as gen_comm_alltoall_module
 from .comm import gen_trtllm_mnnvl_comm_module as gen_trtllm_mnnvl_comm_module
 from .comm import gen_trtllm_comm_module as gen_trtllm_comm_module
 from .comm import gen_vllm_comm_module as gen_vllm_comm_module
 from .comm import gen_pcie_ipc_comm_module as gen_pcie_ipc_comm_module
-from .comm import gen_moe_alltoall_module as gen_moe_alltoall_module
+from .comm import gen_cake_alltoall_module as gen_cake_alltoall_module
 from .comm import (
-    gen_moe_ep_nvlink_one_sided_module as gen_moe_ep_nvlink_one_sided_module,
+    gen_nvlink_one_sided_alltoall_module as gen_nvlink_one_sided_alltoall_module,
+)
+from .comm import (
+    gen_nvlink_two_sided_alltoall_module as gen_nvlink_two_sided_alltoall_module,
 )
 from .comm import gen_dcp_alltoall_module as gen_dcp_alltoall_module
 from .dsv3_optimizations import (
@@ -148,19 +150,10 @@ from .cake_kda import (
     load_cake_kda_m128_unbounded_softplus_module as load_cake_kda_m128_unbounded_softplus_module,
 )
 from .cake_fused_moe_warp_decode import (
-    CakeWarpDecodeTarget as CakeWarpDecodeTarget,
-)
-from .cake_fused_moe_warp_decode import (
     gen_cake_fused_moe_warp_decode_module as gen_cake_fused_moe_warp_decode_module,
 )
 from .cake_fused_moe_warp_decode import (
     get_cake_fused_moe_warp_decode_module as get_cake_fused_moe_warp_decode_module,
-)
-from .cake_fused_moe_warp_decode import (
-    get_cake_fused_moe_warp_decode_uri as get_cake_fused_moe_warp_decode_uri,
-)
-from .cake_fused_moe_warp_decode import (
-    load_cake_fused_moe_warp_decode_module as load_cake_fused_moe_warp_decode_module,
 )
 from .flash_kda import (
     gen_flash_kda_m64_module as gen_flash_kda_m64_module,

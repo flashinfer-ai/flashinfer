@@ -39,6 +39,13 @@ class MoKConfig:
     macrobatch_size: int = 131072
     schedule_capacity_multiplier: float = 0.5
     all_gather_top_experts_chunk_bytes: int = 2048
+    # Diagnostics of the imbalance-aware path: ``True`` prints each change of
+    # the (forward, backward) communication-SM split to stderr, one line per
+    # rank, from the launch that applies it (``MoKFunctional._comm_split``).
+    # Off by default; no effect while ``imbalance_comm_sms`` is ``None``. The
+    # value is compared across ranks at workspace creation like every field; a
+    # later ``dataclasses.replace`` on one rank only changes that rank's log.
+    comm_split_log: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +54,14 @@ class MoKSchedule:
     peer_token_idx: torch.Tensor  # (schedule_capacity,) int32
     num_tokens: torch.Tensor  # (1,) int32
     tokens_per_expert: torch.Tensor  # (num_local_experts,) int32
+    # Expert layout the fused launches decode their tasks from, derived once per
+    # schedule by ``build_schedule`` from ``tokens_per_expert`` and ``peer_rank``:
+    # ``[counts | row offsets | real rows | expert of each 256-row block]``,
+    # (3 * num_local_experts + schedule_capacity // 256,) int32. ``None`` on a
+    # schedule built without it; every launcher then derives the layout itself.
+    # A copy made with ``dataclasses.replace`` that changes ``peer_rank``,
+    # ``tokens_per_expert`` or the capacity must pass ``layout=None``.
+    layout: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)

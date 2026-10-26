@@ -33,7 +33,7 @@ from ..nvlink_common import (
     unmap_mnnvl_memory,
 )
 from .config import NVLinkOneSidedConfig
-from .kernels import get_nvlink_one_sided_module, layout_constants
+from .kernels import get_nvlink_one_sided_alltoall_module, layout_constants
 
 if TYPE_CHECKING:
     import torch
@@ -69,12 +69,16 @@ def _driver_branch() -> Optional[int]:
     return int(match.group(1)) if match else None
 
 
-def _cft_unsupported_reason(device_index: int) -> Optional[str]:
+def _cft_unsupported_reason(device_index: int, fabric_handles: bool) -> Optional[str]:
     """Why this rank cannot use CFT counted writes, or ``None`` if it can.
 
-    Never raises: every rank must reach the collective CFT agreement, and a
-    rank whose probe fails falls back to the fence path with the others.
+    ``fabric_handles`` tells whether the workspace will be shared through
+    FABRIC handles; logical endpoints can only bind such memory. Never raises:
+    every rank must reach the collective CFT agreement, and a rank whose probe
+    fails falls back to the fence path with the others.
     """
+    if not fabric_handles:
+        return "the workspace is not shared through FABRIC handles"
     try:
         return _probe_cft_support(device_index)
     except Exception as exc:  # NVML, CUDA driver or cuda-python errors alike
@@ -84,7 +88,7 @@ def _cft_unsupported_reason(device_index: int) -> Optional[str]:
 def _probe_cft_support(device_index: int) -> Optional[str]:
     import torch
 
-    from ......comm.mnnvl import cuda, is_mnnvl_fabric_supported
+    from ......comm.mnnvl import cuda
 
     major, minor = torch.cuda.get_device_capability(device_index)
     if major < 10:
@@ -95,8 +99,6 @@ def _probe_cft_support(device_index: int) -> Optional[str]:
     if branch < _CFT_MIN_DRIVER_BRANCH:
         return f"driver branch {branch} is older than {_CFT_MIN_DRIVER_BRANCH}"
     try:
-        if not is_mnnvl_fabric_supported(device_index):
-            return "the workspace cannot be allocated with fabric handles"
         attributes = (
             cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_LOGICAL_ENDPOINT_UNICAST_SUPPORTED,
             cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_LOGICAL_ENDPOINT_COUNTED_OPS_SUPPORTED,
@@ -166,7 +168,7 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
                 f"got {params.top_k}"
             )
 
-        self._module = get_nvlink_one_sided_module()
+        self._module = get_nvlink_one_sided_alltoall_module()
         self._index = index = layout_constants()
         if self.ep_size > index.MAX_RANKS:
             raise ValueError(
@@ -185,10 +187,12 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         )
 
         # Every rank must agree on CFT: it changes the workspace layout and
-        # the endpoint exchange is collective.
+        # the endpoint exchange is collective. The handle type is the one the
+        # workspace allocation will start with; _bind_cft checks the one it ends with.
         reason = None
         if config.cft is not False:
-            reason = _cft_unsupported_reason(device.index)
+            fabric_handles = MnnvlMemory.uses_fabric_handles(comm, device.index)
+            reason = _cft_unsupported_reason(device.index, fabric_handles)
         cft_capable = all_ranks_agree(comm, config.cft is not False and reason is None)
         if config.cft is not False and not cft_capable:
             log = logger.warning if config.cft else logger.info
@@ -292,6 +296,12 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         Collective over the EP group; every rank returns the same result.
         """
         cls = type(self)
+        if not mnnvl_mem.fabric_handles:
+            logger.warning(
+                "NVLink one-sided CFT counted writes disabled: the workspace fell "
+                "back to POSIX file descriptors"
+            )
+            return False
         if cls._CFT_WORKSPACE_KEY is not None:
             logger.info(
                 "NVLink one-sided CFT counted writes are bound to another workspace "
