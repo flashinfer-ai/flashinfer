@@ -70,6 +70,12 @@ class SplitKernelBackend(ABC):
         budget)."""
         return x
 
+    @property
+    def packs_dispatch_payload(self) -> bool:
+        """Whether :meth:`pack_dispatch_payload` sends other bytes than the BF16
+        tokens, which the transport must then carry byte for byte."""
+        return False
+
     @abstractmethod
     def compute(self, ctx: SplitKernelContext) -> "torch.Tensor": ...
 
