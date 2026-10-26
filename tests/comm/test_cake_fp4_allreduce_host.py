@@ -80,11 +80,48 @@ PROBE_ALL_TARGETS = ("sm_100a", "sm_103a")
 # The one-shot BF16 kernel's form per target, from each target's own measurement: sm_103a reads the peer's
 # row scale beside the data probe ("_rso") and triggers the dependent launch right after the grid
 # dependency wait ("_el"), sm_107a re-arms with register stores ("_rst"), sm_100a ships the baseline's
-# forms; the NVFP4 one-shot kernel ships one text for all three (its baseline triggers early).
+# forms; the NVFP4 one-shot kernel ships one text for all three (its baseline triggers early), and sm_100a
+# adds its bulk re-arm band (ONESHOT_BANDS below).
 ONESHOT_BF16_FORMS = {"sm_100a": "", "sm_103a": "_rso_el", "sm_107a": "_rst"}
-# The targets whose BF16-input fused-norm programs with NVFP4 / MXFP8 output build the packed quantizing
-# pass 2 ("_qp"), from their own measurement; sm_107a and every other build use the FP32 tree.
-PACKED_QUANT_TARGETS = ("sm_100a", "sm_103a")
+# The (input format, output format) fused-norm programs with NVFP4 / MXFP8 output each target builds with the
+# packed quantizing pass 2 ("_qp"), from its own measurement: the BF16-input builds of sm_100a / sm_103a, the
+# NVFP4-input builds of sm_103a and sm_100a's nvfp4 -> mxfp8; sm_107a and every other build use the FP32 tree.
+PACKED_QUANT_FORMS = {
+    "sm_100a": {("bf16", "nvfp4"), ("bf16", "mxfp8"), ("nvfp4", "mxfp8")},
+    "sm_103a": {
+        ("bf16", "nvfp4"),
+        ("bf16", "mxfp8"),
+        ("nvfp4", "nvfp4"),
+        ("nvfp4", "mxfp8"),
+    },
+    "sm_107a": set(),
+}
+# The (input format, output format) fused-norm programs with NVFP4 / MXFP8 output each target builds with the
+# scale store's swizzled address formed in 32-bit arithmetic once per row ("_sfu"), from its own measurement;
+# every other build forms the whole 64-bit address per store.  Both forms store the same bytes to the same
+# addresses, so the reference does not read the form.  A cell's band inherits the form.
+SF_ADDR_U32_FORMS = {
+    "sm_100a": {("nvfp4", "nvfp4")},
+    "sm_103a": {("bf16", "nvfp4"), ("nvfp4", "mxfp8"), ("nvfp4", "nvfp4")},
+    "sm_107a": {("bf16", "mxfp8"), ("nvfp4", "nvfp4")},
+}
+# The BF16-output fused-norm programs run the direct pass 2 ("_p2d") with the unroll each target measured
+# ("_u<N>" for an unroll other than 1); the quantized outputs run the staged pass 2 (unroll 1, no token).
+PASS2_DIRECT_UNROLL = {
+    ("sm_100a", "bf16", "bf16"): 4,
+    ("sm_103a", "bf16", "bf16"): 4,
+    ("sm_107a", "bf16", "bf16"): 4,
+    ("sm_100a", "nvfp4", "bf16"): 2,
+    ("sm_103a", "nvfp4", "bf16"): 2,
+    ("sm_107a", "nvfp4", "bf16"): 24,
+}
+# The fused-norm programs that trigger the dependent launch right after the grid dependency wait ("_el"),
+# from each target's own measurement: sm_100a's bf16 -> nvfp4 build.
+EARLY_LAUNCH_FORMS = {
+    "sm_100a": {("bf16", "nvfp4")},
+    "sm_103a": set(),
+    "sm_107a": set(),
+}
 # The (input format, output format) fused-norm programs each target builds with the permuted pass-1 sum of
 # squares ("_sop": the lane's loaded chunk order), from its own measurement: every build of sm_107a, every
 # build but nvfp4 -> bf16 of sm_103a and sm_100a; the others accumulate in the row's chunk order
@@ -96,6 +133,27 @@ PERMUTED_SS_FORMS = {
     - {("nvfp4", "bf16")},
     "sm_107a": {(i, o) for i in INPUT_FORMATS for o in OUTPUT_FORMATS},
 }
+# The rows-dispatched programs: beside the whole program of a cell, one program serves a band of row counts
+# (a prefix band at or below the threshold, a suffix band at or above it; both inclusive) in the forms the
+# band deviates in, from each target's own measurement.  The fused norm's bands switch at 6144 rows: the
+# nvfp4 -> bf16 prefix sums the pass-1 squares in the loaded chunk order ("_sop"), the BF16-input suffixes run
+# the direct pass 2 on eleven workers ("_p2d", "_w11"; sm_100a's bf16 -> nvfp4 band drops the whole program's
+# early trigger).  The NVFP4 one-shot of sm_100a re-arms with bulk stores ("_rsb") at or above 16384 rows.
+BAND_THRESHOLD = 6144
+FUSED_NORM_BANDS = {
+    ("sm_100a", "nvfp4", "bf16"): ("prefix", {"ss_order": "perm"}),
+    ("sm_103a", "nvfp4", "bf16"): ("prefix", {"ss_order": "perm"}),
+    ("sm_103a", "bf16", "bf16"): ("suffix", {"workers": 11}),
+    ("sm_100a", "bf16", "nvfp4"): (
+        "suffix",
+        {"pass2": "direct", "workers": 11, "early_launch": False},
+    ),
+    ("sm_103a", "bf16", "nvfp4"): ("suffix", {"pass2": "direct", "workers": 11}),
+    ("sm_100a", "bf16", "mxfp8"): ("suffix", {"pass2": "direct", "workers": 11}),
+    ("sm_103a", "bf16", "mxfp8"): ("suffix", {"pass2": "direct", "workers": 11}),
+}
+ONESHOT_BAND_THRESHOLD = 16384
+ONESHOT_BANDS = {("sm_100a", "nvfp4"): ("suffix", ONESHOT_BAND_THRESHOLD, "_rsb")}
 CAPACITIES = (4, 1024, 4096, 16384, 100000)
 SOURCE_DIR = "csrc/cake_fp4_allreduce"
 MAX_DYNAMIC_SMEM_BYTES = 232448  # the opt-in limit of SM100 / SM103 / SM107
@@ -123,35 +181,120 @@ def _two_shot_suffix(target: str, input_format: str, bv: int) -> str:
     )
 
 
-def _fused_norm_suffix(
-    target: str, input_format: str, output_format: str, prefetch: bool
-) -> str:
-    """The name suffix of the fused-norm program ``target`` builds for one (input format, output format,
-    prefetch form): "_pa" for the probe-all poll, "_qp" for the packed quantizing pass 2, "_csp" for the
-    per-CTA call state, "_sop" for the permuted sum of squares, "_pf" for the residual prefetch, in that
-    order."""
+def _fused_norm_forms(target: str, input_format: str, output_format: str) -> dict:
+    """The forms of the whole fused-norm program ``target`` builds for one (input format, output format), as
+    the registry records them: the poll ("all" for the probe-all poll), the pass 2 and its unroll, the worker
+    count (None for the kernel's own), the quantizing pass 2 and the scale-address form (None for BF16 output),
+    the launch trigger and the pass-1 sum-of-squares order."""
+    cell = (input_format, output_format)
     probe_all = input_format == "nvfp4" and target in PROBE_ALL_TARGETS
-    packed = (
-        input_format == "bf16"
-        and output_format != "bf16"
-        and target in PACKED_QUANT_TARGETS
-    )
-    permuted = (input_format, output_format) in PERMUTED_SS_FORMS[target]
+    unroll = PASS2_DIRECT_UNROLL.get((target, *cell))
+    quant = sf_addr = None
+    if output_format != "bf16":
+        quant = "packed" if cell in PACKED_QUANT_FORMS[target] else "f32"
+        sf_addr = "u32" if cell in SF_ADDR_U32_FORMS[target] else "i64"
+    return {
+        "poll": "all" if probe_all else "grouped",
+        "pass2": "direct" if unroll else "staged",
+        "unroll": unroll or 1,
+        "workers": None,
+        "quant": quant,
+        "sf_addr": sf_addr,
+        "early_launch": cell in EARLY_LAUNCH_FORMS[target],
+        "ss_order": "perm" if cell in PERMUTED_SS_FORMS[target] else "natural",
+    }
+
+
+def _fused_norm_name(
+    input_format: str, output_format: str, prefetch: bool, forms: dict
+) -> str:
+    """The name of the fused-norm program with ``forms``: "_pa" for the probe-all poll, "_p2d" for the direct
+    pass 2 and "_u<N>" for its unroll other than 1, "_w<N>" for a worker count the build spells, "_qp" for the
+    packed quantizing pass 2, "_sfu" for the 32-bit scale-address form, "_el" for the early launch trigger,
+    "_csp" for the per-CTA call state, "_sop" for the permuted sum of squares, "_pf" for the residual prefetch,
+    in that order."""
     return (
-        ("_pa" if probe_all else "")
-        + ("_qp" if packed else "")
+        f"tp2_rmsnorm_{input_format}_{output_format}"
+        + ("_pa" if forms["poll"] == "all" else "")
+        + ("_p2d" if forms["pass2"] == "direct" else "")
+        + (f"_u{forms['unroll']}" if forms["unroll"] != 1 else "")
+        + (f"_w{forms['workers']}" if forms["workers"] is not None else "")
+        + ("_qp" if forms["quant"] == "packed" else "")
+        + ("_sfu" if forms["sf_addr"] == "u32" else "")
+        + ("_el" if forms["early_launch"] else "")
         + CALL_STATE_TOKEN
-        + ("_sop" if permuted else "")
+        + ("_sop" if forms["ss_order"] == "perm" else "")
         + ("_pf" if prefetch else "")
     )
+
+
+def _fused_norm_band_forms(target: str, input_format: str, output_format: str) -> dict:
+    """The forms of the band program ``target`` builds for the cell: the whole program's, the band's keys over
+    them."""
+    _, extra = FUSED_NORM_BANDS[(target, input_format, output_format)]
+    return {**_fused_norm_forms(target, input_format, output_format), **extra}
+
+
+def _fused_norm_band(target: str, input_format: str, output_format: str) -> str:
+    """The name of the band program ``target`` builds for the cell (which must have a band); a band
+    ships without the prefetch."""
+    forms = _fused_norm_band_forms(target, input_format, output_format)
+    return _fused_norm_name(input_format, output_format, False, forms)
+
+
+def _fused_norm_whole_forms(
+    target: str, input_format: str, output_format: str, prefetch: bool
+) -> dict:
+    """The forms of the whole program ``target`` builds for the cell's prefetch form.  The prefetch rows
+    (18 to 28 per CTA: at most 4639 rows on 148 or 160 SMs) all fall inside a prefix band and outside a
+    suffix band, so the prefetch form ships one program per cell: in the band's forms where the band is a
+    prefix, in the forms the target measured everywhere else."""
+    band = FUSED_NORM_BANDS.get((target, input_format, output_format))
+    if prefetch and band is not None and band[0] == "prefix":
+        return _fused_norm_band_forms(target, input_format, output_format)
+    return _fused_norm_forms(target, input_format, output_format)
+
+
+def _fused_norm_program(
+    target: str,
+    input_format: str,
+    output_format: str,
+    prefetch: bool,
+    rows: int | None = None,
+) -> str:
+    """The fused-norm program ``target`` runs for the cell: the band program when the cell has a band, the
+    call runs without the prefetch and ``rows`` falls inside the band, else the whole program."""
+    band = FUSED_NORM_BANDS.get((target, input_format, output_format))
+    if rows is not None and band is not None and not prefetch:
+        kind, _ = band
+        if loader.select_rows(rows, kind, BAND_THRESHOLD):
+            return _fused_norm_band(target, input_format, output_format)
+    forms = _fused_norm_whole_forms(target, input_format, output_format, prefetch)
+    return _fused_norm_name(input_format, output_format, prefetch, forms)
+
+
+def _one_shot_program(target: str, input_format: str, rows: int | None = None) -> str:
+    """The one-shot program ``target`` runs for the input format: the band program when ``rows`` falls inside
+    the target's band, else the whole program (the BF16 form the target measured, the NVFP4 single text)."""
+    form = ONESHOT_BF16_FORMS[target] if input_format == "bf16" else ""
+    band = ONESHOT_BANDS.get((target, input_format))
+    if rows is not None and band is not None:
+        kind, threshold, token = band
+        if loader.select_rows(rows, kind, threshold):
+            form += token
+    return f"tp2_oneshot_{input_format}{form}"
 
 
 def _expected_program_ids() -> set[str]:
     ids = {"tp2_oneshot_nvfp4"}
     ids |= {f"tp2_oneshot_bf16{form}" for form in ONESHOT_BF16_FORMS.values()}
+    ids |= {
+        f"tp2_oneshot_{i}{token}" for (_, i), (_, _, token) in ONESHOT_BANDS.items()
+    }
     # One two-shot program per (target, input format, bv) and one fused-norm program per (target, input
     # format, output format, prefetch form), named by the forms that target measured; targets whose forms
-    # agree share the name (and the program).
+    # agree share the name (and the program).  A cell with a band adds the band's program, which ships
+    # without the prefetch.
     ids |= {
         f"tp4_twoshot_{i}_bv{bv}{_two_shot_suffix(t, i, bv)}"
         for t in TARGETS
@@ -159,12 +302,13 @@ def _expected_program_ids() -> set[str]:
         for bv in BVS
     }
     ids |= {
-        f"tp2_rmsnorm_{i}_{o}{_fused_norm_suffix(t, i, o, pf)}"
+        _fused_norm_program(t, i, o, pf)
         for t in TARGETS
         for i in INPUT_FORMATS
         for o in OUTPUT_FORMATS
         for pf in (False, True)
     }
+    ids |= {_fused_norm_band(t, i, o) for (t, i, o) in FUSED_NORM_BANDS}
     return ids
 
 
@@ -200,6 +344,14 @@ def _expected_params(
     )
 
 
+def _binding_form(record: dict) -> str:
+    """The shared binding form of a record: family, world size and formats."""
+    if record["family"] == "allreduce":
+        shot = "oneshot" if record["world_size"] == 2 else "twoshot"
+        return f"tp{record['world_size']}_{shot}_{record['input_format']}"
+    return f"tp2_rmsnorm_{record['input_format']}_{record['output_format']}"
+
+
 # ---------------------------------------------------------------------------
 # registry schema
 # ---------------------------------------------------------------------------
@@ -207,7 +359,7 @@ def _expected_params(
 
 def test_registry_lists_every_program_with_the_contract_parameters() -> None:
     assert set(PROGRAMS) == _expected_program_ids()
-    assert len(PROGRAMS) == 41
+    assert len(PROGRAMS) == 53
     keys = {
         "family",
         "world_size",
@@ -215,16 +367,8 @@ def test_registry_lists_every_program_with_the_contract_parameters() -> None:
         "output_format",
         "bv",
         "reset",
-        "rs_poll",
-        "poll",
-        "quant",
         "ss_order",
         "prefetch",
-        "call_state",
-        "first_load",
-        "b1poll",
-        "pass2_src",
-        "early_launch",
         "targets",
         "kernel_symbol",
         "sources",
@@ -232,7 +376,6 @@ def test_registry_lists_every_program_with_the_contract_parameters() -> None:
         "dynamic_smem_bytes",
         "params",
         "entry",
-        "window",
         "grid_max",
     }
     symbols = set()
@@ -254,69 +397,50 @@ def test_registry_lists_every_program_with_the_contract_parameters() -> None:
         assert record["kernel_symbol"] == f"cake_fp4_allreduce_{program}"
         assert record["kernel_symbol"] not in symbols
         symbols.add(record["kernel_symbol"])
+        # A prefetch program shares its base program's kernel source, and every
+        # program shares the binding of its form; the kernel symbol, the block
+        # size, the dynamic shared memory and the prefetch come through the
+        # loader's -D flags.
+        stem = program[: -len("_pf")] if record["prefetch"] else program
         assert tuple(record["sources"]) == (
-            f"{SOURCE_DIR}/cake_fp4_allreduce_{program}_kernel.cu",
-            f"{SOURCE_DIR}/cake_fp4_allreduce_{program}_binding.cu",
+            f"{SOURCE_DIR}/cake_fp4_allreduce_{stem}_kernel.cu",
+            f"{SOURCE_DIR}/cake_fp4_allreduce_{_binding_form(record)}_binding.cu",
         )
         assert record["entry"] == "run"
-        expected_block = (
-            288 if (family == "rmsnorm" and input_format == "nvfp4") else 352
+        # One warp per worker and one more: ten workers for a BF16 input and eight for an NVFP4 input,
+        # unless the build spells its own worker count ("_w11").
+        workers = 11 if "_w11" in program else None
+        workers = workers or (
+            8 if (family == "rmsnorm" and input_format == "nvfp4") else 10
         )
-        assert record["block"] == expected_block, program
+        assert record["block"] == 32 * (workers + 1), program
         assert 0 < int(record["dynamic_smem_bytes"]) <= MAX_DYNAMIC_SMEM_BYTES, program
         assert tuple(record["targets"]) and set(record["targets"]) <= set(TARGETS)
         if world_size == 4:
-            # The two-shot kernel's build forms, in name order: the per-CTA call state ("_csp"), the early
-            # first load ("_fe"), the 12-tuple bv-1 poll ("_b1r"), the shared-memory pass-2 source ("_p2m")
-            # and the register-store re-arm ("_rst"); every shipped build keeps its call state per CTA and
-            # polls the row.
+            # The two-shot kernel's phase-B variant ("_bv<N>") and its re-arm ("_rst" for the
+            # register-store re-arm, the bulk re-arm otherwise); the other build forms are name
+            # tokens, pinned per target by the selection tests.
             assert record["bv"] in BVS
-            assert record["reset"] in ("bulk", "st") and record["rs_poll"] is None
-            assert record["call_state"] == "per_cta", program
-            assert record["first_load"] in ("sync", "early"), program
-            assert record["b1poll"] == "row", program
-            assert record["pass2_src"] in ("l2", "smem"), program
-            assert record["early_launch"] is None, program
-            suffix = (
-                CALL_STATE_TOKEN
-                + ("_fe" if record["first_load"] == "early" else "")
-                + B1_POLL_TOKEN
-                + ("_p2m" if record["pass2_src"] == "smem" else "")
-                + ("_rst" if record["reset"] == "st" else "")
-            )
-            assert program == f"tp4_twoshot_{input_format}_bv{record['bv']}{suffix}", (
-                program
-            )
+            assert record["reset"] in ("bulk", "st")
+            assert program.startswith(f"tp4_twoshot_{input_format}_bv{record['bv']}")
             assert program.endswith("_rst") == (record["reset"] == "st")
         elif family == "allreduce":
-            # The one-shot kernel's lever forms: "_rso" for the overlapped row-scale poll, then "_el" / "_ll"
-            # for a launch-trigger placement off the input format's baseline (the NVFP4 kernel triggers the
-            # dependent launch early, the BF16 kernel after its prologue), then "_rst" for a register-store
-            # re-arm off the BF16 baseline (the NVFP4 kernel re-arms with register stores).
+            # The one-shot kernel's re-arm form off the input format's baseline (the BF16 kernel
+            # re-arms with bulk stores, the NVFP4 kernel with register stores): "_rst" / "_rsb"
+            # closes the name; the other lever forms ("_rso", "_el" / "_ll") are name tokens only.
             assert record["bv"] is None
-            assert record["rs_poll"] in ("first", "overlap")
-            assert record["early_launch"] in (False, True), program
             assert record["reset"] in ("bulk", "st")
-            baseline_early = {"bf16": False, "nvfp4": True}[input_format]
             baseline_reset = {"bf16": "bulk", "nvfp4": "st"}[input_format]
-            launch = (
+            rearm = (
                 ""
-                if record["early_launch"] == baseline_early
-                else ("_el" if record["early_launch"] else "_ll")
+                if record["reset"] == baseline_reset
+                else ("_rst" if record["reset"] == "st" else "_rsb")
             )
-            suffix = (
-                ("_rso" if record["rs_poll"] == "overlap" else "")
-                + launch
-                + ("" if record["reset"] == baseline_reset else "_rst")
-            )
-            assert program == f"tp2_oneshot_{input_format}{suffix}", program
-            assert record["call_state"] is None and record["first_load"] is None
-            assert record["b1poll"] is None and record["pass2_src"] is None
+            assert program.startswith(f"tp2_oneshot_{input_format}"), program
+            assert program.endswith(("_rst", "_rsb")) == bool(rearm), program
+            assert program.endswith(rearm), program
         else:
             assert record["bv"] is None and record["reset"] is None
-            assert record["rs_poll"] is None and record["early_launch"] is None
-            assert record["first_load"] is None and record["b1poll"] is None
-            assert record["pass2_src"] is None
         if family == "rmsnorm":
             assert record["prefetch"] in (False, True)
             assert program.endswith("_pf") == record["prefetch"], program
@@ -325,222 +449,15 @@ def test_registry_lists_every_program_with_the_contract_parameters() -> None:
             assert record["ss_order"] in ("natural", "perm"), program
             assert stem.endswith("_sop") == (record["ss_order"] == "perm"), program
             stem = stem[: -len("_sop")] if record["ss_order"] == "perm" else stem
-            # Every fused-norm build keeps its call state per CTA ("_csp", before "_sop").
-            assert record["call_state"] == "per_cta", program
+            # Every fused-norm build keeps its call state per CTA ("_csp", before "_sop"); the
+            # other forms ("_pa", "_p2d", "_u<N>", "_w<N>", "_qp", "_sfu", "_el") are name tokens.
             assert stem.endswith(CALL_STATE_TOKEN), program
-            stem = stem[: -len(CALL_STATE_TOKEN)]
-            # The quantizing pass-2 form exists for the NVFP4 / MXFP8 outputs only ("_qp" for the packed form).
-            assert (record["quant"] is None) == (output_format == "bf16"), program
-            assert record["quant"] in (None, "f32", "packed"), program
-            assert stem.endswith("_qp") == (record["quant"] == "packed"), program
-            stem = stem[: -len("_qp")] if record["quant"] == "packed" else stem
-            assert record["poll"] in ("grouped", "all")
-            assert stem.endswith("_pa") == (record["poll"] == "all"), program
-            assert stem == f"tp2_rmsnorm_{input_format}_{output_format}" + (
-                "_pa" if record["poll"] == "all" else ""
-            ), program
+            assert stem.startswith(f"tp2_rmsnorm_{input_format}_{output_format}")
         else:
-            assert record["prefetch"] is None and record["poll"] is None
-            assert record["quant"] is None and record["ss_order"] is None
+            assert record["prefetch"] is None and record["ss_order"] is None
     assert {
         target for record in PROGRAMS.values() for target in record["targets"]
     } == set(TARGETS)
-
-
-def test_two_shot_programs_cover_every_variant_once_per_target() -> None:
-    """On each target one program serves each (input format, bv), in the first-load, pass-2-source and
-    re-arm forms that target measured, with the per-CTA call state and the 12-tuple bv-1 poll throughout."""
-    for target in TARGETS:
-        for input_format in INPUT_FORMATS:
-            for bv in BVS:
-                matching = [
-                    program
-                    for program, record in PROGRAMS.items()
-                    if record["family"] == "allreduce"
-                    and record["world_size"] == 4
-                    and record["input_format"] == input_format
-                    and record["bv"] == bv
-                    and target in record["targets"]
-                ]
-                assert len(matching) == 1, (target, input_format, bv, matching)
-                (program,) = matching
-                record = PROGRAMS[program]
-                variant = (input_format, bv)
-                register_store = variant in REGISTER_STORE_FORMS[target]
-                assert record["reset"] == ("st" if register_store else "bulk")
-                assert program.endswith("_rst") == register_store
-                assert record["first_load"] == (
-                    "early" if variant in FIRST_LOAD_EARLY_FORMS[target] else "sync"
-                )
-                assert record["pass2_src"] == (
-                    "smem" if variant in PASS2_SMEM_FORMS[target] else "l2"
-                )
-                assert record["call_state"] == "per_cta" and record["b1poll"] == "row"
-                suffix = _two_shot_suffix(target, input_format, bv)
-                assert program == f"tp4_twoshot_{input_format}_bv{bv}{suffix}"
-    # A program ships for exactly the targets whose measured forms spell its name: the early-first-load,
-    # shared-memory pass-2 and register-store forms split an (input format, bv) between names, and no
-    # other name of the variant (the whole-call protocol's plain or "_rst" name included) exists.
-    for input_format in INPUT_FORMATS:
-        for bv in BVS:
-            stem = f"tp4_twoshot_{input_format}_bv{bv}"
-            by_suffix: dict[str, tuple[str, ...]] = {}
-            for target in TARGETS:
-                suffix = _two_shot_suffix(target, input_format, bv)
-                by_suffix[suffix] = (*by_suffix.get(suffix, ()), target)
-            for suffix, targets in by_suffix.items():
-                assert PROGRAMS[f"{stem}{suffix}"]["targets"] == targets, (stem, suffix)
-            assert stem not in PROGRAMS and f"{stem}_rst" not in PROGRAMS
-            assert {p for p in PROGRAMS if p.startswith(f"{stem}_")} == {
-                f"{stem}{suffix}" for suffix in by_suffix
-            }, stem
-
-
-def test_one_shot_programs_serve_every_target_once() -> None:
-    """On each target one one-shot program serves each input format: the NVFP4 kernel's single text, and for
-    BF16 input the form that target measured ("_rso_el" on sm_103a, "_rst" on sm_107a, the baseline on
-    sm_100a)."""
-    for target in TARGETS:
-        for input_format in INPUT_FORMATS:
-            matching = [
-                program
-                for program, record in PROGRAMS.items()
-                if record["family"] == "allreduce"
-                and record["world_size"] == 2
-                and record["input_format"] == input_format
-                and target in record["targets"]
-            ]
-            form = ONESHOT_BF16_FORMS[target] if input_format == "bf16" else ""
-            assert matching == [f"tp2_oneshot_{input_format}{form}"], (
-                target,
-                input_format,
-                matching,
-            )
-    assert PROGRAMS["tp2_oneshot_nvfp4"]["targets"] == TARGETS
-    for target, form in ONESHOT_BF16_FORMS.items():
-        assert PROGRAMS[f"tp2_oneshot_bf16{form}"]["targets"] == (target,)
-
-
-def test_fused_norm_programs_cover_every_form_once_per_target() -> None:
-    """On each target one program serves each (input format, output format, prefetch form), in the poll,
-    quantizing and sum-of-squares forms that target measured: the probe-all poll ("_pa") for NVFP4 input on
-    sm_100a / sm_103a and the two-pair groups otherwise; the packed quantizing pass 2 ("_qp") for BF16 input with
-    NVFP4 / MXFP8 output on sm_100a / sm_103a and the FP32 tree otherwise; the permuted pass-1 sum of squares
-    ("_sop") for every build of sm_107a and every build but nvfp4 -> bf16 of sm_103a and sm_100a, the row's
-    chunk order otherwise; and the per-CTA call state ("_csp") on every target."""
-    for target in TARGETS:
-        for input_format in INPUT_FORMATS:
-            for output_format in OUTPUT_FORMATS:
-                for prefetch in (False, True):
-                    matching = [
-                        program
-                        for program, record in PROGRAMS.items()
-                        if record["family"] == "rmsnorm"
-                        and record["input_format"] == input_format
-                        and record["output_format"] == output_format
-                        and record["prefetch"] is prefetch
-                        and target in record["targets"]
-                    ]
-                    assert len(matching) == 1, (
-                        target,
-                        input_format,
-                        output_format,
-                        prefetch,
-                        matching,
-                    )
-                    (program,) = matching
-                    probe_all = input_format == "nvfp4" and target in PROBE_ALL_TARGETS
-                    assert PROGRAMS[program]["poll"] == (
-                        "all" if probe_all else "grouped"
-                    )
-                    packed = (
-                        input_format == "bf16"
-                        and output_format != "bf16"
-                        and target in PACKED_QUANT_TARGETS
-                    )
-                    assert PROGRAMS[program]["quant"] == (
-                        None
-                        if output_format == "bf16"
-                        else ("packed" if packed else "f32")
-                    )
-                    permuted = (input_format, output_format) in PERMUTED_SS_FORMS[
-                        target
-                    ]
-                    assert PROGRAMS[program]["ss_order"] == (
-                        "perm" if permuted else "natural"
-                    )
-                    assert PROGRAMS[program]["call_state"] == "per_cta", program
-                    suffix = _fused_norm_suffix(
-                        target, input_format, output_format, prefetch
-                    )
-                    assert (
-                        program == f"tp2_rmsnorm_{input_format}_{output_format}{suffix}"
-                    )
-    # A program ships for exactly the targets whose measured forms spell its name: the probe-all,
-    # packed-quantizing and permuted-sum forms split an (input format, output format) between names, and a
-    # name without them survives only where a target keeps every baseline form.
-    for program, record in PROGRAMS.items():
-        if record["family"] != "rmsnorm":
-            continue
-        i, o, pf = record["input_format"], record["output_format"], record["prefetch"]
-        assert record["targets"] == tuple(
-            t
-            for t in TARGETS
-            if program == f"tp2_rmsnorm_{i}_{o}{_fused_norm_suffix(t, i, o, pf)}"
-        ), program
-    for pf in ("", "_pf"):
-        assert f"tp2_rmsnorm_bf16_bf16{pf}" not in PROGRAMS
-        assert f"tp2_rmsnorm_bf16_bf16_csp{pf}" not in PROGRAMS
-        assert PROGRAMS[f"tp2_rmsnorm_bf16_bf16_csp_sop{pf}"]["targets"] == TARGETS
-        assert (
-            PROGRAMS[f"tp2_rmsnorm_nvfp4_bf16_pa_csp{pf}"]["targets"]
-            == PROBE_ALL_TARGETS
-        )
-        assert PROGRAMS[f"tp2_rmsnorm_nvfp4_bf16_csp_sop{pf}"]["targets"] == (
-            "sm_107a",
-        )
-        for output_format in ("nvfp4", "mxfp8"):
-            quantized = f"tp2_rmsnorm_bf16_{output_format}"
-            assert f"{quantized}_qp_csp{pf}" not in PROGRAMS
-            assert PROGRAMS[f"{quantized}_qp_csp_sop{pf}"]["targets"] == (
-                "sm_100a",
-                "sm_103a",
-            )
-            assert PROGRAMS[f"{quantized}_csp_sop{pf}"]["targets"] == ("sm_107a",)
-            records = f"tp2_rmsnorm_nvfp4_{output_format}"
-            assert f"{records}_pa_csp{pf}" not in PROGRAMS
-            assert PROGRAMS[f"{records}_pa_csp_sop{pf}"]["targets"] == (
-                "sm_100a",
-                "sm_103a",
-            )
-            assert PROGRAMS[f"{records}_csp_sop{pf}"]["targets"] == ("sm_107a",)
-            assert f"{quantized}{pf}" not in PROGRAMS
-            assert f"{quantized}_csp{pf}" not in PROGRAMS
-            assert f"{records}{pf}" not in PROGRAMS
-            assert f"{records}_csp{pf}" not in PROGRAMS
-        for output_format in OUTPUT_FORMATS:
-            assert f"tp2_rmsnorm_bf16_{output_format}_pa_csp{pf}" not in PROGRAMS
-            assert f"tp2_rmsnorm_nvfp4_{output_format}_qp_csp{pf}" not in PROGRAMS
-            assert f"tp2_rmsnorm_nvfp4_{output_format}_pa_qp_csp{pf}" not in PROGRAMS
-        assert f"tp2_rmsnorm_bf16_bf16_qp_csp{pf}" not in PROGRAMS
-        assert f"tp2_rmsnorm_nvfp4_bf16_csp{pf}" not in PROGRAMS
-        assert f"tp2_rmsnorm_nvfp4_bf16_pa_csp_sop{pf}" not in PROGRAMS
-    # No fused-norm name of the whole-call exit protocol (without "_csp") survives.
-    assert all(
-        CALL_STATE_TOKEN in program
-        for program, record in PROGRAMS.items()
-        if record["family"] == "rmsnorm"
-    )
-    # The natural order survives on one build only: nvfp4 -> bf16 on sm_100a / sm_103a.
-    natural = {
-        program
-        for program, record in PROGRAMS.items()
-        if record["ss_order"] == "natural"
-    }
-    assert natural == {
-        "tp2_rmsnorm_nvfp4_bf16_pa_csp",
-        "tp2_rmsnorm_nvfp4_bf16_pa_csp_pf",
-    }
 
 
 def _checkout_source_dir() -> Path:
@@ -558,13 +475,43 @@ def test_program_sources_exist_and_declare_their_kernels() -> None:
         assert kernel.is_file(), kernel
         assert binding.is_file(), binding
         kernel_text = kernel.read_text()
-        assert f"{record['kernel_symbol']}(" in kernel_text, program
         assert "__global__" in kernel_text, program
+        # A kernel whose prefetch twin ships serves both programs through the -D
+        # macros: the symbol macro with its own symbol as the default, and the
+        # prefetch switch.  Every other kernel keeps its plain symbol.
+        stem = program[: -len("_pf")] if record["prefetch"] else program
+        shared = f"{stem}_pf" in PROGRAMS
+        if shared:
+            assert "CAKE_FP4_ALLREDUCE_KERNEL(" in kernel_text, program
+            default = f"#define CAKE_FP4_ALLREDUCE_KERNEL cake_fp4_allreduce_{stem}"
+            assert default in kernel_text, program
+            assert "#ifdef CAKE_FP4_ALLREDUCE_PREFETCH" in kernel_text, program
+        else:
+            assert f"{record['kernel_symbol']}(" in kernel_text, program
+            assert "CAKE_FP4_ALLREDUCE_" not in kernel_text, program
         binding_text = binding.read_text()
         assert f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({record['entry']}," in binding_text, (
             program
         )
-        assert record["kernel_symbol"] in binding_text, program
+        # Every program of a (family, world size, input format, output format)
+        # form shares one binding; its kernel symbol, block size and dynamic
+        # shared memory come through the loader's -D flags, so the binding
+        # names no program.
+        form = _binding_form(record)
+        assert binding.name == f"cake_fp4_allreduce_{form}_binding.cu", program
+        for macro in (
+            "CAKE_FP4_ALLREDUCE_KERNEL",
+            "CAKE_FP4_ALLREDUCE_THREADS",
+            "CAKE_FP4_ALLREDUCE_DYNAMIC_SMEM",
+        ):
+            assert f"#ifndef {macro}" in binding_text, (program, macro)
+        assert "cake_fp4_allreduce_tp" not in binding_text, program
+        assert loader.program_defines(program) == [
+            f"-DCAKE_FP4_ALLREDUCE_KERNEL={record['kernel_symbol']}",
+            f"-DCAKE_FP4_ALLREDUCE_THREADS={record['block']}",
+            f"-DCAKE_FP4_ALLREDUCE_DYNAMIC_SMEM={record['dynamic_smem_bytes']}",
+            *(["-DCAKE_FP4_ALLREDUCE_PREFETCH=1"] if record["prefetch"] else []),
+        ], program
     # The loader resolves sources under the package data directory (``flashinfer/data/csrc``, a
     # symlink to the repository's ``csrc`` in an editable install): compare the real files.
     assert {path.resolve() for path in loader.program_sources("tp2_oneshot_bf16")} == {
@@ -790,7 +737,6 @@ def test_window_keys_and_buffer_params_match_the_programs() -> None:
         for record in programs:
             assert params <= set(record["params"]), (key, record["kernel_symbol"])
             assert "peer_ptrs" in record["params"] and "ctrl" in record["params"]
-            assert record["window"] == key, record["kernel_symbol"]
             # The window provisions the control words of the program's grid bound.
             assert record["grid_max"] * CTRL_WORDS_PER_CTA == window["ctrl_words"], (
                 record["kernel_symbol"]
@@ -924,33 +870,25 @@ def test_program_for_two_shot_picks_the_targets_forms(
         assert record["reset"] == (
             "st" if variant in REGISTER_STORE_FORMS[target] else "bulk"
         )
-        assert record["first_load"] == (
-            "early" if variant in FIRST_LOAD_EARLY_FORMS[target] else "sync"
-        )
-        assert record["pass2_src"] == (
-            "smem" if variant in PASS2_SMEM_FORMS[target] else "l2"
-        )
 
 
 @pytest.mark.parametrize("target", TARGETS)
 def test_program_for_one_shot_and_fused_norm(target: str) -> None:
+    """The one-shot and fused-norm calls resolve the target's whole program, or its band program inside the
+    band's row counts (the fused norm's prefetch form first, on rows per CTA; the band on the call's rows)."""
     for input_format in INPUT_FORMATS:
-        form = ONESHOT_BF16_FORMS[target] if input_format == "bf16" else ""
-        for rows in (3, 1031, 2048, 2664, 4096, 4291, 4292, 16384):
+        for rows in (3, 1031, 2048, 2664, 4096, 4291, 4292, 6143, 6144, 6145, 16384):
             suffix = "_pf" if loader.select_prefetch(rows, 148) else ""
             assert (rows in (2664, 4096, 4291)) == bool(suffix)
-            assert (
-                loader.program_for(
-                    family="allreduce",
-                    world_size=2,
-                    input_format=input_format,
-                    output_format=None,
-                    rows=rows,
-                    grid=148,
-                    target=target,
-                )
-                == f"tp2_oneshot_{input_format}{form}"
-            )
+            assert loader.program_for(
+                family="allreduce",
+                world_size=2,
+                input_format=input_format,
+                output_format=None,
+                rows=rows,
+                grid=148,
+                target=target,
+            ) == _one_shot_program(target, input_format, rows)
             for output_format in OUTPUT_FORMATS:
                 program = loader.program_for(
                     family="rmsnorm",
@@ -961,15 +899,23 @@ def test_program_for_one_shot_and_fused_norm(target: str) -> None:
                     grid=148,
                     target=target,
                 )
-                forms = _fused_norm_suffix(
-                    target, input_format, output_format, bool(suffix)
-                )
-                assert program == f"tp2_rmsnorm_{input_format}_{output_format}{forms}"
+                assert program == _fused_norm_program(
+                    target, input_format, output_format, bool(suffix), rows
+                ), (input_format, output_format, rows)
                 # The selected record carries the sum-of-squares order the reference uses on this target.
-                permuted = (input_format, output_format) in PERMUTED_SS_FORMS[target]
-                assert PROGRAMS[program]["ss_order"] == (
-                    "perm" if permuted else "natural"
+                band = FUSED_NORM_BANDS.get((target, input_format, output_format))
+                inside = bool(band) and loader.select_rows(
+                    rows, band[0], BAND_THRESHOLD
                 )
+                forms = (
+                    _fused_norm_band_forms(target, input_format, output_format)
+                    if inside
+                    else _fused_norm_forms(target, input_format, output_format)
+                )
+                assert PROGRAMS[program]["ss_order"] == forms["ss_order"]
+                # The prefetch form has no band: inside a prefix band its whole program carries the band's
+                # forms, and no prefetch row count reaches a suffix band.
+                assert (program in loader.SELECT_ROWS) == (inside and not suffix)
     with pytest.raises(ValueError):
         loader.program_for(
             family="allreduce",
@@ -1000,6 +946,328 @@ def test_program_for_one_shot_and_fused_norm(target: str) -> None:
             grid=148,
             target="sm_90a",
         )
+
+
+# ---------------------------------------------------------------------------
+# rows-dispatched programs: SELECT_ROWS and the rows filter of program_for
+# ---------------------------------------------------------------------------
+
+# The synthetic bands the dispatch tests install beside the registry's whole programs of one target: the
+# fused-norm cell, the band kind, the name token and the record keys the band deviates in.  A prefix band
+# serves rows <= threshold, a suffix band rows >= threshold (both inclusive); the whole program serves
+# the other row counts.
+# (input format, output format, band kind, name token, the band record's keys over the whole program's record,
+# the whole program record's own keys): the third pair's whole program and band differ in more than one key --
+# the band runs on eleven workers and sums the pass-1 squares in the row's chunk order where the whole
+# program permutes them -- and the rows filter pairs them by cell all the same.
+SYNTHETIC_BANDS = (
+    ("nvfp4", "bf16", "prefix", "_sop", {"ss_order": "perm"}, {}),
+    ("bf16", "bf16", "suffix", "_w11", {"block": 384}, {}),
+    (
+        "bf16",
+        "nvfp4",
+        "suffix",
+        "_p2d_w11",
+        {"block": 384, "ss_order": "natural"},
+        {"ss_order": "perm"},
+    ),
+)
+
+
+def _whole_program(
+    target: str, input_format: str, output_format: str, prefetch: bool
+) -> str:
+    (program,) = [
+        program
+        for program, record in PROGRAMS.items()
+        if record["family"] == "rmsnorm"
+        and record["input_format"] == input_format
+        and record["output_format"] == output_format
+        and record["prefetch"] is prefetch
+        and target in record["targets"]
+        and program not in loader.SELECT_ROWS
+    ]
+    return program
+
+
+@pytest.fixture
+def synthetic_bands(monkeypatch):
+    """A registry with rows-dispatched programs on sm_103a, installed over the registry's whole programs (its
+    own bands set aside) the way the generator writes them: one PROGRAMS record per (band, prefetch form)
+    carrying the whole program's record with the band's keys over it, and SELECT_ROWS naming each band's
+    kind and threshold.  Yields ``{(input_format, output_format, prefetch): (band, whole)}``."""
+
+    target = "sm_103a"
+    programs = {
+        name: dict(record)
+        for name, record in loader.PROGRAMS.items()
+        if name not in loader.SELECT_ROWS
+    }
+    bands: dict[str, dict] = {}
+    cells: dict[tuple[str, str, bool], tuple[str, str]] = {}
+    for input_format, output_format, kind, token, extra, whole_extra in SYNTHETIC_BANDS:
+        for prefetch in (False, True):
+            whole = _whole_program(target, input_format, output_format, prefetch)
+            name = whole.replace("_pf", "") + token + ("_pf" if prefetch else "")
+            assert name not in programs
+            programs[whole] = {**programs[whole], **whole_extra}
+            programs[name] = {
+                **programs[whole],
+                **extra,
+                "targets": (target,),
+                "kernel_symbol": f"cake_fp4_allreduce_{name}",
+            }
+            bands[name] = {"kind": kind, "threshold": BAND_THRESHOLD}
+            cells[(input_format, output_format, prefetch)] = (name, whole)
+    monkeypatch.setattr(loader, "PROGRAMS", programs)
+    monkeypatch.setattr(loader, "SELECT_ROWS", bands)
+    loader.program_for.cache_clear()
+    yield cells
+    loader.program_for.cache_clear()
+
+
+def test_select_rows_rule_is_inclusive_at_the_threshold() -> None:
+    probes = (1, BAND_THRESHOLD - 1, BAND_THRESHOLD, BAND_THRESHOLD + 1, 16384)
+    assert [loader.select_rows(rows, "prefix", BAND_THRESHOLD) for rows in probes] == [
+        True,
+        True,
+        True,
+        False,
+        False,
+    ]
+    assert [loader.select_rows(rows, "suffix", BAND_THRESHOLD) for rows in probes] == [
+        False,
+        False,
+        True,
+        True,
+        True,
+    ]
+    with pytest.raises(ValueError):
+        loader.select_rows(BAND_THRESHOLD, "middle", BAND_THRESHOLD)
+    with pytest.raises(ValueError):
+        loader.select_rows(0, "prefix", BAND_THRESHOLD)
+
+
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_program_for_dispatches_the_band_inside_its_rows(
+    synthetic_bands, prefetch: bool
+) -> None:
+    """At threshold - 1 / threshold / threshold + 1 a prefix band's program is served / served / not served
+    and a suffix band's not served / served / served, the whole program otherwise; the prefetch form is
+    chosen first (rows per CTA), the band on the call's row count, however many keys the pair differs in."""
+    target = "sm_103a"
+    grid = (
+        256 if prefetch else 148
+    )  # 6144 // 256 = 24 rows per CTA (prefetch), 6144 // 148 = 41 (plain)
+    probes = (BAND_THRESHOLD - 1, BAND_THRESHOLD, BAND_THRESHOLD + 1)
+    for rows in probes:
+        assert loader.select_prefetch(rows, grid) is prefetch
+    for input_format, output_format, kind, _, extra, whole_extra in SYNTHETIC_BANDS:
+        band, whole = synthetic_bands[(input_format, output_format, prefetch)]
+        expected = (band, band, whole) if kind == "prefix" else (whole, band, band)
+        for rows, program in zip(probes, expected, strict=True):
+            assert (
+                loader.program_for(
+                    family="rmsnorm",
+                    world_size=2,
+                    input_format=input_format,
+                    output_format=output_format,
+                    rows=rows,
+                    grid=grid,
+                    target=target,
+                )
+                == program
+            ), (input_format, output_format, rows)
+        far = (
+            (1 * grid + 1, 64 * grid) if kind == "prefix" else (64 * grid, 1 * grid + 1)
+        )
+        assert loader.select_prefetch(far[0], grid) is False
+        assert loader.select_prefetch(far[1], grid) is False
+        plain_band, plain_whole = synthetic_bands[(input_format, output_format, False)]
+        inside, outside = far
+        assert (
+            loader.program_for(
+                "rmsnorm", 2, input_format, output_format, inside, grid, target
+            )
+            == plain_band
+        )
+        assert (
+            loader.program_for(
+                "rmsnorm", 2, input_format, output_format, outside, grid, target
+            )
+            == plain_whole
+        )
+        # The band's record carries the deviating keys over the whole program's record.
+        record = loader.PROGRAMS[band]
+        for key, value in extra.items():
+            assert record[key] == value
+        # The whole program's own keys stay its own: a pair differing in several keys is still one cell.
+        for key, value in whole_extra.items():
+            assert loader.PROGRAMS[whole][key] == value, (whole, key)
+            assert record[key] != value, (band, key)
+
+
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_program_for_keeps_the_whole_program_without_a_band(
+    synthetic_bands, prefetch: bool
+) -> None:
+    """A cell without a band, and the dispatched cells on the other targets, resolve the whole program at
+    every probe (a registry without bands)."""
+    grid = 256 if prefetch else 148
+    probes = (BAND_THRESHOLD - 1, BAND_THRESHOLD, BAND_THRESHOLD + 1, 1024, 16384)
+    for target in TARGETS:
+        for input_format in INPUT_FORMATS:
+            for output_format in OUTPUT_FORMATS:
+                banded = target == "sm_103a" and any(
+                    (i, o) == (input_format, output_format)
+                    for i, o, *_ in SYNTHETIC_BANDS
+                )
+                if banded:
+                    continue
+                for rows in probes:
+                    program = loader.program_for(
+                        family="rmsnorm",
+                        world_size=2,
+                        input_format=input_format,
+                        output_format=output_format,
+                        rows=rows,
+                        grid=grid,
+                        target=target,
+                    )
+                    assert program not in loader.SELECT_ROWS, (
+                        target,
+                        input_format,
+                        output_format,
+                        rows,
+                    )
+                    assert loader.PROGRAMS[program][
+                        "prefetch"
+                    ] is loader.select_prefetch(rows, grid)
+    # The all-reduce programs, with no band installed here, resolve as before.
+    for target in TARGETS:
+        assert loader.program_for(
+            "allreduce", 2, "bf16", None, BAND_THRESHOLD, 148, target
+        ) == (f"tp2_oneshot_bf16{ONESHOT_BF16_FORMS[target]}")
+
+
+def test_program_for_refuses_two_bands_serving_one_call(
+    synthetic_bands, monkeypatch
+) -> None:
+    """Exactly one candidate must remain: a second band of the same cell inside the row count is refused,
+    as a cell left without a whole program is outside every band."""
+    band, whole = synthetic_bands[("bf16", "bf16", False)]
+    second = band + "_x"
+    programs = dict(loader.PROGRAMS)
+    programs[second] = dict(
+        programs[band], kernel_symbol=f"cake_fp4_allreduce_{second}"
+    )
+    bands = dict(loader.SELECT_ROWS)
+    bands[second] = dict(bands[band])
+    monkeypatch.setattr(loader, "PROGRAMS", programs)
+    monkeypatch.setattr(loader, "SELECT_ROWS", bands)
+    loader.program_for.cache_clear()
+    with pytest.raises(RuntimeError, match="resolves 2 programs"):
+        loader.program_for("rmsnorm", 2, "bf16", "bf16", BAND_THRESHOLD, 148, "sm_103a")
+    assert (
+        loader.program_for(
+            "rmsnorm", 2, "bf16", "bf16", BAND_THRESHOLD - 1, 148, "sm_103a"
+        )
+        == whole
+    )
+    programs.pop(whole)
+    monkeypatch.setattr(loader, "PROGRAMS", programs)
+    loader.program_for.cache_clear()
+    with pytest.raises(RuntimeError, match="resolves 0 programs"):
+        loader.program_for(
+            "rmsnorm", 2, "bf16", "bf16", BAND_THRESHOLD - 1, 148, "sm_103a"
+        )
+    loader.program_for.cache_clear()
+
+
+@pytest.fixture
+def synthetic_oneshot_band(monkeypatch):
+    """A registry with a rows-dispatched one-shot all-reduce program on sm_100a, installed over the registry's
+    whole programs (its own bands set aside) the way the generator writes it: the whole NVFP4 one-shot
+    program's record with the band's re-arm over it, and SELECT_ROWS naming the band's kind and threshold.
+    Yields ``(band, whole)``."""
+
+    target = "sm_100a"
+    whole, band = "tp2_oneshot_nvfp4", "tp2_oneshot_nvfp4_rsb"
+    programs = {
+        name: dict(record)
+        for name, record in loader.PROGRAMS.items()
+        if name not in loader.SELECT_ROWS
+    }
+    assert programs[whole]["family"] == "allreduce"
+    assert target in programs[whole]["targets"]
+    assert band not in programs
+    programs[band] = {
+        **programs[whole],
+        "reset": "bulk",
+        "targets": (target,),
+        "kernel_symbol": f"cake_fp4_allreduce_{band}",
+    }
+    bands = {band: {"kind": "suffix", "threshold": ONESHOT_BAND_THRESHOLD}}
+    monkeypatch.setattr(loader, "PROGRAMS", programs)
+    monkeypatch.setattr(loader, "SELECT_ROWS", bands)
+    loader.program_for.cache_clear()
+    yield band, whole
+    loader.program_for.cache_clear()
+
+
+def test_program_for_dispatches_the_one_shot_band_at_or_above_its_threshold(
+    synthetic_oneshot_band,
+) -> None:
+    """The rows filter is per call, whatever the kernel: on sm_100a the NVFP4 one-shot call runs the whole
+    program below the threshold and the band at and above it (the call's row count, inclusive; the one-shot
+    kernel has no prefetch form to choose first, and the grid plays no part); the BF16 one-shot call and the
+    other targets' NVFP4 calls keep their whole program at every probe, as do the fused-norm calls."""
+    band, whole = synthetic_oneshot_band
+    probes = (
+        1,
+        4096,
+        ONESHOT_BAND_THRESHOLD - 1,
+        ONESHOT_BAND_THRESHOLD,
+        ONESHOT_BAND_THRESHOLD + 1,
+        100000,
+    )
+    expected = (whole, whole, whole, band, band, band)
+
+    def resolve(fmt: str, rows: int, grid: int, target: str) -> str:
+        return loader.program_for("allreduce", 2, fmt, None, rows, grid, target)
+
+    for grid in (148, 4096):
+        for rows, program in zip(probes, expected, strict=True):
+            assert resolve("nvfp4", rows, grid, "sm_100a") == program, (rows, grid)
+    for target in ("sm_103a", "sm_107a"):
+        for rows in probes:
+            assert resolve("nvfp4", rows, 148, target) == whole, (target, rows)
+    for target in TARGETS:
+        bf16 = f"tp2_oneshot_bf16{ONESHOT_BF16_FORMS[target]}"
+        for rows in probes:
+            assert resolve("bf16", rows, 148, target) == bf16, (target, rows)
+    # The band's record: the bulk re-arm over the whole program's register stores, one target; the
+    # whole program keeps its three targets.
+    record, plain = loader.PROGRAMS[band], loader.PROGRAMS[whole]
+    assert (record["reset"], plain["reset"]) == ("bulk", "st")
+    assert (record["output_format"], record["prefetch"], record["bv"]) == (
+        None,
+        None,
+        None,
+    )
+    assert record["targets"] == ("sm_100a",)
+    assert plain["targets"] == TARGETS
+    assert loader.SELECT_ROWS[band] == {
+        "kind": "suffix",
+        "threshold": ONESHOT_BAND_THRESHOLD,
+    }
+    # The fused-norm calls of the same target and input format are untouched by the one-shot band.
+    for output_format in OUTPUT_FORMATS:
+        for rows in (ONESHOT_BAND_THRESHOLD - 1, ONESHOT_BAND_THRESHOLD):
+            program = loader.program_for(
+                "rmsnorm", 2, "nvfp4", output_format, rows, 148, "sm_100a"
+            )
+            assert program not in loader.SELECT_ROWS, (output_format, rows)
 
 
 def test_grid_max_is_the_least_bound_of_the_programs(monkeypatch) -> None:

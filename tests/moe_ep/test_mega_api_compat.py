@@ -162,6 +162,37 @@ def test_new_finalize_validation_is_preserved():
 _SHIM = "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim"
 
 
+@pytest.mark.parametrize(
+    "name", ["Sm100BlockScaledMoeConfig", "Sm100GenphaseMoeConfig"]
+)
+def test_blackwell_next_routing_aliases(name):
+    module = importlib.import_module(
+        "flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe"
+    )
+    cls = getattr(module, name)
+    geometry = dict(
+        num_total_experts=8,
+        max_tokens_per_rank=129,
+        num_topk=3,
+        hidden=384,
+        intermediate=192,
+        rank=0,
+        world_size=1,
+    )
+    with pytest.warns(DeprecationWarning, match="apply_topk_at_fc1"):
+        config = cls(**geometry, apply_topk_at_fc1=False)
+    assert config.apply_routing_weights_before_fc2 is False
+    assert config.apply_topk_at_fc1 is False
+    changed = dataclasses.replace(config, apply_routing_weights_before_fc2=True)
+    assert changed.apply_topk_at_fc1 is True
+    with pytest.warns(DeprecationWarning, match="apply_topk_at_fc1"):
+        changed = dataclasses.replace(changed, apply_topk_at_fc1=False)
+    assert changed.apply_routing_weights_before_fc2 is False
+    assert "apply_topk_at_fc1" not in dataclasses.asdict(config)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        config.apply_topk_at_fc1 = True
+
+
 def test_frozen_shim_config_aliases_and_replace():
     module = importlib.import_module(f"{_SHIM}.nvfp4")
     cls = module.MegaMoENvfp4Config

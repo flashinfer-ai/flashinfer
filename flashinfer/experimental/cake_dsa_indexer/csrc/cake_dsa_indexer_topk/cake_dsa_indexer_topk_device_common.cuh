@@ -59,6 +59,8 @@ union MmaSmemDesc {
 };
 #include "cake_device_helpers/cake_mbarrier_arrive_71ef360c3ac78eb7.cuh"
 #include "cake_device_helpers/cake_tmem_ld_x16_a9ed61940fdba296.cuh"
+#include "cake_device_helpers/cake_add_f32x2_noftz_59cb1f04f8f90a34.cuh"
+#include "cake_device_helpers/cake_fma_f32x2_rn_noftz_e5a5b765e454e524.cuh"
 #include "cake_device_helpers/cake_tma_3d_gmem2smem_7df1e07811f83fc6.cuh"
 #include "cake_device_helpers/cake_tma_2d_gmem2smem_f2637c69284c470a.cuh"
 #include "cake_device_helpers/cake_tcgen05_commit_3d61b9d0baed52f9.cuh"

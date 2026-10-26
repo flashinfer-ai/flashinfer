@@ -761,6 +761,8 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_source_hidden_bf16,
   CheckCudaTensor(arg_published_hidden_bf16, "published_hidden_bf16");
   CheckDtype(arg_published_hidden_bf16, "published_hidden_bf16", 4, 16, 1);
   CheckContiguous(arg_published_hidden_bf16, "published_hidden_bf16");
+  TVM_FFI_CHECK(arg_published_hidden_bf16.numel() >= 16 * arg_tokens_per_rank * 3072, ValueError)
+      << "row mailbox 'published_hidden_bf16' requires 16 x tokens_per_rank x 3072 entries";
   CheckCudaTensor(arg_published_hidden_bf16_peers, "published_hidden_bf16_peers");
   CheckDtype(arg_published_hidden_bf16_peers, "published_hidden_bf16_peers", 0, 64, 1);
   CheckContiguous(arg_published_hidden_bf16_peers, "published_hidden_bf16_peers");
@@ -769,6 +771,8 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_source_hidden_bf16,
   CheckCudaTensor(arg_published_topk_ids_i32, "published_topk_ids_i32");
   CheckDtype(arg_published_topk_ids_i32, "published_topk_ids_i32", 0, 32, 1);
   CheckContiguous(arg_published_topk_ids_i32, "published_topk_ids_i32");
+  TVM_FFI_CHECK(arg_published_topk_ids_i32.numel() >= 16 * arg_tokens_per_rank * 8, ValueError)
+      << "route mailbox 'published_topk_ids_i32' requires 16 x tokens_per_rank x 8 entries";
   CheckCudaTensor(arg_published_topk_ids_i32_peers, "published_topk_ids_i32_peers");
   CheckDtype(arg_published_topk_ids_i32_peers, "published_topk_ids_i32_peers", 0, 64, 1);
   CheckContiguous(arg_published_topk_ids_i32_peers, "published_topk_ids_i32_peers");
@@ -777,6 +781,8 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_source_hidden_bf16,
   CheckCudaTensor(arg_published_topk_weights_f32, "published_topk_weights_f32");
   CheckDtype(arg_published_topk_weights_f32, "published_topk_weights_f32", 2, 32, 1);
   CheckContiguous(arg_published_topk_weights_f32, "published_topk_weights_f32");
+  TVM_FFI_CHECK(arg_published_topk_weights_f32.numel() >= 16 * arg_tokens_per_rank * 8, ValueError)
+      << "route mailbox 'published_topk_weights_f32' requires 16 x tokens_per_rank x 8 entries";
   CheckCudaTensor(arg_published_topk_weights_f32_peers, "published_topk_weights_f32_peers");
   CheckDtype(arg_published_topk_weights_f32_peers, "published_topk_weights_f32_peers", 0, 64, 1);
   CheckContiguous(arg_published_topk_weights_f32_peers, "published_topk_weights_f32_peers");
@@ -895,12 +901,12 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_source_hidden_bf16,
         smem_status = cudaFuncSetAttribute(
             reinterpret_cast<const void*>(kernel_cake_mxfp8_megamoe_ep16_755cbcfb83b38527fe16),
             cudaFuncAttributeMaxDynamicSharedMemorySize,
-            76800);
+            160768);
       if (smem_status == cudaSuccess) {
         smem_status = cudaFuncSetAttribute(
             reinterpret_cast<const void*>(kernel_cake_mxfp8_megamoe_ep16_2670aaff9ad59db52e36),
             cudaFuncAttributeMaxDynamicSharedMemorySize,
-            76800);
+            160768);
       }
       }
       smem_status_by_device->emplace(dev.device_id, smem_status);
@@ -1011,7 +1017,7 @@ inline void Submit(PreparedLaunch& prepared, cudaStream_t stream) {
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
   config.blockDim = block;
-  config.dynamicSmemBytes = 76800u;
+  config.dynamicSmemBytes = 160768u;
   config.stream = stream;
   config.attrs = attrs;
   config.numAttrs = n;

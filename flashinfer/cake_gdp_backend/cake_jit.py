@@ -39,15 +39,16 @@ static-token-count program of the call's ``T`` whose band admits the call's
 runtime-token-count program of the route (``T`` up to its ``max_t_steps``).
 Batch size and head count are runtime scalars, so a changed problem size never
 recompiles anything.  Two kernel bodies ship: the lane-owns-rows body
-(``variant`` ``l8r4`` / ``l8r4p`` / ``l8r4w5`` / ``l8r2`` / ``l4r2``, one CTA per
-batch row and head)
+(``variant`` ``l8r4`` / ``l8r4p`` / ``l8r4w5`` / ``l8r2`` / ``l4r2``, one
+CTA per batch row and head)
 and, for ``T = 1`` with ``B x HV <= 160``, the row-partition body
 (``splitv8_tile8``, eight CTAs per state head); each record names its body
 (``body``: ``lanerow`` for the lane-owns-rows body, ``splitv`` for the row
 partition).  A band may differ per architecture (SM90 has neither the
 one-wave ``l8r4p`` program nor the one-wave-of-5 ``l8r4w5`` program at
-``T = 1`` and owns the one-CTA-per-SM rows of ``T = 4`` with ``l4r2``): a
-selection cell then names the ``arches`` it applies to, and a
+``T = 1`` and owns the one-CTA-per-SM
+rows of ``T = 4`` with ``l4r2``): a selection cell then names the ``arches``
+it applies to, and a
 cell without ``arches`` applies on every architecture its record is delivered
 for.
 
@@ -72,8 +73,10 @@ SHA-256 of the compact JSON ``{"build": <build keywords, sorted>, "module":
 record's ``build`` spells those keywords: ``variant`` (the body's geometry:
 ``l8r4`` = eight lanes per state row, four rows per lane; ``l8r4p`` and
 ``l8r4w5`` = that geometry with the producer preload, for one wave of four
-CTAs per SM and for one wave of five; ``l8r2``; ``l4r2``; ``l4r4`` for the
-runtime programs; ``splitv8_tile8`` = eight CTAs of eight rows
+CTAs per SM and for the many-wave rows (``B x HV > 64 x SM
+count``); ``l8r2``;
+``l4r2``; ``l4r4`` for the runtime programs; ``splitv8_tile8`` = eight CTAs of
+eight rows
 per head), ``num_householder`` (``n``),
 ``t_steps`` (a fixed token count compiled in; ``None`` for a runtime token
 count up to ``max_t_steps``) and ``use_qk_l2norm``.  Prefill: the six flags
@@ -1534,8 +1537,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "above": 160,
             "at_most": None,
-            "ctas_per_sm_above": 4,
-            "ctas_per_sm_at_most": 5,
+            "ctas_per_sm_above": 64,
             "kind": "state_heads_between",
         },
     },
@@ -3307,7 +3309,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 1,
             ),
             "cooperative": False,
-            "dynamic_smem_bytes": 6400,
+            "dynamic_smem_bytes": 2304,
             "use_pdl": False,
         },
         "library": "cake_gdp_f2f0c7abbf10082a6996",
@@ -3671,7 +3673,8 @@ MODULES: dict[str, dict[str, Any]] = {
                     "sm_103a",
                 ],
                 "at_most": None,
-                "ctas_per_sm_above": 5,
+                "ctas_per_sm_above": 4,
+                "ctas_per_sm_at_most": 64,
                 "kind": "state_heads_between",
             },
             {
@@ -3879,10 +3882,11 @@ def route_modules(
 def _selects(rule: Any, state_heads: int, sm_count: int, arch: str) -> bool:
     """Whether a static program's band admits ``state_heads = B x HV`` on a device of ``sm_count`` SMs of ``arch``:
     ``above < state_heads <= at_most`` (``at_most`` ``None`` = unbounded) within the wave bounds
-    ``state_heads <= ctas_per_sm_at_most x sm_count`` / ``state_heads > ctas_per_sm_above x sm_count`` when the
-    rule carries them.  A cell naming ``arches`` applies on those architectures only (a band that differs per
-    architecture); a list of such cells is a band of several intervals and admits when any cell does.  ``None`` (a
-    runtime program) admits everything."""
+    ``state_heads <= ctas_per_sm_at_most x sm_count`` / ``state_heads > ctas_per_sm_above x sm_count`` and the
+    inclusive ``state_heads >= ctas_per_sm_at_least x sm_count`` / ``state_heads < ctas_per_sm_below x sm_count``
+    when the rule carries them.  A cell naming ``arches`` applies on those architectures only (a band that differs
+    per architecture); a list of such cells is a band of several intervals and admits when any cell does.  ``None``
+    (a runtime program) admits everything."""
 
     if rule is None:
         return True
@@ -3900,13 +3904,19 @@ def _selects(rule: Any, state_heads: int, sm_count: int, arch: str) -> bool:
         at_most is not None and state_heads > int(at_most)
     ):
         return False
-    waves_at_most, waves_above = (
+    waves_at_most, waves_above, waves_at_least, waves_below = (
         rule.get("ctas_per_sm_at_most"),
         rule.get("ctas_per_sm_above"),
+        rule.get("ctas_per_sm_at_least"),
+        rule.get("ctas_per_sm_below"),
     )
     if waves_at_most is not None and state_heads > int(waves_at_most) * sm_count:
         return False
     if waves_above is not None and state_heads <= int(waves_above) * sm_count:
+        return False
+    if waves_at_least is not None and state_heads < int(waves_at_least) * sm_count:
+        return False
+    if waves_below is not None and state_heads >= int(waves_below) * sm_count:
         return False
     return True
 

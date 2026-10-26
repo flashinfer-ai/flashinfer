@@ -776,7 +776,8 @@ kernel_cake_nvfp4_svdquant_gemm_aa5225a75028cbb32391(const __grid_constant__ CUt
                 last_stage = mma_stage;
                 if (cta_rank == 0) {
                     elect_commit_cg2_local(klast_done_addr);
-                    mbarrier_wait(klast_done_addr, completed & 1);
+                    unsigned int _parity_klast_done = completed % 2;
+                    mbarrier_wait(klast_done_addr, _parity_klast_done);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                 }
                 #pragma unroll 1
@@ -988,7 +989,6 @@ kernel_cake_nvfp4_svdquant_gemm_aa5225a75028cbb32391(const __grid_constant__ CUt
         { // sched_main
             unsigned int _phase_thr_full = 0;
             unsigned int _phase_clc_empty = 1;
-            unsigned int _phase_clc_full_2 = 0;
             if (cta_rank == 0) {
                 unsigned int sched_clc_stage = 0;
                 unsigned int sched_thr_stage = 0;
@@ -1017,7 +1017,7 @@ kernel_cake_nvfp4_svdquant_gemm_aa5225a75028cbb32391(const __grid_constant__ CUt
                             :: "r"(clc_resp_addr + sched_clc_stage * 16 + 0 * 16), "r"(clc_full_addr + sched_clc_stage * 8)
                             : "memory");
                     }
-                    mbarrier_wait(clc_full_addr + (sched_clc_stage) * 8, _phase_clc_full_2);
+                    mbarrier_wait(clc_full_addr + (sched_clc_stage) * 8, _phase_clc_empty ^ 1);
                     uint32_t _clc_valid_0 = 0;
                     asm volatile(
                         "{\n\t"
@@ -1039,7 +1039,7 @@ kernel_cake_nvfp4_svdquant_gemm_aa5225a75028cbb32391(const __grid_constant__ CUt
                         "}"
                         :: "r"(clc_empty_addr + sched_clc_stage * 8), "r"(0) : "memory");
                     sched_clc_stage += 1;
-                    if (sched_clc_stage == 2) { sched_clc_stage = 0; _phase_clc_empty ^= 1; _phase_clc_full_2 ^= 1; }
+                    if (sched_clc_stage == 2) { sched_clc_stage = 0; _phase_clc_empty ^= 1; }
                     if (_clc_valid_0 == 0) {
                         break;
                     }
@@ -1048,7 +1048,7 @@ kernel_cake_nvfp4_svdquant_gemm_aa5225a75028cbb32391(const __grid_constant__ CUt
                 for (int _ = 0; _ < 2; _++) {
                     mbarrier_wait(clc_empty_addr + (sched_clc_stage) * 8, _phase_clc_empty);
                     sched_clc_stage += 1;
-                    if (sched_clc_stage == 2) { sched_clc_stage = 0; _phase_clc_empty ^= 1; _phase_clc_full_2 ^= 1; }
+                    if (sched_clc_stage == 2) { sched_clc_stage = 0; _phase_clc_empty ^= 1; }
                 }
             }
         }
@@ -1067,12 +1067,12 @@ kernel_cake_nvfp4_svdquant_gemm_aa5225a75028cbb32391(const __grid_constant__ CUt
             int lane_row_addr = taddr + (unsigned int)(epi_warp * 32 << 16);
             unsigned int epi_clc_stage = 0;
             unsigned int tile_e = cluster_id;
-            unsigned int _phase_clc_full_3 = 0;
+            unsigned int _phase_clc_full_2 = 0;
             unsigned int _phase_acc_ovl_full = 0;
             unsigned int _phase_acc_full = 0;
             #pragma unroll 1
             for (unsigned int tiles_done = 0; tiles_done < num_tiles; tiles_done++) {
-                mbarrier_wait(clc_full_addr + (epi_clc_stage) * 8, _phase_clc_full_3);
+                mbarrier_wait(clc_full_addr + (epi_clc_stage) * 8, _phase_clc_full_2);
                 uint32_t _clc_valid_3 = 0;
                 asm volatile(
                     "{\n\t"
@@ -1106,7 +1106,7 @@ kernel_cake_nvfp4_svdquant_gemm_aa5225a75028cbb32391(const __grid_constant__ CUt
                     "}"
                     :: "r"(clc_empty_addr + epi_clc_stage * 8), "r"(0) : "memory");
                 epi_clc_stage += 1;
-                if (epi_clc_stage == 2) { epi_clc_stage = 0; _phase_clc_full_3 ^= 1; }
+                if (epi_clc_stage == 2) { epi_clc_stage = 0; _phase_clc_full_2 ^= 1; }
                 int w_idx_1 = tile_e / (unsigned int)tok_tiles;
                 int tok_idx_2 = tile_e - (unsigned int)(w_idx_1 * tok_tiles);
                 if (raster_group != 0) {
@@ -1220,15 +1220,35 @@ kernel_cake_nvfp4_svdquant_gemm_aa5225a75028cbb32391(const __grid_constant__ CUt
                         if (v8_col < N) {
                             int v8_idx = v8_row * N + v8_col;
                             if (out_hinted != 0) {
-                                asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + v8_idx + (0)), "r"(result_bf16[(0) + 0]), "r"(result_bf16[(0) + 1]), "r"(result_bf16[(0) + 2]), "r"(result_bf16[(0) + 3]), "r"(result_bf16[(0) + 4]), "r"(result_bf16[(0) + 5]), "r"(result_bf16[(0) + 6]), "r"(result_bf16[(0) + 7]) : "memory");
-                                asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + (v8_idx + 16) + (0)), "r"(result_bf16[(8) + 0]), "r"(result_bf16[(8) + 1]), "r"(result_bf16[(8) + 2]), "r"(result_bf16[(8) + 3]), "r"(result_bf16[(8) + 4]), "r"(result_bf16[(8) + 5]), "r"(result_bf16[(8) + 6]), "r"(result_bf16[(8) + 7]) : "memory");
-                                asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + (v8_idx + 32) + (0)), "r"(result_bf16[(16) + 0]), "r"(result_bf16[(16) + 1]), "r"(result_bf16[(16) + 2]), "r"(result_bf16[(16) + 3]), "r"(result_bf16[(16) + 4]), "r"(result_bf16[(16) + 5]), "r"(result_bf16[(16) + 6]), "r"(result_bf16[(16) + 7]) : "memory");
-                                asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + (v8_idx + 48) + (0)), "r"(result_bf16[(24) + 0]), "r"(result_bf16[(24) + 1]), "r"(result_bf16[(24) + 2]), "r"(result_bf16[(24) + 3]), "r"(result_bf16[(24) + 4]), "r"(result_bf16[(24) + 5]), "r"(result_bf16[(24) + 6]), "r"(result_bf16[(24) + 7]) : "memory");
+                                asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + v8_idx), "r"(result_bf16[(0) + 0]), "r"(result_bf16[(0) + 1]), "r"(result_bf16[(0) + 2]), "r"(result_bf16[(0) + 3]), "r"(result_bf16[(0) + 4]), "r"(result_bf16[(0) + 5]), "r"(result_bf16[(0) + 6]), "r"(result_bf16[(0) + 7]) : "memory");
+                                asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + (v8_idx + 16)), "r"(result_bf16[(8) + 0]), "r"(result_bf16[(8) + 1]), "r"(result_bf16[(8) + 2]), "r"(result_bf16[(8) + 3]), "r"(result_bf16[(8) + 4]), "r"(result_bf16[(8) + 5]), "r"(result_bf16[(8) + 6]), "r"(result_bf16[(8) + 7]) : "memory");
+                                asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + (v8_idx + 32)), "r"(result_bf16[(16) + 0]), "r"(result_bf16[(16) + 1]), "r"(result_bf16[(16) + 2]), "r"(result_bf16[(16) + 3]), "r"(result_bf16[(16) + 4]), "r"(result_bf16[(16) + 5]), "r"(result_bf16[(16) + 6]), "r"(result_bf16[(16) + 7]) : "memory");
+                                asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + (v8_idx + 48)), "r"(result_bf16[(24) + 0]), "r"(result_bf16[(24) + 1]), "r"(result_bf16[(24) + 2]), "r"(result_bf16[(24) + 3]), "r"(result_bf16[(24) + 4]), "r"(result_bf16[(24) + 5]), "r"(result_bf16[(24) + 6]), "r"(result_bf16[(24) + 7]) : "memory");
                             } else {
-                                asm volatile("st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + v8_idx + (0)), "r"(result_bf16[(0) + 0]), "r"(result_bf16[(0) + 1]), "r"(result_bf16[(0) + 2]), "r"(result_bf16[(0) + 3]), "r"(result_bf16[(0) + 4]), "r"(result_bf16[(0) + 5]), "r"(result_bf16[(0) + 6]), "r"(result_bf16[(0) + 7]) : "memory");
-                                asm volatile("st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + (v8_idx + 16) + (0)), "r"(result_bf16[(8) + 0]), "r"(result_bf16[(8) + 1]), "r"(result_bf16[(8) + 2]), "r"(result_bf16[(8) + 3]), "r"(result_bf16[(8) + 4]), "r"(result_bf16[(8) + 5]), "r"(result_bf16[(8) + 6]), "r"(result_bf16[(8) + 7]) : "memory");
-                                asm volatile("st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + (v8_idx + 32) + (0)), "r"(result_bf16[(16) + 0]), "r"(result_bf16[(16) + 1]), "r"(result_bf16[(16) + 2]), "r"(result_bf16[(16) + 3]), "r"(result_bf16[(16) + 4]), "r"(result_bf16[(16) + 5]), "r"(result_bf16[(16) + 6]), "r"(result_bf16[(16) + 7]) : "memory");
-                                asm volatile("st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + (v8_idx + 48) + (0)), "r"(result_bf16[(24) + 0]), "r"(result_bf16[(24) + 1]), "r"(result_bf16[(24) + 2]), "r"(result_bf16[(24) + 3]), "r"(result_bf16[(24) + 4]), "r"(result_bf16[(24) + 5]), "r"(result_bf16[(24) + 6]), "r"(result_bf16[(24) + 7]) : "memory");
+                                {
+                                    const unsigned* _raw_stv8_2 = reinterpret_cast<const unsigned*>(result_bf16);
+                                    asm volatile(
+                                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+                                        :: "l"((void*)(out_ptr + v8_idx)), "r"(_raw_stv8_2[0]), "r"(_raw_stv8_2[1]), "r"(_raw_stv8_2[2]), "r"(_raw_stv8_2[3]), "r"(_raw_stv8_2[4]), "r"(_raw_stv8_2[5]), "r"(_raw_stv8_2[6]), "r"(_raw_stv8_2[7]) : "memory");
+                                }
+                                {
+                                    const unsigned* _raw_stv8_3 = reinterpret_cast<const unsigned*>(result_bf16 + (8));
+                                    asm volatile(
+                                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+                                        :: "l"((void*)(out_ptr + (v8_idx + 16))), "r"(_raw_stv8_3[0]), "r"(_raw_stv8_3[1]), "r"(_raw_stv8_3[2]), "r"(_raw_stv8_3[3]), "r"(_raw_stv8_3[4]), "r"(_raw_stv8_3[5]), "r"(_raw_stv8_3[6]), "r"(_raw_stv8_3[7]) : "memory");
+                                }
+                                {
+                                    const unsigned* _raw_stv8_4 = reinterpret_cast<const unsigned*>(result_bf16 + (16));
+                                    asm volatile(
+                                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+                                        :: "l"((void*)(out_ptr + (v8_idx + 32))), "r"(_raw_stv8_4[0]), "r"(_raw_stv8_4[1]), "r"(_raw_stv8_4[2]), "r"(_raw_stv8_4[3]), "r"(_raw_stv8_4[4]), "r"(_raw_stv8_4[5]), "r"(_raw_stv8_4[6]), "r"(_raw_stv8_4[7]) : "memory");
+                                }
+                                {
+                                    const unsigned* _raw_stv8_5 = reinterpret_cast<const unsigned*>(result_bf16 + (24));
+                                    asm volatile(
+                                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+                                        :: "l"((void*)(out_ptr + (v8_idx + 48))), "r"(_raw_stv8_5[0]), "r"(_raw_stv8_5[1]), "r"(_raw_stv8_5[2]), "r"(_raw_stv8_5[3]), "r"(_raw_stv8_5[4]), "r"(_raw_stv8_5[5]), "r"(_raw_stv8_5[6]), "r"(_raw_stv8_5[7]) : "memory");
+                                }
                             }
                         }
                     }

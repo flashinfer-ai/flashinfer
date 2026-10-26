@@ -54,6 +54,23 @@ void CheckUnitInnerStride(const TensorView& t, const char* name) {
       << KERNEL_NAME << ": '" << name << "' needs a unit innermost stride, got " << t.stride(-1);
 }
 
+[[noreturn]] void NoInt64(int64_t a, const char* op, int64_t b) {
+  TVM_FFI_THROW(ValueError) << KERNEL_NAME << ": " << a << " " << op << " " << b
+                            << " has no int64 value in a host check";
+}
+
+int64_t CheckedSub(int64_t a, int64_t b) {
+  int64_t difference;
+  if (__builtin_sub_overflow(a, b, &difference)) NoInt64(a, "-", b);
+  return difference;
+}
+
+int64_t CheckedMul(int64_t a, int64_t b) {
+  int64_t product;
+  if (__builtin_mul_overflow(a, b, &product)) NoInt64(a, "*", b);
+  return product;
+}
+
 cuuint64_t Extent(int64_t value, const char* descriptor) {
   TVM_FFI_CHECK(value > 0, ValueError)
       << KERNEL_NAME << ": an extent of descriptor '" << descriptor << "' resolves to " << value;
@@ -149,15 +166,15 @@ void Run(TensorView a_X, TensorView a_FNP, TensorView a_spart, TensorView a_qpar
   check_same_device(a_qpart, a_X, "qpart", "X");
   check_contiguous(a_ticket, "ticket");
   check_same_device(a_ticket, a_X, "ticket", "X");
-  TVM_FFI_CHECK((a_T >= 1), ValueError)
+  TVM_FFI_CHECK((a_T >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (T >= 1)";
-  TVM_FFI_CHECK((a_log2_pk >= 3), ValueError)
+  TVM_FFI_CHECK((a_log2_pk >= 3LL), ValueError)
       << KERNEL_NAME << ": requires (log2_pk >= 3)";
-  TVM_FFI_CHECK((a_log2_pk <= 5), ValueError)
+  TVM_FFI_CHECK((a_log2_pk <= 5LL), ValueError)
       << KERNEL_NAME << ": requires (log2_pk <= 5)";
-  TVM_FFI_CHECK(((a_m_tiles * 128) >= a_T), ValueError)
+  TVM_FFI_CHECK((CheckedMul(a_m_tiles, 128LL) >= a_T), ValueError)
       << KERNEL_NAME << ": requires ((m_tiles * 128) >= T)";
-  TVM_FFI_CHECK((((a_m_tiles - 1) * 128) < a_T), ValueError)
+  TVM_FFI_CHECK((CheckedMul(CheckedSub(a_m_tiles, 1LL), 128LL) < a_T), ValueError)
       << KERNEL_NAME << ": requires (((m_tiles - 1) * 128) < T)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";

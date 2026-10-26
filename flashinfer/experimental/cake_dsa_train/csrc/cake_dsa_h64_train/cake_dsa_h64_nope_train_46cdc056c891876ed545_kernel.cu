@@ -14,229 +14,22 @@
  * limitations under the License.
  */
 
-typedef signed char        int8_t;
-typedef unsigned char      uint8_t;
-typedef unsigned short     uint16_t;
-typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
-typedef unsigned long long uint64_t;
-#else
-typedef unsigned long      uint64_t;
-#endif
-static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
-typedef signed int         int32_t;
-typedef short int          int16_t;
-struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
-static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
-static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+#define CAKE_DSA_H64_TRAIN_NEED_ADD_F32X2
+#define CAKE_DSA_H64_TRAIN_NEED_APPROX_EXP2
+#define CAKE_DSA_H64_TRAIN_NEED_ELECT_SYNC
+#define CAKE_DSA_H64_TRAIN_NEED_FMA_F32X2
+#define CAKE_DSA_H64_TRAIN_NEED_MAX_NOFTZ
+#define CAKE_DSA_H64_TRAIN_NEED_MBARRIER_ARRIVE
+#define CAKE_DSA_H64_TRAIN_NEED_MBARRIER_ARRIVE_EXPECT_TX
+#define CAKE_DSA_H64_TRAIN_NEED_MBARRIER_INIT
+#define CAKE_DSA_H64_TRAIN_NEED_MBARRIER_WAIT
+#define CAKE_DSA_H64_TRAIN_NEED_MUL_F32X2_NOFTZ_INPLACE
+#define CAKE_DSA_H64_TRAIN_NEED_TCGEN05_COMMIT
+#define CAKE_DSA_H64_TRAIN_NEED_TMA_STORE_4D
+#define CAKE_DSA_H64_TRAIN_NEED_TMEM_ST_X32_F32
+#include "cake_dsa_h64_train_device.cuh"
 
-#if defined(__CUDACC_RTC__)
-typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
-#else
-#include <cuda.h>
-#endif
-
-static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-
-__device__ __forceinline__ int make_warp_uniform(int x) {
-    int result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
-                 : "=r"(result) : "r"(x));
-    return result;
-}
-
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_TMEM_OFFSET 0
-#define NUM_CLC_PIPELINE_STAGES 1
-#define NUM_SCORE_PIPE_STAGES 3
-#define SMEM_QKO_OFF 1024
-#define SMEM_QKO_STAGE_BYTES 65536
-#define SMEM_QKO_STRIDE 65536
-#define SMEM_K_DUAL_OFF 1024
-#define SMEM_K_DUAL_STAGE_BYTES 65536
-#define SMEM_K_DUAL_STRIDE 65536
-#define SMEM_V_OFF 1024
-#define SMEM_V_STAGE_BYTES 65536
-#define SMEM_V_STRIDE 65536
-#define SMEM_EXCHANGE_OFF 197632
-#define SMEM_EXCHANGE_STAGE_BYTES 16384
-#define SMEM_EXCHANGE_STRIDE 16384
-#define SMEM_PROBABILITY_OFF 214016
-#define SMEM_PROBABILITY_STAGE_BYTES 8192
-#define SMEM_PROBABILITY_STRIDE 8192
-#define SMEM_VALIDITY_OFF 222208
-#define SMEM_VALIDITY_STAGE_BYTES 24
-#define SMEM_VALIDITY_STRIDE 24
-#define SMEM_VALIDITY32_OFF 222208
-#define SMEM_VALIDITY32_STAGE_BYTES 24
-#define SMEM_VALIDITY32_STRIDE 24
-#define SMEM_STATS_OFF 222336
-#define SMEM_STATS_STAGE_BYTES 1024
-#define SMEM_STATS_STRIDE 1024
-#define SMEM_CLC_PAYLOAD_OFF 223360
-#define SMEM_CLC_PAYLOAD_STAGE_BYTES 16
-#define SMEM_CLC_PAYLOAD_STRIDE 16
-#define SMEM_LEN_CELLS_OFF 223408
-#define SMEM_LEN_CELLS_STAGE_BYTES 8
-#define SMEM_LEN_CELLS_STRIDE 8
-#define SMEM_BOUND_CELLS_OFF 223416
-#define SMEM_BOUND_CELLS_STAGE_BYTES 8
-#define SMEM_BOUND_CELLS_STRIDE 8
-#define SMEM_TOTAL 223488
-#define THREADS 320
 #define LAUNCH_MIN_BLOCKS 1
-
-#include <math_constants.h>
-
-__device__ __forceinline__ uint32_t elect_sync() {
-    uint32_t pred = 0;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred %%px;\n\t"
-        "elect.sync _|%%px, %1;\n\t"
-        "@%%px mov.s32 %0, 1;\n\t"
-        "}\n"
-        : "+r"(pred)
-        : "r"(0xFFFFFFFF));
-    return pred;
-}
-
-
-__device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
-        :: "r"(mbar_addr), "r"(count) : "memory");
-}
-
-
-
-// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
-// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
-// explicit loop still makes this helper blocking until acquire succeeds.
-__device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1;\n\t"
-        "@P1 bra.uni DONE;\n\t"
-        "bra.uni LAB_WAIT;\n\t"
-        "DONE:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-
-
-
-union MmaSmemDesc {
-    uint64_t u64;
-    uint32_t u32[2];
-};
-
-
-
-__device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
-    asm volatile(
-        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
-        :: "r"(mbar_addr) : "memory");
-}
-
-
-__device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
-    asm volatile(
-        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
-        :: "r"(mbar_addr), "r"(bytes) : "memory");
-}
-
-
-
-__device__ __forceinline__ void tmem_st_x32_f32(int tmem_addr, const float* src) {
-    asm volatile(
-        "tcgen05.st.sync.aligned.32x32b.x32.b32"
-        " [%0], {%1, %2, %3, %4, %5, %6, %7, %8,"
-        "  %9, %10, %11, %12, %13, %14, %15, %16,"
-        "  %17, %18, %19, %20, %21, %22, %23, %24,"
-        "  %25, %26, %27, %28, %29, %30, %31, %32};"
-        :: "r"(tmem_addr),
-           "f"(src[0]),  "f"(src[1]),  "f"(src[2]),  "f"(src[3]),
-           "f"(src[4]),  "f"(src[5]),  "f"(src[6]),  "f"(src[7]),
-           "f"(src[8]),  "f"(src[9]),  "f"(src[10]), "f"(src[11]),
-           "f"(src[12]), "f"(src[13]), "f"(src[14]), "f"(src[15]),
-           "f"(src[16]), "f"(src[17]), "f"(src[18]), "f"(src[19]),
-           "f"(src[20]), "f"(src[21]), "f"(src[22]), "f"(src[23]),
-           "f"(src[24]), "f"(src[25]), "f"(src[26]), "f"(src[27]),
-           "f"(src[28]), "f"(src[29]), "f"(src[30]), "f"(src[31]));
-}
-
-
-__device__ __forceinline__ float approx_exp2(float x) {
-    float y;
-    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
-    return y;
-}
-
-
-__device__ __forceinline__ float max_noftz(float a, float b) {
-    float c;
-    asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
-    return c;
-}
-
-
-
-
-__device__ __forceinline__ void mul_f32x2_noftz_inplace(float2* a, float2 b) {
-    asm("mul.rn.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-__device__ __forceinline__ float2 add_f32x2(float2 a, float2 b) {
-    float2 r;
-    asm("add.rn.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b),
-          "l"(*(unsigned long long*)&c));
-    return r;
-}
-
-
-// ex2_emulation_f32x2 defined in softmax_frag_exp2_cast helper (or standalone)
-
-
-
-
-
-
-
-__device__ __forceinline__ void tma_store_4d(
-    const void *tmap, int x, int y, int z, int w, unsigned smem_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.4d.global.shared::cta.tile.bulk_group"
-        " [%0, {%1, %2, %3, %4}], [%5];"
-        :: "l"(tmap), "r"(x), "r"(y), "r"(z), "r"(w), "r"(smem_addr) : "memory");
-}
-
-
-__device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
-    asm volatile(
-        "tcgen05.commit.cta_group::1.mbarrier::arrive::one"
-        ".shared::cluster.b64 [%0];"
-        :: "r"(mbar_addr) : "memory");
-}
-
-
 
 extern "C" {
 
@@ -272,34 +65,19 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
     #define o_written_addr (mbar_base + 208)
     #define o_written_waited_addr (mbar_base + 216)
 
-    const int bid = blockIdx.x;
-    const int num_bids = gridDim.x;
-
-    const int cta_rank = 0;
-
     // Kernel setup ops
-    __nv_bfloat16* qko = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int qko_addr = smem + 1024;
-    __nv_bfloat16* k_dual = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int k_dual_addr = smem + 1024;
-    __nv_bfloat16* v = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int v_addr = smem + 1024;
     float* exchange = reinterpret_cast<float*>(smem_raw + 197632);
     const int exchange_addr = smem + 197632;
-    __nv_bfloat16* probability = reinterpret_cast<__nv_bfloat16*>(smem_raw + 214016);
     const int probability_addr = smem + 214016;
     uint8_t* validity = reinterpret_cast<uint8_t*>(smem_raw + 222208);
-    const int validity_addr = smem + 222208;
     unsigned int* validity32 = reinterpret_cast<unsigned int*>(smem_raw + 222208);
-    const int validity32_addr = smem + 222208;
     float* stats = reinterpret_cast<float*>(smem_raw + 222336);
-    const int stats_addr = smem + 222336;
-    unsigned int* clc_payload = reinterpret_cast<unsigned int*>(smem_raw + 223360);
     const int clc_payload_addr = smem + 223360;
     int* len_cells = reinterpret_cast<int*>(smem_raw + 223408);
-    const int len_cells_addr = smem + 223408;
     int* bound_cells = reinterpret_cast<int*>(smem_raw + 223416);
-    const int bound_cells_addr = smem + 223416;
     if (warp == 0 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&q_latent))) : "memory"); }
     if (warp == 0 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&kv_latent))) : "memory"); }
     if (warp == 0 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&out))) : "memory"); }
@@ -1069,9 +847,44 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(qko_addr + (unsigned int)swizzled_offset_3), "r"(ov_bf16_1[0]), "r"(ov_bf16_1[1]), "r"(ov_bf16_1[2]), "r"(ov_bf16_1[3]) : "memory");
                 unsigned int _packed_0[8];
                 #pragma unroll
-                for (int _lp = 0; _lp < 8; _lp++) {
+                for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual[_lp*2 + 0], residual[_lp*2+1 + 0]));
                     _packed_0[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual[_lp*2 + 2], residual[_lp*2+1 + 2]));
+                    _packed_0[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual[_lp*2 + 4], residual[_lp*2+1 + 4]));
+                    _packed_0[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual[_lp*2 + 6], residual[_lp*2+1 + 6]));
+                    _packed_0[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual[_lp*2 + 8], residual[_lp*2+1 + 8]));
+                    _packed_0[_lp + 4] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual[_lp*2 + 10], residual[_lp*2+1 + 10]));
+                    _packed_0[_lp + 5] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual[_lp*2 + 12], residual[_lp*2+1 + 12]));
+                    _packed_0[_lp + 6] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual[_lp*2 + 14], residual[_lp*2+1 + 14]));
+                    _packed_0[_lp + 7] = *(uint32_t*)&_bf2;
                 }
                 {
                     const unsigned* _raw_stv8_34 = reinterpret_cast<const unsigned*>(_packed_0);
@@ -1128,9 +941,44 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(qko_addr + (unsigned int)swizzled_offset_10), "r"(ov_bf16_8[0]), "r"(ov_bf16_8[1]), "r"(ov_bf16_8[2]), "r"(ov_bf16_8[3]) : "memory");
                 unsigned int _packed_1[8];
                 #pragma unroll
-                for (int _lp = 0; _lp < 8; _lp++) {
+                for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_4[_lp*2 + 0], residual_4[_lp*2+1 + 0]));
                     _packed_1[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_4[_lp*2 + 2], residual_4[_lp*2+1 + 2]));
+                    _packed_1[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_4[_lp*2 + 4], residual_4[_lp*2+1 + 4]));
+                    _packed_1[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_4[_lp*2 + 6], residual_4[_lp*2+1 + 6]));
+                    _packed_1[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_4[_lp*2 + 8], residual_4[_lp*2+1 + 8]));
+                    _packed_1[_lp + 4] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_4[_lp*2 + 10], residual_4[_lp*2+1 + 10]));
+                    _packed_1[_lp + 5] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_4[_lp*2 + 12], residual_4[_lp*2+1 + 12]));
+                    _packed_1[_lp + 6] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_4[_lp*2 + 14], residual_4[_lp*2+1 + 14]));
+                    _packed_1[_lp + 7] = *(uint32_t*)&_bf2;
                 }
                 {
                     const unsigned* _raw_stv8_35 = reinterpret_cast<const unsigned*>(_packed_1);
@@ -1187,9 +1035,44 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(qko_addr + (unsigned int)swizzled_offset_17), "r"(ov_bf16_15[0]), "r"(ov_bf16_15[1]), "r"(ov_bf16_15[2]), "r"(ov_bf16_15[3]) : "memory");
                 unsigned int _packed_2[8];
                 #pragma unroll
-                for (int _lp = 0; _lp < 8; _lp++) {
+                for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_11[_lp*2 + 0], residual_11[_lp*2+1 + 0]));
                     _packed_2[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_11[_lp*2 + 2], residual_11[_lp*2+1 + 2]));
+                    _packed_2[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_11[_lp*2 + 4], residual_11[_lp*2+1 + 4]));
+                    _packed_2[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_11[_lp*2 + 6], residual_11[_lp*2+1 + 6]));
+                    _packed_2[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_11[_lp*2 + 8], residual_11[_lp*2+1 + 8]));
+                    _packed_2[_lp + 4] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_11[_lp*2 + 10], residual_11[_lp*2+1 + 10]));
+                    _packed_2[_lp + 5] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_11[_lp*2 + 12], residual_11[_lp*2+1 + 12]));
+                    _packed_2[_lp + 6] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_11[_lp*2 + 14], residual_11[_lp*2+1 + 14]));
+                    _packed_2[_lp + 7] = *(uint32_t*)&_bf2;
                 }
                 {
                     const unsigned* _raw_stv8_36 = reinterpret_cast<const unsigned*>(_packed_2);
@@ -1246,9 +1129,44 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(qko_addr + (unsigned int)swizzled_offset_24), "r"(ov_bf16_22[0]), "r"(ov_bf16_22[1]), "r"(ov_bf16_22[2]), "r"(ov_bf16_22[3]) : "memory");
                 unsigned int _packed_3[8];
                 #pragma unroll
-                for (int _lp = 0; _lp < 8; _lp++) {
+                for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_18[_lp*2 + 0], residual_18[_lp*2+1 + 0]));
                     _packed_3[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_18[_lp*2 + 2], residual_18[_lp*2+1 + 2]));
+                    _packed_3[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_18[_lp*2 + 4], residual_18[_lp*2+1 + 4]));
+                    _packed_3[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_18[_lp*2 + 6], residual_18[_lp*2+1 + 6]));
+                    _packed_3[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_18[_lp*2 + 8], residual_18[_lp*2+1 + 8]));
+                    _packed_3[_lp + 4] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_18[_lp*2 + 10], residual_18[_lp*2+1 + 10]));
+                    _packed_3[_lp + 5] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_18[_lp*2 + 12], residual_18[_lp*2+1 + 12]));
+                    _packed_3[_lp + 6] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_18[_lp*2 + 14], residual_18[_lp*2+1 + 14]));
+                    _packed_3[_lp + 7] = *(uint32_t*)&_bf2;
                 }
                 {
                     const unsigned* _raw_stv8_37 = reinterpret_cast<const unsigned*>(_packed_3);
@@ -1394,9 +1312,44 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(qko_addr + (unsigned int)swizzled_offset_32), "r"(ov_25_bf16_30[0]), "r"(ov_25_bf16_30[1]), "r"(ov_25_bf16_30[2]), "r"(ov_25_bf16_30[3]) : "memory");
                 unsigned int _packed_4[8];
                 #pragma unroll
-                for (int _lp = 0; _lp < 8; _lp++) {
+                for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_27[_lp*2 + 0], residual_27[_lp*2+1 + 0]));
                     _packed_4[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_27[_lp*2 + 2], residual_27[_lp*2+1 + 2]));
+                    _packed_4[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_27[_lp*2 + 4], residual_27[_lp*2+1 + 4]));
+                    _packed_4[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_27[_lp*2 + 6], residual_27[_lp*2+1 + 6]));
+                    _packed_4[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_27[_lp*2 + 8], residual_27[_lp*2+1 + 8]));
+                    _packed_4[_lp + 4] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_27[_lp*2 + 10], residual_27[_lp*2+1 + 10]));
+                    _packed_4[_lp + 5] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_27[_lp*2 + 12], residual_27[_lp*2+1 + 12]));
+                    _packed_4[_lp + 6] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_27[_lp*2 + 14], residual_27[_lp*2+1 + 14]));
+                    _packed_4[_lp + 7] = *(uint32_t*)&_bf2;
                 }
                 {
                     const unsigned* _raw_stv8_39 = reinterpret_cast<const unsigned*>(_packed_4);
@@ -1453,9 +1406,44 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(qko_addr + (unsigned int)swizzled_offset_39), "r"(ov_25_bf16_37[0]), "r"(ov_25_bf16_37[1]), "r"(ov_25_bf16_37[2]), "r"(ov_25_bf16_37[3]) : "memory");
                 unsigned int _packed_5[8];
                 #pragma unroll
-                for (int _lp = 0; _lp < 8; _lp++) {
+                for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_33[_lp*2 + 0], residual_33[_lp*2+1 + 0]));
                     _packed_5[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_33[_lp*2 + 2], residual_33[_lp*2+1 + 2]));
+                    _packed_5[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_33[_lp*2 + 4], residual_33[_lp*2+1 + 4]));
+                    _packed_5[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_33[_lp*2 + 6], residual_33[_lp*2+1 + 6]));
+                    _packed_5[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_33[_lp*2 + 8], residual_33[_lp*2+1 + 8]));
+                    _packed_5[_lp + 4] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_33[_lp*2 + 10], residual_33[_lp*2+1 + 10]));
+                    _packed_5[_lp + 5] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_33[_lp*2 + 12], residual_33[_lp*2+1 + 12]));
+                    _packed_5[_lp + 6] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_33[_lp*2 + 14], residual_33[_lp*2+1 + 14]));
+                    _packed_5[_lp + 7] = *(uint32_t*)&_bf2;
                 }
                 {
                     const unsigned* _raw_stv8_40 = reinterpret_cast<const unsigned*>(_packed_5);
@@ -1512,9 +1500,44 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(qko_addr + (unsigned int)swizzled_offset_46), "r"(ov_25_bf16_44[0]), "r"(ov_25_bf16_44[1]), "r"(ov_25_bf16_44[2]), "r"(ov_25_bf16_44[3]) : "memory");
                 unsigned int _packed_6[8];
                 #pragma unroll
-                for (int _lp = 0; _lp < 8; _lp++) {
+                for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_40[_lp*2 + 0], residual_40[_lp*2+1 + 0]));
                     _packed_6[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_40[_lp*2 + 2], residual_40[_lp*2+1 + 2]));
+                    _packed_6[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_40[_lp*2 + 4], residual_40[_lp*2+1 + 4]));
+                    _packed_6[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_40[_lp*2 + 6], residual_40[_lp*2+1 + 6]));
+                    _packed_6[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_40[_lp*2 + 8], residual_40[_lp*2+1 + 8]));
+                    _packed_6[_lp + 4] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_40[_lp*2 + 10], residual_40[_lp*2+1 + 10]));
+                    _packed_6[_lp + 5] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_40[_lp*2 + 12], residual_40[_lp*2+1 + 12]));
+                    _packed_6[_lp + 6] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_40[_lp*2 + 14], residual_40[_lp*2+1 + 14]));
+                    _packed_6[_lp + 7] = *(uint32_t*)&_bf2;
                 }
                 {
                     const unsigned* _raw_stv8_41 = reinterpret_cast<const unsigned*>(_packed_6);
@@ -1571,9 +1594,44 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(qko_addr + (unsigned int)swizzled_offset_53), "r"(ov_25_bf16_51[0]), "r"(ov_25_bf16_51[1]), "r"(ov_25_bf16_51[2]), "r"(ov_25_bf16_51[3]) : "memory");
                 unsigned int _packed_7[8];
                 #pragma unroll
-                for (int _lp = 0; _lp < 8; _lp++) {
+                for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_47[_lp*2 + 0], residual_47[_lp*2+1 + 0]));
                     _packed_7[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_47[_lp*2 + 2], residual_47[_lp*2+1 + 2]));
+                    _packed_7[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_47[_lp*2 + 4], residual_47[_lp*2+1 + 4]));
+                    _packed_7[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_47[_lp*2 + 6], residual_47[_lp*2+1 + 6]));
+                    _packed_7[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_47[_lp*2 + 8], residual_47[_lp*2+1 + 8]));
+                    _packed_7[_lp + 4] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_47[_lp*2 + 10], residual_47[_lp*2+1 + 10]));
+                    _packed_7[_lp + 5] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_47[_lp*2 + 12], residual_47[_lp*2+1 + 12]));
+                    _packed_7[_lp + 6] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_47[_lp*2 + 14], residual_47[_lp*2+1 + 14]));
+                    _packed_7[_lp + 7] = *(uint32_t*)&_bf2;
                 }
                 {
                     const unsigned* _raw_stv8_42 = reinterpret_cast<const unsigned*>(_packed_7);
@@ -1719,9 +1777,44 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(qko_addr + (unsigned int)swizzled_offset_61), "r"(ov_54_bf16_59[0]), "r"(ov_54_bf16_59[1]), "r"(ov_54_bf16_59[2]), "r"(ov_54_bf16_59[3]) : "memory");
                 unsigned int _packed_8[8];
                 #pragma unroll
-                for (int _lp = 0; _lp < 8; _lp++) {
+                for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_56[_lp*2 + 0], residual_56[_lp*2+1 + 0]));
                     _packed_8[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_56[_lp*2 + 2], residual_56[_lp*2+1 + 2]));
+                    _packed_8[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_56[_lp*2 + 4], residual_56[_lp*2+1 + 4]));
+                    _packed_8[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_56[_lp*2 + 6], residual_56[_lp*2+1 + 6]));
+                    _packed_8[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_56[_lp*2 + 8], residual_56[_lp*2+1 + 8]));
+                    _packed_8[_lp + 4] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_56[_lp*2 + 10], residual_56[_lp*2+1 + 10]));
+                    _packed_8[_lp + 5] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_56[_lp*2 + 12], residual_56[_lp*2+1 + 12]));
+                    _packed_8[_lp + 6] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_56[_lp*2 + 14], residual_56[_lp*2+1 + 14]));
+                    _packed_8[_lp + 7] = *(uint32_t*)&_bf2;
                 }
                 {
                     const unsigned* _raw_stv8_44 = reinterpret_cast<const unsigned*>(_packed_8);
@@ -1778,9 +1871,44 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(qko_addr + (unsigned int)swizzled_offset_68), "r"(ov_54_bf16_66[0]), "r"(ov_54_bf16_66[1]), "r"(ov_54_bf16_66[2]), "r"(ov_54_bf16_66[3]) : "memory");
                 unsigned int _packed_9[8];
                 #pragma unroll
-                for (int _lp = 0; _lp < 8; _lp++) {
+                for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_62[_lp*2 + 0], residual_62[_lp*2+1 + 0]));
                     _packed_9[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_62[_lp*2 + 2], residual_62[_lp*2+1 + 2]));
+                    _packed_9[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_62[_lp*2 + 4], residual_62[_lp*2+1 + 4]));
+                    _packed_9[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_62[_lp*2 + 6], residual_62[_lp*2+1 + 6]));
+                    _packed_9[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_62[_lp*2 + 8], residual_62[_lp*2+1 + 8]));
+                    _packed_9[_lp + 4] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_62[_lp*2 + 10], residual_62[_lp*2+1 + 10]));
+                    _packed_9[_lp + 5] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_62[_lp*2 + 12], residual_62[_lp*2+1 + 12]));
+                    _packed_9[_lp + 6] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_62[_lp*2 + 14], residual_62[_lp*2+1 + 14]));
+                    _packed_9[_lp + 7] = *(uint32_t*)&_bf2;
                 }
                 {
                     const unsigned* _raw_stv8_45 = reinterpret_cast<const unsigned*>(_packed_9);
@@ -1837,9 +1965,44 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(qko_addr + (unsigned int)swizzled_offset_75), "r"(ov_54_bf16_73[0]), "r"(ov_54_bf16_73[1]), "r"(ov_54_bf16_73[2]), "r"(ov_54_bf16_73[3]) : "memory");
                 unsigned int _packed_10[8];
                 #pragma unroll
-                for (int _lp = 0; _lp < 8; _lp++) {
+                for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_69[_lp*2 + 0], residual_69[_lp*2+1 + 0]));
                     _packed_10[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_69[_lp*2 + 2], residual_69[_lp*2+1 + 2]));
+                    _packed_10[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_69[_lp*2 + 4], residual_69[_lp*2+1 + 4]));
+                    _packed_10[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_69[_lp*2 + 6], residual_69[_lp*2+1 + 6]));
+                    _packed_10[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_69[_lp*2 + 8], residual_69[_lp*2+1 + 8]));
+                    _packed_10[_lp + 4] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_69[_lp*2 + 10], residual_69[_lp*2+1 + 10]));
+                    _packed_10[_lp + 5] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_69[_lp*2 + 12], residual_69[_lp*2+1 + 12]));
+                    _packed_10[_lp + 6] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_69[_lp*2 + 14], residual_69[_lp*2+1 + 14]));
+                    _packed_10[_lp + 7] = *(uint32_t*)&_bf2;
                 }
                 {
                     const unsigned* _raw_stv8_46 = reinterpret_cast<const unsigned*>(_packed_10);
@@ -1896,9 +2059,44 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(qko_addr + (unsigned int)swizzled_offset_82), "r"(ov_54_bf16_80[0]), "r"(ov_54_bf16_80[1]), "r"(ov_54_bf16_80[2]), "r"(ov_54_bf16_80[3]) : "memory");
                 unsigned int _packed_11[8];
                 #pragma unroll
-                for (int _lp = 0; _lp < 8; _lp++) {
+                for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_76[_lp*2 + 0], residual_76[_lp*2+1 + 0]));
                     _packed_11[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_76[_lp*2 + 2], residual_76[_lp*2+1 + 2]));
+                    _packed_11[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_76[_lp*2 + 4], residual_76[_lp*2+1 + 4]));
+                    _packed_11[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_76[_lp*2 + 6], residual_76[_lp*2+1 + 6]));
+                    _packed_11[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_76[_lp*2 + 8], residual_76[_lp*2+1 + 8]));
+                    _packed_11[_lp + 4] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_76[_lp*2 + 10], residual_76[_lp*2+1 + 10]));
+                    _packed_11[_lp + 5] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_76[_lp*2 + 12], residual_76[_lp*2+1 + 12]));
+                    _packed_11[_lp + 6] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_76[_lp*2 + 14], residual_76[_lp*2+1 + 14]));
+                    _packed_11[_lp + 7] = *(uint32_t*)&_bf2;
                 }
                 {
                     const unsigned* _raw_stv8_47 = reinterpret_cast<const unsigned*>(_packed_11);
@@ -2044,9 +2242,44 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(qko_addr + (unsigned int)swizzled_offset_90), "r"(ov_83_bf16_88[0]), "r"(ov_83_bf16_88[1]), "r"(ov_83_bf16_88[2]), "r"(ov_83_bf16_88[3]) : "memory");
                 unsigned int _packed_12[8];
                 #pragma unroll
-                for (int _lp = 0; _lp < 8; _lp++) {
+                for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_85[_lp*2 + 0], residual_85[_lp*2+1 + 0]));
                     _packed_12[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_85[_lp*2 + 2], residual_85[_lp*2+1 + 2]));
+                    _packed_12[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_85[_lp*2 + 4], residual_85[_lp*2+1 + 4]));
+                    _packed_12[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_85[_lp*2 + 6], residual_85[_lp*2+1 + 6]));
+                    _packed_12[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_85[_lp*2 + 8], residual_85[_lp*2+1 + 8]));
+                    _packed_12[_lp + 4] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_85[_lp*2 + 10], residual_85[_lp*2+1 + 10]));
+                    _packed_12[_lp + 5] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_85[_lp*2 + 12], residual_85[_lp*2+1 + 12]));
+                    _packed_12[_lp + 6] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_85[_lp*2 + 14], residual_85[_lp*2+1 + 14]));
+                    _packed_12[_lp + 7] = *(uint32_t*)&_bf2;
                 }
                 {
                     const unsigned* _raw_stv8_49 = reinterpret_cast<const unsigned*>(_packed_12);
@@ -2103,9 +2336,44 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(qko_addr + (unsigned int)swizzled_offset_97), "r"(ov_83_bf16_95[0]), "r"(ov_83_bf16_95[1]), "r"(ov_83_bf16_95[2]), "r"(ov_83_bf16_95[3]) : "memory");
                 unsigned int _packed_13[8];
                 #pragma unroll
-                for (int _lp = 0; _lp < 8; _lp++) {
+                for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_91[_lp*2 + 0], residual_91[_lp*2+1 + 0]));
                     _packed_13[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_91[_lp*2 + 2], residual_91[_lp*2+1 + 2]));
+                    _packed_13[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_91[_lp*2 + 4], residual_91[_lp*2+1 + 4]));
+                    _packed_13[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_91[_lp*2 + 6], residual_91[_lp*2+1 + 6]));
+                    _packed_13[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_91[_lp*2 + 8], residual_91[_lp*2+1 + 8]));
+                    _packed_13[_lp + 4] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_91[_lp*2 + 10], residual_91[_lp*2+1 + 10]));
+                    _packed_13[_lp + 5] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_91[_lp*2 + 12], residual_91[_lp*2+1 + 12]));
+                    _packed_13[_lp + 6] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_91[_lp*2 + 14], residual_91[_lp*2+1 + 14]));
+                    _packed_13[_lp + 7] = *(uint32_t*)&_bf2;
                 }
                 {
                     const unsigned* _raw_stv8_50 = reinterpret_cast<const unsigned*>(_packed_13);
@@ -2162,9 +2430,44 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(qko_addr + (unsigned int)swizzled_offset_104), "r"(ov_83_bf16_102[0]), "r"(ov_83_bf16_102[1]), "r"(ov_83_bf16_102[2]), "r"(ov_83_bf16_102[3]) : "memory");
                 unsigned int _packed_14[8];
                 #pragma unroll
-                for (int _lp = 0; _lp < 8; _lp++) {
+                for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_98[_lp*2 + 0], residual_98[_lp*2+1 + 0]));
                     _packed_14[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_98[_lp*2 + 2], residual_98[_lp*2+1 + 2]));
+                    _packed_14[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_98[_lp*2 + 4], residual_98[_lp*2+1 + 4]));
+                    _packed_14[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_98[_lp*2 + 6], residual_98[_lp*2+1 + 6]));
+                    _packed_14[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_98[_lp*2 + 8], residual_98[_lp*2+1 + 8]));
+                    _packed_14[_lp + 4] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_98[_lp*2 + 10], residual_98[_lp*2+1 + 10]));
+                    _packed_14[_lp + 5] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_98[_lp*2 + 12], residual_98[_lp*2+1 + 12]));
+                    _packed_14[_lp + 6] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_98[_lp*2 + 14], residual_98[_lp*2+1 + 14]));
+                    _packed_14[_lp + 7] = *(uint32_t*)&_bf2;
                 }
                 {
                     const unsigned* _raw_stv8_51 = reinterpret_cast<const unsigned*>(_packed_14);
@@ -2221,9 +2524,44 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(qko_addr + (unsigned int)swizzled_offset_111), "r"(ov_83_bf16_109[0]), "r"(ov_83_bf16_109[1]), "r"(ov_83_bf16_109[2]), "r"(ov_83_bf16_109[3]) : "memory");
                 unsigned int _packed_15[8];
                 #pragma unroll
-                for (int _lp = 0; _lp < 8; _lp++) {
+                for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_105[_lp*2 + 0], residual_105[_lp*2+1 + 0]));
                     _packed_15[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_105[_lp*2 + 2], residual_105[_lp*2+1 + 2]));
+                    _packed_15[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_105[_lp*2 + 4], residual_105[_lp*2+1 + 4]));
+                    _packed_15[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_105[_lp*2 + 6], residual_105[_lp*2+1 + 6]));
+                    _packed_15[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_105[_lp*2 + 8], residual_105[_lp*2+1 + 8]));
+                    _packed_15[_lp + 4] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_105[_lp*2 + 10], residual_105[_lp*2+1 + 10]));
+                    _packed_15[_lp + 5] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_105[_lp*2 + 12], residual_105[_lp*2+1 + 12]));
+                    _packed_15[_lp + 6] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_105[_lp*2 + 14], residual_105[_lp*2+1 + 14]));
+                    _packed_15[_lp + 7] = *(uint32_t*)&_bf2;
                 }
                 {
                     const unsigned* _raw_stv8_52 = reinterpret_cast<const unsigned*>(_packed_15);
@@ -3747,7 +4085,7 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                         unsigned int mask = 0;
                         int position_4 = block_3 * 64 + lane * 8;
                         int whole_tile_1 = active_0_3 >= block_3 * 64 + 64 && ((idx_stride | indices_offset) & 7) == 0;
-                        if (convert != 0) {
+                        if (convert == 1) {
                             if (active_0_3 > position_4) {
                                 mask = mask | 1;
                             }
@@ -3986,7 +4324,7 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                             if (scan_aligned == 0) {
                                 n_full = 0;
                             }
-                            if (convert != 0) {
+                            if (convert == 1) {
                                 int base = 0;
                                 int fill[4];
                                 fill[0] = -1;
@@ -4588,10 +4926,11 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                                     }
                                 }
                                 length = base;
-                            } else {
-                                #pragma unroll 4
-                                for (int g = 0; g < n_full; g++) {
-                                    int spos_2 = g * 128 + lane16 * 8;
+                            } else if (convert == 2) {
+                                int n_batch_1 = n_full / 4;
+                                #pragma unroll 1
+                                for (int b_1 = 0; b_1 < n_batch_1; b_1++) {
+                                    int spos_2 = b_1 * 4 * 128 + lane16 * 8;
                                     int _vec_load_21[8];
                                     {
                                         uint32_t _iv_74_0;
@@ -4613,29 +4952,396 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                                         _vec_load_21[0 + 6] = (int32_t)_iv_74_6;
                                         _vec_load_21[0 + 7] = (int32_t)_iv_74_7;
                                     }
+                                    int spos_0 = (b_1 * 4 + 1) * 128 + lane16 * 8;
+                                    int _vec_load_22[8];
+                                    {
+                                        uint32_t _iv_75_0;
+                                        uint32_t _iv_75_1;
+                                        uint32_t _iv_75_2;
+                                        uint32_t _iv_75_3;
+                                        uint32_t _iv_75_4;
+                                        uint32_t _iv_75_5;
+                                        uint32_t _iv_75_6;
+                                        uint32_t _iv_75_7;
+                                        asm volatile("ld.global.nc.L1::evict_first.L2::evict_normal.L2::256B.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                                            : "=r"(_iv_75_0), "=r"(_iv_75_1), "=r"(_iv_75_2), "=r"(_iv_75_3), "=r"(_iv_75_4), "=r"(_iv_75_5), "=r"(_iv_75_6), "=r"(_iv_75_7) : "l"((const void*)(indices + (row_base_2 + (long long)spos_0) + (0))) : "memory");
+                                        _vec_load_22[0 + 0] = (int32_t)_iv_75_0;
+                                        _vec_load_22[0 + 1] = (int32_t)_iv_75_1;
+                                        _vec_load_22[0 + 2] = (int32_t)_iv_75_2;
+                                        _vec_load_22[0 + 3] = (int32_t)_iv_75_3;
+                                        _vec_load_22[0 + 4] = (int32_t)_iv_75_4;
+                                        _vec_load_22[0 + 5] = (int32_t)_iv_75_5;
+                                        _vec_load_22[0 + 6] = (int32_t)_iv_75_6;
+                                        _vec_load_22[0 + 7] = (int32_t)_iv_75_7;
+                                    }
+                                    int spos_1_1 = (b_1 * 4 + 2) * 128 + lane16 * 8;
+                                    int _vec_load_23[8];
+                                    {
+                                        uint32_t _iv_76_0;
+                                        uint32_t _iv_76_1;
+                                        uint32_t _iv_76_2;
+                                        uint32_t _iv_76_3;
+                                        uint32_t _iv_76_4;
+                                        uint32_t _iv_76_5;
+                                        uint32_t _iv_76_6;
+                                        uint32_t _iv_76_7;
+                                        asm volatile("ld.global.nc.L1::evict_first.L2::evict_normal.L2::256B.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                                            : "=r"(_iv_76_0), "=r"(_iv_76_1), "=r"(_iv_76_2), "=r"(_iv_76_3), "=r"(_iv_76_4), "=r"(_iv_76_5), "=r"(_iv_76_6), "=r"(_iv_76_7) : "l"((const void*)(indices + (row_base_2 + (long long)spos_1_1) + (0))) : "memory");
+                                        _vec_load_23[0 + 0] = (int32_t)_iv_76_0;
+                                        _vec_load_23[0 + 1] = (int32_t)_iv_76_1;
+                                        _vec_load_23[0 + 2] = (int32_t)_iv_76_2;
+                                        _vec_load_23[0 + 3] = (int32_t)_iv_76_3;
+                                        _vec_load_23[0 + 4] = (int32_t)_iv_76_4;
+                                        _vec_load_23[0 + 5] = (int32_t)_iv_76_5;
+                                        _vec_load_23[0 + 6] = (int32_t)_iv_76_6;
+                                        _vec_load_23[0 + 7] = (int32_t)_iv_76_7;
+                                    }
+                                    int spos_2_1 = (b_1 * 4 + 3) * 128 + lane16 * 8;
+                                    int _vec_load_24[8];
+                                    {
+                                        uint32_t _iv_77_0;
+                                        uint32_t _iv_77_1;
+                                        uint32_t _iv_77_2;
+                                        uint32_t _iv_77_3;
+                                        uint32_t _iv_77_4;
+                                        uint32_t _iv_77_5;
+                                        uint32_t _iv_77_6;
+                                        uint32_t _iv_77_7;
+                                        asm volatile("ld.global.nc.L1::evict_first.L2::evict_normal.L2::256B.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                                            : "=r"(_iv_77_0), "=r"(_iv_77_1), "=r"(_iv_77_2), "=r"(_iv_77_3), "=r"(_iv_77_4), "=r"(_iv_77_5), "=r"(_iv_77_6), "=r"(_iv_77_7) : "l"((const void*)(indices + (row_base_2 + (long long)spos_2_1) + (0))) : "memory");
+                                        _vec_load_24[0 + 0] = (int32_t)_iv_77_0;
+                                        _vec_load_24[0 + 1] = (int32_t)_iv_77_1;
+                                        _vec_load_24[0 + 2] = (int32_t)_iv_77_2;
+                                        _vec_load_24[0 + 3] = (int32_t)_iv_77_3;
+                                        _vec_load_24[0 + 4] = (int32_t)_iv_77_4;
+                                        _vec_load_24[0 + 5] = (int32_t)_iv_77_5;
+                                        _vec_load_24[0 + 6] = (int32_t)_iv_77_6;
+                                        _vec_load_24[0 + 7] = (int32_t)_iv_77_7;
+                                    }
+                                    int outv_4[8];
+                                    outv_4[0] = -1;
                                     if (_vec_load_21[0] >= 0 && _vec_load_21[0] <= bound_1) {
+                                        outv_4[0] = _vec_load_21[0] + key_base;
                                         length = spos_2 + 1;
                                     }
+                                    outv_4[1] = -1;
                                     if (_vec_load_21[1] >= 0 && _vec_load_21[1] <= bound_1) {
+                                        outv_4[1] = _vec_load_21[1] + key_base;
                                         length = spos_2 + 1 + 1;
                                     }
+                                    outv_4[2] = -1;
                                     if (_vec_load_21[2] >= 0 && _vec_load_21[2] <= bound_1) {
+                                        outv_4[2] = _vec_load_21[2] + key_base;
                                         length = spos_2 + 2 + 1;
                                     }
+                                    outv_4[3] = -1;
                                     if (_vec_load_21[3] >= 0 && _vec_load_21[3] <= bound_1) {
+                                        outv_4[3] = _vec_load_21[3] + key_base;
                                         length = spos_2 + 3 + 1;
                                     }
+                                    outv_4[4] = -1;
                                     if (_vec_load_21[4] >= 0 && _vec_load_21[4] <= bound_1) {
+                                        outv_4[4] = _vec_load_21[4] + key_base;
                                         length = spos_2 + 4 + 1;
                                     }
+                                    outv_4[5] = -1;
                                     if (_vec_load_21[5] >= 0 && _vec_load_21[5] <= bound_1) {
+                                        outv_4[5] = _vec_load_21[5] + key_base;
                                         length = spos_2 + 5 + 1;
                                     }
+                                    outv_4[6] = -1;
                                     if (_vec_load_21[6] >= 0 && _vec_load_21[6] <= bound_1) {
+                                        outv_4[6] = _vec_load_21[6] + key_base;
                                         length = spos_2 + 6 + 1;
                                     }
+                                    outv_4[7] = -1;
                                     if (_vec_load_21[7] >= 0 && _vec_load_21[7] <= bound_1) {
+                                        outv_4[7] = _vec_load_21[7] + key_base;
                                         length = spos_2 + 7 + 1;
+                                    }
+                                    if (out_vec != 0) {
+                                        {
+                                            int4 _iv4 = make_int4(outv_4[0 + 0], outv_4[0 + 1], outv_4[0 + 2], outv_4[0 + 3]);
+                                            *reinterpret_cast<int4*>(indices_out + out_base + (long long)spos_2) = _iv4;
+                                        }
+                                        {
+                                            int4 _iv4 = make_int4(outv_4[4 + 0], outv_4[4 + 1], outv_4[4 + 2], outv_4[4 + 3]);
+                                            *reinterpret_cast<int4*>(indices_out + out_base + (long long)spos_2 + 4) = _iv4;
+                                        }
+                                    } else {
+                                        indices_out[out_base + (long long)spos_2] = outv_4[0];
+                                        indices_out[out_base + (long long)(spos_2 + 1)] = outv_4[1];
+                                        indices_out[out_base + (long long)(spos_2 + 2)] = outv_4[2];
+                                        indices_out[out_base + (long long)(spos_2 + 3)] = outv_4[3];
+                                        indices_out[out_base + (long long)(spos_2 + 4)] = outv_4[4];
+                                        indices_out[out_base + (long long)(spos_2 + 5)] = outv_4[5];
+                                        indices_out[out_base + (long long)(spos_2 + 6)] = outv_4[6];
+                                        indices_out[out_base + (long long)(spos_2 + 7)] = outv_4[7];
+                                    }
+                                    int outv_3_1[8];
+                                    outv_3_1[0] = -1;
+                                    if (_vec_load_22[0] >= 0 && _vec_load_22[0] <= bound_1) {
+                                        outv_3_1[0] = _vec_load_22[0] + key_base;
+                                        length = spos_0 + 1;
+                                    }
+                                    outv_3_1[1] = -1;
+                                    if (_vec_load_22[1] >= 0 && _vec_load_22[1] <= bound_1) {
+                                        outv_3_1[1] = _vec_load_22[1] + key_base;
+                                        length = spos_0 + 1 + 1;
+                                    }
+                                    outv_3_1[2] = -1;
+                                    if (_vec_load_22[2] >= 0 && _vec_load_22[2] <= bound_1) {
+                                        outv_3_1[2] = _vec_load_22[2] + key_base;
+                                        length = spos_0 + 2 + 1;
+                                    }
+                                    outv_3_1[3] = -1;
+                                    if (_vec_load_22[3] >= 0 && _vec_load_22[3] <= bound_1) {
+                                        outv_3_1[3] = _vec_load_22[3] + key_base;
+                                        length = spos_0 + 3 + 1;
+                                    }
+                                    outv_3_1[4] = -1;
+                                    if (_vec_load_22[4] >= 0 && _vec_load_22[4] <= bound_1) {
+                                        outv_3_1[4] = _vec_load_22[4] + key_base;
+                                        length = spos_0 + 4 + 1;
+                                    }
+                                    outv_3_1[5] = -1;
+                                    if (_vec_load_22[5] >= 0 && _vec_load_22[5] <= bound_1) {
+                                        outv_3_1[5] = _vec_load_22[5] + key_base;
+                                        length = spos_0 + 5 + 1;
+                                    }
+                                    outv_3_1[6] = -1;
+                                    if (_vec_load_22[6] >= 0 && _vec_load_22[6] <= bound_1) {
+                                        outv_3_1[6] = _vec_load_22[6] + key_base;
+                                        length = spos_0 + 6 + 1;
+                                    }
+                                    outv_3_1[7] = -1;
+                                    if (_vec_load_22[7] >= 0 && _vec_load_22[7] <= bound_1) {
+                                        outv_3_1[7] = _vec_load_22[7] + key_base;
+                                        length = spos_0 + 7 + 1;
+                                    }
+                                    if (out_vec != 0) {
+                                        {
+                                            int4 _iv4 = make_int4(outv_3_1[0 + 0], outv_3_1[0 + 1], outv_3_1[0 + 2], outv_3_1[0 + 3]);
+                                            *reinterpret_cast<int4*>(indices_out + out_base + (long long)spos_0) = _iv4;
+                                        }
+                                        {
+                                            int4 _iv4 = make_int4(outv_3_1[4 + 0], outv_3_1[4 + 1], outv_3_1[4 + 2], outv_3_1[4 + 3]);
+                                            *reinterpret_cast<int4*>(indices_out + out_base + (long long)spos_0 + 4) = _iv4;
+                                        }
+                                    } else {
+                                        indices_out[out_base + (long long)spos_0] = outv_3_1[0];
+                                        indices_out[out_base + (long long)(spos_0 + 1)] = outv_3_1[1];
+                                        indices_out[out_base + (long long)(spos_0 + 2)] = outv_3_1[2];
+                                        indices_out[out_base + (long long)(spos_0 + 3)] = outv_3_1[3];
+                                        indices_out[out_base + (long long)(spos_0 + 4)] = outv_3_1[4];
+                                        indices_out[out_base + (long long)(spos_0 + 5)] = outv_3_1[5];
+                                        indices_out[out_base + (long long)(spos_0 + 6)] = outv_3_1[6];
+                                        indices_out[out_base + (long long)(spos_0 + 7)] = outv_3_1[7];
+                                    }
+                                    int outv_4_1[8];
+                                    outv_4_1[0] = -1;
+                                    if (_vec_load_23[0] >= 0 && _vec_load_23[0] <= bound_1) {
+                                        outv_4_1[0] = _vec_load_23[0] + key_base;
+                                        length = spos_1_1 + 1;
+                                    }
+                                    outv_4_1[1] = -1;
+                                    if (_vec_load_23[1] >= 0 && _vec_load_23[1] <= bound_1) {
+                                        outv_4_1[1] = _vec_load_23[1] + key_base;
+                                        length = spos_1_1 + 1 + 1;
+                                    }
+                                    outv_4_1[2] = -1;
+                                    if (_vec_load_23[2] >= 0 && _vec_load_23[2] <= bound_1) {
+                                        outv_4_1[2] = _vec_load_23[2] + key_base;
+                                        length = spos_1_1 + 2 + 1;
+                                    }
+                                    outv_4_1[3] = -1;
+                                    if (_vec_load_23[3] >= 0 && _vec_load_23[3] <= bound_1) {
+                                        outv_4_1[3] = _vec_load_23[3] + key_base;
+                                        length = spos_1_1 + 3 + 1;
+                                    }
+                                    outv_4_1[4] = -1;
+                                    if (_vec_load_23[4] >= 0 && _vec_load_23[4] <= bound_1) {
+                                        outv_4_1[4] = _vec_load_23[4] + key_base;
+                                        length = spos_1_1 + 4 + 1;
+                                    }
+                                    outv_4_1[5] = -1;
+                                    if (_vec_load_23[5] >= 0 && _vec_load_23[5] <= bound_1) {
+                                        outv_4_1[5] = _vec_load_23[5] + key_base;
+                                        length = spos_1_1 + 5 + 1;
+                                    }
+                                    outv_4_1[6] = -1;
+                                    if (_vec_load_23[6] >= 0 && _vec_load_23[6] <= bound_1) {
+                                        outv_4_1[6] = _vec_load_23[6] + key_base;
+                                        length = spos_1_1 + 6 + 1;
+                                    }
+                                    outv_4_1[7] = -1;
+                                    if (_vec_load_23[7] >= 0 && _vec_load_23[7] <= bound_1) {
+                                        outv_4_1[7] = _vec_load_23[7] + key_base;
+                                        length = spos_1_1 + 7 + 1;
+                                    }
+                                    if (out_vec != 0) {
+                                        {
+                                            int4 _iv4 = make_int4(outv_4_1[0 + 0], outv_4_1[0 + 1], outv_4_1[0 + 2], outv_4_1[0 + 3]);
+                                            *reinterpret_cast<int4*>(indices_out + out_base + (long long)spos_1_1) = _iv4;
+                                        }
+                                        {
+                                            int4 _iv4 = make_int4(outv_4_1[4 + 0], outv_4_1[4 + 1], outv_4_1[4 + 2], outv_4_1[4 + 3]);
+                                            *reinterpret_cast<int4*>(indices_out + out_base + (long long)spos_1_1 + 4) = _iv4;
+                                        }
+                                    } else {
+                                        indices_out[out_base + (long long)spos_1_1] = outv_4_1[0];
+                                        indices_out[out_base + (long long)(spos_1_1 + 1)] = outv_4_1[1];
+                                        indices_out[out_base + (long long)(spos_1_1 + 2)] = outv_4_1[2];
+                                        indices_out[out_base + (long long)(spos_1_1 + 3)] = outv_4_1[3];
+                                        indices_out[out_base + (long long)(spos_1_1 + 4)] = outv_4_1[4];
+                                        indices_out[out_base + (long long)(spos_1_1 + 5)] = outv_4_1[5];
+                                        indices_out[out_base + (long long)(spos_1_1 + 6)] = outv_4_1[6];
+                                        indices_out[out_base + (long long)(spos_1_1 + 7)] = outv_4_1[7];
+                                    }
+                                    int outv_5[8];
+                                    outv_5[0] = -1;
+                                    if (_vec_load_24[0] >= 0 && _vec_load_24[0] <= bound_1) {
+                                        outv_5[0] = _vec_load_24[0] + key_base;
+                                        length = spos_2_1 + 1;
+                                    }
+                                    outv_5[1] = -1;
+                                    if (_vec_load_24[1] >= 0 && _vec_load_24[1] <= bound_1) {
+                                        outv_5[1] = _vec_load_24[1] + key_base;
+                                        length = spos_2_1 + 1 + 1;
+                                    }
+                                    outv_5[2] = -1;
+                                    if (_vec_load_24[2] >= 0 && _vec_load_24[2] <= bound_1) {
+                                        outv_5[2] = _vec_load_24[2] + key_base;
+                                        length = spos_2_1 + 2 + 1;
+                                    }
+                                    outv_5[3] = -1;
+                                    if (_vec_load_24[3] >= 0 && _vec_load_24[3] <= bound_1) {
+                                        outv_5[3] = _vec_load_24[3] + key_base;
+                                        length = spos_2_1 + 3 + 1;
+                                    }
+                                    outv_5[4] = -1;
+                                    if (_vec_load_24[4] >= 0 && _vec_load_24[4] <= bound_1) {
+                                        outv_5[4] = _vec_load_24[4] + key_base;
+                                        length = spos_2_1 + 4 + 1;
+                                    }
+                                    outv_5[5] = -1;
+                                    if (_vec_load_24[5] >= 0 && _vec_load_24[5] <= bound_1) {
+                                        outv_5[5] = _vec_load_24[5] + key_base;
+                                        length = spos_2_1 + 5 + 1;
+                                    }
+                                    outv_5[6] = -1;
+                                    if (_vec_load_24[6] >= 0 && _vec_load_24[6] <= bound_1) {
+                                        outv_5[6] = _vec_load_24[6] + key_base;
+                                        length = spos_2_1 + 6 + 1;
+                                    }
+                                    outv_5[7] = -1;
+                                    if (_vec_load_24[7] >= 0 && _vec_load_24[7] <= bound_1) {
+                                        outv_5[7] = _vec_load_24[7] + key_base;
+                                        length = spos_2_1 + 7 + 1;
+                                    }
+                                    if (out_vec != 0) {
+                                        {
+                                            int4 _iv4 = make_int4(outv_5[0 + 0], outv_5[0 + 1], outv_5[0 + 2], outv_5[0 + 3]);
+                                            *reinterpret_cast<int4*>(indices_out + out_base + (long long)spos_2_1) = _iv4;
+                                        }
+                                        {
+                                            int4 _iv4 = make_int4(outv_5[4 + 0], outv_5[4 + 1], outv_5[4 + 2], outv_5[4 + 3]);
+                                            *reinterpret_cast<int4*>(indices_out + out_base + (long long)spos_2_1 + 4) = _iv4;
+                                        }
+                                    } else {
+                                        indices_out[out_base + (long long)spos_2_1] = outv_5[0];
+                                        indices_out[out_base + (long long)(spos_2_1 + 1)] = outv_5[1];
+                                        indices_out[out_base + (long long)(spos_2_1 + 2)] = outv_5[2];
+                                        indices_out[out_base + (long long)(spos_2_1 + 3)] = outv_5[3];
+                                        indices_out[out_base + (long long)(spos_2_1 + 4)] = outv_5[4];
+                                        indices_out[out_base + (long long)(spos_2_1 + 5)] = outv_5[5];
+                                        indices_out[out_base + (long long)(spos_2_1 + 6)] = outv_5[6];
+                                        indices_out[out_base + (long long)(spos_2_1 + 7)] = outv_5[7];
+                                    }
+                                }
+                                #pragma unroll 1
+                                for (int r = 0; r < n_full - n_batch_1 * 4; r++) {
+                                    int spos_4 = (n_batch_1 * 4 + r) * 128 + lane16 * 8;
+                                    int _vec_load_25[8];
+                                    {
+                                        uint32_t _iv_78_0;
+                                        uint32_t _iv_78_1;
+                                        uint32_t _iv_78_2;
+                                        uint32_t _iv_78_3;
+                                        uint32_t _iv_78_4;
+                                        uint32_t _iv_78_5;
+                                        uint32_t _iv_78_6;
+                                        uint32_t _iv_78_7;
+                                        asm volatile("ld.global.nc.L1::evict_first.L2::evict_normal.L2::256B.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                                            : "=r"(_iv_78_0), "=r"(_iv_78_1), "=r"(_iv_78_2), "=r"(_iv_78_3), "=r"(_iv_78_4), "=r"(_iv_78_5), "=r"(_iv_78_6), "=r"(_iv_78_7) : "l"((const void*)(indices + (row_base_2 + (long long)spos_4) + (0))) : "memory");
+                                        _vec_load_25[0 + 0] = (int32_t)_iv_78_0;
+                                        _vec_load_25[0 + 1] = (int32_t)_iv_78_1;
+                                        _vec_load_25[0 + 2] = (int32_t)_iv_78_2;
+                                        _vec_load_25[0 + 3] = (int32_t)_iv_78_3;
+                                        _vec_load_25[0 + 4] = (int32_t)_iv_78_4;
+                                        _vec_load_25[0 + 5] = (int32_t)_iv_78_5;
+                                        _vec_load_25[0 + 6] = (int32_t)_iv_78_6;
+                                        _vec_load_25[0 + 7] = (int32_t)_iv_78_7;
+                                    }
+                                    int outv_6[8];
+                                    outv_6[0] = -1;
+                                    if (_vec_load_25[0] >= 0 && _vec_load_25[0] <= bound_1) {
+                                        outv_6[0] = _vec_load_25[0] + key_base;
+                                        length = spos_4 + 1;
+                                    }
+                                    outv_6[1] = -1;
+                                    if (_vec_load_25[1] >= 0 && _vec_load_25[1] <= bound_1) {
+                                        outv_6[1] = _vec_load_25[1] + key_base;
+                                        length = spos_4 + 1 + 1;
+                                    }
+                                    outv_6[2] = -1;
+                                    if (_vec_load_25[2] >= 0 && _vec_load_25[2] <= bound_1) {
+                                        outv_6[2] = _vec_load_25[2] + key_base;
+                                        length = spos_4 + 2 + 1;
+                                    }
+                                    outv_6[3] = -1;
+                                    if (_vec_load_25[3] >= 0 && _vec_load_25[3] <= bound_1) {
+                                        outv_6[3] = _vec_load_25[3] + key_base;
+                                        length = spos_4 + 3 + 1;
+                                    }
+                                    outv_6[4] = -1;
+                                    if (_vec_load_25[4] >= 0 && _vec_load_25[4] <= bound_1) {
+                                        outv_6[4] = _vec_load_25[4] + key_base;
+                                        length = spos_4 + 4 + 1;
+                                    }
+                                    outv_6[5] = -1;
+                                    if (_vec_load_25[5] >= 0 && _vec_load_25[5] <= bound_1) {
+                                        outv_6[5] = _vec_load_25[5] + key_base;
+                                        length = spos_4 + 5 + 1;
+                                    }
+                                    outv_6[6] = -1;
+                                    if (_vec_load_25[6] >= 0 && _vec_load_25[6] <= bound_1) {
+                                        outv_6[6] = _vec_load_25[6] + key_base;
+                                        length = spos_4 + 6 + 1;
+                                    }
+                                    outv_6[7] = -1;
+                                    if (_vec_load_25[7] >= 0 && _vec_load_25[7] <= bound_1) {
+                                        outv_6[7] = _vec_load_25[7] + key_base;
+                                        length = spos_4 + 7 + 1;
+                                    }
+                                    if (out_vec != 0) {
+                                        {
+                                            int4 _iv4 = make_int4(outv_6[0 + 0], outv_6[0 + 1], outv_6[0 + 2], outv_6[0 + 3]);
+                                            *reinterpret_cast<int4*>(indices_out + out_base + (long long)spos_4) = _iv4;
+                                        }
+                                        {
+                                            int4 _iv4 = make_int4(outv_6[4 + 0], outv_6[4 + 1], outv_6[4 + 2], outv_6[4 + 3]);
+                                            *reinterpret_cast<int4*>(indices_out + out_base + (long long)spos_4 + 4) = _iv4;
+                                        }
+                                    } else {
+                                        indices_out[out_base + (long long)spos_4] = outv_6[0];
+                                        indices_out[out_base + (long long)(spos_4 + 1)] = outv_6[1];
+                                        indices_out[out_base + (long long)(spos_4 + 2)] = outv_6[2];
+                                        indices_out[out_base + (long long)(spos_4 + 3)] = outv_6[3];
+                                        indices_out[out_base + (long long)(spos_4 + 4)] = outv_6[4];
+                                        indices_out[out_base + (long long)(spos_4 + 5)] = outv_6[5];
+                                        indices_out[out_base + (long long)(spos_4 + 6)] = outv_6[6];
+                                        indices_out[out_base + (long long)(spos_4 + 7)] = outv_6[7];
                                     }
                                 }
                                 int tail0_1 = n_full * 128 + lane16;
@@ -4644,27 +5350,91 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                                 for (int t_3 = 0; t_3 < n_tail_1; t_3++) {
                                     int pos_1 = tail0_1 + t_3 * 16;
                                     int value_10 = indices[row_base_2 + (long long)pos_1];
+                                    int converted_1 = -1;
                                     if (value_10 >= 0 && value_10 <= bound_1) {
+                                        converted_1 = value_10 + key_base;
                                         length = pos_1 + 1;
+                                    }
+                                    indices_out[out_base + (long long)pos_1] = converted_1;
+                                }
+                            } else {
+                                #pragma unroll 4
+                                for (int g = 0; g < n_full; g++) {
+                                    int spos_6 = g * 128 + lane16 * 8;
+                                    int _vec_load_26[8];
+                                    {
+                                        uint32_t _iv_79_0;
+                                        uint32_t _iv_79_1;
+                                        uint32_t _iv_79_2;
+                                        uint32_t _iv_79_3;
+                                        uint32_t _iv_79_4;
+                                        uint32_t _iv_79_5;
+                                        uint32_t _iv_79_6;
+                                        uint32_t _iv_79_7;
+                                        asm volatile("ld.global.nc.L1::evict_first.L2::evict_normal.L2::256B.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                                            : "=r"(_iv_79_0), "=r"(_iv_79_1), "=r"(_iv_79_2), "=r"(_iv_79_3), "=r"(_iv_79_4), "=r"(_iv_79_5), "=r"(_iv_79_6), "=r"(_iv_79_7) : "l"((const void*)(indices + (row_base_2 + (long long)spos_6) + (0))) : "memory");
+                                        _vec_load_26[0 + 0] = (int32_t)_iv_79_0;
+                                        _vec_load_26[0 + 1] = (int32_t)_iv_79_1;
+                                        _vec_load_26[0 + 2] = (int32_t)_iv_79_2;
+                                        _vec_load_26[0 + 3] = (int32_t)_iv_79_3;
+                                        _vec_load_26[0 + 4] = (int32_t)_iv_79_4;
+                                        _vec_load_26[0 + 5] = (int32_t)_iv_79_5;
+                                        _vec_load_26[0 + 6] = (int32_t)_iv_79_6;
+                                        _vec_load_26[0 + 7] = (int32_t)_iv_79_7;
+                                    }
+                                    if (_vec_load_26[0] >= 0 && _vec_load_26[0] <= bound_1) {
+                                        length = spos_6 + 1;
+                                    }
+                                    if (_vec_load_26[1] >= 0 && _vec_load_26[1] <= bound_1) {
+                                        length = spos_6 + 1 + 1;
+                                    }
+                                    if (_vec_load_26[2] >= 0 && _vec_load_26[2] <= bound_1) {
+                                        length = spos_6 + 2 + 1;
+                                    }
+                                    if (_vec_load_26[3] >= 0 && _vec_load_26[3] <= bound_1) {
+                                        length = spos_6 + 3 + 1;
+                                    }
+                                    if (_vec_load_26[4] >= 0 && _vec_load_26[4] <= bound_1) {
+                                        length = spos_6 + 4 + 1;
+                                    }
+                                    if (_vec_load_26[5] >= 0 && _vec_load_26[5] <= bound_1) {
+                                        length = spos_6 + 5 + 1;
+                                    }
+                                    if (_vec_load_26[6] >= 0 && _vec_load_26[6] <= bound_1) {
+                                        length = spos_6 + 6 + 1;
+                                    }
+                                    if (_vec_load_26[7] >= 0 && _vec_load_26[7] <= bound_1) {
+                                        length = spos_6 + 7 + 1;
+                                    }
+                                }
+                                int tail0_2 = n_full * 128 + lane16;
+                                int n_tail_2 = (topk - n_full * 128 - lane16 + 15) / 16;
+                                #pragma unroll 1
+                                for (int t_4 = 0; t_4 < n_tail_2; t_4++) {
+                                    int pos_2 = tail0_2 + t_4 * 16;
+                                    int value_16 = indices[row_base_2 + (long long)pos_2];
+                                    if (value_16 >= 0 && value_16 <= bound_1) {
+                                        length = pos_2 + 1;
                                     }
                                 }
                             }
                             int part = length;
+                            if (convert != 1) {
+                                int peer_1 = __shfl_xor_sync(4294901760u, part, 8);
+                                int _max_80_1 = ((part) > (peer_1) ? (part) : (peer_1));
+                                part = _max_80_1;
+                                int peer_0 = __shfl_xor_sync(4294901760u, part, 4);
+                                int _max_81 = ((part) > (peer_0) ? (part) : (peer_0));
+                                part = _max_81;
+                                int peer_1_1 = __shfl_xor_sync(4294901760u, part, 2);
+                                int _max_82_1 = ((part) > (peer_1_1) ? (part) : (peer_1_1));
+                                part = _max_82_1;
+                                int peer_2 = __shfl_xor_sync(4294901760u, part, 1);
+                                int _max_83 = ((part) > (peer_2) ? (part) : (peer_2));
+                                part = _max_83;
+                            }
                             if (convert != 0) {
                                 __syncwarp(4294901760u);
-                            } else {
-                                int peer_1 = __shfl_xor_sync(4294901760u, part, 8);
-                                int _max_75_1 = ((part) > (peer_1) ? (part) : (peer_1));
-                                part = _max_75_1;
-                                int peer_0 = __shfl_xor_sync(4294901760u, part, 4);
-                                int _max_76 = ((part) > (peer_0) ? (part) : (peer_0));
-                                part = _max_76;
-                                int peer_1_1 = __shfl_xor_sync(4294901760u, part, 2);
-                                int _max_77 = ((part) > (peer_1_1) ? (part) : (peer_1_1));
-                                part = _max_77;
-                                int peer_2 = __shfl_xor_sync(4294901760u, part, 1);
-                                int _max_78 = ((part) > (peer_2) ? (part) : (peer_2));
-                                part = _max_78;
                             }
                             if (lane == 16) {
                                 len_cells[outer_5 & 1] = part;

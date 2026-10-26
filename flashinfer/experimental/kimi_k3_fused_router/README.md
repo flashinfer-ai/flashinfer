@@ -136,7 +136,10 @@ Limits of the current route: FP32 logits and bias, exactly 896 experts and
 top-16, `block_m` 8 or 16, SM100 (B200) and SM103 (B300 / GB300) only. Finite
 logits are expected. Token counts between the 28 measured cells are served by
 the neighbouring cell's arm and validated for correctness; their timings were
-measured at the cells. Token counts above 8192 raise `ValueError`.
+measured at the cells. Token counts above 8192 raise `ValueError`. Token
+counts from 129 to 2048 use arms whose 128 plan-owner CTAs must all be
+co-resident; on a device or MIG slice that cannot hold them, preparation
+raises `RuntimeError` instead of launching.
 
 See `tests/experimental/test_cake_kimi_k3_fused_router.py` for the torch
 reference and validated shape set (all 28 measured cells, token counts between

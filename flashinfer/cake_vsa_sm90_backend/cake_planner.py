@@ -28,13 +28,23 @@ are dependency-free ports of the Cake planners and must stay byte-identical to
 them (the two are changed in the same round).  This module imports torch only;
 the plan object that owns the device state and launches is
 :class:`flashinfer.cake_vsa_sm90_backend.CakeVsaSm90Plan`.
+
+Grouped-query attention (``gqa = num_qo_heads / num_kv_heads`` in {2, 4, 8}):
+the planners take the kv-head-shaped mask ``[H_kv, MB, NB]`` with ``gqa=g``.
+:func:`plan_vsa_sm90` replays the MHA plan of the mask replicated per group
+(its mode; every query block's chain) as head-pair tiles (mode 3: warpgroup
+``w`` computes query head ``head + w`` at ``qb0``, both own every position) and
+per-head split tiles (mode 1), with the kv head in plan word 2 and header
+halfword 2, so the GQA programs' output bits equal the MHA route's on
+replicated inputs; :func:`plan_small` emits the replicated mask's rows plus
+``g_shift`` (``kv_head = head >> g_shift``, the small GQA programs' scalar).
 """
 
 from __future__ import annotations
 
 import functools
 import heapq
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence, Union
 
 import torch
 
@@ -45,6 +55,50 @@ NUM_V_STAGES = 3
 NUM_CONSUMER_WGS = 2
 MAX_SEQ = 136
 MAX_SELECTED = 64
+# Query heads per kv head the GQA programs take (1 = the MHA programs); query
+# head ``h`` attends kv head ``h // gqa``.
+GQA_GROUPS = (1, 2, 4, 8)
+# Tile order of grouped-query SPLIT-mode plans (mode 1 tiles: one query head per tile;
+# the ``gqa`` tiles of one (kv head, query block) stream the same KV list).  "group"
+# (the default, both routes): group-major, those ``gqa`` tiles consecutive, so the CTAs
+# streaming concurrently read one kv head's lists in lockstep.  "head": head-major
+# within each kv head (the MHA order), so the concurrent CTAs read different query
+# blocks' lists of the same kv head.  Measured on H100 (paired, cold L2), "head" was
+# faster only on short-list BF16 split rows whose K / V fit the L2 (h8-m2048-n2048-k8
+# g4 / g8 +2.5 / +3.5 ticks of 32 ns) and slower on the long-list BF16 split rows,
+# -12.5 .. -363.5 ticks (h8-m2048-n32768-k48 ragged g4 1.3685x, h16-m4096-n16384-k16
+# g4 / g8 1.0937x / 1.0977x, h8-m1024-n32768-k64 g8 / g4 1.1535x / 1.0661x) and on the
+# FP8 split rows, so neither route takes it.  The Sage-FP8 wrapper still passes
+# ``plan_vsa_sm90(..., split_tile_order="group")`` explicitly.  Head-pair (mode 3) plans
+# keep the group-major order either way.  The tile set, the CTA count, the tile stride
+# and the output bits never change; only which CTA runs which tile.  Mirrors the Cake
+# reference planner (``GQA_SPLIT_TILE_ORDER``); the two must agree.
+GQA_SPLIT_TILE_ORDER = "group"
+# Re-paired split tiles of grouped-query SPLIT-mode plans (``repair_split``; mirrors
+# the Cake reference planner's ``GQA_REPAIR_SPLIT``, the two must agree): ``"auto"``
+# (the default, both routes) re-pairs the split tiles of a uniform plan whose mode-1
+# tile list needs more than one wave of the persistent CTAs (``H x MB > sms``) --
+# one tile per pair of query heads of a kv head, each warpgroup running the WHOLE KV
+# list for its head, so one K / V^T stream serves two query heads and the plan holds
+# half the tiles.  Measured on H100 (paired, cold L2, 2026-10-23): faster on every
+# uniform multi-wave split entry (1.047x .. 1.293x, incl. the long-list FP8 rows
+# h16-m4096-n16384-k16 g4 / g8 1.234x / 1.236x), slower on every one-wave entry
+# (0.58x .. 0.72x: the re-paired grid idles half the SMs) and on the ragged
+# two-wave entries (0.71x .. 0.96x at g = 4), which therefore keep the mode-1
+# replay.  A re-paired tile's output bits are not the equal-head route's on
+# replicated inputs (one chain over the whole list instead of the fold of the two
+# parity chains); the route's absolute precision gates hold on every re-paired row.
+# ``False`` keeps the mode-1 replay everywhere, ``True`` re-pairs every split plan.
+GQA_REPAIR_SPLIT = "auto"
+# Tile modes (plan word 3 / header halfword 3): a pair of query blocks of one
+# head (MHA), one query block split between the warpgroups (MHA and GQA), the
+# lone block of a pair plan (MHA), the GQA head pair (word 2 = the kv head).
+MODE_PAIR, MODE_SPLIT, MODE_LONE, MODE_HEAD_PAIR = 0, 1, 2, 3
+# The re-paired split tile (``repair_split`` plans, GQA only): the whole KV list of one
+# query block as one chain for query heads ``head`` and ``head + 1`` (warpgroup w computes
+# head + w, both own every position, no merge).  The kernel runs it on the head-pair code
+# path (it tests the mode word only as ``== 1``).
+MODE_HEAD_PAIR_SPLIT = 4
 TILE_FIXED_COST = 0.3
 # A tile's load time also carries a fixed part (Q lift, epilogue, inter-tile gap: ~ one
 # position's load) and a split tile the merge of its two warpgroups' partials; in ring
@@ -150,7 +204,7 @@ COMPACT_MIN_TILES = 4
 # and -6.5 % (h8-m2048-n32768-k48-ragged1) against the legacy order).  Measured A:N on
 # H100 (5 groups): h7-m16384-k32 +1.9 %, h32-m2048-k8 +1.7 %, h8-m2048-k16 (one round)
 # +1.0 / +2.2 %, h8-m4096-k16 +0.3 %, h8-m4096-k32 +0.5 % (noise band +-0.7 %).
-# Mirrors the kernel-tests reference planner.  False disables.
+# Mirrors the Cake reference planner.  False disables.
 UNIFORM_LPT = True
 # Ragged STATIC plans of at most
 # RAGGED_LPT_MAX_TILES tiles per CTA (legacy assignment) are re-ordered like uniform plans
@@ -162,7 +216,7 @@ UNIFORM_LPT = True
 # all groups positive).  Plans of more tiles per CTA (the long ragged rows, 9..26 tiles,
 # tails 1.3..3.5 %) measured -0.4..+0.5 % with the same re-order (noise) and keep the legacy
 # order.  The mode and the grid are decided on the legacy order; the tile set (hence the
-# output bits) never changes.  Mirrors the kernel-tests reference planner.  0 disables.
+# output bits) never changes.  Mirrors the Cake reference planner.  0 disables.
 RAGGED_LPT_MAX_TILES = 8
 META_SEQ_OFF = 8
 META_SEQ_WORDS = MAX_SEQ // 2
@@ -232,6 +286,16 @@ CLUSTER_PAD_COST = 0.15
 # :func:`small_route` (the stages ``small_k6sc{3,4,8}``, a cluster launch).
 SPLIT_CLUSTER_VARIANTS = ((6, 3), (6, 4), (6, 8))
 SPLIT_CLUSTER_ROUTE = True
+# The grouped-query FP8 kmax-4 program at prefetch depth 2 (stage ``small_fp8_gqa_k4p2``):
+# an unsplit, non-cluster FP8 GQA kmax-4 plan of at least this many CTAs (``num_items``)
+# runs it instead of ``small_fp8_gqa_k4``.  Same plan rows and output bits: the depth
+# changes when the K / V loads of blocks 2 / 3 are issued (once K[0] / K[1] have landed
+# instead of up front), nothing else.  Measured on H100 (paired, cold L2, 7 groups x 32):
+# 4.9-9 ticks of 32 ns (1.028-1.050x) faster on the 128-CTA grouped-query k4 rows, 1 tick
+# slower on the 32- and 64-CTA rows.  128 = the measured route (0 turns it off).  Mirrors
+# the Cake kernel module (``vsa_sm90_fp8_small.K4_PREFETCH2_MIN_GRID_GQA`` /
+# ``gqa_prefetch_for``); the two must agree.
+K4_PREFETCH2_MIN_GRID_GQA = 128
 
 
 def _chain_blocks(kmax: int) -> int:
@@ -239,9 +303,60 @@ def _chain_blocks(kmax: int) -> int:
     return -(-int(kmax) // 2) if int(kmax) > 1 else int(kmax)
 
 
+def gqa_group(gqa: int) -> int:
+    """``gqa`` as an int in :data:`GQA_GROUPS`, else ``ValueError`` (the backend's message for other head ratios)."""
+    if gqa not in GQA_GROUPS:
+        raise ValueError(
+            "cake (SM90) VSA supports num_qo_heads = g x num_kv_heads with g in "
+            f"{GQA_GROUPS[1:]} (g = 1: equal head counts); got g = {gqa!r}"
+        )
+    return int(gqa)
+
+
+def fp8_gqa_xshare(plan: dict) -> bool:
+    """Whether a grouped-query persistent plan of the Sage-FP8 route runs the
+    shared-transposer queue program (``attention_fp8_gqa_xs_queue``): queue plans
+    whose tiles are all head-pair tiles (``mode == "pair"``).  Split-mode queue
+    plans keep ``attention_fp8_gqa_queue`` and the static plans their programs:
+    the shared transposer measured 2.4-3.1 % faster on every head-pair queue
+    launch and 5 % slower on the split-tile queue launches.  MHA plans (``gqa``
+    1) never take it; the kernel-tests reference planner states the same rule."""
+    return (
+        int(plan.get("gqa", 1)) > 1 and bool(plan["queue"]) and plan["mode"] == "pair"
+    )
+
+
+def _replicated(mask: torch.Tensor, gqa: int) -> torch.Tensor:
+    """The kv-head-shaped mask replicated per group: the mask the MHA route sees on a GQA problem."""
+    return mask if gqa == 1 else mask.repeat_interleave(gqa, dim=0)
+
+
 def plan_meta(split: bool) -> int:
     """Halfwords before the block ids in one plan row of the given kernel family."""
     return PLAN_META_SPLIT if split else PLAN_META_UNSPLIT
+
+
+def small_prefetch(
+    kmax: int,
+    split: bool,
+    cluster: int,
+    *,
+    num_items: int,
+    fp8: bool,
+    gqa: int = 1,
+) -> Optional[int]:
+    """The ``prefetch`` of the small stage a plan of ``num_items`` CTAs runs on ``(kmax, split,
+    cluster)``: 2 for the unsplit, non-cluster FP8 grouped-query kmax-4 plan of at least
+    :data:`K4_PREFETCH2_MIN_GRID_GQA` CTAs (stage ``small_fp8_gqa_k4p2``), else ``None``
+    (the stage without a depth suffix).  The BF16 stages and the MHA stages (``gqa == 1``)
+    never take it.  Mirrors ``vsa_sm90_fp8_small.gqa_prefetch_for``."""
+    if not fp8 or gqa_group(gqa) == 1:
+        return None
+    if (int(kmax), bool(split), int(cluster or 0)) != (4, False, 0):
+        return None
+    if K4_PREFETCH2_MIN_GRID_GQA > 0 and int(num_items) >= K4_PREFETCH2_MIN_GRID_GQA:
+        return 2
+    return None
 
 
 def small_kmax_for(capacity: int) -> int:
@@ -476,10 +591,16 @@ def cluster_capacity(device_index: int) -> dict[int, int]:
 
 
 def small_route(
-    block_mask: torch.Tensor, *, sms: int, cluster_capacity: Mapping[int, int]
+    block_mask: torch.Tensor,
+    *,
+    sms: int,
+    cluster_capacity: Mapping[int, int],
+    gqa: int = 1,
 ) -> Optional[tuple[int, bool, int]]:
     """``(kmax, split, cluster)`` when the problem should take a small-kernel route, else ``None``.
 
+    ``gqa > 1``: ``block_mask`` is kv-head-shaped and the rule runs on the mask
+    replicated per group (``num_qo_heads x MB`` tiles, the MHA route's thresholds).
     Unsplit rule: every query block selects at most ``SMALL_KMAX_VARIANTS[-1]``
     KV blocks, the whole grid fits one wave of the chosen variant (``tiles <=
     occupancy * SMs``) and the plan fits the by-value parameter.  Sliced rules
@@ -493,7 +614,7 @@ def small_route(
     ingest.  Everything larger goes to the persistent pair/split kernel.
     Mirrors ``vsa_sm90_small.small_route``.
     """
-    mask = block_mask.to("cpu", torch.bool)
+    mask = _replicated(block_mask.to("cpu", torch.bool), gqa_group(gqa))
     h, mb, _nb = mask.shape
     counts = mask.sum(dim=-1).reshape(-1).tolist()
     capacity = max(counts)
@@ -600,6 +721,7 @@ def plan_small(
     kmax: Optional[int] = None,
     split: bool = False,
     cluster: int = 0,
+    gqa: int = 1,
 ) -> dict:
     """Plan rows as int16 halfwords: ``[count, blk...]`` per tile (unsplit) or ``[meta, qtile, blk...]`` per item (split / cluster).
 
@@ -610,13 +732,21 @@ def plan_small(
     ``cluster = csize`` every query block is exactly ``csize`` consecutive
     items (empty slices padded with ``count = 0``) forming one thread-block
     cluster that merges through distributed shared memory.
+    ``gqa > 1``: ``block_mask`` is kv-head-shaped and the rows are those of the
+    mask replicated per group (one item per query head and query block, the
+    kernel's ``tile = head * MB + qb`` decode); ``"H"`` is the query head count,
+    ``"H_kv"`` the kv head count and ``"g_shift"`` the small GQA programs' kernel
+    scalar (``kv_head = head >> g_shift``).
     Returns the CPU int16 ``plan`` of exactly ``PLAN_HALFWORDS`` elements (the
     by-value kernel parameter, ``-1`` padded), or raises when the problem does
     not fit.  Byte-identical to the Cake planner (``vsa_sm90_small.plan_small``).
     """
+    gqa = gqa_group(gqa)
     mask = block_mask.to("cpu", torch.bool)
     if mask.ndim != 3:
         raise ValueError("block_mask must be (H, MB, NB)")
+    mask = _replicated(mask, gqa)
+    group = {"gqa": gqa, "g_shift": gqa.bit_length() - 1, "H_kv": mask.shape[0] // gqa}
     h, mb, nb = mask.shape
     if nb > 32767:
         raise ValueError("KV block ids must fit int16")
@@ -680,6 +810,7 @@ def plan_small(
             "cluster": cluster,
             "stride": stride,
             "meta_halfwords": PLAN_META_UNSPLIT,
+            **group,
         }
     if cluster:
         if kmax is None:
@@ -763,6 +894,7 @@ def plan_small(
         "cluster": cluster,
         "stride": stride,
         "meta_halfwords": meta_halfwords,
+        **group,
     }
 
 
@@ -995,6 +1127,120 @@ def _assign_tiles(
     return best[1], best[2]
 
 
+def _tie_key(info: tuple, gqa: int, split_tile_order: str) -> tuple:
+    """The order of tiles of equal cost: ``(head, query block)`` on MHA plans; group-major ``(kv head,
+    query block, head)`` on GQA plans (word 2 is the kv head), so the head pairs of one (kv head, query
+    block) are consecutive.  Mirrors the Cake reference planner."""
+    if gqa == 1 or (info[3] == MODE_SPLIT and split_tile_order == "head"):
+        return (info[0], info[1])
+    return (info[2], info[1], info[0])
+
+
+def _tile_order(
+    infos,
+    costs,
+    loads,
+    *,
+    ragged: bool,
+    fits_l2: bool,
+    gqa: int,
+    split_tile_order: Optional[str] = None,
+) -> list[int]:
+    """The planner's tile order before the list schedule: uniform plans keep the emission order
+    (head-major, the query-block order within a head; group-major for GQA tiles); ragged plans
+    list-schedule costlier tiles first, over all heads when every head's K and V fit the L2 budget
+    (``fits_l2``), else head-major (kv-head-major for GQA).  Mirrors the Cake reference planner."""
+    if split_tile_order is None:
+        split_tile_order = GQA_SPLIT_TILE_ORDER
+    order = list(range(len(infos)))
+    if ragged and fits_l2:
+        order.sort(
+            key=lambda i: (
+                -max(costs[i], loads[i] * LOAD_COST),
+                *_tie_key(infos[i], gqa, split_tile_order),
+            )
+        )
+    elif ragged:
+        order.sort(
+            key=lambda i: (_tie_key(infos[i], gqa, split_tile_order)[0], -costs[i])
+        )
+    return order
+
+
+def _gqa_tiles(gqa: int, infos, seqs, owns, lens, *, repair_split: bool = False):
+    """The GQA tiles replayed from the MHA tiles of the kv-head mask (``info`` = ``(kv head, qb,
+    partner, mode)``).  Mirrors the Cake reference planner (``_gqa_tiles``).
+
+    A split tile (mode 1) is kept per query head: ``gqa`` tiles ``(gqa j + r, qb, j, 1)`` with its
+    sequence and own lists; with ``repair_split`` it becomes ``gqa / 2`` re-paired tiles
+    ``(gqa j + 2i, qb, j, 4)`` (``MODE_HEAD_PAIR_SPLIT``) whose sequence is the tile's whole KV list
+    and whose two own lists both hold every position with use bits 3.  A pair tile (mode 0) gives,
+    for its query block ``qb`` from warpgroup 0's own list and for ``partner`` from warpgroup 1's, a
+    chain: the ``(first, second)`` block pairs of the owned positions in own-list order; a lone block
+    (mode 2) gives one chain from warpgroup 0's list.  Each chain becomes ``gqa / 2`` head-pair tiles
+    ``(gqa j + 2i, qb, j, 3)`` whose sequence is the chain and whose two own lists both hold every
+    position with use bits 3 (``has_second`` kept).  Tiles are emitted group-major: for each MHA
+    tile, its first block's head pairs, then its partner's.
+    """
+    g_infos, g_seqs, g_owns, g_lens = [], [], [], []
+    for info, seq, own, length in zip(infos, seqs, owns, lens, strict=True):
+        j, qb, partner, mode = info
+        if mode == MODE_SPLIT and not repair_split:
+            for r in range(gqa):
+                g_infos.append((gqa * j + r, qb, j, MODE_SPLIT))
+                g_seqs.append(seq)
+                g_owns.append(own)
+                g_lens.append(length)
+            continue
+        if mode == MODE_SPLIT:
+            # Re-paired split tile: the whole list as one chain (the sequence is the block list,
+            # two per position, an odd tail alone), every position owned by both warpgroups.
+            full_own = [
+                (pos << 3) | ((seq[2 * pos + 1] >= 0) << 2) | 3 for pos in range(length)
+            ]
+            if 2 * length > MAX_SEQ or length > MAX_OWN:
+                raise ValueError(
+                    f"re-paired split tile of (kv head {j}, query block {qb}) has {length} positions"
+                )
+            if not _schedule_feasible([3] * length):
+                raise AssertionError(
+                    "ring schedule of a re-paired split tile infeasible (kernel protocol bug)"
+                )
+            for i in range(gqa // 2):
+                g_infos.append((gqa * j + 2 * i, qb, j, MODE_HEAD_PAIR_SPLIT))
+                g_seqs.append(seq)
+                g_owns.append([full_own, full_own])
+                g_lens.append(length)
+            continue
+        chains = (
+            [(qb, own[0])] if mode == MODE_LONE else [(qb, own[0]), (partner, own[1])]
+        )
+        for block, entries in chains:
+            chain_seq = [
+                blk
+                for entry in entries
+                for blk in seq[2 * (entry >> 3) : 2 * (entry >> 3) + 2]
+            ]
+            chain_own = [
+                (pos << 3) | (entry & (1 << 2)) | 3 for pos, entry in enumerate(entries)
+            ]
+            n = len(entries)
+            if 2 * n > MAX_SEQ or n > MAX_OWN:
+                raise ValueError(
+                    f"head-pair chain of (kv head {j}, query block {block}) has {n} positions"
+                )
+            if not _schedule_feasible([3] * n):
+                raise AssertionError(
+                    "ring schedule of a head-pair tile infeasible (kernel protocol bug)"
+                )
+            for i in range(gqa // 2):
+                g_infos.append((gqa * j + 2 * i, block, j, MODE_HEAD_PAIR))
+                g_seqs.append(chain_seq)
+                g_owns.append([chain_own, chain_own])
+                g_lens.append(n)
+    return g_infos, g_seqs, g_owns, g_lens
+
+
 def _balance_static(
     infos,
     seqs,
@@ -1008,30 +1254,32 @@ def _balance_static(
     refined: bool,
     ragged: bool = False,
     fits_l2: bool = True,
+    gqa: int = 1,
+    split_tile_order: Optional[str] = None,
 ):
     """A static plan's tiles in LPT order (by max(cost, load)) with their CTA lists and makespan, or
     None when the legacy order already is that order.  Uniform plans (UNIFORM_LPT): over all heads
     for a one-round plan, within each head otherwise.  Ragged plans (RAGGED_LPT_MAX_TILES): over all
-    heads when every head's K and V fit the L2 budget, within each head beyond it.  Mirrors the
-    kernel-tests reference planner (``_balance_static``)."""
+    heads when every head's K and V fit the L2 budget, within each head beyond it.  GQA plans tie-break
+    group-major (kv head, query block, head word), and "within each head" means within each kv head.
+    Mirrors the Cake reference planner (``_balance_static``)."""
+    if split_tile_order is None:
+        split_tile_order = GQA_SPLIT_TILE_ORDER
+
+    def lpt(i: int) -> tuple:
+        return (
+            -max(costs[i], loads[i] * LOAD_COST),
+            *_tie_key(infos[i], gqa, split_tile_order),
+        )
+
+    def within(i: int) -> tuple:
+        first, *rest = _tie_key(infos[i], gqa, split_tile_order)
+        return (first, -max(costs[i], loads[i] * LOAD_COST), *rest)
+
     if (one_round and not ragged) or (ragged and fits_l2):
-        order = sorted(
-            range(len(infos)),
-            key=lambda i: (
-                -max(costs[i], loads[i] * LOAD_COST),
-                infos[i][0],
-                infos[i][1],
-            ),
-        )
+        order = sorted(range(len(infos)), key=lpt)
     else:
-        order = sorted(
-            range(len(infos)),
-            key=lambda i: (
-                infos[i][0],
-                -max(costs[i], loads[i] * LOAD_COST),
-                infos[i][1],
-            ),
-        )
+        order = sorted(range(len(infos)), key=within)
     if order == list(range(len(infos))):
         return None
     infos, seqs, owns, lens, costs, loads = (
@@ -1153,7 +1401,13 @@ def _int32_words(words: torch.Tensor) -> torch.Tensor:
 
 
 def plan_vsa_sm90(
-    block_mask: torch.Tensor, *, sms: int, mode: Optional[str] = None
+    block_mask: torch.Tensor,
+    *,
+    sms: int,
+    mode: Optional[str] = None,
+    gqa: int = 1,
+    split_tile_order: Optional[str] = None,
+    repair_split: Union[bool, str] = GQA_REPAIR_SPLIT,
 ) -> dict[str, Any]:
     """Turn a boolean ``[H, MB, NB]`` block mask into the kernel's per-CTA plan.
 
@@ -1162,12 +1416,58 @@ def plan_vsa_sm90(
     its tile count), the tile stride, the chosen mode, the persistent CTA count
     and the tile count.  ``sms`` is the multiprocessor count of the executing
     device (it sizes the persistent grid).
+
+    ``gqa > 1``: ``block_mask`` is kv-head-shaped (``[H_kv, MB, NB]``) and the
+    plan is the GQA programs': its mode is the MHA plan's on the
+    mask replicated per group (the makespan of the replicated tile list, ties
+    to split) and every MHA tile of kv head ``j`` is replayed as GQA tiles
+    whose chains are the MHA warpgroups' own lists verbatim: a pair tile
+    ``(j, a, b)`` gives ``gqa / 2`` head-pair tiles (mode 3; heads ``gqa j +
+    2i``, warpgroup ``w`` computes head ``+ w`` at the block, both own every
+    position) for ``a`` and ``gqa / 2`` for ``b``, a lone block ``gqa / 2``
+    head-pair tiles, a split tile ``gqa`` mode-1 tiles (one per query head).
+    Plan word 2 and header halfword 2 carry the kv head.  Costs, order
+    (group-major: kv head, query block, head pair), grid and the queue /
+    compact / tag rules then run on the GQA tiles, with the K / V^T hint and
+    reader counts keyed by the kv head.  ``"H"`` is the query head count (the
+    MHA route's on replicated inputs), ``"H_kv"`` the kv head count.
+
+    ``split_tile_order`` (GQA split-mode plans): ``None`` takes
+    ``GQA_SPLIT_TILE_ORDER`` (``"group"``); ``"head"`` / ``"group"`` pin the
+    order of the mode-1 tiles (the Sage-FP8 route passes ``"group"``
+    explicitly).  Same tile set, grid, stride and output bits either way.
+
+    ``repair_split`` (grouped-query plans; default ``GQA_REPAIR_SPLIT`` =
+    ``"auto"``, both routes): when the plan's mode is split, every split tile
+    ``(j, qb)`` becomes ``gqa / 2`` re-paired tiles ``(gqa j + 2i, qb, j, 4)``
+    instead of ``gqa`` mode-1 tiles: the whole KV list is one chain, both
+    warpgroups own every position and warpgroup ``w`` computes query head
+    ``gqa j + 2i + w`` over it, so one K / V^T stream serves two query heads
+    and the plan holds half the tiles.  The mode decision, cost model (a
+    re-paired tile costs its whole chain, no split-merge load), tile order,
+    grid rule, queue / compact / tag rules, hint and reader counts are
+    unchanged; they run on the re-paired list, so a re-paired plan can select
+    another program than the same mask's mode-1 plan (fewer tiles per CTA can
+    leave the queue program).  The output bits are not the equal-head route's
+    on replicated inputs (the route's absolute precision gates hold on every
+    re-paired row; the relative error to the equal-head route is reported by
+    the tests, not gating).  ``"auto"`` applies the measured rule: re-pair
+    only a uniform plan (every query block selects the same count) whose
+    split tiles (``H x MB``, one per query head and query block) need more
+    than one wave of the ``sms`` CTAs; one-wave and ragged plans keep the
+    mode-1 replay (H100, 2026-10-23: faster on every uniform multi-wave entry,
+    slower on every one-wave entry and on the ragged two-wave entries).
+    ``False`` keeps the mode-1 replay everywhere, ``True`` re-pairs every
+    split plan.  ``"repair_split"`` reports whether the plan holds re-paired
+    tiles, ``"repair_rule"`` the setting.
     """
+    gqa = gqa_group(gqa)
     if block_mask.dtype != torch.bool or block_mask.ndim != 3:
         raise ValueError("block_mask must be a boolean [H, MB, NB] tensor")
     mask = block_mask.to(device="cpu").contiguous()
-    h, mb, nb = mask.shape
-    if h == 0 or mb == 0 or nb == 0:
+    h_kv, mb, nb = mask.shape
+    h = h_kv * gqa
+    if h_kv == 0 or mb == 0 or nb == 0:
         raise ValueError("block_mask must be non-empty")
     if nb > 0xFFFF:
         raise ValueError("at most 65535 KV blocks are supported")
@@ -1182,49 +1482,113 @@ def plan_vsa_sm90(
         raise ValueError(f"unknown mode {mode!r}")
     if sms < 1:
         raise ValueError("sms must be positive")
-    rows = [[m.nonzero().flatten().tolist() for m in mask[hh]] for hh in range(h)]
+    if split_tile_order is None:
+        split_tile_order = GQA_SPLIT_TILE_ORDER
+    if split_tile_order not in ("group", "head"):
+        raise ValueError(
+            f"split_tile_order must be 'group' or 'head', got {split_tile_order!r}"
+        )
+    rows = [[m.nonzero().flatten().tolist() for m in mask[hh]] for hh in range(h_kv)]
     ragged = int(counts.min()) != int(counts.max())
+    if repair_split not in (False, True, "auto"):
+        raise ValueError(
+            f"repair_split must be False, True or 'auto', got {repair_split!r}"
+        )
+    # The measured rule of "auto": a uniform plan whose split tiles (one per query
+    # head and query block, h x mb) need more than one wave of the sms CTAs.
+    repair = (
+        bool(repair_split) if repair_split != "auto" else (not ragged and h * mb > sms)
+    )
     # The refined load model is calibrated on uniform plans; on ragged plans it
     # only re-orders and re-balances the list schedule and measured slower on
     # the 32k-token K=64 ragged rows, so ragged plans keep the previous model.
-    refined = (not ragged) and float(counts.sum()) / (h * mb) >= REFINED_LOAD_MIN_K
+    refined = (not ragged) and float(counts.sum()) / (h_kv * mb) >= REFINED_LOAD_MIN_K
+    # The L2 budget of the tile order counts the K and V the plan's tiles
+    # stream: one copy per kv head (the MHA plan of the replicated mask, which
+    # decides a GQA plan's mode, counts every query head's).
+    fits_l2 = h_kv * nb * BLOCK * HEAD_DIM * 2 * 2 <= TILE_ORDER_L2_BUDGET
+    fits_l2_replicated = h * nb * BLOCK * HEAD_DIM * 2 * 2 <= TILE_ORDER_L2_BUDGET
 
-    def build(mode: str):
+    def mha_tiles(mode: str):
         infos: list[tuple[int, int, int, int]] = []
         seqs: list[list[int]] = []
         owns: list[list[list[int]]] = []
         lens: list[int] = []
-        for hh in range(h):
+        for hh in range(h_kv):
             pairs = _pairs_for_head(hh, mode, rows, counts, mb, ragged)
             for qb, partner in pairs:
                 _emit_tile(hh, qb, partner, mode, rows, infos, seqs, owns, lens)
+        return infos, seqs, owns, lens
+
+    def model(infos, lens, owns):
         costs = [_tile_cost(owns[t]) for t in range(len(infos))]
         loads = [
             _tile_load(infos[t][3], lens[t]) if refined else float(lens[t])
             for t in range(len(infos))
         ]
-        if not ragged:
-            order = list(range(len(infos)))
-        elif h * nb * BLOCK * HEAD_DIM * 2 * 2 <= TILE_ORDER_L2_BUDGET:
-            order = sorted(
-                range(len(infos)),
-                key=lambda i: (
-                    -max(costs[i], loads[i] * LOAD_COST),
-                    infos[i][0],
-                    infos[i][1],
-                ),
+        return costs, loads
+
+    def build(mode: str):
+        """The plan's tiles in the planner's order with their costs and loads."""
+        infos, seqs, owns, lens = mha_tiles(mode)
+        if gqa > 1:
+            infos, seqs, owns, lens = _gqa_tiles(
+                gqa, infos, seqs, owns, lens, repair_split=repair
             )
-        else:
-            order = sorted(range(len(infos)), key=lambda i: (infos[i][0], -costs[i]))
+            if mode == "split" and split_tile_order == "head":
+                # head-major emission within each kv head (``split_tile_order``);
+                # uniform plans keep the emission order
+                order = sorted(
+                    range(len(infos)), key=lambda i: (infos[i][2], infos[i][0], i)
+                )
+                infos, seqs, owns, lens = (
+                    [x[i] for i in order] for x in (infos, seqs, owns, lens)
+                )
+        costs, loads = model(infos, lens, owns)
+        order = _tile_order(
+            infos,
+            costs,
+            loads,
+            ragged=ragged,
+            fits_l2=fits_l2,
+            gqa=gqa,
+            split_tile_order=split_tile_order,
+        )
         return tuple(
             [x[i] for i in order] for x in (infos, seqs, owns, lens, costs, loads)
         )
+
+    def replicated_makespan(mode: str) -> float:
+        """The MHA planner's makespan on the mask replicated per group (its tiles
+        are the kv heads' tiles under each query head, head-major; the replicas
+        are identical), which decides a GQA plan's mode as it decides the MHA
+        route's on replicated inputs."""
+        infos, seqs, owns, lens = mha_tiles(mode)
+        rep = [
+            ((gqa * j + r, *info[1:]), t)
+            for j in range(h_kv)
+            for r in range(gqa)
+            for t, info in enumerate(infos)
+            if info[0] == j
+        ]
+        rinfos = [info for info, _ in rep]
+        rlens, rowns = [lens[t] for _, t in rep], [owns[t] for _, t in rep]
+        costs, loads = model(rinfos, rlens, rowns)
+        order = _tile_order(
+            rinfos, costs, loads, ragged=ragged, fits_l2=fits_l2_replicated, gqa=1
+        )
+        return _assign_tiles(
+            [costs[i] for i in order], [loads[i] for i in order], sms, refined
+        )[1]
 
     if mode is None:
         best = None
         for cand in ("split", "pair"):  # ties go to split
             built = build(cand)
-            _, makespan = _assign_tiles(built[4], built[5], sms, refined)
+            if gqa == 1:
+                _, makespan = _assign_tiles(built[4], built[5], sms, refined)
+            else:
+                makespan = replicated_makespan(cand)
             if best is None or makespan < best[0]:
                 best = (makespan, cand, built)
         _, mode, (infos, seqs, owns, lens, costs, loads) = best
@@ -1247,9 +1611,11 @@ def plan_vsa_sm90(
     # worth of tiles per head.
     min_tiles = min(len(lst) for lst in lists)
     if ragged:
+        # The long-head window counts the heads whose K/V the pool's consecutive tiles share: the kv heads
+        # (a GQA pool runs kv-head-major).
         queue = min_tiles >= POOL_RAGGED_MIN_TILES or (
             min_tiles >= POOL_RAGGED_LONG_HEAD_MIN_TILES
-            and len(infos) >= POOL_RAGGED_LONG_HEAD_WINDOWS * h * g
+            and len(infos) >= POOL_RAGGED_LONG_HEAD_WINDOWS * h_kv * g
         )
     else:
         queue = min_tiles >= POOL_MIN_TILES or (
@@ -1283,7 +1649,9 @@ def plan_vsa_sm90(
             sms=sms,
             refined=refined,
             ragged=ragged,
-            fits_l2=h * nb * BLOCK * HEAD_DIM * 2 * 2 <= TILE_ORDER_L2_BUDGET,
+            fits_l2=fits_l2,
+            gqa=gqa,
+            split_tile_order=split_tile_order,
         )
         if balanced is not None:
             infos, seqs, owns, lens, costs, loads, lists, makespan = balanced
@@ -1308,8 +1676,11 @@ def plan_vsa_sm90(
     # per CTA (a fetch past the pool stages a slot whose word META_NTILES is 0).
     n_rows = g * stride + len(pool) + (g if queue else 0)
     hdr = torch.zeros((HDR_HALFWORDS,), dtype=torch.int16)
+    # The K / V^T hint and the reader counts are per (kv head, block): info word 0 on MHA plans, word 2
+    # (the kv head) on GQA plans.
+    key_word = 2 if gqa > 1 else 0
     kv_hint = kv_l2_hint(mask, seqs)
-    readers = kv_reader_counts(infos, seqs)
+    readers = kv_reader_counts(infos, seqs, key_word)
     tagged = bool(
         KV_TAG_SINGLE_READER
         and not queue
@@ -1318,7 +1689,7 @@ def plan_vsa_sm90(
         and nb < (1 << KV_TAG_BIT)
         and kv_tags_pay(readers)
     )
-    tseqs = kv_single_reader_tags(infos, seqs, readers) if tagged else seqs
+    tseqs = kv_single_reader_tags(infos, seqs, readers, key_word) if tagged else seqs
     for c, st in enumerate(static):
         t = st[0]
         n_hdr = min(HDR_ISSUE, lens[t])
@@ -1375,22 +1746,31 @@ def plan_vsa_sm90(
         "kv_hint": kv_hint,
         "tagged": tagged,
         "H": h,
+        "H_kv": h_kv,
+        "gqa": gqa,
+        "split_tile_order": split_tile_order,
+        "repair_split": bool(repair and gqa > 1 and mode == "split"),
+        "repair_rule": repair_split,
         "MB": mb,
         "NB": nb,
     }
 
 
 def kv_reader_counts(
-    infos: Sequence[tuple], seqs: Sequence[Sequence[int]]
+    infos: Sequence[tuple], seqs: Sequence[Sequence[int]], key_word: int = 0
 ) -> dict[tuple[int, int], int]:
     """The multiplicity of every (head, block) the plan loads: its occurrences over all
     sequences (a pair tile lists a shared block once; the ring-fallback interleave may
-    list it twice, which counts as re-read).  Sentinels (-1) are skipped."""
+    list it twice, which counts as re-read).  Sentinels (-1) are skipped.  ``key_word``
+    names the info word that owns the K / V: 0 (the head, MHA plans) or 2 (the kv head,
+    GQA plans)."""
     readers: dict[tuple[int, int], int] = {}
     for info, seq in zip(infos, seqs, strict=True):
         for blk in seq:
             if blk >= 0:
-                readers[(info[0], blk)] = readers.get((info[0], blk), 0) + 1
+                readers[(info[key_word], blk)] = (
+                    readers.get((info[key_word], blk), 0) + 1
+                )
     return readers
 
 
@@ -1408,16 +1788,17 @@ def kv_single_reader_tags(
     infos: Sequence[tuple],
     seqs: Sequence[Sequence[int]],
     readers: dict[tuple[int, int], int] | None = None,
+    key_word: int = 0,
 ) -> list[list[int]]:
     """The KV sequences with bit ``KV_TAG_BIT`` set on every block exactly one tile
-    of the plan loads (``readers`` = :func:`kv_reader_counts`); sentinels (-1) and
-    re-read blocks unchanged."""
+    of the plan loads (``readers`` = :func:`kv_reader_counts` keyed by info word
+    ``key_word``); sentinels (-1) and re-read blocks unchanged."""
     if readers is None:
-        readers = kv_reader_counts(infos, seqs)
+        readers = kv_reader_counts(infos, seqs, key_word)
     return [
         [
             blk | (1 << KV_TAG_BIT)
-            if blk >= 0 and readers[(info[0], blk)] == 1
+            if blk >= 0 and readers[(info[key_word], blk)] == 1
             else blk
             for blk in seq
         ]

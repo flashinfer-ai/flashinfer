@@ -44,6 +44,7 @@ from .moe_w4a16_fp4_helpers import swizzle_block_scale
 from .moe_w4a16_host import (
     _W4A16_ALLOWED_ROUTED_SIZES,
     max_packed_route_slots,
+    max_w4a16_scratch_route_slots,
     packed_gemm_scratch_elements,
     route_pack_numel_capacity,
     unswizzle_block_scale,
@@ -3478,11 +3479,14 @@ def _w4a16_workspace_geometry(
         blocks = (slots + int(block_size) - 1) // int(block_size)
         route_slots = max(route_slots, slots)
         route_blocks = max(route_blocks, blocks)
+        scratch_slots = max_w4a16_scratch_route_slots(
+            routed_rows_capacity, num_topk, block_size, slots
+        )
         fc1_c_tmp_elements = max(
             fc1_c_tmp_elements,
             packed_gemm_scratch_elements(
                 size_n=fc1_cols,
-                route_slots=slots,
+                route_slots=scratch_slots,
                 moe_block_size=int(block_size),
                 sms=sms,
             ),
@@ -3491,7 +3495,7 @@ def _w4a16_workspace_geometry(
             fc2_c_tmp_elements,
             packed_gemm_scratch_elements(
                 size_n=int(k),
-                route_slots=slots,
+                route_slots=scratch_slots,
                 moe_block_size=int(block_size),
                 sms=sms,
             ),
