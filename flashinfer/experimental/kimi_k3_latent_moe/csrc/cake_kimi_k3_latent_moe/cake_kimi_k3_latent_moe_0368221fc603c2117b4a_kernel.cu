@@ -48,29 +48,29 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 }
 
 #define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 256
+#define TMEM_NCOLS 512
 #define TMEM_ACC_OFFSET 0
-#define NUM_TMA_PIPE_STAGES 8
+#define NUM_TMA_PIPE_STAGES 7
 #define NUM_EPI_PIPE_STAGES 1
 #define SMEM_LAND_OFF 2048
-#define SMEM_LAND_STAGE_BYTES 32768
-#define SMEM_LAND_STRIDE 32768
+#define SMEM_LAND_STAGE_BYTES 65536
+#define SMEM_LAND_STRIDE 65536
 #define SMEM_FREE_WORD_OFF 1536
 #define SMEM_FREE_WORD_STAGE_BYTES 8
 #define SMEM_FREE_WORD_STRIDE 8
-#define SMEM_SMEM_A_OFF 34816
+#define SMEM_SMEM_A_OFF 2048
 #define SMEM_SMEM_A_STAGE_BYTES 16384
 #define SMEM_SMEM_A_STRIDE 16384
-#define SMEM_SMEM_B_OFF 165888
-#define SMEM_SMEM_B_STAGE_BYTES 8192
-#define SMEM_SMEM_B_STRIDE 8192
-#define SMEM_SMEM_BN_OFF 165888
-#define SMEM_SMEM_BN_STAGE_BYTES 8192
-#define SMEM_SMEM_BN_STRIDE 8192
-#define SMEM_SMEM_AG_OFF 34816
+#define SMEM_SMEM_B_OFF 116736
+#define SMEM_SMEM_B_STAGE_BYTES 16384
+#define SMEM_SMEM_B_STRIDE 16384
+#define SMEM_SMEM_BN_OFF 116736
+#define SMEM_SMEM_BN_STAGE_BYTES 16384
+#define SMEM_SMEM_BN_STRIDE 16384
+#define SMEM_SMEM_AG_OFF 2048
 #define SMEM_SMEM_AG_STAGE_BYTES 8192
 #define SMEM_SMEM_AG_STRIDE 16384
-#define SMEM_SMEM_AU_OFF 43008
+#define SMEM_SMEM_AU_OFF 10240
 #define SMEM_SMEM_AU_STAGE_BYTES 8192
 #define SMEM_SMEM_AU_STRIDE 16384
 #define SMEM_TOTAL 231424
@@ -185,7 +185,7 @@ __device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
 extern "C" {
 
 __global__ __launch_bounds__(192) __cluster_dims__(2,1,1) void
-kernel_cake_kimi_k3_latent_moe_31f72d1c25787de25594(const __grid_constant__ CUtensorMap A_R, const __grid_constant__ CUtensorMap A_L, const __grid_constant__ CUtensorMap A_S, const __grid_constant__ CUtensorMap A_2, const __grid_constant__ CUtensorMap B_1, const __grid_constant__ CUtensorMap B_2, float* __restrict__ out_r, __nv_bfloat16* __restrict__ out_l, __nv_bfloat16* __restrict__ out_s, unsigned int* __restrict__ counters, __nv_bfloat16* __restrict__ routed, __nv_bfloat16* __restrict__ norm_w, __nv_bfloat16* __restrict__ y_out, unsigned long long* __restrict__ tl, int num_tokens, int k1_off, int num_partials, float eps)
+kernel_cake_kimi_k3_latent_moe_0368221fc603c2117b4a(const __grid_constant__ CUtensorMap A_R, const __grid_constant__ CUtensorMap A_L, const __grid_constant__ CUtensorMap A_S, const __grid_constant__ CUtensorMap A_2, const __grid_constant__ CUtensorMap B_1, const __grid_constant__ CUtensorMap B_2, float* __restrict__ out_r, __nv_bfloat16* __restrict__ out_l, __nv_bfloat16* __restrict__ out_s, unsigned int* __restrict__ counters, __nv_bfloat16* __restrict__ routed, __nv_bfloat16* __restrict__ norm_w, __nv_bfloat16* __restrict__ y_out, unsigned long long* __restrict__ tl, int num_tokens, int k1_off, int num_partials, float eps)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -202,13 +202,14 @@ kernel_cake_kimi_k3_latent_moe_31f72d1c25787de25594(const __grid_constant__ CUte
 
     const int mbar_base = smem;
     #define a_full_addr (mbar_base + 0)
-    #define a_empty_addr (mbar_base + 64)
-    #define acc_full_addr (mbar_base + 128)
-    #define acc_empty_addr (mbar_base + 136)
-    #define red_bar_addr (mbar_base + 144)
-    #define issue_bar_addr (mbar_base + 152)
-    #define rows_bar_addr (mbar_base + 160)
-    #define bn_bar_addr (mbar_base + 168)
+    #define a_empty_addr (mbar_base + 56)
+    #define acc_full_addr (mbar_base + 112)
+    #define acc_empty_addr (mbar_base + 120)
+    #define red_bar_addr (mbar_base + 128)
+    #define issue_bar_addr (mbar_base + 136)
+    #define rows_bar_addr (mbar_base + 144)
+    #define bn_bar_addr (mbar_base + 152)
+    #define free_bar_addr (mbar_base + 160)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -224,25 +225,25 @@ kernel_cake_kimi_k3_latent_moe_31f72d1c25787de25594(const __grid_constant__ CUte
     const int land_addr = smem + 2048;
     unsigned int* free_word = reinterpret_cast<unsigned int*>(smem_raw + 1536);
     const int free_word_addr = smem + 1536;
-    __nv_bfloat16* smem_a = reinterpret_cast<__nv_bfloat16*>(smem_raw + 34816);
-    const int smem_a_addr = smem + 34816;
-    __nv_bfloat16* smem_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + 165888);
-    const int smem_b_addr = smem + 165888;
-    __nv_bfloat16* smem_bn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 165888);
-    const int smem_bn_addr = smem + 165888;
-    __nv_bfloat16* smem_ag = reinterpret_cast<__nv_bfloat16*>(smem_raw + 34816);
-    const int smem_ag_addr = smem + 34816;
-    __nv_bfloat16* smem_au = reinterpret_cast<__nv_bfloat16*>(smem_raw + 43008);
-    const int smem_au_addr = smem + 43008;
+    __nv_bfloat16* smem_a = reinterpret_cast<__nv_bfloat16*>(smem_raw + 2048);
+    const int smem_a_addr = smem + 2048;
+    __nv_bfloat16* smem_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + 116736);
+    const int smem_b_addr = smem + 116736;
+    __nv_bfloat16* smem_bn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 116736);
+    const int smem_bn_addr = smem + 116736;
+    __nv_bfloat16* smem_ag = reinterpret_cast<__nv_bfloat16*>(smem_raw + 2048);
+    const int smem_ag_addr = smem + 2048;
+    __nv_bfloat16* smem_au = reinterpret_cast<__nv_bfloat16*>(smem_raw + 10240);
+    const int smem_au_addr = smem + 10240;
 
-    // Mbarrier init (8 pipeline groups, 0 ordered-sequence groups, 22 barriers)
-    // Mbarriers at smem_raw[0..176)
+    // Mbarrier init (9 pipeline groups, 0 ordered-sequence groups, 21 barriers)
+    // Mbarriers at smem_raw[0..168)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
         if (leader) {
             // --- pipeline 'tma_pipe' ---
-            // a_full: 8 barriers, init_count=1
+            // a_full: 7 barriers, init_count=1
             mbarrier_init(smem + 0, 1);
             mbarrier_init(smem + 8, 1);
             mbarrier_init(smem + 16, 1);
@@ -250,41 +251,42 @@ kernel_cake_kimi_k3_latent_moe_31f72d1c25787de25594(const __grid_constant__ CUte
             mbarrier_init(smem + 32, 1);
             mbarrier_init(smem + 40, 1);
             mbarrier_init(smem + 48, 1);
+            // a_empty: 7 barriers, init_count=1
             mbarrier_init(smem + 56, 1);
-            // a_empty: 8 barriers, init_count=1
             mbarrier_init(smem + 64, 1);
             mbarrier_init(smem + 72, 1);
             mbarrier_init(smem + 80, 1);
             mbarrier_init(smem + 88, 1);
             mbarrier_init(smem + 96, 1);
             mbarrier_init(smem + 104, 1);
-            mbarrier_init(smem + 112, 1);
-            mbarrier_init(smem + 120, 1);
             // --- pipeline 'epi_pipe' ---
             // acc_full: 1 barriers, init_count=1
-            mbarrier_init(smem + 128, 1);
+            mbarrier_init(smem + 112, 1);
             // acc_empty: 1 barriers, init_count=1
-            mbarrier_init(smem + 136, 1);
+            mbarrier_init(smem + 120, 1);
             // red_bar: 1 barriers, init_count=1
-            mbarrier_init(smem + 144, 1);
+            mbarrier_init(smem + 128, 1);
             // issue_bar: 1 barriers, init_count=1
-            mbarrier_init(smem + 152, 1);
+            mbarrier_init(smem + 136, 1);
             // rows_bar: 1 barriers, init_count=1
-            mbarrier_init(smem + 160, 1);
+            mbarrier_init(smem + 144, 1);
             // bn_bar: 1 barriers, init_count=1
-            mbarrier_init(smem + 168, 1);
+            mbarrier_init(smem + 152, 1);
+            // free_bar: 1 barriers, init_count=1
+            mbarrier_init(smem + 160, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-            mbarrier_expect_tx(smem + 144, 32768);
+            mbarrier_expect_tx(smem + 128, 65536);
+            mbarrier_expect_tx(smem + 160, 8);
         }
     }
 
     __syncwarp();
 
-    // TMEM alloc (256 columns, 256 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 176);
+    // TMEM alloc (512 columns, 512 used)
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 168);
     if (warp == 0) {
-        int _tmem_hold = smem + 176;
-        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(256) : "memory");
+        int _tmem_hold = smem + 168;
+        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
@@ -479,12 +481,30 @@ kernel_cake_kimi_k3_latent_moe_31f72d1c25787de25594(const __grid_constant__ CUte
             int lane_pair = lane % 4;
             int row_base = epi_warp * 16 + lane / 4;
             int lane_addr = taddr + (unsigned int)(epi_warp * 32 << 16);
-            float red[64];
+            float red[128];
             int fin = 1;
             unsigned int _phase_acc_full = 0;
             mbarrier_wait(acc_full_addr, _phase_acc_full);
             asm volatile("tcgen05.fence::after_thread_sync;");
-            float _tmem_load_0[64];
+            if (slot == 0) {
+                unsigned long long zero_free = 0;
+                if (warp == 0) {
+                    if (elect_sync()) {
+                        uint32_t _cluster_mapa_3;
+                        asm volatile(
+                            "mapa.shared::cluster.u32 %0, %1, %2;"
+                            : "=r"(_cluster_mapa_3) : "r"(free_word_addr), "r"(1));
+                        uint32_t _cluster_mapa_4;
+                        asm volatile(
+                            "mapa.shared::cluster.u32 %0, %1, %2;"
+                            : "=r"(_cluster_mapa_4) : "r"(free_bar_addr), "r"(1));
+                        asm volatile(
+                            "st.async.shared::cluster.mbarrier::complete_tx::bytes.b64 [%0], %1, [%2];"
+                            :: "r"(_cluster_mapa_3), "l"(zero_free), "r"(_cluster_mapa_4) : "memory");
+                    }
+                }
+            }
+            float _tmem_load_0[128];
             asm volatile(
                 "tcgen05.ld.sync.aligned.32x32b.x32.b32"
                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
@@ -496,6 +516,18 @@ kernel_cake_kimi_k3_latent_moe_31f72d1c25787de25594(const __grid_constant__ CUte
                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
                 : "=f"(_tmem_load_0[32]), "=f"(_tmem_load_0[33]), "=f"(_tmem_load_0[34]), "=f"(_tmem_load_0[35]), "=f"(_tmem_load_0[36]), "=f"(_tmem_load_0[37]), "=f"(_tmem_load_0[38]), "=f"(_tmem_load_0[39]), "=f"(_tmem_load_0[40]), "=f"(_tmem_load_0[41]), "=f"(_tmem_load_0[42]), "=f"(_tmem_load_0[43]), "=f"(_tmem_load_0[44]), "=f"(_tmem_load_0[45]), "=f"(_tmem_load_0[46]), "=f"(_tmem_load_0[47]), "=f"(_tmem_load_0[48]), "=f"(_tmem_load_0[49]), "=f"(_tmem_load_0[50]), "=f"(_tmem_load_0[51]), "=f"(_tmem_load_0[52]), "=f"(_tmem_load_0[53]), "=f"(_tmem_load_0[54]), "=f"(_tmem_load_0[55]), "=f"(_tmem_load_0[56]), "=f"(_tmem_load_0[57]), "=f"(_tmem_load_0[58]), "=f"(_tmem_load_0[59]), "=f"(_tmem_load_0[60]), "=f"(_tmem_load_0[61]), "=f"(_tmem_load_0[62]), "=f"(_tmem_load_0[63])
                 : "r"(lane_addr + 32));
+            asm volatile("tcgen05.wait::ld.sync.aligned;");
+            asm volatile(
+                "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                : "=f"(_tmem_load_0[64]), "=f"(_tmem_load_0[65]), "=f"(_tmem_load_0[66]), "=f"(_tmem_load_0[67]), "=f"(_tmem_load_0[68]), "=f"(_tmem_load_0[69]), "=f"(_tmem_load_0[70]), "=f"(_tmem_load_0[71]), "=f"(_tmem_load_0[72]), "=f"(_tmem_load_0[73]), "=f"(_tmem_load_0[74]), "=f"(_tmem_load_0[75]), "=f"(_tmem_load_0[76]), "=f"(_tmem_load_0[77]), "=f"(_tmem_load_0[78]), "=f"(_tmem_load_0[79]), "=f"(_tmem_load_0[80]), "=f"(_tmem_load_0[81]), "=f"(_tmem_load_0[82]), "=f"(_tmem_load_0[83]), "=f"(_tmem_load_0[84]), "=f"(_tmem_load_0[85]), "=f"(_tmem_load_0[86]), "=f"(_tmem_load_0[87]), "=f"(_tmem_load_0[88]), "=f"(_tmem_load_0[89]), "=f"(_tmem_load_0[90]), "=f"(_tmem_load_0[91]), "=f"(_tmem_load_0[92]), "=f"(_tmem_load_0[93]), "=f"(_tmem_load_0[94]), "=f"(_tmem_load_0[95])
+                : "r"(lane_addr + 64));
+            asm volatile("tcgen05.wait::ld.sync.aligned;");
+            asm volatile(
+                "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                : "=f"(_tmem_load_0[96]), "=f"(_tmem_load_0[97]), "=f"(_tmem_load_0[98]), "=f"(_tmem_load_0[99]), "=f"(_tmem_load_0[100]), "=f"(_tmem_load_0[101]), "=f"(_tmem_load_0[102]), "=f"(_tmem_load_0[103]), "=f"(_tmem_load_0[104]), "=f"(_tmem_load_0[105]), "=f"(_tmem_load_0[106]), "=f"(_tmem_load_0[107]), "=f"(_tmem_load_0[108]), "=f"(_tmem_load_0[109]), "=f"(_tmem_load_0[110]), "=f"(_tmem_load_0[111]), "=f"(_tmem_load_0[112]), "=f"(_tmem_load_0[113]), "=f"(_tmem_load_0[114]), "=f"(_tmem_load_0[115]), "=f"(_tmem_load_0[116]), "=f"(_tmem_load_0[117]), "=f"(_tmem_load_0[118]), "=f"(_tmem_load_0[119]), "=f"(_tmem_load_0[120]), "=f"(_tmem_load_0[121]), "=f"(_tmem_load_0[122]), "=f"(_tmem_load_0[123]), "=f"(_tmem_load_0[124]), "=f"(_tmem_load_0[125]), "=f"(_tmem_load_0[126]), "=f"(_tmem_load_0[127])
+                : "r"(lane_addr + 96));
             asm volatile("tcgen05.wait::ld.sync.aligned;");
             red[0] = _tmem_load_0[0];
             red[1] = _tmem_load_0[1];
@@ -561,6 +593,70 @@ kernel_cake_kimi_k3_latent_moe_31f72d1c25787de25594(const __grid_constant__ CUte
             red[61] = _tmem_load_0[61];
             red[62] = _tmem_load_0[62];
             red[63] = _tmem_load_0[63];
+            red[64] = _tmem_load_0[64];
+            red[65] = _tmem_load_0[65];
+            red[66] = _tmem_load_0[66];
+            red[67] = _tmem_load_0[67];
+            red[68] = _tmem_load_0[68];
+            red[69] = _tmem_load_0[69];
+            red[70] = _tmem_load_0[70];
+            red[71] = _tmem_load_0[71];
+            red[72] = _tmem_load_0[72];
+            red[73] = _tmem_load_0[73];
+            red[74] = _tmem_load_0[74];
+            red[75] = _tmem_load_0[75];
+            red[76] = _tmem_load_0[76];
+            red[77] = _tmem_load_0[77];
+            red[78] = _tmem_load_0[78];
+            red[79] = _tmem_load_0[79];
+            red[80] = _tmem_load_0[80];
+            red[81] = _tmem_load_0[81];
+            red[82] = _tmem_load_0[82];
+            red[83] = _tmem_load_0[83];
+            red[84] = _tmem_load_0[84];
+            red[85] = _tmem_load_0[85];
+            red[86] = _tmem_load_0[86];
+            red[87] = _tmem_load_0[87];
+            red[88] = _tmem_load_0[88];
+            red[89] = _tmem_load_0[89];
+            red[90] = _tmem_load_0[90];
+            red[91] = _tmem_load_0[91];
+            red[92] = _tmem_load_0[92];
+            red[93] = _tmem_load_0[93];
+            red[94] = _tmem_load_0[94];
+            red[95] = _tmem_load_0[95];
+            red[96] = _tmem_load_0[96];
+            red[97] = _tmem_load_0[97];
+            red[98] = _tmem_load_0[98];
+            red[99] = _tmem_load_0[99];
+            red[100] = _tmem_load_0[100];
+            red[101] = _tmem_load_0[101];
+            red[102] = _tmem_load_0[102];
+            red[103] = _tmem_load_0[103];
+            red[104] = _tmem_load_0[104];
+            red[105] = _tmem_load_0[105];
+            red[106] = _tmem_load_0[106];
+            red[107] = _tmem_load_0[107];
+            red[108] = _tmem_load_0[108];
+            red[109] = _tmem_load_0[109];
+            red[110] = _tmem_load_0[110];
+            red[111] = _tmem_load_0[111];
+            red[112] = _tmem_load_0[112];
+            red[113] = _tmem_load_0[113];
+            red[114] = _tmem_load_0[114];
+            red[115] = _tmem_load_0[115];
+            red[116] = _tmem_load_0[116];
+            red[117] = _tmem_load_0[117];
+            red[118] = _tmem_load_0[118];
+            red[119] = _tmem_load_0[119];
+            red[120] = _tmem_load_0[120];
+            red[121] = _tmem_load_0[121];
+            red[122] = _tmem_load_0[122];
+            red[123] = _tmem_load_0[123];
+            red[124] = _tmem_load_0[124];
+            red[125] = _tmem_load_0[125];
+            red[126] = _tmem_load_0[126];
+            red[127] = _tmem_load_0[127];
             asm volatile("tcgen05.fence::before_thread_sync;");
             asm volatile("barrier.sync 1, 128;" ::: "memory");
             if (warp == 0) {
@@ -569,6 +665,12 @@ kernel_cake_kimi_k3_latent_moe_31f72d1c25787de25594(const __grid_constant__ CUte
                 }
             }
             if (slot == 1) {
+                if (warp == 0) {
+                    if (elect_sync()) {
+                        mbarrier_arrive(free_bar_addr);
+                    }
+                }
+                mbarrier_wait_cluster_hint(free_bar_addr, 0, 10000000);
                 uint32_t _mapa_0;
                 asm volatile(
                     "mapa.shared::cluster.u32 %0, %1, %2;"
@@ -625,6 +727,54 @@ kernel_cake_kimi_k3_latent_moe_31f72d1c25787de25594(const __grid_constant__ CUte
                 asm volatile(
                     "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
                     :: "r"(_mapa_1 + 30720), "r"(__float_as_uint(red[60])), "r"(__float_as_uint(red[61])), "r"(__float_as_uint(red[62])), "r"(__float_as_uint(red[63])), "r"(_mapa_0) : "memory");
+                asm volatile(
+                    "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                    :: "r"(_mapa_1 + 32768), "r"(__float_as_uint(red[64])), "r"(__float_as_uint(red[65])), "r"(__float_as_uint(red[66])), "r"(__float_as_uint(red[67])), "r"(_mapa_0) : "memory");
+                asm volatile(
+                    "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                    :: "r"(_mapa_1 + 34816), "r"(__float_as_uint(red[68])), "r"(__float_as_uint(red[69])), "r"(__float_as_uint(red[70])), "r"(__float_as_uint(red[71])), "r"(_mapa_0) : "memory");
+                asm volatile(
+                    "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                    :: "r"(_mapa_1 + 36864), "r"(__float_as_uint(red[72])), "r"(__float_as_uint(red[73])), "r"(__float_as_uint(red[74])), "r"(__float_as_uint(red[75])), "r"(_mapa_0) : "memory");
+                asm volatile(
+                    "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                    :: "r"(_mapa_1 + 38912), "r"(__float_as_uint(red[76])), "r"(__float_as_uint(red[77])), "r"(__float_as_uint(red[78])), "r"(__float_as_uint(red[79])), "r"(_mapa_0) : "memory");
+                asm volatile(
+                    "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                    :: "r"(_mapa_1 + 40960), "r"(__float_as_uint(red[80])), "r"(__float_as_uint(red[81])), "r"(__float_as_uint(red[82])), "r"(__float_as_uint(red[83])), "r"(_mapa_0) : "memory");
+                asm volatile(
+                    "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                    :: "r"(_mapa_1 + 43008), "r"(__float_as_uint(red[84])), "r"(__float_as_uint(red[85])), "r"(__float_as_uint(red[86])), "r"(__float_as_uint(red[87])), "r"(_mapa_0) : "memory");
+                asm volatile(
+                    "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                    :: "r"(_mapa_1 + 45056), "r"(__float_as_uint(red[88])), "r"(__float_as_uint(red[89])), "r"(__float_as_uint(red[90])), "r"(__float_as_uint(red[91])), "r"(_mapa_0) : "memory");
+                asm volatile(
+                    "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                    :: "r"(_mapa_1 + 47104), "r"(__float_as_uint(red[92])), "r"(__float_as_uint(red[93])), "r"(__float_as_uint(red[94])), "r"(__float_as_uint(red[95])), "r"(_mapa_0) : "memory");
+                asm volatile(
+                    "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                    :: "r"(_mapa_1 + 49152), "r"(__float_as_uint(red[96])), "r"(__float_as_uint(red[97])), "r"(__float_as_uint(red[98])), "r"(__float_as_uint(red[99])), "r"(_mapa_0) : "memory");
+                asm volatile(
+                    "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                    :: "r"(_mapa_1 + 51200), "r"(__float_as_uint(red[100])), "r"(__float_as_uint(red[101])), "r"(__float_as_uint(red[102])), "r"(__float_as_uint(red[103])), "r"(_mapa_0) : "memory");
+                asm volatile(
+                    "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                    :: "r"(_mapa_1 + 53248), "r"(__float_as_uint(red[104])), "r"(__float_as_uint(red[105])), "r"(__float_as_uint(red[106])), "r"(__float_as_uint(red[107])), "r"(_mapa_0) : "memory");
+                asm volatile(
+                    "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                    :: "r"(_mapa_1 + 55296), "r"(__float_as_uint(red[108])), "r"(__float_as_uint(red[109])), "r"(__float_as_uint(red[110])), "r"(__float_as_uint(red[111])), "r"(_mapa_0) : "memory");
+                asm volatile(
+                    "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                    :: "r"(_mapa_1 + 57344), "r"(__float_as_uint(red[112])), "r"(__float_as_uint(red[113])), "r"(__float_as_uint(red[114])), "r"(__float_as_uint(red[115])), "r"(_mapa_0) : "memory");
+                asm volatile(
+                    "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                    :: "r"(_mapa_1 + 59392), "r"(__float_as_uint(red[116])), "r"(__float_as_uint(red[117])), "r"(__float_as_uint(red[118])), "r"(__float_as_uint(red[119])), "r"(_mapa_0) : "memory");
+                asm volatile(
+                    "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                    :: "r"(_mapa_1 + 61440), "r"(__float_as_uint(red[120])), "r"(__float_as_uint(red[121])), "r"(__float_as_uint(red[122])), "r"(__float_as_uint(red[123])), "r"(_mapa_0) : "memory");
+                asm volatile(
+                    "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                    :: "r"(_mapa_1 + 63488), "r"(__float_as_uint(red[124])), "r"(__float_as_uint(red[125])), "r"(__float_as_uint(red[126])), "r"(__float_as_uint(red[127])), "r"(_mapa_0) : "memory");
                 fin = 0;
             } else {
                 if (warp == 0) {
@@ -697,6 +847,70 @@ kernel_cake_kimi_k3_latent_moe_31f72d1c25787de25594(const __grid_constant__ CUte
                 red[61] = red[61] + land[(1920 + tid_1) * 4 + 1];
                 red[62] = red[62] + land[(1920 + tid_1) * 4 + 2];
                 red[63] = red[63] + land[(1920 + tid_1) * 4 + 3];
+                red[64] = red[64] + land[(2048 + tid_1) * 4];
+                red[65] = red[65] + land[(2048 + tid_1) * 4 + 1];
+                red[66] = red[66] + land[(2048 + tid_1) * 4 + 2];
+                red[67] = red[67] + land[(2048 + tid_1) * 4 + 3];
+                red[68] = red[68] + land[(2176 + tid_1) * 4];
+                red[69] = red[69] + land[(2176 + tid_1) * 4 + 1];
+                red[70] = red[70] + land[(2176 + tid_1) * 4 + 2];
+                red[71] = red[71] + land[(2176 + tid_1) * 4 + 3];
+                red[72] = red[72] + land[(2304 + tid_1) * 4];
+                red[73] = red[73] + land[(2304 + tid_1) * 4 + 1];
+                red[74] = red[74] + land[(2304 + tid_1) * 4 + 2];
+                red[75] = red[75] + land[(2304 + tid_1) * 4 + 3];
+                red[76] = red[76] + land[(2432 + tid_1) * 4];
+                red[77] = red[77] + land[(2432 + tid_1) * 4 + 1];
+                red[78] = red[78] + land[(2432 + tid_1) * 4 + 2];
+                red[79] = red[79] + land[(2432 + tid_1) * 4 + 3];
+                red[80] = red[80] + land[(2560 + tid_1) * 4];
+                red[81] = red[81] + land[(2560 + tid_1) * 4 + 1];
+                red[82] = red[82] + land[(2560 + tid_1) * 4 + 2];
+                red[83] = red[83] + land[(2560 + tid_1) * 4 + 3];
+                red[84] = red[84] + land[(2688 + tid_1) * 4];
+                red[85] = red[85] + land[(2688 + tid_1) * 4 + 1];
+                red[86] = red[86] + land[(2688 + tid_1) * 4 + 2];
+                red[87] = red[87] + land[(2688 + tid_1) * 4 + 3];
+                red[88] = red[88] + land[(2816 + tid_1) * 4];
+                red[89] = red[89] + land[(2816 + tid_1) * 4 + 1];
+                red[90] = red[90] + land[(2816 + tid_1) * 4 + 2];
+                red[91] = red[91] + land[(2816 + tid_1) * 4 + 3];
+                red[92] = red[92] + land[(2944 + tid_1) * 4];
+                red[93] = red[93] + land[(2944 + tid_1) * 4 + 1];
+                red[94] = red[94] + land[(2944 + tid_1) * 4 + 2];
+                red[95] = red[95] + land[(2944 + tid_1) * 4 + 3];
+                red[96] = red[96] + land[(3072 + tid_1) * 4];
+                red[97] = red[97] + land[(3072 + tid_1) * 4 + 1];
+                red[98] = red[98] + land[(3072 + tid_1) * 4 + 2];
+                red[99] = red[99] + land[(3072 + tid_1) * 4 + 3];
+                red[100] = red[100] + land[(3200 + tid_1) * 4];
+                red[101] = red[101] + land[(3200 + tid_1) * 4 + 1];
+                red[102] = red[102] + land[(3200 + tid_1) * 4 + 2];
+                red[103] = red[103] + land[(3200 + tid_1) * 4 + 3];
+                red[104] = red[104] + land[(3328 + tid_1) * 4];
+                red[105] = red[105] + land[(3328 + tid_1) * 4 + 1];
+                red[106] = red[106] + land[(3328 + tid_1) * 4 + 2];
+                red[107] = red[107] + land[(3328 + tid_1) * 4 + 3];
+                red[108] = red[108] + land[(3456 + tid_1) * 4];
+                red[109] = red[109] + land[(3456 + tid_1) * 4 + 1];
+                red[110] = red[110] + land[(3456 + tid_1) * 4 + 2];
+                red[111] = red[111] + land[(3456 + tid_1) * 4 + 3];
+                red[112] = red[112] + land[(3584 + tid_1) * 4];
+                red[113] = red[113] + land[(3584 + tid_1) * 4 + 1];
+                red[114] = red[114] + land[(3584 + tid_1) * 4 + 2];
+                red[115] = red[115] + land[(3584 + tid_1) * 4 + 3];
+                red[116] = red[116] + land[(3712 + tid_1) * 4];
+                red[117] = red[117] + land[(3712 + tid_1) * 4 + 1];
+                red[118] = red[118] + land[(3712 + tid_1) * 4 + 2];
+                red[119] = red[119] + land[(3712 + tid_1) * 4 + 3];
+                red[120] = red[120] + land[(3840 + tid_1) * 4];
+                red[121] = red[121] + land[(3840 + tid_1) * 4 + 1];
+                red[122] = red[122] + land[(3840 + tid_1) * 4 + 2];
+                red[123] = red[123] + land[(3840 + tid_1) * 4 + 3];
+                red[124] = red[124] + land[(3968 + tid_1) * 4];
+                red[125] = red[125] + land[(3968 + tid_1) * 4 + 1];
+                red[126] = red[126] + land[(3968 + tid_1) * 4 + 2];
+                red[127] = red[127] + land[(3968 + tid_1) * 4 + 3];
             }
             if (fin == 1) {
                 if (num_tokens > 0) {
@@ -891,11 +1105,203 @@ kernel_cake_kimi_k3_latent_moe_31f72d1c25787de25594(const __grid_constant__ CUte
                 if (num_tokens > 63) {
                     *(reinterpret_cast<__nv_bfloat16*>(out_l + (451584 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[63];
                 }
+                if (num_tokens > 64) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (458752 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[64];
+                }
+                if (num_tokens > 65) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (465920 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[65];
+                }
+                if (num_tokens > 66) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (473088 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[66];
+                }
+                if (num_tokens > 67) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (480256 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[67];
+                }
+                if (num_tokens > 68) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (487424 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[68];
+                }
+                if (num_tokens > 69) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (494592 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[69];
+                }
+                if (num_tokens > 70) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (501760 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[70];
+                }
+                if (num_tokens > 71) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (508928 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[71];
+                }
+                if (num_tokens > 72) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (516096 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[72];
+                }
+                if (num_tokens > 73) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (523264 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[73];
+                }
+                if (num_tokens > 74) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (530432 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[74];
+                }
+                if (num_tokens > 75) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (537600 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[75];
+                }
+                if (num_tokens > 76) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (544768 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[76];
+                }
+                if (num_tokens > 77) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (551936 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[77];
+                }
+                if (num_tokens > 78) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (559104 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[78];
+                }
+                if (num_tokens > 79) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (566272 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[79];
+                }
+                if (num_tokens > 80) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (573440 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[80];
+                }
+                if (num_tokens > 81) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (580608 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[81];
+                }
+                if (num_tokens > 82) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (587776 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[82];
+                }
+                if (num_tokens > 83) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (594944 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[83];
+                }
+                if (num_tokens > 84) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (602112 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[84];
+                }
+                if (num_tokens > 85) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (609280 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[85];
+                }
+                if (num_tokens > 86) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (616448 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[86];
+                }
+                if (num_tokens > 87) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (623616 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[87];
+                }
+                if (num_tokens > 88) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (630784 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[88];
+                }
+                if (num_tokens > 89) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (637952 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[89];
+                }
+                if (num_tokens > 90) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (645120 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[90];
+                }
+                if (num_tokens > 91) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (652288 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[91];
+                }
+                if (num_tokens > 92) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (659456 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[92];
+                }
+                if (num_tokens > 93) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (666624 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[93];
+                }
+                if (num_tokens > 94) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (673792 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[94];
+                }
+                if (num_tokens > 95) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (680960 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[95];
+                }
+                if (num_tokens > 96) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (688128 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[96];
+                }
+                if (num_tokens > 97) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (695296 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[97];
+                }
+                if (num_tokens > 98) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (702464 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[98];
+                }
+                if (num_tokens > 99) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (709632 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[99];
+                }
+                if (num_tokens > 100) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (716800 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[100];
+                }
+                if (num_tokens > 101) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (723968 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[101];
+                }
+                if (num_tokens > 102) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (731136 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[102];
+                }
+                if (num_tokens > 103) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (738304 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[103];
+                }
+                if (num_tokens > 104) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (745472 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[104];
+                }
+                if (num_tokens > 105) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (752640 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[105];
+                }
+                if (num_tokens > 106) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (759808 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[106];
+                }
+                if (num_tokens > 107) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (766976 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[107];
+                }
+                if (num_tokens > 108) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (774144 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[108];
+                }
+                if (num_tokens > 109) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (781312 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[109];
+                }
+                if (num_tokens > 110) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (788480 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[110];
+                }
+                if (num_tokens > 111) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (795648 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[111];
+                }
+                if (num_tokens > 112) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (802816 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[112];
+                }
+                if (num_tokens > 113) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (809984 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[113];
+                }
+                if (num_tokens > 114) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (817152 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[114];
+                }
+                if (num_tokens > 115) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (824320 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[115];
+                }
+                if (num_tokens > 116) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (831488 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[116];
+                }
+                if (num_tokens > 117) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (838656 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[117];
+                }
+                if (num_tokens > 118) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (845824 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[118];
+                }
+                if (num_tokens > 119) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (852992 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[119];
+                }
+                if (num_tokens > 120) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (860160 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[120];
+                }
+                if (num_tokens > 121) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (867328 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[121];
+                }
+                if (num_tokens > 122) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (874496 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[122];
+                }
+                if (num_tokens > 123) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (881664 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[123];
+                }
+                if (num_tokens > 124) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (888832 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[124];
+                }
+                if (num_tokens > 125) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (896000 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[125];
+                }
+                if (num_tokens > 126) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (903168 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[126];
+                }
+                if (num_tokens > 127) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out_l + (910336 + row_l + tid_1)) + (0)) = (__nv_bfloat16)red[127];
+                }
             }
             asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
             asm volatile("barrier.sync 1, 128;" ::: "memory");
             if (warp == 0) {
-                asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(256));
+                asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(512));
             }
         }
     }
@@ -939,7 +1345,7 @@ kernel_cake_kimi_k3_latent_moe_31f72d1c25787de25594(const __grid_constant__ CUte
                     int need_a = ((pro > s) ? 0 : 1);
                     if (m < 96) {
                         int kb2 = m;
-                        tma_3d_gmem2smem(smem_b_addr + stage * 8192, (&B_2), 0, 0, kb2, a_full_addr + (stage) * 8);
+                        tma_3d_gmem2smem(smem_b_addr + stage * 16384, (&B_2), 0, 0, kb2, a_full_addr + (stage) * 8);
                     } else {
                         if (norm_ok == 0) {
                             mbarrier_wait(rows_bar_addr, 0);
@@ -968,7 +1374,7 @@ kernel_cake_kimi_k3_latent_moe_31f72d1c25787de25594(const __grid_constant__ CUte
                             norm_ok = 1;
                         }
                         int kb = k1_off + (m - 96);
-                        tma_3d_gmem2smem(smem_b_addr + stage * 8192, (&B_1), 0, 0, kb, a_full_addr + (stage) * 8);
+                        tma_3d_gmem2smem(smem_b_addr + stage * 16384, (&B_1), 0, 0, kb, a_full_addr + (stage) * 8);
                     }
                     if (need_a == 1) {
                         if (m < 96) {
@@ -987,9 +1393,9 @@ kernel_cake_kimi_k3_latent_moe_31f72d1c25787de25594(const __grid_constant__ CUte
                                    "r"(a_full_addr + (stage) * 8), "l"(0x12F0000000000000ULL) : "memory");
                         }
                     }
-                    mbarrier_arrive_expect_tx(a_full_addr + (stage) * 8, 24576);
+                    mbarrier_arrive_expect_tx(a_full_addr + (stage) * 8, 32768);
                     stage += 1;
-                    if (stage == 8) { stage = 0; _phase_a_empty ^= 1; }
+                    if (stage == 7) { stage = 0; _phase_a_empty ^= 1; }
                 }
             }
         }
@@ -1018,7 +1424,7 @@ kernel_cake_kimi_k3_latent_moe_31f72d1c25787de25594(const __grid_constant__ CUte
                     int init_flag = ((m_1 == 0) ? 1 : 0);
                     int init_sub = init_flag;
                     int _smem_desc_lo_0 = (((smem_a_addr) >> 4) & 0x3FFF) + (stage_1) * 1024;
-                    int _smem_desc_lo_1 = (((smem_b_addr) >> 4) & 0x3FFF) + (stage_1) * 512;
+                    int _smem_desc_lo_1 = (((smem_b_addr) >> 4) & 0x3FFF) + (stage_1) * 1024;
                     asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"
@@ -1030,7 +1436,7 @@ kernel_cake_kimi_k3_latent_moe_31f72d1c25787de25594(const __grid_constant__ CUte
                     ""
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 135267472;\n\t"
+                    "mov.b32 id, 136316048;\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
@@ -1055,7 +1461,7 @@ kernel_cake_kimi_k3_latent_moe_31f72d1c25787de25594(const __grid_constant__ CUte
                     :: "r"(_smem_desc_lo_0), "r"(_smem_desc_lo_1), "r"(tmem_acc), "r"(((init_sub) ? 0 : 1)) : "memory");
                     tcgen05_commit(a_empty_addr + (stage_1) * 8);
                     stage_1 += 1;
-                    if (stage_1 == 8) { stage_1 = 0; _phase_a_full ^= 1; }
+                    if (stage_1 == 7) { stage_1 = 0; _phase_a_full ^= 1; }
                 }
                 tcgen05_commit(acc_full_addr);
             }
