@@ -123,14 +123,7 @@ class Geometry:
 
 GEOMETRIES = (
     Geometry("e512_i512_k10", 2048, 512, 512, 10, (1, 3, 4, 32)),
-    Geometry(
-        "e60_i1536_k4",
-        2048,
-        1536,
-        60,
-        4,
-        (1, 4, 5, 10, 11, 12, 14, 15, 20, 21, 24, 25, 27, 28, 32),
-    ),
+    Geometry("e60_i1536_k4", 2048, 1536, 60, 4, (1, 4, 5, 10, 11, 12, 14, 15, 32)),
     Geometry("e192_i1536_k4_silu", 6144, 1536, 192, 4, (1, 32), SiLU()),
     Geometry(
         "e256_i2048_k6_clamp10",
@@ -143,17 +136,10 @@ GEOMETRIES = (
     ),
     Geometry("e384_i768_k4", 2560, 768, 384, 4, (1, 32)),
     Geometry("e128_i768_k8", 2048, 768, 128, 8, (1, 7, 8, 15, 16, 32)),
-    Geometry("e128_i1536_k8", 4096, 1536, 128, 8, (1, 6, 11, 12, 25, 26, 27, 32)),
-    Geometry(
-        "e256_i512_k8",
-        2048,
-        512,
-        256,
-        8,
-        (1, 15, 16, 18, 20, 21, 22, 23, 24, 26, 27, 28, 32),
-    ),
-    Geometry("e512_i1024_k10", 4096, 1024, 512, 10, (1, 2, 6, 8, 9, 15, 16, 32)),
-    Geometry("e256_i1536_k8", 3072, 1536, 256, 8, (1, 15, 16, 21, 24, 29, 32)),
+    Geometry("e128_i1536_k8", 4096, 1536, 128, 8, (1, 6, 11, 12, 32)),
+    Geometry("e256_i512_k8", 2048, 512, 256, 8, (1, 15, 16, 18, 19, 30, 32)),
+    Geometry("e512_i1024_k10", 4096, 1024, 512, 10, (1, 2, 6, 8, 25, 26, 32)),
+    Geometry("e256_i1536_k8", 3072, 1536, 256, 8, (1, 15, 16, 32)),
     Geometry(
         "e128_i3072_k4_swiglu_oa",
         6144,
@@ -227,8 +213,6 @@ def _selector_bucket(geometry: Geometry, num_tokens: int) -> str:
         return "persistent_direct_padded_sfb"
     if num_tokens == 11:
         return "persistent_e64_scan1_padded_sfb"
-    if num_tokens in (20, 24, 27):
-        return "persistent_general_route_packer"
     return "persistent_fused_route_packer"
 
 

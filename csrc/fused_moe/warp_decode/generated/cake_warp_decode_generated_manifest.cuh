@@ -10533,8 +10533,9 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
            && inv.shape.num_experts == 128 && inv.shape.local_num_experts == 128)
           || (inv.shape.hidden_size == 2048 && inv.shape.intermediate_size == 512
               && inv.shape.num_experts == 256 && inv.shape.local_num_experts == 256));
-  const bool fixed_q397_top_k = (inv.shape.num_tokens >= 9 && inv.shape.num_tokens <= 32)
-      && fc1_kernel == 23
+  // The general-packer FC1 (23) rows from T9 and every fused route-pack FC1 (27) row.
+  const bool fixed_q397_top_k = ((inv.shape.num_tokens >= 9 && inv.shape.num_tokens <= 32 && fc1_kernel == 23)
+          || (inv.shape.num_tokens >= 1 && inv.shape.num_tokens <= 32 && fc1_kernel == 27))
       && schedule.route_layout == warp_decode::RouteLayout::kGpuPacked
       && schedule.finalize_threads == 128 && schedule.finalize_unroll == 4
       && inv.shape.top_k == 10
