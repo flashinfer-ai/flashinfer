@@ -312,28 +312,28 @@ _CONTEXT_PROGRAM_ROUTES: dict[
 # whose record differs fails closed at load.
 _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int, bool]] = {
     ("context_bf16", "Q8192"): (
-        "cake_fmha_context_bf16_40ad2438607d5cb26a81",
+        "cake_fmha_context_bf16_eb5b942877557703876d",
         256,
         False,
     ),
-    ("context_bf16", "B128"): ("cake_fmha_context_bf16_c0c57df0792f14445bcc", 2, False),
+    ("context_bf16", "B128"): ("cake_fmha_context_bf16_31373706c9fcb1a2b1db", 2, False),
     ("context_bf16", "Q511_SM100A"): (
-        "cake_fmha_context_bf16_7a391c24f1bd3cac5168",
+        "cake_fmha_context_bf16_fe2dfd2eb24d75a1bccc",
         11,
         True,
     ),
     ("context_bf16", "Q511_SM103A"): (
-        "cake_fmha_context_bf16_94e3b4da4beb6bd678bd",
+        "cake_fmha_context_bf16_8bd7d679916961178c03",
         11,
         True,
     ),
     ("context_bf16", "Q257_SM100A"): (
-        "cake_fmha_context_bf16_652eb396dd951593fe4a",
+        "cake_fmha_context_bf16_d400e81a0185922f0097",
         6,
         True,
     ),
     ("context_bf16", "Q257_SM103A"): (
-        "cake_fmha_context_bf16_90d7ee85f49d09a3bcca",
+        "cake_fmha_context_bf16_5fa928327be121e0c987",
         6,
         True,
     ),
