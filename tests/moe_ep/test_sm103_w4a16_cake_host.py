@@ -394,6 +394,11 @@ def test_preprocess_weights_refuses_unquantized_and_misshaped_packs() -> None:
 def test_program_identifiers_cover_every_cell_and_h_max() -> None:
     # 4 cells x 2 known hidden sizes (default h_max 6144, the 7168 variant) + 1 combine
     assert len(PROGRAM_IDENTIFIERS) == 2 * len(CELLS) + 1
+    assert cake_plan.program_identifiers(fused_combine=False) == PROGRAM_IDENTIFIERS
+    # The fused combine retires the combine program: eight fused programs remain.
+    fused_only = cake_plan.program_identifiers(fused_combine=True)
+    assert len(fused_only) == 2 * len(CELLS) and COMBINE not in fused_only
+    assert fused_only == PROGRAM_IDENTIFIERS[:-1]
     assert program_identifier(FUSED, Cell(32)) == "FUSED_N32"
     assert program_identifier(FUSED, Cell(32), 6144) == "FUSED_N32"
     assert program_identifier(FUSED, Cell(32), 1024) == "FUSED_N32"
@@ -504,6 +509,79 @@ def test_buffer_tables_follow_the_geometry() -> None:
         assert name.isidentifier()
     assert set(COMBINE_ARGS) - set(FUSED_ARGS) == {"output", "tokens_per_rank"}
     assert tuple(FUSED_ARGS[-3:]) == GRID_ARGS == tuple(COMBINE_ARGS[-3:])
+    assert cake_plan.fused_args(route_tables=False, fused_combine=False) == FUSED_ARGS
+
+
+def test_program_form_switches_shape_the_tables() -> None:
+    # The shipped head: both switches off, the tables as the programs take them.
+    assert (cake_plan.ROUTE_TABLES, cake_plan.FUSED_COMBINE) == (False, False)
+    assert cake_plan.fused_per_forward_args(fused_combine=False) == {
+        "hidden",
+        "topk_ids",
+        "topk_weights",
+    }
+    g = Geometry(8, 3, 256, 6144, 2048, 8, 512, sm_count=148)
+    base = symmetric_buffers(g, route_tables=False, fused_combine=False)
+    assert "route_offs" not in base and "published_ids" in base
+    # Route tables: two banks of the global-expert prefix and of the route entries.
+    tables = symmetric_buffers(g, route_tables=True, fused_combine=False)
+    assert tables["route_offs"] == ((2, 257), torch.int32)
+    assert tables["route_list"] == ((2, 512 * 8), torch.int32)
+    small = Geometry(2, 1, 64, 6144, 2048, 8, 16, sm_count=148)
+    assert symmetric_buffers(small, route_tables=True)["route_offs"] == (
+        (2, 257),
+        torch.int32,
+    )
+    assert "published_ids" in tables and "published_weights" in tables
+    args = cake_plan.fused_args(route_tables=True, fused_combine=False)
+    assert args[-7:] == (
+        "route_offs",
+        "route_offs_peers",
+        "route_list",
+        "route_list_peers",
+        *GRID_ARGS,
+    )
+    assert "output" not in args
+    # Fused combine: the fused program writes the output; the published routing
+    # retires only once the route tables carry it too.
+    assert "output" in cake_plan.fused_args(route_tables=False, fused_combine=True)
+    assert "output" in cake_plan.fused_per_forward_args(fused_combine=True)
+    assert "published_ids" in symmetric_buffers(
+        g, route_tables=False, fused_combine=True
+    )
+    both = symmetric_buffers(g, route_tables=True, fused_combine=True)
+    assert "published_ids" not in both and "published_weights" not in both
+    assert {"route_offs", "route_list", "published_hidden", "published_meta"} < set(
+        both
+    )
+    assert cake_plan.fused_args(route_tables=True, fused_combine=True)[-4:] == (
+        "output",
+        *GRID_ARGS,
+    )
+    # Geometry rules behind the switches: the global expert bound at a world
+    # size above one with route tables; the combine slice rule drops with the
+    # fused combine.
+    common = dict(num_experts=512, hidden=6144, intermediate=2048, top_k=8, capacity=64)
+    cake_plan.validate_geometry(world_size=8, **common, route_tables=False)
+    with pytest.raises(ValueError, match="in total"):
+        cake_plan.validate_geometry(world_size=8, **common, route_tables=True)
+    cake_plan.validate_geometry(
+        world_size=1,
+        num_experts=256,
+        hidden=6144,
+        intermediate=2048,
+        top_k=8,
+        capacity=64,
+        route_tables=True,
+    )
+    narrow = dict(num_experts=256, intermediate=2048, top_k=8, capacity=64)
+    with pytest.raises(ValueError, match="slice"):
+        cake_plan.validate_geometry(
+            world_size=8, hidden=6144 + 256, **narrow, fused_combine=False
+        )
+    cake_plan.validate_geometry(
+        world_size=8, hidden=6144 + 256, **narrow, fused_combine=True
+    )
 
 
 def test_peer_tables_are_capacity_padded_cpu_int64() -> None:
@@ -804,6 +882,63 @@ def test_host_path_zero_tokens_still_launches_both_programs(host_path) -> None:
     assert out.shape == (0, HIDDEN)
     assert table.calls[0][1]["T_r"] == 0
     assert table.calls[1][1]["grid_y"] == ws.capacity > 0
+
+
+def test_host_path_one_launch_under_the_fused_combine_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The fused-combine form: the fused program takes ``output`` as a per-forward
+    # argument, no combine program is loaded or launched, and the caller's
+    # bound-sized output is written in place.
+    monkeypatch.setattr(cake_backend, "FUSED_COMBINE", True)
+    monkeypatch.setattr(
+        cake_backend,
+        "FUSED_PER_FORWARD_ARGS",
+        cake_plan.fused_per_forward_args(fused_combine=True),
+    )
+    fused_args = cake_plan.fused_args(route_tables=True, fused_combine=True)
+    monkeypatch.setitem(SUPPLIED_ARGS, FUSED, fused_args)
+    table = RecordingTable()
+    monkeypatch.setattr(cake_programs, "_programs", table)
+    config = Sm103_Bf16_Nvfp4_Bf16_Cake_MegaMoeConfig(
+        intermediate_size=INTERMEDIATE, gate_up_clamp=7.0
+    )
+    backend = Sm103Bf16Nvfp4Bf16CakeMegaKernelBackend(config)
+    backend.bind_ep_bootstrap(BootstrapConfig(world_size=8, rank=3))
+    ws = _cpu_workspace(backend, world=8, rank=3, capacity=64, experts=EXPERTS)
+    # The route tables of the switched form, allocated as the buffer table spells them.
+    geometry = ws.geometry
+    for name, (shape, dtype) in symmetric_buffers(
+        geometry, route_tables=True, fused_combine=True
+    ).items():
+        if name in ws.symmetric:
+            continue
+        tensor = torch.zeros(shape, dtype=dtype)
+        peers = cake_symmetric.peer_table([tensor.data_ptr()] * 8, world_size=8)
+        ws.symmetric[name] = cake_symmetric.SymmetricBuffer(
+            tensor,
+            peers,
+            cake_symmetric.peer_table_tensor(peers, rank=3),
+            nvshmem=False,
+        )
+    weights = preprocess_sm103_bf16_nvfp4_cake_mega_weights(
+        _canonical(EXPERTS // 8, HIDDEN, INTERMEDIATE),
+        intermediate_size=INTERMEDIATE,
+        hidden_size=HIDDEN,
+    )
+    t = _inputs(16, seed=9)
+    backend.stage_inputs(t, ws, quantize_input=True)
+    output = torch.empty(16, HIDDEN, dtype=torch.bfloat16)
+    out = backend.compute(ws, weights, output=output)
+    assert out.data_ptr() == output.data_ptr()
+    cell = select_cell(ws.capacity, 8, TOP_K, EXPERTS)
+    assert [name for name, _ in table.calls] == [f"FUSED_{cell.suffix}"]
+    fused = table.calls[0][1]
+    assert fused["output"] is output and fused["T_r"] == 16
+    assert fused["route_offs"] is ws.symmetric["route_offs"].local
+    assert fused["route_list_peers"] is ws.symmetric["route_list"].peers
+    assert ws.plans and next(iter(ws.plans.values())).combine is None
+    assert ws.launches == 1
 
 
 def test_host_path_rejects_aliasing_and_requires_staging(host_path) -> None:

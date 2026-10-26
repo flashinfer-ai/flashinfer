@@ -18,8 +18,10 @@ limitations under the License.
 # ``MegaKernelBackend`` over two Cake programs, the fused dispatch + FC1 +
 # SwiGLU + FC2 + return program and the PDL-chained combine program.
 #
-# One forward is exactly two launches on the current torch stream; the host
-# never synchronizes, never memsets and never allocates in the forward path.
+# One forward is one launch per program of the route on the current torch
+# stream (the fused program, then the combine program unless the combine is
+# fused into the tail); the host never synchronizes, never memsets and never
+# allocates in the forward path.
 # Every counter the programs use is device-resident and zeroed once at
 # allocation: the fused program resets its intra-rank barrier words at its
 # tail and increments the launch epoch, the completion counters are
@@ -61,6 +63,7 @@ from .cake_plan import (
     COMBINE,
     COMBINE_PER_FORWARD_ARGS,
     FUSED,
+    FUSED_COMBINE,
     FUSED_PER_FORWARD_ARGS,
     GRID_ARGS,
     HIDDEN_ALIGN,
@@ -120,14 +123,15 @@ class StagedInputs:
 
 @dataclass
 class LaunchPlan:
-    """The positional calls of one (workspace, weights, token bound, cell)."""
+    """The positional calls of one (workspace, weights, token bound, cell);
+    ``combine`` is ``None`` when the combine is fused into the tail."""
 
     cell: Cell
     bound: int
     fused: ProgramHandle
     fused_values: List[Any]
     fused_dynamic: Dict[str, int]
-    combine: ProgramHandle
+    combine: Optional[ProgramHandle]
     combine_values: List[Any]
     combine_dynamic: Dict[str, int]
     weights: Any  # the TransformedCakeW4a16MegaWeights the plan binds
@@ -499,7 +503,8 @@ class Sm103Bf16Nvfp4Bf16CakeMegaKernelBackend(MegaKernelBackend):
         # The programs load here (not at the first forward) and the fused grid
         # is agreed across the ranks before any buffer exists.
         fused_grids = self._collective_fused_grids(geometry, device, group)
-        combine_handle(geometry.hidden, device)
+        if not FUSED_COMBINE:
+            combine_handle(geometry.hidden, device)
         symmetric = {
             name: allocate_symmetric(
                 shape, dtype, device=device, world_size=world, rank=rank
@@ -696,9 +701,9 @@ class Sm103Bf16Nvfp4Bf16CakeMegaKernelBackend(MegaKernelBackend):
         *,
         output: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Two launches on the current stream (the fused program, then the
-        combine program with programmatic stream serialization); no host
-        sync, no host memset, no allocation.
+        """The fused program, then (unless the combine is fused into its
+        tail) the combine program with programmatic stream serialization, on
+        the current stream; no host sync, no host memset, no allocation.
 
         ``output=None`` returns a view of the workspace output (valid under
         stream ordering until the next launch on this workspace). A caller
@@ -733,7 +738,8 @@ class Sm103Bf16Nvfp4Bf16CakeMegaKernelBackend(MegaKernelBackend):
             combine_values[index] = self._dynamic(name, staged, target)
         with _device_scope(ws.device), ws.use_torch_stream():
             plan.fused.launch(*fused_values)
-            plan.combine.launch(*combine_values)
+            if plan.combine is not None:
+                plan.combine.launch(*combine_values)
         ws.launches += 1
         if self._autotune_winner is None:
             self._autotune_winner = plan.cell.as_knobs()
@@ -845,7 +851,7 @@ class Sm103Bf16Nvfp4Bf16CakeMegaKernelBackend(MegaKernelBackend):
         except ValueError as error:
             raise MoEEpConfigError(str(error)) from error
         fused = fused_handle(cell, g.hidden, ws.device)
-        combine = combine_handle(g.hidden, ws.device)
+        combine = None if FUSED_COMBINE else combine_handle(g.hidden, ws.device)
         values = self._values(ws, tw, bound, cell)
         grid = ws.fused_grids.get(cell.suffix)
         if grid is None:
@@ -861,14 +867,17 @@ class Sm103Bf16Nvfp4Bf16CakeMegaKernelBackend(MegaKernelBackend):
         # The combine program: its ``hidden`` is the i32 hidden size and its grid
         # covers the capacity (CTAs at or past the live count exit), so the
         # launch is identical for every token bound.
-        combine_table = dict(values)
-        combine_table["hidden"] = g.hidden
-        combine_table.update(
-            zip(GRID_ARGS, combine_grid(g.capacity, g.hidden), strict=True)
-        )
-        combine_values, combine_dynamic = self._positional(
-            combine, combine_table, COMBINE_PER_FORWARD_ARGS
-        )
+        combine_values: List[Any] = []
+        combine_dynamic: Dict[str, int] = {}
+        if combine is not None:
+            combine_table = dict(values)
+            combine_table["hidden"] = g.hidden
+            combine_table.update(
+                zip(GRID_ARGS, combine_grid(g.capacity, g.hidden), strict=True)
+            )
+            combine_values, combine_dynamic = self._positional(
+                combine, combine_table, COMBINE_PER_FORWARD_ARGS
+            )
         plan = LaunchPlan(
             cell=cell,
             bound=bound,

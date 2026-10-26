@@ -109,6 +109,19 @@ FUSED_H_LIMIT = 8192
 #: are served by the same programs or by their ``h_max`` variants).
 KNOWN_HIDDEN_SIZES = (6144, 7168)
 
+#: Program-form switches of the route; the host and the programs they describe
+#: land together, so each is flipped once with its programs. ``ROUTE_TABLES``:
+#: at a world size above one the fused program publishes its own routes as the
+#: owner-side route tables (``route_offs`` / ``route_list``, symmetric, banked
+#: by the launch parity) and derives the placement from the peers' tables; the
+#: global expert count is then bounded by :data:`MAX_TOTAL_EXPERTS_ROUTE_TABLES`.
+#: ``FUSED_COMBINE``: the fused program sums the route terms into the output in
+#: its tail; the combine program is not shipped, a forward is one launch and
+#: the hidden size no longer has to be a multiple of the combine slice.
+ROUTE_TABLES = False
+FUSED_COMBINE = False
+MAX_TOTAL_EXPERTS_ROUTE_TABLES = 256
+
 # Program identifiers: the fused program per (cell, h_max variant), one combine
 # program (world size and hidden size are run-time arguments of both).
 FUSED = "FUSED"
@@ -260,6 +273,8 @@ def validate_geometry(
     intermediate: int,
     top_k: int,
     capacity: int,
+    route_tables: bool = ROUTE_TABLES,
+    fused_combine: bool = FUSED_COMBINE,
 ) -> None:
     """Raise ``ValueError`` naming the first rule a geometry breaks."""
 
@@ -288,9 +303,17 @@ def validate_geometry(
             f"{INTERMEDIATE_ALIGN}",
         ),
         (
-            hidden % COMBINE_HIDDEN_PER_CTA == 0,
+            fused_combine or hidden % COMBINE_HIDDEN_PER_CTA == 0,
             f"token_hidden_size ({hidden}) must be a multiple of the combine program's "
             f"{COMBINE_HIDDEN_PER_CTA}-column slice",
+        ),
+        (
+            not route_tables
+            or world_size == 1
+            or num_experts <= MAX_TOTAL_EXPERTS_ROUTE_TABLES,
+            f"at most {MAX_TOTAL_EXPERTS_ROUTE_TABLES} experts in total at an EP world "
+            f"size above one (the route tables span the global experts), got "
+            f"{num_experts}",
         ),
         (
             hidden <= FUSED_H_LIMIT,
@@ -354,9 +377,18 @@ class Geometry:
 
 # Symmetric (peer-mapped) buffers: name -> (shape, dtype). Each is bound to the
 # programs as ``<name>`` (the local tensor) and ``<name>_peers`` (its
-# peer-address table). Allocated zeroed; the host never writes them.
-def symmetric_buffers(g: Geometry) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
-    return {
+# peer-address table). Allocated zeroed; the host never writes them. The route
+# tables are two banks (the launch parity selects one) of the owner's exclusive
+# per-global-expert route prefix and of its ``token * 8 + slot`` route entries;
+# the published ids and weights have no reader once the route tables carry the
+# routing and the combine is fused.
+def symmetric_buffers(
+    g: Geometry,
+    *,
+    route_tables: bool = ROUTE_TABLES,
+    fused_combine: bool = FUSED_COMBINE,
+) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+    buffers: dict[str, tuple[tuple[int, ...], torch.dtype]] = {
         "published_hidden": ((g.capacity, g.hidden), torch.bfloat16),
         "published_ids": ((g.capacity, g.top_k), torch.int32),
         "published_weights": ((g.capacity, g.top_k), torch.float32),
@@ -364,6 +396,25 @@ def symmetric_buffers(g: Geometry) -> dict[str, tuple[tuple[int, ...], torch.dty
         "route_terms": ((g.capacity, g.top_k, g.hidden), torch.bfloat16),
         "completion": ((COMPLETION_WORDS,), torch.uint32),
     }
+    if route_tables:
+        buffers["route_offs"] = (
+            (ROUTE_TABLE_BANKS, MAX_TOTAL_EXPERTS_ROUTE_TABLES + 1),
+            torch.int32,
+        )
+        buffers["route_list"] = (
+            (ROUTE_TABLE_BANKS, g.capacity * g.top_k),
+            torch.int32,
+        )
+        if fused_combine:
+            del buffers["published_ids"], buffers["published_weights"]
+    return buffers
+
+
+#: The two banks of the route tables: a launch writes the bank of its own parity
+#: and a peer still reading the other bank is never overtaken. ``route_offs``
+#: holds the fixed 257 words of the largest global expert count per bank (the
+#: programs read ``num_experts + 1`` of them), so its stride is world-independent.
+ROUTE_TABLE_BANKS = 2
 
 
 # Rank-local buffers: name -> (shape, dtype). The pool, the handoff and the
@@ -401,8 +452,24 @@ def local_buffers(g: Geometry) -> dict[str, tuple[tuple[int, ...], torch.dtype]]
 # Argument names this host supplies to the fused program (any subset, any
 # order): the caller's rows, the canonical weights (TMA descriptors encoded by
 # the binding from the tensors), the local buffers, every symmetric buffer as
-# ``<name>`` + ``<name>_peers``, the process group, and the scalars.
-FUSED_ARGS: Tuple[str, ...] = (
+# ``<name>`` + ``<name>_peers``, the process group, the scalars, and -- under
+# the program-form switches -- the route tables and the output.
+def fused_args(
+    *, route_tables: bool = ROUTE_TABLES, fused_combine: bool = FUSED_COMBINE
+) -> Tuple[str, ...]:
+    return (
+        *FUSED_BASE_ARGS[: -len(GRID_ARGS)],
+        *(
+            ("route_offs", "route_offs_peers", "route_list", "route_list_peers")
+            if route_tables
+            else ()
+        ),
+        *(("output",) if fused_combine else ()),
+        *GRID_ARGS,
+    )
+
+
+FUSED_BASE_ARGS: Tuple[str, ...] = (
     "hidden",
     "topk_ids",
     "topk_weights",
@@ -455,6 +522,7 @@ FUSED_ARGS: Tuple[str, ...] = (
     "fc2_m_div",
     *GRID_ARGS,
 )
+FUSED_ARGS: Tuple[str, ...] = fused_args()
 
 # Argument names this host supplies to the combine program (``tokens_per_rank``
 # is the rank's ``published_meta`` buffer: word 0 holds the live token count the
@@ -492,10 +560,19 @@ SUPPLIED_ARGS = {FUSED: FUSED_ARGS, COMBINE: COMBINE_ARGS}
 #: the output); every other argument of a launch is fixed per (workspace,
 #: weights, token bound).
 PER_FORWARD_ARGS = frozenset({"hidden", "topk_ids", "topk_weights", "output"})
-#: ... per program: the fused program reads the activations and routing; the
-#: combine program reads the routing and writes the output (its ``hidden`` is the
-#: i32 hidden size, a plan constant).
-FUSED_PER_FORWARD_ARGS = frozenset({"hidden", "topk_ids", "topk_weights"})
+
+
+#: ... per program: the fused program reads the activations and routing (and
+#: writes the output when the combine is fused); the combine program reads the
+#: routing and writes the output (its ``hidden`` is the i32 hidden size, a plan
+#: constant).
+def fused_per_forward_args(*, fused_combine: bool = FUSED_COMBINE) -> frozenset:
+    return frozenset(
+        {"hidden", "topk_ids", "topk_weights", *(("output",) if fused_combine else ())}
+    )
+
+
+FUSED_PER_FORWARD_ARGS = fused_per_forward_args()
 COMBINE_PER_FORWARD_ARGS = frozenset({"topk_ids", "topk_weights", "output"})
 
 
@@ -522,13 +599,19 @@ def program_identifier(
     return f"{FUSED}_{cell.suffix}{suffix}"
 
 
-#: Loader identifier of every shipped program.
-PROGRAM_IDENTIFIERS: Tuple[str, ...] = tuple(
-    dict.fromkeys(
-        [program_identifier(FUSED, c, h) for h in KNOWN_HIDDEN_SIZES for c in CELLS]
-        + [program_identifier(COMBINE)]
+#: Loader identifier of every shipped program: the fused program of every cell
+#: at every known pull-slot row, then the combine program unless the combine is
+#: fused into the tail.
+def program_identifiers(*, fused_combine: bool = FUSED_COMBINE) -> Tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            [program_identifier(FUSED, c, h) for h in KNOWN_HIDDEN_SIZES for c in CELLS]
+            + ([] if fused_combine else [program_identifier(COMBINE)])
+        )
     )
-)
+
+
+PROGRAM_IDENTIFIERS: Tuple[str, ...] = program_identifiers()
 
 __all__ = [
     "CELLS",
@@ -546,6 +629,8 @@ __all__ = [
     "FP4_PER_BYTE",
     "FUSED",
     "FUSED_ARGS",
+    "FUSED_BASE_ARGS",
+    "FUSED_COMBINE",
     "FUSED_H_LIMIT",
     "FUSED_H_STEP",
     "FUSED_PER_FORWARD_ARGS",
@@ -559,12 +644,15 @@ __all__ = [
     "KERNEL_NAME",
     "MAX_CTAS_PER_SM",
     "MAX_LOCAL_EXPERTS",
+    "MAX_TOTAL_EXPERTS_ROUTE_TABLES",
     "PEER_TABLE_CAPACITY",
     "PER_FORWARD_ARGS",
     "PG_FLAG_WORDS",
     "PROCESS_GROUP",
     "PROGRAM_IDENTIFIERS",
     "PUBLISHED_META_WORDS",
+    "ROUTE_TABLES",
+    "ROUTE_TABLE_BANKS",
     "SCALE_BLOCK",
     "SELECTABLE_CELLS",
     "SUPPLIED_ARGS",
@@ -576,10 +664,13 @@ __all__ = [
     "Geometry",
     "cell_from_knobs",
     "combine_grid",
+    "fused_args",
+    "fused_per_forward_args",
     "local_buffers",
     "max_tiles",
     "pool_rows",
     "program_identifier",
+    "program_identifiers",
     "select_cell",
     "symmetric_buffers",
     "validate_geometry",
