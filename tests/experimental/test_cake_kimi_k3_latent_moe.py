@@ -418,6 +418,33 @@ COVERAGE_TOKENS = tuple(range(1, 1025)) + tuple(range(1025, 16385, 97)) + (16384
 COVERAGE_PARTIALS = (1, 2, 4)
 
 
+def _reached_programs(sm_count):
+    """The registered programs the routes of the public contract select on ``sm_count`` SMs."""
+    keys = set()
+    for stage in ("front", "tail"):
+        for tp in SUPPORTED_TP:
+            for tokens in COVERAGE_TOKENS:
+                keys.update(route_kernel_keys(stage, tp, tokens, sm_count))
+    for tp in SUPPORTED_TP:
+        for num_partials in COVERAGE_PARTIALS:
+            for tokens in (
+                *range(1, DECODE_MAX_T + 1),
+                129,
+                300,
+                511,
+                512,
+                1024,
+                2047,
+                2048,
+                4096,
+                16384,
+            ):
+                keys.update(
+                    route_kernel_keys("tail", tp, tokens, sm_count, num_partials)
+                )
+    return {KERNELS[key] for key in keys if key in KERNELS}
+
+
 @pytest.mark.parametrize("sm_count", QUALIFIED_SM_COUNTS)
 def test_route_keys_are_registered_for_every_token_count(sm_count):
     """Every route of the public contract resolves to a registered program on every qualified SM
@@ -463,9 +490,13 @@ def test_route_keys_are_registered_for_every_token_count(sm_count):
                         f"tail tp{tp} T={tokens} P={num_partials} on {sm_count} SMs: {key}"
                     )
                     reached.add(KERNELS[key])
-    # Every registered program is reachable, serves every registered architecture once and carries
-    # a complete launch contract.
-    assert reached == set(MODULES)
+    # Every registered program is reachable on some qualified SM count (on 152 SMs the TP1 tail rows of
+    # 129..512 tokens take the 192-wide instance, so the 256-wide ring-6 / ring-7 program serves 148 SMs
+    # only), serves every registered architecture once and carries a complete launch contract.
+    assert reached <= set(MODULES)
+    assert set().union(
+        *(_reached_programs(count) for count in QUALIFIED_SM_COUNTS)
+    ) == set(MODULES)
     for name, record in MODULES.items():
         assert tuple(record["arches"]) == arches, name
         assert len(record["sources"]) == 2 and record["ffi_entry"] == "run"
@@ -522,12 +553,67 @@ def test_plans_follow_the_device_sm_count():
             same_tail = route_kernel_keys("tail", tp, tokens, 148) == route_kernel_keys(
                 "tail", tp, tokens, 152
             )
-            # The 256 x 512 tail tile starts at 4096 TP1 tokens on 152 SMs, at 8192 on 148; the 128-wide TP8 tile
-            # serves T=1024 on 152 SMs only.
+            # The 256 x 512 tail tile starts at 4096 TP1 tokens on 152 SMs, at 8192 on 148; the TP1 rows of
+            # 129..512 tokens take the 192-wide tile on 152 SMs, and the 128-wide TP8 tile serves T=1024 on
+            # 152 SMs only.
             assert same_tail == (
-                not (tp == 1 and 4096 <= tokens < 8192)
+                not (
+                    tp == 1 and (4096 <= tokens < 8192 or DECODE_MAX_T < tokens <= 512)
+                )
                 and not (tp == 8 and tokens == 1024)
             )
+
+
+def test_tail_n192_rule_on_152_sms():
+    """152-SM parts (GB200 / GB300) run the TP1 tail rows of 129..512 tokens on the 192-wide pair tile with
+    an 8-deep ring: 38 column tiles (the last one 64 columns wide), so every one of the 76 resident clusters
+    takes one item (one pair row cuts its 38 tiles into two K halves); 148-SM parts keep the 256-wide tile."""
+    one_row = dict(
+        cluster_tiles=38,
+        sk_tiles=38,
+        full_items=0,
+        num_items=76,
+        sk_ipc=76,
+        sk_max_seg=2,
+    )
+    two_rows = dict(
+        cluster_tiles=76,
+        sk_tiles=0,
+        full_items=76,
+        num_items=76,
+        sk_ipc=152,
+        sk_max_seg=1,
+    )
+    for tokens, expect in (
+        (129, one_row),
+        (256, one_row),
+        (300, two_rows),
+        (511, two_rows),
+        (512, two_rows),
+    ):
+        for num_partials in (1, 3, 8):
+            plan = prefill_tail_plan(tokens, 1, 152, num_partials)
+            assert (plan["num_stages"], plan["block_n"], plan["n_tiles"]) == (
+                8,
+                192,
+                38,
+            )
+            assert {k: plan[k] for k in expect} == expect, tokens
+            assert (
+                plan["gemm_grid"] == 152
+                and plan["fused_norm"]
+                and not plan["claim_items"]
+            )
+            assert plan["weights_evict_first"] and plan["final_ts"]
+            assert route_kernel_keys("tail", 1, tokens, 152, num_partials) == (
+                "tail_gemm:tp1e1f1s8n192t1",
+            )
+            assert prefill_tail_plan(tokens, 1, 148, num_partials)["block_n"] == 256
+    for tokens in (128, 513, 1024):
+        assert prefill_tail_plan(tokens, 1, 152)["block_n"] == 256
+        assert "n192" not in "".join(route_kernel_keys("tail", 1, tokens, 152))
+    for tokens in (129, 256, 512):
+        assert prefill_tail_plan(tokens, 8, 152)["block_n"] != 192
 
 
 def test_generated_program_available_follows_partials_and_sm_count(monkeypatch):
@@ -611,7 +697,8 @@ def test_route_rules_select_the_expected_programs():
 def test_tp1_tail_prefill_routes():
     """TP1 prefill tails past the single-wave fused norm run one claimed launch on the resident grid
     (one CTA pair per resident cluster, default weight L2 policy); the 256 x 512 pair tile starts
-    at 4096 tokens on 152 SMs and at 8192 on 148."""
+    at 4096 tokens on 152 SMs and at 8192 on 148; the single-wave rows take the 192-wide pair tile on
+    152 SMs."""
     assert cb.tail_wide_min_tokens(152) == 4096 and cb.tail_wide_min_tokens(148) == 8192
     for sm_count in QUALIFIED_SM_COUNTS:
         wide = cb.tail_wide_min_tokens(sm_count)
@@ -619,7 +706,8 @@ def test_tp1_tail_prefill_routes():
             plan = prefill_tail_plan(tokens, 1, sm_count)
             claimed = tokens > 512
             assert plan["fused_norm"] and plan["claim_items"] == claimed
-            assert plan["block_n"] == (512 if tokens >= wide else 256)
+            n192 = sm_count == 152 and not claimed
+            assert plan["block_n"] == (512 if tokens >= wide else 192 if n192 else 256)
             assert len(route_kernel_keys("tail", 1, tokens, sm_count)) == 1
             if claimed:
                 assert not plan["weights_evict_first"]

@@ -781,6 +781,17 @@ def tail_n128_tokens(sm_count: int = SM_COUNT) -> tuple[int, ...]:
 TAIL_FINAL_TS = True
 
 
+# Round-4 lever T1F: on 152-SM parts the TP1 rows of more than 128 and at most 512 tokens (the single-wave fused rows)
+# run the 192-wide pair tile with an 8-deep ring: 38 column tiles (the last one 64 columns wide) give 76 pair tiles at
+# two pair rows, one per cluster, where the 256-wide tile fills 56 of the 76 clusters; one pair row cuts its 38 tiles
+# into two K halves (76 items).  The same K order and accumulation as the 256-wide tile, so ``out`` is bit-identical.
+TAIL_N192_TP = 1
+TAIL_N192_MAX_T = 512
+TAIL_N192_SM_COUNT = 152
+TAIL_N192_STAGES = 8
+TAIL_N192_BLOCK_N = 192
+
+
 # TP1 prefill rows from ``tail_wide_min_tokens(sm_count)`` tokens run the 256 x 512 pair tile (a 4-stage ring,
 # single-buffered TMEM): a third fewer operand bytes per FLOP through L2 and shared memory, which the power-capped large
 # rows turn into time; below it the 512-wide items quantise into too few waves (2048 tokens: 112 items over 76 clusters).
@@ -802,6 +813,12 @@ def tail_gemm_config(
 ) -> tuple[int, int, bool]:
     """``(num_stages, block_n, final_ts)`` of the production prefill tail GEMM instance for ``M`` tokens at ``tp`` on a
     ``sm_count``-SM device."""
+    if (
+        int(tp) == TAIL_N192_TP
+        and DECODE_MAX_T < int(M) <= TAIL_N192_MAX_T
+        and int(sm_count) == TAIL_N192_SM_COUNT
+    ):
+        return TAIL_N192_STAGES, TAIL_N192_BLOCK_N, TAIL_FINAL_TS
     if int(tp) == TAIL_RING6_TP and int(M) <= TAIL_RING6_MAX_T:
         return TAIL_RING6_STAGES, BLOCK_N, TAIL_FINAL_TS
     if int(tp) == TAIL_WIDE_TP and int(M) >= tail_wide_min_tokens(sm_count):
@@ -978,7 +995,7 @@ def prefill_tail_plan(
     norm_grid = (M + NORM_ROWS_PER_CTA - 1) // NORM_ROWS_PER_CTA
     m_tiles = m_tiles_for(M)
     num_stages, block_n, final_ts = tail_gemm_config(M, tp, sm_count)
-    n_tiles = HIDDEN // block_n
+    n_tiles = (HIDDEN + block_n - 1) // block_n
     cluster_tiles = (m_tiles // CTA_GROUP) * n_tiles
     num_k = (k_up + i_local) // BLOCK_K
     sk = split_plan(cluster_tiles, num_k, sm_count, min(GROUP_M, m_tiles) // CTA_GROUP)
