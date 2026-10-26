@@ -65,7 +65,7 @@ def _run_blackwell_genphase_graph(rank, world, capacity, early, tile_n, cluster_
         intermediate=intermediate,
         rank=rank,
         world_size=world,
-        apply_topk_at_fc1=early,
+        apply_routing_weights_before_fc2=early,
         mma_tiler_mnk=(256, tile_n, 128),
         cluster_shape_mn=(cluster_m, 1),
     )
@@ -397,7 +397,7 @@ def _torch_nvfp4_mega_reference(
     fc2_alpha=None,  # (E,) fp32 per-expert or None (identity)
     fc1_norm_const=None,  # (E,) fp32 per-expert or None (1.0)
 ):
-    """Pure-torch NVFP4 MegaMoE oracle (apply_topk_in_fc1=True graph).
+    """Pure-torch NVFP4 MegaMoE oracle (routing weights applied before FC2).
 
     Mirrors the kernel's data path — dequant → fp32 fc1 GEMM → 16-interleaved
     gated activation → per-token topk weight folded in BEFORE the fc1-out
@@ -482,7 +482,7 @@ def _torch_nvfp4_mega_reference(
             up = up + beta
         activated = (gate * up).reshape(m, intermediate)
 
-        # apply_topk_in_fc1=True: weight folded in before the fp4 round-trip
+        # Weight folded in before the fp4 round-trip.
         # (post-hoc weighting would NOT match — quant changes the magnitude).
         activated = activated * topk_weights[tokens, slots].unsqueeze(-1)
 
@@ -617,17 +617,25 @@ def test_nvfp4_preprocess_fp4_weights_match_plain_quant(
 
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
-    "mode,tile_n,in_kernel_fc2_reduce,token_back_mode,apply_topk_in_fc1",
+    "mode,tile_n,in_kernel_fc2_reduce,token_back_mode,apply_routing_weights_before_fc2",
     [
-        (mode, 128, False, token_back_mode, apply_topk_in_fc1)
+        (mode, 128, False, token_back_mode, apply_routing_weights_before_fc2)
         for mode in NVFP4_MODES
         for token_back_mode in ("epi_warps", "reuse_dispatch_warps")
-        for apply_topk_in_fc1 in ([False, True] if mode == "w4a16" else [False])
+        for apply_routing_weights_before_fc2 in (
+            [False, True] if mode == "w4a16" else [False]
+        )
     ]
     + [
-        ("w4a16", tile_n, True, "reuse_dispatch_warps", apply_topk_in_fc1)
+        (
+            "w4a16",
+            tile_n,
+            True,
+            "reuse_dispatch_warps",
+            apply_routing_weights_before_fc2,
+        )
         for tile_n in (64, 128)
-        for apply_topk_in_fc1 in (False, True)
+        for apply_routing_weights_before_fc2 in (False, True)
     ],
 )
 @pytest.mark.parametrize(
@@ -647,7 +655,7 @@ def test_nvfp4_kernel_matches_torch_reference(
     tile_n,
     in_kernel_fc2_reduce,
     token_back_mode,
-    apply_topk_in_fc1,
+    apply_routing_weights_before_fc2,
     hidden,
     intermediate,
     num_experts,
@@ -660,7 +668,7 @@ def test_nvfp4_kernel_matches_torch_reference(
         tile_n=tile_n,
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         token_back_mode=token_back_mode,
-        apply_topk_in_fc1=apply_topk_in_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         hidden=hidden,
         intermediate=intermediate,
         num_experts=num_experts,
@@ -679,7 +687,7 @@ def test_nvfp4_w4a4_swiglu_parameters(monkeypatch, token_back_mode, activation_c
         tile_n=128,
         in_kernel_fc2_reduce=False,
         token_back_mode=token_back_mode,
-        apply_topk_in_fc1=False,
+        apply_routing_weights_before_fc2=False,
         hidden=2048,
         intermediate=1024,
         num_experts=4,
@@ -707,7 +715,7 @@ def test_nvfp4_w4a4_situ_parameters(
         tile_n=128,
         in_kernel_fc2_reduce=False,
         token_back_mode=token_back_mode,
-        apply_topk_in_fc1=False,
+        apply_routing_weights_before_fc2=False,
         hidden=hidden,
         intermediate=intermediate,
         num_experts=num_experts,
@@ -725,7 +733,7 @@ def _check_nvfp4_kernel_matches_torch_reference(
     tile_n,
     in_kernel_fc2_reduce,
     token_back_mode,
-    apply_topk_in_fc1,
+    apply_routing_weights_before_fc2,
     hidden,
     intermediate,
     num_experts,
@@ -847,7 +855,7 @@ def _check_nvfp4_kernel_matches_torch_reference(
         fc2_alpha=alpha2,
         knobs=knobs,
         **(
-            {"apply_topk_in_fc1": apply_topk_in_fc1}
+            {"apply_routing_weights_before_fc2": (apply_routing_weights_before_fc2)}
             if mode == "w4a16"
             else dict(
                 swiglu_alpha=activation_pairs[0][0],
@@ -902,7 +910,7 @@ def _check_nvfp4_kernel_matches_torch_reference(
                     mode=mode,
                     fc1_alpha=alpha1,
                     fc2_alpha=alpha2,
-                    apply_topk_in_fc1=apply_topk_in_fc1,
+                    apply_routing_weights_before_fc2=(apply_routing_weights_before_fc2),
                     in_kernel_fc2_reduce=in_kernel_fc2_reduce,
                 )
 
@@ -997,7 +1005,7 @@ def _nvfp4_reference_from_weights(
     fc1_alpha=None,
     fc2_alpha=None,
     fc1_norm_const=None,
-    apply_topk_in_fc1=False,
+    apply_routing_weights_before_fc2=False,
     in_kernel_fc2_reduce=False,
 ):
     """Shared oracle input assembly from canonical prequantized weight packs."""
@@ -1014,12 +1022,12 @@ def _nvfp4_reference_from_weights(
             fc1_alpha=fc1_alpha,
             fc2_alpha=fc2_alpha,
             fc1_norm_const=fc1_norm_const,
-            apply_topk_in_fc1=apply_topk_in_fc1,
+            apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
             in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         )
     assert mode == "w4a4"
     assert fc1_alpha is None and fc2_alpha is None and fc1_norm_const is None
-    assert not apply_topk_in_fc1
+    assert not apply_routing_weights_before_fc2
     import torch
     from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.weights import (
         _interleave_gate_up_16,

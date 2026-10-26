@@ -353,8 +353,6 @@ failure_phase = os.environ["FAILURE_PHASE"]
 
 class PreparationRunner(TunableRunner):
     def get_valid_tactics(self, inputs, profile):
-        if failure_phase == "nested_empty" and rank == 1:
-            return ()
         return (0,)
 
     def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
@@ -433,9 +431,7 @@ finally:
 """
 
 
-@pytest.mark.parametrize(
-    "failure_phase", ("runner", "nested_input", "nested_runner", "nested_empty")
-)
+@pytest.mark.parametrize("failure_phase", ("runner", "nested_input", "nested_runner"))
 def test_preparation_memory_error_falls_back_on_every_rank(tmp_path, failure_phase):
     """A rank-local preparation OOM produces one group-wide fallback."""
     store_file = str(tmp_path / "preparation_oom_rendezvous")

@@ -75,13 +75,15 @@ def _key(config, device: str | None = None) -> dict:
 
 def _read(path: str) -> dict:
     """Read a supported cache document, treating a missing file as an empty cache."""
+    from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
+
     try:
         data = json.loads(Path(path).read_text())
     except FileNotFoundError:
-        return dict(version=1, entries=[])
+        return dict(version=KNOB_CACHE_VERSION, entries=[])
     if (
         not isinstance(data, dict)
-        or data.get("version") != 1
+        or data.get("version") != KNOB_CACHE_VERSION
         or not isinstance(data.get("entries"), list)
     ):
         raise ValueError("unsupported MoE EP knob-cache format")

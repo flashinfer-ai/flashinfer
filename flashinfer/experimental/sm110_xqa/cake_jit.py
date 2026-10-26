@@ -62,8 +62,6 @@ from __future__ import annotations
 import functools
 from typing import Any
 
-import tvm_ffi
-
 from . import cake_build
 
 # One verified build: Thor (``sm_110a``, compute capability 11.0), compiled with
@@ -167,10 +165,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_e0c11de68d1a1979c37d",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 2, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_e0c11de68d1a1979c37d",
@@ -226,10 +222,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_3fd7814f14b6b9a649e9",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_3fd7814f14b6b9a649e9",
@@ -285,10 +279,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_933f8471a4352df91b02",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 2, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_933f8471a4352df91b02",
@@ -344,10 +336,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_d3ccea4cb37103cd793d",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_d3ccea4cb37103cd793d",
@@ -403,10 +393,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_09a5cd2e68fb4fbe4ec9",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 2, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 232448,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_09a5cd2e68fb4fbe4ec9",
@@ -462,10 +450,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_c125edcdfd2ee8711a1c",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_c125edcdfd2ee8711a1c",
@@ -521,10 +507,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_c249f2f90a880237faa3",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 2, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_c249f2f90a880237faa3",
@@ -580,10 +564,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_db8e3cba5b5bb4e2a1ea",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_db8e3cba5b5bb4e2a1ea",
@@ -640,10 +622,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_84d72c1be819435dc9f3",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 2, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_84d72c1be819435dc9f3",
@@ -701,10 +681,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_77c81b13f3cc376f40b9",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_77c81b13f3cc376f40b9",
@@ -762,10 +740,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_2a8b9b1ced9732764bad",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 2, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_2a8b9b1ced9732764bad",
@@ -823,10 +799,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_e2285229da0b524a9dba",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_e2285229da0b524a9dba",
@@ -884,10 +858,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_a4f5ce3e09448c9c190a",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 2, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 232448,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_a4f5ce3e09448c9c190a",
@@ -945,10 +917,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_b0b61c8565cb237fd6ac",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_b0b61c8565cb237fd6ac",
@@ -1006,10 +976,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_7539524656d265147345",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 2, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_7539524656d265147345",
@@ -1067,10 +1035,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_fcbb8ff35135d38e4349",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_fcbb8ff35135d38e4349",
@@ -1127,10 +1093,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_a0477cc0db5f386f93ae",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 2, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_a0477cc0db5f386f93ae",
@@ -1186,10 +1150,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_3c833a88f3bcfecfe6ba",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_3c833a88f3bcfecfe6ba",
@@ -1245,10 +1207,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_08dd67d3d551a02e0836",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 2, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_08dd67d3d551a02e0836",
@@ -1304,10 +1264,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_38e7e57be0f40620775a",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_38e7e57be0f40620775a",
@@ -1363,10 +1321,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_cde5de73f34f0ec3a8bb",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 2, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_cde5de73f34f0ec3a8bb",
@@ -1422,10 +1378,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_566f4afdf1aff7f72617",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_566f4afdf1aff7f72617",
@@ -1481,10 +1435,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_f56c7fd76663571bad8d",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 2, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_f56c7fd76663571bad8d",
@@ -1540,10 +1492,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_64d69075db92ba0be7c1",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_64d69075db92ba0be7c1",
@@ -1600,10 +1550,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_acab6362b4b7a78e80dd",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 2, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_acab6362b4b7a78e80dd",
@@ -1661,10 +1609,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_793e3a241432db50d8b2",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_793e3a241432db50d8b2",
@@ -1722,10 +1668,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_6476068456210ea358ed",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 2, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_6476068456210ea358ed",
@@ -1783,10 +1727,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_2e94f2b5255b56644f61",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_2e94f2b5255b56644f61",
@@ -1844,10 +1786,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_65caf440e38533014608",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 2, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_65caf440e38533014608",
@@ -1905,10 +1845,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_13e2f64ee184ac8856b2",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_13e2f64ee184ac8856b2",
@@ -1966,10 +1904,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_71879ad10f468a1ea333",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 2, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_71879ad10f468a1ea333",
@@ -2027,10 +1963,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 1},
         "kernel_symbol": "kernel_cake_sm110_xqa_026d6281ad6988ea6803",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (2, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_026d6281ad6988ea6803",
@@ -2088,10 +2022,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 2},
         "kernel_symbol": "kernel_cake_sm110_xqa_4582e7c9ae74071db273",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (4, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_4582e7c9ae74071db273",
@@ -2149,10 +2081,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 2},
         "kernel_symbol": "kernel_cake_sm110_xqa_30958b284ef5223c0801",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (4, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_30958b284ef5223c0801",
@@ -2210,10 +2140,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 2},
         "kernel_symbol": "kernel_cake_sm110_xqa_cd771bf9c866203bae1a",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (4, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 232448,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_cd771bf9c866203bae1a",
@@ -2271,10 +2199,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 2},
         "kernel_symbol": "kernel_cake_sm110_xqa_4997db4ddcff05959a3f",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (4, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_4997db4ddcff05959a3f",
@@ -2333,10 +2259,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 2},
         "kernel_symbol": "kernel_cake_sm110_xqa_9f3de565ed9e40c3f0ec",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (4, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_9f3de565ed9e40c3f0ec",
@@ -2396,10 +2320,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 2},
         "kernel_symbol": "kernel_cake_sm110_xqa_9d87fcc1acb00c8b5ba4",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (4, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_9d87fcc1acb00c8b5ba4",
@@ -2459,10 +2381,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 2},
         "kernel_symbol": "kernel_cake_sm110_xqa_1995576e11a89a71eacc",
         "launch": {
-            "block": (640, 1, 1),
             "cluster": (4, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 232448,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_1995576e11a89a71eacc",
@@ -2522,10 +2442,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "tree", "ctas_per_tile": 2, "tiles_per_cluster": 2},
         "kernel_symbol": "kernel_cake_sm110_xqa_965be34307a05a9cc698",
         "launch": {
-            "block": (512, 1, 1),
             "cluster": (4, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 230400,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_965be34307a05a9cc698",
@@ -2581,10 +2499,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "decode_partitions"},
         "kernel_symbol": "kernel_cake_sm110_xqa_d7078cb9bf9476c4bca8",
         "launch": {
-            "block": (128, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 83072,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_d7078cb9bf9476c4bca8",
@@ -2632,10 +2548,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "decode_partitions"},
         "kernel_symbol": "kernel_cake_sm110_xqa_b5e76ffddac9fc04f63e",
         "launch": {
-            "block": (128, 1, 1),
             "cluster": (2, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 91776,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_b5e76ffddac9fc04f63e",
@@ -2683,10 +2597,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {"kind": "decode_partitions"},
         "kernel_symbol": "kernel_cake_sm110_xqa_3e8ea029d502882b2294",
         "launch": {
-            "block": (128, 1, 1),
             "cluster": (4, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 109184,
             "use_pdl": False,
         },
         "library": "cake_sm110_xqa_3e8ea029d502882b2294",
@@ -2891,14 +2803,6 @@ def device_arch(device_index: int) -> str:
     return arch
 
 
-@functools.cache
-def sm_count(device_index: int) -> int:
-    """Streaming multiprocessor count of one CUDA device (immutable per process)."""
-    import torch
-
-    return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
-
-
 def library_name(name: str, arch: str) -> str:
     """``build.json`` library of record ``name`` built for ``arch``: ``<library>_<arch>``."""
     record = MODULES[name]
@@ -2915,12 +2819,6 @@ def load(name: str, arch: str) -> Any:
     prebuilt ``aot/`` library when a builder compiled it, else FlashInfer's JIT
     build of the same sources and flags (``cake_build.load_library``)."""
     return cake_build.load_library(library_name(name, arch))
-
-
-def specs_for_arch(arch: str) -> list[Any]:
-    """JIT specifications of every ``arch`` library without a prebuilt file (for
-    ahead-of-time warm-up through FlashInfer's ``build_jit_specs``)."""
-    return cake_build.jit_specs(arch)
 
 
 @functools.cache
@@ -2968,17 +2866,6 @@ def entry(name: str, device_index: int) -> Any:
     return getattr(load(name, device_arch(device_index)), MODULES[name]["ffi_entry"])
 
 
-def run_module(
-    name: str, values: dict[str, Any], *, grid: tuple[int, int, int], device_index: int
-) -> None:
-    """Launch record ``name`` with logical argument ``values`` on ``grid``
-    (:func:`launch_grid`) on the current torch stream of the device."""
-    run = entry(name, device_index)
-    args = argument_list(name, values, grid=grid)
-    with tvm_ffi.use_torch_stream():
-        run(*args)
-
-
 __all__ = [
     "ARCHES",
     "ARCH_BY_CAPABILITY",
@@ -3004,9 +2891,6 @@ __all__ = [
     "library_name",
     "load",
     "q_tiles",
-    "run_module",
     "select_decode_record",
     "select_record",
-    "sm_count",
-    "specs_for_arch",
 ]

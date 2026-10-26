@@ -204,9 +204,10 @@ autograd entries resolve every switch once in the forward.  **The package reads
 no environment variable.**  The `FLASHINFER_CAKE_LM_HEAD_LOSS_*` variables are
 FlashInfer's own A/B knobs and are read by `flashinfer.chunked_lm_head` only: a
 switch keyword left at `None` there falls back to its variable and the resolved
-value is passed down; the two binding-cache variables are applied when that
-module is imported, through `BINDING_CACHE.configure`.  A build that vendors
-the package without the wrapper sees the backend defaults.
+value is passed down; the two binding-cache variables are read when that
+module is imported and applied through `BINDING_CACHE.configure` when it first
+reaches the backend.  A build that vendors the package without the wrapper
+sees the backend defaults.
 
 | Keyword (backend default) | Variable read by `flashinfer.chunked_lm_head` | Parsing |
 | --- | --- | --- |
@@ -216,8 +217,8 @@ the package without the wrapper sees the backend defaults.
 | `dw_stream` (`"auto"`) | `FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM` | `0` / `false` / `off` / `no` -> `False`; `1` / `true` / `on` / `yes` -> `True`; else `"auto"` |
 | `hidden_count` (`True`) | `FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT` | `0` -> `False`, else `True` |
 | `gemm_tuning` (`{}`) | `FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING` | JSON object -> dict; unset / blank -> no knob; invalid -> `ValueError` |
-| `BINDING_CACHE.configure(enabled=...)` (`True`) | `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE` | `0` -> disabled (at import) |
-| `BINDING_CACHE.configure(capacity=...)` (`64`) | `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE_CAPACITY` | positive integer (at import) |
+| `BINDING_CACHE.configure(enabled=...)` (`True`) | `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE` | `0` -> disabled (read at import, applied on first use) |
+| `BINDING_CACHE.configure(capacity=...)` (`64`) | `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE_CAPACITY` | positive integer (read at import, applied on first use) |
 
 ## Kernel structure of one token chunk
 
@@ -420,7 +421,11 @@ named in the pull request.
 Tests: `tests/experimental/test_cake_lm_head_loss.py` and the public-API suite
 `tests/experimental/test_cake_lm_head_loss_api.py` (the host-layer tests
 run on any device through the reference path; the device tests skip without a
-registered program or a compute capability 10.0 / 10.3 device).  Benchmark:
+registered program or a compute capability 10.0 / 10.3 device), and the
+CPU-only `tests/experimental/test_cake_lm_head_loss_standalone.py` (a copy of
+the package imports with `flashinfer` blocked and raises its host-side errors;
+`scripts/check_cake_build_manifests.py --vendored-gate` builds and loads the
+copy's libraries on a GPU node).  Benchmark:
 `benchmarks/bench_cake_lm_head_loss.py`.
 
 Toolchain note: on CUDA 13.0 (nvcc 13.0.x) the `sm_103a` programs are built

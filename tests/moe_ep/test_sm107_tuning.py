@@ -179,12 +179,18 @@ def fake_trials(monkeypatch):
         fail = False
 
         def __init__(self, cfg):
+            from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_state import (
+                AutoTuningState,
+            )
+
             self.config = cfg
+            self._tuning_state = AutoTuningState()
             self.x = torch.zeros(4, 128, device="cuda")
             self.x_sf = torch.zeros(4, 4, device="cuda")
             self.topk_idx = torch.zeros(4, 2, device="cuda", dtype=torch.int32)
             self.topk_weights = torch.ones(4, 2, device="cuda")
             self.output_activation = torch.zeros(4, 128, device="cuda")
+            self.prepared = False
             self.destroyed = False
             trials.append(self)
 
@@ -194,7 +200,11 @@ def fake_trials(monkeypatch):
         def staged_tokens(self):
             return self.count
 
+        def prepare(self, *weights):
+            self.prepared = True
+
         def launch(self, *weights):
+            assert self.prepared
             if self.fail:
                 raise RuntimeError("injected rank-local CUDA failure")
             self.output_activation.fill_(9 if self.config.fc2_use_bulk else 3)
@@ -220,7 +230,7 @@ def fake_trials(monkeypatch):
         ),
     )
     recorded = mock.Mock()
-    monkeypatch.setattr(knob_cache, "record_knobs", recorded)
+    monkeypatch.setattr(knob_cache, "write_record", recorded)
     return SimpleNamespace(source=source, trial=Trial, trials=trials, recorded=recorded)
 
 
@@ -237,7 +247,7 @@ def test_incorrect_candidate_cannot_enter_cache(fake_trials):
     )
     assert winner == {"fc2_use_bulk": False}
     assert all(t.destroyed for t in state.trials[1:])
-    assert state.recorded.call_args.args[0] == winner
+    assert state.recorded.call_args.args[0]["knobs"] == winner
 
 
 def test_gpu_failure_aborts_without_collective_free_or_cache_write(fake_trials):

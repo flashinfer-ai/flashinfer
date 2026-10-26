@@ -7,7 +7,7 @@ prefix of 1 to 128 rows per rank; every rank must use the same active row count.
 
 The `src/` directory is an immutable generated pair:
 
-- `flashinfer_blackwell_moe_ep_layer_sm100.cu` contains the eleven device
+- `flashinfer_blackwell_moe_ep_layer_sm100.cu` contains the eight device
   kernels in launch order.
 - `manifest.json` pins the source checksum, capacity/workload constraints,
   symbols, launch geometry, cluster geometry, dynamic shared memory, and PDL

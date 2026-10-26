@@ -2946,21 +2946,63 @@ class CudnnFrostMxfp8Mxfp4Config:
 
 @dataclass(frozen=True)
 class FrostLowLatencyConfig:
-    """Low-token routed MoE on SM100/SM103/SM107.
+    """Low-token routed MoE on SM90/SM100/SM103/SM107/SM120.
 
+    SM90 supports BF16, FP16, ordinary per-tensor FP8, DeepSeek FP8 and
+    NVFP4/MXFP4/MXINT4-weight with BF16/FP16-activation FMA.
     Explicit opt-in; omitted from the default backend list. Autotuning selects
     Tensor Core tile sizes or a scalar FMA tactic (top-k <= 32) using the same
     prepared weights and numerical contract. Both are multi-kernel pipelines,
-    with precomputed routing and no EP communication. The Tensor Core path
+    with precomputed routing and no EP communication. The MX Tensor Core path
     overlaps its fused GU/activation/quantizer and Down GEMM through PDL.
     Set ``max_num_tokens`` up to 8 for tuning; the default admits at most 2.
     Prepare other backend views as well to permit fallback for larger inputs.
 
-    MXFP4/MXFP8 weights with MXFP8 inputs support SwiGLU through TC or FMA.
-    BF16 weights/inputs use FMA with gated or non-gated activations and top-k
-    at most 32. BF16 rounds the activation to BF16 and combines BF16 expert
-    outputs with ordered, separate FP32 multiplication and addition. This is
-    distinct from the MX intermediate quantization/combine contract.
+    MXFP4/MXFP8 weights with MXFP8 inputs support the same ten typed
+    activations as BF16, through TC or FMA. Non-gated weights omit gate rows.
+    BF16 or FP16 weights/inputs use FMA with gated or non-gated activations and
+    top-k at most 32. The activation is rounded to the input dtype and expert
+    outputs to the configured BF16/FP16 output dtype. Combine uses ordered,
+    separate FP32 multiplication and addition. Packed routing scores retain
+    BF16 rounding regardless of the input/output dtype. This is distinct from
+    the MX intermediate quantization/combine contract. SM90 and SM120 also
+    offer grouped BF16 Tensor Core candidates for default SwiGLU,
+    H=2048/I=512/top-k=10, T=4 or 8, with finalized BF16 output. Those
+    projections share the typed intermediate and ordered combine contract;
+    FMA remains the untuned default and a tuning candidate.
+
+    Ordinary per-tensor E4M3 FP8 uses static calibration multipliers, with
+    BF16 FC1 preactivation rounding as in the CUTLASS per-tensor backbone.
+    Activation and intermediate quantization remain fused into FC1; FC2
+    produces BF16 expert/final outputs with ordered FP32 multiply/add combine.
+    The TRT-LLM per-tensor path retains FP32 preactivations, so its rounding
+    contract differs even with identical quantized weights and scales.
+
+    E4M3 weight-only mode uses BF16/FP16 inputs and intermediates, with
+    per-expert FP32 weight scales. FC1 preactivation rounds to the input dtype;
+    expert outputs round to the independently configured BF16/FP16 dtype.
+    No activation quantization is required.
+
+    DeepSeek FP8 preserves FP32 preactivation and 128x128 weight block scales.
+    BF16 input is quantized per 128 values; prequantized E4M3 input retains
+    its supplied FP32 scales. The intermediate is dynamically quantized to
+    E4M3 before FC2; expert outputs and ordered combine follow BF16 rounding.
+
+    FP4 weight-only modes preserve canonical E2M1 payloads with BF16/FP16
+    input, preactivation and intermediate rounding. Expert outputs use the
+    configured BF16/FP16 output dtype. NVFP4 uses linear E4M3 K16 scales;
+    MXFP4 uses E8M0 K32 scales and FP32 dequantization to retain its wider
+    range. It uses software decoding on SM90 and native FP4 conversion on Blackwell/Rubin, sharing
+    the BF16 FMA schedule and typed activation/combine implementation.
+    H must be divisible by 128; logical I is padded to 128 from multiples of 32.
+
+    MXINT4 weight-only mode preserves signed INT4 payloads and BF16 K32
+    scales. It retains FP32 preactivation, then BF16/FP16 intermediate/expert
+    rounding and ordered FP32 combine through the same two FMA kernels.
+
+    NVFP4 weights/inputs use shared FMA with H divisible by 512, I by 128,
+    and top-k at most 32. It retains BF16 activation/expert rounding and
+    separate FP32 multiply/add combine; the 4over6 recipe is not supported.
     """
 
     max_num_tokens: int = 2
@@ -2971,14 +3013,20 @@ class FrostLowLatencyConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in (100, 103, 107)
+        return arch in (90, 100, 103, 107, 120)
 
     @staticmethod
-    def prepare_weights(w1, w1_scale, w2, w2_scale):
-        """Pack canonical prequantized MX weights without requantizing them."""
+    def prepare_weights(w1, w1_scale, w2, w2_scale, *, activation=None):
+        """Pack canonical MX weights; pass activation for non-gated weights."""
         from .backends.frost_low_latency.prepare import prepare_weights
 
-        return prepare_weights(w1, w1_scale, w2, w2_scale)
+        return prepare_weights(
+            w1,
+            w1_scale,
+            w2,
+            w2_scale,
+            activation=SwiGLU() if activation is None else activation,
+        )
 
     @staticmethod
     def prepare_bf16_weights(w1, w2, *, activation=None):
@@ -2987,6 +3035,196 @@ class FrostLowLatencyConfig:
 
         return prepare_bf16_weights(
             w1, w2, SwiGLU() if activation is None else activation
+        )
+
+    @staticmethod
+    def prepare_fp16_weights(w1, w2, *, activation=None):
+        """Prepare FP16 [up, gate] or non-gated weights, padding I to 128."""
+        from .backends.frost_low_latency.prepare import prepare_fp16_weights
+
+        return prepare_fp16_weights(
+            w1, w2, SwiGLU() if activation is None else activation
+        )
+
+    @staticmethod
+    def prepare_fp8_per_tensor_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        hidden_states_scale_global,
+        intermediate_scale_global,
+        num_local_experts,
+        hidden_size,
+        intermediate_size,
+        activation=None,
+        device=None,
+    ):
+        """Prepare E4M3 weights with static input/intermediate calibration scales."""
+        from .backends.frost_low_latency.prepare import prepare_fp8_per_tensor_weights
+
+        return prepare_fp8_per_tensor_weights(
+            w1_bf16,
+            w2_bf16,
+            hidden_states_scale_global=hidden_states_scale_global,
+            intermediate_scale_global=intermediate_scale_global,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+        )
+
+    @staticmethod
+    def prepare_fp8_weight_only_weights(w1, w1_scale, w2, w2_scale, *, activation=None):
+        """Prepare E4M3 weights for BF16/FP16 inputs without requantizing the payload.
+
+        Canonical weights are [E, 2*I, H] in [up, gate] order, or [E, I, H]
+        for non-gated activation, and [E, H, I]. Each FP32 scale is [E] and
+        dequantizes that expert's weight matrix. Logical I is padded to 128.
+        Configure FP8PerTensor weights with BF16/FP16 activations and BF16/FP16 output.
+        Preactivation and intermediate round to the activation dtype; expert
+        values round to the output dtype before ordered FP32 combine.
+        """
+        from .backends.frost_low_latency.prepare import prepare_fp8_weight_only_weights
+
+        return prepare_fp8_weight_only_weights(
+            w1, w1_scale, w2, w2_scale, SwiGLU() if activation is None else activation
+        )
+
+    @staticmethod
+    def prepare_mxint4_weight_only_weights(
+        w1, w1_block_scale, w2, w2_block_scale, *, activation=None
+    ):
+        """Preserve signed INT4 payloads and linear BF16 scales per 32 K values.
+
+        Weights are uint8 [E,branches*I,H/2] in [up,gate] order and [E,H,I/2].
+        Each byte stores the even K value in its low nibble, signed [-8,7].
+        H is divisible by 128; logical I is divisible by 32 and padded to 128.
+        Configure MXINT4 weights with BF16/FP16 inputs/output. FC1 preactivation
+        remains FP32; intermediate/expert values use the input/output dtype. Preparation
+        never requantizes the weights or reads values back to the host.
+        """
+        import torch
+        from .backends.frost_low_latency.fp4_weight_only import prepare_weights
+
+        one = torch.ones(w1.shape[0], device=w1.device, dtype=torch.float32)
+        return prepare_weights(
+            w1,
+            w1_block_scale,
+            one,
+            w2,
+            w2_block_scale,
+            one.clone(),
+            SwiGLU() if activation is None else activation,
+            scale_block_size=32,
+            integer_weights=True,
+        )
+
+    @staticmethod
+    def prepare_mxfp4_weight_only_weights(
+        w1, w1_block_scale, w2, w2_block_scale, *, activation=None
+    ):
+        """Preserve CUDA E2M1 weights and linear E8M0 scales per 32 K values.
+
+        Canonical gated FC1 rows use [up,gate] order. H is divisible by128;
+        logical I is divisible by32 and padded to128. Configure MXFP4 weights
+        with BF16/FP16 activations and BF16/FP16 output. No activation
+        quantization is performed.
+        """
+        import torch
+        from .backends.frost_low_latency.fp4_weight_only import prepare_weights
+
+        one = torch.ones(w1.shape[0], device=w1.device, dtype=torch.float32)
+        return prepare_weights(
+            w1,
+            w1_block_scale,
+            one,
+            w2,
+            w2_block_scale,
+            one.clone(),
+            SwiGLU() if activation is None else activation,
+            scale_block_size=32,
+        )
+
+    @staticmethod
+    def prepare_nvfp4_weight_only_weights(
+        w1,
+        w1_block_scale,
+        w1_global_scale,
+        w2,
+        w2_block_scale,
+        w2_global_scale,
+        *,
+        activation=None,
+    ):
+        """Preserve canonical E2M1 weights and linear E4M3 K16 block scales.
+
+        Weights are uint8 [E,branches*I,H/2] in [up,gate] order and [E,H,I/2].
+        E4M3 block scales use the same row dimensions with K/16 columns.
+        FP32 global scales dequantize each expert; FC1 accepts [E] or
+        [E,branches] and FC2 accepts [E]. H is divisible by 128; logical I
+        is divisible by 32 and padded to 128. Configure NVFP4 weights with
+        BF16/FP16 inputs and BF16/FP16 output; no activation quantization
+        is performed.
+        All tensors must reside on the same CUDA device. Payloads and scales
+        from a 4over6 checkpoint are preserved without requantization.
+        """
+        from .backends.frost_low_latency.fp4_weight_only import prepare_weights
+
+        return prepare_weights(
+            w1,
+            w1_block_scale,
+            w1_global_scale,
+            w2,
+            w2_block_scale,
+            w2_global_scale,
+            SwiGLU() if activation is None else activation,
+        )
+
+    @staticmethod
+    def prepare_deepseek_fp8_weights(w1, w1_scale, w2, w2_scale, *, activation=None):
+        """Preserve E4M3 weights and FP32 128x128 block scales without requantizing.
+
+        Canonical FC1 uses [up, gate] order for gated activation. H and I must
+        be divisible by 128. BF16 entry quantization and the E4M3 intermediate
+        use max(amax, 1e-4)/448 per 128 values; FC1 preactivation stays FP32.
+        Prepared E4M3 inputs instead retain their supplied FP32 [H/128,T] scales.
+        """
+        from .backends.frost_low_latency.prepare import prepare_deepseek_fp8_weights
+
+        return prepare_deepseek_fp8_weights(
+            w1, w1_scale, w2, w2_scale, SwiGLU() if activation is None else activation
+        )
+
+    prepare_fp8_per_tensor_activations = staticmethod(
+        TrtllmFp8PerTensorConfig.prepare_activations
+    )
+
+    @staticmethod
+    def prepare_nvfp4_weights(w1, w2, *, activation=None):
+        """Quantize BF16 source weights to the canonical CUTLASS NVFP4 view.
+
+        Requires H divisible by 512 and I by 128. Global scales are one;
+        activation inputs use the same linear scale pack as TRT-LLM.
+        """
+        from .backends.frost_low_latency.fma.activation_config import lower_activation
+
+        activation = SwiGLU() if activation is None else activation
+        lower_activation(activation)
+        if w2.ndim != 3:
+            raise ValueError("NVFP4 weights must be 3-D")
+        e, h, i = w2.shape
+        if e < 1 or h < 512 or h % 512 or i < 128 or i % 128:
+            raise ValueError(
+                "Frost NVFP4 requires positive E, H divisible by 512 and I by 128"
+            )
+        return CutlassNvfp4Config.prepare_weights(
+            w1,
+            w2,
+            num_local_experts=e,
+            hidden_size=h,
+            intermediate_size=i,
+            activation=activation,
         )
 
 
