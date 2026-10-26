@@ -1118,29 +1118,51 @@ def test_stage1_variants_respect_the_device_smem_limit():
     assert choose_stage1(16, 262144, sm_count=148, smem_limit=232448)[2]
 
 
+def _pick_class_k(capability, kclass) -> int:
+    """The largest top-k a ``_STAGE1_PICKS_BY_DEVICE`` top-k class serves that its sweep measured: the capability's
+    CTA-local-select cap for ``_STAGE1_PICK_L1``, 50 for a top-k up to ``_STAGE1_LARGE_K``, ``_STAGE1_PICK_LARGE_K``
+    for a larger one."""
+    if kclass == cs._STAGE1_PICK_L1:
+        return cs._LOCAL_SELECT_MAX_K_BY_CAPABILITY[capability]
+    return cs._STAGE1_PICK_LARGE_K if kclass else 50
+
+
 def test_measured_stage1_picks_are_frozen_variants_of_their_bins():
     """Every measured per-device stage-1 pick is a frozen variant that fits its device's dynamic shared memory opt-in
-    and serves both ends of its vocab and batch bins; outside every bin, and on any other SM count, the pick is None
-    (the cost model's pick stays)."""
+    and serves both ends of its vocab and batch bins at its top-k class; outside every bin, and on any other SM count,
+    the pick is None (the cost model's pick stays).  A CTA-local-select class pick (round 15) serves top-k 1 up to the
+    capability's cap, and a larger top-k falls to the top-k-up-to-64 entry of its bins."""
     smem = {9: _FULL_SMEM_OPTIN, 10: _FULL_SMEM_OPTIN, 12: 99 * 1024}
     vocabs = cs._STAGE1_PICK_VOCABS
     for (major, minor, sms), picks in cs._STAGE1_PICKS_BY_DEVICE.items():
         cap, limit = (major, minor), smem[major]
         assert picks
-        for (vbin, bbin, large), pick in picks.items():
+        for (vbin, bbin, kclass), pick in picks.items():
             assert vbin in vocabs and 1 <= bbin <= 128 and bbin & (bbin - 1) == 0
+            assert kclass in (False, True, cs._STAGE1_PICK_L1)
             assert pick in _stage1_variants(limit)
             prev = vocabs[vocabs.index(vbin) - 1] if vbin != vocabs[0] else 0
-            k = cs._STAGE1_PICK_LARGE_K if large else 50
+            k = _pick_class_k(cap, kclass)
             for vocab in (max(prev, 3 * vbin // 4) + 1, vbin):
                 for batch in (bbin // 2 + 1, bbin):
                     got = cs._measured_stage1_pick(cap, sms, batch, vocab, k, limit)
                     assert got == pick, (cap, sms, vocab, batch, k)
             assert cs._measured_stage1_pick(cap, sms + 1, bbin, vbin, k, limit) is None
+            if kclass == cs._STAGE1_PICK_L1:
+                assert cs._measured_stage1_pick(cap, sms, bbin, vbin, 1, limit) == pick
+                above = cs._measured_stage1_pick(cap, sms, bbin, vbin, k + 1, limit)
+                assert above == picks.get((vbin, bbin, False)), (cap, vbin, bbin)
     cap, sms, limit = (12, 0), 188, 99 * 1024
     assert cs._measured_stage1_pick(cap, sms, 1, 32768, 50, limit) == (2, 32, False)
     for batch, vocab in ((64, 32768), (129, 32768), (1, 24576), (1, 32769)):
         assert cs._measured_stage1_pick(cap, sms, batch, vocab, 50, limit) is None
+    # round 15 (lever L-PK2): the (2, 16) stream at top-k 10 only -- B200 V = 32768 B = 64 up to its cap 20, H100
+    # V = 32768 B = 32 up to its cap 10; the top-k-up-to-64 class there keeps the cost model's pick
+    b200, h100 = ((10, 0), 148), ((9, 0), 132)
+    for k, want in ((10, (2, 16, True)), (20, (2, 16, True)), (21, None), (50, None)):
+        assert cs._measured_stage1_pick(*b200, 64, 32768, k, _FULL_SMEM_OPTIN) == want
+    for k, want in ((10, (2, 16, True)), (11, None), (50, None)):
+        assert cs._measured_stage1_pick(*h100, 32, 32768, k, _FULL_SMEM_OPTIN) == want
 
 
 def test_measured_large_k_picks_keep_their_measured_launch_form():
@@ -1158,8 +1180,8 @@ def test_measured_large_k_picks_keep_their_measured_launch_form():
     for (major, minor, sms), picks in cs._STAGE1_PICKS_BY_DEVICE.items():
         cap, limit = (major, minor), smem[major]
         chain = not cs._block_tail_for_capability(cap)
-        for (vbin, bbin, large), pick in picks.items():
-            if not large:
+        for (vbin, bbin, kclass), pick in picks.items():
+            if kclass is not True:
                 continue
             c, e, st = pick
 
@@ -1194,8 +1216,8 @@ def test_measured_stage1_picks_sample_like_the_cost_model():
         pytest.skip("no measured stage-1 picks for this device")
     saved = dict(cs._STAGE1_PICKS_BY_DEVICE)
     try:
-        for (vbin, bbin, large), pick in sorted(picks.items()):
-            k = cs._STAGE1_PICK_LARGE_K if large else 50
+        for (vbin, bbin, kclass), pick in sorted(picks.items(), key=str):
+            k = _pick_class_k(cap, kclass)
             probs = _probs(bbin, vbin, seed=vbin + bbin)
             outs = []
             for table in (saved, {}):
@@ -1241,7 +1263,21 @@ _PLAN_CELLS = tuple(
 # Round-14 values of the host tables that round 15 changes, to recompute the round-14 plans: the vocabulary bound of the
 # cluster-8 whole-CTA tail (lever LP-BT 3a) and the measured stage-1 picks round 15 adds (lever L-PK2), per device key.
 _R14_BLOCK_TAIL_MAX_VOCAB = {(9, 0): None, (10, 0): None, (10, 3): 196608}
-_R15_ADDED_PICKS: dict = {}
+_R15_ADDED_PICKS = {
+    (9, 0, 132): {(32768, 32, cs._STAGE1_PICK_L1): (2, 16, True)},
+    (10, 0, 148): {
+        (32768, 32, False): (4, 16, True),
+        (128256, 2, True): (8, 16, True),
+        (262144, 64, True): (2, 16, True),
+        (32768, 64, cs._STAGE1_PICK_L1): (2, 16, True),
+    },
+    (10, 3, 152): {
+        (128256, 1, False): (8, 16, True),
+        (128256, 4, False): (8, 16, True),
+        (128256, 64, False): (2, 16, True),
+        (262144, 64, True): (2, 16, True),
+    },
+}
 # (device, vocab, batch, top-k) -> (round-14 plan, round-15 plan) of every owner cell whose plan round 15 changes.
 _R15_PLAN_CHANGES = {
     # LP-BT 3a: the cluster-8 k = 1000 rows above V = 128256 take the leader-push chain instead of the whole-CTA tail
@@ -1259,6 +1295,20 @@ _R15_PLAN_CHANGES = {
         ("GB300", 151936, batch, 1000): ("8_16_1 f2056 1L", "8_16_1 f550 2L")
         for batch in (1, 2, 4, 8)
     },
+    # L-PK2: the measured stage-1 picks round 15 adds (the CTA-local-select class at top-k 10 only)
+    ("H100", 32768, 32, 10): ("1_16_1 f17 1L", "2_16_1 f1553 1L"),
+    ("B200", 32768, 32, 10): ("1_32_1 f145 1L", "4_16_1 f1601 1L"),
+    ("B200", 32768, 32, 50): ("1_32_1 f145 1L", "4_16_1 f1601 1L"),
+    ("B200", 32768, 64, 10): ("1_32_1 f145 1L", "2_16_1 f1601 1L"),
+    ("B200", 128256, 2, 1000): ("8_32_0 f2 2L", "8_16_1 f8 1L"),
+    ("B200", 262144, 64, 1000): ("2_32_1 f4100 2L", "2_16_1 f580 2L"),
+    ("GB300", 128256, 1, 10): ("8_32_1 f1601 1L", "8_16_1 f1601 1L"),
+    ("GB300", 128256, 1, 50): ("8_32_1 f1601 1L", "8_16_1 f577 1L"),
+    ("GB300", 128256, 4, 10): ("8_32_1 f1601 1L", "8_16_1 f1601 1L"),
+    ("GB300", 128256, 4, 50): ("8_32_1 f1601 1L", "8_16_1 f577 1L"),
+    ("GB300", 128256, 64, 10): ("2_32_1 f145 1L", "2_16_1 f1601 1L"),
+    ("GB300", 128256, 64, 50): ("2_32_1 f145 1L", "2_16_1 f577 1L"),
+    ("GB300", 262144, 64, 1000): ("2_32_1 f4100 2L", "2_16_1 f4676 2L"),
 }
 
 
@@ -1301,7 +1351,9 @@ def test_round15_host_levers_change_only_their_cells(monkeypatch):
     on H100, B200, GB300, R200 and RTX PRO 6000 exactly on the cells of ``_R15_PLAN_CHANGES``, each to the listed plan,
     against the plans of the round-14 tables: LP-BT 3a moves the cluster-8 k = 1000 rows above V = 128256 at B = 1-8
     from the whole-CTA tail to the leader-push chain on 9.0 / 10.0 / 10.3 (B200's V = 151936 B = 1 cell and every
-    V = 128256 cell keep the tail).  R200 and RTX PRO 6000 keep every plan."""
+    V = 128256 cell keep the tail); L-PK2 adds measured stage-1 picks on H100, B200 and GB300, two of them in the
+    CTA-local-select top-k class only (top-k 10 changes, top-k 50 keeps its plan).  R200 and RTX PRO 6000 keep every
+    plan."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")  # without CUDA every k > 64 launch plans the two-launch chain
     new = _emulated_plans(monkeypatch)

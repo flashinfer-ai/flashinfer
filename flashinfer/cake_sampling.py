@@ -1628,16 +1628,28 @@ def _choose_stage1_resolved(
 # the pick where one variant beat it by 3 % or more in both modes and every top-k of its class (top-k 10 and 50 for
 # the fused tail, _STAGE1_PICK_LARGE_K for the larger top-k).  A second sweep of the cells where the pick was not
 # faster than the previous kernels adds an entry where a variant beat those kernels in both modes, every top-k of its
-# class and every buffer placement measured.  Key (vocab bin, batch bin, larger top-k): the vocab bin
-# is the measured vocab V, serving (max(3 V / 4, previous V), V]; the batch bin is the measured batch B, serving
-# (B / 2, B].  A larger top-k serves its entry only when its launch takes the whole-CTA tail exactly when one at
-# _STAGE1_PICK_LARGE_K does (on the whole-CTA-tail capabilities a top-k up to _BLOCK_TAIL_MIN_K runs the pick as a
-# two-launch chain, which the sweep did not measure).  A vocab or batch outside every bin, or a device absent here,
-# keeps the cost model's pick.
+# class and every buffer placement measured.  Round 15 (lever L-PK2) re-swept V = 32768 / 128256 / 262144 x B = 1, 2, 4,
+# 8, 32, 64 x top-k 10 / 50 / 1000 against the served picks (14 frozen variants forced, two rounds) and adds an entry
+# where a variant ran at most 0.97 of the served pick in both modes at every top-k of its class: GB300 V = 128256
+# B = 1 / 4 the (8, 16) stream 0.963-0.964, B = 64 the (2, 16) stream 0.968, V = 262144 B = 64 top-k 1000 the (2, 16)
+# stream 0.949 / 0.954; B200 V = 32768 B = 32 the (4, 16) stream 0.877-0.925, V = 128256 B = 2 top-k 1000 the (8, 16)
+# stream 0.963 / 0.954, V = 262144 B = 64 top-k 1000 the (2, 16) stream 0.927 / 0.928.  Key (vocab bin, batch bin,
+# top-k class): the vocab bin is the measured vocab V, serving (max(3 V / 4, previous V), V]; the batch bin is the
+# measured batch B, serving (B / 2, B]; the top-k class is True for a larger top-k, False for a top-k up to
+# _STAGE1_LARGE_K, or _STAGE1_PICK_L1 for a top-k up to the capability's CTA-local-select cap
+# (_LOCAL_SELECT_MAX_K_BY_CAPABILITY), looked up before the False entry: there the leader push is the launch's one
+# cluster round, so a wider grid costs less, and an entry measured at top-k 10 alone serves only that class (round 15:
+# B200 V = 32768 B = 64 the (2, 16) stream 0.955 / 0.962 at top-k 10, 1.026 at 50; H100 V = 32768 B = 32 the (2, 16)
+# stream 0.959 at top-k 10, 1.03 at 50).  A larger top-k serves its entry only when its launch takes the whole-CTA tail
+# exactly when one at _STAGE1_PICK_LARGE_K does (on the whole-CTA-tail capabilities a top-k up to _BLOCK_TAIL_MIN_K
+# runs the pick as a two-launch chain, which the sweep did not measure).  A vocab or batch outside every bin, or a
+# device absent here, keeps the cost model's pick.
 _STAGE1_PICK_LARGE_K = 1000
+_STAGE1_PICK_L1 = "l1"
 _STAGE1_PICK_VOCABS = (32768, 128256, 151936, 262144)
+_Stage1PickKey: TypeAlias = tuple[int, int, Union[bool, str]]
 _STAGE1_PICKS_BY_DEVICE: dict[
-    tuple[int, int, int], dict[tuple[int, int, bool], tuple[int, int, bool]]
+    tuple[int, int, int], dict[_Stage1PickKey, tuple[int, int, bool]]
 ] = {
     # H100 SXM
     (9, 0, 132): {
@@ -1653,6 +1665,7 @@ _STAGE1_PICKS_BY_DEVICE: dict[
         (128256, 2, True): (8, 16, True),
         (128256, 4, True): (8, 16, True),
         (128256, 8, True): (8, 16, True),
+        (32768, 32, _STAGE1_PICK_L1): (2, 16, True),
     },
     # B200
     (10, 0, 148): {
@@ -1661,6 +1674,7 @@ _STAGE1_PICKS_BY_DEVICE: dict[
         (32768, 4, False): (4, 16, True),
         (32768, 8, False): (4, 16, True),
         (32768, 16, False): (4, 16, True),
+        (32768, 32, False): (4, 16, True),
         (128256, 1, False): (8, 16, True),
         (128256, 2, False): (8, 16, True),
         (128256, 4, False): (8, 16, True),
@@ -1684,11 +1698,14 @@ _STAGE1_PICKS_BY_DEVICE: dict[
         (262144, 16, False): (4, 16, True),
         (262144, 32, False): (4, 16, True),
         (262144, 64, False): (2, 16, True),
+        (128256, 2, True): (8, 16, True),
         (128256, 64, True): (2, 16, True),
         (128256, 128, True): (1, 16, True),
         (151936, 128, True): (1, 16, True),
         (262144, 16, True): (4, 16, True),
         (262144, 32, True): (4, 16, True),
+        (262144, 64, True): (2, 16, True),
+        (32768, 64, _STAGE1_PICK_L1): (2, 16, True),
     },
     # GB300
     (10, 3, 152): {
@@ -1698,8 +1715,11 @@ _STAGE1_PICKS_BY_DEVICE: dict[
         (32768, 8, False): (4, 16, True),
         (32768, 16, False): (4, 16, True),
         (32768, 32, False): (4, 16, True),
+        (128256, 1, False): (8, 16, True),
+        (128256, 4, False): (8, 16, True),
         (128256, 16, False): (4, 16, True),
         (128256, 32, False): (4, 16, True),
+        (128256, 64, False): (2, 16, True),
         (151936, 1, False): (8, 16, True),
         (151936, 2, False): (8, 16, True),
         (151936, 4, False): (8, 16, True),
@@ -1718,6 +1738,7 @@ _STAGE1_PICKS_BY_DEVICE: dict[
         (128256, 128, True): (1, 16, True),
         (262144, 16, True): (4, 16, True),
         (262144, 32, True): (4, 16, True),
+        (262144, 64, True): (2, 16, True),
     },
     # R200
     (10, 7, 212): {
@@ -1765,8 +1786,10 @@ def _measured_stage1_pick(
     smem_limit: Optional[int],
 ) -> Optional[tuple[int, int, bool]]:
     """The ``_STAGE1_PICKS_BY_DEVICE`` entry for this call, when the device has one for its vocab and batch bins and
-    the variant ships, fits ``smem_limit``, covers ``vocab`` as the cost model's candidates do and, for a larger top-k,
-    launches in the form measured at ``_STAGE1_PICK_LARGE_K``; else None."""
+    top-k class (the ``_STAGE1_PICK_L1`` class first for a top-k up to the capability's
+    ``_LOCAL_SELECT_MAX_K_BY_CAPABILITY`` cap) and the variant ships, fits ``smem_limit``, covers ``vocab`` as the
+    cost model's candidates do and, for a larger top-k, launches in the form measured at ``_STAGE1_PICK_LARGE_K``;
+    else None."""
     picks = _STAGE1_PICKS_BY_DEVICE.get(
         (int(capability[0]), int(capability[1]), int(sm_count))
     )
@@ -1783,7 +1806,12 @@ def _measured_stage1_pick(
         return None
     bbin = 1 << (int(batch) - 1).bit_length()
     large = int(top_k_max) > _STAGE1_LARGE_K
-    pick = picks.get((vbin, bbin, large))
+    l1 = int(top_k_max) <= _LOCAL_SELECT_MAX_K_BY_CAPABILITY.get(
+        (int(capability[0]), int(capability[1])), 0
+    )
+    pick = picks.get((vbin, bbin, _STAGE1_PICK_L1)) if l1 else None
+    if pick is None:
+        pick = picks.get((vbin, bbin, large))
     if pick is None or pick not in _stage1_variants(smem_limit):
         return None
     cluster, ept, stream = pick
