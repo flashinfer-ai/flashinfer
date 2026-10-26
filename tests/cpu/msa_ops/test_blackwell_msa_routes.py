@@ -125,6 +125,7 @@ def _derive(route):
     raise AssertionError(f"unknown route kind {kind!r} in {route}")
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("target", ["sm100a", "sm103a"])
 def test_every_registered_route_is_input_derived(target):
     keys = _route_keys(target)
@@ -136,6 +137,7 @@ def test_every_registered_route_is_input_derived(target):
         assert loader.route_program(key, target) in loader.MODULES
 
 
+@pytest.mark.cpu_only
 def test_fp8_q1_specializations_are_selected_only_on_their_coordinates():
     common = dict(
         capturing=False,
@@ -163,6 +165,7 @@ def test_fp8_q1_specializations_are_selected_only_on_their_coordinates():
     assert backend._fp8_q1_schedule(**{**flat, "k_dtype": torch.bfloat16}) == ""
 
 
+@pytest.mark.cpu_only
 def test_long_prefill_predicate_covers_flat_and_paged_boundaries():
     common = dict(
         q_dtype=torch.bfloat16,
@@ -236,6 +239,7 @@ def test_long_prefill_predicate_covers_flat_and_paged_boundaries():
         backend._use_long_prefill(**common, **flat, q_lens=(), k_lens=())
 
 
+@pytest.mark.cpu_only
 def test_prefill_route_selects_the_gqa16_paged_mask_family():
     common = dict(
         q_dtype=torch.bfloat16, k_dtype=torch.bfloat16, paged=True, folded_gqa_group=16
@@ -252,6 +256,7 @@ def test_prefill_route_selects_the_gqa16_paged_mask_family():
     ).endswith(":any")
 
 
+@pytest.mark.cpu_only
 def test_uniform_fp8_route_is_the_single_token_program():
     # every seqlen_q takes the single-token program; no other uniform-FP8 route is registered
     single = backend._UNIFORM_FP8_SINGLE_ROUTE
@@ -282,6 +287,7 @@ def _kmaj(q_lens, k_lens, **layout):
     )
 
 
+@pytest.mark.cpu_only
 def test_persistent_route_takes_the_short_request_batches_the_long_route_declines():
     # Every request at or above the long thresholds: the long route, never the
     # persistent one; one request below them hands the whole batch over.
@@ -315,6 +321,7 @@ def test_persistent_route_takes_the_short_request_batches_the_long_route_decline
         _kmaj((100, 100), (25000,), **_KMAJ_PAGED16)
 
 
+@pytest.mark.cpu_only
 def test_persistent_route_shape_guards():
     # Flat KV floor: the longest request spans more than 64 KV blocks.
     assert not _kmaj((1024,), (64 * 128,), **_KMAJ_FLAT16)
@@ -342,6 +349,7 @@ def test_persistent_route_shape_guards():
     assert not backend._kmaj_p_admits(q_lens=(100,), k_lens=(8192,), paged=False)
 
 
+@pytest.mark.cpu_only
 def test_persistent_route_keys_and_plans_are_registered():
     # The dispatcher requests these keys for every admitted batch; the plans
     # are the producer's and the BF16 combine's argument orders.
@@ -380,6 +388,7 @@ def _l2ef_100(batch, seqlen_q, num_kv_heads, kv_len, **over):
     return _l2ef(batch, seqlen_q, num_kv_heads, kv_len, **over)
 
 
+@pytest.mark.cpu_only
 def test_decode_l2ef_constants_and_truth_table():
     assert backend._DECODE_L2EF_TARGETS == ("sm100a", "sm103a")
     assert backend._DECODE_L2EF_ITEMS_FACTOR == (2, 1)
@@ -420,6 +429,7 @@ def test_decode_l2ef_constants_and_truth_table():
         assert _l2ef(batch, seqlen_q, kv_heads, kv) is False, (batch, kv)
 
 
+@pytest.mark.cpu_only
 def test_decode_l2ef_items_and_pages_boundaries():
     # items at twice the SM count (inclusive) ...
     assert _l2ef(1, 1, 304, 200000) is True
@@ -437,6 +447,7 @@ def test_decode_l2ef_items_and_pages_boundaries():
     assert _l2ef(8, 8, 4, 200000, max_pages=319) is False
 
 
+@pytest.mark.cpu_only
 def test_decode_l2ef_target_layout_and_dtype_exclude():
     assert _l2ef(8, 8, 4, 200000) is True
     assert _l2ef_100(8, 8, 4, 200000) is True
@@ -449,6 +460,7 @@ def test_decode_l2ef_target_layout_and_dtype_exclude():
             _l2ef(8, 8, 4, 200000, **bad)
 
 
+@pytest.mark.cpu_only
 def test_decode_l2ef_key_and_program_are_registered_on_both_targets():
     bf16 = dict(q_dtype=torch.bfloat16, k_dtype=torch.bfloat16, paged=True)
     plain = backend._decode_route(**bf16)
@@ -469,6 +481,7 @@ def test_decode_l2ef_key_and_program_are_registered_on_both_targets():
         assert loader.MODULES[program]["arches"] == ["sm_100a", "sm_103a"]
 
 
+@pytest.mark.cpu_only
 def test_uniform_fp8_grid_uses_the_full_even_wave_when_available():
     assert (
         backend._uniform_fp8_decode_grid(total_work_items=256, num_sms=148, seqlen_q=4)
