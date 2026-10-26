@@ -83,6 +83,7 @@ EXECUTION_SOURCE_PATHS = (
     "flashinfer/attn_scores/selective_capacity.py",
     "flashinfer/attn_scores/_math_policy.py",
     "flashinfer/attn_scores/_selective_contract.py",
+    "flashinfer/attn_scores/_fp8_mqa_constants.py",
     "flashinfer/jit/selective_sample_ladder.py",
     "flashinfer/jit/selective_repair_if.py",
     "csrc/selective_sample_ladder.cu",
@@ -163,8 +164,8 @@ def _render_results(results):
     rows, identities, seen, partial = [], set(), set(), []
     for path, result in results:
         schema = result["schema_version"]
-        if schema not in (11, 12, 13, 14):
-            raise ValueError(f"expected block-paired schema 11, 12, 13 or 14: {path}")
+        if schema not in (11, 12, 13, 14, 15, 16):
+            raise ValueError(f"expected block-paired schema 11 through 16: {path}")
         source = result["source"]
         if not source["tracked_worktree_clean"]:
             raise ValueError(f"dirty execution source: {path}")
@@ -211,7 +212,7 @@ def _render_results(results):
                 raise ValueError(f"exact repair failed: {key}")
             summaries = _validated_routes(row, repeats)
             step_summaries = None
-            if schema in (11, 13):
+            if schema in (11, 13, 15):
                 if not row.get("step"):
                     raise ValueError(
                         "setup/layer schema requires per-step setup samples"
@@ -563,6 +564,11 @@ class _FullGVR:
     Query topology is fixed; every step derives physical row/group bounds and
     request IDs from device prefixes, gathers the live map and refreshes the
     public scorer schedule. Layer replay consumes those address-stable owners.
+
+    Default geometries use the ordinary scorer. For compressed multi-query
+    groups, widen its causal prefix and append a valid padding-page mapping;
+    GVR still selects only the original physical row prefixes. Custom scorer
+    configurations use explicit per-row physical bounds.
     """
 
     def __init__(
@@ -594,6 +600,23 @@ class _FullGVR:
         )
         rows, heads, dimension = q.shape
         tile = groups.query_tile
+        ordinary_defaults = (
+            getattr(config, "identity", None) == (128, 1, 160)
+            and config.num_q_stages in (None, 3)
+            and config.num_kv_stages in (None, 3)
+            and heads in (8, 64)
+            and tile in (1, 16 if heads == 8 else 4)
+        )
+        causal_envelope = ordinary_defaults and groups.ratio != 1 and tile > 1
+        explicit_bounds = not ordinary_defaults
+        self.scorer_mode = (
+            "explicit-physical-bounds"
+            if explicit_bounds
+            else "ordinary-causal-envelope"
+            if causal_envelope
+            else "ordinary-causal"
+        )
+        self.scorer_width = width + tile - 1 if width and causal_envelope else width
         config.validate_geometry(
             heads=heads, dimension=dimension, page=kv_fused.shape[1], next_n=tile
         )
@@ -610,20 +633,29 @@ class _FullGVR:
             raise ValueError(
                 "public GVR2 requires singleton score width divisible by four"
             )
-        columns = max(8192, top_k, config.padded_columns(width))
+        columns = max(8192, top_k, config.padded_columns(self.scorer_width))
         self.scores = torch.empty((rows, columns), device=device, dtype=torch.float32)
         scores = self.scores
         logical_scores = scores[:, :width]
         row_ids = torch.arange(rows, device=device, dtype=torch.int32)
         row_ends = torch.empty((rows,), device=device, dtype=torch.int32)
-        metadata = torch.empty(
-            (len(groups.rows), tile + 2), device=device, dtype=torch.int32
+        metadata = (
+            torch.empty((len(groups.rows), tile + 2), device=device, dtype=torch.int32)
+            if explicit_bounds
+            else None
         )
         group_ends = torch.empty((len(groups.rows),), device=device, dtype=torch.int32)
         request_ids = torch.empty((len(groups.rows),), device=device, dtype=torch.int64)
         table_rows = torch.empty(
-            (len(groups.rows), block_table.shape[1]), device=device, dtype=torch.int32
+            (len(groups.rows), block_table.shape[1] + int(causal_envelope)),
+            device=device,
+            dtype=torch.int32,
         )
+        gathered_table = table_rows[:, : block_table.shape[1]]
+        if causal_envelope:
+            # Page zero is a real pool page. Padding scores are outside GVR's
+            # logical prefixes, so its contents never affect the selection.
+            table_rows[:, -1].zero_()
         schedule = torch.empty(
             (torch.cuda.get_device_properties(device).multi_processor_count + 1, 2),
             device=device,
@@ -635,6 +667,12 @@ class _FullGVR:
             ).view(torch.int32)
         }
         grouped_q = q.view(len(groups.rows), tile, heads, dimension)
+        scorer_width = self.scorer_width
+        scorer_options = (
+            dict(kernel_config=config, query_metadata=metadata, output_rows=rows)
+            if explicit_bounds
+            else {}
+        )
         self.workspace_owners = (
             scores,
             logical_scores,
@@ -644,6 +682,7 @@ class _FullGVR:
             request_ids,
             row_ids,
             table_rows,
+            gathered_table,
             schedule,
             workspace,
         )
@@ -662,12 +701,17 @@ class _FullGVR:
                     rounding_mode="floor",
                 )
             )
-            metadata[:, 0].copy_(row_ids.view(-1, tile)[:, 0])
-            metadata[:, 1].fill_(tile)
-            metadata[:, 2:].copy_(row_ends.view(-1, tile))
+            if explicit_bounds:
+                metadata[:, 0].copy_(row_ids.view(-1, tile)[:, 0])
+                metadata[:, 1].fill_(tile)
+                metadata[:, 2:].copy_(row_ends.view(-1, tile))
             torch.amax(row_ends.view(-1, tile), dim=1, out=group_ends)
+            if causal_envelope:
+                # Ordinary row t promises original_group_max + t, covering
+                # every required physical end <= original_group_max.
+                group_ends.add_(tile - 1)
             request_ids.copy_(requests.view(-1, tile)[:, 0])
-            torch.index_select(block_table, 0, request_ids, out=table_rows)
+            torch.index_select(block_table, 0, request_ids, out=gathered_table)
             compute_paged_mqa_logits_schedule(
                 group_ends, device=device, next_n=tile, variant="fp8", out=schedule
             )
@@ -679,16 +723,14 @@ class _FullGVR:
                 weights,
                 table_rows,
                 group_ends,
-                width,
+                scorer_width,
                 output_dtype=torch.float32,
                 epi_dtype=torch.float32,
                 acc_dtype=torch.float32,
                 math_mode="relu_strict",
                 schedule_meta=schedule,
                 out=scores,
-                kernel_config=config,
-                query_metadata=metadata,
-                output_rows=rows,
+                **scorer_options,
             )
             top_k_varlen(
                 logical_scores,
@@ -975,7 +1017,12 @@ def run_row(kv_len: int, args) -> dict:
         "execution_mode": "cuda-graph-replay",
         "full_config": {
             "launch_identity": config.launch_identity,
+            "scorer_mode": full.scorer_mode,
+            "config_scope": "explicit"
+            if full.scorer_mode == "explicit-physical-bounds"
+            else "geometry descriptor; ordinary scorer defaults selected",
             "logical_score_width": physical_length,
+            "scorer_max_seq_len": full.scorer_width,
             "score_pitch": 0 if full.scores is None else full.scores.stride(0),
             "score_arena_bytes": 0 if full.scores is None else full.scores.numel() * 4,
             "page_table_gathers_per_layer": 0,
@@ -1129,7 +1176,7 @@ def main() -> None:
         timeout=60,
     ).stdout.strip()
     result = {
-        "schema_version": 14 if args.layer_only else 13,
+        "schema_version": 16 if args.layer_only else 15,
         "status": "running",
         "source": {
             "git_commit": commit or None,

@@ -8915,7 +8915,8 @@ def test_engine_page_correlated_sampling(page_size, top_k, high_on_sampled):
 
 @_requires_selective_sm100
 @pytest.mark.parametrize("ratio", [1, 4])
-def test_benchmark_full_step_refreshes_lengths_and_page_maps(ratio):
+@pytest.mark.parametrize("query_tile", [1, 16])
+def test_benchmark_full_step_refreshes_lengths_and_page_maps(ratio, query_tile):
     """The separated layer consumes the last device-planned lengths and map."""
     from flashinfer.attn_scores.fp8_kernel_config import FP8MQAKernelConfig
     from flashinfer.attn_scores.query_group_metadata import FP8QueryGroups
@@ -8931,12 +8932,12 @@ def test_benchmark_full_step_refreshes_lengths_and_page_maps(ratio):
     benchmark = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(benchmark)
 
-    inputs = _request_inputs([16, 16], [1024, 1024])
+    inputs = _request_inputs([query_tile, query_tile], [1024, 1024])
     q, keys, scales, weights, qo_indptr, physical_kv = inputs
     pool, table = _paged_inputs(inputs)
     kv_indptr = physical_kv * ratio
     groups = FP8QueryGroups.build(
-        qo_indptr.cpu().tolist(), kv_indptr.cpu().tolist(), ratio, 16
+        qo_indptr.cpu().tolist(), kv_indptr.cpu().tolist(), ratio, query_tile
     )
     full = benchmark._FullGVR(
         q,
@@ -8944,10 +8945,18 @@ def test_benchmark_full_step_refreshes_lengths_and_page_maps(ratio):
         weights,
         table,
         groups,
-        FP8MQAKernelConfig(128, 1, 160, 16, num_q_stages=3, num_kv_stages=3),
+        FP8MQAKernelConfig(128, 1, 160, query_tile, num_q_stages=3, num_kv_stages=3),
         512,
         qo_indptr=qo_indptr,
         kv_indptr=kv_indptr,
+    )
+    assert full.scorer_mode == (
+        "ordinary-causal-envelope"
+        if ratio == 4 and query_tile > 1
+        else "ordinary-causal"
+    )
+    assert full.scorer_width == 1024 + (
+        query_tile - 1 if ratio == 4 and query_tile > 1 else 0
     )
     full.step()
     full.layer()
@@ -8958,6 +8967,12 @@ def test_benchmark_full_step_refreshes_lengths_and_page_maps(ratio):
     with torch.cuda.graph(layer_graph):
         full.layer()
     for lengths in ([1024, 1024], [768, 512]):
+        if lengths[0] == 768:
+            # Keep the pool address but replace its data, so a private stale
+            # pool copy cannot satisfy the captured layer's reference check.
+            key_bytes = keys.view(torch.uint8)
+            key_bytes.copy_(key_bytes.flip(0))
+            pool.copy_(_fuse_paged_kv(keys, scales).flip(0))
         kv_indptr.copy_(
             torch.tensor(
                 [0, lengths[0] * ratio, sum(lengths) * ratio],
@@ -8971,12 +8986,12 @@ def test_benchmark_full_step_refreshes_lengths_and_page_maps(ratio):
         torch.cuda.synchronize()
         oracle = []
         for request, length in enumerate(lengths):
-            for local in range(16):
-                end = (length * ratio - 16 + local + 1) // ratio
+            for local in range(query_tile):
+                end = (length * ratio - query_tile + local + 1) // ratio
                 slots = torch.arange(end, device=q.device)
                 page = pool.shape[0] - 1 - table[request, slots // 128].long()
                 physical = page * 128 + slots % 128
-                row = request * 16 + local
+                row = request * query_tile + local
                 dots = q[row].float() @ keys[physical].float().T
                 oracle.append(
                     (dots.relu() * weights[row, :, None]).sum(0) * scales[physical]

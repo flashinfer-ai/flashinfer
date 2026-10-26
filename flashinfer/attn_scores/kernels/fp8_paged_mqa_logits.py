@@ -1096,7 +1096,9 @@ class _FP8MQAEngineMixin(_FP8MQALayoutMixin):
         t: cutlass.Constexpr,
         next_n: cutlass.Constexpr,
         kv_pos,
-        query_metadata=None,
+        store_out_row_base=None,
+        store_q_valid=None,
+        store_row_ends=None,
     ):
         """Keep the ordinary final association, scale conversion and store."""
         if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
@@ -1112,16 +1114,13 @@ class _FP8MQAEngineMixin(_FP8MQALayoutMixin):
         if cutlass.const_expr(self.explicit_query_bounds):
             # Metadata row: real output base, valid count, exact physical ends.
             # Padded Q/weights are real allocated lanes; they never publish rows.
-            if t < query_metadata[(q_idx, 1)]:
-                out_row = query_metadata[(q_idx, 0)] + t
+            if t < store_q_valid:
+                out_row = store_out_row_base + t
                 value = self.output_dtype(result_t * scale_val)
-                if kv_pos >= query_metadata[(q_idx, 2 + t)]:
+                if kv_pos >= store_row_ends[t]:
                     value = self.output_dtype(-float("inf"))
                 if cutlass.const_expr(self.use_flat_logits_view):
-                    offset_dtype = (
-                        cutlass.Int64 if self.output_index_bits == 64 else cutlass.Int32
-                    )
-                    out_off = offset_dtype(out_row) * logits_stride0 + kv_pos
+                    out_off = out_row_off + t * logits_stride0 + kv_pos
                     output_view[out_off] = value
                 else:
                     output_view[(out_row, kv_pos)] = value
@@ -1392,7 +1391,9 @@ class _FP8MQAEngineMixin(_FP8MQALayoutMixin):
                     t,
                     next_n,
                     kv_pos,
-                    mTileMeta,
+                    store_out_row_base,
+                    store_q_valid,
+                    store_row_ends,
                 )
         return kv_cons_state, umma_cons_state
 
@@ -1503,11 +1504,16 @@ class _FP8MQAEngineMixin(_FP8MQALayoutMixin):
             logits_stride0 = 0
             out_row_off = 0
         else:
-            store_out_row_base = None
-            store_q_valid = None
+            if cutlass.const_expr(self.explicit_query_bounds):
+                store_out_row_base = cutlass.Int32(0)
+                store_q_valid = cutlass.Int32(0)
+                store_row_ends = cute.make_rmem_tensor(next_n, cutlass.Int32)
+            else:
+                store_out_row_base = None
+                store_q_valid = None
+                store_row_ends = None
             store_causal_base = None
             store_row_starts = None
-            store_row_ends = None
             if cutlass.const_expr(self.use_flat_logits_view):
                 # Flat logits view + carried row offset: the store address
                 # is base + out_row*stride0 + kv_pos, but out_row only
@@ -1564,6 +1570,17 @@ class _FP8MQAEngineMixin(_FP8MQALayoutMixin):
                         for row in cutlass.range_constexpr(next_n):
                             store_row_starts[row] = mTileMeta[(q_idx, 4 + row)]
                             store_row_ends[row] = mTileMeta[(q_idx, 4 + next_n + row)]
+                elif cutlass.const_expr(self.explicit_query_bounds):
+                    # One metadata snapshot serves every KV task for this Q
+                    # group. Keep row-base multiplication off the hot store.
+                    store_out_row_base = mTileMeta[(q_idx, 0)]
+                    store_q_valid = mTileMeta[(q_idx, 1)]
+                    for row in cutlass.range_constexpr(next_n):
+                        store_row_ends[row] = mTileMeta[(q_idx, 2 + row)]
+                    if cutlass.const_expr(self.use_flat_logits_view):
+                        out_row_off = (
+                            output_offset_dtype(store_out_row_base) * logits_stride0
+                        )
                 elif cutlass.const_expr(self.use_flat_logits_view):
                     # Promote before either product; widening an already
                     # wrapped Int32 row term cannot recover its address.
