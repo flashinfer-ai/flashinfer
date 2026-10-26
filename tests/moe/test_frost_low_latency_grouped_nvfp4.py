@@ -52,8 +52,6 @@ def _case(packed, dtype=torch.bfloat16):
         (12, 0),
     ):
         pytest.skip("SM103/SM120 packed NVFP4 grouped qualification")
-    if torch.cuda.get_device_capability() == (12, 0) and dtype is torch.float16:
-        pytest.skip("SM120 FP16 grouped NVFP4 is not admitted")
     torch.manual_seed(7340 + int(packed))
     t, h, i, e, k = 8, 2048, 512, 32, 10
     x = torch.randn(t, h, device="cuda", dtype=dtype) * 0.25

@@ -235,13 +235,13 @@ class FrostLowLatencyRunner(MoERunner):
             else "mxint4-load-width-v1"
             if self.config.quant.weight is QuantFormat.MXINT4
             else (
-                "nvfp4-grouped-tc-pr-v4"
+                "nvfp4-grouped-tc-fp16-pr-v5"
                 if self._fp4_weight_only
                 and self.config.quant.weight is QuantFormat.NVFP4
                 else "fp4-route-reuse-load-width-lut-fp16-v8"
                 if self._fp4_weight_only
                 else (
-                    "w8a16-grouped-tc-pr-v17"
+                    "w8a16-grouped-tc-cumulative-v21"
                     if self.config.quant.weight is QuantFormat.FP8PerTensor
                     and self.config.quant.activation
                     in (QuantFormat.BF16, QuantFormat.FP16)
@@ -314,9 +314,9 @@ class FrostLowLatencyRunner(MoERunner):
             ):
                 # Reused routes amortize packed fragment conversion. Retain all
                 # FFMA choices for sparse overlap; untuned dispatch is unchanged.
-                if (
-                    capability == (12, 0)
-                    and self.config.quant.activation is QuantFormat.BF16
+                if capability == (12, 0) and self.config.quant.activation in (
+                    QuantFormat.BF16,
+                    QuantFormat.FP16,
                 ):
                     tactics += [
                         ("warp_mma", 4, 2, 128),
@@ -339,10 +339,10 @@ class FrostLowLatencyRunner(MoERunner):
             and self.config.experts.intermediate_size == 512
             and self.config.routing.top_k == 10
             and (
-                self.config.activation == SwiGLU()
+                self.config.activation in (SwiGLU(), GeGLU())
                 or (
-                    self.config.quant.activation is QuantFormat.FP16
-                    and self.config.activation == GeGLU()
+                    self.config.quant.activation is QuantFormat.BF16
+                    and self.config.activation in (ReLU2(), SiLU())
                 )
             )
             and self.config.finalize.do_finalize

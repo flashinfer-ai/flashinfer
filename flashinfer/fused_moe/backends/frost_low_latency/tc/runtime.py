@@ -137,10 +137,32 @@ def launch_fp8(
             and x.element_type in (cutlass.BFloat16, cutlass.Float16)
         )
     ):
-        first_warp = WarpGroupedProjection(
-            True, group_size, stages, tile_k, top_k, activation, gated, parameters
+        # This BF16 T4 schedule reduces producer synchronization. FP16 retains
+        # cooperative gathering; the same substitution regresses that path.
+        serial_w8_t4 = (
+            architecture == 103
+            and x.element_type == cutlass.BFloat16
+            and w1.element_type == cutlass.Float8E4M3FN
+            and cute.size(x, mode=[0]) == 4
+            and cute.size(x, mode=[1]) == 2048
+            and cute.size(mid, mode=[1]) == 512
+            and top_k == 10
+            and activation == "geglu"
         )
-        second_warp = WarpGroupedProjection(False, group_size, stages, tile_k, top_k)
+        first_warp = WarpGroupedProjection(
+            True,
+            group_size,
+            stages,
+            tile_k,
+            top_k,
+            activation,
+            gated,
+            parameters,
+            serial_gather=serial_w8_t4,
+        )
+        second_warp = WarpGroupedProjection(
+            False, group_size, stages, tile_k, top_k, serial_gather=serial_w8_t4
+        )
         first_warp(w1, x, ids, mid, stream, dq1, aq2)
         second_warp(w2, mid, ids, routes, stream, dq2, aq2)
     else:
@@ -221,7 +243,7 @@ def execute(inputs, config, tactic):
     if scaled:
         tensors += tuple(inputs[9:])
     key = (
-        "grouped-tc-ffi-w8a16-v11",
+        "grouped-tc-ffi-w8a16-gather-v12",
         architecture,
         tuple((v.dtype, tuple(v.shape), tuple(v.stride()), v.device) for v in tensors),
         config.activation,

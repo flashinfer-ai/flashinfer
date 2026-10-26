@@ -1809,7 +1809,8 @@ input types can favor FMA with less expert reuse.
 
 For matching FP16 inputs/outputs, default SwiGLU or GeGLU and finalized T8 at
 H2048/I512/K10, SM90 offers group4 and group8 with stages2/K128 alongside
-all sixteen FMA choices. Matching BF16 inputs/outputs with default SwiGLU
+all sixteen FMA choices. Matching BF16 inputs/outputs with default SwiGLU, GeGLU,
+ReLU2 or SiLU
 at the same geometry offer group8/stages2/K128. These candidates reuse the
 compact-E4M3 TMA and warp-MMA implementation, with conversion to typed register
 fragments and
@@ -1817,7 +1818,8 @@ live per-expert scales. Native FP8 activation execution retains its WGMMA
 projection. The untuned default is unchanged.
 
 Shared expert routes can amortize fragment conversion; partial or disjoint
-routes still favor FMA. Tune with representative routes and cache conditions.
+routes still favor FMA. Cold BF16 execution can favor native cuTile. Tune with
+representative routes and cache conditions.
 Other activations, T1/T2/T4, other shapes, mixed output types and
 raw expert outputs keep their previous candidate sets.
 
@@ -1825,7 +1827,8 @@ Use `benchmarks/bench_frost_low_latency_w8a16.py --baseline frost_fma
 --dtype fp16 --tokens 8 --expert-reuse shared --output result.json` and repeat with warm/cold caches
 and half/disjoint routes; add `--activation geglu` for GeGLU. The native cuTile
 W8A16 adapter accepts BF16 only; this command compares the available matching
-FP16 pipelines. For BF16 SwiGLU, use `--dtype bf16` and compare with
+FP16 pipelines. For BF16 SwiGLU, GeGLU, ReLU2 or SiLU, use `--dtype bf16`
+with the corresponding `--activation` and compare with
 `--baseline cutile_w8a16` as well as `--baseline frost_fma`.
 
 ### SM103 BF16/FP16 W8A16 grouped candidates
@@ -1839,6 +1842,12 @@ At the smaller geometry, matching FP16 GeGLU also offers the T4/T8 candidates;
 FP16 ReLU2 and SiLU offer the T8 candidate. Matching BF16 GeGLU also offers
 the T4/T8 candidates at this geometry. BF16 ReLU2/SiLU and
 FP16 ReLU2/SiLU at T4 retain FMA only.
+
+BF16 GeGLU at T4 uses a serial gather producer to reduce synchronization.
+FP16 retains cooperative gathering; this scheduling choice does not generalize
+across the two input types. All FMA choices remain available for routes with
+less expert reuse.
+
 All sixteen FMA choices and the untuned default remain. The same TMA,
 register conversion, live scale, activation and combine implementation is
 compiled for SM103; this adds no second W8A16 pipeline. T2, FP16 at the larger
@@ -1880,7 +1889,7 @@ and final combine.
 ### Packed NVFP4 grouped decode on SM120 and B300
 
 Autotuning includes four grouped warp-MMA candidates for NVFP4 weights with
-BF16 activation/output, default SwiGLU, finalized output, and
+matching BF16 or FP16 activation/output, default SwiGLU, finalized output, and
 T=8/H=2048/I=512/top-k=10 on SM120: group4/stages2/K128,
 group8/stages4/K128, and group4 or group8 with stages2/K256. All 64 FFMA
 choices and the untuned
@@ -1902,13 +1911,20 @@ admit MXFP4 or MXINT4 Tensor Core candidates.
 `benchmarks/bench_frost_low_latency_w4a16.py` includes both FFMA and these
 grouped choices in the advertised Frost candidate search.
 
-On SM120, compare with the packed cuTile path:
+On SM120, compare BF16 with the packed cuTile path:
 
 ```bash
 python benchmarks/bench_frost_low_latency_w4a16.py \
   --weight-format nvfp4 --native-backend cutile --tokens 8 \
   --expert-reuse shared --cache-mode warm --output nvfp4-sm120-warm.json
 ```
+
+For SM120 FP16, use `--activation-dtype fp16 --native-backend sm120-tc`.
+The native FP16 path retains FP32 preactivation and expert partials; Frost
+rounds those boundaries to FP16. The benchmark checks each path against its
+own reference and does not claim bitwise-equivalent arithmetic. Both keep
+the packed checkpoint payload. Repeat with cold caches and representative
+expert reuse before choosing a tactic.
 
 On SM103, use `--native-backend expanded-bf16` for matching BF16 or
 `--activation-dtype fp16 --native-backend expanded-fp16` for matching FP16.

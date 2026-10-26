@@ -62,6 +62,7 @@ class WarpGroupedProjection:
         gated=True,
         parameters=None,
         block_scaled=False,
+        serial_gather=False,
     ):
         if (
             group_size not in (2, 4, 8)
@@ -81,6 +82,7 @@ class WarpGroupedProjection:
         self.activation = activation
         self.parameters = parameters
         self.block_scaled = block_scaled
+        self.serial_gather = serial_gather
         self.rows_per_tile = 32 if self.split_gate else 64
         self.acc_dtype = cutlass.Float32
         self.cluster_shape_mn = (1, 1)
@@ -207,12 +209,13 @@ class WarpGroupedProjection:
         if cutlass.const_expr(self.a_dtype.width != 16 and self.a_dtype.width != 8):
             raise TypeError("a_dtype should be float16 or float8")
         # Packed scale stages always need the cooperative producer.
-        # E4M3 weights, including W8A16, use cooperative gather at every T.
+        # E4M3 weights use cooperative gather unless a bounded W8A16 schedule
+        # explicitly selects the serial producer.
         # Dense 16-bit weights use it at T >= 8 to overlap the weight copy;
         # smaller dense decode retains the serial producer.
         self.cooperative_gather = (
             self.packed_nvfp4
-            or self.a_dtype == cutlass.Float8E4M3FN
+            or (self.a_dtype == cutlass.Float8E4M3FN and not self.serial_gather)
             or cute.size(ids) >= 8 * self.top_k
         )
         # Per-tensor FP8 benefits from initializing immutable padded rows once.

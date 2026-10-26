@@ -100,10 +100,11 @@ def _candidate_setup(packed, tokens, dtype, group, stages, activation, **shape):
     sm103 = torch.cuda.get_device_capability() == (10, 3)
     sm90 = torch.cuda.get_device_capability() == (9, 0)
     if sm90:
-        if tokens != 8 or not (
-            activation == SwiGLU() or (dtype is torch.float16 and activation == GeGLU())
-        ):
-            pytest.skip("SM90 W8A16 TC admission requires T8 SwiGLU or FP16 GeGLU")
+        admitted_activation = activation in (SwiGLU(), GeGLU()) or (
+            dtype is torch.bfloat16 and activation in (ReLU2(), SiLU())
+        )
+        if tokens != 8 or not admitted_activation:
+            pytest.skip("Outside SM90 W8A16 T8 activation admission")
         choices = runner.get_valid_tactics(inputs, None)
         assert [t for t in choices if t[0] != "ffma"] == [
             ("warp_mma", g, 2, 128)
@@ -269,14 +270,14 @@ def test_grouped_w8a16_large_sm120(packed, dtype):
 def test_grouped_w8a16_bounded_admission():
     cases = [
         dict(tokens=2),
-        dict(activation=ReLU2()),
-        dict(activation=SiLU()),
         dict(activation=SwiGLU(alpha=1.702)),
         dict(hidden=4096),
         dict(intermediate=1024),
         dict(topk=8),
     ]
     _setup()
+    if torch.cuda.get_device_capability() != (9, 0):
+        cases.extend(dict(activation=a) for a in (ReLU2(), SiLU()))
     if torch.cuda.get_device_capability() == (10, 3):
         cases.extend(
             [
@@ -298,6 +299,11 @@ def test_grouped_w8a16_bounded_admission():
             for activation in (GeGLU(), ReLU2(), SiLU())
         )
     elif torch.cuda.get_device_capability() == (9, 0):
+        cases.extend(
+            dict(dtype=torch.bfloat16, tokens=t, activation=a)
+            for t in (1, 2, 4)
+            for a in (ReLU2(), SiLU())
+        )
         cases.extend(dict(tokens=t) for t in (1, 4))
         cases.extend(dict(dtype=torch.float16, tokens=t) for t in (1, 2, 4))
         cases.extend(
@@ -307,7 +313,9 @@ def test_grouped_w8a16_bounded_admission():
         cases.extend(
             dict(dtype=torch.float16, tokens=t, activation=GeGLU()) for t in (1, 2, 4)
         )
-        cases.append(dict(dtype=torch.bfloat16, activation=GeGLU()))
+        cases.extend(
+            dict(dtype=torch.bfloat16, tokens=t, activation=GeGLU()) for t in (1, 2, 4)
+        )
         cases.extend(
             [
                 dict(dtype=torch.float16, hidden=4096),

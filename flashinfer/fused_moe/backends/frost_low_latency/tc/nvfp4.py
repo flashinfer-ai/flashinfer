@@ -63,7 +63,8 @@ def execute(inputs, config, tactic):
             ("warp_mma", 4, 2, 256),
             ("warp_mma", 8, 2, 256),
         )
-        if capability == (12, 0) and config.quant.activation is QuantFormat.BF16
+        if capability == (12, 0)
+        and config.quant.activation in (QuantFormat.BF16, QuantFormat.FP16)
         else (("warp_mma", 4, 2, 256), ("warp_mma", 8, 2, 256))
         if capability == (10, 3)
         and config.quant.activation in (QuantFormat.BF16, QuantFormat.FP16)
@@ -81,11 +82,11 @@ def execute(inputs, config, tactic):
         or tactic not in choices
     ):
         raise ValueError(
-            "Grouped NVFP4 requires qualified SM120 BF16 or SM103 BF16/FP16 T8 H2048 I512 top-k10 SwiGLU"
+            "Grouped NVFP4 requires SM103/SM120 BF16/FP16 T8 H2048 I512 top-k10 SwiGLU"
         )
     tensors, narrow = inputs[:-1], inputs[-1]
     key = (
-        "grouped-nvfp4-ffi-pr-v4",
+        "grouped-nvfp4-fp16-pr-v5",
         tactic,
         config.activation,
         narrow,
