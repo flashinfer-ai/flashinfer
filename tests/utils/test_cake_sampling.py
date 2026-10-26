@@ -23,6 +23,7 @@ CUDA graphs / every frozen kernel variant, and parity with ``top_k_first`` sampl
 """
 
 import functools
+import inspect
 import itertools
 import math
 from dataclasses import dataclass
@@ -89,6 +90,13 @@ def _stage1_builds(man) -> list:
     """The manifest's stage-1 rows without the no-tail twins (``no_tail``), which
     ``test_no_tail_twins_match_their_fused_tail_builds`` checks on their own."""
     return [v for v in man["stage1"] if not v.get("no_tail", False)]
+
+
+def _clear_plan_caches():
+    """Drop the memoised dispatch (``_launch_plan``, ``_choose_stage1_resolved``) around a patched policy table or
+    function, so the next call ranks and plans under the policy then in force."""
+    cs._launch_plan.cache_clear()
+    cs._choose_stage1_resolved.cache_clear()
 
 
 def _assert_fallback_matches_reference(probs, k, p, seed=7, offset=8):
@@ -1215,6 +1223,110 @@ def test_measured_stage1_picks_sample_like_the_cost_model():
         cs._launch_plan.cache_clear()
 
 
+# Emulated devices of the host plan tables: name -> (compute capability, SM count, dynamic shared memory opt-in).
+_PLAN_DEVICES = {
+    "H100": ((9, 0), 132, _FULL_SMEM_OPTIN),
+    "B200": ((10, 0), 148, _FULL_SMEM_OPTIN),
+    "GB300": ((10, 3), 152, _FULL_SMEM_OPTIN),
+    "R200": ((10, 7), 212, _FULL_SMEM_OPTIN),
+    "R200 208 SMs": ((10, 7), 208, _FULL_SMEM_OPTIN),
+    "RTX PRO 6000": ((12, 0), 188, 99 * 1024),
+}
+# The owner cells of the benchmark tables: (vocab, batch, top-k).
+_PLAN_CELLS = tuple(
+    itertools.product(
+        (32768, 128256, 151936, 262144), (1, 2, 4, 8, 16, 32, 64, 128), (10, 50, 1000)
+    )
+)
+# Round-14 values of the host tables that round 15 changes, to recompute the round-14 plans: the vocabulary bound of the
+# cluster-8 whole-CTA tail (lever LP-BT 3a) and the measured stage-1 picks round 15 adds (lever L-PK2), per device key.
+_R14_BLOCK_TAIL_MAX_VOCAB = {(9, 0): None, (10, 0): None, (10, 3): 196608}
+_R15_ADDED_PICKS: dict = {}
+# (device, vocab, batch, top-k) -> (round-14 plan, round-15 plan) of every owner cell whose plan round 15 changes.
+_R15_PLAN_CHANGES = {
+    # LP-BT 3a: the cluster-8 k = 1000 rows above V = 128256 take the leader-push chain instead of the whole-CTA tail
+    **{
+        ("H100", vocab, batch, 1000): ("8_16_1 f8 1L", "8_16_1 f546 2L")
+        for vocab in (151936, 262144)
+        for batch in (1, 2, 4, 8)
+    },
+    **{
+        ("B200", vocab, batch, 1000): ("8_16_1 f8 1L", "8_16_1 f550 2L")
+        for vocab, batch in itertools.product((151936, 262144), (1, 2, 4, 8))
+        if (vocab, batch) != (151936, 1)
+    },
+    **{
+        ("GB300", 151936, batch, 1000): ("8_16_1 f2056 1L", "8_16_1 f550 2L")
+        for batch in (1, 2, 4, 8)
+    },
+}
+
+
+def _plan_text(plan) -> str:
+    """A launch plan in the notation of the benchmark tables: ``<cluster>_<ept>_<stream> f<launch_flags> <1L|2L>``."""
+    stage1 = f"{plan.cluster}_{plan.ept}_{int(plan.stream)}"
+    return f"{stage1} f{plan.launch_flags} {'1L' if plan.one_launch else '2L'}"
+
+
+def _emulated_plans(monkeypatch) -> dict:
+    """``(device, vocab, batch, top-k) -> plan text`` of every ``_PLAN_CELLS`` cell on every ``_PLAN_DEVICES`` device
+    (None where no frozen stage-1 variant covers the vocabulary), computed on the host: the device queries answer for
+    the emulated device and the per-device caches are bypassed."""
+    devices = dict(enumerate(_PLAN_DEVICES.items(), start=1 << 16))  # no real device
+    plans = {}
+    with monkeypatch.context() as m:
+        m.setattr(cs, "_device_capability", lambda index: devices[index][1][0])
+        m.setattr(cs, "_sm_count", lambda index: devices[index][1][1])
+        m.setattr(cs, "_smem_optin", lambda index: devices[index][1][2])
+        for name in (
+            "_block_tail_enabled",
+            "_row_span_diet_capability",
+            "_stream_prepass_flag",
+            "_stage23_variant_flags",
+        ):
+            m.setattr(cs, name, inspect.unwrap(getattr(cs, name)))
+        launch_plan = inspect.unwrap(cs._launch_plan)
+        for index, (name, _) in devices.items():
+            for vocab, batch, k in _PLAN_CELLS:
+                try:
+                    plan = _plan_text(launch_plan(index, batch, vocab, k))
+                except ValueError:
+                    plan = None
+                plans[name, vocab, batch, k] = plan
+    return plans
+
+
+def test_round15_host_levers_change_only_their_cells(monkeypatch):
+    """Round 15's host levers change the launch plans of the owner cells (vocab x batch 1-128 x top-k 10 / 50 / 1000)
+    on H100, B200, GB300, R200 and RTX PRO 6000 exactly on the cells of ``_R15_PLAN_CHANGES``, each to the listed plan,
+    against the plans of the round-14 tables: LP-BT 3a moves the cluster-8 k = 1000 rows above V = 128256 at B = 1-8
+    from the whole-CTA tail to the leader-push chain on 9.0 / 10.0 / 10.3 (B200's V = 151936 B = 1 cell and every
+    V = 128256 cell keep the tail).  R200 and RTX PRO 6000 keep every plan."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")  # without CUDA every k > 64 launch plans the two-launch chain
+    new = _emulated_plans(monkeypatch)
+    with monkeypatch.context() as m:
+        m.setattr(cs, "_BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY", _R14_BLOCK_TAIL_MAX_VOCAB)
+        m.setattr(cs, "_BLOCK_TAIL_ABOVE_VOCAB_CELLS", {})
+        picks = {}
+        for device, table in cs._STAGE1_PICKS_BY_DEVICE.items():
+            added = _R15_ADDED_PICKS.get(device, {})
+            assert all(table.get(key) == pick for key, pick in added.items()), device
+            picks[device] = {
+                key: pick for key, pick in table.items() if key not in added
+            }
+        m.setattr(cs, "_STAGE1_PICKS_BY_DEVICE", picks)
+        old = _emulated_plans(m)
+    changed = {
+        cell: (old[cell], plan) for cell, plan in new.items() if plan != old[cell]
+    }
+    assert not [cell for cell in changed if cell[0] not in ("H100", "B200", "GB300")]
+    assert changed == _R15_PLAN_CHANGES
+    # the cluster-8 V = 128256 k = 1000 cells keep the whole-CTA tail where they ran it (H100's measured picks)
+    for batch in (1, 2, 4, 8):
+        assert new["H100", 128256, batch, 1000] == "8_16_1 f8 1L"
+
+
 # --------------------------------------------------------------------------- adversarial
 
 
@@ -2295,7 +2407,8 @@ def test_block_tail_matches_two_launch_form(monkeypatch):
     """64 < k <= fused_block_tail_kcap on a one-wave stage-1 grid runs the whole-CTA stage 2/3 inside the stage-1
     kernel (launch_flags bit 3) on the capabilities that fuse it; outputs are bitwise identical to the explicit
     two-launch form on adversarial rows, per-row k (mixing k <= 64 rows) and per-row p, and multi-wave grids keep
-    the chain."""
+    the chain.  The identity check runs the tail on rows above the capability's vocabulary bound too (the build
+    serves every row length; the bound is a speed policy)."""
     _require_supported_device()
     import flashinfer.cake_sampling as cs
 
@@ -2353,14 +2466,9 @@ def test_block_tail_matches_two_launch_form(monkeypatch):
         k_row[-1] = 32
         p_row = torch.linspace(0.3, 1.0, batch, device="cuda", dtype=torch.float32)
         c, e, st = cs.choose_stage1(batch, vocab, top_k_max=kcap, two_launch=False)
-        if not cs._fuse_block_tail(
-            batch, c, e, bool(st), sm, kcap, False, vocab, cs._device_capability(0)
-        ):
-            # round 7: only a cluster-8 stream above k = 768 on a one-wave grid takes the twin (GB300: V <= 196608)
-            bound = cs._BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY.get(cs._device_capability(0))
-            assert not (
-                st and c >= 8 and batch * c <= sm and (bound is None or vocab <= bound)
-            ), (vocab, batch, c, e, st)
+        if not cs._fuse_block_tail(batch, c, e, bool(st), sm, kcap, False):
+            # round 7: only a cluster-8 stream above k = 768 on a one-wave grid takes the twin
+            assert not (st and c >= 8 and batch * c <= sm), (vocab, batch, c, e, st)
             continue
         fused_cells += 1
         for k, p in (
@@ -2369,11 +2477,20 @@ def test_block_tail_matches_two_launch_form(monkeypatch):
             (cs._BLOCK_TAIL_MIN_K + 1, 1e-6),
             (k_row, p_row),
         ):
+            top_k_max = k if isinstance(k, int) else int(k.max().item())
             with monkeypatch.context() as m:
                 m.setattr(cs, "_fuse_block_tail", lambda *a, **kw: False)
+                _clear_plan_caches()
+                plan = cs._launch_plan(0, batch, vocab, top_k_max)
+                assert plan.launch_flags & cs._FLAG_FUSE_BLOCK_TAIL == 0, plan
                 two, _ = _run_and_check(probs, k, p, 0x748, 3)
             with monkeypatch.context() as m:
                 m.setattr(cs, "_block_tail_enabled", lambda index: True)
+                # round 15: the rows above the capability's vocabulary bound take the tail here too
+                m.setattr(cs, "_BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY", {})
+                _clear_plan_caches()
+                plan = cs._launch_plan(0, batch, vocab, top_k_max)
+                assert plan.launch_flags & cs._FLAG_FUSE_BLOCK_TAIL, plan
                 fused, _ = _run_and_check(probs, k, p, 0x748, 3)
             kk = k if isinstance(k, int) else kcap
             assert np.array_equal(two.samples, fused.samples), (
@@ -2393,6 +2510,7 @@ def test_block_tail_matches_two_launch_form(monkeypatch):
                     fused.renorm[r, :kr].view(np.uint32),
                 )
             del kk
+    _clear_plan_caches()  # drop the plans ranked under the patched policies above
     if twins and fused_device and streams_ok:
         assert fused_cells >= 1, (
             "no cell of this device's dispatch took the whole-CTA tail"
@@ -2406,10 +2524,22 @@ def test_block_tail_matches_two_launch_form(monkeypatch):
     assert not cs._fuse_block_tail(4, 8, 16, True, 148, 500, False)
     assert not cs._fuse_block_tail(1, 8, 32, False, 148, 1000, False)
     assert not cs._fuse_block_tail(16, 4, 16, True, 148, 1000, False)
-    # the GB300 vocabulary bound (V = 151936 fuses, V = 262144 keeps the chain); B200 fuses any row
-    assert cs._fuse_block_tail(4, 8, 16, True, 148, 1000, False, 151936, (10, 3))
-    assert not cs._fuse_block_tail(4, 8, 16, True, 148, 1000, False, 262144, (10, 3))
-    assert cs._fuse_block_tail(4, 8, 16, True, 148, 1000, False, 262144, (10, 0))
+    # the vocabulary bound (round 15, lever LP-BT 3a): 9.0 / 10.0 / 10.3 run the tail up to V = 128256 and the
+    # leader-push chain above it, except B200's V = 151936 B = 1 cell
+    assert cs._BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY == {
+        (9, 0): 128256,
+        (10, 0): 128256,
+        (10, 3): 128256,
+    }
+    assert cs._BLOCK_TAIL_ABOVE_VOCAB_CELLS == {(10, 0): frozenset({(151936, 1)})}
+    for cap in ((9, 0), (10, 0), (10, 3)):
+        for batch in (1, 2, 4, 8):
+            for vocab in (96193, 128256, 128257, 151936, 262144):
+                got = cs._fuse_block_tail(
+                    batch, 8, 16, True, 148, 1000, False, vocab, cap
+                )
+                kept = vocab <= 128256 or (cap, vocab, batch) == ((10, 0), 151936, 1)
+                assert got == kept, (cap, vocab, batch)
     with pytest.raises(ValueError):
         cs._fuse_block_tail(4, 8, 16, True, 148, 1000, False, None, (10, 3))
     assert not cs._fuse_block_tail(1, 4, 16, False, 148, 1000, False)
@@ -4038,9 +4168,9 @@ def test_int_tail_build_matches_block_tail_build():
     ]
     block_streams = streams(v for v in block if not v["spec_sample"])
     spec_block_streams = streams(v for v in block if v["spec_sample"])
-    # 10.3 (the only int-tail capability) caps the cluster-8 whole-CTA tail at 196608 entries, and up to there the
-    # ranking puts the ept-16 stream first, so the (8, 32) `_bt` build is never dispatched with bit 11 and ships no
-    # `_bt_tia` form
+    # 10.3 (the only int-tail capability) caps the cluster-8 whole-CTA tail at 128256 entries (196608 before round
+    # 15), and up to there the ranking puts the ept-16 stream first, so the (8, 32) `_bt` build is never dispatched
+    # with bit 11 and ships no `_bt_tia` form
     itail_streams = streams(v for v in itail if not v["spec_sample"])
     spec_itail_streams = streams(v for v in itail if v["spec_sample"])
     assert block_streams == [(8, 16), (8, 32)] and itail_streams == [(8, 16)]

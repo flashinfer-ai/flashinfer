@@ -403,19 +403,32 @@ def _stage1_has_fused_block_tail(cluster: int, ept: int, stream: bool) -> bool:
 # only for a cluster-8 stream with top_k_max > _BLOCK_TAIL_MIN_K on a one-wave grid.  Round 8 adds H100: under graph
 # replay the twin runs 0.93-0.97 of the chain at V = 151936 and 0.96-0.99 at V = 262144 (B = 1-8, k = 800 / 1000, bitwise
 # identical; eager 0.93-0.98).  R200 keeps the cluster-8 chain (no graph-replay A/B recorded for it).  This policy covers
-# the cluster-8 streams (``_fuse_block_tail``); the cluster-1 cells are listed per capability in ``_C1_BLOCK_TAIL_CELLS``.
+# the cluster-8 streams (``_fuse_block_tail``), up to the vocabulary bound of ``_BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY``;
+# the cluster-1 cells are listed per capability in ``_C1_BLOCK_TAIL_CELLS``.
 _BLOCK_TAIL_CAPABILITIES: frozenset[tuple[int, int]] = frozenset(
     {(9, 0), (10, 0), (10, 3)}
 )
 _BLOCK_TAIL_MIN_CLUSTER = 8
 _BLOCK_TAIL_MIN_K = 768
-# Largest row the whole-CTA tail serves per capability (None: any).  GB300 round-7 matrices: the cluster-8 streams at
-# V = 151936 run 3-11 % faster fused, at V = 262144 3-7 % slower eager (a cold-L2 stage 1 is hidden by the chain's
-# host-bound launch gap there) and even under graph replay, so GB300 keeps the chain above this vocabulary.
+# Largest row the cluster-8 whole-CTA tail serves per capability (None: any); the (vocab, batch) cells of
+# _BLOCK_TAIL_ABOVE_VOCAB_CELLS keep the tail above it.  GB300 round-7 matrices: the cluster-8 streams at V = 151936 ran
+# 3-11 % faster fused, at V = 262144 3-7 % slower eager (a cold-L2 stage 1 is hidden by the chain's host-bound launch
+# gap there) and even under graph replay, so GB300 kept the chain above 196608.  Round 15 (lever LP-BT 3a): the
+# current two-launch chain of the same (8, 16) stream (its leader-push `_lp` build with the row-span filter arm and the
+# early trigger, plus the prepass on 10.x) beats the tail above V = 128256 on all three capabilities (V = 151936 /
+# 262144, B = 1-8, k = 1000; 8 rounds, two buffer placements, eager and graph, bitwise identical): the chain runs
+# 0.949-0.987 of the `_bt_tia` launch on GB300 at V = 151936, 0.936-0.970 of the `_bt` launch on B200 at V = 262144 and
+# 0.975-0.994 at V = 151936 B = 2-8, and 0.935-0.984 on H100.  B200's V = 151936 B = 1 cell keeps the tail (eager
+# 1.002 / 1.010, graph 0.992), and so does V = 128256 everywhere: the `_lp` build keeps the 2 k + 64 candidate need
+# that round 14 lowered to 1.5 k + 64 in the `_bt` build only, so its k = 1000 rows there miss the whole-list gather
+# (H100 1.18-1.27).
 _BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY: dict[tuple[int, int], Optional[int]] = {
-    (9, 0): None,
-    (10, 0): None,
-    (10, 3): 196608,
+    (9, 0): 128256,
+    (10, 0): 128256,
+    (10, 3): 128256,
+}
+_BLOCK_TAIL_ABOVE_VOCAB_CELLS: dict[tuple[int, int], frozenset[tuple[int, int]]] = {
+    (10, 0): frozenset({(151936, 1)}),
 }
 
 
@@ -487,7 +500,9 @@ def _fuse_block_tail(
     stage-1 grid is a single wave.  Rank 0 of every cluster runs the tail after its row, so a multi-wave grid would
     serialize one tail per wave while the chain's stage-2/3 kernel costs one launch for all rows; under CUDA-graph
     replay the in-CTA tail also loses to the chain on every resident and on every stream at k <= 750 (round 7), and
-    wins 3-11 % only for the cluster-8 streams at k = 1000 on B200 / GB300.  Rows of such a launch with
+    wins 3-11 % only for the cluster-8 streams at k = 1000 on B200 / GB300.  With ``capability`` given, a row longer
+    than the capability's ``_BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY`` bound keeps the chain unless its (vocab, batch) cell
+    is in ``_BLOCK_TAIL_ABOVE_VOCAB_CELLS`` (round 15).  Rows of such a launch with
     k <= CAKE_SAMPLING_FUSED_TAIL_KCAP take the two-warp tail inside the kernel (bit 3 enables it for them too)."""
     if two_launch or top_k_max is None:
         return False
@@ -502,10 +517,14 @@ def _fuse_block_tail(
             raise ValueError(
                 "the whole-CTA tail policy of this capability needs the vocabulary"
             )
-        bound = _BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY.get(
-            (int(capability[0]), int(capability[1]))
-        )
-        if bound is not None and int(vocab) > bound:
+        cc = (int(capability[0]), int(capability[1]))
+        bound = _BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY.get(cc)
+        cells = _BLOCK_TAIL_ABOVE_VOCAB_CELLS.get(cc, frozenset())
+        if (
+            bound is not None
+            and int(vocab) > bound
+            and (int(vocab), int(batch)) not in cells
+        ):
             return False
     wave_ctas = _wave_ctas(int(sm_count))
     return batch * cluster <= wave_ctas[cluster]
