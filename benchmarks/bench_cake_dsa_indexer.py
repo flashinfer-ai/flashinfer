@@ -53,7 +53,8 @@ registry record with a rule replaced -- ``cake_wide`` drops ``l6_rule`` and
 unregistered ``pair_wide``), ``cake_l6`` drops ``pair_rule``, ``cake_pair_l6`` widens both to
 ``[1024.0, 512]`` / ``[128.0, 1024.0, 512]``, ``cake_wide_c1`` drops
 both and takes the wide program from one round, ``wide_rule
-[1.0, 0.0]``; the recorded ``plan`` and workspace bytes are the forced
+[1.0, 0.0]``, ``cake_narrow`` drops both and never qualifies for wide (the
+narrow program; only where ``narrow`` is registered for the row's fit); the recorded ``plan`` and workspace bytes are the forced
 policy's, see ``forced_policy``), ``cake_main`` / ``cake_main_nosample`` (a
 second copy of the package loaded from ``--main-package DIR``, e.g. the
 ``flashinfer/experimental/cake_dsa_indexer``
@@ -768,6 +769,8 @@ WIDE = {"l6_rule": None, "pair_rule": None}
 L6 = {"pair_rule": None}
 PAIR_L6 = {"l6_rule": [1024.0, 512], "pair_rule": [128.0, 1024.0, 512]}
 WIDE_C1 = {"l6_rule": None, "pair_rule": None, "wide_rule": [1.0, 0.0]}
+# forced narrow: no l6, no pair, and a wide rule no call can meet (the single-warpgroup narrow program on every row)
+NARROW = {"l6_rule": None, "pair_rule": None, "wide_rule": [1e18, 1e18]}
 
 
 def _cake(name, backend=None, knobs=None, policy=None):
@@ -811,6 +814,8 @@ ARMS = {
     "cake_wide_c1_nosample": _cake(
         "cake_wide_c1_nosample", knobs=NOSAMPLE, policy=WIDE_C1
     ),
+    "cake_narrow": _cake("cake_narrow", policy=NARROW),
+    "cake_narrow_nosample": _cake("cake_narrow_nosample", knobs=NOSAMPLE, policy=NARROW),
     ChunkedPipelineArm.name: ChunkedPipelineArm,
     MaterializedArm.name: MaterializedArm,
 }
