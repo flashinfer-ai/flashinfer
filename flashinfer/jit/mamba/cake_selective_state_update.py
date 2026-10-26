@@ -2503,6 +2503,17 @@ _DYNAMIC_MAX_TOKEN_STEPS = 8
 # The six-token cache producer's (batch, step) strides of x, dt, B and C in the raw SGLang ABI: the fused
 # projection's padded views the raw build folds.
 _MTP_CACHE_RAW_STRIDES = (26112, 4352, 51072, 8512, 26112, 4352, 26112, 4352)
+# The TMA-ring builds of the short program (64 heads of 8 groups, one or two folded tokens): eight heads of one
+# group per CTA, two CTAs per SM.  Per (architecture, token count): the smallest batch, the largest batch (None: no
+# bound) and the smallest fill of the ring's last wave of CTAs in quarters of a wave (whole waves always qualify).
+_MTP_SHORT_RING_HEADS_PER_CTA = 8
+_MTP_SHORT_RING_CTAS_PER_SM = 2
+_MTP_SHORT_RING_DOMAIN: dict[tuple[str, int], tuple[int, Optional[int], int]] = {
+    ("sm_100a", 1): (32, 96, 2),
+    ("sm_100a", 2): (32, None, 1),
+    ("sm_103a", 1): (64, 96, 2),
+    ("sm_103a", 2): (32, None, 0),
+}
 
 
 def _source_dir() -> Path:
@@ -2743,6 +2754,37 @@ def mtp_cache_program(
                     return f"mtp_cache_groups{groups}_heads64", ()
                 return f"mtp_cache_groups{groups}", ()
     return "mtp_cache_c4_t6", defines
+
+
+def mtp_short_program(
+    batch_size: int,
+    nheads: int,
+    ngroups: int,
+    token_steps: int,
+    sm_count: int,
+    arch: str,
+) -> tuple[str, int]:
+    """``(program, head_tiles)`` of one short (one- or two-token, 128 x 128) launch; ``head_tiles`` is 0 for the
+    one-CTA-per-head builds.
+
+    On 64 heads of 8 groups the TMA-ring build of the launch's token count runs inside its domain
+    (``_MTP_SHORT_RING_DOMAIN``): a batch in the range of the architecture and token count, and a last wave of
+    eight-head CTAs (two per SM) filled at least to the bound, or a whole number of waves.  Smaller batches, and
+    batches that leave the ring's last wave nearly empty, run the build folding those counts with one CTA per
+    batch row and head.  Every other head and group count runs the prefetch build.
+    """
+    if (nheads, ngroups) != (64, 8):
+        return "mtp_short_prefetch", 0
+    bounds = _MTP_SHORT_RING_DOMAIN.get((arch, token_steps))
+    if bounds is not None:
+        low, high, quarters = bounds
+        if batch_size >= low and (high is None or batch_size <= high):
+            head_tiles = -(-(nheads // ngroups) // _MTP_SHORT_RING_HEADS_PER_CTA)
+            wave = _MTP_SHORT_RING_CTAS_PER_SM * sm_count
+            tail = batch_size * ngroups * head_tiles % wave
+            if tail == 0 or 4 * tail >= quarters * wave:
+                return f"mtp_short_ring_heads64_groups8_t{token_steps}", head_tiles
+    return "mtp_short_prefetch_heads64_groups8", 0
 
 
 def _plan_mtp_cache(
@@ -3743,8 +3785,15 @@ def plan_route(
         if compact is None:
             return None
         dt_compact, A_compact, D_compact, bias_compact = compact
+        program, head_tiles = mtp_short_program(
+            batch_size,
+            nheads,
+            ngroups,
+            token_steps,
+            _sm_count(device_index),
+            arch,
+        )
         bindings = dict(
-            state=state,
             x=x,
             dt=dt_compact,
             A=A_compact,
@@ -3760,21 +3809,18 @@ def plan_route(
             dstate=dstate,
             ngroups=ngroups,
             token_steps=token_steps,
-            state_stride_slot=state.stride(0),
             dt_softplus=int(dt_softplus),
             pad_slot_id=pad_slot_id,
         )
-        # 64 heads of 8 groups run the build that folds those counts into each CTA's (batch, head, group).
-        return RoutePlan(
-            "mtp_short_prefetch_heads64_groups8"
-            if (nheads, ngroups) == (64, 8)
-            else "mtp_short_prefetch",
-            (),
-            (batch_size * nheads, 1, 1),
-            bindings,
-            arch,
-            device_index,
-        )
+        if head_tiles:
+            # The TMA ring: a CTA per (batch row, group, tile of heads), the state a tensor map of the slot table.
+            bindings.update(state_tma=state, head_tiles=head_tiles)
+            grid = (batch_size * ngroups * head_tiles, 1, 1)
+        else:
+            # A CTA per (batch row, head); 64 heads of 8 groups fold those counts into each CTA's (batch, head, group).
+            bindings.update(state=state, state_stride_slot=state.stride(0))
+            grid = (batch_size * nheads, 1, 1)
+        return RoutePlan(program, (), grid, bindings, arch, device_index)
 
     if (
         state.dtype == torch.bfloat16
@@ -3953,6 +3999,7 @@ __all__ = [
     "hd64_rows_plan",
     "hd64_split_program",
     "jit_spec",
+    "mtp_short_program",
     "plan_route",
     "rows_defines",
     "try_cake_selective_state_update",

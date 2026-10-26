@@ -21,6 +21,9 @@ _CASES = (
     ("mtp_short1", 64, 64, 8, 128, 128, 1, torch.bfloat16, "auto", False, None),
     ("mtp_short2", 64, 64, 8, 128, 128, 2, torch.bfloat16, "auto", False, None),
     ("mtp_short2_h32", 64, 32, 8, 128, 128, 2, torch.bfloat16, "auto", False, None),
+    ("mtp_short1_b16", 16, 64, 8, 128, 128, 1, torch.bfloat16, "auto", False, None),
+    ("mtp_short2_b16", 16, 64, 8, 128, 128, 2, torch.bfloat16, "auto", False, None),
+    ("mtp_short2_b256", 256, 64, 8, 128, 128, 2, torch.bfloat16, "auto", False, None),
     ("mtp_cache", 1, 64, 8, 64, 128, 6, torch.bfloat16, "vertical", True, None),
     ("mtp_cache_g1", 1, 64, 1, 64, 128, 6, torch.bfloat16, "vertical", True, None),
     ("mtp_horizontal", 32, 64, 8, 64, 128, 6, torch.bfloat16, "horizontal", True, None),
@@ -1410,15 +1413,123 @@ def test_identity_route_falls_back_for_non_contiguous_inputs(cake_hits) -> None:
 
 
 @requires_blackwell
-def test_short_route_falls_back_for_non_contiguous_inputs(cake_hits) -> None:
-    inputs = _make_case(_case("mtp_short2"))
-    assert _route(inputs).program == "mtp_short_prefetch_heads64_groups8"
+@pytest.mark.parametrize(
+    "case_name, program",
+    [
+        ("mtp_short2", "mtp_short_ring_heads64_groups8_t2"),
+        ("mtp_short2_b16", "mtp_short_prefetch_heads64_groups8"),
+    ],
+)
+def test_short_route_falls_back_for_non_contiguous_inputs(
+    case_name, program, cake_hits
+) -> None:
+    inputs = _make_case(_case(case_name))
+    planned = _route(inputs).program
+    if _routes_as_measured():
+        assert planned == program
     inputs["x"] = _padded_steps(inputs["x"])
     assert not inputs["x"].is_contiguous()
-    assert (
-        _route(inputs).program == "mtp_short_prefetch_heads64_groups8"
-    )  # planned; the binding rejects the padded rows
+    # Planned; the binding rejects the padded rows.
+    assert _route(inputs).program == planned
     _assert_falls_back(inputs, cake_hits)
+
+
+# (batch, tokens, SMs, architecture, ring): the short program's TMA-ring domain on 64 heads of 8 groups.
+_SHORT_RING_DOMAIN_CASES = (
+    # sm_100a, one token: batches 32 to 96, the last wave of 296 eight-head CTAs at least half full.
+    (31, 1, 148, "sm_100a", False),
+    (32, 1, 148, "sm_100a", True),
+    (37, 1, 148, "sm_100a", True),  # one whole wave
+    (38, 1, 148, "sm_100a", False),
+    (55, 1, 148, "sm_100a", False),
+    (56, 1, 148, "sm_100a", True),
+    (96, 1, 148, "sm_100a", True),
+    (97, 1, 148, "sm_100a", False),
+    # sm_100a, two tokens: from batch 32, the last wave at least a quarter full.
+    (31, 2, 148, "sm_100a", False),
+    (46, 2, 148, "sm_100a", False),
+    (47, 2, 148, "sm_100a", True),
+    (192, 2, 148, "sm_100a", False),
+    (256, 2, 148, "sm_100a", True),
+    # sm_103a, one token: batches 64 to 96, the last wave of 304 CTAs at least half full.
+    (63, 1, 152, "sm_103a", False),
+    (64, 1, 152, "sm_103a", True),
+    (76, 1, 152, "sm_103a", True),  # two whole waves
+    (77, 1, 152, "sm_103a", False),
+    (94, 1, 152, "sm_103a", False),
+    (95, 1, 152, "sm_103a", True),  # exactly half
+    (97, 1, 152, "sm_103a", False),
+    # sm_103a, two tokens: every batch from 32.
+    (31, 2, 152, "sm_103a", False),
+    (32, 2, 152, "sm_103a", True),
+    (4096, 2, 152, "sm_103a", True),
+)
+
+
+@pytest.mark.parametrize(
+    "batch_size, token_steps, sm_count, arch, ring", _SHORT_RING_DOMAIN_CASES
+)
+def test_short_program_follows_the_ring_domain(
+    batch_size, token_steps, sm_count, arch, ring
+) -> None:
+    program, head_tiles = cake.mtp_short_program(
+        batch_size, 64, 8, token_steps, sm_count, arch
+    )
+    if ring:
+        assert (program, head_tiles) == (
+            f"mtp_short_ring_heads64_groups8_t{token_steps}",
+            1,
+        )
+    else:
+        assert (program, head_tiles) == ("mtp_short_prefetch_heads64_groups8", 0)
+    for nheads, ngroups in ((32, 8), (64, 4), (128, 8)):
+        other = cake.mtp_short_program(
+            batch_size, nheads, ngroups, token_steps, sm_count, arch
+        )
+        assert other == ("mtp_short_prefetch", 0)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("token_steps", (1, 2))
+@pytest.mark.parametrize("variant", ("plain", "pad"))
+def test_ring_programs_are_bitwise_the_pass_build(token_steps, variant) -> None:
+    """Each TMA-ring build writes the output and state of the pass build folding 64 heads of 8 groups, bit for
+    bit, on the same inputs (a pad slot keeps its state and writes a zero output), and matches FlashInfer."""
+    inputs = _make_case(_case(f"mtp_short{token_steps}"))
+    if variant == "pad":
+        inputs["state_batch_indices"][3] = -1
+    reference = dict(inputs, state=inputs["state"].clone())
+    out_reference = selective_state_update(
+        **reference, backend="flashinfer", pad_slot_id=-1
+    )
+    ring_arm, pass_arm = _split_arms(inputs)
+    ring_plan, pass_plan = _route(ring_arm), _route(pass_arm)
+    if not ring_plan.program.startswith("mtp_short_ring"):
+        pytest.skip(f"the route takes {ring_plan.program} on this device")
+    batch_size = inputs["x"].shape[0]
+    assert ring_plan.grid == (batch_size * 8, 1, 1)
+    assert ring_plan.bindings["head_tiles"] == 1
+    with torch.cuda.device(ring_plan.device_index):
+        cake._program(ring_plan.program, ring_plan.arch, ()).launch(
+            ring_plan.grid, ring_plan.bindings
+        )
+        bindings = {
+            key: value
+            for key, value in pass_plan.bindings.items()
+            if key not in ("state_tma", "head_tiles")
+        }
+        state = pass_arm["state"]
+        bindings.update(state=state, state_stride_slot=state.stride(0))
+        cake._program("mtp_short_prefetch_heads64_groups8", pass_plan.arch, ()).launch(
+            (batch_size * 64, 1, 1), bindings
+        )
+    out_ring, out_pass = ring_plan.bindings["output"], pass_plan.bindings["output"]
+    assert torch.equal(out_ring, out_pass)
+    assert torch.equal(ring_arm["state"], pass_arm["state"])
+    torch.testing.assert_close(out_ring, out_reference, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        ring_arm["state"], reference["state"], atol=1e-2, rtol=1e-2
+    )
 
 
 @requires_blackwell
@@ -1480,7 +1591,10 @@ _MULTI_TOKEN_ROUTES = (
     ("dynamic0_b8", "dynamic_lanes8", (8, 16, 4)),
     ("mtp_cache", "mtp_cache_groups8_heads64", (1, 64, 4)),
     ("mtp_cache_g1", "mtp_cache_groups1_heads64", (1, 64, 4)),
-    ("mtp_short2", "mtp_short_prefetch_heads64_groups8", (64 * 64, 1, 1)),
+    ("mtp_short1", "mtp_short_ring_heads64_groups8_t1", (64 * 8, 1, 1)),
+    ("mtp_short2", "mtp_short_ring_heads64_groups8_t2", (64 * 8, 1, 1)),
+    ("mtp_short2_b256", "mtp_short_ring_heads64_groups8_t2", (256 * 8, 1, 1)),
+    ("mtp_short1_b16", "mtp_short_prefetch_heads64_groups8", (16 * 64, 1, 1)),
     ("mtp_short2_h32", "mtp_short_prefetch", (64 * 32, 1, 1)),
     ("mtp_horizontal", "mtp_horizontal_early", (32 * 64 // 2, 1, 1)),
     ("mtp_horizontal_b64", "mtp_horizontal_direct", (64 * 64 // 2, 1, 1)),
@@ -1496,7 +1610,9 @@ _MULTI_TOKEN_ROUTES = (
 )
 def test_routes_pick_the_build_and_grid(case_name, program, grid) -> None:
     """The dynamic program runs 16 lanes per row below eight batch rows of a multi-token call; the horizontal
-    producer runs one CTA per work group, the early-index build up to eight work groups per SM."""
+    producer runs one CTA per work group, the early-index build up to eight work groups per SM; the short
+    program's TMA ring runs one CTA per (batch row, group) inside its domain, the build folding 64 heads of 8
+    groups one CTA per (batch row, head) outside it."""
     plan = _route(_make_case(_case(case_name)))
     assert plan is not None
     if _routes_as_measured():
@@ -1713,6 +1829,8 @@ def test_registry_names_every_program() -> None:
         "mtp_cache_groups8_heads64",
         "mtp_short_prefetch",
         "mtp_short_prefetch_heads64_groups8",
+        "mtp_short_ring_heads64_groups8_t1",
+        "mtp_short_ring_heads64_groups8_t2",
         "mtp_horizontal_early",
         "mtp_horizontal_direct",
     }
@@ -1721,7 +1839,7 @@ def test_registry_names_every_program() -> None:
     # three).
     carried = {"stp_hd64_rows_fp32", "mtp_cache_c4_t6"}
     assert set(cake.PROGRAMS) == paired_rows | split | rows | multi_token | carried
-    assert len(cake.PROGRAMS) == 58
+    assert len(cake.PROGRAMS) == 60
     # The two-head 128x128 build split two ways at five CTAs per SM ships for sm_100a alone.
     narrowed = {p for p, m in cake.PROGRAMS.items() if "arches" in cake.MODULES[m]}
     assert narrowed == {"stp_dim128_hpc2_s2w4_mb5"}
