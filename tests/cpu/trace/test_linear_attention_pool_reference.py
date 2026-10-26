@@ -28,6 +28,7 @@ from tests.test_helpers.cudnn_linear_attention import (
 )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("definition_source", ["generated", "checked_in"])
 def test_gdn2_exported_reference_reads_natural_log_decay(definition_source):
     q = torch.ones(1, 1, 1)
@@ -49,7 +50,8 @@ def test_gdn2_exported_reference_reads_natural_log_decay(definition_source):
     else:
         definition = json.loads(
             (
-                Path(__file__).parent / "fi_trace_out/gdn2_prefill_qk4_v8_d128.json"
+                Path(__file__).resolve().parents[2]
+                / "trace/fi_trace_out/gdn2_prefill_qk4_v8_d128.json"
             ).read_text()
         )
     namespace = {}
@@ -62,6 +64,7 @@ def test_gdn2_exported_reference_reads_natural_log_decay(definition_source):
     torch.testing.assert_close(final, torch.ones_like(final), rtol=0, atol=0)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("definition_source", ["generated", "checked_in"])
 def test_gdn2_exported_initializer_produces_finite_prefill(definition_source):
     if definition_source == "generated":
@@ -72,7 +75,8 @@ def test_gdn2_exported_initializer_produces_finite_prefill(definition_source):
     else:
         definition = json.loads(
             (
-                Path(__file__).parent / "fi_trace_out/gdn2_prefill_qk4_v8_d128.json"
+                Path(__file__).resolve().parents[2]
+                / "trace/fi_trace_out/gdn2_prefill_qk4_v8_d128.json"
             ).read_text()
         )
     namespace = {}
@@ -96,6 +100,7 @@ def test_gdn2_exported_initializer_produces_finite_prefill(definition_source):
     assert (args["g"] <= 0).all()
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("heads", [(2, 2), (4, 2), (2, 4)])
 @pytest.mark.parametrize(
     "optional", [None, "g", "beta", "initial_state", "output_state"]
@@ -131,6 +136,7 @@ def test_gdp_pool_trace_resolves_output_heads(heads, optional):
         assert definition["outputs"]["output"]["shape"][1] == "num_o_heads"
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("family", ["gdn2", "gdp"])
 @pytest.mark.parametrize("heads", [(4, 2, 2), (2, 2, 4)])
 @pytest.mark.parametrize("return_state", [False, True])

@@ -44,6 +44,7 @@ def _ctx(rows=2, max_len=8, next_n=1):
     )
 
 
+@pytest.mark.cpu_only
 def test_all_nan_actual_is_rejected():
     """A kernel emitting NaN everywhere must fail, not pass vacuously."""
     ref = torch.randn(2, 8, device=DEVICE)
@@ -51,6 +52,7 @@ def test_all_nan_actual_is_rejected():
     assert not _paged_mqa_logits_masked_check(ref, act, **_ctx())
 
 
+@pytest.mark.cpu_only
 def test_partial_nan_actual_is_rejected():
     """A single NaN inside the causal region is still a kernel failure.
 
@@ -63,6 +65,7 @@ def test_partial_nan_actual_is_rejected():
     assert not _paged_mqa_logits_masked_check(ref, act, **_ctx())
 
 
+@pytest.mark.cpu_only
 def test_inf_actual_is_rejected():
     ref = torch.randn(2, 8, device=DEVICE)
     act = ref.clone()
@@ -70,6 +73,7 @@ def test_inf_actual_is_rejected():
     assert not _paged_mqa_logits_masked_check(ref, act, **_ctx())
 
 
+@pytest.mark.cpu_only
 def test_nonzero_actual_against_all_zero_reference_is_rejected():
     """An all-zero reference must not accept an arbitrary actual.
 
@@ -81,6 +85,7 @@ def test_nonzero_actual_against_all_zero_reference_is_rejected():
     assert not _paged_mqa_logits_masked_check(ref, act, **_ctx())
 
 
+@pytest.mark.cpu_only
 def test_zero_actual_against_all_zero_reference_is_accepted():
     """The legitimate all-zero case must still pass."""
     ref = torch.zeros(2, 8, device=DEVICE)
@@ -88,12 +93,14 @@ def test_zero_actual_against_all_zero_reference_is_accepted():
     assert _paged_mqa_logits_masked_check(ref, act, **_ctx())
 
 
+@pytest.mark.cpu_only
 def test_matching_output_is_accepted():
     """Guard against the fix over-rejecting: identical tensors must pass."""
     ref = torch.randn(2, 8, device=DEVICE)
     assert _paged_mqa_logits_masked_check(ref, ref.clone(), **_ctx())
 
 
+@pytest.mark.cpu_only
 def test_quantization_noise_is_accepted():
     """Small fp8/fp4-scale noise must still pass, or the oracle is useless."""
     ref = torch.randn(2, 8, device=DEVICE) * 10.0
@@ -101,6 +108,7 @@ def test_quantization_noise_is_accepted():
     assert _paged_mqa_logits_masked_check(ref, act, **_ctx())
 
 
+@pytest.mark.cpu_only
 def test_nonfinite_reference_is_still_tolerated():
     """A non-finite REFERENCE stays tolerated: that is the fp8/fp4 rationale.
 
@@ -113,6 +121,7 @@ def test_nonfinite_reference_is_still_tolerated():
     assert _paged_mqa_logits_masked_check(ref, act, **_ctx())
 
 
+@pytest.mark.cpu_only
 def test_nonfinite_actual_outside_the_causal_region_is_ignored():
     """Beyond a row's causal limit the kernel may write anything, incl. -inf."""
     rows, max_len = 2, 8
@@ -128,18 +137,21 @@ def test_nonfinite_actual_outside_the_causal_region_is_ignored():
     assert _paged_mqa_logits_masked_check(ref, act, **ctx)
 
 
+@pytest.mark.cpu_only
 def test_systematic_scale_error_is_rejected():
     """The rel-L2 floor must still catch a mis-scaled kernel."""
     ref = torch.randn(2, 8, device=DEVICE) * 10.0
     assert not _paged_mqa_logits_masked_check(ref, ref * 1.5, **_ctx())
 
 
+@pytest.mark.cpu_only
 def test_shape_mismatch_is_rejected():
     ref = torch.randn(2, 8, device=DEVICE)
     act = torch.randn(2, 9, device=DEVICE)
     assert not _paged_mqa_logits_masked_check(ref, act, **_ctx())
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("wrap", [list, tuple])
 def test_accepts_sequence_outputs(wrap):
     """Templates may hand the checker a 1-tuple/list; behaviour must not change."""

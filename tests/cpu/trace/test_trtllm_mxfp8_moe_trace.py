@@ -1,5 +1,7 @@
 """Trace tests for TRT-LLM Gen MXFP8 block-scale MoE."""
 
+import pytest
+
 import torch
 
 
@@ -105,6 +107,7 @@ def _make_identity_mxfp8_inputs():
     )
 
 
+@pytest.mark.cpu_only
 def test_mxfp8_moe_trace_schema_includes_swiglu_oa_params():
     from flashinfer.fused_moe import (
         trtllm_fp8_block_scale_moe,
@@ -125,6 +128,7 @@ def test_mxfp8_moe_trace_schema_includes_swiglu_oa_params():
             assert defn["inputs"][name]["description"]
 
 
+@pytest.mark.cpu_only
 def test_mxfp8_moe_trace_reference_applies_swiglu_oa_params():
     from flashinfer.trace.templates.moe import (
         trtllm_fp8_block_scale_moe_default_routing_trace,

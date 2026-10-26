@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 import torch
 
-FI_TRACE_OUT = Path(__file__).parent / "fi_trace_out"
+FI_TRACE_OUT = Path(__file__).resolve().parents[2] / "trace/fi_trace_out"
 BLOCK_SPARSE_JSON = (
     FI_TRACE_OUT / "trtllm_batch_decode_block_sparse_h16_kv2_d128_ps16.json"
 )
@@ -36,6 +36,7 @@ def _exec_in_fresh_namespace(source: str) -> dict:
     return namespace
 
 
+@pytest.mark.cpu_only
 def test_block_sparse_json_init_and_reference_standalone():
     """The committed block-sparse JSON must exec and run without flashinfer."""
     doc = json.loads(BLOCK_SPARSE_JSON.read_text())
@@ -55,6 +56,7 @@ def test_block_sparse_json_init_and_reference_standalone():
     assert torch.isfinite(output.float()).all()
 
 
+@pytest.mark.cpu_only
 def test_dense_trtllm_decode_reference_renders_standalone():
     """The dense decode reference shares helpers; its rendered source must too."""
     from flashinfer.trace.template import _render_reference_source
@@ -74,6 +76,7 @@ def test_dense_trtllm_decode_reference_renders_standalone():
     assert torch.isfinite(output.float()).all()
 
 
+@pytest.mark.cpu_only
 def test_trtllm_gen_routing_init_renders_standalone():
     """The routing init must not leak flashinfer names into the dumped source.
 
@@ -109,6 +112,7 @@ _PMQA_INIT_KWARGS = dict(
 )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "json_path,prefix",
     [

@@ -4,6 +4,7 @@ import torch
 from flashinfer.trace.templates.attention import mla_paged_decode_trace
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("use_group_scales", [False, True])
 def test_mla_paged_decode_fp8_reference_dequantization(use_group_scales):
     head_dim_ckv = 512

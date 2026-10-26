@@ -1,5 +1,7 @@
 """Trace tests for TRT-LLM BF16 MoE."""
 
+import pytest
+
 import torch
 
 
@@ -49,6 +51,7 @@ def _bf16_routed_trace_kwargs():
     return kwargs
 
 
+@pytest.mark.cpu_only
 def test_bf16_moe_trace_schema_includes_swiglu_oa_params():
     from flashinfer.fused_moe import trtllm_bf16_moe, trtllm_bf16_routed_moe
 
@@ -66,6 +69,7 @@ def test_bf16_moe_trace_schema_includes_swiglu_oa_params():
             assert defn["inputs"][name]["description"]
 
 
+@pytest.mark.cpu_only
 def test_bf16_moe_trace_reference_applies_swiglu_oa_params():
     from flashinfer.trace.templates.moe import (
         trtllm_bf16_moe_trace,
