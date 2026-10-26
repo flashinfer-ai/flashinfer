@@ -116,8 +116,8 @@ from ..helpers.math import (
     qkv_major_k_stride_bytes_for,
 )
 from ..helpers.ops import (
-    fp8_log2_quant_scale,
-    fp8_quant_scale_rcp,
+    fp8_log2_p_scale,
+    fp8_p_scale_rcp,
     fmax_f32,
     pack_float4_to_fp8_e4m3,
 )
@@ -2974,6 +2974,16 @@ class TmemSResource(HighThroughputMlaResource):
                     row_max_prev, row_sum_prev = load_peer_state()
 
         row_max_new = fmax_f32(row_max_prev, row_max_tile)
+        if cutlass.const_expr(cfg.softmax_rescale_threshold_log2 > 0.0):
+            # Freeze the running row max while this K tile raises it by at most
+            # the threshold. P then grows by at most 2^T, and the unchanged max
+            # keeps this row's O rescale on the existing exact-equality skip
+            # path below. The first tile (row_max_prev == -inf) yields an
+            # infinite or NaN increase and never freezes. Compare in log2 units with
+            # the threshold as an immediate: the scale is already live here.
+            max_increase_log2 = (row_max_new - row_max_prev) * self.softmax_scale_log2
+            if max_increase_log2 <= Float32(cfg.softmax_rescale_threshold_log2):
+                row_max_new = row_max_prev
         row_has_values = row_max_new != neg_inf
         safe_row_max_prev = row_max_prev if row_has_values else Float32(0)
         safe_row_max_new = row_max_new if row_has_values else Float32(0)
@@ -2991,9 +3001,9 @@ class TmemSResource(HighThroughputMlaResource):
         fma_b = self.softmax_scale_log2
         fma_c = Float32(0) - safe_row_max_new * self.softmax_scale_log2
         if cutlass.const_expr(cfg.is_fp8_qkv()):
-            # Use the same selected FP8 probability scale as output and LSE.
-            # Native FP8 uses exact maxima and scale 448.
-            fma_c = fma_c + fp8_log2_quant_scale()
+            # Use the same selected FP8 probability scale as output and LSE:
+            # 448 with exact maxima, 448 * 2**-T with a rescale threshold T.
+            fma_c = fma_c + fp8_log2_p_scale(cfg)
         for i in cutlass.range_constexpr(0, 64, 2):
             fma_result = fma_packed_f32x2(
                 (qk_acc_regs[i], qk_acc_regs[i + 1]),
@@ -3831,7 +3841,7 @@ class GmemOResource(HighThroughputMlaResource):
                 norm_max = cute.math.max(max_log2, sink_log2)
                 rescale = cute.math.exp2(max_log2 - norm_max, fastmath=True)
                 inv_quant = Float32(
-                    fp8_quant_scale_rcp() if self.cfg.is_fp8_qkv() else 1.0
+                    fp8_p_scale_rcp(self.cfg) if self.cfg.is_fp8_qkv() else 1.0
                 )
                 denominator = row_sum * inv_quant * rescale + cute.math.exp2(
                     sink_log2 - norm_max, fastmath=True
@@ -4207,7 +4217,7 @@ class GmemOResource(HighThroughputMlaResource):
         # Compute and store LSE in the same row-sum domain used by P.
         lse_row_sum = row_sum
         if cutlass.const_expr(cfg.is_fp8_qkv()):
-            lse_row_sum = lse_row_sum * fp8_quant_scale_rcp()
+            lse_row_sum = lse_row_sum * fp8_p_scale_rcp(cfg)
         lse = (
             cute.math.log2(lse_row_sum, fastmath=True)
             + self.softmax_scale_log2 * row_max
@@ -4486,7 +4496,7 @@ class GmemOResource(HighThroughputMlaResource):
         if cutlass.const_expr(iter_n == 0):
             lse_row_sum = row_sum
             if cutlass.const_expr(cfg.is_fp8_qkv()):
-                lse_row_sum = lse_row_sum * fp8_quant_scale_rcp()
+                lse_row_sum = lse_row_sum * fp8_p_scale_rcp(cfg)
             lse = (
                 cute.math.log2(lse_row_sum, fastmath=True)
                 + self.softmax_scale_log2 * row_max

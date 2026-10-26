@@ -30,6 +30,7 @@ output_column_dict = {
         "random_actual_seq_len",
         "is_var_seq",
         "cute_dsl_impl",
+        "softmax_rescale_threshold_log2",
         "timing_metric",
         "row_activity_mode",
         "calls_per_sample",

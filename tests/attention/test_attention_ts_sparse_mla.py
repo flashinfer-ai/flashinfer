@@ -15,6 +15,7 @@ triton = pytest.importorskip("triton")
 import triton.language as tl
 from flashinfer.attention.prims_ts import (
     BatchSparseMLADecodePagedTSWrapper,
+    MLAAttentionTuning,
     batch_sparse_mla_decode_with_paged_kv_cache,
     get_prims_ts_sparse_mla_decode_workspace_size,
 )
@@ -41,6 +42,7 @@ def _reference(
     output_scale=1.0,
     sinks=None,
     softmax_scale=512**-0.5,
+    p_scale=448.0,
 ):
     rows, heads = query.numel() // (query.shape[-2] * 512), query.shape[-2]
     q = query.reshape(rows, heads, 512)
@@ -93,7 +95,10 @@ def _reference(
         ]
         bound[start:end] = (
             output_scale
-            * ((2**-4 + 3 * 2**-8 + 1e-5) * sensitivity + (2**-10 / 448) * underflow)
+            * (
+                (2**-4 + 3 * 2**-8 + 1e-5) * sensitivity
+                + (2**-10 / p_scale) * underflow
+            )
             + 1e-6
         ).masked_fill(empty[:, None, None], 0)
     return (
@@ -1138,3 +1143,99 @@ def test_softmax_score_jumps(heads, dtype):
         else:
             torch.testing.assert_close(out.double(), ref, atol=8e-4, rtol=0.01)
         torch.testing.assert_close(lse.double(), ref_lse, atol=2e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "dtype,rows,heads,capacity,threshold",
+    [
+        pytest.param(torch.bfloat16, 74, 32, 1024, 6.0, id="bf16"),
+        pytest.param(torch.float8_e4m3fn, 16, 128, 1024, 8.0, id="fp8"),
+    ],
+)
+def test_softmax_rescale_threshold_log2(dtype, rows, heads, capacity, threshold):
+    """An explicit threshold reaches the sparse kernels and replaces the default.
+
+    softmax_scale = ln 2 makes one logit unit one binade. Successive 256-slot
+    groups, repeating every 1024 slots, raise the row maximum by threshold - 2
+    (kept anchor), by more than threshold (rescale) and by threshold - 2 again.
+    E4M3 bounds use the ``448 * 2**-threshold`` probability scale.
+    """
+    torch.manual_seed(7)
+    fp8 = dtype == torch.float8_e4m3fn
+    q = (torch.randn(rows, 1, heads, 512, device="cuda") * 0.1).to(dtype)
+    q[..., 0] = 1
+    kv = torch.randn(capacity, 1, 512, device="cuda") * 0.1
+    jump = 10.0 if fp8 else threshold + 3  # E4M3 represents 6, 16 and 22
+    levels = (0.0, threshold - 2, threshold - 2 + jump, 2 * threshold - 4 + jump)
+    for start in range(0, capacity, 256):
+        kv[start : start + 256, :, 0] = levels[start // 256 % 4]
+    kv = kv.to(dtype)
+    indices = torch.arange(capacity, device="cuda", dtype=torch.int32).repeat(
+        rows, 1, 1
+    )
+    sinks = torch.randn(heads, device="cuda")
+    sinks[0], sinks[1], sinks[2] = torch.inf, -torch.inf, 15.0
+    softmax_scale = 0.6931471805599453
+    args = dict(max_topk=capacity, q_data_type=dtype, has_sinks=True, return_lse=True)
+    results = {}
+    for value in (None, 0.0, threshold):
+        wrapper = BatchSparseMLADecodePagedTSWrapper()
+        wrapper.plan(
+            q.device,
+            rows,
+            heads,
+            **args,
+            tuning=MLAAttentionTuning(softmax_rescale_threshold_log2=value),
+        )
+        meta = prepare_sparse_mla_indices(wrapper, q, kv, indices)
+        results[value] = wrapper.run(
+            q, kv, **meta, sinks=sinks, softmax_scale=softmax_scale
+        )
+    out, lse = results[threshold]
+    eager, eager_lse = batch_sparse_mla_decode_with_paged_kv_cache(
+        q,
+        kv,
+        **meta,
+        sinks=sinks,
+        softmax_scale=softmax_scale,
+        return_lse=True,
+        tuning=MLAAttentionTuning(softmax_rescale_threshold_log2=threshold),
+    )
+    assert torch.equal(out, eager) and torch.equal(lse, eager_lse)
+    ref, ref_lse, bound = _reference(
+        q,
+        kv,
+        None,
+        indices,
+        sinks=sinks,
+        softmax_scale=softmax_scale,
+        p_scale=448.0 * 2.0**-threshold,
+    )
+    assert torch.isfinite(out).all()
+    if fp8:
+        assert ((out.double() - ref).abs() <= bound).all()
+    else:
+        torch.testing.assert_close(out.double(), ref, atol=8e-4, rtol=0.01)
+    torch.testing.assert_close(lse.double(), ref_lse, atol=2e-4, rtol=1e-4)
+    # None keeps the schedule's default: exact maxima, or (on some BF16
+    # schedules) a fixed six-binade deferral. An explicit value replaces it,
+    # so exactly one of the explicit plans reproduces the default output.
+    default_out = results[None][0]
+    assert torch.equal(results[0.0][0], default_out) != torch.equal(out, default_out)
+
+
+@pytest.mark.parametrize(
+    "dtype,threshold",
+    [(torch.float8_e4m3fn, 8.5), (torch.bfloat16, -1.0)],
+)
+def test_softmax_rescale_threshold_log2_rejected(dtype, threshold):
+    """Values outside the per-dtype bound raise instead of being clamped."""
+    with pytest.raises(ValueError, match="softmax_rescale_threshold_log2"):
+        get_prims_ts_sparse_mla_decode_workspace_size(
+            torch.device("cuda"),
+            1,
+            16,
+            max_topk=128,
+            q_data_type=dtype,
+            tuning=MLAAttentionTuning(softmax_rescale_threshold_log2=threshold),
+        )

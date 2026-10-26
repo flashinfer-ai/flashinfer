@@ -1773,9 +1773,35 @@ def _make_prims_ts_decode_mla_wrapper_trace(
     max_kv_len: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    softmax_rescale_threshold_log2: float = 0.0,
 ):
     cache_suffix = "_rank4" if rank4_cache else ""
     q_suffix = "_packed_q" if packed_query else ""
+    # A nonzero plan-time rescale threshold selects a different kernel; name it
+    # so its traces never alias the exact-rescale plan. Zero keeps old names.
+    threshold_suffix = ""
+    threshold_tags: list[str] = []
+    threshold_note = ""
+    if softmax_rescale_threshold_log2 > 0.0:
+        # The plan rounds the threshold to float32: use the shortest text that
+        # round-trips in float32, so distinct compiled values never share a name.
+        threshold_value = torch.tensor(
+            float(softmax_rescale_threshold_log2), dtype=torch.float32
+        ).item()
+        threshold_text = next(
+            text
+            for text in (f"{threshold_value:.{digits}g}" for digits in range(1, 10))
+            if torch.tensor(float(text), dtype=torch.float32).item() == threshold_value
+        )
+        threshold_suffix = "_rescale_thr" + threshold_text.replace(".", "p").replace(
+            "-", "m"
+        ).replace("+", "")
+        threshold_tags = [f"softmax_rescale_threshold_log2:{threshold_text}"]
+        threshold_note = (
+            " The plan sets softmax_rescale_threshold_log2="
+            f"{threshold_text}, so O rescales are skipped while a K tile raises "
+            "a row maximum by at most that many binades."
+        )
     axes: dict[str, Var | Const] = {
         "batch_size": Var(description="Exact number of planned MLA requests."),
         "max_seq_len_q": Const(
@@ -1831,11 +1857,13 @@ def _make_prims_ts_decode_mla_wrapper_trace(
         op_type="mla_paged",
         name_prefix=(
             f"prims_ts_decode_mla_wrapper{cache_suffix}{q_suffix}_{mask_type}"
+            f"{threshold_suffix}"
         ),
         description=(
             "Reusable PrimTS MLA decode wrapper. The plan fixes masks, static "
             "bounds, and exact batch size. Every run supplies page tables and "
             "sequence lengths; packed-Q runs also supply Q offsets."
+            f"{threshold_note}"
         ),
         axes=axes,
         inputs={
@@ -1891,6 +1919,7 @@ def _make_prims_ts_decode_mla_wrapper_trace(
             "status:experimental",
             "mla",
             f"mask:{mask_type}",
+            *threshold_tags,
         ],
     )
 
@@ -1924,6 +1953,7 @@ def _get_prims_ts_decode_mla_wrapper_trace(
     max_kv_len: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    softmax_rescale_threshold_log2: float = 0.0,
 ) -> TraceTemplate:
     """Return one stable trace template for a frozen MLA plan identity."""
 
@@ -1935,6 +1965,7 @@ def _get_prims_ts_decode_mla_wrapper_trace(
         max_kv_len=max_kv_len,
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
+        softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
     )
 
 
@@ -1971,6 +2002,10 @@ def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
         max_kv_len=int(state.max_kv_len),
         kv_lora_rank=int(state.kv_lora_rank),
         qk_rope_head_dim=int(state.qk_rope_head_dim),
+        # Plan-state stand-ins in the trace tests predate the threshold field.
+        softmax_rescale_threshold_log2=float(
+            getattr(state, "softmax_rescale_threshold_log2", 0.0)
+        ),
     )
 
 
