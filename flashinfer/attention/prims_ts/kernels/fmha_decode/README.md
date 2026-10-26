@@ -262,7 +262,8 @@ placement. Memory placement is not a configuration or dispatch input.
 For homogeneous FP8 Q/K/V/output, opting into 327 KiB selects the following
 long-KV, nonsplit pipeline defaults. KV depth counts raw K/V slots in total;
 staged one-instance Keeps uses eight slots per operand for depth sixteen.
-Explicit Q/KV depths retain precedence.
+These paired defaults apply when both depths are unspecified. Setting either
+Q or KV depth retains the existing manual-profile inference for the other.
 
 | Physical kernel layout | Q depth | KV depth |
 | --- | ---: | ---: |

@@ -8388,15 +8388,16 @@ def test_attention_ts_decode_16bit_paged_keeps_q128_automatic_scope(
 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize(
-    ("head_dim", "seq_len_q", "tile_size_q", "tile_size_kv"),
+    ("head_dim", "seq_len_q", "tile_size_q", "tile_size_kv", "q_stages"),
     (
-        (128, 1, 16, 128),
-        (256, 1, 16, 128),
-        (128, 4, 64, 128),
-        (128, 8, 128, 128),
-        (256, 4, 64, 128),
-        (256, 8, 128, 128),
-        (128, 4, 64, 256),
+        (128, 1, 16, 128, None),
+        (256, 1, 16, 128, None),
+        (128, 4, 64, 128, None),
+        (128, 8, 128, 128, None),
+        (256, 4, 64, 128, None),
+        (256, 8, 128, 128, None),
+        (128, 4, 64, 256, None),
+        (128, 4, 64, 128, 3),
     ),
 )
 def test_attention_ts_decode_sm107_expanded_resources(
@@ -8405,6 +8406,7 @@ def test_attention_ts_decode_sm107_expanded_resources(
     seq_len_q: int,
     tile_size_q: int,
     tile_size_kv: int,
+    q_stages: int | None,
 ):
     """Check exclusive TMEM and deeper FP8 rings across ragged KV tails."""
 
@@ -8427,16 +8429,19 @@ def test_attention_ts_decode_sm107_expanded_resources(
         device="cuda",
         seed=20261025,
     )
+    config_args = {
+        "use_keeps_mma_ab": tile_size_q >= 64,
+        "tile_size_q": tile_size_q,
+        "tile_size_kv": tile_size_kv,
+        "max_tmem_alloc_cols": 576,
+        "smem_capacity_kib": 327,
+    }
+    if q_stages is not None:
+        config_args["q_stages"] = q_stages
     exercise_explicit_decode_profile(
         monkeypatch,
         case,
-        config_args={
-            "use_keeps_mma_ab": tile_size_q >= 64,
-            "tile_size_q": tile_size_q,
-            "tile_size_kv": tile_size_kv,
-            "max_tmem_alloc_cols": 576,
-            "smem_capacity_kib": 327,
-        },
+        config_args=config_args,
         exercise_all_paths=True,
         split_kv=False,
     )

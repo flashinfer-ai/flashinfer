@@ -3641,11 +3641,12 @@ def _finalize_static_decode_config(
             cfg, "transformed_kv_stages", min(cfg.kv_stages, 4), explicit_fields
         )
 
-    profile = sm107_fp8_pipeline_profile(cfg)
-    if profile is not None:
-        q_stages, kv_stages = profile
-        _set_if_implicit(cfg, "q_stages", q_stages, explicit_fields)
-        _set_if_implicit(cfg, "kv_stages", kv_stages, explicit_fields)
+    # A profile is a matched Q/KV pair. Keep ordinary inference when either
+    # depth is manual, so a preset cannot overfill an otherwise legal ring.
+    if not {"q_stages", "kv_stages"}.intersection(explicit_fields):
+        profile = sm107_fp8_pipeline_profile(cfg)
+        if profile is not None:
+            cfg.q_stages, cfg.kv_stages = profile
 
     # Split-KV mode forbids persistent scheduling. Canonicalize here so
     # downstream consumers can gate on use_persistent_scheduler alone without
